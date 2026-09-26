@@ -1,5 +1,7 @@
 # Rebrand: DeepSeek TUI → Codewhale
 
+> 阅读简体中文版：[zh_hans/REBRAND.md](zh_hans/REBRAND.md)。
+
 Starting with **v0.8.41**, this project ships under a new name: `codewhale`.
 
 This document explains what changed, what didn't, and how to migrate. None of the

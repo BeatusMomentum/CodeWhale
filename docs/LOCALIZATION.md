@@ -1,5 +1,7 @@
 # Localization Matrix
 
+> 阅读简体中文版：[zh_hans/LOCALIZATION.md](zh_hans/LOCALIZATION.md)。
+
 Canonical tracking document for every locale Codewhale ships, is actively
 building, is planning, or has explicitly deferred.
 

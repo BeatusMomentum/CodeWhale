@@ -1,5 +1,7 @@
 # Build and test performance
 
+> 阅读简体中文版：[zh_hans/BUILD_PERFORMANCE.md](zh_hans/BUILD_PERFORMANCE.md)。
+
 Measured facts about how long Codewhale takes to build and test, what was
 changed to make the contributor loop faster, and what is deferred. Numbers
 are from one machine (Apple Silicon, 14 cores, rustc 1.97.0, Xcode 26.2

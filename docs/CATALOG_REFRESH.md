@@ -1,5 +1,7 @@
 # Catalog refresh
 
+> 阅读简体中文版：[zh_hans/CATALOG_REFRESH.md](zh_hans/CATALOG_REFRESH.md)。
+
 How Codewhale keeps model metadata current — what already auto-updates, what
 is hand-maintained, and what a scheduled catalog job should (and should not) do.
 

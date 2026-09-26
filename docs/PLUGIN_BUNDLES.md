@@ -1,5 +1,7 @@
 # Plugin bundles
 
+> 阅读简体中文版：[zh_hans/PLUGIN_BUNDLES.md](zh_hans/PLUGIN_BUNDLES.md)。
+
 Codewhale supports a deliberately small plugin-bundle boundary. The boundary
 was drawn in v0.9.1 and is extended deliberately in v0.9.10: a bundle may
 contribute declarative Skills, MCP configuration, Commands, Agent profiles,
