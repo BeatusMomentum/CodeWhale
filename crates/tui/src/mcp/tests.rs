@@ -79,7 +79,7 @@ fn mark_workspace_trusted(workspace: &Path) -> WorkspaceTrustConfigGuard {
 fn test_mcp_config_defaults() {
     let config = McpConfig::default();
     assert_eq!(config.timeouts.connect_timeout, 10);
-    assert_eq!(config.timeouts.execute_timeout, 60);
+    assert_eq!(config.timeouts.execute_timeout, 1800);
     assert_eq!(config.timeouts.read_timeout, 120);
     assert!(config.servers.is_empty());
 }
@@ -2805,7 +2805,10 @@ fn test_server_effective_timeouts() {
     };
 
     assert_eq!(server_with_override.effective_connect_timeout(&global), 20);
-    assert_eq!(server_with_override.effective_execute_timeout(&global), 60); // global default
+    assert_eq!(
+        server_with_override.effective_execute_timeout(&global),
+        1800
+    ); // global default
     assert_eq!(server_with_override.effective_read_timeout(&global), 180);
 }
 
@@ -3047,6 +3050,99 @@ fn json_frame(value: serde_json::Value) -> Vec<u8> {
     serde_json::to_vec(&value).unwrap()
 }
 
+#[test]
+fn per_request_read_budget_never_undercuts_the_request_budget() {
+    // A long execute budget widens the inner read wait so the response wait
+    // cannot fire first and defeat it.
+    assert_eq!(per_request_read_budget(120, 1800), 1800);
+    // A read knob above the request budget stays intact.
+    assert_eq!(per_request_read_budget(600, 60), 600);
+    // Equal budgets stay equal.
+    assert_eq!(per_request_read_budget(120, 120), 120);
+}
+
+#[test]
+fn http_request_ceiling_covers_the_execute_budget() {
+    let mut config = test_server_config();
+    config.execute_timeout = Some(1800);
+    config.read_timeout = Some(120);
+    let global = McpTimeouts {
+        connect_timeout: 10,
+        execute_timeout: 1800,
+        read_timeout: 120,
+    };
+    assert_eq!(http_request_ceiling_secs(&config, &global), 1800);
+
+    // A per-server read knob above both stays intact.
+    config.read_timeout = Some(3600);
+    assert_eq!(http_request_ceiling_secs(&config, &global), 3600);
+}
+
+/// A transport that stays silent for a fixed delay, then answers with a
+/// matching result — the shape of an MCP server executing a long tool call.
+struct DelayedResponseTransport {
+    delay: Duration,
+    pending: Option<Vec<u8>>,
+}
+
+#[async_trait::async_trait]
+impl McpTransport for DelayedResponseTransport {
+    async fn send(&mut self, msg: Vec<u8>) -> Result<()> {
+        // Echo the request id so every call gets its matching response.
+        let request: serde_json::Value = serde_json::from_slice(&msg)?;
+        let response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": request["id"].clone(),
+            "result": {"ok": true}
+        });
+        self.pending = Some(json_frame(response));
+        Ok(())
+    }
+
+    async fn recv(&mut self) -> Result<Vec<u8>> {
+        tokio::time::sleep(self.delay).await;
+        self.pending.take().context("delayed transport exhausted")
+    }
+}
+
+#[tokio::test]
+async fn a_tool_response_after_the_read_knob_still_completes_within_the_execute_budget() {
+    let mut connection = test_connection(Box::new(DelayedResponseTransport {
+        // The response arrives after the read knob (1s) but well inside the
+        // execute budget (30s): the widened inner read wait must cover it
+        // instead of marking the connection dead at the knob.
+        delay: Duration::from_millis(1500),
+        pending: None,
+    }));
+    connection.read_timeout_secs = 1;
+    let result = connection
+        .call_tool("slow", serde_json::json!({}), 30)
+        .await
+        .expect("a silent tool execution must not be cut off by the read knob");
+    assert_eq!(result, serde_json::json!({"ok": true}));
+    assert!(
+        connection.is_ready(),
+        "a completed call keeps the connection"
+    );
+}
+
+#[tokio::test]
+async fn a_request_whose_budget_does_not_exceed_the_read_knob_still_fails_at_it() {
+    let mut connection = test_connection(Box::new(HangingValueTransport {
+        sent: Arc::new(Mutex::new(Vec::new())),
+    }));
+    connection.read_timeout_secs = 1;
+    let error = connection
+        .read_resource("file:///wedged", 1)
+        .await
+        .expect_err("a wedged server must still fail the request at the read knob");
+    assert!(
+        error.to_string().contains("after 1s"),
+        "the read knob must govern this request, got: {error:#}"
+    );
+    assert!(!connection.is_ready());
+}
+
 #[tokio::test]
 async fn call_method_skips_notifications_and_unmatched_responses() {
     let sent = Arc::new(Mutex::new(Vec::new()));
@@ -3114,7 +3210,7 @@ async fn recv_times_out_waiting_for_mcp_response_and_disconnects() {
     conn.read_timeout_secs = 0;
 
     let err = conn
-        .recv("1".to_string())
+        .recv("1".to_string(), conn.read_timeout_secs)
         .await
         .expect_err("hung transport should time out inside recv");
 

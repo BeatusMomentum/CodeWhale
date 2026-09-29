@@ -249,7 +249,7 @@ Codewhale 同时读取 `servers` 和 `mcpServers`，因此设置页生成的片�
 {
   "timeouts": {
     "connect_timeout": 10,
-    "execute_timeout": 60,
+    "execute_timeout": 1800,
     "read_timeout": 120
   },
   "servers": {

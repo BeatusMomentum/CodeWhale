@@ -516,8 +516,15 @@ pub struct McpTimeouts {
 fn default_connect_timeout() -> u64 {
     10
 }
+// 30 minutes: an MCP tool call legitimately runs minutes — builds, test
+// suites, scrapes, remote jobs. The old 60s default returned "timed out" to
+// the model for healthy-but-slow tools, which then retried and compounded
+// the cost. Per-server and global `execute_timeout` overrides still win.
+// Scope note: `prompts/get` also routes through `effective_execute_timeout`,
+// so it inherits this default; its server-side template work is normally
+// fast, but the override knob is the intended way to keep it tight.
 fn default_execute_timeout() -> u64 {
-    60
+    1800
 }
 fn default_read_timeout() -> u64 {
     120
@@ -1740,6 +1747,26 @@ impl Drop for PendingAuthorityWatch {
     }
 }
 
+/// Per-request inner read budget: the connection's read knob, widened to at
+/// least the request's own outer budget. A server is silent for the whole
+/// execution of a long tool call, so a smaller inner read would fire first,
+/// mark the connection Disconnected, and silently defeat a raised
+/// `execute_timeout`.
+fn per_request_read_budget(read_timeout_secs: u64, request_timeout_secs: u64) -> u64 {
+    read_timeout_secs.max(request_timeout_secs)
+}
+
+/// Total request ceiling handed to the HTTP client: it must cover the longest
+/// request the connection carries (`tools/call` at the execute budget), so a
+/// raised `execute_timeout` governs HTTP servers too. This is a ceiling for
+/// the transport, not the read knob — fast requests still fail at their own
+/// outer budget, which stays at the read knob.
+fn http_request_ceiling_secs(config: &McpServerConfig, global: &McpTimeouts) -> u64 {
+    config
+        .effective_read_timeout(global)
+        .max(config.effective_execute_timeout(global))
+}
+
 impl McpConnection {
     /// Connect to an MCP server and initialize it.
     ///
@@ -1801,7 +1828,12 @@ impl McpConnection {
                 config.allow_private_network,
                 network_policy,
                 Duration::from_secs(connect_timeout_secs),
-                Duration::from_secs(read_timeout_secs),
+                // Transport total-request ceiling, not the read knob: it must
+                // cover the longest request this connection carries
+                // (`tools/call` at the execute budget), so a raised
+                // `execute_timeout` governs HTTP servers too. The read knob
+                // itself stays intact for the connection-level waits below.
+                Duration::from_secs(http_request_ceiling_secs(&config, global_timeouts)),
             )?;
             let oauth_runtime = if config.reviewed_plugin.is_some() {
                 None
@@ -1970,7 +2002,7 @@ impl McpConnection {
         }))
         .await?;
 
-        let response = self.recv(init_id).await?;
+        let response = self.recv(init_id, self.read_timeout_secs).await?;
         if let Some(error) = response.get("error")
             && self.config.reviewed_plugin.is_none()
         {
@@ -2103,7 +2135,7 @@ impl McpConnection {
             }))
             .await?;
 
-            let response = self.recv(list_id).await?;
+            let response = self.recv(list_id, self.read_timeout_secs).await?;
             let Some(result) = response_result(
                 &response,
                 "tools/list",
@@ -2164,7 +2196,7 @@ impl McpConnection {
             }))
             .await?;
 
-            let response = self.recv(list_id).await?;
+            let response = self.recv(list_id, self.read_timeout_secs).await?;
             let Some(result) = response_result(
                 &response,
                 "resources/list",
@@ -2217,7 +2249,7 @@ impl McpConnection {
             }))
             .await?;
 
-            let response = self.recv(list_id).await?;
+            let response = self.recv(list_id, self.read_timeout_secs).await?;
             let Some(result) = response_result(
                 &response,
                 "resources/templates/list",
@@ -2273,7 +2305,7 @@ impl McpConnection {
             }))
             .await?;
 
-            let response = self.recv(list_id).await?;
+            let response = self.recv(list_id, self.read_timeout_secs).await?;
             let Some(result) = response_result(
                 &response,
                 "prompts/list",
@@ -2390,19 +2422,28 @@ impl McpConnection {
             return self.finish_guarded_error(error).await;
         }
 
-        let response =
-            match tokio::time::timeout(Duration::from_secs(timeout_secs), self.recv(call_id))
-                .await
-                .with_context(|| {
-                    format!(
-                        "MCP method '{}' on server '{}' timed out after {}s",
-                        method, self.name, timeout_secs
-                    )
-                }) {
-                Ok(Ok(response)) => response,
-                Ok(Err(error)) => return self.finish_guarded_error(error).await,
-                Err(error) => return self.finish_guarded_error(error).await,
-            };
+        // The inner read wait must never undercut this request's own outer
+        // budget: a server is silent for the whole execution of a tool call,
+        // so a smaller read knob would fire first, mark the connection
+        // Disconnected, and silently defeat a raised `execute_timeout`.
+        // Requests whose budget does not exceed the read knob (resources,
+        // discovery) keep failing at the configured read budget.
+        let read_budget_secs = per_request_read_budget(self.read_timeout_secs, timeout_secs);
+        let response = match tokio::time::timeout(
+            Duration::from_secs(timeout_secs),
+            self.recv(call_id, read_budget_secs),
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "MCP method '{}' on server '{}' timed out after {}s",
+                method, self.name, timeout_secs
+            )
+        }) {
+            Ok(Ok(response)) => response,
+            Ok(Err(error)) => return self.finish_guarded_error(error).await,
+            Err(error) => return self.finish_guarded_error(error).await,
+        };
 
         if let Some(error) = response.get("error") {
             if self.config.reviewed_plugin.is_some() {
@@ -2513,20 +2554,21 @@ impl McpConnection {
         result
     }
 
-    async fn recv(&mut self, expected_id: String) -> Result<serde_json::Value> {
+    async fn recv(
+        &mut self,
+        expected_id: String,
+        read_budget_secs: u64,
+    ) -> Result<serde_json::Value> {
         loop {
-            let bytes = match tokio::time::timeout(
-                Duration::from_secs(self.read_timeout_secs),
-                async {
-                    tokio::select! {
-                        biased;
-                        _ = self.cancel_token.cancelled() => {
-                            anyhow::bail!("MCP connection '{}' was cancelled", self.name)
-                        }
-                        result = self.transport.recv() => result,
+            let bytes = match tokio::time::timeout(Duration::from_secs(read_budget_secs), async {
+                tokio::select! {
+                    biased;
+                    _ = self.cancel_token.cancelled() => {
+                        anyhow::bail!("MCP connection '{}' was cancelled", self.name)
                     }
-                },
-            )
+                    result = self.transport.recv() => result,
+                }
+            })
             .await
             {
                 Ok(result) => result.inspect_err(|_e| {
@@ -2537,7 +2579,7 @@ impl McpConnection {
                     anyhow::bail!(
                         "Timed out waiting for MCP JSON-RPC response from server '{}' after {}s",
                         self.name,
-                        self.read_timeout_secs
+                        read_budget_secs
                     );
                 }
             };

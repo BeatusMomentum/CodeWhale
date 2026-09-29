@@ -379,7 +379,7 @@ The CLI also exposes helper tools when MCP is enabled:
 {
   "timeouts": {
     "connect_timeout": 10,
-    "execute_timeout": 60,
+    "execute_timeout": 1800,
     "read_timeout": 120
   },
   "servers": {
