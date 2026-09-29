@@ -17,110 +17,13 @@ Related docs:
 - [Providers](PROVIDERS.md) — the model/key used to write the review
 - [Receipts](RECEIPTS.md) — how posted reviews are anchored to a head SHA
 
-## Account keys and provider keys
+## Actions setup and model selection
 
-`CODEWHALE_API_KEY` is a Codewhale account machine key (`cwc_key_…`), not a
-vendor credential. In account mode the workflow first runs
-`codewhale --no-project-config account agent` to check authentication and the
-account's configured agent. It then selects the existing `codewhale` provider,
-which sends that key to the Codewhale model relay. It never copies an account
-key into a vendor environment variable.
-
-Connect the underlying provider in your Codewhale account and create a machine
-key with `agent:run` and `models:infer` scopes. The default scopes from
-`codewhale account api-keys create --name github-review` also include
-`account:read`, which permits identity checks. Set `CODEWHALE_REVIEW_MODEL` to
-an exact `provider/model` id returned by your account's authenticated
-`GET /v1/models` catalog. The offline model defaults are bootstrap values, not
-proof of account access; see [Providers](PROVIDERS.md).
-
-Bring your own provider key by setting its secret instead of
-`CODEWHALE_API_KEY`:
-
-| Secret | Route |
-| --- | --- |
-| `CODEWHALE_API_KEY` | Codewhale account relay; requires an explicit account catalog model |
-| `ZAI_API_KEY` | z.ai Coding Plan |
-| `MODELSTUDIO_API_KEY` | Model Studio Token Plan |
-| `DEEPSEEK_API_KEY` | DeepSeek |
-| `OPENROUTER_API_KEY` | OpenRouter |
-| `ANTHROPIC_API_KEY` | Anthropic |
-
-If both account and vendor secrets exist, the workflow selects account mode
-and leaves every vendor variable unchanged. In this mode
-`CODEWHALE_REVIEW_PROVIDER` must be unset or `codewhale`; a conflicting value
-fails before review. To select BYOK, remove the account secret from this
-workflow's configuration.
-
-## Choosing the review route and model
-
-Configure repository variables under Settings → Secrets and variables →
-Actions → Variables:
-
-| Variable | Account mode | BYOK mode |
-| --- | --- | --- |
-| `CODEWHALE_REVIEW_PROVIDER` | Unset or `codewhale` | Explicit provider, such as `deepseek` |
-| `CODEWHALE_REVIEW_MODEL` | Required exact account catalog `provider/model` id | Optional exact model id; otherwise the provider's default |
-
-For BYOK without an explicit provider, the workflow chooses the first available
-key in this order: z.ai, Model Studio Token Plan, DeepSeek, OpenRouter,
-Anthropic. Set the provider explicitly when several keys are present.
-
-The workflow passes provider and model as global CLI flags before `review`,
-with `--no-project-config`. Account mode deliberately pins the relay route:
-the account agent precondition reports a configured provider, but does not
-supply an exact model id or a vendor credential to the runner.
-
-For release PR **#6002** only, the workflow supplies an explicitly approved
-`deepseek` / `deepseek-v4-pro` route and ceilings of **500000** characters per
-pass, **16** complete passes, and **65536** output tokens per request. Existing
-repository variables override these values. Other PRs retain the defaults
-below. This exception changes no credentials or coverage rules: a diff that
-requires more than 16 passes still fails before model review, and a provider
-non-run is never completed-review evidence. Keep the release head frozen
-during review to avoid cancellation and repeated provider cost.
-
-## Complete diffs and input limits
-
-The workflow checks out the event's pinned head SHA for same-repository PRs,
-and the pinned base SHA for fork PRs. It uses full history, fetches the base
-repository's PR head ref, and verifies both event commits and a single merge
-base. Fetching fork objects does not check out or execute their files, hooks,
-submodules, or filters. Checkout credentials are not persisted.
-[GitHub's checkout documentation](https://github.com/actions/checkout) describes
-`fetch-depth: 0` and `persist-credentials: false`.
-
-The shared collector uses the complete GitHub diff when available and a
-verified local Git diff when the API cannot provide it, including large PRs.
-It rejects a changed snapshot, unavailable history, or incomplete diff before
-review. Repository variable `CODEWHALE_REVIEW_MAX_CHARS` sets the input limit
-per pass (default **200000**, allowed range **1–8388608**). The collector also has
-an **8 MiB output** and **60-second command** bound; a character limit does not
-bypass those transport bounds.
-
-A complete diff requiring more than one configured-limit pass fails the job by
-default. It is never silently truncated or treated as a provider funding
-problem. Repository variable `CODEWHALE_REVIEW_MAX_PASSES` (default **1**,
-allowed range **1–64**) passes `--max-passes N` to the CLI. Raising it explicitly
-authorizes the workflow to run up to N ordered passes for a complete review,
-with additional provider cost and run time. Set it only after reviewing that
-budget; leaving it unset retains one pass. If any pass fails, no partial
-review is posted.
-Increasing the character limit is a separate input-budget choice and still
-requires a model with sufficient context.
-
-When the complete PR cannot fit the allowed pass count, keep the failed
-advisory check and record that the model review did not run. Do not turn an
-input-limit failure into a clean review. Maintainers can explicitly authorize
-bounded whole-PR passes, or review bounded paths with a trusted build using
-`review --base <base-sha> --path <path>` from a checkout pinned to the PR head.
-Local diff reviews also reject oversized input. Path scopes cannot use `--pr`
-or `--post`; their receipts cover only the selected paths.
-Record the exact base/head, included paths and diff fingerprints, findings,
-checks actually run, and remaining coverage. Separately review interactions
-across paths and inspect changed media. A file inventory or a passing test
-suite is not evidence that those source reviews completed. This fallback
-does not change repository rules or satisfy a required whole-PR review.
+Use [the reusable GitHub Action setup](GITHUB_ACTION.md) for the workflow,
+account machine key, exact model, release pin, limits, outcomes and retries.
+The repository workflow is now a thin caller of that action. It uses the
+Codewhale account relay and a checksummed release; it does not compile a PR's
+candidate source. BYOK is an explicit option in a user's own workflow.
 
 ## Review evidence and precision
 
@@ -177,8 +80,9 @@ same-repository pull requests can post reviews as the App.
    |----------|-----------------------------|-------------------------------------|
    | Variable | `CODEWHALE_APP_ID`          | the App ID shown on the App's page  |
    | Secret   | `CODEWHALE_APP_PRIVATE_KEY` | the full `.pem` file contents       |
-   | Secret   | `CODEWHALE_API_KEY`         | a Codewhale machine key; for BYOK use the provider's own secret name instead |
-   | Variable | `CODEWHALE_REVIEW_MODEL`    | exact account catalog `provider/model` id (required for account mode) |
+   | Secret   | `CODEWHALE_API_KEY`         | a Codewhale machine key for this repository workflow |
+   | Variable | `CODEWHALE_REVIEW_MODEL`    | exact account catalog `provider/model` id (required) |
+   | Variable | `CODEWHALE_REVIEW_VERSION` | exact released CLI tag; default v0.10.0 |
 
    App settings control identity. Model access separately requires a review
    key and, for account mode, the catalog model. Optional budget variables are
@@ -188,40 +92,20 @@ same-repository pull requests can post reviews as the App.
 ## How the pieces connect
 
 [The review workflow](../.github/workflows/codewhale-review.yml) uses
-`pull_request` for non-draft PRs targeting `main`. Only same-repository PRs
-receive review secrets and build the candidate CLI. Fork PRs keep the trusted
-base checkout and run only the diff-object checks; they receive no model or
-App secrets and no model review. GitHub also
-[withholds ordinary secrets from fork pull requests](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#workflows-in-forked-repositories).
-Review a fork separately with a trusted build and deliberately provided
-credentials. This workflow does not execute a fetched fork merely to obtain
-a large diff.
+`pull_request` and a manual `workflow_dispatch` recovery trigger. The action
+reads the PR's exact Git objects in a fresh repository without checking them
+out. Forks and drafts are explicitly ineligible. The model key is supplied
+only to eligible same-repository events; the action checks eligibility again.
 
-For eligible reviews, when
-`CODEWHALE_APP_ID` **and** `CODEWHALE_APP_PRIVATE_KEY` are both present, the
-job mints a short-lived installation token for the App
-(`actions/create-github-app-token`) and hands it to the CLI as `GH_TOKEN`.
-Otherwise it falls back to the workflow's own `github.token`. The CLI never
-stores the token; each run mints a fresh one.
+When both `CODEWHALE_APP_ID` and `CODEWHALE_APP_PRIVATE_KEY` are present, the
+workflow mints a short-lived installation token restricted to contents:read
+and pull_requests:write. Otherwise it uses `github.token`. The action emits
+one COMMENT review, never approval or a request for changes. CODEOWNERS stays
+the human authority. Setup or provider failures fail the optional review job
+and save a sanitized receipt; they do not post additional status comments.
 
-The key-presence test lives in the job's `env:` block rather than its `if:`
-because the `secrets` context is not available in a job-level `if:`. Job-level
-`env` can read `secrets`, and step-level `if:` can read `env`, so build and review steps
-gate on the non-secret string `env.HAS_ANY_KEY`. Diff preparation needs only
-the workflow token with repository read access. Only booleans about presence
-live at job scope; the key values are injected into the one step that runs the
-review.
-
-Missing review credentials and provider HTTP failures keep the existing
-advisory policy: the job can be green while the step summary explicitly says
-**not run**. Provider failures also leave an idempotent non-run PR comment.
-These are not clean-review results. Input-limit, snapshot, build, and other
-review failures still fail the job. A successful later review removes a stale
-non-run comment.
-
-The review itself is one **COMMENT** review — a summary body plus inline line
-comments anchored to the PR head SHA. It never approves or requests changes;
-CODEOWNERS stays the human authority.
+The Actions-only App setup above does not describe the managed hosted App.
+Do not disable the webhook on an existing App that also serves hosted mentions.
 
 ## Running a review yourself
 
@@ -254,8 +138,8 @@ token (posts as the App). The `--post` flag is always opt-in.
 - **Review posts as you, not the bot.** The variable or the private-key secret
   is missing/empty; the job silently falls back to `github.token`. Check both
   names character-for-character.
-- **Step summary says "not run".** No model review completed. Check whether
-  this is a fork, review credentials are missing, or the provider failed.
+- **No model review completed.** Read the outcome receipt and the
+  [repair guide](GITHUB_ACTION.md#outcomes-and-recovery).
 - **Account model or provider error.** Set the provider to `codewhale` (or
   unset it), choose the exact model from the account catalog, and check that
   the machine key has the required scopes and the account has a configured
@@ -266,8 +150,7 @@ token (posts as the App). The `--post` flag is always opt-in.
 - **PR head changed or history is unavailable.** Rerun for the current
   revision. The workflow refuses to review an unverified snapshot.
 - **"available from configured provider route(s): ...".** Two provider keys are
-  configured and the model is reachable from both. Set repository variable
-  `CODEWHALE_REVIEW_PROVIDER`.
+  configured and the model is reachable from both. Use an explicit provider in your own Action configuration.
 - **Empty review.** The job fails. Inspect provider errors and output-budget
   receipts; increasing `CODEWHALE_REVIEW_MAX_OUTPUT_TOKENS` may help when
   reasoning exhausted the budget, but does not diagnose the cause by itself.
