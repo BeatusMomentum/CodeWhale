@@ -6,7 +6,7 @@ use codewhale_localization::MessageId;
 
 const SECURITY_POLICY_URL: &str = "https://github.com/Hmbown/CodeWhale/security/policy";
 const FEATURE_URL: &str =
-    "https://github.com/Hmbown/CodeWhale/issues/new?template=feature_request.md";
+    "https://github.com/Hmbown/CodeWhale/issues/new?template=feature_request.yml";
 
 pub(in crate::commands) const COMMAND_INFO: CommandInfo = CommandInfo {
     name: "feedback",
