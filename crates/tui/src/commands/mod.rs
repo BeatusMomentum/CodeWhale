@@ -2091,6 +2091,8 @@ mod tests {
             "title",
             // FEAT-025 session export slice.
             "export",
+            // FEAT-026 completes the session structural-copy slice.
+            "structcopy",
             // FEAT-029 complete debug group, including receipts and mutation.
             "tokens",
             "cost",
