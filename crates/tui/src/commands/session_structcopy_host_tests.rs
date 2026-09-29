@@ -412,3 +412,73 @@ fn structcopy_host_exposes_exact_authority_and_filters_private_data_before_cross
         Some("Golden plan")
     );
 }
+
+#[test]
+fn structcopy_public_workflow_preserves_payload_across_locales_and_transports() {
+    use codewhale_localization::MessageId;
+    let temp = TempDir::new().unwrap();
+    let mut app = app(&temp);
+    seed(&mut app);
+    crate::tools::workflow::structcopy_test_seed_run(
+        temp.path(),
+        "transport-run",
+        "structcopy-baseline-session",
+    );
+    for (selector, kind) in [
+        ("turn 2", MessageId::CmdStructcopyKindTurn),
+        ("tool call-golden", MessageId::CmdStructcopyKindTool),
+        ("plan", MessageId::CmdStructcopyKindPlan),
+        (
+            "workflow transport-run",
+            MessageId::CmdStructcopyKindWorkflow,
+        ),
+    ] {
+        let command = format!("/structcopy {selector}");
+        let expected = dispatch(&mut app, &format!("{command} stdout"));
+        assert_eq!(expected["is_error"], false);
+        let payload = expected["message"].as_str().unwrap();
+        assert_eq!(expected["clipboard"], Value::Null);
+        for &locale in Locale::shipped() {
+            app.ui_locale = locale;
+            let stdout = dispatch(&mut app, &format!("{command} stdout"));
+            assert_eq!(stdout["message"], payload);
+            assert_eq!(stdout["clipboard"], Value::Null);
+            for (clipboard, id) in [
+                (
+                    ClipboardHandler::new(),
+                    MessageId::CmdStructcopyClipboardAccepted,
+                ),
+                (
+                    ClipboardHandler::terminal_only_for_test(),
+                    MessageId::CmdStructcopyClipboardQueued,
+                ),
+            ] {
+                app.clipboard = clipboard;
+                let before_messages = app.api_messages.clone();
+                let before_plan = app.plan_state.try_lock().unwrap().snapshot();
+                let before_session = app.current_session_id.clone();
+                let result = execute(&command, &mut app);
+                assert!(!result.is_error);
+                assert!(result.action.is_none());
+                assert_eq!(
+                    result.message.as_deref(),
+                    Some(
+                        tr(locale, id)
+                            .replace("{kind}", &tr(locale, kind))
+                            .replace("{bytes}", &payload.len().to_string())
+                            .as_str()
+                    )
+                );
+                if id == MessageId::CmdStructcopyClipboardAccepted {
+                    assert_eq!(app.clipboard.last_written_text(), Some(payload));
+                } else {
+                    // Terminal writes are queued; this accessor observes native writes only.
+                    assert!(app.clipboard.last_written_text().is_none());
+                }
+                assert_eq!(app.api_messages, before_messages);
+                assert_eq!(app.plan_state.try_lock().unwrap().snapshot(), before_plan);
+                assert_eq!(app.current_session_id, before_session);
+            }
+        }
+    }
+}
