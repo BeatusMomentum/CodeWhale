@@ -1026,6 +1026,7 @@ impl Engine {
             );
             self.refresh_boot_mcp_catalog(&tool_policy, &mut tool_catalog, &mut active_tool_names)
                 .await;
+            self.record_mcp_server_instructions(&tool_catalog).await;
 
             // R1: the cumulative per-turn wall-clock budget. Checked at the
             // provider-request boundary so a turn that runs out of time stops

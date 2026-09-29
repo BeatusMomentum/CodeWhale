@@ -1657,6 +1657,10 @@ pub struct McpConnection {
     state: ConnectionState,
     config: McpServerConfig,
     server_capabilities: Option<McpServerCapabilities>,
+    /// Sanitized `instructions` from this connection's `initialize` result.
+    /// A reconnect builds a new connection, so guidance never outlives the
+    /// handshake that supplied it.
+    instructions: Option<String>,
     discovery_timeout: Duration,
     read_timeout_secs: u64,
     cancel_token: tokio_util::sync::CancellationToken,
@@ -1927,6 +1931,7 @@ impl McpConnection {
             state: ConnectionState::Connecting,
             config,
             server_capabilities: None,
+            instructions: None,
             discovery_timeout: Duration::from_secs(connect_timeout_secs),
             read_timeout_secs,
             cancel_token,
@@ -2020,6 +2025,10 @@ impl McpConnection {
         );
         self.transport.set_protocol_version(negotiated);
         self.server_capabilities = McpServerCapabilities::from_initialize_response(&response);
+        self.instructions = codewhale_mcp::sanitize_server_instructions(
+            &self.name,
+            result.and_then(|result| result.get("instructions")),
+        );
 
         // Send initialized notification (no id, no response expected)
         self.send(serde_json::json!({
@@ -2475,6 +2484,12 @@ impl McpConnection {
     /// a preceding check silently dispatches to a revoked or altered bundle.
     pub(crate) fn is_transport_ready(&self) -> bool {
         self.state == ConnectionState::Ready && !self.transport.probe_dead()
+    }
+
+    /// Usage guidance the server supplied at `initialize`, sanitized and
+    /// capped (see [`codewhale_mcp::sanitize_server_instructions`]).
+    pub fn instructions(&self) -> Option<&str> {
+        self.instructions.as_deref()
     }
 
     /// Get server config
@@ -4322,6 +4337,92 @@ impl McpPool {
                 .then_some((server.as_str(), tool.name.as_str()))
             })
         }))
+    }
+
+    /// Guidance from connected servers that may be put in front of the model,
+    /// as `(server, instructions)` sorted by server name.
+    ///
+    /// A server qualifies only when it is ready, allowed and still authorized
+    /// (the same gates as [`Self::resolved_tool_servers`]), supplied non-empty
+    /// instructions, and owns at least one enabled tool for which
+    /// `model_visible` holds — the caller passes the turn's final catalog, so
+    /// a server whose tools are all denied by the permission posture
+    /// contributes nothing.
+    #[must_use]
+    pub fn model_server_instructions(
+        &self,
+        model_visible: impl Fn(&str) -> bool,
+    ) -> Vec<(String, String)> {
+        let servers: BTreeSet<String> = self
+            .resolved_tool_servers()
+            .into_iter()
+            .filter(|(tool, _)| model_visible(tool))
+            .map(|(_, server)| server)
+            .collect();
+        servers
+            .into_iter()
+            .filter_map(|server| {
+                let conn = self.connections.get(&server)?;
+                if conn.state() != ConnectionState::Ready {
+                    return None;
+                }
+                let text = conn.instructions()?.to_string();
+                Some((server, text))
+            })
+            .collect()
+    }
+
+    /// Insert a ready, idle connection with the given tools and guidance, for
+    /// tests outside this module that need a pool without spawning a server.
+    #[cfg(test)]
+    pub(crate) fn insert_test_connection(
+        &mut self,
+        server: &str,
+        tools: &[&str],
+        instructions: Option<&str>,
+    ) {
+        struct IdleTransport;
+        #[async_trait::async_trait]
+        impl McpTransport for IdleTransport {
+            async fn send(&mut self, _msg: Vec<u8>) -> Result<()> {
+                Ok(())
+            }
+            async fn recv(&mut self) -> Result<Vec<u8>> {
+                anyhow::bail!("idle test transport has no responses")
+            }
+        }
+        let config: McpServerConfig = serde_json::from_value(serde_json::json!({
+            "command": "codewhale-test-idle-mcp"
+        }))
+        .expect("minimal server config");
+        let conn = McpConnection {
+            name: server.to_string(),
+            transport: Box::new(IdleTransport),
+            tools: tools
+                .iter()
+                .map(|name| McpTool {
+                    name: (*name).to_string(),
+                    description: None,
+                    input_schema: serde_json::json!({"type": "object"}),
+                    annotations: None,
+                })
+                .collect(),
+            resources: Vec::new(),
+            resource_templates: Vec::new(),
+            prompts: Vec::new(),
+            request_id: AtomicU64::new(1),
+            state: ConnectionState::Ready,
+            config,
+            server_capabilities: None,
+            instructions: instructions.map(str::to_string),
+            discovery_timeout: Duration::from_secs(1),
+            read_timeout_secs: 1,
+            cancel_token: tokio_util::sync::CancellationToken::new(),
+            authority_revocation_reason: Arc::new(std::sync::Mutex::new(None)),
+            authority_watch: None,
+            catalog_generation: 0,
+        };
+        self.connections.insert(server.to_string(), conn);
     }
 
     /// Get all discovered tools with server-prefixed names

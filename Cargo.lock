@@ -1193,6 +1193,7 @@ dependencies = [
  "codewhale-hooks",
  "codewhale-lane",
  "codewhale-localization",
+ "codewhale-mcp",
  "codewhale-memory",
  "codewhale-models",
  "codewhale-palette",

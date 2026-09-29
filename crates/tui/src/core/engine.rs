@@ -7519,6 +7519,58 @@ impl Engine {
         }
     }
 
+    /// Record connected MCP servers' `initialize` guidance in session history
+    /// before a model request (KV-cache effect: append-only user history).
+    ///
+    /// Only servers owning at least one tool in `catalog` — the turn's final
+    /// model-facing catalog, already narrowed by the allow/deny posture — are
+    /// included. A new event is appended only when the rendered guidance
+    /// differs from the latest one in history, so an unchanged server set
+    /// never grows the transcript or moves the cached prefix, and guidance a
+    /// compaction dropped is re-recorded. The event is persisted with the
+    /// session and rendered in the transcript, so what the model saw stays
+    /// auditable.
+    pub(super) async fn record_mcp_server_instructions(&mut self, catalog: &[Tool]) {
+        let visible: std::collections::HashSet<&str> = catalog
+            .iter()
+            .filter(|tool| crate::mcp::McpPool::is_mcp_tool(&tool.name))
+            .map(|tool| tool.name.as_str())
+            .collect();
+        let servers = match self.mcp_pool.as_ref() {
+            Some(pool) if !visible.is_empty() => {
+                // Never stall a model request behind a pool busy with a
+                // handshake; the next request boundary records it instead.
+                let Ok(pool) = pool.try_lock() else {
+                    return;
+                };
+                pool.model_server_instructions(|name| visible.contains(name))
+            }
+            _ => Vec::new(),
+        };
+        let previous =
+            self.session.messages.iter().rev().find(|message| {
+                crate::runtime_handoff::is_mcp_server_instructions_message(message)
+            });
+        if servers.is_empty() && previous.is_none() {
+            return;
+        }
+        let message = crate::runtime_handoff::mcp_server_instructions_runtime_message(&servers);
+        if previous == Some(&message) {
+            return;
+        }
+        self.add_session_message(message).await;
+        let status = if servers.is_empty() {
+            "MCP server guidance withdrawn from context".to_string()
+        } else {
+            let names: Vec<&str> = servers.iter().map(|(name, _)| name.as_str()).collect();
+            format!(
+                "MCP server guidance added to context (shown in transcript): {}",
+                names.join(", ")
+            )
+        };
+        let _ = self.tx_event.send(Event::status(status)).await;
+    }
+
     /// Recompose the stable system prompt from current context. When the bytes
     /// actually change (hash differs), record `reason` as the declared cause
     /// so the turn loop's prefix check re-pins the KV-cache prefix under a

@@ -469,6 +469,8 @@ fn validate_initialize_result(
 pub struct ChildProcessMcpClient {
     server_name: String,
     capabilities: Option<ServerCapabilities>,
+    /// Sanitized `initialize` guidance; lives and dies with this connection.
+    instructions: Option<String>,
     connection: Mutex<Connection>,
     request_timeout: Duration,
 }
@@ -638,6 +640,8 @@ impl ChildProcessMcpClient {
             handshake_timeout,
         )?;
         let capabilities = validate_initialize_result(&server_name, &initialize)?;
+        let instructions =
+            crate::sanitize_server_instructions(&server_name, initialize.get("instructions"));
 
         connection
             .send(&json!({
@@ -651,6 +655,7 @@ impl ChildProcessMcpClient {
         Ok(Self {
             server_name,
             capabilities,
+            instructions,
             connection: Mutex::new(connection),
             request_timeout,
         })
@@ -769,6 +774,10 @@ impl McpManagedClient for ChildProcessMcpClient {
 
     fn read_resource(&self, uri: &str) -> Result<Value> {
         self.request("resources/read", json!({ "uri": uri }))
+    }
+
+    fn server_instructions(&self) -> Option<&str> {
+        self.instructions.as_deref()
     }
 }
 
@@ -1722,6 +1731,96 @@ while IFS= read -r _line; do :; done
         assert!(
             format!("{error:#}").contains("without jsonrpc \"2.0\""),
             "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn server_instructions_are_sanitized_trimmed_and_capped() {
+        use crate::{
+            MAX_SERVER_INSTRUCTIONS_BYTES, SERVER_INSTRUCTIONS_TRUNCATED_MARKER,
+            sanitize_server_instructions,
+        };
+        assert_eq!(sanitize_server_instructions("fixture", None), None);
+        assert_eq!(
+            sanitize_server_instructions("fixture", Some(&Value::Null)),
+            None
+        );
+        assert_eq!(
+            sanitize_server_instructions("fixture", Some(&json!("  \n\t "))),
+            None
+        );
+        assert_eq!(
+            sanitize_server_instructions(
+                "fixture",
+                Some(&json!("  Use\u{7} add\r\n\tfor sums.\u{202E}\u{1b}[31m  "))
+            )
+            .as_deref(),
+            Some("Use add\n\tfor sums.[31m"),
+            "control and bidi-override characters go; newline and tab stay"
+        );
+        for non_string in [json!(42), json!(true), json!(["a"]), json!({"text": "a"})] {
+            assert_eq!(
+                sanitize_server_instructions("fixture", Some(&non_string)),
+                None,
+                "non-string instructions must be ignored: {non_string}"
+            );
+        }
+
+        // Multi-byte text is cut on a character boundary with an explicit marker.
+        let long = "é".repeat(MAX_SERVER_INSTRUCTIONS_BYTES);
+        let capped = sanitize_server_instructions("fixture", Some(&json!(long))).unwrap();
+        assert!(capped.len() <= MAX_SERVER_INSTRUCTIONS_BYTES);
+        assert!(capped.ends_with(SERVER_INSTRUCTIONS_TRUNCATED_MARKER));
+        assert!(capped.starts_with("éé"));
+        let exact = "a".repeat(MAX_SERVER_INSTRUCTIONS_BYTES);
+        assert_eq!(
+            sanitize_server_instructions("fixture", Some(&json!(exact.clone()))),
+            Some(exact),
+            "guidance at the cap is kept whole"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn handshake_keeps_string_instructions_and_ignores_non_string_ones() {
+        let script = |instructions: &str| {
+            format!(
+                r#"
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  [ -n "$id" ] || continue
+  printf '{{"jsonrpc":"2.0","id":%s,"result":{{"protocolVersion":"2024-11-05","capabilities":{{"tools":{{}}}},"serverInfo":{{"name":"guided","version":"1"}},"instructions":{instructions}}}}}\n' "$id"
+done
+"#
+            )
+        };
+        let guided = ChildProcessMcpClient::spawn(&config(
+            "/bin/sh",
+            &["-c", &script(r#""  Call add for sums.  ""#)],
+        ))
+        .expect("string instructions complete the handshake");
+        assert_eq!(guided.server_instructions(), Some("Call add for sums."));
+
+        let odd = ChildProcessMcpClient::spawn(&config("/bin/sh", &["-c", &script("42")]))
+            .expect("non-string instructions must not fail the handshake");
+        assert_eq!(odd.server_instructions(), None);
+
+        let mut manager = crate::McpManager::default();
+        manager
+            .register_server(
+                config("/bin/sh", &["guided"]),
+                crate::ToolFilter::default(),
+                Box::new(guided),
+            )
+            .unwrap();
+        assert_eq!(
+            manager.server_instructions(),
+            vec![("probe".to_string(), "Call add for sums.".to_string())]
+        );
+        manager.stop_server("probe").unwrap();
+        assert!(
+            manager.server_instructions().is_empty(),
+            "guidance leaves with the connection it came from"
         );
     }
 

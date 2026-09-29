@@ -40,6 +40,7 @@ codewhale-core = { path = "../core", version = "0.10.1" }
 codewhale-execpolicy = { path = "../execpolicy", version = "0.10.1" }
 codewhale-hooks = { path = "../hooks", version = "0.10.1" }
 codewhale-lane = { path = "../lane", version = "0.10.1" }
+codewhale-mcp = { path = "../mcp", version = "0.10.1" }
 codewhale-models = { path = "../models", version = "0.10.1" }
 codewhale-palette = { path = "../palette", version = "0.10.1" }
 codewhale-paths = { path = "../paths", version = "0.10.1" }

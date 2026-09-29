@@ -2960,6 +2960,7 @@ fn test_connection(transport: Box<dyn McpTransport>) -> McpConnection {
         state: ConnectionState::Ready,
         config: test_server_config(),
         server_capabilities: None,
+        instructions: None,
         discovery_timeout: Duration::from_secs(default_connect_timeout()),
         read_timeout_secs: default_read_timeout(),
         cancel_token: tokio_util::sync::CancellationToken::new(),
@@ -9238,5 +9239,86 @@ fn never_started_server_recovers_with_connect_not_reconnect() {
     assert_eq!(
         dropped.recovery_kind(false),
         Some(McpRecoveryKind::Reconnect)
+    );
+}
+
+#[tokio::test]
+async fn initialize_captures_sanitized_server_instructions() {
+    let transport = ScriptedValueTransport {
+        sent: Arc::new(Mutex::new(Vec::new())),
+        responses: VecDeque::from([json_frame(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "protocolVersion": "2024-11-05",
+                "serverInfo": {"name": "guided", "version": "1.0.0"},
+                "capabilities": {"tools": {}},
+                "instructions": "  Prefer search\u{7} before fetch.\r\n\tKeep queries short.\u{202E}  "
+            }
+        }))]),
+    };
+    let mut conn = test_connection(Box::new(transport));
+    conn.initialize().await.expect("initialize");
+    assert_eq!(
+        conn.instructions(),
+        Some("Prefer search before fetch.\n\tKeep queries short.")
+    );
+
+    let transport = ScriptedValueTransport {
+        sent: Arc::new(Mutex::new(Vec::new())),
+        responses: VecDeque::from([json_frame(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "protocolVersion": "2024-11-05",
+                "serverInfo": {"name": "verbose", "version": "1.0.0"},
+                "capabilities": {"tools": {}},
+                "instructions": "x".repeat(10_000)
+            }
+        }))]),
+    };
+    let mut conn = test_connection(Box::new(transport));
+    conn.initialize().await.expect("initialize");
+    let capped = conn.instructions().expect("capped guidance");
+    assert!(capped.len() <= codewhale_mcp::MAX_SERVER_INSTRUCTIONS_BYTES);
+    assert!(capped.ends_with("[truncated]"));
+}
+
+#[tokio::test]
+async fn initialize_ignores_non_string_instructions_without_failing_the_handshake() {
+    let transport = ScriptedValueTransport {
+        sent: Arc::new(Mutex::new(Vec::new())),
+        responses: VecDeque::from([json_frame(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "protocolVersion": "2024-11-05",
+                "serverInfo": {"name": "odd", "version": "1.0.0"},
+                "capabilities": {"tools": {}},
+                "instructions": {"text": "not a string"}
+            }
+        }))]),
+    };
+    let mut conn = test_connection(Box::new(transport));
+    conn.initialize()
+        .await
+        .expect("non-string instructions must not fail the handshake");
+    assert_eq!(conn.instructions(), None);
+}
+
+#[tokio::test]
+async fn mcp_server_instructions_exclude_servers_whose_tools_are_all_denied() {
+    let mut pool = McpPool::new(McpConfig::default())
+        .with_disallowed_tools(vec!["mcp_denied_write".to_string()]);
+    pool.insert_test_connection("guided", &["search"], Some("Use search."));
+    pool.insert_test_connection("denied", &["write"], Some("Denied guidance."));
+    pool.insert_test_connection("hidden", &["read"], Some("Hidden guidance."));
+    pool.insert_test_connection("silent", &["ping"], None);
+
+    // `hidden` is allowed by the pool but absent from the turn's catalog.
+    let visible = |name: &str| name != "mcp_hidden_read";
+    assert_eq!(
+        pool.model_server_instructions(visible),
+        vec![("guided".to_string(), "Use search.".to_string())]
     );
 }

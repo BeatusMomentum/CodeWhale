@@ -716,6 +716,13 @@ pub fn history_cells_from_message(msg: &Message) -> Vec<HistoryCell> {
             content: display.to_string(),
         }];
     }
+    // MCP server guidance is third-party text the model was shown; keep it
+    // auditable in the transcript rather than hiding it with other handoffs.
+    if let Some(guidance) = crate::runtime_handoff::mcp_server_instructions_display(msg) {
+        return vec![HistoryCell::System {
+            content: format!("MCP server guidance shown to the model:\n{guidance}"),
+        }];
+    }
     // Raw runtime handoffs have live tool/status receipts, not user cells.
     // Keep their model-facing payload intact and filter only the display.
     if crate::runtime_handoff::is_internal_runtime_handoff(msg) {
