@@ -273,6 +273,16 @@ pub enum Event {
         /// Legacy/non-model hosts may still attach a route at start. Model
         /// turns emit it separately at the application dispatch boundary.
         route: Option<TurnRoute>,
+        /// Correlation with the host submission that produced this turn: the
+        /// verbatim echo of the `submission_id` the host stamped on its
+        /// `SendMessage`/`EditLastTurn` op, `None` for every runtime
+        /// self-started turn (idle sub-agent completion, background shell
+        /// wake, goal continuation) and for the composer shell command turn.
+        /// Hosts use the echo to tell their own pending submission's
+        /// `TurnStarted` apart from an autonomous follow-up whose start event
+        /// overtook it in the stream, so a deferred submit-window action is
+        /// only ever consumed by the turn it targets.
+        submission_id: Option<String>,
     },
 
     /// Bounded tool-field projection from a prepared model-client request.

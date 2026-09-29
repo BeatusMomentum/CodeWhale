@@ -216,6 +216,18 @@ pub struct TurnSpec {
     /// Structural input origin. This gates whether the turn may inherit
     /// YOLO/auto-approval authority; user-shaped text is not enough.
     pub provenance: UserInputProvenance,
+    /// Host-supplied correlation token for this submission, echoed verbatim on
+    /// the turn's `Event::TurnStarted`. Hosts that arm submit→`TurnStarted`
+    /// window actions (e.g. a deferred stop replay) use the echo to bind those
+    /// actions to the turn that actually started: every engine self-started
+    /// turn (idle sub-agent completion, background shell wake, goal
+    /// continuation) and the composer shell command turn carry no token, so
+    /// their start cannot be mistaken for a pending submission even when it
+    /// overtakes it in the event stream. `None` for callers that do not
+    /// correlate. The token only survives the in-process engine path: the
+    /// wire op projection and the durable-runtime submission path carry none,
+    /// so hosts submitting over those channels cannot correlate.
+    pub submission_id: Option<String>,
 }
 
 /// Operations that can be submitted to the engine.
@@ -432,7 +444,12 @@ pub enum Op {
     /// Edit the last user message: remove the last user+assistant exchange
     /// from the session, then re-send with the new content.
     #[cfg_attr(not(test), expect(dead_code))]
-    EditLastTurn { new_message: String },
+    EditLastTurn {
+        new_message: String,
+        /// Host-supplied correlation token, echoed on the replayed turn's
+        /// `Event::TurnStarted` (see `TurnSpec::submission_id`).
+        submission_id: Option<String>,
+    },
 
     /// Enable or disable the background advisor watcher for this session.
     /// When enabled, a fire-and-forget background task runs after each turn
