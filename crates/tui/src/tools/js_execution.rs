@@ -16,6 +16,7 @@
 
 use std::ffi::OsString;
 use std::path::Path;
+use std::process::Stdio;
 use std::time::Duration;
 
 use crate::dependencies::ExternalTool;
@@ -111,11 +112,58 @@ pub fn js_execution_tool_definition() -> Tool {
     }
 }
 
+/// Wall-clock budget for one `js_execution` call. Real scripts call slow
+/// APIs, wait on local services, and legitimately run for minutes, so the
+/// budget is deliberately generous — and when it does fire, the interpreter
+/// is killed rather than left running orphaned.
+fn js_execution_timeout() -> Duration {
+    if cfg!(test) {
+        // Short enough that the timeout-kill test finishes quickly, long
+        // enough that the happy-path tests never approach it.
+        Duration::from_secs(5)
+    } else {
+        Duration::from_secs(600)
+    }
+}
+
+/// Kill the interpreter after its timeout fired. Node scripts may spawn
+/// their own children, so on Unix the kill names the whole process group
+/// created by `process_group(0)` at spawn — the same containment
+/// `codex_model_cache` and the extension host give their bounded children —
+/// then the immediate child is killed; the caller reaps it with `wait()`
+/// so no window is left where the tool has failed but Node still runs.
+fn kill_js_child(child: &mut tokio::process::Child) {
+    #[cfg(unix)]
+    if let Some(pid) = child.id().and_then(|id| i32::try_from(id).ok()) {
+        // SAFETY: kill(2) dereferences no pointers; the negative pid names
+        // the process group this child leads.
+        unsafe {
+            libc::kill(-pid, libc::SIGKILL);
+        }
+    }
+    let _ = child.start_kill();
+}
+
+/// Read one piped child stream to EOF, the per-pipe half of
+/// `Child::wait_with_output`. Runs as its own task so the wait is not
+/// blocked by a full pipe buffer.
+async fn drain_to_end(pipe: Option<impl tokio::io::AsyncRead + Unpin>) -> std::io::Result<Vec<u8>> {
+    let mut pipe = match pipe {
+        Some(pipe) => pipe,
+        None => return Ok(Vec::new()),
+    };
+    use tokio::io::AsyncReadExt as _;
+    let mut buf = Vec::new();
+    pipe.read_to_end(&mut buf).await?;
+    Ok(buf)
+}
+
 /// Run the model-provided JavaScript and return the captured
 /// stdout / stderr / return_code payload. Mirrors
-/// `execute_code_execution_tool` exactly — same tempfile pattern,
-/// same 120-second timeout, same error shape — so the surfaces
-/// stay interchangeable from the model's point of view.
+/// `execute_code_execution_tool` — same tempfile pattern, same error
+/// shape — so the surfaces stay interchangeable from the model's point of
+/// view. The wall-clock budget is 600 seconds, and on timeout the child
+/// process group is killed instead of being left running orphaned.
 ///
 /// Tempfile lives only for the duration of this execution; `Drop`
 /// removes it. We use the `.js` extension so any source-map /
@@ -156,10 +204,70 @@ pub async fn execute_js_execution_tool(
         cmd.env("NODE_USE_ENV_PROXY", "1");
     }
 
-    let output = tokio::time::timeout(Duration::from_secs(120), cmd.output())
-        .await
-        .map_err(|_| ToolError::Timeout { seconds: 120 })
-        .and_then(|res| res.map_err(|e| ToolError::execution_failed(e.to_string())))?;
+    // Stdio wiring equivalent to `Command::output()` (stdin / stdout /
+    // stderr), but the child is spawned under our ownership so the timeout
+    // path can kill it: dropping the wait future alone would leave Node
+    // running detached. The child leads its own process group on Unix so
+    // the timeout kill reaches scripts that spawned their own children,
+    // and `kill_on_drop` remains the backstop when the whole tool future
+    // is dropped (turn interrupt).
+    cmd.stdin(Stdio::null());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+    #[cfg(unix)]
+    cmd.process_group(0);
+    cmd.kill_on_drop(true);
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| ToolError::execution_failed(format!("js_execution: {e}")))?;
+
+    // Drain stdout/stderr concurrently with the wait — what
+    // `Command::output()` does internally — so a script blocked on a full
+    // pipe buffer still exits and the timeout stays a real kill rather
+    // than a deadlock.
+    let mut stdout_task = tokio::spawn(drain_to_end(child.stdout.take()));
+    let mut stderr_task = tokio::spawn(drain_to_end(child.stderr.take()));
+
+    let budget = js_execution_timeout();
+    let waited = tokio::time::timeout(budget, async {
+        let status = child
+            .wait()
+            .await
+            .map_err(|e| ToolError::execution_failed(format!("js_execution: {e}")))?;
+        let (stdout, stderr) = match tokio::try_join!(&mut stdout_task, &mut stderr_task) {
+            Ok((Ok(stdout), Ok(stderr))) => (stdout, stderr),
+            Ok(_) => {
+                return Err(ToolError::execution_failed(
+                    "js_execution: failed to capture node output".to_string(),
+                ));
+            }
+            Err(e) => return Err(ToolError::execution_failed(format!("js_execution: {e}"))),
+        };
+        Ok(std::process::Output {
+            status,
+            stdout,
+            stderr,
+        })
+    })
+    .await;
+
+    let output = match waited {
+        Ok(result) => result?,
+        Err(_elapsed) => {
+            // Kill before aborting the drain tasks: the group kill is what
+            // frees the pipes, and the aborts only stop our readers. Reap
+            // the child explicitly so the kill cannot leave a zombie behind
+            // for the lazy orphan reaper (a wait() on a SIGKILLed child
+            // returns promptly and never blocks on the pipes).
+            kill_js_child(&mut child);
+            let _ = child.wait().await;
+            stdout_task.abort();
+            stderr_task.abort();
+            return Err(ToolError::Timeout {
+                seconds: budget.as_secs(),
+            });
+        }
+    };
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -365,6 +473,81 @@ mod tests {
         assert!(
             msg.contains("code"),
             "error must name the missing `code` field; got {msg}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timeout_kills_the_node_child_instead_of_orphaning_it() {
+        if !node_present() {
+            eprintln!("skipping: node not present");
+            return;
+        }
+        let workspace = tempdir().expect("workspace tempdir");
+        let pid_file = workspace.path().join("child_pid");
+        let code = format!(
+            "const fs = require('fs'); \
+             fs.writeFileSync({}, String(process.pid)); \
+             setTimeout(() => {{}}, 60000);",
+            serde_json::json!(pid_file.to_string_lossy())
+        );
+
+        let err = execute_js_execution_tool(&serde_json::json!({ "code": code }), workspace.path())
+            .await
+            .expect_err("a 60s sleep must hit the execution timeout");
+        assert!(
+            matches!(err, ToolError::Timeout { .. }),
+            "expected a timeout error; got {err:?}"
+        );
+
+        // The child reported its pid before sleeping; the timeout must have
+        // killed it (and the tool reaped it), not left it running.
+        let pid: i32 = std::fs::read_to_string(&pid_file)
+            .expect("child must have written its pid")
+            .trim()
+            .parse()
+            .expect("pid file must contain an integer");
+        let mut attempts = 0;
+        while unsafe { libc::kill(pid, 0) } == 0 {
+            assert!(
+                attempts < 50,
+                "node child {pid} is still alive after the timeout kill"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            attempts += 1;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timeout_returns_promptly_even_when_a_grandchild_holds_the_pipes() {
+        if !node_present() {
+            eprintln!("skipping: node not present");
+            return;
+        }
+        let workspace = tempdir().expect("workspace tempdir");
+        // The child spawns a grandchild that inherits stdout/stderr (so the
+        // pipe write ends outlive the child) and then blocks far past the
+        // execution timeout. The budget bounds the whole call: the timeout
+        // fires and the process-group kill takes the grandchild down with
+        // the interpreter instead of the call hanging on pipe EOF.
+        let code = "const { spawn } = require('child_process'); \
+                    const g = spawn('sleep', ['30'], { stdio: ['ignore', 'inherit', 'inherit'] }); \
+                    console.log('grandchild ' + g.pid); \
+                    setTimeout(() => {}, 60000);";
+
+        let started = std::time::Instant::now();
+        let err = execute_js_execution_tool(&serde_json::json!({ "code": code }), workspace.path())
+            .await
+            .expect_err("a 60s sleep must hit the execution timeout");
+        let elapsed = started.elapsed();
+        assert!(
+            matches!(err, ToolError::Timeout { .. }),
+            "expected a timeout error; got {err:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(15),
+            "timeout must return promptly even with a grandchild holding the pipes; took {elapsed:?}"
         );
     }
 }
