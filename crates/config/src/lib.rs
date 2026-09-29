@@ -27,10 +27,10 @@ pub mod setup_state;
 pub mod user_constitution;
 mod xai_credentials;
 pub use config_document::{
-    create_config_document, migrate_legacy_root_config, mutate_config_document,
-    mutate_config_document_with_migration, preview_legacy_root_config,
-    replace_config_document_if_unchanged, set_config_document_value, unset_config_document_value,
-    with_config_write_lock,
+    ConfigDocumentUndo, create_config_document, migrate_legacy_root_config, mutate_config_document,
+    mutate_config_document_undoable, mutate_config_document_with_migration,
+    preview_legacy_root_config, replace_config_document_if_unchanged, set_config_document_value,
+    unset_config_document_value, with_config_write_lock,
 };
 pub use model_reference::{Modality, ModelReferenceCard, ModelReferenceDatabase};
 pub(crate) use provider_defaults::*;

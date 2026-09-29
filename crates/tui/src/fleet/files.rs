@@ -642,6 +642,25 @@ mod unix_publication_tests {
     }
 
     #[test]
+    fn shared_replacement_drops_set_id_bits_and_keeps_owner_only_files_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let workspace = tempfile::tempdir().unwrap();
+        // Set-group-id on a file of one's own group is allowed unprivileged;
+        // the sticky bit on a regular file is not (EFTYPE on macOS).
+        for (name, before, after) in [("tool", 0o6750, 0o750), ("key.pem", 0o600, 0o600)] {
+            let path = workspace.path().join(name);
+            std::fs::write(&path, b"old").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(before)).unwrap();
+            WorkspaceFile::open_shared(workspace.path(), Path::new(name), false)
+                .unwrap()
+                .replace(b"new")
+                .unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), b"new");
+            assert_eq!(mode(&path), after, "{name}");
+        }
+    }
+
+    #[test]
     fn shared_creation_follows_the_umask_for_the_file_and_its_parents() {
         let workspace = tempfile::tempdir().unwrap();
         // std creates files as 0o666 and directories as 0o777 under the

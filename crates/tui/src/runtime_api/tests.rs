@@ -1265,6 +1265,7 @@ async fn build_test_server(
         computer: super::computer_display::ComputerState::from_env(),
         shutdown: overrides.shutdown.clone().unwrap_or_default(),
         git_writes: Arc::new(tokio::sync::Mutex::new(())),
+        provider_switches: Arc::new(tokio::sync::Mutex::new(())),
         compat_stream_test_hook: overrides.compat_stream_test_hook,
     };
     let app = build_router(state);
@@ -14215,6 +14216,40 @@ model = "glm-2"
 }
 
 #[tokio::test]
+async fn switch_provider_that_fails_to_load_removes_the_config_file_it_created() -> Result<()> {
+    let root = std::env::temp_dir().join(format!(
+        "codewhale-switch-provider-load-failure-{}",
+        Uuid::new_v4()
+    ));
+    fs::create_dir_all(&root)?;
+    // No config file yet, and a profile the saved file will not define, so
+    // the reload after the save fails to load.
+    let config_file = root.join("absent-config.toml");
+    let Some((addr, _runtime_threads, handle)) =
+        spawn_test_server_with_config_path_and_profile(config_file.clone(), "missing".into())
+            .await?
+    else {
+        return Ok(());
+    };
+
+    let client = crate::tls::reqwest_client();
+    let (status, body) =
+        post_switch_provider(&client, &addr, "deepseek", &serde_json::json!({})).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    assert!(
+        body.to_string().contains("Failed to reload config"),
+        "{body}"
+    );
+    assert!(
+        !config_file.exists(),
+        "a refused switch must leave no config file behind, not an empty one"
+    );
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn zai_model_update_is_provider_scoped_and_preserves_deepseek_fallback() -> Result<()> {
     let root = std::env::temp_dir().join(format!(
         "codewhale-config-zai-model-scope-{}",
@@ -18799,6 +18834,59 @@ async fn output_cap_compatibility_stream_rejects_before_thread_creation() -> Res
             .is_empty()
     );
     server.abort();
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn workspace_file_put_keeps_the_edited_files_mode() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let tmp = tempfile::tempdir()?;
+    let workspace = tmp.path().join("workspace");
+    fs::create_dir_all(&workspace)?;
+    let (addr, _, handle) = spawn_test_server_with_root_token_mobile_workspace(
+        tmp.path().join("runtime"),
+        tmp.path().join("sessions"),
+        Some("files-token".to_string()),
+        false,
+        workspace.clone(),
+    )
+    .await?
+    .context("files test requires a loopback listener")?;
+    let client = crate::tls::reqwest_client();
+    let base = format!("http://{addr}");
+
+    // An executable script keeps its bits (set-user-id is never carried
+    // over); an owner-only file stays owner-only.
+    for (name, before, after) in [("deploy.sh", 0o4755, 0o755), ("secret.env", 0o600, 0o600)] {
+        let path = workspace.join(name);
+        fs::write(&path, "old\n")?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(before))?;
+        let read: Value = client
+            .get(format!("{base}/v1/workspace/files/read?path={name}"))
+            .bearer_auth("files-token")
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        client
+            .put(format!("{base}/v1/workspace/files"))
+            .bearer_auth("files-token")
+            .json(&json!({
+                "path": name,
+                "content": "new\n",
+                "expected_revision": read["revision"],
+            }))
+            .send()
+            .await?
+            .error_for_status()?;
+        assert_eq!(fs::read_to_string(&path)?, "new\n");
+        let mode = fs::symlink_metadata(&path)?.permissions().mode() & 0o7777;
+        assert_eq!(mode, after, "{name}: {mode:o}");
+    }
+
+    handle.abort();
     Ok(())
 }
 
