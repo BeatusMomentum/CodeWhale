@@ -695,9 +695,6 @@ fn sensitive_keys_are_classified_after_control_and_ansi_normalization() {
     );
 }
 
-/// `unique_object_key` must terminate and preserve every value even when
-/// the key cap leaves no room at all for a base.
-
 #[test]
 fn collision_suffix_reserve_reports_its_own_truncation() {
     let tmpdir = TempDir::new().expect("tempdir");
@@ -817,10 +814,6 @@ fn hostile_content_is_redacted_before_serialization() {
     assert!(json.contains("<workspace>/src/main.rs"), "{json}");
     assert!(parsed(&json).is_object());
 }
-
-/// URLs do not arrive as tidy whitespace-delimited tokens. Wrapped,
-/// embedded, uppercased, and malformed forms must all lose their
-/// userinfo, query, and fragment.
 
 /// Workspace/home paths retain useful labels. Every other absolute POSIX,
 /// drive-letter, and UNC path is removed from copied values.

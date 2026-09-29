@@ -1051,6 +1051,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "codewhale-portable-session-structcopy"
+version = "0.10.1"
+dependencies = [
+ "codewhale-command-contract",
+ "codewhale-secrets",
+ "serde_json",
+ "unicode-segmentation",
+ "url",
+]
+
+[[package]]
 name = "codewhale-protocol"
 version = "0.10.1"
 dependencies = [
@@ -1267,6 +1278,7 @@ dependencies = [
  "unicode-normalization",
  "unicode-segmentation",
  "unicode-width",
+ "url",
  "urlencoding",
  "uuid",
  "wait-timeout",

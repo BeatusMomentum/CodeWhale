@@ -389,10 +389,11 @@ impl PathLabels {
             .iter()
             .map(|form| (form.clone(), "<workspace>"))
             .collect();
-        if let Some(home) = &roots.home {
-            if home.len() > 3 && !workspace_forms.contains(home) {
-                labels.push((home.clone(), "<home>"));
-            }
+        if let Some(home) = &roots.home
+            && home.len() > 3
+            && !workspace_forms.contains(home)
+        {
+            labels.push((home.clone(), "<home>"));
         }
         labels.sort_by(|left, right| {
             right
@@ -726,7 +727,7 @@ fn next_url_start(text: &str) -> Option<usize> {
 fn scrub_url_token(token: &str) -> String {
     let trimmed = token.trim_end_matches(URL_TRAILING_PUNCTUATION);
     let suffix = &token[trimmed.len()..];
-    let Ok(mut parsed) = reqwest::Url::parse(trimmed) else {
+    let Ok(mut parsed) = url::Url::parse(trimmed) else {
         return format!("{URL_OMISSION_MARKER}{suffix}");
     };
     // `set_username`/`set_password` only fail for cannot-be-a-base URLs.
@@ -1146,6 +1147,8 @@ mod tests {
     fn no_labels() -> PathLabels {
         PathLabels { labels: Vec::new() }
     }
+    /// `unique_object_key` must terminate and preserve every value even when
+    /// the key cap leaves no room at all for a base.
     #[test]
     fn key_dedup_terminates_under_a_degenerate_cap() {
         let mut map = serde_json::Map::new();
@@ -1173,6 +1176,9 @@ mod tests {
         assert_eq!(decimal_width(1000), 4);
     }
 
+    /// URLs do not arrive as tidy whitespace-delimited tokens. Wrapped,
+    /// embedded, uppercased, and malformed forms must all lose their
+    /// userinfo, query, and fragment.
     #[test]
     fn urls_lose_userinfo_query_and_fragment_in_hostile_shapes() {
         let labels = no_labels();
