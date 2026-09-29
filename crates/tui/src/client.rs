@@ -1553,7 +1553,9 @@ impl CodewhaleClient {
         if api_provider == ApiProvider::OpencodeGo {
             validate_route(api_provider, &default_model).map_err(anyhow::Error::msg)?;
         }
-        let ((api_key, api_key_source), codex_account_id, subscription_login) =
+        // Plan-limit guidance names the account whose credential this client
+        // actually sends, taken from that credential, never from config.
+        let ((api_key, api_key_source), codex_account_id, subscription_limit_guidance) =
             if api_provider == ApiProvider::OpenaiCodex {
                 // The official endpoint requires Codex OAuth credentials. A custom
                 // endpoint prefers its own configured key, but an explicit
@@ -1563,15 +1565,21 @@ impl CodewhaleClient {
                 // working. Only when no env token exists does the custom endpoint
                 // fall back to the generic provider-scoped key resolver.
                 match config.codex_credentials() {
-                    Ok(credentials) => (
-                        (credentials.access_token, "Codex OAuth login".to_string()),
-                        credentials.account_id,
+                    Ok(credentials) => {
                         // A process token outranks every sign-in, so
                         // re-running the login would not switch accounts.
-                        crate::oauth::credentials_from_env()
-                            .is_none()
-                            .then_some(crate::oauth::OAuthProvider::Chatgpt),
-                    ),
+                        let guidance = crate::oauth::credentials_from_env().is_none().then(|| {
+                            crate::oauth::usage_limit_guidance(
+                                crate::oauth::OAuthProvider::Chatgpt,
+                                credentials.account_label.as_deref(),
+                            )
+                        });
+                        (
+                            (credentials.access_token, "Codex OAuth login".to_string()),
+                            credentials.account_id,
+                            guidance,
+                        )
+                    }
                     Err(error) => {
                         if config.provider_uses_custom_endpoint(ApiProvider::OpenaiCodex) {
                             (config.active_route_api_key_with_source()?, None, None)
@@ -1581,24 +1589,28 @@ impl CodewhaleClient {
                     }
                 }
             } else {
-                let xai_oauth = api_provider == ApiProvider::Xai
-                    && !config.provider_uses_custom_endpoint(ApiProvider::Xai)
-                    && config
-                        .provider_config_for(ApiProvider::Xai)
-                        .and_then(|entry| entry.auth_mode.as_deref())
-                        .is_some_and(crate::oauth::auth_mode_uses_xai_oauth);
-                (
-                    config.active_route_api_key_with_source()?,
-                    None,
-                    xai_oauth.then_some(crate::oauth::OAuthProvider::Xai),
-                )
+                let (api_key, api_key_source) = config.active_route_api_key_with_source()?;
+                // Only the xAI OAuth branch of the resolver yields this
+                // source; an `auth_mode = "oauth"` route that fell through to
+                // an API key gets no sign-in guidance. The label is kept only
+                // when it comes from credentials holding this exact token.
+                let guidance = (api_provider == ApiProvider::Xai
+                    && api_key_source == crate::config::XAI_OAUTH_KEY_SOURCE)
+                    .then(|| {
+                        let label = crate::oauth::get_xai_credentials(config)
+                            .ok()
+                            .filter(|credentials| {
+                                codewhale_secrets::normalize_api_key(&credentials.access_token)
+                                    == api_key
+                            })
+                            .and_then(|credentials| credentials.account_label);
+                        crate::oauth::usage_limit_guidance(
+                            crate::oauth::OAuthProvider::Xai,
+                            label.as_deref(),
+                        )
+                    });
+                ((api_key, api_key_source), None, guidance)
             };
-        let subscription_limit_guidance = subscription_login.map(|login| {
-            crate::oauth::usage_limit_guidance(
-                login,
-                crate::oauth::owned_account_label(login, config).as_deref(),
-            )
-        });
         let model_bound_secret_values =
             Arc::new(configured_model_bound_secret_values(config, &api_key));
         // The opt-out is effective only after an explicit startup confirmation;
@@ -8003,6 +8015,40 @@ mod tests {
         let rate = client.http_error_with_route_context(429, "Too Many Requests", None);
         assert!(rate.is_retryable());
         assert!(!rate.to_string().contains("codewhale auth"), "{rate}");
+    }
+
+    /// `auth_mode = "oauth"` alone does not mean a sign-in made the request:
+    /// with no usable OAuth credential the resolver falls through to the API
+    /// key, and a credit error must not blame (or name) a sign-in.
+    #[test]
+    fn xai_oauth_mode_that_fell_back_to_an_api_key_gets_no_sign_in_guidance() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _env = crate::test_support::lock_test_env();
+        let home = tempfile::tempdir().expect("temp home");
+        let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", home.path());
+        let _key = crate::test_support::EnvVarGuard::remove("XAI_API_KEY");
+        let _base = crate::test_support::EnvVarGuard::remove("XAI_BASE_URL");
+        let config = Config {
+            provider: Some("xai".to_string()),
+            providers: Some(ProvidersConfig {
+                xai: ProviderConfig {
+                    api_key: Some("xai-fallback-key-1234567890".to_string()),
+                    auth_mode: Some("oauth".to_string()),
+                    ..ProviderConfig::default()
+                },
+                ..ProvidersConfig::default()
+            }),
+            ..Config::default()
+        };
+        let client = CodewhaleClient::new(&config).expect("xai client");
+        assert_ne!(client.api_key_source, crate::config::XAI_OAUTH_KEY_SOURCE);
+        assert_eq!(client.subscription_limit_guidance, None);
+        let body =
+            r#"{"error":{"code":"credit_balance_exhausted","message":"credit balance exhausted"}}"#;
+        let error = client
+            .http_error_with_route_context(402, body, None)
+            .to_string();
+        assert!(!error.contains("codewhale auth"), "{error}");
     }
 
     fn concentrate_client(server: &MockServer, model: &str) -> CodewhaleClient {

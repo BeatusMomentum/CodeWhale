@@ -3593,9 +3593,11 @@ async fn apply_codewhale_owned_login(
         Ok(activation) => {
             // The account line goes to the transcript: the status line is
             // overwritten by the route summary once the switch lands.
-            app.add_message(HistoryCell::System {
-                content: activation.summary(),
-            });
+            let content = match activation.env_override_warning() {
+                Some(warning) => format!("{}\n{warning}", activation.summary()),
+                None => activation.summary(),
+            };
+            app.add_message(HistoryCell::System { content });
             app.status_message = Some(format!(
                 "{status_prefix}; activated {} via {}",
                 codewhale_config::quote_os_path(&activation.auth_path),

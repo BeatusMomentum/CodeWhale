@@ -232,6 +232,15 @@ fn chatgpt_usage_limit_is_quota_and_carries_account_guidance() {
     );
     assert!(rendered.contains("a@example.com (plus)"), "{rendered}");
     assert!(rendered.contains("`codewhale auth chatgpt`"), "{rendered}");
+
+    // Same backend branch: the signed-in plan does not include Codex.
+    // Retrying cannot help, so it must not be a retryable rate limit.
+    let raw =
+        r#"{"error":{"type":"usage_not_included","message":"Your plan does not include Codex"}}"#;
+    let safe = sanitize_http_error_body(Some("OpenAI Codex"), 429, raw);
+    let error = LlmError::from_http_response(429, &safe);
+    assert!(!error.is_retryable());
+    assert!(matches!(error, LlmError::QuotaExhausted(_)), "{error:?}");
 }
 
 #[test]

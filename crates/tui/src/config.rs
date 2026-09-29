@@ -7072,7 +7072,7 @@ impl Config {
             && crate::oauth::credentials_present(crate::oauth::OAuthProvider::Xai, self)
         {
             return crate::oauth::get_xai_access_token(self)
-                .map(|key| (key, "xAI OAuth login".to_string()));
+                .map(|key| (key, XAI_OAUTH_KEY_SOURCE.to_string()));
         }
 
         // OpenAI Codex (ChatGPT) can read an existing Codex CLI OAuth login
@@ -12395,6 +12395,10 @@ pub fn has_api_key_for(config: &Config, provider: ApiProvider) -> bool {
     credential_resolve::resolve_credential_source(config, provider).is_present()
 }
 
+/// Key-source label the resolver gives a key minted by xAI OAuth (owned
+/// sign-in or consented Grok CLI import). Client guidance matches on it.
+pub(crate) const XAI_OAUTH_KEY_SOURCE: &str = "xAI OAuth login";
+
 impl Config {
     /// Resolve one coherent Codex OAuth snapshot. The bearer and account id
     /// must come from the same secure file handle; opening the external JSON a
@@ -12415,6 +12419,7 @@ impl Config {
             return Ok(crate::oauth::CodexCredentials {
                 access_token: owned.access_token,
                 account_id: owned.account_id,
+                account_label: owned.account_label,
             });
         }
         let path = crate::oauth::auth_file_path();

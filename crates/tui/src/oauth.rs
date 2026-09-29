@@ -32,6 +32,10 @@ use crate::config::Config;
 struct AuthTokens {
     access_token: Option<String>,
     account_id: Option<String>,
+    /// Read only to derive the display label of the account this file signs
+    /// in as; never forwarded.
+    #[serde(default)]
+    id_token: Option<String>,
 }
 
 /// Top-level structure of Codex CLI's `auth.json`.
@@ -46,6 +50,9 @@ struct CodexAuthFile {
 pub struct CodexCredentials {
     pub access_token: String,
     pub account_id: Option<String>,
+    /// Display label (email, plan) of the account these exact credentials
+    /// sign in as, from the same file read. `None` for an env token.
+    pub account_label: Option<String>,
 }
 
 /// JWT claims subset for expiry extraction.
@@ -133,6 +140,10 @@ fn load_credentials(grant: &ExternalCredentialReadGrant) -> Result<Option<CodexC
     Ok(Some(CodexCredentials {
         access_token,
         account_id: tokens.account_id,
+        account_label: tokens
+            .id_token
+            .as_deref()
+            .and_then(account_label_from_id_token),
     }))
 }
 
@@ -150,6 +161,7 @@ pub fn credentials_from_env() -> Option<CodexCredentials> {
         .map(|access_token| CodexCredentials {
             access_token,
             account_id: codex_account_id_env(),
+            account_label: None,
         })
 }
 
@@ -279,6 +291,9 @@ pub struct OAuthEnvOverrides {
     pub client_id_vars: &'static [&'static str],
     pub scope_vars: &'static [&'static str],
     pub no_browser_var: &'static str,
+    /// Set (to anything) to drop [`OAuthProviderParams::account_choice_extras`]
+    /// from the authorize URL, in case the issuer rejects them.
+    pub no_account_prompt_var: Option<&'static str>,
 }
 
 /// Everything about one provider's OAuth login that is not logic.
@@ -306,6 +321,10 @@ pub struct OAuthProviderParams {
     /// Extra authorize-endpoint parameters beyond the standard OAuth set,
     /// sent verbatim so the issuer sees exactly who is calling.
     pub authorize_extras: &'static [(&'static str, &'static str)],
+    /// Authorize parameters that ask the issuer to let the user choose the
+    /// account instead of reusing the browser's session. Sent unless
+    /// [`OAuthEnvOverrides::no_account_prompt_var`] is set.
+    pub account_choice_extras: &'static [(&'static str, &'static str)],
     /// Honest client identity for issuers that require one (ChatGPT's
     /// `originator`). Never impersonate another CLI.
     pub originator: Option<&'static str>,
@@ -321,6 +340,9 @@ pub struct OAuthProviderParams {
     pub loopback_ports: &'static [u16],
     /// The command that re-runs this provider's login, for error guidance.
     pub relogin_hint: &'static str,
+    /// The slash command that re-runs this login inside a running session
+    /// and switches that session's live client.
+    pub session_login_hint: &'static str,
     /// What to tell the user when every callback port is taken.
     pub callback_conflict_hint: &'static str,
 }
@@ -337,6 +359,7 @@ pub const XAI_OAUTH_PARAMS: OAuthProviderParams = OAuthProviderParams {
         client_id_vars: &["GROK_OIDC_CLIENT_ID", "XAI_OIDC_CLIENT_ID"],
         scope_vars: &["GROK_OIDC_SCOPES", "XAI_OIDC_SCOPES"],
         no_browser_var: "CODEWHALE_XAI_OAUTH_NO_BROWSER",
+        no_account_prompt_var: None,
     },
     device_code_path: Some("oauth2/device/code"),
     authorize_path: None,
@@ -344,11 +367,13 @@ pub const XAI_OAUTH_PARAMS: OAuthProviderParams = OAuthProviderParams {
     discover_endpoints: true,
     device_poll_floor_secs: 30,
     authorize_extras: &[],
+    account_choice_extras: &[],
     originator: None,
     revoke_path: None,
     callback_path: "",
     loopback_ports: &[],
     relogin_hint: "codewhale auth xai-device",
+    session_login_hint: "/auth xai-device",
     callback_conflict_hint: "",
 };
 
@@ -364,22 +389,26 @@ pub const CHATGPT_OAUTH_PARAMS: OAuthProviderParams = OAuthProviderParams {
         client_id_vars: &["CODEWHALE_CHATGPT_OAUTH_CLIENT_ID"],
         scope_vars: &[],
         no_browser_var: "CODEWHALE_CHATGPT_OAUTH_NO_BROWSER",
+        no_account_prompt_var: Some("CODEWHALE_CHATGPT_OAUTH_NO_PROMPT"),
     },
     device_code_path: None,
     authorize_path: Some("oauth/authorize"),
     token_path: "oauth/token",
     discover_endpoints: false,
     device_poll_floor_secs: 30,
+    authorize_extras: &[("id_token_add_organizations", "true")],
     // `prompt=login` (OIDC Core 1.0 §3.1.2.1) asks the issuer to re-prompt
     // instead of silently reusing whichever ChatGPT account the browser is
     // already signed into, so an explicit `codewhale auth chatgpt` can pick a
     // different account. Every browser login here is user-initiated; refresh
-    // never visits the authorize endpoint.
-    authorize_extras: &[("id_token_add_organizations", "true"), ("prompt", "login")],
+    // never visits the authorize endpoint. CODEWHALE_CHATGPT_OAUTH_NO_PROMPT
+    // drops it should the issuer ever refuse it.
+    account_choice_extras: &[("prompt", "login")],
     revoke_path: Some("api/accounts/oauth/revoke"),
     callback_path: "/auth/callback",
     loopback_ports: &[1455, 1457],
     relogin_hint: "codewhale auth chatgpt",
+    session_login_hint: "/auth chatgpt",
     callback_conflict_hint: "Stop the process holding that port, or import Codex CLI credentials with `codewhale auth external-consent`.",
 };
 
@@ -858,6 +887,7 @@ pub(crate) fn device_code_login_with(
     eprintln!("{display_name} device-code login");
     eprintln!("  Open:  {verify}");
     eprintln!("  Code:  {user_code}");
+    eprintln!("{}", account_choice_hint(display_name));
     eprintln!("Waiting for approval in the browser… (Ctrl+C to abort)");
     if inputs.open_browser
         && let Err(err) = webbrowser::open(&verify)
@@ -1185,6 +1215,15 @@ pub fn build_authorize_url(
     for (key, value) in params.authorize_extras {
         url.query_pairs_mut().append_pair(key, value);
     }
+    let account_prompt_disabled = params
+        .env
+        .no_account_prompt_var
+        .is_some_and(|var| std::env::var_os(var).is_some());
+    if !account_prompt_disabled {
+        for (key, value) in params.account_choice_extras {
+            url.query_pairs_mut().append_pair(key, value);
+        }
+    }
     Ok(url.to_string())
 }
 
@@ -1509,10 +1548,7 @@ pub(crate) fn pkce_login_with(
     let request = start_auth_request_on(&listeners, params, inputs)?;
     eprintln!("{display_name} sign-in (PKCE)");
     eprintln!("  Open:  {}", request.authorize_url);
-    eprintln!(
-        "Sign in with the {display_name} account Codewhale should use. If the browser skips \
-         straight past account choice, open the URL above in a private window instead."
-    );
+    eprintln!("{}", account_choice_hint(display_name));
     eprintln!("Waiting for the browser callback… (Ctrl+C to abort)");
     if inputs.open_browser
         && let Err(err) = webbrowser::open(&request.authorize_url)
@@ -1676,6 +1712,8 @@ fn redacted(present: bool) -> &'static str {
 pub struct OwnedOAuthCredentials {
     pub access_token: String,
     pub account_id: Option<String>,
+    /// Display label (email, plan) of the entry these credentials came from.
+    pub account_label: Option<String>,
     #[allow(dead_code, reason = "read by provider routes and tests as needed")]
     pub refresh_token: Option<String>,
     #[allow(dead_code, reason = "diagnostic surface only")]
@@ -1695,9 +1733,8 @@ pub struct OAuthActivation {
     pub provider: OAuthProvider,
     /// Non-secret label (email, plan) of the account just signed in.
     pub account_label: Option<String>,
-    /// `Some` when this login replaced an existing Codewhale-owned sign-in
-    /// for the same issuer and client; the inner value is that account's
-    /// label when it had one.
+    /// `Some` when this login replaced an existing Codewhale-owned sign-in;
+    /// the inner value is that account's label when it had one.
     pub replaced: Option<Option<String>>,
 }
 
@@ -1717,12 +1754,33 @@ impl OAuthActivation {
                     " Replaced the previous Codewhale {name} sign-in ({previous})."
                 ));
             }
+            Some(Some(_)) => {
+                summary.push_str(&format!(
+                    " This is the same account as before; to use another {name} account, \
+                     sign out of it in the browser (or use a private window) and sign in again."
+                ));
+            }
             Some(None) => {
                 summary.push_str(&format!(" Replaced the previous Codewhale {name} sign-in."));
             }
             _ => {}
         }
         summary
+    }
+
+    /// A process token outranks every ChatGPT sign-in, so a new login does
+    /// not change the account requests use while one is set. Names the
+    /// variable, never its value.
+    #[must_use]
+    pub fn env_override_warning(&self) -> Option<String> {
+        if self.provider != OAuthProvider::Chatgpt || credentials_from_env().is_none() {
+            return None;
+        }
+        Some(
+            "OPENAI_CODEX_ACCESS_TOKEN or CODEX_ACCESS_TOKEN is set in this environment and \
+             outranks this sign-in; requests keep using that token's account until you unset it."
+                .to_string(),
+        )
     }
 }
 
@@ -1877,6 +1935,7 @@ fn credentials_from_entry(
     OwnedOAuthCredentials {
         access_token,
         account_id: entry.account_id.clone(),
+        account_label: entry.account_label(),
         refresh_token: entry.refresh_token.clone(),
         expires_at: entry.expires_at.clone(),
         issuer: entry
@@ -1970,12 +2029,22 @@ fn account_id_from_id_token(token: &str) -> Option<String> {
 /// Longest email the label keeps (RFC 5321 path limit); plan names are short.
 const ACCOUNT_EMAIL_MAX_CHARS: usize = 254;
 const ACCOUNT_PLAN_MAX_CHARS: usize = 32;
+/// Leading characters of a ChatGPT account id shown to tell two workspaces
+/// on one email apart.
+const ACCOUNT_ID_PREFIX_CHARS: usize = 8;
+/// ChatGPT plans that belong to one person, where email and plan already
+/// identify the account. Any other plan (team, business, enterprise, edu,
+/// or one this list has not seen) is a workspace a person may hold several
+/// of under one email, so its label carries an account-id prefix.
+const PERSONAL_CHATGPT_PLANS: &[&str] = &["free", "go", "plus", "pro"];
 
-/// Non-secret account label (`email` or `email (plan)`) from an ID token's
-/// claims, decoded locally. The signature is not verified: the label is for
-/// display only and never authorizes anything. Claim text is bounded and
-/// stripped of control characters so a hostile token cannot smuggle terminal
-/// escapes into status output. `None` when no usable email claim exists.
+/// Non-secret account label from an ID token's claims, decoded locally:
+/// `email`, `email (plan)`, or for a workspace plan
+/// `email (plan, workspace 1a2b3c4d)`. The signature is not verified: the
+/// label is for display only and never authorizes anything. Claim text is
+/// bounded and stripped of control characters so a hostile token cannot
+/// smuggle terminal escapes into status output. `None` when no usable email
+/// claim exists.
 #[must_use]
 pub fn account_label_from_id_token(token: &str) -> Option<String> {
     let payload = jwt_payload(token)?;
@@ -2003,9 +2072,25 @@ pub fn account_label_from_id_token(token: &str) -> Option<String> {
             .and_then(|auth| auth.get("chatgpt_plan_type")),
         ACCOUNT_PLAN_MAX_CHARS,
     );
-    Some(match plan {
-        Some(plan) => format!("{email} ({plan})"),
-        None => email,
+    let workspace = plan
+        .as_deref()
+        .filter(|plan| {
+            !PERSONAL_CHATGPT_PLANS
+                .iter()
+                .any(|personal| plan.eq_ignore_ascii_case(personal))
+        })
+        .and_then(|_| account_id_from_id_token(token))
+        .map(|id| {
+            id.chars()
+                .filter(char::is_ascii_alphanumeric)
+                .take(ACCOUNT_ID_PREFIX_CHARS)
+                .collect::<String>()
+        })
+        .filter(|prefix| !prefix.is_empty());
+    Some(match (plan, workspace) {
+        (Some(plan), Some(workspace)) => format!("{email} ({plan}, workspace {workspace})"),
+        (Some(plan), None) => format!("{email} ({plan})"),
+        (None, _) => email,
     })
 }
 
@@ -2018,51 +2103,85 @@ impl OwnedAuthEntry {
     }
 }
 
+/// Whether an owned entry can still produce a bearer: a fresh access token,
+/// or a refresh token to mint one. The same test gates [`credentials_valid`]
+/// and the account label, so a label is never shown for an entry the
+/// runtime would refuse.
+fn owned_entry_is_usable(entry: &OwnedAuthEntry) -> bool {
+    entry_access_token_is_fresh(entry)
+        || entry
+            .refresh_token
+            .as_deref()
+            .is_some_and(|token| !token.trim().is_empty())
+}
+
 /// Account label of the Codewhale-owned sign-in stored in one generation
 /// file. Reads only that file; never refreshes, writes, or touches the
-/// network. `None` when the generation is invalid, missing, or its ID token
-/// carries no email claim.
-#[must_use]
+/// network. `Ok(None)` when the usable entry's ID token carries no email;
+/// `Err` (a fixed, token-free reason) when the generation name is invalid,
+/// the file is missing or unreadable, or it holds no usable sign-in.
 pub fn owned_account_label_for_generation(
     provider: OAuthProvider,
     generation: &str,
-) -> Option<String> {
-    let path = provider.generation_path(generation).ok()?;
+) -> Result<Option<String>> {
+    let path = provider
+        .generation_path(generation)
+        .map_err(|_| anyhow::anyhow!("invalid generation pointer"))?;
     owned_account_label_at(provider, &path)
 }
 
-fn owned_account_label_at(provider: OAuthProvider, path: &Path) -> Option<String> {
-    let mut file = load_owned_auth_file(path).ok()??;
-    select_entry(provider, &mut file)?.1.account_label()
+fn owned_account_label_at(provider: OAuthProvider, path: &Path) -> Result<Option<String>> {
+    let mut file = load_owned_auth_file(path)
+        .map_err(|_| anyhow::anyhow!("sign-in file is unreadable"))?
+        .ok_or_else(|| anyhow::anyhow!("sign-in file is missing"))?;
+    let (_, entry) = select_entry(provider, &mut file)
+        .filter(|(_, entry)| owned_entry_is_usable(entry))
+        .ok_or_else(|| anyhow::anyhow!("sign-in file holds no usable sign-in"))?;
+    Ok(entry.account_label())
 }
 
 /// Account label of the Codewhale-owned sign-in the config points at (the
-/// legacy xAI file when no generation is configured).
+/// legacy xAI file when no generation is configured). `None` whenever that
+/// sign-in is unusable, so a stale entry never names an account.
 #[must_use]
 pub fn owned_account_label(provider: OAuthProvider, config: &Config) -> Option<String> {
-    match configured_owned_auth_file_path(provider, config) {
-        Ok(Some(path)) => owned_account_label_at(provider, &path),
+    let path = match configured_owned_auth_file_path(provider, config) {
+        Ok(Some(path)) => path,
         Ok(None) if provider == OAuthProvider::Xai => {
-            owned_account_label_at(provider, &codewhale_config::legacy_xai_oauth_path().ok()?)
+            codewhale_config::legacy_xai_oauth_path().ok()?
         }
-        _ => None,
-    }
+        _ => return None,
+    };
+    owned_account_label_at(provider, &path).ok().flatten()
 }
 
-/// What to tell someone whose subscription account ran out of usage: which
-/// account is signed in (label only, never a token) and the exact command
-/// that signs in with a different one.
+/// What to tell someone whose subscription sign-in hit a plan limit: which
+/// account made the request (label only, never a token) and how to sign in
+/// with a different one, both inside a running session and from a shell.
+/// A shell login does not reach a session that is already open, so the
+/// shell route says to restart.
 #[must_use]
 pub fn usage_limit_guidance(provider: OAuthProvider, account_label: Option<&str>) -> String {
     let params = oauth_provider_params(provider);
     let name = params.display_name;
-    let hint = params.relogin_hint;
-    let switch =
-        format!("To continue with a different {name} account, run `{hint}` and choose it.");
+    let switch = format!(
+        "To continue with a different {name} account, run `{}` in Codewhale, or `{}` in a shell and then restart open Codewhale sessions.",
+        params.session_login_hint, params.relogin_hint
+    );
     match account_label {
-        Some(label) => format!("This limit belongs to the {name} account {label}. {switch}"),
+        Some(label) => format!("This request used the {name} account {label}. {switch}"),
         None => switch,
     }
+}
+
+/// Printed beside a login URL: the issuer signs in whichever account the
+/// browser already holds unless the user picks another.
+fn account_choice_hint(display_name: &str) -> String {
+    format!(
+        "Approve with the {display_name} account Codewhale should use. If the page is already \
+         signed in to a different account, sign out there first or open the URL above in a \
+         private window."
+    )
 }
 
 fn jwt_payload(token: &str) -> Option<Value> {
@@ -2169,11 +2288,7 @@ pub fn credentials_valid(provider: OAuthProvider, config: &Config) -> bool {
     if let Ok(Some(path)) = configured_owned_auth_file_path(provider, config)
         && let Ok(Some(mut file)) = load_owned_auth_file(&path)
         && let Some((_, entry)) = select_entry(provider, &mut file)
-        && (entry_access_token_is_fresh(&entry)
-            || entry
-                .refresh_token
-                .as_deref()
-                .is_some_and(|token| !token.trim().is_empty()))
+        && owned_entry_is_usable(&entry)
     {
         return true;
     }
@@ -2191,11 +2306,7 @@ pub fn credentials_valid(provider: OAuthProvider, config: &Config) -> bool {
         if let Ok(path) = codewhale_config::legacy_xai_oauth_path()
             && let Ok(Some(mut file)) = load_owned_auth_file(&path)
             && let Some((_, entry)) = select_entry(provider, &mut file)
-            && (entry_access_token_is_fresh(&entry)
-                || entry
-                    .refresh_token
-                    .as_deref()
-                    .is_some_and(|token| !token.trim().is_empty()))
+            && owned_entry_is_usable(&entry)
         {
             return true;
         }
@@ -2491,12 +2602,12 @@ fn activate_login_locked(
             }
             None => None,
         };
-        // Carry the previous generation's other scopes forward. A valid
-        // pointer whose file is gone (interrupted revocation, external
-        // cleanup) must not brick login: only a successful activation can
-        // ever rewrite the pointer, so treat the missing generation like a
-        // fresh start instead of failing (#5032).
-        let mut file = match previous_owned_name.as_deref() {
+        // Read the previous generation only to name the account it signed
+        // in as. A valid pointer whose file is gone (interrupted revocation,
+        // external cleanup) must not brick login: only a successful
+        // activation can ever rewrite the pointer, so treat the missing
+        // generation like a fresh start instead of failing (#5032).
+        let mut previous_file = match previous_owned_name.as_deref() {
             Some(name) => load_owned_auth_file_from_store(store, name)?.unwrap_or_else(|| {
                 tracing::warn!(
                     target: "codewhale::oauth",
@@ -2508,14 +2619,16 @@ fn activate_login_locked(
             None => BTreeMap::new(),
         };
         let scope = format!("{}::{}", pending.issuer, pending.client_id);
-        // A new login replaces this scope's entry outright. Merging into the
-        // old entry would let a previous account's refresh token, id token or
-        // account id survive whenever the new grant omits one, pairing two
-        // accounts' material in one credential.
-        let replaced = file
-            .remove(&scope)
-            .filter(entry_has_usable_secret)
-            .map(|entry| entry.account_label());
+        // A new login replaces the whole sign-in: the new generation holds
+        // only this entry. Merging into the old entry would let a previous
+        // account's refresh token, id token or account id survive whenever
+        // the new grant omits one; carrying other scopes forward would let
+        // an older account's entry under a differently spelled issuer
+        // outrank this login in `select_entry` and keep its refresh token
+        // on disk. `replaced` names the entry the runtime was actually using.
+        let replaced =
+            select_entry(provider, &mut previous_file).map(|(_, entry)| entry.account_label());
+        let mut file = AuthFile::new();
         let mut entry = OwnedAuthEntry {
             access_token: None,
             refresh_token: None,
@@ -3922,6 +4035,8 @@ mod tests {
 
     #[test]
     fn authorize_url_is_honest_originator_and_pkce() {
+        let _lock = crate::test_support::lock_test_env();
+        let _prompt = crate::test_support::EnvVarGuard::remove("CODEWHALE_CHATGPT_OAUTH_NO_PROMPT");
         let pkce = PkceChallenge {
             verifier: "verifier".into(),
             challenge: "challenge".into(),
@@ -3952,6 +4067,22 @@ mod tests {
             .collect();
         assert_eq!(query.get("prompt").map(String::as_str), Some("login"));
         assert_eq!(url.matches("prompt=").count(), 1, "{url}");
+
+        // Opt-out, should the issuer ever refuse the parameter.
+        let _opt_out =
+            crate::test_support::EnvVarGuard::set("CODEWHALE_CHATGPT_OAUTH_NO_PROMPT", "1");
+        let url = build_authorize_url(
+            chatgpt(),
+            CHATGPT_OAUTH_ISSUER,
+            CHATGPT_OAUTH_CLIENT_ID,
+            CHATGPT_OAUTH_SCOPE,
+            "http://localhost:1455/auth/callback",
+            "state-1",
+            &pkce,
+        )
+        .expect("static issuer parses");
+        assert!(!url.contains("prompt="), "{url}");
+        assert!(url.contains("id_token_add_organizations=true"), "{url}");
     }
 
     fn id_token(claims: &serde_json::Value) -> String {
@@ -3978,6 +4109,16 @@ mod tests {
         assert_eq!(
             account_label_from_id_token(&profile).as_deref(),
             Some("b@example.com")
+        );
+        // A workspace plan names its account-id prefix: one email can hold
+        // several workspaces, and email + plan alone would read the same.
+        let team = id_token(&serde_json::json!({
+            "email": "a@corp.com",
+            "https://api.openai.com/auth": {"chatgpt_plan_type": "team", "chatgpt_account_id": "1a2b3c4d-5e6f-7081-92a3-b4c5d6e7f809"},
+        }));
+        assert_eq!(
+            account_label_from_id_token(&team).as_deref(),
+            Some("a@corp.com (team, workspace 1a2b3c4d)")
         );
         // xAI: plain OIDC email, no plan claim.
         let xai = id_token(&serde_json::json!({"email": "grok@example.com", "sub": "u1"}));
@@ -4023,8 +4164,19 @@ mod tests {
         let chatgpt = usage_limit_guidance(OAuthProvider::Chatgpt, Some("a@example.com (plus)"));
         assert!(chatgpt.contains("a@example.com (plus)"), "{chatgpt}");
         assert!(chatgpt.contains("`codewhale auth chatgpt`"), "{chatgpt}");
+        // A running session does not see a shell login: the in-session
+        // command comes first, and the shell route says to restart.
+        assert!(
+            chatgpt.contains("`/auth chatgpt` in Codewhale"),
+            "{chatgpt}"
+        );
+        assert!(
+            chatgpt.contains("restart open Codewhale sessions"),
+            "{chatgpt}"
+        );
         let xai = usage_limit_guidance(OAuthProvider::Xai, None);
         assert!(xai.contains("`codewhale auth xai-device`"), "{xai}");
+        assert!(xai.contains("`/auth xai-device`"), "{xai}");
         assert!(!xai.contains("None"), "{xai}");
     }
 
@@ -4091,7 +4243,9 @@ mod tests {
             .and_then(|name| name.to_str())
             .expect("generation name");
         assert_eq!(
-            owned_account_label_for_generation(OAuthProvider::Chatgpt, generation).as_deref(),
+            owned_account_label_for_generation(OAuthProvider::Chatgpt, generation)
+                .expect("usable sign-in")
+                .as_deref(),
             Some("b@example.com")
         );
         let mut config = Config::default();
@@ -4101,10 +4255,90 @@ mod tests {
             Some("b@example.com")
         );
         // An invalid generation name never resolves to a path.
-        assert_eq!(
-            owned_account_label_for_generation(OAuthProvider::Chatgpt, "../auth.json"),
-            None
+        assert!(
+            owned_account_label_for_generation(OAuthProvider::Chatgpt, "../auth.json").is_err()
         );
+    }
+
+    /// A login replaces the whole sign-in, not just its own scope: an older
+    /// account's entry under a differently spelled issuer must neither
+    /// outrank the new login nor keep its refresh token on disk.
+    #[test]
+    fn relogin_drops_other_scopes_and_names_the_account_it_replaced() {
+        let _lock = crate::test_support::lock_test_env();
+        let home = tempfile::tempdir().expect("temp home");
+        let root = home.path().canonicalize().expect("canonical home");
+        let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", &root);
+        let config_path = root.join("config.toml");
+        std::fs::write(&config_path, "").expect("empty config");
+        let token_a = id_token(&serde_json::json!({"email": "a@example.com"}));
+        let mut pending_a = pending_login_with_id_token_for_test(
+            OAuthProvider::Chatgpt,
+            "access-a",
+            "refresh-a",
+            Some(&token_a),
+        );
+        // '/' sorts before ':', so this scope comes first in the file.
+        pending_a.issuer = format!("{CHATGPT_OAUTH_ISSUER}/");
+        activate_login(pending_a, Some(&config_path), None).expect("login A");
+
+        let token_b = id_token(&serde_json::json!({"email": "b@example.com"}));
+        let second = activate_login(
+            pending_login_with_id_token_for_test(
+                OAuthProvider::Chatgpt,
+                "access-b",
+                "refresh-b",
+                Some(&token_b),
+            ),
+            Some(&config_path),
+            None,
+        )
+        .expect("login B");
+        assert_eq!(second.replaced, Some(Some("a@example.com".to_string())));
+        let persisted = std::fs::read_to_string(&second.auth_path).expect("generation");
+        assert!(!persisted.contains("refresh-a"), "{persisted}");
+        assert!(!persisted.contains("access-a"), "{persisted}");
+        let generation = second
+            .auth_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("generation name");
+        let mut config = Config::default();
+        config.mark_codewhale_owned_chatgpt_oauth(generation.to_string());
+        assert_eq!(
+            owned_account_label(OAuthProvider::Chatgpt, &config).as_deref(),
+            Some("b@example.com")
+        );
+    }
+
+    /// The label follows the same usability test as the runtime: an entry
+    /// with an expired access token and no refresh token names no account.
+    #[test]
+    fn stale_owned_entry_names_no_account() {
+        let _lock = crate::test_support::lock_test_env();
+        let home = tempfile::tempdir().expect("temp home");
+        let root = home.path().canonicalize().expect("canonical home");
+        let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", &root);
+        let generation = "chatgpt-auth-0123456789abcdef0123456789abcdef.json";
+        let token_a = id_token(&serde_json::json!({"email": "a@example.com"}));
+        let file = serde_json::json!({
+            format!("{CHATGPT_OAUTH_ISSUER}::{CHATGPT_OAUTH_CLIENT_ID}"): {
+                "access_token": "access-stale",
+                "expires_at": "2000-01-01T00:00:00Z",
+                "id_token": token_a,
+            }
+        });
+        codewhale_config::with_xai_oauth_lifecycle_lock(|store| {
+            store.write(generation, file.to_string().as_bytes(), false)
+        })
+        .expect("seed stale generation");
+        let mut config = Config::default();
+        config.mark_codewhale_owned_chatgpt_oauth(generation.to_string());
+        assert!(!credentials_valid(OAuthProvider::Chatgpt, &config));
+        assert_eq!(owned_account_label(OAuthProvider::Chatgpt, &config), None);
+        let reason = owned_account_label_for_generation(OAuthProvider::Chatgpt, generation)
+            .expect_err("stale entry is unusable");
+        assert_eq!(reason.to_string(), "sign-in file holds no usable sign-in");
     }
 
     #[test]
@@ -5889,6 +6123,7 @@ consent_version = 1
             credentials: OwnedOAuthCredentials {
                 access_token: "secret-access".into(),
                 account_id: None,
+                account_label: None,
                 refresh_token: Some("secret-refresh".into()),
                 expires_at: None,
                 issuer: "issuer".into(),

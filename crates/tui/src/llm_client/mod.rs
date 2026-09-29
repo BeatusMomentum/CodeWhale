@@ -778,6 +778,9 @@ fn is_explicit_quota_code(code: &str) -> bool {
             // as openai/codex `api_bridge.rs` maps it. It resets on the
             // plan's schedule, not after a short backoff.
             | "usagelimitreached"
+            // Same backend, same branch: the signed-in plan does not include
+            // Codex. Retrying cannot help; switching accounts can.
+            | "usagenotincluded"
     )
 }
 

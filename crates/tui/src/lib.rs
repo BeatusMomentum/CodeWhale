@@ -2235,16 +2235,16 @@ fn arm_telemetry(cli: &Cli, command: Option<&Commands>) {
 /// Non-secret account label (email, plan) of the Codewhale-owned
 /// subscription sign-in stored in `generation`, for `codewhale auth status`
 /// and `auth list`. Reads only that Codewhale-owned file: no refresh, no
-/// network, no external CLI file.
-#[must_use]
+/// network, no external CLI file. `Err` carries a fixed, token-free reason
+/// the sign-in is unusable (missing, unreadable, no usable entry).
 pub fn owned_oauth_account_label(
     provider: codewhale_config::ProviderKind,
     generation: &str,
-) -> Option<String> {
+) -> Result<Option<String>> {
     let provider = match provider {
         codewhale_config::ProviderKind::OpenaiCodex => oauth::OAuthProvider::Chatgpt,
         codewhale_config::ProviderKind::Xai => oauth::OAuthProvider::Xai,
-        _ => return None,
+        _ => bail!("provider has no subscription sign-in"),
     };
     oauth::owned_account_label_for_generation(provider, generation)
 }
@@ -8950,6 +8950,9 @@ async fn run_xai_device_auth(config_path: Option<&Path>) -> Result<()> {
         codewhale_config::quote_os_path(&activation.auth_path),
         codewhale_config::quote_os_path(&activation.config_path)
     );
+    println!(
+        "To switch accounts later, run `codewhale auth xai-device` again (or `/auth xai-device` in Codewhale) and approve with the other account. Restart open Codewhale sessions after a shell login."
+    );
     Ok(())
 }
 
@@ -8957,13 +8960,16 @@ async fn run_chatgpt_pkce_auth(config_path: Option<&Path>) -> Result<()> {
     let pending = crate::oauth::login(crate::oauth::OAuthProvider::Chatgpt).await?;
     let activation = crate::oauth::activate_login(pending, config_path, None)?;
     println!("{}", activation.summary());
+    if let Some(warning) = activation.env_override_warning() {
+        println!("{warning}");
+    }
     println!(
         "ChatGPT OAuth is ready; activated {} via {}",
         codewhale_config::quote_os_path(&activation.auth_path),
         codewhale_config::quote_os_path(&activation.config_path)
     );
     println!(
-        "To switch accounts later, run `codewhale auth chatgpt` again and choose the other account."
+        "To switch accounts later, run `codewhale auth chatgpt` again (or `/auth chatgpt` in Codewhale) and choose the other account. Restart open Codewhale sessions after a shell login."
     );
     Ok(())
 }

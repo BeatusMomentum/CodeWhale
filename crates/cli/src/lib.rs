@@ -3295,7 +3295,7 @@ fn xai_credential_route_label(
 ) -> String {
     match diagnostics.route {
         XaiAuthDiagnosticRoute::OwnedOAuth => {
-            "Codewhale-owned OAuth configured/unprobed (valid generation pointer; storage unprobed)"
+            "Codewhale-owned OAuth configured/unprobed (valid generation pointer; availability unprobed)"
                 .to_string()
         }
         XaiAuthDiagnosticRoute::NeedsRepair => {
@@ -3385,7 +3385,7 @@ fn xai_storage_detail(
 fn xai_lookup_order(diagnostics: &XaiAuthDiagnostics) -> String {
     match diagnostics.route {
         XaiAuthDiagnosticRoute::OwnedOAuth => {
-            "lookup order: configured Codewhale-owned OAuth generation (storage unprobed); Grok CLI consent blocked".to_string()
+            "lookup order: configured Codewhale-owned OAuth generation (availability unprobed); Grok CLI consent blocked".to_string()
         }
         XaiAuthDiagnosticRoute::NeedsRepair => {
             "lookup order: invalid Codewhale-owned OAuth generation blocks Grok CLI consent; runtime-effective API-key fallback: CLI -> config -> secret store -> env".to_string()
@@ -3769,15 +3769,17 @@ fn run_auth_diagnostic(store: &ConfigStore, provider: Option<ProviderKind>) -> R
 /// Account label (email, plan) of the Codewhale-owned subscription sign-in
 /// the provider's config points at. The generation file is Codewhale's own;
 /// reading its ID-token claims needs no consent, refresh or network, and the
-/// label never carries token material.
-fn owned_oauth_account(store: &ConfigStore, provider: ProviderKind) -> Option<String> {
+/// label never carries token material. `Ok(None)`: usable sign-in whose ID
+/// token has no email. `Err`: a fixed reason the sign-in is unusable.
+fn owned_oauth_account(store: &ConfigStore, provider: ProviderKind) -> Result<Option<String>> {
     let generation = match provider {
         ProviderKind::OpenaiCodex => &store.config.providers.openai_codex,
         ProviderKind::Xai => &store.config.providers.xai,
-        _ => return None,
+        _ => bail!("provider has no subscription sign-in"),
     }
     .oauth_credential_generation
-    .as_deref()?;
+    .as_deref()
+    .context("no sign-in generation configured")?;
     codewhale_tui::owned_oauth_account_label(provider, generation)
 }
 
@@ -3810,7 +3812,7 @@ fn auth_list_lines_with_runtime(
                 .evaluates_runtime_api_key()
                 .then(|| xai_runtime_api_key(store, secrets, runtime_overrides));
             let account = (diagnostics.route == XaiAuthDiagnosticRoute::OwnedOAuth)
-                .then(|| owned_oauth_account(store, provider))
+                .then(|| owned_oauth_account(store, provider).ok().flatten())
                 .flatten()
                 .map(|account| format!(" ({account})"))
                 .unwrap_or_default();
@@ -3841,9 +3843,13 @@ fn auth_list_lines_with_runtime(
                 .as_deref()
                 .is_some_and(codewhale_config::is_valid_chatgpt_oauth_generation)
             {
+                // An unusable owned sign-in falls through to consent at
+                // runtime (`codex_credentials`), so name what is really used.
                 match owned_oauth_account(store, provider) {
-                    Some(account) => format!("owned-oauth ({account})"),
-                    None => "owned-oauth".to_string(),
+                    Ok(Some(account)) => format!("owned-oauth ({account})"),
+                    Ok(None) => "owned-oauth".to_string(),
+                    Err(_) if external_selected => "external-consent".to_string(),
+                    Err(_) => "owned-oauth-unusable".to_string(),
                 }
             } else if external_selected {
                 "external-consent".to_string()
@@ -3910,10 +3916,18 @@ fn auth_status_lines_for_provider_with_runtime(
             .as_deref()
             .is_some_and(codewhale_config::is_valid_chatgpt_oauth_generation))
     .then(|| match owned_oauth_account(store, provider) {
-        Some(account) => {
+        Ok(Some(account)) => {
             format!("codewhale-owned ChatGPT sign-in as {account} (availability not probed)")
         }
-        None => "codewhale-owned ChatGPT sign-in (availability not probed)".to_string(),
+        Ok(None) => "codewhale-owned ChatGPT sign-in (availability not probed)".to_string(),
+        // The runtime skips an unusable owned sign-in and falls through to
+        // consent (`codex_credentials`), so say so rather than name it.
+        Err(reason) if external_selected => format!(
+            "external read-only consent (availability not probed; the Codewhale-owned ChatGPT sign-in is unusable: {reason})"
+        ),
+        Err(reason) => format!(
+            "missing (the Codewhale-owned ChatGPT sign-in is unusable: {reason}; run `codewhale auth chatgpt`)"
+        ),
     });
     let active_label = {
         let active_source = if provider == ProviderKind::OpenaiCodex {
@@ -4003,10 +4017,15 @@ fn auth_status_lines_for_provider_with_runtime(
         format!("env var: {env_var_label} ({env_status})"),
     ];
     if provider == ProviderKind::OpenaiCodex {
-        lines.push(
-            "switch account: `codewhale auth chatgpt` (choose the other ChatGPT account; replaces the Codewhale-owned sign-in)"
+        // An env token outranks every sign-in, so a new login alone would
+        // change nothing (the client leaves its switch hint out likewise).
+        lines.push(match env_key.as_ref() {
+            Some((name, _)) => format!(
+                "switch account: unset {name} first (it outranks every sign-in), then run `codewhale auth chatgpt` and choose the other ChatGPT account"
+            ),
+            None => "switch account: `codewhale auth chatgpt` (choose the other ChatGPT account; replaces the Codewhale-owned sign-in)"
                 .to_string(),
-        );
+        });
     }
 
     if let Ok((source, expected_path)) = external_credential_target(provider, None) {
@@ -4103,7 +4122,7 @@ fn xai_auth_status_lines_for_provider(
         XaiOAuthGenerationPointer::Valid
             if diagnostics.route == XaiAuthDiagnosticRoute::OwnedOAuth =>
         {
-            "xAI OAuth generation: configured Codewhale-owned pointer (storage unprobed)"
+            "xAI OAuth generation: configured Codewhale-owned pointer (read for the account label only; availability not probed)"
                 .to_string()
         }
         XaiOAuthGenerationPointer::Valid => {
@@ -4116,9 +4135,14 @@ fn xai_auth_status_lines_for_provider(
 
     match diagnostics.route {
         XaiAuthDiagnosticRoute::OwnedOAuth => {
-            if let Some(account) = owned_oauth_account(store, ProviderKind::Xai) {
-                lines.push(format!("signed-in account: {account}"));
-            }
+            lines.push(match owned_oauth_account(store, ProviderKind::Xai) {
+                Ok(Some(account)) => format!("signed-in account: {account}"),
+                Ok(None) => "signed-in account: unknown (the issuer sent no account email)"
+                    .to_string(),
+                Err(reason) => format!(
+                    "signed-in account: none ({reason}; requests fall back to any runtime-effective xAI API key)"
+                ),
+            });
             lines.push(
                 "switch account: `codewhale auth xai-device` (choose the other xAI account; replaces the Codewhale-owned sign-in)"
                     .to_string(),
@@ -9471,6 +9495,37 @@ verbosity = "project-imported"
                 assert!(!output.contains(secret), "{secret} leaked: {output}");
             }
         }
+
+        // An env token outranks the sign-in: a re-login alone switches
+        // nothing, so status must not advertise it as the switch.
+        {
+            let _token = ScopedEnvVar::set("OPENAI_CODEX_ACCESS_TOKEN", "env-token-secret-9931");
+            let codex = auth_status_lines_for_provider(&store, &secrets, ProviderKind::OpenaiCodex)
+                .join("\n");
+            assert!(
+                codex.contains("switch account: unset OPENAI_CODEX_ACCESS_TOKEN first"),
+                "{codex}"
+            );
+            assert!(
+                !codex.contains("replaces the Codewhale-owned sign-in"),
+                "{codex}"
+            );
+            assert!(!codex.contains("env-token-secret-9931"), "{codex}");
+        }
+
+        // A missing generation file is reported, not silently dropped.
+        std::fs::remove_file(
+            codewhale_config::xai_oauth_credentials_dir()
+                .expect("credentials dir")
+                .join(xai_generation),
+        )
+        .expect("remove xai generation");
+        let xai = auth_status_lines_for_provider(&store, &secrets, ProviderKind::Xai).join("\n");
+        assert!(
+            xai.contains("signed-in account: none (sign-in file is missing"),
+            "{xai}"
+        );
+        assert!(!xai.contains("storage unprobed"), "{xai}");
     }
 
     #[test]
@@ -9505,14 +9560,14 @@ verbosity = "project-imported"
         let scoped = auth_status_lines_for_provider(&store, &secrets, ProviderKind::Xai).join("\n");
         assert!(
             scoped.contains(
-                "credential route: Codewhale-owned OAuth configured/unprobed (valid generation pointer; storage unprobed)"
+                "credential route: Codewhale-owned OAuth configured/unprobed (valid generation pointer; availability unprobed)"
             ),
             "{scoped}"
         );
         assert!(scoped.contains("external credentials: blocked by the configured Codewhale-owned xAI OAuth generation"), "{scoped}");
         assert!(
             scoped.contains(
-                "xAI OAuth generation: configured Codewhale-owned pointer (storage unprobed)"
+                "xAI OAuth generation: configured Codewhale-owned pointer (read for the account label only; availability not probed)"
             ),
             "{scoped}"
         );
