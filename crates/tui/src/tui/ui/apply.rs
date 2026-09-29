@@ -3591,6 +3591,11 @@ async fn apply_codewhale_owned_login(
 ) -> bool {
     match crate::oauth::activate_login(pending, app.config_path.as_deref(), Some(&mut *config)) {
         Ok(activation) => {
+            // The account line goes to the transcript: the status line is
+            // overwritten by the route summary once the switch lands.
+            app.add_message(HistoryCell::System {
+                content: activation.summary(),
+            });
             app.status_message = Some(format!(
                 "{status_prefix}; activated {} via {}",
                 codewhale_config::quote_os_path(&activation.auth_path),

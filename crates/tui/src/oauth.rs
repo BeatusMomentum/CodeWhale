@@ -370,7 +370,12 @@ pub const CHATGPT_OAUTH_PARAMS: OAuthProviderParams = OAuthProviderParams {
     token_path: "oauth/token",
     discover_endpoints: false,
     device_poll_floor_secs: 30,
-    authorize_extras: &[("id_token_add_organizations", "true")],
+    // `prompt=login` (OIDC Core 1.0 §3.1.2.1) asks the issuer to re-prompt
+    // instead of silently reusing whichever ChatGPT account the browser is
+    // already signed into, so an explicit `codewhale auth chatgpt` can pick a
+    // different account. Every browser login here is user-initiated; refresh
+    // never visits the authorize endpoint.
+    authorize_extras: &[("id_token_add_organizations", "true"), ("prompt", "login")],
     revoke_path: Some("api/accounts/oauth/revoke"),
     callback_path: "/auth/callback",
     loopback_ports: &[1455, 1457],
@@ -1504,6 +1509,10 @@ pub(crate) fn pkce_login_with(
     let request = start_auth_request_on(&listeners, params, inputs)?;
     eprintln!("{display_name} sign-in (PKCE)");
     eprintln!("  Open:  {}", request.authorize_url);
+    eprintln!(
+        "Sign in with the {display_name} account Codewhale should use. If the browser skips \
+         straight past account choice, open the URL above in a private window instead."
+    );
     eprintln!("Waiting for the browser callback… (Ctrl+C to abort)");
     if inputs.open_browser
         && let Err(err) = webbrowser::open(&request.authorize_url)
@@ -1683,6 +1692,38 @@ pub struct OAuthActivation {
     pub credentials: OwnedOAuthCredentials,
     pub config_path: PathBuf,
     pub auth_path: PathBuf,
+    pub provider: OAuthProvider,
+    /// Non-secret label (email, plan) of the account just signed in.
+    pub account_label: Option<String>,
+    /// `Some` when this login replaced an existing Codewhale-owned sign-in
+    /// for the same issuer and client; the inner value is that account's
+    /// label when it had one.
+    pub replaced: Option<Option<String>>,
+}
+
+impl OAuthActivation {
+    /// "Signed in to ChatGPT as you@example.com (plus)." plus, when this
+    /// login replaced a different account, which one. Never token material.
+    #[must_use]
+    pub fn summary(&self) -> String {
+        let name = oauth_provider_params(self.provider).display_name;
+        let mut summary = match self.account_label.as_deref() {
+            Some(label) => format!("Signed in to {name} as {label}."),
+            None => format!("Signed in to {name} (the issuer sent no account email)."),
+        };
+        match &self.replaced {
+            Some(Some(previous)) if Some(previous) != self.account_label.as_ref() => {
+                summary.push_str(&format!(
+                    " Replaced the previous Codewhale {name} sign-in ({previous})."
+                ));
+            }
+            Some(None) => {
+                summary.push_str(&format!(" Replaced the previous Codewhale {name} sign-in."));
+            }
+            _ => {}
+        }
+        summary
+    }
 }
 
 impl std::fmt::Debug for OAuthActivation {
@@ -1691,6 +1732,9 @@ impl std::fmt::Debug for OAuthActivation {
             .field("credentials", &redacted(true))
             .field("config_path", &self.config_path)
             .field("auth_path", &self.auth_path)
+            .field("provider", &self.provider)
+            .field("account_label", &self.account_label)
+            .field("replaced", &self.replaced)
             .finish()
     }
 }
@@ -1921,6 +1965,104 @@ fn account_id_from_id_token(token: &str) -> Option<String> {
         .map(str::trim)
         .filter(|id| !id.is_empty())
         .map(ToOwned::to_owned)
+}
+
+/// Longest email the label keeps (RFC 5321 path limit); plan names are short.
+const ACCOUNT_EMAIL_MAX_CHARS: usize = 254;
+const ACCOUNT_PLAN_MAX_CHARS: usize = 32;
+
+/// Non-secret account label (`email` or `email (plan)`) from an ID token's
+/// claims, decoded locally. The signature is not verified: the label is for
+/// display only and never authorizes anything. Claim text is bounded and
+/// stripped of control characters so a hostile token cannot smuggle terminal
+/// escapes into status output. `None` when no usable email claim exists.
+#[must_use]
+pub fn account_label_from_id_token(token: &str) -> Option<String> {
+    let payload = jwt_payload(token)?;
+    let claim_text = |value: Option<&Value>, max: usize| {
+        let text: String = value?
+            .as_str()?
+            .chars()
+            .filter(|ch| !ch.is_control())
+            .take(max)
+            .collect();
+        let text = text.trim();
+        (!text.is_empty()).then(|| text.to_string())
+    };
+    let email = claim_text(payload.get("email"), ACCOUNT_EMAIL_MAX_CHARS).or_else(|| {
+        claim_text(
+            payload
+                .get("https://api.openai.com/profile")
+                .and_then(|profile| profile.get("email")),
+            ACCOUNT_EMAIL_MAX_CHARS,
+        )
+    })?;
+    let plan = claim_text(
+        payload
+            .get("https://api.openai.com/auth")
+            .and_then(|auth| auth.get("chatgpt_plan_type")),
+        ACCOUNT_PLAN_MAX_CHARS,
+    );
+    Some(match plan {
+        Some(plan) => format!("{email} ({plan})"),
+        None => email,
+    })
+}
+
+impl OwnedAuthEntry {
+    /// Display label for the account this entry signs in as.
+    fn account_label(&self) -> Option<String> {
+        self.id_token
+            .as_deref()
+            .and_then(account_label_from_id_token)
+    }
+}
+
+/// Account label of the Codewhale-owned sign-in stored in one generation
+/// file. Reads only that file; never refreshes, writes, or touches the
+/// network. `None` when the generation is invalid, missing, or its ID token
+/// carries no email claim.
+#[must_use]
+pub fn owned_account_label_for_generation(
+    provider: OAuthProvider,
+    generation: &str,
+) -> Option<String> {
+    let path = provider.generation_path(generation).ok()?;
+    owned_account_label_at(provider, &path)
+}
+
+fn owned_account_label_at(provider: OAuthProvider, path: &Path) -> Option<String> {
+    let mut file = load_owned_auth_file(path).ok()??;
+    select_entry(provider, &mut file)?.1.account_label()
+}
+
+/// Account label of the Codewhale-owned sign-in the config points at (the
+/// legacy xAI file when no generation is configured).
+#[must_use]
+pub fn owned_account_label(provider: OAuthProvider, config: &Config) -> Option<String> {
+    match configured_owned_auth_file_path(provider, config) {
+        Ok(Some(path)) => owned_account_label_at(provider, &path),
+        Ok(None) if provider == OAuthProvider::Xai => {
+            owned_account_label_at(provider, &codewhale_config::legacy_xai_oauth_path().ok()?)
+        }
+        _ => None,
+    }
+}
+
+/// What to tell someone whose subscription account ran out of usage: which
+/// account is signed in (label only, never a token) and the exact command
+/// that signs in with a different one.
+#[must_use]
+pub fn usage_limit_guidance(provider: OAuthProvider, account_label: Option<&str>) -> String {
+    let params = oauth_provider_params(provider);
+    let name = params.display_name;
+    let hint = params.relogin_hint;
+    let switch =
+        format!("To continue with a different {name} account, run `{hint}` and choose it.");
+    match account_label {
+        Some(label) => format!("This limit belongs to the {name} account {label}. {switch}"),
+        None => switch,
+    }
 }
 
 fn jwt_payload(token: &str) -> Option<Value> {
@@ -2366,7 +2508,15 @@ fn activate_login_locked(
             None => BTreeMap::new(),
         };
         let scope = format!("{}::{}", pending.issuer, pending.client_id);
-        let mut entry = file.remove(&scope).unwrap_or_else(|| OwnedAuthEntry {
+        // A new login replaces this scope's entry outright. Merging into the
+        // old entry would let a previous account's refresh token, id token or
+        // account id survive whenever the new grant omits one, pairing two
+        // accounts' material in one credential.
+        let replaced = file
+            .remove(&scope)
+            .filter(entry_has_usable_secret)
+            .map(|entry| entry.account_label());
+        let mut entry = OwnedAuthEntry {
             access_token: None,
             refresh_token: None,
             expires_at: None,
@@ -2377,7 +2527,7 @@ fn activate_login_locked(
             originator: None,
             auth_mode: Some("oidc".to_string()),
             extra: BTreeMap::new(),
-        });
+        };
         apply_token_response(
             provider,
             &mut entry,
@@ -2413,10 +2563,12 @@ fn activate_login_locked(
         Ok((
             previous_owned_name,
             credentials_from_entry(provider, &scope, &entry, access),
+            entry.account_label(),
+            replaced,
         ))
     });
 
-    let (previous_owned_name, credentials) = match activation {
+    let (previous_owned_name, credentials, account_label, replaced) = match activation {
         Ok(activation) => activation,
         Err(error) => {
             if stage_written && let Err(cleanup_error) = store.remove(&generation) {
@@ -2449,14 +2601,13 @@ fn activate_login_locked(
             "new OAuth generation committed but superseded generation cleanup failed"
         );
     }
-    eprintln!(
-        "Signed in with {display_name}. Codewhale-owned credentials activated at {}.",
-        codewhale_config::quote_os_path(&auth_path)
-    );
     Ok(OAuthActivation {
         credentials,
         config_path,
         auth_path,
+        provider,
+        account_label,
+        replaced,
     })
 }
 
@@ -3792,6 +3943,168 @@ mod tests {
         assert!(!url.contains("codex_cli_rs"));
         assert!(url.contains("redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback"));
         assert!(url.contains("id_token_add_organizations=true"));
+        // Account choice: the issuer must re-prompt rather than reuse the
+        // browser's current ChatGPT session.
+        let query: BTreeMap<String, String> = reqwest::Url::parse(&url)
+            .expect("authorize URL parses")
+            .query_pairs()
+            .into_owned()
+            .collect();
+        assert_eq!(query.get("prompt").map(String::as_str), Some("login"));
+        assert_eq!(url.matches("prompt=").count(), 1, "{url}");
+    }
+
+    fn id_token(claims: &serde_json::Value) -> String {
+        format!(
+            "header.{}.sig",
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(claims).expect("claims serialize"))
+        )
+    }
+
+    #[test]
+    fn account_label_reads_email_and_plan_claims() {
+        let chatgpt = id_token(&serde_json::json!({
+            "email": "a@example.com",
+            "https://api.openai.com/auth": {"chatgpt_plan_type": "plus", "chatgpt_account_id": "acct-1"},
+        }));
+        assert_eq!(
+            account_label_from_id_token(&chatgpt).as_deref(),
+            Some("a@example.com (plus)")
+        );
+        // Profile-namespaced email is the fallback the ChatGPT issuer uses.
+        let profile = id_token(&serde_json::json!({
+            "https://api.openai.com/profile": {"email": "b@example.com"},
+        }));
+        assert_eq!(
+            account_label_from_id_token(&profile).as_deref(),
+            Some("b@example.com")
+        );
+        // xAI: plain OIDC email, no plan claim.
+        let xai = id_token(&serde_json::json!({"email": "grok@example.com", "sub": "u1"}));
+        assert_eq!(
+            account_label_from_id_token(&xai).as_deref(),
+            Some("grok@example.com")
+        );
+    }
+
+    #[test]
+    fn account_label_rejects_malformed_tokens_and_missing_claims() {
+        for token in [
+            "",
+            "not-a-jwt",
+            "header.%%%.sig",
+            &format!("header.{}.sig", URL_SAFE_NO_PAD.encode("not json")),
+            &id_token(&serde_json::json!({"sub": "u1"})),
+            &id_token(&serde_json::json!({"email": "   "})),
+            &id_token(&serde_json::json!({"email": 42})),
+            // A plan alone does not identify an account.
+            &id_token(&serde_json::json!({
+                "https://api.openai.com/auth": {"chatgpt_plan_type": "pro"},
+            })),
+        ] {
+            assert_eq!(account_label_from_id_token(token), None, "{token}");
+        }
+    }
+
+    #[test]
+    fn account_label_strips_control_characters_and_bounds_length() {
+        let hostile = id_token(&serde_json::json!({
+            "email": "\u{1b}[31mevil@example.com\u{7}",
+            "https://api.openai.com/auth": {"chatgpt_plan_type": "x".repeat(500)},
+        }));
+        let label = account_label_from_id_token(&hostile).expect("label");
+        assert!(!label.chars().any(char::is_control), "{label:?}");
+        assert!(label.starts_with("[31mevil@example.com ("), "{label}");
+        assert!(label.len() <= ACCOUNT_EMAIL_MAX_CHARS + ACCOUNT_PLAN_MAX_CHARS + 3);
+    }
+
+    #[test]
+    fn usage_limit_guidance_names_account_and_switch_command() {
+        let chatgpt = usage_limit_guidance(OAuthProvider::Chatgpt, Some("a@example.com (plus)"));
+        assert!(chatgpt.contains("a@example.com (plus)"), "{chatgpt}");
+        assert!(chatgpt.contains("`codewhale auth chatgpt`"), "{chatgpt}");
+        let xai = usage_limit_guidance(OAuthProvider::Xai, None);
+        assert!(xai.contains("`codewhale auth xai-device`"), "{xai}");
+        assert!(!xai.contains("None"), "{xai}");
+    }
+
+    #[test]
+    fn relogin_with_another_account_replaces_the_owned_entry() {
+        let _lock = crate::test_support::lock_test_env();
+        let home = tempfile::tempdir().expect("temp home");
+        let root = home.path().canonicalize().expect("canonical home");
+        let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", &root);
+        let config_path = root.join("config.toml");
+        std::fs::write(&config_path, "").expect("empty config");
+        let token_a = id_token(&serde_json::json!({
+            "email": "a@example.com",
+            "https://api.openai.com/auth": {"chatgpt_plan_type": "plus", "chatgpt_account_id": "acct-a"},
+        }));
+        let first = activate_login(
+            pending_login_with_id_token_for_test(
+                OAuthProvider::Chatgpt,
+                "access-a",
+                "refresh-a",
+                Some(&token_a),
+            ),
+            Some(&config_path),
+            None,
+        )
+        .expect("first login");
+        assert_eq!(first.account_label.as_deref(), Some("a@example.com (plus)"));
+        assert_eq!(first.replaced, None);
+        assert_eq!(
+            first.summary(),
+            "Signed in to ChatGPT as a@example.com (plus)."
+        );
+
+        // Account B's grant carries no refresh token and no account claim:
+        // nothing from account A may survive into B's credential.
+        let token_b = id_token(&serde_json::json!({"email": "b@example.com"}));
+        let mut pending_b = pending_login_with_id_token_for_test(
+            OAuthProvider::Chatgpt,
+            "access-b",
+            "unused",
+            Some(&token_b),
+        );
+        pending_b.token.refresh_token = None;
+        let second = activate_login(pending_b, Some(&config_path), None).expect("second login");
+        assert_eq!(second.account_label.as_deref(), Some("b@example.com"));
+        assert_eq!(
+            second.replaced,
+            Some(Some("a@example.com (plus)".to_string()))
+        );
+        let summary = second.summary();
+        assert_eq!(
+            summary,
+            "Signed in to ChatGPT as b@example.com. Replaced the previous Codewhale ChatGPT sign-in (a@example.com (plus))."
+        );
+        assert!(!summary.contains("access-"), "{summary}");
+
+        let persisted = std::fs::read_to_string(&second.auth_path).expect("generation");
+        assert!(!persisted.contains("refresh-a"), "{persisted}");
+        assert!(!persisted.contains("acct-a"), "{persisted}");
+        assert!(!persisted.contains("access-a"), "{persisted}");
+        let generation = second
+            .auth_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("generation name");
+        assert_eq!(
+            owned_account_label_for_generation(OAuthProvider::Chatgpt, generation).as_deref(),
+            Some("b@example.com")
+        );
+        let mut config = Config::default();
+        config.mark_codewhale_owned_chatgpt_oauth(generation.to_string());
+        assert_eq!(
+            owned_account_label(OAuthProvider::Chatgpt, &config).as_deref(),
+            Some("b@example.com")
+        );
+        // An invalid generation name never resolves to a path.
+        assert_eq!(
+            owned_account_label_for_generation(OAuthProvider::Chatgpt, "../auth.json"),
+            None
+        );
     }
 
     #[test]
@@ -4411,6 +4724,9 @@ mod tests {
             credentials: credentials.clone(),
             config_path: PathBuf::from("/tmp/config.toml"),
             auth_path: PathBuf::from("/tmp/auth.json"),
+            provider: OAuthProvider::Xai,
+            account_label: None,
+            replaced: None,
         };
 
         let rendered = format!("{entry:?} {activation:?}");
@@ -5580,6 +5896,9 @@ consent_version = 1
             },
             config_path: PathBuf::from("/tmp/config.toml"),
             auth_path: PathBuf::from("/tmp/auth.json"),
+            provider: OAuthProvider::Chatgpt,
+            account_label: Some("a@example.com (plus)".into()),
+            replaced: None,
         };
         let rendered = format!("{activation:?}");
         assert!(rendered.contains("<redacted>"));

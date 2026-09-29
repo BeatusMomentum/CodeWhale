@@ -618,6 +618,35 @@ secret. Codewhale links straight to that console and accepts the copied key.
 It never probes or impersonates `kimi_cli`/`kimi_code_cli`; first-class Kimi
 OAuth remains blocked on a vendor-registered Codewhale identity.
 
+### Subscription sign-in accounts (ChatGPT, xAI)
+
+Codewhale keeps one sign-in of its own per subscription provider. It is
+separate from the browser, the ChatGPT or Grok apps, and the Codex or Grok
+CLIs, so those can be signed in to a different account.
+
+- **See which account is signed in.** `codewhale auth status --provider
+  openai-codex` (or `--provider xai`) and `codewhale auth list` show the
+  account email and, for ChatGPT, the plan. The label comes from the ID token
+  the issuer returned at sign-in, decoded locally; no token is printed. The
+  provider picker shows the same label next to the credential, and a
+  successful login ends with `Signed in to ChatGPT as <email> (<plan>).`
+- **Switch accounts.** Run `codewhale auth chatgpt` (or `codewhale auth
+  xai-device`) again and choose the other account. The ChatGPT sign-in page
+  is opened with `prompt=login`, asking the issuer to show the sign-in step
+  instead of reusing the browser's current account; if your browser still
+  skips it, open the printed URL in a private window. The new account
+  replaces the Codewhale-owned sign-in outright, and the login names the
+  account it replaced.
+- **Usage limits.** When the ChatGPT subscription reports its usage limit
+  (`usage_limit_reached`) or a provider reports plan quota exhausted on a
+  subscription sign-in, the error names the signed-in account and the exact
+  command to switch. Codewhale does not retry that error, because the limit
+  resets on the plan's schedule.
+- **Precedence.** `OPENAI_CODEX_ACCESS_TOKEN` / `CODEX_ACCESS_TOKEN` outrank
+  the Codewhale-owned ChatGPT sign-in, and the owned sign-in outranks a
+  consented Codex CLI import. Unset the token variable if a re-login seems to
+  have no effect.
+
 ### External CLI credential consent
 
 Credential files owned by another CLI are disabled by default. Without an

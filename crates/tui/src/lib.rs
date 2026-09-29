@@ -574,10 +574,10 @@ struct TuiAuthArgs {
 
 #[derive(Subcommand, Debug, Clone)]
 enum TuiAuthCommand {
-    /// Sign in to xAI/Grok with an SSH-friendly device code.
+    /// Sign in to xAI/Grok with an SSH-friendly device code; run again to switch accounts.
     #[command(name = "xai-device")]
     XaiDevice,
-    /// Sign in with ChatGPT for Codex subscription access (PKCE loopback).
+    /// Sign in with ChatGPT for Codex subscription access; run again to switch accounts.
     #[command(name = "chatgpt")]
     Chatgpt,
     /// Revoke Codewhale-owned ChatGPT tokens. Codex CLI consent is unchanged.
@@ -2230,6 +2230,23 @@ fn arm_telemetry(cli: &Cli, command: Option<&Commands>) {
         telemetry_session_source(command),
         None,
     );
+}
+
+/// Non-secret account label (email, plan) of the Codewhale-owned
+/// subscription sign-in stored in `generation`, for `codewhale auth status`
+/// and `auth list`. Reads only that Codewhale-owned file: no refresh, no
+/// network, no external CLI file.
+#[must_use]
+pub fn owned_oauth_account_label(
+    provider: codewhale_config::ProviderKind,
+    generation: &str,
+) -> Option<String> {
+    let provider = match provider {
+        codewhale_config::ProviderKind::OpenaiCodex => oauth::OAuthProvider::Chatgpt,
+        codewhale_config::ProviderKind::Xai => oauth::OAuthProvider::Xai,
+        _ => return None,
+    };
+    oauth::owned_account_label_for_generation(provider, generation)
 }
 
 /// Compatibility command to explicitly enable usage under the current policy.
@@ -8927,6 +8944,7 @@ fn run_logout() -> Result<()> {
 async fn run_xai_device_auth(config_path: Option<&Path>) -> Result<()> {
     let pending = crate::oauth::login(crate::oauth::OAuthProvider::Xai).await?;
     let activation = crate::oauth::activate_login(pending, config_path, None)?;
+    println!("{}", activation.summary());
     println!(
         "xAI OAuth is ready; activated {} via {}",
         codewhale_config::quote_os_path(&activation.auth_path),
@@ -8938,10 +8956,14 @@ async fn run_xai_device_auth(config_path: Option<&Path>) -> Result<()> {
 async fn run_chatgpt_pkce_auth(config_path: Option<&Path>) -> Result<()> {
     let pending = crate::oauth::login(crate::oauth::OAuthProvider::Chatgpt).await?;
     let activation = crate::oauth::activate_login(pending, config_path, None)?;
+    println!("{}", activation.summary());
     println!(
         "ChatGPT OAuth is ready; activated {} via {}",
         codewhale_config::quote_os_path(&activation.auth_path),
         codewhale_config::quote_os_path(&activation.config_path)
+    );
+    println!(
+        "To switch accounts later, run `codewhale auth chatgpt` again and choose the other account."
     );
     Ok(())
 }

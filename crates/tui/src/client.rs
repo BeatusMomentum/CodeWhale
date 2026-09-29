@@ -279,6 +279,10 @@ pub struct CodewhaleClient {
     /// Where `api_key` came from (secret store slot, config file, env var
     /// name, CLI, OAuth, …), named in authentication errors (#6528).
     api_key_source: String,
+    /// For a subscription sign-in route (ChatGPT, xAI OAuth): which account
+    /// is signed in and how to switch, appended to plan-quota errors. Holds
+    /// an account label only, never token material.
+    subscription_limit_guidance: Option<String>,
     /// Exact configured credential values removed from model-bound tool
     /// results. Structural redaction handles config/JSON assignments, while
     /// this list closes the gap for bare provider tokens with no recognizable
@@ -611,6 +615,7 @@ impl Clone for CodewhaleClient {
             http1_client: self.http1_client.clone(),
             api_key: self.api_key.clone(),
             api_key_source: self.api_key_source.clone(),
+            subscription_limit_guidance: self.subscription_limit_guidance.clone(),
             model_bound_secret_values: Arc::clone(&self.model_bound_secret_values),
             catalog_error_secret_values: Arc::clone(&self.catalog_error_secret_values),
             model_bound_masking: self.model_bound_masking,
@@ -1548,7 +1553,7 @@ impl CodewhaleClient {
         if api_provider == ApiProvider::OpencodeGo {
             validate_route(api_provider, &default_model).map_err(anyhow::Error::msg)?;
         }
-        let ((api_key, api_key_source), codex_account_id) =
+        let ((api_key, api_key_source), codex_account_id, subscription_login) =
             if api_provider == ApiProvider::OpenaiCodex {
                 // The official endpoint requires Codex OAuth credentials. A custom
                 // endpoint prefers its own configured key, but an explicit
@@ -1561,18 +1566,39 @@ impl CodewhaleClient {
                     Ok(credentials) => (
                         (credentials.access_token, "Codex OAuth login".to_string()),
                         credentials.account_id,
+                        // A process token outranks every sign-in, so
+                        // re-running the login would not switch accounts.
+                        crate::oauth::credentials_from_env()
+                            .is_none()
+                            .then_some(crate::oauth::OAuthProvider::Chatgpt),
                     ),
                     Err(error) => {
                         if config.provider_uses_custom_endpoint(ApiProvider::OpenaiCodex) {
-                            (config.active_route_api_key_with_source()?, None)
+                            (config.active_route_api_key_with_source()?, None, None)
                         } else {
                             return Err(error);
                         }
                     }
                 }
             } else {
-                (config.active_route_api_key_with_source()?, None)
+                let xai_oauth = api_provider == ApiProvider::Xai
+                    && !config.provider_uses_custom_endpoint(ApiProvider::Xai)
+                    && config
+                        .provider_config_for(ApiProvider::Xai)
+                        .and_then(|entry| entry.auth_mode.as_deref())
+                        .is_some_and(crate::oauth::auth_mode_uses_xai_oauth);
+                (
+                    config.active_route_api_key_with_source()?,
+                    None,
+                    xai_oauth.then_some(crate::oauth::OAuthProvider::Xai),
+                )
             };
+        let subscription_limit_guidance = subscription_login.map(|login| {
+            crate::oauth::usage_limit_guidance(
+                login,
+                crate::oauth::owned_account_label(login, config).as_deref(),
+            )
+        });
         let model_bound_secret_values =
             Arc::new(configured_model_bound_secret_values(config, &api_key));
         // The opt-out is effective only after an explicit startup confirmation;
@@ -1678,6 +1704,7 @@ impl CodewhaleClient {
             http1_client,
             api_key,
             api_key_source,
+            subscription_limit_guidance,
             model_bound_secret_values,
             catalog_error_secret_values,
             model_bound_masking,
@@ -1746,6 +1773,10 @@ impl CodewhaleClient {
                 crate::llm_client::base_url_authority(&self.base_url)
                     .unwrap_or_else(|| redact_url_for_display(&self.base_url))
             )),
+            LlmError::QuotaExhausted(error) => match self.subscription_limit_guidance.as_deref() {
+                Some(guidance) => LlmError::QuotaExhausted(error.with_guidance(guidance)),
+                None => LlmError::QuotaExhausted(error),
+            },
             other => other,
         }
     }
@@ -7926,6 +7957,52 @@ mod tests {
             .to_string();
         assert!(model.contains("provider route: openrouter"), "{model}");
         assert!(model.contains("host: openrouter.ai"), "{model}");
+    }
+
+    /// A key route gets no subscription guidance; a sign-in route's plan
+    /// limit names the account label and the switch command, never a token.
+    #[test]
+    fn subscription_quota_errors_name_account_and_switch_command() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let config = Config {
+            provider: Some("openrouter".to_string()),
+            providers: Some(ProvidersConfig {
+                openrouter: ProviderConfig {
+                    api_key: Some("or-quota-key-1234567890".to_string()),
+                    ..ProviderConfig::default()
+                },
+                ..ProvidersConfig::default()
+            }),
+            ..Config::default()
+        };
+        let mut client = CodewhaleClient::new(&config).expect("openrouter client");
+        assert_eq!(client.subscription_limit_guidance, None);
+        let body = r#"{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached"}}"#;
+        let plain = client.http_error_with_route_context(429, body, None);
+        assert!(matches!(plain, LlmError::QuotaExhausted(_)), "{plain:?}");
+        assert!(!plain.to_string().contains("codewhale auth"), "{plain}");
+
+        client.subscription_limit_guidance = Some(crate::oauth::usage_limit_guidance(
+            crate::oauth::OAuthProvider::Chatgpt,
+            Some("a@example.com (plus)"),
+        ));
+        let guided = client
+            .http_error_with_route_context(429, body, None)
+            .to_string();
+        assert!(
+            guided.contains("The usage limit has been reached"),
+            "{guided}"
+        );
+        assert!(
+            guided.contains("ChatGPT account a@example.com (plus)"),
+            "{guided}"
+        );
+        assert!(guided.contains("`codewhale auth chatgpt`"), "{guided}");
+        assert!(!guided.contains("or-quota-key-1234567890"), "{guided}");
+        // Ordinary rate limits stay retryable and unannotated.
+        let rate = client.http_error_with_route_context(429, "Too Many Requests", None);
+        assert!(rate.is_retryable());
+        assert!(!rate.to_string().contains("codewhale auth"), "{rate}");
     }
 
     fn concentrate_client(server: &MockServer, model: &str) -> CodewhaleClient {

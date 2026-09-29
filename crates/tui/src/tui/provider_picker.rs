@@ -594,6 +594,20 @@ impl ProviderDashboardRow {
             crate::credentials::CredentialSource::ExternalGrant { cli, .. } => {
                 format!("{cli} credentials (read-only)")
             }
+            // Name the signed-in subscription account (label only) so two
+            // accounts on one machine are told apart before a limit is hit.
+            crate::credentials::CredentialSource::OAuth { .. } => {
+                let label = credential_resolution.source.label().into_owned();
+                let owned = match provider {
+                    ApiProvider::OpenaiCodex => Some(crate::oauth::OAuthProvider::Chatgpt),
+                    ApiProvider::Xai => Some(crate::oauth::OAuthProvider::Xai),
+                    _ => None,
+                };
+                match owned.and_then(|owned| crate::oauth::owned_account_label(owned, config)) {
+                    Some(account) => format!("{label} · {account}"),
+                    None => label,
+                }
+            }
             other => other.label().into_owned(),
         };
         let credential_state = credential_state_for_provider(config, provider);

@@ -1559,10 +1559,21 @@ struct AuthArgs {
 
 #[derive(Debug, Subcommand)]
 enum AuthCommand {
-    /// Sign in to xAI/Grok with an SSH-friendly device code.
+    /// Sign in to xAI/Grok with an SSH-friendly device code; run again to switch accounts.
+    ///
+    /// The account you approve on the xAI page replaces the Codewhale-owned
+    /// xAI sign-in. `codewhale auth status --provider xai` shows which
+    /// account is signed in.
     #[command(name = "xai-device")]
     XaiDevice,
-    /// Sign in with ChatGPT for Codex subscription access (PKCE loopback).
+    /// Sign in with ChatGPT for Codex subscription access; run again to switch accounts.
+    ///
+    /// Opens the ChatGPT sign-in page (PKCE loopback) and asks you to sign
+    /// in, so you can choose a different account than the one the browser
+    /// is using; if it does not, open the printed URL in a private window.
+    /// The account you choose replaces the Codewhale-owned ChatGPT sign-in.
+    /// `codewhale auth status --provider openai-codex` shows which account
+    /// is signed in.
     #[command(name = "chatgpt")]
     Chatgpt,
     /// Revoke Codewhale-owned ChatGPT tokens. Codex CLI consent is unchanged.
@@ -3755,6 +3766,21 @@ fn run_auth_diagnostic(store: &ConfigStore, provider: Option<ProviderKind>) -> R
     Ok(())
 }
 
+/// Account label (email, plan) of the Codewhale-owned subscription sign-in
+/// the provider's config points at. The generation file is Codewhale's own;
+/// reading its ID-token claims needs no consent, refresh or network, and the
+/// label never carries token material.
+fn owned_oauth_account(store: &ConfigStore, provider: ProviderKind) -> Option<String> {
+    let generation = match provider {
+        ProviderKind::OpenaiCodex => &store.config.providers.openai_codex,
+        ProviderKind::Xai => &store.config.providers.xai,
+        _ => return None,
+    }
+    .oauth_credential_generation
+    .as_deref()?;
+    codewhale_tui::owned_oauth_account_label(provider, generation)
+}
+
 #[cfg(test)]
 fn auth_list_lines(store: &ConfigStore, secrets: &Secrets) -> Vec<String> {
     auth_list_lines_with_runtime(store, secrets, &CliRuntimeOverrides::default())
@@ -3783,8 +3809,13 @@ fn auth_list_lines_with_runtime(
             let api_key = diagnostics
                 .evaluates_runtime_api_key()
                 .then(|| xai_runtime_api_key(store, secrets, runtime_overrides));
+            let account = (diagnostics.route == XaiAuthDiagnosticRoute::OwnedOAuth)
+                .then(|| owned_oauth_account(store, provider))
+                .flatten()
+                .map(|account| format!(" ({account})"))
+                .unwrap_or_default();
             lines.push(format!(
-                "{label:<12}  {}     {}      {}   {}",
+                "{label:<12}  {}     {}      {}   {}{account}",
                 xai_list_storage_status(api_key.as_ref(), RuntimeApiKeySource::ConfigFile),
                 xai_list_storage_status(api_key.as_ref(), RuntimeApiKeySource::Keyring),
                 xai_list_storage_status(api_key.as_ref(), RuntimeApiKeySource::Env),
@@ -3798,23 +3829,37 @@ fn auth_list_lines_with_runtime(
         let env = provider_env_set(provider);
         let external_selected = external_oauth_selected(store, provider);
         let active = if provider == ProviderKind::OpenaiCodex {
+            // Same lookup order as `auth status`: env, then the
+            // Codewhale-owned sign-in, then consented Codex CLI import.
             if env {
-                "env"
+                "env".to_string()
+            } else if store
+                .config
+                .providers
+                .openai_codex
+                .oauth_credential_generation
+                .as_deref()
+                .is_some_and(codewhale_config::is_valid_chatgpt_oauth_generation)
+            {
+                match owned_oauth_account(store, provider) {
+                    Some(account) => format!("owned-oauth ({account})"),
+                    None => "owned-oauth".to_string(),
+                }
             } else if external_selected {
-                "external-consent"
+                "external-consent".to_string()
             } else {
-                "missing"
+                "missing".to_string()
             }
         } else if external_selected {
-            "external-consent"
+            "external-consent".to_string()
         } else if file {
-            "config"
+            "config".to_string()
         } else if keyring == Some(true) {
-            "store"
+            "store".to_string()
         } else if env {
-            "env"
+            "env".to_string()
         } else {
-            "missing"
+            "missing".to_string()
         };
         lines.push(format!(
             "{label:<12}  {}     {}      {}   {active}",
@@ -3856,19 +3901,26 @@ fn auth_status_lines_for_provider_with_runtime(
     let external = external_consent(store, provider);
     let external_selected = external_oauth_selected(store, provider);
 
+    let owned_chatgpt_source = (provider == ProviderKind::OpenaiCodex
+        && store
+            .config
+            .providers
+            .openai_codex
+            .oauth_credential_generation
+            .as_deref()
+            .is_some_and(codewhale_config::is_valid_chatgpt_oauth_generation))
+    .then(|| match owned_oauth_account(store, provider) {
+        Some(account) => {
+            format!("codewhale-owned ChatGPT sign-in as {account} (availability not probed)")
+        }
+        None => "codewhale-owned ChatGPT sign-in (availability not probed)".to_string(),
+    });
     let active_label = {
         let active_source = if provider == ProviderKind::OpenaiCodex {
             if env_key.is_some() {
                 "env"
-            } else if store
-                .config
-                .providers
-                .openai_codex
-                .oauth_credential_generation
-                .as_deref()
-                .is_some_and(codewhale_config::is_valid_chatgpt_oauth_generation)
-            {
-                "codewhale-owned ChatGPT sign-in (availability not probed)"
+            } else if let Some(source) = owned_chatgpt_source.as_deref() {
+                source
             } else if external_selected {
                 "external read-only consent (availability not probed)"
             } else {
@@ -3950,6 +4002,12 @@ fn auth_status_lines_for_provider_with_runtime(
         ),
         format!("env var: {env_var_label} ({env_status})"),
     ];
+    if provider == ProviderKind::OpenaiCodex {
+        lines.push(
+            "switch account: `codewhale auth chatgpt` (choose the other ChatGPT account; replaces the Codewhale-owned sign-in)"
+                .to_string(),
+        );
+    }
 
     if let Ok((source, expected_path)) = external_credential_target(provider, None) {
         let status = codewhale_config::external_credential_consent_status(
@@ -4058,6 +4116,13 @@ fn xai_auth_status_lines_for_provider(
 
     match diagnostics.route {
         XaiAuthDiagnosticRoute::OwnedOAuth => {
+            if let Some(account) = owned_oauth_account(store, ProviderKind::Xai) {
+                lines.push(format!("signed-in account: {account}"));
+            }
+            lines.push(
+                "switch account: `codewhale auth xai-device` (choose the other xAI account; replaces the Codewhale-owned sign-in)"
+                    .to_string(),
+            );
             lines.push(
                 "external credentials: blocked by the configured Codewhale-owned xAI OAuth generation (file not probed)"
                     .to_string(),
@@ -9321,6 +9386,91 @@ verbosity = "project-imported"
             "{changed}"
         );
         assert!(!changed.contains(&ambient_path_str), "{changed}");
+    }
+
+    #[test]
+    fn owned_subscription_sign_ins_show_account_label_without_token_material() {
+        let _lock = env_lock();
+        let _codex_token = ScopedEnvVar::remove("OPENAI_CODEX_ACCESS_TOKEN");
+        let _codex_alias = ScopedEnvVar::remove("CODEX_ACCESS_TOKEN");
+        let _xai_key = ScopedEnvVar::remove("XAI_API_KEY");
+        let _xai_base = ScopedEnvVar::remove("XAI_BASE_URL");
+        let _auth_mode = ScopedEnvVar::remove("DEEPSEEK_AUTH_MODE");
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let home = dir
+            .path()
+            .canonicalize()
+            .expect("canonical temp root")
+            .join("codewhale-home");
+        let _home = ScopedEnvVar::set("CODEWHALE_HOME", &home.to_string_lossy());
+        let mut store = ConfigStore::load(Some(home.join("config.toml"))).expect("store");
+        let chatgpt_generation = "chatgpt-auth-0123456789abcdef0123456789abcdef.json";
+        let xai_generation = "xai-auth-0123456789abcdef0123456789abcdef.json";
+        store
+            .config
+            .providers
+            .openai_codex
+            .oauth_credential_generation = Some(chatgpt_generation.to_string());
+        store.config.providers.xai.auth_mode = Some("oauth".to_string());
+        store.config.providers.xai.oauth_credential_generation = Some(xai_generation.to_string());
+
+        // {"email":"b@example.com","https://api.openai.com/auth":{"chatgpt_plan_type":"pro"}}
+        let chatgpt_claims = "eyJlbWFpbCI6ImJAZXhhbXBsZS5jb20iLCJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9wbGFuX3R5cGUiOiJwcm8ifX0";
+        // {"email":"grok@example.com"}
+        let xai_claims = "eyJlbWFpbCI6Imdyb2tAZXhhbXBsZS5jb20ifQ";
+        let chatgpt_file = serde_json::json!({
+            "https://auth.openai.com::app_EMoamEEZ73f0CkXaXp7hrann": {
+                "access_token": "chatgpt-access-secret-9911",
+                "refresh_token": "chatgpt-refresh-secret-9912",
+                "id_token": format!("hdr.{chatgpt_claims}.sig-secret-9913"),
+            }
+        });
+        let xai_file = serde_json::json!({
+            "https://auth.x.ai::b1a00492-073a-47ea-816f-4c329264a828": {
+                "key": "xai-access-secret-9921",
+                "refresh_token": "xai-refresh-secret-9922",
+                "id_token": format!("hdr.{xai_claims}.sig-secret-9923"),
+            }
+        });
+        codewhale_config::with_xai_oauth_lifecycle_lock(|owned| {
+            owned.write(
+                chatgpt_generation,
+                chatgpt_file.to_string().as_bytes(),
+                false,
+            )?;
+            owned.write(xai_generation, xai_file.to_string().as_bytes(), false)?;
+            Ok(())
+        })
+        .expect("seed Codewhale-owned sign-ins");
+        let secrets = no_keyring_secrets();
+
+        let codex =
+            auth_status_lines_for_provider(&store, &secrets, ProviderKind::OpenaiCodex).join("\n");
+        assert!(
+            codex.contains("active source: codewhale-owned ChatGPT sign-in as b@example.com (pro)"),
+            "{codex}"
+        );
+        assert!(
+            codex.contains("switch account: `codewhale auth chatgpt`"),
+            "{codex}"
+        );
+        let xai = auth_status_lines_for_provider(&store, &secrets, ProviderKind::Xai).join("\n");
+        assert!(xai.contains("signed-in account: grok@example.com"), "{xai}");
+        assert!(
+            xai.contains("switch account: `codewhale auth xai-device`"),
+            "{xai}"
+        );
+        let list = auth_list_lines(&store, &secrets).join("\n");
+        assert!(list.contains("owned-oauth (b@example.com (pro))"), "{list}");
+        assert!(
+            list.contains("owned-oauth-configured (grok@example.com)"),
+            "{list}"
+        );
+        for output in [&codex, &xai, &list] {
+            for secret in ["secret-99", chatgpt_claims, xai_claims] {
+                assert!(!output.contains(secret), "{secret} leaked: {output}");
+            }
+        }
     }
 
     #[test]
