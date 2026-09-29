@@ -24,11 +24,33 @@ fn invalid_path() -> io::Error {
 pub(crate) struct WorkspaceFile {
     directory: File,
     filename: std::ffi::CString,
+    /// A user's own workspace file rather than a private store entry: new
+    /// entries take the process umask and replacement keeps the existing
+    /// permission bits instead of narrowing them to owner-only.
+    shared: bool,
 }
 
 #[cfg(unix)]
 impl WorkspaceFile {
+    /// Private store entry: created files are 0600, created parents 0700, and
+    /// every replacement is owner-only again.
     pub(crate) fn open(workspace: &Path, relative: &Path, create: bool) -> io::Result<Self> {
+        Self::open_confined(workspace, relative, create, false)
+    }
+
+    /// A user's workspace file, edited in place: created entries follow the
+    /// umask and replacement preserves the file's permission bits (an
+    /// executable script stays executable). Confinement is unchanged.
+    pub(crate) fn open_shared(workspace: &Path, relative: &Path, create: bool) -> io::Result<Self> {
+        Self::open_confined(workspace, relative, create, true)
+    }
+
+    fn open_confined(
+        workspace: &Path,
+        relative: &Path,
+        create: bool,
+        shared: bool,
+    ) -> io::Result<Self> {
         use std::os::fd::{AsRawFd, FromRawFd};
         use std::os::unix::ffi::OsStrExt;
         if !path_is_confined(relative) {
@@ -67,7 +89,8 @@ impl WorkspaceFile {
                     && io::Error::last_os_error().kind() == io::ErrorKind::NotFound
                 {
                     // SAFETY: directory and relative basename remain valid.
-                    if unsafe { libc::mkdirat(directory.as_raw_fd(), name.as_ptr(), 0o700) } != 0
+                    let mode = if shared { 0o777 } else { 0o700 };
+                    if unsafe { libc::mkdirat(directory.as_raw_fd(), name.as_ptr(), mode) } != 0
                         && io::Error::last_os_error().kind() != io::ErrorKind::AlreadyExists
                     {
                         return Err(io::Error::last_os_error());
@@ -87,7 +110,12 @@ impl WorkspaceFile {
             filename: std::ffi::CString::new(
                 relative.file_name().ok_or_else(invalid_path)?.as_bytes(),
             )?,
+            shared,
         })
+    }
+
+    fn create_mode(&self) -> libc::c_uint {
+        if self.shared { 0o666 } else { 0o600 }
     }
 
     pub(crate) fn sibling(&self, name: &str) -> io::Result<Self> {
@@ -97,6 +125,7 @@ impl WorkspaceFile {
         Ok(Self {
             directory: self.directory.try_clone()?,
             filename: std::ffi::CString::new(name)?,
+            shared: self.shared,
         })
     }
 
@@ -127,7 +156,7 @@ impl WorkspaceFile {
                 self.directory.as_raw_fd(),
                 self.filename.as_ptr(),
                 flags | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
-                0o600,
+                self.create_mode(),
             )
         };
         if fd < 0 {
@@ -164,7 +193,7 @@ impl WorkspaceFile {
                 self.directory.as_raw_fd(),
                 temporary.as_ptr(),
                 libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                0o600,
+                self.create_mode(),
             )
         };
         if fd < 0 {
@@ -173,6 +202,9 @@ impl WorkspaceFile {
         // SAFETY: fd is freshly owned.
         let mut file = unsafe { File::from_raw_fd(fd) };
         let result = (|| {
+            if self.shared && replace {
+                self.copy_permissions_to(&file)?;
+            }
             file.write_all(bytes)?;
             file.sync_all()?;
             if !replace && rename_exclusive(self.directory.as_raw_fd(), &temporary, &self.filename)?
@@ -214,6 +246,43 @@ impl WorkspaceFile {
         }
         result?;
         self.directory.sync_all()
+    }
+}
+
+#[cfg(unix)]
+impl WorkspaceFile {
+    /// Give the replacement the permission bits of the regular file it
+    /// replaces. Set-id bits are never carried over; an absent target keeps
+    /// the umask-derived creation mode.
+    fn copy_permissions_to(&self, replacement: &File) -> io::Result<()> {
+        use std::os::fd::AsRawFd;
+        // SAFETY: zeroed plain-data struct, filled by fstatat on success.
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: pinned parent, validated basename, and no link following.
+        let found = unsafe {
+            libc::fstatat(
+                self.directory.as_raw_fd(),
+                self.filename.as_ptr(),
+                &mut stat,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if found != 0 {
+            let error = io::Error::last_os_error();
+            return if error.kind() == io::ErrorKind::NotFound {
+                Ok(())
+            } else {
+                Err(error)
+            };
+        }
+        if (stat.st_mode & libc::S_IFMT) != libc::S_IFREG {
+            return Ok(());
+        }
+        // SAFETY: an owned, open descriptor; fchmod never follows a path.
+        if unsafe { libc::fchmod(replacement.as_raw_fd(), stat.st_mode & 0o777) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
     }
 }
 
@@ -340,6 +409,11 @@ impl WorkspaceFile {
             directory,
             filename: relative.file_name().ok_or_else(invalid_path)?.to_owned(),
         })
+    }
+
+    /// Windows has no Unix permission bits to preserve; see the Unix opener.
+    pub(crate) fn open_shared(workspace: &Path, relative: &Path, create: bool) -> io::Result<Self> {
+        Self::open(workspace, relative, create)
     }
 
     pub(crate) fn sibling(&self, name: &str) -> io::Result<Self> {
@@ -536,6 +610,80 @@ mod unix_publication_tests {
         }
         assert_eq!(std::fs::read_dir(workspace.path()).unwrap().count(), 50);
     }
+
+    fn mode(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::symlink_metadata(path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777
+    }
+
+    #[test]
+    fn shared_replacement_keeps_the_existing_permission_bits() {
+        use std::os::unix::fs::PermissionsExt;
+        let workspace = tempfile::tempdir().unwrap();
+        let script = workspace.path().join("deploy.sh");
+        std::fs::write(&script, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        WorkspaceFile::open_shared(workspace.path(), Path::new("deploy.sh"), false)
+            .unwrap()
+            .replace(b"#!/bin/sh\necho edited\n")
+            .unwrap();
+
+        assert_eq!(std::fs::read(&script).unwrap(), b"#!/bin/sh\necho edited\n");
+        assert_eq!(
+            mode(&script),
+            0o755,
+            "an edit must not drop the executable bit"
+        );
+    }
+
+    #[test]
+    fn shared_creation_follows_the_umask_for_the_file_and_its_parents() {
+        let workspace = tempfile::tempdir().unwrap();
+        // std creates files as 0o666 and directories as 0o777 under the
+        // process umask; read that back instead of changing the umask.
+        let probe_file = workspace.path().join("probe-file");
+        std::fs::write(&probe_file, b"").unwrap();
+        let probe_dir = workspace.path().join("probe-dir");
+        std::fs::create_dir(&probe_dir).unwrap();
+
+        WorkspaceFile::open_shared(workspace.path(), Path::new("new/nested/notes.md"), true)
+            .unwrap()
+            .replace(b"notes")
+            .unwrap();
+
+        let created = workspace.path().join("new/nested/notes.md");
+        assert_eq!(std::fs::read(&created).unwrap(), b"notes");
+        assert_eq!(mode(&created), mode(&probe_file));
+        assert_eq!(mode(&workspace.path().join("new")), mode(&probe_dir));
+        assert_eq!(mode(&workspace.path().join("new/nested")), mode(&probe_dir));
+    }
+
+    #[test]
+    fn private_replacement_and_creation_stay_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let workspace = tempfile::tempdir().unwrap();
+        let ledger = workspace.path().join("fleet.jsonl");
+        std::fs::write(&ledger, b"old").unwrap();
+        std::fs::set_permissions(&ledger, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        WorkspaceFile::open(workspace.path(), Path::new("fleet.jsonl"), false)
+            .unwrap()
+            .replace(b"compacted")
+            .unwrap();
+        assert_eq!(mode(&ledger), 0o600);
+
+        WorkspaceFile::open(workspace.path(), Path::new("private/receipt.json"), true)
+            .unwrap()
+            .publish(b"receipt")
+            .unwrap();
+        assert_eq!(mode(&workspace.path().join("private")), 0o700);
+        assert_eq!(mode(&workspace.path().join("private/receipt.json")), 0o600);
+    }
 }
 
 #[cfg(all(test, windows))]
@@ -628,6 +776,9 @@ impl WorkspaceFile {
             io::ErrorKind::Unsupported,
             "Confined Fleet artifact I/O is unavailable on this platform",
         ))
+    }
+    pub(crate) fn open_shared(workspace: &Path, relative: &Path, create: bool) -> io::Result<Self> {
+        Self::open(workspace, relative, create)
     }
     pub(crate) fn sibling(&self, _: &str) -> io::Result<Self> {
         unreachable!()

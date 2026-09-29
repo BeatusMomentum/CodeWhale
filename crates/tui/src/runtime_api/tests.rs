@@ -14149,6 +14149,72 @@ model = "glm-2"
 }
 
 #[tokio::test]
+async fn switch_provider_rejected_by_reload_leaves_the_config_file_unchanged() -> Result<()> {
+    let root = std::env::temp_dir().join(format!(
+        "codewhale-switch-provider-rejected-{}",
+        Uuid::new_v4()
+    ));
+    fs::create_dir_all(&root)?;
+    let config_file = root.join("custom-config.toml");
+    fs::write(
+        &config_file,
+        r#"provider = "lm-studio"
+
+[providers.lm-studio]
+kind = "openai-compatible"
+base_url = "http://127.0.0.1:18181/v1"
+model = "local-model"
+api_key = "local-test-key"
+"#,
+    )?;
+    let Some((addr, runtime_threads, handle)) =
+        spawn_test_server_with_config_path(config_file.clone()).await?
+    else {
+        return Ok(());
+    };
+    let thread = runtime_threads
+        .create_thread(crate::runtime_threads::CreateThreadRequest {
+            model: Some("local-model".to_string()),
+            model_provider: Some("lm-studio".to_string()),
+            ..Default::default()
+        })
+        .await?;
+    let harness = crate::core::engine::mock_engine_handle();
+    runtime_threads
+        .install_test_engine(&thread.id, harness.handle.clone())
+        .await?;
+
+    // The loaded thread's route is removed on disk outside this runtime, so
+    // any reload now rejects it.
+    let edited = r#"provider = "deepseek"
+
+[providers.volcengine]
+api_key = "ark-test"
+base_url = "https://ark.cn-beijing.volces.com/api/plan/v3"
+model = "glm-2"
+"#;
+    fs::write(&config_file, edited)?;
+
+    let client = crate::tls::reqwest_client();
+    let (status, body) =
+        post_switch_provider(&client, &addr, "volcengine", &serde_json::json!({})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body.to_string().contains("Config reload rejected"),
+        "{body}"
+    );
+    assert_eq!(
+        fs::read_to_string(&config_file)?,
+        edited,
+        "a switch the API reported as rejected must not remain in config.toml"
+    );
+
+    drop(harness);
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn zai_model_update_is_provider_scoped_and_preserves_deepseek_fallback() -> Result<()> {
     let root = std::env::temp_dir().join(format!(
         "codewhale-config-zai-model-scope-{}",
@@ -14822,6 +14888,23 @@ async fn cors_layer_advertises_exact_supported_headers_and_never_an_extra() -> R
     .collect::<std::collections::BTreeSet<_>>();
 
     assert_eq!(advertised, expected);
+
+    // Every method a `/v1` route is mounted on must be advertised, or the
+    // browser blocks it at preflight (PUT saves keys, files, sessions, goals).
+    let advertised_methods = allowed
+        .headers()
+        .get("access-control-allow-methods")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .split(',')
+        .map(str::trim)
+        .map(str::to_ascii_uppercase)
+        .collect::<std::collections::BTreeSet<_>>();
+    let expected_methods = ["DELETE", "GET", "OPTIONS", "PATCH", "POST", "PUT"]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(advertised_methods, expected_methods);
 
     let unapproved = client
         .request(reqwest::Method::OPTIONS, format!("http://{addr}/probe"))
@@ -15776,6 +15859,131 @@ async fn memory_search_query_filters_results() -> Result<()> {
         .send()
         .await?;
     assert_eq!(empty_q.status(), StatusCode::BAD_REQUEST);
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn memory_all_scope_includes_workspace_notes() -> Result<()> {
+    let root = std::env::temp_dir().join(format!("cw-memory-all-{}", Uuid::new_v4()));
+    let _lock = lock_test_env();
+    let home = root.join("home");
+    fs::create_dir_all(&home)?;
+    let _codewhale_home = EnvVarGuard::set("CODEWHALE_HOME", &home);
+    let repo = root.join("repo");
+    fs::create_dir_all(&repo)?;
+    run_test_git(&repo, &["init", "-b", "main"])?;
+    run_test_git(
+        &repo,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://example.invalid/memory-scope.git",
+        ],
+    )?;
+    let Some((addr, _rt, handle)) = spawn_test_server_with_root_token_mobile_workspace(
+        root.clone(),
+        root.join("sessions"),
+        None,
+        false,
+        repo,
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+    for (text, scope) in [
+        ("global cedar note", "global"),
+        ("workspace cedar note", "workspace"),
+    ] {
+        let created = client
+            .post(format!("http://{addr}/v1/memory"))
+            .json(&json!({ "text": text, "scope": scope }))
+            .send()
+            .await?;
+        assert_eq!(created.status(), StatusCode::CREATED);
+    }
+
+    // Omitted scope means "all": global plus this repository's notes, with
+    // and without a search query.
+    for url in [
+        format!("http://{addr}/v1/memory"),
+        format!("http://{addr}/v1/memory?scope=all"),
+        format!("http://{addr}/v1/memory?q=cedar"),
+    ] {
+        let listed: serde_json::Value = client
+            .get(&url)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let scopes = listed["entries"]
+            .as_array()
+            .context("entries array")?
+            .iter()
+            .filter_map(|entry| entry["scope"].as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            scopes,
+            ["global", "workspace"].into_iter().collect(),
+            "{url}: {listed}"
+        );
+    }
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn memory_workspace_scope_without_a_remote_is_a_client_error() -> Result<()> {
+    // A workspace with no origin remote has no workspace memory: asking for
+    // that scope is the caller's error, as it already is for create.
+    let root = std::env::temp_dir().join(format!("cw-memory-no-remote-{}", Uuid::new_v4()));
+    let _lock = lock_test_env();
+    let home = root.join("home");
+    fs::create_dir_all(&home)?;
+    let _codewhale_home = EnvVarGuard::set("CODEWHALE_HOME", &home);
+    let plain = root.join("plain");
+    fs::create_dir_all(&plain)?;
+    let Some((addr, _rt, handle)) = spawn_test_server_with_root_token_mobile_workspace(
+        root.clone(),
+        root.join("sessions"),
+        None,
+        false,
+        plain,
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+    client
+        .post(format!("http://{addr}/v1/memory"))
+        .json(&json!({ "text": "global cedar note", "scope": "global" }))
+        .send()
+        .await?
+        .error_for_status()?;
+    let listed = client
+        .get(format!("http://{addr}/v1/memory?scope=workspace"))
+        .send()
+        .await?;
+    assert_eq!(listed.status(), StatusCode::BAD_REQUEST);
+    let cleared = client
+        .delete(format!("http://{addr}/v1/memory?scope=workspace"))
+        .send()
+        .await?;
+    assert_eq!(cleared.status(), StatusCode::BAD_REQUEST);
+    let all: serde_json::Value = client
+        .get(format!("http://{addr}/v1/memory"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(all["total"], 1, "global memory stays listed: {all}");
 
     handle.abort();
     Ok(())

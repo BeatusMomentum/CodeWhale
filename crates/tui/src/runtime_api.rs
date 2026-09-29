@@ -9465,27 +9465,57 @@ async fn switch_provider(
     // model arg) MUST NOT write a `model` key, otherwise the user's
     // per-provider `[providers.<id>].model` config gets overwritten with
     // whatever the runtime resolves as the default.
-    config_persistence::persist_provider_selection(
+    let (config_toml, previous) = config_persistence::persist_provider_selection(
         state.config_path.as_deref(),
         target,
         &provider_identity,
         model_override.as_deref(),
     )
     .map_err(|e| ApiError::internal(format!("Failed to persist provider selection: {e}")))?;
+    let written = std::fs::read_to_string(&config_toml).ok();
 
     // Reload config from disk and sync to active engines. This matches
     // `POST /v1/config/reload` exactly: load → validate thread routes →
     // swap in the new config. A failure here means an active thread's
     // route is invalid under the new provider — surface it so the GUI can
     // tell the user to fix their config.
-    let mut reloaded = Config::load(state.config_path.clone(), state.config_profile.as_deref())
-        .map_err(|e| ApiError::internal(format!("Failed to reload config: {e}")))?;
-    reloaded.account_model_access = state.config.read().account_model_access.clone();
-    state
-        .runtime_threads
-        .reload_config(reloaded.clone())
-        .await
-        .map_err(|err| ApiError::bad_request(format!("Config reload rejected: {err}")))?;
+    let reloaded = match Config::load(state.config_path.clone(), state.config_profile.as_deref()) {
+        Ok(mut reloaded) => {
+            reloaded.account_model_access = state.config.read().account_model_access.clone();
+            match state.runtime_threads.reload_config(reloaded.clone()).await {
+                Ok(_) => Ok(reloaded),
+                Err(err) => Err(ApiError::bad_request(format!(
+                    "Config reload rejected: {err}"
+                ))),
+            }
+        }
+        Err(e) => Err(ApiError::internal(format!("Failed to reload config: {e}"))),
+    };
+    // A rejected switch must not stay on disk, or the next restart or reload
+    // silently applies the switch this response reports as refused. Restore
+    // only while the file still holds this write; a newer save wins.
+    let reloaded = match reloaded {
+        Ok(reloaded) => reloaded,
+        Err(mut error) => {
+            let restored = written.as_deref().map_or_else(
+                || Err(anyhow!("the written config could not be read back")),
+                |written| {
+                    codewhale_config::replace_config_document_if_unchanged(
+                        &config_toml,
+                        Some(written),
+                        &previous,
+                    )
+                },
+            );
+            if let Err(restore) = restored {
+                error.message = format!(
+                    "{}; the provider selection could not be reverted in config.toml: {restore}",
+                    error.message
+                );
+            }
+            return Err(error);
+        }
+    };
     {
         let mut config = state.config.write();
         *config = reloaded;
@@ -10611,20 +10641,32 @@ fn memory_hit_to_record(
 }
 
 /// Resolve a scope query parameter into a `MemoryScope` filter and an
-/// optional workspace_id.  `"all"` / absent → `(None, None)`.
+/// optional workspace_id. `"all"` / absent → `(None, <this workspace's id>)`,
+/// so "all" covers global memory plus this repository's workspace memory;
+/// without a resolvable identity there is no workspace memory to include.
 fn resolve_memory_scope(
     scope_param: &Option<String>,
     workspace: &FsPath,
 ) -> Result<(Option<crate::native_memory::MemoryScope>, Option<String>), ApiError> {
     match scope_param.as_deref().unwrap_or("all").trim() {
-        "all" | "" => Ok((None, None)),
+        "all" | "" => Ok((
+            None,
+            crate::native_memory::NativeMemoryStore::workspace_id(workspace)
+                .ok()
+                .flatten(),
+        )),
         "global" => Ok((Some(crate::native_memory::MemoryScope::Global), None)),
         "workspace" => {
             let workspace_id = crate::native_memory::NativeMemoryStore::workspace_id(workspace)
-                .map_err(|e| ApiError::internal(format!("resolve workspace id: {e}")))?;
+                .map_err(|e| ApiError::internal(format!("resolve workspace id: {e}")))?
+                .ok_or_else(|| {
+                    ApiError::bad_request(
+                        "workspace scope requires a git repository with a remote origin",
+                    )
+                })?;
             Ok((
                 Some(crate::native_memory::MemoryScope::Workspace),
-                workspace_id,
+                Some(workspace_id),
             ))
         }
         other => Err(ApiError::bad_request(format!(
@@ -10666,6 +10708,9 @@ async fn list_memory(
             return Err(ApiError::bad_request("q must be 1–256 characters"));
         }
         match scope_filter {
+            None if workspace_id.is_some() => {
+                store.search_for_workspace(&state.workspace, q, limit)
+            }
             None => store.search(q, limit),
             Some(crate::native_memory::MemoryScope::Global) => store.search(q, limit).map(|h| {
                 h.into_iter()
@@ -10830,6 +10875,7 @@ fn cors_layer(extra_origins: &[String]) -> CorsLayer {
         .allow_methods([
             Method::GET,
             Method::POST,
+            Method::PUT,
             Method::PATCH,
             Method::DELETE,
             Method::OPTIONS,
