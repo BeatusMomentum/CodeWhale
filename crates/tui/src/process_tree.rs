@@ -197,11 +197,35 @@ pub(crate) async fn contained_output_until(
     cmd: &mut tokio::process::Command,
     stop: impl std::future::Future<Output = ()>,
 ) -> std::io::Result<ContainedOutput> {
+    contained_run(cmd, None, stop).await
+}
+
+/// [`contained_output`] for a command that reads a request on stdin (a plugin
+/// tool's JSON input): `input` is written while the output pipes drain, then
+/// stdin is closed.
+pub(crate) async fn contained_output_with_input(
+    cmd: &mut tokio::process::Command,
+    input: Vec<u8>,
+) -> std::io::Result<std::process::Output> {
+    contained_run(cmd, Some(input), std::future::pending())
+        .await
+        .map(|run| run.output)
+}
+
+async fn contained_run(
+    cmd: &mut tokio::process::Command,
+    input: Option<Vec<u8>>,
+    stop: impl std::future::Future<Output = ()>,
+) -> std::io::Result<ContainedOutput> {
     use std::process::Stdio;
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
+    cmd.stdin(if input.is_some() {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    })
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .kill_on_drop(true);
     #[cfg(unix)]
     cmd.process_group(0);
     let mut child = cmd.spawn()?;
@@ -213,14 +237,28 @@ pub(crate) async fn contained_output_until(
     let _listed = child.id().map(ContainedExitListing::new);
     let mut stdout_pipe = child.stdout.take();
     let mut stderr_pipe = child.stderr.take();
+    let stdin_pipe = child.stdin.take();
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
     let exited = {
+        // Written alongside the drains: a child that answers before it has
+        // read all of its input would otherwise deadlock on a full pipe.
+        let feed = async move {
+            use tokio::io::AsyncWriteExt;
+            if let (Some(mut pipe), Some(input)) = (stdin_pipe, input) {
+                // A child that exits without reading its input closes the
+                // pipe; that is its answer, not a run failure.
+                if pipe.write_all(&input).await.is_ok() {
+                    let _ = pipe.shutdown().await;
+                }
+            }
+        };
         let run = async {
-            let (out, err, status) = tokio::join!(
+            let (out, err, status, ()) = tokio::join!(
                 drain_pipe(stdout_pipe.as_mut(), &mut stdout),
                 drain_pipe(stderr_pipe.as_mut(), &mut stderr),
                 child.wait(),
+                feed,
             );
             out?;
             err?;
@@ -510,6 +548,22 @@ mod tests {
             .expect("run");
         assert!(output.status.success());
         assert_eq!(String::from_utf8_lossy(&output.stdout), "done\n");
+    }
+
+    /// The input reaches stdin, and stdin is closed after it.
+    #[tokio::test]
+    async fn contained_output_with_input_feeds_then_closes_stdin() {
+        let mut cmd = tokio::process::Command::new("/bin/sh");
+        cmd.arg("-c").arg("cat; echo done");
+        let output = tokio::time::timeout(
+            Duration::from_secs(10),
+            contained_output_with_input(&mut cmd, b"request\n".to_vec()),
+        )
+        .await
+        .expect("stdin must be closed after the input")
+        .expect("run");
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "request\ndone\n");
     }
 
     /// A command that exits on its own is not reaped along with what it

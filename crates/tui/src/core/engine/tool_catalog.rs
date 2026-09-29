@@ -1637,10 +1637,16 @@ pub(super) async fn execute_code_execution_tool(
     })?;
     cmd.arg(&script_path).current_dir(workspace);
 
-    let output = tokio::time::timeout(Duration::from_secs(120), cmd.output())
-        .await
-        .map_err(|_| ToolError::Timeout { seconds: 120 })
-        .and_then(|res| res.map_err(|e| ToolError::execution_failed(e.to_string())))?;
+    // Contained: at the timeout (or a cancelled turn) the interpreter and
+    // anything the script started die together; a bare `output()` left both
+    // running.
+    let output = tokio::time::timeout(
+        Duration::from_secs(120),
+        crate::process_tree::contained_output(&mut cmd),
+    )
+    .await
+    .map_err(|_| ToolError::Timeout { seconds: 120 })
+    .and_then(|res| res.map_err(|e| ToolError::execution_failed(e.to_string())))?;
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
