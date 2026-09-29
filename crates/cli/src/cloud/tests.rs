@@ -154,6 +154,17 @@ fn command(argv: &[&str]) -> CloudCommand {
     args.command
 }
 
+fn computer(id: &str, status: &str) -> serde_json::Value {
+    json!({
+        "id": id,
+        "ownerId": "acct-123",
+        "name": "Account pilot",
+        "region": "us-west",
+        "status": status,
+        "startQueueReason": if status == "queued" { "active_limit" } else { "" }
+    })
+}
+
 #[test]
 fn parses_cloud_command_matrix_and_rejects_inline_keys() {
     assert!(matches!(
@@ -1832,5 +1843,194 @@ fn logout_preserves_custody_until_server_confirms_revocation_or_dead_session() {
                 "refresh-revoke"
             );
         }
+    }
+}
+
+#[test]
+fn account_computers_use_the_same_account_api_and_report_queued_starts() {
+    const ID: &str = "123e4567-e89b-42d3-a456-426614174000";
+    let (_temp, config) = test_config();
+    let (secrets, _) = test_secrets();
+    let store = AccountSessionStore::new(secrets.clone(), Some("default"), DEFAULT_API_BASE);
+    store
+        .save(auth("access-secret", "refresh-secret", "acct-123"))
+        .unwrap();
+    let mut queued = computer(ID, "suspended");
+    queued["startQueueReason"] = json!("active_limit");
+    let transport = FakeTransport::new(vec![
+        response(200, json!({"computers": [computer(ID, "suspended")]})),
+        response(200, json!({"computer": computer(ID, "suspended")})),
+        response(200, json!({"computer": computer(ID, "suspended")})),
+        response(202, json!({"computer": queued, "queued": true})),
+        response(200, json!({"computer": computer(ID, "suspended")})),
+        response(200, json!({"deleted": true, "computerId": ID})),
+    ]);
+    let mut output = Vec::new();
+    let mut key_reader = |_| bail!("unused");
+    let mut opener = |_| true;
+    let mut sleeper = |_| {};
+    let commands = [
+        vec!["codewhale", "account", "computers", "list"],
+        vec![
+            "codewhale",
+            "account",
+            "computers",
+            "create",
+            "Account pilot",
+        ],
+        vec!["codewhale", "account", "computers", "show", ID],
+        vec!["codewhale", "account", "computers", "start", ID],
+        vec!["codewhale", "account", "computers", "pause", ID],
+        vec!["codewhale", "account", "computers", "delete", ID],
+    ];
+    for argv in commands {
+        run_with(
+            command(&argv),
+            "default",
+            DEFAULT_API_BASE,
+            &config,
+            &secrets,
+            &secrets,
+            &machine::MachineKeyEnv::default(),
+            &transport,
+            &mut output,
+            &mut key_reader,
+            &mut opener,
+            &mut sleeper,
+        )
+        .unwrap();
+    }
+    let requests = transport.requests();
+    assert_eq!(
+        requests
+            .iter()
+            .map(|request| request.path.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "/api/computers",
+            "/api/computers",
+            "/api/computers/123e4567-e89b-42d3-a456-426614174000",
+            "/api/computers/123e4567-e89b-42d3-a456-426614174000/start",
+            "/api/computers/123e4567-e89b-42d3-a456-426614174000/pause",
+            "/api/computers/123e4567-e89b-42d3-a456-426614174000",
+        ]
+    );
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.bearer.as_deref() == Some("access-secret"))
+    );
+    assert!(requests[0].method == HttpMethod::Get);
+    assert!(requests[1].method == HttpMethod::Post);
+    assert!(requests[5].method == HttpMethod::Delete);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(requests[1].body.as_ref().unwrap()).unwrap(),
+        json!({"name":"Account pilot"})
+    );
+    let output = String::from_utf8(output).unwrap();
+    assert!(output.contains("Account ID: acct-123"));
+    assert!(output.contains("Saved Computer identity; compute is allocated when you start it."));
+    assert!(output.contains("Computer start queued."));
+    assert!(output.contains("Reason: active_limit"));
+    assert!(output.contains(&format!("Deleted Computer {ID}.")));
+    assert!(!output.contains("access-secret"));
+}
+
+#[test]
+fn account_computers_refuse_unsafe_ids_machine_keys_and_unconfirmed_delete() {
+    let (secrets, _) = test_secrets();
+    let transport = FakeTransport::new(vec![]);
+    let client = CloudClient::new(&transport, &secrets, "default", DEFAULT_API_BASE);
+    client
+        .save_auth(auth("access-secret", "refresh-secret", "acct-123"))
+        .unwrap();
+    assert!(client.computer("../other").is_err());
+    assert!(client.computer_action("id/other", "start").is_err());
+    assert!(client.delete_computer("id?other").is_err());
+    assert!(client.create_computer("un\nsafe").is_err());
+    let error = run_computers(
+        CloudComputersCommand::List { json: false },
+        &client,
+        &machine::MachineKeyEnv::from_raw(Some("machine-key-present")),
+        &mut Vec::new(),
+    )
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("interactive Codewhale account login")
+    );
+    assert!(transport.requests().is_empty());
+
+    let denied = FakeTransport::new(vec![response(
+        200,
+        json!({"deleted": false, "computerId": "123e4567-e89b-42d3-a456-426614174000"}),
+    )]);
+    let client = CloudClient::new(&denied, &secrets, "default", DEFAULT_API_BASE);
+    assert!(
+        client
+            .delete_computer("123e4567-e89b-42d3-a456-426614174000")
+            .is_err()
+    );
+}
+
+#[test]
+fn account_computers_json_preserves_server_metering_and_entitlement() {
+    const ID: &str = "123e4567-e89b-42d3-a456-426614174000";
+    let (_temp, config) = test_config();
+    let (secrets, _) = test_secrets();
+    let account = AccountSessionStore::new(secrets.clone(), Some("default"), DEFAULT_API_BASE);
+    account
+        .save(auth("access-secret", "refresh-secret", "acct-123"))
+        .unwrap();
+    let mut record = computer(ID, "running");
+    record["allowanceMultiplier"] = json!(1);
+    record["allowance"] = json!({
+        "meter": "compute_cu", "usedCu": 2.5, "includedCu": 20,
+        "remainingCu": 17.5, "state": "ok"
+    });
+    record["futureMeterField"] = json!({"value": 7});
+    let listing = json!({
+        "computers": [record.clone()],
+        "entitlement": {"planId": "test", "seatActive": true}
+    });
+    let shown = json!({"computer": record});
+    let transport = FakeTransport::new(vec![
+        response(200, listing.clone()),
+        response(200, shown.clone()),
+    ]);
+    let mut key_reader = |_| bail!("unused");
+    let mut opener = |_| true;
+    let mut sleeper = |_| {};
+    for (argv, expected) in [
+        (
+            vec!["codewhale", "account", "computers", "list", "--json"],
+            listing,
+        ),
+        (
+            vec!["codewhale", "account", "computers", "show", ID, "--json"],
+            shown,
+        ),
+    ] {
+        let mut output = Vec::new();
+        run_with(
+            command(&argv),
+            "default",
+            DEFAULT_API_BASE,
+            &config,
+            &secrets,
+            &secrets,
+            &machine::MachineKeyEnv::default(),
+            &transport,
+            &mut output,
+            &mut key_reader,
+            &mut opener,
+            &mut sleeper,
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&output).unwrap(),
+            expected
+        );
     }
 }

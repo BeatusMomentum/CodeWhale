@@ -57,6 +57,8 @@ enum CloudCommand {
     /// These are credentials Codewhale presents *to* a model provider. For the
     /// machine tokens a customer presents *to* Codewhale, see `api-keys`.
     Keys(CloudKeysArgs),
+    /// Manage Computers in this signed-in Codewhale account.
+    Computers(CloudComputersArgs),
     /// Manage Codewhale account API keys: machine tokens for CI.
     #[command(name = "api-keys")]
     ApiKeys(machine::ApiKeysArgs),
@@ -102,6 +104,35 @@ struct CloudPushArgs {
 struct CloudKeysArgs {
     #[command(subcommand)]
     command: CloudKeysCommand,
+}
+
+#[derive(Debug, Args)]
+struct CloudComputersArgs {
+    #[command(subcommand)]
+    command: CloudComputersCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum CloudComputersCommand {
+    /// List this account's Computers; --json includes allowance and entitlement data.
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Save a Computer identity; compute is allocated only when it starts.
+    Create { name: String },
+    /// Show one Computer; --json includes allowance and meter data.
+    Show {
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Start a Computer, subject to the account's plan and capacity.
+    Start { id: String },
+    /// Pause a Computer.
+    Pause { id: String },
+    /// Permanently delete a Computer and its provider allocation.
+    Delete { id: String },
 }
 
 #[derive(Debug, Subcommand)]
@@ -156,6 +187,42 @@ struct CatalogProvider {
 struct ProviderCatalogResponse {
     #[serde(default)]
     providers: Vec<CatalogProvider>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AccountComputer {
+    id: String,
+    owner_id: String,
+    name: String,
+    region: String,
+    status: String,
+    #[serde(default)]
+    start_queue_reason: String,
+}
+
+#[derive(Deserialize)]
+struct ComputerListResponse {
+    computers: Vec<AccountComputer>,
+}
+
+#[derive(Deserialize)]
+struct ComputerResponse {
+    computer: AccountComputer,
+    #[serde(default)]
+    queued: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ComputerDeleteResponse {
+    deleted: bool,
+    computer_id: String,
+}
+
+#[derive(Serialize)]
+struct ComputerCreateRequest<'a> {
+    name: &'a str,
 }
 
 impl CatalogProvider {
@@ -495,6 +562,62 @@ impl<'a, T: CloudTransport> CloudClient<'a, T> {
         Ok(providers)
     }
 
+    fn computers(&self) -> Result<serde_json::Value> {
+        let response = self.execute_authenticated(HttpMethod::Get, "/api/computers", None)?;
+        expect_json(response, &[200])
+    }
+
+    fn computer(&self, id: &str) -> Result<serde_json::Value> {
+        let id = validate_computer_id(id)?;
+        let response =
+            self.execute_authenticated(HttpMethod::Get, &format!("/api/computers/{id}"), None)?;
+        expect_json(response, &[200])
+    }
+
+    fn create_computer(&self, name: &str) -> Result<AccountComputer> {
+        let name = validate_computer_name(name)?;
+        let response = self.execute_authenticated(
+            HttpMethod::Post,
+            "/api/computers",
+            Some(json_body(&ComputerCreateRequest { name: &name })?),
+        )?;
+        let result: ComputerResponse = expect_json(response, &[200, 201])?;
+        Ok(result.computer)
+    }
+
+    fn computer_action(&self, id: &str, action: &str) -> Result<ComputerResponse> {
+        let id = validate_computer_id(id)?;
+        let response = self.execute_authenticated(
+            HttpMethod::Post,
+            &format!("/api/computers/{id}/{action}"),
+            None,
+        )?;
+        let status = response.status;
+        let result: ComputerResponse = expect_json(
+            response,
+            if action == "start" {
+                &[200, 202]
+            } else {
+                &[200]
+            },
+        )?;
+        if status == 202 && !result.queued {
+            bail!("The Codewhale service returned a queued start without queue details");
+        }
+        Ok(result)
+    }
+
+    fn delete_computer(&self, id: &str) -> Result<()> {
+        let id = validate_computer_id(id)?;
+        let response =
+            self.execute_authenticated(HttpMethod::Delete, &format!("/api/computers/{id}"), None)?;
+        let result: ComputerDeleteResponse = expect_json(response, &[200])?;
+        if !result.deleted || result.computer_id != id {
+            bail!("The Codewhale service did not confirm deletion of Computer {id}");
+        }
+        Ok(())
+    }
+
     fn logout(&self) -> Result<bool> {
         let snapshot = self.account_store.snapshot()?;
         self.account_store
@@ -647,6 +770,122 @@ impl<'a, T: CloudTransport> CloudClient<'a, T> {
             }
             sleeper(machine::backoff_delay(attempt, retry_after));
             attempt += 1;
+        }
+    }
+}
+
+fn validate_computer_id(value: &str) -> Result<&str> {
+    let id = value.trim();
+    let bytes = id.as_bytes();
+    if bytes.is_empty()
+        || bytes.len() > 160
+        || !bytes[0].is_ascii_alphanumeric()
+        || !bytes
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        bail!("Computer ID must be a bounded identifier of letters, digits, `-`, or `_`");
+    }
+    Ok(id)
+}
+
+fn validate_computer_name(value: &str) -> Result<String> {
+    let name = value.trim();
+    if name.is_empty() || name.chars().count() > 80 || name.chars().any(char::is_control) {
+        bail!("Computer name must contain 1-80 characters without control characters");
+    }
+    Ok(name.to_string())
+}
+
+fn write_computer<W: Write>(out: &mut W, computer: &AccountComputer) -> Result<()> {
+    validate_computer_id(&computer.id)?;
+    if computer.owner_id.trim().is_empty() {
+        bail!("The Codewhale service returned a Computer without an owner");
+    }
+    writeln!(out, "Computer: {}", printable(&computer.name))?;
+    writeln!(out, "ID: {}", computer.id)?;
+    writeln!(out, "Account ID: {}", printable(&computer.owner_id))?;
+    writeln!(out, "Status: {}", printable(&computer.status))?;
+    writeln!(out, "Region: {}", printable(&computer.region))?;
+    Ok(())
+}
+
+fn write_computer_json<W: Write>(out: &mut W, value: &serde_json::Value) -> Result<()> {
+    serde_json::to_writer_pretty(&mut *out, value)
+        .context("failed to write Codewhale Computer JSON")?;
+    writeln!(out)?;
+    Ok(())
+}
+
+fn run_computers<T: CloudTransport, W: Write>(
+    command: CloudComputersCommand,
+    client: &CloudClient<'_, T>,
+    machine: &machine::MachineKeyEnv,
+    out: &mut W,
+) -> Result<()> {
+    // Machine keys are intentionally narrower than an interactive account
+    // session. A present key must never silently fall back to a human login.
+    if machine.is_present() {
+        bail!(
+            "Computers require an interactive Codewhale account login; unset CODEWHALE_API_KEY and run `codewhale login`"
+        );
+    }
+    match command {
+        CloudComputersCommand::List { json } => {
+            let response = client.computers()?;
+            if json {
+                return write_computer_json(out, &response);
+            }
+            let computers: ComputerListResponse = serde_json::from_value(response)
+                .context("The Codewhale service returned an invalid Computer list")?;
+            let computers = computers.computers;
+            writeln!(out, "Codewhale Computers ({})", computers.len())?;
+            for computer in &computers {
+                write_computer(out, computer)?;
+            }
+            Ok(())
+        }
+        CloudComputersCommand::Create { name } => {
+            let computer = client.create_computer(&name)?;
+            write_computer(out, &computer)?;
+            writeln!(
+                out,
+                "Saved Computer identity; compute is allocated when you start it."
+            )?;
+            Ok(())
+        }
+        CloudComputersCommand::Show { id, json } => {
+            let response = client.computer(&id)?;
+            if json {
+                write_computer_json(out, &response)
+            } else {
+                let result: ComputerResponse = serde_json::from_value(response)
+                    .context("The Codewhale service returned an invalid Computer")?;
+                write_computer(out, &result.computer)
+            }
+        }
+        CloudComputersCommand::Start { id } => {
+            let result = client.computer_action(&id, "start")?;
+            if result.queued {
+                writeln!(out, "Computer start queued.")?;
+                if !result.computer.start_queue_reason.is_empty() {
+                    writeln!(
+                        out,
+                        "Reason: {}",
+                        printable(&result.computer.start_queue_reason)
+                    )?;
+                }
+            }
+            write_computer(out, &result.computer)
+        }
+        CloudComputersCommand::Pause { id } => {
+            let result = client.computer_action(&id, "pause")?;
+            write_computer(out, &result.computer)
+        }
+        CloudComputersCommand::Delete { id } => {
+            client.delete_computer(&id)?;
+            writeln!(out, "Deleted Computer {}.", validate_computer_id(&id)?)?;
+            Ok(())
         }
     }
 }
@@ -882,6 +1121,9 @@ fn run_with<T: CloudTransport, W: Write>(
                 Ok(())
             }
         },
+        CloudCommand::Computers(computers) => {
+            run_computers(computers.command, &client, machine, out)
+        }
         CloudCommand::ApiKeys(api_keys) => {
             machine::run_api_keys(api_keys, &client, machine, provider_secrets, out, sleeper)
         }
