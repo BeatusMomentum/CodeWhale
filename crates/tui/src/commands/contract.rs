@@ -101,7 +101,7 @@ use codewhale_localization::{MessageId, tr};
 /// (`scripts/check-command-migration-manifest.py`) reads this exact
 /// declaration by source regex and the Rust frontier tests assert it.
 #[cfg_attr(not(test), expect(dead_code))]
-pub(crate) const PENDING_GROUPS: &[&str] = &["config", "core", "session"];
+pub(crate) const PENDING_GROUPS: &[&str] = &["config", "core"];
 
 // ---------------------------------------------------------------------------
 // Boundary-value mappings (D8)
@@ -283,6 +283,10 @@ struct CommandHost<'a> {
 }
 
 type SharedCommandHost<'a> = Rc<CommandHost<'a>>;
+
+#[path = "session_structcopy_host.rs"]
+pub(in crate::commands) mod structcopy_host;
+use structcopy_host::SessionStructcopyAdapter;
 
 // ---------------------------------------------------------------------------
 // Session lifecycle adapter (FEAT-023 D4)
@@ -2038,11 +2042,22 @@ impl CommandPresentationContext for PresentationAdapter<'_> {
     }
 }
 
-/// Resolve a stable session-control message key to the current catalog id
-/// (FEAT-024 D6). Only `/remote-env` makes runtime catalog calls; the other
-/// five control commands keep their metadata-only `description_key` usage.
+/// Resolve session-control and structural-copy runtime keys to the current
+/// catalog. Other session commands retain metadata-only localization.
 pub(crate) fn key_to_session_message_id(key: &str) -> Option<MessageId> {
     Some(match key {
+        "cmd_structcopy_kind_turn" => MessageId::CmdStructcopyKindTurn,
+        "cmd_structcopy_kind_tool" => MessageId::CmdStructcopyKindTool,
+        "cmd_structcopy_kind_plan" => MessageId::CmdStructcopyKindPlan,
+        "cmd_structcopy_kind_workflow" => MessageId::CmdStructcopyKindWorkflow,
+        "cmd_structcopy_usage_error" => MessageId::CmdStructcopyUsageError,
+        "cmd_structcopy_unavailable" => MessageId::CmdStructcopyUnavailable,
+        "cmd_structcopy_busy" => MessageId::CmdStructcopyBusy,
+        "cmd_structcopy_prepare_failed" => MessageId::CmdStructcopyPrepareFailed,
+        "cmd_structcopy_receipt_too_large" => MessageId::CmdStructcopyReceiptTooLarge,
+        "cmd_structcopy_clipboard_queued" => MessageId::CmdStructcopyClipboardQueued,
+        "cmd_structcopy_clipboard_accepted" => MessageId::CmdStructcopyClipboardAccepted,
+        "cmd_structcopy_clipboard_failed" => MessageId::CmdStructcopyClipboardFailed,
         "cmd_remote_env_overview" => MessageId::CmdRemoteEnvOverview,
         "cmd_remote_env_opening" => MessageId::CmdRemoteEnvOpening,
         "cmd_remote_env_unavailable" => MessageId::CmdRemoteEnvUnavailable,
@@ -4329,7 +4344,7 @@ fn default_codewhale_tools_dir() -> Option<PathBuf> {
 // Envelope construction (D1)
 // ---------------------------------------------------------------------------
 
-/// Owns twenty-two facet objects sharing one synchronous TUI host proxy.
+/// Owns twenty-three facet objects sharing one synchronous TUI host proxy.
 ///
 /// Handlers borrow only these adapters. Every method delegates to the real App
 /// authority and releases its `RefCell` borrow before returning, so facets can
@@ -4351,6 +4366,7 @@ pub(crate) struct CommandContextBundle<'a> {
     lifecycle: SessionLifecycleAdapter<'a>,
     control: SessionControlAdapter<'a>,
     export: SessionExportAdapter<'a>,
+    structcopy: SessionStructcopyAdapter<'a>,
     debug_receipts: DebugOperationsAdapter<'a>,
     debug_change: DebugOperationsAdapter<'a>,
     debug_history: DebugOperationsAdapter<'a>,
@@ -4408,6 +4424,9 @@ impl<'a> CommandContextBundle<'a> {
         if capabilities.contains(CommandCapabilities::SESSION_CONTROL) {
             contexts = contexts.with_control(&mut self.control);
         }
+        if capabilities.contains(CommandCapabilities::SESSION_STRUCTCOPY) {
+            contexts = contexts.with_structcopy(&mut self.structcopy);
+        }
         if capabilities.contains(CommandCapabilities::SESSION_EXPORT) {
             contexts = contexts.with_export(&mut self.export);
         }
@@ -4451,6 +4470,7 @@ impl<'a> CommandContextBundle<'a> {
             .union(CommandCapabilities::SESSION_LIFECYCLE)
             .union(CommandCapabilities::SESSION_CONTROL)
             .union(CommandCapabilities::SESSION_EXPORT)
+            .union(CommandCapabilities::SESSION_STRUCTCOPY)
             .union(CommandCapabilities::DEBUG_RECEIPTS)
             .union(CommandCapabilities::DEBUG_CHANGE)
             .union(CommandCapabilities::DEBUG_HISTORY)
@@ -4485,6 +4505,7 @@ impl App {
             lifecycle: SessionLifecycleAdapter { host: host.clone() },
             control: SessionControlAdapter { host: host.clone() },
             export: SessionExportAdapter { host: host.clone() },
+            structcopy: SessionStructcopyAdapter { host: host.clone() },
             debug_receipts: DebugOperationsAdapter { host: host.clone() },
             debug_change: DebugOperationsAdapter { host: host.clone() },
             debug_history: DebugOperationsAdapter { host: host.clone() },

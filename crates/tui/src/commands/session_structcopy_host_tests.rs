@@ -26,6 +26,7 @@ fn app(temp: &TempDir) -> App {
 
 fn call(name: &str) -> ContentBlock {
     ContentBlock::ToolUse {
+        execution_id: None,
         id: "call-golden".into(),
         name: name.into(),
         input: json!({"url":"https://alice:secret@example.test/path?token=x#frag", "api_key":"secret-value"}),
@@ -39,6 +40,7 @@ fn call(name: &str) -> ContentBlock {
 
 fn result(content: &str, is_error: Option<bool>) -> ContentBlock {
     ContentBlock::ToolResult {
+        execution_id: None,
         tool_use_id: "call-golden".into(),
         content: content.into(),
         is_error,
@@ -305,5 +307,108 @@ fn structcopy_public_workflow_matches_frozen_baseline() {
         baseline_observations(),
         expected,
         "observable structcopy behavior changed"
+    );
+}
+
+#[test]
+fn structcopy_host_exposes_exact_authority_and_filters_private_data_before_crossing() {
+    use super::contract::structcopy_host::StructcopyRegistration;
+    use codewhale_command_contract::facets::*;
+    use codewhale_command_contract::handler::{CommandCapabilities, CommandHandler, ContextParts};
+    use codewhale_command_contract::metadata::RegisterCommand;
+    let CommandHandler::Contextual { capabilities, .. } = StructcopyRegistration::handler() else {
+        panic!("contract registration required");
+    };
+    assert_eq!(
+        capabilities,
+        CommandCapabilities::SESSION_STRUCTCOPY.union(CommandCapabilities::PRESENTATION)
+    );
+    let tmp = TempDir::new().unwrap();
+    let mut app = app(&tmp);
+    seed(&mut app);
+    let mut bundle = app.command_contexts();
+    let ContextParts {
+        structcopy,
+        presentation,
+        session,
+        model,
+        cost,
+        mode_policy,
+        system_prompt,
+        skills,
+        workspace,
+        media,
+        memory,
+        project,
+        skill_group,
+        plugin,
+        lifecycle,
+        control,
+        export,
+        debug_receipts,
+        debug_change,
+        debug_history,
+        debug_diff,
+        debug_undo,
+        debug_diagnostics,
+    } = bundle.contexts(capabilities).into_parts();
+    assert!(presentation.is_some());
+    assert!(
+        session.is_none()
+            && model.is_none()
+            && cost.is_none()
+            && mode_policy.is_none()
+            && system_prompt.is_none()
+            && skills.is_none()
+            && workspace.is_none()
+            && media.is_none()
+            && memory.is_none()
+            && project.is_none()
+            && skill_group.is_none()
+            && plugin.is_none()
+            && lifecycle.is_none()
+            && control.is_none()
+            && export.is_none()
+            && debug_receipts.is_none()
+            && debug_change.is_none()
+            && debug_history.is_none()
+            && debug_diff.is_none()
+            && debug_undo.is_none()
+            && debug_diagnostics.is_none()
+    );
+    let copy = structcopy.unwrap();
+    assert_eq!(copy.transcript_item(0), Err(StructcopyError::Unavailable));
+    assert_eq!(
+        copy.transcript_item(1).unwrap().content,
+        StructcopyContent::InternalContext
+    );
+    let visible = copy.transcript_item(2).unwrap();
+    let debug = format!("{visible:?}");
+    for forbidden in [
+        "hidden reasoning",
+        "hidden-signature",
+        "private-call-signature",
+        "private-base64",
+        "data:image",
+    ] {
+        assert!(!debug.contains(forbidden), "{debug}");
+    }
+    let StructcopyContent::Visible(blocks) = visible.content else {
+        panic!("visible blocks")
+    };
+    assert!(blocks.contains(&StructcopyBlock::ThinkingOmitted));
+    assert!(blocks.contains(&StructcopyBlock::ImageOmitted));
+    let pair = copy.tool_pair("call-golden").unwrap();
+    assert_eq!(pair.name, "last-call");
+    let result = pair.result.unwrap();
+    assert_eq!(result.content, "last-result");
+    assert_eq!(result.is_error, None);
+    assert_eq!(
+        copy.tool_pair("server-only"),
+        Err(StructcopyError::Unavailable)
+    );
+    assert_eq!(
+        copy.plan_snapshot().unwrap().title.as_deref(),
+        Some("Golden plan")
     );
 }

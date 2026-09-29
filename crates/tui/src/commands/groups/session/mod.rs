@@ -15,7 +15,7 @@ mod rename;
 mod resume;
 mod save;
 mod sessions;
-mod structcopy;
+pub(in crate::commands) mod structcopy;
 mod title;
 mod tree;
 // This group dir intentionally has a `session.rs` child module with the same
@@ -28,9 +28,7 @@ use crate::commands::CommandResult;
 
 /// Shared user-facing length policy for `/rename` and `/title`.
 pub(in crate::commands) const MAX_TITLE_LEN: usize = 100;
-use crate::commands::traits::{
-    Command, CommandGroup, ContextualCommand, FunctionCommand, RegisterCommand,
-};
+use crate::commands::traits::{Command, CommandGroup, ContextualCommand};
 
 pub struct SessionCommands;
 
@@ -91,10 +89,12 @@ impl CommandGroup for SessionCommands {
                 ContextualCommand::from_contract::<export::ExportCmd>()
                     .expect("export registration")
             ),
-            Box::new(FunctionCommand::new(
-                structcopy::StructcopyCmd::info(),
-                structcopy::StructcopyCmd::execute,
-            )),
+            Box::new(
+                ContextualCommand::from_contract::<
+                    crate::commands::contract::structcopy_host::StructcopyRegistration,
+                >()
+                .expect("structcopy registration")
+            ),
         ])
     }
 }
