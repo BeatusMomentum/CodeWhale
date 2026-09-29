@@ -4,6 +4,7 @@
 //! approval policy as the other code-executing tools.
 
 use std::path::Path;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -100,7 +101,7 @@ impl ToolSpec for RunTestsTool {
         }
 
         let command_str = format_command(&workdir, &args);
-        let output = run_cargo(&workdir, &args)?;
+        let output = run_cargo(&workdir, &args, context, RUN_TESTS_TIMEOUT).await?;
 
         // The whole output: the end of a cargo run is where the failures and
         // the `test result:` line are. Size is the engine's one recoverable
@@ -134,8 +135,19 @@ fn run_tests_result(result: RunTestsOutput) -> Result<ToolResult, ToolError> {
 
 // === Helpers ===
 
-fn run_cargo(workspace: &Path, args: &[String]) -> Result<std::process::Output, ToolError> {
-    let Some(mut cmd) = crate::dependencies::Cargo::command() else {
+/// Ceiling for one `cargo test` run. Long suites fit; a hung test does not
+/// hold the turn forever.
+const RUN_TESTS_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
+/// Run cargo without blocking a runtime worker. Stop and the timeout both end
+/// the whole process tree (cargo and the test binaries it started).
+async fn run_cargo(
+    workspace: &Path,
+    args: &[String],
+    context: &ToolContext,
+    timeout: Duration,
+) -> Result<std::process::Output, ToolError> {
+    let Some(mut cmd) = crate::dependencies::Cargo::tokio_command() else {
         return Err(ToolError::not_available(
             "cargo is not installed or not in PATH",
         ));
@@ -143,8 +155,21 @@ fn run_cargo(workspace: &Path, args: &[String]) -> Result<std::process::Output, 
     cmd.args(args).current_dir(workspace);
     // `cargo test` builds and runs workspace code; do not hand it parent
     // credentials.
-    crate::child_env::apply_to_command(&mut cmd, std::iter::empty::<(&str, &str)>());
-    cmd.output().map_err(|e| {
+    crate::child_env::apply_to_tokio_command(&mut cmd, std::iter::empty::<(&str, &str)>());
+    let run = tokio::time::timeout(timeout, crate::process_tree::contained_output(&mut cmd));
+    let cancelled = async {
+        match context.cancel_token.as_ref() {
+            Some(token) => token.cancelled().await,
+            None => std::future::pending::<()>().await,
+        }
+    };
+    let output = tokio::select! {
+        output = run => output.map_err(|_| ToolError::Timeout {
+            seconds: timeout.as_secs(),
+        })?,
+        () = cancelled => return Err(ToolError::cancelled("cargo test cancelled")),
+    };
+    output.map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
             ToolError::not_available("cargo is not installed or not in PATH")
         } else {
@@ -211,6 +236,24 @@ mod tests {
             tool.approval_requirement(),
             ApprovalRequirement::Required,
             "run_tests must gate cargo test behind user approval"
+        );
+    }
+
+    /// Stop must reach `cargo test`: the call returns as cancelled instead of
+    /// blocking a runtime worker until cargo exits on its own.
+    #[tokio::test]
+    async fn run_tests_honors_cancellation() {
+        if !cargo_available() {
+            return;
+        }
+        let tmp = tempdir().expect("tempdir");
+        let token = tokio_util::sync::CancellationToken::new();
+        token.cancel();
+        let ctx = ToolContext::new(tmp.path()).with_cancel_token(token);
+        let result = RunTestsTool.execute(json!({}), &ctx).await;
+        assert!(
+            matches!(result, Err(ToolError::Cancelled { .. })),
+            "cancelled run_tests must not run to completion: {result:?}"
         );
     }
 
@@ -378,8 +421,8 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn run_cargo_does_not_inherit_parent_secret_env() {
+    #[tokio::test]
+    async fn run_cargo_does_not_inherit_parent_secret_env() {
         use crate::test_support::{EnvVarGuard, lock_test_env};
         use std::os::unix::fs::PermissionsExt;
         if !cargo_available() {
@@ -405,7 +448,15 @@ mod tests {
         let _target = EnvVarGuard::set("CARGO_TARGET_DIR", "/tmp/codewhale-fixture-target");
         let workspace = tempdir().expect("workspace");
 
-        let output = run_cargo(workspace.path(), &["envprobe".to_string()]).expect("cargo runs");
+        let ctx = ToolContext::new(workspace.path());
+        let output = run_cargo(
+            workspace.path(),
+            &["envprobe".to_string()],
+            &ctx,
+            RUN_TESTS_TIMEOUT,
+        )
+        .await
+        .expect("cargo runs");
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(
             output.status.success(),

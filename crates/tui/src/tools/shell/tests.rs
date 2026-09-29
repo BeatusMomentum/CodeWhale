@@ -3799,12 +3799,127 @@ fn test_list_jobs_cleans_up_completed_old_processes() {
     // Both the completed job and any tracking state should be present.
     assert!(!manager.processes.is_empty());
 
-    // cleanup(ZERO) removes all completed processes immediately.
+    // cleanup(ZERO) removes every delivered completed process immediately.
+    manager.drain_finished_jobs_with_evidence();
     manager.cleanup(Duration::ZERO);
     assert!(
         manager.processes.is_empty(),
         "completed processes should be evicted by cleanup"
     );
+}
+
+/// A job that ran longer than the retention age must survive until its
+/// completion is delivered: age counts from the finish, not the start.
+#[test]
+fn cleanup_ages_jobs_from_finish_and_keeps_undelivered_completions() {
+    let tmp = tempdir().expect("tempdir");
+    let mut manager = ShellManager::new(tmp.path().to_path_buf());
+    let long_run = FINISHED_SHELL_MAX_AGE + Duration::from_secs(600);
+    manager.seed_finished_record_for_test("long-job", long_run);
+
+    // Started 70 minutes ago, finished just now, not yet delivered.
+    manager.list_jobs();
+    assert!(
+        manager.inspect_job("long-job").is_ok(),
+        "a long job must not be evicted the moment it finishes"
+    );
+    let delivered = manager.drain_finished_jobs_with_evidence();
+    assert_eq!(delivered.len(), 1, "the completion must still be delivered");
+    assert_eq!(delivered[0].event.task_id, "long-job");
+
+    // Delivered and recently finished: still inside the retention window.
+    manager.cleanup(FINISHED_SHELL_MAX_AGE);
+    assert!(manager.inspect_job("long-job").is_ok());
+
+    // Delivered and finished longer ago than the window: evicted.
+    let shell = manager.processes.get_mut("long-job").expect("record");
+    shell.finished_at = Instant::now().checked_sub(long_run);
+    manager.cleanup(FINISHED_SHELL_MAX_AGE);
+    assert!(manager.inspect_job("long-job").is_err());
+}
+
+/// A backgrounded lowercase `bash` job: each read returns only output the
+/// caller has not seen, not the whole retained tail again.
+#[cfg(unix)]
+#[test]
+fn bounded_job_delta_returns_only_new_output() {
+    let tmp = tempdir().expect("tempdir");
+    let mut manager = ShellManager::new(tmp.path().to_path_buf());
+    let started = manager
+        .execute_with_options_env_for_owner_and_work(
+            "printf 'first-chunk\\n'; sleep 1; printf 'second-chunk\\n'",
+            None,
+            60_000,
+            true,
+            None,
+            false,
+            None,
+            HashMap::new(),
+            None,
+            String::new(),
+            None,
+            None,
+            None,
+            None,
+            false,
+            (1, BASH_MAX_TIMEOUT_MS),
+        )
+        .expect("spawn bounded job");
+    let task_id = started.task_id.expect("task id");
+    assert!(
+        manager.processes[&task_id].bounded_output.is_some(),
+        "fixture must exercise the bounded accumulator"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut seen = String::new();
+    while !seen.contains("first-chunk") {
+        assert!(Instant::now() < deadline, "first chunk never arrived");
+        let delta = manager
+            .get_output_delta(&task_id, false, 0)
+            .expect("first delta");
+        seen.push_str(&delta.result.stdout);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(seen.matches("first-chunk").count(), 1, "{seen}");
+
+    let rest = manager
+        .get_output_delta(&task_id, true, 10_000)
+        .expect("remaining delta");
+    assert_ne!(rest.result.status, ShellStatus::Running);
+    assert!(
+        rest.result.stdout.contains("second-chunk"),
+        "{}",
+        rest.result.stdout
+    );
+    assert!(
+        !rest.result.stdout.contains("first-chunk"),
+        "a delta must not repeat output already returned: {:?}",
+        rest.result.stdout
+    );
+}
+
+/// A foreground command that reads stdin gets EOF instead of blocking until
+/// the timeout kills it.
+#[cfg(unix)]
+#[tokio::test]
+async fn foreground_command_reading_stdin_gets_eof() {
+    let tmp = tempdir().expect("tempdir");
+    let ctx = ToolContext::new(tmp.path());
+    let started = Instant::now();
+    let result = BashTool::new("Bash")
+        .execute(
+            json!({"command": "cat; echo after-eof", "timeout_ms": 15_000}),
+            &ctx,
+        )
+        .await
+        .expect("execute");
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "stdin read blocked for {:?}",
+        started.elapsed()
+    );
+    assert!(result.content.contains("after-eof"), "{}", result.content);
 }
 
 /// Regression for #1691: a `git commit -m "feat: complete sub-pages"` shell

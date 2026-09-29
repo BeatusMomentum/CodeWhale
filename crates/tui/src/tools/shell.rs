@@ -1508,23 +1508,31 @@ impl BackgroundShell {
     }
 
     fn take_delta(&mut self) -> (String, String, usize, usize, usize, usize) {
-        if let Some(snapshot) = self.bounded_output_snapshot(false).ok().flatten() {
-            let changed = snapshot.total_bytes != self.stdout_cursor;
-            self.stdout_cursor = snapshot.total_bytes;
-            if changed {
-                self.last_output_at = Instant::now();
-                self.last_observed_output_len = snapshot.total_bytes;
-                let delta_len = snapshot.content.len();
-                return (
-                    snapshot.content,
-                    String::new(),
-                    delta_len,
+        // Only the bytes after the cursor: returning the whole retained tail
+        // made every `wait` poll repeat output the caller already holds.
+        let bounded_delta = self.bounded_output.as_ref().and_then(|output| {
+            let output = output.lock().unwrap_or_else(|error| error.into_inner());
+            let total = output.total_bytes();
+            output
+                .delta_since(self.stdout_cursor)
+                .ok()
+                .map(|delta| (delta, total))
+        });
+        if let Some(((mut delta, omitted), total_bytes)) = bounded_delta {
+            let delta_len = total_bytes.saturating_sub(self.stdout_cursor);
+            self.stdout_cursor = total_bytes;
+            if delta_len == 0 {
+                return (String::new(), String::new(), 0, 0, total_bytes, 0);
+            }
+            self.last_output_at = Instant::now();
+            self.last_observed_output_len = total_bytes;
+            if omitted > 0 {
+                delta.insert_str(
                     0,
-                    snapshot.total_bytes,
-                    0,
+                    &format!("[{omitted} bytes of earlier output not retained in memory]\n"),
                 );
             }
-            return (String::new(), String::new(), 0, 0, snapshot.total_bytes, 0);
+            return (delta, String::new(), delta_len, 0, total_bytes, 0);
         }
         let (stdout_delta, stdout_total) =
             take_delta_from_buffer(&self.stdout_buffer, &mut self.stdout_cursor);
@@ -3638,13 +3646,20 @@ impl ShellManager {
     /// Age alone is not a bound: it only fired from `list_jobs()`, so a session
     /// that never opened the jobs panel evicted nothing, and 500 finished
     /// records inside one hour were all retained regardless of size (#5472).
+    ///
+    /// Age counts from when a job finished, not when it started: a job that
+    /// ran longer than `max_age` would otherwise be dropped the moment it
+    /// exited. A completion nobody has received yet is never aged out; only
+    /// the count and byte ceilings below may drop one.
     pub fn cleanup(&mut self, max_age: Duration) {
         self.processes.retain(|_, shell| {
-            if shell.status == ShellStatus::Running {
-                true
-            } else {
-                shell.started_at.elapsed() < max_age
+            if shell.status == ShellStatus::Running || !shell.completion_reported {
+                return true;
             }
+            shell.mark_finished();
+            shell
+                .finished_at
+                .is_none_or(|finished| finished.elapsed() < max_age)
         });
         self.enforce_finished_job_bounds();
     }
@@ -4822,7 +4837,11 @@ async fn execute_foreground_via_background(
         manager.attach_heavy_permit(&task_id, permit)?;
     }
 
-    if stdin_data.is_some() {
+    // A foreground pipe command gets EOF on stdin, like the synchronous
+    // path: an unexpected read (`cat`, `read x`, a confirmation prompt) then
+    // fails at once instead of blocking until the timeout kills it. A TTY
+    // keeps its terminal input.
+    if stdin_data.is_some() || !tty {
         let mut manager = context
             .shell_manager
             .lock()

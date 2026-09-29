@@ -144,6 +144,27 @@ impl Drop for ProcessTree {
     }
 }
 
+/// `Command::output()` for a child whose whole process tree dies with the
+/// returned future. Dropping it — a caller's `timeout` elapsing, or a
+/// cancelled tool call — kills the child and everything it started, where a
+/// bare `output()` left them running. Stdin is closed: callers run
+/// non-interactive work that must never wait on input.
+pub(crate) async fn contained_output(
+    cmd: &mut tokio::process::Command,
+) -> std::io::Result<std::process::Output> {
+    use std::process::Stdio;
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    cmd.process_group(0);
+    let child = cmd.spawn()?;
+    // Best effort: without the tree guard, `kill_on_drop` still ends the child.
+    let _tree = ProcessTree::attach_tokio(&child).ok();
+    child.wait_with_output().await
+}
+
 #[cfg(windows)]
 struct WindowsJob {
     handle: HANDLE,
@@ -191,4 +212,79 @@ impl Drop for WindowsJob {
 #[cfg(windows)]
 pub(crate) fn windows_io_error(error: windows::core::Error) -> std::io::Error {
     std::io::Error::other(error)
+}
+
+/// Test support: wait for `pid` to stop existing. `true` once it is gone.
+#[cfg(all(test, unix))]
+pub(crate) fn wait_for_pid_exit(pid: libc::pid_t, within: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + within;
+    loop {
+        // SAFETY: signal 0 only checks that the process exists.
+        if unsafe { libc::kill(pid, 0) } != 0 {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            // Do not leak the fixture when the assertion is about to fail.
+            // SAFETY: kill(2) dereferences no pointers.
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+/// Test support: read the pid a fixture wrote to `path`, waiting for it.
+#[cfg(all(test, unix))]
+pub(crate) fn read_pid_file(path: &std::path::Path, within: std::time::Duration) -> libc::pid_t {
+    let deadline = std::time::Instant::now() + within;
+    loop {
+        if let Some(pid) = std::fs::read_to_string(path)
+            .ok()
+            .and_then(|text| text.trim().parse().ok())
+        {
+            return pid;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "fixture never wrote {}",
+            path.display()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn dropping_contained_output_kills_the_whole_tree() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let pid_file = tmp.path().join("grandchild.pid");
+        let mut cmd = tokio::process::Command::new("/bin/sh");
+        cmd.arg("-c")
+            .arg("sleep 300 & echo $! > grandchild.pid; wait")
+            .current_dir(tmp.path());
+        let timed_out =
+            tokio::time::timeout(Duration::from_millis(500), contained_output(&mut cmd)).await;
+        assert!(timed_out.is_err(), "fixture must still be running");
+        let grandchild = read_pid_file(&pid_file, Duration::from_secs(5));
+        assert!(
+            wait_for_pid_exit(grandchild, Duration::from_secs(5)),
+            "a process started by the dropped command is still running"
+        );
+    }
+
+    #[tokio::test]
+    async fn contained_output_captures_output_and_closes_stdin() {
+        let mut cmd = tokio::process::Command::new("/bin/sh");
+        cmd.arg("-c").arg("cat; echo done");
+        let output = tokio::time::timeout(Duration::from_secs(10), contained_output(&mut cmd))
+            .await
+            .expect("stdin must be closed, not inherited")
+            .expect("run");
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "done\n");
+    }
 }

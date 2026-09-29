@@ -674,8 +674,13 @@ impl TasksTool {
 
         let started = Instant::now();
         let mut cmd = build_gate_command(&command, &cwd);
-        let output =
-            tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), cmd.output()).await;
+        // Contained: when the timeout elapses the gate's whole process tree
+        // is killed, instead of leaving it running behind a "timeout" result.
+        let output = tokio::time::timeout(
+            std::time::Duration::from_millis(timeout_ms),
+            crate::process_tree::contained_output(&mut cmd),
+        )
+        .await;
 
         let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         let (exit_code, stdout, stderr, timed_out, spawn_error) = match output {
@@ -1786,6 +1791,36 @@ mod tests {
         assert!(
             outside.is_err(),
             "a workspace outside the session is refused"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timed_out_gate_run_kills_the_gate_process_tree() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let context = ToolContext::new(workspace.path())
+            .with_shell_policy(crate::worker_profile::ShellPolicy::Full);
+        let result = TasksTool::new("tasks")
+            .execute(
+                json!({
+                    "action": "gate_run",
+                    "gate": "test",
+                    "command": "sleep 300 & echo $! > gate-child.pid; wait",
+                    "timeout_ms": 1_000
+                }),
+                &context,
+            )
+            .await
+            .expect("gate runs");
+        let metadata = result.metadata.expect("metadata");
+        assert_eq!(metadata["timed_out"], true, "{metadata}");
+        let child = crate::process_tree::read_pid_file(
+            &workspace.path().join("gate-child.pid"),
+            std::time::Duration::from_secs(5),
+        );
+        assert!(
+            crate::process_tree::wait_for_pid_exit(child, std::time::Duration::from_secs(5)),
+            "the timed-out gate's process is still running"
         );
     }
 
