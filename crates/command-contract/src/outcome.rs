@@ -69,3 +69,6 @@ pub enum DebugAction {
 }
 
 pub type DebugCommandResult = CommandResult<DebugAction>;
+
+/// Structural copy cannot request a host action.
+pub type StructcopyCommandResult = CommandResult<std::convert::Infallible>;

@@ -1403,6 +1403,7 @@ fn whole_debug_registry_matches_portable_inventory_and_exact_host_authority() {
                         lifecycle,
                         control,
                         export,
+                        structcopy,
                         debug_diagnostics,
                         debug_receipts,
                         debug_change,
@@ -1431,6 +1432,7 @@ fn whole_debug_registry_matches_portable_inventory_and_exact_host_authority() {
                         ("lifecycle", lifecycle.is_some(), Caps::SESSION_LIFECYCLE),
                         ("control", control.is_some(), Caps::SESSION_CONTROL),
                         ("export", export.is_some(), Caps::SESSION_EXPORT),
+                        ("structcopy", structcopy.is_some(), Caps::SESSION_STRUCTCOPY),
                         (
                             "debug_diagnostics",
                             debug_diagnostics.is_some(),

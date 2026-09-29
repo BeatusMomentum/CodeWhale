@@ -7,6 +7,9 @@
 
 use std::path::{Path, PathBuf};
 
+mod session_structcopy;
+pub use session_structcopy::*;
+
 mod debug_operations;
 pub mod debug_receipts;
 pub use debug_operations::*;

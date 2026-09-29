@@ -3462,3 +3462,233 @@ fn whole_debug_capabilities_extend_published_bits_without_aliasing_authority() {
     }
     assert_eq!(seen, (1u32 << 22) - 1);
 }
+
+struct StructcopyFixture {
+    delivery: Result<StructcopyTransport, String>,
+    writes: RefCell<Vec<String>>,
+}
+impl CommandSessionStructcopyContext for StructcopyFixture {
+    fn transcript_item(&self, index: usize) -> Result<StructcopyTranscript, StructcopyError> {
+        Ok(StructcopyTranscript {
+            index,
+            role: "system".into(),
+            content: StructcopyContent::InternalContext,
+        })
+    }
+    fn tool_pair(&self, _: &str) -> Result<StructcopyToolPair, StructcopyError> {
+        Ok(StructcopyToolPair {
+            name: "tool".into(),
+            input: serde_json::json!({}),
+            result: None,
+        })
+    }
+    fn plan_snapshot(&self) -> Result<StructcopyPlan, StructcopyError> {
+        Err(StructcopyError::Busy)
+    }
+    fn workflow_projection(&self, _: &str) -> Result<StructcopyWorkflow, StructcopyError> {
+        Err(StructcopyError::Unavailable)
+    }
+    fn path_roots(&self) -> StructcopyPathRoots {
+        StructcopyPathRoots::default()
+    }
+    fn write_clipboard(&self, text: &str) -> Result<StructcopyTransport, String> {
+        self.writes.borrow_mut().push(text.into());
+        self.delivery.clone()
+    }
+}
+
+#[test]
+fn structcopy_capability_preserves_all_published_identities() {
+    let capabilities = [
+        CommandCapabilities::SESSION,
+        CommandCapabilities::MODEL,
+        CommandCapabilities::COST,
+        CommandCapabilities::MODE_POLICY,
+        CommandCapabilities::SYSTEM_PROMPT,
+        CommandCapabilities::SKILLS,
+        CommandCapabilities::WORKSPACE,
+        CommandCapabilities::PRESENTATION,
+        CommandCapabilities::MEDIA,
+        CommandCapabilities::MEMORY,
+        CommandCapabilities::PROJECT,
+        CommandCapabilities::SKILL_GROUP,
+        CommandCapabilities::PLUGIN,
+        CommandCapabilities::SESSION_LIFECYCLE,
+        CommandCapabilities::SESSION_CONTROL,
+        CommandCapabilities::SESSION_EXPORT,
+        CommandCapabilities::DEBUG_DIAGNOSTICS,
+        CommandCapabilities::DEBUG_RECEIPTS,
+        CommandCapabilities::DEBUG_CHANGE,
+        CommandCapabilities::DEBUG_HISTORY,
+        CommandCapabilities::DEBUG_DIFF,
+        CommandCapabilities::DEBUG_UNDO,
+        CommandCapabilities::SESSION_STRUCTCOPY,
+    ];
+    let exact = CommandCapabilities::SESSION_STRUCTCOPY | CommandCapabilities::PRESENTATION;
+    for (index, capability) in capabilities.into_iter().enumerate() {
+        assert_eq!(capability.bits_for_test(), 1u32 << index);
+        assert_eq!(exact.contains(capability), index == 7 || index == 22);
+    }
+    assert!(!exact.contains(CommandCapabilities::NONE));
+}
+
+#[test]
+fn structcopy_slot_is_optional_and_does_not_grant_other_authority() {
+    assert!(CommandContexts::empty().into_parts().structcopy.is_none());
+    let mut fixture = StructcopyFixture {
+        delivery: Ok(StructcopyTransport::Native),
+        writes: RefCell::default(),
+    };
+    let mut presentation = Presentation;
+    let ContextParts {
+        session,
+        model,
+        cost,
+        mode_policy,
+        system_prompt,
+        skills,
+        workspace,
+        presentation,
+        media,
+        memory,
+        project,
+        skill_group,
+        plugin,
+        lifecycle,
+        control,
+        export,
+        structcopy,
+        debug_receipts,
+        debug_change,
+        debug_history,
+        debug_diff,
+        debug_undo,
+        debug_diagnostics,
+    } = CommandContexts::empty()
+        .with_structcopy(&mut fixture)
+        .with_presentation(&mut presentation)
+        .into_parts();
+    assert!(presentation.is_some());
+    let copy = structcopy.expect("selected structcopy facet");
+    assert_eq!(
+        copy.transcript_item(3).unwrap(),
+        StructcopyTranscript {
+            index: 3,
+            role: "system".into(),
+            content: StructcopyContent::InternalContext
+        }
+    );
+    assert_eq!(copy.tool_pair("id").unwrap().result, None);
+    assert_eq!(copy.plan_snapshot(), Err(StructcopyError::Busy));
+    assert_eq!(
+        copy.workflow_projection("id"),
+        Err(StructcopyError::Unavailable)
+    );
+    for present in [
+        session.is_some(),
+        model.is_some(),
+        cost.is_some(),
+        mode_policy.is_some(),
+        system_prompt.is_some(),
+        skills.is_some(),
+        workspace.is_some(),
+        media.is_some(),
+        memory.is_some(),
+        project.is_some(),
+        skill_group.is_some(),
+        plugin.is_some(),
+        lifecycle.is_some(),
+        control.is_some(),
+        export.is_some(),
+        debug_receipts.is_some(),
+        debug_change.is_some(),
+        debug_history.is_some(),
+        debug_diff.is_some(),
+        debug_undo.is_some(),
+        debug_diagnostics.is_some(),
+    ] {
+        assert!(!present);
+    }
+    assert!(
+        fixture.writes.borrow().is_empty(),
+        "observations do not write clipboard"
+    );
+}
+
+#[test]
+#[should_panic(expected = "structcopy facet already set")]
+fn structcopy_duplicate_slot_fails_loudly() {
+    let mut a = StructcopyFixture {
+        delivery: Ok(StructcopyTransport::Native),
+        writes: RefCell::default(),
+    };
+    let mut b = StructcopyFixture {
+        delivery: Ok(StructcopyTransport::Native),
+        writes: RefCell::default(),
+    };
+    let _ = CommandContexts::empty()
+        .with_structcopy(&mut a)
+        .with_structcopy(&mut b);
+}
+
+#[test]
+fn structcopy_transport_and_unknown_observations_remain_distinct() {
+    for delivery in [
+        Ok(StructcopyTransport::Native),
+        Ok(StructcopyTransport::TerminalQueued),
+        Err("original host error".into()),
+    ] {
+        let fixture = StructcopyFixture {
+            delivery: delivery.clone(),
+            writes: RefCell::default(),
+        };
+        assert_eq!(fixture.write_clipboard("exact bytes"), delivery);
+        assert_eq!(*fixture.writes.borrow(), ["exact bytes"]);
+    }
+    let unknown = StructcopyToolResult {
+        content: "recorded".into(),
+        is_error: None,
+        content_blocks: None,
+    };
+    assert_ne!(
+        unknown,
+        StructcopyToolResult {
+            is_error: Some(false),
+            ..unknown.clone()
+        }
+    );
+    assert_ne!(
+        StructcopyError::Preparation("detail".into()),
+        StructcopyError::Unavailable
+    );
+    let result = crate::outcome::StructcopyCommandResult::error("detail");
+    assert_eq!(result.message.as_deref(), Some("Error: detail"));
+    assert!(result.action.is_none());
+}
+
+#[test]
+fn structcopy_known_projection_fields_preserve_nulls_and_omission_rules() {
+    let plan: StructcopyPlan = serde_json::from_value(
+        serde_json::json!({"title":"plan","items":[{"step":"one","status":"in_progress"}]}),
+    )
+    .unwrap();
+    assert_eq!(
+        serde_json::to_value(plan).unwrap(),
+        serde_json::json!({"title":"plan","items":[{"step":"one","status":"in_progress"}]})
+    );
+    let workflow = serde_json::json!({
+        "run_id":"run","status":"degraded","lifecycle_seq":1,"started_at_ms":2,"completed_at_ms":null,
+        "source_file":"flow.js","workflow_id":null,"workflow_goal":null,"token_budget":null,
+        "child_count":0,"schema_error_count":0,"schema_repair_count":0,"dispatch_failure_count":0,
+        "progress_count":0,"last_progress":null,"event_count":0,"last_event_type":null,
+        "leaf_count":null,"branch_count":null,"control_count":null,"execution_status":null,
+        "gate_count":1,"blocked_gate_count":0,"gate_status":[{"gate_id":"gate","state":"pending"}],
+        "error":null,"usage":{"tasks_reported":0,"input_tokens":0},"events_dropped":4
+    });
+    let parsed: StructcopyWorkflow = serde_json::from_value(workflow.clone()).unwrap();
+    assert_eq!(parsed.status, StructcopyWorkflowStatus::Degraded);
+    assert_eq!(parsed.leaf_count, None);
+    assert_eq!(parsed.usage.as_ref().unwrap().input_tokens, Some(0));
+    assert_eq!(parsed.usage.as_ref().unwrap().output_tokens, None);
+    assert_eq!(serde_json::to_value(parsed).unwrap(), workflow);
+}
