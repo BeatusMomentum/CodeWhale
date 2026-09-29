@@ -2817,7 +2817,7 @@ impl TaskManager {
             }
             // Supervisor-side liveness only: recording it would put a
             // timeline entry behind every poll tick of a silent build.
-            TaskExecutionEvent::ToolHeartbeat { .. } => {}
+            TaskExecutionEvent::ToolHeartbeat => {}
             TaskExecutionEvent::ToolCompleted {
                 id,
                 name,
@@ -3441,7 +3441,7 @@ fn execution_event_is_progress(event: &TaskExecutionEvent) -> bool {
         TaskExecutionEvent::MessageDelta { .. }
             | TaskExecutionEvent::ToolStarted { .. }
             | TaskExecutionEvent::ToolProgress { .. }
-            | TaskExecutionEvent::ToolHeartbeat { .. }
+            | TaskExecutionEvent::ToolHeartbeat
             | TaskExecutionEvent::ToolCompleted { .. }
     )
 }
@@ -3456,7 +3456,7 @@ fn execution_event_persist_urgent(event: &TaskExecutionEvent) -> bool {
             // ~5x/s throughout a silent build, and persisting it would
             // rewrite the whole task record on every tick while holding the
             // manager-wide state lock.
-            | TaskExecutionEvent::ToolHeartbeat { .. }
+            | TaskExecutionEvent::ToolHeartbeat
     )
 }
 
