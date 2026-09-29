@@ -35,6 +35,8 @@ mod session_acceptance;
 mod session_control_regression_tests;
 #[cfg(test)]
 mod session_export_regression_tests;
+#[cfg(test)]
+mod session_structcopy_host_tests;
 // FEAT-025 Phase 5: public command-surface parity lives at the `commands` root
 // for the same extraction reason as the host regressions above.
 #[cfg(test)]
