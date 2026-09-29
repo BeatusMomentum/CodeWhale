@@ -1526,11 +1526,14 @@ impl BackgroundShell {
             }
             self.last_output_at = Instant::now();
             self.last_observed_output_len = total_bytes;
-            if omitted > 0 {
-                delta.insert_str(
-                    0,
-                    &format!("[{omitted} bytes of earlier output not retained in memory]\n"),
-                );
+            if omitted > 0
+                && let Some(output) = self.bounded_output.as_ref()
+            {
+                let notice = output
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .omitted_notice(omitted);
+                delta.insert_str(0, &notice);
             }
             return (delta, String::new(), delta_len, 0, total_bytes, 0);
         }
@@ -2393,9 +2396,14 @@ impl ShellManager {
         }
         install_parent_death_signal(&mut cmd);
 
-        if stdin_data.is_some() {
-            cmd.stdin(Stdio::piped());
-        }
+        // Without input, stdin is closed rather than inherited: an unexpected
+        // read (`cat`, a prompt) gets EOF instead of blocking on, or reading,
+        // the operator's terminal until the timeout.
+        cmd.stdin(if stdin_data.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        });
 
         child_env::apply_to_command(&mut cmd, child_env::string_map_env(&exec_env.env));
         remove_readonly_redirect_env(&mut cmd, &exec_env.env);
@@ -3649,11 +3657,12 @@ impl ShellManager {
     ///
     /// Age counts from when a job finished, not when it started: a job that
     /// ran longer than `max_age` would otherwise be dropped the moment it
-    /// exited. A completion nobody has received yet is never aged out; only
-    /// the count and byte ceilings below may drop one.
+    /// exited, before its completion was delivered. Undelivered completions
+    /// age out too: jobs launched over the Runtime API, or owned by a session
+    /// that is no longer active, are never drained.
     pub fn cleanup(&mut self, max_age: Duration) {
         self.processes.retain(|_, shell| {
-            if shell.status == ShellStatus::Running || !shell.completion_reported {
+            if shell.status == ShellStatus::Running {
                 return true;
             }
             shell.mark_finished();
@@ -3692,7 +3701,8 @@ impl ShellManager {
                 (
                     id.clone(),
                     shell.completion_reported,
-                    shell.started_at,
+                    // Oldest by finish, like the age rule in `cleanup`.
+                    shell.finished_at.unwrap_or(shell.started_at),
                     shell.retained_output_bytes(),
                 )
             })
@@ -4837,10 +4847,11 @@ async fn execute_foreground_via_background(
         manager.attach_heavy_permit(&task_id, permit)?;
     }
 
-    // A foreground pipe command gets EOF on stdin, like the synchronous
-    // path: an unexpected read (`cat`, `read x`, a confirmation prompt) then
-    // fails at once instead of blocking until the timeout kills it. A TTY
-    // keeps its terminal input.
+    // A foreground pipe command gets EOF on stdin: an unexpected read (`cat`,
+    // `read x`, a confirmation prompt) then fails at once instead of blocking
+    // until the timeout kills it. A TTY keeps its terminal input. A command
+    // later moved to /jobs keeps the closed stdin; interactive input needs
+    // `background: true` from the start.
     if stdin_data.is_some() || !tty {
         let mut manager = context
             .shell_manager

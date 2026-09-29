@@ -244,6 +244,27 @@ impl BoundedOutputAccumulator {
         Ok((String::from_utf8_lossy(&bytes).into_owned(), omitted))
     }
 
+    /// First line of a delta that lost `omitted` bytes to the memory bound:
+    /// how many, and where the complete output is (or why it is not kept).
+    pub(super) fn omitted_notice(&self, omitted: usize) -> String {
+        let location = self
+            .full_output_path
+            .as_deref()
+            .or_else(|| self.temp.as_ref().map(tempfile::NamedTempFile::path));
+        match (location, self.spill_unavailable.as_deref()) {
+            (Some(path), _) => format!(
+                "[{omitted} bytes of earlier output not retained in memory. Full output: {}]\n",
+                path.display()
+            ),
+            (None, Some(reason)) => format!(
+                "[{omitted} bytes of earlier output not retained in memory. Full output was not persisted: {reason}]\n"
+            ),
+            (None, None) => {
+                format!("[{omitted} bytes of earlier output not retained in memory]\n")
+            }
+        }
+    }
+
     pub(super) fn snapshot(&mut self, finalize: bool) -> io::Result<BoundedOutputSnapshot> {
         if let Some(error) = self.stream_error.as_ref() {
             return Err(io::Error::other(error.clone()));
@@ -833,6 +854,27 @@ mod tests {
         assert!(!delta.contains('\u{FFFD}'));
         assert_eq!(delta.len() + omitted, total);
         assert!(delta.len() <= BOUNDED_OUTPUT_RETAIN_BYTES);
+    }
+
+    /// The notice for dropped delta bytes says where the full output is.
+    #[test]
+    fn bounded_output_omitted_notice_points_at_the_spill_file() {
+        let output = BoundedOutputAccumulator::new_in(None);
+        let spill = output
+            .temp
+            .as_ref()
+            .expect("spill file")
+            .path()
+            .display()
+            .to_string();
+        let notice = output.omitted_notice(42);
+        assert!(notice.starts_with("[42 bytes"), "{notice}");
+        assert!(notice.contains(&spill), "{notice}");
+
+        let missing = tempfile::tempdir().expect("tempdir").path().join("gone");
+        let unspilled = BoundedOutputAccumulator::new_in(Some(&missing));
+        let notice = unspilled.omitted_notice(7);
+        assert!(notice.contains("not persisted"), "{notice}");
     }
 
     #[test]

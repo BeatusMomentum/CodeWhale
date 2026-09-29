@@ -675,30 +675,34 @@ impl TasksTool {
         let started = Instant::now();
         let mut cmd = build_gate_command(&command, &cwd);
         // Contained: when the timeout elapses the gate's whole process tree
-        // is killed, instead of leaving it running behind a "timeout" result.
-        let output = tokio::time::timeout(
-            std::time::Duration::from_millis(timeout_ms),
-            crate::process_tree::contained_output(&mut cmd),
+        // is killed, instead of leaving it running behind a "timeout" result,
+        // and what it wrote until then still reaches the log.
+        let output = crate::process_tree::contained_output_until(
+            &mut cmd,
+            tokio::time::sleep(std::time::Duration::from_millis(timeout_ms)),
         )
         .await;
 
         let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         let (exit_code, stdout, stderr, timed_out, spawn_error) = match output {
-            Ok(Ok(out)) => (
-                out.status.code(),
-                String::from_utf8_lossy(&out.stdout).to_string(),
-                String::from_utf8_lossy(&out.stderr).to_string(),
-                false,
+            Ok(run) => (
+                if run.stopped {
+                    None
+                } else {
+                    run.output.status.code()
+                },
+                String::from_utf8_lossy(&run.output.stdout).to_string(),
+                String::from_utf8_lossy(&run.output.stderr).to_string(),
+                run.stopped,
                 None,
             ),
-            Ok(Err(err)) => (
+            Err(err) => (
                 None,
                 String::new(),
                 String::new(),
                 false,
                 Some(err.to_string()),
             ),
-            Err(_) => (None, String::new(), String::new(), true, None),
         };
 
         let full_log = format!(
@@ -1805,8 +1809,8 @@ mod tests {
                 json!({
                     "action": "gate_run",
                     "gate": "test",
-                    "command": "sleep 300 & echo $! > gate-child.pid; wait",
-                    "timeout_ms": 1_000
+                    "command": "echo gate-started; sleep 300 & echo $! > gate-child.pid; wait",
+                    "timeout_ms": 5_000
                 }),
                 &context,
             )
@@ -1814,6 +1818,12 @@ mod tests {
             .expect("gate runs");
         let metadata = result.metadata.expect("metadata");
         assert_eq!(metadata["timed_out"], true, "{metadata}");
+        // What the gate wrote before the timeout is kept.
+        assert!(
+            result.content.contains("gate-started"),
+            "{}",
+            result.content
+        );
         let child = crate::process_tree::read_pid_file(
             &workspace.path().join("gate-child.pid"),
             std::time::Duration::from_secs(5),

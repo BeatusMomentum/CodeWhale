@@ -859,6 +859,8 @@ fn spawn_signal_cleanup_task() {
         if !CLEANED_UP.swap(true, std::sync::atomic::Ordering::SeqCst) {
             #[cfg(unix)]
             crate::tools::shell::abort_pending_persistent_process_groups_for_exit();
+            #[cfg(unix)]
+            crate::process_tree::kill_contained_trees_for_exit();
             crate::tui::ui::emergency_restore_terminal();
             // Nothing async survives the `exit` below, so this is the last
             // chance to say how the session ended. `record_blocking` is one

@@ -290,16 +290,12 @@ mod tests {
                     const child = spawn('sleep', ['300'], { stdio: 'ignore' });\n\
                     require('fs').writeFileSync('grandchild.pid', String(child.pid));\n\
                     setInterval(() => {}, 1000);";
-        let dropped = tokio::time::timeout(
-            Duration::from_secs(3),
-            execute_js_execution_tool(&json!({ "code": code }), tmp.path()),
+        let input = json!({ "code": code });
+        let grandchild = crate::process_tree::drop_once_pid_written(
+            execute_js_execution_tool(&input, tmp.path()),
+            &tmp.path().join("grandchild.pid"),
         )
         .await;
-        assert!(dropped.is_err(), "fixture must still be running");
-        let grandchild = crate::process_tree::read_pid_file(
-            &tmp.path().join("grandchild.pid"),
-            Duration::from_secs(5),
-        );
         assert!(
             crate::process_tree::wait_for_pid_exit(grandchild, Duration::from_secs(5)),
             "a process started by the dropped script is still running"
