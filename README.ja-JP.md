@@ -1,4 +1,4 @@
-<!-- source: README.md sha256:4d2ba4fb6003 -->
+<!-- source: README.md sha256:925619135f77 -->
 # Codewhale
 
 Codewhale は、選んだホスト型またはローカルのモデルを使ってプロジェクトを読み、ファイルを編集し、コマンドを実行して、自分の作業結果を確認するオープンソースのエージェントです。まずはターミナルで一つのタスクから始めましょう。大きな仕事では、異なるモデルや役割を持つエージェントに作業の一部を分担させられます。
@@ -78,6 +78,7 @@ Codewhale は、あなたが許可した範囲のアクセス権で、あなた�
 
 ## ドキュメント
 
+- [GitHub PR レビューの設定](docs/GITHUB_ACTION.md)
 - [プロバイダーとローカルモデル](docs/PROVIDERS.md)
 - [エージェントチーム](docs/FLEET.md)
 - [MCP](docs/MCP.md)、[フック](docs/HOOKS.md)、[設定](docs/CONFIGURATION.md)

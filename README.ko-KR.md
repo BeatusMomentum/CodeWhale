@@ -1,4 +1,4 @@
-<!-- source: README.md sha256:4d2ba4fb6003 -->
+<!-- source: README.md sha256:925619135f77 -->
 # Codewhale
 
 Codewhale은 사용자가 선택한 호스팅 모델이나 로컬 모델로 프로젝트를 읽고, 파일을 편집하고, 명령을 실행하며, 작업 결과를 확인하는 오픈 소스 에이전트입니다. 터미널에서 하나의 작업으로 시작하세요. 더 큰 작업은 서로 다른 모델과 역할을 가진 에이전트에게 나누어 맡길 수 있습니다.
@@ -78,6 +78,7 @@ Codewhale은 사용자가 허용한 접근 권한으로 사용자의 컴퓨터�
 
 ## 문서
 
+- [GitHub PR 검토 설정](docs/GITHUB_ACTION.md)
 - [공급자와 로컬 모델](docs/PROVIDERS.md)
 - [에이전트 팀](docs/FLEET.md)
 - [MCP](docs/MCP.md), [훅](docs/HOOKS.md), [구성](docs/CONFIGURATION.md)

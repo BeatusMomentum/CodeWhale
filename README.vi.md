@@ -1,4 +1,4 @@
-<!-- source: README.md sha256:4d2ba4fb6003 -->
+<!-- source: README.md sha256:925619135f77 -->
 # Codewhale
 
 Codewhale là tác nhân mã nguồn mở có thể đọc dự án, chỉnh sửa tệp, chạy lệnh và kiểm tra công việc của mình bằng mô hình do nhà cung cấp lưu trữ hoặc mô hình cục bộ mà bạn chọn. Hãy bắt đầu với một tác vụ trong terminal. Với công việc lớn hơn, bạn có thể giao từng phần cho các tác nhân dùng mô hình và đảm nhiệm vai trò khác nhau.
@@ -78,6 +78,7 @@ Codewhale chạy trên máy của bạn với quyền truy cập do bạn cấp.
 
 ## Tài liệu
 
+- [Thiết lập đánh giá PR trên GitHub](docs/GITHUB_ACTION.md)
 - [Nhà cung cấp và mô hình cục bộ](docs/PROVIDERS.md)
 - [Nhóm tác nhân](docs/FLEET.md)
 - [MCP](docs/MCP.md), [hook](docs/HOOKS.md) và [cấu hình](docs/CONFIGURATION.md)

@@ -1,4 +1,4 @@
-<!-- source: README.md sha256:4d2ba4fb6003 -->
+<!-- source: README.md sha256:925619135f77 -->
 # Codewhale
 
 Codewhale 是一款开源智能体，可使用你选择的托管模型或本地模型读取项目、编辑文件、运行命令并检查自己的工作。从终端中的一项任务开始。对于较大的工作，可以将其中的部分任务交给使用不同模型、承担不同角色的智能体。
@@ -81,6 +81,7 @@ Codewhale 在你的机器上运行，并仅拥有你授予的访问权限。审�
 
 ## 文档
 
+- [GitHub PR 审查设置](docs/GITHUB_ACTION.md)
 - [提供商和本地模型](docs/PROVIDERS.md)
 - [智能体团队](docs/FLEET.md)
 - [MCP](docs/MCP.md)、[钩子](docs/HOOKS.md)和[配置](docs/CONFIGURATION.md)

@@ -1,4 +1,4 @@
-<!-- source: README.md sha256:4d2ba4fb6003 -->
+<!-- source: README.md sha256:925619135f77 -->
 # Codewhale
 
 Codewhale, seçtiğiniz barındırılan veya yerel bir modeli kullanarak projenizi okuyan, dosyaları düzenleyen, komutları çalıştıran ve yaptığı işi kontrol eden açık kaynaklı bir ajandır. Terminalde tek bir görevle başlayın. Daha büyük bir işte, işin bölümlerini farklı model ve rollere sahip ajanlara verin.
@@ -78,6 +78,7 @@ Politikaların kesin sıralaması için [yetkilendirme sırasını](docs/AUTHORI
 
 ## Belgeler
 
+- [GitHub PR inceleme kurulumu](docs/GITHUB_ACTION.md)
 - [Sağlayıcılar ve yerel modeller](docs/PROVIDERS.md)
 - [Ajan ekipleri](docs/FLEET.md)
 - [MCP](docs/MCP.md), [hook’lar](docs/HOOKS.md) ve [yapılandırma](docs/CONFIGURATION.md)
