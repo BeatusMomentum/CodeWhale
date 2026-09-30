@@ -5305,6 +5305,13 @@ fn run_model_command(
                     provider_source_label(resolved_runtime.provider_source)
                 );
                 println!("model_source: {}", source.as_str());
+                // The runtime refuses a route its resolver rejected; saying
+                // `resolved:` without the rejection would report it as usable.
+                if saved.is_none()
+                    && let Err(error) = &resolved_runtime.route
+                {
+                    println!("route_error: {error}");
+                }
                 return Ok(());
             }
 
@@ -6113,7 +6120,7 @@ mod tests {
             yolo: None,
             verbosity: None,
             http_headers: std::collections::BTreeMap::new(),
-            route: None,
+            route: Err(codewhale_config::route::RouteError::EmptyModel),
         }
     }
 
