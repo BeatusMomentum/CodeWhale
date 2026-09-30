@@ -674,26 +674,35 @@ impl TasksTool {
 
         let started = Instant::now();
         let mut cmd = build_gate_command(&command, &cwd);
-        let output =
-            tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), cmd.output()).await;
+        // Contained: when the timeout elapses the gate's whole process tree
+        // is killed, instead of leaving it running behind a "timeout" result,
+        // and what it wrote until then still reaches the log.
+        let output = crate::process_tree::contained_output_until(
+            &mut cmd,
+            tokio::time::sleep(std::time::Duration::from_millis(timeout_ms)),
+        )
+        .await;
 
         let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         let (exit_code, stdout, stderr, timed_out, spawn_error) = match output {
-            Ok(Ok(out)) => (
-                out.status.code(),
-                String::from_utf8_lossy(&out.stdout).to_string(),
-                String::from_utf8_lossy(&out.stderr).to_string(),
-                false,
+            Ok(run) => (
+                if run.stopped {
+                    None
+                } else {
+                    run.output.status.code()
+                },
+                String::from_utf8_lossy(&run.output.stdout).to_string(),
+                String::from_utf8_lossy(&run.output.stderr).to_string(),
+                run.stopped,
                 None,
             ),
-            Ok(Err(err)) => (
+            Err(err) => (
                 None,
                 String::new(),
                 String::new(),
                 false,
                 Some(err.to_string()),
             ),
-            Err(_) => (None, String::new(), String::new(), true, None),
         };
 
         let full_log = format!(
@@ -1786,6 +1795,42 @@ mod tests {
         assert!(
             outside.is_err(),
             "a workspace outside the session is refused"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timed_out_gate_run_kills_the_gate_process_tree() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let context = ToolContext::new(workspace.path())
+            .with_shell_policy(crate::worker_profile::ShellPolicy::Full);
+        let result = TasksTool::new("tasks")
+            .execute(
+                json!({
+                    "action": "gate_run",
+                    "gate": "test",
+                    "command": "echo gate-started; sleep 300 & echo $! > gate-child.pid; wait",
+                    "timeout_ms": 5_000
+                }),
+                &context,
+            )
+            .await
+            .expect("gate runs");
+        let metadata = result.metadata.expect("metadata");
+        assert_eq!(metadata["timed_out"], true, "{metadata}");
+        // What the gate wrote before the timeout is kept.
+        assert!(
+            result.content.contains("gate-started"),
+            "{}",
+            result.content
+        );
+        let child = crate::process_tree::read_pid_file(
+            &workspace.path().join("gate-child.pid"),
+            std::time::Duration::from_secs(5),
+        );
+        assert!(
+            crate::process_tree::wait_for_pid_exit(child, std::time::Duration::from_secs(5)),
+            "the timed-out gate's process is still running"
         );
     }
 

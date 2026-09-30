@@ -42,7 +42,6 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path as FsPath, PathBuf};
-use std::process::Stdio;
 use std::time::Duration;
 
 use axum::Json;
@@ -112,8 +111,12 @@ async fn git_read(workspace: &FsPath, args: &[&str]) -> Result<GitRun, ApiError>
         .map_err(|_| ApiError::internal("git read setup failed"))?
         .map_err(|error| ApiError::internal(format!("git is unavailable: {error}")))?;
     let mut command = tokio::process::Command::from(command);
-    command.args(args).kill_on_drop(true);
-    finish_git(command.output(), GIT_READ_TIMEOUT).await
+    command.args(args);
+    finish_git(
+        crate::process_tree::contained_output(&mut command),
+        GIT_READ_TIMEOUT,
+    )
+    .await
 }
 
 /// Write path for operator-driven mutations. Non-interactive by contract:
@@ -124,12 +127,14 @@ async fn git_read(workspace: &FsPath, args: &[&str]) -> Result<GitRun, ApiError>
 async fn git_write(workspace: &FsPath, args: Vec<String>) -> Result<GitRun, ApiError> {
     let mut command = Git::tokio_command()
         .ok_or_else(|| ApiError::internal("git is not installed or not in PATH"))?;
-    command
-        .args(&args)
-        .current_dir(workspace)
-        .stdin(Stdio::null())
-        .kill_on_drop(true);
-    finish_git(command.output(), GIT_WRITE_TIMEOUT).await
+    command.args(&args).current_dir(workspace);
+    // Contained: hooks and filters run here, and a timeout or a dropped
+    // request must end them too, not only the `git` process itself.
+    finish_git(
+        crate::process_tree::contained_output(&mut command),
+        GIT_WRITE_TIMEOUT,
+    )
+    .await
 }
 
 async fn finish_git(
@@ -2690,6 +2695,27 @@ mod tests {
         )
         .unwrap();
         assert_eq!(ok.files.unwrap().keys().collect::<Vec<_>>(), vec!["a.txt"]);
+    }
+
+    /// A dropped (or timed-out) write takes down what git started — a hook, a
+    /// filter, an alias — not just the `git` process.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropped_git_write_kills_what_git_started() {
+        let tmp = repo();
+        let pid_file = tmp.path().join("hang.pid");
+        let args = vec![
+            "-c".to_string(),
+            "alias.hang=!sleep 300 & echo $! > hang.pid; wait".to_string(),
+            "hang".to_string(),
+        ];
+        let grandchild =
+            crate::process_tree::drop_once_pid_written(git_write(tmp.path(), args), &pid_file)
+                .await;
+        assert!(
+            crate::process_tree::wait_for_pid_exit(grandchild, Duration::from_secs(5)),
+            "a process git started outlived the dropped request"
+        );
     }
 
     #[test]

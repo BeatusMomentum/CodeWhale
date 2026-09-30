@@ -111,11 +111,26 @@ pub fn js_execution_tool_definition() -> Tool {
     }
 }
 
+/// Wall-clock budget for one `js_execution` call. Real scripts call slow
+/// APIs, wait on local services, and legitimately run for minutes, so the
+/// budget is deliberately generous — and when it does fire, the contained
+/// interpreter and everything it started are killed, not left orphaned.
+fn js_execution_timeout() -> Duration {
+    if cfg!(test) {
+        // Short enough that the timeout-kill test finishes quickly, long
+        // enough that the happy-path tests never approach it.
+        Duration::from_secs(5)
+    } else {
+        Duration::from_secs(600)
+    }
+}
+
 /// Run the model-provided JavaScript and return the captured
 /// stdout / stderr / return_code payload. Mirrors
-/// `execute_code_execution_tool` exactly — same tempfile pattern,
-/// same 120-second timeout, same error shape — so the surfaces
-/// stay interchangeable from the model's point of view.
+/// `execute_code_execution_tool` — same tempfile pattern, same error
+/// shape — so the surfaces stay interchangeable from the model's point of
+/// view. The wall-clock budget is 600 seconds, and on timeout the contained
+/// process tree is killed instead of being left running orphaned.
 ///
 /// Tempfile lives only for the duration of this execution; `Drop`
 /// removes it. We use the `.js` extension so any source-map /
@@ -156,9 +171,14 @@ pub async fn execute_js_execution_tool(
         cmd.env("NODE_USE_ENV_PROXY", "1");
     }
 
-    let output = tokio::time::timeout(Duration::from_secs(120), cmd.output())
+    // Contained: a timeout or a cancelled call ends the interpreter and
+    // anything it started (`setInterval`, a server), not only this future.
+    let budget = js_execution_timeout();
+    let output = tokio::time::timeout(budget, crate::process_tree::contained_output(&mut cmd))
         .await
-        .map_err(|_| ToolError::Timeout { seconds: 120 })
+        .map_err(|_| ToolError::Timeout {
+            seconds: budget.as_secs(),
+        })
         .and_then(|res| res.map_err(|e| ToolError::execution_failed(e.to_string())))?;
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
@@ -272,6 +292,31 @@ mod tests {
         );
     }
 
+    /// A timed-out or cancelled call drops the future; the interpreter and
+    /// what it started must end with it instead of running on.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropped_js_execution_kills_the_interpreter_tree() {
+        if !node_present() {
+            return;
+        }
+        let tmp = tempdir().expect("tempdir");
+        let code = "const { spawn } = require('child_process');\n\
+                    const child = spawn('sleep', ['300'], { stdio: 'ignore' });\n\
+                    require('fs').writeFileSync('grandchild.pid', String(child.pid));\n\
+                    setInterval(() => {}, 1000);";
+        let input = json!({ "code": code });
+        let grandchild = crate::process_tree::drop_once_pid_written(
+            execute_js_execution_tool(&input, tmp.path()),
+            &tmp.path().join("grandchild.pid"),
+        )
+        .await;
+        assert!(
+            crate::process_tree::wait_for_pid_exit(grandchild, Duration::from_secs(5)),
+            "a process started by the dropped script is still running"
+        );
+    }
+
     #[tokio::test]
     async fn execute_js_surfaces_runtime_error_with_nonzero_exit() {
         if !node_present() {
@@ -365,6 +410,81 @@ mod tests {
         assert!(
             msg.contains("code"),
             "error must name the missing `code` field; got {msg}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timeout_kills_the_node_child_instead_of_orphaning_it() {
+        if !node_present() {
+            eprintln!("skipping: node not present");
+            return;
+        }
+        let workspace = tempdir().expect("workspace tempdir");
+        let pid_file = workspace.path().join("child_pid");
+        let code = format!(
+            "const fs = require('fs'); \
+             fs.writeFileSync({}, String(process.pid)); \
+             setTimeout(() => {{}}, 60000);",
+            serde_json::json!(pid_file.to_string_lossy())
+        );
+
+        let err = execute_js_execution_tool(&serde_json::json!({ "code": code }), workspace.path())
+            .await
+            .expect_err("a 60s sleep must hit the execution timeout");
+        assert!(
+            matches!(err, ToolError::Timeout { .. }),
+            "expected a timeout error; got {err:?}"
+        );
+
+        // The child reported its pid before sleeping; the timeout must have
+        // killed it (and the tool reaped it), not left it running.
+        let pid: i32 = std::fs::read_to_string(&pid_file)
+            .expect("child must have written its pid")
+            .trim()
+            .parse()
+            .expect("pid file must contain an integer");
+        let mut attempts = 0;
+        while unsafe { libc::kill(pid, 0) } == 0 {
+            assert!(
+                attempts < 50,
+                "node child {pid} is still alive after the timeout kill"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            attempts += 1;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timeout_returns_promptly_even_when_a_grandchild_holds_the_pipes() {
+        if !node_present() {
+            eprintln!("skipping: node not present");
+            return;
+        }
+        let workspace = tempdir().expect("workspace tempdir");
+        // The child spawns a grandchild that inherits stdout/stderr (so the
+        // pipe write ends outlive the child) and then blocks far past the
+        // execution timeout. The budget bounds the whole call: the timeout
+        // fires and the process-group kill takes the grandchild down with
+        // the interpreter instead of the call hanging on pipe EOF.
+        let code = "const { spawn } = require('child_process'); \
+                    const g = spawn('sleep', ['30'], { stdio: ['ignore', 'inherit', 'inherit'] }); \
+                    console.log('grandchild ' + g.pid); \
+                    setTimeout(() => {}, 60000);";
+
+        let started = std::time::Instant::now();
+        let err = execute_js_execution_tool(&serde_json::json!({ "code": code }), workspace.path())
+            .await
+            .expect_err("a 60s sleep must hit the execution timeout");
+        let elapsed = started.elapsed();
+        assert!(
+            matches!(err, ToolError::Timeout { .. }),
+            "expected a timeout error; got {err:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(15),
+            "timeout must return promptly even with a grandchild holding the pipes; took {elapsed:?}"
         );
     }
 }

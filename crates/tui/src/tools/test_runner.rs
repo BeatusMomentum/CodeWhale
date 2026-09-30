@@ -4,6 +4,7 @@
 //! approval policy as the other code-executing tools.
 
 use std::path::Path;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -27,6 +28,10 @@ struct RunTestsOutput {
     stdout: String,
     stderr: String,
     command: String,
+    /// The run hit [`RUN_TESTS_TIMEOUT`] and was killed; stdout/stderr are
+    /// what it wrote until then.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    timed_out: bool,
 }
 
 #[async_trait]
@@ -100,17 +105,26 @@ impl ToolSpec for RunTestsTool {
         }
 
         let command_str = format_command(&workdir, &args);
-        let output = run_cargo(&workdir, &args)?;
+        let run = run_cargo(&workdir, &args, context, RUN_TESTS_TIMEOUT).await?;
+        let output = run.output;
+        let mut stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        if run.stopped {
+            stderr.push_str(&format!(
+                "\n[run_tests: stopped after {} s; the output above is everything cargo wrote before it was killed]",
+                RUN_TESTS_TIMEOUT.as_secs()
+            ));
+        }
 
         // The whole output: the end of a cargo run is where the failures and
         // the `test result:` line are. Size is the engine's one recoverable
         // budget (#6508), so the failure summary sees everything.
         run_tests_result(RunTestsOutput {
-            success: output.status.success(),
+            success: !run.stopped && output.status.success(),
             exit_code: output.status.code().unwrap_or(-1),
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            stderr,
             command: command_str,
+            timed_out: run.stopped,
         })
     }
 }
@@ -134,8 +148,21 @@ fn run_tests_result(result: RunTestsOutput) -> Result<ToolResult, ToolError> {
 
 // === Helpers ===
 
-fn run_cargo(workspace: &Path, args: &[String]) -> Result<std::process::Output, ToolError> {
-    let Some(mut cmd) = crate::dependencies::Cargo::command() else {
+/// Ceiling for one `cargo test` run. Long suites fit; a hung test does not
+/// hold the turn forever.
+const RUN_TESTS_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
+/// Run cargo without blocking a runtime worker. Stop and the timeout both end
+/// the whole process tree (cargo and the test binaries it started). A timeout
+/// still returns the output written so far (`stopped`): it is the only
+/// evidence of which test hung.
+async fn run_cargo(
+    workspace: &Path,
+    args: &[String],
+    context: &ToolContext,
+    timeout: Duration,
+) -> Result<crate::process_tree::ContainedOutput, ToolError> {
+    let Some(mut cmd) = crate::dependencies::Cargo::tokio_command() else {
         return Err(ToolError::not_available(
             "cargo is not installed or not in PATH",
         ));
@@ -143,8 +170,20 @@ fn run_cargo(workspace: &Path, args: &[String]) -> Result<std::process::Output, 
     cmd.args(args).current_dir(workspace);
     // `cargo test` builds and runs workspace code; do not hand it parent
     // credentials.
-    crate::child_env::apply_to_command(&mut cmd, std::iter::empty::<(&str, &str)>());
-    cmd.output().map_err(|e| {
+    crate::child_env::apply_to_tokio_command(&mut cmd, std::iter::empty::<(&str, &str)>());
+    let run = crate::process_tree::contained_output_until(&mut cmd, tokio::time::sleep(timeout));
+    let cancelled = async {
+        match context.cancel_token.as_ref() {
+            Some(token) => token.cancelled().await,
+            None => std::future::pending::<()>().await,
+        }
+    };
+    // Dropping `run` on cancel kills the tree.
+    let output = tokio::select! {
+        output = run => output,
+        () = cancelled => return Err(ToolError::cancelled("cargo test cancelled")),
+    };
+    output.map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
             ToolError::not_available("cargo is not installed or not in PATH")
         } else {
@@ -211,6 +250,24 @@ mod tests {
             tool.approval_requirement(),
             ApprovalRequirement::Required,
             "run_tests must gate cargo test behind user approval"
+        );
+    }
+
+    /// Stop must reach `cargo test`: the call returns as cancelled instead of
+    /// blocking a runtime worker until cargo exits on its own.
+    #[tokio::test]
+    async fn run_tests_honors_cancellation() {
+        if !cargo_available() {
+            return;
+        }
+        let tmp = tempdir().expect("tempdir");
+        let token = tokio_util::sync::CancellationToken::new();
+        token.cancel();
+        let ctx = ToolContext::new(tmp.path()).with_cancel_token(token);
+        let result = RunTestsTool.execute(json!({}), &ctx).await;
+        assert!(
+            matches!(result, Err(ToolError::Cancelled { .. })),
+            "cancelled run_tests must not run to completion: {result:?}"
         );
     }
 
@@ -305,6 +362,7 @@ mod tests {
             stdout: stdout.clone(),
             stderr: String::new(),
             command: "(cd /repo && cargo test)".to_string(),
+            timed_out: false,
         })
         .expect("result");
 
@@ -378,8 +436,8 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn run_cargo_does_not_inherit_parent_secret_env() {
+    #[tokio::test]
+    async fn run_cargo_does_not_inherit_parent_secret_env() {
         use crate::test_support::{EnvVarGuard, lock_test_env};
         use std::os::unix::fs::PermissionsExt;
         if !cargo_available() {
@@ -405,7 +463,17 @@ mod tests {
         let _target = EnvVarGuard::set("CARGO_TARGET_DIR", "/tmp/codewhale-fixture-target");
         let workspace = tempdir().expect("workspace");
 
-        let output = run_cargo(workspace.path(), &["envprobe".to_string()]).expect("cargo runs");
+        let ctx = ToolContext::new(workspace.path());
+        let run = run_cargo(
+            workspace.path(),
+            &["envprobe".to_string()],
+            &ctx,
+            RUN_TESTS_TIMEOUT,
+        )
+        .await
+        .expect("cargo runs");
+        assert!(!run.stopped);
+        let output = run.output;
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(
             output.status.success(),
@@ -415,6 +483,54 @@ mod tests {
         assert_eq!(
             stdout.trim(),
             "secret=unset target=/tmp/codewhale-fixture-target"
+        );
+    }
+
+    /// A run that hits the timeout is killed, tree and all, and still returns
+    /// what it wrote: the only evidence of which test hung.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timed_out_run_cargo_keeps_partial_output_and_kills_the_tree() {
+        use crate::test_support::{EnvVarGuard, lock_test_env};
+        use std::os::unix::fs::PermissionsExt;
+        if !cargo_available() {
+            return;
+        }
+        let _env_lock = lock_test_env();
+        let bin = tempdir().expect("bin dir");
+        let probe = bin.path().join("cargo-hangprobe");
+        fs::write(
+            &probe,
+            "#!/bin/sh\necho 'test slow_case ... started'\nsleep 300 &\necho $! > hang.pid\nwait\n",
+        )
+        .expect("write probe");
+        fs::set_permissions(&probe, fs::Permissions::from_mode(0o755)).expect("chmod probe");
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let mut paths = vec![bin.path().to_path_buf()];
+        paths.extend(std::env::split_paths(&path));
+        let _path = EnvVarGuard::set("PATH", std::env::join_paths(paths).expect("join PATH"));
+        let workspace = tempdir().expect("workspace");
+        let pid_file = workspace.path().join("hang.pid");
+
+        let ctx = ToolContext::new(workspace.path());
+        let run = run_cargo(
+            workspace.path(),
+            &["hangprobe".to_string()],
+            &ctx,
+            Duration::from_secs(10),
+        )
+        .await
+        .expect("a timed-out run still returns its output");
+        assert!(run.stopped);
+        assert!(
+            String::from_utf8_lossy(&run.output.stdout).contains("test slow_case ... started"),
+            "{:?}",
+            run.output
+        );
+        let hung = crate::process_tree::read_pid_file(&pid_file, Duration::from_secs(5));
+        assert!(
+            crate::process_tree::wait_for_pid_exit(hung, Duration::from_secs(5)),
+            "the timed-out run's process is still running"
         );
     }
 }
