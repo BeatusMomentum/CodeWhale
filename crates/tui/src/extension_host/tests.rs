@@ -2208,16 +2208,22 @@ fn launch_plan_gives_each_runtime_its_own_flags() {
         let shadow_realm_off = launch
             .runtime_env
             .contains(&("BUN_JSC_useShadowRealm".to_string(), "0".to_string()));
+        // An inherited NODE_OPTIONS preload must not run before the lockdown.
+        assert!(
+            launch
+                .runtime_env
+                .contains(&("NODE_OPTIONS".to_string(), String::new())),
+            "{:?}",
+            launch.runtime_env
+        );
+        assert_eq!(shadow_realm_off, kind == HostRuntimeKind::Bun);
         if kind == HostRuntimeKind::Bun {
-            assert!(shadow_realm_off, "{:?}", launch.runtime_env);
             assert!(
                 !launch
                     .args
                     .iter()
                     .any(|arg| arg.starts_with("--max-old-space"))
             );
-        } else {
-            assert!(launch.runtime_env.is_empty(), "{:?}", launch.runtime_env);
         }
     }
     // Where the kernel limit comes from on each platform.
@@ -2245,8 +2251,8 @@ fn launch_plan_gives_each_runtime_its_own_flags() {
 }
 
 #[tokio::test]
-async fn handshake_refuses_runtime_mismatch_and_an_unapplied_kernel_cap() {
-    let Some(node) = node_for_tests("handshake_refuses_a_different_runtime") else {
+async fn handshake_refuses_a_runtime_or_version_mismatch_and_an_unapplied_kernel_cap() {
+    let Some(node) = node_for_tests("handshake_refuses_a_runtime_or_version_mismatch") else {
         return;
     };
     use crate::dependencies::HostRuntimeKind;
@@ -2267,18 +2273,27 @@ async fn handshake_refuses_runtime_mismatch_and_an_unapplied_kernel_cap() {
         fn log(&self, _: &protocol::LogParams) {}
         fn exited(&self, _: u64, _: String, _: String) {}
     }
-    for missing_cap in [false, true] {
+    for case in ["runtime", "version", "cap"] {
         let mut launch =
             super::supervisor::plan_launch(&runtime, &bundle, home.path(), 1 << 30).unwrap();
-        let expected = if missing_cap {
+        let expected = match case {
+            // The core believes it launched Bun; the host truthfully says Node.
+            "runtime" => {
+                launch.runtime.kind = HostRuntimeKind::Bun;
+                "host reports runtime node but bun was launched"
+            }
+            // The pinned probe saw another version: the binary at that path
+            // was replaced after it was probed.
+            "version" => {
+                launch.runtime.version = (0, 0, 1);
+                "the runtime binary changed mid-session"
+            }
             // An actual Node host reports no kernel cap. Even with matching
             // runtime/digest, the requested hard boundary must block admission.
-            launch.memory = super::supervisor::MemoryEnforcement::Jetsam;
-            "host did not apply the requested 1024 MiB kernel memory limit; initialization refused"
-        } else {
-            // The core believes it launched Bun; the host truthfully says Node.
-            launch.runtime.kind = HostRuntimeKind::Bun;
-            "host reports runtime node but bun was launched"
+            _ => {
+                launch.memory = super::supervisor::MemoryEnforcement::Jetsam;
+                "host did not apply the requested 1024 MiB kernel memory limit; initialization refused"
+            }
         };
         let error = match super::supervisor::HostProcess::spawn(
             1,

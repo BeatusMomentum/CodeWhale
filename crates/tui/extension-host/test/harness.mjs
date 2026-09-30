@@ -24,7 +24,8 @@ export const IS_BUN = typeof process.versions.bun === 'string'
  * Node's heap and `__proto__` flags, so it gets its own: never auto-install
  * packages, ignore `bunfig.toml` and `.env` files in the working directory,
  * and no ShadowRealm. Node switches off `node:sqlite`, and `node:ffi` where
- * this Node has it.
+ * this Node has it. Both get a blank `NODE_OPTIONS`, so an inherited preload
+ * cannot run before the native-code lockdown.
  */
 export const HOST_ARGS = IS_BUN
   ? ['--no-install', '--no-env-file', `--config=${process.platform === 'win32' ? 'NUL' : '/dev/null'}`, '--no-addons']
@@ -35,7 +36,7 @@ export const HOST_ARGS = IS_BUN
       '--no-experimental-sqlite',
       ...(process.allowedNodeEnvironmentFlags.has('--no-experimental-ffi') ? ['--no-experimental-ffi'] : []),
     ]
-export const HOST_ENV = IS_BUN ? { BUN_JSC_useShadowRealm: '0' } : {}
+export const HOST_ENV = { NODE_OPTIONS: '', ...(IS_BUN ? { BUN_JSC_useShadowRealm: '0' } : {}) }
 
 export const LIMITS = { max_frame: 32 * 1024 * 1024, max_inflight: 256, dispose_deadline_ms: 2000, activate_deadline_ms: 5000 }
 

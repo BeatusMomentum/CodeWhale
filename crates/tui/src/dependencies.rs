@@ -441,6 +441,14 @@ impl HostRuntime {
         let (major, minor, patch) = self.version;
         format!("{major}.{minor}.{patch}")
     }
+
+    /// Whether a version the running host reported (`process.versions.bun`
+    /// or `process.versions.node`: no `v`, maybe a pre-release suffix) is the
+    /// version this runtime's probe saw.
+    #[must_use]
+    pub fn reports_version(&self, reported: &str) -> bool {
+        parse_version_triple(reported.trim().trim_start_matches('v')) == Some(self.version)
+    }
 }
 
 /// The outcome of `[extension_host] runtime` selection, with every rejected

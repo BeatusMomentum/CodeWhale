@@ -17,17 +17,25 @@
 //! containment boundary. Elsewhere (Linux, Windows) the host runs unsandboxed
 //! with the user's permissions, and `/plugin` says so.
 //!
-//! **Runtime.** Bun (preferred) or Node, chosen once per manager
+//! **Runtime.** Node (the default) or Bun (opt-in: `runtime = "bun"`, or
+//! `"auto"`, which prefers a supported Bun), chosen once per manager
 //! (`[extension_host] runtime`). Each gets its own flags ([`runtime_args`])
 //! and environment ([`runtime_env`]); Bun silently ignores Node's heap and
 //! `__proto__` flags. The host itself takes in-process native code away from
 //! plugins (`extension-host/src/runtime.ts`: `bun:ffi`, `Bun.FFI`, SQLite
 //! extension loading, Worker threads, ShadowRealm, `process.dlopen`) and
-//! refuses to start if a lock does not hold.
+//! refuses to start if a lock does not hold. That lockdown covers the entry
+//! points found so far (Bun 1.4, Node 22 and 26), not every one a runtime
+//! may add.
 //!
-//! **Memory cap** ([`MemoryEnforcement`]), measured 2026-09-30 on macOS 26.1:
-//! * Linux: `RLIMIT_DATA`, set in the child before exec; an allocation past
-//!   the cap fails, on either runtime. Plugin child processes inherit it.
+//! **Memory cap** ([`MemoryEnforcement`]). What was measured where: the
+//! macOS mechanism on macOS 26.1 arm64 (2026-09-30, Bun 1.4.0 and Node);
+//! the Linux thresholds in [`HOST_MEMORY_CAP`] in a Linux container
+//! (2026-09-29). Hosted CI runs the Rust memory-cap test on Linux, macOS and
+//! Windows with Node only; no Bun host has been run on Linux or Windows.
+//! * Linux: `RLIMIT_DATA`, set in the child before exec (clamped to an
+//!   inherited hard limit that is already lower); an allocation past the cap
+//!   fails. Plugin child processes inherit it.
 //! * Windows: the Job Object's per-process limit; an allocation past the cap
 //!   fails. It applies to each process in the job, plugin children included.
 //! * macOS: `setrlimit(RLIMIT_AS/RLIMIT_DATA)` below the current mapping size
@@ -175,11 +183,11 @@ impl MemoryEnforcement {
     }
 }
 
-/// The default memory cap. Measured on Linux (2026-09-29): under
-/// `RLIMIT_DATA` Node 24 aborts when it creates the host's watchdog Worker
-/// at 512 MiB, and Bun 1.4 aborts at startup at 256 MiB. Both start and run
-/// normally at 1 GiB and fail an allocation past it. An idle host uses
-/// 34–67 MB resident.
+/// The default memory cap. Measured once in a Linux container (2026-09-29),
+/// not in CI: under `RLIMIT_DATA` Node 24 aborts when it creates the host's
+/// watchdog Worker at 512 MiB, and Bun 1.4 aborts at startup at 256 MiB.
+/// Both started and ran at 1 GiB and failed an allocation past it. An idle
+/// host used 34–67 MB resident.
 pub const HOST_MEMORY_CAP: u64 = 1 << 30;
 
 /// Runtime flags, before the bundle path. Keep in sync with
@@ -205,15 +213,25 @@ pub(crate) fn runtime_args(runtime: &HostRuntime) -> Vec<String> {
 }
 
 /// Environment for the runtime. Keep in sync with `HOST_ENV` in
-/// `extension-host/test/harness.mjs`. Bun: no ShadowRealm, engine-wide
-/// (a realm imports a fresh `bun:ffi`; `node:vm` contexts would otherwise
-/// hand the constructor out). The host refuses to start without it.
+/// `extension-host/test/harness.mjs`.
+///
+/// - Both: `NODE_OPTIONS` is blanked. The child-environment allowlist passes
+///   the user's value through (shell tools need it), and a `--require` or
+///   `--import` preload there would run before the host's native-code
+///   lockdown. Node honours it; Bun 1.4.0 ignored a `--require` in it when
+///   checked (2026-09-30), and it is blanked for Bun too in case a later
+///   Bun does not. `BUN_OPTIONS`, which Bun does honour, is not in that
+///   allowlist.
+/// - Bun: no ShadowRealm, engine-wide (a realm imports a fresh `bun:ffi`;
+///   `node:vm` contexts would otherwise hand the constructor out). The host
+///   refuses to start without it.
 #[must_use]
 pub(crate) fn runtime_env(kind: HostRuntimeKind) -> Vec<(String, String)> {
-    match kind {
-        HostRuntimeKind::Bun => vec![("BUN_JSC_useShadowRealm".to_string(), "0".to_string())],
-        HostRuntimeKind::Node => Vec::new(),
+    let mut env = vec![("NODE_OPTIONS".to_string(), String::new())];
+    if kind == HostRuntimeKind::Bun {
+        env.push(("BUN_JSC_useShadowRealm".to_string(), "0".to_string()));
     }
+    env
 }
 
 fn base_runtime_args(kind: HostRuntimeKind) -> &'static [&'static str] {
@@ -395,16 +413,31 @@ pub(crate) fn plan_launch(
 
 /// The kernel-enforced memory cap on Linux: `RLIMIT_DATA`, applied in the
 /// child between fork and exec, so only the host (and what it starts) is
-/// limited.
+/// limited. Soft and hard limit are both set, so plugin code cannot raise
+/// it. An unprivileged process cannot raise its hard limit, so when the
+/// inherited hard limit is already below `cap` the host gets that lower
+/// limit instead of failing to spawn with `EPERM`.
+///
+/// Known limit: in that case `/plugin` and doctor still name the configured
+/// cap, not the lower inherited one.
 #[cfg(target_os = "linux")]
 fn limit_child_memory(command: &mut tokio::process::Command, cap: u64) {
     // SAFETY: the closure runs in the forked child before exec and calls only
-    // `setrlimit`, which is async-signal-safe; it allocates nothing.
+    // `getrlimit` and `setrlimit`, which are async-signal-safe; it allocates
+    // nothing.
     unsafe {
         command.pre_exec(move || {
+            let mut inherited = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            if libc::getrlimit(libc::RLIMIT_DATA, &raw mut inherited) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let cap = (cap as libc::rlim_t).min(inherited.rlim_max);
             let limit = libc::rlimit {
-                rlim_cur: cap as libc::rlim_t,
-                rlim_max: cap as libc::rlim_t,
+                rlim_cur: cap,
+                rlim_max: cap,
             };
             if libc::setrlimit(libc::RLIMIT_DATA, &raw const limit) != 0 {
                 return Err(std::io::Error::last_os_error());
@@ -581,9 +614,20 @@ impl HostProcess {
         command.process_group(0);
         limit_child_memory(&mut command, launch.memory_cap);
 
-        let mut child = command
-            .spawn()
-            .map_err(|error| format!("failed to start {}: {error}", launch.program.display()))?;
+        // On Linux a failure to apply the memory cap in the child surfaces
+        // here as a spawn error carrying only its errno, indistinguishable
+        // from a failed exec, so the message names both.
+        let mut child = command.spawn().map_err(|error| {
+            if cfg!(target_os = "linux") {
+                format!(
+                    "failed to start {}, or to apply its {} MiB memory cap (RLIMIT_DATA) before exec: {error}",
+                    launch.program.display(),
+                    launch.memory_cap / (1024 * 1024)
+                )
+            } else {
+                format!("failed to start {}: {error}", launch.program.display())
+            }
+        })?;
         let pid = child.id();
         let tree = match crate::process_tree::ProcessTree::attach_tokio(&child) {
             Ok(tree) => Arc::new(tree),
@@ -759,6 +803,20 @@ impl HostProcess {
                     "host reports runtime {} but {} was launched",
                     hello.runtime.name,
                     launch.runtime.kind.name()
+                ));
+            }
+            // Restarts reuse the pinned runtime without probing it again, so
+            // the binary at that path can have been replaced since (an
+            // upgrade mid-session). Its flags and lockdown were chosen for
+            // the probed version; refuse rather than run an unprobed one.
+            if !launch.runtime.reports_version(&hello.runtime.version) {
+                return Err(format!(
+                    "host reports {} {} but {} {} was probed at {}: the runtime binary changed mid-session; restart Codewhale to use the new version",
+                    hello.runtime.name,
+                    hello.runtime.version,
+                    launch.runtime.kind.name(),
+                    launch.runtime.version_string(),
+                    launch.runtime.path.display()
                 ));
             }
             if hello.bundle_sha256 != expected_sha256 {
