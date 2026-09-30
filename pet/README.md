@@ -88,8 +88,8 @@ The Rust particle implementation lives in the product's
 `crates/tui/src/tui/ambient_life/pet_sim.rs`; this package's runner imports it.
 Swift and Kotlin particle ports must match its conformance digests. Generated
 native bundles are committed so the product Rust build needs no Node compiler.
-Run `npm run sync` after changing core source; the generated-byte check in CI
-rejects a stale bundle. Local Whalesong consumers use aliases to these same
+Run `npm run sync` after changing core source; `npm run check` (run by CI)
+rejects a stale bundle or `shared.html` copy. Local Whalesong consumers use aliases to these same
 canonical files, not separately maintained source copies.
 
 The original Whalesong importer, signal model, schema and browser storage code

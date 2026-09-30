@@ -2,6 +2,7 @@
 /** Local TypeScript build plus deterministic embedded-runtime packaging. */
 import { readFile, writeFile, cp, mkdir } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
+import { dirname } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import ts from 'typescript';
 const root = fileURLToPath(new URL('../', import.meta.url));
@@ -23,11 +24,15 @@ const bundle = `/* Generated from pet/src/core. Run npm --prefix pet run sync. *
   + [...modules].map(([id, js]) => `factories[${JSON.stringify(id)}]=function(exports,require){\n${js}\n};\n`).join('')
   + `function load(id){id=id.replace(/^\\.\\//,'').replace(/\\.js$/,'');if(cache[id])return cache[id];if(!factories[id])throw Error('Missing core module');const e=cache[id]={};factories[id](e,load);return e;}\nglobal.PetNative=load('pet-native').PetNative;\n})(globalThis);\n`;
 await writeFile(root + 'dist/pet-native.js', bundle);
-if (process.argv.includes('--tui')) {
+// Committed native copies are generated from src/core and public/. `--check`
+// regenerates them in memory and fails on any byte difference, so a green
+// `npm run check` cannot sit beside a stale embedded TUI/Apple/Android core.
+const check = process.argv.includes('--check');
+const generated = [];
+if (check || process.argv.includes('--tui')) {
   const destination = root + '../crates/tui/src/tui/pet_watch/';
-  await mkdir(destination, { recursive: true });
-  await writeFile(destination + 'pet-native.js', bundle);
-  await cp(root + 'public/shared.html', destination + 'shared.html');
+  generated.push([destination + 'pet-native.js', Buffer.from(bundle)],
+    [destination + 'shared.html', await readFile(root + 'public/shared.html')]);
 }
 if (process.argv.includes('--study')) {
   const study = root + 'world/';
@@ -44,11 +49,23 @@ if (process.argv.includes('--study')) {
     compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ES2022 },
   }).outputText.replace("'./PetSim.ts'", "'./PetSim.js'"));
 }
-if (process.argv.includes('--apple')) {
+if (check || process.argv.includes('--apple')) {
   const { petDemoEvents } = await import('../dist/core/pet-demo.js');
   const { compilePetTelemetry, encodePetJSONL } = await import('../dist/core/pet-telemetry.js');
-  await mkdir(root + 'ios/Resources', { recursive: true });
-  await writeFile(root + 'ios/Resources/pet-native.js', bundle);
-  await writeFile(root + 'ios/Resources/demo.jsonl', encodePetJSONL(compilePetTelemetry(petDemoEvents(), 80_000)));
+  generated.push([root + 'ios/Resources/pet-native.js', Buffer.from(bundle)],
+    [root + 'ios/Resources/demo.jsonl', Buffer.from(encodePetJSONL(compilePetTelemetry(petDemoEvents(), 80_000)))]);
 }
-console.log(`Built pet viewer and native core (${modules.size} shared modules), entirely local.`);
+if (check) {
+  const stale = [];
+  for (const [path, bytes] of generated) {
+    const current = await readFile(path).catch(error => { if (error.code === 'ENOENT') return undefined; throw error; });
+    if (!current || !bytes.equals(current)) stale.push(path.slice(root.length));
+  }
+  if (stale.length) {
+    console.error(`Generated native artifacts are stale: ${stale.join(', ')}. Run npm --prefix pet run sync and commit them.`);
+    process.exit(1);
+  }
+} else {
+  for (const [path, bytes] of generated) { await mkdir(dirname(path), { recursive: true }); await writeFile(path, bytes); }
+}
+console.log(`Built pet viewer and native core (${modules.size} shared modules), entirely local${check ? '; generated native artifacts match' : ''}.`);
