@@ -929,7 +929,7 @@ pub(super) async fn delete_session(
         if let Err(error) = state.runtime_threads.unbind_session_threads(&id) {
             tracing::warn!(session_id = %id, %error, "deleted session's threads were not unbound");
         }
-        Ok(StatusCode::NO_CONTENT)
+        Ok::<_, ApiError>(StatusCode::NO_CONTENT)
     })
     .await
     .map_err(|_| ApiError::internal("session delete failed"))?
