@@ -653,13 +653,13 @@ workflow({
             assert_eq!(leaf.mode, TaskMode::ReadOnly);
             assert!(!leaf.permissions.allow_write);
             let expected_tools: &[&str] = if expected_role == "explore" {
-                &["File"]
+                &["tool_search", "grep_files"]
             } else {
                 &[]
             };
             assert_eq!(
                 leaf.permissions.allowed_tools, expected_tools,
-                "the fixture must explicitly restrict source gathering to File"
+                "the fixture must allow only search discovery and visible read-only grep"
             );
             assert_eq!(
                 leaf.permissions.deny_all_tools,
@@ -680,12 +680,19 @@ workflow({
             );
             if expected_role == "explore" {
                 assert!(
-                    leaf.prompt.contains("exactly one `File` call")
-                        && leaf.prompt.contains("Do not call `File` more than once")
+                    leaf.prompt
+                        .contains("exactly one `grep_files` evidence call")
                         && leaf
                             .prompt
-                            .contains("do not use any action except `search_content`"),
-                    "the scout must finish discovery in one bounded tool round"
+                            .contains("Do not call `grep_files` more than once")
+                        && leaf.prompt.contains("first call `tool_search`")
+                        && leaf.prompt.contains("`query` set to `grep_files`")
+                        && leaf
+                            .prompt
+                            .contains("response after the `grep_files` result")
+                        && !leaf.prompt.contains("`File`")
+                        && !leaf.prompt.contains("`search_content`"),
+                    "the scout must reserve one bounded evidence search and activate it if needed"
                 );
                 assert_eq!(
                     leaf.file_scope
@@ -696,16 +703,24 @@ workflow({
                         "fleets/stopship.toml",
                         "crates/cli/src/lib.rs",
                         "crates/workflow/src/role_resolve.rs",
-                        "crates/tui/src/tools/workflow.rs",
+                        "crates/tui/src/tools/workflow/mod.rs",
                         "crates/lane/src/runtime.rs",
                     ],
                     "the scout grep must not include its own authored prompt"
                 );
+                let repository_root =
+                    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+                for path in &leaf.file_scope {
+                    assert!(
+                        repository_root.join(path).is_file(),
+                        "scout evidence path must exist: {path}"
+                    );
+                }
                 assert!(
                     leaf.prompt.contains(
-                        "`include` set exactly to [`fleets/stopship.toml`, `crates/cli/src/lib.rs`, `crates/workflow/src/role_resolve.rs`, `crates/tui/src/tools/workflow.rs`, `crates/lane/src/runtime.rs`]"
+                        "`include` set exactly to [`fleets/stopship.toml`, `crates/cli/src/lib.rs`, `crates/workflow/src/role_resolve.rs`, `crates/tui/src/tools/workflow/mod.rs`, `crates/lane/src/runtime.rs`]"
                     ) && leaf.prompt.contains("Matches outside that exact include list do not count"),
-                    "the one File search must constrain the actual tool input, not only File scope metadata"
+                    "the one grep search must constrain its input as well as the declared file scope"
                 );
                 assert!(
                     leaf.prompt.contains("if you can populate all seven")
@@ -735,7 +750,7 @@ workflow({
                     "fleets/stopship.toml",
                     "crates/cli/src/lib.rs",
                     "crates/workflow/src/role_resolve.rs",
-                    "crates/tui/src/tools/workflow.rs",
+                    "crates/tui/src/tools/workflow/mod.rs",
                     "crates/lane/src/runtime.rs",
                 ],
                 "every acceptance role must carry the same promoted evidence boundary"
