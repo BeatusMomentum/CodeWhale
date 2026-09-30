@@ -1391,7 +1391,10 @@ mod tests {
         );
         assert!(result.is_err());
         assert_eq!(record.status, LaneStatus::Failed);
-        assert!(!wt_path.exists(), "the failed lane's worktree was left behind");
+        assert!(
+            !wt_path.exists(),
+            "the failed lane's worktree was left behind"
+        );
     }
 
     #[test]

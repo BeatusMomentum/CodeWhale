@@ -2902,7 +2902,11 @@ mod tests {
                 "codewhale-tui-windows-x64",
                 true,
             ),
-            ("codewhale-macos-arm64.tar.gz", "codewhale-macos-arm64", false),
+            (
+                "codewhale-macos-arm64.tar.gz",
+                "codewhale-macos-arm64",
+                false,
+            ),
             ("codewhale-macos-arm64.zip", "codewhale-macos-arm64", false),
             ("codewhale-macos-arm64.sig", "codewhale-macos-arm64", false),
             (

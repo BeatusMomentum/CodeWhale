@@ -915,7 +915,10 @@ fn read_events_jsonl(
     // Streamed like the audit log: allocation follows one line, not the file.
     for raw_line in std::io::BufRead::lines(std::io::BufReader::new(file)) {
         let Ok(raw_line) = raw_line.inspect_err(|e| {
-            tracing::trace!("metrics: stopped reading events file {}: {e}", path.display());
+            tracing::trace!(
+                "metrics: stopped reading events file {}: {e}",
+                path.display()
+            );
         }) else {
             break;
         };

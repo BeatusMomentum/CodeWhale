@@ -155,11 +155,9 @@ impl DeviceCodePoll {
                     // the clock drifts (WSL, suspended VMs).
                     interval = match interval_seconds.filter(|seconds| *seconds > 0) {
                         Some(seconds) => self.clamp_interval(Duration::from_secs(seconds)),
-                        None => {
-                            self.clamp_interval(
-                                interval.saturating_add(Duration::from_secs(SLOW_DOWN_STEP_SECS)),
-                            )
-                        }
+                        None => self.clamp_interval(
+                            interval.saturating_add(Duration::from_secs(SLOW_DOWN_STEP_SECS)),
+                        ),
                     };
                 }
             }

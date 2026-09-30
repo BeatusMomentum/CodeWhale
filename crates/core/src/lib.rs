@@ -667,7 +667,8 @@ impl ThreadManager {
                 .collect();
             let offered: Vec<String> = history.iter().map(Value::to_string).collect();
             let already = persisted_overlap(&persisted, &offered);
-            let messages: Vec<NewMessage> = history[already..].iter().map(history_message).collect();
+            let messages: Vec<NewMessage> =
+                history[already..].iter().map(history_message).collect();
             self.store.append_messages(&thread.id, &messages)?;
         }
 
@@ -2666,7 +2667,12 @@ mod tests {
         // The client read [yes, question] and answers "yes" twice.
         manager
             .resume_thread_with_history(
-                &resume(vec![yes.clone(), question.clone(), yes.clone(), yes.clone()]),
+                &resume(vec![
+                    yes.clone(),
+                    question.clone(),
+                    yes.clone(),
+                    yes.clone(),
+                ]),
                 Path::new("/tmp/codewhale"),
                 "deepseek".to_string(),
             )

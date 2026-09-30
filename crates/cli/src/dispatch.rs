@@ -343,16 +343,15 @@ mod tests {
                 finished.store(true, Ordering::SeqCst);
             })
         };
-        let job: codewhale_tui::cloud_dispatch::CloudJob = serde_json::from_value(
-            serde_json::json!({
+        let job: codewhale_tui::cloud_dispatch::CloudJob =
+            serde_json::from_value(serde_json::json!({
                 "id": "cloud_test", "kind": "cloud", "status": "running",
                 "prompt": "p", "forge": "github", "remote_name": "origin",
                 "remote_url": "https://example.invalid/r.git", "branch": "b",
                 "confirmed": true, "sandbox_id": null, "pr_url": null,
                 "refusal": null, "note": "", "created_unix": 0
-            }),
-        )
-        .expect("job fixture");
+            }))
+            .expect("job fixture");
         let dir = tempfile::tempdir().unwrap();
         let store = CloudJobStore::from_path(dir.path().to_path_buf());
 

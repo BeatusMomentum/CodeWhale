@@ -692,10 +692,8 @@ impl StateStore {
                     ));
                 }
             }
-            conn.execute_batch(&format!(
-                "{additions} PRAGMA user_version = 5;"
-            ))
-            .context("failed to initialize durable goal stall schema")?;
+            conn.execute_batch(&format!("{additions} PRAGMA user_version = 5;"))
+                .context("failed to initialize durable goal stall schema")?;
             user_version = 5;
         }
         if user_version < 6 {
@@ -2425,7 +2423,10 @@ mod tests {
 
         assert!(store.append_messages("thread-1", &batch).is_err());
         assert!(
-            store.list_messages("thread-1", None).expect("list").is_empty(),
+            store
+                .list_messages("thread-1", None)
+                .expect("list")
+                .is_empty(),
             "a failed batch must leave no messages"
         );
         let leaf: Option<i64> = store
@@ -2444,7 +2445,9 @@ mod tests {
             content: content.to_string(),
             item: None,
         });
-        let ids = store.append_messages("thread-1", &ok).expect("append batch");
+        let ids = store
+            .append_messages("thread-1", &ok)
+            .expect("append batch");
         let chain = store.list_messages("thread-1", None).expect("list");
         assert_eq!(chain.iter().map(|m| m.id).collect::<Vec<_>>(), ids);
         assert_eq!(chain[1].parent_entry_id, Some(ids[0]));
@@ -2457,10 +2460,20 @@ mod tests {
     fn deleted_thread_leaves_the_session_index() {
         let store = temp_state_store("delete-index");
         store
-            .append_thread_name("live", Some("Build".to_string()), 100, Some(PathBuf::from("/live")))
+            .append_thread_name(
+                "live",
+                Some("Build".to_string()),
+                100,
+                Some(PathBuf::from("/live")),
+            )
             .expect("index live");
         store
-            .append_thread_name("gone", Some("build".to_string()), 200, Some(PathBuf::from("/gone")))
+            .append_thread_name(
+                "gone",
+                Some("build".to_string()),
+                200,
+                Some(PathBuf::from("/gone")),
+            )
             .expect("index gone");
         assert_eq!(
             store.find_thread_path_by_name_str("build").expect("find"),

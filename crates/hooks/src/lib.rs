@@ -176,7 +176,10 @@ pub(crate) fn expand_home(path: PathBuf) -> PathBuf {
 /// Hook and lifecycle events carry tool payloads, prompts, and paths; under
 /// an ordinary umask the old defaults were readable by every local user.
 pub(crate) async fn open_private_append(path: &Path) -> Result<tokio::fs::File> {
-    if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
         let mut dirs = tokio::fs::DirBuilder::new();
         dirs.recursive(true);
         #[cfg(unix)]
