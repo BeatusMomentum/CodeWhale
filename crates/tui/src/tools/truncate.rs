@@ -9,7 +9,7 @@
 //!    retrieval and the raw-detail pager can inspect it without leaking a
 //!    process-global filesystem path.
 //!
-//! The default adaptive path writes immutable artifacts under
+//! The opt-in adaptive path writes immutable artifacts under
 //! `~/.codewhale/sessions/<session>/artifacts/`. The historical
 //! `~/.codewhale/tool_outputs/<sanitised-id>.txt` directory remains only for
 //! classic-routing compatibility, protected by a digest-bound origin sidecar.
@@ -1345,7 +1345,11 @@ mod tests {
                 .content
                 .contains("the full output could not be saved")
         );
-        assert!(result.content.contains("re-run with narrower output"));
+        assert!(
+            result
+                .content
+                .contains("re-run the command with narrower output")
+        );
         assert!(!result.content.contains("full output at"));
         assert!(!result.content.contains("retrieve_tool_result"));
         let metadata = result.metadata.as_ref().unwrap();
@@ -1947,15 +1951,22 @@ mod tests {
             );
 
             assert!(path.is_none());
-            assert_eq!(result.content, raw);
+            assert!(!result.success);
+            assert!(result.content.len() < SPILLOVER_HEAD_BYTES + SPILLOVER_TAIL_BYTES + 1024);
+            assert!(!result.content.contains("DEEP_FAILURE_SENTINEL"));
+            assert!(
+                result
+                    .content
+                    .contains("the full output could not be saved")
+            );
             assert!(!result.content.contains(SPILLOVER_PREVIEW_HINT));
             assert!(!result.content.contains("retrieve_tool_result"));
-            assert!(
+            assert_eq!(
                 result
                     .metadata
                     .as_ref()
-                    .and_then(|metadata| metadata.get("evidence_available"))
-                    .is_none()
+                    .and_then(|metadata| metadata.get("evidence_available")),
+                Some(&serde_json::Value::Bool(false))
             );
             assert!(
                 !session_dir
@@ -1994,7 +2005,18 @@ mod tests {
             );
 
             assert!(path.is_none());
-            assert_eq!(result.content, raw);
+            assert!(result.success);
+            assert!(result.content.len() < SPILLOVER_HEAD_BYTES + SPILLOVER_TAIL_BYTES + 1024);
+            assert!(!result.content.contains("DEEP_METADATA_FAILURE_SENTINEL"));
+            assert!(
+                result
+                    .content
+                    .contains("the full output could not be saved")
+            );
+            assert_eq!(
+                result.metadata.as_ref().unwrap()["evidence_available"],
+                false
+            );
             assert!(!result.content.contains(SPILLOVER_PREVIEW_HINT));
             assert!(!result.content.contains("retrieve_tool_result"));
             assert!(
