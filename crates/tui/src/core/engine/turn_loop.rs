@@ -4399,6 +4399,10 @@ impl Engine {
                     .collect();
                 let mut tool_tasks = FuturesUnordered::new();
                 let shell_permits = Arc::new(tokio::sync::Semaphore::new(MAX_PARALLEL_SHELL_EXEC));
+                let session_id = self.session.id.clone();
+                let provider = self.api_provider;
+                let model = self.session.model.clone();
+                let route_limits = self.active_route_limits;
                 for plan in plans {
                     if let Some(result) = plan.guard_result.clone() {
                         let result = Ok(result);
@@ -4449,10 +4453,6 @@ impl Engine {
                     let lock = tool_exec_lock.clone();
                     let mcp_pool = mcp_pool.clone();
                     let tx_event = self.tx_event.clone();
-                    let session_id = self.session.id.clone();
-                    let provider = self.api_provider;
-                    let model = self.session.model.clone();
-                    let route_limits = self.active_route_limits;
                     let started_at = Instant::now();
                     let shell_permits = shell_permits.clone();
                     let workspace = self.session.workspace.clone();
@@ -4482,71 +4482,11 @@ impl Engine {
                             context_override,
                         )
                         .await;
-
-                        let original_content_digest = result
-                            .as_ref()
-                            .ok()
-                            .filter(|_| collect_fleet_evidence)
-                            .and_then(|result| {
-                                FleetDenialGuard::original_content_digest(
-                                    &plan.name,
-                                    &plan.input,
-                                    &result.result,
-                                )
-                            });
-
-                        let result = preserve_tool_output_before_fanout(
-                            result,
-                            provider,
-                            &model,
-                            route_limits,
-                            &session_id,
-                            &plan.id,
-                            &plan.name,
-                        )
-                        .await;
-
-                        let result = match result {
-                            Ok(rich) => Ok(super::tool_media::project(
-                                rich,
-                                &session_id,
-                                &plan.id,
-                                &plan.name,
-                            )
-                            .await),
-                            Err(error) => Err(error),
-                        };
-                        let content_blocks = result
-                            .as_ref()
-                            .map(|result| result.content_blocks.clone())
-                            .unwrap_or_default();
-                        let legacy_result = result.map(RichToolResult::into_result);
-                        if let Ok(permit) = super::streaming::reserve_event_capacity(
-                            &tx_event,
-                            Some(&cancel_token),
-                            super::streaming::EventReservationPolicy::Receipt,
-                        )
-                        .await
-                        {
-                            permit.send(Event::ToolCallComplete {
-                                model_call: plan.model_call.clone(),
-                                id: plan.id.clone(),
-                                name: plan.name.clone(),
-                                result: legacy_result.clone(),
-                            });
-                        }
-
-                        ToolExecOutcome {
-                            model_call: plan.model_call.clone(),
-                            index: plan.index,
-                            id: plan.id,
-                            name: plan.name,
-                            input: plan.input,
-                            started_at,
-                            terminal: ToolExecutionOutcome::from_legacy(legacy_result),
-                            content_blocks,
-                            original_content_digest,
-                        }
+                        // Hand the known result to the existing collector
+                        // before artifact/media processing can yield. Once
+                        // execution finished, cancellation must not drop its
+                        // success and fabricate a cancelled fallback.
+                        (plan, started_at, result)
                     });
                 }
 
@@ -4559,9 +4499,60 @@ impl Engine {
                             break;
                         }
                         outcome = tool_tasks.next() => {
-                            let Some(outcome) = outcome else { break; };
-                            let index = outcome.index;
-                            outcomes[index] = Some(outcome);
+                            let Some((plan, started_at, result)) = outcome else { break; };
+                            let original_content_digest = result
+                                .as_ref()
+                                .ok()
+                                .filter(|_| collect_fleet_evidence)
+                                .and_then(|result| {
+                                    FleetDenialGuard::original_content_digest(
+                                        &plan.name,
+                                        &plan.input,
+                                        &result.result,
+                                    )
+                                });
+                            let result = preserve_tool_output_before_fanout(
+                                result,
+                                provider,
+                                &model,
+                                route_limits,
+                                &session_id,
+                                &plan.id,
+                                &plan.name,
+                            )
+                            .await;
+                            let result = match result {
+                                Ok(rich) => Ok(super::tool_media::project(
+                                    rich,
+                                    &session_id,
+                                    &plan.id,
+                                    &plan.name,
+                                )
+                                .await),
+                                Err(error) => Err(error),
+                            };
+                            let content_blocks = result
+                                .as_ref()
+                                .map(|result| result.content_blocks.clone())
+                                .unwrap_or_default();
+                            let legacy_result = result.map(RichToolResult::into_result);
+                            let _ = self.send_event(Event::ToolCallComplete {
+                                model_call: plan.model_call.clone(),
+                                id: plan.id.clone(),
+                                name: plan.name.clone(),
+                                result: legacy_result.clone(),
+                            }).await;
+                            outcomes[plan.index] = Some(ToolExecOutcome {
+                                model_call: plan.model_call.clone(),
+                                index: plan.index,
+                                id: plan.id,
+                                name: plan.name,
+                                input: plan.input,
+                                started_at,
+                                terminal: ToolExecutionOutcome::from_legacy(legacy_result),
+                                content_blocks,
+                                original_content_digest,
+                            });
                         }
                     }
                 }

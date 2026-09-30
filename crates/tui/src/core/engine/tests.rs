@@ -759,6 +759,16 @@ async fn event_capacity_cancelled_parallel_tool_keeps_completed_span_and_call_wh
                 .filter(|(_, _, result)| result.as_ref().is_ok_and(|result| result.success))
                 .collect();
             assert_eq!(succeeded.len(), 1);
+            let cancelled_peer = calls
+                .iter()
+                .find(|(_, _, result)| !result.as_ref().is_ok_and(|result| result.success))
+                .expect("cancelled peer has its own completion");
+            let peer = cancelled_peer
+                .2
+                .as_ref()
+                .expect("legacy cancelled peer result");
+            assert_eq!(peer.metadata.as_ref().unwrap()["cancelled"], true);
+            assert_eq!(peer.metadata.as_ref().unwrap()["cleanup_confirmed"], false);
             assert_eq!(
                 succeeded[0].2.as_ref().unwrap().content,
                 "completed before cancellation"
