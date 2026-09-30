@@ -7,6 +7,21 @@
 use codewhale_models::ToolCaller;
 use std::time::Duration;
 
+impl super::Engine {
+    /// Forward a nonterminal stream observation through the existing event
+    /// queue. Backpressure remains lossless while the turn is live; cancellation
+    /// drops a pending observation so a stalled consumer cannot keep the model
+    /// stream alive. Terminal settlement still owns ordered, lossless delivery
+    /// and may wait for a consumer that never drains this bounded queue.
+    pub(super) async fn send_stream_event(&self, event: super::Event) -> bool {
+        tokio::select! {
+            biased;
+            () = self.cancel_token.cancelled() => false,
+            result = self.tx_event.send(event) => result.is_ok(),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ContentBlockKind {
     Text,
