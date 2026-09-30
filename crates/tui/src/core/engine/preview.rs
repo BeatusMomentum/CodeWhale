@@ -186,8 +186,9 @@ impl Engine {
         let session = self.preview_session_facts(&inputs);
 
         // Mirror terminal continuation gates before request construction.
-        // Token budgets are telemetry-only in unbounded goal mode, so an
-        // active goal remains previewable after crossing or lowering a budget.
+        // Token budgets are telemetry-only unless `[goal]
+        // enforce_token_budget` is set; only then does an exhausted budget
+        // make the next goal request unavailable, as the live gates stop.
         let goal_budget_exhausted = match self.config.goal_state.lock() {
             Ok(state) => {
                 let snapshot = state.snapshot();
