@@ -54,6 +54,7 @@ const OPTIONAL_FILES = [
   "roadmap.ts",
   "contribute.ts",
   "constitution.ts",
+  "runtime.ts",
   "computer-use.ts",
 ];
 

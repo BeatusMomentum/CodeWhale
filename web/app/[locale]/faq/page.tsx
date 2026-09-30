@@ -27,12 +27,10 @@ interface FaqItem {
   sources?: string[];
 }
 
-/**
- * English answers render for every non-Chinese locale (the page body has no
- * other translation yet), so their internal links follow the reader's route
- * locale instead of silently moving them to `/en`.
- */
-const faqEn = (locale: string): FaqItem[] => [
+/** `p` prefixes a site path with the reader's locale. */
+type SitePath = (path: string) => string;
+
+const faqEn = (p: SitePath): FaqItem[] => [
   {
     q: "What is Codewhale?",
     a: (
@@ -67,7 +65,7 @@ brew install Hmbown/deepseek-tui/codewhale
           Run <code className="inline">codewhale</code> to start. First run creates <code className="inline">~/.codewhale/</code> automatically. Legacy <code className="inline">~/.deepseek/</code> is still read as a compatibility fallback.
           Android arm64 / Termux is preview support: npm works only when the
           selected package version has matching Android assets in its GitHub Release.
-          See the <Link href={`/${locale}/install`} className="body-link">full install guide</Link> for China mirrors, Docker, and troubleshooting.
+          See the <Link href={p("/install")} className="body-link">full install guide</Link> for China mirrors, Docker, and troubleshooting.
         </p>
       </>
     ),
@@ -128,7 +126,7 @@ codewhale doctor         # full connectivity check`}
         <ul className="list-disc pl-5 space-y-1 text-sm text-ink-soft mb-3">
           <li><strong>DeepSeek</strong> — bundled default with a native API route, reasoning streaming, cache metrics, and thinking effort control.</li>
           <li><strong>OpenRouter</strong> — unified API for DeepSeek models and other open-model routes.</li>
-          <li><strong>{FACTS.providers.length - 2} more routes</strong> — including OpenAI-compatible, Anthropic, Mistral AI, OpenAI Codex, xAI, Moonshot/Kimi, Z.ai, MiniMax, StepFun, Volcengine Ark, Baidu Qianfan, Model Studio, NVIDIA NIM, Fireworks AI, Together AI, DeepInfra, SiliconFlow, Novita AI, Hugging Face, Arcee AI, AtlasCloud, and the keyless local endpoints SGLang, vLLM, and Ollama. <Link href={`/${locale}/models`} className="body-link">The full list is generated from the provider registry</Link>.</li>
+          <li><strong>{FACTS.providers.length - 2} more routes</strong> — including OpenAI-compatible, Anthropic, Mistral AI, OpenAI Codex, xAI, Moonshot/Kimi, Z.ai, MiniMax, StepFun, Volcengine Ark, Baidu Qianfan, Model Studio, NVIDIA NIM, Fireworks AI, Together AI, DeepInfra, SiliconFlow, Novita AI, Hugging Face, Arcee AI, AtlasCloud, and the keyless local endpoints SGLang, vLLM, and Ollama. <Link href={p("/models")} className="body-link">The full list is generated from the provider registry</Link>.</li>
         </ul>
         <p>
           Set the corresponding env var (e.g. <code className="inline">OPENROUTER_API_KEY</code>) and your provider in <code className="inline">~/.codewhale/config.toml</code>.
@@ -263,7 +261,7 @@ codewhale --provider openrouter --model deepseek/deepseek-v4-pro
       <>
         Codewhale is a bidirectional MCP client and server. Define servers in <code className="inline">~/.codewhale/mcp.json</code>.
         Tools appear as <code className="inline">mcp_&lt;server&gt;_&lt;tool&gt;</code>. You can also expose Codewhale as an MCP server with <code className="inline">codewhale mcp</code>.
-        See the <Link href={`/${locale}/docs/mcp`} className="body-link">docs page</Link> for configuration examples.
+        See the <Link href={p("/docs/mcp")} className="body-link">docs page</Link> for configuration examples.
       </>
     ),
     sources: ["docs/MCP.md"],
@@ -274,7 +272,7 @@ codewhale --provider openrouter --model deepseek/deepseek-v4-pro
       <>
         No CLA required. Fork, branch with conventional commits (<code className="inline">feat:</code>, <code className="inline">fix:</code>, etc.), run the local checks, open a PR.
         The maintainer reads everything personally. Start with issues labeled <code className="inline">good first issue</code>.
-        See the <Link href={`/${locale}/contribute`} className="body-link">contribute page</Link> and <a href="https://github.com/Hmbown/CodeWhale/blob/main/CONTRIBUTING.md" className="body-link">CONTRIBUTING.md</a>.
+        See the <Link href={p("/contribute")} className="body-link">contribute page</Link> and <a href="https://github.com/Hmbown/CodeWhale/blob/main/CONTRIBUTING.md" className="body-link">CONTRIBUTING.md</a>.
       </>
     ),
     sources: ["CONTRIBUTING.md"],
@@ -322,7 +320,7 @@ registry = "sparse+https://mirrors.tuna.tsinghua.edu.cn/crates.io-index/"`}
         </p>
         <p className="mb-2">
           A CNB mirror is maintained for users who cannot reliably reach GitHub
-          (<Link href={`/${locale}/install`} className="body-link">docs/CNB_MIRROR.md</Link>).
+          (<Link href={p("/install")} className="body-link">docs/CNB_MIRROR.md</Link>).
           Cargo users can use the TUNA mirror for faster downloads in China.
         </p>
         <p>
@@ -399,7 +397,7 @@ brew update && brew upgrade codewhale`}
   },
 ];
 
-const faqZh: FaqItem[] = [
+const faqZh = (p: SitePath): FaqItem[] => [
   {
     q: "Codewhale 是什么？",
     a: (
@@ -433,7 +431,7 @@ brew install Hmbown/deepseek-tui/codewhale
         <p>
           输入 <code className="inline">codewhale</code> 即可启动。首次运行会自动创建 <code className="inline">~/.codewhale/</code>。旧版 <code className="inline">~/.deepseek/</code> 仍会作为兼容回退读取。
           Android arm64 / Termux 仍是预览支持：只有当所选 npm 包版本对应的 GitHub Release 发布了匹配的 Android 资产时，npm 安装才可用。
-          查看 <Link href="/zh/install" className="body-link">完整安装指南</Link> 了解国内镜像、Docker 和故障排除。
+          查看 <Link href={p("/install")} className="body-link">完整安装指南</Link> 了解国内镜像、Docker 和故障排除。
         </p>
       </>
     ),
@@ -493,7 +491,7 @@ codewhale doctor         # 完整连接检查`}
         <ul className="list-disc pl-5 space-y-1 text-sm text-ink-soft mb-3">
           <li><strong>DeepSeek</strong> — 内置默认原生 API 路由，支持推理流、缓存指标和思考力度控制。</li>
           <li><strong>OpenRouter</strong> — 统一 API，可访问 DeepSeek 和其他开放模型路由。</li>
-          <li><strong>另外 {FACTS.providers.length - 2} 条路由</strong>——包括 OpenAI 兼容、Anthropic、Mistral AI、OpenAI Codex、xAI、Moonshot/Kimi、Z.ai、MiniMax、StepFun、Volcengine Ark、百度千帆、Model Studio、NVIDIA NIM、Fireworks、Together AI、DeepInfra、SiliconFlow、Novita、Hugging Face、Arcee AI、AtlasCloud，以及无需密钥的本地端点 SGLang、vLLM 和 Ollama。<Link href="/zh/models" className="body-link">完整列表由提供商注册表生成</Link>。</li>
+          <li><strong>另外 {FACTS.providers.length - 2} 条路由</strong>——包括 OpenAI 兼容、Anthropic、Mistral AI、OpenAI Codex、xAI、Moonshot/Kimi、Z.ai、MiniMax、StepFun、Volcengine Ark、百度千帆、Model Studio、NVIDIA NIM、Fireworks、Together AI、DeepInfra、SiliconFlow、Novita、Hugging Face、Arcee AI、AtlasCloud，以及无需密钥的本地端点 SGLang、vLLM 和 Ollama。<Link href={p("/models")} className="body-link">完整列表由提供商注册表生成</Link>。</li>
         </ul>
         <p>
           设置对应的环境变量（如 <code className="inline">OPENROUTER_API_KEY</code>）并在 <code className="inline">~/.codewhale/config.toml</code> 中配置你的提供商。
@@ -615,7 +613,7 @@ codewhale --provider openrouter --model deepseek/deepseek-v4-pro
       <>
         Codewhale 是双向 MCP 客户端和服务器。在 <code className="inline">~/.codewhale/mcp.json</code> 中定义服务器。
         工具以 <code className="inline">mcp_&lt;server&gt;_&lt;tool&gt;</code> 形式呈现。你也可以通过 <code className="inline">codewhale mcp</code> 将 Codewhale 暴露为 MCP 服务器。
-        查看 <Link href="/zh/docs/mcp" className="body-link">文档页面</Link> 了解配置示例。
+        查看 <Link href={p("/docs/mcp")} className="body-link">文档页面</Link> 了解配置示例。
       </>
     ),
     sources: ["docs/MCP.md"],
@@ -626,7 +624,7 @@ codewhale --provider openrouter --model deepseek/deepseek-v4-pro
       <>
         无需签署 CLA。Fork、用约定式提交（<code className="inline">feat:</code>、<code className="inline">fix:</code> 等）创建分支、通过本地检查、提交 PR。
         维护者亲自阅读每一条内容。从标记为 <code className="inline">good first issue</code> 的议题开始。
-        查看 <Link href="/zh/contribute" className="body-link">贡献页面</Link> 和 <a href="https://github.com/Hmbown/CodeWhale/blob/main/CONTRIBUTING.md" className="body-link">CONTRIBUTING.md</a>。
+        查看 <Link href={p("/contribute")} className="body-link">贡献页面</Link> 和 <a href="https://github.com/Hmbown/CodeWhale/blob/main/CONTRIBUTING.md" className="body-link">CONTRIBUTING.md</a>。
       </>
     ),
     sources: ["CONTRIBUTING.md"],
@@ -673,7 +671,7 @@ registry = "sparse+https://mirrors.tuna.tsinghua.edu.cn/crates.io-index/"`}
         </p>
         <p className="mb-2">
           面向无法稳定访问 GitHub 的用户，提供 CNB 镜像（
-          <Link href="/zh/install" className="body-link">docs/CNB_MIRROR.md</Link>）。
+          <Link href={p("/install")} className="body-link">docs/CNB_MIRROR.md</Link>）。
           Cargo 用户可使用 TUNA 镜像在国内加速下载。
         </p>
         <p>
@@ -753,7 +751,8 @@ brew update && brew upgrade codewhale`}
 export default async function FaqPage({ params }: { params: Promise<{ locale: string }> }) {
   const { locale } = await params;
   const t = getFaq(locale);
-  const items = pickTextLocale(locale) === "zh" ? faqZh : faqEn(locale);
+  const p = (path: string) => `/${locale}${path}`;
+  const items = { en: faqEn, zh: faqZh }[pickTextLocale(locale)](p);
   const canonicalLocale = canonicalLocaleForPath("/faq", locale);
   const jsonLd = buildFaqPageJsonLd({
     items,
