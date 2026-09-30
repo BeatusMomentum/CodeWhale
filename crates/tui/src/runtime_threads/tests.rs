@@ -21791,6 +21791,7 @@ mod execution_identity {
                 turn_id: turn.id.clone(),
                 created_at: Utc::now(),
                 route: None,
+                submission_id: None,
             })
             .await?;
         for (id, name, model, fails) in [
