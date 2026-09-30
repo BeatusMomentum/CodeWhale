@@ -596,18 +596,12 @@ impl ProviderDashboardRow {
             }
             // Name the signed-in subscription account (label only) so two
             // accounts on one machine are told apart before a limit is hit.
-            crate::credentials::CredentialSource::OAuth { .. } => {
-                let label = credential_resolution.source.label().into_owned();
-                let owned = match provider {
-                    ApiProvider::OpenaiCodex => Some(crate::oauth::OAuthProvider::Chatgpt),
-                    ApiProvider::Xai => Some(crate::oauth::OAuthProvider::Xai),
-                    _ => None,
-                };
-                match owned.and_then(|owned| crate::oauth::owned_account_label(owned, config)) {
-                    Some(account) => format!("{label} · {account}"),
-                    None => label,
-                }
-            }
+            // The resolver read it with the sign-in it just proved usable;
+            // the picker opens no credential file of its own.
+            crate::credentials::CredentialSource::OAuth {
+                account: Some(account),
+                ..
+            } => format!("{} · {account}", credential_resolution.source.label()),
             other => other.label().into_owned(),
         };
         let credential_state = credential_state_for_provider(config, provider);

@@ -9036,7 +9036,7 @@ fn run_logout() -> Result<()> {
 async fn run_xai_device_auth(config_path: Option<&Path>) -> Result<()> {
     let pending = crate::oauth::login(crate::oauth::OAuthProvider::Xai).await?;
     let activation = crate::oauth::activate_login(pending, config_path, None)?;
-    println!("{}", activation.summary());
+    println!("{}", activation.summary(codewhale_localization::Locale::En));
     println!(
         "xAI OAuth is ready; activated {} via {}",
         codewhale_config::quote_os_path(&activation.auth_path),
@@ -9051,8 +9051,8 @@ async fn run_xai_device_auth(config_path: Option<&Path>) -> Result<()> {
 async fn run_chatgpt_pkce_auth(config_path: Option<&Path>) -> Result<()> {
     let pending = crate::oauth::login(crate::oauth::OAuthProvider::Chatgpt).await?;
     let activation = crate::oauth::activate_login(pending, config_path, None)?;
-    println!("{}", activation.summary());
-    if let Some(warning) = activation.env_override_warning() {
+    println!("{}", activation.summary(codewhale_localization::Locale::En));
+    if let Some(warning) = activation.env_override_warning(codewhale_localization::Locale::En) {
         println!("{warning}");
     }
     println!(

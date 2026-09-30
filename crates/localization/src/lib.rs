@@ -2670,6 +2670,12 @@ pub enum MessageId {
     ModelPickerReadinessRefreshed,
     ModelPickerOpenToRefresh,
     ModelPickerPinnedChip,
+    AuthSignedInAs,
+    AuthSignedInWithoutEmail,
+    AuthReplacedPreviousSignInAs,
+    AuthReplacedPreviousSignIn,
+    AuthSameAccountAsBefore,
+    AuthEnvTokenOutranksSignIn,
 }
 
 #[allow(dead_code)]
@@ -5112,6 +5118,12 @@ pub const ALL_MESSAGE_IDS: &[MessageId] = &[
     MessageId::ModelPickerReadinessRefreshed,
     MessageId::ModelPickerOpenToRefresh,
     MessageId::ModelPickerPinnedChip,
+    MessageId::AuthSignedInAs,
+    MessageId::AuthSignedInWithoutEmail,
+    MessageId::AuthReplacedPreviousSignInAs,
+    MessageId::AuthReplacedPreviousSignIn,
+    MessageId::AuthSameAccountAsBefore,
+    MessageId::AuthEnvTokenOutranksSignIn,
 ];
 
 pub fn tr(locale: Locale, id: MessageId) -> Cow<'static, str> {

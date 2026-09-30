@@ -3588,9 +3588,10 @@ async fn apply_codewhale_owned_login(
         Ok(activation) => {
             // The account line goes to the transcript: the status line is
             // overwritten by the route summary once the switch lands.
-            let content = match activation.env_override_warning() {
-                Some(warning) => format!("{}\n{warning}", activation.summary()),
-                None => activation.summary(),
+            let locale = app.ui_locale;
+            let content = match activation.env_override_warning(locale) {
+                Some(warning) => format!("{}\n{warning}", activation.summary(locale)),
+                None => activation.summary(locale),
             };
             app.add_message(HistoryCell::System { content });
             app.status_message = Some(format!(

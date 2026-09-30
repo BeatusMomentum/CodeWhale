@@ -1627,27 +1627,18 @@ impl CodewhaleClient {
                     }
                 }
             } else {
-                let (api_key, api_key_source) = config.active_route_api_key_with_source()?;
-                // Only the xAI OAuth branch of the resolver yields this
-                // source; an `auth_mode = "oauth"` route that fell through to
-                // an API key gets no sign-in guidance. The label is kept only
-                // when it comes from credentials holding this exact token.
-                let guidance = (api_provider == ApiProvider::Xai
-                    && api_key_source == crate::config::XAI_OAUTH_KEY_SOURCE)
-                    .then(|| {
-                        let label = crate::oauth::get_xai_credentials(config)
-                            .ok()
-                            .filter(|credentials| {
-                                codewhale_secrets::normalize_api_key(&credentials.access_token)
-                                    == api_key
-                            })
-                            .and_then(|credentials| credentials.account_label);
-                        crate::oauth::usage_limit_guidance(
-                            crate::oauth::OAuthProvider::Xai,
-                            label.as_deref(),
-                        )
-                    });
-                ((api_key, api_key_source), None, guidance)
+                // Only the resolver's xAI OAuth step carries a sign-in; an
+                // `auth_mode = "oauth"` route that fell through to an API key
+                // gets no sign-in guidance. The label comes from the
+                // credential this client sends, in the same read.
+                let (resolved, xai_sign_in) = config.active_route_api_key_with_xai_sign_in()?;
+                let guidance = xai_sign_in.map(|label| {
+                    crate::oauth::usage_limit_guidance(
+                        crate::oauth::OAuthProvider::Xai,
+                        label.as_deref(),
+                    )
+                });
+                (resolved, None, guidance)
             };
         let model_bound_secret_values =
             Arc::new(configured_model_bound_secret_values(config, &api_key));
@@ -8109,6 +8100,142 @@ mod tests {
             .http_error_with_route_context(402, body, None)
             .to_string();
         assert!(!error.contains("codewhale auth"), "{error}");
+    }
+
+    fn test_id_token(email: &str) -> String {
+        use base64::Engine as _;
+        format!(
+            "header.{}.sig",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(json!({ "email": email }).to_string())
+        )
+    }
+
+    /// #6715 review: plan-limit guidance names the account whose credential
+    /// this client sends. An unusable Codewhale-owned ChatGPT sign-in falls
+    /// through to the consented Codex CLI file, so the guidance names that
+    /// file's account and never the owned one.
+    #[test]
+    fn codex_quota_guidance_names_the_consented_import_that_sent_the_request() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _env = crate::test_support::lock_test_env();
+        let home = tempfile::tempdir().expect("temp home");
+        let root = home.path().canonicalize().expect("canonical temp root");
+        let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", &root);
+        let _access = crate::test_support::EnvVarGuard::remove("OPENAI_CODEX_ACCESS_TOKEN");
+        let _legacy_access = crate::test_support::EnvVarGuard::remove("CODEX_ACCESS_TOKEN");
+        // Expired access token and no refresh token: the owned sign-in is
+        // unusable, so the runtime falls through to the consented import.
+        let generation = "chatgpt-auth-0123456789abcdef0123456789abcdef.json";
+        let owned = json!({
+            format!(
+                "{}::{}",
+                crate::oauth::CHATGPT_OAUTH_ISSUER,
+                crate::oauth::CHATGPT_OAUTH_CLIENT_ID
+            ): {
+                "access_token": "owned-stale-access",
+                "expires_at": "2000-01-01T00:00:00Z",
+                "id_token": test_id_token("owned@example.com"),
+            }
+        });
+        codewhale_config::with_xai_oauth_lifecycle_lock(|store| {
+            store.write(generation, owned.to_string().as_bytes(), false)
+        })
+        .expect("seed owned generation");
+        let path = root.join("auth.json");
+        let token = crate::test_support::future_test_jwt("codex-cli");
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&json!({
+                "tokens": {
+                    "access_token": token.clone(),
+                    "id_token": test_id_token("codex-cli@example.com"),
+                }
+            }))
+            .expect("serialize fixture"),
+        )
+        .expect("write fixture");
+        let _auth_path = crate::test_support::EnvVarGuard::set("OPENAI_CODEX_AUTH_FILE", &path);
+        let config = Config {
+            provider: Some(ApiProvider::OpenaiCodex.as_str().to_string()),
+            providers: Some(ProvidersConfig {
+                openai_codex: ProviderConfig {
+                    auth_mode: Some("oauth".to_string()),
+                    oauth_credential_generation: Some(generation.to_string()),
+                    external_credentials: Some(
+                        codewhale_config::ExternalCredentialConsentToml::read_only(
+                            codewhale_config::ProviderKind::OpenaiCodex,
+                            codewhale_config::ExternalCredentialSource::CodexCli,
+                            path.clone(),
+                        ),
+                    ),
+                    ..ProviderConfig::default()
+                },
+                ..ProvidersConfig::default()
+            }),
+            ..Config::default()
+        };
+        let client = CodewhaleClient::new(&config).expect("Codex client");
+        assert_eq!(client.api_key, token);
+        let guidance = client
+            .subscription_limit_guidance
+            .as_deref()
+            .expect("sign-in guidance");
+        assert!(
+            guidance.contains("ChatGPT account codex-cli@example.com"),
+            "{guidance}"
+        );
+        assert!(!guidance.contains("owned@example.com"), "{guidance}");
+    }
+
+    /// An xAI OAuth route names the signed-in account from the credential
+    /// the client sends; the resolver, the guidance and the picker's
+    /// credential source share that one read.
+    #[test]
+    fn xai_oauth_quota_guidance_names_the_signed_in_account() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _env = crate::test_support::lock_test_env();
+        let home = tempfile::tempdir().expect("temp home");
+        let root = home.path().canonicalize().expect("canonical temp root");
+        let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", &root);
+        let _key = crate::test_support::EnvVarGuard::remove("XAI_API_KEY");
+        let _base = crate::test_support::EnvVarGuard::remove("XAI_BASE_URL");
+        let config_path = root.join("config.toml");
+        std::fs::write(&config_path, "").expect("empty config");
+        let mut config = Config {
+            provider: Some("xai".to_string()),
+            ..Config::default()
+        };
+        crate::oauth::activate_login(
+            crate::oauth::pending_login_with_id_token_for_test(
+                crate::oauth::OAuthProvider::Xai,
+                "xai-oauth-access",
+                "xai-oauth-refresh",
+                Some(&test_id_token("grok@example.com")),
+            ),
+            Some(&config_path),
+            Some(&mut config),
+        )
+        .expect("xAI login");
+        let client = CodewhaleClient::new(&config).expect("xai client");
+        assert_eq!(client.api_key, "xai-oauth-access");
+        assert_eq!(client.api_key_source, crate::config::XAI_OAUTH_KEY_SOURCE);
+        let guidance = client
+            .subscription_limit_guidance
+            .as_deref()
+            .expect("sign-in guidance");
+        assert!(
+            guidance.contains("xAI account grok@example.com"),
+            "{guidance}"
+        );
+        assert!(!guidance.contains("xai-oauth-"), "{guidance}");
+        assert_eq!(
+            crate::config::resolve_credential_source(&config, ApiProvider::Xai).source,
+            crate::credentials::CredentialSource::OAuth {
+                flow: "xAI".to_string(),
+                account: Some("grok@example.com".to_string()),
+            }
+        );
     }
 
     fn concentrate_client(server: &MockServer, model: &str) -> CodewhaleClient {

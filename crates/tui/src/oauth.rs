@@ -1739,47 +1739,54 @@ pub struct OAuthActivation {
 }
 
 impl OAuthActivation {
-    /// "Signed in to ChatGPT as you@example.com (plus)." plus, when this
-    /// login replaced a different account, which one. Never token material.
+    /// "Signed in to ChatGPT as you@example.com (plus)." plus, on its own
+    /// line, which sign-in this login replaced. Never token material. Shell
+    /// commands pass [`Locale::En`](codewhale_localization::Locale::En); the
+    /// TUI passes its UI locale.
     #[must_use]
-    pub fn summary(&self) -> String {
+    pub fn summary(&self, locale: codewhale_localization::Locale) -> String {
+        use codewhale_localization::{MessageId, tr};
         let name = oauth_provider_params(self.provider).display_name;
-        let mut summary = match self.account_label.as_deref() {
-            Some(label) => format!("Signed in to {name} as {label}."),
-            None => format!("Signed in to {name} (the issuer sent no account email)."),
+        let signed_in = match self.account_label.as_deref() {
+            Some(label) => tr(locale, MessageId::AuthSignedInAs)
+                .replace("{provider}", name)
+                .replace("{account}", label),
+            None => tr(locale, MessageId::AuthSignedInWithoutEmail).replace("{provider}", name),
         };
-        match &self.replaced {
-            Some(Some(previous)) if Some(previous) != self.account_label.as_ref() => {
-                summary.push_str(&format!(
-                    " Replaced the previous Codewhale {name} sign-in ({previous})."
-                ));
-            }
+        let replaced = match &self.replaced {
+            Some(Some(previous)) if Some(previous) != self.account_label.as_ref() => Some(
+                tr(locale, MessageId::AuthReplacedPreviousSignInAs)
+                    .replace("{provider}", name)
+                    .replace("{account}", previous),
+            ),
             Some(Some(_)) => {
-                summary.push_str(&format!(
-                    " This is the same account as before; to use another {name} account, \
-                     sign out of it in the browser (or use a private window) and sign in again."
-                ));
+                Some(tr(locale, MessageId::AuthSameAccountAsBefore).replace("{provider}", name))
             }
             Some(None) => {
-                summary.push_str(&format!(" Replaced the previous Codewhale {name} sign-in."));
+                Some(tr(locale, MessageId::AuthReplacedPreviousSignIn).replace("{provider}", name))
             }
-            _ => {}
+            None => None,
+        };
+        match replaced {
+            Some(replaced) => format!("{signed_in}\n{replaced}"),
+            None => signed_in,
         }
-        summary
     }
 
     /// A process token outranks every ChatGPT sign-in, so a new login does
     /// not change the account requests use while one is set. Names the
     /// variable, never its value.
     #[must_use]
-    pub fn env_override_warning(&self) -> Option<String> {
+    pub fn env_override_warning(&self, locale: codewhale_localization::Locale) -> Option<String> {
         if self.provider != OAuthProvider::Chatgpt || credentials_from_env().is_none() {
             return None;
         }
         Some(
-            "OPENAI_CODEX_ACCESS_TOKEN or CODEX_ACCESS_TOKEN is set in this environment and \
-             outranks this sign-in; requests keep using that token's account until you unset it."
-                .to_string(),
+            codewhale_localization::tr(
+                locale,
+                codewhale_localization::MessageId::AuthEnvTokenOutranksSignIn,
+            )
+            .into_owned(),
         )
     }
 }
@@ -2140,21 +2147,6 @@ fn owned_account_label_at(provider: OAuthProvider, path: &Path) -> Result<Option
     Ok(entry.account_label())
 }
 
-/// Account label of the Codewhale-owned sign-in the config points at (the
-/// legacy xAI file when no generation is configured). `None` whenever that
-/// sign-in is unusable, so a stale entry never names an account.
-#[must_use]
-pub fn owned_account_label(provider: OAuthProvider, config: &Config) -> Option<String> {
-    let path = match configured_owned_auth_file_path(provider, config) {
-        Ok(Some(path)) => path,
-        Ok(None) if provider == OAuthProvider::Xai => {
-            codewhale_config::legacy_xai_oauth_path().ok()?
-        }
-        _ => return None,
-    };
-    owned_account_label_at(provider, &path).ok().flatten()
-}
-
 /// What to tell someone whose subscription sign-in hit a plan limit: which
 /// account made the request (label only, never a token) and how to sign in
 /// with a different one, both inside a running session and from a shell.
@@ -2266,6 +2258,15 @@ fn configured_owned_auth_file_path(
     }
 }
 
+/// A subscription sign-in the structural check found usable, named by the
+/// same read that proved it usable. Holds a display label only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UsableSignIn {
+    /// Email (and plan) of the account that entry signs in as; `None` when
+    /// its ID token carries no email claim.
+    pub account_label: Option<String>,
+}
+
 /// Prompt-free structural check for owned OAuth material. Never refreshes,
 /// writes, or makes network requests. External storage is not inspected
 /// until exact read-only consent has been persisted, and then only at the
@@ -2273,6 +2274,19 @@ fn configured_owned_auth_file_path(
 /// (#5772).
 #[must_use]
 pub fn credentials_valid(provider: OAuthProvider, config: &Config) -> bool {
+    usable_sign_in(provider, config).is_some()
+}
+
+/// [`credentials_valid`], also naming the account of the entry that passed:
+/// the configured Codewhale-owned generation, else (xAI) the legacy owned
+/// file or the consented Grok CLI import — the credential the route would
+/// send. Readiness surfaces take the label from here so naming the account
+/// costs no second credential read.
+#[must_use]
+pub fn usable_sign_in(provider: OAuthProvider, config: &Config) -> Option<UsableSignIn> {
+    let usable = |entry: &OwnedAuthEntry| UsableSignIn {
+        account_label: entry.account_label(),
+    };
     // Codewhale-owned OAuth bytes are inert until the provider route
     // explicitly selects OAuth. A failed post-login config finalization can
     // therefore never make a newly written token silently ready on the next
@@ -2283,14 +2297,14 @@ pub fn credentials_valid(provider: OAuthProvider, config: &Config) -> bool {
             .and_then(|entry| entry.auth_mode.as_deref())
             .is_some_and(auth_mode_uses_xai_oauth)
     {
-        return false;
+        return None;
     }
     if let Ok(Some(path)) = configured_owned_auth_file_path(provider, config)
         && let Ok(Some(mut file)) = load_owned_auth_file(&path)
         && let Some((_, entry)) = select_entry(provider, &mut file)
         && owned_entry_is_usable(&entry)
     {
-        return true;
+        return Some(usable(&entry));
     }
     if config
         .provider_config_for(provider.api())
@@ -2299,7 +2313,7 @@ pub fn credentials_valid(provider: OAuthProvider, config: &Config) -> bool {
     {
         // A configured generation is authoritative. Invalid, missing, unsafe,
         // or malformed owned storage must not fall through to an external CLI.
-        return false;
+        return None;
     }
     if provider == OAuthProvider::Xai {
         // The pre-generation legacy file is the last owned location.
@@ -2308,7 +2322,7 @@ pub fn credentials_valid(provider: OAuthProvider, config: &Config) -> bool {
             && let Some((_, entry)) = select_entry(provider, &mut file)
             && owned_entry_is_usable(&entry)
         {
-            return true;
+            return Some(usable(&entry));
         }
         // #5772: with no persisted consent record there is no external path
         // to resolve and nothing to open.
@@ -2324,10 +2338,11 @@ pub fn credentials_valid(provider: OAuthProvider, config: &Config) -> bool {
             && let Ok(mut file) = load_external_auth_file(&grant)
         {
             return select_entry(provider, &mut file)
-                .is_some_and(|(_, entry)| entry_access_token_is_fresh(&entry));
+                .filter(|(_, entry)| entry_access_token_is_fresh(entry))
+                .map(|(_, entry)| usable(&entry));
         }
     }
-    false
+    None
 }
 
 #[must_use]
@@ -2411,10 +2426,6 @@ pub fn get_xai_credentials(config: &Config) -> Result<OwnedOAuthCredentials> {
         &entry,
         token,
     ))
-}
-
-pub fn get_xai_access_token(config: &Config) -> Result<String> {
-    Ok(get_xai_credentials(config)?.access_token)
 }
 
 /// Load ChatGPT owned credentials from the configured generation,
@@ -4206,7 +4217,7 @@ mod tests {
         assert_eq!(first.account_label.as_deref(), Some("a@example.com (plus)"));
         assert_eq!(first.replaced, None);
         assert_eq!(
-            first.summary(),
+            first.summary(codewhale_localization::Locale::En),
             "Signed in to ChatGPT as a@example.com (plus)."
         );
 
@@ -4226,12 +4237,17 @@ mod tests {
             second.replaced,
             Some(Some("a@example.com (plus)".to_string()))
         );
-        let summary = second.summary();
+        let summary = second.summary(codewhale_localization::Locale::En);
         assert_eq!(
             summary,
-            "Signed in to ChatGPT as b@example.com. Replaced the previous Codewhale ChatGPT sign-in (a@example.com (plus))."
+            "Signed in to ChatGPT as b@example.com.\nReplaced the previous Codewhale ChatGPT sign-in (a@example.com (plus))."
         );
         assert!(!summary.contains("access-"), "{summary}");
+        // The TUI transcript renders the same facts in the UI locale.
+        let localized = second.summary(codewhale_localization::Locale::Ja);
+        assert_ne!(localized, summary);
+        assert!(localized.contains("b@example.com"), "{localized}");
+        assert!(localized.contains("a@example.com (plus)"), "{localized}");
 
         let persisted = std::fs::read_to_string(&second.auth_path).expect("generation");
         assert!(!persisted.contains("refresh-a"), "{persisted}");
@@ -4251,8 +4267,10 @@ mod tests {
         let mut config = Config::default();
         config.mark_codewhale_owned_chatgpt_oauth(generation.to_string());
         assert_eq!(
-            owned_account_label(OAuthProvider::Chatgpt, &config).as_deref(),
-            Some("b@example.com")
+            usable_sign_in(OAuthProvider::Chatgpt, &config),
+            Some(UsableSignIn {
+                account_label: Some("b@example.com".to_string())
+            })
         );
         // An invalid generation name never resolves to a path.
         assert!(
@@ -4306,9 +4324,87 @@ mod tests {
         let mut config = Config::default();
         config.mark_codewhale_owned_chatgpt_oauth(generation.to_string());
         assert_eq!(
-            owned_account_label(OAuthProvider::Chatgpt, &config).as_deref(),
+            usable_sign_in(OAuthProvider::Chatgpt, &config)
+                .and_then(|sign_in| sign_in.account_label)
+                .as_deref(),
             Some("b@example.com")
         );
+    }
+
+    /// #6715 review: a login under a non-default client id (for example
+    /// `XAI_OIDC_CLIENT_ID`) must become the account requests use.
+    /// `select_entry` prefers the built-in client id, so an old account's
+    /// entry under that id, carried into the new generation, would keep
+    /// winning both the runtime credential and the displayed account.
+    #[test]
+    fn relogin_under_another_client_id_switches_runtime_credentials_and_label() {
+        let _lock = crate::test_support::lock_test_env();
+        let home = tempfile::tempdir().expect("temp home");
+        let root = home.path().canonicalize().expect("canonical home");
+        let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", &root);
+        let config_path = root.join("config.toml");
+        std::fs::write(&config_path, "").expect("empty config");
+        let mut config = Config {
+            provider: Some(ApiProvider::Xai.as_str().to_string()),
+            ..Config::default()
+        };
+        let token_a = id_token(&serde_json::json!({"email": "a@example.com"}));
+        activate_login(
+            pending_login_with_id_token_for_test(
+                OAuthProvider::Xai,
+                "access-a",
+                "refresh-a",
+                Some(&token_a),
+            ),
+            Some(&config_path),
+            Some(&mut config),
+        )
+        .expect("login A");
+        assert_eq!(
+            get_xai_credentials(&config)
+                .expect("account A")
+                .access_token,
+            "access-a"
+        );
+
+        let token_b = id_token(&serde_json::json!({"email": "b@example.com"}));
+        let mut pending_b = pending_login_with_id_token_for_test(
+            OAuthProvider::Xai,
+            "access-b",
+            "refresh-b",
+            Some(&token_b),
+        );
+        pending_b.client_id = "alternate-client".to_string();
+        let second =
+            activate_login(pending_b, Some(&config_path), Some(&mut config)).expect("login B");
+        assert_eq!(second.account_label.as_deref(), Some("b@example.com"));
+        assert_eq!(second.replaced, Some(Some("a@example.com".to_string())));
+
+        // Requests: the runtime credential is account B's, under B's client.
+        let runtime = get_xai_credentials(&config).expect("account B");
+        assert_eq!(runtime.access_token, "access-b");
+        assert_eq!(runtime.client_id, "alternate-client");
+        assert_eq!(runtime.account_label.as_deref(), Some("b@example.com"));
+        // Status: readiness/picker and `auth status` name account B too.
+        assert_eq!(
+            usable_sign_in(OAuthProvider::Xai, &config)
+                .and_then(|sign_in| sign_in.account_label)
+                .as_deref(),
+            Some("b@example.com")
+        );
+        let generation = second
+            .auth_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("generation name");
+        assert_eq!(
+            owned_account_label_for_generation(OAuthProvider::Xai, generation)
+                .expect("usable sign-in")
+                .as_deref(),
+            Some("b@example.com")
+        );
+        let persisted = std::fs::read_to_string(&second.auth_path).expect("generation");
+        assert!(!persisted.contains("refresh-a"), "{persisted}");
     }
 
     /// The label follows the same usability test as the runtime: an entry
@@ -4335,7 +4431,7 @@ mod tests {
         let mut config = Config::default();
         config.mark_codewhale_owned_chatgpt_oauth(generation.to_string());
         assert!(!credentials_valid(OAuthProvider::Chatgpt, &config));
-        assert_eq!(owned_account_label(OAuthProvider::Chatgpt, &config), None);
+        assert_eq!(usable_sign_in(OAuthProvider::Chatgpt, &config), None);
         let reason = owned_account_label_for_generation(OAuthProvider::Chatgpt, generation)
             .expect_err("stale entry is unusable");
         assert_eq!(reason.to_string(), "sign-in file holds no usable sign-in");

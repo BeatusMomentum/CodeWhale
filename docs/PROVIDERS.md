@@ -637,8 +637,10 @@ CLIs, so those can be signed in to a different account.
   from the ID token the issuer returned at sign-in, decoded locally; no token
   is printed. A sign-in that can no longer produce a token (expired, no
   refresh token, file missing) shows no account and says why. The provider
-  picker shows the same label next to the credential, and a successful login
-  ends with `Signed in to ChatGPT as <email> (<plan>).`
+  picker shows the label of the sign-in the route would use (for xAI that
+  includes a consented Grok CLI import) next to the credential, and a
+  successful login ends with `Signed in to ChatGPT as <email> (<plan>).` (in
+  the TUI, in its interface language).
 - **Switch accounts.** Inside Codewhale, run `/auth chatgpt` (or
   `/auth xai-device`); this switches the running session. From a shell, run
   `codewhale auth chatgpt` (or `codewhale auth xai-device`) and restart any
