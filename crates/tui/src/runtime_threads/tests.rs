@@ -11797,20 +11797,49 @@ async fn startup_discards_an_unpublished_partial_seed_and_keeps_a_committed_one(
     Ok(())
 }
 
+/// The next turn a thread admits after its seed, as it lands on disk,
+/// without running one.
+fn turn_after_seed(seeded: &TurnRecord, id: &str) -> TurnRecord {
+    let mut later = seeded.clone();
+    later.id = id.to_string();
+    later.created_at = seeded.created_at + chrono::Duration::seconds(1);
+    later.item_ids = Vec::new();
+    later
+}
+
+/// One uncertain seed journal quarantines only its own thread: the store
+/// opens, that thread's journal and records are left byte-for-byte for
+/// repair (no partial seed is published or deleted), and every other thread
+/// still recovers.
 #[tokio::test]
-async fn startup_refuses_uncertain_seed_journals_without_publishing_partial_history() -> Result<()>
-{
+async fn startup_quarantines_only_the_thread_whose_seed_journal_is_uncertain() -> Result<()> {
     for failure in [
         "unreadable-journal",
         "wrong-thread",
         "unreadable-thread",
         "wrong-commit",
+        "seed-record-missing-beneath-later-turn",
     ] {
         let runtime_dir = test_runtime_dir();
         let manager = test_manager(runtime_dir.clone())?;
         let messages: Vec<Message> = serde_json::from_value(json!([
-            {"role":"user","content":[{"type":"text","text":"seed recovery canary"}]}
+            {"role":"user","content":[{"type":"text","text":"seed recovery canary"}]},
+            {"role":"assistant","content":[{"type":"text","text":"canary answer"}]}
         ]))?;
+        // A healthy neighbour whose pointer recovery must still recompute.
+        let healthy = manager
+            .create_thread(CreateThreadRequest::default())
+            .await?;
+        manager
+            .seed_thread_from_messages(&healthy.id, &messages)
+            .await?;
+        let healthy_turn = manager.store.list_turns_for_thread(&healthy.id)?[0]
+            .id
+            .clone();
+        let mut stale = manager.store.load_thread(&healthy.id)?;
+        stale.latest_turn_id = None;
+        manager.store.save_thread(&stale)?;
+
         let thread = manager
             .create_thread(CreateThreadRequest::default())
             .await?;
@@ -11818,7 +11847,7 @@ async fn startup_refuses_uncertain_seed_journals_without_publishing_partial_hist
             .seed_thread_from_messages(&thread.id, &messages)
             .await?;
         let turns = manager.store.list_turns_for_thread(&thread.id)?;
-        let items = manager.store.list_items_for_turn(&turns[0].id)?;
+        let mut items = manager.store.list_items_for_turn(&turns[0].id)?;
         let mut uncommitted = manager.store.load_thread(&thread.id)?;
         uncommitted.latest_turn_id = None;
         manager.store.save_thread(&uncommitted)?;
@@ -11831,6 +11860,7 @@ async fn startup_refuses_uncertain_seed_journals_without_publishing_partial_hist
         manager.store.save_seed_journal(&journal)?;
         let journal_path = manager.store.seed_journal_path(&thread.id)?;
         let thread_path = manager.store.thread_path(&thread.id)?;
+        let mut paths = vec![journal_path.clone(), thread_path.clone()];
         match failure {
             "unreadable-journal" => fs::write(&journal_path, b"{truncated seed intent")?,
             "wrong-thread" => {
@@ -11843,9 +11873,19 @@ async fn startup_refuses_uncertain_seed_journals_without_publishing_partial_hist
                 uncommitted.latest_turn_id = Some("unrelated-turn".into());
                 manager.store.save_thread(&uncommitted)?;
             }
+            "seed-record-missing-beneath-later-turn" => {
+                // The pointer moved past the seed, but the seed is no longer
+                // whole: nothing proves it committed.
+                let later = turn_after_seed(&turns[0], "turn_after_seed");
+                manager.store.save_turn(&later)?;
+                paths.push(manager.store.turn_path(&later.id)?);
+                uncommitted.latest_turn_id = Some(later.id);
+                manager.store.save_thread(&uncommitted)?;
+                let missing = items.pop().expect("seeded item");
+                fs::remove_file(manager.store.item_path(&missing.id)?)?;
+            }
             _ => unreachable!(),
         }
-        let mut paths = vec![journal_path, thread_path];
         for turn in &turns {
             paths.push(manager.store.turn_path(&turn.id)?);
         }
@@ -11857,13 +11897,9 @@ async fn startup_refuses_uncertain_seed_journals_without_publishing_partial_hist
             .map(fs::read)
             .collect::<std::io::Result<Vec<_>>>()?;
         drop(manager);
-        let error = test_manager(runtime_dir)
-            .err()
-            .expect("uncertain seed must refuse startup");
-        assert!(
-            format!("{error:#}").contains("seed"),
-            "{failure}: {error:#}"
-        );
+
+        let reopened = test_manager(runtime_dir)
+            .with_context(|| format!("{failure}: one uncertain journal must not fail the store"))?;
         for (path, bytes) in paths.iter().zip(original) {
             assert_eq!(
                 fs::read(path)?,
@@ -11872,6 +11908,101 @@ async fn startup_refuses_uncertain_seed_journals_without_publishing_partial_hist
                 path.display()
             );
         }
+        assert_eq!(
+            reopened.store.load_thread(&healthy.id)?.latest_turn_id,
+            Some(healthy_turn),
+            "{failure}: every other thread still recovers"
+        );
+    }
+    Ok(())
+}
+
+/// The seed committed, removing its journal failed, and the conversation
+/// went on. The stale journal is settled as committed: removed, with the
+/// whole seed kept as history beneath the later turn.
+#[tokio::test]
+async fn startup_keeps_a_committed_seed_whose_journal_outlived_later_turns() -> Result<()> {
+    let runtime_dir = test_runtime_dir();
+    let manager = test_manager(runtime_dir.clone())?;
+    let messages: Vec<Message> = serde_json::from_value(json!([
+        {"role":"user","content":[{"type":"text","text":"SEEDED"}]},
+        {"role":"assistant","content":[{"type":"text","text":"SEEDED ANSWER"}]}
+    ]))?;
+    let thread = manager
+        .create_thread(CreateThreadRequest::default())
+        .await?;
+    manager
+        .seed_thread_from_messages(&thread.id, &messages)
+        .await?;
+    let turns = manager.store.list_turns_for_thread(&thread.id)?;
+    let items = manager.store.list_items_for_turn(&turns[0].id)?;
+    manager.store.save_seed_journal(&SeedJournal {
+        thread_id: thread.id.clone(),
+        previous_latest_turn_id: None,
+        turn_ids: turns.iter().map(|turn| turn.id.clone()).collect(),
+        item_ids: items.iter().map(|item| item.id.clone()).collect(),
+    })?;
+    let later = turn_after_seed(&turns[0], "turn_after_seed");
+    manager.store.save_turn(&later)?;
+    let mut moved_on = manager.store.load_thread(&thread.id)?;
+    moved_on.latest_turn_id = Some(later.id.clone());
+    manager.store.save_thread(&moved_on)?;
+    drop(manager);
+
+    let reopened = test_manager(runtime_dir)?;
+    assert!(
+        !reopened.store.seed_journal_path(&thread.id)?.exists(),
+        "a committed seed's stale journal is removed"
+    );
+    assert_eq!(
+        reopened.store.list_turns_for_thread(&thread.id)?.len(),
+        2,
+        "the seed stays history beneath the later turn"
+    );
+    for item in &items {
+        assert!(reopened.store.item_path(&item.id)?.exists());
+    }
+    assert_eq!(
+        reopened.store.load_thread(&thread.id)?.latest_turn_id,
+        Some(later.id)
+    );
+    Ok(())
+}
+
+/// Missing records are not uncertainty: a journal whose thread record is
+/// gone (and some of whose own records already are) is an unpublished seed,
+/// and its remaining records are discarded.
+#[tokio::test]
+async fn startup_discards_a_seed_whose_thread_and_records_are_already_gone() -> Result<()> {
+    let runtime_dir = test_runtime_dir();
+    let manager = test_manager(runtime_dir.clone())?;
+    let messages: Vec<Message> = serde_json::from_value(json!([
+        {"role":"user","content":[{"type":"text","text":"orphaned seed"}]},
+        {"role":"assistant","content":[{"type":"text","text":"orphaned answer"}]}
+    ]))?;
+    let thread = manager
+        .create_thread(CreateThreadRequest::default())
+        .await?;
+    manager
+        .seed_thread_from_messages(&thread.id, &messages)
+        .await?;
+    let turns = manager.store.list_turns_for_thread(&thread.id)?;
+    let items = manager.store.list_items_for_turn(&turns[0].id)?;
+    manager.store.save_seed_journal(&SeedJournal {
+        thread_id: thread.id.clone(),
+        previous_latest_turn_id: None,
+        turn_ids: turns.iter().map(|turn| turn.id.clone()).collect(),
+        item_ids: items.iter().map(|item| item.id.clone()).collect(),
+    })?;
+    fs::remove_file(manager.store.thread_path(&thread.id)?)?;
+    fs::remove_file(manager.store.item_path(&items[0].id)?)?;
+    drop(manager);
+
+    let reopened = test_manager(runtime_dir)?;
+    assert!(!reopened.store.seed_journal_path(&thread.id)?.exists());
+    assert!(!reopened.store.turn_path(&turns[0].id)?.exists());
+    for item in &items {
+        assert!(!reopened.store.item_path(&item.id)?.exists());
     }
     Ok(())
 }
