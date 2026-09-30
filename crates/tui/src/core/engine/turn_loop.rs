@@ -7769,7 +7769,7 @@ mod tests {
     /// without draining that queue. The provider suffix must never be polled.
     #[tokio::test]
     async fn stream_backpressure_cancellation_releases_every_observation_kind() {
-        use crate::llm_client::mock::{MockLlmClient, canned};
+        use crate::llm_client::mock::canned;
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
         struct StreamDrop(Arc<AtomicBool>);
@@ -7919,23 +7919,15 @@ mod tests {
 
     #[tokio::test]
     async fn stream_backpressure_live_delivery_preserves_order_and_usage() {
-        use crate::llm_client::mock::{MockLlmClient, canned};
+        use crate::llm_client::mock::canned;
 
         let tmp = tempdir().expect("tempdir");
-        let model = Arc::new(MockLlmClient::new(Vec::new()));
-        let (mut engine, _handle) = Engine::new_with_model_client(
-            EngineConfig {
-                workspace: tmp.path().into(),
-                snapshots_enabled: false,
-                subagents_enabled: false,
-                ..Default::default()
-            },
-            &Config::default(),
-            model.clone(),
-        );
-        let (tx, mut rx) = mpsc::channel(1);
-        tx.send(Event::status("occupied")).await.unwrap();
-        engine.tx_event = tx;
+        let (mut engine, model, mut rx) = stream_backpressure_fixture(tmp.path(), 1);
+        engine
+            .tx_event
+            .send(Event::status("occupied"))
+            .await
+            .unwrap();
         let stream = futures_util::stream::iter([
             Ok(canned::text_delta(0, "first")),
             Ok(canned::text_delta(0, "second")),
@@ -7982,7 +7974,7 @@ mod tests {
 
     #[tokio::test]
     async fn stream_response_tool_limit_bounds_empty_native_and_server_calls() {
-        use crate::llm_client::mock::{MockLlmClient, canned};
+        use crate::llm_client::mock::canned;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         for server_tool in [false, true] {
@@ -7991,19 +7983,7 @@ mod tests {
                 super::super::streaming::MAX_TOOL_CALLS_PER_RESPONSE + 1,
             ] {
                 let tmp = tempdir().expect("tempdir");
-                let model = Arc::new(MockLlmClient::new(Vec::new()));
-                let (mut engine, _handle) = Engine::new_with_model_client(
-                    EngineConfig {
-                        workspace: tmp.path().into(),
-                        snapshots_enabled: false,
-                        subagents_enabled: false,
-                        ..Default::default()
-                    },
-                    &Config::default(),
-                    model.clone(),
-                );
-                let (tx, mut rx) = mpsc::channel(4);
-                engine.tx_event = tx;
+                let (mut engine, model, mut rx) = stream_backpressure_fixture(tmp.path(), 4);
                 let events = (0..count).map(|index| StreamEvent::ContentBlockStart {
                     index: u32::try_from(index).unwrap(),
                     content_block: if server_tool {
