@@ -77,6 +77,11 @@ const MAX_ACP_SESSIONS: usize = 64;
 /// broken client cannot strand the stdio server forever after cancellation.
 const ACP_PERMISSION_CANCEL_GRACE: Duration = Duration::from_secs(2);
 
+/// How long a cancelled tool gets to observe its token and wind down (kill a
+/// child, flush a write) before the turn stops waiting and drops it. A tool
+/// that ignores its token must not hold the stdio server forever.
+const ACP_TOOL_CANCEL_GRACE: Duration = Duration::from_secs(5);
+
 /// Agent-originated JSON-RPC request ids have their own namespace. Strings
 /// avoid the client-specific numeric response-id compatibility shim used for
 /// replies to client-originated requests.
@@ -1226,11 +1231,22 @@ where
                                     write_jsonrpc_result(writer, msg_id, json!(null)).await?;
                                 }
                                 cancel_token.cancel();
-                                // Give the tool a chance to observe the token and
-                                // wind down (e.g. kill a running child process)
-                                // before we drop it.
+                                // Give the tool a bounded chance to observe the
+                                // token and wind down (e.g. kill a running child
+                                // process) before we drop it.
                                 cancelled = true;
-                                break (&mut exec_fut).await;
+                                break match tokio::time::timeout(
+                                    ACP_TOOL_CANCEL_GRACE,
+                                    &mut exec_fut,
+                                )
+                                .await
+                                {
+                                    Ok(result) => result,
+                                    Err(_) => Err(ToolError::cancelled(format!(
+                                        "the tool did not stop within {}s of cancellation and was abandoned",
+                                        ACP_TOOL_CANCEL_GRACE.as_secs()
+                                    ))),
+                                };
                             }
                             if let Some(msg_id) = msg_id {
                                 let msg_id = response_id_policy.response_id(msg_id);
@@ -2226,7 +2242,9 @@ fn build_acp_system_prompt(
                 route_limits,
             )),
             verbosity: config.verbosity.as_deref(),
-            skills_scan_codewhale_only: config.skills_config().scan_codewhale_only(),
+            skills_discovery_mode: crate::skills::SkillDiscoveryMode::from_config(
+                &config.skills_config(),
+            ),
             plugin_registry: None,
             recovery_hint: None,
             mode: acp_mode(config),

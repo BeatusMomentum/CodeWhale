@@ -74,7 +74,10 @@ export class PetNative {
     this.world.voices = [];
     return this.world.frame.timeMs;
   }
-  observeEngine(metadataJSON: string, timeMs: number): void { this.engine.observe(JSON.parse(metadataJSON), timeMs); }
+  /** A rejected observation leaves the reducer exactly as it was, like a batch. */
+  observeEngine(metadataJSON: string, timeMs: number): void {
+    const next = this.engine.clone(); next.observe(JSON.parse(metadataJSON), timeMs); this.engine = next;
+  }
   observeEngineBatch(metadataJSON: string, timeMs: number): void {
     const events: unknown = JSON.parse(metadataJSON);
     if (!Array.isArray(events) || events.length > 64) throw new Error('Invalid Engine batch.');

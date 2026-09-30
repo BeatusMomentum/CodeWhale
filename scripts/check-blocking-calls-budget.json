@@ -379,13 +379,14 @@
     "path_canonicalize": 1
   },
   "crates/tui/src/session_manager.rs": {
-    "path_canonicalize": 2
+    "path_canonicalize": 2,
+    "thread_sleep": 1
   },
   "crates/tui/src/session_reconcile.rs": {
     "path_canonicalize": 3
   },
   "crates/tui/src/session_secret_scrub.rs": {
-    "std_fs": 4
+    "std_fs": 8
   },
   "crates/tui/src/settings.rs": {
     "std_fs": 4

@@ -498,6 +498,24 @@ assert.equal(
 );
 assert.match(release, /overwrite_files:\s*false/);
 assert.match(release, /fail_on_unmatched_files:\s*true/);
+// Assets land in a draft; the whole verified set becomes public at once, and
+// derived channels (the tagged container manifest) follow the canonical release.
+assert.match(release, /files: artifacts\/\*\n\s+draft: true\n/);
+assert.match(
+  namedStep(release, "Verify the draft's exact asset set, then publish it at once"),
+  /verify-release-inventory\.js \\\n\s+--draft --asset-dir artifacts --publish/,
+);
+const releaseJob = release.match(/\n  release:\n([\s\S]*?)\n  npm:\n/);
+assert.ok(releaseJob, "public release must retain its release job");
+assert.match(releaseJob[1], /^    needs: \[artifacts, docker-build, resolve\]$/m);
+const dockerJob = release.match(/\n  docker:\n([\s\S]*?)\n  release:\n/);
+assert.ok(dockerJob, "public release must retain its container manifest job");
+assert.match(dockerJob[1], /^    needs: \[docker-build, release, resolve\]$/m);
+assert.match(dockerJob[1], /needs\.release\.result == 'success'/);
+assert.match(
+  namedStep(republish, "Require a complete published release"),
+  /verify-release-inventory\.js --manifest/,
+);
 
 assert.match(release, /^  docker-build:\n/m);
 assert.match(release, /^  docker:\n/m);

@@ -127,9 +127,19 @@ pub async fn capture_and_transcribe(
     if !is_available() {
         return Err(tr(locale, MessageId::VoiceErrNoRecorder).to_string());
     }
-    let api_key = config
-        .active_route_api_key()
-        .map_err(|_| tr(locale, MessageId::VoiceErrNoAuth).to_string())?;
+    // C01-10: the credential check follows the ASR backend that will run,
+    // not the chat provider. Local Whisper and Groq need no provider key, so
+    // resolve it lazily — the same contract as `crate::voice::dictate_once`
+    // — and only refuse before recording when provider ASR is the backend.
+    let provider_key = || {
+        config
+            .active_route_api_key()
+            .map_err(|_| tr(locale, MessageId::VoiceErrNoAuth).to_string())
+    };
+    let (asr_kind, _asr_model) = resolve_asr_choice(config);
+    if asr_kind == "provider" {
+        provider_key()?;
+    }
     let base_url = config.active_route_base_url();
     let openrouter_vendor = config
         .openrouter_vendor()
@@ -143,7 +153,6 @@ pub async fn capture_and_transcribe(
     // Streaming interim: poll every 700ms and show partial transcript like Grok Build's
     // VoiceEvent::Interim → VoiceState::Recording{interim}. We re-transcribe the
     // growing buffer (local-whisper is cheap; Groq is ~300ms; provider falls back).
-    let (asr_kind, _asr_model) = resolve_asr_choice(config);
     let interim_enabled = true; // always show partials — feels alive like Spark
 
     // Spawn recorder on blocking thread with a shared buffer for interim polling.
@@ -241,13 +250,30 @@ pub async fn capture_and_transcribe(
     let text = match asr_kind.as_str() {
         "local-whisper" => match transcribe_local_whisper(&samples).await {
             Ok(v) => Ok(v),
-            Err(_) => transcribe(&api_key, &base_url, &samples, openrouter_vendor.as_deref()).await,
+            Err(_) => {
+                transcribe(
+                    &provider_key()?,
+                    &base_url,
+                    &samples,
+                    openrouter_vendor.as_deref(),
+                )
+                .await
+            }
         },
         "groq" => match transcribe_groq(&samples).await {
             Ok(v) => Ok(v),
-            Err(_) => transcribe(&api_key, &base_url, &samples, openrouter_vendor.as_deref()).await,
+            Err(_) => {
+                transcribe(
+                    &provider_key()?,
+                    &base_url,
+                    &samples,
+                    openrouter_vendor.as_deref(),
+                )
+                .await
+            }
         },
         _ => {
+            let api_key = provider_key()?;
             if app.voice_control_enabled {
                 process_voice_control(
                     &api_key,

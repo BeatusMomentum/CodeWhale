@@ -1,4 +1,4 @@
-import { chmod, mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { chmod, mkdir, open, readFile, rename, rm } from "node:fs/promises";
 import path from "node:path";
 import { randomBytes } from "node:crypto";
 
@@ -17,6 +17,39 @@ async function chmodBestEffort(filePath, mode) {
     await chmod(filePath, mode);
   } catch (error) {
     if (process.platform !== "win32") throw error;
+  }
+}
+
+/**
+ * Replace `filePath` so a crash leaves either the old bytes or the new ones:
+ * a unique temporary name (two processes sharing a state dir never write the
+ * same temp file), fsync before the rename, and a best-effort directory fsync
+ * after it so the rename itself survives power loss where the OS allows.
+ */
+export async function writeFileDurable(filePath, contents, { mode = 0o600 } = {}) {
+  const dir = path.dirname(filePath);
+  const tmp = path.join(dir, `.${path.basename(filePath)}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`);
+  let handle = null;
+  try {
+    handle = await open(tmp, "wx", mode);
+    await handle.writeFile(contents);
+    await handle.sync();
+    await handle.close();
+    handle = null;
+    await rename(tmp, filePath);
+  } catch (error) {
+    await handle?.close().catch(() => {});
+    await rm(tmp, { force: true }).catch(() => {});
+    throw error;
+  }
+  let dirHandle = null;
+  try {
+    dirHandle = await open(dir, "r");
+    await dirHandle.sync();
+  } catch {
+    // Windows and some filesystems cannot fsync a directory.
+  } finally {
+    await dirHandle?.close().catch(() => {});
   }
 }
 
@@ -48,6 +81,9 @@ export class ThreadStore {
     if (this.options.messageLimit > 0 && !Array.isArray(this.data.messages)) {
       this.data.messages = [];
     }
+    if (this.options.messageLimit > 0 && (!this.data.inflight || typeof this.data.inflight !== "object" || Array.isArray(this.data.inflight))) {
+      this.data.inflight = {};
+    }
     if (this.options.actions && (!this.data.actions || typeof this.data.actions !== "object")) {
       this.data.actions = {};
     }
@@ -64,6 +100,39 @@ export class ThreadStore {
     } catch (error) {
       if (error.code !== "ENOENT") throw error;
     }
+  }
+
+  /**
+   * Claim one inbound message before acting on it. "new": handle it now (it
+   * is recorded as in flight first, durably). "done": a finished duplicate.
+   * "interrupted": an earlier process claimed it and stopped before
+   * completeMessage, so its effect is unknown; the caller reports that
+   * instead of running it again. Callers handle messages sequentially — a
+   * key still in flight in this process is not a restart.
+   */
+  async claimMessage(messageKey) {
+    if (!messageKey || this.options.messageLimit <= 0) return "new";
+    this.ensureShape();
+    const inflight = this.data.inflight;
+    if (this.data.messages.includes(messageKey)) {
+      if (!Object.hasOwn(inflight, messageKey)) return "done";
+      delete inflight[messageKey];
+      await this.save();
+      return "interrupted";
+    }
+    this.data.messages.push(messageKey);
+    this.data.messages = this.data.messages.slice(-this.options.messageLimit);
+    for (const key of Object.keys(inflight)) if (!this.data.messages.includes(key)) delete inflight[key];
+    inflight[messageKey] = new Date().toISOString();
+    await this.save();
+    return "new";
+  }
+
+  /** Mark a claimed message handled (whether it succeeded or failed in-process). */
+  async completeMessage(messageKey) {
+    if (!messageKey || !this.data.inflight || !Object.hasOwn(this.data.inflight, messageKey)) return;
+    delete this.data.inflight[messageKey];
+    await this.save();
   }
 
   async recordMessage(messageKey) {
@@ -180,10 +249,7 @@ export class ThreadStore {
     const dir = path.dirname(this.filePath);
     await mkdir(dir, { recursive: true, mode: 0o700 });
     if (this.options.privateMode) await chmodBestEffort(dir, 0o700);
-    const tmp = `${this.filePath}.tmp`;
-    await writeFile(tmp, `${JSON.stringify(this.data, null, 2)}\n`, { mode: 0o600 });
-    if (this.options.privateMode) await chmodBestEffort(tmp, 0o600);
-    await rename(tmp, this.filePath);
+    await writeFileDurable(this.filePath, `${JSON.stringify(this.data, null, 2)}\n`, { mode: 0o600 });
     if (this.options.privateMode) await chmodBestEffort(this.filePath, 0o600);
   }
 }

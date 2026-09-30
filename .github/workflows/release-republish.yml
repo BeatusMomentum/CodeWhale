@@ -75,21 +75,17 @@ jobs:
             echo "version=${INPUT_VERSION}"
           } >> "${GITHUB_OUTPUT}"
           echo "Resolved ${tag} -> ${sha}"
-      - name: Require an existing published release
+      - name: Require a complete published release
         # The inverse of release.yml's immutability guard. That one refuses to
-        # run when assets exist; this one refuses to run when they do not,
-        # because there is nothing to derive a channel from.
+        # run when assets exist; this one refuses to run unless the published
+        # release carries exactly the assets its own checksum manifest lists,
+        # each fully uploaded, because a channel derived from a partial set
+        # would advertise bytes that are not there. The tag may predate the
+        # current inventory, so its manifest, not today's list, is the check.
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.release.outputs.tag }}
-        run: |
-          set -euo pipefail
-          count="$(gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" --json assets --jq '.assets | length')"
-          if [[ "${count}" -eq 0 ]]; then
-            echo "::error::${TAG} has no published assets. Run release.yml, not this recovery workflow." >&2
-            exit 1
-          fi
-          echo "${TAG} has ${count} published assets."
+        run: node scripts/release/verify-release-inventory.js --manifest "${GITHUB_REPOSITORY}" "${TAG}"
       - name: Verify the remote tag still points at this commit
         env:
           EXPECTED_SHA: ${{ steps.release.outputs.sha }}

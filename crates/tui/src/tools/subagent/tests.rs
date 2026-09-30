@@ -12605,11 +12605,14 @@ async fn rate_limit_pause_blocks_subagent_spawn() {
     let _clear = ClearRateLimitOnDrop;
     crate::retry_status::clear();
     crate::retry_status::clear_rate_limit();
-    crate::retry_status::note_rate_limit(Duration::from_secs(30));
 
     let tmp = tempdir().expect("tempdir");
     let mut runtime = stub_runtime();
     runtime.context = ToolContext::new(tmp.path().to_path_buf());
+    crate::retry_status::note_rate_limit(
+        &runtime.client.rate_limit_scope(),
+        Duration::from_secs(30),
+    );
     let manager = new_shared_subagent_manager(tmp.path().to_path_buf(), 2);
 
     let err = spawn_subagent_from_input(
@@ -18454,6 +18457,32 @@ async fn spawn_budget_capped_worker(
     Arc<AtomicUsize>,
     tokio::task::JoinHandle<()>,
 ) {
+    spawn_budget_capped_worker_with_pause(
+        workspace,
+        prompt_tokens,
+        completion_tokens,
+        max_steps,
+        wall_time,
+        None,
+    )
+    .await
+}
+
+/// As [`spawn_budget_capped_worker`], optionally opening a rate-limit pause
+/// on the worker's own route before it starts.
+async fn spawn_budget_capped_worker_with_pause(
+    workspace: &Path,
+    prompt_tokens: u64,
+    completion_tokens: u64,
+    max_steps: u32,
+    wall_time: Duration,
+    pause: Option<Duration>,
+) -> (
+    Arc<RwLock<SubAgentManager>>,
+    String,
+    Arc<AtomicUsize>,
+    tokio::task::JoinHandle<()>,
+) {
     let manager = Arc::new(RwLock::new(SubAgentManager::new(
         workspace.to_path_buf(),
         2,
@@ -18502,6 +18531,9 @@ async fn spawn_budget_capped_worker(
         launch_gate: None,
         _foreground_child_registration: None,
     };
+    if let Some(pause) = pause {
+        crate::retry_status::note_rate_limit(&runtime.client.rate_limit_scope(), pause);
+    }
     let task_handle = tokio::spawn(run_subagent_task(task));
     (manager, agent_id, calls, task_handle)
 }
@@ -18781,11 +18813,17 @@ async fn worker_is_not_stranded_by_transient_global_rate_limit_window() {
     // in-flight requests promptly.
     let _guard = crate::retry_status::test_guard();
     let _clear = ClearRateLimitOnDrop;
-    crate::retry_status::note_rate_limit(Duration::from_secs(30));
 
     let tmp = tempdir().expect("tempdir");
-    let (manager, agent_id, _calls, task_handle) =
-        spawn_budget_capped_worker(tmp.path(), 60, 40, 4, DEFAULT_CHILD_WALL_TIME).await;
+    let (manager, agent_id, _calls, task_handle) = spawn_budget_capped_worker_with_pause(
+        tmp.path(),
+        60,
+        40,
+        4,
+        DEFAULT_CHILD_WALL_TIME,
+        Some(Duration::from_secs(30)),
+    )
+    .await;
 
     // Simulate the concurrent test finishing: the window closes shortly
     // after the worker's first request has already observed it.

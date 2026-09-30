@@ -1558,6 +1558,10 @@
   "SessionsSortSize": "大小",
   "SessionsSearchPrompt": "搜索：输入筛选，Enter 应用",
   "SessionsDeleteFailed": "删除失败：{error}",
+  "SessionsDeleteOpenHere": "无法删除此处打开的会话。请先切换到其他会话。",
+  "SessionsDeleteOpenElsewhere": "无法删除：此会话已在另一个 Codewhale 窗口中打开。",
+  "SessionSaveFailed": "无法保存会话 {id}（{error}）。最近的工作可能尚未保存。",
+  "SessionSaveFailedAtExit": "codewhale: 会话 {id} 的最近一次保存失败（{error}）；最近的工作可能尚未保存。",
   "SessionsDeleted": "已删除会话 {id}",
   "SessionsNoSelection": "未选择会话",
   "SessionsTitleLength": "标题长度须为 1–100 个字符",
@@ -2434,7 +2438,5 @@
   "ModelPickerPinReorderFailed": "无法调整固定顺序：{error}",
   "ModelPickerReadinessRefreshed": "已刷新模型就绪状态 · 已重建目录行",
   "ModelPickerOpenToRefresh": "打开 /model 以刷新就绪状态和目录",
-  "ModelPickerPinnedChip": "已固定",
-  "TranscriptThought": "思考完毕",
-  "TranscriptThoughtFor": "思考用时 {duration}"
+  "ModelPickerPinnedChip": "已固定"
 }

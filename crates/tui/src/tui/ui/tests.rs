@@ -31084,6 +31084,169 @@ fn a_scroll_burst_is_folded_into_one_frame() {
     ));
 }
 
+fn observed_key(c: char) -> ObservedTerminalEvent {
+    ObservedTerminalEvent::new(
+        Event::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)),
+        Instant::now(),
+    )
+}
+
+fn idle_input_pump() -> TerminalInputPump {
+    let (_tx, rx) = std::sync::mpsc::channel();
+    TerminalInputPump {
+        rx,
+        stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        paused: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        paused_ack: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        handle: None,
+        last_alive_at: std::cell::Cell::new(Instant::now()),
+    }
+}
+
+fn pending_key_chars(pending: &VecDeque<ObservedTerminalEvent>) -> String {
+    pending
+        .iter()
+        .filter_map(|observed| match &observed.event {
+            Event::Key(KeyEvent {
+                code: KeyCode::Char(c),
+                ..
+            }) => Some(*c),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Typing while the wheel scrolls: the loop has already drained the burst and
+/// the keys into `pending`. The key that ends the burst goes back to the head,
+/// so the composer receives "abc", not "bca".
+#[test]
+fn a_scroll_burst_keeps_following_input_in_order() {
+    let mut app = create_test_app();
+    app.launch.visible = false;
+    app.viewport.last_transcript_area = Some(Rect::new(0, 0, 80, 20));
+    let scroll = crossterm::event::MouseEvent {
+        kind: crossterm::event::MouseEventKind::ScrollDown,
+        column: 10,
+        row: 5,
+        modifiers: KeyModifiers::NONE,
+    };
+    let input = idle_input_pump();
+    let mut pending: VecDeque<ObservedTerminalEvent> = VecDeque::new();
+    pending.push_back(ObservedTerminalEvent::new(
+        Event::Mouse(scroll),
+        Instant::now(),
+    ));
+    for c in ['a', 'b', 'c'] {
+        pending.push_back(observed_key(c));
+    }
+
+    super::event_loop::coalesce_scroll_burst(&mut app, scroll, &input, &mut pending)
+        .expect("coalesce");
+
+    assert_eq!(pending_key_chars(&pending), "abc");
+}
+
+#[test]
+fn a_resize_burst_keeps_following_input_in_order() {
+    let input = idle_input_pump();
+    let mut pending: VecDeque<ObservedTerminalEvent> = VecDeque::new();
+    pending.push_back(ObservedTerminalEvent::new(
+        Event::Resize(120, 40),
+        Instant::now(),
+    ));
+    pending.push_back(observed_key('a'));
+    pending.push_back(observed_key('b'));
+
+    let size =
+        super::event_loop::coalesce_resize_burst(100, 30, &input, &mut pending).expect("coalesce");
+
+    assert_eq!(size, (120, 40), "the final queued size wins");
+    assert_eq!(pending_key_chars(&pending), "ab");
+}
+
+/// A failing session save reaches the user, not only the log, and the notice
+/// is withdrawn once a later save of that session lands.
+#[test]
+fn a_failing_session_save_shows_an_error_until_a_save_lands() {
+    use crate::tui::persistence_actor::SaveHealthReading;
+    let mut app = create_test_app();
+    let mut seen = 0;
+    let failing = SaveHealthReading {
+        generation: 1,
+        failing: Some((
+            "toast-probe".to_string(),
+            std::io::ErrorKind::PermissionDenied,
+        )),
+    };
+    let save_errors = |app: &App| {
+        app.status_toasts
+            .iter()
+            .filter(|toast| toast.level == StatusToastLevel::Error)
+            .count()
+    };
+
+    super::event_loop::surface_session_save_health(&mut app, Some(failing.clone()), &mut seen);
+    assert_eq!(seen, 1);
+    assert_eq!(save_errors(&app), 1, "a failing save is visible");
+    assert!(
+        app.status_toasts
+            .iter()
+            .any(|toast| toast.text.contains("toast-pr")),
+        "{:?}",
+        app.status_toasts
+    );
+
+    // Polling the same reading again does not repeat it.
+    super::event_loop::surface_session_save_health(&mut app, Some(failing), &mut seen);
+    assert_eq!(save_errors(&app), 1);
+
+    // The failure outlives any toast lifetime: well past the sticky TTL, and
+    // behind a full queue of newer notices, it is still there and shown once
+    // they expire, because nothing has recovered.
+    for toast in app.status_toasts.iter_mut() {
+        toast.created_at = std::time::Instant::now()
+            - std::time::Duration::from_millis(App::STICKY_ERROR_TTL_MS * 10);
+    }
+    for i in 0..30 {
+        app.push_status_toast(format!("newer {i}"), StatusToastLevel::Info, Some(1));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    let shown = app
+        .active_status_toast(crate::tui::underwater::ShellPhase::Idle)
+        .expect("a toast is shown");
+    assert!(shown.text.contains("toast-pr"), "{}", shown.text);
+    assert_eq!(save_errors(&app), 1, "a standing failure does not expire");
+
+    let healed = SaveHealthReading {
+        generation: 2,
+        failing: None,
+    };
+    super::event_loop::surface_session_save_health(&mut app, Some(healed), &mut seen);
+    assert_eq!(save_errors(&app), 0, "a later successful save withdraws it");
+}
+
+#[test]
+fn shutdown_reports_only_a_save_that_is_still_failing() {
+    use crate::tui::persistence_actor::SaveHealthReading;
+    let locale = codewhale_localization::Locale::En;
+    let healthy = SaveHealthReading {
+        generation: 4,
+        failing: None,
+    };
+    assert_eq!(
+        super::event_loop::shutdown_persistence_notice(locale, &healthy),
+        None,
+        "failures later replaced by a successful save are not reported"
+    );
+    let failing = SaveHealthReading {
+        generation: 5,
+        failing: Some(("session-a".to_string(), std::io::ErrorKind::StorageFull)),
+    };
+    let notice = super::event_loop::shutdown_persistence_notice(locale, &failing)
+        .expect("a failing save produces an exit notice");
+    assert!(notice.contains("session-a"), "{notice}");
+}
+
 // ---------------------------------------------------------------------------
 // Startup type-ahead integrity (#5925).
 //

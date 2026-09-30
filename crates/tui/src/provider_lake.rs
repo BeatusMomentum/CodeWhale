@@ -165,6 +165,10 @@ static MERGED_CACHE: RwLock<Option<MergedCacheEntry>> = RwLock::new(None);
 /// 600+ row OpenRouter catalog for every route candidate.
 static RUNTIME_RESOLVER_CACHE: RwLock<BTreeMap<String, RuntimeResolverCacheEntry>> =
     RwLock::new(BTreeMap::new());
+/// Most distinct endpoints the resolver cache holds at once. Entries from an
+/// older catalog generation can never hit again and are dropped on insert;
+/// this caps the endpoints of the current generation.
+const MAX_RUNTIME_RESOLVER_CACHE_ENTRIES: usize = 64;
 
 #[derive(Clone)]
 struct RuntimeResolverCacheEntry {
@@ -408,25 +412,59 @@ pub fn live_catalog_origin(provider: ApiProvider, wire_model_id: &str) -> Option
     let Ok(guard) = LIVE_SNAPSHOT.read() else {
         return None;
     };
-    let matches = |row: &CatalogOffering| {
-        row.provider.eq_ignore_ascii_case(catalog_id)
-            && row.wire_model_id.eq_ignore_ascii_case(needle)
-    };
-    if guard
-        .per_provider
-        .get(&owner)
-        .is_some_and(|snap| snap.offerings.iter().any(matches))
-    {
-        return Some(LiveSource::PerProvider);
-    }
-    if guard
-        .models_dev
-        .as_ref()
-        .is_some_and(|snap| snap.offerings.iter().any(|row| matches(row)))
-    {
-        return Some(LiveSource::ModelsDev);
+    // Wire ids are opaque and case-sensitive: an exact row in either
+    // partition decides before a case-folded one does.
+    for exact in [true, false] {
+        let matches = |row: &CatalogOffering| {
+            row.provider.eq_ignore_ascii_case(catalog_id)
+                && if exact {
+                    row.wire_model_id == needle
+                } else {
+                    row.wire_model_id.eq_ignore_ascii_case(needle)
+                }
+        };
+        if guard
+            .per_provider
+            .get(&owner)
+            .is_some_and(|snap| snap.offerings.iter().any(matches))
+        {
+            return Some(LiveSource::PerProvider);
+        }
+        if guard
+            .models_dev
+            .as_ref()
+            .is_some_and(|snap| snap.offerings.iter().any(|row| matches(row)))
+        {
+            return Some(LiveSource::ModelsDev);
+        }
     }
     None
+}
+
+/// The row whose wire id is exactly `needle`, else the one wire id equal to
+/// it ignoring ASCII case. Wire ids are opaque and case-sensitive, so the
+/// fallback only forgives a case slip when it cannot choose between two
+/// distinct ids; otherwise it answers nothing rather than another model's
+/// metadata.
+fn find_wire_model<'a>(
+    rows: impl IntoIterator<Item = &'a CatalogOffering>,
+    needle: &str,
+) -> Option<&'a CatalogOffering> {
+    let mut folded: Option<&'a CatalogOffering> = None;
+    let mut ambiguous = false;
+    for row in rows {
+        if row.wire_model_id == needle {
+            return Some(row);
+        }
+        if row.wire_model_id.eq_ignore_ascii_case(needle) {
+            match folded {
+                None => folded = Some(row),
+                Some(first) if first.wire_model_id != row.wire_model_id => ambiguous = true,
+                Some(_) => {}
+            }
+        }
+    }
+    folded.filter(|_| !ambiguous)
 }
 
 /// Serialize tests that mutate the process-wide live snapshot.
@@ -938,6 +976,12 @@ pub(crate) fn runtime_catalog_resolver_for_identity(
 
     let resolver = RouteResolver::from_offerings(route_offerings.into_values().collect());
     if let Ok(mut cache) = RUNTIME_RESOLVER_CACHE.write() {
+        cache.retain(|_, entry| {
+            entry.generation == generation && entry.cloud_generation == cloud_generation
+        });
+        if cache.len() >= MAX_RUNTIME_RESOLVER_CACHE_ENTRIES && !cache.contains_key(&cache_key) {
+            cache.pop_first();
+        }
         cache.insert(
             cache_key,
             RuntimeResolverCacheEntry {
@@ -1110,14 +1154,14 @@ pub fn catalog_offering_for_model_identity(
         return None;
     }
     if provider == ApiProvider::Custom {
-        return exact_custom_offerings(catalog_id.as_ref())
-            .into_iter()
-            .find(|row| row.wire_model_id.eq_ignore_ascii_case(needle));
+        let rows = exact_custom_offerings(catalog_id.as_ref());
+        return find_wire_model(&rows, needle).cloned();
     }
-    offerings_for_provider_identity(&merged_snapshot(), catalog_id.as_ref())
-        .into_iter()
-        .find(|row| row.wire_model_id.eq_ignore_ascii_case(needle))
-        .cloned()
+    find_wire_model(
+        offerings_for_provider_identity(&merged_snapshot(), catalog_id.as_ref()),
+        needle,
+    )
+    .cloned()
 }
 
 /// Metadata from the exact route, without borrowing another endpoint's live facts.
@@ -1252,11 +1296,11 @@ pub fn bundled_catalog_offering_for_model(
     if needle.is_empty() {
         return None;
     }
-    bundled_snapshot()
-        .offerings_for_provider(catalog_id)
-        .into_iter()
-        .find(|row| row.wire_model_id.eq_ignore_ascii_case(needle))
-        .cloned()
+    find_wire_model(
+        bundled_snapshot().offerings_for_provider(catalog_id),
+        needle,
+    )
+    .cloned()
 }
 
 /// Count of merged-catalog models for one provider (catalog view / dashboard).
@@ -1859,6 +1903,22 @@ mod tests {
     use super::*;
     use crate::config::{DEFAULT_TOGETHER_FLASH_MODEL, DEFAULT_TOGETHER_MODEL};
     use codewhale_config::catalog::CatalogSource;
+
+    #[test]
+    fn wire_model_lookup_is_exact_first_and_never_guesses_between_case_variants() {
+        let row = |id: &str| CatalogOffering {
+            provider: "p".to_string(),
+            wire_model_id: id.to_string(),
+            ..Default::default()
+        };
+        let rows = vec![row("org/Model-A"), row("org/model-a"), row("org/Model-B")];
+        let found =
+            |needle: &str| find_wire_model(&rows, needle).map(|row| row.wire_model_id.clone());
+        assert_eq!(found("org/model-a").as_deref(), Some("org/model-a"));
+        assert_eq!(found("org/Model-A").as_deref(), Some("org/Model-A"));
+        assert_eq!(found("ORG/MODEL-A"), None, "two distinct ids fold together");
+        assert_eq!(found("org/model-b").as_deref(), Some("org/Model-B"));
+    }
 
     fn catalog_test_config(first_url: &str, second_url: &str) -> Config {
         use crate::config::{ProviderConfig, ProvidersConfig};

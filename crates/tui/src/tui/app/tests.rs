@@ -2951,6 +2951,10 @@ fn resolve_skills_dir_ignores_untrusted_workspace_skills() {
         std::fs::create_dir_all(&local_skills).expect("skills dir");
         let config = Config {
             skills_dir: Some(global_skills_dir.to_string_lossy().into_owned()),
+            skills: Some(crate::config::SkillsConfig {
+                flat_workspace_root: Some(true),
+                ..Default::default()
+            }),
             ..Default::default()
         };
 
@@ -7854,4 +7858,45 @@ fn ctrl_t_moves_past_a_persisted_alias_the_ladder_dropped() {
     app.cycle_effort();
 
     assert_eq!(app.reasoning_effort, ReasoningEffort::Max);
+}
+
+#[test]
+fn skills_cache_hides_model_only_and_preserves_argument_hint() {
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace = tmp.path().join("workspace");
+    crate::test_support::trust_workspace(&workspace);
+    let root = workspace.join(".codewhale/skills");
+    for (name, policy) in [
+        ("model", "user-invocable: false"),
+        (
+            "user",
+            "disable-model-invocation: true\nargument-hint: '[path]'",
+        ),
+        (
+            "disabled",
+            "disable-model-invocation: true\nuser-invocable: false",
+        ),
+    ] {
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: routing\n{policy}\n---\nbody"),
+        )
+        .unwrap();
+    }
+    let mut options = test_options(false);
+    options.workspace = workspace;
+    options.skills_dir = root;
+    let app = App::new(options, &Config::default());
+    assert!(
+        app.cached_skills
+            .iter()
+            .all(|(name, _)| name != "model" && name != "disabled")
+    );
+    assert!(
+        app.cached_skills
+            .iter()
+            .any(|(name, description)| name == "user" && description.contains("[path]"))
+    );
 }

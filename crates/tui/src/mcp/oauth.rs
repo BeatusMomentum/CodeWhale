@@ -826,13 +826,17 @@ impl McpOAuthRuntime {
     /// the rotated token while keeping our dead grant would make the next
     /// `invalid_grant` compare an "unchanged" store and delete the newer
     /// valid credential.
+    ///
+    /// The comparison and the delete are one step under the secret store's
+    /// entry lock (the same lock every save takes), so a login that lands
+    /// between them is never the credential that gets deleted.
     async fn clear_stored_tokens(&self, reason: &str) -> Result<()> {
         let held = { self.inner.last_tokens.lock().await.take() };
         let Some(held) = held else {
             return Ok(());
         };
-        match load_oauth_tokens(&self.inner.server_name, &self.inner.url)? {
-            Some(stored) if stored != held => {
+        match delete_oauth_tokens_if_held(&self.inner.server_name, &self.inner.url, &held)? {
+            Some(stored) => {
                 tracing::debug!(
                     target: "mcp",
                     server = %self.inner.server_name,
@@ -845,8 +849,7 @@ impl McpOAuthRuntime {
                 *self.inner.last_tokens.lock().await = Some(stored);
                 *self.inner.rejection.lock().await = None;
             }
-            _ => {
-                delete_oauth_tokens(&self.inner.server_name, &self.inner.url)?;
+            None => {
                 *self.inner.rejection.lock().await = Some(reason.to_string());
             }
         }
@@ -863,8 +866,9 @@ impl McpOAuthRuntime {
         };
         let Some(credentials) = credentials else {
             let mut last = self.inner.last_tokens.lock().await;
-            if last.take().is_some() {
-                delete_oauth_tokens(&self.inner.server_name, &self.inner.url)?;
+            if let Some(previous) = last.take() {
+                // Only our own credential goes; a newer login stays.
+                delete_oauth_tokens_if_held(&self.inner.server_name, &self.inner.url, &previous)?;
             }
             return Ok(());
         };
@@ -1444,9 +1448,42 @@ pub(crate) fn load_oauth_tokens(
     else {
         return Ok(None);
     };
-    let mut tokens = parse_stored_oauth_tokens(&serialized, server_name)?;
+    decode_stored_oauth_tokens(&serialized, server_name).map(Some)
+}
+
+fn decode_stored_oauth_tokens(serialized: &str, server_name: &str) -> Result<StoredMcpOAuthTokens> {
+    let mut tokens = parse_stored_oauth_tokens(serialized, server_name)?;
     refresh_expires_in_from_timestamp(&mut tokens);
-    Ok(Some(tokens))
+    Ok(tokens)
+}
+
+/// Delete the stored credential only while it is still exactly `held`,
+/// comparing and deleting under the store's entry lock. Returns the different
+/// credential found in its place (left untouched), or `None` when the entry
+/// was `held` and is now gone, or was already absent. An unreadable entry is
+/// an error and is left in place, as a plain load would report it.
+fn delete_oauth_tokens_if_held(
+    server_name: &str,
+    url: &str,
+    held: &StoredMcpOAuthTokens,
+) -> Result<Option<StoredMcpOAuthTokens>> {
+    let secrets = codewhale_secrets::Secrets::auto_detect();
+    let key = store_key(server_name, url);
+    secrets
+        .with_entry_transaction(&key, |current| {
+            let Some(serialized) = current.as_deref() else {
+                return Ok(Ok(None));
+            };
+            Ok(match decode_stored_oauth_tokens(serialized, server_name) {
+                Ok(stored) if stored == *held => {
+                    *current = None;
+                    Ok(None)
+                }
+                Ok(stored) => Ok(Some(stored)),
+                Err(error) => Err(error),
+            })
+        })
+        .with_context(|| format!("clearing the MCP OAuth token for '{server_name}'"))?
 }
 
 fn parse_stored_oauth_tokens(serialized: &str, server_name: &str) -> Result<StoredMcpOAuthTokens> {

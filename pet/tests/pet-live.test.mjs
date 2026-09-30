@@ -61,3 +61,17 @@ test('native live delivery journals only newly observed packets across resume', 
   for (let i = 0; i < 12; i++) pet.step(1 / 30, true);
   assert.equal(JSON.parse(pet.snapshot()).state.channel, 'human');
 });
+
+test('a rejected single Engine observation cannot refresh or prune the owner reducer', () => {
+  const pet = new PetNative(points, '', '[]', true);
+  pet.observeEngine(JSON.stringify({ event: 'turn_started', turn_id: 't' }), 0);
+  pet.observeEngine(JSON.stringify({ event: 'operation_activity_started', span_id: 's', activity_kind: 'editing' }), 10);
+  const before = JSON.parse(pet.presentation()).activity;
+  // Passes field validation, then fails the type-specific turn_id requirement.
+  assert.throws(() => pet.observeEngine(JSON.stringify({ event: 'turn_started' }), 60_000), /Missing Engine turn_id/);
+  const after = JSON.parse(pet.presentation()).activity;
+  assert.equal(after.observedAtMs, 10, 'The rejected packet is not a fresh observation');
+  assert.deepEqual(after, before);
+  pet.observeEngine(JSON.stringify({ event: 'tool_call_heartbeat' }), 20);
+  assert.equal(JSON.parse(pet.presentation()).activity.observedAtMs, 20, 'The clock was not advanced by the rejected packet');
+});

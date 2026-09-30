@@ -19,7 +19,6 @@ use crate::runtime_handoff::{
 };
 use crate::tool_inspection::TurnStopReason;
 use crate::tools::canonical_action::canonical_action_alias;
-use crate::tools::spec::ToolTerminalStatus;
 use crate::tools::tool_call_budget::ToolCallBudget;
 use codewhale_core::request::{PrimaryTurnRequest, prepare_primary_turn_request};
 use codewhale_models::Role;
@@ -112,13 +111,39 @@ async fn preserve_tool_output_before_fanout(
     tool_id: &str,
     tool_name: &str,
 ) -> Result<RichToolResult, ToolError> {
-    let mut rich = result?;
     let model = model.to_owned();
     let session_id = session_id.to_owned();
     let tool_id = tool_id.to_owned();
     let tool_name = tool_name.to_owned();
+    let mut rich = match result {
+        Ok(rich) => rich,
+        // C02-12: an error is fanned out to the event stream and the session
+        // exactly like a result, so an oversized one gets the same bounded
+        // head/tail projection and saved artifact. Ordinary short errors
+        // stay byte-identical (the projection only engages past the
+        // spillover threshold).
+        Err(mut error) => {
+            if tool_error_message_mut(&mut error).is_none_or(|message| {
+                message.len() <= crate::tools::truncate::SPILLOVER_THRESHOLD_BYTES
+            }) {
+                return Err(error);
+            }
+            return tokio::task::spawn_blocking(move || {
+                bound_oversized_tool_error(error, &tool_id, &tool_name, &session_id)
+            })
+            .await
+            .map_err(|join_error| {
+                ToolError::execution_failed(format!(
+                    "Tool output preservation failed: {join_error}"
+                ))
+            })
+            .and_then(Err);
+        }
+    };
     tokio::task::spawn_blocking(move || {
-        if let Some(path) = crate::tools::truncate::apply_spillover_with_artifact(
+        // Failed results are bounded too: the fan-out cost of a huge one is
+        // the same whether or not the tool called it a failure (C02-12).
+        if let Some(path) = crate::tools::truncate::apply_spillover_with_artifact_including_errors(
             &mut rich.result,
             &tool_id,
             &tool_name,
@@ -153,6 +178,42 @@ async fn preserve_tool_output_before_fanout(
     .map_err(|error| {
         ToolError::execution_failed(format!("Tool output preservation failed: {error}"))
     })
+}
+
+/// The free-form text of a tool error, when its variant carries one.
+fn tool_error_message_mut(error: &mut ToolError) -> Option<&mut String> {
+    match error {
+        ToolError::InvalidInput { message }
+        | ToolError::ExecutionFailed { message, .. }
+        | ToolError::Cancelled { message }
+        | ToolError::NotAvailable { message }
+        | ToolError::PermissionDenied { message } => Some(message),
+        _ => None,
+    }
+}
+
+/// Give an oversized tool error message the bounded head/tail projection and
+/// saved artifact a failed result gets (C02-12). Blocking: it may write the
+/// artifact, so callers run it under `spawn_blocking`. A failed artifact
+/// write leaves a bounded preview that says the full output could not be saved.
+fn bound_oversized_tool_error(
+    mut error: ToolError,
+    tool_id: &str,
+    tool_name: &str,
+    session_id: &str,
+) -> ToolError {
+    let Some(message) = tool_error_message_mut(&mut error) else {
+        return error;
+    };
+    let mut projected = ToolResult::error(std::mem::take(message));
+    crate::tools::truncate::apply_spillover_with_artifact_including_errors(
+        &mut projected,
+        tool_id,
+        tool_name,
+        session_id,
+    );
+    *message = projected.content;
+    error
 }
 
 fn approval_intent_summary(text: &str) -> Option<String> {
@@ -405,6 +466,28 @@ fn incomplete_tool_result(reason: &str) -> ToolResult {
     }
 }
 
+/// Status receipt carried by the one request a reasoning-only / empty-stop
+/// nudge rides (C02-04). The nudge itself never joins the session.
+pub(super) const REQUEST_NUDGE_RECEIPT_PREFIX: &str =
+    "Continuing — this retry carries a request-scoped nudge (not saved to the conversation): ";
+
+/// The not-executed result for a call collected from a response whose stream
+/// failed before it completed (C02-05). Same shape as
+/// [`incomplete_tool_result`]: nothing started, so nothing needs undoing.
+fn stream_failed_tool_result(error: &str) -> ToolResult {
+    ToolResult {
+        content: format!(
+            "Not executed: the provider stream failed before the model response completed ({error})."
+        ),
+        success: false,
+        metadata: Some(json!({
+            "side_effect_status": "not_started",
+            "error_category": "model_stream_failed",
+            "model_output_incomplete": true,
+        })),
+    }
+}
+
 fn registered_tool_requires_non_bypassable_approval(tool_name: &str) -> bool {
     // `rlm_eval` (and the unified `rlm` tool whose eval action inherits the
     // same Required approval) must never bypass explicit approval (#3866).
@@ -414,9 +497,11 @@ fn registered_tool_requires_non_bypassable_approval(tool_name: &str) -> bool {
 /// Replace the runtime-MCP slice of the tool catalog wholesale. An additive
 /// merge could never remove anything: the synthetic `mcp_<server>_
 /// authenticate` entry would survive its own successful login, and tools
-/// killed by a live 401 would stay callable in name. `universe` is every
-/// name the pool can own; entries inside it are the pool's to manage, and
-/// the refreshed list is the new truth.
+/// killed by a live 401 would stay callable in name. The pool owns `universe`
+/// (every name it can list now) and every MCP name already in the catalog —
+/// the second half is what lets a tool whose server vanished or lost its
+/// authorization leave (C02-07); `universe` alone only names survivors. The
+/// refreshed list is the new truth for all of them.
 ///
 /// The refreshed slice is shaped exactly like the turn's initial catalog —
 /// the same deferral pass, the same surface budget, the same always-load
@@ -425,6 +510,10 @@ fn registered_tool_requires_non_bypassable_approval(tool_name: &str) -> bool {
 /// projection carries `defer_loading = false` on every tool, so pushing it
 /// in unshaped put every MCP tool definition into every remaining request
 /// of the turn (#5939).
+///
+/// Returns whether the catalog or its active set changed in any way — a
+/// schema or description edit included, not only a count change (C02-16) —
+/// so the caller can declare the tool-surface change to the prefix check.
 pub(super) fn replace_runtime_mcp_tools(
     tool_catalog: &mut Vec<Tool>,
     active_tool_names: &mut std::collections::HashSet<String>,
@@ -433,11 +522,12 @@ pub(super) fn replace_runtime_mcp_tools(
     mode: AppMode,
     always_load: &std::collections::HashSet<String>,
     surface_budget: crate::model_profile::ToolSurfaceBudget,
-) -> usize {
-    let before = tool_catalog.len();
+) -> bool {
+    let catalog_before = tool_catalog.clone();
+    let active_before = active_tool_names.clone();
     let mut previously_active = std::collections::HashSet::new();
     tool_catalog.retain(|tool| {
-        let owned = universe.contains(&tool.name);
+        let owned = universe.contains(&tool.name) || McpPool::is_mcp_tool(&tool.name);
         if owned && active_tool_names.remove(&tool.name) {
             previously_active.insert(tool.name.clone());
         }
@@ -455,7 +545,7 @@ pub(super) fn replace_runtime_mcp_tools(
         }
         tool_catalog.push(tool);
     }
-    tool_catalog.len().abs_diff(before)
+    *tool_catalog != catalog_before || *active_tool_names != active_before
 }
 
 impl Engine {
@@ -600,6 +690,18 @@ impl Engine {
         None
     }
 
+    /// R1: the turn-ending error once the per-turn wall-clock budget is spent.
+    /// Checked wherever the loop is about to authorize a provider request.
+    fn turn_wall_clock_exhausted_error(&self) -> Option<String> {
+        self.turn_wall_clock.exhausted().then(|| {
+            format!(
+                "Per-turn wall-clock budget exhausted after {}s (limit: {}s). The turn was stopped before another model request; work already done is in the transcript. Send another message to continue, or raise `[tui].turn_wall_clock_secs`.",
+                self.turn_wall_clock.spent().as_secs(),
+                self.turn_wall_clock.budget().as_secs(),
+            )
+        })
+    }
+
     /// A connection completed during inference must be discoverable in this
     /// turn, without widening its command policy or making every MCP tool eager.
     pub(super) async fn refresh_boot_mcp_catalog(
@@ -615,23 +717,17 @@ impl Engine {
         let Some(pool) = self.mcp_pool.as_ref() else {
             return;
         };
-        let (mut universe, mut refreshed) = {
+        let (universe, mut refreshed) = {
             let pool = pool.lock().await;
             let refreshed = pool.to_api_tools();
             (pool.model_tool_names(&refreshed), refreshed)
         };
         // A config/authority change during handshake can remove a server;
-        // its previous names must also leave this turn's catalog.
-        universe.extend(
-            catalog
-                .iter()
-                .filter(|tool| McpPool::is_mcp_tool(&tool.name))
-                .map(|tool| tool.name.clone()),
-        );
+        // `replace_runtime_mcp_tools` owns every MCP name already in the
+        // catalog, so its previous names leave this turn's catalog too.
         refreshed
             .retain(|tool| policy.passes_allow_list(&tool.name) && !policy.denies_tool(&tool.name));
-        let before = catalog.clone();
-        replace_runtime_mcp_tools(
+        if replace_runtime_mcp_tools(
             catalog,
             active,
             &universe,
@@ -640,8 +736,7 @@ impl Engine {
             &self.config.tools_always_load,
             self.turn_tool_surface_budget
                 .unwrap_or(crate::model_profile::ToolSurfaceBudget::Standard),
-        );
-        if *catalog != before {
+        ) {
             self.session.pending_prefix_change_reason = Some("mcp-session-boot".to_string());
         }
     }
@@ -997,8 +1092,11 @@ impl Engine {
         // retry after that carries a nudge — attached to one outbound request
         // and dropped, never added to the session. Writing it to the session
         // would put a message the user never sent into the transcript, the
-        // exports, and every later turn's context.
-        let mut reasoning_only_nudge: Option<Message> = None;
+        // exports, and every later turn's context. It is still model-visible,
+        // so the request that carries it also emits a durable internal
+        // status receipt with its exact text (C02-04, "model-visible means
+        // logged"): the runtime event log can reconstruct the request.
+        let mut reasoning_only_nudge: Option<String> = None;
         // Outer stream-retry budget: when the chunked-transfer connection
         // dies mid-stream and either nothing useful was streamed (#103
         // Phase 3), the host slept mid-turn (#2990), or a host hit a
@@ -1034,12 +1132,7 @@ impl Engine {
             // result already produced stays in the transcript. Hitting it is
             // never a clean success — the turn ends `Failed` with the limit
             // named, matching how the step ceiling below reports.
-            if self.turn_wall_clock.exhausted() {
-                let error = format!(
-                    "Per-turn wall-clock budget exhausted after {}s (limit: {}s). The turn was stopped before another model request; work already done is in the transcript. Send another message to continue, or raise `[tui].turn_wall_clock_secs`.",
-                    self.turn_wall_clock.spent().as_secs(),
-                    self.turn_wall_clock.budget().as_secs(),
-                );
+            if let Some(error) = self.turn_wall_clock_exhausted_error() {
                 let _ = self.tx_event.send(Event::status(error.clone())).await;
                 return (TurnOutcomeStatus::Failed, Some(error));
             }
@@ -1418,6 +1511,13 @@ impl Engine {
                     }
                 }
                 self.finish_compaction(&compaction_id);
+                // C02-06: a compaction pass has its own bound, not the
+                // turn's. Recheck the wall clock before it can authorize the
+                // provider request below.
+                if let Some(error) = self.turn_wall_clock_exhausted_error() {
+                    let _ = self.tx_event.send(Event::status(error.clone())).await;
+                    return (TurnOutcomeStatus::Failed, Some(error));
+                }
             }
 
             // The guard measures what the compaction gate measures: the honest
@@ -1728,14 +1828,18 @@ impl Engine {
             let fleet_report_response = fleet_denial_guard
                 .as_ref()
                 .is_some_and(FleetDenialGuard::report_only);
+            // `take` is what keeps this request-scoped: the nudge is spent
+            // here and never reaches `self.session.messages`.
+            let request_nudge = reasoning_only_nudge.take();
             let mut request = prepare_primary_turn_request(PrimaryTurnRequest {
                 model: self.session.model.clone(),
                 messages: {
                     let mut messages = self.messages_with_turn_metadata();
-                    // `take` is what keeps this request-scoped: the nudge is
-                    // spent here and never reaches `self.session.messages`.
-                    if let Some(nudge) = reasoning_only_nudge.take() {
-                        messages.push(nudge);
+                    if let Some(nudge) = request_nudge.as_ref() {
+                        messages.push(self.runtime_text_message_with_turn_metadata(
+                            nudge.clone(),
+                            UserInputProvenance::Runtime,
+                        ));
                     }
                     messages
                 },
@@ -1748,10 +1852,11 @@ impl Engine {
                 system: self.session.system_prompt.clone(),
                 tools: active_tools.clone(),
                 tool_choice: if active_tools.is_some() {
-                    if fleet_report_response {
+                    if fleet_report_response || turn.budget_exhausted_final_report {
                         // Keep the pinned tool prefix; only this request's
                         // choice changes. Admission below also enforces this
-                        // if a provider ignores the report-only request.
+                        // if a provider ignores the report-only request
+                        // (C02-10: the step-budget final report included).
                         Some(json!("none"))
                     } else if strict_tool_mode {
                         Some(json!("required"))
@@ -1820,6 +1925,16 @@ impl Engine {
                     snapshot: tool_request_snapshot,
                 })
                 .await;
+            if let Some(nudge) = request_nudge {
+                // The "Continuing — " prefix classifies the receipt as
+                // internal: durable clients keep it, collapsed.
+                let _ = self
+                    .tx_event
+                    .send(Event::status(format!(
+                        "{REQUEST_NUDGE_RECEIPT_PREFIX}{nudge}"
+                    )))
+                    .await;
+            }
             if let Some(mut route) = turn.pending_route.take() {
                 if let Some(billing) = route.billing.as_mut() {
                     // Freeze the exact provider-live row at CodeWhale's
@@ -2015,6 +2130,11 @@ impl Engine {
                 None,
                 Some(super::turn_heartbeat::PREPARING_PHASE_BOUND),
             );
+            // C02-05: a response whose stream failed — a provider error frame,
+            // a transport error, a stall, or a cap — is not a complete
+            // response. Unless the retry below re-issues the request, nothing
+            // it collected may execute or continue the turn.
+            let response_stream_failed = stream_error.is_some();
             turn_error = turn_error.or(stream_error);
             turn.stop_diagnostics
                 .observe_provider_response(stop_reason.as_deref(), tool_uses.len());
@@ -2115,26 +2235,8 @@ impl Engine {
                     output_limit_truncated = Some(reason.to_string());
                     // Fall through to the normal content/tool dispatch below.
                 } else {
-                    for tool in &tool_uses {
-                        let _ = self
-                            .tx_event
-                            .send(Event::ToolCallStarted {
-                                id: tool.execution_id.clone(),
-                                model_call: Some(tool.model_call()),
-                                name: tool.name.clone(),
-                                input: final_tool_input(tool),
-                            })
-                            .await;
-                        let _ = self
-                            .tx_event
-                            .send(Event::ToolCallComplete {
-                                id: tool.execution_id.clone(),
-                                model_call: Some(tool.model_call()),
-                                name: tool.name.clone(),
-                                result: Ok(incomplete_tool_result(reason)),
-                            })
-                            .await;
-                    }
+                    self.settle_unadmitted_tool_calls(&tool_uses, &incomplete_tool_result(reason))
+                        .await;
                     // Do not emit MessageComplete: hosts must retain the visible
                     // fragment as interrupted/failed rather than recording it as
                     // a completed assistant item.
@@ -2311,6 +2413,16 @@ impl Engine {
             let mut final_text = current_text_visible.clone();
             if tool_uses.is_empty() && tool_parser::has_tool_call_markers(&current_text_raw) {
                 let parsed = tool_parser::parse_tool_calls(&current_text_raw);
+                if parsed.tool_calls.len() > super::streaming::MAX_TOOL_CALLS_PER_RESPONSE {
+                    let envelope = super::streaming::tool_call_limit_error();
+                    let error = envelope.message.clone();
+                    turn.stop_diagnostics.last_response_tool_calls_suppressed =
+                        Some(parsed.tool_calls.len());
+                    let _ = self.send_stream_event(Event::error(envelope)).await;
+                    self.add_interrupted_assistant_text(&current_text_visible)
+                        .await;
+                    return (TurnOutcomeStatus::Failed, Some(error));
+                }
                 final_text = parsed.clean_text;
                 for call in parsed.tool_calls {
                     tool_uses.push(ToolUseState {
@@ -2332,6 +2444,28 @@ impl Engine {
                         .await;
                     return (TurnOutcomeStatus::Failed, Some(error.to_string()));
                 }
+            }
+
+            // C02-05: the one admission authority for a failed stream. Calls
+            // collected before the failure are announced with an explicit
+            // not-executed result and never reach planning, approval or a
+            // handler; the visible text is kept as an interrupted fragment
+            // and no tool_use enters history, so the transcript stays paired.
+            // A retry never gets here: it `continue`d above with this batch
+            // dropped, and the re-issued request streams its own calls.
+            if response_stream_failed && !tool_uses.is_empty() {
+                let error = turn_error
+                    .clone()
+                    .unwrap_or_else(|| "provider stream failed".to_string());
+                self.settle_unadmitted_tool_calls(
+                    &tool_uses,
+                    &stream_failed_tool_result(&summarize_text(&error, 200)),
+                )
+                .await;
+                self.add_interrupted_assistant_text(&current_text_visible)
+                    .await;
+                turn.stop_diagnostics.last_response_tool_calls_suppressed = Some(tool_uses.len());
+                return (TurnOutcomeStatus::Failed, Some(error));
             }
 
             for tool in &tool_uses {
@@ -2482,6 +2616,15 @@ impl Engine {
                     content: content_blocks,
                 })
                 .await;
+            }
+
+            // C02-05: a failed stream that carried no tool call keeps its text
+            // (above) and ends the turn with the stream's error. It never
+            // runs a ```repl fence from the failed text, and never authorizes
+            // another request for an output-limit continuation, a steer, a
+            // sub-agent completion or a goal continuation.
+            if response_stream_failed {
+                break;
             }
 
             // A truncated response with no tool call cannot continue through
@@ -3031,11 +3174,7 @@ impl Engine {
                                 crate::config::DEFAULT_REASONING_ONLY_REPROMPT_MESSAGE.to_string()
                             });
                         if !text.trim().is_empty() {
-                            reasoning_only_nudge =
-                                Some(self.runtime_text_message_with_turn_metadata(
-                                    text,
-                                    UserInputProvenance::Runtime,
-                                ));
+                            reasoning_only_nudge = Some(text);
                         }
                     }
                     let how = if nudged {
@@ -3093,11 +3232,7 @@ impl Engine {
                                         .to_string()
                                 });
                             if !text.trim().is_empty() {
-                                reasoning_only_nudge =
-                                    Some(self.runtime_text_message_with_turn_metadata(
-                                        text,
-                                        UserInputProvenance::Runtime,
-                                    ));
+                                reasoning_only_nudge = Some(text);
                             }
                             "re-requesting the answer with a nudge"
                         }
@@ -3553,6 +3688,18 @@ impl Engine {
                 && let Some(guard) = fleet_denial_guard
             {
                 blocked_error = guard.admission_error(&tool_name, &tool_input);
+            }
+
+            // C02-10: the response granted after the step budget ran out is
+            // report-only. A provider that ignores `tool_choice: none` still
+            // gets no execution; the next loop pass ends the turn at the
+            // exhausted budget.
+            if blocked_error.is_none() && turn.budget_exhausted_final_report {
+                blocked_error = Some(ToolError::permission_denied(format!(
+                    "Model-step budget exhausted (limit: {}, {}): this is the final report response, so no tool may execute. Report what you did, what you found, what remains, and the evidence.",
+                    turn.max_steps,
+                    turn.budget_source.key_label(),
+                )));
             }
 
             if blocked_error.is_none()
@@ -4541,66 +4688,6 @@ impl Engine {
                         continue;
                     }
 
-                    if tool_name == MULTI_TOOL_PARALLEL_NAME {
-                        let started_at = Instant::now();
-                        let cancel_token = self.cancel_token.clone();
-                        let (terminal, content_blocks) = tokio::select! {
-                            biased;
-                            () = cancel_token.cancelled() => {
-                                (
-                                    ToolExecutionOutcome::cancelled(interrupted_active_tool_result()),
-                                    Vec::new(),
-                                )
-                            },
-                            result = self.execute_parallel_tool(
-                                tool_input.clone(),
-                                tool_registry,
-                                tool_exec_lock.clone(),
-                                tool_context_for_call(batch_tool_context.clone(), &tool_id),
-                            ) => match result {
-                                Ok(rich) => {
-                                    let rich = super::tool_media::project(rich, &self.session.id, &tool_id, &tool_name).await;
-                                    (ToolExecutionOutcome::from_legacy(Ok(rich.result)), rich.content_blocks)
-                                },
-                                Err(err) => (
-                                    ToolExecutionOutcome::from_legacy(Err(err)),
-                                    Vec::new(),
-                                ),
-                            },
-                        };
-                        let terminal = if terminal.status == ToolTerminalStatus::Cancelled {
-                            ToolExecutionOutcome::cancelled(
-                                self.cancelled_active_tool_result(&tool_id, origin_turn_id),
-                            )
-                        } else {
-                            terminal
-                        };
-                        let result = terminal.legacy_result();
-
-                        let _ = self
-                            .tx_event
-                            .send(Event::ToolCallComplete {
-                                model_call: plan.model_call.clone(),
-                                id: tool_id.clone(),
-                                name: tool_name.clone(),
-                                result: result.clone(),
-                            })
-                            .await;
-
-                        outcomes[plan.index] = Some(ToolExecOutcome {
-                            model_call: plan.model_call.clone(),
-                            index: plan.index,
-                            id: tool_id,
-                            name: tool_name,
-                            input: tool_input,
-                            started_at,
-                            terminal,
-                            content_blocks,
-                            original_content_digest: None,
-                        });
-                        continue;
-                    }
-
                     if is_tool_search_tool(&tool_name) {
                         let started_at = Instant::now();
                         // Tool-search activation changes the request-visible
@@ -5533,7 +5620,7 @@ impl Engine {
                             self.current_mode,
                             &self.config.tools_always_load,
                             surface_budget,
-                        ) > 0;
+                        );
                     }
                     // Any of the legitimate mid-turn tool-surface changes above
                     // re-pin the header under a declared `change:tool_surface`
@@ -5802,7 +5889,7 @@ impl Engine {
                             // of ending "Completed" over a frozen block.
                             stream_errors = stream_errors.saturating_add(1);
                             stream_error.get_or_insert(envelope.message.clone());
-                            let _ = self.tx_event.send(Event::error(envelope)).await;
+                            let _ = self.send_stream_event(Event::error(envelope)).await;
                             None
                         }
                     }
@@ -5819,8 +5906,7 @@ impl Engine {
                 let preview = summarize_text(pending.content.trim(), 120);
                 pending_steers.push(pending);
                 let _ = self
-                    .tx_event
-                    .send(Event::status(format!("Steer input queued: {preview}")))
+                    .send_stream_event(Event::status(format!("Steer input queued: {preview}")))
                     .await;
             }
 
@@ -5836,19 +5922,7 @@ impl Engine {
                 .into_envelope();
                 crate::logging::warn(&envelope.message);
                 stream_error.get_or_insert(envelope.message.clone());
-                let _ = self.tx_event.send(Event::error(envelope)).await;
-                break;
-            }
-
-            // Guard: max accumulated content bytes
-            if stream_content_bytes > max_content_bytes {
-                let envelope = StreamError::Overflow {
-                    limit_bytes: max_content_bytes,
-                }
-                .into_envelope();
-                crate::logging::warn(&envelope.message);
-                stream_error.get_or_insert(envelope.message.clone());
-                let _ = self.tx_event.send(Event::error(envelope)).await;
+                let _ = self.send_stream_event(Event::error(envelope)).await;
                 break;
             }
 
@@ -5894,6 +5968,15 @@ impl Engine {
                             "Stream error after suspected system sleep ({:?} monotonic vs {:?} wall since last chunk); scheduling request retry: {message}",
                             last_progress_mono.elapsed(),
                             wall_elapsed,
+                        ));
+                        // Like the network-drop resumes below, keep the real
+                        // error as the prospective outcome: the retry clears
+                        // it, and an exhausted resume budget then fails the
+                        // turn with it instead of admitting the partial
+                        // response as if it had completed.
+                        stream_error.get_or_insert(stream_read_error_user_message(
+                            &message,
+                            any_content_received,
                         ));
                         pending_resume = Some(StreamResume::AfterSleep);
                         break;
@@ -5943,8 +6026,7 @@ impl Engine {
                                 ));
                                 stream_error.get_or_insert(retry_msg.clone());
                                 let _ = self
-                                    .tx_event
-                                    .send(Event::error(
+                                    .send_stream_event(Event::error(
                                         crate::error_taxonomy::envelope_for_llm_error(
                                             retry_err, retry_msg,
                                         ),
@@ -6032,13 +6114,46 @@ impl Engine {
                     // card. Recoverable classes (rate limit, network) keep
                     // the bounded retry tail.
                     let terminal = !envelope.recoverable;
-                    let _ = self.tx_event.send(Event::error(envelope)).await;
+                    let _ = self.send_stream_event(Event::error(envelope)).await;
                     if terminal || stream_errors >= retry_limits.max_errors {
                         break;
                     }
                     continue;
                 }
             };
+
+            // Guard: max accumulated content bytes (C02-13). Counted per
+            // event and checked before the event is applied, so the delta
+            // that crosses the cap is never forwarded or accumulated — even
+            // when it is the stream's last — and tool-argument JSON counts
+            // like text and reasoning.
+            stream_content_bytes =
+                stream_content_bytes.saturating_add(stream_event_content_bytes(&event));
+            if stream_content_bytes > max_content_bytes {
+                let envelope = StreamError::Overflow {
+                    limit_bytes: max_content_bytes,
+                }
+                .into_envelope();
+                crate::logging::warn(&envelope.message);
+                stream_error.get_or_insert(envelope.message.clone());
+                let _ = self.send_stream_event(Event::error(envelope)).await;
+                break;
+            }
+
+            if matches!(
+                &event,
+                StreamEvent::ContentBlockStart {
+                    content_block: ContentBlockStart::ToolUse { .. }
+                        | ContentBlockStart::ServerToolUse { .. },
+                    ..
+                }
+            ) && tool_uses.len() >= super::streaming::MAX_TOOL_CALLS_PER_RESPONSE
+            {
+                let envelope = super::streaming::tool_call_limit_error();
+                stream_error.get_or_insert(envelope.message.clone());
+                let _ = self.send_stream_event(Event::error(envelope)).await;
+                break;
+            }
 
             match event {
                 StreamEvent::ToolProjectionWarning {
@@ -6047,8 +6162,7 @@ impl Engine {
                     omitted_tool_count,
                 } => {
                     let _ = self
-                        .tx_event
-                        .send(Event::ToolProjectionWarning {
+                        .send_stream_event(Event::ToolProjectionWarning {
                             provider,
                             omitted_tool_names,
                             omitted_tool_count,
@@ -6078,15 +6192,16 @@ impl Engine {
                             && filtered.len() < current_text_raw.len()
                             && contains_fake_tool_wrapper(&current_text_raw)
                         {
-                            let _ = self.tx_event.send(Event::status(FAKE_WRAPPER_NOTICE)).await;
+                            let _ = self
+                                .send_stream_event(Event::status(FAKE_WRAPPER_NOTICE))
+                                .await;
                             fake_wrapper_notice_emitted = true;
                         }
                         current_text_visible.push_str(&filtered);
                         current_block_kind = Some(ContentBlockKind::Text);
                         last_text_index = Some(index as usize);
                         let _ = self
-                            .tx_event
-                            .send(Event::MessageStarted {
+                            .send_stream_event(Event::MessageStarted {
                                 index: index as usize,
                             })
                             .await;
@@ -6097,8 +6212,7 @@ impl Engine {
                         current_thinking_state = None;
                         current_block_kind = Some(ContentBlockKind::Thinking);
                         let _ = self
-                            .tx_event
-                            .send(Event::ThinkingStarted {
+                            .send_stream_event(Event::ThinkingStarted {
                                 index: index as usize,
                             })
                             .await;
@@ -6150,7 +6264,6 @@ impl Engine {
                 },
                 StreamEvent::ContentBlockDelta { index, delta } => match delta {
                     Delta::TextDelta { text } => {
-                        stream_content_bytes = stream_content_bytes.saturating_add(text.len());
                         current_text_raw.push_str(&text);
                         let filtered =
                             filter_tool_call_delta_with_state(&text, &mut tool_call_filter);
@@ -6158,14 +6271,15 @@ impl Engine {
                             && filtered.len() < text.len()
                             && contains_fake_tool_wrapper(&current_text_raw)
                         {
-                            let _ = self.tx_event.send(Event::status(FAKE_WRAPPER_NOTICE)).await;
+                            let _ = self
+                                .send_stream_event(Event::status(FAKE_WRAPPER_NOTICE))
+                                .await;
                             fake_wrapper_notice_emitted = true;
                         }
                         if !filtered.is_empty() {
                             current_text_visible.push_str(&filtered);
                             let _ = self
-                                .tx_event
-                                .send(Event::MessageDelta {
+                                .send_stream_event(Event::MessageDelta {
                                     index: index as usize,
                                     content: filtered,
                                 })
@@ -6173,12 +6287,10 @@ impl Engine {
                         }
                     }
                     Delta::ThinkingDelta { thinking } => {
-                        stream_content_bytes = stream_content_bytes.saturating_add(thinking.len());
                         current_thinking.push_str(&thinking);
                         if !thinking.is_empty() {
                             let _ = self
-                                .tx_event
-                                .send(Event::ThinkingDelta {
+                                .send_stream_event(Event::ThinkingDelta {
                                     index: index as usize,
                                     content: thinking,
                                 })
@@ -6229,8 +6341,7 @@ impl Engine {
                             if !flushed.is_empty() {
                                 current_text_visible.push_str(&flushed);
                                 let _ = self
-                                    .tx_event
-                                    .send(Event::MessageDelta {
+                                    .send_stream_event(Event::MessageDelta {
                                         index: index as usize,
                                         content: flushed,
                                     })
@@ -6241,8 +6352,7 @@ impl Engine {
                         }
                         Some(ContentBlockKind::Thinking) => {
                             let _ = self
-                                .tx_event
-                                .send(Event::ThinkingComplete {
+                                .send_stream_event(Event::ThinkingComplete {
                                     index: index as usize,
                                 })
                                 .await;
@@ -6297,7 +6407,7 @@ impl Engine {
                         .unwrap_or("provider stream error");
                     let envelope = ErrorEnvelope::classify(message.to_string(), true);
                     crate::logging::warn(format!("Provider stream error event: {message}"));
-                    let _ = self.tx_event.send(Event::error(envelope)).await;
+                    let _ = self.send_stream_event(Event::error(envelope)).await;
                     stream_error.get_or_insert(message.to_string());
                     break;
                 }
@@ -6338,6 +6448,32 @@ impl Engine {
         }
     }
 
+    /// Announce every call of a response that will not be admitted, each
+    /// paired with its not-executed `result`, so a host never shows a started
+    /// call without a completion. Nothing here plans, approves or executes.
+    async fn settle_unadmitted_tool_calls(&self, tool_uses: &[ToolUseState], result: &ToolResult) {
+        for tool in tool_uses {
+            let _ = self
+                .tx_event
+                .send(Event::ToolCallStarted {
+                    id: tool.execution_id.clone(),
+                    model_call: Some(tool.model_call()),
+                    name: tool.name.clone(),
+                    input: final_tool_input(tool),
+                })
+                .await;
+            let _ = self
+                .tx_event
+                .send(Event::ToolCallComplete {
+                    id: tool.execution_id.clone(),
+                    model_call: Some(tool.model_call()),
+                    name: tool.name.clone(),
+                    result: Ok(result.clone()),
+                })
+                .await;
+        }
+    }
+
     /// Finalize one streamed tool call's input from its accumulated buffer.
     ///
     /// The parse that lands here must be structurally intact: a value that
@@ -6375,8 +6511,7 @@ impl Engine {
         tool_state.input_parse_error = Some(error);
         tool_state.input = malformed_tool_arguments_input(&tool_state.input_buffer);
         let _ = self
-            .tx_event
-            .send(Event::status(format!(
+            .send_stream_event(Event::status(format!(
                 "⚠ Tool '{}' received malformed arguments from model",
                 tool_state.name
             )))
@@ -7448,6 +7583,37 @@ fn stream_event_has_actionable_content(event: &StreamEvent) -> bool {
     }
 }
 
+/// Bytes an event adds to the response the engine accumulates: text,
+/// reasoning, tool calls (id, name and argument JSON, whether the arguments
+/// arrive whole in the block start or as `InputJsonDelta`s) and replay
+/// signatures. Opaque reasoning state is provider-owned and not counted.
+fn stream_event_content_bytes(event: &StreamEvent) -> usize {
+    fn initial_input_bytes(input: &Value) -> usize {
+        let empty = input.is_null() || input.as_object().is_some_and(serde_json::Map::is_empty);
+        if empty { 0 } else { input.to_string().len() }
+    }
+    match event {
+        StreamEvent::ContentBlockStart { content_block, .. } => match content_block {
+            ContentBlockStart::Text { text } => text.len(),
+            ContentBlockStart::Thinking { thinking } => thinking.len(),
+            ContentBlockStart::ToolUse {
+                id, name, input, ..
+            }
+            | ContentBlockStart::ServerToolUse { id, name, input } => {
+                id.len() + name.len() + initial_input_bytes(input)
+            }
+        },
+        StreamEvent::ContentBlockDelta { delta, .. } => match delta {
+            Delta::TextDelta { text } => text.len(),
+            Delta::ThinkingDelta { thinking } => thinking.len(),
+            Delta::InputJsonDelta { partial_json } => partial_json.len(),
+            Delta::SignatureDelta { signature } => signature.len(),
+            Delta::ReasoningStateDelta { .. } => 0,
+        },
+        _ => 0,
+    }
+}
+
 /// Sentinel reasoning-effort value meaning "let the auto-reasoning system
 /// decide" (#4158).
 pub(super) const REASONING_EFFORT_AUTO: &str = "auto";
@@ -7500,6 +7666,350 @@ mod tests {
     use std::path::PathBuf;
     use std::time::Duration;
     use tempfile::tempdir;
+
+    fn stream_backpressure_fixture(
+        workspace: &std::path::Path,
+        capacity: usize,
+    ) -> (
+        Engine,
+        Arc<crate::llm_client::mock::MockLlmClient>,
+        mpsc::Receiver<Event>,
+    ) {
+        let model = Arc::new(crate::llm_client::mock::MockLlmClient::new(Vec::new()));
+        let (mut engine, _handle) = Engine::new_with_model_client(
+            EngineConfig {
+                workspace: workspace.into(),
+                snapshots_enabled: false,
+                subagents_enabled: false,
+                terminal_chrome_enabled: false,
+                ..Default::default()
+            },
+            &Config::default(),
+            model.clone(),
+        );
+        let (tx, rx) = mpsc::channel(capacity);
+        engine.tx_event = tx;
+        (engine, model, rx)
+    }
+
+    fn stream_backpressure_request() -> codewhale_models::MessageRequest {
+        prepare_primary_turn_request(PrimaryTurnRequest {
+            model: "mock-model".into(),
+            messages: Vec::new(),
+            max_tokens: 128,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            reasoning_effort: None,
+        })
+    }
+
+    /// Hold the actual stream decoder in a full host queue, then cancel
+    /// without draining that queue. The provider suffix must never be polled.
+    #[tokio::test]
+    async fn stream_backpressure_cancellation_releases_every_observation_kind() {
+        use crate::llm_client::mock::canned;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        struct StreamDrop(Arc<AtomicBool>);
+        impl Drop for StreamDrop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let thinking_start = StreamEvent::ContentBlockStart {
+            index: 0,
+            content_block: ContentBlockStart::Thinking {
+                thinking: String::new(),
+            },
+        };
+        let cases = [
+            ("text start", vec![canned::text_block_start(0)], 0),
+            ("text delta", vec![canned::text_delta(0, "partial")], 0),
+            ("thinking start", vec![thinking_start.clone()], 0),
+            (
+                "thinking delta",
+                vec![canned::thinking_delta(0, "partial")],
+                0,
+            ),
+            (
+                "thinking stop",
+                vec![thinking_start, canned::block_stop(0)],
+                1,
+            ),
+            (
+                "projection warning",
+                vec![StreamEvent::ToolProjectionWarning {
+                    provider: "mock".into(),
+                    omitted_tool_names: vec!["omitted".into()],
+                    omitted_tool_count: 1,
+                }],
+                0,
+            ),
+            (
+                "provider error",
+                vec![StreamEvent::Error {
+                    error: json!({"message": "invalid provider request"}),
+                }],
+                0,
+            ),
+            (
+                "malformed tool arguments",
+                vec![
+                    canned::tool_use_block_start(0, "call_1", "read_file"),
+                    canned::tool_input_delta(0, "not-json"),
+                    canned::block_stop(0),
+                ],
+                0,
+            ),
+        ];
+
+        for (label, events, observations_before_block) in cases {
+            let tmp = tempdir().expect("tempdir");
+            let (mut engine, model, mut rx) =
+                stream_backpressure_fixture(tmp.path(), observations_before_block + 1);
+            engine
+                .tx_event
+                .send(Event::status("queue already occupied"))
+                .await
+                .unwrap();
+            let cancel = engine.cancel_token.clone();
+            let mut start = canned::message_start("backpressure");
+            if let StreamEvent::MessageStart { message } = &mut start {
+                message.usage.input_tokens = 17;
+            }
+            let expected_polls = events.len() + 1;
+            let polls = Arc::new(AtomicUsize::new(0));
+            let counted = Arc::clone(&polls);
+            let dropped = Arc::new(AtomicBool::new(false));
+            let drop_probe = StreamDrop(Arc::clone(&dropped));
+            let stream = futures_util::stream::iter(
+                std::iter::once(start)
+                    .chain(events)
+                    .chain(std::iter::once(canned::text_delta(0, "UNREAD-SUFFIX")))
+                    .map(Ok),
+            )
+            .inspect(move |_| {
+                let _ = &drop_probe;
+                counted.fetch_add(1, Ordering::SeqCst);
+            });
+            let request = stream_backpressure_request();
+            let mut diagnostics = crate::tool_inspection::TurnStopDiagnostics::default();
+            let mut process = Box::pin(engine.process_stream(
+                model.as_ref(),
+                Box::pin(stream),
+                &request,
+                Instant::now(),
+                0,
+                &mut diagnostics,
+            ));
+            assert!(
+                tokio::time::timeout(Duration::from_millis(25), &mut process)
+                    .await
+                    .is_err(),
+                "{label}: a live turn must wait for capacity"
+            );
+            assert_eq!(polls.load(Ordering::SeqCst), expected_polls, "{label}");
+            assert!(
+                !dropped.load(Ordering::SeqCst),
+                "{label}: stream is in flight"
+            );
+            cancel.cancel();
+            let outcome = tokio::time::timeout(Duration::from_secs(1), &mut process)
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("{label}: cancellation must release a full event queue")
+                });
+            drop(process);
+            assert!(
+                dropped.load(Ordering::SeqCst),
+                "{label}: provider stream released"
+            );
+            assert_eq!(
+                polls.load(Ordering::SeqCst),
+                expected_polls,
+                "{label}: suffix unread"
+            );
+            assert_eq!(
+                outcome.usage.input_tokens, 17,
+                "{label}: billed usage retained"
+            );
+            assert!(
+                outcome.pending_resume.is_none(),
+                "{label}: cancellation cannot retry"
+            );
+            assert_eq!(model.call_count(), 0, "{label}: no provider retry");
+            assert_eq!(
+                rx.len(),
+                observations_before_block + 1,
+                "{label}: no drain was needed"
+            );
+            while let Ok(event) = rx.try_recv() {
+                assert!(
+                    !matches!(event, Event::MessageDelta { content, .. } if content == "UNREAD-SUFFIX")
+                );
+            }
+            if label == "malformed tool arguments" {
+                assert!(outcome.tool_uses[0].input_parse_error.is_some());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_backpressure_live_delivery_preserves_order_and_usage() {
+        use crate::llm_client::mock::canned;
+
+        let tmp = tempdir().expect("tempdir");
+        let (mut engine, model, mut rx) = stream_backpressure_fixture(tmp.path(), 1);
+        engine
+            .tx_event
+            .send(Event::status("occupied"))
+            .await
+            .unwrap();
+        let stream = futures_util::stream::iter([
+            Ok(canned::text_delta(0, "first")),
+            Ok(canned::text_delta(0, "second")),
+            Ok(canned::message_delta(
+                "end_turn",
+                Some(Usage {
+                    output_tokens: 9,
+                    ..Default::default()
+                }),
+            )),
+        ]);
+        let request = stream_backpressure_request();
+        let mut diagnostics = crate::tool_inspection::TurnStopDiagnostics::default();
+        let mut process = Box::pin(engine.process_stream(
+            model.as_ref(),
+            Box::pin(stream),
+            &request,
+            Instant::now(),
+            0,
+            &mut diagnostics,
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), &mut process)
+                .await
+                .is_err()
+        );
+        assert!(matches!(rx.recv().await, Some(Event::Status { .. })));
+        let drain = async {
+            let first = rx.recv().await.expect("first delta");
+            let second = rx.recv().await.expect("second delta");
+            [first, second]
+        };
+        let (outcome, events) = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(&mut process, drain)
+        })
+        .await
+        .expect("draining the queue must resume lossless delivery");
+        assert!(matches!(&events[0], Event::MessageDelta { content, .. } if content == "first"));
+        assert!(matches!(&events[1], Event::MessageDelta { content, .. } if content == "second"));
+        assert_eq!(outcome.current_text_visible, "firstsecond");
+        assert_eq!(outcome.usage.output_tokens, 9);
+        assert_eq!(outcome.stop_reason.as_deref(), Some("end_turn"));
+    }
+
+    #[tokio::test]
+    async fn stream_response_tool_limit_bounds_empty_native_and_server_calls() {
+        use crate::llm_client::mock::canned;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        for server_tool in [false, true] {
+            for count in [
+                super::super::streaming::MAX_TOOL_CALLS_PER_RESPONSE,
+                super::super::streaming::MAX_TOOL_CALLS_PER_RESPONSE + 1,
+            ] {
+                let tmp = tempdir().expect("tempdir");
+                let (mut engine, model, mut rx) = stream_backpressure_fixture(tmp.path(), 4);
+                let events = (0..count).map(move |index| StreamEvent::ContentBlockStart {
+                    index: u32::try_from(index).unwrap(),
+                    content_block: if server_tool {
+                        ContentBlockStart::ServerToolUse {
+                            id: format!("call_{index}"),
+                            name: "web_search".into(),
+                            input: json!({}),
+                        }
+                    } else {
+                        ContentBlockStart::ToolUse {
+                            id: format!("call_{index}"),
+                            name: "read_file".into(),
+                            input: json!({}),
+                            caller: None,
+                            thought_signature: None,
+                        }
+                    },
+                });
+                let polls = Arc::new(AtomicUsize::new(0));
+                let counted = Arc::clone(&polls);
+                let stream = futures_util::stream::iter(
+                    events
+                        .chain(std::iter::once(canned::text_delta(
+                            0,
+                            "SUFFIX-AFTER-TOOL-BATCH",
+                        )))
+                        .map(Ok),
+                )
+                .inspect(move |_| {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                });
+                let request = stream_backpressure_request();
+                let mut diagnostics = crate::tool_inspection::TurnStopDiagnostics::default();
+                let outcome = tokio::time::timeout(
+                    Duration::from_secs(1),
+                    engine.process_stream(
+                        model.as_ref(),
+                        Box::pin(stream),
+                        &request,
+                        Instant::now(),
+                        0,
+                        &mut diagnostics,
+                    ),
+                )
+                .await
+                .expect("empty tool starts must be bounded");
+                assert_eq!(
+                    outcome.tool_uses.len(),
+                    super::super::streaming::MAX_TOOL_CALLS_PER_RESPONSE
+                );
+                if count > super::super::streaming::MAX_TOOL_CALLS_PER_RESPONSE {
+                    assert!(
+                        outcome
+                            .stream_error
+                            .as_deref()
+                            .is_some_and(|error| error.contains("256 tool calls"))
+                    );
+                    assert_eq!(
+                        polls.load(Ordering::SeqCst),
+                        count,
+                        "overflow stops before the suffix"
+                    );
+                    assert!(
+                        matches!(rx.try_recv(), Ok(Event::Error { envelope, .. }) if envelope.code == "response_tool_call_limit" && !envelope.recoverable)
+                    );
+                    assert!(outcome.current_text_raw.is_empty());
+                } else {
+                    assert!(
+                        outcome.stream_error.is_none(),
+                        "exactly256 calls remain valid"
+                    );
+                    assert_eq!(polls.load(Ordering::SeqCst), count + 1);
+                }
+                while let Ok(event) = rx.try_recv() {
+                    assert!(
+                        !matches!(event, Event::ToolCallStarted { .. }),
+                        "decoding cannot observe/execute a rejected batch"
+                    );
+                }
+                assert_eq!(
+                    model.call_count(),
+                    0,
+                    "tool cardinality overflow cannot retry"
+                );
+            }
+        }
+    }
 
     #[tokio::test]
     async fn rlm_tool_context_inherits_the_spent_parent_clock() {

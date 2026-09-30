@@ -445,6 +445,15 @@ export function getComputerUse(locale: string): ComputerUseDict {
   return COMPUTER_USE[locale] ?? enComputerUse;
 }
 
+/**
+ * Locales whose /computer-use page body is translated (the page renders only
+ * from this dictionary). The content-locale registry derives canonical,
+ * hreflang and sitemap coverage from it, so they cannot drift apart.
+ */
+export function hasComputerUseTranslation(locale: string): boolean {
+  return locale === "en" || Object.hasOwn(COMPUTER_USE, locale);
+}
+
 export function getStates(locale: string): StatesDict {
   return STATES[locale] ?? enStates;
 }

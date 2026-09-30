@@ -113,6 +113,19 @@
       "discovery": "models_endpoint",
       "docs_url": "https://tsubasa.sh/docs",
       "guidance": "OpenAI-compatible host (Chat Completions + GET /v1/models only). Public model ids: tsubasa-pro and tsubasa-fast, both with a 32,768-token context, so set context_window = 32768 on [providers.tsubasa]. Store TSUBASA_API_KEY, not a raw key."
+    },
+    {
+      "id": "yolo-auto",
+      "label": "Yolo-Auto",
+      "wire": "openai-compatible",
+      "base_url": "https://yolo-auto.com/v1",
+      "api_key_env": "YOLO_AUTO_API_KEY",
+      "default_model": "qwen3.8-flash",
+      "discovery": "models_endpoint",
+      "docs_url": "https://yolo-auto.com/docs",
+      "aliases": [
+        "yolo"
+      ]
     }
   ]
 }

@@ -10,6 +10,26 @@ Skills 是可复用的 `SKILL.md` 指令包。Codewhale 从多个根目录发现
 关于 Claude Code 插件边界，参见 [CLAUDE_PLUGIN_COMPAT.md](../CLAUDE_PLUGIN_COMPAT.md)。
 关于 `skills_dir` 和 `[skills]` 配置键，参见 [CONFIGURATION.md](CONFIGURATION.md)。
 
+同一范围内，`.codewhale/skills` 的同名技能优先于兼容目录。项目目录顺序为
+`.codewhale`、`.agents`、`.claude`、`.opencode`、`.cursor`，最后才是显式启用的
+`skills` 目录；全局顺序为 `.codewhale`、`.agents`、`.claude`、`.deepseek`。
+项目范围优先于全局范围。覆盖警告同时显示两个副本的路径。
+
+项目顶层 `skills/` 默认只出现在兼容审计中；设置 `[skills] flat_workspace_root = true`
+或显式配置 `skills_dir` 后才参与加载。项目目录仍须通过工作区信任检查。
+
+前置元数据的嵌套字段保留层级，例如 `metadata.name` 不会覆盖顶层 `name`。
+运行时和安装器共用验证器：运行时对缺少描述或只有 Markdown 标题的文件给出警告，
+安装则要求完整的前置元数据、非空描述和安全的目录名称。名称与所在目录不一致时会警告。
+`license`、`compatibility`、`metadata`、本地化描述与 `x-*` 字段无需警告；
+未知字段及不支持的工具权限、模型选择、独立执行上下文会明确警告。
+
+`disable-model-invocation: true` 只允许用户显式调用；`user-invocable: false` 隐藏用户菜单入口
+并拒绝用户调用，仍允许模型选择。两者同时设置时，两种调用均被禁用。
+支持 `true/false`、`yes/no`、`on/off`、`1/0`；无效布尔值按拒绝调用处理。
+`argument-hint` 显示在用户菜单描述旁；`when_to_use` 以 `Use when:` 加入路由描述。
+这些字段不授予工具、审批或插件信任权限。
+
 ## 架构（四层）
 
 | 层 | 角色 |
@@ -238,6 +258,8 @@ skills_dir = "/path/to/skills"
 # 为 true 时，运行时发现会跳过跨工具根目录（.claude、.agents 等）。
 # 拥有方 Codewhale 根目录与显式 skills_dir 覆盖项仍然生效。
 scan_codewhale_only = false
+# 仅在明确需要把项目顶层 skills/ 当作技能目录时启用。
+flat_workspace_root = false
 
 # 由 --remote、sync 和 install 使用的可选 registry / 安装大小覆盖项。
 # registry_url = "https://…"

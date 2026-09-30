@@ -23,9 +23,19 @@
 //! supposed to be invisible. If a future feature ever needs per-engine
 //! retry surfaces, swap this for an `Arc<RwLock<...>>` carried on the
 //! `EngineHandle`; the public API stays the same.
+//!
+//! The `Retry-After` pause is process-wide too, but keyed by provider scope:
+//! every request to the rate-limited route waits it out, and requests to any
+//! other route (another provider, a local runtime) do not.
 
+use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
+
+/// Rate-limit pause deadlines, one per provider scope (see
+/// [`note_rate_limit`]). A 429 from one provider must not stall requests to
+/// another provider, a local runtime, or a sub-agent on a different route.
+type RateLimitPauses = HashMap<String, Instant>;
 
 /// One in-flight retry attempt. `deadline` is the wall-clock time the
 /// next request will fire — the UI subtracts `Instant::now()` from it
@@ -97,10 +107,10 @@ fn with_state<R>(f: impl FnOnce(&mut RetryState) -> R) -> R {
 }
 
 #[cfg(not(any(test, all(feature = "test-thread-scoped-state", debug_assertions))))]
-fn with_rate_limit<R>(f: impl FnOnce(&mut Option<Instant>) -> R) -> R {
-    static STATE: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
+fn with_rate_limit<R>(f: impl FnOnce(&mut RateLimitPauses) -> R) -> R {
+    static STATE: OnceLock<Mutex<RateLimitPauses>> = OnceLock::new();
     let mut state = STATE
-        .get_or_init(|| Mutex::new(None))
+        .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
         .unwrap_or_else(|error| error.into_inner());
     f(&mut state)
@@ -140,13 +150,11 @@ fn with_state<R>(f: impl FnOnce(&mut RetryState) -> R) -> R {
 }
 
 #[cfg(any(test, all(feature = "test-thread-scoped-state", debug_assertions)))]
-fn with_rate_limit<R>(f: impl FnOnce(&mut Option<Instant>) -> R) -> R {
-    #[allow(clippy::type_complexity)]
-    static STATE: OnceLock<
-        Mutex<std::collections::HashMap<std::thread::ThreadId, Option<Instant>>>,
-    > = OnceLock::new();
+fn with_rate_limit<R>(f: impl FnOnce(&mut RateLimitPauses) -> R) -> R {
+    static STATE: OnceLock<Mutex<HashMap<std::thread::ThreadId, RateLimitPauses>>> =
+        OnceLock::new();
     let mut by_thread = STATE
-        .get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+        .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
         .unwrap_or_else(|error| error.into_inner());
     f(by_thread.entry(std::thread::current().id()).or_default())
@@ -160,26 +168,32 @@ pub fn snapshot() -> RetryState {
     with_state(|state| state.clone())
 }
 
-/// Extend the provider-wide rate-limit pause window. This is separate from
-/// the footer banner so one successful concurrent request cannot clear another
-/// request's active `Retry-After` window.
-pub fn note_rate_limit(delay: Duration) {
-    let deadline = Instant::now() + delay;
-    with_rate_limit(|current| {
-        if current.is_none_or(|existing| existing < deadline) {
-            *current = Some(deadline);
+/// Extend the rate-limit pause window for one provider `scope` (the caller's
+/// route identity and host). This is separate from the footer banner so one
+/// successful concurrent request cannot clear another request's active
+/// `Retry-After` window, and it is keyed so a 429 from one provider never
+/// pauses requests to another. Expired scopes are dropped here, so the map
+/// holds at most the providers currently rate limited.
+pub fn note_rate_limit(scope: &str, delay: Duration) {
+    let now = Instant::now();
+    let deadline = now + delay;
+    with_rate_limit(|pauses| {
+        pauses.retain(|_, existing| *existing > now);
+        let current = pauses.entry(scope.to_string()).or_insert(deadline);
+        if *current < deadline {
+            *current = deadline;
         }
     });
 }
 
-/// Remaining provider-wide rate-limit pause, if any.
+/// Remaining rate-limit pause for `scope`, if any.
 #[must_use]
-pub fn rate_limit_remaining() -> Option<Duration> {
+pub fn rate_limit_remaining(scope: &str) -> Option<Duration> {
     let now = Instant::now();
-    with_rate_limit(|current| match *current {
+    with_rate_limit(|pauses| match pauses.get(scope).copied() {
         Some(deadline) if deadline > now => Some(deadline.duration_since(now)),
         Some(_) => {
-            *current = None;
+            pauses.remove(scope);
             None
         }
         None => None,
@@ -220,9 +234,10 @@ pub fn clear() {
     with_state(|state| *state = RetryState::Idle);
 }
 
+/// Drop every scope's rate-limit pause.
 #[cfg(any(test, feature = "test-support"))]
 pub fn clear_rate_limit() {
-    with_rate_limit(|current| *current = None);
+    with_rate_limit(HashMap::clear);
 }
 
 /// Test helper: serialize tests that touch the global state so cargo's
@@ -300,13 +315,29 @@ mod tests {
     #[test]
     fn rate_limit_deadline_survives_banner_clear() {
         let _g = setup();
-        note_rate_limit(Duration::from_secs(5));
+        note_rate_limit("provider-a", Duration::from_secs(5));
         start(1, Duration::from_secs(5), "rate limited");
         succeeded();
         assert!(
-            rate_limit_remaining().is_some(),
-            "provider-wide rate limit pause must not be cleared by an unrelated success"
+            rate_limit_remaining("provider-a").is_some(),
+            "provider rate limit pause must not be cleared by an unrelated success"
         );
         clear_rate_limit();
+    }
+
+    #[test]
+    fn one_providers_rate_limit_does_not_pause_another() {
+        let _g = setup();
+        note_rate_limit("provider-a@api.a.example", Duration::from_secs(30));
+        assert!(rate_limit_remaining("provider-a@api.a.example").is_some());
+        assert_eq!(rate_limit_remaining("ollama@127.0.0.1:11434"), None);
+
+        // A shorter Retry-After never shortens an existing window.
+        note_rate_limit("provider-a@api.a.example", Duration::from_secs(1));
+        assert!(
+            rate_limit_remaining("provider-a@api.a.example").unwrap() > Duration::from_secs(20)
+        );
+        clear_rate_limit();
+        assert_eq!(rate_limit_remaining("provider-a@api.a.example"), None);
     }
 }

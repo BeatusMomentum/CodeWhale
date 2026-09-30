@@ -293,7 +293,32 @@ fi
 
 stage=""
 stage_dir=""
-trap 'rm -rf "$tmpdir"; if [ -n "$stage" ]; then rm -f "$stage"; fi; if [ -n "$stage_dir" ]; then rmdir "$stage_dir"; fi' EXIT INT TERM
+# Commands this run published. If a later publication fails they are removed
+# again, but only while each is still the exact file this run wrote, so a
+# failed install leaves no half-installed pair and never touches a file that
+# was already installed.
+published_codewhale=""
+published_codew=""
+rollback_published() {
+  if [ -n "$published_codewhale" ] && [ ! -L "$published_codewhale" ] && [ -f "$published_codewhale" ] && cmp -s "$tmpdir/codewhale" "$published_codewhale"; then
+    rm -f "$published_codewhale"
+    say "Removed $published_codewhale: this install did not complete." >&2
+  fi
+  if [ -n "$published_codew" ] && [ ! -L "$published_codew" ] && [ -f "$published_codew" ] && cmp -s "$tmpdir/codew" "$published_codew"; then
+    rm -f "$published_codew"
+    say "Removed $published_codew: this install did not complete." >&2
+  fi
+}
+on_exit() {
+  status=$?
+  if [ -n "$stage" ]; then rm -f "$stage"; fi
+  if [ -n "$stage_dir" ]; then rmdir "$stage_dir"; fi
+  if [ "$status" -ne 0 ]; then rollback_published; fi
+  rm -rf "$tmpdir"
+}
+trap on_exit EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 install_binary() {
   source="$1"
   destination="$2"
@@ -312,6 +337,10 @@ install_binary() {
   # itself would make ln treat a raced-in directory/symlink as a container.
   ln "$stage" "$install_dir/" || fail "destination appeared during install: $destination; it was not replaced"
   [ ! -L "$destination" ] && [ -f "$destination" ] && cmp -s "$stage" "$destination" || fail "installed path changed during publication: $destination"
+  case "$destination" in
+    */codewhale) published_codewhale="$destination" ;;
+    */codew) published_codew="$destination" ;;
+  esac
   rm -f "$stage"
   rmdir "$stage_dir"
   stage=""

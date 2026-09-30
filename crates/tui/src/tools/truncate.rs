@@ -9,7 +9,7 @@
 //!    retrieval and the raw-detail pager can inspect it without leaking a
 //!    process-global filesystem path.
 //!
-//! The default adaptive path writes immutable artifacts under
+//! The opt-in adaptive path writes immutable artifacts under
 //! `~/.codewhale/sessions/<session>/artifacts/`. The historical
 //! `~/.codewhale/tool_outputs/<sanitised-id>.txt` directory remains only for
 //! classic-routing compatibility, protected by a digest-bound origin sidecar.
@@ -454,8 +454,8 @@ fn truncated_preview(
 /// happened (content small enough, error result, write failure).
 /// Failures are logged but never bubble up — a tool that produced a
 /// result shouldn't be marked failed because the spillover writer
-/// couldn't reach disk; we degrade to no-op and the model gets the
-/// original (large) content.
+/// couldn't reach disk; a bounded preview then says the full output could
+/// not be saved, without advertising a recovery path or artifact.
 ///
 /// Error results (`success == false`) are skipped: error messages
 /// are typically short, and turning them into a truncated preview
@@ -547,8 +547,9 @@ fn apply_spillover_inner(
                 target: "spillover",
                 ?err,
                 tool_id,
-                "spillover write failed; passing original content through"
+                "spillover write failed; retaining a bounded unsaved preview"
             );
+            bound_unpersisted_output(result, SPILLOVER_HEAD_BYTES, SPILLOVER_TAIL_BYTES);
             return None;
         }
     };
@@ -691,6 +692,56 @@ fn metadata_object_mut(result: &mut ToolResult) -> &mut serde_json::Map<String, 
         .expect("metadata was just made an object")
 }
 
+/// Bound a failed persistence attempt without turning its preview into exact
+/// evidence. The same windows and footer authority serve both routing modes.
+fn bound_unpersisted_output(result: &mut ToolResult, head_bytes: usize, tail_bytes: usize) {
+    let original = &result.content;
+    let (head, tail) = head_tail_windows(original, head_bytes, tail_bytes);
+    let omitted = original.len().saturating_sub(head.len() + tail.len());
+    if omitted == 0 {
+        return;
+    }
+    let original_bytes = original.len();
+    let original_lines = original.lines().count();
+    let head_len = head.len();
+    let tail_len = tail.len();
+    let omitted_lines = original[head_len..original_bytes - tail_len]
+        .lines()
+        .count();
+    let digest = crate::hashing::sha256_hex(original.as_bytes());
+    result.content = format!(
+        "{head}\n\n{}\n\n…\n{tail}",
+        preview_footer(omitted, omitted_lines, None, None)
+    );
+    let object = metadata_object_mut(result);
+    // A prior metadata envelope cannot claim that it retained these bytes.
+    for key in [
+        "spillover_path",
+        "legacy_spillover_path",
+        "artifact_path",
+        "artifact_id",
+        "artifact_session_id",
+        "artifact_relative_path",
+        "artifact_byte_size",
+        "artifact_digest",
+        "artifact_generation",
+        "artifact_encoding",
+        "artifact_retention_state",
+        "artifact_preview",
+        "artifact_record",
+    ] {
+        object.remove(key);
+    }
+    object.insert("evidence_available".into(), false.into());
+    object.insert("output_persistence_failed".into(), true.into());
+    object.insert("truncated".into(), true.into());
+    object.insert("content_digest".into(), format!("sha256:{digest}").into());
+    object.insert("original_byte_count".into(), original_bytes.into());
+    object.insert("original_line_count".into(), original_lines.into());
+    object.insert("retained_head_bytes".into(), head_len.into());
+    object.insert("retained_tail_bytes".into(), tail_len.into());
+}
+
 /// Stamp the keys the TUI, receipts and `retrieve_tool_result` use to find a
 /// session artifact that holds a tool call's full output.
 fn stamp_artifact_metadata(
@@ -732,6 +783,17 @@ pub(crate) fn preserve_full_output_for_model_context(
     tool_name: &str,
     session_id: &str,
 ) -> bool {
+    if result
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("output_persistence_failed"))
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+    {
+        // Persistence already lost the omitted bytes. Saving this preview as
+        // the full output would manufacture an exact-evidence receipt.
+        return false;
+    }
     if result
         .metadata
         .as_ref()
@@ -995,17 +1057,20 @@ fn apply_adaptive_evidence_inner(
         }
         Ok(_) => {
             tracing::warn!(target: "evidence", tool_id, "adaptive evidence replay conflicts with immutable metadata");
+            bound_unpersisted_output(result, head_bytes, tail_bytes);
             return None;
         }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             if let Err(err) = publish_evidence_metadata(context.session_id, &proposed_artifact) {
                 tracing::warn!(target: "evidence", ?err, tool_id, "adaptive evidence metadata publication failed");
+                bound_unpersisted_output(result, head_bytes, tail_bytes);
                 return None;
             }
             proposed_artifact
         }
         Err(err) => {
             tracing::warn!(target: "evidence", ?err, tool_id, "adaptive evidence metadata validation failed");
+            bound_unpersisted_output(result, head_bytes, tail_bytes);
             return None;
         }
     };
@@ -1024,6 +1089,7 @@ fn apply_adaptive_evidence_inner(
         Ok(paths) => paths,
         Err(err) => {
             tracing::warn!(target: "evidence", ?err, tool_id, "adaptive evidence content publication failed");
+            bound_unpersisted_output(result, head_bytes, tail_bytes);
             return None;
         }
     };
@@ -1267,6 +1333,132 @@ mod tests {
                 session_id,
             },
         )
+    }
+
+    fn assert_unsaved_preview(result: &mut ToolResult, original: &str, success: bool) {
+        assert_eq!(result.success, success);
+        assert!(result.content.len() < SPILLOVER_HEAD_BYTES + SPILLOVER_TAIL_BYTES + 1024);
+        assert!(result.content.starts_with("first 🐳\n"));
+        assert!(result.content.ends_with("last 🐳\n"));
+        assert!(
+            result
+                .content
+                .contains("the full output could not be saved")
+        );
+        assert!(
+            result
+                .content
+                .contains("re-run the command with narrower output")
+        );
+        assert!(!result.content.contains("full output at"));
+        assert!(!result.content.contains("retrieve_tool_result"));
+        let metadata = result.metadata.as_ref().unwrap();
+        assert_eq!(metadata["original_byte_count"], original.len());
+        assert_eq!(metadata["evidence_available"], false);
+        assert_eq!(metadata["output_persistence_failed"], true);
+        assert_eq!(metadata["truncated"], true);
+        assert_eq!(metadata["fixture"], "preserved");
+        assert_eq!(
+            metadata["content_digest"],
+            format!("sha256:{}", crate::hashing::sha256_hex(original.as_bytes()))
+        );
+        assert!(metadata.get("artifact_id").is_none());
+        assert!(metadata.get("spillover_path").is_none());
+        assert!(!preserve_full_output_for_model_context(
+            result,
+            "retry",
+            "exec_shell",
+            "retry-session"
+        ));
+    }
+
+    #[test]
+    fn classic_spillover_write_failure_bounds_success_and_error_without_fake_evidence() {
+        let _g = setup();
+        let tmp = tempdir().unwrap();
+        with_test_home(tmp.path(), || {
+            let root = spillover_root().unwrap();
+            fs::create_dir_all(root.parent().unwrap()).unwrap();
+            fs::write(&root, "keep this file").unwrap();
+            let original = format!("first 🐳\n{}last 🐳\n", "middle 🐳\n".repeat(20_000));
+            for success in [true, false] {
+                let mut result = ToolResult::success(original.clone());
+                result.success = success;
+                result.metadata = Some(serde_json::json!({"fixture": "preserved"}));
+                assert!(apply_spillover_inner(&mut result, "call-failed", None, true).is_none());
+                assert_unsaved_preview(&mut result, &original, success);
+            }
+            assert_eq!(fs::read_to_string(root).unwrap(), "keep this file");
+        });
+    }
+
+    #[test]
+    fn adaptive_persistence_failures_bound_output_and_keep_existing_evidence_immutable() {
+        let _g = setup();
+        let tmp = tempdir().unwrap();
+        with_test_home(tmp.path(), || {
+            let original = format!("first 🐳\n{}last 🐳\n", "middle 🐳\n".repeat(20_000));
+            for failure in [
+                "metadata-write",
+                "metadata-invalid",
+                "metadata-conflict",
+                "content-conflict",
+            ] {
+                for success in [true, false] {
+                    let session = format!("{failure}-{success}");
+                    let directory = tmp
+                        .path()
+                        .join(".codewhale/sessions")
+                        .join(&session)
+                        .join("artifacts");
+                    fs::create_dir_all(directory.parent().unwrap()).unwrap();
+                    let canary = match failure {
+                        "metadata-write" => directory.clone(),
+                        "metadata-invalid" | "metadata-conflict" => {
+                            directory.join("art_call-failed.evidence.json")
+                        }
+                        _ => directory.join("art_call-failed.txt"),
+                    };
+                    if failure != "metadata-write" {
+                        fs::create_dir_all(&directory).unwrap();
+                    }
+                    if failure == "metadata-conflict" {
+                        let mut retained =
+                            ToolResult::success("retained evidence\n".repeat(10_000));
+                        adaptive_spillover(&mut retained, "call-failed", "exec_shell", &session)
+                            .unwrap();
+                    } else {
+                        fs::write(&canary, "keep this file").unwrap();
+                    }
+                    let canary_before = fs::read(&canary).unwrap();
+                    let mut result = ToolResult::success(original.clone());
+                    result.success = success;
+                    result.metadata = Some(serde_json::json!({
+                        "fixture": "preserved",
+                        "artifact_id": "stale",
+                        "spillover_path": "/stale",
+                        "evidence_available": true,
+                    }));
+                    assert!(
+                        adaptive_spillover(&mut result, "call-failed", "exec_shell", &session)
+                            .is_none()
+                    );
+                    assert_unsaved_preview(&mut result, &original, success);
+                    assert_eq!(fs::read(&canary).unwrap(), canary_before);
+                    if failure == "metadata-conflict" {
+                        assert_eq!(
+                            fs::read_to_string(directory.join("art_call-failed.txt")).unwrap(),
+                            "retained evidence\n".repeat(10_000)
+                        );
+                    }
+                }
+            }
+            assert!(
+                !tmp.path()
+                    .join(".codewhale/sessions/retry-session")
+                    .exists()
+            );
+        });
     }
 
     /// The old hint named `read_file`, which is not registered for the model
@@ -1759,15 +1951,22 @@ mod tests {
             );
 
             assert!(path.is_none());
-            assert_eq!(result.content, raw);
+            assert!(!result.success);
+            assert!(result.content.len() < SPILLOVER_HEAD_BYTES + SPILLOVER_TAIL_BYTES + 1024);
+            assert!(!result.content.contains("DEEP_FAILURE_SENTINEL"));
+            assert!(
+                result
+                    .content
+                    .contains("the full output could not be saved")
+            );
             assert!(!result.content.contains(SPILLOVER_PREVIEW_HINT));
             assert!(!result.content.contains("retrieve_tool_result"));
-            assert!(
+            assert_eq!(
                 result
                     .metadata
                     .as_ref()
-                    .and_then(|metadata| metadata.get("evidence_available"))
-                    .is_none()
+                    .and_then(|metadata| metadata.get("evidence_available")),
+                Some(&serde_json::Value::Bool(false))
             );
             assert!(
                 !session_dir
@@ -1806,7 +2005,18 @@ mod tests {
             );
 
             assert!(path.is_none());
-            assert_eq!(result.content, raw);
+            assert!(result.success);
+            assert!(result.content.len() < SPILLOVER_HEAD_BYTES + SPILLOVER_TAIL_BYTES + 1024);
+            assert!(!result.content.contains("DEEP_METADATA_FAILURE_SENTINEL"));
+            assert!(
+                result
+                    .content
+                    .contains("the full output could not be saved")
+            );
+            assert_eq!(
+                result.metadata.as_ref().unwrap()["evidence_available"],
+                false
+            );
             assert!(!result.content.contains(SPILLOVER_PREVIEW_HINT));
             assert!(!result.content.contains("retrieve_tool_result"));
             assert!(

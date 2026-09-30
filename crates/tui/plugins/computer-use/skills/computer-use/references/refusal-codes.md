@@ -30,7 +30,7 @@ Never retry a refusal unchanged — re-observe, re-target, or change route.
 | `menu_item_not_found` | exact title not present (menus expose items only while open) | check the exact title; an ellipsis is part of it |
 | `menu_item_disabled` | item present but the app refuses it right now (often a missing key window) | use the window's own control element instead |
 | `app_not_found` | selector missed — `open_application` names/bundle ids that resolve nowhere and dead pids report it too | `list_apps` (or `all:true`) for exact names/pids |
-| `ambiguous_application` | `kill_app` name matched several running apps | pass `pid` to choose one |
+| `ambiguous_application` | an app name or bundle id matched several running apps (observation, input or `kill_app`) | pass `pid` to choose one |
 | `protected_application` | the target is the Computer Use helper or its host | name the intended app instead; these cannot be terminated through the plugin |
 | `browser_not_running` | browser action before `browser {action:"start"}` (or the browser went away) | start it; a closed CDP connection clears the session state |
 | `browser_not_installed` | no Chromium-family browser found | install one, or set `CODEWHALE_CU_BROWSER_APP` to the app path |
@@ -56,6 +56,7 @@ Never retry a refusal unchanged — re-observe, re-target, or change route.
 | `spawn_failed` | provisioning failed or the desktop did not become ready | read the message; the failed container is removed automatically — fix the cause and spawn again |
 | `invalid_container` | a docker registry entry lacks a valid container name | register it through `computer spawn`, never by hand |
 | `cleanup_failed` | `docker rm` failed while tearing down a spawned computer | the registry entry is still removed; check `docker ps` for the labeled container and remove it manually |
+| `computer_owned_elsewhere` | `computer remove` named a desktop another session spawned | leave it; its session removes it at exit (the message names the container if that session is gone) |
 | `script_error` | osascript exited non-zero; stderr is in the message | read the error, check the app's scripting dictionary (`sdef`), fix the script |
 | `script_timeout` | the script — or a consent dialog — was still open at the deadline | narrow the script; a consent prompt is the person's choice, report it |
 | `script_cancelled` | the script's own dialog was cancelled (-128) | the user declined in-app; stop or ask |
@@ -75,5 +76,7 @@ computer; a typing pause does not authorize foreground control.
   not task success. Verify the effect with a fresh observation.
 - `front_lease` / `front_restored` describe focus accounting for window-record
   deliveries in explicitly authorized foreground mode. `front_restored:false` is a person-visible event: say it out loud.
-- `input_may_have_been_sent` on an error means the press left before the
-  failure: observe the target before doing anything else.
+- `outcome_unknown: true` (with `request_dispatched: true`) on an error means
+  the action was already handed to the helper, remote agent or browser when it
+  timed out, was cancelled or lost its reply: observe the target before doing
+  anything else, and never retry the action blindly.

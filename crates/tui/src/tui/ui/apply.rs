@@ -1482,28 +1482,19 @@ async fn apply_command_result_inner(
                         return Ok(false);
                     }
                 };
-                // A managed record resumes through the manager so its repair is
-                // hydrated, applied, and persisted in place. A foreign `/load`
-                // file is not ours to rewrite: hydrate its journal projection
-                // and repair in memory only.
-                let session = match SessionManager::default_location() {
-                    Ok(manager) if manager.owns_session_path(&parsed.metadata.id, &path) => {
-                        match manager.resume_session(&parsed.metadata.id) {
-                            Ok(recovery) => recovery.session,
-                            Err(err) => {
-                                crate::tui::ui::session_state::surface_session_load_failure(
-                                    app,
-                                    format!("Failed to resume session {}: {err}", path.display()),
-                                );
-                                return Ok(false);
-                            }
-                        }
-                    }
-                    _ => {
-                        let mut session = parsed;
-                        session.ensure_journal();
-                        crate::session_manager::repair_recovered_session(&mut session);
-                        session
+                // `/load` shares the attach contract of `resume` and the
+                // picker (`SessionManager::attach_session_file`); the lease is
+                // committed only once the session is applied.
+                let attached = SessionManager::default_location()
+                    .and_then(|manager| manager.attach_session_file(parsed, &path));
+                let (session, lease) = match attached {
+                    Ok(attached) => attached,
+                    Err(err) => {
+                        crate::tui::ui::session_state::surface_session_load_failure(
+                            app,
+                            format!("Failed to resume session {}: {err}", path.display()),
+                        );
+                        return Ok(false);
                     }
                 };
                 let fresh_config =
@@ -1527,7 +1518,10 @@ async fn apply_command_result_inner(
                     fresh_config,
                     true,
                 ) {
-                    Ok(outcome) => outcome,
+                    Ok(outcome) => {
+                        lease.commit();
+                        outcome
+                    }
                     Err(err) => {
                         crate::tui::ui::session_state::surface_session_load_failure(
                             app,
@@ -2906,7 +2900,8 @@ pub(crate) fn apply_workspace_runtime_state(app: &mut App, config: &Config, work
         workspace.clone(),
     );
     app.skills_dir = crate::tui::app::resolve_skills_dir(&workspace, &config.skills_dir(), config);
-    app.skills_scan_codewhale_only = config.skills_config().scan_codewhale_only();
+    app.skills_discovery_mode =
+        crate::skills::SkillDiscoveryMode::from_config(&config.skills_config());
     app.project_context_pack_enabled = config.project_context_pack_enabled();
     app.refresh_skill_cache();
     app.workspace_context = None;
