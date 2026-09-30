@@ -2167,6 +2167,11 @@ impl Engine {
         else {
             return;
         };
+        let Ok(start_permit) =
+            streaming::reserve_event_capacity(&self.tx_event, Some(&self.cancel_token)).await
+        else {
+            return;
+        };
         self.turn_counter = self.turn_counter.saturating_add(1);
 
         let turn_id = format!(
@@ -2191,13 +2196,11 @@ impl Engine {
         );
         self.apply_runtime_mode_policy(&authority);
 
-        let _ = self
-            .send_event(Event::TurnStarted {
-                turn_id: turn_id.clone(),
-                created_at: chrono::Utc::now(),
-                route: None,
-            })
-            .await;
+        start_permit.send(Event::TurnStarted {
+            turn_id: turn_id.clone(),
+            created_at: chrono::Utc::now(),
+            route: None,
+        });
 
         // The command runs from this snapshot to the post-turn one, so the
         // receipt names it as the call that span belongs to.
@@ -5449,26 +5452,35 @@ impl Engine {
             return SendMessageOutcome::NotStarted { error: None };
         }
         let initial_usage_owner = compaction.runtime_cost_owner.clone();
-        let terminal_permit =
-            match streaming::reserve_event_capacity(&self.tx_event, Some(&self.cancel_token)).await
-            {
-                Ok(permit) => permit,
-                Err(reason) => {
-                    // A queued operation is not an admitted turn. No TurnStarted,
-                    // session mutation or provider dispatch happened, but an Auto
-                    // classifier may already have produced billed routed usage.
-                    crate::cost_status::report_runtime_usage_batch(
-                        crate::cost_status::scope_token(),
-                        initial_usage_owner.as_deref(),
-                        &initial_routed_usage,
-                    );
-                    return SendMessageOutcome::NotStarted {
-                        error: (reason == streaming::EventSendError::Closed).then(|| {
-                            "Cannot start the turn because its event consumer is closed".to_string()
-                        }),
-                    };
-                }
-            };
+        // Reserve both lifecycle observations before mutating the session.
+        // Otherwise cancellation during a blocked TurnStarted send could
+        // create a completion with no start. The production queue has 256
+        // slots; these local permits do not create a second event authority.
+        let admission = async {
+            let terminal =
+                streaming::reserve_event_capacity(&self.tx_event, Some(&self.cancel_token)).await?;
+            let started =
+                streaming::reserve_event_capacity(&self.tx_event, Some(&self.cancel_token)).await?;
+            Ok::<_, streaming::EventSendError>((terminal, started))
+        };
+        let (terminal_permit, start_permit) = match admission.await {
+            Ok(permits) => permits,
+            Err(reason) => {
+                // A queued operation is not an admitted turn. No TurnStarted,
+                // session mutation or provider dispatch happened, but an Auto
+                // classifier may already have produced billed routed usage.
+                crate::cost_status::report_runtime_usage_batch(
+                    crate::cost_status::scope_token(),
+                    initial_usage_owner.as_deref(),
+                    &initial_routed_usage,
+                );
+                return SendMessageOutcome::NotStarted {
+                    error: (reason == streaming::EventSendError::Closed).then(|| {
+                        "Cannot start the turn because its event consumer is closed".to_string()
+                    }),
+                };
+            }
+        };
 
         // Goals are created by the model (`create_goal`) or by the leading
         // `/goal <objective>` command; the host never infers one from
@@ -5684,13 +5696,11 @@ impl Engine {
         // Emit turn started event IMMEDIATELY so the UI knows the turn is
         // active. The snapshot below can take 30+ seconds on slow filesystems
         // (e.g. WSL2 /mnt/c) and must not delay the TurnStarted event.
-        let _ = self
-            .send_event(Event::TurnStarted {
-                turn_id: turn.id.clone(),
-                created_at: turn_started_at,
-                route: Some(turn_route),
-            })
-            .await;
+        start_permit.send(Event::TurnStarted {
+            turn_id: turn.id.clone(),
+            created_at: turn_started_at,
+            route: Some(turn_route),
+        });
 
         // Auto's classifier completed before this parent turn was admitted.
         // Bind its exact routed records to the now-accepted turn: total tokens
@@ -5776,12 +5786,17 @@ impl Engine {
             let _ = self
                 .send_event(Event::error(ErrorEnvelope::fatal_auth(message.clone())))
                 .await;
+            let status = terminal_turn_status_at_settlement(
+                TurnOutcomeStatus::Failed,
+                self.cancel_token.is_cancelled(),
+            );
+            let error = (status == TurnOutcomeStatus::Failed).then_some(message.clone());
             terminal_permit.send(Event::TurnComplete {
                 usage: turn.usage.clone(),
                 parent_route_usage: turn.parent_route_usage.clone(),
                 routed_usage_dropped_records: turn.routed_usage_dropped_records,
-                status: TurnOutcomeStatus::Failed,
-                error: Some(message.clone()),
+                status,
+                error: error.clone(),
                 tool_catalog: None,
                 base_url: None,
             });
@@ -5790,9 +5805,7 @@ impl Engine {
                 goal_token_budget,
                 goal_status,
             );
-            let outcome = SendMessageOutcome::NotStarted {
-                error: Some(message),
-            };
+            let outcome = SendMessageOutcome::Finished { status, error };
             self.reconcile_non_completed_goal_turn(&outcome).await;
             return outcome;
         }
@@ -6030,11 +6043,11 @@ impl Engine {
                 .await;
         }
 
-        // Seal and fully forward every accepted mailbox envelope before the
-        // terminal event. This is the durability barrier for child usage: an
-        // event can no longer arrive after `TurnComplete` and be mistaken for
-        // the following turn (or lost by a runtime monitor that already
-        // settled the record).
+        // Seal the mailbox before the terminal event and flush under its
+        // existing grace. A stopped consumer can force that drainer to be
+        // aborted; the warning names the lost observation boundary. Child
+        // cost owners/leases remain independent of UI delivery, and no late
+        // envelope is attached to the following turn.
         if let Some(barrier) = mailbox_for_runtime.take() {
             if status == TurnOutcomeStatus::Completed && !turn.budget_exhausted_final_report {
                 barrier.continue_and_flush().await;

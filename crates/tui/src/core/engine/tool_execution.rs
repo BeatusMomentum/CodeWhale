@@ -735,10 +735,13 @@ mod tests {
 
     #[tokio::test]
     async fn terminal_guard_queues_resume_when_event_channel_is_full() {
-        let (tx, mut rx) = mpsc::channel(1);
+        let (tx, mut rx) = mpsc::channel(2);
+        let resume = tx.clone().reserve_owned().await.expect("resume capacity");
         tx.try_send(Event::status("filler")).expect("fill channel");
 
-        drop(InteractiveTerminalGuard { tx: Some(tx) });
+        drop(InteractiveTerminalGuard {
+            resume: Some(resume),
+        });
 
         assert!(matches!(rx.recv().await, Some(Event::Status { .. })));
         let resumed = tokio::time::timeout(Duration::from_secs(1), rx.recv())
@@ -746,12 +749,13 @@ mod tests {
             .expect("queued resume event")
             .expect("event channel still open");
         assert!(matches!(resumed, Event::ResumeEvents));
+        assert!(rx.try_recv().is_err(), "restoration is exactly once");
     }
 
     #[tokio::test]
     async fn terminal_guard_waits_for_pause_ack_before_returning() {
         let (tx, mut rx) = mpsc::channel(4);
-        let task = tokio::spawn(InteractiveTerminalGuard::engage(tx, true));
+        let task = tokio::spawn(InteractiveTerminalGuard::engage(tx, true, None));
 
         let event = tokio::time::timeout(Duration::from_secs(1), rx.recv())
             .await
@@ -783,7 +787,7 @@ mod tests {
     #[tokio::test]
     async fn terminal_guard_refuses_child_and_queues_resume_when_pause_is_not_acknowledged() {
         let (tx, mut rx) = mpsc::channel(4);
-        let task = tokio::spawn(InteractiveTerminalGuard::engage(tx, true));
+        let task = tokio::spawn(InteractiveTerminalGuard::engage(tx, true, None));
 
         let event = tokio::time::timeout(Duration::from_secs(1), rx.recv())
             .await
@@ -817,7 +821,7 @@ mod tests {
     #[tokio::test]
     async fn terminal_guard_cancellation_during_pause_ack_still_queues_resume() {
         let (tx, mut rx) = mpsc::channel(4);
-        let task = tokio::spawn(InteractiveTerminalGuard::engage(tx, true));
+        let task = tokio::spawn(InteractiveTerminalGuard::engage(tx, true, None));
 
         let event = tokio::time::timeout(Duration::from_secs(1), rx.recv())
             .await
@@ -840,6 +844,97 @@ mod tests {
             .expect("queued resume event")
             .expect("event channel still open");
         assert!(matches!(resumed, Event::ResumeEvents));
+    }
+
+    #[tokio::test]
+    async fn terminal_guard_cancelled_capacity_reservations_never_pause_or_restore() {
+        for capacity in [1, 2] {
+            let (tx, mut rx) = mpsc::channel(capacity);
+            tx.try_send(Event::status("occupied")).unwrap();
+            let cancel = CancellationToken::new();
+            let mut engage = Box::pin(InteractiveTerminalGuard::engage(
+                tx.clone(),
+                true,
+                Some(cancel.clone()),
+            ));
+            assert!(
+                tokio::time::timeout(Duration::from_millis(20), &mut engage)
+                    .await
+                    .is_err()
+            );
+            // Capacity 1 stalls the resume reservation; capacity 2 stalls
+            // the pause reservation while the first permit is held.
+            cancel.cancel();
+            assert!(
+                tokio::time::timeout(Duration::from_secs(1), &mut engage)
+                    .await
+                    .unwrap()
+                    .is_err()
+            );
+            drop(engage);
+            assert!(matches!(rx.try_recv(), Ok(Event::Status { .. })));
+            assert!(
+                rx.try_recv().is_err(),
+                "a pause that never entered needs no resume"
+            );
+            assert_eq!(
+                tx.capacity(),
+                capacity,
+                "cancelled waits release every permit"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_guard_cancelled_ack_restores_once_without_detached_sender() {
+        let (tx, mut rx) = mpsc::channel(3);
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(InteractiveTerminalGuard::engage(
+            tx.clone(),
+            true,
+            Some(cancel.clone()),
+        ));
+        assert!(matches!(rx.recv().await, Some(Event::PauseEvents { .. })));
+        tx.try_send(Event::status("fill after pause")).unwrap();
+        cancel.cancel();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_err()
+        );
+        assert!(matches!(rx.try_recv(), Ok(Event::Status { .. })));
+        assert!(matches!(rx.try_recv(), Ok(Event::ResumeEvents)));
+        assert!(rx.try_recv().is_err());
+        assert_eq!(tx.capacity(), 3);
+    }
+
+    #[tokio::test]
+    async fn terminal_guard_closed_receiver_refuses_or_releases_held_restoration() {
+        let (tx, rx) = mpsc::channel(3);
+        drop(rx);
+        assert!(
+            InteractiveTerminalGuard::engage(tx, true, None)
+                .await
+                .is_err()
+        );
+
+        let (tx, mut rx) = mpsc::channel(3);
+        let task = tokio::spawn(InteractiveTerminalGuard::engage(tx.clone(), true, None));
+        let Some(Event::PauseEvents { ack: Some(ack) }) = rx.recv().await else {
+            panic!("pause with acknowledgement");
+        };
+        ack.notify_one();
+        let guard = task.await.unwrap().unwrap();
+        drop(rx);
+        drop(guard);
+        assert!(tx.is_closed());
+        assert_eq!(
+            tx.capacity(),
+            3,
+            "receiver closure cannot strand restoration capacity"
+        );
     }
 
     #[cfg(unix)]
