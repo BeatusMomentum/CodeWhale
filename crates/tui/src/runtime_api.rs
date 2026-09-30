@@ -9493,65 +9493,65 @@ async fn switch_provider(
         tokio::task::spawn_blocking(move || {
             #[cfg(test)]
             let _membership = crate::test_support::join_env_scope(env_ticket);
-        let (config_toml, undo) = config_persistence::persist_provider_selection(
-            state.config_path.as_deref(),
-            target,
-            &task_identity,
-            task_model.as_deref(),
-        )
-        .map_err(|e| ApiError::internal(format!("Failed to persist provider selection: {e}")))?;
+            let (config_toml, undo) = config_persistence::persist_provider_selection(
+                state.config_path.as_deref(),
+                target,
+                &task_identity,
+                task_model.as_deref(),
+            )
+            .map_err(|e| ApiError::internal(format!("Failed to persist provider selection: {e}")))?;
 
-        // Reload config from disk and sync to active engines. This matches
-        // `POST /v1/config/reload` exactly: load → validate thread routes →
-        // swap in the new config. A failure here means an active thread's
-        // route is invalid under the new provider — surface it so the GUI can
-        // tell the user to fix their config.
-        let applied =
-            match Config::load(state.config_path.clone(), state.config_profile.as_deref()) {
-                Ok(mut reloaded) => {
-                    reloaded.account_model_access =
-                        state.config.read().account_model_access.clone();
-                    match runtime.block_on(state.runtime_threads.reload_config(reloaded.clone())) {
-                        Ok(_) => Ok(reloaded),
-                        Err(err) => Err(ApiError::bad_request(format!(
-                            "Config reload rejected: {err}"
-                        ))),
+            // Reload config from disk and sync to active engines. This matches
+            // `POST /v1/config/reload` exactly: load → validate thread routes →
+            // swap in the new config. A failure here means an active thread's
+            // route is invalid under the new provider — surface it so the GUI can
+            // tell the user to fix their config.
+            let applied =
+                match Config::load(state.config_path.clone(), state.config_profile.as_deref()) {
+                    Ok(mut reloaded) => {
+                        reloaded.account_model_access =
+                            state.config.read().account_model_access.clone();
+                        match runtime.block_on(state.runtime_threads.reload_config(reloaded.clone())) {
+                            Ok(_) => Ok(reloaded),
+                            Err(err) => Err(ApiError::bad_request(format!(
+                                "Config reload rejected: {err}"
+                            ))),
+                        }
                     }
+                    Err(e) => Err(ApiError::internal(format!("Failed to reload config: {e}"))),
+                };
+            match applied {
+                // Report the route this switch applied, not whatever a later
+                // switch leaves in `state.config` by the time this reply is built.
+                Ok(reloaded) => {
+                    let provider = reloaded.api_provider();
+                    let model = provider_default_model_for_api(&reloaded, provider, provider);
+                    *state.config.write() = reloaded;
+                    Ok::<_, ApiError>((provider, model))
                 }
-                Err(e) => Err(ApiError::internal(format!("Failed to reload config: {e}"))),
-            };
-        match applied {
-            // Report the route this switch applied, not whatever a later
-            // switch leaves in `state.config` by the time this reply is built.
-            Ok(reloaded) => {
-                let provider = reloaded.api_provider();
-                let model = provider_default_model_for_api(&reloaded, provider, provider);
-                *state.config.write() = reloaded;
-                Ok::<_, ApiError>((provider, model))
-            }
-            // A rejected switch must not stay on disk, or the next restart or
-            // reload silently applies the switch this response reports as
-            // refused. Only this save is taken back; a newer one wins.
-            Err(mut error) => {
-                let path = config_toml.display();
-                match undo.undo() {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        error.message = format!(
-                            "{}; {path} changed after this switch was saved, so the newer contents were kept",
-                            error.message
-                        );
+                // A rejected switch must not stay on disk, or the next restart or
+                // reload silently applies the switch this response reports as
+                // refused. Only this save is taken back; a newer one wins.
+                Err(mut error) => {
+                    let path = config_toml.display();
+                    match undo.undo() {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            error.message = format!(
+                                "{}; {path} changed after this switch was saved, so the newer contents were kept",
+                                error.message
+                            );
+                        }
+                        Err(restore) => {
+                            error.message = format!(
+                                "{}; the provider selection could not be reverted in {path}: {restore}",
+                                error.message
+                            );
+                        }
                     }
-                    Err(restore) => {
-                        error.message = format!(
-                            "{}; the provider selection could not be reverted in {path}: {restore}",
-                            error.message
-                        );
-                    }
+                    Err(error)
                 }
-                Err(error)
             }
-        }
         })
         .await
         .map_err(|_| ApiError::internal("provider switch blocking task failed"))?
