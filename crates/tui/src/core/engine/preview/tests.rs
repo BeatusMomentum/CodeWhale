@@ -983,6 +983,7 @@ async fn assert_preview_matches_first_wire_body(
             provenance: UserInputProvenance::ExternalUser,
             images: Vec::new(),
             max_output_tokens: None,
+            submission_id: None,
         })
         .await;
 
@@ -1950,6 +1951,7 @@ async fn provider_reported_usage_is_unavailable_until_a_response_reports_it() {
             provenance: UserInputProvenance::ExternalUser,
             images: Vec::new(),
             max_output_tokens: None,
+            submission_id: None,
         })
         .await;
 

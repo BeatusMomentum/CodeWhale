@@ -8358,6 +8358,7 @@ async fn thread_lifecycle_persists_across_restart() -> Result<()> {
                     turn_id: "engine_turn_1".to_string(),
                     created_at: chrono::Utc::now(),
                     route: None,
+                    submission_id: None,
                 })
                 .await;
             let _ = tx_event
@@ -8523,6 +8524,7 @@ async fn initial_classifier_usage_is_persisted_before_terminal_and_merged_exactl
             turn_id: "engine_classifier_receipt".to_string(),
             created_at: Utc::now(),
             route: None,
+            submission_id: None,
         })
         .await?;
     harness
@@ -9100,6 +9102,7 @@ async fn monitor_deduplicates_sink_and_metadata_and_persists_metadata_only_missi
             turn_id: "engine_metadata_receipt".to_string(),
             created_at: Utc::now(),
             route: None,
+            submission_id: None,
         })
         .await?;
     for _ in 0..2 {
@@ -9183,6 +9186,7 @@ async fn monitor_separates_lifecycle_start_from_billing_dispatch_and_child_usage
             turn_id: "engine_route_receipt".to_string(),
             created_at: started_at,
             route: None,
+            submission_id: None,
         })
         .await?;
     harness
@@ -9357,6 +9361,7 @@ async fn monitor_separates_lifecycle_start_from_billing_dispatch_and_child_usage
             turn_id: second_engine_turn.to_string(),
             created_at: Utc::now(),
             route: None,
+            submission_id: None,
         })
         .await?;
     harness
@@ -9436,6 +9441,7 @@ async fn monitor_persists_request_snapshots_and_matching_terminal_diagnostics() 
             turn_id: engine_turn_id.to_string(),
             created_at: Utc::now(),
             route: None,
+            submission_id: None,
         })
         .await?;
     let mut tool = catalog_tool("mcp_computer_get_app_state");
@@ -9603,6 +9609,7 @@ async fn monitor_persists_request_snapshots_and_matching_terminal_diagnostics() 
             turn_id: second_engine_turn_id.to_string(),
             created_at: Utc::now(),
             route: None,
+            submission_id: None,
         })
         .await?;
     let pre_request = crate::tool_inspection::ToolInspectionSnapshot::from_prepared_request(
@@ -9694,6 +9701,7 @@ async fn completed_turn_without_engine_output_fails() -> Result<()> {
                     turn_id: "engine_empty_turn".to_string(),
                     created_at: chrono::Utc::now(),
                     route: None,
+                    submission_id: None,
                 })
                 .await;
             let _ = tx_event
@@ -9785,6 +9793,7 @@ async fn worker_lifecycle_receipts_preserve_owner_outcome_and_durable_replay() -
                     turn_id: "engine_worker_lifecycle".into(),
                     created_at: Utc::now(),
                     route: None,
+                    submission_id: None,
                 })
                 .await;
             for owner in [thread_id.clone(), foreign_id] {
@@ -9983,6 +9992,7 @@ async fn preturn_control_status_does_not_make_empty_turn_succeed() -> Result<()>
                     turn_id: "engine_empty_after_control_status".to_string(),
                     created_at: chrono::Utc::now(),
                     route: None,
+                    submission_id: None,
                 })
                 .await;
             let _ = tx_event
@@ -10040,6 +10050,7 @@ async fn engine_error_remains_failed_after_nominal_turn_complete() -> Result<()>
                     turn_id: "engine_error_then_complete".to_string(),
                     created_at: chrono::Utc::now(),
                     route: None,
+                    submission_id: None,
                 })
                 .await;
             let _ = tx_event
@@ -10851,6 +10862,7 @@ async fn multi_turn_continuity_same_thread() -> Result<()> {
                     turn_id: format!("engine_turn_{turn_index}"),
                     created_at: chrono::Utc::now(),
                     route: None,
+                    submission_id: None,
                 })
                 .await;
             let _ = tx_event
@@ -11092,6 +11104,7 @@ async fn host_goal_loop_kickoff_arms_one_continuation_and_parks_at_engine_cap() 
                     turn_id: format!("engine_goal_{pass}"),
                     created_at: chrono::Utc::now(),
                     route: None,
+                    submission_id: None,
                 })
                 .await;
             let _ = tx_event
@@ -11210,6 +11223,7 @@ async fn host_goal_loop_skips_rearm_without_update_goal_and_after_failed_pass() 
                     turn_id: "engine_goal_no_update".to_string(),
                     created_at: chrono::Utc::now(),
                     route: None,
+                    submission_id: None,
                 })
                 .await;
             let _ = tx_event
@@ -11300,6 +11314,7 @@ async fn host_goal_loop_skips_rearm_without_update_goal_and_after_failed_pass() 
                     turn_id: "engine_goal_failed".to_string(),
                     created_at: chrono::Utc::now(),
                     route: None,
+                    submission_id: None,
                 })
                 .await;
             let _ = failed_tx_event
@@ -11397,6 +11412,7 @@ async fn host_goal_loop_mirrors_terminal_snapshot_and_does_not_rearm() -> Result
                         turn_id: format!("engine_{status}"),
                         created_at: chrono::Utc::now(),
                         route: None,
+                        submission_id: None,
                     })
                     .await;
                 let _ = tx_event
@@ -11502,6 +11518,7 @@ async fn model_created_goal_persists_through_adopted_revision() -> Result<()> {
                     turn_id: "engine_model_created".to_string(),
                     created_at: chrono::Utc::now(),
                     route: None,
+                    submission_id: None,
                 })
                 .await;
             let _ = tx_event
@@ -11585,6 +11602,7 @@ async fn model_created_goal_never_overwrites_concurrent_explicit_goal() -> Resul
                     turn_id: "engine_concurrent".to_string(),
                     created_at: chrono::Utc::now(),
                     route: None,
+                    submission_id: None,
                 })
                 .await;
             let _ = tx_event
@@ -11911,6 +11929,7 @@ async fn interrupt_turn_marks_interrupted_after_cleanup() -> Result<()> {
                     turn_id: "engine_turn_interrupt".to_string(),
                     created_at: chrono::Utc::now(),
                     route: None,
+                    submission_id: None,
                 })
                 .await;
             let _ = tx_event
@@ -12705,6 +12724,7 @@ async fn thread_detail_cursor_precedes_projection_reads_at_terminal_boundary() -
             turn_id: "snapshot_terminal".to_string(),
             created_at: Utc::now(),
             route: None,
+            submission_id: None,
         })
         .await?;
     harness
@@ -12886,6 +12906,7 @@ async fn thread_detail_materializes_stream_prefixes_before_their_delta_cursor() 
             turn_id: "delta_snapshot".to_string(),
             created_at: Utc::now(),
             route: None,
+            submission_id: None,
         })
         .await?;
     harness
@@ -13009,6 +13030,7 @@ async fn thread_detail_delta_boundary_is_replay_idempotent() -> Result<()> {
             turn_id: "delta_boundary".to_string(),
             created_at: Utc::now(),
             route: None,
+            submission_id: None,
         })
         .await?;
     harness
@@ -13352,6 +13374,7 @@ async fn dynamic_tool_result_settles_snapshot_and_emits_one_safe_resolution() ->
             turn_id: "dynamic_result".to_string(),
             created_at: Utc::now(),
             route: None,
+            submission_id: None,
         })
         .await?;
 
@@ -13513,6 +13536,7 @@ async fn dynamic_tool_result_receipt_outlives_canceled_delivery_future() -> Resu
             turn_id: "dynamic_detached_settlement".to_string(),
             created_at: Utc::now(),
             route: None,
+            submission_id: None,
         })
         .await?;
 
@@ -14455,6 +14479,7 @@ async fn dynamic_tool_timeout_clears_snapshot_and_emits_once() -> Result<()> {
             turn_id: "dynamic_timeout".to_string(),
             created_at: Utc::now(),
             route: None,
+            submission_id: None,
         })
         .await?;
 
@@ -14529,6 +14554,7 @@ async fn terminal_turn_cancels_pending_dynamic_tool_exactly_once() -> Result<()>
             turn_id: "dynamic_cancel".to_string(),
             created_at: Utc::now(),
             route: None,
+            submission_id: None,
         })
         .await?;
 
@@ -14638,6 +14664,7 @@ async fn approval_wait_heartbeat_is_never_sequenced_after_the_decision() -> Resu
             turn_id: "engine_turn_wait".to_string(),
             created_at: Utc::now(),
             route: None,
+            submission_id: None,
         })
         .await?;
     // The Responses client joins call and item ids with `|`.
@@ -15843,6 +15870,7 @@ async fn steer_turn_on_active_turn_records_item_and_event() -> Result<()> {
                     turn_id: "engine_turn_steer".to_string(),
                     created_at: chrono::Utc::now(),
                     route: None,
+                    submission_id: None,
                 })
                 .await;
             if let Some(steer) = rx_steer.recv().await {
@@ -16492,6 +16520,7 @@ async fn compaction_lifecycle_emits_item_events_with_compaction_counts() -> Resu
                             turn_id: "engine_turn_auto".to_string(),
                             created_at: chrono::Utc::now(),
                             route: None,
+                            submission_id: None,
                         })
                         .await;
                     let _ = tx_event
@@ -18948,6 +18977,7 @@ async fn notices_raise_from_engine_events_and_clear_on_settle_or_ack() -> Result
             turn_id: turn.id.clone(),
             created_at: Utc::now(),
             route: None,
+            submission_id: None,
         })
         .await?;
 
@@ -20005,6 +20035,7 @@ async fn engine_plumbing_items_are_tagged_internal_and_retry_hints_are_dropped()
             turn_id: "engine_plumbing_visibility".to_string(),
             created_at: Utc::now(),
             route: None,
+            submission_id: None,
         })
         .await?;
     for status in [
@@ -20673,6 +20704,7 @@ async fn runtime_receipts_mask_configured_secrets() -> Result<()> {
             turn_id: turn.id.clone(),
             created_at: Utc::now(),
             route: None,
+            submission_id: None,
         })
         .await?;
     harness
@@ -20920,6 +20952,7 @@ async fn tool_completion_items_carry_typed_artifact_refs() -> Result<()> {
             turn_id: turn.id.clone(),
             created_at: Utc::now(),
             route: None,
+            submission_id: None,
         })
         .await?;
     for (call, name) in [("call_write", "apply_patch"), ("call_shell", "exec_shell")] {
@@ -21159,6 +21192,7 @@ async fn run_workspace_turn(
             turn_id: "engine-turn".to_string(),
             created_at: Utc::now(),
             route: None,
+            submission_id: None,
         })
         .await?;
     let mut sent = Vec::new();

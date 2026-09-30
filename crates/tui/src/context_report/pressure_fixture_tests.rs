@@ -92,6 +92,7 @@ fn turn_op(content: &str, route: &ResolvedRuntimeRoute) -> Op {
         hook_executor: None,
         verbosity: None,
         provenance: UserInputProvenance::ExternalUser,
+        submission_id: None,
     })
 }
 
