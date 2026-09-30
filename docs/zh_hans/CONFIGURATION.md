@@ -1690,7 +1690,7 @@ code_mode = true # execute_tools composes MCP/plugin/native calls; false defers 
 
 **Provider 原生搜索。** 当路由的 provider 提供自带的网页搜索工具（OpenAI、xAI、Anthropic、DeepSeek、Kimi 等）时，该搜索可以排在已配置 provider 之前。它是在当前路由上的一次独立模型调用。`[search] native` 决定顺序：
 
-- 不设置（默认）：只有在没有配置搜索 provider 时原生搜索才优先；通过 `[search] provider`、`CODEWHALE_SEARCH_PROVIDER`、Tavily key 或会话内 `/search` 选择的 provider 优先；
+- 不设置（默认）：只有在没有配置搜索 provider 时原生搜索才优先；通过 `[search] provider`、`CODEWHALE_SEARCH_PROVIDER` 或 Tavily key 选择的 provider 优先；
 - `native = true`：即使固定了 provider，原生搜索也优先；
 - `native = false`：从不使用原生搜索。
 

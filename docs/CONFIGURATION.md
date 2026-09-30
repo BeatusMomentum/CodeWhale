@@ -3158,7 +3158,7 @@ route. `[search] native` decides the order:
 
 - unset (default): native search leads only when no search provider is
   configured; a provider chosen in `[search] provider`,
-  `CODEWHALE_SEARCH_PROVIDER`, a Tavily key, or `/search` in-session wins;
+  `CODEWHALE_SEARCH_PROVIDER`, or a Tavily key wins;
 - `native = true`: native search leads even when a provider is pinned;
 - `native = false`: native search is never used.
 
