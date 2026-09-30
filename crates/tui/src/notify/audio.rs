@@ -29,15 +29,17 @@ pub fn emit_terminal(cue: &SoundCue, out: &mut dyn Write) -> AudioOutcome {
 
 pub const WHALE_WAV: &[u8] = include_bytes!("../../assets/audio/codewhale-whale-call.wav");
 
-/// Resolve an external audio player (`aplay`, the pet's `ffplay`) from fixed
-/// install prefixes. The ambient `PATH` is never consulted: an empty (`::`),
-/// relative (`.`) or repository-local entry would let a checked-out workspace
-/// plant a player that Codewhale then runs with the user's authority.
+/// Resolve an external system helper (the audio players `aplay` and the
+/// pet's `ffplay`, the Linux browser launcher `xdg-open`) from fixed install
+/// prefixes. The ambient `PATH` is never consulted: an empty (`::`), relative
+/// (`.`) or repository-local entry would let a checked-out workspace plant a
+/// helper that Codewhale then runs with the user's authority.
 ///
-/// Known limitation: a player installed only outside these prefixes (a
+/// Known limitation: a helper installed only outside these prefixes (a
 /// custom `~/bin`, a version manager shim) is refused and the caller reports
-/// audio as unavailable. That is deliberate — there is no `PATH` fallback.
-pub(crate) fn trusted_player(name: &str) -> io::Result<PathBuf> {
+/// the feature as unavailable. That is deliberate — there is no `PATH`
+/// fallback.
+pub(crate) fn trusted_system_executable(name: &str) -> io::Result<PathBuf> {
     trusted_player_in(name, &trusted_player_dirs())
 }
 
@@ -54,7 +56,7 @@ fn trusted_player_in(name: &str, dirs: &[PathBuf]) -> io::Result<PathBuf> {
         .ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,
-                "audio player is not installed in a trusted system location",
+                format!("`{name}` is not installed in a trusted system location"),
             )
         })
 }
@@ -220,7 +222,7 @@ fn play_file(path: &std::path::Path) -> io::Result<()> {
     #[cfg(target_os = "macos")]
     let player = PathBuf::from("/usr/bin/afplay");
     #[cfg(target_os = "linux")]
-    let player = trusted_player("aplay")?;
+    let player = trusted_system_executable("aplay")?;
     let status = std::process::Command::new(player)
         .arg(path)
         .stdin(std::process::Stdio::null())

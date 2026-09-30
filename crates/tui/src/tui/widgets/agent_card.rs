@@ -457,27 +457,33 @@ impl FanoutCard {
         let grid_style = Style::default()
             .fg(codewhale_palette::grammar::ChromeInk::Metadata.color(theme))
             .add_modifier(Modifier::BOLD);
-        let mut header = vec![
-            Span::styled(
+        // Every span fits the painted width, down to zero columns (U05-m6):
+        // the glyph only when it fits, the count only with room after it.
+        let width = usize::from(width);
+        let glyph_width = UnicodeWidthStr::width(glyph);
+        let mut header = Vec::new();
+        if width >= glyph_width {
+            header.push(Span::styled(
                 glyph,
                 Style::default()
                     .fg(header_status.color(theme))
                     .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" "),
-            Span::styled(
-                truncate_action(
-                    &count_text,
-                    usize::from(width).saturating_sub(UnicodeWidthStr::width(glyph) + 1),
-                ),
+            ));
+        }
+        if width > glyph_width + 1 {
+            header.push(Span::raw(" "));
+            header.push(Span::styled(
+                truncate_action(&count_text, width - glyph_width - 1),
                 Style::default()
                     .fg(codewhale_palette::grammar::ChromeInk::Identity.color(theme))
                     .add_modifier(Modifier::BOLD),
-            ),
-        ];
+            ));
+        }
+        if width == 0 {
+            return vec![Line::from(header)];
+        }
         let grid: Vec<char> = self.dot_grid().chars().collect();
-        let header_width = UnicodeWidthStr::width(glyph) + 1 + count_text.width() + 1;
-        let width = usize::from(width).max(1);
+        let header_width = glyph_width + 1 + count_text.width() + 1;
         if header_width + grid.len() <= width {
             header.push(Span::raw(" "));
             header.push(Span::styled(grid.iter().collect::<String>(), grid_style));
@@ -1539,6 +1545,22 @@ mod tests {
 
     /// U05-m6: a wide fanout wraps its dot grid instead of running past the
     /// transcript width, and every worker keeps its glyph.
+    #[test]
+    fn fanout_header_fits_zero_and_one_column_renders() {
+        let ids: Vec<String> = (0..5).map(|i| format!("w_{i}")).collect();
+        let card = FanoutCard::new("rlm").with_workers(ids.iter().cloned());
+        for width in [0_u16, 1, 2, 3] {
+            let lines = render_to_strings(&card.render_lines(width, &codewhale_palette::UI_THEME));
+            assert!(!lines.is_empty(), "{width}");
+            for line in &lines {
+                assert!(
+                    UnicodeWidthStr::width(line.as_str()) <= usize::from(width),
+                    "{width}: {line:?}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn fanout_grid_wraps_within_the_render_width() {
         let ids: Vec<String> = (0..40).map(|i| format!("w_{i}")).collect();

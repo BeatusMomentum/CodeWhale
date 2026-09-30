@@ -1386,6 +1386,27 @@ impl WorkflowPanel {
                 token_budget,
                 at_ms,
             } => {
+                // A repeated or replayed start of this same run never resets
+                // it: rebuilding would erase settled rows and a terminal
+                // outcome (U05-01). It names the run (its goal is fixed for
+                // the run) and fills only what the panel still lacks, such as
+                // the start time of a placeholder opened by a late event.
+                if run_id == self.run_id {
+                    if let Some(label) = workflow_goal.or(workflow_id) {
+                        self.label = label;
+                    }
+                    if self.started_at_ms == 0 {
+                        self.started_at_ms = at_ms;
+                    }
+                    if self.budget_total.is_none() {
+                        self.budget_total = token_budget;
+                        self.budget_remaining = token_budget;
+                    }
+                    if self.source_path.is_none() {
+                        self.source_path = source_path;
+                    }
+                    return;
+                }
                 // New run replaces preserved completed state.
                 let locale = self.locale;
                 *self = Self::new(
@@ -2860,6 +2881,40 @@ mod tests {
                 ch as u32
             );
         }
+    }
+
+    #[test]
+    fn a_repeated_start_of_the_same_run_keeps_settled_rows_and_outcome() {
+        let mut panel = started_panel();
+        panel.apply_event(WorkflowPanelEvent::TaskCompleted {
+            task_id: "t1".to_string(),
+            status: WorkflowRowStatus::Succeeded,
+            usage: None,
+            reason: None,
+            at_ms: 1_400,
+        });
+        panel.apply_event(WorkflowPanelEvent::RunCompleted {
+            status: WorkflowPanelLifecycle::Succeeded,
+            error: None,
+            at_ms: 1_500,
+        });
+        let rows = |panel: &WorkflowPanel| panel.phases.iter().map(|p| p.rows.len()).sum::<usize>();
+        let settled_rows = rows(&panel);
+        assert!(settled_rows > 0);
+        assert!(panel.apply_json_event(&json!({
+            "type": "run_started",
+            "run_id": "workflow_abc",
+            "at_ms": 1_600,
+            "workflow_goal": "ship v0.8.68",
+            "token_budget": 9_000
+        })));
+        assert_eq!(panel.lifecycle, WorkflowPanelLifecycle::Succeeded);
+        assert_eq!(rows(&panel), settled_rows);
+        assert_eq!(
+            panel.budget_total,
+            Some(9_000),
+            "missing metadata is filled"
+        );
     }
 
     #[test]

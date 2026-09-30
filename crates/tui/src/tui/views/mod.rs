@@ -2111,6 +2111,9 @@ pub struct ConfigView {
     selected: usize,
     scroll: usize,
     editing: Option<ConfigEdit>,
+    /// The editor as it was committed, kept until the host answers: a rejected
+    /// value reopens it with the typed buffer instead of dropping it (U09-m1).
+    pending_commit: Option<ConfigEdit>,
     filter: String,
     status: Option<String>,
     locale: Locale,
@@ -2838,6 +2841,7 @@ impl ConfigView {
             selected: 0,
             scroll: 0,
             editing: None,
+            pending_commit: None,
             filter: String::new(),
             status: None,
             locale: app.ui_locale,
@@ -2948,6 +2952,19 @@ impl ConfigView {
             None => view.editing = None,
         }
         view
+    }
+
+    /// Reopen the editor the host just rejected, with the value the user
+    /// typed, on a view rebuilt from disk truth. A row that no longer exists
+    /// has nothing to reopen.
+    pub(crate) fn restore_rejected_commit(&mut self, previous: &Self) {
+        let Some(edit) = previous.pending_commit.clone() else {
+            return;
+        };
+        if let Some(index) = self.rows.iter().position(|row| row.key == edit.key) {
+            self.selected = index;
+            self.editing = Some(edit);
+        }
     }
 
     pub(crate) fn restore_filter(&mut self, filter: String) {
@@ -3373,6 +3390,7 @@ impl ConfigView {
         let Some(edit) = self.editing.take() else {
             return ViewAction::None;
         };
+        self.pending_commit = Some(edit.clone());
         self.last_mouse_selected = None;
         self.clear_hover();
         let value = match edit.choices.as_ref() {
@@ -5769,14 +5787,16 @@ pub(crate) fn subagent_view_agents(
                 if seen.insert(card.agent_id.clone()) =>
             {
                 let agent_type = FleetRole::from_str(&card.agent_type).unwrap_or(FleetRole::Worker);
-                agents.push(live_subagent_result(
+                let mut row = live_subagent_result(
                     &card.agent_id,
                     agent_type,
                     lifecycle_to_subagent_status(card.status, card.summary.as_deref()),
                     card.summary.as_deref().unwrap_or(card.agent_type.as_str()),
                     Some("transcript"),
                     None, // transcript-derived rows get nickname from manager on render
-                ));
+                );
+                row.worker_status = lifecycle_worker_status(card.status);
+                agents.push(row);
             }
             HistoryCell::SubAgent(SubAgentCell::Fanout(card)) => {
                 for worker in &card.workers {
@@ -5786,14 +5806,16 @@ pub(crate) fn subagent_view_agents(
                             summarize_tool_output(&card.kind),
                             summarize_tool_output(&worker.worker_id)
                         );
-                        agents.push(live_subagent_result(
+                        let mut row = live_subagent_result(
                             &worker.agent_id,
                             FleetRole::Worker,
                             lifecycle_to_subagent_status(worker.status, None),
                             &objective,
                             Some(card.kind.as_str()),
                             None, // fanout worker rows get nickname from manager on render
-                        ));
+                        );
+                        row.worker_status = lifecycle_worker_status(worker.status);
+                        agents.push(row);
                     }
                 }
             }
@@ -5836,8 +5858,9 @@ pub(crate) fn subagent_view_agents(
 /// A failure or interruption keeps the reason the card recorded from its
 /// terminal envelope; only a card that recorded none gets the generic line.
 ///
-/// Known limitation: `SubAgentStatus` has no pending state, so a spawned but
-/// not yet started worker reads as running here.
+/// `SubAgentStatus` has no pending state; callers carry a pending worker as
+/// `worker_status: Queued` (see [`lifecycle_worker_status`]) so it is not
+/// shown as running.
 fn lifecycle_to_subagent_status(status: AgentLifecycle, reason: Option<&str>) -> SubAgentStatus {
     let reason = |fallback: &str| {
         reason
@@ -5855,6 +5878,15 @@ fn lifecycle_to_subagent_status(status: AgentLifecycle, reason: Option<&str>) ->
             SubAgentStatus::Interrupted(reason("interrupted in transcript"))
         }
     }
+}
+
+/// The worker-status detail a transcript lifecycle adds to its projected
+/// manager status: a spawned but not yet started worker is `Queued`, which the
+/// row label and whale state show instead of the coarse `Running`.
+fn lifecycle_worker_status(
+    status: AgentLifecycle,
+) -> Option<crate::tools::subagent::AgentWorkerStatus> {
+    (status == AgentLifecycle::Pending).then_some(crate::tools::subagent::AgentWorkerStatus::Queued)
 }
 
 fn live_subagent_result(
@@ -6431,7 +6463,7 @@ fn append_subagent_group(
             .unwrap_or_else(|| format!("{id:<12}"));
         let kind = format_agent_type(whale.locale, &agent.agent_type);
         let (status, status_style, status_detail) =
-            format_agent_status(whale.locale, &agent.status);
+            format_agent_status(whale.locale, &agent.status, agent.worker_status);
 
         let name_style = if is_selected {
             Style::default().fg(palette::WHALE_ACTION).bold()
@@ -6641,10 +6673,21 @@ fn format_agent_type(locale: Locale, agent_type: &FleetRole) -> Cow<'static, str
 fn format_agent_status(
     locale: Locale,
     status: &SubAgentStatus,
+    worker_status: Option<crate::tools::subagent::AgentWorkerStatus>,
 ) -> (Cow<'static, str>, ratatui::style::Style, Option<&str>) {
     use ratatui::style::Style;
 
     match status {
+        // A worker that has not started yet waits; it is not running.
+        SubAgentStatus::Running
+            if worker_status == Some(crate::tools::subagent::AgentWorkerStatus::Queued) =>
+        {
+            (
+                tr(locale, MessageId::AutomationRunStatusQueued),
+                Style::default().fg(palette::STATUS_WARNING),
+                None,
+            )
+        }
         SubAgentStatus::Running => (
             tr(locale, MessageId::AutomationRunStatusRunning),
             Style::default().fg(palette::WHALE_ACTION),
@@ -9566,6 +9609,51 @@ context_window = 262144
         assert!(matches!(clear, ViewAction::None));
         assert!(view.filter.is_empty());
         assert!(!visible_row_keys(&view).is_empty());
+    }
+
+    #[test]
+    fn a_rejected_setting_reopens_the_editor_with_the_typed_value() {
+        let app = create_test_app();
+        let mut view = ConfigView::new_for_app(&app);
+        type_filter(&mut view, "mcp_config");
+        view.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        view.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        type_filter(&mut view, "servers.json");
+        assert!(matches!(
+            view.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            ViewAction::Emit(ViewEvent::ConfigUpdated { .. })
+        ));
+        assert!(view.editing.is_none());
+
+        let accepted = ConfigView::rebuild_preserving(&app, &view, "mcp_config_path");
+        assert!(
+            accepted.editing.is_none(),
+            "an accepted value closes the editor"
+        );
+
+        let mut rejected = ConfigView::rebuild_preserving(&app, &view, "mcp_config_path");
+        rejected.restore_rejected_commit(&view);
+        let edit = rejected.editing.as_ref().expect("a rejected value reopens");
+        assert_eq!(edit.key, "mcp_config_path");
+        assert_eq!(edit.buffer.iter().collect::<String>(), "servers.json");
+    }
+
+    #[test]
+    fn a_pending_worker_row_reads_queued_not_running() {
+        use crate::tools::subagent::AgentWorkerStatus;
+        assert_eq!(
+            lifecycle_worker_status(AgentLifecycle::Pending),
+            Some(AgentWorkerStatus::Queued)
+        );
+        assert_eq!(lifecycle_worker_status(AgentLifecycle::Running), None);
+        let (queued, ..) = format_agent_status(
+            Locale::En,
+            &SubAgentStatus::Running,
+            Some(AgentWorkerStatus::Queued),
+        );
+        let (running, ..) = format_agent_status(Locale::En, &SubAgentStatus::Running, None);
+        assert_eq!(queued, tr(Locale::En, MessageId::AutomationRunStatusQueued));
+        assert_ne!(queued, running);
     }
 
     #[test]

@@ -257,6 +257,12 @@ impl Client {
             // The owner serializes the recording on its world thread for up
             // to its own work bound; giving up sooner abandons an export the
             // owner still completes. Other calls keep the 2 s client bound.
+            //
+            // Known limitation (U06-m4): export runs synchronously in the
+            // owner's single QuickJS world, so the world answers no other work
+            // until it finishes. Keeping it responsive needs an incremental
+            // export in pet-native.js; aligning this wait is only the client
+            // half.
             request = request.timeout(owner::WORK_REPLY_TIMEOUT + Duration::from_secs(1));
         }
         let response = request
@@ -296,7 +302,35 @@ impl Client {
             "http://127.0.0.1:{}/#{}",
             self.descriptor.port, self.descriptor.token
         );
-        webbrowser::open(&url).map_err(io::Error::other)
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            use std::process::{Command as Process, Stdio};
+            // `webbrowser` resolves `$BROWSER` and `xdg-open` through the
+            // environment and `PATH`, where a workspace could shadow the
+            // launcher and receive this URL's owner token. Use the launcher
+            // from a trusted system prefix only (U06-06).
+            let launcher = crate::notify::audio::trusted_system_executable("xdg-open")?;
+            let mut child = Process::new(launcher)
+                .arg(&url)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()?;
+            // Some launchers stay in the foreground with the browser; reap it
+            // off this worker thread so the pet view keeps painting.
+            std::thread::Builder::new()
+                .name("pet-browser-launcher".into())
+                .spawn(move || {
+                    let _ = child.wait();
+                })?;
+            Ok(())
+        }
+        // macOS (LaunchServices) and Windows (ShellExecute) resolve the
+        // default browser through the OS, not `PATH`.
+        #[cfg(not(all(unix, not(target_os = "macos"))))]
+        {
+            webbrowser::open(&url).map_err(io::Error::other)
+        }
     }
     pub fn open_window(&self) -> io::Result<()> {
         #[cfg(target_os = "macos")]
