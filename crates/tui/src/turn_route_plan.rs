@@ -190,6 +190,7 @@ pub(crate) async fn plan_turn_route(
     let initial_routed_usage = auto_selection
         .as_mut()
         .map(|selection| crate::cost_status::RuntimeUsageBatch {
+            decisions: Vec::new(),
             records: std::mem::take(&mut selection.routed_usage),
             drop_records: std::mem::take(&mut selection.routed_usage_drop_records),
             dropped_records: std::mem::take(&mut selection.routed_usage_dropped_records),
@@ -348,6 +349,7 @@ mod tests {
             chrono::Utc::now(),
         );
         let batch = crate::cost_status::RuntimeUsageBatch {
+            decisions: Vec::new(),
             records: vec![crate::cost_status::RuntimeUsageRecord {
                 source_id: "auto-router:plan-usage".to_string(),
                 usage: crate::cost_status::EffectiveRouteUsage {

@@ -73,6 +73,7 @@ fn failed_engine_channel_settles_classifier_batch_once() {
         chrono::Utc::now(),
     );
     let batch = crate::cost_status::RuntimeUsageBatch {
+        decisions: Vec::new(),
         records: vec![crate::cost_status::RuntimeUsageRecord {
             source_id: "auto-router:dispatch-usage".to_string(),
             usage: crate::cost_status::EffectiveRouteUsage {
@@ -21985,6 +21986,7 @@ fn routed_missing_usage_batch_prices_exact_routes_and_only_residual_as_generic()
     local_route.provider_identity = "local-computer".to_string();
     local_route.billing_mode = crate::cost_status::RouteBillingMode::Local;
     let batch = crate::cost_status::RuntimeUsageBatch {
+        decisions: Vec::new(),
         records: Vec::new(),
         drop_records: vec![
             crate::cost_status::RuntimeUsageDropRecord {

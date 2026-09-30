@@ -9478,6 +9478,7 @@ async fn initial_routed_usage_is_total_only_emitted_once_and_keeps_parent_route_
     );
     missing_usage_route.billing_mode = crate::cost_status::RouteBillingMode::Metered;
     **initial_routed_usage = crate::cost_status::RuntimeUsageBatch {
+        decisions: Vec::new(),
         records: vec![crate::cost_status::RuntimeUsageRecord {
             source_id: "auto-router:engine-fixture".to_string(),
             usage: crate::cost_status::EffectiveRouteUsage {

@@ -5788,6 +5788,14 @@ impl Engine {
         );
         turn.add_routed_usage_dropped_records(residual_dropped_records);
         let initial_cost_scope = crate::cost_status::scope_token();
+        crate::cost_status::report_runtime_usage_batch(
+            initial_cost_scope,
+            initial_usage_owner.as_deref(),
+            &crate::cost_status::RuntimeUsageBatch {
+                decisions: initial_routed_usage.decisions.clone(),
+                ..Default::default()
+            },
+        );
         for record in &initial_routed_usage.records {
             crate::cost_status::report_effective_route_for_runtime(
                 initial_cost_scope,

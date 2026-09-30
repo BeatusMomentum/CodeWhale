@@ -603,6 +603,20 @@ where
         .collect::<Vec<_>>()
         .serialize(serializer)
 }
+fn serialize_decision_receipts<S>(
+    values: &[crate::cost_status::RuntimeDecisionReceipt],
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    values
+        .iter()
+        .map(crate::cost_status::RuntimeDecisionReceipt::sanitized)
+        .collect::<Vec<_>>()
+        .serialize(serializer)
+}
+
 const RUNTIME_RESTART_REASON: &str = "Interrupted by process restart";
 const EMPTY_TURN_REASON: &str = "Turn completed without engine output";
 const DYNAMIC_TOOL_RESULT_TIMEOUT: Duration = Duration::from_secs(300);
@@ -1457,6 +1471,14 @@ pub struct TurnRecord {
     /// inline RLM/guardian calls.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub routed_usage: Vec<EffectiveRouteUsage>,
+    /// Decision evidence shares this durable origin-turn ledger, including
+    /// responses arriving after the parent terminal event.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        serialize_with = "serialize_decision_receipts"
+    )]
+    pub decision_receipts: Vec<crate::cost_status::RuntimeDecisionReceipt>,
     /// Exact missing-usage provider responses paired with their frozen route.
     /// Sources are persisted only as fingerprints, routes are sanitized, and
     /// the shared source ledger bounds usage plus missing-usage records.
@@ -1523,6 +1545,11 @@ pub struct TurnRecord {
 
 impl TurnRecord {
     fn validate_output_token_limit(&self) -> Result<()> {
+        if self.decision_receipts.len() > MAX_ROUTED_USAGE_RECORDS_PER_TURN
+            || self.decision_receipts.iter().any(|r| !r.is_bounded())
+        {
+            bail!("Turn decision evidence exceeds its bound");
+        }
         if self.schema_version > MAX_SUPPORTED_RUNTIME_SCHEMA_VERSION {
             bail!(
                 "Turn schema v{} is newer than supported v{}",
@@ -1669,6 +1696,32 @@ fn append_routed_usage_drop_record(turn: &mut TurnRecord, record: RuntimeUsageDr
     true
 }
 
+fn append_decision_receipt(
+    turn: &mut TurnRecord,
+    receipt: &crate::cost_status::RuntimeDecisionReceipt,
+) -> bool {
+    if !receipt.is_bounded() {
+        return false;
+    }
+    let receipt = receipt.sanitized();
+    if turn
+        .decision_receipts
+        .iter()
+        .any(|old| old.source_id == receipt.source_id)
+    {
+        return false;
+    }
+    if turn.decision_receipts.len() >= MAX_ROUTED_USAGE_RECORDS_PER_TURN {
+        if turn.routed_usage_dropped_records == 0 {
+            turn.routed_usage_dropped_records = 1;
+            return true;
+        }
+        return false;
+    }
+    turn.decision_receipts.push(receipt);
+    true
+}
+
 /// Bind pre-parent auxiliary calls to a reserved Runtime turn before the
 /// engine accepts the parent operation. Exact records are persisted now so a
 /// crash cannot erase them; the engine's terminal event remains the sole
@@ -1678,6 +1731,9 @@ fn append_initial_routed_usage_to_turn(
     turn: &mut TurnRecord,
     batch: &crate::cost_status::RuntimeUsageBatch,
 ) {
+    for receipt in &batch.decisions {
+        append_decision_receipt(turn, receipt);
+    }
     for record in &batch.records {
         append_routed_usage_record(turn, &record.source_id, record.usage.clone());
     }
@@ -1694,7 +1750,10 @@ const UNACCEPTED_TURN_REASON: &str =
     "Turn was not accepted; this record keeps the completed pre-turn provider call";
 
 fn routed_usage_batch_is_empty(batch: &crate::cost_status::RuntimeUsageBatch) -> bool {
-    batch.records.is_empty() && batch.drop_records.is_empty() && batch.dropped_records == 0
+    batch.decisions.is_empty()
+        && batch.records.is_empty()
+        && batch.drop_records.is_empty()
+        && batch.dropped_records == 0
 }
 
 /// Durable identity of the settlement record for one completed pre-turn
@@ -1721,6 +1780,12 @@ fn unaccepted_routed_usage_turn_id(
                 .map(|record| routed_usage_source_fingerprint(&record.source_id)),
         )
         .collect::<Vec<_>>();
+    identities.extend(
+        batch
+            .decisions
+            .iter()
+            .map(|record| routed_usage_source_fingerprint(&record.source_id)),
+    );
     if identities.is_empty() {
         return runtime_record_id("turn_unaccepted");
     }
@@ -1758,6 +1823,7 @@ fn settle_unaccepted_routed_usage(
     } else {
         let now = Utc::now();
         TurnRecord {
+            decision_receipts: Vec::new(),
             max_output_tokens: None,
             schema_version: CURRENT_RUNTIME_SCHEMA_VERSION,
             id: turn_id.clone(),
@@ -9733,6 +9799,23 @@ impl RuntimeThreadManager {
                         &thread,
                     );
                 }
+                for receipt in &turn.decision_receipts {
+                    if usage_timestamp_in_range(receipt.route.dispatched_at, since, until) {
+                        if totals
+                            .route_receipts
+                            .iter()
+                            .filter(|r| r.starts_with("decision:"))
+                            .count()
+                            < 64
+                        {
+                            totals.route_receipts.insert(receipt.diagnostic_receipt());
+                        } else {
+                            totals
+                                .route_receipts
+                                .insert("decision:diagnostic_receipt_bound_reached".to_string());
+                        }
+                    }
+                }
                 for child in &turn.routed_usage {
                     if usage_timestamp_in_range(child.route.dispatched_at, since, until) {
                         accumulate_runtime_child_usage_record(
@@ -11763,6 +11846,7 @@ impl RuntimeThreadManager {
             // Only create a turn if there's content.
             if !item_ids.is_empty() {
                 seed_turns.push(TurnRecord {
+                    decision_receipts: Vec::new(),
                     max_output_tokens: None,
                     schema_version: if turn_seed.image_content.is_empty() {
                         CURRENT_RUNTIME_SCHEMA_VERSION
@@ -12166,6 +12250,9 @@ impl RuntimeThreadManager {
             let _turn_mutation = self.store.turn_mutation.lock();
             match self.store.load_turn(turn_id) {
                 Ok(mut turn) => {
+                    for receipt in &background_usage.decisions {
+                        append_decision_receipt(&mut turn, receipt);
+                    }
                     for record in background_usage.records.iter().cloned() {
                         append_routed_usage_record(&mut turn, &record.source_id, record.usage);
                     }
@@ -12844,6 +12931,7 @@ impl RuntimeThreadManager {
             // malformed/stale parent catalog entry cannot erase real
             // auxiliary spend on the error path.
             let initial_routed_usage = crate::cost_status::RuntimeUsageBatch {
+                decisions: Vec::new(),
                 records: std::mem::take(&mut selection.routed_usage),
                 drop_records: std::mem::take(&mut selection.routed_usage_drop_records),
                 dropped_records: std::mem::take(
@@ -12960,6 +13048,7 @@ impl RuntimeThreadManager {
             .clone()
             .unwrap_or_else(|| summarize_text(&prompt, SUMMARY_LIMIT));
         let mut turn = TurnRecord {
+            decision_receipts: Vec::new(),
             max_output_tokens,
             schema_version: if max_output_tokens.is_some() { OUTPUT_LIMIT_RUNTIME_SCHEMA_VERSION } else { CURRENT_RUNTIME_SCHEMA_VERSION },
             id: turn_id.clone(),
@@ -13453,6 +13542,7 @@ impl RuntimeThreadManager {
             thread.auto_approve,
         );
         let turn = TurnRecord {
+            decision_receipts: Vec::new(),
             max_output_tokens: None,
             schema_version: CURRENT_RUNTIME_SCHEMA_VERSION,
             id: turn_id.clone(),
@@ -14677,6 +14767,21 @@ impl RuntimeThreadManager {
                 drop_store.save_turn(&turn).is_ok()
             })),
         );
+        let decision_store = self.store.clone();
+        let decision_turn_id = turn_id.to_string();
+        crate::cost_status::register_runtime_decision_sink(
+            turn_id,
+            Arc::new(move |receipt| {
+                let _turn_mutation = decision_store.turn_mutation.lock();
+                let Ok(mut turn) = decision_store.load_turn(&decision_turn_id) else {
+                    return false;
+                };
+                if !append_decision_receipt(&mut turn, &receipt) {
+                    return true;
+                }
+                decision_store.save_turn(&turn).is_ok()
+            }),
+        );
     }
 
     /// Persist an engine status line as a completed `status` item.
@@ -15181,6 +15286,14 @@ impl RuntimeThreadManager {
                         if let Some(batch) =
                             crate::cost_status::child_usage_records_from_metadata(metadata)
                         {
+                            if !batch.decisions.is_empty() {
+                                let _turn_mutation = self.store.turn_mutation.lock();
+                                let mut turn = self.store.load_turn(&turn_id)?;
+                                for receipt in &batch.decisions {
+                                    append_decision_receipt(&mut turn, receipt);
+                                }
+                                self.store.save_turn(&turn)?;
+                            }
                             for record in batch.records {
                                 self.append_routed_usage_to_turn(
                                     &turn_id,
@@ -16559,6 +16672,9 @@ impl RuntimeThreadManager {
             turn.duration_ms = turn.started_at.map(|start| duration_ms(start, ended_at));
             turn.usage = turn_usage;
             turn.effective_route_usage = turn_effective_route_usage;
+            for receipt in &background_usage.decisions {
+                append_decision_receipt(&mut turn, receipt);
+            }
             for record in background_usage.records {
                 append_routed_usage_record(&mut turn, &record.source_id, record.usage);
             }

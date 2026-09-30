@@ -751,9 +751,9 @@ read from `TYPESAFE_API_KEY`, the `typesafe` secret-store entry, or
 
 #### Decision routers (`kind = "decision"`)
 
-A decision router asks a non-generative decision model one typed question per
-turn — a Choice between the active provider's `fast` and `strong` tiers, plus a
-thinking level — and gets calibrated probabilities back. No prose is parsed.
+A decision router asks a non-generative decision model typed Choice questions
+for the active provider's `fast` and `strong` tiers and thinking level, then
+reads calibrated probabilities. No prose is parsed.
 
 ```toml
 [auto.router]
@@ -771,8 +771,55 @@ min_confidence = 0.5          # default 0.5, clamped to 0..1
   0.75, or the turn stays on the fast tier.
 - An unknown `kind`, or a decision `provider` other than `openrouter` /
   `typesafe`, leaves the router unconfigured and shown as failing.
-- `thinking` is ignored for decision routers. OpenRouter spend is recorded like
-  any routed usage; TypeSafe-direct spend appears on the receipt only.
+- `[auto.router] thinking` is ignored for decision routers. Both routes settle tokens through
+  the originating session's routed-usage ledger. TypeSafe is a named Custom route
+  with unknown billing; its price is never borrowed from the active chat provider.
+  Provider-reported cost remains verbatim on the decision receipt.
+- OpenRouter uses `POST /api/alpha/decisions`; TypeSafe uses `POST /v1/systemone`.
+  The shared client validates Choice, Noul and Score against the offered questions
+  and bounds responses to 256 KiB. Malformed answers fail open with usage retained.
+
+#### Shadow Decision Gate (experimental, off by default)
+
+The Superfast Decision Gate asks a decision model three typed questions about
+the latest user message — does it need a tool, can it be answered from the
+conversation, and what is its intent — and logs a conservative recommendation.
+It is shadow-only: it never changes routing, never skips or delays the model
+call, and fails open on any error, timeout or malformed answer. It uses the same
+System One client as the decision router above; there is no separate HTTP
+client. It is configured from the environment and reads it when a turn starts:
+
+```sh
+SUPERFAST_ENABLED=1              # off unless set
+SUPERFAST_PROVIDER=typesafe      # or openrouter; required when enabled
+SUPERFAST_BASE_URL=http://localhost:8000/v1  # optional TypeSafe-route base, e.g. self-hosted
+SUPERFAST_MODEL=jev-latest       # default jev-latest / ~typesafe/jev-latest
+SUPERFAST_TIMEOUT_MS=150         # 1..=10000, default 150
+```
+
+- Enabling the gate never picks an endpoint by itself: without
+  `SUPERFAST_PROVIDER` nothing is sent and a warning is logged.
+- The key comes from the same place the decision router reads it. The TypeSafe
+  route always authenticates, so a self-hosted server that ignores auth still
+  needs a placeholder `TYPESAFE_API_KEY`.
+- Only the latest user message is sent, truncated to 4,000 characters and
+  redacted of configured secrets. The log (target `superfast`) carries the
+  route, failure class and latency, never prompt text.
+- The gate retains the originating turn's accounting owner and cancellation.
+  Its tokens settle through the shared ledger; missing usage or a cancelled/timed
+  out request after dispatch creates an explicit coverage gap. Unknown TypeSafe
+  pricing is recorded as unpriced rather than free.
+- Provider-reported cost survives rejected answers and late responses in bounded
+  receipts on the originating turn or session. These are diagnostic evidence;
+  unknown pricing never becomes an authoritative dollar total. Incomplete token
+  counters record a coverage gap while preserving the reported raw evidence.
+
+The wire contracts are documented in [TypeSafe's OpenAPI schema](https://api.typesafe.ai/openapi.json)
+and [OpenRouter's Decisions examples](https://openrouter.ai/blog/insights/what-is-jev/).
+
+The Decision Gate concept and reference implementation are by Andrea Bruno,
+released under CC BY 4.0:
+[harness-superfast](https://github.com/Andrea-Bruno/harness-superfast).
 
 Two `[auto]` keys shape routing (`AutoConfig` in `crates/tui/src/config.rs`):
 

@@ -312,6 +312,7 @@ async fn test_preset(app: &mut App, config: &Config, preset: RouterPreset) {
                         cost_scope,
                         None,
                         &crate::cost_status::RuntimeUsageBatch {
+                            decisions: Vec::new(),
                             records: selection.routed_usage.clone(),
                             drop_records: selection.routed_usage_drop_records.clone(),
                             dropped_records: selection.routed_usage_dropped_records,
