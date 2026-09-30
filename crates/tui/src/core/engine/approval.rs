@@ -287,14 +287,36 @@ impl Engine {
         tool_id: &str,
         request: UserInputRequest,
     ) -> Result<UserInputResponse, ToolError> {
-        let _ = self
+        // C02-19: a question that never reached a host has nobody to answer
+        // it. Fail now instead of waiting out the timeout — which by default
+        // is no timeout at all.
+        if self
             .tx_event
             .send(Event::UserInputRequired {
                 id: tool_id.to_string(),
                 request,
             })
-            .await;
+            .await
+            .is_err()
+        {
+            return Err(ToolError::execution_failed(
+                "User input request could not reach its host, so nobody was asked. \
+                 Continue without the answer or ask in your reply instead."
+                    .to_string(),
+            ));
+        }
+        // R1, as for tool approval: the per-turn wall-clock budget bounds the
+        // agent's own time, not how long a person takes to answer.
+        self.turn_wall_clock.begin_human_wait();
+        let response = self.await_user_input_decision(tool_id).await;
+        self.turn_wall_clock.end_human_wait();
+        response
+    }
 
+    async fn await_user_input_decision(
+        &mut self,
+        tool_id: &str,
+    ) -> Result<UserInputResponse, ToolError> {
         // #6003: `[tools] user_input_timeout_seconds`. Absent, or an explicit
         // 0, waits until the person answers or cancels. A positive value is
         // one absolute deadline for the whole wait: `select!` drops the

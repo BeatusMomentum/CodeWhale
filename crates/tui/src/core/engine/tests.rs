@@ -25109,7 +25109,7 @@ async fn reasoning_only_length_stop_fails_without_retry() {
 /// each carry exactly one extra message over the same baseline.
 #[tokio::test]
 async fn the_reasoning_only_nudge_rides_one_request_and_never_joins_the_session() {
-    let (model, _events) = run_reasoning_only_turn_with_reprompts(usize::MAX, "stop", 3).await;
+    let (model, events) = run_reasoning_only_turn_with_reprompts(usize::MAX, "stop", 3).await;
 
     let requests = model.requests.lock().expect("captured requests").clone();
     assert_eq!(requests.len(), 4, "one initial request plus three retries");
@@ -25143,6 +25143,34 @@ async fn the_reasoning_only_nudge_rides_one_request_and_never_joins_the_session(
     assert!(
         carries_nudge(&requests[2]),
         "nudge present once retrying again"
+    );
+
+    // C02-04: model-visible means logged. Every request the nudge rides
+    // leaves a durable (internal) receipt carrying its exact text.
+    let receipts: Vec<&str> = events
+        .iter()
+        .filter_map(|event| match event {
+            Event::Status { message }
+                if message.starts_with(super::turn_loop::REQUEST_NUDGE_RECEIPT_PREFIX) =>
+            {
+                Some(message.as_str())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        receipts.len(),
+        requests
+            .iter()
+            .filter(|request| carries_nudge(request))
+            .count(),
+        "one receipt per nudged request"
+    );
+    assert!(receipts.iter().all(|receipt| receipt.ends_with(nudge)));
+    assert_eq!(
+        crate::core::events::status_visibility(receipts[0]),
+        crate::core::events::StatusVisibility::Internal,
+        "durable clients keep the receipt, collapsed"
     );
 }
 
@@ -27443,6 +27471,7 @@ fn engine_adopts_host_owned_session_id_from_config() {
     );
 }
 
+mod admission_gates;
 mod sse_turn_recovery;
 mod tool_cancellation;
 
