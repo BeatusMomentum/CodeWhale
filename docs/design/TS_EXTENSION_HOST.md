@@ -395,7 +395,8 @@ The package goes at **`crates/tui/extension-host/`**, named `@codewhale/extensio
 crates/tui/extension-host/
   package.json          engines.node "^22.19.0 || >=24.0.0"; build + test scripts
   src/main.ts           boot: framing, console rebinding, parent watchdog, crash attribution
-  src/protocol.gen.ts   GENERATED from Rust (phase 2; hand-written + conformance corpus in phase 1)
+  src/protocol.generated.ts  GENERATED from the Rust protocol types (constants, method table, params shapes, types)
+  src/protocol.ts       frame codec + envelope checks over the generated shapes
   src/root.ts           Cordis root, shim services, refusal list
   src/shims/{tools,commands,skills,system-prompt,mcp-resources,logger}.ts
   src/dsh/{resolve-hooks,profile,dsh-tools-compat}.ts
@@ -521,7 +522,7 @@ Rust then respawns the host and replays activations from its own record of which
 - **Rust serde types are the source of truth.** They go in `crates/tui/src/extension_host/protocol.rs`, not `crates/protocol`, because the host protocol is private to the engine process and the app-server has no reason to see it.
   - Host → core types use `#[serde(deny_unknown_fields, tag = "kind")]`, because host output is untrusted input.
   - Core → host types are tolerant.
-- **Generated TypeScript.** `schemars` (already a `crates/tui` dependency) generates `extension-host-protocol.schema.json`. `json-schema-to-typescript` turns that into `src/protocol.gen.ts`, which is committed, with a CI drift check. Phase 1 uses hand-written TS types plus a shared JSON fixture corpus (`crates/tui/tests/fixtures/extension_host/*.json`) that both sides must parse and round-trip.
+- **Generated TypeScript.** `schemars` (already a `crates/tui` dependency, derived on the wire types under `cfg(test)`) reads each type's serde shape, and a Rust test (`crates/tui/src/extension_host/protocol/tests.rs`) renders `src/protocol.generated.ts` from it and from the Rust method table (`protocol::METHODS`): constants, error codes, the method table, every params shape the host validates, and the wire types. The file is committed and the test fails on drift (re-record with `CODEWHALE_CONFORMANCE_UPDATE=1`, then rebuild `dist/`); no npm generator is involved. Both sides still parse and round-trip the shared JSON fixture corpus (`crates/tui/tests/fixtures/extension_host/protocol/*.json`).
 - **Handshake:**
 
   ```

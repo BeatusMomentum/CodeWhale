@@ -11,7 +11,16 @@ import { readFile } from 'node:fs/promises'
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { pathToFileURL } from 'node:url'
 import { Context, Inject, Service } from '@deepseek-ai/cordis'
-import { ErrorCode, type ContentBlockWire, type Json, type OwnerRef, type ToolResultWire } from './protocol.ts'
+import {
+  ErrorCode,
+  type ActivateParams,
+  type ActivateResult,
+  type ContentBlockWire,
+  type DeactivateResult,
+  type Json,
+  type OwnerRef,
+  type ToolResultWire,
+} from './protocol.ts'
 import { RpcError, type RpcPeer } from './rpc.ts'
 import { explainImportError } from './dsh/resolve-hooks.ts'
 
@@ -64,15 +73,6 @@ interface LocalTool {
   definition: any
   disposed: boolean
 }
-
-export interface ActivateParams {
-  owner: OwnerRef
-  plugin_name: string
-  entry: { path: string; sha256: string }
-  config?: Json
-}
-
-export type ActivateResult = { status: 'ok'; tools: string[] } | { status: 'failed'; diagnostic: string }
 
 export const ownerStorage = new AsyncLocalStorage<OwnerRecord>()
 
@@ -289,7 +289,7 @@ export class HostRoot {
     return owner.disposing
   }
 
-  async deactivate(ref: OwnerRef): Promise<{ disposed: boolean; leaked: string[] }> {
+  async deactivate(ref: OwnerRef): Promise<DeactivateResult> {
     const owner = this.owners.get(ref.owner_token)
     if (!owner) return { disposed: true, leaked: [] }
     let disposed = true

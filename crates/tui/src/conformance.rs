@@ -38,7 +38,7 @@
 #[cfg(test)]
 mod events;
 #[cfg(test)]
-mod golden;
+pub(crate) mod golden;
 #[cfg(unix)]
 #[cfg(test)]
 mod hooks;

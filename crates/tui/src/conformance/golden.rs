@@ -63,7 +63,7 @@ pub(super) fn update_mode() -> bool {
 /// Compare `actual` with the golden at `path`; in update mode write it
 /// instead. Returns a failure description rather than panicking so a family
 /// can report every drifted case in one run.
-pub(super) fn check_golden(path: &Path, actual: &str) -> Result<(), String> {
+pub(crate) fn check_golden(path: &Path, actual: &str) -> Result<(), String> {
     let update = update_mode();
     let expected = std::fs::read_to_string(path).ok();
     if expected.as_deref() == Some(actual) {

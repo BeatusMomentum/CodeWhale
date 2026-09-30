@@ -5,7 +5,7 @@
  * core aborts it. The core resolves a cancelled call on its own side after a
  * 500 ms grace, so a late answer here is harmless (the core drops it).
  */
-import { ErrorCode, validateMessage, type Message, type RpcErrorWire } from './protocol.ts'
+import { ErrorCode, MAX_INFLIGHT, validateMessage, type Message, type RpcErrorWire } from './protocol.ts'
 
 export class RpcError extends Error {
   constructor(
@@ -32,9 +32,6 @@ export interface RequestContext {
 type RequestHandler = (params: any, cx: RequestContext) => Promise<unknown> | unknown
 type NotificationHandler = (params: any) => void
 
-/** Maximum outbound requests awaiting an answer (matches the core's limit). */
-export const MAX_INFLIGHT = 256
-
 export class RpcPeer {
   private nextId = 1
   private readonly pending = new Map<number, { resolve: (v: any) => void; reject: (e: Error) => void }>()
@@ -56,6 +53,7 @@ export class RpcPeer {
   /** Send a host→core request. Outbound messages are validated strictly first. */
   request<T = any>(method: string, params: unknown): Promise<T> {
     if (this.closed) return Promise.reject(new RpcError(ErrorCode.NotAvailable, 'channel closed'))
+    // The core's per-direction limit.
     if (this.pending.size >= MAX_INFLIGHT) {
       return Promise.reject(new RpcError(ErrorCode.Internal, `more than ${MAX_INFLIGHT} requests in flight`))
     }
