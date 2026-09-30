@@ -21,6 +21,14 @@ const BOAT_TRIAL_MODEL: &str = "deepseek-flash";
 const MAX_CONFIRMATION_BYTES: usize = 4096;
 const MAX_CANCEL_REASON_CHARS: usize = 500;
 
+fn valid_confirmation(token: &str) -> bool {
+    !token.is_empty()
+        && token.len() <= MAX_CONFIRMATION_BYTES
+        && token
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
 fn at<'a>(value: &'a Value, path: &[&str]) -> Option<&'a Value> {
     path.iter().try_fold(value, |cursor, key| cursor.get(*key))
 }
@@ -426,6 +434,13 @@ fn write_boat_usage<W: Write>(out: &mut W, envelope: &Value, result: &Value) -> 
             if running { "still running" } else { "stopped" }
         )?;
     }
+    if let Some(confirmed) = block.get("cleanupConfirmed").and_then(Value::as_bool) {
+        writeln!(
+            out,
+            "  Provider cleanup: {}",
+            if confirmed { "confirmed" } else { "pending" }
+        )?;
+    }
     Ok(())
 }
 
@@ -779,7 +794,7 @@ fn launch_hint(code: &str) -> Option<&'static str> {
             "The confirmation is not valid for this launch. Run `work-quote` again with the same --operation-key and use the new confirmation"
         }
         "launch_operation_mismatch" => {
-            "This --operation-key was already used for different Work. Choose a new key and run `work-quote` again"
+            "This --operation-key belongs to different launch inputs. Check `work-status` and `work-result` before starting again; never replace the key to retry an unknown launch"
         }
         "work_run_not_queued" => {
             "Only queued Work can be launched. Run `work-status` to see what happened to it"
@@ -828,27 +843,28 @@ pub(super) fn quote<T: CloudTransport, W: Write>(
 
     // This command starts only the $0 EU Boat trial. If the service quotes
     // anything else, refuse to hand out a confirmation for it.
+    let seconds = count_at(&quote, &["disclosure", "computerTime", "estimatedSeconds"]);
     let expected = at(&quote, &["disclosure", "funding"]).and_then(Value::as_str)
         == Some("provider_trial")
         && at(&quote, &["disclosure", "customerCreditsChargedUsd"]).and_then(Value::as_f64)
             == Some(0.0)
         && str_at(&quote, &["quote", "sku"]) == Some(BOAT_TRIAL_SKU)
-        && str_at(&quote, &["disclosure", "sandboxTargetRegion"]) == Some("eu");
+        && str_at(&quote, &["quote", "adapter"]) == Some("boat")
+        && str_at(&quote, &["disclosure", "sandboxTargetRegion"]) == Some("eu")
+        && str_at(&quote, &["disclosure", "modelInference", "billing"]) == Some("byok_external")
+        && seconds == Some(BOAT_TRIAL_SECONDS);
     if !expected {
         bail!(
             "The Codewhale service quoted something other than the $0 five-minute EU Boat trial. Refusing to print a confirmation for it; nothing started"
         );
     }
     let token = str_at(&quote, &["confirmation", "token"]).unwrap_or_default();
-    if token.is_empty()
-        || token.len() > MAX_CONFIRMATION_BYTES
-        || !token.bytes().all(|byte| byte.is_ascii_graphic())
+    if !valid_confirmation(token)
         || str_at(&quote, &["confirmation", "workRunId"]).is_some_and(|quoted| quoted != id)
     {
         bail!("The Codewhale service returned an unusable launch confirmation");
     }
-    let seconds = count_at(&quote, &["disclosure", "computerTime", "estimatedSeconds"])
-        .unwrap_or(BOAT_TRIAL_SECONDS);
+    let seconds = BOAT_TRIAL_SECONDS;
     writeln!(
         out,
         "Boat trial Work quote. Nothing has started and nothing is charged."
@@ -857,7 +873,7 @@ pub(super) fn quote<T: CloudTransport, W: Write>(
     writeln!(out, "Repository: {}", printable(&target.repo))?;
     writeln!(
         out,
-        "Model: {BOAT_TRIAL_MODEL_PROVIDER}/{BOAT_TRIAL_MODEL} with your own DeepSeek key; DeepSeek may bill you directly"
+        "Model: {BOAT_TRIAL_MODEL_PROVIDER}/{BOAT_TRIAL_MODEL} with your own DeepSeek key; DeepSeek bills your BYOK usage directly"
     )?;
     writeln!(
         out,
@@ -874,7 +890,7 @@ pub(super) fn quote<T: CloudTransport, W: Write>(
     }
     writeln!(
         out,
-        "EU placement: repository code and Work files run on Boat's EU compute."
+        "EU placement: Codewhale admission attestation; Boat reports no region field. Repository code and Work files are admitted to EU compute."
     )?;
     if let Some(title) = text_at(&quote, &["confirmCopy", "title"]) {
         writeln!(out, "{title}")?;
@@ -914,10 +930,7 @@ pub(super) fn launch<T: CloudTransport, W: Write>(
     let id = validate_work_uuid(id)?;
     let operation_key = validate_operation_key(operation_key)?;
     let confirmation = confirmation.trim();
-    if confirmation.is_empty()
-        || confirmation.len() > MAX_CONFIRMATION_BYTES
-        || !confirmation.bytes().all(|byte| byte.is_ascii_graphic())
-    {
+    if !valid_confirmation(confirmation) {
         bail!("Confirmation must be the value printed by `codewhale account agents work-quote`");
     }
     let mut target = load_launch_target(client, id)?;
@@ -975,7 +988,16 @@ pub(super) fn launch<T: CloudTransport, W: Write>(
             .into(),
         ));
     };
-    if str_at(session, &["run", "id"]) != Some(id) {
+    let Some(returned_run_id) = str_at(session, &["run", "id"]) else {
+        return Err(refused(
+            CloudTransportError::new(
+                "The Codewhale service returned a launch reply without a Work ID",
+                std::io::Error::other("missing Work ID"),
+            )
+            .into(),
+        ));
+    };
+    if returned_run_id != id {
         bail!(
             "The Codewhale service launched a different Work than requested. Run `codewhale account agents work-status {id}` before doing anything else"
         );
@@ -1114,7 +1136,7 @@ pub(super) fn bind_github_repo<T: CloudTransport, W: Write>(
                 err
             }
         })?;
-    if matches!(response.status, 404 | 503) {
+    if response.status == 404 {
         return Err(response_error(&response)).context(
             "GitHub repository bindings are unavailable on this Codewhale API, or this repository is not reachable through that installation",
         );

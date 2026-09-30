@@ -704,6 +704,11 @@ impl CloudTransport for ReqwestTransport {
             .client
             .request(method, url)
             .header(reqwest::header::ACCEPT, "application/json");
+        // Hosted launch waits for provider creation and guest bootstrap. Its
+        // HTTP deadline is separate from the guest's bounded trial runtime.
+        if request.method == HttpMethod::Post && request.path == "/api/cloud-sessions" {
+            builder = builder.timeout(Duration::from_secs(600));
+        }
         if let Some(token) = request.bearer {
             builder = builder.bearer_auth(token);
         }
@@ -729,7 +734,11 @@ impl CloudTransport for ReqwestTransport {
                 CloudTransportError::new("failed to read the Codewhale service response", source)
             })?;
         if body.len() as u64 > MAX_RESPONSE_BYTES {
-            bail!("The Codewhale service returned an unexpectedly large response");
+            return Err(CloudTransportError::new(
+                "The Codewhale service returned an unexpectedly large response",
+                std::io::Error::other("response exceeded the account API size limit"),
+            )
+            .into());
         }
         Ok(CloudResponse {
             status,

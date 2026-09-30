@@ -3303,6 +3303,7 @@ fn boat_quote() -> serde_json::Value {
             "funding": "provider_trial", "customerCreditsChargedUsd": 0,
             "providerCostEstimateUsd": 0.0207, "sandboxTargetRegion": "eu",
             "euPlacementConsentRequired": true,
+            "modelInference": { "billing": "byok_external" },
             "computerTime": { "estimatedSeconds": 300 }
         },
         "confirmation": {
@@ -3816,7 +3817,8 @@ fn result_envelope() -> serde_json::Value {
         "modelRoute": { "provider": "deepseek", "model": "deepseek-flash" },
         "boatUsage": {
             "providerSeconds": 212, "providerListPriceDollars": 0.00106,
-            "customerCreditsChargedUsd": 0, "funding": "provider_trial", "running": false
+            "customerCreditsChargedUsd": 0, "funding": "provider_trial", "running": false,
+            "cleanupConfirmed": true
         },
         "receipt": { "eventsThroughSeq": 57, "source": "run.result" }
     } })
@@ -3874,6 +3876,7 @@ fn work_result_summarises_evidence_pr_route_and_boat_usage() {
         "Codewhale credits charged: $0",
         "Funding: provider_trial",
         "Provider VM: stopped",
+        "Provider cleanup: confirmed",
         "Attempts: 2",
         "#1 launch failed (error boat_task_stop_unconfirmed)",
         "#2 recovery settled",
@@ -4085,6 +4088,14 @@ fn work_quote_refuses_before_quoting_anything_it_cannot_launch_or_would_charge_f
         |quote: &mut serde_json::Value| {
             quote["disclosure"]["sandboxTargetRegion"] = json!("us-west")
         },
+        |quote: &mut serde_json::Value| quote["quote"]["adapter"] = json!("other"),
+        |quote: &mut serde_json::Value| {
+            quote["disclosure"]["computerTime"]["estimatedSeconds"] = json!(301)
+        },
+        |quote: &mut serde_json::Value| quote["disclosure"]["computerTime"] = json!({}),
+        |quote: &mut serde_json::Value| {
+            quote["disclosure"]["modelInference"]["billing"] = json!("managed_wallet")
+        },
     ] {
         let mut quote = boat_quote();
         tamper(&mut quote);
@@ -4116,6 +4127,21 @@ fn work_quote_refuses_before_quoting_anything_it_cannot_launch_or_would_charge_f
     let message = chain(&result.unwrap_err());
     assert!(message.contains("boat_work_trial_unavailable"));
     assert!(message.contains("not available for this account"));
+
+    // The printed retry command must not carry remote shell metacharacters.
+    for token in ["tok.$(command)", "tok.`command`", "tok.abc;command"] {
+        let mut quote = boat_quote();
+        quote["confirmation"]["token"] = json!(token);
+        let transport = ScriptedTransport::new(vec![
+            reply(200, work_run("queued")),
+            agents_step(),
+            projects_step(),
+            reply(200, quote),
+        ]);
+        let (result, output) = run_agent_command(&transport, &secrets, &QUOTE_ARGV);
+        assert!(chain(&result.unwrap_err()).contains("unusable launch confirmation"));
+        assert!(!output.contains(token));
+    }
 }
 
 #[test]
@@ -4130,6 +4156,14 @@ fn work_launch_requires_eu_consent_and_sends_the_confirmed_c5_request() {
     assert!(message.contains("Nothing was sent"));
     assert!(output.is_empty());
     assert!(transport.requests().is_empty());
+
+    for token in ["tok.$(command)", "tok.`command`", "tok.abc;command"] {
+        let mut unsafe_token = LAUNCH_ARGV.to_vec();
+        unsafe_token[8] = token;
+        let (result, _) = run_agent_command(&transport, &secrets, &unsafe_token);
+        assert!(chain(&result.unwrap_err()).contains("Confirmation must be"));
+        assert!(transport.requests().is_empty());
+    }
 
     // A malformed confirmation is refused locally too.
     let mut spaced = LAUNCH_ARGV.to_vec();
@@ -4255,6 +4289,15 @@ fn work_launch_reports_unknown_and_refused_outcomes_without_guessing() {
     assert!(message.contains("`work-quote` again with the same --operation-key"));
     assert!(!message.contains("outcome is unknown"));
 
+    let transport = ScriptedTransport::new(steps(reply(
+        409,
+        json!({ "code": "launch_operation_mismatch" }),
+    )));
+    let (result, _) = run_agent_command(&transport, &secrets, &LAUNCH_ARGV);
+    let message = chain(&result.unwrap_err());
+    assert!(message.contains("Check `work-status` and `work-result`"));
+    assert!(message.contains("never replace the key to retry an unknown launch"));
+
     // A reply about another Work is never presented as this launch.
     let mut other = cloud_session();
     other["session"]["run"]["id"] = json!("22222222-2222-4222-8222-222222222222");
@@ -4276,6 +4319,19 @@ fn work_launch_reports_unknown_and_refused_outcomes_without_guessing() {
         let message = chain(&result.unwrap_err());
         assert!(message.contains("launch outcome is unknown"), "{message}");
         assert!(message.contains("without a session"), "{message}");
+        assert!(!message.contains("different Work"), "{message}");
+        assert!(!output.contains("Work launched"));
+    }
+
+    for missing in [
+        json!({ "session": {} }),
+        json!({ "session": { "run": {} } }),
+    ] {
+        let transport = ScriptedTransport::new(steps(reply(201, missing)));
+        let (result, output) = run_agent_command(&transport, &secrets, &LAUNCH_ARGV);
+        let message = chain(&result.unwrap_err());
+        assert!(message.contains("launch outcome is unknown"), "{message}");
+        assert!(message.contains("without a Work ID"), "{message}");
         assert!(!message.contains("different Work"), "{message}");
         assert!(!output.contains("Work launched"));
     }
@@ -4424,17 +4480,25 @@ fn github_bind_refuses_ambiguity_bad_input_and_lost_replies() {
     assert!(!message.contains("outcome is unknown"));
 
     // A lost reply says to check the list before repeating.
-    let transport = ScriptedTransport::new(vec![
-        reply(
-            200,
-            json!({ "bindings": [binding("b1", "octo-org/one", "111", "connected")] }),
-        ),
+    for last in [
         Scripted::Unreachable,
-    ]);
-    let (result, _) = run_github_command(&transport, &secrets, &plain, &bind);
-    let message = chain(&result.unwrap_err());
-    assert!(message.contains("bind outcome is unknown"));
-    assert!(message.contains("account github bindings"));
+        reply(
+            503,
+            json!({ "code": "github_repository_bindings_unavailable" }),
+        ),
+    ] {
+        let transport = ScriptedTransport::new(vec![
+            reply(
+                200,
+                json!({ "bindings": [binding("b1", "octo-org/one", "111", "connected")] }),
+            ),
+            last,
+        ]);
+        let (result, _) = run_github_command(&transport, &secrets, &plain, &bind);
+        let message = chain(&result.unwrap_err());
+        assert!(message.contains("bind outcome is unknown"));
+        assert!(message.contains("account github bindings"));
+    }
 
     // A binding for a different repository is not accepted as this one.
     let transport = ScriptedTransport::new(vec![
