@@ -4245,6 +4245,10 @@ fn work_launch_reports_unknown_and_refused_outcomes_without_guessing() {
         reply(504, json!({ "code": "gateway_timeout" })),
         reply(409, json!({ "code": "boat_task_outcome_unknown" })),
         reply(409, json!({ "code": "boat_task_receipt_invalid" })),
+        reply(
+            409,
+            json!({ "code": "provider_receipt_conflict", "reconciliationRequired": true }),
+        ),
         Scripted::Reply(CloudResponse {
             status: 201,
             body: b"{".to_vec(),

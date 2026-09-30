@@ -2886,6 +2886,7 @@ fn parse_json_body<T: DeserializeOwned>(body: &[u8]) -> Result<T> {
 pub(crate) struct CloudHttpError {
     status: u16,
     code: Option<String>,
+    reconciliation_required: bool,
 }
 
 impl CloudHttpError {
@@ -2945,6 +2946,7 @@ fn outcome_unknown(err: &anyhow::Error) -> bool {
         || err.downcast_ref::<CloudHttpError>().is_some_and(|http| {
             http.status >= 500
                 || http.status == 408
+                || http.reconciliation_required
                 || http.code().is_some_and(|code| {
                     code.ends_with("_outcome_unknown")
                         || matches!(
@@ -2962,21 +2964,30 @@ fn outcome_unknown(err: &anyhow::Error) -> bool {
 }
 
 fn response_error(response: &CloudResponse) -> anyhow::Error {
-    let code = serde_json::from_slice::<serde_json::Value>(&response.body)
-        .ok()
-        .and_then(|body| {
-            body.get("code")
-                .and_then(serde_json::Value::as_str)
-                .or_else(|| {
-                    body.get("error")
-                        .and_then(|error| error.get("code"))
-                        .and_then(serde_json::Value::as_str)
-                })
-                .and_then(safe_error_code)
-        });
+    let body = serde_json::from_slice::<serde_json::Value>(&response.body).ok();
+    let code = body.as_ref().and_then(|body| {
+        body.get("code")
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| {
+                body.get("error")
+                    .and_then(|error| error.get("code"))
+                    .and_then(serde_json::Value::as_str)
+            })
+            .and_then(safe_error_code)
+    });
+    let reconciliation_required = body.as_ref().is_some_and(|body| {
+        body.get("reconciliationRequired")
+            .or_else(|| {
+                body.get("error")
+                    .and_then(|error| error.get("reconciliationRequired"))
+            })
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+    });
     anyhow::Error::new(CloudHttpError {
         status: response.status,
         code,
+        reconciliation_required,
     })
 }
 
