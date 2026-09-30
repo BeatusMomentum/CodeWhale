@@ -852,7 +852,15 @@ mod tests {
 
         assert!(matches!(error, ToolError::NotAvailable { .. }));
         assert!(message.contains("bocha, duckduckgo"));
-        for provider in ["tavily", "bocha", "metaso", "baidu", "volcengine", "serply", "sofya"] {
+        for provider in [
+            "tavily",
+            "bocha",
+            "metaso",
+            "baidu",
+            "volcengine",
+            "serply",
+            "sofya",
+        ] {
             assert!(
                 message.contains(provider),
                 "configuration hint must name {provider}: `{message}`"
