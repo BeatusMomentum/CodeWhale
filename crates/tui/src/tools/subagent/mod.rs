@@ -11277,16 +11277,6 @@ async fn spawn_subagent_from_input(
         )));
     }
 
-    if let Some(remaining) =
-        crate::retry_status::rate_limit_remaining(&runtime.client.rate_limit_scope())
-    {
-        let seconds = remaining.as_secs() + u64::from(remaining.subsec_nanos() > 0);
-        return Err(ToolError::execution_failed(format!(
-            "Provider is rate-limiting; sub-agent spawning is paused for {seconds}s. \
-             Wait for the current backoff window before starting new agent work."
-        )));
-    }
-
     let mut child_runtime = if spawn_request.detached {
         runtime.background_runtime()
     } else {
@@ -11318,6 +11308,19 @@ async fn spawn_subagent_from_input(
         exact_fleet_binding.is_none(),
     )
     .await?;
+    // The pause is per provider route, so it is checked against the route
+    // the child was just bound to, not the parent's: a 429 on the parent's
+    // provider must not refuse a child headed to another provider or a local
+    // runtime (and a child bound to a paused route is refused either way).
+    if let Some(remaining) =
+        crate::retry_status::rate_limit_remaining(&child_runtime.client.rate_limit_scope())
+    {
+        let seconds = remaining.as_secs() + u64::from(remaining.subsec_nanos() > 0);
+        return Err(ToolError::execution_failed(format!(
+            "Provider is rate-limiting; sub-agent spawning is paused for {seconds}s. \
+             Wait for the current backoff window before starting new agent work."
+        )));
+    }
     if let Some(binding) = exact_fleet_binding {
         let provider = child_runtime.api_config.as_ref().map_or_else(
             || child_runtime.client.api_provider().as_str().to_string(),
