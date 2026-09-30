@@ -667,6 +667,45 @@ async fn parallel_partial_mode_keeps_schema_failures_as_structured_slots() {
     );
 }
 
+/// Audit R06-10: a cancel that lands while `task()` is still waiting on
+/// admission ends the run instead of leaving it parked on the driver.
+#[tokio::test]
+async fn cancel_during_task_admission_ends_the_run() {
+    let driver = Arc::new(FakeDriver::new());
+    driver.on("gate", FakeReply::HoldAdmission);
+    let cancel = WorkflowRunCancel::new();
+    let run_cancel = cancel.clone();
+    let run_driver = driver.clone();
+    let handle = tokio::spawn(async move {
+        WorkflowVm::new()
+            .run_script_with_cancel(
+                r#"await task({ description: "gate" });"#,
+                json!(null),
+                run_driver as Arc<dyn codewhale_workflow_js::WorkflowDriver>,
+                run_cancel,
+            )
+            .await
+    });
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while driver.spawn_count() == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("task should reach admission");
+    cancel.cancel();
+
+    let result = tokio::time::timeout(Duration::from_secs(5), handle)
+        .await
+        .expect("the run must end once cancelled")
+        .expect("VM task should join");
+    assert!(
+        matches!(result, Err(WorkflowJsError::Cancelled)),
+        "{result:?}"
+    );
+}
+
 #[tokio::test]
 async fn parallel_partial_mode_still_fails_the_run_on_cancellation() {
     let driver = Arc::new(FakeDriver::new());
