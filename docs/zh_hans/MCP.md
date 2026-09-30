@@ -248,7 +248,7 @@ Codewhale 同时读取 `servers` 和 `mcpServers`，因此设置页生成的片�
 ```json
 {
   "timeouts": {
-    "connect_timeout": 10,
+    "connect_timeout": 30,
     "execute_timeout": 1800,
     "read_timeout": 120
   },

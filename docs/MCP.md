@@ -378,7 +378,7 @@ The CLI also exposes helper tools when MCP is enabled:
 ```json
 {
   "timeouts": {
-    "connect_timeout": 10,
+    "connect_timeout": 30,
     "execute_timeout": 1800,
     "read_timeout": 120
   },

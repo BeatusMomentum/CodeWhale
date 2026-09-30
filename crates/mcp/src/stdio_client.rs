@@ -35,17 +35,8 @@ use crate::{
 /// because a first `npx`/`uvx` launch may download the server package.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Budget for a single request once the server is up. `tools/call` is
-/// exempt: it gets the dedicated, far longer `CALL_TOOL_TIMEOUT`.
+/// Budget for a single request once the server is up.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
-
-/// Budget for a `tools/call` specifically. A legitimate tool run can take
-/// minutes — builds, test suites, long scripts driven through an MCP server —
-/// and cutting those off at the generic request budget returned "timed out"
-/// for healthy work. Still bounded (30 minutes) so a wedged server cannot
-/// hang a consumer forever; the value matches the TUI pool's default
-/// `execute_timeout`.
-const CALL_TOOL_TIMEOUT: Duration = Duration::from_secs(1800);
 
 /// How long a dropped client waits for a graceful exit after closing stdin
 /// before it kills the child.
@@ -750,13 +741,12 @@ impl McpManagedClient for ChildProcessMcpClient {
         // The server's result is returned verbatim, including an `isError`
         // content payload: reinterpreting it here would replace what the
         // server actually said with our guess about it.
-        self.request_with_timeout(
+        self.request(
             "tools/call",
             json!({
                 "name": tool_name,
                 "arguments": arguments
             }),
-            CALL_TOOL_TIMEOUT,
         )
     }
 
@@ -1808,52 +1798,5 @@ done
 
         // The stub's fabricated tools must be gone.
         assert!(client.call_tool("health", json!({})).is_err());
-    }
-
-    #[test]
-    fn tools_call_gets_a_dedicated_budget_longer_than_the_generic_request_budget() {
-        assert_eq!(REQUEST_TIMEOUT, Duration::from_secs(120));
-        assert_eq!(CALL_TOOL_TIMEOUT, Duration::from_secs(1800));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn a_slow_tools_call_outlives_the_generic_request_budget_while_other_requests_keep_it() {
-        let script = r#"
-while IFS= read -r line; do
-  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
-  method=$(printf '%s' "$line" | sed -n 's/.*"method":"\([^"]*\)".*/\1/p')
-  case "$method" in
-    initialize)
-      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{},"resources":{}},"serverInfo":{"name":"slow-tool","version":"1"}}}\n' "$id"
-      ;;
-    tools/call)
-      # Answer well past the generic budget the test injects below, but
-      # far inside the dedicated tools/call budget.
-      sleep 2
-      printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"done"}]}}\n' "$id"
-      ;;
-  esac
-done
-"#;
-        let client = ChildProcessMcpClient::spawn_with_timeouts(
-            &config("/bin/sh", &["-c", script]),
-            Duration::from_secs(5),
-            // Generic request budget: shorter than the tool's 2s execution.
-            Duration::from_millis(500),
-        )
-        .expect("handshake");
-
-        let result = client
-            .call_tool("slow", json!({}))
-            .expect("tools/call must use its dedicated budget, not the generic one");
-        assert_eq!(result["content"][0]["text"], "done");
-
-        // A non-tools/call request stays on the generic budget it always had.
-        let error = client.read_resource("file:///slow").unwrap_err();
-        assert!(
-            error.to_string().contains("resources/read timed out"),
-            "non-tools/call requests must fail at the generic budget: {error:#}"
-        );
     }
 }
