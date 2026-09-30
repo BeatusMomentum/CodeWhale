@@ -355,10 +355,19 @@ pub fn parse_bun_version(banner: &str) -> Option<(u32, u32, u32)> {
 }
 
 /// The oldest Bun the extension host is validated on: the release the
-/// `Bun.plugin` module shim, `--no-install`, `--no-env-file` and the `bun:ffi`
-/// lockdown were tested against (1.4.0 locally, 1.4.2 on Linux). CI pins its
-/// Bun leg to this version.
+/// `Bun.plugin` module shim, `--no-install`, `--no-env-file`, the macOS
+/// memory limit and the native-code lockdown were tested against (1.4.0 on
+/// macOS, 1.4.2 on Linux). CI pins its Bun leg to this version. A newer Bun
+/// on which a lock no longer holds fails the host's start
+/// (`extension-host/src/runtime.ts`).
 pub const BUN_MIN_VERSION_FOR_EXTENSION_HOST: (u32, u32, u32) = (1, 4, 0);
+
+/// Node flags that switch off builtins able to load native code in-process:
+/// `node:sqlite` (SQLite extensions are `dlopen`ed even under `--no-addons`)
+/// and `node:ffi` (on by default where it exists: Node 26.10 has it, 22.20 and
+/// 24.19 reject the flag). Each is passed only when the chosen Node accepts
+/// it; the host refuses to start if either builtin is still available.
+pub const NODE_NATIVE_CODE_FLAGS: &[&str] = &["--no-experimental-sqlite", "--no-experimental-ffi"];
 
 /// A JavaScript runtime that can run the extension host.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -414,6 +423,8 @@ pub struct HostRuntime {
     pub kind: HostRuntimeKind,
     pub path: PathBuf,
     pub version: (u32, u32, u32),
+    /// Node: the [`NODE_NATIVE_CODE_FLAGS`] this Node accepts. Empty for Bun.
+    pub native_code_flags: Vec<&'static str>,
 }
 
 impl HostRuntime {
@@ -486,6 +497,22 @@ impl HostRuntimeResolution {
     }
 }
 
+/// A probe of a runtime binary: no inherited environment (no credentials, no
+/// `NODE_OPTIONS` preloads), since it runs unsandboxed; Windows needs
+/// `SystemRoot` to load system DLLs.
+fn probe_command(path: &Path) -> Command {
+    let mut cmd = Command::new(path);
+    crate::utils::suppress_console_window(&mut cmd);
+    cmd.env_clear();
+    #[cfg(windows)]
+    if let Some(root) = std::env::var_os("SystemRoot") {
+        cmd.env("SystemRoot", root);
+    }
+    cmd.stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    cmd
+}
+
 fn probe_runtime_version(kind: HostRuntimeKind, path: &Path) -> Result<(u32, u32, u32), String> {
     // Only absolute candidates are run: a relative `PATH` entry resolves
     // against the current (workspace) directory, where a repository could
@@ -493,19 +520,8 @@ fn probe_runtime_version(kind: HostRuntimeKind, path: &Path) -> Result<(u32, u32
     if !path.is_absolute() {
         return Err("not an absolute path; skipped".to_string());
     }
-    let mut cmd = Command::new(path);
-    crate::utils::suppress_console_window(&mut cmd);
-    // The probe runs unsandboxed, so it gets no inherited environment (no
-    // credentials, no NODE_OPTIONS preloads); Windows needs SystemRoot to
-    // load system DLLs.
-    cmd.env_clear();
-    #[cfg(windows)]
-    if let Some(root) = std::env::var_os("SystemRoot") {
-        cmd.env("SystemRoot", root);
-    }
-    cmd.arg("--version")
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+    let mut cmd = probe_command(path);
+    cmd.arg("--version");
     let output = cmd
         .output()
         .map_err(|error| format!("does not start ({error})"))?;
@@ -526,10 +542,6 @@ fn probe_runtime_version(kind: HostRuntimeKind, path: &Path) -> Result<(u32, u32
 /// [`resolve_node`] keeps its single-probe contract for `js_execution`.
 #[must_use]
 pub fn resolve_node_for_extension_host(override_path: Option<&Path>) -> NodeResolution {
-    let mut candidates: Vec<PathBuf> = Vec::new();
-    if let Some(path) = override_path {
-        candidates.push(path.to_path_buf());
-    }
     select_runtime(
         HostRuntimeKind::Node,
         runtime_candidates(HostRuntimeKind::Node, override_path),
@@ -590,6 +602,10 @@ fn select_host_runtime(
     };
     let pick = |kind: HostRuntimeKind, probe: &NodeResolution| {
         probe.selected.clone().map(|(path, version)| HostRuntime {
+            native_code_flags: match kind {
+                HostRuntimeKind::Bun => Vec::new(),
+                HostRuntimeKind::Node => accepted_flags(&path, NODE_NATIVE_CODE_FLAGS),
+            },
             kind,
             path,
             version,
@@ -606,6 +622,21 @@ fn select_host_runtime(
         resolution.node = Some(node);
     }
     resolution
+}
+
+/// The `flags` a runtime starts with (`<runtime> <flag> --version` exits 0).
+/// Blocking: one short probe per flag.
+fn accepted_flags(path: &Path, flags: &[&'static str]) -> Vec<&'static str> {
+    flags
+        .iter()
+        .copied()
+        .filter(|flag| {
+            let mut cmd = probe_command(path);
+            cmd.args([*flag, "--version"])
+                .stdout(std::process::Stdio::null());
+            cmd.status().is_ok_and(|status| status.success())
+        })
+        .collect()
 }
 
 fn select_runtime(kind: HostRuntimeKind, candidates: Vec<PathBuf>) -> NodeResolution {
@@ -1187,7 +1218,12 @@ mod tests {
         };
         let bun = script("bun", "echo 1.4.0");
         let old_bun = script("old-bun", "echo 1.3.14");
-        let node = script("node", "echo v24.1.0");
+        // A Node without `node:ffi`: it rejects `--no-experimental-ffi` the
+        // way Node 22 and 24 do.
+        let node = script(
+            "node",
+            "case \"$1\" in --no-experimental-ffi) echo 'bad option' >&2; exit 9;; esac\necho v24.1.0",
+        );
 
         // auto: a supported Bun wins, and Node is never probed.
         let auto = select_host_runtime(
@@ -1199,6 +1235,7 @@ mod tests {
         assert_eq!(selected.kind, HostRuntimeKind::Bun);
         assert_eq!(selected.path, bun);
         assert_eq!(selected.version_string(), "1.4.0");
+        assert!(selected.native_code_flags.is_empty());
         assert!(
             auto.summary().starts_with("bun 1.4.0 at "),
             "{}",
@@ -1245,7 +1282,13 @@ mod tests {
             || panic!("runtime = \"node\" must not probe bun"),
             || vec![node.clone()],
         );
-        assert_eq!(node_only.selected.unwrap().kind, HostRuntimeKind::Node);
+        let node_runtime = node_only.selected.unwrap();
+        assert_eq!(node_runtime.kind, HostRuntimeKind::Node);
+        // Only the flags this Node starts with are passed.
+        assert_eq!(
+            node_runtime.native_code_flags,
+            vec!["--no-experimental-sqlite"]
+        );
         assert!(node_only.bun.is_none());
     }
 

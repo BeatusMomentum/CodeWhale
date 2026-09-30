@@ -25,6 +25,8 @@ test('handshake reports protocol 1 and the digest of the running bundle', async 
   // The real runtime, not Bun's emulated `process.versions.node`.
   assert.deepEqual(host.hello.runtime, IS_BUN ? { name: 'bun', version: process.versions.bun } : { name: 'node', version: process.versions.node })
   assert.equal(host.hello.node_version, undefined)
+  // No limit was asked for, so none is reported.
+  assert.equal(host.hello.memory_limit_mib, undefined)
   t.diagnostic(`spawn → host/ready: ${host.readyMs.toFixed(1)} ms`)
 })
 
@@ -145,26 +147,86 @@ test('a DSH peer or a second Cordis shipped in node_modules is refused, not load
   assert.match(cordis.diagnostic, /requires `@deepseek-ai\/cordis/)
 })
 
-test('plugins cannot load native code in-process', async (t) => {
+test('plugins cannot run native code in-process', async (t) => {
   const host = await startHost()
-  const dlopen = tempPlugin("export function apply() { process.dlopen({ exports: {} }, '/nonexistent/libc.so') }\n")
-  t.after(async () => { await host.stop(); dlopen.cleanup() })
-  const refused = (await activate(host, 'dlopen', dlopen.entry)).result
-  assert.equal(refused.status, 'failed')
-  assert.match(refused.diagnostic, /process\.dlopen is not available to extensions/)
-  if (!IS_BUN) return
-  // `bun:ffi` fails at import, however it is reached.
-  for (const [name, source] of [
-    ['ffi-static', "import { dlopen } from 'bun:ffi'\nexport function apply() { dlopen('libc', {}) }\n"],
-    ['ffi-dynamic', "export async function apply() { const { dlopen } = await import('bun:ffi'); dlopen('libc', {}) }\n"],
-    ['ffi-require', "import { createRequire } from 'node:module'\nexport function apply() { createRequire(import.meta.url)('bun:ffi').dlopen('libc', {}) }\n"],
-  ]) {
+  t.after(() => host.stop())
+  // Each case must fail activation with the given diagnostic.
+  const cases = [
+    ['dlopen', "export function apply() { process.dlopen({ exports: {} }, '/nonexistent/libc.so') }\n", /process\.dlopen is not available to extensions/],
+    // A Worker is a new realm that the host's lockdown never reaches.
+    ['worker', "import { Worker } from 'node:worker_threads'\nexport function apply() { new Worker('1', { eval: true }) }\n", /`Worker` is not available to extensions/],
+    ['worker-execargv', "import { createRequire } from 'node:module'\nexport function apply() { const { Worker } = createRequire(import.meta.url)('worker_threads'); new Worker('1', { eval: true, execArgv: [] }) }\n", /`Worker` is not available to extensions/],
+  ]
+  if (IS_BUN) {
+    // `bun:ffi` fails at import, however it is reached.
+    cases.push(
+      ['ffi-static', "import { dlopen } from 'bun:ffi'\nexport function apply() { dlopen('libc', {}) }\n", /`bun:ffi` is not available to extensions/],
+      ['ffi-dynamic', "export async function apply() { const { dlopen } = await import('bun:ffi'); dlopen('libc', {}) }\n", /`bun:ffi` is not available to extensions/],
+      ['ffi-require', "import { createRequire } from 'node:module'\nexport function apply() { createRequire(import.meta.url)('bun:ffi').dlopen('libc', {}) }\n", /`bun:ffi` is not available to extensions/],
+      ['ffi-global', "export function apply() { Bun.FFI.dlopen('/usr/lib/libSystem.B.dylib', {}) }\n", /`Bun\.FFI` is not available to extensions/],
+      ['ffi-global-swap', "export function apply() { Bun.FFI = {}; }\n", /readonly|read-only|read only/i],
+      ['bun-sqlite', "import { Database } from 'bun:sqlite'\nexport function apply() { Database.setCustomSQLite('/nonexistent/libsqlite3.dylib') }\n", /`bun:sqlite` is not available to extensions/],
+      ['node-sqlite', "import { DatabaseSync } from 'node:sqlite'\nexport function apply() { new DatabaseSync(':memory:').exec('select 1') }\n", /`node:sqlite` is not available to extensions/],
+      ['web-worker', "export function apply() { new Worker(URL.createObjectURL(new Blob(['1']))) }\n", /`Worker` is not available to extensions/],
+      // A ShadowRealm imports a fresh `bun:ffi`, and a `node:vm` context would hand its constructor out.
+      ['shadow-realm', "import vm from 'node:vm'\nexport async function apply() { const Realm = globalThis.ShadowRealm ?? vm.runInNewContext('globalThis.ShadowRealm'); if (!Realm) throw new Error('no ShadowRealm'); await new Realm().importValue('bun:ffi', 'dlopen') }\n", /no ShadowRealm/],
+    )
+  } else {
+    // Switched off by launcher flags (`node:ffi` only exists in newer Node).
+    cases.push(
+      ['node-sqlite', "import { DatabaseSync } from 'node:sqlite'\nexport function apply() { new DatabaseSync(':memory:', { allowExtension: true }) }\n", /node:sqlite/],
+      ['node-ffi', "export async function apply() { const ffi = await import('node:ffi'); ffi.dlopen('/usr/lib/libSystem.B.dylib') }\n", /node:ffi/],
+    )
+  }
+  // Last: if it got through, it would replace the host.
+  if (typeof process.execve === 'function') {
+    cases.push(['execve', "export function apply() { process.execve(process.execPath, [process.execPath, '-e', '0']) }\n", /process\.execve is not available to extensions/])
+  }
+  // Every case runs, so a regression names each entry point that opened up.
+  // A case that ends the host (an `execve` that got through) ends the run.
+  const reachable = []
+  for (const [name, source, diagnostic] of cases) {
     const plugin = tempPlugin(source)
     t.after(plugin.cleanup)
-    const result = (await activate(host, name, plugin.entry)).result
-    assert.equal(result.status, 'failed', name)
-    assert.match(result.diagnostic, /`bun:ffi` is not available to extensions/, name)
+    const result = await Promise.race([
+      activate(host, name, plugin.entry).then(({ result }) => result),
+      host.exit.then(() => ({ status: 'host exited' })),
+    ])
+    if (result.status !== 'failed' || !diagnostic.test(result.diagnostic)) reachable.push(`${name}: ${result.status} ${result.diagnostic ?? ''}`)
+    if (result.status === 'host exited') break
   }
+  assert.deepEqual(reachable, [])
+})
+
+test('a host asked for a kernel memory limit applies it only on Bun on macOS', async (t) => {
+  const plugin = tempPlugin(`export const inject = ['tools']
+export function apply(ctx) {
+  ctx.tools.register({ name: 'pid', description: '', parameters: { type: 'object', properties: {} }, execute: () => String(process.pid) })
+  ctx.tools.register({ name: 'hog', description: '', parameters: { type: 'object', properties: {} }, async execute() {
+    const chunks = []
+    for (let i = 0; i < 32; i++) { chunks.push(Buffer.alloc(64 * 1024 * 1024, 1)); await new Promise((resolve) => setTimeout(resolve, 5)) }
+    return String(chunks.length)
+  } })
+}
+`)
+  const host = await startHost({ env: { CODEWHALE_HOST_MEMORY_LIMIT_MIB: '300' } })
+  t.after(async () => { await host.stop(); plugin.cleanup() })
+  const { result } = await activate(host, 'memory', plugin.entry)
+  assert.equal(result.status, 'ok')
+  const [pid, hog] = host.registry.filter((entry) => entry.op === 'register').map((entry) => entry.handle)
+  if (!(IS_BUN && process.platform === 'darwin')) {
+    assert.equal(host.hello.memory_limit_mib, undefined)
+    assert.match(host.stderr, /kernel memory limit not applied: only Bun on macOS/)
+    return
+  }
+  assert.equal(host.hello.memory_limit_mib, 300)
+  // Re-executed in place: the pid the core spawned is the one running plugins.
+  const running = await host.call('tool/call', { handle: pid, call_id: 'p', input: {}, deadline_ms: 5000 })
+  assert.equal(Number(running.content[0].text), host.child.pid)
+  // 2 GiB against a 300 MiB limit: the kernel kills the host.
+  host.request('tool/call', { handle: hog, call_id: 'h', input: {}, deadline_ms: 30_000 })
+  const exit = await Promise.race([host.exit, new Promise((resolve) => setTimeout(() => resolve('still running'), 20_000))])
+  assert.deepEqual(exit, { code: null, signal: 'SIGKILL' })
 })
 
 test('a Bun host never auto-installs a missing package', { skip: !IS_BUN && 'Bun only' }, async (t) => {

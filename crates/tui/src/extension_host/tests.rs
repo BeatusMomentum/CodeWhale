@@ -2119,6 +2119,38 @@ fn bun_manager(
 }
 
 #[test]
+fn a_table_that_sets_only_node_keeps_running_node() {
+    use crate::config::{ExtensionHostConfig, ExtensionHostRuntime as Choice};
+    let parse = |text: &str| toml::from_str::<ExtensionHostConfig>(text).unwrap();
+    assert_eq!(parse("").effective_runtime(), Choice::Auto);
+    // A pre-Bun config that pinned its Node keeps it.
+    assert_eq!(
+        parse("node = \"/opt/node\"").effective_runtime(),
+        Choice::Node
+    );
+    assert_eq!(
+        parse("bun = \"/opt/bun\"").effective_runtime(),
+        Choice::Auto
+    );
+    assert_eq!(
+        parse("node = \"/n\"\nbun = \"/b\"").effective_runtime(),
+        Choice::Auto
+    );
+    assert_eq!(
+        parse("runtime = \"bun\"\nnode = \"/n\"").effective_runtime(),
+        Choice::Bun
+    );
+    assert!(toml::from_str::<ExtensionHostConfig>("runtime = \"deno\"").is_err());
+    let options = ExtensionHostOptions::from_config(Some(&parse("node = \"~/node\"")));
+    assert_eq!(options.runtime, Choice::Node);
+    assert!(!options.node_override.unwrap().starts_with("~"));
+    assert_eq!(
+        ExtensionHostOptions::from_config(None).runtime,
+        Choice::Auto
+    );
+}
+
+#[test]
 fn launch_plan_gives_each_runtime_its_own_flags() {
     use crate::dependencies::{HostRuntime, HostRuntimeKind};
     let home = tempfile::tempdir().unwrap();
@@ -2134,6 +2166,8 @@ fn launch_plan_gives_each_runtime_its_own_flags() {
                 "--max-old-space-size=256",
                 "--disable-proto=throw",
                 "--no-addons",
+                "--no-experimental-sqlite",
+                "--no-experimental-ffi",
             ],
         ),
     ] {
@@ -2141,6 +2175,10 @@ fn launch_plan_gives_each_runtime_its_own_flags() {
             kind,
             path: PathBuf::from("/opt/runtime/bin").join(kind.name()),
             version: (1, 4, 0),
+            native_code_flags: match kind {
+                HostRuntimeKind::Bun => Vec::new(),
+                HostRuntimeKind::Node => crate::dependencies::NODE_NATIVE_CODE_FLAGS.to_vec(),
+            },
         };
         let launch =
             super::supervisor::plan_launch(&runtime, &bundle, home.path(), 1 << 30).unwrap();
@@ -2156,14 +2194,46 @@ fn launch_plan_gives_each_runtime_its_own_flags() {
         }
         assert_eq!(launch.runtime, runtime);
         assert_eq!(launch.memory_cap, 1 << 30);
+        assert_eq!(
+            launch.memory,
+            super::supervisor::MemoryEnforcement::planned(kind)
+        );
+        let shadow_realm_off = launch
+            .runtime_env
+            .contains(&("BUN_JSC_useShadowRealm".to_string(), "0".to_string()));
         if kind == HostRuntimeKind::Bun {
+            assert!(shadow_realm_off, "{:?}", launch.runtime_env);
             assert!(
                 !launch
                     .args
                     .iter()
                     .any(|arg| arg.starts_with("--max-old-space"))
             );
+        } else {
+            assert!(launch.runtime_env.is_empty(), "{:?}", launch.runtime_env);
         }
+    }
+    // Where the kernel limit comes from on each platform.
+    use super::supervisor::MemoryEnforcement;
+    let (bun, node) = (
+        MemoryEnforcement::planned(HostRuntimeKind::Bun),
+        MemoryEnforcement::planned(HostRuntimeKind::Node),
+    );
+    if cfg!(target_os = "macos") {
+        assert_eq!(
+            (bun, node),
+            (MemoryEnforcement::Jetsam, MemoryEnforcement::Heartbeat)
+        );
+    } else if cfg!(target_os = "linux") {
+        assert_eq!(
+            (bun, node),
+            (MemoryEnforcement::Rlimit, MemoryEnforcement::Rlimit)
+        );
+    } else if cfg!(windows) {
+        assert_eq!(
+            (bun, node),
+            (MemoryEnforcement::JobObject, MemoryEnforcement::JobObject)
+        );
     }
 }
 
@@ -2172,14 +2242,14 @@ async fn handshake_refuses_a_host_on_a_different_runtime_than_launched() {
     let Some(node) = node_for_tests("handshake_refuses_a_different_runtime") else {
         return;
     };
-    use crate::dependencies::{HostRuntime, HostRuntimeKind};
+    use crate::dependencies::HostRuntimeKind;
     let home = tempfile::tempdir().unwrap();
     let bundle = super::materialize_bundle(home.path()).unwrap();
-    let runtime = HostRuntime {
-        kind: HostRuntimeKind::Node,
-        path: node,
-        version: (24, 0, 0),
-    };
+    // Resolved, so the Node gets the native-code flags it accepts.
+    let runtime =
+        crate::dependencies::resolve_extension_host_runtime(NODE, Some(node.as_path()), None)
+            .selected
+            .expect("the test Node resolves");
     let mut launch =
         super::supervisor::plan_launch(&runtime, &bundle, home.path(), 1 << 30).unwrap();
     // The core believes it launched Bun; the host truthfully says Node.
@@ -2286,11 +2356,23 @@ async fn bun_host_runs_the_dsh_plugin_reports_bun_and_restarts_on_bun() {
 }
 
 /// The cap holds for memory outside the JS heap too (Buffers), which Node's
-/// `--max-old-space-size` never bounded. Linux: the kernel fails the
-/// allocation at 1 GiB. macOS: the heartbeat check kills the host.
-async fn memory_hog_is_stopped(manager: Arc<ExtensionHostManager>, fixture: &FixturePlugins) {
+/// `--max-old-space-size` never bounded. Linux and Windows: the kernel fails
+/// the allocation at 1 GiB. macOS: Bun's jetsam limit gets the host killed by
+/// the kernel; a Node host is killed by the heartbeat check.
+async fn memory_hog_is_stopped(
+    manager: Arc<ExtensionHostManager>,
+    fixture: &FixturePlugins,
+    kind: crate::dependencies::HostRuntimeKind,
+) {
+    use super::supervisor::MemoryEnforcement;
     let engine = manager.attach(fixture.registry());
     engine.sync().await.unwrap();
+    // The host confirmed the enforcement this platform plans for it (for
+    // macOS + Bun: the jetsam limit it applied to itself, via `host/hello`).
+    let HostStatus::Ready { memory, .. } = manager.status() else {
+        panic!("{:?} {:?}", manager.status(), manager.diagnostics());
+    };
+    assert_eq!(memory, MemoryEnforcement::planned(kind));
     let tool = host_tool(&engine, fixture.workspace(), "memory_hog");
     let context = ToolContext::new(fixture.workspace());
     let outcome = tokio::time::timeout(
@@ -2310,12 +2392,17 @@ async fn memory_hog_is_stopped(manager: Arc<ExtensionHostManager>, fixture: &Fix
         }
         Err(other) => panic!("unexpected error: {other:?}"),
     }
-    if cfg!(target_os = "macos") {
+    let stopped_by = match memory {
+        MemoryEnforcement::Jetsam => Some("exceeds its 400 MiB memory limit"),
+        MemoryEnforcement::Heartbeat => Some("exceeded its memory cap"),
+        _ => None,
+    };
+    if let Some(stopped_by) = stopped_by {
         assert!(
             manager
                 .diagnostics()
                 .iter()
-                .any(|line| line.contains("exceeded its memory cap")),
+                .any(|line| line.contains(stopped_by)),
             "{:?}",
             manager.diagnostics()
         );
@@ -2326,7 +2413,8 @@ async fn memory_hog_is_stopped(manager: Arc<ExtensionHostManager>, fixture: &Fix
 fn memory_cap_supervision() -> super::SupervisionOptions {
     super::SupervisionOptions {
         // Linux cannot start either runtime under much less than 1 GiB of
-        // RLIMIT_DATA (see `HOST_MEMORY_CAP`); macOS checks resident size.
+        // RLIMIT_DATA (see `HOST_MEMORY_CAP`); on macOS 400 MiB keeps the
+        // test fast for both the jetsam limit and the heartbeat check.
         memory_cap: if cfg!(target_os = "macos") {
             400 << 20
         } else {
@@ -2336,7 +2424,7 @@ fn memory_cap_supervision() -> super::SupervisionOptions {
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 #[tokio::test]
 async fn memory_cap_stops_a_node_host() {
     let Some(node) = node_for_tests("memory_cap_stops_a_node_host") else {
@@ -2351,10 +2439,15 @@ async fn memory_cap_stops_a_node_host() {
         root: Some(fixture.root.clone()),
         supervision: memory_cap_supervision(),
     }));
-    memory_hog_is_stopped(manager, &fixture).await;
+    memory_hog_is_stopped(
+        manager,
+        &fixture,
+        crate::dependencies::HostRuntimeKind::Node,
+    )
+    .await;
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 #[tokio::test]
 async fn memory_cap_stops_a_bun_host() {
     let Some(bun) = bun_for_tests("memory_cap_stops_a_bun_host") else {
@@ -2363,5 +2456,5 @@ async fn memory_cap_stops_a_bun_host() {
     let _policy = TestPolicyGuard::extension_host(true);
     let fixture = FixturePlugins::new(&["memory-hog"]).await;
     let manager = bun_manager(&fixture, bun, memory_cap_supervision());
-    memory_hog_is_stopped(manager, &fixture).await;
+    memory_hog_is_stopped(manager, &fixture, crate::dependencies::HostRuntimeKind::Bun).await;
 }

@@ -1742,11 +1742,13 @@ pub fn model_completion_names_for_provider(provider: ApiProvider) -> Vec<&'stati
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ExtensionHostConfig {
-    /// Which runtime runs the host: `auto` (default: Bun when a supported one
-    /// is found, else Node), `bun`, or `node`. An explicit choice never falls
-    /// back to the other runtime.
+    /// Which runtime runs the host: `auto` (Bun when a supported one is
+    /// found, else Node), `bun`, or `node`. An explicit choice never falls
+    /// back to the other runtime. Unset means `auto`, except that a table
+    /// setting only `node` keeps meaning "run the host on this Node", as it
+    /// did before Bun support ([`Self::effective_runtime`]).
     #[serde(default)]
-    pub runtime: ExtensionHostRuntime,
+    pub runtime: Option<ExtensionHostRuntime>,
     /// Path to a Node.js runtime (>= 22.19). Tried before every `node` on
     /// `PATH`; each candidate must actually run and meet the floor.
     #[serde(default)]
@@ -1755,6 +1757,19 @@ pub struct ExtensionHostConfig {
     /// and `~/.bun/bin/bun`.
     #[serde(default)]
     pub bun: Option<String>,
+}
+
+impl ExtensionHostConfig {
+    /// `runtime` as configured, else `node` when only a Node path is set,
+    /// else `auto`.
+    #[must_use]
+    pub fn effective_runtime(&self) -> ExtensionHostRuntime {
+        match (self.runtime, &self.node, &self.bun) {
+            (Some(runtime), _, _) => runtime,
+            (None, Some(_), None) => ExtensionHostRuntime::Node,
+            (None, _, _) => ExtensionHostRuntime::Auto,
+        }
+    }
 }
 
 /// `[extension_host] runtime`.

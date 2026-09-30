@@ -151,6 +151,11 @@ pub struct HelloParams {
     /// The runtime actually running the host. Under Bun this comes from
     /// `process.versions.bun`, not the Node version Bun emulates.
     pub runtime: HelloRuntime,
+    /// A kernel memory limit the host applied to itself before loading any
+    /// plugin, in MiB: macOS + Bun, when the core asked for one
+    /// (`supervisor::MemoryEnforcement::Jetsam`). Absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_limit_mib: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

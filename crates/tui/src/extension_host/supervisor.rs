@@ -18,20 +18,28 @@
 //! with the user's permissions, and `/plugin` says so.
 //!
 //! **Runtime.** Bun (preferred) or Node, chosen once per manager
-//! (`[extension_host] runtime`). Each gets its own flags ([`runtime_args`]);
-//! Bun silently ignores Node's heap and `__proto__` flags.
+//! (`[extension_host] runtime`). Each gets its own flags ([`runtime_args`])
+//! and environment ([`runtime_env`]); Bun silently ignores Node's heap and
+//! `__proto__` flags. The host itself takes in-process native code away from
+//! plugins (`extension-host/src/runtime.ts`: `bun:ffi`, `Bun.FFI`, SQLite
+//! extension loading, Worker threads, ShadowRealm, `process.dlopen`) and
+//! refuses to start if a lock does not hold.
 //!
-//! **Memory cap.** On Linux the kernel enforces it: `RLIMIT_DATA` is set in
-//! the child before exec, so an allocation past the cap fails, on either
-//! runtime. macOS rejects `setrlimit(RLIMIT_DATA/RLIMIT_AS)` with `EINVAL`.
-//! Its per-task jetsam limit (`memorystatus_control`) is not permitted
-//! unprivileged, and Bun's JSC heap options (`BUN_JSC_gcMaxHeapSize`,
-//! `forceRAMSize`) do not stop growth (all measured 2026-09-29, macOS 26.1).
-//! So on macOS the supervisor checks the host's resident size at every
-//! heartbeat and kills it past the cap. That is enforced, but only as often as
-//! the heartbeat runs, and it does not count the plugins' own child processes.
-//! Windows has no cap yet. Node still gets `--max-old-space-size=256` on every
-//! platform.
+//! **Memory cap** ([`MemoryEnforcement`]), measured 2026-09-30 on macOS 26.1:
+//! * Linux: `RLIMIT_DATA`, set in the child before exec; an allocation past
+//!   the cap fails, on either runtime. Plugin child processes inherit it.
+//! * Windows: the Job Object's per-process limit; an allocation past the cap
+//!   fails. It applies to each process in the job, plugin children included.
+//! * macOS: `setrlimit(RLIMIT_AS/RLIMIT_DATA)` below the current mapping size
+//!   fails with `EINVAL`, and `memorystatus_control` needs privilege. A fatal
+//!   jetsam limit set as a `posix_spawn` attribute works unprivileged, but a
+//!   later `exec` clears it, so it cannot be set on `sandbox-exec`. The Bun
+//!   host therefore re-executes itself in place with the limit before any
+//!   plugin loads, and reports it in `host/hello`; past the cap the kernel
+//!   SIGKILLs it. Plugin child processes are not covered. Node has no FFI to
+//!   do the same, so a Node host (or a Bun host that could not apply the
+//!   limit) is checked at each heartbeat instead: enforced only as often as
+//!   the heartbeat runs. Node also keeps `--max-old-space-size=256`.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -98,8 +106,72 @@ pub(crate) struct HostLaunch {
     pub sandbox_env: Vec<(String, String)>,
     /// The runtime inside the wrapper; `host/hello` must report the same one.
     pub runtime: HostRuntime,
+    /// Environment the runtime needs ([`runtime_env`]).
+    pub runtime_env: Vec<(String, String)>,
     /// Bytes; see the module docs for how each platform enforces it.
     pub memory_cap: u64,
+    /// How the cap is meant to be enforced; a macOS Bun host confirms its
+    /// jetsam limit in `host/hello` or falls back to the heartbeat check.
+    pub memory: MemoryEnforcement,
+}
+
+/// Environment variable carrying the jetsam limit a macOS Bun host applies to
+/// itself, in MiB (`extension-host/src/runtime.ts`, `applyMemoryLimit`).
+pub(crate) const MEMORY_LIMIT_REQUEST_ENV: &str = "CODEWHALE_HOST_MEMORY_LIMIT_MIB";
+
+/// How the host's memory cap is enforced (module docs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryEnforcement {
+    /// Linux: kernel `RLIMIT_DATA`.
+    Rlimit,
+    /// Windows: the Job Object's per-process memory limit.
+    JobObject,
+    /// macOS + Bun: a fatal jetsam limit the host applied to itself.
+    Jetsam,
+    /// macOS otherwise: resident size checked at each heartbeat.
+    Heartbeat,
+    /// No cap on this platform.
+    Unenforced,
+}
+
+impl MemoryEnforcement {
+    /// What this platform does for `kind`, before the host has confirmed it.
+    #[must_use]
+    pub fn planned(kind: HostRuntimeKind) -> Self {
+        if cfg!(target_os = "linux") {
+            Self::Rlimit
+        } else if cfg!(windows) {
+            Self::JobObject
+        } else if cfg!(target_os = "macos") {
+            match kind {
+                HostRuntimeKind::Bun => Self::Jetsam,
+                HostRuntimeKind::Node => Self::Heartbeat,
+            }
+        } else {
+            Self::Unenforced
+        }
+    }
+
+    /// One line for `/plugin` and doctor.
+    #[must_use]
+    pub fn describe(self, cap: u64) -> String {
+        let mib = cap / (1024 * 1024);
+        match self {
+            Self::Rlimit => format!(
+                "memory cap {mib} MiB (kernel RLIMIT_DATA; plugin child processes inherit it)"
+            ),
+            Self::JobObject => format!(
+                "memory cap {mib} MiB (Job Object per-process limit; plugin child processes included)"
+            ),
+            Self::Jetsam => format!(
+                "memory cap {mib} MiB (kernel jetsam limit; the host is killed past it; plugin child processes are not covered)"
+            ),
+            Self::Heartbeat => format!(
+                "memory cap {mib} MiB (resident size checked at each heartbeat; on macOS only the Bun host gets a kernel limit)"
+            ),
+            Self::Unenforced => "no memory cap on this platform".to_string(),
+        }
+    }
 }
 
 /// The default memory cap. Measured on Linux (2026-09-29): under
@@ -112,16 +184,38 @@ pub const HOST_MEMORY_CAP: u64 = 1 << 30;
 /// Runtime flags, before the bundle path. Keep in sync with
 /// `extension-host/test/harness.mjs` (`HOST_ARGS`).
 ///
-/// - Node: a 256 MB old-space cap, `__proto__` throws, no native addons.
+/// - Node: a 256 MB old-space cap, `__proto__` throws, no native addons,
+///   and the [`crate::dependencies::NODE_NATIVE_CODE_FLAGS`] this Node
+///   accepts (`node:sqlite`, and `node:ffi` where it exists).
 /// - Bun ignores all of those except `--no-addons`. Instead it gets
 ///   `--no-install`, because Bun otherwise fetches a missing package from npm
 ///   while plugin code is running. It also gets `--no-env-file` and
 ///   `--config=<null device>`, because Bun otherwise loads `.env` and
 ///   `bunfig.toml` (which can preload code) from the working directory, and
-///   that directory is the host's writable data dir. `bun:ffi` is locked in
-///   the host itself (`src/runtime.ts`).
+///   that directory is the host's writable data dir. `bun:ffi` and the rest
+///   are locked in the host itself (`src/runtime.ts`).
 #[must_use]
-pub(crate) fn runtime_args(kind: HostRuntimeKind) -> &'static [&'static str] {
+pub(crate) fn runtime_args(runtime: &HostRuntime) -> Vec<String> {
+    base_runtime_args(runtime.kind)
+        .iter()
+        .chain(&runtime.native_code_flags)
+        .map(|arg| (*arg).to_string())
+        .collect()
+}
+
+/// Environment for the runtime. Keep in sync with `HOST_ENV` in
+/// `extension-host/test/harness.mjs`. Bun: no ShadowRealm, engine-wide
+/// (a realm imports a fresh `bun:ffi`; `node:vm` contexts would otherwise
+/// hand the constructor out). The host refuses to start without it.
+#[must_use]
+pub(crate) fn runtime_env(kind: HostRuntimeKind) -> Vec<(String, String)> {
+    match kind {
+        HostRuntimeKind::Bun => vec![("BUN_JSC_useShadowRealm".to_string(), "0".to_string())],
+        HostRuntimeKind::Node => Vec::new(),
+    }
+}
+
+fn base_runtime_args(kind: HostRuntimeKind) -> &'static [&'static str] {
     match kind {
         HostRuntimeKind::Node => &[
             "--max-old-space-size=256",
@@ -253,11 +347,8 @@ pub(crate) fn plan_launch(
     let data = home.join("extension-host").join("data");
     std::fs::create_dir_all(&data)
         .map_err(|error| format!("cannot create {}: {error}", data.display()))?;
-    let args: Vec<String> = runtime_args(runtime.kind)
-        .iter()
-        .map(|arg| (*arg).to_string())
-        .chain(std::iter::once(bundle.to_string_lossy().into_owned()))
-        .collect();
+    let mut args = runtime_args(runtime);
+    args.push(bundle.to_string_lossy().into_owned());
     let unsandboxed = HostLaunch {
         program: runtime.path.clone(),
         args: args.clone(),
@@ -265,7 +356,9 @@ pub(crate) fn plan_launch(
         sandbox: None,
         sandbox_env: Vec::new(),
         runtime: runtime.clone(),
+        runtime_env: runtime_env(runtime.kind),
         memory_cap,
+        memory: MemoryEnforcement::planned(runtime.kind),
     };
     if cfg!(windows) {
         // The Windows helper is process containment only; ProcessTree already
@@ -295,14 +388,13 @@ pub(crate) fn plan_launch(
         cwd: env.cwd,
         sandbox: Some(env.sandbox_type.to_string()),
         sandbox_env: env.env.into_iter().collect(),
-        runtime: runtime.clone(),
-        memory_cap,
+        ..unsandboxed
     })
 }
 
-/// The kernel-enforced part of the memory cap: `RLIMIT_DATA` on Linux (see
-/// the module docs for why nothing equivalent exists on macOS). Applied in
-/// the child between fork and exec, so only the host is limited.
+/// The kernel-enforced memory cap on Linux: `RLIMIT_DATA`, applied in the
+/// child between fork and exec, so only the host (and what it starts) is
+/// limited.
 #[cfg(target_os = "linux")]
 fn limit_child_memory(command: &mut tokio::process::Command, cap: u64) {
     // SAFETY: the closure runs in the forked child before exec and calls only
@@ -343,25 +435,35 @@ pub(crate) fn resident_bytes(pid: u32) -> Option<u64> {
     (written == size).then(|| unsafe { info.assume_init() }.pti_resident_size)
 }
 
-/// Platforms without a supervisor-side check (Linux uses `RLIMIT_DATA`).
+/// Platforms without a supervisor-side check (Linux uses `RLIMIT_DATA`,
+/// Windows the Job Object).
 #[cfg(not(target_os = "macos"))]
 pub(crate) fn resident_bytes(_pid: u32) -> Option<u64> {
     None
 }
 
-/// How the memory cap is enforced here, for `/plugin` and doctor.
-#[must_use]
-pub fn memory_cap_posture(cap: u64) -> String {
-    let mib = cap / (1024 * 1024);
-    if cfg!(target_os = "linux") {
-        format!("memory cap {mib} MiB (kernel RLIMIT_DATA)")
-    } else if cfg!(target_os = "macos") {
-        format!(
-            "memory cap {mib} MiB (resident size checked at each heartbeat; macOS offers no unprivileged kernel limit)"
-        )
-    } else {
-        "no memory cap on this platform".to_string()
+/// `exited with …`, naming the memory limit when a jetsam kill is the likely
+/// cause: the kernel's only signal for it is SIGKILL, which otherwise reads
+/// like a crash.
+fn exit_reason(
+    status: std::process::ExitStatus,
+    memory: Option<MemoryEnforcement>,
+    cap: u64,
+) -> String {
+    let reason = format!("exited with {status}");
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt as _;
+        if status.signal() == Some(libc::SIGKILL) && memory == Some(MemoryEnforcement::Jetsam) {
+            return format!(
+                "{reason}; the kernel kills the host this way when it exceeds its {} MiB memory limit",
+                cap / (1024 * 1024)
+            );
+        }
     }
+    #[cfg(not(unix))]
+    let _ = (memory, cap);
+    reason
 }
 
 /// Callbacks from the channel into the manager.
@@ -397,6 +499,8 @@ pub(crate) struct HostProcess {
     /// Runtime version as reported by the host in `host/hello`.
     pub runtime_version: std::sync::OnceLock<String>,
     pub memory_cap: u64,
+    /// How the cap is enforced for this process, settled at the handshake.
+    memory: Arc<std::sync::OnceLock<MemoryEnforcement>>,
     /// `seatbelt` / `bwrap`, or `None` when unsandboxed.
     pub sandbox: Option<String>,
     tree: Arc<crate::process_tree::ProcessTree>,
@@ -452,10 +556,18 @@ impl HostProcess {
         // that group when the core goes away (stdin EOF, or a parent change
         // seen by its watchdog thread).
         let own_group = if cfg!(unix) { "1" } else { "0" };
+        let memory_request = (launch.memory == MemoryEnforcement::Jetsam)
+            .then(|| (launch.memory_cap / (1024 * 1024)).max(1).to_string());
         let overrides = launch
             .sandbox_env
             .iter()
+            .chain(&launch.runtime_env)
             .map(|(key, value)| (key.as_str(), value.as_str()))
+            .chain(
+                memory_request
+                    .as_deref()
+                    .map(|mib| (MEMORY_LIMIT_REQUEST_ENV, mib)),
+            )
             .chain([
                 ("CODEWHALE_HOST_PARENT_PID", parent_pid.as_str()),
                 ("CODEWHALE_HOST_PROCESS_GROUP", own_group),
@@ -480,6 +592,15 @@ impl HostProcess {
                 return Err(format!("failed to contain the extension host: {error}"));
             }
         };
+        #[cfg(windows)]
+        if let Err(error) = tree.limit_process_memory(launch.memory_cap) {
+            let _ = tree.kill();
+            let _ = child.start_kill();
+            return Err(format!(
+                "failed to cap the extension host's memory: {error}"
+            ));
+        }
+        let memory: Arc<std::sync::OnceLock<MemoryEnforcement>> = Arc::default();
         let stdin = child.stdin.take().ok_or("host stdin unavailable")?;
         let stdout = child.stdout.take().ok_or("host stdout unavailable")?;
         let stderr = child.stderr.take().ok_or("host stderr unavailable")?;
@@ -567,11 +688,13 @@ impl HostProcess {
             let tail = Arc::clone(&stderr_tail);
             let events = Arc::clone(&events);
             let tree = Arc::clone(&tree);
+            let memory = Arc::clone(&memory);
+            let memory_cap = launch.memory_cap;
             tokio::spawn(async move {
                 let reason = tokio::select! {
                     biased;
                     status = child.wait() => match status {
-                        Ok(status) => format!("exited with {status}"),
+                        Ok(status) => exit_reason(status, memory.get().copied(), memory_cap),
                         Err(error) => format!("wait failed: {error}"),
                     },
                     Some(reason) = kill_rx.recv() => {
@@ -603,6 +726,7 @@ impl HostProcess {
             runtime: launch.runtime.clone(),
             runtime_version: std::sync::OnceLock::new(),
             memory_cap: launch.memory_cap,
+            memory,
             sandbox: launch.sandbox.clone(),
             tree,
             outbound,
@@ -643,6 +767,23 @@ impl HostProcess {
                     hello.bundle_sha256, expected_sha256
                 ));
             }
+            let requested = memory_request
+                .as_deref()
+                .and_then(|mib| mib.parse::<u64>().ok());
+            let memory = match (hello.memory_limit_mib, requested) {
+                (Some(applied), Some(requested)) if applied == requested => {
+                    MemoryEnforcement::Jetsam
+                }
+                (Some(applied), _) => {
+                    return Err(format!(
+                        "host reports a {applied} MiB memory limit the core did not ask for"
+                    ));
+                }
+                // Asked for but not applied: the host said why on stderr.
+                (None, Some(_)) => MemoryEnforcement::Heartbeat,
+                (None, None) => launch.memory,
+            };
+            let _ = host.memory.set(memory);
             let initialize = CoreRequest::Initialize(InitializeParams {
                 protocol: protocol::PROTOCOL_VERSION,
                 limits: HostLimits {
@@ -682,6 +823,16 @@ impl HostProcess {
                 ))
             }
         }
+    }
+
+    /// How the memory cap is enforced for this process (planned until the
+    /// handshake settles it).
+    #[must_use]
+    pub fn memory(&self) -> MemoryEnforcement {
+        self.memory
+            .get()
+            .copied()
+            .unwrap_or_else(|| MemoryEnforcement::planned(self.runtime.kind))
     }
 
     /// How many requests the core has sent this host (handshake included).

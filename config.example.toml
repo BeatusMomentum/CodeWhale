@@ -1266,6 +1266,11 @@ code_mode = true # execute_tools composes MCP/plugin/native calls; false defers 
                         # so every plugin must be re-reviewed afterwards.
 
 # [extension_host]
+# runtime = "auto"              # "auto" (default: Bun >= 1.4.0 if found, else
+#                               # Node), "bun" or "node". An explicit choice never
+#                               # falls back. Unset with only `node` set: "node".
+# bun = "~/.bun/bin/bun"        # Bun >= 1.4.0. Tried before `bun` on PATH and
+#                               # $BUN_INSTALL/bin or ~/.bun/bin.
 # node = "/usr/local/bin/node"  # Node.js ^22.19 || >=24. Tried first; otherwise
 #                               # every `node` on PATH is tried in order and the
 #                               # first that runs and meets the floor is used.

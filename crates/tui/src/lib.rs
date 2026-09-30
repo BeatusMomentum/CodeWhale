@@ -5531,14 +5531,13 @@ async fn run_doctor(
     {
         // The runtime the TypeScript extension host would use, resolved the
         // same way the host launcher does (`[extension_host] runtime`).
-        let table = config.extension_host.clone().unwrap_or_default();
-        let expand = |path: Option<String>| {
-            path.map(|path| PathBuf::from(shellexpand::tilde(&path).as_ref()))
-        };
+        let options = crate::extension_host::ExtensionHostOptions::from_config(
+            config.extension_host.as_ref(),
+        );
         let resolution = crate::dependencies::resolve_extension_host_runtime(
-            table.runtime,
-            expand(table.node).as_deref(),
-            expand(table.bun).as_deref(),
+            options.runtime,
+            options.node_override.as_deref(),
+            options.bun_override.as_deref(),
         );
         let enabled = config
             .features()
@@ -5548,8 +5547,8 @@ async fn run_doctor(
         } else {
             " (unused: [features] extension_host is off)"
         };
-        match resolution.selected {
-            Some(_) => {
+        match &resolution.selected {
+            Some(runtime) => {
                 println!(
                     "  {} Extension host runtime: {}{state}",
                     "✓".truecolor(aqua_r, aqua_g, aqua_b),
@@ -5557,9 +5556,8 @@ async fn run_doctor(
                 );
                 println!(
                     "    {}",
-                    crate::extension_host::supervisor::memory_cap_posture(
-                        crate::extension_host::supervisor::HOST_MEMORY_CAP
-                    )
+                    crate::extension_host::supervisor::MemoryEnforcement::planned(runtime.kind)
+                        .describe(crate::extension_host::supervisor::HOST_MEMORY_CAP)
                 );
             }
             None => println!(
@@ -8860,17 +8858,9 @@ fn install_extension_host_boot_config(config: &Config) {
         .enabled(crate::features::Feature::ExtensionHost);
     crate::plugins::activation::install_extension_host_policy(enabled);
     if enabled {
-        let table = config.extension_host.clone().unwrap_or_default();
-        let expand = |path: Option<String>| {
-            path.map(|path| PathBuf::from(shellexpand::tilde(&path).as_ref()))
-        };
-        crate::extension_host::configure(crate::extension_host::ExtensionHostOptions {
-            runtime: table.runtime,
-            node_override: expand(table.node),
-            bun_override: expand(table.bun),
-            root: None,
-            ..Default::default()
-        });
+        crate::extension_host::configure(crate::extension_host::ExtensionHostOptions::from_config(
+            config.extension_host.as_ref(),
+        ));
     }
 }
 

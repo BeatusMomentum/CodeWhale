@@ -127,6 +127,8 @@ var PARAMS = {
   "host/hello": {
     dir: "host",
     required: { protocol: "object", host_version: "string", bundle_sha256: "string", runtime: "object" },
+    // A kernel memory limit the host applied to itself (macOS + Bun), in MiB.
+    optional: { memory_limit_mib: "u64" },
     check: (p, strict) => {
       checkShape("host/hello.protocol", p.protocol, { min: "u64", max: "u64" }, {}, strict);
       checkShape("host/hello.runtime", p.runtime, { name: "string", version: "string" }, {}, strict);

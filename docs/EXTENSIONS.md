@@ -45,10 +45,13 @@ runtime = "auto"   # default: Bun >= 1.4.0 if one is found, otherwise Node
 # node = "/opt/homebrew/bin/node" # tried before every `node` on PATH
 ```
 
-Node must satisfy `^22.19 || >=24`; Bun must be 1.4.0 or newer. The choice is
-made once, at the host's first launch in a Codewhale process, and restarts
-reuse it. `codewhale doctor` and `/plugin` show which runtime runs the host,
-its version and path, and, when `auto` fell back to Node, why Bun was not used.
+Node must satisfy `^22.19 || >=24`; Bun must be 1.4.0 or newer. Leaving
+`runtime` unset means `auto`, except that a table which sets only `node` keeps
+running that Node, as it did before Bun support. The choice is made once, at
+the host's first launch in a Codewhale process, and restarts reuse it.
+`codewhale doctor` and `/plugin` show which runtime runs the host, its version
+and path, how its memory cap is enforced, and, when `auto` fell back to Node,
+why Bun was not used.
 
 Write extensions for both runtimes. Use Node's APIs (Bun implements them) and
 only erasable TypeScript in `.mts`. Enums, decorators and syntax that needs
@@ -56,8 +59,17 @@ transformation require a separate author build to JavaScript. Bun would accept
 more, but Node would not. Neither runtime reads your `tsconfig.json` for the
 host. See [Node's TypeScript rules](https://nodejs.org/docs/latest-v22.x/api/typescript.html).
 Under Bun the host runs with `--no-install`: a missing package fails the import;
-it is never downloaded. `bun:ffi` and `process.dlopen` are unavailable on both
-runtimes.
+it is never downloaded.
+
+Extensions cannot run native code inside the host. On both runtimes
+`process.dlopen`, `process.execve` and Worker threads are unavailable (a Worker
+is a new JavaScript realm that would start without these restrictions). Under
+Bun, `bun:ffi`, `Bun.FFI`, `bun:sqlite`, `node:sqlite` and `ShadowRealm` are
+unavailable too; under Node, `node:sqlite` and `node:ffi` are switched off
+(SQLite extensions and FFI load native libraries). The host refuses to start
+when one of these restrictions does not hold on the installed runtime. A
+process an extension starts is outside this policy; on macOS it runs under the
+same sandbox as the host.
 Include local imports in the bundle; trust stages reviewed content, and the
 entry is rehashed before import. Changes to reviewed bytes or capabilities
 require another review. See [bundle rules](PLUGIN_BUNDLES.md).
@@ -138,11 +150,14 @@ before enabling third-party code.
 
 ## Limits
 
-The host process has a 1 GiB memory cap. On Linux the kernel enforces it
-(`RLIMIT_DATA`), so an allocation past it fails. On macOS, which has no
-unprivileged kernel limit, Codewhale checks the host's resident size at each
-3-second heartbeat and kills the host past the cap. Windows has no cap yet.
-Under Node the JavaScript heap is also limited to 256 MiB. The host has a
+The host process has a 1 GiB memory cap, enforced by the kernel. On Linux it is
+`RLIMIT_DATA` and on Windows the Job Object's per-process limit, so an
+allocation past it fails; both also apply to each process an extension starts.
+On macOS the Bun host applies a jetsam limit to itself before any extension
+loads, and the kernel kills it past the cap; processes it starts are not
+covered. A Node host on macOS has no kernel limit: Codewhale checks its
+resident size at each 3-second heartbeat and kills it past the cap. Under Node
+the JavaScript heap is also limited to 256 MiB. The host has a
 32 MiB frame limit, 256 in-flight request
 limit (plus a reserved heartbeat), 128 tools per owner and 1024 per host. Tool
 descriptions are at most 4 KiB and schemas 64 KiB. Tool calls have a 120-second

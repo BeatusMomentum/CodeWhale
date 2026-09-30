@@ -47,9 +47,14 @@
 //! * The runtime is chosen once per manager (`[extension_host] runtime`,
 //!   default `auto`: Bun >= 1.4.0 when found, else Node) and pinned: restarts
 //!   reuse it, an explicit `bun`/`node` never falls back, and the handshake
-//!   refuses a host that reports a different runtime. The memory cap is
-//!   kernel-enforced on Linux, checked at each heartbeat on macOS, and absent
-//!   on Windows (`supervisor` module docs).
+//!   refuses a host that reports a different runtime. The 1 GiB memory cap is
+//!   kernel-enforced on Linux (`RLIMIT_DATA`), Windows (Job Object) and macOS
+//!   under Bun (a jetsam limit the host applies to itself); a macOS Node host
+//!   is checked at each heartbeat instead (`supervisor` module docs).
+//! * In-process native code is taken away from plugins by the host
+//!   (`extension-host/src/runtime.ts`); a process a plugin starts is outside
+//!   that policy and runs under the same OS sandbox (none on Linux and
+//!   Windows).
 //! * The owner token is a bug/staleness guard, not a boundary between
 //!   plugins that share the process: one plugin can alter another's
 //!   behaviour, which the approval card discloses.
@@ -212,6 +217,22 @@ pub struct SupervisionOptions {
     pub memory_cap: u64,
 }
 
+impl ExtensionHostOptions {
+    /// Options for the `[extension_host]` table (paths `~`-expanded).
+    #[must_use]
+    pub fn from_config(table: Option<&crate::config::ExtensionHostConfig>) -> Self {
+        let expand = |path: Option<&String>| {
+            path.map(|path| PathBuf::from(shellexpand::tilde(path).as_ref()))
+        };
+        Self {
+            runtime: table.map_or_else(Default::default, |table| table.effective_runtime()),
+            node_override: expand(table.and_then(|table| table.node.as_ref())),
+            bun_override: expand(table.and_then(|table| table.bun.as_ref())),
+            ..Default::default()
+        }
+    }
+}
+
 impl Default for SupervisionOptions {
     fn default() -> Self {
         Self {
@@ -286,6 +307,8 @@ pub enum HostStatus {
         runtime_version: String,
         /// `seatbelt` / `bwrap`, or `None` when the host runs unsandboxed.
         sandbox: Option<String>,
+        /// How the memory cap is enforced for this process.
+        memory: supervisor::MemoryEnforcement,
     },
     Unresponsive {
         pid: Option<u32>,
@@ -686,7 +709,10 @@ fn monitor_host(shared: &Arc<ManagerShared>, host: &Arc<HostProcess>, generation
             if restart_dirty_host_when_idle(&shared, &host, generation) {
                 return;
             }
-            if let Some(resident) = host.pid.and_then(supervisor::resident_bytes)
+            // Only where no kernel limit holds (a macOS Node host, or a Bun
+            // host that could not apply its jetsam limit).
+            if host.memory() == supervisor::MemoryEnforcement::Heartbeat
+                && let Some(resident) = host.pid.and_then(supervisor::resident_bytes)
                 && resident > host.memory_cap
             {
                 shared.diagnostic(format!(
@@ -803,6 +829,7 @@ impl ExtensionHostManager {
                 runtime: host.runtime.kind.name(),
                 runtime_version: host.runtime_version.get().cloned().unwrap_or_default(),
                 sandbox: host.sandbox.clone(),
+                memory: host.memory(),
             },
             HostSlot::Unresponsive(host) => HostStatus::Unresponsive { pid: host.pid },
             HostSlot::Restarting { reason } => HostStatus::Restarting {
@@ -1377,6 +1404,12 @@ impl ExtensionHostManager {
                     host.runtime_version.get().map_or("?", String::as_str),
                     host.sandbox.as_deref().unwrap_or("none")
                 ));
+                if host.memory() != supervisor::MemoryEnforcement::planned(host.runtime.kind) {
+                    shared.diagnostic(format!(
+                        "extension host did not apply its kernel memory limit (its stderr says why); {}",
+                        host.memory().describe(host.memory_cap)
+                    ));
+                }
                 Ok(host)
             }
             Err(reason) => {
@@ -1451,6 +1484,7 @@ pub(crate) fn render_status(manager: &ExtensionHostManager) -> String {
             runtime,
             runtime_version,
             sandbox,
+            memory: _,
         } => {
             let _ = write!(
                 out,
@@ -1485,11 +1519,20 @@ pub(crate) fn render_status(manager: &ExtensionHostManager) -> String {
         }
     }
     if let Some(summary) = manager.runtime_summary() {
-        let _ = write!(
-            out,
-            "\n  runtime: {summary} · {}",
-            supervisor::memory_cap_posture(manager.shared.options.supervision.memory_cap)
-        );
+        let cap = manager.shared.options.supervision.memory_cap;
+        let memory = match manager.status() {
+            HostStatus::Ready { memory, .. } => memory,
+            _ => manager
+                .shared
+                .runtime
+                .lock()
+                .expect("runtime lock")
+                .as_ref()
+                .map_or(supervisor::MemoryEnforcement::Unenforced, |(runtime, _)| {
+                    supervisor::MemoryEnforcement::planned(runtime.kind)
+                }),
+        };
+        let _ = write!(out, "\n  runtime: {summary} · {}", memory.describe(cap));
     }
     let _ = write!(
         out,
