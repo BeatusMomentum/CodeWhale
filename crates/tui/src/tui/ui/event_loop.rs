@@ -577,6 +577,8 @@ pub(crate) fn coalesce_scroll_burst(
                 latest = *next;
             }
             _ => {
+                // Back to the head, not the tail: `pending` may already hold
+                // later input (typed text, Enter), and this event came first.
                 pending.push_front(next_observed);
                 break;
             }
@@ -598,6 +600,76 @@ pub(crate) fn transcript_cadence_tier(
         !app.input.is_empty(),
         crate::tui::hover_layer::current_hover().is_some(),
     )
+}
+
+/// Fold every queued `Resize` behind the one in hand into the final size, so
+/// one clear and redraw serves the whole drag (#65).
+///
+/// The first non-resize event ends the fold and goes back to the head of the
+/// queue, ahead of any later input already drained into `pending`.
+pub(crate) fn coalesce_resize_burst(
+    width: u16,
+    height: u16,
+    input: &TerminalInputPump,
+    pending: &mut VecDeque<ObservedTerminalEvent>,
+) -> std::io::Result<(u16, u16)> {
+    let (mut final_w, mut final_h) = (width, height);
+    while let Some(next_observed) = try_next_terminal_event(input, pending)? {
+        if let Event::Resize(w, h) = next_observed.event {
+            final_w = w;
+            final_h = h;
+        } else {
+            pending.push_front(next_observed);
+            break;
+        }
+    }
+    Ok((final_w, final_h))
+}
+
+/// Toast identity for a failing session save, so recovery can retire it.
+const SESSION_SAVE_FAILURE_TOAST: &str = "session-save-failure";
+
+/// Keep the save-failure notice in step with the persistence actor's session
+/// save health. Saves run off the UI thread, so a full disk or an unwritable
+/// sessions directory used to reach only the log while the user kept working
+/// unsaved. The notice stays while a session's latest save is failing and is
+/// withdrawn once a later save lands.
+pub(crate) fn surface_session_save_health(
+    app: &mut App,
+    reading: Option<crate::tui::persistence_actor::SaveHealthReading>,
+    seen: &mut u64,
+) {
+    let Some(reading) = reading.filter(|reading| reading.generation != *seen) else {
+        return;
+    };
+    *seen = reading.generation;
+    app.retire_event_notices(SESSION_SAVE_FAILURE_TOAST);
+    if let Some((session_id, kind)) = reading.failing {
+        let text = app
+            .tr(MessageId::SessionSaveFailed)
+            .replace("{id}", crate::session_manager::truncate_id(&session_id))
+            .replace("{error}", &kind.to_string());
+        // Standing, not timed: it must outlast the failure, and only the
+        // recovery reading above withdraws it.
+        app.push_status_toast_record(StatusToast::standing(
+            text,
+            StatusToastLevel::Error,
+            SESSION_SAVE_FAILURE_TOAST,
+        ));
+    }
+}
+
+/// The exit line when a session's latest save failed and was never replaced
+/// by a successful one.
+pub(crate) fn shutdown_persistence_notice(
+    locale: codewhale_localization::Locale,
+    reading: &crate::tui::persistence_actor::SaveHealthReading,
+) -> Option<String> {
+    reading.failing.as_ref().map(|(session_id, kind)| {
+        codewhale_localization::tr(locale, MessageId::SessionSaveFailedAtExit)
+            .replace("{id}", session_id)
+            .replace("{error}", &kind.to_string())
+    })
 }
 
 /// Run the interactive TUI event loop.
@@ -820,28 +892,38 @@ pub async fn run_tui(
         && let Ok(manager) = SessionManager::default_location()
     {
         // Try to load by prefix or full ID
-        let load_result: std::io::Result<Option<crate::session_manager::SavedSession>> =
+        let load_result: std::io::Result<
+            Option<(
+                crate::session_manager::SavedSession,
+                crate::session_manager::SessionLease,
+            )>,
+        > =
+            // `attach_*` reserves the session's live lease first, and refuses
+            // a session another window has open instead of becoming its second
+            // autosaving writer. The lease is committed once the session is
+            // applied.
             if session_id == "latest" {
                 // Special case: resume the most recent session in this workspace.
                 match manager.get_latest_session_for_workspace(&options.workspace) {
                     Ok(Some(meta)) => manager
-                        .resume_session(&meta.id)
-                        .map(|recovery| Some(recovery.session)),
+                        .attach_session(&meta.id)
+                        .map(|(recovery, lease)| Some((recovery.session, lease))),
                     Ok(None) => Ok(None),
                     Err(e) => Err(e),
                 }
             } else {
                 manager
-                    .resume_session_by_prefix(session_id)
-                    .map(|recovery| Some(recovery.session))
+                    .attach_session_by_prefix(session_id)
+                    .map(|(recovery, lease)| Some((recovery.session, lease)))
             };
 
         match load_result {
-            Ok(Some(saved)) => match manager.load_session_goal(&saved.metadata.id) {
+            Ok(Some((saved, lease))) => match manager.load_session_goal(&saved.metadata.id) {
                 Ok(goal) => {
                     let saved_id = saved.metadata.id.clone();
                     match apply_loaded_session_with_goal(&mut app, config, saved, goal.as_ref()) {
                         Ok(()) => {
+                            lease.commit();
                             app.status_message = Some(format!(
                                 "Resumed session: {}",
                                 crate::session_manager::truncate_id(&saved_id)
@@ -1173,6 +1255,7 @@ pub async fn run_tui(
     // applied), the checkpoint is the only durable record of that work:
     // clearing it here unconditionally could erase in-flight progress that
     // never reached a snapshot, so it survives for startup recovery review.
+    let mut shutdown_save_health = None;
     if let Some((handle, task)) = persistence_runtime {
         // A quit key can leave the frame before its usual queue comparison.
         // Capture the final edited draft before the shutdown durability barrier.
@@ -1201,6 +1284,9 @@ pub async fn run_tui(
                 "session persistence reported write failures during shutdown",
             );
         }
+        // Read after the final flush: whether each session's latest save
+        // landed, not every failure this run has ever seen.
+        shutdown_save_health = Some(handle.session_save_health());
         handle.try_send(PersistRequest::Shutdown);
         let _ = task.await;
     }
@@ -1260,7 +1346,24 @@ pub async fn run_tui(
         }
     }
 
+    if let Some(notice) = shutdown_save_health
+        .as_ref()
+        .and_then(|reading| shutdown_persistence_notice(app.ui_locale, reading))
+    {
+        // Primary screen, like the settings failures above.
+        #[allow(clippy::print_stderr)]
+        {
+            eprintln!("{notice}");
+        }
+    }
+
+    // `codewhale resume <id>` for a document that never reached disk (every
+    // save failed, or nothing was ever saved) only fails with NotFound.
+    let session_document_exists = app.current_session_id.as_deref().is_some_and(|id| {
+        SessionManager::default_location().is_ok_and(|manager| manager.session_document_exists(id))
+    });
     if result.is_ok()
+        && session_document_exists
         && let Some(hint) = resume_hint_text(
             app.ui_locale,
             app.current_session_id.as_deref(),
@@ -1677,6 +1780,7 @@ pub(crate) async fn run_event_loop(
     }
 
     let mut pending_subagent_list_refresh = false;
+    let mut session_save_health_seen = 0u64;
 
     loop {
         // #6169: first statement of every iteration. The job-control handler can
@@ -2023,6 +2127,12 @@ pub(crate) async fn run_event_loop(
         {
             deliver_constitution_draft_result(app, model_label, draft_locale, outcome);
         }
+
+        surface_session_save_health(
+            app,
+            crate::tui::persistence_actor::session_save_health(),
+            &mut session_save_health_seen,
+        );
 
         // Discovery and callback delivery never park terminal input.
         poll_mcp_login(app);
@@ -4747,25 +4857,12 @@ pub(crate) async fn run_event_loop(
                 // common "stale art on the right edge" symptom (#65) caused by
                 // the diff renderer skipping cells that match a stale back
                 // buffer between intermediate sizes.
-                let mut final_w = width;
-                let mut final_h = height;
-                while let Some(next_observed) =
-                    try_next_terminal_event(&terminal_input, &mut pending_terminal_events)?
-                {
-                    match next_observed.event {
-                        Event::Resize(w, h) => {
-                            final_w = w;
-                            final_h = h;
-                        }
-                        other => {
-                            pending_terminal_events.push_front(ObservedTerminalEvent::new(
-                                other,
-                                next_observed.observed_at,
-                            ));
-                            break;
-                        }
-                    }
-                }
+                let (final_w, final_h) = coalesce_resize_burst(
+                    width,
+                    height,
+                    &terminal_input,
+                    &mut pending_terminal_events,
+                )?;
 
                 if final_w == 0 || final_h == 0 {
                     tracing::debug!(
