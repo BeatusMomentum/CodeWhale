@@ -25,3 +25,14 @@ test('Codewhale session import bounds emitted events, keeps call identities and 
   assert.ok(trace.warnings.some(w => w.includes('timestamped before its call')));
   assert.ok(compilePetTelemetry(trace.events, trace.duration).length > 0);
 });
+
+test('Codewhale runtime import never ends a turn before its kept start', () => {
+  // turn.completed carries wall times earlier than the turn.started record that fixed the start.
+  const rec = (seq, event, s, turn) => ({ seq, event, thread_id: 'th', turn_id: 't1', timestamp: at(s), payload: { turn } });
+  const [trace] = importTrace([rec(0, 'turn.started', 10, {}),
+    rec(1, 'turn.completed', 12, { started_at: at(0), ended_at: at(5), status: 'completed' })].map(r => JSON.stringify(r)).join('\n'), 'r');
+  const turn = trace.events.find(e => e.id === 'turn:t1');
+  assert.equal(turn.openEnded, false);
+  assert.ok(turn.endTime >= turn.startTime, `${turn.startTime} > ${turn.endTime}`);
+  assert.ok(compilePetTelemetry(trace.events, trace.duration).length > 0);
+});
