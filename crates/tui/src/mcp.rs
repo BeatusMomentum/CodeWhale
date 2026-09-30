@@ -1768,11 +1768,9 @@ impl Drop for PendingAuthorityWatch {
 /// raised `execute_timeout` governs HTTP servers too. This is a ceiling for
 /// the transport, not the read knob.
 ///
-/// Known limitation: Streamable HTTP reads the reply inside the POST, and
-/// `call_method` bounds only the receive, not the send. On that transport
-/// this ceiling — not the request's own budget — ends a slow request, so an
-/// explicit `execute_timeout` below `read_timeout` stops a tool call at
-/// `read_timeout`, and a wedged `resources/read` runs to the larger of the two.
+/// Streamable HTTP reads the reply inside the POST; `call_method` bounds the
+/// send and the receive with the request's own budget, so this ceiling is
+/// only the transport's outer safety net for requests without one.
 fn http_request_ceiling_secs(config: &McpServerConfig, global: &McpTimeouts) -> u64 {
     config
         .effective_read_timeout(global)
@@ -2436,16 +2434,37 @@ impl McpConnection {
         }
 
         let call_id = self.next_id();
-        if let Err(error) = self
-            .send(serde_json::json!({
+        // One deadline bounds the whole request. Streamable HTTP reads the
+        // reply inside the POST, so a budget on the receive alone would leave
+        // that transport to its client-wide ceiling (the larger of the read
+        // and execute knobs) instead of this request's own budget.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
+        let expired_error = anyhow::anyhow!(
+            "MCP method '{}' on server '{}' timed out after {}s",
+            method,
+            self.name,
+            timeout_secs
+        );
+        match tokio::time::timeout_at(
+            deadline,
+            self.send(serde_json::json!({
                 "jsonrpc": "2.0",
                 "id": &call_id,
                 "method": method,
                 "params": params
-            }))
-            .await
+            })),
+        )
+        .await
         {
-            return self.finish_guarded_error(error).await;
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => return self.finish_guarded_error(error).await,
+            Err(_) => {
+                // A send abandoned mid-write can leave a partial frame on a
+                // stream transport, so the frame boundary is unknown: rebuild
+                // the connection rather than reuse it.
+                self.state = ConnectionState::Disconnected;
+                return self.finish_guarded_error(expired_error).await;
+            }
         }
 
         // The request's own budget is its only receive deadline. A per-frame
@@ -2464,17 +2483,14 @@ impl McpConnection {
         // 1800s for `tools/call` by default. Cancelling `cancel_token` instead
         // marks the connection dead, so the pool rebuilds it (a new child for
         // stdio) before the next call.
-        let response = match tokio::time::timeout(
-            Duration::from_secs(timeout_secs),
-            self.recv_reply(call_id, None),
-        )
-        .await
-        .with_context(|| {
-            format!(
-                "MCP method '{}' on server '{}' timed out after {}s",
-                method, self.name, timeout_secs
-            )
-        }) {
+        let response = match tokio::time::timeout_at(deadline, self.recv_reply(call_id, None))
+            .await
+            .with_context(|| {
+                format!(
+                    "MCP method '{}' on server '{}' timed out after {}s",
+                    method, self.name, timeout_secs
+                )
+            }) {
             Ok(Ok(response)) => response,
             Ok(Err(error)) => return self.finish_guarded_error(error).await,
             Err(error) => return self.finish_guarded_error(error).await,

@@ -2887,6 +2887,21 @@ impl McpTransport for ScriptedThenHangingTransport {
     }
 }
 
+/// A transport that answers inside `send`, as Streamable HTTP reads the reply
+/// within the POST, and never finishes that send.
+struct HangingSendTransport;
+
+#[async_trait::async_trait]
+impl McpTransport for HangingSendTransport {
+    async fn send(&mut self, _msg: Vec<u8>) -> Result<()> {
+        std::future::pending().await
+    }
+
+    async fn recv(&mut self) -> Result<Vec<u8>> {
+        std::future::pending().await
+    }
+}
+
 /// A transport whose write side is gone — the shape a crashed or exited
 /// stdio MCP child leaves behind (EPIPE on the next `write_all`).
 struct FailingSendTransport;
@@ -3141,6 +3156,31 @@ async fn a_wedged_request_fails_at_its_own_budget_and_keeps_the_connection() {
     assert!(
         connection.is_ready(),
         "an expired request must not declare the connection dead"
+    );
+}
+
+/// A request whose transport blocks inside `send` (Streamable HTTP) still
+/// ends at its own budget, not at the transport's larger client ceiling, and
+/// the connection is rebuilt because the abandoned write may be partial.
+#[tokio::test]
+async fn a_request_blocked_inside_send_ends_at_its_own_budget() {
+    let mut connection = test_connection(Box::new(HangingSendTransport));
+    connection.read_timeout_secs = 30;
+    let started = std::time::Instant::now();
+    let error = connection
+        .read_resource("file:///wedged-post", 1)
+        .await
+        .expect_err("a POST that never completes must end at the request budget");
+    assert!(
+        error
+            .to_string()
+            .contains("MCP method 'resources/read' on server 'mock' timed out after 1s"),
+        "{error:#}"
+    );
+    assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    assert!(
+        !connection.is_ready(),
+        "a send abandoned mid-write leaves the frame boundary unknown, so the connection is rebuilt"
     );
 }
 
