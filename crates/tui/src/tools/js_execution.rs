@@ -438,7 +438,10 @@ mod tests {
         );
 
         // The child reported its pid before sleeping; the timeout must have
-        // killed it (and the tool reaped it), not left it running.
+        // killed it, not left it running. The dropped child is reaped by the
+        // runtime's orphan queue when its driver parks, so the poll yields
+        // (a blocking sleep here would keep a killed zombie visible to
+        // `kill(pid, 0)` for the whole wait).
         let pid: i32 = std::fs::read_to_string(&pid_file)
             .expect("child must have written its pid")
             .trim()
@@ -450,7 +453,7 @@ mod tests {
                 attempts < 50,
                 "node child {pid} is still alive after the timeout kill"
             );
-            std::thread::sleep(std::time::Duration::from_millis(100));
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             attempts += 1;
         }
     }
