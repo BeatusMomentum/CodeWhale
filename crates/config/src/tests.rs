@@ -4676,7 +4676,7 @@ fn config_store_preserves_builtin_shadowing_custom_and_regional_selectors() {
             assert_eq!(route.base_url, "https://gateway.example/v1");
             assert_eq!(route.model, "Exact-Model");
         }
-        store.config.set_value("verbosity", "quiet").unwrap();
+        store.config.set_value("verbosity", "concise").unwrap();
         store.save().unwrap();
         let saved: toml::Value = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(saved["provider"].as_str(), Some(selector));
@@ -4746,7 +4746,7 @@ fn kindless_table_mirroring_a_builtin_alias_keeps_the_builtin_route() {
     assert_eq!(store.config.provider_id(), "deepseek-cn");
     assert!(store.config.named_custom_provider_id().is_none());
     // An unrelated typed save leaves the inert extras table untouched.
-    store.config.set_value("verbosity", "quiet").unwrap();
+    store.config.set_value("verbosity", "concise").unwrap();
     store.save().unwrap();
     let saved: toml::Value = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
     assert_eq!(saved["provider"].as_str(), Some("deepseek-cn"));
@@ -10114,7 +10114,7 @@ fn typed_save_round_trips_every_builtin_provider_selector() {
         };
         store
             .config
-            .set_value("verbosity", "quiet")
+            .set_value("verbosity", "concise")
             .expect("set verbosity");
         store.save().expect("typed save");
         let reloaded = ConfigStore::load(Some(path.clone()))
@@ -10132,7 +10132,7 @@ fn legacy_siliconflow_cn_spelling_loads_and_is_repaired_on_save() {
     assert_eq!(store.config.provider, ProviderKind::SiliconflowCN);
     store
         .config
-        .set_value("verbosity", "quiet")
+        .set_value("verbosity", "concise")
         .expect("set verbosity");
     store.save().expect("typed save");
     let body = fs::read_to_string(&path).expect("read config");
@@ -10151,7 +10151,7 @@ fn typed_save_keeps_a_providers_section_holding_only_a_legacy_kind_table() {
         };
         store
             .config
-            .set_value("verbosity", "quiet")
+            .set_value("verbosity", "concise")
             .expect("set verbosity");
         store.save().expect("typed save");
         let body = fs::read_to_string(&path).expect("read config");
@@ -10175,7 +10175,7 @@ fn typed_save_keeps_runtime_owned_keys_in_typed_sub_tables() {
     let mut store = ConfigStore::load(Some(path.clone())).expect("load config");
     store
         .config
-        .set_value("verbosity", "quiet")
+        .set_value("verbosity", "concise")
         .expect("set verbosity");
     store.save().expect("typed save");
     let saved: toml::Table = toml::from_str(&fs::read_to_string(&path).expect("read config"))
