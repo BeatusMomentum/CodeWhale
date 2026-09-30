@@ -2699,7 +2699,7 @@ log_level = "trace"
                     bundle
                         .preferences
                         .entries
-                        .insert("allow_shell".into(), toml::Value::Boolean(false));
+                        .insert("log_level".into(), toml::Value::String("info".into()));
                     let error = apply_bundle(&bundle, &mut store, BundleScope::Global, dir.path())
                         .expect_err("closed choice must fail before the transaction");
                     assert!(error.to_string().contains(key), "{error:#}");
@@ -2721,16 +2721,18 @@ log_level = "trace"
 
     #[test]
     fn closed_choice_imports_accept_reader_values_without_revalidating_old_fields() {
-        for (key, value) in [
-            ("approval_policy", " On-Request "),
-            ("sandbox_mode", " WORKSPACE-WRITE "),
-            ("verbosity", " CONCISE "),
-        ] {
+        // Trust posture is intentionally machine-bound and rejected by the
+        // bundle boundary even when its value is otherwise valid. Exercise
+        // the portable closed choice here; authority rejection has its own
+        // no-write and export-scrubbing regressions below.
+        for value in [" CONCISE ", "normal"] {
+            let key = "verbosity";
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("config.toml");
             // Loading and unrelated round trips still preserve legacy text; only
             // the value being written gets the shared closed-choice validation.
-            let original = "# Preserve old fields\nverbosity = 'quiet'\n";
+            let original =
+                "# Preserve old fields\napproval_policy = 'legacy-unknown'\nverbosity = 'quiet'\n";
             std::fs::write(&path, original).unwrap();
             let mut store = ConfigStore::load(Some(path.clone())).unwrap();
             assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
@@ -2749,9 +2751,10 @@ log_level = "trace"
             );
             let reloaded = ConfigStore::load(Some(path)).unwrap();
             assert_eq!(reloaded.config.get_value(key).as_deref(), Some(value));
-            if key != "verbosity" {
-                assert_eq!(reloaded.config.verbosity.as_deref(), Some("quiet"));
-            }
+            assert_eq!(
+                reloaded.config.approval_policy.as_deref(),
+                Some("legacy-unknown")
+            );
         }
     }
 
