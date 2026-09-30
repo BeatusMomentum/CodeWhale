@@ -652,15 +652,12 @@ workflow({
             assert_eq!(leaf.role.as_deref(), Some(expected_role));
             assert_eq!(leaf.mode, TaskMode::ReadOnly);
             assert!(!leaf.permissions.allow_write);
-            let expected_tools: &[&str] = if expected_role == "explore" {
-                &["File"]
-            } else {
-                &[]
-            };
-            assert_eq!(
-                leaf.permissions.allowed_tools, expected_tools,
-                "the fixture must explicitly restrict source gathering to File"
-            );
+            // No explicit `allowed_tools` anywhere: the read-only lowering
+            // alone scopes the source-gathering explore role, and its
+            // catalog-visible surface (tool_search + deferred grep_files) is
+            // pinned from the TUI side (scout_surface_keeps_tool_search_
+            // grep_files_activation_path).
+            assert!(leaf.permissions.allowed_tools.is_empty());
             assert_eq!(
                 leaf.permissions.deny_all_tools,
                 expected_role != "explore",
@@ -680,12 +677,17 @@ workflow({
             );
             if expected_role == "explore" {
                 assert!(
-                    leaf.prompt.contains("exactly one `File` call")
-                        && leaf.prompt.contains("Do not call `File` more than once")
-                        && leaf
-                            .prompt
-                            .contains("do not use any action except `search_content`"),
-                    "the scout must finish discovery in one bounded tool round"
+                    leaf.prompt.contains("exactly one `tool_search` call")
+                        && leaf.prompt.contains("exactly one `grep_files` call")
+                        && leaf.prompt.contains(
+                            "the content-search tool is deferred, so this activation is required before it can be called"
+                        ),
+                    "the scout must activate the deferred content-search tool before searching with it"
+                );
+                assert!(
+                    leaf.prompt.contains("Make no other tool calls")
+                        && leaf.prompt.contains("nothing else"),
+                    "the scout discovery must stay one bounded activation-plus-search round"
                 );
                 assert_eq!(
                     leaf.file_scope
@@ -705,7 +707,7 @@ workflow({
                     leaf.prompt.contains(
                         "`include` set exactly to [`fleets/stopship.toml`, `crates/cli/src/lib.rs`, `crates/workflow/src/role_resolve.rs`, `crates/tui/src/tools/workflow.rs`, `crates/lane/src/runtime.rs`]"
                     ) && leaf.prompt.contains("Matches outside that exact include list do not count"),
-                    "the one File search must constrain the actual tool input, not only File scope metadata"
+                    "the grep_files search must constrain the actual tool input, not only file scope metadata"
                 );
                 assert!(
                     leaf.prompt.contains("if you can populate all seven")
