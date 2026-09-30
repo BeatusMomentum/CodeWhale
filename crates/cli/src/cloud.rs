@@ -296,7 +296,7 @@ enum CloudAgentsCommand {
         id: String,
         #[arg(long)]
         operation_key: String,
-        /// Confirmation printed by `work-quote`.
+        /// Confirmation printed by `work-quote`; use - to read bounded piped stdin.
         #[arg(long)]
         confirmation: String,
         /// Agree that repository code and Work files run on EU compute.
@@ -2136,14 +2136,26 @@ fn run_agents<T: CloudTransport, W: Write>(
             operation_key,
             confirmation,
             confirm_eu_compute,
-        } => work::launch(
-            client,
-            out,
-            &id,
-            &operation_key,
-            &confirmation,
-            confirm_eu_compute,
-        ),
+        } => {
+            let confirmation = if confirmation == "-" && confirm_eu_compute {
+                if io::stdin().is_terminal() {
+                    bail!(
+                        "Pipe the launch confirmation to stdin; it must not be typed into the terminal"
+                    );
+                }
+                work::read_confirmation(io::stdin().lock())?
+            } else {
+                confirmation
+            };
+            work::launch(
+                client,
+                out,
+                &id,
+                &operation_key,
+                &confirmation,
+                confirm_eu_compute,
+            )
+        }
     }
 }
 
