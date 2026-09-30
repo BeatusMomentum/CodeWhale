@@ -912,6 +912,8 @@ pub struct Engine {
     /// the channel closing (task exited with the pool) disarms it and the
     /// next pool ensure respawns.
     mcp_supervisor_rx: Option<mpsc::Receiver<McpSupervisorUpdate>>,
+    /// Abort the supervisor's reconnect handshakes when its pool is retired.
+    mcp_supervisor_task: Option<tokio::task::AbortHandle>,
     mcp_boot_done: Option<tokio::sync::watch::Receiver<bool>>,
     /// Generation owned by the currently installed boot receiver. Terminal
     /// cleanup is conditional on this exact value so an older pass can never
@@ -2064,6 +2066,7 @@ impl Engine {
             mcp_boot_in_flight: false,
             mcp_boot_rx: None,
             mcp_supervisor_rx: None,
+            mcp_supervisor_task: None,
             mcp_boot_done: None,
             mcp_boot_generation: None,
             mcp_boot_task: None,
@@ -6801,8 +6804,8 @@ impl Engine {
     }
 
     /// Start the connection supervisor once per pool. The task holds only a
-    /// Weak: pool replacement lets the old task exit, its channel closes, the
-    /// run loop disarms, and the next ensure respawns against the new pool.
+    /// Weak between sweeps, but an in-flight handshake holds the pool. Keep
+    /// its abort handle so a boundary stops that work and queued diagnoses.
     fn ensure_mcp_supervisor(&mut self) {
         if self.mcp_supervisor_rx.is_some() {
             return;
@@ -6813,11 +6816,12 @@ impl Engine {
         let (tx, rx) = mpsc::channel(16);
         self.mcp_supervisor_rx = Some(rx);
         let weak = Arc::downgrade(pool);
-        spawn_supervised(
+        let task = spawn_supervised(
             "mcp-supervisor",
             std::panic::Location::caller(),
             McpPool::supervise_pool(weak, tx),
         );
+        self.mcp_supervisor_task = Some(task.abort_handle());
     }
 
     /// Apply one supervisor sweep: deaths and failures refresh the engine's
@@ -6952,6 +6956,10 @@ impl Engine {
         if let Some(task) = self.mcp_boot_task.take() {
             task.abort();
         }
+        if let Some(task) = self.mcp_supervisor_task.take() {
+            task.abort();
+        }
+        self.mcp_supervisor_rx = None;
         self.mcp_boot_generation = None;
         self.mcp_boot_in_flight = false;
         self.mcp_boot_rx = None;

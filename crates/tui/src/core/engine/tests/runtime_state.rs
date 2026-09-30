@@ -139,6 +139,57 @@ fn empty_user_input_request() -> crate::tools::user_input::UserInputRequest {
 }
 
 #[tokio::test]
+async fn a_session_boundary_discards_and_stops_the_previous_mcp_supervisor() {
+    let workspace = tempdir().unwrap();
+    let (mut engine, _handle) = quiet_engine(deterministic_engine_config(workspace.path()));
+    let (tx, rx) = mpsc::channel(1);
+    tx.send(McpSupervisorUpdate {
+        died: vec![("previous-server".to_string(), "stale diagnosis".to_string())],
+        failed: Vec::new(),
+        recovered: Vec::new(),
+        parked: Vec::new(),
+    })
+    .await
+    .unwrap();
+    engine.mcp_supervisor_rx = Some(rx);
+
+    // A reconnect future retains its connection resources across await. The
+    // boundary must abort that future, not merely drop a Weak pool owner.
+    let held = Arc::new(());
+    let weak = Arc::downgrade(&held);
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let supervisor = tokio::spawn(async move {
+        let _held = held;
+        started_tx.send(()).unwrap();
+        std::future::pending::<()>().await;
+    });
+    started_rx.await.unwrap();
+    engine.mcp_supervisor_task = Some(supervisor.abort_handle());
+    assert!(
+        engine
+            .install_synced_session_id("next-session".to_string())
+            .is_some()
+    );
+    assert!(
+        engine.mcp_supervisor_rx.is_none(),
+        "queued diagnoses retired"
+    );
+    assert!(engine.mcp_supervisor_task.is_none());
+    let joined = tokio::time::timeout(Duration::from_secs(1), supervisor)
+        .await
+        .expect("the previous supervisor must stop promptly");
+    assert!(joined.unwrap_err().is_cancelled());
+    assert!(weak.upgrade().is_none(), "reconnect resources released");
+    assert!(tx.is_closed(), "old diagnoses cannot cross the boundary");
+
+    engine.ensure_mcp_pool().await.unwrap();
+    assert!(engine.mcp_supervisor_rx.is_some(), "the next pool is armed");
+    assert!(engine.mcp_supervisor_task.is_some());
+    assert!(engine.mcp_connection_errors.is_empty());
+    engine.drop_mcp_pool();
+}
+
+#[tokio::test]
 async fn an_undeliverable_user_input_request_fails_fast() {
     // C02-19: the question cannot reach a host (its event channel is closed,
     // while the answer channel stays open), so nobody can ever answer it.
