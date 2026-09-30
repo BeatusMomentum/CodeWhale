@@ -62,12 +62,6 @@
   "crates/localization/build.rs": {
     "std_fs": 3
   },
-  "crates/mcp/src/stdio_client.rs": {
-    "thread_sleep": 2
-  },
-  "crates/mcp/src/test_support.rs": {
-    "std_fs": 3
-  },
   "crates/memory/src/main.rs": {
     "std_fs": 1
   },
@@ -150,9 +144,6 @@
   },
   "crates/tui/src/commands/user_registry.rs": {
     "std_fs": 2
-  },
-  "crates/tui/src/compaction/last_round.rs": {
-    "std_fs": 1
   },
   "crates/tui/src/composer_history.rs": {
     "thread_sleep": 1
@@ -252,10 +243,6 @@
   },
   "crates/tui/src/integrations/dsh/receipt.rs": {
     "std_fs": 5
-  },
-  "crates/tui/src/lib.rs": {
-    "path_canonicalize": 2,
-    "std_fs": 42
   },
   "crates/tui/src/mcp.rs": {
     "std_fs": 1
@@ -403,7 +390,7 @@
   },
   "crates/tui/src/snapshot/repo.rs": {
     "path_canonicalize": 4,
-    "std_fs": 18,
+    "std_fs": 19,
     "thread_sleep": 1
   },
   "crates/tui/src/tools/git.rs": {
@@ -587,7 +574,7 @@
     "path_canonicalize": 2
   },
   "crates/tui/src/voice.rs": {
-    "std_fs": 6
+    "std_fs": 3
   },
   "crates/tui/src/working_set.rs": {
     "path_canonicalize": 1,

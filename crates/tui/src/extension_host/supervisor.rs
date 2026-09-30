@@ -604,15 +604,13 @@ fn no_wrapper_reason() -> String {
 
 /// How long the bwrap probe may take. A working bwrap runs
 /// `<runtime> --version` in well under a second, even on a loaded CI runner.
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 const BWRAP_PROBE_DEADLINE: Duration = Duration::from_secs(10);
 
 /// Run the finished bwrap wrapper around `<runtime> --version` (`command`),
 /// with no environment, to learn whether bwrap works on this host: it may be
 /// installed yet unable to create its namespaces. Blocking.
-#[cfg_attr(
-    not(all(target_os = "linux", not(target_env = "ohos"))),
-    allow(dead_code)
-)]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 fn probe_bwrap(command: &[String], cwd: &Path) -> Result<(), String> {
     use std::io::Read as _;
     use wait_timeout::ChildExt as _;
@@ -652,10 +650,7 @@ fn probe_bwrap(command: &[String], cwd: &Path) -> Result<(), String> {
 /// it ran, otherwise the reason `/plugin` and doctor show — bwrap's first
 /// line of stderr (or the exit status), and a hint when that line is about
 /// the user namespace bwrap could not create. Pure.
-#[cfg_attr(
-    not(all(target_os = "linux", not(target_env = "ohos"))),
-    allow(dead_code)
-)]
+#[cfg(any(test, all(target_os = "linux", not(target_env = "ohos"))))]
 fn bwrap_probe_verdict(succeeded: bool, status: &str, stderr: &str) -> Result<(), String> {
     if succeeded {
         return Ok(());
