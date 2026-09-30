@@ -12433,8 +12433,12 @@ fn annotate_child_model_error_adds_actionable_hint() {
     let auth = annotate_child_model_error("403 Forbidden", "kimi-k2", provider, &inherit);
     assert!(auth.contains("kimi-k2"), "names the model: {auth}");
     assert!(
-        auth.contains("child model override"),
+        auth.contains("child-agent model config"),
         "names the recovery path: {auth}"
+    );
+    assert!(
+        !auth.contains("explicit child model override"),
+        "an inherited route never blames an override nobody gave: {auth}"
     );
     assert!(
         auth.contains("403 Forbidden"),
@@ -15026,6 +15030,7 @@ pub(crate) fn stub_runtime() -> SubAgentRuntime {
         reasoning_effort_auto: false,
         role_models: std::collections::HashMap::new(),
         route_replacements: Vec::new(),
+        route_origin: None,
         context,
         allow_shell: true,
         accept_edits: false,
