@@ -2802,6 +2802,7 @@ fn new_caches_workspace_skills_for_slash_menu() {
     let workspace = tmp.path().join("workspace");
     let skill_dir = workspace.join(".agents").join("skills").join("local-skill");
     std::fs::create_dir_all(&skill_dir).expect("skill dir");
+    crate::test_support::trust_workspace(&workspace);
     std::fs::write(
         skill_dir.join("SKILL.md"),
         "---\nname: local-skill\ndescription: Local workspace skill\n---\nUse the local skill.\n",
@@ -2858,6 +2859,7 @@ fn cached_skills_merges_across_candidate_directories() {
 fn cached_skills_respect_codewhale_only_scan_config() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let workspace = tmp.path().join("workspace");
+    crate::test_support::trust_workspace(&workspace);
 
     let claude_dir = workspace
         .join(".claude")
@@ -2935,6 +2937,35 @@ fn resolve_skills_dir_requires_codewhale_skills_to_be_directory() {
     let resolved = resolve_skills_dir(&workspace, &global_skills_dir, &config);
 
     assert_eq!(resolved, global_skills_dir);
+}
+
+#[test]
+fn resolve_skills_dir_ignores_untrusted_workspace_skills() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let global_skills_dir = tmp.path().join("global-skills");
+    for relative in [".agents/skills", "skills"] {
+        let workspace = tmp
+            .path()
+            .join(format!("ws-{}", relative.replace('/', "-")));
+        let local_skills = workspace.join(relative);
+        std::fs::create_dir_all(&local_skills).expect("skills dir");
+        let config = Config {
+            skills_dir: Some(global_skills_dir.to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            resolve_skills_dir(&workspace, &global_skills_dir, &config),
+            global_skills_dir,
+            "untrusted {relative} must not be resolved as the skills dir"
+        );
+        crate::test_support::trust_workspace(&workspace);
+        assert_eq!(
+            resolve_skills_dir(&workspace, &global_skills_dir, &config),
+            local_skills,
+            "trusted {relative} resolves as before"
+        );
+    }
 }
 
 #[test]

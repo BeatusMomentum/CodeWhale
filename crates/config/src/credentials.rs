@@ -50,7 +50,13 @@ pub fn clear_provider_api_key_from_config(store: &mut ConfigStore, provider: Pro
 /// unset model to its own default, and model choice belongs to the
 /// model/config commands.
 pub fn prepare_provider_api_key_metadata(store: &mut ConfigStore, provider: ProviderKind) {
-    store.config.auth_mode = Some("api_key".to_string());
+    // The root `auth_mode` is the active provider's fallback marker. Writing
+    // it for an inactive provider would leak `api_key` onto the active route
+    // (e.g. a keyless local Ollama), so only the saved provider's own table
+    // is marked unless it is the active one.
+    if provider == store.config.provider {
+        store.config.auth_mode = Some("api_key".to_string());
+    }
     let provider_config = store.config.providers.for_provider_mut(provider);
     provider_config.auth_mode = Some("api_key".to_string());
     provider_config.external_credentials = None;
@@ -58,6 +64,12 @@ pub fn prepare_provider_api_key_metadata(store: &mut ConfigStore, provider: Prov
         provider_config.oauth_credential_generation = None;
     }
 }
+
+/// Why no writer stores an API key for OpenAI Codex. The route authenticates
+/// through OAuth or an external read-only consent and never reads the secret
+/// store, so a saved key would be unused while its metadata write replaced
+/// the consent.
+pub const OPENAI_CODEX_API_KEY_REFUSAL: &str = "OpenAI Codex uses OAuth. Sign in with ChatGPT via `codewhale auth chatgpt` (subscription billing, Codewhale-owned tokens). The openai API-key route is a different billing owner. Alternatively run `codex login`, then grant exact read-only access with `codewhale auth external-consent --provider openai-codex --mode read-only`, or set OPENAI_CODEX_ACCESS_TOKEN for this process; Codewhale does not store an API key for this provider.";
 
 /// Persist a provider credential to the durable secret store without silently
 /// downgrading a backend failure to plaintext config storage.
@@ -70,6 +82,10 @@ pub fn set_provider_api_key(
     provider: ProviderKind,
     api_key: &str,
 ) -> Result<bool> {
+    anyhow::ensure!(
+        provider != ProviderKind::OpenaiCodex,
+        OPENAI_CODEX_API_KEY_REFUSAL
+    );
     // #6528: strip pasted invisible characters and whitespace in one place.
     let api_key = codewhale_secrets::normalize_api_key(api_key);
     anyhow::ensure!(!api_key.is_empty(), "Refusing to save an empty API key.");
@@ -205,4 +221,94 @@ pub fn clear_provider_api_key(
         slot,
         secret_store_error,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn store_with(body: &str) -> (tempfile::TempDir, ConfigStore) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, body).expect("seed config");
+        let store = ConfigStore::load(Some(path)).expect("store loads");
+        (dir, store)
+    }
+
+    fn in_memory_secrets() -> Secrets {
+        Secrets::new(std::sync::Arc::new(
+            codewhale_secrets::InMemoryKeyringStore::new(),
+        ))
+    }
+
+    #[test]
+    fn saving_a_key_for_an_inactive_provider_leaves_root_auth_mode_alone() {
+        let (_dir, mut store) = store_with("provider = \"ollama\"\n");
+        let secrets = in_memory_secrets();
+
+        set_provider_api_key(&mut store, &secrets, ProviderKind::Openrouter, "or-key")
+            .expect("save succeeds");
+
+        let saved = ConfigStore::load(Some(store.path().to_path_buf())).expect("reload");
+        assert_eq!(saved.config.provider, ProviderKind::Ollama);
+        assert_eq!(saved.config.auth_mode, None);
+        assert_eq!(
+            saved.config.providers.openrouter.auth_mode.as_deref(),
+            Some("api_key")
+        );
+    }
+
+    #[test]
+    fn saving_a_key_for_the_active_provider_still_marks_root_auth_mode() {
+        let (_dir, mut store) = store_with("provider = \"openrouter\"\n");
+        let secrets = in_memory_secrets();
+
+        set_provider_api_key(&mut store, &secrets, ProviderKind::Openrouter, "or-key")
+            .expect("save succeeds");
+
+        let saved = ConfigStore::load(Some(store.path().to_path_buf())).expect("reload");
+        assert_eq!(saved.config.auth_mode.as_deref(), Some("api_key"));
+    }
+
+    #[test]
+    fn openai_codex_key_save_is_refused_and_keeps_external_consent() {
+        let (_dir, mut store) = store_with(
+            "provider = \"openai-codex\"\n\n[providers.openai-codex]\nauth_mode = \"oauth\"\n",
+        );
+        store.config.providers.openai_codex.external_credentials =
+            Some(crate::ExternalCredentialConsentToml::read_only(
+                ProviderKind::OpenaiCodex,
+                crate::ExternalCredentialSource::CodexCli,
+                std::path::PathBuf::from("/synthetic/codex/auth.json"),
+            ));
+        store.save().expect("seed consent");
+        let before = std::fs::read_to_string(store.path()).expect("config before");
+        let secrets = in_memory_secrets();
+
+        let error = set_provider_api_key(&mut store, &secrets, ProviderKind::OpenaiCodex, "k")
+            .expect_err("openai-codex keys are not stored");
+
+        assert!(
+            error.to_string().contains("OpenAI Codex uses OAuth"),
+            "{error}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(store.path()).expect("config after"),
+            before
+        );
+        assert!(
+            store
+                .config
+                .providers
+                .openai_codex
+                .external_credentials
+                .is_some()
+        );
+        assert_eq!(
+            secrets
+                .get(provider_slot(ProviderKind::OpenaiCodex))
+                .expect("read"),
+            None
+        );
+    }
 }

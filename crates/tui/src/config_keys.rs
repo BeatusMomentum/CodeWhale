@@ -21,7 +21,9 @@ use crate::settings::Settings;
 /// Root keys read from config.toml outside both the TUI [`Config`] struct and
 /// the dispatcher's [`ConfigToml`] typed fields. Each has a named reader:
 /// profile overlays (`ConfigFile::profiles`), per-project trust
-/// (`config::project_trust_*`), the route-preference migration
+/// (`config::project_trust_*`), user workspace entries
+/// (`merge_user_workspace_config_from_doc` reads `[workspace.'<path>']` and
+/// the legacy `[projects]` spelling), the route-preference migration
 /// (`config_persistence`), the MCP stdio dispatcher's literal JSON key, the
 /// stream-timeout fallbacks in `ConfigToml::stream_chunk_timeout_secs`, and
 /// the legacy top-level `base_url` / `api_key`, which
@@ -33,12 +35,19 @@ const OTHER_READER_ROOT_KEYS: &[&str] = &[
     "api_key",
     "apiKey",
     "projects",
+    "workspace",
     "route_preferences_version",
     "route_preferences_migration",
     "mcp.server_definitions",
     "stream_chunk_timeout_secs",
     "tui.stream_chunk_timeout_secs",
 ];
+
+/// [`OTHER_READER_ROOT_KEYS`] whose value is a table of user entries
+/// (`[profiles.<name>]`, `[projects.'<path>']`, `[workspace.'<path>']`).
+/// `config doctor` counts them as read, but `config set <key> <value>` would
+/// replace the whole table with a string, so a scalar write is refused.
+const TABLE_ROOT_KEYS: &[&str] = &["profiles", "projects", "workspace"];
 
 /// Where a key a user asked `config set` to write is read from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -153,7 +162,7 @@ fn settable_keys() -> impl Iterator<Item = &'static str> {
             OTHER_READER_ROOT_KEYS
                 .iter()
                 .copied()
-                .filter(|key| !key.contains('.')),
+                .filter(|key| !key.contains('.') && !TABLE_ROOT_KEYS.contains(key)),
         )
 }
 
@@ -212,9 +221,12 @@ pub(crate) fn settings_toml_keys() -> impl Iterator<Item = &'static str> {
 /// whose reader needs more than `ConfigToml::set_value`'s string fallthrough,
 /// or `Ok(None)` when that fallthrough is already right.
 ///
+/// - `approval_policy`, `sandbox_mode` and `verbosity` are refused unless
+///   the value is one [`codewhale_config::config_toml_choices`] names, since
+///   the TUI loader rejects the whole file otherwise.
 /// - `reasoning_effort` is checked against its reader,
 ///   [`ReasoningEffort::parse_strict`], and stored in canonical spelling.
-/// - A root field the TUI [`Config`] reads but `SETTINGS_SCHEMA` does not
+/// - A root field the TUI `Config` reads but `SETTINGS_SCHEMA` does not
 ///   declare (`yolo`, `max_subagents`, `mcp_oauth_callback_port`, ...) is
 ///   typed by that field's own deserializer: a string in a boolean or
 ///   integer field fails the TUI's strict parse of the whole file, so the
@@ -224,6 +236,13 @@ pub(crate) fn settings_toml_keys() -> impl Iterator<Item = &'static str> {
 /// [`ReasoningEffort::parse_strict`]: crate::reasoning_preference::ReasoningEffort::parse_strict
 pub fn config_toml_value(key: &str, value: &str) -> Result<Option<toml::Value>> {
     let key = key.trim();
+    if TABLE_ROOT_KEYS.contains(&key) {
+        anyhow::bail!(
+            "`{key}` is a table of entries, so `config set {key}` would replace all of \
+             them; nothing was saved. Edit the [{key}.<name>] table in config.toml instead."
+        );
+    }
+    codewhale_config::check_config_toml_choice(key, value)?;
     if key == "reasoning_effort" {
         let effort = crate::reasoning_preference::ReasoningEffort::parse_strict(value)
             .map_err(|error| anyhow::anyhow!("invalid value for '{key}': {error}"))?;
@@ -415,6 +434,43 @@ mod tests {
     }
 
     #[test]
+    fn config_toml_value_refuses_values_the_loader_rejects() {
+        for (key, value) in [
+            ("approval_policy", " On-Request "),
+            ("approval_policy", "never"),
+            ("sandbox_mode", "workspace-write"),
+            ("verbosity", "concise"),
+        ] {
+            assert_eq!(
+                config_toml_value(key, value).unwrap(),
+                None,
+                "{key}={value}"
+            );
+        }
+        for (key, value, fix) in [
+            ("approval_policy", "ask", "on-request"),
+            ("sandbox_mode", "full", "read-only"),
+            ("verbosity", "quiet", "normal"),
+        ] {
+            let error = format!("{:#}", config_toml_value(key, value).expect_err(key));
+            assert!(
+                error.contains(&format!("invalid value '{value}' for '{key}'")),
+                "{error}"
+            );
+            assert!(
+                error.contains(&format!("fix: codewhale config set {key} {fix}")),
+                "{error}"
+            );
+        }
+        let error = format!(
+            "{:#}",
+            config_toml_value("approval_policy", "ask").unwrap_err()
+        );
+        assert!(error.contains("on-request, untrusted, never"), "{error}");
+        assert!(error.contains("settings.toml"), "{error}");
+    }
+
+    #[test]
     fn settings_toml_keys_are_user_settable_only() {
         let keys: Vec<&str> = settings_toml_keys().collect();
         assert!(keys.contains(&"calm_mode"), "{keys:?}");
@@ -428,6 +484,100 @@ mod tests {
         ] {
             assert!(!keys.contains(&internal), "{internal} is not settable");
         }
+    }
+
+    #[test]
+    fn scalar_set_of_a_table_root_key_is_refused() {
+        // `config set workspace /path` used to store `workspace = "/path"`,
+        // replacing every `[workspace.'<path>']` entry on save.
+        for key in TABLE_ROOT_KEYS {
+            assert_eq!(config_key_home(key), ConfigKeyHome::ConfigToml, "{key}");
+            let error = config_toml_value(key, "/some/path").expect_err(key);
+            assert!(error.to_string().contains("nothing was saved"), "{error}");
+        }
+    }
+
+    #[test]
+    fn config_set_and_loader_accept_the_same_closed_vocabulary() {
+        for (key, value, valid) in [
+            ("approval_policy", " ON-REQUEST ", true),
+            ("approval_policy", "ask", false),
+            ("verbosity", " CONCISE ", true),
+            ("verbosity", "quiet", false),
+            ("sandbox_mode", " WORKSPACE-WRITE ", true),
+            ("sandbox_mode", "full", false),
+        ] {
+            let mut config = crate::config::Config::default();
+            match key {
+                "approval_policy" => config.approval_policy = Some(value.to_string()),
+                "verbosity" => config.verbosity = Some(value.to_string()),
+                "sandbox_mode" => config.sandbox_mode = Some(value.to_string()),
+                _ => unreachable!(),
+            }
+            assert_eq!(config_toml_value(key, value).is_ok(), valid, "{key}");
+            assert_eq!(config.validate().is_ok(), valid, "{key}");
+        }
+    }
+
+    #[test]
+    fn loader_choice_errors_redact_pasted_keys_but_keep_ordinary_typos() {
+        let token = ["sk-live-", "Z7qX4mNb2Vc9Lk3PwR8t"].concat();
+        for (key, correction) in [
+            ("approval_policy", "on-request"),
+            ("verbosity", "normal"),
+            ("sandbox_mode", "workspace-write"),
+        ] {
+            for value in [token.as_str(), "misspelled-choice"] {
+                let mut config = crate::config::Config::default();
+                match key {
+                    "approval_policy" => config.approval_policy = Some(value.to_string()),
+                    "verbosity" => config.verbosity = Some(value.to_string()),
+                    "sandbox_mode" => config.sandbox_mode = Some(value.to_string()),
+                    _ => unreachable!(),
+                }
+                let error = config.validate().expect_err("invalid choice");
+                let diagnostic = crate::config::SafeConfigDiagnostic::find_in(&error)
+                    .expect("shared choice validation keeps the structured diagnostic");
+                let shareable = diagnostic.display_message();
+                assert!(shareable.starts_with(&format!("Invalid {key} (value not shown):")));
+                assert!(!shareable.contains(value), "{shareable}");
+                let fix = diagnostic
+                    .fix()
+                    .expect("invalid choices keep a recovery action");
+                assert!(
+                    fix.starts_with(&format!("codewhale config set {key} {correction} (if ")),
+                    "{fix}"
+                );
+                assert!(
+                    fix.contains("profile") && fix.contains("managed config"),
+                    "{fix}"
+                );
+                if key != "verbosity" {
+                    assert!(
+                        fix.contains(&format!("CODEWHALE_{}", key.to_ascii_uppercase())),
+                        "{fix}"
+                    );
+                }
+                let error = error.to_string();
+                assert!(!error.contains(&token));
+                assert!(error.contains("expected"));
+                assert!(error.contains(if value == token {
+                    "[redacted]"
+                } else {
+                    "misspelled-choice"
+                }));
+            }
+        }
+    }
+
+    #[test]
+    fn documented_user_workspace_entry_is_read() {
+        // The block docs/CONFIGURATION.md gives under "User workspace entries".
+        let documented: toml::Table =
+            toml::from_str("[workspace.'/absolute/path/to/project']\nallow_shell = true\n")
+                .expect("documented block parses");
+        let unread = unread_config_keys(documented.keys().map(String::as_str));
+        assert!(unread.is_empty(), "{unread:#?}");
     }
 
     #[test]

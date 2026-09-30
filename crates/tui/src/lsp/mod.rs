@@ -743,7 +743,7 @@ impl LspManager {
             };
             let relative = match target.strip_prefix(&self.workspace).or_else(|_| target.strip_prefix(&root)) {
                 Ok(relative) if !relative.as_os_str().is_empty()
-                    && relative.components().all(|component| matches!(component, std::path::Component::Normal(part) if part != ".git")) => relative,
+                    && relative.components().all(|component| matches!(component, std::path::Component::Normal(part) if !crate::snapshot::is_git_metadata_name(part))) => relative,
                 _ => { omitted += 1; continue; }
             };
             let Some(path) = semantic_relative_path(relative) else {
@@ -902,7 +902,7 @@ fn semantic_relative_path(path: &Path) -> Option<String> {
     let parts = path
         .components()
         .map(|component| match component {
-            std::path::Component::Normal(part) if part != ".git" => {
+            std::path::Component::Normal(part) if !crate::snapshot::is_git_metadata_name(part) => {
                 part.to_str().filter(|part| !part.contains('\\'))
             }
             _ => None,

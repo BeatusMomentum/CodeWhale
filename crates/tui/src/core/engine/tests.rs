@@ -13368,6 +13368,7 @@ fn measure_unchanged_prompt_skill_discovery() -> (
     let _userprofile = EnvVarGuard::set("USERPROFILE", &home);
     let codewhale_home = home.join(".codewhale");
     let _codewhale_home = EnvVarGuard::set("CODEWHALE_HOME", &codewhale_home);
+    crate::test_support::trust_workspace(&workspace);
 
     crate::skills::clear_skill_discovery_cache();
     crate::skills::reset_discovery_metrics();

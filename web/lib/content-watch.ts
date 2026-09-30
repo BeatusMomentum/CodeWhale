@@ -363,8 +363,8 @@ ${docsText}`;
     const existing = await getDraft(env.CURATED_KV, draftStorageKey(draft));
     if (existing) continue;
 
-    await saveDraft(env.CURATED_KV, draft);
-    drafted++;
+    // saveDraft refuses findings the maintainer already discarded.
+    if (await saveDraft(env.CURATED_KV, draft)) drafted++;
   }
 
   return { ok: true, drafted };

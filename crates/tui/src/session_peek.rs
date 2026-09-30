@@ -203,23 +203,35 @@ pub const REDACTED_PLACEHOLDER: &str = "[redacted]";
 
 /// Mask credential-shaped substrings.
 ///
-/// Conservative and shape-based: it does not try to understand the text, only
-/// to recognise the handful of forms secrets usually take in a transcript.
-/// Over-redacting a peek line is cheap; leaking a key over a LAN is not.
+/// The shared export sanitizer ([`codewhale_secrets::sanitize::sanitize_text`],
+/// also used by `/export`) runs first: it covers `Bearer <token>`, JWTs,
+/// URL credentials, PEM blocks, and quoted JSON/TOML keyed secrets. A
+/// token-level pass then masks the extra bare prefixes (AWS, Google, Hugging
+/// Face) and long opaque runs a transcript tends to carry. Over-redacting a
+/// peek line is cheap; leaking a key over a LAN is not.
 #[must_use]
 pub fn redact(text: &str) -> (String, bool) {
-    let mut out = String::with_capacity(text.len());
-    let mut redacted = false;
+    let sanitized = codewhale_secrets::sanitize::sanitize_text(text);
+    // The sanitizer also strips control bytes and normalises URLs, so compare
+    // placeholder counts rather than bytes to decide whether it redacted.
+    let mut redacted = redaction_marks(&sanitized) > redaction_marks(text);
+    let mut out = String::with_capacity(sanitized.len());
 
-    for token in text.split_inclusive(char::is_whitespace) {
+    for token in sanitized.split_inclusive(char::is_whitespace) {
         let trimmed = token.trim_end();
         let trailing = &token[trimmed.len()..];
-        if looks_like_secret(trimmed) {
+        // Keep closing quotes and punctuation outside the mask so a masked
+        // token inside `"…"` or `(…)` does not swallow its delimiter.
+        let core = trimmed.trim_end_matches(['"', '\'', '`', ',', ';', ')', ']', '}']);
+        let closing = &trimmed[core.len()..];
+        if looks_like_secret(core) {
             out.push_str(REDACTED_PLACEHOLDER);
+            out.push_str(closing);
             out.push_str(trailing);
             redacted = true;
-        } else if let Some(masked) = mask_assignment(trimmed) {
+        } else if let Some(masked) = mask_assignment(core) {
             out.push_str(&masked);
+            out.push_str(closing);
             out.push_str(trailing);
             redacted = true;
         } else {
@@ -228,6 +240,10 @@ pub fn redact(text: &str) -> (String, bool) {
     }
 
     (out, redacted)
+}
+
+fn redaction_marks(text: &str) -> usize {
+    text.matches("[redacted").count() + text.matches("***").count()
 }
 
 /// Known credential prefixes plus long opaque runs.
@@ -384,6 +400,37 @@ mod tests {
         assert!(masked.contains("api_key="));
         assert!(!masked.contains("hunter2"));
         assert!(!masked.contains("swordfish"));
+    }
+
+    #[test]
+    fn bearer_jwt_and_quoted_json_secrets_are_redacted() {
+        let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.c2lnbmF0dXJlLXZhbHVl";
+        let bearer = format!("Authorization: Bearer {jwt}");
+        let json_key = r#"{"api_key": "sk-ant-api03-abcdefghijklmnopqrstuvwxyz0123456789"}"#;
+        for (input, secret) in [
+            (bearer.as_str(), jwt),
+            (
+                json_key,
+                "sk-ant-api03-abcdefghijklmnopqrstuvwxyz0123456789",
+            ),
+            (
+                "run: curl https://user:hunter2pass@api.example/v1 now",
+                "hunter2pass",
+            ),
+        ] {
+            let (out, redacted) = redact(input);
+            assert!(redacted, "{input} should have been redacted: {out}");
+            assert!(!out.contains(secret), "peek leaked {secret}: {out}");
+        }
+    }
+
+    #[test]
+    fn a_masked_token_keeps_its_closing_quote() {
+        let (out, redacted) =
+            redact(r#"curl -H "X-Key: ghp_abcdefghijklmnopqrstuvwxyz1234" https://api.example"#);
+        assert!(redacted);
+        assert!(!out.contains("ghp_abcdefghijklmnopqrstuvwxyz1234"), "{out}");
+        assert!(out.contains(r#"[redacted]" https://api.example"#), "{out}");
     }
 
     #[test]

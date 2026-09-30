@@ -15580,6 +15580,44 @@ mod terminal_mode_tests {
     }
 
     #[test]
+    fn worker_command_policy_prompt_that_looks_like_a_flag_parses() {
+        use crate::fleet::executor::build_worker_exec_command;
+        use codewhale_config::FleetExecConfig;
+        use codewhale_protocol::fleet::FleetTaskSpec;
+
+        let task: FleetTaskSpec = serde_json::from_value(serde_json::json!({
+            "id": "t1",
+            "name": "Smoke",
+            "objective": "prove it runs",
+            "instructions": "audit",
+            "worker": { "role": "reviewer", "tool_profile": "read-only" }
+        }))
+        .unwrap();
+
+        // A Markdown bullet list, and a policy that reads exactly like one of
+        // exec's own flags; the latter makes clap reject a split
+        // `--append-system-prompt <value>` pair.
+        for policy in ["- Never push to main\n- Never touch .git/config", "--hooks"] {
+            let exec = FleetExecConfig {
+                append_system_prompt: policy.to_string(),
+                ..FleetExecConfig::default()
+            };
+            let cmd = build_worker_exec_command("codewhale", &task, &exec, None);
+            let cli = Cli::try_parse_from(std::iter::once("codewhale".to_string()).chain(cmd.args))
+                .unwrap_or_else(|e| panic!("{policy:?}: {e}"));
+            let Some(Commands::Exec(args)) = cli.command else {
+                panic!("expected exec command");
+            };
+            assert_eq!(args.append_system_prompt.as_deref(), Some(policy));
+            assert!(
+                args.prompt.last().is_some_and(|p| p.contains("audit")),
+                "{policy}"
+            );
+            assert!(!args.hooks, "{policy:?} must stay text, not a flag");
+        }
+    }
+
+    #[test]
     fn sessions_archive_cli_keeps_legacy_listing_and_export_options() {
         let legacy = parse_cli(&["codewhale", "sessions", "--limit", "7", "--search", "work"]);
         assert!(

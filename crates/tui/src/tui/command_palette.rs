@@ -1367,6 +1367,7 @@ mod tests {
     fn command_palette_skills_respect_codewhale_only_scan() {
         let tmp = TempDir::new().expect("tempdir");
         let workspace = tmp.path().join("workspace");
+        crate::test_support::trust_workspace(&workspace);
         let claude_skill_dir = workspace
             .join(".claude")
             .join("skills")

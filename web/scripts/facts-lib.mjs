@@ -57,15 +57,15 @@ export function deriveSandboxBackendsFromSource(source) {
 
 /**
  * Provider label map — the single source of truth for provider → website
- * display mapping. MUST be kept in sync with the copy in
- * web/lib/facts-drift.ts (for the runtime Cloudflare cron path).
+ * display mapping. MUST equal PROVIDER_LABELS in web/lib/facts-drift.ts (the
+ * runtime Cloudflare cron path); lib/facts-drift.test.ts fails when they differ.
  *
  * Excluded variants: DeepseekCN (not wired through shared ProviderKind,
  * #1104), Custom (dynamic meta-provider, #1519), and Antigravity
  * (a non-runnable legacy config tombstone, permanently excluded from public
  * provider facts).
  */
-const PROVIDER_LABEL_MAP = {
+export const PROVIDER_LABEL_MAP = {
   Deepseek: { id: "deepseek", label: "DeepSeek", env: "DEEPSEEK_API_KEY" },
   DeepseekAnthropic: { id: "deepseek-anthropic", label: "DeepSeek Anthropic", env: "DEEPSEEK_API_KEY / ANTHROPIC_API_KEY" },
   NvidiaNim: { id: "nvidia-nim", label: "NVIDIA NIM", env: "NVIDIA_API_KEY / NVIDIA_NIM_API_KEY" },
