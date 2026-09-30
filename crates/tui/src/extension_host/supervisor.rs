@@ -32,7 +32,8 @@
 //! macOS mechanism on macOS 26.1 arm64 (2026-09-30, Bun 1.4.0 and Node);
 //! the Linux thresholds in [`HOST_MEMORY_CAP`] in a Linux container
 //! (2026-09-29). Hosted CI runs the Rust memory-cap test on Linux, macOS and
-//! Windows with Node only; no Bun host has been run on Linux or Windows.
+//! Windows with Node only; the Rust host tests have not run a Bun host on
+//! Linux or Windows (CI's JS host suites run under Bun 1.4.0 on Linux).
 //! * Linux: `RLIMIT_DATA`, set in the child before exec (clamped to an
 //!   inherited hard limit that is already lower); an allocation past the cap
 //!   fails. Plugin child processes inherit it.

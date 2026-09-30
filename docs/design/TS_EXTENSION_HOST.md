@@ -10,34 +10,43 @@
 
 ## As built: Bun runtime (2026-09-30)
 
-Bun is the default runtime for the host: `[extension_host] runtime = "auto" |
-"bun" | "node"`, default `auto` (Bun first). It follows CURRENT_DECISIONS §26
-(D1/D2 and the 2026-09-29 update "go to bun asap") and the 2026-09-29
-Bun-vs-Node spike. D2 made Bun the default only once four gaps were closed in
-code with tests; the table below is the record, measured on macOS 26.1 arm64
-with Bun 1.4.0 and Node 22.20, 24.19 and 26.10. The same embedded bundle runs
-on either runtime.
+The host can run on Bun as an opt-in: `[extension_host] runtime = "node" |
+"bun" | "auto"`, default `node`. It follows CURRENT_DECISIONS §26 (D1/D2 and
+the 2026-09-29 update "go to bun asap") and the 2026-09-29 Bun-vs-Node spike.
+Bun may become the default only after four gates are proven on every
+platform, followed by an explicit, recorded cutover. The table below is the
+record, measured on macOS 26.1 arm64 with Bun 1.4.0 and Node 22.20, 24.19 and
+26.10; there is no Linux or Windows Bun proof, so Node stays the default and
+the diagnosed fallback. The same embedded bundle runs on either runtime.
 
 | Gate | How it is closed | Evidence |
 | --- | --- | --- |
 | 1. `--no-install` always | `supervisor::runtime_args` passes `--no-install --no-env-file --config=<null device> --no-addons` to Bun | host test against a local recording registry (a control run without the flag does contact it); Rust launch-plan test |
 | 2. OS-enforced memory cap | Linux `RLIMIT_DATA`; Windows Job Object per-process limit; macOS + Bun: a fatal jetsam limit the host applies to itself | host test (Bun on macOS: `memory_limit_mib` reported, same pid, SIGKILL at 300 MiB); Rust `memory_cap_stops_a_{bun,node}_host` |
 | 3. FFI policy in the loader | `src/runtime.ts` locks `bun:ffi`, `Bun.FFI`, SQLite, Workers and ShadowRealm; the host refuses to start if a lock does not hold | host test with 13 entry points; each one is reachable when the lockdown is removed |
-| 4. `host/hello` reports the real runtime | `runtime: {name, version}` from `process.versions.bun` first; the handshake refuses a mismatch | corpus 01/21/31–35; Rust handshake-mismatch test; host handshake test |
+| 4. `host/hello` reports the real runtime | `runtime: {name, version}` from `process.versions.bun` first; the handshake refuses a runtime or version mismatch | corpus 01/21/31–35; Rust handshake-mismatch test; host handshake test |
 
-- **Selection** (`dependencies::resolve_extension_host_runtime`). `auto` runs
-  each Bun candidate (the `[extension_host] bun` override, then `bun` on
-  `PATH`, then `$BUN_INSTALL/bin` or `~/.bun/bin`) and takes the first at or
-  above **1.4.0**, the validated floor. Without one it uses the Node ladder
-  (`^22.19 || >=24`) and records why Bun was not used. `bun` and `node` try
-  only that runtime and never fall back. A table that sets only `node` (a
-  pre-Bun config) keeps meaning Node (`ExtensionHostConfig::effective_runtime`).
-  For Node the resolver also probes which of `--no-experimental-sqlite` and
-  `--no-experimental-ffi` the binary accepts (`node <flag> --version`).
-- **Pinned for the process.** The first launch pins the runtime. Every
-  restart reuses it, and it is never resolved again, so a session cannot
-  switch runtime. The handshake also refuses a host whose `host/hello`
-  reports a different runtime than the one launched. `codewhale doctor`
+- **Selection** (`dependencies::resolve_extension_host_runtime`). Unset
+  means `node`, or `bun` when the table sets only a `bun` path
+  (`ExtensionHostConfig::effective_runtime`). A configured `node`/`bun` path is
+  the only candidate for its runtime and fails resolution with its reason
+  rather than falling through. Otherwise each `bun` on `PATH`, then
+  `$BUN_INSTALL/bin` or `~/.bun/bin` (or each `node` on `PATH`) is run, and
+  the first at or above the floor (Bun **1.4.0**, Node `^22.19 || >=24`) is
+  taken. A searched candidate inside a `node_modules` directory or the working
+  directory is skipped without being run (not applied when the working
+  directory contains the user's home). `auto` tries Bun first and records why
+  Bun was not used when it takes Node. `bun` and `node` try only that runtime
+  and never fall back. For Node the resolver also probes which of
+  `--no-experimental-sqlite` and `--no-experimental-ffi` the binary accepts
+  (`node <flag> --version`).
+- **Pinned for the process.** The runtime is pinned once a host on it
+  completes the handshake. Every restart reuses it without resolving it
+  again, so a session cannot switch runtime. Under `auto`, a Bun host that
+  fails to launch or handshake before anything is pinned is reported once and
+  Node is resolved for the rest of the session. The handshake refuses a host
+  whose `host/hello` reports a different runtime, or a different version than
+  the pinned probe saw (the binary was replaced mid-session). `codewhale doctor`
   prints the resolution (what, which version, where, the fallback reason and
   how the memory cap is enforced). `/plugin` shows `running · pid … · bun
   1.4.0 · …` and a `runtime:` line with the summary and memory posture.
@@ -87,8 +96,9 @@ on either runtime.
   the entry points found; one a newer runtime adds is not covered until it is
   added.
 - **Memory cap** (1 GiB, `supervisor::MemoryEnforcement`). Linux:
-  `RLIMIT_DATA` between fork and exec, so the kernel fails an allocation past
-  it; measured in containers, Node 24 cannot create the watchdog Worker at
+  `RLIMIT_DATA` between fork and exec (clamped to a lower inherited hard
+  limit), so the kernel fails an allocation past it; measured once in a Linux
+  container (2026-09-29), Node 24 cannot create the watchdog Worker at
   512 MiB and Bun 1.4 aborts at startup at 256 MiB, and both run at 1 GiB.
   Windows: the Job Object's per-process limit (`JOB_OBJECT_LIMIT_PROCESS_MEMORY`),
   set just after spawn when the host joins its job. Both apply to every process
@@ -102,7 +112,8 @@ on either runtime.
   loads, using `bun:ffi` before the lockdown takes it away, and reports
   `memory_limit_mib` in `host/hello`. The core accepts only the value it asked
   for (`CODEWHALE_HOST_MEMORY_LIMIT_MIB`). Past the limit the kernel SIGKILLs
-  the host, and the exit reason says so. Processes the host starts are not
+  the host; the exit reason reports the SIGKILL and the configured limit but
+  not a cause, since any SIGKILL looks the same. Processes the host starts are not
   covered. A Bun host that cannot apply the requested kernel limit is refused
   before initialization, with the reason retained in its stderr and `/plugin`
   diagnostics. A Node host on macOS is checked at each heartbeat instead,
@@ -110,11 +121,13 @@ on either runtime.
   flag still applies everywhere.
 - **Tests.** The host JS suite runs under `node --test` and `bun test`
   (`npm run test:bun`); each run spawns the host on the runtime running the
-  suite. CI adds a Bun leg pinned to 1.4.0 and keeps the Node leg. Rust
-  covers the selection matrix and flag probe, the config compatibility rule,
-  the per-runtime launch flags and environment, the runtime-mismatch refusal,
-  a Bun end-to-end run with a crash restart that stays on Bun, and the memory
-  cap on both runtimes (Linux, macOS and Windows).
+  suite. CI adds a JS-suite Bun leg pinned to 1.4.0 on Linux and keeps the
+  Node leg. Rust covers the selection matrix and flag probe, the default and
+  config rule, the per-runtime launch flags and environment, the runtime and
+  version mismatch refusals, the `auto` fallback when Bun fails to start, a
+  Bun end-to-end run with a crash restart that stays on Bun, and the memory
+  cap: CI runs it with Node on Linux, macOS and Windows; the Bun case has run
+  on macOS only.
 
 Not done: the bundled single-executable host (`bun build --compile`, D1) is
 not built, signed or shipped; the host still runs on a user-installed Bun or
@@ -123,7 +136,13 @@ Codewhale host does not use them. Bun on Linux and Windows is unsandboxed
 exactly as Node is. The Windows Job Object limit and the Linux `RLIMIT_DATA`
 path were not run on this machine; CI runs the memory-cap tests there. The
 Rust CI job still runs the Rust integration tests on Node only; the Bun ones
-skip there unless `CODEWHALE_EXT_HOST_BUN_TESTS` is set.
+skip there unless `CODEWHALE_EXT_HOST_BUN_TESTS` is set. So the Bun default
+cutover is not done: Node stays the default until the four gates hold on
+Linux and Windows too. Under Bun, a `tsconfig.json` next to or above a
+plugin's files (including one above the reviewed bundle) steers its imports
+through `paths`/`baseUrl`; Node ignores it. The Linux `RLIMIT_DATA` path
+clamps to a lower inherited hard limit and still reports the configured cap.
+The native-code lockdown covers the entry points found so far.
 
 ## As built: phase 2a supervision (2026-09-29)
 
@@ -506,7 +525,7 @@ Rust then respawns the host and replays activations from its own record of which
 - **Handshake:**
 
   ```
-  host → core  host/hello      {protocol: {min: 1, max: 1}, host_version, bundle_sha256, node_version,
+  host → core  host/hello      {protocol: {min: 1, max: 1}, host_version, bundle_sha256, runtime: {name, version},
                                 required_caps: [...], optional_caps: [...]}
   core → host  host/initialize {protocol: 1, session_runtime_id, workspace_roots, caps_granted: [...],
                                 limits: {max_frame, max_inflight, hook_deadline_ms, dispose_deadline_ms}}

@@ -3,9 +3,9 @@
  * macOS, and the in-process native-code policy. Everything here runs before
  * any plugin code loads.
  *
- * The host runs on Bun (preferred) or Node. Bun emulates `process.versions.node`,
- * so the runtime is read from `process.versions.bun` first: `host/hello` must
- * report what is actually running.
+ * The host runs on Node (the default) or Bun (an opt-in). Bun emulates
+ * `process.versions.node`, so the runtime is read from `process.versions.bun`
+ * first: `host/hello` must report what is actually running.
  */
 import * as nodeModule from 'node:module'
 import * as vm from 'node:vm'

@@ -55,8 +55,8 @@
 //!   The 1 GiB memory cap is applied through `RLIMIT_DATA` on Linux, the Job
 //!   Object on Windows and, for a Bun host on macOS, a jetsam limit the host
 //!   applies to itself; a macOS Node host is checked at each heartbeat
-//!   instead. A Bun host has not been run on Linux or Windows (`supervisor`
-//!   module docs say what was measured where).
+//!   instead. The Rust host tests have not run a Bun host on Linux or
+//!   Windows (`supervisor` module docs say what was measured where).
 //! * In-process native code is taken away from plugins by the host
 //!   (`extension-host/src/runtime.ts`), for the entry points found so far; a
 //!   native-code entry point a newer runtime adds is not covered until it is

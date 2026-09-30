@@ -1267,14 +1267,18 @@ code_mode = true # execute_tools composes MCP/plugin/native calls; false defers 
                         # so every plugin must be re-reviewed afterwards.
 
 # [extension_host]
-# runtime = "auto"              # "auto" (default: Bun >= 1.4.0 if found, else
-#                               # Node), "bun" or "node". An explicit choice never
-#                               # falls back. Unset with only `node` set: "node".
-# bun = "~/.bun/bin/bun"        # Bun >= 1.4.0. Tried before `bun` on PATH and
+# runtime = "node"              # "node" (default), "bun" or "auto". Bun is an
+#                               # opt-in, qualified on macOS only. "auto" uses
+#                               # Bun >= 1.4.0 when one is found and starts,
+#                               # else Node. "bun"/"node" never fall back.
+#                               # Unset with only `bun` set: "bun".
+# bun = "~/.bun/bin/bun"        # Bun >= 1.4.0. When set, the only Bun tried; a
+#                               # broken one fails instead of searching PATH and
 #                               # $BUN_INSTALL/bin or ~/.bun/bin.
-# node = "/usr/local/bin/node"  # Node.js ^22.19 || >=24. Tried first; otherwise
-#                               # every `node` on PATH is tried in order and the
-#                               # first that runs and meets the floor is used.
+# node = "/usr/local/bin/node"  # Node.js ^22.19 || >=24. When set, the only Node
+#                               # tried. Unset, every `node` on PATH is tried in
+#                               # order, skipping any inside node_modules or the
+#                               # working directory.
 
 # ─────────────────────────────────────────────────────────────────────────────────
 # Vision Model Configuration (optional)

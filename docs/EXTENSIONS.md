@@ -1,7 +1,7 @@
 # Writing an extension tool
 
 The experimental TypeScript extension host runs reviewed plugin code in a
-shared Bun or Node process. Rust still owns sessions, tool admission, approval and
+shared Node process (or, as an opt-in, Bun). Rust still owns sessions, tool admission, approval and
 execution. Extensions currently contribute tools; they cannot provide an
 approval service, run a second agent loop or replace built-in tools.
 
@@ -34,30 +34,48 @@ remain inventory-only.
 
 ## Runtime
 
-`[extension_host] runtime` selects what runs the host:
+`[extension_host] runtime` selects what runs the host. Node is the default.
+Bun is an opt-in: it is qualified on macOS only, and becomes the default only
+after an explicit, recorded cutover.
 
 ```toml
 [extension_host]
-runtime = "auto"   # default: Bun >= 1.4.0 if one is found, otherwise Node
+runtime = "node"   # default: Node only
 # runtime = "bun"  # Bun only; fails rather than falling back to Node
-# runtime = "node" # Node only
-# bun = "~/.bun/bin/bun"      # tried before `bun` on PATH and ~/.bun/bin/bun
-# node = "/opt/homebrew/bin/node" # tried before every `node` on PATH
+# runtime = "auto" # Bun >= 1.4.0 if one is found and starts, otherwise Node
+# bun = "~/.bun/bin/bun"          # the only Bun tried when set
+# node = "/opt/homebrew/bin/node" # the only Node tried when set
 ```
 
 Node must satisfy `^22.19 || >=24`; Bun must be 1.4.0 or newer. Leaving
-`runtime` unset means `auto`, except that a table which sets only `node` keeps
-running that Node, as it did before Bun support. The choice is made once, at
-the host's first launch in a Codewhale process, and restarts reuse it.
-`codewhale doctor` and `/plugin` show which runtime runs the host, its version
-and path, how its memory cap is enforced, and, when `auto` fell back to Node,
-why Bun was not used.
+`runtime` unset means `node`, except that a table which sets only `bun` means
+`bun`. A configured `node` or `bun` path is the only candidate for that
+runtime: if it does not run or is below the floor, the host fails with that
+reason instead of searching `PATH`. Without one, every `node` (or `bun`, then
+`$BUN_INSTALL/bin`, default `~/.bun/bin`) on `PATH` is tried in order, and one
+inside a `node_modules` directory or the working directory is skipped without
+being run; set the path explicitly to use such a runtime. The working-directory
+check does not apply when Codewhale starts in a directory that contains your
+home directory, such as `~` or `/`.
+
+Under `auto`, if the Bun it found fails to start the host, `/plugin` reports
+why once and Node runs the host for the rest of the session. The runtime is
+pinned once a host on it completes its handshake, and restarts reuse it. A
+runtime binary replaced at that path mid-session is refused; restart Codewhale
+to use it. `codewhale doctor` and `/plugin` show which runtime runs the host,
+its version and path, how its memory cap is enforced, and, when `auto` used
+Node, why Bun was not used.
 
 Write extensions for both runtimes. Use Node's APIs (Bun implements them) and
 only erasable TypeScript in `.mts`. Enums, decorators and syntax that needs
 transformation require a separate author build to JavaScript. Bun would accept
-more, but Node would not. Neither runtime reads your `tsconfig.json` for the
-host. See [Node's TypeScript rules](https://nodejs.org/docs/latest-v22.x/api/typescript.html).
+more, but Node would not. Node never reads a `tsconfig.json` for the host. Bun
+does: a `tsconfig.json` next to or above an extension's files applies its
+`paths`, `baseUrl` and JSX settings to that extension's imports, so an import
+that resolves under Bun can fail under Node. Do not rely on it. Known limit:
+that includes a `tsconfig.json` in a directory above the reviewed bundle,
+which is not part of what you reviewed. See
+[Node's TypeScript rules](https://nodejs.org/docs/latest-v22.x/api/typescript.html).
 Under Bun the host runs with `--no-install`: a missing package fails the import;
 it is never downloaded.
 
@@ -67,7 +85,9 @@ is a new JavaScript realm that would start without these restrictions). Under
 Bun, `bun:ffi`, `Bun.FFI`, `bun:sqlite`, `node:sqlite` and `ShadowRealm` are
 unavailable too; under Node, `node:sqlite` and `node:ffi` are switched off
 (SQLite extensions and FFI load native libraries). The host refuses to start
-when one of these restrictions does not hold on the installed runtime. A
+when one of these restrictions does not hold on the installed runtime. Known
+limit: these are the native-code entry points found so far (Bun 1.4, Node 22
+and 26); one a newer runtime adds is not covered until it is added. A
 process an extension starts is outside this policy; on macOS it runs under the
 same sandbox as the host.
 Include local imports in the bundle; trust stages reviewed content, and the
@@ -150,9 +170,10 @@ before enabling third-party code.
 
 ## Limits
 
-The host process has a 1 GiB memory cap, enforced by the kernel. On Linux it is
-`RLIMIT_DATA` and on Windows the Job Object's per-process limit, so an
-allocation past it fails; both also apply to each process an extension starts.
+The host process has a 1 GiB memory cap. On Linux it is `RLIMIT_DATA` (or a
+lower hard limit Codewhale itself inherited) and on Windows the Job Object's
+per-process limit, so an allocation past it fails; both also apply to each
+process an extension starts. Those two have been tested with a Node host only.
 On macOS the Bun host applies a jetsam limit to itself before any extension
 loads, and the kernel kills it past the cap; processes it starts are not
 covered. A Node host on macOS has no kernel limit: Codewhale checks its
