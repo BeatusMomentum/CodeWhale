@@ -2002,18 +2002,42 @@ impl RuntimeBridge {
             registry.lock().await.remove(key);
         }
 
-        let _ = emit_stdio_event(
-            writer,
-            json!({
-                "type": "response_end",
-                "response_id": response_id,
-            }),
-        )
-        .await;
-        if let Some(transcript) = transcript {
-            transcript.events.push(EventFrame::ResponseEnd {
-                response_id: response_id.clone(),
-            });
+        if stream_result.is_ok() {
+            let _ = emit_stdio_event(
+                writer,
+                json!({
+                    "type": "response_end",
+                    "response_id": response_id,
+                }),
+            )
+            .await;
+            if let Some(transcript) = transcript {
+                transcript.events.push(EventFrame::ResponseEnd {
+                    response_id: response_id.clone(),
+                });
+            }
+        } else {
+            // The stream broke before `turn.completed` (transport error,
+            // oversized or invalid frame, a writer that went away). Ending
+            // the response here reported success ahead of the error, and the
+            // runtime turn kept running with nothing left able to interrupt
+            // it (the registry entry is gone), so the thread refused its next
+            // message until the orphan finished. Stop it, best effort, and
+            // let the error below be the only outcome the client sees.
+            let orphan = InFlightTurn {
+                base_url: self.base_url.clone(),
+                auth_token: self.auth_token.clone(),
+                runtime_thread_id: thread_id.to_string(),
+                turn_id: turn_id.clone(),
+            };
+            if let Err(error) = interrupt_turn_request(&orphan).await {
+                tracing::warn!(
+                    thread_id,
+                    turn_id = %turn_id,
+                    "failed to interrupt a turn whose event stream broke: {}",
+                    error.message
+                );
+            }
         }
 
         let (last_seq, status, error) = stream_result?;
@@ -4982,6 +5006,92 @@ mod tests {
             vec!["response_start", "response_delta", "response_end"]
         );
         assert_eq!(lines[1]["delta"], "hello");
+    }
+
+    /// Audit R03-05: a stream that breaks before `turn.completed` must not
+    /// report `response_end` ahead of the error, and must not leave the
+    /// runtime turn running with nothing able to interrupt it.
+    #[tokio::test]
+    async fn stdio_runtime_bridge_interrupts_a_turn_whose_stream_breaks() {
+        static INTERRUPTED: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+
+        async fn create_turn(AxumPath(thread_id): AxumPath<String>) -> Json<Value> {
+            Json(json!({
+                "thread": { "id": thread_id },
+                "turn": { "id": "turn_broken" },
+            }))
+        }
+
+        async fn thread_events() -> ([(header::HeaderName, &'static str); 1], String) {
+            // One delta, then the stream ends without `turn.completed`.
+            let body = sse_frame(
+                "item.delta",
+                json!({
+                    "seq": 1,
+                    "turn_id": "turn_broken",
+                    "payload": { "kind": "agent_message", "delta": "partial" }
+                }),
+            );
+            ([(header::CONTENT_TYPE, "text/event-stream")], body)
+        }
+
+        async fn interrupt(
+            AxumPath((thread_id, turn_id)): AxumPath<(String, String)>,
+        ) -> Json<Value> {
+            assert_eq!(thread_id, "thr_broken");
+            assert_eq!(turn_id, "turn_broken");
+            INTERRUPTED.store(true, std::sync::atomic::Ordering::SeqCst);
+            Json(json!({ "interrupted": true }))
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let addr = listener.local_addr().expect("listener addr");
+        let app = Router::new()
+            .route("/v1/threads/{thread_id}/turns", post(create_turn))
+            .route("/v1/threads/{thread_id}/events", get(thread_events))
+            .route(
+                "/v1/threads/{thread_id}/turns/{turn_id}/interrupt",
+                post(interrupt),
+            );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve test runtime");
+        });
+
+        let mut bridge = RuntimeBridge::from_base_url_for_test(format!("http://{addr}"));
+        let (mut reader, mut writer) = tokio::io::duplex(4096);
+        let result = bridge
+            .message_thread("thr_broken", "hello", &[], None, &mut writer, None, None)
+            .await;
+        drop(writer);
+        let mut stdout = Vec::new();
+        reader
+            .read_to_end(&mut stdout)
+            .await
+            .expect("read stdio output");
+        server.abort();
+        let _ = server.await;
+
+        assert!(result.is_err(), "a broken stream is an error");
+        let event_types: Vec<String> = String::from_utf8(stdout)
+            .expect("utf8 output")
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<Value>(line).expect("json line")["type"]
+                    .as_str()
+                    .expect("event type")
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(event_types, vec!["response_start", "response_delta"]);
+        assert!(
+            INTERRUPTED.load(std::sync::atomic::Ordering::SeqCst),
+            "the orphaned runtime turn was not interrupted"
+        );
     }
 
     #[tokio::test]
