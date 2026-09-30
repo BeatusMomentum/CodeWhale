@@ -112,13 +112,11 @@ impl CommandSpec {
         #[cfg(windows)]
         let (program, args) = {
             // Force UTF-8 output. cmd.exe uses chcp; PowerShell sets the
-            // console output encoding directly. See issue #982.
+            // console output encoding directly. See issue #982. Key on the
+            // PowerShell family so a custom PowerShell path keeps the same
+            // output contract as the two detected variants (#6745).
             let kind = dispatcher.kind();
-            let cmd = if matches!(
-                kind,
-                crate::shell_dispatcher::ShellKind::Pwsh
-                    | crate::shell_dispatcher::ShellKind::WindowsPowerShell
-            ) {
+            let cmd = if kind.is_powershell() {
                 format!("[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; {command}")
             } else if matches!(kind, crate::shell_dispatcher::ShellKind::Cmd) {
                 format!("chcp 65001 >NUL & {command}")

@@ -13,7 +13,22 @@
 //! 2. **Quoting correctness** — each shell's argument-passing convention is
 //!    respected so quoted strings survive the spawn boundary intact.
 //! 3. **PowerShell safety** — non-interactive flags, temporary `.ps1` files
-//!    for multiline scripts, and explicit native `$LASTEXITCODE` capture.
+//!    for multiline scripts, explicit native `$LASTEXITCODE` capture, and a
+//!    process-scoped execution-policy bypass so a machine whose local policy
+//!    is `Restricted`/`AllSigned` does not refuse the tool's own temp script
+//!    (issue #6745).
+//!
+//! ## Known limitations
+//!
+//! - A Group Policy execution policy (`Get-ExecutionPolicy -List` rows
+//!   `MachinePolicy`/`UserPolicy`) outranks the process scope, so on such a
+//!   machine multiline commands (the temp `-File` form) are still refused and
+//!   PowerShell's own refusal is returned as the command's error. This is
+//!   deliberate: the dispatcher does not re-send the script through
+//!   `-EncodedCommand` to get around an administrator-enforced policy.
+//! - The process scope covers the whole child: scripts that a command itself
+//!   invokes run under the same bypass. The shell tool's approval and sandbox
+//!   policy, not the execution policy, is what gates what may run.
 //! 4. **Terminal state** — foreground shell execution saves and restores
 //!    crossterm raw-mode so the TUI input pipeline is not broken after a
 //!    child process exits (issue #1690).
@@ -137,6 +152,27 @@ fn powershell_prefers_script_file(shell_command: &str) -> bool {
         || shell_command.contains("'''")
         || shell_command.contains("@'")
         || shell_command.contains("@\"")
+}
+
+/// Flags shared by every PowerShell invocation this dispatcher builds.
+///
+/// `-ExecutionPolicy Bypass` matters for the temp `.ps1` form: script files are
+/// subject to the execution policy (the Windows client default is
+/// `Restricted`), so without it a stock or hardened machine refuses a script
+/// this tool wrote itself before a single statement runs. The parameter only
+/// sets the *process* scope — no administrator rights, no persisted change, the
+/// user's own shells are untouched — and it is applied to both forms so a
+/// command behaves the same whether it travels as `-Command` or `-File`.
+/// Group Policy scopes still take precedence; see the module's known
+/// limitations.
+fn powershell_base_args() -> Vec<String> {
+    vec![
+        "-NoLogo".to_string(),
+        "-NoProfile".to_string(),
+        "-NonInteractive".to_string(),
+        "-ExecutionPolicy".to_string(),
+        "Bypass".to_string(),
+    ]
 }
 
 /// Wrap a model/user PowerShell command so native program failures surface
@@ -324,11 +360,7 @@ impl ShellDispatcher {
     pub fn build_command_parts(&self, shell_command: &str) -> (String, Vec<String>) {
         let program = self.kind.binary().to_string();
         if self.kind.is_powershell() {
-            let mut args = vec![
-                "-NoLogo".to_string(),
-                "-NoProfile".to_string(),
-                "-NonInteractive".to_string(),
-            ];
+            let mut args = powershell_base_args();
             if powershell_prefers_script_file(shell_command) {
                 // Complex multiline / heavily quoted scripts: write a temp
                 // .ps1 and invoke with -File so quoting stays structured.
@@ -655,6 +687,32 @@ mod tests {
         assert!(remove_at < exit_at, "self-delete must precede exit");
         // Cleanup temp script created by the builder (the test never runs it).
         let _ = std::fs::remove_file(path);
+    }
+
+    /// #6745: both PowerShell forms carry a process-scoped policy bypass, and
+    /// it precedes `-File`/`-Command` — PowerShell hands every argument after
+    /// `-File` to the script, so a later `-ExecutionPolicy` would be ignored.
+    #[test]
+    fn powershell_forms_bypass_execution_policy_at_process_scope() {
+        let dispatcher = ShellDispatcher {
+            kind: ShellKind::WindowsPowerShell,
+        };
+        for script in ["Write-Output 'one'", "Write-Output 'a'\nWrite-Output 'b'"] {
+            let (_, args) = dispatcher.build_command_parts(script);
+            let policy = args
+                .iter()
+                .position(|a| a == "-ExecutionPolicy")
+                .unwrap_or_else(|| panic!("process-scope policy missing: {args:?}"));
+            assert_eq!(args[policy + 1], "Bypass", "{args:?}");
+            let payload_flag = args
+                .iter()
+                .position(|a| a == "-File" || a == "-Command")
+                .expect("payload flag");
+            assert!(policy < payload_flag, "{args:?}");
+            if args[payload_flag] == "-File" {
+                let _ = std::fs::remove_file(&args[payload_flag + 1]);
+            }
+        }
     }
 
     #[test]
