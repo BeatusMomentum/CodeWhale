@@ -195,7 +195,8 @@ impl ToolSpec for RlmTool {
                 "Run one Python REPL block against a named RLM context. Returns a \
                  bounded projection of stdout/stderr plus metadata. If the code calls \
                  FINAL/finalize, the final value is stored as a var_handle retrievable \
-                 with handle_read instead of copied unbounded into the parent context. \
+                 with handle_read (if `handle_read` is not in your tool list, load it with \
+                 `tool_search` first) instead of copied unbounded into the parent context. \
                  Large stdout/stderr payloads (>1k chars) are also stored as \
                  var_handles (returned in stdout_handle / stderr_handle) to keep the \
                  parent transcript lean. Batch child helpers require \
@@ -217,7 +218,8 @@ impl ToolSpec for RlmTool {
                  kernel; returns only metadata so the parent transcript holds a handle, \
                  not the body), \"eval\" (run one bounded Python REPL block against a \
                  named context; approval required; FINAL/finalize values and large \
-                 stdout/stderr become var_handles retrievable with handle_read), \
+                 stdout/stderr become var_handles retrievable with handle_read; if \
+                 `handle_read` is not in your tool list, load it with `tool_search` first), \
                  \"configure\" (output feedback, child timeout, sub-RLM depth, session \
                  sharing), \"close\" (tear down the kernel and return usage metadata)."
             }
@@ -363,7 +365,10 @@ impl RlmTool {
                     "session_object": "session://active/system_prompt"
                 }
             },
-            "redaction": "Large tool results and thinking blocks are represented by compact metadata in transcript objects; use returned handles and handle_read for bounded payload projections."
+            "redaction": format!(
+                "Large tool results and thinking blocks are represented by compact metadata in transcript objects; use returned handles and handle_read for bounded payload projections ({}).",
+                crate::tools::handle::HANDLE_READ_ACTIVATION_HINT
+            )
         }))
         .map_err(|e| ToolError::execution_failed(e.to_string()))
     }
@@ -561,7 +566,11 @@ impl RlmTool {
                     let name = format!("{tag}_{}", 0); // single counter is fine
                     let handle = store.insert_text(session_id, name, text);
                     (
-                        Some(format!("{} chars; retrieve via handle_read", text.len())),
+                        Some(format!(
+                            "{} chars; retrieve via handle_read ({})",
+                            text.len(),
+                            crate::tools::handle::HANDLE_READ_ACTIVATION_HINT
+                        )),
                         Some(handle),
                     )
                 }
@@ -870,8 +879,9 @@ fn preview_output(text: &str) -> String {
         .skip(total.saturating_sub(FULL_STDOUT_TAIL_CHARS))
         .collect();
     format!(
-        "{head}\n... [{} chars truncated, retrieve via handle_read when returned as a handle] ...\n{tail}",
-        total.saturating_sub(FULL_STDOUT_HEAD_CHARS + FULL_STDOUT_TAIL_CHARS)
+        "{head}\n... [{} chars truncated, retrieve via handle_read when returned as a handle; {}] ...\n{tail}",
+        total.saturating_sub(FULL_STDOUT_HEAD_CHARS + FULL_STDOUT_TAIL_CHARS),
+        crate::tools::handle::HANDLE_READ_ACTIVATION_HINT
     )
 }
 
@@ -886,6 +896,23 @@ mod tests {
     use codewhale_models::Role;
     use codewhale_models::{ContentBlock, Message, SystemPrompt};
     use std::path::PathBuf;
+
+    /// #6747: runtime text pointing at the deferred `handle_read` teaches
+    /// its activation path and names no hidden tool.
+    #[test]
+    fn handle_read_pointers_teach_activation_path() {
+        let long = "x".repeat(FULL_STDOUT_HEAD_CHARS + FULL_STDOUT_TAIL_CHARS + 10);
+        let preview = preview_output(&long);
+        let preview_footer = preview
+            .lines()
+            .find(|line| line.contains("chars truncated"))
+            .expect("truncation footer");
+        crate::tools::canonical_action::tests::assert_text_names_only_callable_tools(
+            "rlm preview footer",
+            preview_footer,
+        );
+        assert!(preview_footer.contains("`tool_search`"));
+    }
 
     fn ctx() -> ToolContext {
         ToolContext::new(".")

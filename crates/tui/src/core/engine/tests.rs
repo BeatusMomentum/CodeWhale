@@ -20129,9 +20129,15 @@ fn subagent_results_are_summarized_before_parent_context_insertion() {
     assert!(context.len() < output.content.len());
     assert!(context.contains("self-report"));
     assert!(context.contains("verify side effects"));
-    assert!(context.contains("`File` actions like `read` or `list`"));
+    assert!(context.contains("verify side effects with `read`"));
     assert!(!context.contains("read_file") && !context.contains("list_dir"));
     assert!(context.contains("handle_read"));
+    // #6747: the guidance names only callable tools (no hidden `File`) and
+    // teaches the deferred `handle_read` activation path.
+    crate::tools::canonical_action::tests::assert_text_names_only_callable_tools(
+        "sub-agent summary guidance",
+        &super::context::subagent_summary_guidance(),
+    );
 }
 
 #[test]

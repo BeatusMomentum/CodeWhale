@@ -1578,28 +1578,47 @@ async fn run_scrape_search_with_endpoints(
         .allow_bing_fallback
         .unwrap_or_else(|| duckduckgo_allows_bing_fallback(context.search_base_url.as_deref()));
     check_policy(decider, &duckduckgo_host)?;
-    let resp = client
-        .get(&url)
-        .header(
-            "Accept",
-            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        )
-        .header("Accept-Language", "en-US,en;q=0.5")
-        .send()
-        .await
-        .map_err(|error| {
-            ToolError::execution_failed(format!("Web search request failed: {error}"))
-        })?;
-    let status = resp.status();
-    let body = resp.text().await.map_err(|error| {
-        ToolError::execution_failed(format!("Failed to read response: {error}"))
-    })?;
-    if !status.is_success() {
-        return Err(ToolError::execution_failed(format!(
-            "Web search failed: HTTP {}",
-            status.as_u16()
-        )));
-    }
+    let fetched = fetch_duckduckgo_html(&client, &url).await;
+    let body = match fetched {
+        Ok(body) => body,
+        // #6746: an unreachable DuckDuckGo (connection error, timeout, or a
+        // non-2xx status) must still reach the Bing fallback, not end the
+        // chain. Only a Bing answer with results replaces the DuckDuckGo
+        // error; otherwise the original failure is reported.
+        Err(error) if allow_bing_fallback => {
+            check_policy(decider, BING_HOST)?;
+            return match run_bing_search(&client, &query.query, max_results, endpoints.bing).await {
+                Ok(results) if !results.is_empty() => {
+                    degraded.push(DegradedReason::BackendUnavailable {
+                        backend: BackendId::DuckDuckGo,
+                    });
+                    degraded.push(DegradedReason::BackendFallback {
+                        from: BackendId::DuckDuckGo,
+                        to: BackendId::Bing,
+                    });
+                    Ok(BackendSearch {
+                        backend: BackendId::Bing,
+                        source: "bing".to_string(),
+                        backend_detail: None,
+                        results: normalize_entries(results),
+                        degraded,
+                        note: Some(format!("{error}; used Bing fallback")),
+                    })
+                }
+                Ok(_) => Err(ToolError::execution_failed(format!(
+                    "{error}; Bing fallback returned no results"
+                ))),
+                Err(bing_error) => Err(ToolError::execution_failed(format!(
+                    "{error}; Bing fallback failed: {}",
+                    match &bing_error {
+                        ToolError::ExecutionFailed { message, .. } => message.clone(),
+                        other => other.to_string(),
+                    }
+                ))),
+            };
+        }
+        Err(error) => return Err(ToolError::execution_failed(error)),
+    };
 
     let results = parse_duckduckgo_results(&body, max_results);
     let blocked = is_duckduckgo_challenge(&body);
@@ -1673,6 +1692,30 @@ async fn run_scrape_search_with_endpoints(
             note: None,
         }),
     }
+}
+
+/// Fetch the DuckDuckGo HTML results page. A transport failure or a non-2xx
+/// status is an error so the caller can decide whether Bing may answer.
+async fn fetch_duckduckgo_html(client: &reqwest::Client, url: &str) -> Result<String, String> {
+    let resp = client
+        .get(url)
+        .header(
+            "Accept",
+            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        )
+        .header("Accept-Language", "en-US,en;q=0.5")
+        .send()
+        .await
+        .map_err(|error| format!("Web search request failed: {error}"))?;
+    let status = resp.status();
+    let body = resp
+        .text()
+        .await
+        .map_err(|error| format!("Failed to read response: {error}"))?;
+    if !status.is_success() {
+        return Err(format!("Web search failed: HTTP {}", status.as_u16()));
+    }
+    Ok(body)
 }
 
 fn normalize_entries(entries: Vec<WebSearchEntry>) -> Vec<SearchResult> {
@@ -4530,6 +4573,108 @@ mod tests {
                 .expect("warning")
                 .contains("used bing fallback")
         );
+    }
+
+    /// #6746: DuckDuckGo being unreachable (connection refused) or answering
+    /// non-2xx must still reach the Bing fallback instead of ending the chain.
+    #[tokio::test]
+    async fn duckduckgo_unreachable_or_non_2xx_falls_back_to_bing() {
+        use crate::config::SearchProvider;
+        use crate::tools::spec::ToolContext;
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/html/"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/bing"))
+            .and(query_param("q", "ddg down"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"
+                <ol><li class="b_algo">
+                  <h2><a href="https://example.com/reachable">Reachable result</a></h2>
+                  <div class="b_caption"><p>Bing answered while DuckDuckGo was down.</p></div>
+                </li></ol>
+                "#,
+            ))
+            .mount(&server)
+            .await;
+        // Bind then drop a listener so the port refuses connections.
+        let refused = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            listener.local_addr().expect("addr").port()
+        };
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let bing = format!("{}/bing", server.uri());
+        let query = SearchQuery::new("ddg down".to_string(), 5, None, Vec::new(), None);
+        for ddg in [
+            format!("http://127.0.0.1:{refused}/html/"),
+            format!("{}/html/", server.uri()),
+        ] {
+            let mut context = ToolContext::new(tmp.path().to_path_buf());
+            context.search_provider = SearchProvider::DuckDuckGo;
+            context.search_base_url = Some(ddg.clone());
+            let raw = run_scrape_search_with_endpoints(
+                SearchProvider::DuckDuckGo,
+                &query,
+                5_000,
+                &context,
+                ScrapeEndpoints {
+                    bing: &bing,
+                    allow_bing_fallback: Some(true),
+                },
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{ddg}: Bing fallback should answer: {error}"));
+
+            assert_eq!(raw.backend, BackendId::Bing, "{ddg}");
+            assert_eq!(raw.results.len(), 1, "{ddg}");
+            assert_eq!(raw.results[0].url, "https://example.com/reachable");
+            assert_eq!(
+                raw.degraded,
+                vec![
+                    DegradedReason::BackendUnavailable {
+                        backend: BackendId::DuckDuckGo
+                    },
+                    DegradedReason::BackendFallback {
+                        from: BackendId::DuckDuckGo,
+                        to: BackendId::Bing
+                    },
+                ],
+                "{ddg}"
+            );
+            assert!(
+                raw.note
+                    .as_deref()
+                    .is_some_and(|note| note.contains("used Bing fallback")),
+                "{ddg}: {:?}",
+                raw.note
+            );
+        }
+
+        // Without the Bing fallback the DuckDuckGo failure is still reported.
+        let mut context = ToolContext::new(tmp.path().to_path_buf());
+        context.search_provider = SearchProvider::DuckDuckGo;
+        context.search_base_url = Some(format!("{}/html/", server.uri()));
+        let error = run_scrape_search_with_endpoints(
+            SearchProvider::DuckDuckGo,
+            &query,
+            5_000,
+            &context,
+            ScrapeEndpoints {
+                bing: &bing,
+                allow_bing_fallback: Some(false),
+            },
+        )
+        .await
+        .err()
+        .expect("no fallback means the HTTP failure surfaces");
+        assert!(error.to_string().contains("HTTP 503"), "{error}");
     }
 
     #[tokio::test]
