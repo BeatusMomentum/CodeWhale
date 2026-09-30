@@ -4837,11 +4837,9 @@ mod tests {
         save_late_usage_test_session(&manager, id);
         let snapshot = manager.validated_session_path(id).expect("snapshot path");
         let original = fs::read(&snapshot).expect("original bytes");
-        // Another process's TUI: an OS lock on its own open file
-        // description. This process's in-memory registry knows nothing.
-        let lease = open_private_lock_file(&manager.live_lease_path(id, true).expect("lease"))
-            .expect("open lease");
-        assert!(crate::runtime_threads::try_lock_file_exclusive(&lease).expect("lock lease"));
+        // Another process's TUI holds the lease; this process's in-memory
+        // registry knows nothing about it.
+        let lease = manager.hold_live_lease_elsewhere(id);
         assert!(!is_live_session(id));
 
         let rename = manager
