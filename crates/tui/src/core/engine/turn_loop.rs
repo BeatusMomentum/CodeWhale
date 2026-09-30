@@ -196,7 +196,7 @@ fn tool_error_message_mut(error: &mut ToolError) -> Option<&mut String> {
 /// Give an oversized tool error message the bounded head/tail projection and
 /// saved artifact a failed result gets (C02-12). Blocking: it may write the
 /// artifact, so callers run it under `spawn_blocking`. A failed artifact
-/// write degrades to the original message, as spillover does for results.
+/// write leaves a bounded preview that says the full output could not be saved.
 fn bound_oversized_tool_error(
     mut error: ToolError,
     tool_id: &str,
