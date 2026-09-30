@@ -5,6 +5,7 @@
 //! event handling, tool planning/execution, LSP post-edit hooks, capacity
 //! checkpoints, and loop termination.
 
+use super::compaction::AutoCompactionStep;
 use super::dispatch::{
     FLEET_FINAL_REPORT_NOTICE, FLEET_NO_PROGRESS_STOP, FLEET_STRATEGY_SWITCH_NOTICE,
     FleetDenialAction, FleetDenialBatch, FleetDenialGuard, normalize_schema_json_containers,
@@ -692,7 +693,7 @@ impl Engine {
 
     /// R1: the turn-ending error once the per-turn wall-clock budget is spent.
     /// Checked wherever the loop is about to authorize a provider request.
-    fn turn_wall_clock_exhausted_error(&self) -> Option<String> {
+    pub(super) fn turn_wall_clock_exhausted_error(&self) -> Option<String> {
         self.turn_wall_clock.exhausted().then(|| {
             format!(
                 "Per-turn wall-clock budget exhausted after {}s (limit: {}s). The turn was stopped before another model request; work already done is in the transcript. Send another message to continue, or raise `[tui].turn_wall_clock_secs`.",
@@ -1272,243 +1273,18 @@ impl Engine {
 
             let active_tools =
                 active_tools_for_request(&tool_catalog, &active_tool_names, strict_tool_mode);
-            let auto_compaction_config = self.config.compaction.clone();
-            // Billing usage accumulates every parent step and child-model
-            // call. Only the most recent parent-route request describes the
-            // live message list whose pressure we are checking here.
-            let billed_input_tokens = turn.live_input_tokens_for_compaction(
-                &self.session.messages,
-                self.session.system_prompt.as_ref(),
-                self.session.latest_parent_input_tokens,
-            );
-            let prepared = if !auto_compaction_suppressed
-                && crate::compaction::compaction_pressure_reached_with_billed(
-                    &self.session.messages,
-                    self.session.system_prompt.as_ref(),
-                    &auto_compaction_config,
-                    billed_input_tokens,
-                ) {
-                let mut prepared = self.prepare_compaction_envelope(auto_compaction_config);
-                prepared.tools = active_tools.clone();
-                Some(prepared)
-            } else {
-                None
-            };
-
-            let compaction_go = match prepared.as_ref() {
-                None => false,
-                Some(prepared) => match crate::compaction::compaction_decision_with_billed(
-                    &self.session.messages,
-                    self.session.system_prompt.as_ref(),
-                    prepared,
-                    billed_input_tokens,
-                ) {
-                    crate::compaction::CompactionDecision::Compact => true,
-                    crate::compaction::CompactionDecision::NotNeeded => false,
-                    crate::compaction::CompactionDecision::Refused(reason) => {
-                        // A silent refusal looks like broken auto-compaction:
-                        // the meter is full and nothing happens (#5577). Name
-                        // the guard once per turn, in both the transcript
-                        // status line and the trace.
-                        if !turn.compaction_refusal_notified {
-                            turn.compaction_refusal_notified = true;
-                            let estimated_tokens_before = self.estimated_input_tokens();
-                            self.record_compaction_event("compaction.refused", serde_json::json!({
-                                "trigger": "auto",
-                                "reason": match &reason {
-                                    crate::compaction::CompactionRefusal::TooFewMessages { .. } => "too_few_messages",
-                                    crate::compaction::CompactionRefusal::RetainedFloor { .. } => "retained_floor",
-                                },
-                                "messages_before": self.session.messages.len(),
-                                "estimated_tokens_before": estimated_tokens_before,
-                                "billed_input_tokens": billed_input_tokens,
-                                "threshold_tokens": prepared.config.token_threshold,
-                            })).await;
-                            let message = match reason {
-                                crate::compaction::CompactionRefusal::TooFewMessages { count } => {
-                                    format!(
-                                        "Context is filling up, but there is nothing to make room from yet: only {count} messages"
-                                    )
-                                }
-                                crate::compaction::CompactionRefusal::RetainedFloor {
-                                    floor,
-                                    threshold,
-                                } => format!(
-                                    "Context is filling up, but making room would not help: retained context (~{}K tokens) cannot fall below the {}K trigger — /compact to force a pass, or trim pinned context",
-                                    floor / 1000,
-                                    threshold / 1000
-                                ),
-                            };
-                            tracing::warn!(
-                                target: "compaction",
-                                ?reason,
-                                billed = ?billed_input_tokens,
-                                "auto-compaction refused under pressure"
-                            );
-                            let _ = self.send_event(Event::status(message)).await;
-                        }
-                        false
-                    }
-                },
-            };
-            if let Some(prepared) = prepared
-                && compaction_go
-            {
-                let compaction_id = format!("compact_{}", &uuid::Uuid::new_v4().to_string()[..8]);
-                turn.stop_diagnostics.automatic_compaction_attempts = turn
-                    .stop_diagnostics
-                    .automatic_compaction_attempts
-                    .saturating_add(1);
-                let compaction_cancel = self
-                    .claim_compaction(&compaction_id)
-                    .expect("a fresh automatic compaction id cannot be pre-canceled");
-                self.emit_compaction_started(
-                    compaction_id.clone(),
-                    true,
-                    "Making room…".to_string(),
+            match self
+                .run_auto_compaction(
+                    client.as_ref(),
+                    active_tools.as_deref(),
+                    turn,
+                    &mut auto_compaction_suppressed,
                 )
-                .await;
-                let auto_messages_before = self.session.messages.len();
-                let auto_tokens_before = self.estimated_input_tokens();
-                let turn_cancel = self.cancel_token.clone();
-                let started = Instant::now();
-                let mut compaction_usage = Usage::default();
-                // Parked: the compaction pass owns its own bound.
-                self.turn_heartbeat
-                    .enter(super::turn_heartbeat::TurnPhase::Compacting, None, None);
-                let (compaction_result, turn_was_canceled) = tokio::select! {
-                    biased;
-                    _ = turn_cancel.cancelled() => (None, true),
-                    _ = compaction_cancel.cancelled() => (None, false),
-                    result = compact_messages_safe(
-                        client.as_ref(),
-                        &self.session.messages,
-                        self.session.system_prompt.as_ref(),
-                        &prepared,
-                        &mut compaction_usage,
-                    ) => (Some(result), false),
-                };
-                turn.add_usage(&compaction_usage);
-                self.emit_compaction_usage(&compaction_usage, started.elapsed())
-                    .await;
-                let Some(compaction_result) = compaction_result else {
-                    auto_compaction_suppressed = true;
-                    self.finish_compaction(&compaction_id);
-                    let message = if turn_was_canceled {
-                        "Making room stopped with the turn; the conversation was not changed"
-                    } else {
-                        "Making room stopped; the conversation was not changed"
-                    }
-                    .to_string();
-                    self.emit_compaction_cancelled(compaction_id, true, message)
-                        .await;
-                    if turn_was_canceled {
-                        return (TurnOutcomeStatus::Interrupted, None);
-                    }
-                    continue;
-                };
-
-                match compaction_result {
-                    Ok(mut result) => {
-                        // Only update if we got valid messages (never corrupt state)
-                        if !result.messages.is_empty() || self.session.messages.is_empty() {
-                            self.append_compaction_agent_topology(&mut result.messages)
-                                .await;
-                            let turn_was_canceled = turn_cancel.is_cancelled();
-                            if turn_was_canceled || compaction_cancel.is_cancelled() {
-                                auto_compaction_suppressed = true;
-                                self.finish_compaction(&compaction_id);
-                                let message = if turn_was_canceled {
-                                    "Making room stopped with the turn; the conversation was not changed"
-                                } else {
-                                    "Making room stopped; the conversation was not changed"
-                                }
-                                .to_string();
-                                self.emit_compaction_cancelled(compaction_id, true, message)
-                                    .await;
-                                if turn_was_canceled {
-                                    return (TurnOutcomeStatus::Interrupted, None);
-                                }
-                                continue;
-                            }
-                            let auto_messages_after = result.messages.len();
-                            let retries_used = result.retries_used;
-                            let coverage_clause = result.coverage.receipt_clause();
-                            let path = result.coverage.path;
-                            self.session.replace_messages(result.messages);
-                            turn.clear_parent_input_tokens();
-                            if let Some(pm) = self.session.prefix_stability.as_mut() {
-                                pm.note_history_reset("compaction");
-                            }
-                            self.commit_compaction_checkpoint(result.summary_prompt);
-                            auto_compaction_suppressed =
-                                crate::compaction::compaction_pressure_reached(
-                                    &self.session.messages,
-                                    self.session.system_prompt.as_ref(),
-                                    &self.config.compaction,
-                                );
-                            self.emit_session_updated().await;
-                            let removed = auto_messages_before.saturating_sub(auto_messages_after);
-                            let auto_tokens_after = self.estimated_input_tokens();
-                            let status = if retries_used > 0 {
-                                format!(
-                                    "Made room: {auto_messages_before} → {auto_messages_after} messages ({removed} removed, {retries_used} retries), ~{auto_tokens_before} → ~{auto_tokens_after} tokens ({coverage_clause})"
-                                )
-                            } else {
-                                format!(
-                                    "Made room: {auto_messages_before} → {auto_messages_after} messages ({removed} removed), ~{auto_tokens_before} → ~{auto_tokens_after} tokens ({coverage_clause})"
-                                )
-                            };
-                            self.emit_compaction_completed(
-                                compaction_id.clone(),
-                                true,
-                                status.clone(),
-                                Some(auto_messages_before),
-                                Some(auto_messages_after),
-                                super::compaction::CompactionPass {
-                                    trigger: "auto",
-                                    path,
-                                    tokens_before: auto_tokens_before,
-                                    threshold_tokens: prepared.config.token_threshold,
-                                    usage: compaction_usage.clone(),
-                                },
-                            )
-                            .await;
-                        } else {
-                            auto_compaction_suppressed = true;
-                            let message =
-                                "Making room skipped: the summary came back empty".to_string();
-                            self.emit_compaction_failed(
-                                compaction_id.clone(),
-                                true,
-                                message.clone(),
-                            )
-                            .await;
-                            let _ = self.send_event(Event::status(message)).await;
-                        }
-                    }
-                    Err(err) => {
-                        auto_compaction_suppressed = true;
-                        // Log error but continue with original messages (never corrupt)
-                        let message = crate::compaction::report_compaction_failure(
-                            "Making room failed",
-                            &compaction_id,
-                            true,
-                            &err,
-                        );
-                        self.emit_compaction_failed(compaction_id.clone(), true, message.clone())
-                            .await;
-                        let _ = self.send_event(Event::status(message)).await;
-                    }
-                }
-                self.finish_compaction(&compaction_id);
-                // C02-06: a compaction pass has its own bound, not the
-                // turn's. Recheck the wall clock before it can authorize the
-                // provider request below.
-                if let Some(error) = self.turn_wall_clock_exhausted_error() {
-                    let _ = self.send_event(Event::status(error.clone())).await;
-                    return (TurnOutcomeStatus::Failed, Some(error));
-                }
+                .await
+            {
+                AutoCompactionStep::Proceed => {}
+                AutoCompactionStep::Restart => continue,
+                AutoCompactionStep::EndTurn(status, error) => return (status, error),
             }
 
             // The guard measures what the compaction gate measures: the honest
