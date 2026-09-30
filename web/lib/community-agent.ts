@@ -566,35 +566,45 @@ export async function clearDraftResolution(
 // next attempt looks for the post the earlier one may have created before
 // posting again, however late the retry comes.
 const POST_UNKNOWN_PREFIX = "draft-post-unknown:";
-const POST_UNKNOWN_TTL_SEC = 60 * 60 * 24 * 30;
 
 function postUnknownKey(type: AgentDraftType, id: string): string {
   return POST_UNKNOWN_PREFIX + draftKey(type, id).slice("draft:".length);
 }
 
-export async function markPostOutcomeUnknown(kv: KVNamespace | undefined, type: AgentDraftType, id: string): Promise<void> {
-  if (!kv) return;
-  await kv.put(postUnknownKey(type, id), JSON.stringify({ at: new Date().toISOString() }), {
-    expirationTtl: POST_UNKNOWN_TTL_SEC,
-  });
+export async function markPostOutcomeUnknown(stores: DraftClaimStores, type: AgentDraftType, id: string, claim: DraftClaim, identity: string): Promise<void> {
+  const attempt = { at: new Date().toISOString(), identity };
+  // Receipt before dispatch: a crash or an unavailable KV write must never
+  // allow a blind resend. The existing claim object is the strong authority.
+  if (claim.lock) await claim.lock.act({ op: "remember-post", token: claim.token, attempt });
+  if (!stores.CURATED_KV) throw new Error("post receipt storage unavailable");
+  const previous = await stores.CURATED_KV.get(postUnknownKey(type, id));
+  await stores.CURATED_KV.put(postUnknownKey(type, id), previous ?? JSON.stringify(attempt));
 }
 
-/** When the earliest unresolved unknown-outcome attempt happened, if any. */
-export async function getPostOutcomeUnknown(kv: KVNamespace | undefined, type: AgentDraftType, id: string): Promise<string | null> {
-  if (!kv) return null;
-  const raw = await kv.get(postUnknownKey(type, id));
+/** Read failures propagate. Absence is never inferred from unavailable storage. */
+export async function getPostOutcomeUnknown(stores: DraftClaimStores, type: AgentDraftType, id: string, identity: string): Promise<string | null> {
+  if (stores.DRAFT_CLAIM_LOCK) {
+    const lock = stores.DRAFT_CLAIM_LOCK.get(stores.DRAFT_CLAIM_LOCK.idFromName(claimKey(type, id)));
+    const result = await lock.act({ op: "post-status" });
+    if (!result.ok) throw new Error("post receipt unavailable");
+    if (result.attempt) {
+      if (typeof result.attempt.at !== "string" || !Number.isFinite(Date.parse(result.attempt.at))) throw new Error("invalid durable post receipt");
+      if (result.attempt.identity !== identity) throw new Error("unresolved post has different text or target");
+      return result.attempt.at;
+    }
+  }
+  if (!stores.CURATED_KV) throw new Error("post receipt storage unavailable");
+  const raw = await stores.CURATED_KV.get(postUnknownKey(type, id));
   if (!raw) return null;
-  try {
-    const at = (JSON.parse(raw) as { at?: unknown }).at;
-    if (typeof at === "string" && Number.isFinite(Date.parse(at))) return at;
-  } catch { /* fall through */ }
-  // An unreadable marker still means "look first"; look back its full life.
-  return new Date(Date.now() - POST_UNKNOWN_TTL_SEC * 1000).toISOString();
+  const attempt = JSON.parse(raw) as { at?: unknown; identity?: unknown };
+  if (attempt.identity !== undefined && attempt.identity !== identity) throw new Error("unresolved post has different text or target");
+  if (typeof attempt.at !== "string" || !Number.isFinite(Date.parse(attempt.at))) throw new Error("invalid post receipt");
+  return attempt.at;
 }
 
-export async function clearPostOutcomeUnknown(kv: KVNamespace | undefined, type: AgentDraftType, id: string): Promise<void> {
-  if (!kv) return;
-  await kv.delete(postUnknownKey(type, id));
+export async function clearPostOutcomeUnknown(stores: DraftClaimStores, type: AgentDraftType, id: string, claim: DraftClaim): Promise<void> {
+  await stores.CURATED_KV?.delete(postUnknownKey(type, id));
+  if (claim.lock) await claim.lock.act({ op: "forget-post", token: claim.token });
 }
 
 // --- Public weekly digest records ---

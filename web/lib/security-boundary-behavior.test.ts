@@ -1,3 +1,4 @@
+import { FakeDraftClaimLock } from "./draft-claim-lock.fake";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const securityMocks = vi.hoisted(() => ({
@@ -145,7 +146,7 @@ describe("public security boundaries", () => {
     });
     vi.stubGlobal("fetch", triageFetch);
 
-    const triageEnv = { CURATED_KV: triageKv, DEEPSEEK_API_KEY: "test-key" };
+    const triageEnv = { CURATED_KV: triageKv, DRAFT_CLAIM_LOCK: new FakeDraftClaimLock(), DEEPSEEK_API_KEY: "test-key" };
     await expect(runTriage(triageEnv)).resolves.toMatchObject({ processed: 1, skipped: 0 });
     expect(securityMocks.agentChat).toHaveBeenCalledOnce();
     securityMocks.agentChat.mockClear();
@@ -171,7 +172,7 @@ describe("public security boundaries", () => {
     });
     vi.stubGlobal("fetch", prFetch);
 
-    const prEnv = { CURATED_KV: prKv, DEEPSEEK_API_KEY: "test-key" };
+    const prEnv = { CURATED_KV: prKv, DRAFT_CLAIM_LOCK: new FakeDraftClaimLock(), DEEPSEEK_API_KEY: "test-key" };
     await expect(runPrReview(prEnv)).resolves.toMatchObject({ processed: 1, skipped: 0 });
     expect(securityMocks.agentChat).toHaveBeenCalledOnce();
     securityMocks.agentChat.mockClear();
