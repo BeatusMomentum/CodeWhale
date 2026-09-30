@@ -4,6 +4,11 @@
   "mode": "agent",
   "approval_mode": "suggest",
   "allow_shell": true,
+  "recorded_platform": {
+    "recorded_on": "macOS",
+    "sandbox_enforcement": "local_os",
+    "no_new_privs_active": null
+  },
   "user_message": "hello",
   "workspace_files": {
     "README.md": "conformance fixture\n"

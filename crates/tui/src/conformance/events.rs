@@ -294,12 +294,43 @@ fn run_scripted_turn_with_deadline(
             ..EngineConfig::default()
         };
         let client: crate::core::model_client::SharedModelClient = provider.clone();
-        let (engine, handle) = Engine::new_with_model_client(engine_config, &config, client);
+        let (mut engine, handle) = Engine::new_with_model_client(engine_config, &config, client);
+        let (enforcement, no_new_privs_active) = recorded_platform(case);
+        engine.pin_recorded_platform_posture(enforcement, no_new_privs_active);
         let op = send_message_op(case, &config);
         drive_turn(engine, handle, op, &driver, deadline).await
     });
     drop(runtime);
     (record, provider)
+}
+
+/// The execution boundary a case's golden was recorded under.
+///
+/// The Engine names its sandbox posture to the model in `<turn_meta>`, and a
+/// live probe makes that line a fact about the runner: macOS applies a local
+/// OS sandbox, a Linux runner without bubblewrap is policy-only, and Linux
+/// startup may relax no-new-privs. Every scripted case therefore declares the
+/// recorded facts and the harness replays exactly those, so a golden states
+/// what the Engine does on that platform rather than which machine ran it.
+/// A case without them fails loud instead of silently probing the host. The
+/// label for each platform is owned and tested by `sandbox::policy`.
+fn recorded_platform(case: &Value) -> (crate::sandbox::policy::SandboxEnforcement, Option<bool>) {
+    use crate::sandbox::policy::SandboxEnforcement;
+    let platform = case
+        .get("recorded_platform")
+        .expect("scripted conformance case must declare `recorded_platform`");
+    let enforcement = match platform.get("sandbox_enforcement").and_then(Value::as_str) {
+        Some("local_os") => SandboxEnforcement::LocalOs,
+        Some("unavailable") => SandboxEnforcement::Unavailable,
+        Some("external_backend") => SandboxEnforcement::ExternalBackend,
+        other => panic!("unknown recorded_platform.sandbox_enforcement: {other:?}"),
+    };
+    let no_new_privs_active = match platform.get("no_new_privs_active") {
+        Some(Value::Null) => None,
+        Some(Value::Bool(active)) => Some(*active),
+        other => panic!("recorded_platform.no_new_privs_active must be null or a bool: {other:?}"),
+    };
+    (enforcement, no_new_privs_active)
 }
 
 /// Run one turn and return every engine event up to and including

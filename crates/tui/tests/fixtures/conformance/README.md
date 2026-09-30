@@ -31,6 +31,17 @@ goldens were recorded on Unix and compile only there — hook fixtures are POSIX
 shell, and a Windows turn differs in shell and path facts no golden covers
 yet. Recording Windows goldens is open work, not an implied capability.
 
+Every `events` and `prompt` case declares `recorded_platform`: the execution
+boundary its goldens were recorded under (`sandbox_enforcement`: `local_os`,
+`unavailable` or `external_backend`; `no_new_privs_active`: `null` where the
+flag does not exist, otherwise a bool). The Engine names this posture to the
+model in `<turn_meta>`, so the harness replays the recorded facts instead of
+probing the runner. Without that, a macOS-recorded golden fails on a Linux
+runner for a fact about the machine, not the Engine. A case that omits the
+field fails loud. Production always probes the host. The per-platform label
+text is owned and tested in `sandbox::policy`. All current cases were
+recorded on macOS. A Linux- or Windows-recorded golden is separate evidence.
+
 ## Families
 
 Each case is `<family>/<name>.case.json` (input, hand-written) plus one or

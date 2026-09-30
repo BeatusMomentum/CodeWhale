@@ -4,6 +4,11 @@
   "approval_mode": "suggest",
   "auto_approve": false,
   "allow_shell": true,
+  "recorded_platform": {
+    "recorded_on": "macOS",
+    "sandbox_enforcement": "local_os",
+    "no_new_privs_active": null
+  },
   "workspace_files": {
     "README.md": "conformance fixture\n"
   },

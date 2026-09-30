@@ -1005,6 +1005,10 @@ pub struct Engine {
     /// Session-pinned execution boundary used by model-visible sandbox labels.
     /// This must not be re-probed per turn or metadata bytes can drift.
     sandbox_enforcement: crate::sandbox::policy::SandboxEnforcement,
+    /// Live no-new-privileges flag, read once at construction beside
+    /// `sandbox_enforcement`: both are fixed for the process, so the per-turn
+    /// posture line stays byte-stable for the session.
+    no_new_privs_active: Option<bool>,
     /// Diagnostics collected during the current step's tool calls. Drained
     /// and forwarded as a synthetic user message before the next API call.
     pending_lsp_blocks: Vec<crate::lsp::DiagnosticBlock>,
@@ -1460,6 +1464,20 @@ impl Engine {
                 })
                 .await;
         }
+    }
+
+    /// Replay the execution-boundary facts a conformance golden was recorded
+    /// under. They reach the model only through `<turn_meta>`'s sandbox
+    /// posture line; production engines always probe this host at
+    /// construction, and never call this.
+    #[cfg(test)]
+    pub(crate) fn pin_recorded_platform_posture(
+        &mut self,
+        enforcement: crate::sandbox::policy::SandboxEnforcement,
+        no_new_privs_active: Option<bool>,
+    ) {
+        self.sandbox_enforcement = enforcement;
+        self.no_new_privs_active = no_new_privs_active;
     }
 
     fn begin_turn_control(&mut self) -> handle::TurnControlGuard {
@@ -2105,6 +2123,7 @@ impl Engine {
             pending_lsp_blocks: Vec::new(),
             sandbox_backend,
             sandbox_enforcement,
+            no_new_privs_active: crate::sandbox::process_hardening::no_new_privs_active(),
             current_mode: AppMode::Agent,
             turn_wall_clock: turn_budget::TurnWallClock::start(turn_wall_clock_budget),
             last_policy_narrowing: None,
@@ -4264,9 +4283,7 @@ impl Engine {
                 "Current sandbox posture: {}",
                 sandbox_posture.posture_label_with_enforcement_and_no_new_privs(
                     self.sandbox_enforcement,
-                    // Fixed at process start, so the per-turn line stays
-                    // byte-stable for the session.
-                    crate::sandbox::process_hardening::no_new_privs_active(),
+                    self.no_new_privs_active,
                 )
             ),
         ];
