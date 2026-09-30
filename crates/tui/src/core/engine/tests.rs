@@ -614,7 +614,9 @@ async fn event_capacity_cancelled_repl_child_keeps_unknown_cost_and_discards_ker
 #[tokio::test]
 async fn event_capacity_cancelled_parallel_tool_keeps_completed_span_and_call_when_available() {
     use crate::llm_client::mock::{MockLlmClient, canned};
-    use crate::tools::spec::{ToolCapability, ToolSpec};
+    use crate::tools::spec::{
+        ApprovalRequirement, PreparedToolCall, ResourceClaim, ToolCapability, ToolSpec,
+    };
     use codewhale_protocol::engine_owner::OwnerOperationOutcome;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -641,6 +643,23 @@ async fn event_capacity_cancelled_parallel_tool_keeps_completed_span_and_call_wh
         fn supports_parallel(&self) -> bool {
             true
         }
+        fn prepare(
+            &self,
+            input: Value,
+            context: &ToolContext,
+        ) -> Result<PreparedToolCall, ToolError> {
+            let resource = input["resource"].as_str().expect("fixture resource");
+            Ok(PreparedToolCall {
+                name: self.name().to_string(),
+                description: self.description().to_string(),
+                read_only: true,
+                supports_parallel: true,
+                starts_detached: false,
+                approval: ApprovalRequirement::Auto,
+                resources: vec![ResourceClaim::ReadPath(context.workspace.join(resource))],
+                input,
+            })
+        }
         async fn execute(&self, _: Value, _: &ToolContext) -> Result<ToolResult, ToolError> {
             self.executed.fetch_add(1, Ordering::SeqCst);
             if self.fill_queue {
@@ -659,8 +678,16 @@ async fn event_capacity_cancelled_parallel_tool_keeps_completed_span_and_call_wh
         let workspace = tempdir().unwrap();
         let mock = Arc::new(MockLlmClient::new(vec![
             tool_batch_turn(&[
-                ("one", "fixture_complete_then_cancel", "{}"),
-                ("two", "fixture_complete_then_cancel", "{}"),
+                (
+                    "one",
+                    "fixture_complete_then_cancel",
+                    r#"{"resource":"one"}"#,
+                ),
+                (
+                    "two",
+                    "fixture_complete_then_cancel",
+                    r#"{"resource":"two"}"#,
+                ),
             ]),
             canned::simple_text_turn("must not run after cancellation"),
         ]));
@@ -701,6 +728,9 @@ async fn event_capacity_cancelled_parallel_tool_keeps_completed_span_and_call_wh
         );
         let mut rx = handle.rx_event.write().await;
         let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(events.iter().any(|event| matches!(event,
+            Event::Status { message } if message == "Executing 2 read-only tools in 1 parallel chunk(s)"
+        )), "fixture must exercise one actual two-tool parallel chunk");
         let starts: Vec<_> = events
             .iter()
             .filter_map(|event| match event {
