@@ -59,6 +59,8 @@ enum CloudCommand {
     Keys(CloudKeysArgs),
     /// Manage Computers in this signed-in Codewhale account.
     Computers(CloudComputersArgs),
+    /// Manage named Agents and their account conversations.
+    Agents(CloudAgentsArgs),
     /// Manage Codewhale account API keys: machine tokens for CI.
     #[command(name = "api-keys")]
     ApiKeys(machine::ApiKeysArgs),
@@ -110,6 +112,59 @@ struct CloudKeysArgs {
 struct CloudComputersArgs {
     #[command(subcommand)]
     command: CloudComputersCommand,
+}
+
+#[derive(Debug, Args)]
+struct CloudAgentsArgs {
+    #[command(subcommand)]
+    command: CloudAgentsCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum CloudAgentsCommand {
+    /// List active Agents in this account.
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Create a named Agent. Reuse the operation key if a response is lost.
+    Create {
+        name: String,
+        #[arg(long)]
+        operation_key: String,
+    },
+    /// List recent, active conversations for a named Agent or Agent ID.
+    Threads {
+        agent: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Create an Agent conversation with an explicit saved model route.
+    NewThread {
+        agent: String,
+        #[arg(long, default_value = "Main")]
+        title: String,
+        #[arg(long, default_value = "deepseek")]
+        provider: String,
+        #[arg(long, default_value = "deepseek-flash")]
+        model: String,
+        #[arg(long)]
+        operation_key: String,
+    },
+    /// Send one message to a selected conversation, using its saved model.
+    Send {
+        agent: String,
+        prompt: String,
+        /// Select a specific thread; otherwise the Agent must have exactly one active Main thread.
+        #[arg(long)]
+        thread: Option<String>,
+        /// Explicit payer: byok_external, membership_included, or managed_wallet.
+        #[arg(long)]
+        billing_mode: String,
+        /// Stable message ID for safe retry after an uncertain response.
+        #[arg(long)]
+        operation_key: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -223,6 +278,56 @@ struct ComputerDeleteResponse {
 #[derive(Serialize)]
 struct ComputerCreateRequest<'a> {
     name: &'a str,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AccountAgent {
+    id: String,
+    name: String,
+    status: String,
+}
+
+#[derive(Deserialize)]
+struct AgentListResponse {
+    agents: Vec<AccountAgent>,
+}
+
+#[derive(Deserialize)]
+struct AgentResponse {
+    agent: AccountAgent,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentThread {
+    id: String,
+    agent_id: String,
+    title: String,
+    model: String,
+    model_provider: String,
+    #[serde(default)]
+    model_provider_id: String,
+    #[serde(default)]
+    kind: String,
+    #[serde(default)]
+    archived_at: String,
+}
+
+#[derive(Deserialize)]
+struct ThreadResponse {
+    thread: AgentThread,
+}
+
+#[derive(Deserialize)]
+struct TurnResponse {
+    turn: TurnReceipt,
+}
+
+#[derive(Deserialize)]
+struct TurnReceipt {
+    id: String,
+    status: String,
 }
 
 impl CatalogProvider {
@@ -567,6 +672,103 @@ impl<'a, T: CloudTransport> CloudClient<'a, T> {
         expect_json(response, &[200])
     }
 
+    fn agents(&self) -> Result<serde_json::Value> {
+        let response = self.execute_authenticated(HttpMethod::Get, "/api/agents", None)?;
+        expect_json(response, &[200])
+    }
+
+    fn create_agent(&self, name: &str, operation_key: &str) -> Result<AccountAgent> {
+        let name = validate_named_text(name, "Agent name", 80)?;
+        let operation_key = validate_operation_key(operation_key)?;
+        let response = self.execute_authenticated(
+            HttpMethod::Post,
+            "/api/agents",
+            Some(json_body(&serde_json::json!({
+                "name": name,
+                "operationKey": operation_key,
+            }))?),
+        )?;
+        let result: AgentResponse = expect_json(response, &[200, 201])?;
+        Ok(result.agent)
+    }
+
+    fn threads(&self) -> Result<Vec<AgentThread>> {
+        let response = self.execute_authenticated(HttpMethod::Get, "/v1/threads/summary", None)?;
+        expect_json(response, &[200])
+    }
+
+    fn thread(&self, id: &str) -> Result<AgentThread> {
+        let id = validate_resource_id(id, "Conversation")?;
+        let response =
+            self.execute_authenticated(HttpMethod::Get, &format!("/v1/threads/{id}"), None)?;
+        let result: ThreadResponse = expect_json(response, &[200])?;
+        Ok(result.thread)
+    }
+
+    fn create_agent_thread(
+        &self,
+        agent_id: &str,
+        title: &str,
+        provider: &str,
+        model: &str,
+        operation_key: &str,
+    ) -> Result<AgentThread> {
+        let agent_id = validate_resource_id(agent_id, "Agent")?;
+        let title = validate_named_text(title, "Conversation title", 120)?;
+        let (provider, model) = validate_model_route(provider, model)?;
+        let operation_key = validate_operation_key(operation_key)?;
+        let response = self.execute_authenticated(
+            HttpMethod::Post,
+            "/v1/threads",
+            Some(json_body(&serde_json::json!({
+                "title": title,
+                "productMode": "chat",
+                "mode": "chat",
+                "agentId": agent_id,
+                "modelProvider": provider,
+                "model": model,
+                "operationKey": operation_key,
+            }))?),
+        )?;
+        let result: ThreadResponse = expect_json(response, &[200, 201])?;
+        Ok(result.thread)
+    }
+
+    fn send_agent_turn(
+        &self,
+        thread: &AgentThread,
+        prompt: &str,
+        billing_mode: &str,
+        operation_key: &str,
+    ) -> Result<TurnReceipt> {
+        let thread_id = validate_resource_id(&thread.id, "Conversation")?;
+        let prompt = prompt.trim();
+        if prompt.is_empty() || prompt.chars().count() > 32_000 {
+            bail!("Message must contain 1-32000 characters");
+        }
+        let billing_mode = validate_billing_mode(billing_mode)?;
+        let (provider, model) = validate_model_route(&thread.model_provider, &thread.model)?;
+        let operation_key = validate_operation_key(operation_key)?;
+        let response = self.execute_authenticated(
+            HttpMethod::Post,
+            &format!("/v1/threads/{thread_id}/turns"),
+            Some(json_body(&serde_json::json!({
+                "prompt": prompt,
+                "billingMode": billing_mode,
+                "modelProvider": provider,
+                "modelProviderId": thread.model_provider_id.as_str(),
+                "model": model,
+                "requiresByok": billing_mode == "byok_external",
+                "mode": "chat",
+                "productMode": "chat",
+                "operationKey": operation_key,
+                "sourceMessageId": operation_key,
+            }))?),
+        )?;
+        let result: TurnResponse = expect_json(response, &[200, 201, 202])?;
+        Ok(result.turn)
+    }
+
     fn computer(&self, id: &str) -> Result<serde_json::Value> {
         let id = validate_computer_id(id)?;
         let response =
@@ -775,6 +977,10 @@ impl<'a, T: CloudTransport> CloudClient<'a, T> {
 }
 
 fn validate_computer_id(value: &str) -> Result<&str> {
+    validate_resource_id(value, "Computer")
+}
+
+fn validate_resource_id<'a>(value: &'a str, kind: &str) -> Result<&'a str> {
     let id = value.trim();
     let bytes = id.as_bytes();
     if bytes.is_empty()
@@ -784,17 +990,253 @@ fn validate_computer_id(value: &str) -> Result<&str> {
             .iter()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
     {
-        bail!("Computer ID must be a bounded identifier of letters, digits, `-`, or `_`");
+        bail!("{kind} ID must be a bounded identifier of letters, digits, `-`, or `_`");
     }
     Ok(id)
 }
 
 fn validate_computer_name(value: &str) -> Result<String> {
-    let name = value.trim();
-    if name.is_empty() || name.chars().count() > 80 || name.chars().any(char::is_control) {
-        bail!("Computer name must contain 1-80 characters without control characters");
+    validate_named_text(value, "Computer name", 80)
+}
+
+fn validate_named_text(value: &str, label: &str, maximum: usize) -> Result<String> {
+    let text = value.trim();
+    if text.is_empty() || text.chars().count() > maximum || text.chars().any(char::is_control) {
+        bail!("{label} must contain 1-{maximum} characters without control characters");
     }
-    Ok(name.to_string())
+    Ok(text.to_string())
+}
+
+fn validate_operation_key(value: &str) -> Result<&str> {
+    let key = value.trim();
+    if key.is_empty()
+        || key.len() > 128
+        || !key
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-'))
+    {
+        bail!("Operation key must be 1-128 URL-safe characters");
+    }
+    Ok(key)
+}
+
+fn validate_billing_mode(value: &str) -> Result<&str> {
+    match value.trim() {
+        "byok_external" => Ok("byok_external"),
+        "membership_included" => Ok("membership_included"),
+        "managed_wallet" => Ok("managed_wallet"),
+        _ => bail!("Billing mode must be byok_external, membership_included, or managed_wallet"),
+    }
+}
+
+fn validate_model_route<'a>(provider: &'a str, model: &'a str) -> Result<(&'a str, &'a str)> {
+    let provider = provider.trim();
+    let model = model.trim();
+    if provider.is_empty()
+        || provider.len() > 128
+        || !provider
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        || model.is_empty()
+        || model.len() > 256
+        || !model.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(byte, b'.' | b'_' | b':' | b'/' | b'@' | b'+' | b'-')
+        })
+        || provider.contains("..")
+        || model.contains("..")
+    {
+        bail!("Model route must contain a bounded provider and model identifier");
+    }
+    Ok((provider, model))
+}
+
+fn resolve_account_agent(agents: &[AccountAgent], selector: &str) -> Result<AccountAgent> {
+    let selector = selector.trim();
+    if selector.is_empty() {
+        bail!("Choose an Agent name or ID");
+    }
+    let by_id = agents.iter().find(|agent| agent.id == selector);
+    let matches = if let Some(agent) = by_id {
+        vec![agent]
+    } else {
+        agents
+            .iter()
+            .filter(|agent| agent.name == selector)
+            .collect::<Vec<_>>()
+    };
+    if matches.len() != 1 {
+        bail!(
+            "Expected one Agent named `{}`; found {}. Run `codewhale account agents list` and use its ID",
+            printable(selector),
+            matches.len()
+        );
+    }
+    let agent = matches[0];
+    validate_resource_id(&agent.id, "Agent")?;
+    if agent.status != "active" {
+        bail!("Agent {} is not active", printable(&agent.name));
+    }
+    Ok(agent.clone())
+}
+
+fn active_agent_thread(thread: &AgentThread, agent_id: &str) -> bool {
+    thread.agent_id == agent_id && thread.archived_at.is_empty() && thread.kind != "smoke"
+}
+
+fn write_agent_thread<W: Write>(out: &mut W, thread: &AgentThread) -> Result<()> {
+    validate_resource_id(&thread.id, "Conversation")?;
+    let (provider, model) = validate_model_route(&thread.model_provider, &thread.model)?;
+    writeln!(out, "Conversation: {}", printable(&thread.title))?;
+    writeln!(out, "ID: {}", thread.id)?;
+    writeln!(out, "Model: {provider}/{model}")?;
+    Ok(())
+}
+
+fn run_agents<T: CloudTransport, W: Write>(
+    command: CloudAgentsCommand,
+    client: &CloudClient<'_, T>,
+    machine: &machine::MachineKeyEnv,
+    out: &mut W,
+) -> Result<()> {
+    if machine.is_present() {
+        bail!(
+            "Agents require an interactive Codewhale account login; unset CODEWHALE_API_KEY and run `codewhale login`"
+        );
+    }
+    match command {
+        CloudAgentsCommand::List { json } => {
+            let response = client.agents()?;
+            if json {
+                return write_computer_json(out, &response);
+            }
+            let listing: AgentListResponse = serde_json::from_value(response)
+                .context("The Codewhale service returned an invalid Agent list")?;
+            writeln!(out, "Codewhale Agents ({})", listing.agents.len())?;
+            for agent in listing.agents {
+                validate_resource_id(&agent.id, "Agent")?;
+                writeln!(out, "{} — {}", printable(&agent.name), agent.id)?;
+            }
+            Ok(())
+        }
+        CloudAgentsCommand::Create {
+            name,
+            operation_key,
+        } => {
+            let agent = client.create_agent(&name, &operation_key)?;
+            validate_resource_id(&agent.id, "Agent")?;
+            writeln!(out, "Agent: {}", printable(&agent.name))?;
+            writeln!(out, "ID: {}", agent.id)?;
+            writeln!(
+                out,
+                "Create request ID: {}",
+                validate_operation_key(&operation_key)?
+            )?;
+            Ok(())
+        }
+        CloudAgentsCommand::Threads { agent, json } => {
+            let listing: AgentListResponse = serde_json::from_value(client.agents()?)
+                .context("The Codewhale service returned an invalid Agent list")?;
+            let selected = resolve_account_agent(&listing.agents, &agent)?;
+            let threads = client
+                .threads()?
+                .into_iter()
+                .filter(|thread| active_agent_thread(thread, &selected.id))
+                .collect::<Vec<_>>();
+            if json {
+                return write_computer_json(out, &serde_json::to_value(&threads)?);
+            }
+            writeln!(
+                out,
+                "Recent conversations for {} ({})",
+                printable(&selected.name),
+                threads.len()
+            )?;
+            for thread in &threads {
+                write_agent_thread(out, thread)?;
+            }
+            Ok(())
+        }
+        CloudAgentsCommand::NewThread {
+            agent,
+            title,
+            provider,
+            model,
+            operation_key,
+        } => {
+            let listing: AgentListResponse = serde_json::from_value(client.agents()?)
+                .context("The Codewhale service returned an invalid Agent list")?;
+            let selected = resolve_account_agent(&listing.agents, &agent)?;
+            let thread = client.create_agent_thread(
+                &selected.id,
+                &title,
+                &provider,
+                &model,
+                &operation_key,
+            )?;
+            if !active_agent_thread(&thread, &selected.id) {
+                bail!("The Codewhale service did not return an active conversation for this Agent");
+            }
+            write_agent_thread(out, &thread)?;
+            writeln!(
+                out,
+                "Create request ID: {}",
+                validate_operation_key(&operation_key)?
+            )?;
+            writeln!(
+                out,
+                "Sending requires an explicit --billing-mode and a new --operation-key for each message."
+            )?;
+            Ok(())
+        }
+        CloudAgentsCommand::Send {
+            agent,
+            prompt,
+            thread,
+            billing_mode,
+            operation_key,
+        } => {
+            let listing: AgentListResponse = serde_json::from_value(client.agents()?)
+                .context("The Codewhale service returned an invalid Agent list")?;
+            let selected = resolve_account_agent(&listing.agents, &agent)?;
+            let selected_thread = if let Some(id) = thread {
+                client.thread(&id)?
+            } else {
+                let mut main = client.threads()?.into_iter().filter(|thread| {
+                    active_agent_thread(thread, &selected.id) && thread.title == "Main"
+                });
+                let first = main.next().ok_or_else(|| anyhow!(
+                    "Agent {} has no active Main conversation. Run `codewhale account agents new-thread` first, or pass --thread",
+                    printable(&selected.name)
+                ))?;
+                if main.next().is_some() {
+                    bail!(
+                        "Agent {} has several Main conversations; pass --thread with an ID",
+                        printable(&selected.name)
+                    );
+                }
+                first
+            };
+            if !active_agent_thread(&selected_thread, &selected.id) {
+                bail!(
+                    "That conversation is not active or does not belong to Agent {}",
+                    printable(&selected.name)
+                );
+            }
+            let receipt =
+                client.send_agent_turn(&selected_thread, &prompt, &billing_mode, &operation_key)?;
+            validate_resource_id(&receipt.id, "Turn")?;
+            writeln!(out, "Conversation ID: {}", selected_thread.id)?;
+            writeln!(out, "Turn ID: {}", receipt.id)?;
+            writeln!(out, "Status: {}", printable(&receipt.status))?;
+            writeln!(
+                out,
+                "Message request ID: {}",
+                validate_operation_key(&operation_key)?
+            )?;
+            Ok(())
+        }
+    }
 }
 
 fn write_computer<W: Write>(out: &mut W, computer: &AccountComputer) -> Result<()> {
@@ -1124,6 +1566,7 @@ fn run_with<T: CloudTransport, W: Write>(
         CloudCommand::Computers(computers) => {
             run_computers(computers.command, &client, machine, out)
         }
+        CloudCommand::Agents(agents) => run_agents(agents.command, &client, machine, out),
         CloudCommand::ApiKeys(api_keys) => {
             machine::run_api_keys(api_keys, &client, machine, provider_secrets, out, sleeper)
         }

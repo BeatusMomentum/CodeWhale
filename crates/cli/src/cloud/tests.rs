@@ -165,6 +165,23 @@ fn computer(id: &str, status: &str) -> serde_json::Value {
     })
 }
 
+fn agent(id: &str, name: &str) -> serde_json::Value {
+    json!({ "id": id, "name": name, "status": "active" })
+}
+
+fn agent_thread(id: &str, agent_id: &str, title: &str) -> serde_json::Value {
+    json!({
+        "id": id,
+        "agentId": agent_id,
+        "title": title,
+        "model": "deepseek-flash",
+        "modelProvider": "deepseek",
+        "modelProviderId": "",
+        "kind": "conversation",
+        "archivedAt": ""
+    })
+}
+
 #[test]
 fn parses_cloud_command_matrix_and_rejects_inline_keys() {
     assert!(matches!(
@@ -2033,4 +2050,247 @@ fn account_computers_json_preserves_server_metering_and_entitlement() {
             expected
         );
     }
+}
+
+#[test]
+fn account_agents_create_model_bound_thread_and_send_with_same_session() {
+    let (_temp, config) = test_config();
+    let (secrets, _) = test_secrets();
+    AccountSessionStore::new(secrets.clone(), Some("default"), DEFAULT_API_BASE)
+        .save(auth("access-secret", "refresh-secret", "acct-123"))
+        .unwrap();
+    let a = agent("agent-1", "Whale");
+    let t = agent_thread("thread-1", "agent-1", "Main");
+    let transport = FakeTransport::new(vec![
+        response(200, json!({ "agents": [a.clone()] })),
+        response(201, json!({ "agent": a.clone() })),
+        response(200, json!({ "agents": [a.clone()] })),
+        response(201, json!({ "thread": t.clone(), "id": "thread-1" })),
+        response(200, json!({ "agents": [a.clone()] })),
+        response(200, json!([t.clone()])),
+        response(200, json!({ "agents": [a] })),
+        response(200, json!({ "thread": t })),
+        response(
+            202,
+            json!({ "turn": { "id": "turn-1", "status": "pending" } }),
+        ),
+    ]);
+    let mut output = Vec::new();
+    let mut key_reader = |_| bail!("unused");
+    let mut opener = |_| true;
+    let mut sleeper = |_| {};
+    for argv in [
+        vec!["codewhale", "account", "agents", "list"],
+        vec![
+            "codewhale",
+            "account",
+            "agents",
+            "create",
+            "Whale",
+            "--operation-key",
+            "create-1",
+        ],
+        vec![
+            "codewhale",
+            "account",
+            "agents",
+            "new-thread",
+            "Whale",
+            "--operation-key",
+            "thread-1",
+        ],
+        vec!["codewhale", "account", "agents", "threads", "Whale"],
+        vec![
+            "codewhale",
+            "account",
+            "agents",
+            "send",
+            "Whale",
+            "Build this",
+            "--thread",
+            "thread-1",
+            "--billing-mode",
+            "byok_external",
+            "--operation-key",
+            "message-1",
+        ],
+    ] {
+        run_with(
+            command(&argv),
+            "default",
+            DEFAULT_API_BASE,
+            &config,
+            &secrets,
+            &secrets,
+            &machine::MachineKeyEnv::default(),
+            &transport,
+            &mut output,
+            &mut key_reader,
+            &mut opener,
+            &mut sleeper,
+        )
+        .unwrap();
+    }
+    let requests = transport.requests();
+    assert_eq!(
+        requests
+            .iter()
+            .map(|request| request.path.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "/api/agents",
+            "/api/agents",
+            "/api/agents",
+            "/v1/threads",
+            "/api/agents",
+            "/v1/threads/summary",
+            "/api/agents",
+            "/v1/threads/thread-1",
+            "/v1/threads/thread-1/turns",
+        ]
+    );
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.bearer.as_deref() == Some("access-secret"))
+    );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(requests[1].body.as_ref().unwrap()).unwrap(),
+        json!({ "name": "Whale", "operationKey": "create-1" })
+    );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(requests[3].body.as_ref().unwrap()).unwrap(),
+        json!({
+            "title": "Main", "productMode": "chat", "mode": "chat",
+            "agentId": "agent-1", "modelProvider": "deepseek",
+            "model": "deepseek-flash", "operationKey": "thread-1"
+        })
+    );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(requests[8].body.as_ref().unwrap()).unwrap(),
+        json!({
+            "prompt": "Build this", "billingMode": "byok_external",
+            "modelProvider": "deepseek", "modelProviderId": "",
+            "model": "deepseek-flash", "requiresByok": true,
+            "mode": "chat", "productMode": "chat", "operationKey": "message-1",
+            "sourceMessageId": "message-1"
+        })
+    );
+    let output = String::from_utf8(output).unwrap();
+    assert!(output.contains("Turn ID: turn-1"));
+    assert!(output.contains("Status: pending"));
+    assert!(!output.contains("access-secret"));
+}
+
+#[test]
+fn account_agents_refuse_foreign_threads_ambiguous_main_and_machine_keys() {
+    let (secrets, _) = test_secrets();
+    let transport = FakeTransport::new(vec![]);
+    let client = CloudClient::new(&transport, &secrets, "default", DEFAULT_API_BASE);
+    let error = run_agents(
+        CloudAgentsCommand::List { json: false },
+        &client,
+        &machine::MachineKeyEnv::from_raw(Some("machine-key-present")),
+        &mut Vec::new(),
+    )
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("interactive Codewhale account login")
+    );
+    assert!(transport.requests().is_empty());
+    assert!(client.create_agent("Whale", "invalid/key").is_err());
+    assert!(transport.requests().is_empty());
+
+    client
+        .save_auth(auth("access-secret", "refresh-secret", "acct-123"))
+        .unwrap();
+    let foreign = FakeTransport::new(vec![
+        response(200, json!({ "agents": [agent("agent-1", "Whale")] })),
+        response(
+            200,
+            json!({ "thread": agent_thread("thread-2", "agent-2", "Main") }),
+        ),
+    ]);
+    let foreign_client = CloudClient::new(&foreign, &secrets, "default", DEFAULT_API_BASE);
+    let error = run_agents(
+        CloudAgentsCommand::Send {
+            agent: "Whale".into(),
+            prompt: "Do work".into(),
+            thread: Some("thread-2".into()),
+            billing_mode: "byok_external".into(),
+            operation_key: "message-2".into(),
+        },
+        &foreign_client,
+        &machine::MachineKeyEnv::default(),
+        &mut Vec::new(),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("does not belong"));
+    assert_eq!(foreign.requests().len(), 2);
+
+    let ambiguous = FakeTransport::new(vec![
+        response(200, json!({ "agents": [agent("agent-1", "Whale")] })),
+        response(
+            200,
+            json!([
+                agent_thread("thread-1", "agent-1", "Main"),
+                agent_thread("thread-2", "agent-1", "Main")
+            ]),
+        ),
+    ]);
+    let ambiguous_client = CloudClient::new(&ambiguous, &secrets, "default", DEFAULT_API_BASE);
+    let error = run_agents(
+        CloudAgentsCommand::Send {
+            agent: "Whale".into(),
+            prompt: "Do work".into(),
+            thread: None,
+            billing_mode: "byok_external".into(),
+            operation_key: "message-3".into(),
+        },
+        &ambiguous_client,
+        &machine::MachineKeyEnv::default(),
+        &mut Vec::new(),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("several Main conversations"));
+    assert_eq!(ambiguous.requests().len(), 2);
+}
+
+#[test]
+fn account_agents_do_not_claim_a_turn_when_runtime_is_unattached() {
+    let (secrets, _) = test_secrets();
+    let transport = FakeTransport::new(vec![
+        response(200, json!({ "agents": [agent("agent-1", "Whale")] })),
+        response(
+            200,
+            json!({ "thread": agent_thread("thread-1", "agent-1", "Main") }),
+        ),
+        response(
+            409,
+            json!({ "error": { "code": "chat_runtime_not_attached" } }),
+        ),
+    ]);
+    let client = CloudClient::new(&transport, &secrets, "default", DEFAULT_API_BASE);
+    client
+        .save_auth(auth("access-secret", "refresh-secret", "acct-123"))
+        .unwrap();
+    let mut output = Vec::new();
+    let error = run_agents(
+        CloudAgentsCommand::Send {
+            agent: "Whale".into(),
+            prompt: "Do work".into(),
+            thread: Some("thread-1".into()),
+            billing_mode: "byok_external".into(),
+            operation_key: "message-4".into(),
+        },
+        &client,
+        &machine::MachineKeyEnv::default(),
+        &mut output,
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("chat_runtime_not_attached"));
+    assert!(output.is_empty());
+    assert_eq!(transport.requests().len(), 3);
 }
