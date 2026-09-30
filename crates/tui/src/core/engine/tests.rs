@@ -337,6 +337,28 @@ async fn event_capacity_releases_all_admitted_senders_and_keeps_idle_receipts_lo
         .unwrap();
     assert_eq!(outcomes, vec![Err(streaming::EventSendError::Cancelled); 8]);
     drop(senders);
+    assert!(matches!(rx.try_recv(), Ok(Event::Status { .. })));
+    // A cancelled turn still delivers its usage/status receipts when they
+    // fit immediately. The stream suffix remains strictly cancelled.
+    engine
+        .send_event(Event::status(
+            "cancelled turn receipt with available capacity",
+        ))
+        .await
+        .unwrap();
+    assert!(
+        matches!(rx.try_recv(), Ok(Event::Status { message, .. }) if message == "cancelled turn receipt with available capacity")
+    );
+    assert!(
+        !engine
+            .send_stream_event(Event::status("forbidden stream suffix"))
+            .await
+    );
+    assert!(rx.try_recv().is_err());
+    engine
+        .tx_event
+        .try_send(Event::status("occupied before idle receipt"))
+        .unwrap();
     drop(turn);
     let mut idle = Box::pin(engine.send_event(Event::status("idle receipt after cancelled turn")));
     assert!(

@@ -47,9 +47,11 @@ impl super::Engine {
         }
     }
 
-    /// Every instance emitter uses the same queue authority. The existing
-    /// TurnControl owns cancellation; an idle refresh must not inherit the
-    /// token of an earlier interrupted turn.
+    /// Every instance emitter uses the same queue authority. Available
+    /// capacity preserves post-cancel usage/status receipts; cancellation
+    /// releases a wait for capacity. An idle refresh must not inherit the
+    /// token of an earlier interrupted turn. Stream/admission/terminal handoff
+    /// reservations retain their strict cancellation floor.
     pub(super) async fn send_event(&self, event: super::Event) -> Result<(), EventSendError> {
         let cancel = self
             .turn_controls
@@ -58,7 +60,15 @@ impl super::Engine {
             .active
             .as_ref()
             .map(|control| control.cancel.clone());
-        let permit = reserve_event_capacity(&self.tx_event, cancel.as_ref()).await?;
+        let permit = match self.tx_event.clone().try_reserve_owned() {
+            Ok(permit) => permit,
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                return Err(EventSendError::Closed);
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                reserve_event_capacity(&self.tx_event, cancel.as_ref()).await?
+            }
+        };
         permit.send(event);
         Ok(())
     }
