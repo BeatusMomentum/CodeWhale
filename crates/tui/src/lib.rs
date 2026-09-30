@@ -20493,7 +20493,8 @@ approval_policy = "on-request"
         );
         let mut config = Config::default();
 
-        merge_project_config_with_approval_baseline(&mut config, tmp.path(), Some("full-access"));
+        merge_project_config_with_approval_baseline(&mut config, tmp.path(), Some("full-access"))
+            .expect("valid project config tightens the saved baseline");
 
         assert_eq!(
             config.approval_policy.as_deref(),

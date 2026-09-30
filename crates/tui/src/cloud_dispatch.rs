@@ -311,10 +311,14 @@ impl CloudJobStore {
     /// the write are one step with respect to a cancel in another process.
     pub fn save_unless_canceled(&self, job: &CloudJob) -> Result<bool> {
         self.with_job_lock(&job.id, || {
-            if let Ok(current) = self.load(&job.id)
-                && current.status == CloudJobStatus::Canceled
-            {
-                return Ok(false);
+            match self.load(&job.id) {
+                Ok(current) if current.status == CloudJobStatus::Canceled => return Ok(false),
+                Ok(_) => {}
+                Err(error)
+                    if error
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) => {}
+                Err(error) => return Err(error.context("cannot verify the persisted job status")),
             }
             self.write_record(job)?;
             Ok(true)
@@ -3205,6 +3209,27 @@ mod tests {
         assert_eq!(persisted.status, CloudJobStatus::Canceled);
         assert_eq!(persisted.note, "Canceled locally");
         assert_eq!(persisted.finished_unix, Some(10_000_060));
+    }
+
+    #[test]
+    fn a_phase_save_preserves_an_unreadable_job_record() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = CloudJobStore::from_path(temp.path().join("jobs"));
+        let job = stored_job(CloudJobStatus::Running, 10_000_000);
+        // A genuinely absent record can be created by the first phase save.
+        assert!(store.save_unless_canceled(&job).unwrap());
+        let path = store.job_path(&job.id).unwrap();
+        let damaged = b"{\"status\":\"canceled\", interrupted write";
+        fs::write(&path, damaged).unwrap();
+        let error = store.save_unless_canceled(&job).unwrap_err();
+        assert!(format!("{error:#}").contains("cannot verify the persisted job status"));
+        assert_eq!(fs::read(&path).unwrap(), damaged);
+
+        // An I/O failure is uncertainty too, rather than permission to replace it.
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        assert!(store.save_unless_canceled(&job).is_err());
+        assert!(path.is_dir());
     }
 
     #[test]
