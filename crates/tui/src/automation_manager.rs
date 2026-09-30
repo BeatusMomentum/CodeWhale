@@ -2222,11 +2222,13 @@ where
     Ok(run)
 }
 
-/// Run one of the scheduler's whole-store scans (every automation or run
-/// record read and parsed) on the blocking pool (#6149), holding the manager
-/// lock exactly as the inline call did. Known limit: the per-record claim,
-/// recovery, and receipt writes between scans still run inline; each touches
-/// one small record under the store lock.
+/// Run a scheduler store operation on the blocking pool (#6149), holding the
+/// manager lock exactly as the inline call did: the whole-store scans (every
+/// automation or run record read and parsed) and the per-record claim,
+/// recovery, and receipt transactions, which wait on the cross-process
+/// `state.lock` and read/write JSON. Known limit: opening `dispatch.lock`
+/// (one small file open whose non-blocking guard must outlive the awaits)
+/// and the in-memory scope checks stay inline.
 async fn with_manager_blocking<T, F>(automations: &SharedAutomationManager, scan: F) -> Result<T>
 where
     T: Send + 'static,
@@ -2287,7 +2289,12 @@ where
         }
         // A single damaged admission is quarantined to its diagnostic; it must
         // not take down recovery of every pending run behind it.
-        if let Err(error) = automations.lock().await.recover_schedule_advance(&run) {
+        let recovered = with_manager_blocking(automations, {
+            let run = run.clone();
+            move |manager| manager.recover_schedule_advance(&run)
+        })
+        .await;
+        if let Err(error) = recovered {
             tracing::warn!(
                 "automation schedule recovery failed for run {}: {error:#}",
                 run.id
@@ -2295,10 +2302,11 @@ where
             continue;
         }
         let run = enqueue(run).await;
-        if let Err(error) = automations
-            .lock()
-            .await
-            .finish_scheduled_run(&run, Utc::now())
+        if let Err(error) = with_manager_blocking(automations, {
+            let run = run.clone();
+            move |manager| manager.finish_scheduled_run(&run, Utc::now())
+        })
+        .await
         {
             tracing::warn!(
                 "automation run {} receipt could not be persisted: {error:#}",
@@ -2317,29 +2325,35 @@ where
         {
             continue;
         }
-        let run =
-            match automations
-                .lock()
-                .await
-                .claim_scheduled_run(&observed, proposed, task_data_dir)
-            {
-                Ok(run) => run,
-                Err(error) => {
-                    // One automation's claim failure (for example a corrupt
-                    // receipt in its own dedup history) quarantines that
-                    // automation, not the tick: later due work still dispatches.
-                    tracing::warn!(
-                        "automation {} occurrence claim failed: {error:#}",
-                        observed.id
-                    );
-                    continue;
-                }
-            };
+        let claimed = with_manager_blocking(automations, {
+            let observed = observed.clone();
+            let task_data_dir = task_data_dir.to_path_buf();
+            move |manager| manager.claim_scheduled_run(&observed, proposed, &task_data_dir)
+        })
+        .await;
+        let run = match claimed {
+            Ok(run) => run,
+            Err(error) => {
+                // One automation's claim failure (for example a corrupt
+                // receipt in its own dedup history) quarantines that
+                // automation, not the tick: later due work still dispatches.
+                tracing::warn!(
+                    "automation {} occurrence claim failed: {error:#}",
+                    observed.id
+                );
+                continue;
+            }
+        };
         let Some(run) = run else {
             continue;
         };
         let run = enqueue(run).await;
-        if let Err(error) = automations.lock().await.finish_scheduled_run(&run, now) {
+        if let Err(error) = with_manager_blocking(automations, {
+            let run = run.clone();
+            move |manager| manager.finish_scheduled_run(&run, now)
+        })
+        .await
+        {
             tracing::warn!(
                 "automation run {} receipt could not be persisted: {error:#}",
                 run.id
@@ -2425,69 +2439,74 @@ where
         {
             continue;
         }
-        let claimed = {
-            let manager = automations.lock().await;
-            match manager.with_transaction(|| {
-                let mut current = manager.get_trigger(&candidate.trigger_id)?;
-                if current.status == DelayedTriggerStatus::Dispatching {
-                    if !manager.eligible_scope(
-                        current
-                            .dispatch
-                            .as_ref()
-                            .and_then(|d| d.execution_scope.as_deref()),
-                    ) {
+        let claim = with_manager_blocking(automations, {
+            let trigger_id = candidate.trigger_id.clone();
+            let task_data_dir = task_data_dir.to_path_buf();
+            move |manager| {
+                manager.with_transaction(|| {
+                    let mut current = manager.get_trigger(&trigger_id)?;
+                    if current.status == DelayedTriggerStatus::Dispatching {
+                        if !manager.eligible_scope(
+                            current
+                                .dispatch
+                                .as_ref()
+                                .and_then(|d| d.execution_scope.as_deref()),
+                        ) {
+                            return Ok(None);
+                        }
+                        if current.dispatch.is_none() || current.task_id.is_none() {
+                            bail!("Claimed delayed trigger has no durable task binding");
+                        }
+                        return Ok(Some(current));
+                    }
+                    if !manager.eligible_scope(current.execution_scope.as_deref())
+                        || current.status != DelayedTriggerStatus::Pending
+                        || current.fire_at > now
+                        || current.owner_session_id.is_none()
+                    {
                         return Ok(None);
                     }
-                    if current.dispatch.is_none() || current.task_id.is_none() {
-                        bail!("Claimed delayed trigger has no durable task binding");
-                    }
-                    return Ok(Some(current));
-                }
-                if !manager.eligible_scope(current.execution_scope.as_deref())
-                    || current.status != DelayedTriggerStatus::Pending
-                    || current.fire_at > now
-                    || current.owner_session_id.is_none()
-                {
-                    return Ok(None);
-                }
-                current.schema_version = CURRENT_TRIGGER_SCHEMA_VERSION;
-                current.status = DelayedTriggerStatus::Dispatching;
-                current.task_id = Some(crate::task_manager::TaskManager::new_task_id());
-                current.dispatch = Some(AutomationDispatch {
-                    execution_scope: current.execution_scope.clone(),
-                    request: NewTaskRequest {
-                        prompt: current.message.clone(),
-                        name: None,
-                        model: None,
-                        model_provider: None,
-                        model_provider_id: None,
-                        workspace: current.workspace.clone(),
-                        mode: Some("agent".into()),
-                        allow_shell: Some(false),
-                        trust_mode: Some(false),
-                        auto_approve: Some(false),
-                        permission_posture: Some(automation_posture(false)),
-                        owner_session_id: current.owner_session_id.clone(),
-                    },
-                    task_data_dir: task_data_dir.canonicalize()?,
-                    accepted: false,
-                    delivery_mode: AutomationDeliveryMode::Task,
-                    suppress_report: false,
-                    schedule: None,
-                });
-                manager.save_trigger_unlocked(&current)?;
-                Ok(Some(current))
-            }) {
-                Ok(claimed) => claimed,
-                Err(error) => {
-                    // One damaged trigger record quarantines to a diagnostic;
-                    // the remaining due triggers still fire this pass.
-                    tracing::warn!(
-                        "delayed trigger {} claim failed: {error:#}",
-                        candidate.trigger_id
-                    );
-                    continue;
-                }
+                    current.schema_version = CURRENT_TRIGGER_SCHEMA_VERSION;
+                    current.status = DelayedTriggerStatus::Dispatching;
+                    current.task_id = Some(crate::task_manager::TaskManager::new_task_id());
+                    current.dispatch = Some(AutomationDispatch {
+                        execution_scope: current.execution_scope.clone(),
+                        request: NewTaskRequest {
+                            prompt: current.message.clone(),
+                            name: None,
+                            model: None,
+                            model_provider: None,
+                            model_provider_id: None,
+                            workspace: current.workspace.clone(),
+                            mode: Some("agent".into()),
+                            allow_shell: Some(false),
+                            trust_mode: Some(false),
+                            auto_approve: Some(false),
+                            permission_posture: Some(automation_posture(false)),
+                            owner_session_id: current.owner_session_id.clone(),
+                        },
+                        task_data_dir: task_data_dir.canonicalize()?,
+                        accepted: false,
+                        delivery_mode: AutomationDeliveryMode::Task,
+                        suppress_report: false,
+                        schedule: None,
+                    });
+                    manager.save_trigger_unlocked(&current)?;
+                    Ok(Some(current))
+                })
+            }
+        })
+        .await;
+        let claimed = match claim {
+            Ok(claimed) => claimed,
+            Err(error) => {
+                // One damaged trigger record quarantines to a diagnostic;
+                // the remaining due triggers still fire this pass.
+                tracing::warn!(
+                    "delayed trigger {} claim failed: {error:#}",
+                    candidate.trigger_id
+                );
+                continue;
             }
         };
         let Some(trigger) = claimed else {
@@ -2503,7 +2522,12 @@ where
                 continue;
             }
         };
-        if let Err(error) = automations.lock().await.save_trigger(&trigger) {
+        if let Err(error) = with_manager_blocking(automations, {
+            let trigger = trigger.clone();
+            move |manager| manager.save_trigger(&trigger)
+        })
+        .await
+        {
             tracing::warn!(
                 "delayed trigger {} receipt could not be persisted: {error:#}",
                 trigger.trigger_id
@@ -2615,18 +2639,28 @@ async fn reconcile_run_statuses_shared(
         let Some(task_id) = run.task_id.clone() else {
             continue;
         };
-        let lookup = (|| {
-            if let Some(dispatch) = &run.dispatch {
-                check_dispatch_store(dispatch, task_manager)?;
+        // The bound task record is a JSON read under the task store: keep it
+        // off the Tokio worker like the scans above (#6149).
+        let lookup = tokio::task::spawn_blocking({
+            let dispatch = run.dispatch.clone();
+            let task_id = task_id.clone();
+            let task_manager = Arc::clone(task_manager);
+            move || {
+                if let Some(dispatch) = &dispatch {
+                    check_dispatch_store(dispatch, &task_manager)?;
+                }
+                let task = task_manager.read_bound_task(&task_id)?;
+                if let Some(task) = &task
+                    && let Some(dispatch) = &dispatch
+                {
+                    crate::task_manager::validate_bound_task_request(task, &dispatch.request)?;
+                }
+                Ok::<_, anyhow::Error>(task)
             }
-            let task = task_manager.read_bound_task(&task_id)?;
-            if let Some(task) = &task
-                && let Some(dispatch) = &run.dispatch
-            {
-                crate::task_manager::validate_bound_task_request(task, &dispatch.request)?;
-            }
-            Ok::<_, anyhow::Error>(task)
-        })();
+        })
+        .await
+        .context("automation task lookup failed")
+        .and_then(|lookup| lookup);
         let task = match lookup {
             Ok(Some(task)) => task,
             Ok(None) => {
@@ -2653,10 +2687,11 @@ async fn reconcile_run_statuses_shared(
                         "Automation reconciliation unavailable: bound task {task_id} is missing"
                     ));
                 }
-                if let Err(error) = automations
-                    .lock()
-                    .await
-                    .finish_scheduled_run(&run, Utc::now())
+                if let Err(error) = with_manager_blocking(automations, {
+                    let run = run.clone();
+                    move |manager| manager.finish_scheduled_run(&run, Utc::now())
+                })
+                .await
                 {
                     tracing::warn!(
                         "automation run {} receipt could not be persisted: {error:#}",
@@ -2667,10 +2702,11 @@ async fn reconcile_run_statuses_shared(
             }
             Err(error) => {
                 run.error = Some(format!("Automation reconciliation unavailable: {error:#}"));
-                if let Err(error) = automations
-                    .lock()
-                    .await
-                    .finish_scheduled_run(&run, Utc::now())
+                if let Err(error) = with_manager_blocking(automations, {
+                    let run = run.clone();
+                    move |manager| manager.finish_scheduled_run(&run, Utc::now())
+                })
+                .await
                 {
                     tracing::warn!(
                         "automation run {} receipt could not be persisted: {error:#}",
@@ -2722,10 +2758,11 @@ async fn reconcile_run_statuses_shared(
         run.schema_version = CURRENT_RUN_SCHEMA_VERSION;
         dispatch.accepted = true;
         dispatch.suppress_report = watcher_noop;
-        if let Err(error) = automations
-            .lock()
-            .await
-            .finish_scheduled_run(&run, Utc::now())
+        if let Err(error) = with_manager_blocking(automations, {
+            let run = run.clone();
+            move |manager| manager.finish_scheduled_run(&run, Utc::now())
+        })
+        .await
         {
             tracing::warn!(
                 "automation run {} receipt could not be persisted: {error:#}",
