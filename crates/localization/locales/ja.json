@@ -1,4 +1,5 @@
 {
+  "ComposerOversizedSubmitHeld": "未送信：メッセージが {limit} 文字を超えており、貼り付けファイルに保存できませんでした（{error}）。全文は入力欄に残っています。短くするか .codewhale/pastes を書き込み可能にしてから、もう一度 Enter を押してください。",
   "CmdPluginOwnerReport": "拡張機能ホスト:\n  状態: {state}\n  有効なツール ({count}): {tools}",
   "CmdPluginOwnerActivating": "有効化中",
   "CmdPluginOwnerActive": "有効",

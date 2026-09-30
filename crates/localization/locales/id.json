@@ -1,4 +1,5 @@
 {
+  "ComposerOversizedSubmitHeld": "Belum terkirim: pesan ini melebihi {limit} karakter dan tidak dapat disimpan sebagai berkas teks tempelan ({error}). Teks lengkap masih ada di kolom input: persingkat teks atau izinkan penulisan ke .codewhale/pastes, lalu tekan Enter lagi.",
   "CmdPluginOwnerReport": "Host ekstensi:\n  Status: {state}\n  Alat aktif ({count}): {tools}",
   "CmdPluginOwnerActivating": "Sedang diaktifkan",
   "CmdPluginOwnerActive": "Aktif",

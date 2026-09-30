@@ -101,6 +101,7 @@ const HOST_DENIED_HOME_ENTRIES: &[&str] = &[
     "session_index.jsonl",
     "tool_outputs",
     "composer_history.txt",
+    "composer_history.jsonl",
     "remote-control",
     "integrations",
     "audit.log",

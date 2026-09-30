@@ -827,6 +827,12 @@ async fn sandboxed_host_cannot_read_codewhale_secrets_or_write_outside_its_data_
         late["ok"], false,
         "a store created after start was readable"
     );
+    // The migrated history can first appear after host launch too. Its name
+    // must be denied before enumeration can observe the file.
+    let history = fixture.root.join("composer_history.jsonl");
+    std::fs::write(&history, "\"private synthetic prompt\"\n").unwrap();
+    let late_history = probe(&read, &history, &context).await;
+    assert_eq!(late_history["ok"], false, "new history was readable");
     // The Codex credential file Codewhale itself reads, when this machine has
     // one. Only `ok` is reported, never the content.
     let codex_auth = crate::oauth::auth_file_path();

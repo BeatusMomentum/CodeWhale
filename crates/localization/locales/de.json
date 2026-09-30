@@ -1,4 +1,5 @@
 {
+  "ComposerOversizedSubmitHeld": "Nicht gesendet: Diese Nachricht enthält mehr als {limit} Zeichen und konnte nicht als Einfügedatei gespeichert werden ({error}). Der vollständige Text steht noch im Eingabefeld: Kürze ihn oder mache .codewhale/pastes beschreibbar und drücke dann erneut Enter.",
   "CmdPluginOwnerReport": "Erweiterungshost:\n  Status: {state}\n  Aktive Werkzeuge ({count}): {tools}",
   "CmdPluginOwnerActivating": "Wird aktiviert",
   "CmdPluginOwnerActive": "Aktiv",

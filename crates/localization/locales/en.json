@@ -1,4 +1,5 @@
 {
+  "ComposerOversizedSubmitHeld": "Not sent: this message is over {limit} characters and could not be saved as a paste file ({error}). The full text is still in the composer: shorten it, or make .codewhale/pastes writable, then press Enter again.",
   "CmdPluginOwnerReport": "Extension host:\n  State: {state}\n  Live tools ({count}): {tools}",
   "CmdPluginOwnerActivating": "Activating",
   "CmdPluginOwnerActive": "Active",

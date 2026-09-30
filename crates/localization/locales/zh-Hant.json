@@ -1,4 +1,5 @@
 {
+  "ComposerOversizedSubmitHeld": "未傳送：訊息超過 {limit} 個字元，無法儲存為貼上文字檔案（{error}）。完整文字仍保留在輸入框中：請縮短內容，或允許寫入 .codewhale/pastes，然後再次按 Enter。",
   "CmdPluginOwnerReport": "擴充功能主機：\n  狀態：{state}\n  活動工具（{count}）：{tools}",
   "CmdPluginOwnerActivating": "正在啟用",
   "CmdPluginOwnerActive": "已啟用",

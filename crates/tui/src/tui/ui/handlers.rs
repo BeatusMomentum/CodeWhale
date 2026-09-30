@@ -2490,7 +2490,7 @@ pub(crate) async fn handle_view_events(
                     insertion.push(' ');
                 }
                 insertion.push('@');
-                insertion.push_str(&path);
+                insertion.push_str(&crate::tui::file_mention::file_mention_body(&path));
                 insertion.push(' ');
                 app.insert_str(&insertion);
                 app.status_message = Some(format!("Attached @{path}"));

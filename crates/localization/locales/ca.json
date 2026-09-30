@@ -1,4 +1,5 @@
 {
+  "ComposerOversizedSubmitHeld": "No s’ha enviat: el missatge supera els {limit} caràcters i no s’ha pogut desar en un fitxer de text enganxat ({error}). El text complet continua al camp d’entrada: escurça’l o habilita l’escriptura a .codewhale/pastes i torna a prémer Enter.",
   "CmdPluginOwnerReport": "Amfitrió d’extensions:\n  Estat: {state}\n  Eines actives ({count}): {tools}",
   "CmdPluginOwnerActivating": "S’està activant",
   "CmdPluginOwnerActive": "Actiu",

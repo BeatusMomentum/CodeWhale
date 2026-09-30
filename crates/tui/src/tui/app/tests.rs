@@ -3313,6 +3313,35 @@ fn submit_input_consolidates_oversized_input_into_paste_file() {
 }
 
 #[test]
+fn submit_input_holds_oversized_input_when_paste_file_cannot_be_written() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    // `.codewhale` is a file, so `.codewhale/pastes` cannot be created.
+    std::fs::write(tmp.path().join(".codewhale"), "not a dir").expect("seed file");
+    let mut opts = test_options(false);
+    opts.workspace = tmp.path().to_path_buf();
+    let mut app = App::new(opts, &Config::default());
+    let full_content = "y".repeat(MAX_SUBMITTED_INPUT_CHARS + 128);
+    app.input = full_content.clone();
+    app.cursor_position = app.input.chars().count();
+
+    assert_eq!(
+        app.submit_input(),
+        None,
+        "a truncated prompt must not be sent"
+    );
+    assert_eq!(
+        app.input, full_content,
+        "the full text stays in the composer"
+    );
+    assert!(
+        app.status_toasts
+            .iter()
+            .any(|toast| toast.text.starts_with("Not sent") && toast.text.contains("shorten it")),
+        "expected an actionable not-sent toast"
+    );
+}
+
+#[test]
 fn app_starts_without_seeded_transcript_messages() {
     let app = App::new(test_options(false), &Config::default());
     assert!(app.history.is_empty());

@@ -1,4 +1,5 @@
 {
+  "ComposerOversizedSubmitHeld": "Не надіслано: повідомлення перевищує {limit} символів, і його не вдалося зберегти у файл вставленого тексту ({error}). Повний текст залишається в полі введення: скоротіть його або дозвольте запис у .codewhale/pastes, а потім знову натисніть Enter.",
   "CmdPluginOwnerReport": "Хост розширень:\n  Стан: {state}\n  Активні інструменти ({count}): {tools}",
   "CmdPluginOwnerActivating": "Активація",
   "CmdPluginOwnerActive": "Активний",

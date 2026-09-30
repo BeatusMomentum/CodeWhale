@@ -1,4 +1,5 @@
 {
+  "ComposerOversizedSubmitHeld": "नहीं भेजा गया: इस संदेश में {limit} से अधिक वर्ण हैं और इसे पेस्ट फ़ाइल के रूप में सहेजा नहीं जा सका ({error})। पूरा पाठ अभी भी इनपुट बॉक्स में है: इसे छोटा करें या .codewhale/pastes में लिखने की अनुमति दें, फिर Enter दबाएँ।",
   "CmdPluginOwnerReport": "एक्सटेंशन होस्ट:\n  स्थिति: {state}\n  सक्रिय टूल ({count}): {tools}",
   "CmdPluginOwnerActivating": "सक्रिय किया जा रहा है",
   "CmdPluginOwnerActive": "सक्रिय",

@@ -1281,6 +1281,20 @@ pub async fn run_tui(
     result
 }
 
+/// Whether a composer guard owns this launch-screen Enter. Every guard is
+/// applied here, before a session exists, so a held submit never leaves the
+/// user in a new empty session.
+pub(super) fn launch_submit_held(app: &mut App) -> bool {
+    if app.startup_input_unproven || !app.composer_enter_would_submit() {
+        // A paste burst, empty composer or startup integrity hold.
+        app.handle_composer_enter();
+        return true;
+    }
+    // An oversized draft is backed up to a paste file now; if that fails the
+    // submit is held with the full text in the composer.
+    !app.consolidate_large_input_if_oversized()
+}
+
 /// Submit the pre-session composer's message as the first message of a new
 /// session.
 ///
@@ -1319,10 +1333,7 @@ async fn dispatch_launch_composer_submit(
         .await;
     }
     let action = app.decide_composer_submit(chord);
-    if app.startup_input_unproven || !app.composer_enter_would_submit() {
-        // A paste burst, empty composer or startup integrity hold owns this
-        // Enter. Apply that guard without creating an empty session.
-        app.handle_composer_enter();
+    if launch_submit_held(app) {
         return Ok(false);
     }
     let result = begin_launch_session(app, None);
@@ -1353,14 +1364,6 @@ async fn dispatch_launch_composer_submit(
     Ok(false)
 }
 
-/// Submit the live-session composer through the same branches Enter uses.
-///
-/// Mouse `[↵]` sets `pending_composer_submit`; this consumes that chord without
-/// duplicating draft consumption or opening transcript-only Enter shortcuts.
-/// Its own gates (`SendQueuedNow`, the paste-burst probe) run here; everything
-/// from slash-menu selection onward is the shared `submit_decided_composer_input`
-/// tail the keyboard Enter arm also uses, so the two surfaces cannot drift.
-#[allow(clippy::too_many_arguments)]
 /// Show why a turn ended without success. The composer status line always
 /// names it; a turn the Engine stopped itself (wall-clock or step budget, no
 /// progress, an incomplete response) posts no error event, so its reason also
@@ -1399,6 +1402,14 @@ pub(super) fn present_turn_failure(
     }
 }
 
+/// Submit the live-session composer through the same branches Enter uses.
+///
+/// Mouse `[↵]` sets `pending_composer_submit`; this consumes that chord without
+/// duplicating draft consumption or opening transcript-only Enter shortcuts.
+/// Its own gates (`SendQueuedNow`, the paste-burst probe) run here; everything
+/// from slash-menu selection onward is the shared `submit_decided_composer_input`
+/// tail the keyboard Enter arm also uses, so the two surfaces cannot drift.
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_session_composer_submit(
     terminal: &mut AppTerminal,
     app: &mut App,
