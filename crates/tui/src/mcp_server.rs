@@ -372,6 +372,12 @@ impl McpServer {
             .get("arguments")
             .cloned()
             .unwrap_or_else(|| json!({}));
+        if !arguments.is_object() {
+            return Err(RpcError {
+                code: -32602,
+                message: "Tool arguments must be an object".into(),
+            });
+        }
         // Approval comes from the operator's config, never from the caller:
         // a request cannot vouch for itself.
         if self.require_approval
@@ -491,6 +497,206 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
+    fn initialize_request() -> Value {
+        json!({
+            "jsonrpc": "2.0", "id": 0, "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "clientInfo": {"name": "native-server-test", "version": "1"},
+                "capabilities": {}
+            }
+        })
+    }
+
+    async fn complete_handshake(server: &mut McpServer) {
+        let response = server.handle_message(initialize_request()).await.unwrap();
+        assert_eq!(response["result"]["protocolVersion"], "2024-11-05");
+        assert!(
+            server
+                .handle_message(json!({
+                    "jsonrpc": "2.0", "method": "notifications/initialized"
+                }))
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn native_server_validates_identity_without_echoing_request_data() {
+        let mut server = McpServer::new(
+            PathBuf::from("."),
+            McpServerSettings {
+                expose_tools: default_expose_tools(),
+                require_approval: true,
+            },
+        )
+        .unwrap();
+        for request in [
+            json!([]),
+            Value::Null,
+            json!({"method": "ping"}),
+            json!({"jsonrpc": "2", "id": 1, "method": "ping"}),
+            json!({"jsonrpc": "2.0", "id": true, "method": "ping"}),
+            json!({"jsonrpc": "2.0", "id": 1.5, "method": "ping"}),
+            json!({"jsonrpc": "2.0", "id": 1, "method": 7}),
+            json!({"jsonrpc": "2.0", "id": 1, "method": "ping", "params": "PRIVATE_TOKEN=sentinel"}),
+        ] {
+            let response = server.handle_message(request).await.unwrap();
+            assert!(response["id"].is_null(), "{response}");
+            assert_eq!(response["error"]["code"], -32600, "{response}");
+            assert!(!response.to_string().contains("PRIVATE_TOKEN"));
+            assert!(!response.to_string().contains("sentinel"));
+        }
+        let response = server
+            .handle_message(json!({"jsonrpc": "2.0", "id": null, "method": "ping"}))
+            .await
+            .unwrap();
+        assert!(response["id"].is_null());
+        assert_eq!(response["result"], json!({}));
+        assert!(
+            server
+                .handle_message(json!({"jsonrpc": "2.0", "method": "ping"}))
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn native_server_requires_completed_handshake_before_any_tool_effect() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut server = McpServer::new(
+            workspace.path().to_path_buf(),
+            McpServerSettings {
+                expose_tools: vec!["file_write".into()],
+                require_approval: false,
+            },
+        )
+        .unwrap();
+        let write = json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {
+            "name": "file_write", "arguments": {"path": "canary.txt", "content": "written"}
+        }});
+        let response = server.handle_message(write.clone()).await.unwrap();
+        assert_eq!(response["error"]["code"], -32600);
+        assert!(!workspace.path().join("canary.txt").exists());
+        assert!(
+            server
+                .handle_message(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}))
+                .await
+                .is_none()
+        );
+        let mut notification = initialize_request();
+        notification.as_object_mut().unwrap().remove("id");
+        assert!(server.handle_message(notification).await.is_none());
+        assert_eq!(
+            server.handle_message(write.clone()).await.unwrap()["error"]["code"],
+            -32600
+        );
+        let mut malformed = initialize_request();
+        malformed["params"]["clientInfo"]["name"] = json!("");
+        assert_eq!(
+            server.handle_message(malformed).await.unwrap()["error"]["code"],
+            -32602
+        );
+        let mut initialize = initialize_request();
+        initialize["id"] = Value::Null;
+        let response = server.handle_message(initialize).await.unwrap();
+        assert!(response["id"].is_null());
+        assert_eq!(response["result"]["protocolVersion"], "2024-11-05");
+        assert_eq!(
+            server.handle_message(initialize_request()).await.unwrap()["error"]["code"],
+            -32600
+        );
+        assert_eq!(
+            server.handle_message(write.clone()).await.unwrap()["error"]["code"],
+            -32600
+        );
+        assert_eq!(
+            server
+                .handle_message(
+                    json!({"jsonrpc": "2.0", "id": 3, "method": "notifications/initialized"})
+                )
+                .await
+                .unwrap()["error"]["code"],
+            -32600
+        );
+        assert_eq!(
+            server.handle_message(write.clone()).await.unwrap()["error"]["code"],
+            -32600
+        );
+        assert!(
+            server
+                .handle_message(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}))
+                .await
+                .is_none()
+        );
+        let mut unacknowledged = write.clone();
+        unacknowledged.as_object_mut().unwrap().remove("id");
+        assert!(server.handle_message(unacknowledged).await.is_none());
+        assert!(!workspace.path().join("canary.txt").exists());
+        let response = server.handle_message(write).await.unwrap();
+        assert!(response.get("error").is_none(), "{response}");
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join("canary.txt")).unwrap(),
+            "written"
+        );
+    }
+
+    async fn run_native_pipe(input: &[u8]) -> (Result<()>, Vec<u8>) {
+        use tokio::io::AsyncReadExt;
+        let mut server = McpServer::new(
+            PathBuf::from("."),
+            McpServerSettings {
+                expose_tools: default_expose_tools(),
+                require_approval: true,
+            },
+        )
+        .unwrap();
+        let (client, server_io) = tokio::io::duplex(8192);
+        let (mut writer, mut reader) = tokio::io::split(client);
+        let (server_reader, server_writer) = tokio::io::split(server_io);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(server.run_io(server_reader, server_writer), async {
+                // Oversized input deliberately closes the server before the
+                // writer finishes. Both halves still settle without a task.
+                let _ = writer.write_all(input).await;
+                drop(writer);
+                let mut output = Vec::new();
+                reader.read_to_end(&mut output).await.unwrap();
+                output
+            })
+        })
+        .await
+        .expect("the bounded server pipe must settle")
+    }
+
+    #[tokio::test]
+    async fn native_pipe_reports_parse_error_and_preserves_the_following_frame() {
+        let (result, output) = run_native_pipe(b"{\"PRIVATE_TOKEN\":\"sentinel\",\n{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"ping\"}\n").await;
+        result.unwrap();
+        let text = String::from_utf8(output).unwrap();
+        assert!(!text.contains("PRIVATE_TOKEN"));
+        assert!(!text.contains("sentinel"));
+        let responses: Vec<Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(responses.len(), 2);
+        assert_eq!(responses[0]["error"]["code"], -32700);
+        assert!(responses[0]["id"].is_null());
+        assert_eq!(responses[1]["id"], 7);
+        assert_eq!(responses[1]["result"], json!({}));
+    }
+
+    #[tokio::test]
+    async fn native_pipe_refuses_oversized_unterminated_input() {
+        let input = vec![b'x'; crate::mcp::MAX_MCP_RESPONSE_BYTES + 8192];
+        let (result, output) = run_native_pipe(&input).await;
+        assert!(result.is_err());
+        let response: Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(response["error"]["code"], -32700);
+        assert!(response["id"].is_null());
+    }
+
     #[test]
     fn exposed_tools_map_aliases() {
         let names = vec![
@@ -561,6 +767,7 @@ mod tests {
             require_approval: false,
         };
         let mut server = McpServer::new(PathBuf::from("."), settings).expect("build server");
+        complete_handshake(&mut server).await;
 
         let tools = server.list_tools_response();
         assert_eq!(
@@ -633,6 +840,7 @@ mod tests {
         };
         let mut server =
             McpServer::new(workspace.path().to_path_buf(), settings).expect("build server");
+        complete_handshake(&mut server).await;
 
         let tools = server.list_tools_response();
         let names: Vec<&str> = tools["tools"]
@@ -677,6 +885,7 @@ mod tests {
         };
         let mut server =
             McpServer::new(workspace.path().to_path_buf(), settings).expect("build server");
+        complete_handshake(&mut server).await;
         let response = server
             .handle_message(json!({
                 "jsonrpc": "2.0",
