@@ -420,7 +420,10 @@ where
     };
 
     // No response body exists yet, so switching protocols and replaying the
-    // request is safe. The policy guard above keeps this to exactly one retry.
+    // request cannot corrupt stream state. It can still bill twice if the
+    // provider accepted the first request (see the ambiguous-replay limit on
+    // `llm_client::with_retry`). The policy guard above keeps this to exactly
+    // one retry.
     let h1_req = open_req.clone().with_h1_only();
     crate::logging::warn(format!(
         "SSE stream {fallback_reason}; retrying once with HTTP/1.1"
