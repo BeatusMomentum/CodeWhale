@@ -6666,8 +6666,8 @@ fn selected_reasoning_actions_roundtrip_for_every_expansion_baseline() {
                     app.thinking_folds.insert(0, fold);
                 }
                 app.resync_history_revisions();
-                // The adaptive preview fills spare viewport rows. Keep the
-                // 40-line body larger than the pane so both actions exist.
+                // Keep a long body so expanded and collapsed states are
+                // observably different under every preference baseline.
                 let _ = render_underwater_test_app(&mut app, 100, 32);
                 select_original_cell(&mut app, 0);
 
@@ -6896,41 +6896,38 @@ fn latest_streaming_reasoning_owns_space_after_an_older_tool() {
 }
 
 #[test]
-fn reasoning_preview_spends_available_viewport_rows_before_truncating() {
-    for streaming in [false, true] {
-        let mut roomy = create_test_app();
-        roomy.history = vec![reasoning_with_lines("roomy", 20, streaming)];
-        roomy.resync_history_revisions();
-        let roomy_surface = render_underwater_test_app(&mut roomy, 100, 32);
-
-        assert!(roomy_surface.contains("roomy line 01"), "{roomy_surface}");
-        assert!(roomy_surface.contains("roomy line 20"), "{roomy_surface}");
-        assert!(
-            !roomy_surface.contains("Space:expand"),
-            "a body that fits the live viewport must not be truncated: {roomy_surface}"
-        );
-        assert!(
-            roomy.viewport.last_transcript_total <= roomy.viewport.last_transcript_visible,
-            "the complete reasoning body should fit without scrolling"
-        );
-
-        let mut compact = create_test_app();
-        compact.history = vec![reasoning_with_lines("compact", 20, streaming)];
-        compact.resync_history_revisions();
-        let compact_surface = render_underwater_test_app(&mut compact, 60, 12);
-        assert!(
-            compact_surface.contains("Space:expand"),
-            "{compact_surface}"
-        );
-        assert_eq!(
-            compact.viewport.last_transcript_total,
-            if streaming {
-                14
+#[allow(clippy::print_stderr)]
+fn calm1_reasoning_frames_keep_fixed_budgets_and_explicit_expansion() {
+    for (width, height) in [(40, 12), (60, 16), (80, 24), (140, 40)] {
+        for (streaming, expanded) in [(true, false), (false, false), (false, true)] {
+            let mut app = create_test_app();
+            app.calm_mode = true;
+            app.history = vec![reasoning_with_lines("fixture", 20, streaming)];
+            app.resync_history_revisions();
+            if expanded {
+                app.thinking_folds.insert(0, ThinkingFold::Expanded);
+            }
+            let surface = render_underwater_test_app(&mut app, width, height);
+            let rows = app.viewport.last_transcript_total;
+            if expanded {
+                assert!(rows >= 21);
+                assert_eq!(app.thinking_folds.get(&0), Some(&ThinkingFold::Expanded));
+                assert!(surface.contains("fixture line 20"), "{surface}");
             } else {
-                compact.viewport.last_transcript_visible
-            },
-            "streaming keeps its 12-row fallback while completed thought spends the visible viewport before truncating: {compact_surface}"
-        );
+                assert_eq!(rows, if streaming { 4 } else { 1 }, "{surface}");
+                assert_eq!(reasoning_hint_cells(&app), vec![0]);
+                if rows <= app.viewport.last_transcript_visible {
+                    assert!(surface.contains("Space:expand"), "{surface}");
+                }
+                assert!(!surface.contains("fixture line 01"), "{surface}");
+                if streaming {
+                    assert!(surface.contains("fixture line 20"), "{surface}");
+                }
+            }
+            eprintln!(
+                "calm1 frame {width}x{height}: streaming={streaming} expanded={expanded}, transcript_rows={rows}"
+            );
+        }
     }
 }
 

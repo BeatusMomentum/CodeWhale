@@ -168,6 +168,8 @@
   "HistoryHintRestore": "Esc 还原",
   "HistoryNoMatches": "  无匹配",
   "TranscriptReasoningExpand": "展开",
+  "TranscriptThought": "思考完毕",
+  "TranscriptThoughtFor": "思考用时 {duration}",
   "TelemetryNoticeDefaultOn": "使用统计默认开启。 向 Codewhale 和数据处理方 PostHog 分享版本/平台、会话、功能和错误的汇总计数。不收集内容或 IP。docs/TELEMETRY.md 关闭： codewhale config set telemetry false",
   "TelemetryNoticeHeadline": "Codewhale 使用统计",
   "TelemetryNoticeBody": "Codewhale 只统计：您运行的版本、操作系统和 CPU 系列、会话时长和结果，\n以及汇总的功能和错误计数。\n\n它绝不会收集您的对话、代码、提示词、文件、仓库名或分支名、模型内容\n或凭据，也绝不会发送按轮次或按工具记录的代理活动。\n\n系统只使用存储在本机上的随机 ID 来识别您，该 ID 每 90 天更换一次。\n您可以随时更改：\n              codewhale config set telemetry false\n\n逐字段完整架构：docs/TELEMETRY.md\n\n使用统计默认开启。 配置发送后，Codewhale 和 PostHog 会处理这些计数。不收集 IP。",

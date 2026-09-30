@@ -302,15 +302,9 @@ impl TranscriptViewCache {
             self.identity_epoch = Some(owner.identity_epoch);
         }
         self.transcript_action_owner = action_owner;
-        // The viewport height only sizes the newest reasoning cell's preview
-        // (the post-flatten pass below); every other cell renders the same at
-        // any height. Composer growth, toasts, and turn chrome resize the
-        // viewport often, so treating it as layout re-rendered the whole
-        // history on each change, a cost that grew with the session (#6652).
-        let viewport_changed = self.options.reasoning_preview_viewport_lines
-            != options.reasoning_preview_viewport_lines;
-        let layout_changed =
-            self.width != width || !same_layout_options(self.options, options) || identity_changed;
+        // Collapsed reasoning has a fixed preview budget; viewport height
+        // does not participate in wrapping or cached cell identity.
+        let layout_changed = self.width != width || self.options != options || identity_changed;
         let folded_changed = self.thinking_folds != *thinking_folds;
         // `todo_write` replaces the whole list on every call, so only the
         // newest snapshot is worth a full card (#5871). When a new one lands
@@ -372,7 +366,6 @@ impl TranscriptViewCache {
         let revisions_match = cell_revisions.len() == total_cells;
         let mut dirty_cells = 0usize;
         let mut streaming_tail_update = None;
-        let mut newest_reasoning = None;
 
         let mut idx: usize = 0;
         for cell in cells {
@@ -385,8 +378,6 @@ impl TranscriptViewCache {
             let original_idx = original_index_map
                 .map(|m| *m.get(idx).unwrap_or(&idx))
                 .unwrap_or(idx);
-            let is_layout_aware_preview = idx + 1 == total_cells;
-            let was_layout_aware_preview = idx + 1 == old_len;
             let is_tool_groupable = matches!(cell, HistoryCell::Tool(_));
             let render_width = if is_tool_groupable {
                 width.saturating_sub(2).max(1)
@@ -394,14 +385,7 @@ impl TranscriptViewCache {
                 width
             };
             let fold = thinking_folds.get(&original_idx).copied();
-            if is_layout_aware_preview && matches!(cell, HistoryCell::Thinking { .. }) {
-                newest_reasoning = Some((idx, cell, current_rev, fold));
-            }
             if !layout_changed
-                && is_layout_aware_preview == was_layout_aware_preview
-                && !(is_layout_aware_preview
-                    && matches!(cell, HistoryCell::Thinking { .. })
-                    && (any_dirty || viewport_changed))
                 && revisions_match
                 && old_per_cell
                     .get(idx)
@@ -495,7 +479,6 @@ impl TranscriptViewCache {
             }
 
             let mut cell_options = options;
-            cell_options.reasoning_preview_extra_lines = 0;
             cell_options.superseded_work_receipt = matches!(
                 cell,
                 HistoryCell::Tool(tool) if tool.is_durable_work_receipt()
@@ -562,26 +545,6 @@ impl TranscriptViewCache {
         }
 
         self.flatten_from(options.spacing, rebuild_from);
-
-        let Some(viewport_lines) = options.reasoning_preview_viewport_lines else {
-            return;
-        };
-        let free_rows = viewport_lines.saturating_sub(self.total_lines());
-        let Some((idx, cell, current_rev, fold)) = newest_reasoning.filter(|_| free_rows > 0)
-        else {
-            return;
-        };
-        let mut expanded_options = options;
-        expanded_options.reasoning_preview_extra_lines = free_rows;
-        let expanded = render_cached_cell(cell, current_rev, width, expanded_options, fold);
-        if expanded.lines == self.per_cell[idx].lines {
-            return;
-        }
-        self.per_cell[idx] = expanded;
-        let rebuild_from = self
-            .set_action_owner(action_owner, original_index_map)
-            .map_or(idx, |change| first_hint_cell(change).min(idx));
-        self.flatten_from(options.spacing, rebuild_from.saturating_sub(1));
     }
 
     /// A hidden cell has no line boundary at which to truncate. Rebuild from
@@ -621,7 +584,7 @@ impl TranscriptViewCache {
     }
 
     /// Rewrite the affordance row of the cells whose hint changed. The hint
-    /// only swaps the final span of a cell's last line, so geometry, spacers,
+    /// only swaps the final span of a cell's header, so geometry, spacers,
     /// and every other row are unchanged. Returns false when the flat index
     /// cannot vouch for a cell, and the caller falls back to a rebuild.
     fn repaint_action_hints(&mut self, change: HintChange) -> bool {
@@ -630,9 +593,10 @@ impl TranscriptViewCache {
             let Some(cached) = self.per_cell.get(cell_index) else {
                 return false;
             };
-            let Some(line_in_cell) = cached.lines.len().checked_sub(1) else {
+            if cached.lines.is_empty() {
                 continue;
-            };
+            }
+            let line_in_cell = 0;
             let Some(at) = self
                 .cell_line_starts
                 .get(cell_index)
@@ -686,15 +650,21 @@ impl TranscriptViewCache {
         let cached = &self.per_cell[cell_index];
         let rendered_line_count = cached.lines.len();
         let line = &cached.lines[line_in_cell];
-        let hint = hint.filter(|_| {
+        let hint = hint.filter(|hint| {
             self.reasoning_action_rendered_cell == Some(cell_index)
-                && line_in_cell + 1 == rendered_line_count
+                && line_in_cell == 0
+                && line
+                    .width()
+                    .saturating_sub(line.spans.last().map_or(0, Span::width))
+                    + unicode_width::UnicodeWidthStr::width(*hint)
+                    + 1
+                    <= usize::from(self.width)
         });
         let is_hint = hint.is_some();
         let hinted = hint.map(|hint| {
             let mut hinted = line.clone();
             if let Some(span) = hinted.spans.last_mut() {
-                span.content = hint.to_string().into();
+                span.content = format!(" {hint}").into();
             }
             hinted
         });
@@ -964,13 +934,16 @@ fn render_cached_cell(
         copy_separators.push(rendered_line.copy_separator_after);
     }
     if reasoning_action == Some(ReasoningAction::Expand)
-        && let Some(line) = lines.last()
+        && let Some(line) = lines.first()
     {
         let prefix = line.width().saturating_sub(compute_rail_prefix_width(line));
         *copy_prefix_widths
-            .last_mut()
-            .expect("reasoning affordance line") = prefix;
-        links.last_mut().expect("reasoning affordance line").clear();
+            .first_mut()
+            .expect("reasoning affordance header") = prefix;
+        links
+            .first_mut()
+            .expect("reasoning affordance header")
+            .clear();
     }
     let is_empty = lines.is_empty();
     let ends_blank = last_line_is_blank(&lines);
@@ -999,18 +972,6 @@ fn strip_cell_local_tool_rail(line: &mut Line<'static>) {
         .is_some_and(|span| matches!(span.content.as_ref(), "─ " | "╭ " | "│ " | "╰ "))
     {
         line.spans.remove(0);
-    }
-}
-
-/// Options equal apart from the viewport height, which only the newest
-/// reasoning cell's preview reads.
-fn same_layout_options(a: TranscriptRenderOptions, b: TranscriptRenderOptions) -> bool {
-    TranscriptRenderOptions {
-        reasoning_preview_viewport_lines: None,
-        ..a
-    } == TranscriptRenderOptions {
-        reasoning_preview_viewport_lines: None,
-        ..b
     }
 }
 

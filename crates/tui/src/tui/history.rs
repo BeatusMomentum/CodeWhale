@@ -41,9 +41,10 @@ use checklist::{
 #[cfg(test)]
 use checklist::{ChecklistChange, ChecklistItemSnapshot, ChecklistSnapshot};
 use constants::{
-    ASSISTANT_GLYPH, FOREGROUND_SHELL_WAIT_HINT, TOOL_CARD_SUMMARY_LINES, TOOL_COMMAND_LINE_LIMIT,
-    TOOL_DONE_SYMBOL, TOOL_FAILED_SYMBOL, TOOL_HEADER_SUMMARY_LIMIT, TOOL_OUTPUT_LINE_LIMIT,
-    TOOL_SUCCESS_OUTPUT_PREVIEW_LINES, TOOL_SUMMARY_CARD_LINES, TRANSCRIPT_RAIL, USER_GLYPH,
+    ASSISTANT_GLYPH, FOREGROUND_SHELL_WAIT_HINT, TOOL_COMMAND_LINE_LIMIT, TOOL_DONE_SYMBOL,
+    TOOL_FAILED_SYMBOL, TOOL_FAILURE_PREVIEW_LINES, TOOL_HEADER_SUMMARY_LIMIT,
+    TOOL_OUTPUT_LINE_LIMIT, TOOL_SUCCESS_OUTPUT_PREVIEW_LINES, TOOL_SUMMARY_CARD_LINES,
+    TRANSCRIPT_RAIL, USER_GLYPH,
 };
 #[cfg(test)]
 use constants::{TOOL_RUNNING_SYMBOLS, TOOL_STATUS_SYMBOL_MS};
@@ -246,15 +247,6 @@ pub struct TranscriptRenderOptions {
     /// the elevated-surface background; every older prompt renders on the
     /// bare ground, so the eye lands on the turn in play.
     pub(crate) newest_user_turn: bool,
-    /// Extra raw reasoning body rows available to the newest transcript cell.
-    /// The transcript cache derives this from genuinely unused viewport rows;
-    /// non-layout-aware renderers and historical cells retain the compact
-    /// 10/12-row fallback.
-    pub(crate) reasoning_preview_extra_lines: usize,
-    /// Live transcript height used by the cache to derive the extra rows
-    /// above. Kept separate from the render-level budget so cached geometry is
-    /// stable and explicit reasoning summaries retain their four-row cap.
-    pub(crate) reasoning_preview_viewport_lines: Option<usize>,
 }
 
 impl Default for TranscriptRenderOptions {
@@ -276,8 +268,6 @@ impl Default for TranscriptRenderOptions {
             spacing: TranscriptSpacing::Comfortable,
             palette_mode: palette::PaletteMode::detect(),
             prose_measure: None,
-            reasoning_preview_extra_lines: 0,
-            reasoning_preview_viewport_lines: None,
         }
     }
 }
@@ -481,9 +471,13 @@ impl HistoryCell {
                     *duration_secs,
                     collapsed,
                     options.low_motion,
-                    options.thinking_highlight,
-                    options.reasoning_preview_extra_lines,
-                    options.thinking_preview_lines,
+                    options.thinking_highlight && !options.calm_mode,
+                    options.locale,
+                    if options.calm_mode {
+                        0
+                    } else {
+                        options.thinking_preview_lines
+                    },
                 );
                 reasoning_action = expandable.then_some(if collapsed {
                     ReasoningAction::Expand
@@ -498,23 +492,13 @@ impl HistoryCell {
                 RenderMode::Live,
                 options.inline_diff_mode,
             ),
-            HistoryCell::Tool(cell) if !options.show_tool_details && !cell.is_failed() => {
+            HistoryCell::Tool(cell)
+                if (!options.show_tool_details || options.calm_mode) && !cell.is_failed() =>
+            {
                 let mut lines =
                     cell.lines_with_motion_and_locale(width, options.low_motion, options.locale);
                 if lines.len() > TOOL_SUMMARY_CARD_LINES {
-                    lines.truncate(TOOL_SUMMARY_CARD_LINES);
-                    lines.push(details_affordance_line(
-                        &crate::tui::key_shortcuts::tool_details_shortcut_action_hint("details"),
-                        Style::default().fg(palette::TEXT_MUTED).italic(),
-                    ));
-                }
-                lines
-            }
-            HistoryCell::Tool(cell) if options.calm_mode && !cell.is_failed() => {
-                let mut lines =
-                    cell.lines_with_motion_and_locale(width, options.low_motion, options.locale);
-                if lines.len() > TOOL_CARD_SUMMARY_LINES {
-                    lines.truncate(TOOL_CARD_SUMMARY_LINES);
+                    lines.truncate(TOOL_SUMMARY_CARD_LINES.saturating_sub(1));
                     lines.push(details_affordance_line(
                         &crate::tui::key_shortcuts::tool_details_shortcut_action_hint("details"),
                         Style::default().fg(palette::TEXT_MUTED).italic(),
@@ -1609,12 +1593,6 @@ impl McpToolCell {
             None,
             low_motion,
         ));
-        lines.extend(render_compact_kv(
-            "name",
-            &self.tool,
-            tool_value_style(),
-            width,
-        ));
 
         if self.is_image {
             lines.extend(render_compact_kv(
@@ -1633,7 +1611,11 @@ impl McpToolCell {
             lines.extend(render_tool_output_mode(
                 content,
                 width,
-                TOOL_COMMAND_LINE_LIMIT,
+                if self.status == ToolStatus::Failed {
+                    TOOL_FAILURE_PREVIEW_LINES
+                } else {
+                    TOOL_COMMAND_LINE_LIMIT
+                },
                 mode,
             ));
         }
@@ -1942,8 +1924,12 @@ impl GenericToolCell {
                     low_motion,
                 ));
                 if matches!(mode, RenderMode::Live) {
-                    let rendered =
-                        diff_render::render_diff_bounded(output, width, TOOL_OUTPUT_LINE_LIMIT);
+                    let limit = if self.status == ToolStatus::Failed {
+                        TOOL_FAILURE_PREVIEW_LINES
+                    } else {
+                        TOOL_OUTPUT_LINE_LIMIT
+                    };
+                    let rendered = diff_render::render_diff_bounded(output, width, limit);
                     lines.extend(rendered.lines);
                     if rendered.omitted_rows > 0 {
                         let detail_hint =
@@ -1959,18 +1945,12 @@ impl GenericToolCell {
                     lines.extend(diff_render::render_diff(output, width));
                 }
             } else {
-                let output_mode =
-                    if matches!(mode, RenderMode::Live) && self.status == ToolStatus::Failed {
-                        RenderMode::Transcript
-                    } else {
-                        mode
-                    };
-                lines.extend(render_tool_output_mode(
-                    output,
-                    width,
-                    TOOL_OUTPUT_LINE_LIMIT,
-                    output_mode,
-                ));
+                let limit = if self.status == ToolStatus::Failed {
+                    TOOL_FAILURE_PREVIEW_LINES
+                } else {
+                    TOOL_OUTPUT_LINE_LIMIT
+                };
+                lines.extend(render_tool_output_mode(output, width, limit, mode));
             }
 
             if matches!(mode, RenderMode::Live) && self.spillover_path.is_some() {
@@ -2743,7 +2723,7 @@ fn render_tool_header_with_family_and_summary(
             glyph_style,
         ),
         Span::styled(format!("{glyph} "), glyph_style),
-        Span::styled(verb.to_string(), tool_title_style()),
+        Span::styled(verb.to_string(), tool_title_style(status)),
         Span::styled(" ", Style::default()),
         Span::styled(state_owned, tool_status_style(status, family)),
     ];
@@ -2924,10 +2904,14 @@ fn render_card_detail_line_single(
 // regardless of the selected theme, as every other cell in this file does by
 // reading the same `palette` constants directly.
 
-fn tool_title_style() -> Style {
-    Style::default()
-        .fg(palette::TEXT_SOFT)
-        .add_modifier(Modifier::BOLD)
+fn tool_title_style(status: ToolStatus) -> Style {
+    if status == ToolStatus::Success {
+        Style::default().fg(palette::TEXT_MUTED)
+    } else {
+        Style::default()
+            .fg(palette::TEXT_SOFT)
+            .add_modifier(Modifier::BOLD)
+    }
 }
 
 /// Right-side status text ("running", "done", "issue"). Reads as the glyph it
@@ -2953,10 +2937,8 @@ fn tool_detail_label_style() -> Style {
 /// stalled "tool loaded — retry required", not live work, so it takes the hint
 /// colour instead of borrowing the running accent and reading as in-flight.
 ///
-/// Deliberately *not* the same function as [`tool_glyph_color`]: the border
-/// reports lifecycle, the glyph reports identity. They agree wherever it
-/// matters — running, warning and failure are the same ink in both, so the two
-/// can never disagree about trouble.
+/// The glyph and status word use the same lifecycle ink; the glyph shape
+/// preserves the tool's identity after its successful result settles.
 fn tool_rail_color(status: ToolStatus) -> Color {
     match status {
         ToolStatus::Running => palette::WHALE_ACTION,
@@ -2967,35 +2949,12 @@ fn tool_rail_color(status: ToolStatus) -> Color {
     }
 }
 
-/// Colour of a tool cell's **status glyph** and the state word beside it.
-///
-/// Follows the accepted mockup (`tideline-mockups/tideline-01`) rather than
-/// the border rule: a finished verify row keeps its green `✓`, and a finished
-/// read or search keeps the family accent that identifies it — the blue
-/// magnifier in that mockup. A settled card therefore still says *what it was*
-/// even while its border has receded to muted.
-///
-/// Everything that needs attention reads identically to the rail.
+/// Settled success recedes; warning and failure retain their attention ink.
 fn tool_glyph_color(
     status: ToolStatus,
-    family: crate::tui::widgets::tool_card::ToolFamily,
+    _family: crate::tui::widgets::tool_card::ToolFamily,
 ) -> Color {
-    use crate::tui::widgets::tool_card::ToolFamily;
-    match status {
-        ToolStatus::Running => palette::WHALE_ACTION,
-        // Verified work earns Working Green; every other family keeps the
-        // action accent it wore while running, which is what makes a
-        // completed `read` row still read as a read.
-        ToolStatus::Success => match family {
-            ToolFamily::Verify => palette::STATUS_SUCCESS,
-            _ => palette::WHALE_ACTION,
-        },
-        // A hydrated cell has not succeeded at anything yet, so it never
-        // borrows the verified or family accent.
-        ToolStatus::Hydrated => palette::TEXT_DIM,
-        ToolStatus::Warning => palette::WHALE_HUMAN,
-        ToolStatus::Failed => palette::WHALE_ERROR,
-    }
+    tool_rail_color(status)
 }
 
 fn tool_status_label(status: ToolStatus) -> &'static str {

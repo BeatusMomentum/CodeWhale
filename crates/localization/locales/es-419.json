@@ -168,6 +168,8 @@
   "HistoryHintRestore": "Esc restaurar",
   "HistoryNoMatches": "  Sin resultados",
   "TranscriptReasoningExpand": "expandir",
+  "TranscriptThought": "Pensamiento terminado",
+  "TranscriptThoughtFor": "Pensó durante {duration}",
   "TelemetryNoticeDefaultOn": "Las estadísticas de uso están activadas de forma predeterminada. Compartir totales de versión, plataforma, sesiones, funciones y errores con Codewhale y su procesador PostHog. Sin contenido ni IP. docs/TELEMETRY.md Desactivar: codewhale config set telemetry false",
   "TelemetryNoticeHeadline": "Estadísticas de uso de Codewhale",
   "TelemetryNoticeBody": "Codewhale cuenta: la versión que ejecutas, el sistema operativo y la familia\nde CPU, la duración y el resultado de la sesión, y conteos agregados de\nfunciones y errores.\n\nNunca recopila tus conversaciones, código, prompts, archivos, nombres de\narchivos, repositorios o ramas, contenido del modelo ni credenciales — y nunca\nenvía una cronología de la actividad del agente por turno o herramienta.\n\nSolo te identifica un ID aleatorio almacenado en esta máquina, que se\nreemplaza cada 90 días. Cambia de opinión cuando quieras:\n                              codewhale config set telemetry false\n\nEsquema completo, campo por campo:  docs/TELEMETRY.md\n\nLas estadísticas de uso están activadas de forma predeterminada. Codewhale y PostHog procesan estos totales cuando el envío está configurado. No se recopilan IP.",

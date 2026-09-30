@@ -262,8 +262,7 @@ impl ChatWidget {
         let jump_border = app.ui_theme.border;
         let jump_arrow = app.ui_theme.status_working;
         let visible_lines = content_area.height as usize;
-        let mut render_options = app.transcript_render_options();
-        render_options.reasoning_preview_viewport_lines = Some(visible_lines);
+        let render_options = app.transcript_render_options();
 
         if render_empty_state {
             let lines = build_empty_state_lines(app, content_area);
@@ -773,7 +772,7 @@ fn tool_run_summary_cell(run: &ToolRun) -> HistoryCell {
         output: None,
         prompts: None,
         spillover_path: None,
-        output_summary: None,
+        output_summary: Some(format!("+{}", run.count)),
         is_diff: false,
     }))
 }
@@ -5403,6 +5402,22 @@ mod tests {
                 before,
                 after
             );
+        }
+    }
+
+    #[test]
+    fn calm1_collapsed_group_keeps_count_and_reveal_affordance() {
+        let mut app = create_test_app();
+        app.tool_collapse_mode = ToolCollapseMode::Compact;
+        app.tool_collapse_threshold = 3;
+        add_dense_tool_run(&mut app);
+        for width in [40, 60, 80, 140] {
+            let area = Rect::new(0, 0, width, 8);
+            let mut buf = Buffer::empty(area);
+            ChatWidget::new(&mut app, area).render(area, &mut buf);
+            let text = buffer_text(&buf, area);
+            assert!(text.contains("+3 ›"), "{text}");
+            assert_eq!(app.collapsed_cell_map, vec![0]);
         }
     }
 

@@ -168,6 +168,8 @@
   "HistoryHintRestore": "Esc 복원",
   "HistoryNoMatches": "  일치 항목 없음",
   "TranscriptReasoningExpand": "펼치기",
+  "TranscriptThought": "생각 완료",
+  "TranscriptThoughtFor": "{duration} 동안 생각함",
   "TelemetryNoticeDefaultOn": "사용 통계 보고는 기본적으로 켜져 있습니다. 버전·플랫폼·세션·기능·오류의 집계 수치를 Codewhale 및 처리업체 PostHog와 공유합니다. 콘텐츠나 IP는 수집하지 않습니다. docs/TELEMETRY.md 끄기: codewhale config set telemetry false",
   "TelemetryNoticeHeadline": "Codewhale 사용 통계",
   "TelemetryNoticeBody": "Codewhale이 집계하는 항목: 실행 중인 버전, 운영 체제와 CPU 계열, 세션\n시간과 결과, 기능 및 오류의 집계 수치입니다.\n\n대화, 코드, 프롬프트, 파일, 파일 이름, 저장소 또는 브랜치 이름, 모델\n내용이나 자격 증명은 절대 수집하지 않으며, 턴별 또는 도구별 에이전트 활동\n기록도 전송하지 않습니다.\n\n이 컴퓨터에 저장된 임의의 ID로만 식별되며, 90일마다 새 ID로 교체됩니다.\n언제든지 변경할 수 있습니다:\n                              codewhale config set telemetry false\n\n필드별 전체 스키마:  docs/TELEMETRY.md\n\n사용 통계 보고는 기본적으로 켜져 있습니다. 전송이 설정된 경우 Codewhale과 PostHog가 이 수치를 처리합니다. IP는 수집하지 않습니다.",

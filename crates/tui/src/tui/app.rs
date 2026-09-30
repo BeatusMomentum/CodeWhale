@@ -5989,8 +5989,6 @@ impl App {
             spacing: self.transcript_spacing,
             palette_mode: self.ui_theme.mode,
             prose_measure: self.prose_measure,
-            reasoning_preview_extra_lines: 0,
-            reasoning_preview_viewport_lines: None,
         }
     }
 

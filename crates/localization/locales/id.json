@@ -168,6 +168,8 @@
   "HistoryHintRestore": "Esc pulihkan",
   "HistoryNoMatches": "  Tidak ada hasil",
   "TranscriptReasoningExpand": "perluas",
+  "TranscriptThought": "Selesai berpikir",
+  "TranscriptThoughtFor": "Berpikir selama {duration}",
   "TelemetryNoticeDefaultOn": "Pelaporan penggunaan aktif secara bawaan. Bagikan total versi, platform, sesi, fitur, dan galat dengan Codewhale dan pemroses PostHog. Tanpa konten atau IP. docs/TELEMETRY.md Nonaktifkan: codewhale config set telemetry false",
   "TelemetryNoticeHeadline": "Pelaporan penggunaan Codewhale",
   "TelemetryNoticeBody": "Codewhale menghitung: versi yang dijalankan, sistem operasi dan keluarga CPU,\ndurasi dan hasil sesi, serta hitungan agregat fitur dan galat.\n\nIa tidak pernah mengumpulkan percakapan, kode, prompt, berkas, nama berkas,\nrepositori atau cabang, konten model, maupun kredensial Anda — dan tidak pernah\nmengirim linimasa aktivitas agen per giliran atau per alat.\n\nAnda hanya dikenali melalui ID acak yang disimpan di mesin ini, diganti setiap\n90 hari. Ubah keputusan kapan saja:\n                              codewhale config set telemetry false\n\nSkema lengkap, per bidang:  docs/TELEMETRY.md\n\nPelaporan penggunaan aktif secara bawaan. Codewhale dan PostHog memproses hitungan ini jika pengiriman dikonfigurasi. IP tidak dikumpulkan.",

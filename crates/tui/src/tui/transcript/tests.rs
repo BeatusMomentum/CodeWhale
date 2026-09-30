@@ -1685,9 +1685,7 @@ fn reasoning_target_transfer_rewrites_same_revision_cells() {
         .iter()
         .zip(cache.line_meta())
         .enumerate()
-        .find(|(_, (_, meta))| {
-            meta.cell_line() == Some((1, cache.per_cell[1].lines.len().saturating_sub(1)))
-        })
+        .find(|(_, (_, meta))| meta.cell_line() == Some((1, 0)))
         .map(|(index, (line, meta))| (index, line, meta))
         .expect("untargeted neutral affordance");
     assert_eq!(
@@ -1757,7 +1755,7 @@ fn retargeting_a_long_transcript_repaints_only_the_hint_rows() {
     };
     let mut cache = TranscriptViewCache::new();
     ensure(&mut cache, 0);
-    assert!(cache.total_lines() > 800, "{}", cache.total_lines());
+    assert!(cache.total_lines() > 600, "{}", cache.total_lines());
 
     // Scroll-frame path: `retarget` after layout.
     for owner in [2, 100, 198, 0] {
@@ -1794,58 +1792,6 @@ fn retargeting_a_long_transcript_repaints_only_the_hint_rows() {
     assert!(!plain_lines(&cache).join("\n").contains("Space:expand"));
 }
 
-/// Composer growth, toasts, and turn chrome change the viewport height. That
-/// height only sizes the newest reasoning preview, so a long history must
-/// not re-render and re-flatten on each change (#6652).
-#[test]
-fn viewport_height_change_rebuilds_only_the_newest_cell() {
-    let (cells, revisions) = long_reasoning_transcript(100);
-    let ensure = |cache: &mut TranscriptViewCache, cells: &[HistoryCell], viewport: usize| {
-        let revisions = vec![1; cells.len()];
-        cache.ensure_split(
-            &[cells],
-            &revisions,
-            80,
-            TranscriptRenderOptions {
-                reasoning_preview_viewport_lines: Some(viewport),
-                ..TranscriptRenderOptions::default()
-            },
-            &HashMap::new(),
-            None,
-            Some(reasoning_owner(0)),
-        );
-    };
-    assert_eq!(revisions.len(), cells.len());
-    let mut cache = TranscriptViewCache::new();
-    ensure(&mut cache, &cells, 30);
-    let total = cache.total_lines();
-    assert!(total > 800, "{total}");
-
-    for viewport in [31, 24, 40, 30] {
-        let before = cache.streaming_lines_reflattened();
-        ensure(&mut cache, &cells, viewport);
-        let rows = cache.streaming_lines_reflattened() - before;
-        assert!(
-            rows < 40,
-            "viewport {viewport} re-flattened {rows} of {total} rows"
-        );
-        let mut cold = TranscriptViewCache::new();
-        ensure(&mut cold, &cells, viewport);
-        assert_same_flat_output(&cache, &cold);
-    }
-
-    // A short transcript whose newest reasoning cell grows into free rows
-    // must still track the height through the warm cache.
-    let short = vec![reasoning_cell(false), reasoning_cell(false)];
-    let mut warm = TranscriptViewCache::new();
-    for viewport in [18, 34, 18, 26] {
-        ensure(&mut warm, &short, viewport);
-        let mut cold = TranscriptViewCache::new();
-        ensure(&mut cold, &short, viewport);
-        assert_same_flat_output(&warm, &cold);
-    }
-}
-
 /// While a reply streams its cell is dirty every frame. Scrolling in that
 /// state must still repaint only the hint rows plus the streamed tail, not
 /// re-flatten everything below the old owner (#6652).
@@ -1876,7 +1822,7 @@ fn retargeting_while_streaming_repaints_only_hint_rows_and_tail() {
     };
     let mut cache = TranscriptViewCache::new();
     ensure(&mut cache, &cells, &revisions, 0);
-    assert!(cache.total_lines() > 800, "{}", cache.total_lines());
+    assert!(cache.total_lines() > 600, "{}", cache.total_lines());
 
     for (frame, owner) in [2, 100, 198, streaming - 1, 0, 4].into_iter().enumerate() {
         let previous = revisions[streaming];
@@ -1946,7 +1892,7 @@ fn retargeting_a_filtered_transcript_with_hidden_cells_repaints_in_place() {
     let mut cache = TranscriptViewCache::new();
     ensure(&mut cache, 0);
     assert!(cache.per_cell.iter().any(|cell| cell.is_empty));
-    assert!(cache.total_lines() > 800, "{}", cache.total_lines());
+    assert!(cache.total_lines() > 600, "{}", cache.total_lines());
 
     // Original indices: 2 and 7 sit after a hidden cell, 397 is the last
     // reasoning cell, and 1 is the hidden cell itself (no hint).
@@ -2007,93 +1953,6 @@ fn bench_retarget_scroll_over_long_transcript() {
         elapsed / frames as u32,
         cache.streaming_lines_reflattened() - before
     );
-}
-
-#[test]
-fn layout_aware_reasoning_budget_applies_only_to_the_newest_cell() {
-    let cells = vec![reasoning_cell(false), reasoning_cell(false)];
-    let revisions = [1, 1];
-    let mut cache = TranscriptViewCache::new();
-    let constrained = TranscriptRenderOptions {
-        reasoning_preview_viewport_lines: Some(18),
-        ..TranscriptRenderOptions::default()
-    };
-    cache.ensure_split(
-        &[&cells],
-        &revisions,
-        80,
-        constrained,
-        &HashMap::new(),
-        None,
-        Some(reasoning_owner(1)),
-    );
-
-    let first = cache.per_cell[0]
-        .lines
-        .iter()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>()
-        .join("\n");
-    let newest = cache.per_cell[1]
-        .lines
-        .iter()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert!(!first.contains("reasoning line 20"), "{first}");
-    assert!(newest.contains("reasoning line 12"), "{newest}");
-    assert!(!newest.contains("reasoning line 13"), "{newest}");
-    assert_eq!(cache.total_lines(), 18);
-    assert!(cache.per_cell[0].reasoning_action.is_some());
-    assert!(cache.per_cell[1].reasoning_action.is_some());
-
-    let roomy = TranscriptRenderOptions {
-        reasoning_preview_viewport_lines: Some(34),
-        ..TranscriptRenderOptions::default()
-    };
-    cache.ensure_split(
-        &[&cells],
-        &revisions,
-        80,
-        roomy,
-        &HashMap::new(),
-        None,
-        Some(reasoning_owner(1)),
-    );
-    let newest = cache.per_cell[1]
-        .lines
-        .iter()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert!(newest.contains("reasoning line 20"), "{newest}");
-    assert!(cache.total_lines() <= 34);
-    assert!(cache.per_cell[1].reasoning_action.is_none());
-
-    // Appending a non-reasoning cell removes the adaptive treatment from the
-    // old tail even though its revision did not change.
-    let extended = vec![
-        reasoning_cell(false),
-        reasoning_cell(false),
-        assistant_cell("answer", false),
-    ];
-    cache.ensure_split(
-        &[&extended],
-        &[1, 1, 1],
-        80,
-        roomy,
-        &HashMap::new(),
-        None,
-        Some(reasoning_owner(2)),
-    );
-    let former_tail = cache.per_cell[1]
-        .lines
-        .iter()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert!(!former_tail.contains("reasoning line 20"), "{former_tail}");
-    assert!(cache.per_cell[1].reasoning_action.is_some());
 }
 
 #[test]
@@ -2171,7 +2030,7 @@ fn streaming_tail_fast_path_cannot_skip_reasoning_retarget() {
 #[test]
 fn narrow_reasoning_hint_never_changes_cache_geometry() {
     let cells = [reasoning_cell(false)];
-    for width in 1..=16 {
+    for width in 1..=40 {
         let mut cache = TranscriptViewCache::new();
         cache.ensure_split(
             &[&cells],
@@ -2193,19 +2052,12 @@ fn narrow_reasoning_hint_never_changes_cache_geometry() {
             Some(reasoning_owner(0)),
         );
         assert_eq!(cache.total_lines(), neutral_lines, "width {width}");
-        let affordance_line = cache
-            .lines()
-            .iter()
-            .zip(cache.line_meta())
-            .find(|(_, meta)| {
-                meta.cell_line() == Some((0, cache.per_cell[0].lines.len().saturating_sub(1)))
-            })
-            .map(|(line, _)| line.to_string())
-            .expect("reasoning affordance line");
-        if width >= 14 {
-            assert_eq!(affordance_line, "╎ Space:expand", "width {width}");
-        } else {
-            assert_eq!(affordance_line, "╎ …", "width {width}");
+        // The terminal clips an overlong neutral header. Adding a hint must
+        // never add a row or advertise a chord that cannot fit alongside it.
+        if width == 40 {
+            assert!(plain_lines(&cache).join("\n").contains("Space:expand"));
+        }
+        if width < 14 {
             assert!(!plain_lines(&cache).join("\n").contains("Space:"));
         }
     }
@@ -2316,10 +2168,7 @@ fn measure_calm_rows_per_turn() {
         },
     ];
     let mut cache = TranscriptViewCache::new();
-    let live_options = TranscriptRenderOptions {
-        reasoning_preview_viewport_lines: Some(40),
-        ..shipped
-    };
+    let live_options = shipped;
     cache.ensure_split(
         &[&live],
         &[1, 1],
@@ -2330,34 +2179,33 @@ fn measure_calm_rows_per_turn() {
         None,
     );
     eprintln!(
-        "calm-rows streaming thinking cell at viewport 40: {}",
+        "calm-rows streaming thinking cell (height-independent): {}",
         cache.per_cell[1].lines.len()
     );
 }
 
 #[test]
-fn g3_height_change_keeps_even_a_long_final_answer_cached() {
-    let cells = [
-        user_cell("question"),
-        assistant_cell(&"long answer\n".repeat(1_000), false),
-    ];
+fn calm1_reasoning_header_hint_keeps_the_entire_live_tail_copyable() {
+    let cells = [reasoning_cell(true)];
     let mut cache = TranscriptViewCache::new();
-    let mut options = TranscriptRenderOptions {
-        reasoning_preview_viewport_lines: Some(20),
+    let options = TranscriptRenderOptions {
+        calm_mode: true,
+        low_motion: true,
         ..Default::default()
     };
-    cache.ensure(&cells, &[1, 2], 80, options);
-    let before: Vec<_> = cache
-        .per_cell
-        .iter()
-        .map(|cell| Arc::clone(&cell.lines))
-        .collect();
-    options.reasoning_preview_viewport_lines = Some(40);
-    cache.ensure(&cells, &[1, 2], 80, options);
-    assert!(
-        before
-            .iter()
-            .zip(&cache.per_cell)
-            .all(|(lines, cell)| Arc::ptr_eq(lines, &cell.lines))
+    cache.ensure_split(
+        &[&cells],
+        &[1],
+        80,
+        options,
+        &HashMap::new(),
+        None,
+        Some(reasoning_owner(0)),
     );
+    assert_eq!(cache.total_lines(), 4);
+    assert!(cache.lines()[0].to_string().contains("Space:expand"));
+    assert!(cache.lines()[3].to_string().contains("reasoning line 20"));
+    for index in 1..4 {
+        assert!(cache.line_meta()[index].copy_prefix_width() < cache.lines()[index].width());
+    }
 }
