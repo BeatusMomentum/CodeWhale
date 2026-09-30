@@ -27,15 +27,20 @@
 //! Known limits, stated so nobody assumes them: the harness pins what the
 //! Rust side does today, including the one behavior an audit slice is
 //! changing (see `events/provider_error_after_tool_call.case.json`); it runs
-//! no real provider, MCP server binary, or Node host; hook fixtures are POSIX
-//! shell and run on Unix only.
+//! no real provider, MCP server binary, or Node host. The `events`, `prompt`
+//! and `hooks` goldens were recorded on Unix and are compiled only there:
+//! hook fixtures are POSIX shell, and a Windows turn differs in shell and
+//! path facts that no recorded golden covers yet. `sse` and `mcp` run
+//! everywhere.
 #![cfg(test)]
 
+#[cfg(unix)]
 mod events;
 mod golden;
 #[cfg(unix)]
 mod hooks;
 mod mcp;
+#[cfg(unix)]
 mod prompt;
 mod sse;
 mod stream_json;

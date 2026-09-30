@@ -23,8 +23,8 @@ use std::collections::BTreeMap;
 
 use serde_json::{Value, json};
 
-use super::events::{Sandbox, run_scripted_turn};
-use super::golden::{self, Failures};
+use super::events::run_scripted_turn;
+use super::golden::{self, Failures, Sandbox};
 
 const FAMILY: &str = "prompt";
 

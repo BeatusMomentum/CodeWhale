@@ -5,11 +5,10 @@
   "auto_approve": false,
   "allow_shell": true,
   "workspace_files": {
-    "README.md": "conformance fixture\n",
-    "build/keep.txt": "must survive\n"
+    "README.md": "conformance fixture\n"
   },
-  "description": "A shell call that needs approval under `suggest`; the host denies it. The command never runs, the model sees the denial as the tool result, and the turn continues.",
-  "user_message": "Delete the build directory.",
+  "description": "A mutating shell call that needs approval under `suggest`; the host denies it. The command never runs, the model sees the denial as the tool result, and the turn continues to a final answer.",
+  "user_message": "Create denied.txt with touch.",
   "provider_script": [
     {
       "events": [
@@ -34,7 +33,7 @@
           "index": 0,
           "content_block": {
             "type": "tool_use",
-            "id": "call_rm_build",
+            "id": "call_touch",
             "name": "Bash",
             "input": {}
           }
@@ -44,7 +43,7 @@
           "index": 0,
           "delta": {
             "type": "input_json_delta",
-            "partial_json": "{\"command\":\"rm -rf build\"}"
+            "partial_json": "{\"command\":\"touch denied.txt\"}"
           }
         },
         {
@@ -97,7 +96,7 @@
           "index": 0,
           "delta": {
             "type": "text_delta",
-            "text": "Understood, I left the build directory alone."
+            "text": "Understood, I did not create it."
           }
         },
         {
@@ -130,7 +129,7 @@
   ],
   "invariants": [
     {
-      "workspace_file_present": "build/keep.txt"
+      "workspace_file_absent": "denied.txt"
     },
     {
       "max_model_requests": 2

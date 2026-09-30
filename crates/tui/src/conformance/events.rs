@@ -29,7 +29,7 @@ use codewhale_execpolicy::ApprovalMode;
 use codewhale_models::{MessageRequest, MessageResponse, StreamEvent};
 use codewhale_protocol::ids::{SessionId, ThreadId};
 
-use super::golden::{self, Failures, Masker};
+use super::golden::{self, Failures, Masker, Sandbox};
 use super::stream_json;
 use crate::compaction::CompactionConfig;
 use crate::config::Config;
@@ -38,7 +38,6 @@ use crate::core::events::Event;
 use crate::core::ops::{Op, TurnSpec, UserInputProvenance};
 use crate::core::protocol_parity::{ProtocolIds, event_to_protocol};
 use crate::llm_client::{LlmClient, StreamEventBox};
-use crate::test_support::{EnvVarGuard, lock_test_env};
 
 const FAMILY: &str = "events";
 pub(super) const PREFIX_OWNED_BY_PROMPT_FAMILY: &str = "<pinned by the prompt family>";
@@ -224,22 +223,6 @@ pub(super) fn send_message_op(case: &Value, config: &Config) -> Op {
     })
 }
 
-pub(super) fn write_workspace(workspace: &Path, case: &Value) {
-    if let Some(files) = case.get("workspace_files").and_then(Value::as_object) {
-        for (relative, content) in files {
-            let path = workspace.join(relative);
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent).expect("create fixture dir");
-            }
-            std::fs::write(
-                &path,
-                content.as_str().expect("workspace file content is text"),
-            )
-            .expect("write fixture file");
-        }
-    }
-}
-
 /// Relative path → sha256 prefix for every file left in the workspace.
 fn workspace_listing(workspace: &Path) -> BTreeMap<String, String> {
     fn walk(root: &Path, dir: &Path, out: &mut BTreeMap<String, String>) {
@@ -269,58 +252,6 @@ fn workspace_listing(workspace: &Path) -> BTreeMap<String, String> {
 pub(super) struct TurnRecord {
     pub(super) events: Vec<Event>,
     pub(super) timed_out: bool,
-}
-
-/// A hermetic home + workspace for one engine turn. Holds the process test
-/// env lock for its lifetime; field order is drop order (guards restore the
-/// environment before the lock is released).
-pub(super) struct Sandbox {
-    _guards: Vec<EnvVarGuard>,
-    _lock: crate::test_support::TestEnvLock,
-    pub(super) home: std::path::PathBuf,
-    pub(super) workspace: std::path::PathBuf,
-    root: tempfile::TempDir,
-}
-
-impl Sandbox {
-    pub(super) fn new(case: &Value) -> Self {
-        let lock = lock_test_env();
-        let root = tempfile::tempdir().expect("tempdir");
-        let home = root.path().join("home");
-        let workspace = root.path().join("workspace");
-        std::fs::create_dir_all(&home).expect("home");
-        std::fs::create_dir_all(&workspace).expect("workspace");
-        let guards = vec![
-            EnvVarGuard::set("HOME", &home),
-            EnvVarGuard::set("USERPROFILE", &home),
-            EnvVarGuard::set("CODEWHALE_HOME", home.join(".codewhale")),
-            // Model-visible host facts that would otherwise follow the
-            // developer's shell and locale.
-            EnvVarGuard::set("SHELL", "/bin/bash"),
-            EnvVarGuard::set("LC_ALL", "en_US.UTF-8"),
-            EnvVarGuard::set("LANG", "en_US.UTF-8"),
-            EnvVarGuard::remove("LC_MESSAGES"),
-        ];
-        write_workspace(&workspace, case);
-        if case["trusted_workspace"].as_bool() == Some(true) {
-            // Repository instructions, commands and skills load only here.
-            crate::test_support::trust_workspace(&workspace);
-        }
-        Self {
-            _guards: guards,
-            _lock: lock,
-            home,
-            workspace,
-            root,
-        }
-    }
-
-    pub(super) fn masker(&self, volatile_keys: &'static [&'static str]) -> Masker {
-        Masker::new(volatile_keys)
-            .path(&self.workspace, "<WORKSPACE>")
-            .path(&self.home, "<HOME>")
-            .path(self.root.path(), "<TMP>")
-    }
 }
 
 /// Drive one scripted turn inside `sandbox` on a fresh current-thread

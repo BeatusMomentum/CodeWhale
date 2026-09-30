@@ -29,8 +29,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{Mutex as AsyncMutex, Notify, mpsc};
 use tokio_util::sync::CancellationToken;
 
-use super::events::Sandbox;
-use super::golden::{self, Failures};
+use super::golden::{self, Failures, Sandbox};
 use crate::core::engine::Engine;
 use crate::core::events::Event;
 use crate::mcp::{McpConfig, McpPool};

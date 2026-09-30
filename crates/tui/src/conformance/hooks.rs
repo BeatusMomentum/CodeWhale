@@ -21,8 +21,7 @@ use serde_json::{Value, json};
 
 use codewhale_config::AppMode;
 
-use super::events::Sandbox;
-use super::golden::{self, Failures};
+use super::golden::{self, Failures, Sandbox};
 use crate::hooks::{HookContext, HookEvent, HookExecutor, HooksConfig};
 use crate::tools::spec::{ToolError, ToolResult};
 

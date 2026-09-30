@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
+use crate::test_support::{EnvVarGuard, TestEnvLock, lock_test_env};
 use crate::tools::spec::ToolError;
 
 /// `CODEWHALE_CONFORMANCE_UPDATE=1` rewrites goldens from the current source.
@@ -164,7 +165,7 @@ pub(super) fn pretty(value: &Value) -> String {
 ///   including their canonicalized spellings (`/private/var` on macOS);
 /// - UUIDs → `<uuid:N>`, numbered by first appearance so that two events
 ///   naming the same id still visibly agree;
-/// - RFC 3339 timestamps → `<timestamp>`;
+/// - RFC 3339 timestamps → `<timestamp>` (applied first);
 /// - values of the named volatile keys (durations, clocks) → `"<masked>"`.
 pub(super) struct Masker {
     literals: Vec<(String, String)>,
@@ -220,15 +221,18 @@ impl Masker {
     }
 
     pub(super) fn text(&mut self, text: &str) -> String {
-        let mut out = text.to_string();
+        // Timestamps first: a literal (today's date, say) must not split one.
+        let mut out = self
+            .timestamp_re
+            .replace_all(text, "<timestamp>")
+            .into_owned();
         for (literal, label) in &self.literals {
             if out.contains(literal.as_str()) {
                 out = out.replace(literal.as_str(), label);
             }
         }
         let uuids = &mut self.uuids;
-        let out = self
-            .uuid_re
+        self.uuid_re
             .replace_all(&out, |captures: &regex::Captures<'_>| {
                 let raw = captures[0].to_ascii_lowercase();
                 let next = uuids.len() + 1;
@@ -237,9 +241,6 @@ impl Masker {
                     .or_insert_with(|| format!("<uuid:{next}>"))
                     .clone()
             })
-            .into_owned();
-        self.timestamp_re
-            .replace_all(&out, "<timestamp>")
             .into_owned()
     }
 
@@ -277,6 +278,77 @@ pub(super) fn tool_error_kind(error: &ToolError) -> &'static str {
         ToolError::Cancelled { .. } => "cancelled",
         ToolError::NotAvailable { .. } => "not_available",
         ToolError::PermissionDenied { .. } => "permission_denied",
+    }
+}
+
+/// A hermetic home + workspace for one case. Holds the process test
+/// env lock for its lifetime; field order is drop order (guards restore the
+/// environment before the lock is released).
+pub(super) struct Sandbox {
+    _guards: Vec<EnvVarGuard>,
+    _lock: TestEnvLock,
+    pub(super) home: std::path::PathBuf,
+    pub(super) workspace: std::path::PathBuf,
+    root: tempfile::TempDir,
+}
+
+impl Sandbox {
+    pub(super) fn new(case: &Value) -> Self {
+        let lock = lock_test_env();
+        let root = tempfile::tempdir().expect("tempdir");
+        let home = root.path().join("home");
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir_all(&home).expect("home");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let guards = vec![
+            EnvVarGuard::set("HOME", &home),
+            EnvVarGuard::set("USERPROFILE", &home),
+            EnvVarGuard::set("CODEWHALE_HOME", home.join(".codewhale")),
+            // Model-visible host facts that would otherwise follow the
+            // developer's shell and locale.
+            EnvVarGuard::set("SHELL", "/bin/bash"),
+            EnvVarGuard::set("LC_ALL", "en_US.UTF-8"),
+            EnvVarGuard::set("LANG", "en_US.UTF-8"),
+            EnvVarGuard::remove("LC_MESSAGES"),
+        ];
+        write_workspace(&workspace, case);
+        if case["trusted_workspace"].as_bool() == Some(true) {
+            // Repository instructions, commands and skills load only here.
+            crate::test_support::trust_workspace(&workspace);
+        }
+        Self {
+            _guards: guards,
+            _lock: lock,
+            home,
+            workspace,
+            root,
+        }
+    }
+
+    pub(super) fn masker(&self, volatile_keys: &'static [&'static str]) -> Masker {
+        // `<turn_meta>` states the local date; it is a clock, not a contract.
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        Masker::new(volatile_keys)
+            .path(&self.workspace, "<WORKSPACE>")
+            .path(&self.home, "<HOME>")
+            .path(self.root.path(), "<TMP>")
+            .literal(&today, "<today>")
+    }
+}
+
+pub(super) fn write_workspace(workspace: &Path, case: &Value) {
+    if let Some(files) = case.get("workspace_files").and_then(Value::as_object) {
+        for (relative, content) in files {
+            let path = workspace.join(relative);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).expect("create fixture dir");
+            }
+            std::fs::write(
+                &path,
+                content.as_str().expect("workspace file content is text"),
+            )
+            .expect("write fixture file");
+        }
     }
 }
 
