@@ -860,7 +860,9 @@ pub(crate) async fn run_exec_agent(
                     )
                 );
             }
-            Event::ToolCallStarted { id, name, input } => {
+            Event::ToolCallStarted {
+                id, name, input, ..
+            } => {
                 let started_at = chrono::Utc::now().to_rfc3339();
                 tool_starts.insert(id.clone(), (Instant::now(), started_at.clone()));
                 if output_format == ExecOutputFormat::StreamJson {

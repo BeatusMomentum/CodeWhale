@@ -1,5 +1,7 @@
 # Environment-specific caveats
 
+> 阅读简体中文版：[zh_hans/ENVIRONMENTS.md](zh_hans/ENVIRONMENTS.md)。
+
 Standard build/test/run commands live in `AGENTS.md` and `CONTRIBUTING.md`.
 This file records only the non-obvious quirks of particular environments, so
 they do not cost context on machines that will never hit them.

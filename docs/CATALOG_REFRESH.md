@@ -1,5 +1,7 @@
 # Catalog refresh
 
+> 阅读简体中文版：[zh_hans/CATALOG_REFRESH.md](zh_hans/CATALOG_REFRESH.md)。
+
 How Codewhale keeps model metadata current — what already auto-updates, what
 is hand-maintained, and what a scheduled catalog job should (and should not) do.
 
@@ -191,8 +193,9 @@ hand: CI runs `seed render --check` and fails on any difference.
 
 The spec selects and maps; it cannot state a value that disagrees with
 upstream (unknown keys are refused). If an upstream value is wrong for a
-Codewhale route, add a correction instead: a seed-only hold would vanish on
-the first live refresh.
+Codewhale route, add a correction instead. Corrections apply to both the seed
+and live rows; a hold made only by hand-editing the seed would vanish on the
+first live refresh.
 
 1. `python3 scripts/catalog_models_dev.py seed lock --dry-run` prints the
    review report: field changes per row, corrections that upstream now
@@ -205,8 +208,8 @@ the first live refresh.
 5. Check that default wire IDs still match `DEFAULT_*_MODEL`, run the
    catalog tests, and open a PR with the report in its body.
 
-Optional: use a cheap model **on the PR** to summarize “new / removed /
-default-risk” — never as the author of the JSON.
+Optional: use a cheap model to summarize “new / removed / default-risk” in
+the PR body — never as the author of the JSON.
 
 ---
 
@@ -223,7 +226,7 @@ cron (daily or weekly)
      (and optionally report new ids vs provider defaults)
   → if material change: open PR
        title: chore(catalog): refresh Models.dev offline seed
-  → optional: agent comments a human-readable diff summary on the PR
+  → optional: include an agent-written, human-readable diff summary in the PR body
 ```
 
 Such a job would run `seed lock` and `seed render` and open the PR. A PR

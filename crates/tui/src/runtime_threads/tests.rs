@@ -7787,6 +7787,7 @@ async fn seed_thread_keeps_tool_results_on_preceding_turn() -> Result<()> {
                     state: None,
                 },
                 ContentBlock::ToolUse {
+                    execution_id: None,
                     id: "tool-1".to_string(),
                     name: "shell".to_string(),
                     input: json!({ "cmd": "one" }),
@@ -7794,6 +7795,7 @@ async fn seed_thread_keeps_tool_results_on_preceding_turn() -> Result<()> {
                     thought_signature: None,
                 },
                 ContentBlock::ToolUse {
+                    execution_id: None,
                     id: "tool-2".to_string(),
                     name: "shell".to_string(),
                     input: json!({ "cmd": "two" }),
@@ -7805,6 +7807,7 @@ async fn seed_thread_keeps_tool_results_on_preceding_turn() -> Result<()> {
         Message {
             role: Role::User,
             content: vec![ContentBlock::ToolResult {
+                execution_id: None,
                 tool_use_id: "tool-1".to_string(),
                 content: "one".to_string(),
                 is_error: None,
@@ -7817,6 +7820,7 @@ async fn seed_thread_keeps_tool_results_on_preceding_turn() -> Result<()> {
         Message {
             role: Role::User,
             content: vec![ContentBlock::ToolResult {
+                execution_id: None,
                 tool_use_id: "tool-2".to_string(),
                 content: "two".to_string(),
                 is_error: Some(true),
@@ -7852,6 +7856,7 @@ async fn seed_thread_keeps_tool_results_on_preceding_turn() -> Result<()> {
             content,
             is_error,
             content_blocks,
+            ..
         } => {
             assert_eq!(tool_use_id, "tool-1");
             assert_eq!(content, "one");
@@ -7871,6 +7876,7 @@ async fn seed_thread_keeps_tool_results_on_preceding_turn() -> Result<()> {
             content,
             is_error,
             content_blocks,
+            ..
         } => {
             assert_eq!(tool_use_id, "tool-2");
             assert_eq!(content, "two");
@@ -7914,6 +7920,7 @@ async fn seeded_session_records_carry_a_total_order() -> Result<()> {
                     state: None,
                 },
                 ContentBlock::ToolUse {
+                    execution_id: None,
                     id: "tool-1".to_string(),
                     name: "shell".to_string(),
                     input: json!({ "cmd": "ls" }),
@@ -7925,6 +7932,7 @@ async fn seeded_session_records_carry_a_total_order() -> Result<()> {
         Message {
             role: Role::User,
             content: vec![ContentBlock::ToolResult {
+                execution_id: None,
                 tool_use_id: "tool-1".to_string(),
                 content: "listing".to_string(),
                 is_error: None,
@@ -9098,6 +9106,7 @@ async fn monitor_deduplicates_sink_and_metadata_and_persists_metadata_only_missi
         harness
             .tx_event
             .send(EngineEvent::ToolCallComplete {
+                model_call: None,
                 id: "tool-child-usage".to_string(),
                 name: "rlm".to_string(),
                 result: Ok(
@@ -9233,6 +9242,11 @@ async fn monitor_separates_lifecycle_start_from_billing_dispatch_and_child_usage
     harness
         .tx_event
         .send(EngineEvent::ToolCallStarted {
+            model_call: Some(crate::core::events::ModelToolCall {
+                provider_id: "tool-routed-coverage".to_string(),
+                caller: None,
+                thought_signature: None,
+            }),
             id: "tool-routed-coverage".to_string(),
             name: "rlm".to_string(),
             input: json!({"action": "eval"}),
@@ -9241,6 +9255,7 @@ async fn monitor_separates_lifecycle_start_from_billing_dispatch_and_child_usage
     harness
         .tx_event
         .send(EngineEvent::ToolCallComplete {
+            model_call: None,
             id: "tool-routed-coverage".to_string(),
             name: "rlm".to_string(),
             result: Ok(
@@ -18989,6 +19004,7 @@ async fn notices_raise_from_engine_events_and_clear_on_settle_or_ack() -> Result
     harness
         .tx_event
         .send(EngineEvent::ToolCallComplete {
+            model_call: None,
             id: "tool_notify_1".to_string(),
             name: "notify".to_string(),
             result: Ok(crate::tools::spec::ToolResult::success("pinged")),
@@ -19029,6 +19045,7 @@ async fn notices_raise_from_engine_events_and_clear_on_settle_or_ack() -> Result
     harness
         .tx_event
         .send(EngineEvent::ToolCallComplete {
+            model_call: None,
             id: "tool_needs_elev".to_string(),
             name: "exec_command".to_string(),
             result: Ok(crate::tools::spec::ToolResult::success("elevated ok")),
@@ -20000,6 +20017,11 @@ async fn engine_plumbing_items_are_tagged_internal_and_retry_hints_are_dropped()
     harness
         .tx_event
         .send(EngineEvent::ToolCallStarted {
+            model_call: Some(crate::core::events::ModelToolCall {
+                provider_id: "tool-search-1".to_string(),
+                caller: None,
+                thought_signature: None,
+            }),
             id: "tool-search-1".to_string(),
             name: "tool_search".to_string(),
             input: json!({"query": "skill"}),
@@ -20008,6 +20030,7 @@ async fn engine_plumbing_items_are_tagged_internal_and_retry_hints_are_dropped()
     harness
         .tx_event
         .send(EngineEvent::ToolCallComplete {
+            model_call: None,
             id: "tool-search-1".to_string(),
             name: "tool_search".to_string(),
             result: Ok(crate::tools::spec::ToolResult::success("found load_skill")),
@@ -20016,6 +20039,11 @@ async fn engine_plumbing_items_are_tagged_internal_and_retry_hints_are_dropped()
     harness
         .tx_event
         .send(EngineEvent::ToolCallStarted {
+            model_call: Some(crate::core::events::ModelToolCall {
+                provider_id: "hydrate-1".to_string(),
+                caller: None,
+                thought_signature: None,
+            }),
             id: "hydrate-1".to_string(),
             name: "load_skill".to_string(),
             input: json!({}),
@@ -20024,6 +20052,7 @@ async fn engine_plumbing_items_are_tagged_internal_and_retry_hints_are_dropped()
     harness
         .tx_event
         .send(EngineEvent::ToolCallComplete {
+            model_call: None,
             id: "hydrate-1".to_string(),
             name: "load_skill".to_string(),
             result: Ok(
@@ -20494,6 +20523,10 @@ fn a_lost_call_is_answered_only_where_its_own_outcome_is_known() {
         item
     };
     let none = HashSet::new();
+    let identity = |provider_id| RuntimeToolIdentity {
+        execution_id: None,
+        provider_id,
+    };
 
     // A failure keeps the text the tool reported, and falls back to the
     // item's summary when the record holds no detail of its own.
@@ -20503,7 +20536,7 @@ fn a_lost_call_is_answered_only_where_its_own_outcome_is_known() {
                 TurnItemLifecycleStatus::Failed,
                 Some("Failed to execute tool: boom")
             ),
-            "call-1",
+            identity("call-1"),
             "bash",
             &none
         ),
@@ -20512,7 +20545,7 @@ fn a_lost_call_is_answered_only_where_its_own_outcome_is_known() {
     assert_eq!(
         unanswered_call_result(
             &item(TurnItemLifecycleStatus::Failed, None),
-            "call-1",
+            identity("call-1"),
             "bash",
             &none
         ),
@@ -20526,7 +20559,7 @@ fn a_lost_call_is_answered_only_where_its_own_outcome_is_known() {
         TurnItemLifecycleStatus::Canceled,
     ] {
         assert_eq!(
-            unanswered_call_result(&item(status, None), "call-1", "bash", &none),
+            unanswered_call_result(&item(status, None), identity("call-1"), "bash", &none),
             Some(crate::tool_history_repair::CRASH_REPAIR_CONTENT.to_string()),
             "{status:?} is terminal: no result is coming"
         );
@@ -20542,7 +20575,7 @@ fn a_lost_call_is_answered_only_where_its_own_outcome_is_known() {
         TurnItemLifecycleStatus::Completed,
     ] {
         assert_eq!(
-            unanswered_call_result(&item(status, None), "call-1", "bash", &none),
+            unanswered_call_result(&item(status, None), identity("call-1"), "bash", &none),
             None,
             "{status:?} is not a lost outcome"
         );
@@ -20550,7 +20583,7 @@ fn a_lost_call_is_answered_only_where_its_own_outcome_is_known() {
     assert_eq!(
         unanswered_call_result(
             &item(TurnItemLifecycleStatus::Failed, None),
-            "call-1",
+            identity("call-1"),
             "",
             &none
         ),
@@ -20560,7 +20593,7 @@ fn a_lost_call_is_answered_only_where_its_own_outcome_is_known() {
     assert_eq!(
         unanswered_call_result(
             &item(TurnItemLifecycleStatus::Failed, None),
-            "",
+            identity(""),
             "bash",
             &none
         ),
@@ -20568,11 +20601,11 @@ fn a_lost_call_is_answered_only_where_its_own_outcome_is_known() {
     );
 
     // A result the turn records on its own item is that call's answer.
-    let recorded: HashSet<String> = ["call-1".to_string()].into_iter().collect();
+    let recorded = [identity("call-1").key()].into_iter().collect();
     assert_eq!(
         unanswered_call_result(
             &item(TurnItemLifecycleStatus::Failed, None),
-            "call-1",
+            identity("call-1"),
             "bash",
             &recorded
         ),
@@ -20645,6 +20678,11 @@ async fn runtime_receipts_mask_configured_secrets() -> Result<()> {
     harness
         .tx_event
         .send(EngineEvent::ToolCallStarted {
+            model_call: Some(crate::core::events::ModelToolCall {
+                provider_id: "tool-cat-auth".to_string(),
+                caller: None,
+                thought_signature: None,
+            }),
             id: "tool-cat-auth".to_string(),
             name: "exec_command".to_string(),
             input: json!({"cmd": "cat auth.json"}),
@@ -20653,6 +20691,7 @@ async fn runtime_receipts_mask_configured_secrets() -> Result<()> {
     harness
         .tx_event
         .send(EngineEvent::ToolCallComplete {
+            model_call: None,
             id: "tool-cat-auth".to_string(),
             name: "exec_command".to_string(),
             // Real `exec_shell` metadata shape: the summaries carry the
@@ -20674,6 +20713,11 @@ async fn runtime_receipts_mask_configured_secrets() -> Result<()> {
     harness
         .tx_event
         .send(EngineEvent::ToolCallStarted {
+            model_call: Some(crate::core::events::ModelToolCall {
+                provider_id: "tool-error".into(),
+                caller: None,
+                thought_signature: None,
+            }),
             id: "tool-error".into(),
             name: "exec_command".into(),
             input: json!({"cmd": "false"}),
@@ -20682,6 +20726,7 @@ async fn runtime_receipts_mask_configured_secrets() -> Result<()> {
     harness
         .tx_event
         .send(EngineEvent::ToolCallComplete {
+            model_call: None,
             id: "tool-error".into(),
             name: "exec_command".into(),
             result: Err(crate::tools::spec::ToolError::execution_failed(format!(
@@ -20881,6 +20926,11 @@ async fn tool_completion_items_carry_typed_artifact_refs() -> Result<()> {
         harness
             .tx_event
             .send(EngineEvent::ToolCallStarted {
+                model_call: Some(crate::core::events::ModelToolCall {
+                    provider_id: call.to_string(),
+                    caller: None,
+                    thought_signature: None,
+                }),
                 id: call.to_string(),
                 name: name.to_string(),
                 input: json!({}),
@@ -20890,6 +20940,7 @@ async fn tool_completion_items_carry_typed_artifact_refs() -> Result<()> {
     harness
         .tx_event
         .send(EngineEvent::ToolCallComplete {
+            model_call: None,
             id: "call_write".to_string(),
             name: "apply_patch".to_string(),
             result: Ok(
@@ -20909,6 +20960,7 @@ async fn tool_completion_items_carry_typed_artifact_refs() -> Result<()> {
     harness
         .tx_event
         .send(EngineEvent::ToolCallComplete {
+            model_call: None,
             id: "call_shell".to_string(),
             name: "exec_shell".to_string(),
             // A failed call's large output spills too.
@@ -21124,6 +21176,11 @@ async fn run_workspace_turn(
     harness
         .tx_event
         .send(EngineEvent::ToolCallStarted {
+            model_call: Some(crate::core::events::ModelToolCall {
+                provider_id: "call_patch".to_string(),
+                caller: None,
+                thought_signature: None,
+            }),
             id: "call_patch".to_string(),
             name: "apply_patch".to_string(),
             input: json!({}),
@@ -21148,6 +21205,7 @@ async fn run_workspace_turn(
     harness
         .tx_event
         .send(EngineEvent::ToolCallComplete {
+            model_call: None,
             id: "call_patch".to_string(),
             name: "apply_patch".to_string(),
             result: Ok(
@@ -21530,4 +21588,377 @@ async fn runtime_shell_completion_delivers_exit_code_and_status_to_hooks() -> Re
         ]
     );
     Ok(())
+}
+
+mod execution_identity {
+    use super::*;
+    use crate::core::events::ModelToolCall;
+
+    #[tokio::test]
+    async fn seed_restart_snapshot_import_and_fork_preserve_execution_pairs() -> Result<()> {
+        let _env = crate::test_support::lock_test_env();
+        let dir = tempfile::tempdir()?;
+        let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", dir.path());
+        let runtime = dir.path().join("runtime");
+        let manager = test_manager(runtime.clone())?;
+        let thread = manager.create_thread(Default::default()).await?;
+        let original: Vec<Message> = serde_json::from_value(json!([
+            {"role":"user","content":[{"type":"text","text":"retain both executions"}]},
+            {"role":"assistant","content":[{"type":"tool_use","id":"wire-reused","execution_id":"host-one","name":"read_file","input":{"path":"one"},"caller":{"type":"subagent","tool_id":"parent-wire"},"thought_signature":"signed-one"}]},
+            {"role":"user","content":[{"type":"tool_result","tool_use_id":"wire-reused","execution_id":"host-one","content":"one","content_blocks":[{"type":"text","text":"rich-one"}]}]},
+            {"role":"assistant","content":[{"type":"tool_use","id":"wire-reused","execution_id":"host-two","name":"read_file","input":{"path":"two"}}]},
+            {"role":"user","content":[{"type":"tool_result","tool_use_id":"wire-reused","execution_id":"host-two","content":"two"}]}
+        ]))?;
+        manager
+            .seed_thread_from_messages(&thread.id, &original)
+            .await?;
+        drop(manager);
+        let manager = test_manager(runtime)?;
+        let reopened = manager.get_thread(&thread.id).await?;
+        assert_eq!(manager.restore_thread_messages(&reopened)?, original);
+        let detail = manager.get_thread_detail(&thread.id).await?;
+        let calls: Vec<_> = detail
+            .items
+            .iter()
+            .filter_map(|item| item.metadata.as_ref())
+            .filter(|meta| meta.get("tool_use_id").is_some())
+            .collect();
+        assert_eq!(calls.len(), 2);
+        assert_ne!(calls[0]["tool_use_id"], calls[1]["tool_use_id"]);
+        assert!(
+            calls
+                .iter()
+                .all(|meta| meta["provider_tool_use_id"] == "wire-reused")
+        );
+
+        // The existing snapshot/journal and foreign-import owner carry the
+        // metadata; importing does not create authority or a fresh execution.
+        let saved = crate::session_manager::create_saved_session_with_id_and_mode(
+            Uuid::new_v4().to_string(),
+            &original,
+            &thread.model,
+            &thread.workspace,
+            0,
+            None,
+            Some("agent"),
+        );
+        let sessions = crate::session_manager::SessionManager::new(
+            crate::session_manager::default_sessions_dir()?,
+        )?;
+        sessions.save_session(&saved)?;
+        let loaded = sessions.load_session(&saved.metadata.id)?;
+        assert_eq!(loaded.messages, original);
+        let imported = crate::session_manager::SavedSession::import_foreign(
+            loaded.export_container("identity-fixture"),
+            thread.workspace.clone(),
+            thread.model.clone(),
+        )
+        .map_err(anyhow::Error::msg)?;
+        assert_eq!(imported.messages, original);
+        assert!(imported.approval_receipts.is_empty());
+        manager
+            .set_thread_session_checkpoint(&thread.id, &loaded)
+            .await?;
+        let fork = manager.fork_thread(&thread.id).await?;
+        assert_eq!(manager.restore_thread_messages(&fork)?, original);
+        assert_eq!(
+            manager
+                .get_thread_detail(&fork.id)
+                .await?
+                .pending_approvals
+                .len(),
+            0
+        );
+        let mut other_identity = original.clone();
+        if let ContentBlock::ToolUse { execution_id, .. } = &mut other_identity[1].content[0] {
+            *execution_id = Some("host-other".into());
+        }
+        assert_ne!(
+            session_recovery_projection(&original),
+            session_recovery_projection(&other_identity)
+        );
+        if let ContentBlock::ToolUse { execution_id, .. } = &mut other_identity[1].content[0] {
+            *execution_id = Some(String::new());
+        }
+        let before = serde_json::to_value(manager.get_thread_detail(&thread.id).await?)?;
+        assert!(
+            manager
+                .seed_thread_from_messages(&thread.id, &other_identity)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            serde_json::to_value(manager.get_thread_detail(&thread.id).await?)?,
+            before,
+            "reject the whole malformed import before writing any turn or item"
+        );
+        let mut wrong_provider = original.clone();
+        if let ContentBlock::ToolResult { tool_use_id, .. } = &mut wrong_provider[4].content[0] {
+            *tool_use_id = "different-wire".into();
+        }
+        assert!(
+            manager
+                .seed_thread_from_messages(&thread.id, &wrong_provider)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("inconsistent provider identity")
+        );
+        assert_eq!(
+            serde_json::to_value(manager.get_thread_detail(&thread.id).await?)?,
+            before
+        );
+        // Also refuse already-corrupted separate result records on a real
+        // item-only rebuild; never return a repaired call plus an orphan result.
+        let turns = manager.store.list_turns_for_thread(&thread.id)?;
+        let mut result = manager
+            .store
+            .list_items_for_turn(&turns[0].id)?
+            .into_iter()
+            .find(|item| {
+                item.metadata
+                    .as_ref()
+                    .is_some_and(|meta| meta["tool_result_for"] == "host-two")
+            })
+            .context("second result")?;
+        result.metadata.as_mut().unwrap()["provider_tool_use_id"] = json!("different-wire");
+        manager.store.save_item(&result)?;
+        assert!(
+            manager
+                .reconstruct_messages_from_turns(&turns)
+                .unwrap_err()
+                .to_string()
+                .contains("inconsistent provider identity")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn monitor_preserves_admitted_correlation_and_redacts_private_answers() -> Result<()> {
+        let manager = test_manager(test_runtime_dir())?;
+        let thread = manager.create_thread(Default::default()).await?;
+        let mut harness = install_mock_engine(&manager, &thread.id).await;
+        let turn = manager
+            .start_turn(
+                &thread.id,
+                StartTurnRequest {
+                    prompt: "project exact tool events".into(),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        assert!(matches!(
+            harness.rx_op.recv().await,
+            Some(Op::SendMessage(_))
+        ));
+        harness
+            .tx_event
+            .send(EngineEvent::TurnStarted {
+                turn_id: turn.id.clone(),
+                created_at: Utc::now(),
+                route: None,
+            })
+            .await?;
+        for (id, name, model, fails) in [
+            ("host-one", "read_file", true, false),
+            ("host-two", "exec_shell", true, false),
+            ("host-three", "write_file", true, true),
+            ("host-local", "read_file", false, false),
+            ("host-private", REQUEST_USER_INPUT_TOOL_NAME, true, false),
+        ] {
+            let caller = (id == "host-one").then(|| ToolCaller {
+                caller_type: "subagent".into(),
+                tool_id: Some("parent-wire".into()),
+            });
+            let model_call = model.then(|| ModelToolCall {
+                provider_id: "wire-reused".into(),
+                caller,
+                thought_signature: (id == "host-one").then(|| "trusted-signature".into()),
+            });
+            harness
+                .tx_event
+                .send(EngineEvent::ToolCallStarted {
+                    id: id.into(),
+                    name: name.into(),
+                    input: json!({"source":id}),
+                    model_call,
+                })
+                .await?;
+            let result = if fails {
+                Err(crate::tools::spec::ToolError::execution_failed(
+                    "interrupted fixture",
+                ))
+            } else {
+                Ok(crate::tools::spec::ToolResult::success(if id == "host-private" {
+                    "private-answer-do-not-persist"
+                } else { "output" }).with_metadata(json!({
+                    "tool_use_id":"forged", "tool_result_for":"forged", "tool_name":"forged",
+                    "tool_input":"forged", "execution_id":"forged", "provider_tool_use_id":"forged",
+                    "tool_caller":{"type":"forged"}, "tool_thought_signature":"forged",
+                    "visibility":"forged", "ordinary_result_metadata":42,
+                    "content_blocks":[{"type":"text","text":"rich-output"}]
+                })))
+            };
+            harness
+                .tx_event
+                .send(EngineEvent::ToolCallComplete {
+                    id: id.into(),
+                    name: name.into(),
+                    result,
+                    // Completion cannot replace the admitted start's identity.
+                    model_call: Some(ModelToolCall {
+                        provider_id: "forged-completion".into(),
+                        caller: None,
+                        thought_signature: None,
+                    }),
+                })
+                .await?;
+        }
+        harness
+            .tx_event
+            .send(EngineEvent::TurnComplete {
+                usage: Usage::default(),
+                parent_route_usage: Usage::default(),
+                routed_usage_dropped_records: 0,
+                status: TurnOutcomeStatus::Completed,
+                error: None,
+                tool_catalog: None,
+                base_url: None,
+            })
+            .await?;
+        wait_for_terminal_turn(&manager, &turn.id).await?;
+        let detail = manager.get_thread_detail(&thread.id).await?;
+        let bytes = serde_json::to_string(&detail.items)?;
+        assert!(!bytes.contains("private-answer-do-not-persist"));
+        assert!(!bytes.contains("forged"));
+        let second = detail
+            .items
+            .iter()
+            .find(|item| {
+                item.metadata
+                    .as_ref()
+                    .is_some_and(|meta| meta["tool_use_id"] == "host-two")
+            })
+            .context("second call")?;
+        assert_eq!(second.kind, TurnItemKind::CommandExecution);
+        let meta = second.metadata.as_ref().unwrap();
+        assert!(meta.get("tool_caller").is_none());
+        assert!(meta.get("tool_thought_signature").is_none());
+        assert!(meta.get("visibility").is_none());
+        assert_eq!(meta["ordinary_result_metadata"], 42);
+        let messages = manager.reconstruct_messages_from_turns(&detail.turns)?;
+        let uses: Vec<_> = messages
+            .iter()
+            .flat_map(|m| &m.content)
+            .filter(|block| matches!(block, ContentBlock::ToolUse { .. }))
+            .collect();
+        let results: Vec<_> = messages
+            .iter()
+            .flat_map(|m| &m.content)
+            .filter(|block| matches!(block, ContentBlock::ToolResult { .. }))
+            .collect();
+        assert_eq!(
+            uses.len(),
+            3,
+            "non-model and redacted private items are not replayed"
+        );
+        assert_eq!(
+            results.len(),
+            3,
+            "an earlier same-wire result cannot hide a failed later call"
+        );
+        for (index, (call, result)) in uses.iter().zip(results.iter()).enumerate() {
+            let expected = format!("host-{}", ["one", "two", "three"][index]);
+            assert_eq!(
+                call.tool_call_key(),
+                Some(ToolCallKey::Execution(&expected))
+            );
+            assert_eq!(call.tool_call_key(), result.tool_call_key());
+            match call {
+                ContentBlock::ToolUse {
+                    id,
+                    caller,
+                    thought_signature,
+                    ..
+                } => {
+                    assert_eq!(id, "wire-reused");
+                    assert_eq!(caller.is_some(), index == 0);
+                    assert_eq!(thought_signature.is_some(), index == 0);
+                }
+                _ => unreachable!(),
+            }
+        }
+        assert!(matches!(
+            results[2],
+            ContentBlock::ToolResult {
+                is_error: Some(true),
+                ..
+            }
+        ));
+        assert!(
+            !serde_json::to_string(&manager.events_since(&thread.id, None)?)?
+                .contains("private-answer-do-not-persist")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_and_legacy_result_domains_cannot_settle_each_other() -> Result<()> {
+        let mut item = sample_item(
+            "turn_identity",
+            "call",
+            TurnItemLifecycleStatus::Interrupted,
+        );
+        item.kind = TurnItemKind::ToolCall;
+        let new = RuntimeToolIdentity {
+            execution_id: Some("same-text"),
+            provider_id: "wire",
+        };
+        let legacy = RuntimeToolIdentity {
+            execution_id: None,
+            provider_id: "same-text",
+        };
+        for (call, result) in [
+            (new, legacy),
+            (legacy, new),
+            (
+                new,
+                RuntimeToolIdentity {
+                    execution_id: Some("same-text"),
+                    provider_id: "different-wire",
+                },
+            ),
+        ] {
+            assert!(
+                unanswered_call_result(
+                    &item,
+                    call,
+                    "read_file",
+                    &[result.key()].into_iter().collect()
+                )
+                .is_some()
+            );
+        }
+        assert!(
+            unanswered_call_result(&item, new, "read_file", &[new.key()].into_iter().collect())
+                .is_none()
+        );
+        for meta in [
+            json!({"tool_use_id":"same-text","execution_id":"","provider_tool_use_id":"wire"}),
+            json!({"tool_use_id":"other","execution_id":"same-text","provider_tool_use_id":"wire"}),
+            json!({"tool_use_id":"same-text","execution_id":"same-text","provider_tool_use_id":false}),
+        ] {
+            assert!(RuntimeToolIdentity::read(Some(&meta), "tool_use_id").is_err());
+        }
+        let non_model = json!({"tool_use_id":"same-text","execution_id":"same-text"});
+        assert!(RuntimeToolIdentity::read(Some(&non_model), "tool_use_id")?.is_none());
+        let old = json!({"tool_use_id":"same-text"});
+        assert_eq!(
+            RuntimeToolIdentity::read(Some(&old), "tool_use_id")?
+                .unwrap()
+                .key(),
+            legacy.key()
+        );
+        Ok(())
+    }
 }

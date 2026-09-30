@@ -49,7 +49,7 @@ use crate::tui::streaming::StreamingState;
 use crate::tui::transcript::TranscriptViewCache;
 use crate::tui::views::ViewStack;
 use codewhale_localization::{Locale, MessageId, resolve_locale, tr};
-use codewhale_models::{Message, SystemPrompt, Tool, Usage};
+use codewhale_models::{ContentBlock, Message, SystemPrompt, Tool, Usage};
 use codewhale_palette::{self as palette, UiTheme};
 
 mod composer;
@@ -187,30 +187,35 @@ pub enum OnboardingState {
     None,
 }
 
+/// Pick the session's primary skills dir. A workspace directory is chosen only
+/// when the workspace-trust gate admits it; an untrusted repository falls back
+/// to the global dir so its skills neither load nor become the install target.
 pub(crate) fn resolve_skills_dir(
     workspace: &Path,
     global_skills_dir: &Path,
     config: &Config,
 ) -> PathBuf {
+    let admitted =
+        |dir: &Path| crate::skills::skills_dir_allowed_by_workspace_trust(workspace, dir);
     if config.skills_config().scan_codewhale_only() {
         if config.skills_dir.is_some() {
             return global_skills_dir.to_path_buf();
         }
         if let Some(codewhale_skills_dir) = crate::skills::codewhale_workspace_skills_dir(workspace)
+            && admitted(&codewhale_skills_dir)
         {
             return codewhale_skills_dir;
         }
         return global_skills_dir.to_path_buf();
     }
 
-    let agents_skills_dir = workspace.join(".agents").join("skills");
-    if agents_skills_dir.exists() {
-        return agents_skills_dir;
-    }
-
-    let local_skills_dir = workspace.join("skills");
-    if local_skills_dir.exists() {
-        return local_skills_dir;
+    for local_skills_dir in [
+        workspace.join(".agents").join("skills"),
+        workspace.join("skills"),
+    ] {
+        if local_skills_dir.exists() && admitted(&local_skills_dir) {
+            return local_skills_dir;
+        }
     }
 
     if config.skills_dir.is_none()
@@ -2316,7 +2321,7 @@ pub struct App {
     /// Last completed reasoning block
     pub last_reasoning: Option<String>,
     /// Tool calls captured for the pending assistant message
-    pub pending_tool_uses: Vec<(String, String, Value)>,
+    pub pending_tool_uses: Vec<ContentBlock>,
     /// One-line permission receipts (`tool_id`, text) for decisions nobody
     /// was prompted for, held until that tool's card completes so the note
     /// lands directly under the card instead of splitting a running tool run.

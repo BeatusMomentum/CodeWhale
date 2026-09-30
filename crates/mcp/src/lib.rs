@@ -1043,6 +1043,16 @@ pub(crate) const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
 /// Servers answering an older supported revision get it echoed back.
 pub(crate) const MCP_SUPPORTED_PROTOCOL_VERSIONS: &[&str] =
     &[MCP_PROTOCOL_VERSION, "2025-03-26", "2024-11-05"];
+/// Revisions a server may answer our *client* `initialize` with, newest first.
+/// Current SDK servers answer `2025-11-25` even when offered an older revision,
+/// and the shapes our client uses are unchanged there. The server side above
+/// still negotiates from `MCP_SUPPORTED_PROTOCOL_VERSIONS` alone.
+pub(crate) const MCP_CLIENT_ACCEPTED_PROTOCOL_VERSIONS: &[&str] = &[
+    "2025-11-25",
+    MCP_PROTOCOL_VERSION,
+    "2025-03-26",
+    "2024-11-05",
+];
 const MCP_SERVER_NAME: &str = "codewhale-mcp-server";
 
 fn initialize_response(state: &StdioMcpState, protocol_version: &str) -> Value {

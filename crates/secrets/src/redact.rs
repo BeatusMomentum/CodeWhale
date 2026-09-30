@@ -116,8 +116,11 @@ fn redact_json_secrets_at(
 ///    everything from the value to the end of the line is dropped, exactly as
 ///    the whole-line form already does. Token *counts* in diagnostics
 ///    (`max tokens = 8192`) are not credentials and stay visible.
-/// 2. **Bare tokens.** Whitespace-delimited words beginning with a known
-///    `SECRET_TOKEN_PREFIXES` are replaced wholesale.
+/// 2. **Bare tokens.** Whitespace-delimited words that are a credential on
+///    their own — a known `SECRET_TOKEN_PREFIXES` word, a provider-prefixed
+///    opaque key (`CREDENTIAL_VALUE_PREFIXES`, `xai-`, `nvapi-`, `gsk_`,
+///    `hf_`, `pplx-`), an AWS access key id, or a JWT — are replaced
+///    wholesale.
 ///
 /// The goal is defense in depth: setup state and reports are built from safe
 /// summaries that never include secrets in the first place, and this is the
@@ -241,9 +244,9 @@ fn redact_line(line: &str, policy: RedactionPolicy) -> String {
             changed = true;
             masked.push(word.replace(trimmed, &redacted));
             spaced = SpacedAssignment::None;
-        } else if !trimmed.is_empty() && looks_like_secret_token(trimmed) {
+        } else if let Some(core) = secret_token_core(trimmed) {
             changed = true;
-            masked.push(word.replace(trimmed, REDACTED));
+            masked.push(word.replacen(core, REDACTED, 1));
             spaced = SpacedAssignment::None;
         } else if let Some(redacted) = redact_structured_word(trimmed, policy) {
             changed = true;
@@ -687,10 +690,62 @@ fn redact_keyed_assignment(body: &str, policy: RedactionPolicy) -> Option<String
     ))
 }
 
+/// Provider key prefixes masked as bare words only when the rest of the word
+/// is an opaque run ([`is_opaque_token_body`]): real keys under them are
+/// random, while identifiers sharing the prefix (`hf_hub_download`,
+/// `npm_config_cache`) are not. [`CREDENTIAL_VALUE_PREFIXES`] joins them.
+const BARE_OPAQUE_TOKEN_PREFIXES: &[&str] = &["xai-", "nvapi-", "gsk_", "hf_", "pplx-"];
+
+/// Whether a whitespace-delimited word is a credential on its own: a
+/// [`SECRET_TOKEN_PREFIXES`] word, a provider-prefixed opaque key, an AWS
+/// access key id, or a JWT.
 fn looks_like_secret_token(word: &str) -> bool {
+    secret_token_core(word).is_some()
+}
+
+/// The credential inside `word` once markdown and prose punctuation around it
+/// is dropped (`` `xai-…` ``, `(nvapi-…)`, `AKIA…:`, a JWT ending a
+/// sentence), or `None` when the word is not a credential on its own.
+fn secret_token_core(word: &str) -> Option<&str> {
+    let core = word.trim_matches(|c| {
+        matches!(
+            c,
+            '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>' | ':' | '`' | '.' | '!' | '?'
+        )
+    });
+    (!core.is_empty() && is_bare_secret_token(core)).then_some(core)
+}
+
+fn is_bare_secret_token(word: &str) -> bool {
     SECRET_TOKEN_PREFIXES
         .iter()
         .any(|p| word.len() > p.len() + 6 && word.starts_with(p))
+        || CREDENTIAL_VALUE_PREFIXES
+            .iter()
+            .chain(BARE_OPAQUE_TOKEN_PREFIXES)
+            .filter(|p| !matches!(**p, "AKIA" | "ASIA"))
+            .any(|p| word.strip_prefix(p).is_some_and(is_opaque_token_body))
+        || is_aws_access_key_id(word)
+        || is_jwt_shaped(word)
+}
+
+/// At least 16 key characters with both a letter and a digit.
+fn is_opaque_token_body(body: &str) -> bool {
+    body.len() >= 16
+        && body
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+        && body.chars().any(|c| c.is_ascii_alphabetic())
+        && body.chars().any(|c| c.is_ascii_digit())
+}
+
+/// `AKIA`/`ASIA` followed by exactly 16 upper-case letters or digits.
+fn is_aws_access_key_id(word: &str) -> bool {
+    word.len() == 20
+        && (word.starts_with("AKIA") || word.starts_with("ASIA"))
+        && word[4..]
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
 }
 
 #[cfg(test)]
@@ -729,5 +784,82 @@ mod model_bound_json_tests {
         // The key-based pass would have hidden the second half of the command.
         let key_based = redact_json_secrets(&input);
         assert!(!key_based["command"].as_str().unwrap().contains("evil.test"));
+    }
+}
+
+#[cfg(test)]
+mod bare_token_tests {
+    use super::*;
+
+    #[test]
+    fn every_known_prefix_is_masked_as_a_bare_word() {
+        let body = "Z7qX4mNb2Vc9Lk3PwR8t";
+        let mut tokens: Vec<String> = SECRET_TOKEN_PREFIXES
+            .iter()
+            .chain(CREDENTIAL_VALUE_PREFIXES)
+            .chain(BARE_OPAQUE_TOKEN_PREFIXES)
+            .filter(|prefix| !matches!(**prefix, "AKIA" | "ASIA"))
+            .map(|prefix| format!("{prefix}{body}"))
+            .collect();
+        tokens.push(["AKIA", "Z7QX4MNB2VC9LK3P"].concat());
+        tokens.push(["ASIA", "Z7QX4MNB2VC9LK3P"].concat());
+        tokens.push(["eyJhbGciOiJIUzI1NiJ9", ".eyJzdWIiOiIxIn0", ".c2lnbmF0dXJl"].concat());
+        for token in tokens {
+            let out = redact_secrets(&format!("request failed: {token} rejected"));
+            assert_eq!(out, "request failed: [redacted] rejected", "{token}");
+        }
+    }
+
+    #[test]
+    fn a_bare_token_wrapped_in_markdown_or_prose_punctuation_is_masked() {
+        let body = "Z7qX4mNb2Vc9Lk3PwR8t";
+        let aws = ["AKIA", "Z7QX4MNB2VC9LK3P"].concat();
+        let jwt = ["eyJhbGciOiJIUzI1NiJ9", ".eyJzdWIiOiIxIn0", ".c2lnbmF0dXJl"].concat();
+        for (wrapped, token) in [
+            (format!("`xai-{body}`"), format!("xai-{body}")),
+            (format!("(nvapi-{body})"), format!("nvapi-{body}")),
+            (format!("hf_{body})"), format!("hf_{body}")),
+            (format!("[pplx-{body}]"), format!("pplx-{body}")),
+            (format!("{aws}:"), aws.clone()),
+            (format!("{aws})"), aws.clone()),
+            (format!("{jwt})."), jwt.clone()),
+        ] {
+            let out = redact_secrets(&format!("key {wrapped} rejected"));
+            assert!(!out.contains(&token), "{out}");
+            assert!(out.contains(REDACTED), "{out}");
+        }
+        assert_eq!(
+            redact_secrets(&format!("key `xai-{body}` rejected")),
+            "key `[redacted]` rejected"
+        );
+    }
+
+    #[test]
+    fn lowercase_opaque_keys_with_separators_are_still_masked() {
+        // Lowercase letters and separators are also valid random key material;
+        // their shape alone does not establish that this is an identifier.
+        for prefix in BARE_OPAQUE_TOKEN_PREFIXES {
+            for separator in ['-', '_', '.'] {
+                let body = ["a1b2c3d4", "e5f6g7h8", "i9j0k1l2"].join(&separator.to_string());
+                let token = format!("{prefix}{body}");
+                let out = redact_secrets(&format!("request failed: `{token}` rejected"));
+                assert_eq!(out, "request failed: `[redacted]` rejected");
+            }
+        }
+    }
+
+    #[test]
+    fn identifiers_sharing_a_prefix_stay_visible() {
+        for word in [
+            "hf_hub_download",
+            "npm_config_cache",
+            "xai-grok-sdk",
+            "AKIAshort",
+            "gsk_",
+            "eyJ.eyJ",
+        ] {
+            let line = format!("call {word} now");
+            assert_eq!(redact_secrets(&line), line, "{word}");
+        }
     }
 }

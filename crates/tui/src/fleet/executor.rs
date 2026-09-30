@@ -340,8 +340,13 @@ fn build_worker_exec_command_from_prompt(
         args.push(max_tool_calls.to_string());
     }
     if !exec_config.append_system_prompt.trim().is_empty() {
-        args.push("--append-system-prompt".to_string());
-        args.push(exec_config.append_system_prompt.clone());
+        // One `--flag=value` argument, so the policy is always the value: as a
+        // separate argument, text that reads like one of exec's own options
+        // (`--hooks`) is parsed as that option and the worker fails to start.
+        args.push(format!(
+            "--append-system-prompt={}",
+            exec_config.append_system_prompt
+        ));
     }
 
     if let Some(authority) = authority {
@@ -847,11 +852,14 @@ impl FleetExecutor {
     }
 
     /// Wall-clock time this worker process has been running (R5). `None` when
-    /// the worker is not tracked.
+    /// the worker is not tracked or its exit was already observed: a process
+    /// that has exited is not running, so a deadline must not rewrite the
+    /// outcome that exit produced as a timeout.
     #[must_use]
     pub fn worker_running_for(&self, worker_id: &str) -> Option<std::time::Duration> {
         self.streams
             .get(worker_id)
+            .filter(|stream| !stream.terminal)
             .map(|stream| stream.started_at.elapsed())
     }
 
@@ -1201,7 +1209,11 @@ mod tests {
         assert!(joined.contains("--allowed-tools read_file,grep_files"));
         assert!(joined.contains("--disallowed-tools exec_shell"));
         assert!(joined.contains("--max-turns 40"));
-        assert!(cmd.args.iter().any(|a| a == "never push to main"));
+        assert!(
+            cmd.args
+                .iter()
+                .any(|a| a == "--append-system-prompt=never push to main")
+        );
     }
 
     #[test]

@@ -999,6 +999,7 @@ mod tests {
     fn foreground_projection_forwards_only_typed_owner_metadata() {
         let call = metadata(
             &Event::ToolCallStarted {
+                model_call: None,
                 id: "call-a".into(),
                 name: "exec_command".into(),
                 input: json!({"command":"PRIVATE TOOL INPUT"}),

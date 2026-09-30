@@ -3969,7 +3969,7 @@ var ErrorCode = {
   Cancelled: -32800
 };
 var CORE_TO_HOST = {
-  requests: ["host/initialize", "host/shutdown", "ext/activate", "ext/deactivate", "tool/call"],
+  requests: ["host/initialize", "host/shutdown", "host/ping", "ext/activate", "ext/deactivate", "tool/call"],
   notifications: ["$/cancel"]
 };
 var HOST_TO_CORE = {
@@ -4104,6 +4104,7 @@ var PARAMS = {
     )
   },
   "host/shutdown": { dir: "core", required: {} },
+  "host/ping": { dir: "core", required: {} },
   "ext/activate": {
     dir: "core",
     required: { owner: "owner", plugin_name: "string", entry: "object" },
@@ -4656,6 +4657,10 @@ rpc.onRequest("host/initialize", (params) => {
 function requireInitialized() {
   if (!initialized) throw new RpcError(ErrorCode.InvalidRequest, "host is not initialized");
 }
+rpc.onRequest("host/ping", () => {
+  requireInitialized();
+  return {};
+});
 rpc.onRequest("ext/activate", async (params) => {
   requireInitialized();
   return host.activate(params);

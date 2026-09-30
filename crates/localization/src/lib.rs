@@ -708,6 +708,13 @@ pub enum MessageId {
     PluginSuggestionReason,
     PagerActionConfirm,
     CmdPluginBundleDetail,
+    CmdPluginOwnerReport,
+    CmdPluginOwnerActivating,
+    CmdPluginOwnerActive,
+    CmdPluginOwnerFailed,
+    CmdPluginOwnerFaulted,
+    CmdPluginOwnerRevoked,
+    CmdPluginOwnerInactive,
     CmdPluginBundleDiagnosticsHeader,
     CmdPluginBundleMutationSuccess,
     CmdPluginActionFailed,
@@ -989,6 +996,7 @@ pub enum MessageId {
     ClipboardCutKeptText,
     /// Paste found nothing: the clipboard read came back empty or failed.
     ClipboardNothingToPaste,
+    ComposerOversizedSubmitHeld,
     KbContextMenu,
     KbPointerScroll,
     KbPointerClick,
@@ -1929,6 +1937,10 @@ pub enum MessageId {
     SessionsSortSize,
     SessionsSearchPrompt,
     SessionsDeleteFailed,
+    SessionsDeleteOpenHere,
+    SessionsDeleteOpenElsewhere,
+    SessionSaveFailed,
+    SessionSaveFailedAtExit,
     SessionsDeleted,
     SessionsNoSelection,
     SessionsTitleLength,
@@ -3244,6 +3256,13 @@ pub const ALL_MESSAGE_IDS: &[MessageId] = &[
     MessageId::PluginSuggestionReason,
     MessageId::PagerActionConfirm,
     MessageId::CmdPluginBundleDetail,
+    MessageId::CmdPluginOwnerReport,
+    MessageId::CmdPluginOwnerActivating,
+    MessageId::CmdPluginOwnerActive,
+    MessageId::CmdPluginOwnerFailed,
+    MessageId::CmdPluginOwnerFaulted,
+    MessageId::CmdPluginOwnerRevoked,
+    MessageId::CmdPluginOwnerInactive,
     MessageId::CmdPluginBundleDiagnosticsHeader,
     MessageId::CmdPluginBundleMutationSuccess,
     MessageId::CmdPluginActionFailed,
@@ -3519,6 +3538,7 @@ pub const ALL_MESSAGE_IDS: &[MessageId] = &[
     MessageId::ClipboardSentToTerminal,
     MessageId::ClipboardCutKeptText,
     MessageId::ClipboardNothingToPaste,
+    MessageId::ComposerOversizedSubmitHeld,
     MessageId::KbContextMenu,
     MessageId::KbPointerScroll,
     MessageId::KbPointerClick,
@@ -4393,6 +4413,10 @@ pub const ALL_MESSAGE_IDS: &[MessageId] = &[
     MessageId::SessionsSortSize,
     MessageId::SessionsSearchPrompt,
     MessageId::SessionsDeleteFailed,
+    MessageId::SessionsDeleteOpenHere,
+    MessageId::SessionsDeleteOpenElsewhere,
+    MessageId::SessionSaveFailed,
+    MessageId::SessionSaveFailedAtExit,
     MessageId::SessionsDeleted,
     MessageId::SessionsNoSelection,
     MessageId::SessionsTitleLength,
@@ -5532,6 +5556,37 @@ mod tests {
             .skip(1)
             .filter_map(|suffix| suffix.split_once('}').map(|(name, _)| name.to_string()))
             .collect()
+    }
+
+    #[test]
+    fn plugin_owner_report_keeps_translated_state_and_placeholder_parity() {
+        let english = raw_locale_messages(Locale::En);
+        let keys: Vec<_> = english
+            .keys()
+            .filter(|key| key.starts_with("CmdPluginOwner"))
+            .collect();
+        assert_eq!(keys.len(), 7);
+        for locale in Locale::shipped_complete() {
+            let pack = raw_locale_messages(*locale);
+            for key in &keys {
+                let original = english[*key].as_str().unwrap();
+                let translated = pack[*key].as_str().unwrap();
+                assert_eq!(
+                    message_placeholders(translated),
+                    message_placeholders(original),
+                    "{} changed placeholders for {key}",
+                    locale.tag()
+                );
+                if *locale != Locale::En {
+                    assert_ne!(
+                        translated,
+                        original,
+                        "{} left {key} in English",
+                        locale.tag()
+                    );
+                }
+            }
+        }
     }
 
     /// #5906: the parked-agent vocabulary is new copy on the busiest rows in

@@ -744,6 +744,7 @@ fn push_repeated_shell_results(app: &mut App, output: &str) {
         app.api_messages_mut().push(Message {
             role: Role::Assistant,
             content: vec![ContentBlock::ToolUse {
+                execution_id: None,
                 id: id.to_string(),
                 name: "shell_command".to_string(),
                 input: serde_json::json!({"command": "cargo test"}),
@@ -754,6 +755,7 @@ fn push_repeated_shell_results(app: &mut App, output: &str) {
         app.api_messages_mut().push(Message {
             role: Role::User,
             content: vec![ContentBlock::ToolResult {
+                execution_id: None,
                 tool_use_id: id.to_string(),
                 content: output.to_string(),
                 is_error: None,

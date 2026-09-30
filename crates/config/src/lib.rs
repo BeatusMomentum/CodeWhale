@@ -2978,6 +2978,7 @@ impl ConfigToml {
         if let Some(alias) = self.root_alias_key(key) {
             return self.set_value(&alias, value);
         }
+        check_config_toml_choice(key, value)?;
         if notifications::in_namespace(key) {
             let setting = notifications::NotificationSetting::required(key)?;
             let update = notifications::NotificationConfigUpdate::parse(setting, value)?;
@@ -3753,6 +3754,56 @@ fn telemetry_consent_from_env(
     (on, source)
 }
 
+/// Values config.toml's root `approval_policy` accepts, compared trimmed and
+/// case-insensitively. settings.toml's `approval_policy` is a different
+/// vocabulary (`use-tui-default`, `ask`, `auto-review`, `full-access`).
+pub const CONFIG_TOML_APPROVAL_POLICIES: &[&str] =
+    &["on-request", "untrusted", "never", "auto", "suggest"];
+/// Values config.toml's root `sandbox_mode` accepts.
+pub const CONFIG_TOML_SANDBOX_MODES: &[&str] = &[
+    "read-only",
+    "workspace-write",
+    "danger-full-access",
+    "external-sandbox",
+];
+/// Values config.toml's root `verbosity` accepts.
+pub const CONFIG_TOML_VERBOSITIES: &[&str] = &["normal", "concise"];
+
+/// The closed vocabulary of a config.toml root key, if it has one.
+#[must_use]
+pub fn config_toml_choices(key: &str) -> Option<&'static [&'static str]> {
+    match key {
+        "approval_policy" => Some(CONFIG_TOML_APPROVAL_POLICIES),
+        "sandbox_mode" => Some(CONFIG_TOML_SANDBOX_MODES),
+        "verbosity" => Some(CONFIG_TOML_VERBOSITIES),
+        _ => None,
+    }
+}
+
+/// Refuse a value the config.toml loader would reject for a closed-vocabulary
+/// root key, so shared setters cannot write a file the TUI then fails to load.
+pub fn check_config_toml_choice(key: &str, value: &str) -> Result<()> {
+    let Some(choices) = config_toml_choices(key) else {
+        return Ok(());
+    };
+    if choices.contains(&value.trim().to_ascii_lowercase().as_str()) {
+        return Ok(());
+    }
+    let settings_note = if key == "approval_policy" {
+        " (`use-tui-default`, `ask`, `auto-review` and `full-access` are settings.toml \
+         values for the /settings editor; config.toml does not read them.)"
+    } else {
+        ""
+    };
+    let value = codewhale_secrets::redact::redact_secrets(value);
+    bail!(
+        "invalid value '{value}' for '{key}': config.toml accepts {}.{settings_note} \
+         No value was changed.\nfix: codewhale config set {key} {}",
+        choices.join(", "),
+        choices[0]
+    )
+}
+
 #[must_use]
 pub fn project_approval_policy_is_allowed(current: Option<&str>, project: &str) -> bool {
     let Some(project_rank) = approval_policy_rank(project) else {
@@ -3885,7 +3936,12 @@ pub fn load_project_config_outcome(workspace: &Path) -> ProjectConfigOutcome {
                     return ProjectConfigOutcome::Invalid {
                         path,
                         reason: match raw_provider {
-                            Some(name) => format!("unknown provider '{name}'"),
+                            // A key pasted into `provider =` must not be
+                            // echoed; an ordinary typo stays readable.
+                            Some(name) => format!(
+                                "unknown provider '{}'",
+                                codewhale_secrets::redact::redact_secrets(&name)
+                            ),
                             None => "unknown provider".to_string(),
                         },
                     };
@@ -3899,9 +3955,9 @@ pub fn load_project_config_outcome(workspace: &Path) -> ProjectConfigOutcome {
                 );
                 return ProjectConfigOutcome::Invalid {
                     path,
-                    // `toml`'s message names the offending key and span
-                    // without echoing the file, so it is safe to surface.
-                    reason: err.message().to_string(),
+                    // Position only: `toml`'s message and snippet can quote
+                    // the offending value, which may be a credential.
+                    reason: format!("invalid TOML at {}", config_toml_error_location(&raw, &err)),
                 };
             }
         }
@@ -4749,21 +4805,16 @@ fn xiaomi_mimo_base_url_uses_token_plan(base_url: &str) -> bool {
         || normalized == XIAOMI_MIMO_TOKEN_PLAN_AMS_BASE_URL
 }
 
-fn xiaomi_mimo_env_var(candidates: &[&str]) -> Option<String> {
-    candidates.iter().find_map(|name| {
-        std::env::var(name)
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-    })
-}
+const XIAOMI_MIMO_TOKEN_PLAN_ENV_VARS: &[&str] =
+    &["XIAOMI_MIMO_TOKEN_PLAN_API_KEY", "MIMO_TOKEN_PLAN_API_KEY"];
+const XIAOMI_MIMO_STANDARD_ENV_VARS: &[&str] =
+    &["XIAOMI_MIMO_API_KEY", "XIAOMI_API_KEY", "MIMO_API_KEY"];
 
 fn xiaomi_mimo_env_api_key_for_runtime(
     mode: Option<&str>,
     base_url: Option<&str>,
 ) -> Option<String> {
-    const TOKEN_PLAN_ENV_VARS: &[&str] =
-        &["XIAOMI_MIMO_TOKEN_PLAN_API_KEY", "MIMO_TOKEN_PLAN_API_KEY"];
-    const STANDARD_ENV_VARS: &[&str] = &["XIAOMI_MIMO_API_KEY", "XIAOMI_API_KEY", "MIMO_API_KEY"];
+    let env_value = |vars: &[&str]| codewhale_secrets::env_first(vars).map(|(_, value)| value);
 
     let normalized_mode =
         mode.map(|value| value.trim().to_ascii_lowercase().replace(['_', ' '], "-"));
@@ -4772,7 +4823,7 @@ fn xiaomi_mimo_env_api_key_for_runtime(
         .is_some_and(xiaomi_mimo_mode_uses_standard_endpoint)
         || base_url.is_some_and(xiaomi_mimo_base_url_is_pay_as_you_go);
     if standard_selected {
-        return xiaomi_mimo_env_var(STANDARD_ENV_VARS);
+        return env_value(XIAOMI_MIMO_STANDARD_ENV_VARS);
     }
 
     let token_plan_selected = normalized_mode
@@ -4781,10 +4832,10 @@ fn xiaomi_mimo_env_api_key_for_runtime(
         .is_some()
         || base_url.is_some_and(xiaomi_mimo_base_url_uses_token_plan);
     if token_plan_selected {
-        return xiaomi_mimo_env_var(TOKEN_PLAN_ENV_VARS);
+        return env_value(XIAOMI_MIMO_TOKEN_PLAN_ENV_VARS);
     }
 
-    xiaomi_mimo_env_var(TOKEN_PLAN_ENV_VARS).or_else(|| xiaomi_mimo_env_var(STANDARD_ENV_VARS))
+    env_value(XIAOMI_MIMO_TOKEN_PLAN_ENV_VARS).or_else(|| env_value(XIAOMI_MIMO_STANDARD_ENV_VARS))
 }
 
 fn resolve_xiaomi_mimo_base_url(
@@ -4997,18 +5048,21 @@ fn stored_api_key_for_provider(
     })
 }
 
+/// The provider's API key from its own environment variables, the single
+/// list on its descriptor ([`provider::Provider::env_vars`]).
+///
+/// Xiaomi MiMo is the exception: its token-plan variables belong to the
+/// token-plan endpoints, and `xiaomi_mimo_env_api_key_for_runtime` (which the
+/// resolver tries first) is the only reader that knows the selected mode. This
+/// fallback reads the standard variables only, so a token-plan key is never
+/// sent to the pay-as-you-go endpoint.
 fn env_api_key_for_provider(provider: ProviderKind) -> Option<String> {
-    if provider == ProviderKind::Huggingface {
-        let normalized = |value: String| {
-            Some(codewhale_secrets::normalize_api_key(&value)).filter(|value| !value.is_empty())
-        };
-        return std::env::var("HUGGINGFACE_API_KEY")
-            .ok()
-            .and_then(normalized)
-            .or_else(|| std::env::var("HF_TOKEN").ok().and_then(normalized));
-    }
-
-    codewhale_secrets::env_for(provider.as_str())
+    let env_vars = if provider == ProviderKind::XiaomiMimo {
+        XIAOMI_MIMO_STANDARD_ENV_VARS
+    } else {
+        provider.provider().env_vars()
+    };
+    codewhale_secrets::env_first(env_vars).map(|(_, value)| value)
 }
 
 /// Whether an authentication mode requires API-key material.
@@ -5267,6 +5321,55 @@ fn parse_config_toml_canonical(
     Ok((config, receipt))
 }
 
+/// Where a TOML error sits: `line L, column C` in `source` (the exact text
+/// that was parsed), plus the key path when the deserializer recorded one.
+///
+/// Never the error's message or source snippet: both can quote the offending
+/// value (`invalid type: string "sk-…", expected a boolean`), and config and
+/// permissions files hold credentials. Pass `None` for `source` when the
+/// span refers to text the user did not write.
+#[must_use]
+pub fn toml_error_location(source: Option<&str>, err: &toml::de::Error) -> String {
+    let position = source.zip(err.span()).map(|(source, span)| {
+        let mut start = span.start.min(source.len());
+        while !source.is_char_boundary(start) {
+            start -= 1;
+        }
+        let before = &source[..start];
+        let line = before.matches('\n').count() + 1;
+        let column = before.rsplit('\n').next().unwrap_or("").chars().count() + 1;
+        format!("line {line}, column {column}")
+    });
+    // Without its input, `toml` renders exactly `{message}\n` followed by
+    // ``in `{keys}`\n`` when it recorded a key path; take only the latter.
+    let mut detached = err.clone();
+    detached.set_input(None);
+    let rendered = detached.to_string();
+    let key_path = rendered
+        .strip_prefix(err.message())
+        .and_then(|rest| rest.strip_prefix("\nin `"))
+        .and_then(|rest| rest.strip_suffix("`\n"))
+        .filter(|keys| !keys.is_empty())
+        .map(|keys| format!("in `{}`", codewhale_secrets::redact::redact_secrets(keys)));
+    match (position, key_path) {
+        (Some(position), Some(keys)) => format!("{position}, {keys}"),
+        (Some(position), None) => position,
+        (None, Some(keys)) => keys,
+        (None, None) => "position unknown".to_string(),
+    }
+}
+
+/// [`toml_error_location`] for an error from [`parse_config_toml_with_receipt`].
+/// A file with legacy top-level keys is parsed from a rewritten copy whose
+/// offsets name nothing the user wrote, so only the key path is reported.
+fn config_toml_error_location(raw: &str, err: &toml::de::Error) -> String {
+    let rewritten = matches!(
+        legacy_root::canonicalize_text(raw),
+        Ok((std::borrow::Cow::Owned(_), _))
+    );
+    toml_error_location((!rewritten).then_some(raw), err)
+}
+
 /// Parse any `config.toml`-shaped document into [`ConfigToml`], moving legacy
 /// top-level `base_url` / `api_key` into their provider tables first. Every
 /// caller outside this crate (bundle import, tests) parses through here so a
@@ -5288,16 +5391,18 @@ impl ConfigStore {
         let path = resolve_config_path(path)?;
         let (config, original_raw, legacy_root) = if checked_path_exists(&path)? {
             let raw = read_checked_config_file(&path)?;
-            let (mut parsed, receipt) = parse_config_toml_with_receipt(&raw).map_err(|_| {
+            let (mut parsed, receipt) = parse_config_toml_with_receipt(&raw).map_err(|err| {
                 anyhow::anyhow!(
-                    "failed to parse config at {}; file contents were omitted",
-                    quote_os_path(&path)
+                    "failed to parse config at {} ({}); file contents were omitted",
+                    quote_os_path(&path),
+                    config_toml_error_location(&raw, &err)
                 )
             })?;
-            let raw_document: toml::Value = toml::from_str(&raw).map_err(|_| {
+            let raw_document: toml::Value = toml::from_str(&raw).map_err(|err| {
                 anyhow::anyhow!(
-                    "failed to parse config at {}; file contents were omitted",
-                    quote_os_path(&path)
+                    "failed to parse config at {} ({}); file contents were omitted",
+                    quote_os_path(&path),
+                    toml_error_location(Some(&raw), &err)
                 )
             })?;
             if let Some(provider_id) = raw_document.get("provider").and_then(toml::Value::as_str) {
@@ -6532,10 +6637,11 @@ fn read_permissions_state(path: &Path) -> Result<(bool, String, PermissionsToml)
     let permissions = if raw.trim().is_empty() {
         PermissionsToml::default()
     } else {
-        toml::from_str(&raw).map_err(|_| {
+        toml::from_str(&raw).map_err(|err| {
             anyhow::anyhow!(
-                "failed to parse permissions at {}; file contents were omitted",
-                quote_os_path(path)
+                "failed to parse permissions at {} ({}); file contents were omitted",
+                quote_os_path(path),
+                toml_error_location(Some(&raw), &err)
             )
         })?
     };

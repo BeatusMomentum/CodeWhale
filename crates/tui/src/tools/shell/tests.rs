@@ -1513,15 +1513,23 @@ fn readonly_github_shell_calls_obey_the_host_network_policy_before_spawn() {
         .to_string();
     assert!(prompted.contains("requires network approval"));
 
-    // Read-only agents: every segment is judged, and npm reads count too.
+    // Read-only agents: every admitted network segment is judged.
     let readonly_deny = context(crate::network_policy::DecisionToml::Deny)
         .with_shell_policy(crate::worker_profile::ShellPolicy::ReadOnly);
-    for command in ["gh pr view 1 | head", "ls && gh issue list", "npm view x"] {
+    for command in ["gh pr view 1 | head", "ls && gh issue list"] {
         let denied = enforce_readonly_network_reads(command, &readonly_deny)
             .expect_err("a network read inside a composition is still judged")
             .to_string();
         assert!(denied.contains("blocked"), "{command}: {denied}");
     }
+    // npm is refused by the command authority before a configured registry
+    // could be mistaken for the fixed public-registry network label.
+    let npm = json!({"command": "npm view x"});
+    let refusal = exec_shell_input_agent_readonly_verdict(&npm).expect_err("npm needs approval");
+    assert!(refusal.detail.contains("configuration"));
+    // An ordinary full shell retains its existing policy/approval path.
+    enforce_readonly_network_reads("npm view x", &deny)
+        .expect("npm is not granted or refused by full-shell read-only detection");
     // A full shell keeps its historical scope: only a lone gh read.
     enforce_readonly_network_reads("gh pr view 1 | head", &deny)
         .expect("full shell pipelines are governed elsewhere");

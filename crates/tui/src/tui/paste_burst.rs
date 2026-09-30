@@ -145,6 +145,13 @@ impl PasteBurst {
 
     pub fn append_newline_if_active(&mut self, now: Instant) -> bool {
         if self.is_active() {
+            // A held first char precedes this newline in arrival order; move
+            // it into the burst first or it would land after the newline
+            // ("a\nb" became "\nab").
+            if let Some((held, _)) = self.pending_first_char.take() {
+                self.buffer.push(held);
+                self.active = true;
+            }
             self.buffer.push('\n');
             self.burst_window_until = Some(now + PASTE_ENTER_SUPPRESS_WINDOW);
             true
@@ -304,6 +311,30 @@ mod tests {
         assert!(matches!(
             burst.flush_if_due(t2),
             FlushResult::Paste(ref s) if s == "ab"
+        ));
+    }
+
+    #[test]
+    fn newline_after_held_first_char_keeps_arrival_order() {
+        let mut burst = PasteBurst::default();
+        let t0 = Instant::now();
+        assert!(matches!(
+            burst.on_plain_char('1', t0),
+            CharDecision::RetainFirstChar
+        ));
+        let t1 = t0 + Duration::from_millis(1);
+        assert!(burst.append_newline_if_active(t1));
+        let t2 = t1 + Duration::from_millis(1);
+        let decision = burst.on_plain_char('2', t2);
+        assert!(matches!(
+            decision,
+            CharDecision::BufferAppend | CharDecision::BeginBufferFromPending
+        ));
+        burst.append_char_to_buffer('2', t2);
+        let t3 = t2 + PasteBurst::recommended_active_flush_delay() + Duration::from_millis(1);
+        assert!(matches!(
+            burst.flush_if_due(t3),
+            FlushResult::Paste(ref s) if s == "1\n2"
         ));
     }
 

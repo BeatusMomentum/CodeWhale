@@ -1,5 +1,7 @@
 # Rebrand: DeepSeek TUI → Codewhale
 
+> 阅读简体中文版：[zh_hans/REBRAND.md](zh_hans/REBRAND.md)。
+
 Starting with **v0.8.41**, this project ships under a new name: `codewhale`.
 
 This document explains what changed, what didn't, and how to migrate. None of the
@@ -138,7 +140,7 @@ to `npm install -g codewhale`.
 
 ### Homebrew
 
-**Current published state (v0.9.13, published 2026-09-14; workspace source version 0.9.13):** The
+**Historical migration state as of v0.9.13 (published 2026-09-14):** The
 formula is `codewhale`. New installs:
 
 ```bash

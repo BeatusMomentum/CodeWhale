@@ -431,6 +431,7 @@ fn parse_skill_snapshots(
             }
             skill_snapshots.push(PluginSkillSnapshot {
                 name: skill.name.clone(),
+                legacy_activation_name: skill.legacy_activation_name.clone(),
                 description: skill.description.clone(),
                 localized_descriptions: skill.localized_descriptions.clone(),
                 invocation: skill.invocation,

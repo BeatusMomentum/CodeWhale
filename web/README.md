@@ -2,7 +2,7 @@
 
 Documentation and community site for [Codewhale](https://github.com/Hmbown/CodeWhale) — lives at **codewhale.net**.
 
-Next.js 15 (App Router) + Tailwind, deployed to Cloudflare Workers via [`@opennextjs/cloudflare`](https://opennext.js.org/cloudflare). Curated "Today's Dispatch" content is regenerated every 6 hours by a Cloudflare Cron Trigger that calls `deepseek-v4-flash` to summarise recent repo activity, and stored in Workers KV.
+Next.js 15 (App Router) + Tailwind, deployed to Cloudflare Workers via [`@opennextjs/cloudflare`](https://opennext.js.org/cloudflare). Curated "Today's Dispatch" content is regenerated every 6 hours by a Cloudflare Cron Trigger that calls `deepseek-flash` to summarise recent repo activity, and stored in Workers KV.
 
 ## Local dev
 
@@ -21,7 +21,7 @@ Env (mirrors `.env.example`):
 | `GITHUB_TOKEN`              | Fine-grained PAT, public-repo read scope                         | optional (raises rate limit 60 → 5000 req/h) |
 | `GITHUB_REPO`               | Defaults to `Hmbown/CodeWhale`                                   | optional             |
 | `CRON_SECRET`               | Shared secret for manual `/api/cron` invocation                  | optional (Cloudflare cron triggers don't need it) |
-| `DEEPSEEK_MODEL`            | Defaults to `deepseek-v4-flash`                                  | optional             |
+| `DEEPSEEK_MODEL`            | Defaults to `deepseek-flash`                                     | optional             |
 | `DEEPSEEK_BASE_URL`         | Defaults to `https://api.deepseek.com`                           | optional             |
 | `MAINTAINER_TOKEN`          | Admin panel auth; enter it in the `/admin` login form            | only for `/admin`    |
 | `MAINTAINER_GITHUB_PAT`     | PAT with `issues:write`, for posting comments via `/admin`       | only for `/admin` posting |

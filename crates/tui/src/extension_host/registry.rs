@@ -23,6 +23,7 @@ pub const MAX_TOOLS_PER_HOST: usize = 1024;
 /// Name prefixes no extension may use: MCP's namespace, and one kept free
 /// for future core-issued extension names.
 const RESERVED_PREFIXES: &[&str] = &["mcp_", "ext_"];
+const NAME_HINT: &str = "use a plugin-specific prefix, for example `myplugin_read_x`";
 
 /// Core tool names that exist outside the native registry builder (catalog
 /// meta-tools) and so never show up in a registry snapshot.
@@ -224,7 +225,7 @@ impl OwnerRegistry {
     }
 
     /// Mark an owner failed or faulted and drop everything it registered.
-    pub fn mark_failed(&mut self, owner: &OwnerRef, state: OwnerState) {
+    pub fn mark_failed(&mut self, owner: &OwnerRef, state: OwnerState) -> bool {
         let matches = self
             .owners
             .get(&owner.plugin_id)
@@ -235,6 +236,7 @@ impl OwnerRegistry {
                 entry.state = state;
             }
         }
+        matches
     }
 
     /// Admit or refuse one `registry/register`.
@@ -248,7 +250,7 @@ impl OwnerRegistry {
         let name = spec.name.as_str();
         if !valid_tool_name(name) {
             return Err(format!(
-                "tool name `{}` must match ^[A-Za-z][A-Za-z0-9_-]{{0,63}}$",
+                "tool name `{}` must match ^[A-Za-z][A-Za-z0-9_-]{{0,63}}$; {NAME_HINT}",
                 crate::safe_label::SafeLabel::identifier(name)
             ));
         }
@@ -257,16 +259,18 @@ impl OwnerRegistry {
             .iter()
             .any(|prefix| key.starts_with(prefix))
         {
-            return Err(format!("tool name `{name}` uses a reserved prefix"));
+            return Err(format!(
+                "tool name `{name}` uses a reserved prefix; {NAME_HINT}"
+            ));
         }
         if self.native_names.contains(&key) {
             return Err(format!(
-                "tool name `{name}` collides with a built-in tool; extensions never shadow core tools"
+                "tool name `{name}` collides with a built-in tool; extensions never shadow core tools; {NAME_HINT}"
             ));
         }
         if let Some(reason) = core_special_case(name) {
             return Err(format!(
-                "tool name `{name}` is reserved: {reason}; extension tools never borrow a built-in's approval identity"
+                "tool name `{name}` is reserved: {reason}; extension tools never borrow a built-in's approval identity; {NAME_HINT}"
             ));
         }
         if spec.description.len() > MAX_DESCRIPTION_BYTES {
@@ -296,7 +300,7 @@ impl OwnerRegistry {
         {
             if existing.owner.plugin_id != params.owner.plugin_id {
                 return Err(format!(
-                    "tool name `{name}` is already registered by extension `{}`",
+                    "tool name `{name}` is already registered by extension `{}`; {NAME_HINT}",
                     existing.plugin_name
                 ));
             }
@@ -391,13 +395,35 @@ impl OwnerRegistry {
     }
 
     /// Forget owners that are not live (failed, faulted, revoked) so a new
-    /// session retries them.
+    /// explicit plugin mutation retries them.
     pub fn forget_inactive(&mut self) {
         self.owners
             .retain(|_, entry| matches!(entry.state, OwnerState::Activating | OwnerState::Active));
     }
 
-    /// The host exited: every owner is revoked and every tool is gone.
+    /// A crash drops live registrations, preserves failed/faulted receipts,
+    /// and blames the sole activating owner. Other owners are replayable only
+    /// after reconciliation verifies their current persisted authority again.
+    pub fn host_exited(&mut self, reason: &str) {
+        self.tools.clear();
+        self.by_name.clear();
+        let activating: Vec<_> = self
+            .owners
+            .values()
+            .filter(|entry| entry.state == OwnerState::Activating)
+            .map(|entry| entry.owner.plugin_id.clone())
+            .collect();
+        if let [plugin] = activating.as_slice() {
+            self.owners.get_mut(plugin).expect("activating owner").state =
+                OwnerState::Failed(format!("host crashed during activation: {reason}"));
+        }
+        self.owners.retain(|_, entry| {
+            matches!(entry.state, OwnerState::Failed(_) | OwnerState::Faulted(_))
+        });
+    }
+
+    /// Planned test shutdown drops all tools and fails the remaining live owners.
+    #[cfg(test)]
     pub fn revoke_all(&mut self, reason: &str) {
         self.tools.clear();
         self.by_name.clear();

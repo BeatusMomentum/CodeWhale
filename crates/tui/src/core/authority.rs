@@ -589,7 +589,9 @@ fn carve_out_relative_path_allowed(relative: &Path) -> bool {
 /// `.git` internals, runtime/project state, credential-bearing directories
 /// and files, and key material.
 fn is_carve_out_excluded_name(name: &str) -> bool {
-    if name == ".git" {
+    // The shared `.git` rule, so a Windows alias (`.git.`, `GIT~1`) is
+    // excluded here exactly as the workspace file routes exclude it.
+    if crate::snapshot::is_git_metadata_name(OsStr::new(name)) {
         return true;
     }
     // Runtime/project state and credential-bearing directories. `.codewhale`
@@ -889,6 +891,26 @@ mod tests {
                 "{paths:?} must keep the modal"
             );
         }
+    }
+
+    #[test]
+    fn carve_out_excludes_git_metadata_by_the_shared_rule() {
+        let tmp = carve_out_workspace();
+        let workspace = tmp.path();
+        let mut refused = vec![".GIT/config", "nested/.Git/hooks/pre-commit"];
+        if cfg!(windows) {
+            refused.extend([".git./config", ".git /config", "GIT~1/config"]);
+        }
+        for path in refused {
+            assert!(
+                !paths_within_workspace_write_carve_out(workspace, &[path.to_string()]),
+                "{path} must keep the modal"
+            );
+        }
+        assert!(paths_within_workspace_write_carve_out(
+            workspace,
+            &[".github/workflows/ci.yml".to_string()]
+        ));
     }
 
     #[test]

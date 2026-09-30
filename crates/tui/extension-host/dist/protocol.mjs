@@ -19,7 +19,7 @@ var ErrorCode = {
   Cancelled: -32800
 };
 var CORE_TO_HOST = {
-  requests: ["host/initialize", "host/shutdown", "ext/activate", "ext/deactivate", "tool/call"],
+  requests: ["host/initialize", "host/shutdown", "host/ping", "ext/activate", "ext/deactivate", "tool/call"],
   notifications: ["$/cancel"]
 };
 var HOST_TO_CORE = {
@@ -154,6 +154,7 @@ var PARAMS = {
     )
   },
   "host/shutdown": { dir: "core", required: {} },
+  "host/ping": { dir: "core", required: {} },
   "ext/activate": {
     dir: "core",
     required: { owner: "owner", plugin_name: "string", entry: "object" },

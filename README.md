@@ -137,6 +137,7 @@ stack and [configuration](docs/CONFIGURATION.md) for local settings.
 
 ## Documentation
 
+- [GitHub PR review setup](docs/GITHUB_ACTION.md)
 - [Providers and local models](docs/PROVIDERS.md)
 - [Agent teams](docs/FLEET.md)
 - [MCP](docs/MCP.md), [hooks](docs/HOOKS.md), and [configuration](docs/CONFIGURATION.md)

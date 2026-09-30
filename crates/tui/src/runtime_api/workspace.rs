@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::dependencies::{ExternalTool as _, Git};
+use crate::snapshot::is_git_metadata_name;
 
 use super::{ApiError, RuntimeApiState};
 
@@ -412,7 +413,7 @@ pub(super) fn relative_request_path(raw: &str, allow_root: bool) -> Result<PathB
     }
     if path
         .components()
-        .any(|component| matches!(component, Component::Normal(name) if name == ".git"))
+        .any(|component| matches!(component, Component::Normal(name) if is_git_metadata_name(name)))
     {
         return Err(ApiError::forbidden("the .git directory is not served"));
     }
@@ -495,7 +496,7 @@ fn list_workspace_directory(
         let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
             continue;
         };
-        if name == ".git" {
+        if is_git_metadata_name(std::ffi::OsStr::new(&name)) {
             continue;
         }
         let Ok(file_type) = entry.file_type() else {
@@ -883,6 +884,39 @@ pub(super) async fn workspace_instructions(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn git_metadata_directory_is_refused_in_any_letter_case() {
+        for raw in [
+            ".git",
+            ".git/config",
+            ".GIT/config",
+            ".Git/hooks/pre-commit",
+            "sub/.gIt/HEAD",
+        ] {
+            let error = relative_request_path(raw, false).expect_err(raw);
+            assert_eq!(error.status, StatusCode::FORBIDDEN, "{raw}");
+        }
+        for raw in [".github/workflows/ci.yml", "a.git/b", ".gitignore", "git"] {
+            assert!(relative_request_path(raw, false).is_ok(), "{raw}");
+        }
+    }
+
+    #[test]
+    fn listing_hides_git_metadata_directory_in_any_letter_case() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        std::fs::create_dir_all(tmp.path().join(".Git"))?;
+        std::fs::write(tmp.path().join("kept.txt"), "kept")?;
+        let listing = list_workspace_directory(tmp.path(), FsPath::new(""), 100)
+            .map_err(|error| anyhow::anyhow!(error.message))?;
+        let names: Vec<&str> = listing
+            .entries
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect();
+        assert_eq!(names, ["kept.txt"]);
+        Ok(())
+    }
 
     #[test]
     fn workspace_file_search_reuses_discovery_ignores() -> anyhow::Result<()> {

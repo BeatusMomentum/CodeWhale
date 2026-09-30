@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Contributors
+
+- **[@SparkofSpike](https://github.com/SparkofSpike)** — translated seventeen Tier-2 guides and thirteen developer and internal docs into Simplified Chinese, and connected the localized documentation ([#6662](https://github.com/Hmbown/Codewhale/pull/6662), [#6663](https://github.com/Hmbown/Codewhale/pull/6663)).
+- **[@harryvgiunta](https://github.com/harryvgiunta)** — added Yolo-Auto as a bundled OpenAI-compatible host, starting on the vendor's recommended `qwen3.8-flash` model ([#6408](https://github.com/Hmbown/Codewhale/pull/6408)).
+
 ## [0.10.1] - 2026-09-28
 
 The website's not-found page now uses the Codwhale poster and typo joke,
@@ -47,7 +52,7 @@ quieter, and Fleet runs can be checked before they spend anything.
 ### Contributors
 
 - **[@gaord](https://github.com/gaord)** — let a client fork a thread at a named turn ([#6580](https://github.com/Hmbown/Codewhale/pull/6580)), let undo roll back files for the turn it is undoing ([#6483](https://github.com/Hmbown/Codewhale/pull/6483)), stopped resume and fork from duplicating threads and sessions ([#6406](https://github.com/Hmbown/Codewhale/pull/6406)), exposed user-defined provider routes to native clients ([#6404](https://github.com/Hmbown/Codewhale/pull/6404)), and kept a fork going when a turn lost its tool call ([#6664](https://github.com/Hmbown/Codewhale/pull/6664)).
-- **[@Lstarsky0](https://github.com/Lstarsky0)** — moved the docs/work, legal, digest and FAQ pages onto the dictionary spine ([#6405](https://github.com/Hmbown/Codewhale/pull/6405), [#6417](https://github.com/Hmbown/Codewhale/pull/6417), [#6499](https://github.com/Hmbown/Codewhale/pull/6499), [#6574](https://github.com/Hmbown/Codewhale/pull/6574)), tightened the Chinese-branching ceiling to 18 ([#6403](https://github.com/Hmbown/Codewhale/pull/6403)), and made Fleet publish without a two-link window ([#6431](https://github.com/Hmbown/Codewhale/pull/6431)).
+- **[@Lstarsky0](https://github.com/Lstarsky0)** — moved the docs/work, legal, digest and FAQ pages onto the dictionary spine ([#6405](https://github.com/Hmbown/Codewhale/pull/6405), [#6417](https://github.com/Hmbown/Codewhale/pull/6417), [#6499](https://github.com/Hmbown/Codewhale/pull/6499), [#6574](https://github.com/Hmbown/Codewhale/pull/6574)), tightened the Chinese-branching ceiling to 18 ([#6403](https://github.com/Hmbown/Codewhale/pull/6403)), and made Fleet publish without a two-link window ([#6431](https://github.com/Hmbown/Codewhale/pull/6431)). Also moved the constitution page onto the dictionary spine and kept its install link in the selected locale ([#6733](https://github.com/Hmbown/Codewhale/pull/6733)).
 - **[@aboimpinto](https://github.com/aboimpinto)** — restored a green Linux full-workspace test gate without loosening any test, twice ([#6581](https://github.com/Hmbown/Codewhale/pull/6581), [#6666](https://github.com/Hmbown/Codewhale/pull/6666)).
 - **[@dajiaohuang](https://github.com/dajiaohuang)** — `codewhale config set` checks a known setting's value against its schema type before saving it ([#6568](https://github.com/Hmbown/Codewhale/pull/6568)).
 - **[@cenab](https://github.com/cenab)** — requested the Tsubasa provider row and supplied its endpoint, key and model values ([#6695](https://github.com/Hmbown/Codewhale/issues/6695)).

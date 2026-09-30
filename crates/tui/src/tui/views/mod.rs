@@ -1224,7 +1224,7 @@ pub struct ViewStack {
     /// When the view now on top became the top view — pushed, or revealed
     /// by closing or removing the views above it. A key observed before
     /// this instant was typed at something else and must never answer an
-    /// approval card that only then became visible (approvals M2).
+    /// approval or elevation card that only then became visible (approvals M2).
     top_since: Option<std::time::Instant>,
 }
 
@@ -1315,14 +1315,16 @@ impl ViewStack {
     }
 
     /// Whether a key observed at `observed_at` predates the moment the
-    /// approval card on top became visible — raised, or revealed by closing
-    /// the card above it — i.e. it was typed ahead and must not answer that
-    /// card. Two quick `y` presses answer one card, never the one beneath.
+    /// approval or elevation card on top became visible — raised, or revealed
+    /// by closing the card above it — i.e. it was typed ahead and must not
+    /// answer that card. Two quick answers cannot confirm the card beneath.
     pub fn key_predates_top_approval(&self, observed_at: std::time::Instant) -> bool {
-        self.top_approval_id().is_some()
-            && self
-                .top_since
-                .is_some_and(|top_since| observed_at < top_since)
+        matches!(
+            self.top_kind(),
+            Some(ModalKind::Approval | ModalKind::Elevation)
+        ) && self
+            .top_since
+            .is_some_and(|top_since| observed_at < top_since)
     }
 
     pub fn contains_kind(&self, kind: ModalKind) -> bool {

@@ -16,6 +16,15 @@ use crate::tools::subagent::{AgentWorkerStatus, CoordinationDetailProjection, Su
 use crate::tools::user_input::UserInputRequest;
 use codewhale_models::{Message, SystemPrompt, Tool, Usage};
 
+/// Provider correlation retained only for model-history reconstruction.
+/// Event ids remain host execution ids; this is not approval authority.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModelToolCall {
+    pub provider_id: String,
+    pub caller: Option<codewhale_models::ToolCaller>,
+    pub thought_signature: Option<String>,
+}
+
 /// Final status for a turn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -234,6 +243,7 @@ pub enum Event {
     /// Tool call initiated
     ToolCallStarted {
         id: String,
+        model_call: Option<ModelToolCall>,
         name: String,
         input: Value,
     },
@@ -248,6 +258,7 @@ pub enum Event {
     /// Tool call completed
     ToolCallComplete {
         id: String,
+        model_call: Option<ModelToolCall>,
         name: String,
         result: Result<ToolResult, ToolError>,
     },
@@ -973,7 +984,7 @@ pub fn bounded_gate_reason(reason: &str) -> String {
     out
 }
 
-fn is_bidi_format_control(c: char) -> bool {
+pub(crate) fn is_bidi_format_control(c: char) -> bool {
     matches!(
         c,
         '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'

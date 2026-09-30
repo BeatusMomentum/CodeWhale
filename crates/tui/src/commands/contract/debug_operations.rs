@@ -151,61 +151,67 @@ pub(in crate::commands) fn undo_conversation(app: &mut App) -> usize {
 }
 
 pub(crate) fn prune_undone_tool_context(app: &mut App, tool_id: &str) {
+    // A display/control id alone must not choose between duplicated or mixed
+    // legacy/local history. Refuse to prune when the source is ambiguous.
+    let mut matches = app
+        .api_messages
+        .iter()
+        .enumerate()
+        .flat_map(|(msg_idx, msg)| {
+            msg.content
+                .iter()
+                .enumerate()
+                .filter_map(move |(block_idx, block)| {
+                    (matches!(block, ContentBlock::ToolUse { .. })
+                        && block.tool_call_key().is_some_and(|key| {
+                            !key.as_str().trim().is_empty() && key.as_str() == tool_id
+                        }))
+                    .then_some((msg_idx, block_idx))
+                })
+        });
+    let Some((msg_idx, block_idx)) = matches.next() else {
+        return;
+    };
+    if matches.next().is_some() {
+        return;
+    }
+    drop(matches);
     if let Some(history_idx) = app.tool_cells.get(tool_id).copied() {
         app.truncate_history_to(history_idx);
     }
-
-    let Some((msg_idx, block_idx)) =
-        app.api_messages
-            .iter()
-            .enumerate()
-            .find_map(|(msg_idx, msg)| {
-                msg.content
-                    .iter()
-                    .position(
-                        |block| matches!(block, ContentBlock::ToolUse { id, ..} if id == tool_id),
-                    )
-                    .map(|block_idx| (msg_idx, block_idx))
-            })
-    else {
-        return;
-    };
-
     let kept_blocks = app.api_messages[msg_idx].content[..block_idx].to_vec();
-    let kept_tool_ids: std::collections::HashSet<String> = kept_blocks
+    let kept_tool_ids: std::collections::HashSet<_> = kept_blocks
         .iter()
         .filter_map(|block| match block {
-            ContentBlock::ToolUse { id, .. } => Some(id.clone()),
+            ContentBlock::ToolUse { id, .. } => block.tool_call_key().map(|key| (key, id.as_str())),
             _ => None,
         })
         .collect();
-
     if kept_blocks.is_empty() {
         app.truncate_api_messages(msg_idx);
         return;
     }
-    // Re-inserted tool results keep the stamp they earned, so the journal's
-    // timeline survives the prune.
-    let preserved_tool_results: Vec<_> =
-        app.api_messages_stamped()
-            .skip(msg_idx + 1)
-            .take_while(|(msg, _)| {
-                msg.role == "user"
-                    && !msg.content.is_empty()
-                    && msg
-                        .content
-                        .iter()
-                        .all(|block| tool_result_id(block).is_some())
-            })
-            .filter(|(msg, _)| {
-                msg.role == "user"
-                    && !msg.content.is_empty()
-                    && msg.content.iter().all(|block| {
-                        tool_result_id(block).is_some_and(|id| kept_tool_ids.contains(id))
-                    })
-            })
-            .map(|(msg, stamp)| (msg.clone(), stamp))
-            .collect();
+    // Preserve surviving result blocks even when a message also contains the
+    // undone result; retain the stamp of the original message.
+    let preserved_tool_results: Vec<_> = app
+        .api_messages_stamped()
+        .skip(msg_idx + 1)
+        .take_while(|(msg, _)| {
+            msg.role == "user"
+                && !msg.content.is_empty()
+                && msg
+                    .content
+                    .iter()
+                    .all(|block| tool_result_id(block).is_some())
+        })
+        .filter_map(|(msg, stamp)| {
+            let mut retained = msg.clone();
+            retained.content.retain(|block| {
+                tool_result_id(block).is_some_and(|key| kept_tool_ids.contains(&key))
+            });
+            (!retained.content.is_empty()).then_some((retained, stamp))
+        })
+        .collect();
     app.truncate_api_messages(msg_idx + 1);
     app.api_messages_mut()[msg_idx].content = kept_blocks;
     for (message, stamp) in preserved_tool_results {
@@ -227,11 +233,13 @@ fn prune_undone_turn_context(app: &mut App) {
     }
 }
 
-fn tool_result_id(block: &ContentBlock) -> Option<&String> {
+fn tool_result_id(block: &ContentBlock) -> Option<(codewhale_models::ToolCallKey<'_>, &str)> {
     match block {
         ContentBlock::ToolResult { tool_use_id, .. }
         | ContentBlock::ToolSearchToolResult { tool_use_id, .. }
-        | ContentBlock::CodeExecutionToolResult { tool_use_id, .. } => Some(tool_use_id),
+        | ContentBlock::CodeExecutionToolResult { tool_use_id, .. } => {
+            block.tool_call_key().map(|key| (key, tool_use_id.as_str()))
+        }
         _ => None,
     }
 }

@@ -1563,6 +1563,8 @@ mod tests {
         let config_path = workspace.join(".deepseek").join("config.toml");
         std::fs::create_dir_all(config_path.parent().expect("config parent")).expect("config dir");
         let guard = ConfigPathGuard::new(&config_path);
+        // Skills live under the workspace here, so they load only once trusted.
+        crate::test_support::trust_workspace(&workspace);
         let options = TuiOptions {
             config_path: Some(config_path),
             skills_dir: workspace.join("skills"),
@@ -2409,6 +2411,8 @@ mod tests {
     }
 
     fn feat022_test_app(tmp: &tempfile::TempDir) -> App {
+        // The fixture's skills dir lives inside its workspace.
+        crate::test_support::trust_workspace(tmp.path());
         let mut options = crate::test_support::test_tui_options(tmp.path());
         options.skills_dir = tmp.path().join("skills");
         crate::test_support::test_app_with_options(options)

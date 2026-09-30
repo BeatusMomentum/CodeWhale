@@ -73,6 +73,7 @@ fn image_blocks_fixture() -> Vec<codewhale_models::Message> {
         codewhale_models::Message {
             role: Role::User,
             content: vec![ContentBlock::ToolResult {
+                execution_id: None,
                 tool_use_id: "call_1".to_string(),
                 content: "Read image file [image/png]".to_string(),
                 is_error: None,
@@ -228,6 +229,7 @@ fn blind_route_removes_nested_tool_result_image() {
     let mut messages = vec![codewhale_models::Message {
         role: Role::User,
         content: vec![ContentBlock::ToolResult {
+            execution_id: None,
             tool_use_id: "call-image".to_string(),
             content: "Read image file [image/png]".to_string(),
             is_error: None,
@@ -860,6 +862,7 @@ fn only_images_since_the_latest_prompt_count_as_this_turns() {
     let tool_image = codewhale_models::Message {
         role: Role::User,
         content: vec![ContentBlock::ToolResult {
+            execution_id: None,
             tool_use_id: "call".to_string(),
             content: "Read image".to_string(),
             is_error: None,

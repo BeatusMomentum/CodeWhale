@@ -1205,6 +1205,8 @@ mod tests {
         // only in a trusted workspace, which this composition test is not
         // about.
         let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
         let skills_root = dir.path().join("configured-skills");
         let skill_dir = skills_root.join("greet");
         std::fs::create_dir_all(&skill_dir).unwrap();
@@ -1213,7 +1215,7 @@ mod tests {
             "---\nname: greet\ndescription: Say hello\n---\n# Greet\nSay hello warmly.\n",
         )
         .unwrap();
-        let context = ToolContext::new(dir.path()).with_skills_config(&skills_root, false);
+        let context = ToolContext::new(&workspace).with_skills_config(&skills_root, false);
         let registry = ToolRegistryBuilder::new()
             .with_tool(Arc::new(crate::tools::skill::LoadSkillTool))
             .build(context.clone());

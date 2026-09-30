@@ -122,11 +122,7 @@ impl SessionEntry {
         }
     }
     pub fn short_id(&self) -> &str {
-        if self.id.len() >= 8 {
-            &self.id[..8]
-        } else {
-            &self.id
-        }
+        char_prefix(&self.id, 8)
     }
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -413,18 +409,35 @@ impl SessionImportContainer {
         serde_json::from_str(json)
     }
 }
+/// The first `chars` characters of `text`. Ids come from imported journals as
+/// well as from this process, so a byte slice could split a character.
+fn char_prefix(text: &str, chars: usize) -> &str {
+    let end = text
+        .char_indices()
+        .nth(chars)
+        .map_or(text.len(), |(index, _)| index);
+    &text[..end]
+}
+
+/// Render the journal as a tree, one line per reachable entry.
+///
+/// Indentation grows only where the history forks: an entry with a single
+/// child is followed by that child at the same depth, so a long linear
+/// session stays flat instead of drawing entry N at depth N. Each fork on the
+/// way down still adds one guide column. Several roots (a rewind to before
+/// the first message starts a new one) are drawn as siblings. The walk uses
+/// an explicit stack, so no session length can exhaust the thread's stack.
 pub fn render_tree(journal: &SessionJournal) -> String {
     if journal.entries.is_empty() {
         return "(empty session — no entries yet)".to_string();
     }
-    let index = journal.index();
     let mut out = String::new();
-    let mut children: HashMap<Option<&str>, Vec<&SessionEntry>> = HashMap::new();
-    for entry in &journal.entries {
+    let mut children: HashMap<Option<&str>, Vec<usize>> = HashMap::new();
+    for (index, entry) in journal.entries.iter().enumerate() {
         children
             .entry(entry.parent_id.as_deref())
             .or_default()
-            .push(entry);
+            .push(index);
     }
     let active_ids: HashSet<&str> = journal
         .root_to_leaf()
@@ -432,95 +445,132 @@ pub fn render_tree(journal: &SessionJournal) -> String {
         .map(|e| e.id.as_str())
         .collect();
     let leaf = journal.leaf_id.as_deref();
-    fn render_node(
-        out: &mut String,
-        children: &HashMap<Option<&str>, Vec<&SessionEntry>>,
-        active_ids: &HashSet<&str>,
-        leaf: Option<&str>,
-        parent: Option<&str>,
-        depth: usize,
-    ) {
-        let Some(nodes) = children.get(&parent) else {
-            return;
-        };
-        for (idx, entry) in nodes.iter().enumerate() {
-            let is_last = idx + 1 == nodes.len();
-            let prefix = if depth == 0 {
-                "".to_string()
-            } else {
-                let mut p = String::new();
-                for _ in 0..depth - 1 {
-                    p.push_str("│  ");
-                }
-                if is_last {
-                    p.push_str("└─ ");
-                } else {
-                    p.push_str("├─ ");
-                }
-                p
-            };
-            let marker = if Some(entry.id.as_str()) == leaf {
-                "*"
-            } else if active_ids.contains(entry.id.as_str()) {
-                "●"
-            } else {
-                "○"
-            };
-            let kind_label = match &entry.kind {
-                SessionEntryKind::Message { message } => {
-                    let role = &message.role;
-                    let snippet: String = message
-                        .content
-                        .iter()
-                        .filter_map(|b| match b {
-                            ContentBlock::Text { text, .. } => Some(text.as_str()),
-                            _ => None,
-                        })
-                        .collect::<Vec<_>>()
-                        .join(" ");
-                    let short: String = snippet.chars().take(60).collect();
-                    format!("{role}: {short}")
-                }
-                SessionEntryKind::User { text } => {
-                    let short: String = text.chars().take(60).collect();
-                    format!("user: {short}")
-                }
-                SessionEntryKind::Assistant { text } => {
-                    let short: String = text.chars().take(60).collect();
-                    format!("assistant: {short}")
-                }
-                SessionEntryKind::Compaction { summary, .. } => {
-                    let short: String = summary.chars().take(60).collect();
-                    format!("compaction: {short}")
-                }
-                SessionEntryKind::BranchSummary {
-                    branch_id, summary, ..
-                } => {
-                    let short: String = summary.chars().take(60).collect();
-                    format!("branch:{} {short}", &branch_id[..branch_id.len().min(8)])
-                }
-                SessionEntryKind::System { content } => {
-                    let short: String = content.chars().take(60).collect();
-                    format!("system: {short}")
-                }
-            };
-            out.push_str(&format!(
-                "{prefix}{marker} {} [{}] {kind_label}\n",
-                entry.short_id(),
-                entry.id
-            ));
-            render_node(out, children, active_ids, leaf, Some(&entry.id), depth + 1);
+    // (entry index, guide columns inherited from forks above, connector)
+    let mut stack: Vec<(usize, String, &'static str)> = Vec::new();
+    push_tree_children(&mut stack, children.get(&None), "");
+    // Duplicate ids in an imported journal would otherwise revisit a subtree
+    // forever; each entry is drawn at most once.
+    let mut drawn = vec![false; journal.entries.len()];
+    while let Some((index, guide, connector)) = stack.pop() {
+        if std::mem::replace(&mut drawn[index], true) {
+            continue;
         }
+        let entry = &journal.entries[index];
+        let marker = if Some(entry.id.as_str()) == leaf {
+            "*"
+        } else if active_ids.contains(entry.id.as_str()) {
+            "●"
+        } else {
+            "○"
+        };
+        out.push_str(&format!(
+            "{guide}{connector}{marker} {} [{}] {}\n",
+            entry.short_id(),
+            entry.id,
+            tree_label(&entry.kind)
+        ));
+        let child_guide = match connector {
+            "├─ " => format!("{guide}│  "),
+            "└─ " => format!("{guide}   "),
+            _ => guide,
+        };
+        push_tree_children(
+            &mut stack,
+            children.get(&Some(entry.id.as_str())),
+            &child_guide,
+        );
     }
-    render_node(&mut out, &children, &active_ids, leaf, None, 0);
-    let _ = index;
     if let Some(leaf_id) = leaf {
         out.push_str(&format!(
             "\nleaf: {leaf_id} (active, {} entries)\n",
             journal.entries.len()
         ));
     }
+    // Entries whose parents form a loop hang off no root and cannot be drawn;
+    // say so instead of letting the total above silently disagree.
+    let unreachable = drawn.iter().filter(|drawn| !**drawn).count();
+    if unreachable > 0 {
+        out.push_str(&format!(
+            "{unreachable} entries not reachable from a root\n"
+        ));
+    }
     out
+}
+
+/// Queue `nodes` so they pop in journal order. A lone child (or a lone root)
+/// continues its line of history without a connector; siblings get one each.
+fn push_tree_children(
+    stack: &mut Vec<(usize, String, &'static str)>,
+    nodes: Option<&Vec<usize>>,
+    guide: &str,
+) {
+    let Some(nodes) = nodes else {
+        return;
+    };
+    let forked = nodes.len() > 1;
+    for (position, &index) in nodes.iter().enumerate().rev() {
+        let connector = if !forked {
+            ""
+        } else if position + 1 == nodes.len() {
+            "└─ "
+        } else {
+            "├─ "
+        };
+        stack.push((index, guide.to_string(), connector));
+    }
+}
+
+fn tree_label(kind: &SessionEntryKind) -> String {
+    match kind {
+        SessionEntryKind::Message { message } => {
+            let role = &message.role;
+            let snippet: String = message
+                .content
+                .iter()
+                .filter_map(|b| match b {
+                    ContentBlock::Text { text, .. } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            format!("{role}: {}", label_snippet(&snippet))
+        }
+        SessionEntryKind::User { text } => format!("user: {}", label_snippet(text)),
+        SessionEntryKind::Assistant { text } => format!("assistant: {}", label_snippet(text)),
+        SessionEntryKind::Compaction { summary, .. } => {
+            format!("compaction: {}", label_snippet(summary))
+        }
+        SessionEntryKind::BranchSummary {
+            branch_id, summary, ..
+        } => format!(
+            "branch:{} {}",
+            char_prefix(branch_id, 8),
+            label_snippet(summary)
+        ),
+        SessionEntryKind::System { content } => format!("system: {}", label_snippet(content)),
+    }
+}
+
+/// The first 60 characters of an entry, kept on its one tree line: a line
+/// break, tab or other control character reads as a space, and bidirectional
+/// format characters, which would reorder the rest of the row, are dropped.
+fn label_snippet(text: &str) -> String {
+    text.chars()
+        .filter(|ch| {
+            !matches!(
+                ch,
+                '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
+            )
+        })
+        .map(|ch| {
+            if ch.is_control() || matches!(ch, '\u{2028}' | '\u{2029}') {
+                ' '
+            } else {
+                ch
+            }
+        })
+        .take(60)
+        .collect()
 }
 #[cfg(test)]
 mod tests {
@@ -684,6 +734,158 @@ mod tests {
         let tree = render_tree(&j);
         assert!(tree.contains('*'));
     }
+    #[test]
+    fn render_keeps_a_linear_session_flat() {
+        let mut j = SessionJournal::new();
+        for i in 0..200 {
+            j.append(SessionEntryKind::User {
+                text: format!("turn {i}"),
+            });
+        }
+        let tree = render_tree(&j);
+        let entry_lines: Vec<&str> = tree.lines().take(200).collect();
+        for (i, line) in entry_lines.iter().enumerate() {
+            assert!(
+                line.ends_with(&format!("user: turn {i}")),
+                "entry {i} out of order: {line:?}"
+            );
+            assert!(
+                line.starts_with(['●', '*']),
+                "a linear history must not indent: {line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn render_indents_only_at_forks() {
+        let mut j = SessionJournal::new();
+        let a = j.append(SessionEntryKind::User { text: "a".into() });
+        j.append(SessionEntryKind::User { text: "b".into() });
+        j.append(SessionEntryKind::User { text: "c".into() });
+        j.branch_to(&a).unwrap();
+        j.append(SessionEntryKind::User { text: "d".into() });
+        j.append(SessionEntryKind::User { text: "e".into() });
+        let tree = render_tree(&j);
+        let shape: Vec<String> = tree
+            .lines()
+            .take(5)
+            .map(|line| {
+                let (head, label) = line.split_once(" [").unwrap();
+                let prefix: String = head.chars().take_while(|c| !c.is_alphanumeric()).collect();
+                format!("{prefix}{}", label.rsplit(": ").next().unwrap())
+            })
+            .collect();
+        assert_eq!(
+            shape,
+            ["● a", "├─ ○ b", "│  ○ c", "└─ ● d", "   * e"],
+            "{tree}"
+        );
+    }
+
+    #[test]
+    fn render_draws_several_roots_as_siblings() {
+        let mut j = SessionJournal::new();
+        j.append(SessionEntryKind::User { text: "r1".into() });
+        j.append(SessionEntryKind::User { text: "c1".into() });
+        // A rewind to before the first message appends a second root.
+        j.leaf_id = None;
+        j.append(SessionEntryKind::User { text: "r2".into() });
+        j.append(SessionEntryKind::User { text: "d1".into() });
+        let tree = render_tree(&j);
+        let shape: Vec<String> = tree
+            .lines()
+            .take(4)
+            .map(|line| {
+                let (head, label) = line.split_once(" [").unwrap();
+                let prefix: String = head.chars().take_while(|c| !c.is_alphanumeric()).collect();
+                format!("{prefix}{}", label.rsplit(": ").next().unwrap())
+            })
+            .collect();
+        assert_eq!(
+            shape,
+            ["├─ ○ r1", "│  ○ c1", "└─ ● r2", "   * d1"],
+            "{tree}"
+        );
+    }
+
+    #[test]
+    fn render_keeps_each_entry_on_one_line_whatever_its_text_or_id() {
+        let mut j = SessionJournal::new();
+        j.append(SessionEntryKind::User {
+            text: "first line\nsecond line\r\n\tthird\u{202E}".into(),
+        });
+        // Imported ids need not be ASCII; a byte slice would split a char.
+        j.entries[0].id = "会話会話会話会話".into();
+        j.leaf_id = Some(j.entries[0].id.clone());
+        j.append(SessionEntryKind::BranchSummary {
+            branch_id: "枝枝枝枝枝枝枝枝枝".into(),
+            summary: "multi\nline".into(),
+            parent_branch_id: None,
+        });
+        let tree = render_tree(&j);
+        let lines: Vec<&str> = tree.lines().collect();
+        assert_eq!(
+            lines[0], "● 会話会話会話会話 [会話会話会話会話] user: first line second line   third",
+            "{tree}"
+        );
+        assert!(
+            lines[1].ends_with("branch:枝枝枝枝枝枝枝枝 multi line"),
+            "{tree}"
+        );
+        assert_eq!(lines.len(), 2 + 2, "two entries plus the footer: {tree}");
+    }
+
+    #[test]
+    fn render_draws_a_repeated_id_once_and_counts_unreachable_entries() {
+        let mut j = SessionJournal::new();
+        let a = j.append(SessionEntryKind::User { text: "a".into() });
+        j.append(SessionEntryKind::User { text: "b".into() });
+        // An imported journal repeating `a`'s id under `a` itself: following
+        // children by id would revisit `a`'s subtree forever.
+        let mut repeat = j.entries[0].clone();
+        repeat.parent_id = Some(a.clone());
+        j.entries.push(repeat);
+        // Two entries that are each other's parent hang off no root.
+        let mut x = SessionEntry::new(SessionEntryKind::User { text: "x".into() }, None, 0);
+        let mut y = SessionEntry::new(SessionEntryKind::User { text: "y".into() }, None, 0);
+        x.parent_id = Some(y.id.clone());
+        y.parent_id = Some(x.id.clone());
+        j.entries.extend([x, y]);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || tx.send(render_tree(&j)).ok());
+        let tree = rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("a repeated id must not make the walk revisit a subtree forever");
+        let entry_lines = tree.lines().take_while(|line| !line.is_empty()).count();
+        assert_eq!(
+            entry_lines, 3,
+            "each journal entry is drawn at most once: {tree}"
+        );
+        assert!(
+            tree.ends_with("2 entries not reachable from a root\n"),
+            "{tree}"
+        );
+    }
+
+    #[test]
+    fn render_handles_a_long_session_on_a_small_stack() {
+        let mut j = SessionJournal::new();
+        for i in 0..20_000 {
+            j.append(SessionEntryKind::User {
+                text: format!("turn {i}"),
+            });
+        }
+        // One recursion frame per entry overflows this long before the end.
+        let lines = std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(move || render_tree(&j).lines().count())
+            .unwrap()
+            .join()
+            .expect("rendering must not exhaust the stack");
+        assert_eq!(lines, 20_000 + 2);
+    }
+
     #[test]
     fn active_messages_root_to_leaf() {
         let mut j = SessionJournal::new();

@@ -904,6 +904,7 @@ mod tests {
             Message {
                 role: Role::Assistant,
                 content: vec![ContentBlock::ToolResult {
+                    execution_id: None,
                     tool_use_id: "call_1".to_string(),
                     content: "large tool output".repeat(40),
                     is_error: None,

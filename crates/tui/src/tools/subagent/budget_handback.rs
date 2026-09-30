@@ -63,31 +63,29 @@ pub(super) enum Outcome {
 }
 
 pub(super) fn repair_stopped_tool_calls(messages: &mut Vec<Message>, cause: &str) {
+    // Keep the final call blocks, so keys remain borrowed from their original
+    // identities while repair changes the message vector.
     let final_calls = messages
         .iter()
         .rev()
         .find(|message| message.role == Role::Assistant)
-        .into_iter()
-        .flat_map(|message| &message.content)
-        .filter_map(|block| match block {
-            ContentBlock::ToolUse { id, .. } => Some(id.clone()),
-            _ => None,
-        })
-        .collect::<HashSet<_>>();
+        .map(|message| message.content.clone())
+        .unwrap_or_default();
     let repair = crate::tool_history_repair::repair_tool_call_pairs_for_provider(messages);
-    let stopped = repair
-        .repaired_call_ids
-        .into_iter()
-        .filter(|id| final_calls.contains(id))
-        .collect::<HashSet<_>>();
-    for block in messages.iter_mut().flat_map(|message| &mut message.content) {
-        if let ContentBlock::ToolResult {
-            tool_use_id,
-            content,
-            ..
-        } = block
-            && stopped.contains(tool_use_id.as_str())
-        {
+    let final_message = messages
+        .iter()
+        .rposition(|message| message.role == Role::Assistant);
+    for (message_index, block_index) in repair.repaired_result_positions {
+        if !final_message.is_some_and(|index| message_index > index) {
+            continue;
+        }
+        let block = &mut messages[message_index].content[block_index];
+        let key = block.tool_call_key();
+        let is_final_call = key.is_some_and(|key| !key.as_str().trim().is_empty())
+            && final_calls.iter().any(|call| {
+                matches!(call, ContentBlock::ToolUse { .. }) && call.tool_call_key() == key
+            });
+        if is_final_call && let ContentBlock::ToolResult { content, .. } = block {
             *content = format!(
                 "Tool call not executed: task execution stopped at its budget boundary. Terminal status: budget_exhausted. {cause}"
             );

@@ -880,6 +880,10 @@ fn bracketed_paste_returns_dock_focus_to_the_visible_composer() {
 /// One representative terminal encoding per shell binding.
 fn shell_binding_probe(id: ShellBindingId) -> KeyEvent {
     match id {
+        ShellBindingId::ElevationUp => KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+        ShellBindingId::ElevationDown => KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+        ShellBindingId::ElevationConfirm => KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        ShellBindingId::ElevationAbort => KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
         ShellBindingId::PetResultUp => KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
         ShellBindingId::PetResultDown => KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
         ShellBindingId::PetResultPageUp => KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE),
@@ -9093,6 +9097,7 @@ fn apply_loaded_session_never_restores_background_shell_event_as_composer_draft(
             Message {
                 role: Role::Assistant,
                 content: vec![ContentBlock::ToolUse {
+                    execution_id: None,
                     id: "plan-complete".to_string(),
                     name: "update_plan".to_string(),
                     input: serde_json::json!({"plan": [{"step": "Check the output", "status": "completed"}]}),
@@ -9103,6 +9108,7 @@ fn apply_loaded_session_never_restores_background_shell_event_as_composer_draft(
             Message {
                 role: Role::User,
                 content: vec![ContentBlock::ToolResult {
+                    execution_id: None,
                     tool_use_id: "plan-complete".to_string(),
                     content: "Plan updated".to_string(),
                     is_error: None,
@@ -16959,12 +16965,6 @@ async fn empty_bang_shell_input_is_consumed_with_usage_error() {
     );
 }
 
-#[test]
-fn local_bang_shell_tool_ids_are_not_model_visible() {
-    assert!(!is_model_visible_tool_call("user_shell_1"));
-    assert!(is_model_visible_tool_call("toolu_01abc"));
-}
-
 fn complete_release_json(tag: &str) -> serde_json::Value {
     let assets = REQUIRED_RELEASE_ASSETS
         .iter()
@@ -21065,6 +21065,52 @@ fn try_autocomplete_file_mention_extends_to_common_prefix() {
 }
 
 #[test]
+fn try_autocomplete_file_mention_common_prefix_stops_at_whitespace() {
+    let tmpdir = TempDir::new().expect("tempdir");
+    std::fs::create_dir_all(tmpdir.path().join("My Docs")).unwrap();
+    std::fs::create_dir_all(tmpdir.path().join("My Dogs")).unwrap();
+    std::fs::write(tmpdir.path().join("My Docs/a.md"), "a").unwrap();
+    std::fs::write(tmpdir.path().join("My Dogs/b.md"), "b").unwrap();
+
+    let mut app = create_test_app();
+    app.workspace = tmpdir.path().to_path_buf();
+    app.input = "@My".to_string();
+    app.cursor_position = app.input.chars().count();
+
+    let _ = await_visible_mention_entries(&mut app, 64);
+    assert!(try_autocomplete_file_mention(&mut app));
+    // `@My Do` would split into a missing `@My` mention and leave the next
+    // Tab with no partial to complete.
+    assert_eq!(app.input, "@My");
+    assert!(
+        app.status_message
+            .as_deref()
+            .is_some_and(|status| status.starts_with("Matches:")),
+        "{:?}",
+        app.status_message
+    );
+}
+
+#[test]
+fn launch_submit_holds_oversized_draft_before_creating_a_session() {
+    let tmpdir = TempDir::new().expect("tempdir");
+    // `.codewhale` is a file, so `.codewhale/pastes` cannot be created.
+    std::fs::write(tmpdir.path().join(".codewhale"), "not a dir").unwrap();
+    let mut app = create_test_app();
+    app.workspace = tmpdir.path().to_path_buf();
+    let draft = "z".repeat(crate::tui::app::MAX_SUBMITTED_INPUT_CHARS + 1);
+    app.input = draft.clone();
+    app.cursor_position = app.input.chars().count();
+
+    assert!(super::event_loop::launch_submit_held(&mut app));
+    assert_eq!(app.input, draft, "the full text stays in the composer");
+
+    app.input = "hello".to_string();
+    app.cursor_position = app.input.chars().count();
+    assert!(!super::event_loop::launch_submit_held(&mut app));
+}
+
+#[test]
 fn try_autocomplete_file_mention_no_match_reports_status() {
     let tmpdir = TempDir::new().expect("tempdir");
     std::fs::write(tmpdir.path().join("README.md"), "x").unwrap();
@@ -21318,6 +21364,22 @@ fn apply_mention_menu_selection_splices_selected_entry() {
         input = app.input,
     );
     // Cursor should land at the end of the spliced token.
+    assert_eq!(app.cursor_position, app.input.chars().count());
+}
+
+#[test]
+fn apply_mention_menu_selection_quotes_a_path_with_spaces() {
+    // A bare `@My Docs/notes.md` parses as a missing `@My` mention; the
+    // quoted form is the one the send-time parser reads back whole.
+    let mut app = create_test_app();
+    app.input = "open @My".to_string();
+    app.cursor_position = app.input.chars().count();
+    app.mention_menu_selected = 0;
+    assert!(apply_mention_menu_selection(
+        &mut app,
+        &["My Docs/notes.md".to_string()]
+    ));
+    assert_eq!(app.input, "open @\"My Docs/notes.md\"");
     assert_eq!(app.cursor_position, app.input.chars().count());
 }
 
@@ -25322,11 +25384,14 @@ fn message_complete_drain_preserves_thinking_when_thinking_complete_lost() {
 #[test]
 fn approval_prompt_uses_event_input_after_message_complete_drain() {
     let mut app = create_test_app();
-    app.pending_tool_uses.push((
-        "tool-1".to_string(),
-        "exec_shell".to_string(),
-        serde_json::json!({"command": "stale value from drained list"}),
-    ));
+    app.pending_tool_uses.push(ContentBlock::ToolUse {
+        execution_id: Some("tool-1".to_string()),
+        id: "provider-tool-1".to_string(),
+        name: "exec_shell".to_string(),
+        input: serde_json::json!({"command": "stale value from drained list"}),
+        caller: None,
+        thought_signature: None,
+    });
 
     // Mirror the old race: MessageComplete drains pending tool uses before
     // ApprovalRequired is handled. The approval modal must still show the
@@ -26693,6 +26758,54 @@ fn typeahead_before_card_does_not_answer() {
     assert!(app.view_stack.key_predates_top_approval(typed_before));
     assert!(!app.view_stack.key_predates_top_approval(Instant::now()));
     assert_eq!(app.view_stack.top_kind(), Some(ModalKind::Approval));
+}
+
+#[test]
+fn stale_keys_cannot_answer_a_raised_or_revealed_elevation() {
+    use crate::tui::approval::ElevationOption;
+
+    let mut app = ask_posture_app();
+    let typed_before = Instant::now() - Duration::from_secs(1);
+    app.view_stack.push(ElevationView::new(
+        ElevationRequest::for_shell("elevation-id", "cargo test", "blocked", true, false),
+        codewhale_localization::Locale::En,
+    ));
+    let up = KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
+    assert!(route_key_to_view_stack(&mut app, up, typed_before).is_none());
+    assert_eq!(app.view_stack.top_approval_id(), None);
+    // Deliberately select Full Access, then cover it with another decision.
+    assert!(route_key_to_view_stack(&mut app, up, Instant::now()).is_some());
+    push_approval_request_view(
+        &mut app,
+        "approval-id",
+        "exec_shell",
+        "Run a command",
+        &serde_json::json!({"command": "cargo test"}),
+        "k",
+        "g",
+        None,
+        crate::config::ApprovalDefaultSelection::AllowOnce,
+        None,
+    );
+    let queued_enter = Instant::now();
+    std::thread::sleep(Duration::from_millis(2));
+    let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+    let events = route_key_to_view_stack(&mut app, enter, queued_enter).expect("visible approval");
+    assert!(
+        matches!(events.as_slice(), [ViewEvent::ApprovalDecision { tool_id, .. }] if tool_id == "approval-id")
+    );
+    assert_eq!(app.view_stack.top_kind(), Some(ModalKind::Elevation));
+    assert!(
+        route_key_to_view_stack(&mut app, enter, queued_enter).is_none(),
+        "Enter queued for the previous card must not elevate the newly revealed one"
+    );
+    assert_eq!(app.view_stack.top_kind(), Some(ModalKind::Elevation));
+    let events =
+        route_key_to_view_stack(&mut app, enter, Instant::now()).expect("fresh confirmation");
+    assert!(matches!(events.as_slice(), [ViewEvent::ElevationDecision {
+        tool_id, option: ElevationOption::FullAccess, ..
+    }] if tool_id == "elevation-id"));
+    assert!(app.view_stack.is_empty());
 }
 
 #[test]
@@ -29743,6 +29856,7 @@ fn backtrack_cut_index_skips_tool_result_user_messages() {
         Message {
             role: Role::Assistant,
             content: vec![ContentBlock::ToolUse {
+                execution_id: None,
                 id: "t1".into(),
                 name: "read_file".into(),
                 input: serde_json::json!({"path":"x"}),
@@ -29753,6 +29867,7 @@ fn backtrack_cut_index_skips_tool_result_user_messages() {
         Message {
             role: Role::User,
             content: vec![ContentBlock::ToolResult {
+                execution_id: None,
                 tool_use_id: "t1".into(),
                 content: "data".into(),
                 is_error: None,
@@ -30909,6 +31024,169 @@ fn a_scroll_burst_is_folded_into_one_frame() {
         pending.front().map(|observed| &observed.event),
         Some(Event::Key(_))
     ));
+}
+
+fn observed_key(c: char) -> ObservedTerminalEvent {
+    ObservedTerminalEvent::new(
+        Event::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)),
+        Instant::now(),
+    )
+}
+
+fn idle_input_pump() -> TerminalInputPump {
+    let (_tx, rx) = std::sync::mpsc::channel();
+    TerminalInputPump {
+        rx,
+        stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        paused: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        paused_ack: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        handle: None,
+        last_alive_at: std::cell::Cell::new(Instant::now()),
+    }
+}
+
+fn pending_key_chars(pending: &VecDeque<ObservedTerminalEvent>) -> String {
+    pending
+        .iter()
+        .filter_map(|observed| match &observed.event {
+            Event::Key(KeyEvent {
+                code: KeyCode::Char(c),
+                ..
+            }) => Some(*c),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Typing while the wheel scrolls: the loop has already drained the burst and
+/// the keys into `pending`. The key that ends the burst goes back to the head,
+/// so the composer receives "abc", not "bca".
+#[test]
+fn a_scroll_burst_keeps_following_input_in_order() {
+    let mut app = create_test_app();
+    app.launch.visible = false;
+    app.viewport.last_transcript_area = Some(Rect::new(0, 0, 80, 20));
+    let scroll = crossterm::event::MouseEvent {
+        kind: crossterm::event::MouseEventKind::ScrollDown,
+        column: 10,
+        row: 5,
+        modifiers: KeyModifiers::NONE,
+    };
+    let input = idle_input_pump();
+    let mut pending: VecDeque<ObservedTerminalEvent> = VecDeque::new();
+    pending.push_back(ObservedTerminalEvent::new(
+        Event::Mouse(scroll),
+        Instant::now(),
+    ));
+    for c in ['a', 'b', 'c'] {
+        pending.push_back(observed_key(c));
+    }
+
+    super::event_loop::coalesce_scroll_burst(&mut app, scroll, &input, &mut pending)
+        .expect("coalesce");
+
+    assert_eq!(pending_key_chars(&pending), "abc");
+}
+
+#[test]
+fn a_resize_burst_keeps_following_input_in_order() {
+    let input = idle_input_pump();
+    let mut pending: VecDeque<ObservedTerminalEvent> = VecDeque::new();
+    pending.push_back(ObservedTerminalEvent::new(
+        Event::Resize(120, 40),
+        Instant::now(),
+    ));
+    pending.push_back(observed_key('a'));
+    pending.push_back(observed_key('b'));
+
+    let size =
+        super::event_loop::coalesce_resize_burst(100, 30, &input, &mut pending).expect("coalesce");
+
+    assert_eq!(size, (120, 40), "the final queued size wins");
+    assert_eq!(pending_key_chars(&pending), "ab");
+}
+
+/// A failing session save reaches the user, not only the log, and the notice
+/// is withdrawn once a later save of that session lands.
+#[test]
+fn a_failing_session_save_shows_an_error_until_a_save_lands() {
+    use crate::tui::persistence_actor::SaveHealthReading;
+    let mut app = create_test_app();
+    let mut seen = 0;
+    let failing = SaveHealthReading {
+        generation: 1,
+        failing: Some((
+            "toast-probe".to_string(),
+            std::io::ErrorKind::PermissionDenied,
+        )),
+    };
+    let save_errors = |app: &App| {
+        app.status_toasts
+            .iter()
+            .filter(|toast| toast.level == StatusToastLevel::Error)
+            .count()
+    };
+
+    super::event_loop::surface_session_save_health(&mut app, Some(failing.clone()), &mut seen);
+    assert_eq!(seen, 1);
+    assert_eq!(save_errors(&app), 1, "a failing save is visible");
+    assert!(
+        app.status_toasts
+            .iter()
+            .any(|toast| toast.text.contains("toast-pr")),
+        "{:?}",
+        app.status_toasts
+    );
+
+    // Polling the same reading again does not repeat it.
+    super::event_loop::surface_session_save_health(&mut app, Some(failing), &mut seen);
+    assert_eq!(save_errors(&app), 1);
+
+    // The failure outlives any toast lifetime: well past the sticky TTL, and
+    // behind a full queue of newer notices, it is still there and shown once
+    // they expire, because nothing has recovered.
+    for toast in app.status_toasts.iter_mut() {
+        toast.created_at = std::time::Instant::now()
+            - std::time::Duration::from_millis(App::STICKY_ERROR_TTL_MS * 10);
+    }
+    for i in 0..30 {
+        app.push_status_toast(format!("newer {i}"), StatusToastLevel::Info, Some(1));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    let shown = app
+        .active_status_toast(crate::tui::underwater::ShellPhase::Idle)
+        .expect("a toast is shown");
+    assert!(shown.text.contains("toast-pr"), "{}", shown.text);
+    assert_eq!(save_errors(&app), 1, "a standing failure does not expire");
+
+    let healed = SaveHealthReading {
+        generation: 2,
+        failing: None,
+    };
+    super::event_loop::surface_session_save_health(&mut app, Some(healed), &mut seen);
+    assert_eq!(save_errors(&app), 0, "a later successful save withdraws it");
+}
+
+#[test]
+fn shutdown_reports_only_a_save_that_is_still_failing() {
+    use crate::tui::persistence_actor::SaveHealthReading;
+    let locale = codewhale_localization::Locale::En;
+    let healthy = SaveHealthReading {
+        generation: 4,
+        failing: None,
+    };
+    assert_eq!(
+        super::event_loop::shutdown_persistence_notice(locale, &healthy),
+        None,
+        "failures later replaced by a successful save are not reported"
+    );
+    let failing = SaveHealthReading {
+        generation: 5,
+        failing: Some(("session-a".to_string(), std::io::ErrorKind::StorageFull)),
+    };
+    let notice = super::event_loop::shutdown_persistence_notice(locale, &failing)
+        .expect("a failing save produces an exit notice");
+    assert!(notice.contains("session-a"), "{notice}");
 }
 
 // ---------------------------------------------------------------------------
@@ -32169,4 +32447,22 @@ async fn provider_switch_back_lands_on_root_default_owned_by_that_provider() {
     );
     assert_eq!(app.api_provider, ApiProvider::Openai);
     assert_eq!(app.model, "gpui-fixture");
+}
+
+#[test]
+fn transient_assistant_history_preserves_provider_and_local_tool_identity() {
+    let mut app = create_test_app();
+    let block = ContentBlock::ToolUse {
+        id: "wire-reused".to_string(),
+        execution_id: Some("local-fresh".to_string()),
+        name: "read".to_string(),
+        input: serde_json::json!({"path":"README.md"}),
+        caller: Some(codewhale_models::ToolCaller {
+            caller_type: "code_execution".to_string(),
+            tool_id: Some("provider-parent".to_string()),
+        }),
+        thought_signature: Some("provider-signature".to_string()),
+    };
+    push_assistant_message(&mut app, String::new(), None, vec![block.clone()]);
+    assert_eq!(app.api_messages.last().unwrap().content, vec![block]);
 }

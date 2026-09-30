@@ -28,6 +28,7 @@ import {
   EN_LEGAL_TERMS,
   EN_ROADMAP,
   EN_CONTRIBUTE,
+  EN_CONSTITUTION,
   fill,
   getChrome,
   getDocsGuide,
@@ -58,6 +59,7 @@ import {
   getLegalTerms,
   getRoadmap,
   getContribute,
+  getConstitution,
   pickText,
   pickTextLocale,
   splitToken,
@@ -279,6 +281,7 @@ describe("website dictionaries", () => {
       ["faq", getFaq, EN_FAQ],
       ["roadmap", getRoadmap, EN_ROADMAP],
       ["contribute", getContribute, EN_CONTRIBUTE],
+      ["constitution", getConstitution, EN_CONSTITUTION],
     ] as const) {
       const enKeys = Object.keys(reference).sort();
       for (const locale of [...DICTIONARY_LOCALES, "fr", "und"]) {

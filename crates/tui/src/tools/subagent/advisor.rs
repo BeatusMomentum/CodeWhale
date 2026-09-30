@@ -224,17 +224,20 @@ impl Default for EmissionGuard {
 
 /// Extract bounded tool-call/result pairs from a session message slice.
 ///
-/// Scans `messages` in reverse (newest first), collects up to `max_pairs`
-/// `ToolUse`/`ToolResult` pairs, then returns them oldest-first.
+/// Takes the newest `max_pairs` tool calls, then returns their unambiguous
+/// pairs oldest-first. Missing results remain pending; corrupt or ambiguous
+/// identities are omitted rather than borrowing another execution's output.
 #[must_use]
 pub fn extract_tool_call_pairs(messages: &[Message], max_pairs: usize) -> Vec<ToolCallPair> {
-    // Collect ToolUse names+inputs (from assistant messages) and
-    // ToolResult texts (from user messages) into a pairing structure.
-    let mut uses: Vec<(String, String, String)> = Vec::new(); // (id, name, input)
-    let mut results: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut uses = Vec::new();
+    let mut use_counts = std::collections::HashMap::new();
+    let mut results = std::collections::HashMap::new();
 
     for msg in messages {
         for block in &msg.content {
+            let Some(key) = block.tool_call_key() else {
+                continue;
+            };
             match block {
                 ContentBlock::ToolUse {
                     id, name, input, ..
@@ -244,37 +247,51 @@ pub fn extract_tool_call_pairs(messages: &[Message], max_pairs: usize) -> Vec<To
                         MAX_CHARS_PER_PAIR / 2,
                         "…",
                     );
-                    uses.push((id.clone(), name.clone(), input_str));
+                    *use_counts.entry(key).or_insert(0usize) += 1;
+                    uses.push((key, id.as_str(), name.as_str(), input_str));
                 }
                 ContentBlock::ToolResult {
                     tool_use_id,
                     content,
                     ..
                 } => {
-                    results.insert(
-                        tool_use_id.clone(),
-                        truncate_with_ellipsis(content, MAX_CHARS_PER_PAIR / 2, "…"),
-                    );
+                    results
+                        .entry(key)
+                        .and_modify(|result| *result = None)
+                        .or_insert_with(|| {
+                            Some((
+                                tool_use_id.as_str(),
+                                truncate_with_ellipsis(content, MAX_CHARS_PER_PAIR / 2, "…"),
+                            ))
+                        });
                 }
                 _ => {}
             }
         }
     }
 
-    // Match uses with results and take the last `max_pairs`.
     let start = uses.len().saturating_sub(max_pairs);
     uses[start..]
         .iter()
-        .map(|(id, name, input)| {
-            let result = results
-                .get(id.as_str())
-                .cloned()
-                .unwrap_or_else(|| "(pending)".to_string());
-            ToolCallPair {
-                name: name.clone(),
+        .filter_map(|(key, provider_id, name, input)| {
+            if key.as_str().trim().is_empty()
+                || provider_id.trim().is_empty()
+                || use_counts.get(key) != Some(&1)
+            {
+                return None;
+            }
+            let result = match results.get(key) {
+                Some(Some((result_provider, content))) if result_provider == provider_id => {
+                    content.clone()
+                }
+                Some(_) => return None,
+                None => "(pending)".to_string(),
+            };
+            Some(ToolCallPair {
+                name: (*name).to_string(),
                 input_preview: input.clone(),
                 result_preview: result,
-            }
+            })
         })
         .collect()
 }
@@ -585,6 +602,7 @@ mod tests {
             messages.push(Message {
                 role: Role::Assistant,
                 content: vec![ContentBlock::ToolUse {
+                    execution_id: None,
                     id: id.clone(),
                     name: "exec_shell".to_string(),
                     input: serde_json::json!({"command": format!("echo {i}")}),
@@ -596,6 +614,7 @@ mod tests {
             messages.push(Message {
                 role: Role::User,
                 content: vec![ContentBlock::ToolResult {
+                    execution_id: None,
                     tool_use_id: id,
                     content: format!("{i}"),
                     is_error: None,
@@ -633,6 +652,121 @@ mod tests {
         let messages = make_messages_with_n_tool_calls(3);
         let pairs = extract_tool_call_pairs(&messages, 10);
         assert_eq!(pairs.len(), 3);
+    }
+
+    #[test]
+    fn extract_tool_call_pairs_keep_execution_and_legacy_domains_distinct() {
+        let messages: Vec<Message> = serde_json::from_value(serde_json::json!([
+            {"role":"assistant", "content":[{"type":"tool_use", "id":"wire",
+                "execution_id":"first", "name":"read_file", "input":{"path":"first.txt"}}]},
+            {"role":"user", "content":[{"type":"tool_result", "tool_use_id":"wire",
+                "execution_id":"first", "content":"first output"}]},
+            {"role":"assistant", "content":[{"type":"tool_use", "id":"wire",
+                "execution_id":"second", "name":"read_file", "input":{"path":"second.txt"}}]},
+            {"role":"user", "content":[{"type":"tool_result", "tool_use_id":"wire",
+                "execution_id":"second", "content":"second output"}]},
+            {"role":"assistant", "content":[{"type":"tool_use", "id":"first",
+                "name":"read_file", "input":{"path":"legacy.txt"}}]},
+            {"role":"user", "content":[{"type":"tool_result", "tool_use_id":"first",
+                "content":"legacy output"}]}
+        ]))
+        .expect("transcript");
+        let pairs = extract_tool_call_pairs(&messages, 3);
+        assert_eq!(pairs.len(), 3);
+        for (pair, path, output) in [
+            (&pairs[0], "first.txt", "first output"),
+            (&pairs[1], "second.txt", "second output"),
+            (&pairs[2], "legacy.txt", "legacy output"),
+        ] {
+            assert!(pair.input_preview.contains(path));
+            assert_eq!(pair.result_preview, output);
+        }
+        let bounded = extract_tool_call_pairs(&messages, 2);
+        assert_eq!(bounded.len(), 2);
+        assert_eq!(bounded[0].result_preview, "second output");
+        assert_eq!(bounded[1].result_preview, "legacy output");
+        assert!(extract_tool_call_pairs(&messages, 0).is_empty());
+    }
+
+    #[test]
+    fn extract_tool_call_pairs_refuse_corrupt_identity_without_fallback() {
+        let call = |execution_id: Option<&str>| {
+            serde_json::json!({
+                "type":"tool_use", "id":"wire", "execution_id":execution_id,
+                "name":"read_file", "input":{"path":"selected.txt"}
+            })
+        };
+        let result = |execution_id: Option<&str>, provider: &str| {
+            serde_json::json!({
+                "type":"tool_result", "tool_use_id":provider, "execution_id":execution_id,
+                "content":"must not borrow this output"
+            })
+        };
+        for (label, calls, results, pending) in [
+            (
+                "duplicate local calls",
+                vec![call(Some("exec")), call(Some("exec"))],
+                vec![result(Some("exec"), "wire")],
+                false,
+            ),
+            (
+                "duplicate legacy calls",
+                vec![call(None), call(None)],
+                vec![result(None, "wire")],
+                false,
+            ),
+            (
+                "duplicate local results",
+                vec![call(Some("exec"))],
+                vec![result(Some("exec"), "wire"), result(Some("exec"), "wire")],
+                false,
+            ),
+            (
+                "duplicate legacy results",
+                vec![call(None)],
+                vec![result(None, "wire"), result(None, "wire")],
+                false,
+            ),
+            (
+                "wrong provider",
+                vec![call(Some("exec"))],
+                vec![result(Some("exec"), "other")],
+                false,
+            ),
+            (
+                "empty local identity",
+                vec![call(Some(""))],
+                vec![result(Some(""), "wire")],
+                false,
+            ),
+            (
+                "no local fallback",
+                vec![call(Some("exec"))],
+                vec![result(Some("wrong"), "wire"), result(None, "wire")],
+                true,
+            ),
+            (
+                "no legacy fallback",
+                vec![call(None)],
+                vec![result(Some("wire"), "wire")],
+                true,
+            ),
+            ("missing result", vec![call(Some("exec"))], vec![], true),
+        ] {
+            let messages: Vec<Message> = serde_json::from_value(serde_json::json!([
+                {"role":"assistant", "content":calls}, {"role":"user", "content":results}
+            ]))
+            .expect("transcript");
+            let pairs = extract_tool_call_pairs(&messages, 5);
+            assert_eq!(pairs.len(), usize::from(pending), "{label}");
+            if pending {
+                assert_eq!(pairs[0].result_preview, "(pending)", "{label}");
+            }
+            assert!(
+                !build_advisor_prompt(&pairs).contains("must not borrow"),
+                "{label}"
+            );
+        }
     }
 
     // ── rate limiting ─────────────────────────────────────────────────────

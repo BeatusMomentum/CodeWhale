@@ -1719,7 +1719,6 @@ impl Engine {
             .filter(|_| config.features.enabled(Feature::ExtensionHost))
             .map(|registry| {
                 let manager = crate::extension_host::manager();
-                manager.begin_session();
                 let attachment = manager.attach(Arc::clone(registry));
                 attachment.sync_in_background();
                 attachment
@@ -2095,6 +2094,7 @@ impl Engine {
         let _ = self
             .tx_event
             .send(Event::ToolCallStarted {
+                model_call: None,
                 id: tool_id.clone(),
                 name: tool_name.clone(),
                 input: tool_input.clone(),
@@ -2185,6 +2185,7 @@ impl Engine {
         let _ = self
             .tx_event
             .send(Event::ToolCallComplete {
+                model_call: None,
                 id: tool_id,
                 name: tool_name,
                 result,
@@ -7431,7 +7432,10 @@ impl Engine {
     // KV-cache effect: append-only user history. SessionUpdated persists this
     // warning even when an explicit prompt rebuild replaces the system prefix.
     fn record_project_trust_warning(&mut self) {
-        let warning = crate::skills::untrusted_project_skills_warning(&self.session.workspace);
+        let warning = crate::skills::untrusted_project_skills_warning(
+            &self.session.workspace,
+            Some(&self.config.skills_dir),
+        );
         let previous = self
             .session
             .messages

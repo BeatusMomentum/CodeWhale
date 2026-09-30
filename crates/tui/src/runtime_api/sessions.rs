@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::runtime_threads::{
-    CreateThreadRequest, RuntimeTurnStatus, ThreadDetail, ThreadListFilter, TurnItemKind,
+    CreateThreadRequest, RuntimeThreadManager, RuntimeTurnStatus, ThreadDetail, ThreadListFilter,
     TurnItemLifecycleStatus,
 };
 use crate::session_manager::{
@@ -17,10 +17,9 @@ use crate::session_manager::{
 };
 use crate::session_peek::{MAX_PEEK_ENTRIES, SessionPeek, build_peek};
 use crate::session_projection::{SessionQuery, SessionSortMode, SessionSummary, project_sessions};
-use codewhale_models::{ContentBlock, Message};
+use codewhale_models::{Message, Role};
 
 use super::{ApiError, RuntimeApiState, map_thread_err, truncate_text};
-use codewhale_models::Role;
 
 #[derive(Debug, Serialize)]
 pub(super) struct SessionsResponse {
@@ -444,7 +443,9 @@ pub(super) async fn create_session_from_thread(
         });
     }
 
-    let messages = messages_from_thread_detail(&detail);
+    let messages = messages_from_thread_detail(&detail).map_err(|error| {
+        ApiError::internal(format!("Failed to reconstruct thread history: {error}"))
+    })?;
     if messages.is_empty() {
         return Err(ApiError::bad_request(format!(
             "Thread {thread_id} has no user or assistant messages to save"
@@ -606,130 +607,15 @@ fn thread_detail_has_live_work(detail: &ThreadDetail) -> bool {
     })
 }
 
-pub(super) fn messages_from_thread_detail(detail: &ThreadDetail) -> Vec<Message> {
-    let items_by_id: HashMap<&str, _> = detail
-        .items
-        .iter()
-        .map(|item| (item.id.as_str(), item))
-        .collect();
-    let mut messages = Vec::new();
-
-    for turn in &detail.turns {
-        let mut assistant_blocks: Vec<ContentBlock> = Vec::new();
-        let mut user_blocks: Vec<ContentBlock> = Vec::new();
-        let flush_assistant = |blocks: &mut Vec<ContentBlock>, msgs: &mut Vec<Message>| {
-            if !blocks.is_empty() {
-                msgs.push(Message {
-                    role: Role::Assistant,
-                    content: std::mem::take(blocks),
-                });
-            }
-        };
-        let flush_user = |blocks: &mut Vec<ContentBlock>, msgs: &mut Vec<Message>| {
-            if !blocks.is_empty() {
-                msgs.push(Message {
-                    role: Role::User,
-                    content: std::mem::take(blocks),
-                });
-            }
-        };
-
-        for item_id in &turn.item_ids {
-            let Some(item) = items_by_id.get(item_id.as_str()) else {
-                continue;
-            };
-            match item.kind {
-                TurnItemKind::UserMessage => {
-                    flush_assistant(&mut assistant_blocks, &mut messages);
-
-                    let text = item.detail.as_deref().map(str::trim).unwrap_or("");
-                    if !text.is_empty() {
-                        user_blocks.push(ContentBlock::Text {
-                            text: text.to_string(),
-                            cache_control: None,
-                        });
-                    }
-                }
-                TurnItemKind::AgentMessage => {
-                    flush_user(&mut user_blocks, &mut messages);
-                    let text = item.detail.as_deref().map(str::trim).unwrap_or("");
-                    if !text.is_empty() {
-                        assistant_blocks.push(ContentBlock::Text {
-                            text: text.to_string(),
-                            cache_control: None,
-                        });
-                    }
-                }
-                TurnItemKind::AgentReasoning => {
-                    flush_user(&mut user_blocks, &mut messages);
-                    let thinking = item.detail.as_deref().map(str::trim).unwrap_or("");
-                    if !thinking.is_empty() {
-                        assistant_blocks.push(ContentBlock::Thinking {
-                            thinking: thinking.to_string(),
-                            signature: None,
-                            state: None,
-                        });
-                    }
-                }
-                TurnItemKind::ToolCall => {
-                    // Check metadata to distinguish tool_use from tool_result.
-                    let meta = item.metadata.as_ref();
-                    let is_tool_result = meta.and_then(|m| m.get("tool_result_for")).is_some();
-                    if is_tool_result {
-                        flush_assistant(&mut assistant_blocks, &mut messages);
-
-                        let tool_use_id = meta
-                            .and_then(|m| m.get("tool_result_for"))
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        let content = item.detail.as_deref().unwrap_or("").to_string();
-                        let is_error = meta
-                            .and_then(|m| m.get("is_error"))
-                            .and_then(|v| v.as_bool())
-                            .unwrap_or(false);
-                        let content_blocks = meta
-                            .and_then(|m| m.get("content_blocks"))
-                            .and_then(|v| v.as_array())
-                            .cloned();
-                        user_blocks.push(ContentBlock::ToolResult {
-                            tool_use_id,
-                            content,
-                            is_error: if is_error { Some(true) } else { None },
-                            content_blocks,
-                        });
-                    } else {
-                        flush_user(&mut user_blocks, &mut messages);
-                        let tool_use_id = meta
-                            .and_then(|m| m.get("tool_use_id"))
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        let tool_name = meta
-                            .and_then(|m| m.get("tool_name"))
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        let input_str = item.detail.as_deref().unwrap_or("{}");
-                        let input: Value = serde_json::from_str(input_str).unwrap_or(Value::Null);
-                        assistant_blocks.push(ContentBlock::ToolUse {
-                            id: tool_use_id,
-                            name: tool_name,
-                            input,
-                            caller: None,
-                            thought_signature: None,
-                        });
-                    }
-                }
-                // Skip other item kinds (file_change, command_execution, etc.)
-                _ => {}
-            }
-        }
-        flush_assistant(&mut assistant_blocks, &mut messages);
-        flush_user(&mut user_blocks, &mut messages);
+pub(super) fn messages_from_thread_detail(detail: &ThreadDetail) -> anyhow::Result<Vec<Message>> {
+    let mut items_by_turn = HashMap::new();
+    for item in &detail.items {
+        items_by_turn
+            .entry(item.turn_id.clone())
+            .or_insert_with(Vec::new)
+            .push(item.clone());
     }
-
-    messages
+    RuntimeThreadManager::reconstruct_messages_from_turns_with(&detail.turns, &items_by_turn)
 }
 
 /// Merge the thread's authoritative cost into a session about to be saved.

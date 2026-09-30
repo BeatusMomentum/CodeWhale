@@ -1339,6 +1339,7 @@ fn mcp_model(app: &App, locale: Locale) -> ExtensionsTabModel {
                             crate::mcp::McpRecoveryKind::Connect
                                 | crate::mcp::McpRecoveryKind::Reconnect
                                 | crate::mcp::McpRecoveryKind::Diagnose
+                                | crate::mcp::McpRecoveryKind::AwsLogin
                         ) =>
                 {
                     ExtensionAction::Command {

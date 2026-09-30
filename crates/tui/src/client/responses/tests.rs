@@ -1156,6 +1156,7 @@ fn responses_input_includes_user_role_tool_results() {
             Message {
                 role: Role::Assistant,
                 content: vec![ContentBlock::ToolUse {
+                    execution_id: None,
                     id: "call_abc|fc_123".to_string(),
                     name: "checklist_write".to_string(),
                     input: json!({"items": []}),
@@ -1166,6 +1167,7 @@ fn responses_input_includes_user_role_tool_results() {
             Message {
                 role: Role::User,
                 content: vec![ContentBlock::ToolResult {
+                    execution_id: None,
                     tool_use_id: "call_abc|fc_123".to_string(),
                     content: "<6 items>".to_string(),
                     is_error: None,
@@ -1202,6 +1204,7 @@ fn responses_input_encodes_tool_call_names() {
         messages: vec![Message {
             role: Role::Assistant,
             content: vec![ContentBlock::ToolUse {
+                execution_id: None,
                 id: "call_abc|fc_123".to_string(),
                 name: "web.run".to_string(),
                 input: json!({}),
@@ -1378,6 +1381,7 @@ fn tool_result_image_becomes_native_function_output_content() {
         Message {
             role: Role::Assistant,
             content: vec![ContentBlock::ToolUse {
+                execution_id: None,
                 id: "call_image_1".to_string(),
                 name: "read".to_string(),
                 input: serde_json::json!({"path": "shot.png"}),
@@ -1388,6 +1392,7 @@ fn tool_result_image_becomes_native_function_output_content() {
         Message {
             role: Role::User,
             content: vec![ContentBlock::ToolResult {
+                execution_id: None,
                 tool_use_id: "call_image_1".to_string(),
                 content: "screenshot captured".to_string(),
                 is_error: Some(false),

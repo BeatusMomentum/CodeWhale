@@ -432,7 +432,28 @@ pub(crate) fn run_receipts_command(
 /// block) comes back too: it labels the turn's workspace snapshots.
 fn steps_from_messages(messages: &[Message]) -> (Vec<ToolStep>, Vec<TurnPosture>, Vec<TurnPrompt>) {
     let mut steps: Vec<ToolStep> = Vec::new();
-    let mut by_id: HashMap<String, usize> = HashMap::new();
+    let mut by_id = HashMap::new();
+    let mut call_counts = HashMap::<codewhale_models::ToolCallKey<'_>, usize>::new();
+    let mut raw_counts = HashMap::<&str, usize>::new();
+    let mut results = HashMap::new();
+    for block in messages.iter().flat_map(|message| &message.content) {
+        let Some(key) = block.tool_call_key() else {
+            continue;
+        };
+        match block {
+            ContentBlock::ToolUse { .. } | ContentBlock::ServerToolUse { .. } => {
+                *call_counts.entry(key).or_default() += 1;
+                *raw_counts.entry(key.as_str()).or_default() += 1;
+            }
+            ContentBlock::ToolResult { tool_use_id, .. } => {
+                results
+                    .entry(key)
+                    .and_modify(|entry| *entry = None)
+                    .or_insert(Some(tool_use_id.as_str()));
+            }
+            _ => {}
+        }
+    }
     let mut turn_postures: Vec<TurnPosture> = Vec::new();
     let mut turn_prompts: Vec<TurnPrompt> = Vec::new();
     let mut turn = 0usize;
@@ -450,10 +471,19 @@ fn steps_from_messages(messages: &[Message]) -> (Vec<ToolStep>, Vec<TurnPosture>
                     id, name, input, ..
                 }
                 | ContentBlock::ServerToolUse { id, name, input } => {
-                    by_id.insert(id.clone(), steps.len());
+                    let key = block.tool_call_key().expect("tool use key");
+                    let unambiguous = !key.as_str().trim().is_empty()
+                        && call_counts.get(&key) == Some(&1)
+                        && raw_counts.get(key.as_str()) == Some(&1)
+                        && results
+                            .get(&key)
+                            .is_none_or(|result| result.as_deref() == Some(id.as_str()));
+                    if unambiguous {
+                        by_id.insert(key, (steps.len(), id.as_str()));
+                    }
                     steps.push(ToolStep {
                         turn: (turn > 0).then(|| turn.to_string()),
-                        call_id: Some(id.clone()),
+                        call_id: unambiguous.then(|| key.as_str().to_string()),
                         name: name.clone(),
                         input: input.clone(),
                         outcome: StepOutcome::Unknown,
@@ -469,7 +499,10 @@ fn steps_from_messages(messages: &[Message]) -> (Vec<ToolStep>, Vec<TurnPosture>
                     is_error,
                     ..
                 } => {
-                    if let Some(&index) = by_id.get(tool_use_id) {
+                    if let Some(&(index, provider_id)) =
+                        block.tool_call_key().and_then(|key| by_id.get(&key))
+                        && provider_id == tool_use_id
+                    {
                         let step = &mut steps[index];
                         step.outcome = if is_error.unwrap_or(false) {
                             StepOutcome::Failed
@@ -1656,11 +1689,26 @@ fn assemble(
         turn_postures,
         approvals_recorded,
     } = scope;
-    let mut approvals_by_call: HashMap<String, usize> = HashMap::new();
+    let mut approvals_by_call = HashMap::new();
+    let mut calls_by_id = HashMap::<&str, usize>::new();
+    for step in &steps {
+        if let Some(id) = step.call_id.as_deref() {
+            *calls_by_id.entry(id).or_default() += 1;
+        }
+    }
     for (index, approval) in approvals.iter().enumerate() {
         if let Some(call_id) = &approval.call_id {
-            approvals_by_call.insert(call_id.clone(), index);
+            approvals_by_call
+                .entry(call_id.as_str())
+                .and_modify(|entry| *entry = None)
+                .or_insert(Some(index));
         }
+    }
+    if steps.iter().any(|step| step.call_id.is_none())
+        || calls_by_id.values().any(|count| *count > 1)
+        || approvals_by_call.values().any(Option::is_none)
+    {
+        notes.insert("Tool identity: missing, mismatched or repeated call identities cannot establish a unique approval association.".to_string());
     }
     let mut approval_used = vec![false; approvals.len()];
     let mut totals = ReceiptTotals {
@@ -1674,8 +1722,9 @@ fn assemble(
     for step in &steps {
         let approval_index = step
             .call_id
-            .as_ref()
-            .and_then(|id| approvals_by_call.get(id).copied());
+            .as_deref()
+            .filter(|id| !id.trim().is_empty() && calls_by_id.get(id) == Some(&1))
+            .and_then(|id| approvals_by_call.get(id).copied().flatten());
         if let Some(index) = approval_index {
             approval_used[index] = true;
         }
@@ -1871,7 +1920,14 @@ fn assemble(
     if approvals_recorded {
         totals.ran_without_asking = actions
             .iter()
-            .filter(|action| action.ran_without_asking())
+            .filter(|action| {
+                action.ran_without_asking()
+                    && action.call_id.as_deref().is_some_and(|id| {
+                        !id.trim().is_empty()
+                            && calls_by_id.get(id) == Some(&1)
+                            && approvals_by_call.get(id).is_none_or(Option::is_some)
+                    })
+            })
             .count();
     }
     let mut postures: Vec<&'static str> = Vec::new();

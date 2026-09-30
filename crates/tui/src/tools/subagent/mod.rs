@@ -1368,6 +1368,10 @@ async fn record_provider_response_usage(
     );
 }
 
+fn new_child_execution_id(agent_id: &str) -> String {
+    format!("agent:{agent_id}:approval:{}", Uuid::new_v4())
+}
+
 /// One logical held child-tool call gets one guardian usage identity even if a
 /// mailbox/monitor replays its receipt. Raw agent/tool ids can be model-owned,
 /// so only this fixed-length digest crosses telemetry or persistence seams.
@@ -3737,13 +3741,18 @@ pub struct SubAgentManager {
     /// the same interrupted id returns the existing resumed target instead of
     /// spawning a duplicate agent loop (duplicate-resume guard).
     resume_targets: HashMap<String, String>,
+    /// Isolated worktrees whose finished-worker removal is claimed and may be
+    /// running on the blocking pool. Continuation refuses these paths until
+    /// the removal settles, so a successor never starts in a directory that
+    /// is about to be deleted. Shared so the blocking task releases its claim
+    /// without the manager lock, even when the awaiting task was aborted.
+    worktree_cleanups: Arc<std::sync::Mutex<HashSet<PathBuf>>>,
     /// Approval prompts raised on a child's behalf under Ask: the approval id
-    /// the host sees (`agent:<agent_id>:approval:<boot_id>:<n>`) → the
+    /// the host sees (`agent:<agent_id>:approval:<execution UUID>`) → the
     /// waiting child. The engine
     /// routes the person's decision here; a decision for an id nobody is
     /// waiting on is dropped, never applied to a different call.
     child_approvals: HashMap<String, ChildPendingRequest>,
-    child_approval_seq: u64,
     /// Wake cursor for `agent wait` (approvals C2): approval ids already
     /// reported to the parent model as `needs_person`. A reported id keeps a
     /// later wait blocking instead of re-waking on the same request.
@@ -4021,31 +4030,33 @@ impl SubAgentManager {
     pub fn register_child_approval(
         &mut self,
         agent_id: &str,
+        tool_id: &str,
         tool_name: &str,
         reason: &str,
-    ) -> (String, tokio::sync::oneshot::Receiver<ChildApprovalOutcome>) {
-        self.child_approval_seq = self.child_approval_seq.wrapping_add(1);
-        // Namespace with the manager's boot id (#5615): the sequence restarts
-        // with every manager, and a resumed agent under a new manager would
-        // otherwise reuse ids from an earlier lifecycle. Durable approval
-        // receipts (#5584) make a stale id a live hazard — the old receipt
-        // could auto-answer the new prompt.
-        let id = format!(
-            "agent:{agent_id}:approval:{}:{}",
-            self.current_session_boot_id, self.child_approval_seq
+    ) -> Result<(String, tokio::sync::oneshot::Receiver<ChildApprovalOutcome>)> {
+        // The host mints this before checkpointing the call. Approval, history,
+        // audit, and artifacts share it; registration never allocates another.
+        let prefix = format!("agent:{agent_id}:approval:");
+        anyhow::ensure!(
+            tool_id
+                .strip_prefix(&prefix)
+                .is_some_and(|id| Uuid::parse_str(id).is_ok()),
+            "invalid child execution identity"
         );
+        let std::collections::hash_map::Entry::Vacant(entry) =
+            self.child_approvals.entry(tool_id.to_string())
+        else {
+            anyhow::bail!("child execution already has a pending approval");
+        };
         let (tx, rx) = tokio::sync::oneshot::channel();
-        self.child_approvals.insert(
-            id.clone(),
-            ChildPendingRequest {
-                tx,
-                agent_id: agent_id.to_string(),
-                tool_name: tool_name.to_string(),
-                summary: one_line_pending_summary(reason),
-                requested_at: std::time::Instant::now(),
-            },
-        );
-        (id, rx)
+        entry.insert(ChildPendingRequest {
+            tx,
+            agent_id: agent_id.to_string(),
+            tool_name: tool_name.to_string(),
+            summary: one_line_pending_summary(reason),
+            requested_at: std::time::Instant::now(),
+        });
+        Ok((tool_id.to_string(), rx))
     }
 
     /// Requests from `agent_id` still waiting on a person, oldest first.
@@ -4228,8 +4239,8 @@ impl SubAgentManager {
             woken_agents: HashMap::new(),
             pending_handle_evictions: Vec::new(),
             resume_targets: HashMap::new(),
+            worktree_cleanups: Arc::default(),
             child_approvals: HashMap::new(),
-            child_approval_seq: 0,
             reported_pending: HashSet::new(),
         }
     }
@@ -6159,6 +6170,43 @@ impl SubAgentManager {
         false
     }
 
+    /// Claim `workspace` for removing `worker_id`'s unchanged isolated
+    /// worktree. Taken under the manager lock, so it is ordered against
+    /// continuation, which checks [`Self::worktree_cleanup_pending`] under the
+    /// write lock. `None` when another running agent works in that directory
+    /// or a removal of it is already claimed.
+    fn claim_worktree_cleanup(
+        &self,
+        worker_id: &str,
+        workspace: &Path,
+    ) -> Option<WorktreeCleanupClaim> {
+        let shared = self.agents.iter().any(|(id, agent)| {
+            id != worker_id
+                && agent.status == SubAgentStatus::Running
+                && agent.workspace == workspace
+        });
+        if shared {
+            return None;
+        }
+        let mut cleanups = self
+            .worktree_cleanups
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cleanups
+            .insert(workspace.to_path_buf())
+            .then(|| WorktreeCleanupClaim {
+                cleanups: Arc::clone(&self.worktree_cleanups),
+                workspace: workspace.to_path_buf(),
+            })
+    }
+
+    fn worktree_cleanup_pending(&self, workspace: &Path) -> bool {
+        self.worktree_cleanups
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(workspace)
+    }
+
     /// Snapshot everything delivery verification needs. `None` when there is
     /// no record, verification already ran, or the result is not terminal.
     /// Pure reads for the read lock in `ensure_worker_delivery_verified`
@@ -6919,6 +6967,25 @@ impl SubAgentManager {
                 "Cannot resume agent {agent_id}: sub-agent depth limit reached (current {}, max {})",
                 runtime.spawn_depth,
                 runtime.max_spawn_depth
+            ));
+        }
+        // A finished worker's unchanged worktree may be mid-removal on the
+        // blocking pool (an interrupt can win after that removal started).
+        // A successor started now could lose its directory underneath it.
+        if self.worktree_cleanup_pending(&workspace) {
+            return Err(anyhow!(
+                "Cannot resume agent {agent_id}: its workspace {} is being checked for removal as an unchanged isolated worktree; retry the follow-up in a moment.",
+                workspace.display()
+            ));
+        }
+        // A checkpoint outlives its workspace (a finished worker's unchanged
+        // worktree is removed, a directory is deleted or unmounted).
+        // Resuming into the missing directory would start a child whose
+        // every tool fails.
+        if !workspace.is_dir() {
+            return Err(anyhow!(
+                "Cannot resume agent {agent_id}: its workspace {} no longer exists (for example, an isolated worktree with no changes is removed when its agent finishes); start a new agent for the follow-up work.",
+                workspace.display()
             ));
         }
         runtime.context.workspace = workspace;
@@ -11242,6 +11309,15 @@ async fn spawn_subagent_from_input(
         spawn_request.session_name.as_deref(),
         &spawn_request.agent_type,
     )?;
+    // Every later refusal (resume_from, resident lease, admission, a name
+    // already in use) would otherwise leave the new checkout and its branch
+    // behind, one more per failed attempt. Disarmed once the child is live.
+    let mut pending_worktree = PendingChildWorktree(
+        child_workspace
+            .as_ref()
+            .filter(|_| spawn_request.worktree.is_some())
+            .cloned(),
+    );
 
     child_runtime.max_spawn_depth = child_max_spawn_depth_for_spawn(
         child_runtime.max_spawn_depth,
@@ -11471,9 +11547,32 @@ async fn spawn_subagent_from_input(
     if let Some((lease_key, _)) = resident_lease.as_ref() {
         commit_resident_lease(lease_key, &result.agent_id);
     }
+    pending_worktree.0 = None;
 
     Ok((result, spawn_metadata))
 }
+
+/// An isolated worktree created for a spawn that has not started yet. If the
+/// spawn fails, or its future is dropped, the checkout and its new branch are
+/// removed. Removal runs git and deletes a directory, so inside a runtime it
+/// goes to the blocking pool rather than stall an async worker.
+struct PendingChildWorktree(Option<PathBuf>);
+
+impl Drop for PendingChildWorktree {
+    fn drop(&mut self) {
+        let Some(worktree) = self.0.take() else {
+            return;
+        };
+        let remove = move || worktree::remove_unstarted_worktree(&worktree);
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime.spawn_blocking(remove);
+            }
+            Err(_) => remove(),
+        }
+    }
+}
+
 const CHILD_ROUTE_RECEIPT_MAX_BYTES: usize = 1024;
 
 fn assemble_spawn_prompt(request: &SpawnRequest, resident: Option<&ResidentContext>) -> String {
@@ -12292,18 +12391,24 @@ async fn ensure_worker_delivery_verified(
     worker_id: &str,
     result: &SubAgentResult,
 ) {
-    let inputs = {
+    let (inputs, cleanup) = {
         let manager = manager.read().await;
         let Some(inputs) = manager.delivery_verification_inputs(worker_id, result) else {
             return;
         };
-        inputs
+        let cleanup = inputs
+            .remove_worktree_if_unchanged
+            .then(|| manager.claim_worktree_cleanup(worker_id, &inputs.workspace))
+            .flatten();
+        (inputs, cleanup)
     };
+    let shared = Arc::clone(manager);
+    let worker = worker_id.to_string();
     let verification = tokio::task::spawn_blocking(move || {
         let mut verification = delivery::compute_delivery_verification(&inputs);
-        if inputs.remove_worktree_if_unchanged {
+        if let Some(claim) = cleanup {
             let changed = inputs.evidence.changed_paths(&inputs.workspace);
-            if worktree::remove_unchanged_worktree(&inputs.workspace, changed.as_ref()) {
+            if remove_finished_worktree(&shared, &worker, claim, changed.as_ref()) {
                 verification
                     .summary
                     .push_str(" The worker's isolated worktree changed nothing and was removed.");
@@ -12320,6 +12425,44 @@ async fn ensure_worker_delivery_verified(
         .write()
         .await
         .store_delivery_verification(worker_id, verification);
+}
+
+/// A claimed removal of a finished worker's isolated worktree; dropping it
+/// releases the claim, also when the removal panics.
+struct WorktreeCleanupClaim {
+    cleanups: Arc<std::sync::Mutex<HashSet<PathBuf>>>,
+    workspace: PathBuf,
+}
+
+impl Drop for WorktreeCleanupClaim {
+    fn drop(&mut self) {
+        self.cleanups
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.workspace);
+    }
+}
+
+/// Remove `worker_id`'s unchanged isolated worktree under `claim`. Runs on
+/// the blocking pool. The inputs were read before the terminal commit, and an
+/// interrupt can win after that: the worker is then continuable again, so its
+/// workspace is kept. The claim keeps a continuation from starting until this
+/// decision and the removal are done. The manager lock is released before git
+/// runs.
+fn remove_finished_worktree(
+    manager: &SharedSubAgentManager,
+    worker_id: &str,
+    claim: WorktreeCleanupClaim,
+    changed: Option<&BTreeSet<String>>,
+) -> bool {
+    let continuable = manager
+        .blocking_read()
+        .agents
+        .get(worker_id)
+        .is_some_and(|agent| matches!(agent.status, SubAgentStatus::Interrupted(_)));
+    let removed = !continuable && worktree::remove_unchanged_worktree(&claim.workspace, changed);
+    drop(claim);
+    removed
 }
 
 fn budget_partial_result_with_note(
@@ -14461,7 +14604,7 @@ async fn run_subagent(
         // cancel during a long thinking turn doesn't have to wait for the
         // step timeout.
         let request_attempted = std::sync::atomic::AtomicBool::new(false);
-        let (response, usage_route) = tokio::select! {
+        let (mut response, usage_route) = tokio::select! {
             biased;
             () = runtime.cancel_token.cancelled() => {
                 if request_attempted.load(std::sync::atomic::Ordering::Relaxed) {
@@ -14727,6 +14870,30 @@ async fn run_subagent(
         // boundary weighs it for compaction exactly as the parent does.
         last_billed_input_tokens = Some(u64::from(response.usage.input_tokens));
 
+        // Admission precedes checkpointing any executable calls. A provider's
+        // optional host field cannot select local correlation, even on resume.
+        let invalid_pairing = route_runtime
+            .client
+            .validate_tool_call_ids(response.content.iter().filter_map(|block| match block {
+                ContentBlock::ToolUse { id, .. } => Some(id.as_str()),
+                _ => None,
+            }))
+            .err();
+        if invalid_pairing.is_some() {
+            response.content.retain(|block| {
+                !matches!(
+                    block,
+                    ContentBlock::ToolUse { .. } | ContentBlock::ToolResult { .. }
+                )
+            });
+        } else {
+            for block in &mut response.content {
+                if let ContentBlock::ToolUse { execution_id, .. } = block {
+                    *execution_id = Some(new_child_execution_id(&agent_id));
+                }
+            }
+        }
+
         let mut current_response_text = None;
         for block in &response.content {
             match block {
@@ -14735,9 +14902,18 @@ async fn run_subagent(
                     final_result = Some(text.clone());
                 }
                 ContentBlock::ToolUse {
-                    id, name, input, ..
+                    id,
+                    execution_id,
+                    name,
+                    input,
+                    ..
                 } => {
-                    tool_uses.push((id.clone(), name.clone(), input.clone()));
+                    tool_uses.push((
+                        id.clone(),
+                        execution_id.clone().expect("admitted host identity"),
+                        name.clone(),
+                        input.clone(),
+                    ));
                 }
                 _ => {}
             }
@@ -14772,6 +14948,18 @@ async fn run_subagent(
             fork_context_enabled,
         )
         .await;
+
+        if let Some(error) = invalid_pairing {
+            let reason = error.to_string();
+            record_agent_progress(
+                runtime,
+                &agent_id,
+                AgentProgressEventMeta::new(AgentWorkerStatus::Failed).with_step(steps),
+                format!("{}: {reason}", format_step_counter(steps, max_steps)),
+            );
+            terminal_failure_reason = Some(reason);
+            break;
+        }
 
         if is_incomplete_stop_reason(response.stop_reason.as_deref()) {
             final_result = current_response_text;
@@ -14871,7 +15059,7 @@ async fn run_subagent(
         );
         let mut tool_results: Vec<ContentBlock> = Vec::new();
         let mut denial_batch = FleetDenialBatch::default();
-        for (tool_id, tool_name, tool_input) in tool_uses {
+        for (provider_id, tool_id, tool_name, tool_input) in tool_uses {
             if work_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                 budget_failure_reason = Some("child wall-time budget exhausted during task execution; remaining time is reserved for hand-back. Narrow the task or have the operator raise the inherited wall-time limit".to_string());
                 break;
@@ -14897,7 +15085,8 @@ async fn run_subagent(
                     format!("Error: {blocked}"),
                 );
                 tool_results.push(ContentBlock::ToolResult {
-                    tool_use_id: tool_id,
+                    execution_id: Some(tool_id),
+                    tool_use_id: provider_id,
                     content: result,
                     // Refusals reach the provider as errors, matching the
                     // parent turn loop (#6015).
@@ -15062,7 +15251,8 @@ async fn run_subagent(
             }
 
             tool_results.push(ContentBlock::ToolResult {
-                tool_use_id: tool_id,
+                execution_id: Some(tool_id),
+                tool_use_id: provider_id,
                 content: result,
                 // A refused or failed call is marked as an error for the
                 // provider, matching the parent turn loop (#6015).
@@ -18485,14 +18675,21 @@ impl SubAgentToolRegistry {
                         unreachable!("force_prompt implies ForcePrompt");
                     };
                     return self
-                        .prompt_parent_for_child_call(agent_id, name, input, &reason, true)
+                        .prompt_parent_for_child_call(agent_id, tool_id, name, input, &reason, true)
                         .await;
                 };
                 if approval_mode == ApprovalMode::Never {
                     return ChildGateVerdict::Deny(refusal);
                 }
-                self.prompt_parent_for_child_call(agent_id, name, input, &refusal, force_prompt)
-                    .await
+                self.prompt_parent_for_child_call(
+                    agent_id,
+                    tool_id,
+                    name,
+                    input,
+                    &refusal,
+                    force_prompt,
+                )
+                .await
             }
         }
     }
@@ -18584,6 +18781,7 @@ impl SubAgentToolRegistry {
     async fn prompt_parent_for_child_call(
         &self,
         agent_id: &str,
+        tool_id: &str,
         name: &str,
         input: &Value,
         reason: &str,
@@ -18599,12 +18797,16 @@ impl SubAgentToolRegistry {
                 "{reason} (this host cannot raise a prompt for an agent; run the call in the main conversation, or switch the session to Auto-Review or Full Access)"
             ));
         };
-        let (approval_id, receiver) = self
+        let (approval_id, receiver) = match self
             .gate_runtime
             .manager
             .write()
             .await
-            .register_child_approval(agent_id, name, reason);
+            .register_child_approval(agent_id, tool_id, name, reason)
+        {
+            Ok(pending) => pending,
+            Err(error) => return ChildGateVerdict::Deny(error.to_string()),
+        };
         if let Err(error) = self
             .commit_child_approval_receipt(crate::approval_log::ApprovalReceipt::asked(
                 approval_id.clone(),
@@ -19458,7 +19660,8 @@ impl SubAgentToolRegistry {
             .registry
             .context()
             .clone()
-            .with_owner_agent(self.owner_agent_id.clone(), self.owner_agent_name.clone());
+            .with_owner_agent(self.owner_agent_id.clone(), self.owner_agent_name.clone())
+            .with_origin_tool_call_id(tool_id.to_string());
         let observed_paths = if scope_aware_write {
             mutation_paths(name, &input)?
         } else {
@@ -19485,7 +19688,7 @@ impl SubAgentToolRegistry {
 
     #[cfg(test)]
     async fn execute(&self, agent_id: &str, name: &str, input: Value) -> Result<String> {
-        self.execute_full(agent_id, "", name, input)
+        self.execute_full(agent_id, &new_child_execution_id(agent_id), name, input)
             .await
             .map(|result| result.result.content)
     }

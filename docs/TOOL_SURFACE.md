@@ -1,5 +1,7 @@
 # Tool surface
 
+> 阅读简体中文版：[zh_hans/TOOL_SURFACE.md](zh_hans/TOOL_SURFACE.md)。
+
 This document describes the current model-facing tool contract. The v0.9.1
 cutover that produced it is recorded in `docs/RUNTIME_SIMPLIFICATION_DESIGN.md`;
 read the workspace version from `Cargo.toml`, not from this line. The registry

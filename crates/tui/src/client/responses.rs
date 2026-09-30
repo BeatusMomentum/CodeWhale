@@ -625,6 +625,7 @@ impl CodewhaleClient {
                             caller,
                             thought_signature,
                         } => ContentBlock::ToolUse {
+                            execution_id: None,
                             id,
                             name,
                             input,
@@ -1021,7 +1022,7 @@ fn string_at<'a>(value: &'a Value, path: &str) -> Option<&'a str> {
 
 /// Parse a composite tool_use_id back to (call_id, item_id).
 /// Composite format: "call_id|item_id"
-fn parse_tool_use_id(id: &str) -> (String, String) {
+pub(super) fn parse_tool_use_id(id: &str) -> (String, String) {
     if let Some(pipe_pos) = id.find('|') {
         (id[..pipe_pos].to_string(), id[pipe_pos + 1..].to_string())
     } else {

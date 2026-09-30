@@ -918,22 +918,33 @@ fn tool_args_preview(input: &serde_json::Value) -> String {
     truncate_chars(&raw, 120).to_string()
 }
 
-fn collect_tool_uses(messages: &[Message]) -> HashMap<String, ToolUseInfo> {
+fn collect_tool_uses(
+    messages: &[Message],
+) -> HashMap<codewhale_models::ToolCallKey<'_>, Option<(&str, ToolUseInfo)>> {
     let mut tool_uses = HashMap::new();
     for message in messages {
         for block in &message.content {
             if let ContentBlock::ToolUse {
                 id, name, input, ..
             } = block
+                && let Some(key) = block.tool_call_key()
+                && !key.as_str().trim().is_empty()
             {
-                tool_uses.insert(
-                    id.clone(),
-                    ToolUseInfo {
-                        name: name.clone(),
-                        key: tool_use_key(name, input),
-                        args_preview: tool_args_preview(input),
-                    },
-                );
+                // Ambiguous old or malformed new history is left intact; a
+                // later call must not supply the earlier result's metadata.
+                tool_uses
+                    .entry(key)
+                    .and_modify(|entry| *entry = None)
+                    .or_insert_with(|| {
+                        Some((
+                            id.as_str(),
+                            ToolUseInfo {
+                                name: name.clone(),
+                                key: tool_use_key(name, input),
+                                args_preview: tool_args_preview(input),
+                            },
+                        ))
+                    });
             }
         }
     }
@@ -1054,9 +1065,16 @@ fn plan_tool_result_prunes(messages: &[Message], protected_window: usize) -> Vec
             else {
                 continue;
             };
-            let Some(info) = tool_uses.get(tool_use_id) else {
+            let Some((provider_id, info)) = block
+                .tool_call_key()
+                .and_then(|key| tool_uses.get(&key))
+                .and_then(Option::as_ref)
+            else {
                 continue;
             };
+            if provider_id != &tool_use_id.as_str() {
+                continue;
+            }
             latest_by_key.insert(info.key.clone(), message_idx);
             *count_by_key.entry(info.key.clone()).or_insert(0) += 1;
             candidates.push(ToolResultPruneCandidate {
@@ -2294,6 +2312,7 @@ mod tests {
         Message {
             role: Role::Assistant,
             content: vec![ContentBlock::ToolUse {
+                execution_id: None,
                 id: id.to_string(),
                 name: name.to_string(),
                 input,
@@ -2307,6 +2326,7 @@ mod tests {
         Message {
             role: Role::User,
             content: vec![ContentBlock::ToolResult {
+                execution_id: None,
                 tool_use_id: id.to_string(),
                 content: content.to_string(),
                 is_error: None,
@@ -3396,6 +3416,7 @@ mod tests {
         // the retained copy must keep the text and drop the orphaned result.
         let mut mixed = msg("user", "Please keep this context.");
         mixed.content.push(ContentBlock::ToolResult {
+            execution_id: None,
             tool_use_id: "toolu_orphan_1".to_string(),
             content: "{\"ok\":true}".to_string(),
             is_error: None,
@@ -3836,6 +3857,7 @@ mod tests {
                         thinking: thinking.clone(),
                     },
                     ContentBlock::ToolUse {
+                        execution_id: None,
                         id: "tool-1".to_string(),
                         name: "read_file".to_string(),
                         input: serde_json::json!({"path": "Cargo.toml"}),
@@ -3847,6 +3869,7 @@ mod tests {
             Message {
                 role: Role::User,
                 content: vec![ContentBlock::ToolResult {
+                    execution_id: None,
                     tool_use_id: "tool-1".to_string(),
                     content: "manifest".to_string(),
                     is_error: None,

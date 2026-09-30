@@ -32,6 +32,7 @@ const MAX_SCHEMA_CONTAINER_REPAIR_BYTES: usize = 64 * 1024;
 pub(super) struct ToolExecOutcome {
     pub(super) index: usize,
     pub(super) id: String,
+    pub(super) model_call: Option<crate::core::events::ModelToolCall>,
     pub(super) name: String,
     pub(super) input: serde_json::Value,
     pub(super) started_at: std::time::Instant,
@@ -276,6 +277,7 @@ impl FleetDenialGuard {
 pub(super) struct ToolExecutionPlan {
     pub(super) index: usize,
     pub(super) id: String,
+    pub(super) model_call: Option<crate::core::events::ModelToolCall>,
     pub(super) name: String,
     pub(super) input: serde_json::Value,
     pub(super) caller: Option<ToolCaller>,

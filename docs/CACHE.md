@@ -1,5 +1,7 @@
 # Prompt-cache stability (the pinned prefix)
 
+> 阅读简体中文版：[zh_hans/CACHE.md](zh_hans/CACHE.md)。
+
 Provider prompt caches (DeepSeek KV cache, Anthropic `cache_control`) only pay
 off when the **byte prefix** of a request matches the previous one: the system
 prompt, then the tool catalog, then `messages[0..n-1]`. Any change to those

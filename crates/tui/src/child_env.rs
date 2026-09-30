@@ -54,6 +54,35 @@ where
     env
 }
 
+/// Environment for a Codewhale runtime child (a Fleet worker), built from a
+/// snapshot of the parent environment.
+///
+/// It uses the same allowlist as [`sanitized_child_env`], so provider keys and
+/// other secret-shaped variables are dropped, with one deliberate difference:
+/// proxy URLs keep their `user:password@` part. The runtime child is Codewhale
+/// itself, not a model-chosen program, and must reach its provider through the
+/// same authenticated proxy as the parent. Every tool it starts builds its own
+/// environment through [`sanitized_child_env`], which strips that userinfo at
+/// the model-facing boundary.
+pub fn sanitized_runtime_env_from<B, K, V>(base_environment: B) -> Vec<(OsString, OsString)>
+where
+    B: IntoIterator<Item = (K, V)>,
+    K: AsRef<OsStr>,
+    V: AsRef<OsStr>,
+{
+    let mut env = Vec::new();
+    for (key, value) in base_environment {
+        if is_allowed_parent_env_key(key.as_ref()) {
+            upsert_env(
+                &mut env,
+                key.as_ref().to_os_string(),
+                value.as_ref().to_os_string(),
+            );
+        }
+    }
+    env
+}
+
 pub fn apply_to_command<I, K, V>(cmd: &mut std::process::Command, overrides: I)
 where
     I: IntoIterator<Item = (K, V)>,
@@ -138,8 +167,10 @@ where
 /// `npx ...` / `uvx ...` / `python -m mcp_server_*` setups (#1244), the
 /// MCP-launch allowlist is wider than the base shell-tool allowlist: it
 /// also passes through Node, npm, Python, Ruby, Java, proxy, and CA-bundle
-/// bootstrap variables. It still drops arbitrary parent env so secret-bearing
-/// vars (`AWS_*`, `*_API_KEY`, `GITHUB_TOKEN`, …) are not silently exported.
+/// bootstrap variables, plus the non-secret AWS profile/region/config-path
+/// selectors. It still drops arbitrary parent env so secret-bearing vars
+/// (AWS keys and session tokens, `*_API_KEY`, `GITHUB_TOKEN`, …) are not
+/// silently exported.
 pub fn sanitized_mcp_env<I, K, V>(overrides: I) -> Vec<(OsString, OsString)>
 where
     I: IntoIterator<Item = (K, V)>,
@@ -500,6 +531,18 @@ fn is_allowed_mcp_env_key(key: &OsStr) -> bool {
             | "SSL_CERT_DIR"
             | "REQUESTS_CA_BUNDLE"
             | "CURL_CA_BUNDLE"
+            // AWS profile/region selection and config-file locations. These
+            // name *which* credentials to use, never the credentials
+            // themselves: an AWS MCP server launched with `--profile x`
+            // still needs the user's config file and region to resolve an
+            // SSO session. Keys, secrets and session tokens
+            // (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
+            // `AWS_SESSION_TOKEN`, …) stay dropped.
+            | "AWS_PROFILE"
+            | "AWS_REGION"
+            | "AWS_DEFAULT_REGION"
+            | "AWS_CONFIG_FILE"
+            | "AWS_SHARED_CREDENTIALS_FILE"
     ) {
         return true;
     }
@@ -1060,10 +1103,28 @@ mod tests {
     }
 
     #[test]
+    fn mcp_env_allowlist_includes_aws_profile_and_region_selectors() {
+        for key in [
+            "AWS_PROFILE",
+            "AWS_REGION",
+            "AWS_DEFAULT_REGION",
+            "AWS_CONFIG_FILE",
+            "AWS_SHARED_CREDENTIALS_FILE",
+        ] {
+            assert!(
+                is_allowed_mcp_env_key(OsStr::new(key)),
+                "MCP allowlist should include non-secret AWS selector {key}"
+            );
+        }
+    }
+
+    #[test]
     fn mcp_env_allowlist_excludes_secrets_and_creds() {
         for key in [
             "AWS_SECRET_ACCESS_KEY",
             "AWS_ACCESS_KEY_ID",
+            "AWS_SESSION_TOKEN",
+            "AWS_SECURITY_TOKEN",
             "GITHUB_TOKEN",
             "OPENAI_API_KEY",
             "ANTHROPIC_API_KEY",

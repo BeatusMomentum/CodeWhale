@@ -478,6 +478,7 @@ mod tests {
                 content: vec![
                     ContentBlock::thinking("I should run ls first"),
                     ContentBlock::ToolUse {
+                        execution_id: None,
                         id: "toolu_01".to_string(),
                         name: "shell".to_string(),
                         input: serde_json::json!({ "command": "ls src" }),
@@ -489,6 +490,7 @@ mod tests {
             Message {
                 role: Role::User,
                 content: vec![ContentBlock::ToolResult {
+                    execution_id: None,
                     tool_use_id: "toolu_01".to_string(),
                     content: "main.rs\nlib.rs".to_string(),
                     is_error: None,

@@ -47,6 +47,10 @@ pub(crate) enum StatusToastKind {
     BehavioralTip(crate::tui::behavioral_tips::BehavioralTip),
     PluginSuggestion,
     ContextPressure(crate::context_budget::PressureLevel),
+    /// A condition that holds until its owner retires it by event id (a
+    /// session save that keeps failing). It never times out: expiring it
+    /// would report recovery that has not happened.
+    Standing,
 }
 
 impl StatusToast {
@@ -65,6 +69,24 @@ impl StatusToast {
     pub(crate) fn for_event(mut self, event_id: impl Into<String>) -> Self {
         self.event_id = Some(event_id.into());
         self
+    }
+
+    /// A notice for a standing condition, withdrawn only through
+    /// [`App::retire_event_notices`]`(event_id)` once the condition clears.
+    #[must_use]
+    pub(crate) fn standing(
+        text: impl Into<String>,
+        level: StatusToastLevel,
+        event_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            text: text.into(),
+            level,
+            created_at: Instant::now(),
+            ttl_ms: None,
+            kind: StatusToastKind::Standing,
+            event_id: Some(event_id.into()),
+        }
     }
 
     pub(crate) fn for_action(mut self, request_id: impl Into<String>) -> Self {
@@ -130,8 +152,15 @@ impl App {
             return;
         }
         self.status_toasts.push_back(toast);
+        // Overflow drops the oldest notice that is not a standing condition;
+        // those leave only when their condition clears.
         while self.status_toasts.len() > 24 {
-            self.status_toasts.pop_front();
+            let oldest = self
+                .status_toasts
+                .iter()
+                .position(|toast| toast.kind != StatusToastKind::Standing)
+                .unwrap_or(0);
+            self.status_toasts.remove(oldest);
         }
         self.needs_redraw = true;
     }
@@ -144,6 +173,14 @@ impl App {
             toast.kind != StatusToastKind::ActionRequired
                 || request_id.is_some_and(|id| toast.event_id.as_deref() != Some(id))
         });
+        self.needs_redraw |= self.status_toasts.len() != before;
+    }
+
+    /// Retire the notices pushed with [`StatusToast::for_event`]`(event_id)`.
+    pub(crate) fn retire_event_notices(&mut self, event_id: &str) {
+        let before = self.status_toasts.len();
+        self.status_toasts
+            .retain(|toast| toast.event_id.as_deref() != Some(event_id));
         self.needs_redraw |= self.status_toasts.len() != before;
     }
 

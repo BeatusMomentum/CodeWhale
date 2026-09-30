@@ -21,6 +21,9 @@ pub struct ToolRepairReceipt {
     pub repaired_call_ids: Vec<String>,
     pub duplicate_result_ids: Vec<String>,
     pub orphan_result_ids: Vec<String>,
+    /// Exact synthetic result positions in the repaired messages; callers must
+    /// not rediscover them by potentially reused provider IDs.
+    pub repaired_result_positions: Vec<(usize, usize)>,
 }
 
 impl ToolRepairReceipt {
@@ -69,7 +72,7 @@ fn repair_tool_call_pairs_inner(
     let mut pending_call_message = None;
     let mut pending_call_ids = Vec::new();
     let mut retained_for_pending = HashSet::new();
-    let mut missing_by_message: HashMap<usize, Vec<String>> = HashMap::new();
+    let mut missing_by_message: HashMap<usize, Vec<(String, Option<String>)>> = HashMap::new();
     let mut repaired_call_ids = Vec::new();
     let mut duplicate_result_ids = Vec::new();
     let mut orphan_result_ids = Vec::new();
@@ -90,10 +93,7 @@ fn repair_tool_call_pairs_inner(
             pending_call_ids = message
                 .content
                 .iter()
-                .filter_map(|block| match block {
-                    ContentBlock::ToolUse { id, .. } => Some(id.clone()),
-                    _ => None,
-                })
+                .filter(|block| matches!(block, ContentBlock::ToolUse { .. }))
                 .collect();
             pending_call_message = (!pending_call_ids.is_empty()).then_some(message_index);
             retained_for_pending.clear();
@@ -107,10 +107,22 @@ fn repair_tool_call_pairs_inner(
 
             let follows_known_call = pending_call_message
                 .is_some_and(|call_index| call_index < message_index)
-                && pending_call_ids.iter().any(|id| id == tool_use_id);
+                && block
+                    .tool_call_key()
+                    .is_some_and(|key| !key.as_str().trim().is_empty())
+                && pending_call_ids
+                    .iter()
+                    .filter(|call| call.tool_call_key() == block.tool_call_key())
+                    .count()
+                    == 1
+                && pending_call_ids.iter().any(|call| {
+                    call.tool_call_key() == block.tool_call_key()
+                        && matches!(call, ContentBlock::ToolUse { id, .. } if id == tool_use_id)
+                });
             if !follows_known_call {
                 orphan_result_ids.push(tool_use_id.clone());
-            } else if !retained_for_pending.insert(tool_use_id.clone()) {
+            } else if !retained_for_pending.insert(block.tool_call_key().expect("tool result key"))
+            {
                 duplicate_result_ids.push(tool_use_id.clone());
             } else {
                 keep_results.insert(ordinal);
@@ -125,10 +137,11 @@ fn repair_tool_call_pairs_inner(
         &mut repaired_call_ids,
     );
 
-    let receipt = ToolRepairReceipt {
+    let mut receipt = ToolRepairReceipt {
         repaired_call_ids,
         duplicate_result_ids,
         orphan_result_ids,
+        repaired_result_positions: Vec::new(),
     };
     if receipt.is_empty() {
         return receipt;
@@ -161,11 +174,15 @@ fn repair_tool_call_pairs_inner(
         }
 
         if !missing_after_message.is_empty() {
+            receipt.repaired_result_positions.extend(
+                (0..missing_after_message.len()).map(|block_index| (rebuilt.len(), block_index)),
+            );
             rebuilt.push(Message {
                 role: Role::User,
                 content: missing_after_message
                     .into_iter()
-                    .map(|tool_use_id| ContentBlock::ToolResult {
+                    .map(|(tool_use_id, execution_id)| ContentBlock::ToolResult {
+                        execution_id,
                         tool_use_id,
                         content: CRASH_REPAIR_CONTENT.to_string(),
                         is_error: Some(true),
@@ -191,23 +208,32 @@ fn repair_tool_call_pairs_inner(
 
 fn record_missing_results(
     call_message: Option<usize>,
-    call_ids: &[String],
-    retained_results: &HashSet<String>,
-    missing_by_message: &mut HashMap<usize, Vec<String>>,
+    calls: &[&ContentBlock],
+    retained_results: &HashSet<codewhale_models::ToolCallKey<'_>>,
+    missing_by_message: &mut HashMap<usize, Vec<(String, Option<String>)>>,
     repaired_call_ids: &mut Vec<String>,
 ) {
     let Some(message_index) = call_message else {
         return;
     };
-    let missing = call_ids
+    let missing = calls
         .iter()
-        .filter(|id| !retained_results.contains(*id))
-        .cloned()
+        .filter(|call| {
+            !call
+                .tool_call_key()
+                .is_some_and(|key| retained_results.contains(&key))
+        })
+        .filter_map(|call| match call {
+            ContentBlock::ToolUse {
+                id, execution_id, ..
+            } => Some((id.clone(), execution_id.clone())),
+            _ => None,
+        })
         .collect::<Vec<_>>();
     if missing.is_empty() {
         return;
     }
-    repaired_call_ids.extend(missing.iter().cloned());
+    repaired_call_ids.extend(missing.iter().map(|(id, _)| id.clone()));
     missing_by_message.insert(message_index, missing);
 }
 
@@ -221,6 +247,7 @@ mod tests {
         Message {
             role: Role::Assistant,
             content: vec![ContentBlock::ToolUse {
+                execution_id: None,
                 id: id.to_string(),
                 name: "read_file".to_string(),
                 input: json!({"path": "README.md"}),
@@ -234,6 +261,7 @@ mod tests {
         Message {
             role: Role::User,
             content: vec![ContentBlock::ToolResult {
+                execution_id: None,
                 tool_use_id: id.to_string(),
                 content: content.to_string(),
                 is_error: None,
@@ -250,6 +278,66 @@ mod tests {
                 cache_control: None,
             }],
         }
+    }
+
+    #[test]
+    fn repair_preserves_execution_identity_and_refuses_mismatched_results() {
+        let mut messages: Vec<Message> = serde_json::from_value(json!([
+            {"role":"assistant","content":[{"type":"tool_use","id":"wire","execution_id":"first","name":"read","input":{}}]},
+            {"role":"user","content":[{"type":"tool_result","tool_use_id":"wire","execution_id":"first","content":"kept"}]},
+            {"role":"assistant","content":[{"type":"tool_use","id":"wire","execution_id":"second","name":"read","input":{}}]},
+            {"role":"user","content":[{"type":"tool_result","tool_use_id":"wire","execution_id":"first","content":"stale"}]}
+        ])).unwrap();
+        let first_pair = messages[..2].to_vec();
+        let receipt = repair_tool_call_pairs_for_provider(&mut messages);
+        assert_eq!(&messages[..2], first_pair.as_slice());
+        assert_eq!(receipt.orphan_result_ids, ["wire"]);
+        assert_eq!(receipt.repaired_result_positions, [(3, 0)]);
+        assert!(
+            matches!(&messages[3].content[0], ContentBlock::ToolResult { tool_use_id, execution_id: Some(id), content, is_error: Some(true), .. }
+            if tool_use_id == "wire" && id == "second" && content == CRASH_REPAIR_CONTENT)
+        );
+        assert!(repair_tool_call_pairs_for_provider(&mut messages).is_empty());
+
+        for (call_id, result_id, result_wire) in [
+            (Some("local"), None, "wire"),
+            (None, Some("wire"), "wire"),
+            (Some("local"), Some("local"), "wrong-wire"),
+            (Some(""), Some(""), "wire"),
+        ] {
+            let mut malformed: Vec<Message> = serde_json::from_value(json!([
+                {"role":"assistant","content":[{"type":"tool_use","id":"wire","execution_id":call_id,"name":"read","input":{}}]},
+                {"role":"user","content":[{"type":"tool_result","tool_use_id":result_wire,"execution_id":result_id,"content":"not a match"}]}
+            ])).unwrap();
+            let receipt = repair_tool_call_pairs_for_provider(&mut malformed);
+            assert_eq!(receipt.orphan_result_ids.len(), 1);
+            assert_eq!(receipt.repaired_result_positions, [(1, 0)]);
+            assert!(
+                matches!(&malformed[1].content[0], ContentBlock::ToolResult { execution_id, .. } if execution_id.as_deref() == call_id)
+            );
+        }
+    }
+
+    #[test]
+    fn duplicate_execution_ids_cannot_lend_one_result_to_two_calls() {
+        let mut messages: Vec<Message> = serde_json::from_value(json!([
+            {"role":"assistant","content":[
+                {"type":"tool_use","id":"wire-a","execution_id":"duplicate","name":"read","input":{}},
+                {"type":"tool_use","id":"wire-b","execution_id":"duplicate","name":"read","input":{}}
+            ]},
+            {"role":"user","content":[{"type":"tool_result","tool_use_id":"wire-a","execution_id":"duplicate","content":"not attributable"}]}
+        ])).unwrap();
+        let receipt = repair_tool_call_pairs_for_provider(&mut messages);
+        assert_eq!(receipt.orphan_result_ids, ["wire-a"]);
+        assert_eq!(receipt.repaired_result_positions, [(1, 0), (1, 1)]);
+        assert!(
+            messages[1]
+                .content
+                .iter()
+                .all(|block| matches!(block, ContentBlock::ToolResult {
+            execution_id: Some(id), content, is_error: Some(true), ..
+        } if id == "duplicate" && content == CRASH_REPAIR_CONTENT))
+        );
     }
 
     #[test]

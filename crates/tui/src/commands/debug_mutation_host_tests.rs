@@ -448,6 +448,7 @@ fn test_patch_undo_prunes_tool_turn_context() {
                 cache_control: None,
             },
             ContentBlock::ToolUse {
+                execution_id: None,
                 id: "call-1".to_string(),
                 name: "write_file".to_string(),
                 input: serde_json::json!({"path": "a.txt"}),
@@ -459,6 +460,7 @@ fn test_patch_undo_prunes_tool_turn_context() {
     app.api_messages_mut().push(Message {
         role: Role::User,
         content: vec![ContentBlock::ToolResult {
+            execution_id: None,
             tool_use_id: "call-1".to_string(),
             content: "updated".to_string(),
             is_error: None,
@@ -631,6 +633,7 @@ fn test_prune_undone_tool_context_preserves_prior_tool_pairs() {
                 cache_control: None,
             },
             ContentBlock::ToolUse {
+                execution_id: None,
                 id: "call-a".to_string(),
                 name: "write_file".to_string(),
                 input: serde_json::json!({"path": "a.txt"}),
@@ -638,6 +641,7 @@ fn test_prune_undone_tool_context_preserves_prior_tool_pairs() {
                 thought_signature: None,
             },
             ContentBlock::ToolUse {
+                execution_id: None,
                 id: "call-b".to_string(),
                 name: "write_file".to_string(),
                 input: serde_json::json!({"path": "b.txt"}),
@@ -649,6 +653,7 @@ fn test_prune_undone_tool_context_preserves_prior_tool_pairs() {
     app.api_messages_mut().push(Message {
         role: Role::User,
         content: vec![ContentBlock::ToolResult {
+            execution_id: None,
             tool_use_id: "call-a".to_string(),
             content: "updated a".to_string(),
             is_error: None,
@@ -658,6 +663,7 @@ fn test_prune_undone_tool_context_preserves_prior_tool_pairs() {
     app.api_messages_mut().push(Message {
         role: Role::User,
         content: vec![ContentBlock::ToolResult {
+            execution_id: None,
             tool_use_id: "call-b".to_string(),
             content: "updated b".to_string(),
             is_error: None,
@@ -687,6 +693,52 @@ fn test_prune_undone_tool_context_preserves_prior_tool_pairs() {
         &app.api_messages[2].content[0],
         ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "call-a"
     ));
+}
+
+#[test]
+fn undo_uses_execution_identity_and_preserves_coalesced_result_stamp() {
+    let mut app = create_test_app();
+    let stamp = chrono::DateTime::parse_from_rfc3339("2026-01-02T03:04:05Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let messages: Vec<Message> = serde_json::from_value(serde_json::json!([
+        {"role":"assistant","content":[
+            {"type":"tool_use","id":"wire","execution_id":"first","name":"write_file","input":{"path":"a.txt"}},
+            {"type":"tool_use","id":"wire","execution_id":"second","name":"write_file","input":{"path":"b.txt"}}
+        ]},
+        {"role":"user","content":[
+            {"type":"tool_result","tool_use_id":"wire","execution_id":"first","content":"kept"},
+            {"type":"tool_result","tool_use_id":"wire","execution_id":"second","content":"undone"}
+        ]}
+    ])).unwrap();
+    for message in messages {
+        app.push_api_message_stamped(message, stamp);
+    }
+    prune_undone_tool_context(&mut app, "second");
+    assert_eq!(app.api_messages.len(), 2);
+    assert_eq!(app.api_messages[0].content.len(), 1);
+    assert!(
+        matches!(&app.api_messages[1].content[..], [ContentBlock::ToolResult {
+        execution_id: Some(id), tool_use_id, content, ..
+    }] if id == "first" && tool_use_id == "wire" && content == "kept")
+    );
+    assert_eq!(app.api_messages_stamped().nth(1).unwrap().1, stamp);
+
+    // A legacy provider ID that happens to spell a local ID is not another
+    // spelling for that execution. With both present, the raw undo request is
+    // ambiguous and must leave every message intact.
+    app.push_api_message_stamped(
+        serde_json::from_value(serde_json::json!({
+            "role":"assistant","content":[
+                {"type":"tool_use","id":"first","name":"write_file","input":{}}
+            ]
+        }))
+        .unwrap(),
+        stamp,
+    );
+    let before = serde_json::to_value(&*app.api_messages).unwrap();
+    prune_undone_tool_context(&mut app, "first");
+    assert_eq!(serde_json::to_value(&*app.api_messages).unwrap(), before);
 }
 
 // ── /cache stats tests ──────────────────────────────────────────────
@@ -1228,6 +1280,7 @@ fn receipts_command_is_registered_and_reads_the_transcript() {
     app.api_messages_mut().push(Message {
         role: Role::Assistant,
         content: vec![ContentBlock::ToolUse {
+            execution_id: None,
             id: "call-1".to_string(),
             name: "bash".to_string(),
             input: serde_json::json!({"command": "cargo test"}),
@@ -1238,6 +1291,7 @@ fn receipts_command_is_registered_and_reads_the_transcript() {
     app.api_messages_mut().push(Message {
         role: Role::User,
         content: vec![ContentBlock::ToolResult {
+            execution_id: None,
             tool_use_id: "call-1".to_string(),
             content: "ok".to_string(),
             is_error: None,
@@ -1255,6 +1309,7 @@ fn receipts_command_is_registered_and_reads_the_transcript() {
     app.api_messages_mut().push(Message {
         role: Role::Assistant,
         content: vec![ContentBlock::ToolUse {
+            execution_id: None,
             id: "call-2".to_string(),
             name: "bash".to_string(),
             input: serde_json::json!({ "command": shell }),
@@ -1265,6 +1320,7 @@ fn receipts_command_is_registered_and_reads_the_transcript() {
     app.api_messages_mut().push(Message {
         role: Role::User,
         content: vec![ContentBlock::ToolResult {
+            execution_id: None,
             tool_use_id: "call-2".to_string(),
             content: "ok".to_string(),
             is_error: None,

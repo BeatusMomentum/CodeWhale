@@ -735,36 +735,44 @@ fn generation_15_refreshes_help_and_pdf_from_generation_14() {
 }
 
 #[test]
-fn generation_16_refreshes_plugin_creator_from_generation_15() {
-    let old = include_str!("../../../assets/skills/plugin-creator/SKILL.generation-15.md");
-    assert!(is_superseded_shipped_body("plugin-creator", old));
-    assert!(
-        old.contains("Create `plugin.toml`"),
-        "the retained body is the old one"
-    );
+fn generation_17_refreshes_previous_plugin_creator_bodies() {
     let skill = BUNDLED_SKILLS
         .iter()
         .find(|skill| skill.name == "plugin-creator")
         .unwrap();
     assert!(skill.body.contains("Create `plugin.json`"));
-    for customized in [false, true] {
-        let tmp = TempDir::new().unwrap();
-        fs::create_dir_all(skill_dir(&tmp, "plugin-creator")).unwrap();
-        let body = if customized {
-            format!("{old}\nMy instructions.\n")
-        } else {
-            old.to_string()
-        };
-        fs::write(skill_file(&tmp, "plugin-creator"), &body).unwrap();
-        fs::write(marker_file(&tmp), "15").unwrap();
-        install_system_skills(tmp.path()).unwrap();
-        assert_eq!(
-            fs::read_to_string(skill_file(&tmp, "plugin-creator")).unwrap(),
-            if customized {
-                body
+    assert!(skill.body.contains("## Experimental host code"));
+    for (generation, old) in [
+        (
+            "15",
+            include_str!("../../../assets/skills/plugin-creator/SKILL.generation-15.md"),
+        ),
+        (
+            "16",
+            include_str!("../../../assets/skills/plugin-creator/SKILL.generation-16.md"),
+        ),
+    ] {
+        assert!(is_superseded_shipped_body("plugin-creator", old));
+        assert!(!old.contains("## Experimental host code"));
+        for customized in [false, true] {
+            let tmp = TempDir::new().unwrap();
+            fs::create_dir_all(skill_dir(&tmp, "plugin-creator")).unwrap();
+            let body = if customized {
+                format!("{old}\nMy instructions.\n")
             } else {
-                skill.body.to_string()
-            },
-        );
+                old.to_string()
+            };
+            fs::write(skill_file(&tmp, "plugin-creator"), &body).unwrap();
+            fs::write(marker_file(&tmp), generation).unwrap();
+            install_system_skills(tmp.path()).unwrap();
+            assert_eq!(
+                fs::read_to_string(skill_file(&tmp, "plugin-creator")).unwrap(),
+                if customized {
+                    body
+                } else {
+                    skill.body.to_string()
+                },
+            );
+        }
     }
 }

@@ -17,6 +17,7 @@ pub(super) enum ContentBlockKind {
 #[derive(Debug, Clone)]
 pub(super) struct ToolUseState {
     pub(super) id: String,
+    pub(super) execution_id: String,
     pub(super) name: String,
     pub(super) input: serde_json::Value,
     pub(super) caller: Option<ToolCaller>,
@@ -25,6 +26,16 @@ pub(super) struct ToolUseState {
     pub(super) thought_signature: Option<String>,
     pub(super) input_buffer: String,
     pub(super) input_parse_error: Option<String>,
+}
+
+impl ToolUseState {
+    pub(super) fn model_call(&self) -> crate::core::events::ModelToolCall {
+        crate::core::events::ModelToolCall {
+            provider_id: self.id.clone(),
+            caller: self.caller.clone(),
+            thought_signature: self.thought_signature.clone(),
+        }
+    }
 }
 
 /// Maximum total bytes of text/thinking content before aborting the stream.

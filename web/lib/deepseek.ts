@@ -1,7 +1,7 @@
 import type { CuratedDispatch, FeedItem, RepoStats } from "./types";
 
 const FALLBACK_BASE = "https://api.deepseek.com";
-const FALLBACK_MODEL = "deepseek-v4-flash";
+const FALLBACK_MODEL = "deepseek-flash";
 
 interface ChatMessage {
   role: "system" | "user" | "assistant";
