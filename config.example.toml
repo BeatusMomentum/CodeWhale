@@ -1240,6 +1240,7 @@ web_search = true # enables canonical web.run plus the compatibility web_search 
 apply_patch = true
 mcp = true
 exec_policy = true
+code_mode = true # execute_tools composes MCP/plugin/native calls; false defers it behind tool_search
 # vision_model = false  # enable vision model for image_analyze tool
 # verify_tool = false   # disable the agent-callable `verify` self-critique tool
                         # (#4196). On by default; the agent decides when to spend

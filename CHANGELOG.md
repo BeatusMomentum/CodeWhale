@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `docs/features.toml` lists every user feature with its status, first
+  release, docs page and owning code. A test fails when a `[features]` flag
+  and its row disagree, or when a listed docs page or code path is missing.
+  The configuration reference now lists the `verify_tool`, `vision_model` and
+  `extension_host` flags, and `config.example.toml` lists `code_mode`.
+
 ### Contributors
 
 - **[@SparkofSpike](https://github.com/SparkofSpike)** — translated seventeen Tier-2 guides and thirteen developer and internal docs into Simplified Chinese, and connected the localized documentation ([#6662](https://github.com/Hmbown/Codewhale/pull/6662), [#6663](https://github.com/Hmbown/Codewhale/pull/6663)).

@@ -3054,12 +3054,24 @@ apply_patch = true
 mcp = true
 exec_policy = true
 code_mode = true # execute_tools composes MCP/plugin/native calls; false defers it behind tool_search
+verify_tool = true # agent-callable `verify` self-critique; false removes it from the tool catalog
+vision_model = false # true routes image analysis to the [vision_model] model (see above)
+extension_host = false # experimental: run reviewed plugins' native code (see EXTENSIONS.md)
 ```
 
 `code_mode` is on by default: `execute_tools` is advertised from the first
 request and nested calls go through the same permission gate as direct calls
 (see [Tool surface](TOOL_SURFACE.md#code-mode-execute_tools)). Set
 `code_mode = false` to defer it behind `tool_search` again.
+
+`extension_host` is experimental and off by default. Turning it on lets reviewed
+plugins run their `native` TypeScript/JavaScript tool code in a Node sidecar;
+toggling it in either direction changes the plugin activation policy, so every
+plugin is reviewed again after a restart. See
+[Writing an extension tool](EXTENSIONS.md).
+
+Every flag has a row in [`docs/features.toml`](features.toml), the feature
+registry; a test fails when a flag and its row disagree.
 
 You can also override features for a single run:
 

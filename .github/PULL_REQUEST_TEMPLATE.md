@@ -25,4 +25,4 @@ For visible UI changes, add a screenshot or recording. -->
 
 - [ ] One focused change, rebased on current `main`
 - [ ] `cargo fmt --all` passes, and tests cover new or changed behavior
-- [ ] If this adds or changes a user-facing feature, I updated the docs (feature registry coming soon)
+- [ ] If this adds or changes a user-facing feature, I updated its docs and its row in `docs/features.toml` (`cargo test -p codewhale-tui --test feature_registry` checks it)
