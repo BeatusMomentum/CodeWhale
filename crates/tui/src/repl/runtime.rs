@@ -616,6 +616,13 @@ impl PythonRuntime {
         String::from_utf8_lossy(&buf).to_string()
     }
 
+    /// True once a round failed or was dropped before reading its own DONE
+    /// sentinel. Every later round refuses, so a holder that wants to keep
+    /// going replaces the kernel instead of reusing it.
+    pub fn is_broken(&self) -> bool {
+        self.broken.is_some()
+    }
+
     /// Total rounds executed.
     pub fn round_count(&self) -> u64 {
         self.round_count
