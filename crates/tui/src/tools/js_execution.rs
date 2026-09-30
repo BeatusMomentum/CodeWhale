@@ -156,10 +156,15 @@ pub async fn execute_js_execution_tool(
         cmd.env("NODE_USE_ENV_PROXY", "1");
     }
 
-    let output = tokio::time::timeout(Duration::from_secs(120), cmd.output())
-        .await
-        .map_err(|_| ToolError::Timeout { seconds: 120 })
-        .and_then(|res| res.map_err(|e| ToolError::execution_failed(e.to_string())))?;
+    // Contained: a timeout or a cancelled call ends the interpreter and
+    // anything it started (`setInterval`, a server), not only this future.
+    let output = tokio::time::timeout(
+        Duration::from_secs(120),
+        crate::process_tree::contained_output(&mut cmd),
+    )
+    .await
+    .map_err(|_| ToolError::Timeout { seconds: 120 })
+    .and_then(|res| res.map_err(|e| ToolError::execution_failed(e.to_string())))?;
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -269,6 +274,31 @@ mod tests {
             result.content.contains("hello from node"),
             "stdout payload must surface the printed text; got {}",
             result.content
+        );
+    }
+
+    /// A timed-out or cancelled call drops the future; the interpreter and
+    /// what it started must end with it instead of running on.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropped_js_execution_kills_the_interpreter_tree() {
+        if !node_present() {
+            return;
+        }
+        let tmp = tempdir().expect("tempdir");
+        let code = "const { spawn } = require('child_process');\n\
+                    const child = spawn('sleep', ['300'], { stdio: 'ignore' });\n\
+                    require('fs').writeFileSync('grandchild.pid', String(child.pid));\n\
+                    setInterval(() => {}, 1000);";
+        let input = json!({ "code": code });
+        let grandchild = crate::process_tree::drop_once_pid_written(
+            execute_js_execution_tool(&input, tmp.path()),
+            &tmp.path().join("grandchild.pid"),
+        )
+        .await;
+        assert!(
+            crate::process_tree::wait_for_pid_exit(grandchild, Duration::from_secs(5)),
+            "a process started by the dropped script is still running"
         );
     }
 
