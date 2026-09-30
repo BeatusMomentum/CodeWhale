@@ -977,7 +977,7 @@ impl Git {
 
     /// Git with fsmonitor, hooks, lazy fetch and replace objects disabled,
     /// running in `workspace`. [`Self::review_command`] adds filter overrides.
-    fn review_base(workspace: &Path) -> anyhow::Result<Command> {
+    pub(crate) fn review_base(workspace: &Path) -> anyhow::Result<Command> {
         use anyhow::Context;
 
         let mut command = Self::command().context("git not found on PATH")?;
