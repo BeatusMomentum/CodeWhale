@@ -4661,7 +4661,7 @@ mod tests {
         let mut context = ToolContext::new(tmp.path().to_path_buf());
         context.search_provider = SearchProvider::DuckDuckGo;
         context.search_base_url = Some(format!("{}/html/", server.uri()));
-        let error = run_scrape_search_with_endpoints(
+        let Err(error) = run_scrape_search_with_endpoints(
             SearchProvider::DuckDuckGo,
             &query,
             5_000,
@@ -4672,8 +4672,9 @@ mod tests {
             },
         )
         .await
-        .err()
-        .expect("no fallback means the HTTP failure surfaces");
+        else {
+            panic!("no fallback means the HTTP failure surfaces");
+        };
         assert!(error.to_string().contains("HTTP 503"), "{error}");
     }
 

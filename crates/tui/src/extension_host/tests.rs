@@ -1131,7 +1131,10 @@ async fn typed_author_example_is_reviewed_before_its_tool_can_execute() {
         "trust alone does not enable code"
     );
     plugins.enable("hello-extension").unwrap();
-    let manager = supervised_manager(&fixture, node);
+    // This tests plugin review and typed loading, not hang detection. The
+    // 600 ms watchdog used by supervision fault tests can kill a healthy
+    // typed-plugin load on a busy runner before registration completes.
+    let manager = fixture.manager(node);
     let engine = manager.attach(Arc::new(plugins));
     engine.sync().await.unwrap();
     let tool = host_tool(&engine, fixture.workspace(), "hello_greet");
