@@ -225,6 +225,40 @@ fn parses_cloud_command_matrix_and_rejects_inline_keys() {
         command(&[
             "codewhale",
             "account",
+            "computers",
+            "create",
+            "Trial",
+            "--boat-trial",
+            "--eu-compute-opt-in"
+        ]),
+        CloudCommand::Computers(CloudComputersArgs {
+            command: CloudComputersCommand::Create {
+                boat_trial: true,
+                eu_compute_opt_in: true,
+                ..
+            }
+        })
+    ));
+    for lone_flag in ["--boat-trial", "--eu-compute-opt-in"] {
+        assert!(
+            Cli::try_parse_from([
+                "codewhale",
+                "account",
+                "computers",
+                "create",
+                "Trial",
+                lone_flag
+            ])
+            .is_err()
+        );
+    }
+    assert!(
+        Cli::try_parse_from(["codewhale", "account", "computers", "usage", "computer-1"]).is_err()
+    );
+    assert!(matches!(
+        command(&[
+            "codewhale",
+            "account",
             "projects",
             "create",
             "My Project",
@@ -2026,7 +2060,10 @@ fn account_computers_refuse_unsafe_ids_machine_keys_and_unconfirmed_delete() {
     assert!(client.computer("../other").is_err());
     assert!(client.computer_action("id/other", "start").is_err());
     assert!(client.delete_computer("id?other").is_err());
-    assert!(client.create_computer("un\nsafe").is_err());
+    assert!(client.create_computer("un\nsafe", false, false).is_err());
+    assert!(client.create_computer("Trial", true, false).is_err());
+    assert!(client.create_computer("Trial", false, true).is_err());
+    assert!(client.computer_usage("../other").is_err());
     let error = run_computers(
         CloudComputersCommand::List { json: false },
         &client,
@@ -2112,6 +2149,89 @@ fn account_computers_json_preserves_server_metering_and_entitlement() {
             expected
         );
     }
+}
+
+#[test]
+fn account_computers_boat_trial_and_usage_send_explicit_consent_and_read_receipts() {
+    const ID: &str = "123e4567-e89b-42d3-a456-426614174000";
+    let (_temp, config) = test_config();
+    let (secrets, _) = test_secrets();
+    AccountSessionStore::new(secrets.clone(), Some("default"), DEFAULT_API_BASE)
+        .save(auth("access-secret", "refresh-secret", "acct-123"))
+        .unwrap();
+    let usage = json!({
+        "computerId": ID,
+        "provider": "boat",
+        "meter": "provider_billable_seconds",
+        "trialLimitSeconds": 7200,
+        "usedSeconds": 360,
+        "remainingSeconds": 6840,
+        "customerChargeDollars": 0,
+        "receipts": [{"operationId": "operation-1", "seconds": 360}]
+    });
+    let transport = FakeTransport::new(vec![
+        response(201, json!({"computer": computer(ID, "suspended")})),
+        response(200, usage.clone()),
+    ]);
+    let mut output = Vec::new();
+    let mut key_reader = |_| bail!("unused");
+    let mut opener = |_| true;
+    let mut sleeper = |_| {};
+    for (index, argv) in [
+        vec![
+            "codewhale",
+            "account",
+            "computers",
+            "create",
+            "Trial",
+            "--boat-trial",
+            "--eu-compute-opt-in",
+        ],
+        vec!["codewhale", "account", "computers", "usage", ID, "--json"],
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        run_with(
+            command(&argv),
+            "default",
+            DEFAULT_API_BASE,
+            &config,
+            &secrets,
+            &secrets,
+            &machine::MachineKeyEnv::default(),
+            &transport,
+            &mut output,
+            &mut key_reader,
+            &mut opener,
+            &mut sleeper,
+        )
+        .unwrap();
+        if index == 0 {
+            assert!(String::from_utf8_lossy(&output).contains("Saved Computer identity"));
+            output.clear();
+        }
+    }
+    let requests = transport.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].method, HttpMethod::Post);
+    assert_eq!(requests[0].path, "/api/computers");
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(requests[0].body.as_ref().unwrap()).unwrap(),
+        json!({"name": "Trial", "provider": "boat", "boatEuComputeOptIn": true})
+    );
+    assert_eq!(requests[1].method, HttpMethod::Get);
+    assert_eq!(requests[1].path, format!("/api/computers/{ID}/usage"));
+    assert!(requests[1].body.is_none());
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.bearer.as_deref() == Some("access-secret"))
+    );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&output).unwrap(),
+        usage
+    );
 }
 
 #[test]

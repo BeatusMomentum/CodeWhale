@@ -231,11 +231,26 @@ enum CloudComputersCommand {
         json: bool,
     },
     /// Save a Computer identity; compute is allocated only when it starts.
-    Create { name: String },
+    Create {
+        name: String,
+        /// Try Boat compute in the EU for this Computer.
+        #[arg(long, requires = "eu_compute_opt_in")]
+        boat_trial: bool,
+        /// Confirm that Boat trial code and files run on EU compute.
+        #[arg(long, requires = "boat_trial")]
+        eu_compute_opt_in: bool,
+    },
     /// Show one Computer; --json includes allowance and meter data.
     Show {
         id: String,
         #[arg(long)]
+        json: bool,
+    },
+    /// Read Boat trial usage receipts for one Computer.
+    Usage {
+        id: String,
+        /// Print the full metering response.
+        #[arg(long, required = true)]
         json: bool,
     },
     /// Start a Computer, subject to the account's plan and capacity.
@@ -370,6 +385,10 @@ struct GitHubBindingListResponse {
 #[derive(Serialize)]
 struct ComputerCreateRequest<'a> {
     name: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider: Option<&'static str>,
+    #[serde(rename = "boatEuComputeOptIn", skip_serializing_if = "Option::is_none")]
+    boat_eu_compute_opt_in: Option<bool>,
 }
 
 #[derive(Clone, Deserialize)]
@@ -1001,12 +1020,34 @@ impl<'a, T: CloudTransport> CloudClient<'a, T> {
         expect_json(response, &[200])
     }
 
-    fn create_computer(&self, name: &str) -> Result<AccountComputer> {
+    fn computer_usage(&self, id: &str) -> Result<serde_json::Value> {
+        let id = validate_computer_id(id)?;
+        let response = self.execute_authenticated(
+            HttpMethod::Get,
+            &format!("/api/computers/{id}/usage"),
+            None,
+        )?;
+        expect_json(response, &[200])
+    }
+
+    fn create_computer(
+        &self,
+        name: &str,
+        boat_trial: bool,
+        eu_compute_opt_in: bool,
+    ) -> Result<AccountComputer> {
+        if boat_trial != eu_compute_opt_in {
+            bail!("Boat trial requires both --boat-trial and --eu-compute-opt-in");
+        }
         let name = validate_computer_name(name)?;
         let response = self.execute_authenticated(
             HttpMethod::Post,
             "/api/computers",
-            Some(json_body(&ComputerCreateRequest { name: &name })?),
+            Some(json_body(&ComputerCreateRequest {
+                name: &name,
+                provider: boat_trial.then_some("boat"),
+                boat_eu_compute_opt_in: boat_trial.then_some(true),
+            })?),
         )?;
         let result: ComputerResponse = expect_json(response, &[200, 201])?;
         Ok(result.computer)
@@ -1843,8 +1884,12 @@ fn run_computers<T: CloudTransport, W: Write>(
             }
             Ok(())
         }
-        CloudComputersCommand::Create { name } => {
-            let computer = client.create_computer(&name)?;
+        CloudComputersCommand::Create {
+            name,
+            boat_trial,
+            eu_compute_opt_in,
+        } => {
+            let computer = client.create_computer(&name, boat_trial, eu_compute_opt_in)?;
             write_computer(out, &computer)?;
             writeln!(
                 out,
@@ -1861,6 +1906,12 @@ fn run_computers<T: CloudTransport, W: Write>(
                     .context("The Codewhale service returned an invalid Computer")?;
                 write_computer(out, &result.computer)
             }
+        }
+        CloudComputersCommand::Usage { id, json } => {
+            if !json {
+                bail!("Use --json to inspect Computer usage receipts");
+            }
+            write_computer_json(out, &client.computer_usage(&id)?)
         }
         CloudComputersCommand::Start { id } => {
             let result = client.computer_action(&id, "start")?;
