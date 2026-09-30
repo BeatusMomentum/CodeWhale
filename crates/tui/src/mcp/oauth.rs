@@ -367,13 +367,14 @@ fn error_is_invalid_grant(error: &anyhow::Error) -> bool {
 /// authorization server has definitively rejected the stored grant — only a
 /// fresh login recovers it.
 pub fn error_text_looks_auth_required(text: &str) -> bool {
+    let status_401 = text_names_http_status(text, "401");
     let text = text.to_ascii_lowercase();
     // `auth required` and `requires oauth` are anchored to the shapes this
     // product and the Codex-compatible managers actually emit (`◆ auth
     // required`, `requires OAuth login/authentication/reauthentication`) —
     // bare substrings would misclassify incidental server errors like
     // "auth required parameter is missing".
-    text.contains("401")
+    status_401
         || text.contains("unauthorized")
         || text.contains("authentication_required")
         || text.contains("invalid_grant")
@@ -394,6 +395,21 @@ pub fn error_text_looks_auth_required(text: &str) -> bool {
         || text.contains("re-authorize")
         || text.contains("/mcp login")
         || text.contains("mcp login")
+}
+
+/// Whether error text names an HTTP status as a status, not as digits inside
+/// an address or a larger number. Transport errors carry the URL they failed
+/// on, so a bare substring match read the reset on
+/// `http://127.0.0.1:50401/mcp` as a 401 and put a healthy server into
+/// `◆ auth required` — whenever the ephemeral port happened to contain it.
+pub(crate) fn text_names_http_status(text: &str, status: &str) -> bool {
+    text.split_whitespace()
+        .filter(|token| !token.contains("://"))
+        .any(|token| {
+            token
+                .split(|c: char| !c.is_ascii_digit())
+                .any(|digits| digits == status)
+        })
 }
 
 pub fn auth_required_login_hint(server_name: &str) -> String {
@@ -2378,6 +2394,17 @@ mod tests {
 
         let err = anyhow!("connection refused");
         assert!(!error_looks_auth_required(&err));
+
+        assert!(error_text_looks_auth_required("HTTP 401 from upstream"));
+        assert!(error_text_looks_auth_required("request failed (401)"));
+        // The failure the classifier used to misread: a reset on a loopback
+        // server whose ephemeral port contains 401 is a transport error.
+        let reset = "error sending request for url (http://127.0.0.1:50401/mcp): \
+                     client error (SendRequest): connection closed before message completed";
+        assert!(!error_text_looks_auth_required(reset), "{reset}");
+        assert!(!error_text_looks_auth_required(
+            "read 14010 bytes before the stream reset"
+        ));
     }
 
     #[test]

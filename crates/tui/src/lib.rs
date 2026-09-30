@@ -5074,11 +5074,13 @@ async fn run_doctor(
                     "\r  {} API connection failed",
                     "✗".truecolor(red_r, red_g, red_b)
                 );
-                if error_msg.contains("401") || error_msg.contains("Unauthorized") {
+                let names_status =
+                    |status| crate::mcp::oauth::text_names_http_status(&error_msg, status);
+                if names_status("401") || error_msg.contains("Unauthorized") {
                     println!(
                         "    Invalid API key. Check `codewhale auth status`, DEEPSEEK_API_KEY, or config.toml"
                     );
-                } else if error_msg.contains("403") || error_msg.contains("Forbidden") {
+                } else if names_status("403") || error_msg.contains("Forbidden") {
                     println!(
                         "    API key lacks permissions. Verify key is active at platform.deepseek.com"
                     );
