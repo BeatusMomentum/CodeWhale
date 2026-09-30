@@ -7,31 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added
-
-- `docs/features.toml` lists every user feature with its status, first
-  release, docs page and owning code. A test fails when a `[features]` flag
-  and its row disagree, or when a listed docs page or code path is missing.
-  The configuration reference now lists the `verify_tool`, `vision_model` and
-  `extension_host` flags, and `config.example.toml` lists `code_mode`.
-
-### Contributors
-
-- **[@SparkofSpike](https://github.com/SparkofSpike)** — translated seventeen Tier-2 guides and thirteen developer and internal docs into Simplified Chinese, and connected the localized documentation ([#6662](https://github.com/Hmbown/Codewhale/pull/6662), [#6663](https://github.com/Hmbown/Codewhale/pull/6663)).
-
-## [0.10.1] - 2026-09-28
+## [0.10.1] - Unreleased candidate
 
 The website's not-found page now uses the Codwhale poster and typo joke,
 with English/Chinese recovery links to home and docs
 ([#6419](https://github.com/Hmbown/Codewhale/issues/6419),
 [#6420](https://github.com/Hmbown/Codewhale/pull/6420)).
 
-Codewhale v0.10.1 is a reliability and first-run release. Turns that
+Codewhale v0.10.1 source candidate focuses on reliability and first-run behavior.
+Turns that
 stall now say so, approvals keep what you approved, plugin suggestions are
 quieter, and Fleet runs can be checked before they spend anything.
 
 ### Security
 
+- Update development tooling to Undici 7.29.1 for
+  [GHSA-w293-vg96-wgc3](https://github.com/advisories/GHSA-w293-vg96-wgc3).
 - Harden local runtime browser sessions, fleet SSH trust, agent continuation
   ownership, task gate approval, plugin tool registration, bridge action tokens,
   and release metadata credential forwarding. Browser sessions recover across
@@ -76,11 +67,26 @@ quieter, and Fleet runs can be checked before they spend anything.
 - **[@BX166](https://github.com/BX166)** — reported the AICraft provider row missing its key console, docs link and guidance, and supplied the values ([#6616](https://github.com/Hmbown/Codewhale/issues/6616)).
 - **[@Water-Run](https://github.com/Water-Run)** — ingested namespaced model-only catalog entries so models present only in the canonical `models` map reach the offering list ([#6400](https://github.com/Hmbown/Codewhale/pull/6400)), and retired the blanket dead-code allowance with its unused feature stages, tightening the budget to match ([#6402](https://github.com/Hmbown/Codewhale/pull/6402)).
 - **[@wuisabel-gif](https://github.com/wuisabel-gif)** — designed the `tool_call_after` execution-receipt contract and its tests on a reference branch, which landed re-implemented on the current hook seam ([#6689](https://github.com/Hmbown/Codewhale/issues/6689), [#6713](https://github.com/Hmbown/Codewhale/pull/6713)).
-- **[@SparkofSpike](https://github.com/SparkofSpike)** — let making room survive a provider request-body limit (HTTP 413) by shrinking, then replacing, inline images for that one summary pass ([#6642](https://github.com/Hmbown/Codewhale/pull/6642)).
+- **[@SparkofSpike](https://github.com/SparkofSpike)** — let making room survive a provider request-body limit (HTTP 413) by shrinking, then replacing, inline images for that one summary pass ([#6642](https://github.com/Hmbown/Codewhale/pull/6642)). Translated seventeen Tier-2 guides and thirteen developer and internal docs into Simplified Chinese, and connected the localized documentation ([#6662](https://github.com/Hmbown/Codewhale/pull/6662), [#6663](https://github.com/Hmbown/Codewhale/pull/6663)); added regression coverage for rejecting unknown website locales before dictionary lookup ([#6786](https://github.com/Hmbown/Codewhale/pull/6786)).
 
 ### Added
 
+- `docs/features.toml` lists every user feature with its status, first
+  release, docs page and owning code. A test fails when a `[features]` flag
+  and its row disagree, or when a listed docs page or code path is missing.
+  The configuration reference now lists the `verify_tool`, `vision_model` and
+  `extension_host` flags, and `config.example.toml` lists `code_mode`.
+- A reusable GitHub Action runs PR reviews with a configurable model endpoint
+  and a checksum-pinned Codewhale binary. It checks the PR's eligibility and
+  exact revisions before inference; fork events receive no model key
+  ([#6780](https://github.com/Hmbown/Codewhale/pull/6780)).
 - `tool_call_after` hooks for shell tools receive `DEEPSEEK_TOOL_EXECUTION_RECEIPT`: the command that actually ran after admission, its working directory, how it ended, and bounded stdout/stderr previews, so a hook can record exactly what executed ([#6689](https://github.com/Hmbown/Codewhale/issues/6689), requested by [@wuisabel-gif](https://github.com/wuisabel-gif)).
+  Supported settled local shell calls also send a versioned JSON document on
+  stdin to foreground or background observers, with session/tool-call IDs,
+  nullable exit status and output truncation flags. Existing environment fields
+  stay available; unsupported execution paths send no document, and observer
+  output cannot change the completed call
+  ([#6582](https://github.com/Hmbown/Codewhale/issues/6582)).
 - Runtime API: turns now record what they produced. Each item and turn
   carries typed artifact references (path, kind, size, revision, and a
   restore point when file-revert would accept one) for files a tool wrote,
@@ -220,15 +226,34 @@ quieter, and Fleet runs can be checked before they spend anything.
   exit code on either surface. The new `DEEPSEEK_TOOL_STATUS` says how the
   command ended (`completed`, `failed`, `timed_out`, `killed`)
   ([#6582](https://github.com/Hmbown/Codewhale/issues/6582)).
-- Scrolling a long transcript no longer re-renders everything below the
-  reasoning block you scroll past. Moving the view shifts the `Space:expand`
-  hint to the newest visible reasoning cell, and each move re-flattened the
-  whole transcript tail from that cell, so scrolling slowed as a session
-  grew. The two hint rows are now repainted in place, including while a
-  reply is streaming, so a scroll frame only rebuilds rows that actually
-  changed. The pinned-prompt lookup also searches from the newest row
-  instead of the oldest. Other per-frame work still grows with session
-  length ([#6652](https://github.com/Hmbown/Codewhale/issues/6652)).
+- Scrolling a long transcript repaints the reasoning reveal hint in place
+  instead of rebuilding the transcript tail. Wheel and scrollbar input use
+  interactive frame pacing, collapsed tool groups reuse cached summaries, and
+  height-only resizes keep wrapped history. Width changes still rewrap content,
+  and other per-frame work still grows with session length
+  ([#6652](https://github.com/Hmbown/Codewhale/issues/6652)).
+- Calm transcript previews keep the latest three rows of live thought and a
+  single duration header when it settles. Successful tool headers are quieter;
+  failed generic and MCP calls keep a bounded head-and-tail excerpt, with full
+  output available in details. Existing collapsed groups show their hidden
+  count and reveal cue, and explicit thought expansion stays available.
+- Composer history preserves multiline entries and literal quoted text while
+  retaining the old history file during migration. An oversized message stays
+  in the composer if its paste file cannot be saved, with a localized notice;
+  mouse placement and quoted file mentions handle multibyte text and spaces
+  ([#6776](https://github.com/Hmbown/Codewhale/pull/6776)).
+- Model-facing guidance names callable tools and explains discovery before a
+  deferred read. The stopship workflow uses bounded `grep_files` evidence,
+  optional `tool_search` activation and the current workflow source path
+  ([#6747](https://github.com/Hmbown/Codewhale/issues/6747)).
+- Simplified and Traditional Chinese permission, provider and session wording
+  now follows the current behavior. Chinese guides correct hook receipts,
+  trusted skills, MCP startup and Windows limitations, preserving the
+  contributor translations and a shared glossary.
+- Unknown website locale segments, including dotted missing paths, return a
+  real 404 with noindex metadata and no home-page canonical URL. The existing
+  layout guards now have regression coverage across all registered locales
+  ([#6786](https://github.com/Hmbown/Codewhale/pull/6786)).
 - The terminal caret no longer blinks at the hidden composer while a picker,
   settings screen or other view covers it; it returns when the view closes
   ([#6545](https://github.com/Hmbown/Codewhale/issues/6545)).
@@ -240,13 +265,13 @@ quieter, and Fleet runs can be checked before they spend anything.
   shells are not covered. Under the bwrap sandbox, the sandboxed command
   now also exits when bwrap does
   ([#6654](https://github.com/Hmbown/Codewhale/issues/6654)).
-- Idle task workers no longer take the shared task-store lock and reload
-  every task record every 200ms, which made several TUIs sharing one data
-  directory contend for the store. An idle worker now reloads only when the
-  task queue file changes or every 2 seconds, including while tasks run
-  elsewhere, and backs off up to 8 seconds after a failed claim. Tasks
-  submitted in the same process still start immediately
-  ([#6573](https://github.com/Hmbown/Codewhale/issues/6573)).
+- Idle task workers stop periodically reloading a settled, unchanged empty
+  queue, and task listings reuse an unchanged store snapshot. New queue writes
+  and local notifications still wake workers; recent or unreadable metadata and
+  failed claims keep bounded retries. This reduces repeated disk work when
+  several TUIs share a data directory without changing task ownership or
+  cancellation ([#6573](https://github.com/Hmbown/Codewhale/issues/6573),
+  [#6728](https://github.com/Hmbown/Codewhale/issues/6728)).
 - File writes, including legacy `File` and `write_file` calls, stop if the
   original contents cannot be read; legacy writers also reject non-UTF-8
   originals, keeping undo and diffs from recording an empty original file.
@@ -258,9 +283,13 @@ quieter, and Fleet runs can be checked before they spend anything.
   before reporting remaining credentials with a non-zero exit status.
 - `doctor --fix` keeps temporary files modified within the last hour.
 - Provider streams stop with a clear error if an SSE line exceeds 8 MiB.
-- Recursive `rlm_query` turns now stop at the existing child wall-clock budget,
-  including stalled model requests and Python work, and return the last response
-  with an incomplete-result error instead of waiting indefinitely
+- Recursive `rlm_query` turns inherit the parent's remaining deadline,
+  bounded by the existing child budget, including asynchronous lock waits,
+  startup, model requests and Python evaluation. Expired work is refused before
+  dispatch; a timeout returns the last response with an incomplete-result error.
+  Nested code and status receipts accompany the enclosing tool result on success
+  or failure and survive its session save/reopen. In-flight receipts still need
+  that result to be handed back before they become durable
   ([#6511](https://github.com/Hmbown/Codewhale/issues/6511)).
 - The TUI keeps redrawing while its terminal is unfocused. v0.10.0 held
   every frame on focus loss, so on Windows Terminal, macOS and other
