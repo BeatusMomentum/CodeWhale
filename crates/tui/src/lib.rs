@@ -5577,24 +5577,32 @@ async fn run_doctor(
 
     {
         // The runtime the TypeScript extension host would use, resolved the
-        // same way the host launcher does (`[extension_host] runtime`). The
-        // resolver runs each candidate runtime, so it stays off the async
-        // runtime. Known limit: the probes have no timeout, so a runtime
-        // binary that hangs on `--version` stalls doctor here.
+        // same way the host launcher does (`[extension_host] runtime`), and
+        // with the host on, the OS sandbox it would get, planned (on Linux,
+        // bwrap-probed) the way a launch plans it. Both run child processes,
+        // so they stay off the async runtime. Known limit: the runtime probes
+        // have no timeout, so a runtime binary that hangs on `--version`
+        // stalls doctor here.
         let options = crate::extension_host::ExtensionHostOptions::from_config(
             config.extension_host.as_ref(),
         );
-        let resolution = tokio::task::spawn_blocking(move || {
-            crate::dependencies::resolve_extension_host_runtime(
-                options.runtime,
-                options.node_override.as_deref(),
-                options.bun_override.as_deref(),
-            )
-        })
-        .await;
         let enabled = config
             .features()
             .enabled(crate::features::Feature::ExtensionHost);
+        let resolution = tokio::task::spawn_blocking(move || {
+            let resolution = crate::dependencies::resolve_extension_host_runtime(
+                options.runtime,
+                options.node_override.as_deref(),
+                options.bun_override.as_deref(),
+            );
+            let sandbox = resolution
+                .selected
+                .as_ref()
+                .filter(|_| enabled)
+                .map(|runtime| crate::extension_host::planned_sandbox(&options, runtime));
+            (resolution, sandbox)
+        })
+        .await;
         let state = if enabled {
             ""
         } else {
@@ -5606,7 +5614,7 @@ async fn run_doctor(
             "·".dimmed()
         };
         match resolution {
-            Ok(resolution) => match &resolution.selected {
+            Ok((resolution, sandbox)) => match &resolution.selected {
                 Some(runtime) => {
                     println!(
                         "  {} Extension host runtime: {}{state}",
@@ -5618,6 +5626,13 @@ async fn run_doctor(
                         crate::extension_host::supervisor::MemoryEnforcement::planned(runtime.kind)
                             .describe(crate::extension_host::supervisor::HOST_MEMORY_CAP)
                     );
+                    match sandbox {
+                        Some(Ok(sandbox)) => println!("    {sandbox}"),
+                        Some(Err(error)) => {
+                            println!("    host sandbox not determined: {error}")
+                        }
+                        None => {}
+                    }
                 }
                 None => println!(
                     "  {failed} Extension host runtime: {}{state}",

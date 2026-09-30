@@ -41,14 +41,17 @@
 //!   (`supervisor::HostProcess::call`). Cancellation is a request: a plugin
 //!   that ignores its abort signal keeps running in the host until the host
 //!   is torn down, though the core has already failed the call.
-//! * One host per engine process and one trust tier. On macOS (Seatbelt) the
-//!   host has no direct network, and cannot read the Codewhale home (except
-//!   the bundle, its data dir and plugin code), the Codex and DSH credential
-//!   homes, or the default credential stores (`supervisor::plan_launch`).
-//!   Other files the user can read — including project `.env` files — stay
-//!   readable, and Mach services are not restricted. On Linux and Windows it
-//!   runs unsandboxed with the user's permissions. Either way the flag is
-//!   Experimental.
+//! * One host per engine process and one trust tier. Under its OS sandbox
+//!   (Seatbelt on macOS; bubblewrap on Linux when a launch-time probe shows it
+//!   works) the host has no direct network, and cannot read the Codewhale
+//!   home (except the bundle, its data dir and plugin code), the Codex and
+//!   DSH credential homes, or the default credential stores
+//!   (`supervisor::plan_launch`, whose module docs list what bubblewrap does
+//!   not cover). Other files the user can read — including project `.env`
+//!   files — stay readable, and Mach services are not restricted. On Windows,
+//!   and on Linux where bwrap is missing or cannot start, it runs unsandboxed
+//!   with the user's permissions, and `/plugin`, doctor and the start
+//!   diagnostic say why. Either way the flag is Experimental.
 //! * The runtime (`[extension_host] runtime`) defaults to Node. Bun is an
 //!   opt-in (`bun`, or `auto`, which prefers a Bun >= 1.4.0 and uses Node
 //!   when none is found) and is qualified on macOS only. The runtime is
@@ -66,7 +69,7 @@
 //!   (`extension-host/src/runtime.ts`), for the entry points found so far; a
 //!   native-code entry point a newer runtime adds is not covered until it is
 //!   added there. A process a plugin starts is outside that policy and runs
-//!   under the same OS sandbox (none on Linux and Windows).
+//!   under the same OS sandbox (none on Windows, or where bwrap fails).
 //! * The owner token is a bug/staleness guard, not a boundary between
 //!   plugins that share the process: one plugin can alter another's
 //!   behaviour, which the approval card discloses.
@@ -328,8 +331,7 @@ pub enum HostStatus {
         runtime: &'static str,
         /// As reported by the host (`host/hello`).
         runtime_version: String,
-        /// `seatbelt` / `bwrap`, or `None` when the host runs unsandboxed.
-        sandbox: Option<String>,
+        sandbox: supervisor::HostSandbox,
         /// How the memory cap is enforced for this process.
         memory: supervisor::MemoryEnforcement,
     },
@@ -495,14 +497,29 @@ fn prepare_launch(
             (runtime, Some(format!("{}{note}", resolution.summary())))
         }
     };
-    let root = match options.root.clone() {
-        Some(root) => root,
-        None => codewhale_config::codewhale_home()
-            .map_err(|error| format!("Codewhale home unavailable: {error}"))?,
-    };
+    let root = host_root(options)?;
     let bundle = materialize_bundle(&root)?;
     let launch = supervisor::plan_launch(&runtime, &bundle, &root, options.supervision.memory_cap)?;
     Ok((launch, summary))
+}
+
+/// The Codewhale home the host lives under.
+fn host_root(options: &ExtensionHostOptions) -> Result<PathBuf, String> {
+    match options.root.clone() {
+        Some(root) => Ok(root),
+        None => codewhale_config::codewhale_home()
+            .map_err(|error| format!("Codewhale home unavailable: {error}")),
+    }
+}
+
+/// The OS sandbox a host started now on `runtime` would run under, planned —
+/// and on Linux probed — exactly as a launch does (for doctor). Blocking;
+/// creates the host's data dir, as a launch would.
+pub(crate) fn planned_sandbox(
+    options: &ExtensionHostOptions,
+    runtime: &crate::dependencies::HostRuntime,
+) -> Result<supervisor::HostSandbox, String> {
+    supervisor::planned_sandbox(runtime, &host_root(options)?)
 }
 
 impl ManagerShared {
@@ -1525,7 +1542,7 @@ impl ExtensionHostManager {
                         .map_or_else(|| "?".to_string(), |pid| pid.to_string()),
                     host.runtime.kind.name(),
                     host.runtime_version.get().map_or("?", String::as_str),
-                    host.sandbox.as_deref().unwrap_or("none")
+                    host.sandbox.label()
                 ));
                 Ok(host)
             }
@@ -1605,14 +1622,8 @@ pub(crate) fn render_status(manager: &ExtensionHostManager) -> String {
         } => {
             let _ = write!(
                 out,
-                "running · pid {} · {runtime} {runtime_version} · {}",
+                "running · pid {} · {runtime} {runtime_version} · {sandbox}",
                 pid.map_or_else(|| "?".to_string(), |pid| pid.to_string()),
-                match sandbox {
-                    Some(sandbox) => format!(
-                        "{sandbox} sandbox (no direct network; the Codewhale home except plugin code, the Codex and DSH credential homes and the default credential stores are unreadable; other files you can read, such as project .env files, are not protected)"
-                    ),
-                    None => "UNSANDBOXED: host code runs with your user permissions".to_string(),
-                }
             );
         }
         HostStatus::Failed { stderr_tail, .. } => {

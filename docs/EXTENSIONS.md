@@ -97,8 +97,8 @@ unavailable too; under Node, `node:sqlite` and `node:ffi` are switched off
 when one of these restrictions does not hold on the installed runtime. Known
 limit: these are the native-code entry points found so far (Bun 1.4, Node 22
 and 26); one a newer runtime adds is not covered until it is added. A
-process an extension starts is outside this policy; on macOS it runs under the
-same sandbox as the host.
+process an extension starts is outside this policy; on macOS and Linux it runs
+under the same sandbox as the host.
 Include local imports in the bundle; trust stages reviewed content, and the
 entry is rehashed before import. Changes to reviewed bytes or capabilities
 require another review. See [bundle rules](PLUGIN_BUNDLES.md).
@@ -170,12 +170,19 @@ Dispose within 2 seconds and avoid leaving background work behind.
 ## Sandbox
 
 Trust is not a complete security boundary. Plugins share one process and can
-interfere with each other. On macOS, the existing Seatbelt profile denies direct
-network access, writes outside host data/temp paths and reads of the protected
-credential locations. Other user-readable files, including project `.env`
-files, remain readable. Linux and Windows currently run this host with the
-user's permissions. Review the [current design limits](design/TS_EXTENSION_HOST.md)
-before enabling third-party code.
+interfere with each other. On macOS the existing Seatbelt profile, and on Linux
+bubblewrap (`/usr/bin/bwrap`), deny direct network access, writes outside host
+data/temp paths and reads of the protected credential locations. Other
+user-readable files, including project `.env` files, remain readable. On Linux
+each start first checks that bwrap actually runs; where it is missing or cannot
+create its namespaces (for example Ubuntu 24.04's
+`kernel.apparmor_restrict_unprivileged_userns`), the host runs with the user's
+permissions and `/plugin`, `codewhale doctor` and the start diagnostic say
+`UNSANDBOXED` with bwrap's own error. Under bubblewrap a default credential
+store created after the host started stays readable until it restarts.
+Windows runs this host with the user's permissions. Review the
+[current design limits](design/TS_EXTENSION_HOST.md) before enabling
+third-party code.
 
 ## Limits
 
