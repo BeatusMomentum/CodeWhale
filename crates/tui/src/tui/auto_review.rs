@@ -1025,7 +1025,9 @@ fn shell_params_are_publish_like(params: &Value) -> bool {
 /// durable-review floor armed now that the floor no longer treats every
 /// non-read-only command as destructive (#3883).
 fn shell_params_are_destructive_like(params: &Value, workspace: Option<&std::path::Path>) -> bool {
-    use codewhale_execpolicy::command_safety::{SafetyLevel, analyze_command, command_invocations};
+    use codewhale_execpolicy::command_safety::{
+        SafetyLevel, analyze_command, command_invocations, is_literal_rm_invocation,
+    };
     let Some(command) = params
         .get("command")
         .or_else(|| params.get("cmd"))
@@ -1037,11 +1039,11 @@ fn shell_params_are_destructive_like(params: &Value, workspace: Option<&std::pat
     split_shell_segments_for_review(command)
         .iter()
         .any(|segment| analyze_command(segment).level == SafetyLevel::Dangerous)
-        // The same reader command_safety uses; unreadable nesting holds. A
-        // command that makes links can change what a path means before `rm`
-        // runs, so it gets no in-workspace clearance.
+        // Only one literal rm may use paths resolved before execution. Any
+        // earlier command could replace an ancestor (mv and Python can do
+        // that just as ln can), invalidating the workspace clearance.
         || command_invocations(command).is_none_or(|argvs| {
-            let workspace = workspace.filter(|_| !argvs.iter().any(|argv| argv[0] == "ln"));
+            let workspace = workspace.filter(|_| is_literal_rm_invocation(command));
             argvs.iter().any(|argv| argv_is_destroyer(argv, workspace))
         })
 }
@@ -1703,8 +1705,138 @@ mod tests {
             "\\rm -rf /home/me",
             "/bin/rm -rf /home/me",
             "FOO=1 env -i rm -rf /home/me",
+            "command rm -rf /etc",
+            "exec rm -rf /etc",
+            "eval 'rm -rf /etc'",
+            "r''m -rf /etc",
+            "rm -r -f /etc",
+            "rm --recursive --force /etc",
+            "rm -rf -- /etc",
+            "find / -delete",
+            "busybox rm -rf /etc",
+            "nohup rm -rf /etc",
+            "xargs -0 rm -rf /etc",
         ] {
             assert!(destroyer_held(workspace.path(), command), "{command}");
+        }
+    }
+
+    #[test]
+    fn opaque_program_deletes_keep_the_legacy_destroyer_floor() {
+        let workspace = tempfile::tempdir().expect("tempdir");
+        for command in [
+            r#"python3 -c '__import__("os").system("rm -rf /etc")'"#,
+            r#"perl -e 'system("rm -rf /etc")'"#,
+        ] {
+            assert!(destroyer_held(workspace.path(), command), "{command}");
+        }
+    }
+
+    #[test]
+    fn wrappers_cannot_borrow_workspace_path_clearance() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        std::fs::create_dir(workspace.path().join("build")).unwrap();
+        let build = workspace.path().join("build").display().to_string();
+        for command in [
+            format!("sudo --chroot=/other-root rm -rf {build}"),
+            format!("sudo --chroot=/other-root rm -r -f {build}"),
+        ] {
+            assert!(destroyer_held(workspace.path(), &command), "{command}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn composed_deletes_cannot_clear_paths_that_an_earlier_command_rebinds() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let outside = tempfile::tempdir().expect("outside");
+        let root = workspace.path();
+        std::fs::create_dir_all(root.join("build/data")).unwrap();
+        std::fs::create_dir_all(outside.path().join("data")).unwrap();
+        let sentinel = outside.path().join("data/keep");
+        std::fs::write(&sentinel, b"keep").unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.join("link")).unwrap();
+        let ws = root.display();
+        for flags in ["-rf", "-r -f", "--recursive --force"] {
+            let command = format!(
+                "mv {ws}/build {ws}/saved && mv {ws}/link {ws}/build && rm {flags} {ws}/build/data"
+            );
+            assert!(destroyer_held(root, &command), "{command}");
+        }
+        // Exercise only the harmless rebinding, never the destructive command:
+        // the path checked inside the workspace would now delete outside it.
+        assert!(
+            root.join("build/data")
+                .canonicalize()
+                .unwrap()
+                .starts_with(root.canonicalize().unwrap())
+        );
+        std::fs::rename(root.join("build"), root.join("saved")).unwrap();
+        std::fs::rename(root.join("link"), root.join("build")).unwrap();
+        assert_eq!(
+            root.join("build/data").canonicalize().unwrap(),
+            outside.path().join("data").canonicalize().unwrap()
+        );
+        assert_eq!(std::fs::read(sentinel).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn full_access_workspace_cleanup_stays_clear() {
+        use crate::core::engine::{AutoReviewPlanDecision, auto_review_plan_decision_for_context};
+
+        let workspace = tempfile::tempdir().expect("workspace");
+        let root = workspace.path();
+        for directory in ["target", "build", "node_modules"] {
+            std::fs::create_dir(root.join(directory)).unwrap();
+        }
+        let ws = root.display();
+        for command in [
+            "rm -rf target build node_modules".to_string(),
+            format!("rm -rf {ws}/target {ws}/build {ws}/node_modules"),
+        ] {
+            assert!(!destroyer_held(root, &command), "{command}");
+            let context = AutoReviewContext::from_tool_call(
+                "bash",
+                &json!({"command": command}),
+                RunOrigin::Interactive,
+                ApprovalMode::Bypass,
+                true,
+                Some(root),
+            );
+            let (decision, _) =
+                auto_review_plan_decision_for_context(&AutoReviewPolicy::default(), &context);
+            assert!(
+                !matches!(decision, AutoReviewPlanDecision::Block(_)),
+                "Full Access parent cleanup must run: {decision:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn full_access_blocks_detached_catastrophic_tools_without_prompting() {
+        use crate::core::engine::{AutoReviewPlanDecision, auto_review_plan_decision_for_context};
+
+        for run_origin in [RunOrigin::Background, RunOrigin::Headless] {
+            let context = AutoReviewContext::from_tool_call(
+                "exec_shell",
+                &json!({"command": "rm -rf ~/", "background": true}),
+                run_origin,
+                ApprovalMode::Bypass,
+                true,
+                None,
+            );
+            let (decision, audit) =
+                auto_review_plan_decision_for_context(&AutoReviewPolicy::default(), &context);
+            assert_eq!(
+                decision,
+                AutoReviewPlanDecision::Block(
+                    "Built-in safety gate requires approval: destructive background/headless action requires durable review"
+                        .to_string()
+                )
+            );
+            assert_eq!(audit["approval_mode"], "BYPASS");
+            assert_eq!(audit["run_origin"], run_origin.as_str());
+            assert_eq!(audit["decision"], "hold_for_review");
         }
     }
 
@@ -1713,6 +1845,7 @@ mod tests {
     #[test]
     fn unknowable_or_unsafe_targets_are_never_inside_the_workspace() {
         let workspace = tempfile::tempdir().expect("tempdir");
+        #[cfg(unix)]
         let outside = tempfile::tempdir().expect("tempdir");
         let root = workspace.path();
         std::fs::create_dir_all(root.join("build")).unwrap();

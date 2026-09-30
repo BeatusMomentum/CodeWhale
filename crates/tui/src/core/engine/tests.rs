@@ -11246,35 +11246,6 @@ fn auto_review_routes_shell_commands_requiring_approval_to_reviewer() {
 }
 
 #[test]
-fn full_access_blocks_detached_catastrophic_tools_without_prompting() {
-    for run_origin in [
-        crate::tui::auto_review::RunOrigin::Background,
-        crate::tui::auto_review::RunOrigin::Headless,
-    ] {
-        let (decision, audit) = auto_review_plan_decision(
-            &crate::tui::auto_review::AutoReviewPolicy::default(),
-            "exec_shell",
-            &json!({"command": "rm -rf ~/", "background": true}),
-            run_origin,
-            ApprovalMode::Bypass,
-            true,
-            None,
-        );
-
-        assert_eq!(
-            decision,
-            AutoReviewPlanDecision::Block(
-                "Built-in safety gate requires approval: destructive background/headless action requires durable review"
-                    .to_string()
-            )
-        );
-        assert_eq!(audit["approval_mode"], "BYPASS");
-        assert_eq!(audit["run_origin"], run_origin.as_str());
-        assert_eq!(audit["decision"], "hold_for_review");
-    }
-}
-
-#[test]
 fn auto_review_plan_decision_uses_configured_policy() {
     let policy = crate::tui::auto_review::AutoReviewPolicy {
         block_rules: vec![

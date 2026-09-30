@@ -1814,8 +1814,10 @@ pub fn analyze_command(command: &str) -> SafetyAnalysis {
 
     // Check for dangerous patterns first. The token-aware pass above handles
     // spacing and quoting variants; these literal patterns remain as a compact
-    // fallback for legacy shapes. A pattern must not run on into a longer
-    // path: `rm -rf /` is the root, `rm -rf /home/me/project/build` is not.
+    // fallback for legacy shapes. Only a single literal rm invocation may
+    // treat `rm -rf /some/path` as a path instead of this legacy root match.
+    // Opaque code such as Python's system("rm -rf /etc") was held by this
+    // fallback before workspace cleanup was exempted; keep that protection.
     for (pattern, reason) in DANGEROUS_PATTERNS {
         let pattern = pattern.to_lowercase();
         if command_lower.match_indices(&pattern).any(|(at, _)| {
@@ -1825,6 +1827,7 @@ pub fn analyze_command(command: &str) -> SafetyAnalysis {
                 .is_none_or(|next| {
                     !(next.is_alphanumeric() || matches!(next, '_' | '-' | '.' | '/'))
                 })
+                || (pattern == "rm -rf /" && !is_literal_rm_invocation(command))
         }) {
             return SafetyAnalysis::dangerous(
                 command,
@@ -2044,6 +2047,21 @@ fn shell_words(segment: &str) -> Vec<String> {
             .map(|token| token.trim_matches(['"', '\'']).to_string())
             .collect()
     })
+}
+
+/// Whether this is one direct, literal rm invocation. Only that shape may
+/// clear an existing workspace path: commands run earlier can replace an
+/// ancestor, and wrappers such as sudo --chroot can reinterpret absolute paths.
+/// Reuse the shell expander to reject composition, dynamic words and redirects.
+pub fn is_literal_rm_invocation(command: &str) -> bool {
+    let expansion = crate::shell_expand::expand_command(command);
+    if expansion.control || expansion.dynamic || expansion.arguments_dynamic || expansion.redirects
+    {
+        return false;
+    }
+    shlex::split(command)
+        .and_then(|tokens| tokens.first().map(|token| command_word(token) == "rm"))
+        .unwrap_or(false)
 }
 
 /// Every argv that could run as a command somewhere in `command`: each stage
@@ -2853,6 +2871,42 @@ mod tests {
             analyze_command("rm -rf /home/me/project/build").level,
             SafetyLevel::Dangerous
         );
+    }
+
+    #[test]
+    fn opaque_absolute_deletes_keep_the_legacy_literal_hold() {
+        for command in [
+            r#"python3 -c '__import__("os").system("rm -rf /etc")'"#,
+            r#"perl -e 'system("rm -rf /etc")'"#,
+        ] {
+            assert_eq!(
+                analyze_command(command).level,
+                SafetyLevel::Dangerous,
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn literal_rm_clearance_excludes_prior_effects_and_dynamic_targets() {
+        for command in [
+            "rm -rf target build node_modules",
+            "/bin/rm -r -f /workspace/build",
+        ] {
+            assert!(is_literal_rm_invocation(command), "{command}");
+        }
+        for command in [
+            "mv build saved && rm -rf /workspace/build",
+            "sudo --chroot=/other-root rm -rf /workspace/build",
+            "bash -c 'rm -rf /workspace/build'",
+            "bash -c 'mv build saved; rm -rf /workspace/build'",
+            "rm -rf /workspace/$(make_path)",
+            "rm -rf /workspace/$TARGET",
+            "rm -rf /workspace/build > output",
+            r#"python3 -c '__import__("os").system("rm -rf /workspace/build")'"#,
+        ] {
+            assert!(!is_literal_rm_invocation(command), "{command}");
+        }
     }
 
     #[test]

@@ -24689,26 +24689,8 @@ mod child_permission_gate {
         let build = workspace.join("build");
         std::fs::create_dir_all(build.join("out")).unwrap();
         let command = format!("rm -rf {}", build.display());
-        // The parent turn's own verdict for this exact call under Full Access.
-        let parent_context = crate::tui::auto_review::AutoReviewContext::from_tool_call(
-            "bash",
-            &json!({"command": command}),
-            crate::core::engine::auto_review_run_origin_for_plan(false),
-            ApprovalMode::Bypass,
-            true,
-            Some(&workspace),
-        );
-        let (parent_decision, _) = crate::core::engine::auto_review_plan_decision_for_context(
-            &crate::tui::auto_review::AutoReviewPolicy::default(),
-            &parent_context,
-        );
-        assert!(
-            !matches!(
-                parent_decision,
-                crate::core::engine::AutoReviewPlanDecision::Block(_)
-            ),
-            "precondition: the parent runs it: {parent_decision:?}"
-        );
+        // Parent classification is covered in tui::auto_review; this runtime
+        // test proves the child actually executes and preserves the gate receipt.
         registry
             .execute("agent_gate", "bash", json!({"command": command}))
             .await
