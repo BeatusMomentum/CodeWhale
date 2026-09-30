@@ -97,6 +97,62 @@ const LEGACY_HANDOFF_RELATIVE_PATH: &str = ".deepseek/handoff.md";
 /// marker rather than skipped entirely so the model still sees the head.
 const INSTRUCTIONS_FILE_MAX_BYTES: usize = 100 * 1024;
 
+/// Read at most `cap` bytes of a prompt file plus slack for the leading
+/// whitespace the renderers trim, so an oversized file is never read whole
+/// into memory just to be truncated. Returns the text and the file's full
+/// length (for the truncation note). A file that is not UTF-8 within the read
+/// window is an error, as a whole-file `read_to_string` would report; only a
+/// character cut by the window's end is dropped.
+fn read_prompt_file_bounded(path: &Path, cap: usize) -> std::io::Result<(String, usize)> {
+    use std::io::Read as _;
+
+    const LEADING_WHITESPACE_SLACK: usize = 4 * 1024;
+    let file = std::fs::File::open(path)?;
+    let full_len = usize::try_from(file.metadata()?.len()).unwrap_or(usize::MAX);
+    let mut bytes = Vec::new();
+    file.take((cap + LEADING_WHITESPACE_SLACK) as u64)
+        .read_to_end(&mut bytes)?;
+    let truncated = bytes.len() < full_len;
+    let text = match String::from_utf8(bytes) {
+        Ok(text) => text,
+        Err(error) => {
+            let valid = error.utf8_error().valid_up_to();
+            let mut bytes = error.into_bytes();
+            // Only a multi-byte character split by the read window is
+            // forgiven; invalid bytes anywhere else still fail the read.
+            if !truncated || bytes.len() - valid > 3 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "stream did not contain valid UTF-8",
+                ));
+            }
+            bytes.truncate(valid);
+            String::from_utf8(bytes)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?
+        }
+    };
+    Ok((text, full_len))
+}
+
+/// Cap `trimmed` at `cap` bytes on a character boundary, noting what was
+/// omitted out of `total` (the file length when the read itself was bounded).
+fn cap_prompt_text(trimmed: &str, total: usize, cap: usize, hint: &str) -> String {
+    if trimmed.len() <= cap && total <= trimmed.len() {
+        return trimmed.to_string();
+    }
+    let head_end = (0..=cap.min(trimmed.len()))
+        .rev()
+        .find(|&i| trimmed.is_char_boundary(i))
+        .unwrap_or(0);
+    let total = total.max(trimmed.len());
+    format!(
+        "{}\n[…truncated: {} of {} bytes omitted — {hint}]",
+        &trimmed[..head_end],
+        total - head_end,
+        total
+    )
+}
+
 /// System prompt block appended when `translation_enabled` is true.
 /// Instructs the model to respond in the resolved session locale for all
 /// natural-language output — explanations, summaries, conversation.
@@ -303,39 +359,44 @@ impl From<&PathBuf> for InstructionSource {
 fn render_instructions_block(sources: &[InstructionSource]) -> Option<String> {
     let mut sections: Vec<String> = Vec::new();
     for source in sources {
+        let mut total_len: Option<usize> = None;
         let (raw_source_name, raw_content): (String, String) = match source {
-            InstructionSource::File(path) => match std::fs::read_to_string(path) {
-                Ok(raw) => (path.display().to_string(), raw),
-                Err(err) => {
-                    tracing::warn!(
-                        target: "instructions",
-                        ?err,
-                        ?path,
-                        "skipping unreadable instructions file"
-                    );
-                    continue;
+            InstructionSource::File(path) => {
+                match read_prompt_file_bounded(path, INSTRUCTIONS_FILE_MAX_BYTES) {
+                    Ok((raw, full_len)) => {
+                        // `full_len` covers bytes the bounded read left unread.
+                        total_len = Some(full_len);
+                        (path.display().to_string(), raw)
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            target: "instructions",
+                            ?err,
+                            ?path,
+                            "skipping unreadable instructions file"
+                        );
+                        continue;
+                    }
                 }
-            },
+            }
             InstructionSource::Inline { name, content } => (name.clone(), content.clone()),
         };
         let trimmed = raw_content.trim();
         if trimmed.is_empty() {
             continue;
         }
-        let body = if trimmed.len() > INSTRUCTIONS_FILE_MAX_BYTES {
-            let head_end = (0..=INSTRUCTIONS_FILE_MAX_BYTES)
-                .rev()
-                .find(|&i| trimmed.is_char_boundary(i))
-                .unwrap_or(0);
-            format!(
-                "{}\n[…truncated: {} of {} bytes omitted — consider splitting this instructions file]",
-                &trimmed[..head_end],
-                trimmed.len() - head_end,
-                trimmed.len()
-            )
-        } else {
-            trimmed.to_string()
+        // A bounded read that stopped short makes the file's own length the
+        // total; otherwise the trimmed text is everything there was.
+        let total = match total_len {
+            Some(full_len) if raw_content.len() < full_len => full_len,
+            _ => trimmed.len(),
         };
+        let body = cap_prompt_text(
+            trimmed,
+            total,
+            INSTRUCTIONS_FILE_MAX_BYTES,
+            "consider splitting this instructions file",
+        );
         sections.push(format!(
             "<instructions source=\"{raw_source_name}\">\n{body}\n</instructions>"
         ));
@@ -357,13 +418,26 @@ fn load_handoff_block(workspace: &Path) -> Option<String> {
     } else {
         workspace.join(LEGACY_HANDOFF_RELATIVE_PATH)
     };
-    let raw = std::fs::read_to_string(&path).ok()?;
+    // The relay is workspace-writable, so it gets the same per-file cap as
+    // an instructions file rather than an unbounded read into the prompt.
+    let (raw, full_len) = read_prompt_file_bounded(&path, INSTRUCTIONS_FILE_MAX_BYTES).ok()?;
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return None;
     }
+    let total = if raw.len() < full_len {
+        full_len
+    } else {
+        trimmed.len()
+    };
+    let relay = cap_prompt_text(
+        trimmed,
+        total,
+        INSTRUCTIONS_FILE_MAX_BYTES,
+        "shorten the relay artifact",
+    );
     Some(format!(
-        "## Previous Session Relay\n\nThe previous session in this workspace left a relay artifact at `{HANDOFF_RELATIVE_PATH}`. Consider it the first artifact to read on this turn — open blockers, in-flight changes, and recent decisions live there. Update or rewrite it before exiting if state changes materially.\n\n{trimmed}"
+        "## Previous Session Relay\n\nThe previous session in this workspace left a relay artifact at `{HANDOFF_RELATIVE_PATH}`. Consider it the first artifact to read on this turn — open blockers, in-flight changes, and recent decisions live there. Update or rewrite it before exiting if state changes materially.\n\n{relay}"
     ))
 }
 
@@ -3545,6 +3619,23 @@ mod tests {
         assert!(
             !a.contains(summary),
             "summary must not be embedded in system prompt"
+        );
+    }
+
+    #[test]
+    fn oversized_relay_artifact_is_capped_like_an_instructions_file() {
+        let tmp = tempdir().expect("tempdir");
+        let dir = tmp.path().join(".codewhale");
+        std::fs::create_dir_all(&dir).unwrap();
+        // 300 KiB relay: well past the per-file prompt cap.
+        std::fs::write(dir.join("handoff.md"), "R".repeat(300 * 1024)).unwrap();
+
+        let block = super::load_handoff_block(tmp.path()).expect("relay block");
+        assert!(block.contains("[…truncated:"), "truncation marker missing");
+        assert!(
+            block.len() < 110 * 1024,
+            "relay must be capped near 100 KiB, got {} bytes",
+            block.len()
         );
     }
 
