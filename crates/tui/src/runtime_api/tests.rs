@@ -14087,6 +14087,52 @@ model = "glm-2"
 }
 
 #[tokio::test]
+async fn switch_provider_rolls_back_a_selection_the_runtime_cannot_apply() -> Result<()> {
+    // The reload after the write fails (the runtime's profile is not in the
+    // file), so the switch is not applied in memory: the file must not keep
+    // it either, or the next start silently adopts a provider the caller was
+    // told failed.
+    let root = std::env::temp_dir().join(format!("codewhale-switch-rollback-{}", Uuid::new_v4()));
+    fs::create_dir_all(&root)?;
+    let config_file = root.join("custom-config.toml");
+    fs::write(
+        &config_file,
+        r#"provider = "deepseek"
+default_text_model = "deepseek-v4-pro"
+
+[providers.volcengine]
+api_key = "ark-test"
+base_url = "https://ark.cn-beijing.volces.com/api/plan/v3"
+model = "glm-2"
+"#,
+    )?;
+    let before = fs::read_to_string(&config_file)?;
+
+    let Some((addr, _runtime_threads, handle)) = spawn_test_server_with_config_path_and_profile(
+        config_file.clone(),
+        "absent-profile".to_string(),
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+
+    let (status, body) =
+        post_switch_provider(&client, &addr, "volcengine", &serde_json::json!({})).await;
+    assert!(!status.is_success(), "the switch cannot apply: {body}");
+    assert_eq!(
+        fs::read_to_string(&config_file)?,
+        before,
+        "a switch the runtime refused must not stay persisted"
+    );
+    assert!(body.to_string().contains("rolled back"), "{body}");
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn switch_provider_with_explicit_model_arg_persists_model() -> Result<()> {
     // When the user explicitly chooses a model (e.g. `/provider volcengine
     // glm-2.5` or a model-picker selection), the switch endpoint MUST

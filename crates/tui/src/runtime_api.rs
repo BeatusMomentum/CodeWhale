@@ -9372,6 +9372,42 @@ struct SwitchProviderResponse {
     persisted: bool,
 }
 
+/// The config file's bytes, or `None` when it does not exist.
+async fn read_config_snapshot(path: &std::path::Path) -> Result<Option<String>, ApiError> {
+    match tokio::fs::read_to_string(path).await {
+        Ok(raw) => Ok(Some(raw)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(ApiError::internal(format!(
+            "Failed to read the config before changing it: {error}"
+        ))),
+    }
+}
+
+/// Undo a config write the runtime refused to apply, but only while the file
+/// still holds exactly what that write left (a concurrent writer's change is
+/// never overwritten). Returns the sentence that tells the caller which state
+/// the file is in now.
+async fn roll_back_config_write(
+    path: PathBuf,
+    before: Option<String>,
+    written: Option<String>,
+) -> String {
+    let (Some(before), Some(written)) = (before, written) else {
+        return "the provider selection is saved in config.toml but not applied; switch back or fix the config".to_string();
+    };
+    let restored = tokio::task::spawn_blocking(move || {
+        codewhale_config::replace_config_document_if_unchanged(&path, Some(&written), &before)
+    })
+    .await;
+    match restored {
+        Ok(Ok(())) => "the saved provider selection was rolled back".to_string(),
+        Ok(Err(error)) => format!(
+            "the provider selection is saved in config.toml but not applied, and rolling it back failed: {error}"
+        ),
+        Err(_) => "the provider selection is saved in config.toml but not applied, and rolling it back failed".to_string(),
+    }
+}
+
 /// `POST /v1/providers/{id}/switch` — switch the active provider, optionally
 /// overriding the model.
 ///
@@ -9402,6 +9438,9 @@ struct SwitchProviderResponse {
 ///   are committed together through the canonical Config writer.
 /// - Config is reloaded from disk and synced to active engines via
 ///   `runtime_threads.reload_config`, exactly like `POST /v1/config/reload`.
+/// - A reload that fails or is rejected rolls the persisted selection back
+///   (only while the file still holds what this write left), so disk and the
+///   running config never disagree about the provider. The error says which.
 async fn switch_provider(
     State(state): State<RuntimeApiState>,
     Path(id): Path<String>,
@@ -9481,6 +9520,13 @@ async fn switch_provider(
     // model arg) MUST NOT write a `model` key, otherwise the user's
     // per-provider `[providers.<id>].model` config gets overwritten with
     // whatever the runtime resolves as the default.
+    //
+    // The file is snapshotted first so a switch the runtime then refuses to
+    // apply is rolled back: disk and the running config must not disagree
+    // about the provider (the next restart would silently adopt it).
+    let config_file = config_persistence::config_toml_path(state.config_path.as_deref())
+        .map_err(|e| ApiError::internal(format!("Failed to resolve the config path: {e}")))?;
+    let before = read_config_snapshot(&config_file).await?;
     config_persistence::persist_provider_selection(
         state.config_path.as_deref(),
         target,
@@ -9488,20 +9534,36 @@ async fn switch_provider(
         model_override.as_deref(),
     )
     .map_err(|e| ApiError::internal(format!("Failed to persist provider selection: {e}")))?;
+    let written = read_config_snapshot(&config_file).await?;
 
     // Reload config from disk and sync to active engines. This matches
     // `POST /v1/config/reload` exactly: load → validate thread routes →
     // swap in the new config. A failure here means an active thread's
     // route is invalid under the new provider — surface it so the GUI can
     // tell the user to fix their config.
-    let mut reloaded = Config::load(state.config_path.clone(), state.config_profile.as_deref())
-        .map_err(|e| ApiError::internal(format!("Failed to reload config: {e}")))?;
-    reloaded.account_model_access = state.config.read().account_model_access.clone();
-    state
-        .runtime_threads
-        .reload_config(reloaded.clone())
-        .await
-        .map_err(|err| ApiError::bad_request(format!("Config reload rejected: {err}")))?;
+    let applied = async {
+        let mut reloaded = Config::load(state.config_path.clone(), state.config_profile.as_deref())
+            .map_err(|e| ApiError::internal(format!("Failed to reload config: {e}")))?;
+        reloaded.account_model_access = state.config.read().account_model_access.clone();
+        state
+            .runtime_threads
+            .reload_config(reloaded.clone())
+            .await
+            .map_err(|err| ApiError::bad_request(format!("Config reload rejected: {err}")))?;
+        Ok::<_, ApiError>(reloaded)
+    }
+    .await;
+    let reloaded = match applied {
+        Ok(reloaded) => reloaded,
+        Err(mut error) => {
+            error.message = format!(
+                "{}; {}",
+                error.message,
+                roll_back_config_write(config_file, before, written).await
+            );
+            return Err(error);
+        }
+    };
     {
         let mut config = state.config.write();
         *config = reloaded;
