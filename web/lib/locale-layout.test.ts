@@ -1,4 +1,6 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { localeDirection, locales } from "./i18n/config";
+import * as dictionaries from "./i18n/dictionaries";
 
 vi.mock("next/font/local", () => ({ default: () => ({ variable: "font" }) }));
 
@@ -9,12 +11,16 @@ function render(locale: string) {
   return LocaleLayout({ children: null, params: Promise.resolve({ locale }) });
 }
 
+afterEach(() => vi.restoreAllMocks());
+
 describe("locale layout", () => {
-  // Middleware skips dotted paths, so `/wp-login.php` reaches `[locale]`.
-  it("answers not-found for a segment that is not a locale", async () => {
-    await expect(render("wp-login.php")).rejects.toMatchObject({
-      digest: expect.stringContaining("404"),
-    });
+  // Middleware leaves dotted files alone; unknown files reach `[locale]`
+  // just like unknown directory segments, including their child routes.
+  const invalidLocales = ["foo.txt", "llms-full.txt", "robots.json", "wp-login.php", "xx", ""];
+  it.each(invalidLocales)("rejects %j before reading chrome dictionaries", async (locale) => {
+    const chrome = vi.spyOn(dictionaries, "getChrome");
+    await expect(render(locale)).rejects.toMatchObject({ digest: "NEXT_HTTP_ERROR_FALLBACK;404" });
+    expect(chrome).not.toHaveBeenCalled();
   });
 
   // The layout cannot catch its own notFound(), so the root boundary answers.
@@ -29,14 +35,18 @@ describe("locale layout", () => {
   });
 
   // Otherwise the home page's title, canonical, and hreflang stream into it.
-  it("gives that not-found the not-found metadata, not the home page's", async () => {
-    const metadata = await generateMetadata({ params: Promise.resolve({ locale: "wp-login.php" }) });
+  it.each(invalidLocales)("gives %j noindex metadata without a home dictionary", async (locale) => {
+    const home = vi.spyOn(dictionaries, "getHome");
+    const metadata = await generateMetadata({ params: Promise.resolve({ locale }) });
     expect(metadata.title).toBe("Not found · Codewhale");
+    expect(metadata.robots).toEqual({ index: false, follow: true });
     expect(metadata.alternates).toEqual({});
+    expect(home).not.toHaveBeenCalled();
   });
 
-  it("renders a real locale", async () => {
-    const element = await render("en");
-    expect(element.props.lang).toBe("en");
+  it.each(locales)("renders the registered locale %s", async (locale) => {
+    const element = await render(locale);
+    expect(element.props.lang).toBe(locale);
+    expect(element.props.dir).toBe(localeDirection(locale));
   });
 });

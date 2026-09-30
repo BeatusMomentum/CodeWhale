@@ -80,9 +80,10 @@ export default async function LocaleLayout({
   params: Promise<{ locale: string }>;
 }) {
   const { locale } = await params;
-  // Middleware leaves dotted paths alone, so `/wp-login.php` reaches this
-  // segment with that "locale". Without this it rendered the home page with
-  // HTTP 200 and `<html lang="wp-login.php">`.
+  // Dotted paths bypass locale redirection so real files keep resolving.
+  // An unknown path such as /foo.txt (or /foo.txt/faq) still binds `[locale]`
+  // here. Reject it before reading dictionaries or rendering home chrome,
+  // so nonexistent files never become HTTP 200 pages with a fake html lang.
   if (!isValidLocale(locale)) notFound();
   const chrome = getChrome(locale);
   // RTL locales (e.g. ar) set the document direction from the canonical
