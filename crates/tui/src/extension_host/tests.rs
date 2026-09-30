@@ -2393,11 +2393,92 @@ async fn bun_host_runs_the_dsh_plugin_reports_bun_and_restarts_on_bun() {
             "{diagnostics:?}"
         );
         assert!(
-            !diagnostics.iter().any(|line| line.contains("exceeds its")),
+            !diagnostics
+                .iter()
+                .any(|line| line.contains("exceeded its memory cap")),
             "{diagnostics:?}"
         );
     }
     manager.shutdown().await;
+}
+
+/// `runtime = "auto"`: a Bun that passes the version probe but cannot start
+/// the host is reported once, and Node runs the host for the rest of the
+/// session. `runtime = "bun"` never falls back, and a launch that never
+/// completed a handshake pins nothing.
+#[cfg(unix)]
+#[tokio::test]
+async fn auto_uses_node_for_the_session_when_the_bun_host_fails_to_start() {
+    use std::os::unix::fs::PermissionsExt;
+    let Some(node) = node_for_tests("auto_uses_node_when_the_bun_host_fails_to_start") else {
+        return;
+    };
+    let _policy = TestPolicyGuard::extension_host(true);
+    let fixture = FixturePlugins::new(&["slow-tool"]).await;
+    let bin = tempfile::tempdir().unwrap();
+    let bun = bin.path().join("bun");
+    std::fs::write(
+        &bun,
+        "#!/bin/sh\ncase \"$1\" in --version) echo 1.4.0;; *) echo 'simulated Bun start failure' >&2; exit 3;; esac\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&bun, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let manager_for = |runtime| {
+        Arc::new(ExtensionHostManager::new(ExtensionHostOptions {
+            runtime,
+            node_override: Some(node.clone()),
+            bun_override: Some(bun.clone()),
+            root: Some(fixture.root.clone()),
+            supervision: fast_supervision(),
+        }))
+    };
+
+    let manager = manager_for(crate::config::ExtensionHostRuntime::Auto);
+    let engine = manager.attach(fixture.registry());
+    engine.sync().await.unwrap();
+    assert!(
+        matches!(
+            manager.status(),
+            HostStatus::Ready {
+                runtime: "node",
+                ..
+            }
+        ),
+        "{:?} {:?}",
+        manager.status(),
+        manager.diagnostics()
+    );
+    let diagnostics = manager.diagnostics();
+    let reported: Vec<_> = diagnostics
+        .iter()
+        .filter(|line| line.contains("uses Node for the rest of this session"))
+        .collect();
+    assert_eq!(reported.len(), 1, "{diagnostics:?}");
+    assert!(
+        reported[0].contains(&bun.display().to_string()),
+        "{diagnostics:?}"
+    );
+    let summary = manager.runtime_summary().unwrap();
+    assert!(summary.starts_with("node "), "{summary}");
+    assert!(summary.contains("(runtime = \"auto\")"), "{summary}");
+    assert!(
+        summary.contains("Bun failed to start this session"),
+        "{summary}"
+    );
+    assert_eq!(manager.spawn_attempts(), 2);
+    manager.shutdown().await;
+
+    let explicit = manager_for(crate::config::ExtensionHostRuntime::Bun);
+    let engine = explicit.attach(fixture.registry());
+    let _ = engine.sync().await;
+    assert!(
+        matches!(explicit.status(), HostStatus::Failed { .. }),
+        "{:?} {:?}",
+        explicit.status(),
+        explicit.diagnostics()
+    );
+    assert_eq!(explicit.spawn_attempts(), 1);
+    assert_eq!(explicit.runtime_summary(), None);
 }
 
 /// The cap holds for memory outside the JS heap too (Buffers), which Node's
