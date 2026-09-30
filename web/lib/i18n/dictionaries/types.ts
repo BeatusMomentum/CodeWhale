@@ -499,6 +499,35 @@ export interface FeedDict {
   startDiscussion: string;
 }
 
+/** `app/[locale]/community/page.tsx`. */
+export interface CommunityDict {
+  metaTitle: string;
+  metaDescription: string;
+  kicker: string;
+  /** Page H1. */
+  title: string;
+  lede: string;
+  fileIssue: string;
+  browsePulls: string;
+  readGuide: string;
+  pathsTitle: string;
+  pathsScope: string;
+  recordTitle: string;
+  recordScope: string;
+  creditTitle: string;
+  /** Credit scope once the source version is the published release. */
+  creditScope: string;
+  /** Credit scope while the source version is ahead of the published release. */
+  creditScopeUnreleased: string;
+  /** Credit heading for the published release; `{version}` is filled at render time. */
+  creditLabel: string;
+  /** Credit heading while the source version is unreleased; `{version}` is filled at render time. */
+  creditLabelUnreleased: string;
+  mergedTitle: string;
+  helpersTitle: string;
+  fullRecord: string;
+}
+
 /** `app/[locale]/faq/page.tsx` and its `components/faq-search.tsx`. */
 export interface FaqDict {
   metaTitle: string;

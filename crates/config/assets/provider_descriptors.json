@@ -45,6 +45,21 @@
       "credential_url": "https://cloud.cerebras.ai"
     },
     {
+      "id": "cheaperinference",
+      "label": "Cheaper Inference",
+      "wire": "openai-compatible",
+      "base_url": "https://api.cheaperinference.com/v1",
+      "api_key_env": "CHEAPER_INFERENCE_API_KEY",
+      "default_model": "gpt-5.4-mini",
+      "discovery": "models_endpoint",
+      "docs_url": "https://cheaperinference.com/docs",
+      "credential_url": "https://cheaperinference.com/signup",
+      "guidance": "OpenAI-compatible host (Chat Completions + GET /v1/models). Live /v1/models is the model authority: ids are bare, such as gpt-5.4-mini, claude-sonnet-5 and gemini-3.1-pro. Store CHEAPER_INFERENCE_API_KEY, not a raw key.",
+      "aliases": [
+        "cheaper-inference"
+      ]
+    },
+    {
       "id": "command-code",
       "label": "Command Code",
       "wire": "openai-compatible",

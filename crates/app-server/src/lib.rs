@@ -1158,7 +1158,7 @@ async fn run_bridged_turn<W: AsyncWrite + Unpin>(
     // access. The cache slot itself stays unlocked, so config updates and
     // bridge invalidation are never queued behind a streaming turn.
     let mut bridge = acquire_live_runtime_bridge(state).await?;
-    let mut thread_map = state.runtime_thread_map.lock().await;
+    let mut thread_map = state.runtime_thread_map.clone().lock_owned().await;
     // A link restored from the store was written by an earlier process. If
     // the runtime no longer has that thread (its data dir was wiped or
     // moved), every turn would fail against it forever; start a new runtime
@@ -1219,26 +1219,29 @@ async fn run_bridged_turn<W: AsyncWrite + Unpin>(
     // Persist the link whenever the store lacks it, not only when this call
     // minted the runtime thread: an earlier turn that was dropped between
     // minting and saving leaves a mapped but unlinked thread, which would
-    // otherwise fork on the next restart. The save is synchronous on a store
-    // handle copied out beforehand, so there is no await point between the
-    // mapping change and its persistence, and no runtime lock is taken while
-    // the bridge and thread-map locks are held.
+    // otherwise fork on the next restart. SQLite may wait for another
+    // process's writer, so save off-runtime. The worker owns both guards until
+    // the link is persisted or the new mapping is rolled back: cancelling the
+    // caller cannot expose a half-settled mapping to the next turn.
     if let Some(durable) = durable.as_ref()
         && (minted || durable.runtime_thread_id.is_none())
-        && let Err(err) = durable
-            .store
-            .set_runtime_thread_link(turn.thread_key, &runtime_thread_id)
     {
-        // A turn on a link that dies with this process would silently fork
-        // the conversation on the next restart, so a mapping minted here is
-        // undone as well.
-        if minted {
-            bridge.forget_thread(&mut thread_map, turn.thread_key);
-        }
-        return Err(JsonRpcError::internal(format!(
-            "failed to save the runtime link for thread {}: {err}",
-            turn.thread_key
-        )));
+        let store = durable.store.clone();
+        let thread_key = turn.thread_key.to_string();
+        let linked_runtime_id = runtime_thread_id.clone();
+        (bridge, thread_map) = tokio::task::spawn_blocking(move || {
+            if let Err(err) = store.set_runtime_thread_link(&thread_key, &linked_runtime_id) {
+                if minted {
+                    bridge.forget_thread(&mut thread_map, &thread_key);
+                }
+                return Err(JsonRpcError::internal(format!(
+                    "failed to save the runtime link for thread {thread_key}: {err}"
+                )));
+            }
+            Ok((bridge, thread_map))
+        })
+        .await
+        .map_err(|err| JsonRpcError::internal(format!("thread link save task failed: {err}")))??;
     }
     // The mapping is settled for this turn; drop the guard so a long stream
     // never holds the map hostage. `forget_thread` re-locks below.
@@ -1299,7 +1302,19 @@ async fn restore_thread_link(
         .state_store()
         .clone();
     let internal = |err: anyhow::Error| JsonRpcError::internal(err.to_string());
-    let Some(metadata) = store.get_thread(thread_key).map_err(internal)? else {
+    let read_store = store.clone();
+    let lookup_key = thread_key.to_string();
+    let persisted = tokio::task::spawn_blocking(move || -> Result<_> {
+        let Some(metadata) = read_store.get_thread(&lookup_key)? else {
+            return Ok(None);
+        };
+        let runtime_thread_id = read_store.get_runtime_thread_link(&lookup_key)?;
+        Ok(Some((metadata, runtime_thread_id)))
+    })
+    .await
+    .map_err(|err| JsonRpcError::internal(format!("thread link lookup task failed: {err}")))?
+    .map_err(internal)?;
+    let Some((metadata, runtime_thread_id)) = persisted else {
         if require_known
             && !state
                 .runtime_thread_map
@@ -1311,9 +1326,6 @@ async fn restore_thread_link(
         }
         return Ok(None);
     };
-    let runtime_thread_id = store
-        .get_runtime_thread_link(thread_key)
-        .map_err(internal)?;
     Ok(Some(DurableThread {
         store,
         cwd: metadata.cwd,
@@ -2852,16 +2864,21 @@ async fn update_config_store(
 ) -> Result<()> {
     let state = state.clone();
     tokio::spawn(async move {
-        {
-            // Hold the write guard across load→mutate→save→install so two
-            // concurrent mutations cannot save over each other's change, and
-            // `state.config` always matches what was saved last.
-            let mut config = state.config.write().await;
-            let mut store = ConfigStore::load(state.config_path.clone())
+        // Own the write guard across load→mutate→save→install so two
+        // concurrent mutations cannot overwrite one another. All disk work
+        // runs off-runtime; the owned operation still finishes propagation
+        // when the requesting connection goes away.
+        let mut config = state.config.clone().write_owned().await;
+        let config_path = state.config_path.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let mut store = ConfigStore::load(config_path)
                 .map_err(|err| anyhow!("{CONFIG_LOAD_ERROR}: {err}"))?;
             update(&mut store)?;
             *config = store.config;
-        }
+            Ok(())
+        })
+        .await
+        .map_err(|err| anyhow!("config store task failed: {err}"))??;
         propagate_config(&state).await;
         Ok(())
     })
@@ -3854,6 +3871,44 @@ mod tests {
             state.config.read().await.telemetry,
             Some(true),
             "the live config reflects what was saved",
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn config_store_work_does_not_block_the_runtime() {
+        let (state, _tmp) = capability_test_state();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let update_state = state.clone();
+        let update = tokio::spawn(async move {
+            update_config_store(&update_state, move |store| {
+                started_tx
+                    .send(())
+                    .map_err(|_| anyhow!("configuration test caller disappeared"))?;
+                // Simulate a stalled file/store operation. The only Tokio
+                // thread must remain free to send the resume signal.
+                resume_rx
+                    .recv_timeout(Duration::from_secs(3))
+                    .context("configuration store work blocked the runtime")?;
+                store.config.model = Some("deepseek-reasoner".to_string());
+                Ok(())
+            })
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), started_rx)
+            .await
+            .expect("the store operation started")
+            .expect("start signal");
+        resume_tx
+            .send(())
+            .expect("Tokio must run while the store operation is waiting");
+        update
+            .await
+            .expect("configuration task joined")
+            .expect("configuration update finished");
+        assert_eq!(
+            state.config.read().await.model.as_deref(),
+            Some("deepseek-reasoner")
         );
     }
 

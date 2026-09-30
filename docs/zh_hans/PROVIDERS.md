@@ -22,10 +22,12 @@ DeepSeek 仍是默认提供商，但 `ProviderKind::ALL` 中的每个条目都�
 | AICraft | `https://aicraftapi.com/v1` | `claude-4.6-sonnet`；DeepSeek / Claude / Gemini / Qwen / GLM / MiniMax / Doubao 系列 | `AICRAFT_API_KEY` |
 | Tsubasa | `https://api.tsubasa.sh/v1` | `tsubasa-pro`, `tsubasa-fast`（32,768 token 上下文） | `TSUBASA_API_KEY` |
 | Yolo-Auto | `https://yolo-auto.com/v1` | `qwen3.8-flash`（默认）、`claude-4.6-sonnet`、`gemini-3.5-pro` | `YOLO_AUTO_API_KEY` |
+| Cheaper Inference | `https://api.cheaperinference.com/v1` | `gpt-5.4-mini`、`claude-sonnet-5`、`gemini-3.1-pro` | `CHEAPER_INFERENCE_API_KEY` |
 
 AICraft 的 OpenAI 兼容端点提供 DeepSeek、Anthropic Claude、Google Gemini、Qwen、GLM、MiniMax 和 Doubao 的模型 ID。权威来源是带上你的密钥请求 `GET https://aicraftapi.com/v1/models` 的结果：请从该列表中选择模型，而不是从上表中选。
 Tsubasa 只实现了 `GET /v1/models` 和 Chat Completions。它的两个公开模型 ID 共用 32,768 token 的上下文，小于 Codewhale 对未知模型假定的 128,000 token，因此保存后请在该路由上设置：
 `codewhale config set providers.tsubasa.context_window 32768`。
+Cheaper Inference 是 OpenAI 兼容网关，模型 ID 不带前缀（例如 `gpt-5.4-mini`、`claude-sonnet-5`），以带密钥请求 `GET https://api.cheaperinference.com/v1/models` 的结果为准；价格随模型和路由而变，请以提供商的实时目录为准。
 OpenCode Zen 和 OpenCode Go 是一等提供商路由，配置方式与下文其他提供商相同；它们不在上表之列。在 `/provider` 中，直接输入即可筛选列表（未绑定行操作的字母）；`Ctrl+T` 探测所选行的 `/models`，只记录可达性（2xx 并不代表模型可用）。
 
 需要保持同步的来源：
