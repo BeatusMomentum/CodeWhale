@@ -1625,27 +1625,48 @@ impl SessionManager {
         Err(session_open_elsewhere(id))
     }
 
+    /// Hold the existing live lease throughout an external mutation. A
+    /// liveness probe releases its lock before returning and cannot protect
+    /// the subsequent read/write from another surface attaching meanwhile.
+    fn reserve_session_for_external_write(&self, id: &str) -> io::Result<SessionLease> {
+        let live = live_sessions()
+            .read()
+            .map_err(|_| io::Error::other("session ownership registry unavailable"))?;
+        if live.contains(id.trim()) {
+            return Err(live_session_conflict(id));
+        }
+        drop(live);
+        let lease = self.reserve_session_for_attach(id)?;
+        // A same-process attach may have committed after the registry read.
+        // Its already-held lease is borrowed, never ours to mutate through.
+        if lease.file.is_none() {
+            return Err(live_session_conflict(id));
+        }
+        Ok(lease)
+    }
+
     /// Is `session_id` open in an interactive session in this process *or any
     /// other*? External writers (the Runtime API, retention) check this before
-    /// rewriting or deleting a document, because the process holding it would
-    /// revert the change at its next autosave (#6144).
+    /// listing recovery candidates. Mutations reserve the live lease instead;
+    /// a released probe cannot authorize a subsequent write (#6144).
     #[must_use]
     pub fn is_session_live_anywhere(&self, session_id: &str) -> bool {
         if is_live_session(session_id) {
             return true;
         }
         let Ok(path) = self.live_lease_path(session_id, false) else {
-            return false;
+            return true;
         };
         let file = match open_private_read_file(&path) {
             Ok(file) => file,
-            Err(_) => return false,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return false,
+            Err(_) => return true,
         };
         // Contention means a live holder; acquiring proves none, and the
         // probe's lock is released when `file` drops here.
-        matches!(
+        !matches!(
             crate::runtime_threads::try_lock_file_exclusive(&file),
-            Ok(false)
+            Ok(true)
         )
     }
 
@@ -2906,9 +2927,9 @@ impl SessionManager {
         archived: bool,
         mutator: SessionMutator,
     ) -> std::io::Result<SessionMetadata> {
-        if mutator == SessionMutator::External && self.is_session_live_anywhere(id) {
-            return Err(live_session_conflict(id));
-        }
+        let _lease = (mutator == SessionMutator::External)
+            .then(|| self.reserve_session_for_external_write(id))
+            .transpose()?;
         let mut session = self.load_session(id)?;
         if session.metadata.archived == archived {
             return Ok(session.metadata);
@@ -2964,9 +2985,9 @@ impl SessionManager {
         mutator: SessionMutator,
     ) -> std::io::Result<SessionMetadata> {
         let title = normalize_session_title(title)?;
-        if mutator == SessionMutator::External && self.is_session_live_anywhere(id) {
-            return Err(live_session_conflict(id));
-        }
+        let _lease = (mutator == SessionMutator::External)
+            .then(|| self.reserve_session_for_external_write(id))
+            .transpose()?;
         let mut session = self.load_session(id)?;
         if session.metadata.title == title {
             return Ok(session.metadata);
@@ -3059,6 +3080,7 @@ impl SessionManager {
 
     fn remove_session(&self, id: &str, removal: SessionRemoval) -> std::io::Result<()> {
         let path = self.validated_session_path(id)?;
+        let _lease = self.reserve_session_for_external_write(id)?;
         // Older ordinary snapshots may use a name reserved by the checkpoint
         // directory. Such a name must never address its shared legacy files.
         let checkpoint = self.validated_checkpoint_path(id).ok();
@@ -3314,6 +3336,7 @@ impl SessionManager {
         let result = if listed_path == canonical {
             self.remove_session(id, SessionRemoval::Retention)
         } else {
+            let _lease = self.reserve_session_for_external_write(id)?;
             fs::remove_file(listed_path)
         };
         match result {
