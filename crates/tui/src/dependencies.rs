@@ -282,6 +282,9 @@ pub(crate) fn host_tool_available(tool: &str, probe: impl FnOnce() -> bool) -> b
     }) {
         return available;
     }
+    // Only a conformance replay reads the name.
+    #[cfg(not(all(test, unix)))]
+    let _ = tool;
     probe()
 }
 
