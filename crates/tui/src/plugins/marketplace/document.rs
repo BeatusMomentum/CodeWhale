@@ -176,6 +176,11 @@ pub fn resolve_candidate_install<'a>(
 /// let catalog metadata point the installer at an arbitrary directory on this
 /// machine, so such an entry is not installable from the catalog; installing a
 /// directory outside it stays an explicit `/plugin install path:...`.
+///
+/// Known limitation: the check is textual. It inspects the source's path
+/// components and never resolves the filesystem, so a symlink inside the
+/// catalog tree (`plugins/foo -> /elsewhere`) still passes, and the install
+/// follows it out of the catalog directory.
 fn resolve_spec(
     source_path: &str,
     format: MarketplaceFormat,

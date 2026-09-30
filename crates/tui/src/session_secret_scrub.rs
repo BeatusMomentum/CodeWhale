@@ -11,8 +11,10 @@
 //! Only transcript tool results and Runtime tool receipts (including event
 //! copies) are touched. Cleanup masks credential shapes and currently configured
 //! secret values; bare secrets absent from current configuration cannot be recovered.
-//! Runtime rewrites require the exclusive process lease; busy stores are reported
-//! and left untouched while the remaining files are scrubbed.
+//! Runtime rewrites require the exclusive process lease, and session rewrites
+//! the session's live lease; busy stores and sessions open in an interactive
+//! surface are reported and left untouched while the remaining files are
+//! scrubbed.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -33,7 +35,8 @@ pub(crate) struct ScrubReport {
     pub flagged_tool_results: usize,
     /// Files the scan could not read or parse, left untouched.
     pub unreadable: Vec<PathBuf>,
-    /// Credential-bearing Runtime files left untouched because their store is live.
+    /// Credential-bearing files left untouched because their Runtime store is
+    /// live or their session is open in an interactive surface.
     pub busy: Vec<PathBuf>,
 }
 
@@ -268,6 +271,12 @@ pub(crate) fn scrub_files(
                     None => FileScan::Unreadable,
                     Some(Err(error)) if error.kind() == io::ErrorKind::InvalidInput => {
                         FileScan::Unreadable
+                    }
+                    // Open in an interactive session, whose next autosave
+                    // would put the credential back: report and leave it.
+                    Some(Err(error)) if error.kind() == io::ErrorKind::ResourceBusy => {
+                        report.busy.push(path.clone());
+                        continue;
                     }
                     Some(Err(error)) => return Err(error),
                 }
@@ -531,6 +540,31 @@ mod tests {
         assert_eq!(unreadable.len(), 1, "{unreadable:?}");
         assert!(unreadable[0].ends_with(crate::session_manager::WORK_GRAPH_IMPORT_ARCHIVE_DIR));
         assert!(std::fs::read_to_string(&outside).unwrap().contains(TOKEN));
+    }
+
+    /// An interactive session holds the conversation in memory; its next
+    /// autosave would put a masked credential back. Such a session is
+    /// reported busy and left byte-for-byte, like a live Runtime store.
+    #[test]
+    fn a_session_open_in_an_interactive_surface_is_reported_busy() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let output = format!("{{\"access_token\": \"{TOKEN}\"}}");
+        let open = dir.path().join("open-elsewhere.json");
+        std::fs::write(&open, session_with_tool_output(&output).to_string()).unwrap();
+        let before = std::fs::read(&open).unwrap();
+        let manager =
+            crate::session_manager::SessionManager::new(dir.path().to_path_buf()).expect("manager");
+        let _held = manager.hold_live_lease_elsewhere("open-elsewhere");
+
+        let files = session_files(dir.path(), &dir.path().join("standalone"), &mut Vec::new());
+        let report = scrub_files(&files, Some(&manager), &[]).expect("scrub");
+        assert_eq!(
+            report.busy,
+            vec![open.canonicalize().unwrap()],
+            "{report:?}"
+        );
+        assert!(report.flagged_files.is_empty(), "{report:?}");
+        assert_eq!(std::fs::read(&open).unwrap(), before);
     }
 
     #[test]

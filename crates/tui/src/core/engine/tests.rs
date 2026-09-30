@@ -8336,6 +8336,65 @@ async fn normal_repl_kernel_persists_across_user_turns() {
     );
 }
 
+/// A turn dropped mid-round leaves its kernel broken, and a broken kernel
+/// refuses every later round. The next turn starts a fresh kernel instead of
+/// failing once on the stale one.
+#[tokio::test]
+async fn a_broken_repl_kernel_is_replaced_by_the_next_turn() {
+    use crate::llm_client::mock::{MockLlmClient, canned};
+    use codewhale_models::{ContentBlock, Message};
+
+    let workspace = tempdir().expect("tempdir");
+    let mock = std::sync::Arc::new(MockLlmClient::new(vec![canned::simple_text_turn(
+        "```repl\nfinalize('fresh kernel ran')\n```",
+    )]));
+    let client: crate::core::model_client::SharedModelClient = mock.clone();
+    let (mut engine, _handle) = Engine::new_with_model_client(
+        deterministic_engine_config(workspace.path()),
+        &Config::default(),
+        client,
+    );
+    engine.session.auto_approve = true;
+
+    // What a turn dropped mid-round leaves behind.
+    let mut stale = crate::repl::PythonRuntime::new().await.expect("spawn");
+    let dropped = tokio::time::timeout(
+        Duration::from_millis(50),
+        stale.execute("import time\ntime.sleep(30)"),
+    )
+    .await;
+    assert!(dropped.is_err(), "the round must still be running");
+    assert!(stale.is_broken());
+    engine.repl_kernel = Some(stale);
+
+    engine.session.add_message(Message {
+        role: Role::User,
+        content: vec![ContentBlock::Text {
+            text: "Run the kernel again.".to_string(),
+            cache_control: None,
+        }],
+    });
+    let registry = crate::tools::ToolRegistry::new(crate::tools::ToolContext::new(
+        workspace.path().to_path_buf(),
+    ));
+    let policy = test_tool_surface(
+        &engine,
+        registry,
+        Some(vec![catalog_tool(CODE_EXECUTION_TOOL_NAME)]),
+        AppMode::Agent,
+    );
+    let mut turn = crate::core::turn::TurnContext::new(4);
+    let (status, error) = engine.run_turn(&mut turn, policy, None, None).await;
+    assert_eq!(status, TurnOutcomeStatus::Completed, "{error:?}");
+    assert!(
+        !engine
+            .repl_kernel
+            .as_ref()
+            .expect("a fresh kernel")
+            .is_broken()
+    );
+}
+
 /// Plan mode withholds `code_execution`, and a ```repl fence is not a way
 /// around that: even under Full Access and with the tool named in the
 /// supplied catalog, the fenced Python does not run in Plan mode.

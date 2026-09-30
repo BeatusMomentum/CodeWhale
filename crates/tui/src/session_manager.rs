@@ -1539,6 +1539,15 @@ impl SessionManager {
     /// Claim `session_id` for this process's interactive surface: the
     /// in-process registry ([`set_live_session`]) plus the cross-process
     /// lease in this store, so writers in other processes see it too.
+    ///
+    /// Known limitation: this claim is best-effort. Attach paths reserve the
+    /// lease up front ([`Self::reserve_session_for_attach`]), but a session
+    /// that starts fresh is claimed only at its first snapshot, and a claim
+    /// that loses the lock to another process's probe or external write, or
+    /// cannot open the lease file, runs unleased until a later snapshot
+    /// retries it (an open failure is logged only at debug). In that window
+    /// another process's external writer can take the lease and write, and
+    /// this session's next autosave reverts that write.
     pub fn claim_live_session(&self, session_id: &str) {
         set_live_session(Some(session_id));
         let id = session_id.trim();
@@ -1628,7 +1637,13 @@ impl SessionManager {
     /// Hold the existing live lease throughout an external mutation. A
     /// liveness probe releases its lock before returning and cannot protect
     /// the subsequent read/write from another surface attaching meanwhile.
-    fn reserve_session_for_external_write(&self, id: &str) -> io::Result<SessionLease> {
+    ///
+    /// Refuses with `ResourceBusy` when an interactive session in this or
+    /// another process holds the session, and with `InvalidInput` for a
+    /// malformed id. It may sleep briefly between lock attempts (see
+    /// [`Self::reserve_session_for_attach`]), so async callers run it under
+    /// `spawn_blocking`. Keep the returned lease alive until the write lands.
+    pub(crate) fn reserve_session_for_external_write(&self, id: &str) -> io::Result<SessionLease> {
         let live = live_sessions()
             .read()
             .map_err(|_| io::Error::other("session ownership registry unavailable"))?;
@@ -1646,9 +1661,25 @@ impl SessionManager {
     }
 
     /// Is `session_id` open in an interactive session in this process *or any
-    /// other*? External writers (the Runtime API, retention) check this before
-    /// listing recovery candidates. Mutations reserve the live lease instead;
-    /// a released probe cannot authorize a subsequent write (#6144).
+    /// other*? A read-only hint for listings and recovery candidates (the
+    /// session picker, interrupted-work discovery, retention's candidate
+    /// scan). It never authorizes a write: the probe releases its lock before
+    /// returning, so every mutation — rename, archive, delete, the Runtime
+    /// API's export and save, `scrub-secrets` — holds
+    /// [`Self::reserve_session_for_external_write`] across its load and save
+    /// instead (#6144).
+    ///
+    /// Fails closed: a malformed id, or a lease that cannot be opened, reads
+    /// as live, so a caller skips it rather than acting on it. Callers that
+    /// must tell a malformed id apart (a 400, not a 409) validate first or
+    /// reserve the lease, which reports `InvalidInput`.
+    ///
+    /// Known limitation: startup's stale-checkpoint pruning
+    /// (`load_recent_checkpoints` in `lib.rs`) still clears a checkpoint
+    /// older than a day after this released probe. A session that attached
+    /// in that gap and is mid-turn refreshes its checkpoint, so only a
+    /// day-old checkpoint of a session attached in the same instant is
+    /// exposed.
     #[must_use]
     pub fn is_session_live_anywhere(&self, session_id: &str) -> bool {
         if is_live_session(session_id) {
@@ -1841,15 +1872,25 @@ impl SessionManager {
 
     /// Run an out-of-band rewrite of a session's files (`scrub-secrets`)
     /// under the same per-session lock every save takes, so it cannot
-    /// interleave with a live session's save. `None` when the session was
-    /// deleted; an invalid id is an `InvalidInput` error.
+    /// interleave with a save, and while holding the session's live lease, so
+    /// no interactive session holds the conversation in memory to put the old
+    /// content back on its next autosave. `None` when the session was
+    /// deleted; an invalid id is an `InvalidInput` error, and a session open
+    /// in an interactive surface is `ResourceBusy`, left untouched.
+    ///
+    /// The lease is taken inside the save lock with non-blocking attempts, so
+    /// the reverse order elsewhere (lease, then a save) cannot deadlock: one
+    /// side reports busy instead.
     pub(crate) fn with_session_file_lock<T>(
         &self,
         session_id: &str,
         rewrite: impl FnOnce() -> io::Result<T>,
     ) -> io::Result<Option<T>> {
         let session_id = self.validated_session_id(session_id)?;
-        self.with_session_write_admission(session_id, rewrite)
+        self.with_session_write_admission(session_id, || {
+            let _lease = self.reserve_session_for_external_write(session_id)?;
+            rewrite()
+        })
     }
 
     /// Serialize active accounting admission with deletion of its origin.
@@ -3043,6 +3084,29 @@ impl SessionManager {
         Ok(metadata)
     }
 
+    /// Whether `remove_session` has anything of `id`'s to act on: its
+    /// document, a recovery checkpoint (its own, or the legacy slot it
+    /// originated), or a deletion marker whose cleanup a retry finishes. The
+    /// same test `remove_session` repeats under the session's lock, made
+    /// before any lease or lock file is created for the id.
+    fn session_may_have_records(&self, id: &str, path: &Path) -> io::Result<bool> {
+        match fs::symlink_metadata(path) {
+            Ok(_) => return Ok(true),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        if let Ok(checkpoint) = self.validated_checkpoint_path(id)
+            && checkpoint.try_exists()?
+        {
+            return Ok(true);
+        }
+        if matches!(self.legacy_checkpoint_origin(), Ok(Some(origin)) if origin == id.trim()) {
+            return Ok(true);
+        }
+        let (late_path, _) = self.late_usage_paths(id)?;
+        Self::late_usage_is_deleted(&late_path)
+    }
+
     /// Delete a session and its recovery checkpoints, retiring its origin.
     pub fn delete_session(&self, id: &str) -> std::io::Result<()> {
         self.remove_session(id, SessionRemoval::Explicit)
@@ -3080,6 +3144,15 @@ impl SessionManager {
 
     fn remove_session(&self, id: &str, removal: SessionRemoval) -> std::io::Result<()> {
         let path = self.validated_session_path(id)?;
+        // Reserving the lease creates `.late-usage/<id>.live`; an id with
+        // nothing to remove must not leave one behind. The authoritative
+        // check below repeats this under the session's lock.
+        if !self.session_may_have_records(id, &path)? {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("Session '{}' not found", id.trim()),
+            ));
+        }
         let _lease = self.reserve_session_for_external_write(id)?;
         // Older ordinary snapshots may use a name reserved by the checkpoint
         // directory. Such a name must never address its shared legacy files.

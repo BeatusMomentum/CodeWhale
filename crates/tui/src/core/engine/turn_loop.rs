@@ -2764,6 +2764,8 @@ impl Engine {
                     let repl_deadline = self
                         .nested_work_deadline()
                         .map_or(child_deadline, |parent| parent.min(child_deadline));
+                    // A kernel left broken by a dropped turn refuses every round; kill it.
+                    drop(self.repl_kernel.take_if(|kernel| kernel.is_broken()));
                     if self.repl_kernel.is_none() {
                         let startup = tokio::select! {
                             biased;

@@ -8612,7 +8612,7 @@ fn run_sessions_scrub_secrets_blocking(
     }
     if !report.busy.is_empty() {
         println!(
-            "{} credential-bearing Runtime files were skipped because their stores are active. Close the session or Runtime server and re-run `{} --apply`:",
+            "{} credential-bearing files were skipped because their session or Runtime store is open. Close the session or Runtime server and re-run `{} --apply`:",
             report.busy.len(),
             session_secret_scrub::SCRUB_COMMAND
         );

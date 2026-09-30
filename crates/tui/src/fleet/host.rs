@@ -769,6 +769,19 @@ impl FleetHostAdapter for SshFleetHostAdapter {
 /// the old handle so status, logs, and cleanup still reach a worker that may
 /// be running, and no replacement starts beside it (duplicate execution). The
 /// process-tree lifecycle in `stop_worker` stays the authority on "gone".
+///
+/// Known limitations:
+/// - For [`SshFleetHostAdapter`], "confirmed stopped" proves only that the
+///   local `ssh` client's process tree is gone. The remote `codewhale`
+///   process is not observed: if the remote side does not tear the command
+///   down when the connection drops, a restart can start a second remote
+///   worker beside it.
+/// - `start_worker` on an id the adapter still holds refuses only `Running`
+///   and `Draining` (see `LocalProcessFleetHostAdapter::start_with_kind`),
+///   while this restart also refuses `Unknown`. The process-backed adapters
+///   never report `Unknown`, so the gap is latent; an adapter that does must
+///   refuse `Unknown` in its start path too, or a start can overlap a worker
+///   in an unknown state.
 fn restart_after_confirmed_stop<A: FleetHostAdapter>(
     adapter: &mut A,
     worker_id: &str,
