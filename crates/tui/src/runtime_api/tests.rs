@@ -8722,9 +8722,12 @@ async fn session_detail_route_serves_a_bounded_redacted_peek_on_request() -> Res
     Ok(())
 }
 
+/// An unknown id is a 404 that leaves nothing behind: no live lease or lock
+/// file is created for an id with nothing to delete. A malformed id is a
+/// 400, not a liveness conflict.
 #[tokio::test]
 async fn session_delete_returns_404_for_missing_id() -> Result<()> {
-    let Some((addr, _runtime_threads, handle)) = spawn_test_server().await? else {
+    let Some((addr, sessions_dir, handle)) = spawn_server_with_saved_sessions(&[]).await? else {
         return Ok(());
     };
     let client = crate::tls::reqwest_client();
@@ -8733,6 +8736,17 @@ async fn session_delete_returns_404_for_missing_id() -> Result<()> {
         .send()
         .await?;
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    for sidecar in ["nonexistent-id.live", "nonexistent-id.lock"] {
+        assert!(
+            !sessions_dir.join(".late-usage").join(sidecar).exists(),
+            "an unknown id must not litter {sidecar}"
+        );
+    }
+    let malformed = client
+        .delete(format!("http://{addr}/v1/sessions/not.a.session"))
+        .send()
+        .await?;
+    assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
     handle.abort();
     Ok(())
 }
