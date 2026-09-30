@@ -14419,6 +14419,54 @@ model = "glm-2"
     Ok(())
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn switch_provider_waiting_for_config_lock_keeps_the_async_worker_running() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let config_file = root.path().join("config.toml");
+    fs::write(&config_file, "provider = \"deepseek\"\n")?;
+    let (addr, _runtime_threads, handle) = spawn_test_server_with_config_path(config_file.clone())
+        .await?
+        .context("loopback Runtime API server must be available")?;
+
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let locker = std::thread::spawn(move || {
+        codewhale_config::with_config_write_lock(&config_file, |_| {
+            let _ = entered_tx.send(());
+            // A reverted synchronous implementation must fail promptly,
+            // rather than leave this current-thread runtime deadlocked.
+            let _ = release_rx.recv_timeout(Duration::from_secs(3));
+            Ok(())
+        })
+    });
+    entered_rx.await?;
+
+    let client = crate::tls::reqwest_client();
+    let request =
+        tokio::spawn(
+            async move { post_switch_provider(&client, &addr, "deepseek", &json!({})).await },
+        );
+    let started = std::time::Instant::now();
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let elapsed = started.elapsed();
+    let was_waiting = !request.is_finished();
+    let _ = release_tx.send(());
+    locker.join().expect("config lock holder must finish")?;
+    let (status, body) = request.await?;
+    handle.abort();
+
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "the async worker must run while the provider switch waits for a filesystem lock: {elapsed:?}"
+    );
+    assert!(
+        was_waiting,
+        "the real switch must await the held config lock"
+    );
+    assert_eq!(status, StatusCode::OK, "{body}");
+    Ok(())
+}
+
 #[tokio::test]
 async fn switch_provider_that_fails_to_load_removes_the_config_file_it_created() -> Result<()> {
     let root = std::env::temp_dir().join(format!(

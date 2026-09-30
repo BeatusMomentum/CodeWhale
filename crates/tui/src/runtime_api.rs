@@ -9482,9 +9482,17 @@ async fn switch_provider(
     let task_state = state.clone();
     let task_identity = provider_identity.clone();
     let task_model = model_override.clone();
+    let runtime = tokio::runtime::Handle::current();
+    #[cfg(test)]
+    let env_ticket = crate::test_support::env_scope_ticket();
     let (active_provider, active_model) = tokio::spawn(async move {
         let state = task_state;
         let _one_switch_at_a_time = state.provider_switches.lock().await;
+        // Keep the cancellation-safe owned switch, while all filesystem and
+        // keyring work runs off the async worker under the same serialization.
+        tokio::task::spawn_blocking(move || {
+            #[cfg(test)]
+            let _membership = crate::test_support::join_env_scope(env_ticket);
         let (config_toml, undo) = config_persistence::persist_provider_selection(
             state.config_path.as_deref(),
             target,
@@ -9503,7 +9511,7 @@ async fn switch_provider(
                 Ok(mut reloaded) => {
                     reloaded.account_model_access =
                         state.config.read().account_model_access.clone();
-                    match state.runtime_threads.reload_config(reloaded.clone()).await {
+                    match runtime.block_on(state.runtime_threads.reload_config(reloaded.clone())) {
                         Ok(_) => Ok(reloaded),
                         Err(err) => Err(ApiError::bad_request(format!(
                             "Config reload rejected: {err}"
@@ -9544,6 +9552,9 @@ async fn switch_provider(
                 Err(error)
             }
         }
+        })
+        .await
+        .map_err(|_| ApiError::internal("provider switch blocking task failed"))?
     })
     .await
     .map_err(|_| ApiError::internal("provider switch task failed"))??;
