@@ -24735,23 +24735,24 @@ mod child_permission_gate {
                 Some(unreachable_client()),
             );
             assert!(registry.gate_runtime.foreground_children.is_none());
-            // Harmless if it ever ran; classified as a raw-device write.
-            let err = registry
-                .execute(
-                    "agent_gate",
-                    "bash",
-                    json!({"command": "dd if=/dev/zero of=/dev/null count=0"}),
-                )
-                .await
-                .expect_err("a detached agent's device write is held");
-            // Ask turns the hold into a prompt no person can answer here; every
-            // other posture blocks it outright. Either way it never runs.
-            assert!(
-                err.to_string().contains("destructive background")
-                    || (mode == ApprovalMode::Suggest
-                        && err.to_string().contains("cannot raise a prompt")),
-                "{mode:?}: {err}"
-            );
+            for command in [
+                "dd if=/dev/zero of=/dev/null count=0",
+                "rm -rf /home/me",
+                "bash -c 'rm -rf /etc'",
+            ] {
+                let err = registry
+                    .execute("agent_gate", "bash", json!({ "command": command }))
+                    .await
+                    .expect_err("a detached agent's catastrophic write is held");
+                // Ask turns the hold into a prompt no person can answer here;
+                // every other posture blocks it outright. Either way it never runs.
+                assert!(
+                    err.to_string().contains("destructive background")
+                        || (mode == ApprovalMode::Suggest
+                            && err.to_string().contains("cannot raise a prompt")),
+                    "{mode:?} {command}: {err}"
+                );
+            }
             let receipts = drain_gate_receipts(&mut rx);
             assert!(
                 receipts

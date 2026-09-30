@@ -18736,31 +18736,45 @@ impl SubAgentToolRegistry {
             AgentProgressEventMeta::new(AgentWorkerStatus::Running).with_tool(name.to_string()),
             format!("Auto-Review checking '{name}'"),
         );
-        // A posture change mid-review abandons it: the call is gated again
-        // under what the person just chose (Full Access runs it at once).
-        let review = tokio::select! {
-            review = consult_reviewer(
-                &self.gate_runtime.client,
-                &context_text,
-                &self.gate_runtime.cancel_token,
-            ) => review,
-            () = posture.live_posture_moved() => return ChildGateVerdict::PostureChanged,
-        };
         // A provider-success reply carries usage even when it is incomplete or
         // semantically invalid. Record before interpreting the verdict so the
         // fail-closed path cannot erase spend. Pre-dispatch cancellation and
         // transport failure expose no usage and therefore mint no receipt.
-        if let Some(usage) = review.usage.as_ref() {
-            let source_id = child_guardian_usage_source_id(agent_id, tool_id);
-            record_provider_response_usage(
-                &self.gate_runtime,
-                agent_id,
-                &source_id,
-                review_route,
-                usage,
-            )
-            .await;
-        }
+        let mut review = tokio::spawn({
+            let runtime = self.gate_runtime.clone();
+            let agent_id = agent_id.to_string();
+            let source_id = child_guardian_usage_source_id(&agent_id, tool_id);
+            async move {
+                let review =
+                    consult_reviewer(&runtime.client, &context_text, &runtime.cancel_token).await;
+                if let Some(usage) = review.usage.as_ref() {
+                    record_provider_response_usage(
+                        &runtime,
+                        &agent_id,
+                        &source_id,
+                        review_route,
+                        usage,
+                    )
+                    .await;
+                }
+                review
+            }
+        });
+        // A posture change mid-review stops waiting on it (the review still
+        // finishes and its spend is recorded): the call is gated again under
+        // what the person just chose, and Full Access runs it at once.
+        let review = tokio::select! {
+            joined = &mut review => match joined {
+                Ok(review) => review,
+                Err(_) => {
+                    return ChildGateVerdict::Deny(
+                        "Auto-Review guardian review failed; the call was denied (fail closed)"
+                            .to_string(),
+                    );
+                }
+            },
+            () = posture.live_posture_moved() => return ChildGateVerdict::PostureChanged,
+        };
         let risk = review.outcome.audit_risk();
         let (verdict, reason) = match &review.outcome {
             ReviewerOutcome::Allow { reason, .. } => (ToolGateVerdict::Allowed, reason.clone()),

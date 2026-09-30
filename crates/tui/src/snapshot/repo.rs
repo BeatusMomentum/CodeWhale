@@ -2217,7 +2217,10 @@ pub fn estimate_workspace_size_bounded(
     Ok(total)
 }
 
-fn unsafe_workspace_snapshot_reason(workspace: &Path, home: Option<&Path>) -> Option<&'static str> {
+pub(crate) fn unsafe_workspace_snapshot_reason(
+    workspace: &Path,
+    home: Option<&Path>,
+) -> Option<&'static str> {
     let workspace = normalize_path_for_safety(workspace);
     if is_filesystem_root(&workspace) {
         return Some("filesystem root");

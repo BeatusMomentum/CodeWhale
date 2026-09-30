@@ -1018,15 +1018,14 @@ fn shell_params_are_publish_like(params: &Value) -> bool {
         .any(|tokens| shell_tokens_are_publish_like(&tokens))
 }
 
-/// True when any segment of the shell command is genuinely destructive: the
-/// command-safety analyzer's `Dangerous` verdict (`rm -rf /`, `curl | sh`,
-/// `eval`, fork bombs) OR the catastrophic-write classes
-/// [`segment_is_device_or_filesystem_destroyer`] adds (`dd` to a device,
-/// `mkfs`/`shred`/`wipefs`, forced recursive deletion of an absolute system
-/// path). This is what keeps the background/headless durable-review floor
-/// armed now that the floor no longer treats every non-read-only command as
-/// destructive (#3883).
+/// True when the shell command is genuinely destructive: the command-safety
+/// analyzer's `Dangerous` verdict for any segment (`rm -rf /`, `curl | sh`,
+/// `eval`, fork bombs) OR a catastrophic write [`argv_is_destroyer`] finds in
+/// any command it could run. This is what keeps the background/headless
+/// durable-review floor armed now that the floor no longer treats every
+/// non-read-only command as destructive (#3883).
 fn shell_params_are_destructive_like(params: &Value, workspace: Option<&std::path::Path>) -> bool {
+    use codewhale_execpolicy::command_safety::{SafetyLevel, analyze_command, command_invocations};
     let Some(command) = params
         .get("command")
         .or_else(|| params.get("cmd"))
@@ -1037,165 +1036,84 @@ fn shell_params_are_destructive_like(params: &Value, workspace: Option<&std::pat
 
     split_shell_segments_for_review(command)
         .iter()
-        .any(|segment| {
-            codewhale_execpolicy::command_safety::analyze_command(segment).level
-                == codewhale_execpolicy::command_safety::SafetyLevel::Dangerous
-                || segment_is_device_or_filesystem_destroyer(segment, workspace)
+        .any(|segment| analyze_command(segment).level == SafetyLevel::Dangerous)
+        // The same reader command_safety uses; unreadable nesting holds. A
+        // command that makes links can change what a path means before `rm`
+        // runs, so it gets no in-workspace clearance.
+        || command_invocations(command).is_none_or(|argvs| {
+            let workspace = workspace.filter(|_| !argvs.iter().any(|argv| argv[0] == "ln"));
+            argvs.iter().any(|argv| argv_is_destroyer(argv, workspace))
         })
 }
 
 /// The non-bypassable floor must hold genuinely catastrophic writes even when
 /// `command_safety` (tuned to avoid over-blocking build/test chains) rates
-/// them merely `RequiresApproval`. This covers the classes that irreversibly
-/// destroy a disk or a system tree — `dd`/`shred`/`wipefs` onto a device,
-/// `mkfs`, and forced recursive deletion of an absolute system path — so a
-/// background/headless call in YOLO cannot run them without durable review
-/// (#3883 follow-up; the earlier narrowing lost this coverage).
-fn segment_is_device_or_filesystem_destroyer(
-    segment: &str,
-    workspace: Option<&std::path::Path>,
-) -> bool {
-    // A command may be piped (`cat x | dd of=/dev/sda`); each stage is its own
-    // effective command, so check every pipe stage.
-    segment
-        .split('|')
-        .any(|stage| stage_is_device_or_filesystem_destroyer(stage, workspace))
-}
-
-/// Strip a surrounding pair of single or double quotes from a shell token so
-/// `"dd"`, `'mkfs'`, and `of="/dev/sda"` values match their bare forms.
-fn unquote_token(token: &str) -> &str {
-    let t = token.trim();
-    for q in ['"', '\''] {
-        if t.len() >= 2 && t.starts_with(q) && t.ends_with(q) {
-            return &t[1..t.len() - 1];
-        }
-    }
-    t
-}
-
-/// Peel leading `VAR=val` env assignments and command wrappers
-/// (`sudo`/`env`/`nohup`/`time`/`command`/`nice`/`ionice`/`doas`/`stdbuf`/
-/// `timeout`/`setsid`) plus their flags, so `FOO=bar sudo -n dd of=/dev/sda`
-/// resolves to the real `dd` command. Best-effort: exotic
-/// wrapper-with-positional-arg forms may slip, but the common evasions
-/// (env assignment, sudo/env/nohup prefix) are covered.
-fn effective_command_tokens<'a>(tokens: &'a [&'a str]) -> &'a [&'a str] {
-    const WRAPPERS: &[&str] = &[
-        "sudo", "env", "nohup", "time", "command", "nice", "ionice", "doas", "stdbuf", "timeout",
-        "setsid",
-    ];
-    let mut i = 0;
-    while i < tokens.len() {
-        let raw = unquote_token(tokens[i]);
-        // Leading env assignment: VAR=value (no slash before the '=').
-        if let Some(eq) = raw.find('=')
-            && eq > 0
-            && !raw[..eq].contains('/')
-        {
-            i += 1;
-            continue;
-        }
-        let base = raw
-            .trim_start_matches("./")
-            .rsplit('/')
-            .next()
-            .unwrap_or(raw);
-        if WRAPPERS.contains(&base) {
-            let is_timeout = base == "timeout";
-            i += 1;
-            // Skip that wrapper's leading flags and env's VAR=val args.
-            while i < tokens.len() {
-                let f = unquote_token(tokens[i]);
-                let is_env_assign = f
-                    .find('=')
-                    .is_some_and(|eq| eq > 0 && !f[..eq].contains('/'));
-                if f.starts_with('-') || is_env_assign {
-                    i += 1;
-                } else {
-                    break;
-                }
-            }
-            // `timeout` takes a positional DURATION before the command.
-            if is_timeout
-                && i < tokens.len()
-                && unquote_token(tokens[i])
-                    .chars()
-                    .next()
-                    .is_some_and(|c| c.is_ascii_digit())
-            {
-                i += 1;
-            }
-            continue;
-        }
-        break;
-    }
-    &tokens[i..]
-}
-
-fn stage_is_device_or_filesystem_destroyer(
-    stage: &str,
-    workspace: Option<&std::path::Path>,
-) -> bool {
-    let raw_tokens: Vec<&str> = stage.split_whitespace().collect();
-    let tokens = effective_command_tokens(&raw_tokens);
-    let Some(cmd) = tokens
-        .first()
-        .map(|t| unquote_token(t).trim_start_matches("./"))
-    else {
+/// them merely `RequiresApproval`: `dd`/`shred`/`wipefs` onto a device,
+/// `mkfs`, and a forced recursive delete of an absolute path that is not
+/// provably inside a safe workspace (#3883 follow-up).
+fn argv_is_destroyer(argv: &[String], workspace: Option<&std::path::Path>) -> bool {
+    let Some((command, args)) = argv.split_first() else {
         return false;
     };
-    let base = cmd.rsplit('/').next().unwrap_or(cmd);
-    // Filesystem creation / whole-device wipes: the target IS destruction.
-    if matches!(base, "mkfs" | "wipefs" | "shred" | "blkdiscard") || base.starts_with("mkfs.") {
-        return true;
-    }
-    // `dd` writing to a block device (of=/dev/...): overwrites the raw disk.
-    if base == "dd" {
-        return tokens.iter().any(|t| {
-            unquote_token(t)
-                .strip_prefix("of=")
-                .map(|dest| unquote_token(dest).starts_with("/dev/"))
-                .unwrap_or(false)
-        });
-    }
-    // Forced recursive deletion aimed at an absolute path outside the
-    // workspace (e.g. `rm -rf /etc`, `/usr`, `/var`): command_safety only
-    // flags root/home/parent-escape, so catch absolute-system targets here.
-    if base == "rm" {
-        let mut recursive = false;
-        let mut force = false;
-        let mut abs_system_target = false;
-        for token in &tokens[1..] {
-            let token = unquote_token(token);
-            if token.starts_with("--") {
-                match token {
+    match command.as_str() {
+        "mkfs" | "wipefs" | "shred" | "blkdiscard" => true,
+        name if name.starts_with("mkfs.") => true,
+        "dd" => args.iter().any(|arg| {
+            arg.strip_prefix("of=")
+                .is_some_and(|dest| dest.starts_with("/dev/"))
+        }),
+        "rm" => {
+            let (mut recursive, mut force) = (false, false);
+            let mut outside_target = false;
+            for arg in args {
+                match arg.as_str() {
                     "--recursive" | "--dir" => recursive = true,
                     "--force" => force = true,
+                    flag if flag.starts_with('-') && !flag.starts_with("--") => {
+                        recursive |= flag.contains(['r', 'R']);
+                        force |= flag.contains('f');
+                    }
+                    target if target.starts_with('/') => {
+                        outside_target |= !strictly_inside(workspace, target);
+                    }
                     _ => {}
                 }
-            } else if let Some(flags) = token.strip_prefix('-') {
-                recursive |= flags.contains('r') || flags.contains('R');
-                force |= flags.contains('f');
-            } else if token.starts_with('/') && !strictly_inside(workspace, token) {
-                abs_system_target = true;
             }
+            recursive && force && outside_target
         }
-        return recursive && force && abs_system_target;
+        _ => false,
     }
-    false
 }
 
-/// Whether absolute `target` resolves strictly below `workspace` — the
-/// workspace root itself, a `..` escape, or a symlink hop out of it do not.
+/// Whether absolute `target` provably resolves strictly below a safe
+/// `workspace`. Fails closed: no workspace, a workspace at `/`, home, or a
+/// top-level home folder, a target carrying glob, brace, `~` or `$` (their
+/// expansion is unknowable here, and `<ws>/*` is the whole workspace), a
+/// target that does not exist yet, the workspace root itself, a `..` escape,
+/// or a symlink hop out of it.
 fn strictly_inside(workspace: Option<&std::path::Path>, target: &str) -> bool {
     use crate::tools::spec::normalize_path;
     let Some(workspace) = workspace else {
         return false;
     };
+    if target.contains(['*', '?', '[', ']', '{', '}', '~', '$'])
+        || crate::snapshot::repo::unsafe_workspace_snapshot_reason(
+            &workspace
+                .canonicalize()
+                .unwrap_or_else(|_| workspace.to_path_buf()),
+            crate::config::effective_home_dir().as_deref(),
+        )
+        .is_some()
+    {
+        return false;
+    }
     let target = std::path::Path::new(target);
     let lexical = normalize_path(target);
-    let resolved = target.canonicalize().unwrap_or_else(|_| lexical.clone());
+    // A target that does not exist yet proves nothing about what it will be
+    // when `rm` runs (`ln -s / ws/x && rm -rf ws/x/etc`).
+    let Ok(resolved) = target.canonicalize() else {
+        return false;
+    };
     let roots = [
         normalize_path(workspace),
         workspace.canonicalize().unwrap_or_default(),
@@ -1730,9 +1648,23 @@ mod tests {
         }
     }
 
-    /// A forced delete of an absolute path inside the workspace is ordinary
-    /// cleanup, not a system-tree destroyer. The workspace root itself, a
-    /// `..` escape, a symlink hop out, and a system path all still hold.
+    fn destroyer_held(workspace: &std::path::Path, command: &str) -> bool {
+        let ctx = AutoReviewContext::from_tool_call(
+            "exec_shell",
+            &json!({ "command": command, "background": true }),
+            RunOrigin::Background,
+            ApprovalMode::Bypass,
+            true,
+            Some(workspace),
+        );
+        AutoReviewPolicy::default()
+            .evaluate(&ctx)
+            .built_in_safety_gate
+    }
+
+    /// A forced delete of an existing absolute path inside the workspace is
+    /// ordinary cleanup, not a system-tree destroyer. The workspace root
+    /// itself, a `..` escape, a symlink hop out, and a system path all hold.
     #[test]
     fn absolute_forced_delete_inside_the_workspace_is_not_a_destroyer() {
         let workspace = tempfile::tempdir().expect("tempdir");
@@ -1740,27 +1672,82 @@ mod tests {
         std::fs::create_dir_all(root.join("build")).unwrap();
         #[cfg(unix)]
         std::os::unix::fs::symlink("/usr", root.join("escape")).unwrap();
-        let held = |command: String| {
-            let ctx = AutoReviewContext::from_tool_call(
-                "exec_shell",
-                &json!({ "command": command, "background": true }),
-                RunOrigin::Background,
-                ApprovalMode::Bypass,
-                true,
-                Some(root),
-            );
-            AutoReviewPolicy::default()
-                .evaluate(&ctx)
-                .built_in_safety_gate
-        };
         let at = |rel: &str| root.join(rel).display().to_string();
-        assert!(!held(format!("rm -rf {}", at("build"))));
-        assert!(!held(format!("rm -rf {}", at("not/yet/there"))));
-        assert!(held(format!("rm -rf {}", root.display())));
-        assert!(held(format!("rm -rf {}", at("build/../.."))));
+        assert!(!destroyer_held(root, &format!("rm -rf {}", at("build"))));
+        assert!(destroyer_held(root, &format!("rm -rf {}", root.display())));
+        assert!(destroyer_held(
+            root,
+            &format!("rm -rf {}", at("build/../.."))
+        ));
         #[cfg(unix)]
-        assert!(held(format!("rm -rf {}/", at("escape"))));
-        assert!(held("rm -rf /usr".to_string()));
+        assert!(destroyer_held(root, &format!("rm -rf {}/", at("escape"))));
+        assert!(destroyer_held(root, "rm -rf /usr"));
+    }
+
+    /// Second review of 05264125e: once `rm -rf /` stopped matching every
+    /// absolute path, only the destroyer check held these, and its own
+    /// wrapper peeler was weaker than command_safety's. It now reads commands
+    /// with command_safety's reader; every one of these holds again.
+    #[test]
+    fn wrapped_system_deletes_are_destroyers() {
+        let workspace = tempfile::tempdir().expect("tempdir");
+        for command in [
+            "bash -c 'rm -rf /home/me'",
+            "sh -c \"rm -rf /etc\"",
+            "sh -c 'cd /tmp; rm -rf /etc'",
+            "echo x | xargs rm -rf /home/me",
+            "nice -n 19 rm -rf /home/me",
+            "ionice -c 3 rm -rf /home/me",
+            "timeout -s KILL 60 rm -rf /home/me",
+            "sudo -u me rm -rf /home/me",
+            "\\rm -rf /home/me",
+            "/bin/rm -rf /home/me",
+            "FOO=1 env -i rm -rf /home/me",
+        ] {
+            assert!(destroyer_held(workspace.path(), command), "{command}");
+        }
+    }
+
+    /// Second review of 05264125e: targets whose meaning is only known when
+    /// the shell runs never count as inside the workspace.
+    #[test]
+    fn unknowable_or_unsafe_targets_are_never_inside_the_workspace() {
+        let workspace = tempfile::tempdir().expect("tempdir");
+        let outside = tempfile::tempdir().expect("tempdir");
+        let root = workspace.path();
+        std::fs::create_dir_all(root.join("build")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(outside.path(), root.join("data")).unwrap();
+        let ws = root.display();
+        for command in [
+            format!("rm -rf {ws}/data/*"),
+            format!("rm -rf {ws}/*"),
+            format!("rm -rf {ws}/{{build,..}}"),
+            format!("rm -rf {ws}/build?"),
+            format!("rm -rf {ws}/[b]uild"),
+            format!("rm -rf {ws}/$TARGET"),
+            format!("rm -rf {ws}/~"),
+            format!("ln -s / {ws}/x && rm -rf {ws}/x/etc"),
+            format!("ln -s / {ws}/build/x; rm -rf {ws}/build"),
+            format!("rm -rf {ws}/not-there-yet"),
+        ] {
+            assert!(destroyer_held(root, &command), "{command}");
+        }
+        // Unsafe workspaces clear nothing by being "inside" them.
+        assert!(destroyer_held(std::path::Path::new("/"), "rm -rf /usr"));
+        if let Some(home) = crate::config::effective_home_dir()
+            && let Some(existing) = std::fs::read_dir(&home).ok().and_then(|entries| {
+                entries
+                    .flatten()
+                    .map(|entry| entry.path())
+                    .find(|path| path.is_dir())
+            })
+        {
+            assert!(destroyer_held(
+                &home,
+                &format!("rm -rf {}", existing.display())
+            ));
+        }
     }
 
     #[test]
