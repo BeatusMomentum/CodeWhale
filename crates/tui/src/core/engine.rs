@@ -5426,12 +5426,31 @@ impl Engine {
         let route = *route;
         let compaction = *compaction;
         let initial_routed_usage = *initial_routed_usage;
+        let initial_usage_owner = compaction.runtime_cost_owner.clone();
+        let autonomous = self.admitted_turn_control.is_none() && !provenance.can_authorize_work();
+        // A queued Op already installed its control in run(). Own its guard
+        // before any rejecting input path, so invalid images cannot retain
+        // an active control or inherit cancellation into a later request.
+        let turn_control = self.begin_turn_control_for_provenance(provenance);
+        if autonomous && self.cancel_token.is_cancelled() {
+            crate::cost_status::report_runtime_usage_batch(
+                crate::cost_status::scope_token(),
+                initial_usage_owner.as_deref(),
+                &initial_routed_usage,
+            );
+            return SendMessageOutcome::NotStarted { error: None };
+        }
         // All surfaces reuse the same bounded validator. Runtime already checks
         // before admission; this also protects direct in-process operations.
         let images = match crate::image_attach::prepare_stored_images(&images) {
             Ok(images) => images,
             Err(error) => {
                 let message = error.to_string();
+                crate::cost_status::report_runtime_usage_batch(
+                    crate::cost_status::scope_token(),
+                    initial_usage_owner.as_deref(),
+                    &initial_routed_usage,
+                );
                 let _ = self
                     .send_event(Event::error(ErrorEnvelope::new(
                         crate::error_taxonomy::ErrorCategory::InvalidInput,
@@ -5446,12 +5465,6 @@ impl Engine {
                 };
             }
         };
-        let autonomous = self.admitted_turn_control.is_none() && !provenance.can_authorize_work();
-        let turn_control = self.begin_turn_control_for_provenance(provenance);
-        if autonomous && self.cancel_token.is_cancelled() {
-            return SendMessageOutcome::NotStarted { error: None };
-        }
-        let initial_usage_owner = compaction.runtime_cost_owner.clone();
         // Reserve both lifecycle observations before mutating the session.
         // Otherwise cancellation during a blocked TurnStarted send could
         // create a completion with no start. The production queue has 256

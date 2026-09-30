@@ -214,6 +214,104 @@ async fn event_capacity_admitted_full_channel_settles_once_with_partial_usage_wi
 }
 
 #[tokio::test]
+async fn event_capacity_invalid_images_release_queued_control_and_keep_classifier_receipt() {
+    use crate::llm_client::mock::MockLlmClient;
+    for full in [false, true] {
+        let _cost = crate::cost_status::test_scope();
+        let workspace = tempdir().unwrap();
+        let config = Config::default();
+        let mock = Arc::new(MockLlmClient::new(Vec::new()));
+        let mut engine_config = deterministic_engine_config(workspace.path());
+        engine_config.features.disable(Feature::Mcp);
+        let (engine, handle) = Engine::new_with_model_client(engine_config, &config, mock.clone());
+        if full {
+            while engine.tx_event.try_send(Event::status("occupied")).is_ok() {}
+        }
+        let controls = Arc::clone(&engine.turn_controls);
+        let mut op = external_user_message_op("invalid attachment", AppMode::Agent, &config);
+        let Op::SendMessage(spec) = &mut op else {
+            unreachable!()
+        };
+        spec.images
+            .push(codewhale_protocol::runtime::RuntimeImageInput {
+                mime: "image/png".into(),
+                data_base64: "invalid@base64".into(),
+            });
+        spec.initial_routed_usage
+            .records
+            .push(crate::cost_status::RuntimeUsageRecord {
+                source_id: "event-capacity:invalid-image-classifier".into(),
+                usage: crate::cost_status::EffectiveRouteUsage {
+                    route: crate::cost_status::EffectiveRouteEnvelope::capture(
+                        None,
+                        ApiProvider::Openai,
+                        "openai",
+                        "classifier",
+                        None,
+                        chrono::Utc::now(),
+                    ),
+                    usage: Usage {
+                        input_tokens: 7,
+                        output_tokens: 3,
+                        ..Usage::default()
+                    },
+                },
+            });
+        handle.send(op).await.unwrap();
+        let task = tokio::spawn(engine.run());
+        if full {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if controls.lock().unwrap().active.is_some() {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            handle.cancel();
+        }
+        let snapshot = tokio::time::timeout(Duration::from_secs(2), handle.get_session_snapshot())
+            .await
+            .expect("rejected input releases the current control")
+            .unwrap();
+        assert!(snapshot.messages.is_empty());
+        assert_eq!(mock.call_count(), 0);
+        assert!(controls.lock().unwrap().active.is_none());
+        let cost = crate::cost_status::drain();
+        assert!(cost.usage_source_fingerprints.contains(
+            &crate::cost_status::usage_source_fingerprint(
+                "event-capacity:invalid-image-classifier"
+            ),
+        ));
+        let mut events = handle.rx_event.write().await;
+        let mut invalid_errors = 0;
+        while let Ok(event) = events.try_recv() {
+            assert!(!matches!(
+                event,
+                Event::TurnStarted { .. } | Event::TurnComplete { .. }
+            ));
+            if let Event::Error { envelope, .. } = event {
+                assert_eq!(envelope.code, "image_input_invalid");
+                invalid_errors += 1;
+            }
+        }
+        assert_eq!(
+            invalid_errors,
+            usize::from(!full),
+            "a cancelled full-channel rejection is not fabricated as delivered"
+        );
+        drop(events);
+        handle.send(Op::Shutdown).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+}
+
+#[tokio::test]
 async fn event_capacity_releases_all_admitted_senders_and_keeps_idle_receipts_lossless() {
     let workspace = tempdir().unwrap();
     let (mut engine, _handle) = Engine::new(
@@ -292,6 +390,128 @@ async fn event_capacity_nested_vm_fanout_is_bounded_per_program_not_per_turn() {
             50 * program
         );
     }
+}
+
+#[tokio::test]
+async fn event_capacity_cancelled_repl_child_keeps_unknown_cost_and_discards_kernel() {
+    use crate::llm_client::mock::{MockLlmClient, canned};
+    struct ReplClient {
+        inner: MockLlmClient,
+        child_entered: Arc<tokio::sync::Notify>,
+        child_dropped: Arc<std::sync::atomic::AtomicBool>,
+    }
+    #[async_trait::async_trait]
+    impl crate::core::model_client::ModelClient for ReplClient {
+        fn provider_name(&self) -> &str {
+            "backpressure-repl-fixture"
+        }
+        fn model(&self) -> &str {
+            "mock-model"
+        }
+        async fn create_message(
+            &self,
+            _: codewhale_models::MessageRequest,
+        ) -> anyhow::Result<codewhale_models::MessageResponse> {
+            let _drop = DropSignal(Arc::clone(&self.child_dropped));
+            self.child_entered.notify_one();
+            std::future::pending().await
+        }
+        async fn create_message_stream(
+            &self,
+            request: codewhale_models::MessageRequest,
+        ) -> anyhow::Result<crate::llm_client::StreamEventBox> {
+            crate::core::model_client::ModelClient::create_message_stream(&self.inner, request)
+                .await
+        }
+        async fn health_check(&self) -> anyhow::Result<bool> {
+            Ok(true)
+        }
+    }
+    let _cost = crate::cost_status::test_scope();
+    let workspace = tempdir().unwrap();
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut response = canned::simple_text_turn(
+        "```repl\nchild = sub_query('hang until cancelled')\nfinalize(child)\n```",
+    );
+    for event in &mut response {
+        if let codewhale_models::StreamEvent::MessageDelta { usage, .. } = event {
+            *usage = Some(Usage {
+                input_tokens: 11,
+                output_tokens: 5,
+                ..Usage::default()
+            });
+        }
+    }
+    let client = Arc::new(ReplClient {
+        inner: MockLlmClient::new(vec![response]),
+        child_entered: Arc::clone(&entered),
+        child_dropped: Arc::clone(&dropped),
+    });
+    let (mut engine, handle) = Engine::new_with_model_client(
+        deterministic_engine_config(workspace.path()),
+        &Config::default(),
+        client.clone(),
+    );
+    engine.session.auto_approve = true;
+    engine.session.add_message(Message {
+        role: Role::User,
+        content: vec![ContentBlock::Text {
+            text: "run cancellable REPL".into(),
+            cache_control: None,
+        }],
+    });
+    let registry = crate::tools::ToolRegistry::new(crate::tools::ToolContext::new(
+        workspace.path().to_owned(),
+    ));
+    let policy = test_tool_surface(
+        &engine,
+        registry,
+        Some(vec![catalog_tool(CODE_EXECUTION_TOOL_NAME)]),
+        AppMode::Agent,
+    );
+    let turn_guard = engine.begin_turn_control();
+    let tx = engine.tx_event.clone();
+    let mut turn = TurnContext::new(4);
+    let mut run = Box::pin(engine.run_turn(&mut turn, policy, None, None));
+    tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::select! {
+            result = &mut run => panic!("REPL did not enter the child provider request: {result:?}"),
+            () = entered.notified() => {},
+        }
+    }).await.expect("actual Python kernel dispatches the pending child request");
+    while tx
+        .try_send(Event::status("full during nested REPL"))
+        .is_ok()
+    {}
+    handle.cancel();
+    let (status, error) = tokio::time::timeout(Duration::from_secs(2), &mut run)
+        .await
+        .expect("cancel drops the pending REPL round even with a full queue");
+    drop(run);
+    assert_eq!(status, TurnOutcomeStatus::Interrupted, "{error:?}");
+    assert!(error.is_none());
+    assert!(
+        dropped.load(std::sync::atomic::Ordering::SeqCst),
+        "nested provider future is released"
+    );
+    assert!(
+        engine.repl_kernel.is_none(),
+        "a cancelled round cannot preserve an executing process"
+    );
+    assert_eq!((turn.usage.input_tokens, turn.usage.output_tokens), (11, 5));
+    let cost = crate::cost_status::drain();
+    assert!(
+        cost.unpriced_reasons
+            .contains("provider_success_missing_usage"),
+        "pending child usage stays unknown, never zero"
+    );
+    assert_eq!(
+        client.inner.call_count(),
+        1,
+        "no next root provider request after cancellation"
+    );
+    drop(turn_guard);
 }
 const REPRESENTATIVE_FIXTURE_ID: &str = "representative-v1";
 const REPRESENTATIVE_PROJECT_AUTHORITY: &str = "REPRESENTATIVE_PROJECT_AUTHORITY";

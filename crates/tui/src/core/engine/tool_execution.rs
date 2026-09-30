@@ -172,7 +172,7 @@ impl Drop for ToolHeartbeatGuard {
 /// synchronously, including on cancellation and a full channel. No detached
 /// sender can outlive the tool or compete with the turn's terminal event.
 pub(super) struct InteractiveTerminalGuard {
-    resume: Option<mpsc::OwnedPermit<Event>>,
+    resume: Option<(mpsc::Sender<Event>, mpsc::OwnedPermit<Event>)>,
 }
 
 impl InteractiveTerminalGuard {
@@ -188,18 +188,18 @@ impl InteractiveTerminalGuard {
         }
         let resume = super::streaming::reserve_event_capacity(&tx, cancel.as_ref())
             .await
-            .map_err(|reason| terminal_handoff_send_error(reason))?;
+            .map_err(terminal_handoff_send_error)?;
         let ack = Arc::new(tokio::sync::Notify::new());
         let pause = super::streaming::reserve_event_capacity(&tx, cancel.as_ref())
             .await
-            .map_err(|reason| terminal_handoff_send_error(reason))?;
+            .map_err(terminal_handoff_send_error)?;
         // No await separates the pause send and guard installation. A
         // cancelled reservation above never paused and needs no resume.
         pause.send(Event::PauseEvents {
             ack: Some(ack.clone()),
         });
         let guard = Self {
-            resume: Some(resume),
+            resume: Some((tx, resume)),
         };
         let acknowledged = match cancel.as_ref() {
             Some(cancel) => tokio::select! {
@@ -233,7 +233,9 @@ fn terminal_handoff_send_error(reason: super::streaming::EventSendError) -> Tool
 
 impl Drop for InteractiveTerminalGuard {
     fn drop(&mut self) {
-        if let Some(resume) = self.resume.take() {
+        if let Some((tx, resume)) = self.resume.take()
+            && !tx.is_closed()
+        {
             resume.send(Event::ResumeEvents);
         }
     }
@@ -740,7 +742,7 @@ mod tests {
         tx.try_send(Event::status("filler")).expect("fill channel");
 
         drop(InteractiveTerminalGuard {
-            resume: Some(resume),
+            resume: Some((tx, resume)),
         });
 
         assert!(matches!(rx.recv().await, Some(Event::Status { .. })));
