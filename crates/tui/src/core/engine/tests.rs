@@ -628,8 +628,11 @@ async fn event_capacity_cancelled_parallel_tool_keeps_completed_span_and_call_wh
     }
     #[async_trait::async_trait]
     impl ToolSpec for CompleteThenCancel {
+        // Registered under the canonical read identity so the engine's
+        // central resource authority (not this fixture) grants the disjoint
+        // ReadPath claims that form one real parallel chunk.
         fn name(&self) -> &str {
-            "fixture_complete_then_cancel"
+            "read_file"
         }
         fn description(&self) -> &str {
             "Finish an observed operation before firing its turn cancellation token."
@@ -648,7 +651,7 @@ async fn event_capacity_cancelled_parallel_tool_keeps_completed_span_and_call_wh
             input: Value,
             context: &ToolContext,
         ) -> Result<PreparedToolCall, ToolError> {
-            let resource = input["resource"].as_str().expect("fixture resource");
+            let path = input["path"].as_str().expect("fixture path");
             Ok(PreparedToolCall {
                 name: self.name().to_string(),
                 description: self.description().to_string(),
@@ -656,7 +659,8 @@ async fn event_capacity_cancelled_parallel_tool_keeps_completed_span_and_call_wh
                 supports_parallel: true,
                 starts_detached: false,
                 approval: ApprovalRequirement::Auto,
-                resources: vec![ResourceClaim::ReadPath(context.workspace.join(resource))],
+                // Replaced by `registered_resource_claims`; kept honest anyway.
+                resources: vec![ResourceClaim::ReadPath(context.workspace.join(path))],
                 input,
             })
         }
@@ -676,18 +680,13 @@ async fn event_capacity_cancelled_parallel_tool_keeps_completed_span_and_call_wh
 
     for fill_queue in [false, true] {
         let workspace = tempdir().unwrap();
+        for path in ["one", "two"] {
+            std::fs::write(workspace.path().join(path), path).unwrap();
+        }
         let mock = Arc::new(MockLlmClient::new(vec![
             tool_batch_turn(&[
-                (
-                    "one",
-                    "fixture_complete_then_cancel",
-                    r#"{"resource":"one"}"#,
-                ),
-                (
-                    "two",
-                    "fixture_complete_then_cancel",
-                    r#"{"resource":"two"}"#,
-                ),
+                ("one", "read_file", r#"{"path":"one"}"#),
+                ("two", "read_file", r#"{"path":"two"}"#),
             ]),
             canned::simple_text_turn("must not run after cancellation"),
         ]));
