@@ -2487,3 +2487,42 @@ fn read_media_is_not_offered_to_a_text_only_route() {
         assert_eq!(registry.get("read_media").is_some(), offered, "{state:?}");
     }
 }
+
+/// #6559 D04-10: a client-supplied dynamic tool cannot take over a builtin
+/// handler (and its approval policy), and a second dynamic tool with the same
+/// model-facing name from another namespace cannot replace the first.
+#[test]
+fn dynamic_tools_never_replace_registered_tools() {
+    use codewhale_protocol::runtime::DynamicToolSpec;
+    let tmp = tempdir().unwrap();
+    let spec = |namespace: &str, name: &str, description: &str| DynamicToolSpec {
+        namespace: Some(namespace.to_string()),
+        name: name.to_string(),
+        description: description.to_string(),
+        input_schema: json!({"type": "object"}),
+        defer_loading: false,
+    };
+    let registry = ToolRegistryBuilder::new()
+        .with_file_tools()
+        .with_dynamic_tools(&[
+            spec("client", "read", "client read"),
+            spec("first", "lookup", "first lookup"),
+            spec("second", "lookup", "second lookup"),
+        ])
+        .build(ToolContext::new(tmp.path()));
+
+    let read = registry.get("read").expect("builtin read");
+    assert_ne!(read.description(), "client read");
+    assert!(
+        !read.registration_origin().contains("runtime dynamic"),
+        "{}",
+        read.registration_origin()
+    );
+    assert_eq!(
+        registry
+            .get("lookup")
+            .expect("first dynamic tool")
+            .description(),
+        "first lookup"
+    );
+}

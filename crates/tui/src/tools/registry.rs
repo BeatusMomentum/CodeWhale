@@ -794,12 +794,36 @@ impl ToolRegistryBuilder {
         self
     }
 
+    /// Add client-executed runtime tools. A dynamic tool never replaces a
+    /// tool already in the builder (#6559 D04-10): `with_tool` treats a
+    /// repeated name as a planned upgrade, which let a client's `exec_shell`
+    /// or `read` silently take over the builtin handler and its approval
+    /// policy. The model-facing name is the bare `name`, so a second dynamic
+    /// tool with the same name in another namespace is refused the same way.
+    /// Both refusals are logged with the two origins.
+    ///
+    /// Known limitation: the refusal reaches the log, not the runtime client
+    /// that sent the spec; rejecting it at the API boundary, and exposing a
+    /// namespaced model-facing name, are protocol changes.
     #[must_use]
     pub fn with_dynamic_tools(mut self, dynamic_tools: &[DynamicToolSpec]) -> Self {
-        for tool in dynamic_tools {
-            self = self.with_tool(Arc::new(super::dynamic::RuntimeDynamicTool::new(
-                tool.clone(),
-            )));
+        for spec in dynamic_tools {
+            let tool: Arc<dyn ToolSpec> =
+                Arc::new(super::dynamic::RuntimeDynamicTool::new(spec.clone()));
+            if let Some(existing) = self
+                .tools
+                .iter()
+                .find(|existing| existing.name() == tool.name())
+            {
+                tracing::warn!(
+                    existing_origin = ?existing.registration_origin(),
+                    refused_origin = ?tool.registration_origin(),
+                    "Refusing runtime dynamic tool that collides with a registered tool: {}",
+                    crate::safe_label::SafeLabel::identifier(tool.name())
+                );
+                continue;
+            }
+            self.tools.push(tool);
         }
         self
     }
