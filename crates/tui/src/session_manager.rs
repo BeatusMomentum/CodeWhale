@@ -1539,6 +1539,15 @@ impl SessionManager {
     /// Claim `session_id` for this process's interactive surface: the
     /// in-process registry ([`set_live_session`]) plus the cross-process
     /// lease in this store, so writers in other processes see it too.
+    ///
+    /// Known limitation: this claim is best-effort. Attach paths reserve the
+    /// lease up front ([`Self::reserve_session_for_attach`]), but a session
+    /// that starts fresh is claimed only at its first snapshot, and a claim
+    /// that loses the lock to another process's probe or external write, or
+    /// cannot open the lease file, runs unleased until a later snapshot
+    /// retries it (an open failure is logged only at debug). In that window
+    /// another process's external writer can take the lease and write, and
+    /// this session's next autosave reverts that write.
     pub fn claim_live_session(&self, session_id: &str) {
         set_live_session(Some(session_id));
         let id = session_id.trim();
