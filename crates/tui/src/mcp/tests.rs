@@ -1954,10 +1954,7 @@ async fn plugin_stdio_does_not_surface_reviewed_child_stderr() {
 async fn stdio_shutdown_also_terminates_the_servers_grandchildren() {
     let mut config = test_server_config();
     config.command = Some("sh".to_string());
-    config.args = vec![
-        "-c".to_string(),
-        "sleep 300 & echo $!; wait".to_string(),
-    ];
+    config.args = vec!["-c".to_string(), "sleep 300 & echo $!; wait".to_string()];
     let mut transport = StdioTransport::spawn(
         "grandparent",
         "sh",

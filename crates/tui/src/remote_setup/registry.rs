@@ -570,12 +570,17 @@ mod tests {
         };
         // `open-port` has no source restriction: it admits the whole internet.
         assert!(
-            steps.iter().all(|s| !s.args.iter().any(|a| a == "open-port")),
+            steps
+                .iter()
+                .all(|s| !s.args.iter().any(|a| a == "open-port")),
             "Azure plan must not open a port to every source"
         );
         let create = steps
             .iter()
-            .find(|s| s.args.starts_with(&["vm".to_string(), "create".to_string()]))
+            .find(|s| {
+                s.args
+                    .starts_with(&["vm".to_string(), "create".to_string()])
+            })
             .expect("vm create step");
         assert_eq!(arg_after(create, "--nsg-rule").as_deref(), Some("NONE"));
         let ssh_rules: Vec<_> = steps

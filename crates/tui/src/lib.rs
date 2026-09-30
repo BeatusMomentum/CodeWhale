@@ -11320,7 +11320,10 @@ fn run_sandbox_command(args: SandboxArgs) -> Result<()> {
         }
     }
 
-    let stderr = stderr_tail.lock().map(|tail| tail.clone()).unwrap_or_default();
+    let stderr = stderr_tail
+        .lock()
+        .map(|tail| tail.clone())
+        .unwrap_or_default();
     let stderr_str = String::from_utf8_lossy(&stderr);
     let exit_code = status.code().unwrap_or(-1);
     let sandbox_type = exec_env.sandbox_type;
@@ -18877,14 +18880,28 @@ api_key = "test-only-key"
     fn scorecard_rejects_a_threshold_that_cannot_gate() {
         for bad in ["NaN", "inf", "-inf"] {
             assert!(
-                Cli::try_parse_from(["codewhale", "scorecard", "--input", "t.json", "--threshold", bad])
-                    .is_err(),
+                Cli::try_parse_from([
+                    "codewhale",
+                    "scorecard",
+                    "--input",
+                    "t.json",
+                    "--threshold",
+                    bad
+                ])
+                .is_err(),
                 "--threshold {bad} must be refused"
             );
         }
         assert!(
-            Cli::try_parse_from(["codewhale", "scorecard", "--input", "t.json", "--threshold", "2.5"])
-                .is_ok()
+            Cli::try_parse_from([
+                "codewhale",
+                "scorecard",
+                "--input",
+                "t.json",
+                "--threshold",
+                "2.5"
+            ])
+            .is_ok()
         );
     }
 
@@ -20147,8 +20164,9 @@ mod project_config_tests {
             ..Config::default()
         };
 
-        let error = merge_project_config_with_approval_baseline(&mut config, workspace.path(), None)
-            .expect_err("a symlinked primary project config must stop the launch");
+        let error =
+            merge_project_config_with_approval_baseline(&mut config, workspace.path(), None)
+                .expect_err("a symlinked primary project config must stop the launch");
         assert!(error.to_string().contains("--no-project-config"), "{error}");
 
         assert_eq!(

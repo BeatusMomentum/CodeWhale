@@ -279,9 +279,11 @@ async fn responses_stream_eof_without_a_terminal_event_is_an_error() {
         "a truncated stream must not report MessageStop: {events:?}"
     );
     assert!(
-        events.last().is_some_and(|event| event
-            .as_ref()
-            .is_err_and(|error| error.to_string().contains("closed before response.completed"))),
+        events
+            .last()
+            .is_some_and(|event| event.as_ref().is_err_and(|error| error
+                .to_string()
+                .contains("closed before response.completed"))),
         "{events:?}"
     );
 }

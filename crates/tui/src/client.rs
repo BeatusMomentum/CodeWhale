@@ -3779,8 +3779,7 @@ impl CodewhaleClient {
                     // shortened deadline) must release requests that are
                     // already waiting instead of stranding them for the whole
                     // original window.
-                    while let Some(delay) = crate::retry_status::rate_limit_remaining(pause_scope)
-                    {
+                    while let Some(delay) = crate::retry_status::rate_limit_remaining(pause_scope) {
                         tokio::time::sleep(delay.min(RATE_LIMIT_PAUSE_RECHECK_INTERVAL)).await;
                     }
                     self.wait_for_rate_limit().await;
@@ -3848,7 +3847,7 @@ impl CodewhaleClient {
     /// identity plus the host it reaches. A 429 from one provider pauses only
     /// requests that would hit the same limit, never another provider, a
     /// local runtime, or a sub-agent on a different route.
-    fn rate_limit_scope(&self) -> String {
+    pub(crate) fn rate_limit_scope(&self) -> String {
         let route = if self.provider_identity.is_empty() {
             self.api_provider.as_str()
         } else {

@@ -1296,7 +1296,11 @@ pub fn bundled_catalog_offering_for_model(
     if needle.is_empty() {
         return None;
     }
-    find_wire_model(bundled_snapshot().offerings_for_provider(catalog_id), needle).cloned()
+    find_wire_model(
+        bundled_snapshot().offerings_for_provider(catalog_id),
+        needle,
+    )
+    .cloned()
 }
 
 /// Count of merged-catalog models for one provider (catalog view / dashboard).
@@ -1908,9 +1912,8 @@ mod tests {
             ..Default::default()
         };
         let rows = vec![row("org/Model-A"), row("org/model-a"), row("org/Model-B")];
-        let found = |needle: &str| {
-            find_wire_model(&rows, needle).map(|row| row.wire_model_id.clone())
-        };
+        let found =
+            |needle: &str| find_wire_model(&rows, needle).map(|row| row.wire_model_id.clone());
         assert_eq!(found("org/model-a").as_deref(), Some("org/model-a"));
         assert_eq!(found("org/Model-A").as_deref(), Some("org/Model-A"));
         assert_eq!(found("ORG/MODEL-A"), None, "two distinct ids fold together");

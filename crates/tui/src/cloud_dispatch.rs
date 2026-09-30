@@ -3237,13 +3237,20 @@ mod tests {
             .unwrap()
             .join()
             .unwrap();
-        assert!(!outcome, "the phase save must see the cancel and stand down");
+        assert!(
+            !outcome,
+            "the phase save must see the cancel and stand down"
+        );
         assert_eq!(
             store.load(&job.id).unwrap().status,
             CloudJobStatus::Canceled
         );
         assert!(
-            !temp.path().join("jobs").join(format!("{}.json.tmp", job.id)).exists(),
+            !temp
+                .path()
+                .join("jobs")
+                .join(format!("{}.json.tmp", job.id))
+                .exists(),
             "records are written through unique temporaries"
         );
     }

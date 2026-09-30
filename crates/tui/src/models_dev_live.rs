@@ -891,7 +891,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("huge.json");
         let file = std::fs::File::create(&path).expect("create");
-        file.set_len(MAX_CATALOG_BYTES as u64 + 1).expect("sparse size");
+        file.set_len(MAX_CATALOG_BYTES as u64 + 1)
+            .expect("sparse size");
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
