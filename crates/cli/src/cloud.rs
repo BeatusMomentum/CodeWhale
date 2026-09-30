@@ -2942,9 +2942,23 @@ impl std::error::Error for CloudTransportError {
 /// Whether a failed mutating request may still have taken effect.
 fn outcome_unknown(err: &anyhow::Error) -> bool {
     err.downcast_ref::<CloudTransportError>().is_some()
-        || err
-            .downcast_ref::<CloudHttpError>()
-            .is_some_and(|http| http.status >= 500 || http.status == 408)
+        || err.downcast_ref::<CloudHttpError>().is_some_and(|http| {
+            http.status >= 500
+                || http.status == 408
+                || http.code().is_some_and(|code| {
+                    code.ends_with("_outcome_unknown")
+                        || matches!(
+                            code,
+                            "boat_task_replay_expired"
+                                | "boat_task_create_in_progress"
+                                | "boat_task_cleanup_pending"
+                                | "boat_task_receipt_invalid"
+                                | "boat_task_authority_changed"
+                                | "boat_task_stop_unconfirmed"
+                                | "boat_task_usage_pending"
+                        )
+                })
+        })
 }
 
 fn response_error(response: &CloudResponse) -> anyhow::Error {

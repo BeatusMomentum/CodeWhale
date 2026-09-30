@@ -4243,6 +4243,8 @@ fn work_launch_reports_unknown_and_refused_outcomes_without_guessing() {
     for lost in [
         Scripted::Unreachable,
         reply(504, json!({ "code": "gateway_timeout" })),
+        reply(409, json!({ "code": "boat_task_outcome_unknown" })),
+        reply(409, json!({ "code": "boat_task_receipt_invalid" })),
         Scripted::Reply(CloudResponse {
             status: 201,
             body: b"{".to_vec(),
@@ -4272,6 +4274,18 @@ fn work_launch_reports_unknown_and_refused_outcomes_without_guessing() {
         assert!(output.is_empty());
         assert!(!message.contains("tok.abc-123_DEF") && !message.contains("access-secret"));
     }
+    let transport = ScriptedTransport::new(steps(reply(
+        409,
+        json!({ "code": "boat_task_replay_expired" }),
+    )));
+    let (result, output) = run_agent_command(&transport, &secrets, &LAUNCH_ARGV);
+    let message = chain(&result.unwrap_err());
+    assert!(message.contains("launch outcome is unknown"));
+    assert!(message.contains("operator reconciliation is required"));
+    assert!(message.contains("Do not submit a new operation key"));
+    assert!(!message.contains("re-run this exact command"));
+    assert!(output.is_empty());
+
     let transport =
         ScriptedTransport::new(steps(reply(409, json!({ "code": "launch_in_progress" }))));
     let (result, _) = run_agent_command(&transport, &secrets, &LAUNCH_ARGV);

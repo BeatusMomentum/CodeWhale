@@ -946,6 +946,11 @@ pub(super) fn launch<T: CloudTransport, W: Write>(
     body["customerEuPlacementConsent"] = json!(true);
 
     let refused = |err: anyhow::Error| -> anyhow::Error {
+        if http_code(&err) == Some("boat_task_replay_expired") {
+            return err.context(format!(
+                "The launch outcome is unknown and the provider's safe replay window expired. Run `codewhale account agents work-status {id}` and `work-result {id}`; operator reconciliation is required. Do not submit a new operation key or retry the provider allocation"
+            ));
+        }
         if outcome_unknown(&err) {
             return err.context(format!(
                 "The launch outcome is unknown, and a computer may already be running. Run `codewhale account agents work-status {id}` (and `work-cancel {id}` to stop it). To retry, re-run this exact command with the same --operation-key and --confirmation; it replays the launch and cannot start a second computer"
