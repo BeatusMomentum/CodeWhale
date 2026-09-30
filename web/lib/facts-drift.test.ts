@@ -151,6 +151,20 @@ describe("runFactsDrift", () => {
     expect(isRepoFacts(JSON.parse(store.get("facts:current") ?? "null"))).toBe(true);
   });
 
+  it("never replaces a snapshot from a newer source commit with an older one", async () => {
+    installGitHubFixture(VALID_GENERATED_FACTS);
+    const newer = JSON.stringify({ sourceCommittedAt: "2026-07-22T00:00:00Z", version: "9.9.9" });
+    const store = new Map<string, string>([["facts:current", newer]]);
+    const kv = {
+      get: async (key: string) => store.get(key) ?? null,
+      put: async (key: string, value: string) => { store.set(key, value); },
+    };
+    // The fixture's source commit is 2026-07-21T23:00:00Z: an overlapping,
+    // slower run finishing after a newer one.
+    expect(await runFactsDrift({ CURATED_KV: kv })).toEqual({ ok: true, changed: false });
+    expect(store.get("facts:current")).toBe(newer);
+  });
+
   // The scheduled handler discards the result, so the log line is the only
   // signal that the cron stopped refreshing KV.
   it("warns and writes nothing when the derived facts fail validation", async () => {

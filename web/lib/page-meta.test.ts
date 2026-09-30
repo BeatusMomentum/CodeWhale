@@ -71,12 +71,11 @@ describe("page metadata", () => {
   it("advertises only genuine page-body translations", () => {
     for (const [path, locale, expectedLocales, expectedCanonical] of [
       ["/", "ja", locales, `${SITE_URL}/ja`],
-      [
-        "/docs/guide",
-        "fr",
-        ["en", "zh", "fr", "de", "ca", "hi", "tr", "it", "pl", "ar"],
-        `${SITE_URL}/fr/docs/guide`,
-      ],
+      // The guide's steps (its body) ship en/zh only; a French overview
+      // dictionary does not make the page a French translation.
+      ["/docs/guide", "fr", ["en", "zh"], `${SITE_URL}/en/docs/guide`],
+      // /computer-use renders only from its per-locale dictionary.
+      ["/computer-use", "ja", locales, `${SITE_URL}/ja/computer-use`],
       [
         "/docs/guide",
         "ja",

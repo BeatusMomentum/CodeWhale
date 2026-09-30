@@ -11,3 +11,6 @@ export function emitSql(envelope: unknown, options: { publishedBy?: string; publ
 export function readBoundedFile(path: string, maxBytes?: number): Buffer;
 export function readBoundedResponse(response: Response, maxBytes?: number): Promise<string>;
 export function buildEnvelope(options: { privateKey: KeyObject; keyId: string; payload: Record<string, unknown> }): CloudFactsEnvelope;
+export type PostgrestRequest = (path: string, init?: { method?: string; body?: Record<string, unknown>; prefer?: string }) => Promise<unknown>;
+export function publishRelease(request: PostgrestRequest, envelope: CloudFactsEnvelope, row: Record<string, unknown>, publicKey: string): Promise<Record<string, unknown>>;
+export function revokeRelease(request: PostgrestRequest, options: { channel: string; version: number; reason: string; at: string }): Promise<Record<string, unknown>>;

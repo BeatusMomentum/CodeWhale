@@ -99,6 +99,8 @@ export function isAgentDraft(value: unknown): value is AgentDraft {
   );
 }
 
+const MODEL_TIMEOUT_MS = 180_000;
+
 export async function agentChat(
   messages: ChatMessage[],
   apiKey: string,
@@ -109,6 +111,9 @@ export async function agentChat(
   const model = dsEnv?.model ?? process.env.DEEPSEEK_MODEL ?? FALLBACK_MODEL;
   const res = await fetch(`${base}/v1/chat/completions`, {
     method: "POST",
+    // Bounded so a stalled provider cannot hold a cron run until the
+    // platform kills it; generous because high-effort reasoning is slow.
+    signal: AbortSignal.timeout(MODEL_TIMEOUT_MS),
     headers: {
       "Content-Type": "application/json",
       Authorization: `Bearer ${apiKey}`,
@@ -556,6 +561,42 @@ export async function clearDraftResolution(
   await kv.delete(resolutionKey(type, id));
 }
 
+// A post whose GitHub outcome was unknown (network error, 5xx, 408, 429).
+// GitHub has no idempotency key, so this outlives the 15-minute claim: the
+// next attempt looks for the post the earlier one may have created before
+// posting again, however late the retry comes.
+const POST_UNKNOWN_PREFIX = "draft-post-unknown:";
+const POST_UNKNOWN_TTL_SEC = 60 * 60 * 24 * 30;
+
+function postUnknownKey(type: AgentDraftType, id: string): string {
+  return POST_UNKNOWN_PREFIX + draftKey(type, id).slice("draft:".length);
+}
+
+export async function markPostOutcomeUnknown(kv: KVNamespace | undefined, type: AgentDraftType, id: string): Promise<void> {
+  if (!kv) return;
+  await kv.put(postUnknownKey(type, id), JSON.stringify({ at: new Date().toISOString() }), {
+    expirationTtl: POST_UNKNOWN_TTL_SEC,
+  });
+}
+
+/** When the earliest unresolved unknown-outcome attempt happened, if any. */
+export async function getPostOutcomeUnknown(kv: KVNamespace | undefined, type: AgentDraftType, id: string): Promise<string | null> {
+  if (!kv) return null;
+  const raw = await kv.get(postUnknownKey(type, id));
+  if (!raw) return null;
+  try {
+    const at = (JSON.parse(raw) as { at?: unknown }).at;
+    if (typeof at === "string" && Number.isFinite(Date.parse(at))) return at;
+  } catch { /* fall through */ }
+  // An unreadable marker still means "look first"; look back its full life.
+  return new Date(Date.now() - POST_UNKNOWN_TTL_SEC * 1000).toISOString();
+}
+
+export async function clearPostOutcomeUnknown(kv: KVNamespace | undefined, type: AgentDraftType, id: string): Promise<void> {
+  if (!kv) return;
+  await kv.delete(postUnknownKey(type, id));
+}
+
 // --- Public weekly digest records ---
 //
 // The cron writes the structured digest unapproved; only the maintainer's
@@ -810,16 +851,15 @@ export async function logUsage(
   outputTokens: number
 ): Promise<void> {
   if (!kv) return;
-  const date = new Date().toISOString().slice(0, 10);
-  const key = `usage:${date}`;
-  const raw = await kv.get(key);
-  const existing: UsageLog = raw
-    ? JSON.parse(raw)
-    : { date, calls: 0, inputTokens: 0, outputTokens: 0 };
-  existing.calls += 1;
-  existing.inputTokens += inputTokens;
-  existing.outputTokens += outputTokens;
-  await kv.put(key, JSON.stringify(existing), { expirationTtl: 60 * 60 * 24 * 90 }); // 90 days
+  // One record per model call under the day's prefix. KV has no atomic
+  // increment, so a shared daily counter that overlapping cron tasks read,
+  // bumped and wrote back lost calls; an append-only record cannot.
+  const at = new Date().toISOString();
+  const date = at.slice(0, 10);
+  const record: UsageLog = { date, calls: 1, inputTokens, outputTokens };
+  await kv.put(`usage:${date}:${at}:${crypto.randomUUID()}`, JSON.stringify(record), {
+    expirationTtl: 60 * 60 * 24 * 90, // 90 days
+  });
 }
 
 /**

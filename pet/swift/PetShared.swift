@@ -37,11 +37,26 @@ public struct PetSharedFrame: Decodable {
     public let appearance: PetAppearance?
     public let activity: PetActionCue?
     public let producerConnected: Bool, storageAvailable: Bool, audioOwner: String?, audioUnavailable: Bool
+    /// Every rendered field of both poses, not only the points: after the
+    /// owner exits, any local process can bind its loopback port and answer.
     public func validate() throws {
         guard version == 1, UUID(uuidString: identity) != nil, UUID(uuidString: epoch) != nil,
               timeMs.isFinite, timeMs >= 0, digest.count == 16, appearance?.valid != false,
+              ["swim", "dive", "roll", "breathe", "drift", "doze", "wake"].contains(behaviour),
+              ["none", "orient", "approach", "call"].contains(needs),
+              activity.map({ $0.label.count <= 256 && ($0.tool?.count ?? 0) <= 256 && (0...256).contains($0.parallel) }) != false,
+              [state, still.state].allSatisfy(Self.valid), [style, still.style].allSatisfy(Self.valid),
               [points, still.points].allSatisfy({ $0.count == 980 && $0.allSatisfy { $0.count == 2 && $0.allSatisfy { $0.isFinite && abs($0) <= 8 } } })
         else { throw PetCoreError.invalid("Invalid shared pet frame.") }
+    }
+    /// The shared core's validatePetState bounds.
+    static func valid(_ s: PetState) -> Bool {
+        [s.activity, s.coherence, s.attention, s.observed, s.lit].allSatisfy { $0.isFinite && (0...1).contains($0) }
+            && [s.roamX, s.roamY, s.flip].allSatisfy { $0.isFinite && abs($0) <= 1 } && channelIndex(s.channel) != nil
+    }
+    static func valid(_ f: Frame) -> Bool {
+        [f.r, f.g, f.b].allSatisfy { $0.isFinite && (0...255).contains($0) } && f.alpha.isFinite && (0...1).contains(f.alpha)
+            && f.work.isFinite && channelIndex(f.channel) != nil
     }
 }
 
@@ -135,8 +150,16 @@ public struct PetSharedFrame: Decodable {
         var request = URLRequest(url: URL(string: "http://127.0.0.1:\(connection.port)\(path)")!)
         request.setValue("Bearer " + connection.token, forHTTPHeaderField: "Authorization")
         if let body { request.httpMethod = "POST"; request.httpBody = body; request.setValue("application/json", forHTTPHeaderField: "Content-Type") }
-        let (data, response) = try await session.data(for: request)
-        guard data.count <= (path == "/v1/export" ? 64 : 8) * 1024 * 1024, (response as? HTTPURLResponse)?.statusCode == 200 else {
+        // Stream against the bound; never buffer an oversized body before checking it.
+        let limit = (path == "/v1/export" ? 64 : 8) * 1024 * 1024
+        let (bytes, response) = try await session.bytes(for: request)
+        guard response.expectedContentLength <= Int64(limit) else { bytes.task.cancel(); throw PetCoreError.invalid("Shared pet response exceeds its bound.") }
+        var data = Data(); data.reserveCapacity(Int(max(0, response.expectedContentLength)))
+        for try await byte in bytes {
+            guard data.count < limit else { bytes.task.cancel(); throw PetCoreError.invalid("Shared pet response exceeds its bound.") }
+            data.append(byte)
+        }
+        guard (response as? HTTPURLResponse)?.statusCode == 200 else {
             let error = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
             let message = error?["error"] as? String ?? "Shared pet unavailable."
             if path == "/v1/action", (response as? HTTPURLResponse)?.statusCode == 409, !message.contains("storage") { pending = nil }

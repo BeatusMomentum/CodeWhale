@@ -26,8 +26,13 @@ suffix over the finding's full identity, max 80 chars — so unchanged findings
 dedup and changed findings land as new drafts. Semantic-drift model output is
 validated and capped (10 drafts/run) before any KV writes.
 
-Usage logged to:
-  usage:<YYYY-MM-DD>
+A post whose GitHub outcome was unknown (network error, 5xx, 408, 429) leaves
+  draft-post-unknown:<type>:<id>              (30 days; the next post of that
+                                               draft first looks on GitHub for
+                                               the earlier attempt's post)
+
+Usage logged to (one record per model call; sum the day's prefix):
+  usage:<YYYY-MM-DD>:<timestamp>:<uuid>
 ```
 
 ## Cron schedule
@@ -57,7 +62,9 @@ All drafts follow these rules:
 - Each cron invocation caps at ~30k input tokens and ~2k output tokens.
 - Issue/PR bodies are truncated to 1000–4000 chars before sending to the model.
 - Deduplication: `hasFreshDraft` checks if a draft already exists that's newer than the item's `updated_at`. Skips if so.
-- Token usage is logged to `usage:<YYYY-MM-DD>` KV keys (retained 90 days).
+- Token usage is logged as one `usage:<YYYY-MM-DD>:…` KV record per model call
+  (retained 90 days); list the day's prefix and sum `calls`/`inputTokens`/
+  `outputTokens`. Records are append-only because KV has no atomic increment.
 - If `DEEPSEEK_API_KEY` is missing or the API errors, the cron returns 200 with `{ skipped: true, reason }` — never crashes, never retry-loops.
 
 ## Maintainer review surface

@@ -12,6 +12,7 @@
  * Categories that come back empty fall through to the page's static items —
  * the maintainer can adopt label-driven roadmap incrementally.
  */
+import { OUTBOUND_TIMEOUT_MS } from "./bounded-body";
 import { truncateChars } from "./truncate";
 
 const REPO = process.env.GITHUB_REPO ?? "Hmbown/CodeWhale";
@@ -48,7 +49,7 @@ async function gh<T>(url: string, ghToken?: string): Promise<T | null> {
   };
   if (ghToken) headers["Authorization"] = `Bearer ${ghToken}`;
   try {
-    const r = await fetch(url, { headers });
+    const r = await fetch(url, { headers, signal: AbortSignal.timeout(OUTBOUND_TIMEOUT_MS) });
     if (!r.ok) return null;
     return (await r.json()) as T;
   } catch {

@@ -12,6 +12,7 @@
  * fixes itself within one cron tick — no redeploy. Semantic drift (a new
  * feature should be advertised on the homepage) is still left to humans.
  */
+import { fetchBoundedText } from "./bounded-body";
 import type {
   PublishedReleaseFact,
   RepoFacts,
@@ -46,9 +47,8 @@ async function fetchText(
   };
   if (ghToken) headers["Authorization"] = `Bearer ${ghToken}`;
   try {
-    const r = await fetch(`${RAW_ROOT}/${revision}/${path}`, { headers });
-    if (!r.ok) return null;
-    return await r.text();
+    const r = await fetchBoundedText(`${RAW_ROOT}/${revision}/${path}`, { headers });
+    return r.ok ? r.text : null;
   } catch {
     return null;
   }
@@ -62,12 +62,12 @@ async function fetchSourceMarker(ghToken?: string): Promise<SourceMarker | null>
   };
   if (ghToken) headers.Authorization = `Bearer ${ghToken}`;
   try {
-    const response = await fetch(
+    const response = await fetchBoundedText(
       "https://api.github.com/repos/Hmbown/CodeWhale/commits/main",
       { headers },
     );
     if (!response.ok) return null;
-    const json = (await response.json()) as {
+    const json = JSON.parse(response.text) as {
       sha?: string;
       commit?: { committer?: { date?: string } };
     };
@@ -208,9 +208,9 @@ async function fetchLatestPublishedRelease(
   };
   if (ghToken) headers["Authorization"] = `Bearer ${ghToken}`;
   try {
-    const r = await fetch("https://api.github.com/repos/Hmbown/CodeWhale/releases/latest", { headers });
+    const r = await fetchBoundedText("https://api.github.com/repos/Hmbown/CodeWhale/releases/latest", { headers });
     if (!r.ok) return null;
-    const j = (await r.json()) as {
+    const j = JSON.parse(r.text) as {
       tag_name?: string;
       published_at?: string;
     };
@@ -415,6 +415,14 @@ export async function runFactsDrift(env: { CURATED_KV?: KVNamespace; GITHUB_TOKE
     } catch {
       // A truncated or legacy cache is replaced by the newly derived snapshot.
     }
+  }
+
+  // Overlapping runs can finish out of order; a snapshot from an older source
+  // commit never replaces a newer one (KV has no compare-and-set, so this
+  // narrows the race to the read-to-write window rather than closing it).
+  const cachedAt = Date.parse(String(cached.sourceCommittedAt ?? ""));
+  if (cachedRaw && Number.isFinite(cachedAt) && cachedAt > Date.parse(String(remote.sourceCommittedAt))) {
+    return { ok: true, changed: false };
   }
 
   const diffs = diff(cached, remote);
