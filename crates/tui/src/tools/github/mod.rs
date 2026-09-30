@@ -328,6 +328,50 @@ mod tests {
         );
     }
 
+    /// D03-03: only the schema's `issue`/`pr` select a thread kind. Any other
+    /// spelling is refused before `gh` runs instead of commenting on an issue.
+    #[tokio::test]
+    async fn comment_refuses_a_target_outside_the_schema_enum() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let context = ToolContext::new(tmp.path());
+        let tool = GithubTool::new("github");
+        for target in ["PR", "pull_request", "pull"] {
+            let error = tool
+                .execute(
+                    json!({
+                        "action": "comment",
+                        "target": target,
+                        "number": 7,
+                        "body": "evidence",
+                        "evidence": {},
+                        "dry_run": true
+                    }),
+                    &context,
+                )
+                .await
+                .expect_err("an unknown target must not resolve to an issue")
+                .to_string();
+            assert!(error.contains("target must be"), "{target}: {error}");
+        }
+        for target in ["issue", "pr"] {
+            let result = tool
+                .execute(
+                    json!({
+                        "action": "comment",
+                        "target": target,
+                        "number": 7,
+                        "body": "evidence",
+                        "evidence": {},
+                        "dry_run": true
+                    }),
+                    &context,
+                )
+                .await
+                .expect("schema targets stay valid");
+            assert!(result.content.contains(&format!("{target} #7")));
+        }
+    }
+
     #[test]
     fn missing_close_evidence_refuses() {
         let input = json!({
