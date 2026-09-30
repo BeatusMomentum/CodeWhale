@@ -902,7 +902,13 @@ impl SnapshotRepo {
                         rel.display()
                     )));
                 }
-                Err(error) if error.kind() == io::ErrorKind::NotADirectory => {
+                // Unix reports a path under a live file as NotADirectory;
+                // Windows reports NotFound, so look for the file itself.
+                Err(error)
+                    if error.kind() == io::ErrorKind::NotADirectory
+                        || (error.kind() == io::ErrorKind::NotFound
+                            && ancestor_is_not_a_directory(&self.work_tree, rel)) =>
+                {
                     return Err(io_other(format!(
                         "'{}' requires a file/directory transition; nothing was restored",
                         rel.display()
@@ -2376,6 +2382,17 @@ pub fn workspace_relative_path(workspace: &Path, raw: &str) -> Option<PathBuf> {
     is_safe_relative_path(&rel).then_some(rel)
 }
 
+/// Whether some existing ancestor of `rel` (within `root`) is not a
+/// directory: restoring `rel` would then turn a file into a directory.
+fn ancestor_is_not_a_directory(root: &Path, rel: &Path) -> bool {
+    rel.ancestors()
+        .skip(1)
+        .filter(|ancestor| !ancestor.as_os_str().is_empty())
+        .any(|ancestor| {
+            std::fs::symlink_metadata(root.join(ancestor)).is_ok_and(|metadata| !metadata.is_dir())
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2738,6 +2755,29 @@ mod tests {
                 assert_eq!(std::fs::read(&child).unwrap(), b"new child");
             }
         }
+    }
+
+    #[test]
+    fn a_path_under_a_live_file_needs_a_transition() {
+        let tmp = tempdir().unwrap();
+        std::fs::write(tmp.path().join("a"), b"file").unwrap();
+        std::fs::create_dir(tmp.path().join("d")).unwrap();
+        assert!(super::ancestor_is_not_a_directory(
+            tmp.path(),
+            Path::new("a/child")
+        ));
+        assert!(!super::ancestor_is_not_a_directory(
+            tmp.path(),
+            Path::new("d/child")
+        ));
+        assert!(!super::ancestor_is_not_a_directory(
+            tmp.path(),
+            Path::new("missing/child")
+        ));
+        assert!(!super::ancestor_is_not_a_directory(
+            tmp.path(),
+            Path::new("a")
+        ));
     }
 
     /// A failed safety snapshot refuses before a symlinked parent could be
