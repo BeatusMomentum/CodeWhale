@@ -850,6 +850,10 @@ fn start_lane(request: LaneStartRequest) -> Result<()> {
     // Validate the worktree flags before creating the pending record, so a
     // bad pairing never leaves an orphaned `pending` lane in the registry.
     let worktree_request = validate_lane_worktree_flags(worktree_repo, branch, worktree_path)?;
+    let log_proxy = (kind == RuntimeBackendKind::Tmux)
+        .then(std::env::current_exe)
+        .transpose()
+        .context("resolve current Codewhale executable for tmux log proxy")?;
     let reg = LaneRegistry::open_default()?;
     let mut record = reg.create_pending(workflow, fleet, issue, goal, kind, worktree_ttl_secs)?;
     let worktree = worktree_request.map(|(repo_root, branch_name, worktree_path)| {
@@ -875,14 +879,18 @@ fn start_lane(request: LaneStartRequest) -> Result<()> {
         command: cmd,
         cwd,
         environment,
-        log_proxy: (kind == RuntimeBackendKind::Tmux)
-            .then(std::env::current_exe)
-            .transpose()
-            .context("resolve current Codewhale executable for tmux log proxy")?,
+        log_proxy,
         worktree,
     };
     let backend = resolve_backend(kind);
-    backend.start(&reg, &mut record, &spec)?;
+    if let Err(error) = backend.start(&reg, &mut record, &spec) {
+        // A start that failed before launch (worktree provisioning, the
+        // first log write) left the lane `pending` forever; reconcile skips
+        // pending lanes. Close it as failed. A lane a backend already made
+        // terminal is left as it is.
+        let _ = reg.mark_terminal_if_active(&mut record, LaneStatus::Failed);
+        return Err(error);
+    }
     println!("started {}", record.id);
     println!("status:  {}", record.status.as_str());
     println!("runtime: {}", record.runtime.as_str());
