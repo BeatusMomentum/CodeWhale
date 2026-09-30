@@ -245,8 +245,6 @@ pub enum InstallError {
     OversizedTarball { limit: u64 },
     #[error("missing SKILL.md in archive")]
     MissingSkillMd,
-    #[error("SKILL.md frontmatter missing required field: {0}")]
-    MissingFrontmatterField(&'static str),
     #[error("symlinks are not allowed in skill tarballs")]
     SymlinkRejected,
     #[error(
