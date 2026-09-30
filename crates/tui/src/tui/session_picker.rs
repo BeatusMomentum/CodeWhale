@@ -97,11 +97,14 @@ struct PendingPreview {
     cell: Arc<Mutex<Option<PreviewLoad>>>,
 }
 
+/// One session-store listing, or why the store could not be listed.
+type SessionListing = Result<Vec<SessionMetadata>, String>;
+
 /// The session-store listing running off the event loop (U08-09). The
 /// store's metadata scan grows with every saved session, so the picker opens
 /// at once and fills in when the listing lands.
 struct PendingSessionList {
-    cell: Arc<Mutex<Option<Result<Vec<SessionMetadata>, String>>>>,
+    cell: Arc<Mutex<Option<SessionListing>>>,
     /// Row to land on once the list arrives (`new_selecting`).
     select: Option<String>,
 }
@@ -200,11 +203,7 @@ impl SessionPickerView {
 
     /// Install a finished store listing. A failure is shown as a failure —
     /// never as an empty store — and the list stays empty.
-    fn apply_session_list(
-        &mut self,
-        listed: Result<Vec<SessionMetadata>, String>,
-        select: Option<String>,
-    ) {
+    fn apply_session_list(&mut self, listed: SessionListing, select: Option<String>) {
         match listed {
             Ok(sessions) => {
                 self.sessions = sessions;
@@ -845,7 +844,7 @@ impl SessionPickerView {
 
 /// List the saved-session store. Blocking; runs on the blocking pool when a
 /// runtime is available.
-fn list_session_store() -> Result<Vec<SessionMetadata>, String> {
+fn list_session_store() -> SessionListing {
     SessionManager::default_location()
         .and_then(|manager| manager.list_sessions())
         .map_err(|error| error.to_string())
