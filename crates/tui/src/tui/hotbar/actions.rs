@@ -1796,7 +1796,7 @@ mod tests {
         let palette_slash_ids = build_command_palette_entries(
             Locale::En,
             tmp.path(),
-            true,
+            crate::skills::SkillDiscoveryMode::CodeWhaleOnly,
             tmp.path(),
             &tmp.path().join("mcp.json"),
             None,
