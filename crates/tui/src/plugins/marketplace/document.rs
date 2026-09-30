@@ -8,7 +8,7 @@
 //! command and the HTTP API can never disagree about what would be fetched.
 
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use super::parsers::{self, MarketplaceDocument};
 use super::store::StoredMarketplaceCatalog;
@@ -151,17 +151,18 @@ pub fn resolve_candidate_install<'a>(
         };
     }
     match &candidate.install_plan {
-        MarketplaceInstallPlan::Supported { spec, source_kind } => {
-            CatalogInstallResolution::Supported {
-                spec: resolve_spec(
-                    &entry.source_path,
-                    entry.catalog.format,
-                    &candidate.source,
-                    spec,
-                ),
+        MarketplaceInstallPlan::Supported { spec, source_kind } => match resolve_spec(
+            &entry.source_path,
+            entry.catalog.format,
+            &candidate.source,
+            spec,
+        ) {
+            Ok(spec) => CatalogInstallResolution::Supported {
+                spec,
                 source_kind: source_kind.clone(),
-            }
-        }
+            },
+            Err(reason) => CatalogInstallResolution::Unsupported { reason },
+        },
         MarketplaceInstallPlan::Unsupported { reason, .. } => {
             CatalogInstallResolution::Unsupported {
                 reason: reason.clone(),
@@ -170,14 +171,28 @@ pub fn resolve_candidate_install<'a>(
     }
 }
 
+/// A catalog's local source must name a directory inside the catalog's own
+/// tree. An absolute path, a root or drive prefix, or any `..` component would
+/// let catalog metadata point the installer at an arbitrary directory on this
+/// machine, so such an entry is not installable from the catalog; installing a
+/// directory outside it stays an explicit `/plugin install path:...`.
 fn resolve_spec(
     source_path: &str,
     format: MarketplaceFormat,
     source: &MarketplaceSourceSpec,
     spec: &str,
-) -> String {
+) -> Result<String, String> {
     if let MarketplaceSourceSpec::LocalPath { path } = source
-        && path.is_relative()
+        && !path
+            .components()
+            .all(|part| matches!(part, Component::Normal(_) | Component::CurDir))
+    {
+        return Err(format!(
+            "Local catalog source `{}` leaves the catalog directory; only paths inside it (no absolute paths or `..`) are installable from a catalog",
+            path.display()
+        ));
+    }
+    if let MarketplaceSourceSpec::LocalPath { path } = source
         && let Some(dir) = Path::new(source_path).parent()
     {
         // Claude keeps its catalog in a manifest-only metadata directory;
@@ -189,9 +204,9 @@ fn resolve_spec(
         } else {
             dir
         };
-        return format!("path:{}", dir.join(path).display());
+        return Ok(format!("path:{}", dir.join(path).display()));
     }
-    spec.to_string()
+    Ok(spec.to_string())
 }
 
 /// Resolve a user-supplied document path to an existing regular file without
