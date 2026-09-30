@@ -106,6 +106,7 @@ fn undo_retry_apply_path_keeps_engine_request_and_reopened_session_consistent() 
             canned::simple_text_turn("undone answer"),
             canned::simple_text_turn("retry answer one"),
             canned::simple_text_turn("retry answer two"),
+            canned::simple_text_turn("answer after reopen"),
         ]));
         let (engine, mut handle) = Engine::new_with_model_client(
             EngineConfig {
@@ -265,6 +266,61 @@ fn undo_retry_apply_path_keeps_engine_request_and_reopened_session_consistent() 
             "undo performs no inference"
         );
 
+        // Resume the durable record through the existing UI projection and
+        // SyncSession apply action, then inspect the actual next model request.
+        // File LoadSession always respawns a real client, so use the same
+        // loaded-session projection with our injected model client here.
+        apply_loaded_session(&mut app, &mut config, &reopened).unwrap();
+        let restore = AppAction::SyncSession {
+            session_id: app.current_session_id.clone(),
+            messages: app.api_messages.as_ref().clone(),
+            system_prompt: app.system_prompt.clone(),
+            model: app.model.clone(),
+            workspace: app.workspace.clone(),
+            mode: app.mode,
+        };
+        for action in [restore, AppAction::SendMessage("after reopen".into())] {
+            apply_command_result(
+                &mut terminal,
+                &mut app,
+                &mut handle,
+                &tasks,
+                &mut config,
+                commands::CommandResult {
+                    message: None,
+                    action: Some(action),
+                    is_error: false,
+                },
+            )
+            .await
+            .unwrap();
+        }
+        settled(&mut app, &handle, "answer after reopen").await;
+        let requests = mock.captured_requests();
+        assert_eq!(requests.len(), 5);
+        assert_eq!(
+            prompts(&requests.last().unwrap().messages),
+            ["keep this", "after reopen"]
+        );
+        let inbound = serde_json::to_string(&requests.last().unwrap().messages).unwrap();
+        assert!(!inbound.contains("retry this"));
+        assert!(!inbound.contains("undone answer"));
+        assert!(!inbound.contains("retry answer"));
+
+        // Return to the retained exchange before probing durable-save failure.
+        let result = commands::execute("/undo", &mut app);
+        apply_command_result(
+            &mut terminal,
+            &mut app,
+            &mut handle,
+            &tasks,
+            &mut config,
+            result,
+        )
+        .await
+        .unwrap();
+        assert_eq!(prompts(&app.api_messages), ["keep this"]);
+
         // Portable save failure: block the canonical file with a directory.
         // Preserve the last durable snapshot as a sibling for inspection.
         std::fs::rename(&path, path.with_extension("before-failure")).unwrap();
@@ -282,7 +338,7 @@ fn undo_retry_apply_path_keeps_engine_request_and_reopened_session_consistent() 
         .unwrap();
         assert_eq!(
             mock.captured_requests().len(),
-            4,
+            5,
             "save failure must forbid retry inference"
         );
         assert!(
@@ -334,7 +390,7 @@ fn undo_retry_apply_path_keeps_engine_request_and_reopened_session_consistent() 
                 .text
                 .contains("retry was not sent")
         );
-        assert_eq!(mock.captured_requests().len(), 4);
+        assert_eq!(mock.captured_requests().len(), 5);
         tasks.shutdown_and_wait().await.unwrap();
         assert!(actor.try_send(PersistRequest::Shutdown));
         actor_task.await.unwrap();
