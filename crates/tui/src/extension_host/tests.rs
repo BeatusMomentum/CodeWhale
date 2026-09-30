@@ -2722,6 +2722,16 @@ async fn memory_hog_is_stopped(
         Err(ToolError::NotAvailable { message }) => {
             assert!(message.contains("extension host exited"), "{message}");
         }
+        // Linux (RLIMIT_DATA) and Windows (Job Object): the kernel refuses the
+        // allocation, the runtime throws inside the tool, and the host lives on.
+        Err(ToolError::ExecutionFailed { message, .. })
+            if matches!(
+                memory,
+                MemoryEnforcement::Rlimit | MemoryEnforcement::JobObject
+            ) =>
+        {
+            assert!(message.contains("allocation failed"), "{message}");
+        }
         Err(other) => panic!("unexpected error: {other:?}"),
     }
     let stopped_by = match memory {
