@@ -2315,23 +2315,26 @@ mod tests {
 
     #[test]
     fn runtime_surface_review_documented_ssh_host_loads() {
-        // Windows checkouts may carry CRLF line endings.
-        let docs = include_str!("../../../../docs/zh_hans/FLEET.md").replace("\r\n", "\n");
-        let example = docs
-            .split_once("### Worker 认证")
-            .expect("worker authentication guidance")
-            .1
-            .split("```json\n")
-            .skip(1)
-            .filter_map(|block| {
-                serde_json::from_str::<serde_json::Value>(block.split("```").next()?).ok()
-            })
-            .find(|value| value["id"] == "builder-1")
-            .expect("documented SSH worker example");
-        let host: FleetHostSpec = serde_json::from_value(example["host"].clone()).unwrap();
-        let config = SshFleetHostConfig::from_host_spec(&host)
-            .expect("documented host must load without migration errors");
-        assert!(config.known_hosts.is_some());
+        for docs in [
+            include_str!("../../../../docs/FLEET.md"),
+            include_str!("../../../../docs/zh_hans/FLEET.md"),
+        ] {
+            // Match the actual example, not a translated section heading.
+            // Windows checkouts may carry CRLF line endings.
+            let docs = docs.replace("\r\n", "\n");
+            let example = docs
+                .split("```json\n")
+                .skip(1)
+                .filter_map(|block| {
+                    serde_json::from_str::<serde_json::Value>(block.split("```").next()?).ok()
+                })
+                .find(|value| value["id"] == "builder-1")
+                .expect("documented SSH worker example");
+            let host: FleetHostSpec = serde_json::from_value(example["host"].clone()).unwrap();
+            let config = SshFleetHostConfig::from_host_spec(&host)
+                .expect("documented host must load without migration errors");
+            assert!(config.known_hosts.is_some());
+        }
     }
 
     #[test]

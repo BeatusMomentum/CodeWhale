@@ -1667,6 +1667,9 @@ mod tests {
     /// A forced delete of an existing absolute path inside the workspace is
     /// ordinary cleanup, not a system-tree destroyer. The workspace root
     /// itself, a `..` escape, a symlink hop out, and a system path all hold.
+    // POSIX rm path clearance is exercised with Unix filesystem paths.
+    // Windows live-posture execution has native shell fixtures in subagent tests.
+    #[cfg(unix)]
     #[test]
     fn absolute_forced_delete_inside_the_workspace_is_not_a_destroyer() {
         let workspace = tempfile::tempdir().expect("tempdir");
@@ -1732,6 +1735,9 @@ mod tests {
         }
     }
 
+    // POSIX rm path clearance is exercised with Unix filesystem paths.
+    // Windows live-posture execution has native shell fixtures in subagent tests.
+    #[cfg(unix)]
     #[test]
     fn wrappers_cannot_borrow_workspace_path_clearance() {
         let workspace = tempfile::tempdir().expect("workspace");
@@ -1780,6 +1786,9 @@ mod tests {
         assert_eq!(std::fs::read(sentinel).unwrap(), b"keep");
     }
 
+    // POSIX rm path clearance is exercised with Unix filesystem paths.
+    // Windows live-posture execution has native shell fixtures in subagent tests.
+    #[cfg(unix)]
     #[test]
     fn full_access_workspace_cleanup_stays_clear() {
         use crate::core::engine::{AutoReviewPlanDecision, auto_review_plan_decision_for_context};
@@ -1842,6 +1851,9 @@ mod tests {
 
     /// Second review of 05264125e: targets whose meaning is only known when
     /// the shell runs never count as inside the workspace.
+    // POSIX rm path clearance is exercised with Unix filesystem paths.
+    // Windows live-posture execution has native shell fixtures in subagent tests.
+    #[cfg(unix)]
     #[test]
     fn unknowable_or_unsafe_targets_are_never_inside_the_workspace() {
         let workspace = tempfile::tempdir().expect("tempdir");

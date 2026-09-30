@@ -458,6 +458,11 @@ Runtime 的宿主 adapter 边界支持本地子进程与显式 SSH worker。宿�
 
 SSH worker 通过系统 `ssh` 客户端以 `BatchMode=yes` 与有界连接超时运行。远程环境变量通过 OpenSSH `SendEnv` 发送；值不会嵌入本地 ssh argv 或 fleet 日志。
 
+宿主密钥必须事先受信任：连接使用 `StrictHostKeyChecking=yes`，不会自动接受新密钥。
+显式配置 `known_hosts` 文件时，信任仅来自该文件；省略时，OpenSSH 使用其常规宿主密钥库。
+请先核实宿主密钥，再加入相应密钥库。旧的 `host_key_fingerprint` 字段不受支持，配置后会被拒绝；
+请将它迁移为已核实的 `known_hosts` 条目。`identity` 文件选择客户端登录密钥，并不验证远程宿主。
+
 示例 SSH worker 规范：
 
 ```json
@@ -470,6 +475,7 @@ SSH worker 通过系统 `ssh` 客户端以 `BatchMode=yes` 与有界连接超时
     "user": "codewhale",
     "port": 22,
     "identity": "~/.ssh/codewhale_fleet",
+    "known_hosts": "~/.ssh/codewhale_fleet_known_hosts",
     "working_directory": "/srv/codewhale/work",
     "env_allowlist": ["CODEWHALE_PROFILE"],
     "codewhale_binary": "/usr/local/bin/codewhale"

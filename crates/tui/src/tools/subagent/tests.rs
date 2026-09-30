@@ -24665,7 +24665,7 @@ mod child_permission_gate {
             Some(unreachable_client()),
             Some(live.clone()),
         );
-        let call = json!({"command": "echo built | cat"});
+        let call = json!({"command": GUARDIAN_PIPELINE});
         let err = registry
             .execute("agent_gate", "bash", call.clone())
             .await
@@ -24705,7 +24705,16 @@ mod child_permission_gate {
         let workspace = registry.gate_runtime.context.workspace.clone();
         let build = workspace.join("build");
         std::fs::create_dir_all(build.join("out")).unwrap();
-        let command = format!("rm -rf {}", build.display());
+        #[cfg(windows)]
+        let command = format!(
+            "Remove-Item -LiteralPath '{}' -Recurse -Force",
+            build.to_string_lossy().replace('\'', "''")
+        );
+        #[cfg(not(windows))]
+        let command = format!(
+            "rm -rf {}",
+            shlex::try_quote(&build.to_string_lossy()).unwrap()
+        );
         // Parent classification is covered in tui::auto_review; this runtime
         // test proves the child actually executes and preserves the gate receipt.
         registry
