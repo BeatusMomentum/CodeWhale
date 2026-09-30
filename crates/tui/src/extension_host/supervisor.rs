@@ -4,18 +4,43 @@
 //! The existing Rust manager owns heartbeat, crash budget, generation changes,
 //! and receipt-checked replay; this channel never replays a tool call.
 //!
-//! **OS sandbox.** Where Codewhale's default command sandbox is available
-//! (Seatbelt on macOS; bubblewrap stays opt-in for shell commands and is not
-//! used here) the host runs under a workspace-write profile rooted at
+//! **OS sandbox** ([`HostSandbox`]: the one value `/plugin`, doctor and the
+//! start diagnostic report). The host runs under Codewhale's command sandbox
+//! with a workspace-write policy rooted at
 //! `$CODEWHALE_HOME/extension-host/data`: no direct network, writes only
 //! there and in the temp dirs, and **no reads** of the Codewhale homes
 //! (everything but the bundle, its data dir and plugin code), the Codex and
 //! DSH credential homes, and the credential-store default deny-list
 //! (`sandbox::read_guard`). Other user-readable files stay readable —
-//! including `.env` files, whose filename rule has no Seatbelt subpath form —
-//! and Mach services are not restricted, so this is defense-in-depth, not a
-//! containment boundary. Elsewhere (Linux, Windows) the host runs unsandboxed
-//! with the user's permissions, and `/plugin` says so.
+//! including `.env` files, whose filename rule has no Seatbelt subpath or
+//! bubblewrap mount form — so this is defense-in-depth, not a containment
+//! boundary.
+//! * macOS: Seatbelt. Mach services are not restricted.
+//! * Linux: bubblewrap (`/usr/bin/bwrap`, the shell's builder), used without
+//!   the shell's `prefer_bwrap` opt-in. Every launch first runs the finished
+//!   wrapper around `<runtime> --version` ([`probe_bwrap`]). When bwrap is
+//!   missing or cannot start — e.g. unprivileged user namespaces blocked by
+//!   Ubuntu 24.04's `kernel.apparmor_restrict_unprivileged_userns` — the host
+//!   starts unsandboxed and every surface says so with bwrap's own error;
+//!   never a silent downgrade. bwrap can mask only what exists, so each
+//!   Codewhale home is masked whole and its readable entries are bound again
+//!   (`sandbox::bwrap_exception_args`): an entry created after launch is
+//!   denied, as on macOS.
+//! * Windows: unsandboxed (the Job Object contains the process tree; that is
+//!   not isolation), and `/plugin` says so.
+//!
+//! Known limits under bubblewrap: a default-deny-list credential store
+//! created after launch stays readable (Seatbelt denies it by name); a
+//! Codewhale home, or a readable entry such as `plugins/`, that does not exist
+//! at launch is not masked, or not visible, until the host restarts; bwrap
+//! anywhere but `/usr/bin/bwrap` is not used; the probe costs one extra
+//! runtime start per launch. The reported pid is bwrap's. The host runs in
+//! bwrap's PID namespace, where its parent is bwrap's init and never
+//! changes, so the host's own parent watchdog (`extension-host/src/main.ts`)
+//! cannot fire; `--die-with-parent` is what ends it with the core. That is
+//! a parent-death signal tied to the thread that spawned bwrap, a Tokio
+//! worker that lives as long as the runtime. Plugin child processes end with
+//! the namespace when bwrap's init loses the host.
 //!
 //! **Runtime.** Node (the default) or Bun (opt-in: `runtime = "bun"`, or
 //! `"auto"`, which prefers a supported Bun), chosen once per manager
@@ -116,8 +141,7 @@ pub(crate) struct HostLaunch {
     pub program: PathBuf,
     pub args: Vec<String>,
     pub cwd: PathBuf,
-    /// `seatbelt` / `bwrap`, or `None` when the host runs unsandboxed.
-    pub sandbox: Option<String>,
+    pub sandbox: HostSandbox,
     /// Environment the sandbox wrapper adds (`CODEWHALE_SANDBOX`, …).
     pub sandbox_env: Vec<(String, String)>,
     /// The runtime inside the wrapper; `host/hello` must report the same one.
@@ -129,6 +153,44 @@ pub(crate) struct HostLaunch {
     /// How the cap is meant to be enforced; a macOS Bun host confirms its
     /// jetsam limit in `host/hello` or initialization is refused.
     pub memory: MemoryEnforcement,
+}
+
+/// Whether the host runs under an OS sandbox, and why not when it does not
+/// (module docs). Settled by [`plan_launch`]; never inferred afterwards.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HostSandbox {
+    /// Under this wrapper, named as `sandbox::SandboxType` names it
+    /// (`macos-seatbelt`, `linux-bwrap`).
+    Wrapped(String),
+    /// With the user's permissions, for this reason.
+    Unsandboxed(String),
+}
+
+impl HostSandbox {
+    /// The wrapper's name, or `none: <reason>`, for one-line diagnostics.
+    #[must_use]
+    pub fn label(&self) -> String {
+        match self {
+            Self::Wrapped(name) => name.clone(),
+            Self::Unsandboxed(reason) => format!("none: {reason}"),
+        }
+    }
+}
+
+/// What `/plugin` and doctor say about the sandbox.
+impl std::fmt::Display for HostSandbox {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Wrapped(name) => write!(
+                f,
+                "{name} sandbox (no direct network; the Codewhale home except plugin code, the Codex and DSH credential homes and the default credential stores are unreadable; other files you can read, such as project .env files, are not protected)"
+            ),
+            Self::Unsandboxed(reason) => write!(
+                f,
+                "UNSANDBOXED ({reason}): host code runs with your user permissions"
+            ),
+        }
+    }
 }
 
 /// Environment variable carrying the jetsam limit a macOS Bun host applies to
@@ -299,12 +361,22 @@ const HOST_DENIED_HOME_ENTRIES: &[&str] = &[
 ];
 
 /// Paths the host process must never read, even though the sandbox otherwise
-/// grants full-disk read: the curated credential-store defaults; every entry
-/// of Codewhale's homes (the runtime home, the ambient `~/.codewhale`, and the
-/// legacy `~/.deepseek`) except [`HOST_READABLE_HOME_ENTRIES`]; and the Codex
-/// and DSH homes whose credential files Codewhale itself reads. Blocking.
-pub(crate) fn host_denied_read_paths(home: &Path) -> Vec<PathBuf> {
+/// grants full-disk read, and the exceptions inside them: the curated
+/// credential-store defaults; Codewhale's homes (the runtime home, the ambient
+/// `~/.codewhale`, and the legacy `~/.deepseek`) except
+/// [`HOST_READABLE_HOME_ENTRIES`]; and the Codex and DSH homes whose
+/// credential files Codewhale itself reads. Blocking.
+///
+/// With `whole_homes` (bubblewrap, which can mask only what exists) each home
+/// is denied whole and its readable entries come back as exceptions to bind
+/// again. Without it (Seatbelt, which matches paths that do not exist yet)
+/// every other entry is denied by name and there are no exceptions.
+pub(crate) fn host_denied_read_paths(
+    home: &Path,
+    whole_homes: bool,
+) -> (Vec<PathBuf>, Vec<PathBuf>) {
     let mut paths = crate::sandbox::read_guard::ReadDenylist::build(true, &[], &[]).subtree_paths();
+    let mut exceptions: Vec<PathBuf> = Vec::new();
     let mut push = |path: PathBuf| {
         if !paths.contains(&path) {
             paths.push(path);
@@ -318,6 +390,16 @@ pub(crate) fn host_denied_read_paths(home: &Path) -> Vec<PathBuf> {
         roots.push(user.join(".deepseek"));
     }
     for root in roots {
+        if whole_homes {
+            for entry in HOST_READABLE_HOME_ENTRIES {
+                let readable = root.join(entry);
+                if !exceptions.contains(&readable) {
+                    exceptions.push(readable);
+                }
+            }
+            push(root);
+            continue;
+        }
         let mut names: Vec<std::ffi::OsString> = HOST_DENIED_HOME_ENTRIES
             .iter()
             .chain(std::iter::once(&codewhale_config::CONFIG_FILE_NAME))
@@ -358,64 +440,237 @@ pub(crate) fn host_denied_read_paths(home: &Path) -> Vec<PathBuf> {
     if let Some(dsh_home) = codewhale_config::default_dsh_credentials_path().parent() {
         push(dsh_home.to_path_buf());
     }
-    paths
+    (paths, exceptions)
 }
 
 /// Plan the host launch. Blocking (creates the data dir, canonicalizes the
-/// deny-list); call from `spawn_blocking`.
+/// deny-list, and on Linux runs the bwrap probe); call from `spawn_blocking`.
 pub(crate) fn plan_launch(
     runtime: &HostRuntime,
     bundle: &Path,
     home: &Path,
     memory_cap: u64,
 ) -> Result<HostLaunch, String> {
-    use crate::sandbox::{CommandSpec, SandboxManager, SandboxPolicy, SandboxType};
+    let data = host_data_dir(home)?;
+    let mut args = runtime_args(runtime);
+    args.push(bundle.to_string_lossy().into_owned());
+    let wrapped = wrap_host(&runtime.path, &args, &data, home);
+    host_launch(runtime, args, data, memory_cap, wrapped)
+}
+
+/// The sandbox a host started now would get, planned (and on Linux probed)
+/// exactly as [`plan_launch`] does, for doctor. Blocking; creates the data
+/// dir, as a launch would.
+pub(crate) fn planned_sandbox(runtime: &HostRuntime, home: &Path) -> Result<HostSandbox, String> {
+    let data = host_data_dir(home)?;
+    Ok(
+        match wrap_host(&runtime.path, &runtime_args(runtime), &data, home) {
+            Ok(wrapped) => HostSandbox::Wrapped(wrapped.name),
+            Err(reason) => HostSandbox::Unsandboxed(reason),
+        },
+    )
+}
+
+fn host_data_dir(home: &Path) -> Result<PathBuf, String> {
     let data = home.join("extension-host").join("data");
     std::fs::create_dir_all(&data)
         .map_err(|error| format!("cannot create {}: {error}", data.display()))?;
-    let mut args = runtime_args(runtime);
-    args.push(bundle.to_string_lossy().into_owned());
-    let unsandboxed = HostLaunch {
-        program: runtime.path.clone(),
-        args: args.clone(),
-        cwd: data.clone(),
-        sandbox: None,
-        sandbox_env: Vec::new(),
-        runtime: runtime.clone(),
-        runtime_env: runtime_env(runtime.kind),
-        memory_cap,
-        memory: MemoryEnforcement::planned(runtime.kind),
-    };
+    Ok(data)
+}
+
+/// A host command wrapped in an OS sandbox ([`wrap_host`]).
+#[derive(Debug)]
+struct Wrapped {
+    /// `sandbox::SandboxType`'s name for the wrapper.
+    name: String,
+    /// The wrapper's argv, ending with the runtime's.
+    command: Vec<String>,
+    /// Environment the wrapper adds (`CODEWHALE_SANDBOX`, …).
+    env: Vec<(String, String)>,
+}
+
+/// Why the host runs on Windows without an OS sandbox.
+const WINDOWS_UNSANDBOXED: &str = "Windows has no host sandbox yet; its Job Object contains the process tree, which is not isolation";
+
+/// Wrap `program args` in the host's OS sandbox (module docs), or say why it
+/// has none here. Blocking.
+fn wrap_host(program: &Path, args: &[String], data: &Path, home: &Path) -> Result<Wrapped, String> {
+    use crate::sandbox::{CommandSpec, SandboxManager, SandboxPolicy, SandboxType};
     if cfg!(windows) {
-        // The Windows helper is process containment only; ProcessTree already
-        // provides that, and it must not be reported as isolation.
-        return Ok(unsandboxed);
+        return Err(WINDOWS_UNSANDBOXED.to_string());
     }
-    let spec = CommandSpec::program(&runtime.path.to_string_lossy(), args, data, Duration::ZERO)
+    let spec = |args: Vec<String>| {
+        CommandSpec::program(
+            &program.to_string_lossy(),
+            args,
+            data.to_path_buf(),
+            Duration::ZERO,
+        )
         .with_policy(SandboxPolicy::WorkspaceWrite {
             writable_roots: Vec::new(),
             network_access: false,
             exclude_tmpdir: false,
             exclude_slash_tmp: false,
-        });
-    let mut manager = SandboxManager::new();
-    manager.set_denied_read_subpaths(host_denied_read_paths(home));
-    let env = manager.prepare(&spec);
+        })
+    };
+    let bwrap = cfg!(all(target_os = "linux", not(target_env = "ohos")));
+    let mut manager = SandboxManager::with_bwrap_preference(bwrap);
+    let (denied, exceptions) = host_denied_read_paths(home, bwrap);
+    manager.set_denied_read_subpaths(denied);
+    manager.set_denied_read_exceptions(exceptions);
+    let env = manager.prepare(&spec(args.to_vec()));
     if matches!(env.sandbox_type, SandboxType::None) {
-        return Ok(unsandboxed);
+        return Err(no_wrapper_reason());
     }
-    let mut command = env.command.into_iter();
-    let program = command
-        .next()
-        .ok_or("sandbox wrapper produced an empty command")?;
-    Ok(HostLaunch {
-        program: PathBuf::from(program),
-        args: command.collect(),
-        cwd: env.cwd,
-        sandbox: Some(env.sandbox_type.to_string()),
-        sandbox_env: env.env.into_iter().collect(),
-        ..unsandboxed
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+    if matches!(env.sandbox_type, SandboxType::LinuxBubblewrap) {
+        probe_bwrap(
+            &manager
+                .prepare(&spec(vec!["--version".to_string()]))
+                .command,
+            data,
+        )?;
+    }
+    Ok(Wrapped {
+        name: env.sandbox_type.to_string(),
+        command: env.command,
+        env: env.env.into_iter().collect(),
     })
+}
+
+/// The launch for a [`wrap_host`] outcome: the wrapper's argv, or the
+/// runtime itself, unsandboxed, carrying the reason `/plugin` shows. Pure.
+fn host_launch(
+    runtime: &HostRuntime,
+    args: Vec<String>,
+    data: PathBuf,
+    memory_cap: u64,
+    wrapped: Result<Wrapped, String>,
+) -> Result<HostLaunch, String> {
+    let (program, args, sandbox, sandbox_env) = match wrapped {
+        Ok(wrapped) => {
+            let mut command = wrapped.command.into_iter();
+            let program = command
+                .next()
+                .ok_or("sandbox wrapper produced an empty command")?;
+            (
+                PathBuf::from(program),
+                command.collect(),
+                HostSandbox::Wrapped(wrapped.name),
+                wrapped.env,
+            )
+        }
+        Err(reason) => (
+            runtime.path.clone(),
+            args,
+            HostSandbox::Unsandboxed(reason),
+            Vec::new(),
+        ),
+    };
+    Ok(HostLaunch {
+        program,
+        args,
+        cwd: data,
+        sandbox,
+        sandbox_env,
+        runtime: runtime.clone(),
+        runtime_env: runtime_env(runtime.kind),
+        memory_cap,
+        memory: MemoryEnforcement::planned(runtime.kind),
+    })
+}
+
+/// Why [`wrap_host`] found no wrapper on this platform.
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+fn no_wrapper_reason() -> String {
+    format!(
+        "bwrap unavailable: {} is not an executable file (install bubblewrap)",
+        crate::sandbox::bwrap::BWRAP_PATH
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn no_wrapper_reason() -> String {
+    "Seatbelt (sandbox-exec) is unavailable".to_string()
+}
+
+#[cfg(not(any(
+    target_os = "macos",
+    all(target_os = "linux", not(target_env = "ohos"))
+)))]
+fn no_wrapper_reason() -> String {
+    "no OS sandbox for the host on this platform".to_string()
+}
+
+/// How long the bwrap probe may take. A working bwrap runs
+/// `<runtime> --version` in well under a second, even on a loaded CI runner.
+const BWRAP_PROBE_DEADLINE: Duration = Duration::from_secs(10);
+
+/// Run the finished bwrap wrapper around `<runtime> --version` (`command`),
+/// with no environment, to learn whether bwrap works on this host: it may be
+/// installed yet unable to create its namespaces. Blocking.
+#[cfg_attr(
+    not(all(target_os = "linux", not(target_env = "ohos"))),
+    allow(dead_code)
+)]
+fn probe_bwrap(command: &[String], cwd: &Path) -> Result<(), String> {
+    use std::io::Read as _;
+    use wait_timeout::ChildExt as _;
+    let (program, args) = command
+        .split_first()
+        .ok_or("the sandbox wrapper produced an empty command")?;
+    let mut child = std::process::Command::new(program)
+        .args(args)
+        .current_dir(cwd)
+        .env_clear()
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("bwrap unavailable: {program} does not start ({error})"))?;
+    let status = match child.wait_timeout(BWRAP_PROBE_DEADLINE) {
+        Ok(Some(status)) => status,
+        outcome => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(match outcome {
+                Err(error) => format!("bwrap unavailable: waiting for the probe failed ({error})"),
+                _ => format!(
+                    "bwrap unavailable: the probe did not finish within {BWRAP_PROBE_DEADLINE:?}"
+                ),
+            });
+        }
+    };
+    let mut stderr = String::new();
+    if let Some(mut pipe) = child.stderr.take() {
+        let _ = pipe.read_to_string(&mut stderr);
+    }
+    bwrap_probe_verdict(status.success(), &status.to_string(), &stderr)
+}
+
+/// What a wrapped `<runtime> --version` run says about bwrap here: `Ok` when
+/// it ran, otherwise the reason `/plugin` and doctor show — bwrap's first
+/// line of stderr (or the exit status), and a hint when that line is about
+/// the user namespace bwrap could not create. Pure.
+#[cfg_attr(
+    not(all(target_os = "linux", not(target_env = "ohos"))),
+    allow(dead_code)
+)]
+fn bwrap_probe_verdict(succeeded: bool, status: &str, stderr: &str) -> Result<(), String> {
+    if succeeded {
+        return Ok(());
+    }
+    let first = stderr.lines().map(str::trim).find(|line| !line.is_empty());
+    let mut detail: String = first.map_or_else(
+        || status.to_string(),
+        |line| line.chars().take(240).collect(),
+    );
+    if first.is_some_and(|line| line.contains("namespace") || line.contains("uid map")) {
+        detail.push_str(
+            "; unprivileged user namespaces look blocked here (on Ubuntu 24.04 and later: the kernel.apparmor_restrict_unprivileged_userns sysctl)",
+        );
+    }
+    Err(format!("bwrap unavailable ({detail})"))
 }
 
 /// The kernel-enforced memory cap on Linux: `RLIMIT_DATA`, applied in the
@@ -541,8 +796,7 @@ pub(crate) struct HostProcess {
     pub memory_cap: u64,
     /// How the cap is enforced for this process, settled at the handshake.
     memory: Arc<std::sync::OnceLock<MemoryEnforcement>>,
-    /// `seatbelt` / `bwrap`, or `None` when unsandboxed.
-    pub sandbox: Option<String>,
+    pub sandbox: HostSandbox,
     tree: Arc<crate::process_tree::ProcessTree>,
     outbound: mpsc::Sender<Vec<u8>>,
     pending: Arc<Mutex<HashMap<u64, PendingCall>>>,
@@ -1213,4 +1467,138 @@ fn handle_host_message(
 #[must_use]
 pub fn bundle_dir(root: &Path, sha256: &str) -> PathBuf {
     root.join("extension-host").join(sha256)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn node() -> HostRuntime {
+        HostRuntime {
+            kind: HostRuntimeKind::Node,
+            path: PathBuf::from("/opt/node/bin/node"),
+            version: (22, 19, 0),
+            native_code_flags: Vec::new(),
+        }
+    }
+
+    /// The Linux launch decision, exercised on every platform: a bwrap that
+    /// is installed but cannot start (the probe's stderr as Ubuntu 24.04
+    /// prints it) launches the runtime itself, labelled unsandboxed with
+    /// bwrap's own error wherever the sandbox is reported — never
+    /// `linux-bwrap` — while a probe that ran keeps the wrapper's argv.
+    #[test]
+    fn a_bwrap_that_cannot_start_leaves_the_host_unsandboxed_and_says_why() {
+        let runtime = node();
+        let data = PathBuf::from("/home/u/.codewhale/extension-host/data");
+        let mut args = runtime_args(&runtime);
+        args.push("/home/u/.codewhale/extension-host/abc/host.mjs".to_string());
+
+        let refused = bwrap_probe_verdict(
+            false,
+            "exit status: 1",
+            "\nbwrap: setting up uid map: Permission denied\n",
+        )
+        .unwrap_err();
+        assert!(
+            refused.starts_with("bwrap unavailable (bwrap: setting up uid map: Permission denied;"),
+            "{refused}"
+        );
+        assert!(
+            refused.contains("kernel.apparmor_restrict_unprivileged_userns"),
+            "{refused}"
+        );
+        let launch = host_launch(
+            &runtime,
+            args.clone(),
+            data.clone(),
+            HOST_MEMORY_CAP,
+            Err(refused.clone()),
+        )
+        .unwrap();
+        assert_eq!(launch.program, runtime.path);
+        assert_eq!(launch.args, args);
+        assert!(launch.sandbox_env.is_empty());
+        assert_eq!(launch.sandbox, HostSandbox::Unsandboxed(refused.clone()));
+        assert_eq!(launch.sandbox.label(), format!("none: {refused}"));
+        assert!(
+            launch
+                .sandbox
+                .to_string()
+                .starts_with(&format!("UNSANDBOXED ({refused}): ")),
+            "{}",
+            launch.sandbox
+        );
+
+        // No stderr: the exit status is the reason, with no namespace hint.
+        assert_eq!(
+            bwrap_probe_verdict(false, "signal: 9 (SIGKILL)", ""),
+            Err("bwrap unavailable (signal: 9 (SIGKILL))".to_string())
+        );
+
+        // A probe that ran keeps the wrapper.
+        assert_eq!(bwrap_probe_verdict(true, "exit status: 0", ""), Ok(()));
+        let command: Vec<String> = ["/usr/bin/bwrap", "--unshare-all", "--die-with-parent", "--"]
+            .iter()
+            .map(ToString::to_string)
+            .chain(std::iter::once(runtime.path.to_string_lossy().into_owned()))
+            .chain(args.iter().cloned())
+            .collect();
+        let launch = host_launch(
+            &runtime,
+            args.clone(),
+            data.clone(),
+            HOST_MEMORY_CAP,
+            Ok(Wrapped {
+                name: "linux-bwrap".to_string(),
+                command: command.clone(),
+                env: vec![("CODEWHALE_SANDBOX".to_string(), "bwrap".to_string())],
+            }),
+        )
+        .unwrap();
+        assert_eq!(launch.program, PathBuf::from("/usr/bin/bwrap"));
+        assert_eq!(launch.args, command[1..].to_vec());
+        assert_eq!(launch.cwd, data);
+        assert_eq!(
+            launch.sandbox,
+            HostSandbox::Wrapped("linux-bwrap".to_string())
+        );
+        assert!(
+            launch
+                .sandbox
+                .to_string()
+                .starts_with("linux-bwrap sandbox (no direct network;"),
+            "{}",
+            launch.sandbox
+        );
+    }
+
+    /// bubblewrap can mask only what exists, so under it each Codewhale home
+    /// is denied whole (an entry created later is then denied too) and its
+    /// readable entries come back as exceptions; Seatbelt's form is unchanged.
+    #[test]
+    fn under_bubblewrap_a_codewhale_home_is_denied_whole_but_its_readable_entries() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        std::fs::create_dir_all(home.join("extension-host")).unwrap();
+        std::fs::write(home.join("config.toml.bak-1"), "").unwrap();
+
+        let (seatbelt, none) = host_denied_read_paths(&home, false);
+        assert!(none.is_empty());
+        assert!(seatbelt.contains(&home.join("config.toml.bak-1")));
+        assert!(
+            seatbelt.contains(&home.join("secrets")),
+            "named before it exists"
+        );
+        assert!(!seatbelt.contains(&home));
+        assert!(!seatbelt.contains(&home.join("extension-host")));
+
+        let (bwrap, exceptions) = host_denied_read_paths(&home, true);
+        assert!(bwrap.contains(&home));
+        assert!(!bwrap.contains(&home.join("config.toml.bak-1")));
+        for entry in HOST_READABLE_HOME_ENTRIES {
+            assert!(exceptions.contains(&home.join(entry)), "{entry}");
+            assert!(!bwrap.contains(&home.join(entry)), "{entry}");
+        }
+    }
 }

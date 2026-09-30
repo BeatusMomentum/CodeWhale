@@ -144,8 +144,8 @@ the diagnosed fallback. The same embedded bundle runs on either runtime.
 Not done: the bundled single-executable host (`bun build --compile`, D1) is
 not built, signed or shipped; the host still runs on a user-installed Bun or
 Node. DSH's own loader, HMR and inspector bridge stay Node-only (spike §2); the
-Codewhale host does not use them. Bun on Linux and Windows is unsandboxed
-exactly as Node is. The Windows Job Object limit and the Linux `RLIMIT_DATA`
+Codewhale host does not use them. Bun on Linux runs under the same bwrap
+wrapper as Node, and on Windows is unsandboxed exactly as Node is. The Windows Job Object limit and the Linux `RLIMIT_DATA`
 path were not run on this machine; CI runs the memory-cap tests there. The
 Rust CI job still runs the Rust integration tests on Node only; the Bun ones
 skip there unless `CODEWHALE_EXT_HOST_BUN_TESTS` is set. So the Bun default
@@ -223,8 +223,13 @@ differences from the text below:
   **What it does not do:** other user-readable files, including project `.env`
   files, stay readable (the `.env` filename rule has no Seatbelt subpath form),
   and Mach services and `exec` are not restricted, so this is defense in depth,
-  not the §4.5 containment. Linux and Windows run the host unsandboxed, and
-  `/plugin` says so. §4.5 remains the plan for real containment.
+  not the §4.5 containment. On Linux the same policy runs under bubblewrap
+  when a launch-time probe shows bwrap works; each Codewhale home is masked
+  whole and its readable entries bound again, since bwrap cannot deny a path
+  that does not exist yet (`extension_host::supervisor` lists what that does
+  not cover). Where bwrap is missing or cannot start, and on Windows, the host
+  runs unsandboxed, and `/plugin` and doctor say why. §4.5 remains the plan
+  for real containment.
 - **Extension tool names that the approval path keys by name are refused.**
   Approval keys (`approval_cache`), approval-card summaries and the approval /
   auto-review category are derived from the tool name. A plugin tool named

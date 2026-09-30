@@ -5,10 +5,29 @@ import { mkdirSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs'
 import { createServer } from 'node:http'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
-import { spawn } from 'node:child_process'
+import { execFileSync, spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { BUNDLE, HOST_ARGS, IS_BUN, activate, sha256File, startHost } from './harness.mjs'
 import { encodeFrame } from '../dist/protocol.mjs'
+
+// Budgets for a cold host start (the first host this file starts), gated in
+// the first test. Measured 2026-09-30 on macOS arm64, 5 starts each: Node 26
+// ready in 50-54 ms at 56 MiB resident, Bun 1.4 in 23-24 ms at 36 MiB; a
+// Linux container measured 34-67 MB idle (`supervisor::HOST_MEMORY_CAP`).
+// CI runs these suites on shared ubuntu-latest runners with test files in
+// parallel, so each budget leaves room for load: 1500 ms is ~30x the Node
+// start and ~15x the slowest runtime start measured for the host (Node SEA,
+// 98 ms p50, CURRENT_DECISIONS D1); 160 MiB is 2.4x the largest idle host.
+// The Rust integration test gates the core-side start and a tree RSS.
+const READY_BUDGET_MS = 1500
+const IDLE_RSS_BUDGET_MIB = 160
+
+/** Resident MiB of `pid` from `ps`; `undefined` where there is no `ps`. */
+function residentMiB(pid) {
+  if (process.platform === 'win32') return undefined
+  const kib = Number(execFileSync('ps', ['-o', 'rss=', '-p', String(pid)], { encoding: 'utf8' }).trim())
+  return Number.isFinite(kib) && kib > 0 ? kib / 1024 : undefined
+}
 
 function tempPlugin(source) {
   const dir = mkdtempSync(join(tmpdir(), 'cw-ext-host-'))
@@ -27,7 +46,13 @@ test('handshake reports protocol 1 and the digest of the running bundle', async 
   assert.equal(host.hello.node_version, undefined)
   // No limit was asked for, so none is reported.
   assert.equal(host.hello.memory_limit_mib, undefined)
-  t.diagnostic(`spawn → host/ready: ${host.readyMs.toFixed(1)} ms`)
+  const rss = residentMiB(host.child.pid)
+  t.diagnostic(
+    `spawn → host/ready: ${host.readyMs.toFixed(1)} ms (budget ${READY_BUDGET_MS} ms); ` +
+      `idle RSS ${rss === undefined ? '?' : rss.toFixed(1)} MiB (budget ${IDLE_RSS_BUDGET_MIB} MiB)`,
+  )
+  assert.ok(host.readyMs <= READY_BUDGET_MS, `cold start took ${host.readyMs.toFixed(1)} ms, over ${READY_BUDGET_MS} ms`)
+  if (rss !== undefined) assert.ok(rss <= IDLE_RSS_BUDGET_MIB, `idle host is ${rss.toFixed(1)} MiB resident, over ${IDLE_RSS_BUDGET_MIB} MiB`)
 })
 
 test('heartbeat answers after initialization without an owner or tool call', async (t) => {

@@ -418,12 +418,62 @@ pub(crate) fn host_tool(
     registry.get(name).unwrap()
 }
 
-fn rss_kib(pid: u32) -> Option<u64> {
+/// Start budget for `dsh_plugin_runs_end_to_end_behind_the_approval_gate`:
+/// bundle materialization, the runtime probe, the launch plan (on Linux, the
+/// bwrap probe), spawn, handshake and one plugin's activation, under
+/// nextest's full-core load on every CI OS. The host alone is ready in
+/// ~50 ms (the JS suite's `READY_BUDGET_MS` gates that), but Windows CI
+/// under load has taken over 5 s to hand-shake (`HANDSHAKE_DEADLINE`).
+/// 20 s fails a start drifting toward that 30 s deadline, whose miss
+/// disables every extension for the session, without failing on CI load.
+const HOST_START_BUDGET: Duration = Duration::from_secs(20);
+
+/// Resident-size budget for a host with one plugin active, summed over its
+/// process tree (bwrap's two processes included on Linux). 160 MiB is 2.4x
+/// the largest idle host measured (67 MB, Node in a Linux container:
+/// `supervisor::HOST_MEMORY_CAP`; 57 MiB Node 26 and 41 MiB Bun 1.4 with this
+/// plugin on macOS arm64, 2026-09-30) and far below the 1 GiB cap. Not
+/// checked where there is no `ps` (Windows).
+const HOST_RSS_BUDGET_MIB: u64 = 160;
+
+/// Resident size in KiB of `pid` and every process under it — under bwrap,
+/// `pid` is bwrap's and the runtime two levels down — from `ps`; `None` where
+/// `ps` is missing or does not list `pid`.
+fn tree_rss_kib(pid: u32) -> Option<u64> {
     let output = std::process::Command::new("ps")
-        .args(["-o", "rss=", "-p", &pid.to_string()])
+        .args(["-A", "-o", "pid=,ppid=,rss="])
         .output()
         .ok()?;
-    String::from_utf8_lossy(&output.stdout).trim().parse().ok()
+    let rows: Vec<[u64; 3]> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let fields: Vec<u64> = line
+                .split_whitespace()
+                .filter_map(|field| field.parse().ok())
+                .collect();
+            <[u64; 3]>::try_from(fields).ok()
+        })
+        .collect();
+    let root = u64::from(pid);
+    if !rows.iter().any(|row| row[0] == root) {
+        return None;
+    }
+    let mut members = vec![root];
+    let mut next = 0;
+    while let Some(&parent) = members.get(next) {
+        members.extend(
+            rows.iter()
+                .filter(|row| row[1] == parent && row[0] != parent)
+                .map(|row| row[0]),
+        );
+        next += 1;
+    }
+    Some(
+        rows.iter()
+            .filter(|row| members.contains(&row[0]))
+            .map(|row| row[2])
+            .sum(),
+    )
 }
 
 #[tokio::test]
@@ -445,11 +495,23 @@ async fn dsh_plugin_runs_end_to_end_behind_the_approval_gate() {
     engine.sync().await.unwrap();
     let elapsed = started.elapsed();
     let pid = manager.host_pid().expect("host running");
+    let rss = tree_rss_kib(pid);
     eprintln!(
-        "extension host: spawn + handshake + activation {:.1} ms; RSS {} KiB",
+        "extension host: spawn + handshake + activation {:.1} ms (budget {HOST_START_BUDGET:?}); RSS {} KiB (budget {HOST_RSS_BUDGET_MIB} MiB)",
         elapsed.as_secs_f64() * 1000.0,
-        rss_kib(pid).map_or_else(|| "?".to_string(), |kib| kib.to_string())
+        rss.map_or_else(|| "?".to_string(), |kib| kib.to_string())
     );
+    assert!(
+        elapsed <= HOST_START_BUDGET,
+        "the extension host took {elapsed:?} to start, over its {HOST_START_BUDGET:?} budget"
+    );
+    match rss {
+        Some(kib) => assert!(
+            kib <= HOST_RSS_BUDGET_MIB * 1024,
+            "the extension host is {kib} KiB resident, over its {HOST_RSS_BUDGET_MIB} MiB budget"
+        ),
+        None => eprintln!("extension host RSS budget not checked: no `ps` listing here"),
+    }
     assert_eq!(
         manager.live_tool_names(),
         vec!["load_workspace_dependencies"]
@@ -791,20 +853,50 @@ async fn sandboxed_host_cannot_read_codewhale_secrets_or_write_outside_its_data_
     let readable = fixture.workspace().join("readable.txt");
     std::fs::write(&readable, "plain").unwrap();
 
-    let manager = fixture.manager(node);
+    let manager = fixture.manager(node.clone());
     let engine = manager.attach(fixture.registry());
     engine.sync().await.unwrap();
     let HostStatus::Ready { sandbox, .. } = manager.status() else {
         panic!("host not ready: {:?}", manager.status());
     };
-    let Some(sandbox) = sandbox else {
-        assert!(
-            cfg!(windows) || crate::sandbox::get_platform_sandbox().is_none(),
-            "an OS sandbox is available here, so the host must run under it"
-        );
-        eprintln!("skipping sandbox assertions: no OS sandbox for the host on this platform");
-        manager.shutdown().await;
-        return;
+    let sandbox = match sandbox {
+        super::supervisor::HostSandbox::Wrapped(name) => name,
+        super::supervisor::HostSandbox::Unsandboxed(reason) => {
+            // Only where no wrapper works, checked independently of the
+            // launch's own probe, and the reason is what `/plugin` shows.
+            #[cfg(target_os = "linux")]
+            {
+                let minimal = std::process::Command::new("/usr/bin/bwrap")
+                    .args(["--unshare-all", "--die-with-parent", "--ro-bind", "/", "/"])
+                    .args(["--dev", "/dev", "--proc", "/proc", "--"])
+                    .arg(&node)
+                    .arg("--version")
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .is_ok_and(|status| status.success());
+                assert!(
+                    !minimal,
+                    "bwrap runs here, so the host must run under it: {reason}"
+                );
+                assert!(reason.starts_with("bwrap unavailable"), "{reason}");
+            }
+            #[cfg(target_os = "macos")]
+            assert!(
+                crate::sandbox::get_platform_sandbox().is_none(),
+                "Seatbelt is available here, so the host must run under it: {reason}"
+            );
+            #[cfg(windows)]
+            assert!(reason.starts_with("Windows"), "{reason}");
+            assert!(
+                super::render_status(&manager).contains(&format!("UNSANDBOXED ({reason})")),
+                "{}",
+                super::render_status(&manager)
+            );
+            eprintln!("skipping sandbox assertions: the host runs unsandboxed here ({reason})");
+            manager.shutdown().await;
+            return;
+        }
     };
     assert!(super::render_status(&manager).contains(&format!("{sandbox} sandbox")));
 
