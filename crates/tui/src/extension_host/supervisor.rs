@@ -544,6 +544,9 @@ pub(crate) struct HostProcess {
     /// this flag to avoid activation while the exit callback is still pending.
     admission_closed: AtomicBool,
     next_id: AtomicU64,
+    /// Heartbeat pings among those ids; tests count only the core's own work.
+    #[cfg(test)]
+    heartbeats_sent: AtomicU64,
     stderr_tail: Arc<Mutex<VecDeque<u8>>>,
     exited: tokio::sync::watch::Receiver<bool>,
     kill: mpsc::Sender<String>,
@@ -778,6 +781,8 @@ impl HostProcess {
             pending,
             admission_closed: AtomicBool::new(false),
             next_id: AtomicU64::new(1),
+            #[cfg(test)]
+            heartbeats_sent: AtomicU64::new(0),
             stderr_tail,
             exited: exited_rx,
             kill: kill_tx.clone(),
@@ -900,10 +905,12 @@ impl HostProcess {
             .unwrap_or_else(|| MemoryEnforcement::planned(self.runtime.kind))
     }
 
-    /// How many requests the core has sent this host (handshake included).
+    /// How many requests the core has sent this host (handshake included),
+    /// excluding the monitor's heartbeat pings, which run on their own timer
+    /// and would otherwise make a "no request yet" assertion timing-dependent.
     #[cfg(test)]
     pub(crate) fn requests_started(&self) -> u64 {
-        self.next_id.load(Ordering::Relaxed) - 1
+        self.next_id.load(Ordering::Relaxed) - 1 - self.heartbeats_sent.load(Ordering::Relaxed)
     }
 
     #[must_use]
@@ -963,6 +970,10 @@ impl HostProcess {
             return Err(HostCallError::Exited("already exited".to_string()));
         }
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        #[cfg(test)]
+        if matches!(request, CoreRequest::Ping) {
+            self.heartbeats_sent.fetch_add(1, Ordering::Relaxed);
+        }
         let (tx, rx) = oneshot::channel();
         {
             let mut pending = self.pending.lock().expect("pending lock");
