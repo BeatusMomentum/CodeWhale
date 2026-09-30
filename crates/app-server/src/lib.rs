@@ -327,7 +327,9 @@ struct ThreadInterruptParams {
 
 pub async fn run(options: AppServerOptions) -> Result<()> {
     let auth_token = resolve_auth_token(&options)?;
-    let state = build_state(options.config_path.clone(), auth_token)?;
+    let state =
+        build_state_off_runtime(options.config_path.clone(), auth_token, AppTransport::Http)
+            .await?;
     let app = app_router(state, &options.cors_origins);
 
     let listener = tokio::net::TcpListener::bind(options.listen).await?;
@@ -408,7 +410,7 @@ fn app_router(state: AppState, cors_origins: &[String]) -> Router {
 }
 
 pub async fn run_stdio(config_path: Option<PathBuf>) -> Result<()> {
-    let state = build_state_with_transport(config_path, None, AppTransport::Stdio)?;
+    let state = build_state_off_runtime(config_path, None, AppTransport::Stdio).await?;
     let reader = BufReader::new(tokio::io::stdin()).lines();
     let writer = tokio::io::BufWriter::new(tokio::io::stdout());
     run_stdio_loop(
@@ -764,8 +766,26 @@ fn app_response_status(response: &AppResponse) -> StatusCode {
     }
 }
 
+#[cfg(test)]
 fn build_state(config_path: Option<PathBuf>, auth_token: Option<String>) -> Result<AppState> {
     build_state_with_transport(config_path, auth_token, AppTransport::Http)
+}
+
+/// [`build_state_with_transport`] on the blocking pool. Server startup is
+/// async, but building state is not: it reads and parses the config file,
+/// creates directories, and opens SQLite (a schema migration that may wait
+/// out the 5s busy timeout behind another process). Run inline, that parked
+/// a Tokio worker.
+async fn build_state_off_runtime(
+    config_path: Option<PathBuf>,
+    auth_token: Option<String>,
+    transport: AppTransport,
+) -> Result<AppState> {
+    tokio::task::spawn_blocking(move || {
+        build_state_with_transport(config_path, auth_token, transport)
+    })
+    .await
+    .context("app-server state setup task failed")?
 }
 
 fn build_state_with_transport(
