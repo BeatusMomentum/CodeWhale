@@ -2180,3 +2180,102 @@ fn reasoning_hint_uses_the_render_locale() {
     assert!(text.contains("Space:展開"), "{text}");
     assert!(!text.contains("Space:expand"), "{text}");
 }
+
+/// Rows-per-element measurement for the calm-UI PR body. Run with
+/// `--ignored --nocapture`.
+#[test]
+#[ignore = "measurement, not a correctness gate"]
+#[allow(clippy::print_stderr)]
+fn measure_calm_rows_per_turn() {
+    use crate::tui::history::{GenericToolCell, McpToolCell};
+    let shipped = TranscriptRenderOptions {
+        show_tool_details: false,
+        calm_mode: true,
+        low_motion: true,
+        ..TranscriptRenderOptions::default()
+    };
+    let body = (1..=40)
+        .map(|i| format!("reasoning line {i:02}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let noisy = (0..30)
+        .map(|i| format!("row {i:02} output"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let generic = |name: &str, status: ToolStatus, output: Option<String>| {
+        HistoryCell::Tool(ToolCell::Generic(GenericToolCell {
+            name: name.to_string(),
+            status,
+            input_summary: Some("path: src/lib.rs".to_string()),
+            output,
+            prompts: None,
+            spillover_path: None,
+            output_summary: None,
+            is_diff: false,
+        }))
+    };
+    let mcp = |status: ToolStatus, content: String| {
+        HistoryCell::Tool(ToolCell::Mcp(McpToolCell {
+            tool: "mcp_linear_get_issue".to_string(),
+            status,
+            content: Some(content),
+            is_image: false,
+        }))
+    };
+    let turn = vec![
+        user_cell("fix the bug"),
+        HistoryCell::Thinking {
+            content: body.clone(),
+            streaming: false,
+            duration_secs: Some(12.0),
+        },
+        mcp(ToolStatus::Success, "CW-123\nTitle\nState: Todo".to_string()),
+        mcp(ToolStatus::Failed, noisy.clone()),
+        generic("read_file", ToolStatus::Failed, Some(noisy.clone())),
+        exec_tool_cell_with_output("cargo test", noisy.clone()),
+        assistant_cell("done", false),
+    ];
+    for cell in &turn {
+        let rows = cell.lines_with_options(80, shipped).len();
+        eprintln!("calm-rows element: {rows}");
+    }
+    let revisions = vec![1u64; turn.len()];
+    let mut cache = TranscriptViewCache::new();
+    cache.ensure_split(
+        &[&turn],
+        &revisions,
+        80,
+        shipped,
+        &HashMap::new(),
+        None,
+        None,
+    );
+    eprintln!("calm-rows settled turn total: {}", cache.total_lines());
+
+    let live = vec![
+        user_cell("fix the bug"),
+        HistoryCell::Thinking {
+            content: body,
+            streaming: true,
+            duration_secs: None,
+        },
+    ];
+    let mut cache = TranscriptViewCache::new();
+    let live_options = TranscriptRenderOptions {
+        reasoning_preview_viewport_lines: Some(40),
+        ..shipped
+    };
+    cache.ensure_split(
+        &[&live],
+        &[1, 1],
+        80,
+        live_options,
+        &HashMap::new(),
+        None,
+        None,
+    );
+    eprintln!(
+        "calm-rows streaming thinking cell at viewport 40: {}",
+        cache.per_cell[1].lines.len()
+    );
+}
