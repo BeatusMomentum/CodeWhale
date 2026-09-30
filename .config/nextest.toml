@@ -44,6 +44,11 @@ exec-persistent-service = { max-threads = 1 }
 # (a durable heartbeat and a `ps` sample on every scheduler tick) is now
 # bounded to once a second per worker.
 fleet-manager-lifecycle = { max-threads = 1 }
+# Extension fixtures launch real Node hosts with a five-second production
+# handshake deadline. Windows full-suite runs on #6776/#6780 reported ordinary
+# hosts missing that deadline. Bound contention across nextest processes;
+# keep production deadlines and the explicit hang-detection tests unchanged.
+extension-host = { max-threads = 1 }
 
 # First matching test-group override wins. Keep these more-specific
 # integration filters before binary(integration) so they are not stolen
@@ -69,6 +74,10 @@ test-group = 'telemetry-contract'
 [[profile.default.overrides]]
 filter = 'package(codewhale-tui) & kind(lib) & test(/^fleet::manager::tests::/)'
 test-group = 'fleet-manager-lifecycle'
+
+[[profile.default.overrides]]
+filter = 'package(codewhale-tui) & kind(lib) & (test(/^extension_host::/) | test(/^core::engine::.*extension/))'
+test-group = 'extension-host'
 
 [[profile.default.overrides]]
 filter = 'binary(integration) & test(/^exec_persistent_service::/)'
