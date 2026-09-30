@@ -1814,9 +1814,18 @@ pub fn analyze_command(command: &str) -> SafetyAnalysis {
 
     // Check for dangerous patterns first. The token-aware pass above handles
     // spacing and quoting variants; these literal patterns remain as a compact
-    // fallback for legacy shapes.
+    // fallback for legacy shapes. A pattern must not run on into a longer
+    // path: `rm -rf /` is the root, `rm -rf /home/me/project/build` is not.
     for (pattern, reason) in DANGEROUS_PATTERNS {
-        if command_lower.contains(&pattern.to_lowercase()) {
+        let pattern = pattern.to_lowercase();
+        if command_lower.match_indices(&pattern).any(|(at, _)| {
+            command_lower[at + pattern.len()..]
+                .chars()
+                .next()
+                .is_none_or(|next| {
+                    !(next.is_alphanumeric() || matches!(next, '_' | '-' | '.' | '/'))
+                })
+        }) {
             return SafetyAnalysis::dangerous(
                 command,
                 vec![(*reason).to_string()],

@@ -37,6 +37,16 @@ quieter, and Fleet runs can be checked before they spend anything.
 
 ### Fixed
 
+- Agents follow the Permissions you choose while they run: switching to
+  Full Access reaches an agent that is already working, instead of leaving
+  it with the Auto-Review guardian that denied it. Tightening reaches it too.
+  An agent's answer to an approval prompt is delivered while the main
+  session is busy, and a forced delete inside the workspace is no longer
+  treated as a catastrophic system delete. On Linux, Full Access switched on
+  at runtime cannot lift the kernel no-new-privileges flag set at startup,
+  so `sudo` and setuid helpers still fail; start with
+  `sandbox_mode = "danger-full-access"` or `CODEWHALE_NO_NEW_PRIVS=0` if
+  agents need them.
 - Switching providers keeps a model set only in the root `default_text_model`
   with the provider it belongs to. Switching away and back (`/provider` in the
   TUI, or the desktop app's model chip) used to land on the provider's catalog

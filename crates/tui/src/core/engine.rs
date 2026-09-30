@@ -752,6 +752,10 @@ pub struct EngineHandle {
     compaction_cancellation: Arc<StdMutex<CompactionCancellationState>>,
     /// Read-only view of the engine's turn-phase heartbeat (#6184).
     turn_heartbeat: Arc<turn_heartbeat::TurnHeartbeat>,
+    /// Where an agent's pending approval waits. An answer to one is handed
+    /// straight to it: the engine may be streaming or running tools and not
+    /// reading approvals for a long time.
+    subagent_manager: SharedSubAgentManager,
 }
 
 const MAX_PENDING_COMPACTION_CANCELLATIONS: usize = 64;
@@ -1038,7 +1042,7 @@ pub struct Engine {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct LiveRuntimeAuthority {
+pub(crate) struct LiveRuntimeAuthority {
     mode: AppMode,
     allow_shell: bool,
     trust_mode: bool,
@@ -1087,7 +1091,7 @@ impl LiveRuntimeAuthority {
     ///
     /// A call the user approved under `prior` stays approved under a posture
     /// that is equal or broader; only a narrowing sends it back for a retry.
-    fn narrows(&self, prior: &Self) -> bool {
+    pub(crate) fn narrows(&self, prior: &Self) -> bool {
         fn posture_rank(mode: ApprovalMode) -> u8 {
             match mode {
                 ApprovalMode::Never => 0,
@@ -1157,7 +1161,8 @@ impl LiveRuntimeAuthorityState {
 /// posture: an agent spawned under Auto-Review went on asking the guardian,
 /// and being denied, after the person had granted Full Access. Each agent call
 /// now re-reads the posture the person last chose — the same cell the TUI
-/// decides that agent's approval prompts against — and the sandbox it implies.
+/// decides that agent's approval prompts against — through the projection
+/// the parent turn uses (trust, approval, shell policy, sandbox).
 #[derive(Clone)]
 pub(crate) struct LivePosture {
     state: Arc<StdMutex<LiveRuntimeAuthorityState>>,
@@ -1166,26 +1171,54 @@ pub(crate) struct LivePosture {
 }
 
 impl LivePosture {
-    /// Project the live posture onto one agent call: approval, and the
-    /// sandbox that posture implies. Shell and trust stay as the agent's grant
-    /// narrowed them.
-    pub(crate) fn apply(&self, context: &mut ToolContext) {
-        let live = self
-            .state
+    /// The posture the person last chose.
+    pub(crate) fn read(&self) -> LiveRuntimeAuthority {
+        self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .authority
-            .clone();
-        context.auto_approve = live.auto_approve;
-        context.approval_mode = live.approval_mode;
-        context.elevated_sandbox_policy = Some(crate::core::authority::sandbox_policy_for_turn(
-            live.mode,
-            live.approval_mode,
-            live.configured_sandbox_mode.as_deref(),
-            &self.workspace,
-            self.network_access,
-        ));
+            .clone()
     }
+
+    /// Project the live posture onto one agent call — the same projection the
+    /// parent turn applies to its own calls — and return what was read.
+    pub(crate) fn apply(&self, context: &mut ToolContext) -> LiveRuntimeAuthority {
+        let live = self.read();
+        project_turn_authority(
+            context,
+            &TurnAuthority::from_effective_fields(
+                live.mode,
+                live.allow_shell,
+                live.trust_mode,
+                live.auto_approve,
+                live.approval_mode,
+            ),
+            &self.workspace,
+            live.configured_sandbox_mode.as_deref(),
+            self.network_access,
+        );
+        live
+    }
+}
+
+/// Project one permission authority onto a tool context: trust, approval,
+/// shell policy, and the sandbox that posture implies. The parent turn and
+/// every agent call use this one projection.
+fn project_turn_authority(
+    context: &mut ToolContext,
+    authority: &TurnAuthority,
+    workspace: &Path,
+    configured_sandbox_mode: Option<&str>,
+    network_access: crate::core::authority::SandboxNetworkAccess,
+) {
+    context.trust_mode = authority.trust_mode;
+    context.auto_approve = authority.auto_approve;
+    context.approval_mode = authority.approval_mode;
+    context.set_shell_policy(authority.shell_policy());
+    context.elevated_sandbox_policy =
+        Some(authority.sandbox_policy(workspace, configured_sandbox_mode, network_access));
+    context.shell_network_denied_hint =
+        matches!(authority.mode, AppMode::Plan).then(|| PLAN_SHELL_NETWORK_DENIED_HINT.to_string());
 }
 
 #[cfg(test)]
@@ -2088,6 +2121,7 @@ impl Engine {
             live_runtime_authority,
             compaction_cancellation,
             turn_heartbeat: Arc::clone(&engine.turn_heartbeat),
+            subagent_manager: Arc::clone(&engine.subagent_manager),
         };
 
         (engine, handle)
@@ -2828,14 +2862,10 @@ impl Engine {
                     completion = self.rx_subagent_completion.recv(), if subagent_wake_armed => {
                         return completion.map(EngineRunInput::SubAgentCompletion);
                     }
-                    // A background child may be waiting on a person's answer
-                    // while the parent turn is idle: route it. Any other
-                    // decision has no waiter and is dropped, as before.
-                    decision = self.rx_approval.recv() => {
-                        if let Some(decision) = decision {
-                            self.route_child_approval_decision(decision).await;
-                        }
-                    }
+                    // No call of this engine awaits approval while idle, and
+                    // the handle hands agent answers to the agent directly:
+                    // a stale decision has no waiter and is dropped.
+                    _ = self.rx_approval.recv() => {}
                     update = async {
                         match self.mcp_boot_rx.as_mut() {
                             Some(rx) => rx.recv().await,
@@ -2873,40 +2903,6 @@ impl Engine {
                 }
             }
         }
-    }
-
-    /// Deliver an approval decision to a child waiting on it. Returns whether
-    /// a child took it; the parent's own awaiting call keeps every other id.
-    async fn route_child_approval_decision(
-        &self,
-        decision: super::engine::approval::ApprovalDecision,
-    ) -> bool {
-        use crate::tools::subagent::{ChildApprovalOutcome, SubAgentManager};
-        let (id, outcome) = match &decision {
-            super::engine::approval::ApprovalDecision::Approved { id, .. } => {
-                (id.clone(), ChildApprovalOutcome::Approved)
-            }
-            super::engine::approval::ApprovalDecision::Denied { id, .. } => {
-                (id.clone(), ChildApprovalOutcome::Denied)
-            }
-            // A child has no timeout outcome of its own (#6101); an expired
-            // card is a deny for whichever call it was answering.
-            super::engine::approval::ApprovalDecision::TimedOut { id } => {
-                (id.clone(), ChildApprovalOutcome::Denied)
-            }
-            super::engine::approval::ApprovalDecision::Unavailable { id } => {
-                (id.clone(), ChildApprovalOutcome::Unavailable)
-            }
-            // A sandbox retry only exists for the parent's own tool call.
-            super::engine::approval::ApprovalDecision::RetryWithPolicy { .. } => return false,
-        };
-        if !SubAgentManager::is_child_approval_id(&id) {
-            return false;
-        }
-        self.subagent_manager
-            .write()
-            .await
-            .resolve_child_approval(&id, outcome)
     }
 
     /// Whether the idle loop should poll for background shell completion: a
@@ -6403,19 +6399,15 @@ impl Engine {
             self.session.auto_approve,
             self.session.approval_mode,
         );
-        context.trust_mode = authority.trust_mode;
-        context.auto_approve = authority.auto_approve;
-        context.approval_mode = authority.approval_mode;
-        context.set_shell_policy(authority.shell_policy());
-        context.elevated_sandbox_policy = Some(authority.sandbox_policy(
+        project_turn_authority(
+            &mut context,
+            &authority,
             &self.session.workspace,
             self.api_config.sandbox_mode.as_deref(),
             crate::core::authority::SandboxNetworkAccess::from_config(
                 self.api_config.sandbox_network_access,
             ),
-        ));
-        context.shell_network_denied_hint = matches!(authority.mode, AppMode::Plan)
-            .then(|| PLAN_SHELL_NETWORK_DENIED_HINT.to_string());
+        );
         Some(context)
     }
 
@@ -8277,6 +8269,10 @@ pub(crate) fn mock_engine_handle() -> MockEngineHandle {
         live_runtime_authority,
         compaction_cancellation,
         turn_heartbeat: turn_heartbeat::TurnHeartbeat::new(),
+        subagent_manager: crate::tools::subagent::new_shared_subagent_manager(
+            std::env::temp_dir(),
+            1,
+        ),
     };
 
     MockEngineHandle {

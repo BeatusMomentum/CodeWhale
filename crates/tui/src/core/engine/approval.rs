@@ -272,12 +272,10 @@ impl Engine {
                             ).await?;
                             return Ok(ApprovalResult::RetryWithPolicy(policy));
                         }
-                        // A child prompt answered while the parent itself is
-                        // waiting: hand it to the child instead of dropping it.
-                        other => {
-                            self.route_child_approval_decision(other).await;
-                            continue;
-                        }
+                        // A stale answer for another call: no waiter here. (An
+                        // agent's answer never arrives here; the handle hands
+                        // it to the agent directly.)
+                        _ => continue,
                     }
                 }
             }

@@ -87,11 +87,18 @@ impl ToolActionKind {
 
     #[must_use]
     pub fn from_tool_name(tool_name: &str, category: ToolCategory) -> Self {
-        Self::from_tool_call(tool_name, &Value::Null, category)
+        Self::from_tool_call(tool_name, &Value::Null, category, None)
     }
 
+    /// `workspace`, when known, lets a forced delete of a path inside it stay
+    /// ordinary work instead of a catastrophic system-path delete.
     #[must_use]
-    pub fn from_tool_call(tool_name: &str, params: &Value, category: ToolCategory) -> Self {
+    pub fn from_tool_call(
+        tool_name: &str,
+        params: &Value,
+        category: ToolCategory,
+        workspace: Option<&std::path::Path>,
+    ) -> Self {
         let qualified = action_qualified_tool_name(tool_name, params);
         let normalized = qualified.to_ascii_lowercase();
         let normalized = normalized.as_str();
@@ -128,7 +135,9 @@ impl ToolActionKind {
         if matches!(category, ToolCategory::Shell) && shell_params_are_publish_like(params) {
             return Self::Publish;
         }
-        if matches!(category, ToolCategory::Shell) && shell_params_are_destructive_like(params) {
+        if matches!(category, ToolCategory::Shell)
+            && shell_params_are_destructive_like(params, workspace)
+        {
             return Self::Destructive;
         }
 
@@ -425,7 +434,7 @@ impl<'a> AutoReviewContext<'a> {
         } else {
             classify_risk(tool_name, category, params)
         };
-        let action_kind = ToolActionKind::from_tool_call(tool_name, params, category);
+        let action_kind = ToolActionKind::from_tool_call(tool_name, params, category, workspace);
         Self {
             tool_name,
             category,
@@ -1017,7 +1026,7 @@ fn shell_params_are_publish_like(params: &Value) -> bool {
 /// path). This is what keeps the background/headless durable-review floor
 /// armed now that the floor no longer treats every non-read-only command as
 /// destructive (#3883).
-fn shell_params_are_destructive_like(params: &Value) -> bool {
+fn shell_params_are_destructive_like(params: &Value, workspace: Option<&std::path::Path>) -> bool {
     let Some(command) = params
         .get("command")
         .or_else(|| params.get("cmd"))
@@ -1031,7 +1040,7 @@ fn shell_params_are_destructive_like(params: &Value) -> bool {
         .any(|segment| {
             codewhale_execpolicy::command_safety::analyze_command(segment).level
                 == codewhale_execpolicy::command_safety::SafetyLevel::Dangerous
-                || segment_is_device_or_filesystem_destroyer(segment)
+                || segment_is_device_or_filesystem_destroyer(segment, workspace)
         })
 }
 
@@ -1042,12 +1051,15 @@ fn shell_params_are_destructive_like(params: &Value) -> bool {
 /// `mkfs`, and forced recursive deletion of an absolute system path — so a
 /// background/headless call in YOLO cannot run them without durable review
 /// (#3883 follow-up; the earlier narrowing lost this coverage).
-fn segment_is_device_or_filesystem_destroyer(segment: &str) -> bool {
+fn segment_is_device_or_filesystem_destroyer(
+    segment: &str,
+    workspace: Option<&std::path::Path>,
+) -> bool {
     // A command may be piped (`cat x | dd of=/dev/sda`); each stage is its own
     // effective command, so check every pipe stage.
     segment
         .split('|')
-        .any(stage_is_device_or_filesystem_destroyer)
+        .any(|stage| stage_is_device_or_filesystem_destroyer(stage, workspace))
 }
 
 /// Strip a surrounding pair of single or double quotes from a shell token so
@@ -1121,7 +1133,10 @@ fn effective_command_tokens<'a>(tokens: &'a [&'a str]) -> &'a [&'a str] {
     &tokens[i..]
 }
 
-fn stage_is_device_or_filesystem_destroyer(stage: &str) -> bool {
+fn stage_is_device_or_filesystem_destroyer(
+    stage: &str,
+    workspace: Option<&std::path::Path>,
+) -> bool {
     let raw_tokens: Vec<&str> = stage.split_whitespace().collect();
     let tokens = effective_command_tokens(&raw_tokens);
     let Some(cmd) = tokens
@@ -1162,13 +1177,35 @@ fn stage_is_device_or_filesystem_destroyer(stage: &str) -> bool {
             } else if let Some(flags) = token.strip_prefix('-') {
                 recursive |= flags.contains('r') || flags.contains('R');
                 force |= flags.contains('f');
-            } else if token.starts_with('/') {
+            } else if token.starts_with('/') && !strictly_inside(workspace, token) {
                 abs_system_target = true;
             }
         }
         return recursive && force && abs_system_target;
     }
     false
+}
+
+/// Whether absolute `target` resolves strictly below `workspace` — the
+/// workspace root itself, a `..` escape, or a symlink hop out of it do not.
+fn strictly_inside(workspace: Option<&std::path::Path>, target: &str) -> bool {
+    use crate::tools::spec::normalize_path;
+    let Some(workspace) = workspace else {
+        return false;
+    };
+    let target = std::path::Path::new(target);
+    let lexical = normalize_path(target);
+    let resolved = target.canonicalize().unwrap_or_else(|_| lexical.clone());
+    let roots = [
+        normalize_path(workspace),
+        workspace.canonicalize().unwrap_or_default(),
+    ];
+    let below = |path: &std::path::Path| {
+        roots
+            .iter()
+            .any(|root| !root.as_os_str().is_empty() && path.starts_with(root) && path != root)
+    };
+    below(&lexical) && below(&resolved)
 }
 
 fn shell_tokens_are_publish_like(tokens: &[&str]) -> bool {
@@ -1691,6 +1728,39 @@ mod tests {
             );
             assert_safety_gate(&policy.evaluate(&ctx));
         }
+    }
+
+    /// A forced delete of an absolute path inside the workspace is ordinary
+    /// cleanup, not a system-tree destroyer. The workspace root itself, a
+    /// `..` escape, a symlink hop out, and a system path all still hold.
+    #[test]
+    fn absolute_forced_delete_inside_the_workspace_is_not_a_destroyer() {
+        let workspace = tempfile::tempdir().expect("tempdir");
+        let root = workspace.path();
+        std::fs::create_dir_all(root.join("build")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("/usr", root.join("escape")).unwrap();
+        let held = |command: String| {
+            let ctx = AutoReviewContext::from_tool_call(
+                "exec_shell",
+                &json!({ "command": command, "background": true }),
+                RunOrigin::Background,
+                ApprovalMode::Bypass,
+                true,
+                Some(root),
+            );
+            AutoReviewPolicy::default()
+                .evaluate(&ctx)
+                .built_in_safety_gate
+        };
+        let at = |rel: &str| root.join(rel).display().to_string();
+        assert!(!held(format!("rm -rf {}", at("build"))));
+        assert!(!held(format!("rm -rf {}", at("not/yet/there"))));
+        assert!(held(format!("rm -rf {}", root.display())));
+        assert!(held(format!("rm -rf {}", at("build/../.."))));
+        #[cfg(unix)]
+        assert!(held(format!("rm -rf {}/", at("escape"))));
+        assert!(held("rm -rf /usr".to_string()));
     }
 
     #[test]

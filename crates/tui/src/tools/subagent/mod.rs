@@ -3203,8 +3203,6 @@ impl SubAgentRuntime {
     #[must_use]
     pub fn child_runtime(&self) -> Self {
         let mut child_context = self.context.clone();
-        child_context.auto_approve = self.context.auto_approve;
-        child_context.approval_mode = self.context.approval_mode;
         let cancel_token = self.cancel_token.child_token();
         child_context.cancel_token = Some(cancel_token.clone());
         Self {
@@ -18303,6 +18301,8 @@ enum ChildGateVerdict {
     Proceed,
     /// Refuse the call with this reason (returned to the child model).
     Deny(String),
+    /// The person changed the posture while the gate waited; gate again.
+    PostureChanged,
 }
 
 impl SubAgentToolRegistry {
@@ -18468,6 +18468,17 @@ impl SubAgentToolRegistry {
         }
     }
 
+    /// Re-read the session's live posture onto this child's call context,
+    /// never wider than the child's own shell grant.
+    fn refresh_posture(
+        &self,
+        context: &mut ToolContext,
+    ) -> Option<crate::core::engine::LiveRuntimeAuthority> {
+        let posture = context.refresh_live_posture();
+        context.set_shell_policy(context.shell_policy.min_with(self.grant.shell_policy()));
+        posture
+    }
+
     /// Emit a transcript-visible receipt for a decision made on this child's
     /// call without a person seeing a prompt (the audit log has the record).
     #[allow(clippy::too_many_arguments)]
@@ -18572,12 +18583,15 @@ impl SubAgentToolRegistry {
             return ChildGateVerdict::Deny(reason);
         }
         let workspace_trusted = crate::config::is_workspace_trusted(&workspace);
-        // Judged exactly like the parent's own call: destructive *detached*
-        // work holds in every posture, and nothing else is background.
-        let detached = self
-            .registry
-            .get(name)
-            .is_some_and(|spec| spec.starts_detached_for(input));
+        // Destructive work nobody is watching holds in every posture: a call
+        // that starts detached, or any call of an agent that runs detached
+        // (no foreground turn owns it). A foreground agent's call is judged
+        // exactly like the parent's own.
+        let detached = self.gate_runtime.foreground_children.is_none()
+            || self
+                .registry
+                .get(name)
+                .is_some_and(|spec| spec.starts_detached_for(input));
         let review_context = AutoReviewContext::from_tool_call(
             name,
             input,
@@ -18639,6 +18653,7 @@ impl SubAgentToolRegistry {
                         input,
                         &review_context,
                         &held_reason,
+                        posture,
                     )
                     .await
                 }
@@ -18692,6 +18707,7 @@ impl SubAgentToolRegistry {
     /// Auto-Review: ask the one-shot model guardian about a held call, using
     /// the child's own session client, and turn its answer into a verdict
     /// plus a transcript receipt. Any failure denies (fail closed).
+    #[allow(clippy::too_many_arguments)]
     async fn consult_child_guardian(
         &self,
         agent_id: &str,
@@ -18700,6 +18716,7 @@ impl SubAgentToolRegistry {
         input: &Value,
         review_context: &crate::tui::auto_review::AutoReviewContext<'_>,
         held_reason: &str,
+        posture: &ToolContext,
     ) -> ChildGateVerdict {
         use crate::core::engine::reviewer::{ReviewerOutcome, consult_reviewer};
         use crate::core::events::{ToolGate, ToolGateVerdict};
@@ -18713,12 +18730,22 @@ impl SubAgentToolRegistry {
             .gate_runtime
             .client
             .effective_route_envelope(self.gate_runtime.client.model(), chrono::Utc::now());
-        let review = consult_reviewer(
-            &self.gate_runtime.client,
-            &context_text,
-            &self.gate_runtime.cancel_token,
-        )
-        .await;
+        record_agent_progress(
+            &self.gate_runtime,
+            agent_id,
+            AgentProgressEventMeta::new(AgentWorkerStatus::Running).with_tool(name.to_string()),
+            format!("Auto-Review checking '{name}'"),
+        );
+        // A posture change mid-review abandons it: the call is gated again
+        // under what the person just chose (Full Access runs it at once).
+        let review = tokio::select! {
+            review = consult_reviewer(
+                &self.gate_runtime.client,
+                &context_text,
+                &self.gate_runtime.cancel_token,
+            ) => review,
+            () = posture.live_posture_moved() => return ChildGateVerdict::PostureChanged,
+        };
         // A provider-success reply carries usage even when it is incomplete or
         // semantically invalid. Record before interpreting the verdict so the
         // fail-closed path cannot erase spend. Pre-dispatch cancellation and
@@ -19557,18 +19584,28 @@ impl SubAgentToolRegistry {
         // Role posture and the execution envelope below stay authoritative:
         // this gate can only decide whether a call the role permits also
         // clears the session's approval boundary.
-        let context = self
+        let mut context = self
             .registry
             .context()
             .clone()
-            .with_live_posture()
             .with_owner_agent(self.owner_agent_id.clone(), self.owner_agent_name.clone())
             .with_origin_tool_call_id(tool_id.to_string());
-        if let ChildGateVerdict::Deny(reason) = self
-            .gate_held_call(agent_id, tool_id, name, &input, &context)
-            .await
-        {
-            return Err(admission_denied(reason));
+        let mut posture = self.refresh_posture(&mut context);
+        loop {
+            let verdict = self
+                .gate_held_call(agent_id, tool_id, name, &input, &context)
+                .await;
+            if let ChildGateVerdict::Deny(reason) = verdict {
+                return Err(admission_denied(reason));
+            }
+            // A guardian or a person can take a while. Run under the posture
+            // as it is now: gate again if the person narrowed it meanwhile.
+            let now = self.refresh_posture(&mut context);
+            let narrowed = matches!((&now, &posture), (Some(now), Some(then)) if now.narrows(then));
+            posture = now;
+            if verdict == ChildGateVerdict::Proceed && !narrowed {
+                break;
+            }
         }
         reject_subagent_terminal_takeover(name, &input).map_err(as_denied)?;
         if self.write_is_denied() {

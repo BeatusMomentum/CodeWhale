@@ -859,13 +859,25 @@ impl ToolContext {
         self
     }
 
-    /// Re-read the session's live permission posture (see `live_posture`).
-    #[must_use]
-    pub(crate) fn with_live_posture(mut self) -> Self {
-        if let Some(live) = self.live_posture.clone() {
-            live.apply(&mut self);
+    /// Re-read the session's live permission posture (see `live_posture`) and
+    /// return what was read; `None` when this context has no live source.
+    pub(crate) fn refresh_live_posture(
+        &mut self,
+    ) -> Option<crate::core::engine::LiveRuntimeAuthority> {
+        let live = self.live_posture.clone()?;
+        Some(live.apply(self))
+    }
+
+    /// Resolves once the live posture differs from what it is now; never for
+    /// a context without a live source.
+    pub(crate) async fn live_posture_moved(&self) {
+        let Some(live) = self.live_posture.as_ref() else {
+            return std::future::pending().await;
+        };
+        let start = live.read();
+        while live.read() == start {
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
         }
-        self
     }
 
     /// Stamp tool work with the sub-agent that owns it.

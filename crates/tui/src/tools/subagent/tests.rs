@@ -24682,7 +24682,9 @@ mod child_permission_gate {
     /// parent's: only a genuinely detached start keeps the floor.
     #[tokio::test]
     async fn full_access_child_runs_what_the_parent_turn_runs() {
-        let (registry, mut rx, _) = worker_registry(ApprovalMode::Bypass, true, true, None);
+        let (mut registry, mut rx, _) = worker_registry(ApprovalMode::Bypass, true, true, None);
+        // A foreground agent: the parent turn owns and waits on it.
+        registry.gate_runtime.foreground_children = Some(Arc::new(ForegroundChildRegistry::new()));
         let workspace = registry.gate_runtime.context.workspace.clone();
         let build = workspace.join("build");
         std::fs::create_dir_all(build.join("out")).unwrap();
@@ -24715,6 +24717,89 @@ mod child_permission_gate {
         assert!(drain_gate_receipts(&mut rx).is_empty());
     }
 
+    /// Review finding on d1655c424: judging agent calls as foreground let a
+    /// detached agent run catastrophic work. Nobody watches a detached agent,
+    /// so the floor holds for it in every posture, Full Access included.
+    #[tokio::test]
+    async fn a_detached_agents_catastrophic_shell_is_held_in_every_posture() {
+        for mode in [
+            ApprovalMode::Bypass,
+            ApprovalMode::Auto,
+            ApprovalMode::Suggest,
+            ApprovalMode::Never,
+        ] {
+            let (registry, mut rx, _) = worker_registry(
+                mode,
+                mode == ApprovalMode::Bypass,
+                false,
+                Some(unreachable_client()),
+            );
+            assert!(registry.gate_runtime.foreground_children.is_none());
+            // Harmless if it ever ran; classified as a raw-device write.
+            let err = registry
+                .execute(
+                    "agent_gate",
+                    "bash",
+                    json!({"command": "dd if=/dev/zero of=/dev/null count=0"}),
+                )
+                .await
+                .expect_err("a detached agent's device write is held");
+            // Ask turns the hold into a prompt no person can answer here; every
+            // other posture blocks it outright. Either way it never runs.
+            assert!(
+                err.to_string().contains("destructive background")
+                    || (mode == ApprovalMode::Suggest
+                        && err.to_string().contains("cannot raise a prompt")),
+                "{mode:?}: {err}"
+            );
+            let receipts = drain_gate_receipts(&mut rx);
+            assert!(
+                receipts
+                    .iter()
+                    .all(|receipt| receipt.0 == ToolGate::AutoReviewDeterministic),
+                "{mode:?}: the floor never reaches a guardian: {receipts:?}"
+            );
+        }
+    }
+
+    /// Review finding on d1655c424: the posture was read once, before the
+    /// gate. A person who tightened Permissions while an agent's prompt was
+    /// open still had that call run under the old posture once approved.
+    #[tokio::test]
+    async fn a_posture_narrowed_during_a_prompt_regates_the_call() {
+        let live = crate::core::engine::LivePosture::for_tests(
+            &std::env::temp_dir(),
+            ApprovalMode::Suggest,
+        );
+        let (registry, mut rx, manager) = worker_registry_with_live_posture(
+            ApprovalMode::Suggest,
+            false,
+            true,
+            None,
+            Some(live.clone()),
+        );
+        let call = registry.execute("agent_gate", "bash", json!({"command": "echo held | cat"}));
+        let answer = async {
+            let id = loop {
+                match rx.recv().await.expect("event stream") {
+                    Event::ApprovalRequired { id, .. } => break id,
+                    _ => continue,
+                }
+            };
+            // The person tightens Permissions, then answers the open card.
+            live.switch_for_tests(ApprovalMode::Never);
+            assert!(
+                manager
+                    .write()
+                    .await
+                    .resolve_child_approval(&id, ChildApprovalOutcome::Approved)
+            );
+        };
+        let (result, ()) = tokio::join!(call, answer);
+        let err = result.expect_err("the call is gated again under the narrower posture");
+        assert!(err.to_string().contains("requires approval"), "{err}");
+    }
+
     #[tokio::test]
     async fn full_access_runs_ordinary_shell_but_still_hard_blocks_the_safety_floor() {
         let (registry, mut rx, _) = worker_registry(ApprovalMode::Bypass, true, true, None);
@@ -24724,14 +24809,11 @@ mod child_permission_gate {
             .expect("Full Access runs ordinary shell without a prompt");
         assert!(output.contains("full-access"), "{output}");
         assert!(drain_gate_receipts(&mut rx).is_empty());
-        // Destructive *detached* work holds in every posture, exactly as it
-        // does for a detached parent start, so Full Access fails closed here.
+        // This harness agent is detached (no foreground turn owns it), and
+        // destructive detached work holds in every posture, exactly as it
+        // does for a detached parent start: Full Access fails closed here.
         let err = registry
-            .execute(
-                "agent_gate",
-                "Bash",
-                json!({"command": "rm -rf /usr", "background": true}),
-            )
+            .execute("agent_gate", "bash", json!({"command": "rm -rf /usr"}))
             .await
             .expect_err("destructive background shell stays blocked in Full Access");
         assert!(

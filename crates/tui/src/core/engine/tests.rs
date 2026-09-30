@@ -628,26 +628,17 @@ fn registry_instruction_is_in_the_initial_prompt_only_when_mcp_is_enabled() {
     assert!(!prompt.contains(MCP_REGISTRY_FIRST_INSTRUCTION_SOURCE));
 }
 
-/// The regression this test exists for. A real DeepSeek turn — "build a
-/// self-contained HTML focus timer, read a local fixture, verify it" — spent
-/// its steps on five `tool_search` calls for `registry_sync`, a deferred-schema
-/// retry, and reasoning about starting a browser MCP server, because the
-/// always-visible instruction ordered Registry discovery *before* code
-/// execution or a manual implementation and named two tools that are not in the
-/// catalog head.
-///
-/// Two properties keep that from coming back, and both are about this prompt,
-/// not about a second policy surface: discovery is never ordered ahead of
-/// ordinary local work, and the deferred-tool cost of reaching the Registry
-/// tools is stated where the model reads about them.
 /// The engine hands every agent the live posture cell, not a copy: a
 /// posture the person publishes after the agent's context was built is what
-/// the agent's next call runs under, sandbox included.
+/// the agent's next call runs under: approval, shell, sandbox.
 #[test]
 fn agent_tool_contexts_follow_the_published_posture() {
     let (engine, handle) = Engine::new(EngineConfig::default(), &Config::default());
     let context = engine.build_tool_context(AppMode::Agent, false);
-    let before = context.clone().with_live_posture();
+    let mut before = context.clone();
+    before
+        .refresh_live_posture()
+        .expect("engine contexts carry the live cell");
     assert!(!before.auto_approve);
     assert_ne!(
         before.elevated_sandbox_policy,
@@ -661,15 +652,70 @@ fn agent_tool_contexts_follow_the_published_posture() {
         ApprovalMode::Bypass,
         None,
     );
-    let after = context.with_live_posture();
+    let mut after = context;
+    after.refresh_live_posture();
     assert!(after.auto_approve);
     assert_eq!(after.approval_mode, ApprovalMode::Bypass);
     assert_eq!(
         after.elevated_sandbox_policy,
         Some(crate::sandbox::SandboxPolicy::DangerFullAccess)
     );
+    // Narrowing reaches it too: Plan drops shell and makes the sandbox read-only.
+    handle.publish_turn_authority(
+        AppMode::Plan,
+        true,
+        false,
+        false,
+        ApprovalMode::Suggest,
+        None,
+    );
+    after.refresh_live_posture();
+    assert!(!after.auto_approve);
+    assert_eq!(after.shell_policy, crate::worker_profile::ShellPolicy::None);
+    assert_eq!(
+        after.elevated_sandbox_policy,
+        Some(crate::sandbox::SandboxPolicy::ReadOnly)
+    );
 }
 
+/// "Gets stuck": an agent's approval answer only reached the agent when the
+/// engine was idle or itself awaiting approval. While the parent turn
+/// streamed or ran tools nobody read it, and the agent waited on. The handle
+/// now hands it to the agent directly — here with no engine running at all.
+#[tokio::test]
+async fn an_agent_approval_answer_reaches_the_agent_while_the_engine_is_busy() {
+    let mock = mock_engine_handle();
+    let id = format!("agent:agent_busy:approval:{}", uuid::Uuid::new_v4());
+    let (_, waiting) = mock
+        .handle
+        .subagent_manager
+        .write()
+        .await
+        .register_child_approval("agent_busy", &id, "bash", "held")
+        .expect("register");
+    mock.handle.approve_tool_call(id).await.expect("send");
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(2), waiting)
+        .await
+        .expect("the waiting agent is answered without the engine")
+        .expect("answer");
+    assert_eq!(
+        outcome,
+        crate::tools::subagent::ChildApprovalOutcome::Approved
+    );
+}
+
+/// The regression this test exists for. A real DeepSeek turn — "build a
+/// self-contained HTML focus timer, read a local fixture, verify it" — spent
+/// its steps on five `tool_search` calls for `registry_sync`, a deferred-schema
+/// retry, and reasoning about starting a browser MCP server, because the
+/// always-visible instruction ordered Registry discovery *before* code
+/// execution or a manual implementation and named two tools that are not in the
+/// catalog head.
+///
+/// Two properties keep that from coming back, and both are about this prompt,
+/// not about a second policy surface: discovery is never ordered ahead of
+/// ordinary local work, and the deferred-tool cost of reaching the Registry
+/// tools is stated where the model reads about them.
 #[test]
 fn registry_instruction_does_not_gate_ordinary_local_work() {
     let (engine, _handle) = Engine::new(EngineConfig::default(), &Config::default());
@@ -25495,6 +25541,10 @@ fn engine_handle_try_send_does_not_block_when_op_channel_is_full() {
         ))),
         compaction_cancellation: Arc::new(StdMutex::new(CompactionCancellationState::default())),
         turn_heartbeat: turn_heartbeat::TurnHeartbeat::new(),
+        subagent_manager: crate::tools::subagent::new_shared_subagent_manager(
+            std::env::temp_dir(),
+            1,
+        ),
     };
 
     // Fill the op channel with one message (capacity = 1).
