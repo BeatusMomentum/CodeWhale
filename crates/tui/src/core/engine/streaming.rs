@@ -38,7 +38,7 @@ impl ToolUseState {
     }
 }
 
-/// Maximum total bytes of text/thinking content before aborting the stream.
+/// Maximum total bytes of text, reasoning and tool-argument content before aborting the stream.
 pub(super) const STREAM_MAX_CONTENT_BYTES: usize = 10 * 1024 * 1024; // 10 MB
 /// Sanity backstop for total stream wall-clock duration. **Not** a routine
 /// kill switch — the stream chunk idle timeout is the primary stall

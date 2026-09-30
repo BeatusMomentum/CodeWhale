@@ -109,7 +109,44 @@ EOF
   chmod 0640 /etc/codewhale/feishu-bridge.env
 fi
 
-ufw allow OpenSSH
+# SSH_ALLOWED_CIDRS (comma or space separated IPv4/IPv6 CIDRs) limits who can
+# reach SSH. Every entry is validated before the firewall changes, the narrow
+# rules are added before the open one is removed (so the current session is
+# never cut off), and without the variable SSH stays open to every source
+# with a loud warning; the Lighthouse console firewall is the other layer.
+valid_cidr() {
+  local cidr="$1" ip bits octet
+  [[ "${cidr}" == */* ]] || return 1
+  ip="${cidr%/*}"
+  bits="${cidr##*/}"
+  [[ "${bits}" =~ ^[0-9]{1,3}$ ]] || return 1
+  if [[ "${ip}" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
+    (( 10#${bits} >= 8 && 10#${bits} <= 32 )) || return 1
+    IFS=. read -r -a octets <<< "${ip}"
+    for octet in "${octets[@]}"; do (( 10#${octet} <= 255 )) || return 1; done
+    return 0
+  fi
+  [[ "${ip}" =~ ^[0-9A-Fa-f:]+$ && "${ip}" == *:* ]] || return 1
+  (( 10#${bits} >= 16 && 10#${bits} <= 128 ))
+}
+
+ssh_cidrs="${SSH_ALLOWED_CIDRS:-}"
+ssh_cidrs="${ssh_cidrs//,/ }"
+if [[ -n "${ssh_cidrs// /}" ]]; then
+  for cidr in ${ssh_cidrs}; do
+    if ! valid_cidr "${cidr}"; then
+      echo "SSH_ALLOWED_CIDRS entry '${cidr}' is not an IPv4 /8-/32 or IPv6 /16-/128 CIDR; the firewall was not changed." >&2
+      exit 1
+    fi
+  done
+  for cidr in ${ssh_cidrs}; do
+    ufw allow from "${cidr}" to any app OpenSSH
+  done
+  ufw delete allow OpenSSH >/dev/null 2>&1 || true
+else
+  echo "WARNING: SSH is reachable from every source. Set SSH_ALLOWED_CIDRS (e.g. 203.0.113.4/32) and rerun to restrict it." >&2
+  ufw allow OpenSSH
+fi
 ufw --force enable
 
 cat <<EOF

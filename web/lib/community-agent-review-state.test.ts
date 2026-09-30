@@ -149,11 +149,15 @@ function stubAdminEnv(kv: FakeKv, lock?: FakeDraftClaimLock) {
   });
 }
 
-/** GitHub stub that records every comment/issue creation. */
-function stubGitHub(status = 201) {
+/**
+ * GitHub stub that records every comment/issue creation. Reads (the lookup
+ * for an earlier unknown-outcome post) answer `existing` and are not posts.
+ */
+function stubGitHub(status = 201, existing: unknown[] = []) {
   const posts: string[] = [];
-  const fetchMock = vi.fn(async (input: string | URL | Request) => {
+  const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
     const url = inputUrl(input);
+    if ((init?.method ?? "GET") === "GET") return jsonResponse(existing);
     posts.push(url);
     if (url.endsWith("/issues")) {
       return jsonResponse({ number: 900, html_url: "https://github.com/Hmbown/CodeWhale/issues/900" }, status);
@@ -209,7 +213,7 @@ describe("weekly digest publication requires maintainer approval", () => {
       usage: { input: 1, output: 1 },
     });
 
-    await expect(runDigest({ CURATED_KV: kv, DEEPSEEK_API_KEY: "k" })).resolves.toMatchObject({ ok: true });
+    await expect(runDigest({ CURATED_KV: kv, DRAFT_CLAIM_LOCK: new FakeDraftClaimLock(), DEEPSEEK_API_KEY: "k" })).resolves.toMatchObject({ ok: true });
     const recordKey = onlyKey(kv, "digest:weekly-");
     const staged: unknown = JSON.parse(kv.values.get(recordKey)!);
     expect(staged).toMatchObject({ approved: false });
@@ -231,7 +235,7 @@ describe("weekly digest publication requires maintainer approval", () => {
     const kv = new FakeKv();
     stubDigestSources();
     mocks.agentChat.mockResolvedValue({ content: JSON.stringify(DIGEST_MODEL_OUTPUT), usage: { input: 1, output: 1 } });
-    await runDigest({ CURATED_KV: kv, DEEPSEEK_API_KEY: "k" });
+    await runDigest({ CURATED_KV: kv, DRAFT_CLAIM_LOCK: new FakeDraftClaimLock(), DEEPSEEK_API_KEY: "k" });
 
     stubAdminEnv(kv);
     stubGitHub();
@@ -245,7 +249,7 @@ describe("weekly digest publication requires maintainer approval", () => {
     const kv = new FakeKv();
     stubDigestSources();
     mocks.agentChat.mockResolvedValue({ content: JSON.stringify(DIGEST_MODEL_OUTPUT), usage: { input: 1, output: 1 } });
-    await runDigest({ CURATED_KV: kv, DEEPSEEK_API_KEY: "k" });
+    await runDigest({ CURATED_KV: kv, DRAFT_CLAIM_LOCK: new FakeDraftClaimLock(), DEEPSEEK_API_KEY: "k" });
 
     stubAdminEnv(kv);
     stubGitHub();
@@ -261,7 +265,7 @@ describe("weekly digest publication requires maintainer approval", () => {
     const kv = new FakeKv();
     stubDigestSources();
     mocks.agentChat.mockResolvedValue({ content: JSON.stringify(DIGEST_MODEL_OUTPUT), usage: { input: 1, output: 1 } });
-    await runDigest({ CURATED_KV: kv, DEEPSEEK_API_KEY: "k" });
+    await runDigest({ CURATED_KV: kv, DRAFT_CLAIM_LOCK: new FakeDraftClaimLock(), DEEPSEEK_API_KEY: "k" });
 
     stubAdminEnv(kv);
     stubGitHub();
@@ -280,7 +284,7 @@ describe("weekly digest publication requires maintainer approval", () => {
     const kv = new FakeKv();
     stubDigestSources();
     mocks.agentChat.mockResolvedValue({ content: JSON.stringify(DIGEST_MODEL_OUTPUT), usage: { input: 1, output: 1 } });
-    await runDigest({ CURATED_KV: kv, DEEPSEEK_API_KEY: "k" });
+    await runDigest({ CURATED_KV: kv, DRAFT_CLAIM_LOCK: new FakeDraftClaimLock(), DEEPSEEK_API_KEY: "k" });
 
     stubAdminEnv(kv);
     const draftKey = onlyKey(kv, "draft:digest:");
@@ -289,7 +293,7 @@ describe("weekly digest publication requires maintainer approval", () => {
     expect([...kv.values.keys()].filter((k) => k.startsWith("digest:weekly-"))).toEqual([]);
 
     mocks.agentChat.mockClear();
-    await expect(runDigest({ CURATED_KV: kv, DEEPSEEK_API_KEY: "k" })).resolves.toMatchObject({ skipped: true });
+    await expect(runDigest({ CURATED_KV: kv, DRAFT_CLAIM_LOCK: new FakeDraftClaimLock(), DEEPSEEK_API_KEY: "k" })).resolves.toMatchObject({ skipped: true });
     expect(mocks.agentChat).not.toHaveBeenCalled();
     expect(kv.values.has(draftKey)).toBe(false);
   });
@@ -298,7 +302,7 @@ describe("weekly digest publication requires maintainer approval", () => {
     const kv = new FakeKv();
     stubDigestSources();
     mocks.agentChat.mockResolvedValue({ content: JSON.stringify(DIGEST_MODEL_OUTPUT), usage: { input: 1, output: 1 } });
-    await runDigest({ CURATED_KV: kv, DEEPSEEK_API_KEY: "k" });
+    await runDigest({ CURATED_KV: kv, DRAFT_CLAIM_LOCK: new FakeDraftClaimLock(), DEEPSEEK_API_KEY: "k" });
 
     stubAdminEnv(kv);
     stubGitHub(422);
@@ -311,11 +315,31 @@ describe("weekly digest publication requires maintainer approval", () => {
     expect(isPublishedDigest(JSON.parse(kv.values.get(onlyKey(kv, "digest:weekly-"))!))).toBe(false);
   });
 
+  it("finds a digest issue an unknown-outcome attempt created and publishes without a second issue", async () => {
+    const kv = new FakeKv();
+    stubDigestSources();
+    mocks.agentChat.mockResolvedValue({ content: JSON.stringify(DIGEST_MODEL_OUTPUT), usage: { input: 1, output: 1 } });
+    await runDigest({ CURATED_KV: kv, DRAFT_CLAIM_LOCK: new FakeDraftClaimLock(), DEEPSEEK_API_KEY: "k" });
+    stubAdminEnv(kv);
+    const draftKey = onlyKey(kv, "draft:digest:");
+    stubGitHub(504);
+    expect((await act(kv, { action: "post", draftKey, lang: "en" })).status).toBe(502);
+    // The claim and "posting" marker lapse (15 minutes in production).
+    for (const key of [...kv.values.keys()]) if (/^draft-(claim|resolved):digest:/.test(key)) kv.values.delete(key);
+
+    const body = JSON.parse(kv.values.get(draftKey)!).bodyEn as string;
+    const title = body.split("\n")[0].replace(/^#+\s*/, "").trim();
+    const posts = stubGitHub(201, [{ number: 901, html_url: "https://github.com/Hmbown/CodeWhale/issues/901", title, body }]);
+    const retry = await act(kv, { action: "post", draftKey, lang: "en" });
+    await expect(retry.json()).resolves.toMatchObject({ ok: true, number: 901, published: true });
+    expect(posts).toEqual([]);
+  });
+
   it("never publishes an older record when a later run saved its draft but not its record", async () => {
     const kv = new FakeKv();
     stubDigestSources();
     mocks.agentChat.mockResolvedValue({ content: JSON.stringify(DIGEST_MODEL_OUTPUT), usage: { input: 1, output: 1 } });
-    await runDigest({ CURATED_KV: kv, DEEPSEEK_API_KEY: "k" });
+    await runDigest({ CURATED_KV: kv, DRAFT_CLAIM_LOCK: new FakeDraftClaimLock(), DEEPSEEK_API_KEY: "k" });
     const recordKey = onlyKey(kv, "digest:weekly-");
     const recordA = kv.values.get(recordKey)!;
 
@@ -325,7 +349,7 @@ describe("weekly digest publication requires maintainer approval", () => {
       usage: { input: 1, output: 1 },
     });
     kv.failPutsMatching = /^digest:weekly-/;
-    await expect(runDigest({ CURATED_KV: kv, DEEPSEEK_API_KEY: "k" })).resolves.toMatchObject({ ok: false });
+    await expect(runDigest({ CURATED_KV: kv, DRAFT_CLAIM_LOCK: new FakeDraftClaimLock(), DEEPSEEK_API_KEY: "k" })).resolves.toMatchObject({ ok: false });
     kv.failPutsMatching = null;
     const draftKey = onlyKey(kv, "draft:digest:");
     expect(JSON.parse(kv.values.get(draftKey)!).bodyEn).toContain("Digest B");
@@ -353,7 +377,7 @@ describe("weekly digest publication requires maintainer approval", () => {
     const kv = new FakeKv();
     stubDigestSources();
     mocks.agentChat.mockResolvedValue({ content: JSON.stringify(DIGEST_MODEL_OUTPUT), usage: { input: 1, output: 1 } });
-    await runDigest({ CURATED_KV: kv, DEEPSEEK_API_KEY: "k" });
+    await runDigest({ CURATED_KV: kv, DRAFT_CLAIM_LOCK: new FakeDraftClaimLock(), DEEPSEEK_API_KEY: "k" });
     const recordKey = onlyKey(kv, "digest:weekly-");
     kv.values.set(recordKey, JSON.stringify({ ...JSON.parse(kv.values.get(recordKey)!), extra: "<script>" }));
 
@@ -411,7 +435,7 @@ describe("resolved drafts are not resurrected by the cron", () => {
     expect(res.status).toBe(200);
 
     stubIssues("2020-01-01T00:00:00.000Z");
-    await expect(runTriage({ CURATED_KV: kv, DEEPSEEK_API_KEY: "k" })).resolves.toMatchObject({ processed: 0, skipped: 1 });
+    await expect(runTriage({ CURATED_KV: kv, DRAFT_CLAIM_LOCK: new FakeDraftClaimLock(), DEEPSEEK_API_KEY: "k" })).resolves.toMatchObject({ processed: 0, skipped: 1 });
     expect(mocks.agentChat).not.toHaveBeenCalled();
     expect(kv.values.has("draft:triage:42")).toBe(false);
   });
@@ -426,7 +450,7 @@ describe("resolved drafts are not resurrected by the cron", () => {
 
     // Our own comment bumps updated_at past the draft's generatedAt.
     stubIssues(new Date().toISOString());
-    await runTriage({ CURATED_KV: kv, DEEPSEEK_API_KEY: "k" });
+    await runTriage({ CURATED_KV: kv, DRAFT_CLAIM_LOCK: new FakeDraftClaimLock(), DEEPSEEK_API_KEY: "k" });
     expect(mocks.agentChat).not.toHaveBeenCalled();
     expect(JSON.parse(kv.values.get("draft:triage:42")!)).toMatchObject({ posted: true });
   });
@@ -440,7 +464,7 @@ describe("resolved drafts are not resurrected by the cron", () => {
 
     // New commits or a reply a day later.
     stubIssues(new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString());
-    await expect(runTriage({ CURATED_KV: kv, DEEPSEEK_API_KEY: "k" })).resolves.toMatchObject({ processed: 1 });
+    await expect(runTriage({ CURATED_KV: kv, DRAFT_CLAIM_LOCK: new FakeDraftClaimLock(), DEEPSEEK_API_KEY: "k" })).resolves.toMatchObject({ processed: 1 });
     expect(JSON.parse(kv.values.get("draft:triage:42")!)).toMatchObject({ posted: false, bodyEn: "review" });
 
     // The fresh draft can be posted.
@@ -460,7 +484,7 @@ describe("resolved drafts are not resurrected by the cron", () => {
       usage: { input: 1, output: 1 },
     });
 
-    await expect(runDupes({ CURATED_KV: kv, DEEPSEEK_API_KEY: "k" })).resolves.toMatchObject({ ok: true, processed: 0 });
+    await expect(runDupes({ CURATED_KV: kv, DRAFT_CLAIM_LOCK: new FakeDraftClaimLock(), DEEPSEEK_API_KEY: "k" })).resolves.toMatchObject({ ok: true, processed: 0 });
     expect(JSON.parse(kv.values.get("draft:dupes:7")!)).toMatchObject({ posted: true });
   });
 });
@@ -843,6 +867,45 @@ describe("admin claims with the DRAFT_CLAIM_LOCK Durable Object bound", () => {
     expect(retryPosts).toHaveLength(1);
   });
 
+  it("looks for the earlier attempt's comment after an unknown outcome instead of posting it twice", async () => {
+    const { kv, lock } = await lockedAdmin(502);
+    expect((await act(kv, { action: "post", draftKey: KEY })).status).toBe(502);
+    lock.now += 15 * 60 * 1000;
+    kv.values.delete("draft-resolved:triage:42");
+
+    // GitHub did create it: the late retry records it and posts nothing.
+    const posts = stubGitHub(201, [{ id: 7, body: "English body" }]);
+    const retry = await act(kv, { action: "post", draftKey: KEY });
+    expect(retry.status).toBe(200);
+    await expect(retry.json()).resolves.toMatchObject({ ok: true, action: "posted", warning: expect.stringContaining("not posted again") });
+    expect(posts).toEqual([]);
+    expect(JSON.parse(kv.values.get("draft-resolved:triage:42")!).state).toBe("posted");
+    expect(kv.values.has("draft-post-unknown:triage:42")).toBe(false);
+  });
+
+  it("posts nothing when the lookup for an earlier attempt fails, and frees the draft", async () => {
+    const { kv, lock } = await lockedAdmin(502);
+    expect((await act(kv, { action: "post", draftKey: KEY })).status).toBe(502);
+    lock.now += 15 * 60 * 1000;
+    kv.values.delete("draft-resolved:triage:42");
+
+    const posts: string[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      if ((init?.method ?? "GET") === "GET") return jsonResponse({ message: "down" }, 503);
+      posts.push(inputUrl(input));
+      return jsonResponse({ id: 1 }, 201);
+    }));
+    const blocked = await act(kv, { action: "post", draftKey: KEY });
+    expect(blocked.status).toBe(502);
+    await expect(blocked.json()).resolves.toMatchObject({ error: expect.stringContaining("nothing was posted") });
+    expect(posts).toEqual([]);
+
+    // Once GitHub answers and has no such comment, the retry posts once.
+    const retryPosts = stubGitHub();
+    expect((await act(kv, { action: "post", draftKey: KEY })).status).toBe(200);
+    expect(retryPosts).toHaveLength(1);
+  });
+
   it("frees the draft at once when GitHub definitely rejected the post", async () => {
     const { kv } = await lockedAdmin(422);
     expect((await act(kv, { action: "post", draftKey: KEY })).status).toBe(502);
@@ -929,5 +992,97 @@ describe("admin draft queue", () => {
     vi.spyOn(console, "error").mockImplementation(() => {});
 
     await expect(listDrafts(kv)).resolves.toHaveLength(200);
+  });
+});
+
+describe("post retry durability and generation admission", () => {
+  const KEY = "draft:triage:42";
+  async function prepared() {
+    const kv = new FakeKv();
+    await saveDraft(kv, draft());
+    const lock = new FakeDraftClaimLock();
+    stubAdminEnv(kv, lock);
+    return { kv, lock };
+  }
+  it("posts nothing when an earlier receipt cannot be read", async () => {
+    const { kv } = await prepared();
+    const originalGet = kv.get.bind(kv);
+    kv.get = async (key) => { if (key.startsWith("draft-post-unknown:")) throw new Error("unavailable"); return originalGet(key); };
+    const posts = stubGitHub();
+    expect((await act(kv, { action: "post", draftKey: KEY })).status).toBe(503);
+    expect(posts).toEqual([]);
+  });
+  it("writes the attempt before dispatch and refuses an unavailable receipt write", async () => {
+    const { kv } = await prepared();
+    kv.failPutsMatching = /^draft-post-unknown:/;
+    const posts = stubGitHub();
+    expect((await act(kv, { action: "post", draftKey: KEY })).status).toBe(502);
+    expect(posts).toEqual([]);
+  });
+  it("finds an earlier post past page one even when KV lost the receipt", async () => {
+    const { kv, lock } = await prepared();
+    stubGitHub(504);
+    expect((await act(kv, { action: "post", draftKey: KEY })).status).toBe(502);
+    lock.now += 15 * 60 * 1000;
+    kv.values.delete("draft-resolved:triage:42");
+    kv.values.delete("draft-post-unknown:triage:42");
+    const posts: string[] = [], pages: string[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = inputUrl(input);
+      if (init?.method === "POST") { posts.push(url); return jsonResponse({ id: 2 }, 201); }
+      const page = new URL(url).searchParams.get("page"); pages.push(page!);
+      return jsonResponse(page === "1" ? Array.from({ length: 100 }, () => ({ body: "another body" })) : [{ id: 7, body: "English body" }]);
+    }));
+    expect((await act(kv, { action: "post", draftKey: KEY })).status).toBe(200);
+    expect(pages).toEqual(["1", "2"]);
+    expect(posts).toEqual([]);
+  });
+  it("a bounded incomplete reconciliation never licenses another post", async () => {
+    const { kv, lock } = await prepared();
+    stubGitHub(504);
+    await act(kv, { action: "post", draftKey: KEY });
+    lock.now += 15 * 60 * 1000;
+    kv.values.delete("draft-resolved:triage:42");
+    const posts: string[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      if (init?.method === "POST") posts.push(inputUrl(input));
+      return jsonResponse(Array.from({ length: 100 }, () => ({ body: "another body" })));
+    }));
+    expect((await act(kv, { action: "post", draftKey: KEY })).status).toBe(502);
+    expect(posts).toEqual([]);
+  });
+  it("refuses changed retry text while the earlier attempt is unresolved", async () => {
+    const { kv, lock } = await prepared();
+    stubGitHub(504);
+    await act(kv, { action: "post", draftKey: KEY });
+    lock.now += 15 * 60 * 1000;
+    kv.values.delete("draft-resolved:triage:42");
+    const posts = stubGitHub();
+    expect((await act(kv, { action: "post", draftKey: KEY, editedBody: "different body" })).status).toBe(409);
+    expect(posts).toEqual([]);
+  });
+  it("admits one overlapping generation batch and holds completed KV propagation", async () => {
+    const kv = new FakeKv(), lock = new FakeDraftClaimLock();
+    const env = { CURATED_KV: kv, DRAFT_CLAIM_LOCK: lock, DEEPSEEK_API_KEY: "k" };
+    vi.stubGlobal("fetch", vi.fn(async () => jsonResponse([{ number: 42, title: "issue", body: "body", updated_at: "2020-01-01T00:00:00.000Z", html_url: "https://github.com/Hmbown/CodeWhale/issues/42", labels: [] }])));
+    let finish!: (value: unknown) => void;
+    mocks.agentChat.mockImplementationOnce(() => new Promise(resolve => { finish = resolve; })).mockResolvedValue({ content: JSON.stringify({ bodyEn: "other", bodyZh: "另一个" }), usage: { input: 1, output: 1 } });
+    const first = runTriage(env);
+    await vi.waitFor(() => expect(mocks.agentChat).toHaveBeenCalledOnce());
+    const second = await runTriage(env);
+    expect(second).toMatchObject({ processed: 0, skipped: 1 });
+    finish({ content: JSON.stringify({ bodyEn: "generated", bodyZh: "生成" }), usage: { input: 1, output: 1 } });
+    expect(await first).toMatchObject({ processed: 1 });
+    kv.values.delete(KEY); // another location's stale KV must not spend again.
+    expect(await runTriage(env)).toMatchObject({ processed: 0, skipped: 1 });
+    expect(mocks.agentChat).toHaveBeenCalledOnce();
+  });
+  it("missing or failed durable generation admission starts no provider call", async () => {
+    const kv = new FakeKv();
+    const reads = vi.fn(); vi.stubGlobal("fetch", reads);
+    expect(await runTriage({ CURATED_KV: kv, DEEPSEEK_API_KEY: "k" })).toMatchObject({ skipped: true });
+    const broken = { idFromName: () => ({ toString: () => "x" }), get: () => ({ act: async () => { throw new Error("down"); } }) };
+    expect(await runTriage({ CURATED_KV: kv, DRAFT_CLAIM_LOCK: broken, DEEPSEEK_API_KEY: "k" })).toMatchObject({ skipped: true });
+    expect(reads).not.toHaveBeenCalled(); expect(mocks.agentChat).not.toHaveBeenCalled();
   });
 });

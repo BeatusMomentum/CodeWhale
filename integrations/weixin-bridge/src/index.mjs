@@ -23,9 +23,10 @@ import {
   latestRunningTurn,
   activeTurnBlock,
   helpText,
+  processUpdateBatch,
 } from "./lib.mjs";
 import { renderQrToText } from "./qr.mjs";
-import { ThreadStore as CoreThreadStore } from "../../bridge-core/src/lib.mjs";
+import { ThreadStore as CoreThreadStore, writeFileDurable } from "../../bridge-core/src/lib.mjs";
 
 // ============================================================================
 // ThreadStore — JSON 文件持久化（与 feishu/telegram/wechat bridge 一致）
@@ -59,11 +60,7 @@ async function loadAccount(stateDir) {
 async function saveAccount(stateDir, account) {
   const p = resolveAccountPath(stateDir);
   await fs.mkdir(path.dirname(p), { recursive: true, mode: 0o700 });
-  const tmp = `${p}.tmp`;
-  await fs.writeFile(tmp, `${JSON.stringify(account, null, 2)}\n`, {
-    mode: 0o600,
-  });
-  await fs.rename(tmp, p);
+  await writeFileDurable(p, `${JSON.stringify(account, null, 2)}\n`, { mode: 0o600 });
 }
 
 // ============================================================================
@@ -718,9 +715,57 @@ async function saveSyncBuf(stateDir, buf) {
   // The state dir may not exist yet on a first run whose first persisted write
   // is the poll cursor rather than account.json.
   await fs.mkdir(path.dirname(p), { recursive: true, mode: 0o700 });
-  const tmp = `${p}.tmp`;
-  await fs.writeFile(tmp, buf, { mode: 0o600 });
-  await fs.rename(tmp, p);
+  await writeFileDurable(p, buf, { mode: 0o600 });
+}
+
+/** One claimed inbound message: context token, text, allowlist, command. */
+async function handleInbound(msg) {
+  const fromUser = msg.from_user_id || "";
+  // 保存 context_token
+  if (msg.context_token) {
+    await threadStore.patchChat(fromUser, {
+      contextToken: msg.context_token,
+      updatedAt: new Date().toISOString(),
+    });
+  }
+
+  // 提取文本
+  const text = extractText(msg.item_list);
+
+  if (!text) {
+    await sendText(
+      fromUser,
+      "仅支持文本消息。图片/语音/视频/文件暂不支持。"
+    );
+    return;
+  }
+
+  console.log(
+    `[inbound] from=${fromUser} text=${text.slice(0, 100)}`
+  );
+
+  // 白名单检查
+  if (!isAllowed(fromUser)) {
+    await sendText(
+      fromUser,
+      [
+        "This WeChat user is not in WEIXIN_CHAT_ALLOWLIST.",
+        `user_id=${fromUser}`,
+        "",
+        "For first pairing, add this user_id to WEIXIN_CHAT_ALLOWLIST, or temporarily set WEIXIN_ALLOW_UNLISTED=true.",
+      ].join("\n")
+    );
+    return;
+  }
+
+  // 命令路由
+  const command = parseCommand(text);
+  await handleCommand(fromUser, command).catch((error) => {
+    console.error(
+      `failed to handle command from=${fromUser} text=${text.slice(0, 100)}`,
+      error
+    );
+  });
 }
 
 async function monitorLoop() {
@@ -775,69 +820,26 @@ async function monitorLoop() {
 
       consecutiveFailures = 0;
 
-      // 保存游标
-      if (resp.get_updates_buf) {
-        getUpdatesBuf = resp.get_updates_buf;
-        await saveSyncBuf(config.stateDir, getUpdatesBuf);
-      }
-
-      // 处理消息
-      const msgs = resp.msgs || [];
-      for (const msg of msgs) {
-        const fromUser = msg.from_user_id || "";
-        const messageId = String(msg.message_id || "");
-
-        if (!fromUser) continue;
-
-        const msgKey = `${fromUser}:${messageId}`;
-        if (await threadStore.recordMessage(msgKey)) continue;
-
-        // 保存 context_token
-        if (msg.context_token) {
-          await threadStore.patchChat(fromUser, {
-            contextToken: msg.context_token,
-            updatedAt: new Date().toISOString(),
-          });
-        }
-
-        // 提取文本
-        const text = extractText(msg.item_list);
-
-        if (!text) {
+      // 先处理消息，再保存游标：进程崩溃时整批从 iLink 重放，
+      // 已完成的消息按 key 跳过，崩溃时正在处理的消息只提示、不重跑。
+      await processUpdateBatch({
+        messages: resp.msgs || [],
+        nextCursor: resp.get_updates_buf,
+        store: threadStore,
+        keyOf: (msg) => (msg.from_user_id ? `${msg.from_user_id}:${String(msg.message_id || "")}` : null),
+        interrupted: async (msg) => {
+          if (!isAllowed(msg.from_user_id)) return;
           await sendText(
-            fromUser,
-            "仅支持文本消息。图片/语音/视频/文件暂不支持。"
+            msg.from_user_id,
+            "桥接进程在处理这条消息时重启，未重复执行；如仍需要请重新发送。\nThe bridge restarted while handling this message and did not run it again; send it again if you still need it."
           );
-          continue;
-        }
-
-        console.log(
-          `[inbound] from=${fromUser} text=${text.slice(0, 100)}`
-        );
-
-        // 白名单检查
-        if (!isAllowed(fromUser)) {
-          await sendText(
-            fromUser,
-            [
-              "This WeChat user is not in WEIXIN_CHAT_ALLOWLIST.",
-              `user_id=${fromUser}`,
-              "",
-              "For first pairing, add this user_id to WEIXIN_CHAT_ALLOWLIST, or temporarily set WEIXIN_ALLOW_UNLISTED=true.",
-            ].join("\n")
-          );
-          continue;
-        }
-
-        // 命令路由
-        const command = parseCommand(text);
-        await handleCommand(fromUser, command).catch((error) => {
-          console.error(
-            `failed to handle command from=${fromUser} text=${text.slice(0, 100)}`,
-            error
-          );
-        });
-      }
+        },
+        handle: handleInbound,
+        commitCursor: async (buf) => {
+          getUpdatesBuf = buf;
+          await saveSyncBuf(config.stateDir, buf);
+        },
+      });
     } catch (error) {
       if (error.name === "AbortError" || error.message?.includes("abort")) {
         // 长轮询超时是正常的，立即重试

@@ -60,6 +60,9 @@ export function SessionMedia({ asset, locale = "en" }: { asset: MediaAsset; loca
   const poster = asset.poster!;
   const video = asset.video!;
   const captions = asset.captions ?? [];
+  // The track matching the page's language is the default; English only
+  // when the page's language has no captions.
+  const defaultCaption = captions.some((track) => track.srclang === locale) ? locale : "en";
 
   return (
     <figure
@@ -84,7 +87,7 @@ export function SessionMedia({ asset, locale = "en" }: { asset: MediaAsset; loca
             src={`/${track.src}`}
             srcLang={track.srclang}
             label={track.label}
-            default={track.srclang === "en"}
+            default={track.srclang === defaultCaption}
           />
         ))}
       </video>

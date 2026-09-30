@@ -231,3 +231,17 @@ test("Docker desktop entrypoint survives repeated orderly restarts", { ...NEED_D
     assert.equal(observed, true, `desktop unavailable after restart ${cycle}: ${last}`);
   }
 });
+
+test("destroyDockerComputer never removes a desktop another session spawned", async () => {
+  const issued = [];
+  const labels = (value) => async (args) => {
+    issued.push(args);
+    return args[0] === "container" ? { code: 0, stdout: `${value}\n`, stderr: "" } : { code: 0, stdout: "", stderr: "" };
+  };
+  const computer = { container: "cu-spawn-other-ab12cd" };
+  assert.deepEqual(await spawnMod.destroyDockerComputer(computer, labels("1|another-session")), { destroyed: false, reason: "other_session" });
+  assert.deepEqual(await spawnMod.destroyDockerComputer(computer, labels("|")), { destroyed: false, reason: "not_spawned" });
+  assert.equal(issued.filter((args) => args[0] === "rm").length, 0, "no docker rm for a container this session does not own");
+  assert.deepEqual(await spawnMod.destroyDockerComputer(computer, labels(`1|${SESSION_ID}`)), { destroyed: true });
+  assert.deepEqual(issued.at(-1), ["rm", "-f", "cu-spawn-other-ab12cd"]);
+});
