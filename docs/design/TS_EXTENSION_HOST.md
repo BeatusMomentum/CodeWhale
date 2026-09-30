@@ -103,9 +103,10 @@ on either runtime.
   `memory_limit_mib` in `host/hello`. The core accepts only the value it asked
   for (`CODEWHALE_HOST_MEMORY_LIMIT_MIB`). Past the limit the kernel SIGKILLs
   the host, and the exit reason says so. Processes the host starts are not
-  covered. A Node host on macOS, or a Bun host that could not apply the limit
-  (the reason is on its stderr and in `/plugin` diagnostics), is checked at
-  each heartbeat instead, which lags by up to one interval. Node's 256 MB heap
+  covered. A Bun host that cannot apply the requested kernel limit is refused
+  before initialization, with the reason retained in its stderr and `/plugin`
+  diagnostics. A Node host on macOS is checked at each heartbeat instead,
+  which lags by up to one interval. Node's 256 MB heap
   flag still applies everywhere.
 - **Tests.** The host JS suite runs under `node --test` and `bun test`
   (`npm run test:bun`); each run spawns the host on the runtime running the

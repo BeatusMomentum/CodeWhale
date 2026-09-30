@@ -709,8 +709,7 @@ fn monitor_host(shared: &Arc<ManagerShared>, host: &Arc<HostProcess>, generation
             if restart_dirty_host_when_idle(&shared, &host, generation) {
                 return;
             }
-            // Only where no kernel limit holds (a macOS Node host, or a Bun
-            // host that could not apply its jetsam limit).
+            // Only where no kernel limit is planned (a macOS Node host).
             if host.memory() == supervisor::MemoryEnforcement::Heartbeat
                 && let Some(resident) = host.pid.and_then(supervisor::resident_bytes)
                 && resident > host.memory_cap

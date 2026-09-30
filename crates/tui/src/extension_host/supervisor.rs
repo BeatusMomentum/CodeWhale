@@ -36,9 +36,10 @@
 //!   later `exec` clears it, so it cannot be set on `sandbox-exec`. The Bun
 //!   host therefore re-executes itself in place with the limit before any
 //!   plugin loads, and reports it in `host/hello`; past the cap the kernel
-//!   SIGKILLs it. Plugin child processes are not covered. Node has no FFI to
-//!   do the same, so a Node host (or a Bun host that could not apply the
-//!   limit) is checked at each heartbeat instead: enforced only as often as
+//!   SIGKILLs it. Plugin child processes are not covered. A Bun host that
+//!   cannot apply the requested limit is refused before initialization. Node
+//!   has no FFI to do the same, so a Node host is checked at each heartbeat
+//!   instead: enforced only as often as
 //!   the heartbeat runs. Node also keeps `--max-old-space-size=256`.
 
 use std::collections::{HashMap, VecDeque};
@@ -111,7 +112,7 @@ pub(crate) struct HostLaunch {
     /// Bytes; see the module docs for how each platform enforces it.
     pub memory_cap: u64,
     /// How the cap is meant to be enforced; a macOS Bun host confirms its
-    /// jetsam limit in `host/hello` or falls back to the heartbeat check.
+    /// jetsam limit in `host/hello` or initialization is refused.
     pub memory: MemoryEnforcement,
 }
 
@@ -779,8 +780,14 @@ impl HostProcess {
                         "host reports a {applied} MiB memory limit the core did not ask for"
                     ));
                 }
-                // Asked for but not applied: the host said why on stderr.
-                (None, Some(_)) => MemoryEnforcement::Heartbeat,
+                // The mandatory kernel cap cannot degrade to a delayed RSS
+                // observation. Refuse before plugin initialization and keep
+                // the host's stderr explanation in the existing diagnosis.
+                (None, Some(requested)) => {
+                    return Err(format!(
+                        "host did not apply the requested {requested} MiB kernel memory limit; initialization refused"
+                    ));
+                }
                 (None, None) => launch.memory,
             };
             let _ = host.memory.set(memory);

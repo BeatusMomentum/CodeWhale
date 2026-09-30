@@ -57,7 +57,7 @@ const JETSAM_PRIORITY_DEFAULT = -1
  * native-code lockdown takes FFI away afterwards (`denyNativeCode`).
  *
  * If the limit cannot be applied, the reason goes to stderr and `host/hello`
- * reports no limit, so the core falls back to its heartbeat check.
+ * reports no limit, so the core refuses initialization before plugins load.
  */
 export function applyMemoryLimit(): number | undefined {
   const requested = Number(process.env[LIMIT_REQUEST] ?? '')
