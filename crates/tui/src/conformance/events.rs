@@ -14,6 +14,8 @@
 //! system prompt and tool catalog bodies are replaced by a marker because the
 //! prompt family owns those bytes; runs of adjacent `tool_call_complete`
 //! events are ordered by tool call id because parallel completions race.
+//! Adjacent `operation_activity_completed` observations are likewise ordered
+//! by their established span id. No start, error, or other event is crossed.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::path::Path;
@@ -453,19 +455,66 @@ pub(super) fn normalize_events(events: &[Event], masker: &mut Masker) -> Vec<Val
 fn order_parallel_completions(lines: &mut [Value]) {
     let mut start = 0;
     while start < lines.len() {
+        let (kind, key) = match lines[start]["event"].as_str() {
+            Some("tool_call_complete") => ("tool_call_complete", "tool_call_id"),
+            Some("operation_activity_completed") => ("operation_activity_completed", "span_id"),
+            _ => {
+                start += 1;
+                continue;
+            }
+        };
         let mut end = start;
-        while end < lines.len() && lines[end]["event"] == "tool_call_complete" {
+        while end < lines.len() && lines[end]["event"] == kind {
             end += 1;
         }
         if end - start > 1 {
-            lines[start..end].sort_by(|left, right| {
-                left["tool_call_id"]
-                    .as_str()
-                    .cmp(&right["tool_call_id"].as_str())
-            });
+            lines[start..end].sort_by(|left, right| left[key].as_str().cmp(&right[key].as_str()));
         }
         start = end.max(start + 1);
     }
+}
+
+#[test]
+fn parallel_completion_projection_keeps_outcomes_spans_and_causal_boundaries() {
+    let first = json!({"event": "operation_activity_completed", "span_id": "call_a#1", "outcome": "succeeded"});
+    let second = json!({"event": "operation_activity_completed", "span_id": "call_b#2", "outcome": "failed"});
+    let boundary = json!({"event": "error", "message": "exact error bytes"});
+    let start = json!({"event": "operation_activity_started", "span_id": "call_a#1"});
+    let original = vec![
+        start.clone(),
+        second.clone(),
+        first.clone(),
+        boundary.clone(),
+        second.clone(),
+        start.clone(),
+        first.clone(),
+    ];
+    let expected = vec![
+        start.clone(),
+        first.clone(),
+        second.clone(),
+        boundary,
+        second,
+        start,
+        first,
+    ];
+    let mut normalized = original.clone();
+    order_parallel_completions(&mut normalized);
+    assert_eq!(normalized, expected);
+    assert_eq!(normalized.len(), original.len());
+
+    let mut wrong_outcome = original.clone();
+    wrong_outcome[1]["outcome"] = json!("succeeded");
+    order_parallel_completions(&mut wrong_outcome);
+    assert_ne!(wrong_outcome, expected, "wrong outcome was normalized away");
+
+    let mut wrong_span = original;
+    wrong_span[1]["span_id"] = json!("call_other#2");
+    order_parallel_completions(&mut wrong_span);
+    assert_ne!(
+        wrong_span, expected,
+        "wrong span relationship was normalized away"
+    );
 }
 
 fn check_invariants(case: &Value, workspace: &Path, provider: &ScriptedProvider) -> Vec<String> {

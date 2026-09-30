@@ -10,7 +10,8 @@ written in the abstract.
 Everything here is language-neutral: JSON, JSONL, raw SSE bytes, and POSIX
 shell. No fixture was captured from a real provider or contains a secret.
 
-The Rust runner is `crates/tui/src/conformance/` (one test per family):
+The Rust runner is `crates/tui/src/conformance/` (one golden test per family,
+plus hardening controls):
 
 ```sh
 cargo test -p codewhale-tui --lib -- conformance::
@@ -78,6 +79,9 @@ Each line is `codewhale_protocol::EventMsg` as serialized (`"event"` tag), with:
 - `tool_catalog` and `system_prompt` bodies → `"<pinned by the prompt family>"`;
 - runs of adjacent `tool_call_complete` events ordered by `tool_call_id`
   (parallel completions race);
+- runs of adjacent `operation_activity_completed` observations ordered by
+  the established `span_id` for the same reason; outcomes, span relationships,
+  and event counts stay exact, and no start/error/other event is crossed;
 - keys sorted.
 
 The last line is `{"harness_summary": {model_requests, non_streaming_requests,
@@ -179,6 +183,9 @@ background observers, cancellation and process-tree teardown are not covered.
 The turns do not qualify persistence/resume, nested multi-tool cardinality,
 non-draining client backpressure, or every client projection. Slash-command,
 script-tool, and migrated adapter calls need their own fixtures before flipping.
+The Plan prefix records its advertised catalog and frozen prompt bytes; it
+does not prove read-only admission. At this baseline it still advertises
+`bash`, `edit` and `write`; full-turn Plan refusal needs separate evidence.
 
 The prefix runner names unavailable host-probed tools explicitly. A skipped
 definition (`code_execution`, `image_ocr`, `js_execution`, `pandoc_convert`) is
