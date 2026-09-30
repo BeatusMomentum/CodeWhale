@@ -46,6 +46,7 @@ fn rlm_kernel_error_result(
     error: &str,
     elapsed: Duration,
     usage_batch: &crate::cost_status::RuntimeUsageBatch,
+    nested_events: &[Value],
 ) -> ToolResult {
     let mut metadata = json!({
         // The registered tool is `rlm`; `eval` is its action. Naming a
@@ -57,7 +58,14 @@ fn rlm_kernel_error_result(
         "kernel_error": true,
     });
     crate::cost_status::attach_child_usage_batch_metadata(&mut metadata, usage_batch);
-    ToolResult::error(format!("rlm action='eval': {error}")).with_metadata(metadata)
+    ToolResult::error(
+        json!({
+            "tool": "rlm", "action": "eval", "error": error,
+            "nested_events": nested_events,
+        })
+        .to_string(),
+    )
+    .with_metadata(metadata)
 }
 
 /// Unified RLM session tool.
@@ -467,6 +475,14 @@ impl RlmTool {
                  Example: {\"name\": \"<ctx>\", \"code\": \"print(len(content))\"}; call FINAL(value) to return a result handle.",
             )
         })?;
+        if context
+            .turn_deadline
+            .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
+        {
+            return Err(ToolError::execution_failed(
+                "RLM parent turn deadline exhausted before execution",
+            ));
+        }
         let session = get_session(context, name).await?;
         let mut session = session.lock().await;
         let config = session.config.clone();
@@ -478,13 +494,24 @@ impl RlmTool {
         };
 
         let started = Instant::now();
-        let (round, child_usage_batch) = if let Some(client) = self.client.clone() {
+        let deadline = context.turn_deadline.unwrap_or_else(|| {
+            tokio::time::Instant::now() + crate::tools::subagent::DEFAULT_CHILD_WALL_TIME
+        });
+        let (round, child_usage_batch, nested_events) = if let Some(client) = self.client.clone() {
             let bridge = RlmBridge::new(
                 Arc::new(client),
                 self.root_model.clone(),
                 config.sub_rlm_max_depth.min(HARD_SUB_RLM_DEPTH_CAP),
-            );
-            let round_result = kernel.run(code, Some(&bridge)).await;
+            )
+            .with_deadline(Some(deadline));
+            let round_result =
+                tokio::time::timeout_at(bridge.deadline(), kernel.run(code, Some(&bridge)))
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err(anyhow::anyhow!(
+                            "RLM evaluation reached the parent turn deadline"
+                        ))
+                    });
             let usage = bridge.usage_snapshot().await;
             let round = match round_result {
                 Ok(round) => round,
@@ -494,6 +521,9 @@ impl RlmTool {
                     // Return a failed ToolResult (rather than a bare ToolError)
                     // so ToolCallComplete still carries the immutable child
                     // receipt and the runtime can durably account for it.
+                    // Cancellation may leave Python running. Discard the
+                    // owned interpreter rather than reusing unknown state.
+                    session.kernel = None;
                     session.last_used_at = Instant::now();
                     return Ok(rlm_kernel_error_result(
                         &error.to_string(),
@@ -503,6 +533,7 @@ impl RlmTool {
                             drop_records: usage.drop_records,
                             dropped_records: usage.dropped_records,
                         },
+                        &usage.nested_events,
                     ));
                 }
             };
@@ -513,13 +544,27 @@ impl RlmTool {
                     drop_records: usage.drop_records,
                     dropped_records: usage.dropped_records,
                 },
+                usage.nested_events,
             )
         } else {
-            let round = kernel
-                .run(code, None::<&RlmBridge>)
-                .await
-                .map_err(|e| ToolError::execution_failed(format!("rlm_eval: {e}")))?;
-            (round, crate::cost_status::RuntimeUsageBatch::default())
+            let round =
+                match tokio::time::timeout_at(deadline, kernel.run(code, None::<&RlmBridge>)).await
+                {
+                    Ok(result) => {
+                        result.map_err(|e| ToolError::execution_failed(format!("rlm_eval: {e}")))?
+                    }
+                    Err(_) => {
+                        session.kernel = None;
+                        return Err(ToolError::execution_failed(
+                            "RLM evaluation reached the parent turn deadline",
+                        ));
+                    }
+                };
+            (
+                round,
+                crate::cost_status::RuntimeUsageBatch::default(),
+                Vec::new(),
+            )
         };
 
         session.rpc_count = session.rpc_count.saturating_add(round.rpc_count);
@@ -600,6 +645,7 @@ impl RlmTool {
             "rpc_count": rpc_count,
             "had_error": had_error,
             "new_vars": [],
+            "nested_events": nested_events,
             "final": final_handle,
         });
         if let Some(ref stdout_preview) = stdout_preview {
@@ -1027,6 +1073,7 @@ mod tests {
                 drop_records: vec![drop_record],
                 dropped_records: 1,
             },
+            &[],
         );
 
         assert!(!result.success);
@@ -1290,6 +1337,146 @@ mod tests {
         assert!(description.contains("`content`"));
         assert!(description.contains("print(len(content))"));
         assert!(!description.contains("SOURCE"));
+    }
+
+    #[tokio::test]
+    async fn nested_rlm_receipts_survive_tool_result_save_and_reopen_even_on_kernel_failure() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("POST")).respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "nested-model-response", "object": "chat.completion",
+            "model": "deepseek-v4-flash",
+            "choices": [{"index": 0, "message": {"role": "assistant",
+                "content": "```repl\nFINAL('durable nested answer')\n```"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 7, "completion_tokens": 9, "total_tokens": 16}
+        }))).expect(2).mount(&server).await;
+        let config = crate::config::Config::default()
+            .with_legacy_root(Some("loopback-fixture-key".into()), Some(server.uri()));
+        let client = CodewhaleClient::new(&config).unwrap();
+        let tool = RlmTool::new("rlm", Some(client)).with_root_model("deepseek-v4-flash".into());
+        let temp = tempfile::tempdir().unwrap();
+        let context = ToolContext::new(temp.path());
+        tool.execute(
+            json!({"action": "open", "name": "receipts", "content": "fixture context"}),
+            &context,
+        )
+        .await
+        .unwrap();
+        for (failed, code) in [
+            (false, "print(rlm_query('nested context'))"),
+            (true, "print(rlm_query('nested context')); _os._exit(2)"),
+        ] {
+            let result = tool
+                .execute(
+                    json!({"action": "eval", "name": "receipts", "code": code}),
+                    &context,
+                )
+                .await
+                .unwrap();
+            assert_eq!(result.success, !failed);
+            let output: Value = serde_json::from_str(&result.content).unwrap();
+            let events = output["nested_events"]
+                .as_array()
+                .expect("retained nested events");
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|entry| entry["kind"] == "code")
+                    .count(),
+                1
+            );
+            assert!(events.iter().any(|entry| {
+                entry["content"]
+                    .as_str()
+                    .is_some_and(|line| line.contains("FINAL('durable nested answer')"))
+            }));
+            assert!(events.iter().any(|entry| {
+                entry["content"]
+                    .as_str()
+                    .is_some_and(|line| line.contains("RLM finished: Final"))
+            }));
+            let messages = vec![
+                Message {
+                    role: Role::Assistant,
+                    content: vec![ContentBlock::ToolUse {
+                        id: "rlm-call".into(),
+                        name: "rlm".into(),
+                        input: json!({"action": "eval", "name": "receipts", "code": code}),
+                        execution_id: Some("rlm-execution".into()),
+                        caller: None,
+                        thought_signature: None,
+                    }],
+                },
+                Message {
+                    role: Role::User,
+                    content: vec![ContentBlock::ToolResult {
+                        tool_use_id: "rlm-call".into(),
+                        execution_id: Some("rlm-execution".into()),
+                        content: result.content,
+                        is_error: Some(failed),
+                        content_blocks: None,
+                    }],
+                },
+            ];
+            let manager =
+                crate::session_manager::SessionManager::new(temp.path().join("sessions")).unwrap();
+            let saved = crate::session_manager::create_saved_session(
+                &messages,
+                "deepseek-v4-flash",
+                temp.path(),
+                16,
+                None,
+            );
+            manager.save_session(&saved).unwrap();
+            let reopened = manager.load_session(&saved.metadata.id).unwrap();
+            let ContentBlock::ToolResult { content, .. } = &reopened.messages[1].content[0] else {
+                panic!("saved tool result");
+            };
+            let replay: Value = serde_json::from_str(content).unwrap();
+            assert_eq!(&replay["nested_events"], &output["nested_events"]);
+        }
+        assert!(
+            get_session(&context, "receipts")
+                .await
+                .unwrap()
+                .lock()
+                .await
+                .kernel
+                .is_none(),
+            "a failed interpreter must not be reused"
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_parent_deadline_prevents_rlm_python_side_effects() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut context = ToolContext::new(temp.path());
+        let tool = RlmTool::new("rlm", None);
+        tool.execute(
+            json!({"action": "open", "name": "expired", "content": "fixture"}),
+            &context,
+        )
+        .await
+        .unwrap();
+        context.turn_deadline = Some(tokio::time::Instant::now());
+        let marker = temp.path().join("must-not-exist");
+        let code = format!(
+            "open({}, 'w').write('ran')",
+            serde_json::to_string(&marker.to_string_lossy()).unwrap()
+        );
+        let error = tool
+            .execute(
+                json!({"action": "eval", "name": "expired", "code": code}),
+                &context,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("deadline exhausted"));
+        assert!(!marker.exists());
+        tool.execute(json!({"action": "close", "name": "expired"}), &context)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

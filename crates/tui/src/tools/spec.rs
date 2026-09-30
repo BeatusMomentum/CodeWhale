@@ -676,6 +676,9 @@ pub struct ToolExecutionState {
     /// Cancellation token for the active engine turn. Tools that may wait on
     /// external work should observe this so UI cancel can interrupt them.
     pub cancel_token: Option<CancellationToken>,
+    /// Absolute deadline inherited from the active Engine turn after approval.
+    /// Nested model/code work may narrow this bound but must never reset it.
+    pub(crate) turn_deadline: Option<tokio::time::Instant>,
     /// Optional external sandbox backend for shell execution.
     /// When set, exec_shell routes commands through this instead of spawning
     /// a local process.
@@ -813,6 +816,7 @@ impl ToolContext {
                 runtime: RuntimeToolServices::default(),
                 session_objects: None,
                 cancel_token: None,
+                turn_deadline: None,
                 sandbox_backend: None,
                 memory_path: None,
                 lsp_manager: None,

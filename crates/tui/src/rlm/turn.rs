@@ -8,10 +8,10 @@
 //! `Engine::run_turn`, listed as a named interim exception in
 //! `crates/core/tests/single_turn_loop.rs` until it converges.
 //!
-//! - **Logged.** Every status line and code round is sent on `tx_event`; the
-//!   bridge forwards a nested loop's events to its parent's stream (and to
-//!   `tracing` when the parent has no event stream) instead of draining them.
-//!   A terminal `RLM finished: …` line records how the loop ended.
+//! - **Logged.** Every status line and code round is retained in the shared
+//!   RLM receipt batch before live forwarding. The enclosing RLM tool includes
+//!   those receipts in its result, using the same session/artifact persistence
+//!   as any other tool. A terminal receipt records how the loop ended.
 //! - **History is kept whole.** The root model sees every prior round. The
 //!   history is bounded by `MAX_RLM_ITERATIONS` (two small metadata messages
 //!   per round), not by silently dropping the middle.
@@ -24,10 +24,12 @@
 //!   (including recursive RPCs), and shutdown. Timeout keeps the last root
 //!   response and reports an incomplete result, just like iteration exhaustion.
 //!
-//! Known limitations: the parent turn's remaining budget is not plumbed through
-//! `RlmBridge`; this loop uses the existing default child wall-time budget.
-//! Async cancellation cannot preempt synchronous context-file I/O or CPU work,
-//! stop remote provider work already dispatched, or kill Python's descendants.
+//! The parent deadline is inherited through every bridge; the existing default
+//! child wall-time remains an additional upper bound. Async cancellation cannot
+//! preempt synchronous context-file I/O or CPU work, stop remote provider work
+//! already dispatched, or kill Python's descendants. Receipts become durable
+//! with the enclosing tool result; killing the host or externally dropping the
+//! whole tool future before hand-back can still lose its in-flight receipts.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -141,6 +143,7 @@ pub(crate) fn run_rlm_turn_inner(
         tx_event,
         max_depth,
         RlmUsageAccumulator::new(),
+        tokio::time::Instant::now() + crate::tools::subagent::DEFAULT_CHILD_WALL_TIME,
     )
 }
 
@@ -155,6 +158,7 @@ pub(crate) fn run_rlm_turn_inner_with_usage(
     tx_event: mpsc::Sender<Event>,
     max_depth: u32,
     usage: RlmUsageAccumulator,
+    deadline: tokio::time::Instant,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = RlmTurnResult> + Send>> {
     Box::pin(async move {
         let mut result = run_rlm_turn_impl(
@@ -166,9 +170,7 @@ pub(crate) fn run_rlm_turn_inner_with_usage(
             tx_event,
             max_depth,
             usage.clone(),
-            // RlmBridge carries no parent deadline/configured budget. Reuse the
-            // existing child-run default rather than another RLM-specific cap.
-            tokio::time::Instant::now() + crate::tools::subagent::DEFAULT_CHILD_WALL_TIME,
+            deadline,
         )
         .await;
         let snapshot = usage.snapshot().await;
@@ -184,6 +186,38 @@ pub(crate) fn run_rlm_turn_inner_with_usage(
 // Implementation
 // ---------------------------------------------------------------------------
 
+/// Record at the producing loop, before forwarding. Recording at each bridge
+/// would duplicate deeper events as they pass through their ancestors.
+struct RlmEventSender {
+    sender: mpsc::Sender<Event>,
+    usage: RlmUsageAccumulator,
+    run_id: String,
+    depth_remaining: u32,
+}
+
+impl RlmEventSender {
+    async fn record(&self, event: &Event) {
+        let (kind, content) = match event {
+            Event::Status { message } => ("status", message.as_str()),
+            Event::MessageDelta { content, .. } => ("code", content.as_str()),
+            _ => return,
+        };
+        self.usage
+            .record_nested_event(serde_json::json!({
+                "run_id": self.run_id,
+                "depth_remaining": self.depth_remaining,
+                "kind": kind,
+                "content": content,
+            }))
+            .await;
+    }
+
+    async fn send(&self, event: Event) -> Result<(), mpsc::error::SendError<Event>> {
+        self.record(&event).await;
+        self.sender.send(event).await
+    }
+}
+
 async fn run_rlm_turn_impl(
     client: Arc<dyn RlmLlmClient>,
     model: String,
@@ -196,6 +230,12 @@ async fn run_rlm_turn_impl(
     deadline: tokio::time::Instant,
 ) -> RlmTurnResult {
     let start = Instant::now();
+    let tx_event = RlmEventSender {
+        sender: tx_event,
+        usage: routed_usage.clone(),
+        run_id: Uuid::new_v4().to_string(),
+        depth_remaining: max_depth,
+    };
     let mut total_usage = Usage::default();
     let mut trace: Vec<RlmRoundTrace> = Vec::new();
     let mut total_rpcs: u32 = 0;
@@ -255,7 +295,8 @@ async fn run_rlm_turn_impl(
             max_depth,
             routed_usage.clone(),
         )
-        .with_events(tx_event.clone());
+        .with_events(tx_event.sender.clone())
+        .with_deadline(Some(deadline));
 
         let _ = tx_event
             .send(Event::status(format!(
@@ -693,9 +734,11 @@ async fn run_rlm_turn_impl(
     });
     let result = require_answer_or_error(result);
     let status = termination_status(&result);
+    let terminal_event = Event::status(status.clone());
+    tx_event.record(&terminal_event).await;
     // A full event stream must not turn deadline hand-back into another wait.
     if !matches!(
-        tokio::time::timeout_at(deadline, tx_event.send(Event::status(status.clone()))).await,
+        tokio::time::timeout_at(deadline, tx_event.sender.send(terminal_event)).await,
         Ok(Ok(()))
     ) {
         tracing::info!(target: "rlm", "{status}");

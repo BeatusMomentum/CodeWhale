@@ -6408,7 +6408,18 @@ impl Engine {
                 self.api_config.sandbox_network_access,
             ),
         );
+        context.turn_deadline = self.nested_work_deadline();
         Some(context)
+    }
+
+    /// One absolute bound for admitted nested work, resolved after any human
+    /// wait so approval time remains excluded by the Engine's clock.
+    fn nested_work_deadline(&self) -> Option<tokio::time::Instant> {
+        tokio::time::Instant::now().checked_add(
+            self.turn_wall_clock
+                .budget()
+                .saturating_sub(self.turn_wall_clock.spent()),
+        )
     }
 
     /// Build one tool context from the already-resolved turn authority and

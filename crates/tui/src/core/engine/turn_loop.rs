@@ -2623,6 +2623,12 @@ impl Engine {
                         .await;
                     // Admission may have applied a pending posture change.
                     mode = self.current_mode;
+                    if self.turn_wall_clock.exhausted() {
+                        let reason =
+                            "parent turn deadline exhausted before REPL execution".to_string();
+                        repl_fence_skip_reason = Some(reason.clone());
+                        turn_error = Some(reason);
+                    }
                 }
                 if let Some(reason) = repl_fence_skip_reason.as_deref() {
                     let _ = self
@@ -2689,6 +2695,7 @@ impl Engine {
                         // A nested `rlm_query` reports on this turn's stream,
                         // so its model calls are part of the record (#6511).
                         .with_events(self.tx_event.clone())
+                        .with_deadline(self.nested_work_deadline())
                     });
                     let repl_cost_scope = crate::cost_status::scope_token();
                     let repl_started = Instant::now();
@@ -2706,13 +2713,19 @@ impl Engine {
                             .await;
 
                         let round_result = match bridge.as_ref() {
-                            Some(bridge) => {
+                            Some(bridge) => tokio::time::timeout_at(
+                                bridge.deadline(),
                                 self.repl_kernel
                                     .as_mut()
                                     .expect("REPL kernel stays alive during a round")
-                                    .run(&block.code, Some(bridge))
-                                    .await
-                            }
+                                    .run(&block.code, Some(bridge)),
+                            )
+                            .await
+                            .unwrap_or_else(|_| {
+                                Err(anyhow::anyhow!(
+                                    "REPL execution reached the parent turn deadline"
+                                ))
+                            }),
                             None => {
                                 self.repl_kernel
                                     .as_mut()
@@ -4878,7 +4891,13 @@ impl Engine {
                     let call_context = tool_context_for_call(
                         context_override.or_else(|| batch_tool_context.clone()),
                         &tool_id,
-                    );
+                    )
+                    .map(|mut context| {
+                        // The batch may have waited for a person. Rebase the
+                        // absolute deadline from the same paused Engine clock.
+                        context.turn_deadline = self.nested_work_deadline();
+                        context
+                    });
                     let (mut result, cancelled_before_completion) = if let Some(result_override) =
                         result_override
                     {
@@ -7467,6 +7486,45 @@ mod tests {
     use std::path::PathBuf;
     use std::time::Duration;
     use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn rlm_tool_context_inherits_the_spent_parent_clock() {
+        let tmp = tempdir().unwrap();
+        let (mut engine, _handle) = Engine::new(
+            EngineConfig {
+                workspace: tmp.path().into(),
+                turn_wall_clock: Duration::from_secs(60),
+                ..Default::default()
+            },
+            &Config::default(),
+        );
+        let registry = crate::tools::ToolRegistryBuilder::new()
+            .build(crate::tools::ToolContext::new(tmp.path()));
+        engine
+            .turn_wall_clock
+            .rewind_for_test(Duration::from_secs(55));
+        let context = engine.live_tool_context(Some(&registry)).unwrap();
+        let remaining = context
+            .turn_deadline
+            .expect("inherited deadline")
+            .saturating_duration_since(tokio::time::Instant::now());
+        assert!(
+            remaining <= Duration::from_secs(5),
+            "spent time must not reset"
+        );
+        engine
+            .turn_wall_clock
+            .rewind_for_test(Duration::from_secs(10));
+        assert!(
+            engine
+                .live_tool_context(Some(&registry))
+                .unwrap()
+                .turn_deadline
+                .unwrap()
+                <= tokio::time::Instant::now(),
+            "an exhausted turn gets no new allowance"
+        );
+    }
 
     #[test]
     fn tool_context_for_call_preserves_turn_and_sets_call_origin() {
