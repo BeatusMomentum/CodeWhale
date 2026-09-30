@@ -165,6 +165,15 @@ enum CloudAgentsCommand {
         #[arg(long)]
         operation_key: String,
     },
+    /// Read one turn's answer and status from this account's conversation events.
+    Result {
+        agent: String,
+        thread: String,
+        turn: String,
+        /// Resume from a previously printed event sequence for long conversations.
+        #[arg(long, default_value_t = 0)]
+        since_seq: u64,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -332,6 +341,23 @@ struct TurnResponse {
 struct TurnReceipt {
     id: String,
     status: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentTurnEvent {
+    seq: u64,
+    #[serde(rename = "type")]
+    kind: String,
+    turn_id: String,
+    payload: serde_json::Value,
+}
+
+struct AgentTurnResult {
+    last_seq: u64,
+    status: String,
+    answer: String,
+    seen_turn: bool,
 }
 
 impl CatalogProvider {
@@ -696,8 +722,13 @@ impl<'a, T: CloudTransport> CloudClient<'a, T> {
         Ok(result.agent)
     }
 
-    fn threads(&self) -> Result<Vec<AgentThread>> {
-        let response = self.execute_authenticated(HttpMethod::Get, "/v1/threads/summary", None)?;
+    fn threads(&self, agent_id: &str) -> Result<Vec<AgentThread>> {
+        let agent_id = validate_resource_id(agent_id, "Agent")?;
+        let response = self.execute_authenticated(
+            HttpMethod::Get,
+            &format!("/v1/threads/summary?agentId={agent_id}&limit=100"),
+            None,
+        )?;
         expect_json(response, &[200])
     }
 
@@ -774,6 +805,28 @@ impl<'a, T: CloudTransport> CloudClient<'a, T> {
         )?;
         let result: TurnResponse = expect_json(response, &[200, 201, 202])?;
         Ok(result.turn)
+    }
+
+    fn agent_turn_result(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        since_seq: u64,
+    ) -> Result<AgentTurnResult> {
+        let thread_id = validate_resource_id(thread_id, "Conversation")?;
+        let turn_id = validate_turn_id(turn_id)?;
+        if since_seq > i64::MAX as u64 {
+            bail!("Event sequence is too large");
+        }
+        let response = self.execute_authenticated(
+            HttpMethod::Get,
+            &format!("/v1/threads/{thread_id}/events?since_seq={since_seq}"),
+            None,
+        )?;
+        if response.status != 200 {
+            return Err(response_error(&response));
+        }
+        parse_agent_turn_events(&response.body, turn_id, since_seq)
     }
 
     fn computer(&self, id: &str) -> Result<serde_json::Value> {
@@ -1002,6 +1055,24 @@ fn validate_resource_id<'a>(value: &'a str, kind: &str) -> Result<&'a str> {
     Ok(id)
 }
 
+fn validate_turn_id(value: &str) -> Result<&str> {
+    let id = value.trim();
+    let bytes = id.as_bytes();
+    if bytes.is_empty()
+        || bytes.len() > 160
+        || !bytes[0].is_ascii_alphanumeric()
+        || !bytes.iter().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':' | b'@')
+        })
+        || id.contains("..")
+    {
+        bail!(
+            "Turn ID must be a bounded identifier of letters, digits, `-`, `_`, `.`, `:`, or `@`"
+        );
+    }
+    Ok(id)
+}
+
 fn validate_computer_name(value: &str) -> Result<String> {
     validate_named_text(value, "Computer name", 80)
 }
@@ -1091,6 +1162,71 @@ fn active_agent_thread(thread: &AgentThread, agent_id: &str) -> bool {
     thread.agent_id == agent_id && thread.archived_at.is_empty() && thread.kind != "smoke"
 }
 
+fn parse_agent_turn_events(body: &[u8], turn_id: &str, since_seq: u64) -> Result<AgentTurnResult> {
+    let text = std::str::from_utf8(body)
+        .context("The Codewhale service returned invalid conversation events")?;
+    let normalized = text.replace("\r\n", "\n");
+    let mut result = AgentTurnResult {
+        last_seq: since_seq,
+        status: "not_seen".to_string(),
+        answer: String::new(),
+        seen_turn: false,
+    };
+    for frame in normalized.split("\n\n") {
+        let mut data = None;
+        for line in frame.lines() {
+            if let Some(value) = line.strip_prefix("data:") {
+                if data.replace(value.trim_start_matches(' ')).is_some() {
+                    bail!("The Codewhale service returned a malformed conversation event");
+                }
+            }
+        }
+        let Some(data) = data else { continue };
+        let event: AgentTurnEvent = serde_json::from_str(data)
+            .context("The Codewhale service returned an invalid conversation event")?;
+        if event.seq <= result.last_seq {
+            bail!("The Codewhale service returned an out-of-order conversation event");
+        }
+        result.last_seq = event.seq;
+        if event.turn_id != turn_id {
+            continue;
+        }
+        result.seen_turn = true;
+        if result.status == "not_seen" {
+            result.status = "pending".to_string();
+        }
+        match event.kind.as_str() {
+            "assistant.delta" => {
+                let delta = event
+                    .payload
+                    .get("text")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| {
+                        anyhow!("The Codewhale service returned invalid assistant text")
+                    })?;
+                result.answer.push_str(delta);
+                if result.answer.len() > 128 * 1024 {
+                    bail!("The Codewhale service returned an unexpectedly long answer");
+                }
+            }
+            "turn.completed" => {
+                let status = event
+                    .payload
+                    .get("status")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("completed");
+                if !matches!(status, "completed" | "failed") {
+                    bail!("The Codewhale service returned an invalid turn status");
+                }
+                result.status = status.to_string();
+            }
+            "turn.canceled" => result.status = "canceled".to_string(),
+            _ => {}
+        }
+    }
+    Ok(result)
+}
+
 fn write_agent_thread<W: Write>(out: &mut W, thread: &AgentThread) -> Result<()> {
     validate_resource_id(&thread.id, "Conversation")?;
     let (provider, model) = validate_model_route(&thread.model_provider, &thread.model)?;
@@ -1146,7 +1282,7 @@ fn run_agents<T: CloudTransport, W: Write>(
                 .context("The Codewhale service returned an invalid Agent list")?;
             let selected = resolve_account_agent(&listing.agents, &agent)?;
             let threads = client
-                .threads()?
+                .threads(&selected.id)?
                 .into_iter()
                 .filter(|thread| active_agent_thread(thread, &selected.id))
                 .collect::<Vec<_>>();
@@ -1222,7 +1358,14 @@ fn run_agents<T: CloudTransport, W: Write>(
             let selected_thread = if let Some(id) = thread {
                 client.thread(&id)?
             } else {
-                let mut main = client.threads()?.into_iter().filter(|thread| {
+                let threads = client.threads(&selected.id)?;
+                if threads.len() >= 100 {
+                    bail!(
+                        "Agent {} has at least 100 recent conversations; pass --thread with an ID so an older Main conversation is not missed",
+                        printable(&selected.name)
+                    );
+                }
+                let mut main = threads.into_iter().filter(|thread| {
                     active_agent_thread(thread, &selected.id) && thread.title == "Main"
                 });
                 let first = main.next().ok_or_else(|| anyhow!(
@@ -1245,7 +1388,7 @@ fn run_agents<T: CloudTransport, W: Write>(
             }
             let receipt =
                 client.send_agent_turn(&selected_thread, &prompt, &billing_mode, &operation_key)?;
-            validate_resource_id(&receipt.id, "Turn")?;
+            validate_turn_id(&receipt.id)?;
             writeln!(out, "Conversation ID: {}", selected_thread.id)?;
             writeln!(out, "Turn ID: {}", receipt.id)?;
             writeln!(out, "Status: {}", printable(&receipt.status))?;
@@ -1254,6 +1397,56 @@ fn run_agents<T: CloudTransport, W: Write>(
                 "Message request ID: {}",
                 validate_operation_key(&operation_key)?
             )?;
+            writeln!(
+                out,
+                "Read the answer: codewhale account agents result {} {} {}",
+                selected.id, selected_thread.id, receipt.id
+            )?;
+            Ok(())
+        }
+        CloudAgentsCommand::Result {
+            agent,
+            thread,
+            turn,
+            since_seq,
+        } => {
+            let listing: AgentListResponse = serde_json::from_value(client.agents()?)
+                .context("The Codewhale service returned an invalid Agent list")?;
+            let selected = resolve_account_agent(&listing.agents, &agent)?;
+            let selected_thread = client.thread(&thread)?;
+            if !active_agent_thread(&selected_thread, &selected.id) {
+                bail!(
+                    "That conversation is not active or does not belong to Agent {}",
+                    printable(&selected.name)
+                );
+            }
+            let turn_id = validate_turn_id(&turn)?;
+            let result = client.agent_turn_result(&selected_thread.id, turn_id, since_seq)?;
+            writeln!(out, "Turn ID: {turn_id}")?;
+            writeln!(out, "Status: {}", result.status)?;
+            writeln!(out, "Last event sequence: {}", result.last_seq)?;
+            if !result.seen_turn {
+                writeln!(out, "No events for this turn after the selected sequence.")?;
+            } else if !result.answer.is_empty() {
+                let label = if result.status == "pending" {
+                    "Answer so far"
+                } else {
+                    "Answer"
+                };
+                writeln!(out, "{label}:")?;
+                writeln!(
+                    out,
+                    "{}",
+                    result
+                        .answer
+                        .chars()
+                        .filter(|ch| *ch == '\n' || *ch == '\t' || !ch.is_control())
+                        .collect::<String>()
+                )?;
+            }
+            if result.status == "pending" || result.status == "not_seen" {
+                writeln!(out, "Run this result command again to read later events.")?;
+            }
             Ok(())
         }
     }

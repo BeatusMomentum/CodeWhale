@@ -57,6 +57,26 @@ fn response_retry_after(status: u16, body: serde_json::Value, seconds: u64) -> C
     }
 }
 
+fn sse_response(events: &[serde_json::Value]) -> CloudResponse {
+    let body = events
+        .iter()
+        .map(|event| {
+            format!(
+                "event: {}\ndata: {}\nid: {}\n\n",
+                event["type"].as_str().unwrap(),
+                event,
+                event["seq"].as_u64().unwrap()
+            )
+        })
+        .collect::<String>()
+        .into_bytes();
+    CloudResponse {
+        status: 200,
+        body,
+        retry_after: None,
+    }
+}
+
 fn account(id: &str) -> serde_json::Value {
     json!({
         "user": {
@@ -2075,6 +2095,16 @@ fn account_agents_create_model_bound_thread_and_send_with_same_session() {
             202,
             json!({ "turn": { "id": "turn-1", "status": "pending" } }),
         ),
+        response(200, json!({ "agents": [agent("agent-1", "Whale")] })),
+        response(
+            200,
+            json!({ "thread": agent_thread("thread-1", "agent-1", "Main") }),
+        ),
+        sse_response(&[
+            json!({ "type": "turn.started", "seq": 1, "turnId": "turn-1", "payload": { "status": "running" } }),
+            json!({ "type": "assistant.delta", "seq": 2, "turnId": "turn-1", "payload": { "text": "Done.\n" } }),
+            json!({ "type": "turn.completed", "seq": 3, "turnId": "turn-1", "payload": { "status": "completed" } }),
+        ]),
     ]);
     let mut output = Vec::new();
     let mut key_reader = |_| bail!("unused");
@@ -2115,6 +2145,15 @@ fn account_agents_create_model_bound_thread_and_send_with_same_session() {
             "--operation-key",
             "message-1",
         ],
+        vec![
+            "codewhale",
+            "account",
+            "agents",
+            "result",
+            "Whale",
+            "thread-1",
+            "turn-1",
+        ],
     ] {
         run_with(
             command(&argv),
@@ -2144,10 +2183,13 @@ fn account_agents_create_model_bound_thread_and_send_with_same_session() {
             "/api/agents",
             "/v1/threads",
             "/api/agents",
-            "/v1/threads/summary",
+            "/v1/threads/summary?agentId=agent-1&limit=100",
             "/api/agents",
             "/v1/threads/thread-1",
             "/v1/threads/thread-1/turns",
+            "/api/agents",
+            "/v1/threads/thread-1",
+            "/v1/threads/thread-1/events?since_seq=0",
         ]
     );
     assert!(
@@ -2181,6 +2223,8 @@ fn account_agents_create_model_bound_thread_and_send_with_same_session() {
     let output = String::from_utf8(output).unwrap();
     assert!(output.contains("Turn ID: turn-1"));
     assert!(output.contains("Status: pending"));
+    assert!(output.contains("Status: completed"));
+    assert!(output.contains("Answer:\nDone."));
     assert!(!output.contains("access-secret"));
 }
 
@@ -2237,6 +2281,60 @@ fn account_agents_new_thread_requires_and_preserves_agent_project() {
         serde_json::from_slice::<serde_json::Value>(requests[1].body.as_ref().unwrap()).unwrap()["projectId"],
         "project-codewhale"
     );
+}
+
+#[test]
+fn account_agents_require_explicit_thread_when_recent_page_may_be_incomplete() {
+    let (secrets, _) = test_secrets();
+    let auth_transport = FakeTransport::new(vec![]);
+    CloudClient::new(&auth_transport, &secrets, "default", DEFAULT_API_BASE)
+        .save_auth(auth("access-secret", "refresh-secret", "acct-123"))
+        .unwrap();
+    let page = (0..100)
+        .map(|index| agent_thread(&format!("thread-{index}"), "agent-1", "Main"))
+        .collect::<Vec<_>>();
+    let transport = FakeTransport::new(vec![
+        response(200, json!({ "agents": [agent("agent-1", "Whale")] })),
+        response(200, json!(page)),
+    ]);
+    let client = CloudClient::new(&transport, &secrets, "default", DEFAULT_API_BASE);
+    let error = run_agents(
+        CloudAgentsCommand::Send {
+            agent: "Whale".into(),
+            prompt: "Do work".into(),
+            thread: None,
+            billing_mode: "byok_external".into(),
+            operation_key: "message-100".into(),
+        },
+        &client,
+        &machine::MachineKeyEnv::default(),
+        &mut Vec::new(),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("pass --thread"));
+    assert_eq!(transport.requests().len(), 2);
+    assert_eq!(
+        transport.requests()[1].path,
+        "/v1/threads/summary?agentId=agent-1&limit=100"
+    );
+}
+
+#[test]
+fn account_agents_result_replays_only_the_selected_turn_after_cursor() {
+    assert_eq!(validate_turn_id("turn:reply@1").unwrap(), "turn:reply@1");
+    assert!(validate_turn_id("turn/other").is_err());
+    let events = sse_response(&[
+        json!({ "type": "assistant.delta", "seq": 11, "turnId": "other-turn", "payload": { "text": "Other answer" } }),
+        json!({ "type": "assistant.delta", "seq": 12, "turnId": "turn-1", "payload": { "text": "Selected " } }),
+        json!({ "type": "assistant.delta", "seq": 13, "turnId": "turn-1", "payload": { "text": "answer" } }),
+        json!({ "type": "turn.completed", "seq": 14, "turnId": "turn-1", "payload": { "status": "completed" } }),
+    ]);
+    let result = parse_agent_turn_events(&events.body, "turn-1", 10).unwrap();
+    assert_eq!(result.answer, "Selected answer");
+    assert_eq!(result.status, "completed");
+    assert_eq!(result.last_seq, 14);
+    assert!(result.seen_turn);
+    assert!(parse_agent_turn_events(&events.body, "turn-1", 12).is_err());
 }
 
 #[test]
