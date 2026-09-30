@@ -40,6 +40,7 @@ pub(crate) fn parse_frontmatter(
     let indentation = |line: &str| line.chars().take_while(|ch| ch.is_whitespace()).count();
     let lines: Vec<&str> = frontmatter.lines().collect();
     let mut i = 0;
+    let mut maps: Vec<(usize, String)> = Vec::new();
     while i < lines.len() {
         let raw = lines[i];
         let line = raw.trim();
@@ -48,6 +49,17 @@ pub(crate) fn parse_frontmatter(
             continue;
         }
         if let Some((key, value)) = line.split_once(':') {
+            let indent = indentation(raw);
+            while maps
+                .last()
+                .is_some_and(|(parent_indent, _)| *parent_indent >= indent)
+            {
+                maps.pop();
+            }
+            let key = key.trim().to_ascii_lowercase();
+            let key = maps
+                .last()
+                .map_or_else(|| key.clone(), |(_, parent)| format!("{parent}.{key}"));
             let value = value.trim();
             // Check for YAML block scalar indicators: > (folded), | (literal),
             // optionally with chomping: >-, >+, |-, |+
@@ -151,7 +163,7 @@ pub(crate) fn parse_frontmatter(
                     // Literal: join with newlines.
                     block_lines.join("\n")
                 };
-                metadata.insert(key.trim().to_ascii_lowercase(), description);
+                metadata.insert(key, description);
             } else if value.is_empty()
                 && lines
                     .get(i + 1)
@@ -174,7 +186,32 @@ pub(crate) fn parse_frontmatter(
                     }
                     i += 1;
                 }
-                metadata.insert(key.trim().to_ascii_lowercase(), items.join(", "));
+                metadata.insert(key, items.join(", "));
+            } else if value.is_empty() {
+                // Child fields retain their map path. In particular,
+                // metadata.name must never replace the skill's own name.
+                metadata.insert(key.clone(), String::new());
+                maps.push((indent, key));
+                i += 1;
+            } else if value.starts_with('[') {
+                // Reuse the installed YAML reader for quoted flow items rather
+                // than splitting commas inside quoted tool names or aliases.
+                let documents = yaml_rust2::YamlLoader::load_from_str(value)
+                    .map_err(|err| format!("invalid frontmatter sequence `{key}`: {err}"))?;
+                let items = documents
+                    .first()
+                    .and_then(yaml_rust2::Yaml::as_vec)
+                    .ok_or_else(|| format!("frontmatter `{key}` must be a flow sequence"))?;
+                let values: Result<Vec<_>, _> = items
+                    .iter()
+                    .map(|item| {
+                        item.as_str().ok_or_else(|| {
+                            format!("frontmatter `{key}` sequence items must be strings")
+                        })
+                    })
+                    .collect();
+                metadata.insert(key, values?.join(", "));
+                i += 1;
             } else {
                 let unquoted = match value {
                     v if (v.starts_with('"') && v.ends_with('"') && v.len() >= 2)
@@ -201,7 +238,7 @@ pub(crate) fn parse_frontmatter(
                         i += 1;
                     }
                 }
-                metadata.insert(key.trim().to_ascii_lowercase(), text);
+                metadata.insert(key, text);
             }
         } else {
             i += 1;
