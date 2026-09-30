@@ -334,10 +334,12 @@ mod tests {
 
     #[test]
     fn bounded_read_accepts_exact_remaining_bytes() {
-        let mut file = tempfile::tempfile().unwrap();
-        use std::io::{Seek as _, Write as _};
-        file.write_all(b"exact").unwrap();
-        file.rewind().unwrap();
+        // A named file in a temp dir, like the neighbouring test: Windows CI
+        // denies the anonymous `tempfile()` under the hermetic test home.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("exact");
+        fs::write(&path, b"exact").unwrap();
+        let mut file = fs::File::open(path).unwrap();
         assert_eq!(read_package_file(&mut file, 5).unwrap(), b"exact");
     }
 }
