@@ -14,7 +14,7 @@ pub use context_reference::{
     media_attachment_references,
 };
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Result, anyhow};
@@ -27,7 +27,7 @@ use codewhale_protocol::{
     ThreadResumeParams, ThreadSetNameParams, ThreadStatus,
 };
 use codewhale_state::{
-    JobStateRecord, JobStateStatus, SessionSource, StateStore, ThreadGoalRecord,
+    JobStateRecord, JobStateStatus, NewMessage, SessionSource, StateStore, ThreadGoalRecord,
     ThreadGoalStatus as PersistedThreadGoalStatus, ThreadListFilters, ThreadMetadata,
     ThreadStatus as PersistedThreadStatus,
 };
@@ -531,14 +531,40 @@ impl ThreadManager {
         initial_history: InitialHistory,
         persist_extended_history: bool,
     ) -> Result<NewThread> {
+        let preview = preview_from_initial_history(&initial_history);
+        let (source, items) = match &initial_history {
+            InitialHistory::New => (SessionSource::Interactive, &[][..]),
+            InitialHistory::Forked(items) => (SessionSource::Fork, items.as_slice()),
+            InitialHistory::Resumed { history, .. } => (SessionSource::Resume, history.as_slice()),
+        };
+        let messages: Vec<NewMessage> = items.iter().map(history_message).collect();
+        self.spawn_thread_with_messages(
+            model_provider,
+            cwd,
+            source,
+            preview,
+            persist_extended_history,
+            &messages,
+        )
+    }
+
+    /// Persist a new thread row and its opening messages.
+    ///
+    /// The messages land in one transaction, so the thread starts with all of
+    /// them or none. If they fail, the just-written row is removed rather
+    /// than left behind as an orphan with no history that a retry (which mints
+    /// a new id) would never reach.
+    fn spawn_thread_with_messages(
+        &mut self,
+        model_provider: String,
+        cwd: PathBuf,
+        source: SessionSource,
+        preview: String,
+        persist_extended_history: bool,
+        messages: &[NewMessage],
+    ) -> Result<NewThread> {
         let id = format!("thread-{}", Uuid::new_v4());
         let now = chrono::Utc::now().timestamp();
-        let preview = preview_from_initial_history(&initial_history);
-        let source = match initial_history {
-            InitialHistory::New => SessionSource::Interactive,
-            InitialHistory::Forked(_) => SessionSource::Fork,
-            InitialHistory::Resumed { .. } => SessionSource::Resume,
-        };
         let thread = Thread {
             id: id.clone(),
             preview,
@@ -560,28 +586,14 @@ impl ThreadManager {
             name: None,
         };
         self.persist_thread(&thread, None)?;
-        match &initial_history {
-            InitialHistory::Forked(items) => {
-                for item in items {
-                    self.store.append_message(
-                        &thread.id,
-                        "history",
-                        &item.to_string(),
-                        Some(item.clone()),
-                    )?;
-                }
+        if let Err(error) = self.store.append_messages(&thread.id, messages) {
+            if let Err(cleanup) = self.store.delete_thread(&thread.id) {
+                tracing::warn!(
+                    thread_id = %thread.id,
+                    "failed to remove a thread whose history did not persist: {cleanup:#}"
+                );
             }
-            InitialHistory::Resumed { history, .. } => {
-                for item in history {
-                    self.store.append_message(
-                        &thread.id,
-                        "history",
-                        &item.to_string(),
-                        Some(item.clone()),
-                    )?;
-                }
-            }
-            InitialHistory::New => {}
+            return Err(error);
         }
         self.running_threads
             .insert(thread.id.clone(), thread.clone());
@@ -636,11 +648,13 @@ impl ThreadManager {
         if let Some(history) = params.history.as_ref() {
             // A read→resume flow hands back items that are already on the
             // persisted chain; appending them again would double the
-            // conversation on every resume, compounding. Dedup by content
-            // fingerprint (the item's JSON, matching what append_message
-            // stores as content) against the persisted chain and against
-            // items already appended in this loop.
-            let mut seen: HashSet<String> = self
+            // conversation on every resume, compounding. Skip exactly the
+            // part of `history` that repeats the chain's tail (the longest
+            // suffix of the chain that is a prefix of `history`) and append
+            // the rest verbatim. A set of seen fingerprints used to drop
+            // every repeat, so a genuinely repeated item ("yes", "yes") or
+            // one equal to any earlier turn vanished.
+            let persisted: Vec<String> = self
                 .store
                 .list_messages(&thread.id, None)?
                 .into_iter()
@@ -651,18 +665,11 @@ impl ThreadManager {
                         .map_or(message.content.clone(), |item| item.to_string())
                 })
                 .collect();
-            for item in history {
-                let fingerprint = item.to_string();
-                if !seen.insert(fingerprint.clone()) {
-                    continue;
-                }
-                self.store.append_message(
-                    &thread.id,
-                    "history",
-                    &fingerprint,
-                    Some(item.clone()),
-                )?;
-            }
+            let offered: Vec<String> = history.iter().map(Value::to_string).collect();
+            let already = persisted_overlap(&persisted, &offered);
+            let messages: Vec<NewMessage> =
+                history[already..].iter().map(history_message).collect();
+            self.store.append_messages(&thread.id, &messages)?;
         }
 
         Ok(Some(NewThread {
@@ -694,17 +701,34 @@ impl ThreadManager {
             None if !parent_thread.cwd.as_os_str().is_empty() => parent_thread.cwd.clone(),
             None => fallback_cwd.to_path_buf(),
         };
-        let new = self.spawn_thread_with_history(
+        // The child starts with the parent's whole current branch, copied
+        // verbatim (role, content, item), then a marker at the fork point.
+        // Only the marker used to be written, so a fork opened empty and
+        // nothing ever resolved `from_thread_id` back to the parent.
+        let mut messages: Vec<NewMessage> = self
+            .store
+            .list_messages(&parent_thread.id, Some(FORK_HISTORY_LIMIT))?
+            .into_iter()
+            .map(|message| NewMessage {
+                role: message.role,
+                content: message.content,
+                item: message.item,
+            })
+            .collect();
+        messages.push(history_message(&json!({
+            "type": "fork",
+            "from_thread_id": parent_thread.id
+        })));
+        let new = self.spawn_thread_with_messages(
             params
                 .model_provider
                 .clone()
                 .unwrap_or_else(|| parent_thread.model_provider.clone()),
             cwd,
-            InitialHistory::Forked(vec![json!({
-                "type": "fork",
-                "from_thread_id": parent_thread.id
-            })]),
+            SessionSource::Fork,
+            parent_thread.preview.clone(),
             params.persist_extended_history,
+            &messages,
         )?;
         Ok(Some(new))
     }
@@ -1384,6 +1408,30 @@ fn thread_response_from_new(status: &str, new: NewThread) -> ThreadResponse {
         events: Vec::new(),
         data: json!({}),
     }
+}
+
+/// Ancestor bound for copying a parent branch into a fork: the whole branch.
+/// `list_messages` defaults to the newest 500, which would silently drop the
+/// start of a long conversation from its fork.
+const FORK_HISTORY_LIMIT: usize = i64::MAX as usize;
+
+/// A history item stored the way thread history always has been: role
+/// `history`, the item's JSON as content, and the item itself.
+fn history_message(item: &Value) -> NewMessage {
+    NewMessage {
+        role: "history".to_string(),
+        content: item.to_string(),
+        item: Some(item.clone()),
+    }
+}
+
+/// How many leading entries of `offered` repeat the end of `persisted`: the
+/// longest suffix of `persisted` that is also a prefix of `offered`.
+fn persisted_overlap(persisted: &[String], offered: &[String]) -> usize {
+    (1..=persisted.len().min(offered.len()))
+        .rev()
+        .find(|&len| persisted[persisted.len() - len..] == offered[..len])
+        .unwrap_or(0)
 }
 
 fn preview_from_initial_history(initial_history: &InitialHistory) -> String {
@@ -2523,6 +2571,135 @@ mod tests {
             .expect("fork thread")
             .expect("parent found");
         assert_eq!(moved.cwd, PathBuf::from("/work/other"));
+    }
+
+    /// Audit R05-03: a fork opens with the parent's branch, verbatim, and a
+    /// marker at the fork point — not with the marker alone.
+    #[test]
+    fn fork_copies_the_parent_branch_then_marks_the_fork_point() {
+        let store = temp_core_state("fork-history");
+        store
+            .upsert_thread(&test_thread_metadata("thread-parent"))
+            .expect("seed parent");
+        store
+            .append_message("thread-parent", "user", "plan the release", None)
+            .expect("parent user message");
+        store
+            .append_message(
+                "thread-parent",
+                "history",
+                "{}",
+                Some(json!({"type": "assistant_message", "message": "on it"})),
+            )
+            .expect("parent history item");
+        let mut manager = ThreadManager::new(store);
+        let forked = manager
+            .fork_thread(
+                &ThreadForkParams {
+                    thread_id: "thread-parent".to_string(),
+                    path: None,
+                    model: None,
+                    model_provider: None,
+                    cwd: None,
+                    approval_policy: None,
+                    sandbox: None,
+                    config: None,
+                    base_instructions: None,
+                    developer_instructions: None,
+                    persist_extended_history: false,
+                },
+                Path::new("/tmp/codewhale"),
+            )
+            .expect("fork thread")
+            .expect("parent found");
+
+        let child = manager
+            .state_store()
+            .list_messages(&forked.thread.id, None)
+            .expect("child messages");
+        assert_eq!(child.len(), 3, "{child:?}");
+        assert_eq!(
+            (child[0].role.as_str(), child[0].content.as_str()),
+            ("user", "plan the release")
+        );
+        assert_eq!(
+            child[1].item,
+            Some(json!({"type": "assistant_message", "message": "on it"}))
+        );
+        assert_eq!(
+            child[2].item,
+            Some(json!({"type": "fork", "from_thread_id": "thread-parent"}))
+        );
+    }
+
+    /// Audit R05-02: resume skips only the part of the offered history that
+    /// repeats the persisted tail; a genuinely repeated item is kept.
+    #[test]
+    fn resume_keeps_genuinely_repeated_history_items() {
+        let store = temp_core_state("resume-repeats");
+        let mut manager = ThreadManager::new(store);
+        let question = json!({"type": "assistant_message", "message": "ship it?"});
+        let yes = json!({"type": "user_message", "message": "yes"});
+        let spawned = manager
+            .spawn_thread_with_history(
+                "deepseek".to_string(),
+                PathBuf::from("/tmp/codewhale"),
+                InitialHistory::Forked(vec![yes.clone(), question.clone()]),
+                true,
+            )
+            .expect("spawn thread");
+        let thread_id = spawned.thread.id.clone();
+        let resume = |history: Vec<Value>| ThreadResumeParams {
+            thread_id: thread_id.clone(),
+            history: Some(history),
+            path: None,
+            model: None,
+            model_provider: None,
+            cwd: None,
+            approval_policy: None,
+            sandbox: None,
+            config: None,
+            base_instructions: None,
+            developer_instructions: None,
+            personality: None,
+            persist_extended_history: false,
+        };
+        // The client read [yes, question] and answers "yes" twice.
+        manager
+            .resume_thread_with_history(
+                &resume(vec![
+                    yes.clone(),
+                    question.clone(),
+                    yes.clone(),
+                    yes.clone(),
+                ]),
+                Path::new("/tmp/codewhale"),
+                "deepseek".to_string(),
+            )
+            .expect("resume")
+            .expect("thread found");
+        let items = |manager: &ThreadManager| {
+            manager
+                .state_store()
+                .list_messages(&thread_id, None)
+                .expect("list")
+                .into_iter()
+                .map(|message| message.item.expect("history item"))
+                .collect::<Vec<_>>()
+        };
+        let expected = vec![yes.clone(), question.clone(), yes.clone(), yes.clone()];
+        assert_eq!(items(&manager), expected);
+
+        // Resuming with the full transcript again is still idempotent.
+        manager
+            .resume_thread_with_history(
+                &resume(expected.clone()),
+                Path::new("/tmp/codewhale"),
+                "deepseek".to_string(),
+            )
+            .expect("resume")
+            .expect("thread found");
+        assert_eq!(items(&manager), expected);
     }
 
     #[tokio::test]

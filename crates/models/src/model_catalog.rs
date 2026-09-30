@@ -64,10 +64,14 @@ pub struct CatalogCache {
 }
 
 impl CatalogCache {
+    /// Past its TTL, or dated in the future. A future `fetched_at` (a
+    /// corrupt file, a clock that moved backwards) never ages into the TTL
+    /// window, so it used to stay "fresh" forever and keep overriding the
+    /// bundled facts; it is not evidence of freshness.
     #[must_use]
     pub fn is_stale(&self, now: DateTime<Utc>) -> bool {
-        if now <= self.fetched_at {
-            return false;
+        if now < self.fetched_at {
+            return true;
         }
         let ttl = Duration::seconds(self.ttl_secs.min(i64::MAX as u64) as i64);
         now.signed_duration_since(self.fetched_at) > ttl
@@ -376,6 +380,30 @@ mod tests {
         let resolved = merged.resolve("sample/model").expect("resolved");
         assert_eq!(resolved.context_window, Some(1_000));
         assert_eq!(resolved.provenance, MetadataProvenance::Bundled);
+    }
+
+    /// Audit R03-10: a future-dated cache cannot override the bundled facts.
+    #[test]
+    fn future_dated_cache_is_stale_and_ignored_for_facts() {
+        let now = Utc::now();
+        let mut bundled_entries = BTreeMap::new();
+        bundled_entries.insert(
+            "sample/model".to_string(),
+            entry("sample/model", 1_000, MetadataProvenance::Bundled),
+        );
+        let bundled = cache(now, 3600, bundled_entries);
+        let mut provider_entries = BTreeMap::new();
+        provider_entries.insert(
+            "sample/model".to_string(),
+            entry("sample/model", 9_000, MetadataProvenance::ProviderApi),
+        );
+        let future = cache(now + Duration::days(3650), 3600, provider_entries);
+        assert!(future.is_stale(now));
+        assert!(!cache(now, 3600, BTreeMap::new()).is_stale(now));
+
+        let merged = MergedCatalog::from_sources(BTreeMap::new(), Some(future), bundled, now);
+        let resolved = merged.resolve("sample/model").expect("resolved");
+        assert_eq!(resolved.context_window, Some(1_000));
     }
 
     #[test]

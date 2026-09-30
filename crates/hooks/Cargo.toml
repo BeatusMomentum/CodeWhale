@@ -14,6 +14,7 @@ workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 chrono.workspace = true
+codewhale-paths = { path = "../paths", version = "0.10.1" }
 codewhale-protocol = { path = "../protocol", version = "0.10.1" }
 codewhale-release = { path = "../release", version = "0.10.1" }
 reqwest.workspace = true

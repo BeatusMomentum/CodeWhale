@@ -942,6 +942,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "chrono",
+ "codewhale-paths",
  "codewhale-protocol",
  "codewhale-release",
  "reqwest",

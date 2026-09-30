@@ -1189,30 +1189,22 @@ fn release_asset_stem_for(current_exe: &Path, os: &str, rust_arch: &str) -> Stri
     release_asset_stem_for_prefix("codewhale", os, rust_arch)
 }
 
-pub(crate) fn asset_matches_platform(asset_name: &str, binary_name: &str) -> bool {
-    if asset_name.ends_with(".sha256") {
-        return false;
-    }
-    asset_name == binary_name
-        || asset_name == format!("{binary_name}.exe")
-        || asset_name.starts_with(&format!("{binary_name}."))
-}
-
 fn asset_is_exact_platform_binary(asset_name: &str, binary_name: &str) -> bool {
     asset_name == binary_name || asset_name == format!("{binary_name}.exe")
 }
 
+/// The raw platform executable, and nothing else.
+///
+/// The updater writes the downloaded bytes straight over the running binary;
+/// it never unpacks. An archive, signature, or sidecar that merely shares the
+/// stem (`codewhale-macos-arm64.tar.gz`) would pass the checksum — the manifest
+/// lists it too — and then replace the executable with a non-executable. A
+/// release without the raw binary has no asset for this platform.
 fn select_platform_asset<'a>(release: &'a Release, binary_name: &str) -> Option<&'a Asset> {
     release
         .assets
         .iter()
         .find(|asset| asset_is_exact_platform_binary(&asset.name, binary_name))
-        .or_else(|| {
-            release
-                .assets
-                .iter()
-                .find(|asset| asset_matches_platform(&asset.name, binary_name))
-        })
 }
 
 fn select_checksum_manifest_asset(release: &Release) -> Option<&Asset> {
@@ -2902,27 +2894,34 @@ mod tests {
     }
 
     #[test]
-    fn test_asset_matching_accepts_binary_assets_and_rejects_checksums() {
-        assert!(asset_matches_platform(
-            "codewhale-macos-arm64",
-            "codewhale-macos-arm64"
-        ));
-        assert!(asset_matches_platform(
-            "codewhale-macos-arm64.tar.gz",
-            "codewhale-macos-arm64"
-        ));
-        assert!(asset_matches_platform(
-            "codewhale-tui-windows-x64.exe",
-            "codewhale-tui-windows-x64"
-        ));
-        assert!(!asset_matches_platform(
-            "codewhale-tui-windows-x64.exe.sha256",
-            "codewhale-tui-windows-x64"
-        ));
-        assert!(!asset_matches_platform(
-            "codewhale-macos-aarch64.tar.gz",
-            "codewhale-macos-arm64"
-        ));
+    fn test_asset_matching_accepts_only_the_raw_binary() {
+        for (asset, binary, expected) in [
+            ("codewhale-macos-arm64", "codewhale-macos-arm64", true),
+            (
+                "codewhale-tui-windows-x64.exe",
+                "codewhale-tui-windows-x64",
+                true,
+            ),
+            (
+                "codewhale-macos-arm64.tar.gz",
+                "codewhale-macos-arm64",
+                false,
+            ),
+            ("codewhale-macos-arm64.zip", "codewhale-macos-arm64", false),
+            ("codewhale-macos-arm64.sig", "codewhale-macos-arm64", false),
+            (
+                "codewhale-tui-windows-x64.exe.sha256",
+                "codewhale-tui-windows-x64",
+                false,
+            ),
+            ("codewhale-macos-aarch64", "codewhale-macos-arm64", false),
+        ] {
+            assert_eq!(
+                asset_is_exact_platform_binary(asset, binary),
+                expected,
+                "{asset} vs {binary}"
+            );
+        }
     }
 
     #[test]
@@ -2950,22 +2949,26 @@ mod tests {
         assert_eq!(asset.name, "codewhale-macos-arm64");
     }
 
+    /// Audit R02-04: the updater installs the downloaded bytes verbatim, so a
+    /// release that ships only an archive/signature/sidecar for this platform
+    /// has no installable asset rather than one that bricks the binary.
     #[test]
-    fn select_platform_asset_falls_back_to_archive_when_bare_binary_is_missing() {
+    fn select_platform_asset_never_substitutes_an_archive_or_sidecar() {
         let release = Release {
             tag_name: "v0.8.8".to_string(),
             prerelease: false,
-            assets: vec![Asset {
-                name: "codewhale-macos-arm64.tar.gz".to_string(),
-                browser_download_url: "https://example.invalid/codewhale-macos-arm64.tar.gz"
-                    .to_string(),
-            }],
+            assets: ["tar.gz", "zip", "sig", "sbom.json"]
+                .into_iter()
+                .map(|ext| Asset {
+                    name: format!("codewhale-macos-arm64.{ext}"),
+                    browser_download_url: format!(
+                        "https://example.invalid/codewhale-macos-arm64.{ext}"
+                    ),
+                })
+                .collect(),
         };
 
-        let asset =
-            select_platform_asset(&release, "codewhale-macos-arm64").expect("platform asset");
-
-        assert_eq!(asset.name, "codewhale-macos-arm64.tar.gz");
+        assert!(select_platform_asset(&release, "codewhale-macos-arm64").is_none());
     }
 
     #[test]

@@ -3493,16 +3493,15 @@ impl ConfigToml {
         // RouteResolver is the runtime path: the executable wire model,
         // protocol, and endpoint come from a ReadyRouteCandidate. Auth/key
         // resolution above is unchanged. A resolver error keeps the existing
-        // model string so this method stays total.
-        let route = crate::route::RouteResolver::new()
-            .resolve(&crate::route::RouteRequest {
-                explicit_provider: Some(provider),
-                model_selector: Some(crate::route::LogicalModelRef::from(model.as_str())),
-                saved_provider_model: None,
-                base_url_override: Some(base_url.clone()),
-                limit_overrides: Vec::new(),
-            })
-            .ok();
+        // model string so this method stays total, and keeps the error itself
+        // so no caller can present the rejected model as a resolved route.
+        let route = crate::route::RouteResolver::new().resolve(&crate::route::RouteRequest {
+            explicit_provider: Some(provider),
+            model_selector: Some(crate::route::LogicalModelRef::from(model.as_str())),
+            saved_provider_model: None,
+            base_url_override: Some(base_url.clone()),
+            limit_overrides: Vec::new(),
+        });
 
         let mut http_headers = self.http_headers.clone();
         http_headers.extend(provider_cfg.http_headers.clone());
@@ -5297,10 +5296,13 @@ pub struct ResolvedRuntimeOptions {
     pub http_headers: BTreeMap<String, String>,
     /// Executable route minted by [`crate::route::RouteResolver`].
     ///
-    /// `None` only when the resolver rejected the selector (foreign model on a
-    /// strict direct provider, empty model). Auth/key fields above are
-    /// independent: the resolver never inspects credentials.
-    pub route: Option<crate::route::ReadyRouteCandidate>,
+    /// `Err` carries the resolver's rejection (foreign model on a strict
+    /// direct provider, empty model, unsupported protocol). `model` and
+    /// `base_url` above are still the requested values in that case, so a
+    /// caller that reports them as a resolved route must check this first.
+    /// Auth/key fields above are independent: the resolver never inspects
+    /// credentials.
+    pub route: Result<crate::route::ReadyRouteCandidate, crate::route::RouteError>,
 }
 
 #[derive(Debug, Clone)]

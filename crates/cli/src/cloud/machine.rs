@@ -975,8 +975,24 @@ pub(crate) fn run_api_keys<T: CloudTransport, W: Write>(
 /// The secret goes to stdout exactly once, whether or not stdout is a TTY: CI
 /// captures stdout, and a secret written to stderr would land in a diagnostics
 /// stream that is far more likely to be archived and shared.
+///
+/// A 2xx whose secret is missing or malformed is not a created key the caller
+/// can use: it fails before anything reads "Created", naming the id (when the
+/// server sent one) so the half-minted key can be revoked.
 fn write_created_key<W: Write>(out: &mut W, created: &ApiKeyCreateResponse) -> Result<()> {
     let metadata = &created.api_key;
+    if !token_is_well_formed(&created.secret) {
+        let id = if metadata.id.trim().is_empty() {
+            "(no id returned)".to_string()
+        } else {
+            printable(&metadata.id)
+        };
+        bail!(
+            "Codewhale answered the API key request without a well-formed secret, so no usable \
+key was created. The server may still have recorded key {id}: run `codewhale account api-keys \
+list` and revoke it with `codewhale account api-keys revoke <id>`, then create another."
+        );
+    }
     writeln!(
         out,
         "Created Codewhale API key {}.",
