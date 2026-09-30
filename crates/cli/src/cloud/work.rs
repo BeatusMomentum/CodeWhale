@@ -29,6 +29,28 @@ fn valid_confirmation(token: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
+/// Consume a pipe rather than placing signed consent proof in process argv.
+/// Bound the read before decoding and allow only one terminal line ending.
+pub(super) fn read_confirmation(reader: impl Read) -> Result<String> {
+    let mut bytes = Vec::new();
+    reader
+        .take(MAX_CONFIRMATION_BYTES as u64 + 3)
+        .read_to_end(&mut bytes)
+        .context("Could not read the launch confirmation from stdin")?;
+    if bytes.len() > MAX_CONFIRMATION_BYTES + 2 {
+        bail!("Launch confirmation from stdin is too long");
+    }
+    let value = String::from_utf8(bytes).context("Launch confirmation from stdin must be UTF-8")?;
+    let token = value
+        .strip_suffix("\r\n")
+        .or_else(|| value.strip_suffix('\n'))
+        .unwrap_or(&value);
+    if !valid_confirmation(token) {
+        bail!("Launch confirmation from stdin must be one non-empty confirmation token");
+    }
+    Ok(token.to_string())
+}
+
 fn at<'a>(value: &'a Value, path: &[&str]) -> Option<&'a Value> {
     path.iter().try_fold(value, |cursor, key| cursor.get(*key))
 }
