@@ -187,7 +187,7 @@ jobs:
                 ;;
             esac
             case "${path}" in
-              .github/workflows/*|.github/actionlint.yml)
+              .github/workflows/*|.github/actionlint.yml|action.yml|scripts/github-action/*)
                 actions=true
                 ;;
             esac
@@ -302,6 +302,8 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: 22
+      - name: Test reusable GitHub review action
+        run: node --test scripts/github-action/*.test.mjs
       - name: Run Runtime SDK runtime and type tests
         run: |
           npm ci --ignore-scripts --workspace @codewhale/runtime-sdk

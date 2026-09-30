@@ -1,4 +1,4 @@
-<!-- source: README.md sha256:4d2ba4fb6003 -->
+<!-- source: README.md sha256:925619135f77 -->
 # Codewhale
 
 Codewhale est un agent open source qui lit votre projet, modifie des fichiers, exécute des commandes et vérifie son travail avec un modèle hébergé ou local de votre choix. Commencez par une tâche dans votre terminal. Pour un travail plus important, confiez-en des parties à des agents utilisant différents modèles et rôles.
@@ -78,6 +78,7 @@ Consultez l’[ordre d’autorisation](docs/AUTHORIZATION_ORDER.md) pour connaî
 
 ## Documentation
 
+- [Configuration de la revue des PR GitHub](docs/GITHUB_ACTION.md)
 - [Fournisseurs et modèles locaux](docs/PROVIDERS.md)
 - [Équipes d’agents](docs/FLEET.md)
 - [MCP](docs/MCP.md), [hooks](docs/HOOKS.md) et [configuration](docs/CONFIGURATION.md)

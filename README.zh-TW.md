@@ -1,4 +1,4 @@
-<!-- source: README.md sha256:4d2ba4fb6003 -->
+<!-- source: README.md sha256:925619135f77 -->
 # Codewhale
 
 Codewhale 是一款開源代理，可使用你選擇的託管模型或本機模型讀取專案、編輯檔案、執行指令，並檢查自己的工作。從終端機中的一項任務開始。對於較大的工作，可以將部分任務交給使用不同模型、擔任不同角色的代理。
@@ -78,6 +78,7 @@ Codewhale 在你的電腦上執行，且只擁有你授予的存取權限。核�
 
 ## 文件
 
+- [GitHub PR 審查設定](docs/GITHUB_ACTION.md)
 - [供應商與本機模型](docs/PROVIDERS.md)
 - [代理團隊](docs/FLEET.md)
 - [MCP](docs/MCP.md)、[掛鉤](docs/HOOKS.md)與[設定](docs/CONFIGURATION.md)

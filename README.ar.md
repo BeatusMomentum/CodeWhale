@@ -1,4 +1,4 @@
-<!-- source: README.md sha256:4d2ba4fb6003 -->
+<!-- source: README.md sha256:925619135f77 -->
 # Codewhale
 
 Codewhale وكيل مفتوح المصدر يقرأ مشروعك ويعدّل الملفات ويشغّل الأوامر ويتحقق من عمله باستخدام نموذج مستضاف أو محلي تختاره. ابدأ بمهمة واحدة في الطرفية. وللأعمال الأكبر، وزّع أجزاء العمل على وكلاء بنماذج وأدوار مختلفة.
@@ -78,6 +78,7 @@ codewhale exec "fix the failing tests and explain what changed"
 
 ## الوثائق
 
+- [إعداد مراجعة طلبات السحب على GitHub](docs/GITHUB_ACTION.md)
 - [الموفّرون والنماذج المحلية](docs/PROVIDERS.md)
 - [فرق الوكلاء](docs/FLEET.md)
 - [MCP](docs/MCP.md) و[الخطافات](docs/HOOKS.md) و[الإعدادات](docs/CONFIGURATION.md)
