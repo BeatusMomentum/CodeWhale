@@ -355,7 +355,14 @@ fn classify(
 ) -> BillingPresentation {
     match provider {
         ApiProvider::Ollama | ApiProvider::Sglang | ApiProvider::Vllm => BillingPresentation::Local,
-        ApiProvider::OpenaiCodex => BillingPresentation::Subscription("Codex OAuth quota"),
+        // The Codex OAuth quota is a fact of the ChatGPT backend, not of the
+        // provider name: a custom `[providers.openai_codex] base_url` (a
+        // gateway, a proxy) sells its own terms, so it is Unknown rather than
+        // a subscription that would hide metered spend.
+        ApiProvider::OpenaiCodex if is_chatgpt_codex_backend(base_url) => {
+            BillingPresentation::Subscription("Codex OAuth quota")
+        }
+        ApiProvider::OpenaiCodex => BillingPresentation::Unknown,
         ApiProvider::OpencodeGo => BillingPresentation::Subscription("OpenCode Go quota"),
         // StepFun already reduces an endpoint to a non-secret billing surface
         // and fails closed on anything it does not recognize.
@@ -606,6 +613,20 @@ fn stepfun_billing_for_endpoint(base_url: Option<&str>) -> BillingPresentation {
         }
         _ => BillingPresentation::Unknown,
     }
+}
+
+/// The ChatGPT backend the Codex OAuth route ships with
+/// (`https://chatgpt.com/backend-api`, or a path under it).
+fn is_chatgpt_codex_backend(base_url: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(base_url.trim()) else {
+        return false;
+    };
+    let path = url.path().trim_end_matches('/');
+    url.scheme() == "https"
+        && url.host_str() == Some("chatgpt.com")
+        && url.port().is_none()
+        && url.username().is_empty()
+        && (path == "/backend-api" || path.starts_with("/backend-api/"))
 }
 
 fn is_zai_coding_plan_endpoint(base_url: &str) -> bool {
@@ -2401,6 +2422,26 @@ mod tests {
             ),
             BillingPresentation::Subscription("Codex OAuth quota")
         );
+        // The OAuth token pointed anywhere else proves no Codex quota.
+        for elsewhere in [
+            "https://codex-gateway.example.com/backend-api",
+            "https://chatgpt.com.example.net/backend-api",
+            "http://chatgpt.com/backend-api",
+            "https://chatgpt.com/v1",
+            "",
+        ] {
+            assert_eq!(
+                for_dispatched_route(
+                    &config,
+                    DispatchedRoute {
+                        provider: ApiProvider::OpenaiCodex,
+                        base_url: elsewhere,
+                    },
+                ),
+                BillingPresentation::Unknown,
+                "{elsewhere:?}"
+            );
+        }
     }
 
     #[test]

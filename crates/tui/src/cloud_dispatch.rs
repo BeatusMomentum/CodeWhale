@@ -21,7 +21,6 @@
 //! provider-accepted active observation.
 
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -288,25 +287,13 @@ impl CloudJobStore {
     }
 
     /// Persist a job atomically. Never writes credentials.
+    ///
+    /// The record is written through a unique temporary file (never a fixed
+    /// `.json.tmp` two writers would share) and renamed into place while the
+    /// job's lock is held, so it cannot interleave with a
+    /// [`Self::save_unless_canceled`] or a cancel.
     pub fn save(&self, job: &CloudJob) -> Result<()> {
-        fs::create_dir_all(&self.root).context("failed to create cloud-jobs directory")?;
-        let path = self.job_path(&job.id)?;
-        let tmp = path.with_extension("json.tmp");
-        let body = serde_json::to_vec_pretty(job).context("failed to encode cloud job")?;
-        {
-            let mut file =
-                fs::File::create(&tmp).context("failed to start a private cloud job write")?;
-            file.write_all(&body)
-                .context("failed to write the cloud job record")?;
-            file.sync_all().ok();
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600));
-        }
-        fs::rename(&tmp, &path).context("failed to commit the cloud job record")?;
-        Ok(())
+        self.with_job_lock(&job.id, || self.write_record(job))
     }
 
     /// Cancel-authoritative save: refuse to overwrite a `canceled` record.
@@ -319,19 +306,49 @@ impl CloudJobStore {
     /// persisted record is already `canceled`, `Ok(true)` after a normal
     /// save.
     ///
-    /// This is load-check-save: the store is file-backed with no
-    /// cross-process lock, so the check cannot remove the load→save window
-    /// entirely — it narrows the clobber window from a whole phase (seconds
-    /// to minutes) to the span of one save, which is the single-writer
-    /// discipline this store assumes elsewhere.
+    /// The load, check and save run under the job's advisory file lock, and
+    /// [`cancel_job`] flips the record under the same lock, so the check and
+    /// the write are one step with respect to a cancel in another process.
     pub fn save_unless_canceled(&self, job: &CloudJob) -> Result<bool> {
-        if let Ok(current) = self.load(&job.id)
-            && current.status == CloudJobStatus::Canceled
-        {
-            return Ok(false);
-        }
-        self.save(job)?;
-        Ok(true)
+        self.with_job_lock(&job.id, || {
+            if let Ok(current) = self.load(&job.id)
+                && current.status == CloudJobStatus::Canceled
+            {
+                return Ok(false);
+            }
+            self.write_record(job)?;
+            Ok(true)
+        })
+    }
+
+    /// Run `f` holding the job's exclusive advisory lock
+    /// (`<root>/<id>.json.lock`). The lock is released when `f` returns.
+    ///
+    /// Limitation: the lock is advisory, so it serializes Codewhale writers
+    /// only; it is not reentrant, so `f` must not call a locking method.
+    fn with_job_lock<T>(&self, id: &str, f: impl FnOnce() -> Result<T>) -> Result<T> {
+        let path = self.job_path(id)?;
+        fs::create_dir_all(&self.root).context("failed to create cloud-jobs directory")?;
+        let lock_file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(path.with_extension("json.lock"))
+            .context("failed to open the cloud job lock")?;
+        let mut lock = fd_lock::RwLock::new(lock_file);
+        let _guard = lock
+            .write()
+            .context("failed to lock the cloud job record")?;
+        f()
+    }
+
+    /// Write the record through a unique private temporary file. Callers
+    /// hold the job lock.
+    fn write_record(&self, job: &CloudJob) -> Result<()> {
+        let path = self.job_path(&job.id)?;
+        let body = serde_json::to_vec_pretty(job).context("failed to encode cloud job")?;
+        crate::utils::write_atomic(&path, &body).context("failed to commit the cloud job record")
     }
 
     /// Load one job by id.
@@ -789,23 +806,32 @@ pub fn cancel_job(
     id: &str,
     launcher: &dyn DaytonaLauncher,
 ) -> Result<CloudJob> {
-    let mut job = store.load(id)?;
-    if matches!(
-        job.status,
-        CloudJobStatus::Canceled | CloudJobStatus::Failed | CloudJobStatus::Refused
-    ) {
-        return Ok(job);
-    }
-    let had_sandbox = job.sandbox_id.is_some();
-    let sandbox_may_exist = had_sandbox || job.sandbox_pending;
-    job.status = CloudJobStatus::Canceled;
-    job.finished_unix = Some(unix_now());
-    job.note = if sandbox_may_exist {
-        "Canceled locally; the cloud agent sandbox is being torn down.".to_string()
-    } else {
-        "Canceled locally before a sandbox was created.".to_string()
+    // The flip is one locked read-modify-write, so a runner phase save cannot
+    // land between this load and this write (and lose either the cancel or
+    // the sandbox id the runner just recorded).
+    let flipped = store.with_job_lock(id, || {
+        let mut job = store.load(id)?;
+        if matches!(
+            job.status,
+            CloudJobStatus::Canceled | CloudJobStatus::Failed | CloudJobStatus::Refused
+        ) {
+            return Ok((job, false));
+        }
+        let sandbox_may_exist = job.sandbox_id.is_some() || job.sandbox_pending;
+        job.status = CloudJobStatus::Canceled;
+        job.finished_unix = Some(unix_now());
+        job.note = if sandbox_may_exist {
+            "Canceled locally; the cloud agent sandbox is being torn down.".to_string()
+        } else {
+            "Canceled locally before a sandbox was created.".to_string()
+        };
+        store.write_record(&job)?;
+        Ok((job, true))
+    })?;
+    let mut job = match flipped {
+        (job, false) => return Ok(job),
+        (job, true) => job,
     };
-    store.save(&job)?;
     if let Some(sandbox_id) = job.sandbox_id.clone() {
         let receipt = SandboxReceipt {
             sandbox_id,
@@ -3179,6 +3205,47 @@ mod tests {
         assert_eq!(persisted.status, CloudJobStatus::Canceled);
         assert_eq!(persisted.note, "Canceled locally");
         assert_eq!(persisted.finished_unix, Some(10_000_060));
+    }
+
+    #[test]
+    fn a_phase_save_waits_for_a_cancel_holding_the_job_lock() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = CloudJobStore::from_path(temp.path().join("jobs"));
+        let job = stored_job(CloudJobStatus::Running, 10_000_000);
+        store.save(&job).unwrap();
+        let mut runner_copy = job.clone();
+        runner_copy.status = CloudJobStatus::OpeningPr;
+
+        // A cancel in progress holds the lock between its load and its write;
+        // the runner's check-and-save must not slip into that window.
+        let outcome = store
+            .with_job_lock(&job.id, || {
+                let runner_store = store.clone();
+                let runner = std::thread::spawn(move || {
+                    runner_store.save_unless_canceled(&runner_copy).unwrap()
+                });
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                assert!(
+                    !runner.is_finished(),
+                    "the phase save ran inside the cancel's read-modify-write"
+                );
+                let mut canceled = store.load(&job.id)?;
+                canceled.status = CloudJobStatus::Canceled;
+                store.write_record(&canceled)?;
+                Ok(runner)
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+        assert!(!outcome, "the phase save must see the cancel and stand down");
+        assert_eq!(
+            store.load(&job.id).unwrap().status,
+            CloudJobStatus::Canceled
+        );
+        assert!(
+            !temp.path().join("jobs").join(format!("{}.json.tmp", job.id)).exists(),
+            "records are written through unique temporaries"
+        );
     }
 
     #[test]

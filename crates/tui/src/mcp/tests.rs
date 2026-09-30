@@ -1946,6 +1946,51 @@ async fn plugin_stdio_does_not_surface_reviewed_child_stderr() {
     assert!(!error.contains("ARBITRARY_PLUGIN_CREDENTIAL"));
 }
 
+/// Shutdown reaches what the server started, not only the server: a
+/// background grandchild (an `npx` wrapper's node, a shell job) must not
+/// survive the transport.
+#[cfg(unix)]
+#[tokio::test]
+async fn stdio_shutdown_also_terminates_the_servers_grandchildren() {
+    let mut config = test_server_config();
+    config.command = Some("sh".to_string());
+    config.args = vec![
+        "-c".to_string(),
+        "sleep 300 & echo $!; wait".to_string(),
+    ];
+    let mut transport = StdioTransport::spawn(
+        "grandparent",
+        "sh",
+        &config,
+        tokio_util::sync::CancellationToken::new(),
+    )
+    .unwrap();
+    let line = tokio::time::timeout(Duration::from_secs(5), transport.recv())
+        .await
+        .expect("grandchild pid line")
+        .unwrap();
+    let grandchild: i32 = String::from_utf8(line).unwrap().trim().parse().unwrap();
+
+    transport.shutdown().await;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        // SAFETY: signal 0 only probes whether the pid still exists.
+        if unsafe { libc::kill(grandchild, 0) } != 0 {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            // Do not leak the sleeper past a failing run.
+            // SAFETY: plain kill(2) of the pid this test started.
+            unsafe {
+                libc::kill(grandchild, libc::SIGKILL);
+            }
+            panic!("the MCP server's grandchild outlived the transport");
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 /// #6187: a crashed stdio child must stop reading as "ready" before any
 /// call is in flight — `is_ready` probes the child, so the pool rebuilds
 /// the connection on the next use instead of handing the dead transport
@@ -5120,6 +5165,7 @@ async fn stdio_transport_shutdown_terminates_child() {
         stderr_tail: StderrTail::new(),
         authority_cancel_watch: None,
         _reviewed_launch: None,
+        process_tree: None,
     };
 
     // shutdown() should send SIGTERM and complete within the grace window.
@@ -5249,6 +5295,7 @@ async fn stdio_transport_recv_error_includes_stderr_tail() {
         stderr_tail,
         authority_cancel_watch: None,
         _reviewed_launch: None,
+        process_tree: None,
     };
 
     // Give the subprocess time to write its stderr line and exit.

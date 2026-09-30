@@ -105,10 +105,18 @@ pub(super) struct WorkspaceGitMetadata {
     pub(super) dirty: bool,
 }
 
+/// Status is several blocking `git` spawns, so it runs off the async workers
+/// (#6149) like every other git read on this surface. It deliberately uses
+/// normal Git (filters, untracked settings) rather than the review command,
+/// so its counts match `git status` and the operator writes (see `git.rs`).
 pub(super) async fn workspace_status(
     State(state): State<RuntimeApiState>,
 ) -> Result<Json<WorkspaceStatusResponse>, ApiError> {
-    Ok(Json(collect_workspace_status(&state.workspace)))
+    let workspace = state.workspace.clone();
+    tokio::task::spawn_blocking(move || collect_workspace_status(&workspace))
+        .await
+        .map(Json)
+        .map_err(|_| ApiError::internal("workspace status failed"))
 }
 
 pub(super) fn collect_workspace_status(workspace: &FsPath) -> WorkspaceStatusResponse {

@@ -98,6 +98,10 @@ pub(super) fn extract_sse_data_value(line: &str) -> Option<&str> {
 /// Hard ceiling for one pending SSE line, matching the MCP frame limit.
 /// This does not bound the size of a multi-line event or the whole stream.
 const MAX_SSE_LINE_BYTES: usize = 8 * 1024 * 1024;
+/// Hard ceiling for one assembled SSE event (its `data:` fields joined), so a
+/// peer that never sends the blank line ending an event cannot grow memory
+/// without bound. Same size as the single-line ceiling.
+const MAX_SSE_EVENT_BYTES: usize = MAX_SSE_LINE_BYTES;
 
 /// Invalid or oversized SSE line (or unterminated flush).
 ///
@@ -109,6 +113,7 @@ const MAX_SSE_LINE_BYTES: usize = 8 * 1024 * 1024;
 pub(super) enum SseLineError {
     InvalidUtf8 { valid_up_to: usize },
     TooLong,
+    EventTooLong,
 }
 
 impl std::fmt::Display for SseLineError {
@@ -120,6 +125,10 @@ impl std::fmt::Display for SseLineError {
             Self::TooLong => write!(
                 f,
                 "SSE line exceeded {MAX_SSE_LINE_BYTES} bytes (8 MiB) — aborting stream"
+            ),
+            Self::EventTooLong => write!(
+                f,
+                "SSE event exceeded {MAX_SSE_EVENT_BYTES} bytes (8 MiB) — aborting stream"
             ),
         }
     }
@@ -182,6 +191,27 @@ pub(super) fn flush_sse_line(buffer: &mut Vec<u8>) -> Result<Option<String>, Sse
     let decoded = decode_sse_line_bytes(&buffer[..end]).map(|text| text.trim().to_string());
     buffer.clear();
     decoded.map(|line| (!line.is_empty()).then_some(line))
+}
+
+/// Append one `data:` field to the event being assembled. The SSE spec joins
+/// the `data:` fields of one event with '\n' and dispatches the event at the
+/// blank line that ends it; a provider may split one JSON payload across
+/// several fields, so parsing each field alone would drop the event. Fails
+/// closed (clearing the event) past [`MAX_SSE_EVENT_BYTES`].
+pub(super) fn push_sse_event_data(event: &mut String, data: &str) -> Result<(), SseLineError> {
+    let needed = event
+        .len()
+        .saturating_add(usize::from(!event.is_empty()))
+        .saturating_add(data.len());
+    if needed > MAX_SSE_EVENT_BYTES {
+        event.clear();
+        return Err(SseLineError::EventTooLong);
+    }
+    if !event.is_empty() {
+        event.push('\n');
+    }
+    event.push_str(data);
+    Ok(())
 }
 
 /// Next decoded SSE line. When `at_end` is false, wait for `\n`. When `at_end`
