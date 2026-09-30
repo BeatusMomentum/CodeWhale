@@ -27472,6 +27472,7 @@ fn engine_adopts_host_owned_session_id_from_config() {
 }
 
 mod admission_gates;
+mod runtime_state;
 mod sse_turn_recovery;
 mod tool_cancellation;
 
