@@ -66,6 +66,13 @@ pub enum DebugAction {
     OpenContextInspector,
     SendMessage(String),
     SyncSession(SessionSyncPayload),
+    /// `/retry`: install the truncated conversation as the engine's history,
+    /// then resend `input`, so the retried turn is not appended after the
+    /// exchange it replaces (#6788).
+    Resend {
+        sync: SessionSyncPayload,
+        input: String,
+    },
 }
 
 pub type DebugCommandResult = CommandResult<DebugAction>;

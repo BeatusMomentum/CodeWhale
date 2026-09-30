@@ -23112,7 +23112,8 @@ fn final_tool_scenario() {
     }
 }
 
-// === #103 transparent stream-retry policy =====================================
+// === #103 transparent stream-retry policy ==============================}
+
 
 #[test]
 fn stream_retry_scenario() {
@@ -28678,4 +28679,153 @@ async fn mcp_server_instructions_reach_the_request_labelled_once_and_only_for_vi
         crate::runtime_handoff::mcp_server_instructions_display(recorded[1])
             .is_some_and(|text| text.contains("no longer applies"))
     );
+=======
+/// #6788: `/undo` and `/retry` roll back the engine's history — the one model
+/// context authority — not just the TUI transcript mirror. The next request
+/// must not carry the undone turn, and the engine session (which
+/// `SessionUpdated` projects and every checkpoint persists) must not either.
+#[test]
+fn undo_and_retry_roll_back_the_engine_history_not_just_the_transcript() {
+    use crate::llm_client::mock::{MockLlmClient, canned};
+    use crate::tui::app::{App, AppAction};
+    use crate::tui::history::HistoryCell;
+
+    async fn wait_for_completed_turn(handle: &EngineHandle) {
+        let mut rx = handle.rx_event.write().await;
+        loop {
+            let event = tokio::time::timeout(model_turn_event_timeout(), rx.recv())
+                .await
+                .expect("timed out waiting for turn completion")
+                .expect("engine event channel closed before turn completion");
+            if let Event::TurnComplete { status, error, .. } = event {
+                assert_eq!(status, TurnOutcomeStatus::Completed, "{error:?}");
+                break;
+            }
+        }
+    }
+
+    fn user_texts(messages: &[Message]) -> Vec<String> {
+        messages
+            .iter()
+            .filter(|message| message.role == "user")
+            .flat_map(|message| &message.content)
+            .filter_map(|block| match block {
+                ContentBlock::Text { text, .. } if !text.starts_with("<turn_meta>") => {
+                    Some(text.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn sync_op(action: Option<AppAction>) -> Op {
+        let Some(AppAction::SyncSession {
+            session_id,
+            messages,
+            system_prompt,
+            model,
+            workspace,
+            mode,
+        }) = action
+        else {
+            panic!("conversation undo must sync the engine history, got {action:?}");
+        };
+        Op::SyncSession {
+            session_id,
+            messages,
+            system_prompt,
+            system_prompt_override: false,
+            model,
+            workspace,
+            mode,
+        }
+    }
+
+    let _env = lock_test_env();
+    let home = tempdir().unwrap();
+    let _codewhale_home = EnvVarGuard::set("CODEWHALE_HOME", home.path());
+    let _user_home = EnvVarGuard::set("HOME", home.path());
+    let _user_profile = EnvVarGuard::set("USERPROFILE", home.path());
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let workspace = tempdir().expect("tempdir");
+        let config = Config::default();
+        let mock = std::sync::Arc::new(MockLlmClient::new(vec![
+            canned::simple_text_turn("kept answer"),
+            canned::simple_text_turn("undone answer"),
+            canned::simple_text_turn("retried answer"),
+        ]));
+        let client: crate::core::model_client::SharedModelClient = mock.clone();
+        let (engine, handle) = Engine::new_with_model_client(
+            deterministic_engine_config(workspace.path()),
+            &config,
+            client,
+        );
+        let task = tokio::spawn(engine.run());
+
+        let mut app = App::new(
+            crate::test_support::test_tui_options(workspace.path()),
+            &config,
+        );
+        for (prompt, answer) in [("keep this", "kept answer"), ("undo this", "undone answer")] {
+            handle
+                .send(external_user_message_op(prompt, AppMode::Agent, &config))
+                .await
+                .expect("send turn");
+            wait_for_completed_turn(&handle).await;
+            app.push_history_cell(HistoryCell::User {
+                content: prompt.to_string(),
+            });
+            app.push_history_cell(HistoryCell::Assistant {
+                content: answer.to_string(),
+                streaming: false,
+            });
+        }
+        // The TUI mirror is the engine's projection, as `SessionUpdated`
+        // installs it.
+        let before = handle.get_session_snapshot().await.expect("snapshot");
+        assert_eq!(user_texts(&before.messages), ["keep this", "undo this"]);
+        app.set_api_messages(std::sync::Arc::new(before.messages));
+
+        // /undo: the engine adopts the truncated conversation.
+        let undone = crate::commands::execute("/undo", &mut app);
+        handle
+            .send(sync_op(undone.action))
+            .await
+            .expect("sync undo");
+        let after_undo = handle.get_session_snapshot().await.expect("snapshot");
+        assert_eq!(user_texts(&after_undo.messages), ["keep this"]);
+
+        // /retry: sync, then resend the same input exactly once.
+        let retried = crate::commands::execute("/retry", &mut app);
+        let Some(AppAction::Sequence(mut steps)) = retried.action else {
+            panic!("/retry must sync the engine before resending: {retried:?}");
+        };
+        assert_eq!(steps.len(), 2, "{steps:?}");
+        let Some(AppAction::SendMessage(input)) = steps.pop() else {
+            panic!("/retry must resend its input last: {steps:?}");
+        };
+        handle.send(sync_op(steps.pop())).await.expect("sync retry");
+        handle
+            .send(external_user_message_op(&input, AppMode::Agent, &config))
+            .await
+            .expect("resend retried turn");
+        wait_for_completed_turn(&handle).await;
+
+        let requests = mock.captured_requests();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(
+            user_texts(&requests[2].messages),
+            ["keep this"],
+            "the retried request must carry neither the undone turn nor a duplicate"
+        );
+        let reloaded = handle.get_session_snapshot().await.expect("snapshot");
+        assert_eq!(user_texts(&reloaded.messages), ["keep this"]);
+
+        handle.send(Op::Shutdown).await.expect("shutdown engine");
+        task.await.expect("engine task");
+    });
 }

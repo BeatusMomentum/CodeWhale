@@ -67,6 +67,17 @@ impl CommandGroup for DebugCommands {
     }
 }
 
+fn sync_session(sync: codewhale_command_contract::facets::SessionSyncPayload) -> AppAction {
+    AppAction::SyncSession {
+        session_id: sync.session_id,
+        messages: sync.messages,
+        system_prompt: sync.system_prompt,
+        model: sync.model,
+        workspace: sync.workspace,
+        mode: super::contract::from_command_mode(sync.mode),
+    }
+}
+
 pub(in crate::commands) fn host_result(result: DebugCommandResult) -> CommandResult {
     let action = result.action.map(|action| match action {
         DebugAction::FetchBalance => AppAction::FetchBalance,
@@ -85,14 +96,10 @@ pub(in crate::commands) fn host_result(result: DebugCommandResult) -> CommandRes
         }
         DebugAction::OpenContextInspector => AppAction::OpenContextInspector,
         DebugAction::SendMessage(input) => AppAction::SendMessage(input),
-        DebugAction::SyncSession(sync) => AppAction::SyncSession {
-            session_id: sync.session_id,
-            messages: sync.messages,
-            system_prompt: sync.system_prompt,
-            model: sync.model,
-            workspace: sync.workspace,
-            mode: super::contract::from_command_mode(sync.mode),
-        },
+        DebugAction::SyncSession(sync) => sync_session(sync),
+        DebugAction::Resend { sync, input } => {
+            AppAction::Sequence(vec![sync_session(sync), AppAction::SendMessage(input)])
+        }
     });
     CommandResult {
         message: result.message,

@@ -1671,6 +1671,27 @@ async fn apply_command_result_inner(
                         .await;
                 }
             }
+            AppAction::Sequence(actions) => {
+                for action in actions {
+                    let step = commands::CommandResult {
+                        message: None,
+                        action: Some(action),
+                        is_error: false,
+                    };
+                    if Box::pin(apply_command_result_inner(
+                        terminal,
+                        app,
+                        engine_handle,
+                        task_manager,
+                        config,
+                        step,
+                    ))
+                    .await?
+                    {
+                        return Ok(true);
+                    }
+                }
+            }
             AppAction::SendMessage(content) => {
                 let queued = build_queued_message(app, content);
                 dispatch_composer_message(

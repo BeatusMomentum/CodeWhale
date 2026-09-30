@@ -9,7 +9,7 @@ fn patch_undo(app: &mut App) -> CommandResult {
 }
 fn undo_conversation(app: &mut App) -> CommandResult {
     super::debug_group::host_result(undo::conversation_result(
-        super::contract::debug_operations::undo_conversation(app),
+        super::contract::debug_operations::undo_conversation_for_engine(app),
     ))
 }
 fn retry(app: &mut App) -> CommandResult {
@@ -186,7 +186,13 @@ fn test_retry_with_previous_message() {
     let msg = result.message.unwrap();
     assert!(msg.contains("Retrying"));
     assert!(msg.contains("Test message"));
-    assert!(matches!(result.action, Some(AppAction::SendMessage(_))));
+    assert!(matches!(
+        result.action.as_ref(),
+        Some(AppAction::Sequence(steps)) if matches!(
+            steps.as_slice(),
+            [AppAction::SyncSession { .. }, AppAction::SendMessage(input)] if input == "Test message"
+        )
+    ));
 }
 
 #[test]

@@ -283,9 +283,22 @@ impl CommandDebugHistoryContext for HistoryFacet {
         self.events.borrow_mut().push("composer");
         self.composer = Some(input);
     }
-    fn undo_conversation(&mut self) -> usize {
+    fn undo_conversation(&mut self) -> DebugConversationUndo {
         self.events.borrow_mut().push("undo_chat");
-        self.removed
+        DebugConversationUndo {
+            removed: self.removed,
+            sync: synced_conversation(),
+        }
+    }
+}
+fn synced_conversation() -> SessionSyncPayload {
+    SessionSyncPayload {
+        session_id: Some("undo-session".to_string()),
+        messages: Vec::new(),
+        system_prompt: None,
+        model: "model".to_string(),
+        workspace: std::path::PathBuf::from("/tmp/undo-workspace"),
+        mode: codewhale_command_contract::CommandMode::Agent,
     }
 }
 struct UndoFacet {
@@ -401,7 +414,13 @@ fn retry_truncates_history_before_emitting_the_exact_original_input() {
         CommandContexts::empty().with_debug_history(&mut history),
         None,
     );
-    assert_eq!(result.action, Some(DebugAction::SendMessage(input.clone())));
+    assert_eq!(
+        result.action,
+        Some(DebugAction::Resend {
+            sync: synced_conversation(),
+            input: input.clone(),
+        })
+    );
     assert_eq!(
         result.message,
         Some(format!("Retrying: {}...", "漢字".repeat(8)))

@@ -73,8 +73,8 @@ impl CommandDebugHistoryContext for DebugOperationsAdapter<'_> {
         app.cursor_position = app.input.chars().count();
         app.edit_in_progress = true;
     }
-    fn undo_conversation(&mut self) -> usize {
-        undo_conversation(&mut self.host.app.borrow_mut())
+    fn undo_conversation(&mut self) -> DebugConversationUndo {
+        undo_conversation_for_engine(&mut self.host.app.borrow_mut())
     }
 }
 
@@ -148,6 +148,51 @@ pub(in crate::commands) fn undo_conversation(app: &mut App) -> usize {
         app.mark_history_updated();
     }
     removed_count
+}
+
+/// Conversation undo as every command sees it (#6788): truncate the
+/// transcript mirror, persist the truncated session so a reload cannot revive
+/// the undone turn, and return the conversation the engine — the one model
+/// context authority — must adopt via `SyncSession`.
+pub(in crate::commands) fn undo_conversation_for_engine(app: &mut App) -> DebugConversationUndo {
+    let removed = undo_conversation(app);
+    if removed > 0 {
+        persist_undone_conversation(app);
+    }
+    DebugConversationUndo {
+        removed,
+        sync: session_sync_payload(app),
+    }
+}
+
+fn persist_undone_conversation(app: &mut App) {
+    // A session that was never saved has nothing on disk to revive.
+    if app.current_session_id.is_none() {
+        return;
+    }
+    let Ok(manager) = crate::session_manager::SessionManager::default_location() else {
+        return;
+    };
+    let persisted = crate::tui::ui::build_session_snapshot(app, &manager).and_then(|session| {
+        crate::tui::ui::persist_with_pending_work_boundary(
+            app,
+            crate::tui::persistence_actor::PersistRequest::SessionSnapshot(session),
+        )
+    });
+    if let Err(err) = persisted {
+        app.status_message = Some(format!("Undo applied, but the session save failed ({err})"));
+    }
+}
+
+fn session_sync_payload(app: &App) -> SessionSyncPayload {
+    SessionSyncPayload {
+        session_id: app.current_session_id.clone(),
+        messages: app.api_messages.as_ref().clone(),
+        system_prompt: app.system_prompt.clone(),
+        model: app.model.clone(),
+        workspace: app.workspace.clone(),
+        mode: super::to_command_mode(app.mode),
+    }
 }
 
 pub(crate) fn prune_undone_tool_context(app: &mut App, tool_id: &str) {
@@ -634,13 +679,6 @@ pub(in crate::commands) fn undo_files(app: &mut App) -> DebugUndoOutcome {
             })
             .collect(),
         skipped: step.skipped,
-        sync: SessionSyncPayload {
-            session_id: app.current_session_id.clone(),
-            messages: app.api_messages.as_ref().clone(),
-            system_prompt: app.system_prompt.clone(),
-            model: app.model.clone(),
-            workspace: app.workspace.clone(),
-            mode: super::to_command_mode(app.mode),
-        },
+        sync: session_sync_payload(app),
     })
 }

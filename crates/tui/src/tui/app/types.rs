@@ -643,6 +643,9 @@ pub enum AppAction {
     },
     /// Send a message to the AI (normal chat mode).
     SendMessage(String),
+    /// Apply each action in order, stopping if one ends the app. `/retry`
+    /// uses it to sync the engine's history before resending (#6788).
+    Sequence(Vec<AppAction>),
     /// Send a built-in Workflow planning turn with separate user-visible text
     /// and bounded runtime guidance. Draft instructions carry a typed marker
     /// that makes the dispatch path expose no tools for that turn.
