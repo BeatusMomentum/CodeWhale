@@ -26,7 +26,7 @@ pub(crate) const MAX_STREAM_OPEN_TIMEOUT_SECS: u64 = 300;
 
 /// Resolve the response-header wait shared by every streaming adapter.
 ///
-/// A positive `[tui].stream_open_timeout_secs` wins (#6700); omitted or `0`
+/// A positive `[stream].open_timeout_secs` (legacy `[tui]` fallback) wins; omitted or `0`
 /// falls back to the env override (`CODEWHALE_STREAM_OPEN_TIMEOUT_SECS`,
 /// legacy `DEEPSEEK_STREAM_OPEN_TIMEOUT_SECS`), then the 45s default. Every
 /// source clamps to `5..=300`.
@@ -160,7 +160,7 @@ pub struct StreamOpenRequest {
 
 impl StreamOpenRequest {
     /// `force_http1` is the client's resolved pin (`Config::force_http1`:
-    /// `[tui].force_http1` or `CODEWHALE_FORCE_HTTP1`), never re-read here.
+    /// `[stream].force_http1`, legacy `[tui]`, or `CODEWHALE_FORCE_HTTP1`), never re-read here.
     #[must_use]
     pub fn new(force_http1: bool, open_timeout: Duration, idle_timeout: Duration) -> Self {
         Self {

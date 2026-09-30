@@ -10736,3 +10736,42 @@ fn ensure_state_dir_keeps_legacy_authoritative_until_migration_succeeds() {
     }
     let _ = fs::remove_dir_all(&state_env.home);
 }
+
+#[test]
+fn stream_settings_are_typed_nested_and_fail_without_mutation() {
+    let mut config = ConfigToml::default();
+    for (key, value) in [
+        ("stream.open_timeout_secs", "120"),
+        ("stream.force_http1", "on"),
+        ("stream.tcp_keepalive_secs", "0"),
+    ] {
+        config.set_value(key, value).unwrap();
+    }
+    assert_eq!(
+        config.extras["stream"]["open_timeout_secs"].as_integer(),
+        Some(120)
+    );
+    assert_eq!(config.extras["stream"]["force_http1"].as_bool(), Some(true));
+    let before = toml::to_string(&config).unwrap();
+    for (key, value) in [
+        ("stream.max_resumes", "-1"),
+        ("stream.max_resumes", "4294967296"),
+        ("stream.force_http1", "flase"),
+        ("stream.tcp_keepalive_secs", "1.5"),
+        ("stream.open_timout_secs", "45"),
+    ] {
+        assert!(config.set_value(key, value).is_err(), "{key}");
+        assert_eq!(toml::to_string(&config).unwrap(), before);
+    }
+    let mut reloaded: ConfigToml = toml::from_str(&before).unwrap();
+    reloaded.unset_value("stream.force_http1").unwrap();
+    assert!(reloaded.extras["stream"].get("force_http1").is_none());
+    assert_eq!(
+        reloaded.extras["stream"]["open_timeout_secs"].as_integer(),
+        Some(120)
+    );
+    assert_eq!(
+        reloaded.extras["stream"]["tcp_keepalive_secs"].as_integer(),
+        Some(0)
+    );
+}

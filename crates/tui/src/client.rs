@@ -351,7 +351,7 @@ pub struct CodewhaleClient {
     pub(super) reasoning_stream_style: Option<String>,
     pub(super) stream_idle_timeout: Duration,
     /// Bounded wait for SSE response headers, resolved once from
-    /// `[tui].stream_open_timeout_secs` / `CODEWHALE_STREAM_OPEN_TIMEOUT_SECS`.
+    /// `[stream].open_timeout_secs`, legacy `[tui]`, or the environment fallback.
     pub(super) stream_open_timeout: Duration,
     /// HTTP/1.1 pin resolved once from `Config::force_http1` (#6700); the
     /// single source every client builder and stream open reads.
@@ -1394,7 +1394,7 @@ fn build_speech_synthesis_body(
 
 /// Returns true when CODEWHALE_FORCE_HTTP1 (legacy alias: DEEPSEEK_FORCE_HTTP1)
 /// is set to a truthy value (`1`, `true`, `yes`, `on`, case-insensitive). Read
-/// only by `Config::force_http1`, which ORs it with `[tui].force_http1`; every
+/// only by `Config::force_http1`, which ORs it with the selected stream config flag; every
 /// client builder and stream open takes that resolved value (#103, #6700). Anything else (unset, `0`,
 /// `false`, ...) leaves HTTP/2 on.
 pub(crate) fn force_http1_from_env() -> bool {
@@ -1628,11 +1628,10 @@ impl CodewhaleClient {
         let retry = config.retry_policy();
         let stream_idle_timeout = Duration::from_secs(config.stream_chunk_timeout_secs());
         let stream_open_timeout = config.stream_open_timeout();
-        let connect_timeout = config.connect_timeout();
         let force_http1 = config.force_http1();
         if force_http1 {
             logging::info(
-                "HTTP/1.1 pinned ([tui].force_http1 or CODEWHALE_FORCE_HTTP1) — HTTP/2 disabled",
+                "HTTP/1.1 pinned (stream configuration or environment) — HTTP/2 disabled",
             );
         }
         let http_headers = config.http_headers();
@@ -1690,7 +1689,7 @@ impl CodewhaleClient {
             wire_format,
             auth_disabled,
             force_http1,
-            connect_timeout,
+            config,
         )?
         .build()?;
         let models_http_client = Self::http_client_builder_with_auth_mode(
@@ -1701,7 +1700,7 @@ impl CodewhaleClient {
             wire_format,
             auth_disabled,
             force_http1,
-            connect_timeout,
+            config,
         )?
         .redirect(reqwest::redirect::Policy::none())
         .build()?;
@@ -1716,7 +1715,7 @@ impl CodewhaleClient {
             wire_format,
             auth_disabled,
             true,
-            connect_timeout,
+            config,
         )?
         .build()?;
 
@@ -2055,7 +2054,7 @@ impl CodewhaleClient {
             provider_default_wire_format(api_provider),
             false,
             false,
-            Duration::from_secs(crate::config::DEFAULT_CONNECT_TIMEOUT_SECS),
+            &Config::default(),
         )?
         .build()
         .map_err(Into::into)
@@ -2069,7 +2068,7 @@ impl CodewhaleClient {
         wire_format: WireFormat,
         auth_disabled: bool,
         force_http1: bool,
-        connect_timeout: Duration,
+        config: &Config,
     ) -> Result<reqwest::ClientBuilder> {
         let headers = build_default_headers(
             api_key,
@@ -2082,10 +2081,10 @@ impl CodewhaleClient {
         let mut builder = crate::tls::reqwest_client_builder()
             .default_headers(headers)
             .user_agent(client_user_agent(api_provider))
-            .connect_timeout(connect_timeout)
-            .tcp_keepalive(Some(Duration::from_secs(30)))
-            .http2_keep_alive_interval(Some(Duration::from_secs(15)))
-            .http2_keep_alive_timeout(Duration::from_secs(20))
+            .connect_timeout(config.connect_timeout())
+            .tcp_keepalive(config.tcp_keepalive())
+            .http2_keep_alive_interval(config.http2_keep_alive_interval())
+            .http2_keep_alive_timeout(config.http2_keep_alive_timeout())
             .min_tls_version(reqwest::tls::Version::TLS_1_2);
         if force_http1 {
             builder = builder.http1_only();
@@ -13797,6 +13796,69 @@ mod tests {
                 None => unsafe { std::env::remove_var("DEEPSEEK_FORCE_HTTP1") },
             }
         }
+    }
+
+    #[tokio::test]
+    async fn configured_http2_keepalive_reaches_real_client_transport() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let config: Config = toml::from_str(
+            "[stream]\nhttp2_keep_alive_interval_secs=1\nhttp2_keep_alive_timeout_secs=1\n",
+        )
+        .unwrap();
+        let client = CodewhaleClient::http_client_builder_with_auth_mode(
+            "",
+            &HashMap::new(),
+            ApiProvider::Deepseek,
+            &url,
+            WireFormat::ChatCompletions,
+            true,
+            false,
+            &config,
+        )
+        .unwrap()
+        .no_proxy()
+        .http2_prior_knowledge()
+        .build()
+        .unwrap();
+        let request = tokio::spawn(async move { client.get(url).send().await });
+        // Minimal HTTP/2 peer: handshake, leave the request open, and observe
+        // the actual PING. No additional dependency or external provider.
+        let peer = tokio::time::timeout(Duration::from_secs(5), async {
+            let (mut peer, _) = listener.accept().await.unwrap();
+            let mut preface = [0; 24];
+            peer.read_exact(&mut preface).await.unwrap();
+            assert_eq!(&preface, b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+            peer.write_all(&[0, 0, 0, 4, 0, 0, 0, 0, 0]).await.unwrap();
+            loop {
+                let mut header = [0; 9];
+                peer.read_exact(&mut header).await.unwrap();
+                let len = (usize::from(header[0]) << 16)
+                    | (usize::from(header[1]) << 8)
+                    | usize::from(header[2]);
+                assert!(len <= 65536, "bounded test frame");
+                let mut body = vec![0; len];
+                peer.read_exact(&mut body).await.unwrap();
+                if header[3] == 4 && header[4] & 1 == 0 {
+                    peer.write_all(&[0, 0, 0, 4, 1, 0, 0, 0, 0]).await.unwrap();
+                }
+                if header[3] == 6 && header[4] & 1 == 0 {
+                    assert_eq!(len, 8);
+                    return peer; // Deliberately withhold the PING ACK.
+                }
+            }
+        })
+        .await
+        .expect("configured one-second interval must send a PING before the default 15 seconds");
+        let result = tokio::time::timeout(Duration::from_secs(3), request).await
+            .expect("configured one-second acknowledgement timeout must end the request before default 20 seconds")
+            .unwrap();
+        assert!(
+            result.is_err(),
+            "an unacknowledged PING must fail the request"
+        );
+        drop(peer); // Keep the peer open until the client's own timer fires.
     }
 
     #[test]

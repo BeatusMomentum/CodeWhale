@@ -15655,3 +15655,84 @@ fn tui_force_http1_key_pins_http1() {
     let config: Config = toml::from_str("[tui]\nforce_http1 = true\n").expect("config parses");
     assert!(config.force_http1());
 }
+
+#[test]
+fn canonical_stream_config_preserves_legacy_resolution_and_precedence() {
+    let _lock = lock_test_env();
+    let _pin = EnvVarGuard::remove("CODEWHALE_FORCE_HTTP1");
+    let _legacy_pin = EnvVarGuard::remove("DEEPSEEK_FORCE_HTTP1");
+    let legacy = "[tui]\nstream_open_timeout_secs=80\nstream_chunk_timeout_secs=120\nforce_http1=true\nstream_max_resumes=4\nstream_max_transparent_retries=3\nstream_max_errors=7\nstream_max_duration_secs=900\nstream_max_content_mb=12\nconnect_timeout_secs=60\n";
+    let canonical = "[stream]\nopen_timeout_secs=80\nchunk_timeout_secs=120\nforce_http1=true\nmax_resumes=4\nmax_transparent_retries=3\nmax_stream_errors=7\nmax_duration_secs=900\nmax_content_mb=12\nconnect_timeout_secs=60\n";
+    let parse = |body: &str| toml::from_str::<Config>(body).unwrap();
+    assert_eq!(
+        toml::Value::try_from(parse(legacy).resolved_stream_settings()).unwrap(),
+        toml::Value::try_from(parse(canonical).resolved_stream_settings()).unwrap(),
+    );
+    let mixed = parse(&format!(
+        "{legacy}\n[stream]\nmax_resumes=0\nforce_http1=false\n"
+    ));
+    assert_eq!(mixed.stream_retry_limits().max_resumes, 0);
+    assert_eq!(mixed.stream_retry_limits().max_errors, 7);
+    assert_eq!(mixed.stream_open_timeout(), Duration::from_secs(80));
+    assert!(!mixed.force_http1());
+    let _pin = EnvVarGuard::set("CODEWHALE_FORCE_HTTP1", "1");
+    assert!(
+        mixed.force_http1(),
+        "the existing environment pin still wins"
+    );
+}
+
+#[test]
+fn canonical_stream_config_env_clamps_and_keepalive_disable() {
+    let _lock = lock_test_env();
+    let _open = EnvVarGuard::set("CODEWHALE_STREAM_OPEN_TIMEOUT_SECS", "70");
+    let _idle = EnvVarGuard::set("CODEWHALE_STREAM_IDLE_TIMEOUT_SECS", "90");
+    let config: Config = toml::from_str("[stream]\nopen_timeout_secs=0\nchunk_timeout_secs=0\nmax_resumes=99\nmax_transparent_retries=99\nmax_stream_errors=0\nmax_duration_secs=999999\nmax_content_mb=999999\nconnect_timeout_secs=999999\ntcp_keepalive_secs=0\nhttp2_keep_alive_interval_secs=0\nhttp2_keep_alive_timeout_secs=0\n").unwrap();
+    assert_eq!(config.stream_open_timeout(), Duration::from_secs(70));
+    assert_eq!(
+        config.stream_chunk_timeout_secs(),
+        900,
+        "zero retains idle default semantics"
+    );
+    assert_eq!(config.stream_retry_limits().max_resumes, 10);
+    assert_eq!(config.stream_retry_limits().max_transparent_retries, 10);
+    assert_eq!(config.stream_retry_limits().max_errors, 5);
+    assert_eq!(config.stream_max_duration(), Duration::from_secs(86400));
+    assert_eq!(config.stream_max_content_bytes(), 512 * 1024 * 1024);
+    assert_eq!(config.connect_timeout(), Duration::from_secs(300));
+    assert_eq!(config.tcp_keepalive(), None);
+    assert_eq!(config.http2_keep_alive_interval(), None);
+    assert_eq!(config.http2_keep_alive_timeout(), Duration::from_secs(20));
+    let positive: Config = toml::from_str("[stream]\nopen_timeout_secs=12\nchunk_timeout_secs=14\ntcp_keepalive_secs=9000\nhttp2_keep_alive_interval_secs=9000\nhttp2_keep_alive_timeout_secs=9000\n").unwrap();
+    assert_eq!(positive.stream_open_timeout(), Duration::from_secs(12));
+    assert_eq!(positive.stream_chunk_timeout_secs(), 14);
+    assert_eq!(positive.tcp_keepalive(), Some(Duration::from_secs(3600)));
+    assert_eq!(
+        positive.http2_keep_alive_interval(),
+        Some(Duration::from_secs(3600))
+    );
+    assert_eq!(
+        positive.http2_keep_alive_timeout(),
+        Duration::from_secs(3600)
+    );
+    for invalid in [
+        "open_timeout_secs=-1",
+        "max_resumes=4294967296",
+        "force_http1='yes'",
+        "open_timout_secs=45",
+    ] {
+        assert!(
+            toml::from_str::<Config>(&format!("[stream]\n{invalid}\n")).is_err(),
+            "{invalid}"
+        );
+    }
+}
+
+#[test]
+fn canonical_stream_config_profile_merges_independent_keys() {
+    let config = parse_config_file("[stream]\nmax_resumes=7\ntcp_keepalive_secs=41\n[profiles.mobile.stream]\nopen_timeout_secs=180\n").unwrap();
+    let resolved = apply_profile(config, Some("mobile")).unwrap();
+    assert_eq!(resolved.stream_retry_limits().max_resumes, 7);
+    assert_eq!(resolved.tcp_keepalive(), Some(Duration::from_secs(41)));
+    assert_eq!(resolved.stream_open_timeout(), Duration::from_secs(180));
+}

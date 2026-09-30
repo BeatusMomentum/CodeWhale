@@ -2979,6 +2979,33 @@ impl ConfigToml {
             return self.set_value(&alias, value);
         }
         check_config_toml_choice(key, value)?;
+        if let Some(field) = key.strip_prefix("stream.") {
+            let def = setting(key).with_context(|| format!("unknown stream setting `{key}`"))?;
+            let stored = schema_toml_value(key, def, value)?;
+            if let Some(number) = stored.as_integer() {
+                // Retry counts are u32 in the runtime reader; other values
+                // are u64. Reject invalid types before touching the document.
+                let max = if matches!(
+                    field,
+                    "max_resumes" | "max_transparent_retries" | "max_stream_errors"
+                ) {
+                    i64::from(u32::MAX)
+                } else {
+                    i64::MAX
+                };
+                anyhow::ensure!(
+                    (0..=max).contains(&number),
+                    "invalid unsigned value for `{key}`"
+                );
+            }
+            self.extras
+                .entry("stream".to_string())
+                .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+                .as_table_mut()
+                .context("stream must be a TOML table")?
+                .insert(field.to_string(), stored);
+            return Ok(());
+        }
         if notifications::in_namespace(key) {
             let setting = notifications::NotificationSetting::required(key)?;
             let update = notifications::NotificationConfigUpdate::parse(setting, value)?;
@@ -3067,6 +3094,16 @@ impl ConfigToml {
     pub fn unset_value(&mut self, key: &str) -> Result<()> {
         if let Some(alias) = self.root_alias_key(key) {
             return self.unset_value(&alias);
+        }
+        if let Some(field) = key.strip_prefix("stream.") {
+            anyhow::ensure!(setting(key).is_some(), "unknown stream setting `{key}`");
+            if let Some(stream) = self.extras.get_mut("stream") {
+                stream
+                    .as_table_mut()
+                    .context("stream must be a TOML table")?
+                    .remove(field);
+            }
+            return Ok(());
         }
         if notifications::in_namespace(key) {
             let setting = notifications::NotificationSetting::required(key)?;

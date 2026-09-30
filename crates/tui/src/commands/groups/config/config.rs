@@ -13,7 +13,7 @@ use crate::config::{
 };
 use crate::config_persistence::{
     persist_root_bool_key, persist_root_string_key, persist_subagents_bool_key,
-    persist_subagents_integer_key, persist_table_string_key, persist_tui_integer_key,
+    persist_subagents_integer_key, persist_table_string_key, persist_table_value_key,
     persist_unset_root_key,
 };
 use crate::reasoning_preference::ReasoningEffort;
@@ -967,7 +967,7 @@ fn config_editability_audit(app: &App) -> CommandResult {
             app.stream_chunk_timeout_secs.to_string(),
             "runtime+persisted",
             "/config stream_chunk_timeout_secs <0|1..3600> --save",
-            "Writes [tui].stream_chunk_timeout_secs and updates the running stream timeout.",
+            "Writes [stream].chunk_timeout_secs and updates the running stream timeout.",
         ),
         (
             "posture_bar",
@@ -2528,10 +2528,11 @@ pub fn set_config_value(app: &mut App, key: &str, value: &str, persist: bool) ->
             app.stream_chunk_timeout_secs = resolved;
             let value_label = stream_chunk_timeout_value_label(raw, resolved);
             if persist {
-                match persist_tui_integer_key(
+                match persist_table_value_key(
                     app.config_path.as_deref(),
-                    "stream_chunk_timeout_secs",
-                    raw,
+                    "stream",
+                    "chunk_timeout_secs",
+                    (raw as i64).into(), // validated above: at most 3600
                 ) {
                     Ok(path) => {
                         return CommandResult::with_message_and_action(
@@ -5384,7 +5385,7 @@ context_window = 262144
     }
 
     #[test]
-    fn config_command_stream_chunk_timeout_save_persists_tui_key() {
+    fn config_command_stream_chunk_timeout_save_overrides_canonical_value() {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -5398,6 +5399,11 @@ context_window = 262144
         let _guard = EnvGuard::new(&temp_root);
 
         let config_path = temp_root.join("custom-config.toml");
+        fs::write(
+            &config_path,
+            "[stream]\nchunk_timeout_secs=45\n[tui]\nstream_chunk_timeout_secs=30\n",
+        )
+        .unwrap();
         let mut app = create_test_app();
         app.config_path = Some(config_path.clone());
 
@@ -5412,8 +5418,17 @@ context_window = 262144
                 config_path.display()
             )
         );
-        assert!(saved.contains("[tui]"));
-        assert!(saved.contains("stream_chunk_timeout_secs = 120"));
+        let reopened: Config = toml::from_str(&saved).unwrap();
+        assert_eq!(
+            reopened.stream_chunk_timeout_secs(),
+            120,
+            "saved value must survive reopening when a canonical value already existed"
+        );
+        assert_eq!(
+            reopened.tui.unwrap().stream_chunk_timeout_secs,
+            Some(30),
+            "legacy compatibility input is preserved"
+        );
         assert_eq!(app.stream_chunk_timeout_secs, 120);
         assert!(matches!(
             result.action,

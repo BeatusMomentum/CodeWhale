@@ -148,6 +148,7 @@ fn settable_keys() -> impl Iterator<Item = &'static str> {
         .map(|def| def.key)
         .filter(|key| {
             codewhale_config::notifications::in_namespace(key)
+                || key.starts_with("stream.")
                 || (!key.contains('.') && config_key_home(key) != ConfigKeyHome::Unknown)
         })
         // serde's field table carries the camelCase aliases too; suggest the
@@ -191,6 +192,24 @@ pub fn unknown_config_key_message(key: &str) -> String {
         "unknown config key `{key}`: nothing reads it, so it was not saved.{hint} \
          Run `codewhale config list` for config.toml keys or `/settings text` for settings."
     )
+}
+
+/// Effective stream values for dispatcher diagnostics, resolved by the same
+/// Config accessors as Engine/client construction. Start from the unredacted
+/// document to parse its types; return only this non-secret table. The caller
+/// keeps the existing redaction path for every other config value.
+pub fn resolved_stream_config(config: &ConfigToml) -> Result<toml::Value> {
+    let document = toml::Value::try_from(config)?;
+    // Parse only the two owning tables: dispatcher-specific root values must
+    // not change their existing dump behavior just to inspect transport.
+    let mut transport = toml::Table::new();
+    for key in ["stream", "tui"] {
+        if let Some(value) = document.get(key) {
+            transport.insert(key.to_string(), value.clone());
+        }
+    }
+    let config: Config = toml::Value::Table(transport).try_into()?;
+    Ok(toml::Value::try_from(config.resolved_stream_settings())?)
 }
 
 /// Write one settings.toml key through the same validator and locked
@@ -591,6 +610,35 @@ mod tests {
         assert!(
             findings[1].contains("`totally_bogus_key` is not read by anything"),
             "{findings:#?}"
+        );
+    }
+    #[test]
+    fn stream_dump_uses_runtime_resolution_without_exposing_other_config() {
+        let _env = crate::test_support::lock_test_env();
+        let _open =
+            crate::test_support::EnvVarGuard::set("CODEWHALE_STREAM_OPEN_TIMEOUT_SECS", "88");
+        let _pin = crate::test_support::EnvVarGuard::set("CODEWHALE_FORCE_HTTP1", "1");
+        let config: ConfigToml = toml::from_str("[providers.deepseek]\napi_key='fixture-secret'\n[tui]\nstream_max_resumes=6\n[stream]\nhttp2_keep_alive_timeout_secs=0\n").unwrap();
+        let stream = resolved_stream_config(&config).unwrap();
+        assert_eq!(stream["open_timeout_secs"].as_integer(), Some(88));
+        assert_eq!(stream["max_resumes"].as_integer(), Some(6));
+        assert_eq!(stream["force_http1"].as_bool(), Some(true));
+        assert_eq!(
+            stream["http2_keep_alive_timeout_secs"].as_integer(),
+            Some(20)
+        );
+        assert!(!stream.to_string().contains("fixture-secret"));
+        assert!(unread_config_keys(["stream"]).is_empty());
+        for key in stream.as_table().unwrap().keys() {
+            assert!(
+                codewhale_config::setting(&format!("stream.{key}")).is_some(),
+                "{key}"
+            );
+        }
+        assert_eq!(
+            config.extras["stream"].as_table().unwrap().len(),
+            1,
+            "dump never persists resolved defaults"
         );
     }
 }

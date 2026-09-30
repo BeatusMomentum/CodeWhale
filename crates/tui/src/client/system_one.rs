@@ -208,7 +208,7 @@ impl CodewhaleClient {
                     WireFormat::ChatCompletions,
                     false,
                     client.force_http1,
-                    config.connect_timeout(),
+                    config,
                 )?
                 .build()?;
                 client.base_url = base_url;

@@ -1152,6 +1152,23 @@ base_url = "https://api.deepseek.com/beta"
 # max_install_size_bytes = 5_242_880
 # scan_codewhale_only = false # true: ignore Claude/OpenCode/Cursor/agentskills.io skill dirs
 
+# Model-stream budgets and HTTP transport. `config dump` shows effective values.
+# Legacy [tui] stream_* keys remain fallbacks when a canonical field is absent.
+[stream]
+open_timeout_secs = 45      # response headers, including connect (0 = env/default, 5-300)
+chunk_timeout_secs = 900    # per-SSE-chunk idle bound (0 = default, 1-3600)
+max_resumes = 3             # whole-request reissues after failed streams (0 = off, 0-10)
+max_transparent_retries = 2 # retry before any content (0 = off, 0-10)
+max_stream_errors = 5       # recoverable errors per stream (0 = default, 1-50)
+max_duration_secs = 1800    # one stream, not the whole turn (0 = default, 10-86400)
+max_content_mb = 10         # one stream's content (0 = default, 1-512)
+connect_timeout_secs = 30   # TCP/TLS setup (0 = default, 1-300)
+force_http1 = false         # a truthy CODEWHALE_FORCE_HTTP1 still pins HTTP/1.1
+# Keepalive settings apply to newly built model/catalog/fallback clients.
+tcp_keepalive_secs = 30             # idle TCP probes (0 = off, 1-3600)
+http2_keep_alive_interval_secs = 15  # active HTTP/2 PINGs (0 = off, 1-3600)
+http2_keep_alive_timeout_secs = 20   # PING ACK deadline (0 = default, 1-3600)
+
 # ─────────────────────────────────────────────────────────────────────────────────
 # TUI
 # ─────────────────────────────────────────────────────────────────────────────────
@@ -1159,26 +1176,12 @@ base_url = "https://api.deepseek.com/beta"
 alternate_screen = "auto"   # auto/always start on the alternate screen; never starts inline (keeps terminal scrollback). /fullscreen and /inline switch at runtime
 mouse_capture = true        # true: TUI-owned mouse selection (payload set by selection_copy_markdown); false: raw terminal selection/copy
 selection_copy_markdown = true # true: copy transcript drag selections as Markdown source; false: rendered text
-stream_chunk_timeout_secs = 900 # optional SSE idle timeout per chunk (0 = default, 1-3600)
 # Model steps are uncapped by default. Uncomment to install an explicit
 # ceiling; omission or 0 means no step limit, positive values clamp to 1-100000.
 # max_model_steps = 1000
 # A turn has no wall-clock limit unless you set one; omission or 0 means none.
 # turn_wall_clock_secs = 7200  # cumulative wall clock for one turn, excluding
                                # time blocked on a human approval (30-86400)
-# Stream budgets remain finite; 0 selects their default.
-stream_max_content_mb = 10   # per-step cap on streamed content (0 = default, 1-512)
-stream_max_duration_secs = 1800 # per-step cap on one stream's duration (0 = default, 10-86400)
-# Stream retry budgets and transport timeouts. Every failed stream — one that
-# never opened, died before content, or dropped mid-stream — spends
-# stream_max_resumes. For the two retry counts 0 disables that retry kind;
-# stream_max_errors is a finite budget, so 0 selects its default.
-# stream_max_resumes = 3             # re-issue a failed stream's request (0 = off, 0-10)
-# stream_max_transparent_retries = 2 # in-stream re-request before any content (0 = off, 0-10)
-# stream_max_errors = 5              # recoverable errors tolerated per stream (0 = default, 1-50)
-# stream_open_timeout_secs = 45      # response-header wait (0 = env/default, 5-300)
-# connect_timeout_secs = 30          # TCP/TLS connect timeout (0 = default, 1-300)
-# force_http1 = false               # pin HTTP/1.1 (same as CODEWHALE_FORCE_HTTP1=1)
 osc8_links = true            # emit OSC 8 escapes around URLs (Cmd+click in iTerm2/Ghostty/Kitty/WezTerm/Terminal.app 13+); set false for terminals that misrender
 # What the bottom chrome shows. Each key is one thing on screen: `mode` is the
 # posture bar's plan/act/operate chip, everything else is a segment of the

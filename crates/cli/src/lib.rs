@@ -4811,6 +4811,18 @@ fn run_config_command(
                 println!("{value}");
                 return Ok(());
             }
+            if key == "stream" || key.starts_with("stream.") {
+                let stream = codewhale_tui::config_keys::resolved_stream_config(&store.config)?;
+                let value = if key == "stream" {
+                    &stream
+                } else {
+                    stream
+                        .get(&key["stream.".len()..])
+                        .with_context(|| format!("key not found: {key}"))?
+                };
+                println!("{value}");
+                return Ok(());
+            }
             if let Some(value) = store.config.get_display_value(&key) {
                 if key == "telemetry" {
                     println!(
@@ -4965,10 +4977,15 @@ fn run_config_command(
                 );
             }
             println!("# {}", store.path().display());
-            print!(
-                "{}",
-                toml::to_string_pretty(&store.config.redacted_toml_value())?
-            );
+            let mut document = store.config.redacted_toml_value();
+            document
+                .as_table_mut()
+                .context("config must be a TOML table")?
+                .insert(
+                    "stream".to_string(),
+                    codewhale_tui::config_keys::resolved_stream_config(&store.config)?,
+                );
+            print!("{}", toml::to_string_pretty(&document)?);
             Ok(())
         }
         ConfigCommand::Import(args) => {
@@ -6440,6 +6457,69 @@ mod tests {
         write_config_fixture(&path, "verbosity = \"concise\"\n");
         let store = ConfigStore::load(Some(path)).expect("load fixture");
         run_config_doctor(&store).expect("clean doctor");
+    }
+
+    #[test]
+    fn stream_config_commands_preserve_saved_values_and_apply_per_run_overrides() {
+        let _env = env_lock();
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.toml");
+        write_config_fixture(&path, "[stream]\nopen_timeout_secs=70\nmax_resumes=6\n");
+        let mut store = ConfigStore::load(Some(path.clone())).unwrap();
+        run_config_command(
+            &mut store,
+            ConfigCommand::Set {
+                key: "stream.tcp_keepalive_secs".into(),
+                value: "17".into(),
+            },
+            false,
+            &[],
+        )
+        .unwrap();
+        store.reload().unwrap();
+        assert_eq!(
+            store.config.extras["stream"]["tcp_keepalive_secs"].as_integer(),
+            Some(17)
+        );
+        run_config_command(
+            &mut store,
+            ConfigCommand::Unset {
+                key: "stream.tcp_keepalive_secs".into(),
+            },
+            false,
+            &[],
+        )
+        .unwrap();
+        store.reload().unwrap();
+        assert!(
+            store.config.extras["stream"]
+                .get("tcp_keepalive_secs")
+                .is_none()
+        );
+        let original = std::fs::read(&path).unwrap();
+        let overlays = ["stream.open_timeout_secs=120".into()];
+        apply_per_run_overrides(&mut store, &overlays).unwrap();
+        run_config_command(&mut store, ConfigCommand::Dump, false, &overlays).unwrap();
+        run_config_command(
+            &mut store,
+            ConfigCommand::Get {
+                key: "stream.open_timeout_secs".into(),
+            },
+            false,
+            &overlays,
+        )
+        .unwrap();
+        let stream = codewhale_tui::config_keys::resolved_stream_config(&store.config).unwrap();
+        assert_eq!(stream["open_timeout_secs"].as_integer(), Some(120));
+        assert_eq!(stream["max_resumes"].as_integer(), Some(6));
+        assert_eq!(
+            std::fs::read(path).unwrap(),
+            original,
+            "per-run overlay does not persist"
+        );
+        assert!(
+            apply_per_run_overrides(&mut store, &["stream.open_timout_secs=90".into()]).is_err()
+        );
     }
 
     #[test]

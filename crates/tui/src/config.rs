@@ -1792,6 +1792,29 @@ where
     }))
 }
 
+/// Canonical model-stream and transport settings. The existing `Config`
+/// accessors own resolution; `[tui]` spellings remain read-only compatibility.
+/// Transport changes apply to newly constructed clients, not active requests.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct StreamConfig {
+    pub open_timeout_secs: Option<u64>,
+    pub chunk_timeout_secs: Option<u64>,
+    pub force_http1: Option<bool>,
+    pub max_resumes: Option<u32>,
+    pub max_transparent_retries: Option<u32>,
+    pub max_stream_errors: Option<u32>,
+    pub max_duration_secs: Option<u64>,
+    pub max_content_mb: Option<u64>,
+    pub connect_timeout_secs: Option<u64>,
+    /// Omitted keeps 30 seconds; zero disables TCP keepalive.
+    pub tcp_keepalive_secs: Option<u64>,
+    /// Omitted keeps 15 seconds; zero disables HTTP/2 PINGs.
+    pub http2_keep_alive_interval_secs: Option<u64>,
+    /// Omitted or zero keeps the 20-second PING acknowledgement deadline.
+    pub http2_keep_alive_timeout_secs: Option<u64>,
+}
+
 /// UI configuration loaded from config files.
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct TuiConfig {
@@ -3111,6 +3134,7 @@ pub struct Config {
     #[serde(alias = "maxSubagents")]
     pub max_subagents: Option<usize>,
     pub retry: Option<RetryConfig>,
+    pub stream: Option<StreamConfig>,
     pub features: Option<FeaturesToml>,
     /// Experimental TypeScript extension host settings.
     #[serde(default)]
@@ -8004,7 +8028,7 @@ impl Config {
 
     /// Resolved per-SSE-chunk idle timeout in seconds.
     ///
-    /// Reads `[tui].stream_chunk_timeout_secs`, falling back to the
+    /// Reads `[stream].chunk_timeout_secs`, then legacy `[tui]`, then the
     /// `CODEWHALE_STREAM_IDLE_TIMEOUT_SECS` env var (legacy alias:
     /// `DEEPSEEK_STREAM_IDLE_TIMEOUT_SECS`) when the config key is
     /// omitted. `None` or `0` resolve to the default 900 seconds; explicit
@@ -8012,9 +8036,14 @@ impl Config {
     #[must_use]
     pub fn stream_chunk_timeout_secs(&self) -> u64 {
         let raw = self
-            .tui
+            .stream
             .as_ref()
-            .and_then(|cfg| cfg.stream_chunk_timeout_secs)
+            .and_then(|cfg| cfg.chunk_timeout_secs)
+            .or_else(|| {
+                self.tui
+                    .as_ref()
+                    .and_then(|cfg| cfg.stream_chunk_timeout_secs)
+            })
             .or_else(|| {
                 std::env::var(STREAM_CHUNK_TIMEOUT_ENV)
                     .or_else(|_| std::env::var(LEGACY_STREAM_CHUNK_TIMEOUT_ENV))
@@ -8070,7 +8099,10 @@ impl Config {
     #[must_use]
     pub fn stream_max_content_bytes(&self) -> usize {
         crate::core::engine::turn_budget::resolve_stream_max_content_bytes(
-            self.tui.as_ref().and_then(|cfg| cfg.stream_max_content_mb),
+            self.stream
+                .as_ref()
+                .and_then(|cfg| cfg.max_content_mb)
+                .or_else(|| self.tui.as_ref().and_then(|cfg| cfg.stream_max_content_mb)),
         )
     }
 
@@ -8079,22 +8111,33 @@ impl Config {
     pub fn stream_max_duration(&self) -> std::time::Duration {
         std::time::Duration::from_secs(
             crate::core::engine::turn_budget::resolve_stream_max_duration_secs(
-                self.tui
+                self.stream
                     .as_ref()
-                    .and_then(|cfg| cfg.stream_max_duration_secs),
+                    .and_then(|cfg| cfg.max_duration_secs)
+                    .or_else(|| {
+                        self.tui
+                            .as_ref()
+                            .and_then(|cfg| cfg.stream_max_duration_secs)
+                    }),
             ),
         )
     }
 
-    /// #6700: resolved stream retry budgets (`[tui].stream_max_resumes`,
-    /// `stream_max_transparent_retries`, `stream_max_errors`).
+    /// Resolved `[stream]` retry budgets, falling back to legacy `[tui]` keys.
     #[must_use]
     pub fn stream_retry_limits(&self) -> crate::core::engine::turn_budget::StreamRetryLimits {
         let tui = self.tui.as_ref();
+        let stream = self.stream.as_ref();
         crate::core::engine::turn_budget::resolve_stream_retry_limits(
-            tui.and_then(|cfg| cfg.stream_max_resumes),
-            tui.and_then(|cfg| cfg.stream_max_transparent_retries),
-            tui.and_then(|cfg| cfg.stream_max_errors),
+            stream
+                .and_then(|cfg| cfg.max_resumes)
+                .or_else(|| tui.and_then(|cfg| cfg.stream_max_resumes)),
+            stream
+                .and_then(|cfg| cfg.max_transparent_retries)
+                .or_else(|| tui.and_then(|cfg| cfg.stream_max_transparent_retries)),
+            stream
+                .and_then(|cfg| cfg.max_stream_errors)
+                .or_else(|| tui.and_then(|cfg| cfg.stream_max_errors)),
         )
     }
 
@@ -8102,19 +8145,25 @@ impl Config {
     #[must_use]
     pub fn stream_open_timeout(&self) -> std::time::Duration {
         crate::client::resolve_stream_open_timeout(
-            self.tui
+            self.stream
                 .as_ref()
-                .and_then(|cfg| cfg.stream_open_timeout_secs),
+                .and_then(|cfg| cfg.open_timeout_secs)
+                .or_else(|| {
+                    self.tui
+                        .as_ref()
+                        .and_then(|cfg| cfg.stream_open_timeout_secs)
+                }),
         )
     }
 
     /// #6700: whether the model HTTP client is pinned to HTTP/1.1 —
-    /// `[tui].force_http1 = true` or a truthy `CODEWHALE_FORCE_HTTP1`.
+    /// `[stream].force_http1` (legacy `[tui]` fallback), OR the environment pin.
     #[must_use]
     pub fn force_http1(&self) -> bool {
-        self.tui
+        self.stream
             .as_ref()
             .and_then(|cfg| cfg.force_http1)
+            .or_else(|| self.tui.as_ref().and_then(|cfg| cfg.force_http1))
             .unwrap_or(false)
             || crate::client::force_http1_from_env()
     }
@@ -8122,11 +8171,72 @@ impl Config {
     /// #6700: resolved TCP/TLS connect timeout for the model HTTP client.
     #[must_use]
     pub fn connect_timeout(&self) -> std::time::Duration {
-        let secs = match self.tui.as_ref().and_then(|cfg| cfg.connect_timeout_secs) {
+        let secs = match self
+            .stream
+            .as_ref()
+            .and_then(|cfg| cfg.connect_timeout_secs)
+            .or_else(|| self.tui.as_ref().and_then(|cfg| cfg.connect_timeout_secs))
+        {
             None | Some(0) => DEFAULT_CONNECT_TIMEOUT_SECS,
             Some(secs) => secs.clamp(MIN_CONNECT_TIMEOUT_SECS, MAX_CONNECT_TIMEOUT_SECS),
         };
         std::time::Duration::from_secs(secs)
+    }
+
+    /// TCP keepalive idle time. Zero disables; positive values clamp to 1..=3600.
+    pub fn tcp_keepalive(&self) -> Option<std::time::Duration> {
+        let secs = self
+            .stream
+            .as_ref()
+            .and_then(|cfg| cfg.tcp_keepalive_secs)
+            .unwrap_or(30);
+        (secs > 0).then(|| std::time::Duration::from_secs(secs.min(3600)))
+    }
+
+    /// HTTP/2 PING interval for active connections (not idle pooled connections).
+    pub fn http2_keep_alive_interval(&self) -> Option<std::time::Duration> {
+        let secs = self
+            .stream
+            .as_ref()
+            .and_then(|cfg| cfg.http2_keep_alive_interval_secs)
+            .unwrap_or(15);
+        (secs > 0).then(|| std::time::Duration::from_secs(secs.min(3600)))
+    }
+
+    pub fn http2_keep_alive_timeout(&self) -> std::time::Duration {
+        let secs = match self
+            .stream
+            .as_ref()
+            .and_then(|cfg| cfg.http2_keep_alive_timeout_secs)
+        {
+            None | Some(0) => 20,
+            Some(secs) => secs.min(3600),
+        };
+        std::time::Duration::from_secs(secs)
+    }
+
+    /// Non-secret effective settings for `config dump`/`get`. This projection
+    /// calls the runtime accessors, so aliases, environment and clamps cannot
+    /// acquire a second policy in the dispatcher. It does not save defaults.
+    pub fn resolved_stream_settings(&self) -> StreamConfig {
+        let limits = self.stream_retry_limits();
+        StreamConfig {
+            open_timeout_secs: Some(self.stream_open_timeout().as_secs()),
+            chunk_timeout_secs: Some(self.stream_chunk_timeout_secs()),
+            force_http1: Some(self.force_http1()),
+            max_resumes: Some(limits.max_resumes),
+            max_transparent_retries: Some(limits.max_transparent_retries),
+            max_stream_errors: Some(limits.max_errors),
+            max_duration_secs: Some(self.stream_max_duration().as_secs()),
+            max_content_mb: Some((self.stream_max_content_bytes() / (1024 * 1024)) as u64),
+            connect_timeout_secs: Some(self.connect_timeout().as_secs()),
+            tcp_keepalive_secs: Some(self.tcp_keepalive().map_or(0, |value| value.as_secs())),
+            http2_keep_alive_interval_secs: Some(
+                self.http2_keep_alive_interval()
+                    .map_or(0, |value| value.as_secs()),
+            ),
+            http2_keep_alive_timeout_secs: Some(self.http2_keep_alive_timeout().as_secs()),
+        }
     }
 
     /// Raw sub-agent model override map. Values are validated at spawn time
@@ -11418,6 +11528,30 @@ fn merge_config(base: Config, override_cfg: Config) -> Config {
         requirements_path: override_cfg.requirements_path.or(base.requirements_path),
         max_subagents: override_cfg.max_subagents.or(base.max_subagents),
         retry: override_cfg.retry.or(base.retry),
+        stream: match (base.stream, override_cfg.stream) {
+            (Some(base), Some(over)) => Some(StreamConfig {
+                open_timeout_secs: over.open_timeout_secs.or(base.open_timeout_secs),
+                chunk_timeout_secs: over.chunk_timeout_secs.or(base.chunk_timeout_secs),
+                force_http1: over.force_http1.or(base.force_http1),
+                max_resumes: over.max_resumes.or(base.max_resumes),
+                max_transparent_retries: over
+                    .max_transparent_retries
+                    .or(base.max_transparent_retries),
+                max_stream_errors: over.max_stream_errors.or(base.max_stream_errors),
+                max_duration_secs: over.max_duration_secs.or(base.max_duration_secs),
+                max_content_mb: over.max_content_mb.or(base.max_content_mb),
+                connect_timeout_secs: over.connect_timeout_secs.or(base.connect_timeout_secs),
+                tcp_keepalive_secs: over.tcp_keepalive_secs.or(base.tcp_keepalive_secs),
+                http2_keep_alive_interval_secs: over
+                    .http2_keep_alive_interval_secs
+                    .or(base.http2_keep_alive_interval_secs),
+                http2_keep_alive_timeout_secs: over
+                    .http2_keep_alive_timeout_secs
+                    .or(base.http2_keep_alive_timeout_secs),
+            }),
+            (base, over) => over.or(base),
+        },
+
         auto_review: override_cfg.auto_review.or(base.auto_review),
         tui: override_cfg.tui.or(base.tui),
         transcript: override_cfg.transcript.or(base.transcript),
