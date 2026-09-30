@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
-import { BUNDLE, IS_BUN, activate, sha256File, startHost } from './harness.mjs'
+import { BUNDLE, HOST_ARGS, IS_BUN, activate, sha256File, startHost } from './harness.mjs'
 import { encodeFrame } from '../dist/protocol.mjs'
 
 function tempPlugin(source) {
@@ -201,7 +201,7 @@ test('plugins cannot run native code in-process', async (t) => {
 test('a host asked for a kernel memory limit applies it only on Bun on macOS', async (t) => {
   const plugin = tempPlugin(`export const inject = ['tools']
 export function apply(ctx) {
-  ctx.tools.register({ name: 'pid', description: '', parameters: { type: 'object', properties: {} }, execute: () => String(process.pid) })
+  ctx.tools.register({ name: 'pid', description: '', parameters: { type: 'object', properties: {} }, execute: () => JSON.stringify({ pid: process.pid, execArgv: process.execArgv }) })
   ctx.tools.register({ name: 'hog', description: '', parameters: { type: 'object', properties: {} }, async execute() {
     const chunks = []
     for (let i = 0; i < 32; i++) { chunks.push(Buffer.alloc(64 * 1024 * 1024, 1)); await new Promise((resolve) => setTimeout(resolve, 5)) }
@@ -220,9 +220,13 @@ export function apply(ctx) {
     return
   }
   assert.equal(host.hello.memory_limit_mib, 300)
-  // Re-executed in place: the pid the core spawned is the one running plugins.
+  // Re-executed in place: the pid the core spawned is the one running plugins,
+  // still with every launch flag (`--no-install`, `--no-env-file`, the null
+  // `--config`, `--no-addons`), since the re-exec rebuilds argv from execArgv.
   const running = await host.call('tool/call', { handle: pid, call_id: 'p', input: {}, deadline_ms: 5000 })
-  assert.equal(Number(running.content[0].text), host.child.pid)
+  const reexecuted = JSON.parse(running.content[0].text)
+  assert.equal(reexecuted.pid, host.child.pid)
+  assert.deepEqual(reexecuted.execArgv, HOST_ARGS)
   // 2 GiB against a 300 MiB limit: the kernel kills the host.
   host.request('tool/call', { handle: hog, call_id: 'h', input: {}, deadline_ms: 30_000 })
   const exit = await Promise.race([host.exit, new Promise((resolve) => setTimeout(() => resolve('still running'), 20_000))])
