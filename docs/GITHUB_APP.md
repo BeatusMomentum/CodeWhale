@@ -94,8 +94,9 @@ same-repository pull requests can post reviews as the App.
 [The review workflow](../.github/workflows/codewhale-review.yml) uses
 `pull_request` and a manual `workflow_dispatch` recovery trigger. The action
 reads the PR's exact Git objects in a fresh repository without checking them
-out. Forks and drafts are explicitly ineligible. The model key is supplied
-only to eligible same-repository events; the action checks eligibility again.
+out. Fork events receive no model key. Before any inference, the action
+rejects fork, draft and closed PRs and verifies their revisions, including
+on manual runs.
 
 When both `CODEWHALE_APP_ID` and `CODEWHALE_APP_PRIVATE_KEY` are present, the
 workflow mints a short-lived installation token restricted to contents:read
