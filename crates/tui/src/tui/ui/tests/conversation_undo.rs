@@ -52,6 +52,12 @@ async fn settled(app: &mut App, handle: &EngineHandle, answer: &str) {
     });
 }
 
+async fn flush_persistence(actor: &persistence_actor::PersistActorHandle) {
+    let (reply, receive) = tokio::sync::oneshot::channel();
+    assert!(actor.try_send(PersistRequest::FlushAndReport { reply }));
+    assert!(receive.await.unwrap().failures.is_empty());
+}
+
 #[test]
 fn undo_retry_apply_path_keeps_engine_request_and_reopened_session_consistent() {
     const PROBE: &str = "CODEWHALE_UNDO_RETRY_APPLY_PROBE";
@@ -167,6 +173,18 @@ fn undo_retry_apply_path_keeps_engine_request_and_reopened_session_consistent() 
         let path = manager.save_session(&old).unwrap();
         // The stale in-flight recovery record must not revive the undone turn.
         assert!(actor.try_send(PersistRequest::SaveCheckpoint { session: old }));
+        flush_persistence(&actor).await;
+        assert!(
+            serde_json::to_string(
+                &manager
+                    .load_session_checkpoint(&id)
+                    .unwrap()
+                    .unwrap()
+                    .messages
+            )
+            .unwrap()
+            .contains("undone answer")
+        );
 
         for answer in ["retry answer one", "retry answer two"] {
             let result = commands::execute("/retry", &mut app);
@@ -199,7 +217,16 @@ fn undo_retry_apply_path_keeps_engine_request_and_reopened_session_consistent() 
                 ["keep this"],
                 "rollback is durable before replacement inference"
             );
-            assert!(manager.load_session_checkpoint(&id).unwrap().is_none());
+            // Dispatch starts a fresh recovery checkpoint. This fixture reads
+            // TurnComplete directly, so it does not run the UI completion save
+            // that would retire that new checkpoint. Inspect its history rather
+            // than incorrectly expecting the replacement turn to have none.
+            flush_persistence(&actor).await;
+            let checkpoint = manager.load_session_checkpoint(&id).unwrap().unwrap();
+            assert_eq!(prompts(&checkpoint.messages), ["keep this", "retry this"]);
+            let checkpoint_text = serde_json::to_string(&checkpoint.messages).unwrap();
+            assert!(!checkpoint_text.contains("undone answer"));
+            assert!(!checkpoint_text.contains("retry answer"));
         }
         assert_eq!(mock.captured_requests().len(), 4);
 
@@ -255,6 +282,10 @@ fn undo_retry_apply_path_keeps_engine_request_and_reopened_session_consistent() 
         assert_eq!(prompts(&engine_saved.messages), ["keep this"]);
         assert_eq!(prompts(&app.api_messages), ["keep this"]);
         assert_eq!(prompts(&reopened.messages), ["keep this"]);
+        assert!(
+            manager.load_session_checkpoint(&id).unwrap().is_none(),
+            "standalone undo retires the checkpoint without starting new turn work"
+        );
         assert!(
             !serde_json::to_string(&reopened.messages)
                 .unwrap()

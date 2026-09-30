@@ -47,7 +47,7 @@ fn missing_api_stamps_never_drop_messages_or_shift_preserved_times() {
     assert_eq!(app.api_message_stamps.len(), 3);
     assert_eq!(app.api_message_stamps[0], first);
     assert_eq!(app.api_message_stamps[2], third);
-    app.pop_api_message();
+    app.truncate_api_messages(2);
     assert_eq!(app.api_messages.len(), 2);
     assert_eq!(app.api_message_stamps.len(), 2);
     app.truncate_api_messages(1);

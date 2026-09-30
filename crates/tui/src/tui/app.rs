@@ -5044,13 +5044,6 @@ impl App {
         self.api_message_stamps.push(stamp);
     }
 
-    pub fn pop_api_message(&mut self) -> Option<Message> {
-        self.api_message_stamps
-            .resize_with(self.api_messages.len(), Utc::now);
-        self.api_message_stamps.pop();
-        self.api_messages_mut().pop()
-    }
-
     /// `created_at` of each `api_messages` entry, paired positionally.
     /// Preserve messages even if older state lacks a stamp; missing times
     /// fall back to observation time, as they do when restoring a session.
