@@ -7935,7 +7935,11 @@ async fn session_denied_cache_notice_renders_host_scope_in_zh_hans() {
     assert!(!notice.contains("example.com"));
 
     let rendered = render_underwater_test_app(&mut app, 60, 16);
+    // Join wrapped body text without the transcript rail between its lines.
     let rendered_compact = rendered
+        .lines()
+        .map(|line| line.trim_start().trim_start_matches('▏'))
+        .collect::<String>()
         .chars()
         .filter(|ch| !ch.is_whitespace())
         .collect::<String>();
