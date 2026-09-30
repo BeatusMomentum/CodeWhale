@@ -7293,10 +7293,25 @@ fn pending_scroll_retargets_reasoning_in_the_same_frame() {
     app.resync_history_revisions();
     let _ = render_underwater_test_app(&mut app, 60, 8);
     assert_eq!(reasoning_hint_cells(&app), vec![1]);
+    assert_eq!(app.viewport.last_transcript_top, 0);
+    assert!(app.viewport.last_transcript_total <= app.viewport.last_transcript_visible);
+    // Both compact headers fit. Scrolling an already fitting transcript must
+    // keep the newest visible owner, not invent a hidden newer cell.
     app.viewport.pending_scroll_delta = -1_000_000;
     let _ = render_underwater_test_app(&mut app, 60, 8);
+    assert_eq!(reasoning_hint_cells(&app), vec![1]);
+
+    // Now force a real viewport boundary and prove the fixture's geometry.
+    app.viewport.transcript_scroll = TranscriptScroll::to_bottom();
+    let _ = render_underwater_test_app(&mut app, 60, 5);
+    assert_eq!(app.viewport.last_transcript_visible, 1);
+    assert!(app.viewport.last_transcript_top > 0);
+    assert_eq!(reasoning_hint_cells(&app), vec![1]);
+    app.viewport.pending_scroll_delta = -1_000_000;
+    let surface = render_underwater_test_app(&mut app, 60, 5);
     assert_eq!(app.viewport.last_transcript_top, 0);
     assert_eq!(reasoning_hint_cells(&app), vec![0]);
+    assert!(surface.contains("Space:expand"), "{surface}");
     assert_eq!(
         app.viewport
             .transcript_cache
@@ -7311,17 +7326,19 @@ fn visible_older_reasoning_owns_space_over_a_newer_offscreen_tool() {
     let mut app = create_test_app();
     app.history = vec![long_reasoning("visible", false), running_exec_cell()];
     app.resync_history_revisions();
-    let _ = render_underwater_test_app(&mut app, 60, 8);
+    let _ = render_underwater_test_app(&mut app, 60, 5);
+    assert_eq!(app.viewport.last_transcript_visible, 1);
     assert_eq!(
         app.transcript_action_owner().map(|owner| owner.cell_index),
         Some(1)
     );
 
-    // The settled calm header owns Space. Scroll to that row while the
-    // newer tool remains below the compact viewport.
+    // The settled calm header owns Space when the newer tool is genuinely
+    // outside the viewport. A 60x8 frame now fits both compact cells.
     app.viewport.transcript_scroll = TranscriptScroll::at_line(0);
-    let surface = render_underwater_test_app(&mut app, 60, 8);
+    let surface = render_underwater_test_app(&mut app, 60, 5);
     assert_eq!(app.viewport.last_transcript_top, 0);
+    assert!(first_line_for_cell(&app, 1) >= app.viewport.last_transcript_visible);
     assert_eq!(reasoning_hint_cells(&app), vec![0]);
     assert!(surface.contains("Space:expand"), "{surface}");
     assert_eq!(

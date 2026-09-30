@@ -2008,7 +2008,7 @@ fn an_activity_group_renders_as_a_single_metadata_line() {
     let lines = cell.lines_with_mode(120, true, RenderMode::Live);
 
     assert_eq!(lines.len(), 1);
-    assert_eq!(lines_text(&lines), "Explored 2 files, 1 search");
+    assert_eq!(lines_text(&lines), "Explored 2 files, 1 search ›");
     assert!(!lines_text(&lines).contains("activity_group"));
 }
 
@@ -2534,18 +2534,10 @@ fn card_rail_carries_the_cell_status() {
             .style
             .fg
             .expect("header status glyph must be styled");
-        if status == ToolStatus::Success {
-            // A settled card dims its border but keeps an identifying glyph.
-            assert_ne!(
-                rail_color, glyph_color,
-                "a settled card must not dim its glyph along with its rail"
-            );
-        } else {
-            assert_eq!(
-                rail_color, glyph_color,
-                "{status:?} must read the same on the rail and the glyph"
-            );
-        }
+        assert_eq!(
+            rail_color, glyph_color,
+            "{status:?} must read the same on the rail and the glyph"
+        );
 
         rails.push((status, rail_color));
     }
@@ -2560,16 +2552,14 @@ fn card_rail_carries_the_cell_status() {
     }
 }
 
-/// The header glyph reports identity, not just lifecycle: a passed `verify`
-/// card keeps its green tick where a finished `read` keeps the family accent
-/// the mockup draws as a blue magnifier. Relationship, not token — the two must
-/// simply not collapse into one another.
+/// Finished work shares quiet ink while its glyph shape preserves identity:
+/// a passed verify and a completed read must still be distinguishable.
 #[test]
 fn a_settled_verify_glyph_does_not_read_as_a_settled_read() {
     let verify = generic_tool("run_tests", ToolStatus::Success);
     let read = generic_tool("read_file", ToolStatus::Success);
 
-    let glyph_color = |cell: &GenericToolCell| {
+    let glyph = |cell: &GenericToolCell| {
         cell.lines_with_mode_and_locale(
             80,
             /*low_motion*/ true,
@@ -2577,15 +2567,14 @@ fn a_settled_verify_glyph_does_not_read_as_a_settled_read() {
             codewhale_localization::Locale::En,
         )[0]
         .spans[1]
-            .style
-            .fg
-            .expect("header status glyph must be styled")
+            .clone()
     };
-
-    assert_ne!(
-        glyph_color(&verify),
-        glyph_color(&read),
-        "a passed verify and a finished read must not share a glyph colour"
+    let verify = glyph(&verify);
+    let read = glyph(&read);
+    assert_ne!(verify.content, read.content, "tool identity stays visible");
+    assert_eq!(
+        verify.style.fg, read.style.fg,
+        "settled work shares quiet ink"
     );
 }
 
