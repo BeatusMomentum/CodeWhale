@@ -15045,7 +15045,6 @@ pub(crate) fn stub_runtime() -> SubAgentRuntime {
         parent_completion_tx: None,
         fork_context: None,
         parent_mode: AppMode::Agent,
-        approval_mode: ApprovalMode::Suggest,
         auto_review_policy: std::sync::Arc::new(
             crate::tui::auto_review::AutoReviewPolicy::default(),
         ),
@@ -20511,7 +20510,7 @@ async fn read_only_web_evidence_keeps_the_parent_approval_gate() {
         let mut runtime =
             stub_runtime().with_agent_tool_surface_options(enabled_agent_surface_options());
         runtime.context = ToolContext::new(tmp.path());
-        runtime.approval_mode = ApprovalMode::Never;
+        runtime.context.approval_mode = ApprovalMode::Never;
         runtime.worker_profile = WorkerRuntimeProfile::for_role(role.clone());
         runtime.worker_profile.permissions.network = true;
         let registry = SubAgentToolRegistry::new(
@@ -20540,7 +20539,13 @@ async fn read_only_web_evidence_keeps_the_parent_approval_gate() {
             assert!(
                 matches!(
                     registry
-                        .gate_held_call("agent_scout", "test-web", name, &input)
+                        .gate_held_call(
+                            "agent_scout",
+                            "test-web",
+                            name,
+                            &input,
+                            registry.registry.context(),
+                        )
                         .await,
                     ChildGateVerdict::Deny(_)
                 ),
@@ -23365,6 +23370,26 @@ mod child_permission_gate {
         tokio::sync::mpsc::Receiver<Event>,
         SharedSubAgentManager,
     ) {
+        worker_registry_with_live_posture(
+            approval_mode,
+            auto_approve,
+            parent_can_prompt,
+            client,
+            None,
+        )
+    }
+
+    fn worker_registry_with_live_posture(
+        approval_mode: ApprovalMode,
+        auto_approve: bool,
+        parent_can_prompt: bool,
+        client: Option<CodewhaleClient>,
+        live_posture: Option<crate::core::engine::LivePosture>,
+    ) -> (
+        SubAgentToolRegistry,
+        tokio::sync::mpsc::Receiver<Event>,
+        SharedSubAgentManager,
+    ) {
         let tmp = tempdir().expect("tempdir");
         let (tx, rx) = tokio::sync::mpsc::channel(32);
         let mut runtime = stub_runtime();
@@ -23375,13 +23400,14 @@ mod child_permission_gate {
         let session_id = format!("child_gate_{}", uuid::Uuid::new_v4().simple());
         runtime.context = ToolContext::new(workspace.clone()).with_state_namespace(session_id);
         runtime.context.auto_approve = auto_approve;
+        runtime.context.approval_mode = approval_mode;
+        runtime.context.live_posture = live_posture;
         runtime.allow_shell = true;
         runtime.event_tx = Some(tx);
         runtime = runtime.with_approval_receipt_store(Ok(
             crate::approval_log::ApprovalReceiptStore::new(tmp.path().join("sessions")),
         ));
         runtime = runtime.with_permission_posture(
-            approval_mode,
             std::sync::Arc::new(crate::tui::auto_review::AutoReviewPolicy::default()),
             parent_can_prompt,
         );
@@ -24605,6 +24631,90 @@ mod child_permission_gate {
         assert!(receipts[0].2.is_none());
     }
 
+    /// Linux report against 0.10.0: "even when I give maximum permissions to
+    /// one of the agents, it doesn't take them (the guardian denies)". A
+    /// running agent kept the posture it was spawned under, so switching the
+    /// session to Full Access left an Auto-Review agent asking — and, with no
+    /// reachable guardian, being denied by — the guardian. The agent's next
+    /// call now runs under the posture the person just chose, both ways.
+    #[tokio::test]
+    async fn a_posture_switch_reaches_an_already_running_agent() {
+        let live =
+            crate::core::engine::LivePosture::for_tests(&std::env::temp_dir(), ApprovalMode::Auto);
+        let (registry, mut rx, _) = worker_registry_with_live_posture(
+            ApprovalMode::Auto,
+            false,
+            true,
+            Some(unreachable_client()),
+            Some(live.clone()),
+        );
+        let call = json!({"command": "echo built | cat"});
+        let err = registry
+            .execute("agent_gate", "bash", call.clone())
+            .await
+            .expect_err("Auto-Review with no reachable guardian fails closed");
+        assert!(err.to_string().contains("fail closed"), "{err}");
+        assert_eq!(drain_gate_receipts(&mut rx).len(), 1);
+
+        live.switch_for_tests(ApprovalMode::Bypass);
+        let output = registry
+            .execute("agent_gate", "bash", call.clone())
+            .await
+            .expect("the same running agent runs the call once Full Access is granted");
+        assert!(output.contains("built"), "{output}");
+        assert!(
+            drain_gate_receipts(&mut rx).is_empty(),
+            "Full Access consults no guardian"
+        );
+
+        live.switch_for_tests(ApprovalMode::Auto);
+        registry
+            .execute("agent_gate", "bash", call)
+            .await
+            .expect_err("narrowing back to Auto-Review reaches the agent too");
+    }
+
+    /// Linux report against 0.10.0: an agent given Full Access still had its
+    /// calls denied by the "safety gate". Every child call was judged as
+    /// detached background work, so an ordinary absolute-path cleanup — which
+    /// the same session runs without a word in its own turn — failed closed in
+    /// the agent. Full Access judges the agent's call exactly like the
+    /// parent's: only a genuinely detached start keeps the floor.
+    #[tokio::test]
+    async fn full_access_child_runs_what_the_parent_turn_runs() {
+        let (registry, mut rx, _) = worker_registry(ApprovalMode::Bypass, true, true, None);
+        let workspace = registry.gate_runtime.context.workspace.clone();
+        let build = workspace.join("build");
+        std::fs::create_dir_all(build.join("out")).unwrap();
+        let command = format!("rm -rf {}", build.display());
+        // The parent turn's own verdict for this exact call under Full Access.
+        let parent_context = crate::tui::auto_review::AutoReviewContext::from_tool_call(
+            "bash",
+            &json!({"command": command}),
+            crate::core::engine::auto_review_run_origin_for_plan(false),
+            ApprovalMode::Bypass,
+            true,
+            Some(&workspace),
+        );
+        let (parent_decision, _) = crate::core::engine::auto_review_plan_decision_for_context(
+            &crate::tui::auto_review::AutoReviewPolicy::default(),
+            &parent_context,
+        );
+        assert!(
+            !matches!(
+                parent_decision,
+                crate::core::engine::AutoReviewPlanDecision::Block(_)
+            ),
+            "precondition: the parent runs it: {parent_decision:?}"
+        );
+        registry
+            .execute("agent_gate", "bash", json!({"command": command}))
+            .await
+            .expect("a Full Access agent runs what its Full Access session runs");
+        assert!(!build.exists(), "the cleanup actually ran");
+        assert!(drain_gate_receipts(&mut rx).is_empty());
+    }
+
     #[tokio::test]
     async fn full_access_runs_ordinary_shell_but_still_hard_blocks_the_safety_floor() {
         let (registry, mut rx, _) = worker_registry(ApprovalMode::Bypass, true, true, None);
@@ -24614,10 +24724,14 @@ mod child_permission_gate {
             .expect("Full Access runs ordinary shell without a prompt");
         assert!(output.contains("full-access"), "{output}");
         assert!(drain_gate_receipts(&mut rx).is_empty());
-        // Destructive detached work holds in every posture (children are
-        // background workers), so Full Access still fails closed here.
+        // Destructive *detached* work holds in every posture, exactly as it
+        // does for a detached parent start, so Full Access fails closed here.
         let err = registry
-            .execute("agent_gate", "bash", json!({"command": "rm -rf /usr"}))
+            .execute(
+                "agent_gate",
+                "Bash",
+                json!({"command": "rm -rf /usr", "background": true}),
+            )
             .await
             .expect_err("destructive background shell stays blocked in Full Access");
         assert!(

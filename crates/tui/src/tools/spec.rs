@@ -720,6 +720,9 @@ pub struct ToolExecutionState {
     /// hosts without an engine turn), where code mode keeps its read-only,
     /// auto-approved profile.
     pub(crate) nested_call_gate: Option<crate::tools::codemode::NestedCallGate>,
+    /// Where the session's live permission posture lives. Set by the engine;
+    /// every agent call re-reads it (`None` keeps the posture above as is).
+    pub(crate) live_posture: Option<crate::core::engine::LivePosture>,
 }
 
 impl std::ops::Deref for ToolContext {
@@ -820,6 +823,7 @@ impl ToolContext {
                 provider_native_search: None,
                 route_capabilities: codewhale_config::route::RouteCapabilities::default(),
                 nested_call_gate: None,
+                live_posture: None,
             }),
         }
     }
@@ -852,6 +856,15 @@ impl ToolContext {
     #[must_use]
     pub fn with_runtime_services(mut self, runtime: RuntimeToolServices) -> Self {
         self.runtime = runtime;
+        self
+    }
+
+    /// Re-read the session's live permission posture (see `live_posture`).
+    #[must_use]
+    pub(crate) fn with_live_posture(mut self) -> Self {
+        if let Some(live) = self.live_posture.clone() {
+            live.apply(&mut self);
+        }
         self
     }
 

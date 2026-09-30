@@ -2846,12 +2846,6 @@ pub struct SubAgentRuntime {
     pub todos: SharedTodoList,
     /// Session mode of the orchestrating parent at spawn time (Wave 7 M4/M5).
     pub parent_mode: AppMode,
-    /// The session's permission posture at spawn time. Children inherit it
-    /// faithfully: under Auto-Review the same deterministic floor and model
-    /// guardian that gate the parent gate the child's held calls; under Ask a
-    /// held call is routed to the parent's approval UI when one exists;
-    /// Full Access still fails closed on the non-bypassable safety floor.
-    pub approval_mode: ApprovalMode,
     /// The session's deterministic Auto-Review policy (configured allow/block
     /// rules plus the built-in safety floor), shared with every descendant.
     pub auto_review_policy: std::sync::Arc<crate::tui::auto_review::AutoReviewPolicy>,
@@ -2931,7 +2925,6 @@ impl SubAgentRuntime {
             speech_output_dir: None,
             todos: crate::tools::todo::new_shared_todo_list(),
             parent_mode: AppMode::Agent,
-            approval_mode: ApprovalMode::Suggest,
             auto_review_policy: std::sync::Arc::new(
                 crate::tui::auto_review::AutoReviewPolicy::default(),
             ),
@@ -2964,17 +2957,15 @@ impl SubAgentRuntime {
         self
     }
 
-    /// Install the session's permission posture and Auto-Review policy so
-    /// children are gated exactly like the parent, and say whether the host
-    /// can answer a prompt raised on a child's behalf.
+    /// Install the session's Auto-Review policy so children are gated exactly
+    /// like the parent, and say whether the host can answer a prompt raised on
+    /// a child's behalf. The posture itself travels on `context`, live.
     #[must_use]
     pub fn with_permission_posture(
         mut self,
-        approval_mode: ApprovalMode,
         auto_review_policy: std::sync::Arc<crate::tui::auto_review::AutoReviewPolicy>,
         parent_can_prompt: bool,
     ) -> Self {
-        self.approval_mode = approval_mode;
         self.auto_review_policy = auto_review_policy;
         self.parent_can_prompt = parent_can_prompt;
         self
@@ -3268,7 +3259,6 @@ impl SubAgentRuntime {
             // LLM attempt reports 429s/successes to the adaptive scheduler.
             governor: self.governor.clone(),
             parent_mode: self.parent_mode,
-            approval_mode: self.approval_mode,
             auto_review_policy: Arc::clone(&self.auto_review_policy),
             parent_can_prompt: self.parent_can_prompt,
             approval_receipt_store: self.approval_receipt_store.clone(),
@@ -18288,9 +18278,6 @@ struct SubAgentToolRegistry {
     // prefixes; the grant decides what the surface *is*, these names are
     // removed from whatever it granted.
     disallowed_tools: Vec<String>,
-    // Approval posture is separate from authority. Auto approval can remove a
-    // prompt, but cannot restore a tool removed by role, scope, or envelope.
-    auto_approve: bool,
     accept_edits: bool,
     agent_type: FleetRole,
     // Every mutation is attributed to the child and checked against its live
@@ -18424,7 +18411,6 @@ impl SubAgentToolRegistry {
         Self {
             grant,
             disallowed_tools: effective_profile.denied_tools.clone(),
-            auto_approve: runtime.context.auto_approve,
             accept_edits: runtime.accept_edits,
             agent_type,
             owner_agent_id,
@@ -18545,16 +18531,21 @@ impl SubAgentToolRegistry {
         tool_id: &str,
         name: &str,
         input: &Value,
+        posture: &ToolContext,
     ) -> ChildGateVerdict {
-        use crate::core::engine::{AutoReviewPlanDecision, auto_review_plan_decision_for_context};
-        use crate::core::events::{ToolGate, ToolGateVerdict};
-        use crate::tui::auto_review::{AutoReviewContext, RunOrigin};
-
-        let approval_mode = if self.auto_approve {
-            ApprovalMode::Bypass
-        } else {
-            self.gate_runtime.approval_mode
+        use crate::core::engine::{
+            AutoReviewPlanDecision, auto_review_plan_decision_for_context,
+            auto_review_run_origin_for_plan,
         };
+        use crate::core::events::{ToolGate, ToolGateVerdict};
+        use crate::tui::auto_review::AutoReviewContext;
+
+        // Approval posture is separate from authority: it can remove a
+        // prompt, never restore a tool removed by role, scope, or envelope.
+        let approval_mode = crate::core::authority::agent_approval_mode_for_turn(
+            posture.auto_approve,
+            posture.approval_mode,
+        );
         let workspace = self.gate_runtime.context.workspace.clone();
         // Operator deny rules constrain every descendant, including Full
         // Access and role-delegated reads/writes. The Config clone retains the
@@ -18581,12 +18572,16 @@ impl SubAgentToolRegistry {
             return ChildGateVerdict::Deny(reason);
         }
         let workspace_trusted = crate::config::is_workspace_trusted(&workspace);
-        // Children are background workers: destructive detached work holds
-        // in every posture, exactly as it does for a detached parent start.
+        // Judged exactly like the parent's own call: destructive *detached*
+        // work holds in every posture, and nothing else is background.
+        let detached = self
+            .registry
+            .get(name)
+            .is_some_and(|spec| spec.starts_detached_for(input));
         let review_context = AutoReviewContext::from_tool_call(
             name,
             input,
-            RunOrigin::Background,
+            auto_review_run_origin_for_plan(detached),
             approval_mode,
             workspace_trusted,
             Some(&workspace),
@@ -19562,8 +19557,16 @@ impl SubAgentToolRegistry {
         // Role posture and the execution envelope below stay authoritative:
         // this gate can only decide whether a call the role permits also
         // clears the session's approval boundary.
-        if let ChildGateVerdict::Deny(reason) =
-            self.gate_held_call(agent_id, tool_id, name, &input).await
+        let context = self
+            .registry
+            .context()
+            .clone()
+            .with_live_posture()
+            .with_owner_agent(self.owner_agent_id.clone(), self.owner_agent_name.clone())
+            .with_origin_tool_call_id(tool_id.to_string());
+        if let ChildGateVerdict::Deny(reason) = self
+            .gate_held_call(agent_id, tool_id, name, &input, &context)
+            .await
         {
             return Err(admission_denied(reason));
         }
@@ -19656,12 +19659,6 @@ impl SubAgentToolRegistry {
                 }
             }
         }
-        let context = self
-            .registry
-            .context()
-            .clone()
-            .with_owner_agent(self.owner_agent_id.clone(), self.owner_agent_name.clone())
-            .with_origin_tool_call_id(tool_id.to_string());
         let observed_paths = if scope_aware_write {
             mutation_paths(name, &input)?
         } else {

@@ -640,6 +640,36 @@ fn registry_instruction_is_in_the_initial_prompt_only_when_mcp_is_enabled() {
 /// not about a second policy surface: discovery is never ordered ahead of
 /// ordinary local work, and the deferred-tool cost of reaching the Registry
 /// tools is stated where the model reads about them.
+/// The engine hands every agent the live posture cell, not a copy: a
+/// posture the person publishes after the agent's context was built is what
+/// the agent's next call runs under, sandbox included.
+#[test]
+fn agent_tool_contexts_follow_the_published_posture() {
+    let (engine, handle) = Engine::new(EngineConfig::default(), &Config::default());
+    let context = engine.build_tool_context(AppMode::Agent, false);
+    let before = context.clone().with_live_posture();
+    assert!(!before.auto_approve);
+    assert_ne!(
+        before.elevated_sandbox_policy,
+        Some(crate::sandbox::SandboxPolicy::DangerFullAccess)
+    );
+    handle.publish_turn_authority(
+        AppMode::Agent,
+        true,
+        false,
+        true,
+        ApprovalMode::Bypass,
+        None,
+    );
+    let after = context.with_live_posture();
+    assert!(after.auto_approve);
+    assert_eq!(after.approval_mode, ApprovalMode::Bypass);
+    assert_eq!(
+        after.elevated_sandbox_policy,
+        Some(crate::sandbox::SandboxPolicy::DangerFullAccess)
+    );
+}
+
 #[test]
 fn registry_instruction_does_not_gate_ordinary_local_work() {
     let (engine, _handle) = Engine::new(EngineConfig::default(), &Config::default());

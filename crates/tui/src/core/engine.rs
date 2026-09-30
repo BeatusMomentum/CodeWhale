@@ -1150,6 +1150,81 @@ impl LiveRuntimeAuthorityState {
     }
 }
 
+/// The session's live permission posture, as every agent it spawned reads it.
+///
+/// Agents used to copy the posture when they were spawned, so a session the
+/// person switched to Full Access kept gating its running agents with the old
+/// posture: an agent spawned under Auto-Review went on asking the guardian,
+/// and being denied, after the person had granted Full Access. Each agent call
+/// now re-reads the posture the person last chose — the same cell the TUI
+/// decides that agent's approval prompts against — and the sandbox it implies.
+#[derive(Clone)]
+pub(crate) struct LivePosture {
+    state: Arc<StdMutex<LiveRuntimeAuthorityState>>,
+    workspace: PathBuf,
+    network_access: crate::core::authority::SandboxNetworkAccess,
+}
+
+impl LivePosture {
+    /// Project the live posture onto one agent call: approval, and the
+    /// sandbox that posture implies. Shell and trust stay as the agent's grant
+    /// narrowed them.
+    pub(crate) fn apply(&self, context: &mut ToolContext) {
+        let live = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .authority
+            .clone();
+        context.auto_approve = live.auto_approve;
+        context.approval_mode = live.approval_mode;
+        context.elevated_sandbox_policy = Some(crate::core::authority::sandbox_policy_for_turn(
+            live.mode,
+            live.approval_mode,
+            live.configured_sandbox_mode.as_deref(),
+            &self.workspace,
+            self.network_access,
+        ));
+    }
+}
+
+#[cfg(test)]
+impl LivePosture {
+    /// A posture cell a test switches the way the TUI does.
+    pub(crate) fn for_tests(workspace: &Path, approval_mode: ApprovalMode) -> Self {
+        let posture = Self {
+            state: Arc::new(StdMutex::new(LiveRuntimeAuthorityState::new(
+                LiveRuntimeAuthority::from_fields(
+                    AppMode::Agent,
+                    true,
+                    false,
+                    false,
+                    ApprovalMode::Suggest,
+                    None,
+                ),
+            ))),
+            workspace: workspace.to_path_buf(),
+            network_access: crate::core::authority::SandboxNetworkAccess::Restricted,
+        };
+        posture.switch_for_tests(approval_mode);
+        posture
+    }
+
+    pub(crate) fn switch_for_tests(&self, approval_mode: ApprovalMode) {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .authority = LiveRuntimeAuthority::from_fields(
+            AppMode::Agent,
+            true,
+            false,
+            false,
+            approval_mode,
+            None,
+        );
+    }
+}
+
 /// Runtime-facing view of the engine's exact live permission authority.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RuntimePermissionAuthority {
@@ -5105,7 +5180,6 @@ impl Engine {
                 .with_parent_mode(input_policy.mode)
                 .with_approval_receipt_store(self.approval_receipt_store.clone())
                 .with_permission_posture(
-                    self.session.approval_mode,
                     Arc::clone(&self.shared_auto_review_policy),
                     self.config.terminal_chrome_enabled,
                 );
@@ -6303,7 +6377,6 @@ impl Engine {
         .with_parent_mode(mode)
         .with_approval_receipt_store(self.approval_receipt_store.clone())
         .with_permission_posture(
-            self.session.approval_mode,
             Arc::clone(&self.shared_auto_review_policy),
             self.config.terminal_chrome_enabled,
         );
@@ -6452,14 +6525,20 @@ impl Engine {
                 .and_then(crate::client::ProviderNativeSearchClient::new);
         }
 
+        let network_access = crate::core::authority::SandboxNetworkAccess::from_config(
+            self.api_config.sandbox_network_access,
+        );
         let policy = authority.sandbox_policy(
             &self.session.workspace,
             self.api_config.sandbox_mode.as_deref(),
-            crate::core::authority::SandboxNetworkAccess::from_config(
-                self.api_config.sandbox_network_access,
-            ),
+            network_access,
         );
         let mut ctx = ctx.with_elevated_sandbox_policy(policy);
+        ctx.live_posture = Some(LivePosture {
+            state: Arc::clone(&self.live_runtime_authority),
+            workspace: self.session.workspace.clone(),
+            network_access,
+        });
         if matches!(authority.mode, AppMode::Plan) {
             ctx = ctx.with_shell_network_denied_hint(PLAN_SHELL_NETWORK_DENIED_HINT);
         }
@@ -7748,7 +7827,7 @@ pub(crate) enum AutoReviewPlanDecision {
     ConsultReviewer(String),
 }
 
-pub(super) fn auto_review_run_origin_for_plan(
+pub(crate) fn auto_review_run_origin_for_plan(
     detached_start: bool,
 ) -> crate::tui::auto_review::RunOrigin {
     if detached_start {
