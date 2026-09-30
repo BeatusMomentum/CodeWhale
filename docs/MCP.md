@@ -19,6 +19,13 @@ Server mode note:
 - `codewhale mcp-server` is an equivalent stdio entrypoint on the same
   consolidated runtime.
 
+In 0.10.1, the old child-server aggregation proxy is removed. `mcp-server`
+now uses the same native tool server as `serve --mcp`; it does not launch the
+legacy `mcp.server_definitions` list. Saved definitions are left intact. Configure
+external servers in `mcp.json` for the existing MCP client, or connect to those
+servers directly from your external client. Native server write tools remain
+withheld unless the operator explicitly permits them in its server configuration.
+
 ## Setup wizard vs manual MCP setup (#3407)
 
 The `/setup` hub includes an optional **Tools and MCP**

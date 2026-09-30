@@ -525,7 +525,7 @@ impl Drop for StdioTransport {
 /// exceeds `max` bytes. Cancellation retains consumed bytes; the caller clears
 /// the buffer only after receiving a complete frame. Returns the total bytes
 /// accumulated; 0 means EOF.
-async fn read_line_capped<R>(
+pub(crate) async fn read_line_capped<R>(
     reader: &mut R,
     out: &mut Vec<u8>,
     max: usize,

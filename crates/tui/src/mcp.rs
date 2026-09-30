@@ -34,8 +34,10 @@ mod wire;
 use self::http::{HttpTransport, McpHttpAuth};
 use self::sse::SseTransport;
 use self::stdio::StdioTransport;
+pub(crate) use self::stdio::read_line_capped;
 #[cfg(all(test, unix))]
 use self::stdio::{STDIO_SHUTDOWN_GRACE, StderrTail};
+pub(crate) use self::wire::MAX_MCP_RESPONSE_BYTES;
 use self::wire::{
     is_mcp_connection_lost_error, is_mcp_session_rejected_error, is_mcp_stale_session_body,
 };
@@ -48,7 +50,7 @@ use crate::utils::write_atomic;
 const ERROR_BODY_PREVIEW_BYTES: usize = 200;
 
 /// Newest dated MCP protocol revision Codewhale advertises at `initialize` and
-/// answers as an MCP server. Matches the shared MCP crate (`crates/mcp`).
+/// answers as the native MCP server.
 pub(crate) const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
 /// Dated MCP revisions accepted during negotiation, newest first. A peer
 /// answering or requesting any of these continues the handshake.

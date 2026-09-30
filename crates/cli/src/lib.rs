@@ -31,7 +31,6 @@ use codewhale_config::{
     classify_config_api_key_value, provider_base_url_is_official,
 };
 use codewhale_execpolicy::{AskForApproval, ExecPolicyContext, ExecPolicyEngine};
-use codewhale_mcp::{McpServerDefinition, run_stdio_server};
 use codewhale_secrets::Secrets;
 use codewhale_state::{StateStore, ThreadListFilters};
 use codewhale_telemetry::{
@@ -1905,8 +1904,6 @@ struct AppServerArgs {
     cors_origin: Vec<String>,
 }
 
-const MCP_SERVER_DEFINITIONS_KEY: &str = "mcp.server_definitions";
-
 fn install_rustls_crypto_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
@@ -2399,22 +2396,14 @@ fn run() -> Result<()> {
         }
         Some(Commands::Dispatch(args)) => dispatch::run(args),
         Some(Commands::McpServer) => {
-            // `codewhale serve --mcp` delegates to the TUI and arms there, so
-            // without this the same user action reported differently depending
-            // on which spelling they typed — and `mcp-server`, a surface the
-            // schema documents as emitting, could only ever read zero. A
-            // structural zero a maintainer mistakes for an adoption zero is
-            // the thing the "which surfaces emit" section exists to prevent.
-            let resolved_runtime =
-                resolve_runtime_for_diagnostic_dispatch(&store, &runtime_overrides);
-            let session = start_cli_telemetry(
+            // Keep the CLI spelling, with the same tool and permission authority
+            // as `serve --mcp`. The legacy child-server proxy is retired.
+            let resolved_runtime = resolve_runtime_for_dispatch(&mut store, &runtime_overrides);
+            run_tui_server_in_process(
+                &cli,
                 &resolved_runtime,
-                Some(store.path().to_path_buf()),
-                Surface::McpServer,
-            );
-            let outcome = run_mcp_server_command(&mut store);
-            finish_cli_telemetry(session, &outcome);
-            outcome
+                vec!["serve".to_string(), "--mcp".to_string()],
+            )
         }
         Some(Commands::Config(args)) => {
             let resolved_runtime =
@@ -5642,65 +5631,6 @@ fn app_server_token_from_env() -> Option<String> {
         .or_else(|| std::env::var("DEEPSEEK_APP_SERVER_TOKEN").ok())
 }
 
-fn run_mcp_server_command(store: &mut ConfigStore) -> Result<()> {
-    let persisted = load_mcp_server_definitions(store);
-    let updated = run_stdio_server(persisted)?;
-    persist_mcp_server_definitions(store, &updated)
-}
-
-fn load_mcp_server_definitions(store: &ConfigStore) -> Vec<McpServerDefinition> {
-    // `get_raw_string` first: `get_value` re-renders the extras entry as TOML,
-    // which quotes a JSON payload into `'[{"config":…}]'` and makes it
-    // unparseable — so every persisted definition was silently dropped and
-    // `mcp-server` started with an empty server list (#4727). `get_value`
-    // remains as the fallback for keys that are not plain extras strings.
-    let raw = store
-        .config
-        .get_raw_string(MCP_SERVER_DEFINITIONS_KEY)
-        .map(ToOwned::to_owned)
-        .or_else(|| store.config.get_value(MCP_SERVER_DEFINITIONS_KEY));
-    let Some(raw) = raw else {
-        return Vec::new();
-    };
-
-    match parse_mcp_server_definitions(&raw) {
-        Ok(definitions) => definitions,
-        Err(err) => {
-            eprintln!(
-                "warning: failed to parse persisted MCP server definitions ({MCP_SERVER_DEFINITIONS_KEY}): {err}"
-            );
-            Vec::new()
-        }
-    }
-}
-
-fn parse_mcp_server_definitions(raw: &str) -> Result<Vec<McpServerDefinition>> {
-    if let Ok(parsed) = serde_json::from_str::<Vec<McpServerDefinition>>(raw) {
-        return Ok(parsed);
-    }
-
-    let unwrapped: String = serde_json::from_str(raw).map_err(|_| {
-        anyhow!("invalid JSON payload at key {MCP_SERVER_DEFINITIONS_KEY}; contents were omitted")
-    })?;
-    serde_json::from_str::<Vec<McpServerDefinition>>(&unwrapped).map_err(|_| {
-        anyhow!(
-            "invalid MCP server definition list in key {MCP_SERVER_DEFINITIONS_KEY}; contents were omitted"
-        )
-    })
-}
-
-fn persist_mcp_server_definitions(
-    store: &mut ConfigStore,
-    definitions: &[McpServerDefinition],
-) -> Result<()> {
-    let encoded =
-        serde_json::to_string(definitions).context("failed to encode MCP server definitions")?;
-    store
-        .config
-        .set_value(MCP_SERVER_DEFINITIONS_KEY, &encoded)?;
-    store.save()
-}
-
 /// Delegate a long-running server command (`serve --http`/`--mobile`,
 /// `app-server --http`/`--mobile`) to the sibling TUI binary, supervising the
 /// child so its listener does not outlive the dispatcher (#3259).
@@ -6357,18 +6287,6 @@ mod tests {
         // What the `for cause in err.chain().skip(1)` loop iterates over.
         let causes: Vec<String> = err.chain().skip(1).map(ToString::to_string).collect();
         assert_eq!(causes, vec!["TOML parse error at line 1, column 20"]);
-    }
-
-    #[test]
-    fn malformed_persisted_mcp_json_omits_secret_contents_and_keys() {
-        let secret = "sentinel";
-        let raw =
-            format!(r#"[{{"name":"private","env":{{"PRIVATE_TOKEN":"{secret}"}} trailing-junk}}]"#);
-        let error = parse_mcp_server_definitions(&raw).expect_err("malformed JSON must fail");
-        let diagnostic = format!("{error:#}");
-        assert!(!diagnostic.contains(secret), "{diagnostic}");
-        assert!(!diagnostic.contains("PRIVATE_TOKEN"), "{diagnostic}");
-        assert!(diagnostic.contains("contents were omitted"), "{diagnostic}");
     }
 
     #[test]

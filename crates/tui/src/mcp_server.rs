@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
 use crate::session_manager::SessionManager;
 use crate::tools::spec::{ToolError, ToolResult};
@@ -92,6 +92,14 @@ struct McpServer {
     registry: crate::tools::ToolRegistry,
     exposed_tools: Vec<ExposedTool>,
     require_approval: bool,
+    phase: SessionPhase,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SessionPhase {
+    Uninitialized,
+    InitializeResponded,
+    Ready,
 }
 
 impl McpServer {
@@ -121,6 +129,7 @@ impl McpServer {
             registry,
             exposed_tools,
             require_approval: settings.require_approval,
+            phase: SessionPhase::Uninitialized,
         })
     }
 
@@ -128,55 +137,136 @@ impl McpServer {
     /// stdio server answers one request at a time by definition, so it
     /// needs no private `Runtime` and no `block_on` (#6140).
     async fn run(&mut self) -> Result<()> {
-        let stdin = tokio::io::BufReader::new(tokio::io::stdin());
-        let mut stdout = tokio::io::stdout();
-        let mut lines = stdin.lines();
+        self.run_io(tokio::io::stdin(), tokio::io::stdout()).await
+    }
 
-        while let Some(line) = lines.next_line().await? {
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            let Ok(message) = serde_json::from_str::<Value>(trimmed) else {
-                continue;
+    async fn run_io<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+        &mut self,
+        input: R,
+        mut output: W,
+    ) -> Result<()> {
+        let mut reader = tokio::io::BufReader::new(input);
+        let mut frame = Vec::new();
+        loop {
+            let response = match crate::mcp::read_line_capped(
+                &mut reader,
+                &mut frame,
+                crate::mcp::MAX_MCP_RESPONSE_BYTES,
+            )
+            .await
+            {
+                Ok(0) => break,
+                Ok(_) if frame.iter().all(u8::is_ascii_whitespace) => {
+                    frame.clear();
+                    continue;
+                }
+                Ok(_) => match serde_json::from_slice(&frame) {
+                    Ok(message) => self.handle_message(message).await,
+                    Err(_) => respond_error(Some(&Value::Null), -32700, "Invalid JSON".into()),
+                },
+                Err(err) => {
+                    let response = respond_error(
+                        Some(&Value::Null),
+                        -32700,
+                        "Invalid or oversized JSON-RPC frame".into(),
+                    );
+                    if let Some(response) = response {
+                        output.write_all(response.to_string().as_bytes()).await?;
+                        output.write_all(b"\n").await?;
+                        output.flush().await?;
+                    }
+                    return Err(err).context("Failed to read bounded MCP input");
+                }
             };
-
-            if let Some(response) = self.handle_message(message).await {
-                let payload = serde_json::to_string(&response)?;
-                stdout.write_all(payload.as_bytes()).await?;
-                stdout.write_all(b"\n").await?;
-                stdout.flush().await?;
+            frame.clear();
+            if let Some(response) = response {
+                let payload = serde_json::to_vec(&response)?;
+                output.write_all(&payload).await?;
+                output.write_all(b"\n").await?;
+                output.flush().await?;
             }
         }
-
         Ok(())
     }
 
     async fn handle_message(&mut self, message: Value) -> Option<Value> {
-        let method = message.get("method").and_then(Value::as_str)?;
-        let id = message.get("id").cloned();
+        let id = message.get("id");
+        let method = message.get("method").and_then(Value::as_str);
+        if !message.is_object()
+            || message.get("jsonrpc").and_then(Value::as_str) != Some("2.0")
+            || method.is_none_or(str::is_empty)
+            || id.is_some_and(|id| !(id.is_null() || id.is_string() || id.is_i64() || id.is_u64()))
+            || message
+                .get("params")
+                .is_some_and(|params| !params.is_object())
+        {
+            return respond_error(
+                Some(&Value::Null),
+                -32600,
+                "Invalid JSON-RPC request".into(),
+            );
+        }
+        let method = method.unwrap_or_default();
+        if matches!(method, "tools/list" | "tools/call" | "resources/list")
+            && self.phase != SessionPhase::Ready
+        {
+            return respond_error(
+                id,
+                -32600,
+                "A completed initialize / notifications/initialized handshake is required".into(),
+            );
+        }
 
         match method {
-            "initialize" => respond(
-                id.as_ref(),
-                initialize_response(
-                    message
-                        .pointer("/params/protocolVersion")
-                        .and_then(Value::as_str),
-                ),
-            ),
-            "tools/list" => respond(id.as_ref(), self.list_tools_response()),
-            "tools/call" => {
-                let params = message.get("params").cloned().unwrap_or_else(|| json!({}));
-                match self.call_tool(params).await {
-                    Ok(result) => respond(id.as_ref(), result),
-                    Err(err) => respond_error(id.as_ref(), err.code, err.message),
+            "initialize" => {
+                // A notification has no response carrying the negotiated version
+                // and cannot advance the handshake.
+                id?;
+                if self.phase != SessionPhase::Uninitialized {
+                    return respond_error(id, -32600, "Initialize may only be sent once".into());
+                }
+                let requested = message
+                    .pointer("/params/protocolVersion")
+                    .and_then(Value::as_str);
+                if requested.is_none_or(|version| version.trim().is_empty())
+                    || ["name", "version"].iter().any(|field| {
+                        message["params"]["clientInfo"][*field]
+                            .as_str()
+                            .is_none_or(|value| value.trim().is_empty())
+                    })
+                    || !message["params"]["capabilities"].is_object()
+                {
+                    return respond_error(id, -32602, "Invalid MCP initialize parameters".into());
+                }
+                self.phase = SessionPhase::InitializeResponded;
+                respond(id, initialize_response(requested))
+            }
+            "notifications/initialized" => {
+                if id.is_none() && self.phase == SessionPhase::InitializeResponded {
+                    self.phase = SessionPhase::Ready;
+                    None
+                } else {
+                    respond_error(
+                        id,
+                        -32600,
+                        "Expected initialized notification after initialize".into(),
+                    )
                 }
             }
-            "resources/list" => respond(id.as_ref(), self.list_resources_response().await),
-            "ping" => respond(id.as_ref(), json!({})),
-            "notifications/initialized" => None,
-            _ => respond_error(id.as_ref(), -32601, format!("Method not found: {method}")),
+            "tools/list" => respond(id, self.list_tools_response()),
+            "tools/call" => {
+                // Calls without an identity are notifications and must not run
+                // a tool whose result the client cannot acknowledge.
+                id?;
+                let params = message.get("params").cloned().unwrap_or_else(|| json!({}));
+                match self.call_tool(params).await {
+                    Ok(result) => respond(id, result),
+                    Err(err) => respond_error(id, err.code, err.message),
+                }
+            }
+            "resources/list" => respond(id, self.list_resources_response().await),
+            "ping" => respond(id, json!({})),
+            _ => respond_error(id, -32601, format!("Method not found: {method}")),
         }
     }
 

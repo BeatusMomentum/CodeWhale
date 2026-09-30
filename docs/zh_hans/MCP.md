@@ -15,6 +15,12 @@ codewhale 可以通过 MCP（Model Context Protocol，模型上下文协议）�
 - `codewhale serve --http` 运行运行时 HTTP/SSE API（独立模式）。
 - `codewhale mcp-server` 是同一个统一运行时上等价的 stdio 入口。
 
+0.10.1 移除了旧的子服务器聚合代理。`mcp-server` 现在与 `serve --mcp`
+使用同一个原生工具服务器，不再启动旧的 `mcp.server_definitions` 列表。
+已保存的定义会保留。请在 `mcp.json` 中为现有 MCP 客户端配置外部服务器，
+或让外部客户端直接连接这些服务器。原生服务器默认不暴露写入工具；只有
+操作员在服务器配置中明确允许后，这些工具才会开放。
+
 ## 设置向导与手动 MCP 设置（#3407）
 
 `/setup` 中心包含一个可选的 **Tools and MCP** 步骤。该步骤仅用于发现/就绪检查：

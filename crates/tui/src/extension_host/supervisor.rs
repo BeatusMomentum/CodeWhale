@@ -44,7 +44,7 @@ use super::protocol::{
 /// a too-tight budget disables every extension for that session. The
 /// handshake runs in the background, off the first-prompt path, so a wider
 /// budget costs nothing when the host is healthy; 30 s matches the MCP stdio
-/// handshake (`codewhale_mcp::stdio_client::HANDSHAKE_TIMEOUT`).
+/// handshake; it is independent of the active TUI MCP client.
 pub const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(30);
 pub const ACTIVATE_DEADLINE: Duration = Duration::from_secs(5);
 pub const DISPOSE_DEADLINE: Duration = Duration::from_secs(2);
