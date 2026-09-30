@@ -552,10 +552,11 @@ mod tests {
                 .expect("cleanup probe"),
             "the direct child outlived failed containment attachment"
         );
-        let error = result
+        let Err(error) = result
             .expect("attachment failure must return without running the command to completion")
-            .err()
-            .expect("a containment failure must not be accepted as a successful run");
+        else {
+            panic!("a containment failure must not be accepted as a successful run");
+        };
         assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
         assert_eq!(error.to_string(), "injected containment attachment failure");
     }
