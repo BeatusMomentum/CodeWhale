@@ -6582,7 +6582,7 @@ fn completed_answer_clears_stale_reasoning_expand_hint() {
 #[test]
 fn selected_reasoning_hint_and_space_share_one_owner() {
     let mut app = create_test_app();
-    app.history = vec![oversized_reasoning("selected", false)];
+    app.history = vec![oversized_reasoning("selected", true)];
     app.resync_history_revisions();
     let _ = render_underwater_test_app(&mut app, 100, 32);
     select_original_cell(&mut app, 0);
@@ -6634,6 +6634,19 @@ fn selected_reasoning_hint_and_space_share_one_owner() {
             },
             action: crate::tui::history::ReasoningAction::Collapse,
         })
+    );
+
+    app.history[0] = oversized_reasoning("selected", false);
+    app.bump_history_cell(0);
+    let _ = render_underwater_test_app(&mut app, 100, 32);
+    assert_eq!(app.thinking_folds.get(&0), Some(&ThinkingFold::Expanded));
+    assert!(
+        app.viewport
+            .transcript_cache
+            .lines()
+            .iter()
+            .any(|line| line.to_string().contains("selected line 40")),
+        "settling must not override the user's explicit expansion"
     );
 
     assert!(handle_transcript_space(&mut app));
@@ -7303,12 +7316,11 @@ fn visible_older_reasoning_owns_space_over_a_newer_offscreen_tool() {
         Some(1)
     );
 
-    // The configurable two-line completed preview puts the Space affordance
-    // immediately after the header + body, so scroll one row to keep that
-    // action visible while the newer tool remains below the viewport.
-    app.viewport.transcript_scroll = TranscriptScroll::at_line(1);
+    // The settled calm header owns Space. Scroll to that row while the
+    // newer tool remains below the compact viewport.
+    app.viewport.transcript_scroll = TranscriptScroll::at_line(0);
     let surface = render_underwater_test_app(&mut app, 60, 8);
-    assert_eq!(app.viewport.last_transcript_top, 1);
+    assert_eq!(app.viewport.last_transcript_top, 0);
     assert_eq!(reasoning_hint_cells(&app), vec![0]);
     assert!(surface.contains("Space:expand"), "{surface}");
     assert_eq!(
