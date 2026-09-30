@@ -657,8 +657,7 @@ impl TranscriptViewCache {
                     .width()
                     .saturating_sub(line.spans.last().map_or(0, Span::width))
                     + unicode_width::UnicodeWidthStr::width(*hint)
-                    + 1
-                    <= usize::from(self.width)
+                    < usize::from(self.width)
         });
         let is_hint = hint.is_some();
         let hinted = hint.map(|hint| {

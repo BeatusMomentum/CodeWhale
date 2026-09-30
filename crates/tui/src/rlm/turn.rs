@@ -212,9 +212,9 @@ impl RlmEventSender {
             .await;
     }
 
-    async fn send(&self, event: Event) -> Result<(), mpsc::error::SendError<Event>> {
+    async fn send(&self, event: Event) {
         self.record(&event).await;
-        self.sender.send(event).await
+        let _ = self.sender.send(event).await;
     }
 }
 
@@ -298,7 +298,7 @@ async fn run_rlm_turn_impl(
         .with_events(tx_event.sender.clone())
         .with_deadline(Some(deadline));
 
-        let _ = tx_event
+        tx_event
             .send(Event::status(format!(
                 "RLM: spawned Python REPL (root={model}, child={child_model}, max_depth={max_depth}, ctx={} chars)",
                 prompt.chars().count()
@@ -322,7 +322,7 @@ async fn run_rlm_turn_impl(
             for iteration in 0..MAX_RLM_ITERATIONS {
                 iterations = iteration + 1;
 
-                let _ = tx_event
+                tx_event
                     .send(Event::status(format!(
                         "RLM iteration {}/{}",
                         iteration + 1,
@@ -453,7 +453,7 @@ async fn run_rlm_turn_impl(
                         });
                         continue;
                     }
-                    let _ = tx_event
+                    tx_event
                         .send(Event::status(
                             "RLM: FINAL detected in response text".to_string(),
                         ))
@@ -521,7 +521,7 @@ async fn run_rlm_turn_impl(
                     }
                 };
 
-                let _ = tx_event
+                tx_event
                     .send(Event::MessageDelta {
                         index: iteration as usize,
                         content: format!(
@@ -565,7 +565,7 @@ async fn run_rlm_turn_impl(
                     elapsed_ms: round.elapsed.as_millis() as u64,
                 });
 
-                let _ = tx_event
+                tx_event
                     .send(Event::status(format!(
                         "RLM round {}: {} bytes stdout, {} sub-LLM call(s){}",
                         iteration + 1,
@@ -577,7 +577,7 @@ async fn run_rlm_turn_impl(
 
                 // 4e. FINAL detection.
                 if let Some(final_val) = round.final_value.clone() {
-                    let _ = tx_event
+                    tx_event
                         .send(Event::status(
                             "RLM: FINAL detected in REPL, ending loop".to_string(),
                         ))
