@@ -2894,13 +2894,25 @@ impl SessionManager {
                 Err(error) => return Err(error),
             }
         }
-        if matches!(removal, SessionRemoval::Retention)
-            && (has_recovery || legacy_origin.is_err())
-            && !already_deleted
-        {
+        if matches!(removal, SessionRemoval::Retention) && !already_deleted {
+            // Retention never acts on an uncertain origin. An unreadable
+            // legacy checkpoint may be this id's crash recovery, and a
+            // damaged recovery leaves the ordinary snapshot as the only
+            // readable copy of the conversation. Fail closed: keep every byte
+            // and let the caller skip this record.
+            if let Err(error) = &legacy_origin {
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!(
+                        "retention left session '{}' untouched: the legacy checkpoint's origin is unreadable ({error})",
+                        id.trim()
+                    ),
+                ));
+            }
+        }
+        if matches!(removal, SessionRemoval::Retention) && has_recovery && !already_deleted {
             // Retention owns the ordinary snapshot, not crash recovery. Keep
             // the origin and its accounting/evidence writable for resume.
-            // An unreadable legacy origin cannot justify retiring any id.
             return match fs::remove_file(&path) {
                 Ok(()) => Ok(()),
                 Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -4605,6 +4617,45 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn retention_fails_closed_on_an_unreadable_legacy_checkpoint_origin() {
+        let tmp = tempdir().expect("tempdir");
+        let manager = SessionManager::new(tmp.path().join("sessions")).expect("manager");
+        let id = "66666666-6666-4666-8666-666666666666";
+        let mut old = save_late_usage_test_session(&manager, id);
+        old.metadata.updated_at = Utc::now() - chrono::Duration::days(60);
+        manager.save_session(&old).expect("old snapshot");
+        let snapshot = manager.validated_session_path(id).expect("snapshot path");
+        let original = fs::read(&snapshot).expect("original snapshot bytes");
+        // Fault fixture: a legacy checkpoint whose owner cannot be read. It
+        // may be this session's (damaged) recovery.
+        fs::create_dir_all(manager.checkpoints_dir()).expect("checkpoints");
+        let legacy = manager.checkpoints_dir().join(LEGACY_CHECKPOINT_FILE);
+        let corrupt: &[u8] = b"{\"messages\": [truncated";
+        write_atomic(&legacy, corrupt).expect("corrupt legacy checkpoint");
+        assert!(manager.legacy_checkpoint_origin().is_err());
+
+        assert_eq!(
+            manager
+                .prune_sessions_older_than(std::time::Duration::from_secs(24 * 3600))
+                .expect("age prune"),
+            0,
+            "an uncertain origin must not be pruned"
+        );
+        assert_eq!(
+            fs::read(&snapshot).expect("snapshot survives retention"),
+            original,
+            "the ordinary snapshot keeps its original bytes"
+        );
+        assert_eq!(fs::read(&legacy).expect("legacy survives"), corrupt);
+        let (ledger, _) = manager.late_usage_paths(id).expect("ledger paths");
+        assert!(!SessionManager::late_usage_is_deleted(&ledger).expect("not retired"));
+
+        // Explicit deletion remains the user's decision.
+        manager.delete_session(id).expect("explicit delete");
+        assert!(!snapshot.exists());
     }
 
     #[test]
@@ -8230,10 +8281,19 @@ mod tests {
         let manager = SessionManager::new(sessions_dir.clone()).expect("new");
         let checkpoint_dir = sessions_dir.join("checkpoints");
         fs::create_dir_all(&checkpoint_dir).expect("mkdir checkpoints");
-        // Drop a stale-looking JSON inside the checkpoint dir; prune
-        // should leave it alone.
-        let checkpoint_file = checkpoint_dir.join("latest.json");
-        fs::write(&checkpoint_file, "{}").expect("write checkpoint");
+        // Drop a legacy checkpoint inside the checkpoint dir; prune should
+        // leave it alone. It belongs to a readable, unrelated origin: an
+        // unreadable origin makes retention fail closed instead (see
+        // `retention_fails_closed_on_an_unreadable_legacy_checkpoint_origin`).
+        let checkpoint_file = checkpoint_dir.join(LEGACY_CHECKPOINT_FILE);
+        let unrelated = save_late_usage_test_session(&manager, "unrelated-origin");
+        write_atomic(
+            &checkpoint_file,
+            serialize_saved_session(unrelated)
+                .expect("legacy bytes")
+                .as_bytes(),
+        )
+        .expect("write checkpoint");
 
         write_session_with_updated_at(&manager, "stale", Utc::now() - chrono::Duration::days(60));
         let pruned = manager
