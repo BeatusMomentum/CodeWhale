@@ -3051,17 +3051,6 @@ fn json_frame(value: serde_json::Value) -> Vec<u8> {
 }
 
 #[test]
-fn per_request_read_budget_never_undercuts_the_request_budget() {
-    // A long execute budget widens the inner read wait so the response wait
-    // cannot fire first and defeat it.
-    assert_eq!(per_request_read_budget(120, 1800), 1800);
-    // A read knob above the request budget stays intact.
-    assert_eq!(per_request_read_budget(600, 60), 600);
-    // Equal budgets stay equal.
-    assert_eq!(per_request_read_budget(120, 120), 120);
-}
-
-#[test]
 fn http_request_ceiling_covers_the_execute_budget() {
     let mut config = test_server_config();
     config.execute_timeout = Some(1800);
@@ -3109,8 +3098,8 @@ impl McpTransport for DelayedResponseTransport {
 async fn a_tool_response_after_the_read_knob_still_completes_within_the_execute_budget() {
     let mut connection = test_connection(Box::new(DelayedResponseTransport {
         // The response arrives after the read knob (1s) but well inside the
-        // execute budget (30s): the widened inner read wait must cover it
-        // instead of marking the connection dead at the knob.
+        // execute budget (30s): the read knob must not bound a request's
+        // receive and mark the connection dead before the reply lands.
         delay: Duration::from_millis(1500),
         pending: None,
     }));
@@ -3126,21 +3115,33 @@ async fn a_tool_response_after_the_read_knob_still_completes_within_the_execute_
     );
 }
 
+/// A wedged server fails a request at the request's own budget, and the
+/// request is abandoned, not the connection: its late reply carries the
+/// abandoned id and is skipped (see the stdio fixtures below). The read knob
+/// (1s) and the budget (2s) are distinct on purpose: equal deadlines used to
+/// race, and whichever timer won decided whether the connection survived.
+/// The per-frame read-knob disconnect is still pinned for the handshake by
+/// `recv_times_out_waiting_for_mcp_response_and_disconnects`.
 #[tokio::test]
-async fn a_request_whose_budget_does_not_exceed_the_read_knob_still_fails_at_it() {
+async fn a_wedged_request_fails_at_its_own_budget_and_keeps_the_connection() {
     let mut connection = test_connection(Box::new(HangingValueTransport {
         sent: Arc::new(Mutex::new(Vec::new())),
     }));
     connection.read_timeout_secs = 1;
     let error = connection
-        .read_resource("file:///wedged", 1)
+        .read_resource("file:///wedged", 2)
         .await
-        .expect_err("a wedged server must still fail the request at the read knob");
+        .expect_err("a wedged server must fail the request at its budget");
     assert!(
-        error.to_string().contains("after 1s"),
-        "the read knob must govern this request, got: {error:#}"
+        error
+            .to_string()
+            .contains("MCP method 'resources/read' on server 'mock' timed out after 2s"),
+        "the request budget, not the read knob, must end the request: {error:#}"
     );
-    assert!(!connection.is_ready());
+    assert!(
+        connection.is_ready(),
+        "an expired request must not declare the connection dead"
+    );
 }
 
 #[tokio::test]
@@ -3210,7 +3211,7 @@ async fn recv_times_out_waiting_for_mcp_response_and_disconnects() {
     conn.read_timeout_secs = 0;
 
     let err = conn
-        .recv("1".to_string(), conn.read_timeout_secs)
+        .recv("1".to_string())
         .await
         .expect_err("hung transport should time out inside recv");
 

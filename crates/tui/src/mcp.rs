@@ -1763,20 +1763,16 @@ impl Drop for PendingAuthorityWatch {
     }
 }
 
-/// Per-request inner read budget: the connection's read knob, widened to at
-/// least the request's own outer budget. A server is silent for the whole
-/// execution of a long tool call, so a smaller inner read would fire first,
-/// mark the connection Disconnected, and silently defeat a raised
-/// `execute_timeout`.
-fn per_request_read_budget(read_timeout_secs: u64, request_timeout_secs: u64) -> u64 {
-    read_timeout_secs.max(request_timeout_secs)
-}
-
 /// Total request ceiling handed to the HTTP client: it must cover the longest
 /// request the connection carries (`tools/call` at the execute budget), so a
 /// raised `execute_timeout` governs HTTP servers too. This is a ceiling for
-/// the transport, not the read knob — fast requests still fail at their own
-/// outer budget, which stays at the read knob.
+/// the transport, not the read knob.
+///
+/// Known limitation: Streamable HTTP reads the reply inside the POST, and
+/// `call_method` bounds only the receive, not the send. On that transport
+/// this ceiling — not the request's own budget — ends a slow request, so an
+/// explicit `execute_timeout` below `read_timeout` stops a tool call at
+/// `read_timeout`, and a wedged `resources/read` runs to the larger of the two.
 fn http_request_ceiling_secs(config: &McpServerConfig, global: &McpTimeouts) -> u64 {
     config
         .effective_read_timeout(global)
@@ -2019,7 +2015,7 @@ impl McpConnection {
         }))
         .await?;
 
-        let response = self.recv(init_id, self.read_timeout_secs).await?;
+        let response = self.recv(init_id).await?;
         if let Some(error) = response.get("error") {
             // A JSON-RPC error on `initialize` is the server refusing the
             // handshake, not a transport fault: name the server and what was
@@ -2165,7 +2161,7 @@ impl McpConnection {
             }))
             .await?;
 
-            let response = self.recv(list_id, self.read_timeout_secs).await?;
+            let response = self.recv(list_id).await?;
             let Some(result) = response_result(
                 &response,
                 "tools/list",
@@ -2226,7 +2222,7 @@ impl McpConnection {
             }))
             .await?;
 
-            let response = self.recv(list_id, self.read_timeout_secs).await?;
+            let response = self.recv(list_id).await?;
             let Some(result) = response_result(
                 &response,
                 "resources/list",
@@ -2279,7 +2275,7 @@ impl McpConnection {
             }))
             .await?;
 
-            let response = self.recv(list_id, self.read_timeout_secs).await?;
+            let response = self.recv(list_id).await?;
             let Some(result) = response_result(
                 &response,
                 "resources/templates/list",
@@ -2335,7 +2331,7 @@ impl McpConnection {
             }))
             .await?;
 
-            let response = self.recv(list_id, self.read_timeout_secs).await?;
+            let response = self.recv(list_id).await?;
             let Some(result) = response_result(
                 &response,
                 "prompts/list",
@@ -2452,16 +2448,25 @@ impl McpConnection {
             return self.finish_guarded_error(error).await;
         }
 
-        // The inner read wait must never undercut this request's own outer
-        // budget: a server is silent for the whole execution of a tool call,
-        // so a smaller read knob would fire first, mark the connection
-        // Disconnected, and silently defeat a raised `execute_timeout`.
-        // Requests whose budget does not exceed the read knob (resources,
-        // discovery) keep failing at the configured read budget.
-        let read_budget_secs = per_request_read_budget(self.read_timeout_secs, timeout_secs);
+        // The request's own budget is its only receive deadline. A per-frame
+        // read-knob wait here either undercut it — a server is silent for the
+        // whole execution of a tool call, so the knob fired first, marked the
+        // connection Disconnected, and capped a raised `execute_timeout` — or
+        // tied with it, leaving the connection's fate to timer order. On
+        // expiry the request is abandoned and the connection kept: a late
+        // reply carries the abandoned id and the next receive skips it.
+        //
+        // Known limitation: the server is never told a request was abandoned
+        // (no `notifications/cancelled`), whether by this budget or by the
+        // caller dropping the call (turn cancellation). A server that handles
+        // requests one at a time answers the next call only after finishing
+        // the abandoned one, so that call can wait up to its own budget —
+        // 1800s for `tools/call` by default. Cancelling `cancel_token` instead
+        // marks the connection dead, so the pool rebuilds it (a new child for
+        // stdio) before the next call.
         let response = match tokio::time::timeout(
             Duration::from_secs(timeout_secs),
-            self.recv(call_id, read_budget_secs),
+            self.recv_reply(call_id, None),
         )
         .await
         .with_context(|| {
@@ -2592,35 +2597,53 @@ impl McpConnection {
         result
     }
 
-    async fn recv(
+    /// Handshake and discovery receive: each frame wait is bounded by the read
+    /// knob, and a server that stays silent past it is treated as dead.
+    async fn recv(&mut self, expected_id: String) -> Result<serde_json::Value> {
+        self.recv_reply(expected_id, Some(self.read_timeout_secs))
+            .await
+    }
+
+    /// The next transport frame, unless the connection is cancelled first.
+    async fn next_frame(&mut self) -> Result<Vec<u8>> {
+        tokio::select! {
+            biased;
+            _ = self.cancel_token.cancelled() => {
+                anyhow::bail!("MCP connection '{}' was cancelled", self.name)
+            }
+            result = self.transport.recv() => result,
+        }
+    }
+
+    /// Receive the reply to `expected_id`, skipping notifications and replies
+    /// to other (abandoned) requests. `frame_timeout_secs` bounds each frame
+    /// wait and treats its expiry as a dead connection; `None` leaves the
+    /// whole wait to the caller's own request budget.
+    async fn recv_reply(
         &mut self,
         expected_id: String,
-        read_budget_secs: u64,
+        frame_timeout_secs: Option<u64>,
     ) -> Result<serde_json::Value> {
         loop {
-            let bytes = match tokio::time::timeout(Duration::from_secs(read_budget_secs), async {
-                tokio::select! {
-                    biased;
-                    _ = self.cancel_token.cancelled() => {
-                        anyhow::bail!("MCP connection '{}' was cancelled", self.name)
+            let frame = match frame_timeout_secs {
+                Some(secs) => {
+                    match tokio::time::timeout(Duration::from_secs(secs), self.next_frame()).await {
+                        Ok(frame) => frame,
+                        Err(_) => {
+                            self.state = ConnectionState::Disconnected;
+                            anyhow::bail!(
+                                "Timed out waiting for MCP JSON-RPC response from server '{}' after {}s",
+                                self.name,
+                                secs
+                            );
+                        }
                     }
-                    result = self.transport.recv() => result,
                 }
-            })
-            .await
-            {
-                Ok(result) => result.inspect_err(|_e| {
-                    self.state = ConnectionState::Disconnected;
-                })?,
-                Err(_) => {
-                    self.state = ConnectionState::Disconnected;
-                    anyhow::bail!(
-                        "Timed out waiting for MCP JSON-RPC response from server '{}' after {}s",
-                        self.name,
-                        read_budget_secs
-                    );
-                }
+                None => self.next_frame().await,
             };
+            let bytes = frame.inspect_err(|_e| {
+                self.state = ConnectionState::Disconnected;
+            })?;
             let value: serde_json::Value = match serde_json::from_slice(&bytes) {
                 Ok(value) => value,
                 Err(err) => {
