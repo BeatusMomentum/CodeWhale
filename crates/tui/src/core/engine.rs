@@ -5495,16 +5495,25 @@ impl Engine {
         // Otherwise cancellation during a blocked TurnStarted send could
         // create a completion with no start. The production queue has 256
         // slots; these local permits do not create a second event authority.
+        //
+        // A durable host (Runtime threads) recorded this turn before the
+        // engine saw it and settles it only on its terminal event. A queued
+        // cancellation there must still yield the ordered TurnStarted and
+        // Interrupted TurnComplete (the cancelled token stops the turn before
+        // any provider dispatch), so its admission waits for capacity instead
+        // of refusing on cancellation. An interactive queued cancellation
+        // keeps no lifecycle.
+        let admission_cancel = (!self.host_managed_turns()).then_some(&self.cancel_token);
         let admission = async {
             let terminal = streaming::reserve_event_capacity(
                 &self.tx_event,
-                Some(&self.cancel_token),
+                admission_cancel,
                 streaming::EventReservationPolicy::Strict,
             )
             .await?;
             let started = streaming::reserve_event_capacity(
                 &self.tx_event,
-                Some(&self.cancel_token),
+                admission_cancel,
                 streaming::EventReservationPolicy::Strict,
             )
             .await?;
@@ -5852,7 +5861,13 @@ impl Engine {
                 goal_token_budget,
                 goal_status,
             );
-            let outcome = SendMessageOutcome::Finished { status, error };
+            // The reserved lifecycle is settled above, but no model client
+            // ever received this turn: it did not start. `/edit` restores the
+            // exchange it cut only for NotStarted (C02-02), and goal
+            // reconciliation names the same fact.
+            let outcome = SendMessageOutcome::NotStarted {
+                error: Some(message),
+            };
             self.reconcile_non_completed_goal_turn(&outcome).await;
             return outcome;
         }
