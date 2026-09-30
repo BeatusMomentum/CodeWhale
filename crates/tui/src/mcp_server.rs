@@ -659,6 +659,7 @@ mod tests {
                 // Oversized input deliberately closes the server before the
                 // writer finishes. Both halves still settle without a task.
                 let _ = writer.write_all(input).await;
+                let _ = writer.shutdown().await;
                 drop(writer);
                 let mut output = Vec::new();
                 reader.read_to_end(&mut output).await.unwrap();
