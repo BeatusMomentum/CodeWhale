@@ -2697,17 +2697,25 @@ impl RuntimeThreadStore {
 
     /// A late turn can only update the revision admitted with that turn.
     /// Load/compare/write share the same guard as explicit save/delete.
+    /// Mutate the goal only while it is still the revision the caller read:
+    /// the same `goal_id` and, when `expected_status` is given, the same
+    /// status. Returns `Ok(None)` without writing when either changed, so a
+    /// transition decided against a stale read (for example Blocked computed
+    /// while a concurrent Complete landed) can never overwrite the newer state.
     fn update_goal_if_revision(
         &self,
         thread_id: &str,
         goal_id: &str,
+        expected_status: Option<codewhale_protocol::ThreadGoalStatus>,
         update: impl FnOnce(&mut codewhale_protocol::ThreadGoal),
     ) -> Result<Option<codewhale_protocol::ThreadGoal>> {
         let _guard = self.goal_mutation.lock();
         let Some(mut goal) = self.load_goal(thread_id)? else {
             return Ok(None);
         };
-        if goal.goal_id != goal_id {
+        if goal.goal_id != goal_id
+            || expected_status.is_some_and(|expected| goal.status != expected)
+        {
             return Ok(None);
         }
         update(&mut goal);
@@ -7698,23 +7706,30 @@ impl RuntimeThreadManager {
 
     /// Transition the goal status through a revision-checked mutation. A
     /// stale load-then-save could otherwise overwrite a concurrent PUT
-    /// replacement or DELETE; here the write commits only when the record is
-    /// still the revision the caller read. Returns the updated goal, or
-    /// `Ok(None)` when the goal changed or vanished since the read.
+    /// replacement or DELETE, or a concurrent terminal transition; here the
+    /// write commits only when the record still carries the goal id *and* the
+    /// status the caller read. Returns the updated goal, or `Ok(None)` when
+    /// the goal changed or vanished since the read.
     pub async fn transition_goal_status(
         &self,
         thread_id: &str,
         expected_goal_id: &str,
+        expected_status: codewhale_protocol::ThreadGoalStatus,
         status: codewhale_protocol::ThreadGoalStatus,
     ) -> Result<Option<codewhale_protocol::ThreadGoal>> {
         let thread_id = thread_id.to_string();
         let expected_goal_id = expected_goal_id.to_string();
         let store = self.store.clone();
         tokio::task::spawn_blocking(move || {
-            store.update_goal_if_revision(&thread_id, &expected_goal_id, |goal| {
-                goal.status = status;
-                goal.updated_at = chrono::Utc::now().timestamp();
-            })
+            store.update_goal_if_revision(
+                &thread_id,
+                &expected_goal_id,
+                Some(expected_status),
+                |goal| {
+                    goal.status = status;
+                    goal.updated_at = chrono::Utc::now().timestamp();
+                },
+            )
         })
         .await
         .context("goal status transition task panicked")?
@@ -7828,7 +7843,7 @@ impl RuntimeThreadManager {
             return;
         };
         let mut continue_after: Option<u64> = None;
-        let updated = self.store.update_goal_if_revision(thread_id, admitted_goal_id, |goal| {
+        let updated = self.store.update_goal_if_revision(thread_id, admitted_goal_id, None, |goal| {
         // Accrue this turn's provider spend onto the durable counters. The
         // engine tracks the same totals in memory; the record is the
         // cross-restart authority.
@@ -16026,7 +16041,7 @@ impl RuntimeThreadManager {
                         // Persist an acknowledged review before awaiting another
                         // event, so restart midway through a turn retains it.
                         self.store
-                            .update_goal_if_revision(&thread_id, goal_id, |goal| {
+                            .update_goal_if_revision(&thread_id, goal_id, None, |goal| {
                                 merge_engine_goal_progress(goal, &snapshot);
                             })?;
                     } else if snapshot.is_active() {

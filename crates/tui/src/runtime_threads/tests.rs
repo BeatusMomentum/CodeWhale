@@ -11743,12 +11743,33 @@ async fn transition_goal_status_commits_only_the_read_revision() -> Result<()> {
         .transition_goal_status(
             &thread.id,
             "goal_a",
+            codewhale_protocol::ThreadGoalStatus::Active,
             codewhale_protocol::ThreadGoalStatus::Complete,
         )
         .await?
         .ok_or_else(|| anyhow::anyhow!("current revision must commit"))?;
     assert_eq!(
         completed.status,
+        codewhale_protocol::ThreadGoalStatus::Complete
+    );
+
+    // A Blocked transition decided from the earlier Active read races the
+    // Complete above; the terminal state must survive it.
+    let raced = manager
+        .transition_goal_status(
+            &thread.id,
+            "goal_a",
+            codewhale_protocol::ThreadGoalStatus::Active,
+            codewhale_protocol::ThreadGoalStatus::Blocked,
+        )
+        .await?;
+    assert!(raced.is_none(), "a stale status read must not commit");
+    assert_eq!(
+        manager
+            .store
+            .load_goal(&thread.id)?
+            .ok_or_else(|| anyhow::anyhow!("goal record missing"))?
+            .status,
         codewhale_protocol::ThreadGoalStatus::Complete
     );
 
@@ -11760,6 +11781,7 @@ async fn transition_goal_status_commits_only_the_read_revision() -> Result<()> {
         .transition_goal_status(
             &thread.id,
             "goal_a",
+            codewhale_protocol::ThreadGoalStatus::Active,
             codewhale_protocol::ThreadGoalStatus::Blocked,
         )
         .await?;
