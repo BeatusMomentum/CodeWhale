@@ -35,12 +35,19 @@
 #![cfg(test)]
 
 #[cfg(unix)]
+#[cfg(test)]
 mod events;
+#[cfg(test)]
 mod golden;
 #[cfg(unix)]
+#[cfg(test)]
 mod hooks;
+#[cfg(test)]
 mod mcp;
 #[cfg(unix)]
+#[cfg(test)]
 mod prompt;
+#[cfg(test)]
 mod sse;
+#[cfg(test)]
 mod stream_json;
