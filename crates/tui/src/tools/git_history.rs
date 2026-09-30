@@ -483,7 +483,15 @@ impl ToolSpec for GitFetchTool {
         let git_ctx = resolve_git_context(context, optional_str(&input, "path")?)?;
         require_configured_remote(&git_ctx.working_dir, remote).await?;
 
-        let mut args = vec!["fetch".to_string(), remote.to_string()];
+        // Remote-tracking refs only (#6561 D03-01): a default fetch
+        // auto-follows tags into refs/tags/, and `tagOpt`/`pruneTags`
+        // config can add or delete local tags. The flags override both.
+        let mut args = vec![
+            "fetch".to_string(),
+            "--no-tags".to_string(),
+            "--no-prune-tags".to_string(),
+            remote.to_string(),
+        ];
         args.extend(refspecs.clone());
 
         let command_str = format_command(&git_ctx.working_dir, &args);
@@ -1252,6 +1260,9 @@ mod tests {
         init_git_repo(origin.path());
         fs::write(origin.path().join("file.txt"), "one\n").expect("write");
         commit_all(origin.path(), "first");
+        // An annotated tag on fetched history: a default `git fetch`
+        // auto-follows it into the local refs/tags/ namespace.
+        run_git(origin.path(), &["tag", "-a", "v1", "-m", "v1"]);
 
         let work = tempdir().expect("tempdir");
         init_git_repo(work.path());
@@ -1271,6 +1282,12 @@ mod tests {
             .await
             .expect("execute");
         assert!(result.success, "{}", result.content);
+
+        // #6561 D03-01: remote-tracking refs only, so no local tag appeared.
+        let tags = crate::dependencies::Git::output(&["tag", "--list"], work.path())
+            .expect("git should spawn");
+        assert!(tags.status.success());
+        assert_eq!(String::from_utf8_lossy(&tags.stdout).trim(), "");
 
         // The refs arrived, but nothing was checked out: the work tree has no
         // file.txt and no local branch moved.
