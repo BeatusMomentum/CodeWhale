@@ -359,7 +359,7 @@ fn classify(
         // provider name: a custom `[providers.openai_codex] base_url` (a
         // gateway, a proxy) sells its own terms, so it is Unknown rather than
         // a subscription that would hide metered spend.
-        ApiProvider::OpenaiCodex if is_chatgpt_codex_backend(base_url) => {
+        ApiProvider::OpenaiCodex if crate::pricing::is_chatgpt_codex_backend(base_url) => {
             BillingPresentation::Subscription("Codex OAuth quota")
         }
         ApiProvider::OpenaiCodex => BillingPresentation::Unknown,
@@ -613,20 +613,6 @@ fn stepfun_billing_for_endpoint(base_url: Option<&str>) -> BillingPresentation {
         }
         _ => BillingPresentation::Unknown,
     }
-}
-
-/// The ChatGPT backend the Codex OAuth route ships with
-/// (`https://chatgpt.com/backend-api`, or a path under it).
-fn is_chatgpt_codex_backend(base_url: &str) -> bool {
-    let Ok(url) = reqwest::Url::parse(base_url.trim()) else {
-        return false;
-    };
-    let path = url.path().trim_end_matches('/');
-    url.scheme() == "https"
-        && url.host_str() == Some("chatgpt.com")
-        && url.port().is_none()
-        && url.username().is_empty()
-        && (path == "/backend-api" || path.starts_with("/backend-api/"))
 }
 
 fn is_zai_coding_plan_endpoint(base_url: &str) -> bool {
@@ -2441,7 +2427,24 @@ mod tests {
                 BillingPresentation::Unknown,
                 "{elsewhere:?}"
             );
+            // The persisted billing surface agrees: a custom endpoint is not
+            // an OAuth subscription that would drop out of money coverage.
+            if !elsewhere.is_empty() {
+                assert_eq!(
+                    billing_surface_for_dispatch(None, ApiProvider::OpenaiCodex, Some(elsewhere)),
+                    Some(crate::pricing::UNCLASSIFIED_BILLING_SURFACE),
+                    "{elsewhere:?}"
+                );
+            }
         }
+        assert_eq!(
+            billing_surface_for_dispatch(
+                None,
+                ApiProvider::OpenaiCodex,
+                Some("https://chatgpt.com/backend-api/codex")
+            ),
+            Some(crate::pricing::OAUTH_SUBSCRIPTION_BILLING_SURFACE)
+        );
     }
 
     #[test]

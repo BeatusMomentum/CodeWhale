@@ -399,6 +399,22 @@ fn host_of(url: &str) -> Option<String> {
         .map(str::to_ascii_lowercase)
 }
 
+/// The ChatGPT backend the Codex OAuth route ships with
+/// (`https://chatgpt.com/backend-api`, or a path under it). Only this endpoint
+/// carries the Codex OAuth quota; the billing surface and the route
+/// presentation both decide from it.
+pub(crate) fn is_chatgpt_codex_backend(base_url: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(base_url.trim()) else {
+        return false;
+    };
+    let path = url.path().trim_end_matches('/');
+    url.scheme() == "https"
+        && url.host_str() == Some("chatgpt.com")
+        && url.port().is_none()
+        && url.username().is_empty()
+        && (path == "/backend-api" || path.starts_with("/backend-api/"))
+}
+
 /// Reduce a concrete request endpoint to non-secret billing provenance.
 ///
 /// Every reachable endpoint now gets a positive classification, including
@@ -421,8 +437,19 @@ pub(crate) fn billing_surface_for_route(
         // of PAYG dollars: keep it in money coverage as unclassified until an
         // authoritative billing surface is available.
         ApiProvider::OllamaCloud => return Some(UNCLASSIFIED_BILLING_SURFACE),
-        ApiProvider::OpenaiCodex | ApiProvider::OpencodeGo => {
-            return Some(OAUTH_SUBSCRIPTION_BILLING_SURFACE);
+        ApiProvider::OpencodeGo => return Some(OAUTH_SUBSCRIPTION_BILLING_SURFACE),
+        // The Codex OAuth quota is a fact of the ChatGPT backend, not of the
+        // provider name: a custom endpoint (a gateway, a proxy) sells its own
+        // terms, so it is unclassified rather than a subscription that would
+        // drop its spend out of money coverage. No endpoint at all keeps the
+        // provider default, which is the ChatGPT backend.
+        ApiProvider::OpenaiCodex => {
+            return Some(
+                match base_url.map(str::trim).filter(|url| !url.is_empty()) {
+                    Some(url) if !is_chatgpt_codex_backend(url) => UNCLASSIFIED_BILLING_SURFACE,
+                    _ => OAUTH_SUBSCRIPTION_BILLING_SURFACE,
+                },
+            );
         }
         // A named custom endpoint is never assumed to be metered; the billing
         // presentation layer decides that from explicit config.
