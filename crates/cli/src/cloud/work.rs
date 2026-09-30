@@ -143,7 +143,7 @@ pub(super) fn assign<T: CloudTransport, W: Write>(
         .map_err(|err| {
             if outcome_unknown(&err) {
                 err.context(format!(
-                    "The request may or may not have reached Codewhale. Re-run this exact command with --message-id {message_id}; it is replay-safe and never creates duplicate Work"
+                    "The request may or may not have reached Codewhale. Re-run this exact command with --message-id {message_id}; replaying the same --message-id never creates a second Work for the same instruction. If the message was a stop or a correction, check `work-status` first"
                 ))
             } else {
                 err
@@ -959,12 +959,23 @@ pub(super) fn launch<T: CloudTransport, W: Write>(
     if !matches!(response.status, 200..=202) {
         return Err(refused(response_error(&response)));
     }
-    let session = parse_reply(
+    let reply = parse_reply(
         &response.body,
         "The Codewhale service returned an unreadable launch reply",
     )
     .map_err(refused)?;
-    if str_at(&session, &["run", "id"]) != Some(id) {
+    // The service acted, so a reply without its `session` document is an
+    // unknown outcome, not a success and not a different Work.
+    let Some(session) = reply.get("session").filter(|value| value.is_object()) else {
+        return Err(refused(
+            CloudTransportError::new(
+                "The Codewhale service returned a launch reply without a session",
+                std::io::Error::other("missing session"),
+            )
+            .into(),
+        ));
+    };
+    if str_at(session, &["run", "id"]) != Some(id) {
         bail!(
             "The Codewhale service launched a different Work than requested. Run `codewhale account agents work-status {id}` before doing anything else"
         );
@@ -974,31 +985,31 @@ pub(super) fn launch<T: CloudTransport, W: Write>(
     writeln!(
         out,
         "Status: {}",
-        text_at(&session, &["run", "state"]).unwrap_or_else(|| "unknown".to_string())
+        text_at(session, &["run", "state"]).unwrap_or_else(|| "unknown".to_string())
     )?;
-    if let Some(session_id) = text_at(&session, &["id"]) {
+    if let Some(session_id) = text_at(session, &["id"]) {
         writeln!(out, "Session: {session_id}")?;
     }
-    if let Some(provider) = text_at(&session, &["sandbox", "provider"]) {
+    if let Some(provider) = text_at(session, &["sandbox", "provider"]) {
         writeln!(
             out,
             "Computer: {provider} ({})",
-            text_at(&session, &["sandbox", "status"])
+            text_at(session, &["sandbox", "status"])
                 .unwrap_or_else(|| "status unknown".to_string())
         )?;
     }
-    if let Some(region) = text_at(&session, &["sandboxTargetRegion"]) {
+    if let Some(region) = text_at(session, &["sandboxTargetRegion"]) {
         writeln!(out, "Compute region: {region}")?;
     }
     if let Some(charged) =
-        at(&session, &["quote", "customerCreditsChargedUsd"]).and_then(Value::as_f64)
+        at(session, &["quote", "customerCreditsChargedUsd"]).and_then(Value::as_f64)
     {
         writeln!(out, "Codewhale credits charged: {}", usd(charged))?;
     }
-    if let Some(attempt) = text_at(&session, &["attempt", "status"]) {
+    if let Some(attempt) = text_at(session, &["attempt", "status"]) {
         writeln!(out, "Attempt: {attempt}")?;
     }
-    if let Some(turn) = text_at(&session, &["initialTurn", "status"]) {
+    if let Some(turn) = text_at(session, &["initialTurn", "status"]) {
         writeln!(out, "First turn: {turn} (not complete yet)")?;
     }
     writeln!(out, "Operation key: {operation_key}")?;

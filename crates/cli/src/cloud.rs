@@ -240,7 +240,9 @@ enum CloudAgentsCommand {
     /// command such as "stop" is applied to its active Work, a correction
     /// edits that Work's objective, and a question changes nothing. The
     /// output states which happened. If the reply is lost, re-run the same
-    /// command with the same --message-id; it never creates a duplicate.
+    /// command with the same --message-id; that never creates a second Work for
+    /// the same instruction. If the message was a stop or a correction, check
+    /// `work-status` first.
     Work {
         agent: String,
         objective: String,
@@ -1159,7 +1161,18 @@ impl<'a, T: CloudTransport> CloudClient<'a, T> {
                 "text": objective,
             }))?),
         )?;
-        expect_json(response, &[200, 201, 202])
+        if ![200, 201, 202].contains(&response.status) {
+            return Err(response_error(&response));
+        }
+        // A 2xx the client cannot read means the service acted: an unknown
+        // outcome (replay with the same message id), not a plain failure.
+        serde_json::from_slice(&response.body).map_err(|source| {
+            CloudTransportError::new(
+                "The Codewhale service returned an unreadable reply to this message",
+                source,
+            )
+            .into()
+        })
     }
 
     fn agent_work_status(&self, id: &str) -> Result<serde_json::Value> {
@@ -1499,13 +1512,23 @@ fn validate_model_route<'a>(provider: &'a str, model: &'a str) -> Result<(&'a st
 /// The catalog is served data (`GET /api/model-providers`), so a new model
 /// needs no CLI release and a retired one stops being accepted here. The
 /// message names the catalog and what it does list for the provider.
-fn assert_catalog_route(catalog: &[CatalogProvider], provider: &str, model: &str) -> Result<()> {
+///
+/// Returns the row's canonical id: the control plane stores that id even when
+/// the caller named the runtime alias (`xiaomi-mimo` for `xiaomi`), so it is
+/// the value to send and to compare the created conversation against.
+fn assert_catalog_route<'a>(
+    catalog: &'a [CatalogProvider],
+    provider: &str,
+    model: &str,
+) -> Result<&'a str> {
     let row = catalog.iter().find(|row| {
         row.connection_available != Some(false)
             && (row.id == provider || row.runtime_provider.as_deref() == Some(provider))
     });
-    if row.is_some_and(|row| row.models.iter().any(|listed| listed == model)) {
-        return Ok(());
+    if let Some(row) = row
+        && row.models.iter().any(|listed| listed == model)
+    {
+        return Ok(row.id.as_str());
     }
     let listed = match row {
         Some(row) if !row.models.is_empty() => format!(
@@ -1891,7 +1914,8 @@ fn run_agents<T: CloudTransport, W: Write>(
             // route the live catalog does not list is refused before anything
             // is created rather than accepted and discovered at first send.
             let (route_provider, route_model) = validate_model_route(&provider, &model)?;
-            assert_catalog_route(&client.provider_catalog()?, route_provider, route_model)?;
+            let catalog = client.provider_catalog()?;
+            let route_provider = assert_catalog_route(&catalog, route_provider, route_model)?;
             let thread = client.create_agent_thread(
                 &selected.id,
                 if project_id.is_empty() {
@@ -1900,8 +1924,8 @@ fn run_agents<T: CloudTransport, W: Write>(
                     Some(project_id)
                 },
                 &title,
-                &provider,
-                &model,
+                route_provider,
+                route_model,
                 &operation_key,
             )?;
             if !active_agent_thread(&thread, &selected.id) {

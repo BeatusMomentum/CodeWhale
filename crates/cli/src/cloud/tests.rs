@@ -3316,8 +3316,9 @@ fn boat_quote() -> serde_json::Value {
     })
 }
 
+/// POST /api/cloud-sessions replies `{ "session": {...} }`.
 fn cloud_session() -> serde_json::Value {
-    json!({
+    json!({ "session": {
         "id": format!("session_{WORK_ID}"),
         "run": { "id": WORK_ID, "state": "planning" },
         "attempt": { "status": "accepted" },
@@ -3325,7 +3326,7 @@ fn cloud_session() -> serde_json::Value {
         "sandboxTargetRegion": "eu",
         "quote": { "customerCreditsChargedUsd": 0 },
         "initialTurn": { "status": "queued" }
-    })
+    } })
 }
 
 const QUOTE_ARGV: [&str; 7] = [
@@ -3611,6 +3612,15 @@ fn work_transport_and_server_failures_point_at_the_same_message_id() {
             agents_step(),
             reply(503, json!({ "code": "runtime_unavailable" })),
         ],
+        // A truncated 2xx: the service acted, so the same hint applies.
+        vec![
+            agents_step(),
+            Scripted::Reply(CloudResponse {
+                status: 201,
+                body: b"{\"intent\":".to_vec(),
+                retry_after: None,
+            }),
+        ],
     ] {
         let transport = ScriptedTransport::new(lost);
         let (result, output) = run_work(&transport, &secrets);
@@ -3620,6 +3630,10 @@ fn work_transport_and_server_failures_point_at_the_same_message_id() {
             "{message}"
         );
         assert!(message.contains("--message-id work-1"), "{message}");
+        assert!(
+            message.contains("never creates a second Work for the same instruction"),
+            "{message}"
+        );
         assert!(output.is_empty());
         assert!(!message.contains("access-secret") && !message.contains("refresh-secret"));
     }
@@ -4243,11 +4257,28 @@ fn work_launch_reports_unknown_and_refused_outcomes_without_guessing() {
 
     // A reply about another Work is never presented as this launch.
     let mut other = cloud_session();
-    other["run"]["id"] = json!("22222222-2222-4222-8222-222222222222");
+    other["session"]["run"]["id"] = json!("22222222-2222-4222-8222-222222222222");
     let transport = ScriptedTransport::new(steps(reply(201, other)));
     let (result, output) = run_agent_command(&transport, &secrets, &LAUNCH_ARGV);
     assert!(chain(&result.unwrap_err()).contains("launched a different Work"));
     assert!(!output.contains("Work launched"));
+
+    // A 2xx without the `session` document (or with a non-object one) means the
+    // service acted but the client cannot say how: an unknown outcome, never a
+    // success and never "a different Work".
+    for missing in [
+        json!({}),
+        json!({ "session": "nope" }),
+        cloud_session()["session"].clone(),
+    ] {
+        let transport = ScriptedTransport::new(steps(reply(201, missing)));
+        let (result, output) = run_agent_command(&transport, &secrets, &LAUNCH_ARGV);
+        let message = chain(&result.unwrap_err());
+        assert!(message.contains("launch outcome is unknown"), "{message}");
+        assert!(message.contains("without a session"), "{message}");
+        assert!(!message.contains("different Work"), "{message}");
+        assert!(!output.contains("Work launched"));
+    }
 }
 
 fn binding(id: &str, repo: &str, installation: &str, status: &str) -> serde_json::Value {
@@ -4489,6 +4520,45 @@ fn new_thread_refuses_a_route_the_live_catalog_does_not_list() {
     let (result, _) = run_agent_command(&transport, &secrets, &argv("deepseek", "deepseek-flash"));
     result.unwrap_err();
     assert_eq!(transport.requests().len(), 2);
+}
+
+#[test]
+fn new_thread_sends_the_canonical_route_id_when_given_a_runtime_alias() {
+    // `xiaomi-mimo` is the runtime name of the catalog row `xiaomi`; the server
+    // stores `xiaomi`, so the preflight must resolve to it before creating.
+    let secrets = signed_in();
+    let argv = [
+        "codewhale",
+        "account",
+        "agents",
+        "new-thread",
+        "Whale",
+        "--provider",
+        "xiaomi-mimo",
+        "--model",
+        "mimo-v2",
+        "--operation-key",
+        "thread-1",
+    ];
+    let catalog = json!({ "providers": [{
+        "id": "xiaomi",
+        "runtimeProvider": "xiaomi-mimo",
+        "connectionAvailable": true,
+        "models": ["mimo-v2"]
+    }] });
+    let mut created = agent_thread("thread-1", "agent-1", "Main");
+    created["modelProvider"] = json!("xiaomi");
+    created["model"] = json!("mimo-v2");
+    let transport = ScriptedTransport::new(vec![
+        agents_step(),
+        reply(200, catalog),
+        reply(201, json!({ "thread": created })),
+    ]);
+    let (result, output) = run_agent_command(&transport, &secrets, &argv);
+    result.unwrap();
+    let requests = transport.requests();
+    assert_eq!(body_of(&requests[2])["modelProvider"], "xiaomi");
+    assert!(output.contains("Model: xiaomi/mimo-v2"), "{output}");
 }
 
 #[test]
