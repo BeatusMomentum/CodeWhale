@@ -101,7 +101,9 @@ fn read_capture(capture: &Path, hook: &str) -> Value {
         .map(|field| String::from_utf8_lossy(field).into_owned())
         .collect();
     let env: serde_json::Map<String, Value> = fields
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .filter(|pair| HOOK_ENV_CONTRACT.contains(&pair[0].as_str()))
         .map(|pair| (pair[0].clone(), Value::String(pair[1].clone())))
         .collect();
