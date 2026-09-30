@@ -41,7 +41,10 @@ runner for a fact about the machine, not the Engine. A case that omits the
 field fails loud. The same record carries `os` and `shell` (`macos`, `/bin/bash`: the shell
 dispatcher names the recording process's `$SHELL` path verbatim),
 which the `## Environment` block renders into the frozen prompt prefix and so
-into `prefix_cache_change`'s prefix hash; the harness replays those too.
+into `prefix_cache_change`'s prefix hash; the harness replays those too, and
+`host_tools`: the optional tools whose backend the recording machine had
+(`code_execution`, `js_execution`, `pandoc_convert`, `image_ocr`), which
+change the registry the `tool_request_snapshot` counts.
 Production always probes the host. The per-platform label
 text is owned and tested in `sandbox::policy`. All current cases were
 recorded on macOS. A Linux- or Windows-recorded golden is separate evidence.

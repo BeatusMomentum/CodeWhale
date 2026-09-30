@@ -9,7 +9,13 @@
     "os": "macos",
     "shell": "/bin/bash",
     "sandbox_enforcement": "local_os",
-    "no_new_privs_active": null
+    "no_new_privs_active": null,
+    "host_tools": [
+      "code_execution",
+      "image_ocr",
+      "js_execution",
+      "pandoc_convert"
+    ]
   },
   "user_message": "make a plan",
   "workspace_files": {

@@ -288,6 +288,7 @@ fn run_scripted_turn_with_deadline(
     // Held across the whole turn: the engine builds and refreshes its system
     // prompt on this thread's current-thread runtime.
     let _environment = crate::prompts::pin_recorded_environment(&os, &shell);
+    let _host_tools = crate::dependencies::pin_recorded_host_tools(recorded_host_tools(case));
     let record = runtime.block_on(async {
         let config = Config::default();
         let engine_config = EngineConfig {
@@ -353,6 +354,23 @@ fn recorded_environment(case: &Value) -> (String, String) {
             .to_string()
     };
     (field("os"), field("shell"))
+}
+
+/// The optional host-backed tools the recording machine had (see
+/// `dependencies::host_tool_available`). They change the registry the golden
+/// snapshot counts; a case without the list fails loud.
+fn recorded_host_tools(case: &Value) -> Vec<String> {
+    case.get("recorded_platform")
+        .and_then(|platform| platform.get("host_tools"))
+        .and_then(Value::as_array)
+        .expect("recorded_platform.host_tools must list the recording host's optional tools")
+        .iter()
+        .map(|tool| {
+            tool.as_str()
+                .expect("recorded_platform.host_tools entries are tool names")
+                .to_string()
+        })
+        .collect()
 }
 
 /// Run one turn and return every engine event up to and including

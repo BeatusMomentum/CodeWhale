@@ -310,7 +310,9 @@ pub(crate) fn ensure_advanced_tooling(
     // `crate::dependencies::resolve_python_interpreter` for the probe.
     if mode != AppMode::Plan
         && !catalog.iter().any(|t| t.name == CODE_EXECUTION_TOOL_NAME)
-        && crate::dependencies::resolve_python_interpreter().is_some()
+        && crate::dependencies::host_tool_available(CODE_EXECUTION_TOOL_NAME, || {
+            crate::dependencies::resolve_python_interpreter().is_some()
+        })
     {
         catalog.push(Tool {
             tool_type: Some(CODE_EXECUTION_TOOL_TYPE.to_string()),
@@ -341,7 +343,9 @@ pub(crate) fn ensure_advanced_tooling(
     // the tool only when `resolve_node()` succeeds.
     if mode != AppMode::Plan
         && !catalog.iter().any(|t| t.name == JS_EXECUTION_TOOL_NAME)
-        && crate::dependencies::resolve_node().is_some()
+        && crate::dependencies::host_tool_available(JS_EXECUTION_TOOL_NAME, || {
+            crate::dependencies::resolve_node().is_some()
+        })
     {
         let mut tool = crate::tools::js_execution::js_execution_tool_definition();
         tool.defer_loading = Some(should_default_defer_tool(&tool.name, always_load));

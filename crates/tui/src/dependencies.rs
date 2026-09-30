@@ -269,6 +269,46 @@ pub fn resolve_pandoc() -> Option<String> {
         .clone()
 }
 
+/// Whether an optional tool whose backend lives on this host (an interpreter,
+/// a converter, an OCR engine) is available: `probe` decides, except that a
+/// conformance replay answers with the recorded host's set so goldens do not
+/// depend on what the machine running them has installed (test builds only).
+pub(crate) fn host_tool_available(tool: &str, probe: impl FnOnce() -> bool) -> bool {
+    #[cfg(all(test, unix))]
+    if let Some(available) = RECORDED_HOST_TOOLS.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .map(|tools| tools.iter().any(|name| name == tool))
+    }) {
+        return available;
+    }
+    probe()
+}
+
+#[cfg(all(test, unix))]
+thread_local! {
+    static RECORDED_HOST_TOOLS: std::cell::RefCell<Option<Vec<String>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Pin [`host_tool_available`] on this thread to a recorded host's tools until
+/// the guard drops.
+#[cfg(all(test, unix))]
+pub(crate) fn pin_recorded_host_tools(tools: Vec<String>) -> RecordedHostToolsGuard {
+    RECORDED_HOST_TOOLS.with(|cell| *cell.borrow_mut() = Some(tools));
+    RecordedHostToolsGuard
+}
+
+#[cfg(all(test, unix))]
+pub(crate) struct RecordedHostToolsGuard;
+
+#[cfg(all(test, unix))]
+impl Drop for RecordedHostToolsGuard {
+    fn drop(&mut self) {
+        RECORDED_HOST_TOOLS.with(|cell| *cell.borrow_mut() = None);
+    }
+}
+
 /// Resolve the Node.js runtime once per process. Used by the
 /// `js_execution` tool to decide whether to advertise itself in
 /// the catalog. Unlike Python, the executable name `node` is the

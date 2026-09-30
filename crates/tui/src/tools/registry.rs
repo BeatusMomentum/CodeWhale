@@ -932,7 +932,9 @@ impl ToolRegistryBuilder {
     /// sees a binary it can't actually use.
     #[must_use]
     pub fn with_pandoc_tools(self) -> Self {
-        if crate::dependencies::resolve_pandoc().is_some() {
+        if crate::dependencies::host_tool_available("pandoc_convert", || {
+            crate::dependencies::resolve_pandoc().is_some()
+        }) {
             use super::pandoc::PandocConvertTool;
             self.with_tool(Arc::new(PandocConvertTool))
         } else {
@@ -945,7 +947,7 @@ impl ToolRegistryBuilder {
     /// Tesseract when installed.
     #[must_use]
     pub fn with_image_ocr_tools(self) -> Self {
-        if super::image_ocr::ocr_available() {
+        if crate::dependencies::host_tool_available("image_ocr", super::image_ocr::ocr_available) {
             use super::image_ocr::ImageOcrTool;
             self.with_tool(Arc::new(ImageOcrTool))
         } else {
