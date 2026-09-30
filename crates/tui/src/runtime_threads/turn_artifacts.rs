@@ -156,11 +156,10 @@ fn relative_display(rel: &Path) -> Option<String> {
         let Component::Normal(name) = component else {
             return None;
         };
-        let name = name.to_str()?;
-        if name == ".git" {
+        if crate::snapshot::is_git_metadata_name(name) {
             return None;
         }
-        parts.push(name);
+        parts.push(name.to_str()?);
     }
     (!parts.is_empty()).then(|| parts.join("/"))
 }

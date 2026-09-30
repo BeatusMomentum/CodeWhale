@@ -913,11 +913,9 @@ impl SnapshotRepo {
     /// Validate every existing component before reading, backing up or writing.
     pub fn validate_restore_file(&self, rel: &Path) -> io::Result<bool> {
         if !is_safe_relative_path(rel)
-            || rel.components().any(|part| {
-                part.as_os_str()
-                    .as_encoded_bytes()
-                    .eq_ignore_ascii_case(b".git")
-            })
+            || rel
+                .components()
+                .any(|part| is_git_metadata_name(part.as_os_str()))
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -2278,6 +2276,35 @@ fn is_safe_relative_path(path: &Path) -> bool {
             .all(|component| matches!(component, Component::Normal(_)))
 }
 
+/// Whether one path component names the repository metadata directory as the
+/// filesystem resolves it, not just as spelled: `.git` in any letter case
+/// (macOS and Windows default to case-insensitive names) and, on Windows,
+/// with the trailing dots/spaces or `:stream` suffix it drops and the `GIT~N`
+/// short-name alias. The one `.git` rule for workspace file routes, file
+/// restore, displayed workspace paths, the write carve-out and sub-agent
+/// deliverables.
+pub fn is_git_metadata_name(name: &std::ffi::OsStr) -> bool {
+    git_metadata_name(&name.to_string_lossy(), cfg!(windows))
+}
+
+fn git_metadata_name(name: &str, windows: bool) -> bool {
+    let name = if windows {
+        name.split(':')
+            .next()
+            .unwrap_or_default()
+            .trim_end_matches(['.', ' '])
+    } else {
+        name
+    };
+    name.eq_ignore_ascii_case(".git")
+        || (windows
+            && name.len() > 4
+            && name
+                .get(..4)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("git~"))
+            && name[4..].bytes().all(|byte| byte.is_ascii_digit()))
+}
+
 /// Normalize a caller-supplied path into a safe workspace-relative path.
 ///
 /// Accepts either a workspace-relative path or an absolute path inside
@@ -2308,6 +2335,44 @@ mod tests {
     use crate::test_support::lock_test_env;
     use std::fs::{File, FileTimes};
     use tempfile::tempdir;
+
+    #[test]
+    fn git_metadata_name_covers_case_and_windows_aliases() {
+        for windows in [false, true] {
+            for name in [".git", ".GIT", ".Git", ".gIt"] {
+                assert!(git_metadata_name(name, windows), "{name} windows={windows}");
+            }
+            for name in [
+                ".github",
+                ".gitignore",
+                "a.git",
+                "git",
+                "",
+                "git~",
+                "GIT~1a",
+            ] {
+                assert!(
+                    !git_metadata_name(name, windows),
+                    "{name} windows={windows}"
+                );
+            }
+        }
+        // Windows drops trailing dots/spaces and `:stream` suffixes, and
+        // `GIT~N` is the 8.3 short name of `.git`; elsewhere these are
+        // ordinary names.
+        for name in [
+            ".git.",
+            ".git ",
+            ".GIT. .",
+            ".git::$INDEX_ALLOCATION",
+            ".git:stream",
+            "GIT~1",
+            "git~12",
+        ] {
+            assert!(git_metadata_name(name, true), "{name}");
+            assert!(!git_metadata_name(name, false), "{name}");
+        }
+    }
 
     #[test]
     fn snapshot_id_parse_accepts_only_full_hex_object_ids() {
@@ -3183,7 +3248,11 @@ mod tests {
         let id = repo.snapshot("pre-turn:1").expect("snapshot");
         std::fs::write(dir.join("lib.rs"), b"fn b() {}").unwrap();
 
-        for rel in ["src", ".git/config", "src/.GIT/x", ".git"] {
+        let mut refused = vec!["src", ".git/config", "src/.GIT/x", ".git"];
+        if cfg!(windows) {
+            refused.extend([".git./config", ".git /config", "GIT~1/config"]);
+        }
+        for rel in refused {
             let err = repo.validate_restore_file(Path::new(rel)).expect_err(rel);
             assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{rel}");
         }
