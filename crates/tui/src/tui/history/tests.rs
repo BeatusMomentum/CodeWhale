@@ -2566,7 +2566,8 @@ fn a_settled_verify_glyph_does_not_read_as_a_settled_read() {
             RenderMode::Live,
             codewhale_localization::Locale::En,
         )[0]
-        .spans[1]
+        // Rail, shared status mark, then the tool-family identity glyph.
+        .spans[2]
             .clone()
     };
     let verify = glyph(&verify);
