@@ -61,6 +61,8 @@ enum CloudCommand {
     Computers(CloudComputersArgs),
     /// List Projects available to this signed-in Codewhale account.
     Projects(CloudProjectsArgs),
+    /// Inspect GitHub repositories authorized for this account.
+    Github(CloudGithubArgs),
     /// Manage named Agents and their account conversations.
     Agents(CloudAgentsArgs),
     /// Manage Codewhale account API keys: machine tokens for CI.
@@ -128,12 +130,35 @@ struct CloudProjectsArgs {
     command: CloudProjectsCommand,
 }
 
+#[derive(Debug, Args)]
+struct CloudGithubArgs {
+    #[command(subcommand)]
+    command: CloudGithubCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum CloudGithubCommand {
+    /// List repository bindings saved by GitHub App installation.
+    Bindings {
+        #[arg(long)]
+        json: bool,
+    },
+}
+
 #[derive(Debug, Subcommand)]
 enum CloudProjectsCommand {
     /// List account Projects; use an ID when binding an Agent.
     List {
         #[arg(long)]
         json: bool,
+    },
+    /// Create a Project from a GitHub repository already connected to this account.
+    Create {
+        name: String,
+        #[arg(long)]
+        repo_binding_id: String,
+        #[arg(long)]
+        operation_key: String,
     },
 }
 
@@ -310,11 +335,36 @@ struct ComputerDeleteResponse {
 struct AccountProject {
     id: String,
     name: String,
+    #[serde(rename = "defaultRepoProvider", default)]
+    default_repo_provider: String,
+    #[serde(rename = "defaultRepo", default)]
+    default_repo: String,
 }
 
 #[derive(Deserialize)]
 struct ProjectListResponse {
     projects: Vec<AccountProject>,
+}
+
+#[derive(Deserialize)]
+struct ProjectResponse {
+    project: AccountProject,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AccountGitHubBinding {
+    id: String,
+    provider: String,
+    repo: String,
+    status: String,
+    #[serde(default)]
+    installation_id: String,
+}
+
+#[derive(Deserialize)]
+struct GitHubBindingListResponse {
+    bindings: Vec<AccountGitHubBinding>,
 }
 
 #[derive(Serialize)]
@@ -746,6 +796,49 @@ impl<'a, T: CloudTransport> CloudClient<'a, T> {
     fn projects(&self) -> Result<serde_json::Value> {
         let response = self.execute_authenticated(HttpMethod::Get, "/api/projects", None)?;
         expect_json(response, &[200])
+    }
+
+    fn github_bindings(&self) -> Result<serde_json::Value> {
+        let response =
+            self.execute_authenticated(HttpMethod::Get, "/api/integrations/github/bindings", None)?;
+        if matches!(response.status, 404 | 503) {
+            return Err(response_error(&response)).context(
+                "GitHub repository bindings are unavailable on this Codewhale API; the account GitHub route must be attached before CLI setup",
+            );
+        }
+        expect_json(response, &[200])
+    }
+
+    fn create_github_project(
+        &self,
+        name: &str,
+        binding: &AccountGitHubBinding,
+        operation_key: &str,
+    ) -> Result<AccountProject> {
+        let name = validate_named_text(name, "Project name", 80)?;
+        let operation_key = validate_operation_key(operation_key)?;
+        let response = self.execute_authenticated(
+            HttpMethod::Post,
+            "/api/projects",
+            Some(json_body(&serde_json::json!({
+                "name": name,
+                "defaultMode": "chat",
+                "chatFilesystem": "optional_scratch",
+                "repoBindingId": binding.id,
+                "operationKey": operation_key,
+            }))?),
+        )?;
+        let result: ProjectResponse = expect_json(response, &[200, 201])?;
+        validate_resource_id(&result.project.id, "Project")?;
+        if result.project.default_repo_provider != "github"
+            || !result
+                .project
+                .default_repo
+                .eq_ignore_ascii_case(&binding.repo)
+        {
+            bail!("The Codewhale service returned a Project for a different GitHub repository");
+        }
+        Ok(result.project)
     }
 
     fn create_agent(
@@ -1334,6 +1427,90 @@ fn run_projects<T: CloudTransport, W: Write>(
             for project in listing.projects {
                 validate_resource_id(&project.id, "Project")?;
                 writeln!(out, "{} — {}", printable(&project.name), project.id)?;
+            }
+            Ok(())
+        }
+        CloudProjectsCommand::Create {
+            name,
+            repo_binding_id,
+            operation_key,
+        } => {
+            let listing: GitHubBindingListResponse =
+                serde_json::from_value(client.github_bindings()?)
+                    .context("The Codewhale service returned an invalid GitHub repository list")?;
+            let binding = listing
+                .bindings
+                .iter()
+                .find(|binding| binding.id == repo_binding_id)
+                .ok_or_else(|| anyhow!(
+                    "GitHub binding {} is not connected to this account. Run `codewhale account github bindings`",
+                    printable(&repo_binding_id)
+                ))?;
+            if binding.provider != "github"
+                || binding.installation_id.is_empty()
+                || ["error", "revoked", "suspended", "disabled"]
+                    .contains(&binding.status.to_ascii_lowercase().as_str())
+            {
+                bail!(
+                    "That GitHub binding is unavailable for a Project. Reconnect the repository, then run `codewhale account github bindings`"
+                );
+            }
+            let project = client.create_github_project(&name, binding, &operation_key)?;
+            writeln!(out, "Project: {}", printable(&project.name))?;
+            writeln!(out, "ID: {}", project.id)?;
+            writeln!(
+                out,
+                "GitHub repository: {}",
+                printable(&project.default_repo)
+            )?;
+            writeln!(
+                out,
+                "Assign a Whale: codewhale account agents bind-project AGENT {}",
+                project.id
+            )?;
+            Ok(())
+        }
+    }
+}
+
+fn run_github<T: CloudTransport, W: Write>(
+    command: CloudGithubCommand,
+    client: &CloudClient<'_, T>,
+    machine: &machine::MachineKeyEnv,
+    out: &mut W,
+) -> Result<()> {
+    if machine.is_present() {
+        bail!(
+            "GitHub bindings require an interactive Codewhale account login; unset CODEWHALE_API_KEY and run `codewhale login`"
+        );
+    }
+    match command {
+        CloudGithubCommand::Bindings { json } => {
+            let response = client.github_bindings()?;
+            if json {
+                return write_computer_json(out, &response);
+            }
+            let listing: GitHubBindingListResponse = serde_json::from_value(response)
+                .context("The Codewhale service returned an invalid GitHub repository list")?;
+            writeln!(out, "GitHub repositories ({})", listing.bindings.len())?;
+            if listing.bindings.is_empty() {
+                writeln!(
+                    out,
+                    "No GitHub repositories are connected to this account. Authorize one in Codewhale's GitHub setup, then retry."
+                )?;
+            }
+            for binding in listing.bindings {
+                if binding.provider != "github" || binding.id.is_empty() || binding.repo.is_empty()
+                {
+                    bail!("The Codewhale service returned an invalid GitHub repository binding");
+                }
+                writeln!(
+                    out,
+                    "{} — {} ({})",
+                    printable(&binding.repo),
+                    printable(&binding.id),
+                    printable(&binding.status)
+                )?;
             }
             Ok(())
         }
@@ -1946,6 +2123,7 @@ fn run_with<T: CloudTransport, W: Write>(
             run_computers(computers.command, &client, machine, out)
         }
         CloudCommand::Projects(projects) => run_projects(projects.command, &client, machine, out),
+        CloudCommand::Github(github) => run_github(github.command, &client, machine, out),
         CloudCommand::Agents(agents) => run_agents(agents.command, &client, machine, out),
         CloudCommand::ApiKeys(api_keys) => {
             machine::run_api_keys(api_keys, &client, machine, provider_secrets, out, sleeper)

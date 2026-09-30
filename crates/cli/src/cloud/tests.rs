@@ -216,6 +216,28 @@ fn parses_cloud_command_matrix_and_rejects_inline_keys() {
         })
     ));
     assert!(matches!(
+        command(&["codewhale", "account", "github", "bindings"]),
+        CloudCommand::Github(CloudGithubArgs {
+            command: CloudGithubCommand::Bindings { json: false }
+        })
+    ));
+    assert!(matches!(
+        command(&[
+            "codewhale",
+            "account",
+            "projects",
+            "create",
+            "My Project",
+            "--repo-binding-id",
+            "github:acct-123:987:owner/repo",
+            "--operation-key",
+            "project-create-1",
+        ]),
+        CloudCommand::Projects(CloudProjectsArgs {
+            command: CloudProjectsCommand::Create { .. }
+        })
+    ));
+    assert!(matches!(
         command(&[
             "codewhale",
             "account",
@@ -2306,6 +2328,216 @@ fn account_projects_list_and_agent_binding_use_the_saved_revision() {
     let output = String::from_utf8(output).unwrap();
     assert!(output.contains("Codewhale — project-codewhale"));
     assert!(output.contains("Agent Whale is bound to Project project-codewhale."));
+}
+
+#[test]
+fn account_github_binding_creates_a_project_from_the_same_repository() {
+    let (secrets, _) = test_secrets();
+    CloudClient::new(
+        &FakeTransport::new(vec![]),
+        &secrets,
+        "default",
+        DEFAULT_API_BASE,
+    )
+    .save_auth(auth("access-secret", "refresh-secret", "acct-123"))
+    .unwrap();
+    let binding_id = "github:acct-123:987:owner/repo";
+    let binding = json!({
+        "id": binding_id,
+        "provider": "github",
+        "repo": "owner/repo",
+        "status": "bound",
+        "installationId": "987",
+    });
+    let transport = FakeTransport::new(vec![
+        response(200, json!({ "bindings": [binding.clone()] })),
+        response(200, json!({ "bindings": [binding] })),
+        response(
+            201,
+            json!({ "project": {
+            "id": "project-github", "name": "My Project",
+            "defaultRepoProvider": "github", "defaultRepo": "owner/repo",
+        } }),
+        ),
+    ]);
+    let client = CloudClient::new(&transport, &secrets, "default", DEFAULT_API_BASE);
+    let mut output = Vec::new();
+    run_github(
+        CloudGithubCommand::Bindings { json: false },
+        &client,
+        &machine::MachineKeyEnv::default(),
+        &mut output,
+    )
+    .unwrap();
+    run_projects(
+        CloudProjectsCommand::Create {
+            name: "My Project".into(),
+            repo_binding_id: binding_id.into(),
+            operation_key: "project-create-1".into(),
+        },
+        &client,
+        &machine::MachineKeyEnv::default(),
+        &mut output,
+    )
+    .unwrap();
+    let requests = transport.requests();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[0].path, "/api/integrations/github/bindings");
+    assert_eq!(requests[1].path, "/api/integrations/github/bindings");
+    assert_eq!(requests[2].path, "/api/projects");
+    assert_eq!(requests[2].method, HttpMethod::Post);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(requests[2].body.as_ref().unwrap()).unwrap(),
+        json!({
+            "name": "My Project", "defaultMode": "chat", "chatFilesystem": "optional_scratch",
+            "repoBindingId": binding_id, "operationKey": "project-create-1",
+        })
+    );
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.bearer.as_deref() == Some("access-secret"))
+    );
+    let output = String::from_utf8(output).unwrap();
+    assert!(output.contains("owner/repo — github:acct-123:987:owner/repo (bound)"));
+    assert!(output.contains("GitHub repository: owner/repo"));
+    assert!(output.contains("agents bind-project AGENT project-github"));
+    assert!(!output.contains("access-secret"));
+}
+
+#[test]
+fn account_github_project_setup_refuses_missing_or_inactive_bindings_before_write() {
+    let (secrets, _) = test_secrets();
+    CloudClient::new(
+        &FakeTransport::new(vec![]),
+        &secrets,
+        "default",
+        DEFAULT_API_BASE,
+    )
+    .save_auth(auth("access-secret", "refresh-secret", "acct-123"))
+    .unwrap();
+    let command = |repo_binding_id: &str| CloudProjectsCommand::Create {
+        name: "My Project".into(),
+        repo_binding_id: repo_binding_id.into(),
+        operation_key: "project-create-1".into(),
+    };
+    let missing = FakeTransport::new(vec![response(200, json!({ "bindings": [] }))]);
+    let error = run_projects(
+        command("github:missing:repo"),
+        &CloudClient::new(&missing, &secrets, "default", DEFAULT_API_BASE),
+        &machine::MachineKeyEnv::default(),
+        &mut Vec::new(),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("not connected to this account"));
+    assert_eq!(missing.requests().len(), 1);
+
+    let empty = FakeTransport::new(vec![response(200, json!({ "bindings": [] }))]);
+    let mut output = Vec::new();
+    run_github(
+        CloudGithubCommand::Bindings { json: false },
+        &CloudClient::new(&empty, &secrets, "default", DEFAULT_API_BASE),
+        &machine::MachineKeyEnv::default(),
+        &mut output,
+    )
+    .unwrap();
+    assert!(
+        String::from_utf8(output)
+            .unwrap()
+            .contains("No GitHub repositories are connected")
+    );
+
+    let revoked = FakeTransport::new(vec![response(
+        200,
+        json!({ "bindings": [{
+        "id": "github:revoked:repo", "provider": "github", "repo": "owner/repo",
+        "status": "revoked", "installationId": "987",
+    }] }),
+    )]);
+    let error = run_projects(
+        command("github:revoked:repo"),
+        &CloudClient::new(&revoked, &secrets, "default", DEFAULT_API_BASE),
+        &machine::MachineKeyEnv::default(),
+        &mut Vec::new(),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("unavailable for a Project"));
+    assert_eq!(revoked.requests().len(), 1);
+}
+
+#[test]
+fn account_github_setup_reports_unattached_api_and_rejects_wrong_project_receipt() {
+    let (secrets, _) = test_secrets();
+    CloudClient::new(
+        &FakeTransport::new(vec![]),
+        &secrets,
+        "default",
+        DEFAULT_API_BASE,
+    )
+    .save_auth(auth("access-secret", "refresh-secret", "acct-123"))
+    .unwrap();
+    let unavailable = FakeTransport::new(vec![response(
+        503,
+        json!({ "code": "control_plane_not_attached" }),
+    )]);
+    let error = run_github(
+        CloudGithubCommand::Bindings { json: false },
+        &CloudClient::new(&unavailable, &secrets, "default", DEFAULT_API_BASE),
+        &machine::MachineKeyEnv::default(),
+        &mut Vec::new(),
+    )
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("GitHub repository bindings are unavailable")
+    );
+
+    let machine_only = FakeTransport::new(vec![]);
+    let error = run_github(
+        CloudGithubCommand::Bindings { json: false },
+        &CloudClient::new(&machine_only, &secrets, "default", DEFAULT_API_BASE),
+        &machine::MachineKeyEnv::from_raw(Some("machine-key-present")),
+        &mut Vec::new(),
+    )
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("interactive Codewhale account login")
+    );
+    assert!(machine_only.requests().is_empty());
+
+    let binding_id = "github:acct-123:987:owner/repo";
+    let mismatch = FakeTransport::new(vec![
+        response(
+            200,
+            json!({ "bindings": [{
+            "id": binding_id, "provider": "github", "repo": "owner/repo",
+            "status": "bound", "installationId": "987",
+        }] }),
+        ),
+        response(
+            201,
+            json!({ "project": {
+            "id": "project-other", "name": "My Project",
+            "defaultRepoProvider": "github", "defaultRepo": "someone/else",
+        } }),
+        ),
+    ]);
+    let error = run_projects(
+        CloudProjectsCommand::Create {
+            name: "My Project".into(),
+            repo_binding_id: binding_id.into(),
+            operation_key: "project-create-1".into(),
+        },
+        &CloudClient::new(&mismatch, &secrets, "default", DEFAULT_API_BASE),
+        &machine::MachineKeyEnv::default(),
+        &mut Vec::new(),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("different GitHub repository"));
+    assert_eq!(mismatch.requests().len(), 2);
 }
 
 #[test]
