@@ -389,7 +389,9 @@ structural argv as lossless JSON strings and environment provenance without
 values. Credential-bearing argv is rejected at manifest validation;
 plugin-originated errors suppress URL query, authentication, argv, and
 environment material. Legacy executable tools under `[tools].plugin_dir`
-remain a distinct system and are listed under `/plugin tools`.
+remain a distinct system and are listed under `/plugin tools`; they cannot
+approve themselves or replace built-in tools (see
+[CONFIGURATION.md](CONFIGURATION.md#script-tools-and-overrides)).
 
 ## Explicit non-goals as of v0.9.10
 

@@ -5307,7 +5307,7 @@ impl Engine {
 
         // Load plugin tools from the user's tools directory and apply any
         // config.toml overrides. Explicit overrides win over auto-discovered
-        // scripts with the same tool name.
+        // scripts with the same tool name; neither may replace a built-in.
         let extension_host = self
             .extension_host
             .as_ref()
@@ -5319,8 +5319,19 @@ impl Engine {
                 .note_native_names(tool_registry.names());
             attachment.sync_in_background();
         }
-        let mut plugin_tool_names =
+        let (mut plugin_tool_names, refused_overrides) =
             configure_plugin_tools(&mut tool_registry, self.config.tools.as_ref());
+        // The registry is rebuilt every turn: name each refused override to
+        // the user once per process, not once per turn.
+        for name in refused_overrides {
+            if first_override_refusal(&name) {
+                let _ = self
+                    .send_event(Event::status(
+                        crate::tools::registry::override_refusal_notice(&name),
+                    ))
+                    .await;
+            }
+        }
         // Extension tools go in last and never replace a name already present
         // (`ToolRegistry::register` would overwrite it silently). Only this
         // engine's own plugins' tools are installed.
@@ -7947,11 +7958,27 @@ fn plugin_tools_dir(tools_config: Option<&crate::config::ToolsConfig>) -> PathBu
     default_plugin_tools_dir()
 }
 
+/// Whether this process has not yet told the user about the refused
+/// `[tools.overrides.<name>]`.
+fn first_override_refusal(name: &str) -> bool {
+    static NOTIFIED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    NOTIFIED
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(name.to_string())
+}
+
+/// Load drop-in scripts and apply `[tools.overrides]`. Returns the tool names
+/// this added and the overrides refused for naming a built-in (D4).
 fn configure_plugin_tools(
     tool_registry: &mut crate::tools::ToolRegistry,
     tools_config: Option<&crate::config::ToolsConfig>,
-) -> std::collections::HashSet<String> {
-    let names_before: std::collections::HashSet<String> = tool_registry
+) -> (std::collections::HashSet<String>, Vec<String>) {
+    // Everything registered before the plugin directory loads is built in
+    // (native and host-dynamic tools); no script tool may replace it (D4).
+    let builtin_names: std::collections::HashSet<String> = tool_registry
         .names()
         .into_iter()
         .map(|s| s.to_string())
@@ -7960,18 +7987,17 @@ fn configure_plugin_tools(
     let plugin_dir = plugin_tools_dir(tools_config);
     tool_registry.load_plugins(&plugin_dir);
 
-    if let Some(tools_config) = tools_config
-        && let Some(ref overrides) = tools_config.overrides
-    {
-        tool_registry.apply_overrides(overrides, &plugin_dir);
-    }
+    let refused = match tools_config.and_then(|config| config.overrides.as_ref()) {
+        Some(overrides) => tool_registry.apply_overrides(overrides, &plugin_dir, &builtin_names),
+        None => Vec::new(),
+    };
 
     let names_after: std::collections::HashSet<String> = tool_registry
         .names()
         .into_iter()
         .map(|s| s.to_string())
         .collect();
-    &names_after - &names_before
+    (&names_after - &builtin_names, refused)
 }
 
 fn system_prompt_hash(prompt: Option<&SystemPrompt>) -> u64 {

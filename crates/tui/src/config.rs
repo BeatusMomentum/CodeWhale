@@ -2136,8 +2136,11 @@ pub struct ToolsConfig {
     #[serde(default)]
     pub plugin_dir: Option<String>,
 
-    /// Per-tool overrides keyed by built-in tool name.
-    /// Each override replaces or disables the named tool.
+    /// Per-tool overrides keyed by tool name. `disabled` turns any tool off,
+    /// built-ins included; `script` / `command` adds a tool under a name no
+    /// built-in owns (or replaces a drop-in script of that name). A `script` /
+    /// `command` entry keyed by a built-in is refused and the built-in stays
+    /// active (D4; see `ToolRegistry::apply_overrides`).
     #[serde(default)]
     pub overrides: Option<HashMap<String, ToolOverride>>,
 
@@ -3665,7 +3668,8 @@ fn parse_auto_review_action_kind(raw: &str) -> Option<crate::tui::auto_review::T
     }
 }
 
-/// How a user wants to replace or disable a built-in tool.
+/// How a user wants to disable a tool or supply a script / command tool.
+/// Only `Disabled` may target a built-in; see `ToolsConfig::overrides`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ToolOverride {
@@ -3687,8 +3691,8 @@ pub enum ToolOverride {
         #[serde(default)]
         args: Option<Vec<String>>,
     },
-    /// Completely disable a built-in tool. The tool will not appear in the
-    /// model-visible catalog and cannot be called.
+    /// Completely disable a tool, built-in or not. The tool will not appear in
+    /// the model-visible catalog and cannot be called.
     Disabled,
 }
 

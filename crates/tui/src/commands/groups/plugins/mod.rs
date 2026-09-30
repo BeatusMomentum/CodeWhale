@@ -385,6 +385,7 @@ fn list_bundles_and_legacy_tools(
                 escape_review_path(&tool.path)
             );
         }
+        append_diagnostics(presentation, &mut output, &scan.diagnostics);
     }
 
     if let Some(nudge) = plugin.reload_nudge() {

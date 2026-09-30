@@ -501,26 +501,149 @@ fn rlm_is_the_only_registered_session_surface() {
     }
 }
 
+/// The names an engine treats as built in: whatever is registered before the
+/// plugin directory loads (see `configure_plugin_tools`).
+fn builtin_names(registry: &ToolRegistry) -> std::collections::HashSet<String> {
+    registry.names().into_iter().map(str::to_string).collect()
+}
+
 #[test]
 fn apply_overrides_removes_original_when_replacement_is_missing() {
     let tmp = tempdir().expect("tempdir");
     let ctx = ToolContext::new(tmp.path().to_path_buf());
     let mut registry = ToolRegistryBuilder::new().with_file_tools().build(ctx);
-
-    assert!(registry.contains("File"));
+    let builtins = builtin_names(&registry);
+    std::fs::write(
+        tmp.path().join("reader.sh"),
+        "# name: custom-reader\n# description: drop-in reader\n",
+    )
+    .unwrap();
+    registry.load_plugins(tmp.path());
+    assert!(registry.contains("custom-reader"));
 
     let mut overrides = HashMap::new();
     overrides.insert(
-        "File".to_string(),
+        "custom-reader".to_string(),
         ToolOverride::Script {
             path: "missing-wrapper.sh".to_string(),
             args: None,
         },
     );
 
-    registry.apply_overrides(&overrides, tmp.path());
+    registry.apply_overrides(&overrides, tmp.path(), &builtins);
 
+    assert!(!registry.contains("custom-reader"));
+    assert!(registry.contains("File"));
+}
+
+/// D4 (CURRENT_DECISIONS §26): a `[tools.overrides]` script or command cannot
+/// replace a built-in. The entry is refused loudly, naming the config key and
+/// the built-in, and the built-in stays active; `disabled` and overrides under
+/// a new name keep working.
+#[test]
+fn script_and_command_overrides_cannot_replace_builtins() {
+    let tmp = tempdir().unwrap();
+    let mut registry = ToolRegistryBuilder::new()
+        .with_file_tools()
+        .with_patch_tools()
+        .build(ToolContext::new(tmp.path()));
+    let builtins = builtin_names(&registry);
+    let file = registry.get("File").unwrap();
+    let patch = registry.get("apply_patch").unwrap();
+    std::fs::write(
+        tmp.path().join("wrapper.sh"),
+        "# name: wrapper\n# description: audit wrapper\n",
+    )
+    .unwrap();
+    let script = || ToolOverride::Script {
+        path: "wrapper.sh".to_string(),
+        args: None,
+    };
+    let command = || ToolOverride::Command {
+        command: "my-patcher".to_string(),
+        args: None,
+    };
+    let overrides = HashMap::from([
+        ("File".to_string(), script()),
+        ("apply_patch".to_string(), command()),
+        ("audited_file".to_string(), script()),
+        ("my_patcher".to_string(), command()),
+    ]);
+
+    let mut refused = Vec::new();
+    let errors = capture_registration_warnings(|| {
+        refused = registry.apply_overrides(&overrides, tmp.path(), &builtins);
+    });
+
+    assert!(Arc::ptr_eq(&registry.get("File").unwrap(), &file));
+    assert!(Arc::ptr_eq(&registry.get("apply_patch").unwrap(), &patch));
+    // The refusals are returned for the engine's status line and logged.
+    refused.sort();
+    assert_eq!(refused, ["File", "apply_patch"]);
+    for name in ["File", "apply_patch"] {
+        assert!(
+            errors.contains(&super::override_refusal_notice(name)),
+            "{errors}"
+        );
+    }
+    assert_eq!(
+        registry.get("audited_file").unwrap().description(),
+        "audit wrapper"
+    );
+    assert!(registry.contains("my_patcher"));
+
+    let disable = HashMap::from([("File".to_string(), ToolOverride::Disabled)]);
+    registry.apply_overrides(&disable, tmp.path(), &builtins);
     assert!(!registry.contains("File"));
+}
+
+/// D4 (CURRENT_DECISIONS §26): a script cannot approve itself. `approval: auto`
+/// gets the default a script without the line gets, and the loader says so.
+#[test]
+fn script_tool_auto_approval_is_ignored_and_reported() {
+    let tmp = tempdir().unwrap();
+    let mut registry = ToolRegistryBuilder::new()
+        .with_file_tools()
+        .build(ToolContext::new(tmp.path()));
+    let builtins = builtin_names(&registry);
+    let plugin_dir = tmp.path().join("tools");
+    std::fs::create_dir(&plugin_dir).unwrap();
+    std::fs::write(
+        plugin_dir.join("greet.sh"),
+        "# name: greet\n# description: Say hello\n# approval: auto\n",
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.path().join("audit.sh"),
+        "# name: ignored\n# description: audit\n# approval: auto\n",
+    )
+    .unwrap();
+    let overrides = HashMap::from([(
+        "audited".to_string(),
+        ToolOverride::Script {
+            path: tmp.path().join("audit.sh").to_string_lossy().into_owned(),
+            args: None,
+        },
+    )]);
+
+    let warnings = capture_registration_warnings(|| {
+        registry.load_plugins(&plugin_dir);
+        registry.apply_overrides(&overrides, &plugin_dir, &builtins);
+    });
+
+    for name in ["greet", "audited"] {
+        assert_eq!(
+            registry.get(name).unwrap().approval_requirement(),
+            ApprovalRequirement::Suggest,
+            "{name}"
+        );
+        assert!(
+            warnings.contains(&format!(
+                "Script tool '{name}': `approval: auto` is no longer supported for script tools"
+            )),
+            "{warnings}"
+        );
+    }
 }
 
 #[test]
@@ -2177,16 +2300,26 @@ fn runtime_surface_hardening_plugin_collisions_preserve_registered_tools() {
     registry.load_plugins(tmp.path());
     assert!(registry.contains("custom-reader"));
 
+    // An explicit override still wins over a drop-in script of the same name;
+    // it never replaces a built-in (see
+    // `script_and_command_overrides_cannot_replace_builtins`).
+    let builtins = std::collections::HashSet::from(["File".to_string()]);
     let overrides = std::collections::HashMap::from([(
-        "File".to_string(),
-        crate::config::ToolOverride::Script {
-            path: "other.sh".to_string(),
+        "custom-reader".to_string(),
+        crate::config::ToolOverride::Command {
+            command: "my-reader".to_string(),
             args: None,
         },
     )]);
-    registry.apply_overrides(&overrides, tmp.path());
-    assert_eq!(registry.get("File").unwrap().description(), "custom reader");
-    assert!(!Arc::ptr_eq(&registry.get("File").unwrap(), &original));
+    registry.apply_overrides(&overrides, tmp.path(), &builtins);
+    assert!(
+        registry
+            .get("custom-reader")
+            .unwrap()
+            .description()
+            .contains("my-reader")
+    );
+    assert!(Arc::ptr_eq(&registry.get("File").unwrap(), &original));
 }
 
 #[test]

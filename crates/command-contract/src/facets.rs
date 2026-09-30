@@ -745,11 +745,13 @@ pub struct PluginLegacyTool {
     pub path: PathBuf,
 }
 
-/// Portable legacy-tool scan result: directory and discovered tools.
+/// Portable legacy-tool scan result: directory, discovered tools, and load
+/// diagnostics for scripts that asked for something the loader ignored.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PluginLegacyScan {
     pub dir: PathBuf,
     pub tools: Vec<PluginLegacyTool>,
+    pub diagnostics: Vec<PluginDiagnostic>,
 }
 
 /// Portable Kimi managed-plugin candidate (FEAT-020 D2).

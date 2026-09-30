@@ -3060,6 +3060,45 @@ tools loaded on every request, add them to `[tools].always_load`:
 always_load = ["Git", "notify"]
 ```
 
+### Script tools and overrides
+
+Scripts in `~/.codewhale/tools/` (or `[tools].plugin_dir`) that start with a
+`# name:` header become model-visible tools, and `/plugin tools` lists them.
+The script reads the tool's JSON input on stdin and writes a JSON
+`ToolResult` (`{"content": "...", "success": true}`) on stdout.
+
+```sh
+#!/usr/bin/env sh
+# name: word_count
+# description: Count words in the given text
+# schema: {"type":"object","properties":{"text":{"type":"string"}}}
+# approval: required
+```
+
+`# approval:` takes `suggest` (the default) or `required`; either way the
+tool follows the session's approval setting. A script cannot approve itself:
+`approval: auto` is no longer supported, so such a script gets the default,
+and the runtime log (`~/.codewhale/logs/`) and `/plugin tools` name it.
+
+A script cannot replace a built-in tool either. A script whose `# name:` is
+already registered is not loaded. `[tools.overrides]` may disable a built-in,
+or add a script or command tool under a name of its own:
+
+```toml
+[tools.overrides]
+"Web" = { type = "disabled" }                                   # turn a built-in off
+"audited_shell" = { type = "script", path = "audit-shell.sh" }  # a new tool
+"Bash" = { type = "script", path = "audit-shell.sh" }           # refused: Bash is built in
+```
+
+A `script` or `command` override keyed by a built-in is refused, and the
+built-in stays active. A status line names the key once per session, and the
+runtime log records it. To route a
+built-in through your own wrapper, disable the built-in and register the
+wrapper under a new name. An override keyed by a drop-in script's name still
+replaces that script. Relative `path` values resolve against the plugin
+directory.
+
 ### `request_user_input` limits
 
 `request_user_input` asks the user a short batch of multiple-choice questions.

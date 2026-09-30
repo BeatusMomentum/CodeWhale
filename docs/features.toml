@@ -314,6 +314,15 @@ docs = "docs/PLUGINS.md"
 owner = "crates/tui/src/plugins"
 
 [[feature]]
+id = "script-tools"
+name = "Script tools"
+summary = "Scripts in ~/.codewhale/tools become approval-gated tools; [tools.overrides] disables built-ins, never replaces them."
+status = "stable"
+surfaces = { tui = "stable" }
+docs = "docs/CONFIGURATION.md#script-tools-and-overrides"
+owner = "crates/tui/src/tools/plugin.rs"
+
+[[feature]]
 id = "claude-plugin-compat"
 name = "Claude plugin compatibility"
 summary = "Loads Claude Code plugin bundles and skill folders where their features are supported."
