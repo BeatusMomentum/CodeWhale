@@ -274,8 +274,6 @@ pub fn resolve_pandoc() -> Option<String> {
 /// conformance replay answers with the recorded host's set so goldens do not
 /// depend on what the machine running them has installed (test builds only).
 pub(crate) fn host_tool_available(tool: &str, probe: impl FnOnce() -> bool) -> bool {
-    #[cfg(not(all(test, unix)))]
-    let _ = tool;
     #[cfg(all(test, unix))]
     if let Some(available) = RECORDED_HOST_TOOLS.with(|cell| {
         cell.borrow()
