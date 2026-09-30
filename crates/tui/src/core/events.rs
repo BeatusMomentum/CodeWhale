@@ -984,7 +984,7 @@ pub fn bounded_gate_reason(reason: &str) -> String {
     out
 }
 
-fn is_bidi_format_control(c: char) -> bool {
+pub(crate) fn is_bidi_format_control(c: char) -> bool {
     matches!(
         c,
         '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
