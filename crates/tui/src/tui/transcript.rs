@@ -354,7 +354,6 @@ impl TranscriptViewCache {
         // index is removed and later filled by a different cell.
         let old_len = self.per_cell.len();
         let mut any_dirty = layout_changed
-            || viewport_changed
             || folded_changed
             || work_receipt_changed
             || user_turn_changed
@@ -400,7 +399,9 @@ impl TranscriptViewCache {
             }
             if !layout_changed
                 && is_layout_aware_preview == was_layout_aware_preview
-                && !(is_layout_aware_preview && any_dirty)
+                && !(is_layout_aware_preview
+                    && matches!(cell, HistoryCell::Thinking { .. })
+                    && (any_dirty || viewport_changed))
                 && revisions_match
                 && old_per_cell
                     .get(idx)

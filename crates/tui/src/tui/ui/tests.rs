@@ -32330,3 +32330,115 @@ fn bench_full_frame_scroll_cost_by_history_length() {
         );
     }
 }
+
+#[test]
+fn g3_wheel_and_scrollbar_use_interactive_cadence() {
+    use crate::tui::display_refresh::DrawCadenceTier;
+    let mut app = create_test_app();
+    app.viewport.pending_scroll_delta = -3;
+    assert_eq!(
+        super::event_loop::transcript_cadence_tier(&app, false),
+        DrawCadenceTier::Interactive
+    );
+    app.viewport.pending_scroll_delta = 0;
+    app.viewport.transcript_scrollbar_dragging = true;
+    assert_eq!(
+        super::event_loop::transcript_cadence_tier(&app, false),
+        DrawCadenceTier::Interactive
+    );
+}
+
+#[test]
+fn g3_scroll_burst_preserves_the_first_non_scroll_before_later_input() {
+    let mut app = create_test_app();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let input = TerminalInputPump {
+        rx,
+        stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        paused: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        paused_ack: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        handle: None,
+        last_alive_at: std::cell::Cell::new(Instant::now()),
+    };
+    let mut pending = VecDeque::from(['a', 'b'].map(|c| {
+        ObservedTerminalEvent::new(
+            Event::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)),
+            Instant::now(),
+        )
+    }));
+    let first = crossterm::event::MouseEvent {
+        kind: crossterm::event::MouseEventKind::ScrollDown,
+        column: 10,
+        row: 5,
+        modifiers: KeyModifiers::NONE,
+    };
+    super::event_loop::coalesce_scroll_burst(&mut app, first, &input, &mut pending).unwrap();
+    for expected in ['a', 'b'] {
+        let observed = try_next_terminal_event(&input, &mut pending)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            observed.event,
+            Event::Key(KeyEvent::new(KeyCode::Char(expected), KeyModifiers::NONE))
+        );
+    }
+    drop(tx);
+}
+
+#[test]
+fn g3_real_height_resize_keeps_wrapped_rows_and_tool_projection() {
+    let mut app = create_test_app();
+    app.history = long_session_history(10);
+    app.resync_history_revisions();
+    let _ = crate::tui::widgets::ChatWidget::new(&mut app, Rect::new(0, 0, 80, 20));
+    let lines = app.viewport.transcript_cache.total_lines();
+    let version = app.history_version;
+    app.handle_resize(80, 30);
+    assert_eq!(app.viewport.transcript_cache.total_lines(), lines);
+    assert_eq!(app.history_version, version);
+    assert_eq!(app.viewport.pending_terminal_size, Some(Size::new(80, 30)));
+    let _ = crate::tui::widgets::ChatWidget::new(&mut app, Rect::new(0, 0, 80, 30));
+    assert_eq!(app.viewport.transcript_cache.total_lines(), lines);
+}
+
+#[test]
+fn g3_resize_clear_and_failure_are_inside_synchronized_output() {
+    #[derive(Clone, Default)]
+    struct Capture(std::rc::Rc<std::cell::RefCell<Vec<u8>>>);
+    impl std::io::Write for Capture {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.borrow_mut().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    for fail in [false, true] {
+        let capture = Capture::default();
+        let mut backend = crate::tui::color_compat::ColorCompatBackend::new(
+            capture.clone(),
+            codewhale_palette::ColorDepth::TrueColor,
+            codewhale_palette::PaletteMode::Dark,
+        );
+        backend.force_size(Size::new(80, 24));
+        let mut terminal = Terminal::new(backend).unwrap();
+        capture.0.borrow_mut().clear();
+        let result = super::frame::synchronized_frame(&mut terminal, true, |terminal| {
+            terminal.resize(Rect::new(0, 0, 80, 30))?;
+            if fail {
+                anyhow::bail!("injected draw failure");
+            }
+            terminal.backend_mut().write_all(b"frame after resize")?;
+            Ok(())
+        });
+        assert_eq!(result.is_err(), fail);
+        let output = capture.0.borrow();
+        assert!(output.starts_with(BEGIN_SYNC_UPDATE));
+        assert!(output.ends_with(END_SYNC_UPDATE));
+        assert!(
+            output.windows(4).any(|bytes| bytes == b"\x1b[2J"),
+            "resize must emit a clear"
+        );
+    }
+}

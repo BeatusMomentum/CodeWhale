@@ -577,12 +577,27 @@ pub(crate) fn coalesce_scroll_burst(
                 latest = *next;
             }
             _ => {
-                pending.push_back(next_observed);
+                pending.push_front(next_observed);
                 break;
             }
         }
     }
     Ok(latest)
+}
+
+/// Wheel input and scrollbar dragging need the same cadence as text selection.
+pub(crate) fn transcript_cadence_tier(
+    app: &App,
+    has_running_agents: bool,
+) -> crate::tui::display_refresh::DrawCadenceTier {
+    crate::tui::display_refresh::cadence_tier_from_signals(
+        app.is_loading || has_running_agents,
+        app.viewport.transcript_selection.is_active()
+            || app.viewport.pending_scroll_delta != 0
+            || app.viewport.transcript_scrollbar_dragging,
+        !app.input.is_empty(),
+        crate::tui::hover_layer::current_hover().is_some(),
+    )
 }
 
 /// Run the interactive TUI event loop.
@@ -4357,12 +4372,7 @@ pub(crate) async fn run_event_loop(
         // full interactive rate while streaming, selecting, typing, or hovering.
         // Read once here so the animation tick and the frame limiter below
         // agree on the same tier for this frame.
-        let cadence_tier = crate::tui::display_refresh::cadence_tier_from_signals(
-            app.is_loading || has_running_agents,
-            app.viewport.transcript_selection.is_active(),
-            !app.input.is_empty(),
-            crate::tui::hover_layer::current_hover().is_some(),
-        );
+        let cadence_tier = transcript_cadence_tier(app, has_running_agents);
         let underwater_motion =
             underwater_ambient_motion || underwater_completion_motion || launch_motion;
         let animation_active = status_motion || underwater_motion;
@@ -4737,7 +4747,7 @@ pub(crate) async fn run_event_loop(
                             final_h = h;
                         }
                         other => {
-                            pending_terminal_events.push_back(ObservedTerminalEvent::new(
+                            pending_terminal_events.push_front(ObservedTerminalEvent::new(
                                 other,
                                 next_observed.observed_at,
                             ));
@@ -4757,36 +4767,9 @@ pub(crate) async fn run_event_loop(
                     continue;
                 }
 
-                // #582: commit the event-reported size to ratatui's
-                // viewport explicitly before the redraw, instead of
-                // relying on `crossterm::terminal::size()` which gets
-                // queried internally during `terminal.draw`. On
-                // Windows ConHost specifically, `terminal::size()` has
-                // been observed to return stale dimensions briefly
-                // during a maximize→windowed transition; the next
-                // `draw` then paints into a buffer that does not
-                // match the post-restore viewport, producing the
-                // unrecoverable black screen reported by @imakid.
-                // The `Event::Resize` payload itself carries the
-                // authoritative new size, so we forward it.
-                //
-                // Inline mode cannot use `resize`: ratatui keeps an inline
-                // viewport at the rows it was built with, so the viewport is
-                // rebuilt at the new height instead.
-                let refit = if app.screen_mode == ScreenMode::Inline {
-                    refit_inline_viewport(terminal, Size::new(final_w, final_h))
-                } else {
-                    terminal.resize(Rect::new(0, 0, final_w, final_h))
-                };
-                if let Err(err) = refit {
-                    tracing::warn!(
-                        ?err,
-                        final_w,
-                        final_h,
-                        "terminal.resize during Resize event failed; falling back to clear+draw"
-                    );
-                }
-
+                // The event-reported size is authoritative (#582). Applying
+                // it may clear the terminal, so defer it into the synchronized
+                // draw instead of exposing an empty frame while resizing.
                 app.handle_resize(final_w, final_h);
                 // #6311: a resize that lands while unfocused records the size
                 // but must not emit the frame — same deferral as zero-size.
@@ -4795,27 +4778,7 @@ pub(crate) async fn run_event_loop(
                     app.needs_redraw = true;
                     continue;
                 }
-                // #macos-resize: some terminals (macOS Terminal.app, Windows
-                // ConHost) briefly report stale dimensions via
-                // `terminal::size()` after a resize. ratatui's `draw()` calls
-                // `autoresize()` internally, which queries the backend size;
-                // if it sees the old dimension it shrinks the viewport back,
-                // leaving the newly-expanded area filled with stale content
-                // from the previous frame (duplicate UI panels).
-                //
-                // We force the backend to report the resize-event size for
-                // this single draw so the buffer matches the real viewport.
-                {
-                    let backend = terminal.backend_mut();
-                    let new_size = Size::new(final_w, final_h);
-                    backend.force_size(new_size);
-                    backend.set_terminal_size(new_size);
-                }
                 draw_app_frame_inner(terminal, app, config, true)?;
-                {
-                    let backend = terminal.backend_mut();
-                    backend.clear_forced_size();
-                }
                 app.needs_redraw = false;
                 continue;
             }

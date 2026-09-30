@@ -970,6 +970,8 @@ impl Default for ComposerState {
 pub struct ViewportState {
     pub transcript_scroll: TranscriptScroll,
     pub pending_scroll_delta: i32,
+    /// Applied inside the next synchronized frame, including resize clears.
+    pub(crate) pending_terminal_size: Option<ratatui::layout::Size>,
     pub mouse_scroll: MouseScrollState,
     pub transcript_cache: TranscriptViewCache,
     pub transcript_selection: TranscriptSelection,
@@ -1027,6 +1029,7 @@ impl Default for ViewportState {
         Self {
             transcript_scroll: TranscriptScroll::to_bottom(),
             pending_scroll_delta: 0,
+            pending_terminal_size: None,
             mouse_scroll: MouseScrollState::new(),
             transcript_cache: TranscriptViewCache::new(),
             transcript_selection: TranscriptSelection::default(),
@@ -2612,7 +2615,13 @@ pub(crate) struct ToolRunCache {
     pub(crate) threshold: usize,
     pub(crate) mode: ToolCollapseMode,
     pub(crate) calm_mode: bool,
-    pub(crate) runs: Vec<crate::tui::history::ToolRun>,
+    #[cfg(test)]
+    pub(crate) projection_builds: usize,
+    pub(crate) history_len: usize,
+    pub(crate) expanded_runs: HashSet<usize>,
+    pub(crate) summaries: HashMap<usize, (HistoryCell, u64)>,
+    pub(crate) hidden_indices: HashSet<usize>,
+    pub(crate) superseded_todos: HashSet<usize>,
 }
 
 impl Default for ToolRunCache {
@@ -2624,7 +2633,13 @@ impl Default for ToolRunCache {
             threshold: usize::MAX,
             mode: ToolCollapseMode::Expanded,
             calm_mode: false,
-            runs: Vec::new(),
+            #[cfg(test)]
+            projection_builds: 0,
+            history_len: usize::MAX,
+            expanded_runs: HashSet::new(),
+            summaries: HashMap::new(),
+            hidden_indices: HashSet::new(),
+            superseded_todos: HashSet::new(),
         }
     }
 }
@@ -5980,10 +5995,12 @@ impl App {
     }
 
     /// Handle terminal resize event.
-    pub fn handle_resize(&mut self, _width: u16, _height: u16) {
+    pub fn handle_resize(&mut self, width: u16, height: u16) {
         let preserved_scroll = (!self.viewport.transcript_scroll.is_at_tail())
             .then_some(self.viewport.last_transcript_top);
-        self.viewport.transcript_cache = TranscriptViewCache::new();
+        // Wrapped rows already key themselves by width and render options.
+        // Height changes only affect the final reasoning preview (#6652).
+        self.viewport.pending_terminal_size = Some(ratatui::layout::Size::new(width, height));
 
         if let Some(top) = preserved_scroll {
             self.viewport.transcript_scroll = TranscriptScroll::at_line(top);
@@ -5997,12 +6014,12 @@ impl App {
         self.viewport.last_transcript_top = 0;
         // Seed visible height from the resize event so paging keys use a
         // useful page size immediately, before the next render updates it.
-        self.viewport.last_transcript_visible = (_height as usize).saturating_sub(2).max(1);
+        self.viewport.last_transcript_visible = (height as usize).saturating_sub(2).max(1);
         self.viewport.last_transcript_total = 0;
         self.viewport.last_transcript_padding_top = 0;
         self.viewport.jump_to_latest_button_area = None;
 
-        self.mark_history_updated();
+        self.needs_redraw = true;
     }
 
     pub fn scroll_up(&mut self, amount: usize) {

@@ -2281,7 +2281,10 @@ fn measure_calm_rows_per_turn() {
             streaming: false,
             duration_secs: Some(12.0),
         },
-        mcp(ToolStatus::Success, "CW-123\nTitle\nState: Todo".to_string()),
+        mcp(
+            ToolStatus::Success,
+            "CW-123\nTitle\nState: Todo".to_string(),
+        ),
         mcp(ToolStatus::Failed, noisy.clone()),
         generic("read_file", ToolStatus::Failed, Some(noisy.clone())),
         exec_tool_cell_with_output("cargo test", noisy.clone()),
@@ -2329,5 +2332,32 @@ fn measure_calm_rows_per_turn() {
     eprintln!(
         "calm-rows streaming thinking cell at viewport 40: {}",
         cache.per_cell[1].lines.len()
+    );
+}
+
+#[test]
+fn g3_height_change_keeps_even_a_long_final_answer_cached() {
+    let cells = [
+        user_cell("question"),
+        assistant_cell(&"long answer\n".repeat(1_000), false),
+    ];
+    let mut cache = TranscriptViewCache::new();
+    let mut options = TranscriptRenderOptions {
+        reasoning_preview_viewport_lines: Some(20),
+        ..Default::default()
+    };
+    cache.ensure(&cells, &[1, 2], 80, options);
+    let before: Vec<_> = cache
+        .per_cell
+        .iter()
+        .map(|cell| Arc::clone(&cell.lines))
+        .collect();
+    options.reasoning_preview_viewport_lines = Some(40);
+    cache.ensure(&cells, &[1, 2], 80, options);
+    assert!(
+        before
+            .iter()
+            .zip(&cache.per_cell)
+            .all(|(lines, cell)| Arc::ptr_eq(lines, &cell.lines))
     );
 }

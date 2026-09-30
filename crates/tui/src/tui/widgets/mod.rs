@@ -345,60 +345,78 @@ impl ChatWidget {
             .active_cell
             .as_ref()
             .map_or(&[], |active| active.entries());
-        let superseded_todos = superseded_todo_write_indices(&app.history, active_entries);
-
         let history_len = app.history.len();
-        let mut tool_runs = if app.tool_collapse_active() {
-            let cache_key_matches = app.tool_run_cache.history_version == app.history_version
-                && app.tool_run_cache.active_cell_revision == app.active_cell_revision
-                && app.tool_run_cache.active_len == active_entries.len()
-                && app.tool_run_cache.threshold == app.tool_collapse_threshold
-                && app.tool_run_cache.mode == app.tool_collapse_mode
-                && app.tool_run_cache.calm_mode == app.calm_mode;
-            if !cache_key_matches {
-                app.tool_run_cache.runs = crate::tui::history::detect_tool_runs_from_slices(
+        // Cache the group projection, not the whole frame: filtered refs and
+        // transcript bookkeeping below still walk the retained history.
+        let cache_key_matches = app.tool_run_cache.history_version == app.history_version
+            && app.tool_run_cache.history_len == history_len
+            && app.tool_run_cache.active_cell_revision == app.active_cell_revision
+            && app.tool_run_cache.active_len == active_entries.len()
+            && app.tool_run_cache.threshold == app.tool_collapse_threshold
+            && app.tool_run_cache.mode == app.tool_collapse_mode
+            && app.tool_run_cache.calm_mode == app.calm_mode
+            && app.tool_run_cache.expanded_runs == app.expanded_tool_runs;
+        if !cache_key_matches {
+            let superseded_todos = superseded_todo_write_indices(&app.history, active_entries);
+            let runs = if app.tool_collapse_active() {
+                crate::tui::history::detect_tool_runs_from_slices(
                     &app.history,
                     active_entries,
                     app.tool_collapse_threshold,
+                )
+            } else {
+                Vec::new()
+            };
+            let cache = &mut app.tool_run_cache;
+            #[cfg(test)]
+            {
+                cache.projection_builds += 1;
+            }
+            cache.summaries.clear();
+            cache.hidden_indices.clear();
+            for run in &runs {
+                // A hidden replacement snapshot cannot own a group summary.
+                if app.expanded_tool_runs.contains(&run.start)
+                    || (run.start..run.start.saturating_add(run.count))
+                        .any(|index| superseded_todos.contains(&index))
+                {
+                    continue;
+                }
+                cache.summaries.insert(
+                    run.start,
+                    (
+                        tool_run_summary_cell(run),
+                        tool_run_summary_revision(
+                            run,
+                            &app.history_revisions,
+                            history_len,
+                            app.active_cell_revision,
+                        ),
+                    ),
                 );
-                app.tool_run_cache.history_version = app.history_version;
-                app.tool_run_cache.active_cell_revision = app.active_cell_revision;
-                app.tool_run_cache.active_len = active_entries.len();
-                app.tool_run_cache.threshold = app.tool_collapse_threshold;
-                app.tool_run_cache.mode = app.tool_collapse_mode;
-                app.tool_run_cache.calm_mode = app.calm_mode;
+                cache
+                    .hidden_indices
+                    .extend(run.start + 1..run.start + run.count);
             }
-            app.tool_run_cache.runs.clone()
-        } else {
-            Vec::new()
-        };
-        // A collapsed run that crosses a hidden replacement snapshot would
-        // otherwise lose its summary start or count a row the user cannot
-        // see. Leave only that run expanded; unrelated dense runs still use
-        // the normal collapse path.
-        tool_runs.retain(|run| {
-            !(run.start..run.start.saturating_add(run.count))
-                .any(|index| superseded_todos.contains(&index))
-        });
-        let collapsed_run_starts: HashSet<usize> = tool_runs
-            .iter()
-            .filter_map(|run| (!app.expanded_tool_runs.contains(&run.start)).then_some(run.start))
-            .collect();
-        let mut collapsed_tool_indices: HashSet<usize> = HashSet::new();
-        for run in &tool_runs {
-            if !collapsed_run_starts.contains(&run.start) {
-                continue;
-            }
-            for offset in 1..run.count {
-                collapsed_tool_indices.insert(run.start + offset);
-            }
+            cache.superseded_todos = superseded_todos;
+            cache.history_version = app.history_version;
+            cache.history_len = history_len;
+            cache.active_cell_revision = app.active_cell_revision;
+            cache.active_len = active_entries.len();
+            cache.threshold = app.tool_collapse_threshold;
+            cache.mode = app.tool_collapse_mode;
+            cache.calm_mode = app.calm_mode;
+            cache.expanded_runs.clone_from(&app.expanded_tool_runs);
         }
+        let superseded_todos = &app.tool_run_cache.superseded_todos;
+        let collapsed_tool_indices = &app.tool_run_cache.hidden_indices;
+        let summary_cells = &app.tool_run_cache.summaries;
 
         // v0.9.1: do not collapse concurrent sub-agent cards into an Enter-
         // expand shelf. Count lives in header chrome; full cards stay visible;
         // sidebar / SubAgents modal are the drill-in surface.
         let has_collapsed = !app.collapsed_cells.is_empty()
-            || !collapsed_run_starts.is_empty()
+            || !summary_cells.is_empty()
             || !superseded_todos.is_empty();
 
         // Fast path: no collapsed cells — use original slices directly.
@@ -440,22 +458,8 @@ impl ChatWidget {
             // Slow path: borrow non-collapsed cells into a filtered ref list
             // so collapsed cells are excluded from rendering, and build the
             // filtered→original index mapping. Collapsed run starts render a
-            // synthetic summary cell; those few summaries are materialized
-            // up front so the ref list can borrow from a stable Vec —
-            // avoiding the per-frame deep clone of every visible cell that
-            // this path used to pay (#3896).
-            let summary_cells: Vec<(usize, HistoryCell)> = tool_runs
-                .iter()
-                .filter(|run| collapsed_run_starts.contains(&run.start))
-                .map(|run| (run.start, tool_run_summary_cell(run)))
-                .collect();
-            let summary_cell_for = |idx: usize| -> Option<&HistoryCell> {
-                summary_cells
-                    .iter()
-                    .find(|(start, _)| *start == idx)
-                    .map(|(_, cell)| cell)
-            };
-
+            // synthetic summary cell borrowed from the generation cache.
+            // No history cells or summary bodies are cloned on scroll frames.
             let mut filtered_cells: Vec<&HistoryCell> =
                 Vec::with_capacity(history_len + active_entries.len());
             let mut filtered_revs: Vec<u64> =
@@ -473,17 +477,9 @@ impl ChatWidget {
                 if collapsed_tool_indices.contains(&idx) {
                     continue;
                 }
-                if let Some(run) = tool_runs
-                    .iter()
-                    .find(|run| run.start == idx && collapsed_run_starts.contains(&idx))
-                {
-                    filtered_cells.push(summary_cell_for(idx).expect("summary cell materialized"));
-                    filtered_revs.push(tool_run_summary_revision(
-                        run,
-                        &app.history_revisions,
-                        history_len,
-                        app.active_cell_revision,
-                    ));
+                if let Some((summary, revision)) = summary_cells.get(&idx) {
+                    filtered_cells.push(summary);
+                    filtered_revs.push(*revision);
                     filtered_to_original.push(idx);
                     continue;
                 }
@@ -505,17 +501,9 @@ impl ChatWidget {
                     if collapsed_tool_indices.contains(&original_idx) {
                         continue;
                     }
-                    if let Some(run) = tool_runs.iter().find(|run| {
-                        run.start == original_idx && collapsed_run_starts.contains(&original_idx)
-                    }) {
-                        filtered_cells
-                            .push(summary_cell_for(original_idx).expect("summary materialized"));
-                        filtered_revs.push(tool_run_summary_revision(
-                            run,
-                            &app.history_revisions,
-                            history_len,
-                            active_rev,
-                        ));
+                    if let Some((summary, revision)) = summary_cells.get(&original_idx) {
+                        filtered_cells.push(summary);
+                        filtered_revs.push(*revision);
                         filtered_to_original.push(original_idx);
                         continue;
                     }
@@ -5340,6 +5328,82 @@ mod tests {
             !rendered.contains("full output from list_dir"),
             "{rendered}"
         );
+    }
+
+    #[test]
+    fn g3_collapsed_projection_reuses_summaries_until_content_or_expansion_changes() {
+        let mut app = create_test_app();
+        app.tool_collapse_mode = ToolCollapseMode::Compact;
+        app.tool_collapse_threshold = 3;
+        add_dense_tool_run(&mut app);
+        let area = Rect::new(0, 0, 80, 20);
+        let _ = ChatWidget::new(&mut app, area);
+        assert_eq!(app.tool_run_cache.projection_builds, 1);
+        app.scroll_up(3);
+        let _ = ChatWidget::new(&mut app, area);
+        assert_eq!(app.tool_run_cache.projection_builds, 1);
+        app.expanded_tool_runs.insert(0);
+        let _ = ChatWidget::new(&mut app, area);
+        assert_eq!(app.collapsed_cell_map, vec![0, 1, 2]);
+        app.expanded_tool_runs.clear();
+        if let HistoryCell::Tool(ToolCell::Generic(tool)) = &mut app.history[1] {
+            tool.status = ToolStatus::Failed;
+        }
+        app.bump_history_cell(1);
+        let _ = ChatWidget::new(&mut app, area);
+        assert!(app.tool_run_cache.summaries.is_empty());
+        assert_eq!(app.collapsed_cell_map, vec![0, 1, 2]);
+    }
+
+    /// Isolates the former per-cell linear run lookup from rendering and I/O.
+    #[test]
+    #[ignore = "timing benchmark, not a correctness gate"]
+    #[allow(clippy::print_stderr)]
+    fn bench_g3_collapsed_projection_lookup() {
+        for groups in [100usize, 1_000] {
+            let mut app = create_test_app();
+            app.tool_collapse_mode = ToolCollapseMode::Compact;
+            app.tool_collapse_threshold = 3;
+            for _ in 0..groups {
+                add_dense_tool_run(&mut app);
+                app.push_history_cell(HistoryCell::Assistant {
+                    content: "done".into(),
+                    streaming: false,
+                });
+            }
+            let area = Rect::new(0, 0, 140, 40);
+            let _ = ChatWidget::new(&mut app, area);
+            let runs = crate::tui::history::detect_tool_runs_from_slices(&app.history, &[], 3);
+            let frames = 200u32;
+            let started = std::time::Instant::now();
+            for _ in 0..frames {
+                for index in 0..app.history.len() {
+                    std::hint::black_box(
+                        runs.iter()
+                            .find(|run| run.start == std::hint::black_box(index)),
+                    );
+                }
+            }
+            let before = started.elapsed() / frames;
+            let started = std::time::Instant::now();
+            for _ in 0..frames {
+                for index in 0..app.history.len() {
+                    std::hint::black_box(
+                        app.tool_run_cache
+                            .summaries
+                            .get(&std::hint::black_box(index)),
+                    );
+                }
+            }
+            let after = started.elapsed() / frames;
+            eprintln!(
+                "#6652 lookup: {} cells, {} groups, linear {:?}, cached direct {:?} per frame",
+                app.history.len(),
+                runs.len(),
+                before,
+                after
+            );
+        }
     }
 
     #[test]
