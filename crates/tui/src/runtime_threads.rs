@@ -3921,20 +3921,31 @@ impl RuntimeThreadStore {
         thread_id: &str,
         since_seq: Option<u64>,
     ) -> Result<Vec<RuntimeEventRecord>> {
+        let mut out = Vec::new();
+        self.for_each_event(thread_id, |event| {
+            if since_seq.is_none_or(|since| event.seq > since) {
+                out.push(event);
+            }
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
+    /// Visit every complete event of a thread in order without collecting
+    /// the log, for callers that only need a summary of a long history.
+    pub fn for_each_event(
+        &self,
+        thread_id: &str,
+        mut visit: impl FnMut(RuntimeEventRecord) -> Result<()>,
+    ) -> Result<()> {
         let path = self.events_path(thread_id)?;
         let Some(mut reader) = self.open_event_reader(thread_id)? else {
-            return Ok(Vec::new());
+            return Ok(());
         };
-        let mut out = Vec::new();
         while let Some(event) = read_complete_event(&mut reader, &path)? {
-            if let Some(since) = since_seq
-                && event.seq <= since
-            {
-                continue;
-            }
-            out.push(event);
+            visit(event)?;
         }
-        Ok(out)
+        Ok(())
     }
 
     /// Incremental JSONL replay from a byte cursor. The returned cursor only
@@ -17030,31 +17041,34 @@ impl RuntimeThreadManager {
 
         let mut recovery_receipts: HashMap<String, Vec<RecoveredTurnReceipt>> = HashMap::new();
         for (thread_id, mut turns) in turns_by_thread {
-            let events = self.store.events_since(&thread_id, None)?;
-            let completed_turns = events
-                .iter()
-                .filter(|event| event.event == "turn.completed")
-                .filter_map(|event| event.turn_id.clone())
-                .collect::<HashSet<_>>();
-            let terminal_calls = events
-                .iter()
-                .filter(|event| {
-                    matches!(
-                        event.event.as_str(),
-                        "tool_call.resolved" | "tool_call.canceled" | "tool_call.timeout"
-                    )
-                })
-                .filter_map(|event| {
-                    let turn_id = event.turn_id.as_deref()?;
-                    let call_id = event.payload.get("call_id")?.as_str()?;
-                    Some((turn_id.to_string(), call_id.to_string()))
-                })
-                .collect::<HashSet<_>>();
+            // One streaming pass keeps only what recovery needs (completed
+            // turns, terminal calls, tool requests), not the whole log: a
+            // long thread's history is never held in memory at startup.
+            let mut completed_turns = HashSet::new();
+            let mut terminal_calls = HashSet::new();
+            let mut requested = Vec::new();
+            self.store.for_each_event(&thread_id, |event| {
+                match event.event.as_str() {
+                    "turn.completed" => {
+                        if let Some(turn_id) = event.turn_id {
+                            completed_turns.insert(turn_id);
+                        }
+                    }
+                    "tool_call.resolved" | "tool_call.canceled" | "tool_call.timeout" => {
+                        if let (Some(turn_id), Some(call_id)) = (
+                            event.turn_id,
+                            event.payload.get("call_id").and_then(|id| id.as_str()),
+                        ) {
+                            terminal_calls.insert((turn_id, call_id.to_string()));
+                        }
+                    }
+                    "tool_call.requested" => requested.push(event),
+                    _ => {}
+                }
+                Ok(())
+            })?;
             let mut requests_by_turn: HashMap<String, Vec<DynamicToolCallParams>> = HashMap::new();
-            for event in events
-                .iter()
-                .filter(|event| event.event == "tool_call.requested")
-            {
+            for event in &requested {
                 let Ok(params) =
                     serde_json::from_value::<DynamicToolCallParams>(event.payload.clone())
                 else {
