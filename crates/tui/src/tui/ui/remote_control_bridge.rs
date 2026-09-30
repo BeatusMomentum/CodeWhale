@@ -251,7 +251,10 @@ pub(crate) async fn drain_remote_control_events(
                         }
                     }
                     crate::remote_control::RemoteCommand::Approval { gate, approved } => {
-                        let Some(tool_id) = app.remote_control.take_pending_approval(&gate) else {
+                        // Keep the gate pending until the engine takes the
+                        // decision: a failed send leaves it retryable (U03-07).
+                        let Some(tool_id) = app.remote_control.pending_approval_tool_id(&gate)
+                        else {
                             app.remote_control.acknowledge(
                                 &run_id,
                                 seq,
@@ -268,6 +271,7 @@ pub(crate) async fn drain_remote_control_events(
                         };
                         match result {
                             Ok(()) => {
+                                let _ = app.remote_control.take_pending_approval(&gate);
                                 app.retire_action_notices(Some(&tool_id));
                                 // First decision wins: the web answered this
                                 // gate, so dismiss exactly the matching card —

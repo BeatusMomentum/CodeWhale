@@ -2566,13 +2566,24 @@ fn details_affordance_line(text: &str, style: Style) -> Line<'static> {
     ])
 }
 
+/// Truncate to `max_len` display cells, cutting only at grapheme-cluster
+/// boundaries. Counting chars let CJK text overflow a width budget and could
+/// split a ZWJ or combining sequence (U04-m5); ASCII output is unchanged.
 fn truncate_text(text: &str, max_len: usize) -> String {
-    if text.chars().count() <= max_len {
+    use unicode_segmentation::UnicodeSegmentation;
+    if crate::tui::ui_text::text_display_width(text) <= max_len {
         return text.to_string();
     }
+    let budget = max_len.saturating_sub(3);
     let mut out = String::new();
-    for ch in text.chars().take(max_len.saturating_sub(3)) {
-        out.push(ch);
+    let mut used = 0usize;
+    for grapheme in text.graphemes(true) {
+        let width = crate::tui::ui_text::text_display_width(grapheme);
+        if used + width > budget {
+            break;
+        }
+        used += width;
+        out.push_str(grapheme);
     }
     out.push_str("...");
     out

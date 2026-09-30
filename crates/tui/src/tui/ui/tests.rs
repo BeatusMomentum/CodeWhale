@@ -19840,6 +19840,47 @@ fn steer_reuses_queued_echo_cell_instead_of_doubling() {
     assert_eq!(idx, 0, "the rewritten cell keeps the queue-time index");
 }
 
+/// U02-03: a message_submit hook that rewrites a queued message retargets
+/// the queue-time echo, so dispatch reuses it instead of adding a second
+/// User cell beside the stale pre-hook text.
+#[test]
+fn hook_replaced_queued_message_keeps_one_user_cell() {
+    let mut app = create_test_app();
+    let mut message = QueuedMessage::new("draft as typed".to_string(), None);
+    echo_queued_user_turn(&mut app, &mut message);
+    assert!(apply_message_submit_outcome(
+        &mut app,
+        &mut message,
+        crate::hooks::MessageSubmitOutcome::replaced("draft as rewritten".to_string()),
+    ));
+
+    paint_user_turn_cell(&mut app, &message, message.display.clone());
+
+    let user_cells: Vec<String> = app
+        .history
+        .iter()
+        .filter_map(|cell| match cell {
+            HistoryCell::User { content } => Some(content.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(user_cells, vec!["draft as rewritten".to_string()]);
+}
+
+/// U02-10: a dispatch still in flight, or a locally cancelled turn whose
+/// terminal event has not landed, holds the session: switching now would
+/// carry the stale cancellation into the next session's first turn.
+#[test]
+fn session_transition_waits_for_pending_dispatch_and_cancelled_turn() {
+    let mut app = create_test_app();
+    assert!(!app.session_transition_blocked());
+    app.suppress_stream_events_until_turn_complete = true;
+    assert!(app.session_transition_blocked());
+    app.suppress_stream_events_until_turn_complete = false;
+    app.dispatch_in_flight = true;
+    assert!(app.session_transition_blocked());
+}
+
 #[test]
 fn engine_drain_budget_respects_event_and_time_limits() {
     let start = Instant::now();

@@ -7,7 +7,9 @@
 //! rather than as a question ("that's even more confusing tbh"). This is the
 //! question, as a popup, with the session it is about named in it.
 
-use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{
+    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use ratatui::layout::Rect;
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Padding, Paragraph, Widget, Wrap};
@@ -58,8 +60,18 @@ impl ModalView for LaunchResumeConfirmView {
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> ViewAction {
+        // Resuming replaces the whole session, so only a plain press answers:
+        // a release/repeat, or a Ctrl/Alt/Super chord that happens to end in
+        // Enter or `y`, is not a confirmation (U01-05). Shift stays allowed
+        // for `Y`.
+        if key.kind != KeyEventKind::Press {
+            return ViewAction::None;
+        }
+        let chord = key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER);
         match key.code {
-            KeyCode::Enter => {
+            KeyCode::Enter if !chord => {
                 if self.selected == 0 {
                     self.confirm()
                 } else {
@@ -73,7 +85,7 @@ impl ModalView for LaunchResumeConfirmView {
             // `y` is the habit every terminal confirmation teaches; Esc and
             // `n` both back out. Nothing else acts, so a stray keystroke
             // cannot resume a session by accident.
-            KeyCode::Char('y') | KeyCode::Char('Y') => self.confirm(),
+            KeyCode::Char('y') | KeyCode::Char('Y') if !chord => self.confirm(),
             KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => ViewAction::Close,
             _ => ViewAction::None,
         }
@@ -260,6 +272,25 @@ mod tests {
             confirm.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE)),
             ViewAction::None
         ));
+
+        // U01-05: a chord that ends in Enter or `y`, and a key release, are
+        // not a confirmation.
+        for key in [
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::ALT),
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::SUPER),
+            KeyEvent::new_with_kind(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+                crossterm::event::KeyEventKind::Release,
+            ),
+        ] {
+            let mut confirm = view();
+            assert!(
+                matches!(confirm.handle_key(key), ViewAction::None),
+                "{key:?} must not resume"
+            );
+        }
     }
 
     #[test]

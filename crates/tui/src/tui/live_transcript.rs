@@ -208,6 +208,10 @@ impl LiveTranscriptOverlay {
         let options = app.transcript_render_options();
         if self.options != options {
             self.options = options;
+            // Per-cell wraps are keyed by (cell, width, revision) only, so a
+            // theme, locale or thinking toggle would otherwise reuse lines
+            // rendered under the old options (U04-m1).
+            self.cache.get_mut().clear();
             changed = true;
         }
         if changed {
