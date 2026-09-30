@@ -1,6 +1,6 @@
 {
   "direction": "host_to_core",
-  "valid": true,
+  "valid": false,
   "frame": {
     "jsonrpc": "2.0",
     "method": "host/hello",
@@ -14,7 +14,8 @@
       "runtime": {
         "name": "bun",
         "version": "1.4.0"
-      }
+      },
+      "memory_limit_mib": -1
     }
   }
 }

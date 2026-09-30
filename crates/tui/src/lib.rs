@@ -5573,6 +5573,61 @@ async fn run_doctor(
         }
     }
 
+    {
+        // The runtime the TypeScript extension host would use, resolved the
+        // same way the host launcher does (`[extension_host] runtime`). The
+        // resolver runs each candidate runtime, so it stays off the async
+        // runtime. Known limit: the probes have no timeout, so a runtime
+        // binary that hangs on `--version` stalls doctor here.
+        let options = crate::extension_host::ExtensionHostOptions::from_config(
+            config.extension_host.as_ref(),
+        );
+        let resolution = tokio::task::spawn_blocking(move || {
+            crate::dependencies::resolve_extension_host_runtime(
+                options.runtime,
+                options.node_override.as_deref(),
+                options.bun_override.as_deref(),
+            )
+        })
+        .await;
+        let enabled = config
+            .features()
+            .enabled(crate::features::Feature::ExtensionHost);
+        let state = if enabled {
+            ""
+        } else {
+            " (unused: [features] extension_host is off)"
+        };
+        let failed = if enabled {
+            "✗".truecolor(red_r, red_g, red_b)
+        } else {
+            "·".dimmed()
+        };
+        match resolution {
+            Ok(resolution) => match &resolution.selected {
+                Some(runtime) => {
+                    println!(
+                        "  {} Extension host runtime: {}{state}",
+                        "✓".truecolor(aqua_r, aqua_g, aqua_b),
+                        resolution.summary(),
+                    );
+                    println!(
+                        "    {}",
+                        crate::extension_host::supervisor::MemoryEnforcement::planned(runtime.kind)
+                            .describe(crate::extension_host::supervisor::HOST_MEMORY_CAP)
+                    );
+                }
+                None => println!(
+                    "  {failed} Extension host runtime: {}{state}",
+                    resolution.failure(),
+                ),
+            },
+            Err(error) => println!(
+                "  {failed} Extension host runtime: the runtime probe did not finish ({error}){state}"
+            ),
+        }
+    }
+
     match crate::dependencies::resolve_pandoc() {
         Some(_) => println!(
             "  {} pandoc: present → pandoc_convert tool registered",
@@ -8851,7 +8906,7 @@ fn load_structural_config_from_cli(cli: &Cli) -> Result<Config> {
 }
 
 /// Select the plugin activation policy (v3, or v4 with the experimental
-/// extension host) and the host's Node override, once per process, before
+/// extension host) and the host's runtime settings, once per process, before
 /// any plugin discovery. Later config reloads never flip either.
 fn install_extension_host_boot_config(config: &Config) {
     let enabled = config
@@ -8859,15 +8914,9 @@ fn install_extension_host_boot_config(config: &Config) {
         .enabled(crate::features::Feature::ExtensionHost);
     crate::plugins::activation::install_extension_host_policy(enabled);
     if enabled {
-        crate::extension_host::configure(crate::extension_host::ExtensionHostOptions {
-            node_override: config
-                .extension_host
-                .as_ref()
-                .and_then(|table| table.node.as_deref())
-                .map(|node| PathBuf::from(shellexpand::tilde(node).as_ref())),
-            root: None,
-            ..Default::default()
-        });
+        crate::extension_host::configure(crate::extension_host::ExtensionHostOptions::from_config(
+            config.extension_host.as_ref(),
+        ));
     }
 }
 

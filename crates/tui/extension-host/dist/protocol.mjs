@@ -126,8 +126,16 @@ var PARAMS = {
   // host → core
   "host/hello": {
     dir: "host",
-    required: { protocol: "object", host_version: "string", bundle_sha256: "string", node_version: "string" },
-    check: (p, strict) => checkShape("host/hello.protocol", p.protocol, { min: "u64", max: "u64" }, {}, strict)
+    required: { protocol: "object", host_version: "string", bundle_sha256: "string", runtime: "object" },
+    // A kernel memory limit the host applied to itself (macOS + Bun), in MiB.
+    optional: { memory_limit_mib: "u64" },
+    check: (p, strict) => {
+      checkShape("host/hello.protocol", p.protocol, { min: "u64", max: "u64" }, {}, strict);
+      checkShape("host/hello.runtime", p.runtime, { name: "string", version: "string" }, {}, strict);
+      if (p.runtime.name !== "bun" && p.runtime.name !== "node") {
+        throw new ProtocolError(`host/hello.runtime.name: unknown runtime \`${p.runtime.name}\``);
+      }
+    }
   },
   "host/ready": { dir: "host", required: {} },
   "registry/register": {

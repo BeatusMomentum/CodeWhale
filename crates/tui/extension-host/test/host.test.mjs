@@ -1,12 +1,13 @@
 // End-to-end tests of the committed host bundle against a fake core.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, writeFileSync, rmSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs'
+import { createServer } from 'node:http'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
-import { BUNDLE, activate, sha256File, startHost } from './harness.mjs'
+import { BUNDLE, HOST_ARGS, IS_BUN, activate, sha256File, startHost } from './harness.mjs'
 import { encodeFrame } from '../dist/protocol.mjs'
 
 function tempPlugin(source) {
@@ -21,7 +22,11 @@ test('handshake reports protocol 1 and the digest of the running bundle', async 
   t.after(() => host.stop())
   assert.deepEqual(host.hello.protocol, { min: 1, max: 1 })
   assert.equal(host.hello.bundle_sha256, sha256File(BUNDLE))
-  assert.match(host.hello.node_version, /^\d+\.\d+\.\d+$/)
+  // The real runtime, not Bun's emulated `process.versions.node`.
+  assert.deepEqual(host.hello.runtime, IS_BUN ? { name: 'bun', version: process.versions.bun } : { name: 'node', version: process.versions.node })
+  assert.equal(host.hello.node_version, undefined)
+  // No limit was asked for, so none is reported.
+  assert.equal(host.hello.memory_limit_mib, undefined)
   t.diagnostic(`spawn → host/ready: ${host.readyMs.toFixed(1)} ms`)
 })
 
@@ -117,6 +122,141 @@ test('an unsupported DSH peer fails the import loudly', async (t) => {
   const { result } = await activate(host, 'needs-agent', plugin.entry)
   assert.equal(result.status, 'failed')
   assert.match(result.diagnostic, /requires `@deepseek-ai\/dsh-agent`/)
+})
+
+test('a DSH peer or a second Cordis shipped in node_modules is refused, not loaded', async (t) => {
+  const host = await startHost()
+  const plugin = tempPlugin(
+    "import { x } from '@deepseek-ai/dsh-agent'\nexport function apply() { throw new Error('loaded: ' + x) }\n",
+  )
+  const subpath = tempPlugin("import { x } from '@deepseek-ai/cordis/lib/x.js'\nexport function apply() { throw new Error('loaded: ' + x) }\n")
+  for (const dir of [plugin.dir, subpath.dir]) {
+    for (const [name, main] of [['dsh-agent', 'index.js'], ['cordis', 'lib/x.js']]) {
+      const root = join(dir, 'node_modules', '@deepseek-ai', name)
+      mkdirSync(join(root, 'lib'), { recursive: true })
+      writeFileSync(join(root, 'package.json'), JSON.stringify({ name: `@deepseek-ai/${name}`, type: 'module', main, exports: { '.': `./${main}`, './lib/*': './lib/*' } }))
+      writeFileSync(join(root, main), "export const x = 'a second copy'\n")
+    }
+  }
+  t.after(async () => { await host.stop(); plugin.cleanup(); subpath.cleanup() })
+  const agent = (await activate(host, 'ships-agent', plugin.entry)).result
+  assert.equal(agent.status, 'failed')
+  assert.match(agent.diagnostic, /requires `@deepseek-ai\/dsh-agent`/)
+  const cordis = (await activate(host, 'ships-cordis', subpath.entry)).result
+  assert.equal(cordis.status, 'failed')
+  assert.match(cordis.diagnostic, /requires `@deepseek-ai\/cordis/)
+})
+
+test('plugins cannot run native code in-process', async (t) => {
+  const host = await startHost()
+  t.after(() => host.stop())
+  // Each case must fail activation with the given diagnostic.
+  const cases = [
+    ['dlopen', "export function apply() { process.dlopen({ exports: {} }, '/nonexistent/libc.so') }\n", /process\.dlopen is not available to extensions/],
+    // A Worker is a new realm that the host's lockdown never reaches.
+    ['worker', "import { Worker } from 'node:worker_threads'\nexport function apply() { new Worker('1', { eval: true }) }\n", /`Worker` is not available to extensions/],
+    ['worker-execargv', "import { createRequire } from 'node:module'\nexport function apply() { const { Worker } = createRequire(import.meta.url)('worker_threads'); new Worker('1', { eval: true, execArgv: [] }) }\n", /`Worker` is not available to extensions/],
+  ]
+  if (IS_BUN) {
+    // `bun:ffi` fails at import, however it is reached.
+    cases.push(
+      ['ffi-static', "import { dlopen } from 'bun:ffi'\nexport function apply() { dlopen('libc', {}) }\n", /`bun:ffi` is not available to extensions/],
+      ['ffi-dynamic', "export async function apply() { const { dlopen } = await import('bun:ffi'); dlopen('libc', {}) }\n", /`bun:ffi` is not available to extensions/],
+      ['ffi-require', "import { createRequire } from 'node:module'\nexport function apply() { createRequire(import.meta.url)('bun:ffi').dlopen('libc', {}) }\n", /`bun:ffi` is not available to extensions/],
+      ['ffi-global', "export function apply() { Bun.FFI.dlopen('/usr/lib/libSystem.B.dylib', {}) }\n", /`Bun\.FFI` is not available to extensions/],
+      ['ffi-global-swap', "export function apply() { Bun.FFI = {}; }\n", /readonly|read-only|read only/i],
+      ['bun-sqlite', "import { Database } from 'bun:sqlite'\nexport function apply() { Database.setCustomSQLite('/nonexistent/libsqlite3.dylib') }\n", /`bun:sqlite` is not available to extensions/],
+      ['node-sqlite', "import { DatabaseSync } from 'node:sqlite'\nexport function apply() { new DatabaseSync(':memory:').exec('select 1') }\n", /`node:sqlite` is not available to extensions/],
+      ['web-worker', "export function apply() { new Worker(URL.createObjectURL(new Blob(['1']))) }\n", /`Worker` is not available to extensions/],
+      // A ShadowRealm imports a fresh `bun:ffi`, and a `node:vm` context would hand its constructor out.
+      ['shadow-realm', "import vm from 'node:vm'\nexport async function apply() { const Realm = globalThis.ShadowRealm ?? vm.runInNewContext('globalThis.ShadowRealm'); if (!Realm) throw new Error('no ShadowRealm'); await new Realm().importValue('bun:ffi', 'dlopen') }\n", /no ShadowRealm/],
+    )
+  } else {
+    // Switched off by launcher flags (`node:ffi` only exists in newer Node).
+    cases.push(
+      ['node-sqlite', "import { DatabaseSync } from 'node:sqlite'\nexport function apply() { new DatabaseSync(':memory:', { allowExtension: true }) }\n", /node:sqlite/],
+      ['node-ffi', "export async function apply() { const ffi = await import('node:ffi'); ffi.dlopen('/usr/lib/libSystem.B.dylib') }\n", /node:ffi/],
+    )
+  }
+  // Last: if it got through, it would replace the host.
+  if (typeof process.execve === 'function') {
+    cases.push(['execve', "export function apply() { process.execve(process.execPath, [process.execPath, '-e', '0']) }\n", /process\.execve is not available to extensions/])
+  }
+  // Every case runs, so a regression names each entry point that opened up.
+  // A case that ends the host (an `execve` that got through) ends the run.
+  const reachable = []
+  for (const [name, source, diagnostic] of cases) {
+    const plugin = tempPlugin(source)
+    t.after(plugin.cleanup)
+    const result = await Promise.race([
+      activate(host, name, plugin.entry).then(({ result }) => result),
+      host.exit.then(() => ({ status: 'host exited' })),
+    ])
+    if (result.status !== 'failed' || !diagnostic.test(result.diagnostic)) reachable.push(`${name}: ${result.status} ${result.diagnostic ?? ''}`)
+    if (result.status === 'host exited') break
+  }
+  assert.deepEqual(reachable, [])
+})
+
+test('a host asked for a kernel memory limit applies it only on Bun on macOS', async (t) => {
+  const plugin = tempPlugin(`export const inject = ['tools']
+export function apply(ctx) {
+  ctx.tools.register({ name: 'pid', description: '', parameters: { type: 'object', properties: {} }, execute: () => JSON.stringify({ pid: process.pid, execArgv: process.execArgv }) })
+  ctx.tools.register({ name: 'hog', description: '', parameters: { type: 'object', properties: {} }, async execute() {
+    const chunks = []
+    for (let i = 0; i < 32; i++) { chunks.push(Buffer.alloc(64 * 1024 * 1024, 1)); await new Promise((resolve) => setTimeout(resolve, 5)) }
+    return String(chunks.length)
+  } })
+}
+`)
+  const host = await startHost({ env: { CODEWHALE_HOST_MEMORY_LIMIT_MIB: '300' } })
+  t.after(async () => { await host.stop(); plugin.cleanup() })
+  const { result } = await activate(host, 'memory', plugin.entry)
+  assert.equal(result.status, 'ok')
+  const [pid, hog] = host.registry.filter((entry) => entry.op === 'register').map((entry) => entry.handle)
+  if (!(IS_BUN && process.platform === 'darwin')) {
+    assert.equal(host.hello.memory_limit_mib, undefined)
+    assert.match(host.stderr, /kernel memory limit not applied: only Bun on macOS/)
+    return
+  }
+  assert.equal(host.hello.memory_limit_mib, 300)
+  // Re-executed in place: the pid the core spawned is the one running plugins,
+  // still with every launch flag (`--no-install`, `--no-env-file`, the null
+  // `--config`, `--no-addons`), since the re-exec rebuilds argv from execArgv.
+  const running = await host.call('tool/call', { handle: pid, call_id: 'p', input: {}, deadline_ms: 5000 })
+  const reexecuted = JSON.parse(running.content[0].text)
+  assert.equal(reexecuted.pid, host.child.pid)
+  assert.deepEqual(reexecuted.execArgv, HOST_ARGS)
+  // 2 GiB against a 300 MiB limit: the kernel kills the host.
+  host.request('tool/call', { handle: hog, call_id: 'h', input: {}, deadline_ms: 30_000 })
+  const exit = await Promise.race([host.exit, new Promise((resolve) => setTimeout(() => resolve('still running'), 20_000))])
+  assert.deepEqual(exit, { code: null, signal: 'SIGKILL' })
+})
+
+test('a Bun host never auto-installs a missing package', { skip: !IS_BUN && 'Bun only' }, async (t) => {
+  // A local registry that records requests: no network access. The control
+  // below proves Bun would contact it without `--no-install`.
+  const requests = []
+  const server = createServer((request, response) => {
+    requests.push(request.url)
+    response.statusCode = 404
+    response.end('{}')
+  })
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+  const registry = `http://127.0.0.1:${server.address().port}/`
+  const cache = mkdtempSync(join(tmpdir(), 'cw-bun-cache-'))
+  const env = { BUN_CONFIG_REGISTRY: registry, NPM_CONFIG_REGISTRY: registry, BUN_INSTALL_CACHE_DIR: cache }
+  const plugin = tempPlugin("import 'codewhale-test-not-installed-6600'\nexport function apply() {}\n")
+  const host = await startHost({ env })
+  t.after(async () => { await host.stop(); plugin.cleanup(); server.close(); rmSync(cache, { recursive: true, force: true }) })
+  const { result } = await activate(host, 'needs-install', plugin.entry)
+  assert.equal(result.status, 'failed')
+  assert.match(result.diagnostic, /Cannot find package 'codewhale-test-not-installed-6600'/)
+  assert.deepEqual(requests, [], 'the host must not contact a registry')
+
+  const control = spawn(process.execPath, [plugin.entry], { env: { ...process.env, ...env }, stdio: 'ignore' })
+  await new Promise((resolve) => control.on('exit', resolve))
+  assert.ok(requests.length > 0, 'control: without --no-install, Bun asks the registry')
 })
 
 test('plugins share one Cordis and one schemastery with the host', async (t) => {
@@ -263,7 +403,8 @@ export function apply(ctx) {
   t.after(plugin.cleanup)
   const { result } = await activate(host, 'hijack', plugin.entry)
   assert.equal(result.status, 'failed')
-  assert.match(result.diagnostic, /read only|read-only|not extensible|Cannot assign/i)
+  // V8: "Cannot assign to read only property"; JSC: "Attempted to assign to readonly property."
+  assert.match(result.diagnostic, /read ?only|read-only|not extensible|Cannot assign/i)
 })
 
 test('stdin EOF kills the child processes a plugin started', { skip: process.platform === 'win32' && 'Windows relies on the core\'s Job Object' }, async (t) => {

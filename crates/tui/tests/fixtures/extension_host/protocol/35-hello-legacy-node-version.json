@@ -1,6 +1,6 @@
 {
   "direction": "host_to_core",
-  "valid": true,
+  "valid": false,
   "frame": {
     "jsonrpc": "2.0",
     "method": "host/hello",
@@ -11,10 +11,7 @@
       },
       "host_version": "0.1.0",
       "bundle_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
-      "runtime": {
-        "name": "bun",
-        "version": "1.4.0"
-      }
+      "node_version": "22.20.0"
     }
   }
 }

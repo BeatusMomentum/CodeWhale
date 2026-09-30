@@ -2,8 +2,8 @@
 //!
 //! Codewhale's Rust core stays closed and authoritative: one turn loop, one
 //! event authority, one store, one prompt authority, one approval gate. The
-//! extension host (`crates/tui/extension-host`, a Node process running the
-//! embedded bundle) is the only extensible surface, and in phase 1 it can do
+//! extension host (`crates/tui/extension-host`, a Bun or Node process running
+//! the embedded bundle) is the only extensible surface, and in phase 1 it can do
 //! exactly one thing: contribute tools, which become ordinary registry
 //! `ToolSpec`s ([`tool::HostToolSpec`]) behind the existing gate.
 //!
@@ -44,6 +44,24 @@
 //!   readable, and Mach services are not restricted. On Linux and Windows it
 //!   runs unsandboxed with the user's permissions. Either way the flag is
 //!   Experimental.
+//! * The runtime (`[extension_host] runtime`) defaults to Node. Bun is an
+//!   opt-in (`bun`, or `auto`, which prefers a Bun >= 1.4.0 and uses Node
+//!   when none is found) and is qualified on macOS only. The runtime is
+//!   pinned once a host on it completes the handshake; restarts reuse it
+//!   without probing it again, and the handshake refuses a host reporting a
+//!   different runtime or version. Under `auto`, a Bun that fails to launch or
+//!   handshake before anything is pinned is reported once and Node is used
+//!   for the rest of the session; an explicit `bun`/`node` never falls back.
+//!   The 1 GiB memory cap is applied through `RLIMIT_DATA` on Linux, the Job
+//!   Object on Windows and, for a Bun host on macOS, a jetsam limit the host
+//!   applies to itself; a macOS Node host is checked at each heartbeat
+//!   instead. The Rust host tests have not run a Bun host on Linux or
+//!   Windows (`supervisor` module docs say what was measured where).
+//! * In-process native code is taken away from plugins by the host
+//!   (`extension-host/src/runtime.ts`), for the entry points found so far; a
+//!   native-code entry point a newer runtime adds is not covered until it is
+//!   added there. A process a plugin starts is outside that policy and runs
+//!   under the same OS sandbox (none on Linux and Windows).
 //! * The owner token is a bug/staleness guard, not a boundary between
 //!   plugins that share the process: one plugin can alter another's
 //!   behaviour, which the approval card discloses.
@@ -179,8 +197,13 @@ fn materialize_bundle(root: &Path) -> Result<PathBuf, String> {
 /// Options fixed for the life of one manager.
 #[derive(Debug, Clone, Default)]
 pub struct ExtensionHostOptions {
+    /// `[extension_host] runtime`: `node` (the default), `bun`, or `auto`
+    /// (Bun first).
+    pub runtime: crate::config::ExtensionHostRuntime,
     /// `[extension_host] node`: tried before every `node` on `PATH`.
     pub node_override: Option<PathBuf>,
+    /// `[extension_host] bun`: tried before every `bun` on `PATH`.
+    pub bun_override: Option<PathBuf>,
     /// Where the bundle is materialized; defaults to the Codewhale home.
     pub root: Option<PathBuf>,
     /// Per-manager timings; tests can shorten them without global state.
@@ -198,6 +221,24 @@ pub struct SupervisionOptions {
     pub start_retry_cooldown: Duration,
     pub dirty_window: Duration,
     pub dirty_limit: usize,
+    /// Host memory cap in bytes (`supervisor::HOST_MEMORY_CAP`).
+    pub memory_cap: u64,
+}
+
+impl ExtensionHostOptions {
+    /// Options for the `[extension_host]` table (paths `~`-expanded).
+    #[must_use]
+    pub fn from_config(table: Option<&crate::config::ExtensionHostConfig>) -> Self {
+        let expand = |path: Option<&String>| {
+            path.map(|path| PathBuf::from(shellexpand::tilde(path).as_ref()))
+        };
+        Self {
+            runtime: table.map_or_else(Default::default, |table| table.effective_runtime()),
+            node_override: expand(table.and_then(|table| table.node.as_ref())),
+            bun_override: expand(table.and_then(|table| table.bun.as_ref())),
+            ..Default::default()
+        }
+    }
 }
 
 impl Default for SupervisionOptions {
@@ -212,6 +253,7 @@ impl Default for SupervisionOptions {
             start_retry_cooldown: Duration::from_secs(60),
             dirty_window: Duration::from_secs(10 * 60),
             dirty_limit: 2,
+            memory_cap: supervisor::HOST_MEMORY_CAP,
         }
     }
 }
@@ -267,9 +309,14 @@ pub enum HostStatus {
     Starting,
     Ready {
         pid: Option<u32>,
-        node_version: String,
+        /// `bun` or `node`.
+        runtime: &'static str,
+        /// As reported by the host (`host/hello`).
+        runtime_version: String,
         /// `seatbelt` / `bwrap`, or `None` when the host runs unsandboxed.
         sandbox: Option<String>,
+        /// How the memory cap is enforced for this process.
+        memory: supervisor::MemoryEnforcement,
     },
     Unresponsive {
         pid: Option<u32>,
@@ -317,6 +364,68 @@ pub(crate) struct ManagerShared {
     diagnostics: Mutex<VecDeque<Diagnostic>>,
     /// Lock order: host, supervision, registry. Never held across await.
     supervision: Mutex<SupervisionState>,
+    /// Never held with another lock.
+    runtime: Mutex<RuntimePin>,
+}
+
+/// Which runtime this manager's hosts run on.
+#[derive(Default)]
+struct RuntimePin {
+    /// Set by the first host that completes the handshake and reused by
+    /// every restart, so a session never switches runtime (a `bun` install
+    /// or removal mid-session changes nothing until the next process; a
+    /// binary replaced at the pinned path is refused at the handshake). With
+    /// the one-line summary of why it was chosen, for `/plugin`.
+    pinned: Option<(crate::dependencies::HostRuntime, String)>,
+    /// `runtime = "auto"` only: a Bun host failed to launch or handshake
+    /// before anything was pinned, so every later launch this session
+    /// resolves Node.
+    bun_failed: bool,
+}
+
+/// Resolve the runtime unless one is pinned, materialize the bundle and plan
+/// the launch. Returns the summary to pin once a host on this runtime
+/// completes the handshake, or `None` when the runtime was already pinned.
+/// Blocking.
+fn prepare_launch(
+    options: &ExtensionHostOptions,
+    pinned: Option<(crate::dependencies::HostRuntime, String)>,
+    bun_failed: bool,
+) -> Result<(supervisor::HostLaunch, Option<String>), String> {
+    let (runtime, summary) = match pinned {
+        Some((runtime, _)) => (runtime, None),
+        None => {
+            let choice = if bun_failed {
+                crate::config::ExtensionHostRuntime::Node
+            } else {
+                options.runtime
+            };
+            let mut resolution = crate::dependencies::resolve_extension_host_runtime(
+                choice,
+                options.node_override.as_deref(),
+                options.bun_override.as_deref(),
+            );
+            // Report the configured choice, not the Node-only fallback.
+            resolution.choice = options.runtime;
+            let note = if bun_failed {
+                "; Bun failed to start this session (see diagnostics)"
+            } else {
+                ""
+            };
+            let Some(runtime) = resolution.selected.clone() else {
+                return Err(format!("{}{note}", resolution.failure()));
+            };
+            (runtime, Some(format!("{}{note}", resolution.summary())))
+        }
+    };
+    let root = match options.root.clone() {
+        Some(root) => root,
+        None => codewhale_config::codewhale_home()
+            .map_err(|error| format!("Codewhale home unavailable: {error}"))?,
+    };
+    let bundle = materialize_bundle(&root)?;
+    let launch = supervisor::plan_launch(&runtime, &bundle, &root, options.supervision.memory_cap)?;
+    Ok((launch, summary))
 }
 
 impl ManagerShared {
@@ -665,6 +774,20 @@ fn monitor_host(shared: &Arc<ManagerShared>, host: &Arc<HostProcess>, generation
             if restart_dirty_host_when_idle(&shared, &host, generation) {
                 return;
             }
+            // Only where no kernel limit is planned (a macOS Node host).
+            if host.memory() == supervisor::MemoryEnforcement::Heartbeat
+                && let Some(resident) = host.pid.and_then(supervisor::resident_bytes)
+                && resident > host.memory_cap
+            {
+                shared.diagnostic(format!(
+                    "extension host exceeded its memory cap ({} MiB resident, cap {} MiB); killed",
+                    resident / (1024 * 1024),
+                    host.memory_cap / (1024 * 1024)
+                ));
+                drop(shared);
+                host.terminate("exceeded the memory cap".into());
+                return;
+            }
             drop(shared);
             let (id, mut answer) = match host.start_request(CoreRequest::Ping, None) {
                 Ok(request) => {
@@ -752,6 +875,7 @@ impl ExtensionHostManager {
                 sync_lock: tokio::sync::Mutex::new(()),
                 diagnostics: Mutex::new(VecDeque::new()),
                 supervision: Mutex::new(SupervisionState::default()),
+                runtime: Mutex::new(RuntimePin::default()),
             }),
         }
     }
@@ -766,8 +890,10 @@ impl ExtensionHostManager {
             },
             HostSlot::Ready(host) => HostStatus::Ready {
                 pid: host.pid,
-                node_version: host.node_version.get().cloned().unwrap_or_default(),
+                runtime: host.runtime.kind.name(),
+                runtime_version: host.runtime_version.get().cloned().unwrap_or_default(),
                 sandbox: host.sandbox.clone(),
+                memory: host.memory(),
             },
             HostSlot::Unresponsive(host) => HostStatus::Unresponsive { pid: host.pid },
             HostSlot::Restarting { reason } => HostStatus::Restarting {
@@ -781,6 +907,19 @@ impl ExtensionHostManager {
                 stderr_tail: stderr_tail.clone(),
             },
         }
+    }
+
+    /// The pinned runtime's one-line summary, once a host on it has completed
+    /// the handshake.
+    #[must_use]
+    pub fn runtime_summary(&self) -> Option<String> {
+        self.shared
+            .runtime
+            .lock()
+            .expect("runtime lock")
+            .pinned
+            .as_ref()
+            .map(|(_, summary)| summary.clone())
     }
 
     /// How many times this manager has tried to start a host process.
@@ -1216,7 +1355,7 @@ impl ExtensionHostManager {
 
     async fn ensure_host(&self, policy: bool) -> Result<Arc<HostProcess>, String> {
         let shared = &self.shared;
-        let generation = {
+        let mut generation = {
             let mut slot = shared.host.lock().expect("host lock");
             match &*slot {
                 HostSlot::Ready(host) if !host.has_exited() && !host.is_retiring() => {
@@ -1244,52 +1383,82 @@ impl ExtensionHostManager {
             supervision.planned_restart = None;
             shared.host_generation.fetch_add(1, Ordering::SeqCst) + 1
         };
-        shared.spawn_attempts.fetch_add(1, Ordering::SeqCst);
-        let options = shared.options.clone();
-        let prepared = tokio::task::spawn_blocking(move || -> Result<supervisor::HostLaunch, String> {
-            let resolution =
-                crate::dependencies::resolve_node_for_extension_host(options.node_override.as_deref());
-            let Some((node, _)) = resolution.selected else {
-                return Err(format!(
-                    "the extension host needs Node.js ^22.19 || >=24 (set `[extension_host] node`); {}",
-                    resolution.describe_rejections()
-                ));
+        // At most two launches: under `auto`, before anything is pinned, a
+        // Bun that cannot start is reported once and Node is resolved for the
+        // rest of the session. An explicit `bun` or `node` never falls back.
+        let spawned = loop {
+            shared.spawn_attempts.fetch_add(1, Ordering::SeqCst);
+            let options = shared.options.clone();
+            let (pinned, bun_failed) = {
+                let runtime = shared.runtime.lock().expect("runtime lock");
+                (runtime.pinned.clone(), runtime.bun_failed)
             };
-            let root = match options.root {
-                Some(root) => root,
-                None => codewhale_config::codewhale_home()
-                    .map_err(|error| format!("Codewhale home unavailable: {error}"))?,
+            let prepared =
+                tokio::task::spawn_blocking(move || prepare_launch(&options, pinned, bun_failed))
+                    .await
+                    .map_err(|error| format!("extension host preparation failed: {error}"))
+                    .and_then(|result| result);
+            let (launch, summary) = match prepared {
+                Ok(prepared) => prepared,
+                Err(error) => break Err(error),
             };
-            let bundle = materialize_bundle(&root)?;
-            supervisor::plan_launch(&node, &bundle, &root)
-        })
-        .await
-        .map_err(|error| format!("extension host preparation failed: {error}"))
-        .and_then(|result| result);
-        let spawned = match prepared {
-            Ok(launch) => {
-                let events: Arc<dyn HostEvents> = Arc::new(Events {
-                    shared: Arc::downgrade(shared),
-                    generation,
-                });
-                HostProcess::spawn(generation, &launch, bundle_sha256(), events).await
+            let events: Arc<dyn HostEvents> = Arc::new(Events {
+                shared: Arc::downgrade(shared),
+                generation,
+            });
+            let reason =
+                match HostProcess::spawn(generation, &launch, bundle_sha256(), events).await {
+                    Ok(host) => break Ok((host, summary)),
+                    Err(reason) => reason,
+                };
+            if shared.options.runtime != crate::config::ExtensionHostRuntime::Auto
+                || launch.runtime.kind != crate::dependencies::HostRuntimeKind::Bun
+                || summary.is_none()
+            {
+                break Err(reason);
             }
-            Err(error) => Err(error),
+            shared.runtime.lock().expect("runtime lock").bun_failed = true;
+            shared.diagnostic(format!(
+                "extension host: Bun {} at {} failed to start ({reason}); runtime = \"auto\" uses Node for the rest of this session",
+                launch.runtime.version_string(),
+                launch.runtime.path.display()
+            ));
+            // A fresh generation, so the failed Bun host's exit report can
+            // never be taken for the Node host's.
+            generation = {
+                let slot = shared.host.lock().expect("host lock");
+                if shared.host_generation.load(Ordering::SeqCst) != generation
+                    || !matches!(&*slot, HostSlot::Starting)
+                {
+                    break Err("extension host startup was superseded".into());
+                }
+                shared.host_generation.fetch_add(1, Ordering::SeqCst) + 1
+            };
         };
         let mut slot = shared.host.lock().expect("host lock");
         if shared.host_generation.load(Ordering::SeqCst) != generation
             || !matches!(&*slot, HostSlot::Starting)
         {
             drop(slot);
-            if let Ok(host) = spawned {
+            if let Ok((host, _)) = spawned {
                 host.terminate("host startup superseded".into());
             }
             return Err("extension host startup was superseded".into());
         }
         match spawned {
-            Ok(host) => {
+            Ok((host, summary)) => {
                 *slot = HostSlot::Ready(Arc::clone(&host));
                 drop(slot);
+                // Pinned only once a host on this runtime has completed the
+                // handshake; every restart then reuses it.
+                if let Some(summary) = summary {
+                    let mut runtime = shared.runtime.lock().expect("runtime lock");
+                    if runtime.pinned.is_none() {
+                        runtime.pinned = Some((host.runtime.clone(), summary.clone()));
+                        drop(runtime);
+                        shared.diagnostic(format!("extension host runtime: {summary}"));
+                    }
+                }
                 if host.has_exited() {
                     Events {
                         shared: Arc::downgrade(shared),
@@ -1304,10 +1473,11 @@ impl ExtensionHostManager {
                 }
                 monitor_host(shared, &host, generation);
                 shared.diagnostic(format!(
-                    "extension host started (pid {}, node {}, sandbox {})",
+                    "extension host started (pid {}, {} {}, sandbox {})",
                     host.pid
                         .map_or_else(|| "?".to_string(), |pid| pid.to_string()),
-                    host.node_version.get().map_or("?", String::as_str),
+                    host.runtime.kind.name(),
+                    host.runtime_version.get().map_or("?", String::as_str),
                     host.sandbox.as_deref().unwrap_or("none")
                 ));
                 Ok(host)
@@ -1374,19 +1544,22 @@ impl ExtensionHostManager {
 pub(crate) fn render_status(manager: &ExtensionHostManager) -> String {
     use std::fmt::Write as _;
     let mut out = String::from("Extension host (experimental): ");
-    match manager.status() {
+    let status = manager.status();
+    match status.clone() {
         HostStatus::Idle => out.push_str(
             "not running (starts in the background when a reviewed plugin with host code is enabled)",
         ),
         HostStatus::Starting => out.push_str("starting"),
         HostStatus::Ready {
             pid,
-            node_version,
+            runtime,
+            runtime_version,
             sandbox,
+            memory: _,
         } => {
             let _ = write!(
                 out,
-                "running · pid {} · node {node_version} · {}",
+                "running · pid {} · {runtime} {runtime_version} · {}",
                 pid.map_or_else(|| "?".to_string(), |pid| pid.to_string()),
                 match sandbox {
                     Some(sandbox) => format!(
@@ -1414,6 +1587,15 @@ pub(crate) fn render_status(manager: &ExtensionHostManager) -> String {
                     .map_or(0, |(index, _)| index);
                 let _ = write!(out, "\n  stderr: {}", &tail[start..]);
             }
+        }
+    }
+    if let Some(summary) = manager.runtime_summary() {
+        let _ = write!(out, "\n  runtime: {summary}");
+        // How the running host's cap is enforced, as its handshake settled
+        // it; with no host running there is nothing enforced to describe.
+        if let HostStatus::Ready { memory, .. } = &status {
+            let cap = manager.shared.options.supervision.memory_cap;
+            let _ = write!(out, " · {}", memory.describe(cap));
         }
     }
     let _ = write!(

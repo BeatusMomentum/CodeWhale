@@ -173,6 +173,9 @@
   "crates/tui/src/core/engine/tool_execution.rs": {
     "std_fs": 1
   },
+  "crates/tui/src/dependencies.rs": {
+    "std_fs": 2
+  },
   "crates/tui/src/dispatch_runner.rs": {
     "std_fs": 2
   },
