@@ -901,6 +901,11 @@ async function callTool(params) {
       try { teardown = await destroyDockerComputer(entry); }
       catch (err) { teardown = { destroyed: false, cleanup_error: err.message ?? String(err) }; }
     }
+    if (teardown?.reason === "other_session") {
+      // Another live (or crashed) MCP session owns this desktop. Leave its
+      // container and registry entry alone; the owner removes both at exit.
+      return { content: [{ type: "text", text: JSON.stringify(fail(entry, "computer_owned_elsewhere", `computer "${entry.id}" was spawned by another session and is still its disposable desktop — it is removed when that session ends. If that session is gone, remove the container with docker rm -f ${entry.container}.`)) }], isError: true };
+    }
     const res = registry.remove(args.computer);
     if (activeComputerId === args.computer) activeComputerId = "local";
     res.active = activeComputerId;
@@ -1107,7 +1112,12 @@ async function callTool(params) {
         const timeoutMs = backendMethod.startsWith("recording") || backendMethod === "get_app_state" ? 60_000 : 30_000;
         const invoke = async (tool, a) => {
           const r = await remoteCall({ tool, args: a }, { timeoutMs });
-          if (!r.ok) throw new ServerError(r.error?.code ?? "remote_error", r.error?.message ?? "remote agent failed");
+          if (!r.ok) {
+            const error = new ServerError(r.error?.code ?? "remote_error", r.error?.message ?? "remote agent failed");
+            // The helper's backend reported that input may already have landed.
+            if (r.error?.request_dispatched === true) error.requestDispatched = true;
+            throw error;
+          }
           return r.data;
         };
         data = name === "type" ? await invokeType(invoke, wireArgs) : await invoke(backendMethod, wireArgs);
@@ -1246,7 +1256,9 @@ async function callTool(params) {
     // A failed open_application cleared the backend's input binding before it
     // attempted anything — the tracked bound app must not claim otherwise.
     if (name === "open_application") boundApps.delete(computer.id);
-    let outcomeUnknown = !!err.requestDispatched;
+    // A local backend that timed out or was cancelled after posting input
+    // (inputMayHaveBeenSent) is as unknown as a transport that lost the reply.
+    let outcomeUnknown = !!(err.requestDispatched || err.inputMayHaveBeenSent);
     if (dispatched && !outcomeUnknown) {
       // A transport/backend can fail after delivering input. Reconcile its
       // captured route on failure too, without replacing the original error

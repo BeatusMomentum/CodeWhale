@@ -29,6 +29,9 @@ crates/tui/src/commands/fixtures/*.md text eol=lf
 # with LF, so a CRLF checkout failed every Windows baseline parity test with a
 # pure \r\n diff.
 crates/tui/src/commands/fixtures/diagnostics/* text eol=lf
+# Conformance fixtures are recorded wire bytes (SSE framing is line-exact) and
+# goldens compared byte for byte; a CRLF checkout must not rewrite either.
+crates/tui/tests/fixtures/conformance/** text eol=lf
 crates/*/assets/**/*.json text eol=lf
 crates/*/assets/**/*.md text eol=lf
 crates/*/locales/*.json text eol=lf

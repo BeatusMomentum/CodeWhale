@@ -41,7 +41,10 @@ function canonicalHostRedirect(req: NextRequest): NextResponse | null {
   const url = req.nextUrl.clone();
   url.host = CANONICAL_HOST;
   url.port = "";
-  return NextResponse.redirect(url, 301);
+  // 308, not 301: clients may turn a 301'd POST (the admin login and post
+  // forms) into a GET and drop its body. 308 keeps the method and body and is
+  // still a permanent move for crawlers.
+  return NextResponse.redirect(url, 308);
 }
 
 /**

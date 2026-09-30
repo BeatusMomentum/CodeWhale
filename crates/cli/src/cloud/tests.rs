@@ -203,6 +203,19 @@ fn agent_thread(id: &str, agent_id: &str, title: &str) -> serde_json::Value {
     })
 }
 
+fn route_catalog() -> serde_json::Value {
+    json!({
+        "providers": [{
+            "id": "deepseek",
+            "label": "DeepSeek",
+            "runtimeProvider": "deepseek",
+            "availability": "account_key",
+            "connectionAvailable": true,
+            "models": ["deepseek-v4-pro", "deepseek-flash"]
+        }]
+    })
+}
+
 #[test]
 fn parses_cloud_command_matrix_and_rejects_inline_keys() {
     assert!(matches!(
@@ -2247,6 +2260,7 @@ fn account_agents_create_model_bound_thread_and_send_with_same_session() {
         response(200, json!({ "agents": [a.clone()] })),
         response(201, json!({ "agent": a.clone() })),
         response(200, json!({ "agents": [a.clone()] })),
+        response(200, route_catalog()),
         response(201, json!({ "thread": t.clone(), "id": "thread-1" })),
         response(200, json!({ "agents": [a.clone()] })),
         response(200, json!([t.clone()])),
@@ -2344,6 +2358,7 @@ fn account_agents_create_model_bound_thread_and_send_with_same_session() {
             "/api/agents",
             "/api/agents",
             "/api/agents",
+            "/api/model-providers",
             "/v1/threads",
             "/api/agents",
             "/v1/threads/summary?agentId=agent-1&limit=100",
@@ -2355,17 +2370,17 @@ fn account_agents_create_model_bound_thread_and_send_with_same_session() {
             "/v1/threads/thread-1/events?since_seq=0",
         ]
     );
-    assert!(
-        requests
-            .iter()
-            .all(|request| request.bearer.as_deref() == Some("access-secret"))
-    );
+    // The model catalog is public: no credential rides along with that read.
+    assert!(requests.iter().all(|request| {
+        request.bearer.as_deref()
+            == (request.path != "/api/model-providers").then_some("access-secret")
+    }));
     assert_eq!(
         serde_json::from_slice::<serde_json::Value>(requests[1].body.as_ref().unwrap()).unwrap(),
         json!({ "name": "Whale", "projectId": "project-codewhale", "operationKey": "create-1" })
     );
     assert_eq!(
-        serde_json::from_slice::<serde_json::Value>(requests[3].body.as_ref().unwrap()).unwrap(),
+        serde_json::from_slice::<serde_json::Value>(requests[4].body.as_ref().unwrap()).unwrap(),
         json!({
             "title": "Main", "productMode": "chat", "mode": "chat",
             "agentId": "agent-1", "projectId": "project-codewhale",
@@ -2374,7 +2389,7 @@ fn account_agents_create_model_bound_thread_and_send_with_same_session() {
         })
     );
     assert_eq!(
-        serde_json::from_slice::<serde_json::Value>(requests[8].body.as_ref().unwrap()).unwrap(),
+        serde_json::from_slice::<serde_json::Value>(requests[9].body.as_ref().unwrap()).unwrap(),
         json!({
             "prompt": "Build this", "billingMode": "byok_external",
             "modelProvider": "deepseek", "modelProviderId": "",
@@ -2810,7 +2825,8 @@ fn account_agent_work_records_one_idempotent_request_without_allocating_compute(
     );
     let shown = String::from_utf8(output).unwrap();
     assert!(shown.contains("Work ID: run-1"));
-    assert!(shown.contains("Hosted compute needs a separate reviewed quote and launch."));
+    assert!(shown.contains("Work is recorded, not started."));
+    assert!(shown.contains("work-quote run-1 --operation-key"));
 }
 
 #[test]
@@ -2911,6 +2927,7 @@ fn account_agents_new_thread_omits_an_unbound_project_and_preserves_a_bound_one(
     default_project_thread["projectId"] = json!("project-general");
     let unbound = FakeTransport::new(vec![
         response(200, json!({ "agents": [unbound_agent] })),
+        response(200, route_catalog()),
         response(201, json!({ "thread": default_project_thread })),
     ]);
     let unbound_client = CloudClient::new(&unbound, &secrets, "default", DEFAULT_API_BASE);
@@ -2927,15 +2944,16 @@ fn account_agents_new_thread_omits_an_unbound_project_and_preserves_a_bound_one(
             .unwrap()
             .contains("ID: thread-1")
     );
-    assert_eq!(unbound.requests().len(), 2);
+    assert_eq!(unbound.requests().len(), 3);
     let unbound_body: serde_json::Value =
-        serde_json::from_slice(unbound.requests()[1].body.as_ref().unwrap()).unwrap();
+        serde_json::from_slice(unbound.requests()[2].body.as_ref().unwrap()).unwrap();
     assert!(unbound_body.get("projectId").is_none());
 
     let mut foreign_thread = agent_thread("thread-1", "agent-1", "Main");
     foreign_thread["projectId"] = json!("project-other");
     let foreign = FakeTransport::new(vec![
         response(200, json!({ "agents": [agent("agent-1", "Whale")] })),
+        response(200, route_catalog()),
         response(201, json!({ "thread": foreign_thread })),
     ]);
     let foreign_client = CloudClient::new(&foreign, &secrets, "default", DEFAULT_API_BASE);
@@ -2950,9 +2968,9 @@ fn account_agents_new_thread_omits_an_unbound_project_and_preserves_a_bound_one(
     assert!(error.to_string().contains("different Project"));
     assert!(output.is_empty());
     let requests = foreign.requests();
-    assert_eq!(requests.len(), 2);
+    assert_eq!(requests.len(), 3);
     assert_eq!(
-        serde_json::from_slice::<serde_json::Value>(requests[1].body.as_ref().unwrap()).unwrap()["projectId"],
+        serde_json::from_slice::<serde_json::Value>(requests[2].body.as_ref().unwrap()).unwrap()["projectId"],
         "project-codewhale"
     );
 }
@@ -3122,4 +3140,1691 @@ fn account_agents_do_not_claim_a_turn_when_runtime_is_unattached() {
     assert!(error.to_string().contains("chat_runtime_not_attached"));
     assert!(output.is_empty());
     assert_eq!(transport.requests().len(), 3);
+}
+
+// ---- Account Work journey (work.rs) -------------------------------------
+
+const WORK_ID: &str = "123e4567-e89b-42d3-a456-426614174000";
+
+enum Scripted {
+    Reply(CloudResponse),
+    Unreachable,
+}
+
+/// A transport that can also lose the connection, which `FakeTransport`
+/// cannot: a lost reply is the case mutating commands must report honestly.
+struct ScriptedTransport {
+    steps: Mutex<VecDeque<Scripted>>,
+    requests: Mutex<Vec<CloudRequest>>,
+}
+
+impl ScriptedTransport {
+    fn new(steps: Vec<Scripted>) -> Self {
+        Self {
+            steps: Mutex::new(steps.into()),
+            requests: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn requests(&self) -> std::sync::MutexGuard<'_, Vec<CloudRequest>> {
+        self.requests.lock().unwrap()
+    }
+}
+
+impl CloudTransport for ScriptedTransport {
+    fn execute(&self, request: CloudRequest) -> Result<CloudResponse> {
+        self.requests.lock().unwrap().push(request);
+        match self.steps.lock().unwrap().pop_front() {
+            Some(Scripted::Reply(reply)) => Ok(reply),
+            Some(Scripted::Unreachable) => Err(CloudTransportError::new(
+                "could not reach the Codewhale service",
+                std::io::Error::other("connection reset"),
+            )
+            .into()),
+            None => Err(anyhow!("scripted transport exhausted")),
+        }
+    }
+}
+
+fn reply(status: u16, body: serde_json::Value) -> Scripted {
+    Scripted::Reply(response(status, body))
+}
+
+fn signed_in() -> Secrets {
+    let (secrets, _) = test_secrets();
+    AccountSessionStore::new(secrets.clone(), Some("default"), DEFAULT_API_BASE)
+        .save(auth("access-secret", "refresh-secret", "acct-123"))
+        .unwrap();
+    secrets
+}
+
+/// Run one agents subcommand and return its result with everything it printed.
+fn run_agent_command(
+    transport: &impl CloudTransport,
+    secrets: &Secrets,
+    argv: &[&str],
+) -> (Result<()>, String) {
+    let CloudCommand::Agents(agents) = command(argv) else {
+        panic!("expected an agents command");
+    };
+    let client = CloudClient::new(transport, secrets, "default", DEFAULT_API_BASE);
+    let mut output = Vec::new();
+    let result = run_agents(
+        agents.command,
+        &client,
+        &machine::MachineKeyEnv::default(),
+        &mut output,
+    );
+    (result, String::from_utf8(output).unwrap())
+}
+
+fn run_github_command(
+    transport: &impl CloudTransport,
+    secrets: &Secrets,
+    machine: &machine::MachineKeyEnv,
+    argv: &[&str],
+) -> (Result<()>, String) {
+    let CloudCommand::Github(github) = command(argv) else {
+        panic!("expected a github command");
+    };
+    let client = CloudClient::new(transport, secrets, "default", DEFAULT_API_BASE);
+    let mut output = Vec::new();
+    let result = run_github(github.command, &client, machine, &mut output);
+    (result, String::from_utf8(output).unwrap())
+}
+
+fn chain(err: &anyhow::Error) -> String {
+    format!("{err:#}")
+}
+
+fn body_of(request: &CloudRequest) -> serde_json::Value {
+    serde_json::from_slice(request.body.as_ref().expect("request body")).unwrap()
+}
+
+fn work_message(intent: &str, extra: serde_json::Value, work: serde_json::Value) -> CloudResponse {
+    let mut body = json!({ "intent": intent, "work": work });
+    for (key, value) in extra.as_object().unwrap() {
+        body[key] = value.clone();
+    }
+    response(200, body)
+}
+
+fn work_item(status: &str) -> serde_json::Value {
+    json!({ "id": "run-1", "agentId": "agent-1", "status": status, "objective": "Fix the build" })
+}
+
+fn agents_step() -> Scripted {
+    reply(200, json!({ "agents": [agent("agent-1", "Whale")] }))
+}
+
+fn work_command(message_id: &str) -> Vec<String> {
+    [
+        "codewhale",
+        "account",
+        "agents",
+        "work",
+        "Whale",
+        "Fix the build",
+        "--message-id",
+        message_id,
+    ]
+    .map(String::from)
+    .to_vec()
+}
+
+fn run_work(transport: &impl CloudTransport, secrets: &Secrets) -> (Result<()>, String) {
+    let argv = work_command("work-1");
+    let argv = argv.iter().map(String::as_str).collect::<Vec<_>>();
+    run_agent_command(transport, secrets, &argv)
+}
+
+fn work_run(state: &str) -> serde_json::Value {
+    json!({ "run": {
+        "id": WORK_ID, "agentId": "agent-1", "projectId": "project-codewhale",
+        "title": "Fix the build", "state": state, "repo": "octo-org/app", "repoProvider": "github"
+    } })
+}
+
+fn projects_step() -> Scripted {
+    reply(
+        200,
+        json!({ "projects": [{
+            "id": "project-codewhale", "name": "Codewhale",
+            "defaultRepoProvider": "github", "defaultRepo": "octo-org/app"
+        }] }),
+    )
+}
+
+fn boat_quote() -> serde_json::Value {
+    json!({
+        "runner": {},
+        "quote": { "sku": "boat-small", "adapter": "boat", "target": "eu", "pricingStatus": "provider_trial" },
+        "disclosure": {
+            "funding": "provider_trial", "customerCreditsChargedUsd": 0,
+            "providerCostEstimateUsd": 0.0207, "sandboxTargetRegion": "eu",
+            "euPlacementConsentRequired": true,
+            "modelInference": { "billing": "byok_external" },
+            "computerTime": { "estimatedSeconds": 300 }
+        },
+        "confirmation": {
+            "token": "tok.abc-123_DEF", "expiresAt": "2026-09-30T12:00:00.000Z", "workRunId": WORK_ID
+        },
+        "confirmCopy": {
+            "title": "Run this five-minute Boat trial Work?",
+            "body": "Boat trial credit covers its computer time.\u{1b}[31m",
+            "confirmLabel": "Start trial Work"
+        }
+    })
+}
+
+/// POST /api/cloud-sessions replies `{ "session": {...} }`.
+fn cloud_session() -> serde_json::Value {
+    json!({ "session": {
+        "id": format!("session_{WORK_ID}"),
+        "run": { "id": WORK_ID, "state": "planning" },
+        "attempt": { "status": "accepted" },
+        "sandbox": { "provider": "boat", "providerId": "bx_abcd1234", "status": "running" },
+        "sandboxTargetRegion": "eu",
+        "quote": { "customerCreditsChargedUsd": 0 },
+        "initialTurn": { "status": "queued" }
+    } })
+}
+
+const QUOTE_ARGV: [&str; 7] = [
+    "codewhale",
+    "account",
+    "agents",
+    "work-quote",
+    WORK_ID,
+    "--operation-key",
+    "launch-1",
+];
+const LAUNCH_ARGV: [&str; 10] = [
+    "codewhale",
+    "account",
+    "agents",
+    "work-launch",
+    WORK_ID,
+    "--operation-key",
+    "launch-1",
+    "--confirmation",
+    "tok.abc-123_DEF",
+    "--confirm-eu-compute",
+];
+
+#[test]
+fn work_journey_commands_parse_and_are_documented_in_help() {
+    assert!(matches!(
+        command(&["codewhale", "account", "agents", "work-cancel", "run-1"]),
+        CloudCommand::Agents(CloudAgentsArgs {
+            command: CloudAgentsCommand::WorkCancel {
+                queue: None,
+                reason: None,
+                ..
+            }
+        })
+    ));
+    assert!(matches!(
+        command(&[
+            "codewhale",
+            "account",
+            "agents",
+            "work-cancel",
+            "run-1",
+            "--queue",
+            "park",
+            "--reason",
+            "wrong repo"
+        ]),
+        CloudCommand::Agents(CloudAgentsArgs {
+            command: CloudAgentsCommand::WorkCancel {
+                queue: Some(WorkQueueChoice::Park),
+                reason: Some(_),
+                ..
+            }
+        })
+    ));
+    assert!(matches!(
+        command(&[
+            "codewhale",
+            "account",
+            "agents",
+            "work-cancel",
+            "run-1",
+            "--queue",
+            "discard"
+        ]),
+        CloudCommand::Agents(CloudAgentsArgs {
+            command: CloudAgentsCommand::WorkCancel {
+                queue: Some(WorkQueueChoice::Discard),
+                ..
+            }
+        })
+    ));
+    assert!(
+        Cli::try_parse_from([
+            "codewhale",
+            "account",
+            "agents",
+            "work-cancel",
+            "run-1",
+            "--queue",
+            "keep"
+        ])
+        .is_err()
+    );
+    assert!(matches!(
+        command(&[
+            "codewhale",
+            "account",
+            "agents",
+            "work-result",
+            "run-1",
+            "--json"
+        ]),
+        CloudCommand::Agents(CloudAgentsArgs {
+            command: CloudAgentsCommand::WorkResult { json: true, .. }
+        })
+    ));
+    assert!(matches!(
+        command(&QUOTE_ARGV),
+        CloudCommand::Agents(CloudAgentsArgs {
+            command: CloudAgentsCommand::WorkQuote { .. }
+        })
+    ));
+    assert!(matches!(
+        command(&LAUNCH_ARGV),
+        CloudCommand::Agents(CloudAgentsArgs {
+            command: CloudAgentsCommand::WorkLaunch {
+                confirm_eu_compute: true,
+                ..
+            }
+        })
+    ));
+    assert!(matches!(
+        command(&[
+            "codewhale",
+            "account",
+            "agents",
+            "work-launch",
+            WORK_ID,
+            "--operation-key",
+            "k",
+            "--confirmation",
+            "t"
+        ]),
+        CloudCommand::Agents(CloudAgentsArgs {
+            command: CloudAgentsCommand::WorkLaunch {
+                confirm_eu_compute: false,
+                ..
+            }
+        })
+    ));
+    for missing_key in [
+        vec!["codewhale", "account", "agents", "work-quote", WORK_ID],
+        vec![
+            "codewhale",
+            "account",
+            "agents",
+            "work-launch",
+            WORK_ID,
+            "--confirmation",
+            "t",
+        ],
+        vec![
+            "codewhale",
+            "account",
+            "agents",
+            "work-launch",
+            WORK_ID,
+            "--operation-key",
+            "k",
+        ],
+    ] {
+        assert!(Cli::try_parse_from(missing_key).is_err());
+    }
+    assert!(matches!(
+        command(&["codewhale", "account", "github", "bind", "octo-org/app"]),
+        CloudCommand::Github(CloudGithubArgs {
+            command: CloudGithubCommand::Bind {
+                installation_id: None,
+                ..
+            }
+        })
+    ));
+    assert!(matches!(
+        command(&[
+            "codewhale",
+            "account",
+            "github",
+            "bind",
+            "octo-org/app",
+            "--installation-id",
+            "987"
+        ]),
+        CloudCommand::Github(CloudGithubArgs {
+            command: CloudGithubCommand::Bind {
+                installation_id: Some(_),
+                ..
+            }
+        })
+    ));
+
+    let help = |argv: &[&str]| Cli::try_parse_from(argv).unwrap_err().to_string();
+    let agents_help = help(&["codewhale", "account", "agents", "--help"]);
+    for name in [
+        "work-cancel",
+        "work-result",
+        "work-quote",
+        "work-launch",
+        "work-status",
+    ] {
+        assert!(agents_help.contains(name), "agents --help must list {name}");
+    }
+    assert!(
+        help(&["codewhale", "account", "agents", "work-launch", "--help"])
+            .contains("--confirm-eu-compute")
+    );
+    assert!(help(&["codewhale", "account", "agents", "work-cancel", "--help"]).contains("--queue"));
+    assert!(help(&["codewhale", "account", "github", "--help"]).contains("bind"));
+}
+
+#[test]
+fn work_reports_what_the_agent_actually_did_with_the_message() {
+    // A control verb acts on existing Work: it must say which action was
+    // applied and never claim new Work was recorded.
+    let secrets = signed_in();
+    let transport = FakeTransport::new(vec![
+        response(200, json!({ "agents": [agent("agent-1", "Whale")] })),
+        work_message(
+            "control",
+            json!({ "reason": "control_verb:stop", "controlAction": "stop", "confident": true }),
+            work_item("canceled"),
+        ),
+    ]);
+    let (result, output) = run_work(&transport, &secrets);
+    result.unwrap();
+    assert!(output.contains("Intent: control"));
+    assert!(output.contains("Applied control action: stop"));
+    assert!(output.contains("Reason: control_verb:stop"));
+    assert!(output.contains("Status: canceled"));
+    assert!(!output.contains("Work is recorded"));
+    assert!(!output.contains("work-quote"));
+
+    let transport = FakeTransport::new(vec![
+        response(200, json!({ "agents": [agent("agent-1", "Whale")] })),
+        work_message(
+            "correction",
+            json!({ "reason": "correction_marker", "confident": true }),
+            work_item("running"),
+        ),
+    ]);
+    let (result, output) = run_work(&transport, &secrets);
+    result.unwrap();
+    assert!(output.contains("edited the objective of active Work"));
+    assert!(output.contains("No new Work was created"));
+    assert!(!output.contains("Work is recorded"));
+
+    let transport = FakeTransport::new(vec![
+        response(200, json!({ "agents": [agent("agent-1", "Whale")] })),
+        work_message(
+            "informational",
+            json!({ "reason": "no_action_signal", "confident": false, "suggestion": "the build is red" }),
+            json!(null),
+        ),
+    ]);
+    let (result, output) = run_work(&transport, &secrets);
+    result.unwrap();
+    assert!(output.contains("No Work was created and nothing was changed."));
+    assert!(output.contains("Suggestion: the build is red"));
+    assert!(output.contains("not confident"));
+    assert!(!output.contains("Work is recorded"));
+
+    let transport = FakeTransport::new(vec![
+        response(200, json!({ "agents": [agent("agent-1", "Whale")] })),
+        work_message(
+            "actionable",
+            json!({ "reason": "imperative_verb", "confident": true }),
+            work_item("queued"),
+        ),
+    ]);
+    let (result, output) = run_work(&transport, &secrets);
+    result.unwrap();
+    assert!(output.contains("Work is recorded, not started."));
+    assert!(output.contains("work-quote run-1 --operation-key"));
+    assert!(output.contains("Message ID: work-1"));
+
+    // A control action with no Work record cannot be confirmed, so it fails.
+    let transport = FakeTransport::new(vec![
+        response(200, json!({ "agents": [agent("agent-1", "Whale")] })),
+        work_message("control", json!({ "controlAction": "stop" }), json!(null)),
+    ]);
+    let (result, output) = run_work(&transport, &secrets);
+    assert!(chain(&result.unwrap_err()).contains("returned no Work record"));
+    assert!(output.is_empty());
+}
+
+#[test]
+fn work_transport_and_server_failures_point_at_the_same_message_id() {
+    let secrets = signed_in();
+    for lost in [
+        vec![agents_step(), Scripted::Unreachable],
+        vec![
+            agents_step(),
+            reply(503, json!({ "code": "runtime_unavailable" })),
+        ],
+        // A truncated 2xx: the service acted, so the same hint applies.
+        vec![
+            agents_step(),
+            Scripted::Reply(CloudResponse {
+                status: 201,
+                body: b"{\"intent\":".to_vec(),
+                retry_after: None,
+            }),
+        ],
+    ] {
+        let transport = ScriptedTransport::new(lost);
+        let (result, output) = run_work(&transport, &secrets);
+        let message = chain(&result.unwrap_err());
+        assert!(
+            message.contains("may or may not have reached Codewhale"),
+            "{message}"
+        );
+        assert!(message.contains("--message-id work-1"), "{message}");
+        assert!(
+            message.contains("never creates a second Work for the same instruction"),
+            "{message}"
+        );
+        assert!(output.is_empty());
+        assert!(!message.contains("access-secret") && !message.contains("refresh-secret"));
+    }
+    // A definitive refusal is not an unknown outcome and gives no replay hint.
+    let transport = ScriptedTransport::new(vec![
+        agents_step(),
+        reply(422, json!({ "code": "conversation_message_id_required" })),
+    ]);
+    let (result, _) = run_work(&transport, &secrets);
+    let message = chain(&result.unwrap_err());
+    assert!(message.contains("conversation_message_id_required"));
+    assert!(!message.contains("may or may not"));
+}
+
+#[test]
+fn work_cancel_sends_choices_and_reports_each_outcome_honestly() {
+    let secrets = signed_in();
+    let argv = [
+        "codewhale",
+        "account",
+        "agents",
+        "work-cancel",
+        "run-1",
+        "--queue",
+        "park",
+        "--reason",
+        "wrong repo",
+    ];
+    let transport = FakeTransport::new(vec![response(
+        200,
+        json!({
+            "run": { "id": "run-1", "state": "canceled" },
+            "command": { "type": "run.control", "action": "cancel" },
+            "promptQueue": { "queuedCount": 0 }
+        }),
+    )]);
+    let (result, output) = run_agent_command(&transport, &secrets, &argv);
+    result.unwrap();
+    let requests = transport.requests();
+    assert_eq!(requests[0].method, HttpMethod::Post);
+    assert_eq!(requests[0].path, "/api/runs/run-1/cancel");
+    assert_eq!(
+        body_of(&requests[0]),
+        json!({ "reason": "wrong repo", "queue": "park" })
+    );
+    assert_eq!(requests[0].bearer.as_deref(), Some("access-secret"));
+    assert!(output.contains("Status: canceled"));
+    assert!(output.contains("Work canceled."));
+    assert!(output.contains("Queued prompts: parked (recorded)."));
+    assert!(!output.contains("access-secret"));
+    drop(requests);
+
+    // The runtime has been asked to stop but has not confirmed.
+    let transport = FakeTransport::new(vec![response(
+        200,
+        json!({ "command": { "type": "run.control" }, "queued": { "seq": 4 } }),
+    )]);
+    let (result, output) = run_agent_command(
+        &transport,
+        &secrets,
+        &["codewhale", "account", "agents", "work-cancel", "run-1"],
+    );
+    result.unwrap();
+    assert!(output.contains("Cancel requested. The runtime has not confirmed the stop yet."));
+    assert!(!output.contains("Work canceled."));
+    assert_eq!(body_of(&transport.requests()[0]), json!({}));
+
+    // Already final is success, and says where to read the outcome.
+    let transport = FakeTransport::new(vec![response(
+        409,
+        json!({ "code": "run_control_terminal", "message": "Run run-1 is already completed." }),
+    )]);
+    let (result, output) = run_agent_command(
+        &transport,
+        &secrets,
+        &["codewhale", "account", "agents", "work-cancel", "run-1"],
+    );
+    result.unwrap();
+    assert!(output.contains("already final"));
+    assert!(output.contains("work-result run-1"));
+
+    // Queued prompts need an explicit choice; nothing was cancelled.
+    let transport = FakeTransport::new(vec![response(
+        422,
+        json!({ "code": "run_prompt_queue_choice_required" }),
+    )]);
+    let (result, _) = run_agent_command(
+        &transport,
+        &secrets,
+        &["codewhale", "account", "agents", "work-cancel", "run-1"],
+    );
+    let message = chain(&result.unwrap_err());
+    assert!(
+        message.contains("--queue discard or --queue park"),
+        "{message}"
+    );
+    assert!(message.contains("was not cancelled"));
+
+    // A different definitive refusal is reported without an unknown-outcome claim.
+    let transport = FakeTransport::new(vec![response(
+        409,
+        json!({ "code": "run_control_transition_invalid" }),
+    )]);
+    let (result, _) = run_agent_command(
+        &transport,
+        &secrets,
+        &["codewhale", "account", "agents", "work-cancel", "run-1"],
+    );
+    let message = chain(&result.unwrap_err());
+    assert!(message.contains("run_control_transition_invalid"));
+    assert!(!message.contains("unknown"));
+}
+
+#[test]
+fn work_cancel_with_a_lost_reply_is_an_unknown_outcome() {
+    let secrets = signed_in();
+    for lost in [
+        Scripted::Unreachable,
+        reply(502, json!({ "code": "bad_gateway" })),
+        Scripted::Reply(CloudResponse {
+            status: 200,
+            body: b"not json".to_vec(),
+            retry_after: None,
+        }),
+    ] {
+        let transport = ScriptedTransport::new(vec![lost]);
+        let (result, output) = run_agent_command(
+            &transport,
+            &secrets,
+            &["codewhale", "account", "agents", "work-cancel", "run-1"],
+        );
+        let message = chain(&result.unwrap_err());
+        assert!(message.contains("cancel outcome is unknown"), "{message}");
+        assert!(message.contains("work-status run-1"), "{message}");
+        assert!(output.is_empty());
+    }
+    // A bad id or reason never leaves the machine.
+    let transport = ScriptedTransport::new(vec![]);
+    let (result, _) = run_agent_command(
+        &transport,
+        &secrets,
+        &["codewhale", "account", "agents", "work-cancel", "../x"],
+    );
+    result.unwrap_err();
+    let (result, _) = run_agent_command(
+        &transport,
+        &secrets,
+        &[
+            "codewhale",
+            "account",
+            "agents",
+            "work-cancel",
+            "run-1",
+            "--reason",
+            "bad\u{7}bell",
+        ],
+    );
+    result.unwrap_err();
+    assert!(transport.requests().is_empty());
+}
+
+fn result_envelope() -> serde_json::Value {
+    json!({ "result": {
+        "run": { "id": "run-1", "title": "Fix the\u{1b}[31m build", "state": "completed", "workspaceId": "ws-1", "projectId": "p-1" },
+        "status": "ready",
+        "summary": { "text": "Fixed the failing test.\nSecond line", "source": "run.result" },
+        "repository": {
+            "name": "octo-org/app", "branch": "codewhale/run-1", "revision": "0123456789abcdef",
+            "pullRequest": { "url": "https://github.com/octo-org/app/pull/42", "number": 42, "state": "draft" }
+        },
+        "changes": { "files": [], "fileCount": 2, "additions": 10, "deletions": 3, "evidence": "recorded" },
+        "checks": [
+            { "name": "cargo test", "status": "passed", "passed": true },
+            { "name": "lint", "status": "failed", "passed": false }
+        ],
+        "findings": [{ "id": "f1", "severity": "low", "title": "Style nit" }],
+        "artifacts": [{ "id": "a1", "name": "patch.diff", "status": "stored", "contentType": "text/x-diff", "size": 512 }],
+        "readiness": { "prReady": false, "blockers": ["checks_failed"] },
+        "nextAction": { "kind": "open_github", "label": "Open in GitHub", "url": "https://github.com/octo-org/app/pull/42" },
+        "modelRoute": { "provider": "deepseek", "model": "deepseek-flash" },
+        "boatUsage": {
+            "providerSeconds": 212, "providerListPriceDollars": 0.00106,
+            "customerCreditsChargedUsd": 0, "funding": "provider_trial", "running": false,
+            "cleanupConfirmed": true
+        },
+        "receipt": { "eventsThroughSeq": 57, "source": "run.result" }
+    } })
+}
+
+fn attempts_envelope() -> serde_json::Value {
+    json!({
+        "workId": "run-1", "attemptCount": 2,
+        "attempts": [
+            { "id": "attempt_a", "sequence": 1, "kind": "launch", "status": "failed", "errorCode": "boat_task_stop_unconfirmed" },
+            { "id": "attempt_b", "sequence": 2, "kind": "recovery", "status": "settled", "errorCode": "" }
+        ]
+    })
+}
+
+#[test]
+fn work_result_summarises_evidence_pr_route_and_boat_usage() {
+    let secrets = signed_in();
+    let transport = FakeTransport::new(vec![
+        response(200, result_envelope()),
+        response(200, attempts_envelope()),
+    ]);
+    let (result, output) = run_agent_command(
+        &transport,
+        &secrets,
+        &["codewhale", "account", "agents", "work-result", "run-1"],
+    );
+    result.unwrap();
+    let requests = transport.requests();
+    assert_eq!(requests[0].path, "/api/runs/run-1/result");
+    assert_eq!(requests[1].path, "/api/runs/run-1/attempts");
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.method == HttpMethod::Get)
+    );
+    for expected in [
+        "State: completed",
+        "Result: ready",
+        "Objective: Fix the[31m build",
+        "Summary: Fixed the failing test.Second line",
+        "Changes: 2 file(s), +10 -3 (recorded)",
+        "Checks: 1 passed of 2",
+        "not passed: lint (failed)",
+        "Findings: 1",
+        "low: Style nit",
+        "patch.diff (stored, text/x-diff, 512 bytes)",
+        "Branch: codewhale/run-1",
+        "Draft PR: https://github.com/octo-org/app/pull/42",
+        "Blockers: checks_failed",
+        "Model route: deepseek/deepseek-flash",
+        "Boat usage:",
+        "Provider seconds: 212",
+        "Provider list price: $0.0011",
+        "Codewhale credits charged: $0",
+        "Funding: provider_trial",
+        "Provider VM: stopped",
+        "Provider cleanup: confirmed",
+        "Attempts: 2",
+        "#1 launch failed (error boat_task_stop_unconfirmed)",
+        "#2 recovery settled",
+        "Evidence through event 57",
+    ] {
+        assert!(
+            output.contains(expected),
+            "missing {expected:?} in:\n{output}"
+        );
+    }
+    assert!(!output.contains('\u{1b}'));
+    assert!(!output.contains("access-secret") && !output.contains("refresh-secret"));
+}
+
+#[test]
+fn work_result_never_shows_a_link_that_is_not_a_github_pull_request_and_survives_missing_parts() {
+    let secrets = signed_in();
+    for hostile in [
+        "https://github.com/octo-org/app/pull/42/files",
+        "https://github.com/other-org/app/pull/42",
+        "https://evil.example/octo-org/app/pull/42",
+        "javascript:alert(1)",
+        "https://github.com/octo-org/app/pull/042",
+        "https://github.com/octo-org/app/issues/42",
+    ] {
+        let mut envelope = result_envelope();
+        envelope["result"]["repository"]["pullRequest"]["url"] = json!(hostile);
+        let transport = FakeTransport::new(vec![
+            response(200, envelope),
+            response(503, json!({ "code": "work_attempt_lineage_unavailable" })),
+        ]);
+        let (result, output) = run_agent_command(
+            &transport,
+            &secrets,
+            &["codewhale", "account", "agents", "work-result", "run-1"],
+        );
+        result.unwrap();
+        assert!(!output.contains("Draft PR:"), "{hostile}");
+        assert!(!output.contains(hostile), "{hostile}");
+        assert!(output.contains("not a GitHub pull request"), "{hostile}");
+        // Attempt lineage failing does not hide the result itself.
+        assert!(output.contains("Attempts: unavailable"));
+    }
+    // A running Work with nothing recorded says it is not final and invents nothing.
+    let transport = FakeTransport::new(vec![
+        response(
+            200,
+            json!({ "result": {
+                "run": { "id": "run-1", "state": "running" }, "status": "in_progress",
+                "changes": { "evidence": "unavailable" }, "checks": [], "artifacts": []
+            } }),
+        ),
+        response(200, json!({ "attempts": [] })),
+    ]);
+    let (result, output) = run_agent_command(
+        &transport,
+        &secrets,
+        &["codewhale", "account", "agents", "work-result", "run-1"],
+    );
+    result.unwrap();
+    assert!(output.contains("still running; nothing below is final"));
+    assert!(output.contains("Changes: not verified (evidence: unavailable)"));
+    assert!(output.contains("Checks: none recorded"));
+    assert!(output.contains("Artifacts: none"));
+    assert!(output.contains("Draft PR: none"));
+    assert!(output.contains("Model route: not reported"));
+    assert!(!output.contains("Boat usage:"));
+    // Another run's record is refused.
+    let transport = FakeTransport::new(vec![response(
+        200,
+        json!({ "result": { "run": { "id": "run-2", "state": "completed" } } }),
+    )]);
+    let (result, _) = run_agent_command(
+        &transport,
+        &secrets,
+        &["codewhale", "account", "agents", "work-result", "run-1"],
+    );
+    assert!(chain(&result.unwrap_err()).contains("different Work result"));
+}
+
+#[test]
+fn work_result_json_prints_the_raw_result_and_attempts() {
+    let secrets = signed_in();
+    let transport = FakeTransport::new(vec![
+        response(200, result_envelope()),
+        response(200, attempts_envelope()),
+    ]);
+    let (result, output) = run_agent_command(
+        &transport,
+        &secrets,
+        &[
+            "codewhale",
+            "account",
+            "agents",
+            "work-result",
+            "run-1",
+            "--json",
+        ],
+    );
+    result.unwrap();
+    let printed: serde_json::Value = serde_json::from_str(&output).unwrap();
+    assert_eq!(printed["result"], result_envelope());
+    assert_eq!(printed["attempts"], attempts_envelope());
+    assert!(!output.contains("access-secret"));
+}
+
+#[test]
+fn work_quote_builds_the_c5_request_from_served_records_and_prints_the_disclosure() {
+    let secrets = signed_in();
+    let transport = FakeTransport::new(vec![
+        response(200, work_run("queued")),
+        response(200, json!({ "agents": [agent("agent-1", "Whale")] })),
+        response(
+            200,
+            json!({ "projects": [{
+            "id": "project-codewhale", "name": "Codewhale",
+            "defaultRepoProvider": "github", "defaultRepo": "octo-org/app"
+        }] }),
+        ),
+        response(200, boat_quote()),
+    ]);
+    let (result, output) = run_agent_command(&transport, &secrets, &QUOTE_ARGV);
+    result.unwrap();
+    let requests = transport.requests();
+    assert_eq!(
+        requests
+            .iter()
+            .map(|request| request.path.as_str())
+            .collect::<Vec<_>>(),
+        [
+            format!("/api/runs/{WORK_ID}").as_str(),
+            "/api/agents",
+            "/api/projects",
+            "/api/sandbox/launch-quote"
+        ]
+    );
+    assert_eq!(requests[3].method, HttpMethod::Post);
+    assert_eq!(
+        body_of(&requests[3]),
+        json!({
+            "workRunId": WORK_ID, "agentId": "agent-1", "projectId": "project-codewhale",
+            "repo": "octo-org/app", "provider": "github", "prompt": "Fix the build",
+            "runnerKind": "hosted", "sandboxSku": "boat-small", "estimatedSeconds": 300,
+            "modelProvider": "deepseek", "model": "deepseek-flash",
+            "billingMode": "byok_external", "computeRegion": "eu",
+            "sandboxTargetRegion": "eu", "crossRegionSandboxOptIn": true,
+            "operationKey": "launch-1"
+        })
+    );
+    for expected in [
+        "Nothing has started and nothing is charged.",
+        "Repository: octo-org/app",
+        "deepseek/deepseek-flash",
+        "boat-small on Boat in the EU, up to 300 seconds",
+        "Funding: provider trial; Codewhale credits charged: $0",
+        "Provider cost estimate: $0.0207",
+        "EU placement",
+        "Run this five-minute Boat trial Work?",
+        "Boat trial credit covers its computer time.[31m",
+        "Confirmation: tok.abc-123_DEF",
+        "Operation key: launch-1",
+        &format!(
+            "work-launch {WORK_ID} --operation-key launch-1 --confirmation tok.abc-123_DEF --confirm-eu-compute"
+        ),
+    ] {
+        assert!(
+            output.contains(expected),
+            "missing {expected:?} in:\n{output}"
+        );
+    }
+    assert!(!output.contains('\u{1b}'));
+    assert!(!output.contains("access-secret") && !output.contains("refresh-secret"));
+}
+
+#[test]
+fn work_quote_refuses_before_quoting_anything_it_cannot_launch_or_would_charge_for() {
+    let secrets = signed_in();
+    // Not queued: only the Work is read.
+    let transport = FakeTransport::new(vec![response(200, work_run("running"))]);
+    let (result, _) = run_agent_command(&transport, &secrets, &QUOTE_ARGV);
+    assert!(chain(&result.unwrap_err()).contains("only queued Work can be quoted"));
+    assert_eq!(transport.requests().len(), 1);
+
+    // The Agent moved to another Project after the Work was created.
+    let mut moved = agent("agent-1", "Whale");
+    moved["projectId"] = json!("project-other");
+    let transport = FakeTransport::new(vec![
+        response(200, work_run("queued")),
+        response(200, json!({ "agents": [moved] })),
+    ]);
+    let (result, _) = run_agent_command(&transport, &secrets, &QUOTE_ARGV);
+    assert!(chain(&result.unwrap_err()).contains("no longer bound to this Work's Project"));
+
+    // A non-GitHub Work cannot use the Boat trial.
+    let mut cnb = work_run("queued");
+    cnb["run"]["repoProvider"] = json!("cnb");
+    let transport = FakeTransport::new(vec![response(200, cnb)]);
+    let (result, _) = run_agent_command(&transport, &secrets, &QUOTE_ARGV);
+    assert!(chain(&result.unwrap_err()).contains("GitHub repositories only"));
+
+    // A quote that would charge Codewhale credits (or is not the EU trial)
+    // yields no confirmation and no launch command.
+    for tamper in [
+        |quote: &mut serde_json::Value| {
+            quote["disclosure"]["customerCreditsChargedUsd"] = json!(0.4)
+        },
+        |quote: &mut serde_json::Value| quote["disclosure"]["funding"] = json!("membership"),
+        |quote: &mut serde_json::Value| quote["quote"]["sku"] = json!("boat-large"),
+        |quote: &mut serde_json::Value| {
+            quote["disclosure"]["sandboxTargetRegion"] = json!("us-west")
+        },
+        |quote: &mut serde_json::Value| quote["quote"]["adapter"] = json!("other"),
+        |quote: &mut serde_json::Value| {
+            quote["disclosure"]["computerTime"]["estimatedSeconds"] = json!(301)
+        },
+        |quote: &mut serde_json::Value| quote["disclosure"]["computerTime"] = json!({}),
+        |quote: &mut serde_json::Value| {
+            quote["disclosure"]["modelInference"]["billing"] = json!("managed_wallet")
+        },
+    ] {
+        let mut quote = boat_quote();
+        tamper(&mut quote);
+        let transport = FakeTransport::new(vec![
+            response(200, work_run("queued")),
+            response(200, json!({ "agents": [agent("agent-1", "Whale")] })),
+            response(
+                200,
+                json!({ "projects": [{
+                "id": "project-codewhale", "name": "Codewhale",
+                "defaultRepoProvider": "github", "defaultRepo": "octo-org/app"
+            }] }),
+            ),
+            response(200, quote),
+        ]);
+        let (result, output) = run_agent_command(&transport, &secrets, &QUOTE_ARGV);
+        assert!(chain(&result.unwrap_err()).contains("Refusing to print a confirmation"));
+        assert!(!output.contains("tok.abc-123_DEF"));
+    }
+
+    // Server refusals keep their code and gain the next step.
+    let transport = ScriptedTransport::new(vec![
+        reply(200, work_run("queued")),
+        agents_step(),
+        projects_step(),
+        reply(404, json!({ "code": "boat_work_trial_unavailable" })),
+    ]);
+    let (result, _) = run_agent_command(&transport, &secrets, &QUOTE_ARGV);
+    let message = chain(&result.unwrap_err());
+    assert!(message.contains("boat_work_trial_unavailable"));
+    assert!(message.contains("not available for this account"));
+
+    // The printed retry command must not carry remote shell metacharacters.
+    for token in ["tok.$(command)", "tok.`command`", "tok.abc;command"] {
+        let mut quote = boat_quote();
+        quote["confirmation"]["token"] = json!(token);
+        let transport = ScriptedTransport::new(vec![
+            reply(200, work_run("queued")),
+            agents_step(),
+            projects_step(),
+            reply(200, quote),
+        ]);
+        let (result, output) = run_agent_command(&transport, &secrets, &QUOTE_ARGV);
+        assert!(chain(&result.unwrap_err()).contains("unusable launch confirmation"));
+        assert!(!output.contains(token));
+    }
+}
+
+#[test]
+fn work_confirmation_stdin_is_exposed_without_a_token_in_argv() {
+    let parsed = command(&[
+        "codewhale",
+        "account",
+        "agents",
+        "work-launch",
+        WORK_ID,
+        "--operation-key",
+        "launch-stdin",
+        "--confirmation",
+        "-",
+        "--confirm-eu-compute",
+    ]);
+    assert!(matches!(parsed, CloudCommand::Agents(CloudAgentsArgs {
+        command: CloudAgentsCommand::WorkLaunch { confirmation, confirm_eu_compute: true, .. }
+    }) if confirmation == "-"));
+    let help = Cli::try_parse_from(["codewhale", "account", "agents", "work-launch", "--help"])
+        .unwrap_err()
+        .to_string();
+    assert!(help.contains("bounded piped stdin"));
+}
+
+#[test]
+fn work_confirmation_stdin_accepts_a_single_proof_with_optional_line_ending() {
+    for input in [
+        "consent.abc-123_DEF",
+        "consent.abc-123_DEF\n",
+        "consent.abc-123_DEF\r\n",
+    ] {
+        assert_eq!(
+            work::read_confirmation(input.as_bytes()).unwrap(),
+            "consent.abc-123_DEF"
+        );
+    }
+    let maximum = "A".repeat(4096);
+    assert_eq!(
+        work::read_confirmation(format!("{maximum}\r\n").as_bytes()).unwrap(),
+        maximum
+    );
+}
+
+#[test]
+fn work_confirmation_stdin_rejects_untrusted_input_without_echo_and_bounds_reads() {
+    for input in [
+        "",
+        "consent SECRET",
+        "consent.$(SECRET)",
+        "consent.SECRET\nsecond",
+        "consent.SECRET\n\n",
+        "consent.SECRET\r",
+    ] {
+        let error = chain(&work::read_confirmation(input.as_bytes()).unwrap_err());
+        assert!(!error.contains("SECRET"));
+    }
+    assert!(
+        work::read_confirmation(&[0xff][..])
+            .unwrap_err()
+            .to_string()
+            .contains("UTF-8")
+    );
+    let mut huge = std::io::Cursor::new(vec![b'A'; 1_000_000]);
+    let error = chain(&work::read_confirmation(&mut huge).unwrap_err());
+    assert!(error.contains("too long"));
+    assert_eq!(
+        huge.position(),
+        4099,
+        "read is bounded even if the pipe contains arbitrarily much input"
+    );
+}
+
+#[test]
+fn work_confirmation_stdin_proof_reaches_only_the_confirmed_request() {
+    let secrets = signed_in();
+    let transport = ScriptedTransport::new(vec![
+        reply(200, work_run("queued")),
+        agents_step(),
+        projects_step(),
+        reply(201, cloud_session()),
+    ]);
+    let client = CloudClient::new(&transport, &secrets, "default", DEFAULT_API_BASE);
+    let proof = work::read_confirmation(&b"consent.private-proof\n"[..]).unwrap();
+    let mut output = Vec::new();
+    work::launch(&client, &mut output, WORK_ID, "launch-stdin", &proof, true).unwrap();
+    assert_eq!(
+        body_of(&transport.requests()[3])["launchQuoteConfirmation"],
+        proof
+    );
+    let output = String::from_utf8(output).unwrap();
+    assert!(!output.contains(&proof));
+    assert!(!output.contains("access-secret") && !output.contains("refresh-secret"));
+}
+
+#[test]
+fn work_launch_requires_eu_consent_and_sends_the_confirmed_c5_request() {
+    let secrets = signed_in();
+    // No consent flag: nothing is read or sent.
+    let transport = ScriptedTransport::new(vec![]);
+    let without_consent = &LAUNCH_ARGV[..LAUNCH_ARGV.len() - 1];
+    let (result, output) = run_agent_command(&transport, &secrets, without_consent);
+    let message = chain(&result.unwrap_err());
+    assert!(message.contains("--confirm-eu-compute"));
+    assert!(message.contains("Nothing was sent"));
+    assert!(output.is_empty());
+    assert!(transport.requests().is_empty());
+
+    for token in ["tok.$(command)", "tok.`command`", "tok.abc;command"] {
+        let mut unsafe_token = LAUNCH_ARGV.to_vec();
+        unsafe_token[8] = token;
+        let (result, _) = run_agent_command(&transport, &secrets, &unsafe_token);
+        assert!(chain(&result.unwrap_err()).contains("Confirmation must be"));
+        assert!(transport.requests().is_empty());
+    }
+
+    // A malformed confirmation is refused locally too.
+    let mut spaced = LAUNCH_ARGV.to_vec();
+    spaced[8] = "tok en";
+    let (result, _) = run_agent_command(&transport, &secrets, &spaced);
+    result.unwrap_err();
+    assert!(transport.requests().is_empty());
+
+    let transport = ScriptedTransport::new(vec![
+        reply(200, work_run("queued")),
+        agents_step(),
+        projects_step(),
+        reply(201, cloud_session()),
+    ]);
+    let (result, output) = run_agent_command(&transport, &secrets, &LAUNCH_ARGV);
+    result.unwrap();
+    let requests = transport.requests();
+    assert_eq!(requests[3].path, "/api/cloud-sessions");
+    assert_eq!(requests[3].method, HttpMethod::Post);
+    assert_eq!(
+        body_of(&requests[3]),
+        json!({
+            "workRunId": WORK_ID, "agentId": "agent-1", "projectId": "project-codewhale",
+            "repo": "octo-org/app", "provider": "github", "prompt": "Fix the build",
+            "runnerKind": "hosted", "sandboxSku": "boat-small", "estimatedSeconds": 300,
+            "modelProvider": "deepseek", "model": "deepseek-flash",
+            "billingMode": "byok_external", "computeRegion": "eu",
+            "sandboxTargetRegion": "eu", "crossRegionSandboxOptIn": true,
+            "operationKey": "launch-1",
+            "launchQuoteConfirmation": "tok.abc-123_DEF",
+            "customerEuPlacementConsent": true
+        })
+    );
+    for expected in [
+        "Work launched on bounded Boat trial compute.",
+        &format!("Work ID: {WORK_ID}"),
+        "Status: planning",
+        "Computer: boat (running)",
+        "Compute region: eu",
+        "Codewhale credits charged: $0",
+        "Attempt: accepted",
+        "First turn: queued (not complete yet)",
+        "Operation key: launch-1",
+        &format!("work-cancel {WORK_ID}"),
+    ] {
+        assert!(
+            output.contains(expected),
+            "missing {expected:?} in:\n{output}"
+        );
+    }
+    assert!(!output.contains("access-secret") && !output.contains("refresh-secret"));
+}
+
+#[test]
+fn work_launch_is_replay_safe_after_the_work_has_already_started() {
+    // Once the first launch was accepted the Work is no longer queued. The same
+    // command must still reach the operation ledger (which replays the receipt)
+    // instead of dying on a local "not queued" check.
+    let secrets = signed_in();
+    let transport = ScriptedTransport::new(vec![
+        reply(200, work_run("running")),
+        reply(200, cloud_session()),
+    ]);
+    let (result, output) = run_agent_command(&transport, &secrets, &LAUNCH_ARGV);
+    result.unwrap();
+    let requests = transport.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[1].path, "/api/cloud-sessions");
+    assert_eq!(body_of(&requests[1])["operationKey"], "launch-1");
+    assert!(output.contains("Work launched"));
+}
+
+#[test]
+fn work_launch_reports_unknown_and_refused_outcomes_without_guessing() {
+    let secrets = signed_in();
+    let steps = |last: Scripted| vec![reply(200, work_run("running")), last];
+    for lost in [
+        Scripted::Unreachable,
+        reply(504, json!({ "code": "gateway_timeout" })),
+        reply(409, json!({ "code": "boat_task_outcome_unknown" })),
+        reply(409, json!({ "code": "boat_task_receipt_invalid" })),
+        reply(
+            409,
+            json!({ "code": "provider_receipt_conflict", "reconciliationRequired": true }),
+        ),
+        Scripted::Reply(CloudResponse {
+            status: 201,
+            body: b"{".to_vec(),
+            retry_after: None,
+        }),
+    ] {
+        let transport = ScriptedTransport::new(steps(lost));
+        let (result, output) = run_agent_command(&transport, &secrets, &LAUNCH_ARGV);
+        let message = chain(&result.unwrap_err());
+        assert!(message.contains("launch outcome is unknown"), "{message}");
+        assert!(
+            message.contains("a computer may already be running"),
+            "{message}"
+        );
+        assert!(
+            message.contains(&format!("work-status {WORK_ID}")),
+            "{message}"
+        );
+        assert!(
+            message.contains(&format!("work-cancel {WORK_ID}")),
+            "{message}"
+        );
+        assert!(
+            message.contains("same --operation-key and --confirmation"),
+            "{message}"
+        );
+        assert!(output.is_empty());
+        assert!(!message.contains("tok.abc-123_DEF") && !message.contains("access-secret"));
+    }
+    let transport = ScriptedTransport::new(steps(reply(
+        409,
+        json!({ "code": "boat_task_replay_expired" }),
+    )));
+    let (result, output) = run_agent_command(&transport, &secrets, &LAUNCH_ARGV);
+    let message = chain(&result.unwrap_err());
+    assert!(message.contains("launch outcome is unknown"));
+    assert!(message.contains("operator reconciliation is required"));
+    assert!(message.contains("Do not submit a new operation key"));
+    assert!(!message.contains("re-run this exact command"));
+    assert!(output.is_empty());
+
+    let transport =
+        ScriptedTransport::new(steps(reply(409, json!({ "code": "launch_in_progress" }))));
+    let (result, _) = run_agent_command(&transport, &secrets, &LAUNCH_ARGV);
+    let message = chain(&result.unwrap_err());
+    assert!(message.contains("still being recorded"), "{message}");
+    assert!(!message.contains("outcome is unknown"));
+
+    let transport = ScriptedTransport::new(steps(reply(
+        422,
+        json!({ "code": "hosted_launch_quote_expired" }),
+    )));
+    let (result, _) = run_agent_command(&transport, &secrets, &LAUNCH_ARGV);
+    let message = chain(&result.unwrap_err());
+    assert!(message.contains("hosted_launch_quote_expired"));
+    assert!(message.contains("`work-quote` again with the same --operation-key"));
+    assert!(!message.contains("outcome is unknown"));
+
+    let transport = ScriptedTransport::new(steps(reply(
+        409,
+        json!({ "code": "launch_operation_mismatch" }),
+    )));
+    let (result, _) = run_agent_command(&transport, &secrets, &LAUNCH_ARGV);
+    let message = chain(&result.unwrap_err());
+    assert!(message.contains("Check `work-status` and `work-result`"));
+    assert!(message.contains("never replace the key to retry an unknown launch"));
+
+    // A reply about another Work is never presented as this launch.
+    let mut other = cloud_session();
+    other["session"]["run"]["id"] = json!("22222222-2222-4222-8222-222222222222");
+    let transport = ScriptedTransport::new(steps(reply(201, other)));
+    let (result, output) = run_agent_command(&transport, &secrets, &LAUNCH_ARGV);
+    assert!(chain(&result.unwrap_err()).contains("launched a different Work"));
+    assert!(!output.contains("Work launched"));
+
+    // A 2xx without the `session` document (or with a non-object one) means the
+    // service acted but the client cannot say how: an unknown outcome, never a
+    // success and never "a different Work".
+    for missing in [
+        json!({}),
+        json!({ "session": "nope" }),
+        cloud_session()["session"].clone(),
+    ] {
+        let transport = ScriptedTransport::new(steps(reply(201, missing)));
+        let (result, output) = run_agent_command(&transport, &secrets, &LAUNCH_ARGV);
+        let message = chain(&result.unwrap_err());
+        assert!(message.contains("launch outcome is unknown"), "{message}");
+        assert!(message.contains("without a session"), "{message}");
+        assert!(!message.contains("different Work"), "{message}");
+        assert!(!output.contains("Work launched"));
+    }
+
+    for missing in [
+        json!({ "session": {} }),
+        json!({ "session": { "run": {} } }),
+    ] {
+        let transport = ScriptedTransport::new(steps(reply(201, missing)));
+        let (result, output) = run_agent_command(&transport, &secrets, &LAUNCH_ARGV);
+        let message = chain(&result.unwrap_err());
+        assert!(message.contains("launch outcome is unknown"), "{message}");
+        assert!(message.contains("without a Work ID"), "{message}");
+        assert!(!message.contains("different Work"), "{message}");
+        assert!(!output.contains("Work launched"));
+    }
+}
+
+fn binding(id: &str, repo: &str, installation: &str, status: &str) -> serde_json::Value {
+    json!({ "id": id, "provider": "github", "repo": repo, "status": status, "installationId": installation })
+}
+
+#[test]
+fn github_bind_connects_a_repository_through_the_known_installation() {
+    let secrets = signed_in();
+    let transport = ScriptedTransport::new(vec![
+        reply(
+            200,
+            json!({ "bindings": [binding("github:acct-123:987:octo-org/other", "octo-org/other", "987", "connected")] }),
+        ),
+        reply(
+            201,
+            json!({ "binding": binding("github:acct-123:987:octo-org/app", "octo-org/app", "987", "connected") }),
+        ),
+    ]);
+    let (result, output) = run_github_command(
+        &transport,
+        &secrets,
+        &machine::MachineKeyEnv::default(),
+        &["codewhale", "account", "github", "bind", "octo-org/app"],
+    );
+    result.unwrap();
+    let requests = transport.requests();
+    assert_eq!(requests[0].path, "/api/integrations/github/bindings");
+    assert_eq!(requests[0].method, HttpMethod::Get);
+    assert_eq!(requests[1].method, HttpMethod::Post);
+    assert_eq!(requests[1].path, "/api/integrations/github/bindings");
+    assert_eq!(
+        body_of(&requests[1]),
+        json!({ "installationId": "987", "repo": "octo-org/app" })
+    );
+    assert!(
+        output.contains("Connected octo-org/app: github:acct-123:987:octo-org/app (connected)")
+    );
+    assert!(output.contains("--repo-binding-id github:acct-123:987:octo-org/app"));
+
+    // An explicit installation ID is used as given.
+    let transport = ScriptedTransport::new(vec![
+        reply(200, json!({ "bindings": [] })),
+        reply(
+            200,
+            json!({ "binding": binding("github:acct-123:55:octo-org/app", "octo-org/app", "55", "connected") }),
+        ),
+    ]);
+    let (result, _) = run_github_command(
+        &transport,
+        &secrets,
+        &machine::MachineKeyEnv::default(),
+        &[
+            "codewhale",
+            "account",
+            "github",
+            "bind",
+            "octo-org/app",
+            "--installation-id",
+            "55",
+        ],
+    );
+    result.unwrap();
+    assert_eq!(body_of(&transport.requests()[1])["installationId"], "55");
+}
+
+#[test]
+fn github_bind_refuses_ambiguity_bad_input_and_lost_replies() {
+    let secrets = signed_in();
+    let plain = machine::MachineKeyEnv::default();
+    let bind = ["codewhale", "account", "github", "bind", "octo-org/app"];
+
+    // Already connected: no write at all.
+    let transport = ScriptedTransport::new(vec![reply(
+        200,
+        json!({ "bindings": [binding("github:acct-123:987:octo-org/app", "Octo-Org/App", "987", "connected")] }),
+    )]);
+    let (result, output) = run_github_command(&transport, &secrets, &plain, &bind);
+    result.unwrap();
+    assert!(output.contains("is already connected"));
+    assert_eq!(transport.requests().len(), 1);
+
+    // Several installations: the user must choose.
+    let transport = ScriptedTransport::new(vec![reply(
+        200,
+        json!({ "bindings": [
+            binding("b1", "octo-org/one", "111", "connected"),
+            binding("b2", "octo-org/two", "222", "connected")
+        ] }),
+    )]);
+    let (result, _) = run_github_command(&transport, &secrets, &plain, &bind);
+    let message = chain(&result.unwrap_err());
+    assert!(message.contains("several GitHub App installations (111, 222)"));
+    assert_eq!(transport.requests().len(), 1);
+
+    // No installation known at all.
+    let transport = ScriptedTransport::new(vec![reply(200, json!({ "bindings": [] }))]);
+    let (result, _) = run_github_command(&transport, &secrets, &plain, &bind);
+    assert!(chain(&result.unwrap_err()).contains("--installation-id"));
+
+    // Malformed repository and installation fail before any request.
+    let transport = ScriptedTransport::new(vec![]);
+    for argv in [
+        vec!["codewhale", "account", "github", "bind", "octo-org"],
+        vec![
+            "codewhale",
+            "account",
+            "github",
+            "bind",
+            "octo-org/app/extra",
+        ],
+        vec!["codewhale", "account", "github", "bind", "../app"],
+        vec![
+            "codewhale",
+            "account",
+            "github",
+            "bind",
+            "octo-org/app",
+            "--installation-id",
+            "12x",
+        ],
+    ] {
+        run_github_command(&transport, &secrets, &plain, &argv)
+            .0
+            .unwrap_err();
+    }
+    assert!(transport.requests().is_empty());
+
+    // The server refusing (not the owner, no repository access) keeps its code.
+    let transport = ScriptedTransport::new(vec![
+        reply(
+            200,
+            json!({ "bindings": [binding("b1", "octo-org/one", "111", "connected")] }),
+        ),
+        reply(
+            403,
+            json!({ "code": "github_repository_user_access_denied" }),
+        ),
+    ]);
+    let (result, _) = run_github_command(&transport, &secrets, &plain, &bind);
+    let message = chain(&result.unwrap_err());
+    assert!(message.contains("github_repository_user_access_denied"));
+    assert!(!message.contains("outcome is unknown"));
+
+    // A lost reply says to check the list before repeating.
+    for last in [
+        Scripted::Unreachable,
+        reply(
+            503,
+            json!({ "code": "github_repository_bindings_unavailable" }),
+        ),
+    ] {
+        let transport = ScriptedTransport::new(vec![
+            reply(
+                200,
+                json!({ "bindings": [binding("b1", "octo-org/one", "111", "connected")] }),
+            ),
+            last,
+        ]);
+        let (result, _) = run_github_command(&transport, &secrets, &plain, &bind);
+        let message = chain(&result.unwrap_err());
+        assert!(message.contains("bind outcome is unknown"));
+        assert!(message.contains("account github bindings"));
+    }
+
+    // A binding for a different repository is not accepted as this one.
+    let transport = ScriptedTransport::new(vec![
+        reply(
+            200,
+            json!({ "bindings": [binding("b1", "octo-org/one", "111", "connected")] }),
+        ),
+        reply(
+            201,
+            json!({ "binding": binding("b9", "octo-org/elsewhere", "111", "connected") }),
+        ),
+    ]);
+    let (result, output) = run_github_command(&transport, &secrets, &plain, &bind);
+    assert!(chain(&result.unwrap_err()).contains("different repository"));
+    assert!(!output.contains("Connected"));
+
+    // A machine key never binds repositories.
+    let transport = ScriptedTransport::new(vec![]);
+    let (result, _) = run_github_command(&transport, &secrets, &machine_env(), &bind);
+    assert!(chain(&result.unwrap_err()).contains("interactive Codewhale account login"));
+    assert!(transport.requests().is_empty());
+}
+
+#[test]
+fn new_thread_refuses_a_route_the_live_catalog_does_not_list() {
+    let secrets = signed_in();
+    let argv = |provider: &'static str, model: &'static str| {
+        vec![
+            "codewhale",
+            "account",
+            "agents",
+            "new-thread",
+            "Whale",
+            "--provider",
+            provider,
+            "--model",
+            model,
+            "--operation-key",
+            "thread-1",
+        ]
+    };
+    for (provider, model, expect) in [
+        (
+            "deepseek",
+            "deepseek-v9",
+            "catalog lists these models for `deepseek`: deepseek-v4-pro, deepseek-flash",
+        ),
+        (
+            "openai",
+            "gpt-x",
+            "is not a hosted provider in the catalog. Known providers: deepseek",
+        ),
+    ] {
+        let transport = ScriptedTransport::new(vec![agents_step(), reply(200, route_catalog())]);
+        let (result, output) = run_agent_command(&transport, &secrets, &argv(provider, model));
+        let message = chain(&result.unwrap_err());
+        assert!(
+            message.contains("live Codewhale model catalog"),
+            "{message}"
+        );
+        assert!(message.contains("GET /api/model-providers"), "{message}");
+        assert!(message.contains(expect), "{message}");
+        assert!(output.is_empty());
+        // Only reads happened: no conversation was created.
+        let requests = transport.requests();
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| request.path.as_str())
+                .collect::<Vec<_>>(),
+            ["/api/agents", "/api/model-providers"]
+        );
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.method == HttpMethod::Get)
+        );
+    }
+    // A runtime-only row is not a hosted route even when it lists the model.
+    let mut catalog = route_catalog();
+    catalog["providers"][0]["connectionAvailable"] = json!(false);
+    let transport = ScriptedTransport::new(vec![agents_step(), reply(200, catalog)]);
+    let (result, _) = run_agent_command(&transport, &secrets, &argv("deepseek", "deepseek-flash"));
+    result.unwrap_err();
+    assert_eq!(transport.requests().len(), 2);
+}
+
+#[test]
+fn new_thread_sends_the_canonical_route_id_when_given_a_runtime_alias() {
+    // `xiaomi-mimo` is the runtime name of the catalog row `xiaomi`; the server
+    // stores `xiaomi`, so the preflight must resolve to it before creating.
+    let secrets = signed_in();
+    let argv = [
+        "codewhale",
+        "account",
+        "agents",
+        "new-thread",
+        "Whale",
+        "--provider",
+        "xiaomi-mimo",
+        "--model",
+        "mimo-v2",
+        "--operation-key",
+        "thread-1",
+    ];
+    let catalog = json!({ "providers": [{
+        "id": "xiaomi",
+        "runtimeProvider": "xiaomi-mimo",
+        "connectionAvailable": true,
+        "models": ["mimo-v2"]
+    }] });
+    let mut created = agent_thread("thread-1", "agent-1", "Main");
+    created["modelProvider"] = json!("xiaomi");
+    created["model"] = json!("mimo-v2");
+    let transport = ScriptedTransport::new(vec![
+        agents_step(),
+        reply(200, catalog),
+        reply(201, json!({ "thread": created })),
+    ]);
+    let (result, output) = run_agent_command(&transport, &secrets, &argv);
+    result.unwrap();
+    let requests = transport.requests();
+    assert_eq!(body_of(&requests[2])["modelProvider"], "xiaomi");
+    assert!(output.contains("Model: xiaomi/mimo-v2"), "{output}");
+}
+
+#[test]
+fn new_thread_asserts_the_created_route_equals_the_requested_one() {
+    let secrets = signed_in();
+    let argv = [
+        "codewhale",
+        "account",
+        "agents",
+        "new-thread",
+        "Whale",
+        "--operation-key",
+        "thread-1",
+    ];
+    let mut swapped = agent_thread("thread-1", "agent-1", "Main");
+    swapped["model"] = json!("deepseek-v4-pro");
+    let transport = ScriptedTransport::new(vec![
+        agents_step(),
+        reply(200, route_catalog()),
+        reply(201, json!({ "thread": swapped })),
+    ]);
+    let (result, output) = run_agent_command(&transport, &secrets, &argv);
+    let message = chain(&result.unwrap_err());
+    assert!(
+        message
+            .contains("deepseek/deepseek-v4-pro instead of the requested deepseek/deepseek-flash"),
+        "{message}"
+    );
+    assert!(message.contains("Do not send to it"));
+    assert!(output.is_empty());
+
+    let mut other_provider = agent_thread("thread-1", "agent-1", "Main");
+    other_provider["modelProvider"] = json!("openrouter");
+    let transport = ScriptedTransport::new(vec![
+        agents_step(),
+        reply(200, route_catalog()),
+        reply(201, json!({ "thread": other_provider })),
+    ]);
+    let (result, _) = run_agent_command(&transport, &secrets, &argv);
+    assert!(chain(&result.unwrap_err()).contains("instead of the requested"));
+
+    // The defaults are the DeepSeek V4.1 Flash route and are accepted when honored.
+    let transport = ScriptedTransport::new(vec![
+        agents_step(),
+        reply(200, route_catalog()),
+        reply(
+            201,
+            json!({ "thread": agent_thread("thread-1", "agent-1", "Main") }),
+        ),
+    ]);
+    let (result, output) = run_agent_command(&transport, &secrets, &argv);
+    result.unwrap();
+    assert!(output.contains("Model: deepseek/deepseek-flash"));
+}
+
+#[test]
+fn account_errors_stay_typed_so_callers_can_tell_refusals_from_unknown_outcomes() {
+    let refusal = response_error(&response(
+        422,
+        json!({ "code": "boat_work_trial_seconds_invalid" }),
+    ));
+    assert_eq!(
+        refusal.to_string(),
+        "Codewhale account request failed (HTTP 422, code boat_work_trial_seconds_invalid)"
+    );
+    assert!(!outcome_unknown(&refusal));
+    for status in [500, 502, 503, 504, 408] {
+        assert!(
+            outcome_unknown(&response_error(&response(status, json!({})))),
+            "{status}"
+        );
+    }
+    for status in [400, 401, 404, 409, 422, 429] {
+        assert!(
+            !outcome_unknown(&response_error(&response(status, json!({})))),
+            "{status}"
+        );
+    }
+    let lost: anyhow::Error = CloudTransportError::new(
+        "could not reach the Codewhale service",
+        std::io::Error::other("reset"),
+    )
+    .into();
+    assert!(outcome_unknown(&lost));
+    // Context layers do not hide the typed cause.
+    assert!(outcome_unknown(&lost.context("while cancelling")));
+    assert!(!outcome_unknown(&anyhow!("Not signed in")));
+    // A hostile code is dropped, never echoed.
+    let hostile = response_error(&response(422, json!({ "code": "bad code\u{1b}[31m" })));
+    assert_eq!(
+        hostile.to_string(),
+        "Codewhale account request failed (HTTP 422)"
+    );
 }

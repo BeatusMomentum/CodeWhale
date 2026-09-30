@@ -43,3 +43,35 @@ export async function readBoundedBody(request: { body: ReadableStream<Uint8Array
   }
   return bytes;
 }
+
+/** Budget for background (cron) reads of other hosts. */
+export interface OutboundBudget {
+  /** Deadline for the whole exchange, body included. */
+  timeoutMs?: number;
+  /** Largest body read; a larger one is an error, never a silent truncation. */
+  maxBytes?: number;
+}
+
+export const OUTBOUND_TIMEOUT_MS = 15_000;
+export const OUTBOUND_MAX_BYTES = 2 * 1024 * 1024;
+
+/**
+ * One outbound GET-style read under a deadline and a byte cap. A slow or
+ * endless peer cannot hold a cron invocation until the platform kills it, and
+ * a huge body cannot exhaust isolate memory. Non-2xx answers return
+ * `{ ok: false }` with the body discarded; transport, timeout and size
+ * failures throw, so callers keep their own fallbacks.
+ */
+export async function fetchBoundedText(
+  url: string,
+  init: RequestInit = {},
+  { timeoutMs = OUTBOUND_TIMEOUT_MS, maxBytes = OUTBOUND_MAX_BYTES }: OutboundBudget = {},
+): Promise<{ ok: boolean; status: number; text: string }> {
+  const response = await fetch(url, { ...init, signal: AbortSignal.timeout(timeoutMs) });
+  if (!response.ok) {
+    try { await response.body?.cancel(); } catch { /* The status is the answer. */ }
+    return { ok: false, status: response.status, text: "" };
+  }
+  const bytes = await readBoundedBody(response, maxBytes);
+  return { ok: true, status: response.status, text: new TextDecoder().decode(bytes) };
+}

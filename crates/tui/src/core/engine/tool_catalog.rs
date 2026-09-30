@@ -1045,7 +1045,7 @@ fn suggest_tool_names(catalog: &[Tool], requested: &str, limit: usize) -> Vec<St
 ///
 /// MCP-contributed names are deliberately *not* here: those resolve through the
 /// real pool, and stay unknown when the pool did not resolve them.
-/// [`MULTI_TOOL_PARALLEL_NAME`] is not here either — it is a call name the model
+/// `multi_tool_use.parallel` is not here either — it is a legacy name the model
 /// may emit, never a catalog entry, so it can never appear in a transmitted
 /// tool array and has no catalog provenance to report.
 pub(super) fn default_synthetic_catalog_tool_names() -> Vec<String> {

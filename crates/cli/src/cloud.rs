@@ -11,7 +11,7 @@ use std::thread;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
-use clap::{Args, Subcommand};
+use clap::{Args, Subcommand, ValueEnum};
 use codewhale_config::device_code::DevicePollOutcome;
 use codewhale_config::{ConfigStore, ProviderKind};
 use codewhale_secrets::Secrets;
@@ -26,6 +26,7 @@ use reqwest::Url;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 pub(crate) mod machine;
+mod work;
 
 const MAX_RESPONSE_BYTES: u64 = 256 * 1024;
 const MIN_API_KEY_BYTES: usize = 8;
@@ -143,6 +144,18 @@ enum CloudGithubCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Connect one repository from an installed GitHub App to this account.
+    ///
+    /// The account API checks that you own the installation and can read the
+    /// repository; nothing is written to GitHub. Omit --installation-id when
+    /// every repository already connected shares one installation.
+    Bind {
+        /// Repository as OWNER/REPO.
+        repo: String,
+        /// GitHub App installation ID (see `account github bindings --json`).
+        #[arg(long)]
+        installation_id: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -222,6 +235,14 @@ enum CloudAgentsCommand {
         since_seq: u64,
     },
     /// Give a named Agent durable repository Work. This records a request; it does not start compute.
+    ///
+    /// The Agent reads the message first: a plain instruction becomes Work, a
+    /// command such as "stop" is applied to its active Work, a correction
+    /// edits that Work's objective, and a question changes nothing. The
+    /// output states which happened. If the reply is lost, re-run the same
+    /// command with the same --message-id; that never creates a second Work for
+    /// the same instruction. If the message was a stop or a correction, check
+    /// `work-status` first.
     Work {
         agent: String,
         objective: String,
@@ -231,6 +252,64 @@ enum CloudAgentsCommand {
     },
     /// Read the account-owned status of a Work request.
     WorkStatus { id: String },
+    /// Cancel Work and stop its computer; safe to repeat.
+    ///
+    /// If the Work still has queued prompts, choose --queue discard or --queue
+    /// park. An already-finished Work is reported and exits successfully. When
+    /// the reply is lost the outcome is unknown: run `work-status` before
+    /// retrying.
+    WorkCancel {
+        id: String,
+        /// What happens to queued prompts: discard them or park them on the Work.
+        #[arg(long, value_enum)]
+        queue: Option<WorkQueueChoice>,
+        /// Short reason recorded with the cancellation.
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Read a Work's outcome: state, attempts, evidence, artifacts, draft PR, model route and usage.
+    ///
+    /// --json prints the account API's raw result and attempt records.
+    WorkResult {
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Quote bounded Boat trial computer time for queued Work. Nothing starts.
+    ///
+    /// Prints the funding, EU placement and time disclosure plus a short-lived
+    /// confirmation for `work-launch`. Reuse one --operation-key for the quote
+    /// and the launch.
+    WorkQuote {
+        id: String,
+        /// Stable launch ID, reused by `work-launch` so a retry cannot start two computers.
+        #[arg(long)]
+        operation_key: String,
+    },
+    /// Start quoted Boat trial Work on EU compute (five minutes at most, $0 Codewhale charge).
+    ///
+    /// Requires the confirmation printed by `work-quote` and --confirm-eu-compute,
+    /// which agrees that repository code and Work files run on Boat's EU
+    /// compute. Re-running with the same --operation-key and --confirmation is
+    /// safe: it replays the launch instead of starting another computer.
+    WorkLaunch {
+        id: String,
+        #[arg(long)]
+        operation_key: String,
+        /// Confirmation printed by `work-quote`; use - to read bounded piped stdin.
+        #[arg(long)]
+        confirmation: String,
+        /// Agree that repository code and Work files run on EU compute.
+        #[arg(long)]
+        confirm_eu_compute: bool,
+    },
+}
+
+/// What a cancellation does with prompts still waiting behind the Work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum WorkQueueChoice {
+    Discard,
+    Park,
 }
 
 #[derive(Debug, Subcommand)]
@@ -317,6 +396,13 @@ struct CatalogProvider {
     /// row's own id is tried.
     #[serde(default)]
     runtime_provider: Option<String>,
+    /// Model ids the account API lists for this provider. `new-thread` checks
+    /// its explicit route against this served list, not a compiled table.
+    #[serde(default)]
+    models: Vec<String>,
+    /// False for runtime-only rows a hosted conversation cannot use.
+    #[serde(default)]
+    connection_available: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -470,6 +556,17 @@ struct AccountAgentWork {
 #[serde(rename_all = "camelCase")]
 struct AgentWorkMessageResponse {
     intent: String,
+    /// Why the Agent read the message that way (a server-owned code).
+    #[serde(default)]
+    reason: String,
+    /// The action applied to active Work when `intent` is `control`.
+    #[serde(default)]
+    control_action: Option<String>,
+    #[serde(default)]
+    confident: Option<bool>,
+    /// What the Agent offers to do when it declined to act on an unclear message.
+    #[serde(default)]
+    suggestion: Option<String>,
     work: Option<AccountAgentWork>,
     #[serde(default)]
     queued_work: Vec<AccountAgentWork>,
@@ -607,6 +704,11 @@ impl CloudTransport for ReqwestTransport {
             .client
             .request(method, url)
             .header(reqwest::header::ACCEPT, "application/json");
+        // Hosted launch waits for provider creation and guest bootstrap. Its
+        // HTTP deadline is separate from the guest's bounded trial runtime.
+        if request.method == HttpMethod::Post && request.path == "/api/cloud-sessions" {
+            builder = builder.timeout(Duration::from_secs(600));
+        }
         if let Some(token) = request.bearer {
             builder = builder.bearer_auth(token);
         }
@@ -615,9 +717,9 @@ impl CloudTransport for ReqwestTransport {
                 .header(reqwest::header::CONTENT_TYPE, "application/json")
                 .body(body);
         }
-        let response = builder
-            .send()
-            .context("could not reach the Codewhale service")?;
+        let response = builder.send().map_err(|source| {
+            CloudTransportError::new("could not reach the Codewhale service", source)
+        })?;
         let status = response.status().as_u16();
         let retry_after = response
             .headers()
@@ -628,9 +730,15 @@ impl CloudTransport for ReqwestTransport {
         response
             .take(MAX_RESPONSE_BYTES + 1)
             .read_to_end(&mut body)
-            .context("failed to read the Codewhale service response")?;
+            .map_err(|source| {
+                CloudTransportError::new("failed to read the Codewhale service response", source)
+            })?;
         if body.len() as u64 > MAX_RESPONSE_BYTES {
-            bail!("The Codewhale service returned an unexpectedly large response");
+            return Err(CloudTransportError::new(
+                "The Codewhale service returned an unexpectedly large response",
+                std::io::Error::other("response exceeded the account API size limit"),
+            )
+            .into());
         }
         Ok(CloudResponse {
             status,
@@ -1062,7 +1170,18 @@ impl<'a, T: CloudTransport> CloudClient<'a, T> {
                 "text": objective,
             }))?),
         )?;
-        expect_json(response, &[200, 201, 202])
+        if ![200, 201, 202].contains(&response.status) {
+            return Err(response_error(&response));
+        }
+        // A 2xx the client cannot read means the service acted: an unknown
+        // outcome (replay with the same message id), not a plain failure.
+        serde_json::from_slice(&response.body).map_err(|source| {
+            CloudTransportError::new(
+                "The Codewhale service returned an unreadable reply to this message",
+                source,
+            )
+            .into()
+        })
     }
 
     fn agent_work_status(&self, id: &str) -> Result<serde_json::Value> {
@@ -1397,6 +1516,59 @@ fn validate_model_route<'a>(provider: &'a str, model: &'a str) -> Result<(&'a st
     Ok((provider, model))
 }
 
+/// Refuse a (provider, model) the live account catalog does not list.
+///
+/// The catalog is served data (`GET /api/model-providers`), so a new model
+/// needs no CLI release and a retired one stops being accepted here. The
+/// message names the catalog and what it does list for the provider.
+///
+/// Returns the row's canonical id: the control plane stores that id even when
+/// the caller named the runtime alias (`xiaomi-mimo` for `xiaomi`), so it is
+/// the value to send and to compare the created conversation against.
+fn assert_catalog_route<'a>(
+    catalog: &'a [CatalogProvider],
+    provider: &str,
+    model: &str,
+) -> Result<&'a str> {
+    let row = catalog.iter().find(|row| {
+        row.connection_available != Some(false)
+            && (row.id == provider || row.runtime_provider.as_deref() == Some(provider))
+    });
+    if let Some(row) = row
+        && row.models.iter().any(|listed| listed == model)
+    {
+        return Ok(row.id.as_str());
+    }
+    let listed = match row {
+        Some(row) if !row.models.is_empty() => format!(
+            "The catalog lists these models for `{}`: {}",
+            printable(provider),
+            row.models
+                .iter()
+                .take(12)
+                .map(|model| printable(model))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        Some(_) => format!("The catalog lists no models for `{}`", printable(provider)),
+        None => format!(
+            "`{}` is not a hosted provider in the catalog. Known providers: {}",
+            printable(provider),
+            catalog
+                .iter()
+                .filter(|row| row.connection_available != Some(false))
+                .map(|row| row.id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    };
+    bail!(
+        "`{}/{}` is not listed in the live Codewhale model catalog (GET /api/model-providers), so no conversation was created. {listed}",
+        printable(provider),
+        printable(model)
+    )
+}
+
 fn resolve_account_agent(agents: &[AccountAgent], selector: &str) -> Result<AccountAgent> {
     let selector = selector.trim();
     if selector.is_empty() {
@@ -1443,10 +1615,10 @@ fn parse_agent_turn_events(body: &[u8], turn_id: &str, since_seq: u64) -> Result
     for frame in normalized.split("\n\n") {
         let mut data = None;
         for line in frame.lines() {
-            if let Some(value) = line.strip_prefix("data:") {
-                if data.replace(value.trim_start_matches(' ')).is_some() {
-                    bail!("The Codewhale service returned a malformed conversation event");
-                }
+            if let Some(value) = line.strip_prefix("data:")
+                && data.replace(value.trim_start_matches(' ')).is_some()
+            {
+                bail!("The Codewhale service returned a malformed conversation event");
             }
         }
         let Some(data) = data else { continue };
@@ -1614,6 +1786,10 @@ fn run_github<T: CloudTransport, W: Write>(
             }
             Ok(())
         }
+        CloudGithubCommand::Bind {
+            repo,
+            installation_id,
+        } => work::bind_github_repo(client, out, &repo, installation_id.as_deref()),
     }
 }
 
@@ -1650,10 +1826,10 @@ fn run_agents<T: CloudTransport, W: Write>(
         } => {
             let agent = client.create_agent(&name, project_id.as_deref(), &operation_key)?;
             validate_resource_id(&agent.id, "Agent")?;
-            if let Some(project_id) = project_id.as_deref() {
-                if agent.project_id != validate_resource_id(project_id, "Project")? {
-                    bail!("The Codewhale service returned an unexpected Agent Project binding");
-                }
+            if let Some(project_id) = project_id.as_deref()
+                && agent.project_id != validate_resource_id(project_id, "Project")?
+            {
+                bail!("The Codewhale service returned an unexpected Agent Project binding");
             }
             writeln!(out, "Agent: {}", printable(&agent.name))?;
             writeln!(out, "ID: {}", agent.id)?;
@@ -1743,6 +1919,12 @@ fn run_agents<T: CloudTransport, W: Write>(
                 .context("The Codewhale service returned an invalid Agent list")?;
             let selected = resolve_account_agent(&listing.agents, &agent)?;
             let project_id = selected.project_id.trim();
+            // The saved route is a promise about which model answers, so a
+            // route the live catalog does not list is refused before anything
+            // is created rather than accepted and discovered at first send.
+            let (route_provider, route_model) = validate_model_route(&provider, &model)?;
+            let catalog = client.provider_catalog()?;
+            let route_provider = assert_catalog_route(&catalog, route_provider, route_model)?;
             let thread = client.create_agent_thread(
                 &selected.id,
                 if project_id.is_empty() {
@@ -1751,12 +1933,20 @@ fn run_agents<T: CloudTransport, W: Write>(
                     Some(project_id)
                 },
                 &title,
-                &provider,
-                &model,
+                route_provider,
+                route_model,
                 &operation_key,
             )?;
             if !active_agent_thread(&thread, &selected.id) {
                 bail!("The Codewhale service did not return an active conversation for this Agent");
+            }
+            if thread.model_provider != route_provider || thread.model != route_model {
+                bail!(
+                    "The Codewhale service created conversation {} on {}/{} instead of the requested {route_provider}/{route_model}. Do not send to it; create a new conversation or report this route mismatch",
+                    printable(&thread.id),
+                    printable(&thread.model_provider),
+                    printable(&thread.model)
+                );
             }
             if !project_id.is_empty() && thread.project_id != project_id {
                 bail!(
@@ -1906,36 +2096,7 @@ fn run_agents<T: CloudTransport, W: Write>(
                     printable(&selected.name)
                 );
             }
-            let receipt = client.assign_agent_work(&selected.id, &objective, &message_id)?;
-            writeln!(out, "Intent: {}", printable(&receipt.intent))?;
-            let mut work = receipt.work.into_iter().chain(receipt.queued_work);
-            let mut recorded = 0;
-            for item in work.by_ref() {
-                validate_resource_id(&item.id, "Work")?;
-                if item.agent_id != selected.id {
-                    bail!("The Codewhale service returned Work for a different Agent");
-                }
-                writeln!(out, "Work ID: {}", item.id)?;
-                writeln!(out, "Status: {}", printable(&item.status))?;
-                if !item.objective.is_empty() {
-                    writeln!(out, "Objective: {}", printable(&item.objective))?;
-                }
-                recorded += 1;
-            }
-            if recorded == 0 {
-                writeln!(
-                    out,
-                    "No Work was created. The Agent classified this message as {}.",
-                    printable(&receipt.intent)
-                )?;
-            } else {
-                writeln!(
-                    out,
-                    "Work is recorded. Hosted compute needs a separate reviewed quote and launch."
-                )?;
-            }
-            writeln!(out, "Message ID: {}", validate_operation_key(&message_id)?)?;
-            Ok(())
+            work::assign(client, out, &selected, &objective, &message_id)
         }
         CloudAgentsCommand::WorkStatus { id } => {
             let result = client.agent_work_status(&id)?;
@@ -1962,6 +2123,38 @@ fn run_agents<T: CloudTransport, W: Write>(
                 writeln!(out, "Objective: {}", printable(title))?;
             }
             Ok(())
+        }
+        CloudAgentsCommand::WorkCancel { id, queue, reason } => {
+            work::cancel(client, out, &id, queue, reason.as_deref())
+        }
+        CloudAgentsCommand::WorkResult { id, json } => work::result(client, out, &id, json),
+        CloudAgentsCommand::WorkQuote { id, operation_key } => {
+            work::quote(client, out, &id, &operation_key)
+        }
+        CloudAgentsCommand::WorkLaunch {
+            id,
+            operation_key,
+            confirmation,
+            confirm_eu_compute,
+        } => {
+            let confirmation = if confirmation == "-" && confirm_eu_compute {
+                if io::stdin().is_terminal() {
+                    bail!(
+                        "Pipe the launch confirmation to stdin; it must not be typed into the terminal"
+                    );
+                }
+                work::read_confirmation(io::stdin().lock())?
+            } else {
+                confirmation
+            };
+            work::launch(
+                client,
+                out,
+                &id,
+                &operation_key,
+                &confirmation,
+                confirm_eu_compute,
+            )
         }
     }
 }
@@ -2699,29 +2892,115 @@ fn parse_json_body<T: DeserializeOwned>(body: &[u8]) -> Result<T> {
     serde_json::from_slice(body).context("The Codewhale service returned an invalid JSON response")
 }
 
-fn response_error(response: &CloudResponse) -> anyhow::Error {
-    let code = serde_json::from_slice::<serde_json::Value>(&response.body)
-        .ok()
-        .and_then(|body| {
-            body.get("code")
-                .and_then(serde_json::Value::as_str)
-                .or_else(|| {
-                    body.get("error")
-                        .and_then(|error| error.get("code"))
-                        .and_then(serde_json::Value::as_str)
-                })
-                .and_then(safe_error_code)
-        });
-    match code {
-        Some(code) => anyhow!(
-            "Codewhale account request failed (HTTP {}, code {code})",
-            response.status
-        ),
-        None => anyhow!(
-            "Codewhale account request failed (HTTP {})",
-            response.status
-        ),
+/// A non-success reply from the account API, kept typed so a caller can tell a
+/// definitive refusal (4xx) from an outcome it cannot know (5xx, timeout).
+#[derive(Debug)]
+pub(crate) struct CloudHttpError {
+    status: u16,
+    code: Option<String>,
+    reconciliation_required: bool,
+}
+
+impl CloudHttpError {
+    fn code(&self) -> Option<&str> {
+        self.code.as_deref()
     }
+}
+
+impl std::fmt::Display for CloudHttpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.code {
+            Some(code) => write!(
+                f,
+                "Codewhale account request failed (HTTP {}, code {code})",
+                self.status
+            ),
+            None => write!(f, "Codewhale account request failed (HTTP {})", self.status),
+        }
+    }
+}
+
+impl std::error::Error for CloudHttpError {}
+
+/// The request may or may not have been processed: it never reached the
+/// service, or its reply was lost or unreadable. Mutating commands use this to
+/// say "unknown" instead of guessing "failed".
+#[derive(Debug)]
+pub(crate) struct CloudTransportError {
+    message: &'static str,
+    source: Box<dyn std::error::Error + Send + Sync + 'static>,
+}
+
+impl CloudTransportError {
+    fn new(message: &'static str, source: impl std::error::Error + Send + Sync + 'static) -> Self {
+        Self {
+            message,
+            source: Box::new(source),
+        }
+    }
+}
+
+impl std::fmt::Display for CloudTransportError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.message)
+    }
+}
+
+impl std::error::Error for CloudTransportError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
+/// Whether a failed mutating request may still have taken effect.
+fn outcome_unknown(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<CloudTransportError>().is_some()
+        || err.downcast_ref::<CloudHttpError>().is_some_and(|http| {
+            http.status >= 500
+                || http.status == 408
+                || http.reconciliation_required
+                || http.code().is_some_and(|code| {
+                    code.ends_with("_outcome_unknown")
+                        || matches!(
+                            code,
+                            "boat_task_replay_expired"
+                                | "boat_task_create_in_progress"
+                                | "boat_task_cleanup_pending"
+                                | "boat_task_receipt_invalid"
+                                | "boat_task_authority_changed"
+                                | "boat_task_stop_unconfirmed"
+                                | "boat_task_usage_pending"
+                        )
+                })
+        })
+}
+
+fn response_error(response: &CloudResponse) -> anyhow::Error {
+    let body = serde_json::from_slice::<serde_json::Value>(&response.body).ok();
+    let code = body.as_ref().and_then(|body| {
+        body.get("code")
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| {
+                body.get("error")
+                    .and_then(|error| error.get("code"))
+                    .and_then(serde_json::Value::as_str)
+            })
+            .and_then(safe_error_code)
+    });
+    let reconciliation_required = body.as_ref().is_some_and(|body| {
+        body.get("reconciliationRequired")
+            .or_else(|| {
+                body.get("error")
+                    .and_then(|error| error.get("reconciliationRequired"))
+            })
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+    });
+    anyhow::Error::new(CloudHttpError {
+        status: response.status,
+        code,
+        reconciliation_required,
+    })
 }
 
 fn safe_error_code(code: &str) -> Option<String> {
@@ -2737,10 +3016,15 @@ fn safe_error_code(code: &str) -> Option<String> {
 }
 
 fn printable(value: &str) -> String {
+    printable_max(value, 200)
+}
+
+/// `printable` with a caller-chosen bound, for remote prose longer than a label.
+fn printable_max(value: &str, max_chars: usize) -> String {
     value
         .chars()
         .filter(|character| !character.is_control())
-        .take(200)
+        .take(max_chars)
         .collect::<String>()
         .trim()
         .to_string()

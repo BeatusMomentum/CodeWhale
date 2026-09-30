@@ -11210,8 +11210,10 @@ async fn unicode_skill_activation_matches_api_load_and_owned_lifecycle() -> Resu
     .await?
     .context("isolated skill API fixture requires loopback")?;
     let client = crate::tls::reqwest_client();
-    let context =
-        ToolContext::new(&workspace).with_skills_config(workspace.join(".codewhale/skills"), false);
+    let context = ToolContext::new(&workspace).with_skills_config(
+        workspace.join(".codewhale/skills"),
+        crate::skills::SkillDiscoveryMode::Compatible,
+    );
     let tool = crate::tools::skill::LoadSkillTool;
 
     let before: serde_json::Value = client
@@ -11451,7 +11453,13 @@ fn resolve_skills_scenario() {
         crate::test_support::trust_workspace(workspace);
         fs::create_dir_all(&local_skills).expect("create skills dir");
 
-        let config = Config::default();
+        let config = Config {
+            skills: Some(crate::config::SkillsConfig {
+                flat_workspace_root: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
         let resolved = resolve_skills_dir(&config, workspace);
 
         let expected = fs::canonicalize(&local_skills).expect("canonical local skills");
@@ -11558,6 +11566,7 @@ fn skill_entry_is_bundled_requires_configured_bundle_path() {
         localized_descriptions: std::collections::HashMap::new(),
         invocation: crate::skills::SkillInvocation::ModelAndUser,
         aliases: Vec::new(),
+        argument_hint: None,
         body: String::new(),
         path: bundled_skill_path,
         source: crate::skills::SkillSource::Native,
@@ -11569,6 +11578,7 @@ fn skill_entry_is_bundled_requires_configured_bundle_path() {
         localized_descriptions: std::collections::HashMap::new(),
         invocation: crate::skills::SkillInvocation::ModelAndUser,
         aliases: Vec::new(),
+        argument_hint: None,
         body: String::new(),
         path: override_skill_path,
         source: crate::skills::SkillSource::Native,
@@ -11635,7 +11645,16 @@ fn resolve_skills_dir_ignores_untrusted_workspace_skills() {
     };
     for (relative, config) in [
         (".agents/skills", Config::default()),
-        ("skills", Config::default()),
+        (
+            "skills",
+            Config {
+                skills: Some(crate::config::SkillsConfig {
+                    flat_workspace_root: Some(true),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        ),
         (".codewhale/skills", codewhale_only),
     ] {
         let workspace = tmp

@@ -226,7 +226,7 @@ export async function handle(req, { computerId = "local", sessionId = "direct", 
       return { ok: true, platform: process.platform, tool, data };
     }));
   } catch (err) {
-    return { ok: false, platform: process.platform, tool, error: { code: err?.code ?? "tool_error", message: String(err?.message ?? err) } };
+    return { ok: false, platform: process.platform, tool, error: { code: err?.code ?? "tool_error", message: String(err?.message ?? err), ...(err?.inputMayHaveBeenSent || err?.requestDispatched ? { request_dispatched: true } : {}) } };
   } finally {
     signal?.removeEventListener("abort", abort);
     session.requests.delete(controller);

@@ -17,7 +17,6 @@ use codewhale_agent::ModelRegistry;
 use codewhale_config::ConfigStore;
 use codewhale_core::Runtime;
 use codewhale_hooks::{HookDispatcher, JsonlHookSink, StdoutHookSink, UnixSocketHookSink};
-use codewhale_mcp::McpManager;
 use codewhale_protocol::{
     AppRequest, AppResponse, EventFrame, PromptRequest, PromptResponse, ResponseChannel,
     ThreadGoalClearParams, ThreadGoalGetParams, ThreadGoalSetParams, ThreadRequest, ThreadResponse,
@@ -373,7 +372,7 @@ async fn shutdown_signal() {
 /// `RuntimeBridge::stream_turn_events` forwards only `item.delta` and the
 /// turn's completion, and there is no decision route, so approval-gated work
 /// belongs on the Runtime API (`/v1/threads/*`, `POST /v1/approvals/{id}`).
-const ADVERTISED_ROUTES: &[&str] = &["/thread", "/app", "/prompt", "/jobs", "/mcp/startup"];
+const ADVERTISED_ROUTES: &[&str] = &["/thread", "/app", "/prompt", "/jobs"];
 
 fn app_router(state: AppState, cors_origins: &[String]) -> Router {
     let protected_routes = Router::new()
@@ -391,7 +390,6 @@ fn app_router(state: AppState, cors_origins: &[String]) -> Router {
             )),
         )
         .route("/jobs", get(jobs_handler))
-        .route("/mcp/startup", post(mcp_startup_handler))
         .route(
             "/v1/chat/completions",
             post(chat_completions::chat_completions_handler),
@@ -740,15 +738,6 @@ async fn jobs_handler(State(state): State<AppState>) -> Json<AppResponse> {
     Json(runtime.app_status())
 }
 
-async fn mcp_startup_handler(State(state): State<AppState>) -> Json<Value> {
-    let runtime = state.runtime.read().await;
-    let summary = runtime.mcp_startup().await;
-    Json(json!({
-        "ok": true,
-        "summary": summary
-    }))
-}
-
 async fn app_handler(
     State(state): State<AppState>,
     Json(req): Json<AppRequest>,
@@ -817,12 +806,7 @@ fn build_state_with_transport(
         hooks.add_sink(Arc::new(UnixSocketHookSink::new(socket_path.clone())));
     }
 
-    let runtime = Runtime::new(
-        config.clone(),
-        state_store,
-        Arc::new(McpManager::default()),
-        hooks,
-    );
+    let runtime = Runtime::new(config.clone(), state_store, hooks);
 
     Ok(AppState {
         config_path,
@@ -2658,7 +2642,7 @@ async fn process_app_request(
             data: json!({
                 "routes": ADVERTISED_ROUTES,
                 "config": ["get", "set", "unset", "list", "reload"],
-                "events": ["response_start", "response_delta", "response_end", "tool_call_start", "tool_call_result", "mcp_startup_update", "mcp_startup_complete"],
+                "events": ["response_start", "response_delta", "response_end", "tool_call_start", "tool_call_result"],
                 "transport": "stdio+http",
                 "config_path": state.config_path.as_ref().map(|p| p.display().to_string()),
             }),
@@ -3093,6 +3077,40 @@ mod tests {
         let caps = process_app_request(&state, AppRequest::Capabilities, AppTransport::Http).await;
         let advertised = caps.data["routes"].as_array().expect("routes list");
         assert!(!advertised.iter().any(|route| route == "/tool"));
+    }
+
+    #[tokio::test]
+    async fn mcp_startup_route_cannot_start_a_parallel_pool() {
+        let (app, tmp) = app_with_config(Some("test-token"));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/mcp/startup")
+                    .header(header::AUTHORIZATION, "Bearer test-token")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let state = build_state(Some(tmp.path().join("config.toml")), None).expect("state");
+        let caps = process_app_request(&state, AppRequest::Capabilities, AppTransport::Http).await;
+        assert!(
+            !caps.data["routes"]
+                .as_array()
+                .expect("routes")
+                .iter()
+                .any(|route| route == "/mcp/startup")
+        );
+        assert!(
+            !caps.data["events"]
+                .as_array()
+                .expect("events")
+                .iter()
+                .any(|event| event == "mcp_startup_update" || event == "mcp_startup_complete")
+        );
     }
 
     #[tokio::test]
@@ -3953,7 +3971,7 @@ mod tests {
         let state = build_state(Some(config_path.clone()), None).expect("state");
         *state.runtime_bridge.lock().await = Some(sentinel_bridge());
 
-        // A long reader (e.g. `/mcp/startup`) holds the runtime, so the set
+        // A concurrent reader holds the runtime, so the set
         // saves to disk and then waits to propagate.
         let runtime_reader = state.runtime.read().await;
         let request = process_app_request(

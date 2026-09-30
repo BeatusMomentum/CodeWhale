@@ -3772,9 +3772,7 @@ async fn list_skills(
     let (skills_dir, mode) = {
         let config = state.config.read();
         let skills_dir = resolve_skills_dir(&config, &state.workspace);
-        let mode = crate::skills::SkillDiscoveryMode::from_codewhale_only(
-            config.skills_config().scan_codewhale_only(),
-        );
+        let mode = crate::skills::SkillDiscoveryMode::from_config(&config.skills_config());
         (skills_dir, mode)
     };
     let plugin_registry = state
@@ -3845,9 +3843,7 @@ async fn set_skill_enabled(
     let (skills_dir, mode) = {
         let config = state.config.read();
         let skills_dir = resolve_skills_dir(&config, &state.workspace);
-        let mode = crate::skills::SkillDiscoveryMode::from_codewhale_only(
-            config.skills_config().scan_codewhale_only(),
-        );
+        let mode = crate::skills::SkillDiscoveryMode::from_config(&config.skills_config());
         (skills_dir, mode)
     };
     let plugin_registry = state
@@ -8193,8 +8189,11 @@ fn resolve_skills_dir(config: &Config, workspace: &std::path::Path) -> PathBuf {
         Err(_) => return config.skills_dir(),
     };
     for candidate in [
-        canonical_workspace.join(".agents").join("skills"),
-        canonical_workspace.join("skills"),
+        canonical_workspace.join(".codewhale/skills"),
+        canonical_workspace.join(".agents/skills"),
+        canonical_workspace.join(".claude/skills"),
+        canonical_workspace.join(".opencode/skills"),
+        canonical_workspace.join(".cursor/skills"),
     ] {
         // Re-canonicalize the candidate so a `.agents/skills` symlink to e.g.
         // `/etc` cannot promote arbitrary filesystem locations into the
@@ -8207,6 +8206,15 @@ fn resolve_skills_dir(config: &Config, workspace: &std::path::Path) -> PathBuf {
         {
             return canon;
         }
+    }
+    let flat = canonical_workspace.join("skills");
+    if config.skills_config().flat_workspace_root()
+        && let Ok(canonical) = fs::canonicalize(&flat)
+        && canonical.starts_with(&canonical_workspace)
+        && canonical.is_dir()
+        && crate::skills::skills_dir_allowed_by_workspace_trust(workspace, &canonical)
+    {
+        return canonical;
     }
     config.skills_dir()
 }

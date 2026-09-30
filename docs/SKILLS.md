@@ -43,12 +43,19 @@ and similar harness layouts.
 
 **Audit-only (not runtime-active)**
 
+- Flat `<workspace>/skills` is an audit candidate until `[skills] flat_workspace_root = true`; an explicit `skills_dir` can also select it.
 - `.codex/skills` appears in **compatible** audit scans so operators can see it.
   It does **not** join the runtime discovery set.
 
 Configured `skills_dir` that is not one of the owned Codewhale roots stays
 read-only. Discovery and the manager can list it; mutations still target owned
 project/global roots only.
+
+Within each scope, the owned `.codewhale/skills` root wins name collisions.
+Project order is `.codewhale`, `.agents`, `.claude`, `.opencode`, `.cursor`, then
+an opted-in flat `skills` root. Global order is `.codewhale`, `.agents`, `.claude`,
+then legacy `.deepseek`. Project roots precede global roots. Shadowing warnings
+name both copies, so install and update select the owned copy in that scope.
 
 Every root inside the workspace — owned, compatible, or a configured
 `skills_dir` that resolves there — loads only once the workspace is trusted
@@ -140,6 +147,25 @@ Bundled and user skills may declare two runtime-routing fields in frontmatter:
 | `invocation: model+user` | The default; the skill appears in the model's compact catalogue and can be loaded by the model or user. |
 | `invocation: explicit-only` | The skill remains loadable by an explicit name, but is omitted from the model catalogue so opt-in instructions do not become ambient context. |
 | `aliases-for: name, other-name` | Additional lookup names for the same canonical skill. Aliases are not separate catalogue entries and do not duplicate prompt content. |
+
+`disable-model-invocation: true` makes a skill explicit-only. `user-invocable:
+false` hides it from user menus and refuses explicit activation while preserving
+model selection. Setting both disables both paths. Boolean spellings `true/false`,
+`yes/no`, `on/off`, and `1/0` are accepted; invalid policy booleans fail closed.
+The model's catalog, list/query, and `load_skill` enforce model eligibility; the
+user's slash and command palettes enforce user eligibility. `argument-hint` is
+shown beside user-facing descriptions. `when_to_use` joins the routing description
+as `Use when:`.
+
+The runtime and installer share one frontmatter validator. Runtime accepts missing
+descriptions and heading-only Markdown with warnings; installation requires a
+frontmatter block, a nonempty description, and a path-safe name. A name/directory
+mismatch warns without renaming the file. Nested `metadata` stays nested; flow
+and block lists share the same interpretation. `license`, `compatibility`,
+`metadata`, localized descriptions, and `x-*` extension keys are accepted silently.
+Unknown keys warn once. `allowed-tools` / `disallowed-tools`, `model`, `context`,
+and `agent` warn because they grant no tool, approval, provider, or fork authority.
+The existing workspace-trust and reviewed-plugin byte/hash gates still apply.
 
 Missing or unknown invocation values retain the historical `model+user`
 behavior. Canonical names win over aliases when a collision exists. Loading a
@@ -236,7 +262,7 @@ Collision and prompt-budget invariants asserted today:
 | Single alias owner | No two bundled skills may claim the same alias. |
 | No duplicate entries | Each canonical name renders at most one catalogue line; aliases render zero. |
 | Budget headroom | The shipped pack alone renders under the window-scaled skills budget (25 600 chars at the default 128k window; 2 400-char floor) with **no** "additional skills omitted" line, so user skills are never silently displaced. |
-| No context poisoning | Descriptions stay single-line and are truncated to `MAX_SKILL_DESCRIPTION_CHARS` (280) before entering the prompt. |
+| No context poisoning | Descriptions stay single-line and are truncated to `MAX_SKILL_DESCRIPTION_CHARS` (400) before entering the prompt. |
 
 ### Locale-aware routing metadata
 

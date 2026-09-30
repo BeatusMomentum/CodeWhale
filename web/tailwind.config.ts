@@ -1,7 +1,9 @@
 import type { Config } from "tailwindcss";
 
 export default {
-  content: ["./app/**/*.{ts,tsx}", "./components/**/*.{ts,tsx}"],
+  // Dictionaries carry per-locale class names (e.g. the Arabic and Hindi
+  // docs guide's `leading-loose`); unscanned, those utilities never exist.
+  content: ["./app/**/*.{ts,tsx}", "./components/**/*.{ts,tsx}", "./lib/i18n/dictionaries/**/*.ts"],
   theme: {
     extend: {
       colors: {

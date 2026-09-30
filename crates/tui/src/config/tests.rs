@@ -8255,6 +8255,7 @@ fn profile_skills_config_merges_individual_fields() {
         Config {
             skills: Some(SkillsConfig {
                 scan_codewhale_only: Some(true),
+                flat_workspace_root: Some(false),
                 ..Default::default()
             }),
             ..Default::default()
@@ -8265,6 +8266,7 @@ fn profile_skills_config_merges_individual_fields() {
             skills: Some(SkillsConfig {
                 registry_url: Some("https://registry.example/skills.json".to_string()),
                 max_install_size_bytes: Some(1234),
+                flat_workspace_root: Some(true),
                 ..Default::default()
             }),
             ..Default::default()
@@ -8281,6 +8283,7 @@ fn profile_skills_config_merges_individual_fields() {
     );
     assert_eq!(skills.max_install_size_bytes, Some(1234));
     assert_eq!(skills.scan_codewhale_only, Some(true));
+    assert_eq!(skills.flat_workspace_root, Some(false));
 }
 
 #[test]

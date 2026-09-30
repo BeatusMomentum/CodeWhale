@@ -57,6 +57,21 @@ CODEWHALE_PROVIDER=vllm VLLM_BASE_URL=http://127.0.0.1:8000/v1 VLLM_MODEL=<id> \
 超过挂起阈值——上报 `System sleep detected; connection lost — retrying request`，
 并重新发起请求，而不是让回合失败（#2990）。
 
+## Windows PowerShell 执行策略
+
+shell 工具以 `-ExecutionPolicy Bypass` 运行 PowerShell。它只设置所启动子进程
+自己的策略：不会持久化，不需要管理员权限，你自己打开的 PowerShell 窗口仍保持
+原有策略。没有它时，本地策略为 `Restricted`（Windows 客户端的默认值）或
+`AllSigned` 的机器，会拒绝运行 Codewhale 为多行命令写入的临时 `.ps1` 脚本
+（#6745）。
+
+由组策略设置的策略（`Get-ExecutionPolicy -List` 中 `MachinePolicy` 或
+`UserPolicy` 行）优先级高于进程范围。在这样的机器上，多行命令仍会被拒绝，
+PowerShell 的拒绝信息会作为该命令的错误返回；Codewhale 不会绕过管理员强制的
+策略。单行命令通过 `-Command` 运行，不受执行策略约束。命令自身调用的脚本也在
+同一进程范围内运行；决定什么可以运行的是 shell 工具的审批与沙箱设置，而不是
+执行策略。
+
 ## 统一的运行时命令
 
 当前的 `codewhale` 二进制在进程内运行 TUI。发布安装器会把同样的字节复制到

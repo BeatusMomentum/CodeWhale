@@ -431,7 +431,11 @@ impl<'a> AutoReviewContext<'a> {
         let tool_name = tool_name.to_owned();
         let params = params.clone();
         let workspace = workspace.map(std::path::Path::to_path_buf);
+        #[cfg(test)]
+        let env_ticket = crate::test_support::env_scope_ticket();
         tokio::task::spawn_blocking(move || {
+            #[cfg(test)]
+            let _membership = crate::test_support::join_env_scope(env_ticket);
             let trusted = workspace
                 .as_deref()
                 .is_some_and(crate::config::is_workspace_trusted);
@@ -2687,6 +2691,36 @@ mod tests {
             true,
             Some(workspace),
         )
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn auto_review_worker_keeps_the_callers_sealed_environment() {
+        use crate::test_support::{EnvVarGuard, lock_test_env};
+        use std::time::Duration;
+
+        let _lock = lock_test_env();
+        let home = tempfile::tempdir().expect("test home");
+        let workspace = tempfile::tempdir().expect("workspace");
+        let _home = EnvVarGuard::set("CODEWHALE_HOME", home.path());
+        crate::config::save_workspace_trust(workspace.path()).expect("save trust");
+
+        let context = tokio::time::timeout(
+            Duration::from_secs(2),
+            AutoReviewContext::from_tool_call_async(
+                "read_file",
+                &json!({ "path": "README.md" }),
+                RunOrigin::Interactive,
+                ApprovalMode::Auto,
+                Some(workspace.path()),
+            ),
+        )
+        .await
+        .expect("worker must not wait for its awaiting caller's environment lock")
+        .expect("evidence");
+        assert!(
+            context.workspace_trusted,
+            "worker must read the sealed trust file"
+        );
     }
 
     #[cfg(unix)]
