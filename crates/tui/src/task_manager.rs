@@ -52,6 +52,10 @@ const STORE_IDLE_POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// written by another process can wait up to about 13s after contention; an
 /// in-process submission or a queue change ends the backoff early.
 const STORE_BUSY_BACKOFF_MAX: Duration = Duration::from_secs(8);
+/// A read snapshot is only trusted once both stamps are at least this old, so
+/// a write landing in the same coarse mtime tick as the load (1s or 2s on
+/// some filesystems) cannot hide behind an unchanged stamp (#6573).
+const READ_SNAPSHOT_SETTLE: Duration = Duration::from_secs(2);
 
 const fn default_task_schema_version() -> u32 {
     CURRENT_TASK_SCHEMA_VERSION
@@ -1415,14 +1419,47 @@ pub struct TaskManager {
 struct StoreFingerprint(Option<(std::time::SystemTime, u64, u64)>);
 
 impl StoreFingerprint {
-    fn read(queue_path: &Path) -> Self {
-        Self(fs::metadata(queue_path).ok().and_then(|meta| {
+    fn read(path: &Path) -> Self {
+        Self(fs::metadata(path).ok().and_then(|meta| {
             #[cfg(unix)]
             let inode = std::os::unix::fs::MetadataExt::ino(&meta);
             #[cfg(not(unix))]
             let inode = 0;
             Some((meta.modified().ok()?, meta.len(), inode))
         }))
+    }
+
+    /// True when the stamp is old enough that a later write cannot share it.
+    fn settled(&self, now: std::time::SystemTime) -> bool {
+        self.0.as_ref().is_none_or(|(modified, _, _)| {
+            now.duration_since(*modified)
+                .is_ok_and(|age| age >= READ_SNAPSHOT_SETTLE)
+        })
+    }
+}
+
+/// Stat-only view of everything `load_state` reads, for read-only callers
+/// (#6573). Every task and queue write is an atomic rename, which bumps the
+/// tasks directory's or the queue file's mtime, so an unchanged snapshot
+/// means an unchanged store. The TUI task panel lists tasks every 2.5s; with
+/// this, an idle session answers from memory instead of taking the
+/// cross-process store lock and re-parsing every task record each time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReadSnapshot {
+    queue: StoreFingerprint,
+    tasks_dir: StoreFingerprint,
+}
+
+impl ReadSnapshot {
+    fn read(tasks_dir: &Path, queue_path: &Path) -> Self {
+        Self {
+            queue: StoreFingerprint::read(queue_path),
+            tasks_dir: StoreFingerprint::read(tasks_dir),
+        }
+    }
+
+    fn settled(&self, now: std::time::SystemTime) -> bool {
+        self.queue.settled(now) && self.tasks_dir.settled(now)
     }
 }
 
@@ -1482,6 +1519,9 @@ struct ManagerState {
     running_cancel: HashMap<String, CancellationToken>,
     /// Uncommitted typed deltas, reapplied to a fresh record before persistence.
     pending_events: HashMap<String, Vec<TaskExecutionEvent>>,
+    /// Store snapshot that `tasks` and `queue` exactly reflect, set only by a
+    /// read-only refresh and cleared by every path that may change them.
+    read_snapshot: Option<ReadSnapshot>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Default)]
@@ -1600,6 +1640,7 @@ impl TaskManager {
                 queue: VecDeque::new(),
                 running_cancel: HashMap::new(),
                 pending_events: HashMap::new(),
+                read_snapshot: None,
             }),
             notify: Notify::new(),
             cancel_token: cancel_token.clone(),
@@ -1997,8 +2038,7 @@ impl TaskManager {
         owner_session_id: Option<&str>,
     ) -> Result<Vec<TaskSummary>> {
         let mut state = self.state.lock().await;
-        let _transaction = self.lock_store().await?;
-        self.refresh_locked(&mut state)?;
+        self.refresh_for_read(&mut state).await?;
         let mut items = state
             .tasks
             .values()
@@ -2048,8 +2088,7 @@ impl TaskManager {
         owner_session_id: &str,
     ) -> Result<TaskRecord> {
         let mut state = self.state.lock().await;
-        let _transaction = self.lock_store().await?;
-        self.refresh_locked(&mut state)?;
+        self.refresh_for_read(&mut state).await?;
         let id = resolve_task_id_visible_to_operator(
             &state.tasks,
             id_or_prefix,
@@ -2070,8 +2109,7 @@ impl TaskManager {
     /// ownerless tasks without that provenance still fail closed.
     pub(crate) async fn get_task_for_active_runtime(&self, task_id: &str) -> Result<TaskRecord> {
         let mut state = self.state.lock().await;
-        let _transaction = self.lock_store().await?;
-        self.refresh_locked(&mut state)?;
+        self.refresh_for_read(&mut state).await?;
         state
             .tasks
             .get(task_id)
@@ -2089,8 +2127,7 @@ impl TaskManager {
         owner_session_id: Option<&str>,
     ) -> Result<TaskRecord> {
         let mut state = self.state.lock().await;
-        let _transaction = self.lock_store().await?;
-        self.refresh_locked(&mut state)?;
+        self.refresh_for_read(&mut state).await?;
         let id = resolve_task_id_visible_to(&state.tasks, id_or_prefix, owner_session_id)?;
         state
             .tasks
@@ -2226,8 +2263,7 @@ impl TaskManager {
     /// Return aggregate status counters.
     pub async fn counts(&self) -> Result<TaskCounts> {
         let mut state = self.state.lock().await;
-        let _transaction = self.lock_store().await?;
-        self.refresh_locked(&mut state)?;
+        self.refresh_for_read(&mut state).await?;
         let mut counts = TaskCounts::default();
         for task in state.tasks.values() {
             match task.status {
@@ -2326,6 +2362,7 @@ impl TaskManager {
         else {
             return Ok(None);
         };
+        state.read_snapshot = None;
         state.queue.retain(|queued| queued != &id);
         let task = state
             .tasks
@@ -3115,8 +3152,35 @@ impl TaskManager {
     }
 
     fn refresh_locked(&self, state: &mut ManagerState) -> Result<()> {
+        // Callers go on to change `state`; a failed persist must not leave a
+        // diverged view that a read-only caller would trust.
+        state.read_snapshot = None;
         let loaded = load_state(&self.tasks_dir, &self.queue_path)?;
         self.apply_loaded_locked(state, loaded)
+    }
+
+    /// Bring `state` up to date for a read-only caller (#6573).
+    ///
+    /// Skips the cross-process lock and the full reload while the store is
+    /// provably unchanged since the last read-only refresh. Several TUIs
+    /// sharing one data dir each list tasks every 2.5s on their event loop;
+    /// without this, every idle session took the store lock and re-parsed
+    /// every task record on each poll, contending with the others.
+    async fn refresh_for_read(&self, state: &mut ManagerState) -> Result<()> {
+        if let Some(snapshot) = &state.read_snapshot
+            && *snapshot == ReadSnapshot::read(&self.tasks_dir, &self.queue_path)
+        {
+            return Ok(());
+        }
+        let _transaction = self.lock_store().await?;
+        // Taken under the lock and before the load, so any later write
+        // changes it.
+        let snapshot = ReadSnapshot::read(&self.tasks_dir, &self.queue_path);
+        self.refresh_locked(state)?;
+        if snapshot.settled(std::time::SystemTime::now()) {
+            state.read_snapshot = Some(snapshot);
+        }
+        Ok(())
     }
 
     fn apply_loaded_locked(&self, state: &mut ManagerState, loaded: LoadedTaskState) -> Result<()> {
@@ -3849,6 +3913,61 @@ mod tests {
 
         first.shutdown_and_wait().await?;
         second.shutdown_and_wait().await?;
+        Ok(())
+    }
+
+    /// #6573: the TUI task panel lists tasks every 2.5s. An unchanged store
+    /// must be answered from memory, without the cross-process lock or a
+    /// reload, while a write from another process is still seen.
+    #[tokio::test]
+    async fn repeated_listing_of_an_unchanged_store_does_not_reload_it() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let lister = TaskManager::start_with_executor_in_scope(
+            test_config(root.path().to_path_buf()),
+            Arc::new(MockExecutor),
+            "lister",
+        )
+        .await?;
+        let writer = TaskManager::start_with_executor_in_scope(
+            test_config(root.path().to_path_buf()),
+            Arc::new(MockExecutor),
+            "writer",
+        )
+        .await?;
+        let first = writer
+            .add_task(NewTaskRequest::from_prompt("first"))
+            .await?;
+        wait_for_terminal_state(&writer, &first.id, Duration::from_secs(2)).await?;
+        // Let the store's mtimes settle so a snapshot can be trusted.
+        sleep(READ_SNAPSHOT_SETTLE + Duration::from_millis(300)).await;
+        assert_eq!(lister.list_tasks(None).await?.len(), 1);
+
+        lister.store_loads.store(0, Ordering::Relaxed);
+        for _ in 0..20 {
+            assert_eq!(lister.list_tasks(None).await?.len(), 1);
+            assert_eq!(lister.counts().await?.completed, 1);
+        }
+        let loads = lister.store_loads.load(Ordering::Relaxed);
+        // Only the idle worker's fallback poll may reload in this window.
+        assert!(
+            loads <= 1,
+            "40 read-only calls on an unchanged store reloaded it {loads} times"
+        );
+
+        let second = writer
+            .add_task(NewTaskRequest::from_prompt("second"))
+            .await?;
+        assert!(
+            lister
+                .list_tasks(None)
+                .await?
+                .iter()
+                .any(|task| task.id == second.id),
+            "a write from another process must invalidate the read snapshot"
+        );
+
+        lister.shutdown_and_wait().await?;
+        writer.shutdown_and_wait().await?;
         Ok(())
     }
 

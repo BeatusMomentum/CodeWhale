@@ -27,6 +27,7 @@ vi.mock("@/lib/github", async (importOriginal) => {
 
 import { POST as adminPost } from "../app/api/admin/post/route";
 import { GET as publicFeed } from "../app/api/github/feed/route";
+import { reviewedBodyHash } from "./community-agent";
 import { runPrReview, runTriage } from "./community-agent-tasks";
 
 class FakeKv {
@@ -218,7 +219,12 @@ describe("public security boundaries", () => {
         cookie: "mt_sid=test-session",
         origin: "https://codewhale.net",
       },
-      body: JSON.stringify({ action: "post", draftKey: "draft:triage:42", lang: "zh" }),
+      body: JSON.stringify({
+        action: "post",
+        draftKey: "draft:triage:42",
+        lang: "zh",
+        reviewedSha256: await reviewedBodyHash("中文正文"),
+      }),
     }));
 
     await expect(response.json()).resolves.toMatchObject({ ok: true });

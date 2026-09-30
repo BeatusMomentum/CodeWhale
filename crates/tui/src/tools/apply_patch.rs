@@ -5,7 +5,7 @@
 
 use std::collections::HashSet;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -121,9 +121,7 @@ pub struct ApplyPatchPreflight {
 #[derive(Debug, Clone)]
 pub struct Hunk {
     pub old_start: usize,
-    #[cfg_attr(not(test), expect(dead_code))]
     pub old_count: usize,
-    #[cfg_attr(not(test), expect(dead_code))]
     pub new_start: usize,
     #[cfg_attr(not(test), expect(dead_code))]
     pub new_count: usize,
@@ -147,6 +145,9 @@ struct FilePatch {
     hunks: Vec<Hunk>,
     delete_after: bool,
     create_if_missing: bool,
+    /// The section's old header is `/dev/null`: it creates the file and has
+    /// nothing to anchor against, so it must not land on an existing one.
+    creates_new_file: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -183,6 +184,8 @@ struct PatchStatsExt {
 struct PatchShape {
     has_hunks: bool,
     header_files: Vec<String>,
+    /// Some section's old header is `/dev/null` (a file creation).
+    creates_new_file: bool,
 }
 
 impl PatchShape {
@@ -211,7 +214,11 @@ struct HunkApplyOutcome {
 #[derive(Debug, Clone)]
 enum ApplyPatchPreflightKind {
     Replace,
-    PathOverride { path: String, hunks: Vec<Hunk> },
+    PathOverride {
+        path: String,
+        hunks: Vec<Hunk>,
+        creates_new_file: bool,
+    },
     FilePatches(Vec<FilePatch>),
 }
 
@@ -451,11 +458,16 @@ impl ToolSpec for ApplyPatchTool {
             ApplyPatchPreflightKind::Replace => {
                 unreachable!("replace input returned before patch execution")
             }
-            ApplyPatchPreflightKind::PathOverride { path, hunks } => vec![FilePatch {
+            ApplyPatchPreflightKind::PathOverride {
+                path,
+                hunks,
+                creates_new_file,
+            } => vec![FilePatch {
                 path,
                 hunks,
                 delete_after: false,
                 create_if_missing,
+                creates_new_file,
             }],
             ApplyPatchPreflightKind::FilePatches(file_patches) => file_patches,
         };
@@ -619,6 +631,9 @@ fn preflight_apply_patch_plan(
             kind: ApplyPatchPreflightKind::PathOverride {
                 path: path.to_string(),
                 hunks,
+                // `path` retargets the section; a `--- /dev/null` header
+                // still means "create", and must not land on an existing file.
+                creates_new_file: patch_shape.creates_new_file,
             },
         });
     }
@@ -857,6 +872,7 @@ fn parse_unified_diff_files(
             let new_path = Some(stripped.trim().to_string());
             let (path, delete_after, create_flag) =
                 resolve_diff_paths(old_path.as_deref(), new_path.as_deref(), create_if_missing)?;
+            let creates_new_file = old_path.as_deref().is_some_and(is_dev_null_header);
             old_path = None;
             if let Some(file) = current.take() {
                 files.push(file);
@@ -866,6 +882,7 @@ fn parse_unified_diff_files(
                 hunks: Vec::new(),
                 delete_after,
                 create_if_missing: create_flag,
+                creates_new_file,
             });
             continue;
         }
@@ -906,6 +923,11 @@ fn resolve_diff_paths(
         .or(old_norm)
         .ok_or_else(|| ToolError::invalid_input("Patch is missing both old and new file paths"))?;
     Ok((path, delete_after, create_flag))
+}
+
+fn is_dev_null_header(raw: &str) -> bool {
+    let raw = raw.split_once('\t').map_or(raw, |(path, _timestamp)| path);
+    matches!(raw.trim(), "/dev/null" | "dev/null")
 }
 
 fn normalize_diff_path(raw: &str) -> Option<String> {
@@ -1044,6 +1066,7 @@ fn inspect_patch_shape(patch: &str) -> PatchShape {
     let mut shape = PatchShape::default();
     let mut seen = HashSet::new();
     let mut old_path: Option<String> = None;
+    let mut old_is_dev_null = false;
     let mut hunk_old_remaining = 0usize;
     let mut hunk_new_remaining = 0usize;
 
@@ -1063,11 +1086,14 @@ fn inspect_patch_shape(patch: &str) -> PatchShape {
         }
 
         if let Some(stripped) = line.strip_prefix("--- ") {
+            old_is_dev_null = is_dev_null_header(stripped);
             old_path = normalize_diff_path(stripped);
             continue;
         }
 
         if let Some(stripped) = line.strip_prefix("+++ ") {
+            shape.creates_new_file |= old_is_dev_null && !is_dev_null_header(stripped);
+            old_is_dev_null = false;
             let new_path = normalize_diff_path(stripped);
             let resolved = new_path.or(old_path.clone());
             if let Some(path) = resolved
@@ -1279,9 +1305,15 @@ fn build_pending_writes_from_patches(
                     file_patch.path
                 )));
             };
+            if file_patch.creates_new_file && !current.is_empty() {
+                return Err(file_already_exists_error(&file_patch.path, &resolved));
+            }
             let mut lines: Vec<String> = current.lines().map(String::from).collect();
             let apply_stats =
                 apply_hunks_to_lines(&mut lines, &file_patch.hunks, fuzz, &file_patch.path)?;
+            if file_patch.delete_after {
+                ensure_delete_consumes_file(&lines, &file_patch.path)?;
+            }
             stats.stats.hunks_applied += apply_stats.hunks_applied;
             stats.stats.hunks_total += file_patch.hunks.len();
             stats.stats.fuzz_used += apply_stats.fuzz_used;
@@ -1329,6 +1361,13 @@ fn build_pending_writes_from_patches(
             )));
         }
 
+        // A `--- /dev/null` section has no old lines to anchor on, so on an
+        // existing file it would splice the "new" content onto the top of
+        // the old one and report success. `git apply` refuses this too.
+        if file_patch.creates_new_file && original.as_deref().is_some_and(|c| !c.is_empty()) {
+            return Err(file_already_exists_error(&file_patch.path, &resolved));
+        }
+
         let base_content = original.clone().unwrap_or_default();
         let mut lines: Vec<String> = if base_content.is_empty() {
             Vec::new()
@@ -1338,6 +1377,9 @@ fn build_pending_writes_from_patches(
 
         let apply_stats =
             apply_hunks_to_lines(&mut lines, &file_patch.hunks, fuzz, &file_patch.path)?;
+        if file_patch.delete_after {
+            ensure_delete_consumes_file(&lines, &file_patch.path)?;
+        }
         stats.stats.hunks_applied += apply_stats.hunks_applied;
         stats.stats.hunks_total += file_patch.hunks.len();
         stats.stats.fuzz_used += apply_stats.fuzz_used;
@@ -1374,6 +1416,25 @@ fn build_pending_writes_from_patches(
     }
 
     Ok((pending, stats))
+}
+
+fn file_already_exists_error(label: &str, resolved: &Path) -> ToolError {
+    ToolError::execution_failed(format!(
+        "Patch creates `{label}` (`--- /dev/null`), but it already exists at `{}`. Nothing was changed. To change the existing file, send a patch with context lines from its current contents; to replace it wholesale, use a write/replace action.",
+        resolved.display(),
+    ))
+}
+
+/// A `+++ /dev/null` section deletes the file, so its hunks must remove every
+/// line. Deleting after a partial match would silently drop the rest.
+fn ensure_delete_consumes_file(remaining: &[String], label: &str) -> Result<(), ToolError> {
+    if remaining.is_empty() {
+        return Ok(());
+    }
+    Err(ToolError::execution_failed(format!(
+        "Patch deletes `{label}` (`+++ /dev/null`), but its hunks leave {} line(s) of the file unaccounted for. Nothing was changed. Include every line of the file as `-` lines to delete it, or send a patch with a real `+++` path to edit it.",
+        remaining.len(),
+    )))
 }
 
 /// Normalize the Rust files a patch rewrites (#6205), before the write and
@@ -1608,10 +1669,22 @@ fn apply_hunk(
 
     // Try to find the location with fuzzy matching
     // Apply cumulative offset from previous hunks, clamping to valid range.
-    let base_idx = if hunk.old_start > 0 {
-        hunk.old_start - 1
+    // A pure insertion (`@@ -N,0 +M,K @@`, as `git diff -U0` emits) names
+    // the line it follows, so it goes *after* line N, not before it. Only a
+    // header that says `,0` qualifies: an omitted or nonzero old count keeps
+    // the "before line N" anchor. `new_start` settles the common hand-written
+    // `@@ -N,0 +N,K @@` ("new text starts at line N"): when it points at
+    // line N itself rather than after it, the text goes before line N.
+    let pure_insertion = hunk.old_count == 0 && old_lines.is_empty();
+    let starts_at_named_line = hunk.new_start > 0
+        && cumulative_offset
+            .checked_neg()
+            .and_then(|back| (hunk.new_start - 1).checked_add_signed(back))
+            == Some(hunk.old_start.saturating_sub(1));
+    let base_idx = if pure_insertion && !starts_at_named_line {
+        hunk.old_start
     } else {
-        0
+        hunk.old_start.saturating_sub(1)
     };
     // Use checked_add_signed to safely handle negative offsets without
     // risking isize overflow on adversarial input.
@@ -3178,5 +3251,127 @@ diff --git a/two.txt b/two.txt
         assert_eq!(summary.files_total, 1, "one file, two sections");
         assert_eq!(summary.files_applied, 1);
         assert_eq!(summary.hunks_applied, 2);
+    }
+
+    #[tokio::test]
+    async fn creation_patch_on_an_existing_file_is_refused() {
+        let tmp = tempdir().expect("tempdir");
+        let ctx = ToolContext::new(tmp.path().to_path_buf());
+        fs::write(tmp.path().join("foo.rs"), "fn keep() {}\n").expect("write");
+        let patch = "--- /dev/null\n+++ b/foo.rs\n@@ -0,0 +1,2 @@\n+fn a() {}\n+fn b() {}\n";
+
+        let err = ApplyPatchTool
+            .execute(json!({"patch": patch}), &ctx)
+            .await
+            .expect_err("a /dev/null creation must not land on an existing file");
+
+        assert!(err.to_string().contains("already exists"), "{err}");
+        assert_eq!(
+            fs::read_to_string(tmp.path().join("foo.rs")).expect("read"),
+            "fn keep() {}\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn pure_insertion_hunk_lands_after_the_named_line() {
+        let tmp = tempdir().expect("tempdir");
+        let ctx = ToolContext::new(tmp.path().to_path_buf());
+        fs::write(tmp.path().join("f.txt"), "l1\nl2\nl3\nl4\n").expect("write");
+        // `git diff -U0` form: insert after line 3.
+        let patch = "@@ -3,0 +4,1 @@\n+inserted\n";
+
+        ApplyPatchTool
+            .execute(json!({"path": "f.txt", "patch": patch}), &ctx)
+            .await
+            .expect("execute");
+
+        assert_eq!(
+            fs::read_to_string(tmp.path().join("f.txt")).expect("read"),
+            "l1\nl2\nl3\ninserted\nl4\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_section_covering_part_of_a_file_is_refused() {
+        let tmp = tempdir().expect("tempdir");
+        let ctx = ToolContext::new(tmp.path().to_path_buf());
+        let original = "1\n2\n3\n4\n5\n";
+        fs::write(tmp.path().join("big.txt"), original).expect("write");
+        let patch = "--- a/big.txt\n+++ /dev/null\n@@ -1,3 +0,0 @@\n-1\n-2\n-3\n";
+
+        let err = ApplyPatchTool
+            .execute(json!({"patch": patch}), &ctx)
+            .await
+            .expect_err("a partial delete must not remove the file");
+
+        assert!(err.to_string().contains("2 line(s)"), "{err}");
+        assert_eq!(
+            fs::read_to_string(tmp.path().join("big.txt")).expect("still there"),
+            original
+        );
+    }
+
+    #[tokio::test]
+    async fn creation_patch_with_a_path_override_on_an_existing_file_is_refused() {
+        let tmp = tempdir().expect("tempdir");
+        let ctx = ToolContext::new(tmp.path().to_path_buf());
+        fs::write(tmp.path().join("foo.rs"), "fn keep() {}\n").expect("write");
+        let patch = "--- /dev/null\n+++ b/foo.rs\n@@ -0,0 +1,2 @@\n+fn a() {}\n+fn b() {}\n";
+
+        let err = ApplyPatchTool
+            .execute(json!({"path": "foo.rs", "patch": patch}), &ctx)
+            .await
+            .expect_err("`path` must not turn a /dev/null creation into a prepend");
+
+        assert!(err.to_string().contains("already exists"), "{err}");
+        assert_eq!(
+            fs::read_to_string(tmp.path().join("foo.rs")).expect("read"),
+            "fn keep() {}\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn creation_section_after_an_edit_of_the_same_file_is_refused() {
+        let tmp = tempdir().expect("tempdir");
+        let ctx = ToolContext::new(tmp.path().to_path_buf());
+        fs::write(tmp.path().join("foo.txt"), "a\nb\n").expect("write");
+        let patch = "--- a/foo.txt\n+++ b/foo.txt\n@@ -1,2 +1,2 @@\n a\n-b\n+c\n\
+                     --- /dev/null\n+++ b/foo.txt\n@@ -0,0 +1,1 @@\n+new\n";
+
+        let err = ApplyPatchTool
+            .execute(json!({"patch": patch}), &ctx)
+            .await
+            .expect_err("a second, creating section must not prepend to the edited file");
+
+        assert!(err.to_string().contains("already exists"), "{err}");
+        assert_eq!(
+            fs::read_to_string(tmp.path().join("foo.txt")).expect("read"),
+            "a\nb\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn insertion_hunks_without_a_zero_old_count_keep_the_before_anchor() {
+        let tmp = tempdir().expect("tempdir");
+        let ctx = ToolContext::new(tmp.path().to_path_buf());
+        for (patch, expected) in [
+            // Omitted old count (defaults to 1): before line 2, as before.
+            ("@@ -2 +2,1 @@\n+x\n", "l1\nx\nl2\nl3\n"),
+            // Hand-written "new text starts at line 1": at the top.
+            ("@@ -1,0 +1,1 @@\n+x\n", "x\nl1\nl2\nl3\n"),
+            // `git diff -U0` form: after line 1.
+            ("@@ -1,0 +2,1 @@\n+x\n", "l1\nx\nl2\nl3\n"),
+        ] {
+            fs::write(tmp.path().join("f.txt"), "l1\nl2\nl3\n").expect("write");
+            ApplyPatchTool
+                .execute(json!({"path": "f.txt", "patch": patch}), &ctx)
+                .await
+                .expect("execute");
+            assert_eq!(
+                fs::read_to_string(tmp.path().join("f.txt")).expect("read"),
+                expected,
+                "{patch:?}"
+            );
+        }
     }
 }

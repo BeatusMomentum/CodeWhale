@@ -5000,11 +5000,13 @@ fn apply_per_run_overrides(store: &mut ConfigStore, specs: &[String]) -> Result<
     for spec in specs {
         let (key, value) = spec
             .split_once('=')
-            .with_context(|| format!("invalid --set {spec:?}: expected KEY=VALUE"))?;
-        store
-            .config
-            .set_value(key.trim(), value)
-            .with_context(|| format!("invalid --set {spec:?}"))?;
+            .context("invalid --set: expected KEY=VALUE")?;
+        store.config.set_value(key.trim(), value).map_err(|error| {
+            anyhow!(
+                "invalid --set: {}",
+                codewhale_config::persistence::redact_secrets(&format!("{error:#}"))
+            )
+        })?;
     }
     Ok(())
 }
@@ -6491,6 +6493,35 @@ mod tests {
         apply_per_run_overrides(&mut store, &["verbosity=concise".to_string()])
             .expect("overlay applies");
         assert_eq!(store.config.verbosity.as_deref(), Some("concise"));
+        let before = toml::to_string(&store.config).unwrap();
+        let bytes_before = std::fs::read(&path).unwrap();
+        let token = ["sk-live-", "Z7qX4mNb2Vc9Lk3PwR8t"].concat();
+        for (key, value) in [
+            ("approval_policy", "ask"),
+            ("sandbox_mode", "full"),
+            ("verbosity", "quiet"),
+            ("approval_policy", token.as_str()),
+            ("sandbox_mode", token.as_str()),
+            ("verbosity", token.as_str()),
+        ] {
+            let error = apply_per_run_overrides(&mut store, &[format!("{key}={value}")])
+                .expect_err("invalid overlay");
+            let rendered = format!("{error:#}");
+            assert!(!rendered.contains(&token), "{rendered}");
+            assert!(rendered.contains("fix: codewhale config set"), "{rendered}");
+            assert_eq!(toml::to_string(&store.config).unwrap(), before);
+            assert_eq!(std::fs::read(&path).unwrap(), bytes_before);
+        }
+        // Malformed input and an unsupported dotted key must not reintroduce
+        // credential-shaped text through the outer context or nested-key help.
+        for spec in [token.clone(), format!("{token}.unknown=normal")] {
+            let error = apply_per_run_overrides(&mut store, &[spec]).expect_err("invalid overlay");
+            let rendered = format!("{error:#}");
+            assert!(!rendered.contains(&token), "{rendered}");
+            assert!(rendered.contains("invalid --set"), "{rendered}");
+            assert_eq!(toml::to_string(&store.config).unwrap(), before);
+            assert_eq!(std::fs::read(&path).unwrap(), bytes_before);
+        }
         let error = apply_per_run_overrides(&mut store, &["no-equals-here".to_string()])
             .expect_err("missing = must fail");
         assert!(format!("{error:#}").contains("KEY=VALUE"));
@@ -6624,7 +6655,7 @@ mod tests {
 kind = "codewhale.portable-config"
 
 [project]
-verbosity = "project-imported"
+verbosity = "concise"
 "#,
         )
         .expect("write project bundle");
@@ -6645,10 +6676,7 @@ verbosity = "project-imported"
             .expect("import project bundle");
         let project = ConfigStore::load(Some(project_path.clone())).expect("reload project");
         let global = ConfigStore::load(Some(global_path.clone())).expect("reload global");
-        assert_eq!(
-            project.config.verbosity.as_deref(),
-            Some("project-imported")
-        );
+        assert_eq!(project.config.verbosity.as_deref(), Some("concise"));
         assert_eq!(global.config.verbosity.as_deref(), Some("global-only"));
 
         let explicit_argv = [

@@ -54,6 +54,35 @@ where
     env
 }
 
+/// Environment for a Codewhale runtime child (a Fleet worker), built from a
+/// snapshot of the parent environment.
+///
+/// It uses the same allowlist as [`sanitized_child_env`], so provider keys and
+/// other secret-shaped variables are dropped, with one deliberate difference:
+/// proxy URLs keep their `user:password@` part. The runtime child is Codewhale
+/// itself, not a model-chosen program, and must reach its provider through the
+/// same authenticated proxy as the parent. Every tool it starts builds its own
+/// environment through [`sanitized_child_env`], which strips that userinfo at
+/// the model-facing boundary.
+pub fn sanitized_runtime_env_from<B, K, V>(base_environment: B) -> Vec<(OsString, OsString)>
+where
+    B: IntoIterator<Item = (K, V)>,
+    K: AsRef<OsStr>,
+    V: AsRef<OsStr>,
+{
+    let mut env = Vec::new();
+    for (key, value) in base_environment {
+        if is_allowed_parent_env_key(key.as_ref()) {
+            upsert_env(
+                &mut env,
+                key.as_ref().to_os_string(),
+                value.as_ref().to_os_string(),
+            );
+        }
+    }
+    env
+}
+
 pub fn apply_to_command<I, K, V>(cmd: &mut std::process::Command, overrides: I)
 where
     I: IntoIterator<Item = (K, V)>,

@@ -5824,7 +5824,10 @@ mod tests {
         }
     }
 
+    /// The fixture's skills dir lives inside its workspace, so the workspace
+    /// must be trusted for those skills to load.
     fn skill_test_app(tmp: &TempDir, skills_dir: &Path) -> App {
+        crate::test_support::trust_workspace(tmp.path());
         let mut options = crate::test_support::test_tui_options(tmp.path());
         options.skills_dir = skills_dir.to_path_buf();
         crate::test_support::test_app_with_options(options)
