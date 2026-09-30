@@ -2238,7 +2238,7 @@ fn launch_plan_gives_each_runtime_its_own_flags() {
 }
 
 #[tokio::test]
-async fn handshake_refuses_a_host_on_a_different_runtime_than_launched() {
+async fn handshake_refuses_runtime_mismatch_and_an_unapplied_kernel_cap() {
     let Some(node) = node_for_tests("handshake_refuses_a_different_runtime") else {
         return;
     };
@@ -2250,10 +2250,6 @@ async fn handshake_refuses_a_host_on_a_different_runtime_than_launched() {
         crate::dependencies::resolve_extension_host_runtime(NODE, Some(node.as_path()), None)
             .selected
             .expect("the test Node resolves");
-    let mut launch =
-        super::supervisor::plan_launch(&runtime, &bundle, home.path(), 1 << 30).unwrap();
-    // The core believes it launched Bun; the host truthfully says Node.
-    launch.runtime.kind = HostRuntimeKind::Bun;
     struct NoEvents;
     impl super::supervisor::HostEvents for NoEvents {
         fn register(&self, _: &protocol::RegisterParams) -> protocol::RegisterResult {
@@ -2264,21 +2260,32 @@ async fn handshake_refuses_a_host_on_a_different_runtime_than_launched() {
         fn log(&self, _: &protocol::LogParams) {}
         fn exited(&self, _: u64, _: String, _: String) {}
     }
-    let error = match super::supervisor::HostProcess::spawn(
-        1,
-        &launch,
-        super::bundle_sha256(),
-        Arc::new(NoEvents),
-    )
-    .await
-    {
-        Ok(_) => panic!("a runtime mismatch must fail the handshake"),
-        Err(error) => error,
-    };
-    assert!(
-        error.contains("host reports runtime node but bun was launched"),
-        "{error}"
-    );
+    for missing_cap in [false, true] {
+        let mut launch =
+            super::supervisor::plan_launch(&runtime, &bundle, home.path(), 1 << 30).unwrap();
+        let expected = if missing_cap {
+            // An actual Node host reports no kernel cap. Even with matching
+            // runtime/digest, the requested hard boundary must block admission.
+            launch.memory = super::supervisor::MemoryEnforcement::Jetsam;
+            "host did not apply the requested 1024 MiB kernel memory limit; initialization refused"
+        } else {
+            // The core believes it launched Bun; the host truthfully says Node.
+            launch.runtime.kind = HostRuntimeKind::Bun;
+            "host reports runtime node but bun was launched"
+        };
+        let error = match super::supervisor::HostProcess::spawn(
+            1,
+            &launch,
+            super::bundle_sha256(),
+            Arc::new(NoEvents),
+        )
+        .await
+        {
+            Ok(_) => panic!("{expected}"),
+            Err(error) => error,
+        };
+        assert!(error.contains(expected), "{error}");
+    }
 }
 
 #[tokio::test]
@@ -2393,7 +2400,9 @@ async fn memory_hog_is_stopped(
         Err(other) => panic!("unexpected error: {other:?}"),
     }
     let stopped_by = match memory {
-        MemoryEnforcement::Jetsam => Some("exceeds its 400 MiB memory limit"),
+        MemoryEnforcement::Jetsam => Some(
+            "configured kernel memory limit: 400 MiB; SIGKILL cause unavailable",
+        ),
         MemoryEnforcement::Heartbeat => Some("exceeded its memory cap"),
         _ => None,
     };

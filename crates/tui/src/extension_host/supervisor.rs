@@ -443,9 +443,8 @@ pub(crate) fn resident_bytes(_pid: u32) -> Option<u64> {
     None
 }
 
-/// `exited with …`, naming the memory limit when a jetsam kill is the likely
-/// cause: the kernel's only signal for it is SIGKILL, which otherwise reads
-/// like a crash.
+/// Report the observed exit and configured cap. SIGKILL alone cannot identify
+/// jetsam: an operator or another process can send the same signal.
 fn exit_reason(
     status: std::process::ExitStatus,
     memory: Option<MemoryEnforcement>,
@@ -457,7 +456,7 @@ fn exit_reason(
         use std::os::unix::process::ExitStatusExt as _;
         if status.signal() == Some(libc::SIGKILL) && memory == Some(MemoryEnforcement::Jetsam) {
             return format!(
-                "{reason}; the kernel kills the host this way when it exceeds its {} MiB memory limit",
+                "{reason}; configured kernel memory limit: {} MiB; SIGKILL cause unavailable",
                 cap / (1024 * 1024)
             );
         }
