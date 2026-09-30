@@ -59,6 +59,7 @@ quieter, and Fleet runs can be checked before they spend anything.
 
 ### Contributors
 
+- **[@Andrea-Bruno](https://github.com/Andrea-Bruno)** — designed the Superfast Decision Gate and contributed its off-by-default shadow classifier ([#6604](https://github.com/Hmbown/Codewhale/pull/6604), [#6603](https://github.com/Hmbown/Codewhale/issues/6603)).
 - **[@aiapienthusiast](https://github.com/aiapienthusiast)** — added Cheaper Inference to the bundled provider catalog ([#6761](https://github.com/Hmbown/Codewhale/pull/6761)).
 - **[@gaord](https://github.com/gaord)** — let a client fork a thread at a named turn ([#6580](https://github.com/Hmbown/Codewhale/pull/6580)), let undo roll back files for the turn it is undoing ([#6483](https://github.com/Hmbown/Codewhale/pull/6483)), stopped resume and fork from duplicating threads and sessions ([#6406](https://github.com/Hmbown/Codewhale/pull/6406)), exposed user-defined provider routes to native clients ([#6404](https://github.com/Hmbown/Codewhale/pull/6404)), and kept a fork going when a turn lost its tool call ([#6664](https://github.com/Hmbown/Codewhale/pull/6664)).
 - **[@Lstarsky0](https://github.com/Lstarsky0)** — moved the docs/work, legal, digest and FAQ pages onto the dictionary spine ([#6405](https://github.com/Hmbown/Codewhale/pull/6405), [#6417](https://github.com/Hmbown/Codewhale/pull/6417), [#6499](https://github.com/Hmbown/Codewhale/pull/6499), [#6574](https://github.com/Hmbown/Codewhale/pull/6574)), tightened the Chinese-branching ceiling to 18 ([#6403](https://github.com/Hmbown/Codewhale/pull/6403)), and made Fleet publish without a two-link window ([#6431](https://github.com/Hmbown/Codewhale/pull/6431)). Also moved the constitution page onto the dictionary spine and kept its install link in the selected locale ([#6733](https://github.com/Hmbown/Codewhale/pull/6733)).
@@ -72,6 +73,13 @@ quieter, and Fleet runs can be checked before they spend anything.
 
 ### Added
 
+- An optional, off-by-default shadow Decision Gate classifies the first request
+  of a turn — tool need, answerability from context, intent — through the
+  existing System One client and only logs a typed recommendation; it never
+  changes routing or delays the model call. Configure it with
+  `SUPERFAST_ENABLED` and `SUPERFAST_PROVIDER` (docs/CONFIGURATION.md)
+  ([#6603](https://github.com/Hmbown/Codewhale/issues/6603),
+  [#6604](https://github.com/Hmbown/Codewhale/pull/6604), thanks @Andrea-Bruno).
 - `tool_call_after` hooks for shell tools receive `DEEPSEEK_TOOL_EXECUTION_RECEIPT`: the command that actually ran after admission, its working directory, how it ended, and bounded stdout/stderr previews, so a hook can record exactly what executed ([#6689](https://github.com/Hmbown/Codewhale/issues/6689), requested by [@wuisabel-gif](https://github.com/wuisabel-gif)).
 - Runtime API: turns now record what they produced. Each item and turn
   carries typed artifact references (path, kind, size, revision, and a

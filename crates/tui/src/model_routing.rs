@@ -443,7 +443,7 @@ pub(crate) struct AutoRouteReceipt {
 /// What a decision model answered and what it cost. Probabilities are basis
 /// points (0..=10000) so the receipt stays `Eq` and never re-renders floats.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct AutoRouteDecisionEvidence {
+pub struct AutoRouteDecisionEvidence {
     /// The tier the decision model chose (`fast` | `strong`).
     pub(crate) choice: String,
     pub(crate) probabilities_bp: BTreeMap<String, u16>,
@@ -473,6 +473,7 @@ pub(crate) enum AutoRouterFailure {
     /// Declared but unusable: missing key, unknown kind, or client setup.
     NotRunnable,
     Timeout,
+    Cancelled,
     Http {
         status: u16,
     },
@@ -492,6 +493,7 @@ impl AutoRouterFailure {
                 "not runnable (check the router key and [auto.router])".to_string()
             }
             Self::Timeout => "timed out".to_string(),
+            Self::Cancelled => "cancelled".to_string(),
             Self::Http { status } => format!("HTTP {status}"),
             Self::QuotaExhausted => "provider quota or credits exhausted".to_string(),
             Self::Rejected => "request rejected by the provider".to_string(),
@@ -1223,7 +1225,10 @@ fn auto_route_usage_has_reported_data(usage: &codewhale_models::Usage) -> bool {
 /// Stable, persistence-safe identity for one classifier response. The raw
 /// provider response id is hashed with the frozen dispatch route and instant;
 /// neither it nor any custom route label crosses into telemetry/persistence.
-fn auto_route_usage_source_id(route: &EffectiveRouteEnvelope, response_id: &str) -> String {
+pub(crate) fn auto_route_usage_source_id(
+    route: &EffectiveRouteEnvelope,
+    response_id: &str,
+) -> String {
     use sha2::{Digest as _, Sha256};
 
     let mut digest = Sha256::new();
@@ -1546,8 +1551,17 @@ async fn auto_route_decision_recommendation(
     let route = inventory
         .router_decision_route
         .ok_or_else(|| anyhow::anyhow!("decision router has no route"))?;
-    let client =
-        CodewhaleClient::for_decision_route(config, route, inventory.router_base_url.as_deref())?;
+    // Resolve environment/keyring credentials off the async worker.
+    let decision_config = config.clone();
+    let base_url = inventory.router_base_url.clone();
+    #[cfg(test)]
+    let ticket = crate::test_support::env_scope_ticket();
+    let client = tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        let _membership = crate::test_support::join_env_scope(ticket);
+        CodewhaleClient::for_decision_route(&decision_config, route, base_url.as_deref())
+    })
+    .await??;
     let body = decision_request_body(
         &client,
         &inventory.router_model,
@@ -1556,11 +1570,10 @@ async fn auto_route_decision_recommendation(
         session_mode,
         selected_thinking_mode,
     );
-    // OpenRouter spend enters the session through the ordinary routed-usage
-    // path. TypeSafe is not a chat provider, so its spend is shown on the
-    // receipt only (see `client::system_one`).
-    let request_route = (route == DecisionRouterRoute::Openrouter)
-        .then(|| client.effective_route_envelope(&inventory.router_model, chrono::Utc::now()));
+    // Both transports enter the existing usage ledger. TypeSafe carries its
+    // own Custom/Unknown identity; no chat price or zero-cost claim is inherited.
+    let request_route =
+        Some(client.effective_route_envelope(&inventory.router_model, chrono::Utc::now()));
     let started = Instant::now();
     let dispatched = std::sync::atomic::AtomicBool::new(false);
     let outcome = tokio::time::timeout(
@@ -1580,8 +1593,10 @@ async fn auto_route_decision_recommendation(
             _ => InventoryAutoRouteAttempt::failed(AutoRouterFailure::Timeout),
         },
         Ok(Err(failure)) => match request_route {
-            Some(route) => auto_route_attempt_with_dropped_response(route, failure),
-            None => InventoryAutoRouteAttempt::failed(failure),
+            Some(route) if dispatched.load(std::sync::atomic::Ordering::Acquire) => {
+                auto_route_attempt_with_dropped_response(route, failure)
+            }
+            _ => InventoryAutoRouteAttempt::failed(failure),
         },
         Ok(Ok(response)) => decision_attempt_from_response(
             config.auto_cost_saving(),
@@ -1595,15 +1610,18 @@ async fn auto_route_decision_recommendation(
 }
 
 /// A validated `choice` answer.
-struct ValidChoice {
-    choice: String,
-    probabilities_bp: BTreeMap<String, u16>,
-    confidence_bp: u16,
+pub(crate) struct ValidChoice {
+    pub(crate) choice: String,
+    pub(crate) probabilities_bp: BTreeMap<String, u16>,
+    pub(crate) confidence_bp: u16,
 }
 
 /// Validate one `choice` answer against the offered options. Any violation
 /// rejects the whole answer; nothing is repaired.
-fn validated_choice(answer: Option<&SystemOneAnswer>, options: &[&str]) -> Option<ValidChoice> {
+pub(crate) fn validated_choice(
+    answer: Option<&SystemOneAnswer>,
+    options: &[&str],
+) -> Option<ValidChoice> {
     let answer = answer?;
     if answer.kind != "choice" {
         return None;
@@ -1625,6 +1643,14 @@ fn validated_choice(answer: Option<&SystemOneAnswer>, options: &[&str]) -> Optio
     if (sum - 1.0).abs() > 0.02 {
         return None;
     }
+    let selected = (*answer.probabilities.get(choice)?)?;
+    if answer
+        .probabilities
+        .values()
+        .any(|probability| probability.is_some_and(|v| v > selected))
+    {
+        return None;
+    }
     let confidence = answer.confidence?;
     if !confidence.is_finite() || !(0.0..=1.0).contains(&confidence) {
         return None;
@@ -1634,6 +1660,42 @@ fn validated_choice(answer: Option<&SystemOneAnswer>, options: &[&str]) -> Optio
         probabilities_bp,
         confidence_bp: probability_bp(confidence),
     })
+}
+
+/// One decision response settled through the existing routed-usage ledger.
+/// Malformed policy answers still carry provider usage; missing/all-zero usage
+/// remains an explicit coverage gap. The source identity is route-bound.
+pub(crate) fn decision_usage_batch(
+    request_route: &EffectiveRouteEnvelope,
+    response: &SystemOneResponse,
+) -> crate::cost_status::RuntimeUsageBatch {
+    let usage = codewhale_models::Usage {
+        input_tokens: response.usage.as_ref().map_or(0, |u| u.input_tokens),
+        output_tokens: response.usage.as_ref().map_or(0, |u| u.output_tokens),
+        ..Default::default()
+    };
+    let source_id =
+        auto_route_usage_source_id(request_route, response.id.as_deref().unwrap_or("systemone"));
+    let route = request_route.sanitized_for_persistence();
+    if response.usage.as_ref().is_some_and(|u| u.complete)
+        && auto_route_usage_has_reported_data(&usage)
+    {
+        crate::cost_status::RuntimeUsageBatch {
+            decisions: Vec::new(),
+            records: vec![RuntimeUsageRecord {
+                source_id,
+                usage: EffectiveRouteUsage { route, usage },
+            }],
+            ..Default::default()
+        }
+    } else {
+        crate::cost_status::RuntimeUsageBatch {
+            decisions: Vec::new(),
+            drop_records: vec![RuntimeUsageDropRecord { source_id, route }],
+            dropped_records: 1,
+            ..Default::default()
+        }
+    }
 }
 
 /// Turn a decoded System One response into a routing attempt. All policy is
@@ -1656,41 +1718,35 @@ fn decision_attempt_from_response(
         fallback_reason: None,
     };
     if let Some(request_route) = request_route {
-        let usage = codewhale_models::Usage {
-            input_tokens: response
-                .usage
-                .as_ref()
-                .map_or(0, |usage| usage.input_tokens),
-            output_tokens: response
-                .usage
-                .as_ref()
-                .map_or(0, |usage| usage.output_tokens),
-            ..Default::default()
-        };
-        let response_id = response.id.as_deref().unwrap_or("systemone");
-        if auto_route_usage_has_reported_data(&usage) {
-            attempt.routed_usage.push(RuntimeUsageRecord {
-                source_id: auto_route_usage_source_id(&request_route, response_id),
-                usage: EffectiveRouteUsage {
-                    route: request_route.sanitized_for_persistence(),
-                    usage,
-                },
-            });
-        } else {
-            let drop_route = request_route.sanitized_for_persistence();
-            attempt
-                .routed_usage_drop_records
-                .push(RuntimeUsageDropRecord {
-                    source_id: auto_route_usage_source_id(
-                        &drop_route,
-                        &format!("missing-usage:{response_id}"),
-                    ),
-                    route: drop_route,
-                });
-            attempt.routed_usage_dropped_records = 1;
-        }
+        let batch = decision_usage_batch(&request_route, response);
+        attempt.routed_usage = batch.records;
+        attempt.routed_usage_dropped_records = batch.dropped_records;
+        attempt.routed_usage_drop_records = batch.drop_records;
     }
 
+    // Rejected answers still incurred spend. Keep bounded diagnostic evidence
+    // before any policy return; valid tier evidence below replaces this shell.
+    attempt.decision = Some(AutoRouteDecisionEvidence {
+        choice: "invalid".to_string(),
+        probabilities_bp: Default::default(),
+        confidence_bp: 0,
+        min_confidence_bp: inventory.router_min_confidence_bp,
+        cost_saving_kept_fast: false,
+        thinking: None,
+        provider_reported_cost_usd: response
+            .usage
+            .as_ref()
+            .and_then(|usage| usage.reported_cost()),
+        latency_ms,
+        response_model: response
+            .model
+            .as_deref()
+            .map(|model| model.chars().take(128).collect()),
+    });
+    if response.answers_validated == Some(false) {
+        attempt.failure = Some(AutoRouterFailure::InvalidAnswer);
+        return attempt;
+    }
     let Some(tier) = validated_choice(response.answers.get("tier"), &DECISION_TIER_OPTIONS) else {
         attempt.failure = Some(AutoRouterFailure::InvalidAnswer);
         return attempt;
@@ -1886,7 +1942,7 @@ fn append_router_text(out: &mut String, text: &str) {
     out.push_str(text);
 }
 
-fn truncate_for_auto_router(text: &str, max_chars: usize) -> String {
+pub(crate) fn truncate_for_auto_router(text: &str, max_chars: usize) -> String {
     let mut chars = text.chars();
     let truncated: String = chars.by_ref().take(max_chars).collect();
     if chars.next().is_some() {
@@ -3280,13 +3336,13 @@ mod decision_router_tests {
         let _env = hermetic_env();
         let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path("/v1/systemone"))
+            .and(path("/api/alpha/decisions"))
             .and(header("authorization", "Bearer or-test-key"))
             .respond_with(ResponseTemplate::new(200).set_body_json(answer_body(0.82, 0.64)))
             .expect(1)
             .mount(&server)
             .await;
-        let mut config = decision_config(&server.uri(), false, 2);
+        let mut config = decision_config(&format!("{}/api/v1", server.uri()), false, 2);
         // A configured credential that a tool result echoed back.
         let secret = "cw-router-secret-should-never-leave-process";
         config
@@ -3363,11 +3419,11 @@ mod decision_router_tests {
         let _env = hermetic_env();
         let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path("/v1/systemone"))
+            .and(path("/api/alpha/decisions"))
             .respond_with(ResponseTemplate::new(200).set_body_json(answer_body(0.82, 0.64)))
             .mount(&server)
             .await;
-        let config = decision_config(&server.uri(), false, 2);
+        let config = decision_config(&format!("{}/api/v1", server.uri()), false, 2);
         let selection = route(&config, "Debug the release pipeline", "").await;
 
         assert_eq!(selection.provider, ApiProvider::Deepseek);
@@ -3418,11 +3474,11 @@ mod decision_router_tests {
         let _env = hermetic_env();
         let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path("/v1/systemone"))
+            .and(path("/api/alpha/decisions"))
             .respond_with(ResponseTemplate::new(200).set_body_json(answer_body(0.35, 0.3)))
             .mount(&server)
             .await;
-        let config = decision_config(&server.uri(), false, 2);
+        let config = decision_config(&format!("{}/api/v1", server.uri()), false, 2);
         let selection = route(&config, "What does this function do?", "").await;
 
         assert_eq!(selection.model, "deepseek-v4-pro", "declared default");
@@ -3449,7 +3505,7 @@ mod decision_router_tests {
             let _env = hermetic_env();
             let server = MockServer::start().await;
             Mock::given(method("POST"))
-                .and(path("/v1/systemone"))
+                .and(path("/api/alpha/decisions"))
                 .respond_with(
                     ResponseTemplate::new(status)
                         .set_body_string(format!(r#"{{"error":{{"message":"{MARKER}"}}}}"#)),
@@ -3457,7 +3513,7 @@ mod decision_router_tests {
                 .expect(1)
                 .mount(&server)
                 .await;
-            let config = decision_config(&server.uri(), false, 2);
+            let config = decision_config(&format!("{}/api/v1", server.uri()), false, 2);
             let selection = route(&config, "Explain the diff", "").await;
 
             assert_eq!(selection.model, "deepseek-v4-pro", "status {status}");
@@ -3485,7 +3541,7 @@ mod decision_router_tests {
         let _env = hermetic_env();
         let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path("/v1/systemone"))
+            .and(path("/api/alpha/decisions"))
             .respond_with(
                 ResponseTemplate::new(200)
                     .set_body_json(answer_body(0.9, 0.8))
@@ -3493,7 +3549,7 @@ mod decision_router_tests {
             )
             .mount(&server)
             .await;
-        let config = decision_config(&server.uri(), false, 1);
+        let config = decision_config(&format!("{}/api/v1", server.uri()), false, 1);
         let selection = route(&config, "Explain the diff", "").await;
 
         let receipt = receipt(&selection);
@@ -3517,7 +3573,7 @@ mod decision_router_tests {
             .expect(0)
             .mount(&server)
             .await;
-        let mut config = decision_config(&server.uri(), false, 2);
+        let mut config = decision_config(&format!("{}/api/v1", server.uri()), false, 2);
         // A single-tier active provider: nothing for the decision to choose.
         config.provider = Some("openrouter".to_string());
         config.default_text_model = Some("synthetic/single-tier-model".to_string());
@@ -3590,8 +3646,17 @@ mod decision_router_tests {
             }
         );
         assert!(receipt.decision.is_some());
-        // TypeSafe is not a chat provider: spend stays on the receipt only.
-        assert!(selection.routed_usage.is_empty());
+        // A decision endpoint never inherits the active DeepSeek billing identity.
+        assert_eq!(selection.routed_usage.len(), 1);
+        let usage = &selection.routed_usage[0];
+        assert_eq!(usage.usage.route.provider, ApiProvider::Custom);
+        assert_eq!(usage.usage.route.provider_identity, "typesafe");
+        assert_eq!(
+            usage.usage.route.billing_mode,
+            crate::cost_status::RouteBillingMode::Unknown
+        );
+        assert_eq!(usage.usage.usage.input_tokens, 476);
+        assert_eq!(usage.usage.usage.output_tokens, 70);
         assert!(selection.routed_usage_drop_records.is_empty());
     }
 
@@ -3673,6 +3738,18 @@ mod decision_router_tests {
             let attempt = policy(false, &parsed(body.clone()));
             assert_eq!(attempt.recommendation, None, "{body}");
             assert_eq!(
+                attempt
+                    .decision
+                    .as_ref()
+                    .and_then(|r| r.provider_reported_cost_usd.as_deref()),
+                parsed(body.clone())
+                    .usage
+                    .as_ref()
+                    .and_then(|u| u.reported_cost())
+                    .as_deref(),
+                "rejected policy retains cost"
+            );
+            assert_eq!(
                 attempt.failure,
                 Some(AutoRouterFailure::InvalidAnswer),
                 "{body}"
@@ -3686,6 +3763,58 @@ mod decision_router_tests {
         let recommendation = attempt.recommendation.expect("tier still acted on");
         assert_eq!(recommendation.model, "deepseek-v4-pro");
         assert_eq!(recommendation.reasoning_effort, None);
+    }
+
+    #[tokio::test]
+    async fn malformed_decision_envelopes_preserve_cost_without_a_route_hop() {
+        let _env = hermetic_env();
+        for (pointer, value, incomplete_usage) in [
+            ("/answers/tier/choice", serde_json::json!(17), false),
+            ("/model", serde_json::json!({"invalid":"model"}), false),
+            ("/usage/input_tokens", serde_json::json!(u64::MAX), true),
+        ] {
+            let server = MockServer::start().await;
+            let mut body = answer_body(0.9, 0.9);
+            *body.pointer_mut(pointer).expect("fixture field") = value;
+            Mock::given(method("POST"))
+                .and(path("/api/alpha/decisions"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(body))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let config = decision_config(&format!("{}/api/v1", server.uri()), false, 2);
+            let fallback =
+                auto_route_without_router(&config, &ModelInventory::from_config(&config));
+            let selection = route(&config, "Explain a variable name", "").await;
+            assert_eq!(selection.source, AutoRouteSource::Heuristic);
+            assert_eq!(selection.provider, fallback.provider);
+            assert_eq!(
+                selection.model, fallback.model,
+                "malformed policy cannot change the route"
+            );
+            let receipt = receipt(&selection);
+            assert_eq!(
+                receipt.router_failure,
+                Some(AutoRouterFailure::InvalidAnswer)
+            );
+            assert_eq!(
+                receipt
+                    .decision
+                    .as_ref()
+                    .expect("billing evidence")
+                    .provider_reported_cost_usd
+                    .as_deref(),
+                Some("0.000019992")
+            );
+            if incomplete_usage {
+                assert!(selection.routed_usage.is_empty());
+                assert_eq!(selection.routed_usage_dropped_records, 1);
+                assert_eq!(selection.routed_usage_drop_records.len(), 1);
+            } else {
+                assert_eq!(selection.routed_usage.len(), 1);
+                assert!(selection.routed_usage_drop_records.is_empty());
+            }
+        }
     }
 
     #[test]

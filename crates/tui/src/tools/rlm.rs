@@ -494,6 +494,7 @@ impl RlmTool {
                         &error.to_string(),
                         started.elapsed(),
                         &crate::cost_status::RuntimeUsageBatch {
+                            decisions: Vec::new(),
                             records: usage.records,
                             drop_records: usage.drop_records,
                             dropped_records: usage.dropped_records,
@@ -504,6 +505,7 @@ impl RlmTool {
             (
                 round,
                 crate::cost_status::RuntimeUsageBatch {
+                    decisions: Vec::new(),
                     records: usage.records,
                     drop_records: usage.drop_records,
                     dropped_records: usage.dropped_records,
@@ -996,6 +998,7 @@ mod tests {
             "kernel stdout closed",
             Duration::from_millis(11),
             &crate::cost_status::RuntimeUsageBatch {
+                decisions: Vec::new(),
                 records: vec![record],
                 drop_records: vec![drop_record],
                 dropped_records: 1,

@@ -2447,6 +2447,7 @@ fn sample_thread(thread_id: &str) -> ThreadRecord {
 fn sample_turn(thread_id: &str, turn_id: &str, status: RuntimeTurnStatus) -> TurnRecord {
     let now = Utc::now();
     TurnRecord {
+        decision_receipts: Vec::new(),
         max_output_tokens: None,
         schema_version: CURRENT_RUNTIME_SCHEMA_VERSION,
         id: turn_id.to_string(),
@@ -8464,6 +8465,7 @@ async fn initial_classifier_usage_is_persisted_before_terminal_and_merged_exactl
         Utc::now(),
     );
     let classifier_batch = crate::cost_status::RuntimeUsageBatch {
+        decisions: Vec::new(),
         records: vec![crate::cost_status::RuntimeUsageRecord {
             source_id: "auto-router:runtime-fixture".to_string(),
             usage: crate::cost_status::EffectiveRouteUsage {
@@ -8600,6 +8602,7 @@ fn classifier_settlement_batch(
     );
     route.billing_mode = crate::cost_status::RouteBillingMode::Subscription;
     crate::cost_status::RuntimeUsageBatch {
+        decisions: Vec::new(),
         records: vec![crate::cost_status::RuntimeUsageRecord {
             source_id: format!("auto-router:{source_prefix}-usage"),
             usage: crate::cost_status::EffectiveRouteUsage {
@@ -16747,6 +16750,7 @@ fn opening_manager_recovers_stale_queued_and_in_progress_work() -> Result<()> {
     manager.store.save_item(&queued_item)?;
 
     manager.store.save_turn(&TurnRecord {
+        decision_receipts: Vec::new(),
         max_output_tokens: None,
         schema_version: CURRENT_RUNTIME_SCHEMA_VERSION,
         id: "turn_in_progress".to_string(),
@@ -16785,6 +16789,7 @@ fn opening_manager_recovers_stale_queued_and_in_progress_work() -> Result<()> {
         workspace_snapshots: Vec::new(),
     })?;
     manager.store.save_turn(&TurnRecord {
+        decision_receipts: Vec::new(),
         max_output_tokens: None,
         schema_version: CURRENT_RUNTIME_SCHEMA_VERSION,
         id: "turn_queued".to_string(),
@@ -16981,6 +16986,7 @@ fn seed_turns_with_user_messages(
             ended_at: Some(created_at),
         })?;
         manager.store.save_turn(&TurnRecord {
+            decision_receipts: Vec::new(),
             max_output_tokens: None,
             schema_version: CURRENT_RUNTIME_SCHEMA_VERSION,
             id: turn_id.clone(),
@@ -17800,6 +17806,7 @@ fn restart_rebuild_restores_tool_call_identity_from_persisted_items() -> Result<
     manager.store.save_item(&user_item)?;
     manager.store.save_item(&call_item)?;
     manager.store.save_turn(&TurnRecord {
+        decision_receipts: Vec::new(),
         max_output_tokens: None,
         schema_version: CURRENT_RUNTIME_SCHEMA_VERSION,
         id: "turn_5823".to_string(),
@@ -17905,6 +17912,7 @@ fn restart_rebuild_keeps_in_flight_tool_call_identity() -> Result<()> {
     };
     manager.store.save_item(&call_item)?;
     manager.store.save_turn(&TurnRecord {
+        decision_receipts: Vec::new(),
         max_output_tokens: None,
         schema_version: CURRENT_RUNTIME_SCHEMA_VERSION,
         id: "turn_5823_inflight".to_string(),
@@ -18005,6 +18013,7 @@ fn restart_rebuild_skips_steers_the_engine_never_delivered() -> Result<()> {
     manager.store.save_item(&dropped)?;
     manager.store.save_item(&pending)?;
     manager.store.save_turn(&TurnRecord {
+        decision_receipts: Vec::new(),
         max_output_tokens: None,
         schema_version: CURRENT_RUNTIME_SCHEMA_VERSION,
         id: turn_id.clone(),
@@ -18106,6 +18115,7 @@ fn restart_rebuild_skips_legacy_tool_items_without_identity() -> Result<()> {
     manager.store.save_item(&user_item)?;
     manager.store.save_item(&legacy_tool_item)?;
     manager.store.save_turn(&TurnRecord {
+        decision_receipts: Vec::new(),
         max_output_tokens: None,
         schema_version: CURRENT_RUNTIME_SCHEMA_VERSION,
         id: "turn_5823_legacy".to_string(),
@@ -21961,4 +21971,69 @@ mod execution_identity {
         );
         Ok(())
     }
+}
+
+#[tokio::test]
+async fn decision_receipt_lease_persists_terminal_turn_and_replays_exactly_once() -> Result<()> {
+    let _cost_scope = crate::cost_status::test_scope();
+    let directory = test_runtime_dir();
+    let manager = test_manager(directory.clone())?;
+    let thread = manager
+        .create_thread(CreateThreadRequest::default())
+        .await?;
+    let turn = sample_turn(
+        &thread.id,
+        "decision-terminal-origin",
+        RuntimeTurnStatus::Completed,
+    );
+    manager.store.save_turn(&turn)?;
+    manager.register_runtime_usage_sink(&turn.id);
+    let lease = crate::cost_status::acquire_runtime_usage_lease(&turn.id).expect("origin lease");
+    crate::cost_status::finish_runtime_usage_owner(&turn.id);
+    let receipt = crate::cost_status::decision_receipt_fixture("raw-runtime-decision-id");
+    let batch = crate::cost_status::RuntimeUsageBatch {
+        decisions: vec![receipt.clone()],
+        ..Default::default()
+    };
+    for _ in 0..2 {
+        crate::cost_status::report_runtime_usage_batch(
+            crate::cost_status::scope_token(),
+            Some(&turn.id),
+            &batch,
+        );
+    }
+    drop(lease);
+    drop(manager);
+    let restarted = test_manager(directory)?;
+    let reloaded = restarted.store.load_turn(&turn.id)?;
+    assert_eq!(reloaded.status, RuntimeTurnStatus::Completed);
+    assert_eq!(reloaded.decision_receipts, vec![receipt.sanitized()]);
+    assert_eq!(
+        reloaded.decision_receipts[0]
+            .evidence
+            .provider_reported_cost_usd
+            .as_deref(),
+        Some("0.000012054")
+    );
+    let aggregate = restarted
+        .aggregate_usage(None, None, UsageGroupBy::Thread)
+        .await?;
+    assert!(
+        aggregate
+            .totals
+            .route_receipts
+            .iter()
+            .any(|r| r.contains("0.000012054")),
+        "existing cost diagnostics expose retained provider evidence"
+    );
+    assert!(
+        reloaded.routed_usage.is_empty(),
+        "diagnostic receipt alone must not mint a second token charge"
+    );
+    assert_eq!(
+        unaccepted_routed_usage_turn_id(&thread.id, &batch),
+        unaccepted_routed_usage_turn_id(&thread.id, &batch)
+    );
+    assert!(!serde_json::to_string(&reloaded)?.contains("raw-runtime-decision-id"));
+    Ok(())
 }

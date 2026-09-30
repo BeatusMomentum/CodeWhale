@@ -488,6 +488,7 @@ pub fn attach_child_usage_metadata(
 pub const MAX_CHILD_USAGE_RECORDS: usize = 64;
 
 const CHILD_USAGE_RECORDS_KEY: &str = "child_usage_records";
+const CHILD_DECISION_RECEIPTS_KEY: &str = "child_decision_receipts";
 const CHILD_USAGE_DROP_RECORDS_KEY: &str = "child_usage_drop_records";
 const CHILD_USAGE_DROPPED_RECORDS_KEY: &str = "child_usage_dropped_records";
 
@@ -506,6 +507,18 @@ pub fn attach_child_usage_batch_metadata(
     let Some(object) = metadata.as_object_mut() else {
         return;
     };
+    object.insert(
+        CHILD_DECISION_RECEIPTS_KEY.into(),
+        serde_json::json!(
+            batch
+                .decisions
+                .iter()
+                .filter(|receipt| receipt.is_bounded())
+                .take(MAX_CHILD_USAGE_RECORDS)
+                .map(RuntimeDecisionReceipt::sanitized)
+                .collect::<Vec<_>>()
+        ),
+    );
     let retained_records = batch
         .records
         .iter()
@@ -545,10 +558,23 @@ pub fn attach_child_usage_batch_metadata(
         serde_json::json!(retained_drops),
     );
     let usage_overflow = batch.records.len().saturating_sub(MAX_CHILD_USAGE_RECORDS);
+    let decision_overflow = batch
+        .decisions
+        .len()
+        .saturating_sub(MAX_CHILD_USAGE_RECORDS)
+        .saturating_add(
+            batch
+                .decisions
+                .iter()
+                .take(MAX_CHILD_USAGE_RECORDS)
+                .filter(|r| !r.is_bounded())
+                .count(),
+        );
     let dropped_records = batch
         .dropped_records
         .max(u64::try_from(batch.drop_records.len()).unwrap_or(u64::MAX))
-        .saturating_add(u64::try_from(usage_overflow).unwrap_or(u64::MAX));
+        .saturating_add(u64::try_from(usage_overflow).unwrap_or(u64::MAX))
+        .saturating_add(u64::try_from(decision_overflow).unwrap_or(u64::MAX));
     if dropped_records > 0 {
         object.insert(
             CHILD_USAGE_DROPPED_RECORDS_KEY.into(),
@@ -581,6 +607,7 @@ pub fn child_usage_records_from_metadata(
         .unwrap_or(0);
     let Some(values) = value.as_array() else {
         return Some(RuntimeUsageBatch {
+            decisions: Vec::new(),
             records: Vec::new(),
             drop_records: Vec::new(),
             dropped_records: declared_dropped.saturating_add(1),
@@ -589,6 +616,7 @@ pub fn child_usage_records_from_metadata(
 
     let overflow = values.len().saturating_sub(MAX_CHILD_USAGE_RECORDS);
     let mut batch = RuntimeUsageBatch {
+        decisions: Vec::new(),
         records: Vec::with_capacity(values.len().min(MAX_CHILD_USAGE_RECORDS)),
         drop_records: Vec::with_capacity(drop_values.len().min(MAX_CHILD_USAGE_RECORDS)),
         dropped_records: declared_dropped
@@ -635,6 +663,27 @@ pub fn child_usage_records_from_metadata(
         }
         // Every declared drop slot already contributes to dropped_records,
         // including malformed entries; do not count the same gap twice.
+    }
+    if let Some(decisions) = metadata.get(CHILD_DECISION_RECEIPTS_KEY) {
+        if let Some(values) = decisions.as_array() {
+            for value in values.iter().take(MAX_CHILD_USAGE_RECORDS) {
+                let bounded = serde_json::to_vec(value).is_ok_and(|bytes| bytes.len() <= 8 * 1024);
+                let parsed = bounded
+                    .then(|| serde_json::from_value::<RuntimeDecisionReceipt>(value.clone()).ok())
+                    .flatten();
+                if let Some(receipt) = parsed.filter(RuntimeDecisionReceipt::is_bounded) {
+                    batch.decisions.push(receipt.sanitized());
+                } else {
+                    batch.dropped_records = batch.dropped_records.saturating_add(1);
+                }
+            }
+            batch.dropped_records = batch.dropped_records.saturating_add(
+                u64::try_from(values.len().saturating_sub(MAX_CHILD_USAGE_RECORDS))
+                    .unwrap_or(u64::MAX),
+            );
+        } else {
+            batch.dropped_records = batch.dropped_records.saturating_add(1);
+        }
     }
     Some(batch)
 }
@@ -794,7 +843,7 @@ fn with_pending_state_mut<R>(f: impl FnOnce(&mut ScopedPendingBackgroundCost) ->
             .get_or_init(|| Mutex::new(std::collections::HashMap::new()))
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        f(by_thread.entry(std::thread::current().id()).or_default())
+        f(by_thread.entry(test_cost_scope_id()).or_default())
     }
 }
 
@@ -807,6 +856,7 @@ const MAX_RUNTIME_USAGE_RECORDS_PER_OWNER: usize = 64;
 #[derive(Default)]
 struct OwnerRuntimeUsageJournal {
     records: VecDeque<RuntimeUsageRecord>,
+    decisions: VecDeque<RuntimeDecisionReceipt>,
     drop_records: VecDeque<RuntimeUsageDropRecord>,
     dropped_records: u64,
     dropped_source_fingerprints: HashSet<String>,
@@ -820,6 +870,8 @@ type RuntimeUsageJournal = HashMap<String, OwnerRuntimeUsageJournal>;
 /// closed instead of silently presenting a partial cost as complete.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RuntimeUsageBatch {
+    /// Bounded decision evidence, owned and retired with the same usage ledger.
+    pub decisions: Vec<RuntimeDecisionReceipt>,
     pub records: Vec<RuntimeUsageRecord>,
     /// Exact provider-success calls whose usage payload was absent. The
     /// bounded records retain route billing truth; `dropped_records` remains
@@ -846,14 +898,136 @@ pub struct RuntimeUsageDropRecord {
     pub route: EffectiveRouteEnvelope,
 }
 
+/// Provider decision evidence attached to the existing origin-turn ledger.
+/// It is diagnostic evidence, never an instruction to change the model route.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RuntimeDecisionReceipt {
+    pub source_id: String,
+    pub route: EffectiveRouteEnvelope,
+    pub usage: Option<Usage>,
+    #[serde(default)]
+    pub usage_complete: bool,
+    pub shadow: bool,
+    pub valid_answers: bool,
+    pub evidence: crate::model_routing::AutoRouteDecisionEvidence,
+}
+
+impl RuntimeDecisionReceipt {
+    pub(crate) fn is_bounded(&self) -> bool {
+        !self.source_id.trim().is_empty()
+            && self.source_id.len() <= 128
+            && self.evidence.choice.len() <= 128
+            && self.evidence.probabilities_bp.len() <= 64
+            && self
+                .evidence
+                .probabilities_bp
+                .iter()
+                .all(|(key, value)| key.len() <= 128 && *value <= 10_000)
+            && self.evidence.confidence_bp <= 10_000
+            && self.evidence.min_confidence_bp <= 10_000
+            && self
+                .evidence
+                .thinking
+                .as_ref()
+                .is_none_or(|v| v.len() <= 128)
+            && self
+                .evidence
+                .response_model
+                .as_ref()
+                .is_none_or(|v| v.len() <= 128)
+            && self
+                .evidence
+                .provider_reported_cost_usd
+                .as_ref()
+                .is_none_or(|v| {
+                    v.len() <= 128
+                        && v.parse::<f64>()
+                            .is_ok_and(|cost| cost.is_finite() && cost >= 0.0)
+                })
+            && serde_json::to_vec(self).is_ok_and(|bytes| bytes.len() <= 8 * 1024)
+    }
+
+    pub(crate) fn sanitized(&self) -> Self {
+        let mut receipt = self.clone();
+        receipt.source_id = usage_source_fingerprint(&receipt.source_id);
+        receipt.route = receipt.route.sanitized_for_persistence();
+        receipt.evidence.choice = sanitize_persisted_route_label(&receipt.evidence.choice);
+        receipt.evidence.thinking = receipt
+            .evidence
+            .thinking
+            .as_deref()
+            .map(sanitize_persisted_route_label);
+        receipt.evidence.response_model = receipt
+            .evidence
+            .response_model
+            .as_deref()
+            .map(sanitize_persisted_route_label);
+        receipt.evidence.probabilities_bp = receipt
+            .evidence
+            .probabilities_bp
+            .into_iter()
+            .map(|(key, value)| (sanitize_persisted_route_label(&key), value))
+            .collect();
+        receipt
+    }
+
+    pub(crate) fn diagnostic_receipt(&self) -> String {
+        // Reuse cost_status's persisted diagnostic receipt surface. No prompt,
+        // response id, URL, auth header or unoffered choice enters this string.
+        format!(
+            "decision:{}",
+            serde_json::to_string(&self.sanitized()).unwrap_or_default()
+        )
+    }
+}
+
+pub(crate) type RuntimeDecisionSink = Arc<dyn Fn(RuntimeDecisionReceipt) -> bool + Send + Sync>;
+
 pub(crate) type RuntimeUsageSink = Arc<dyn Fn(RuntimeUsageRecord) -> bool + Send + Sync>;
 pub(crate) type RuntimeUsageDropSink = Arc<dyn Fn(RuntimeUsageDropRecord) -> bool + Send + Sync>;
 
 struct RuntimeUsageSinkEntry {
     sink: RuntimeUsageSink,
     dropped_sink: Option<RuntimeUsageDropSink>,
+    decision_sink: Option<RuntimeDecisionSink>,
     leases: usize,
     terminal: bool,
+}
+
+#[cfg(test)]
+pub(crate) fn decision_receipt_fixture(source_id: &str) -> RuntimeDecisionReceipt {
+    let mut route = EffectiveRouteEnvelope::capture(
+        None,
+        crate::config::ApiProvider::Custom,
+        "typesafe",
+        "jev-latest",
+        Some("https://api.typesafe.ai/v1"),
+        Utc::now(),
+    );
+    route.billing_mode = RouteBillingMode::Unknown;
+    RuntimeDecisionReceipt {
+        source_id: source_id.to_string(),
+        route,
+        usage: Some(Usage {
+            input_tokens: 9,
+            output_tokens: 4,
+            ..Default::default()
+        }),
+        usage_complete: true,
+        shadow: true,
+        valid_answers: false,
+        evidence: crate::model_routing::AutoRouteDecisionEvidence {
+            choice: "invalid".to_string(),
+            probabilities_bp: Default::default(),
+            confidence_bp: 0,
+            min_confidence_bp: 5_000,
+            cost_saving_kept_fast: false,
+            thinking: None,
+            provider_reported_cost_usd: Some("0.000012054".to_string()),
+            latency_ms: 12,
+            response_model: Some("jev-latest".to_string()),
+        },
+    }
 }
 
 /// Keeps an owner sink alive while a detached child can still report usage.
@@ -908,7 +1082,7 @@ fn with_runtime_usage_sinks<R>(
             .get_or_init(|| Mutex::new(HashMap::new()))
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        f(by_thread.entry(std::thread::current().id()).or_default())
+        f(by_thread.entry(test_cost_scope_id()).or_default())
     }
 }
 
@@ -928,7 +1102,7 @@ fn with_existing_runtime_usage_sinks<R>(
     {
         let by_thread = TEST_RUNTIME_USAGE_SINKS.get()?;
         let mut by_thread = by_thread.lock().unwrap_or_else(|error| error.into_inner());
-        let sinks = by_thread.get_mut(&std::thread::current().id())?;
+        let sinks = by_thread.get_mut(&test_cost_scope_id())?;
         Some(f(sinks))
     }
 }
@@ -948,7 +1122,7 @@ fn with_runtime_usage_journal_mut<R>(f: impl FnOnce(&mut RuntimeUsageJournal) ->
             .get_or_init(|| Mutex::new(std::collections::HashMap::new()))
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        f(by_thread.entry(std::thread::current().id()).or_default())
+        f(by_thread.entry(test_cost_scope_id()).or_default())
     }
 }
 
@@ -1079,10 +1253,79 @@ pub(crate) fn register_runtime_usage_sink_with_drop(
             RuntimeUsageSinkEntry {
                 sink,
                 dropped_sink,
+                decision_sink: None,
                 leases: 0,
                 terminal: false,
             },
         );
+    });
+}
+
+/// Extend the existing owner entry; this is not another sink registry.
+pub(crate) fn register_runtime_decision_sink(owner: &str, sink: RuntimeDecisionSink) {
+    with_runtime_usage_sinks(|sinks| {
+        if let Some(entry) = sinks.get_mut(owner.trim()) {
+            entry.decision_sink = Some(sink);
+        }
+    });
+}
+
+fn record_runtime_decision(owner: &str, record: &RuntimeDecisionReceipt) {
+    if !record.is_bounded() {
+        record_runtime_usage_drop(owner, &record.source_id, &record.route);
+        return;
+    }
+    let record = record.sanitized();
+    let sink = with_runtime_usage_sinks(|sinks| {
+        sinks
+            .get(owner)
+            .and_then(|entry| entry.decision_sink.clone())
+    });
+    if sink.is_some_and(|sink| sink(record.clone())) {
+        return;
+    }
+    with_runtime_usage_journal_mut(|journal| {
+        let entry = journal.entry(owner.to_string()).or_default();
+        if entry
+            .decisions
+            .iter()
+            .any(|old| old.source_id == record.source_id)
+        {
+            return;
+        }
+        if entry.decisions.len() == MAX_RUNTIME_USAGE_RECORDS_PER_OWNER {
+            entry.decisions.pop_front();
+            entry.dropped_records = entry.dropped_records.saturating_add(1);
+        }
+        entry.decisions.push_back(record);
+    });
+}
+
+fn report_interactive_decision(scope: CostScopeToken, receipt: &RuntimeDecisionReceipt) {
+    if !receipt.is_bounded() {
+        return;
+    }
+    with_pending_state_mut(|state| {
+        if state.generation == scope.0 {
+            if state
+                .pending
+                .route_receipts
+                .iter()
+                .filter(|v| v.starts_with("decision:"))
+                .count()
+                < MAX_RUNTIME_USAGE_RECORDS_PER_OWNER
+            {
+                state
+                    .pending
+                    .route_receipts
+                    .insert(receipt.diagnostic_receipt());
+            } else {
+                state
+                    .pending
+                    .route_receipts
+                    .insert("decision:diagnostic_receipt_bound_reached".to_string());
+            }
+        }
     });
 }
 
@@ -1151,6 +1394,9 @@ fn register_persistent_interactive_runtime_usage_sink_at(
     let drop_session_id = usage_session_id.clone();
     let drop_turn_id = usage_turn_id.clone();
     let usage_sessions_dir = sessions_dir.clone();
+    let decision_sessions_dir = sessions_dir.clone();
+    let decision_session_id = session_id.to_string();
+    let decision_turn_id = turn_id.to_string();
     register_runtime_usage_sink_with_drop(
         owner,
         Arc::new(move |record| {
@@ -1182,6 +1428,28 @@ fn register_persistent_interactive_runtime_usage_sink_at(
                 })
                 .unwrap_or(false)
         })),
+    );
+    register_runtime_decision_sink(
+        owner,
+        Arc::new(move |receipt| {
+            let Ok(manager) =
+                crate::session_manager::SessionManager::new(decision_sessions_dir.clone())
+            else {
+                return false;
+            };
+            let accepted = manager
+                .persist_late_decision_receipt(&decision_session_id, &decision_turn_id, &receipt)
+                .unwrap_or(false);
+            if accepted {
+                // The append may have been handled by a deletion tombstone. Only
+                // a live origin may enter the foreground diagnostic projection.
+                let _ = manager.with_live_session_origin(&decision_session_id, || {
+                    report_interactive_decision(scope, &receipt);
+                    true
+                });
+            }
+            accepted
+        }),
     );
 }
 
@@ -1288,11 +1556,39 @@ pub fn take_runtime_usage(owner: &str) -> RuntimeUsageBatch {
         journal
             .remove(owner)
             .map_or_else(RuntimeUsageBatch::default, |entry| RuntimeUsageBatch {
+                decisions: entry.decisions.into_iter().collect(),
                 records: entry.records.into_iter().collect(),
                 drop_records: entry.drop_records.into_iter().collect(),
                 dropped_records: entry.dropped_records,
             })
     })
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_COST_ORIGIN: std::cell::Cell<Option<std::thread::ThreadId>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn test_cost_scope_id() -> std::thread::ThreadId {
+    TEST_COST_ORIGIN
+        .with(|scope| scope.get())
+        .unwrap_or_else(|| std::thread::current().id())
+}
+
+#[cfg(test)]
+pub(crate) struct TestCostScopeBinding(Option<std::thread::ThreadId>);
+
+#[cfg(test)]
+pub(crate) fn bind_test_cost_scope(origin: std::thread::ThreadId) -> TestCostScopeBinding {
+    TestCostScopeBinding(TEST_COST_ORIGIN.with(|scope| scope.replace(Some(origin))))
+}
+
+#[cfg(test)]
+impl Drop for TestCostScopeBinding {
+    fn drop(&mut self) {
+        TEST_COST_ORIGIN.with(|scope| scope.set(self.0));
+    }
 }
 
 /// Capture the current session/run generation before starting a background
@@ -1845,6 +2141,13 @@ pub(crate) fn report_runtime_usage_batch(
     runtime_owner: Option<&str>,
     batch: &RuntimeUsageBatch,
 ) {
+    for receipt in &batch.decisions {
+        if let Some(owner) = runtime_owner {
+            record_runtime_decision(owner, receipt);
+        } else {
+            report_interactive_decision(scope, receipt);
+        }
+    }
     for record in &batch.records {
         report_effective_route_for_runtime(
             scope,
@@ -3189,6 +3492,7 @@ mod tests {
         attach_child_usage_batch_metadata(
             &mut metadata,
             &RuntimeUsageBatch {
+                decisions: Vec::new(),
                 records,
                 drop_records: Vec::new(),
                 dropped_records: 0,
@@ -3207,6 +3511,53 @@ mod tests {
         let malformed = child_usage_records_from_metadata(&metadata).expect("batch key wins");
         assert!(malformed.records.is_empty());
         assert_eq!(malformed.dropped_records, 1);
+    }
+
+    #[test]
+    fn decision_receipts_metadata_round_trip_is_bounded_and_legacy_compatible() {
+        let receipt = decision_receipt_fixture("raw-child-decision-id");
+        let mut metadata = serde_json::json!({});
+        attach_child_usage_batch_metadata(
+            &mut metadata,
+            &RuntimeUsageBatch {
+                decisions: vec![receipt.clone()],
+                ..Default::default()
+            },
+        );
+        assert!(!metadata.to_string().contains("raw-child-decision-id"));
+        let decoded = child_usage_records_from_metadata(&metadata).expect("batch");
+        assert_eq!(decoded.decisions, vec![receipt.sanitized()]);
+        assert_eq!(decoded.dropped_records, 0);
+        metadata[CHILD_DECISION_RECEIPTS_KEY][0]["evidence"]["response_model"] =
+            serde_json::json!("x".repeat(129));
+        let invalid = child_usage_records_from_metadata(&metadata).expect("batch");
+        assert!(invalid.decisions.is_empty());
+        assert_eq!(invalid.dropped_records, 1);
+        metadata
+            .as_object_mut()
+            .expect("metadata")
+            .remove(CHILD_DECISION_RECEIPTS_KEY);
+        assert!(
+            child_usage_records_from_metadata(&metadata)
+                .expect("old batch")
+                .decisions
+                .is_empty()
+        );
+        let mut oversized = receipt;
+        oversized.evidence.response_model = Some("x".repeat(129));
+        attach_child_usage_batch_metadata(
+            &mut metadata,
+            &RuntimeUsageBatch {
+                decisions: vec![oversized],
+                ..Default::default()
+            },
+        );
+        let invalid = child_usage_records_from_metadata(&metadata).expect("bounded batch");
+        assert!(invalid.decisions.is_empty());
+        assert_eq!(
+            invalid.dropped_records, 1,
+            "discarded evidence must leave an explicit coverage gap"
+        );
     }
 
     fn deepseek() -> BackgroundRoute<'static> {

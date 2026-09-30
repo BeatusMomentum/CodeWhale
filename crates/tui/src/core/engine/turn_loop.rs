@@ -1813,6 +1813,22 @@ impl Engine {
             // first call) so we can resend it on a transparent retry below
             // when the wire dies before any content was streamed (#103).
             let stream_request = request;
+            // Superfast Decision Gate (shadow mode, off by default). When
+            // SUPERFAST_ENABLED is set, this spawns a detached task that asks
+            // a small System One decision model about the user's turn and only
+            // logs the recommendation. It never changes routing, never skips
+            // the model call below, and never waits on the decision call.
+            // Fired only on the first model request of the turn, where the raw
+            // user message decides intent. See `crate::superfast`.
+            if turn.step == 0 {
+                // Detached on purpose: dropping the handle does not cancel it.
+                drop(crate::superfast::spawn_shadow_gate(
+                    &self.api_config,
+                    &stream_request.messages,
+                    self.config.compaction.runtime_cost_owner.as_deref(),
+                    &self.cancel_token,
+                ));
+            }
             let _ = self
                 .tx_event
                 .send(Event::ToolRequestSnapshot {

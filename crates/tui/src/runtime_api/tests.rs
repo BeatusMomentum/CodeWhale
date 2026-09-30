@@ -449,6 +449,7 @@ fn messages_from_thread_detail_batches_tool_results() {
         saved_session_checkpoint: None,
     };
     let turn = TurnRecord {
+        decision_receipts: Vec::new(),
         max_output_tokens: None,
         schema_version: 2,
         id: turn_id.clone(),
@@ -9382,6 +9383,7 @@ async fn session_save_merges_thread_cost_split_and_records_coverage() -> Result<
     let store = runtime_threads.test_store();
     let now = Utc::now();
     let mut turn = TurnRecord {
+        decision_receipts: Vec::new(),
         max_output_tokens: None,
         schema_version: 2,
         id: "turn_cost_merge".to_string(),
@@ -9580,6 +9582,7 @@ async fn session_save_persists_parent_cny_unpriced_reasons_without_double_count(
     let store = runtime_threads.test_store();
     let now = Utc::now();
     let mut turn = TurnRecord {
+        decision_receipts: Vec::new(),
         max_output_tokens: None,
         schema_version: 2,
         id: "turn_cny_reasons".to_string(),
@@ -10830,6 +10833,7 @@ fn seed_summary_search_transcript(
             item_ids.push(item_id);
         }
         store.save_turn(&TurnRecord {
+            decision_receipts: Vec::new(),
             max_output_tokens: None,
             schema_version: 2,
             id: turn_id.clone(),
