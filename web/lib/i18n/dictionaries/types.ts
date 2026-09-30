@@ -115,7 +115,8 @@ export interface ChromeDict {
   /**
    * Visible badge marking a partial locale pack in the switcher, e.g.
    * "(partial)" — honest scope signal, per the localization quality
-   * contract. Keep it short.
+   * contract. Keep it short. The switcher shows it, brackets stripped, as
+   * the heading of the group that lists partial packs.
    */
   partialBadge: string;
 }
@@ -498,6 +499,35 @@ export interface FeedDict {
   startDiscussion: string;
 }
 
+/** `app/[locale]/community/page.tsx`. */
+export interface CommunityDict {
+  metaTitle: string;
+  metaDescription: string;
+  kicker: string;
+  /** Page H1. */
+  title: string;
+  lede: string;
+  fileIssue: string;
+  browsePulls: string;
+  readGuide: string;
+  pathsTitle: string;
+  pathsScope: string;
+  recordTitle: string;
+  recordScope: string;
+  creditTitle: string;
+  /** Credit scope once the source version is the published release. */
+  creditScope: string;
+  /** Credit scope while the source version is ahead of the published release. */
+  creditScopeUnreleased: string;
+  /** Credit heading for the published release; `{version}` is filled at render time. */
+  creditLabel: string;
+  /** Credit heading while the source version is unreleased; `{version}` is filled at render time. */
+  creditLabelUnreleased: string;
+  mergedTitle: string;
+  helpersTitle: string;
+  fullRecord: string;
+}
+
 /** `app/[locale]/faq/page.tsx` and its `components/faq-search.tsx`. */
 export interface FaqDict {
   metaTitle: string;
@@ -584,6 +614,33 @@ export interface ContributeDict {
   reviewScope: string;
   devTitle: string;
   devScope: string;
+}
+
+/** `app/[locale]/constitution/page.tsx` and its `components/thinking-trace.tsx`. */
+export interface ConstitutionDict {
+  metaTitle: string;
+  metaDescription: string;
+  kicker: string;
+  /** Page H1. */
+  title: string;
+  /** The H1 again in the other script, set beside it (the bilingual Han title). */
+  titleAside: string;
+  /** BCP 47 language of `titleAside`. */
+  titleAsideLang: string;
+  lede: string;
+  /** Status label on the setup callout. */
+  since: string;
+  sinceBody: string;
+  rankTitle: string;
+  rankScope: string;
+  boundaryTitle: string;
+  boundaryBody: string;
+  traceTitle: string;
+  traceScope: string;
+  /** The label every traced scene carries: these are illustrations, not transcripts. */
+  illustration: string;
+  install: string;
+  configuration: string;
 }
 
 export type DocsHooksDict = DocsPageDict;

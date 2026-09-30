@@ -27,8 +27,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
 
 use crate::{
-    MCP_PROTOCOL_VERSION, MCP_SUPPORTED_PROTOCOL_VERSIONS, McpManagedClient, McpResourceDescriptor,
-    McpServerConfig, McpToolDescriptor,
+    MCP_CLIENT_ACCEPTED_PROTOCOL_VERSIONS, MCP_PROTOCOL_VERSION, McpManagedClient,
+    McpResourceDescriptor, McpServerConfig, McpToolDescriptor,
 };
 
 /// Budget for spawn + `initialize` + `notifications/initialized`. Generous
@@ -436,10 +436,10 @@ fn validate_initialize_result(
         })?;
     // Negotiation per spec: we advertise the newest revision and accept any
     // dated revision we still implement; anything else ends the handshake.
-    if !MCP_SUPPORTED_PROTOCOL_VERSIONS.contains(&protocol_version) {
+    if !MCP_CLIENT_ACCEPTED_PROTOCOL_VERSIONS.contains(&protocol_version) {
         bail!(
             "MCP server '{server_name}': unsupported protocol version '{protocol_version}' (supported: {})",
-            MCP_SUPPORTED_PROTOCOL_VERSIONS.join(", ")
+            MCP_CLIENT_ACCEPTED_PROTOCOL_VERSIONS.join(", ")
         );
     }
 
@@ -630,10 +630,10 @@ impl ChildProcessMcpClient {
                     "name": "codewhale-mcp-server",
                     "version": env!("CARGO_PKG_VERSION")
                 },
-                "capabilities": {
-                    "tools": {},
-                    "resources": {}
-                }
+                // Client capabilities name what the client offers (roots,
+                // sampling, elicitation); `tools`/`resources` are server
+                // capabilities and strict servers reject them with -32602.
+                "capabilities": {}
             }),
             handshake_timeout,
         )?;
@@ -1243,7 +1243,7 @@ mod tests {
 
         // Negotiation accepts every dated revision still implemented, not only
         // the newest one advertised at initialize.
-        for version in ["2025-03-26", "2024-11-05"] {
+        for version in ["2025-11-25", "2025-03-26", "2024-11-05"] {
             let older = json!({
                 "protocolVersion": version,
                 "serverInfo": {"name": "fixture", "version": "1"},

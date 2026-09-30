@@ -5,6 +5,7 @@ import { faqSourceHref } from "@/lib/faq-source";
 import { fill, getFaq } from "@/lib/i18n/dictionaries";
 import { extractText } from "@/lib/react-text";
 import { highlightSpan } from "@/lib/search-utils";
+import { isSlashShortcut } from "@/lib/slash-shortcut";
 import { Icon } from "./icon";
 import { WhalePose } from "./whale-pose";
 
@@ -70,9 +71,9 @@ export function FaqSearch({
       .filter(({ i }) => haystacks[i].includes(q));
   }, [query, haystacks, items]);
 
-  // Keyboard shortcut: focus search on "/".
+  // Keyboard shortcut: focus search on an unmodified "/" typed outside a field.
   const handleKeyDown = useCallback((e: KeyboardEvent) => {
-    if (e.key === "/" && document.activeElement?.tagName !== "INPUT") {
+    if (isSlashShortcut(e)) {
       e.preventDefault();
       inputRef.current?.focus();
     }

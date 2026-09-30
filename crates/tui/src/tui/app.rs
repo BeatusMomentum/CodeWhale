@@ -49,7 +49,7 @@ use crate::tui::streaming::StreamingState;
 use crate::tui::transcript::TranscriptViewCache;
 use crate::tui::views::ViewStack;
 use codewhale_localization::{Locale, MessageId, resolve_locale, tr};
-use codewhale_models::{Message, SystemPrompt, Tool, Usage};
+use codewhale_models::{ContentBlock, Message, SystemPrompt, Tool, Usage};
 use codewhale_palette::{self as palette, UiTheme};
 
 mod composer;
@@ -95,6 +95,20 @@ pub(crate) struct PendingMcpLogin {
 pub(crate) enum McpLoginProgress {
     AuthorizationUrl(String),
     Finished(Result<(), String>),
+}
+
+/// One `/mcp retry <name>` in flight. The retry runs as an engine op from a
+/// background task, so a running turn queues it in the engine mailbox instead
+/// of parking the UI loop (#6159) or asking the person to press it again; the
+/// outcome lands in `result` and `poll_mcp_retries` reports it.
+pub(crate) struct PendingMcpRetry {
+    pub server: String,
+    /// A turn owned the engine when the retry was requested, so it waits for
+    /// that turn to finish before it connects.
+    pub queued: bool,
+    pub result: std::sync::Arc<
+        std::sync::Mutex<Option<Result<crate::core::ops::McpManagerUpdate, String>>>,
+    >,
 }
 
 impl Drop for PendingMcpLogin {
@@ -173,30 +187,35 @@ pub enum OnboardingState {
     None,
 }
 
+/// Pick the session's primary skills dir. A workspace directory is chosen only
+/// when the workspace-trust gate admits it; an untrusted repository falls back
+/// to the global dir so its skills neither load nor become the install target.
 pub(crate) fn resolve_skills_dir(
     workspace: &Path,
     global_skills_dir: &Path,
     config: &Config,
 ) -> PathBuf {
+    let admitted =
+        |dir: &Path| crate::skills::skills_dir_allowed_by_workspace_trust(workspace, dir);
     if config.skills_config().scan_codewhale_only() {
         if config.skills_dir.is_some() {
             return global_skills_dir.to_path_buf();
         }
         if let Some(codewhale_skills_dir) = crate::skills::codewhale_workspace_skills_dir(workspace)
+            && admitted(&codewhale_skills_dir)
         {
             return codewhale_skills_dir;
         }
         return global_skills_dir.to_path_buf();
     }
 
-    let agents_skills_dir = workspace.join(".agents").join("skills");
-    if agents_skills_dir.exists() {
-        return agents_skills_dir;
-    }
-
-    let local_skills_dir = workspace.join("skills");
-    if local_skills_dir.exists() {
-        return local_skills_dir;
+    for local_skills_dir in [
+        workspace.join(".agents").join("skills"),
+        workspace.join("skills"),
+    ] {
+        if local_skills_dir.exists() && admitted(&local_skills_dir) {
+            return local_skills_dir;
+        }
     }
 
     if config.skills_dir.is_none()
@@ -1570,6 +1589,10 @@ pub struct App {
     /// that `TurnComplete { error: .. }` would otherwise emit on top of
     /// the in-transcript error cell.
     pub turn_error_posted: bool,
+    /// Text of the error cell posted for the current turn, when
+    /// `turn_error_posted`. A turn that then ends `Failed` persists exactly
+    /// this text, so resume shows what the live transcript showed.
+    pub(crate) turn_error_notice: Option<String>,
     /// Legacy status text sink retained for compatibility with existing call sites.
     pub status_message: Option<String>,
     /// Recent status toasts (ephemeral, newest at back).
@@ -2134,6 +2157,9 @@ pub struct App {
     pub(crate) current_session_metadata: Option<SessionMetadata>,
     /// Metadata-only registry of large tool outputs produced in this session.
     pub session_artifacts: Vec<ArtifactRecord>,
+    /// Turns in this session that ended `Failed`, persisted with the session
+    /// so the reason survives the TUI closing.
+    pub(crate) session_turn_outcomes: Vec<crate::session_manager::SavedTurnOutcome>,
     /// Trust mode - allow access outside workspace
     pub trust_mode: bool,
     /// Translation mode — when enabled, the model is instructed to respond in
@@ -2295,7 +2321,7 @@ pub struct App {
     /// Last completed reasoning block
     pub last_reasoning: Option<String>,
     /// Tool calls captured for the pending assistant message
-    pub pending_tool_uses: Vec<(String, String, Value)>,
+    pub pending_tool_uses: Vec<ContentBlock>,
     /// One-line permission receipts (`tool_id`, text) for decisions nobody
     /// was prompted for, held until that tool's card completes so the note
     /// lands directly under the card instead of splitting a running tool run.
@@ -2384,6 +2410,8 @@ pub struct App {
     /// Discovery, registration and the browser callback all run in the
     /// background. Esc or dropping the app cancels the entire operation.
     pub(crate) mcp_login: Option<PendingMcpLogin>,
+    /// `/mcp retry` requests still waiting on the engine, one per server.
+    pub(crate) mcp_retries: Vec<PendingMcpRetry>,
     /// Shared cell for async prompt suggestion delivery from background task.
     pub prompt_suggestion_cell: std::sync::Arc<std::sync::Mutex<Option<(u64, String)>>>,
     /// Tracks whether the initial balance fetch has been attempted for this session.
@@ -4782,6 +4810,7 @@ impl App {
         self.context_references_by_cell.clear();
         self.session_context_references.clear();
         self.session_artifacts.clear();
+        self.session_turn_outcomes.clear();
         self.prune_transcript_index_state(0);
         self.history_version = self.history_version.wrapping_add(1);
         self.needs_redraw = true;
@@ -5523,11 +5552,20 @@ impl App {
         if let Some(error) = run_failure
             && !already_failed
         {
-            let detail = error
-                .as_deref()
-                .map(str::trim)
-                .filter(|detail| !detail.is_empty());
-            let message = match detail {
+            // The same reason the workbar and the finish row show: a failed
+            // agent's own cause ("Authorization failed: …") when nothing
+            // succeeded, not the run's aggregate summary.
+            let detail = self
+                .workflow_run(event_run_id)
+                .and_then(WorkflowPanel::outcome_reason)
+                .or_else(|| {
+                    error
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|detail| !detail.is_empty())
+                        .map(str::to_string)
+                });
+            let message = match detail.as_deref() {
                 Some(detail) => format!(
                     "{} · {}",
                     self.tr(MessageId::WorkflowRunFailedToast),
@@ -5610,9 +5648,11 @@ impl App {
     /// reuses the card renderer and expands in Transcript mode.
     ///
     /// One row per run: when the call that started the run is already in
-    /// history (its call returned, its record still says running), that card
-    /// becomes the finish — the final state replaces `started` rather than
-    /// stacking a second row under it. The card's tool-detail record is keyed
+    /// history (its call returned, its record still says running) and the
+    /// conversation has not moved past it, that card becomes the finish — the
+    /// final state replaces `started` rather than stacking a second row under
+    /// it. A run that settles after a later user message gets its finish at
+    /// the tail, where it is seen. The card's tool-detail record is keyed
     /// separately and still holds what the model saw.
     ///
     /// While a `workflow` card is still in the active group (a foreground
@@ -5663,26 +5703,40 @@ impl App {
                     )
             })
         };
-        // The returned `start` card for this run, still showing `started`. A
-        // card whose call is still running is left alone: its result would
-        // overwrite the finish.
+        // The card that started this run, when it is still showing `started`
+        // and still in the current exchange. The first card naming a run is
+        // the one that launched it (the id does not exist before `start`); a
+        // later `status` poll returns the same running shape and must not be
+        // mistaken for it. Once the conversation has moved on (a user message
+        // after the card), rewriting a row far up in scrollback would leave
+        // nothing at the tail to say the run settled, so the finish is
+        // appended instead. A card whose call is still running is left alone:
+        // its result would overwrite the finish.
         let start_card = |history: &[HistoryCell], run_id: &str| {
-            history.iter().rposition(|cell| {
+            let first = history.iter().position(|cell| {
                 let HistoryCell::Tool(ToolCell::Generic(tool)) = cell else {
                     return false;
                 };
-                if tool.name != "workflow" || tool.status == ToolStatus::Running {
-                    return false;
-                }
-                record_of(tool).is_some_and(|value| {
-                    value.get("run_id").and_then(serde_json::Value::as_str) == Some(run_id)
-                        && value.get("transcript_line").is_none()
-                        && matches!(
-                            value.get("status").and_then(serde_json::Value::as_str),
-                            None | Some("running" | "pending" | "started")
-                        )
-                })
-            })
+                tool.name == "workflow"
+                    && record_of(tool).is_some_and(|value| {
+                        value.get("run_id").and_then(serde_json::Value::as_str) == Some(run_id)
+                            && value.get("transcript_line").is_none()
+                    })
+            })?;
+            let HistoryCell::Tool(ToolCell::Generic(tool)) = &history[first] else {
+                return None;
+            };
+            let still_started = tool.status != ToolStatus::Running
+                && record_of(tool).is_some_and(|value| {
+                    matches!(
+                        value.get("status").and_then(serde_json::Value::as_str),
+                        None | Some("running" | "pending" | "started")
+                    )
+                });
+            let same_exchange = !history[first + 1..]
+                .iter()
+                .any(|cell| matches!(cell, HistoryCell::User { .. }));
+            (still_started && same_exchange).then_some(first)
         };
         let mut replaced = Vec::new();
         let mut lines = Vec::new();
@@ -5691,10 +5745,13 @@ impl App {
                 continue;
             }
             run.finish_announced = true;
-            let start = start_card(&self.history, &run.run_id);
-            if start.is_none() && card_owns_finish(&self.history, &run.run_id) {
+            // A later card (a `status` poll, a foreground `run`) that returned
+            // the settled record already shows the finish; rewriting the start
+            // card too would say it twice.
+            if card_owns_finish(&self.history, &run.run_id) {
                 continue;
             }
+            let start = start_card(&self.history, &run.run_id);
             let mut output = run.to_run_json();
             output["transcript_line"] = serde_json::Value::from("finished");
             let status = match run.lifecycle {

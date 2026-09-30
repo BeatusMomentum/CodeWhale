@@ -25,6 +25,24 @@ test('handshake reports protocol 1 and the digest of the running bundle', async 
   t.diagnostic(`spawn → host/ready: ${host.readyMs.toFixed(1)} ms`)
 })
 
+test('heartbeat answers after initialization without an owner or tool call', async (t) => {
+  const host = await startHost()
+  t.after(() => host.stop())
+  assert.deepEqual(await host.call('host/ping', {}), {})
+  assert.equal(host.registry.length, 0)
+})
+
+test('the documented typed hello extension activates and executes unchanged', async (t) => {
+  const host = await startHost()
+  t.after(() => host.stop())
+  const entry = fileURLToPath(new URL('../../../../docs/examples/plugins/hello-extension/hello.mts', import.meta.url))
+  const { result } = await activate(host, 'hello-extension', entry)
+  assert.deepEqual(result, { status: 'ok', tools: ['hello_greet'] })
+  const tool = host.registry.find((entry) => entry.op === 'register')
+  const output = await host.call('tool/call', { handle: tool.handle, call_id: 'hello-1', input: { name: 'Codewhale' }, deadline_ms: 5000 })
+  assert.deepEqual(output.structured, { greeting: 'Hello, Codewhale!', callId: 'hello-1' })
+})
+
 test('the published DSH plugin runs unmodified and returns its payload', async (t) => {
   const host = await startHost()
   t.after(() => host.stop())

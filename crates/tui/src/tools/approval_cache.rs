@@ -143,6 +143,34 @@ pub fn build_approval_grouping_key(tool_name: &str, input: &serde_json::Value) -
     ApprovalKey(fingerprint)
 }
 
+/// Exact and grouping keys for one call, as the engine puts them on an
+/// approval request. A tool with an [`approval_scope`] (extension tools) is
+/// keyed `<scope>:<tool_name>:<hash of input>` for both, so its grants are
+/// bound to the reviewed plugin build and never widened to a family; every
+/// other tool keeps [`build_approval_key`] / [`build_approval_grouping_key`].
+///
+/// [`approval_scope`]: crate::tools::spec::ToolSpec::approval_scope
+#[must_use]
+pub fn approval_keys_for_call(
+    registry: Option<&crate::tools::ToolRegistry>,
+    tool_name: &str,
+    input: &serde_json::Value,
+) -> (ApprovalKey, ApprovalKey) {
+    let scope = registry
+        .and_then(|registry| registry.get(tool_name))
+        .and_then(|tool| tool.approval_scope());
+    match scope {
+        Some(scope) => {
+            let key = ApprovalKey(format!("{scope}:{tool_name}:{}", hash_json_value(input)));
+            (key.clone(), key)
+        }
+        None => (
+            build_approval_key(tool_name, input),
+            build_approval_grouping_key(tool_name, input),
+        ),
+    }
+}
+
 /// The sorted `web.run` action kinds present in `input`, e.g. `open+search_query`.
 fn web_run_action_class(input: &Value) -> String {
     const ACTIONS: [&str; 6] = [

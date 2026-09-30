@@ -156,28 +156,55 @@ pub(crate) fn agent_display_label(app: &App, agent_id: &str) -> String {
 /// running, after the tool-use block itself), so a decision reads in place.
 fn cells_for_messages(messages: &[Message], receipts: &[(String, String)]) -> Vec<HistoryCell> {
     use codewhale_models::ContentBlock;
-    let mut resulted: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    for message in messages {
-        for block in &message.content {
-            if let ContentBlock::ToolResult { tool_use_id, .. } = block {
-                resulted.insert(tool_use_id.as_str());
+    let mut calls = std::collections::HashMap::new();
+    let mut results = std::collections::HashMap::new();
+    let mut raw_ids = std::collections::HashMap::<&str, usize>::new();
+    for block in messages.iter().flat_map(|message| &message.content) {
+        let Some(key) = block
+            .tool_call_key()
+            .filter(|key| !key.as_str().trim().is_empty())
+        else {
+            continue;
+        };
+        match block {
+            ContentBlock::ToolUse { id, .. } => {
+                *raw_ids.entry(key.as_str()).or_default() += 1;
+                calls
+                    .entry(key)
+                    .and_modify(|entry| *entry = None)
+                    .or_insert(Some(id.as_str()));
             }
+            ContentBlock::ToolResult { tool_use_id, .. } => {
+                results
+                    .entry(key)
+                    .and_modify(|entry| *entry = None)
+                    .or_insert(Some(tool_use_id.as_str()));
+            }
+            _ => {}
         }
     }
     let mut cells = Vec::new();
     for message in messages {
         cells.extend(history_cells_from_message(message));
         for block in &message.content {
-            let anchor = match block {
-                ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.as_str()),
-                ContentBlock::ToolUse { id, .. } if !resulted.contains(id.as_str()) => {
-                    Some(id.as_str())
-                }
-                _ => None,
+            let Some(key) = block.tool_call_key() else {
+                continue;
             };
-            let Some(anchor) = anchor else { continue };
-            for (tool_id, text) in receipts {
-                if tool_id == anchor {
+            let Some(Some(provider)) = calls.get(&key) else {
+                continue;
+            };
+            if raw_ids.get(key.as_str()) != Some(&1) {
+                continue;
+            }
+            let anchor = match block {
+                ContentBlock::ToolResult { tool_use_id, .. } => {
+                    results.get(&key) == Some(&Some(*provider)) && tool_use_id.as_str() == *provider
+                }
+                ContentBlock::ToolUse { .. } => !results.contains_key(&key),
+                _ => false,
+            };
+            if anchor {
+                for (_, text) in receipts.iter().filter(|(id, _)| id == key.as_str()) {
                     cells.push(HistoryCell::System {
                         content: text.clone(),
                     });
@@ -758,6 +785,41 @@ mod tests {
             },
             &Config::default(),
         )
+    }
+
+    #[test]
+    fn child_receipts_anchor_only_to_unique_execution_pairs() {
+        let messages: Vec<Message> = serde_json::from_value(json!([
+            {"role":"assistant","content":[{"type":"tool_use","id":"wire","execution_id":"first","name":"read_file","input":{}}]},
+            {"role":"user","content":[{"type":"tool_result","tool_use_id":"wire","execution_id":"first","content":"one"}]},
+            {"role":"assistant","content":[{"type":"tool_use","id":"wire","execution_id":"second","name":"read_file","input":{}}]},
+            {"role":"user","content":[{"type":"tool_result","tool_use_id":"wire","execution_id":"second","content":"two"}]}
+        ])).unwrap();
+        let receipts = vec![
+            ("first".into(), "receipt one".into()),
+            ("second".into(), "receipt two".into()),
+        ];
+        let rendered = cells_for_messages(&messages, &receipts);
+        let anchored: Vec<_> = rendered
+            .iter()
+            .filter_map(|cell| match cell {
+                HistoryCell::System { content } if content.starts_with("receipt ") => {
+                    Some(content.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(anchored, ["receipt one", "receipt two"]);
+
+        for duplicate in [messages[0].clone(), serde_json::from_value(json!({
+            "role":"assistant","content":[{"type":"tool_use","id":"first","name":"read_file","input":{}}]
+        })).unwrap()] {
+            let mut ambiguous = messages.clone();
+            ambiguous.push(duplicate);
+            let rendered = cells_for_messages(&ambiguous, &receipts);
+            assert!(!rendered.iter().any(|cell| matches!(cell, HistoryCell::System { content } if content == "receipt one")));
+            assert_eq!(rendered.iter().filter(|cell| matches!(cell, HistoryCell::System { content } if content == "receipt two")).count(), 1);
+        }
     }
 
     #[test]

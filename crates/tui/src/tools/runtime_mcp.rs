@@ -293,21 +293,9 @@ impl ToolSpec for StartRuntimeMcpServer {
             parsed.config.connect_timeout = Some(timeout);
         }
 
-        // Reject shell-wrapped commands that could execute arbitrary code
+        // Refuse shell wrappers and anything outside the runtime allowlist.
         if let Some(ref cmd) = parsed.config.command {
-            let cmd_lower = cmd.to_lowercase();
-            if cmd_lower == "bash"
-                || cmd_lower == "sh"
-                || cmd_lower == "zsh"
-                || cmd_lower == "cmd"
-                || cmd_lower == "powershell"
-            {
-                return Err(ToolError::invalid_input(format!(
-                    "Shell wrapper commands ({cmd}) are not allowed. \
-                     Provide the actual MCP server command directly, \
-                     e.g. 'npx @modelcontextprotocol/server-filesystem /tmp'"
-                )));
-            }
+            validate_runtime_command(cmd)?;
         }
 
         // Reject shell metacharacters in arguments to prevent injection.
@@ -317,27 +305,6 @@ impl ToolSpec for StartRuntimeMcpServer {
         // guard refused it, so deleting the guard left them green
         // (2026-08-04 audit).
         reject_shell_metacharacters(&parsed.config.args)?;
-
-        // Allowlist of known MCP server runtimes and package managers.
-        // Commands not in this list are rejected to prevent arbitrary execution.
-        if let Some(ref cmd) = parsed.config.command {
-            let cmd_base = std::path::Path::new(cmd)
-                .file_stem()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_lowercase();
-            const ALLOWED_COMMANDS: &[&str] = &[
-                "npx", "npm", "pnpm", "yarn", "bunx", "bun", "node", "python", "python3", "uvx",
-                "uv", "deno", "ruby", "cargo",
-            ];
-            if !ALLOWED_COMMANDS.contains(&cmd_base.as_ref()) {
-                return Err(ToolError::invalid_input(format!(
-                    "Command '{cmd}' is not in the allowed list. \
-                     Permitted commands: {}",
-                    ALLOWED_COMMANDS.join(", ")
-                )));
-            }
-        }
 
         let server_name = custom_name
             .map(sanitize_name)
@@ -421,6 +388,44 @@ fn connected_result(
     let mut output = ToolResult::success(result);
     output.metadata = Some(json!({ "mcp_catalog_changed": true }));
     output
+}
+
+/// Shell interpreters that would run an arbitrary script as the "server".
+const SHELL_WRAPPERS: &[&str] = &["bash", "sh", "zsh", "cmd", "powershell"];
+
+/// Known MCP server runtimes and package managers. Anything else is refused
+/// to prevent arbitrary execution.
+const ALLOWED_COMMANDS: &[&str] = &[
+    "npx", "npm", "pnpm", "yarn", "bunx", "bun", "node", "python", "python3", "uvx", "uv", "deno",
+    "ruby", "cargo",
+];
+
+/// Refuse a runtime MCP command that is a shell wrapper or is not a known
+/// server runtime. Both checks read the command's lowercased file stem, so
+/// `/bin/zsh` and `powershell.exe` are named for what they are. Kept out of
+/// `execute` (as [`reject_shell_metacharacters`] is) so tests exercise the
+/// real guard rather than a copy of its list.
+fn validate_runtime_command(cmd: &str) -> Result<(), ToolError> {
+    let cmd_base = std::path::Path::new(cmd)
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_lowercase();
+    if SHELL_WRAPPERS.contains(&cmd_base.as_str()) {
+        return Err(ToolError::invalid_input(format!(
+            "Shell wrapper commands ({cmd}) are not allowed. \
+             Provide the actual MCP server command directly, \
+             e.g. 'npx @modelcontextprotocol/server-filesystem /tmp'"
+        )));
+    }
+    if !ALLOWED_COMMANDS.contains(&cmd_base.as_str()) {
+        return Err(ToolError::invalid_input(format!(
+            "Command '{cmd}' is not in the allowed list. \
+             Permitted commands: {}",
+            ALLOWED_COMMANDS.join(", ")
+        )));
+    }
+    Ok(())
 }
 
 /// Refuse MCP server arguments carrying shell metacharacters.
@@ -786,10 +791,30 @@ mod tests {
     // === command validation tests ===
 
     #[test]
-    fn reject_shell_wrapper_bash() {
-        let result = parse_mcp_command("bash -c 'npx server'");
-        assert!(result.is_ok()); // parsing succeeds
-        // but execute would reject — tested via parse_mcp_command structure
+    fn shell_wrappers_and_unlisted_commands_are_refused() {
+        for (cmd, reason) in [
+            ("bash", "Shell wrapper"),
+            ("sh", "Shell wrapper"),
+            ("/bin/zsh", "Shell wrapper"),
+            ("powershell", "Shell wrapper"),
+            ("PowerShell.exe", "Shell wrapper"),
+            ("curl", "not in the allowed list"),
+        ] {
+            let err =
+                super::validate_runtime_command(cmd).expect_err(&format!("{cmd} must be refused"));
+            assert!(err.to_string().contains(reason), "{cmd}: {err}");
+        }
+        // The parsed command, not the raw string, is what gets checked.
+        let parsed = parse_mcp_command("bash -c 'npx server'").expect("parses");
+        let cmd = parsed.config.command.expect("stdio command");
+        assert!(super::validate_runtime_command(&cmd).is_err());
+    }
+
+    #[test]
+    fn known_runtimes_pass_the_command_guard() {
+        for cmd in ["npx", "/usr/local/bin/node", "python3", "uvx", "cargo"] {
+            assert!(super::validate_runtime_command(cmd).is_ok(), "{cmd}");
+        }
     }
 
     /// These used to assert only that their own input string contained the
@@ -824,20 +849,6 @@ mod tests {
             "--read-only".to_string(),
         ];
         assert!(super::reject_shell_metacharacters(&args).is_ok());
-    }
-
-    #[test]
-    fn allowlist_includes_common_runtimes() {
-        // Verify the allowlist covers the expected commands
-        const ALLOWED: &[&str] = &[
-            "npx", "npm", "pnpm", "yarn", "bunx", "bun", "node", "python", "python3", "uvx", "uv",
-            "deno", "ruby", "cargo",
-        ];
-        // All standard MCP server launchers should be present
-        assert!(ALLOWED.contains(&"npx"));
-        assert!(ALLOWED.contains(&"node"));
-        assert!(ALLOWED.contains(&"python3"));
-        assert!(ALLOWED.contains(&"uvx"));
     }
 
     // === approval-gate contract ===

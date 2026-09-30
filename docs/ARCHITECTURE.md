@@ -1,5 +1,7 @@
 # Codewhale Architecture
 
+> 阅读简体中文版：[zh_hans/ARCHITECTURE.md](zh_hans/ARCHITECTURE.md)。
+
 This document provides an overview of the codewhale architecture for developers and contributors.
 
 Current boundary note (read the workspace version from `Cargo.toml`; this

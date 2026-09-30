@@ -663,7 +663,57 @@ impl StateStore {
                 "BEGIN; {additions} PRAGMA user_version = 5; COMMIT;"
             ))
             .context("failed to initialize durable goal stall schema")?;
+            user_version = 5;
         }
+        if user_version < 6 {
+            conn.execute_batch(
+                r#"
+                BEGIN;
+                CREATE TABLE IF NOT EXISTS thread_runtime_links (
+                    thread_id TEXT PRIMARY KEY NOT NULL,
+                    runtime_thread_id TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    FOREIGN KEY(thread_id) REFERENCES threads(id) ON DELETE CASCADE
+                );
+
+                PRAGMA user_version = 6;
+                COMMIT;
+                "#,
+            )
+            .context("failed to initialize thread runtime link schema")?;
+        }
+        Ok(())
+    }
+
+    /// The runtime (turn engine) thread a client-facing thread runs on, if
+    /// one was linked. Links outlive the app-server process, so a thread
+    /// keeps its conversation across a daemon restart.
+    pub fn get_runtime_thread_link(&self, thread_id: &str) -> Result<Option<String>> {
+        let conn = self.conn()?;
+        conn.query_row(
+            "SELECT runtime_thread_id FROM thread_runtime_links WHERE thread_id = ?1",
+            params![thread_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .with_context(|| format!("failed to read runtime link for thread {thread_id}"))
+    }
+
+    /// Record the runtime thread for `thread_id`. The thread must exist; the
+    /// link is removed with it.
+    pub fn set_runtime_thread_link(&self, thread_id: &str, runtime_thread_id: &str) -> Result<()> {
+        let conn = self.conn()?;
+        conn.execute(
+            r#"
+            INSERT INTO thread_runtime_links(thread_id, runtime_thread_id, created_at)
+            VALUES (?1, ?2, ?3)
+            ON CONFLICT(thread_id) DO UPDATE SET
+                runtime_thread_id = excluded.runtime_thread_id,
+                created_at = excluded.created_at
+            "#,
+            params![thread_id, runtime_thread_id, Utc::now().timestamp()],
+        )
+        .with_context(|| format!("failed to save runtime link for thread {thread_id}"))?;
         Ok(())
     }
 
@@ -2387,6 +2437,46 @@ mod tests {
         assert_eq!(listed.len(), 2, "both writers should persist their jobs");
 
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn runtime_thread_link_round_trips_and_goes_with_its_thread() {
+        let store = temp_state_store("runtime-thread-link");
+        store
+            .upsert_thread(&test_thread("thread-linked"))
+            .expect("upsert thread");
+        assert_eq!(
+            store
+                .get_runtime_thread_link("thread-linked")
+                .expect("read"),
+            None
+        );
+        store
+            .set_runtime_thread_link("thread-linked", "thr_runtime_1")
+            .expect("link");
+        store
+            .set_runtime_thread_link("thread-linked", "thr_runtime_2")
+            .expect("relink");
+        assert_eq!(
+            store
+                .get_runtime_thread_link("thread-linked")
+                .expect("read")
+                .as_deref(),
+            Some("thr_runtime_2")
+        );
+        assert!(
+            store
+                .set_runtime_thread_link("no-such-thread", "thr_runtime_3")
+                .is_err(),
+            "a link needs an existing thread"
+        );
+        store.delete_thread("thread-linked").expect("delete thread");
+        assert_eq!(
+            store
+                .get_runtime_thread_link("thread-linked")
+                .expect("read"),
+            None
+        );
     }
 
     #[test]

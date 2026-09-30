@@ -2754,14 +2754,11 @@ pub fn format_cost_amount(cost: f64, currency: CostCurrency) -> String {
 /// Format a cost amount for detailed reports in the chosen currency.
 #[must_use]
 pub fn format_cost_amount_precise(cost: f64, currency: CostCurrency) -> String {
-    let symbol = currency.symbol();
-    if cost == 0.0 {
-        format!("{symbol}0.0000")
-    } else if cost > 0.0 && cost < 0.0001 {
-        format!("<{symbol}0.0001")
-    } else {
-        format!("{symbol}{cost:.4}")
-    }
+    let selected = match currency {
+        CostCurrency::Usd => codewhale_command_contract::types::CommandCurrency::Usd,
+        CostCurrency::Cny => codewhale_command_contract::types::CommandCurrency::Cny,
+    };
+    crate::diagnostics_reports::format_cost_amount_precise(cost, selected)
 }
 
 /// Format a dual-currency estimate using the selected display currency.

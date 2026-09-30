@@ -311,6 +311,7 @@ fn saved_session_with_blocks(blocks: Vec<codewhale_models::ContentBlock>) -> Sav
         work_state: None,
         window_title: None,
         last_auto_route: None,
+        turn_outcomes: Vec::new(),
     }
 }
 
@@ -371,6 +372,7 @@ fn session_detail_scenario() {
     {
         let detail = session_to_detail(saved_session_with_blocks(vec![
             codewhale_models::ContentBlock::ToolUse {
+                execution_id: Some("host-display-only".into()),
                 id: "tool-1".to_string(),
                 name: "task_shell_start".to_string(),
                 input: json!({ "cmd": "cargo test" }),
@@ -384,6 +386,10 @@ fn session_detail_scenario() {
 
         let block = &detail.messages[0]["content"][0];
         assert_eq!(block["type"].as_str(), Some("tool_use"));
+        assert!(
+            block.get("execution_id").is_none(),
+            "detail remains a display projection"
+        );
         assert_eq!(block["caller"]["type"].as_str(), Some("subagent"));
         assert_eq!(block["caller"]["tool_id"].as_str(), Some("parent-tool"));
     }
@@ -391,6 +397,7 @@ fn session_detail_scenario() {
     {
         let detail = session_to_detail(saved_session_with_blocks(vec![
             codewhale_models::ContentBlock::ToolResult {
+                execution_id: None,
                 tool_use_id: "tool-1".to_string(),
                 content: "fallback text".to_string(),
                 is_error: Some(false),
@@ -573,7 +580,7 @@ fn messages_from_thread_detail_batches_tool_results() {
         approval_grants: Vec::new(),
     };
 
-    let messages = messages_from_thread_detail(&detail);
+    let messages = messages_from_thread_detail(&detail).expect("rebuild thread history");
     let roles = messages
         .iter()
         .map(|message| message.role.as_str())
@@ -586,6 +593,7 @@ fn messages_from_thread_detail_batches_tool_results() {
             content,
             is_error,
             content_blocks,
+            ..
         } => {
             assert_eq!(tool_use_id, "tool-1");
             assert_eq!(content, "one");
@@ -605,6 +613,7 @@ fn messages_from_thread_detail_batches_tool_results() {
             content,
             is_error,
             content_blocks,
+            ..
         } => {
             assert_eq!(tool_use_id, "tool-2");
             assert_eq!(content, "two");
@@ -952,6 +961,8 @@ struct TestServerOverrides {
     fleet_codewhale_binary: Option<String>,
     config: Option<Config>,
     config_path: Option<PathBuf>,
+    /// Observe the exact loaded config shared with the HTTP handlers.
+    config_handle: Option<Arc<parking_lot::RwLock<Config>>>,
     config_profile: Option<String>,
     mobile: Option<mobile::RuntimeMobileState>,
     web: Option<web::RuntimeWebState>,
@@ -1226,8 +1237,14 @@ async fn build_test_server(
     } else {
         None
     };
+    let config = if let Some(handle) = overrides.config_handle {
+        *handle.write() = config;
+        handle
+    } else {
+        Arc::new(parking_lot::RwLock::new(config))
+    };
     let state = RuntimeApiState {
-        config: Arc::new(parking_lot::RwLock::new(config)),
+        config,
         workspace,
         plugin_discovery: overrides
             .plugin_discovery
@@ -3424,6 +3441,11 @@ async fn compatibility_stream_exposes_and_resolves_user_input_without_answer_ech
         harness
             .tx_event
             .send(EngineEvent::ToolCallStarted {
+                model_call: Some(crate::core::events::ModelToolCall {
+                    provider_id: "input_compat".to_string(),
+                    caller: None,
+                    thought_signature: None,
+                }),
                 id: "input_compat".to_string(),
                 name: "request_user_input".to_string(),
                 input: serde_json::to_value(&request)?,
@@ -3449,6 +3471,7 @@ async fn compatibility_stream_exposes_and_resolves_user_input_without_answer_ech
         harness
             .tx_event
             .send(EngineEvent::ToolCallComplete {
+                model_call: None,
                 id: "input_compat".to_string(),
                 name: "request_user_input".to_string(),
                 result: Ok(tool_result),
@@ -10541,6 +10564,9 @@ async fn thread_summary_search_does_not_scan_the_whole_store_per_thread() -> Res
     let Some((addr, runtime_threads, handle)) = spawn_test_server().await? else {
         return Ok(());
     };
+    // Settle the server's startup item-index warm-up, so the read counts below
+    // measure this route and not a background pass over the directory.
+    runtime_threads.warm_item_index()?;
     let client = crate::tls::reqwest_client();
 
     const THREADS: usize = 8;
@@ -10644,21 +10670,26 @@ async fn thread_summary_search_does_not_scan_the_whole_store_per_thread() -> Res
     Ok(())
 }
 
-/// The default listing carries no `search`, and it must read the store once
-/// rather than once per row.
+/// The default listing carries no `search`, and it must not walk the items
+/// directory at all.
 ///
 /// This route used to call `get_thread_detail` for every row, and detail is a
 /// whole-store walk: `list_turns_for_thread` scans every turn record and
 /// `list_items_for_turns_map` scans every item record, because an item's
 /// filename carries only the item id. Listing `T` threads therefore cost
 /// `T x (all_turns + all_items)` reads — seconds-per-thread, and the reason a
-/// 72-thread rail went blank. The bound asserted here is one pass per
-/// directory, so any return to a per-row detail read fails loudly.
+/// 72-thread rail went blank. The next fix made that one pass per directory,
+/// and the one after it read each row's preview out of the row's own newest
+/// turn, so no item file is read by directory walk at all. The bound asserted
+/// here is that zero, so any return to a store-wide item read fails loudly.
 #[tokio::test]
-async fn thread_summary_listing_reads_the_store_once_not_once_per_thread() -> Result<()> {
+async fn thread_summary_listing_never_walks_the_items_directory() -> Result<()> {
     let Some((addr, runtime_threads, handle)) = spawn_test_server().await? else {
         return Ok(());
     };
+    // Settle the server's startup item-index warm-up, so the read counts below
+    // measure this route and not a background pass over the directory.
+    runtime_threads.warm_item_index()?;
     let client = crate::tls::reqwest_client();
 
     const THREADS: usize = 8;
@@ -10711,21 +10742,21 @@ async fn thread_summary_listing_reads_the_store_once_not_once_per_thread() -> Re
     );
     assert_eq!(
         turn_files, total_turns,
-        "the page must scan the turns directory exactly once: read {turn_files} of \
+        "the page still reads every turn record exactly once: read {turn_files} of \
          {total_turns} turn files, while reading one thread's detail per row would have \
          been {per_thread_file_reads} reads in total"
     );
     assert_eq!(
-        item_files, total_items,
-        "the page must scan the items directory exactly once: read {item_files} of \
-         {total_items} item files, while reading one thread's detail per row would have \
-         been {per_thread_file_reads} reads in total"
+        item_files, 0,
+        "a page must not read the items directory at all: read {item_files} item files, \
+         while one pass over the directory would have been {total_items} and one detail \
+         read per row {per_thread_file_reads}"
     );
     assert!(
         rows.iter().all(|row| row["preview"]
             .as_str()
             .is_some_and(|preview| preview.contains(PREVIEW_TOKEN))),
-        "one pass must still fill every row's preview; got {listed}"
+        "reading each row's own turn must still fill every preview; got {listed}"
     );
     assert!(
         rows.iter()
@@ -11145,6 +11176,142 @@ async fn skills_endpoint_includes_enabled_field() -> Result<()> {
 }
 
 #[tokio::test]
+async fn unicode_skill_activation_matches_api_load_and_owned_lifecycle() -> Result<()> {
+    use crate::tools::spec::{ToolContext, ToolSpec as _};
+
+    let _env = lock_test_env();
+    let tmp = tempfile::tempdir()?;
+    let root = tmp.path().join("runtime");
+    let workspace = tmp.path().join("workspace");
+    let home = tmp.path().join("home");
+    fs::create_dir_all(&root)?;
+    fs::create_dir_all(&home)?;
+    let _home = EnvVarGuard::set("HOME", &home);
+    let _userprofile = EnvVarGuard::set("USERPROFILE", &home);
+    let _state_home = EnvVarGuard::set("CODEWHALE_HOME", &root);
+    let _config = EnvVarGuard::set("CODEWHALE_CONFIG_PATH", tmp.path().join("config.toml"));
+    crate::test_support::trust_workspace(&workspace);
+    let (original_dir, _) = create_managed_skill(&workspace, "技能")?;
+    create_managed_skill(&workspace, "分析")?;
+    create_managed_skill(&workspace, "skill")?;
+    let a = crate::skills::normalize_skill_name_for_lookup("技能");
+    let b = crate::skills::normalize_skill_name_for_lookup("分析");
+    assert_ne!(a, b);
+    let state_path = root.join("skills_state.toml");
+    let initial = b"disabled = [\"skill\"]\n";
+    fs::write(&state_path, initial)?;
+    let (addr, _threads, handle) = spawn_test_server_with_root_token_mobile_workspace(
+        root.clone(),
+        root.join("sessions"),
+        None,
+        false,
+        workspace.clone(),
+    )
+    .await?
+    .context("isolated skill API fixture requires loopback")?;
+    let client = crate::tls::reqwest_client();
+    let context =
+        ToolContext::new(&workspace).with_skills_config(workspace.join(".codewhale/skills"), false);
+    let tool = crate::tools::skill::LoadSkillTool;
+
+    let before: serde_json::Value = client
+        .get(format!("http://{addr}/v1/skills"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    for name in [a.as_str(), b.as_str(), "skill"] {
+        let entry = before["skills"]
+            .as_array()
+            .context("skills")?
+            .iter()
+            .find(|skill| skill["name"] == name)
+            .context("discovered identity")?;
+        assert_eq!(entry["enabled"], false);
+    }
+    assert!(
+        tool.execute(json!({"name":"技能"}), &context)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        fs::read(&state_path)?,
+        initial,
+        "listing/loading must not migrate state"
+    );
+
+    let raw_toggle = client
+        .post(format!("http://{addr}/v1/skills/技能"))
+        .json(&json!({"enabled":true}))
+        .send()
+        .await?;
+    assert_eq!(
+        raw_toggle.status(),
+        StatusCode::NOT_FOUND,
+        "toggle accepts exact catalog IDs only"
+    );
+    for name in [a.as_str(), "skill"] {
+        client
+            .post(format!("http://{addr}/v1/skills/{name}"))
+            .json(&json!({"enabled":true}))
+            .send()
+            .await?
+            .error_for_status()?;
+    }
+    let after: serde_json::Value = client
+        .get(format!("http://{addr}/v1/skills"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    for (name, enabled) in [(a.as_str(), true), (b.as_str(), false), ("skill", true)] {
+        let entry = after["skills"]
+            .as_array()
+            .context("skills")?
+            .iter()
+            .find(|skill| skill["name"] == name)
+            .context("discovered identity")?;
+        assert_eq!(entry["enabled"], enabled);
+    }
+    for name in [a.as_str(), "技能", "skill"] {
+        let loaded = tool.execute(json!({"name":name}), &context).await?;
+        assert!(loaded.success);
+    }
+    assert!(
+        tool.execute(json!({"name":"分析"}), &context)
+            .await
+            .is_err()
+    );
+    let audit: serde_json::Value = client
+        .get(format!("http://{addr}/v1/skills/{a}/audit"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(audit["skills"][0]["name"], a);
+    assert!(original_dir.join("SKILL.md").is_file());
+    assert!(
+        !workspace.join(".codewhale/skills").join(&a).exists(),
+        "no directory rename"
+    );
+    client
+        .delete(format!("http://{addr}/v1/skills/{a}?scope=project"))
+        .send()
+        .await?
+        .error_for_status()?;
+    assert!(
+        !original_dir.exists(),
+        "owned resolver must use the shared canonical identity"
+    );
+    assert!(workspace.join(".codewhale/skills/分析/SKILL.md").is_file());
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn skills_endpoint_exposes_safe_plugin_provenance_and_shared_toggle() -> Result<()> {
     let tmp = tempfile::tempdir()?;
     let root = tmp.path().join("runtime");
@@ -11267,6 +11434,7 @@ fn resolve_skills_scenario() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let workspace = tmp.path();
         let local_skills = workspace.join(".agents").join("skills");
+        crate::test_support::trust_workspace(workspace);
         fs::create_dir_all(&local_skills).expect("create skills dir");
 
         let config = Config::default();
@@ -11280,6 +11448,7 @@ fn resolve_skills_scenario() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let workspace = tmp.path();
         let local_skills = workspace.join("skills");
+        crate::test_support::trust_workspace(workspace);
         fs::create_dir_all(&local_skills).expect("create skills dir");
 
         let config = Config::default();
@@ -11296,6 +11465,7 @@ fn resolve_skills_scenario() {
         let codewhale_skills = workspace.join(".codewhale").join("skills");
         fs::create_dir_all(&agents_skills).expect("create agents skills dir");
         fs::create_dir_all(&codewhale_skills).expect("create codewhale skills dir");
+        crate::test_support::trust_workspace(workspace);
 
         let config = Config {
             skills: Some(crate::config::SkillsConfig {
@@ -11382,6 +11552,7 @@ fn skill_entry_is_bundled_requires_configured_bundle_path() {
     .expect("write override skill");
 
     let bundled_skill = crate::skills::Skill {
+        legacy_activation_name: None,
         name: "delegate".to_string(),
         description: String::new(),
         localized_descriptions: std::collections::HashMap::new(),
@@ -11392,6 +11563,7 @@ fn skill_entry_is_bundled_requires_configured_bundle_path() {
         source: crate::skills::SkillSource::Native,
     };
     let override_skill = crate::skills::Skill {
+        legacy_activation_name: None,
         name: "delegate".to_string(),
         description: String::new(),
         localized_descriptions: std::collections::HashMap::new(),
@@ -11444,6 +11616,47 @@ fn resolve_skills_dir_rejects_symlink_escaping_workspace() {
         config.skills_dir(),
         "with no valid in-workspace skills dir, resolution should fall back to config"
     );
+}
+
+/// An untrusted workspace's skill dirs must not become the resolved skills
+/// dir: discovery would search it and bypass the workspace-trust gate.
+#[test]
+fn resolve_skills_dir_ignores_untrusted_workspace_skills() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let _env_lock = crate::test_support::lock_test_env();
+    let _home = crate::test_support::EnvVarGuard::set("HOME", tmp.path());
+    let _userprofile = crate::test_support::EnvVarGuard::set("USERPROFILE", tmp.path());
+    let codewhale_only = Config {
+        skills: Some(crate::config::SkillsConfig {
+            scan_codewhale_only: Some(true),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    for (relative, config) in [
+        (".agents/skills", Config::default()),
+        ("skills", Config::default()),
+        (".codewhale/skills", codewhale_only),
+    ] {
+        let workspace = tmp
+            .path()
+            .join(format!("ws-{}", relative.replace('/', "-")));
+        let local_skills = workspace.join(relative);
+        fs::create_dir_all(&local_skills).expect("create skills dir");
+
+        assert_eq!(
+            resolve_skills_dir(&config, &workspace),
+            config.skills_dir(),
+            "untrusted {relative} must not be resolved as the skills dir"
+        );
+
+        crate::test_support::trust_workspace(&workspace);
+        assert_eq!(
+            resolve_skills_dir(&config, &workspace),
+            fs::canonicalize(&local_skills).expect("canonical skills"),
+            "trusted {relative} resolves as before"
+        );
+    }
 }
 
 #[cfg(unix)]
@@ -19719,9 +19932,23 @@ async fn provider_key_write_is_write_only_and_reports_readiness() -> Result<()> 
     let tmp = tempfile::tempdir()?;
     let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", tmp.path().join("cwhome"));
     let _backend = crate::test_support::EnvVarGuard::set("CODEWHALE_SECRET_BACKEND", "file");
+    let _cli_key = crate::test_support::EnvVarGuard::remove("CODEWHALE_CLI_API_KEY");
+    let _provider_keys: Vec<_> = ApiProvider::Deepseek
+        .env_vars()
+        .iter()
+        .copied()
+        .map(crate::test_support::EnvVarGuard::remove)
+        .collect();
     fs::create_dir_all(tmp.path().join("cwhome"))?;
     let workspace = tmp.path().join("workspace");
     fs::create_dir_all(&workspace)?;
+    let config_path = tmp.path().join("config.toml");
+    fs::write(
+        &config_path,
+        "provider = \"deepseek\"\n[providers.deepseek]\nbase_url = \"http://127.0.0.1:1/v1\"\n",
+    )?;
+    let secret_path = tmp.path().join("cwhome/secrets/secrets.json");
+    let live_config = Arc::new(parking_lot::RwLock::new(Config::default()));
 
     // No literal DeepSeek key in the live config: the older harness kept one
     // at the top level, where it silently outranked the store. Since #6394
@@ -19734,10 +19961,8 @@ async fn provider_key_write_is_write_only_and_reports_readiness() -> Result<()> 
             false,
             workspace.clone(),
             TestServerOverrides {
-                config: Some(
-                    Config::default()
-                        .with_legacy_root(None, Some("http://127.0.0.1:1/v1".to_string())),
-                ),
+                config_path: Some(config_path.clone()),
+                config_handle: Some(live_config.clone()),
                 ..TestServerOverrides::default()
             },
         )
@@ -19776,22 +20001,38 @@ async fn provider_key_write_is_write_only_and_reports_readiness() -> Result<()> 
         .status();
     assert_eq!(status, StatusCode::BAD_REQUEST);
 
-    // A key written for the *active* provider reports configured through the
-    // live store even though the test route is a keyless local endpoint —
-    // saving a key declares the api-key contract, exactly as `auth set` would.
-    let receipt: Value = client
-        .put(format!("{base}/v1/providers/deepseek/key"))
+    // An unsupported write is a client error before opening a secret backend
+    // or changing either config copy. No opaque setter error is reclassified.
+    let config_before = fs::read(&config_path)?;
+    assert!(!secret_path.exists());
+    let refused = client
+        .put(format!("{base}/v1/providers/openai-codex/key"))
         .bearer_auth("keys-token")
-        .json(&json!({ "key": "sk-test-active-route-key" }))
+        .json(&json!({ "key": "synthetic-unsupported-codex-key" }))
         .send()
-        .await?
-        .error_for_status()?
-        .json()
         .await?;
-    assert_eq!(receipt["provider"], "deepseek");
-    assert_eq!(receipt["stored"], true);
-    assert!(!receipt.to_string().contains("sk-test-active-route-key"));
-    assert_eq!(receipt["credentialState"], "configured");
+    assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+    let refused: Value = refused.json().await?;
+    assert_eq!(
+        refused["error"]["message"],
+        codewhale_config::credentials::OPENAI_CODEX_API_KEY_REFUSAL
+    );
+    assert!(
+        !refused
+            .to_string()
+            .contains("synthetic-unsupported-codex-key")
+    );
+    assert_eq!(fs::read(&config_path)?, config_before);
+    assert!(!secret_path.exists());
+    {
+        let live = live_config.read();
+        assert_eq!(live.auth_mode, None);
+        assert_eq!(
+            live.provider_config_for(ApiProvider::OpenaiCodex)
+                .and_then(|entry| entry.auth_mode.as_deref()),
+            None
+        );
+    }
 
     // A key written for a *non-active* provider is the harder case: the
     // readiness catalog only probes the secret store for it when the
@@ -19829,6 +20070,96 @@ async fn provider_key_write_is_write_only_and_reports_readiness() -> Result<()> 
         .find(|p| p["id"] == "openai")
         .expect("openai is listed");
     assert_eq!(openai["credentialState"], "configured");
+
+    // Before the active provider has a saved key, its local route must stay
+    // keyless. An unconditional live root marker changes this to "missing".
+    let deepseek = providers["providers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["id"] == "deepseek")
+        .expect("deepseek is listed");
+    assert_eq!(deepseek["credentialState"], "local");
+    {
+        let live = live_config.read();
+        assert_eq!(live.auth_mode, None);
+        assert_eq!(
+            live.provider_config_for(ApiProvider::Deepseek)
+                .and_then(|entry| entry.auth_mode.as_deref()),
+            None
+        );
+        assert_eq!(
+            live.provider_config_for(ApiProvider::Openai)
+                .and_then(|entry| entry.auth_mode.as_deref()),
+            Some("api_key")
+        );
+    }
+    let saved = codewhale_config::ConfigStore::load(Some(config_path.clone()))?;
+    assert_eq!(saved.config.auth_mode, None);
+    assert_eq!(
+        saved.config.providers.openai.auth_mode.as_deref(),
+        Some("api_key")
+    );
+    assert_eq!(saved.config.providers.openai_codex.auth_mode, None);
+
+    // A key written for the *active* provider reports configured through the
+    // live store even though the test route is a keyless local endpoint —
+    // saving a key declares the api-key contract, exactly as `auth set` would.
+    let receipt: Value = client
+        .put(format!("{base}/v1/providers/deepseek/key"))
+        .bearer_auth("keys-token")
+        .json(&json!({ "key": "sk-test-active-route-key" }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(receipt["provider"], "deepseek");
+    assert_eq!(receipt["stored"], true);
+    assert!(!receipt.to_string().contains("sk-test-active-route-key"));
+    assert_eq!(receipt["credentialState"], "configured");
+
+    {
+        let live = live_config.read();
+        assert_eq!(live.auth_mode.as_deref(), Some("api_key"));
+        assert_eq!(
+            live.provider_config_for(ApiProvider::Deepseek)
+                .and_then(|entry| entry.auth_mode.as_deref()),
+            Some("api_key")
+        );
+    }
+    let saved = codewhale_config::ConfigStore::load(Some(config_path.clone()))?;
+    assert_eq!(saved.config.auth_mode.as_deref(), Some("api_key"));
+    assert_eq!(
+        saved.config.providers.deepseek.auth_mode.as_deref(),
+        Some("api_key")
+    );
+
+    // A real backend read failure still reports a server error and leaves
+    // the last committed metadata and damaged backend bytes untouched.
+    let config_before = fs::read(&config_path)?;
+    fs::write(&secret_path, b"not valid secret-store JSON")?;
+    let failed = client
+        .put(format!("{base}/v1/providers/openrouter/key"))
+        .bearer_auth("keys-token")
+        .json(&json!({ "key": "synthetic-failed-storage-key" }))
+        .send()
+        .await?;
+    assert_eq!(failed.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let failed = failed.text().await?;
+    assert!(failed.contains("credential write failed"));
+    assert!(!failed.contains("synthetic-failed-storage-key"));
+    assert_eq!(fs::read(&config_path)?, config_before);
+    assert_eq!(fs::read(&secret_path)?, b"not valid secret-store JSON");
+    {
+        let live = live_config.read();
+        assert_eq!(live.auth_mode.as_deref(), Some("api_key"));
+        assert_eq!(
+            live.provider_config_for(ApiProvider::Openrouter)
+                .and_then(|entry| entry.auth_mode.as_deref()),
+            None
+        );
+    }
 
     handle.abort();
     Ok(())
@@ -23082,6 +23413,7 @@ mod thread_snapshot_ownership {
                     Message {
                         role: Role::Assistant,
                         content: vec![ContentBlock::ToolUse {
+                            execution_id: None,
                             id: "call_legacy".to_string(),
                             name: "write_file".to_string(),
                             input: json!({ "path": "legacy.txt", "content": "x" }),
@@ -23523,6 +23855,133 @@ api_key = "sk-or-test"
     assert_eq!(status, StatusCode::OK, "body: {back}");
     assert_eq!(back["model"].as_str(), Some("gpui-fixture"), "body: {back}");
 
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn session_export_keeps_execution_identity_and_rejects_invalid_item_correlation() -> Result<()>
+{
+    let _env = lock_test_env();
+    let dir = tempfile::tempdir()?;
+    let _home = EnvVarGuard::set("CODEWHALE_HOME", dir.path());
+    let root = dir.path().join("server");
+    let sessions = dir.path().join("sessions");
+    let (addr, runtime, handle) = spawn_test_server_with_root(root.clone(), sessions.clone())
+        .await?
+        .context("execution identity export requires the local API fixture")?;
+    let thread = runtime.create_thread(Default::default()).await?;
+    let original: Vec<Message> = serde_json::from_value(json!([
+        {"role":"user","content":[{"type":"text","text":"export exact executions"}]},
+        {"role":"assistant","content":[{"type":"tool_use","id":"same-wire","execution_id":"host-first","name":"read_file","input":{"path":"one"},"caller":{"type":"subagent","tool_id":"parent"},"thought_signature":"signature"}]},
+        {"role":"user","content":[{"type":"tool_result","tool_use_id":"same-wire","execution_id":"host-first","content":"one","content_blocks":[{"type":"text","text":"rich"}]}]},
+        {"role":"assistant","content":[{"type":"tool_use","id":"same-wire","execution_id":"host-second","name":"read_file","input":{"path":"two"}}]},
+        {"role":"user","content":[{"type":"tool_result","tool_use_id":"same-wire","execution_id":"host-second","content":"two"}]}
+    ]))?;
+    runtime
+        .seed_thread_from_messages(&thread.id, &original)
+        .await?;
+    let detail = runtime.get_thread_detail(&thread.id).await?;
+    assert_eq!(messages_from_thread_detail(&detail)?, original);
+
+    // A completed live item contains both sides. It must not become only a
+    // result when the same thread is saved through the API's projection.
+    let mut coalesced = detail.clone();
+    let result_index = coalesced
+        .items
+        .iter()
+        .position(|item| {
+            item.metadata
+                .as_ref()
+                .is_some_and(|m| m["tool_result_for"] == "host-first")
+        })
+        .context("result item")?;
+    let result_item = coalesced.items.remove(result_index);
+    let call = coalesced
+        .items
+        .iter_mut()
+        .find(|item| {
+            item.metadata
+                .as_ref()
+                .is_some_and(|m| m["tool_use_id"] == "host-first")
+        })
+        .context("call item")?;
+    let metadata = call.metadata.as_mut().unwrap();
+    metadata["tool_input"] = json!(call.detail.clone().unwrap());
+    metadata["tool_result_for"] = json!("host-first");
+    metadata["content_blocks"] = result_item.metadata.as_ref().unwrap()["content_blocks"].clone();
+    call.detail = result_item.detail;
+    for turn in &mut coalesced.turns {
+        turn.item_ids.retain(|id| id != &result_item.id);
+    }
+    assert_eq!(messages_from_thread_detail(&coalesced)?, original);
+
+    let client = crate::tls::reqwest_client();
+    let exported = client
+        .post(format!("http://{addr}/v1/sessions"))
+        .json(&json!({"thread_id":thread.id}))
+        .send()
+        .await?;
+    assert_eq!(exported.status(), StatusCode::CREATED);
+    let exported: Value = exported.json().await?;
+    let id = exported["session_id"].as_str().context("session id")?;
+    let manager = crate::session_manager::SessionManager::new(sessions.clone())?;
+    let saved = manager.load_session(id)?;
+    assert_eq!(saved.messages, original);
+    assert_eq!(
+        saved.journal.as_ref().context("journal")?.to_messages(),
+        original
+    );
+    let display: Value = client
+        .get(format!("http://{addr}/v1/sessions/{id}"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert!(
+        display["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|m| m["content"].as_array().unwrap())
+            .all(|block| block.get("execution_id").is_none()),
+        "detail stays display-only"
+    );
+
+    // Corrupt an identity in the existing durable record. The export must
+    // report the error, without overwriting its prior valid saved document.
+    let mut broken = detail
+        .items
+        .iter()
+        .find(|item| {
+            item.metadata
+                .as_ref()
+                .is_some_and(|m| m["tool_use_id"] == "host-first")
+        })
+        .context("first call")?
+        .clone();
+    broken.metadata.as_mut().unwrap()["execution_id"] = json!("");
+    fs::write(
+        root.join("runtime/runtime/items")
+            .join(format!("{}.json", broken.id)),
+        serde_json::to_vec(&broken)?,
+    )?;
+    let saved_path = sessions.join(format!("{id}.json"));
+    let before = fs::read(&saved_path)?;
+    let refused = client
+        .post(format!("http://{addr}/v1/sessions"))
+        .json(&json!({"thread_id":thread.id}))
+        .send()
+        .await?;
+    assert_eq!(refused.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(
+        refused
+            .text()
+            .await?
+            .contains("Invalid stored tool execution identity")
+    );
+    assert_eq!(fs::read(saved_path)?, before);
     handle.abort();
     Ok(())
 }

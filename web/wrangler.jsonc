@@ -33,9 +33,17 @@
       "id": "a2e6f324db9b4b03bbc940a4ba246985"
     }
   ],
+  "durable_objects": {
+    "bindings": [
+      { "name": "DRAFT_CLAIM_LOCK", "class_name": "DraftClaimLock" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["DraftClaimLock"] }
+  ],
   "vars": {
     "GITHUB_REPO": "Hmbown/CodeWhale",
-    "DEEPSEEK_MODEL": "deepseek-v4-flash",
+    "DEEPSEEK_MODEL": "deepseek-flash",
     "DEEPSEEK_BASE_URL": "https://gateway.ai.cloudflare.com/v1/cf50f793171d7cb3b2ce23368b69cdcb/codewhale-web/deepseek",
     "SUPABASE_URL": "https://mungbvkvpkxbkjzspehg.supabase.co"
   },

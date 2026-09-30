@@ -8,7 +8,7 @@ use regex::Regex;
 /// `pattern` compiled once as an anchored `*`-glob, then reused.
 ///
 /// Every other regex metacharacter is escaped, so `*` is the only wildcard
-/// (matching any run of characters, newline included). `None` means the pattern
+/// (matching any run of characters within one line). `None` means the pattern
 /// does not compile; callers treat that as "no match".
 ///
 /// The patterns come from configuration and are stable between edits, but the

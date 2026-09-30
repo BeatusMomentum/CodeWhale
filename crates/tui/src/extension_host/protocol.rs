@@ -435,6 +435,7 @@ pub struct ToolCallParams {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum CoreRequest {
+    Ping,
     Initialize(InitializeParams),
     /// Production relies on stdin EOF at process exit (the host is shared by
     /// every engine in the process); the bounded shutdown is test-driven.
@@ -449,6 +450,7 @@ impl CoreRequest {
     #[must_use]
     pub fn method(&self) -> &'static str {
         match self {
+            Self::Ping => "host/ping",
             Self::Initialize(_) => "host/initialize",
             #[cfg(test)]
             Self::Shutdown => "host/shutdown",
@@ -461,6 +463,7 @@ impl CoreRequest {
     #[must_use]
     pub fn params(&self) -> Value {
         match self {
+            Self::Ping => json!({}),
             Self::Initialize(p) => to_value(p),
             #[cfg(test)]
             Self::Shutdown => json!({}),
@@ -549,6 +552,10 @@ pub fn parse_core_message(value: Value) -> Result<CoreMessage, ProtocolError> {
     let request = match method.as_str() {
         "host/initialize" => CoreRequest::Initialize(params(&method, p)?),
         "host/shutdown" => CoreRequest::Shutdown,
+        "host/ping" => {
+            let _: serde_json::Map<String, Value> = params(&method, p)?;
+            CoreRequest::Ping
+        }
         "ext/activate" => CoreRequest::Activate(params(&method, p)?),
         "ext/deactivate" => CoreRequest::Deactivate(params(&method, p)?),
         "tool/call" => CoreRequest::ToolCall(params(&method, p)?),

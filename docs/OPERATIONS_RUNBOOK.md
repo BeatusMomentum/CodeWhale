@@ -1,5 +1,7 @@
 # codewhale Operations Runbook
 
+> 阅读简体中文版：[zh_hans/OPERATIONS_RUNBOOK.md](zh_hans/OPERATIONS_RUNBOOK.md)。
+
 This runbook covers practical debugging and incident response for the local CLI/TUI runtime.
 
 ## Quick Triage

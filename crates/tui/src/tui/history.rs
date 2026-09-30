@@ -2646,7 +2646,10 @@ fn render_error_message(
     let body_style = error_body_style(severity);
     let prefix_width = UnicodeWidthStr::width(label);
     let content_width = width.saturating_sub(2 + prefix_width as u16).max(1);
-    let mut lines = wrap_plain_line(message, body_style, content_width);
+    let mut lines: Vec<_> = message
+        .split('\n')
+        .flat_map(|line| wrap_plain_line(line, body_style, content_width))
+        .collect();
     if let Some(first) = lines.get_mut(0) {
         first.spans.insert(0, Span::raw(" "));
         first.spans.insert(0, Span::styled(label, label_style));

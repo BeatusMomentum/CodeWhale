@@ -1,4 +1,4 @@
-<!-- source: README.md sha256:ccb7a0b00317 -->
+<!-- source: README.md sha256:925619135f77 -->
 # Codewhale
 
 Codewhale, seçtiğiniz barındırılan veya yerel bir modeli kullanarak projenizi okuyan, dosyaları düzenleyen, komutları çalıştıran ve yaptığı işi kontrol eden açık kaynaklı bir ajandır. Terminalde tek bir görevle başlayın. Daha büyük bir işte, işin bölümlerini farklı model ve rollere sahip ajanlara verin.
@@ -23,6 +23,8 @@ curl -fsSL https://codewhale.net/install.sh | sh
 "$HOME/.local/bin/codewhale"
 ```
 
+Yalnızca `codewhale` yazdığınızda "command not found" hatası alıyorsanız `~/.local/bin` henüz PATH’inizde değildir: yükleyicinin kabuğunuz için yazdırdığı tek satırı çalıştırın veya [PATH’e ekleme](docs/INSTALL.md#put-it-on-your-path) bölümüne bakın.
+
 Yükleyici, yayımlanmış en son sürümü seçer. [Değişiklik günlüğü](CHANGELOG.md), bir sonraki sürümün henüz yayımlanmamış adayını da açıklar; bu değişiklikler, sürüm kullanıma sunulana kadar yayımlanmış indirmelere dahil edilmez.
 
 Windows’ta [GitHub Releases](https://github.com/Hmbown/CodeWhale/releases/latest) üzerinden uygun yükleyiciyi veya arşivi indirin. Mevcut doğrudan kurulumu güncellemek için `codewhale update`, yalnızca kontrol etmek için `codewhale update --check` çalıştırın. Güncelleyici çalıştırılabilir dosyanın yolunu gösterir ve daha yeni derlemeleri korur. npm ve Cargo ikincil paketleme seçenekleridir. Paket yöneticisinden geçiş ve PATH ayarları için [kurulum kılavuzuna](docs/INSTALL.md) bakın.
@@ -33,7 +35,7 @@ Her kabukta Tab tamamlama tek bir komutla etkinleştirilir — `codewhale comple
 
 ## Kullanım
 
-Proje klasörünüzde bir terminal açın ve `codewhale` komutunu çalıştırın. `/provider` ile sağlayıcınızı, `/model` ile modelinizi seçin. Ardından somut bir görev tarif edin:
+Proje klasörünüzde bir terminal açın ve `codewhale` komutunu çalıştırın ([PATH’inizde](docs/INSTALL.md#put-it-on-your-path) olduktan sonra). `/provider` ile sağlayıcınızı, `/model` ile modelinizi seçin. Ardından somut bir görev tarif edin:
 
 ```text
 Fix the failing tests and explain what changed.
@@ -76,6 +78,7 @@ Politikaların kesin sıralaması için [yetkilendirme sırasını](docs/AUTHORI
 
 ## Belgeler
 
+- [GitHub PR inceleme kurulumu](docs/GITHUB_ACTION.md)
 - [Sağlayıcılar ve yerel modeller](docs/PROVIDERS.md)
 - [Ajan ekipleri](docs/FLEET.md)
 - [MCP](docs/MCP.md), [hook’lar](docs/HOOKS.md) ve [yapılandırma](docs/CONFIGURATION.md)

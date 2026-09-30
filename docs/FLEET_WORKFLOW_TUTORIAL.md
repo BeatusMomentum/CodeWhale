@@ -1,5 +1,7 @@
 # Fleet + Workflow Tutorial
 
+> 阅读简体中文版：[zh_hans/FLEET_WORKFLOW_TUTORIAL.md](zh_hans/FLEET_WORKFLOW_TUTORIAL.md)。
+
 Fleet and Workflow are meant to work together, but they solve different parts
 of the problem:
 

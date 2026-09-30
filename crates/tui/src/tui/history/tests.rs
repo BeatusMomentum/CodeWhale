@@ -1530,6 +1530,30 @@ fn error_severity_ranks_stay_visually_distinguishable() {
     assert_eq!(body_fg, error_fg);
 }
 
+#[test]
+fn error_guidance_keeps_recovery_commands_on_their_own_line() {
+    let cell = HistoryCell::Error {
+        message: "DeepSeek API key not found.\nSave it:\n  codewhale auth set --provider deepseek"
+            .to_string(),
+        severity: crate::error_taxonomy::ErrorSeverity::Error,
+    };
+    for width in [80, 140] {
+        let lines = cell.lines(width);
+        let command_line = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .find(|line| line.contains("codewhale auth set --provider deepseek"))
+            .expect("recovery command stays intact");
+        assert!(!command_line.contains('\n'), "{command_line:?}");
+        assert!(!command_line.contains("Save it:"), "{command_line:?}");
+    }
+}
+
 /// A multiline failure can run past the bottom of the terminal while its full
 /// text stays in history. The live cell advertises the pager; the pager and the
 /// transcript must carry the recovery instruction verbatim and must not
@@ -2087,6 +2111,7 @@ fn replay_routes_repair_receipts_and_plan_calls_to_typed_cells() {
     let plan = Message {
         role: Role::Assistant,
         content: vec![ContentBlock::ToolUse {
+            execution_id: None,
             id: "plan-1".to_string(),
             name: "update_plan".to_string(),
             input: serde_json::json!({

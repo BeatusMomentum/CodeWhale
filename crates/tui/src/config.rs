@@ -1756,6 +1756,18 @@ pub struct RetryConfig {
     pub initial_delay: Option<f64>,
     pub max_delay: Option<f64>,
     pub exponential_base: Option<f64>,
+    /// #6700: randomize each backoff delay by `jitter_factor`. Default `true`.
+    #[serde(default)]
+    pub jitter: Option<bool>,
+    /// #6700: jitter spread as a fraction of the delay (`0.1` = ±10%).
+    /// Default `0.1`; values clamp to `0.0..=1.0`, non-finite values use the
+    /// default.
+    #[serde(default)]
+    pub jitter_factor: Option<f64>,
+    /// #6700: honor a server `Retry-After` header instead of the computed
+    /// backoff. Default `true`.
+    #[serde(default)]
+    pub respect_retry_after: Option<bool>,
 }
 
 /// Deserialize `status_items` tolerantly: skip keys unknown to this build
@@ -1778,6 +1790,29 @@ where
             })
             .collect()
     }))
+}
+
+/// Canonical model-stream and transport settings. The existing `Config`
+/// accessors own resolution; `[tui]` spellings remain read-only compatibility.
+/// Transport changes apply to newly constructed clients, not active requests.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct StreamConfig {
+    pub open_timeout_secs: Option<u64>,
+    pub chunk_timeout_secs: Option<u64>,
+    pub force_http1: Option<bool>,
+    pub max_resumes: Option<u32>,
+    pub max_transparent_retries: Option<u32>,
+    pub max_stream_errors: Option<u32>,
+    pub max_duration_secs: Option<u64>,
+    pub max_content_mb: Option<u64>,
+    pub connect_timeout_secs: Option<u64>,
+    /// Omitted keeps 30 seconds; zero disables TCP keepalive.
+    pub tcp_keepalive_secs: Option<u64>,
+    /// Omitted keeps 15 seconds; zero disables HTTP/2 PINGs.
+    pub http2_keep_alive_interval_secs: Option<u64>,
+    /// Omitted or zero keeps the 20-second PING acknowledgement deadline.
+    pub http2_keep_alive_timeout_secs: Option<u64>,
 }
 
 /// UI configuration loaded from config files.
@@ -1811,6 +1846,30 @@ pub struct TuiConfig {
     /// seconds. Omitted or `0` resolve to the default (1800); explicit
     /// values clamp to `10..=86_400`.
     pub stream_max_duration_secs: Option<u64>,
+    /// #6700: whole-request re-issues after a failed stream — a stream that
+    /// never opened (#6699), died before content, or dropped mid-stream.
+    /// Omitted resolves to the default (3); `0` disables them; values clamp
+    /// to `0..=10`.
+    pub stream_max_resumes: Option<u32>,
+    /// #6700: in-stream re-requests while nothing has streamed yet (#103).
+    /// Omitted resolves to the default (2); `0` disables them; values clamp
+    /// to `0..=10`.
+    pub stream_max_transparent_retries: Option<u32>,
+    /// #6700: recoverable errors tolerated within one stream before it
+    /// ends. Omitted or `0` resolves to the default (5); other values clamp
+    /// to `1..=50`.
+    pub stream_max_errors: Option<u32>,
+    /// #6700: wait for SSE response headers, in seconds. Omitted or `0`
+    /// fall back to `CODEWHALE_STREAM_OPEN_TIMEOUT_SECS`, then 45; values
+    /// clamp to `5..=300`.
+    pub stream_open_timeout_secs: Option<u64>,
+    /// #6700: TCP/TLS connect timeout for the model HTTP client, in seconds.
+    /// Omitted or `0` resolve to the default (30); values clamp to `1..=300`.
+    pub connect_timeout_secs: Option<u64>,
+    /// #6700: pin the model HTTP client to HTTP/1.1 (config form of
+    /// `CODEWHALE_FORCE_HTTP1`). Omitted or `false` leaves HTTP/2 on unless
+    /// the env var is truthy; either one pins.
+    pub force_http1: Option<bool>,
     /// Ordered list of footer items the user wants visible. `None` (the field
     /// missing from `config.toml`) means "use the built-in default order"; an
     /// empty `Some(vec![])` means "show nothing in the footer".
@@ -2330,6 +2389,9 @@ pub struct RetryPolicy {
     pub initial_delay: f64,
     pub max_delay: f64,
     pub exponential_base: f64,
+    pub jitter: bool,
+    pub jitter_factor: f64,
+    pub respect_retry_after: bool,
 }
 
 /// Context management configuration.
@@ -3072,6 +3134,7 @@ pub struct Config {
     #[serde(alias = "maxSubagents")]
     pub max_subagents: Option<usize>,
     pub retry: Option<RetryConfig>,
+    pub stream: Option<StreamConfig>,
     pub features: Option<FeaturesToml>,
     /// Experimental TypeScript extension host settings.
     #[serde(default)]
@@ -5132,10 +5195,7 @@ impl Config {
                 .and_then(|providers| providers.custom_provider_config(provider))
                 .is_none()
         {
-            anyhow::bail!(
-                "Invalid provider '{provider}': expected {}.",
-                ApiProvider::names_hint()
-            );
+            return Err(invalid_provider_diagnostic(provider).into());
         }
         let active_provider = self.api_provider();
         match validate_kimi_code_api_model_id(
@@ -5191,37 +5251,53 @@ impl Config {
             } else {
                 format!(" (for example: {})", known.join(", "))
             };
-            anyhow::bail!(
-                "Invalid configured model '{model}' for provider '{}': expected auto or a model ID this provider serves{hint}.",
-                provider.as_str()
-            );
+            return Err(SafeConfigDiagnostic::invalid_value(
+                "model",
+                model,
+                &format!(
+                    "auto or a model ID provider '{}' serves{hint}",
+                    provider.as_str()
+                ),
+                user_config_fix("model", "auto", Some("a *_MODEL environment variable")),
+            )
+            .into());
         }
-        if let Some(policy) = self.approval_policy.as_deref() {
-            let normalized = policy.trim().to_ascii_lowercase();
-            if !matches!(
-                normalized.as_str(),
-                "on-request" | "untrusted" | "never" | "auto" | "suggest"
-            ) {
-                anyhow::bail!(
-                    "Invalid approval_policy '{policy}': expected on-request, untrusted, never, auto, or suggest."
-                );
-            }
-        }
-        if let Some(v) = self.verbosity.as_deref() {
-            let normalized = v.trim().to_ascii_lowercase();
-            if !matches!(normalized.as_str(), "normal" | "concise") {
-                anyhow::bail!("Invalid verbosity '{v}': expected normal or concise.");
-            }
-        }
-        if let Some(mode) = self.sandbox_mode.as_deref() {
-            let normalized = mode.trim().to_ascii_lowercase();
-            if !matches!(
-                normalized.as_str(),
-                "read-only" | "workspace-write" | "danger-full-access" | "external-sandbox"
-            ) {
-                anyhow::bail!(
-                    "Invalid sandbox_mode '{mode}': expected read-only, workspace-write, danger-full-access, or external-sandbox."
-                );
+        // One vocabulary with `codewhale config set`, which refuses the same
+        // values before writing them (`codewhale_config::config_toml_choices`).
+        for (key, value, replacement, env_var) in [
+            (
+                "approval_policy",
+                self.approval_policy.as_deref(),
+                "on-request",
+                Some("CODEWHALE_APPROVAL_POLICY"),
+            ),
+            ("verbosity", self.verbosity.as_deref(), "normal", None),
+            (
+                "sandbox_mode",
+                self.sandbox_mode.as_deref(),
+                "workspace-write",
+                Some("CODEWHALE_SANDBOX_MODE"),
+            ),
+        ] {
+            let (Some(value), Some(choices)) = (value, codewhale_config::config_toml_choices(key))
+            else {
+                continue;
+            };
+            if !choices.contains(&value.trim().to_ascii_lowercase().as_str()) {
+                let expected = match choices.split_last() {
+                    Some((last, [])) => (*last).to_string(),
+                    Some((last, [only])) => format!("{only} or {last}"),
+                    Some((last, rest)) => format!("{}, or {last}", rest.join(", ")),
+                    None => String::new(),
+                };
+                let displayed_value = codewhale_secrets::redact::redact_secrets(value);
+                return Err(SafeConfigDiagnostic::invalid_value(
+                    key,
+                    &displayed_value,
+                    &expected,
+                    user_config_fix(key, replacement, env_var),
+                )
+                .into());
             }
         }
         if let Some(tui) = &self.tui
@@ -5229,9 +5305,13 @@ impl Config {
         {
             let mode = mode.to_ascii_lowercase();
             if !matches!(mode.as_str(), "auto" | "always" | "never") {
-                anyhow::bail!(
-                    "Invalid tui.alternate_screen '{mode}': expected auto, always, or never."
-                );
+                return Err(SafeConfigDiagnostic::invalid_value(
+                    "tui.alternate_screen",
+                    &mode,
+                    "auto, always, or never",
+                    user_config_fix("tui.alternate_screen", "auto", None),
+                )
+                .into());
             }
         }
         if let Some(transcript) = &self.transcript
@@ -5544,6 +5624,29 @@ impl Config {
             identity.migrated_legacy_ollama_cloud_route = false;
         }
         Ok(identity)
+    }
+
+    /// Resolve a provider a user is selecting now (`codewhale config set
+    /// provider <name>`). A name that is neither a built-in provider nor a
+    /// configured table is a typo, not a saved session missing its route, so
+    /// it gets config validation's wording instead of the resume wording.
+    pub(crate) fn resolve_provider_selection_identity(
+        &self,
+        provider_id: &str,
+    ) -> std::result::Result<ProviderIdentity, String> {
+        let requested = provider_id.trim();
+        if !requested.is_empty()
+            && ApiProvider::parse(requested).is_none()
+            && !requested.eq_ignore_ascii_case(ApiProvider::Custom.as_str())
+            && self
+                .providers
+                .as_ref()
+                .and_then(|providers| providers.custom_provider_config(requested))
+                .is_none()
+        {
+            return Err(invalid_provider_message(requested));
+        }
+        self.resolve_provider_pin_identity(provider_id)
     }
 
     /// Resolve an additive exact provider id. Unlike raw selector resolution,
@@ -7264,21 +7367,9 @@ impl Config {
                     .credential_url()
                     .unwrap_or("https://app.codewhale.net/settings?section=api")
             ),
-            ApiProvider::Deepseek | ApiProvider::DeepseekCN => anyhow::bail!(
-                "DeepSeek API key not found.\n\
-                 \n\
-                 1. Get a key:  https://platform.deepseek.com/api_keys\n\
-                 2. Save it (works in every folder, no OS prompts):\n\
-                        codewhale auth set --provider deepseek\n\
-                 \n\
-                 Alternatives:\n\
-                   • export DEEPSEEK_API_KEY=<your-key>      (current shell only;\n\
-                     also note: zsh users — exports in ~/.zshrc only reach interactive\n\
-                     shells, prefer ~/.zshenv for everything)\n\
-                   • api_key = \"<your-key>\"  in ~/.codewhale/config.toml\n\
-                   • already configured DeepSeek Harness? grant read-only access:\n\
-                        codewhale auth external-consent --provider deepseek --mode read-only"
-            ),
+            ApiProvider::Deepseek | ApiProvider::DeepseekCN => {
+                anyhow::bail!(deepseek_missing_key_message())
+            }
             ApiProvider::SiliconflowCn => anyhow::bail!(
                 "SiliconFlow China API key not found. Get a key: {}. Run 'codewhale auth set --provider siliconflow-CN', \
                  set {}, or add [{}] api_key in ~/.codewhale/config.toml. \
@@ -7937,7 +8028,7 @@ impl Config {
 
     /// Resolved per-SSE-chunk idle timeout in seconds.
     ///
-    /// Reads `[tui].stream_chunk_timeout_secs`, falling back to the
+    /// Reads `[stream].chunk_timeout_secs`, then legacy `[tui]`, then the
     /// `CODEWHALE_STREAM_IDLE_TIMEOUT_SECS` env var (legacy alias:
     /// `DEEPSEEK_STREAM_IDLE_TIMEOUT_SECS`) when the config key is
     /// omitted. `None` or `0` resolve to the default 900 seconds; explicit
@@ -7945,9 +8036,14 @@ impl Config {
     #[must_use]
     pub fn stream_chunk_timeout_secs(&self) -> u64 {
         let raw = self
-            .tui
+            .stream
             .as_ref()
-            .and_then(|cfg| cfg.stream_chunk_timeout_secs)
+            .and_then(|cfg| cfg.chunk_timeout_secs)
+            .or_else(|| {
+                self.tui
+                    .as_ref()
+                    .and_then(|cfg| cfg.stream_chunk_timeout_secs)
+            })
             .or_else(|| {
                 std::env::var(STREAM_CHUNK_TIMEOUT_ENV)
                     .or_else(|_| std::env::var(LEGACY_STREAM_CHUNK_TIMEOUT_ENV))
@@ -8003,7 +8099,10 @@ impl Config {
     #[must_use]
     pub fn stream_max_content_bytes(&self) -> usize {
         crate::core::engine::turn_budget::resolve_stream_max_content_bytes(
-            self.tui.as_ref().and_then(|cfg| cfg.stream_max_content_mb),
+            self.stream
+                .as_ref()
+                .and_then(|cfg| cfg.max_content_mb)
+                .or_else(|| self.tui.as_ref().and_then(|cfg| cfg.stream_max_content_mb)),
         )
     }
 
@@ -8012,11 +8111,132 @@ impl Config {
     pub fn stream_max_duration(&self) -> std::time::Duration {
         std::time::Duration::from_secs(
             crate::core::engine::turn_budget::resolve_stream_max_duration_secs(
-                self.tui
+                self.stream
                     .as_ref()
-                    .and_then(|cfg| cfg.stream_max_duration_secs),
+                    .and_then(|cfg| cfg.max_duration_secs)
+                    .or_else(|| {
+                        self.tui
+                            .as_ref()
+                            .and_then(|cfg| cfg.stream_max_duration_secs)
+                    }),
             ),
         )
+    }
+
+    /// Resolved `[stream]` retry budgets, falling back to legacy `[tui]` keys.
+    #[must_use]
+    pub fn stream_retry_limits(&self) -> crate::core::engine::turn_budget::StreamRetryLimits {
+        let tui = self.tui.as_ref();
+        let stream = self.stream.as_ref();
+        crate::core::engine::turn_budget::resolve_stream_retry_limits(
+            stream
+                .and_then(|cfg| cfg.max_resumes)
+                .or_else(|| tui.and_then(|cfg| cfg.stream_max_resumes)),
+            stream
+                .and_then(|cfg| cfg.max_transparent_retries)
+                .or_else(|| tui.and_then(|cfg| cfg.stream_max_transparent_retries)),
+            stream
+                .and_then(|cfg| cfg.max_stream_errors)
+                .or_else(|| tui.and_then(|cfg| cfg.stream_max_errors)),
+        )
+    }
+
+    /// #6700: resolved wait for SSE response headers.
+    #[must_use]
+    pub fn stream_open_timeout(&self) -> std::time::Duration {
+        crate::client::resolve_stream_open_timeout(
+            self.stream
+                .as_ref()
+                .and_then(|cfg| cfg.open_timeout_secs)
+                .or_else(|| {
+                    self.tui
+                        .as_ref()
+                        .and_then(|cfg| cfg.stream_open_timeout_secs)
+                }),
+        )
+    }
+
+    /// #6700: whether the model HTTP client is pinned to HTTP/1.1 —
+    /// `[stream].force_http1` (legacy `[tui]` fallback), OR the environment pin.
+    #[must_use]
+    pub fn force_http1(&self) -> bool {
+        self.stream
+            .as_ref()
+            .and_then(|cfg| cfg.force_http1)
+            .or_else(|| self.tui.as_ref().and_then(|cfg| cfg.force_http1))
+            .unwrap_or(false)
+            || crate::client::force_http1_from_env()
+    }
+
+    /// #6700: resolved TCP/TLS connect timeout for the model HTTP client.
+    #[must_use]
+    pub fn connect_timeout(&self) -> std::time::Duration {
+        let secs = match self
+            .stream
+            .as_ref()
+            .and_then(|cfg| cfg.connect_timeout_secs)
+            .or_else(|| self.tui.as_ref().and_then(|cfg| cfg.connect_timeout_secs))
+        {
+            None | Some(0) => DEFAULT_CONNECT_TIMEOUT_SECS,
+            Some(secs) => secs.clamp(MIN_CONNECT_TIMEOUT_SECS, MAX_CONNECT_TIMEOUT_SECS),
+        };
+        std::time::Duration::from_secs(secs)
+    }
+
+    /// TCP keepalive idle time. Zero disables; positive values clamp to 1..=3600.
+    pub fn tcp_keepalive(&self) -> Option<std::time::Duration> {
+        let secs = self
+            .stream
+            .as_ref()
+            .and_then(|cfg| cfg.tcp_keepalive_secs)
+            .unwrap_or(30);
+        (secs > 0).then(|| std::time::Duration::from_secs(secs.min(3600)))
+    }
+
+    /// HTTP/2 PING interval for active connections (not idle pooled connections).
+    pub fn http2_keep_alive_interval(&self) -> Option<std::time::Duration> {
+        let secs = self
+            .stream
+            .as_ref()
+            .and_then(|cfg| cfg.http2_keep_alive_interval_secs)
+            .unwrap_or(15);
+        (secs > 0).then(|| std::time::Duration::from_secs(secs.min(3600)))
+    }
+
+    pub fn http2_keep_alive_timeout(&self) -> std::time::Duration {
+        let secs = match self
+            .stream
+            .as_ref()
+            .and_then(|cfg| cfg.http2_keep_alive_timeout_secs)
+        {
+            None | Some(0) => 20,
+            Some(secs) => secs.min(3600),
+        };
+        std::time::Duration::from_secs(secs)
+    }
+
+    /// Non-secret effective settings for `config dump`/`get`. This projection
+    /// calls the runtime accessors, so aliases, environment and clamps cannot
+    /// acquire a second policy in the dispatcher. It does not save defaults.
+    pub fn resolved_stream_settings(&self) -> StreamConfig {
+        let limits = self.stream_retry_limits();
+        StreamConfig {
+            open_timeout_secs: Some(self.stream_open_timeout().as_secs()),
+            chunk_timeout_secs: Some(self.stream_chunk_timeout_secs()),
+            force_http1: Some(self.force_http1()),
+            max_resumes: Some(limits.max_resumes),
+            max_transparent_retries: Some(limits.max_transparent_retries),
+            max_stream_errors: Some(limits.max_errors),
+            max_duration_secs: Some(self.stream_max_duration().as_secs()),
+            max_content_mb: Some((self.stream_max_content_bytes() / (1024 * 1024)) as u64),
+            connect_timeout_secs: Some(self.connect_timeout().as_secs()),
+            tcp_keepalive_secs: Some(self.tcp_keepalive().map_or(0, |value| value.as_secs())),
+            http2_keep_alive_interval_secs: Some(
+                self.http2_keep_alive_interval()
+                    .map_or(0, |value| value.as_secs()),
+            ),
+            http2_keep_alive_timeout_secs: Some(self.http2_keep_alive_timeout().as_secs()),
+        }
     }
 
     /// Raw sub-agent model override map. Values are validated at spawn time
@@ -8267,6 +8487,9 @@ impl Config {
             initial_delay: 1.0,
             max_delay: 60.0,
             exponential_base: 2.0,
+            jitter: true,
+            jitter_factor: 0.1,
+            respect_retry_after: true,
         };
 
         let Some(cfg) = &self.retry else {
@@ -8279,6 +8502,14 @@ impl Config {
             initial_delay: cfg.initial_delay.unwrap_or(defaults.initial_delay),
             max_delay: cfg.max_delay.unwrap_or(defaults.max_delay),
             exponential_base: cfg.exponential_base.unwrap_or(defaults.exponential_base),
+            jitter: cfg.jitter.unwrap_or(defaults.jitter),
+            jitter_factor: cfg
+                .jitter_factor
+                .filter(|factor| factor.is_finite())
+                .map_or(defaults.jitter_factor, |factor| factor.clamp(0.0, 1.0)),
+            respect_retry_after: cfg
+                .respect_retry_after
+                .unwrap_or(defaults.respect_retry_after),
         }
     }
 }
@@ -10682,6 +10913,23 @@ pub(crate) fn is_kimi_code_membership_model(model: &str) -> bool {
         .any(|id| model.eq_ignore_ascii_case(id))
 }
 
+/// Keep the recovery command visible in small terminals. The optional DSH
+/// advice is conditional prose: producing an error must not inspect PATH or
+/// another application's credential file on the runtime thread.
+fn deepseek_missing_key_message() -> &'static str {
+    concat!(
+        "DeepSeek API key not found.\n",
+        "Save a key for every folder:\n",
+        "  codewhale auth set --provider deepseek\n",
+        "Get a key: https://platform.deepseek.com/api_keys\n",
+        "Or export DEEPSEEK_API_KEY=<your-key> (this shell only).\n",
+        "zsh: ~/.zshrc is interactive only; use ~/.zshenv.\n",
+        "Or set api_key in ~/.codewhale/config.toml.\n",
+        "If you already use DeepSeek Harness, grant read-only access:\n",
+        "  codewhale auth external-consent --provider deepseek --mode read-only"
+    )
+}
+
 /// The Moonshot direct-platform roster, as one fact. Mirror of
 /// [`KIMI_CODE_MEMBERSHIP_MODELS`] for the pay-as-you-go product.
 pub(crate) const MOONSHOT_DIRECT_PLATFORM_MODELS: [&str; 3] = [
@@ -10692,10 +10940,93 @@ pub(crate) const MOONSHOT_DIRECT_PLATFORM_MODELS: [&str; 3] = [
 
 pub(crate) const KIMI_CODE_CLAUDE_ALIAS_GUIDANCE: &str = "Kimi Code model `k3[1m]` is a Claude Code environment convention, not an API model id. Use model = \"k3\". If your Kimi Code plan includes 1M context, also set context_window = 1048576; otherwise keep the 262144 safe default.";
 
+/// Configuration errors whose text is safe to show in diagnostics such as
+/// `codewhale doctor`. Everything else stays suppressed there because parse
+/// errors and credential fields can echo secret material.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum SafeConfigDiagnostic {
     #[error("{}", KIMI_CODE_CLAUDE_ALIAS_GUIDANCE)]
     KimiCodeClaudeAlias,
+    /// A plain enum/value validation failure on a non-credential key.
+    /// `message` quotes the rejected value for the local error; `shareable`
+    /// omits it, because a mistyped value can still be a pasted secret.
+    #[error("{message}")]
+    InvalidValue {
+        message: String,
+        shareable: String,
+        /// A `codewhale config set <key> <valid>` command, when one fixes it.
+        fix: Option<String>,
+    },
+}
+
+impl SafeConfigDiagnostic {
+    fn invalid_value(key: &str, value: &str, expected: &str, fix: String) -> Self {
+        Self::InvalidValue {
+            message: format!("Invalid {key} '{value}': expected {expected}."),
+            shareable: format!("Invalid {key} (value not shown): expected {expected}."),
+            fix: Some(fix),
+        }
+    }
+
+    /// The diagnostic text for reports such as `codewhale doctor`, without
+    /// the rejected value and redacted defensively.
+    pub(crate) fn display_message(&self) -> String {
+        let text = match self {
+            Self::KimiCodeClaudeAlias => self.to_string(),
+            Self::InvalidValue { shareable, .. } => shareable.clone(),
+        };
+        codewhale_secrets::redact::redact_secrets(&text)
+    }
+
+    pub(crate) fn fix(&self) -> Option<&str> {
+        match self {
+            Self::KimiCodeClaudeAlias => None,
+            Self::InvalidValue { fix, .. } => fix.as_deref(),
+        }
+    }
+
+    /// Find a safe diagnostic anywhere in an error chain (loaders wrap
+    /// validation errors in file-path context).
+    pub(crate) fn find_in(error: &anyhow::Error) -> Option<&Self> {
+        error.chain().find_map(|cause| cause.downcast_ref::<Self>())
+    }
+}
+
+/// How to correct a rejected value in the user config. `config set` does not
+/// take dotted keys, so a table field names the table to edit. Validation runs
+/// after the environment, profile and managed layers are applied, and any of
+/// them outranks the user config, so the fix names those layers too.
+fn user_config_fix(key: &str, valid: &str, env_var: Option<&str>) -> String {
+    let edit = match key.split_once('.') {
+        Some((table, field)) => {
+            format!("set {field} = \"{valid}\" in the [{table}] table of config.toml")
+        }
+        None => format!("codewhale config set {key} {valid}"),
+    };
+    let layers = match env_var {
+        Some(env_var) => format!("{env_var}, a profile, or managed config"),
+        None => "a profile or managed config".to_string(),
+    };
+    format!("{edit} (if {layers} sets it, correct it there)")
+}
+
+fn invalid_provider_diagnostic(provider: &str) -> SafeConfigDiagnostic {
+    SafeConfigDiagnostic::invalid_value(
+        "provider",
+        provider,
+        &ApiProvider::names_hint(),
+        user_config_fix(
+            "provider",
+            ApiProvider::Deepseek.as_str(),
+            Some("CODEWHALE_PROVIDER"),
+        ),
+    )
+}
+
+/// The one wording for an unknown provider name, shared by config validation
+/// and `config set provider`.
+pub(crate) fn invalid_provider_message(provider: &str) -> String {
+    invalid_provider_diagnostic(provider).to_string()
 }
 
 /// Fail closed on known-bad model/endpoint pairings (#4687).
@@ -11072,7 +11403,19 @@ fn apply_profile(config: ConfigFile, profile: Option<&str>) -> Result<Config> {
                         }
                     })
                     .unwrap_or_else(|| "none".to_string());
-                anyhow::bail!("Profile '{profile_name}' not found. Available profiles: {available}")
+                // Profile names are user-typed (`--profile`), so the shareable
+                // text omits the requested one like every other InvalidValue;
+                // the available names are config table keys, not values.
+                Err(SafeConfigDiagnostic::InvalidValue {
+                    message: format!(
+                        "Profile '{profile_name}' not found. Available profiles: {available}"
+                    ),
+                    shareable: format!(
+                        "Profile not found (name not shown). Available profiles: {available}"
+                    ),
+                    fix: None,
+                }
+                .into())
             }
         }
     } else {
@@ -11185,6 +11528,30 @@ fn merge_config(base: Config, override_cfg: Config) -> Config {
         requirements_path: override_cfg.requirements_path.or(base.requirements_path),
         max_subagents: override_cfg.max_subagents.or(base.max_subagents),
         retry: override_cfg.retry.or(base.retry),
+        stream: match (base.stream, override_cfg.stream) {
+            (Some(base), Some(over)) => Some(StreamConfig {
+                open_timeout_secs: over.open_timeout_secs.or(base.open_timeout_secs),
+                chunk_timeout_secs: over.chunk_timeout_secs.or(base.chunk_timeout_secs),
+                force_http1: over.force_http1.or(base.force_http1),
+                max_resumes: over.max_resumes.or(base.max_resumes),
+                max_transparent_retries: over
+                    .max_transparent_retries
+                    .or(base.max_transparent_retries),
+                max_stream_errors: over.max_stream_errors.or(base.max_stream_errors),
+                max_duration_secs: over.max_duration_secs.or(base.max_duration_secs),
+                max_content_mb: over.max_content_mb.or(base.max_content_mb),
+                connect_timeout_secs: over.connect_timeout_secs.or(base.connect_timeout_secs),
+                tcp_keepalive_secs: over.tcp_keepalive_secs.or(base.tcp_keepalive_secs),
+                http2_keep_alive_interval_secs: over
+                    .http2_keep_alive_interval_secs
+                    .or(base.http2_keep_alive_interval_secs),
+                http2_keep_alive_timeout_secs: over
+                    .http2_keep_alive_timeout_secs
+                    .or(base.http2_keep_alive_timeout_secs),
+            }),
+            (base, over) => over.or(base),
+        },
+
         auto_review: override_cfg.auto_review.or(base.auto_review),
         tui: override_cfg.tui.or(base.tui),
         transcript: override_cfg.transcript.or(base.transcript),
@@ -12581,9 +12948,7 @@ fn save_api_key_for_identity_unlocked(
 ) -> Result<SavedCredential> {
     let provider = identity.provider;
     if provider == ApiProvider::OpenaiCodex {
-        anyhow::bail!(
-            "OpenAI Codex uses OAuth. Sign in with ChatGPT via `codewhale auth chatgpt` (subscription billing, Codewhale-owned tokens). The openai API-key route is a different billing owner. Alternatively run `codex login`, then grant exact read-only access with `codewhale auth external-consent --provider openai-codex --mode read-only`, or set OPENAI_CODEX_ACCESS_TOKEN for this process; Codewhale does not store an API key for this provider."
-        );
+        anyhow::bail!(codewhale_config::credentials::OPENAI_CODEX_API_KEY_REFUSAL);
     }
     let is_legacy_literal_custom = provider == ApiProvider::Custom
         && identity.key.trim() == ApiProvider::Custom.as_str()

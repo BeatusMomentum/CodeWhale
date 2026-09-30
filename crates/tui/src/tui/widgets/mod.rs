@@ -3495,24 +3495,20 @@ impl Renderable for ElevationWidget<'_> {
                 Style::default()
             };
 
-            let (key, label_id, desc_id) = match option {
+            let (label_id, desc_id) = match option {
                 ElevationOption::WithNetwork => (
-                    "n",
                     MessageId::ElevationOptionNetwork,
                     MessageId::ElevationOptionNetworkDesc,
                 ),
                 ElevationOption::WithWriteAccess(_) => (
-                    "w",
                     MessageId::ElevationOptionWrite,
                     MessageId::ElevationOptionWriteDesc,
                 ),
                 ElevationOption::FullAccess => (
-                    "f",
                     MessageId::ElevationOptionFullAccess,
                     MessageId::ElevationOptionFullAccessDesc,
                 ),
                 ElevationOption::Abort => (
-                    "a",
                     MessageId::ElevationOptionAbort,
                     MessageId::ElevationOptionAbortDesc,
                 ),
@@ -3527,8 +3523,8 @@ impl Renderable for ElevationWidget<'_> {
             lines.push(Line::from(vec![
                 Span::raw("  "),
                 Span::styled(
-                    format!("[{key}] "),
-                    Style::default().fg(palette::STATUS_SUCCESS),
+                    format!("{} ", crate::tui::glyphs::selection_marker(is_selected)),
+                    style,
                 ),
                 Span::styled(tr(self.locale, label_id), style.fg(label_color)),
             ]));
@@ -3552,12 +3548,39 @@ impl Renderable for ElevationWidget<'_> {
         let inner_width = popup_width.saturating_sub(CHROME);
         let max_inner_height = area.height.saturating_sub(2).saturating_sub(CHROME);
 
+        // The same binding table routes these keys. Reserve its hint alongside
+        // the choices so truncating the denial never hides keyboard access.
+        use crate::tui::shell_key_routing::{ShellBindingId, binding};
+        let controls = Line::from(Span::styled(
+            format!(
+                "  {}/{} · {} · {}",
+                binding(ShellBindingId::ElevationUp).footer_chord,
+                binding(ShellBindingId::ElevationDown).footer_chord,
+                binding(ShellBindingId::ElevationConfirm).footer_chord,
+                binding(ShellBindingId::ElevationAbort).footer_chord,
+            ),
+            Style::default().fg(palette::TEXT_MUTED),
+        ));
+        let controls_rows = measure_wrapped_rows(std::slice::from_ref(&controls), inner_width);
+        // Elevation has no details pager. Do not reuse the initial-approval
+        // hint that advertises a details shortcut this card cannot handle.
+        let truncation_hint = Line::from(Span::styled(
+            "  …",
+            Style::default().fg(palette::TEXT_MUTED),
+        ));
+        let truncation_rows =
+            measure_wrapped_rows(std::slice::from_ref(&truncation_hint), inner_width);
+
         let mut option_lines = lines.split_off(option_start);
         // Each option is a label row followed by a description row. On a terminal
         // too small for both, the description is chrome and the choice is
         // content, so the descriptions go first and every option keeps its row.
         let mut rows_per_option = 2usize;
-        if measure_wrapped_rows(&option_lines, inner_width) > max_inner_height {
+        if measure_wrapped_rows(&option_lines, inner_width)
+            .saturating_add(controls_rows)
+            .saturating_add(2 + truncation_rows)
+            > max_inner_height
+        {
             option_lines = option_lines
                 .into_iter()
                 .enumerate()
@@ -3565,21 +3588,35 @@ impl Renderable for ElevationWidget<'_> {
                 .collect();
             rows_per_option = 1;
         }
-        let option_rows = measure_wrapped_rows(&option_lines, inner_width);
-        // Trim the denial detail down to the title rather than the option list.
+        let option_rows =
+            measure_wrapped_rows(&option_lines, inner_width).saturating_add(controls_rows);
+        // Empty separators are chrome. Remove them before truncating useful
+        // detail; on the smallest frame even the preamble can go, since the
+        // border still names the card and the choices must remain reachable.
+        if measure_wrapped_rows(&lines, inner_width)
+            .saturating_add(option_rows)
+            .saturating_add(truncation_rows)
+            > max_inner_height
+        {
+            lines.retain(|line| line.width() != 0);
+        }
         let mut truncated = false;
-        while lines.len() > 2
-            && measure_wrapped_rows(&lines, inner_width).saturating_add(option_rows)
+        while !lines.is_empty()
+            && measure_wrapped_rows(&lines, inner_width)
+                .saturating_add(option_rows)
+                .saturating_add(truncation_rows)
                 > max_inner_height
         {
             lines.pop();
             truncated = true;
         }
-        if truncated {
-            lines.push(Line::from(Span::styled(
-                approval_truncation_hint(self.locale),
-                Style::default().fg(palette::TEXT_MUTED),
-            )));
+        if truncated
+            && measure_wrapped_rows(&lines, inner_width)
+                .saturating_add(option_rows)
+                .saturating_add(truncation_rows)
+                <= max_inner_height
+        {
+            lines.push(truncation_hint);
         }
 
         // Row offsets are measured after wrapping, not counted in source lines:
@@ -3596,6 +3633,7 @@ impl Renderable for ElevationWidget<'_> {
             offsets
         };
         lines.extend(option_lines);
+        lines.push(controls);
 
         let popup_height = measure_wrapped_rows(&lines, inner_width)
             .saturating_add(CHROME)

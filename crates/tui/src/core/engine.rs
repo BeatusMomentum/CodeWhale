@@ -506,6 +506,17 @@ pub struct EngineConfig {
     /// from `[tui].stream_max_duration_secs`. Pre-R1 this was the hard-coded
     /// `STREAM_MAX_DURATION_SECS`.
     pub stream_max_duration: Duration,
+    /// Stream-level retry budgets (#6700): whole-request resumes (also spent
+    /// by stream-open failures, #6699), in-stream transparent retries, and
+    /// the per-stream error streak. Resolved from `[tui].stream_max_resumes`,
+    /// `[tui].stream_max_transparent_retries` and `[tui].stream_max_errors`;
+    /// the defaults are the historical compiled-in values.
+    pub stream_retry_limits: turn_budget::StreamRetryLimits,
+    /// Bounded wait for SSE response headers (#6700). Resolved from
+    /// `[tui].stream_open_timeout_secs`, then
+    /// `CODEWHALE_STREAM_OPEN_TIMEOUT_SECS`; only the awaiting-model
+    /// heartbeat bound reads it here — the client owns the real timeout.
+    pub stream_open_timeout: Duration,
     /// No-progress heartbeat timeout for live sub-agents. Used by the manager
     /// and parent wait loop to auto-cancel stuck children before they exhaust
     /// the sub-agent slot pool indefinitely (#2614).
@@ -642,6 +653,8 @@ impl Default for EngineConfig {
             turn_wall_clock: turn_budget::resolve_turn_wall_clock(None),
             stream_max_content_bytes: turn_budget::DEFAULT_STREAM_MAX_CONTENT_BYTES,
             stream_max_duration: Duration::from_secs(turn_budget::DEFAULT_STREAM_MAX_DURATION_SECS),
+            stream_retry_limits: turn_budget::StreamRetryLimits::default(),
+            stream_open_timeout: crate::client::resolve_stream_open_timeout(None),
             subagent_heartbeat_timeout: Duration::from_secs(
                 crate::config::DEFAULT_SUBAGENT_HEARTBEAT_TIMEOUT_SECS,
             ),
@@ -906,6 +919,11 @@ pub struct Engine {
     mcp_event_generation: u64,
     /// Workspace-scoped immutable plugin catalogue and authority receipts.
     plugin_registry: Arc<crate::plugins::PluginRegistry>,
+    /// This engine's hold on the process-wide extension host (`[features]
+    /// extension_host`), carrying `plugin_registry`. `None` with the flag off
+    /// and for engines without a plugin snapshot of their own (isolated
+    /// chats), which must never revoke another engine's plugins.
+    extension_host: Option<crate::extension_host::HostAttachment>,
     api_provider: ApiProvider,
     /// Exact configured route key. Named custom providers share the `Custom`
     /// enum, so the enum alone cannot prove that the active client is current.
@@ -1687,19 +1705,26 @@ impl Engine {
         let compaction_cancellation =
             Arc::new(StdMutex::new(CompactionCancellationState::default()));
         let tool_exec_lock = Arc::new(RwLock::new(()));
-        let plugin_registry = config
+        let own_plugin_registry = config
             .plugin_registry
             .as_ref()
             .filter(|registry| registry.workspace() == config.workspace)
-            .cloned()
-            .unwrap_or_else(|| Arc::new(crate::plugins::PluginRegistry::empty(&config.workspace)));
+            .cloned();
         // Experimental extension host: start in the background, never on the
-        // first-prompt path. Its tools join at the next turn's rebuild.
-        if config.features.enabled(Feature::ExtensionHost) {
-            let manager = crate::extension_host::manager();
-            manager.begin_session();
-            manager.sync_in_background(Arc::clone(&plugin_registry));
-        }
+        // first-prompt path. Its tools join at the next turn's rebuild. Only
+        // an engine with its own plugin snapshot attaches; the empty fallback
+        // below would desire nothing and must not affect other engines.
+        let extension_host = own_plugin_registry
+            .as_ref()
+            .filter(|_| config.features.enabled(Feature::ExtensionHost))
+            .map(|registry| {
+                let manager = crate::extension_host::manager();
+                let attachment = manager.attach(Arc::clone(registry));
+                attachment.sync_in_background();
+                attachment
+            });
+        let plugin_registry = own_plugin_registry
+            .unwrap_or_else(|| Arc::new(crate::plugins::PluginRegistry::empty(&config.workspace)));
 
         // Create clients for both providers
         let (codewhale_client, codewhale_client_error) = match CodewhaleClient::new(api_config) {
@@ -1931,6 +1956,7 @@ impl Engine {
             mcp_boot_generation: None,
             mcp_event_generation: 0,
             plugin_registry,
+            extension_host,
             api_provider,
             api_provider_identity,
             api_provider_id,
@@ -2068,6 +2094,7 @@ impl Engine {
         let _ = self
             .tx_event
             .send(Event::ToolCallStarted {
+                model_call: None,
                 id: tool_id.clone(),
                 name: tool_name.clone(),
                 input: tool_input.clone(),
@@ -2158,6 +2185,7 @@ impl Engine {
         let _ = self
             .tx_event
             .send(Event::ToolCallComplete {
+                model_call: None,
                 id: tool_id,
                 name: tool_name,
                 result,
@@ -3506,6 +3534,10 @@ impl Engine {
                             // A pool may contain plugin servers and authority
                             // receipts from the previous workspace snapshot.
                             self.mcp_pool = None;
+                            if let Some(attachment) = &self.extension_host {
+                                attachment.set_plugins(Arc::clone(&self.plugin_registry));
+                                attachment.sync_in_background();
+                            }
                         }
                         let ctx =
                             crate::project_context::load_project_context_with_parents(&workspace);
@@ -3516,11 +3548,9 @@ impl Engine {
                         };
                         self.session.rebuild_working_set();
                         self.reconcile_restored_work_bindings().await;
+                        // SessionUpdated acknowledges the sync. A generic status
+                        // would immediately cover the host's confirmed resume receipt.
                         self.emit_session_updated().await;
-                        let _ = self
-                            .tx_event
-                            .send(Event::status("Session context synced".to_string()))
-                            .await;
                     }
                     Op::CompactContext {
                         id,
@@ -4626,9 +4656,16 @@ impl Engine {
                 }
                 let snapshot = state.snapshot();
                 if snapshot.status != GoalStatus::Blocked.as_str() {
-                    tracing::warn!(
+                    // Not an ordering bug: only an Active goal is moved to
+                    // Blocked above, so reaching here means there was no
+                    // active goal to block — most often no goal at all
+                    // (`status=none`) on an ordinary turn that failed, or one
+                    // the user paused or completed during the turn. The
+                    // turn's own failure already reached the host through
+                    // `TurnComplete`; there is nothing goal-side to publish.
+                    tracing::debug!(
                         status = %snapshot.status,
-                        "goal changed before continuation blocker could be published"
+                        "no active goal to block after a non-completed turn"
                     );
                     return;
                 }
@@ -5111,21 +5148,23 @@ impl Engine {
         // config.toml overrides. Explicit overrides win over auto-discovered
         // scripts with the same tool name.
         let extension_host = self
-            .config
-            .features
-            .enabled(Feature::ExtensionHost)
-            .then(crate::extension_host::manager);
-        if let Some(manager) = &extension_host {
+            .extension_host
+            .as_ref()
+            .filter(|_| self.config.features.enabled(Feature::ExtensionHost));
+        if let Some(attachment) = extension_host {
             // Natives only: scripts are added next and must not count as built-ins.
-            manager.note_native_names(tool_registry.names());
-            manager.sync_in_background(Arc::clone(&self.plugin_registry));
+            attachment
+                .manager()
+                .note_native_names(tool_registry.names());
+            attachment.sync_in_background();
         }
         let mut plugin_tool_names =
             configure_plugin_tools(&mut tool_registry, self.config.tools.as_ref());
         // Extension tools go in last and never replace a name already present
-        // (`ToolRegistry::register` would overwrite it silently).
-        if let Some(manager) = &extension_host {
-            plugin_tool_names.extend(manager.install_tools(&mut tool_registry));
+        // (`ToolRegistry::register` would overwrite it silently). Only this
+        // engine's own plugins' tools are installed.
+        if let Some(attachment) = extension_host {
+            plugin_tool_names.extend(attachment.install_tools(&mut tool_registry));
         }
 
         let mcp_state = if self.config.features.enabled(Feature::Mcp) {
@@ -7285,15 +7324,28 @@ impl Engine {
             .await
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
         let mut pool = pool.lock().await;
+        // The outcome is logged here, at the one manager every surface drives,
+        // so a panel retry, `/mcp retry`, and the runtime API all leave the
+        // same receipt in the session log.
         match pool.retry_connection(name).await {
-            Ok(_) => {
+            Ok(connection) => {
+                tracing::info!(
+                    target: "mcp",
+                    server = %name,
+                    tools = connection.tools().len(),
+                    "MCP server connected on retry"
+                );
                 self.mcp_connection_errors.remove(name);
             }
             Err(error) => {
-                self.mcp_connection_errors.insert(
-                    name.to_string(),
-                    crate::mcp::format_mcp_error_for_display(&error),
+                let reason = crate::mcp::format_mcp_error_for_display(&error);
+                tracing::warn!(
+                    target: "mcp",
+                    server = %name,
+                    error = %reason,
+                    "MCP server retry failed"
                 );
+                self.mcp_connection_errors.insert(name.to_string(), reason);
             }
         }
         let snapshot = pool.manager_snapshot(
@@ -7380,7 +7432,10 @@ impl Engine {
     // KV-cache effect: append-only user history. SessionUpdated persists this
     // warning even when an explicit prompt rebuild replaces the system prefix.
     fn record_project_trust_warning(&mut self) {
-        let warning = crate::skills::untrusted_project_skills_warning(&self.session.workspace);
+        let warning = crate::skills::untrusted_project_skills_warning(
+            &self.session.workspace,
+            Some(&self.config.skills_dir),
+        );
         let previous = self
             .session
             .messages
@@ -7842,6 +7897,12 @@ pub(crate) fn file_tool_ask_rule_decision_for_policy(
         crate::tools::canonical_action::canonical_action_alias(tool_name, tool_input);
     let paths = file_tool_permission_paths(policy_tool_name, tool_input)?;
     if paths.is_empty() {
+        if matches!(policy_tool_name, "write_file" | "edit_file" | "apply_patch") {
+            return Some(ToolAskRuleDecision::Block(
+                "File write has no resolvable target; provide an explicit path or valid patch."
+                    .to_string(),
+            ));
+        }
         return tool_ask_rule_decision_for_context(
             exec_policy_engine,
             policy_tool_name,
@@ -7924,15 +7985,32 @@ fn tool_ask_rule_decision_for_context(
     }
 }
 
+/// Every path the file tool will act on. The tools fold `file_path` /
+/// `filePath` onto `path` before executing, so each alias spelling is read
+/// here too; a rule keyed on `path` would otherwise never see that target.
 fn file_tool_permission_paths(tool_name: &str, input: &Value) -> Option<Vec<String>> {
+    let path_arguments = || {
+        let mut paths: Vec<String> = crate::tools::file::path_argument_keys()
+            .filter_map(|key| string_field(input, key))
+            .collect();
+        paths.dedup();
+        paths
+    };
     match tool_name {
         "read_file" | "write_file" | "edit_file" | "file_search" | "grep_files" => {
-            Some(string_field(input, "path").into_iter().collect())
+            Some(path_arguments())
         }
-        "list_dir" => Some(vec![
-            string_field(input, "path").unwrap_or_else(|| ".".to_string()),
-        ]),
-        "apply_patch" => Some(apply_patch_permission_paths(input)),
+        "list_dir" => {
+            let paths = path_arguments();
+            Some(if paths.is_empty() {
+                vec![".".to_string()]
+            } else {
+                paths
+            })
+        }
+        "apply_patch" => Some(apply_patch_permission_paths(
+            &crate::tools::file::with_canonical_path_argument(input),
+        )),
         _ => None,
     }
 }
@@ -8579,12 +8657,15 @@ use self::streaming::TOOL_CALL_START_MARKERS;
 #[cfg(test)]
 use self::streaming::filter_tool_call_delta;
 use self::streaming::{
-    ContentBlockKind, MAX_STREAM_ERRORS_BEFORE_FAIL, MAX_STREAM_RETRIES,
-    MAX_TRANSPARENT_STREAM_RETRIES, StreamResume, StreamRetryBudget, ToolCallDeltaFilterState,
-    ToolUseState, contains_fake_tool_wrapper, filter_tool_call_delta_with_state,
-    flush_tool_call_delta_state, should_resume_after_network_drop, should_resume_after_sleep,
+    ContentBlockKind, StreamResume, StreamRetryBudget, ToolCallDeltaFilterState, ToolUseState,
+    contains_fake_tool_wrapper, filter_tool_call_delta_with_state, flush_tool_call_delta_state,
+    should_resume_after_network_drop, should_resume_after_sleep,
     should_resume_interactive_after_network_drop, should_transparently_retry_stream,
     sleep_gap_detected, stream_read_error_user_message,
+};
+#[cfg(test)]
+use self::streaming::{
+    MAX_STREAM_ERRORS_BEFORE_FAIL, MAX_STREAM_RETRIES, MAX_TRANSPARENT_STREAM_RETRIES,
 };
 use self::tool_catalog::{
     CODE_EXECUTION_TOOL_NAME, EXECUTE_TOOLS_TOOL_NAME, JS_EXECUTION_TOOL_NAME,

@@ -759,13 +759,7 @@ pub(super) fn is_context_length_error_message(message: &str) -> bool {
     let lower = message.to_lowercase();
     lower.contains("model output truncated")
         || lower.contains("model response incomplete")
-        || lower.contains("maximum context length")
-        || lower.contains("context length")
-        || lower.contains("context_length")
-        || lower.contains("prompt is too long")
-        || lower.contains("context window")
-        // llama.cpp: "the request exceeds the available context size".
-        || lower.contains("available context size")
+        || crate::llm_client::is_context_length_message(&lower)
         || (lower.contains("requested") && lower.contains("tokens") && lower.contains("maximum"))
 }
 

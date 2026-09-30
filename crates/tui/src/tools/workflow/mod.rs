@@ -2732,10 +2732,12 @@ fn workflow_source(input: &Value, context: &ToolContext) -> Result<WorkflowSourc
 
     match (script, source_path, plan) {
         (Some(source), None, None) if !source.trim().is_empty() => {
-            workflow_source_from_raw(source, None)
+            workflow_source_from_raw(source, None, Some(&context.workspace))
         }
         (None, Some(path), None) => read_workflow_source_path(path, context),
-        (None, None, Some(plan_value)) => workflow_source_from_plan(plan_value),
+        (None, None, Some(plan_value)) => {
+            workflow_source_from_plan_in(plan_value, Some(&context.workspace))
+        }
         _ => Err(ToolError::missing_field("script")),
     }
 }
@@ -2745,9 +2747,17 @@ fn workflow_source(input: &Value, context: &ToolContext) -> Result<WorkflowSourc
 /// Accepts product-shaped plans (`goal` + `phases`/`children`) or IR-shaped
 /// plans (`goal` + `nodes`), validates them, and lowers to imperative JS that
 /// uses `parallel()` (partial success) rather than raw `Promise.all()`.
+#[cfg(test)]
 fn workflow_source_from_plan(plan_value: &Value) -> Result<WorkflowSource, ToolError> {
+    workflow_source_from_plan_in(plan_value, None)
+}
+
+fn workflow_source_from_plan_in(
+    plan_value: &Value,
+    workspace: Option<&Path>,
+) -> Result<WorkflowSource, ToolError> {
     let spec = structured_plan_to_workflow_spec(plan_value)?;
-    let lowered = lower_declarative_workflow_to_imperative_js(&spec)?;
+    let lowered = lower_declarative_workflow_to_imperative_js_in(&spec, workspace)?;
     Ok(WorkflowSource {
         source: lowered,
         path: None,
@@ -3209,14 +3219,15 @@ fn read_workflow_source_path(
             canonical.display()
         ))
     })?;
-    workflow_source_from_raw(source, Some(canonical))
+    workflow_source_from_raw(source, Some(canonical), Some(&context.workspace))
 }
 
 fn workflow_source_from_raw(
     source: String,
     path: Option<PathBuf>,
+    workspace: Option<&Path>,
 ) -> Result<WorkflowSource, ToolError> {
-    let adapted = adapt_workflow_source(&source, path.as_deref())?;
+    let adapted = adapt_workflow_source_in(&source, path.as_deref(), workspace)?;
     Ok(WorkflowSource {
         source: adapted.source,
         path,
@@ -3229,9 +3240,18 @@ struct AdaptedWorkflowSource {
     spec: Option<WorkflowSpec>,
 }
 
+#[cfg(test)]
 fn adapt_workflow_source(
     source: &str,
     path: Option<&Path>,
+) -> Result<AdaptedWorkflowSource, ToolError> {
+    adapt_workflow_source_in(source, path, None)
+}
+
+fn adapt_workflow_source_in(
+    source: &str,
+    path: Option<&Path>,
+    workspace: Option<&Path>,
 ) -> Result<AdaptedWorkflowSource, ToolError> {
     if !looks_like_declarative_workflow(source) {
         return Ok(AdaptedWorkflowSource {
@@ -3258,7 +3278,7 @@ fn adapt_workflow_source(
         ))
     })?;
 
-    let lowered = lower_declarative_workflow_to_imperative_js(&spec)?;
+    let lowered = lower_declarative_workflow_to_imperative_js_in(&spec, workspace)?;
     Ok(AdaptedWorkflowSource {
         source: lowered,
         spec: Some(spec),
@@ -3276,8 +3296,19 @@ fn looks_like_declarative_workflow(source: &str) -> bool {
     })
 }
 
+#[cfg(test)]
 fn lower_declarative_workflow_to_imperative_js(spec: &WorkflowSpec) -> Result<String, ToolError> {
-    let mut lowerer = DeclarativeWorkflowLowerer::default();
+    lower_declarative_workflow_to_imperative_js_in(spec, None)
+}
+
+fn lower_declarative_workflow_to_imperative_js_in(
+    spec: &WorkflowSpec,
+    workspace: Option<&Path>,
+) -> Result<String, ToolError> {
+    let mut lowerer = DeclarativeWorkflowLowerer {
+        workspace: workspace.map(Path::to_path_buf),
+        ..DeclarativeWorkflowLowerer::default()
+    };
     lowerer.line("\"use strict\";");
     lowerer.line("const __results = Object.create(null);");
     lowerer.line(format!(
@@ -3295,6 +3326,9 @@ fn lower_declarative_workflow_to_imperative_js(spec: &WorkflowSpec) -> Result<St
 struct DeclarativeWorkflowLowerer {
     source: String,
     next_var: usize,
+    /// Workspace root, so a leaf's absolute `cwd` inside it lowers to the
+    /// repo-relative form `task()` accepts.
+    workspace: Option<PathBuf>,
 }
 
 impl DeclarativeWorkflowLowerer {
@@ -3335,7 +3369,7 @@ impl DeclarativeWorkflowLowerer {
         self.line(format!(
             "__results[{}] = await task({});",
             js_string(&spec.id),
-            leaf_task_options_expression(spec, phase, parallel)?
+            leaf_task_options_expression(spec, phase, parallel, self.workspace.as_deref())?
         ));
         Ok(())
     }
@@ -3362,7 +3396,12 @@ impl DeclarativeWorkflowLowerer {
                 // (#4120) unless the plan explicitly sets isolation: shared.
                 self.line(format!(
                     "  () => task({}),",
-                    leaf_task_options_expression(leaf, Some(&spec.id), /* parallel */ true)?
+                    leaf_task_options_expression(
+                        leaf,
+                        Some(&spec.id),
+                        /* parallel */ true,
+                        self.workspace.as_deref(),
+                    )?
                 ));
             }
             self.line("]);");
@@ -3472,6 +3511,7 @@ fn leaf_task_options_expression(
     spec: &LeafSpec,
     phase: Option<&str>,
     parallel: bool,
+    workspace: Option<&Path>,
 ) -> Result<String, ToolError> {
     validate_leaf_runtime_contract(spec)?;
     // Reject invalid plans before accepting a background run, using the same
@@ -3479,7 +3519,7 @@ fn leaf_task_options_expression(
     let cwd = spec
         .cwd
         .as_deref()
-        .map(codewhale_workflow_js::normalize_task_cwd)
+        .map(|cwd| codewhale_workflow_js::normalize_task_cwd_in(cwd, workspace))
         .transpose()
         .map_err(|error| {
             ToolError::invalid_input(format!("Workflow leaf '{}': {error}", spec.id))
@@ -4926,6 +4966,10 @@ impl WorkflowDriver for SubAgentWorkflowDriver {
         snapshot
     }
 
+    fn workspace_root(&self) -> Option<PathBuf> {
+        Some(self.runtime.context.workspace.clone())
+    }
+
     fn progress(&self, event: ProgressEvent) {
         let mut schema_error = None;
         let mut schema_repair = None;
@@ -5439,10 +5483,37 @@ fn spawn_completion_pump(
                 let (task_completion, usage) =
                     completion_from_manager(driver.manager.clone(), &agent_id, completion.payload)
                         .await;
+                // A worker that ran somewhere other than its requested route
+                // says so in the run itself, not only on its receipt.
+                if let Some(note) = rerouted_task_note(&driver.manager, &agent_id).await {
+                    driver.record_run_event(WorkflowUiEvent::new(
+                        &driver.owner_session_id,
+                        WorkflowUiEventKind::Log {
+                            message: format!("Route fallback ({agent_id}): {note}"),
+                        },
+                    ));
+                }
                 driver.deliver_completion(agent_id, task_completion, usage);
             }
         },
     );
+}
+
+/// The fallback note of a child that ran on a replacement or parent route
+/// instead of the one it requested, if it did.
+async fn rerouted_task_note(manager: &SharedSubAgentManager, agent_id: &str) -> Option<String> {
+    let route = manager
+        .read()
+        .await
+        .get_result(agent_id)
+        .ok()?
+        .child_route?;
+    matches!(
+        route.route_source.as_str(),
+        "session.fallback" | "role.replacement"
+    )
+    .then_some(route.fallback_note)
+    .flatten()
 }
 
 /// Resolve a child's terminal completion from the manager, reading it exactly
@@ -8117,6 +8188,43 @@ export default workflow({
     }
 
     #[test]
+    fn leaf_absolute_cwd_inside_the_workspace_lowers_repo_relative() {
+        // Founder run: a plan leaf with cwd "/Volumes/VIXinSSD/CW/codewhale"
+        // was refused although it named the workspace's own checkout.
+        // Platform-absolute paths: `/Volumes/…` is not absolute on Windows.
+        let workspace = std::env::temp_dir().join("cw-leaf-fixture");
+        let leaf: LeafSpec = serde_json::from_value(json!({
+            "id": "engine-readiness",
+            "prompt": "Audit release readiness",
+            "agent_type": "review",
+            "mode": "read_only",
+            "cwd": workspace.join("codewhale").to_str().unwrap()
+        }))
+        .expect("leaf");
+        let source = leaf_task_options_expression(&leaf, None, false, Some(&workspace)).unwrap();
+        assert!(source.contains("cwd: \"codewhale\""), "{source}");
+        assert!(!source.contains("cw-leaf-fixture"), "{source}");
+
+        let mut outside = leaf.clone();
+        outside.cwd = Some(
+            std::env::temp_dir()
+                .join("cw-leaf-fixture-other")
+                .to_str()
+                .unwrap()
+                .to_string(),
+        );
+        let error = leaf_task_options_expression(&outside, None, false, Some(&workspace))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("outside the workspace"), "{error}");
+        // Without a known workspace the old refusal stands.
+        let error = leaf_task_options_expression(&leaf, None, false, None)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("bounded repo-relative paths"), "{error}");
+    }
+
+    #[test]
     fn read_only_workflow_leaves_use_the_runtime_grant_unless_explicitly_narrowed() {
         for agent_type in ["explore", "review", "verifier", "general"] {
             let mut leaf: LeafSpec = serde_json::from_value(json!({
@@ -8127,7 +8235,7 @@ export default workflow({
             }))
             .expect("read-only leaf");
             assert_eq!(leaf_allowed_tools(&leaf).unwrap(), None);
-            let source = leaf_task_options_expression(&leaf, None, false).unwrap();
+            let source = leaf_task_options_expression(&leaf, None, false, None).unwrap();
             assert!(source.contains("writeAuthority: \"read_only\""), "{source}");
             assert!(!source.contains("allowedTools:"), "{source}");
 

@@ -54,7 +54,15 @@ pub enum ProviderKind {
     Siliconflow,
     #[serde(alias = "arcee-ai", alias = "arcee_ai")]
     Arcee,
-    #[serde(alias = "siliconflow-cn", alias = "siliconflow-CN")]
+    // `rename_all = "kebab-case"` would spell this variant `siliconflow-c-n`,
+    // which is not the canonical id (`siliconflow-CN`) and which the config
+    // loader rejects. Serialize the canonical id; keep reading the old
+    // spelling so files written by earlier releases still load.
+    #[serde(
+        rename = "siliconflow-CN",
+        alias = "siliconflow-cn",
+        alias = "siliconflow-c-n"
+    )]
     SiliconflowCN,
     #[serde(alias = "moonshot-ai", alias = "moonshotai", alias = "moonshot_ai")]
     Moonshot,
@@ -113,7 +121,12 @@ pub enum ProviderKind {
     Deepinfra,
     #[serde(alias = "sakana-ai", alias = "sakana_ai", alias = "fugu")]
     Sakana,
-    #[serde(alias = "long-cat", alias = "meituan-longcat", alias = "meituan")]
+    #[serde(
+        rename = "longcat",
+        alias = "long-cat",
+        alias = "meituan-longcat",
+        alias = "meituan"
+    )]
     LongCat,
     #[serde(alias = "opencode_go", alias = "opencodego")]
     OpencodeGo,

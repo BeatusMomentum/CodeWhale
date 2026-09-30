@@ -1,4 +1,4 @@
-<!-- source: README.md sha256:ccb7a0b00317 -->
+<!-- source: README.md sha256:925619135f77 -->
 # Codewhale
 
 Codewhale は、選んだホスト型またはローカルのモデルを使ってプロジェクトを読み、ファイルを編集し、コマンドを実行して、自分の作業結果を確認するオープンソースのエージェントです。まずはターミナルで一つのタスクから始めましょう。大きな仕事では、異なるモデルや役割を持つエージェントに作業の一部を分担させられます。
@@ -23,6 +23,8 @@ curl -fsSL https://codewhale.net/install.sh | sh
 "$HOME/.local/bin/codewhale"
 ```
 
+`codewhale` だけで実行して "command not found" と表示される場合は、`~/.local/bin` がまだ PATH に含まれていません。インストーラーがお使いのシェル向けに表示する 1 行のコマンドを実行するか、[PATH に追加する](docs/INSTALL.md#put-it-on-your-path)を参照してください。
+
 インストーラーは、公開済みの最新リリースを選択します。[変更履歴](CHANGELOG.md)には次のリリースの未公開候補版についても記載されていますが、その変更が公開ダウンロードに含まれるのは、リリースが公開されてからです。
 
 Windows では [GitHub Releases](https://github.com/Hmbown/CodeWhale/releases/latest) から対応するインストーラーまたはアーカイブを入手してください。既存の直接インストールは `codewhale update` で更新できます。確認だけなら `codewhale update --check` を使います。更新対象の実行ファイルのパスが表示され、より新しいビルドは保持されます。npm と Cargo は補助的なパッケージ導入方法です。パッケージ管理からの移行や PATH の設定は[インストールガイド](docs/INSTALL.md)を参照してください。
@@ -33,7 +35,7 @@ Windows では [GitHub Releases](https://github.com/Hmbown/CodeWhale/releases/la
 
 ## 使い方
 
-プロジェクトのフォルダーでターミナルを開き、`codewhale` を実行します。`/provider` でプロバイダーを、`/model` でモデルを選び、具体的なタスクを伝えます：
+プロジェクトのフォルダーでターミナルを開き、`codewhale` を実行します（[PATH に追加](docs/INSTALL.md#put-it-on-your-path)済みであることが前提です）。`/provider` でプロバイダーを、`/model` でモデルを選び、具体的なタスクを伝えます：
 
 ```text
 Fix the failing tests and explain what changed.
@@ -76,6 +78,7 @@ Codewhale は、あなたが許可した範囲のアクセス権で、あなた�
 
 ## ドキュメント
 
+- [GitHub PR レビューの設定](docs/GITHUB_ACTION.md)
 - [プロバイダーとローカルモデル](docs/PROVIDERS.md)
 - [エージェントチーム](docs/FLEET.md)
 - [MCP](docs/MCP.md)、[フック](docs/HOOKS.md)、[設定](docs/CONFIGURATION.md)

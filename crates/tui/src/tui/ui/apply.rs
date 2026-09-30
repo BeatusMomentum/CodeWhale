@@ -249,6 +249,7 @@ pub(crate) fn apply_engine_error_to_app(
         app.dispatch_started_at = None;
     }
     app.turn_error_posted = true;
+    app.turn_error_notice = Some(message.clone());
     if credential_rejected_before_output {
         // #6566: the provider refused the key before any model output, so the
         // engine takes the question back out of the session. Give it back to
@@ -1376,28 +1377,19 @@ async fn apply_command_result_inner(
                         return Ok(false);
                     }
                 };
-                // A managed record resumes through the manager so its repair is
-                // hydrated, applied, and persisted in place. A foreign `/load`
-                // file is not ours to rewrite: hydrate its journal projection
-                // and repair in memory only.
-                let session = match SessionManager::default_location() {
-                    Ok(manager) if manager.owns_session_path(&parsed.metadata.id, &path) => {
-                        match manager.resume_session(&parsed.metadata.id) {
-                            Ok(recovery) => recovery.session,
-                            Err(err) => {
-                                crate::tui::ui::session_state::surface_session_load_failure(
-                                    app,
-                                    format!("Failed to resume session {}: {err}", path.display()),
-                                );
-                                return Ok(false);
-                            }
-                        }
-                    }
-                    _ => {
-                        let mut session = parsed;
-                        session.ensure_journal();
-                        crate::session_manager::repair_recovered_session(&mut session);
-                        session
+                // `/load` shares the attach contract of `resume` and the
+                // picker (`SessionManager::attach_session_file`); the lease is
+                // committed only once the session is applied.
+                let attached = SessionManager::default_location()
+                    .and_then(|manager| manager.attach_session_file(parsed, &path));
+                let (session, lease) = match attached {
+                    Ok(attached) => attached,
+                    Err(err) => {
+                        crate::tui::ui::session_state::surface_session_load_failure(
+                            app,
+                            format!("Failed to resume session {}: {err}", path.display()),
+                        );
+                        return Ok(false);
                     }
                 };
                 let fresh_config =
@@ -1421,7 +1413,10 @@ async fn apply_command_result_inner(
                     fresh_config,
                     true,
                 ) {
-                    Ok(outcome) => outcome,
+                    Ok(outcome) => {
+                        lease.commit();
+                        outcome
+                    }
                     Err(err) => {
                         crate::tui::ui::session_state::surface_session_load_failure(
                             app,
@@ -3836,6 +3831,20 @@ pub(crate) fn apply_loaded_session_with_goal(
     app.last_exec_wait_command = None;
     let messages = app.api_messages.clone();
     let mut message_to_cell = std::collections::HashMap::new();
+    // Failed-turn notices are replayed where they happened: after the
+    // messages that existed when the turn ended (clamped to the transcript).
+    let mut turn_outcomes = session.turn_outcomes.iter().peekable();
+    let mut replay_outcomes_through = |app: &mut App, message_count: usize, last: bool| {
+        while let Some(outcome) =
+            turn_outcomes.next_if(|outcome| last || outcome.after_message_count <= message_count)
+        {
+            app.extend_history(std::iter::once(HistoryCell::Error {
+                message: outcome.error.clone(),
+                severity: crate::error_taxonomy::ErrorSeverity::Warning,
+            }));
+        }
+    };
+    replay_outcomes_through(app, 0, messages.is_empty());
     for (message_index, msg) in messages.iter().enumerate() {
         let mut cells = history_cells_from_message(msg);
         if msg.role == "user"
@@ -3859,6 +3868,7 @@ pub(crate) fn apply_loaded_session_with_goal(
             message_to_cell.insert(message_index, base + offset);
         }
         app.extend_history(cells);
+        replay_outcomes_through(app, message_index + 1, message_index + 1 == messages.len());
     }
     app.rebuild_completed_assistant_outputs_from_restored_history();
     app.sync_context_references_from_session(&session.context_references, &message_to_cell);
@@ -4007,6 +4017,7 @@ pub(crate) fn apply_loaded_session_with_goal(
         );
     }
     app.session_artifacts = session.artifacts;
+    app.session_turn_outcomes = session.turn_outcomes;
     app.window_title = session.window_title;
     app.workspace_context = None;
     app.workspace_is_linked_worktree = false;

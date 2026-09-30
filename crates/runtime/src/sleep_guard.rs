@@ -33,6 +33,11 @@
 //! no `wait` runs inline on a worker (#6149). `hold` therefore has to be
 //! called from within a Tokio runtime context.
 //!
+//! `Drop` never runs when the process is killed, crashes or calls
+//! `process::exit`, so each inhibitor is also tied to this process's lifetime
+//! independently of the guard: on macOS `caffeinate -w <pid>` exits with the
+//! process it watches, and on Linux the pipe below closes with it.
+//!
 //! On Linux the lock is held by `systemd-inhibit` around a child of its own,
 //! and a kill is never forwarded to that grandchild. The command is therefore
 //! `cat` reading a pipe this guard holds: dropping the guard closes the pipe,
@@ -92,11 +97,19 @@ impl Drop for SleepGuard {
     }
 }
 
-/// `-i` prevents idle sleep. Without `-t` caffeinate runs until it is killed,
-/// which is what `Drop` does; macOS releases the assertion with the process.
+/// `-i` prevents idle sleep. `Drop` kills caffeinate, and macOS releases the
+/// assertion with the process. `-w` watches this process too: a crash, kill
+/// or `process::exit` skips `Drop`, and the reparented caffeinate would
+/// otherwise keep the host awake indefinitely.
 #[cfg(target_os = "macos")]
 fn start_inhibitor() -> Option<Child> {
-    spawn("caffeinate", &["-i"])
+    let pid = std::process::id().to_string();
+    spawn("caffeinate", &caffeinate_args(&pid))
+}
+
+#[cfg(target_os = "macos")]
+fn caffeinate_args(watched_pid: &str) -> [&str; 3] {
+    ["-i", "-w", watched_pid]
 }
 
 /// `--what=idle` only: an explicit suspend or a closed lid is still honoured.
@@ -211,6 +224,62 @@ mod tests {
                 "process {grandchild} outlived the guard: the inhibitor's command must end with the guard's pipe"
             );
         }
+    }
+
+    /// macOS: when the owning process dies without running `Drop`, the
+    /// inhibitor must exit on its own. A stand-in owner is killed here, since
+    /// the test cannot kill its own process.
+    #[tokio::test]
+    #[cfg(target_os = "macos")]
+    async fn the_inhibitor_exits_when_its_owner_dies_without_dropping_the_guard() {
+        let mut owner = Command::new("sleep")
+            .arg("60")
+            .kill_on_drop(true)
+            .spawn()
+            .expect("start a stand-in owner process");
+        let owner_pid = owner.id().expect("owner pid").to_string();
+        let mut inhibitor = spawn("caffeinate", &caffeinate_args(&owner_pid))
+            .expect("start caffeinate watching the stand-in owner");
+        let pid = inhibitor.id().expect("inhibitor pid");
+        assert!(
+            alive(pid),
+            "the inhibitor must be running while its owner lives"
+        );
+
+        // The owner dies without anything killing the inhibitor, as when the
+        // process is SIGKILLed and the guard's `Drop` never runs.
+        owner.kill().await.expect("kill the stand-in owner");
+
+        // Waiting (rather than probing the pid) also reaps the child; if it
+        // never exits, dropping it at the end of the test kills it.
+        let exited =
+            tokio::time::timeout(std::time::Duration::from_secs(5), inhibitor.wait()).await;
+        assert!(
+            exited.is_ok(),
+            "an inhibitor whose owner died must not keep the host awake"
+        );
+    }
+
+    /// macOS: the guard a turn really takes must watch this process. The
+    /// test above proves `-w` ends caffeinate with a stand-in owner; this one
+    /// proves `hold` passes it, and passes our own pid.
+    #[tokio::test]
+    #[cfg(target_os = "macos")]
+    async fn a_held_guard_watches_the_process_that_holds_it() {
+        let guard = SleepGuard::hold();
+        let pid = guard
+            .inhibitor_pid()
+            .expect("this platform starts an inhibitor");
+        let ps = std::process::Command::new("ps")
+            .args(["-o", "args=", "-p", &pid.to_string()])
+            .output()
+            .expect("run ps");
+        let args = String::from_utf8_lossy(&ps.stdout);
+        assert_eq!(
+            args.trim(),
+            format!("caffeinate -i -w {}", std::process::id()),
+            "the inhibitor must end with the process whose turn it holds"
+        );
     }
 
     #[tokio::test]

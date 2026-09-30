@@ -218,7 +218,7 @@ RLM 面（`rlm_open` / `rlm_eval` / `rlm_configure` / `rlm_close` / `rlm_session
 
 - `agent` 启动一个专注的后台子代理并返回 agent id 加转录句柄。
 - 子代理结果以完成事件到达。父代理应该继续工作，而不是轮询生命周期工具。
-- 子代理工具目录排除被移除的子代理*生命周期*工具。（**并非如落地所示：** 该要点原本继续写着"因此子代理是叶子 worker，不能递归召唤更多代理"。那不是最终结果。子代理会收到 `agent`，并且可以递归到配置的深度——见 `tools/subagent/mod.rs` 中的 `with_full_agent_surface_options` 和 `can_spawn_child`，以及 [`SUBAGENTS.md`](../SUBAGENTS.md)。）
+- 子代理工具目录排除被移除的子代理*生命周期*工具。（**并非如落地所示：** 该要点原本继续写着"因此子代理是叶子 worker，不能递归召唤更多代理"。那不是最终结果。子代理会收到 `agent`，并且可以递归到配置的深度——见 `tools/subagent/mod.rs` 中的 `with_full_agent_surface_options` 和 `can_spawn_child`，以及 [`SUBAGENTS.md`](./SUBAGENTS.md)。）
 - 详细检查通过 `handle_read` 对返回的转录句柄进行。
 
 这是生命周期简化，不是 provider 门槛。

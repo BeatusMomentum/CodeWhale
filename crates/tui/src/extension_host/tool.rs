@@ -2,13 +2,18 @@
 //!
 //! Because it is a registry tool, every existing gate applies unchanged:
 //! plan mode, the authority envelope, deferral, hooks, approval, and code
-//! mode (which, on main, refuses it as mutating/needs-approval before any
-//! host call). Two rules are specific to extension tools:
+//! mode (which suspends gated calls for approval and refuses ungated calls
+//! before any host call). Three rules are specific to extension tools:
 //!
 //! * **Always `ApprovalRequirement::Required`.** A plugin's own read-only
 //!   hint (`presentCall` `kind: 'read'`, MCP-style annotations) is display
 //!   data at most. Honouring it would let a plugin switch approval off for a
 //!   tool whose body runs arbitrary Node — self-approval.
+//! * **Approval grants are receipt-bound.** Keys are
+//!   `ext:<plugin_id>@<content_hash>:<name>:<hash(input)>` for both the exact
+//!   and the session-grant key ([`ToolSpec::approval_scope`]), so an updated
+//!   plugin, or a different plugin that later takes the same tool name, never
+//!   inherits a grant.
 //! * **Liveness is re-checked at call time**: the plugin's reviewed receipt,
 //!   the Native adapter in this build's policy, and the exact owner
 //!   generation. A revocation mid-turn fails the call closed.
@@ -190,6 +195,14 @@ impl ToolSpec for HostToolSpec {
 
     fn defer_loading(&self) -> bool {
         true
+    }
+
+    /// Grants are bound to the plugin's reviewed receipt (design §4.3).
+    fn approval_scope(&self) -> Option<String> {
+        Some(format!(
+            "ext:{}@{}",
+            self.registration.owner.plugin_id, self.registration.content_hash
+        ))
     }
 
     fn prepare(&self, input: Value, _context: &ToolContext) -> Result<PreparedToolCall, ToolError> {

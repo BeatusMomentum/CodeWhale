@@ -486,7 +486,9 @@ pub fn event_to_protocol(event: &Event, ids: &ProtocolIds) -> wire::EventMsg {
             session_id,
             index: count(*index),
         },
-        Event::ToolCallStarted { id, name, input } => wire::EventMsg::ToolCallStarted {
+        Event::ToolCallStarted {
+            id, name, input, ..
+        } => wire::EventMsg::ToolCallStarted {
             thread_id,
             session_id,
             tool_call_id: id.clone(),
@@ -497,7 +499,9 @@ pub fn event_to_protocol(event: &Event, ids: &ProtocolIds) -> wire::EventMsg {
             thread_id,
             session_id,
         },
-        Event::ToolCallComplete { id, name, result } => wire::EventMsg::ToolCallComplete {
+        Event::ToolCallComplete {
+            id, name, result, ..
+        } => wire::EventMsg::ToolCallComplete {
             thread_id,
             session_id,
             tool_call_id: id.clone(),
@@ -1417,17 +1421,20 @@ mod tests {
                 content: "hmm".into(),
             },
             Event::ToolCallStarted {
+                model_call: None,
                 id: "c1".into(),
                 name: "read_file".into(),
                 input: json!({"path": "x"}),
             },
             Event::ToolCallHeartbeat,
             Event::ToolCallComplete {
+                model_call: None,
                 id: "c1".into(),
                 name: "read_file".into(),
                 result: Ok(ToolResult::success("ok")),
             },
             Event::ToolCallComplete {
+                model_call: None,
                 id: "c2".into(),
                 name: "bash".into(),
                 result: Err(ToolError::Timeout { seconds: 9 }),

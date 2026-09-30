@@ -61,7 +61,7 @@ pub use repo::{
     DEFAULT_MAX_WORKSPACE_BYTES_FOR_SNAPSHOT, GATE_TOO_LARGE_MARKER, GATE_TOO_MANY_ENTRIES_MARKER,
     GATE_UNSAFE_LOCATION_MARKER, PathRestoreAction, PathRestoreOutcome, SIZE_WALK_MAX_ENTRIES,
     Snapshot, SnapshotId, SnapshotPathChange, SnapshotRepo, TakenSnapshot, WorkspaceGate,
-    estimate_workspace_size_bounded, workspace_relative_path,
+    estimate_workspace_size_bounded, is_git_metadata_name, workspace_relative_path,
 };
 
 /// Which point of a turn a recorded workspace snapshot captured.

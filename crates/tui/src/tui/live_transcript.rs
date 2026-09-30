@@ -313,6 +313,10 @@ impl LiveTranscriptOverlay {
         };
 
         let mut cache = self.cache.borrow_mut();
+        // Room for every cell plus a new revision of each, so the sweep
+        // below never evicts entries it is about to read (a 1,000-cell
+        // transcript against the old fixed 512 cap missed every lookup).
+        cache.ensure_capacity(self.snapshots.len().saturating_mul(2));
         for (cell_idx, snap) in self.snapshots.iter().enumerate() {
             // Borrow the cached slice and clone each line (and its links)
             // exactly once into the flattened output.
@@ -962,6 +966,32 @@ mod tests {
         assert!(
             changed_cells <= max_changed_cells,
             "stream delta changed {changed_cells} cells; budget is {max_changed_cells}"
+        );
+    }
+
+    /// A transcript longer than the default cache cap must still hit the
+    /// wrap cache on the next sweep instead of re-wrapping every cell.
+    #[test]
+    fn thousand_cell_sweep_hits_the_cache_on_the_second_pass() {
+        let mut v = LiveTranscriptOverlay::new();
+        let cells = (0..1_000)
+            .map(|index| user(&format!("cell {index}")))
+            .collect::<Vec<_>>();
+        install_snapshots(&mut v, cells);
+        let area = Rect::new(0, 0, 60, 16);
+        let mut buf = Buffer::empty(area);
+        v.render(area, &mut buf);
+        assert_eq!(
+            v.cache.borrow().len(),
+            1_000,
+            "the first sweep must keep every cell's wrap"
+        );
+        mark_snapshots_changed(&v);
+        v.render(area, &mut buf);
+        assert_eq!(
+            v.cache.borrow().len(),
+            1_000,
+            "the second sweep must reuse every wrap, not re-insert any"
         );
     }
 

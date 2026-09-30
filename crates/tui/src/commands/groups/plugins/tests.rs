@@ -8,6 +8,56 @@ use std::fs;
 use std::path::Path;
 use tempfile::TempDir;
 
+#[test]
+fn extension_owner_report_escapes_every_plugin_controlled_field() {
+    struct Presentation(Locale);
+    impl CommandPresentationContext for Presentation {
+        fn translate(&self, key: &str, replacements: &[(&str, &str)]) -> Result<String, String> {
+            let id = crate::commands::contract::key_to_plugin_message_id(key).unwrap();
+            let mut output = codewhale_localization::tr(self.0, id).to_string();
+            for (name, value) in replacements {
+                output = output.replace(&format!("{{{name}}}"), value);
+            }
+            Ok(output)
+        }
+    }
+    let mut output = String::new();
+    append_host_owner_report(
+        &Presentation(Locale::En),
+        &mut output,
+        &crate::extension_host::OwnerReport {
+            state: Some(crate::extension_host::registry::OwnerState::Failed(
+                "\u{1b}[31m<script>".into(),
+            )),
+            tools: vec!["[tool](https://example.invalid)".into()],
+            diagnostics: vec!["\n# approved\u{202e}".into()],
+        },
+    );
+    assert!(output.contains("Extension host:"));
+    for value in [
+        "\u{1b}[31m<script>",
+        "[tool](https://example.invalid)",
+        "\n# approved\u{202e}",
+    ] {
+        assert!(output.contains(&escape_review_text(value)));
+        assert!(!output.contains(value));
+    }
+    let mut localized = String::new();
+    append_host_owner_report(
+        &Presentation(Locale::ZhHans),
+        &mut localized,
+        &crate::extension_host::OwnerReport {
+            state: None,
+            tools: vec![],
+            diagnostics: vec![],
+        },
+    );
+    assert_eq!(
+        localized,
+        "\n扩展宿主：\n  状态：未激活\n  活动工具（0）：—"
+    );
+}
+
 fn create_test_app(root: &Path) -> (App, TempDir) {
     let temp = TempDir::new().expect("tempdir");
     let config_path = temp.path().join("config.toml");

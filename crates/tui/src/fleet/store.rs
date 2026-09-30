@@ -714,15 +714,41 @@ pub fn save_fleet(
     fleet.validate()?;
     let dir = ensure_fleets_dir(scope, workspace)?;
     let path = dir.join(format!("{}.toml", fleet.file_slug()));
-    if path.is_file()
-        && let Ok(text) = fs::read_to_string(&path)
-        && let Ok(existing) = FleetFile::parse(&text)
-        && existing.name != fleet.name
-    {
-        return Err(FleetStoreError::NameTaken {
-            name: fleet.name.clone(),
+    if path.is_file() {
+        // Only a readable v2 Fleet of this same name may be replaced. Any
+        // other non-empty file at this slug (a legacy roster or exact fleet,
+        // a Fleet from a newer build, a Fleet mid-edit that no longer parses)
+        // is left unchanged.
+        let text = fs::read_to_string(&path).map_err(|e| FleetStoreError::Io {
             path: path.display().to_string(),
-        });
+            message: e.to_string(),
+        })?;
+        if !text.trim().is_empty() {
+            match FleetFile::parse(&text) {
+                Ok(existing) if existing.name == fleet.name => {}
+                Ok(_) => {
+                    return Err(FleetStoreError::NameTaken {
+                        name: fleet.name.clone(),
+                        path: path.display().to_string(),
+                    });
+                }
+                Err(parse_error) => {
+                    let reason = if codewhale_workflow::fleet_exact::declared_schema_kind(&text)
+                        .as_deref()
+                        == Some(FLEET_SCHEMA_KIND)
+                    {
+                        format!("is a Fleet file this build cannot read ({parse_error})")
+                    } else {
+                        "holds another fleet file (a legacy roster or exact fleet)".to_string()
+                    };
+                    return Err(FleetStoreError::Invalid(format!(
+                        "{} {reason}; it was left unchanged. Fix or move that file, or save `{}` under another name",
+                        path.display(),
+                        fleet.name
+                    )));
+                }
+            }
+        }
     }
     let rendered = fleet.render_toml()?;
     atomic_write(&path, rendered.as_bytes())?;
@@ -888,20 +914,13 @@ fn clear_selection_if_matching(scope: FleetScope, workspace: &Path, name: &str) 
 
 /// Atomic write: temp file in the same directory, then rename. A failed write
 /// never leaves a half-written Fleet or selection.
+/// Each write gets its own temp file, so two concurrent savers can never
+/// interleave bytes into one shared temp and publish a mixed file.
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), FleetStoreError> {
-    let tmp = path.with_extension("tmp");
-    fs::write(&tmp, bytes).map_err(|e| FleetStoreError::Io {
-        path: tmp.display().to_string(),
+    crate::utils::write_atomic_workspace(path, bytes).map_err(|e| FleetStoreError::Io {
+        path: path.display().to_string(),
         message: e.to_string(),
-    })?;
-    if let Err(e) = fs::rename(&tmp, path) {
-        let _ = fs::remove_file(&tmp);
-        return Err(FleetStoreError::Io {
-            path: path.display().to_string(),
-            message: e.to_string(),
-        });
-    }
-    Ok(())
+    })
 }
 
 /// One row of the migration receipt: how a legacy role profile maps into the
@@ -1583,6 +1602,67 @@ members = []"#;
         other.members = fleet.members.clone();
         let err = save_fleet(&other, FleetScope::Workspace, ws.path()).unwrap_err();
         assert!(err.to_string().contains("already exists"), "{err}");
+    }
+
+    #[test]
+    fn save_refuses_to_overwrite_a_legacy_fleet_file_of_the_same_slug() {
+        let _lock = crate::test_support::lock_test_env();
+        let ws = tempfile::TempDir::new().unwrap();
+        let dir = ws.path().join(".codewhale/fleets");
+        std::fs::create_dir_all(&dir).unwrap();
+        let legacy_path = dir.join("default.toml");
+        let legacy = "[roles.builder]\nmodel = \"deepseek-v4-flash\"\n";
+        std::fs::write(&legacy_path, legacy).unwrap();
+
+        let fleet = FleetFile::new("Default".to_string(), None).unwrap();
+        let err = save_fleet(&fleet, FleetScope::Workspace, ws.path()).unwrap_err();
+        assert!(err.to_string().contains("left unchanged"), "{err}");
+        assert_eq!(std::fs::read_to_string(&legacy_path).unwrap(), legacy);
+
+        // A saved v2 Fleet of the same name is still updated in place.
+        std::fs::remove_file(&legacy_path).unwrap();
+        save_fleet(&fleet, FleetScope::Workspace, ws.path()).expect("first save");
+        save_fleet(&fleet, FleetScope::Workspace, ws.path()).expect("re-save");
+    }
+
+    #[test]
+    fn save_leaves_an_unreadable_fleet_file_of_the_same_slug_unchanged() {
+        let _lock = crate::test_support::lock_test_env();
+        let ws = tempfile::TempDir::new().unwrap();
+        let dir = ws.path().join(".codewhale/fleets");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("default.toml");
+        let fleet = FleetFile::new("Default".to_string(), None).unwrap();
+
+        for existing in [
+            // Written by a newer build.
+            "schema = \"fleet\"\nschema_revision = 3\nname = \"Default\"\n",
+            // The schema declaration other readers normalize.
+            "schema = \"Fleet\"\nschema_revision = 2\nname = \"Default\"\n",
+            // A v2 Fleet the user is mid-edit on.
+            "schema = \"fleet\"\nschema_revision = 2\nname = \"Default\"\nmembers = [\n",
+        ] {
+            std::fs::write(&path, existing).unwrap();
+            let err = save_fleet(&fleet, FleetScope::Workspace, ws.path()).unwrap_err();
+            let message = err.to_string();
+            assert!(message.contains("left unchanged"), "{message}");
+            assert!(!message.contains("migrate"), "{message}");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), existing);
+        }
+        let declared = "schema = \"fleet\"\nschema_revision = 3\nname = \"Default\"\n";
+        std::fs::write(&path, declared).unwrap();
+        let message = save_fleet(&fleet, FleetScope::Workspace, ws.path())
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("cannot read"), "{message}");
+
+        // An empty placeholder is not a Fleet worth keeping.
+        std::fs::write(&path, "").unwrap();
+        save_fleet(&fleet, FleetScope::Workspace, ws.path()).expect("replace empty file");
+        assert!(
+            load_fleet_at(&path).is_ok(),
+            "the saved Fleet must read back"
+        );
     }
 
     #[test]

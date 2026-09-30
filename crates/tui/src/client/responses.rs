@@ -180,10 +180,7 @@ impl CodewhaleClient {
         let account_id = self.codex_account_id.clone();
         let request_body =
             serde_json::to_vec(&body).context("Failed to serialize Responses API request body")?;
-        let open_req = super::stream_entry::StreamOpenRequest::new(
-            super::stream_entry::stream_open_timeout(),
-            self.stream_idle_timeout,
-        );
+        let open_req = self.stream_open_request();
         let response = super::stream_entry::open_sse_response(&open_req, |policy| {
             let url = url.clone();
             let account_id = account_id.clone();
@@ -625,6 +622,7 @@ impl CodewhaleClient {
                             caller,
                             thought_signature,
                         } => ContentBlock::ToolUse {
+                            execution_id: None,
                             id,
                             name,
                             input,
@@ -1021,7 +1019,7 @@ fn string_at<'a>(value: &'a Value, path: &str) -> Option<&'a str> {
 
 /// Parse a composite tool_use_id back to (call_id, item_id).
 /// Composite format: "call_id|item_id"
-fn parse_tool_use_id(id: &str) -> (String, String) {
+pub(super) fn parse_tool_use_id(id: &str) -> (String, String) {
     if let Some(pipe_pos) = id.find('|') {
         (id[..pipe_pos].to_string(), id[pipe_pos + 1..].to_string())
     } else {

@@ -577,12 +577,84 @@ pub(crate) fn coalesce_scroll_burst(
                 latest = *next;
             }
             _ => {
-                pending.push_back(next_observed);
+                // Back to the head, not the tail: `pending` may already hold
+                // later input (typed text, Enter), and this event came first.
+                pending.push_front(next_observed);
                 break;
             }
         }
     }
     Ok(latest)
+}
+
+/// Fold every queued `Resize` behind the one in hand into the final size, so
+/// one clear and redraw serves the whole drag (#65).
+///
+/// The first non-resize event ends the fold and goes back to the head of the
+/// queue, ahead of any later input already drained into `pending`.
+pub(crate) fn coalesce_resize_burst(
+    width: u16,
+    height: u16,
+    input: &TerminalInputPump,
+    pending: &mut VecDeque<ObservedTerminalEvent>,
+) -> std::io::Result<(u16, u16)> {
+    let (mut final_w, mut final_h) = (width, height);
+    while let Some(next_observed) = try_next_terminal_event(input, pending)? {
+        if let Event::Resize(w, h) = next_observed.event {
+            final_w = w;
+            final_h = h;
+        } else {
+            pending.push_front(next_observed);
+            break;
+        }
+    }
+    Ok((final_w, final_h))
+}
+
+/// Toast identity for a failing session save, so recovery can retire it.
+const SESSION_SAVE_FAILURE_TOAST: &str = "session-save-failure";
+
+/// Keep the save-failure notice in step with the persistence actor's session
+/// save health. Saves run off the UI thread, so a full disk or an unwritable
+/// sessions directory used to reach only the log while the user kept working
+/// unsaved. The notice stays while a session's latest save is failing and is
+/// withdrawn once a later save lands.
+pub(crate) fn surface_session_save_health(
+    app: &mut App,
+    reading: Option<crate::tui::persistence_actor::SaveHealthReading>,
+    seen: &mut u64,
+) {
+    let Some(reading) = reading.filter(|reading| reading.generation != *seen) else {
+        return;
+    };
+    *seen = reading.generation;
+    app.retire_event_notices(SESSION_SAVE_FAILURE_TOAST);
+    if let Some((session_id, kind)) = reading.failing {
+        let text = app
+            .tr(MessageId::SessionSaveFailed)
+            .replace("{id}", crate::session_manager::truncate_id(&session_id))
+            .replace("{error}", &kind.to_string());
+        // Standing, not timed: it must outlast the failure, and only the
+        // recovery reading above withdraws it.
+        app.push_status_toast_record(StatusToast::standing(
+            text,
+            StatusToastLevel::Error,
+            SESSION_SAVE_FAILURE_TOAST,
+        ));
+    }
+}
+
+/// The exit line when a session's latest save failed and was never replaced
+/// by a successful one.
+pub(crate) fn shutdown_persistence_notice(
+    locale: codewhale_localization::Locale,
+    reading: &crate::tui::persistence_actor::SaveHealthReading,
+) -> Option<String> {
+    reading.failing.as_ref().map(|(session_id, kind)| {
+        codewhale_localization::tr(locale, MessageId::SessionSaveFailedAtExit)
+            .replace("{id}", session_id)
+            .replace("{error}", &kind.to_string())
+    })
 }
 
 /// Run the interactive TUI event loop.
@@ -805,28 +877,38 @@ pub async fn run_tui(
         && let Ok(manager) = SessionManager::default_location()
     {
         // Try to load by prefix or full ID
-        let load_result: std::io::Result<Option<crate::session_manager::SavedSession>> =
+        let load_result: std::io::Result<
+            Option<(
+                crate::session_manager::SavedSession,
+                crate::session_manager::SessionLease,
+            )>,
+        > =
+            // `attach_*` reserves the session's live lease first, and refuses
+            // a session another window has open instead of becoming its second
+            // autosaving writer. The lease is committed once the session is
+            // applied.
             if session_id == "latest" {
                 // Special case: resume the most recent session in this workspace.
                 match manager.get_latest_session_for_workspace(&options.workspace) {
                     Ok(Some(meta)) => manager
-                        .resume_session(&meta.id)
-                        .map(|recovery| Some(recovery.session)),
+                        .attach_session(&meta.id)
+                        .map(|(recovery, lease)| Some((recovery.session, lease))),
                     Ok(None) => Ok(None),
                     Err(e) => Err(e),
                 }
             } else {
                 manager
-                    .resume_session_by_prefix(session_id)
-                    .map(|recovery| Some(recovery.session))
+                    .attach_session_by_prefix(session_id)
+                    .map(|(recovery, lease)| Some((recovery.session, lease)))
             };
 
         match load_result {
-            Ok(Some(saved)) => match manager.load_session_goal(&saved.metadata.id) {
+            Ok(Some((saved, lease))) => match manager.load_session_goal(&saved.metadata.id) {
                 Ok(goal) => {
                     let saved_id = saved.metadata.id.clone();
                     match apply_loaded_session_with_goal(&mut app, config, saved, goal.as_ref()) {
                         Ok(()) => {
+                            lease.commit();
                             app.status_message = Some(format!(
                                 "Resumed session: {}",
                                 crate::session_manager::truncate_id(&saved_id)
@@ -1158,6 +1240,7 @@ pub async fn run_tui(
     // applied), the checkpoint is the only durable record of that work:
     // clearing it here unconditionally could erase in-flight progress that
     // never reached a snapshot, so it survives for startup recovery review.
+    let mut shutdown_save_health = None;
     if let Some((handle, task)) = persistence_runtime {
         // A quit key can leave the frame before its usual queue comparison.
         // Capture the final edited draft before the shutdown durability barrier.
@@ -1186,6 +1269,9 @@ pub async fn run_tui(
                 "session persistence reported write failures during shutdown",
             );
         }
+        // Read after the final flush: whether each session's latest save
+        // landed, not every failure this run has ever seen.
+        shutdown_save_health = Some(handle.session_save_health());
         handle.try_send(PersistRequest::Shutdown);
         let _ = task.await;
     }
@@ -1245,7 +1331,24 @@ pub async fn run_tui(
         }
     }
 
+    if let Some(notice) = shutdown_save_health
+        .as_ref()
+        .and_then(|reading| shutdown_persistence_notice(app.ui_locale, reading))
+    {
+        // Primary screen, like the settings failures above.
+        #[allow(clippy::print_stderr)]
+        {
+            eprintln!("{notice}");
+        }
+    }
+
+    // `codewhale resume <id>` for a document that never reached disk (every
+    // save failed, or nothing was ever saved) only fails with NotFound.
+    let session_document_exists = app.current_session_id.as_deref().is_some_and(|id| {
+        SessionManager::default_location().is_ok_and(|manager| manager.session_document_exists(id))
+    });
     if result.is_ok()
+        && session_document_exists
         && let Some(hint) = resume_hint_text(
             app.ui_locale,
             app.current_session_id.as_deref(),
@@ -1264,6 +1367,20 @@ pub async fn run_tui(
     }
 
     result
+}
+
+/// Whether a composer guard owns this launch-screen Enter. Every guard is
+/// applied here, before a session exists, so a held submit never leaves the
+/// user in a new empty session.
+pub(super) fn launch_submit_held(app: &mut App) -> bool {
+    if app.startup_input_unproven || !app.composer_enter_would_submit() {
+        // A paste burst, empty composer or startup integrity hold.
+        app.handle_composer_enter();
+        return true;
+    }
+    // An oversized draft is backed up to a paste file now; if that fails the
+    // submit is held with the full text in the composer.
+    !app.consolidate_large_input_if_oversized()
 }
 
 /// Submit the pre-session composer's message as the first message of a new
@@ -1304,10 +1421,7 @@ async fn dispatch_launch_composer_submit(
         .await;
     }
     let action = app.decide_composer_submit(chord);
-    if app.startup_input_unproven || !app.composer_enter_would_submit() {
-        // A paste burst, empty composer or startup integrity hold owns this
-        // Enter. Apply that guard without creating an empty session.
-        app.handle_composer_enter();
+    if launch_submit_held(app) {
         return Ok(false);
     }
     let result = begin_launch_session(app, None);
@@ -1338,14 +1452,6 @@ async fn dispatch_launch_composer_submit(
     Ok(false)
 }
 
-/// Submit the live-session composer through the same branches Enter uses.
-///
-/// Mouse `[↵]` sets `pending_composer_submit`; this consumes that chord without
-/// duplicating draft consumption or opening transcript-only Enter shortcuts.
-/// Its own gates (`SendQueuedNow`, the paste-burst probe) run here; everything
-/// from slash-menu selection onward is the shared `submit_decided_composer_input`
-/// tail the keyboard Enter arm also uses, so the two surfaces cannot drift.
-#[allow(clippy::too_many_arguments)]
 /// Show why a turn ended without success. The composer status line always
 /// names it; a turn the Engine stopped itself (wall-clock or step budget, no
 /// progress, an incomplete response) posts no error event, so its reason also
@@ -1357,20 +1463,41 @@ pub(super) fn present_turn_failure(
     status: crate::core::events::TurnOutcomeStatus,
     error: Option<&str>,
 ) {
-    let Some(error) = error else { return };
-    if app.turn_error_posted {
-        return;
+    let failed = matches!(status, crate::core::events::TurnOutcomeStatus::Failed);
+    // What the transcript shows for this turn's failure: the error cell an
+    // earlier `Event::Error` already posted, or the notice added here.
+    let shown = if app.turn_error_posted {
+        app.turn_error_notice.clone()
+    } else if let Some(error) = error {
+        let notice = format!("{}: {error}", app.tr(MessageId::NotificationTurnFailed));
+        if failed {
+            app.add_message(HistoryCell::Error {
+                message: notice.clone(),
+                severity: crate::error_taxonomy::ErrorSeverity::Warning,
+            });
+        }
+        app.set_sticky_status(notice.clone(), StatusToastLevel::Error, None);
+        Some(notice)
+    } else {
+        None
+    };
+    // Persist the failure with the session (redacted), so resume, export,
+    // and the Runtime API can say why the turn stopped after the TUI closes.
+    if failed && let Some(shown) = shown {
+        let outcome =
+            crate::session_manager::SavedTurnOutcome::failed(&shown, app.api_messages.len());
+        crate::session_manager::push_turn_outcome(&mut app.session_turn_outcomes, outcome);
     }
-    let notice = format!("{}: {error}", app.tr(MessageId::NotificationTurnFailed));
-    if matches!(status, crate::core::events::TurnOutcomeStatus::Failed) {
-        app.add_message(HistoryCell::Error {
-            message: notice.clone(),
-            severity: crate::error_taxonomy::ErrorSeverity::Warning,
-        });
-    }
-    app.set_sticky_status(notice, StatusToastLevel::Error, None);
 }
 
+/// Submit the live-session composer through the same branches Enter uses.
+///
+/// Mouse `[↵]` sets `pending_composer_submit`; this consumes that chord without
+/// duplicating draft consumption or opening transcript-only Enter shortcuts.
+/// Its own gates (`SendQueuedNow`, the paste-burst probe) run here; everything
+/// from slash-menu selection onward is the shared `submit_decided_composer_input`
+/// tail the keyboard Enter arm also uses, so the two surfaces cannot drift.
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_session_composer_submit(
     terminal: &mut AppTerminal,
     app: &mut App,
@@ -1638,6 +1765,7 @@ pub(crate) async fn run_event_loop(
     }
 
     let mut pending_subagent_list_refresh = false;
+    let mut session_save_health_seen = 0u64;
 
     loop {
         // #6169: first statement of every iteration. The job-control handler can
@@ -1985,8 +2113,15 @@ pub(crate) async fn run_event_loop(
             deliver_constitution_draft_result(app, model_label, draft_locale, outcome);
         }
 
+        surface_session_save_health(
+            app,
+            crate::tui::persistence_actor::session_save_health(),
+            &mut session_save_health_seen,
+        );
+
         // Discovery and callback delivery never park terminal input.
         poll_mcp_login(app);
+        poll_mcp_retries(app);
 
         // #1830/#2317: service any already-arrived terminal keys before a
         // potentially long engine batch so composer/modal input stays live.
@@ -2360,10 +2495,23 @@ pub(crate) async fn run_event_loop(
                         streaming_thinking::stash_reasoning_buffer_into_last_reasoning(app);
                         stream_display_clock.reset();
                     }
-                    EngineEvent::ToolCallStarted { id, name, input } => {
+                    EngineEvent::ToolCallStarted {
+                        id,
+                        name,
+                        input,
+                        model_call,
+                    } => {
                         app.session_metrics.record_tool_started(&id);
-                        app.pending_tool_uses
-                            .push((id.clone(), name.clone(), input.clone()));
+                        if let Some(model_call) = model_call {
+                            app.pending_tool_uses.push(ContentBlock::ToolUse {
+                                id: model_call.provider_id,
+                                execution_id: Some(id.clone()),
+                                name: name.clone(),
+                                input: input.clone(),
+                                caller: model_call.caller,
+                                thought_signature: model_call.thought_signature,
+                            });
+                        }
                         // Note this dispatch so the next sub-agent `Started`
                         // mailbox envelope routes into the right card kind
                         // (delegate vs fanout).
@@ -2389,7 +2537,12 @@ pub(crate) async fn run_event_loop(
                     // transcript renders from the ToolCall* events.
                     EngineEvent::OperationActivityStarted { .. }
                     | EngineEvent::OperationActivityCompleted { .. } => {}
-                    EngineEvent::ToolCallComplete { id, name, result } => {
+                    EngineEvent::ToolCallComplete {
+                        id,
+                        name,
+                        result,
+                        model_call,
+                    } => {
                         if crate::tui::tool_routing::evidence_completion_should_be_ignored(
                             app, &id, &result,
                         ) {
@@ -2397,7 +2550,7 @@ pub(crate) async fn run_event_loop(
                             continue;
                         }
                         app.session_metrics.record_tool_completed(&id);
-                        if is_model_visible_tool_call(&id) {
+                        if let Some(model_call) = model_call {
                             let tool_content = match &result {
                                 Ok(output) => sanitize_stream_chunk(
                                     &tool_result_content_for_api_message(app, &name, output),
@@ -2407,15 +2560,18 @@ pub(crate) async fn run_event_loop(
                             app.push_api_message(Message {
                                 role: Role::User,
                                 content: vec![ContentBlock::ToolResult {
-                                    tool_use_id: id.clone(),
+                                    execution_id: Some(id.clone()),
+                                    tool_use_id: model_call.provider_id,
                                     content: tool_content,
                                     is_error: None,
                                     content_blocks: None,
                                 }],
                             });
                         } else {
-                            app.pending_tool_uses
-                                .retain(|(tool_id, _, _)| tool_id != &id);
+                            app.pending_tool_uses.retain(|block| {
+                                block.tool_call_key()
+                                    != Some(codewhale_models::ToolCallKey::Execution(&id))
+                            });
                         }
                         handle_tool_call_complete(app, &id, &name, &result);
                         if name
@@ -2518,6 +2674,7 @@ pub(crate) async fn run_event_loop(
                         app.is_loading = true;
                         app.offline_mode = false;
                         app.turn_error_posted = false;
+                        app.turn_error_notice = None;
                         app.lsp_repair = crate::tui::app::LspRepairState::default();
                         app.prompt_suggestion = None;
                         app.prompt_suggestion_gen
@@ -4690,25 +4847,12 @@ pub(crate) async fn run_event_loop(
                 // common "stale art on the right edge" symptom (#65) caused by
                 // the diff renderer skipping cells that match a stale back
                 // buffer between intermediate sizes.
-                let mut final_w = width;
-                let mut final_h = height;
-                while let Some(next_observed) =
-                    try_next_terminal_event(&terminal_input, &mut pending_terminal_events)?
-                {
-                    match next_observed.event {
-                        Event::Resize(w, h) => {
-                            final_w = w;
-                            final_h = h;
-                        }
-                        other => {
-                            pending_terminal_events.push_back(ObservedTerminalEvent::new(
-                                other,
-                                next_observed.observed_at,
-                            ));
-                            break;
-                        }
-                    }
-                }
+                let (final_w, final_h) = coalesce_resize_burst(
+                    width,
+                    height,
+                    &terminal_input,
+                    &mut pending_terminal_events,
+                )?;
 
                 if final_w == 0 || final_h == 0 {
                     tracing::debug!(

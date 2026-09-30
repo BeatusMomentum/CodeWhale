@@ -499,31 +499,40 @@ fn publish_offloaded_context(
 }
 
 /// When a message containing a ToolUse or ToolResult is marked for removal,
-/// cascade that removal to its counterpart so the API never sees orphaned
-/// blocks. Runs a fixpoint loop until the remove set is closed under pairing.
+/// cascade that removal to its unambiguous counterpart. Corrupt or ambiguous
+/// identities cannot select another exchange for deletion. Runs a fixpoint
+/// loop until the remove set is closed under proven pairing.
 fn cascade_tool_pair_removals(messages: &[Message], remove_set: &mut FastHashSet<usize>) {
     if remove_set.is_empty() {
         return;
     }
 
-    // Internal transcript IDs and message indices are assigned by the engine,
-    // so this per-purge pairing pass can use the faster non-cryptographic hasher.
-    let mut call_id_to_idx: FastHashMap<String, usize> = FastHashMap::default();
-    let mut result_id_to_idx: FastHashMap<String, usize> = FastHashMap::default();
-
+    // A reused provider ID is not a unique host identity. Ambiguous entries
+    // cannot select another exchange's counterpart for deletion.
+    let mut call_id_to_idx = FastHashMap::default();
+    let mut result_id_to_idx = FastHashMap::default();
     for (idx, msg) in messages.iter().enumerate() {
         for block in &msg.content {
-            match block {
+            let Some(key) = block
+                .tool_call_key()
+                .filter(|key| !key.as_str().trim().is_empty())
+            else {
+                continue;
+            };
+            let (map, provider_id) = match block {
                 ContentBlock::ToolUse { id, .. } | ContentBlock::ServerToolUse { id, .. } => {
-                    call_id_to_idx.insert(id.clone(), idx);
+                    (&mut call_id_to_idx, id.as_str())
                 }
                 ContentBlock::ToolResult { tool_use_id, .. }
                 | ContentBlock::ToolSearchToolResult { tool_use_id, .. }
                 | ContentBlock::CodeExecutionToolResult { tool_use_id, .. } => {
-                    result_id_to_idx.insert(tool_use_id.clone(), idx);
+                    (&mut result_id_to_idx, tool_use_id.as_str())
                 }
-                _ => {}
-            }
+                _ => continue,
+            };
+            map.entry(key)
+                .and_modify(|entry| *entry = None)
+                .or_insert(Some((idx, provider_id)));
         }
     }
 
@@ -538,7 +547,16 @@ fn cascade_tool_pair_removals(messages: &[Message], remove_set: &mut FastHashSet
             for block in &msg.content {
                 match block {
                     ContentBlock::ToolUse { id, .. } | ContentBlock::ServerToolUse { id, .. } => {
-                        if let Some(&result_idx) = result_id_to_idx.get(id)
+                        if let Some(&(result_idx, provider_id)) = block
+                            .tool_call_key()
+                            .and_then(|key| result_id_to_idx.get(&key))
+                            .and_then(Option::as_ref)
+                            && provider_id == id.as_str()
+                            && block
+                                .tool_call_key()
+                                .and_then(|key| call_id_to_idx.get(&key))
+                                .and_then(Option::as_ref)
+                                .is_some_and(|(call_idx, _)| *call_idx == idx)
                             && remove_set.insert(result_idx)
                         {
                             changed = true;
@@ -547,7 +565,16 @@ fn cascade_tool_pair_removals(messages: &[Message], remove_set: &mut FastHashSet
                     ContentBlock::ToolResult { tool_use_id, .. }
                     | ContentBlock::ToolSearchToolResult { tool_use_id, .. }
                     | ContentBlock::CodeExecutionToolResult { tool_use_id, .. } => {
-                        if let Some(&call_idx) = call_id_to_idx.get(tool_use_id)
+                        if let Some(&(call_idx, provider_id)) = block
+                            .tool_call_key()
+                            .and_then(|key| call_id_to_idx.get(&key))
+                            .and_then(Option::as_ref)
+                            && provider_id == tool_use_id.as_str()
+                            && block
+                                .tool_call_key()
+                                .and_then(|key| result_id_to_idx.get(&key))
+                                .and_then(Option::as_ref)
+                                .is_some_and(|(result_idx, _)| *result_idx == idx)
                             && remove_set.insert(call_idx)
                         {
                             changed = true;
@@ -753,6 +780,7 @@ mod tests {
         Message {
             role: Role::Assistant,
             content: vec![ContentBlock::ToolUse {
+                execution_id: None,
                 id: id.to_string(),
                 name: name.to_string(),
                 input,
@@ -766,12 +794,35 @@ mod tests {
         Message {
             role: Role::User,
             content: vec![ContentBlock::ToolResult {
+                execution_id: None,
                 tool_use_id: id.to_string(),
                 content: content.to_string(),
                 is_error: None,
                 content_blocks: None,
             }],
         }
+    }
+
+    #[test]
+    fn purge_counterparts_use_execution_identity_without_legacy_fallback() {
+        let messages: Vec<Message> = serde_json::from_value(json!([
+            {"role":"assistant","content":[{"type":"tool_use","id":"wire","execution_id":"first","name":"read","input":{}}]},
+            {"role":"user","content":[{"type":"tool_result","tool_use_id":"wire","execution_id":"first","content":"first"}]},
+            {"role":"assistant","content":[{"type":"tool_use","id":"wire","execution_id":"second","name":"read","input":{}}]},
+            {"role":"user","content":[{"type":"tool_result","tool_use_id":"wire","execution_id":"second","content":"second"}]},
+            {"role":"assistant","content":[{"type":"tool_use","id":"first","name":"read","input":{}}]},
+            {"role":"user","content":[{"type":"tool_result","tool_use_id":"first","content":"legacy"}]}
+        ])).unwrap();
+        for (selected, expected) in [(0, vec![0, 1]), (3, vec![2, 3]), (4, vec![4, 5])] {
+            let mut remove = FastHashSet::from_iter([selected]);
+            cascade_tool_pair_removals(&messages, &mut remove);
+            assert_eq!(remove, FastHashSet::from_iter(expected));
+        }
+        let mut ambiguous = messages.clone();
+        ambiguous.push(messages[0].clone());
+        let mut remove = FastHashSet::from_iter([0]);
+        cascade_tool_pair_removals(&ambiguous, &mut remove);
+        assert_eq!(remove, FastHashSet::from_iter([0]));
     }
 
     #[test]
@@ -1101,6 +1152,7 @@ mod tests {
             r#type: "message".to_string(),
             role: "assistant".to_string(),
             content: vec![ContentBlock::ToolUse {
+                execution_id: None,
                 id: "call_purge".to_string(),
                 name: "purge_context".to_string(),
                 input: json!({"operations": operations}),

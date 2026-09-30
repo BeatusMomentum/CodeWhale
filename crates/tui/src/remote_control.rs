@@ -6421,6 +6421,7 @@ mod tests {
             content: "existing turn output".to_string(),
         });
         controller.observe_engine_event(&EngineEvent::ToolCallStarted {
+            model_call: None,
             id: "tool_existing".to_string(),
             name: "shell".to_string(),
             input: json!({ "never": "relayed" }),
@@ -8800,6 +8801,7 @@ mod tests {
         );
 
         controller.observe_engine_event(&EngineEvent::ToolCallStarted {
+            model_call: None,
             id: "tool_fixture".to_string(),
             name: "shell".to_string(),
             input: json!({}),

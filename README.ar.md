@@ -1,4 +1,4 @@
-<!-- source: README.md sha256:ccb7a0b00317 -->
+<!-- source: README.md sha256:925619135f77 -->
 # Codewhale
 
 Codewhale وكيل مفتوح المصدر يقرأ مشروعك ويعدّل الملفات ويشغّل الأوامر ويتحقق من عمله باستخدام نموذج مستضاف أو محلي تختاره. ابدأ بمهمة واحدة في الطرفية. وللأعمال الأكبر، وزّع أجزاء العمل على وكلاء بنماذج وأدوار مختلفة.
@@ -23,6 +23,8 @@ curl -fsSL https://codewhale.net/install.sh | sh
 "$HOME/.local/bin/codewhale"
 ```
 
+إذا ظهرت رسالة "command not found" عند تشغيل `codewhale` وحده، فهذا يعني أن `~/.local/bin` ليس ضمن PATH بعد: شغّل السطر الواحد الذي يطبعه المثبّت لواجهة الأوامر لديك، أو راجع [إضافته إلى PATH](docs/INSTALL.md#put-it-on-your-path).
+
 يختار المثبّت أحدث إصدار منشور. ويصف [سجل التغييرات](CHANGELOG.md) أيضًا النسخة المرشحة غير المنشورة للإصدار التالي؛ ولا تُضمّن هذه التغييرات في التنزيلات المنشورة حتى يصبح الإصدار متاحًا.
 
 على Windows، نزّل المثبّت أو الأرشيف المناسب من [GitHub Releases](https://github.com/Hmbown/CodeWhale/releases/latest). لتحديث تثبيت مباشر موجود، شغّل `codewhale update`، أو `codewhale update --check` للفحص فقط. يعرض المحدّث مسار الملف التنفيذي ويحتفظ بالبنيات الأحدث. npm وCargo خياران ثانويان؛ راجع [دليل التثبيت](docs/INSTALL.md) للانتقال من تثبيت يديره مدير حزم وإعداد PATH.
@@ -33,7 +35,7 @@ curl -fsSL https://codewhale.net/install.sh | sh
 
 ## الاستخدام
 
-افتح طرفية في مجلد مشروعك وشغّل `codewhale`. اختر موفّرك باستخدام `/provider` ونموذجك باستخدام `/model`. ثم صِف مهمة محددة:
+افتح طرفية في مجلد مشروعك وشغّل `codewhale` (بعد أن يصبح [ضمن PATH](docs/INSTALL.md#put-it-on-your-path)). اختر موفّرك باستخدام `/provider` ونموذجك باستخدام `/model`. ثم صِف مهمة محددة:
 
 ```text
 Fix the failing tests and explain what changed.
@@ -76,6 +78,7 @@ codewhale exec "fix the failing tests and explain what changed"
 
 ## الوثائق
 
+- [إعداد مراجعة طلبات السحب على GitHub](docs/GITHUB_ACTION.md)
 - [الموفّرون والنماذج المحلية](docs/PROVIDERS.md)
 - [فرق الوكلاء](docs/FLEET.md)
 - [MCP](docs/MCP.md) و[الخطافات](docs/HOOKS.md) و[الإعدادات](docs/CONFIGURATION.md)

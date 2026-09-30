@@ -202,13 +202,26 @@ fn extract_into(scan: &TarballScan, bytes: &[u8], dest: &Path, max_size: u64) ->
             if total_size > max_size {
                 return Err(PluginInstallError::OversizedBundle { limit: max_size }.into());
             }
-            let mut out = fs::OpenOptions::new()
-                .create_new(true)
-                .write(true)
+            let mut options = fs::OpenOptions::new();
+            options.create_new(true).write(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                options.mode(0o600);
+            }
+            let mut out = options
                 .open(&target)
                 .with_context(|| format!("failed to create {}", target.display()))?;
             out.write_all(&buf)
                 .with_context(|| format!("failed to write {}", target.display()))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                let executable = header.mode().context("invalid archive file mode")? & 0o111 != 0;
+                let mode = if executable { 0o700 } else { 0o600 };
+                out.set_permissions(fs::Permissions::from_mode(mode))
+                    .with_context(|| format!("failed to set mode for {}", target.display()))?;
+            }
         }
     }
     Ok(())

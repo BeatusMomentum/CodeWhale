@@ -1,5 +1,7 @@
 # Runtime API & Integration Contract
 
+> 阅读简体中文版：[zh_hans/RUNTIME_API.md](zh_hans/RUNTIME_API.md)。
+
 `codewhale app-server` is the canonical local runtime API and control plane.
 Local SDKs, mobile/remote-control clients, and editor integrations talk to it
 instead of screen-scraping terminal output. It serves the full HTTP/SSE runtime
@@ -39,9 +41,9 @@ local supervisor / SDK / automation harness
 The engine runs as a local-only process. All APIs bind to `localhost` by
 default. No hosted relay, no provider-token custody, no secret leakage.
 
-For a proposed read-only audit export over completed turns, see
-[`docs/RECEIPTS.md`](RECEIPTS.md). That document is a protocol note; the receipt
-CLI/API surfaces are not implemented yet.
+For the read-only record of what a thread or turn did, see
+[`docs/RECEIPTS.md`](RECEIPTS.md): `codewhale receipts` on the CLI and the
+`/receipt` routes under **Threads** below.
 
 ## Runtime API entrypoints
 
@@ -451,6 +453,40 @@ in the app-server can produce model output, so a prompt either runs or fails.
 and replies `status: "completed"` with the streamed frames in `events` — where
 it previously replied `accepted` without doing anything.
 
+### Thread ids and restarts
+
+`thread/message`, `thread/request` messages, and HTTP `POST /thread` messages
+take a thread id from `thread/create` (or `thread/fork`). An id that was never
+created fails with `-32004` (`thread_not_found`) on stdio, or HTTP `404` on
+`/thread`, before any runtime thread is started. `/prompt`, `prompt/request`,
+and `prompt/run` are different: their optional `thread_id` is any key the
+caller chooses, and a new key starts a new conversation.
+
+The runtime thread behind each created thread is recorded in the state store,
+so a message sent after the app-server restarts continues the same
+conversation. If the runtime no longer has that thread (its data directory was
+removed or replaced), the next message starts a new runtime thread in the
+thread's recorded workspace and records it; the earlier conversation is not
+recovered. `thread/resume` and `thread/fork` without `cwd` keep the recorded
+workspace (a fork uses its parent's). A new fork, or a persisted thread resumed
+through a fresh metadata manager, can record an explicit `cwd`. This control
+transport does not move an already linked Runtime thread: its workspace remains
+owned by the Runtime API. Updating that thread's workspace requires the Runtime
+`PATCH /v1/threads/{id}` operation; cached metadata resume also does not persist
+an explicit cwd change. These paths are not a cross-store workspace transaction.
+
+### Changing config
+
+`app/config/set` and `app/config/unset` write the change to the config file
+before replying: the `--config` path, or the default `config.toml` the runtime
+child also reads when no `--config` is given. They change user settings that
+outlive the app-server, not just this session. The change is applied to the
+file as it is on disk, so edits saved by other processes are kept. If the file
+cannot be read, parsed, or written, the reply is `ok: false` and nothing
+changes; a file that does not parse is not rewritten, so fix it by hand (or
+`app/config/reload` after fixing it). Over HTTP `/app`, a rejected key or value
+is `400` and a read or write failure is `500`.
+
 ### Answering a clarification question
 
 When a headless turn calls `request_user_input`, the runtime emits a
@@ -759,7 +795,10 @@ a TLS or verified transport boundary.
 - `GET /v1/sessions?limit=50&search=<fuzzy>&include_archived=false&archived_only=false&workspace=<path>&sort=recent|name|size`
 - `GET /v1/sessions/summary?…` (same query params; projected row shape)
 - `GET /v1/sessions/{id}` (add `?peek=true&entries=12` for a bounded, redacted
-  read-only peek instead of the full transcript)
+  read-only peek instead of the full transcript). The full response carries
+  `turn_outcomes` when a turn ended `Failed`: `{ status, error, ended_at,
+  after_message_count }` per failure, oldest first, bounded to 64, with the
+  error text the transcript showed and secrets redacted
 - `PATCH /v1/sessions/{id}` (`{ "title"?: string, "archived"?: bool }`)
 - `DELETE /v1/sessions/{id}`
 - `POST /v1/sessions/{id}/resume-thread` returns the open thread that already
@@ -1420,9 +1459,6 @@ Capability probe: `GET` on the route returns `405` where the endpoint exists
 and `404` on an older engine; clients treat any non-`404` as available and
 degrade with an explanation otherwise.
 
-**Receipts** (future read-only audit export)
-- Proposed only: `GET /v1/threads/{thread_id}/turns/{turn_id}/receipt`
-
 **Compatibility stream** (one-shot, backwards-compatible)
 - `POST /v1/stream`
 
@@ -1581,7 +1617,13 @@ routes are the contract for now.
   "tty"?, "env"? }` → `201 { "job" }`; runs as a background shell under the
   thread's projected sandbox policy. `tty: true` merges stderr into stdout
   and gives the command a terminal (required for interactive programs);
-  background jobs are never killed at `timeout_ms`
+  background jobs are never killed at `timeout_ms`. A relative `cwd`
+  resolves against the thread workspace. Outside trust mode `cwd` must stay
+  inside it after symlinks resolve (`403` otherwise): unlike the shell tool,
+  this route does not follow `workspace_follow_symlinks` or `/trust add`
+  roots, so a symlink leading out of the workspace is refused. The job runs
+  in the resolved directory that was checked (a later symlink retarget does
+  not move it); a `cwd` that resolves to a non-UTF-8 path is a `400`
 - `GET /v1/threads/{id}/jobs/{job_id}` — one job's status + metadata
 - `GET /v1/threads/{id}/jobs/{job_id}/output?stream=<stdout|stderr>&cursor=
   <bytes>&max_bytes=<1-512KiB>&wait_ms=<0-30s>&format=<base64|text>` — the
@@ -1727,7 +1769,9 @@ also how a client sees model-spawned work.
   (tracked paths only — no `all`, an untracked path fails closed);
   `POST /v1/git/commit` `{ "message", "all"? }`; stage, unstage, discard
   and commit also take an optional `expect` (below); `POST /v1/git/push`
-  `{ "remote"?, "set_upstream"? }`; `POST /v1/git/branch`
+  `{ "remote"?, "set_upstream"? }` (`remote`, or `origin` when only
+  `set_upstream` is given, must name a configured remote);
+  `POST /v1/git/branch`
   `{ "name", "create"? }`
 
 Diffs and precondition token reads run through the hardened review command

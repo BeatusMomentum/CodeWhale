@@ -1552,6 +1552,17 @@ pub trait ToolSpec: Send + Sync {
         })
     }
 
+    /// The approval-grant scope this tool's calls are keyed under instead of
+    /// the name-derived key families, if it has one. `None` (every built-in,
+    /// script and MCP tool) keeps [`crate::tools::approval_cache`]'s keys.
+    ///
+    /// Extension tools return `ext:<plugin_id>@<content_hash>`, so a session
+    /// grant covers one reviewed plugin build: an updated plugin, or another
+    /// plugin that later registers the same name, is asked again.
+    fn approval_scope(&self) -> Option<String> {
+        None
+    }
+
     /// Returns whether this tool should be excluded from the model-visible
     /// tool catalog (deferred loading). Tools marked `true` are registered
     /// but not sent to the model until explicitly activated via tool search.

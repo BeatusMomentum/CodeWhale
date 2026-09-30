@@ -510,6 +510,19 @@ impl SessionPickerView {
     fn delete_selected(&mut self) -> Option<ViewEvent> {
         let session = self.selected_session().cloned()?;
         let manager = SessionManager::default_location().ok()?;
+        // A deleted document the live session still owns refuses every later
+        // save, so the conversation on screen would silently stop persisting.
+        let refusal = if self.current_session_id.as_deref() == Some(session.id.as_str()) {
+            Some(MessageId::SessionsDeleteOpenHere)
+        } else if manager.is_session_live_anywhere(&session.id) {
+            Some(MessageId::SessionsDeleteOpenElsewhere)
+        } else {
+            None
+        };
+        if let Some(reason) = refusal {
+            self.status = Some(tr(self.locale, reason).into_owned());
+            return None;
+        }
         if let Err(err) = manager.delete_session(&session.id) {
             self.status = Some(
                 tr(self.locale, MessageId::SessionsDeleteFailed)
@@ -1631,6 +1644,59 @@ mod tests {
         };
         view.apply_sort_and_filter();
         view
+    }
+
+    /// Deleting the session open in this window would leave it unable to
+    /// save anything afterwards, with nothing on screen saying so.
+    #[test]
+    fn delete_refuses_the_session_open_here() {
+        let _lock = crate::test_support::lock_test_env();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", tmp.path());
+        let manager = SessionManager::default_location().expect("session manager");
+        let mut saved = saved_session_with_messages(vec![text_message("user", "hello")]);
+        saved.metadata.id = "session-open-here".to_string();
+        manager.save_session(&saved).expect("save session");
+        let mut view = picker_with(vec![saved.metadata.clone()], None);
+        view.current_session_id = Some("session-open-here".to_string());
+
+        assert!(view.delete_selected().is_none(), "no deletion event");
+
+        assert_eq!(
+            view.status.as_deref(),
+            Some(tr(view.locale, MessageId::SessionsDeleteOpenHere).as_ref())
+        );
+        assert_eq!(view.sessions.len(), 1, "the row stays listed");
+        assert!(
+            manager.load_session("session-open-here").is_ok(),
+            "the document is not deleted"
+        );
+    }
+
+    /// A session another Codewhale window holds open would be written back
+    /// by that window's next autosave, so deleting it here is refused.
+    #[test]
+    fn delete_refuses_a_session_open_in_another_window() {
+        let _lock = crate::test_support::lock_test_env();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", tmp.path());
+        let manager = SessionManager::default_location().expect("session manager");
+        let mut saved = saved_session_with_messages(vec![text_message("user", "hello")]);
+        saved.metadata.id = "session-open-elsewhere".to_string();
+        manager.save_session(&saved).expect("save session");
+        let _lease = manager.hold_live_lease_elsewhere("session-open-elsewhere");
+        let mut view = picker_with(vec![saved.metadata.clone()], None);
+
+        assert!(view.delete_selected().is_none(), "no deletion event");
+
+        assert_eq!(
+            view.status.as_deref(),
+            Some(tr(view.locale, MessageId::SessionsDeleteOpenElsewhere).as_ref())
+        );
+        assert!(
+            manager.load_session("session-open-elsewhere").is_ok(),
+            "the document is not deleted"
+        );
     }
 
     #[test]

@@ -4,7 +4,7 @@ import { redirect } from "next/navigation";
 import PricingPage from "../app/[locale]/pricing/page";
 import { footerLegalLinks } from "./i18n/links";
 import { getChrome } from "./i18n/dictionaries";
-import { LEGAL_UPDATED, PRIVACY_SECTIONS, TERMS_SECTIONS } from "./legal-copy";
+import { formatLegalUpdated, LEGAL_UPDATED, PRIVACY_SECTIONS, TERMS_SECTIONS } from "./legal-copy";
 
 const webRoot = new URL("../", import.meta.url);
 vi.mock("next/navigation", () => ({ redirect: vi.fn() }));
@@ -26,7 +26,9 @@ describe("public legal routes and retired pricing", () => {
       "/en/legal/terms",
       "/en/legal/privacy",
     ]);
-    expect(LEGAL_UPDATED).toBe("September 4, 2026");
+    expect(LEGAL_UPDATED).toBe("2026-09-04");
+    expect(formatLegalUpdated(getChrome("en").dateLocale)).toBe("September 4, 2026");
+    expect(formatLegalUpdated(getChrome("de").dateLocale)).toBe("4. September 2026");
     expect(TERMS_SECTIONS.some((s) => s.title === "Plans and charges")).toBe(true);
     expect(PRIVACY_SECTIONS.some((s) => s.title === "Retention and deletion")).toBe(true);
   });

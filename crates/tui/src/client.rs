@@ -350,6 +350,12 @@ pub struct CodewhaleClient {
     test_messages_transport_base_url: Option<String>,
     pub(super) reasoning_stream_style: Option<String>,
     pub(super) stream_idle_timeout: Duration,
+    /// Bounded wait for SSE response headers, resolved once from
+    /// `[stream].open_timeout_secs`, legacy `[tui]`, or the environment fallback.
+    pub(super) stream_open_timeout: Duration,
+    /// HTTP/1.1 pin resolved once from `Config::force_http1` (#6700); the
+    /// single source every client builder and stream open reads.
+    pub(super) force_http1: bool,
 }
 
 const CONNECTION_FAILURE_THRESHOLD: u32 = 2;
@@ -638,6 +644,8 @@ impl Clone for CodewhaleClient {
             test_messages_transport_base_url: self.test_messages_transport_base_url.clone(),
             reasoning_stream_style: self.reasoning_stream_style.clone(),
             stream_idle_timeout: self.stream_idle_timeout,
+            stream_open_timeout: self.stream_open_timeout,
+            force_http1: self.force_http1,
         }
     }
 }
@@ -1385,9 +1393,9 @@ fn build_speech_synthesis_body(
 // === CodewhaleClient ===
 
 /// Returns true when CODEWHALE_FORCE_HTTP1 (legacy alias: DEEPSEEK_FORCE_HTTP1)
-/// is set to a truthy value (`1`, `true`, `yes`, `on`, case-insensitive). Used
-/// by `build_http_client` to opt out of HTTP/2 entirely when a provider's edge
-/// mishandles long-lived H2 streams (#103). Anything else (unset, `0`,
+/// is set to a truthy value (`1`, `true`, `yes`, `on`, case-insensitive). Read
+/// only by `Config::force_http1`, which ORs it with the selected stream config flag; every
+/// client builder and stream open takes that resolved value (#103, #6700). Anything else (unset, `0`,
 /// `false`, ...) leaves HTTP/2 on.
 pub(crate) fn force_http1_from_env() -> bool {
     std::env::var("CODEWHALE_FORCE_HTTP1")
@@ -1441,7 +1449,41 @@ fn add_extra_root_certs(
     builder
 }
 
+/// Admit a complete response's tool pairing ids before hooks, approvals or
+/// replayable history. Use the protocol frozen with the actual request.
+pub(crate) fn validate_tool_call_ids_for_protocol<'a>(
+    protocol: WireFormat,
+    ids: impl IntoIterator<Item = &'a str>,
+) -> Result<()> {
+    let mut seen = std::collections::HashSet::new();
+    for id in ids {
+        let pairing_id = if protocol == WireFormat::Responses {
+            responses::parse_tool_use_id(id).0
+        } else {
+            id.to_string()
+        };
+        if pairing_id.trim().is_empty() {
+            anyhow::bail!("Provider returned a tool call without a pairing id");
+        }
+        if !seen.insert(pairing_id) {
+            anyhow::bail!("Provider returned duplicate tool call pairing ids in one response");
+        }
+    }
+    Ok(())
+}
+
 impl CodewhaleClient {
+    pub(crate) fn wire_format(&self) -> WireFormat {
+        self.wire_format
+    }
+
+    pub(crate) fn validate_tool_call_ids<'a>(
+        &self,
+        ids: impl IntoIterator<Item = &'a str>,
+    ) -> Result<()> {
+        validate_tool_call_ids_for_protocol(self.wire_format, ids)
+    }
+
     fn is_local_ds4_model(&self, model: &str) -> bool {
         self.api_provider == ApiProvider::Custom
             && self.provider_identity.eq_ignore_ascii_case("ds4")
@@ -1585,6 +1627,13 @@ impl CodewhaleClient {
         validate_base_url_security(&base_url, config.allow_insecure_http())?;
         let retry = config.retry_policy();
         let stream_idle_timeout = Duration::from_secs(config.stream_chunk_timeout_secs());
+        let stream_open_timeout = config.stream_open_timeout();
+        let force_http1 = config.force_http1();
+        if force_http1 {
+            logging::info(
+                "HTTP/1.1 pinned (stream configuration or environment) — HTTP/2 disabled",
+            );
+        }
         let http_headers = config.http_headers();
         let auth_disabled =
             auth_mode_disables_api_key(config.auth_mode_for_provider(api_provider).as_deref());
@@ -1639,7 +1688,8 @@ impl CodewhaleClient {
             &base_url,
             wire_format,
             auth_disabled,
-            false,
+            force_http1,
+            config,
         )?
         .build()?;
         let models_http_client = Self::http_client_builder_with_auth_mode(
@@ -1649,12 +1699,13 @@ impl CodewhaleClient {
             &base_url,
             wire_format,
             auth_disabled,
-            false,
+            force_http1,
+            config,
         )?
         .redirect(reqwest::redirect::Policy::none())
         .build()?;
         // Always keep an HTTP/1.1 twin for automatic stream-header fallback
-        // when H2 stalls. When CODEWHALE_FORCE_HTTP1 is set, both clients are
+        // when H2 stalls. When `force_http1` is pinned, both clients are
         // HTTP/1.1 and the fallback is a no-op retry path.
         let http1_client = Self::http_client_builder_with_auth_mode(
             &api_key,
@@ -1664,6 +1715,7 @@ impl CodewhaleClient {
             wire_format,
             auth_disabled,
             true,
+            config,
         )?
         .build()?;
 
@@ -1706,6 +1758,8 @@ impl CodewhaleClient {
             test_messages_transport_base_url: None,
             reasoning_stream_style,
             stream_idle_timeout,
+            stream_open_timeout,
+            force_http1,
         })
     }
 
@@ -2000,6 +2054,7 @@ impl CodewhaleClient {
             provider_default_wire_format(api_provider),
             false,
             false,
+            &Config::default(),
         )?
         .build()
         .map_err(Into::into)
@@ -2013,6 +2068,7 @@ impl CodewhaleClient {
         wire_format: WireFormat,
         auth_disabled: bool,
         force_http1: bool,
+        config: &Config,
     ) -> Result<reqwest::ClientBuilder> {
         let headers = build_default_headers(
             api_key,
@@ -2025,16 +2081,12 @@ impl CodewhaleClient {
         let mut builder = crate::tls::reqwest_client_builder()
             .default_headers(headers)
             .user_agent(client_user_agent(api_provider))
-            .connect_timeout(Duration::from_secs(30))
-            .tcp_keepalive(Some(Duration::from_secs(30)))
-            .http2_keep_alive_interval(Some(Duration::from_secs(15)))
-            .http2_keep_alive_timeout(Duration::from_secs(20))
+            .connect_timeout(config.connect_timeout())
+            .tcp_keepalive(config.tcp_keepalive())
+            .http2_keep_alive_interval(config.http2_keep_alive_interval())
+            .http2_keep_alive_timeout(config.http2_keep_alive_timeout())
             .min_tls_version(reqwest::tls::Version::TLS_1_2);
-        let pin_http1 = force_http1 || force_http1_from_env();
-        if pin_http1 {
-            if force_http1_from_env() && !force_http1 {
-                logging::info("CODEWHALE_FORCE_HTTP1=1 — pinning HTTP client to HTTP/1.1");
-            }
+        if force_http1 {
             builder = builder.http1_only();
         }
         if let Ok(cert_path) = std::env::var("SSL_CERT_FILE")
@@ -5425,12 +5477,21 @@ mod stream_entry;
 pub(crate) mod system_one;
 
 /// Longest a request may take to open its stream and deliver the first body
-/// byte before the client itself times out (#6184): the header wait plus the
-/// first-byte bound. The engine heartbeat uses it as its awaiting-model bound.
+/// byte before the client itself times out (#6184): the first-byte bound plus
+/// two header waits, because a failed or stalled open on the dual client
+/// retries once on the HTTP/1.1 twin under its own header wait. HTTP retries
+/// inside one open attempt run within that attempt's header wait. The engine
+/// heartbeat uses this as its awaiting-model bound, so it must cover the
+/// fallback or an in-progress recovery reads as a stall (#6711).
 #[must_use]
-pub(crate) fn stream_first_response_bound(idle: Duration) -> Duration {
-    stream_entry::stream_open_timeout().saturating_add(stream_entry::first_byte_timeout(idle))
+pub(crate) fn stream_first_response_bound(open: Duration, idle: Duration) -> Duration {
+    open.saturating_mul(2)
+        .saturating_add(stream_entry::first_byte_timeout(idle))
 }
+
+#[cfg(test)]
+pub(crate) use stream_entry::first_byte_timeout as stream_first_byte_timeout;
+pub(crate) use stream_entry::{is_stream_open_transport_failure, resolve_stream_open_timeout};
 mod wire;
 
 // Retain the crate-visible accounting helpers at the existing client seam.
@@ -5457,7 +5518,10 @@ pub(crate) fn chat_messages_for_test(messages: &[codewhale_models::Message]) -> 
     chat::build_chat_messages(None, messages, "gpt-4o")
 }
 
-pub(crate) use chat::{CacheWarmupKey, PromptInspection};
+pub(crate) use chat::{
+    CacheWarmupKey, PromptInspection, PromptLayerInspection, PromptLayerStability,
+    ToolResultInspection, TurnMetaInspection,
+};
 pub(crate) use prepared::{
     CallerStreamMode, EndpointIdentity, PreparedOutboundRequest, RouteShape, WireBodyView,
     WireDialect, canonical_json,
@@ -7295,6 +7359,7 @@ mod tests {
                         state: None,
                     },
                     ContentBlock::ToolUse {
+                        execution_id: None,
                         id: "call-k3-replay".to_string(),
                         name: "read_file".to_string(),
                         input: json!({"path": "src/lib.rs"}),
@@ -7306,6 +7371,7 @@ mod tests {
             Message {
                 role: Role::User,
                 content: vec![ContentBlock::ToolResult {
+                    execution_id: None,
                     tool_use_id: "call-k3-replay".to_string(),
                     content: "file contents".to_string(),
                     is_error: None,
@@ -8816,6 +8882,7 @@ mod tests {
                 Message {
                     role: Role::Assistant,
                     content: vec![ContentBlock::ToolUse {
+                        execution_id: None,
                         id: "call-secret-test".to_string(),
                         name: "read_file".to_string(),
                         input: json!({"path": "config.toml"}),
@@ -8826,6 +8893,7 @@ mod tests {
                 Message {
                     role: Role::User,
                     content: vec![ContentBlock::ToolResult {
+                        execution_id: None,
                         tool_use_id: "call-secret-test".to_string(),
                         content: content.into(),
                         is_error: None,
@@ -10633,6 +10701,7 @@ mod tests {
                         thinking: "Need to call a tool".to_string(),
                     },
                     ContentBlock::ToolUse {
+                        execution_id: None,
                         id: "tool-1".to_string(),
                         name: "get_date".to_string(),
                         input: json!({}),
@@ -10644,6 +10713,7 @@ mod tests {
             Message {
                 role: Role::User,
                 content: vec![ContentBlock::ToolResult {
+                    execution_id: None,
                     tool_use_id: "tool-1".to_string(),
                     content: "2026-04-23".to_string(),
                     is_error: None,
@@ -10687,6 +10757,7 @@ mod tests {
                         thinking: "Need to call a tool".to_string(),
                     },
                     ContentBlock::ToolUse {
+                        execution_id: None,
                         id: "tool-1".to_string(),
                         name: "get_date".to_string(),
                         input: json!({}),
@@ -10698,6 +10769,7 @@ mod tests {
             Message {
                 role: Role::User,
                 content: vec![ContentBlock::ToolResult {
+                    execution_id: None,
                     tool_use_id: "tool-1".to_string(),
                     content: "2026-04-23".to_string(),
                     is_error: None,
@@ -10859,6 +10931,7 @@ mod tests {
                 Message {
                     role: Role::Assistant,
                     content: vec![ContentBlock::ToolUse {
+                        execution_id: None,
                         id: "call-no-thinking".to_string(),
                         name: "read_file".to_string(),
                         input: json!({"path": "Cargo.toml"}),
@@ -10869,6 +10942,7 @@ mod tests {
                 Message {
                     role: Role::User,
                     content: vec![ContentBlock::ToolResult {
+                        execution_id: None,
                         tool_use_id: "call-no-thinking".to_string(),
                         content: "workspace manifest".to_string(),
                         is_error: None,
@@ -12025,6 +12099,7 @@ mod tests {
             let messages = vec![Message {
                 role: Role::User,
                 content: vec![ContentBlock::ToolResult {
+                    execution_id: None,
                     tool_use_id: "tool-1".to_string(),
                     content: "ok".to_string(),
                     is_error: None,
@@ -12162,6 +12237,7 @@ mod tests {
                         thinking: "Need to inspect the directory".to_string(),
                     },
                     ContentBlock::ToolUse {
+                        execution_id: None,
                         id: "tool-1".to_string(),
                         name: "list_dir".to_string(),
                         input: json!({}),
@@ -12173,6 +12249,7 @@ mod tests {
             Message {
                 role: Role::User,
                 content: vec![ContentBlock::ToolResult {
+                    execution_id: None,
                     tool_use_id: "tool-1".to_string(),
                     content: "ok".to_string(),
                     is_error: None,
@@ -12205,6 +12282,7 @@ mod tests {
                         thinking: "Need to search".to_string(),
                     },
                     ContentBlock::ToolUse {
+                        execution_id: None,
                         id: "tool-1".to_string(),
                         name: "web.run".to_string(),
                         input: json!({}),
@@ -12216,6 +12294,7 @@ mod tests {
             Message {
                 role: Role::User,
                 content: vec![ContentBlock::ToolResult {
+                    execution_id: None,
                     tool_use_id: "tool-1".to_string(),
                     content: "ok".to_string(),
                     is_error: None,
@@ -12251,6 +12330,7 @@ mod tests {
             Message {
                 role: Role::Assistant,
                 content: vec![ContentBlock::ToolUse {
+                    execution_id: None,
                     id: "tool-orphan".to_string(),
                     name: "read_file".to_string(),
                     input: json!({"path": "src/main.rs"}),
@@ -12298,6 +12378,7 @@ mod tests {
                         thinking: "Need to list files".to_string(),
                     },
                     ContentBlock::ToolUse {
+                        execution_id: None,
                         id: "tool-ok".to_string(),
                         name: "list_dir".to_string(),
                         input: json!({}),
@@ -12309,6 +12390,7 @@ mod tests {
             Message {
                 role: Role::User,
                 content: vec![ContentBlock::ToolResult {
+                    execution_id: None,
                     tool_use_id: "tool-ok".to_string(),
                     content: "files".to_string(),
                     is_error: None,
@@ -12340,6 +12422,7 @@ mod tests {
                 role: Role::Assistant,
                 content: vec![
                     ContentBlock::ToolUse {
+                        execution_id: None,
                         id: "t1".to_string(),
                         name: "read_file".to_string(),
                         input: json!({"path": "a.rs"}),
@@ -12347,6 +12430,7 @@ mod tests {
                         thought_signature: None,
                     },
                     ContentBlock::ToolUse {
+                        execution_id: None,
                         id: "t2".to_string(),
                         name: "read_file".to_string(),
                         input: json!({"path": "b.rs"}),
@@ -12354,6 +12438,7 @@ mod tests {
                         thought_signature: None,
                     },
                     ContentBlock::ToolUse {
+                        execution_id: None,
                         id: "t3".to_string(),
                         name: "shell".to_string(),
                         input: json!({"cmd": "ls"}),
@@ -12365,6 +12450,7 @@ mod tests {
             Message {
                 role: Role::User,
                 content: vec![ContentBlock::ToolResult {
+                    execution_id: None,
                     tool_use_id: "t1".to_string(),
                     content: "content a".to_string(),
                     is_error: None,
@@ -12374,6 +12460,7 @@ mod tests {
             Message {
                 role: Role::User,
                 content: vec![ContentBlock::ToolResult {
+                    execution_id: None,
                     tool_use_id: "t2".to_string(),
                     content: "content b".to_string(),
                     is_error: None,
@@ -13689,7 +13776,7 @@ mod tests {
 
     /// Serialize tests that mutate `DEEPSEEK_FORCE_HTTP1` so they don't race
     /// against each other — env vars are process-global.
-    static FORCE_HTTP1_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    pub(super) static FORCE_HTTP1_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     struct ForceHttp1EnvGuard {
         prior: Option<std::ffi::OsString>,
@@ -13709,6 +13796,69 @@ mod tests {
                 None => unsafe { std::env::remove_var("DEEPSEEK_FORCE_HTTP1") },
             }
         }
+    }
+
+    #[tokio::test]
+    async fn configured_http2_keepalive_reaches_real_client_transport() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let config: Config = toml::from_str(
+            "[stream]\nhttp2_keep_alive_interval_secs=1\nhttp2_keep_alive_timeout_secs=1\n",
+        )
+        .unwrap();
+        let client = CodewhaleClient::http_client_builder_with_auth_mode(
+            "",
+            &HashMap::new(),
+            ApiProvider::Deepseek,
+            &url,
+            WireFormat::ChatCompletions,
+            true,
+            false,
+            &config,
+        )
+        .unwrap()
+        .no_proxy()
+        .http2_prior_knowledge()
+        .build()
+        .unwrap();
+        let request = tokio::spawn(async move { client.get(url).send().await });
+        // Minimal HTTP/2 peer: handshake, leave the request open, and observe
+        // the actual PING. No additional dependency or external provider.
+        let peer = tokio::time::timeout(Duration::from_secs(5), async {
+            let (mut peer, _) = listener.accept().await.unwrap();
+            let mut preface = [0; 24];
+            peer.read_exact(&mut preface).await.unwrap();
+            assert_eq!(&preface, b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+            peer.write_all(&[0, 0, 0, 4, 0, 0, 0, 0, 0]).await.unwrap();
+            loop {
+                let mut header = [0; 9];
+                peer.read_exact(&mut header).await.unwrap();
+                let len = (usize::from(header[0]) << 16)
+                    | (usize::from(header[1]) << 8)
+                    | usize::from(header[2]);
+                assert!(len <= 65536, "bounded test frame");
+                let mut body = vec![0; len];
+                peer.read_exact(&mut body).await.unwrap();
+                if header[3] == 4 && header[4] & 1 == 0 {
+                    peer.write_all(&[0, 0, 0, 4, 1, 0, 0, 0, 0]).await.unwrap();
+                }
+                if header[3] == 6 && header[4] & 1 == 0 {
+                    assert_eq!(len, 8);
+                    return peer; // Deliberately withhold the PING ACK.
+                }
+            }
+        })
+        .await
+        .expect("configured one-second interval must send a PING before the default 15 seconds");
+        let result = tokio::time::timeout(Duration::from_secs(3), request).await
+            .expect("configured one-second acknowledgement timeout must end the request before default 20 seconds")
+            .unwrap();
+        assert!(
+            result.is_err(),
+            "an unacknowledged PING must fail the request"
+        );
+        drop(peer); // Keep the peer open until the client's own timer fires.
     }
 
     #[test]
@@ -13838,6 +13988,165 @@ mod tests {
             &config,
         )
         .expect("route cap test client")
+    }
+
+    #[test]
+    fn tool_pairing_admission_uses_the_frozen_wire_protocol() {
+        for wire in [
+            WireFormat::ChatCompletions,
+            WireFormat::AnthropicMessages,
+            WireFormat::Responses,
+        ] {
+            let client = route_cap_test_client(wire, RouteLimits::default());
+            assert!(
+                client
+                    .validate_tool_call_ids(["unique-a", "unique-b"])
+                    .is_ok()
+            );
+            for ids in [["", "valid"], ["   ", "valid"], ["same", "same"]] {
+                assert!(
+                    client.validate_tool_call_ids(ids).is_err(),
+                    "{wire:?}: {ids:?}"
+                );
+            }
+            let result = client.validate_tool_call_ids(["call|item-a", "call|item-b"]);
+            assert_eq!(result.is_err(), wire == WireFormat::Responses);
+            assert_eq!(
+                client.validate_tool_call_ids(["|item"]).is_err(),
+                wire == WireFormat::Responses
+            );
+            // Each response is independent: provider reuse on another round is valid.
+            assert!(client.validate_tool_call_ids(["reused"]).is_ok());
+            assert!(client.validate_tool_call_ids(["reused"]).is_ok());
+        }
+    }
+
+    #[test]
+    fn outbound_seam_excludes_host_execution_identity_for_every_dialect() {
+        let _lock = crate::test_support::lock_test_env();
+        const IMAGE: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
+        for (wire, google_route) in [
+            (WireFormat::ChatCompletions, false),
+            (WireFormat::ChatCompletions, true),
+            (WireFormat::Responses, false),
+            (WireFormat::AnthropicMessages, false),
+        ] {
+            let model = if google_route {
+                "gemini-2.5-flash"
+            } else {
+                "DeepSeek-V4-Flash"
+            };
+            let client = if google_route {
+                let base_url = "https://generativelanguage.googleapis.com/v1beta/openai";
+                let config = Config {
+                    provider: Some("custom".to_string()),
+                    default_text_model: Some(model.to_string()),
+                    ..Config::default()
+                }
+                .with_legacy_root(Some("fixture".to_string()), Some(base_url.to_string()));
+                CodewhaleClient::from_parts(
+                    base_url.to_string(),
+                    model.to_string(),
+                    wire,
+                    Some(RouteLimits::default()),
+                    &config,
+                )
+                .unwrap()
+            } else {
+                route_cap_test_client(wire, RouteLimits::default())
+            };
+            let provider_id = if wire == WireFormat::Responses {
+                "wire-call|provider-item"
+            } else {
+                "wire-call"
+            };
+            let mut request =
+                translation_message_request("inspect", model.to_string(), "English", 1024);
+            request.messages.extend([
+                Message {
+                    role: Role::Assistant,
+                    content: vec![ContentBlock::ToolUse {
+                        id: provider_id.to_string(),
+                        execution_id: Some("local-execution-sentinel".to_string()),
+                        name: "read".to_string(),
+                        input: json!({"path": "shot.png"}),
+                        caller: Some(codewhale_models::ToolCaller {
+                            caller_type: "code_execution".to_string(),
+                            tool_id: Some("parent-wire".to_string()),
+                        }),
+                        thought_signature: Some("provider-signature".to_string()),
+                    }],
+                },
+                Message {
+                    role: Role::User,
+                    content: vec![ContentBlock::ToolResult {
+                        tool_use_id: provider_id.to_string(),
+                        execution_id: Some("local-execution-sentinel".to_string()),
+                        content: "captured image".to_string(),
+                        is_error: Some(false),
+                        content_blocks: Some(vec![
+                            json!({"type": "image", "mime_type": "image/png", "data": IMAGE}),
+                        ]),
+                    }],
+                },
+            ]);
+            let mut legacy = request.clone();
+            for block in legacy
+                .messages
+                .iter_mut()
+                .flat_map(|message| &mut message.content)
+            {
+                match block {
+                    ContentBlock::ToolUse { execution_id, .. }
+                    | ContentBlock::ToolResult { execution_id, .. } => *execution_id = None,
+                    _ => {}
+                }
+            }
+            for streaming in [false, true] {
+                let prepared = client
+                    .prepare_outbound_request(request.clone(), streaming)
+                    .unwrap();
+                let without_local = client
+                    .prepare_outbound_request(legacy.clone(), streaming)
+                    .unwrap();
+                assert_eq!(
+                    prepared.body, without_local.body,
+                    "{wire:?}, stream={streaming}"
+                );
+                let bytes = prepared.body.to_string();
+                assert!(
+                    !bytes.contains("execution_id") && !bytes.contains("local-execution-sentinel")
+                );
+                assert!(bytes.contains("wire-call") && bytes.contains(IMAGE));
+                if wire == WireFormat::ChatCompletions {
+                    assert!(bytes.contains("parent-wire"));
+                    assert_eq!(
+                        bytes.contains("provider-signature"),
+                        google_route,
+                        "Google signatures remain restricted to Google's route"
+                    );
+                }
+                if wire == WireFormat::Responses {
+                    let input = prepared.body["input"].as_array().unwrap();
+                    assert!(
+                        input.iter().any(|item| item["type"] == "function_call"
+                            && item["call_id"] == "wire-call")
+                    );
+                    assert!(
+                        input
+                            .iter()
+                            .any(|item| item["type"] == "function_call_output"
+                                && item["call_id"] == "wire-call")
+                    );
+                }
+            }
+            assert_eq!(
+                request.messages[1].content[0].tool_call_key(),
+                Some(codewhale_models::ToolCallKey::Execution(
+                    "local-execution-sentinel"
+                ))
+            );
+        }
     }
 
     #[test]
