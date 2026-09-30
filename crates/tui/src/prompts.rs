@@ -234,6 +234,14 @@ pub(crate) fn pin_recorded_environment(os: &str, shell: &str) -> RecordedEnviron
     RecordedEnvironmentGuard
 }
 
+/// The replayed shell on this thread, when a recorded environment is pinned.
+/// Tool descriptions that name the shell use it too, so a replay never
+/// depends on which shell first initialized their process-wide caches.
+#[cfg(all(test, unix))]
+pub(crate) fn recorded_shell() -> Option<String> {
+    RECORDED_ENVIRONMENT.with(|cell| cell.borrow().as_ref().map(|(_, shell)| shell.clone()))
+}
+
 #[cfg(all(test, unix))]
 pub(crate) struct RecordedEnvironmentGuard;
 
