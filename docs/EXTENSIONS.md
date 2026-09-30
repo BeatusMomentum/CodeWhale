@@ -66,6 +66,15 @@ to use it. `codewhale doctor` and `/plugin` show which runtime runs the host,
 its version and path, how its memory cap is enforced, and, when `auto` used
 Node, why Bun was not used.
 
+When the host cannot take a call, `/plugin` and the failing extension tool
+call give the same reason: not started, starting, unresponsive, restarting
+after a crash (with how it exited), failed to start or out of crash budget
+(with the reason; change or reload a plugin to retry), or disabled by config.
+Every call into the host has a deadline, 120 s for a tool call; past it
+Codewhale cancels the call, reports a timeout, and the host keeps serving
+other calls. A plugin that ignores cancellation keeps running inside the host
+until the host is torn down.
+
 Write extensions for both runtimes. Use Node's APIs (Bun implements them) and
 only erasable TypeScript in `.mts`. Enums, decorators and syntax that needs
 transformation require a separate author build to JavaScript. Bun would accept

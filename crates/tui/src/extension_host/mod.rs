@@ -98,6 +98,7 @@ pub(crate) mod tool;
 pub(crate) mod tests;
 
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
@@ -312,9 +313,13 @@ impl SupervisionState {
     }
 }
 
-/// Observable host state, for `/plugin`, doctor and tests.
+/// Observable host state: the one source for `/plugin` and for the error a
+/// tool call routed to the host gets while it is down ([`fmt::Display`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HostStatus {
+    /// `[features] extension_host` is off for this process.
+    Disabled,
+    /// Not started: nothing has needed it yet.
     Idle,
     Starting,
     Ready {
@@ -331,13 +336,39 @@ pub enum HostStatus {
     Unresponsive {
         pid: Option<u32>,
     },
+    /// Crashed (or retired for maintenance); the supervisor restarts it.
     Restarting {
         reason: String,
     },
+    /// Start refused (`start failed: …`) or crash budget exhausted; only an
+    /// explicit plugin change or reload retries.
     Failed {
         reason: String,
         stderr_tail: String,
     },
+}
+
+/// Why the host can or cannot take a call, in one phrase.
+impl fmt::Display for HostStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Disabled => f.write_str("disabled by config ([features] extension_host is off)"),
+            Self::Idle => f.write_str(
+                "not started (it starts in the background when a reviewed plugin with host code is enabled)",
+            ),
+            Self::Starting => f.write_str("starting"),
+            Self::Ready { .. } => f.write_str("running"),
+            Self::Unresponsive { pid } => write!(
+                f,
+                "unresponsive (pid {} missed its heartbeat; the supervisor restarts it if it stays silent)",
+                pid.map_or_else(|| "?".to_string(), |pid| pid.to_string())
+            ),
+            Self::Restarting { reason } => write!(f, "restarting after: {reason}"),
+            Self::Failed { reason, .. } => {
+                write!(f, "{reason} (change or reload a plugin to retry)")
+            }
+        }
+    }
 }
 
 enum HostSlot {
@@ -347,6 +378,42 @@ enum HostSlot {
     Unresponsive(Arc<HostProcess>),
     Restarting { reason: String },
     Failed { reason: String, stderr_tail: String },
+}
+
+impl HostSlot {
+    fn status(&self) -> HostStatus {
+        match self {
+            Self::Idle => HostStatus::Idle,
+            Self::Starting => HostStatus::Starting,
+            Self::Ready(host) if host.is_retiring() => HostStatus::Restarting {
+                reason: DIRTY_RESTART_REASON.to_string(),
+            },
+            // The exit watcher reports the exit a moment later.
+            Self::Ready(host) | Self::Unresponsive(host) if host.has_exited() => {
+                HostStatus::Restarting {
+                    reason: "the host process exited".to_string(),
+                }
+            }
+            Self::Ready(host) => HostStatus::Ready {
+                pid: host.pid,
+                runtime: host.runtime.kind.name(),
+                runtime_version: host.runtime_version.get().cloned().unwrap_or_default(),
+                sandbox: host.sandbox.clone(),
+                memory: host.memory(),
+            },
+            Self::Unresponsive(host) => HostStatus::Unresponsive { pid: host.pid },
+            Self::Restarting { reason } => HostStatus::Restarting {
+                reason: reason.clone(),
+            },
+            Self::Failed {
+                reason,
+                stderr_tail,
+            } => HostStatus::Failed {
+                reason: reason.clone(),
+                stderr_tail: stderr_tail.clone(),
+            },
+        }
+    }
 }
 
 struct DesiredOwner {
@@ -500,22 +567,29 @@ impl ManagerShared {
         }
     }
 
-    fn ready_host(&self) -> Option<Arc<HostProcess>> {
+    /// The host, when it can take a call; otherwise why not.
+    fn ready_host(&self) -> Result<Arc<HostProcess>, HostStatus> {
         match &*self.host.lock().expect("host lock") {
             HostSlot::Ready(host) if !host.has_exited() && !host.is_retiring() => {
-                Some(Arc::clone(host))
+                Ok(Arc::clone(host))
             }
-            _ => None,
+            slot => Err(slot.status()),
         }
     }
 
     /// Re-check everything a call depends on, immediately before it is sent:
+    /// a running host (first, so a call to a host that is down says why),
     /// exact owner generation, the reviewed receipt and staged bytes, the
-    /// Native adapter in this build's policy, and a running host.
+    /// Native adapter in this build's policy, and the host again.
     pub(crate) async fn live_host_for(
         &self,
         registration: &ToolRegistration,
     ) -> Result<Arc<HostProcess>, String> {
+        let policy = activation::extension_host_policy_enabled();
+        if !policy {
+            return Err(host_down(&HostStatus::Disabled));
+        }
+        self.ready_host().map_err(|status| host_down(&status))?;
         let authority = {
             let registry = self.registry.lock().expect("registry lock");
             if !registry.is_live(registration.handle, &registration.owner) {
@@ -528,7 +602,6 @@ impl ManagerShared {
                 .authority_for(&registration.owner)
                 .ok_or_else(|| "extension owner has no authority".to_string())?
         };
-        let policy = activation::extension_host_policy_enabled();
         tokio::task::spawn_blocking(move || {
             let _scope = activation::PolicyScope::propagate(policy);
             crate::plugins::registry::verify_plugin_component_authority(
@@ -538,9 +611,13 @@ impl ManagerShared {
         })
         .await
         .map_err(|error| format!("authority check failed: {error}"))??;
-        self.ready_host()
-            .ok_or_else(|| "the extension host is not running".to_string())
+        self.ready_host().map_err(|status| host_down(&status))
     }
+}
+
+/// The error a host tool call gets while the host cannot take it.
+fn host_down(status: &HostStatus) -> String {
+    format!("extension host is down: {status}")
 }
 
 /// Channel callbacks. Holds a `Weak` so the host process (which owns the
@@ -891,31 +968,7 @@ impl ExtensionHostManager {
 
     #[must_use]
     pub fn status(&self) -> HostStatus {
-        match &*self.shared.host.lock().expect("host lock") {
-            HostSlot::Idle => HostStatus::Idle,
-            HostSlot::Starting => HostStatus::Starting,
-            HostSlot::Ready(host) if host.is_retiring() => HostStatus::Restarting {
-                reason: DIRTY_RESTART_REASON.to_string(),
-            },
-            HostSlot::Ready(host) => HostStatus::Ready {
-                pid: host.pid,
-                runtime: host.runtime.kind.name(),
-                runtime_version: host.runtime_version.get().cloned().unwrap_or_default(),
-                sandbox: host.sandbox.clone(),
-                memory: host.memory(),
-            },
-            HostSlot::Unresponsive(host) => HostStatus::Unresponsive { pid: host.pid },
-            HostSlot::Restarting { reason } => HostStatus::Restarting {
-                reason: reason.clone(),
-            },
-            HostSlot::Failed {
-                reason,
-                stderr_tail,
-            } => HostStatus::Failed {
-                reason: reason.clone(),
-                stderr_tail: stderr_tail.clone(),
-            },
-        }
+        self.shared.host.lock().expect("host lock").status()
     }
 
     /// The pinned runtime's one-line summary, once a host on it has completed
@@ -1256,7 +1309,7 @@ impl ExtensionHostManager {
                 }
             }
         }
-        let host = shared.ready_host();
+        let host = shared.ready_host().ok();
         for owner in revoked {
             shared.plugin_diagnostic(
                 &owner.plugin_id,
@@ -1364,17 +1417,8 @@ impl ExtensionHostManager {
                 HostSlot::Ready(host) if !host.has_exited() && !host.is_retiring() => {
                     return Ok(Arc::clone(host));
                 }
-                HostSlot::Ready(_) | HostSlot::Unresponsive(_) => {
-                    return Err("extension host is unavailable; waiting for supervision".into());
-                }
-                HostSlot::Restarting { .. } => return Err("extension host is restarting".into()),
-                HostSlot::Failed { reason, .. } => {
-                    return Err(format!(
-                        "extension host is failed ({reason}); change/reload a plugin to retry"
-                    ));
-                }
-                HostSlot::Starting => return Err("extension host is starting".into()),
                 HostSlot::Idle => {}
+                other => return Err(host_down(&other.status())),
             }
             *slot = HostSlot::Starting;
             let mut supervision = shared.supervision.lock().expect("supervision lock");
@@ -1492,7 +1536,7 @@ impl ExtensionHostManager {
                     .expect("supervision lock")
                     .launch_failed = true;
                 *slot = HostSlot::Failed {
-                    reason: reason.clone(),
+                    reason: format!("start failed: {reason}"),
                     stderr_tail: String::new(),
                 };
                 drop(slot);
@@ -1534,12 +1578,15 @@ impl ExtensionHostManager {
 
     #[cfg(test)]
     pub(crate) fn host_requests_started(&self) -> Option<u64> {
-        self.shared.ready_host().map(|host| host.requests_started())
+        self.shared
+            .ready_host()
+            .ok()
+            .map(|host| host.requests_started())
     }
 
     #[cfg(test)]
     pub(crate) fn host_pid(&self) -> Option<u32> {
-        self.shared.ready_host().and_then(|host| host.pid)
+        self.shared.ready_host().ok().and_then(|host| host.pid)
     }
 }
 
@@ -1549,10 +1596,6 @@ pub(crate) fn render_status(manager: &ExtensionHostManager) -> String {
     let mut out = String::from("Extension host (experimental): ");
     let status = manager.status();
     match status.clone() {
-        HostStatus::Idle => out.push_str(
-            "not running (starts in the background when a reviewed plugin with host code is enabled)",
-        ),
-        HostStatus::Starting => out.push_str("starting"),
         HostStatus::Ready {
             pid,
             runtime,
@@ -1572,15 +1615,8 @@ pub(crate) fn render_status(manager: &ExtensionHostManager) -> String {
                 }
             );
         }
-        HostStatus::Unresponsive { pid } => {
-            let _ = write!(out, "unresponsive · pid {} (supervisor is waiting for a pong)", pid.map_or_else(|| "?".into(), |pid| pid.to_string()));
-        }
-        HostStatus::Restarting { reason } => { let _ = write!(out, "restarting after: {reason}"); }
-        HostStatus::Failed {
-            reason,
-            stderr_tail,
-        } => {
-            let _ = write!(out, "failed: {reason} (change/reload a plugin to retry)");
+        HostStatus::Failed { stderr_tail, .. } => {
+            let _ = write!(out, "{status}");
             let tail = stderr_tail.trim();
             if !tail.is_empty() {
                 let start = tail
@@ -1590,6 +1626,9 @@ pub(crate) fn render_status(manager: &ExtensionHostManager) -> String {
                     .map_or(0, |(index, _)| index);
                 let _ = write!(out, "\n  stderr: {}", &tail[start..]);
             }
+        }
+        down => {
+            let _ = write!(out, "{down}");
         }
     }
     if let Some(summary) = manager.runtime_summary() {
@@ -1647,10 +1686,14 @@ pub fn plugins_changed(plugins: Arc<PluginRegistry>) {
     }
 }
 
-/// The `/plugin` section, or `None` when the experimental host is off.
+/// The `/plugin` section. With the experimental host off it is one line
+/// saying so.
 #[must_use]
-pub fn status_report() -> Option<String> {
-    activation::extension_host_policy_enabled().then(|| render_status(&manager()))
+pub fn status_report() -> String {
+    if !activation::extension_host_policy_enabled() {
+        return format!("Extension host (experimental): {}", HostStatus::Disabled);
+    }
+    render_status(&manager())
 }
 
 pub struct OwnerReport {

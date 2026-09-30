@@ -1587,7 +1587,10 @@ async fn idle_retirement_seals_admission_and_does_not_wait_for_heartbeat() {
         .start_request(protocol::CoreRequest::Ping, None)
         .unwrap();
     assert!(host.terminate_if_idle(super::DIRTY_RESTART_REASON));
-    assert!(manager.shared.ready_host().is_none());
+    assert!(matches!(
+        manager.shared.ready_host(),
+        Err(HostStatus::Restarting { .. })
+    ));
     assert!(matches!(manager.status(), HostStatus::Restarting { .. }));
     // Poll without yielding to the exit watcher. A reconcile in this exact
     // gap must not start activation on the sealed process and falsely fail
@@ -1837,6 +1840,67 @@ fn opening_an_engine_never_resets_a_crash_budget() {
             .is_empty()
     );
     assert_eq!(manager.status(), HostStatus::Idle);
+}
+
+/// One typed state, `HostStatus`, names why the host is down in `/plugin`
+/// and in the error a tool call routed to it gets.
+#[tokio::test]
+async fn a_host_that_is_down_names_why_in_plugin_status_and_tool_errors() {
+    let policy = TestPolicyGuard::extension_host(true);
+    let manager = Arc::new(ExtensionHostManager::new(ExtensionHostOptions::default()));
+    let registration = {
+        let mut registry = manager.shared.registry.lock().unwrap();
+        let owner = registry.begin_owner("probe", "probe", fake_authority("probe"), "hash");
+        registry.mark_active(&owner);
+        register(&mut registry, &owner, "probe_tool").unwrap();
+        registry.live_tools()[0].clone()
+    };
+    let tool = super::tool::HostToolSpec::new(registration, Arc::clone(&manager.shared));
+    let context = ToolContext::new(Path::new("/fixture"));
+    let refused = "start failed: host did not apply the requested 1024 MiB kernel memory limit; initialization refused";
+    for (slot, why) in [
+        (
+            super::HostSlot::Restarting {
+                reason: "exited with signal: 9 (SIGKILL)".into(),
+            },
+            "restarting after: exited with signal: 9 (SIGKILL)".to_string(),
+        ),
+        (
+            super::HostSlot::Failed {
+                reason: refused.into(),
+                stderr_tail: String::new(),
+            },
+            format!("{refused} (change or reload a plugin to retry)"),
+        ),
+        (super::HostSlot::Idle, "not started".to_string()),
+    ] {
+        *manager.shared.host.lock().unwrap() = slot;
+        let report = super::render_status(&manager);
+        assert!(
+            report.starts_with(&format!("Extension host (experimental): {why}")),
+            "{report}"
+        );
+        match tool.execute(json!({}), &context).await {
+            Err(ToolError::NotAvailable { message }) => assert!(
+                message.starts_with(&format!("extension host is down: {why}")),
+                "{message}"
+            ),
+            other => panic!("expected a typed not-available error, got {other:?}"),
+        }
+    }
+    drop(policy);
+    let _off = TestPolicyGuard::extension_host(false);
+    let disabled = "disabled by config ([features] extension_host is off)";
+    assert_eq!(
+        super::status_report(),
+        format!("Extension host (experimental): {disabled}")
+    );
+    match tool.execute(json!({}), &context).await {
+        Err(ToolError::NotAvailable { message }) => {
+            assert_eq!(message, format!("extension host is down: {disabled}"))
+        }
+        other => panic!("expected a typed not-available error, got {other:?}"),
+    }
 }
 
 #[tokio::test]
