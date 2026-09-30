@@ -6066,6 +6066,37 @@ fn cursor_moves_by_grapheme_over_emoji_and_cjk() {
     assert_eq!(app.cursor_position, 0); // clamped at start
 }
 
+/// U01-m4: vim Normal-mode clamps, `a`, and `j`/`k` column moves land on
+/// grapheme-cluster starts, never inside a combining or skin-tone sequence.
+#[test]
+fn vim_cursor_moves_never_split_a_grapheme_cluster() {
+    let mut app = App::new(test_options(false), &Config::default());
+    app.vim_enabled = true;
+    // "e" + COMBINING ACUTE: two scalars, one cluster.
+    app.input = "e\u{301}".to_string();
+    app.cursor_position = char_count(&app.input);
+    app.vim_enter_normal();
+    assert_eq!(
+        app.cursor_position, 0,
+        "Normal mode sits on the cluster start"
+    );
+    app.vim_enter_append();
+    assert_eq!(
+        app.cursor_position, 2,
+        "`a` appends after the whole cluster"
+    );
+
+    // Scalar column 1 falls inside the other line's skin-tone emoji.
+    app.input = "ab\n\u{1f44d}\u{1f3fd}c".to_string();
+    app.cursor_position = 1; // on `b`
+    app.vim_move_down();
+    assert_eq!(app.cursor_position, 3, "`j` lands on the emoji's start");
+    app.input = "\u{1f44d}\u{1f3fd}c\nab".to_string();
+    app.cursor_position = 5; // on `b`
+    app.vim_move_up();
+    assert_eq!(app.cursor_position, 0, "`k` lands on the emoji's start");
+}
+
 #[test]
 fn backspace_removes_whole_emoji_cluster() {
     let mut app = App::new(test_options(false), &Config::default());

@@ -606,7 +606,9 @@ fn deliver_constitution_draft_result(
                 let preview = boxed
                     .as_any_mut()
                     .downcast_mut::<crate::tui::setup::SetupWizardView>()
-                    .map(|wizard| wizard.install_model_draft(constitution, model_label.clone()));
+                    .and_then(|wizard| {
+                        wizard.install_model_draft(constitution, model_label.clone())
+                    });
                 app.view_stack.push_boxed(boxed);
                 if let Some((title, content)) = preview {
                     open_text_pager(app, title, content);
