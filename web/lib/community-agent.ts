@@ -99,6 +99,8 @@ export function isAgentDraft(value: unknown): value is AgentDraft {
   );
 }
 
+const MODEL_TIMEOUT_MS = 180_000;
+
 export async function agentChat(
   messages: ChatMessage[],
   apiKey: string,
@@ -109,6 +111,9 @@ export async function agentChat(
   const model = dsEnv?.model ?? process.env.DEEPSEEK_MODEL ?? FALLBACK_MODEL;
   const res = await fetch(`${base}/v1/chat/completions`, {
     method: "POST",
+    // Bounded so a stalled provider cannot hold a cron run until the
+    // platform kills it; generous because high-effort reasoning is slow.
+    signal: AbortSignal.timeout(MODEL_TIMEOUT_MS),
     headers: {
       "Content-Type": "application/json",
       Authorization: `Bearer ${apiKey}`,

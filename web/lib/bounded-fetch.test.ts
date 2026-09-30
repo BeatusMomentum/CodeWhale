@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { fetchBoundedText } from "./bounded-body";
+import { runDigest, runDupes, runPrReview, runStale, runTriage } from "./community-agent-tasks";
 import { runLinkCheck } from "./content-watch";
 import { deriveFactsFromRemote } from "./facts-drift";
 
@@ -31,6 +32,10 @@ describe("bounded outbound reads", () => {
     vi.stubGlobal("fetch", seen);
     await deriveFactsFromRemote();
     await runLinkCheck({ CURATED_KV: { get: async () => null, put: async () => undefined } } as never);
+    const kv = { get: async () => null, put: async () => undefined, delete: async () => undefined, list: async () => ({ keys: [], list_complete: true }) };
+    for (const task of [runTriage, runPrReview, runStale, runDupes, runDigest]) {
+      await task({ CURATED_KV: kv, DEEPSEEK_API_KEY: "k" } as never).catch(() => undefined);
+    }
     expect(seen.mock.calls.length).toBeGreaterThan(1);
     const unbounded = seen.mock.calls
       .filter((call) => !((call as unknown[])[1] as RequestInit | undefined)?.signal)

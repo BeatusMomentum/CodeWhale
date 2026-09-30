@@ -1,3 +1,4 @@
+import { OUTBOUND_TIMEOUT_MS } from "@/lib/bounded-body";
 import { fetchFeed, fetchRepoStats } from "@/lib/github";
 import { curate } from "@/lib/deepseek";
 import { putDispatchWithKv } from "@/lib/kv";
@@ -87,6 +88,7 @@ export async function runTriage(env: AgentEnv): Promise<Record<string, unknown>>
     const res = await fetch(
       `https://api.github.com/repos/${repo}/issues?state=open&sort=created&direction=desc&per_page=30`,
       {
+        signal: AbortSignal.timeout(OUTBOUND_TIMEOUT_MS),
         headers: {
           Accept: "application/vnd.github+json",
           "X-GitHub-Api-Version": "2022-11-28",
@@ -153,6 +155,7 @@ export async function runPrReview(env: AgentEnv): Promise<Record<string, unknown
     const res = await fetch(
       `https://api.github.com/repos/${repo}/pulls?state=open&sort=created&direction=desc&per_page=20`,
       {
+        signal: AbortSignal.timeout(OUTBOUND_TIMEOUT_MS),
         headers: {
           Accept: "application/vnd.github+json",
           "X-GitHub-Api-Version": "2022-11-28",
@@ -177,6 +180,7 @@ export async function runPrReview(env: AgentEnv): Promise<Record<string, unknown
       if (!pr.changed_files) {
         try {
           const diffRes = await fetch(`https://api.github.com/repos/${repo}/pulls/${pr.number}`, {
+            signal: AbortSignal.timeout(OUTBOUND_TIMEOUT_MS),
             headers: {
               Accept: "application/vnd.github+json",
               "X-GitHub-Api-Version": "2022-11-28",
@@ -237,6 +241,7 @@ export async function runStale(env: AgentEnv): Promise<Record<string, unknown>> 
     const res = await fetch(
       `https://api.github.com/search/issues?q=${encodeURIComponent(`repo:${repo} is:issue is:open updated:<${thirtyDaysAgo}`)}&sort=updated&per_page=20`,
       {
+        signal: AbortSignal.timeout(OUTBOUND_TIMEOUT_MS),
         headers: {
           Accept: "application/vnd.github+json",
           "X-GitHub-Api-Version": "2022-11-28",
@@ -303,6 +308,7 @@ export async function runDupes(env: AgentEnv): Promise<Record<string, unknown>> 
     const res = await fetch(
       `https://api.github.com/repos/${repo}/issues?state=open&per_page=100`,
       {
+        signal: AbortSignal.timeout(OUTBOUND_TIMEOUT_MS),
         headers: {
           Accept: "application/vnd.github+json",
           "X-GitHub-Api-Version": "2022-11-28",
@@ -376,6 +382,7 @@ export async function runDigest(env: AgentEnv): Promise<Record<string, unknown>>
       fetch(
         `https://api.github.com/repos/${repo}/issues?state=all&since=${weekAgo}&per_page=50&sort=updated&direction=desc`,
         {
+          signal: AbortSignal.timeout(OUTBOUND_TIMEOUT_MS),
           headers: {
             Accept: "application/vnd.github+json",
             "X-GitHub-Api-Version": "2022-11-28",
@@ -387,6 +394,7 @@ export async function runDigest(env: AgentEnv): Promise<Record<string, unknown>>
       fetch(
         `https://api.github.com/repos/${repo}/pulls?state=all&sort=updated&direction=desc&per_page=50`,
         {
+          signal: AbortSignal.timeout(OUTBOUND_TIMEOUT_MS),
           headers: {
             Accept: "application/vnd.github+json",
             "X-GitHub-Api-Version": "2022-11-28",
