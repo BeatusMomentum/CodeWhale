@@ -1,9 +1,217 @@
 use tempfile::TempDir;
 
+#[test]
+fn frontmatter_handles_bom_exact_fences_and_plain_continuations() {
+    let content = "\u{feff}---\r\nname: demo\r\ndescription: Deploy apps --- safely\r\n  for X or Y: really\r\ninvocation: user\r\n---\r\n# Body\r\n";
+    let (metadata, body) = super::parse_frontmatter(content).unwrap().unwrap();
+    assert_eq!(metadata["name"], "demo");
+    assert_eq!(
+        metadata["description"],
+        "Deploy apps --- safely for X or Y: really"
+    );
+    assert_eq!(metadata.len(), 3, "continuation text is not a new key");
+    assert_eq!(body.trim(), "# Body");
+    assert!(
+        super::parse_frontmatter("---not a fence\n# Body")
+            .unwrap()
+            .is_none()
+    );
+    assert!(super::parse_frontmatter("---\nname: demo\ndescription: inline --- only").is_err());
+}
+
+#[test]
+fn frontmatter_block_indentation_is_character_safe_and_keeps_nested_fences() {
+    for indicator in ["|", ">"] {
+        let content = format!(
+            "---\nname: demo\ndescription: {indicator}\n  first\n\u{3000}wide\n \u{a0}mixed\n  ---\n    nested\n---\nbody"
+        );
+        let (metadata, body) = super::parse_frontmatter(&content).unwrap().unwrap();
+        let expected = if indicator == "|" {
+            "first\nwide\nmixed\n---\n  nested"
+        } else {
+            "first wide mixed ---   nested"
+        };
+        assert_eq!(metadata["description"], expected);
+        assert_eq!(body.trim(), "body");
+    }
+}
+
+#[test]
+fn unavailable_home_fallbacks_are_fresh_nonexistent_paths() {
+    let first = super::unavailable_home_root();
+    let second = super::unavailable_home_root();
+    assert_ne!(first, second);
+    assert!(!first.exists());
+    assert!(!second.exists());
+    assert!(first.starts_with(std::env::temp_dir()));
+    assert_ne!(first, std::path::Path::new("/tmp/codewhale"));
+}
+
 fn create_skill_dir(tmpdir: &TempDir, skill_name: &str, skill_content: &str) {
     let skill_dir = tmpdir.path().join("skills").join(skill_name);
     std::fs::create_dir_all(&skill_dir).unwrap();
     std::fs::write(skill_dir.join("SKILL.md"), skill_content).unwrap();
+}
+
+#[test]
+fn unicode_skill_identity_preserves_bodies_and_legacy_activation() {
+    let tmp = TempDir::new().unwrap();
+    let names = [
+        "技能",
+        "分析",
+        "PDF阅读",
+        "PDF签名",
+        "skill",
+        "pdf",
+        "Café",
+        "Cafe\u{301}",
+    ];
+    for (index, raw) in names.iter().enumerate() {
+        create_skill_dir(
+            &tmp,
+            &format!("source-{index}"),
+            &format!("---\nname: {raw}\ndescription: identity fixture\n---\nbody {index}"),
+        );
+    }
+    let registry = super::SkillRegistry::discover(&tmp.path().join("skills"));
+    assert_eq!(
+        registry.len(),
+        names.len(),
+        "colliding old slugs must not hide bodies"
+    );
+    for (index, raw) in names.iter().enumerate() {
+        let skill = registry.get(raw).unwrap();
+        assert_eq!(skill.body, format!("body {index}"));
+        assert!(super::is_valid_skill_name(&skill.name));
+        assert_eq!(registry.get(&skill.name).unwrap().body, skill.body);
+        assert_eq!(
+            super::normalize_skill_name_for_lookup(&skill.name),
+            skill.name
+        );
+        assert!(skill.path.ends_with(format!("source-{index}/SKILL.md")));
+    }
+    assert_eq!(registry.get("skill").unwrap().name, "skill");
+    assert_eq!(registry.get("pdf阅读").unwrap().body, "body 2");
+    assert_ne!(
+        registry.get("Café").unwrap().name,
+        registry.get("Cafe\u{301}").unwrap().name
+    );
+    let long = format!("{}技能", "a".repeat(100));
+    assert_eq!(super::normalize_skill_name_for_lookup(&long).len(), 64);
+    assert!(registry.warnings().is_empty(), "{:?}", registry.warnings());
+    let mut malformed = registry.get("技能").unwrap().clone();
+    malformed.name = "bad\u{1}技能".to_string();
+    let mut validation = super::SkillRegistry::default();
+    validation.normalize_skill_name(&mut malformed, std::path::Path::new("SKILL.md"));
+    assert_eq!(
+        validation.warnings().len(),
+        1,
+        "control bytes remain invalid"
+    );
+
+    let path = tmp.path().join("skills_state.toml");
+    let original = b"disabled = [\"skill\", \"pdf\"]\n";
+    std::fs::write(&path, original).unwrap();
+    let filtered = registry
+        .clone()
+        .into_enabled_with_state(crate::skill_state::SkillStateStore::load_from(path.clone()));
+    assert_eq!(filtered.len(), 2);
+    assert!(filtered.get("技能").is_none());
+    assert_eq!(std::fs::read(&path).unwrap(), original);
+    let mut state = crate::skill_state::SkillStateStore::load_from(path.clone()).unwrap();
+    state
+        .set_enabled(&registry.get("技能").unwrap().name, true)
+        .unwrap();
+    state.set_enabled("skill", true).unwrap();
+    let filtered = registry.into_enabled_with_state(Ok(state));
+    assert_eq!(filtered.get("技能").unwrap().body, "body 0");
+    assert_eq!(filtered.get("skill").unwrap().body, "body 4");
+    for hidden in ["分析", "PDF阅读", "PDF签名", "pdf"] {
+        assert!(filtered.get(hidden).is_none(), "must not revive {hidden}");
+    }
+    let rendered = super::render_skills_block(&filtered, "en", tmp.path()).unwrap();
+    assert!(rendered.contains(&filtered.get("技能").unwrap().name));
+    assert!(!rendered.contains("body 1"));
+}
+
+#[test]
+fn unicode_plugin_identity_keeps_exact_namespaces_and_reviewed_metadata() {
+    let tmp = TempDir::new().unwrap();
+    let config = crate::plugins::discovery::DiscoveryConfig {
+        workspace: tmp.path().join("workspace"),
+        user_plugins_dir: tmp.path().join("plugins"),
+        workspace_plugins_dir: tmp.path().join("workspace-plugins"),
+        builtin_plugin_dirs: Vec::new(),
+        state_path: tmp.path().join("plugin-state/state.json"),
+    };
+    for namespace in ["team.plugin", "team-plugin"] {
+        let root = config.user_plugins_dir.join(namespace);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("plugin.json"),
+            serde_json::json!({
+                "$schema": "https://agent-plugins.org/schemas/plugin.json",
+                "name": namespace,
+                "version": "1.0.0"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        for name in ["技能", "分析", "skill"] {
+            write_skill(
+                &root.join("skills"),
+                name,
+                "reviewed identity",
+                &format!("{namespace} {name}"),
+            );
+        }
+    }
+    let mut plugins = crate::plugins::discovery::discover_with_config(&config);
+    assert!(plugins.validation_is_clean(), "{:?}", plugins.diagnostics());
+    let mut registry = super::SkillRegistry::default();
+    super::merge_active_plugin_skills(&mut registry, &plugins);
+    assert!(registry.is_empty());
+    for namespace in ["team.plugin", "team-plugin"] {
+        plugins.trust(namespace).unwrap();
+        plugins.enable(namespace).unwrap_or_else(|error| {
+            panic!("{error}: {:?}", plugins.get(namespace).unwrap().diagnostics)
+        });
+        let plugin = plugins.get(namespace).unwrap();
+        let unicode = plugin
+            .skill_snapshots
+            .iter()
+            .find(|s| s.body == format!("{namespace} 技能"))
+            .unwrap();
+        assert_eq!(unicode.legacy_activation_name.as_deref(), Some("skill"));
+        assert!(!unicode.source_hash.is_empty());
+    }
+    super::merge_active_plugin_skills(&mut registry, &plugins);
+    assert_eq!(registry.len(), 6);
+    let dotted = registry.get("TEAM.PLUGIN:技能").unwrap();
+    assert_eq!(dotted.body, "team.plugin 技能");
+    assert_eq!(
+        dotted.legacy_activation_name.as_deref(),
+        Some("team.plugin:skill")
+    );
+    assert_eq!(
+        registry.get("TEAM-PLUGIN:技能").unwrap().body,
+        "team-plugin 技能"
+    );
+    assert!(registry.get("team_plugin:技能").is_none());
+    let path = tmp.path().join("skills_state.toml");
+    std::fs::write(&path, "disabled = [\"team.plugin:skill\"]\n").unwrap();
+    let filtered = registry
+        .clone()
+        .into_enabled_with_state(crate::skill_state::SkillStateStore::load_from(path));
+    assert!(filtered.get("team.plugin:技能").is_none());
+    assert!(filtered.get("team-plugin:技能").is_some());
+    registry
+        .skills
+        .retain(|skill| !skill.name.starts_with("team.plugin:"));
+    assert!(
+        registry.get("team.plugin:技能").is_none(),
+        "absent dotted namespace must not select dashed namespace"
+    );
 }
 
 #[test]
@@ -321,6 +529,7 @@ fn render_skills_block_shortens_summary_before_trigger() {
     let summary = "s".repeat(300);
     for i in 0..120 {
         registry.skills.push(super::Skill {
+            legacy_activation_name: None,
             name: format!("skill-{i:03}"),
             description: format!("{summary} Use when: the user asks for widget {i}."),
             localized_descriptions: std::collections::HashMap::new(),
@@ -371,6 +580,7 @@ fn render_skills_block_holds_budget_with_five_digit_omission_counts() {
     let mut registry = super::SkillRegistry::default();
     for i in 0..15_000 {
         registry.skills.push(super::Skill {
+            legacy_activation_name: None,
             name: format!("skill-{i:05}"),
             description: "x".to_string(),
             localized_descriptions: std::collections::HashMap::new(),
@@ -412,6 +622,7 @@ fn explicit_only_skills_do_not_reduce_ambient_index_capacity() {
     let mut registry = super::SkillRegistry::default();
     for i in 0..6 {
         registry.skills.push(super::Skill {
+            legacy_activation_name: None,
             name: format!("visible-{i:03}"),
             description: "x".repeat(246),
             localized_descriptions: std::collections::HashMap::new(),
@@ -430,6 +641,7 @@ fn explicit_only_skills_do_not_reduce_ambient_index_capacity() {
     let mut with_explicit_only = registry.clone();
     for i in 0..10_000 {
         with_explicit_only.skills.push(super::Skill {
+            legacy_activation_name: None,
             name: format!("explicit-{i:05}"),
             description: String::new(),
             localized_descriptions: std::collections::HashMap::new(),
@@ -451,6 +663,7 @@ fn render_skills_block_preserves_registry_precedence_under_prompt_budget() {
     let tmpdir = TempDir::new().unwrap();
     let mut registry = super::SkillRegistry::default();
     registry.skills.push(super::Skill {
+        legacy_activation_name: None,
         name: "workspace-priority".to_string(),
         description: "must survive truncation".to_string(),
         localized_descriptions: std::collections::HashMap::new(),
@@ -469,6 +682,7 @@ fn render_skills_block_preserves_registry_precedence_under_prompt_budget() {
     let big_desc = "y".repeat(super::MAX_SKILL_DESCRIPTION_CHARS - 20);
     for i in 0..200 {
         registry.skills.push(super::Skill {
+            legacy_activation_name: None,
             name: format!("aaa-global-{i:03}"),
             description: big_desc.clone(),
             localized_descriptions: std::collections::HashMap::new(),
@@ -588,6 +802,7 @@ fn description_for_locale_matches_exact_then_primary_then_falls_back() {
     localized.insert("zh".to_string(), "中文描述".to_string());
     localized.insert("ja".to_string(), "日本語の説明".to_string());
     let skill = super::Skill {
+        legacy_activation_name: None,
         name: "demo".to_string(),
         description: "English description".to_string(),
         localized_descriptions: localized,
@@ -622,6 +837,7 @@ fn description_for_locale_uses_exact_traditional_key_when_authored() {
     localized.insert("zh".to_string(), "简体描述".to_string());
     localized.insert("zh-hant".to_string(), "繁體描述".to_string());
     let skill = super::Skill {
+        legacy_activation_name: None,
         name: "demo".to_string(),
         description: "English".to_string(),
         localized_descriptions: localized,
@@ -641,6 +857,7 @@ fn description_for_locale_uses_exact_traditional_key_when_authored() {
 #[test]
 fn description_for_locale_uses_default_when_no_localized_variants() {
     let skill = super::Skill {
+        legacy_activation_name: None,
         name: "demo".to_string(),
         description: "only english".to_string(),
         localized_descriptions: std::collections::HashMap::new(),
@@ -659,6 +876,7 @@ fn render_skills_block_selects_description_by_locale() {
     let mut localized = std::collections::HashMap::new();
     localized.insert("zh".to_string(), "压缩日志的技能".to_string());
     registry.skills.push(super::Skill {
+        legacy_activation_name: None,
         name: "compress".to_string(),
         description: "Compress logs to save space".to_string(),
         localized_descriptions: localized,
@@ -1377,6 +1595,7 @@ fn discover_finds_both_workspace_and_global_skills() {
         "body",
     );
 
+    crate::test_support::trust_workspace(&workspace);
     let skills_dir = workspace.join(".agents").join("skills");
     let registry =
         super::discover_for_workspace_and_dir_with_home(&workspace, &skills_dir, Some(&home));
@@ -1677,6 +1896,7 @@ fn plugin_skills_are_qualified_and_denied_until_trusted_and_enabled() {
 
     let mut fail_closed_input = registry.clone();
     fail_closed_input.skills.push(super::Skill {
+        legacy_activation_name: None,
         name: "native-recovery".to_string(),
         description: "native recovery skill".to_string(),
         localized_descriptions: std::collections::HashMap::new(),
@@ -1924,6 +2144,7 @@ fn default_workspace_skill_prompt_preserves_its_discoverable_path() {
     let _userprofile = crate::test_support::EnvVarGuard::set("USERPROFILE", &home);
     let _codewhale_home =
         crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", home.join(".codewhale"));
+    crate::test_support::trust_workspace(&workspace);
 
     let rendered =
         super::render_available_skills_context_for_workspace_and_dir_with_mode_and_plugins(
@@ -1972,6 +2193,110 @@ fn global_skill_roots_come_from_the_os_home_only() {
     );
 }
 
+/// Passing a workspace skills dir as the session's `skills_dir` (as
+/// `resolve_skills_dir` and the runtime API did) must not re-admit what the
+/// root catalog's trust gate filtered out, and the warning must name the dir.
+fn assert_skills_dir_held_to_workspace_trust(
+    workspace: &std::path::Path,
+    skills_dir: &std::path::Path,
+    mode: super::SkillDiscoveryMode,
+) {
+    write_skill(
+        skills_dir,
+        "repo-skill",
+        "from the repository",
+        "do repo things",
+    );
+
+    let registry = super::discover_for_workspace_and_dir_with_mode_and_plugins(
+        workspace, skills_dir, mode, None,
+    );
+    assert!(
+        registry.get("repo-skill").is_none(),
+        "untrusted workspace skill loaded via skills_dir {}",
+        skills_dir.display()
+    );
+    assert!(
+        !super::skill_directories_for_workspace_and_dir(workspace, skills_dir, mode)
+            .iter()
+            .any(|dir| super::roots::paths_refer_to_same_dir(dir, skills_dir)),
+        "untrusted workspace skills_dir must not be searched"
+    );
+    let dir_name = skills_dir
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    assert!(
+        registry
+            .warnings()
+            .iter()
+            .any(|warning| warning.contains("not trusted") && warning.contains(&dir_name)),
+        "{:?}",
+        registry.warnings()
+    );
+
+    crate::test_support::trust_workspace(workspace);
+    let registry = super::discover_for_workspace_and_dir_with_mode_and_plugins(
+        workspace, skills_dir, mode, None,
+    );
+    assert!(registry.get("repo-skill").is_some());
+    assert!(
+        !registry
+            .warnings()
+            .iter()
+            .any(|warning| warning.contains("not trusted")),
+        "{:?}",
+        registry.warnings()
+    );
+}
+
+#[test]
+fn untrusted_workspace_agents_skills_via_skills_dir_not_loaded() {
+    let tmp = TempDir::new().unwrap();
+    let workspace = tmp.path().join("ws");
+    assert_skills_dir_held_to_workspace_trust(
+        &workspace,
+        &workspace.join(".agents").join("skills"),
+        super::SkillDiscoveryMode::Compatible,
+    );
+}
+
+#[test]
+fn untrusted_workspace_flat_skills_via_skills_dir_not_loaded() {
+    let tmp = TempDir::new().unwrap();
+    let workspace = tmp.path().join("ws");
+    assert_skills_dir_held_to_workspace_trust(
+        &workspace,
+        &workspace.join("skills"),
+        super::SkillDiscoveryMode::Compatible,
+    );
+}
+
+#[test]
+fn untrusted_workspace_codewhale_only_skills_dir_not_loaded() {
+    let tmp = TempDir::new().unwrap();
+    let workspace = tmp.path().join("ws");
+    assert_skills_dir_held_to_workspace_trust(
+        &workspace,
+        &workspace.join(".codewhale").join("skills"),
+        super::SkillDiscoveryMode::CodeWhaleOnly,
+    );
+}
+
+/// An explicitly configured dir that lives inside the repository is still
+/// repository content: it waits for trust like the built-in project roots.
+#[test]
+fn untrusted_workspace_custom_configured_dir_inside_workspace_not_loaded() {
+    let tmp = TempDir::new().unwrap();
+    let workspace = tmp.path().join("ws");
+    assert_skills_dir_held_to_workspace_trust(
+        &workspace,
+        &workspace.join("my-skills"),
+        super::SkillDiscoveryMode::Compatible,
+    );
+}
+
 /// Repository-supplied skills are instructions nobody reviewed: they stay out
 /// of runtime discovery until the workspace is trusted, and discovery says so
 /// rather than dropping them silently.
@@ -2016,4 +2341,64 @@ fn project_skills_require_workspace_trust() {
         "{:?}",
         registry.warnings()
     );
+}
+
+#[test]
+fn hidden_and_backup_payload_changes_stale_the_trust_receipt() {
+    use super::audit::{self, SkillAuditMode, TrustState};
+    use super::install::{INSTALLED_FROM_MARKER, TRUSTED_MARKER, write_trust_v2};
+    use super::package_digest::compute_package_digest;
+    use std::fs;
+    let tmp = tempfile::tempdir().unwrap();
+    let package = tmp.path().join(".codewhale/skills/demo");
+    fs::create_dir_all(&package).unwrap();
+    fs::write(
+        package.join("SKILL.md"),
+        "---\nname: demo\ndescription: test\n---\nbody",
+    )
+    .unwrap();
+    let payloads = [
+        ".hidden",
+        ".hidden-dir/run.sh",
+        "script.bak",
+        "script.tmp",
+        "nested/.trusted",
+    ];
+    for relative in payloads {
+        let path = package.join(relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, "safe").unwrap();
+    }
+    let digest = compute_package_digest(&package).unwrap();
+    write_trust_v2(&package, &digest).unwrap();
+    let initial = audit::scan(tmp.path(), None, SkillAuditMode::OwnedOnly, None);
+    assert_eq!(initial.skills.len(), 1);
+    assert_eq!(
+        initial.skills[0].trust,
+        TrustState::TrustedForDigest(digest.clone())
+    );
+    for relative in payloads {
+        fs::write(package.join(relative), "evil").unwrap();
+        assert_ne!(
+            compute_package_digest(&package).unwrap(),
+            digest,
+            "{relative}"
+        );
+        let changed = audit::scan(tmp.path(), None, SkillAuditMode::OwnedOnly, None);
+        assert_eq!(
+            changed.skills[0].trust,
+            TrustState::TrustStale,
+            "{relative}"
+        );
+        fs::write(package.join(relative), "safe").unwrap();
+    }
+    // These root files are local bookkeeping, not executable payload.
+    for marker in [
+        INSTALLED_FROM_MARKER,
+        TRUSTED_MARKER,
+        ".system-installed-version",
+    ] {
+        fs::write(package.join(marker), "local metadata").unwrap();
+        assert_eq!(compute_package_digest(&package).unwrap(), digest);
+    }
 }

@@ -1,4 +1,11 @@
 {
+  "CmdPluginOwnerReport": "एक्सटेंशन होस्ट:\n  स्थिति: {state}\n  सक्रिय टूल ({count}): {tools}",
+  "CmdPluginOwnerActivating": "सक्रिय किया जा रहा है",
+  "CmdPluginOwnerActive": "सक्रिय",
+  "CmdPluginOwnerFailed": "विफल: {reason}",
+  "CmdPluginOwnerFaulted": "त्रुटिग्रस्त: {reason}",
+  "CmdPluginOwnerRevoked": "अनुमति रद्द",
+  "CmdPluginOwnerInactive": "निष्क्रिय",
   "MobileStreamReplayFailed": "Runtime इस बातचीत का इतिहास नहीं पढ़ सका — फिर से कोशिश हो रही है",
   "MobileStreamCatchUpFailed": "Runtime पीछे रह गया और छूटी हुई घटनाएँ प्राप्त नहीं कर सका — फिर से कोशिश हो रही है",
   "MobileStreamRuntimeShutdown": "Runtime बंद हो रहा है — फिर से कनेक्ट हो रहा है",

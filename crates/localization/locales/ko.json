@@ -1,4 +1,11 @@
 {
+  "CmdPluginOwnerReport": "확장 호스트:\n  상태: {state}\n  활성 도구 ({count}): {tools}",
+  "CmdPluginOwnerActivating": "활성화 중",
+  "CmdPluginOwnerActive": "활성",
+  "CmdPluginOwnerFailed": "실패: {reason}",
+  "CmdPluginOwnerFaulted": "오류 발생: {reason}",
+  "CmdPluginOwnerRevoked": "권한 철회됨",
+  "CmdPluginOwnerInactive": "비활성",
   "MobileStreamReplayFailed": "Runtime이 이 대화의 기록을 읽지 못했습니다 — 다시 시도 중",
   "MobileStreamCatchUpFailed": "Runtime의 이벤트 처리가 지연되어 따라잡지 못했습니다 — 다시 시도 중",
   "MobileStreamRuntimeShutdown": "Runtime을 종료하고 있습니다 — 다시 연결 중",

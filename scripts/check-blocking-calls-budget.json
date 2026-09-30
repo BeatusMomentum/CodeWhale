@@ -35,7 +35,7 @@
   },
   "crates/config/src/lib.rs": {
     "path_canonicalize": 3,
-    "std_fs": 9
+    "std_fs": 10
   },
   "crates/config/src/redaction.rs": {
     "path_canonicalize": 2,
@@ -399,7 +399,8 @@
   },
   "crates/tui/src/snapshot/repo.rs": {
     "path_canonicalize": 4,
-    "std_fs": 17
+    "std_fs": 17,
+    "thread_sleep": 1
   },
   "crates/tui/src/tools/git.rs": {
     "path_canonicalize": 1

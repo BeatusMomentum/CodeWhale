@@ -52,6 +52,7 @@ const OPTIONAL_FILES = [
   "faq.ts",
   "roadmap.ts",
   "contribute.ts",
+  "constitution.ts",
   "computer-use.ts",
 ];
 

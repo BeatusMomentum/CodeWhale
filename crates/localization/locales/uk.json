@@ -1,4 +1,11 @@
 {
+  "CmdPluginOwnerReport": "Хост розширень:\n  Стан: {state}\n  Активні інструменти ({count}): {tools}",
+  "CmdPluginOwnerActivating": "Активація",
+  "CmdPluginOwnerActive": "Активний",
+  "CmdPluginOwnerFailed": "Збій: {reason}",
+  "CmdPluginOwnerFaulted": "Несправний: {reason}",
+  "CmdPluginOwnerRevoked": "Доступ відкликано",
+  "CmdPluginOwnerInactive": "Неактивний",
   "MobileStreamReplayFailed": "Runtime не вдалося прочитати історію цієї розмови — повторна спроба",
   "MobileStreamCatchUpFailed": "Runtime відстав і не зміг отримати пропущені події — повторна спроба",
   "MobileStreamRuntimeShutdown": "Runtime завершує роботу — повторне підключення",

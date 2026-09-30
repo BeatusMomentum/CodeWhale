@@ -37,7 +37,7 @@ fn component_paths(plugin: &LoadedPlugin, capability: PluginActivationCapability
 
 /// Why `path` cannot be an extension-host entry, if it cannot.
 ///
-/// A `native` entry is one `.mjs` or `.js` ES module file: the host imports
+/// A `native` entry is one `.mjs`, `.js` or `.mts` ES module file: the host imports
 /// exactly that file and re-hashes it first. This is the one statement of the
 /// rule. Discovery reports it as an error diagnostic (so `/plugin validate`
 /// and the review screen show it) and activation refuses the entry, both only
@@ -50,10 +50,10 @@ fn component_paths(plugin: &LoadedPlugin, capability: PluginActivationCapability
 /// function touches no filesystem.
 #[must_use]
 pub fn native_entry_problem(path: &Path, is_regular_file: bool) -> Option<&'static str> {
-    const RULE: &str = "a native entry must be one .mjs or .js ES module file";
+    const RULE: &str = "a native entry must be one .mjs, .js or .mts ES module file";
     let is_module = path
         .extension()
-        .is_some_and(|extension| extension == "mjs" || extension == "js");
+        .is_some_and(|extension| extension == "mjs" || extension == "js" || extension == "mts");
     (!is_module || !is_regular_file).then_some(RULE)
 }
 

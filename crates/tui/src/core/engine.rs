@@ -1719,7 +1719,6 @@ impl Engine {
             .filter(|_| config.features.enabled(Feature::ExtensionHost))
             .map(|registry| {
                 let manager = crate::extension_host::manager();
-                manager.begin_session();
                 let attachment = manager.attach(Arc::clone(registry));
                 attachment.sync_in_background();
                 attachment
@@ -2095,6 +2094,7 @@ impl Engine {
         let _ = self
             .tx_event
             .send(Event::ToolCallStarted {
+                model_call: None,
                 id: tool_id.clone(),
                 name: tool_name.clone(),
                 input: tool_input.clone(),
@@ -2185,6 +2185,7 @@ impl Engine {
         let _ = self
             .tx_event
             .send(Event::ToolCallComplete {
+                model_call: None,
                 id: tool_id,
                 name: tool_name,
                 result,
@@ -7431,7 +7432,10 @@ impl Engine {
     // KV-cache effect: append-only user history. SessionUpdated persists this
     // warning even when an explicit prompt rebuild replaces the system prefix.
     fn record_project_trust_warning(&mut self) {
-        let warning = crate::skills::untrusted_project_skills_warning(&self.session.workspace);
+        let warning = crate::skills::untrusted_project_skills_warning(
+            &self.session.workspace,
+            Some(&self.config.skills_dir),
+        );
         let previous = self
             .session
             .messages
@@ -7893,6 +7897,12 @@ pub(crate) fn file_tool_ask_rule_decision_for_policy(
         crate::tools::canonical_action::canonical_action_alias(tool_name, tool_input);
     let paths = file_tool_permission_paths(policy_tool_name, tool_input)?;
     if paths.is_empty() {
+        if matches!(policy_tool_name, "write_file" | "edit_file" | "apply_patch") {
+            return Some(ToolAskRuleDecision::Block(
+                "File write has no resolvable target; provide an explicit path or valid patch."
+                    .to_string(),
+            ));
+        }
         return tool_ask_rule_decision_for_context(
             exec_policy_engine,
             policy_tool_name,
@@ -7975,15 +7985,32 @@ fn tool_ask_rule_decision_for_context(
     }
 }
 
+/// Every path the file tool will act on. The tools fold `file_path` /
+/// `filePath` onto `path` before executing, so each alias spelling is read
+/// here too; a rule keyed on `path` would otherwise never see that target.
 fn file_tool_permission_paths(tool_name: &str, input: &Value) -> Option<Vec<String>> {
+    let path_arguments = || {
+        let mut paths: Vec<String> = crate::tools::file::path_argument_keys()
+            .filter_map(|key| string_field(input, key))
+            .collect();
+        paths.dedup();
+        paths
+    };
     match tool_name {
         "read_file" | "write_file" | "edit_file" | "file_search" | "grep_files" => {
-            Some(string_field(input, "path").into_iter().collect())
+            Some(path_arguments())
         }
-        "list_dir" => Some(vec![
-            string_field(input, "path").unwrap_or_else(|| ".".to_string()),
-        ]),
-        "apply_patch" => Some(apply_patch_permission_paths(input)),
+        "list_dir" => {
+            let paths = path_arguments();
+            Some(if paths.is_empty() {
+                vec![".".to_string()]
+            } else {
+                paths
+            })
+        }
+        "apply_patch" => Some(apply_patch_permission_paths(
+            &crate::tools::file::with_canonical_path_argument(input),
+        )),
         _ => None,
     }
 }

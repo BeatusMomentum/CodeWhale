@@ -151,12 +151,15 @@ Declare Commands, Agents, and Hooks paths under
 Do not place MCP server fields or arbitrary runtime entrypoints at the manifest
 root. LSP can be inventoried but has no executable adapter. A `native`
 extension is inventory-only by default; with the experimental
-`[features] extension_host` flag on, it names one `.mjs` or `.js` ES module
+`[features] extension_host` flag on, it names one `.mjs`, `.js` or `.mts` ES module
 file that the TypeScript extension host runs, and `/plugin validate` rejects
 any other entry. Its tools always use `Required` approval, never a plugin's
 read-only hint. Full Access, Bypass, or an exact session grant for the
 reviewed build can satisfy that gate without a prompt
 ([design](design/TS_EXTENSION_HOST.md#as-built-phase-1-2026-09-25)).
+For a tested typed example, lifecycle rules and per-plugin diagnostics, read
+[Writing an extension tool](EXTENSIONS.md). `.mts` supports Node's erasable
+types without a separate compiler; syntax needing transformation is not supported.
 
 Plugin trust is **not an OS sandbox**. A local MCP server or hook can launch a
 process; review its code and authority before enabling it. Skills do not grant

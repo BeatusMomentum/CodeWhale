@@ -2374,10 +2374,23 @@ pub(crate) async fn run_event_loop(
                         streaming_thinking::stash_reasoning_buffer_into_last_reasoning(app);
                         stream_display_clock.reset();
                     }
-                    EngineEvent::ToolCallStarted { id, name, input } => {
+                    EngineEvent::ToolCallStarted {
+                        id,
+                        name,
+                        input,
+                        model_call,
+                    } => {
                         app.session_metrics.record_tool_started(&id);
-                        app.pending_tool_uses
-                            .push((id.clone(), name.clone(), input.clone()));
+                        if let Some(model_call) = model_call {
+                            app.pending_tool_uses.push(ContentBlock::ToolUse {
+                                id: model_call.provider_id,
+                                execution_id: Some(id.clone()),
+                                name: name.clone(),
+                                input: input.clone(),
+                                caller: model_call.caller,
+                                thought_signature: model_call.thought_signature,
+                            });
+                        }
                         // Note this dispatch so the next sub-agent `Started`
                         // mailbox envelope routes into the right card kind
                         // (delegate vs fanout).
@@ -2403,7 +2416,12 @@ pub(crate) async fn run_event_loop(
                     // transcript renders from the ToolCall* events.
                     EngineEvent::OperationActivityStarted { .. }
                     | EngineEvent::OperationActivityCompleted { .. } => {}
-                    EngineEvent::ToolCallComplete { id, name, result } => {
+                    EngineEvent::ToolCallComplete {
+                        id,
+                        name,
+                        result,
+                        model_call,
+                    } => {
                         if crate::tui::tool_routing::evidence_completion_should_be_ignored(
                             app, &id, &result,
                         ) {
@@ -2411,7 +2429,7 @@ pub(crate) async fn run_event_loop(
                             continue;
                         }
                         app.session_metrics.record_tool_completed(&id);
-                        if is_model_visible_tool_call(&id) {
+                        if let Some(model_call) = model_call {
                             let tool_content = match &result {
                                 Ok(output) => sanitize_stream_chunk(
                                     &tool_result_content_for_api_message(app, &name, output),
@@ -2421,15 +2439,18 @@ pub(crate) async fn run_event_loop(
                             app.push_api_message(Message {
                                 role: Role::User,
                                 content: vec![ContentBlock::ToolResult {
-                                    tool_use_id: id.clone(),
+                                    execution_id: Some(id.clone()),
+                                    tool_use_id: model_call.provider_id,
                                     content: tool_content,
                                     is_error: None,
                                     content_blocks: None,
                                 }],
                             });
                         } else {
-                            app.pending_tool_uses
-                                .retain(|(tool_id, _, _)| tool_id != &id);
+                            app.pending_tool_uses.retain(|block| {
+                                block.tool_call_key()
+                                    != Some(codewhale_models::ToolCallKey::Execution(&id))
+                            });
                         }
                         handle_tool_call_complete(app, &id, &name, &result);
                         if name

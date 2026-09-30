@@ -587,6 +587,33 @@ export interface ContributeDict {
   devScope: string;
 }
 
+/** `app/[locale]/constitution/page.tsx` and its `components/thinking-trace.tsx`. */
+export interface ConstitutionDict {
+  metaTitle: string;
+  metaDescription: string;
+  kicker: string;
+  /** Page H1. */
+  title: string;
+  /** The H1 again in the other script, set beside it (the bilingual Han title). */
+  titleAside: string;
+  /** BCP 47 language of `titleAside`. */
+  titleAsideLang: string;
+  lede: string;
+  /** Status label on the setup callout. */
+  since: string;
+  sinceBody: string;
+  rankTitle: string;
+  rankScope: string;
+  boundaryTitle: string;
+  boundaryBody: string;
+  traceTitle: string;
+  traceScope: string;
+  /** The label every traced scene carries: these are illustrations, not transcripts. */
+  illustration: string;
+  install: string;
+  configuration: string;
+}
+
 export type DocsHooksDict = DocsPageDict;
 
 export type DocsTroubleshootingDict = DocsPageDict;

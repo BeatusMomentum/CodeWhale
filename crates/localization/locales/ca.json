@@ -1,4 +1,11 @@
 {
+  "CmdPluginOwnerReport": "Amfitrió d’extensions:\n  Estat: {state}\n  Eines actives ({count}): {tools}",
+  "CmdPluginOwnerActivating": "S’està activant",
+  "CmdPluginOwnerActive": "Actiu",
+  "CmdPluginOwnerFailed": "Ha fallat: {reason}",
+  "CmdPluginOwnerFaulted": "Amb errors: {reason}",
+  "CmdPluginOwnerRevoked": "Revocat",
+  "CmdPluginOwnerInactive": "Inactiu",
   "MobileStreamReplayFailed": "El Runtime no ha pogut llegir l'historial d'aquesta conversa — tornant-ho a provar",
   "MobileStreamCatchUpFailed": "El Runtime s'ha endarrerit i no s'ha pogut posar al dia — tornant-ho a provar",
   "MobileStreamRuntimeShutdown": "El Runtime s'està tancant — reconnectant",

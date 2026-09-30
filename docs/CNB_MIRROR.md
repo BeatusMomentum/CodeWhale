@@ -1,5 +1,7 @@
 # CNB Cool mirror
 
+> 阅读简体中文版：[zh_hans/CNB_MIRROR.md](zh_hans/CNB_MIRROR.md)。
+
 `cnb.cool/codewhale.net/codewhale` is a one-way mirror of this
 GitHub repository for users on networks where GitHub is slow or blocked
 (primarily mainland China). The mirror receives every push to `main`, every
@@ -210,7 +212,7 @@ Users behind GitHub-blocking networks can also select a source explicitly:
   `codewhale-tui` install is not required.
   Linux build-time dependencies (`build-essential`, `pkg-config`,
   `libdbus-1-dev` on Debian/Ubuntu) are required — see
-  [INSTALL.md](INSTALL.md#4-install-via-cargo-any-tier-1-rust-target).
+  [INSTALL.md](INSTALL.md#5-cargo-and-building-from-source).
 
 - **CNB release assets** for Linux x64, when the matching CNB tag pipeline has
   completed successfully. Download `codewhale-linux-x64`, `codew-linux-x64`,

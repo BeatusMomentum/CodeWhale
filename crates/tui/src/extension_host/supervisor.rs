@@ -1,10 +1,8 @@
 //! One extension-host process: launch plan, spawn, handshake, channel, exit.
 //!
-//! Phase 1 has no heartbeat and no auto-restart. When the process exits for
-//! any reason, every in-flight call fails with a typed error, the owner
-//! registry is revoked wholesale, and the host is marked failed with its
-//! stderr tail. Nothing respawns until the next session or a newly enabled
-//! plugin.
+//! When the process exits, every in-flight call fails with a typed error.
+//! The existing Rust manager owns heartbeat, crash budget, generation changes,
+//! and receipt-checked replay; this channel never replays a tool call.
 //!
 //! **OS sandbox.** Where Codewhale's default command sandbox is available
 //! (Seatbelt on macOS; bubblewrap stays opt-in for shell commands and is not
@@ -22,7 +20,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -227,6 +225,7 @@ pub(crate) trait HostEvents: Send + Sync + 'static {
     fn register(&self, params: &protocol::RegisterParams) -> RegisterResult;
     fn unregister(&self, params: &protocol::UnregisterParams);
     fn faulted(&self, params: &protocol::FaultedParams);
+    fn log(&self, params: &protocol::LogParams);
     fn exited(&self, host_generation: u64, reason: String, stderr_tail: String);
 }
 
@@ -238,6 +237,7 @@ struct PendingCall {
     /// Plugin whose revocation cancels this call.
     owner: Option<String>,
     revoked: bool,
+    heartbeat: bool,
 }
 
 #[derive(Default)]
@@ -254,9 +254,13 @@ pub(crate) struct HostProcess {
     tree: Arc<crate::process_tree::ProcessTree>,
     outbound: mpsc::Sender<Vec<u8>>,
     pending: Arc<Mutex<HashMap<u64, PendingCall>>>,
+    /// Admission checks and sealing hold `pending`; the manager also reads
+    /// this flag to avoid activation while the exit callback is still pending.
+    admission_closed: AtomicBool,
     next_id: AtomicU64,
     stderr_tail: Arc<Mutex<VecDeque<u8>>>,
     exited: tokio::sync::watch::Receiver<bool>,
+    kill: mpsc::Sender<String>,
 }
 
 fn push_tail(tail: &Mutex<VecDeque<u8>>, bytes: &[u8]) {
@@ -416,6 +420,7 @@ impl HostProcess {
             let tree = Arc::clone(&tree);
             tokio::spawn(async move {
                 let reason = tokio::select! {
+                    biased;
                     status = child.wait() => match status {
                         Ok(status) => format!("exited with {status}"),
                         Err(error) => format!("wait failed: {error}"),
@@ -428,16 +433,16 @@ impl HostProcess {
                 };
                 // The leader is gone; take anything it left behind with it.
                 let _ = tree.kill();
-                let drained: Vec<PendingCall> = pending
-                    .lock()
-                    .expect("pending lock")
-                    .drain()
-                    .map(|(_, call)| call)
-                    .collect();
+                let drained: Vec<PendingCall> = {
+                    let mut pending = pending.lock().expect("pending lock");
+                    // Publish exit under the admission lock before draining:
+                    // waking a failed call must not admit another orphaned call.
+                    let _ = exited_tx.send(true);
+                    pending.drain().map(|(_, call)| call).collect()
+                };
                 for call in drained {
                     let _ = call.tx.send(Err(HostCallError::Exited(reason.clone())));
                 }
-                let _ = exited_tx.send(true);
                 // Give the stderr task a moment to capture the last lines.
                 tokio::time::sleep(Duration::from_millis(50)).await;
                 events.exited(generation, reason, tail_string(&tail));
@@ -451,9 +456,11 @@ impl HostProcess {
             tree,
             outbound,
             pending,
+            admission_closed: AtomicBool::new(false),
             next_id: AtomicU64::new(1),
             stderr_tail,
             exited: exited_rx,
+            kill: kill_tx.clone(),
         });
 
         let handshake_result = tokio::time::timeout(HANDSHAKE_DEADLINE, async {
@@ -528,6 +535,35 @@ impl HostProcess {
         *self.exited.borrow()
     }
 
+    pub(crate) fn terminate(&self, reason: String) {
+        let _ = self.kill.try_send(reason);
+    }
+
+    pub(crate) fn is_retiring(&self) -> bool {
+        self.admission_closed.load(Ordering::Acquire)
+    }
+
+    /// Seal admission and retire this process only if no non-heartbeat call
+    /// is pending. The same lock guards admission in `start_request`.
+    pub(crate) fn terminate_if_idle(&self, reason: &str) -> bool {
+        let pending = self.pending.lock().expect("pending lock");
+        if self.has_exited()
+            || self.admission_closed.load(Ordering::Relaxed)
+            || pending.values().any(|call| !call.heartbeat)
+        {
+            return false;
+        }
+        if self.kill.try_send(reason.to_string()).is_err() {
+            return false;
+        }
+        self.admission_closed.store(true, Ordering::Release);
+        true
+    }
+
+    pub(crate) fn stderr_tail(&self) -> String {
+        tail_string(&self.stderr_tail)
+    }
+
     fn send_frame(&self, value: &Value) -> Result<(), HostCallError> {
         let frame = protocol::encode_frame(value).map_err(|error| HostCallError::Rpc {
             code: error_code::INVALID_PARAMS,
@@ -554,7 +590,17 @@ impl HostProcess {
         let (tx, rx) = oneshot::channel();
         {
             let mut pending = self.pending.lock().expect("pending lock");
-            if pending.len() >= protocol::MAX_INFLIGHT {
+            // Exit may have won after the fast check above. It publishes under
+            // this same lock, so every admitted call is either live or drained.
+            if self.has_exited() {
+                return Err(HostCallError::Exited("already exited".to_string()));
+            }
+            if self.admission_closed.load(Ordering::Relaxed) {
+                return Err(HostCallError::Exited("host is restarting".to_string()));
+            }
+            // Reserve one control request for the single heartbeat monitor,
+            // so saturated tool calls cannot make a healthy host look hung.
+            if pending.len() >= protocol::MAX_INFLIGHT && !matches!(request, CoreRequest::Ping) {
                 return Err(HostCallError::Busy);
             }
             pending.insert(
@@ -563,6 +609,7 @@ impl HostProcess {
                     tx,
                     owner,
                     revoked: false,
+                    heartbeat: matches!(request, CoreRequest::Ping),
                 },
             );
         }
@@ -739,6 +786,7 @@ fn handle_host_message(
             }
             HostNotification::Faulted(params) => events.faulted(&params),
             HostNotification::Log(log) => {
+                events.log(&log);
                 let plugin = log.plugin_id.as_deref().unwrap_or("host");
                 match log.level.as_str() {
                     "error" => tracing::warn!(target: "extension_host", plugin, "{}", log.msg),

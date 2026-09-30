@@ -1,4 +1,11 @@
 {
+  "CmdPluginOwnerReport": "Extension host:\n  State: {state}\n  Live tools ({count}): {tools}",
+  "CmdPluginOwnerActivating": "Activating",
+  "CmdPluginOwnerActive": "Active",
+  "CmdPluginOwnerFailed": "Failed: {reason}",
+  "CmdPluginOwnerFaulted": "Faulted: {reason}",
+  "CmdPluginOwnerRevoked": "Revoked",
+  "CmdPluginOwnerInactive": "Not active",
   "MobileStreamReplayFailed": "Runtime could not read this conversation's history — retrying",
   "MobileStreamCatchUpFailed": "Runtime fell behind and could not catch up — retrying",
   "MobileStreamRuntimeShutdown": "Runtime is shutting down — reconnecting",

@@ -1,4 +1,11 @@
 {
+  "CmdPluginOwnerReport": "Máy chủ tiện ích mở rộng:\n  Trạng thái: {state}\n  Công cụ đang hoạt động ({count}): {tools}",
+  "CmdPluginOwnerActivating": "Đang kích hoạt",
+  "CmdPluginOwnerActive": "Đang hoạt động",
+  "CmdPluginOwnerFailed": "Thất bại: {reason}",
+  "CmdPluginOwnerFaulted": "Gặp lỗi: {reason}",
+  "CmdPluginOwnerRevoked": "Đã thu hồi",
+  "CmdPluginOwnerInactive": "Chưa hoạt động",
   "MobileStreamReplayFailed": "Runtime không thể đọc lịch sử cuộc trò chuyện này — đang thử lại",
   "MobileStreamCatchUpFailed": "Runtime bị chậm và không thể bắt kịp — đang thử lại",
   "MobileStreamRuntimeShutdown": "Runtime đang tắt — đang kết nối lại",

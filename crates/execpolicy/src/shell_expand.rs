@@ -35,7 +35,8 @@
 //! command (a substitution, `eval`, a `-c` payload, `find -exec`), which is
 //! never covered by an allow rule written for the outer command.
 //!
-//! Known limits: a script *file* (`bash ./x.sh`, `. ./env.sh`) is opaque, as
+//! Known limits: a script *file* (`bash ./x.sh`, `. ./env.sh`) is opaque
+//! (a descriptor path such as `/dev/stdin` is not a file: it is dynamic), as
 //! is any program that interprets its arguments as code (`python -c`, `ssh
 //! host cmd`, `git -c alias.x=!cmd`). Aliases and functions defined in an
 //! earlier call are not tracked. Arithmetic contexts (`(( ))`, `$(( ))`,
@@ -413,6 +414,383 @@ static WRAPPERS: &[Wrapper] = &[
         long_values: &["distribution", "user", "cd", "shell-type"],
         long_switches: &["exec"],
         operands: 0,
+    }, // Privilege, sandbox, scheduling and tracing launchers: each runs its
+    // operands as a command.
+    Wrapper {
+        name: "pkexec",
+        short_values: "",
+        short_switches: "",
+        long_values: &["user"],
+        long_switches: &["disable-internal-agent", "keep-cwd"],
+        operands: 0,
+    },
+    Wrapper {
+        name: "run0",
+        short_values: "ugD",
+        short_switches: "",
+        long_values: &[
+            "user",
+            "group",
+            "nice",
+            "chdir",
+            "setenv",
+            "unit",
+            "property",
+            "description",
+            "slice",
+            "machine",
+        ],
+        long_switches: &["no-ask-password", "background", "pty", "pipe"],
+        operands: 0,
+    },
+    Wrapper {
+        name: "fakeroot",
+        short_values: "lsib",
+        short_switches: "uhv",
+        long_values: &["lib", "faked"],
+        long_switches: &["unknown-is-real"],
+        operands: 0,
+    },
+    Wrapper {
+        name: "taskset",
+        short_values: "",
+        short_switches: "acpV",
+        long_values: &[],
+        long_switches: &["all-tasks", "cpu-list", "pid"],
+        operands: 1,
+    },
+    Wrapper {
+        name: "chrt",
+        short_values: "TPD",
+        short_switches: "abdefimoprRv",
+        long_values: &["sched-runtime", "sched-period", "sched-deadline"],
+        long_switches: &[
+            "all-tasks",
+            "batch",
+            "deadline",
+            "fifo",
+            "idle",
+            "other",
+            "pid",
+            "rr",
+            "reset-on-fork",
+            "verbose",
+            "max",
+        ],
+        operands: 1,
+    },
+    Wrapper {
+        name: "prlimit",
+        short_values: "po",
+        short_switches: "",
+        long_values: &["pid", "output"],
+        long_switches: &["noheadings", "raw", "verbose"],
+        operands: 0,
+    },
+    Wrapper {
+        name: "strace",
+        short_values: "abeIoOpPsSuEX",
+        short_switches: "cCdDfFhikNqrtTvVwxyYzZ",
+        long_values: &[
+            "output",
+            "expr",
+            "trace",
+            "signal",
+            "status",
+            "attach",
+            "user",
+            "env",
+            "string-limit",
+            "trace-path",
+        ],
+        long_switches: &[
+            "follow-forks",
+            "output-separately",
+            "summary-only",
+            "summary",
+            "no-abbrev",
+            "verbose",
+        ],
+        operands: 0,
+    },
+    Wrapper {
+        name: "ltrace",
+        short_values: "aAeDFlnopsuxwX",
+        short_switches: "bcCfhiLrStTV",
+        long_values: &["output", "library", "indent", "align"],
+        long_switches: &["demangle", "help", "version"],
+        operands: 0,
+    },
+    Wrapper {
+        name: "systemd-run",
+        short_values: "puEHM",
+        short_switches: "rtqGdPS",
+        long_values: &[
+            "property",
+            "unit",
+            "description",
+            "slice",
+            "setenv",
+            "uid",
+            "gid",
+            "nice",
+            "working-directory",
+            "host",
+            "machine",
+            "service-type",
+            "on-active",
+            "on-boot",
+            "on-startup",
+            "on-unit-active",
+            "on-unit-inactive",
+            "on-calendar",
+            "timer-property",
+            "path-property",
+            "socket-property",
+        ],
+        long_switches: &[
+            "user",
+            "system",
+            "scope",
+            "pty",
+            "pipe",
+            "wait",
+            "collect",
+            "quiet",
+            "no-ask-password",
+            "remain-after-exit",
+            "same-dir",
+            "no-block",
+            "send-sighup",
+        ],
+        operands: 0,
+    },
+    Wrapper {
+        name: "numactl",
+        short_values: "NmCipPw",
+        short_switches: "laHsS",
+        long_values: &[
+            "cpunodebind",
+            "membind",
+            "physcpubind",
+            "interleave",
+            "preferred",
+            "preferred-many",
+            "weighted-interleave",
+            "huge",
+            "offset",
+            "length",
+            "mode",
+            "strict",
+            "shmmode",
+            "shmid",
+            "shm",
+            "file",
+        ],
+        long_switches: &["localalloc", "all", "hardware", "show", "touch"],
+        operands: 0,
+    },
+    Wrapper {
+        name: "firejail",
+        short_values: "",
+        short_switches: "",
+        long_values: &[],
+        long_switches: &[
+            "noprofile",
+            "quiet",
+            "private",
+            "private-dev",
+            "private-tmp",
+            "nonewprivs",
+            "noroot",
+            "seccomp",
+            "x11",
+            "appimage",
+            "allusers",
+        ],
+        operands: 0,
+    },
+    Wrapper {
+        name: "xvfb-run",
+        short_values: "efnpsw",
+        short_switches: "alh",
+        long_values: &[
+            "error-file",
+            "auth-file",
+            "server-num",
+            "xauth-protocol",
+            "server-args",
+            "wait",
+        ],
+        long_switches: &["auto-servernum", "listen-tcp", "help"],
+        operands: 0,
+    },
+    Wrapper {
+        name: "dbus-launch",
+        short_values: "",
+        short_switches: "",
+        long_values: &[],
+        long_switches: &[
+            "sh-syntax",
+            "csh-syntax",
+            "auto-syntax",
+            "binary-syntax",
+            "close-stderr",
+            "exit-with-session",
+            "exit-with-x11",
+            "version",
+        ],
+        operands: 0,
+    },
+    Wrapper {
+        name: "dbus-run-session",
+        short_values: "",
+        short_switches: "",
+        long_values: &["config-file", "dbus-daemon"],
+        long_switches: &["session", "version", "help"],
+        operands: 0,
+    },
+    Wrapper {
+        name: "sg",
+        short_values: "",
+        short_switches: "c",
+        long_values: &[],
+        long_switches: &[],
+        operands: 1,
+    },
+    Wrapper {
+        name: "proxychains",
+        short_values: "f",
+        short_switches: "q",
+        long_values: &[],
+        long_switches: &[],
+        operands: 0,
+    },
+    Wrapper {
+        name: "proxychains4",
+        short_values: "f",
+        short_switches: "q",
+        long_values: &[],
+        long_switches: &[],
+        operands: 0,
+    },
+    Wrapper {
+        name: "torsocks",
+        short_values: "uapP",
+        short_switches: "idqh",
+        long_values: &["user", "pass", "address", "port"],
+        long_switches: &["isolate", "debug", "quiet", "shell", "help", "version"],
+        operands: 0,
+    },
+    Wrapper {
+        name: "tsocks",
+        short_values: "",
+        short_switches: "",
+        long_values: &[],
+        long_switches: &[],
+        operands: 0,
+    },
+    Wrapper {
+        name: "eatmydata",
+        short_values: "",
+        short_switches: "",
+        long_values: &[],
+        long_switches: &[],
+        operands: 0,
+    },
+    Wrapper {
+        name: "cpulimit",
+        short_values: "lpe",
+        short_switches: "mzikvh",
+        long_values: &["limit", "pid", "exe", "cpu"],
+        long_switches: &[
+            "monitor-forks",
+            "lazy",
+            "include-children",
+            "kill",
+            "verbose",
+            "help",
+        ],
+        operands: 0,
+    },
+    Wrapper {
+        name: "setpriv",
+        short_values: "",
+        short_switches: "",
+        long_values: &[
+            "reuid",
+            "regid",
+            "groups",
+            "inh-caps",
+            "ambient-caps",
+            "bounding-set",
+            "securebits",
+            "pdeathsig",
+            "selinux-label",
+            "apparmor-profile",
+            "landlock-access",
+            "landlock-rule",
+        ],
+        long_switches: &[
+            "clear-groups",
+            "keep-groups",
+            "init-groups",
+            "nnp",
+            "no-new-privs",
+            "reset-env",
+            "dump",
+            "list-caps",
+        ],
+        operands: 0,
+    },
+    Wrapper {
+        name: "trickle",
+        short_values: "udwtlnL",
+        short_switches: "svh",
+        long_values: &[],
+        long_switches: &[],
+        operands: 0,
+    },
+    // GNU coreutils as installed on macOS (`brew install coreutils`).
+    Wrapper {
+        name: "gtimeout",
+        short_values: "sk",
+        short_switches: "fpv",
+        long_values: &["signal", "kill-after"],
+        long_switches: &["preserve-status", "foreground", "verbose"],
+        operands: 1,
+    },
+    Wrapper {
+        name: "gnice",
+        short_values: "n",
+        short_switches: "",
+        long_values: &["adjustment"],
+        long_switches: &[],
+        operands: 0,
+    },
+    Wrapper {
+        name: "gnohup",
+        short_values: "",
+        short_switches: "",
+        long_values: &[],
+        long_switches: &[],
+        operands: 0,
+    },
+    Wrapper {
+        name: "gstdbuf",
+        short_values: "ioe",
+        short_switches: "",
+        long_values: &["input", "output", "error"],
+        long_switches: &[],
+        operands: 0,
+    },
+    Wrapper {
+        name: "gchroot",
+        short_values: "ugG",
+        short_switches: "",
+        long_values: &["userspec", "groups"],
+        long_switches: &["skip-chdir"],
+        operands: 1,
     },
 ];
 
@@ -440,6 +818,16 @@ pub struct Expansion {
     /// substitution, `eval`, a shell `-c` payload or stdin script, or a
     /// `find -exec` payload.
     pub nested: bool,
+    /// An argument's value is resolved only at execution time. A prefix grant
+    /// cannot check whether that value introduces a write/execute option.
+    /// Unlike `dynamic`, this does not make the command head unknowable.
+    pub arguments_dynamic: bool,
+    /// Unquoted control operators or grouping. Recorded before command
+    /// deduplication: `echo x; echo x` still contains a command list.
+    pub control: bool,
+    /// Unquoted redirection syntax, including descriptor duplication and
+    /// heredocs. Quoted operator characters and heredoc body data are excluded.
+    pub redirects: bool,
 }
 
 /// Returns every command line the shell would execute for `command`.
@@ -468,6 +856,9 @@ fn expand_for_platform(command: &str, windows: bool) -> Expansion {
         literal_backslashes: windows,
         dynamic: false,
         nested: false,
+        arguments_dynamic: false,
+        control: false,
+        redirects: false,
     };
     // Native Windows shells preserve path separators. Also retain the POSIX
     // interpretation for Bash/WSL commands. Both passes use the same bounded,
@@ -481,6 +872,9 @@ fn expand_for_platform(command: &str, windows: bool) -> Expansion {
         commands: expander.out,
         dynamic: expander.dynamic,
         nested: expander.nested,
+        arguments_dynamic: expander.arguments_dynamic,
+        control: expander.control,
+        redirects: expander.redirects,
     }
 }
 
@@ -490,6 +884,9 @@ struct Expander {
     literal_backslashes: bool,
     dynamic: bool,
     nested: bool,
+    arguments_dynamic: bool,
+    control: bool,
+    redirects: bool,
 }
 
 /// The word being read, with what the parser learned about it.
@@ -542,8 +939,8 @@ struct Line {
 
 /// How a shell invocation receives its script.
 enum ShellInput {
-    /// `-c` / `--command`: the word at this offset is a command line.
-    Command(usize),
+    /// `-c` / `--command`: the word at each offset may be the command line.
+    Command(Vec<usize>),
     /// A script file operand at this offset.
     Script(usize),
     /// The script is read from stdin.
@@ -728,6 +1125,7 @@ impl Expander {
                     i = next;
                 }
                 '<' if chars.get(i + 1) == Some(&'<') && chars.get(i + 2) != Some(&'<') => {
+                    self.redirects = true;
                     if !word.quoted && is_redirect_descriptor(&word.text) {
                         word.text.clear();
                         word.started = false;
@@ -779,6 +1177,7 @@ impl Expander {
                 // descriptor and next operand. Parse that operand normally so
                 // nested substitutions are still checked as commands.
                 '<' | '>' | '&' if redirection_len(&chars[i..]) > 0 => {
+                    self.redirects = true;
                     if !word.quoted && is_redirect_descriptor(&word.text) {
                         word.text.clear();
                         word.started = false;
@@ -795,6 +1194,7 @@ impl Expander {
                 // arms above, so a bare paren here is grouping: the body is a
                 // command list of its own, not part of the surrounding word.
                 '(' | ')' => {
+                    self.control = true;
                     word.flush(&mut line);
                     end_command(&mut commands, &mut line);
                     word.redirect_operand = false;
@@ -815,6 +1215,7 @@ impl Expander {
                 // Control operators end the current command line. `&&`, `||`,
                 // `;;`, `|&` and runs of newlines collapse into one break.
                 '\n' | '\r' | ';' | '&' | '|' => {
+                    self.control = true;
                     word.flush(&mut line);
                     end_command(&mut commands, &mut line);
                     word.redirect_operand = false;
@@ -956,12 +1357,14 @@ impl Expander {
             }
             let name = command_name(&tokens[head]);
             let args_dynamic = dynamic[head + 1..].iter().any(|dynamic| *dynamic);
+            self.arguments_dynamic |= args_dynamic;
             match name.as_str() {
                 // `eval …` takes a *command line* as data. Parse it.
                 "eval" => self.code_payload(&tokens[head + 1..].join(" "), args_dynamic, depth),
                 "source" | "." => match tokens.get(head + 1) {
                     None if !line.heredoc => self.dynamic = true,
                     Some(_) if dynamic[head + 1] => self.dynamic = true,
+                    Some(script) => self.dynamic |= script_read_at_run_time(script, line),
                     _ => {}
                 },
                 "find" => self.record_find_exec(line, head, depth),
@@ -982,8 +1385,9 @@ impl Expander {
                         self.code_payload(&payload, payload_dynamic, depth);
                     }
                 }
-                // `watch` joins its operands and hands them to `sh -c`.
-                "watch" => {
+                // `watch` and `sg GROUP [-c]` join their operands and hand
+                // them to `sh -c`.
+                "watch" | "sg" => {
                     for &inner in heads.heads.iter().filter(|&&inner| inner > head) {
                         let inner_dynamic = dynamic[inner..].iter().any(|dynamic| *dynamic);
                         self.code_payload(&tokens[inner..].join(" "), inner_dynamic, depth);
@@ -1004,15 +1408,18 @@ impl Expander {
                 "powershell" | "pwsh" => self.record_powershell(tokens, head, &dynamic, depth),
                 _ if SHELL_NAMES.contains(&name.as_str()) => {
                     match shell_input(&tokens[head..]) {
-                        ShellInput::Command(offset) => {
-                            self.code_payload(
-                                &tokens[head + offset],
-                                dynamic[head + offset],
-                                depth,
-                            );
+                        ShellInput::Command(offsets) => {
+                            for offset in offsets {
+                                self.code_payload(
+                                    &tokens[head + offset],
+                                    dynamic[head + offset],
+                                    depth,
+                                );
+                            }
                         }
                         ShellInput::Script(offset) => {
-                            self.dynamic |= dynamic[head + offset];
+                            self.dynamic |= dynamic[head + offset]
+                                || script_read_at_run_time(&tokens[head + offset], line);
                         }
                         // A heredoc body was already expanded as the script;
                         // any other stdin is only known at run time.
@@ -1646,6 +2053,40 @@ fn command_heads(tokens: &[String]) -> Heads {
     }
 }
 
+/// A script operand that names a file descriptor rather than a file:
+/// `/dev/stdin`, `/dev/fd/N` or `/proc/<pid>/fd/N`. Its text arrives through
+/// a pipe, a here-string or a redirect, so it is only known at run time —
+/// unless it is stdin and a heredoc body (already expanded as the script)
+/// feeds it.
+fn script_read_at_run_time(script: &str, line: &Line) -> bool {
+    let mut parts: Vec<&str> = Vec::new();
+    for part in script.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            part => parts.push(part),
+        }
+    }
+    if !script.starts_with('/') {
+        return false;
+    }
+    let descriptor = match parts.as_slice() {
+        ["dev", "stdin"] => "0",
+        ["dev", "fd", fd] => fd,
+        ["proc", process, "fd", fd]
+            if *process == "self"
+                || *process == "thread-self"
+                || process.chars().all(|ch| ch.is_ascii_digit()) =>
+        {
+            fd
+        }
+        _ => return false,
+    };
+    descriptor != "0" || !line.heredoc
+}
+
 /// How the shell invocation `tokens` (with `tokens[0]` the shell) gets its
 /// script.
 ///
@@ -1657,23 +2098,31 @@ fn command_heads(tokens: &[String]) -> Heads {
 /// really an argument to a script (`bash script.sh -c x`), but this
 /// expander's contract is explicit that over-emitting targets is safe and
 /// under-emitting is a bypass.
+///
+/// `-c` only switches the shell into command mode: options may still follow
+/// it, and the command string is the first *operand* after option parsing
+/// (`bash -c -e 'cmd'`, `sh -c -- 'cmd'`, `bash -c -o pipefail 'cmd'` all run
+/// `cmd`). Shells that read `-c`'s value as the very next word (fish) run
+/// that word instead, so both candidates are reported when they differ.
 fn shell_input(tokens: &[String]) -> ShellInput {
     let mut script = None;
     let mut from_stdin = false;
     let mut options_done = false;
+    let mut command = Vec::new();
     let mut index = 1usize;
     while index < tokens.len() {
         let token = tokens[index].as_str();
         if !options_done && token == "--" {
             options_done = true;
         } else if !options_done && token == "-" {
-            // `bash -` reads the script from stdin.
-            from_stdin = true;
+            // `bash -` reads the script from stdin; after `-c` it only ends
+            // the options.
+            from_stdin |= command.is_empty();
             options_done = true;
         } else if let Some(long) = token.strip_prefix("--").filter(|_| !options_done) {
             if long.eq_ignore_ascii_case("command") {
                 return match tokens.get(index + 1) {
-                    Some(_) => ShellInput::Command(index + 1),
+                    Some(_) => ShellInput::Command(vec![index + 1]),
                     None => ShellInput::Stdin,
                 };
             }
@@ -1685,22 +2134,26 @@ fn shell_input(tokens: &[String]) -> ShellInput {
             && (token.starts_with('-') || token.starts_with('+'))
         {
             let flags = &token[1..];
-            if token.starts_with('-') && flags.contains('c') {
-                return match tokens.get(index + 1) {
-                    Some(_) => ShellInput::Command(index + 1),
-                    None => ShellInput::Stdin,
-                };
+            if token.starts_with('-') && flags.contains('c') && command.is_empty() {
+                command.push(index + 1);
             }
             from_stdin |= token.starts_with('-') && flags.contains('s');
             if flags.contains(['o', 'O']) {
                 index += 1;
             }
+        } else if !command.is_empty() {
+            if command[0] != index {
+                command.push(index);
+            }
+            return ShellInput::Command(command);
         } else if script.is_none() {
             script = Some(index);
         }
         index += 1;
     }
+    command.retain(|&at| at < tokens.len());
     match script {
+        _ if !command.is_empty() => ShellInput::Command(command),
         Some(index) if !from_stdin => ShellInput::Script(index),
         _ => ShellInput::Stdin,
     }
@@ -1842,6 +2295,55 @@ mod tests {
     }
 
     #[test]
+    fn options_after_dash_c_do_not_hide_the_command_string() {
+        // The command string is the first operand once options end, so an
+        // option between `-c` and it does not change what runs.
+        for command in [
+            "bash -c -e 'rm -rf /'",
+            "bash -c -l 'rm -rf /'",
+            "sh -c -x 'rm -rf /'",
+            "bash -c -- 'rm -rf /'",
+            "sh -c - 'rm -rf /'",
+            "bash -c +e 'rm -rf /'",
+            "bash -lc -e 'rm -rf /'",
+            "bash -c -o pipefail 'rm -rf /'",
+            "bash -c -O extglob -e 'rm -rf /'",
+            "bash script.sh -c 'rm -rf /'",
+        ] {
+            assert!(
+                contains(command, "rm -rf /"),
+                "{command}: {:?}",
+                expand(command)
+            );
+        }
+        // Arguments after the command string are positional parameters.
+        assert!(!contains("bash -c 'echo $0' 'rm -rf /'", "rm -rf /"));
+    }
+
+    #[test]
+    fn script_operand_naming_a_descriptor_is_read_at_run_time() {
+        for command in [
+            "echo 'rm -rf /' | bash /dev/stdin",
+            "bash /dev/stdin <<< 'rm -rf /'",
+            "sh /dev/fd/0 <<< 'rm -rf /'",
+            "sh /proc/self/fd/0 <<< 'rm -rf /'",
+            "bash //dev/./stdin <<< 'rm -rf /'",
+            "bash /dev/fd/3 3< script",
+            ". /dev/stdin <<< 'rm -rf /'",
+            "source /proc/self/fd/0 <<< 'rm -rf /'",
+        ] {
+            assert!(expand_command(command).dynamic, "{command}");
+        }
+        // A heredoc on stdin was expanded as the script itself.
+        let heredoc = expand_for_platform("bash /dev/stdin <<EOF\nrm -rf /\nEOF", false);
+        assert!(!heredoc.dynamic);
+        assert!(heredoc.commands.iter().any(|target| target == "rm -rf /"));
+        // An ordinary script file is still opaque, not unresolved.
+        assert!(!expand_command("bash ./dev/stdin").dynamic);
+        assert!(!expand_command(". ./env.sh").dynamic);
+    }
+
+    #[test]
     fn wrapper_head_scan_stops_at_a_real_command() {
         // `echo` prints its arguments; nothing here is executed as a shell.
         let targets = expand("echo bash -c 'rm -rf /'");
@@ -1874,6 +2376,69 @@ mod tests {
             "find . \\( -name a \\) -print",
             "find . ( -name a ) -print"
         ));
+    }
+
+    #[test]
+    fn syntax_metadata_is_independent_of_candidates_and_literal_data() {
+        for command in [
+            "printf x; printf x",
+            "git log | git log",
+            "cargo test && cargo test",
+            "(git log)",
+        ] {
+            let expansion = expand_for_platform(command, false);
+            assert!(expansion.control, "{command}: {expansion:?}");
+        }
+        assert_eq!(
+            expand_for_platform("printf x; printf x", false)
+                .commands
+                .len(),
+            1
+        );
+        assert!(expand_for_platform("sudo git log", false).commands.len() > 1);
+        assert!(!expand_for_platform("sudo git log", false).control);
+        for command in [
+            r#"grep -E "a|b" src"#,
+            r#"git commit -m "fix: a & b; c""#,
+            r"echo a\;b\&c\|d\>e",
+            "echo '> < ; | &'",
+            "echo ok # ; | > ignored",
+        ] {
+            let expansion = expand_for_platform(command, false);
+            assert!(
+                !expansion.control && !expansion.redirects,
+                "{command}: {expansion:?}"
+            );
+        }
+        for command in [
+            "cargo test 2>&1",
+            "cargo test &>result.log",
+            "cat a<>out",
+            "cat a>|out",
+            "cat 3<&0",
+            "cat<<<literal",
+        ] {
+            for windows in [false, true] {
+                let expansion = expand_for_platform(command, windows);
+                assert!(
+                    expansion.redirects && !expansion.control,
+                    "{command}: {expansion:?}"
+                );
+            }
+        }
+        for command in ["git log $FLAGS", r#"git log "$FLAGS""#] {
+            let expansion = expand_for_platform(command, false);
+            assert!(
+                expansion.arguments_dynamic && !expansion.dynamic,
+                "{command}: {expansion:?}"
+            );
+        }
+        assert!(!expand_for_platform("git log '$FLAGS'", false).arguments_dynamic);
+        assert!(!expand_for_platform(r"git log \$FLAGS", false).arguments_dynamic);
+        let heredoc = expand_for_platform("cat <<'EOF'\n; | > $(not-code)\nEOF", false);
+        assert!(heredoc.redirects);
+        assert!(!heredoc.nested);
+        assert_eq!(heredoc.commands, vec!["cat"]);
     }
 
     #[test]

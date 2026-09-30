@@ -1,4 +1,11 @@
 {
+  "CmdPluginOwnerReport": "拡張機能ホスト:\n  状態: {state}\n  有効なツール ({count}): {tools}",
+  "CmdPluginOwnerActivating": "有効化中",
+  "CmdPluginOwnerActive": "有効",
+  "CmdPluginOwnerFailed": "失敗: {reason}",
+  "CmdPluginOwnerFaulted": "異常: {reason}",
+  "CmdPluginOwnerRevoked": "許可取消済み",
+  "CmdPluginOwnerInactive": "無効",
   "MobileStreamReplayFailed": "Runtime がこの会話の履歴を読み込めませんでした — 再試行中",
   "MobileStreamCatchUpFailed": "Runtime のイベント処理が遅れ、追いつけませんでした — 再試行中",
   "MobileStreamRuntimeShutdown": "Runtime は終了処理中です — 再接続中",

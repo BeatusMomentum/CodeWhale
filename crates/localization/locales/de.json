@@ -1,4 +1,11 @@
 {
+  "CmdPluginOwnerReport": "Erweiterungshost:\n  Status: {state}\n  Aktive Werkzeuge ({count}): {tools}",
+  "CmdPluginOwnerActivating": "Wird aktiviert",
+  "CmdPluginOwnerActive": "Aktiv",
+  "CmdPluginOwnerFailed": "Fehlgeschlagen: {reason}",
+  "CmdPluginOwnerFaulted": "Gestört: {reason}",
+  "CmdPluginOwnerRevoked": "Widerrufen",
+  "CmdPluginOwnerInactive": "Nicht aktiv",
   "MobileStreamReplayFailed": "Runtime konnte den Verlauf dieser Unterhaltung nicht lesen — erneuter Versuch",
   "MobileStreamCatchUpFailed": "Runtime ist zurückgefallen und konnte nicht aufholen — erneuter Versuch",
   "MobileStreamRuntimeShutdown": "Runtime wird heruntergefahren — Verbindung wird wiederhergestellt",

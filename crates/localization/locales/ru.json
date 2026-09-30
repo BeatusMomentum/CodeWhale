@@ -1,4 +1,11 @@
 {
+  "CmdPluginOwnerReport": "Хост расширений:\n  Состояние: {state}\n  Активные инструменты ({count}): {tools}",
+  "CmdPluginOwnerActivating": "Активация",
+  "CmdPluginOwnerActive": "Активен",
+  "CmdPluginOwnerFailed": "Сбой: {reason}",
+  "CmdPluginOwnerFaulted": "Неисправен: {reason}",
+  "CmdPluginOwnerRevoked": "Доступ отозван",
+  "CmdPluginOwnerInactive": "Неактивен",
   "MobileStreamReplayFailed": "Runtime не удалось прочитать историю этой беседы — повторная попытка",
   "MobileStreamCatchUpFailed": "Runtime отстал и не смог получить пропущенные события — повторная попытка",
   "MobileStreamRuntimeShutdown": "Runtime завершает работу — переподключение",

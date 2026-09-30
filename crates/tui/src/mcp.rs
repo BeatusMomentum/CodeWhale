@@ -1535,8 +1535,8 @@ pub trait McpTransport: Send + Sync {
     /// [`McpConnection::is_ready`] so a crashed stdio child stops reading
     /// as "ready" before the next call fails (#6187). Must never block and
     /// never spawn — a contended lock reads as alive; the next call observes
-    /// the death. HTTP/SSE transports have no child to observe, so the
-    /// default is "alive".
+    /// the death. The default is "alive"; Streamable HTTP has no long-lived
+    /// channel to observe, while legacy SSE reports its closed event stream.
     fn probe_dead(&self) -> bool {
         false
     }
@@ -5529,6 +5529,12 @@ pub fn load_config(path: &Path) -> Result<McpConfig> {
 const MAX_MCP_CONFIG_BYTES: u64 = 1024 * 1024;
 
 fn read_mcp_config_file(path: &Path) -> Result<Option<String>> {
+    read_bounded_mcp_config_file(path, MAX_MCP_CONFIG_BYTES)
+}
+
+/// [`read_mcp_config_file`] with a caller-chosen size bound, for foreign files
+/// such as `~/.claude.json` that carry far more than an MCP server map.
+fn read_bounded_mcp_config_file(path: &Path, max_bytes: u64) -> Result<Option<String>> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -5545,11 +5551,15 @@ fn read_mcp_config_file(path: &Path) -> Result<Option<String>> {
     let file = open_mcp_config_file(path)
         .with_context(|| format!("Failed to read MCP config {}", path.display()))?;
     let mut contents = String::new();
-    file.take(MAX_MCP_CONFIG_BYTES + 1)
+    file.take(max_bytes + 1)
         .read_to_string(&mut contents)
         .with_context(|| format!("Failed to read MCP config {}", path.display()))?;
-    if contents.len() as u64 > MAX_MCP_CONFIG_BYTES {
-        anyhow::bail!("MCP config {} exceeds the 1 MiB limit", path.display());
+    if contents.len() as u64 > max_bytes {
+        anyhow::bail!(
+            "MCP config {} exceeds the {} MiB limit",
+            path.display(),
+            max_bytes / (1024 * 1024)
+        );
     }
     Ok(Some(contents))
 }

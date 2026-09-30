@@ -1,4 +1,11 @@
 {
+  "CmdPluginOwnerReport": "擴充功能主機：\n  狀態：{state}\n  活動工具（{count}）：{tools}",
+  "CmdPluginOwnerActivating": "正在啟用",
+  "CmdPluginOwnerActive": "已啟用",
+  "CmdPluginOwnerFailed": "失敗：{reason}",
+  "CmdPluginOwnerFaulted": "故障：{reason}",
+  "CmdPluginOwnerRevoked": "已撤銷",
+  "CmdPluginOwnerInactive": "未啟用",
   "MobileStreamReplayFailed": "Runtime 無法讀取此對話的歷史記錄 — 正在重試",
   "MobileStreamCatchUpFailed": "Runtime 處理落後且無法追趕 — 正在重試",
   "MobileStreamRuntimeShutdown": "Runtime 正在關閉 — 正在重新連線",

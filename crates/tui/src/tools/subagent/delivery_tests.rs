@@ -82,6 +82,22 @@ fn complete(manager: &mut SubAgentManager, id: &str, report: &str) -> AgentRunVe
 }
 
 #[test]
+fn declared_deliverables_exclude_git_metadata_by_the_shared_rule() {
+    let mut refused = vec![".GIT/config", "sub/.Git/HEAD"];
+    if cfg!(windows) {
+        refused.extend([".git./config", ".git /config", "GIT~1/config"]);
+    }
+    for path in refused {
+        let error = delivery::declared_paths(&[path.to_string()], None).expect_err(path);
+        assert!(error.contains("git metadata"), "{path}: {error}");
+    }
+    assert_eq!(
+        delivery::declared_paths(&[".github/report.md".to_string()], None).unwrap(),
+        [".github/report.md"]
+    );
+}
+
+#[test]
 fn declared_deliverables_narrow_default_scope_and_reject_invalid_input() {
     let request = parse_spawn_request(&json!({
         "type": "implement", "prompt": "write outputs", "deliverables": ["tmp/a/report.md", "tmp/b/report.md"]

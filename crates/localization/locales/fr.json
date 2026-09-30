@@ -1,4 +1,11 @@
 {
+  "CmdPluginOwnerReport": "Hôte des extensions :\n  État : {state}\n  Outils actifs ({count}) : {tools}",
+  "CmdPluginOwnerActivating": "Activation en cours",
+  "CmdPluginOwnerActive": "Actif",
+  "CmdPluginOwnerFailed": "Échec : {reason}",
+  "CmdPluginOwnerFaulted": "En défaut : {reason}",
+  "CmdPluginOwnerRevoked": "Révoqué",
+  "CmdPluginOwnerInactive": "Inactif",
   "MobileStreamReplayFailed": "Le Runtime n’a pas pu lire l’historique de cette conversation — nouvelle tentative",
   "MobileStreamCatchUpFailed": "Le Runtime a pris du retard et n’a pas pu le rattraper — nouvelle tentative",
   "MobileStreamRuntimeShutdown": "Le Runtime est en cours d’arrêt — reconnexion",

@@ -1497,6 +1497,7 @@ mod tests {
         let tool_result = Message {
             role: Role::User,
             content: vec![ContentBlock::ToolResult {
+                execution_id: None,
                 tool_use_id: "call_1".to_string(),
                 content: "tool output".to_string(),
                 is_error: None,

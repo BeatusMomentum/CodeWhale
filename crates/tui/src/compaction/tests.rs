@@ -202,6 +202,7 @@ fn oversized_tool_pair(id: &str, content: String) -> Vec<Message> {
         Message {
             role: Role::Assistant,
             content: vec![ContentBlock::ToolUse {
+                execution_id: None,
                 id: id.to_string(),
                 name: "read_file".to_string(),
                 input: serde_json::json!({"path": "src/compaction.rs"}),
@@ -212,6 +213,7 @@ fn oversized_tool_pair(id: &str, content: String) -> Vec<Message> {
         Message {
             role: Role::User,
             content: vec![ContentBlock::ToolResult {
+                execution_id: None,
                 tool_use_id: id.to_string(),
                 content,
                 is_error: None,
@@ -608,6 +610,7 @@ fn tool_call(id: &str) -> Message {
     Message {
         role: Role::Assistant,
         content: vec![ContentBlock::ToolUse {
+            execution_id: None,
             id: id.to_string(),
             name: "Bash".to_string(),
             input: serde_json::json!({"command": "ls"}),
@@ -621,6 +624,7 @@ fn tool_output(id: &str) -> Message {
     Message {
         role: Role::User,
         content: vec![ContentBlock::ToolResult {
+            execution_id: None,
             tool_use_id: id.to_string(),
             content: "ok".to_string(),
             is_error: None,
@@ -680,4 +684,26 @@ fn overflow_retry_keeps_the_previous_note_and_the_instruction() {
     let mut quoted = vec![quote, text_message(Role::User, "later"), instruction];
     assert!(drop_oldest_history_messages(&mut quoted));
     assert_eq!(quoted[0], text_message(Role::User, "later"));
+}
+
+#[test]
+fn pruning_metadata_belongs_to_the_exact_execution() {
+    let messages: Vec<Message> = serde_json::from_value(serde_json::json!([
+        {"role":"assistant","content":[{"type":"tool_use","id":"reused","execution_id":"first","name":"read","input":{"path":"first.txt"}}]},
+        {"role":"user","content":[{"type":"tool_result","tool_use_id":"reused","execution_id":"first","content":"A".repeat(20000)}]},
+        {"role":"assistant","content":[{"type":"tool_use","id":"reused","execution_id":"second","name":"search","input":{"pattern":"second"}}]},
+        {"role":"user","content":[{"type":"tool_result","tool_use_id":"reused","execution_id":"second","content":"B".repeat(20000)}]}
+    ])).unwrap();
+    let plan = plan_tool_result_prunes(&messages, 0);
+    assert_eq!(plan.len(), 2);
+    let first = plan.iter().find(|item| item.message_idx == 1).unwrap();
+    assert!(first.summary.contains("first.txt"), "{}", first.summary);
+    assert!(!first.summary.contains("second"), "{}", first.summary);
+    let mut ambiguous = messages.clone();
+    ambiguous.push(messages[0].clone());
+    assert!(
+        !plan_tool_result_prunes(&ambiguous, 0)
+            .iter()
+            .any(|item| item.message_idx == 1)
+    );
 }

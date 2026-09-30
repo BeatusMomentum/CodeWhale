@@ -6035,51 +6035,58 @@ async fn legacy_sse_session_expiry_is_marked_stale() {
     server.abort();
 }
 
+/// Read one HTTP/1.1 request from a legacy SSE test server socket.
+async fn read_legacy_sse_http_request(
+    socket: &mut tokio::net::TcpStream,
+) -> (String, serde_json::Value) {
+    let mut request = Vec::new();
+    let mut buf = [0; 4096];
+    let header_end = loop {
+        let n = tokio::io::AsyncReadExt::read(socket, &mut buf)
+            .await
+            .unwrap();
+        if n == 0 {
+            return (String::new(), serde_json::Value::Null);
+        }
+        request.extend_from_slice(&buf[..n]);
+        if let Some(pos) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+            break pos + 4;
+        }
+    };
+    let headers = String::from_utf8_lossy(&request[..header_end]).to_string();
+    let content_length = headers
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().ok())
+                .flatten()
+        })
+        .unwrap_or(0);
+    while request.len() < header_end + content_length {
+        let n = tokio::io::AsyncReadExt::read(socket, &mut buf)
+            .await
+            .unwrap();
+        if n == 0 {
+            return (headers, serde_json::Value::Null);
+        }
+        request.extend_from_slice(&buf[..n]);
+    }
+    let body = &request[header_end..header_end + content_length];
+    let json = if body.is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::from_slice(body).unwrap()
+    };
+    (headers, json)
+}
+
 #[tokio::test]
 async fn legacy_sse_closed_stream_reports_unknown_outcome_and_reconnects_without_replay() {
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::{TcpListener, TcpStream};
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpListener;
     use tokio::sync::mpsc;
-
-    async fn read_http_request(socket: &mut TcpStream) -> (String, serde_json::Value) {
-        let mut request = Vec::new();
-        let mut buf = [0; 4096];
-        let header_end = loop {
-            let n = socket.read(&mut buf).await.unwrap();
-            if n == 0 {
-                return (String::new(), serde_json::Value::Null);
-            }
-            request.extend_from_slice(&buf[..n]);
-            if let Some(pos) = request.windows(4).position(|w| w == b"\r\n\r\n") {
-                break pos + 4;
-            }
-        };
-        let headers = String::from_utf8_lossy(&request[..header_end]).to_string();
-        let content_length = headers
-            .lines()
-            .find_map(|line| {
-                let (name, value) = line.split_once(':')?;
-                name.eq_ignore_ascii_case("content-length")
-                    .then(|| value.trim().parse::<usize>().ok())
-                    .flatten()
-            })
-            .unwrap_or(0);
-        while request.len() < header_end + content_length {
-            let n = socket.read(&mut buf).await.unwrap();
-            if n == 0 {
-                return (headers, serde_json::Value::Null);
-            }
-            request.extend_from_slice(&buf[..n]);
-        }
-        let body = &request[header_end..header_end + content_length];
-        let json = if body.is_empty() {
-            serde_json::Value::Null
-        } else {
-            serde_json::from_slice(body).unwrap()
-        };
-        (headers, json)
-    }
 
     // A concurrent proxy fixture changes process-wide HTTP_PROXY/NO_PROXY.
     // Hold the environment guard before the loopback guard, as other MCP
@@ -6108,7 +6115,7 @@ async fn legacy_sse_closed_stream_reports_unknown_outcome_and_reconnects_without
             let tool_call_count = Arc::clone(&server_tool_call_count);
             let success_seen = Arc::clone(&server_success_seen);
             tokio::spawn(async move {
-                let (headers, request_json) = read_http_request(&mut socket).await;
+                let (headers, request_json) = read_legacy_sse_http_request(&mut socket).await;
                 if headers.starts_with("GET /sse ") {
                     get_count.fetch_add(1, AtomicOrdering::SeqCst);
                     let (tx, mut rx) = mpsc::unbounded_channel::<Option<String>>();
@@ -6269,6 +6276,152 @@ async fn legacy_sse_closed_stream_reports_unknown_outcome_and_reconnects_without
     assert_eq!(tool_call_count.load(AtomicOrdering::SeqCst), 2);
     assert_eq!(get_count.load(AtomicOrdering::SeqCst), 2);
     assert!(success_seen.load(AtomicOrdering::SeqCst));
+
+    server.abort();
+}
+
+/// Servers without an explicit `transport = "sse"` reach legacy SSE through
+/// the Streamable HTTP fallback, inside `HttpTransport`. An event stream that
+/// closes while idle must read as not ready there too, so the next call
+/// reconnects before it dispatches instead of losing the result.
+#[tokio::test]
+async fn fallback_sse_stream_closed_while_idle_reconnects_before_dispatch() {
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpListener;
+    use tokio::sync::mpsc;
+
+    let _env = crate::test_support::lock_test_env();
+    let _lock = lock_mcp_loopback_tests().await;
+    let _no_proxy = crate::test_support::EnvVarGuard::set("NO_PROXY", "*");
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let active_sse = Arc::new(Mutex::new(None::<mpsc::UnboundedSender<Option<String>>>));
+    let initialize_count = Arc::new(AtomicUsize::new(0));
+    let tool_call_count = Arc::new(AtomicUsize::new(0));
+    let server_active_sse = Arc::clone(&active_sse);
+    let server_initialize_count = Arc::clone(&initialize_count);
+    let server_tool_call_count = Arc::clone(&tool_call_count);
+
+    let server = tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            let active_sse = Arc::clone(&server_active_sse);
+            let initialize_count = Arc::clone(&server_initialize_count);
+            let tool_call_count = Arc::clone(&server_tool_call_count);
+            tokio::spawn(async move {
+                let (headers, request_json) = read_legacy_sse_http_request(&mut socket).await;
+                if headers.starts_with("GET /mcp ") {
+                    // The session preflight and the fallback stream both land
+                    // here; the later GET replaces the earlier stream.
+                    let (tx, mut rx) = mpsc::unbounded_channel::<Option<String>>();
+                    *active_sse.lock().unwrap() = Some(tx);
+                    let opened = socket
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\nevent: endpoint\ndata: /messages\n\n")
+                        .await;
+                    if opened.is_err() {
+                        return;
+                    }
+                    while let Some(Some(message)) = rx.recv().await {
+                        let event = format!("event: message\ndata: {message}\n\n");
+                        if socket.write_all(event.as_bytes()).await.is_err() {
+                            return;
+                        }
+                    }
+                    return;
+                }
+                if headers.starts_with("POST /mcp ") {
+                    // No Streamable HTTP: the client falls back to legacy SSE.
+                    let _ = socket
+                        .write_all(b"HTTP/1.1 405 Method Not Allowed\r\nConnection: close\r\nContent-Length: 0\r\n\r\n")
+                        .await;
+                    return;
+                }
+                if !headers.starts_with("POST /messages ") {
+                    return;
+                }
+                let _ = socket
+                    .write_all(
+                        b"HTTP/1.1 202 Accepted\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+                    )
+                    .await;
+                let method = request_json
+                    .get("method")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                let result = match method {
+                    "notifications/initialized" => return,
+                    "initialize" => {
+                        initialize_count.fetch_add(1, AtomicOrdering::SeqCst);
+                        serde_json::json!({
+                            "protocolVersion": "2024-11-05",
+                            "capabilities": {"tools": {}}
+                        })
+                    }
+                    "tools/list" => serde_json::json!({
+                        "tools": [{ "name": "search", "inputSchema": {} }]
+                    }),
+                    "resources/list" => serde_json::json!({ "resources": [] }),
+                    "resources/templates/list" => serde_json::json!({ "resourceTemplates": [] }),
+                    "prompts/list" => serde_json::json!({ "prompts": [] }),
+                    "tools/call" => {
+                        tool_call_count.fetch_add(1, AtomicOrdering::SeqCst);
+                        serde_json::json!({ "content": [{ "type": "text", "text": "ok" }] })
+                    }
+                    other => panic!("unexpected method: {other}"),
+                };
+                let response = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": request_json.get("id").cloned().unwrap_or(serde_json::Value::Null),
+                    "result": result
+                })
+                .to_string();
+                let tx = active_sse.lock().unwrap().as_ref().cloned();
+                if let Some(tx) = tx {
+                    let _ = tx.send(Some(response));
+                }
+            });
+        }
+    });
+
+    let mut cfg = McpConfig::default();
+    let mut server_config = test_server_config();
+    server_config.command = None;
+    server_config.url = Some(format!("http://{addr}/mcp"));
+    server_config.connect_timeout = Some(10);
+    server_config.execute_timeout = Some(10);
+    cfg.servers.insert("fallback".to_string(), server_config);
+    let mut pool = McpPool::new(cfg);
+    let ok = serde_json::json!({ "content": [{ "type": "text", "text": "ok" }] });
+
+    let result = pool
+        .call_tool("mcp_fallback_search", serde_json::json!({}))
+        .await
+        .unwrap();
+    assert_eq!(result, ok);
+
+    // The server ends the event stream while the connection is idle.
+    let stream = active_sse
+        .lock()
+        .unwrap()
+        .take()
+        .expect("fallback stream open");
+    stream.send(None).unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while pool.connections["fallback"].is_transport_ready() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "a closed fallback SSE stream must stop reading as ready"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // The next call reconnects first, so it is dispatched once and answered.
+    let result = pool
+        .call_tool("mcp_fallback_search", serde_json::json!({}))
+        .await
+        .unwrap();
+    assert_eq!(result, ok);
+    assert_eq!(tool_call_count.load(AtomicOrdering::SeqCst), 2);
+    assert_eq!(initialize_count.load(AtomicOrdering::SeqCst), 2);
 
     server.abort();
 }

@@ -1,4 +1,11 @@
 {
+  "CmdPluginOwnerReport": "Host de extensões:\n  Estado: {state}\n  Ferramentas ativas ({count}): {tools}",
+  "CmdPluginOwnerActivating": "Ativando",
+  "CmdPluginOwnerActive": "Ativo",
+  "CmdPluginOwnerFailed": "Falhou: {reason}",
+  "CmdPluginOwnerFaulted": "Com erro: {reason}",
+  "CmdPluginOwnerRevoked": "Revogado",
+  "CmdPluginOwnerInactive": "Inativo",
   "MobileStreamReplayFailed": "O Runtime não conseguiu ler o histórico desta conversa — tentando novamente",
   "MobileStreamCatchUpFailed": "O Runtime ficou para trás e não conseguiu recuperar os eventos — tentando novamente",
   "MobileStreamRuntimeShutdown": "O Runtime está sendo encerrado — reconectando",

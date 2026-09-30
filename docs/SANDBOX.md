@@ -1,5 +1,7 @@
 # Sandbox threat model
 
+> 阅读简体中文版：[zh_hans/SANDBOX.md](zh_hans/SANDBOX.md)。
+
 Codewhale can launch shell commands proposed by a model. Approval policy,
 workspace-aware tools, and an operating-system command wrapper are separate
 controls: an approval is not a sandbox, and selecting `workspace-write` does

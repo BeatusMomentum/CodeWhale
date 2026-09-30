@@ -1641,6 +1641,7 @@ fn project_block(block: &ContentBlock) -> ExportBlock {
             content,
             is_error,
             content_blocks,
+            ..
         } => ExportBlock::ToolResult {
             tool_use_id: tool_use_id.clone(),
             content: content.clone(),
@@ -2060,6 +2061,13 @@ pub(crate) fn key_to_plugin_message_id(key: &str) -> Option<MessageId> {
     Some(match key {
         "cmd_plugin_action_failed" => MessageId::CmdPluginActionFailed,
         "cmd_plugin_bundle_detail" => MessageId::CmdPluginBundleDetail,
+        "cmd_plugin_owner_report" => MessageId::CmdPluginOwnerReport,
+        "cmd_plugin_owner_activating" => MessageId::CmdPluginOwnerActivating,
+        "cmd_plugin_owner_active" => MessageId::CmdPluginOwnerActive,
+        "cmd_plugin_owner_failed" => MessageId::CmdPluginOwnerFailed,
+        "cmd_plugin_owner_faulted" => MessageId::CmdPluginOwnerFaulted,
+        "cmd_plugin_owner_revoked" => MessageId::CmdPluginOwnerRevoked,
+        "cmd_plugin_owner_inactive" => MessageId::CmdPluginOwnerInactive,
         "cmd_plugin_bundle_diagnostics_header" => MessageId::CmdPluginBundleDiagnosticsHeader,
         "cmd_plugin_bundle_list_header" => MessageId::CmdPluginBundleListHeader,
         "cmd_plugin_bundle_mutation_success" => MessageId::CmdPluginBundleMutationSuccess,
@@ -2538,6 +2546,65 @@ fn installer_settings() -> (NetworkPolicy, u64, String) {
     (network, max_size, registry_url)
 }
 
+/// Resolve the cache destination before loading settings or entering the network bridge.
+fn sync_registry_to_cache(cache_dir: Option<PathBuf>) -> Result<SkillSyncOutcome, String> {
+    use crate::skills::install::{SkillSyncOutcome as TuiSyncOutcome, SyncResult};
+    let cache_dir =
+        cache_dir.ok_or_else(|| "global skill mutations require a home directory".to_string())?;
+    let (network, max_size, registry_url) = installer_settings();
+    let result = run_async(async move {
+        crate::skills::install::sync_registry(&network, &registry_url, &cache_dir, max_size).await
+    });
+    match result {
+        Ok(SyncResult::RegistryDenied(host)) => Ok(SkillSyncOutcome::RegistryDenied(host)),
+        Ok(SyncResult::RegistryNeedsApproval(host)) => {
+            Ok(SkillSyncOutcome::RegistryNeedsApproval(host))
+        }
+        Ok(SyncResult::Done { outcomes }) => {
+            let total = outcomes.len();
+            let mut downloaded = 0usize;
+            let mut fresh = 0usize;
+            let mut failed = 0usize;
+            let entries = outcomes
+                .into_iter()
+                .map(|outcome| match outcome {
+                    TuiSyncOutcome::Downloaded { name, path } => {
+                        downloaded += 1;
+                        SkillSyncEntry::Downloaded {
+                            name,
+                            path: path.display().to_string(),
+                        }
+                    }
+                    TuiSyncOutcome::Fresh { name } => {
+                        fresh += 1;
+                        SkillSyncEntry::Fresh { name }
+                    }
+                    TuiSyncOutcome::Failed { name, reason } => {
+                        failed += 1;
+                        SkillSyncEntry::Failed { name, reason }
+                    }
+                    TuiSyncOutcome::Denied { name, host } => {
+                        failed += 1;
+                        SkillSyncEntry::Denied { name, host }
+                    }
+                    TuiSyncOutcome::NeedsApproval { name, host } => {
+                        failed += 1;
+                        SkillSyncEntry::NeedsApproval { name, host }
+                    }
+                })
+                .collect();
+            Ok(SkillSyncOutcome::Done {
+                total,
+                downloaded,
+                fresh,
+                failed,
+                entries,
+            })
+        }
+        Err(err) => Err(format_registry_error("Sync failed", &err)),
+    }
+}
+
 /// Inspect an anyhow chain and surface a one-line hint pointing at the most
 /// common cause of a registry fetch failure (DNS, refused, TLS, HTTP status,
 /// timeout). Mirrors `groups/skills/skills.rs::registry_fetch_error_hint`.
@@ -2959,61 +3026,7 @@ impl CommandSkillGroupContext for SkillGroupAdapter<'_> {
     }
 
     fn sync_registry(&mut self) -> Result<SkillSyncOutcome, String> {
-        use crate::skills::install::{SkillSyncOutcome as TuiSyncOutcome, SyncResult};
-        let (network, max_size, registry_url) = installer_settings();
-        let cache_dir = crate::skills::install::default_cache_skills_dir();
-        let result = run_async(async move {
-            crate::skills::install::sync_registry(&network, &registry_url, &cache_dir, max_size)
-                .await
-        });
-        match result {
-            Ok(SyncResult::RegistryDenied(host)) => Ok(SkillSyncOutcome::RegistryDenied(host)),
-            Ok(SyncResult::RegistryNeedsApproval(host)) => {
-                Ok(SkillSyncOutcome::RegistryNeedsApproval(host))
-            }
-            Ok(SyncResult::Done { outcomes }) => {
-                let total = outcomes.len();
-                let mut downloaded = 0usize;
-                let mut fresh = 0usize;
-                let mut failed = 0usize;
-                let entries = outcomes
-                    .into_iter()
-                    .map(|outcome| match outcome {
-                        TuiSyncOutcome::Downloaded { name, path } => {
-                            downloaded += 1;
-                            SkillSyncEntry::Downloaded {
-                                name,
-                                path: path.display().to_string(),
-                            }
-                        }
-                        TuiSyncOutcome::Fresh { name } => {
-                            fresh += 1;
-                            SkillSyncEntry::Fresh { name }
-                        }
-                        TuiSyncOutcome::Failed { name, reason } => {
-                            failed += 1;
-                            SkillSyncEntry::Failed { name, reason }
-                        }
-                        TuiSyncOutcome::Denied { name, host } => {
-                            failed += 1;
-                            SkillSyncEntry::Denied { name, host }
-                        }
-                        TuiSyncOutcome::NeedsApproval { name, host } => {
-                            failed += 1;
-                            SkillSyncEntry::NeedsApproval { name, host }
-                        }
-                    })
-                    .collect();
-                Ok(SkillSyncOutcome::Done {
-                    total,
-                    downloaded,
-                    fresh,
-                    failed,
-                    entries,
-                })
-            }
-            Err(err) => Err(format_registry_error("Sync failed", &err)),
-        }
+        sync_registry_to_cache(crate::skills::install::default_cache_skills_dir())
     }
 
     fn run_review(&mut self) -> Result<ReviewOutcome, String> {
@@ -4495,6 +4508,17 @@ mod tests {
         ))
     }
 
+    #[test]
+    fn skill_registry_sync_without_home_refuses_before_the_network_bridge() {
+        // No Tokio runtime is present: entering run_async would panic rather
+        // than downloading a registry into an undiscoverable temporary root.
+        let result = sync_registry_to_cache(None);
+        assert_eq!(
+            result.unwrap_err(),
+            "global skill mutations require a home directory"
+        );
+    }
+
     /// A 1x1 PNG for media adapter tests.
     const PNG_1X1: &[u8] = &[
         0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44,
@@ -5800,7 +5824,10 @@ mod tests {
         }
     }
 
+    /// The fixture's skills dir lives inside its workspace, so the workspace
+    /// must be trusted for those skills to load.
     fn skill_test_app(tmp: &TempDir, skills_dir: &Path) -> App {
+        crate::test_support::trust_workspace(tmp.path());
         let mut options = crate::test_support::test_tui_options(tmp.path());
         options.skills_dir = skills_dir.to_path_buf();
         crate::test_support::test_app_with_options(options)

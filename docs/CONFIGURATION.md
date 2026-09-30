@@ -363,7 +363,12 @@ bundle goes to stdout. Typed tables, arrays, numbers, booleans, and datetimes
 remain typed. Machine-bound authority is deliberately non-portable: project
 trust overlays, credential readers, auto-running hooks, executable LSP
 definitions, and local path bindings are omitted rather than copied to a new
-host.
+host. So is trust posture (`yolo`, `allow_shell`, `approval_policy`,
+`sandbox_mode`, `sandbox_network_access`, and the sandbox read-denylist
+paths) and local endpoints or executables (`[lifecycle_outbox]`,
+`[extension_host]`, `[control_socket]`). URLs that carry a credential —
+userinfo, a token-named query parameter, or a Slack/Discord/Teams webhook
+path — are treated as credentials.
 
 `codewhale config import <FILE|HTTPS_URL|-> [--dry-run] [--yes] [--project]`
 applies a bundle. The envelope is strict (`schema_version = 1`, kind

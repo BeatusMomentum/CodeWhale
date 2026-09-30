@@ -201,6 +201,7 @@ fn recorded_snapshot_receipts_bracket_the_turn_and_its_file_writes() {
         handle.send(Op::SendMessage(spec)).await.unwrap();
 
         let mut completions = HashMap::new();
+        let mut local_ids = HashMap::new();
         let mut receipts = Vec::new();
         let mut rx = handle.rx_event.write().await;
         while let Some(event) = tokio::time::timeout(model_turn_event_timeout(), rx.recv())
@@ -208,8 +209,23 @@ fn recorded_snapshot_receipts_bracket_the_turn_and_its_file_writes() {
             .expect("turn events")
         {
             match event {
-                Event::ToolCallComplete { id, result, .. } => {
-                    completions.insert(id, result.expect("tool result"));
+                Event::ToolCallStarted {
+                    id,
+                    model_call: Some(model_call),
+                    ..
+                } => {
+                    uuid::Uuid::parse_str(&id).expect("host execution id");
+                    assert_ne!(id, model_call.provider_id);
+                    assert!(local_ids.insert(model_call.provider_id, id).is_none());
+                }
+                Event::ToolCallComplete {
+                    id,
+                    result,
+                    model_call: Some(model_call),
+                    ..
+                } => {
+                    assert_eq!(local_ids.get(&model_call.provider_id), Some(&id));
+                    completions.insert(model_call.provider_id, result.expect("tool result"));
                 }
                 Event::WorkspaceSnapshotTaken { snapshot } => receipts.push(snapshot),
                 Event::TurnComplete { status, error, .. } => {
@@ -223,6 +239,8 @@ fn recorded_snapshot_receipts_bracket_the_turn_and_its_file_writes() {
 
         assert!(completions.get("call-write").expect("write ran").success);
         assert!(completions.get("call-read").expect("read ran").success);
+        assert_eq!(local_ids.len(), 2);
+        assert_ne!(local_ids["call-write"], local_ids["call-read"]);
         // Every receipt, post-turn included, arrived before TurnComplete.
         assert_eq!(
             receipts
@@ -231,8 +249,14 @@ fn recorded_snapshot_receipts_bracket_the_turn_and_its_file_writes() {
                 .collect::<Vec<_>>(),
             [
                 (WorkspaceSnapshotKind::PreTurn, None),
-                (WorkspaceSnapshotKind::Tool, Some("call-write")),
-                (WorkspaceSnapshotKind::PostTool, Some("call-write")),
+                (
+                    WorkspaceSnapshotKind::Tool,
+                    Some(local_ids["call-write"].as_str())
+                ),
+                (
+                    WorkspaceSnapshotKind::PostTool,
+                    Some(local_ids["call-write"].as_str())
+                ),
                 (WorkspaceSnapshotKind::PostTurn, None),
             ],
             "a read-only call takes no restore point: {receipts:?}"
@@ -256,9 +280,8 @@ fn recorded_snapshot_receipts_bracket_the_turn_and_its_file_writes() {
             .expect("snapshot repo");
         let listed = repo.list(usize::MAX).unwrap();
         assert!(
-            listed.iter().any(
-                |snapshot| receipts[1].matches(snapshot) && snapshot.label == "tool:call-write"
-            ),
+            listed.iter().any(|snapshot| receipts[1].matches(snapshot)
+                && snapshot.label == format!("tool:{}", local_ids["call-write"])),
             "the tool receipt names a live snapshot"
         );
         let delta = repo
@@ -5879,11 +5902,185 @@ async fn run_budgeted_read_turn(
     let mut events = handle.rx_event.write().await;
     let completions = std::iter::from_fn(|| events.try_recv().ok())
         .filter_map(|event| match event {
-            Event::ToolCallComplete { id, result, .. } => Some((id, result)),
+            Event::ToolCallComplete {
+                model_call: Some(model_call),
+                result,
+                ..
+            } => Some((model_call.provider_id, result)),
             _ => None,
         })
         .collect::<Vec<_>>();
     (status, error, completions)
+}
+
+#[tokio::test]
+async fn provider_id_reuse_mints_distinct_execution_identity_in_all_dispatch_modes() {
+    use crate::llm_client::mock::{MockLlmClient, canned};
+    use crate::tools::spec::{ToolCapability, ToolSpec};
+
+    struct IdentityTool {
+        parallel: bool,
+        observed: Arc<StdMutex<Vec<String>>>,
+    }
+    #[async_trait::async_trait]
+    impl ToolSpec for IdentityTool {
+        fn name(&self) -> &str {
+            "fixture_identity"
+        }
+        fn description(&self) -> &str {
+            "Record the admitted execution identity."
+        }
+        fn input_schema(&self) -> Value {
+            json!({"type": "object"})
+        }
+        fn capabilities(&self) -> Vec<ToolCapability> {
+            vec![ToolCapability::ReadOnly]
+        }
+        fn supports_parallel(&self) -> bool {
+            self.parallel
+        }
+        async fn execute(&self, _: Value, context: &ToolContext) -> Result<ToolResult, ToolError> {
+            let id = context
+                .origin_tool_call_id
+                .as_ref()
+                .expect("host origin")
+                .clone();
+            self.observed.lock().unwrap().push(id.clone());
+            Ok(ToolResult::success(id))
+        }
+    }
+    for parallel in [false, true] {
+        let workspace = tempdir().unwrap();
+        let calls = [
+            ("reused", "fixture_identity", "{}"),
+            ("peer", "fixture_identity", "{}"),
+        ];
+        let mock = Arc::new(MockLlmClient::new(vec![
+            tool_batch_turn(&calls),
+            tool_batch_turn(&calls),
+            canned::simple_text_turn("done"),
+        ]));
+        let (mut engine, handle) = Engine::new_with_model_client(
+            deterministic_engine_config(workspace.path()),
+            &Config::default(),
+            mock.clone(),
+        );
+        let observed = Arc::new(StdMutex::new(Vec::new()));
+        let mut registry =
+            crate::tools::ToolRegistry::new(ToolContext::new(workspace.path().to_path_buf()));
+        registry.register(Arc::new(IdentityTool {
+            parallel,
+            observed: observed.clone(),
+        }));
+        let tools = Some(registry.to_api_tools_with_cache(true));
+        let surface = test_tool_surface(&engine, registry, tools, AppMode::Agent);
+        let mut turn = crate::core::turn::TurnContext::new(4);
+        let (status, error) = engine.run_turn(&mut turn, surface, None, None).await;
+        assert_eq!(status, TurnOutcomeStatus::Completed, "{error:?}");
+        let ids: HashSet<_> = observed.lock().unwrap().iter().cloned().collect();
+        assert_eq!(ids.len(), 4);
+        assert!(ids.iter().all(|id| uuid::Uuid::parse_str(id).is_ok()));
+        let mut starts = HashMap::new();
+        let mut completes = HashMap::new();
+        let mut events = handle.rx_event.write().await;
+        while let Ok(event) = events.try_recv() {
+            match event {
+                Event::ToolCallStarted {
+                    id,
+                    model_call: Some(correlation),
+                    ..
+                } => {
+                    assert!(starts.insert(id, correlation).is_none());
+                }
+                Event::ToolCallComplete {
+                    id,
+                    model_call: Some(correlation),
+                    result,
+                    ..
+                } => {
+                    assert_eq!(result.unwrap().content, id);
+                    assert!(completes.insert(id, correlation).is_none());
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(starts, completes);
+        assert_eq!(starts.keys().cloned().collect::<HashSet<_>>(), ids);
+        let requests = mock.captured_requests();
+        let history = &requests[2].messages;
+        let mut pairs = HashMap::<String, (usize, usize)>::new();
+        for block in history.iter().flat_map(|message| &message.content) {
+            match block {
+                ContentBlock::ToolUse {
+                    id,
+                    execution_id: Some(local),
+                    ..
+                } => {
+                    assert_eq!(starts[local].provider_id, *id);
+                    pairs.entry(local.clone()).or_default().0 += 1;
+                }
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    execution_id: Some(local),
+                    ..
+                } => {
+                    assert_eq!(starts[local].provider_id, *tool_use_id);
+                    pairs.entry(local.clone()).or_default().1 += 1;
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(pairs.len(), 4);
+        assert!(pairs.values().all(|pair| *pair == (1, 1)));
+    }
+}
+
+#[tokio::test]
+async fn invalid_provider_tool_batch_is_rejected_before_observation_or_history() {
+    use crate::llm_client::mock::MockLlmClient;
+    for ids in [["duplicate", "duplicate"], ["valid", ""], ["valid", "   "]] {
+        let workspace = tempdir().unwrap();
+        let mock = Arc::new(MockLlmClient::new(vec![tool_batch_turn(&[
+            (ids[0], "read_file", r#"{"path":"never-read"}"#),
+            (ids[1], "read_file", r#"{"path":"never-read"}"#),
+        ])]));
+        let (mut engine, handle) = Engine::new_with_model_client(
+            deterministic_engine_config(workspace.path()),
+            &Config::default(),
+            mock.clone(),
+        );
+        let mut registry =
+            crate::tools::ToolRegistry::new(ToolContext::new(workspace.path().to_path_buf()));
+        registry.register(Arc::new(crate::tools::file::ReadFileTool));
+        let tools = Some(registry.to_api_tools_with_cache(true));
+        let surface = test_tool_surface(&engine, registry, tools, AppMode::Agent);
+        let mut turn = crate::core::turn::TurnContext::new(4);
+        let (status, error) = engine.run_turn(&mut turn, surface, None, None).await;
+        assert_eq!(status, TurnOutcomeStatus::Failed);
+        assert!(error.unwrap().contains("pairing id"));
+        assert_eq!(mock.call_count(), 1);
+        let mut events = handle.rx_event.write().await;
+        while let Ok(event) = events.try_recv() {
+            assert!(!matches!(
+                event,
+                Event::ToolCallStarted { .. }
+                    | Event::ToolCallComplete { .. }
+                    | Event::ApprovalRequired { .. }
+                    | Event::ToolGateDecision { .. }
+            ));
+        }
+        assert!(
+            !engine
+                .session
+                .messages
+                .iter()
+                .flat_map(|message| &message.content)
+                .any(|block| matches!(
+                    block,
+                    ContentBlock::ToolUse { .. } | ContentBlock::ToolResult { .. }
+                ))
+        );
+    }
 }
 
 /// B1: tool output is redacted once, as it enters the transcript, so the
@@ -6079,7 +6276,9 @@ async fn approval_timeout_is_reported_as_timeout_and_refunds_the_budget() {
             .expect("timed out waiting for the turn")
             .expect("engine event stream closed");
         match event {
-            Event::ApprovalRequired { id, .. } if id == "call-timeout" => {
+            Event::ApprovalRequired { id, tool_name, .. }
+                if matches!(tool_name.as_str(), "bash" | "Bash") =>
+            {
                 handle
                     .deny_tool_call_timed_out(&id)
                     .await
@@ -6088,10 +6287,18 @@ async fn approval_timeout_is_reported_as_timeout_and_refunds_the_budget() {
             Event::ApprovalRequired { id, .. } => {
                 handle.approve_tool_call(&id).await.expect("approve");
             }
-            Event::ToolCallComplete { id, result, .. } if id == "call-timeout" => {
+            Event::ToolCallComplete {
+                model_call: Some(model_call),
+                result,
+                ..
+            } if model_call.provider_id == "call-timeout" => {
                 timed_out = Some(result);
             }
-            Event::ToolCallComplete { id, result, .. } if id == "call-after" => {
+            Event::ToolCallComplete {
+                model_call: Some(model_call),
+                result,
+                ..
+            } if model_call.provider_id == "call-after" => {
                 after = Some(result);
             }
             Event::TurnComplete { status, error, .. } => {
@@ -6119,6 +6326,185 @@ async fn approval_timeout_is_reported_as_timeout_and_refunds_the_budget() {
     assert!(after.content.contains("fixture"), "{after:?}");
     handle.send(Op::Shutdown).await.expect("shutdown engine");
     task.await.expect("engine task");
+}
+
+/// A repeated provider ID is a different host execution each time. The FIFO
+/// child waiter proves the stale answer was consumed while the second Ask was
+/// pending, without relying on a sleep or a second execution racing an assert.
+#[cfg(unix)]
+#[test]
+fn repeated_provider_id_ask_rejects_stale_answer_and_keeps_local_artifact_origin() {
+    use crate::approval_log::{ApprovalOutcome, ApprovalReceipt};
+    use crate::llm_client::mock::{MockLlmClient, canned};
+    use crate::tools::subagent::ChildApprovalOutcome;
+
+    with_artifact_home(|home| {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let command = "printf 'identity:%10000s:done\\n' x";
+                let arguments = json!({"command": command}).to_string();
+                let mock = Arc::new(MockLlmClient::new(vec![
+                    canned::tool_call_turn("reused-ask", "bash", &arguments),
+                    canned::tool_call_turn("reused-ask", "bash", &arguments),
+                    canned::simple_text_turn("done"),
+                ]));
+                let mut config = Config::default();
+                let mut op = external_user_message_op(
+                    "Run the same output fixture twice.",
+                    AppMode::Agent,
+                    &config,
+                );
+                let Op::SendMessage(turn) = &mut op else {
+                    unreachable!("fixture creates a model turn");
+                };
+                // Declare both limits on the actual route. A 64K window alone
+                // still reserves the model's 64K output cap, leaving 1K input.
+                config.custom_models = Some(vec![
+                    serde_json::from_value(json!({
+                        "provider": turn.route.identity.key,
+                        "base_url": turn.route.candidate.endpoint().base_url,
+                        "id": turn.route.model,
+                        "tool_call": true,
+                        "limit": {"context": 64_000, "output": 4_096},
+                    }))
+                    .expect("fixture model limits"),
+                ]);
+                turn.route = resolved_route_for_test(&config, &turn.route.model);
+                let limits = turn.route.candidate.limits();
+                let provider = turn.route.identity.provider;
+                assert_eq!(limits.context_tokens, Some(64_000));
+                assert_eq!(limits.output_tokens, Some(4_096));
+                assert!(
+                    context_input_budget_for_route(provider, &turn.route.model, Some(limits), 0)
+                        .unwrap()
+                        >= 58_880,
+                    "the resolved input budget must fit the real instructions and two calls"
+                );
+                assert!(
+                    crate::route_budget::route_inline_char_budget_for_route(
+                        provider,
+                        &turn.route.model,
+                        Some(limits),
+                    ) < 10_000,
+                    "the unchanged output fixture must still require an artifact"
+                );
+                let mut engine_config = deterministic_engine_config(home);
+                engine_config.exec_policy_engine = ask_rule_engine(command);
+                let (engine, handle) =
+                    Engine::new_with_model_client(engine_config, &config, mock.clone());
+                let shell_manager = engine.shell_manager.clone();
+                let child_manager = engine.subagent_manager.clone();
+                let session_id = engine.session.id.clone();
+                let receipt_store = engine.approval_receipt_store.clone().unwrap();
+                let task = tokio::spawn(engine.run());
+                handle.send(op).await.unwrap();
+
+                let mut starts = Vec::new();
+                let mut approvals = Vec::new();
+                let mut completions = Vec::new();
+                let mut artifact_paths = Vec::new();
+                let mut rx = handle.rx_event.write().await;
+                loop {
+                    match tokio::time::timeout(model_turn_event_timeout(), rx.recv())
+                        .await
+                        .expect("the fixture turn must settle")
+                        .expect("engine event stream")
+                    {
+                        Event::ToolCallStarted { id, model_call, .. } => {
+                            assert_eq!(model_call.unwrap().provider_id, "reused-ask");
+                            assert!(uuid::Uuid::parse_str(&id).is_ok());
+                            assert!(!starts.contains(&id));
+                            starts.push(id);
+                        }
+                        Event::ApprovalRequired { id, .. } => {
+                            assert_eq!(starts.last(), Some(&id));
+                            if let Some(first) = approvals.first() {
+                                assert_ne!(first, &id);
+                                assert_eq!(completions, approvals);
+                                let (barrier_id, barrier) = child_manager
+                                    .write()
+                                    .await
+                                    .register_child_approval(
+                                        "agent_barrier",
+                                        &format!("agent:agent_barrier:approval:{}", uuid::Uuid::new_v4()),
+                                        "bash",
+                                        "approval-channel barrier",
+                                    )
+                                    .unwrap();
+                                handle.approve_tool_call(first).await.unwrap();
+                                handle.approve_tool_call(&barrier_id).await.unwrap();
+                                assert_eq!(
+                                    tokio::time::timeout(model_turn_event_timeout(), barrier)
+                                        .await
+                                        .expect("queued decisions are consumed")
+                                        .unwrap(),
+                                    ChildApprovalOutcome::Approved
+                                );
+                                let receipts = receipt_store.load(&session_id).unwrap();
+                                assert_eq!(receipts.len(), 3, "stale answer cannot decide the second Ask");
+                                assert!(matches!(receipts.last(), Some(ApprovalReceipt::Asked { tool_call_id, .. }) if tool_call_id == &id));
+                                let jobs = shell_manager.lock().unwrap().list_jobs_for_session(&session_id);
+                                assert_eq!(jobs.len(), 1, "the second command is still unexecuted");
+                                assert_eq!(jobs[0].origin_tool_call_id.as_ref(), Some(first));
+                            }
+                            handle.approve_tool_call(&id).await.unwrap();
+                            approvals.push(id);
+                        }
+                        Event::ToolCallComplete { id, model_call, result, .. } => {
+                            assert_eq!(model_call.unwrap().provider_id, "reused-ask");
+                            assert_eq!(approvals.last(), Some(&id));
+                            let output = result.expect("approved shell fixture succeeds");
+                            assert!(output.success, "{output:?}");
+                            let metadata = output.metadata.as_ref().expect("over-budget output is archived");
+                            assert_eq!(metadata["artifact_id"], crate::artifacts::artifact_id_for_tool_call(&id));
+                            let path = metadata["artifact_path"].as_str().unwrap().to_string();
+                            assert_eq!(fs::read_to_string(&path).unwrap(), output.content);
+                            assert!(!artifact_paths.contains(&path));
+                            artifact_paths.push(path);
+                            completions.push(id);
+                        }
+                        Event::TurnComplete { status, error, .. } => {
+                            assert_eq!(status, TurnOutcomeStatus::Completed, "{error:?}");
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                drop(rx);
+                assert_eq!(starts.len(), 2);
+                assert_eq!(starts, approvals);
+                assert_eq!(starts, completions);
+                let receipts = receipt_store.load(&session_id).unwrap();
+                assert_eq!(receipts.len(), 4);
+                for (pair, id) in receipts.as_chunks::<2>().0.iter().zip(&starts) {
+                    assert!(matches!(&pair[0], ApprovalReceipt::Asked { approval_id, tool_call_id, .. } if approval_id == id && tool_call_id == id));
+                    assert!(matches!(&pair[1], ApprovalReceipt::Decided { approval_id, tool_call_id, outcome: ApprovalOutcome::ApprovedOnce, .. } if approval_id == id && tool_call_id == id));
+                }
+                let origins = shell_manager
+                    .lock()
+                    .unwrap()
+                    .list_jobs_for_session(&session_id)
+                    .into_iter()
+                    .map(|job| job.origin_tool_call_id.unwrap())
+                    .collect::<HashSet<_>>();
+                assert_eq!(origins, starts.iter().cloned().collect());
+                let requests = mock.captured_requests();
+                assert_eq!(requests.len(), 3);
+                for id in &starts {
+                    let pairs = requests[2].messages.iter().flat_map(|message| &message.content)
+                        .filter(|block| block.tool_call_key() == Some(codewhale_models::ToolCallKey::Execution(id)))
+                        .collect::<Vec<_>>();
+                    assert_eq!(pairs.len(), 2);
+                    assert!(matches!(pairs[0], ContentBlock::ToolUse { id, .. } if id == "reused-ask"));
+                    assert!(matches!(pairs[1], ContentBlock::ToolResult { tool_use_id, content, .. } if tool_use_id == "reused-ask" && content.contains(&crate::artifacts::artifact_id_for_tool_call(id))));
+                }
+                handle.send(Op::Shutdown).await.unwrap();
+                task.await.unwrap();
+            });
+    });
 }
 
 /// #4415 AC(b): a 4-call parallel batch proposed with 2 calls remaining is
@@ -6523,6 +6909,7 @@ fn make_plan_at(
     interactive: bool,
 ) -> ToolExecutionPlan {
     ToolExecutionPlan {
+        model_call: None,
         index,
         id: format!("tool-{index}"),
         name: "grep_files".to_string(),
@@ -7640,8 +8027,8 @@ async fn tool_result_followed_by_terminal_empty_assistant_fails_turn() {
     assert!(
         events.iter().any(|event| matches!(
             event,
-            Event::ToolCallComplete { id, result, .. }
-                if id == "call-read" && result.is_ok()
+            Event::ToolCallComplete { model_call: Some(model_call), result, .. }
+                if model_call.provider_id == "call-read" && result.is_ok()
         )),
         "the successful tool result must remain durable: {events:?}"
     );
@@ -8454,7 +8841,7 @@ async fn injected_model_sandbox_escalation_applies_only_after_exact_call_approva
                 input,
                 description,
                 ..
-            } if id == "call-escalated-bash" => {
+            } => {
                 assert_eq!(input["sandbox_permissions"], "workspace-write");
                 assert!(
                     description.contains("the exact command writes the requested workspace proof"),
@@ -8477,7 +8864,11 @@ async fn injected_model_sandbox_escalation_applies_only_after_exact_call_approva
                     .await
                     .expect("approve exact escalated call");
             }
-            Event::ToolCallComplete { id, result, .. } if id == "call-escalated-bash" => {
+            Event::ToolCallComplete {
+                model_call: Some(model_call),
+                result,
+                ..
+            } if model_call.provider_id == "call-escalated-bash" => {
                 approved_result = Some(result.expect("approved escalation result"));
             }
             Event::TurnComplete { status, error, .. } => {
@@ -8578,9 +8969,11 @@ async fn sandbox_escalation_fails_closed_when_the_posture_cannot_prompt() {
                 Event::ApprovalRequired { .. } => {
                     panic!("{posture} must not open an escalation prompt")
                 }
-                Event::ToolCallComplete { id, result, .. }
-                    if id == "call-unattended-escalation" =>
-                {
+                Event::ToolCallComplete {
+                    model_call: Some(model_call),
+                    result,
+                    ..
+                } if model_call.provider_id == "call-unattended-escalation" => {
                     let error = result.expect_err("unattended escalation must be denied");
                     assert!(error.to_string().contains(expected_denial), "{error}");
                     assert!(error.to_string().contains(posture), "{error}");
@@ -9026,9 +9419,12 @@ async fn injected_model_duplicate_reads_both_execute_and_close_both_tool_ids() {
     {
         match event {
             Event::ToolCallComplete {
-                id, name, result, ..
+                model_call: Some(model_call),
+                name,
+                result,
+                ..
             } if name == "File" => {
-                results.insert(id, result.expect("read result"));
+                results.insert(model_call.provider_id, result.expect("read result"));
             }
             Event::TurnComplete { status, error, .. } => {
                 assert_eq!(status, TurnOutcomeStatus::Completed, "{error:?}");
@@ -9364,15 +9760,25 @@ async fn injected_model_complete_tool_block_at_max_output_tokens_executes() {
     {
         match event {
             Event::TurnUsage { .. } => saw_turn_usage = true,
-            Event::ToolCallStarted { id, name, .. } => {
-                assert_eq!(id, "call-truncated");
+            Event::ToolCallStarted {
+                id,
+                name,
+                model_call,
+                ..
+            } => {
+                assert_ne!(id, "call-truncated");
+                assert_eq!(model_call.unwrap().provider_id, "call-truncated");
                 assert_eq!(name, "File");
                 saw_tool_start = true;
             }
             Event::ToolCallComplete {
-                id, name, result, ..
+                id,
+                name,
+                result,
+                model_call,
             } => {
-                assert_eq!(id, "call-truncated");
+                assert_ne!(id, "call-truncated");
+                assert_eq!(model_call.unwrap().provider_id, "call-truncated");
                 assert_eq!(name, "File");
                 let result = result.expect("complete tool call closes with a tool result");
                 assert!(
@@ -9590,6 +9996,7 @@ async fn collect_guardian_journey_with_receipts(
     Vec<GateReceipt>,
 ) {
     let mut completion = None;
+    let mut execution_id = None;
     let mut usage_events = Vec::new();
     let mut receipts = Vec::new();
     let mut rx = handle.rx_event.write().await;
@@ -9599,7 +10006,18 @@ async fn collect_guardian_journey_with_receipts(
             .expect("timed out waiting for Auto-Review journey")
             .expect("engine event stream closed");
         match event {
-            Event::ToolCallComplete { id, result, .. } if id == call_id => {
+            Event::ToolCallStarted {
+                id,
+                model_call: Some(model_call),
+                ..
+            } if model_call.provider_id == call_id => {
+                execution_id = Some(id);
+            }
+            Event::ToolCallComplete {
+                model_call: Some(model_call),
+                result,
+                ..
+            } if model_call.provider_id == call_id => {
                 assert!(
                     completion.replace(result).is_none(),
                     "duplicate tool result"
@@ -9618,7 +10036,7 @@ async fn collect_guardian_journey_with_receipts(
                 risk,
                 reason,
                 ..
-            } if tool_id == call_id => receipts.push(GateReceipt {
+            } if execution_id.as_deref() == Some(tool_id.as_str()) => receipts.push(GateReceipt {
                 gate,
                 decision,
                 risk,
@@ -11099,6 +11517,132 @@ fn canonical_file_action_honors_legacy_path_ask_rules() {
 }
 
 #[test]
+fn path_alias_spellings_meet_the_same_typed_file_rules() {
+    let config = EngineConfig {
+        exec_policy_engine: file_ask_rule_engine("write_file", "src/lib.rs"),
+        ..EngineConfig::default()
+    };
+    let expected = Some(ToolAskRuleDecision::Prompt(
+        "Typed ask rule 'tool=write_file path=src/lib.rs' requires approval.".to_string(),
+    ));
+    for (tool, input) in [
+        (
+            "write_file",
+            json!({"filePath": "src/lib.rs", "content": "new\n"}),
+        ),
+        (
+            "write_file",
+            json!({"file_path": "src/lib.rs", "content": "new\n"}),
+        ),
+        (
+            "File",
+            json!({"action": "write", "filePath": "src/lib.rs", "content": "new\n"}),
+        ),
+    ] {
+        let decision = file_tool_ask_rule_decision(
+            &config,
+            tool,
+            &input,
+            Path::new("/repo"),
+            ApprovalMode::Auto,
+        );
+        assert_eq!(decision, expected, "{tool} {input}");
+    }
+    assert_eq!(
+        file_write_tool_target_paths("write_file", &json!({"filePath": "src/lib.rs"})),
+        Some(vec!["src/lib.rs".to_string()])
+    );
+}
+
+#[test]
+fn file_path_aliases_preserve_deny_allow_and_patch_targets() {
+    use codewhale_execpolicy::{ExecPolicyEngine, PermissionAction, Ruleset, ToolAskRule};
+
+    for policy_tool in [
+        "read_file",
+        "write_file",
+        "edit_file",
+        "list_dir",
+        "file_search",
+        "grep_files",
+        "apply_patch",
+    ] {
+        for action in [PermissionAction::Deny, PermissionAction::Allow] {
+            let mut rule = ToolAskRule::file_path(policy_tool, "protected.txt");
+            rule.action = action;
+            let policy = ExecPolicyEngine::with_rulesets(vec![
+                Ruleset::user(vec![], vec![]).with_ask_rules(vec![rule]),
+            ]);
+            for key in ["path", "file_path", "filePath"] {
+                let mut input = json!({key: "protected.txt"});
+                if policy_tool == "apply_patch" {
+                    input["patch"] = json!("@@ -1 +1 @@\n-original\n+changed\n");
+                }
+                let decision = file_tool_ask_rule_decision_for_policy(
+                    &policy,
+                    policy_tool,
+                    &input,
+                    Path::new("/repo"),
+                    ApprovalMode::Bypass,
+                );
+                match action {
+                    PermissionAction::Deny => assert!(
+                        matches!(decision, Some(ToolAskRuleDecision::Block(_))),
+                        "{policy_tool} {key}: {decision:?}"
+                    ),
+                    PermissionAction::Allow => assert_eq!(
+                        decision,
+                        Some(ToolAskRuleDecision::Allow),
+                        "{policy_tool} {key}"
+                    ),
+                    PermissionAction::Ask => unreachable!(),
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn file_write_without_resolvable_target_is_blocked_before_execution() {
+    let policy = codewhale_execpolicy::ExecPolicyEngine::new(vec![], vec![]);
+    for mode in [
+        ApprovalMode::Suggest,
+        ApprovalMode::Auto,
+        ApprovalMode::Bypass,
+        ApprovalMode::Never,
+    ] {
+        for (tool, input) in [
+            ("write_file", json!({"content": "changed"})),
+            (
+                "edit_file",
+                json!({"filePath": " ", "search": "a", "replace": "b"}),
+            ),
+            (
+                "File",
+                json!({"action": "write", "file_path": false, "content": "changed"}),
+            ),
+            ("apply_patch", json!({"patch": "not a patch"})),
+        ] {
+            let decision = file_tool_ask_rule_decision_for_policy(
+                &policy,
+                tool,
+                &input,
+                Path::new("/repo"),
+                mode,
+            );
+            assert!(
+                matches!(decision, Some(ToolAskRuleDecision::Block(_))),
+                "{tool} {mode:?}: {decision:?}"
+            );
+        }
+    }
+    assert_eq!(
+        file_tool_permission_paths("list_dir", &json!({})),
+        Some(vec![".".to_string()])
+    );
+}
+
+#[test]
 fn apply_patch_allow_requires_every_touched_path_to_match() {
     let rules = ["src/a.rs", "src/b.rs"]
         .into_iter()
@@ -11666,6 +12210,7 @@ fn execution_failures_are_returned_without_strategy_coaching() {
 #[test]
 fn tool_exec_outcome_tracks_duration() {
     let outcome = ToolExecOutcome {
+        model_call: None,
         index: 0,
         id: "tool-1".to_string(),
         name: "grep_files".to_string(),
@@ -12823,6 +13368,7 @@ fn measure_unchanged_prompt_skill_discovery() -> (
     let _userprofile = EnvVarGuard::set("USERPROFILE", &home);
     let codewhale_home = home.join(".codewhale");
     let _codewhale_home = EnvVarGuard::set("CODEWHALE_HOME", &codewhale_home);
+    crate::test_support::trust_workspace(&workspace);
 
     crate::skills::clear_skill_discovery_cache();
     crate::skills::reset_discovery_metrics();
@@ -13480,8 +14026,14 @@ async fn run_shell_command_op_executes_without_approval_modal() {
                 assert!(turn_id.starts_with(USER_SHELL_TOOL_ID_PREFIX));
                 assert!(route.is_none());
             }
-            Event::ToolCallStarted { id, name, input } => {
+            Event::ToolCallStarted {
+                id,
+                name,
+                input,
+                model_call,
+            } => {
                 saw_started = true;
+                assert!(model_call.is_none());
                 assert!(id.starts_with(USER_SHELL_TOOL_ID_PREFIX));
                 assert_eq!(name, "Bash");
                 assert_eq!(input["action"], json!("run"));
@@ -13491,8 +14043,14 @@ async fn run_shell_command_op_executes_without_approval_modal() {
             Event::ApprovalRequired { .. } => {
                 saw_approval = true;
             }
-            Event::ToolCallComplete { id, name, result } => {
+            Event::ToolCallComplete {
+                id,
+                name,
+                result,
+                model_call,
+            } => {
                 saw_complete = true;
+                assert!(model_call.is_none());
                 assert!(id.starts_with(USER_SHELL_TOOL_ID_PREFIX));
                 assert_eq!(name, "Bash");
                 let result = result.expect("shell result");
@@ -14701,7 +15259,7 @@ async fn full_access_permission_allow_cannot_bypass_repo_law() {
         ..EngineConfig::default()
     };
     let tool_input =
-        json!({"action": "write", "path": "CHANGELOG.md", "content": "must not be written\n"});
+        json!({"action": "write", "filePath": "CHANGELOG.md", "content": "must not be written\n"});
     assert_eq!(
         file_tool_ask_rule_decision(
             &engine_config,
@@ -14726,6 +15284,56 @@ async fn full_access_permission_allow_cannot_bypass_repo_law() {
     .await;
 
     assert!(!target.exists(), "repo-law block must prevent the write");
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn full_access_file_rules_block_alias_and_parent_paths_without_mutation() {
+    use codewhale_execpolicy::{ExecPolicyEngine, PermissionAction, Ruleset, ToolAskRule};
+
+    let _lock = lock_test_env();
+    let workspace = tempdir().expect("tempdir");
+    fs::create_dir(workspace.path().join("sub")).expect("fixture directory");
+    let target = workspace.path().join("protected.txt");
+    fs::write(&target, "original\n").expect("fixture contents");
+    let rules = ["write_file", "edit_file", "apply_patch"]
+        .into_iter()
+        .map(|tool| {
+            let mut rule = ToolAskRule::file_path(tool, "protected.txt");
+            rule.action = PermissionAction::Deny;
+            rule
+        })
+        .collect();
+    let engine_config = EngineConfig {
+        model: crate::config::DEFAULT_TEXT_MODEL.to_string(),
+        workspace: workspace.path().to_path_buf(),
+        snapshots_enabled: false,
+        subagents_enabled: false,
+        exec_policy_engine: ExecPolicyEngine::with_rulesets(vec![
+            Ruleset::user(vec![], vec![]).with_ask_rules(rules),
+        ]),
+        ..EngineConfig::default()
+    };
+    assert_full_access_model_tool_batch_is_blocked(
+        engine_config,
+        vec![
+            ("write_file", json!({"filePath": "protected.txt", "content": "changed\n"})),
+            ("File", json!({"action": "edit", "file_path": "protected.txt", "search": "original", "replace": "changed"})),
+            ("apply_patch", json!({"filePath": "protected.txt", "patch": "@@ -1 +1 @@\n-original\n+changed\n"})),
+            ("write", json!({"path": "sub/../protected.txt", "content": "changed\n"})),
+        ],
+        &[
+            ("write_file", "Permission rule 'tool=write_file path=protected.txt' explicitly denies"),
+            ("File", "Permission rule 'tool=edit_file path=protected.txt' explicitly denies"),
+            ("apply_patch", "Permission rule 'tool=apply_patch path=protected.txt' explicitly denies"),
+            ("write", "Permission rule 'tool=write_file path=protected.txt' explicitly denies"),
+        ],
+        "explicitly denies this invocation",
+    ).await;
+    assert_eq!(
+        fs::read_to_string(&target).expect("retained contents"),
+        "original\n"
+    );
 }
 
 #[tokio::test]
@@ -16467,6 +17075,7 @@ async fn session_update_preserves_reasoning_tool_only_turn() {
                 thinking: "Need a tool before answering.".to_string(),
             },
             ContentBlock::ToolUse {
+                execution_id: None,
                 id: "tool-1".to_string(),
                 name: "read_file".to_string(),
                 input: json!({"path": "Cargo.toml"}),
@@ -18118,6 +18727,7 @@ async fn edit_last_turn_cuts_at_user_prompt_before_tool_results() {
         Message {
             role: Role::Assistant,
             content: vec![ContentBlock::ToolUse {
+                execution_id: None,
                 id: "call_1".to_string(),
                 name: "Bash".to_string(),
                 input: serde_json::json!({"command": "printf hi"}),
@@ -18128,6 +18738,7 @@ async fn edit_last_turn_cuts_at_user_prompt_before_tool_results() {
         Message {
             role: Role::User,
             content: vec![ContentBlock::ToolResult {
+                execution_id: None,
                 tool_use_id: "call_1".to_string(),
                 content: "unique-tool-output-marker".to_string(),
                 is_error: None,
@@ -19148,7 +19759,10 @@ fn oversized_tool_output_is_recoverable_before_serial_and_parallel_fanout() {
                     let mut events = handle.rx_event.write().await;
                     let mut completed = 0;
                     while let Ok(event) = events.try_recv() {
-                        let Event::ToolCallComplete { id, result, .. } = event else {
+                        let Event::ToolCallComplete {
+                            result, model_call, ..
+                        } = event
+                        else {
                             continue;
                         };
                         let output = result.expect("tool succeeded");
@@ -19159,7 +19773,8 @@ fn oversized_tool_output_is_recoverable_before_serial_and_parallel_fanout() {
                         let path = metadata["artifact_path"].as_str().expect("artifact path");
                         assert_eq!(fs::read_to_string(path).unwrap(), raw);
                         let reference = metadata["artifact_id"].as_str().unwrap();
-                        let results = guardian_tool_results(&requests[1], &id);
+                        let results =
+                            guardian_tool_results(&requests[1], &model_call.unwrap().provider_id);
                         assert_eq!(results.len(), 1);
                         let (text, _) = results[0];
                         assert!(text.len() <= 7_680, "64K route inline budget");
@@ -20794,6 +21409,7 @@ fn turn_metadata_skips_tool_result_messages() {
     engine.session.add_message(Message {
         role: Role::Assistant,
         content: vec![ContentBlock::ToolUse {
+            execution_id: None,
             id: "call_42".to_string(),
             name: "read_file".to_string(),
             input: serde_json::json!({"path": "src/lib.rs"}),
@@ -20805,6 +21421,7 @@ fn turn_metadata_skips_tool_result_messages() {
     engine.session.add_message(Message {
         role: Role::User,
         content: vec![ContentBlock::ToolResult {
+            execution_id: None,
             tool_use_id: "call_42".to_string(),
             content: "pub fn sample() {}".to_string(),
             is_error: None,
@@ -20906,6 +21523,7 @@ fn turn_metadata_skips_when_only_tool_results_trail() {
     engine.session.add_message(Message {
         role: Role::User,
         content: vec![ContentBlock::ToolResult {
+            execution_id: None,
             tool_use_id: "call_42".to_string(),
             content: "pub fn sample() {}".to_string(),
             is_error: None,
@@ -22375,11 +22993,12 @@ fn fake_wrapper_notice_is_compact_and_actionable() {
 // chunks that build up `input_buffer`. The TUI used to fire `ToolCallStarted`
 // from `ContentBlockStart` with the empty initial input and never re-emit
 // once args were known, so cells rendered the literal text `<command>` /
-// `<file>` placeholders. The fix relocates the emission to `ContentBlockStop`
-// and routes the input through `final_tool_input`, which prefers the parsed
+// `<file>` placeholders. The input is finalized at `ContentBlockStop`, then published after batch admission
+// through `final_tool_input`, which prefers the parsed
 // buffer over a stale empty placeholder.
 fn tool_state(initial: serde_json::Value, buffer: &str) -> ToolUseState {
     ToolUseState {
+        execution_id: uuid::Uuid::new_v4().to_string(),
         id: "t1".into(),
         name: "exec_shell".into(),
         input: initial,
@@ -26510,11 +27129,16 @@ async fn idle_engine_routes_child_approval_decisions_to_the_waiting_child() {
     let manager = engine.subagent_manager.clone();
     let run = tokio::spawn(engine.run());
 
-    let (approval_id, receiver) =
-        manager
-            .write()
-            .await
-            .register_child_approval("agent_child", "bash", "fixture");
+    let (approval_id, receiver) = manager
+        .write()
+        .await
+        .register_child_approval(
+            "agent_child",
+            &format!("agent:agent_child:approval:{}", uuid::Uuid::new_v4()),
+            "bash",
+            "fixture",
+        )
+        .unwrap();
     handle
         .approve_tool_call(approval_id.clone())
         .await
@@ -26527,11 +27151,16 @@ async fn idle_engine_routes_child_approval_decisions_to_the_waiting_child() {
     assert_eq!(manager.read().await.pending_child_approvals(), 0);
 
     // A denial for a second prompt routes the same way.
-    let (approval_id, receiver) =
-        manager
-            .write()
-            .await
-            .register_child_approval("agent_child", "bash", "fixture");
+    let (approval_id, receiver) = manager
+        .write()
+        .await
+        .register_child_approval(
+            "agent_child",
+            &format!("agent:agent_child:approval:{}", uuid::Uuid::new_v4()),
+            "bash",
+            "fixture",
+        )
+        .unwrap();
     handle
         .deny_tool_call(approval_id)
         .await
@@ -27572,17 +28201,25 @@ async fn extension_tool_is_deferred_gated_and_attributed_on_the_model_path() {
             .expect("timed out waiting for the extension tool turn")
             .expect("engine event stream closed");
         match event {
-            Event::ToolCallComplete { id, result: r, .. } if id == "call-search" => {
+            Event::ToolCallComplete {
+                model_call: Some(model_call),
+                result: r,
+                ..
+            } if model_call.provider_id == "call-search" => {
                 search = Some(r.expect("tool_search result"));
             }
             Event::ApprovalRequired {
                 id, description, ..
-            } if id == "call-ext" => {
+            } => {
                 assert!(result.is_none(), "approval must precede execution");
                 approval = Some(description);
                 handle.approve_tool_call(&id).await.expect("approve");
             }
-            Event::ToolCallComplete { id, result: r, .. } if id == "call-ext" => {
+            Event::ToolCallComplete {
+                model_call: Some(model_call),
+                result: r,
+                ..
+            } if model_call.provider_id == "call-ext" => {
                 result = Some(r.expect("extension tool result"));
             }
             Event::TurnComplete { status, error, .. } => {

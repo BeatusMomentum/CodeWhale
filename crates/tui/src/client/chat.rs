@@ -2785,6 +2785,7 @@ fn build_chat_messages_with_reasoning(
                     input,
                     caller,
                     thought_signature,
+                    ..
                 } => {
                     let args = serde_json::to_string(input).unwrap_or_else(|_| input.to_string());
                     let mut call = json!({
@@ -3818,6 +3819,7 @@ fn parse_chat_message_for_route(
                 .and_then(Value::as_str)
                 .map(str::to_string);
             content_blocks.push(ContentBlock::ToolUse {
+                execution_id: None,
                 id,
                 name: from_api_tool_name(&name),
                 input: arguments,
@@ -4779,6 +4781,7 @@ mod minimax_reasoning_replay_tests {
                         cache_control: None,
                     },
                     ContentBlock::ToolUse {
+                        execution_id: None,
                         id: "call_qwen38_001".to_string(),
                         name: "read".to_string(),
                         input: serde_json::json!({ "path": "widget.rs" }),
@@ -4790,6 +4793,7 @@ mod minimax_reasoning_replay_tests {
             Message {
                 role: Role::User,
                 content: vec![ContentBlock::ToolResult {
+                    execution_id: None,
                     tool_use_id: "call_qwen38_001".to_string(),
                     content: "widget.rs: struct Widget { .. }".to_string(),
                     is_error: None,
@@ -6787,6 +6791,7 @@ mod image_block_wire_tests {
 
     fn fixture_tool_use(id: &str) -> ContentBlock {
         ContentBlock::ToolUse {
+            execution_id: None,
             id: id.to_string(),
             name: "read".to_string(),
             input: serde_json::json!({"path": format!("{id}.txt")}),
@@ -6799,6 +6804,7 @@ mod image_block_wire_tests {
         Message {
             role: Role::User,
             content: vec![ContentBlock::ToolResult {
+                execution_id: None,
                 tool_use_id: id.to_string(),
                 content: format!("result for {id}"),
                 is_error: Some(false),
@@ -6947,6 +6953,7 @@ mod image_block_wire_tests {
             Message {
                 role: Role::Assistant,
                 content: vec![ContentBlock::ToolUse {
+                    execution_id: None,
                     id: "call_image_1".to_string(),
                     name: "read".to_string(),
                     input: serde_json::json!({"path": "shot.png"}),
@@ -6957,6 +6964,7 @@ mod image_block_wire_tests {
             Message {
                 role: Role::User,
                 content: vec![ContentBlock::ToolResult {
+                    execution_id: None,
                     tool_use_id: "call_image_1".to_string(),
                     content: "screenshot captured".to_string(),
                     is_error: Some(false),
@@ -7008,6 +7016,7 @@ mod image_block_wire_tests {
                 role: Role::Assistant,
                 content: vec![
                     ContentBlock::ToolUse {
+                        execution_id: None,
                         id: "call_image_1".to_string(),
                         name: "read".to_string(),
                         input: serde_json::json!({"path": "first.png"}),
@@ -7015,6 +7024,7 @@ mod image_block_wire_tests {
                         thought_signature: None,
                     },
                     ContentBlock::ToolUse {
+                        execution_id: None,
                         id: "call_image_2".to_string(),
                         name: "read".to_string(),
                         input: serde_json::json!({"path": "second.png"}),
@@ -7026,6 +7036,7 @@ mod image_block_wire_tests {
             Message {
                 role: Role::User,
                 content: vec![ContentBlock::ToolResult {
+                    execution_id: None,
                     tool_use_id: "call_image_1".to_string(),
                     content: "first screenshot captured".to_string(),
                     is_error: Some(false),
@@ -7039,6 +7050,7 @@ mod image_block_wire_tests {
             Message {
                 role: Role::User,
                 content: vec![ContentBlock::ToolResult {
+                    execution_id: None,
                     tool_use_id: "call_image_2".to_string(),
                     content: "second screenshot captured".to_string(),
                     is_error: Some(false),
@@ -7133,6 +7145,7 @@ mod image_block_wire_tests {
                 role: Role::Assistant,
                 content: vec![
                     ContentBlock::ToolUse {
+                        execution_id: None,
                         id: "call_one".to_string(),
                         name: "read".to_string(),
                         input: serde_json::json!({"path": "first.png"}),
@@ -7140,6 +7153,7 @@ mod image_block_wire_tests {
                         thought_signature: None,
                     },
                     ContentBlock::ToolUse {
+                        execution_id: None,
                         id: "call_two".to_string(),
                         name: "read".to_string(),
                         input: serde_json::json!({"path": "second.png"}),
@@ -7151,6 +7165,7 @@ mod image_block_wire_tests {
             Message {
                 role: Role::User,
                 content: vec![ContentBlock::ToolResult {
+                    execution_id: None,
                     tool_use_id: "call_one".to_string(),
                     content: "first screenshot captured".to_string(),
                     is_error: Some(false),
@@ -7169,6 +7184,7 @@ mod image_block_wire_tests {
                         cache_control: None,
                     },
                     ContentBlock::ToolResult {
+                        execution_id: None,
                         tool_use_id: "call_two".to_string(),
                         content: "second screenshot captured".to_string(),
                         is_error: Some(false),
@@ -7214,6 +7230,7 @@ mod image_block_wire_tests {
                 role: Role::Assistant,
                 content: vec![
                     ContentBlock::ToolUse {
+                        execution_id: None,
                         id: "duplicate".to_string(),
                         name: "read".to_string(),
                         input: serde_json::json!({"path": "first.png"}),
@@ -7221,6 +7238,7 @@ mod image_block_wire_tests {
                         thought_signature: None,
                     },
                     ContentBlock::ToolUse {
+                        execution_id: None,
                         id: "duplicate".to_string(),
                         name: "read".to_string(),
                         input: serde_json::json!({"path": "second.png"}),
@@ -7232,6 +7250,7 @@ mod image_block_wire_tests {
             Message {
                 role: Role::User,
                 content: vec![ContentBlock::ToolResult {
+                    execution_id: None,
                     tool_use_id: "duplicate".to_string(),
                     content: "one result for two calls".to_string(),
                     is_error: Some(false),
@@ -7292,6 +7311,7 @@ mod mistral_reasoning_tests {
                             cache_control: None,
                         },
                         ContentBlock::ToolUse {
+                            execution_id: None,
                             id: "call-1".to_string(),
                             name: "read_file".to_string(),
                             input: json!({"path": "README.md"}),
@@ -7303,6 +7323,7 @@ mod mistral_reasoning_tests {
                 Message {
                     role: Role::User,
                     content: vec![ContentBlock::ToolResult {
+                        execution_id: None,
                         tool_use_id: "call-1".to_string(),
                         content: "contents".to_string(),
                         is_error: None,
@@ -7714,6 +7735,7 @@ mod google_thought_signature_tests {
                         cache_control: None,
                     },
                     ContentBlock::ToolUse {
+                        execution_id: None,
                         id: "call-g-1".to_string(),
                         name: "read".to_string(),
                         input: json!({"path": "config.toml"}),
@@ -7727,6 +7749,7 @@ mod google_thought_signature_tests {
             messages.push(Message {
                 role: Role::User,
                 content: vec![ContentBlock::ToolResult {
+                    execution_id: None,
                     tool_use_id: "call-g-1".to_string(),
                     content: "key = \"value\"".to_string(),
                     is_error: None,

@@ -2,11 +2,11 @@
 
 > 本文翻译自英文版 [FLEET.md](../FLEET.md)，与英文修订 `fc23323c4`（2026-08-17）同步。
 
-Agent Fleet 是面向持久化多 worker 运行的本地优先控制平面。它**不是**一个独立的执行引擎：fleet worker 就是一次由 fleet 启动并持久跟踪的无头 `codewhale exec` 运行。关于子代理、`exec` 与 fleet 如何汇聚到同一个持久运行时，请参阅 [AGENT_RUNTIME.md](../AGENT_RUNTIME.md)。在产品语言里，用户仍然可以"打开一个子代理"；在架构语言里，持久的嵌套工作应当是一个带 role 的 fleet-backed worker。
+Agent Fleet 是面向持久化多 worker 运行的本地优先控制平面。它**不是**一个独立的执行引擎：fleet worker 就是一次由 fleet 启动并持久跟踪的无头 `codewhale exec` 运行。关于子代理、`exec` 与 fleet 如何汇聚到同一个持久运行时，请参阅 [AGENT_RUNTIME.md](./AGENT_RUNTIME.md)。在产品语言里，用户仍然可以"打开一个子代理"；在架构语言里，持久的嵌套工作应当是一个带 role 的 fleet-backed worker。
 
 只要工作场景需要重试、睡眠/重启后存活、远程执行、回执（receipt）或有账本（ledger）的审计轨迹，就应该使用 Fleet 而不是短命的 `agent` 扇出。初始 CLI 表面如下：
 
-关于结合 Fleet 任务规范与 Workflow 编排的引导式端到端监控演练，请参阅 [Fleet + Workflow Tutorial](../FLEET_WORKFLOW_TUTORIAL.md)。
+关于结合 Fleet 任务规范与 Workflow 编排的引导式端到端监控演练，请参阅 [Fleet + Workflow Tutorial](./FLEET_WORKFLOW_TUTORIAL.md)。
 
 ```sh
 codewhale fleet init

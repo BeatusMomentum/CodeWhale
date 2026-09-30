@@ -880,6 +880,10 @@ fn bracketed_paste_returns_dock_focus_to_the_visible_composer() {
 /// One representative terminal encoding per shell binding.
 fn shell_binding_probe(id: ShellBindingId) -> KeyEvent {
     match id {
+        ShellBindingId::ElevationUp => KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+        ShellBindingId::ElevationDown => KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+        ShellBindingId::ElevationConfirm => KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        ShellBindingId::ElevationAbort => KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
         ShellBindingId::PetResultUp => KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
         ShellBindingId::PetResultDown => KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
         ShellBindingId::PetResultPageUp => KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE),
@@ -9093,6 +9097,7 @@ fn apply_loaded_session_never_restores_background_shell_event_as_composer_draft(
             Message {
                 role: Role::Assistant,
                 content: vec![ContentBlock::ToolUse {
+                    execution_id: None,
                     id: "plan-complete".to_string(),
                     name: "update_plan".to_string(),
                     input: serde_json::json!({"plan": [{"step": "Check the output", "status": "completed"}]}),
@@ -9103,6 +9108,7 @@ fn apply_loaded_session_never_restores_background_shell_event_as_composer_draft(
             Message {
                 role: Role::User,
                 content: vec![ContentBlock::ToolResult {
+                    execution_id: None,
                     tool_use_id: "plan-complete".to_string(),
                     content: "Plan updated".to_string(),
                     is_error: None,
@@ -16957,12 +16963,6 @@ async fn empty_bang_shell_input_is_consumed_with_usage_error() {
         app.status_message.as_deref(),
         Some("Error: Usage: ! <shell command>")
     );
-}
-
-#[test]
-fn local_bang_shell_tool_ids_are_not_model_visible() {
-    assert!(!is_model_visible_tool_call("user_shell_1"));
-    assert!(is_model_visible_tool_call("toolu_01abc"));
 }
 
 fn complete_release_json(tag: &str) -> serde_json::Value {
@@ -25322,11 +25322,14 @@ fn message_complete_drain_preserves_thinking_when_thinking_complete_lost() {
 #[test]
 fn approval_prompt_uses_event_input_after_message_complete_drain() {
     let mut app = create_test_app();
-    app.pending_tool_uses.push((
-        "tool-1".to_string(),
-        "exec_shell".to_string(),
-        serde_json::json!({"command": "stale value from drained list"}),
-    ));
+    app.pending_tool_uses.push(ContentBlock::ToolUse {
+        execution_id: Some("tool-1".to_string()),
+        id: "provider-tool-1".to_string(),
+        name: "exec_shell".to_string(),
+        input: serde_json::json!({"command": "stale value from drained list"}),
+        caller: None,
+        thought_signature: None,
+    });
 
     // Mirror the old race: MessageComplete drains pending tool uses before
     // ApprovalRequired is handled. The approval modal must still show the
@@ -26693,6 +26696,54 @@ fn typeahead_before_card_does_not_answer() {
     assert!(app.view_stack.key_predates_top_approval(typed_before));
     assert!(!app.view_stack.key_predates_top_approval(Instant::now()));
     assert_eq!(app.view_stack.top_kind(), Some(ModalKind::Approval));
+}
+
+#[test]
+fn stale_keys_cannot_answer_a_raised_or_revealed_elevation() {
+    use crate::tui::approval::ElevationOption;
+
+    let mut app = ask_posture_app();
+    let typed_before = Instant::now() - Duration::from_secs(1);
+    app.view_stack.push(ElevationView::new(
+        ElevationRequest::for_shell("elevation-id", "cargo test", "blocked", true, false),
+        codewhale_localization::Locale::En,
+    ));
+    let up = KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
+    assert!(route_key_to_view_stack(&mut app, up, typed_before).is_none());
+    assert_eq!(app.view_stack.top_approval_id(), None);
+    // Deliberately select Full Access, then cover it with another decision.
+    assert!(route_key_to_view_stack(&mut app, up, Instant::now()).is_some());
+    push_approval_request_view(
+        &mut app,
+        "approval-id",
+        "exec_shell",
+        "Run a command",
+        &serde_json::json!({"command": "cargo test"}),
+        "k",
+        "g",
+        None,
+        crate::config::ApprovalDefaultSelection::AllowOnce,
+        None,
+    );
+    let queued_enter = Instant::now();
+    std::thread::sleep(Duration::from_millis(2));
+    let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+    let events = route_key_to_view_stack(&mut app, enter, queued_enter).expect("visible approval");
+    assert!(
+        matches!(events.as_slice(), [ViewEvent::ApprovalDecision { tool_id, .. }] if tool_id == "approval-id")
+    );
+    assert_eq!(app.view_stack.top_kind(), Some(ModalKind::Elevation));
+    assert!(
+        route_key_to_view_stack(&mut app, enter, queued_enter).is_none(),
+        "Enter queued for the previous card must not elevate the newly revealed one"
+    );
+    assert_eq!(app.view_stack.top_kind(), Some(ModalKind::Elevation));
+    let events =
+        route_key_to_view_stack(&mut app, enter, Instant::now()).expect("fresh confirmation");
+    assert!(matches!(events.as_slice(), [ViewEvent::ElevationDecision {
+        tool_id, option: ElevationOption::FullAccess, ..
+    }] if tool_id == "elevation-id"));
+    assert!(app.view_stack.is_empty());
 }
 
 #[test]
@@ -29743,6 +29794,7 @@ fn backtrack_cut_index_skips_tool_result_user_messages() {
         Message {
             role: Role::Assistant,
             content: vec![ContentBlock::ToolUse {
+                execution_id: None,
                 id: "t1".into(),
                 name: "read_file".into(),
                 input: serde_json::json!({"path":"x"}),
@@ -29753,6 +29805,7 @@ fn backtrack_cut_index_skips_tool_result_user_messages() {
         Message {
             role: Role::User,
             content: vec![ContentBlock::ToolResult {
+                execution_id: None,
                 tool_use_id: "t1".into(),
                 content: "data".into(),
                 is_error: None,
@@ -32169,4 +32222,22 @@ async fn provider_switch_back_lands_on_root_default_owned_by_that_provider() {
     );
     assert_eq!(app.api_provider, ApiProvider::Openai);
     assert_eq!(app.model, "gpui-fixture");
+}
+
+#[test]
+fn transient_assistant_history_preserves_provider_and_local_tool_identity() {
+    let mut app = create_test_app();
+    let block = ContentBlock::ToolUse {
+        id: "wire-reused".to_string(),
+        execution_id: Some("local-fresh".to_string()),
+        name: "read".to_string(),
+        input: serde_json::json!({"path":"README.md"}),
+        caller: Some(codewhale_models::ToolCaller {
+            caller_type: "code_execution".to_string(),
+            tool_id: Some("provider-parent".to_string()),
+        }),
+        thought_signature: Some("provider-signature".to_string()),
+    };
+    push_assistant_message(&mut app, String::new(), None, vec![block.clone()]);
+    assert_eq!(app.api_messages.last().unwrap().content, vec![block]);
 }

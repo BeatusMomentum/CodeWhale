@@ -1,5 +1,7 @@
 # Docker
 
+> 阅读简体中文版：[zh_hans/DOCKER.md](zh_hans/DOCKER.md)。
+
 Codewhale publishes a multi-arch Linux image to GitHub Container Registry
 for each release.
 

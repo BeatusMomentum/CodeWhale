@@ -1,5 +1,7 @@
 # Plugin bundles
 
+> 阅读简体中文版：[zh_hans/PLUGIN_BUNDLES.md](zh_hans/PLUGIN_BUNDLES.md)。
+
 Codewhale supports a deliberately small plugin-bundle boundary. The boundary
 was drawn in v0.9.1 and is extended deliberately in v0.9.10: a bundle may
 contribute declarative Skills, MCP configuration, Commands, Agent profiles,
@@ -222,7 +224,7 @@ The accept/reject behavior is deliberately loud, never silent:
   receipts fail closed as `capabilities-changed`.
 - **`native` under the experimental extension host.** With
   `[features] extension_host` on, the policy becomes v4 and `native` is an
-  active adapter: each entry is one `.mjs` or `.js` ES module file that the
+  active adapter: each entry is one `.mjs`, `.js` or `.mts` ES module file that the
   TypeScript extension host imports. A directory or any other file reports
   an error in `/plugin validate` and review and prevents activation. Its tools
   always use `Required` approval;
@@ -230,6 +232,8 @@ The accept/reject behavior is deliberately loud, never silent:
   satisfy that gate without a prompt. Toggling the flag
   re-reviews every plugin. See
   [the design](design/TS_EXTENSION_HOST.md#as-built-phase-1-2026-09-25).
+  The [extension author guide](EXTENSIONS.md) includes a tested typed example,
+  diagnostic workflow and Node's erasable-TypeScript restrictions.
 - A **recognized-but-inactive** declaration (`lsp`, `native`, a non-empty
   `capabilities.filesystem_roots`, or
   `capabilities.lifecycle_mutation = true`) parses and is validated like any

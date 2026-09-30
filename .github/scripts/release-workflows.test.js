@@ -611,13 +611,17 @@ assert.doesNotMatch(
 // itself runs none: its parity job calls release-parity.yml.
 let hermeticInvocations = 0;
 for (const [label, workflow, expected] of [
-  ["CI", ci, 5],
+  ["CI", ci, 6],
   ["release", release, 0],
   ["release parity", parityWorkflow, 4],
   ["CNB", cnb, 3],
 ]) {
   const commands = workflow.split("\n").filter((line) =>
-    !line.trimStart().startsWith("#") && /\bcargo (?:test|nextest run)\b/.test(line),
+    !line.trimStart().startsWith("#") &&
+    // Exclude only this standalone quoted receipt argument. A printf line
+    // with command substitution or any appended execution still counts.
+    line.trim() !== "'command=sh scripts/with-hermetic-test-home.sh cargo test --workspace --all-features --locked -- --format=pretty'" &&
+    /\bcargo (?:test|nextest run)\b/.test(line),
   );
   assert.equal(commands.length, expected, `${label} must retain every Rust test invocation`);
   for (const command of commands) {

@@ -1,4 +1,11 @@
 {
+  "CmdPluginOwnerReport": "Host ekstensi:\n  Status: {state}\n  Alat aktif ({count}): {tools}",
+  "CmdPluginOwnerActivating": "Sedang diaktifkan",
+  "CmdPluginOwnerActive": "Aktif",
+  "CmdPluginOwnerFailed": "Gagal: {reason}",
+  "CmdPluginOwnerFaulted": "Bermasalah: {reason}",
+  "CmdPluginOwnerRevoked": "Dicabut",
+  "CmdPluginOwnerInactive": "Tidak aktif",
   "MobileStreamReplayFailed": "Runtime tidak dapat membaca riwayat percakapan ini — mencoba lagi",
   "MobileStreamCatchUpFailed": "Runtime tertinggal dan tidak dapat mengejar — mencoba lagi",
   "MobileStreamRuntimeShutdown": "Runtime sedang dimatikan — menghubungkan kembali",

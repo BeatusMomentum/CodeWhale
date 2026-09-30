@@ -1,5 +1,7 @@
 # Accessibility
 
+> 阅读简体中文版：[zh_hans/ACCESSIBILITY.md](zh_hans/ACCESSIBILITY.md)。
+
 Codewhale runs in a terminal, so the platform's own accessibility
 stack (screen readers, magnifiers, terminal-level themes) does most
 of the work. The TUI provides a small set of toggles that reduce
