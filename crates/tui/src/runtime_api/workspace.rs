@@ -8,7 +8,7 @@ use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::dependencies::{ExternalTool as _, Git};
+use crate::dependencies::Git;
 use crate::snapshot::is_git_metadata_name;
 
 use super::{ApiError, RuntimeApiState};
@@ -895,6 +895,7 @@ pub(super) async fn workspace_instructions(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dependencies::ExternalTool as _;
 
     #[cfg(unix)]
     #[test]
