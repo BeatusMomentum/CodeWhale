@@ -337,6 +337,10 @@ impl TerminalInputPump {
     /// detached: `stop` is flagged and the `JoinHandle` dropped, so if the
     /// thread ever wakes it exits on its own (its send fails once `rx` is
     /// replaced, and the stop flag covers the poll loop).
+    ///
+    /// Known limitation (U03-10): stop is flagged before the replacement is
+    /// spawned, but a thread already inside `event::read` cannot be stopped.
+    /// If it ever wakes, the one event it read has no receiver and is lost.
     pub(super) fn restart_detached(&mut self) -> io::Result<()> {
         self.detach_current_thread();
         let parts = Self::spawn_parts()?;
