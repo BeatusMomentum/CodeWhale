@@ -2,9 +2,121 @@
 //! This leaf is also included by the installation acceptance harness.
 
 use std::collections::HashMap;
+use std::path::{Component, Path};
 
 /// Parsed frontmatter: lowercased metadata keys and the body after the fence.
 pub(crate) type Frontmatter<'a> = (HashMap<String, String>, &'a str);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SkillValidationMode {
+    Lenient,
+    Strict,
+}
+
+/// Runtime accepts incomplete authoring metadata with visible warnings;
+/// installation requires frontmatter, a path-safe name, and a description.
+/// Neither mode grants tools, model selection, execution, or fork authority.
+pub(crate) fn validate_skill_frontmatter(
+    metadata: Option<&HashMap<String, String>>,
+    path: Option<&Path>,
+    mode: SkillValidationMode,
+) -> Result<Vec<String>, String> {
+    let Some(metadata) = metadata else {
+        return match mode {
+            SkillValidationMode::Strict => {
+                Err("SKILL.md is missing the leading '---' frontmatter fence".into())
+            }
+            SkillValidationMode::Lenient => Ok(vec![
+                "missing frontmatter; using the Markdown heading as the skill name".into(),
+                "missing description".into(),
+            ]),
+        };
+    };
+    let name = metadata
+        .get("name")
+        .filter(|name| !name.trim().is_empty())
+        .ok_or_else(|| "missing required frontmatter field: name".to_string())?;
+    if mode == SkillValidationMode::Strict && !is_path_safe_skill_name(name) {
+        return Err(format!(
+            "SKILL.md `name` must be a single path-safe segment (got '{name}')"
+        ));
+    }
+    let mut warnings = Vec::new();
+    if !metadata
+        .get("description")
+        .is_some_and(|value| !value.trim().is_empty())
+    {
+        if mode == SkillValidationMode::Strict {
+            return Err("missing required frontmatter field: description".into());
+        }
+        warnings.push("missing description".into());
+    }
+    if let Some(directory) = path
+        .and_then(Path::parent)
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+        && directory != name
+    {
+        warnings.push(format!(
+            "frontmatter name `{name}` differs from directory `{directory}`"
+        ));
+    }
+    let mut keys: Vec<_> = metadata.keys().collect();
+    keys.sort();
+    for key in keys {
+        if key.starts_with("metadata.") || key.starts_with("x-") || key.starts_with("description_")
+        {
+            continue;
+        }
+        let warning = match key.as_str() {
+            "name" | "description" | "invocation" | "aliases-for" | "license" | "compatibility"
+            | "metadata" | "when_to_use" | "argument-hint" => None,
+            "disable-model-invocation" | "user-invocable" => {
+                if parse_frontmatter_bool(&metadata[key]).is_none() {
+                    let warning = format!("invalid boolean `{key}`; invocation fails closed");
+                    if mode == SkillValidationMode::Strict {
+                        return Err(warning);
+                    }
+                    Some(warning)
+                } else {
+                    None
+                }
+            }
+            "allowed-tools" | "disallowed-tools" => Some(format!(
+                "`{key}` ignored: skills grant no tool or approval authority"
+            )),
+            "model" => Some("`model` ignored: skills do not select providers or models".into()),
+            "context" | "agent" => Some(format!(
+                "`{key}` unsupported: skills do not create a separate execution context"
+            )),
+            _ => Some(format!("unknown frontmatter key `{key}` ignored")),
+        };
+        if let Some(warning) = warning {
+            warnings.push(warning);
+        }
+    }
+    Ok(warnings)
+}
+
+pub(crate) fn parse_frontmatter_bool(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" | "yes" | "on" | "1" => Some(true),
+        "false" | "no" | "off" | "0" => Some(false),
+        _ => None,
+    }
+}
+
+pub(crate) fn is_path_safe_skill_name(name: &str) -> bool {
+    if name.is_empty()
+        || name.trim() != name
+        || name.chars().any(char::is_whitespace)
+        || name.contains(['/', '\\'])
+    {
+        return false;
+    }
+    let mut components = Path::new(name).components();
+    matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none()
+}
 
 /// Split a Markdown file into its `---` frontmatter metadata and body.
 ///
@@ -252,4 +364,137 @@ pub(crate) fn parse_frontmatter(
 fn is_block_sequence_item(line: &str) -> bool {
     let line = line.trim();
     line == "-" || line.starts_with("- ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nested_metadata_does_not_override_name_or_description() {
+        let (metadata, _) = parse_frontmatter("---\nname: outer\ndescription: real routing\nmetadata:\n  name: impostor\n  description: hidden\n  nested:\n    name: deeper\nlicense: MIT\n---\nbody").unwrap().unwrap();
+        assert_eq!(metadata["name"], "outer");
+        assert_eq!(metadata["description"], "real routing");
+        assert_eq!(metadata["metadata.name"], "impostor");
+        assert_eq!(metadata["metadata.nested.name"], "deeper");
+        assert_eq!(metadata["license"], "MIT");
+    }
+
+    #[test]
+    fn flow_list_parsed() {
+        let (metadata, _) = parse_frontmatter("---\nname: demo\nallowed-tools: [Read, 'Bash(ls *)', \"Grep, Glob\"]\naliases-for: [other, another]\n---\nbody").unwrap().unwrap();
+        assert_eq!(metadata["allowed-tools"], "Read, Bash(ls *), Grep, Glob");
+        assert_eq!(metadata["aliases-for"], "other, another");
+        assert!(parse_frontmatter("---\nname: demo\nallowed-tools: [Read\n---\nbody").is_err());
+    }
+
+    #[test]
+    fn metadata_short_description_captured() {
+        // Actual Codex sample frontmatter, retaining its nested metadata map.
+        let (metadata, _) = parse_frontmatter(include_str!(
+            "../../tests/fixtures/skills/codex-skill-creator.md"
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            metadata["metadata.short-description"],
+            "Create or update a skill"
+        );
+        assert!(!metadata.contains_key("short-description"));
+        assert!(
+            validate_skill_frontmatter(Some(&metadata), None, SkillValidationMode::Strict)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn real_claude_fixture_preserves_block_sequence_and_authority_warning() {
+        let (metadata, _) =
+            parse_frontmatter(include_str!("../../tests/fixtures/skills/claude-access.md"))
+                .unwrap()
+                .unwrap();
+        assert_eq!(metadata["name"], "access");
+        assert_eq!(
+            metadata["allowed-tools"],
+            "Read, Write, Bash(ls *), Bash(mkdir *)"
+        );
+        let warnings =
+            validate_skill_frontmatter(Some(&metadata), None, SkillValidationMode::Strict).unwrap();
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("grant no tool or approval authority"));
+    }
+
+    #[test]
+    fn runtime_and_install_validation_agree() {
+        let (metadata, _) = parse_frontmatter("---\nname: valid\ndescription: routing\n---\nbody")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            validate_skill_frontmatter(Some(&metadata), None, SkillValidationMode::Lenient),
+            validate_skill_frontmatter(Some(&metadata), None, SkillValidationMode::Strict)
+        );
+        let mut missing = metadata.clone();
+        missing.remove("description");
+        assert_eq!(
+            validate_skill_frontmatter(Some(&missing), None, SkillValidationMode::Lenient).unwrap(),
+            vec!["missing description"]
+        );
+        assert!(
+            validate_skill_frontmatter(Some(&missing), None, SkillValidationMode::Strict)
+                .unwrap_err()
+                .contains("description")
+        );
+        missing.remove("name");
+        assert!(
+            validate_skill_frontmatter(Some(&missing), None, SkillValidationMode::Lenient).is_err()
+        );
+        let mut unsafe_name = metadata;
+        unsafe_name.insert("name".into(), "../escape".into());
+        assert!(
+            validate_skill_frontmatter(Some(&unsafe_name), None, SkillValidationMode::Strict)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn unknown_keys_warn_once_spec_keys_silent() {
+        let (metadata, _) = parse_frontmatter("---\nname: demo\ndescription: routing\nlicense: MIT\ncompatibility: Codewhale\nmetadata:\n  vendor-field: fine\nx-custom: fine\nallowed-tools: [Read]\nmodel: example\ncontext: fork\nmystery: ignored\n---\nbody").unwrap().unwrap();
+        let warnings =
+            validate_skill_frontmatter(Some(&metadata), None, SkillValidationMode::Lenient)
+                .unwrap();
+        assert_eq!(warnings.len(), 4, "{warnings:?}");
+        for key in ["allowed-tools", "model", "context", "mystery"] {
+            assert_eq!(
+                warnings
+                    .iter()
+                    .filter(|warning| warning.contains(key))
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_invocation_booleans_fail_closed() {
+        let (metadata, _) = parse_frontmatter(
+            "---\nname: demo\ndescription: routing\nuser-invocable: maybe\n---\nbody",
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            validate_skill_frontmatter(Some(&metadata), None, SkillValidationMode::Lenient)
+                .unwrap()[0]
+                .contains("fails closed")
+        );
+        assert!(
+            validate_skill_frontmatter(Some(&metadata), None, SkillValidationMode::Strict).is_err()
+        );
+        for value in ["yes", "on", "1", "true"] {
+            assert_eq!(parse_frontmatter_bool(value), Some(true));
+        }
+        for value in ["no", "off", "0", "false"] {
+            assert_eq!(parse_frontmatter_bool(value), Some(false));
+        }
+    }
 }

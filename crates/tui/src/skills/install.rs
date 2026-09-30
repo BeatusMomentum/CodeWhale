@@ -1581,14 +1581,7 @@ fn skill_target_path(name: &str, skills_dir: &Path) -> Result<PathBuf> {
 }
 
 pub(crate) fn validate_skill_name_segment(name: &str) -> Result<&str> {
-    if name.is_empty() || name.trim() != name || name.chars().any(char::is_whitespace) {
-        bail!("skill name must be a single path-safe segment (got '{name}')");
-    }
-    if name == "." || name == ".." || name.contains('/') || name.contains('\\') {
-        bail!("skill name must be a single path-safe segment (got '{name}')");
-    }
-    let mut components = Path::new(name).components();
-    if !matches!(components.next(), Some(Component::Normal(_))) || components.next().is_some() {
+    if !super::frontmatter::is_path_safe_skill_name(name) {
         bail!("skill name must be a single path-safe segment (got '{name}')");
     }
     Ok(name)
@@ -1628,25 +1621,15 @@ fn strip_prefix<'a>(path: &'a str, prefix: &str) -> std::borrow::Cow<'a, str> {
 /// Also verifies the leading `---` fence so we reject malformed files early.
 fn parse_frontmatter_name(bytes: &[u8]) -> Result<String> {
     let content = std::str::from_utf8(bytes).context("SKILL.md is not valid UTF-8")?;
-    let (metadata, _) = super::frontmatter::parse_frontmatter(content)
-        .map_err(anyhow::Error::msg)?
-        .ok_or_else(|| {
-            anyhow::anyhow!("SKILL.md is missing the leading '---' frontmatter fence")
-        })?;
-    let name = metadata
-        .get("name")
-        .filter(|value| !value.trim().is_empty())
-        .cloned()
-        .ok_or(InstallError::MissingFrontmatterField("name"))?;
-    if !metadata
-        .get("description")
-        .is_some_and(|value| !value.trim().is_empty())
-    {
-        return Err(InstallError::MissingFrontmatterField("description").into());
-    }
-    if validate_skill_name_segment(&name).is_err() {
-        bail!("SKILL.md `name` must be a single path-safe segment (got '{name}')");
-    }
+    let parsed = super::frontmatter::parse_frontmatter(content).map_err(anyhow::Error::msg)?;
+    super::frontmatter::validate_skill_frontmatter(
+        parsed.as_ref().map(|(metadata, _)| metadata),
+        None,
+        super::frontmatter::SkillValidationMode::Strict,
+    )
+    .map_err(anyhow::Error::msg)?;
+    let (metadata, _) = parsed.expect("strict validation requires frontmatter");
+    let name = metadata["name"].clone();
     Ok(name)
 }
 

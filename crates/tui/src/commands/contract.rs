@@ -2666,7 +2666,7 @@ fn discover_visible(app: &App) -> crate::skills::SkillRegistry {
     crate::skills::discover_for_workspace_and_dir_with_mode_and_plugins(
         &app.workspace,
         &app.skills_dir,
-        crate::skills::SkillDiscoveryMode::from_codewhale_only(app.skills_scan_codewhale_only),
+        app.skills_discovery_mode,
         Some(app.plugin_registry.as_ref()),
     )
     .into_enabled()
@@ -2772,8 +2772,7 @@ fn network_denied_message(host: &str) -> String {
 impl CommandSkillGroupContext for SkillGroupAdapter<'_> {
     fn skill_registry_projection(&self) -> SkillRegistryProjection {
         let app = self.host.app.borrow();
-        let mode =
-            crate::skills::SkillDiscoveryMode::from_codewhale_only(app.skills_scan_codewhale_only);
+        let mode = app.skills_discovery_mode;
         let dirs = crate::skills::skill_directories_for_workspace_and_dir(
             &app.workspace,
             &app.skills_dir,
@@ -2782,6 +2781,9 @@ impl CommandSkillGroupContext for SkillGroupAdapter<'_> {
         let registry = discover_visible(&app);
         let mode_label = match mode {
             crate::skills::SkillDiscoveryMode::Compatible => "compatible",
+            crate::skills::SkillDiscoveryMode::CompatibleWithFlatWorkspace => {
+                "compatible (flat workspace enabled)"
+            }
             crate::skills::SkillDiscoveryMode::CodeWhaleOnly => "codewhale-only",
         };
         SkillRegistryProjection {
@@ -2804,6 +2806,12 @@ impl CommandSkillGroupContext for SkillGroupAdapter<'_> {
             discover_visible(&app)
         };
         if let Some(skill) = registry.get(name) {
+            if !skill.invocation.user_invocable() {
+                return Err(SkillActivationError::InvocationRejected {
+                    name: skill.name.clone(),
+                    reason: "frontmatter does not allow user invocation".into(),
+                });
+            }
             let plugin_provenance = match &skill.source {
                 crate::skills::SkillSource::Native => None,
                 crate::skills::SkillSource::Plugin { authority, .. } => {
@@ -3048,6 +3056,12 @@ impl CommandSkillGroupContext for SkillGroupAdapter<'_> {
 
         match skill {
             Some(skill) => {
+                if !skill.invocation.user_invocable() {
+                    return Err(format!(
+                        "Skill '{}' does not allow user invocation",
+                        skill.name
+                    ));
+                }
                 // Host-side side effects (D2): session-message insertion and
                 // active-skill mutation are authoritative App operations; the
                 // portable handler renders no success message (baseline emits

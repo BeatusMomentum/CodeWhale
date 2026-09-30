@@ -2226,7 +2226,9 @@ fn build_acp_system_prompt(
                 route_limits,
             )),
             verbosity: config.verbosity.as_deref(),
-            skills_scan_codewhale_only: config.skills_config().scan_codewhale_only(),
+            skills_discovery_mode: crate::skills::SkillDiscoveryMode::from_config(
+                &config.skills_config(),
+            ),
             plugin_registry: None,
             recovery_hint: None,
             mode: acp_mode(config),

@@ -13064,7 +13064,7 @@ async fn build_direct_workflow_tool(
     .with_features(config.features())
     .with_skills_config(
         config.skills_dir(),
-        config.skills_config().scan_codewhale_only(),
+        crate::skills::SkillDiscoveryMode::from_config(&config.skills_config()),
     )
     .with_plugin_registry(std::sync::Arc::clone(&plugin_registry))
     .with_shell_policy(shell_policy)

@@ -210,14 +210,24 @@ pub(crate) fn resolve_skills_dir(
     }
 
     for local_skills_dir in [
-        workspace.join(".agents").join("skills"),
-        workspace.join("skills"),
+        workspace.join(".codewhale/skills"),
+        workspace.join(".agents/skills"),
+        workspace.join(".claude/skills"),
+        workspace.join(".opencode/skills"),
+        workspace.join(".cursor/skills"),
     ] {
         if local_skills_dir.exists() && admitted(&local_skills_dir) {
             return local_skills_dir;
         }
     }
 
+    let flat = workspace.join("skills");
+    if config.skills_config().flat_workspace_root() && flat.exists() && admitted(&flat) {
+        return flat;
+    }
+    if global_skills_dir.exists() {
+        return global_skills_dir.to_path_buf();
+    }
     if config.skills_dir.is_none()
         && let Some(global_agents) = crate::skills::agents_global_skills_dir()
         && global_agents.exists()
@@ -1756,7 +1766,7 @@ pub struct App {
     pub legacy_plugin_tools_dir: Option<PathBuf>,
     pub mcp_config_path: PathBuf,
     pub skills_dir: PathBuf,
-    pub skills_scan_codewhale_only: bool,
+    pub skills_discovery_mode: crate::skills::SkillDiscoveryMode,
     /// Whether the optional project context pack was enabled when this
     /// session loaded its configuration. Context diagnostics consult this
     /// source of truth even before the first system prompt is assembled.
@@ -3040,19 +3050,20 @@ impl App {
     fn discover_cached_skills(
         workspace: &std::path::Path,
         skills_dir: &std::path::Path,
-        scan_codewhale_only: bool,
+        discovery_mode: crate::skills::SkillDiscoveryMode,
         plugins: &crate::plugins::PluginRegistry,
     ) -> Vec<(String, String)> {
         crate::skills::discover_for_workspace_and_dir_with_mode_and_plugins(
             workspace,
             skills_dir,
-            crate::skills::SkillDiscoveryMode::from_codewhale_only(scan_codewhale_only),
+            discovery_mode,
             Some(plugins),
         )
         .into_enabled()
         .list()
         .iter()
-        .map(|s| (s.name.clone(), s.description.clone()))
+        .filter(|s| s.invocation.user_invocable())
+        .map(|s| (s.name.clone(), s.user_menu_description()))
         .collect()
     }
 
@@ -3062,7 +3073,7 @@ impl App {
         let cached_skills = Self::discover_cached_skills(
             &self.workspace,
             &skills_dir,
-            self.skills_scan_codewhale_only,
+            self.skills_discovery_mode,
             self.plugin_registry.as_ref(),
         );
         self.hotbar_actions.replace_skills(&cached_skills);

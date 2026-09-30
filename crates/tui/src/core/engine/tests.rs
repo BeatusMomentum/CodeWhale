@@ -13096,7 +13096,7 @@ fn representative_prompt(
         PromptSessionContext {
             user_memory_block,
             goal_objective,
-            skills_scan_codewhale_only: true,
+            skills_discovery_mode: crate::skills::SkillDiscoveryMode::CodeWhaleOnly,
             mode: AppMode::Agent,
             ..PromptSessionContext::default()
         },

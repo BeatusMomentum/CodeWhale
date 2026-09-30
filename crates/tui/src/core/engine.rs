@@ -317,7 +317,7 @@ pub struct EngineConfig {
     pub skills_dir: PathBuf,
     /// Restrict skill discovery to CodeWhale-owned roots plus explicit
     /// `skills_dir` configuration.
-    pub skills_scan_codewhale_only: bool,
+    pub skills_discovery_mode: crate::skills::SkillDiscoveryMode,
     /// Immutable plugin authority snapshot scoped to `workspace`. Normal App
     /// hosts provide this explicitly; headless/embed callers that leave it
     /// unset receive a fresh workspace-specific snapshot in [`Engine::new`].
@@ -591,7 +591,7 @@ impl Default for EngineConfig {
             mcp_oauth_callback_port: None,
             mcp_oauth_callback_url: None,
             skills_dir: crate::skills::default_skills_dir(),
-            skills_scan_codewhale_only: false,
+            skills_discovery_mode: crate::skills::SkillDiscoveryMode::Compatible,
             plugin_registry: None,
             instructions: Vec::new(),
             project_context_pack_enabled: false,
@@ -1936,7 +1936,7 @@ impl Engine {
                     ),
                     verbosity: config.verbosity.as_deref(),
                     recovery_hint: recovery_hint.as_deref(),
-                    skills_scan_codewhale_only: config.skills_scan_codewhale_only,
+                    skills_discovery_mode: config.skills_discovery_mode,
                     plugin_registry: Some(plugin_registry.as_ref()),
                     // Matches `current_mode`'s initial value below; a later
                     // `/mode` switch re-runs `refresh_system_prompt`.
@@ -6519,7 +6519,7 @@ impl Engine {
         .with_runtime_services(self.config.runtime_services.clone())
         .with_skills_config(
             self.config.skills_dir.clone(),
-            self.config.skills_scan_codewhale_only,
+            self.config.skills_discovery_mode,
         )
         .with_plugin_registry(Arc::clone(&self.plugin_registry))
         .with_session_objects(crate::rlm::session::SessionObjectSnapshot::new(
@@ -7571,6 +7571,7 @@ impl Engine {
         let warning = crate::skills::untrusted_project_skills_warning(
             &self.session.workspace,
             Some(&self.config.skills_dir),
+            self.config.skills_discovery_mode,
         );
         let previous = self
             .session
@@ -7780,7 +7781,7 @@ impl Engine {
                     ),
                     verbosity: context.verbosity.as_deref(),
                     recovery_hint: recovery_hint.as_deref(),
-                    skills_scan_codewhale_only: self.config.skills_scan_codewhale_only,
+                    skills_discovery_mode: self.config.skills_discovery_mode,
                     plugin_registry: Some(self.plugin_registry.as_ref()),
                     mode: context.mode,
                 },

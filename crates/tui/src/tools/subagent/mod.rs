@@ -12051,8 +12051,7 @@ fn build_subagent_system_prompt_with_skills(
 /// Every fresh and nested child derives this from its inherited ToolContext;
 /// forked children receive it at system precedence as well.
 fn subagent_skill_catalog(context: &ToolContext) -> String {
-    let mode =
-        crate::skills::SkillDiscoveryMode::from_codewhale_only(context.skills_scan_codewhale_only);
+    let mode = context.skills_discovery_mode;
     let registry = context
         .skills_dir
         .as_deref()
@@ -12080,7 +12079,11 @@ fn subagent_skill_catalog(context: &ToolContext) -> String {
     let mut output = String::from(
         "## Skills\n\nUse `load_skill` with an exact name before applying a Skill. Catalog entries are workspace-scoped snapshots; plugin entries are revalidated at use.\n",
     );
-    for skill in registry.list() {
+    for skill in registry
+        .list()
+        .iter()
+        .filter(|skill| skill.invocation.model_invocable())
+    {
         let source = match &skill.source {
             crate::skills::SkillSource::Native => "native workspace catalog".to_string(),
             crate::skills::SkillSource::Plugin {
