@@ -138,6 +138,11 @@ export function openAppSession(sessionId) {
       // Library clients need not keep Node alive solely for an idle lease.
       socket.unref();
       return lease;
+    }, (error) => {
+      // Opening a lease sends no input, so its failure is never
+      // outcome-unknown for the action that was waiting on it.
+      if (error && typeof error === "object") delete error.requestDispatched;
+      throw error;
     });
     // A refused or unreachable open is retried on the next request, not cached.
     pending.catch(() => { if (sessionLeases.get(sessionId) === pending) sessionLeases.delete(sessionId); });

@@ -7,7 +7,7 @@ import path from "node:path";
 import net from "node:net";
 import { run, runOk, runInputLease, ExecError, have, trim, withSignal } from "../src/exec.mjs";
 import { safeRemotePath, b64, localExec, hdcExec, executorFor } from "../src/transport.mjs";
-import { appRequest, ensureApp, writeRegistration } from "../src/app-socket.mjs";
+import { appRequest, appSessionRequest, ensureApp, writeRegistration } from "../src/app-socket.mjs";
 
 test("a missing registered bundle gives a repair path without falling back to host input",async t=>{
   const directory=fs.mkdtempSync(path.join(os.tmpdir(),"cu-missing-app-"));
@@ -229,6 +229,8 @@ test("a helper request that was written reports an unknown outcome when it times
   controller.abort();
   await assert.rejects(pending,error=>error.code==="cancelled"&&error.requestDispatched===true);
   assert.equal(received.length,2,"each request reached the helper before its failure");
+  // Opening the session lease sends no input: its timeout is not outcome-unknown.
+  await assert.rejects(appSessionRequest({tool:"left_click",args:{},sessionId:"silent-lease"},{timeoutMs:80,signal:null}),error=>error.code==="app_timeout"&&error.requestDispatched===undefined);
   // Nothing written: an unreachable helper is a plain failure, safe to retry.
   process.env.CODEWHALE_CU_APP_SOCKET=path.join(dir,"absent.sock");
   await assert.rejects(appRequest({tool:"left_click",args:{}},{timeoutMs:1_000,signal:null}),error=>error.code==="app_unavailable"&&error.requestDispatched===undefined);
