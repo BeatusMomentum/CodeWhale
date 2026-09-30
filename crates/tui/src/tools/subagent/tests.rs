@@ -2990,6 +2990,9 @@ async fn always_rate_limited_chat_client() -> (CodewhaleClient, Arc<AtomicUsize>
             initial_delay: Some(0.0),
             max_delay: Some(0.0),
             exponential_base: Some(1.0),
+            jitter: None,
+            jitter_factor: None,
+            respect_retry_after: None,
         }),
         ..crate::config::Config::default()
     }
@@ -3042,6 +3045,9 @@ async fn always_invalid_request_chat_client() -> (CodewhaleClient, Arc<AtomicUsi
             initial_delay: Some(0.0),
             max_delay: Some(0.0),
             exponential_base: Some(1.0),
+            jitter: None,
+            jitter_factor: None,
+            respect_retry_after: None,
         }),
         ..crate::config::Config::default()
     }
@@ -16480,6 +16486,9 @@ async fn tool_call_then_invalid_request_chat_client() -> (CodewhaleClient, Arc<A
             initial_delay: Some(0.0),
             max_delay: Some(0.0),
             exponential_base: Some(1.0),
+            jitter: None,
+            jitter_factor: None,
+            respect_retry_after: None,
         }),
         ..crate::config::Config::default()
     }
@@ -16740,6 +16749,9 @@ async fn denied_call_then_report_chat_client() -> (CodewhaleClient, Arc<AtomicUs
             initial_delay: Some(0.0),
             max_delay: Some(0.0),
             exponential_base: Some(1.0),
+            jitter: None,
+            jitter_factor: None,
+            respect_retry_after: None,
         }),
         ..crate::config::Config::default()
     }
@@ -25462,6 +25474,9 @@ mod readonly_shell_6015 {
                 initial_delay: Some(0.0),
                 max_delay: Some(0.0),
                 exponential_base: Some(1.0),
+                jitter: None,
+                jitter_factor: None,
+                respect_retry_after: None,
             }),
             ..crate::config::Config::default()
         }
@@ -25895,6 +25910,9 @@ async fn late_launch_permit_still_gets_the_full_work_budget() {
                 initial_delay: Some(0.0),
                 max_delay: Some(0.0),
                 exponential_base: Some(1.0),
+                jitter: None,
+                jitter_factor: None,
+                respect_retry_after: None,
             }),
             ..crate::config::Config::default()
         }

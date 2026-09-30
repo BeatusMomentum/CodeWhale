@@ -353,6 +353,9 @@ pub struct CodewhaleClient {
     /// Bounded wait for SSE response headers, resolved once from
     /// `[tui].stream_open_timeout_secs` / `CODEWHALE_STREAM_OPEN_TIMEOUT_SECS`.
     pub(super) stream_open_timeout: Duration,
+    /// HTTP/1.1 pin resolved once from `Config::force_http1` (#6700); the
+    /// single source every client builder and stream open reads.
+    pub(super) force_http1: bool,
 }
 
 const CONNECTION_FAILURE_THRESHOLD: u32 = 2;
@@ -642,6 +645,7 @@ impl Clone for CodewhaleClient {
             reasoning_stream_style: self.reasoning_stream_style.clone(),
             stream_idle_timeout: self.stream_idle_timeout,
             stream_open_timeout: self.stream_open_timeout,
+            force_http1: self.force_http1,
         }
     }
 }
@@ -1389,9 +1393,9 @@ fn build_speech_synthesis_body(
 // === CodewhaleClient ===
 
 /// Returns true when CODEWHALE_FORCE_HTTP1 (legacy alias: DEEPSEEK_FORCE_HTTP1)
-/// is set to a truthy value (`1`, `true`, `yes`, `on`, case-insensitive). Used
-/// by `build_http_client` to opt out of HTTP/2 entirely when a provider's edge
-/// mishandles long-lived H2 streams (#103). Anything else (unset, `0`,
+/// is set to a truthy value (`1`, `true`, `yes`, `on`, case-insensitive). Read
+/// only by `Config::force_http1`, which ORs it with `[tui].force_http1`; every
+/// client builder and stream open takes that resolved value (#103, #6700). Anything else (unset, `0`,
 /// `false`, ...) leaves HTTP/2 on.
 pub(crate) fn force_http1_from_env() -> bool {
     std::env::var("CODEWHALE_FORCE_HTTP1")
@@ -1625,6 +1629,12 @@ impl CodewhaleClient {
         let stream_idle_timeout = Duration::from_secs(config.stream_chunk_timeout_secs());
         let stream_open_timeout = config.stream_open_timeout();
         let connect_timeout = config.connect_timeout();
+        let force_http1 = config.force_http1();
+        if force_http1 {
+            logging::info(
+                "HTTP/1.1 pinned ([tui].force_http1 or CODEWHALE_FORCE_HTTP1) — HTTP/2 disabled",
+            );
+        }
         let http_headers = config.http_headers();
         let auth_disabled =
             auth_mode_disables_api_key(config.auth_mode_for_provider(api_provider).as_deref());
@@ -1679,7 +1689,7 @@ impl CodewhaleClient {
             &base_url,
             wire_format,
             auth_disabled,
-            false,
+            force_http1,
             connect_timeout,
         )?
         .build()?;
@@ -1690,13 +1700,13 @@ impl CodewhaleClient {
             &base_url,
             wire_format,
             auth_disabled,
-            false,
+            force_http1,
             connect_timeout,
         )?
         .redirect(reqwest::redirect::Policy::none())
         .build()?;
         // Always keep an HTTP/1.1 twin for automatic stream-header fallback
-        // when H2 stalls. When CODEWHALE_FORCE_HTTP1 is set, both clients are
+        // when H2 stalls. When `force_http1` is pinned, both clients are
         // HTTP/1.1 and the fallback is a no-op retry path.
         let http1_client = Self::http_client_builder_with_auth_mode(
             &api_key,
@@ -1750,6 +1760,7 @@ impl CodewhaleClient {
             reasoning_stream_style,
             stream_idle_timeout,
             stream_open_timeout,
+            force_http1,
         })
     }
 
@@ -2076,11 +2087,7 @@ impl CodewhaleClient {
             .http2_keep_alive_interval(Some(Duration::from_secs(15)))
             .http2_keep_alive_timeout(Duration::from_secs(20))
             .min_tls_version(reqwest::tls::Version::TLS_1_2);
-        let pin_http1 = force_http1 || force_http1_from_env();
-        if pin_http1 {
-            if force_http1_from_env() && !force_http1 {
-                logging::info("CODEWHALE_FORCE_HTTP1=1 — pinning HTTP client to HTTP/1.1");
-            }
+        if force_http1 {
             builder = builder.http1_only();
         }
         if let Ok(cert_path) = std::env::var("SSL_CERT_FILE")
@@ -13770,7 +13777,7 @@ mod tests {
 
     /// Serialize tests that mutate `DEEPSEEK_FORCE_HTTP1` so they don't race
     /// against each other — env vars are process-global.
-    static FORCE_HTTP1_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    pub(super) static FORCE_HTTP1_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     struct ForceHttp1EnvGuard {
         prior: Option<std::ffi::OsString>,

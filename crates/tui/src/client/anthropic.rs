@@ -256,10 +256,7 @@ impl CodewhaleClient {
         body: &Value,
     ) -> Result<reqwest::Response> {
         let url = self.messages_transport_url(url);
-        let open_req = super::stream_entry::StreamOpenRequest::new(
-            self.stream_open_timeout,
-            self.stream_idle_timeout,
-        );
+        let open_req = self.stream_open_request();
         let opened = super::stream_entry::open_sse_response(&open_req, |policy| {
             let url = url.clone();
             async move {

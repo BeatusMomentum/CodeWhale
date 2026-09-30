@@ -2512,6 +2512,10 @@ reasoning contract, and all four membership ids omit generic sampling fields.
   - `[retry].initial_delay` (float seconds, default `1.0`)
   - `[retry].max_delay` (float seconds, default `60.0`)
   - `[retry].exponential_base` (float, default `2.0`)
+  - `[retry].jitter` (bool, default `true`): randomize each backoff delay
+  - `[retry].jitter_factor` (float, default `0.1` = ±10%; clamps to `0.0..=1.0`)
+  - `[retry].respect_retry_after` (bool, default `true`): wait for a server
+    `Retry-After` header instead of the computed backoff
 
   `[retry]` schedules HTTP-request retries inside the client. The stream-level
   budgets that sit above it — how often a turn re-issues a request whose
@@ -2571,6 +2575,7 @@ reasoning contract, and all four membership ids omit generic sampling fields.
 - `tui.stream_max_errors` (int, optional, default `5`): recoverable errors tolerated within one stream before it ends. Unlike the two retry counts above, `0` does not switch anything off: like the other finite stream budgets it selects the default. Other values clamp to `1..=50`, so `1` ends the stream on its first recoverable error.
 - `tui.stream_open_timeout_secs` (int, optional, default `45`): wait for a streaming request's response headers (connection setup included). A header stall on HTTP/2 retries once over HTTP/1.1 with the same wait. Omitted or `0` falls back to `CODEWHALE_STREAM_OPEN_TIMEOUT_SECS`, then the default; values clamp to `5..=300`.
 - `tui.connect_timeout_secs` (int, optional, default `30`): TCP/TLS connect timeout for the model HTTP client. Omitted or `0` uses the default; values clamp to `1..=300`.
+- `tui.force_http1` (bool, optional, default `false`): pin the model HTTP client to HTTP/1.1, for provider edges or proxies that mishandle long-lived HTTP/2 streams. `CODEWHALE_FORCE_HTTP1=1` does the same; either one pins.
 - `tui.stream_max_content_mb` (int, optional, default `10`) and `tui.stream_max_duration_secs` (int, optional, default `1800`): per-step caps on one stream's accumulated content and wall-clock duration. `0` selects the default; values clamp to `1..=512` MB and `10..=86400` seconds.
 - `transcript.prose_measure` (positive integer, optional, default absent = full width): wrap cap, in columns, for prose cells — user messages, assistant answers, and reasoning/thinking blocks — in the live transcript (#5436). Absent (or `0`) spends the full content width, consistent with tool/status cells and the #5322 wide-frame decision; the former 105-column prose rail is gone. Set a positive whole number (e.g. `prose_measure = 120` under `[transcript]`) to restore a bounded reading measure on ultrawide terminals. Narrow terminals always keep their content width — the cap clamps from above only. Tool, diff, and status cells never inherit this cap. Invalid values (negative or non-integer) are rejected at startup with a `transcript.prose_measure` config error. Resolved once per render pass, so the main transcript cache and the full-screen overlay always agree on the effective width.
 - `hooks` (optional): lifecycle hooks configuration (see `config.example.toml`).

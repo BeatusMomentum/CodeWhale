@@ -1756,6 +1756,18 @@ pub struct RetryConfig {
     pub initial_delay: Option<f64>,
     pub max_delay: Option<f64>,
     pub exponential_base: Option<f64>,
+    /// #6700: randomize each backoff delay by `jitter_factor`. Default `true`.
+    #[serde(default)]
+    pub jitter: Option<bool>,
+    /// #6700: jitter spread as a fraction of the delay (`0.1` = ±10%).
+    /// Default `0.1`; values clamp to `0.0..=1.0`, non-finite values use the
+    /// default.
+    #[serde(default)]
+    pub jitter_factor: Option<f64>,
+    /// #6700: honor a server `Retry-After` header instead of the computed
+    /// backoff. Default `true`.
+    #[serde(default)]
+    pub respect_retry_after: Option<bool>,
 }
 
 /// Deserialize `status_items` tolerantly: skip keys unknown to this build
@@ -1831,6 +1843,10 @@ pub struct TuiConfig {
     /// #6700: TCP/TLS connect timeout for the model HTTP client, in seconds.
     /// Omitted or `0` resolve to the default (30); values clamp to `1..=300`.
     pub connect_timeout_secs: Option<u64>,
+    /// #6700: pin the model HTTP client to HTTP/1.1 (config form of
+    /// `CODEWHALE_FORCE_HTTP1`). Omitted or `false` leaves HTTP/2 on unless
+    /// the env var is truthy; either one pins.
+    pub force_http1: Option<bool>,
     /// Ordered list of footer items the user wants visible. `None` (the field
     /// missing from `config.toml`) means "use the built-in default order"; an
     /// empty `Some(vec![])` means "show nothing in the footer".
@@ -2350,6 +2366,9 @@ pub struct RetryPolicy {
     pub initial_delay: f64,
     pub max_delay: f64,
     pub exponential_base: f64,
+    pub jitter: bool,
+    pub jitter_factor: f64,
+    pub respect_retry_after: bool,
 }
 
 /// Context management configuration.
@@ -8089,6 +8108,17 @@ impl Config {
         )
     }
 
+    /// #6700: whether the model HTTP client is pinned to HTTP/1.1 —
+    /// `[tui].force_http1 = true` or a truthy `CODEWHALE_FORCE_HTTP1`.
+    #[must_use]
+    pub fn force_http1(&self) -> bool {
+        self.tui
+            .as_ref()
+            .and_then(|cfg| cfg.force_http1)
+            .unwrap_or(false)
+            || crate::client::force_http1_from_env()
+    }
+
     /// #6700: resolved TCP/TLS connect timeout for the model HTTP client.
     #[must_use]
     pub fn connect_timeout(&self) -> std::time::Duration {
@@ -8347,6 +8377,9 @@ impl Config {
             initial_delay: 1.0,
             max_delay: 60.0,
             exponential_base: 2.0,
+            jitter: true,
+            jitter_factor: 0.1,
+            respect_retry_after: true,
         };
 
         let Some(cfg) = &self.retry else {
@@ -8359,6 +8392,14 @@ impl Config {
             initial_delay: cfg.initial_delay.unwrap_or(defaults.initial_delay),
             max_delay: cfg.max_delay.unwrap_or(defaults.max_delay),
             exponential_base: cfg.exponential_base.unwrap_or(defaults.exponential_base),
+            jitter: cfg.jitter.unwrap_or(defaults.jitter),
+            jitter_factor: cfg
+                .jitter_factor
+                .filter(|factor| factor.is_finite())
+                .map_or(defaults.jitter_factor, |factor| factor.clamp(0.0, 1.0)),
+            respect_retry_after: cfg
+                .respect_retry_after
+                .unwrap_or(defaults.respect_retry_after),
         }
     }
 }

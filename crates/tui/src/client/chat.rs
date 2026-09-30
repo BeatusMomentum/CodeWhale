@@ -1330,10 +1330,7 @@ impl CodewhaleClient {
         url: &str,
         body: &Value,
     ) -> Result<(reqwest::Response, Duration)> {
-        let open_req = super::stream_entry::StreamOpenRequest::new(
-            self.stream_open_timeout,
-            self.stream_idle_timeout,
-        );
+        let open_req = self.stream_open_request();
         let idle_timeout = open_req.idle_timeout;
         let response = super::stream_entry::open_sse_response(&open_req, |policy| async move {
             match policy {

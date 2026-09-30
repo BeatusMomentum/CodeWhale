@@ -15618,3 +15618,40 @@ fn missing_profile_diagnostic_does_not_show_the_requested_name() {
     // The local error keeps the typed name for the person at the terminal.
     assert!(error.to_string().contains("sk-pasted-token"), "{error}");
 }
+
+/// #6700: `[retry].jitter`, `jitter_factor` and `respect_retry_after` reach
+/// the resolved policy (and the client's `RetryConfig`) instead of being
+/// dropped for compiled-in defaults.
+#[test]
+fn retry_policy_reads_jitter_and_retry_after_keys() {
+    let parse = |body: &str| toml::from_str::<Config>(body).expect("config parses");
+
+    let defaults = parse("[retry]\nmax_retries = 2\n").retry_policy();
+    assert!(defaults.jitter);
+    assert!((defaults.jitter_factor - 0.1).abs() < f64::EPSILON);
+    assert!(defaults.respect_retry_after);
+
+    let tuned =
+        parse("[retry]\njitter = false\njitter_factor = 0.3\nrespect_retry_after = false\n")
+            .retry_policy();
+    assert!(!tuned.jitter);
+    assert!((tuned.jitter_factor - 0.3).abs() < f64::EPSILON);
+    assert!(!tuned.respect_retry_after);
+    let client: crate::llm_client::RetryConfig = tuned.into();
+    assert!(!client.jitter);
+    assert!((client.jitter_factor - 0.3).abs() < f64::EPSILON);
+    assert!(!client.respect_retry_after);
+
+    let high = parse("[retry]\njitter_factor = 7.5\n").retry_policy();
+    assert!((high.jitter_factor - 1.0).abs() < f64::EPSILON);
+    let negative = parse("[retry]\njitter_factor = -0.5\n").retry_policy();
+    assert!(negative.jitter_factor.abs() < f64::EPSILON);
+}
+
+/// #6700: `[tui].force_http1 = true` pins HTTP/1.1 without the env var.
+/// (The env-only path is covered by `force_http1_scenario` under its lock.)
+#[test]
+fn tui_force_http1_key_pins_http1() {
+    let config: Config = toml::from_str("[tui]\nforce_http1 = true\n").expect("config parses");
+    assert!(config.force_http1());
+}

@@ -82,6 +82,9 @@ fn test_codex_config(server: &MockServer) -> Config {
             initial_delay: Some(0.0),
             max_delay: Some(0.0),
             exponential_base: Some(1.0),
+            jitter: None,
+            jitter_factor: None,
+            respect_retry_after: None,
         }),
         providers: Some(ProvidersConfig {
             openai_codex: ProviderConfig {

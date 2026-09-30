@@ -1178,6 +1178,7 @@ stream_max_duration_secs = 1800 # per-step cap on one stream's duration (0 = def
 # stream_max_errors = 5              # recoverable errors tolerated per stream (0 = default, 1-50)
 # stream_open_timeout_secs = 45      # response-header wait (0 = env/default, 5-300)
 # connect_timeout_secs = 30          # TCP/TLS connect timeout (0 = default, 1-300)
+# force_http1 = false               # pin HTTP/1.1 (same as CODEWHALE_FORCE_HTTP1=1)
 osc8_links = true            # emit OSC 8 escapes around URLs (Cmd+click in iTerm2/Ghostty/Kitty/WezTerm/Terminal.app 13+); set false for terminals that misrender
 # What the bottom chrome shows. Each key is one thing on screen: `mode` is the
 # posture bar's plan/act/operate chip, everything else is a segment of the
@@ -1291,6 +1292,9 @@ max_retries = 3
 initial_delay = 1.0
 max_delay = 60.0
 exponential_base = 2.0
+# jitter = true                 # randomize each backoff delay
+# jitter_factor = 0.1           # ±10% spread (0.0-1.0)
+# respect_retry_after = true    # honor a server Retry-After header
 
 # ─────────────────────────────────────────────────────────────────────────────────
 # Goal loop (`[goal]`) — operate-mode persistent goals

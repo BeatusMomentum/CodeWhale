@@ -180,10 +180,7 @@ impl CodewhaleClient {
         let account_id = self.codex_account_id.clone();
         let request_body =
             serde_json::to_vec(&body).context("Failed to serialize Responses API request body")?;
-        let open_req = super::stream_entry::StreamOpenRequest::new(
-            self.stream_open_timeout,
-            self.stream_idle_timeout,
-        );
+        let open_req = self.stream_open_request();
         let response = super::stream_entry::open_sse_response(&open_req, |policy| {
             let url = url.clone();
             let account_id = account_id.clone();
