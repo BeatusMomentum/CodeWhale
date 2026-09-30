@@ -19,7 +19,6 @@ codewhale-agent = { path = "../agent", version = "0.10.1" }
 codewhale-config = { path = "../config", version = "0.10.1" }
 codewhale-core = { path = "../core", version = "0.10.1" }
 codewhale-hooks = { path = "../hooks", version = "0.10.1" }
-codewhale-mcp = { path = "../mcp", version = "0.10.1" }
 codewhale-paths = { path = "../paths", version = "0.10.1" }
 codewhale-protocol = { path = "../protocol", version = "0.10.1" }
 codewhale-release = { path = "../release", version = "0.10.1" }

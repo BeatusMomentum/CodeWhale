@@ -16,14 +16,10 @@ pub use context_reference::{
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use anyhow::{Result, anyhow};
 use codewhale_config::{ConfigToml, ProviderKind};
-use codewhale_hooks::{HookDispatcher, HookEvent};
-use codewhale_mcp::{
-    McpManager, McpStartupCompleteEvent, McpStartupStatus as McpManagerStartupStatus,
-};
+use codewhale_hooks::HookDispatcher;
 use codewhale_protocol::{
     AppResponse, EventFrame, ResponseChannel, Status, Thread, ThreadForkParams, ThreadGoal,
     ThreadGoalClearParams, ThreadGoalGetParams, ThreadGoalProgressParams, ThreadGoalSetParams,
@@ -922,7 +918,7 @@ impl ThreadManager {
     }
 }
 
-/// Top-level headless runtime combining config, threads, MCP, and hooks.
+/// Headless bookkeeping combining config, threads, jobs, and hooks.
 ///
 /// It does not execute tools and holds no approval policy: the Engine behind
 /// the app-server's runtime bridge is the only tool and approval authority.
@@ -931,8 +927,6 @@ pub struct Runtime {
     pub config: ConfigToml,
     /// Manages conversation thread lifecycle.
     pub thread_manager: ThreadManager,
-    /// Manager for MCP server connections.
-    pub mcp_manager: Arc<McpManager>,
     /// Dispatcher for lifecycle hooks.
     pub hooks: HookDispatcher,
     /// Manager for background job lifecycle.
@@ -941,12 +935,7 @@ pub struct Runtime {
 
 impl Runtime {
     /// Constructs a new `Runtime`, loading existing jobs from the state store.
-    pub fn new(
-        config: ConfigToml,
-        state: StateStore,
-        mcp_manager: Arc<McpManager>,
-        hooks: HookDispatcher,
-    ) -> Self {
+    pub fn new(config: ConfigToml, state: StateStore, hooks: HookDispatcher) -> Self {
         let mut jobs = JobManager::default();
         if let Err(e) = jobs.load_from_store(&state) {
             tracing::warn!("Failed to load job store, starting with empty job list: {e}");
@@ -954,7 +943,6 @@ impl Runtime {
         Self {
             config,
             thread_manager: ThreadManager::new(state),
-            mcp_manager,
             hooks,
             jobs,
         }
@@ -1306,55 +1294,6 @@ impl Runtime {
                  app-server runtime bridge (POST /v1/threads/{{id}}/turns)."
             )),
         }
-    }
-
-    /// Starts all configured MCP servers and emits startup events via hooks.
-    pub async fn mcp_startup(&self) -> McpStartupCompleteEvent {
-        let mut updates = Vec::new();
-        let summary = self.mcp_manager.start_all(|update| {
-            updates.push(update);
-        });
-        for update in updates {
-            let status = match update.status {
-                McpManagerStartupStatus::Starting => codewhale_protocol::McpStartupStatus::Starting,
-                McpManagerStartupStatus::Ready => codewhale_protocol::McpStartupStatus::Ready,
-                McpManagerStartupStatus::Failed { error } => {
-                    codewhale_protocol::McpStartupStatus::Failed { error }
-                }
-                McpManagerStartupStatus::Cancelled => {
-                    codewhale_protocol::McpStartupStatus::Cancelled
-                }
-            };
-            self.hooks
-                .emit(HookEvent::GenericEventFrame {
-                    frame: Box::new(EventFrame::McpStartupUpdate {
-                        update: codewhale_protocol::McpStartupUpdateEvent {
-                            server_name: update.server_name,
-                            status,
-                        },
-                    }),
-                })
-                .await;
-        }
-        self.hooks
-            .emit(HookEvent::GenericEventFrame {
-                frame: Box::new(EventFrame::McpStartupComplete {
-                    summary: codewhale_protocol::McpStartupCompleteEvent {
-                        ready: summary.ready.clone(),
-                        failed: summary
-                            .failed
-                            .iter()
-                            .map(|f| codewhale_protocol::McpStartupFailure {
-                                server_name: f.server_name.clone(),
-                                error: f.error.clone(),
-                            })
-                            .collect(),
-                        cancelled: summary.cancelled.clone(),
-                    },
-                }),
-            })
-            .await;
-        summary
     }
 
     /// Returns the current application status including all jobs and their history.
@@ -2591,7 +2530,6 @@ mod tests {
         let mut runtime = Runtime::new(
             ConfigToml::default(),
             temp_core_state("archive-unknown"),
-            Arc::new(McpManager::default()),
             HookDispatcher::default(),
         );
         for request in [
@@ -2641,7 +2579,6 @@ mod tests {
         let mut runtime = Runtime::new(
             ConfigToml::default(),
             temp_core_state("message-refused"),
-            Arc::new(McpManager::default()),
             HookDispatcher::default(),
         );
         let spawned = runtime
