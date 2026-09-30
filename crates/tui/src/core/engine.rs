@@ -8909,10 +8909,9 @@ pub(crate) fn default_active_native_tool_names() -> &'static [&'static str] {
 
 use self::approval::{ApprovalDecision, ApprovalResult, UserInputDecision};
 use self::dispatch::{
-    ParallelToolResult, ParallelToolResultEntry, ToolApprovalStamp, ToolExecGuard, ToolExecOutcome,
-    ToolExecutionBatch, ToolExecutionPlan, caller_allowed_for_tool, caller_type_for_tool_use,
-    final_tool_input, format_tool_error_with_schema, malformed_tool_arguments_error,
-    malformed_tool_arguments_input, mcp_tool_is_parallel_safe, parse_parallel_tool_calls,
+    ToolApprovalStamp, ToolExecGuard, ToolExecOutcome, ToolExecutionBatch, ToolExecutionPlan,
+    caller_allowed_for_tool, caller_type_for_tool_use, final_tool_input,
+    format_tool_error_with_schema, malformed_tool_arguments_error, malformed_tool_arguments_input,
     parse_tool_input, plan_tool_execution_batches, stamp_tool_result_approval,
 };
 #[cfg(test)]
@@ -8937,7 +8936,7 @@ use self::streaming::{
 };
 use self::tool_catalog::{
     CODE_EXECUTION_TOOL_NAME, EXECUTE_TOOLS_TOOL_NAME, JS_EXECUTION_TOOL_NAME,
-    MULTI_TOOL_PARALLEL_NAME, REQUEST_USER_INPUT_NAME, ToolSurfacePolicy, active_tools_for_request,
+    REQUEST_USER_INPUT_NAME, ToolSurfacePolicy, active_tools_for_request,
     build_model_tool_catalog_with_surface, default_synthetic_catalog_tool_names,
     execute_code_execution_tool, is_tool_search_tool, maybe_hydrate_requested_deferred_tool,
     missing_tool_error_message,

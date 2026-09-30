@@ -4679,66 +4679,6 @@ impl Engine {
                         continue;
                     }
 
-                    if tool_name == MULTI_TOOL_PARALLEL_NAME {
-                        let started_at = Instant::now();
-                        let cancel_token = self.cancel_token.clone();
-                        let (terminal, content_blocks) = tokio::select! {
-                            biased;
-                            () = cancel_token.cancelled() => {
-                                (
-                                    ToolExecutionOutcome::cancelled(interrupted_active_tool_result()),
-                                    Vec::new(),
-                                )
-                            },
-                            result = self.execute_parallel_tool(
-                                tool_input.clone(),
-                                tool_registry,
-                                tool_exec_lock.clone(),
-                                tool_context_for_call(batch_tool_context.clone(), &tool_id),
-                            ) => match result {
-                                Ok(rich) => {
-                                    let rich = super::tool_media::project(rich, &self.session.id, &tool_id, &tool_name).await;
-                                    (ToolExecutionOutcome::from_legacy(Ok(rich.result)), rich.content_blocks)
-                                },
-                                Err(err) => (
-                                    ToolExecutionOutcome::from_legacy(Err(err)),
-                                    Vec::new(),
-                                ),
-                            },
-                        };
-                        let terminal = if terminal.status == ToolTerminalStatus::Cancelled {
-                            ToolExecutionOutcome::cancelled(
-                                self.cancelled_active_tool_result(&tool_id, origin_turn_id),
-                            )
-                        } else {
-                            terminal
-                        };
-                        let result = terminal.legacy_result();
-
-                        let _ = self
-                            .tx_event
-                            .send(Event::ToolCallComplete {
-                                model_call: plan.model_call.clone(),
-                                id: tool_id.clone(),
-                                name: tool_name.clone(),
-                                result: result.clone(),
-                            })
-                            .await;
-
-                        outcomes[plan.index] = Some(ToolExecOutcome {
-                            model_call: plan.model_call.clone(),
-                            index: plan.index,
-                            id: tool_id,
-                            name: tool_name,
-                            input: tool_input,
-                            started_at,
-                            terminal,
-                            content_blocks,
-                            original_content_digest: None,
-                        });
-                        continue;
-                    }
-
                     if is_tool_search_tool(&tool_name) {
                         let started_at = Instant::now();
                         // Tool-search activation changes the request-visible
