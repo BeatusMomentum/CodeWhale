@@ -652,7 +652,7 @@ mod tests {
         )
         .unwrap();
         let (client, server_io) = tokio::io::duplex(8192);
-        let (mut writer, mut reader) = tokio::io::split(client);
+        let (mut reader, mut writer) = tokio::io::split(client);
         let (server_reader, server_writer) = tokio::io::split(server_io);
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             tokio::join!(server.run_io(server_reader, server_writer), async {
