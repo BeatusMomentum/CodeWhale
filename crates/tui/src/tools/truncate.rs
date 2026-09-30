@@ -722,8 +722,10 @@ fn stamp_artifact_metadata(
 /// the metadata gains the artifact keys, so the model-context view can name a
 /// ref `retrieve_tool_result` resolves. A result that already has an artifact
 /// (spillover wrote one) is left alone. Returns whether an artifact exists
-/// afterwards. A failed write is logged and reported as `false`; the caller's
-/// footer then says no tool call reaches the rest instead of promising a ref.
+/// afterwards. Publication is immutable: a reused ID may name the same bytes,
+/// but never replace earlier output. A failed write is logged and reported as
+/// `false`; the caller's footer then says no tool call reaches the rest instead
+/// of promising a ref.
 pub(crate) fn preserve_full_output_for_model_context(
     result: &mut ToolResult,
     tool_id: &str,
@@ -739,7 +741,11 @@ pub(crate) fn preserve_full_output_for_model_context(
         return true;
     }
     let artifact_id = crate::artifacts::artifact_id_for_tool_call(tool_id);
-    match crate::artifacts::write_session_artifact(session_id, &artifact_id, &result.content) {
+    match crate::artifacts::write_session_artifact_immutable(
+        session_id,
+        &artifact_id,
+        result.content.as_bytes(),
+    ) {
         Ok((absolute_path, relative_path)) => {
             let record = crate::artifacts::record_tool_output_artifact(
                 session_id,
@@ -1171,6 +1177,68 @@ mod tests {
         let unsaved = fit_to_inline_budget(&content, 120, None, None);
         assert!(unsaved.len() <= 120);
         assert!(!unsaved.contains("retrieve_tool_result"));
+    }
+
+    #[test]
+    fn model_context_archive_reuse_keeps_original_bytes_and_reports_conflicts() {
+        let _guard = setup();
+        let home = tempdir().unwrap();
+        with_test_home(home.path(), || {
+            let provider = crate::config::ApiProvider::Deepseek;
+            let model = "deepseek-v3.2-128k";
+            let budget =
+                crate::route_budget::route_inline_char_budget_for_route(provider, model, None);
+            let original = "a".repeat(budget + 1_000);
+            let prior = serde_json::json!({"prior_key": "prior_value"});
+            let mut first = ToolResult::success(original.clone()).with_metadata(prior.clone());
+            assert!(preserve_full_output_for_model_context(
+                &mut first,
+                "reused-call",
+                "exec_shell",
+                "session-inline",
+            ));
+            let metadata = first.metadata.clone().unwrap();
+            let path = PathBuf::from(metadata["artifact_path"].as_str().unwrap());
+            assert_eq!(fs::read(&path).unwrap(), original.as_bytes());
+            assert_eq!(first.content, original);
+            assert_eq!(metadata["prior_key"], prior["prior_key"]);
+
+            // An identical replay still names the original immutable bytes.
+            let mut identical = ToolResult::success(original.clone()).with_metadata(prior.clone());
+            assert!(preserve_full_output_for_model_context(
+                &mut identical,
+                "reused-call",
+                "exec_shell",
+                "session-inline",
+            ));
+            assert_eq!(identical.metadata.as_ref(), Some(&metadata));
+
+            let changed = "b".repeat(original.len());
+            let mut conflict = ToolResult::success(changed.clone()).with_metadata(prior.clone());
+            assert!(!preserve_full_output_for_model_context(
+                &mut conflict,
+                "reused-call",
+                "exec_shell",
+                "session-inline",
+            ));
+            assert_eq!(fs::read(&path).unwrap(), original.as_bytes());
+            assert_eq!(first.metadata.as_ref(), Some(&metadata));
+            assert_eq!(conflict.content, changed);
+            assert_eq!(conflict.metadata.as_ref(), Some(&prior));
+
+            // Use the real model-context projection, not a fabricated footer.
+            let view = crate::core::engine::compact_tool_result_for_route(
+                provider,
+                model,
+                None,
+                "exec_shell",
+                &conflict,
+            );
+            assert!(view.contains("the full output could not be saved"));
+            assert!(view.contains("no tool call reaches this copy"));
+            assert!(!view.contains("retrieve_tool_result"));
+            assert!(!view.contains("art_reused-call"));
+        });
     }
 
     /// Tests in this module serialize through this guard because they mutate

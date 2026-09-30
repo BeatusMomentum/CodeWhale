@@ -1292,6 +1292,12 @@ fn ordered_rows(
                 })
                 .filter(|node| !is_settled_transient_operation(node))
                 .filter(|node| !surface.is_prior_instance_residue(node))
+                // A plan step dropped from the Plan/To-do list (e.g. the model
+                // cleared it with an empty `todo_write`) stays in the graph
+                // but must leave the rail (#6546).
+                .filter(|node| {
+                    node.kind != NodeKind::PlanStep || snapshot.compat.projects(&node.id)
+                })
                 .enumerate()
                 .map(|(order, node)| RankedWorkRow {
                     bucket: node_bucket(node),
@@ -3629,6 +3635,11 @@ mod tests {
         let mut transient = operation(NodeState::Completed, "settled-op");
         transient.binding.as_mut().expect("binding").durable = true;
         let mut snapshot = WorkGraphSnapshot::new();
+        snapshot.compat.todos.push(CompatTodoBinding {
+            legacy_id: 1,
+            node: plan_step.id.clone(),
+            plan_index: None,
+        });
         snapshot.nodes = vec![plan_step, transient];
 
         let mut surface = surface();
@@ -3766,6 +3777,72 @@ mod tests {
                 .iter()
                 .any(|node| node.title == "operation settled"),
             "projection filtering must retain the historical graph receipt"
+        );
+    }
+
+    /// #6546: clearing the To-do list (an empty `todo_write`) drops the
+    /// compat bindings but keeps the old plan-step nodes in the graph. The
+    /// rail must follow the projection, not every plan step ever written.
+    #[tokio::test]
+    async fn cleared_todo_list_leaves_no_plan_step_rows() {
+        use crate::tools::todo::{TodoList, TodoStatus};
+
+        let todos = crate::tools::todo::new_shared_todo_list();
+        let plan = crate::tools::plan::new_shared_plan_state();
+        let work = crate::work_graph::new_shared_work_runtime(todos.clone(), plan);
+        let mut written = TodoList::new();
+        written.add("stale finished item".to_string(), TodoStatus::Completed);
+        work.apply_todo_update("session-6546", "todo_write", &written.snapshot())
+            .await
+            .expect("write todo");
+        work.publish_pending().await.expect("publish write");
+        let rows_for = |graph: &WorkGraphSnapshot| {
+            graph_rows(
+                &mut surface(),
+                graph,
+                None,
+                Vec::new(),
+                None,
+                SettledFileActivity::default(),
+            )
+            .into_iter()
+            .map(|row| row.label)
+            .collect::<Vec<_>>()
+        };
+        let before = work
+            .capture(Some("session-6546"))
+            .expect("capture")
+            .expect("graph");
+        assert!(
+            rows_for(&before.graph)
+                .iter()
+                .any(|label| label.contains("stale finished item")),
+            "precondition: the written item renders"
+        );
+
+        work.apply_todo_update("session-6546", "todo_write", &TodoList::new().snapshot())
+            .await
+            .expect("clear todos");
+        work.publish_pending().await.expect("publish clear");
+        let after = work
+            .capture(Some("session-6546"))
+            .expect("capture")
+            .expect("graph keeps its history");
+        assert!(after.todos.is_empty());
+        assert!(
+            after
+                .graph
+                .nodes
+                .iter()
+                .any(|node| node.title == "stale finished item"),
+            "precondition: the retired node is still in the graph"
+        );
+        let labels = rows_for(&after.graph);
+        assert!(
+            !labels
+                .iter()
+                .any(|label| label.contains("stale finished item")),
+            "cleared To-do item must leave the rail: {labels:?}"
         );
     }
 

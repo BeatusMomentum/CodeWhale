@@ -490,7 +490,7 @@ Per-server settings:
 - `command` (string, required)
 - `args` (array of strings, optional)
 - `env` (object, optional)
-- `connect_timeout`, `execute_timeout`, `read_timeout` (seconds, optional)
+- `connect_timeout`, `execute_timeout`, `read_timeout` (seconds, optional). `connect_timeout` defaults to 30 and covers spawn, `initialize` and the first `tools/list`, so a cold `uvx`/`npx` package download counts against it.
 - `disabled` (bool, optional)
 - `enabled` (bool, optional, default `true`)
 - `required` (bool, optional): startup/connect validation fails if this server cannot initialize.

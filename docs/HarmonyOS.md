@@ -1,5 +1,7 @@
 # HarmonyOS and OpenHarmony
 
+> 阅读简体中文版：[zh_hans/HarmonyOS.md](zh_hans/HarmonyOS.md)。
+
 This page covers Codewhale on HarmonyOS PC and OpenHarmony cross-build setups.
 
 ## Support Tier

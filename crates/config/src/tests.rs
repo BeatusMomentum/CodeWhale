@@ -3741,6 +3741,26 @@ base_url = "https://acme.example/v1"
 }
 
 #[test]
+fn project_config_unknown_provider_reason_never_echoes_a_pasted_key() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let config_dir = workspace.path().join(CODEWHALE_APP_DIR);
+    fs::create_dir_all(&config_dir).expect("mkdir project config");
+    let key = ["sk-live-", "Z7qX4mNb2Vc9Lk3PwR8t"].concat();
+    fs::write(
+        config_dir.join(CONFIG_FILE_NAME),
+        format!("provider = \"{key}\"\n"),
+    )
+    .expect("write project config");
+
+    let reason = load_project_config_outcome(workspace.path())
+        .invalid()
+        .map(|(_, reason)| reason.to_string())
+        .expect("unknown provider is rejected");
+    assert!(reason.starts_with("unknown provider"), "{reason}");
+    assert!(!reason.contains(&key), "{reason}");
+}
+
+#[test]
 fn malformed_project_config_is_distinguishable_from_a_missing_one() {
     // #4733: the loader returned `None` for both cases. A project config can
     // only *tighten* approval/sandbox posture, so reporting a broken file as
@@ -4215,6 +4235,105 @@ fn config_store_load_fails_on_malformed_config_without_touching_file() {
 }
 
 #[test]
+fn env_api_key_lookup_reads_exactly_each_providers_env_vars() {
+    // `auth print-api-key` and the dispatcher resolve through this lookup; it
+    // used to read a second hand-kept table in the secrets crate that had no
+    // entry for mistral, minimax, zai, orcarouter, google, stepfun, qianfan,
+    // or the Anthropic-dialect routes, so their exported keys were ignored.
+    let _lock = env_lock();
+    let all_vars: std::collections::BTreeSet<&str> = crate::provider::all_providers()
+        .iter()
+        .flat_map(|provider| provider.env_vars().iter().copied())
+        .collect();
+    let saved: Vec<_> = all_vars
+        .iter()
+        .map(|var| (*var, std::env::var_os(var)))
+        .collect();
+    for var in &all_vars {
+        unsafe { std::env::remove_var(var) };
+    }
+    for provider in crate::provider::all_providers() {
+        let kind = provider.kind();
+        let mut reads = Vec::new();
+        for var in &all_vars {
+            unsafe { std::env::set_var(var, "probe-key") };
+            if super::env_api_key_for_provider(kind).as_deref() == Some("probe-key") {
+                reads.push(*var);
+            }
+            unsafe { std::env::remove_var(var) };
+        }
+        // Xiaomi MiMo's token-plan variables are read only by the mode-aware
+        // lookup, never by this generic fallback.
+        let mut declared = if kind == ProviderKind::XiaomiMimo {
+            super::XIAOMI_MIMO_STANDARD_ENV_VARS.to_vec()
+        } else {
+            provider.env_vars().to_vec()
+        };
+        declared.sort_unstable();
+        assert_eq!(reads, declared, "{}", kind.as_str());
+    }
+    for (var, value) in saved {
+        if let Some(value) = value {
+            unsafe { std::env::set_var(var, value) };
+        }
+    }
+}
+
+#[test]
+fn toml_errors_name_line_and_column_but_never_the_value() {
+    // A type error's message quotes the string (`invalid type: string "…"`)
+    // and a syntax error's snippet quotes the whole line; both can carry a
+    // credential, so every layer reports only where the error is.
+    let canary = "LEAKCANARY0123456789";
+    let secret = format!("sk-live-{canary}");
+    let cases = [
+        (
+            format!("model = \"x\"\ntelemetry = \"{secret}\"\n"),
+            "line 2, column 13, in `telemetry`",
+        ),
+        (
+            format!("model = \"x\"\n\n[providers.xai]\napi_key = \"{secret}\" junk\n"),
+            "line 4, column",
+        ),
+    ];
+    for (body, location) in &cases {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = dir.path().join(CONFIG_FILE_NAME);
+        fs::write(&config_path, body).expect("write config");
+        let error = format!(
+            "{:#}",
+            ConfigStore::load(Some(config_path)).expect_err("invalid config")
+        );
+        assert!(!error.contains(canary), "{error}");
+        assert!(error.contains(location), "{error}");
+
+        let workspace = tempfile::tempdir().expect("workspace");
+        let project_dir = workspace.path().join(CODEWHALE_APP_DIR);
+        fs::create_dir_all(&project_dir).expect("project dir");
+        fs::write(project_dir.join(CONFIG_FILE_NAME), body).expect("write project config");
+        let outcome = load_project_config_outcome(workspace.path());
+        let (_, reason) = outcome.invalid().expect("invalid project config");
+        assert!(!reason.contains(canary), "{reason}");
+        assert!(reason.contains(location), "{reason}");
+    }
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config_path = dir.path().join(CONFIG_FILE_NAME);
+    fs::write(&config_path, "model = \"x\"\n").expect("write config");
+    fs::write(
+        dir.path().join(PERMISSIONS_FILE_NAME),
+        format!("[[rules]]\ntool = \"{secret}\" junk\n"),
+    )
+    .expect("write permissions");
+    let error = format!(
+        "{:#}",
+        load_permissions_snapshot(Some(config_path)).expect_err("invalid permissions")
+    );
+    assert!(!error.contains(canary), "{error}");
+    assert!(error.contains("line 2, column"), "{error}");
+}
+
+#[test]
 fn config_store_rendered_body_preserves_comments_at_legacy_deepseek_path() {
     // #3410 legacy case: a config still living under `.deepseek/` keeps its
     // comments when written back through a transaction at the same path.
@@ -4560,11 +4679,11 @@ fn fireworks_and_together_base_url_and_auth_metadata() {
         std::env::set_var("TOGETHER_API_KEY", "tg-test-key");
     }
     assert_eq!(
-        codewhale_secrets::env_for("fireworks").as_deref(),
+        super::env_api_key_for_provider(ProviderKind::Fireworks).as_deref(),
         Some("fw-test-key")
     );
     assert_eq!(
-        codewhale_secrets::env_for("together").as_deref(),
+        super::env_api_key_for_provider(ProviderKind::Together).as_deref(),
         Some("tg-test-key")
     );
     unsafe {
@@ -4676,7 +4795,7 @@ fn config_store_preserves_builtin_shadowing_custom_and_regional_selectors() {
             assert_eq!(route.base_url, "https://gateway.example/v1");
             assert_eq!(route.model, "Exact-Model");
         }
-        store.config.set_value("verbosity", "quiet").unwrap();
+        store.config.set_value("verbosity", "concise").unwrap();
         store.save().unwrap();
         let saved: toml::Value = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(saved["provider"].as_str(), Some(selector));
@@ -4746,7 +4865,7 @@ fn kindless_table_mirroring_a_builtin_alias_keeps_the_builtin_route() {
     assert_eq!(store.config.provider_id(), "deepseek-cn");
     assert!(store.config.named_custom_provider_id().is_none());
     // An unrelated typed save leaves the inert extras table untouched.
-    store.config.set_value("verbosity", "quiet").unwrap();
+    store.config.set_value("verbosity", "concise").unwrap();
     store.save().unwrap();
     let saved: toml::Value = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
     assert_eq!(saved["provider"].as_str(), Some("deepseek-cn"));
@@ -5021,7 +5140,7 @@ model = "opencode-go/glm-5.2"
         std::env::set_var("OPENCODE_GO_MODEL", "opencode-go/mimo-v2.5-pro");
     }
     assert_eq!(
-        codewhale_secrets::env_for("opencode-go").as_deref(),
+        super::env_api_key_for_provider(ProviderKind::OpencodeGo).as_deref(),
         Some("go-env-key")
     );
     let resolved = config.resolve_runtime_options(&CliRuntimeOverrides::default());
@@ -5105,7 +5224,7 @@ model = "glm-5.2"
         std::env::set_var("TELECOMJS_MODEL", "kimi-k2.5");
     }
     assert_eq!(
-        codewhale_secrets::env_for("tokenhub").as_deref(),
+        super::env_api_key_for_provider(ProviderKind::Telecomjs).as_deref(),
         Some("telecom-env-key")
     );
 
@@ -7411,6 +7530,25 @@ fn xiaomi_mimo_env_pay_as_you_go_mode_prefers_standard_key() {
 }
 
 #[test]
+fn xiaomi_mimo_pay_as_you_go_mode_never_falls_back_to_a_token_plan_key() {
+    let _lock = env_lock();
+    let _env = EnvGuard::without_deepseek_runtime_overrides();
+    // Safety: test-only environment mutation guarded by a module mutex.
+    unsafe {
+        env::set_var("DEEPSEEK_PROVIDER", "xiaomi-mimo");
+        env::set_var("XIAOMI_MIMO_MODE", "pay-as-you-go");
+        env::set_var("MIMO_TOKEN_PLAN_API_KEY", "tp-env-key");
+    }
+
+    let resolved = ConfigToml::default().resolve_runtime_options(&CliRuntimeOverrides::default());
+
+    assert_eq!(resolved.provider, ProviderKind::XiaomiMimo);
+    assert_eq!(resolved.base_url, XIAOMI_MIMO_PAY_AS_YOU_GO_BASE_URL);
+    assert_eq!(resolved.api_key, None);
+    assert_eq!(resolved.api_key_source, None);
+}
+
+#[test]
 fn novita_env_overrides_key_and_model_when_config_missing() {
     let _lock = env_lock();
     let _env = EnvGuard::without_deepseek_runtime_overrides();
@@ -9635,6 +9773,35 @@ fn retired_output_mode_key_still_loads_and_survives_a_typed_save() {
 }
 
 #[test]
+fn closed_choice_writes_validate_before_mutation_and_redact_pasted_credentials() {
+    let mut config = ConfigToml::default();
+    let token = ["sk-live-", "Z7qX4mNb2Vc9Lk3PwR8t"].concat();
+    for key in ["approval_policy", "sandbox_mode", "verbosity"] {
+        for choice in config_toml_choices(key).unwrap() {
+            let value = format!(" {} ", choice.to_ascii_uppercase());
+            config
+                .set_value(key, &value)
+                .expect("reader accepts normalized choice");
+            assert_eq!(config.get_value(key).as_deref(), Some(value.as_str()));
+        }
+        let before = toml::to_string(&config).unwrap();
+        for value in ["misspelled-choice", token.as_str()] {
+            let error = config.set_value(key, value).expect_err("invalid choice");
+            let message = error.to_string();
+            assert!(message.contains(key), "{message}");
+            assert!(message.contains("fix: codewhale config set"), "{message}");
+            assert!(!message.contains(&token), "{message}");
+            assert!(message.contains(if value == token { "[redacted]" } else { value }));
+            assert_eq!(
+                toml::to_string(&config).unwrap(),
+                before,
+                "{key} changed on refusal"
+            );
+        }
+    }
+}
+
+#[test]
 fn declared_setting_writes_keep_schema_type_and_refuse_bad_values() {
     let mut config = ConfigToml::default();
     config.set_value("allow_shell", "off").unwrap();
@@ -9866,7 +10033,7 @@ api_key = "sk-table"
 
         let mut store = ConfigStore::load(Some(path.clone())).unwrap();
         assert!(store.legacy_root_migration().has_pending_moves());
-        store.config.set_value("verbosity", "high").unwrap();
+        store.config.set_value("verbosity", "normal").unwrap();
         store.save().unwrap();
 
         let raw = raw_table(&path);
@@ -9917,7 +10084,7 @@ api_key = "sk-table"
             store.legacy_root_migration().unresolved_conflicts().count(),
             2
         );
-        store.config.set_value("verbosity", "high").unwrap();
+        store.config.set_value("verbosity", "normal").unwrap();
         store.save().unwrap();
         let raw = raw_table(&path);
         assert_eq!(
@@ -10086,4 +10253,486 @@ api_key = "sk-table"
         // endpoint sits in a table nothing merges into the user's routing.
         assert_eq!(project_config.approval_policy.as_deref(), Some("never"));
     }
+}
+
+#[test]
+fn typed_save_round_trips_every_builtin_provider_selector() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join(CONFIG_FILE_NAME);
+    let mismatched: Vec<String> = provider::all_providers()
+        .iter()
+        .map(|entry| entry.kind())
+        .filter_map(|kind| {
+            let serialized = toml::Value::try_from(kind).expect("serialize provider kind");
+            (serialized.as_str() != Some(kind.as_str()))
+                .then(|| format!("{} -> {serialized}", kind.as_str()))
+        })
+        .collect();
+    assert!(
+        mismatched.is_empty(),
+        "serde spelling must be the canonical id: {mismatched:?}"
+    );
+    for entry in provider::all_providers() {
+        let kind = entry.kind();
+        fs::write(&path, format!("provider = \"{}\"\n", entry.id())).expect("write config");
+        let Ok(mut store) = ConfigStore::load(Some(path.clone())) else {
+            // A retired tombstone may refuse to load; it must not be written.
+            continue;
+        };
+        store
+            .config
+            .set_value("verbosity", "concise")
+            .expect("set verbosity");
+        store.save().expect("typed save");
+        let reloaded = ConfigStore::load(Some(path.clone()))
+            .unwrap_or_else(|err| panic!("reload after saving {}: {err:#}", entry.id()));
+        assert_eq!(reloaded.config.provider, kind, "{}", entry.id());
+    }
+}
+
+#[test]
+fn legacy_siliconflow_cn_spelling_loads_and_is_repaired_on_save() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join(CONFIG_FILE_NAME);
+    fs::write(&path, "provider = \"siliconflow-c-n\"\n").expect("write config");
+    let mut store = ConfigStore::load(Some(path.clone())).expect("load legacy spelling");
+    assert_eq!(store.config.provider, ProviderKind::SiliconflowCN);
+    store
+        .config
+        .set_value("verbosity", "concise")
+        .expect("set verbosity");
+    store.save().expect("typed save");
+    let body = fs::read_to_string(&path).expect("read config");
+    assert!(body.contains("provider = \"siliconflow-CN\""), "{body}");
+}
+
+#[test]
+fn typed_save_keeps_a_providers_section_holding_only_a_legacy_kind_table() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join(CONFIG_FILE_NAME);
+    for entry in provider::all_providers() {
+        let key = entry.provider_config_key();
+        fs::write(&path, format!("[providers.{key}]\nmodel = \"m-x\"\n")).expect("write config");
+        let Ok(mut store) = ConfigStore::load(Some(path.clone())) else {
+            continue;
+        };
+        store
+            .config
+            .set_value("verbosity", "concise")
+            .expect("set verbosity");
+        store.save().expect("typed save");
+        let body = fs::read_to_string(&path).expect("read config");
+        assert!(
+            body.contains("m-x"),
+            "[providers.{key}] was dropped by a typed save:\n{body}"
+        );
+    }
+}
+
+#[test]
+fn typed_save_keeps_runtime_owned_keys_in_typed_sub_tables() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join(CONFIG_FILE_NAME);
+    fs::write(
+        &path,
+        "[snapshots]\nmax_workspace_gb = 8\n\n[skills]\nscan_codewhale_only = true\n\n\
+         [network]\nfuture_network_key = \"kept\"\n\n[lsp]\nfuture_lsp_key = 3\n",
+    )
+    .expect("write config");
+    let mut store = ConfigStore::load(Some(path.clone())).expect("load config");
+    store
+        .config
+        .set_value("verbosity", "concise")
+        .expect("set verbosity");
+    store.save().expect("typed save");
+    let saved: toml::Table = toml::from_str(&fs::read_to_string(&path).expect("read config"))
+        .expect("parse saved config");
+    assert_eq!(
+        saved["snapshots"].get("max_workspace_gb"),
+        Some(&toml::Value::Integer(8))
+    );
+    assert_eq!(
+        saved["skills"].get("scan_codewhale_only"),
+        Some(&toml::Value::Boolean(true))
+    );
+    assert_eq!(
+        saved["network"].get("future_network_key"),
+        Some(&toml::Value::String("kept".to_string()))
+    );
+    assert_eq!(
+        saved["lsp"].get("future_lsp_key"),
+        Some(&toml::Value::Integer(3))
+    );
+}
+
+const NAMED_CUSTOM_WITH_LEGACY_CUSTOM: &str = r#"provider = "acme"
+
+[providers.acme]
+kind = "openai-compatible"
+base_url = "https://acme.example/v1"
+model = "acme-model"
+context_window = CONTEXT_WINDOW
+
+[providers.custom]
+base_url = "https://legacy-custom.example/v1"
+model = "legacy-model"
+api_key = "legacy-custom-key-1234567890"
+"#;
+
+#[test]
+fn named_custom_provider_with_invalid_table_is_rejected_on_load() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join(CONFIG_FILE_NAME);
+    fs::write(
+        &path,
+        NAMED_CUSTOM_WITH_LEGACY_CUSTOM.replace("CONTEXT_WINDOW", "\"big-secret-value\""),
+    )
+    .expect("write config");
+    let err = ConfigStore::load(Some(path)).expect_err("invalid named table must not load");
+    let message = format!("{err:#}");
+    assert!(message.contains("[providers.acme]"), "{message}");
+    assert!(!message.contains("big-secret-value"), "{message}");
+}
+
+#[test]
+fn named_custom_provider_never_resolves_to_legacy_custom_table() {
+    let _lock = env_lock();
+    let _env = EnvGuard::without_deepseek_runtime_overrides();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join(CONFIG_FILE_NAME);
+    fs::write(
+        &path,
+        NAMED_CUSTOM_WITH_LEGACY_CUSTOM.replace("CONTEXT_WINDOW", "128000"),
+    )
+    .expect("write config");
+    let mut store = ConfigStore::load(Some(path)).expect("load valid named table");
+    let resolved = store
+        .config
+        .resolve_runtime_options(&CliRuntimeOverrides::default());
+    assert_eq!(resolved.base_url, "https://acme.example/v1");
+
+    // The table turns invalid after binding: resolution fails closed instead
+    // of reading `[providers.custom]`.
+    store
+        .config
+        .providers
+        .extras
+        .get_mut("acme")
+        .and_then(toml::Value::as_table_mut)
+        .expect("acme table")
+        .insert("context_window".to_string(), toml::Value::from("big"));
+    let resolved = store
+        .config
+        .resolve_runtime_options(&CliRuntimeOverrides::default());
+    assert!(
+        !resolved.base_url.contains("legacy-custom"),
+        "{}",
+        resolved.base_url
+    );
+    assert_ne!(resolved.model, "legacy-model");
+    assert_ne!(
+        resolved.api_key.as_deref(),
+        Some("legacy-custom-key-1234567890")
+    );
+}
+
+#[test]
+fn deepseek_scoped_headers_and_model_stay_out_of_root_keys() -> Result<()> {
+    let _lock = env_lock();
+    let _env = EnvGuard::without_deepseek_runtime_overrides();
+    let mut config = ConfigToml::default();
+    config.set_value("providers.deepseek.http_headers", "X-Gateway-Key=ds-only")?;
+    config.set_value("providers.deepseek.model", "deepseek-v4-pro")?;
+    assert!(config.http_headers.is_empty());
+    assert_eq!(config.default_text_model, None);
+
+    config.set_value("provider", "openrouter")?;
+    let resolved = config.resolve_runtime_options(&CliRuntimeOverrides::default());
+    assert!(
+        !resolved.http_headers.contains_key("X-Gateway-Key"),
+        "{:?}",
+        resolved.http_headers
+    );
+
+    // Root values the user set apart survive unsetting the provider leg,
+    // while a mirrored copy left by an earlier release is cleared with it.
+    config.set_value("http_headers", "X-Everywhere=root")?;
+    config.set_value("default_text_model", "root-model")?;
+    config.unset_value("providers.deepseek.http_headers")?;
+    config.unset_value("providers.deepseek.model")?;
+    assert_eq!(
+        config.http_headers.get("X-Everywhere").map(String::as_str),
+        Some("root")
+    );
+    assert_eq!(config.default_text_model.as_deref(), Some("root-model"));
+
+    config.set_value("providers.deepseek.http_headers", "X-Everywhere=root")?;
+    config.unset_value("providers.deepseek.http_headers")?;
+    assert!(config.http_headers.is_empty());
+    Ok(())
+}
+
+#[test]
+fn key_and_cookie_names_are_classified_as_sensitive() {
+    for name in [
+        "Ocp-Apim-Subscription-Key",
+        "Cookie",
+        "Set-Cookie",
+        "secret_key",
+        "access_key",
+        "private_key",
+        "providers.acme.secret_key",
+        "X-Api-Key",
+        "api_key",
+    ] {
+        assert!(is_sensitive_config_key(name), "{name}");
+        assert!(is_upstream_auth_header(name), "{name}");
+    }
+    for name in [
+        "api_key_env",
+        "public_key",
+        "base_url",
+        "model",
+        "X-Model-Provider-Id",
+    ] {
+        assert!(!is_sensitive_config_key(name), "{name}");
+    }
+
+    let mut config = ConfigToml::default();
+    config.http_headers.insert(
+        "Ocp-Apim-Subscription-Key".to_string(),
+        "apim-value-0123456789abcdef".to_string(),
+    );
+    let listed = config.list_values();
+    let shown = listed.get("http_headers").expect("headers listed");
+    assert!(!shown.contains("apim-value-0123456789abcdef"), "{shown}");
+}
+
+#[test]
+fn config_backup_strips_every_credential_named_key() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join(CONFIG_FILE_NAME);
+    let original = r#"chatgpt_access_token = "root-access-token-value"
+model = "deepseek-v4-pro"
+
+[lifecycle_outbox]
+path = "/tmp/outbox.jsonl"
+webhook_token = "webhook-token-value"
+
+[providers.openrouter]
+api_key = "provider-api-key-value"
+auth_mode = "api_key"
+
+[providers.openrouter.http_headers]
+Authorization = "Bearer header-bearer-value"
+X-Title = "kept-title"
+
+[future_section]
+profiles = [{ secret_key = "inline-array-secret-value", label = "kept-label" }]
+"#;
+    fs::write(&path, original).expect("seed config");
+
+    let mut store = ConfigStore::load(Some(path.clone())).expect("load config");
+    store.config.model = Some("deepseek-v4-flash".to_string());
+    store.save().expect("changed save");
+
+    let backup = fs::read_to_string(config_backup_path(&path)).expect("read backup");
+    for secret in [
+        "root-access-token-value",
+        "webhook-token-value",
+        "provider-api-key-value",
+        "header-bearer-value",
+        "inline-array-secret-value",
+    ] {
+        assert!(
+            !backup.contains(secret),
+            "{secret} left in backup:\n{backup}"
+        );
+    }
+    for kept in [
+        "auth_mode = \"api_key\"",
+        "kept-title",
+        "kept-label",
+        "model = \"deepseek-v4-pro\"",
+    ] {
+        assert!(
+            backup.contains(kept),
+            "{kept} missing from backup:\n{backup}"
+        );
+    }
+}
+
+#[test]
+fn blank_or_unrecognized_env_overrides_do_not_shadow_config_or_legacy_vars() {
+    let _lock = env_lock();
+    let _env = EnvGuard::without_deepseek_runtime_overrides();
+    let names = [
+        "CODEWHALE_AUTH_MODE",
+        "DEEPSEEK_AUTH_MODE",
+        "CODEWHALE_SANDBOX_MODE",
+        "DEEPSEEK_SANDBOX_MODE",
+    ];
+    let saved: Vec<(&str, Option<OsString>)> = names
+        .iter()
+        .map(|name| (*name, env::var_os(name)))
+        .collect();
+    // SAFETY: env mutation is serialized by `env_lock` and restored below.
+    unsafe {
+        env::set_var("CODEWHALE_AUTH_MODE", "");
+        env::remove_var("DEEPSEEK_AUTH_MODE");
+        env::set_var("CODEWHALE_SANDBOX_MODE", " ");
+        env::set_var("DEEPSEEK_SANDBOX_MODE", "workspace-write");
+        env::set_var("CODEWHALE_PROVIDER", "openroutr");
+        env::set_var("DEEPSEEK_PROVIDER", "openrouter");
+    }
+
+    let mut config = ConfigToml {
+        auth_mode: Some("api_key".to_string()),
+        ..ConfigToml::default()
+    };
+    config.provider = ProviderKind::Deepseek;
+    let resolved = config.resolve_runtime_options(&CliRuntimeOverrides::default());
+    let env_overrides = EnvRuntimeOverrides::load();
+
+    unsafe {
+        for (name, value) in saved {
+            match value {
+                Some(value) => env::set_var(name, value),
+                None => env::remove_var(name),
+            }
+        }
+    }
+
+    assert_eq!(resolved.auth_mode.as_deref(), Some("api_key"));
+    assert_eq!(
+        env_overrides.sandbox_mode.as_deref(),
+        Some("workspace-write")
+    );
+    assert_eq!(resolved.provider, ProviderKind::Openrouter);
+    assert!(matches!(
+        resolved.provider_source,
+        ProviderSource::Env("DEEPSEEK_PROVIDER")
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn failed_legacy_state_copy_leaves_no_partial_primary() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let legacy = dir.path().join("legacy-sessions");
+    let primary = dir.path().join("primary").join("sessions");
+    fs::create_dir_all(legacy.join("nested")).expect("legacy dir");
+    fs::create_dir_all(primary.parent().expect("parent")).expect("primary root");
+    fs::write(legacy.join("a.json"), b"a").expect("file a");
+    let unreadable = legacy.join("nested").join("b.json");
+    fs::write(&unreadable, b"b").expect("file b");
+    fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000)).expect("chmod");
+    let readable_anyway = fs::read(&unreadable).is_ok();
+
+    let result = copy_dir_into_place(&legacy, &primary);
+    fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o644)).expect("chmod back");
+    if readable_anyway {
+        // Running as root: permissions cannot force the failure.
+        return;
+    }
+    assert!(result.is_err());
+    assert!(
+        !primary.exists(),
+        "a failed copy must not create the primary"
+    );
+    assert_eq!(
+        fs::read_dir(primary.parent().unwrap()).unwrap().count(),
+        0,
+        "a failed copy removes only its owned staging directory"
+    );
+
+    copy_dir_into_place(&legacy, &primary).expect("retry succeeds");
+    assert_eq!(fs::read(primary.join("a.json")).expect("a"), b"a");
+    assert_eq!(
+        fs::read(primary.join("nested").join("b.json")).expect("b"),
+        b"b"
+    );
+}
+
+#[test]
+fn legacy_state_copy_preserves_another_attempts_staging_directory() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let legacy = root.path().join("legacy");
+    let primary = root.path().join("sessions");
+    let other_staging = root.path().join(".sessions.migrating");
+    fs::create_dir_all(&legacy).expect("legacy");
+    fs::create_dir_all(&other_staging).expect("other attempt");
+    fs::write(legacy.join("session.json"), b"source").expect("source");
+    fs::write(other_staging.join("in-flight.json"), b"other attempt").expect("marker");
+
+    copy_dir_into_place(&legacy, &primary).expect("copy");
+    assert_eq!(fs::read(primary.join("session.json")).unwrap(), b"source");
+    assert_eq!(
+        fs::read(other_staging.join("in-flight.json")).unwrap(),
+        b"other attempt"
+    );
+    assert!(legacy.join("session.json").exists());
+    let siblings: Vec<_> = fs::read_dir(root.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(siblings.len(), 3, "only this attempt's staging is removed");
+}
+
+#[test]
+fn legacy_state_copy_preserves_a_completed_primary() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let legacy = root.path().join("legacy");
+    let primary = root.path().join("sessions");
+    fs::create_dir_all(&legacy).expect("legacy");
+    fs::create_dir_all(&primary).expect("completed primary");
+    fs::write(legacy.join("session.json"), b"legacy").expect("source");
+    fs::write(primary.join("session.json"), b"newer").expect("primary");
+
+    assert!(copy_dir_into_place(&legacy, &primary).is_err());
+    assert_eq!(fs::read(primary.join("session.json")).unwrap(), b"newer");
+    assert_eq!(fs::read(legacy.join("session.json")).unwrap(), b"legacy");
+    assert_eq!(fs::read_dir(root.path()).unwrap().count(), 2);
+}
+
+#[cfg(unix)]
+#[test]
+fn ensure_state_dir_keeps_legacy_authoritative_until_migration_succeeds() {
+    use std::os::unix::fs::PermissionsExt;
+    let _lock = env_lock();
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    let state_env = StateDirEnv::install(unique);
+    fs::create_dir_all(state_env.legacy("sessions")).expect("legacy dir");
+    fs::write(state_env.legacy("sessions").join("old.json"), b"legacy").expect("legacy file");
+    let root = state_env.home.join(CODEWHALE_APP_DIR);
+    fs::create_dir_all(&root).expect("codewhale root");
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o555)).expect("chmod root");
+    let root_writable = fs::write(root.join("probe"), b"").is_ok();
+
+    let first = ensure_state_dir_with_migration("sessions");
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).expect("chmod back");
+    if !root_writable {
+        let (dir, migration) = first.expect("ensure_state_dir falls back to legacy");
+        assert_eq!(dir, state_env.legacy("sessions"));
+        assert!(migration.is_none());
+        assert!(!state_env.primary("sessions").exists());
+        assert_eq!(
+            resolve_state_dir("sessions").expect("resolve"),
+            state_env.legacy("sessions")
+        );
+
+        // Once the primary root is writable again the migration retries.
+        let (dir, migration) = ensure_state_dir_with_migration("sessions").expect("retry");
+        assert_eq!(dir, state_env.primary("sessions"));
+        assert!(migration.is_some());
+        assert_eq!(
+            fs::read(state_env.primary("sessions").join("old.json")).expect("migrated"),
+            b"legacy"
+        );
+    }
+    let _ = fs::remove_dir_all(&state_env.home);
 }

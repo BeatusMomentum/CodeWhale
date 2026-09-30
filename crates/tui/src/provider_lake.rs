@@ -4233,4 +4233,76 @@ mod tests {
             "an unattested correction cannot survive the roster's omission"
         );
     }
+
+    /// #6705: through the production runtime resolver, a curated Zen
+    /// transport row wins over a Models.dev row for the same id, a
+    /// catalog-only row routes on the wire its row declares, and a deprecated
+    /// catalog row stays unroutable.
+    #[test]
+    fn opencode_zen_runtime_resolver_keeps_curated_wire_over_models_dev_row() {
+        use codewhale_config::models_dev::ModelsDevCatalog;
+        use codewhale_config::route::{LogicalModelRef, RequestProtocol, RouteError, RouteRequest};
+
+        let _live = lock_live_snapshot();
+        clear_live_snapshot();
+        let raw = r#"{
+          "providers": {
+            "opencode": {
+              "id": "opencode",
+              "npm": "@ai-sdk/openai-compatible",
+              "models": {
+                "gpt-5.6-sol": { "id": "gpt-5.6-sol", "provider": { "npm": "@ai-sdk/anthropic" } },
+                "claude-opus-9": { "id": "claude-opus-9", "provider": { "npm": "@ai-sdk/anthropic" } },
+                "claude-2-retired": {
+                  "id": "claude-2-retired",
+                  "status": "deprecated",
+                  "provider": { "npm": "@ai-sdk/anthropic" }
+                }
+              }
+            }
+          }
+        }"#;
+        let catalog = ModelsDevCatalog::parse_json(raw).expect("fixture parses");
+        set_live_snapshot(
+            CatalogSnapshot {
+                offerings: codewhale_config::catalog::live_offerings_from_models_dev(&catalog, 1),
+            },
+            LiveSource::ModelsDev,
+        );
+
+        let provider = ApiProvider::OpencodeZen;
+        let resolver = runtime_catalog_resolver_for_identity(
+            provider,
+            None,
+            provider.default_base_url(),
+            CatalogStatus::Unknown,
+        )
+        .resolver;
+        let resolve = |model: &str| {
+            resolver.resolve(&RouteRequest {
+                explicit_provider: provider.kind(),
+                model_selector: Some(LogicalModelRef::from(model)),
+                saved_provider_model: None,
+                base_url_override: None,
+                limit_overrides: Vec::new(),
+            })
+        };
+
+        let curated = resolve("gpt-5.6-sol").expect("curated Zen row resolves");
+        assert_eq!(
+            curated.protocol(),
+            RequestProtocol::Responses,
+            "the curated transport row must win over the catalog's conflicting row"
+        );
+        let catalog_only = resolve("claude-opus-9").expect("catalog-proven Zen row resolves");
+        assert_eq!(catalog_only.protocol(), RequestProtocol::AnthropicMessages);
+        match resolve("claude-2-retired") {
+            Err(RouteError::UnsupportedModelProtocol { endpoint_key, .. }) => {
+                assert_eq!(endpoint_key, "deprecated");
+            }
+            other => panic!("a deprecated Zen row must fail closed, got {other:?}"),
+        }
+
+        clear_live_snapshot();
+    }
 }

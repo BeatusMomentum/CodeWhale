@@ -600,9 +600,6 @@ impl ChatWidget {
 
         app.viewport.last_transcript_area = Some(transcript_area);
         app.viewport.last_transcript_padding_top = 0;
-        let detail_target_cell = (!app.viewport.transcript_selection.is_active())
-            .then(|| app.detail_cell_index_for_viewport(top, visible_lines, line_meta))
-            .flatten();
 
         let end = (top + visible_lines).min(total_lines);
         let mut lines = if total_lines == 0 {
@@ -655,16 +652,12 @@ impl ChatWidget {
             app.last_send_at = None;
         }
 
-        if let Some(target_cell) = detail_target_cell {
-            apply_detail_target_highlight(
-                &mut lines,
-                top,
-                target_cell,
-                line_meta,
-                &app.collapsed_cell_map,
-            );
-        }
-
+        // No background "highlight" for the Alt+V detail target: it used to
+        // paint the target cell's spans `Color::Reset`, which is invisible on
+        // terminal-owned themes and a black hole on painted surfaces
+        // (Underwater, Shoreline): the cell's text sat on the terminal's own
+        // background, and CJK trailing columns left black remnants when the
+        // cell scrolled (#6704). The footer's `Alt+V:details` hint names it.
         apply_selection(&mut lines, top, app);
 
         if let Some(pin) = pinned_prompt {
@@ -3502,24 +3495,20 @@ impl Renderable for ElevationWidget<'_> {
                 Style::default()
             };
 
-            let (key, label_id, desc_id) = match option {
+            let (label_id, desc_id) = match option {
                 ElevationOption::WithNetwork => (
-                    "n",
                     MessageId::ElevationOptionNetwork,
                     MessageId::ElevationOptionNetworkDesc,
                 ),
                 ElevationOption::WithWriteAccess(_) => (
-                    "w",
                     MessageId::ElevationOptionWrite,
                     MessageId::ElevationOptionWriteDesc,
                 ),
                 ElevationOption::FullAccess => (
-                    "f",
                     MessageId::ElevationOptionFullAccess,
                     MessageId::ElevationOptionFullAccessDesc,
                 ),
                 ElevationOption::Abort => (
-                    "a",
                     MessageId::ElevationOptionAbort,
                     MessageId::ElevationOptionAbortDesc,
                 ),
@@ -3534,8 +3523,8 @@ impl Renderable for ElevationWidget<'_> {
             lines.push(Line::from(vec![
                 Span::raw("  "),
                 Span::styled(
-                    format!("[{key}] "),
-                    Style::default().fg(palette::STATUS_SUCCESS),
+                    format!("{} ", crate::tui::glyphs::selection_marker(is_selected)),
+                    style,
                 ),
                 Span::styled(tr(self.locale, label_id), style.fg(label_color)),
             ]));
@@ -3559,12 +3548,39 @@ impl Renderable for ElevationWidget<'_> {
         let inner_width = popup_width.saturating_sub(CHROME);
         let max_inner_height = area.height.saturating_sub(2).saturating_sub(CHROME);
 
+        // The same binding table routes these keys. Reserve its hint alongside
+        // the choices so truncating the denial never hides keyboard access.
+        use crate::tui::shell_key_routing::{ShellBindingId, binding};
+        let controls = Line::from(Span::styled(
+            format!(
+                "  {}/{} · {} · {}",
+                binding(ShellBindingId::ElevationUp).footer_chord,
+                binding(ShellBindingId::ElevationDown).footer_chord,
+                binding(ShellBindingId::ElevationConfirm).footer_chord,
+                binding(ShellBindingId::ElevationAbort).footer_chord,
+            ),
+            Style::default().fg(palette::TEXT_MUTED),
+        ));
+        let controls_rows = measure_wrapped_rows(std::slice::from_ref(&controls), inner_width);
+        // Elevation has no details pager. Do not reuse the initial-approval
+        // hint that advertises a details shortcut this card cannot handle.
+        let truncation_hint = Line::from(Span::styled(
+            "  …",
+            Style::default().fg(palette::TEXT_MUTED),
+        ));
+        let truncation_rows =
+            measure_wrapped_rows(std::slice::from_ref(&truncation_hint), inner_width);
+
         let mut option_lines = lines.split_off(option_start);
         // Each option is a label row followed by a description row. On a terminal
         // too small for both, the description is chrome and the choice is
         // content, so the descriptions go first and every option keeps its row.
         let mut rows_per_option = 2usize;
-        if measure_wrapped_rows(&option_lines, inner_width) > max_inner_height {
+        if measure_wrapped_rows(&option_lines, inner_width)
+            .saturating_add(controls_rows)
+            .saturating_add(2 + truncation_rows)
+            > max_inner_height
+        {
             option_lines = option_lines
                 .into_iter()
                 .enumerate()
@@ -3572,21 +3588,35 @@ impl Renderable for ElevationWidget<'_> {
                 .collect();
             rows_per_option = 1;
         }
-        let option_rows = measure_wrapped_rows(&option_lines, inner_width);
-        // Trim the denial detail down to the title rather than the option list.
+        let option_rows =
+            measure_wrapped_rows(&option_lines, inner_width).saturating_add(controls_rows);
+        // Empty separators are chrome. Remove them before truncating useful
+        // detail; on the smallest frame even the preamble can go, since the
+        // border still names the card and the choices must remain reachable.
+        if measure_wrapped_rows(&lines, inner_width)
+            .saturating_add(option_rows)
+            .saturating_add(truncation_rows)
+            > max_inner_height
+        {
+            lines.retain(|line| line.width() != 0);
+        }
         let mut truncated = false;
-        while lines.len() > 2
-            && measure_wrapped_rows(&lines, inner_width).saturating_add(option_rows)
+        while !lines.is_empty()
+            && measure_wrapped_rows(&lines, inner_width)
+                .saturating_add(option_rows)
+                .saturating_add(truncation_rows)
                 > max_inner_height
         {
             lines.pop();
             truncated = true;
         }
-        if truncated {
-            lines.push(Line::from(Span::styled(
-                approval_truncation_hint(self.locale),
-                Style::default().fg(palette::TEXT_MUTED),
-            )));
+        if truncated
+            && measure_wrapped_rows(&lines, inner_width)
+                .saturating_add(option_rows)
+                .saturating_add(truncation_rows)
+                <= max_inner_height
+        {
+            lines.push(truncation_hint);
         }
 
         // Row offsets are measured after wrapping, not counted in source lines:
@@ -3603,6 +3633,7 @@ impl Renderable for ElevationWidget<'_> {
             offsets
         };
         lines.extend(option_lines);
+        lines.push(controls);
 
         let popup_height = measure_wrapped_rows(&lines, inner_width)
             .saturating_add(CHROME)
@@ -3684,30 +3715,6 @@ fn apply_selection(lines: &mut [Line<'static>], top: usize, app: &App) {
         }
 
         line.spans = apply_selection_to_line(line, col_start, col_end, selection_style);
-    }
-}
-
-fn apply_detail_target_highlight(
-    lines: &mut [Line<'static>],
-    top: usize,
-    target_cell: usize,
-    line_meta: &[TranscriptLineMeta],
-    original_index_map: &[usize],
-) {
-    let highlight_bg = Color::Reset;
-    for (idx, line) in lines.iter_mut().enumerate() {
-        let line_index = top + idx;
-        if let Some(TranscriptLineMeta::CellLine { cell_index, .. }) = line_meta.get(line_index)
-            && original_index_map
-                .get(*cell_index)
-                .copied()
-                .unwrap_or(*cell_index)
-                == target_cell
-        {
-            for span in &mut line.spans {
-                span.style = span.style.bg(highlight_bg);
-            }
-        }
     }
 }
 
@@ -4935,15 +4942,15 @@ mod tests {
     use super::{
         ACTIVE_REVISION_DOMAIN, ApprovalWidget, COMPOSER_PANEL_HEIGHT, COMPOSER_PLACEHOLDER,
         ChatWidget, ComposerWidget, Renderable, SlashMenuEntry, active_composer_submit_rect,
-        active_entry_revision, apply_detail_target_highlight, apply_selection_to_line,
-        apply_send_flash, approval_palette, approval_truncation_hint, build_empty_state_lines,
-        composer_content_geometry, composer_empty_hint_text, composer_height, composer_inner_area,
-        composer_max_height, composer_submit_hint, composer_top_padding, cursor_row_col,
-        empty_composer_visual_rows, enclosed_composer_panel_fits, fish_flee_offset, fish_heading,
-        fish_mark, history_entry_revision, layout_input, layout_input_with_scroll,
-        placeholder_visual_lines, push_command_entry, receipt_is_settling, revision_in_domain,
-        should_render_empty_state, slash_completion_hints, tool_run_summary_revision,
-        wrap_input_lines, wrap_input_lines_for_mouse, wrap_text,
+        active_entry_revision, apply_selection_to_line, apply_send_flash, approval_palette,
+        approval_truncation_hint, build_empty_state_lines, composer_content_geometry,
+        composer_empty_hint_text, composer_height, composer_inner_area, composer_max_height,
+        composer_submit_hint, composer_top_padding, cursor_row_col, empty_composer_visual_rows,
+        enclosed_composer_panel_fits, fish_flee_offset, fish_heading, fish_mark,
+        history_entry_revision, layout_input, layout_input_with_scroll, placeholder_visual_lines,
+        push_command_entry, receipt_is_settling, revision_in_domain, should_render_empty_state,
+        slash_completion_hints, tool_run_summary_revision, wrap_input_lines,
+        wrap_input_lines_for_mouse, wrap_text,
     };
     use crate::config::{ApiProvider, Config};
     use crate::tui::active_cell::ActiveCell;
@@ -5231,20 +5238,37 @@ mod tests {
         );
     }
 
+    /// #6704: the Alt+V detail target (here a visible error cell) must not
+    /// punch the terminal's own background through a painted surface. Its
+    /// text used to be forced to `Color::Reset`, which Windows Terminal shows
+    /// as black under the Underwater theme's navy water.
     #[test]
-    fn detail_highlight_uses_original_index_map_for_collapsed_rows() {
-        let mut lines = vec![Line::from("tool group")];
-        let line_meta = vec![TranscriptLineMeta::CellLine {
-            cell_index: 0,
-            line_in_cell: 0,
-            copy_prefix_width: 0,
-            copy_separator_after: crate::tui::ui_text::CopyLineSeparator::Newline,
-        }];
-        let original_index_map = vec![4];
+    fn detail_target_text_keeps_the_painted_surface() {
+        let mut app = create_test_app();
+        app.theme_id = codewhale_palette::ThemeId::Underwater;
+        app.ui_theme = palette::UNDERWATER_UI_THEME;
+        app.add_message(HistoryCell::User {
+            content: "run the check".to_string(),
+        });
+        app.add_message(HistoryCell::Error {
+            message: "验证失败 detail target".to_string(),
+            severity: crate::error_taxonomy::ErrorSeverity::Error,
+        });
 
-        apply_detail_target_highlight(&mut lines, 0, 4, &line_meta, &original_index_map);
+        let area = Rect::new(0, 0, 80, 12);
+        let mut buf = Buffer::empty(area);
+        ChatWidget::new_with_ocean_elapsed(&mut app, area, 0).render(area, &mut buf);
 
-        assert_eq!(lines[0].spans[0].style.bg, Some(Color::Reset));
+        let rendered = buffer_text(&buf, area);
+        assert!(rendered.contains("detail target"), "{rendered}");
+        let holes = (area.y..area.bottom())
+            .flat_map(|y| (area.x..area.right()).map(move |x| (x, y)))
+            .filter(|&pos| buf[pos].bg == Color::Reset)
+            .collect::<Vec<_>>();
+        assert!(
+            holes.is_empty(),
+            "cells fell through to the terminal background at {holes:?}:\n{rendered}"
+        );
     }
 
     #[test]

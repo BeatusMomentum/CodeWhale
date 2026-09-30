@@ -1091,6 +1091,7 @@ mod tests {
         app.api_messages_mut().push(Message {
             role: Role::User,
             content: vec![ContentBlock::ToolResult {
+                execution_id: None,
                 tool_use_id: "call-big".to_string(),
                 content: raw,
                 is_error: None,

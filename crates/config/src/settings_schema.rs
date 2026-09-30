@@ -40,6 +40,9 @@
 //! here so `/config` and `/effort` cannot disagree; the live settings screen
 //! still narrows that list to the active route's rungs.
 
+/// Fresh terminal installs, theme resets and the settings schema share this default.
+pub const DEFAULT_TUI_THEME: &str = "underwater";
+
 /// One selectable value of a [`SettingKind::Enum`] (or a boolean override).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SettingOption {
@@ -502,7 +505,7 @@ pub const SETTINGS_SCHEMA: &[SettingDef] = &[
     def(
         "theme",
         SettingKind::String,
-        "shoreline",
+        DEFAULT_TUI_THEME,
         ui(
             TAB_APPEARANCE,
             "display",

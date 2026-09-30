@@ -22,6 +22,9 @@
 //! What stays unknowable stays unknown regardless: nothing here observes the
 //! provider adapter's wire payload, so it is always reported as unavailable.
 
+mod portable_projection;
+pub(crate) use portable_projection::tool_snapshot as project_snapshot;
+
 use std::collections::BTreeMap;
 use std::io::{self, Write};
 
@@ -169,19 +172,6 @@ pub enum ToolProvenance {
     Unknown,
 }
 
-impl ToolProvenance {
-    #[must_use]
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Builtin => "builtin",
-            Self::Plugin => "plugin",
-            Self::Mcp => "mcp",
-            Self::Synthetic => "synthetic",
-            Self::Unknown => "unknown",
-        }
-    }
-}
-
 /// A tool's state relative to the request that was prepared for this step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -195,18 +185,10 @@ pub enum ToolVisibility {
 }
 
 impl ToolVisibility {
-    #[must_use]
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Active => "active",
-            Self::Deferred => "deferred",
-            Self::InRequest => "in-request",
-        }
-    }
-
     /// Whether this state means the tool's bytes are carried by the prepared
     /// request. The only honest source of this answer is the request itself.
     #[must_use]
+    #[cfg(test)]
     pub const fn in_request(self) -> bool {
         matches!(self, Self::Active | Self::Deferred | Self::InRequest)
     }
@@ -463,199 +445,14 @@ impl ToolInspectionSnapshot {
     }
 
     #[must_use]
+    #[cfg(test)]
     pub fn render_text(&self) -> String {
-        let mut out = String::new();
-        out.push_str("Prepared Model-Client Tool Request (read-only)\n");
-        out.push_str(&format!("Capture source: {}\n", self.capture_source));
-        out.push_str(&format!("Delivery: {}\n", self.delivery_status));
-        out.push_str(&format!(
-            "Turn: {}\nTurn truncated: {}\n",
-            json_string(&self.turn_id.value),
-            yes_no(self.turn_id.truncated)
-        ));
-        out.push_str(&format!("Step: {}\n", self.step));
-        if let Some(terminal) = &self.terminal {
-            out.push_str("Terminal diagnostics (observed facts; effective_max_steps null means uncapped, other nulls mean unknown):\n");
-            if let Ok(json) = serde_json::to_string_pretty(terminal) {
-                out.push_str(&json);
-                out.push('\n');
-            }
-        }
-        out.push_str(&format!(
-            "Tools field: {}\nTool count: {}\n",
-            if self.tools_field_present {
-                "present"
-            } else {
-                "absent"
-            },
-            self.tool_count
-        ));
-        out.push_str(&format!(
-            "Rendered tools: {}; omitted by render bound: {}\n",
-            self.rendered_tool_count, self.omitted_tool_count
-        ));
-        out.push_str(&format!(
-            "Model-client payload measurement: {}\n",
-            self.payload_measurement_status
-        ));
-        out.push_str(&format_optional_usize(
-            "Model-client tool JSON bytes",
-            self.payload_json_bytes,
-        ));
-        out.push_str(&format_optional_string(
-            "Active tool catalog digest (same digest as the request manifest)",
-            self.active_tool_catalog_sha256.as_deref(),
-        ));
-        out.push_str(
-            "Provider-wire tool payload: unavailable (the provider adapter may transform or omit model-client fields)\n",
-        );
-        match &self.provider {
-            ProviderAvailability::Available { provider, model } => out.push_str(&format!(
-                "Provider: {} (resolved model client)\nModel: {}\n",
-                json_string(provider),
-                json_string(model)
-            )),
-            ProviderAvailability::Unavailable { reason } => {
-                out.push_str(&format!("Provider: unavailable ({reason})\n"));
-            }
-            ProviderAvailability::Unknown => {
-                out.push_str("Provider: unknown (no model-client receipt captured)\n");
-            }
-        }
-        out.push_str(&format!(
-            "Registry facts: {}\n",
-            if self.registry_facts_present {
-                "captured"
-            } else {
-                "not captured"
-            }
-        ));
-        match &self.registry_tool_count {
-            Evidence::Known { value } => {
-                out.push_str(&format!("Registered tools: {value}\n"));
-            }
-            Evidence::Unknown { reason } => {
-                out.push_str(&format!("Registered tools: unknown ({reason})\n"));
-            }
-        }
-        match &self.registry_only_tools {
-            Evidence::Known { value } => {
-                let rendered = value
-                    .rendered
-                    .iter()
-                    .map(|entry| entry.value.as_str())
-                    .collect::<Vec<_>>();
-                out.push_str(&format!(
-                    "Model-visible tools not in this request: {}\n  names: {}\n  omitted by render bound: {}\n",
-                    value.count,
-                    serde_json::to_string(&rendered).unwrap_or_else(|_| "unavailable".to_string()),
-                    value.omitted
-                ));
-            }
-            Evidence::Unknown { reason } => {
-                out.push_str(&format!(
-                    "Model-visible tools not in this request: unknown ({reason})\n"
-                ));
-            }
-        }
-        out.push_str(&format!(
-            "Unavailable for this request: {}\n",
-            self.unavailable_for_this_request.join(", ")
-        ));
-
-        for tool in &self.tools {
-            out.push_str(&format!(
-                "\n{}. {}\n",
-                tool.ordinal,
-                json_string(&tool.name.value)
-            ));
-            out.push_str(&format!(
-                "   name truncated: {}\n",
-                yes_no(tool.name.truncated)
-            ));
-            render_bounded_evidence(&mut out, "type", &tool.tool_type);
-            out.push_str(&format!(
-                "   description: {}\n   description truncated: {}\n",
-                json_string(&tool.description.value),
-                yes_no(tool.description.truncated)
-            ));
-            out.push_str(&format!(
-                "   input schema JSON: {}\n   input schema truncated: {}\n",
-                tool.input_schema_json.value,
-                yes_no(tool.input_schema_json.truncated)
-            ));
-            match &tool.allowed_callers {
-                Evidence::Known { value } => {
-                    let rendered = value
-                        .rendered
-                        .iter()
-                        .map(|entry| entry.value.as_str())
-                        .collect::<Vec<_>>();
-                    out.push_str(&format!(
-                        "   allowed callers: {}\n   allowed callers count: {}\n   allowed callers omitted: {}\n   allowed callers truncated: {}\n",
-                        serde_json::to_string(&rendered).unwrap_or_else(|_| "unavailable".to_string()),
-                        value.count,
-                        value.omitted,
-                        yes_no(value.rendered.iter().any(|entry| entry.truncated))
-                    ));
-                }
-                Evidence::Unknown { reason } => {
-                    out.push_str(&format!("   allowed callers: unknown ({reason})\n"));
-                }
-            }
-            render_bool_evidence(&mut out, "deferred loading", &tool.defer_loading);
-            render_bool_evidence(&mut out, "strict", &tool.strict);
-            match &tool.input_examples {
-                Evidence::Known { value } => out.push_str(&format!(
-                    "   input examples: present ({} value(s), {})\n",
-                    value.count, value.values
-                )),
-                Evidence::Unknown { reason } => {
-                    out.push_str(&format!("   input examples: unknown ({reason})\n"));
-                }
-            }
-            render_bounded_evidence(&mut out, "cache control type", &tool.cache_control_type);
-            out.push_str(&format!(
-                "   request state: {}\n   in request: {}\n",
-                tool.visibility.label(),
-                yes_no(tool.visibility.in_request())
-            ));
-            match &tool.provenance {
-                Evidence::Known { value } => {
-                    out.push_str(&format!("   provenance: {}\n", value.label()));
-                }
-                Evidence::Unknown { reason } => {
-                    out.push_str(&format!("   provenance: unknown ({reason})\n"));
-                }
-            }
-            render_bounded_evidence(&mut out, "MCP server", &tool.mcp_server);
-            match &tool.capabilities {
-                Evidence::Known { value } => {
-                    let rendered = value
-                        .rendered
-                        .iter()
-                        .map(|entry| entry.value.as_str())
-                        .collect::<Vec<_>>();
-                    out.push_str(&format!(
-                        "   capabilities: {}\n   capabilities count: {}\n   capabilities omitted: {}\n",
-                        serde_json::to_string(&rendered)
-                            .unwrap_or_else(|_| "unavailable".to_string()),
-                        value.count,
-                        value.omitted
-                    ));
-                }
-                Evidence::Unknown { reason } => {
-                    out.push_str(&format!("   capabilities: unknown ({reason})\n"));
-                }
-            }
-            render_bounded_evidence(&mut out, "approval", &tool.approval);
-            render_bool_evidence(&mut out, "model visible", &tool.model_visible);
-        }
-        out
+        crate::diagnostics_reports::render_tool_snapshot_text(&project_snapshot(self))
     }
 
+    #[cfg(test)]
     pub fn render_json(&self) -> Result<String, serde_json::Error> {
-        serde_json::to_string_pretty(self)
+        crate::diagnostics_reports::render_tool_snapshot_json(&project_snapshot(self))
     }
 }
 
@@ -859,50 +656,6 @@ fn unknown<T>(reason: &str) -> Evidence<T> {
     Evidence::Unknown {
         reason: reason.to_string(),
     }
-}
-
-fn render_bounded_evidence(out: &mut String, label: &str, evidence: &Evidence<BoundedString>) {
-    match evidence {
-        Evidence::Known { value } => out.push_str(&format!(
-            "   {label}: {}\n   {label} truncated: {}\n",
-            json_string(&value.value),
-            yes_no(value.truncated)
-        )),
-        Evidence::Unknown { reason } => {
-            out.push_str(&format!("   {label}: unknown ({reason})\n"));
-        }
-    }
-}
-
-fn render_bool_evidence(out: &mut String, label: &str, evidence: &Evidence<bool>) {
-    match evidence {
-        Evidence::Known { value } => out.push_str(&format!("   {label}: {value}\n")),
-        Evidence::Unknown { reason } => {
-            out.push_str(&format!("   {label}: unknown ({reason})\n"));
-        }
-    }
-}
-
-fn json_string(value: &str) -> String {
-    serde_json::to_string(value).unwrap_or_else(|_| "\"unavailable\"".to_string())
-}
-
-fn format_optional_usize(label: &str, value: Option<usize>) -> String {
-    value.map_or_else(
-        || format!("{label}: unavailable\n"),
-        |value| format!("{label}: {value}\n"),
-    )
-}
-
-fn format_optional_string(label: &str, value: Option<&str>) -> String {
-    value.map_or_else(
-        || format!("{label}: unavailable\n"),
-        |value| format!("{label}: {value}\n"),
-    )
-}
-
-const fn yes_no(value: bool) -> &'static str {
-    if value { "yes" } else { "no" }
 }
 
 #[cfg(test)]

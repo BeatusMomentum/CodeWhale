@@ -310,6 +310,25 @@ pub struct ModelsDevProviderModel {
     /// Interleaved reasoning field hints.
     #[serde(default)]
     pub interleaved: Option<ModelsDevInterleaved>,
+    /// Per-model override of the provider's transport (`provider.npm`), used
+    /// when a gateway serves some models over a different wire than its
+    /// provider-level `npm` default (OpenCode Zen, #6705).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<ModelsDevModelTransport>,
+    /// Lifecycle marker such as `deprecated` or `beta`; absent for current
+    /// rows. A model-aware gateway's deprecated row is not a routable wire
+    /// fact (#6705).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+}
+
+/// A Models.dev model row's `provider` override: the AI SDK package that
+/// serves this model when it differs from the provider default.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ModelsDevModelTransport {
+    /// AI SDK package identifier, such as `@ai-sdk/anthropic`.
+    #[serde(default)]
+    pub npm: Option<String>,
 }
 
 impl ModelsDevProviderModel {
@@ -317,6 +336,14 @@ impl ModelsDevProviderModel {
     #[must_use]
     pub fn supports_text_chat(&self) -> bool {
         supports_text_chat(self.modalities.as_ref())
+    }
+
+    /// True when the catalog marks this offering `deprecated`.
+    #[must_use]
+    pub fn is_deprecated(&self) -> bool {
+        self.status
+            .as_deref()
+            .is_some_and(|status| status.trim().eq_ignore_ascii_case("deprecated"))
     }
 }
 

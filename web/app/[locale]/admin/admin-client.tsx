@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import { draftStorageKey, type AgentDraft } from "@/lib/community-agent";
+import { draftStorageKey, reviewedBodyHash, type AgentDraft } from "@/lib/community-agent";
 
 interface Props {
   drafts: AgentDraft[];
@@ -17,13 +17,17 @@ export function AdminClient({ drafts, posted, isZh, typeLabels }: Props) {
   const [editBody, setEditBody] = useState("");
   const [loading, setLoading] = useState<string | null>(null);
 
-  const handleAction = async (draftKey: string, action: "post" | "discard", editedBody?: string) => {
+  const handleAction = async (draft: AgentDraft, action: "post" | "discard", editedBody?: string) => {
+    const draftKey = draftStorageKey(draft);
     setLoading(draftKey);
     try {
+      // Binds the action to the text shown here; the route refuses it if the
+      // stored draft was regenerated since this page loaded.
+      const reviewedSha256 = await reviewedBodyHash(isZh ? draft.bodyZh : draft.bodyEn);
       const res = await fetch("/api/admin/post", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ action, draftKey, editedBody, lang: isZh ? "zh" : "en" }),
+        body: JSON.stringify({ action, draftKey, editedBody, lang: isZh ? "zh" : "en", reviewedSha256 }),
       });
       const data = await res.json();
       if (data.ok) {
@@ -37,6 +41,9 @@ export function AdminClient({ drafts, posted, isZh, typeLabels }: Props) {
           }
         }
         setEditing(null);
+        // The post went through but something after it did not (draft state
+        // not saved, or the digest was not published on /digest).
+        if (typeof data.warning === "string") alert(data.warning);
       } else {
         alert(`Error: ${data.error}`);
       }
@@ -90,7 +97,7 @@ export function AdminClient({ drafts, posted, isZh, typeLabels }: Props) {
                       />
                       <div className="flex gap-2">
                         <button
-                          onClick={() => handleAction(key, "post", editBody)}
+                          onClick={() => handleAction(draft, "post", editBody)}
                           disabled={loading === key}
                           className="btn btn-primary disabled:opacity-50"
                         >
@@ -111,7 +118,7 @@ export function AdminClient({ drafts, posted, isZh, typeLabels }: Props) {
                       </div>
                       <div className="flex gap-2 flex-wrap">
                         <button
-                          onClick={() => handleAction(key, "post")}
+                          onClick={() => handleAction(draft, "post")}
                           disabled={loading === key}
                           className="btn btn-primary disabled:opacity-50"
                         >
@@ -124,7 +131,7 @@ export function AdminClient({ drafts, posted, isZh, typeLabels }: Props) {
                           {isZh ? "编辑后发布" : "Edit & post"}
                         </button>
                         <button
-                          onClick={() => handleAction(key, "discard")}
+                          onClick={() => handleAction(draft, "discard")}
                           disabled={loading === key}
                           className="btn btn-danger"
                         >

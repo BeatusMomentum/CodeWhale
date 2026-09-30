@@ -1119,6 +1119,17 @@ pub async fn run_http_server(
         .context("load persistent Skill activation state for Runtime API")?;
     let sub_agent_manager = runtime_api_sub_agent_manager(&workspace, options.workers);
     let shutdown = RuntimeServerShutdown::default();
+    // Opening a thread is every client's first read, and the store can only
+    // answer it after one pass over the whole items directory (an item's
+    // filename names the item, not its turn). Every open used to pay that pass;
+    // here it is paid once, while the server is starting and nobody is waiting
+    // for it. See [`RuntimeThreadStore::ensure_item_index`].
+    let warm_threads = runtime_threads.clone();
+    tokio::task::spawn_blocking(move || {
+        if let Err(error) = warm_threads.warm_item_index() {
+            tracing::warn!(%error, "thread item index warm-up failed");
+        }
+    });
     let state = RuntimeApiState {
         config: Arc::new(parking_lot::RwLock::new(config.clone())),
         workspace,
@@ -3812,7 +3823,8 @@ async fn list_skills(
                 plugin_id,
                 plugin_generation,
                 plugin_content_hash,
-                enabled: skill_state.is_enabled(&skill.name),
+                enabled: skill_state
+                    .is_enabled_with_legacy(&skill.name, skill.legacy_activation_name.as_deref()),
                 is_bundled: skill_entry_is_bundled(skill, &skills_dir),
             }
         })
@@ -8159,6 +8171,10 @@ fn resolve_skills_dir(config: &Config, workspace: &std::path::Path) -> PathBuf {
             return config.skills_dir();
         }
         if let Some(codewhale_skills_dir) = crate::skills::codewhale_workspace_skills_dir(workspace)
+            && crate::skills::skills_dir_allowed_by_workspace_trust(
+                workspace,
+                &codewhale_skills_dir,
+            )
             && let Ok(canonical_skills) = fs::canonicalize(&codewhale_skills_dir)
         {
             return canonical_skills;
@@ -8185,6 +8201,7 @@ fn resolve_skills_dir(config: &Config, workspace: &std::path::Path) -> PathBuf {
         if let Ok(canon) = fs::canonicalize(&candidate)
             && canon.starts_with(&canonical_workspace)
             && canon.is_dir()
+            && crate::skills::skills_dir_allowed_by_workspace_trust(workspace, &canon)
         {
             return canon;
         }

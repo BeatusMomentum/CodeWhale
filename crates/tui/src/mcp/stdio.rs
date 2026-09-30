@@ -67,6 +67,17 @@ impl StderrTail {
     async fn snapshot(&self) -> Vec<String> {
         self.lines.lock().await.iter().cloned().collect()
     }
+
+    async fn last_line(&self) -> Option<String> {
+        self.lines
+            .lock()
+            .await
+            .iter()
+            .rev()
+            .map(|line| line.trim())
+            .find(|line| !line.is_empty())
+            .map(str::to_string)
+    }
 }
 
 impl StdioTransport {
@@ -200,15 +211,8 @@ impl StdioTransport {
             // stderr to avoid blocking, but do not retain or surface arbitrary
             // child output that could echo those credentials into a chat or
             // persisted transcript.
-            let capture_lines = config.reviewed_plugin.is_none();
-            tokio::spawn(async move {
-                let mut lines = tokio::io::BufReader::new(stderr).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    if capture_lines {
-                        tail.push(line).await;
-                    }
-                }
-            });
+            let capture = config.reviewed_plugin.is_none().then_some(tail);
+            tokio::spawn(drain_stderr(stderr, capture));
         }
 
         let child = Arc::new(TokioMutex::new(child));
@@ -230,6 +234,70 @@ impl StdioTransport {
             _reviewed_launch: reviewed_launch,
         })
     }
+}
+
+/// Longest stderr line retained in the tail, in bytes after decoding. An
+/// overlong line keeps its end, where the error usually is, and the start is
+/// drained and discarded so a newline-free progress stream cannot grow memory.
+const STDERR_LINE_CAP: usize = 4 * 1024;
+
+/// Drain a child's stderr until EOF, retaining lossily decoded, length-capped
+/// lines in `tail` when given. Stderr is not a protocol channel: a non-UTF-8
+/// byte or an endless line must never stop the drain, because dropping the
+/// pipe makes the child's next stderr write fail (EPIPE/SIGPIPE) and hides
+/// the context this tail exists to keep.
+async fn drain_stderr<R>(stderr: R, tail: Option<Arc<StderrTail>>)
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut reader = tokio::io::BufReader::new(stderr);
+    let mut line = Vec::new();
+    loop {
+        let (consumed, line_ended) = {
+            let available = match reader.fill_buf().await {
+                Ok(available) => available,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            };
+            if available.is_empty() {
+                break;
+            }
+            let (consumed, line_ended) = match available.iter().position(|&b| b == b'\n') {
+                Some(pos) => (pos + 1, true),
+                None => (available.len(), false),
+            };
+            if tail.is_some() {
+                let content = &available[..consumed - usize::from(line_ended)];
+                let keep = content.len().min(STDERR_LINE_CAP);
+                let overflow = (line.len() + keep).saturating_sub(STDERR_LINE_CAP);
+                line.drain(..overflow);
+                line.extend_from_slice(&content[content.len() - keep..]);
+            }
+            (consumed, line_ended)
+        };
+        reader.consume(consumed);
+        if line_ended {
+            push_stderr_line(tail.as_deref(), &mut line).await;
+        }
+    }
+    if !line.is_empty() {
+        push_stderr_line(tail.as_deref(), &mut line).await;
+    }
+}
+
+async fn push_stderr_line(tail: Option<&StderrTail>, line: &mut Vec<u8>) {
+    if let Some(tail) = tail {
+        let bytes: &[u8] = line;
+        let text = String::from_utf8_lossy(bytes.strip_suffix(b"\r").unwrap_or(bytes));
+        // Lossy decoding can triple invalid bytes; hold the retained size to
+        // the cap too, again keeping the end.
+        let mut start = text.len().saturating_sub(STDERR_LINE_CAP);
+        while !text.is_char_boundary(start) {
+            start += 1;
+        }
+        tail.push(text[start..].to_owned()).await;
+    }
+    line.clear();
 }
 
 /// Format the captured stderr tail for inclusion in an error message. Empty
@@ -305,6 +373,17 @@ async fn terminate_child(child: &mut Child) {
 
 #[async_trait::async_trait]
 impl McpTransport for StdioTransport {
+    async fn last_stderr_line(&self) -> Option<String> {
+        // The child usually writes its reason to stderr just before the error
+        // reply; give the drain task a bounded moment to catch up.
+        tokio::task::yield_now().await;
+        if let Some(line) = self.stderr_tail.last_line().await {
+            return Some(line);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        self.stderr_tail.last_line().await
+    }
+
     async fn send(&mut self, mut msg: Vec<u8>) -> Result<()> {
         msg.push(b'\n');
         self.stdin.write_all(&msg).await?;
@@ -441,6 +520,77 @@ where
         }
     }
     Ok(out.len())
+}
+
+#[cfg(test)]
+mod stderr_drain_tests {
+    use super::{STDERR_LINE_CAP, StderrTail, drain_stderr};
+    use tokio::io::AsyncWriteExt;
+
+    #[tokio::test]
+    async fn invalid_utf8_and_long_lines_do_not_stop_the_drain() {
+        let (mut writer, reader) = tokio::io::duplex(64);
+        let tail = StderrTail::new();
+        let drain = tokio::spawn(drain_stderr(reader, Some(tail.clone())));
+        writer.write_all(b"starting\r\n").await.unwrap();
+        writer.write_all(b"caf\xe9 \xff\xfe\n").await.unwrap();
+        writer
+            .write_all(&vec![b'#'; STDERR_LINE_CAP * 3])
+            .await
+            .unwrap();
+        writer.write_all(b"\npanic: boom").await.unwrap();
+        drop(writer);
+        drain.await.unwrap();
+        let lines = tail.snapshot().await;
+        assert_eq!(lines.len(), 4, "{lines:?}");
+        assert_eq!(lines[0], "starting");
+        assert_eq!(lines[1], "caf\u{fffd} \u{fffd}\u{fffd}");
+        assert_eq!(lines[2].len(), STDERR_LINE_CAP);
+        assert_eq!(lines[3], "panic: boom");
+    }
+
+    #[tokio::test]
+    async fn overlong_lines_keep_their_end_within_the_cap() {
+        let (mut writer, reader) = tokio::io::duplex(64);
+        let tail = StderrTail::new();
+        let drain = tokio::spawn(drain_stderr(reader, Some(tail.clone())));
+        // A long prefix, then the actual failure at the end of the line.
+        writer
+            .write_all(&vec![b'.'; STDERR_LINE_CAP * 3])
+            .await
+            .unwrap();
+        writer.write_all(b"error: config missing\n").await.unwrap();
+        // Invalid bytes decode to three-byte U+FFFD each.
+        writer
+            .write_all(&vec![0xff; STDERR_LINE_CAP])
+            .await
+            .unwrap();
+        writer.write_all(b"\n").await.unwrap();
+        drop(writer);
+        drain.await.unwrap();
+        let lines = tail.snapshot().await;
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(
+            lines[0].ends_with("error: config missing"),
+            "{:?}",
+            &lines[0][lines[0].len() - 40..]
+        );
+        assert_eq!(lines[0].len(), STDERR_LINE_CAP);
+        assert!(lines[1].len() <= STDERR_LINE_CAP, "{}", lines[1].len());
+        assert!(lines[1].chars().all(|c| c == '\u{fffd}'));
+    }
+
+    #[tokio::test]
+    async fn uncaptured_stderr_is_still_drained_to_eof() {
+        let (mut writer, reader) = tokio::io::duplex(16);
+        let drain = tokio::spawn(drain_stderr(reader, None));
+        // A non-UTF-8 line, then far more than the pipe buffer: a drain that
+        // stopped at the bad line would fail this write with a broken pipe.
+        writer.write_all(b"\xff\n").await.unwrap();
+        writer.write_all(&[b'x'; 4096]).await.unwrap();
+        drop(writer);
+        drain.await.unwrap();
+    }
 }
 
 #[cfg(test)]

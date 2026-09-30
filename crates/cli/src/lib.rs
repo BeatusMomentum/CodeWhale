@@ -95,8 +95,10 @@ fn parse_provider_identifier(value: &str) -> std::result::Result<String, String>
     override_usage = "codewhale [OPTIONS] [PROMPT]\n       codewhale [OPTIONS] <COMMAND> [ARGS]"
 )]
 struct Cli {
+    /// Path to the config file to load instead of the default.
     #[arg(long)]
     config: Option<PathBuf>,
+    /// Config profile to apply (a `[profiles.<name>]` table).
     #[arg(long)]
     profile: Option<String>,
     #[arg(
@@ -106,6 +108,7 @@ struct Cli {
         help = "Provider selector; exec/fleet also accept configured custom provider identifiers"
     )]
     provider: Option<String>,
+    /// Model to use for this run (not saved).
     #[arg(long)]
     model: Option<String>,
     /// Retired (#6516): nothing ever read it. Still accepted, hidden and
@@ -119,6 +122,7 @@ struct Cli {
         help = "Controls transcript and output verbosity (normal, concise)"
     )]
     verbosity: Option<String>,
+    /// Log level for this run (for example `info`, `debug`, or `trace`).
     #[arg(long = "log-level")]
     log_level: Option<String>,
     #[arg(
@@ -128,21 +132,32 @@ struct Cli {
                 durable off: config set telemetry false; CODEWHALE_TELEMETRY=0 always wins)"
     )]
     telemetry: Option<bool>,
+    /// Tool approval policy for this run: on-request, untrusted, or never.
     #[arg(long)]
     approval_policy: Option<String>,
+    /// Sandbox mode for this run: read-only, workspace-write,
+    /// danger-full-access, or external-sandbox. danger-full-access disables
+    /// the sandbox entirely.
     #[arg(long)]
     sandbox_mode: Option<String>,
+    /// Provider API key for this run (not saved). Visible in the process
+    /// list; prefer `auth set --api-key-stdin` or the provider's env var.
     #[arg(long)]
     api_key: Option<String>,
+    /// Provider base URL for this run (not saved).
     #[arg(long)]
     base_url: Option<String>,
     /// Workspace directory for Codewhale file tools.
     #[arg(short = 'C', long = "workspace", alias = "cd", value_name = "DIR")]
     workspace: Option<PathBuf>,
+    /// Enable terminal mouse capture for internal scrolling, transcript
+    /// selection, and scrollbar dragging (default off in legacy Windows consoles).
     #[arg(long = "mouse-capture", conflicts_with = "no_mouse_capture")]
     mouse_capture: bool,
+    /// Disable terminal mouse capture so terminal-native text selection works.
     #[arg(long = "no-mouse-capture", conflicts_with = "mouse_capture")]
     no_mouse_capture: bool,
+    /// Skip onboarding screens.
     #[arg(long = "skip-onboarding")]
     skip_onboarding: bool,
     /// Start a fresh session without automatic resume or crash recovery.
@@ -183,6 +198,8 @@ struct Cli {
     /// short `-c` is already `--continue`.
     #[arg(long = "set", value_name = "KEY=VALUE")]
     overrides: Vec<String>,
+    /// Initial prompt for the interactive session. Use `exec` for a
+    /// non-interactive run.
     #[arg(
         value_name = "PROMPT",
         trailing_var_arg = true,
@@ -231,6 +248,9 @@ Examples:
   codewhale exec \"explain this function\"
   codewhale exec --auto \"list crates/ with ls\"
   codewhale exec --auto --output-format stream-json \"fix the failing test\"
+
+Global options such as --model, --provider, --config and --profile go before exec:
+  codewhale --model MODEL exec \"explain this function\"
 
 Common forwarded flags:
   --auto                           Enable tool-backed agent mode with auto-approvals
@@ -1615,13 +1635,14 @@ enum AuthCommand {
         #[arg(long, default_value_t = false)]
         diagnostic: bool,
     },
-    /// Save an API key to the shared user config file. Reads from
-    /// `--api-key`, `--api-key-stdin`, or prompts on stdin when
+    /// Save an API key to the credential store (config keeps metadata only).
+    /// Reads from `--api-key`, `--api-key-stdin`, or prompts on stdin when
     /// neither is given. Does not echo the key.
     Set {
         #[arg(long, value_parser = parse_catalog_route)]
         provider: ProviderKind,
-        /// Inline value (discouraged — appears in shell history).
+        /// Inline value (discouraged — visible in the process list and shell
+        /// history; prefer `--api-key-stdin`).
         #[arg(long)]
         api_key: Option<String>,
         /// Read the key from stdin instead of prompting.
@@ -1872,6 +1893,8 @@ struct AppServerArgs {
     workers: Option<usize>,
     #[arg(long)]
     config: Option<PathBuf>,
+    /// Bearer token required on runtime API routes. Visible in the process
+    /// list; prefer CODEWHALE_RUNTIME_TOKEN.
     #[arg(long = "auth-token")]
     auth_token: Option<String>,
     #[arg(long, default_value_t = false)]
@@ -2035,6 +2058,43 @@ fn retired_output_mode_warning(cli: &Cli) -> Option<&'static str> {
     })
 }
 
+/// A secret passed as an argv value is readable by other local users through
+/// the process list (and lands in shell history). Name the non-argv route.
+/// `login`/`account` already reject the global `--api-key` with their own
+/// guidance, so they get no second line. The pipe-only credential handoff
+/// keeps its existing bounded diagnostics instead of adding interactive advice.
+fn argv_secret_warning(cli: &Cli, command: Option<&Commands>) -> Option<&'static str> {
+    const RUNTIME_TOKEN: &str =
+        "warning: --auth-token is visible in the process list; use CODEWHALE_RUNTIME_TOKEN instead";
+    match command {
+        Some(Commands::AppServer(args)) if args.auth_token.is_some() => Some(RUNTIME_TOKEN),
+        Some(Commands::Serve(args))
+            if args
+                .args
+                .iter()
+                .take_while(|arg| *arg != "--")
+                .any(|arg| arg == "--auth-token" || arg.starts_with("--auth-token=")) =>
+        {
+            Some(RUNTIME_TOKEN)
+        }
+        Some(Commands::Auth(AuthArgs {
+            command: AuthCommand::Set {
+                api_key: Some(_), ..
+            },
+        })) => {
+            Some("warning: --api-key is visible in the process list; use --api-key-stdin instead")
+        }
+        Some(Commands::Login(_) | Commands::Account(_))
+        | Some(Commands::Auth(AuthArgs {
+            command: AuthCommand::PrintApiKey { .. },
+        })) => None,
+        _ if cli.api_key.is_some() => Some(
+            "warning: --api-key is visible in the process list; use `codewhale auth set --api-key-stdin` or the provider's API-key env var instead",
+        ),
+        _ => None,
+    }
+}
+
 fn run() -> Result<()> {
     let matches = Cli::command().get_matches();
     let project_bundle_scope = config_command_targets_project(&matches);
@@ -2062,6 +2122,9 @@ fn run() -> Result<()> {
         apply_runtime_set_overrides(&mut cli)?;
     }
     if let Some(warning) = retired_output_mode_warning(&cli) {
+        eprintln!("{warning}");
+    }
+    if let Some(warning) = argv_secret_warning(&cli, command.as_ref()) {
         eprintln!("{warning}");
     }
 
@@ -4471,7 +4534,7 @@ fn run_auth_command_with_secrets_and_runtime(
             if secret_store_saved {
                 println!(
                     "saved API key for {slot} to {} (config contains metadata only)",
-                    secrets.backend_name(),
+                    secret_store_location(secrets),
                 );
             } else {
                 println!("saved API key for {slot} to {}", store.path().display());
@@ -4509,6 +4572,19 @@ fn run_auth_command_with_secrets_and_runtime(
         }
         AuthCommand::Migrate { dry_run } => run_auth_migrate(store, secrets, dry_run),
     }
+}
+
+/// Where `auth set` just wrote a key. The file backend's static label names
+/// `~/.codewhale/secrets/`, which is wrong under `CODEWHALE_HOME`; report the
+/// resolved file instead. Other backends keep their label.
+fn secret_store_location(secrets: &Secrets) -> String {
+    let label = secrets.backend_name();
+    if label.starts_with("file-based")
+        && let Ok((path, _)) = codewhale_secrets::FileKeyringStore::default_paths_read_only()
+    {
+        return format!("file-based ({})", codewhale_config::quote_os_path(&path));
+    }
+    label.to_string()
 }
 
 fn external_consent_preview_lines(
@@ -5013,11 +5089,13 @@ fn apply_per_run_overrides(store: &mut ConfigStore, specs: &[String]) -> Result<
     for spec in specs {
         let (key, value) = spec
             .split_once('=')
-            .with_context(|| format!("invalid --set {spec:?}: expected KEY=VALUE"))?;
-        store
-            .config
-            .set_value(key.trim(), value)
-            .with_context(|| format!("invalid --set {spec:?}"))?;
+            .context("invalid --set: expected KEY=VALUE")?;
+        store.config.set_value(key.trim(), value).map_err(|error| {
+            anyhow!(
+                "invalid --set: {}",
+                codewhale_config::persistence::redact_secrets(&format!("{error:#}"))
+            )
+        })?;
     }
     Ok(())
 }
@@ -6504,6 +6582,35 @@ mod tests {
         apply_per_run_overrides(&mut store, &["verbosity=concise".to_string()])
             .expect("overlay applies");
         assert_eq!(store.config.verbosity.as_deref(), Some("concise"));
+        let before = toml::to_string(&store.config).unwrap();
+        let bytes_before = std::fs::read(&path).unwrap();
+        let token = ["sk-live-", "Z7qX4mNb2Vc9Lk3PwR8t"].concat();
+        for (key, value) in [
+            ("approval_policy", "ask"),
+            ("sandbox_mode", "full"),
+            ("verbosity", "quiet"),
+            ("approval_policy", token.as_str()),
+            ("sandbox_mode", token.as_str()),
+            ("verbosity", token.as_str()),
+        ] {
+            let error = apply_per_run_overrides(&mut store, &[format!("{key}={value}")])
+                .expect_err("invalid overlay");
+            let rendered = format!("{error:#}");
+            assert!(!rendered.contains(&token), "{rendered}");
+            assert!(rendered.contains("fix: codewhale config set"), "{rendered}");
+            assert_eq!(toml::to_string(&store.config).unwrap(), before);
+            assert_eq!(std::fs::read(&path).unwrap(), bytes_before);
+        }
+        // Malformed input and an unsupported dotted key must not reintroduce
+        // credential-shaped text through the outer context or nested-key help.
+        for spec in [token.clone(), format!("{token}.unknown=normal")] {
+            let error = apply_per_run_overrides(&mut store, &[spec]).expect_err("invalid overlay");
+            let rendered = format!("{error:#}");
+            assert!(!rendered.contains(&token), "{rendered}");
+            assert!(rendered.contains("invalid --set"), "{rendered}");
+            assert_eq!(toml::to_string(&store.config).unwrap(), before);
+            assert_eq!(std::fs::read(&path).unwrap(), bytes_before);
+        }
         let error = apply_per_run_overrides(&mut store, &["no-equals-here".to_string()])
             .expect_err("missing = must fail");
         assert!(format!("{error:#}").contains("KEY=VALUE"));
@@ -6637,7 +6744,7 @@ mod tests {
 kind = "codewhale.portable-config"
 
 [project]
-verbosity = "project-imported"
+verbosity = "concise"
 "#,
         )
         .expect("write project bundle");
@@ -6658,10 +6765,7 @@ verbosity = "project-imported"
             .expect("import project bundle");
         let project = ConfigStore::load(Some(project_path.clone())).expect("reload project");
         let global = ConfigStore::load(Some(global_path.clone())).expect("reload global");
-        assert_eq!(
-            project.config.verbosity.as_deref(),
-            Some("project-imported")
-        );
+        assert_eq!(project.config.verbosity.as_deref(), Some("concise"));
         assert_eq!(global.config.verbosity.as_deref(), Some("global-only"));
 
         let explicit_argv = [
@@ -7586,7 +7690,9 @@ verbosity = "project-imported"
             "the retired Fleet-led summary must be gone from top-level help"
         );
 
-        let fleet_help = help_for(&["codewhale", "fleet", "--help"]);
+        // `fleet --help` forwards to the delegated binary; the wrapper's own
+        // help (with these examples) stays reachable as `help fleet`.
+        let fleet_help = help_for(&["codewhale", "help", "fleet"]);
         assert!(fleet_help.contains("Manage durable Agent fleet runs"));
         assert!(fleet_help.contains("codewhale fleet run tasks.json --max-workers 4"));
 
@@ -11441,6 +11547,144 @@ verbosity = "project-imported"
         }
     }
 
+    /// Help must exit in the wrapper's parser, before config, credentials or
+    /// provider setup can run. Its schema also preserves wrapper-only rules.
+    #[test]
+    fn passthrough_subcommand_help_exits_in_the_wrapper() {
+        for subcommand in [
+            "doctor",
+            "setup",
+            "init",
+            "models",
+            "exec",
+            "review",
+            "sessions",
+            "resume",
+            "fleet",
+            "apply",
+            "eval",
+            "mcp",
+            "features",
+            "integrations",
+            "receipts",
+            "rc",
+            "fork",
+            "speech",
+        ] {
+            for flag in ["--help", "-h"] {
+                let error = Cli::try_parse_from(["codewhale", subcommand, flag])
+                    .expect_err("help must exit before dispatch");
+                assert_eq!(error.kind(), clap::error::ErrorKind::DisplayHelp);
+                assert!(
+                    error
+                        .to_string()
+                        .contains(&format!("Usage: codewhale {subcommand}")),
+                    "{subcommand} must show its own help: {error}"
+                );
+            }
+        }
+        let exec = help_for(&["codewhale", "exec", "--help"]);
+        assert!(exec.contains("go before exec"), "{exec}");
+        assert!(exec.contains("codewhale --model MODEL exec"), "{exec}");
+        let rc = help_for(&["codewhale", "rc", "--help"]);
+        assert!(rc.contains("hand it to the Codewhale web app"), "{rc}");
+    }
+
+    #[test]
+    fn root_help_describes_every_global_option() {
+        let help = help_for(&["codewhale", "--help"]);
+        for needle in [
+            "Path to the config file",
+            "Config profile to apply",
+            "Model to use for this run",
+            "Log level for this run",
+            "Tool approval policy",
+            "danger-full-access disables",
+            "Provider API key for this run",
+            "Provider base URL for this run",
+            "Enable terminal mouse capture",
+            "Initial prompt for the interactive session",
+        ] {
+            assert!(
+                help.contains(needle),
+                "root help missing `{needle}`:\n{help}"
+            );
+        }
+        let app_server = help_for(&["codewhale", "app-server", "--help"]);
+        assert!(
+            app_server.contains("CODEWHALE_RUNTIME_TOKEN"),
+            "{app_server}"
+        );
+        let auth_set = help_for(&["codewhale", "auth", "set", "--help"]);
+        assert!(
+            auth_set.contains("Save an API key to the credential store"),
+            "{auth_set}"
+        );
+    }
+
+    #[test]
+    fn argv_secrets_print_a_process_list_hint() {
+        let warn = |argv: &[&str]| {
+            let cli = parse_ok(argv);
+            argv_secret_warning(&cli, cli.command.as_ref())
+        };
+        assert!(
+            warn(&["codewhale", "--api-key", "sk-x", "doctor"])
+                .expect("global --api-key warns")
+                .contains("process list")
+        );
+        assert!(
+            warn(&["codewhale", "app-server", "--http", "--auth-token", "t"])
+                .expect("app-server --auth-token warns")
+                .contains("CODEWHALE_RUNTIME_TOKEN")
+        );
+        assert!(
+            warn(&["codewhale", "serve", "--http", "--auth-token=t"])
+                .expect("serve --auth-token warns")
+                .contains("CODEWHALE_RUNTIME_TOKEN")
+        );
+        assert!(
+            warn(&[
+                "codewhale",
+                "auth",
+                "set",
+                "--provider",
+                "deepseek",
+                "--api-key",
+                "k"
+            ])
+            .expect("auth set --api-key warns")
+            .contains("--api-key-stdin")
+        );
+        assert_eq!(warn(&["codewhale", "doctor"]), None);
+        assert_eq!(
+            warn(&[
+                "codewhale",
+                "auth",
+                "set",
+                "--provider",
+                "deepseek",
+                "--api-key-stdin"
+            ]),
+            None
+        );
+        assert_eq!(warn(&["codewhale", "app-server", "--http"]), None);
+        // login/account reject the global flag with their own guidance.
+        assert_eq!(warn(&["codewhale", "--api-key", "sk-x", "login"]), None);
+        assert_eq!(
+            warn(&[
+                "codewhale",
+                "--api-key",
+                "sk-x",
+                "auth",
+                "print-api-key",
+                "--provider",
+                "deepseek",
+            ]),
+            None
+        );
+    }
+
     /// #6516: `--output-mode` never had a reader. It stays accepted so old
     /// scripts keep running, but it is no longer advertised.
     #[test]
@@ -11510,7 +11754,9 @@ verbosity = "project-imported"
         ];
 
         for (subcommand, expected_tokens) in cases {
-            let argv = ["deepseek", subcommand, "--help"];
+            // `help <sub>`: passthrough subcommands such as `exec` forward
+            // `--help` to the delegated binary instead of rendering here.
+            let argv = ["deepseek", "help", subcommand];
             let rendered = help_for(&argv);
             for token in expected_tokens {
                 assert!(

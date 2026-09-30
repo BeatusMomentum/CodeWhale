@@ -105,58 +105,9 @@ reasoning_effort = "max"
 #   pin_last_prompt = true
 #   show_tool_details = false
 
-# Signed catalog overlays are optional and inactive without approved trust keys.
-# Explicit route/model selections and provider-owned rosters keep priority.
-# CODEWHALE_DISABLE_CLOUD_FACTS=1 disables cache, local files and network too.
-[cloud_facts]
-enabled = false
-channel = "stable"
-ttl_hours = 6
-# url = "https://codewhale.net/api/facts/v1/{channel}"
-
-# ─────────────────────────────────────────────────────────────────────────────────
-# Startup update check
-# ─────────────────────────────────────────────────────────────────────────────────
-# The TUI checks for newer Codewhale releases in the background at startup.
-# Set check_for_updates = false in managed or air-gapped environments.
-# The result is cached in ~/.codewhale/update-check.json, so the network is
-# touched at most once per check_interval_hours while the notice still shows
-# on every launch. Set 0 to check on every launch.
-# Checks are skipped entirely in CI, and when CODEWHALE_NO_UPDATE_CHECK or
-# NO_UPDATE_NOTIFIER is set.
-# update_uri may point at a GitHub-compatible latest-release JSON endpoint.
-[update]
-check_for_updates = true
-check_interval_hours = 24
-# update_uri = "https://internal.mirror.example/codewhale/releases/latest"
-
-# ─────────────────────────────────────────────────────────────────────────────────
-# Hotbar slots (#2061 / #2064)
-# ─────────────────────────────────────────────────────────────────────────────────
-# Optional 1-8 workbar hotbar bindings. Since #3807 a missing `hotbar` key
-# renders NO bar — the Hotbar is hidden until you configure [[hotbar]]
-# tables here (or via `/hotbar`). An explicit `hotbar = []` also disables it.
-#
-# Invalid slots are skipped with a warning, duplicate slots use the last entry,
-# and unknown actions are preserved so the UI can show a disabled entry.
-# Slash commands can be bound as slash.<name>, for example slash.workflow.
-# `/hotbar on` writes the default slots: slash.workflow, slash.goal, slash.auto,
-# then Plan/Work/Operate, palette, and workbar toggle. Commands that require arguments
-# pre-fill the composer instead of running incomplete.
-#
-# [[hotbar]]
-# slot = 1
-# label = "voice"
-# action = "voice.toggle"
-#
-# [[hotbar]]
-# slot = 2
-# action = "session.compact"
-#
-# [[hotbar]]
-# slot = 3
-# label = "mode"
-# action = "slash.mode"
+# Root-level keys must appear before the first `[table]` header: TOML assigns
+# every key after a header to that table. Keep new top-level keys in this
+# block (scripts/check-config-example.py enforces it in CI).
 
 # ─────────────────────────────────────────────────────────────────────────────────
 # Paths
@@ -187,142 +138,6 @@ memory_path = "~/.codewhale/memory.md"
 # the user-level array wholesale rather than merging — list `~/global.md`
 # inside the project array if you want both. An explicit empty array
 # (`instructions = []`) clears the user list for the current repo.
-
-# ─────────────────────────────────────────────────────────────────────────────────
-# User memory (#489) — opt-in. When enabled, the TUI loads the native store
-# derived from memory_path (see above), injects a bounded recall block into
-# the system prompt, intercepts `# foo` in the composer, and registers the
-# `remember` / `memory_search` / `memory_get` tools.
-# ─────────────────────────────────────────────────────────────────────────────────
-[memory]
-# enabled = true            # turn the feature on (default: false)
-# Override the env-var equivalent: `DEEPSEEK_MEMORY=on`
-
-# Xiaomi MiMo speech/TTS defaults. Also configurable with
-# XIAOMI_MIMO_SPEECH_OUTPUT_DIR / MIMO_SPEECH_OUTPUT_DIR.
-[speech]
-# output_dir = "./speech"
-
-# ─────────────────────────────────────────────────────────────────────────────────
-# Reasoning-only recovery
-# ─────────────────────────────────────────────────────────────────────────────────
-# When a reasoning model returns only hidden thinking without any answer text
-# or tool call, the engine can re-request the answer automatically.
-# Set max_reprompts = 0 to disable automatic recovery entirely.
-# [reasoning_only]
-# max_reprompts = 2
-# reprompt_message = "So, what's up ? Keep running !"
-
-# ───────────────────────────────────────────────────────────────────────────
-# Model-bound key redaction ([redaction])
-# ───────────────────────────────────────────────────────────────────────────
-# Codewhale masks credential-looking values in tool output before it reaches
-# the model (the "model boundary"), so a file that contains a configured API
-# key, a bare provider token, or a credential-shaped opaque string never leaks
-# those bytes to the model. Leave this enabled unless the model must read and
-# edit files that contain real credentials.
-#
-# Disabling is a security decision, so it is never a plain flag:
-#   * Set model_bound = "disabled" here, restart Codewhale, and the startup
-#     gate asks twice - a first confirmation, then a red "are you really
-#     sure?" stage. Only the second confirmation takes effect, and it applies
-#     on later launches while model_bound stays "disabled".
-#   * Going back to "enabled" - or rewriting config.toml after the
-#     confirmation - invalidates it: requesting "disabled" again always
-#     asks for a fresh confirmation.
-#   * Until a confirmation exists - including in non-interactive/headless
-#     runs, which never confirm anything - masking stays on regardless of
-#     this key. Choosing "keep masking on" on the gate leaves the key
-#     untouched, so the next launch asks again.
-#   * The value is forgiving: false/"off" mean "disabled"; true/"on" mean
-#     "enabled".
-# [redaction]
-# model_bound = "enabled"    # mask keys before they reach the model (default)
-# model_bound = "disabled"   # request the opt-out (restart + confirm required)
-
-# Native tool catalog controls (#2076). By default only the core tool surface
-# is loaded into the model context; less common native tools are discoverable
-# through ToolSearch and loaded on first use.
-# [tools]
-# always_load = ["git_show", "notify"]
-#
-# `request_user_input` payload ceilings (#5949). The model may ask up to
-# `user_input_max_questions` questions per call, each offering up to
-# `user_input_max_options` options. Out-of-range values are clamped to the
-# supported ranges (1..=10 and 2..=10) with a warning.
-# user_input_max_questions = 6
-# user_input_max_options = 4
-#
-# Seconds a question or an approval decision waits before it cancels (#6003).
-# 0 disables the timeout entirely; values above 86400 (24h) are clamped.
-# user_input_timeout_seconds = 300
-#
-# Bound an interactive approval card's wait (#6101). When the window elapses
-# the card resolves to deny (fail-closed) and the transcript says the bound
-# denied the call; omitted or 0 waits indefinitely.
-# [approval]
-# timeout_seconds = 300
-
-# ─────────────────────────────────────────────────────────────────────────────────
-# Product telemetry — optional, enabled by default with a startup disclosure
-# ─────────────────────────────────────────────────────────────────────────────────
-# Anonymous usage analytics are enabled when this key is omitted, unless an
-# existing opt-out or a run-scoped kill switch disables them. No first-run
-# affirmative opt-in is required. See docs/TELEMETRY.md for the complete schema.
-# Local session history and usage diagnostics work with telemetry disabled;
-# they require no account or hosted analytics service.
-#
-# Setting it to `false` here is an answer, not just a flag: it deletes the
-# random install id, truncates every buffered event, and leaves a tombstone
-# that a session already running re-checks before it sends anything. Every
-# later run re-reads this key and re-asserts that tombstone, so it stands for
-# as long as the `false` does — and nothing outranks it, not `--telemetry true`
-# and not `CODEWHALE_TELEMETRY=1`. Turning telemetry back on means writing
-# `telemetry = true` here.
-#
-# The environment variable and the flag are different: they stop the run and
-# erase nothing, so a harness that disables telemetry for one command does not
-# discard the machine owner's install id and dry-run records.
-#
-#   codewhale config set telemetry false     # opt out: stops it and erases state
-#   CODEWHALE_TELEMETRY=0 codewhale          # kill switch: stops it, erases nothing
-#
-# What is never collected: prompts, completions, tool arguments, diffs, file
-# contents, filenames, paths, git remotes, repo or branch names, memory
-# entries, chat history, API keys or tokens (not even a boolean saying one
-# exists), model ids, custom provider table names, MCP server names, error or
-# panic message bodies, per-event timestamps, keystrokes, clipboard,
-# screenshots, or location. The complete schema is `docs/TELEMETRY.md`, and a
-# test asserts this file and the serializer agree.
-#
-# A repo-local `.codewhale/config.toml` can set neither key: someone else's
-# repository cannot turn your telemetry on or aim it at a host of their choosing.
-# telemetry = false
-
-# Where batches are POSTed. Leaving this unset selects the shipped default,
-# the first-party ingest service:
-#
-#   https://telemetry.codewhale.net/v1/telemetry
-#
-# That default is only ever consulted for a session that is already enabled —
-# it decides where a batch goes, never whether one exists. Nothing is sent
-# until `telemetry` is on AND the first-run notice was answered with Enable.
-#
-# Two overrides, both of which beat the default:
-#
-#   telemetry_endpoint = "https://collector.internal/v1/batch"  # your own sink
-#   telemetry_endpoint = ""                                     # contact nobody
-#
-# The empty string is the local dry-run sink: batches are serialized exactly as
-# a real endpoint would see them, appended to
-# `$CODEWHALE_HOME/telemetry/dryrun.jsonl`, and no HTTP client is ever
-# constructed. Read that file to see precisely what would have been sent.
-# `CODEWHALE_TELEMETRY_ENDPOINT` overrides this file, and setting it to the
-# empty string means the same "contact nobody".
-#
-# `https://` is required; plain `http://` is accepted only for loopback, and no
-# environment variable overrides that refusal.
-# telemetry_endpoint = "https://telemetry.codewhale.net/v1/telemetry"
 
 # ─────────────────────────────────────────────────────────────────────────────────
 # Security
@@ -498,16 +313,205 @@ sandbox_mode = "workspace-write" # read-only | workspace-write | danger-full-acc
 #                          #   node — character/block devices only, never
 #                          #   directories, so this cannot widen file writes
 
-# auto_allow entries match by command prefix, not raw string.
-# See command_safety.rs for the prefix dictionary.
+# There is no config.toml `auto_allow` key. To pre-approve a command, add an
+# `action = "allow"` rule to permissions.toml `[[rules]]` (see the
+# permissions.toml example above).
+max_subagents = 64 # optional (default 64, clamped to 1-128)
+
+# Optional managed policy paths (defaults to /etc/deepseek/*.toml on unix):
+# managed_config_path = "/etc/deepseek/managed_config.toml"
+# requirements_path = "/etc/deepseek/requirements.toml"
+
+# ─────────────────────────────────────────────────────────────────────────────────
+# Product telemetry — optional, enabled by default with a startup disclosure
+# ─────────────────────────────────────────────────────────────────────────────────
+# Anonymous usage analytics are enabled when this key is omitted, unless an
+# existing opt-out or a run-scoped kill switch disables them. No first-run
+# affirmative opt-in is required. See docs/TELEMETRY.md for the complete schema.
+# Local session history and usage diagnostics work with telemetry disabled;
+# they require no account or hosted analytics service.
 #
-# Examples:
-#   auto_allow = ["git status"]   # auto-approves: git status, git status -s, git status --porcelain
-#                                 # does NOT auto-approve: git push, git checkout
-#   auto_allow = ["cargo check", "npm run"]
+# Setting it to `false` here is an answer, not just a flag: it deletes the
+# random install id, truncates every buffered event, and leaves a tombstone
+# that a session already running re-checks before it sends anything. Every
+# later run re-reads this key and re-asserts that tombstone, so it stands for
+# as long as the `false` does — and nothing outranks it, not `--telemetry true`
+# and not `CODEWHALE_TELEMETRY=1`. Turning telemetry back on means writing
+# `telemetry = true` here.
 #
-# auto_allow = []
-max_subagents = 10 # optional (default 64, clamped to 1-128)
+# The environment variable and the flag are different: they stop the run and
+# erase nothing, so a harness that disables telemetry for one command does not
+# discard the machine owner's install id and dry-run records.
+#
+#   codewhale config set telemetry false     # opt out: stops it and erases state
+#   CODEWHALE_TELEMETRY=0 codewhale          # kill switch: stops it, erases nothing
+#
+# What is never collected: prompts, completions, tool arguments, diffs, file
+# contents, filenames, paths, git remotes, repo or branch names, memory
+# entries, chat history, API keys or tokens (not even a boolean saying one
+# exists), model ids, custom provider table names, MCP server names, error or
+# panic message bodies, per-event timestamps, keystrokes, clipboard,
+# screenshots, or location. The complete schema is `docs/TELEMETRY.md`, and a
+# test asserts this file and the serializer agree.
+#
+# A repo-local `.codewhale/config.toml` can set neither key: someone else's
+# repository cannot turn your telemetry on or aim it at a host of their choosing.
+# telemetry = false
+
+# Where batches are POSTed. Leaving this unset selects the shipped default,
+# the first-party ingest service:
+#
+#   https://telemetry.codewhale.net/v1/telemetry
+#
+# That default is only ever consulted for a session that is already enabled —
+# it decides where a batch goes, never whether one exists. Nothing is sent
+# until `telemetry` is on AND the first-run notice was answered with Enable.
+#
+# Two overrides, both of which beat the default:
+#
+#   telemetry_endpoint = "https://collector.internal/v1/batch"  # your own sink
+#   telemetry_endpoint = ""                                     # contact nobody
+#
+# The empty string is the local dry-run sink: batches are serialized exactly as
+# a real endpoint would see them, appended to
+# `$CODEWHALE_HOME/telemetry/dryrun.jsonl`, and no HTTP client is ever
+# constructed. Read that file to see precisely what would have been sent.
+# `CODEWHALE_TELEMETRY_ENDPOINT` overrides this file, and setting it to the
+# empty string means the same "contact nobody".
+#
+# `https://` is required; plain `http://` is accepted only for loopback, and no
+# environment variable overrides that refusal.
+# telemetry_endpoint = "https://telemetry.codewhale.net/v1/telemetry"
+
+# Signed catalog overlays are optional and inactive without approved trust keys.
+# Explicit route/model selections and provider-owned rosters keep priority.
+# CODEWHALE_DISABLE_CLOUD_FACTS=1 disables cache, local files and network too.
+[cloud_facts]
+enabled = false
+channel = "stable"
+ttl_hours = 6
+# url = "https://codewhale.net/api/facts/v1/{channel}"
+
+# ─────────────────────────────────────────────────────────────────────────────────
+# Startup update check
+# ─────────────────────────────────────────────────────────────────────────────────
+# The TUI checks for newer Codewhale releases in the background at startup.
+# Set check_for_updates = false in managed or air-gapped environments.
+# The result is cached in ~/.codewhale/update-check.json, so the network is
+# touched at most once per check_interval_hours while the notice still shows
+# on every launch. Set 0 to check on every launch.
+# Checks are skipped entirely in CI, and when CODEWHALE_NO_UPDATE_CHECK or
+# NO_UPDATE_NOTIFIER is set.
+# update_uri may point at a GitHub-compatible latest-release JSON endpoint.
+[update]
+check_for_updates = true
+check_interval_hours = 24
+# update_uri = "https://internal.mirror.example/codewhale/releases/latest"
+
+# ─────────────────────────────────────────────────────────────────────────────────
+# Hotbar slots (#2061 / #2064)
+# ─────────────────────────────────────────────────────────────────────────────────
+# Optional hotbar bindings for slots 1-8. Since #3807 the Hotbar is hidden by
+# default: an omitted `hotbar` key and an explicit `hotbar = []` both mean no
+# hotbar. It shows only when [[hotbar]] tables are configured here, and
+# `/hotbar on` writes the eight default slots as explicit [[hotbar]] tables:
+#   1 slash.workflow  2 slash.goal  3 slash.auto  4 mode.plan
+#   5 mode.agent      6 mode.operate  7 palette.open  8 sidebar.toggle
+#
+# Invalid slots are skipped with a warning, duplicate slots use the last entry,
+# and unknown actions are preserved so the UI can show a disabled entry.
+# Slash commands can be bound as slash.<name>, for example slash.workflow.
+# Commands that require arguments pre-fill the composer instead of running
+# incomplete.
+#
+# [[hotbar]]
+# slot = 1
+# label = "voice"
+# action = "voice.toggle"
+#
+# [[hotbar]]
+# slot = 2
+# action = "session.compact"
+#
+# [[hotbar]]
+# slot = 3
+# label = "mode"
+# action = "slash.mode"
+
+# ─────────────────────────────────────────────────────────────────────────────────
+# User memory (#489) — opt-in. When enabled, the TUI loads the native store
+# derived from memory_path (see above), injects a bounded recall block into
+# the system prompt, intercepts `# foo` in the composer, and registers the
+# `remember` / `memory_search` / `memory_get` tools.
+# ─────────────────────────────────────────────────────────────────────────────────
+[memory]
+# enabled = true            # turn the feature on (default: false)
+# Override the env-var equivalent: `DEEPSEEK_MEMORY=on`
+
+# Xiaomi MiMo speech/TTS defaults. Also configurable with
+# XIAOMI_MIMO_SPEECH_OUTPUT_DIR / MIMO_SPEECH_OUTPUT_DIR.
+[speech]
+# output_dir = "./speech"
+
+# ─────────────────────────────────────────────────────────────────────────────────
+# Reasoning-only recovery
+# ─────────────────────────────────────────────────────────────────────────────────
+# When a reasoning model returns only hidden thinking without any answer text
+# or tool call, the engine can re-request the answer automatically.
+# Set max_reprompts = 0 to disable automatic recovery entirely.
+# [reasoning_only]
+# max_reprompts = 2
+# reprompt_message = "So, what's up ? Keep running !"
+
+# ───────────────────────────────────────────────────────────────────────────
+# Model-bound key redaction ([redaction])
+# ───────────────────────────────────────────────────────────────────────────
+# Codewhale masks credential-looking values in tool output before it reaches
+# the model (the "model boundary"), so a file that contains a configured API
+# key, a bare provider token, or a credential-shaped opaque string never leaks
+# those bytes to the model. Leave this enabled unless the model must read and
+# edit files that contain real credentials.
+#
+# Disabling is a security decision, so it is never a plain flag:
+#   * Set model_bound = "disabled" here, restart Codewhale, and the startup
+#     gate asks twice - a first confirmation, then a red "are you really
+#     sure?" stage. Only the second confirmation takes effect, and it applies
+#     on later launches while model_bound stays "disabled".
+#   * Going back to "enabled" - or rewriting config.toml after the
+#     confirmation - invalidates it: requesting "disabled" again always
+#     asks for a fresh confirmation.
+#   * Until a confirmation exists - including in non-interactive/headless
+#     runs, which never confirm anything - masking stays on regardless of
+#     this key. Choosing "keep masking on" on the gate leaves the key
+#     untouched, so the next launch asks again.
+#   * The value is forgiving: false/"off" mean "disabled"; true/"on" mean
+#     "enabled".
+# [redaction]
+# model_bound = "enabled"    # mask keys before they reach the model (default)
+# model_bound = "disabled"   # request the opt-out (restart + confirm required)
+
+# Native tool catalog controls (#2076). By default only the core tool surface
+# is loaded into the model context; less common native tools are discoverable
+# through ToolSearch and loaded on first use.
+# [tools]
+# always_load = ["git_show", "notify"]
+#
+# `request_user_input` payload ceilings (#5949). The model may ask up to
+# `user_input_max_questions` questions per call, each offering up to
+# `user_input_max_options` options. Out-of-range values are clamped to the
+# supported ranges (1..=10 and 2..=10) with a warning.
+# user_input_max_questions = 6
+# user_input_max_options = 4
+#
+# Seconds a question or an approval decision waits before it cancels (#6003).
+# 0 disables the timeout entirely; values above 86400 (24h) are clamped.
+# user_input_timeout_seconds = 300
+#
+# Bound an interactive approval card's wait (#6101). When the window elapses
+# the card resolves to deny (fail-closed) and the transcript says the bound
+# denied the call; omitted or 0 waits indefinitely.
+# [approval]
+# timeout_seconds = 300
 
 # Optional sub-agent tuning. max_concurrent overrides top-level max_subagents.
 # [subagents]
@@ -522,10 +526,6 @@ max_subagents = 10 # optional (default 64, clamped to 1-128)
 # limit is enforced in code, not requested of the model — a sub-agent past the
 # limit cannot be spawned regardless of what the model decides.
 # max_depth = 3
-
-# Optional managed policy paths (defaults to /etc/deepseek/*.toml on unix):
-# managed_config_path = "/etc/deepseek/managed_config.toml"
-# requirements_path = "/etc/deepseek/requirements.toml"
 
 # ─────────────────────────────────────────────────────────────────────────────────
 # Per-provider credentials (peer providers — NIM is first-class, not a flag)
@@ -965,7 +965,7 @@ base_url = "https://api.deepseek.com/beta"
 #   OPENAI_CODEX_ACCOUNT_ID / CODEX_ACCOUNT_ID, OPENAI_CODEX_AUTH_FILE, CODEX_HOME
 [providers.openai_codex]
 # base_url = "https://chatgpt.com/backend-api"
-# model = "gpt-5.5"
+# model = "gpt-5.6"
 # The CLI writes this table after informed consent; do not copy it between
 # providers or machines. Absence means disabled.
 # [providers.openai_codex.external_credentials]
@@ -1169,6 +1169,15 @@ stream_chunk_timeout_secs = 900 # optional SSE idle timeout per chunk (0 = defau
 # Stream budgets remain finite; 0 selects their default.
 stream_max_content_mb = 10   # per-step cap on streamed content (0 = default, 1-512)
 stream_max_duration_secs = 1800 # per-step cap on one stream's duration (0 = default, 10-86400)
+# Stream retry budgets and transport timeouts. Every failed stream — one that
+# never opened, died before content, or dropped mid-stream — spends
+# stream_max_resumes. For the two retry counts 0 disables that retry kind;
+# stream_max_errors is a finite budget, so 0 selects its default.
+# stream_max_resumes = 3             # re-issue a failed stream's request (0 = off, 0-10)
+# stream_max_transparent_retries = 2 # in-stream re-request before any content (0 = off, 0-10)
+# stream_max_errors = 5              # recoverable errors tolerated per stream (0 = default, 1-50)
+# stream_open_timeout_secs = 45      # response-header wait (0 = env/default, 5-300)
+# connect_timeout_secs = 30          # TCP/TLS connect timeout (0 = default, 1-300)
 osc8_links = true            # emit OSC 8 escapes around URLs (Cmd+click in iTerm2/Ghostty/Kitty/WezTerm/Terminal.app 13+); set false for terminals that misrender
 # What the bottom chrome shows. Each key is one thing on screen: `mode` is the
 # posture bar's plan/act/operate chip, everything else is a segment of the
@@ -1238,8 +1247,12 @@ exec_policy = true
                         # Set false to remove it from the model's tool catalog.
 # extension_host = false # EXPERIMENTAL. Run reviewed plugins' `native` host code
                         # (TypeScript/JavaScript, Cordis/DSH plugin model) in a
-                        # Node.js sidecar. Tools only in this phase; every
-                        # extension tool always asks for approval. On macOS
+                        # Node.js sidecar. Tools only in this phase. Every
+                        # extension tool is always Required and never
+                        # read-only; like any Required tool it runs without
+                        # a prompt under Full Access, under Bypass, or with a
+                        # matching session grant, which is bound to the
+                        # plugin's reviewed build (an update asks again). On macOS
                         # the host runs under Seatbelt (no network, no reads of
                         # ~/.codewhale secrets/credentials/config/sessions,
                         # writes only to its data dir and temp dirs); on Linux

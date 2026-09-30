@@ -1,6 +1,6 @@
 # Community Assistant Agent
 
-The community assistant is a set of Cloudflare Cron Triggers that call `deepseek-v4-flash` to draft triage comments, PR reviews, stale-issue nudges, duplicate suggestions, and weekly digests. **It never posts to GitHub directly.** Every output is a draft staged in Workers KV for maintainer review.
+The community assistant is a set of Cloudflare Cron Triggers that call `deepseek-flash` to draft triage comments, PR reviews, stale-issue nudges, duplicate suggestions, and weekly digests. **It never posts to GitHub directly.** Every output is a draft staged in Workers KV for maintainer review.
 
 ## Architecture
 

@@ -262,6 +262,7 @@ fn tool_use(id: &str, name: &str, input: Value) -> Message {
     Message {
         role: Role::Assistant,
         content: vec![ContentBlock::ToolUse {
+            execution_id: None,
             id: id.into(),
             name: name.into(),
             input,
@@ -275,6 +276,7 @@ fn tool_result(id: &str, content: &str, is_error: bool) -> Message {
     Message {
         role: Role::User,
         content: vec![ContentBlock::ToolResult {
+            execution_id: None,
             tool_use_id: id.into(),
             content: content.into(),
             is_error: is_error.then_some(true),
@@ -1067,4 +1069,77 @@ fn a_repeated_prompt_does_not_take_another_turns_snapshots() {
         "{:?}",
         receipt.not_recorded
     );
+}
+
+#[test]
+fn session_receipts_join_only_unambiguous_execution_identities() {
+    let messages: Vec<Message> = serde_json::from_value(json!([
+        {"role":"assistant","content":[{"type":"tool_use","id":"wire","execution_id":"first","name":"bash","input":{"command":"echo first"}}]},
+        {"role":"user","content":[{"type":"tool_result","tool_use_id":"wire","execution_id":"first","content":"first"}]},
+        {"role":"assistant","content":[{"type":"tool_use","id":"wire","execution_id":"second","name":"bash","input":{"command":"echo second"}}]},
+        {"role":"user","content":[{"type":"tool_result","tool_use_id":"wire","execution_id":"second","content":"second"}]}
+    ])).unwrap();
+    let approvals = vec![
+        ApprovalReceipt::asked("first", "bash"),
+        ApprovalReceipt::decided("first", ApprovalOutcome::ApprovedOnce),
+    ];
+    let receipt = session_receipt(session_source_fixture(), &messages, &approvals, None).unwrap();
+    let commands = receipt
+        .actions
+        .iter()
+        .filter(|action| matches!(action.what, ActionKind::Command { .. }))
+        .collect::<Vec<_>>();
+    assert_eq!(commands.len(), 2);
+    assert_eq!(commands[0].call_id.as_deref(), Some("first"));
+    assert!(commands[0].approval.is_some());
+    assert_eq!(commands[1].call_id.as_deref(), Some("second"));
+    assert!(commands[1].approval.is_none());
+    assert_eq!(commands[1].status, ActionStatus::Ok);
+
+    // Duplicate local IDs, repeated legacy IDs, and mixed domains with the
+    // same string cannot lend one stored approval to multiple calls.
+    for (first, second, wire) in [
+        (Some("wire"), Some("wire"), "provider"),
+        (None, None, "wire"),
+        (Some("wire"), None, "wire"),
+    ] {
+        let ambiguous: Vec<Message> = serde_json::from_value(json!([
+            {"role":"assistant","content":[{"type":"tool_use","id":wire,"execution_id":first,"name":"bash","input":{"command":"echo a"}}]},
+            {"role":"user","content":[{"type":"tool_result","tool_use_id":wire,"execution_id":first,"content":"a"}]},
+            {"role":"assistant","content":[{"type":"tool_use","id":wire,"execution_id":second,"name":"bash","input":{"command":"echo b"}}]},
+            {"role":"user","content":[{"type":"tool_result","tool_use_id":wire,"execution_id":second,"content":"b"}]}
+        ])).unwrap();
+        let approvals = vec![
+            ApprovalReceipt::asked("wire", "bash"),
+            ApprovalReceipt::decided("wire", ApprovalOutcome::ApprovedOnce),
+        ];
+        let receipt =
+            session_receipt(session_source_fixture(), &ambiguous, &approvals, None).unwrap();
+        assert!(
+            receipt
+                .actions
+                .iter()
+                .filter(|action| matches!(action.what, ActionKind::Command { .. }))
+                .all(|action| action.approval.is_none() && action.call_id.is_none())
+        );
+        assert!(
+            receipt
+                .not_recorded
+                .iter()
+                .any(|note| note.contains("unique approval association"))
+        );
+    }
+    for (call, result, wire) in [
+        (Some(""), Some(""), "wire"),
+        (Some("first"), None, "wire"),
+        (Some("first"), Some("first"), "other"),
+    ] {
+        let invalid: Vec<Message> = serde_json::from_value(json!([
+            {"role":"assistant","content":[{"type":"tool_use","id":"wire","execution_id":call,"name":"bash","input":{"command":"echo a"}}]},
+            {"role":"user","content":[{"type":"tool_result","tool_use_id":wire,"execution_id":result,"content":"not this execution"}]}
+        ])).unwrap();
+        let (steps, _, _) = steps_from_messages(&invalid);
+        assert_eq!(steps[0].outcome, StepOutcome::Unknown);
+        assert!(steps[0].output.is_none());
+    }
 }

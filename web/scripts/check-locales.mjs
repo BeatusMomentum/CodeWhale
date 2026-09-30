@@ -42,13 +42,17 @@ const OPTIONAL_FILES = [
   "docs-auth.ts",
   "docs-trust.ts",
   "docs-work.ts",
+  "docs-vocabulary.ts",
   "states.ts",
   "changelog.ts",
   "legal-terms.ts",
   "legal-privacy.ts",
   "digest.ts",
+  "feed.ts",
   "faq.ts",
   "roadmap.ts",
+  "contribute.ts",
+  "constitution.ts",
   "computer-use.ts",
 ];
 

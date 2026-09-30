@@ -1,4 +1,4 @@
-<!-- source: README.md sha256:ccb7a0b00317 -->
+<!-- source: README.md sha256:925619135f77 -->
 # Codewhale
 
 Codewhale és un agent de codi obert que llegeix el teu projecte, edita fitxers, executa ordres i comprova la seva feina amb un model allotjat o local que tu tries. Comença amb una tasca al terminal. Per a una feina més gran, assigna parts de la feina a agents amb models i rols diferents.
@@ -23,6 +23,8 @@ curl -fsSL https://codewhale.net/install.sh | sh
 "$HOME/.local/bin/codewhale"
 ```
 
+Si en executar només `codewhale` apareix "command not found", `~/.local/bin` encara no és al teu PATH: executa la línia que l’instal·lador mostra per al teu shell o consulta [Afegir-lo al PATH](docs/INSTALL.md#put-it-on-your-path).
+
 L’instal·lador selecciona l’última versió publicada. El [registre de canvis](CHANGELOG.md) també descriu la versió candidata, encara no publicada, de la pròxima versió; aquests canvis no s’inclouen en les descàrregues publicades fins que la versió està disponible.
 
 A Windows, descarrega l’instal·lador o l’arxiu corresponent de [GitHub Releases](https://github.com/Hmbown/CodeWhale/releases/latest). Per actualitzar una instal·lació directa existent, executa `codewhale update`, o `codewhale update --check` només per comprovar-la. L’actualitzador mostra el camí de l’executable i conserva les compilacions més noves. npm i Cargo són opcions secundàries; consulta la [guia d’instal·lació](docs/INSTALL.md) per migrar una instal·lació gestionada per paquets i configurar PATH.
@@ -33,7 +35,7 @@ L’autocompleció amb Tab s’activa amb una sola ordre per shell — `codewhal
 
 ## Ús
 
-Obre un terminal a la carpeta del teu projecte i executa `codewhale`. Tria el proveïdor amb `/provider` i el model amb `/model`. Després, descriu una tasca concreta:
+Obre un terminal a la carpeta del teu projecte i executa `codewhale` (un cop sigui [al teu PATH](docs/INSTALL.md#put-it-on-your-path)). Tria el proveïdor amb `/provider` i el model amb `/model`. Després, descriu una tasca concreta:
 
 ```text
 Fix the failing tests and explain what changed.
@@ -76,6 +78,7 @@ Llegeix l’[ordre d’autorització](docs/AUTHORIZATION_ORDER.md) per conèixer
 
 ## Documentació
 
+- [Configuració de les revisions de PR a GitHub](docs/GITHUB_ACTION.md)
 - [Proveïdors i models locals](docs/PROVIDERS.md)
 - [Equips d’agents](docs/FLEET.md)
 - [MCP](docs/MCP.md), [hooks](docs/HOOKS.md) i [configuració](docs/CONFIGURATION.md)

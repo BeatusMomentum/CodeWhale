@@ -2,8 +2,8 @@ use std::collections::BTreeMap;
 
 use chrono::{DateTime, Duration, Utc};
 use codewhale_config::route::{
-    LimitField, LogicalModelRef, OverrideSource, ReadyRouteCandidate, RouteLimits, RouteRequest,
-    RouteResolver, SourcedLimitOverride, WireModelId,
+    LimitField, LogicalModelRef, OverrideSource, ReadyRouteCandidate, RouteError, RouteLimits,
+    RouteRequest, RouteResolver, SourcedLimitOverride, WireModelId,
 };
 use serde::Serialize;
 
@@ -249,24 +249,52 @@ impl std::fmt::Debug for ValidatedRuntimeRoute {
     }
 }
 
+/// Who reads a route preflight failure. The interactive app can run slash
+/// commands; a headless caller only has the CLI. Only `codewhale exec` asks
+/// for [`Self::Headless`] today (through [`ResolvedRuntimeRoute::validate_for`]);
+/// `preflight` and other callers keep the interactive wording.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RouteErrorSurface {
+    Interactive,
+    Headless,
+}
+
 impl ResolvedRuntimeRoute {
     pub(crate) fn preflight(mut self) -> Result<Self, String> {
         if self.preflighted_client.is_none() {
             self.preflighted_client = Some(
                 CodewhaleClient::from_candidate(&self.config, &self.candidate).map_err(|err| {
-                    format_provider_route_preflight_error(&self.identity.key, &self.model, &err)
+                    format_provider_route_preflight_error(
+                        &self.identity.key,
+                        &self.model,
+                        &err,
+                        RouteErrorSurface::Interactive,
+                    )
                 })?,
             );
         }
         Ok(self)
     }
 
-    pub(crate) fn validate(mut self) -> Result<ValidatedRuntimeRoute, String> {
+    pub(crate) fn validate(self) -> Result<ValidatedRuntimeRoute, String> {
+        self.validate_for(RouteErrorSurface::Interactive)
+    }
+
+    /// [`Self::validate`] with next steps worded for `surface`.
+    pub(crate) fn validate_for(
+        mut self,
+        surface: RouteErrorSurface,
+    ) -> Result<ValidatedRuntimeRoute, String> {
         let client = match self.preflighted_client.take() {
             Some(client) => client,
             None => {
                 CodewhaleClient::from_candidate(&self.config, &self.candidate).map_err(|err| {
-                    format_provider_route_preflight_error(&self.identity.key, &self.model, &err)
+                    format_provider_route_preflight_error(
+                        &self.identity.key,
+                        &self.model,
+                        &err,
+                        surface,
+                    )
                 })?
             }
         };
@@ -289,34 +317,61 @@ fn format_provider_route_preflight_error(
     identity_key: &str,
     model: &str,
     err: &anyhow::Error,
+    surface: RouteErrorSurface,
 ) -> String {
-    let reason = err.to_string().trim().to_string();
-    let mut message = format!(
-        "{}. Failed to configure provider route {} / {}.",
-        reason, identity_key, model
-    );
-    if let Some(next_step) = classify_provider_route_preflight_next_step(identity_key, &reason) {
-        message.push_str(" Next step: ");
+    let reason = err.to_string();
+    let reason = reason.trim();
+    // Multi-line guidance ends in a command to copy; a period appended to it
+    // would break the paste, so it gets a line break instead.
+    let multi_line = reason.contains('\n');
+    let mut message = if multi_line {
+        format!("{reason}\nFailed to configure provider route {identity_key} / {model}.")
+    } else {
+        format!(
+            "{}. Failed to configure provider route {identity_key} / {model}.",
+            reason.trim_end_matches('.')
+        )
+    };
+    if let Some(next_step) =
+        classify_provider_route_preflight_next_step(identity_key, reason, surface)
+    {
+        message.push_str(if multi_line { "\n" } else { " " });
+        message.push_str("Next step: ");
         message.push_str(&next_step);
     }
     message
 }
 
-fn classify_provider_route_preflight_next_step(identity_key: &str, reason: &str) -> Option<String> {
+fn classify_provider_route_preflight_next_step(
+    identity_key: &str,
+    reason: &str,
+    surface: RouteErrorSurface,
+) -> Option<String> {
+    let headless = surface == RouteErrorSurface::Headless;
     let lower = reason.to_ascii_lowercase();
     if lower
         .contains("codex oauth credentials are only available on the official openai codex route")
     {
-        return Some(format!(
-            "Run /provider setup {identity_key} and remove its custom base URL; Codex OAuth only works on the official route."
-        ));
+        return Some(if headless {
+            format!(
+                "Remove the custom base_url from [providers.{identity_key}]; Codex OAuth only works on the official route."
+            )
+        } else {
+            format!(
+                "Run /provider setup {identity_key} and remove its custom base URL; Codex OAuth only works on the official route."
+            )
+        });
     }
     if lower.contains("openai codex oauth credentials are unavailable")
         || lower.contains("codex access token")
     {
-        return Some(format!(
-            "Run `codewhale auth chatgpt` or /provider setup {identity_key} to Sign in with ChatGPT; Codex CLI import remains an explicit alternative."
-        ));
+        return Some(if headless {
+            "Run `codewhale auth chatgpt` to Sign in with ChatGPT; Codex CLI import remains an explicit alternative.".to_string()
+        } else {
+            format!(
+                "Run `codewhale auth chatgpt` or /provider setup {identity_key} to Sign in with ChatGPT; Codex CLI import remains an explicit alternative."
+            )
+        });
     }
     if lower.contains("api key not found")
         || lower.contains("access token")
@@ -325,9 +380,35 @@ fn classify_provider_route_preflight_next_step(identity_key: &str, reason: &str)
                 || lower.contains("missing")
                 || lower.contains("unsupported")))
     {
-        return Some(format!(
-            "Run /auth or /provider setup {identity_key} to configure credentials."
-        ));
+        if !headless {
+            return Some(format!(
+                "Run /auth or /provider setup {identity_key} to configure credentials."
+            ));
+        }
+        // The reason usually names its own command (`codewhale auth set`,
+        // `codewhale auth chatgpt`, `codewhale auth xai-device`, ...);
+        // repeating one would make two instructions out of one.
+        if lower.contains("codewhale auth") {
+            return None;
+        }
+        // `auth set` stores an API key. An access-token or other credential
+        // failure may belong to an OAuth route, where it is the wrong fix.
+        if !lower.contains("api key") {
+            return Some(
+                "Run `codewhale doctor` to see which credential this route needs.".to_string(),
+            );
+        }
+        return Some(
+            match ApiProvider::parse(identity_key).filter(|p| *p != ApiProvider::Custom) {
+                Some(provider) => {
+                    format!("Run `codewhale auth set --provider {}`.", provider.as_str())
+                }
+                // A custom identity's key is its `[providers.<name>]` table.
+                None => format!(
+                    "Add api_key or api_key_env to [providers.{identity_key}] in config.toml."
+                ),
+            },
+        );
     }
     if lower.contains("tls certificate")
         || lower.contains("ssl_cert_file")
@@ -336,9 +417,11 @@ fn classify_provider_route_preflight_next_step(identity_key: &str, reason: &str)
         || lower.contains("base url")
         || lower.contains("invalid url")
     {
-        return Some(format!(
-            "Run /provider setup {identity_key} to fix base URL/TLS settings."
-        ));
+        return Some(if headless {
+            format!("Fix base_url/TLS settings in [providers.{identity_key}] of config.toml.")
+        } else {
+            format!("Run /provider setup {identity_key} to fix base URL/TLS settings.")
+        });
     }
     if lower.contains("provider")
         && lower.contains("model")
@@ -347,10 +430,13 @@ fn classify_provider_route_preflight_next_step(identity_key: &str, reason: &str)
             || lower.contains("unknown")
             || lower.contains("not found"))
     {
-        return Some(
+        return Some(if headless {
+            "Pass a model this provider serves with --model (`codewhale models` lists them)."
+                .to_string()
+        } else {
             "Run /models (or open the model picker) and choose a model valid for this provider."
-                .to_string(),
-        );
+                .to_string()
+        });
     }
     if lower.contains("fleet") || lower.contains("profile") || lower.contains("partial route") {
         return Some(
@@ -358,9 +444,11 @@ fn classify_provider_route_preflight_next_step(identity_key: &str, reason: &str)
                 .to_string(),
         );
     }
-    Some(format!(
-        "Run /provider setup {identity_key} to review this route configuration."
-    ))
+    Some(if headless {
+        "Run `codewhale doctor` to review this route configuration.".to_string()
+    } else {
+        format!("Run /provider setup {identity_key} to review this route configuration.")
+    })
 }
 
 impl ValidatedRuntimeRoute {
@@ -473,6 +561,7 @@ pub(crate) fn resolve_declared_model_candidate(
         None,
         &resolver,
         false,
+        false,
     )
 }
 
@@ -495,7 +584,31 @@ pub(crate) fn resolve_route_candidate_with_context_metadata(
         provider_reported_context,
         &RouteResolver::new(),
         false,
+        false,
     )
+}
+
+/// #6705: OpenCode Zen is the one model-aware route whose protocol roster
+/// comes from the Models.dev snapshot, and only the provider-lake resolver
+/// carries that snapshot. There, an unproven Zen model may simply be newer than
+/// the loaded catalog, so name the refresh that can prove it. Anywhere else a
+/// refresh cannot change the answer and is not offered.
+fn route_error_text(
+    provider: ApiProvider,
+    resolver_reads_models_dev: bool,
+    err: &RouteError,
+) -> String {
+    let text = err.to_string();
+    match err {
+        RouteError::UnsupportedModelProtocol { endpoint_key, .. }
+            if resolver_reads_models_dev
+                && provider == ApiProvider::OpencodeZen
+                && endpoint_key == "unproven" =>
+        {
+            format!("{text}, or refresh the Models.dev catalog with `codewhale models --update`")
+        }
+        _ => text,
+    }
 }
 
 fn resolve_route_candidate_with_catalog_resolver(
@@ -508,6 +621,7 @@ fn resolve_route_candidate_with_catalog_resolver(
     provider_reported_context: Option<ProviderReportedKimiCodeContext>,
     resolver: &RouteResolver,
     endpoint_catalog_authoritative: bool,
+    resolver_reads_models_dev: bool,
 ) -> Result<RouteCandidateResolution, String> {
     let effective_base_url = base_url_override
         .as_deref()
@@ -536,7 +650,8 @@ fn resolve_route_candidate_with_catalog_resolver(
             resolver.resolve(request)
         }
     };
-    let resolved = resolve(&base_request).map_err(|err| err.to_string())?;
+    let route_error = |err: RouteError| route_error_text(provider, resolver_reads_models_dev, &err);
+    let resolved = resolve(&base_request).map_err(route_error)?;
     let plan = plan_limit_overrides(
         provider,
         &resolved,
@@ -551,7 +666,7 @@ fn resolve_route_candidate_with_catalog_resolver(
             limit_overrides: plan.overrides,
             ..base_request
         })
-        .map_err(|err| err.to_string())?
+        .map_err(route_error)?
     };
     Ok(RouteCandidateResolution {
         candidate,
@@ -867,6 +982,7 @@ pub(crate) fn resolve_runtime_route_for_identity(
             None,
             &catalog.resolver,
             catalog.endpoint_catalog_authoritative,
+            true,
         )?
     } else {
         resolve_route_candidate_with_context_metadata(
@@ -1158,7 +1274,12 @@ mod tests {
         let err = anyhow::anyhow!(
             "Custom provider 'lm-studio' API key not found. Run 'codewhale auth set --provider custom'."
         );
-        let formatted = format_provider_route_preflight_error("lm-studio", "local-model", &err);
+        let formatted = format_provider_route_preflight_error(
+            "lm-studio",
+            "local-model",
+            &err,
+            RouteErrorSurface::Interactive,
+        );
 
         assert!(formatted.starts_with("Custom provider 'lm-studio' API key not found."));
         assert!(formatted.contains("Failed to configure provider route lm-studio / local-model."));
@@ -1168,10 +1289,70 @@ mod tests {
     }
 
     #[test]
+    fn provider_route_preflight_headless_missing_key_is_one_cli_message() {
+        let single = anyhow::anyhow!(
+            "Custom provider 'lm-studio' API key not found. Run 'codewhale auth set --provider custom'."
+        );
+        let formatted = format_provider_route_preflight_error(
+            "lm-studio",
+            "local-model",
+            &single,
+            RouteErrorSurface::Headless,
+        );
+        assert!(!formatted.contains(".."), "{formatted}");
+        assert!(!formatted.contains("/auth"), "{formatted}");
+        assert!(!formatted.contains("/provider"), "{formatted}");
+        assert!(!formatted.contains("Next step"), "{formatted}");
+
+        let bare = anyhow::anyhow!("DeepSeek API key not found.");
+        let formatted = format_provider_route_preflight_error(
+            "deepseek",
+            "deepseek-v4-flash",
+            &bare,
+            RouteErrorSurface::Headless,
+        );
+        assert_eq!(
+            formatted,
+            "DeepSeek API key not found. Failed to configure provider route deepseek / deepseek-v4-flash. Next step: Run `codewhale auth set --provider deepseek`."
+        );
+
+        // An OAuth access-token failure is not an `auth set` (API key) fix.
+        let oauth = anyhow::anyhow!("OAuth access token is empty");
+        let formatted = format_provider_route_preflight_error(
+            "xai",
+            "grok-4",
+            &oauth,
+            RouteErrorSurface::Headless,
+        );
+        assert!(!formatted.contains("auth set"), "{formatted}");
+        assert!(formatted.contains("codewhale doctor"), "{formatted}");
+
+        let multi = anyhow::anyhow!(
+            "DeepSeek API key not found.\n\n  codewhale auth set --provider deepseek"
+        );
+        let formatted = format_provider_route_preflight_error(
+            "deepseek",
+            "deepseek-v4-flash",
+            &multi,
+            RouteErrorSurface::Headless,
+        );
+        assert!(
+            formatted.contains(
+                "\n  codewhale auth set --provider deepseek\nFailed to configure provider route"
+            ),
+            "{formatted}"
+        );
+    }
+
+    #[test]
     fn provider_route_preflight_codex_oauth_errors_surface_the_right_next_step() {
         let missing = anyhow::anyhow!("OpenAI Codex OAuth credentials are unavailable.");
-        let missing_formatted =
-            format_provider_route_preflight_error("openai-codex", "gpt-5.6-sol", &missing);
+        let missing_formatted = format_provider_route_preflight_error(
+            "openai-codex",
+            "gpt-5.6-sol",
+            &missing,
+            RouteErrorSurface::Interactive,
+        );
         assert!(missing_formatted.contains(
             "Next step: Run `codewhale auth chatgpt` or /provider setup openai-codex to Sign in with ChatGPT; Codex CLI import remains an explicit alternative."
         ));
@@ -1179,8 +1360,12 @@ mod tests {
         let custom = anyhow::anyhow!(
             "Codex OAuth credentials are only available on the official OpenAI Codex route"
         );
-        let custom_formatted =
-            format_provider_route_preflight_error("openai-codex", "gpt-5.6-sol", &custom);
+        let custom_formatted = format_provider_route_preflight_error(
+            "openai-codex",
+            "gpt-5.6-sol",
+            &custom,
+            RouteErrorSurface::Interactive,
+        );
         assert!(custom_formatted.contains(
             "Next step: Run /provider setup openai-codex and remove its custom base URL; Codex OAuth only works on the official route."
         ));
@@ -1191,7 +1376,12 @@ mod tests {
         let err = anyhow::anyhow!(
             "TLS certificate verification cannot be disabled for provider custom; configure SSL_CERT_FILE with a trusted custom CA bundle instead"
         );
-        let formatted = format_provider_route_preflight_error("lm-studio", "local-model", &err);
+        let formatted = format_provider_route_preflight_error(
+            "lm-studio",
+            "local-model",
+            &err,
+            RouteErrorSurface::Interactive,
+        );
 
         assert!(
             formatted
@@ -2426,6 +2616,42 @@ mod tests {
         assert_eq!(
             route.candidate.endpoint().base_url,
             "http://gpu.internal.example:8000/v1"
+        );
+    }
+
+    /// #6705: only the lake-backed OpenCode Zen route reads a refreshed
+    /// Models.dev catalog, so only it is told to refresh.
+    #[test]
+    fn catalog_refresh_remedy_is_scoped_to_the_lake_backed_zen_route() {
+        let unproven = |provider: &str| RouteError::UnsupportedModelProtocol {
+            provider: provider.into(),
+            model: "new-model".to_string(),
+            endpoint_key: "unproven".to_string(),
+        };
+        let remedy = "codewhale models --update";
+        assert!(
+            route_error_text(ApiProvider::OpencodeZen, true, &unproven("opencode-zen"))
+                .contains(remedy)
+        );
+        // OpenCode Go's roster is compiled, and a bundled-only resolver
+        // never sees the refreshed catalog.
+        assert!(
+            !route_error_text(ApiProvider::OpencodeGo, true, &unproven("opencode-go"))
+                .contains(remedy)
+        );
+        assert!(
+            !route_error_text(ApiProvider::OpencodeZen, false, &unproven("opencode-zen"))
+                .contains(remedy)
+        );
+        let deprecated = RouteError::UnsupportedModelProtocol {
+            provider: "opencode-zen".into(),
+            model: "claude-2-retired".to_string(),
+            endpoint_key: "deprecated".to_string(),
+        };
+        let text = route_error_text(ApiProvider::OpencodeZen, true, &deprecated);
+        assert!(
+            text.contains("deprecated") && !text.contains(remedy),
+            "{text}"
         );
     }
 }

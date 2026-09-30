@@ -660,6 +660,9 @@ fn deterministic_fallback(
 }
 
 fn file_write_target_paths(tool_name: &str, input: &Value) -> Option<Vec<String>> {
+    // Judge the path the tool will write: it folds `file_path`/`filePath`
+    // onto `path` before executing.
+    let input = &*crate::tools::file::with_canonical_path_argument(input);
     let canonical = crate::tools::canonical_action::canonical_action_alias(tool_name, input);
     Some(match canonical {
         "write_file" | "edit_file" => vec![
@@ -695,6 +698,7 @@ fn file_write_delete_paths(
     input: &Value,
     workspace: Option<&std::path::Path>,
 ) -> Vec<String> {
+    let input = &*crate::tools::file::with_canonical_path_argument(input);
     let empties_existing = |entry: &Value| -> Option<String> {
         let path = entry
             .get("path")
@@ -2505,6 +2509,19 @@ mod tests {
         let ctx = auto_write_ctx("write_file", &empty, root);
         assert_eq!(ctx.unrecoverable_deletes, vec!["untracked.txt".to_string()]);
         assert_eq!(policy.evaluate(&ctx).action, AutoReviewAction::AskUser);
+
+        // The tool folds `file_path`/`filePath` onto `path`; so does review.
+        for key in ["file_path", "filePath"] {
+            let aliased = json!({key: "untracked.txt", "content": ""});
+            let ctx = auto_write_ctx("write_file", &aliased, root);
+            assert_eq!(
+                ctx.unrecoverable_deletes,
+                vec!["untracked.txt".to_string()],
+                "{key}"
+            );
+            assert!(ctx.write_targets_bounded, "{key}");
+            assert_eq!(policy.evaluate(&ctx).action, AutoReviewAction::AskUser);
+        }
 
         let replace = json!({"replace": [
             {"path": "untracked.txt", "content": ""},

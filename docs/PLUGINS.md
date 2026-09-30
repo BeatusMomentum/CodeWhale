@@ -1,5 +1,7 @@
 # Installing plugins
 
+> 阅读简体中文版：[zh_hans/PLUGINS.md](zh_hans/PLUGINS.md)。
+
 To create a bundle, start with [Write your first Codewhale plugin](PLUGIN_AUTHORING.md)
 and its runnable Skills example.
 

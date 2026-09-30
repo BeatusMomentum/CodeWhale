@@ -12,6 +12,7 @@ import {
 import { DOC_TASKS, docTaskHaystack, type DocTask } from "@/lib/docs-tasks";
 import { fill, getDocsShell, pickText } from "@/lib/i18n/dictionaries";
 import { docTopicHaystack, highlightSpan } from "@/lib/search-utils";
+import { isSlashShortcut } from "@/lib/slash-shortcut";
 import { EmptyState } from "./surface-state";
 
 /* ------------------------------------------------------------------ */
@@ -146,9 +147,9 @@ export function DocsSearch({ locale }: { locale: string }) {
     return map;
   }, [filteredTopics]);
 
-  // Keyboard shortcut: focus search on "/".
+  // Keyboard shortcut: focus search on an unmodified "/" typed outside a field.
   const handleKeyDown = useCallback((e: KeyboardEvent) => {
-    if (e.key === "/" && document.activeElement?.tagName !== "INPUT") {
+    if (isSlashShortcut(e)) {
       e.preventDefault();
       inputRef.current?.focus();
     }

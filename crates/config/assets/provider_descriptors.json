@@ -102,6 +102,17 @@
         "meituan-sensenova",
         "meituan-sensenova-cn"
       ]
+    },
+    {
+      "id": "tsubasa",
+      "label": "Tsubasa",
+      "wire": "openai-compatible",
+      "base_url": "https://api.tsubasa.sh/v1",
+      "api_key_env": "TSUBASA_API_KEY",
+      "default_model": "tsubasa-pro",
+      "discovery": "models_endpoint",
+      "docs_url": "https://tsubasa.sh/docs",
+      "guidance": "OpenAI-compatible host (Chat Completions + GET /v1/models only). Public model ids: tsubasa-pro and tsubasa-fast, both with a 32,768-token context, so set context_window = 32768 on [providers.tsubasa]. Store TSUBASA_API_KEY, not a raw key."
     }
   ]
 }

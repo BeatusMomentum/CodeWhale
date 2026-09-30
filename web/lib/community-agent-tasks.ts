@@ -10,7 +10,11 @@ import {
   DIGEST_PROMPT,
   saveDraft,
   hasFreshDraft,
+  getDraftResolution,
+  digestRecordKey,
+  renderDigestBody,
   logUsage,
+  type WeeklyDigestRecord,
   type AgentDraft,
   type DeepSeekEnv,
 } from "@/lib/community-agent";
@@ -129,9 +133,9 @@ export async function runTriage(env: AgentEnv): Promise<Record<string, unknown>>
           generatedAt: new Date().toISOString(),
           posted: false,
         };
-        await saveDraft(env.CURATED_KV, draft);
         await logUsage(env.CURATED_KV, usage.input, usage.output);
-        processed++;
+        if (await saveDraft(env.CURATED_KV, draft, issue.updated_at)) processed++;
+        else skipped++;
       } catch {
         skipped++;
       }
@@ -212,9 +216,9 @@ export async function runPrReview(env: AgentEnv): Promise<Record<string, unknown
           generatedAt: new Date().toISOString(),
           posted: false,
         };
-        await saveDraft(env.CURATED_KV, draft);
         await logUsage(env.CURATED_KV, usage.input, usage.output);
-        processed++;
+        if (await saveDraft(env.CURATED_KV, draft, pr.updated_at)) processed++;
+        else skipped++;
       } catch {
         skipped++;
       }
@@ -279,9 +283,9 @@ export async function runStale(env: AgentEnv): Promise<Record<string, unknown>> 
           generatedAt: new Date().toISOString(),
           posted: false,
         };
-        await saveDraft(env.CURATED_KV, draft);
         await logUsage(env.CURATED_KV, usage.input, usage.output);
-        processed++;
+        if (await saveDraft(env.CURATED_KV, draft, issue.updated_at)) processed++;
+        else skipped++;
       } catch {
         skipped++;
       }
@@ -342,8 +346,8 @@ export async function runDupes(env: AgentEnv): Promise<Record<string, unknown>> 
         generatedAt: new Date().toISOString(),
         posted: false,
       };
-      await saveDraft(env.CURATED_KV, draft);
-      processed++;
+      // saveDraft refuses identities the maintainer already posted or discarded.
+      if (await saveDraft(env.CURATED_KV, draft)) processed++;
     }
 
     await logUsage(env.CURATED_KV, usage.input, usage.output);
@@ -357,7 +361,17 @@ export async function runDigest(env: AgentEnv): Promise<Record<string, unknown>>
   const repo = env.GITHUB_REPO ?? "Hmbown/CodeWhale";
   const weekAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
 
+  // Compute week ID
+  const now = new Date();
+  const startOfYear = new Date(now.getFullYear(), 0, 1);
+  const weekNum = Math.ceil(((now.getTime() - startOfYear.getTime()) / 86400000 + startOfYear.getDay() + 1) / 7);
+  const weekId = `${now.getFullYear()}-W${String(weekNum).padStart(2, "0")}`;
+
   try {
+    if (await getDraftResolution(env.CURATED_KV, "digest", weekId)) {
+      return { ok: true, skipped: true, weekId, reason: "digest already reviewed" };
+    }
+
     const [issuesRes, pullsRes, stats] = await Promise.all([
       fetch(
         `https://api.github.com/repos/${repo}/issues?state=all&since=${weekAgo}&per_page=50&sort=updated&direction=desc`,
@@ -414,29 +428,36 @@ export async function runDigest(env: AgentEnv): Promise<Record<string, unknown>>
 
     const parsed = JSON.parse(content) as { titleEn: string; titleZh: string; summaryEn: string; summaryZh: string; sections: { heading: string; items: string[] }[] };
 
-    // Compute week ID
-    const now = new Date();
-    const startOfYear = new Date(now.getFullYear(), 0, 1);
-    const weekNum = Math.ceil(((now.getTime() - startOfYear.getTime()) / 86400000 + startOfYear.getDay() + 1) / 7);
-    const weekId = `${now.getFullYear()}-W${String(weekNum).padStart(2, "0")}`;
-
     const draft: AgentDraft = {
       id: weekId,
       type: "digest",
-      bodyEn: `# ${parsed.titleEn}\n\n${parsed.summaryEn}\n\n${parsed.sections.map((s) => `## ${s.heading}\n${s.items.map((i) => `- ${i}`).join("\n")}`).join("\n\n")}`,
-      bodyZh: `# ${parsed.titleZh}\n\n${parsed.summaryZh}\n\n${parsed.sections.map((s) => `## ${s.heading}\n${s.items.map((i) => `- ${i}`).join("\n")}`).join("\n\n")}`,
+      bodyEn: renderDigestBody(parsed, "en"),
+      bodyZh: renderDigestBody(parsed, "zh"),
       generatedAt: new Date().toISOString(),
       posted: false,
     };
 
-    await saveDraft(env.CURATED_KV, draft);
+    if (!(await saveDraft(env.CURATED_KV, draft))) {
+      return { ok: true, skipped: true, weekId, reason: "digest already reviewed" };
+    }
 
-    // Also save the structured digest for the weekly page
-    await env.CURATED_KV?.put(
-      `digest:weekly-${weekId}`,
-      JSON.stringify({ ...parsed, weekId, generatedAt: draft.generatedAt }),
-      { expirationTtl: 60 * 60 * 24 * 90 }
-    );
+    // Stage the structured digest for the weekly page, unapproved. The page
+    // renders it only after the maintainer posts the draft from /admin.
+    // Pick fields explicitly: model output must never be able to set
+    // `approved` or any other record key.
+    const record: WeeklyDigestRecord = {
+      titleEn: parsed.titleEn,
+      titleZh: parsed.titleZh,
+      summaryEn: parsed.summaryEn,
+      summaryZh: parsed.summaryZh,
+      sections: parsed.sections,
+      weekId,
+      generatedAt: draft.generatedAt,
+      approved: false,
+    };
+    await env.CURATED_KV?.put(digestRecordKey(weekId), JSON.stringify(record), {
+      expirationTtl: 60 * 60 * 24 * 90,
+    });
 
     await logUsage(env.CURATED_KV, usage.input, usage.output);
     return { ok: true, weekId };

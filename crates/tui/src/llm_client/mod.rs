@@ -505,11 +505,7 @@ impl LlmError {
                         status,
                         message: body.to_string(),
                     }
-                } else if body_lower.contains("context_length")
-                    || body_lower.contains("token")
-                    || body_lower.contains("too long")
-                    || body_lower.contains("maximum")
-                {
+                } else if is_context_length_message(&body_lower) {
                     LlmError::ContextLengthError(body.to_string())
                 } else if body_lower.contains("content_policy")
                     || body_lower.contains("safety")
@@ -733,6 +729,32 @@ fn looks_like_authentication_failure(body: &str) -> bool {
         || lower.contains("invalid token")
         || lower.contains("bearer token")
         || lower.contains("missing token")
+}
+
+/// A provider error is a context overflow only when it says so. Bare
+/// "token", "too long" or "maximum" also appear in ordinary invalid-request
+/// errors (`max_tokens must be ...`, a field value too long), which compaction
+/// or a bigger window cannot fix. This is the one phrase list: the typed 400
+/// classification here and the engine's string classifier both read it.
+/// `lower` must already be lowercase.
+pub(crate) fn is_context_length_message(lower: &str) -> bool {
+    [
+        "context_length",
+        "context length",
+        "context window",
+        "context limit",
+        "maximum context",
+        "prompt is too long",
+        "input is too long",
+        "maximum prompt length",
+        "exceeded model token limit",
+        "tokens exceed",
+        "exceeds the maximum number of tokens",
+        // llama.cpp: "the request exceeds the available context size".
+        "available context size",
+    ]
+    .iter()
+    .any(|phrase| lower.contains(phrase))
 }
 
 /// Quota exhaustion is a durable account state, not a generic rate-limit

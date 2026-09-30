@@ -4,7 +4,7 @@ import { useMemo, useState } from "react";
 import { Icon } from "./icon";
 import type { ModelFact } from "@/lib/facts";
 import { MODELS_COPY } from "@/lib/content/models";
-import { pickText } from "@/lib/i18n/dictionaries";
+import { getChrome, pickText } from "@/lib/i18n/dictionaries";
 
 type SortKey = "added" | "id" | "provider" | "context";
 
@@ -18,11 +18,11 @@ function formatTokens(n: number | null): string {
   return String(n);
 }
 
-function formatDate(iso: string | null, locale: string): string {
+function formatDate(iso: string | null, dateLocale: string): string {
   if (!iso) return "—";
   const d = new Date(`${iso}T00:00:00Z`);
   if (!Number.isFinite(d.getTime())) return "—";
-  return new Intl.DateTimeFormat(locale === "zh" ? "zh-CN" : "en-US", {
+  return new Intl.DateTimeFormat(dateLocale, {
     dateStyle: "medium",
     timeZone: "UTC",
   }).format(d);
@@ -79,6 +79,7 @@ export function ModelsTable({
   const [key, setKey] = useState<SortKey>("added");
   const [desc, setDesc] = useState(true);
   const t = (copy: { en: string; zh: string }) => pickText(copy, locale);
+  const dateLocale = getChrome(locale).dateLocale;
 
   const rows = useMemo(
     () => [...models].sort((a, b) => compare(a, b, key, desc)),
@@ -142,7 +143,7 @@ export function ModelsTable({
               </th>
               <td>{model.provider ?? "—"}</td>
               <td className="tabular">{formatTokens(model.contextWindow)}</td>
-              <td className="tabular">{formatDate(model.addedAt, locale)}</td>
+              <td className="tabular">{formatDate(model.addedAt, dateLocale)}</td>
             </tr>
           ))}
         </tbody>

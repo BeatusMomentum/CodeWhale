@@ -158,6 +158,38 @@ fn http_response_boundary_classifies_status_contract() {
         LlmError::from_http_response(400, "invalid json"),
         LlmError::InvalidRequest { status: 400, .. }
     ));
+    for context in [
+        "This model's maximum context length is 131072 tokens.",
+        "prompt is too long: 250000 tokens > 200000 maximum",
+        "input tokens exceed the configured limit",
+        "The input token count (2000000) exceeds the maximum number of tokens allowed (1048576).",
+        // xAI, Moonshot, Anthropic and Bedrock wording.
+        "This model's maximum prompt length is 131072 but the request contains 200000 tokens.",
+        "Invalid request: Your request exceeded model token limit: 262144",
+        "input length and `max_tokens` exceed context limit: 187254 + 20000 > 204798",
+        "Input is too long for requested model.",
+    ] {
+        assert!(
+            matches!(
+                LlmError::from_http_response(400, context),
+                LlmError::ContextLengthError(_)
+            ),
+            "{context}"
+        );
+    }
+    for invalid in [
+        "max_tokens must be less than or equal to 8192",
+        "Invalid 'messages[1].name': string too long. Expected a maximum length of 64.",
+        "invalid token in JSON body",
+    ] {
+        assert!(
+            matches!(
+                LlmError::from_http_response(400, invalid),
+                LlmError::InvalidRequest { status: 400, .. }
+            ),
+            "{invalid}"
+        );
+    }
     // "Unsupported parameter: max_output_tokens" names a *token* field, which
     // the generic keyword rules misread as a context-window overflow. It is a
     // request-shape error, and retrying or compacting cannot fix it.

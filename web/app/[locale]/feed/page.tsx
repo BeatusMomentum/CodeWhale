@@ -6,7 +6,7 @@ import { FeedRetry } from "@/components/feed-retry";
 import { EmptyState, ErrorState, UnavailableState } from "@/components/surface-state";
 import { loadFeed, type FeedLoadStatus } from "@/lib/github";
 import { getEnv } from "@/lib/kv";
-import { getStates } from "@/lib/i18n/dictionaries";
+import { fill, getFeed, getStates, splitToken } from "@/lib/i18n/dictionaries";
 import { buildPageMetadata } from "@/lib/page-meta";
 import type { FeedItem } from "@/lib/types";
 
@@ -14,20 +14,18 @@ export const revalidate = 600;
 
 export async function generateMetadata({ params }: { params: Promise<{ locale: string }> }) {
   const { locale } = await params;
-  const isZh = locale === "zh";
+  const t = getFeed(locale);
   return buildPageMetadata({
     path: "/feed",
     locale,
-    title: isZh ? "动态 · Codewhale" : "Activity · Codewhale",
-    description: isZh
-      ? "来自 Hmbown/CodeWhale GitHub 仓库的议题、合并请求和发布的实时动态。"
-      : "Live feed of issues, pull requests, and releases mirrored from the Hmbown/CodeWhale GitHub repo.",
+    title: t.metaTitle,
+    description: t.metaDescription,
   });
 }
 
 export default async function FeedPage({ params }: { params: Promise<{ locale: string }> }) {
   const { locale } = await params;
-  const isZh = locale === "zh";
+  const t = getFeed(locale);
 
   const env = await getEnv();
   let feed: FeedItem[] = [];
@@ -65,55 +63,34 @@ export default async function FeedPage({ params }: { params: Promise<{ locale: s
       <UnavailableState locale={locale} compact action={retry} />
     );
 
-  const copy = isZh
-    ? {
-        title: "动态",
-        titleAside: "Activity",
-        lede: (
-          <>
-            来自{" "}
-            <Link href="https://github.com/Hmbown/CodeWhale" className="link">Hmbown/CodeWhale</Link>
-            {" "}的议题与合并请求镜像，每十分钟刷新一次。点击任意条目跳转至 GitHub。
-          </>
-        ),
-        pulls: "合并请求",
-        issues: "议题",
-        shown: (n: number) => `${n} 条`,
-        actions: ["提交议题", "提交合并请求", "发起讨论"],
-      }
-    : {
-        title: "Activity",
-        titleAside: "动态",
-        lede: (
-          <>
-            Follow issues and pull requests from{" "}
-            <Link href="https://github.com/Hmbown/CodeWhale" className="link">Hmbown/CodeWhale</Link>,
-            mirrored here and refreshed every ten minutes. Select any item to open it on GitHub.
-          </>
-        ),
-        pulls: "Pull requests",
-        issues: "Issues",
-        shown: (n: number) => `${n} shown`,
-        actions: ["Open an issue", "Open a pull request", "Start a discussion"],
-      };
-  const actionLinks: { href: string; icon: IconName }[] = [
-    { href: "https://github.com/Hmbown/CodeWhale/issues/new/choose", icon: "alert" },
-    { href: "https://github.com/Hmbown/CodeWhale/compare", icon: "git-pull-request" },
-    { href: "https://github.com/Hmbown/CodeWhale/discussions/new", icon: "message" },
+  // The repository link is typeset between the lede's halves, so a locale
+  // may place the {repo} token anywhere.
+  const ledeParts = splitToken(t.lede, "repo");
+  const lede = (
+    <>
+      {ledeParts[0]}
+      <Link href="https://github.com/Hmbown/CodeWhale" className="link">Hmbown/CodeWhale</Link>
+      {ledeParts[1]}
+    </>
+  );
+  const actionLinks: { href: string; icon: IconName; label: string }[] = [
+    { href: "https://github.com/Hmbown/CodeWhale/issues/new/choose", icon: "alert", label: t.openIssue },
+    { href: "https://github.com/Hmbown/CodeWhale/compare", icon: "git-pull-request", label: t.openPull },
+    { href: "https://github.com/Hmbown/CodeWhale/discussions/new", icon: "message", label: t.startDiscussion },
   ];
   const columns = [
-    { id: "feed-pulls", title: copy.pulls, items: pulls, status: pullsStatus },
-    { id: "feed-issues", title: copy.issues, items: issues, status: issuesStatus },
+    { id: "feed-pulls", title: t.pulls, items: pulls, status: pullsStatus },
+    { id: "feed-issues", title: t.issues, items: issues, status: issuesStatus },
   ];
 
   return (
     <>
       <PageHeader
         seal="动"
-        title={copy.title}
-        titleAside={copy.titleAside}
-        titleAsideLang={isZh ? "en" : "zh"}
-        lede={copy.lede}
+        title={t.title}
+        titleAside={t.titleAside}
+        titleAsideLang={t.titleAsideLang}
+        lede={lede}
         pose="browse"
       />
       <div className="page-body">
@@ -122,7 +99,7 @@ export default async function FeedPage({ params }: { params: Promise<{ locale: s
             <section key={column.id} className="feed-column" aria-labelledby={column.id}>
               <div className="feed-column-head">
                 <h2 id={column.id}>{column.title}</h2>
-                <span className="page-meta tabular">{copy.shown(column.items.length)}</span>
+                <span className="page-meta tabular">{fill(t.shownCount, { count: column.items.length })}</span>
               </div>
               {column.items.length > 0 ? (
                 <ul className="feed-items" role="list">
@@ -139,11 +116,11 @@ export default async function FeedPage({ params }: { params: Promise<{ locale: s
 
         <section className="page-section">
           <ul className="grid-3" role="list">
-            {actionLinks.map((link, index) => (
+            {actionLinks.map((link) => (
               <li key={link.href}>
                 <Link href={link.href} className="dir-row feed-action">
                   <span className="dir-mark" aria-hidden="true"><Icon name={link.icon} /></span>
-                  <span className="dir-text"><span className="dir-title">{copy.actions[index]}</span></span>
+                  <span className="dir-text"><span className="dir-title">{link.label}</span></span>
                   <span className="dir-action" aria-hidden="true"><Icon name="external" /></span>
                 </Link>
               </li>

@@ -153,6 +153,26 @@ mod tests {
         }
     }
 
+    /// #6695: Tsubasa is a data row on the existing compatible transport with
+    /// its own key env. The row carries no context field, so the guidance is
+    /// where the 32K window and the second public model id reach the user.
+    #[test]
+    fn tsubasa_is_a_compatible_row_with_its_own_key() {
+        let tsubasa = provider_descriptor("tsubasa").expect("tsubasa");
+        assert_eq!(tsubasa.wire, DescriptorWire::OpenaiCompatible);
+        assert_eq!(tsubasa.base_url, "https://api.tsubasa.sh/v1");
+        assert_eq!(tsubasa.api_key_env, "TSUBASA_API_KEY");
+        assert_eq!(tsubasa.default_model, "tsubasa-pro");
+        let guidance = tsubasa.guidance.as_deref().expect("tsubasa guidance");
+        for needle in [
+            "tsubasa-fast",
+            "context_window = 32768",
+            "Store TSUBASA_API_KEY",
+        ] {
+            assert!(guidance.contains(needle), "{needle}: {guidance}");
+        }
+    }
+
     #[test]
     fn descriptors_do_not_embed_model_rosters() {
         let raw = DESCRIPTORS_JSON;

@@ -381,7 +381,7 @@ pub(super) fn declared_paths(
         if path == "."
             || path
                 .split('/')
-                .any(|part| part.eq_ignore_ascii_case(".git"))
+                .any(|part| crate::snapshot::is_git_metadata_name(std::ffi::OsStr::new(part)))
         {
             return Err("deliverables must name files outside git metadata".into());
         }

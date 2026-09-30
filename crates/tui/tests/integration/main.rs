@@ -15,6 +15,8 @@
 mod config;
 #[path = "../../src/eval.rs"]
 mod eval;
+#[path = "../../src/skills/frontmatter.rs"]
+mod frontmatter;
 #[path = "../../src/skills/install.rs"]
 #[allow(dead_code)]
 mod install;

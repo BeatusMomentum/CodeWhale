@@ -1,9 +1,9 @@
 import Link from "next/link";
 import { LegalTabs } from "@/components/legal-tabs";
 import { PageHeader } from "@/components/page-header";
-import { fill, getLegalTerms } from "@/lib/i18n/dictionaries";
+import { fill, getChrome, getLegalTerms } from "@/lib/i18n/dictionaries";
 import { buildPageMetadata } from "@/lib/page-meta";
-import { LEGAL_UPDATED, TERMS_SECTIONS } from "@/lib/legal-copy";
+import { formatLegalUpdated, TERMS_SECTIONS } from "@/lib/legal-copy";
 
 export async function generateMetadata({ params }: { params: Promise<{ locale: string }> }) {
   const { locale } = await params;
@@ -24,7 +24,7 @@ export default async function TermsPage({ params }: { params: Promise<{ locale: 
       <PageHeader
         kicker={t.kicker}
         title={t.title}
-        meta={fill(t.updated, { date: LEGAL_UPDATED })}
+        meta={fill(t.updated, { date: formatLegalUpdated(getChrome(locale).dateLocale) })}
       />
       <div className="page-body">
         <div className="page-body-narrow">

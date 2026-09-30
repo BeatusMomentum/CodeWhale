@@ -998,6 +998,7 @@ fn tool_use_message(id: &str, name: &str, input: Value) -> Message {
     Message {
         role: Role::Assistant,
         content: vec![ContentBlock::ToolUse {
+            execution_id: None,
             id: id.to_string(),
             name: name.to_string(),
             input,
@@ -1011,6 +1012,7 @@ fn tool_result_message(id: &str, content: &str) -> Message {
     Message {
         role: Role::User,
         content: vec![ContentBlock::ToolResult {
+            execution_id: None,
             tool_use_id: id.to_string(),
             content: content.to_string(),
             is_error: None,

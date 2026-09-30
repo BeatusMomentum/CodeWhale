@@ -2018,13 +2018,16 @@ impl GenericToolCell {
         ))
     }
 
-    /// Render the `workflow` tool as the transcript's two lines per run
-    /// (#4122): the call that launched it is one `started` line naming the
-    /// run, and the card `App::announce_settled_workflows` writes when the run
-    /// settles is one finish line — state, agents, elapsed, tokens — with the
-    /// result or reason under it. Live progress is the workbar's, not the
-    /// transcript's. Transcript mode expands the finish card's phase/child
-    /// detail. Status-list payloads keep a multi-run summary card.
+    /// Render the `workflow` tool as the transcript's one row per run
+    /// (#4122): while the run is live, the call that launched it is one
+    /// `started` line naming the run; when it settles,
+    /// `App::announce_settled_workflows` swaps that card's record for the
+    /// finish, so the same row becomes the final state — outcome counts,
+    /// elapsed, tokens — with the result or the reason under it. A card that
+    /// returned a settled record (a foreground `run`, a `status` poll) shows
+    /// only the finish. Live progress is the workbar's, not the transcript's.
+    /// Transcript mode expands the finish card's phase/child detail.
+    /// Status-list payloads keep a multi-run summary card.
     fn try_render_as_workflow(
         &self,
         width: u16,
@@ -2036,7 +2039,40 @@ impl GenericToolCell {
             return None;
         }
         let output = self.output.as_ref()?;
-        let value: serde_json::Value = serde_json::from_str(output).ok()?;
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(output) else {
+            // A call the runtime refused (invalid plan, unknown fleet) never
+            // started a run. It says why — the error's first sentence, wrapped
+            // under the header — instead of echoing `action: start`; the full
+            // error and validation feedback stay behind the details key.
+            if self.status != ToolStatus::Failed {
+                return None;
+            }
+            let reason = workflow_call_error_reason(output)?;
+            let family = crate::tui::widgets::tool_card::tool_family_for_name("workflow");
+            let mut lines = vec![render_tool_header_with_family_and_summary(
+                family,
+                None,
+                tool_status_label(self.status),
+                self.status,
+                None,
+                low_motion,
+            )];
+            lines.extend(render_card_detail_line(
+                None,
+                &reason,
+                tool_value_style(),
+                width,
+            ));
+            if matches!(mode, RenderMode::Transcript) {
+                lines.extend(render_tool_output_mode(
+                    output,
+                    width,
+                    TOOL_OUTPUT_LINE_LIMIT,
+                    mode,
+                ));
+            }
+            return Some(wrap_card_rail(lines, self.status));
+        };
         let is_status_list =
             value.get("action").and_then(serde_json::Value::as_str) == Some("status");
         if value.get("run_id").is_none() && !is_status_list {
@@ -2102,10 +2138,12 @@ impl GenericToolCell {
         // `App::announce_settled_workflows` writes later.
         let owns_finish =
             finish_card || (self.status != ToolStatus::Running && panel.lifecycle.is_terminal());
-        if !finish_card {
+        if !owns_finish {
             // The start line: the run's name. Its progress lives in the
-            // workbar, never here.
-            let name = panel.label.split_whitespace().collect::<Vec<_>>().join(" ");
+            // workbar, never here. A card that already holds the settled
+            // record shows only the finish: the final state replaces
+            // `started`, one row per run.
+            let name = panel.short_title();
             lines.push(render_tool_header_with_family_and_summary(
                 family,
                 Some(name.as_str()),
@@ -2145,10 +2183,18 @@ impl GenericToolCell {
             low_motion,
         ));
         if let Some(detail) = detail {
-            let room = usize::from(width).saturating_sub(4).max(8);
+            // Why a run fell short is the one fact worth reading: its first
+            // sentence wraps instead of being cut. A success summary keeps to
+            // one row, cut at a word boundary; the expand key shows the rest.
+            let detail = if finish_status == ToolStatus::Failed {
+                detail
+            } else {
+                let room = usize::from(width).saturating_sub(4).max(8);
+                crate::tui::ui_text::semantic_truncate(&detail, room)
+            };
             lines.extend(render_card_detail_line(
                 None,
-                &crate::tui::ui_text::truncate_line_to_width(&detail, room),
+                &detail,
                 tool_value_style(),
                 width,
             ));
@@ -2184,6 +2230,24 @@ impl GenericToolCell {
         }
         Some(wrap_card_rail(lines, finish_status))
     }
+}
+
+/// The first sentence of a refused `workflow` call's error, without the
+/// dispatcher's `Error: Invalid input for tool 'workflow':` preamble, which
+/// names the tool the card already names.
+fn workflow_call_error_reason(output: &str) -> Option<String> {
+    let first = output
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())?;
+    let first = first.strip_prefix("Error:").map_or(first, str::trim_start);
+    let first = if first.starts_with("Invalid input for tool") {
+        first.split_once("': ").map_or(first, |(_, rest)| rest)
+    } else {
+        first
+    };
+    let reason = crate::tui::widgets::workflow_panel::first_sentence(first);
+    (!reason.is_empty()).then_some(reason)
 }
 
 /// Render the inline annotation for a tool cell whose full output was
@@ -2582,7 +2646,10 @@ fn render_error_message(
     let body_style = error_body_style(severity);
     let prefix_width = UnicodeWidthStr::width(label);
     let content_width = width.saturating_sub(2 + prefix_width as u16).max(1);
-    let mut lines = wrap_plain_line(message, body_style, content_width);
+    let mut lines: Vec<_> = message
+        .split('\n')
+        .flat_map(|line| wrap_plain_line(line, body_style, content_width))
+        .collect();
     if let Some(first) = lines.get_mut(0) {
         first.spans.insert(0, Span::raw(" "));
         first.spans.insert(0, Span::styled(label, label_style));

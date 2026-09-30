@@ -417,6 +417,7 @@ mod tests {
         let tmp = tempdir().unwrap();
         let missing = tmp.path().join("delegate").join("SKILL.md");
         let skill = Skill {
+            legacy_activation_name: None,
             name: "delegate".to_string(),
             description: "delegate work".to_string(),
             localized_descriptions: std::collections::HashMap::new(),
@@ -472,6 +473,7 @@ mod tests {
         fs::write(&skill_path, "changed on disk").unwrap();
         fs::write(tmp.path().join("companion.txt"), "changed companion").unwrap();
         let skill = Skill {
+            legacy_activation_name: None,
             name: "demo:hello".to_string(),
             description: "hello".to_string(),
             localized_descriptions: std::collections::HashMap::new(),
@@ -714,6 +716,7 @@ mod tests {
     async fn execute_respects_codewhale_only_skill_discovery() {
         let tmp = tempdir().unwrap();
         let workspace = tmp.path().to_path_buf();
+        crate::test_support::trust_workspace(&workspace);
         write_skill(
             &workspace.join(".claude").join("skills"),
             "claude-only",

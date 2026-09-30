@@ -132,15 +132,7 @@ pub(crate) fn push_assistant_message(
             cache_control: None,
         });
     }
-    for (id, name, input) in tool_uses {
-        blocks.push(ContentBlock::ToolUse {
-            id,
-            name,
-            input,
-            caller: None,
-            thought_signature: None,
-        });
-    }
+    blocks.extend(tool_uses);
 
     let has_sendable_content = blocks.iter().any(|block| {
         matches!(

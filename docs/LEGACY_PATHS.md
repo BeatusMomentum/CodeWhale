@@ -1,5 +1,7 @@
 # Legacy `.deepseek/` compatibility paths — audit & migration status (#3068)
 
+> 阅读简体中文版：[zh_hans/LEGACY_PATHS.md](zh_hans/LEGACY_PATHS.md)。
+
 ## v0.9.10 cleanse ledger
 
 This is the release-window decision record for residue that can otherwise look

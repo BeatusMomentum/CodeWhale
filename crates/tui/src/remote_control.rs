@@ -353,6 +353,32 @@ impl ClassicSessionOwnerLock {
     }
 }
 
+impl Drop for ClassicSessionOwnerLock {
+    fn drop(&mut self) {
+        // close() alone does not release the lock while a descriptor
+        // duplicated into a child spawned between fork and exec still shares
+        // this open file description; unlocking first lets a same-process
+        // reopen proceed (#5735, #6698), as the relay and runtime store locks do.
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd as _;
+            // SAFETY: Drop runs only while `_file` still owns this descriptor.
+            unsafe {
+                libc::flock(self._file.as_raw_fd(), libc::LOCK_UN);
+            }
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawHandle as _;
+            use windows_sys::Win32::Storage::FileSystem::UnlockFile;
+            // SAFETY: Drop runs only while `_file` still owns this handle.
+            unsafe {
+                UnlockFile(self._file.as_raw_handle() as _, 0, 0, u32::MAX, u32::MAX);
+            }
+        }
+    }
+}
+
 fn runtime_journal_scope_tag(target_ref: &str, session_id: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(b"cwc-remote-control-journal.v2\0");
@@ -6395,6 +6421,7 @@ mod tests {
             content: "existing turn output".to_string(),
         });
         controller.observe_engine_event(&EngineEvent::ToolCallStarted {
+            model_call: None,
             id: "tool_existing".to_string(),
             name: "shell".to_string(),
             input: json!({ "never": "relayed" }),
@@ -8374,6 +8401,24 @@ mod tests {
         assert_ne!(first_recovery_turn, second_recovery_turn);
     }
 
+    /// #6698: a process spawned between fork and exec while a journal is open
+    /// holds a duplicate of the lock descriptor. Dropping the journal must
+    /// still release the session lock, or the next same-process reopen fails
+    /// with the unfinished-account-turn error.
+    #[cfg(unix)]
+    #[test]
+    fn classic_session_lock_releases_while_a_duplicated_descriptor_survives() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("active_classic_fixture.lock");
+        let lock = ClassicSessionOwnerLock::acquire(&path).unwrap();
+        let inherited = lock._file.try_clone().unwrap();
+        drop(lock);
+        let reopened = ClassicSessionOwnerLock::acquire(&path)
+            .expect("dropping the owner releases the lock despite a surviving duplicate");
+        drop(reopened);
+        drop(inherited);
+    }
+
     #[test]
     fn classic_terminal_cursor_repairs_failed_canonical_clear_before_compaction() {
         let (mut controller, _worker_rx, _event_tx, journal_root) = wired_controller();
@@ -8756,6 +8801,7 @@ mod tests {
         );
 
         controller.observe_engine_event(&EngineEvent::ToolCallStarted {
+            model_call: None,
             id: "tool_fixture".to_string(),
             name: "shell".to_string(),
             input: json!({}),

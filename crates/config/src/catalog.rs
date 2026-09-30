@@ -398,11 +398,30 @@ fn offerings_from_models_dev(
             if !model.supports_text_chat() {
                 continue;
             }
+            // OpenCode Zen is model-aware: its catalog names each model's AI
+            // SDK package, which is the wire (#6705). Every other provider's
+            // endpoint key stays the Chat placeholder its fixed policy ignores.
+            // A deprecated Zen row stays visible but is not a route: Zen no
+            // longer serves it, so sending it would be a guaranteed upstream
+            // failure instead of a local refusal that names the reason.
+            let endpoint_key = if route_id != crate::ProviderKind::OpencodeZen.as_str() {
+                "chat"
+            } else if model.is_deprecated() {
+                crate::route::OPENCODE_ZEN_DEPRECATED_ENDPOINT_KEY
+            } else {
+                crate::route::opencode_zen_endpoint_key_for_npm(
+                    model
+                        .provider
+                        .as_ref()
+                        .and_then(|transport| transport.npm.as_deref())
+                        .or(provider.npm.as_deref()),
+                )
+            };
             out.push(CatalogOffering {
                 provider: provider_id.clone(),
                 wire_model_id: wire_model_id.to_string(),
                 canonical_model: model.base_model.clone(),
-                endpoint_key: "chat".to_string(),
+                endpoint_key: endpoint_key.to_string(),
                 default_for_provider: model.default_for_provider,
                 family: model.family.clone(),
                 limit: model.limit.clone(),
@@ -436,6 +455,10 @@ fn offerings_from_models_dev(
             continue;
         }
         let provider = normalized(provider_key);
+        // A canonical fact names no transport, and Zen's wire is per model.
+        if provider == crate::ProviderKind::OpencodeZen.as_str() {
+            continue;
+        }
         if !provider_rows.insert((provider.clone(), wire_model_id.to_string())) {
             continue;
         }

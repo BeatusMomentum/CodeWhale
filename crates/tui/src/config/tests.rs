@@ -15521,3 +15521,100 @@ fn no_parse_leaves_a_top_level_key_behind() -> Result<()> {
     assert!(!codewhale_config::legacy_root::has_legacy_root_keys(&table));
     Ok(())
 }
+
+#[test]
+fn config_set_provider_typo_reuses_the_invalid_provider_wording() {
+    let config = Config::default();
+    let error = config
+        .resolve_provider_selection_identity("deepsek")
+        .expect_err("a typo is not a provider");
+    assert!(
+        error.starts_with("Invalid provider 'deepsek': expected deepseek"),
+        "{error}"
+    );
+    assert!(!error.contains("saved session"), "{error}");
+    // The resume path keeps its own saved-session wording.
+    let resume = config
+        .resolve_provider_pin_identity("deepsek")
+        .expect_err("missing custom route");
+    assert!(resume.starts_with("saved session requires"), "{resume}");
+    assert_eq!(
+        config
+            .resolve_provider_selection_identity("deepseek")
+            .expect("built-in provider")
+            .provider,
+        ApiProvider::Deepseek
+    );
+}
+
+#[test]
+fn deepseek_missing_key_message_keeps_commands_copyable_and_harness_advice_conditional() {
+    let plain = deepseek_missing_key_message();
+    assert!(
+        plain.contains("\n  codewhale auth set --provider deepseek\n"),
+        "{plain}"
+    );
+    assert!(
+        plain.contains("If you already use DeepSeek Harness, grant read-only access:"),
+        "{plain}"
+    );
+    assert!(
+        plain.ends_with("\n  codewhale auth external-consent --provider deepseek --mode read-only"),
+        "{plain}"
+    );
+}
+
+#[test]
+fn invalid_value_fixes_are_commands_that_work_and_name_overriding_layers() {
+    let error = Config {
+        tui: Some(TuiConfig {
+            alternate_screen: Some("sometimes".to_string()),
+            ..TuiConfig::default()
+        }),
+        ..Config::default()
+    }
+    .validate()
+    .expect_err("unknown alternate_screen");
+    let diagnostic = SafeConfigDiagnostic::find_in(&error).expect("safe diagnostic");
+    // `config set` refuses dotted keys, so the fix edits the table instead.
+    assert_eq!(
+        diagnostic.fix(),
+        Some(
+            "set alternate_screen = \"auto\" in the [tui] table of config.toml (if a profile or managed config sets it, correct it there)"
+        )
+    );
+
+    let error = Config {
+        sandbox_mode: Some("bogus".to_string()),
+        ..Config::default()
+    }
+    .validate()
+    .expect_err("unknown sandbox_mode");
+    let fix = SafeConfigDiagnostic::find_in(&error)
+        .and_then(SafeConfigDiagnostic::fix)
+        .expect("fix");
+    assert!(
+        fix.starts_with("codewhale config set sandbox_mode workspace-write (if CODEWHALE_SANDBOX_MODE, a profile, or managed config sets it"),
+        "{fix}"
+    );
+}
+
+#[test]
+fn missing_profile_diagnostic_does_not_show_the_requested_name() {
+    let mut profiles = HashMap::new();
+    profiles.insert("work".to_string(), Config::default());
+    let config = ConfigFile {
+        base: Box::default(),
+        profiles: Some(profiles),
+        legacy_root: Default::default(),
+    };
+    let error = apply_profile(config, Some("sk-pasted-token")).expect_err("no such profile");
+    let diagnostic = SafeConfigDiagnostic::find_in(&error).expect("safe diagnostic");
+    let shown = diagnostic.display_message();
+    assert_eq!(
+        shown,
+        "Profile not found (name not shown). Available profiles: work"
+    );
+    // The local error keeps the typed name for the person at the terminal.
+    assert!(error.to_string().contains("sk-pasted-token"), "{error}");
+}

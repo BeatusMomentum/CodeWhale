@@ -814,6 +814,7 @@ impl App {
             prompt_suggestion_gen: std::sync::atomic::AtomicU64::new(0),
             offline_mode: false,
             turn_error_posted: false,
+            turn_error_notice: None,
             // Surface parse warnings so the user knows their config file is
             // broken instead of silently losing all settings.
             status_message: xai_dangling_repair_message
@@ -1025,6 +1026,7 @@ impl App {
             pending_goal_controls: VecDeque::new(),
             current_session_metadata: None,
             session_artifacts: Vec::new(),
+            session_turn_outcomes: Vec::new(),
             trust_mode: yolo_compat || configured_trust_mode,
             translation_enabled: false,
             mini_window: config.mini_window.clone().unwrap_or_default(),
@@ -1117,6 +1119,7 @@ impl App {
             fleet_draft_cell: std::sync::Arc::new(std::sync::Mutex::new(None)),
             constitution_draft_cell: std::sync::Arc::new(std::sync::Mutex::new(None)),
             mcp_login: None,
+            mcp_retries: Vec::new(),
             prompt_suggestion_cell: std::sync::Arc::new(std::sync::Mutex::new(None)),
             balance_initiated: false,
             last_balance_fetch: None,

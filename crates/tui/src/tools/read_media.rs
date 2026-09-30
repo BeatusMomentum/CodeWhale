@@ -1492,6 +1492,7 @@ mod tests {
             codewhale_models::Message {
                 role: Role::Assistant,
                 content: vec![codewhale_models::ContentBlock::ToolUse {
+                    execution_id: None,
                     id: "call_read_media".to_string(),
                     name: "read_media".to_string(),
                     input: json!({ "path": "wire.png" }),
@@ -1502,6 +1503,7 @@ mod tests {
             codewhale_models::Message {
                 role: Role::User,
                 content: vec![codewhale_models::ContentBlock::ToolResult {
+                    execution_id: None,
                     tool_use_id: "call_read_media".to_string(),
                     content: rich.content.clone(),
                     is_error: None,

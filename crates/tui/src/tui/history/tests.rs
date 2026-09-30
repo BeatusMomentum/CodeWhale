@@ -1530,6 +1530,30 @@ fn error_severity_ranks_stay_visually_distinguishable() {
     assert_eq!(body_fg, error_fg);
 }
 
+#[test]
+fn error_guidance_keeps_recovery_commands_on_their_own_line() {
+    let cell = HistoryCell::Error {
+        message: "DeepSeek API key not found.\nSave it:\n  codewhale auth set --provider deepseek"
+            .to_string(),
+        severity: crate::error_taxonomy::ErrorSeverity::Error,
+    };
+    for width in [80, 140] {
+        let lines = cell.lines(width);
+        let command_line = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .find(|line| line.contains("codewhale auth set --provider deepseek"))
+            .expect("recovery command stays intact");
+        assert!(!command_line.contains('\n'), "{command_line:?}");
+        assert!(!command_line.contains("Save it:"), "{command_line:?}");
+    }
+}
+
 /// A multiline failure can run past the bottom of the terminal while its full
 /// text stays in history. The live cell advertises the pager; the pager and the
 /// transcript must carry the recovery instruction verbatim and must not
@@ -1590,9 +1614,9 @@ fn a_web_search_receipt_names_its_source_and_any_degradation() {
     }
 }
 
-/// A workflow's transcript is its start and its finish; live progress is the
+/// A workflow's transcript is one row per run; live progress is the
 /// workbar's. A foreground `run` card that returned its settled record says
-/// both — started, then finished with agents — without repeating the header
+/// only the finish — the final state replaces `started` — without repeating the header
 /// in a body; the expanded card adds the goal, the child labels, the final
 /// result and the error; the status card lists the runs it found.
 ///
@@ -1622,12 +1646,15 @@ fn workflow_cards_report_lifecycle_children_phases_and_failures() {
     run.input_summary = Some("action: run".to_string());
     run.output = Some(run_output);
     let text = lines_text(&run.lines_with_mode(120, true, RenderMode::Live));
-    assert!(text.contains("started"), "the start line: {text:?}");
     assert!(
-        text.contains("finished") && text.contains("/3 agents"),
-        "the finish line with finished/total agents: {text:?}"
+        !text.contains("started"),
+        "the settled record replaces the start line: {text:?}"
     );
-    assert_eq!(text.lines().count(), 2, "start and finish only: {text:?}");
+    assert!(
+        text.contains("finished") && text.contains("/3 done"),
+        "the finish line with done/total agents: {text:?}"
+    );
+    assert_eq!(text.lines().count(), 1, "one row for the run: {text:?}");
     // #6503: a run with no failures does not announce `0 fail`.
     assert!(!text.contains("fail"), "no zero failure count: {text:?}");
     assert!(
@@ -1693,6 +1720,76 @@ fn workflow_cards_report_lifecycle_children_phases_and_failures() {
             "the status card must list {needle:?}: {text:?}"
         );
     }
+}
+
+/// The founder's transcript (2026-09-28): a refused `start` echoed
+/// `action: start` and hid its reason; the settled run's reason was cut
+/// mid-word. Each is one row that says why.
+#[test]
+fn workflow_rows_say_why_without_raw_action_or_mid_word_cuts() {
+    let mut refused = generic_tool("workflow", ToolStatus::Failed);
+    refused.input_summary = Some("action: start".to_string());
+    refused.output = Some(
+        "Error: Invalid input for tool 'workflow': Workflow leaf 'engine-readiness': \
+         task(): cwd entries must be bounded repo-relative paths\n\
+         Tool validation feedback: {\"category\":\"invalid_input\"}"
+            .to_string(),
+    );
+    let text = lines_text(&refused.lines_with_mode(100, true, RenderMode::Live));
+    assert!(!text.contains("action: start"), "{text}");
+    assert!(
+        text.contains("cwd entries must be bounded repo-relative paths"),
+        "{text}"
+    );
+    assert!(!text.contains("Invalid input for tool"), "{text}");
+
+    let reason = "[auth] Authorization failed: You have run out of credits or need a Grok \
+                  subscription. Add credits at https://grok.com/?_s=usage.";
+    let failed = serde_json::json!({
+        "run_id": "workflow_6409ebe6",
+        "status": "failed",
+        "workflow_goal": "Read-only release-readiness audit for Codewhale v0.10.1. Determine blockers.",
+        "started_at_ms": 1_000,
+        "completed_at_ms": 1_355,
+        "error": "no task produced a result: all 2 task(s) failed and 1 fan-out(s) lost every slot (no work survived them); the recorded result reflects no completed work",
+        "transcript_line": "finished",
+        "events": [
+            {"type": "run_started", "at_ms": 1_000, "workflow_goal": "Read-only release-readiness audit for Codewhale v0.10.1. Determine blockers."},
+            {"type": "task_started", "at_ms": 1_080, "task_id": "a", "workflow_task_label": "engine-readiness"},
+            {"type": "task_started", "at_ms": 1_117, "task_id": "b", "workflow_task_label": "desktop-readiness"},
+            {"type": "task_completed", "at_ms": 1_329, "task_id": "a", "status": "failed", "reason": reason},
+            {"type": "task_completed", "at_ms": 1_338, "task_id": "b", "status": "failed", "reason": reason},
+            {"type": "run_completed", "at_ms": 1_355, "status": "failed"},
+        ],
+    })
+    .to_string();
+    let mut finish = generic_tool("workflow", ToolStatus::Failed);
+    finish.output = Some(failed);
+    let text = lines_text(&finish.lines_with_mode(60, true, RenderMode::Live));
+    assert!(!text.contains("started"), "{text}");
+    assert!(text.contains("0/2 done · 2 failed"), "{text}");
+    assert!(text.contains("355ms"), "{text}");
+    // The whole first sentence, wrapped, never cut.
+    let flat = text
+        .split_whitespace()
+        .filter(|word| {
+            !word
+                .chars()
+                .all(|ch| ('\u{2500}'..='\u{259F}').contains(&ch))
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        flat.contains(
+            "Authorization failed: You have run out of credits or need a Grok subscription"
+        ),
+        "{text}"
+    );
+    assert!(
+        !flat.contains("grok.com"),
+        "only the first sentence: {text}"
+    );
+    assert!(!text.contains("..."), "{text}");
 }
 
 #[test]
@@ -2014,6 +2111,7 @@ fn replay_routes_repair_receipts_and_plan_calls_to_typed_cells() {
     let plan = Message {
         role: Role::Assistant,
         content: vec![ContentBlock::ToolUse {
+            execution_id: None,
             id: "plan-1".to_string(),
             name: "update_plan".to_string(),
             input: serde_json::json!({

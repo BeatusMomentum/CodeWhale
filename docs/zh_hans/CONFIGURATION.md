@@ -694,7 +694,7 @@ harness profile 里未知的姿态名或未知键会让配置反序列化失败�
 - `CODEWHALE_HOME`(覆盖基础数据目录；默认 `~/.codewhale`)。如果你之前导出过 `DEEPSEEK_HOME`，把它改名为 `CODEWHALE_HOME`；新 Codewhale 状态路径不使用旧环境变量。
 - `CODEWHALE_RELEASE_BASE_URL`(`codewhale update` 和 TUI 启动更新检查在 `[update].update_uri` 未设置时使用的 release 资源镜像，或该配置 URI 无法获取时的回退)
 - `CODEWHALE_AUTOMATIONS_DIR`(覆盖自动化存储目录；默认 `~/.codewhale/automations`，旧 `~/.deepseek/automations` 仅在旧目录存在时回退)
-- `NO_ANIMATIONS`(`1|true|yes|on` 在启动时强制 `low_motion = true` 和 `fancy_animations = false`，无论已保存设置如何；见 [`docs/ACCESSIBILITY.md`](../ACCESSIBILITY.md))。
+- `NO_ANIMATIONS`(`1|true|yes|on` 在启动时强制 `low_motion = true` 和 `fancy_animations = false`，无论已保存设置如何；见 [`docs/ACCESSIBILITY.md`](./ACCESSIBILITY.md))。
 - `SSL_CERT_FILE`——企业代理 / TLS 检查 MITM 用户把它指向 PEM 包(或单个 DER 证书)，证书会与平台的系统信任库一起添加。失败记录警告并继续——现有系统根仍然适用。
 
 ### 指令来源(`instructions = [...]`，#454)
@@ -1005,7 +1005,7 @@ codewhale 还把用户偏好存储在：
 
 Plan 和 Act 是 UI 中的日常可见模式；Operate 是显式预览入口，其 Workflow 控制面仍在构建中。用 `/mode` 切换。为了兼容，较旧设置文件中的 `default_mode = "normal"` 仍作为 `agent` 加载。
 
-本地化范围在 [LOCALIZATION.md](../LOCALIZATION.md) 中跟踪。v0.7.6 核心包只覆盖高可见性 TUI chrome;provider/工具 schema、个性提示和完整文档保持英语，除非之后显式翻译。
+本地化范围在 [LOCALIZATION.md](./LOCALIZATION.md) 中跟踪。v0.7.6 核心包只覆盖高可见性 TUI chrome;provider/工具 schema、个性提示和完整文档保持英语，除非之后显式翻译。
 
 可读性语义：
 
@@ -1045,7 +1045,7 @@ DeepSeek V4 前缀缓存让 token 标签变得重要。这些数量保持分离�
 ### 核心键(供 TUI/引擎使用)
 
 - `provider`(字符串，可选)：`deepseek`(默认)、`deepseek-anthropic`、`nvidia-nim`、`openai`、`atlascloud`、`wanjie-ark`、`volcengine`、`openrouter`、`xiaomi-mimo`、`novita`、`fireworks`、`siliconflow`、`arcee`、`siliconflow-CN`、`moonshot`、`sglang`、`vllm`、`ollama`、`ollama-cloud`、`huggingface`、`modelscope`、`together`、`qianfan`、`openai-codex`、`anthropic`、`openmodel`、`zai`、`stepfun`、`minimax`、`deepinfra`、`sakana`、`longcat`、`opencode-go`、`meta`、`mistral`、`telecomjs`、`xai`、`orcarouter`、`modelstudio-token-plan`、`google`、`antigravity`、`edenai` 或 `custom`。旧 `deepseek-cn` 配置仍作为 `deepseek` 的别名被接受；DeepSeek 在全球使用同一个官方主机 [`https://api.deepseek.com`](https://api-docs.deepseek.com/)。`deepseek-anthropic` 使用 `DEEPSEEK_API_KEY` 指向 DeepSeek 的 Anthropic Messages 兼容端点 `https://api.deepseek.com/anthropic`;`nvidia-nim` 通过 `https://integrate.api.nvidia.com/v1` 指向 NVIDIA NIM 托管的 DeepSeek 端点；`openai` 指向通用 OpenAI 兼容端点，默认 `https://api.openai.com/v1`;`atlascloud` 指向 AtlasCloud 的 OpenAI 兼容端点 `https://api.atlascloud.ai/v1`;`wanjie-ark` 指向 Wanjie Ark 的 OpenAI 兼容端点 `https://maas-openapi.wanjiedata.com/api/v1`;`volcengine` 指向火山方舟(Volcengine Ark)的 OpenAI 兼容编码端点 `https://ark.cn-beijing.volces.com/api/coding/v3`;`openrouter` 指向 `https://openrouter.ai/api/v1`;`xiaomi-mimo` 指向小米 MiMo 的 OpenAI 兼容端点，Token Plan key(`tp-...`)默认用 `https://token-plan-sgp.xiaomimimo.com/v1`,按量付费 key 用 `https://api.xiaomimimo.com/v1`。对于新加坡默认之外的 Token Plan 账号，显式设置 `base_url` 或对中国的账号用 `mode = "token-plan-cn"`，对欧洲/阿姆斯特丹用 `mode = "token-plan-ams"`；`novita` 指向 `https://api.novita.ai/openai/v1`;`fireworks` 指向 `https://api.fireworks.ai/inference/v1`;`siliconflow` 指向 SiliconFlow，默认 `https://api.siliconflow.com/v1`;`arcee` 指向 Arcee AI 的 OpenAI 兼容端点 `https://api.arcee.ai/api/v1`;`siliconflow-CN` 通过 `[providers.siliconflow_cn]` 指向 SiliconFlow 中国区域端点；`moonshot` 指向 Moonshot/Kimi，默认 `https://api.moonshot.ai/v1`;`sglang` 指向自托管 OpenAI 兼容端点，默认 `http://localhost:30000/v1`;`vllm` 指向自托管 vLLM OpenAI 兼容端点，默认 `http://localhost:8000/v1`;`ollama` 指向 Ollama 的 OpenAI 兼容端点，默认 `http://localhost:11434/v1`;`huggingface` 指向 Hugging Face Inference Providers `https://router.huggingface.co/v1`;`modelscope` 指向魔搭社区的 OpenAI 兼容推理 API `https://api-inference.modelscope.cn/v1`;`together` 指向 Together AI `https://api.together.xyz/v1`;`qianfan` 指向百度千帆 `https://api.baiduqianfan.ai/v1`;`openai-codex` 指向 ChatGPT/Codex OAuth；`anthropic` 指向 Claude 的原生 Messages API；`openmodel` 指向 OpenModel 的 Anthropic 兼容 Messages API `https://api.openmodel.ai`;`zai` 指向 Z.ai `https://api.z.ai/api/coding/paas/v4`;`stepfun` 指向 StepFun `https://api.stepfun.ai/v1`;`minimax` 指向 MiniMax `https://api.minimax.io/v1`;`deepinfra` 指向 DeepInfra `https://api.deepinfra.com/v1/openai`;`sakana` 指向 Sakana AI Fugu `https://api.sakana.ai/v1`;`longcat` 指向美团 LongCat `https://api.longcat.chat/openai/v1`;`opencode-go` 指向订阅支撑的 OpenCode Go Chat Completions 路由 `https://opencode.ai/zen/go/v1`;`meta` 指向 Meta Model API；`mistral` 指向 Mistral AI 的 OpenAI 兼容端点 `https://api.mistral.ai/v1`;`telecomjs` 指向 TelecomJS TokenHub `https://aigw.telecomjs.com/v1`;`xai` 指向 xAI 的 API key 或 OAuth 路由。
-- `opencode-zen`(字符串 provider 值)：通过 `[providers.opencode_zen]` 选择模型感知的 OpenCode Zen 网关。默认 base URL 是 `https://opencode.ai/zen/v1`,默认模型 `gpt-5.6`，凭据来自 `api_key`、`OPENCODE_ZEN_API_KEY` 或回退 `OPENCODE_API_KEY`——绝不是 ChatGPT/Codex OAuth。接受 `OPENCODE_ZEN_BASE_URL` 和 `OPENCODE_ZEN_MODEL`。所选模型通过精选的 Zen 目录解析：GPT 用 Responses,Claude/Qwen 用 Anthropic Messages，记录的 DeepSeek/MiniMax/GLM/Kimi/Grok/free 行用 Chat Completions。Gemini 和未知模型失败关闭，因为 Codewhale 对它们没有经过验证的受支持线契约。确切当前模型组见 [`PROVIDERS.md`](PROVIDERS.md#opencode-zen-protocol-catalog)。
+- `opencode-zen`(字符串 provider 值)：通过 `[providers.opencode_zen]` 选择模型感知的 OpenCode Zen 网关。默认 base URL 是 `https://opencode.ai/zen/v1`,默认模型 `gpt-5.6`，凭据来自 `api_key`、`OPENCODE_ZEN_API_KEY` 或回退 `OPENCODE_API_KEY`——绝不是 ChatGPT/Codex OAuth。接受 `OPENCODE_ZEN_BASE_URL` 和 `OPENCODE_ZEN_MODEL`。所选模型的线协议先取自精选的 Zen 快照，再取自其 Models.dev `opencode` 行声明的 AI SDK 包（用 `codewhale models --update` 刷新）：GPT、Grok 和 Muse Spark 用 Responses,Claude 和大多数 Qwen 行用 Anthropic Messages,DeepSeek/MiniMax/GLM/Kimi、`qwen3.8-max` 和免费行用 Chat Completions。Gemini、Models.dev 标记为 `deprecated` 的行以及任何已加载目录都未列出的模型失败关闭，因为 Codewhale 对它们没有经过验证的受支持线契约。确切当前模型组见 [`PROVIDERS.md`](PROVIDERS.md#opencode-zen-协议目录)。
 - `minimax-anthropic`(字符串 provider 值)：通过 `[providers.minimax_anthropic]` 选择 MiniMax 的 Anthropic 兼容 Messages 路由。默认 Base URL 是 `https://api.minimax.io/anthropic`;中国区域设置 `https://api.minimaxi.com/anthropic`。保留 `/anthropic` 后缀，因为 Codewhale 会追加 `/v1/messages`。该路由使用 `MINIMAX_API_KEY`，默认 `MiniMax-M3`；`MiniMax-M2.7` 也已注册。官方 M3 输入模态是文本、图像和视频，带自适应或禁用思考。M2.7 仅文本，总是保持思考启用。
 - `api_key`(字符串，托管 provider 必填)：对 DeepSeek/托管 provider 必须非空(或设置 provider API key 环境变量)。自托管 SGLang、vLLM 和本地 `ollama` 可省略。`ollama-cloud` 需要为该 provider 保存的密钥或由 `OLLAMA_CLOUD_API_KEY` 提供，然后 `OLLAMA_API_KEY`。
 - `auth_mode`(字符串，可选的 provider 表键)：选择 provider 特有的认证契约。Kimi Code 会员使用 `auth_mode = "api_key"`(或省略该字段)，在 [Kimi Code 控制台](https://www.kimi.com/code/console) 创建的 key，`base_url = "https://api.kimi.com/coding/v1"`，K3 用裸 `model = "k3"`。Codewhale 给该路由安全的 262,144-token 基线；只有 Kimi Code 计划包含 1M 访问(Allegretto 及以上)时才设置 `context_window = 1048576`。`k3[1m]` 是仅 Claude Code 的约定，不是 API 模型 ID,Codewhale 会拒绝它，而不是静默改变线模型或假定资格。`model = "kimi-for-coding"` 仍是所有 Kimi Code 会员可用的有效 K2.7 兼容路由。旧 `auth_mode = "kimi_oauth"` 以 API key 指引失败关闭，从不探测、读取、刷新或重写 `kimi_cli`/`kimi_code_cli` 凭据文件。一等 OAuth 需要 Codewhale 自己的厂商注册客户端身份，仍在 #4417 跟踪。
@@ -1113,7 +1113,7 @@ DeepSeek V4 前缀缓存让 token 标签变得重要。这些数量保持分离�
   reason = "Release and publish actions require maintainer review."
   ```
 
-  规则匹配器是精确 `tool` 和/或 `action_kind`。至少需要一个匹配器。`action_kind` 接受六个决策相关种类 `read`、`write`、`shell`、`external`、`publish` 和 `destructive`。无效名称让配置验证失败，而不是静默扩大到另一个策略类。在阻断规则中，旧名称保持保守兼容别名：`network`、`git`、`mcp_action`、`browser` 和 `unknown` 映射到 `external`；`secret` 映射到 `destructive`；`mcp_read` 映射到 `read`。允许规则中退役的窄种类验证失败，而不是扩大到更宽类别。退役的 `text_contains` 匹配器同样验证失败，而不是静默扩大旧的意图依赖规则。交互式 Auto-Review 中的回退拦阻升级为一次无状态守卫请求。请求包含确切被拦调用和确定性观察作为独立 JSON 字段。对话历史、技能指令、附加文件内容和其它展开的模型上下文被排除。守卫不推断用户意图，不算授权分数。它不暴露工具，返回风险级别、允许/拒绝和理由。高或关键风险即使模型说允许也不能自动运行。过大的确切调用被拒绝而不是截断。只做一次审查请求；不完整或格式错误的输出、超时、取消、provider 失败或空理由都失败关闭。确定性底线从不被模型审查，无头适配器使用仅确定性层级。固定的 Codex、Kimi 和 DeepSeek 源边界从[权限姿态](MODES.md#permission-posture)链接。审查结果发出 `tool.auto_review` 审计事件，`gate = "guardian"`。
+  规则匹配器是精确 `tool` 和/或 `action_kind`。至少需要一个匹配器。`action_kind` 接受六个决策相关种类 `read`、`write`、`shell`、`external`、`publish` 和 `destructive`。无效名称让配置验证失败，而不是静默扩大到另一个策略类。在阻断规则中，旧名称保持保守兼容别名：`network`、`git`、`mcp_action`、`browser` 和 `unknown` 映射到 `external`；`secret` 映射到 `destructive`；`mcp_read` 映射到 `read`。允许规则中退役的窄种类验证失败，而不是扩大到更宽类别。退役的 `text_contains` 匹配器同样验证失败，而不是静默扩大旧的意图依赖规则。交互式 Auto-Review 中的回退拦阻升级为一次无状态守卫请求。请求包含确切被拦调用和确定性观察作为独立 JSON 字段。对话历史、技能指令、附加文件内容和其它展开的模型上下文被排除。守卫不推断用户意图，不算授权分数。它不暴露工具，返回风险级别、允许/拒绝和理由。高或关键风险即使模型说允许也不能自动运行。过大的确切调用被拒绝而不是截断。只做一次审查请求；不完整或格式错误的输出、超时、取消、provider 失败或空理由都失败关闭。确定性底线从不被模型审查，无头适配器使用仅确定性层级。固定的 Codex、Kimi 和 DeepSeek 源边界从[权限姿态](MODES.md#权限姿态)链接。审查结果发出 `tool.auto_review` 审计事件，`gate = "guardian"`。
 
   自动审查决策在启用工具审计日志时发出 `tool.auto_review` 审计事件，`gate = "deterministic"`。未来的 PreToolUse/PostToolUse hooks 可以在这层周围添加观察者输入，但配置的自动审查策略在工具调用被允许继续之前评估。
 - `managed_config_path`(字符串，可选)：用户/环境配置之后加载的受管配置文件。
@@ -1154,7 +1154,7 @@ DeepSeek V4 前缀缓存让 token 标签变得重要。这些数量保持分离�
 - `mcp_config_path`(字符串，可选)：默认 `~/.codewhale/mcp.json`，Codewhale 路径缺失时旧 `~/.deepseek/mcp.json` 回退。自定义路径必须绝对；相对值回退到用户全局路径，这样改变启动目录不能静默改变 MCP 池。它在 `/config` 中可见，可从 TUI 更改。新路径被 `/mcp` 立即使用，但重建模型可见的 MCP 工具池需要重启 TUI。
 - `notes_path`(字符串，可选)：默认 `~/.codewhale/notes.txt`，Codewhale 路径缺失时旧 `~/.deepseek/notes.txt` 回退，由模型可见的 `note` 工具使用。
 - `[memory].enabled`(bool，可选)：默认 `false`。为 `true` 时，TUI 把用户记忆文件加载进 `<user_memory>` 提示块，在输入区启用 `# foo` 快速捕获，浮现 `/memory` 斜杠命令，并注册 `remember` 工具。同一开关可通过 `DEEPSEEK_MEMORY=on` 使用。
-- `memory_path`(字符串，可选)：锚定原生记忆存储。配置的文件名**不是**被写入的文件。在 Native 后端(唯一后端)下，存储被重新根到 `<parent-of-memory_path>/memory/global/MEMORY.md`——所以默认 `~/.codewhale/memory.md` 产生 `~/.codewhale/memory/global/MEMORY.md`(加工作区作用域文件和可重建的 SQLite FTS5 索引)。完整功能面见 [`MEMORY.md`](../MEMORY.md)(`# foo` 输入区前缀、`/memory` 斜杠命令、`remember` 工具、选择加入开关)。
+- `memory_path`(字符串，可选)：锚定原生记忆存储。配置的文件名**不是**被写入的文件。在 Native 后端(唯一后端)下，存储被重新根到 `<parent-of-memory_path>/memory/global/MEMORY.md`——所以默认 `~/.codewhale/memory.md` 产生 `~/.codewhale/memory/global/MEMORY.md`(加工作区作用域文件和可重建的 SQLite FTS5 索引)。完整功能面见 [`MEMORY.md`](./MEMORY.md)(`# foo` 输入区前缀、`/memory` 斜杠命令、`remember` 工具、选择加入开关)。
 - `snapshots.*`(可选)：用于文件回滚的 side-git 工作区快照：
   - `[snapshots].enabled`(bool，默认 `true`)
   - `[snapshots].max_age_days`(int，默认 `7`)
@@ -1221,7 +1221,7 @@ enabled = true
 - `DEEPSEEK_MEMORY_PATH` 从环境覆盖锚路径。
 - `DEEPSEEK_MEMORY=on`(也 `1`、`true`、`yes`、`y` 或 `enabled`)不编辑 `config.toml` 就翻转功能开启。
 - 禁用时功能惰性：不注入文件，`# foo` 落到普通消息提交，模型看不到 `remember` 工具。
-- 示例和完整 `/memory` 命令面见 [`MEMORY.md`](../MEMORY.md)。
+- 示例和完整 `/memory` 命令面见 [`MEMORY.md`](./MEMORY.md)。
 
 ### 目标循环(`[goal]`)
 
@@ -1464,7 +1464,7 @@ allowed_sandbox_modes = ["read-only", "workspace-write"]
 
 - `--status`——打印紧凑的单屏状态(api key、base URL、模型、MCP/skills/tools/plugins 计数、沙箱、`.env` 存在)。只读且无网络；在 CI 中安全。如果工作区中 `.env` 缺失而 `.env.example` 存在，状态输出指向 `cp .env.example .env`。
 - `--tools`——用描述自描述 frontmatter 约定(`# name:` / `# description:` / `# usage:`)的 `README.md` 和一个遵循它的 `example.sh`，搭建 `~/.codewhale/tools/`。该目录刻意不自动加载；通过 MCP、hooks 或 skills 把单个脚本接入智能体。
-- `--plugins`——用 `README.md` 和 `example/plugin.toml` 加一个命名空间示例 Skill 搭建 `~/.codewhale/plugins/`。包被只读、不可信、禁用地发现；启用前通过 `/plugin` 审查。v0.9.1 只激活声明的 Skills 和 MCP 服务器。见 [PLUGIN_BUNDLES.md](../PLUGIN_BUNDLES.md)。
+- `--plugins`——用 `README.md` 和 `example/plugin.toml` 加一个命名空间示例 Skill 搭建 `~/.codewhale/plugins/`。包被只读、不可信、禁用地发现；启用前通过 `/plugin` 审查。v0.9.1 只激活声明的 Skills 和 MCP 服务器。见 [PLUGIN_BUNDLES.md](./PLUGIN_BUNDLES.md)。
 - `--all` 现在一起搭建 MCP + skills + tools + plugins。
 - `--clean`——列出 `~/.codewhale/sessions/checkpoints/latest.json` 和 `offline_queue.json`(若存在)。旧 `~/.deepseek/sessions/checkpoints/` 文件不自动扫描；一次性旧版清理设置 `CODEWHALE_HOME=~/.deepseek`。传 `--force` 才实际移除匹配文件。这从不触碰真实会话历史或任务队列。
 

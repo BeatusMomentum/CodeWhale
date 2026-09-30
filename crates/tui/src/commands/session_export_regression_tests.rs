@@ -118,6 +118,7 @@ fn adapter_projects_authoritative_metadata_and_omits_hidden_payloads() {
                     state: None,
                 },
                 ContentBlock::ToolUse {
+                    execution_id: None,
                     id: "call-1".to_string(),
                     name: "fetch_url".to_string(),
                     input: serde_json::json!({"url": "https://example.com/a"}),
@@ -703,6 +704,7 @@ fn baseline_golden_messages() -> Vec<Message> {
                     state: None,
                 },
                 ContentBlock::ToolUse {
+                    execution_id: None,
                     id: "call-1".to_string(),
                     name: "fetch_url".to_string(),
                     input: serde_json::json!({
@@ -721,6 +723,7 @@ fn baseline_golden_messages() -> Vec<Message> {
         Message {
             role: Role::User,
             content: vec![ContentBlock::ToolResult {
+                execution_id: None,
                 tool_use_id: "call-1".to_string(),
                 content: "Authorization: Bearer another-secret-token\nresult ok".to_string(),
                 is_error: Some(false),
@@ -997,6 +1000,7 @@ fn command_clipboard_export_preserves_structure_and_redacts_secrets() {
                     state: None,
                 },
                 ContentBlock::ToolUse {
+                    execution_id: None,
                     id: "call-1".to_string(),
                     name: "fetch_url".to_string(),
                     input: serde_json::json!({
@@ -1015,6 +1019,7 @@ fn command_clipboard_export_preserves_structure_and_redacts_secrets() {
         Message {
             role: Role::User,
             content: vec![ContentBlock::ToolResult {
+                execution_id: None,
                 tool_use_id: "call-1".to_string(),
                 content: "Authorization: Bearer another-secret-token\nresult ok".to_string(),
                 is_error: Some(false),

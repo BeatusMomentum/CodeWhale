@@ -6,7 +6,7 @@
 
 DeepSeek 仍是默认提供商，但 `ProviderKind::ALL` 中的每个条目都是一等公民、可选的提供商路由。`ALL` 是目录/选择器表面——每个厂商一个身份。双线协议方言种类（`*Anthropic`，例如 `deepseek-anthropic`）和 Model Studio 套餐变体保留在枚举中用于 serde 和 `provider_for_kind`，但刻意**不**作为目录行：套餐是主提供商配置（`crates/config/src/provider_kind.rs:221-226`）上的 `mode`/`base_url`，方言则是 `wire = openai|anthropic`。托管路由、通用 OpenAI 兼容端点、OpenAI Codex/ChatGPT 路由、原生 Anthropic 以及本地运行时，都在所选提供商/模型/base URL 上运行同一个终端 harness。
 
-经普通 Chat Completions 访问的主机是普通的具名 provider（`[providers.<name>]` 表：base URL、模型、密钥环境变量），而不是 `ProviderKind`；`/provider` 与 `/setup` 保留「粘贴 Base URL 和密钥」路径。英文版中的「已知可用主机」表列出 SenseNova、Baseten、Groq、Cerebras、Command Code、阿里云百炼（DashScope）与 AICraft 的 URL 和密钥变量；这些主机作为内置描述符行随附于 `crates/config/assets/provider_descriptors.json`（仅描述如何连接主机，模型 ID 以实时 `GET /v1/models` 与 Codewhale 目录为准），仅供参考，请以各厂商文档为准。AICraft 的模型列表涵盖 DeepSeek、Anthropic Claude、Google Gemini、Qwen、GLM、MiniMax 与 Doubao（例如 `claude-4.6-sonnet`），以带密钥请求 `GET https://aicraftapi.com/v1/models` 的结果为准。OpenCode Zen 与 OpenCode Go 是下方的一等路由。在 `/provider` 中直接输入即可筛选列表（已绑定行操作的字母除外）；`Ctrl+T` 探测所选行的 `/models`，只记录可达性（2xx 并不代表模型可用）。
+经普通 Chat Completions 访问的主机是普通的具名 provider（`[providers.<name>]` 表：base URL、模型、密钥环境变量），而不是 `ProviderKind`；`/provider` 与 `/setup` 保留「粘贴 Base URL 和密钥」路径。英文版中的「已知可用主机」表列出 SenseNova、Baseten、Groq、Cerebras、Command Code、阿里云百炼（DashScope）、AICraft 与 Tsubasa 的 URL 和密钥变量；这些主机作为内置描述符行随附于 `crates/config/assets/provider_descriptors.json`（仅描述如何连接主机，模型 ID 以实时 `GET /v1/models` 与 Codewhale 目录为准），仅供参考，请以各厂商文档为准。AICraft 的模型列表涵盖 DeepSeek、Anthropic Claude、Google Gemini、Qwen、GLM、MiniMax 与 Doubao（例如 `claude-4.6-sonnet`），以带密钥请求 `GET https://aicraftapi.com/v1/models` 的结果为准。Tsubasa（`https://api.tsubasa.sh/v1`，`TSUBASA_API_KEY`）仅实现 `GET /v1/models` 与 Chat Completions，公开模型 `tsubasa-pro` 与 `tsubasa-fast` 的上下文均为 32,768 tokens；保存后请执行 `codewhale config set providers.tsubasa.context_window 32768`。OpenCode Zen 与 OpenCode Go 是下方的一等路由。在 `/provider` 中直接输入即可筛选列表（已绑定行操作的字母除外）；`Ctrl+T` 探测所选行的 `/models`，只记录可达性（2xx 并不代表模型可用）。
 
 需要保持同步的来源：
 
@@ -421,7 +421,7 @@ Kimi 仍然仅支持 API 密钥；对 Kimi 的外部授权被拒绝。
 | `sakana` | `[providers.sakana]` | `FUGU_API_KEY`, `SAKANA_API_KEY` | `SAKANA_BASE_URL`；默认 `https://api.sakana.ai/v1` | `fugu`（默认）, `fugu-ultra-20260615` | Sakana AI Fugu OpenAI 兼容路由。标准 Chat Completions 线协议；支持流式。`fugu-ultra-20260615` 是重型/推理变体。环境变量别名：`FUGU_API_KEY`（主）, `SAKANA_API_KEY`；提供商别名：`sakana-ai`, `sakana_ai`, `fugu`。 |
 | `longcat` | `[providers.longcat]` | `LONGCAT_API_KEY` | `LONGCAT_BASE_URL`；默认 `https://api.longcat.chat/openai/v1` | `LongCat-2.0`（默认） | 美团 LongCat 精选模型网关。OpenAI 兼容 Chat Completions 线协议。在 https://longcat.chat/platform 注册获取 API 密钥。提供商别名：`long-cat`, `meituan-longcat`, `meituan`。 |
 | `opencode-go` | `[providers.opencode_go]` | `OPENCODE_GO_API_KEY` | `OPENCODE_GO_BASE_URL`；默认 `https://opencode.ai/zen/go/v1` | `deepseek-v4-pro`（默认）, `grok-4.5`, `glm-5.2`, `glm-5.1`, `kimi-k3`, `kimi-k2.7-code`, `kimi-k2.6`, `deepseek-v4-flash`, `mimo-v2.5`, `mimo-v2.5-pro` | [OpenCode Go](https://opencode.ai/docs/go/) 订阅路由，使用 OpenAI 兼容 Chat Completions。接受 `OPENCODE_GO_MODEL`。Codewhale 使用裸线协议 ID；常见的 `opencode-go/<model-id>` 输入别名规范化为裸 ID。只在 Anthropic `/messages` 端点文档化的 Go 模型，在 Codewhale 支持按模型选择线协议之前被该路由刻意不公布。计费界面显示 Go 额度而不是 token 价格估算。 |
-| `opencode-zen` | `[providers.opencode_zen]` | `OPENCODE_ZEN_API_KEY`, 回退 `OPENCODE_API_KEY` | `OPENCODE_ZEN_BASE_URL`；默认 `https://opencode.ai/zen/v1` | `gpt-5.5`（默认）；当前文档化的 GPT、Claude、Qwen、DeepSeek、MiniMax、GLM、Kimi、Grok 和免费模型 ID | [OpenCode Zen](https://opencode.ai/docs/zen/) 模型感知网关。接受 `OPENCODE_ZEN_MODEL`，官方 `opencode/<model-id>` 选择器规范化为裸线协议 ID。GPT 行使用 `/responses`；Claude 和 Qwen 行使用 `/messages`；DeepSeek、MiniMax、GLM、Kimi、Grok 和列出的免费行使用 `/chat/completions`。Responses 和 Chat Completions 用 Bearer `Authorization` 认证，而 Anthropic Messages 用 `x-api-key`；这些路由都不用 ChatGPT/Codex OAuth 指引或头。Gemini 目前失败关闭，因为其模型特定的 Google 线协议未实现。未知模型在精选目录中存在其协议之前也失败关闭。 |
+| `opencode-zen` | `[providers.opencode_zen]` | `OPENCODE_ZEN_API_KEY`, 回退 `OPENCODE_API_KEY` | `OPENCODE_ZEN_BASE_URL`；默认 `https://opencode.ai/zen/v1` | `gpt-5.6`（默认）；当前的 GPT、Claude、Qwen、DeepSeek、MiniMax、GLM、Kimi、Grok、Muse Spark 和免费模型 ID | [OpenCode Zen](https://opencode.ai/docs/zen/) 模型感知网关。接受 `OPENCODE_ZEN_MODEL`，官方 `opencode/<model-id>` 选择器规范化为裸线协议 ID。每个模型的线协议先取自精选快照，再取自其 [Models.dev](https://models.dev) 行声明的 AI SDK 包：GPT、Grok 和 Muse Spark 行使用 `/responses`；Claude 和大多数 Qwen 行使用 `/messages`；DeepSeek、MiniMax、GLM、Kimi、`qwen3.8-max` 和免费行使用 `/chat/completions`。Responses 和 Chat Completions 用 Bearer `Authorization` 认证，而 Anthropic Messages 用 `x-api-key`；这些路由都不用 ChatGPT/Codex OAuth 指引或头。Gemini 失败关闭，因为其模型特定的 Google 线协议未实现；Models.dev 标记为 `deprecated` 的行以及任何已加载目录都未列出的模型也失败关闭。见 [OpenCode Zen 协议目录](#opencode-zen-协议目录)。 |
 | `meta` | `[providers.meta]` | `META_MODEL_API_KEY`, `MODEL_API_KEY` | `META_MODEL_API_BASE_URL`, `MODEL_API_BASE_URL`；默认 `https://api.meta.ai/v1` | `muse-spark-1.2`（默认） | [Meta Model API](https://developer.meta.com/ai/resources/blog/build-with-muse-spark/) 公开预览路由，使用 OpenAI 兼容 Chat Completions。Muse Spark 1.2 保留其线协议 ID、工具支持、1M 上下文、32K 输出元数据和 `none` 到 `xhigh` 的推理强度。接受 `META_MODEL_API_MODEL` 和 `MODEL_API_MODEL`。提供商别名：`meta-ai`, `meta_model_api`, `muse`, `muse-spark`。 |
 | `telecomjs` | `[providers.telecomjs]` | `TELECOMJS_API_KEY` | `TELECOMJS_BASE_URL`；默认 `https://aigw.telecomjs.com/v1` | 保守回退 `deepseek-v4-pro`；配置密钥后认证的 `/models` 行 | TelecomJS TokenHub OpenAI 兼容 Chat Completions 路由。实时目录按提供商和密钥指纹隔离，过期的行在瞬时刷新失败时存活，不支持的推理请求字段被省略。接受 `TELECOMJS_MODEL`。提供商别名：`telecom-js`, `telecom_js`, `telecomjs-cn`, `tokenhub`。 |
 | `mistral` | `[providers.mistral]` | `MISTRAL_API_KEY` | `MISTRAL_BASE_URL`；默认 `https://api.mistral.ai/v1` | `mistral-code-latest`（默认；`codestral-latest` 接受为别名）, `mistral-medium-latest`（别名：`mistral-medium-3-5`）, `mistral-small-latest`（别名：`mistral-small-2603`）, `mistral-large-latest` | Mistral AI（la Plateforme）OpenAI 兼容 Chat 路由。在文档化的第一方 HTTPS `/v1` 主机上，Medium 和 Small 发送可调的 `reasoning_effort`（仅 `none` 或 `high`），解析 Mistral 的多态 thinking/text 块，并以相同线协议形状重放存储的思考。已废弃的原生 Magistral ID 仍是显式配置兼容路由：它们始终思考，从不接收可调 effort 字段。Code 和 Large 不推理。除非是文档化的第一方主机之一，自定义 `MISTRAL_BASE_URL` 保持通用 Chat 语义。接受 `MISTRAL_MODEL`。提供商别名：`mistral-ai`, `mistralai`, `la-plateforme`。 |
@@ -438,26 +438,39 @@ Kimi 仍然仅支持 API 密钥；对 Kimi 的外部授权被拒绝。
 
 Zen Responses 和 Chat Completions 请求使用 Bearer `Authorization` 认证；Zen Anthropic Messages 请求使用 `x-api-key`。这些路由都不会添加 ChatGPT/Codex OAuth 头。
 
-捆绑的 Zen 传输快照遵循[官方端点表](https://opencode.ai/docs/zen/)并且刻意保持显式：
+每个 Zen 模型的线协议来自两个来源，都不会按模型 ID 家族猜测（`qwen3.8-flash` 走 Messages，而 `qwen3.8-max` 走 Chat）：
 
-- Responses：`gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-5.5`,
-  `gpt-5.5-pro`, `gpt-5.4`, `gpt-5.4-pro`, `gpt-5.4-mini`, `gpt-5.4-nano`,
-  `gpt-5.3-codex`, `gpt-5.3-codex-spark`, `gpt-5.2`, `gpt-5.2-codex`,
-  `gpt-5.1`, `gpt-5.1-codex`, `gpt-5.1-codex-max`,
-  `gpt-5.1-codex-mini`, `gpt-5`, `gpt-5-codex`, `gpt-5-nano`。
-- Anthropic Messages：`claude-fable-5`, `claude-opus-4-8`,
-  `claude-opus-4-7`, `claude-opus-4-6`, `claude-opus-4-5`,
+1. **精选快照**：编译进 Codewhale，已对照[官方端点表](https://opencode.ai/docs/zen/)和 [Models.dev](https://models.dev) 的 `opencode` provider 核实。它是离线下限；当目录行为同一 ID 声明了不同线协议时，以它为准。
+2. **Models.dev 目录**：其 `opencode` provider 就是 Zen 公布的目录，每个模型行都写明 OpenCode 自己使用的 AI SDK 包。Codewhale 精确映射：`@ai-sdk/openai` → Responses，`@ai-sdk/anthropic` → Anthropic Messages，`@ai-sdk/openai-compatible`（provider 默认值）→ Chat Completions。本版本之后发布的 Zen 模型只要出现在目录中即可路由，无需发布新版 Codewhale。交互式 TUI 和 `codewhale exec` 都会加载持久化的目录；用 `codewhale models --update` 刷新。
+
+精选快照：
+
+- Responses：`gpt-6-astra`, `gpt-6-sol`, `gpt-6-luna`, `gpt-5.6-sol`,
+  `gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-5.5`, `gpt-5.5-pro`, `gpt-5.4`,
+  `gpt-5.4-pro`, `gpt-5.4-mini`, `gpt-5.4-nano`, `gpt-5.3-codex`,
+  `gpt-5.3-codex-spark`, `gpt-5.2`, `gpt-5.2-codex`, `gpt-5.1`,
+  `gpt-5.1-codex`, `gpt-5.1-codex-max`, `gpt-5.1-codex-mini`, `gpt-5`,
+  `gpt-5-codex`, `gpt-5-nano`, `grok-4.7`, `grok-4.6`, `grok-4.5`,
+  `grok-build-0.1`, `muse-spark-1.3`, `muse-spark-1.3-contributor-free`,
+  `muse-spark-1.2`, `muse-spark-1.2-contributor`,
+  `muse-spark-1.2-contributor-free`。
+- Anthropic Messages：`claude-fable-5-1`, `claude-fable-5`,
+  `claude-opus-5-5`, `claude-opus-5`, `claude-opus-4-8`, `claude-opus-4-7`,
+  `claude-opus-4-6`, `claude-opus-4-5`, `claude-sonnet-5-5`,
   `claude-sonnet-5`, `claude-sonnet-4-6`, `claude-sonnet-4-5`,
-  `claude-haiku-4-5`, `qwen3.7-max`, `qwen3.7-plus`, `qwen3.6-plus`,
-  `qwen3.5-plus`。
-- Chat Completions：`deepseek-v4-pro`, `deepseek-v4-flash`, `minimax-m3`,
-  `minimax-m2.7`, `minimax-m2.5`, `glm-5.2`, `glm-5.1`, `glm-5`,
-  `kimi-k2.5`, `kimi-k2.6`, `kimi-k2.7-code`, `grok-4.5`,
-  `grok-build-0.1`, `big-pickle`, `mimo-v2.5-free`,
-  `north-mini-code-free`, `nemotron-3-ultra-free`,
+  `claude-sonnet-4`, `claude-haiku-4-5`, `qwen3.8-flash`, `qwen3.7-max`,
+  `qwen3.7-plus`, `qwen3.6-plus`, `qwen3.5-plus`。
+- Chat Completions：`deepseek-v4.1-flash`, `deepseek-v4-pro`,
+  `deepseek-v4-flash`, `deepseek-v4-flash-vision-exp`, `minimax-m3`,
+  `minimax-m2.7`, `minimax-m2.5`, `glm-5.3-flash`, `glm-5.3`, `glm-5.2`,
+  `glm-5.1`, `glm-5`, `kimi-k3`, `kimi-k2.7-code`, `kimi-k2.6`, `kimi-k2.5`,
+  `qwen3.8-max`, `big-pickle`, `space-bunny-free`,
+  `longcat-2.5-preview-free`, `mimo-v2.6-flash-free`, `mimo-v2.5-free`,
+  `ling-3.0-flash-fin-free`, `north-mini-code-free`,
+  `nemotron-3-ultra-free`, `nemotron-3.5-lightning-free`,
   `deepseek-v4-flash-free`。
 
-Gemini 条目被排除，因为官方表给它们分配了 Google 的模型特定协议。目录缺失永远不会回退到另一种 Zen 线协议形态，包括配置了自定义 Zen base URL 时。
+以下情况在本地失败关闭并在错误中说明原因，而不会发往 Zen：Gemini（`@ai-sdk/google`，Google 的模型特定协议，Codewhale 不支持）；目录行声明了其他任何包；Models.dev 标记为 `deprecated` 的目录行；两个来源都未列出的模型。目录缺失永远不会回退到另一种 Zen 线协议形态，包括配置了自定义 Zen base URL 时。
 
 ### Hugging Face Provider 与 MCP 与 Hub
 

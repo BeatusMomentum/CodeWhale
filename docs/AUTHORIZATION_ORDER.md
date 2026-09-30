@@ -1,5 +1,7 @@
 # Authorization order
 
+> 阅读简体中文版：[zh_hans/AUTHORIZATION_ORDER.md](zh_hans/AUTHORIZATION_ORDER.md)。
+
 Codewhale combines tool availability, hooks, typed permission rules, approval
 posture, repository policy, and sandboxing. An approval from one layer is not a
 universal bypass: a later safety layer can still require review or block the

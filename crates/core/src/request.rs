@@ -163,6 +163,11 @@ pub enum ContentBlock {
         id: String,
         name: String,
         input: serde_json::Value,
+        /// Host-owned execution correlation, distinct from the provider's id.
+        /// Persisted with history; provider adapters project only wire fields.
+        /// Missing identifies legacy/provider-only history, never a new grant.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        execution_id: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         caller: Option<ToolCaller>,
         /// Google thought signature captured from the OpenAI-compat route's
@@ -176,6 +181,9 @@ pub enum ContentBlock {
     ToolResult {
         tool_use_id: String,
         content: String,
+        /// The exact host execution that produced this result, when recorded.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        execution_id: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         is_error: Option<bool>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -199,7 +207,53 @@ pub enum ContentBlock {
     },
 }
 
+/// Identity for pairing host history without conflating a provider's reused
+/// string with a local execution. Legacy identity cannot establish a grant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ToolCallKey<'a> {
+    Execution(&'a str),
+    LegacyProvider(&'a str),
+}
+
+impl<'a> ToolCallKey<'a> {
+    #[must_use]
+    pub fn as_str(self) -> &'a str {
+        match self {
+            Self::Execution(id) | Self::LegacyProvider(id) => id,
+        }
+    }
+}
+
 impl ContentBlock {
+    /// Pairing identity in persisted host history. An explicit execution id
+    /// never falls back to provider correlation, even if malformed or mismatched.
+    /// Wire adapters must continue using the original id/tool_use_id instead.
+    #[must_use]
+    pub fn tool_call_key(&self) -> Option<ToolCallKey<'_>> {
+        match self {
+            Self::ToolUse {
+                id, execution_id, ..
+            }
+            | Self::ToolResult {
+                tool_use_id: id,
+                execution_id,
+                ..
+            } => Some(
+                execution_id
+                    .as_deref()
+                    .map_or(ToolCallKey::LegacyProvider(id), ToolCallKey::Execution),
+            ),
+            Self::ServerToolUse { id, .. }
+            | Self::ToolSearchToolResult {
+                tool_use_id: id, ..
+            }
+            | Self::CodeExecutionToolResult {
+                tool_use_id: id, ..
+            } => Some(ToolCallKey::LegacyProvider(id)),
+            _ => None,
+        }
+    }
+
     /// Build readable reasoning with no provider-owned continuity state.
     #[must_use]
     pub fn thinking(thinking: impl Into<String>) -> Self {
@@ -318,6 +372,80 @@ mod tests {
             serde_json::to_vec(&decoded).expect("re-save transcript"),
             persisted.to_vec(),
             "re-saving a loaded transcript must not change a single byte",
+        );
+    }
+
+    #[test]
+    fn tool_execution_identity_round_trips_without_changing_legacy_bytes() {
+        let legacy = br#"[{"role":"assistant","content":[{"type":"tool_use","id":"wire","name":"read","input":{},"caller":{"type":"code_execution","tool_id":"parent-wire"},"thought_signature":"signature"}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"wire","content":"result"}]}]"#;
+        let mut messages: Vec<Message> = serde_json::from_slice(legacy).unwrap();
+        assert_eq!(serde_json::to_vec(&messages).unwrap(), legacy);
+        for block in messages.iter_mut().flat_map(|message| &mut message.content) {
+            match block {
+                ContentBlock::ToolUse { execution_id, .. }
+                | ContentBlock::ToolResult { execution_id, .. } => {
+                    assert!(execution_id.is_none());
+                    *execution_id = Some("local-execution".to_string());
+                }
+                _ => unreachable!(),
+            }
+        }
+        let persisted = serde_json::to_vec(&messages).unwrap();
+        let restored: Vec<Message> = serde_json::from_slice(&persisted).unwrap();
+        assert_eq!(restored, messages);
+        assert_eq!(
+            restored[0].content[0].tool_call_key(),
+            restored[1].content[0].tool_call_key()
+        );
+        let ContentBlock::ToolUse {
+            id,
+            caller,
+            thought_signature,
+            ..
+        } = &restored[0].content[0]
+        else {
+            unreachable!()
+        };
+        assert_eq!(id, "wire");
+        assert_eq!(
+            caller.as_ref().unwrap().tool_id.as_deref(),
+            Some("parent-wire")
+        );
+        assert_eq!(thought_signature.as_deref(), Some("signature"));
+    }
+
+    #[test]
+    fn tool_history_keys_never_fall_back_or_cross_identity_domains() {
+        let call = |execution_id: Option<&str>| ContentBlock::ToolUse {
+            id: "same-string".to_string(),
+            name: "read".to_string(),
+            input: json!({}),
+            execution_id: execution_id.map(str::to_string),
+            caller: None,
+            thought_signature: None,
+        };
+        let legacy = call(None);
+        let local = call(Some("same-string"));
+        let different = call(Some("other-execution"));
+        let malformed = call(Some(""));
+        assert_eq!(
+            legacy.tool_call_key(),
+            Some(ToolCallKey::LegacyProvider("same-string"))
+        );
+        assert_eq!(
+            local.tool_call_key(),
+            Some(ToolCallKey::Execution("same-string"))
+        );
+        assert_ne!(legacy.tool_call_key(), local.tool_call_key());
+        assert_ne!(local.tool_call_key(), different.tool_call_key());
+        assert_eq!(malformed.tool_call_key(), Some(ToolCallKey::Execution("")));
+        assert_eq!(
+            std::collections::HashSet::from([
+                legacy.tool_call_key().unwrap(),
+                local.tool_call_key().unwrap(),
+            ])
+            .len(),
+            2
         );
     }
 

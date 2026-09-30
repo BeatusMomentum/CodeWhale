@@ -1693,7 +1693,12 @@ impl App {
         // into a workspace paste file now (#553). Bracketed pastes hit
         // the consolidation in `insert_paste_text` first, so the user
         // sees the @mention in the composer before submission.
-        self.consolidate_large_input_if_oversized();
+        if !self.consolidate_large_input_if_oversized() {
+            // The paste file could not be written. Never send a silently
+            // truncated prompt: the full text stays in the composer and the
+            // error explains why Enter did nothing.
+            return None;
+        }
         // If consolidation created a paste file, submit only the @-mention so
         // the model reads the full content from the paste file. Sending both
         // the inline text and the file mention duplicates the content in the
@@ -1907,10 +1912,14 @@ impl App {
     /// insert path (visible-before-submit) and the submit-time safety net
     /// route through here, so the cap is enforced exactly once even when
     /// both paths fire on the same buffer.
-    fn consolidate_large_input_if_oversized(&mut self) {
+    ///
+    /// Returns `false` when the input is oversized and could not be backed
+    /// up to a paste file; the composer then still holds the full text.
+    pub(crate) fn consolidate_large_input_if_oversized(&mut self) -> bool {
         if char_count(&self.input) > MAX_SUBMITTED_INPUT_CHARS {
-            self.consolidate_large_input();
+            return self.consolidate_large_input();
         }
+        true
     }
 
     /// When the composer input exceeds [`MAX_SUBMITTED_INPUT_CHARS`], write
@@ -1918,42 +1927,30 @@ impl App {
     /// `.codewhale/pastes/` and replace `self.input` with an `@`-mention
     /// pointing at it so the model can read the full content via the
     /// normal file-mention resolution path (#553).
-    fn consolidate_large_input(&mut self) {
-        let full_input = std::mem::take(&mut self.input);
-        self.cursor_position = 0;
-
+    ///
+    /// Returns `false` without touching the composer when the paste file
+    /// cannot be written, so the caller holds the submit instead of sending
+    /// a truncated prompt.
+    fn consolidate_large_input(&mut self) -> bool {
         let now = chrono::Local::now();
         let suffix = uuid::Uuid::new_v4().to_string()[..8].to_string();
         let filename = format!("paste-{}-{}.md", now.format("%Y-%m-%d-%H%M%S"), suffix);
         let rel_path = format!(".codewhale/pastes/{filename}");
 
         let pastes_dir = self.workspace.join(".codewhale/pastes");
-        if let Err(e) = std::fs::create_dir_all(&pastes_dir) {
-            // Fallback: keep a truncated version so we don't lose the
-            // user's input entirely when the filesystem is unhappy.
-            self.input = full_input.chars().take(MAX_SUBMITTED_INPUT_CHARS).collect();
-            self.resync_command_line_claim();
-            self.cursor_position = char_count(&self.input);
-            self.push_status_toast(
-                format!("Failed to create paste directory: {e}"),
-                StatusToastLevel::Error,
-                Some(8_000),
-            );
-            return;
-        }
-
         let file_path = self.workspace.join(&rel_path);
-        if let Err(e) = std::fs::write(&file_path, &full_input) {
-            self.input = full_input.chars().take(MAX_SUBMITTED_INPUT_CHARS).collect();
-            self.resync_command_line_claim();
-            self.cursor_position = char_count(&self.input);
-            self.push_status_toast(
-                format!("Failed to write paste file: {e}"),
-                StatusToastLevel::Error,
-                Some(8_000),
-            );
-            return;
+        let written = std::fs::create_dir_all(&pastes_dir)
+            .and_then(|()| std::fs::write(&file_path, &self.input));
+        if let Err(error) = written {
+            let reason = self
+                .tr(MessageId::ComposerOversizedSubmitHeld)
+                .replace("{limit}", &MAX_SUBMITTED_INPUT_CHARS.to_string())
+                .replace("{error}", &error.to_string());
+            self.push_status_toast(reason, StatusToastLevel::Error, Some(8_000));
+            self.needs_redraw = true;
+            return false;
         }
+        let full_input = std::mem::take(&mut self.input);
 
         // Keep a truncated preview in the composer so the user can still
         // select, copy, and edit it. The full text is written to the paste
@@ -1974,6 +1971,7 @@ impl App {
             StatusToastLevel::Info,
             Some(5_000),
         );
+        true
     }
 
     pub fn history_down(&mut self) {

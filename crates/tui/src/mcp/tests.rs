@@ -78,7 +78,7 @@ fn mark_workspace_trusted(workspace: &Path) -> WorkspaceTrustConfigGuard {
 #[test]
 fn test_mcp_config_defaults() {
     let config = McpConfig::default();
-    assert_eq!(config.timeouts.connect_timeout, 10);
+    assert_eq!(config.timeouts.connect_timeout, 30);
     assert_eq!(config.timeouts.execute_timeout, 60);
     assert_eq!(config.timeouts.read_timeout, 120);
     assert!(config.servers.is_empty());
@@ -6035,51 +6035,58 @@ async fn legacy_sse_session_expiry_is_marked_stale() {
     server.abort();
 }
 
+/// Read one HTTP/1.1 request from a legacy SSE test server socket.
+async fn read_legacy_sse_http_request(
+    socket: &mut tokio::net::TcpStream,
+) -> (String, serde_json::Value) {
+    let mut request = Vec::new();
+    let mut buf = [0; 4096];
+    let header_end = loop {
+        let n = tokio::io::AsyncReadExt::read(socket, &mut buf)
+            .await
+            .unwrap();
+        if n == 0 {
+            return (String::new(), serde_json::Value::Null);
+        }
+        request.extend_from_slice(&buf[..n]);
+        if let Some(pos) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+            break pos + 4;
+        }
+    };
+    let headers = String::from_utf8_lossy(&request[..header_end]).to_string();
+    let content_length = headers
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().ok())
+                .flatten()
+        })
+        .unwrap_or(0);
+    while request.len() < header_end + content_length {
+        let n = tokio::io::AsyncReadExt::read(socket, &mut buf)
+            .await
+            .unwrap();
+        if n == 0 {
+            return (headers, serde_json::Value::Null);
+        }
+        request.extend_from_slice(&buf[..n]);
+    }
+    let body = &request[header_end..header_end + content_length];
+    let json = if body.is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::from_slice(body).unwrap()
+    };
+    (headers, json)
+}
+
 #[tokio::test]
 async fn legacy_sse_closed_stream_reports_unknown_outcome_and_reconnects_without_replay() {
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::{TcpListener, TcpStream};
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpListener;
     use tokio::sync::mpsc;
-
-    async fn read_http_request(socket: &mut TcpStream) -> (String, serde_json::Value) {
-        let mut request = Vec::new();
-        let mut buf = [0; 4096];
-        let header_end = loop {
-            let n = socket.read(&mut buf).await.unwrap();
-            if n == 0 {
-                return (String::new(), serde_json::Value::Null);
-            }
-            request.extend_from_slice(&buf[..n]);
-            if let Some(pos) = request.windows(4).position(|w| w == b"\r\n\r\n") {
-                break pos + 4;
-            }
-        };
-        let headers = String::from_utf8_lossy(&request[..header_end]).to_string();
-        let content_length = headers
-            .lines()
-            .find_map(|line| {
-                let (name, value) = line.split_once(':')?;
-                name.eq_ignore_ascii_case("content-length")
-                    .then(|| value.trim().parse::<usize>().ok())
-                    .flatten()
-            })
-            .unwrap_or(0);
-        while request.len() < header_end + content_length {
-            let n = socket.read(&mut buf).await.unwrap();
-            if n == 0 {
-                return (headers, serde_json::Value::Null);
-            }
-            request.extend_from_slice(&buf[..n]);
-        }
-        let body = &request[header_end..header_end + content_length];
-        let json = if body.is_empty() {
-            serde_json::Value::Null
-        } else {
-            serde_json::from_slice(body).unwrap()
-        };
-        (headers, json)
-    }
 
     // A concurrent proxy fixture changes process-wide HTTP_PROXY/NO_PROXY.
     // Hold the environment guard before the loopback guard, as other MCP
@@ -6108,7 +6115,7 @@ async fn legacy_sse_closed_stream_reports_unknown_outcome_and_reconnects_without
             let tool_call_count = Arc::clone(&server_tool_call_count);
             let success_seen = Arc::clone(&server_success_seen);
             tokio::spawn(async move {
-                let (headers, request_json) = read_http_request(&mut socket).await;
+                let (headers, request_json) = read_legacy_sse_http_request(&mut socket).await;
                 if headers.starts_with("GET /sse ") {
                     get_count.fetch_add(1, AtomicOrdering::SeqCst);
                     let (tx, mut rx) = mpsc::unbounded_channel::<Option<String>>();
@@ -6269,6 +6276,152 @@ async fn legacy_sse_closed_stream_reports_unknown_outcome_and_reconnects_without
     assert_eq!(tool_call_count.load(AtomicOrdering::SeqCst), 2);
     assert_eq!(get_count.load(AtomicOrdering::SeqCst), 2);
     assert!(success_seen.load(AtomicOrdering::SeqCst));
+
+    server.abort();
+}
+
+/// Servers without an explicit `transport = "sse"` reach legacy SSE through
+/// the Streamable HTTP fallback, inside `HttpTransport`. An event stream that
+/// closes while idle must read as not ready there too, so the next call
+/// reconnects before it dispatches instead of losing the result.
+#[tokio::test]
+async fn fallback_sse_stream_closed_while_idle_reconnects_before_dispatch() {
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpListener;
+    use tokio::sync::mpsc;
+
+    let _env = crate::test_support::lock_test_env();
+    let _lock = lock_mcp_loopback_tests().await;
+    let _no_proxy = crate::test_support::EnvVarGuard::set("NO_PROXY", "*");
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let active_sse = Arc::new(Mutex::new(None::<mpsc::UnboundedSender<Option<String>>>));
+    let initialize_count = Arc::new(AtomicUsize::new(0));
+    let tool_call_count = Arc::new(AtomicUsize::new(0));
+    let server_active_sse = Arc::clone(&active_sse);
+    let server_initialize_count = Arc::clone(&initialize_count);
+    let server_tool_call_count = Arc::clone(&tool_call_count);
+
+    let server = tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            let active_sse = Arc::clone(&server_active_sse);
+            let initialize_count = Arc::clone(&server_initialize_count);
+            let tool_call_count = Arc::clone(&server_tool_call_count);
+            tokio::spawn(async move {
+                let (headers, request_json) = read_legacy_sse_http_request(&mut socket).await;
+                if headers.starts_with("GET /mcp ") {
+                    // The session preflight and the fallback stream both land
+                    // here; the later GET replaces the earlier stream.
+                    let (tx, mut rx) = mpsc::unbounded_channel::<Option<String>>();
+                    *active_sse.lock().unwrap() = Some(tx);
+                    let opened = socket
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\nevent: endpoint\ndata: /messages\n\n")
+                        .await;
+                    if opened.is_err() {
+                        return;
+                    }
+                    while let Some(Some(message)) = rx.recv().await {
+                        let event = format!("event: message\ndata: {message}\n\n");
+                        if socket.write_all(event.as_bytes()).await.is_err() {
+                            return;
+                        }
+                    }
+                    return;
+                }
+                if headers.starts_with("POST /mcp ") {
+                    // No Streamable HTTP: the client falls back to legacy SSE.
+                    let _ = socket
+                        .write_all(b"HTTP/1.1 405 Method Not Allowed\r\nConnection: close\r\nContent-Length: 0\r\n\r\n")
+                        .await;
+                    return;
+                }
+                if !headers.starts_with("POST /messages ") {
+                    return;
+                }
+                let _ = socket
+                    .write_all(
+                        b"HTTP/1.1 202 Accepted\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+                    )
+                    .await;
+                let method = request_json
+                    .get("method")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                let result = match method {
+                    "notifications/initialized" => return,
+                    "initialize" => {
+                        initialize_count.fetch_add(1, AtomicOrdering::SeqCst);
+                        serde_json::json!({
+                            "protocolVersion": "2024-11-05",
+                            "capabilities": {"tools": {}}
+                        })
+                    }
+                    "tools/list" => serde_json::json!({
+                        "tools": [{ "name": "search", "inputSchema": {} }]
+                    }),
+                    "resources/list" => serde_json::json!({ "resources": [] }),
+                    "resources/templates/list" => serde_json::json!({ "resourceTemplates": [] }),
+                    "prompts/list" => serde_json::json!({ "prompts": [] }),
+                    "tools/call" => {
+                        tool_call_count.fetch_add(1, AtomicOrdering::SeqCst);
+                        serde_json::json!({ "content": [{ "type": "text", "text": "ok" }] })
+                    }
+                    other => panic!("unexpected method: {other}"),
+                };
+                let response = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": request_json.get("id").cloned().unwrap_or(serde_json::Value::Null),
+                    "result": result
+                })
+                .to_string();
+                let tx = active_sse.lock().unwrap().as_ref().cloned();
+                if let Some(tx) = tx {
+                    let _ = tx.send(Some(response));
+                }
+            });
+        }
+    });
+
+    let mut cfg = McpConfig::default();
+    let mut server_config = test_server_config();
+    server_config.command = None;
+    server_config.url = Some(format!("http://{addr}/mcp"));
+    server_config.connect_timeout = Some(10);
+    server_config.execute_timeout = Some(10);
+    cfg.servers.insert("fallback".to_string(), server_config);
+    let mut pool = McpPool::new(cfg);
+    let ok = serde_json::json!({ "content": [{ "type": "text", "text": "ok" }] });
+
+    let result = pool
+        .call_tool("mcp_fallback_search", serde_json::json!({}))
+        .await
+        .unwrap();
+    assert_eq!(result, ok);
+
+    // The server ends the event stream while the connection is idle.
+    let stream = active_sse
+        .lock()
+        .unwrap()
+        .take()
+        .expect("fallback stream open");
+    stream.send(None).unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while pool.connections["fallback"].is_transport_ready() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "a closed fallback SSE stream must stop reading as ready"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // The next call reconnects first, so it is dispatched once and answered.
+    let result = pool
+        .call_tool("mcp_fallback_search", serde_json::json!({}))
+        .await
+        .unwrap();
+    assert_eq!(result, ok);
+    assert_eq!(tool_call_count.load(AtomicOrdering::SeqCst), 2);
+    assert_eq!(initialize_count.load(AtomicOrdering::SeqCst), 2);
 
     server.abort();
 }
@@ -6527,6 +6680,419 @@ fn removed_runtime_server_config_can_be_retried_with_same_name() {
     pool.remove_runtime_server_config("retryable");
     pool.add_runtime_server_config("retryable".to_string(), config)
         .expect("rollback must release the deterministic runtime name");
+}
+
+#[tokio::test]
+async fn mcp_initialize_sends_empty_client_capabilities_and_accepts_2025_11_25() {
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let transport = ScriptedValueTransport {
+        sent: Arc::clone(&sent),
+        responses: VecDeque::from([json_frame(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "protocolVersion": "2025-11-25",
+                "serverInfo": {"name": "current-sdk", "version": "1.0.0"},
+                "capabilities": {"tools": {}}
+            }
+        }))]),
+    };
+    let mut conn = test_connection(Box::new(transport));
+
+    conn.initialize()
+        .await
+        .expect("a 2025-11-25 server must complete the handshake");
+
+    let sent = sent.lock().unwrap();
+    let initialize = sent
+        .iter()
+        .find(|message| message["method"] == "initialize")
+        .expect("initialize sent");
+    assert_eq!(
+        initialize["params"],
+        serde_json::json!({
+            "protocolVersion": MCP_PROTOCOL_VERSION,
+            "clientInfo": {"name": "codewhale-tui", "version": env!("CARGO_PKG_VERSION")},
+            "capabilities": {}
+        }),
+        "client capabilities must not declare server-side tools/resources/prompts"
+    );
+}
+
+#[tokio::test]
+async fn mcp_initialize_rejection_from_expired_aws_sso_names_the_login_command() {
+    let transport = ScriptedValueTransport {
+        sent: Arc::new(Mutex::new(Vec::new())),
+        responses: VecDeque::from([json_frame(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "error": {
+                "code": -32602,
+                "message": "Error retrieving credentials: The SSO session associated with this profile has expired or is otherwise invalid."
+            }
+        }))]),
+    };
+    let mut conn = test_connection(Box::new(transport));
+    conn.config.args = vec![
+        "mcp-proxy-for-aws@1.6.4".to_string(),
+        "--profile".to_string(),
+        "work-sso".to_string(),
+    ];
+
+    let error = format!("{:#}", conn.initialize().await.expect_err("rejected"));
+    assert!(
+        error.contains(
+            "run `aws sso login --profile work-sso` in a terminal, then `/mcp retry mock`"
+        ),
+        "{error}"
+    );
+    assert_eq!(
+        mcp_recovery_kind(true, true, false, Some(&error), false),
+        Some(McpRecoveryKind::AwsLogin)
+    );
+}
+
+#[test]
+fn mcp_recovery_kind_routes_expired_aws_credentials_to_external_login() {
+    for stderr in [
+        "The SSO session associated with this profile has expired or is otherwise invalid. To refresh this SSO session run aws sso login with the corresponding profile.",
+        "Error loading SSO Token: Token for my-sso does not exist",
+        "An error occurred (ExpiredTokenException) when calling the GetCallerIdentity operation: The security token included in the request is expired",
+        // An expired AWS token that also says 401/Unauthorized must not be
+        // routed to `/mcp login`, an OAuth flow that cannot renew it.
+        "UnauthorizedException (401): AWS token has expired",
+    ] {
+        assert_eq!(
+            mcp_recovery_kind(true, true, false, Some(stderr), false),
+            Some(McpRecoveryKind::AwsLogin),
+            "{stderr}"
+        );
+    }
+    // Unrelated text that merely shares substrings stays where it was.
+    for (stderr, expected) in [
+        ("processor token invalid", McpRecoveryKind::Diagnose),
+        ("401 Unauthorized", McpRecoveryKind::Reauth),
+        (
+            "oauth token expired; invalid_grant",
+            McpRecoveryKind::Reauth,
+        ),
+        (
+            "laws of token expiry were expired",
+            McpRecoveryKind::Diagnose,
+        ),
+    ] {
+        assert_eq!(
+            mcp_recovery_kind(true, true, false, Some(stderr), false),
+            Some(expected),
+            "{stderr}"
+        );
+    }
+    assert_eq!(
+        McpRecoveryKind::AwsLogin.slash_command("aws"),
+        "/mcp retry aws"
+    );
+    assert_eq!(
+        McpRecoveryKind::AwsLogin.slash_command("name with spaces"),
+        "/mcp reload"
+    );
+
+    let mut config = test_server_config();
+    assert_eq!(
+        aws_login_hint(&config, "aws", ""),
+        "AWS credentials expired: run `aws sso login` in a terminal, then `/mcp retry aws`"
+    );
+    config
+        .env
+        .insert("AWS_PROFILE".to_string(), "from-env".to_string());
+    assert!(aws_login_hint(&config, "aws", "").contains("aws sso login --profile from-env"));
+    config.args = vec!["--profile=from-arg".to_string()];
+    assert!(aws_login_hint(&config, "aws", "").contains("aws sso login --profile from-arg"));
+    // A profile the shell could misread is left out rather than quoted.
+    config.args = vec!["--profile".to_string(), "x; rm -rf ~".to_string()];
+    config.env.clear();
+    assert!(aws_login_hint(&config, "aws", "").contains("run `aws sso login` in"));
+    config.args = vec!["--profile=--no-sign-request".to_string()];
+    assert!(aws_login_hint(&config, "aws", "").contains("run `aws sso login` in"));
+}
+
+/// Review of #6789: the AWS-before-OAuth ordering lived only in the free
+/// classifier, while the panel read the typed needs-auth flag first. A stdio
+/// AWS proxy whose token expired with `401`/`Unauthorized` wording must not
+/// enter the needs-auth set, must not read `auth_required`, and its row must
+/// route to the in-place retry with the login command in the detail.
+#[test]
+fn expired_aws_login_with_401_wording_never_reaches_oauth_needs_auth() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = McpConfig::default();
+    let mut server = test_server_config();
+    server.args = vec!["--profile".to_string(), "work".to_string()];
+    config.servers.insert("aws".to_string(), server);
+    let mut pool = McpPool::new(config);
+
+    // Not the initialize branch: no hint was appended to this error.
+    let error = anyhow::anyhow!("UnauthorizedException (401): AWS token has expired");
+    pool.note_connect_failure("aws", &error);
+    assert!(!pool.server_needs_auth("aws"));
+
+    let errors = HashMap::from([("aws".to_string(), format_mcp_error_for_display(&error))]);
+    let snapshot = pool.manager_snapshot(&dir.path().join("mcp.json"), false, &errors);
+    let aws = snapshot
+        .servers
+        .iter()
+        .find(|server| server.name == "aws")
+        .expect("aws in snapshot");
+    assert!(!aws.auth_required, "{aws:?}");
+    let recovery = aws
+        .recovery_kind(false)
+        .expect("a failed server has a recovery");
+    assert_eq!(recovery, McpRecoveryKind::AwsLogin);
+    assert_eq!(recovery.slash_command("aws"), "/mcp retry aws");
+    // Labelled for what it runs, not "re-auth".
+    assert_eq!(
+        recovery.label_key(),
+        codewhale_localization::MessageId::ExtensionsActionReconnect
+    );
+    let detail = aws.error.as_deref().unwrap_or_default();
+    assert!(
+        detail.contains("run `aws sso login --profile work` in a terminal, then `/mcp retry aws`"),
+        "{detail}"
+    );
+
+    // A genuine OAuth 401 on the same pool still enters the needs-auth set.
+    pool.note_connect_failure("aws", &anyhow::anyhow!("HTTP 401 Unauthorized"));
+    assert!(pool.server_needs_auth("aws"));
+}
+
+#[tokio::test]
+async fn live_aws_expiry_retires_the_catalog_and_lists_external_recovery() {
+    for method in ["tools/call", "resources/read", "prompts/get"] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = McpConfig::default();
+        let server = test_server_config();
+        config.servers.insert("aws".to_string(), server.clone());
+        let mut pool = McpPool::new(config);
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let mut connection = test_connection(Box::new(ScriptedValueTransport {
+            sent: Arc::clone(&sent),
+            responses: VecDeque::from([json_frame(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "error": { "code": -32000, "message": "UnauthorizedException (401): AWS token has expired" }
+            }))]),
+        }));
+        connection.name = "aws".to_string();
+        connection.config = server;
+        connection.catalog_generation = pool.current_catalog_generation();
+        connection.tools.push(McpTool {
+            name: "lookup".to_string(),
+            description: None,
+            input_schema: serde_json::json!({"type": "object"}),
+            annotations: None,
+        });
+        connection.resources.push(McpResource {
+            uri: "aws://example".to_string(),
+            name: "example".to_string(),
+            description: None,
+            mime_type: None,
+        });
+        connection.prompts.push(McpPrompt {
+            name: "lookup".to_string(),
+            description: None,
+            arguments: Vec::new(),
+        });
+        pool.store_ready_connection("aws".to_string(), connection)
+            .unwrap();
+
+        let result = match method {
+            "tools/call" => {
+                pool.call_tool("mcp_aws_lookup", serde_json::json!({}))
+                    .await
+            }
+            "resources/read" => pool.read_resource("aws", "aws://example").await,
+            "prompts/get" => {
+                pool.get_prompt("aws", "lookup", serde_json::json!({}))
+                    .await
+            }
+            _ => unreachable!(),
+        };
+        let error = result.expect_err("expired AWS credentials fail the call");
+        assert!(format!("{error:#}").contains("aws sso login"));
+        assert_eq!(sent.lock().unwrap().len(), 1, "never replay the call");
+        assert!(!pool.connected_servers().contains(&"aws"));
+        assert!(!pool.server_needs_auth("aws"));
+        assert!(
+            pool.to_api_tools()
+                .iter()
+                .all(|tool| !tool.name.starts_with("mcp_aws_"))
+        );
+
+        // No external boot error map: the latest pool failure owns this row.
+        let snapshot = pool.manager_snapshot(&dir.path().join("mcp.json"), false, &HashMap::new());
+        let row = &snapshot.servers[0];
+        assert!(!row.connected && !row.auth_required);
+        assert_eq!(row.recovery_kind(false), Some(McpRecoveryKind::AwsLogin));
+        assert!(
+            row.error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("aws sso login")
+        );
+
+        // Backoff reuses the recorded failure, so neither listing spawns a
+        // process or logs in. Both model surfaces name the external recovery.
+        for items in [
+            pool.list_resources(None).await.unwrap(),
+            pool.list_resource_templates(None).await.unwrap(),
+        ] {
+            let item = items
+                .iter()
+                .find(|item| item["server"] == "aws")
+                .expect("AWS failure item");
+            assert_eq!(item["error"], "aws_login_required");
+            assert!(item.get("authenticate_tool").is_none());
+            let message = item["message"].as_str().unwrap();
+            assert!(message.contains("aws sso login") && message.contains("/mcp retry aws"));
+            assert!(!message.contains("/mcp login"));
+        }
+    }
+}
+
+#[test]
+fn sso_wording_on_an_oauth_capable_server_stays_on_the_oauth_route() {
+    // Corporate SSO in front of an OAuth HTTP server: `aws sso login` cannot
+    // help it, `/mcp login` can.
+    assert!(!mcp_error_is_aws_login(
+        "401 Unauthorized: SSO token expired",
+        true
+    ));
+    assert_eq!(
+        mcp_recovery_kind(
+            true,
+            true,
+            false,
+            Some("401 Unauthorized: SSO token expired"),
+            true
+        ),
+        Some(McpRecoveryKind::Reauth)
+    );
+    assert_eq!(
+        mcp_recovery_kind(true, true, false, Some("SSO token expired"), true),
+        Some(McpRecoveryKind::Diagnose)
+    );
+    // The same text from a stdio server is still the AWS route.
+    assert_eq!(
+        mcp_recovery_kind(true, true, false, Some("SSO token expired"), false),
+        Some(McpRecoveryKind::AwsLogin)
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = McpConfig::default();
+    let mut server = test_server_config();
+    server.command = None;
+    server.url = Some("https://mcp.example.test/mcp".to_string());
+    // Automatic OAuth discovery works without explicit scopes/client config.
+    assert!(mcp_server_oauth_capable(&server));
+    config.servers.insert("corp".to_string(), server);
+    let mut pool = McpPool::new(config);
+    pool.note_connect_failure(
+        "corp",
+        &anyhow::anyhow!("401 Unauthorized: SSO token expired"),
+    );
+    assert!(pool.server_needs_auth("corp"));
+    let errors = HashMap::new();
+    let snapshot = pool.manager_snapshot(&dir.path().join("mcp.json"), false, &errors);
+    let corp = &snapshot.servers[0];
+    assert!(corp.auth_required);
+    assert_eq!(corp.recovery_kind(true), Some(McpRecoveryKind::Reauth));
+}
+
+/// Review of #6789: a reviewed plugin's initialize/live error is suppressed to
+/// protect environment-backed credentials, which also hid the AWS wording
+/// the recovery keys on. The classification now runs on the raw text first
+/// and only our fixed hint survives — never the server's own words, and
+/// never the plugin's `AWS_PROFILE` env value.
+#[tokio::test]
+async fn reviewed_plugin_rejection_keeps_aws_recovery_but_not_server_text() {
+    let dir = tempfile::tempdir().unwrap();
+    let plugins_root = dir.path().join("plugins");
+    let plugin_base = plugins_root.join("aws-guard");
+    fs::create_dir_all(&plugin_base).unwrap();
+    fs::create_dir_all(dir.path().join("project")).unwrap();
+    fs::write(
+        plugin_base.join("plugin.toml"),
+        "schema_version = 1\n[plugin]\nname = \"aws-guard\"\nversion = \"1.0.0\"\n",
+    )
+    .unwrap();
+    let discovery = crate::plugins::discovery::DiscoveryConfig {
+        workspace: dir.path().join("project"),
+        user_plugins_dir: plugins_root,
+        workspace_plugins_dir: dir.path().join("workspace-plugins-unused"),
+        builtin_plugin_dirs: Vec::new(),
+        state_path: dir.path().join("plugin-state/state.json"),
+    };
+    let mut registry = crate::plugins::discovery::discover_with_config(&discovery);
+    registry.trust("aws-guard").unwrap();
+    registry.enable("aws-guard").unwrap();
+    let authority = registry.authority_for("aws-guard").unwrap();
+
+    let mut config = test_server_config();
+    config
+        .env
+        .insert("AWS_PROFILE".to_string(), "env-profile-secret".to_string());
+    config.reviewed_plugin = Some(
+        ReviewedPluginMcpSource::from_authority(
+            authority,
+            None,
+            Arc::new(crate::plugins::HostEnvironment::capture()),
+        )
+        .unwrap(),
+    );
+
+    for initialize in [true, false] {
+        for (server_error, login) in [
+            (
+                "Error retrieving credentials for acct-SECRET-123: The SSO session associated with this profile has expired or is otherwise invalid.",
+                "aws sso login",
+            ),
+            (
+                "acct-SECRET-123 LoginRefreshRequired: Please reauthenticate using aws login",
+                "aws login",
+            ),
+        ] {
+            let transport = ScriptedValueTransport {
+                sent: Arc::new(Mutex::new(Vec::new())),
+                responses: VecDeque::from([json_frame(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "error": { "code": -32602, "message": server_error }
+                }))]),
+            };
+            let mut conn = test_connection(Box::new(transport));
+            conn.config = config.clone();
+            let error = if initialize {
+                conn.initialize().await.expect_err("initialize rejected")
+            } else {
+                conn.call_method("tools/call", serde_json::json!({}), 5)
+                    .await
+                    .expect_err("live call rejected")
+            };
+            let error = format!("{error:#}");
+            assert!(error.contains("server details suppressed"), "{error}");
+            assert!(!error.contains("acct-SECRET-123"), "{error}");
+            assert!(!error.contains("env-profile-secret"), "{error}");
+            let hint = format!(
+                "AWS credentials expired: run `{login}` in a terminal, then `/mcp retry mock`"
+            );
+            assert!(error.contains(&hint), "{error}");
+            assert_eq!(
+                mcp_recovery_kind(true, true, false, Some(&error), false),
+                Some(McpRecoveryKind::AwsLogin)
+            );
+            // Pool/snapshot/listing classification sees only sanitized text;
+            // it must preserve aws login versus aws sso login on that pass.
+            assert_eq!(aws_login_hint(&config, "mock", &error), hint);
+        }
+    }
 }
 
 #[test]
@@ -8967,4 +9533,131 @@ fn computer_use_duplicate_warning_names_user_copies_of_the_enabled_bundle() {
         .expect("bundle entry")
         .enabled = false;
     assert!(duplicate_computer_use_servers(&config).is_empty());
+}
+
+/// Founder run: an `uvx mcp-proxy-for-aws` server answered `initialize` with
+/// JSON-RPC -32602 and the only thing surfaced was
+/// "MCP error in 'initialize': {...}". The proxy had explained itself on
+/// stderr (expired AWS login). The error now says the server rejected the
+/// handshake, names what was launched, and carries that last stderr line.
+#[cfg(unix)]
+#[tokio::test]
+async fn initialize_rejection_names_the_server_command_and_its_stderr_reason() {
+    let mut config = test_server_config();
+    config.command = Some("sh".to_string());
+    config.args = vec![
+        "-c".to_string(),
+        concat!(
+            "read line; ",
+            "echo 'LoginRefreshRequired: Please reauthenticate using aws login' 1>&2; ",
+            "echo '{\"jsonrpc\":\"2.0\",\"id\":\"1\",\"error\":{\"code\":-32602,\"message\":\"Invalid request parameters\"}}'; ",
+            "sleep 5"
+        )
+        .to_string(),
+    ];
+    let error = McpConnection::connect_with_policy(
+        "aws".to_string(),
+        config,
+        &McpTimeouts::default(),
+        None,
+    )
+    .await
+    .err()
+    .expect("a JSON-RPC error on initialize ends the handshake");
+    let text = format_mcp_error_for_display(&error);
+    assert!(
+        text.contains("MCP server 'aws' rejected initialize"),
+        "{text}"
+    );
+    assert!(text.contains("command `sh`"), "{text}");
+    assert!(text.contains("-32602"), "{text}");
+    assert!(
+        text.contains("server stderr: LoginRefreshRequired: Please reauthenticate using aws login"),
+        "{text}"
+    );
+    // The founder's exact stderr is an AWS CLI `aws login` session, renewed
+    // with `aws login` (not `aws sso login`).
+    assert!(
+        text.contains(
+            "AWS credentials expired: run `aws login` in a terminal, then `/mcp retry aws`"
+        ),
+        "{text}"
+    );
+}
+
+/// The file the founder had carried both `"disabled": true` and
+/// `"enabled": false`; a hand edit can leave them disagreeing. Enabling (and
+/// disabling) must always write the pair so the two keys agree.
+#[test]
+fn set_server_enabled_makes_the_enabled_and_disabled_keys_agree() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mcp.json");
+    fs::write(
+        &path,
+        r#"{"servers":{"linear":{"url":"https://mcp.linear.app/mcp","enabled":true,"disabled":true}}}"#,
+    )
+    .unwrap();
+    assert!(!load_config(&path).unwrap().servers["linear"].is_enabled());
+
+    set_server_enabled(&path, "linear", true).unwrap();
+    let raw: serde_json::Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(raw["servers"]["linear"]["enabled"], serde_json::json!(true));
+    assert_eq!(
+        raw["servers"]["linear"]["disabled"],
+        serde_json::json!(false)
+    );
+    assert!(load_config(&path).unwrap().servers["linear"].is_enabled());
+
+    set_server_enabled(&path, "linear", false).unwrap();
+    let raw: serde_json::Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(
+        raw["servers"]["linear"]["enabled"],
+        serde_json::json!(false)
+    );
+    assert_eq!(
+        raw["servers"]["linear"]["disabled"],
+        serde_json::json!(true)
+    );
+}
+
+/// Lazy boot (#6033) leaves an unselected server with no connection, no
+/// failure and no observed capabilities. That is "never started" — its
+/// recovery is `connect`, not `reconnect`, and an OAuth-capable one is not
+/// yet known to need a login.
+#[test]
+fn never_started_server_recovers_with_connect_not_reconnect() {
+    let snapshot = McpServerSnapshot {
+        name: "lazy".into(),
+        enabled: true,
+        required: false,
+        transport: "stdio".into(),
+        command_or_url: "lazy-mcp".into(),
+        connect_timeout: 5,
+        execute_timeout: 5,
+        read_timeout: 5,
+        connected: false,
+        error: None,
+        auth_required: false,
+        capability_metadata: McpServerCapabilityMetadata::NotObserved,
+        tools: Vec::new(),
+        resources: Vec::new(),
+        prompts: Vec::new(),
+    };
+    assert!(!snapshot.started());
+    assert_eq!(
+        snapshot.recovery_kind(false),
+        Some(McpRecoveryKind::Connect)
+    );
+    assert_eq!(snapshot.recovery_kind(true), Some(McpRecoveryKind::Connect));
+
+    // A server that had a live connection and lost it is a reconnect.
+    let dropped = McpServerSnapshot {
+        capability_metadata: McpServerCapabilityMetadata::LegacyFallback,
+        ..snapshot
+    };
+    assert!(dropped.started());
+    assert_eq!(
+        dropped.recovery_kind(false),
+        Some(McpRecoveryKind::Reconnect)
+    );
 }

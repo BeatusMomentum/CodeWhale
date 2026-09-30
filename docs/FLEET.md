@@ -236,7 +236,9 @@ path reads authority from the profile's storage scope or identity selector.
 A worker whose envelope grants read-only shell access runs the same read-only
 command grammar as an in-session read-only agent, including pipelines, chains
 and a leading `cd` (see "Read-only shell commands" in `docs/SUBAGENTS.md`);
-`gh` and `npm view` reads also need the envelope's network grant.
+Admitted `gh` reads also need the envelope's network grant. `npm view` remains
+outside the read-only grammar because npm configuration can select executable
+helpers; a network grant does not authorize those helpers.
 
 Picking a concrete model pins its provider explicitly: the saved profile records both
 `model` and `provider` fields, so the route it names doesn't depend on

@@ -33,6 +33,10 @@ curl -fsSL https://codewhale.net/install.sh | sh
 "$HOME/.local/bin/codewhale"
 ```
 
+If plain `codewhale` then says "command not found", `~/.local/bin` is not on
+your PATH yet: run the one line that installer prints for your shell, or see
+[Put it on your PATH](docs/INSTALL.md#put-it-on-your-path).
+
 The installer selects the latest published release. The [changelog](CHANGELOG.md)
 also describes the next release's unreleased candidate; those changes are not
 included in published downloads until the release is available.
@@ -57,7 +61,8 @@ See [shell completions](docs/INSTALL.md#8-shell-completions).
 
 ## Use
 
-Open a terminal in your project folder and run `codewhale`. Choose your provider
+Open a terminal in your project folder and run `codewhale` (once it is
+[on your PATH](docs/INSTALL.md#put-it-on-your-path)). Choose your provider
 with `/provider` and your model with `/model`. Then describe a concrete task:
 
 ```text
@@ -132,6 +137,7 @@ stack and [configuration](docs/CONFIGURATION.md) for local settings.
 
 ## Documentation
 
+- [GitHub PR review setup](docs/GITHUB_ACTION.md)
 - [Providers and local models](docs/PROVIDERS.md)
 - [Agent teams](docs/FLEET.md)
 - [MCP](docs/MCP.md), [hooks](docs/HOOKS.md), and [configuration](docs/CONFIGURATION.md)

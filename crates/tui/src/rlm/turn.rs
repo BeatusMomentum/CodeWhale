@@ -13,7 +13,7 @@
 //!   `tracing` when the parent has no event stream) instead of draining them.
 //!   A terminal `RLM finished: …` line records how the loop ended.
 //! - **History is kept whole.** The root model sees every prior round. The
-//!   history is bounded by [`MAX_RLM_ITERATIONS`] (two small metadata messages
+//!   history is bounded by `MAX_RLM_ITERATIONS` (two small metadata messages
 //!   per round), not by silently dropping the middle.
 //! - **Never an empty answer without a reason.** On exhaustion the last root
 //!   response is returned with the error, and the REPL's `rlm_query` hands

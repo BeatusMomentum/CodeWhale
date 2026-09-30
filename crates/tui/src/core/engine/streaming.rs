@@ -17,6 +17,7 @@ pub(super) enum ContentBlockKind {
 #[derive(Debug, Clone)]
 pub(super) struct ToolUseState {
     pub(super) id: String,
+    pub(super) execution_id: String,
     pub(super) name: String,
     pub(super) input: serde_json::Value,
     pub(super) caller: Option<ToolCaller>,
@@ -25,6 +26,16 @@ pub(super) struct ToolUseState {
     pub(super) thought_signature: Option<String>,
     pub(super) input_buffer: String,
     pub(super) input_parse_error: Option<String>,
+}
+
+impl ToolUseState {
+    pub(super) fn model_call(&self) -> crate::core::events::ModelToolCall {
+        crate::core::events::ModelToolCall {
+            provider_id: self.id.clone(),
+            caller: self.caller.clone(),
+            thought_signature: self.thought_signature.clone(),
+        }
+    }
 }
 
 /// Maximum total bytes of text/thinking content before aborting the stream.
@@ -44,12 +55,14 @@ pub(super) const STREAM_MAX_DURATION_SECS: u64 = 1800; // 30 minutes (was 300s; 
 /// Hard cap on consecutive recoverable stream errors before we surface a turn
 /// failure. Bumped 3 → 5 in v0.6.7 along with the HTTP/2 keepalive defaults
 /// (#103) — keepalive should make spurious decode errors rarer, so we can
-/// tolerate a longer streak before giving up on the turn.
+/// tolerate a longer streak before giving up on the turn. This is the
+/// default; `[tui].stream_max_errors` overrides it (#6700).
 pub(super) const MAX_STREAM_ERRORS_BEFORE_FAIL: u32 = 5;
 /// Cap on transparent stream-level retries — these only happen when the wire
 /// dies before any content was streamed. The user has seen nothing, but
 /// provider usage or billing may already exist. Two attempts can ride out a
-/// flaky edge node without amplifying real outages (#103).
+/// flaky edge node without amplifying real outages (#103). This is the
+/// default; `[tui].stream_max_transparent_retries` overrides it (#6700).
 pub(super) const MAX_TRANSPARENT_STREAM_RETRIES: u32 = 2;
 
 /// Decide whether a stream error is eligible for a transparent retry.
@@ -58,7 +71,9 @@ pub(super) const MAX_TRANSPARENT_STREAM_RETRIES: u32 = 2;
 /// 1. No content has been received on the current attempt. Reissuing after
 ///    visible partial deltas needs a separate recovery policy. This content
 ///    check is not evidence that the provider consumed or billed zero tokens.
-/// 2. We still have transparent-retry budget remaining.
+/// 2. We still have transparent-retry budget remaining (`max_attempts`,
+///    `[tui].stream_max_transparent_retries`, default
+///    [`MAX_TRANSPARENT_STREAM_RETRIES`]).
 /// 3. The turn has not been cancelled.
 ///
 /// Extracted as a pure function so the four #103 retry cases can be exercised
@@ -66,14 +81,16 @@ pub(super) const MAX_TRANSPARENT_STREAM_RETRIES: u32 = 2;
 pub(super) fn should_transparently_retry_stream(
     any_content_received: bool,
     transparent_attempts: u32,
+    max_attempts: u32,
     cancelled: bool,
 ) -> bool {
-    !any_content_received && transparent_attempts < MAX_TRANSPARENT_STREAM_RETRIES && !cancelled
+    !any_content_received && transparent_attempts < max_attempts && !cancelled
 }
 
-/// Budget for re-issuing the whole request after a dead stream. Shared by the
-/// nothing-streamed outer retry (#103 Phase 3) and the sleep-resume retry
-/// (#2990).
+/// Default budget for re-issuing the whole request after a dead stream.
+/// Shared by the nothing-streamed outer retry (#103 Phase 3), the
+/// sleep-resume retry (#2990), the network-drop resumes, and stream-open
+/// failures (#6699). Overridable via `[tui].stream_max_resumes` (#6700).
 pub(super) const MAX_STREAM_RETRIES: u32 = 3;
 
 /// Typed, engine-internal state for one mid-stream drop recovery.
@@ -113,15 +130,33 @@ pub(super) enum StreamResume {
 /// Bounded authorization for drop-resume retries.
 ///
 /// Mechanism, not comment: [`StreamRetryBudget::authorize`] is the only way
-/// to spend a resume and it returns `None` once [`MAX_STREAM_RETRIES`]
-/// resumes have been issued, so no call site can loop past the budget even
-/// if a guard predicate is relaxed. A healthy stream round resets it.
-#[derive(Debug, Default)]
+/// to spend a resume and it returns `None` once `limit` resumes (default
+/// [`MAX_STREAM_RETRIES`]) have been issued, so no call site can loop past
+/// the budget even if a guard predicate is relaxed. A healthy stream round
+/// resets it.
+#[derive(Debug)]
 pub(super) struct StreamRetryBudget {
     spent: u32,
+    limit: u32,
+}
+
+impl Default for StreamRetryBudget {
+    fn default() -> Self {
+        Self::with_limit(MAX_STREAM_RETRIES)
+    }
 }
 
 impl StreamRetryBudget {
+    /// A fresh budget allowing at most `limit` resumes.
+    pub(super) fn with_limit(limit: u32) -> Self {
+        Self { spent: 0, limit }
+    }
+
+    /// The configured resume ceiling.
+    pub(super) fn limit(&self) -> u32 {
+        self.limit
+    }
+
     /// Drop-resumes already issued without a healthy round in between.
     pub(super) fn spent(&self) -> u32 {
         self.spent
@@ -130,7 +165,7 @@ impl StreamRetryBudget {
     /// Spend one resume and return its 1-based attempt number, or `None`
     /// when the budget is exhausted.
     pub(super) fn authorize(&mut self) -> Option<u32> {
-        if self.spent >= MAX_STREAM_RETRIES {
+        if self.spent >= self.limit {
             return None;
         }
         self.spent = self.spent.saturating_add(1);
@@ -170,9 +205,10 @@ pub(super) fn sleep_gap_detected(monotonic_elapsed: Duration, wallclock_elapsed:
 pub(super) fn should_resume_after_sleep(
     sleep_detected: bool,
     retry_attempts: u32,
+    retry_limit: u32,
     cancelled: bool,
 ) -> bool {
-    sleep_detected && retry_attempts < MAX_STREAM_RETRIES && !cancelled
+    sleep_detected && retry_attempts < retry_limit && !cancelled
 }
 
 /// Decide whether a failed stream should be re-issued after a mid-stream
@@ -194,9 +230,10 @@ pub(super) fn should_resume_after_network_drop(
     headless_host: bool,
     network_class_error: bool,
     retry_attempts: u32,
+    retry_limit: u32,
     cancelled: bool,
 ) -> bool {
-    headless_host && network_class_error && retry_attempts < MAX_STREAM_RETRIES && !cancelled
+    headless_host && network_class_error && retry_attempts < retry_limit && !cancelled
 }
 
 /// Decide whether an interactive TUI stream should be re-issued after a
@@ -219,13 +256,14 @@ pub(super) fn should_resume_interactive_after_network_drop(
     any_content_received: bool,
     tool_uses_empty: bool,
     retry_attempts: u32,
+    retry_limit: u32,
     cancelled: bool,
 ) -> bool {
     terminal_chrome_enabled
         && network_class_error
         && any_content_received
         && tool_uses_empty
-        && retry_attempts < MAX_STREAM_RETRIES
+        && retry_attempts < retry_limit
         && !cancelled
 }
 

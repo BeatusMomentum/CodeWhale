@@ -58,7 +58,7 @@ use crate::tools::todo::new_shared_todo_list;
 use codewhale_config::AppMode;
 use codewhale_execpolicy::ApprovalMode;
 use codewhale_models::Role;
-use codewhale_models::{ContentBlock, Message, SystemPrompt, Usage};
+use codewhale_models::{ContentBlock, Message, SystemPrompt, ToolCallKey, ToolCaller, Usage};
 use codewhale_protocol::agent_mail::{
     AGENT_MAIL_EVENT_CANCELED, AGENT_MAIL_EVENT_DELIVERED, AGENT_MAIL_EVENT_DELIVERING,
     AGENT_MAIL_EVENT_DELIVERY_FAILED, AGENT_MAIL_EVENT_QUEUED, AGENT_MAIL_EVENT_READ,
@@ -607,14 +607,6 @@ const RUNTIME_RESTART_REASON: &str = "Interrupted by process restart";
 const EMPTY_TURN_REASON: &str = "Turn completed without engine output";
 const DYNAMIC_TOOL_RESULT_TIMEOUT: Duration = Duration::from_secs(300);
 
-#[cfg(test)]
-static TEST_APPROVAL_DECISION_TIMEOUT_MS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-
-#[cfg(test)]
-static TEST_DYNAMIC_TOOL_RESULT_TIMEOUT_MS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-
 impl RuntimeThreadManager {
     /// Wait for one external approval decision. The one approval clock,
     /// `[approval] timeout_seconds`, governs here as it does for the TUI
@@ -624,12 +616,42 @@ impl RuntimeThreadManager {
     pub(crate) fn approval_decision_timeout(&self) -> Option<Duration> {
         #[cfg(test)]
         {
-            let ms = TEST_APPROVAL_DECISION_TIMEOUT_MS.load(std::sync::atomic::Ordering::SeqCst);
+            let ms = self
+                .test_approval_decision_timeout_ms
+                .load(std::sync::atomic::Ordering::SeqCst);
             if ms > 0 {
                 return Some(Duration::from_millis(ms));
             }
         }
         self.read_config().approval_timeout()
+    }
+
+    fn dynamic_tool_result_timeout(&self) -> Duration {
+        #[cfg(test)]
+        {
+            let ms = self
+                .test_dynamic_tool_result_timeout_ms
+                .load(std::sync::atomic::Ordering::SeqCst);
+            if ms > 0 {
+                return Duration::from_millis(ms);
+            }
+        }
+        DYNAMIC_TOOL_RESULT_TIMEOUT
+    }
+
+    /// Test seam: shorten this manager's external approval wait. Scoped to
+    /// one manager so parallel libtest cases never see another's value (#6698).
+    #[cfg(test)]
+    pub(crate) fn set_test_approval_decision_timeout_ms(&self, ms: u64) {
+        self.test_approval_decision_timeout_ms
+            .store(ms, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Test seam: shorten this manager's dynamic tool result wait.
+    #[cfg(test)]
+    pub(crate) fn set_test_dynamic_tool_result_timeout_ms(&self, ms: u64) {
+        self.test_dynamic_tool_result_timeout_ms
+            .store(ms, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -670,27 +692,6 @@ fn fire_runtime_tool_completion_hooks(
     {
         tracing::warn!(target: "hooks", %error, thread_id, "on_error hook was not submitted");
     }
-}
-
-fn dynamic_tool_result_timeout() -> Duration {
-    #[cfg(test)]
-    {
-        let ms = TEST_DYNAMIC_TOOL_RESULT_TIMEOUT_MS.load(std::sync::atomic::Ordering::SeqCst);
-        if ms > 0 {
-            return Duration::from_millis(ms);
-        }
-    }
-    DYNAMIC_TOOL_RESULT_TIMEOUT
-}
-
-#[cfg(test)]
-pub(crate) fn set_test_approval_decision_timeout_ms(ms: u64) -> u64 {
-    TEST_APPROVAL_DECISION_TIMEOUT_MS.swap(ms, std::sync::atomic::Ordering::SeqCst)
-}
-
-#[cfg(test)]
-pub(crate) fn set_test_dynamic_tool_result_timeout_ms(ms: u64) -> u64 {
-    TEST_DYNAMIC_TOOL_RESULT_TIMEOUT_MS.swap(ms, std::sync::atomic::Ordering::SeqCst)
 }
 
 const fn default_runtime_schema_version() -> u32 {
@@ -1048,9 +1049,19 @@ fn session_recovery_projection(messages: &[Message]) -> Vec<Value> {
                     projection.push(json!(["thinking", thinking]))
                 }
                 ContentBlock::ToolUse {
-                    id, name, input, ..
+                    id,
+                    name,
+                    input,
+                    execution_id,
+                    ..
+                } if role == "assistant" => {
+                    let mut row = json!(["tool_use", id, name, input]);
+                    if let Some(id) = execution_id {
+                        row.as_array_mut().expect("projection row").push(json!(id));
+                    }
+                    projection.push(row);
                 }
-                | ContentBlock::ServerToolUse {
+                ContentBlock::ServerToolUse {
                     id, name, input, ..
                 } if role == "assistant" => projection.push(json!(["tool_use", id, name, input])),
                 ContentBlock::ToolResult {
@@ -1058,13 +1069,20 @@ fn session_recovery_projection(messages: &[Message]) -> Vec<Value> {
                     content,
                     is_error,
                     content_blocks,
-                } if role == "user" => projection.push(json!([
-                    "tool_result",
-                    tool_use_id,
-                    content,
-                    is_error.unwrap_or(false),
-                    content_blocks
-                ])),
+                    execution_id,
+                } if role == "user" => {
+                    let mut row = json!([
+                        "tool_result",
+                        tool_use_id,
+                        content,
+                        is_error.unwrap_or(false),
+                        content_blocks
+                    ]);
+                    if let Some(id) = execution_id {
+                        row.as_array_mut().expect("projection row").push(json!(id));
+                    }
+                    projection.push(row);
+                }
                 _ => {}
             }
         }
@@ -1108,6 +1126,124 @@ fn saved_transcript_is_compacted(
     })
 }
 
+/// Stored item correlation is a projection of the existing history identity.
+/// Explicit executions never fall back to legacy provider ids. New non-model
+/// events carry an execution id but no provider id and do not enter history.
+#[derive(Clone, Copy)]
+struct RuntimeToolIdentity<'a> {
+    execution_id: Option<&'a str>,
+    provider_id: &'a str,
+}
+
+impl<'a> RuntimeToolIdentity<'a> {
+    fn read(metadata: Option<&'a Value>, side: &str) -> Result<Option<Self>> {
+        let Some(meta) = metadata else {
+            return Ok(None);
+        };
+        let Some(local) = meta.get(side) else {
+            return Ok(None);
+        };
+        let local = local.as_str().context("Invalid stored tool correlation")?;
+        let Some(execution) = meta.get("execution_id") else {
+            return Ok((!local.is_empty()).then_some(Self {
+                execution_id: None,
+                provider_id: local,
+            }));
+        };
+        let execution = execution
+            .as_str()
+            .filter(|id| !id.is_empty())
+            .context("Invalid stored tool execution identity")?;
+        anyhow::ensure!(
+            local == execution,
+            "Stored tool execution identity mismatch"
+        );
+        let Some(provider) = meta.get("provider_tool_use_id") else {
+            return Ok(None);
+        };
+        let provider = provider
+            .as_str()
+            .filter(|id| !id.is_empty())
+            .context("Invalid stored provider tool identity")?;
+        Ok(Some(Self {
+            execution_id: Some(execution),
+            provider_id: provider,
+        }))
+    }
+
+    fn key(self) -> (ToolCallKey<'a>, &'a str) {
+        (
+            self.execution_id.map_or(
+                ToolCallKey::LegacyProvider(self.provider_id),
+                ToolCallKey::Execution,
+            ),
+            self.provider_id,
+        )
+    }
+}
+
+/// A persisted execution cannot acquire a different provider pairing on a
+/// later result, turn, or import block. This is a transient validation index,
+/// never a grant or another history store; legacy wire-only keys stay unchanged.
+fn check_execution_provider(
+    bindings: &mut HashMap<String, String>,
+    execution: Option<&str>,
+    provider: &str,
+) -> Result<()> {
+    if let Some(execution) = execution {
+        anyhow::ensure!(
+            !execution.is_empty() && !provider.is_empty(),
+            "Invalid stored tool execution identity"
+        );
+        if let Some(previous) = bindings.get(execution) {
+            anyhow::ensure!(
+                previous == provider,
+                "Stored tool execution has inconsistent provider identity"
+            );
+        } else {
+            bindings.insert(execution.to_string(), provider.to_string());
+        }
+    }
+    Ok(())
+}
+
+/// Only the admitted start supplies correlation, even when an optional value
+/// was absent. Tool output cannot manufacture those missing fields.
+fn retain_started_tool_metadata(
+    output: &mut serde_json::Map<String, Value>,
+    started: Option<&Value>,
+) {
+    for key in [
+        "tool_use_id",
+        "tool_name",
+        "tool_input",
+        "visibility",
+        "execution_id",
+        "provider_tool_use_id",
+        "tool_caller",
+        "tool_thought_signature",
+    ] {
+        output.remove(key);
+        if let Some(value) = started.and_then(|meta| meta.get(key)) {
+            output.insert(key.to_string(), value.clone());
+        }
+    }
+}
+
+/// Legacy item reconstruction covered generic tool rows only. New model
+/// correlation survives the UI's shell/file classification as well; a local
+/// non-model record is still excluded by RuntimeToolIdentity::read.
+fn projects_tool_history(item: &TurnItemRecord) -> bool {
+    item.kind == TurnItemKind::ToolCall
+        || (matches!(
+            item.kind,
+            TurnItemKind::FileChange | TurnItemKind::CommandExecution
+        ) && item
+            .metadata
+            .as_ref()
+            .is_some_and(|meta| meta.get("execution_id").is_some()))
+}
+
 /// The result a rebuilt history must give a tool call whose outcome the turn
 /// store never recorded, or `None` when nothing is missing.
 ///
@@ -1135,11 +1271,14 @@ fn saved_transcript_is_compacted(
 /// coming — so this answers only the terminal failures.
 fn unanswered_call_result(
     item: &TurnItemRecord,
-    call_id: &str,
+    identity: RuntimeToolIdentity<'_>,
     call_name: &str,
-    recorded_results: &HashSet<String>,
+    recorded_results: &HashSet<(ToolCallKey<'_>, &str)>,
 ) -> Option<String> {
-    if call_id.is_empty() || call_name.is_empty() || recorded_results.contains(call_id) {
+    if identity.provider_id.is_empty()
+        || call_name.is_empty()
+        || recorded_results.contains(&identity.key())
+    {
         return None;
     }
     match item.status {
@@ -2105,6 +2244,15 @@ pub struct RuntimeThreadStore {
     /// the queue; this guard prevents concurrent replay/wake requests from
     /// starting more than one turn for the same message.
     mail_mutation: Arc<parking_lot::Mutex<()>>,
+    /// Turn id -> item ids, filled by one items-directory read and kept
+    /// current by the item writers; see [`Self::item_ids_for_turns`].
+    item_index: Arc<parking_lot::RwLock<ItemIndex>>,
+    /// Serializes the one items-directory read that fills `item_index`. Held
+    /// across the whole read, so a caller that arrives while it runs waits for
+    /// its result instead of repeating it — and so an item writer can tell
+    /// whether a read is running by probing it. A writer never holds it, so a
+    /// running turn's write is never behind a store-wide read.
+    item_index_seed: Arc<parking_lot::Mutex<()>>,
     /// Files read by whole-directory turn scans (`list_all_turns`). Shared
     /// across store clones so a `spawn_blocking` snapshot still counts against
     /// the manager the test holds. Per-store so parallel tests do not collide.
@@ -2119,6 +2267,23 @@ pub struct RuntimeThreadStore {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct RuntimeStoreOwner {
     owner_id: String,
+}
+
+/// Every item id the store holds, grouped by turn.
+///
+/// An item's filename carries the item id and nothing else, so a reader that
+/// wants one thread's items has no way to ask the filesystem for them: the only
+/// answer is to read every item record. This makes that whole-directory read a
+/// one-time cost per store instead of a per-request one.
+#[derive(Debug, Default)]
+struct ItemIndex {
+    /// `None` until the items directory has been read once.
+    by_turn: Option<HashMap<String, Vec<String>>>,
+    /// Item writes that landed while the directory read was running and may
+    /// therefore have been missed by it. Drained into `by_turn` when it is
+    /// published. Only writes that race a read are recorded; see
+    /// [`RuntimeThreadStore::note_item_in_index`].
+    pending: Vec<(String, String)>,
 }
 
 impl RuntimeThreadStore {
@@ -2163,6 +2328,8 @@ impl RuntimeThreadStore {
             turn_mutation: Arc::new(parking_lot::ReentrantMutex::new(())),
             goal_mutation: Arc::new(parking_lot::Mutex::new(())),
             mail_mutation: Arc::new(parking_lot::Mutex::new(())),
+            item_index: Arc::new(parking_lot::RwLock::new(ItemIndex::default())),
+            item_index_seed: Arc::new(parking_lot::Mutex::new(())),
             #[cfg(test)]
             turn_dir_files_read: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             #[cfg(test)]
@@ -2187,6 +2354,15 @@ impl RuntimeThreadStore {
     /// Offline readers (`codewhale receipts`) use this so reading a thread
     /// never mutates a store a live `codewhale serve` may own. Event reads
     /// still take the shared event lock, so they see only committed records.
+    ///
+    /// The item index this store builds (see [`Self::ensure_item_index`]) is
+    /// a snapshot of one open: a store another process owns keeps writing
+    /// items, and those are invisible here until the next open reads the
+    /// directory again. That is the contract every caller already lives
+    /// under — `codewhale receipts` opens the store once per invocation and
+    /// exits — so holding an instance across foreign writes serves no
+    /// caller today. If one ever does, invalidate or reopen rather than
+    /// serving a stale map silently.
     pub(crate) fn open_read_only(root: PathBuf) -> Result<Option<Self>> {
         let root = checked_runtime_store_root(root)?;
         let threads_dir = root.join("threads");
@@ -2208,6 +2384,8 @@ impl RuntimeThreadStore {
             turn_mutation: Arc::new(parking_lot::ReentrantMutex::new(())),
             goal_mutation: Arc::new(parking_lot::Mutex::new(())),
             mail_mutation: Arc::new(parking_lot::Mutex::new(())),
+            item_index: Arc::new(parking_lot::RwLock::new(ItemIndex::default())),
+            item_index_seed: Arc::new(parking_lot::Mutex::new(())),
             #[cfg(test)]
             turn_dir_files_read: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             #[cfg(test)]
@@ -2637,7 +2815,9 @@ impl RuntimeThreadStore {
                 &item.id,
                 &path,
             )
-        })
+        })?;
+        self.note_item_in_index(&item.turn_id, &item.id);
+        Ok(())
     }
 
     /// Publish many items at once, paying the items directory's costs once.
@@ -2660,7 +2840,11 @@ impl RuntimeThreadStore {
             files.push((path, payload.into_bytes()));
         }
         crate::utils::write_atomic_batch(&files)
-            .with_context(|| format!("Failed to write {} store items", files.len()))
+            .with_context(|| format!("Failed to write {} store items", files.len()))?;
+        for item in items {
+            self.note_item_in_index(&item.turn_id, &item.id);
+        }
+        Ok(())
     }
 
     fn remove_turn(&self, turn_id: &str) -> Result<()> {
@@ -2916,6 +3100,79 @@ impl RuntimeThreadStore {
 
         let wanted: HashSet<&str> = turn_ids.iter().map(String::as_str).collect();
         let mut out: HashMap<String, Vec<TurnItemRecord>> = HashMap::new();
+        for (turn_id, item_ids) in self.item_ids_for_turns(&wanted)? {
+            for item_id in item_ids {
+                // An index entry whose file is gone contributes nothing, which
+                // is what the directory walk this replaced reported too.
+                if !self.item_path(&item_id)?.exists() {
+                    continue;
+                }
+                let item = self.load_item(&item_id)?;
+                out.entry(turn_id.clone()).or_default().push(item);
+            }
+        }
+
+        for items in out.values_mut() {
+            sort_turn_items_by_start(items);
+        }
+        Ok(out)
+    }
+
+    /// The item ids this store holds for each of `turn_ids`, from the one
+    /// items-directory read [`Self::ensure_item_index`] performs.
+    fn item_ids_for_turns(&self, turn_ids: &HashSet<&str>) -> Result<HashMap<String, Vec<String>>> {
+        self.ensure_item_index()?;
+        let index = self.item_index.read();
+        let by_turn = index
+            .by_turn
+            .as_ref()
+            .context("item index must be published before it is read")?;
+        Ok(turn_ids
+            .iter()
+            .filter_map(|turn_id| {
+                by_turn
+                    .get(*turn_id)
+                    .map(|item_ids| ((*turn_id).to_string(), item_ids.clone()))
+            })
+            .collect())
+    }
+
+    /// Read the items directory once, and never again for this store.
+    ///
+    /// An item's filename carries the item id and nothing else, so the only way
+    /// to learn which items a turn has is to read every item record. Both
+    /// callers used to do exactly that per request: [`Self::get_thread_detail`]
+    /// (`GET /v1/threads/{id}`, one walk per thread opened) and the fork
+    /// preparation whose items the transcript rebuild reads. On the store this
+    /// was measured against — 61,441 items, 294MB, 140 threads — one walk costs
+    /// ~1.4s warm and 6.7s cold, and it was the whole of a thread's open time; a
+    /// median thread holds 272 items, so reading the ones it needs is ~7ms.
+    ///
+    /// The walk is not parallelizable either, which is why this reads once
+    /// instead of reading harder: sixteen concurrent `cat` streams of the same
+    /// 61k files finished in 3.6s against 2.1s for one, and four in 1.5s. The
+    /// cost is the per-file syscall, not the bytes.
+    ///
+    /// The read runs under the seed guard and outside the index guard, so a
+    /// writer never waits for it. A write that lands while the read runs may or
+    /// may not be in the directory snapshot it takes, so the writer records that
+    /// write and the published map drains the records. A write with no read
+    /// running records nothing: its file is already on disk, so the next read
+    /// finds it in the directory itself.
+    fn ensure_item_index(&self) -> Result<()> {
+        if self.item_index.read().by_turn.is_some() {
+            return Ok(());
+        }
+
+        // One read at a time. A caller that finds the read already running
+        // waits here and then takes the map it produced, rather than reading
+        // the same directory a second time.
+        let _seed = self.item_index_seed.lock();
+        if self.item_index.read().by_turn.is_some() {
+            return Ok(());
+        }
+
+        let mut by_turn: HashMap<String, Vec<String>> = HashMap::new();
         let items_dir = checked_existing_runtime_store_dir(&self.items_dir)?;
         for entry in fs::read_dir(&items_dir)
             .with_context(|| format!("Failed to read {}", items_dir.display()))?
@@ -2929,51 +3186,200 @@ impl RuntimeThreadStore {
                 .file_stem()
                 .map(|stem| stem.to_string_lossy().into_owned())
                 .unwrap_or_default();
-            let raw = read_store_file(&path).with_context(|| {
-                RuntimeStoreRecordFailure::new(
-                    RuntimeStoreOperation::Read,
-                    RuntimeStoreRecordKind::Item,
-                    &item_id,
-                    &path,
-                )
-            })?;
             #[cfg(test)]
             self.item_dir_files_read
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let item: TurnItemRecord = serde_json::from_str(&raw).with_context(|| {
-                RuntimeStoreRecordFailure::new(
-                    RuntimeStoreOperation::Parse,
-                    RuntimeStoreRecordKind::Item,
-                    &item_id,
-                    &path,
-                )
-            })?;
-            if item.schema_version > MAX_SUPPORTED_RUNTIME_SCHEMA_VERSION {
-                bail!(
-                    "Item schema v{} is newer than supported v{}",
-                    item.schema_version,
-                    MAX_SUPPORTED_RUNTIME_SCHEMA_VERSION
-                );
+            let item = self.load_item(&item_id)?;
+            by_turn.entry(item.turn_id).or_default().push(item.id);
+        }
+
+        let mut index = self.item_index.write();
+        for (turn_id, item_id) in std::mem::take(&mut index.pending) {
+            let item_ids = by_turn.entry(turn_id).or_default();
+            if !item_ids.contains(&item_id) {
+                item_ids.push(item_id);
             }
-            if matches!(
-                item.schema_version,
-                IMAGE_RUNTIME_SCHEMA_VERSION | OUTPUT_LIMIT_RUNTIME_SCHEMA_VERSION
-            ) && item.kind == TurnItemKind::UserMessage
-            {
-                item.user_content()?;
+        }
+        index.by_turn = Some(by_turn);
+        Ok(())
+    }
+
+    /// Keep the item index current across an item write.
+    ///
+    /// The two writers ([`Self::save_item`] and [`Self::save_items_batch`]) are
+    /// the only paths that can put an item in this store, so this is what makes
+    /// the index exact rather than a snapshot: a reader sees every item the
+    /// directory would have shown it, including the late ones
+    /// [`Self::attach_item_to_turn`] deliberately leaves out of a settled turn's
+    /// `item_ids`.
+    fn note_item_in_index(&self, turn_id: &str, item_id: &str) {
+        // Probing the seed guard says whether a directory read is running, and
+        // the guard is dropped immediately: this call must never wait behind
+        // one. The item this follows is already on disk, so a read that starts
+        // later finds it in the directory; only a read that is *already*
+        // running may have passed the file, and only that case is recorded —
+        // which is what keeps this queue finite in a process that writes items
+        // without ever reading them.
+        let read_in_flight = self.item_index_seed.try_lock().is_none();
+        let mut index = self.item_index.write();
+        if index.by_turn.is_none() {
+            if read_in_flight {
+                index
+                    .pending
+                    .push((turn_id.to_string(), item_id.to_string()));
             }
-            if wanted.contains(item.turn_id.as_str()) {
-                out.entry(item.turn_id.clone()).or_default().push(item);
+            return;
+        }
+        // The runtime saves one item id many times (in progress, then
+        // completed or failed), and a write that raced the directory read may
+        // already be in the map from that read. An id is listed once per turn.
+        let item_ids = index
+            .by_turn
+            .as_mut()
+            .expect("checked above")
+            .entry(turn_id.to_string())
+            .or_default();
+        if !item_ids.iter().any(|known| known == item_id) {
+            item_ids.push(item_id.to_string());
+        }
+    }
+
+    /// The newest message text for each row of the thread list, read from the
+    /// thread's own newest turn.
+    ///
+    /// A row shows the newest message of the newest turn that has one. That
+    /// used to be answered by [`Self::newest_message_text_by_turn`] over every
+    /// turn of every listed thread, and that call walks the whole items
+    /// directory — an item filename carries only the item id, never its turn.
+    /// A page of 100 threads out of a 140-thread store therefore read all
+    /// 58,048 item records to fill 100 previews: ~1.4s per summary, on every
+    /// summary, measured 2026-09-26 against the 658MB store, which is the
+    /// wait the rail's spinner was covering.
+    ///
+    /// A turn record carries its own `item_ids`, so one turn's newest message
+    /// can be read directly, and the walk below stops at the first thread turn
+    /// that yields one. The page measured above resolves all 100 previews from
+    /// 165 item files — it reads the tail of each row's newest turn and
+    /// nothing else.
+    ///
+    /// The choice of turn is the one the batch read made: newest first, an
+    /// older turn only when the newer ones hold no message text at all.
+    fn newest_message_text_by_thread(
+        &self,
+        turns_by_thread: &HashMap<String, Vec<TurnRecord>>,
+    ) -> Result<HashMap<String, String>> {
+        let mut previews: HashMap<String, String> = HashMap::new();
+        // A turn written before `item_ids` existed cannot be read by id: only a
+        // scan of the items directory can find it. Those turns are collected
+        // so the scan runs once for the page rather than once per turn, and the
+        // thread's walk resumes from the turn it stopped on.
+        let mut legacy_turn_ids: Vec<String> = Vec::new();
+        let mut legacy_stops: Vec<(&str, usize)> = Vec::new();
+
+        for (thread_id, turns) in turns_by_thread {
+            let mut walked = turns.len();
+            while walked > 0 {
+                walked -= 1;
+                let turn = &turns[walked];
+                if turn.item_ids.is_empty() {
+                    // This turn and every turn older than it are legacy, and
+                    // both need the same directory scan: hand them all over at
+                    // once instead of scanning per turn.
+                    for turn in &turns[..=walked] {
+                        legacy_turn_ids.push(turn.id.clone());
+                    }
+                    legacy_stops.push((thread_id.as_str(), walked));
+                    break;
+                }
+                if let Some(text) = self.newest_message_text_in_turn(turn)? {
+                    previews.insert(thread_id.clone(), text);
+                    break;
+                }
             }
         }
 
-        for items in out.values_mut() {
-            sort_turn_items_by_start(items);
+        if !legacy_turn_ids.is_empty() {
+            let legacy = self.newest_message_text_by_turn(&legacy_turn_ids)?;
+            for (thread_id, walked) in legacy_stops {
+                let turns = &turns_by_thread[thread_id];
+                if let Some(text) = turns[..=walked]
+                    .iter()
+                    .rev()
+                    .find_map(|turn| legacy.get(&turn.id).cloned())
+                {
+                    previews.insert(thread_id.to_string(), text);
+                }
+            }
         }
-        Ok(out)
+
+        Ok(previews)
+    }
+
+    /// The newest message text `turn` appended, read from the turn's own item
+    /// list instead of from a scan of the items directory.
+    ///
+    /// A turn appends its items in order, so the last message item it wrote is
+    /// the newest message it has: what follows that message is a status,
+    /// reasoning, file-change or tool record, never another message. Walking
+    /// the ids from the tail therefore ends within the handful of files between
+    /// the end of the turn and its last message, where reading the turn whole
+    /// would read every item it ever wrote.
+    ///
+    /// Selection agrees with [`Self::newest_message_text_by_turn`] on every
+    /// turn of the 658MB / 58k-item store this was measured against (538 turns,
+    /// 3,537 message items, 2026-09-26): non-message items never win and an
+    /// empty message is skipped rather than reported. The comparison that call
+    /// makes is on `started_at`, and append order is timestamp order because
+    /// the runtime writes each item as its turn produces it — for every source
+    /// of `item_ids`, not only the live one: a fork rebuilds the cloned turn's
+    /// list from items already ordered by [`sort_turn_items_by_start`], and an
+    /// imported conversation pushes its seed items in the order the importer
+    /// stamped them. Where the two orders could disagree is a hand-edited or
+    /// externally written store; there this walk agrees with what
+    /// `RuntimeThreadManager::reconstruct_messages_from_turns_with` would
+    /// replay for the model — `item_ids` order — rather than with `started_at`,
+    /// which is the agreement that matters for a preview.
+    ///
+    /// Reading only `turn.item_ids` is complete for messages, not just fast:
+    /// every writer of an `AgentMessage`/`UserMessage` item registers the id on
+    /// its turn at the same time. Streaming turns attach as they go (the turn
+    /// is active, so [`Self::attach_item_to_turn`] appends); `start_turn` and
+    /// `steer_turn` push the user item onto a turn they have just loaded or
+    /// verified in progress; an imported conversation writes the whole list
+    /// before its turn exists. [`Self::attach_item_to_turn`] does leave a
+    /// settled turn's `item_ids` untouched, but the only items that reach a
+    /// settled turn that way are status, tool and error records — kinds this
+    /// walk skips — never messages, so a settled turn cannot hold a late
+    /// message its preview missed.
+    fn newest_message_text_in_turn(&self, turn: &TurnRecord) -> Result<Option<String>> {
+        for item_id in turn.item_ids.iter().rev() {
+            // A turn can name an item whose file was since removed; the
+            // directory walk this replaced never saw such an id, so it must
+            // not fail the whole summary page either.
+            if !self.item_path(item_id)?.exists() {
+                continue;
+            }
+            let item = self.load_item(item_id)?;
+            if !matches!(
+                item.kind,
+                TurnItemKind::AgentMessage | TurnItemKind::UserMessage
+            ) {
+                continue;
+            }
+            let text = item.detail.unwrap_or(item.summary);
+            if text.trim().is_empty() {
+                continue;
+            }
+            return Ok(Some(text));
+        }
+        Ok(None)
     }
 
     /// The newest agent/user message text in each requested turn, in one pass.
+    ///
+    /// This is the directory-scan fallback: the thread summary reads previews
+    /// through [`Self::newest_message_text_by_thread`], and reaches this call
+    /// only for turns whose record predates `item_ids`.
     ///
     /// [`Self::list_items_for_turns_map`] materializes every item of every
     /// requested turn. The thread summary needs only the last user/agent
@@ -5259,6 +5665,12 @@ pub struct RuntimeThreadManager {
     #[cfg(test)]
     test_model_client:
         Arc<parking_lot::Mutex<Option<crate::core::model_client::SharedModelClient>>>,
+    /// Test seams for the external approval and dynamic tool waits; `0`
+    /// keeps the production behavior.
+    #[cfg(test)]
+    test_approval_decision_timeout_ms: Arc<std::sync::atomic::AtomicU64>,
+    #[cfg(test)]
+    test_dynamic_tool_result_timeout_ms: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl RuntimeStoreBinding {
@@ -5802,11 +6214,15 @@ enum SeedItem {
     Thinking(String),
     ToolUse {
         id: String,
+        execution_id: Option<String>,
         name: String,
         input: serde_json::Value,
+        caller: Option<ToolCaller>,
+        thought_signature: Option<String>,
     },
     ToolResult {
         tool_use_id: String,
+        execution_id: Option<String>,
         content: String,
         is_error: bool,
         content_blocks: Option<Vec<serde_json::Value>>,
@@ -6263,6 +6679,10 @@ impl RuntimeThreadManager {
             replay_test_hook: Arc::new(parking_lot::Mutex::new(None)),
             #[cfg(test)]
             test_model_client: Arc::new(parking_lot::Mutex::new(None)),
+            #[cfg(test)]
+            test_approval_decision_timeout_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            #[cfg(test)]
+            test_dynamic_tool_result_timeout_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
         manager.recover_interrupted_state()?;
         Ok(manager)
@@ -8758,6 +9178,19 @@ impl RuntimeThreadManager {
         Ok(())
     }
 
+    /// Read the store's item index ahead of the read that needs it.
+    ///
+    /// Opening a thread is the first thing every client asks for and the last
+    /// thing the store can answer cheaply: a reader has to learn which items
+    /// each turn owns, and nothing but a pass over the whole items directory can
+    /// tell it, because an item's filename carries the item id and not its turn.
+    /// That pass is the same one every open used to pay. Paid here, while the
+    /// Runtime API is starting and no client is waiting, it is paid once
+    /// instead. See [`RuntimeThreadStore::ensure_item_index`].
+    pub(crate) fn warm_item_index(&self) -> Result<()> {
+        self.store.ensure_item_index()
+    }
+
     /// The [`ThreadListFacts`] for every id in `thread_ids`, read in one pass.
     ///
     /// `GET /v1/threads/summary` used to call [`Self::get_thread_detail`] once
@@ -8788,7 +9221,7 @@ impl RuntimeThreadManager {
 
         let store = self.store.clone();
         let scanned = wanted.clone();
-        let (turns_by_thread, preview_by_turn) = tokio::task::spawn_blocking(move || {
+        let (turns_by_thread, preview_by_thread) = tokio::task::spawn_blocking(move || {
             // One turns scan, grouped by thread. `list_all_turns` sorts by
             // `created_at`, so each group keeps ascending turn order and a
             // group's last element is the newest turn — the same turn a
@@ -8802,15 +9235,11 @@ impl RuntimeThreadManager {
                         .push(turn);
                 }
             }
-            // One items scan covering every turn of those threads, keeping
-            // only the message text that could be a row's preview.
-            let turn_ids: Vec<String> = turns_by_thread
-                .values()
-                .flatten()
-                .map(|turn| turn.id.clone())
-                .collect();
-            let preview_by_turn = store.newest_message_text_by_turn(&turn_ids)?;
-            Ok::<_, anyhow::Error>((turns_by_thread, preview_by_turn))
+            // The preview is read from each row's own newest turn, not from a
+            // page-wide scan of every item record: see
+            // `newest_message_text_by_thread` for what that cost and why.
+            let preview_by_thread = store.newest_message_text_by_thread(&turns_by_thread)?;
+            Ok::<_, anyhow::Error>((turns_by_thread, preview_by_thread))
         })
         .await
         .context("Runtime thread list scan task failed")??;
@@ -8819,14 +9248,10 @@ impl RuntimeThreadManager {
         for thread_id in &wanted {
             let turns = turns_by_thread.get(thread_id);
             let latest_turn = turns.and_then(|turns| turns.last());
-            // Newest turn first: the scan already picked the newest message
-            // within each turn, so the first turn holding one is the message a
-            // per-thread detail read would have found.
-            let preview = turns
-                .into_iter()
-                .flatten()
-                .rev()
-                .find_map(|turn| preview_by_turn.get(&turn.id).cloned());
+            // Newest turn first, resolved by the walk inside
+            // `newest_message_text_by_thread`: the first turn holding a message
+            // is the message a per-thread detail read would have found.
+            let preview = preview_by_thread.get(thread_id).cloned();
             let (pending_approvals, pending_user_inputs) =
                 self.pending_requests_for_thread(thread_id);
             facts.insert(
@@ -10689,12 +11114,14 @@ impl RuntimeThreadManager {
                             }
                             ContentBlock::ToolResult {
                                 tool_use_id,
+                                execution_id,
                                 content,
                                 is_error,
                                 content_blocks,
                             } => {
                                 tool_results.push(SeedItem::ToolResult {
                                     tool_use_id: tool_use_id.clone(),
+                                    execution_id: execution_id.clone(),
                                     content: content.clone(),
                                     is_error: is_error.unwrap_or(false),
                                     content_blocks: content_blocks.clone(),
@@ -10754,12 +11181,20 @@ impl RuntimeThreadManager {
                                 turn.items.push(SeedItem::Thinking(thinking.clone()));
                             }
                             ContentBlock::ToolUse {
-                                id, name, input, ..
+                                id,
+                                execution_id,
+                                name,
+                                input,
+                                caller,
+                                thought_signature,
                             } => {
                                 turn.items.push(SeedItem::ToolUse {
                                     id: id.clone(),
+                                    execution_id: execution_id.clone(),
                                     name: name.clone(),
                                     input: input.clone(),
+                                    caller: caller.clone(),
+                                    thought_signature: thought_signature.clone(),
                                 });
                             }
                             ContentBlock::ServerToolUse {
@@ -10767,8 +11202,11 @@ impl RuntimeThreadManager {
                             } => {
                                 turn.items.push(SeedItem::ToolUse {
                                     id: id.clone(),
+                                    execution_id: None,
                                     name: name.clone(),
                                     input: input.clone(),
+                                    caller: None,
+                                    thought_signature: None,
                                 });
                             }
                             // Skip other block types (image_url, etc.)
@@ -10787,9 +11225,29 @@ impl RuntimeThreadManager {
 
         // Validate the entire import before the first durable write. Saved local
         // images keep their 5 MiB ceiling; no path or remote URL is dereferenced.
+        let mut execution_providers = HashMap::new();
         for turn_seed in &turns {
             if !turn_seed.image_content.is_empty() {
                 crate::image_attach::validate_stored_image_content(&turn_seed.image_content)?;
+            }
+            for item in &turn_seed.items {
+                if let SeedItem::ToolUse {
+                    execution_id,
+                    id: provider,
+                    ..
+                }
+                | SeedItem::ToolResult {
+                    execution_id,
+                    tool_use_id: provider,
+                    ..
+                } = item
+                {
+                    check_execution_provider(
+                        &mut execution_providers,
+                        execution_id.as_deref(),
+                        provider,
+                    )?;
+                }
             }
         }
 
@@ -10875,8 +11333,11 @@ impl RuntimeThreadManager {
                     }
                     SeedItem::ToolUse {
                         id: tool_id,
+                        execution_id,
                         name,
                         input,
+                        caller,
+                        thought_signature,
                     } => {
                         let input_str =
                             serde_json::to_string(input).unwrap_or_else(|_| input.to_string());
@@ -10896,15 +11357,23 @@ impl RuntimeThreadManager {
                             status: TurnItemLifecycleStatus::Completed,
                             summary: tool_summary,
                             detail: Some(input_str),
-                            metadata: Some(serde_json::Value::Object(
-                                serde_json::json!({
-                                    "tool_use_id": tool_id,
+                            metadata: Some({
+                                let mut meta = json!({
+                                    "tool_use_id": execution_id.as_ref().unwrap_or(tool_id),
                                     "tool_name": name,
-                                })
-                                .as_object()
-                                .unwrap()
-                                .clone(),
-                            )),
+                                });
+                                if let Some(id) = execution_id {
+                                    meta["execution_id"] = json!(id);
+                                    meta["provider_tool_use_id"] = json!(tool_id);
+                                }
+                                if let Some(caller) = caller {
+                                    meta["tool_caller"] = json!(caller);
+                                }
+                                if let Some(signature) = thought_signature {
+                                    meta["tool_thought_signature"] = json!(signature);
+                                }
+                                meta
+                            }),
                             artifact_refs: Vec::new(),
                             artifacts: Vec::new(),
                             started_at: Some(item_at),
@@ -10913,6 +11382,7 @@ impl RuntimeThreadManager {
                     }
                     SeedItem::ToolResult {
                         tool_use_id,
+                        execution_id,
                         content,
                         is_error,
                         content_blocks,
@@ -10923,7 +11393,14 @@ impl RuntimeThreadManager {
                             content.clone()
                         };
                         let mut metadata = serde_json::Map::new();
-                        metadata.insert("tool_result_for".to_string(), json!(tool_use_id));
+                        metadata.insert(
+                            "tool_result_for".to_string(),
+                            json!(execution_id.as_ref().unwrap_or(tool_use_id)),
+                        );
+                        if let Some(id) = execution_id {
+                            metadata.insert("execution_id".to_string(), json!(id));
+                            metadata.insert("provider_tool_use_id".to_string(), json!(tool_use_id));
+                        }
                         metadata.insert("is_error".to_string(), json!(is_error));
                         if let Some(blocks) = content_blocks {
                             metadata
@@ -13073,6 +13550,8 @@ impl RuntimeThreadManager {
                 turn_wall_clock: cfg.turn_wall_clock(),
                 stream_max_content_bytes: cfg.stream_max_content_bytes(),
                 stream_max_duration: cfg.stream_max_duration(),
+                stream_retry_limits: cfg.stream_retry_limits(),
+                stream_open_timeout: cfg.stream_open_timeout(),
                 subagent_heartbeat_timeout: std::time::Duration::from_secs(
                     cfg.subagent_heartbeat_timeout_secs_for_provider(provider),
                 ),
@@ -13578,11 +14057,12 @@ impl RuntimeThreadManager {
         Self::reconstruct_messages_from_turns_with(turns, &items_by_turn)
     }
 
-    fn reconstruct_messages_from_turns_with(
+    pub(crate) fn reconstruct_messages_from_turns_with(
         turns: &[TurnRecord],
         items_by_turn: &HashMap<String, Vec<TurnItemRecord>>,
     ) -> Result<Vec<Message>> {
         let mut messages = Vec::new();
+        let mut execution_providers = HashMap::new();
         for turn in turns {
             let stored_items = items_by_turn.get(&turn.id).cloned().unwrap_or_default();
             let items = if turn.item_ids.is_empty() {
@@ -13607,24 +14087,30 @@ impl RuntimeThreadManager {
                 ordered
             };
 
-            // The calls this turn already answers with a result item of their
-            // own. Only a `tool_call` item is rebuilt into a result — a
-            // `file_change` item records its own call and result, and the
-            // rebuild reads neither — so this set names exactly the answers a
-            // rebuild will emit, and a call in it must not be answered twice.
-            // A call item may carry its result (the completed live shape) or a
-            // sibling `tool_result_for` item may (seeded history, and the
-            // repair's own notice); both are `tool_call` items.
-            let recorded_results: HashSet<String> = items
+            for item in items.iter().filter(|item| projects_tool_history(item)) {
+                for side in ["tool_use_id", "tool_result_for"] {
+                    if let Some(identity) = RuntimeToolIdentity::read(item.metadata.as_ref(), side)?
+                    {
+                        check_execution_provider(
+                            &mut execution_providers,
+                            identity.execution_id,
+                            identity.provider_id,
+                        )?;
+                    }
+                }
+            }
+
+            // Only results this same projection will emit can settle a call.
+            // New execution and legacy provider key domains remain disjoint;
+            // provider identity must also agree with an explicit execution.
+            let recorded_results: HashSet<_> = items
                 .iter()
-                .filter(|item| item.kind == TurnItemKind::ToolCall)
-                .filter_map(|item| {
-                    item.metadata
-                        .as_ref()?
-                        .get("tool_result_for")?
-                        .as_str()
-                        .map(str::to_string)
-                })
+                .filter(|item| projects_tool_history(item))
+                .map(|item| RuntimeToolIdentity::read(item.metadata.as_ref(), "tool_result_for"))
+                .collect::<Result<Vec<_>>>()?
+                .into_iter()
+                .flatten()
+                .map(RuntimeToolIdentity::key)
                 .collect();
 
             let mut assistant_blocks: Vec<ContentBlock> = Vec::new();
@@ -13645,7 +14131,7 @@ impl RuntimeThreadManager {
                     });
                 }
             };
-            for item in items {
+            for item in &items {
                 match item.kind {
                     TurnItemKind::UserMessage => {
                         // A steer the engine never committed is recorded
@@ -13664,7 +14150,7 @@ impl RuntimeThreadManager {
                     }
                     TurnItemKind::AgentMessage => {
                         flush_user(&mut user_blocks, &mut messages);
-                        let text = item.detail.unwrap_or(item.summary);
+                        let text = item.detail.clone().unwrap_or_else(|| item.summary.clone());
                         if !text.trim().is_empty() {
                             assistant_blocks.push(ContentBlock::Text {
                                 text,
@@ -13674,7 +14160,7 @@ impl RuntimeThreadManager {
                     }
                     TurnItemKind::AgentReasoning => {
                         flush_user(&mut user_blocks, &mut messages);
-                        let thinking = item.detail.unwrap_or(item.summary);
+                        let thinking = item.detail.clone().unwrap_or_else(|| item.summary.clone());
                         if !thinking.trim().is_empty() {
                             assistant_blocks.push(ContentBlock::Thinking {
                                 thinking,
@@ -13683,7 +14169,7 @@ impl RuntimeThreadManager {
                             });
                         }
                     }
-                    TurnItemKind::ToolCall => {
+                    _ if projects_tool_history(item) => {
                         let meta = item.metadata.as_ref();
                         let meta_str = |key: &str| {
                             meta.and_then(|m| m.get(key))
@@ -13691,20 +14177,17 @@ impl RuntimeThreadManager {
                                 .unwrap_or_default()
                                 .to_string()
                         };
-                        let tool_use_id = meta_str("tool_use_id");
+                        let call = RuntimeToolIdentity::read(meta, "tool_use_id")?;
+                        let result = RuntimeToolIdentity::read(meta, "tool_result_for")?;
                         let tool_name = meta_str("tool_name");
-                        let tool_result_for = meta_str("tool_result_for");
                         // A call whose own outcome the store never recorded is
                         // answered with the outcome it does hold, decided while
                         // the id is still borrowed — see
                         // `unanswered_call_result`.
-                        let unanswered = unanswered_call_result(
-                            &item,
-                            &tool_use_id,
-                            &tool_name,
-                            &recorded_results,
-                        )
-                        .map(|content| (tool_use_id.clone(), content));
+                        let unanswered = call.and_then(|identity| {
+                            unanswered_call_result(item, identity, &tool_name, &recorded_results)
+                                .map(|content| (identity, content))
+                        });
                         // Completed live turns persist the call and its result
                         // on one item; seeded history persists them as two.
                         // Both shapes must rebuild the paired tool_call /
@@ -13712,7 +14195,7 @@ impl RuntimeThreadManager {
                         // was durable carry neither side: skip them rather than
                         // replay an empty tool_call shell that strict
                         // OpenAI-compatible endpoints reject (#5823).
-                        if !tool_use_id.is_empty() && !tool_name.is_empty() {
+                        if let Some(identity) = call.filter(|_| !tool_name.is_empty()) {
                             flush_user(&mut user_blocks, &mut messages);
                             let input_str = meta
                                 .and_then(|m| m.get("tool_input"))
@@ -13723,16 +14206,29 @@ impl RuntimeThreadManager {
                             let input: serde_json::Value =
                                 serde_json::from_str(&input_str).unwrap_or(serde_json::Value::Null);
                             assistant_blocks.push(ContentBlock::ToolUse {
-                                id: tool_use_id,
+                                execution_id: identity.execution_id.map(str::to_string),
+                                id: identity.provider_id.to_string(),
                                 name: tool_name,
                                 input,
-                                caller: None,
-                                thought_signature: None,
+                                caller: meta
+                                    .and_then(|m| m.get("tool_caller"))
+                                    .map(|value| serde_json::from_value(value.clone()))
+                                    .transpose()
+                                    .context("Invalid stored tool caller")?,
+                                thought_signature: meta
+                                    .and_then(|m| m.get("tool_thought_signature"))
+                                    .map(|value| {
+                                        value
+                                            .as_str()
+                                            .map(str::to_string)
+                                            .context("Invalid stored tool thought signature")
+                                    })
+                                    .transpose()?,
                             });
                         }
-                        if !tool_result_for.is_empty() {
+                        if let Some(identity) = result {
                             flush_assistant(&mut assistant_blocks, &mut messages);
-                            let content = item.detail.unwrap_or_default();
+                            let content = item.detail.clone().unwrap_or_default();
                             let is_error = meta
                                 .and_then(|m| m.get("is_error"))
                                 .and_then(Value::as_bool)
@@ -13742,18 +14238,20 @@ impl RuntimeThreadManager {
                                 .and_then(Value::as_array)
                                 .cloned();
                             user_blocks.push(ContentBlock::ToolResult {
-                                tool_use_id: tool_result_for,
+                                execution_id: identity.execution_id.map(str::to_string),
+                                tool_use_id: identity.provider_id.to_string(),
                                 content,
                                 is_error: if is_error { Some(true) } else { None },
                                 content_blocks,
                             });
-                        } else if let Some((call_id, content)) = unanswered {
+                        } else if let Some((identity, content)) = unanswered {
                             // The call above had no recorded outcome: pair it
                             // here, in the position the live transcript held
                             // its result, so the rebuilt turn is complete.
                             flush_assistant(&mut assistant_blocks, &mut messages);
                             user_blocks.push(ContentBlock::ToolResult {
-                                tool_use_id: call_id,
+                                execution_id: identity.execution_id.map(str::to_string),
+                                tool_use_id: identity.provider_id.to_string(),
                                 content,
                                 is_error: Some(true),
                                 content_blocks: None,
@@ -14222,7 +14720,12 @@ impl RuntimeThreadManager {
                         .await?;
                     }
                 }
-                EngineEvent::ToolCallStarted { id, name, input } => {
+                EngineEvent::ToolCallStarted {
+                    id,
+                    name,
+                    input,
+                    model_call,
+                } => {
                     let item_id = runtime_record_id("item");
                     tool_items.insert(id.clone(), item_id.clone());
                     let kind = tool_kind_for_name(&name);
@@ -14246,7 +14749,17 @@ impl RuntimeThreadManager {
                                 "tool_use_id": id.clone(),
                                 "tool_name": name.clone(),
                                 "tool_input": input_str,
+                                "execution_id": id.clone(),
                             });
+                            if let Some(model_call) = model_call {
+                                meta["provider_tool_use_id"] = json!(model_call.provider_id);
+                                if let Some(caller) = model_call.caller {
+                                    meta["tool_caller"] = json!(caller);
+                                }
+                                if let Some(signature) = model_call.thought_signature {
+                                    meta["tool_thought_signature"] = json!(signature);
+                                }
+                            }
                             // Tool discovery is engine plumbing, not work the
                             // user asked for: clients collapse it by default.
                             if crate::core::engine::tool_catalog::is_tool_search_tool(&name) {
@@ -14270,7 +14783,9 @@ impl RuntimeThreadManager {
                     )
                     .await?;
                 }
-                EngineEvent::ToolCallComplete { id, name, result } => {
+                EngineEvent::ToolCallComplete {
+                    id, name, result, ..
+                } => {
                     if let Some(hooks) = thread_hooks.as_deref() {
                         fire_runtime_tool_completion_hooks(hooks, &thread_id, &id, &name, &result);
                     }
@@ -14386,20 +14901,7 @@ impl RuntimeThreadManager {
                                         _ => json!({}),
                                     };
                                     if let Some(obj) = meta.as_object_mut() {
-                                        if let Some(started) =
-                                            item.metadata.as_ref().and_then(Value::as_object)
-                                        {
-                                            for key in [
-                                                "tool_use_id",
-                                                "tool_name",
-                                                "tool_input",
-                                                "visibility",
-                                            ] {
-                                                if let Some(value) = started.get(key) {
-                                                    obj.insert(key.to_string(), value.clone());
-                                                }
-                                            }
-                                        }
+                                        retain_started_tool_metadata(obj, item.metadata.as_ref());
                                         // A first call to a deferred tool only
                                         // loads its schema; the model retries.
                                         // That hand-off is not a user-facing step.
@@ -14413,6 +14915,12 @@ impl RuntimeThreadManager {
                                         }
                                         obj.insert("tool_result_for".to_string(), json!(id));
                                         obj.insert("is_error".to_string(), json!(!output.success));
+                                        // The shell execution receipt (#6689) is
+                                        // for completion hooks, which already
+                                        // read it from the live result; it
+                                        // repeats output previews `detail`
+                                        // holds, so it is never persisted.
+                                        obj.remove("execution_receipt");
                                     }
                                     // Failed calls count too: a large error
                                     // output spills like any other.
@@ -16338,7 +16846,7 @@ impl crate::tools::spec::DynamicToolExecutor for RuntimeThreadManager {
         }
         drop(projection);
 
-        let result_timeout = dynamic_tool_result_timeout();
+        let result_timeout = self.dynamic_tool_result_timeout();
         match tokio::time::timeout(result_timeout, &mut rx).await {
             Ok(Ok(result)) => Ok(dynamic_tool_result_to_tool_result(result)),
             Ok(Err(_recv_err)) => Err(crate::tools::spec::ToolError::execution_failed(format!(

@@ -2107,17 +2107,44 @@ fn one_line(value: &str, max: usize) -> String {
     }
 }
 
-/// Sanitized (control-character-free, bounded) error text for job notes.
+const SANITIZED_ERROR_MAX_CHARS: usize = 240;
+
+/// Sanitized (single-line, secret-redacted, bounded) error text for job
+/// notes. Controls, newlines and tabs become one space so words never fuse;
+/// long text keeps its head and its tail, because harness and command output
+/// put the actual failure last.
 pub fn sanitize_error(message: &str) -> String {
-    redact_machine_tokens(&redact_url_userinfo(
-        &message
-            .chars()
-            .filter(|ch| !ch.is_control())
-            .collect::<String>(),
-    ))
-    .chars()
-    .take(240)
-    .collect()
+    fn redact(text: &str) -> String {
+        redact_machine_tokens(&redact_url_userinfo(text))
+    }
+    fn flatten(text: &str) -> String {
+        text.split(|ch: char| ch.is_control() || ch.is_whitespace())
+            .filter(|word| !word.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+    // A secret split by a control character (a newline, BEL, an ANSI
+    // fragment) must still be caught, so redaction first sees the text with
+    // every control removed, which rejoins it. Only when that finds nothing
+    // do controls become spaces for readability; flattening only inserts
+    // separators, so it cannot expose a token the rejoined text did not.
+    let fused: String = message.chars().filter(|ch| !ch.is_control()).collect();
+    let fused_redacted = redact(&fused);
+    // Redact before cutting so a secret can never be split past the redactor.
+    let redacted = if fused_redacted == fused {
+        redact(&flatten(message))
+    } else {
+        flatten(&fused_redacted)
+    };
+    let count = redacted.chars().count();
+    if count <= SANITIZED_ERROR_MAX_CHARS {
+        return redacted;
+    }
+    let head_chars = SANITIZED_ERROR_MAX_CHARS / 3;
+    let tail_chars = SANITIZED_ERROR_MAX_CHARS - head_chars - 1;
+    let head: String = redacted.chars().take(head_chars).collect();
+    let tail: String = redacted.chars().skip(count - tail_chars).collect();
+    format!("{}…{}", head.trim_end(), tail.trim_start())
 }
 
 /// Replace anything shaped like a Codewhale account machine token with its
@@ -2574,6 +2601,44 @@ mod tests {
                 .contains("token"),
             "userinfo must not survive sanitize_error"
         );
+    }
+
+    #[test]
+    fn sanitize_error_redacts_a_token_split_by_a_control_character() {
+        let head = "0123456789abcdef01234567";
+        for split in ['\u{7}', '\n', '\u{1b}'] {
+            let message = format!("push failed: cwc_key_{head}{split}tailsecret0123456789 done");
+            let sanitized = sanitize_error(&message);
+            assert!(!sanitized.contains("tailsecret"), "{sanitized}");
+            assert!(sanitized.contains("[redacted]"), "{sanitized}");
+        }
+    }
+
+    #[test]
+    fn sanitize_error_flattens_whitespace_and_keeps_the_tail() {
+        assert_eq!(
+            sanitize_error("npm ERR!\tcode 1\n\n  npm ERR!\u{7}  missing\r\nscript"),
+            "npm ERR! code 1 npm ERR! missing script"
+        );
+        let long = format!(
+            "{} error: the real failure is here",
+            "progress line\n".repeat(60)
+        );
+        let sanitized = sanitize_error(&long);
+        assert!(
+            sanitized.chars().count() <= SANITIZED_ERROR_MAX_CHARS,
+            "{sanitized}"
+        );
+        assert!(
+            sanitized.starts_with("progress line progress line"),
+            "{sanitized}"
+        );
+        assert!(sanitized.contains('…'), "{sanitized}");
+        assert!(
+            sanitized.ends_with("error: the real failure is here"),
+            "{sanitized}"
+        );
+        assert!(!sanitized.contains('\n'), "{sanitized}");
     }
 
     #[test]

@@ -1014,7 +1014,6 @@ async fn fleet_authority_allows_only_classifier_proven_readonly_bash() {
         "sed -n '2p' src/evidence.txt | head -n 1",
         "sed -n '2p' src/evidence.txt | gh issue list",
         "gh issue list | sed -n '2p'",
-        "npm view codewhale",
         "find src -name '*.rs'",
     ] {
         enforce_tool_authority(
@@ -1211,14 +1210,11 @@ fn fleet_authority_intersects_readonly_github_bash_with_network_ceiling() {
         .to_string();
     assert!(error.contains("does not grant network access"), "{error}");
 
-    // #6015: a network read cannot hide inside a pipeline or chain, and npm
-    // registry reads need the same grant.
+    // #6015: an admitted network read cannot hide inside a pipeline or chain.
     for command in [
         "gh pr view 1 | head",
         "ls && gh issue list",
-        "npm view x",
         "cd . && gh pr view 1",
-        "cd sub && npm view x",
     ] {
         let input = json!({"action": "run", "command": command});
         enforce_tool_authority("Bash", &input, &shell, &networked)
@@ -1230,6 +1226,20 @@ fn fleet_authority_intersects_readonly_github_bash_with_network_ceiling() {
             error.contains("does not grant network access"),
             "{command}: {error}"
         );
+    }
+    // Network access alone cannot authorize npm's configured destinations.
+    for command in [
+        "npm view x",
+        "npm view @scope/pkg --json",
+        "cd sub && npm view x",
+    ] {
+        let input = json!({"action": "run", "command": command});
+        for context in [&networked, &offline] {
+            let error = enforce_tool_authority("Bash", &input, &shell, context)
+                .expect_err("npm metadata reads require ordinary shell authority")
+                .to_string();
+            assert!(error.contains("configuration"), "{command}: {error}");
+        }
     }
 }
 

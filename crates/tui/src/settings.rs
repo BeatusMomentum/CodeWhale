@@ -20,7 +20,7 @@ use codewhale_palette::{normalize_hex_rgb_color, normalize_theme_setting};
 const SETTINGS_FILE_NAME: &str = "settings.toml";
 
 /// Fresh terminal installs and explicit theme resets share one default.
-pub(crate) const DEFAULT_TUI_THEME: &str = "underwater";
+pub(crate) use codewhale_config::settings_schema::DEFAULT_TUI_THEME;
 
 /// Smallest Top work surface that can show its divider plus the compact
 /// goal / to-do / Agent projection without turning the rail into invisible

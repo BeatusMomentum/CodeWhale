@@ -32,7 +32,7 @@ export const ErrorCode = {
 
 /** Methods the core sends to the host. */
 export const CORE_TO_HOST = {
-  requests: ['host/initialize', 'host/shutdown', 'ext/activate', 'ext/deactivate', 'tool/call'],
+  requests: ['host/initialize', 'host/shutdown', 'host/ping', 'ext/activate', 'ext/deactivate', 'tool/call'],
   notifications: ['$/cancel'],
 } as const
 
@@ -233,6 +233,7 @@ const PARAMS: Record<string, { dir: 'core' | 'host'; required: Shape; optional?:
       ),
   },
   'host/shutdown': { dir: 'core', required: {} },
+  'host/ping': { dir: 'core', required: {} },
   'ext/activate': {
     dir: 'core',
     required: { owner: 'owner', plugin_name: 'string', entry: 'object' },

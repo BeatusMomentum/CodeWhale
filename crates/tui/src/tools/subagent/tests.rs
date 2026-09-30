@@ -258,7 +258,14 @@ fn child_approval_ids_stay_unique_within_and_across_manager_boots() {
 
     let mut first_ids = Vec::new();
     for _ in 0..3 {
-        let (id, _rx) = first.register_child_approval("resumed-agent-7", "bash", "fixture");
+        let (id, _rx) = first
+            .register_child_approval(
+                "resumed-agent-7",
+                &new_child_execution_id("resumed-agent-7"),
+                "bash",
+                "fixture",
+            )
+            .unwrap();
         assert!(
             SubAgentManager::is_child_approval_id(&id),
             "routing hint must still recognize {id}"
@@ -277,7 +284,14 @@ fn child_approval_ids_stay_unique_within_and_across_manager_boots() {
     let mut second = SubAgentManager::new(tmp.path().to_path_buf(), 4);
     let mut second_ids = Vec::new();
     for _ in 0..3 {
-        let (id, _rx) = second.register_child_approval("resumed-agent-7", "bash", "fixture");
+        let (id, _rx) = second
+            .register_child_approval(
+                "resumed-agent-7",
+                &new_child_execution_id("resumed-agent-7"),
+                "bash",
+                "fixture",
+            )
+            .unwrap();
         assert!(SubAgentManager::is_child_approval_id(&id));
         second_ids.push(id);
     }
@@ -287,6 +301,46 @@ fn child_approval_ids_stay_unique_within_and_across_manager_boots() {
             "id {id} from the second manager collides with the first boot's ids"
         );
     }
+}
+
+#[tokio::test]
+async fn child_execution_identity_cannot_replace_a_waiter_or_answer_a_later_call() {
+    let tmp = tempdir().unwrap();
+    let mut manager = SubAgentManager::new(tmp.path().to_path_buf(), 2);
+    let first = new_child_execution_id("child");
+    let second = new_child_execution_id("child");
+    let (registered, receiver) = manager
+        .register_child_approval("child", &first, "bash", "one")
+        .unwrap();
+    assert_eq!(registered, first);
+    assert!(
+        manager
+            .register_child_approval("child", &first, "bash", "replacement")
+            .is_err()
+    );
+    assert!(
+        manager
+            .register_child_approval("other", &first, "bash", "wrong owner")
+            .is_err()
+    );
+    assert!(manager.resolve_child_approval(&first, ChildApprovalOutcome::Denied));
+    assert!(matches!(
+        receiver.await.unwrap(),
+        ChildApprovalOutcome::Denied
+    ));
+    let (_, mut receiver) = manager
+        .register_child_approval("child", &second, "bash", "two")
+        .unwrap();
+    assert!(!manager.resolve_child_approval(&first, ChildApprovalOutcome::Approved));
+    assert!(matches!(
+        receiver.try_recv(),
+        Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+    ));
+    assert!(manager.resolve_child_approval(&second, ChildApprovalOutcome::Approved));
+    assert!(matches!(
+        receiver.await.unwrap(),
+        ChildApprovalOutcome::Approved
+    ));
 }
 
 #[test]
@@ -8078,7 +8132,14 @@ async fn execute_surface_tool(
 ) -> Result<String> {
     let request_active = surface.active_names.clone();
     registry
-        .execute_from_surface("agent_test", "", surface, &request_active, name, input)
+        .execute_from_surface(
+            "agent_test",
+            &new_child_execution_id("agent_test"),
+            surface,
+            &request_active,
+            name,
+            input,
+        )
         .await
         .map(|result| result.result.content)
 }
@@ -8240,6 +8301,7 @@ async fn small_surface_fork_context_survives_fresh_child_discovery() {
             Message {
                 role: Role::Assistant,
                 content: vec![ContentBlock::ToolUse {
+                    execution_id: None,
                     id: "search-1".to_string(),
                     name: TOOL_SEARCH_NAME.to_string(),
                     input: json!({"query": "web"}),
@@ -8250,6 +8312,7 @@ async fn small_surface_fork_context_survives_fresh_child_discovery() {
             Message {
                 role: Role::User,
                 content: vec![ContentBlock::ToolResult {
+                    execution_id: None,
                     tool_use_id: "search-1".to_string(),
                     content: json!({
                         "type": "tool_search_tool_search_result",
@@ -8579,10 +8642,10 @@ fn seed_read_only_role_deny_list(runtime: &mut SubAgentRuntime) {
 }
 
 /// #5426 acceptance point 1, gate-level: a live scout must be able to run
-/// the three canonical read-only inspection commands DIRECTLY through
-/// canonical `bash` — `git -C ... log`, `find ... | head`, `npm view` — with
+/// the canonical read-only inspection commands DIRECTLY through
+/// canonical `bash` — `git -C ... log`, `find ... | head` — with
 /// no child spawn. The first live dogfood against a #5428 binary denied all
-/// three at `posture_permits_tool`: the Required branch demanded
+/// these at `posture_permits_tool`: the Required branch demanded
 /// `ShellPolicy::Full`, and #5428's relaxed agent classifier was unreachable
 /// from the gate (it only guards `BashTool::execute`, which the gate
 /// precedes). This test pins the gate↔classifier agreement the catalog
@@ -8608,7 +8671,6 @@ fn scout_posture_gate_admits_agent_readonly_bash_commands() {
     let admitted = [
         "git -C /Volumes/VIXinSSD/CW/worktrees/demo log --oneline -3",
         "find /Volumes/VIXinSSD/CW/worktrees/demo/crates -name offering.rs -maxdepth 4 | head -3",
-        "npm view @deepseek-ai/dsh version",
     ];
     for command in admitted {
         let input = serde_json::json!({ "command": command });
@@ -8616,6 +8678,20 @@ fn scout_posture_gate_admits_agent_readonly_bash_commands() {
             registry.posture_permits_tool("bash", Some(&input)),
             "scout posture gate must admit agent-read-only bash directly: {command}"
         );
+    }
+    // npm's project/user configuration can redirect its destination, so a
+    // network-enabled Scout still cannot grant it automatic shell authority.
+    for command in [
+        "npm view @deepseek-ai/dsh version",
+        "npm view x --json",
+        "npm view owner/repo",
+    ] {
+        let input = serde_json::json!({"command": command});
+        assert!(
+            !registry.posture_permits_tool("bash", Some(&input)),
+            "{command}"
+        );
+        assert!(!registry.envelope_permits("bash", &input), "{command}");
     }
 
     // Mutation still refused at the gate, legacy `Bash` stays raw-shell-denied
@@ -19429,8 +19505,14 @@ async fn agent_wait_returns_early_with_needs_approval() {
     let mut inner = SubAgentManager::new(PathBuf::from("."), 1);
     let agent_id = insert_running_agent(&mut inner, "test_agent_wait_needs_person");
     // The child is blocked on the Ask prompt for a shell call.
-    let (_approval_id, _rx) =
-        inner.register_child_approval(&agent_id, "bash", "Tool bash requires approval\nand more");
+    let (_approval_id, _rx) = inner
+        .register_child_approval(
+            &agent_id,
+            &new_child_execution_id(&agent_id),
+            "bash",
+            "Tool bash requires approval\nand more",
+        )
+        .unwrap();
     let manager = Arc::new(RwLock::new(inner));
 
     let context = ToolContext::new(".");
@@ -19471,7 +19553,14 @@ async fn agent_wait_returns_early_with_needs_approval() {
 async fn agent_wait_does_not_rewake_on_reported_request() {
     let mut inner = SubAgentManager::new(PathBuf::from("."), 1);
     let agent_id = insert_running_agent(&mut inner, "test_agent_wait_no_rewake");
-    let (_approval_id, _rx) = inner.register_child_approval(&agent_id, "bash", "held");
+    let (_approval_id, _rx) = inner
+        .register_child_approval(
+            &agent_id,
+            &new_child_execution_id(&agent_id),
+            "bash",
+            "held",
+        )
+        .unwrap();
     let manager = Arc::new(RwLock::new(inner));
     let context = ToolContext::new(".");
 
@@ -19508,11 +19597,16 @@ async fn agent_wait_does_not_rewake_on_reported_request() {
     assert!(joined.get("needs_person").is_none(), "{joined}");
 
     // A new request wakes the join.
-    let (_next_id, _next_rx) =
-        manager
-            .write()
-            .await
-            .register_child_approval(&agent_id, "write_file", "held again");
+    let (_next_id, _next_rx) = manager
+        .write()
+        .await
+        .register_child_approval(
+            &agent_id,
+            &new_child_execution_id(&agent_id),
+            "write_file",
+            "held again",
+        )
+        .unwrap();
     let joined = coord::dispatch_wait(
         &json!({"until": "all", "timeout_secs": 30}),
         Arc::clone(&manager),
@@ -19537,7 +19631,14 @@ async fn status_waiting_is_derived_from_pending_store() {
         "workspace",
         None,
     );
-    let (approval_id, _rx) = inner.register_child_approval(&agent_id, "bash", "held");
+    let (approval_id, _rx) = inner
+        .register_child_approval(
+            &agent_id,
+            &new_child_execution_id(&agent_id),
+            "bash",
+            "held",
+        )
+        .unwrap();
     // The WaitingForUser progress write was skipped under contention; the
     // store still makes the record waiting, with the request and the action.
     let record = inner.get_worker_record(&agent_id).expect("worker record");
@@ -20658,6 +20759,11 @@ fn a_network_denied_child_cannot_address_a_remote_location_through_any_tool() {
         ("bash", json!({"command": "gh pr view 1 | head"})),
         ("bash", json!({"command": "ls && gh issue list"})),
         ("bash", json!({"command": "npm view x | head"})),
+        ("bash", json!({"command": "npm view owner/repo"})),
+        (
+            "bash",
+            json!({"command": "npm view @scope/pkg --registry=https://registry.example/"}),
+        ),
         // A leading `cd` is moved into `cwd` before the command runs, so the
         // read behind it is judged too.
         ("bash", json!({"command": "cd . && gh pr view 1"})),
@@ -22851,7 +22957,10 @@ async fn resume_keeps_recorded_reasoning_in_manifest_and_request_after_parent_ch
                 "resuming must not rewrite the interrupted record"
             );
         }
-        tokio::time::timeout(Duration::from_secs(5), async {
+        // Readiness only: the poll ends on the first request. A loaded
+        // shared-process `cargo test` run, where env readers can queue behind the
+        // process-wide test env barrier, overran 5s here (#6698).
+        tokio::time::timeout(Duration::from_secs(30), async {
             while calls.load(Ordering::SeqCst) == 0 {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
@@ -23007,6 +23116,235 @@ fn user_follow_up_to_completed_child_requires_a_runtime_to_resume() {
     assert!(err.to_string().contains("no runtime"), "{err}");
 }
 
+/// A finished worker's unchanged isolated worktree is removed, but its
+/// checkpoint stays continuable. Continuing it used to start a child inside
+/// the missing directory, where every tool failed.
+#[tokio::test]
+async fn continuing_a_child_whose_worktree_was_removed_fails_with_the_reason() {
+    let tmp = tempdir().expect("tempdir");
+    let worktree = tmp.path().join("removed-worktree");
+    std::fs::create_dir_all(&worktree).expect("worktree dir");
+    let manager = new_shared_subagent_manager(tmp.path().to_path_buf(), 4);
+    let agent_id = {
+        let mut guard = manager.write().await;
+        let (id, _) = guard.insert_test_interrupted_continuable_agent(
+            "read_mostly",
+            &worktree,
+            vec![text_message("user", "prior work")],
+        );
+        guard.agents.get_mut(&id).expect("agent").status = SubAgentStatus::Completed;
+        id
+    };
+    std::fs::remove_dir(&worktree).expect("worktree removed on completion");
+    let mut runtime = stub_runtime();
+    runtime.manager = Arc::clone(&manager);
+
+    let result = {
+        let mut guard = manager.write().await;
+        guard.continue_child_from_user(Arc::clone(&manager), Some(runtime), &agent_id, "more")
+    };
+    let err = result.expect_err("a child whose workspace is gone cannot be continued");
+    assert!(err.to_string().contains("no longer exists"), "{err}");
+    assert_eq!(
+        manager.read().await.agents.len(),
+        1,
+        "no continuation child was started"
+    );
+}
+
+/// A finished worker's unchanged worktree is removed on the blocking pool, and
+/// an interrupt can win while that runs. A continuation started then passed
+/// the existence check and could lose its directory to the removal. It now
+/// waits until the claimed removal has settled.
+#[tokio::test]
+async fn continuation_is_refused_while_its_worktree_removal_is_claimed() {
+    let tmp = tempdir().expect("tempdir");
+    let workspace = tmp.path().join("worktree");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    let manager = new_shared_subagent_manager(tmp.path().to_path_buf(), 4);
+    let (agent_id, claim) = {
+        let mut guard = manager.write().await;
+        let (id, _) = guard.insert_test_interrupted_continuable_agent(
+            "claimed",
+            &workspace,
+            vec![text_message("user", "prior work")],
+        );
+        let claim = guard
+            .claim_worktree_cleanup(&id, &workspace)
+            .expect("the removal is claimed");
+        assert!(
+            guard.claim_worktree_cleanup(&id, &workspace).is_none(),
+            "one removal per path at a time"
+        );
+        (id, claim)
+    };
+    let mut runtime = stub_runtime();
+    runtime.manager = Arc::clone(&manager);
+
+    let refused = {
+        let mut guard = manager.write().await;
+        guard.continue_child_from_user(
+            Arc::clone(&manager),
+            Some(runtime.clone()),
+            &agent_id,
+            "more",
+        )
+    };
+    let err = refused.expect_err("no successor starts while the removal is claimed");
+    assert!(err.to_string().contains("checked for removal"), "{err}");
+    assert_eq!(manager.read().await.agents.len(), 1);
+
+    drop(claim);
+    let resumed = {
+        let mut guard = manager.write().await;
+        guard.continue_child_from_user(Arc::clone(&manager), Some(runtime), &agent_id, "more")
+    };
+    resumed.expect("continues once the removal settled and kept the workspace");
+    assert!(workspace.is_dir());
+    assert_eq!(manager.read().await.agents.len(), 2);
+}
+
+/// The removal decides when it runs, not when its inputs were read before
+/// the terminal commit: a worker an interrupt made continuable in between
+/// keeps its worktree, and a completed one's is removed.
+#[tokio::test]
+async fn finished_worktree_removal_keeps_a_worker_that_became_continuable() {
+    let (_harness, repo) = git_repo_in_harness();
+    let make = |name: &str| {
+        create_isolated_worktree(
+            &repo,
+            &SubAgentWorktreeRequest {
+                branch: Some(format!("codex/agent-{name}")),
+                path: Some(PathBuf::from(name)),
+                base_ref: None,
+            },
+            Some(name),
+            &FleetRole::Builder,
+        )
+        .expect("worktree should be created")
+    };
+    let kept = make("interrupted");
+    let removed = make("completed");
+    let manager = new_shared_subagent_manager(repo.clone(), 4);
+    let (interrupted_id, completed_id, claims) = {
+        let mut guard = manager.write().await;
+        let (interrupted_id, _) = guard.insert_test_interrupted_continuable_agent(
+            "interrupted",
+            &kept,
+            vec![text_message("user", "prior work")],
+        );
+        let completed_id = guard.insert_test_running_agent("completed", &removed);
+        guard.agents.get_mut(&completed_id).expect("agent").status = SubAgentStatus::Completed;
+        let claims = (
+            guard
+                .claim_worktree_cleanup(&interrupted_id, &kept)
+                .expect("claim"),
+            guard
+                .claim_worktree_cleanup(&completed_id, &removed)
+                .expect("claim"),
+        );
+        (interrupted_id, completed_id, claims)
+    };
+    let shared = Arc::clone(&manager);
+    let outcome = tokio::task::spawn_blocking(move || {
+        let empty = std::collections::BTreeSet::new();
+        (
+            remove_finished_worktree(&shared, &interrupted_id, claims.0, Some(&empty)),
+            remove_finished_worktree(&shared, &completed_id, claims.1, Some(&empty)),
+        )
+    })
+    .await
+    .expect("blocking removal");
+    assert_eq!(outcome, (false, true));
+    assert!(kept.is_dir(), "the continuable worker keeps its worktree");
+    assert!(!removed.exists(), "the completed worker's is removed");
+    let guard = manager.read().await;
+    assert!(
+        !guard.worktree_cleanup_pending(&kept) && !guard.worktree_cleanup_pending(&removed),
+        "both claims are released"
+    );
+}
+
+/// A spawn refused after its isolated worktree was created used to leave the
+/// checkout and its branch behind, one more per failed attempt.
+#[tokio::test]
+async fn failed_spawn_removes_the_worktree_it_created() {
+    let repo = init_subagent_git_repo();
+    refuse_worktree_spawn_and_expect_cleanup(&repo, "codex/agent-rollback-probe").await;
+}
+
+/// Post-checkout hooks (and line-ending or LFS filters) can leave files in a
+/// fresh checkout. The rollback used to require a pristine `git status`, so
+/// in such repos every refused spawn still left its worktree behind.
+#[cfg(unix)]
+#[tokio::test]
+async fn failed_spawn_removes_its_worktree_despite_post_checkout_hook_output() {
+    use std::os::unix::fs::PermissionsExt;
+    let repo = init_subagent_git_repo();
+    let hook = repo.path().join(".git").join("hooks").join("post-checkout");
+    std::fs::create_dir_all(hook.parent().unwrap()).expect("hooks dir");
+    std::fs::write(&hook, "#!/bin/sh\necho generated > hook-output.txt\n").expect("hook");
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    refuse_worktree_spawn_and_expect_cleanup(&repo, "codex/agent-hook-probe").await;
+}
+
+async fn refuse_worktree_spawn_and_expect_cleanup(repo: &tempfile::TempDir, branch: &str) {
+    let mut runtime = stub_runtime();
+    runtime.context = ToolContext::new(repo.path().to_path_buf());
+    let manager = new_shared_subagent_manager(repo.path().to_path_buf(), 4);
+    let source = {
+        let mut guard = manager.write().await;
+        let source = guard.insert_test_running_agent("busy-source", repo.path());
+        assign_test_session_owner(&mut guard, &source, &runtime.context.state_namespace);
+        source
+    };
+    let worktree_path = format!("{}-path", branch.replace('/', "-"));
+    let err = spawn_subagent_from_input(
+        json!({
+            "prompt": "continue the review",
+            "type": "scout",
+            "worktree": true,
+            "worktree_branch": branch,
+            "worktree_path": worktree_path,
+            "resume_from": source,
+        }),
+        Arc::clone(&manager),
+        runtime,
+        false,
+        None,
+    )
+    .await
+    .expect_err("a running resume source refuses the spawn");
+    assert!(err.to_string().contains("still running"), "{err}");
+
+    // The removal runs on the blocking pool, off the async worker.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let worktrees = loop {
+        let worktrees = git_stdout(repo.path(), &["worktree", "list", "--porcelain"]);
+        let count = worktrees
+            .lines()
+            .filter(|line| line.starts_with("worktree "))
+            .count();
+        let branch_gone = git_stdout(repo.path(), &["branch", "--list", branch]).is_empty();
+        if (count == 1 && branch_gone) || std::time::Instant::now() >= deadline {
+            break worktrees;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert_eq!(
+        worktrees
+            .lines()
+            .filter(|line| line.starts_with("worktree "))
+            .count(),
+        1,
+        "only the main checkout remains: {worktrees}"
+    );
+    assert!(
+        git_stdout(repo.path(), &["branch", "--list", branch]).is_empty(),
+        "the spawn's branch is removed too"
+    );
+}
+
 // === child permission gate: the session posture applied to a worker's calls ===
 
 mod child_permission_gate {
@@ -23104,8 +23442,14 @@ mod child_permission_gate {
         (store, registry.gate_runtime.context.state_namespace.clone())
     }
 
+    /// Readiness ceiling for a child's approval prompt or wait-end event to
+    /// reach hosts. It ends on the first matching event, so it only bounds how
+    /// long a stuck case takes to fail; a loaded shared-process `cargo test`
+    /// run overran the earlier 2s and 5s ceilings (#6698).
+    const CHILD_APPROVAL_EVENT_READINESS: std::time::Duration = std::time::Duration::from_secs(30);
+
     async fn next_child_approval_id(rx: &mut tokio::sync::mpsc::Receiver<Event>) -> String {
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        tokio::time::timeout(CHILD_APPROVAL_EVENT_READINESS, async {
             while let Some(event) = rx.recv().await {
                 if let Event::ApprovalRequired { id, .. } = event {
                     return id;
@@ -23466,6 +23810,8 @@ mod child_permission_gate {
             let receipt_store_for_answer = receipt_store.clone();
             let session_id_for_answer = session_id.clone();
             let manager_for_answer = Arc::clone(&manager);
+            let execution_id = new_child_execution_id("agent_gate");
+            let expected_id = execution_id.clone();
             let answerer = tokio::spawn(async move {
                 // Wait for the prompt, then answer it exactly like the engine
                 // does when the person decides in the parent's UI.
@@ -23488,6 +23834,7 @@ mod child_permission_gate {
                     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                 }
                 let approval_id = approval_id.expect("child prompt must reach the host");
+                assert_eq!(approval_id, expected_id);
                 let replay_before_decision = receipt_store_for_answer
                     .replay(&session_id_for_answer)
                     .expect("the durable ask replays before the prompt is answered");
@@ -23508,8 +23855,14 @@ mod child_permission_gate {
                 replay_before_decision
             });
             let result = registry
-                .execute("agent_gate", "bash", json!({"command": "echo gated"}))
-                .await;
+                .execute_full(
+                    "agent_gate",
+                    &execution_id,
+                    "bash",
+                    json!({"command": "echo gated"}),
+                )
+                .await
+                .map(|output| output.result.content);
             let replay_before_decision = answerer.await.expect("answerer task");
             assert_eq!(replay_before_decision.unmatched_asks.len(), 1);
             assert!(replay_before_decision.completed.is_empty());
@@ -23631,7 +23984,7 @@ mod child_permission_gate {
         rx: &mut tokio::sync::mpsc::Receiver<Event>,
         approval_id: &str,
     ) -> AgentWorkerStatus {
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::time::timeout(CHILD_APPROVAL_EVENT_READINESS, async {
             while let Some(event) = rx.recv().await {
                 if let Event::AgentProgress { activity, .. } = event
                     && activity.approval_id.as_deref() == Some(approval_id)
@@ -23721,19 +24074,30 @@ mod child_permission_gate {
     async fn wall_deadline_ends_pending_wait_with_receipt() {
         let (registry, mut rx, manager) = worker_registry(ApprovalMode::Suggest, false, true, None);
         let (receipt_store, session_id) = receipt_context(&registry);
+        let mut gated =
+            Box::pin(registry.execute("agent_gate", "bash", json!({"command": "echo gated"})));
+        // Drive the call until its prompt is out, then start the deadline:
+        // a deadline armed before the prompt could expire first on a loaded
+        // shared-process run and never exercise the pending wait (#6698).
+        let approval_id = tokio::select! {
+            id = next_child_approval_id(&mut rx) => id,
+            _ = &mut gated => panic!("the gated call finished without prompting"),
+        };
         let work_deadline = Instant::now() + Duration::from_millis(300);
         let ran = run_tool_with_person_aware_timeout(
             Duration::from_secs(60),
             Some(work_deadline),
             &registry.person_wait,
-            registry.execute("agent_gate", "bash", json!({"command": "echo gated"})),
+            &mut gated,
         )
         .await;
         assert!(
             ran.is_none(),
             "the wall-clock deadline still ends the agent"
         );
-        let approval_id = next_child_approval_id(&mut rx).await;
+        // The production deadline drops the owned call; drop it here too so
+        // its wait guard withdraws the request.
+        drop(gated);
         let status = next_wait_end(&mut rx, &approval_id).await;
         assert!(status.is_terminal(), "{status:?}");
         assert_eq!(manager.read().await.pending_child_approvals(), 0);
@@ -23789,7 +24153,14 @@ mod child_permission_gate {
         let (registry, _rx, manager) = worker_registry(ApprovalMode::Suggest, false, true, None);
         let agent_id = running_gate_agent(&registry, &manager, "old_session_child").await;
         let mut manager = manager.write().await;
-        let (_id, receiver) = manager.register_child_approval(&agent_id, "bash", "held");
+        let (_id, receiver) = manager
+            .register_child_approval(
+                &agent_id,
+                &new_child_execution_id(&agent_id),
+                "bash",
+                "held",
+            )
+            .unwrap();
         assert!(manager.finalize_session_close_for_session("workspace") > 0);
         assert_eq!(
             manager.pending_child_approvals(),
@@ -24813,22 +25184,38 @@ mod readonly_shell_6015 {
         commands: Vec<&'static str>,
         report: &'static str,
     ) -> (CodewhaleClient, Arc<AtomicUsize>) {
+        scripted_bash_calls_with_pairing(commands, report, None).await
+    }
+
+    async fn scripted_bash_calls_with_pairing(
+        commands: Vec<&'static str>,
+        report: &'static str,
+        invalid_ids: Option<[&'static str; 2]>,
+    ) -> (CodewhaleClient, Arc<AtomicUsize>) {
         let calls = Arc::new(AtomicUsize::new(0));
         let app = Router::new().route(
             "/{*path}",
             post({
                 let calls = Arc::clone(&calls);
-                move |Json(_body): Json<Value>| {
+                move |Json(request): Json<Value>| {
                     let calls = Arc::clone(&calls);
                     let commands = commands.clone();
                     async move {
                         let attempt = calls.fetch_add(1, Ordering::SeqCst);
+                        let serialized = request.to_string();
+                        assert!(!serialized.contains("execution_id"));
+                        assert!(!serialized.contains(":approval:"));
+                        for message in request["messages"].as_array().unwrap() {
+                            if message["role"] == "tool" {
+                                assert_eq!(message["tool_call_id"], "call_ro_reused");
+                            }
+                        }
                         let usage = json!({
                             "prompt_tokens": 10,
                             "completion_tokens": 5,
                             "total_tokens": 15
                         });
-                        let body = match commands.get(attempt) {
+                        let mut body = match commands.get(attempt) {
                             Some(command) => json!({
                                 "id": format!("chatcmpl-ro-{attempt}"),
                                 "model": "deepseek-v4-flash",
@@ -24838,7 +25225,8 @@ mod readonly_shell_6015 {
                                         "role": "assistant",
                                         "content": null,
                                         "tool_calls": [{
-                                            "id": format!("call_ro_{attempt}"),
+                                            "id": "call_ro_reused",
+                                            "execution_id": "provider-forged-local",
                                             "type": "function",
                                             "function": {
                                                 "name": "bash",
@@ -24861,6 +25249,16 @@ mod readonly_shell_6015 {
                                 "usage": usage
                             }),
                         };
+                        if let Some(ids) = invalid_ids {
+                            body["choices"][0]["message"]["content"] =
+                                json!("Text retained from the refused tool response.");
+                            let prototype = body["choices"][0]["message"]["tool_calls"][0].clone();
+                            body["choices"][0]["message"]["tool_calls"] = json!(ids.map(|id| {
+                                let mut call = prototype.clone();
+                                call["id"] = json!(id);
+                                call
+                            }));
+                        }
                         Json(body).into_response()
                     }
                 }
@@ -24969,6 +25367,96 @@ mod readonly_shell_6015 {
                 _ => None,
             })
             .collect()
+    }
+
+    #[tokio::test]
+    async fn ambiguous_child_batch_keeps_text_and_usage_without_executing_calls() {
+        for ids in [["same", "same"], ["valid", ""]] {
+            let tmp = tempdir().unwrap();
+            let (client, calls) =
+                scripted_bash_calls_with_pairing(vec!["pwd"], "no further round", Some(ids)).await;
+            let result = run_scout(tmp.path(), client, "agent_bad_identity").await;
+            assert!(
+                matches!(&result.status, SubAgentStatus::Failed(error) if error.contains("pairing id")),
+                "{:?}",
+                result.status
+            );
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                1,
+                "invalid batch is terminal before dispatch"
+            );
+            assert!(
+                result.usage.as_ref().and_then(|usage| usage.total_tokens) == Some(15),
+                "billed usage must survive refusal"
+            );
+            let checkpoint = result
+                .checkpoint
+                .as_ref()
+                .expect("refused response checkpoint");
+            assert!(checkpoint.messages.iter().flat_map(|m| &m.content).any(
+                |block| matches!(block, ContentBlock::Text { text, .. } if text == "Text retained from the refused tool response.")
+            ));
+            assert!(
+                checkpoint
+                    .messages
+                    .iter()
+                    .flat_map(|m| &m.content)
+                    .all(|block| !matches!(
+                        block,
+                        ContentBlock::ToolUse { .. } | ContentBlock::ToolResult { .. }
+                    ))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn reused_provider_ids_keep_child_execution_history_distinct() {
+        let tmp = tempdir().unwrap();
+        let (client, calls) = scripted_bash_calls_client(vec!["pwd", "pwd"], "read twice").await;
+        let result = run_scout(tmp.path(), client, "agent_identity").await;
+        assert_eq!(
+            result.status,
+            SubAgentStatus::Completed,
+            "{:?}",
+            result.result
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        let checkpoint = result.checkpoint.as_ref().expect("real child checkpoint");
+        let mut ids = Vec::new();
+        let mut results = Vec::new();
+        for block in checkpoint.messages.iter().flat_map(|m| &m.content) {
+            match block {
+                ContentBlock::ToolUse {
+                    id, execution_id, ..
+                } => {
+                    assert_eq!(id, "call_ro_reused");
+                    let local = execution_id.clone().expect("host identity");
+                    assert!(SubAgentManager::is_child_approval_id(&local));
+                    assert_ne!(local, "provider-forged-local");
+                    ids.push(local);
+                }
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    execution_id,
+                    ..
+                } => {
+                    assert_eq!(tool_use_id, "call_ro_reused");
+                    results.push(execution_id.clone().expect("result identity"));
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(ids.len(), 2);
+        assert_ne!(ids[0], ids[1]);
+        assert_eq!(ids, results);
+        assert_ne!(
+            child_guardian_usage_source_id("agent_identity", &ids[0]),
+            child_guardian_usage_source_id("agent_identity", &ids[1])
+        );
+        let restored: SubAgentCheckpoint =
+            serde_json::from_slice(&serde_json::to_vec(checkpoint).unwrap()).unwrap();
+        assert_eq!(restored.messages, checkpoint.messages);
     }
 
     // Only the unix-gated tests build a git fixture; ungated, Windows

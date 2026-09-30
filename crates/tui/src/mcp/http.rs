@@ -297,6 +297,13 @@ impl McpTransport for HttpTransport {
         }
     }
 
+    fn probe_dead(&self) -> bool {
+        match &self.mode {
+            HttpTransportMode::Streamable(_) => false,
+            HttpTransportMode::Sse(transport) => transport.probe_dead(),
+        }
+    }
+
     async fn shutdown(&mut self) {
         if let HttpTransportMode::Sse(transport) = &mut self.mode {
             transport.shutdown().await;

@@ -157,6 +157,7 @@ impl PluginTrustStatus {
 #[derive(Debug, Clone)]
 pub struct PluginSkillSnapshot {
     pub name: String,
+    pub legacy_activation_name: Option<String>,
     pub description: String,
     pub localized_descriptions: HashMap<String, String>,
     pub invocation: crate::skills::SkillInvocation,
