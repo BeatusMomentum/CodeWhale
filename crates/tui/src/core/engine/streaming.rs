@@ -15,14 +15,32 @@ pub(super) enum EventSendError {
     Closed,
 }
 
-/// Reserve from the one event queue. A terminal reservation is held by its
-/// turn; ordinary sends consume theirs immediately. A live turn retains
-/// lossless backpressure, cancellation releases its wait, and idle sends have
-/// no turn token to cancel them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum EventReservationPolicy {
+    /// Cancellation wins before admitting work or a new stream observation.
+    Strict,
+    /// Preserve a completed observation when capacity is already available.
+    Receipt,
+}
+
+/// Reserve from the one event queue. Lifecycle and terminal handoff permits
+/// are held locally; ordinary receipts consume theirs immediately. Receipts
+/// may enter available capacity after cancellation, but cancellation always
+/// releases a wait on a full queue. Idle sends have no turn token to cancel.
 pub(super) async fn reserve_event_capacity(
     tx: &tokio::sync::mpsc::Sender<super::Event>,
     cancel: Option<&tokio_util::sync::CancellationToken>,
+    policy: EventReservationPolicy,
 ) -> Result<tokio::sync::mpsc::OwnedPermit<super::Event>, EventSendError> {
+    if policy == EventReservationPolicy::Receipt {
+        match tx.clone().try_reserve_owned() {
+            Ok(permit) => return Ok(permit),
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                return Err(EventSendError::Closed);
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {}
+        }
+    }
     let reserve = tx.clone().reserve_owned();
     match cancel {
         Some(cancel) => tokio::select! {
@@ -38,7 +56,13 @@ impl super::Engine {
     /// Stream observations always belong to the decoder's current turn,
     /// including direct test/embedding calls that do not enqueue an Op.
     pub(super) async fn send_stream_event(&self, event: super::Event) -> bool {
-        match reserve_event_capacity(&self.tx_event, Some(&self.cancel_token)).await {
+        match reserve_event_capacity(
+            &self.tx_event,
+            Some(&self.cancel_token),
+            EventReservationPolicy::Strict,
+        )
+        .await
+        {
             Ok(permit) => {
                 permit.send(event);
                 true
@@ -60,15 +84,12 @@ impl super::Engine {
             .active
             .as_ref()
             .map(|control| control.cancel.clone());
-        let permit = match self.tx_event.clone().try_reserve_owned() {
-            Ok(permit) => permit,
-            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                return Err(EventSendError::Closed);
-            }
-            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                reserve_event_capacity(&self.tx_event, cancel.as_ref()).await?
-            }
-        };
+        let permit = reserve_event_capacity(
+            &self.tx_event,
+            cancel.as_ref(),
+            EventReservationPolicy::Receipt,
+        )
+        .await?;
         permit.send(event);
         Ok(())
     }

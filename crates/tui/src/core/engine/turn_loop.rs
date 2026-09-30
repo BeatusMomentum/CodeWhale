@@ -4521,9 +4521,12 @@ impl Engine {
                             .map(|result| result.content_blocks.clone())
                             .unwrap_or_default();
                         let legacy_result = result.map(RichToolResult::into_result);
-                        if let Ok(permit) =
-                            super::streaming::reserve_event_capacity(&tx_event, Some(&cancel_token))
-                                .await
+                        if let Ok(permit) = super::streaming::reserve_event_capacity(
+                            &tx_event,
+                            Some(&cancel_token),
+                            super::streaming::EventReservationPolicy::Receipt,
+                        )
+                        .await
                         {
                             permit.send(Event::ToolCallComplete {
                                 model_call: plan.model_call.clone(),

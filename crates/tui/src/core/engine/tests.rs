@@ -611,6 +611,181 @@ async fn event_capacity_cancelled_repl_child_keeps_unknown_cost_and_discards_ker
     );
     drop(turn_guard);
 }
+#[tokio::test]
+async fn event_capacity_cancelled_parallel_tool_keeps_completed_span_and_call_when_available() {
+    use crate::llm_client::mock::{MockLlmClient, canned};
+    use crate::tools::spec::{ToolCapability, ToolSpec};
+    use codewhale_protocol::engine_owner::OwnerOperationOutcome;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct CompleteThenCancel {
+        cancel: tokio_util::sync::CancellationToken,
+        tx: mpsc::Sender<Event>,
+        fill_queue: bool,
+        executed: Arc<AtomicUsize>,
+    }
+    #[async_trait::async_trait]
+    impl ToolSpec for CompleteThenCancel {
+        fn name(&self) -> &str {
+            "fixture_complete_then_cancel"
+        }
+        fn description(&self) -> &str {
+            "Finish an observed operation before firing its turn cancellation token."
+        }
+        fn input_schema(&self) -> Value {
+            json!({"type": "object"})
+        }
+        fn capabilities(&self) -> Vec<ToolCapability> {
+            vec![ToolCapability::ReadOnly]
+        }
+        fn supports_parallel(&self) -> bool {
+            true
+        }
+        async fn execute(&self, _: Value, _: &ToolContext) -> Result<ToolResult, ToolError> {
+            self.executed.fetch_add(1, Ordering::SeqCst);
+            if self.fill_queue {
+                while self
+                    .tx
+                    .try_send(Event::status("full at tool completion"))
+                    .is_ok()
+                {}
+            }
+            self.cancel.cancel();
+            Ok(ToolResult::success("completed before cancellation"))
+        }
+    }
+
+    for fill_queue in [false, true] {
+        let workspace = tempdir().unwrap();
+        let mock = Arc::new(MockLlmClient::new(vec![
+            tool_batch_turn(&[
+                ("one", "fixture_complete_then_cancel", "{}"),
+                ("two", "fixture_complete_then_cancel", "{}"),
+            ]),
+            canned::simple_text_turn("must not run after cancellation"),
+        ]));
+        let (mut engine, handle) = Engine::new_with_model_client(
+            deterministic_engine_config(workspace.path()),
+            &Config::default(),
+            mock.clone(),
+        );
+        let turn_guard = engine.begin_turn_control();
+        let executed = Arc::new(AtomicUsize::new(0));
+        let mut registry = crate::tools::ToolRegistry::new(ToolContext::new(workspace.path()));
+        registry.register(Arc::new(CompleteThenCancel {
+            cancel: engine.cancel_token.clone(),
+            tx: engine.tx_event.clone(),
+            fill_queue,
+            executed: executed.clone(),
+        }));
+        let tools = Some(registry.to_api_tools_with_cache(true));
+        let policy = test_tool_surface(&engine, registry, tools, AppMode::Agent);
+        let mut turn = TurnContext::new(4);
+        let (status, error) = tokio::time::timeout(
+            Duration::from_secs(2),
+            engine.run_turn(&mut turn, policy, None, None),
+        )
+        .await
+        .expect("actual parallel tool completion cannot park on a full cancelled queue");
+        assert_eq!(status, TurnOutcomeStatus::Interrupted, "{error:?}");
+        assert!(error.is_none());
+        assert_eq!(
+            executed.load(Ordering::SeqCst),
+            1,
+            "the peer never executes"
+        );
+        assert_eq!(
+            mock.call_count(),
+            1,
+            "no provider continuation after cancellation"
+        );
+        let mut rx = handle.rx_event.write().await;
+        let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        let starts: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::OperationActivityStarted {
+                    span_id,
+                    activity_kind,
+                } => Some((span_id, activity_kind)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(starts.len(), 1, "one actual tool activity was admitted");
+        let completed: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::OperationActivityCompleted {
+                    span_id,
+                    activity_kind,
+                    outcome,
+                } => Some((span_id, activity_kind, outcome)),
+                _ => None,
+            })
+            .collect();
+        let calls: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::ToolCallComplete {
+                    id,
+                    model_call,
+                    result,
+                    ..
+                } => Some((id, model_call, result)),
+                _ => None,
+            })
+            .collect();
+        if fill_queue {
+            assert!(
+                completed.is_empty() && calls.is_empty(),
+                "cancelled full waits release without inventing delivery"
+            );
+        } else {
+            assert_eq!(
+                completed.len(),
+                1,
+                "preserve the completed activity after cancellation"
+            );
+            assert_eq!(completed[0].0, starts[0].0, "retain the span relationship");
+            assert_eq!(completed[0].1, starts[0].1);
+            assert_eq!(*completed[0].2, OwnerOperationOutcome::Succeeded);
+            assert_eq!(
+                calls.len(),
+                2,
+                "completed call and cancelled peer both settle exactly once"
+            );
+            let succeeded: Vec<_> = calls
+                .iter()
+                .filter(|(_, _, result)| result.as_ref().is_ok_and(|result| result.success))
+                .collect();
+            assert_eq!(succeeded.len(), 1);
+            assert_eq!(
+                succeeded[0].2.as_ref().unwrap().content,
+                "completed before cancellation"
+            );
+            assert!(
+                starts[0].0.starts_with(&format!("{}#", succeeded[0].0)),
+                "span retains its completed execution identity"
+            );
+            let provider_ids: HashSet<_> = calls
+                .iter()
+                .map(|(_, model_call, _)| model_call.as_ref().unwrap().provider_id.as_str())
+                .collect();
+            assert_eq!(provider_ids, HashSet::from(["one", "two"]));
+            let call_starts: HashSet<_> = events
+                .iter()
+                .filter_map(|event| match event {
+                    Event::ToolCallStarted { id, .. } => Some(id),
+                    _ => None,
+                })
+                .collect();
+            assert!(calls.iter().all(|(id, _, _)| call_starts.contains(id)));
+        }
+        drop(rx);
+        drop(turn_guard);
+    }
+}
+
 const REPRESENTATIVE_FIXTURE_ID: &str = "representative-v1";
 const REPRESENTATIVE_PROJECT_AUTHORITY: &str = "REPRESENTATIVE_PROJECT_AUTHORITY";
 const REPRESENTATIVE_PROJECT_AUTHORITY_BODY: &str = concat!(

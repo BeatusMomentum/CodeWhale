@@ -2162,13 +2162,21 @@ impl Engine {
         approval_mode: ApprovalMode,
     ) {
         let turn_control = self.begin_turn_control();
-        let Ok(terminal_permit) =
-            streaming::reserve_event_capacity(&self.tx_event, Some(&self.cancel_token)).await
+        let Ok(terminal_permit) = streaming::reserve_event_capacity(
+            &self.tx_event,
+            Some(&self.cancel_token),
+            streaming::EventReservationPolicy::Strict,
+        )
+        .await
         else {
             return;
         };
-        let Ok(start_permit) =
-            streaming::reserve_event_capacity(&self.tx_event, Some(&self.cancel_token)).await
+        let Ok(start_permit) = streaming::reserve_event_capacity(
+            &self.tx_event,
+            Some(&self.cancel_token),
+            streaming::EventReservationPolicy::Strict,
+        )
+        .await
         else {
             return;
         };
@@ -5470,10 +5478,18 @@ impl Engine {
         // create a completion with no start. The production queue has 256
         // slots; these local permits do not create a second event authority.
         let admission = async {
-            let terminal =
-                streaming::reserve_event_capacity(&self.tx_event, Some(&self.cancel_token)).await?;
-            let started =
-                streaming::reserve_event_capacity(&self.tx_event, Some(&self.cancel_token)).await?;
+            let terminal = streaming::reserve_event_capacity(
+                &self.tx_event,
+                Some(&self.cancel_token),
+                streaming::EventReservationPolicy::Strict,
+            )
+            .await?;
+            let started = streaming::reserve_event_capacity(
+                &self.tx_event,
+                Some(&self.cancel_token),
+                streaming::EventReservationPolicy::Strict,
+            )
+            .await?;
             Ok::<_, streaming::EventSendError>((terminal, started))
         };
         let (terminal_permit, start_permit) = match admission.await {

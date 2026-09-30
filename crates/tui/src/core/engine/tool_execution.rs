@@ -24,15 +24,15 @@ fn inherited_interactive_shell_refusal(tool_name: &str, interactive: bool) -> Op
         .map(|message| ToolError::execution_failed(message.to_string()))
 }
 
-/// Pairs one `OperationActivityStarted` with exactly one
-/// `OperationActivityCompleted`.
+/// Pairs an observed `OperationActivityStarted` with at most one completion.
 ///
 /// The turn loop drops an in-flight tool future when the user cancels
 /// (`tokio::select!` on the cancel token, or `drop(tool_tasks)` for a parallel
 /// batch), so a Completed sent inline after the await would never be sent.
 /// Dropping an unfinished span sends `Completed { Cancelled }` with
 /// `try_send`: best effort, like the other guards here, because `Drop` cannot
-/// await a full channel.
+/// await a full channel. Cancellation may release a completion parked on a
+/// full queue; the turn's reserved terminal observation settles its lifecycle.
 pub(super) struct OperationSpanGuard {
     tx: mpsc::Sender<Event>,
     span: Option<(String, codewhale_protocol::engine_owner::OwnerActivityKind)>,
@@ -56,9 +56,15 @@ impl OperationSpanGuard {
         cancel: Option<CancellationToken>,
     ) -> Self {
         let span_id = Self::span_id(call_id);
-        // `Sender::send` is cancel safe: if this future is dropped the event
+        // Reservation is cancel safe: if this future is dropped the event
         // was either sent or not, and the guard is armed only once it was.
-        let sent = match super::streaming::reserve_event_capacity(&tx, cancel.as_ref()).await {
+        let sent = match super::streaming::reserve_event_capacity(
+            &tx,
+            cancel.as_ref(),
+            super::streaming::EventReservationPolicy::Strict,
+        )
+        .await
+        {
             Ok(permit) => {
                 permit.send(Event::OperationActivityStarted {
                     span_id: span_id.clone(),
@@ -76,16 +82,19 @@ impl OperationSpanGuard {
     }
 
     async fn complete(mut self, outcome: codewhale_protocol::engine_owner::OwnerOperationOutcome) {
-        if let Some((span_id, activity_kind)) = self.span.take() {
-            if let Ok(permit) =
-                super::streaming::reserve_event_capacity(&self.tx, self.cancel.as_ref()).await
-            {
-                permit.send(Event::OperationActivityCompleted {
-                    span_id,
-                    activity_kind,
-                    outcome,
-                });
-            }
+        if let Some((span_id, activity_kind)) = self.span.take()
+            && let Ok(permit) = super::streaming::reserve_event_capacity(
+                &self.tx,
+                self.cancel.as_ref(),
+                super::streaming::EventReservationPolicy::Receipt,
+            )
+            .await
+        {
+            permit.send(Event::OperationActivityCompleted {
+                span_id,
+                activity_kind,
+                outcome,
+            });
         }
     }
 }
@@ -186,13 +195,21 @@ impl InteractiveTerminalGuard {
         if !interactive {
             return Ok(Self { resume: None });
         }
-        let resume = super::streaming::reserve_event_capacity(&tx, cancel.as_ref())
-            .await
-            .map_err(terminal_handoff_send_error)?;
+        let resume = super::streaming::reserve_event_capacity(
+            &tx,
+            cancel.as_ref(),
+            super::streaming::EventReservationPolicy::Strict,
+        )
+        .await
+        .map_err(terminal_handoff_send_error)?;
         let ack = Arc::new(tokio::sync::Notify::new());
-        let pause = super::streaming::reserve_event_capacity(&tx, cancel.as_ref())
-            .await
-            .map_err(terminal_handoff_send_error)?;
+        let pause = super::streaming::reserve_event_capacity(
+            &tx,
+            cancel.as_ref(),
+            super::streaming::EventReservationPolicy::Strict,
+        )
+        .await
+        .map_err(terminal_handoff_send_error)?;
         // No await separates the pause send and guard installation. A
         // cancelled reservation above never paused and needs no resume.
         pause.send(Event::PauseEvents {
@@ -311,7 +328,13 @@ impl Engine {
                 let url = url.to_string();
                 let tx = tx_event.clone();
                 notice_task = Some(super::turn_heartbeat::AbortOnDrop(tokio::spawn(async move {
-                    if let Ok(permit) = super::streaming::reserve_event_capacity(&tx, None).await {
+                    if let Ok(permit) = super::streaming::reserve_event_capacity(
+                        &tx,
+                        None,
+                        super::streaming::EventReservationPolicy::Receipt,
+                    )
+                    .await
+                    {
                         permit.send(Event::status(format!(
                             "◆ auth required: sign in to MCP server '{server}' in your browser — {url}"
                         )));
@@ -682,6 +705,80 @@ mod tests {
 
         assert!(matches!(event, Event::ToolCallHeartbeat));
         drop(guard);
+    }
+
+    #[tokio::test]
+    async fn event_capacity_cancelled_activity_preserves_exact_outcomes_and_releases_full_queue() {
+        use codewhale_protocol::engine_owner::{OwnerActivityKind, OwnerOperationOutcome};
+        for outcome in [
+            OwnerOperationOutcome::Succeeded,
+            OwnerOperationOutcome::Failed,
+            OwnerOperationOutcome::Denied,
+            OwnerOperationOutcome::Cancelled,
+        ] {
+            let (tx, mut rx) = mpsc::channel(2);
+            let cancel = CancellationToken::new();
+            let span = OperationSpanGuard::start(
+                tx,
+                "completed-call",
+                OwnerActivityKind::Tool,
+                Some(cancel.clone()),
+            )
+            .await;
+            cancel.cancel();
+            tokio::time::timeout(Duration::from_millis(100), span.complete(outcome))
+                .await
+                .expect("completed activity preserves available capacity after cancellation");
+            let Event::OperationActivityStarted {
+                span_id,
+                activity_kind,
+            } = rx.try_recv().unwrap()
+            else {
+                panic!("activity start");
+            };
+            let Event::OperationActivityCompleted {
+                span_id: completed_span,
+                activity_kind: completed_kind,
+                outcome: completed_outcome,
+            } = rx
+                .try_recv()
+                .expect("cancellation must not discard the completion")
+            else {
+                panic!("activity completion");
+            };
+            assert_eq!(completed_span, span_id);
+            assert_eq!(completed_kind, activity_kind);
+            assert_eq!(
+                completed_outcome, outcome,
+                "retain the observed outcome exactly"
+            );
+            assert!(rx.try_recv().is_err(), "exactly one completion");
+        }
+
+        let (tx, mut rx) = mpsc::channel(1);
+        let cancel = CancellationToken::new();
+        let span = OperationSpanGuard::start(
+            tx,
+            "full-call",
+            OwnerActivityKind::Tool,
+            Some(cancel.clone()),
+        )
+        .await;
+        cancel.cancel();
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            span.complete(OwnerOperationOutcome::Succeeded),
+        )
+        .await
+        .expect("a full queue cannot retain a cancelled activity sender");
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            Event::OperationActivityStarted { .. }
+        ));
+        assert!(
+            rx.try_recv().is_err(),
+            "no sender survives to publish after draining"
+        );
     }
 
     #[tokio::test]
