@@ -6827,6 +6827,56 @@ async fn full_event_channel_still_delivers_agent_complete() {
     ));
 }
 
+/// #6560 D02-06: a nested parent's completion inbox is bounded and has no
+/// terminal-results synthesis behind it, so a completion that meets a full
+/// inbox must wait for capacity rather than be dropped.
+#[tokio::test]
+async fn full_nested_completion_inbox_still_delivers_child_completion() {
+    let tmp = tempdir().expect("tempdir");
+    let mut manager = SubAgentManager::new(tmp.path().to_path_buf(), 2);
+    let agent_id = "agent_full_inbox".to_string();
+    let (input_tx, _input_rx) = mpsc::unbounded_channel();
+    let mut agent = SubAgent::new(
+        agent_id.clone(),
+        FleetRole::Worker,
+        "finish while the parent inbox is full".to_string(),
+        make_assignment(),
+        "deepseek-v4-flash".to_string(),
+        None,
+        None,
+        input_tx,
+        tmp.path().to_path_buf(),
+        manager.current_session_boot_id.clone(),
+    );
+    agent.task_handle = Some(tokio::spawn(async {
+        tokio::time::sleep(Duration::from_secs(60)).await;
+    }));
+
+    let (completion_tx, mut completion_rx) = mpsc::channel::<SubAgentCompletion>(1);
+    completion_tx
+        .try_send(SubAgentCompletion {
+            owner_session_id: String::new(),
+            agent_id: "earlier_sibling".to_string(),
+            payload: "already queued".to_string(),
+        })
+        .expect("fill the only slot");
+    let runtime = runtime_with_depth(2, Some(completion_tx));
+    agent.terminal_delivery = Some(SubAgentTerminalDeliveryContext::from_runtime(&runtime));
+    manager.agents.insert(agent_id.clone(), agent);
+    manager.register_worker(make_worker_spec(&agent_id, tmp.path().to_path_buf()));
+
+    let result = manager.cancel_agent(&agent_id).expect("stop");
+    assert_eq!(result.status, SubAgentStatus::Cancelled);
+
+    let filler = completion_rx.recv().await.expect("filler completion");
+    assert_eq!(filler.agent_id, "earlier_sibling");
+    let delivered = tokio::time::timeout(Duration::from_secs(5), completion_rx.recv())
+        .await
+        .expect("child completion is not dropped")
+        .expect("inbox open");
+    assert_eq!(delivered.agent_id, agent_id);
+}
+
 #[tokio::test]
 async fn model_wait_cancel_fans_in_once_and_preserves_checkpoint() {
     use tokio_util::sync::CancellationToken;

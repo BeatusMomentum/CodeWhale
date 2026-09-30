@@ -2370,9 +2370,11 @@ impl SubAgentTerminalDeliveryContext {
         if self.spawn_depth > 0
             && let Some(tx) = self.parent_completion_tx.as_ref()
         {
-            // A full inbox drops this wake; the terminal-results synthesis
-            // still delivers the completion at the next explicit turn (#6147).
-            let _ = tx.try_send(completion.clone());
+            // A full inbox waits for capacity instead of dropping the wake
+            // (#6560 D02-06): a nested parent has no terminal-results
+            // synthesis to recover it, so a child finishing while the inbox
+            // is full would otherwise never reach the parent's model.
+            send_terminal_event(tx, completion.clone());
         }
 
         if let Some(mailbox) = self.mailbox.as_ref() {
@@ -2398,16 +2400,17 @@ impl SubAgentTerminalDeliveryContext {
     }
 }
 
-/// Deliver a terminal sub-agent event the host must not lose (#6184 H2).
+/// Deliver a terminal sub-agent event (or child completion) the receiver
+/// must not lose (#6184 H2, #6560 D02-06).
 ///
 /// `try_send` dropped `AgentComplete` whenever the event channel was full,
 /// leaving a ghost Running row that silenced every stall watchdog. The
 /// terminal claim forbids awaiting here, so a full channel hands the event to
-/// a task that waits for capacity; only a closed channel (no host left)
+/// a task that waits for capacity; only a closed channel (no receiver left)
 /// drops it. Progress events stay lossy by design. `AgentSpawned` also stays
 /// lossy: delivered late it could land after the completion and resurrect a
 /// Running row, while a lost one is recovered by the completion itself.
-pub(crate) fn send_terminal_event(event_tx: &mpsc::Sender<Event>, event: Event) {
+pub(crate) fn send_terminal_event<T: Send + 'static>(event_tx: &mpsc::Sender<T>, event: T) {
     let event = match event_tx.try_send(event) {
         Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => return,
         Err(mpsc::error::TrySendError::Full(event)) => event,
@@ -11292,11 +11295,18 @@ async fn spawn_subagent_from_input(
         child_runtime.max_output_tokens =
             narrow_optional_limit(child_runtime.max_output_tokens, Some(n));
     }
-    let resident_context = spawn_request
-        .resident_file
-        .as_deref()
-        .map(|file_path| read_bounded_resident_context(&runtime.context, file_path))
-        .transpose()?;
+    // File reads, git and transcript loads below run on the blocking pool,
+    // not the async worker (#6561 D02-09).
+    let resident_context = match spawn_request.resident_file.clone() {
+        Some(file_path) => {
+            let context = runtime.context.clone();
+            Some(
+                spawn_prep_blocking(move || read_bounded_resident_context(&context, &file_path))
+                    .await?,
+            )
+        }
+        None => None,
+    };
     let effective_prompt = assemble_spawn_prompt(&spawn_request, resident_context.as_ref());
     let (model_route, route_source, fallback_note) = bind_spawn_model_route(
         &mut child_runtime,
@@ -11353,22 +11363,35 @@ async fn spawn_subagent_from_input(
             .check_admission_capacity()
             .map_err(|err| ToolError::execution_failed(err.to_string()))?;
     }
-    let child_workspace = prepare_child_workspace(
-        &runtime.context.workspace,
-        spawn_request.cwd.as_deref(),
-        spawn_request.worktree.as_ref(),
-        spawn_request.session_name.as_deref(),
-        &spawn_request.agent_type,
-    )?;
     // Every later refusal (resume_from, resident lease, admission, a name
     // already in use) would otherwise leave the new checkout and its branch
     // behind, one more per failed attempt. Disarmed once the child is live.
-    let mut pending_worktree = PendingChildWorktree(
-        child_workspace
-            .as_ref()
-            .filter(|_| spawn_request.worktree.is_some())
-            .cloned(),
-    );
+    // The guard is armed inside the blocking task, so a spawn future dropped
+    // while git creates the worktree still removes it when the task ends.
+    let (child_workspace, mut pending_worktree) = {
+        let parent_workspace = runtime.context.workspace.clone();
+        let cwd = spawn_request.cwd.clone();
+        let worktree = spawn_request.worktree.clone();
+        let session_name = spawn_request.session_name.clone();
+        let agent_type = spawn_request.agent_type.clone();
+        spawn_prep_blocking(move || {
+            let child_workspace = prepare_child_workspace(
+                &parent_workspace,
+                cwd.as_deref(),
+                worktree.as_ref(),
+                session_name.as_deref(),
+                &agent_type,
+            )?;
+            let pending = PendingChildWorktree(
+                child_workspace
+                    .as_ref()
+                    .filter(|_| worktree.is_some())
+                    .cloned(),
+            );
+            Ok((child_workspace, pending))
+        })
+        .await?
+    };
 
     child_runtime.max_spawn_depth = child_max_spawn_depth_for_spawn(
         child_runtime.max_spawn_depth,
@@ -11436,91 +11459,96 @@ async fn spawn_subagent_from_input(
     // resolve_resume_from: look up the source agent, validate it is settled
     // and lives in the same workspace, then load its transcript so the new
     // child inherits the full lineage (issue #425).
-    let (fork_context, resume_from_agent_id) =
-        if let Some(ref source_ref) = spawn_request.resume_from {
-            // Validate: fork_context=false is incompatible with resume_from.
-            if spawn_request.fork_context == Some(false) {
-                return Err(ToolError::invalid_input(
-                    "resume_from requires fork_context to be true or unset; \
+    let (fork_context, resume_from_agent_id) = if let Some(ref source_ref) =
+        spawn_request.resume_from
+    {
+        // Validate: fork_context=false is incompatible with resume_from.
+        if spawn_request.fork_context == Some(false) {
+            return Err(ToolError::invalid_input(
+                "resume_from requires fork_context to be true or unset; \
                  explicit fork_context=false conflicts with transcript continuation."
-                        .to_string(),
-                ));
-            }
-            let (source_agent_id, source_workspace, source_state_root, checkpoint_messages) = {
-                let manager_read = manager.read().await;
-                let source_id = manager_read
-                    .resolve_agent_ref_for_session(&runtime.context.state_namespace, source_ref)
-                    .map_err(|_| {
-                        ToolError::invalid_input(format!(
-                            "resume_from: agent or session '{source_ref}' not found. \
+                    .to_string(),
+            ));
+        }
+        let (source_agent_id, source_workspace, source_state_root, checkpoint_messages) = {
+            let manager_read = manager.read().await;
+            let source_id = manager_read
+                .resolve_agent_ref_for_session(&runtime.context.state_namespace, source_ref)
+                .map_err(|_| {
+                    ToolError::invalid_input(format!(
+                        "resume_from: agent or session '{source_ref}' not found. \
                      Use agent action=status to list available agents."
-                        ))
-                    })?;
-                manager_read
-                    .ensure_caller_controls_descendant_for_session(
-                        &runtime.context.state_namespace,
-                        &source_id,
-                        runtime.parent_agent_id.as_deref(),
-                        "agent/resume_from",
-                    )
-                    .map_err(|err| ToolError::invalid_input(err.to_string()))?;
-                let source = manager_read.agents.get(&source_id).ok_or_else(|| {
-                    ToolError::invalid_input(format!("resume_from: agent '{source_id}' not found"))
+                    ))
                 })?;
-                if source.status == SubAgentStatus::Running {
-                    return Err(ToolError::invalid_input(format!(
-                        "resume_from: agent '{source_id}' (session '{}') is still running. \
+            manager_read
+                .ensure_caller_controls_descendant_for_session(
+                    &runtime.context.state_namespace,
+                    &source_id,
+                    runtime.parent_agent_id.as_deref(),
+                    "agent/resume_from",
+                )
+                .map_err(|err| ToolError::invalid_input(err.to_string()))?;
+            let source = manager_read.agents.get(&source_id).ok_or_else(|| {
+                ToolError::invalid_input(format!("resume_from: agent '{source_id}' not found"))
+            })?;
+            if source.status == SubAgentStatus::Running {
+                return Err(ToolError::invalid_input(format!(
+                    "resume_from: agent '{source_id}' (session '{}') is still running. \
                      Only settled agents (completed, interrupted, failed, cancelled) \
                      may be used as a resume source. Use action=wait to block until \
                      it settles, or action=interrupt to stop it.",
-                        source.session_name
-                    )));
-                }
-                // Capture checkpoint messages now while holding the read lock; used
-                // as a fallback when the transcript artifact is unavailable.
-                let checkpoint_messages = source
-                    .checkpoint
-                    .as_ref()
-                    .filter(|cp| cp.continuable && !cp.messages.is_empty())
-                    .map(|cp| cp.messages.clone())
-                    .unwrap_or_default();
-                (
-                    source_id,
-                    source.workspace.clone(),
-                    manager_read.state_root.clone(),
-                    checkpoint_messages,
-                )
-            };
-            // Cross-workspace resume remains unsupported because execution
-            // authority and inherited context belong to the source workspace,
-            // even when the transcript artifact itself has a separate state root.
-            let parent_workspace = normalize_subagent_workspace(&runtime.context.workspace);
-            let source_workspace_normalized = normalize_subagent_workspace(&source_workspace);
-            if parent_workspace != source_workspace_normalized {
-                return Err(ToolError::invalid_input(format!(
-                    "resume_from: source agent '{source_agent_id}' lives in a different \
-                 workspace ({}) than this agent ({}). Cross-workspace continuation \
-                 is not supported.",
-                    source_workspace.display(),
-                    runtime.context.workspace.display()
+                    source.session_name
                 )));
             }
-            // Load the full transcript from the on-disk artifact. Fall back to the
-            // checkpoint messages for legacy records that predate transcript
-            // artifacts or for agents whose artifacts were cleaned up.
-            let messages = load_subagent_transcript_artifact(&source_state_root, &source_agent_id)
-                .unwrap_or(checkpoint_messages);
-            let resume_ctx = SubAgentForkContext {
-                messages,
-                structured_state_block: None,
-                work_source: None,
-            };
-            child_runtime.fork_context = Some(resume_ctx);
-            spawn_metadata.resume_from_agent_id = Some(source_agent_id.clone());
-            (true, Some(source_agent_id))
-        } else {
-            (fork_context, None)
+            // Capture checkpoint messages now while holding the read lock; used
+            // as a fallback when the transcript artifact is unavailable.
+            let checkpoint_messages = source
+                .checkpoint
+                .as_ref()
+                .filter(|cp| cp.continuable && !cp.messages.is_empty())
+                .map(|cp| cp.messages.clone())
+                .unwrap_or_default();
+            (
+                source_id,
+                source.workspace.clone(),
+                manager_read.state_root.clone(),
+                checkpoint_messages,
+            )
         };
+        // Cross-workspace resume remains unsupported because execution
+        // authority and inherited context belong to the source workspace,
+        // even when the transcript artifact itself has a separate state root.
+        let parent_workspace = normalize_subagent_workspace(&runtime.context.workspace);
+        let source_workspace_normalized = normalize_subagent_workspace(&source_workspace);
+        if parent_workspace != source_workspace_normalized {
+            return Err(ToolError::invalid_input(format!(
+                "resume_from: source agent '{source_agent_id}' lives in a different \
+                 workspace ({}) than this agent ({}). Cross-workspace continuation \
+                 is not supported.",
+                source_workspace.display(),
+                runtime.context.workspace.display()
+            )));
+        }
+        // Load the full transcript from the on-disk artifact. Fall back to the
+        // checkpoint messages for legacy records that predate transcript
+        // artifacts or for agents whose artifacts were cleaned up.
+        let transcript_agent_id = source_agent_id.clone();
+        let messages = spawn_prep_blocking(move || {
+            Ok(load_subagent_transcript_artifact(&source_state_root, &transcript_agent_id).ok())
+        })
+        .await?
+        .unwrap_or(checkpoint_messages);
+        let resume_ctx = SubAgentForkContext {
+            messages,
+            structured_state_block: None,
+            work_source: None,
+        };
+        child_runtime.fork_context = Some(resume_ctx);
+        spawn_metadata.resume_from_agent_id = Some(source_agent_id.clone());
+        (true, Some(source_agent_id))
+    } else {
+        (fork_context, None)
+    };
 
     let resident_lease = resident_context
         .as_ref()
@@ -11601,6 +11629,15 @@ async fn spawn_subagent_from_input(
     pending_worktree.0 = None;
 
     Ok((result, spawn_metadata))
+}
+
+/// Run synchronous spawn preparation (file reads, git) on the blocking pool.
+async fn spawn_prep_blocking<T: Send + 'static>(
+    work: impl FnOnce() -> Result<T, ToolError> + Send + 'static,
+) -> Result<T, ToolError> {
+    tokio::task::spawn_blocking(work).await.map_err(|error| {
+        ToolError::execution_failed(format!("sub-agent spawn preparation failed: {error}"))
+    })?
 }
 
 /// An isolated worktree created for a spawn that has not started yet. If the
@@ -13912,7 +13949,9 @@ fn record_agent_progress(
 }
 
 /// Bound on the nested-agent completion inbox (#6147): one completion per
-/// terminated nested child, drained by the parent agent's turn loop.
+/// terminated nested child, drained by the parent agent's turn loop. A full
+/// inbox delays a completion rather than dropping it; see
+/// [`send_terminal_event`].
 const CHILD_COMPLETION_CHANNEL_CAPACITY: usize = 64;
 
 fn runtime_for_nested_agent_tools(
