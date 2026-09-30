@@ -38,6 +38,36 @@ use super::roster::FleetRoster;
 pub const FLEET_SCHEMA_KIND: &str = "fleet";
 pub const FLEET_SCHEMA_REVISION: u32 = 2;
 const MAX_MEMBER_DISPLAY_NAME_CHARS: usize = 80;
+const MAX_FLEET_NAME_CHARS: usize = 120;
+const MAX_MEMBER_ID_CHARS: usize = 64;
+const MAX_MEMBER_ROLE_CHARS: usize = 80;
+const MAX_ROUTE_FIELD_CHARS: usize = 256;
+const MAX_MEMBER_INSTRUCTIONS_CHARS: usize = 32 * 1024;
+
+/// A value that reaches selectors, receipts, and terminal rendering: printable
+/// and bounded. `multiline` admits newlines and tabs (instruction overlays)
+/// but no other control characters.
+fn validate_text(
+    what: &str,
+    value: &str,
+    max_chars: usize,
+    multiline: bool,
+) -> Result<(), FleetStoreError> {
+    let printable = value
+        .chars()
+        .all(|ch| !ch.is_control() || (multiline && matches!(ch, '\n' | '\r' | '\t')));
+    if !printable || value.chars().count() > max_chars {
+        return Err(FleetStoreError::Invalid(format!(
+            "{what} must be printable {} no longer than {max_chars} characters",
+            if multiline {
+                "text"
+            } else {
+                "single-line text"
+            }
+        )));
+    }
+    Ok(())
+}
 
 /// The directory name used by both roots (next to `agents/` for legacy
 /// profiles). Also used by the workflow crate for its own legacy/exact files;
@@ -286,6 +316,7 @@ impl FleetFile {
                 "fleet name must not be empty".to_string(),
             ));
         }
+        validate_text("fleet name", name, MAX_FLEET_NAME_CHARS, false)?;
         let mut seen: BTreeMap<String, String> = BTreeMap::new();
         for member in &self.members {
             let member_id = member.id.trim();
@@ -293,6 +324,56 @@ impl FleetFile {
                 return Err(FleetStoreError::Invalid(
                     "member id must not be empty".to_string(),
                 ));
+            }
+            // The id is dispatch identity: exact, not merely equal once trimmed.
+            if member_id != member.id {
+                return Err(FleetStoreError::Invalid(format!(
+                    "member id {:?} must not carry leading or trailing whitespace",
+                    member.id
+                )));
+            }
+            validate_text("member id", member_id, MAX_MEMBER_ID_CHARS, false)?;
+            let fields = [
+                (
+                    "role",
+                    Some(member.role.as_str()),
+                    MAX_MEMBER_ROLE_CHARS,
+                    false,
+                ),
+                (
+                    "provider",
+                    member.provider.as_deref(),
+                    MAX_ROUTE_FIELD_CHARS,
+                    false,
+                ),
+                (
+                    "model",
+                    member.model.as_deref(),
+                    MAX_ROUTE_FIELD_CHARS,
+                    false,
+                ),
+                (
+                    "reasoning",
+                    member.reasoning.as_deref(),
+                    MAX_ROUTE_FIELD_CHARS,
+                    false,
+                ),
+                (
+                    "instructions",
+                    member.instructions.as_deref(),
+                    MAX_MEMBER_INSTRUCTIONS_CHARS,
+                    true,
+                ),
+            ];
+            for (field, value, max_chars, multiline) in fields {
+                if let Some(value) = value {
+                    validate_text(
+                        &format!("member `{member_id}` {field}"),
+                        value,
+                        max_chars,
+                        multiline,
+                    )?;
+                }
             }
             let member_key = member_id.to_ascii_lowercase();
             if let Some(existing) = seen.insert(member_key, member.id.clone()) {
@@ -1248,6 +1329,33 @@ mod tests {
             err.to_string().contains("one trimmed printable line"),
             "{err}"
         );
+
+        // Identity and route values are bounded and control-free too; only
+        // the instruction overlay may span lines.
+        let mut fleet = sample_fleet();
+        fleet.members[0].id = "scout\u{1b}[2J".to_string();
+        let err = fleet.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("member id must be printable"),
+            "{err}"
+        );
+        let mut fleet = sample_fleet();
+        fleet.members[0].id = "x".repeat(MAX_MEMBER_ID_CHARS + 1);
+        assert!(fleet.validate().is_err());
+        let mut fleet = sample_fleet();
+        fleet.members[0].id = format!("{} ", fleet.members[0].id);
+        assert!(
+            fleet.validate().is_err(),
+            "an untrimmed id is not its trimmed twin"
+        );
+        let mut fleet = sample_fleet();
+        fleet.name = "Team\u{7}".to_string();
+        assert!(fleet.validate().is_err());
+        let mut fleet = sample_fleet();
+        fleet.members[0].instructions = Some("line one\nline two\ttabbed".to_string());
+        fleet.validate().expect("instructions may span lines");
+        fleet.members[0].instructions = Some("x".repeat(MAX_MEMBER_INSTRUCTIONS_CHARS + 1));
+        assert!(fleet.validate().is_err());
 
         // Lone provider / lone model: never silently reinterpreted.
         let mut fleet = sample_fleet();

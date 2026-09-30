@@ -11730,6 +11730,216 @@ async fn live_goal_progress_is_revision_fenced_and_settled_once() -> Result<()> 
 }
 
 #[tokio::test]
+async fn startup_discards_an_unpublished_partial_seed_and_keeps_a_committed_one() -> Result<()> {
+    let runtime_dir = test_runtime_dir();
+    let manager = test_manager(runtime_dir.clone())?;
+    let messages: Vec<Message> = serde_json::from_value(json!([
+        {"role":"user","content":[{"type":"text","text":"SEEDED"}]},
+        {"role":"assistant","content":[{"type":"text","text":"SEEDED ANSWER"}]}
+    ]))?;
+    let mut fixtures = Vec::new();
+    for _ in 0..2 {
+        let thread = manager
+            .create_thread(CreateThreadRequest::default())
+            .await?;
+        manager
+            .seed_thread_from_messages(&thread.id, &messages)
+            .await?;
+        assert!(
+            !manager.store.seed_journal_path(&thread.id)?.exists(),
+            "a committed seed leaves no journal"
+        );
+        let turns = manager.store.list_turns_for_thread(&thread.id)?;
+        assert_eq!(turns.len(), 1);
+        let items = manager.store.list_items_for_turn(&turns[0].id)?;
+        assert_eq!(items.len(), 2);
+        // Fault fixture: the journal the seed wrote before its first record.
+        manager.store.save_seed_journal(&SeedJournal {
+            thread_id: thread.id.clone(),
+            previous_latest_turn_id: None,
+            turn_ids: turns.iter().map(|turn| turn.id.clone()).collect(),
+            item_ids: items.iter().map(|item| item.id.clone()).collect(),
+        })?;
+        fixtures.push((thread.id, turns, items));
+    }
+    // The first thread crashed before its commit record: every turn and item
+    // is on disk, but the thread pointer never advanced.
+    let (partial_id, partial_turns, partial_items) = &fixtures[0];
+    let mut uncommitted = manager.store.load_thread(partial_id)?;
+    uncommitted.latest_turn_id = None;
+    manager.store.save_thread(&uncommitted)?;
+    drop(manager);
+
+    let reopened = test_manager(runtime_dir)?;
+    assert!(
+        reopened.store.list_turns_for_thread(partial_id)?.is_empty(),
+        "an unpublished partial seed must not be restored as history"
+    );
+    for item in partial_items {
+        assert!(!reopened.store.item_path(&item.id)?.exists());
+    }
+    assert!(!reopened.store.turn_path(&partial_turns[0].id)?.exists());
+    assert_eq!(reopened.store.load_thread(partial_id)?.latest_turn_id, None);
+    assert!(!reopened.store.seed_journal_path(partial_id)?.exists());
+
+    // The second crashed after its commit, before removing the journal.
+    let (committed_id, committed_turns, _) = &fixtures[1];
+    assert_eq!(
+        reopened.store.list_turns_for_thread(committed_id)?.len(),
+        1,
+        "a committed seed survives recovery"
+    );
+    assert_eq!(
+        reopened.store.load_thread(committed_id)?.latest_turn_id,
+        Some(committed_turns[0].id.clone())
+    );
+    assert!(!reopened.store.seed_journal_path(committed_id)?.exists());
+    Ok(())
+}
+
+#[tokio::test]
+async fn startup_refuses_uncertain_seed_journals_without_publishing_partial_history() -> Result<()>
+{
+    for failure in [
+        "unreadable-journal",
+        "wrong-thread",
+        "unreadable-thread",
+        "wrong-commit",
+    ] {
+        let runtime_dir = test_runtime_dir();
+        let manager = test_manager(runtime_dir.clone())?;
+        let messages: Vec<Message> = serde_json::from_value(json!([
+            {"role":"user","content":[{"type":"text","text":"seed recovery canary"}]}
+        ]))?;
+        let thread = manager
+            .create_thread(CreateThreadRequest::default())
+            .await?;
+        manager
+            .seed_thread_from_messages(&thread.id, &messages)
+            .await?;
+        let turns = manager.store.list_turns_for_thread(&thread.id)?;
+        let items = manager.store.list_items_for_turn(&turns[0].id)?;
+        let mut uncommitted = manager.store.load_thread(&thread.id)?;
+        uncommitted.latest_turn_id = None;
+        manager.store.save_thread(&uncommitted)?;
+        let journal = SeedJournal {
+            thread_id: thread.id.clone(),
+            previous_latest_turn_id: None,
+            turn_ids: turns.iter().map(|turn| turn.id.clone()).collect(),
+            item_ids: items.iter().map(|item| item.id.clone()).collect(),
+        };
+        manager.store.save_seed_journal(&journal)?;
+        let journal_path = manager.store.seed_journal_path(&thread.id)?;
+        let thread_path = manager.store.thread_path(&thread.id)?;
+        match failure {
+            "unreadable-journal" => fs::write(&journal_path, b"{truncated seed intent")?,
+            "wrong-thread" => {
+                let mut wrong = serde_json::to_value(&journal)?;
+                wrong["thread_id"] = json!("another-thread");
+                fs::write(&journal_path, serde_json::to_vec(&wrong)?)?;
+            }
+            "unreadable-thread" => fs::write(&thread_path, b"{truncated thread")?,
+            "wrong-commit" => {
+                uncommitted.latest_turn_id = Some("unrelated-turn".into());
+                manager.store.save_thread(&uncommitted)?;
+            }
+            _ => unreachable!(),
+        }
+        let mut paths = vec![journal_path, thread_path];
+        for turn in &turns {
+            paths.push(manager.store.turn_path(&turn.id)?);
+        }
+        for item in &items {
+            paths.push(manager.store.item_path(&item.id)?);
+        }
+        let original = paths
+            .iter()
+            .map(fs::read)
+            .collect::<std::io::Result<Vec<_>>>()?;
+        drop(manager);
+        let error = test_manager(runtime_dir)
+            .err()
+            .expect("uncertain seed must refuse startup");
+        assert!(
+            format!("{error:#}").contains("seed"),
+            "{failure}: {error:#}"
+        );
+        for (path, bytes) in paths.iter().zip(original) {
+            assert_eq!(
+                fs::read(path)?,
+                bytes,
+                "{failure}: retain {}",
+                path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn seed_cleanup_validates_every_record_before_removing_anything() -> Result<()> {
+    for foreign in ["turn", "item"] {
+        let manager = test_manager(test_runtime_dir())?;
+        let messages: Vec<Message> = serde_json::from_value(json!([
+            {"role":"user","content":[{"type":"text","text":"keep both histories"}]}
+        ]))?;
+        let mut histories = Vec::new();
+        for _ in 0..2 {
+            let thread = manager
+                .create_thread(CreateThreadRequest::default())
+                .await?;
+            manager
+                .seed_thread_from_messages(&thread.id, &messages)
+                .await?;
+            let turns = manager.store.list_turns_for_thread(&thread.id)?;
+            let items = manager.store.list_items_for_turn(&turns[0].id)?;
+            histories.push((thread, turns, items));
+        }
+        let (thread, turns, items) = &histories[0];
+        let mut journal = SeedJournal {
+            thread_id: thread.id.clone(),
+            previous_latest_turn_id: None,
+            turn_ids: turns.iter().map(|turn| turn.id.clone()).collect(),
+            item_ids: items.iter().map(|item| item.id.clone()).collect(),
+        };
+        if foreign == "turn" {
+            journal.turn_ids.push(histories[1].1[0].id.clone());
+        } else {
+            journal.item_ids.push(histories[1].2[0].id.clone());
+        }
+        manager.store.save_seed_journal(&journal)?;
+        let mut paths = vec![manager.store.seed_journal_path(&thread.id)?];
+        for (thread, turns, items) in &histories {
+            paths.push(manager.store.thread_path(&thread.id)?);
+            for turn in turns {
+                paths.push(manager.store.turn_path(&turn.id)?);
+            }
+            for item in items {
+                paths.push(manager.store.item_path(&item.id)?);
+            }
+        }
+        let original = paths
+            .iter()
+            .map(fs::read)
+            .collect::<std::io::Result<Vec<_>>>()?;
+        let error = manager
+            .store
+            .discard_seed(&journal)
+            .expect_err("foreign history is not cleanup ownership");
+        assert!(format!("{error:#}").contains("outside"), "{error:#}");
+        for (path, bytes) in paths.iter().zip(original) {
+            assert_eq!(
+                fs::read(path)?,
+                bytes,
+                "validate the whole set before removing {}",
+                path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn transition_goal_status_commits_only_the_read_revision() -> Result<()> {
     let manager = test_manager(test_runtime_dir())?;
     let thread = manager
@@ -11743,12 +11953,33 @@ async fn transition_goal_status_commits_only_the_read_revision() -> Result<()> {
         .transition_goal_status(
             &thread.id,
             "goal_a",
+            codewhale_protocol::ThreadGoalStatus::Active,
             codewhale_protocol::ThreadGoalStatus::Complete,
         )
         .await?
         .ok_or_else(|| anyhow::anyhow!("current revision must commit"))?;
     assert_eq!(
         completed.status,
+        codewhale_protocol::ThreadGoalStatus::Complete
+    );
+
+    // A Blocked transition decided from the earlier Active read races the
+    // Complete above; the terminal state must survive it.
+    let raced = manager
+        .transition_goal_status(
+            &thread.id,
+            "goal_a",
+            codewhale_protocol::ThreadGoalStatus::Active,
+            codewhale_protocol::ThreadGoalStatus::Blocked,
+        )
+        .await?;
+    assert!(raced.is_none(), "a stale status read must not commit");
+    assert_eq!(
+        manager
+            .store
+            .load_goal(&thread.id)?
+            .ok_or_else(|| anyhow::anyhow!("goal record missing"))?
+            .status,
         codewhale_protocol::ThreadGoalStatus::Complete
     );
 
@@ -11760,6 +11991,7 @@ async fn transition_goal_status_commits_only_the_read_revision() -> Result<()> {
         .transition_goal_status(
             &thread.id,
             "goal_a",
+            codewhale_protocol::ThreadGoalStatus::Active,
             codewhale_protocol::ThreadGoalStatus::Blocked,
         )
         .await?;

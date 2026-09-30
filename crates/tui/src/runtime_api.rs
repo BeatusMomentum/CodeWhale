@@ -7163,6 +7163,7 @@ async fn complete_thread_goal(
         .transition_goal_status(
             &id,
             &goal.goal_id,
+            goal.status.clone(),
             codewhale_protocol::ThreadGoalStatus::Complete,
         )
         .await
@@ -7215,6 +7216,7 @@ async fn block_thread_goal(
         .transition_goal_status(
             &id,
             &goal.goal_id,
+            goal.status.clone(),
             codewhale_protocol::ThreadGoalStatus::Blocked,
         )
         .await

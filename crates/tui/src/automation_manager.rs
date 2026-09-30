@@ -2222,6 +2222,22 @@ where
     Ok(run)
 }
 
+/// Run one of the scheduler's whole-store scans (every automation or run
+/// record read and parsed) on the blocking pool (#6149), holding the manager
+/// lock exactly as the inline call did. Known limit: the per-record claim,
+/// recovery, and receipt writes between scans still run inline; each touches
+/// one small record under the store lock.
+async fn with_manager_blocking<T, F>(automations: &SharedAutomationManager, scan: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce(&AutomationManager) -> Result<T> + Send + 'static,
+{
+    let manager = Arc::clone(automations).lock_owned().await;
+    tokio::task::spawn_blocking(move || scan(&manager))
+        .await
+        .context("automation store scan task failed")?
+}
+
 async fn scheduler_tick_shared(
     automations: &SharedAutomationManager,
     task_manager: &SharedTaskManager,
@@ -2255,7 +2271,8 @@ where
     };
     // Repair admitted work before collecting a new occurrence, including claims
     // whose definitions were edited/deleted or whose final enqueue save tore.
-    let pending = automations.lock().await.collect_pending_runs()?;
+    let pending =
+        with_manager_blocking(automations, AutomationManager::collect_pending_runs).await?;
     for run in pending.into_iter().filter(|run| {
         run.dispatch
             .as_ref()
@@ -2290,7 +2307,8 @@ where
         }
     }
     let now = Utc::now();
-    let due = automations.lock().await.collect_due_runs(now)?;
+    let due =
+        with_manager_blocking(automations, move |manager| manager.collect_due_runs(now)).await?;
     for (observed, proposed) in due {
         if !automations
             .lock()
@@ -2386,7 +2404,10 @@ where
         Err(error) => return Err(error).context("claim delayed-trigger dispatch"),
     };
     let now = Utc::now();
-    let candidates = automations.lock().await.collect_due_triggers(now)?;
+    let candidates = with_manager_blocking(automations, move |manager| {
+        manager.collect_due_triggers(now)
+    })
+    .await?;
     for candidate in candidates {
         let scope = if candidate.status == DelayedTriggerStatus::Dispatching {
             candidate
@@ -2576,7 +2597,8 @@ async fn reconcile_run_statuses_shared(
         Err(error) if dispatch_lock_busy(&error) => return Ok(()),
         Err(error) => return Err(error).context("claim automation reconciliation"),
     };
-    let pending = automations.lock().await.collect_pending_runs()?;
+    let pending =
+        with_manager_blocking(automations, AutomationManager::collect_pending_runs).await?;
     for mut run in pending {
         // Shared storage is not shared ownership. A receipt admitted under
         // another execution scope is reconciled by that scope's owner; this
