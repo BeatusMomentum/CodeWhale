@@ -30,6 +30,7 @@ impl Fixture {
     fn command(&self) -> Command {
         let mut command = Command::new(codewhale_binary());
         command
+            .current_dir(&self.home)
             .env_clear()
             .env("PATH", std::env::var("PATH").unwrap_or_default())
             .env("HOME", &self.home)

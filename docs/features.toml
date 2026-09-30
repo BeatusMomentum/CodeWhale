@@ -298,7 +298,7 @@ owner = "crates/tui/src/cloud_dispatch.rs"
 [[feature]]
 id = "skills"
 name = "Skills"
-summary = "Installs, trusts and loads reusable instruction packages with owned-root precedence and independent user/model invocation controls."
+summary = "Installs and loads trusted instruction packages with owned-root precedence and separate user/model invocation controls."
 status = "stable"
 surfaces = { tui = "stable", api = "stable" }
 docs = "docs/SKILLS.md"
