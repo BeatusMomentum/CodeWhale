@@ -875,7 +875,7 @@ name = "codewhale-command-contract"
 version = "0.10.1"
 dependencies = [
  "chrono",
- "codewhale-core",
+ "codewhale-protocol",
  "serde",
  "serde_json",
 ]
@@ -1051,11 +1051,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "codewhale-portable-session-structcopy"
+name = "codewhale-portable-session"
 version = "0.10.1"
 dependencies = [
+ "chrono",
  "codewhale-command-contract",
- "codewhale-secrets",
+ "codewhale-sanitize",
  "serde_json",
  "unicode-segmentation",
  "url",
@@ -1113,22 +1114,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "codewhale-sanitize"
+version = "0.10.1"
+dependencies = [
+ "regex",
+ "serde_json",
+ "url",
+]
+
+[[package]]
 name = "codewhale-secrets"
 version = "0.10.1"
 dependencies = [
  "chrono",
  "codewhale-paths",
+ "codewhale-sanitize",
  "fd-lock",
  "keyring",
  "libc",
- "regex",
  "serde",
  "serde_json",
  "sha2 0.11.0",
  "tempfile",
  "thiserror 2.0.20",
  "tracing",
- "url",
 ]
 
 [[package]]
@@ -1211,6 +1220,7 @@ dependencies = [
  "codewhale-protocol",
  "codewhale-release",
  "codewhale-runtime",
+ "codewhale-sanitize",
  "codewhale-secrets",
  "codewhale-telemetry",
  "codewhale-tools",

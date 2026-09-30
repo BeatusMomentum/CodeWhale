@@ -1,8 +1,8 @@
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 
-use codewhale_core::request::{ContentBlock, Message, SystemPrompt};
-use codewhale_core::role::Role;
+use codewhale_protocol::request::{ContentBlock, Message, SystemPrompt};
+use codewhale_protocol::role::Role;
 
 use crate::*;
 

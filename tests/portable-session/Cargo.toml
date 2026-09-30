@@ -1,5 +1,5 @@
 [package]
-name = "codewhale-portable-session-structcopy"
+name = "codewhale-portable-session"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,8 +8,9 @@ repository.workspace = true
 publish = false
 
 [dependencies]
+chrono.workspace = true
 codewhale-command-contract = { path = "../../crates/command-contract", version = "0.10.1" }
-codewhale-secrets = { path = "../../crates/secrets", version = "0.10.1" }
+codewhale-sanitize = { path = "../../crates/sanitize", version = "0.10.1" }
 serde_json.workspace = true
 unicode-segmentation = "1.12"
 url = "2.5"

@@ -11,7 +11,7 @@
 //!   or authority, and it writes nothing back into App/session/plan/workflow
 //!   state (see the registry/catalog contract test).
 //! - Read-only projection over existing state. Redaction reuses the shared
-//!   sanitizer seams in `codewhale_secrets::sanitize` (`redact_json` for
+//!   sanitizer seams in `codewhale_sanitize::sanitize` (`redact_json` for
 //!   values, `sanitize_text` for keys and status labels, which
 //!   `redact_json` does not reach) plus a strict pass that strips URL
 //!   userinfo/query/fragment entirely and folds the workspace and home
@@ -46,7 +46,7 @@ use codewhale_command_contract::facets::*;
 use codewhale_command_contract::handler::{CommandCapabilities, CommandContexts, CommandHandler};
 use codewhale_command_contract::metadata::{CommandInfo, RegisterCommand};
 use codewhale_command_contract::outcome::StructcopyCommandResult as CommandResult;
-use codewhale_secrets::sanitize::{is_sensitive_key, redact_json, sanitize_text};
+use codewhale_sanitize::sanitize::{is_sensitive_key, redact_json, sanitize_text};
 
 pub(in crate::commands) const COMMAND_INFO: CommandInfo = CommandInfo {
     name: "structcopy",

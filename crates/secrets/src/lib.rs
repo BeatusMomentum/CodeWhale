@@ -11,20 +11,9 @@
 //! config crate so user-facing commands can keep `config -> secret store -> env`
 //! explicit at the call site.
 //!
-//! Sanitization: [`redact`] and [`sanitize`] are pure and carry no host types.
-//! They live here (FEAT-025 D4) because this is the lowest crate that both the
-//! config diagnostics path and the TUI already reach, so `/export`,
-//! `/structcopy`, client URL masking, and OSC8 stripping share exactly one
-//! implementation instead of drifting copies. `config::persistence` and
-//! `tui::client` / `tui::osc8` re-export or delegate to these functions.
-//!
-//! Note for the command extraction (EPIC-006): this crate is already reachable
-//! from `codewhale-command-contract` transitively via
-//! `core -> config -> secrets`, so consuming the sanitizer from the future
-//! `codewhale-commands` crate adds no new dependency edge. It does mean the
-//! sanitizer inherits this crate's OS keyring dependencies; if the surface grows
-//! beyond redaction, split a dedicated `codewhale-sanitize` crate rather than
-//! widening this one.
+//! Pure sanitization is implemented in `codewhale-sanitize`. The re-exports
+//! here preserve existing storage consumers' public paths; portable callers
+//! depend directly on that leaf crate and do not inherit credential backends.
 #![deny(missing_docs)]
 
 /// Shared secure-storage contract for the Codewhale account session.
@@ -34,10 +23,10 @@ mod file_lock;
 mod file_transactions_tests;
 /// Pure secret-redaction primitives shared by config diagnostics and the
 /// portable command sanitizer (FEAT-025 D4).
-pub mod redact;
+pub use codewhale_sanitize::redact;
 /// Pure text/URL/ANSI output sanitization shared by the portable command
 /// helpers (FEAT-025 D4).
-pub mod sanitize;
+pub use codewhale_sanitize::sanitize;
 
 use std::collections::HashMap;
 use std::fs;

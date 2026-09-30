@@ -20,7 +20,7 @@ mod diagnostics_tools;
 pub use diagnostics_report::*;
 pub use diagnostics_tools::*;
 
-use codewhale_core::request::{Message, SystemPrompt};
+use codewhale_protocol::request::{Message, SystemPrompt};
 use serde_json::Value;
 
 use crate::types::{CommandApprovalMode, CommandCurrency, CommandMode, CommandProviderId};

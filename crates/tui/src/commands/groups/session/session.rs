@@ -1,7 +1,7 @@
 //! Shared session lifecycle implementation (FEAT-023).
 //!
 //! The nine lifecycle commands' concrete host work moved into the
-//! `SessionLifecycleAdapter` in `crate::commands::contract` (FEAT-023 Phase 3)
+//! `SessionLifecycleAdapter` in the host command contract module (FEAT-023 Phase 3)
 //! and the portable handlers own all parsing/message/action composition
 //! (Phase 4). Dispatch switched to the contract registrations in Phase 6, so
 //! no lifecycle body remains here. Shared host helpers used by the still

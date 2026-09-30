@@ -83,6 +83,7 @@ mod debug_change_host_tests;
 mod debug_group;
 #[cfg(test)]
 mod debug_mutation_host_tests;
+mod session_group;
 
 use crate::tui::app::{App, AppAction};
 use codewhale_config::AppMode;

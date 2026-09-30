@@ -15,7 +15,7 @@ use codewhale_command_contract::metadata::{
     CommandInfo as ContractInfo, RegisterCommand as ContractRegisterCommand,
 };
 
-use crate::tui::app::AppAction;
+use codewhale_command_contract::outcome::SessionAction;
 
 pub(in crate::commands) const CONTRACT_INFO: ContractInfo = ContractInfo {
     name: "compact",
@@ -44,13 +44,13 @@ pub(in crate::commands) fn compact_pure(arg: Option<&str>) -> CommandResult {
         Some(focus) => format!("Making room (focus: {focus})…"),
         None => "Making room…".to_string(),
     };
-    CommandResult::with_message_and_action(receipt, AppAction::CompactContext { focus })
+    CommandResult::with_message_and_action(receipt, SessionAction::CompactContext { focus })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tui::app::AppAction;
+    use codewhale_command_contract::outcome::SessionAction;
 
     #[test]
     fn pure_compact_matches_baseline_receipts() {
@@ -58,14 +58,14 @@ mod tests {
         assert_eq!(none.message.as_deref(), Some("Making room…"));
         assert!(matches!(
             none.action,
-            Some(AppAction::CompactContext { focus: None })
+            Some(SessionAction::CompactContext { focus: None })
         ));
         assert!(!none.is_error);
 
         let blank = compact_pure(Some("   "));
         assert!(matches!(
             blank.action,
-            Some(AppAction::CompactContext { focus: None })
+            Some(SessionAction::CompactContext { focus: None })
         ));
 
         let focus = compact_pure(Some("  the auth refactor  "));
@@ -75,7 +75,7 @@ mod tests {
         );
         assert!(matches!(
             focus.action,
-            Some(AppAction::CompactContext { focus: Some(ref f) }) if f == "the auth refactor"
+            Some(SessionAction::CompactContext { focus: Some(ref f) }) if f == "the auth refactor"
         ));
     }
 }

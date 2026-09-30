@@ -3,11 +3,10 @@
 //! workflow/session scope, plan locking and safe structured-image projection.
 
 use super::SharedCommandHost;
+#[cfg(test)]
 use crate::commands::CommandResult as HostResult;
-use crate::commands::groups::session::structcopy;
 use codewhale_command_contract::facets::*;
-use codewhale_command_contract::handler::CommandHandler;
-use codewhale_command_contract::metadata::{CommandInfo, RegisterCommand};
+#[cfg(test)]
 use codewhale_command_contract::outcome::StructcopyCommandResult;
 use codewhale_models::ContentBlock;
 use codewhale_secrets::sanitize::is_internal_role;
@@ -202,19 +201,7 @@ fn project_block(block: &ContentBlock) -> StructcopyBlock {
     }
 }
 
-pub(in crate::commands) struct StructcopyRegistration;
-impl RegisterCommand<HostResult> for StructcopyRegistration {
-    fn info() -> &'static CommandInfo {
-        structcopy::StructcopyCmd::info()
-    }
-    fn handler() -> CommandHandler<HostResult> {
-        CommandHandler::Contextual {
-            capabilities: structcopy::CAPABILITIES,
-            handler: |contexts, args| host_result(structcopy::execute_structcopy(contexts, args)),
-        }
-    }
-}
-
+#[cfg(test)]
 pub(in crate::commands) fn host_result(result: StructcopyCommandResult) -> HostResult {
     HostResult {
         message: result.message,

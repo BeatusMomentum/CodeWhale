@@ -287,7 +287,7 @@ fn baseline_observations() -> Value {
         "name":info.name,"aliases":info.aliases,"usage":info.usage,
         "description_en":tr(Locale::En,info.description_id),
         "description_zh_hans":tr(Locale::ZhHans,info.description_id),
-        "session_order":super::groups::session::SessionCommands.commands().iter().map(|c|c.info().name).collect::<Vec<_>>(),
+        "session_order":super::session_group::SessionCommands.commands().iter().map(|c|c.info().name).collect::<Vec<_>>(),
         "native_model_tool":crate::core::engine::default_active_native_tool_names().contains(&"structcopy"),
     }));
     Value::Object(captures)
@@ -312,7 +312,7 @@ fn structcopy_public_workflow_matches_frozen_baseline() {
 
 #[test]
 fn structcopy_host_exposes_exact_authority_and_filters_private_data_before_crossing() {
-    use super::contract::structcopy_host::StructcopyRegistration;
+    use super::groups::session::StructcopyRegistration;
     use codewhale_command_contract::facets::*;
     use codewhale_command_contract::handler::{CommandCapabilities, CommandHandler, ContextParts};
     use codewhale_command_contract::metadata::RegisterCommand;
