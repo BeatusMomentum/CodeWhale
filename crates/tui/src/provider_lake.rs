@@ -1026,15 +1026,16 @@ fn exact_custom_offerings(provider_identity: &str) -> Vec<CatalogOffering> {
         .unwrap_or_default()
 }
 
+/// Wire model ids are opaque and case-sensitive (`org/Model-A` and
+/// `org/model-a` may be two models), so dedup compares them exactly; folding
+/// case here would hide a real row. Only lookup forgives a case slip, and only
+/// when it is unambiguous (see `find_wire_model`).
 fn push_unique_model(models: &mut Vec<String>, model: &str) {
     let model = model.trim();
     if model.is_empty() {
         return;
     }
-    if !models
-        .iter()
-        .any(|existing| existing.eq_ignore_ascii_case(model))
-    {
+    if !models.iter().any(|existing| existing == model) {
         models.push(model.to_string());
     }
 }
@@ -1918,6 +1919,14 @@ mod tests {
         assert_eq!(found("org/Model-A").as_deref(), Some("org/Model-A"));
         assert_eq!(found("ORG/MODEL-A"), None, "two distinct ids fold together");
         assert_eq!(found("org/model-b").as_deref(), Some("org/Model-B"));
+
+        // Listing keeps both case variants: each is a distinct, pickable id.
+        let listed = catalog_models_from_offerings(rows.iter());
+        assert!(
+            listed.contains(&"org/Model-A".to_string())
+                && listed.contains(&"org/model-a".to_string()),
+            "case variants of a wire id are distinct models: {listed:?}"
+        );
     }
 
     fn catalog_test_config(first_url: &str, second_url: &str) -> Config {
