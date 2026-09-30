@@ -21,8 +21,12 @@ quieter, and Fleet runs can be checked before they spend anything.
 
 ### Security
 
-- Update development tooling to Undici 7.29.1 for
-  [GHSA-w293-vg96-wgc3](https://github.com/advisories/GHSA-w293-vg96-wgc3).
+- Update development tooling to Undici 7.29.1 or newer for
+  [GHSA-w293-vg96-wgc3](https://github.com/advisories/GHSA-w293-vg96-wgc3),
+  brace-expansion 1.1.21/5.0.12 for
+  [GHSA-q2hr-2g5m-vwhr](https://github.com/advisories/GHSA-q2hr-2g5m-vwhr),
+  and the VS Code extension's markdown-it to 14.3.2 for
+  [GHSA-253c-mchw-3w2r](https://github.com/advisories/GHSA-253c-mchw-3w2r).
 - Harden local runtime browser sessions, fleet SSH trust, agent continuation
   ownership, task gate approval, plugin tool registration, bridge action tokens,
   and release metadata credential forwarding. Browser sessions recover across
@@ -56,6 +60,14 @@ quieter, and Fleet runs can be checked before they spend anything.
 - A turn no longer stops after an hour of work. The cumulative per-turn wall
   clock is unlimited by default, like model steps; set
   `[tui].turn_wall_clock_secs` to cap it.
+- Stream limits and transport settings share a typed `[stream]` configuration
+  table, including retry budgets, TCP keepalive and HTTP/2 keepalive. Explicit
+  values take precedence over legacy `[tui]` aliases; omitted values preserve
+  existing defaults and environment behavior. A configured HTTP/1 pin stays
+  pinned during recovery. `/config stream_chunk_timeout_secs ... --save`
+  updates the canonical setting so it survives reopening a configuration
+  that already had a timeout. Transport changes apply when a client is built
+  ([#6700](https://github.com/Hmbown/Codewhale/issues/6700)).
 
 ### Contributors
 
