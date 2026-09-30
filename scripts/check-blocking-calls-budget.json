@@ -302,7 +302,7 @@
     "std_fs": 3
   },
   "crates/tui/src/prompts.rs": {
-    "std_fs": 3
+    "std_fs": 2
   },
   "crates/tui/src/provider_lake.rs": {
     "std_fs": 1

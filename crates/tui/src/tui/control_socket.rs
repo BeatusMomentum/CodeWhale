@@ -75,7 +75,6 @@ use std::io;
 #[cfg(unix)]
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-#[cfg(unix)]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
@@ -168,6 +167,20 @@ pub(crate) struct PendingCommand {
     pub(crate) id: String,
     pub(crate) command: ControlCommand,
     pub(crate) respond_to: mpsc::Sender<String>,
+    /// Set by whichever side acts first: the event loop about to execute the
+    /// verb, or the socket side giving up on it at the response timeout. A
+    /// verb the client was told timed out is therefore never executed later,
+    /// so retrying it cannot deliver a message twice or interrupt a later
+    /// turn.
+    claimed: Arc<AtomicBool>,
+}
+
+impl PendingCommand {
+    /// Claim the verb for execution. `false` means the client already gave
+    /// up on it (and was told so): drop it without running it.
+    pub(crate) fn claim(&self) -> bool {
+        !self.claimed.swap(true, Ordering::AcqRel)
+    }
 }
 
 #[cfg_attr(not(unix), allow(dead_code))]
@@ -400,6 +413,9 @@ impl SessionControl {
             return;
         }
         while let Ok(pending) = self.commands_rx.try_recv() {
+            if !pending.claim() {
+                continue;
+            }
             let response = execute_command(
                 app,
                 config,
@@ -772,11 +788,23 @@ fn dispatch_to_app(
     command: ControlCommand,
     commands_tx: &mpsc::Sender<PendingCommand>,
 ) -> String {
+    dispatch_to_app_within(id, command, commands_tx, DISPATCH_RESPONSE_TIMEOUT)
+}
+
+#[cfg(unix)]
+fn dispatch_to_app_within(
+    id: String,
+    command: ControlCommand,
+    commands_tx: &mpsc::Sender<PendingCommand>,
+    timeout: Duration,
+) -> String {
     let (respond_to, rx) = mpsc::channel();
+    let claimed = Arc::new(AtomicBool::new(false));
     if let Err(error) = commands_tx.send(PendingCommand {
         id: id.clone(),
         command,
         respond_to,
+        claimed: Arc::clone(&claimed),
     }) {
         return response_error(
             &id,
@@ -784,22 +812,31 @@ fn dispatch_to_app(
             format!("failed to dispatch request: {error}"),
         );
     }
-    match rx.recv_timeout(DISPATCH_RESPONSE_TIMEOUT) {
-        Ok(response) => response,
-        Err(mpsc::RecvTimeoutError::Timeout) => response_error(
-            &id,
-            "timeout",
-            format!(
-                "timed out waiting for the app to handle the request after {} ms",
-                DISPATCH_RESPONSE_TIMEOUT.as_millis()
-            ),
-        ),
-        Err(mpsc::RecvTimeoutError::Disconnected) => response_error(
+    let answer = match rx.recv_timeout(timeout) {
+        // Withdraw the verb unless the event loop already claimed it: a
+        // timeout reply must mean "not executed", or a retry duplicates it.
+        Err(mpsc::RecvTimeoutError::Timeout) if !claimed.swap(true, Ordering::AcqRel) => {
+            return response_error(
+                &id,
+                "timeout",
+                format!(
+                    "timed out waiting for the app to handle the request after {} ms; it was not executed",
+                    timeout.as_millis()
+                ),
+            );
+        }
+        // Claimed and executing: its answer (or the channel closing) is due.
+        Err(mpsc::RecvTimeoutError::Timeout) => rx.recv().map_err(|_| ()),
+        Ok(response) => Ok(response),
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err(()),
+    };
+    answer.unwrap_or_else(|()| {
+        response_error(
             &id,
             "server_unavailable",
             "request handling failed: app response channel closed".to_string(),
-        ),
-    }
+        )
+    })
 }
 
 /// One newline-terminated line, bounded. `Ok(None)` = EOF before any content.
@@ -1052,6 +1089,24 @@ mod tests {
         assert_eq!(value["id"], "1");
         assert_eq!(value["result"]["type"], "message_sent");
         assert_eq!(value["result"]["delivery"], "dispatched");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_timed_out_verb_is_never_executed_later() {
+        let (tx, rx) = mpsc::channel();
+        let response = dispatch_to_app_within(
+            "7".into(),
+            ControlCommand::Interrupt,
+            &tx,
+            Duration::from_millis(20),
+        );
+        let value: serde_json::Value = serde_json::from_str(&response).expect("response is json");
+        assert_eq!(value["error"]["code"], "timeout");
+        // The event loop reaches the queued verb only now: the client was
+        // told it timed out, so it must not run (a retry would duplicate it).
+        let pending = rx.try_recv().expect("verb stayed queued");
+        assert!(!pending.claim(), "a withdrawn verb must not execute");
     }
 
     #[cfg(unix)]

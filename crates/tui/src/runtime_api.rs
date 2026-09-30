@@ -9406,6 +9406,9 @@ struct SwitchProviderResponse {
 ///   are committed together through the canonical Config writer.
 /// - Config is reloaded from disk and synced to active engines via
 ///   `runtime_threads.reload_config`, exactly like `POST /v1/config/reload`.
+/// - A reload that fails or is rejected rolls the persisted selection back
+///   (only while the file still holds what this write left), so disk and the
+///   running config never disagree about the provider. The error says which.
 async fn switch_provider(
     State(state): State<RuntimeApiState>,
     Path(id): Path<String>,

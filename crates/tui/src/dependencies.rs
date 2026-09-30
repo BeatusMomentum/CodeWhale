@@ -273,6 +273,13 @@ pub fn resolve_pandoc() -> Option<String> {
 /// a converter, an OCR engine) is available: `probe` decides, except that a
 /// conformance replay answers with the recorded host's set so goldens do not
 /// depend on what the machine running them has installed (test builds only).
+#[cfg_attr(
+    not(all(test, unix)),
+    expect(
+        unused_variables,
+        reason = "`tool` is read only by the test-build replay"
+    )
+)]
 pub(crate) fn host_tool_available(tool: &str, probe: impl FnOnce() -> bool) -> bool {
     #[cfg(all(test, unix))]
     if let Some(available) = RECORDED_HOST_TOOLS.with(|cell| {
@@ -980,7 +987,7 @@ impl Git {
 
     /// Git with fsmonitor, hooks, lazy fetch and replace objects disabled,
     /// running in `workspace`. [`Self::review_command`] adds filter overrides.
-    fn review_base(workspace: &Path) -> anyhow::Result<Command> {
+    pub(crate) fn review_base(workspace: &Path) -> anyhow::Result<Command> {
         use anyhow::Context;
 
         let mut command = Self::command().context("git not found on PATH")?;

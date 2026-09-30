@@ -615,8 +615,19 @@ pub(crate) fn message_has_tool_use(message: &Message) -> bool {
         .any(|block| matches!(block, ContentBlock::ToolUse { .. }))
 }
 
+/// Conservative text estimate: three characters per token, but never below
+/// the bytes/4 estimate the message path uses. Characters alone read
+/// multibyte (CJK) text at ~0.33 tokens each, *under* the byte estimate's
+/// ~0.75, which made the "conservative" figure the smaller one exactly where
+/// it matters.
+///
+/// Known limitation: both are heuristics, not a tokenizer. CJK costs roughly
+/// 0.6-1.5 tokens per character depending on the provider's tokenizer, so a
+/// CJK-heavy prompt can still be underestimated; the compaction trigger
+/// bounds that by taking the larger of this estimate and the provider-billed
+/// prompt size.
 pub(crate) fn estimate_text_tokens_conservative(text: &str) -> usize {
-    text.chars().count().div_ceil(3)
+    text.chars().count().div_ceil(3).max(text.len().div_ceil(4))
 }
 
 fn estimate_system_tokens_conservative(system: Option<&SystemPrompt>) -> usize {
@@ -3799,6 +3810,14 @@ mod tests {
         }];
         let tokens = estimate_tokens(&messages);
         assert!(tokens > 0 && tokens < 10);
+    }
+
+    #[test]
+    fn conservative_estimate_never_reads_cjk_below_the_byte_estimate() {
+        let cjk = "中".repeat(1200); // 3,600 UTF-8 bytes
+        assert!(estimate_text_tokens_conservative(&cjk) >= cjk.len() / 4);
+        // ASCII keeps its three-characters-per-token reading.
+        assert_eq!(estimate_text_tokens_conservative(&"a".repeat(300)), 100);
     }
 
     #[test]

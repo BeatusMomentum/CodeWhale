@@ -13,8 +13,11 @@
 //! - `ask` force-prompts only in Ask posture. Auto-Review, Full Access, and
 //!   Never never open tool-approval prompts, so the same law fails closed
 //!   there. `block` denies outright in every posture.
-//! - Any failure (missing file, parse error, bad glob) degrades to fewer or
-//!   zero rules — never a poisoned gate, never a hold on unprotected paths.
+//! - No constitution (or an empty one) means no holds. A constitution that
+//!   exists but cannot be read or parsed, or an enforced invariant whose glob
+//!   does not compile, holds every write (`ask`) naming the problem: the law
+//!   the file meant to state is unknown, and enforcing less than it says
+//!   would fail open. Fixing the file releases the hold.
 //! - Only the repo-local constitution participates. The user-global
 //!   constitution stays advisory prose and never reaches this module.
 
@@ -56,7 +59,14 @@ pub(crate) fn repo_law_plan_decision(
     if targets.is_empty() {
         return None;
     }
-    let rules = load_repo_law_rules(workspace);
+    let rules = match load_repo_law_rules(workspace) {
+        Ok(rules) => rules,
+        Err(problem) => {
+            return Some(RepoLawPlanDecision::ForcePrompt(format!(
+                "Repo law holds every write until .codewhale/constitution.json is fixed: {problem}"
+            )));
+        }
+    };
     if rules.is_empty() {
         return None;
     }
@@ -428,29 +438,36 @@ mod tests {
     }
 
     #[test]
-    fn malformed_law_and_bad_globs_degrade_to_no_holds() {
+    fn malformed_law_and_bad_globs_hold_every_write() {
         let tmp = TempDir::new().unwrap();
+        let write = json!({"path": "src/unrelated.rs", "content": "x"});
         write_law(tmp.path(), "{ not json");
-        assert_eq!(
-            repo_law_plan_decision(
-                tmp.path(),
-                "write_file",
-                &json!({"path": "crates/protocol/wire.rs", "content": "x"}),
-            ),
-            None
-        );
+        let Some(RepoLawPlanDecision::ForcePrompt(reason)) =
+            repo_law_plan_decision(tmp.path(), "write_file", &write)
+        else {
+            panic!("an unparseable constitution must hold writes");
+        };
+        assert!(reason.contains("constitution.json"), "{reason}");
         write_law(
             tmp.path(),
             r#"{"protected_invariants": [
                 { "text": "broken glob", "paths": ["crates/[invalid"] }
             ]}"#,
         );
+        let Some(RepoLawPlanDecision::ForcePrompt(reason)) =
+            repo_law_plan_decision(tmp.path(), "write_file", &write)
+        else {
+            panic!("an invariant whose glob does not compile must hold writes");
+        };
+        assert!(reason.contains("crates/[invalid"), "{reason}");
+        // Non-write tools stay unaffected, and an empty file is no law.
         assert_eq!(
-            repo_law_plan_decision(
-                tmp.path(),
-                "write_file",
-                &json!({"path": "crates/protocol/wire.rs", "content": "x"}),
-            ),
+            repo_law_plan_decision(tmp.path(), "read_file", &json!({"path": "a.rs"})),
+            None
+        );
+        write_law(tmp.path(), "  \n");
+        assert_eq!(
+            repo_law_plan_decision(tmp.path(), "write_file", &write),
             None
         );
     }

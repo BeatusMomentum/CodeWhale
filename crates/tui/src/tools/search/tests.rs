@@ -57,6 +57,21 @@ async fn grep_refuses_mistyped_optional_parameters_by_name() {
         .expect("explicit nulls read as absent");
 }
 
+/// The model supplies the pattern, so it compiles through the bounded
+/// regex cache: an over-long pattern is refused, not compiled.
+#[tokio::test]
+async fn grep_refuses_a_pattern_past_the_user_regex_length_cap() {
+    let tmp = tempdir().expect("tempdir");
+    fs::write(tmp.path().join("a.txt"), "needle\n").expect("write");
+    let ctx = ToolContext::new(tmp.path());
+    let long = "a".repeat(crate::regex_cache::MAX_USER_REGEX_PATTERN_BYTES + 1);
+    let err = GrepFilesTool
+        .execute(json!({ "pattern": long }), &ctx)
+        .await
+        .expect_err("an over-long pattern must be refused");
+    assert!(err.to_string().contains("limit"), "{err}");
+}
+
 #[test]
 fn test_matches_glob_star() {
     assert!(matches_glob("test.rs", "*.rs"));

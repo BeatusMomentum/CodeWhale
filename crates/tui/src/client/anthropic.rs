@@ -2421,7 +2421,7 @@ mod tests {
             .and(path("/v1/messages"))
             .respond_with(
                 ResponseTemplate::new(429)
-                    .insert_header("retry-after", "0")
+                    .insert_header("retry-after", "1")
                     .set_body_string(
                         "{\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"slow down\"}}",
                     ),
@@ -2446,6 +2446,7 @@ mod tests {
         client.retry.max_retries = 2;
         client.retry.initial_delay = 0.0;
         client.retry.max_delay = 0.0;
+        let started = std::time::Instant::now();
         let stream = client
             .handle_anthropic_stream(
                 &client
@@ -2456,6 +2457,13 @@ mod tests {
         assert!(
             stream.is_ok(),
             "a 429 before the stream body must be retried, not surfaced"
+        );
+        // The backoff is configured to zero, so only the provider's
+        // `Retry-After: 1` can account for the wait before the retry.
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(900),
+            "the retry must wait out Retry-After, waited {:?}",
+            started.elapsed()
         );
     }
 
