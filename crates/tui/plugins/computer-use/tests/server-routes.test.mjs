@@ -398,3 +398,16 @@ for (const mode of ["backend", "reply", "connection"]) {
     });
   }
 }
+
+test("register and spawn never replace a desktop another session spawned", async t => {
+  const f = fixture(t, null, null);
+  const file = path.join(f.dir, "computers.json");
+  const owned = { id: "desk", transport: "docker", label: "desk", container: "cu-spawn-desk-ab12cd", image: "codewhale-cu-linux", platform: "linux", owned: true, spawnedBy: "another-session", registeredAt: new Date().toISOString() };
+  writeJsonAtomic(file, { version: 1, active: "local", computers: { desk: owned } });
+  for (const [name, args] of [["computer_register", { computer: "desk", transport: "hdc", target: "B" }], ["computer_spawn", { computer: "desk", transport: "docker" }]]) {
+    const result = await f.tool(name, args);
+    assert.equal(result.ok, false, JSON.stringify(result));
+    assert.equal(result.error.code, "computer_owned_elsewhere");
+    assert.deepEqual(JSON.parse(fs.readFileSync(file)).computers.desk, owned, `${name} must leave the owning session's entry intact`);
+  }
+});
