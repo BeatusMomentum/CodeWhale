@@ -15,8 +15,8 @@ D9 describe the old behaviour. In `crates/tui/src/tools/plugin.rs` and
 `ToolRegistry::apply_overrides`: a script's `# approval: auto` is ignored and
 the tool gets the default a script with no `approval:` line gets (`Suggest`),
 reported in the runtime log and `/plugin tools`; a `[tools.overrides]`
-`script` / `command` entry keyed by a built-in is refused with a logged error
-and the built-in stays active (`disabled` still works). D9(a) planned
+`script` / `command` entry keyed by a built-in is refused, named once in a
+status line and in the runtime log, and the built-in stays active (`disabled` still works). D9(a) planned
 `Required`, rememberable per tool: `Suggest` and `Required` resolve the same
 way in `resolve_tool_permission`, and per-tool remembering was not built.
 

@@ -7768,7 +7768,7 @@ fn configure_plugin_tools_applies_overrides_after_discovered_plugins() {
         .build(ctx);
     let file = registry.get("File").expect("built-in File");
 
-    let plugin_names = configure_plugin_tools(&mut registry, Some(&tools_config));
+    let (plugin_names, refused) = configure_plugin_tools(&mut registry, Some(&tools_config));
 
     let tool = registry.get("same_tool").expect("same_tool registered");
     assert!(tool.description().contains("configured-command"));
@@ -7778,6 +7778,11 @@ fn configure_plugin_tools_applies_overrides_after_discovered_plugins() {
         &file
     ));
     assert!(!plugin_names.contains("File"));
+    // The refusal reaches the engine so it can name it to the user.
+    assert_eq!(refused, vec!["File".to_string()]);
+    assert!(
+        crate::tools::registry::override_refusal_notice("File").contains("[tools.overrides.File]")
+    );
 }
 
 fn make_plan(

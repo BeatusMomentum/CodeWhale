@@ -38,6 +38,15 @@ pub struct ToolRegistry {
     api_cache: OnceLock<Vec<Tool>>,
 }
 
+/// The one sentence naming a `[tools.overrides]` entry that D4 refused, shared
+/// by the runtime log and the engine's user-facing status line.
+pub(crate) fn override_refusal_notice(tool_name: &str) -> String {
+    format!(
+        "Refused [tools.overrides.{name}]: a script or command override cannot replace the built-in tool '{name}', which stays active. Set type = \"disabled\" to turn it off, or key the override by a new tool name.",
+        name = crate::safe_label::SafeLabel::identifier(tool_name)
+    )
+}
+
 impl ToolRegistry {
     /// Create a new empty registry with the given context.
     #[must_use]
@@ -375,9 +384,10 @@ impl ToolRegistry {
     ///   the built-in stays active: script tools cannot shadow built-ins (D4,
     ///   CURRENT_DECISIONS §26).
     ///
-    /// Known limitation: like a drop-in name collision in [`Self::load_plugins`],
-    /// the refusal is an error in the runtime log only. `/plugin` does not list
-    /// `[tools.overrides]` entries, so it cannot show the refusal there.
+    /// Returns the refused override names so the engine can name each one to
+    /// the user ([`override_refusal_notice`]); the runtime log records every
+    /// refusal. `/plugin` does not list `[tools.overrides]` entries, so it
+    /// cannot show them there.
     ///
     /// `plugin_dir` is used as the base for relative script paths.
     pub fn apply_overrides(
@@ -385,7 +395,8 @@ impl ToolRegistry {
         overrides: &std::collections::HashMap<String, crate::config::ToolOverride>,
         plugin_dir: &Path,
         builtin_names: &std::collections::HashSet<String>,
-    ) {
+    ) -> Vec<String> {
+        let mut refused = Vec::new();
         for (tool_name, override_cfg) in overrides {
             match override_cfg {
                 crate::config::ToolOverride::Disabled => {
@@ -396,10 +407,8 @@ impl ToolRegistry {
                     }
                 }
                 _ if builtin_names.contains(tool_name) => {
-                    tracing::error!(
-                        "Refusing [tools.overrides.{name}]: a script or command override cannot replace the built-in tool '{name}', which stays active; set type = \"disabled\" to turn it off, or key the override by a new tool name",
-                        name = crate::safe_label::SafeLabel::identifier(tool_name)
-                    );
+                    tracing::error!("{}", override_refusal_notice(tool_name));
+                    refused.push(tool_name.clone());
                 }
                 _ => {
                     // Script and Command overrides create replacement tools.
@@ -426,6 +435,7 @@ impl ToolRegistry {
                 }
             }
         }
+        refused
     }
 
     /// Load and register plugin tools from a directory.

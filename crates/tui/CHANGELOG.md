@@ -15,8 +15,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the session's approval setting like a script with no `approval:` line, and
   the runtime log and `/plugin tools` name each script that still declares it.
   A `[tools.overrides]` entry of `type = "script"` or `type = "command"` keyed
-  by a built-in tool name is refused with an error in the runtime log naming
-  the key, and the built-in stays active. `type = "disabled"` still turns a
+  by a built-in tool name is refused, and the built-in stays active; a status
+  line names the key once per session, and the runtime log records it. `type = "disabled"` still turns a
   built-in off, and script or command overrides under a new name still work.
   To keep a wrapper such as an audited shell, disable the built-in and give
   the wrapper its own name

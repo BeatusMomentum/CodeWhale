@@ -3091,8 +3091,9 @@ or add a script or command tool under a name of its own:
 "Bash" = { type = "script", path = "audit-shell.sh" }           # refused: Bash is built in
 ```
 
-A `script` or `command` override keyed by a built-in is refused with an error
-in the runtime log naming the key, and the built-in stays active. To route a
+A `script` or `command` override keyed by a built-in is refused, and the
+built-in stays active. A status line names the key once per session, and the
+runtime log records it. To route a
 built-in through your own wrapper, disable the built-in and register the
 wrapper under a new name. An override keyed by a drop-in script's name still
 replaces that script. Relative `path` values resolve against the plugin
