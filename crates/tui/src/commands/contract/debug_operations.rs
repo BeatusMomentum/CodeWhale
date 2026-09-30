@@ -111,77 +111,24 @@ impl CommandDebugDiffContext for DebugOperationsAdapter<'_> {
     }
 }
 
-/// Remove last message pair (user + assistant).
-///
-/// This is the old `/undo` behaviour — it removes the most recent
-/// user+assistant conversation pair from history and API messages.
-/// The new `/undo` first tries to revert workspace files via
-/// [`undo_files`]; if no snapshots are available it falls back to
-/// this function.
-pub(in crate::commands) fn undo_conversation(app: &mut App) -> usize {
-    // Remove from display history (up to the last user message)
-    let mut removed_count = 0;
-    while !app.history.is_empty() {
-        let last_is_user = matches!(app.history.last(), Some(HistoryCell::User { .. }));
-        app.pop_history();
-        removed_count += 1;
-        if last_is_user {
-            break;
-        }
-    }
-
-    // Remove from API messages
-    while let Some(last) = app.api_messages.last() {
-        if last.role == "user" {
-            app.pop_api_message();
-            break;
-        }
-        app.pop_api_message();
-    }
-
-    if removed_count > 0 {
-        // Keep tool/index mappings consistent after truncation.
-        app.tool_cells.clear();
-        app.tool_details_by_cell.clear();
-        app.exploring_entries.clear();
-        app.ignored_tool_calls.clear();
-        app.mark_history_updated();
-    }
-    removed_count
-}
-
-/// Conversation undo as every command sees it (#6788): truncate the
-/// transcript mirror, persist the truncated session so a reload cannot revive
-/// the undone turn, and return the conversation the engine — the one model
-/// context authority — must adopt via `SyncSession`.
+/// Prepare the rollback; the UI action owns Engine acknowledgement and save.
+/// The last real user boundary includes following tool results/runtime notes.
 pub(in crate::commands) fn undo_conversation_for_engine(app: &mut App) -> DebugConversationUndo {
-    let removed = undo_conversation(app);
-    if removed > 0 {
-        persist_undone_conversation(app);
-    }
-    DebugConversationUndo {
-        removed,
-        sync: session_sync_payload(app),
-    }
-}
-
-fn persist_undone_conversation(app: &mut App) {
-    // A session that was never saved has nothing on disk to revive.
-    if app.current_session_id.is_none() {
-        return;
-    }
-    let Ok(manager) = crate::session_manager::SessionManager::default_location() else {
-        return;
-    };
-    let persisted = crate::tui::ui::build_session_snapshot(app, &manager).and_then(|session| {
-        crate::tui::ui::persist_with_pending_work_boundary(
-            app,
-            crate::tui::persistence_actor::PersistRequest::SessionSnapshot(session),
+    let removed = app
+        .history
+        .iter()
+        .rposition(|cell| matches!(cell, HistoryCell::User { .. }))
+        .map_or(0, |index| app.history.len() - index);
+    let mut sync = session_sync_payload(app);
+    if let Some(index) = sync.messages.iter().rposition(|message| {
+        !matches!(
+            crate::runtime_handoff::classify_user_turn_prompt(message),
+            crate::runtime_handoff::UserTurnPromptKind::NotPrompt
         )
-    });
-    if let Err(err) = persisted {
-        app.status_message = Some(format!("Undo applied, but the session save failed ({err})"));
+    }) {
+        sync.messages.truncate(index);
     }
+    DebugConversationUndo { removed, sync }
 }
 
 fn session_sync_payload(app: &App) -> SessionSyncPayload {

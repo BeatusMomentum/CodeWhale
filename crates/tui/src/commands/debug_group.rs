@@ -97,8 +97,8 @@ pub(in crate::commands) fn host_result(result: DebugCommandResult) -> CommandRes
         DebugAction::OpenContextInspector => AppAction::OpenContextInspector,
         DebugAction::SendMessage(input) => AppAction::SendMessage(input),
         DebugAction::SyncSession(sync) => sync_session(sync),
-        DebugAction::Resend { sync, input } => {
-            AppAction::Sequence(vec![sync_session(sync), AppAction::SendMessage(input)])
+        DebugAction::ConversationUndo { sync, retry_input } => {
+            AppAction::ConversationUndo { sync, retry_input }
         }
     });
     CommandResult {

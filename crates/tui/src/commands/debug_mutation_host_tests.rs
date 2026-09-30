@@ -129,7 +129,7 @@ pub(in crate::commands) fn test_tool(name: &str) -> Tool {
 }
 
 #[test]
-fn test_undo_conversation_removes_last_exchange() {
+fn test_undo_conversation_stages_last_exchange_without_mutating_live_history() {
     let mut app = create_test_app();
     app.history.push(HistoryCell::User {
         content: "Hello".to_string(),
@@ -154,8 +154,38 @@ fn test_undo_conversation_removes_last_exchange() {
     assert!(result.message.is_some());
     let msg = result.message.unwrap();
     assert!(msg.contains("Removed"));
-    assert!(app.history.len() < initial_history_len);
-    assert!(app.api_messages.len() < initial_api_len);
+    assert_eq!(
+        app.history.len(),
+        initial_history_len,
+        "planning leaves live UI untouched"
+    );
+    assert_eq!(app.api_messages.len(), initial_api_len);
+    assert!(
+        matches!(result.action, Some(AppAction::ConversationUndo { sync, retry_input: None }) if sync.messages.is_empty())
+    );
+}
+
+#[test]
+fn conversation_undo_includes_following_tool_results_and_runtime_notes() {
+    let mut app = create_test_app();
+    app.history.push(HistoryCell::User {
+        content: "undo this".into(),
+    });
+    let messages: Vec<Message> = serde_json::from_value(serde_json::json!([
+        {"role":"user","content":[{"type":"text","text":"keep this"}]},
+        {"role":"assistant","content":[{"type":"text","text":"kept answer"}]},
+        {"role":"user","content":[{"type":"text","text":"undo this"}]},
+        {"role":"assistant","content":[{"type":"tool_use","id":"call-1","name":"read_file","input":{}}]},
+        {"role":"user","content":[{"type":"tool_result","tool_use_id":"call-1","content":"undone tool result"}]},
+        {"role":"assistant","content":[{"type":"text","text":"undone answer"}]}
+    ])).unwrap();
+    app.set_api_messages(std::sync::Arc::new(messages.clone()));
+    let result = undo_conversation(&mut app);
+    let Some(AppAction::ConversationUndo { sync, .. }) = result.action else {
+        panic!("missing rollback")
+    };
+    assert_eq!(sync.messages, messages[..2]);
+    assert_eq!(app.api_messages.as_ref(), &messages);
 }
 
 #[test]
@@ -188,10 +218,7 @@ fn test_retry_with_previous_message() {
     assert!(msg.contains("Test message"));
     assert!(matches!(
         result.action.as_ref(),
-        Some(AppAction::Sequence(steps)) if matches!(
-            steps.as_slice(),
-            [AppAction::SyncSession { .. }, AppAction::SendMessage(input)] if input == "Test message"
-        )
+        Some(AppAction::ConversationUndo { retry_input: Some(input), .. }) if input == "Test message"
     ));
 }
 

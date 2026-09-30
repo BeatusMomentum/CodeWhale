@@ -643,9 +643,12 @@ pub enum AppAction {
     },
     /// Send a message to the AI (normal chat mode).
     SendMessage(String),
-    /// Apply each action in order, stopping if one ends the app. `/retry`
-    /// uses it to sync the engine's history before resending (#6788).
-    Sequence(Vec<AppAction>),
+    /// Same-session rollback. A retry is admitted only after the Engine
+    /// acknowledges this history and its persisted snapshot is durable.
+    ConversationUndo {
+        sync: codewhale_command_contract::facets::SessionSyncPayload,
+        retry_input: Option<String>,
+    },
     /// Send a built-in Workflow planning turn with separate user-visible text
     /// and bounded runtime guidance. Draft instructions carry a typed marker
     /// that makes the dispatch path expose no tools for that turn.

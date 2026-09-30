@@ -416,9 +416,9 @@ fn retry_truncates_history_before_emitting_the_exact_original_input() {
     );
     assert_eq!(
         result.action,
-        Some(DebugAction::Resend {
+        Some(DebugAction::ConversationUndo {
             sync: synced_conversation(),
-            input: input.clone(),
+            retry_input: Some(input.clone()),
         })
     );
     assert_eq!(

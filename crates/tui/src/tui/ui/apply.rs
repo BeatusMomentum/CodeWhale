@@ -1312,6 +1312,96 @@ pub(crate) fn apply_notification_update(
     Ok(())
 }
 
+/// Roll back only this idle Engine conversation, then require a durability
+/// receipt before a retry can reach inference. A save failure leaves the
+/// acknowledged undo visible, reports the error, and sends no replacement turn.
+async fn apply_conversation_undo(
+    app: &mut App,
+    engine: &EngineHandle,
+    sync: codewhale_command_contract::facets::SessionSyncPayload,
+) -> Result<()> {
+    anyhow::ensure!(
+        !app.is_loading
+            && !app.dispatch_in_flight
+            && !app.remote_control.runtime_chat_blocks_local_dispatch(),
+        "wait for the active turn to finish before undoing its conversation"
+    );
+    let before = engine.get_session_snapshot().await?;
+    anyhow::ensure!(
+        app.current_session_id
+            .as_deref()
+            .is_none_or(|id| id == before.session_id)
+            && sync.session_id == app.current_session_id
+            && sync.workspace == before.workspace
+            && sync.model == before.model
+            && before.messages.as_slice() == app.api_messages.as_slice()
+            && sync.messages.len() < before.messages.len()
+            && before.messages.starts_with(&sync.messages),
+        "the active conversation changed; refresh it before retrying"
+    );
+    let id = before.session_id;
+    let checkpoint = crate::compaction::extract_compaction_summary(sync.system_prompt.as_ref());
+    let expected = crate::compaction::restore_compaction_checkpoint(
+        crate::runtime_handoff::project_owned_messages_for_restore(sync.messages.clone()),
+        checkpoint.as_ref(),
+    );
+    engine
+        .send(Op::SyncSession {
+            session_id: Some(id.clone()),
+            messages: sync.messages,
+            system_prompt: sync.system_prompt,
+            system_prompt_override: false,
+            model: sync.model,
+            workspace: sync.workspace,
+            mode: app.mode,
+        })
+        .await?;
+    // The snapshot is ordered after SyncSession on the same Engine channel.
+    // A send alone is not an acknowledgement that the engine adopted history.
+    let installed = engine.get_session_snapshot().await?;
+    anyhow::ensure!(
+        installed.session_id == id && installed.messages == expected,
+        "the Engine did not acknowledge the conversation rollback"
+    );
+    while !app.history.is_empty() {
+        let last_is_user = matches!(app.history.last(), Some(HistoryCell::User { .. }));
+        app.pop_history();
+        if last_is_user {
+            break;
+        }
+    }
+    app.set_api_messages(Arc::new(installed.messages));
+    app.current_session_id = Some(id);
+    app.tool_cells.clear();
+    app.tool_details_by_cell.clear();
+    app.exploring_entries.clear();
+    app.ignored_tool_calls.clear();
+    app.mark_history_updated();
+    let manager = tokio::task::spawn_blocking(SessionManager::default_location).await??;
+    let session = build_session_snapshot(app, &manager).map_err(anyhow::Error::msg)?;
+    // CompletedCommit supersedes an older queued checkpoint as well as its
+    // snapshot. A plain snapshot could let crash recovery revive the old turn.
+    anyhow::ensure!(
+        persistence_actor::try_persist(PersistRequest::CompletedCommit { session }),
+        "the session persistence worker is unavailable"
+    );
+    let (reply, receive) = tokio::sync::oneshot::channel();
+    anyhow::ensure!(
+        persistence_actor::try_persist(PersistRequest::FlushAndReport { reply }),
+        "could not request the session save receipt"
+    );
+    let report = receive.await?;
+    anyhow::ensure!(
+        report.failures.is_empty(),
+        "the session save failed: {:?}",
+        report.failures
+    );
+    publish_pending_work_projection(app)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    Ok(())
+}
+
 pub(crate) async fn apply_command_result(
     terminal: &mut AppTerminal,
     app: &mut App,
@@ -1347,8 +1437,14 @@ async fn apply_command_result_inner(
     if reject_inline_inference_while_runtime_chat_owns_run(app, &result) {
         return Ok(false);
     }
+    let conversation_message = matches!(result.action, Some(AppAction::ConversationUndo { .. }))
+        .then(|| result.message.clone())
+        .flatten();
     if let Some(msg) = result.message
-        && !matches!(result.action, Some(AppAction::OpenCommandReview { .. }))
+        && !matches!(
+            result.action,
+            Some(AppAction::OpenCommandReview { .. } | AppAction::ConversationUndo { .. })
+        )
     {
         app.add_message(HistoryCell::System { content: msg });
     }
@@ -1671,25 +1767,29 @@ async fn apply_command_result_inner(
                         .await;
                 }
             }
-            AppAction::Sequence(actions) => {
-                for action in actions {
-                    let step = commands::CommandResult {
-                        message: None,
-                        action: Some(action),
-                        is_error: false,
-                    };
-                    if Box::pin(apply_command_result_inner(
-                        terminal,
+            AppAction::ConversationUndo { sync, retry_input } => {
+                if let Err(error) = apply_conversation_undo(app, engine_handle, sync).await {
+                    app.push_status_toast(
+                        format!("Conversation rollback failed; retry was not sent: {error:#}"),
+                        StatusToastLevel::Error,
+                        None,
+                    );
+                    return Ok(false);
+                }
+                if let Some(message) = conversation_message {
+                    app.add_message(HistoryCell::System { content: message });
+                }
+                if let Some(content) = retry_input {
+                    let queued = build_queued_message(app, content);
+                    dispatch_composer_message(
                         app,
-                        engine_handle,
-                        task_manager,
                         config,
-                        step,
-                    ))
-                    .await?
-                    {
-                        return Ok(true);
-                    }
+                        engine_handle,
+                        queued,
+                        DispatchRecovery::Immediate,
+                        ComposerSubmitAction::Submit(app.decide_submit_disposition()),
+                    )
+                    .await?;
                 }
             }
             AppAction::SendMessage(content) => {

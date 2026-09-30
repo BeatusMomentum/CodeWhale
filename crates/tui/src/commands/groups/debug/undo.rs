@@ -102,7 +102,10 @@ pub(super) fn retry(contexts: CommandContexts<'_>, _: Option<&str>) -> CommandRe
             };
             CommandResult::with_message_and_action(
                 format!("Retrying: {display_input}"),
-{ let _ = undone; DebugAction::SendMessage(input) },
+                DebugAction::ConversationUndo {
+                    sync: undone.sync,
+                    retry_input: Some(input),
+                },
             )
         }
         None => CommandResult::error("No previous request to retry"),
@@ -153,7 +156,13 @@ pub(super) fn diff(contexts: CommandContexts<'_>, _: Option<&str>) -> CommandRes
 /// to the engine, which owns the model context (#6788).
 pub(in crate::commands) fn conversation_result(undone: DebugConversationUndo) -> CommandResult {
     if undone.removed > 0 {
-CommandResult::message(format!("Removed {} message(s)", undone.removed))
+        CommandResult::with_message_and_action(
+            format!("Removed {} message(s)", undone.removed),
+            DebugAction::ConversationUndo {
+                sync: undone.sync,
+                retry_input: None,
+            },
+        )
     } else {
         CommandResult::message("Nothing to undo")
     }
