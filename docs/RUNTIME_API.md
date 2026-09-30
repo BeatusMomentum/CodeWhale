@@ -453,6 +453,40 @@ in the app-server can produce model output, so a prompt either runs or fails.
 and replies `status: "completed"` with the streamed frames in `events` — where
 it previously replied `accepted` without doing anything.
 
+### Thread ids and restarts
+
+`thread/message`, `thread/request` messages, and HTTP `POST /thread` messages
+take a thread id from `thread/create` (or `thread/fork`). An id that was never
+created fails with `-32004` (`thread_not_found`) on stdio, or HTTP `404` on
+`/thread`, before any runtime thread is started. `/prompt`, `prompt/request`,
+and `prompt/run` are different: their optional `thread_id` is any key the
+caller chooses, and a new key starts a new conversation.
+
+The runtime thread behind each created thread is recorded in the state store,
+so a message sent after the app-server restarts continues the same
+conversation. If the runtime no longer has that thread (its data directory was
+removed or replaced), the next message starts a new runtime thread in the
+thread's recorded workspace and records it; the earlier conversation is not
+recovered. `thread/resume` and `thread/fork` without `cwd` keep the recorded
+workspace (a fork uses its parent's). A new fork, or a persisted thread resumed
+through a fresh metadata manager, can record an explicit `cwd`. This control
+transport does not move an already linked Runtime thread: its workspace remains
+owned by the Runtime API. Updating that thread's workspace requires the Runtime
+`PATCH /v1/threads/{id}` operation; cached metadata resume also does not persist
+an explicit cwd change. These paths are not a cross-store workspace transaction.
+
+### Changing config
+
+`app/config/set` and `app/config/unset` write the change to the config file
+before replying: the `--config` path, or the default `config.toml` the runtime
+child also reads when no `--config` is given. They change user settings that
+outlive the app-server, not just this session. The change is applied to the
+file as it is on disk, so edits saved by other processes are kept. If the file
+cannot be read, parsed, or written, the reply is `ok: false` and nothing
+changes; a file that does not parse is not rewritten, so fix it by hand (or
+`app/config/reload` after fixing it). Over HTTP `/app`, a rejected key or value
+is `400` and a read or write failure is `500`.
+
 ### Answering a clarification question
 
 When a headless turn calls `request_user_input`, the runtime emits a
