@@ -13,6 +13,7 @@
  * Both surface as drafts in CURATED_KV under `draft:linkcheck:<...>` and
  * `draft:semantic-drift:<...>`, picked up by the existing /admin listing.
  */
+import { fetchBoundedText } from "./bounded-body";
 import { agentChat, draftStorageKey, getDraft, saveDraft, type AgentDraft, type DeepSeekEnv, VOICE_CONSTRAINTS } from "./community-agent";
 
 interface KVNamespace {
@@ -95,15 +96,20 @@ export interface LinkCheckResult {
   ms: number;
 }
 
+const PROBE_TIMEOUT_MS = 10_000;
+
 async function probe(target: { url: string; label: string }): Promise<LinkCheckResult> {
   const start = Date.now();
   try {
     // Use HEAD where possible; fall back to GET on 405/403 since some hosts
     // (e.g. Cloudflare-protected) reject HEAD.
-    let r = await fetch(target.url, { method: "HEAD", redirect: "follow" });
+    // Each request has its own deadline; only the status matters, so a GET
+    // body is discarded unread.
+    let r = await fetch(target.url, { method: "HEAD", redirect: "follow", signal: AbortSignal.timeout(PROBE_TIMEOUT_MS) });
     if (r.status === 405 || r.status === 403 || r.status === 404) {
       // Some sites return 404 to HEAD but 200 to GET (e.g. NPM)
-      r = await fetch(target.url, { method: "GET", redirect: "follow" });
+      r = await fetch(target.url, { method: "GET", redirect: "follow", signal: AbortSignal.timeout(PROBE_TIMEOUT_MS) });
+      await r.body?.cancel().catch(() => undefined);
     }
     return { url: target.url, label: target.label, status: r.status, ok: r.ok, ms: Date.now() - start };
   } catch {
@@ -291,10 +297,10 @@ export async function runSemanticDrift(env: WatchEnv): Promise<{ ok: boolean; dr
 
   // Fetch CHANGELOG (truncated), recent commits, and live homepage HTML.
   const [changelog, commits, homepageHtml, docsHtml] = await Promise.all([
-    fetch("https://raw.githubusercontent.com/Hmbown/CodeWhale/main/CHANGELOG.md", { headers: ghHeaders }).then((r) => r.ok ? r.text() : "").catch(() => ""),
-    fetch("https://api.github.com/repos/Hmbown/CodeWhale/commits?per_page=30", { headers: ghHeaders }).then((r) => r.ok ? r.json() as Promise<{ commit: { message: string }; sha: string }[]> : []).catch(() => []),
-    fetch("https://codewhale.net/en", { headers: { "User-Agent": "codewhale-watch" } }).then((r) => r.ok ? r.text() : "").catch(() => ""),
-    fetch("https://codewhale.net/en/docs", { headers: { "User-Agent": "codewhale-watch" } }).then((r) => r.ok ? r.text() : "").catch(() => ""),
+    fetchBoundedText("https://raw.githubusercontent.com/Hmbown/CodeWhale/main/CHANGELOG.md", { headers: ghHeaders }).then((r) => r.text).catch(() => ""),
+    fetchBoundedText("https://api.github.com/repos/Hmbown/CodeWhale/commits?per_page=30", { headers: ghHeaders }).then((r) => r.ok ? JSON.parse(r.text) as { commit: { message: string }; sha: string }[] : []).catch(() => []),
+    fetchBoundedText("https://codewhale.net/en", { headers: { "User-Agent": "codewhale-watch" } }).then((r) => r.text).catch(() => ""),
+    fetchBoundedText("https://codewhale.net/en/docs", { headers: { "User-Agent": "codewhale-watch" } }).then((r) => r.text).catch(() => ""),
   ]);
 
   if (!changelog && (!commits || commits.length === 0)) {

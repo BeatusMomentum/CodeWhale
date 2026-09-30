@@ -8,7 +8,11 @@ export const CHANNEL_RE = /^[a-z0-9][a-z0-9-]{0,31}$/;
 export const KV_PREFIX = "facts:cloud:";
 export const SUPABASE_TIMEOUT_MS = 3000;
 export const MAX_ENVELOPE_BYTES = 768 * 1024;
-const KV_TTL_SECS = 60 * 60 * 24 * 30;
+// The last-good copy only bridges a transport outage. It lives no longer than
+// a client keeps applying its own cached envelope (payload ttl_secs, 6 h by
+// default, docs/CLOUD_FACTS.md), so an outage cannot extend a withdrawn
+// release beyond the staleness every client already accepts.
+const KV_TTL_SECS = 60 * 60 * 6;
 const KEY_ID_RE = /^cwf-[a-z0-9-]{1,32}$/;
 const VERSION_REQ_RE = /^(\*|(?:>=|<=|>|<|=|\^|~)?\s*\d+(\.\d+){0,2}(-[0-9A-Za-z.-]+)?(\s*,\s*(?:>=|<=|>|<|=|\^|~)?\s*\d+(\.\d+){0,2}(-[0-9A-Za-z.-]+)?)*)$/;
 const MAX_SIGNATURES = 7; // Plus the primary signature: eight candidates total.
@@ -286,6 +290,13 @@ async function kvGet(env: CloudFactsEnv, channel: string): Promise<unknown> {
   } catch { return null; }
 }
 
+async function retireLastGood(env: CloudFactsEnv, channel: string): Promise<void> {
+  if (!env.CURATED_KV || !isEnvelope(await kvGet(env, channel))) return;
+  try {
+    await env.CURATED_KV.put(`${KV_PREFIX}${channel}`, JSON.stringify({ retired: "no-current-head" }), { expirationTtl: KV_TTL_SECS });
+  } catch { /* Best effort, like the write; the copy still expires on its TTL. */ }
+}
+
 export async function resolveCloudFacts(channel: string, env: CloudFactsEnv, opts: ResolveOptions = {}): Promise<CloudFactsResult> {
   if (!isValidChannel(channel)) return { kind: "none" };
   const keys = opts.keys ?? TRUSTED_KEYS;
@@ -295,7 +306,12 @@ export async function resolveCloudFacts(channel: string, env: CloudFactsEnv, opt
   let source: "supabase" | "kv-stale" = "supabase";
   try {
     const row = await fetchCurrentRow(channel, env, opts);
-    if (!row) return { kind: "none" };
+    if (!row) {
+      // The head was revoked, expired or future-dated. Retire the last-good
+      // copy so a later outage cannot resurrect it through the stale path.
+      await retireLastGood(env, channel);
+      return { kind: "none" };
+    }
     envelope = envelopeFromRow(row);
   } catch {
     source = "kv-stale";

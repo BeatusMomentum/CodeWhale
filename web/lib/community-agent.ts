@@ -810,16 +810,15 @@ export async function logUsage(
   outputTokens: number
 ): Promise<void> {
   if (!kv) return;
-  const date = new Date().toISOString().slice(0, 10);
-  const key = `usage:${date}`;
-  const raw = await kv.get(key);
-  const existing: UsageLog = raw
-    ? JSON.parse(raw)
-    : { date, calls: 0, inputTokens: 0, outputTokens: 0 };
-  existing.calls += 1;
-  existing.inputTokens += inputTokens;
-  existing.outputTokens += outputTokens;
-  await kv.put(key, JSON.stringify(existing), { expirationTtl: 60 * 60 * 24 * 90 }); // 90 days
+  // One record per model call under the day's prefix. KV has no atomic
+  // increment, so a shared daily counter that overlapping cron tasks read,
+  // bumped and wrote back lost calls; an append-only record cannot.
+  const at = new Date().toISOString();
+  const date = at.slice(0, 10);
+  const record: UsageLog = { date, calls: 1, inputTokens, outputTokens };
+  await kv.put(`usage:${date}:${at}:${crypto.randomUUID()}`, JSON.stringify(record), {
+    expirationTtl: 60 * 60 * 24 * 90, // 90 days
+  });
 }
 
 /**
