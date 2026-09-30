@@ -2359,6 +2359,22 @@ async fn bun_host_runs_the_dsh_plugin_reports_bun_and_restarts_on_bun() {
         HostStatus::Ready { runtime: "bun", .. }
     ));
     assert_eq!(manager.runtime_summary().unwrap(), summary);
+    #[cfg(target_os = "macos")]
+    {
+        // This kill came from the operator, not the memory hog. The observed
+        // signal and configured cap must not invent a cause for it.
+        let diagnostics = manager.diagnostics();
+        assert!(
+            diagnostics
+                .iter()
+                .any(|line| line.contains("SIGKILL cause unavailable")),
+            "{diagnostics:?}"
+        );
+        assert!(
+            !diagnostics.iter().any(|line| line.contains("exceeds its")),
+            "{diagnostics:?}"
+        );
+    }
     manager.shutdown().await;
 }
 
@@ -2400,21 +2416,22 @@ async fn memory_hog_is_stopped(
         Err(other) => panic!("unexpected error: {other:?}"),
     }
     let stopped_by = match memory {
-        MemoryEnforcement::Jetsam => Some(
-            "configured kernel memory limit: 400 MiB; SIGKILL cause unavailable",
-        ),
+        MemoryEnforcement::Jetsam => {
+            Some("configured kernel memory limit: 400 MiB; SIGKILL cause unavailable")
+        }
         MemoryEnforcement::Heartbeat => Some("exceeded its memory cap"),
         _ => None,
     };
     if let Some(stopped_by) = stopped_by {
-        assert!(
+        // Pending calls settle before the existing exit callback publishes
+        // its diagnostic. Observe that callback rather than race its delivery.
+        wait_host(&manager, || {
             manager
                 .diagnostics()
                 .iter()
-                .any(|line| line.contains(stopped_by)),
-            "{:?}",
-            manager.diagnostics()
-        );
+                .any(|line| line.contains(stopped_by))
+        })
+        .await;
     }
     manager.shutdown().await;
 }
