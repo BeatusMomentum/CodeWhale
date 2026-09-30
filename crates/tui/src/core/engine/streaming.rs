@@ -55,6 +55,23 @@ impl ToolUseState {
 
 /// Maximum total bytes of text, reasoning and tool-argument content before aborting the stream.
 pub(super) const STREAM_MAX_CONTENT_BYTES: usize = 10 * 1024 * 1024; // 10 MB
+/// A response can contain many empty tool starts without spending the byte
+/// budget. Bound that batch before any call is retained or admitted. A lower
+/// configured per-turn tool budget remains authoritative at execution.
+pub(super) const MAX_TOOL_CALLS_PER_RESPONSE: usize = 256;
+
+pub(super) fn tool_call_limit_error() -> crate::error_taxonomy::ErrorEnvelope {
+    crate::error_taxonomy::ErrorEnvelope::new(
+        crate::error_taxonomy::ErrorCategory::InvalidInput,
+        crate::error_taxonomy::ErrorSeverity::Error,
+        false,
+        "response_tool_call_limit",
+        format!(
+            "Model response exceeded the maximum of {MAX_TOOL_CALLS_PER_RESPONSE} tool calls; no call from this response was executed"
+        ),
+    )
+}
+
 /// Sanity backstop for total stream wall-clock duration. **Not** a routine
 /// kill switch — the stream chunk idle timeout is the primary stall
 /// detector. The wall-clock cap is here only to bound pathological cases
