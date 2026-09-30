@@ -113,8 +113,11 @@ impl ChangeCounts {
             self.untracked = self.untracked.saturating_add(1);
             return;
         }
+        // An unmerged path is a conflict and nothing else: its two letters
+        // name the merge sides, not a staged and a worktree change (U08-m2).
         if unmerged {
             self.conflicts = self.conflicts.saturating_add(1);
+            return;
         }
         if x != ' ' && x != '?' {
             self.staged = self.staged.saturating_add(1);
@@ -849,8 +852,10 @@ locked
         assert_eq!(
             status.changes,
             ChangeCounts {
-                staged: 3,
-                modified: 2,
+                // The UU record is a conflict only, not also staged and
+                // modified (U08-m2).
+                staged: 2,
+                modified: 1,
                 untracked: 1,
                 conflicts: 1,
             }
@@ -872,7 +877,7 @@ locked
         );
         assert_eq!(
             status_line(&status).as_deref(),
-            Some("main | 3 staged, 2 modified, 1 untracked, 1 conflicts")
+            Some("main | 2 staged, 1 modified, 1 untracked, 1 conflicts")
         );
     }
 
@@ -884,9 +889,15 @@ locked
             );
             let status = parse_porcelain_v2(&raw).unwrap();
             assert_eq!(status.changes.conflicts, 1, "{code}");
+            assert_eq!(
+                (status.changes.staged, status.changes.modified),
+                (0, 0),
+                "{code} is not also staged or modified"
+            );
             assert!(status_line(&status).unwrap().contains("1 conflicts"));
             let (legacy, _, _) = parse_porcelain_v1(&format!("{code} conflict.rs\n"));
             assert_eq!(legacy.conflicts, 1, "legacy {code}");
+            assert_eq!((legacy.staged, legacy.modified), (0, 0), "legacy {code}");
         }
     }
 
