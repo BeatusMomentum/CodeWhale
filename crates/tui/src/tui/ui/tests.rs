@@ -4363,6 +4363,10 @@ fn selection_to_text_strips_nested_blockquote_rails() {
 #[test]
 fn selection_to_text_copies_rendered_transcript_block() {
     let mut app = create_test_app();
+    app.calm_mode = true;
+    app.show_thinking = true;
+    app.verbose_transcript = false;
+    app.thinking_default_expanded = false;
     app.history = vec![
         HistoryCell::System {
             content: "copy system".to_string(),
@@ -4414,17 +4418,16 @@ fn selection_to_text_copies_rendered_transcript_block() {
     let selected = selection_to_text(&app).expect("selection text");
     assert!(selected.contains("Note copy system"), "{selected:?}");
     assert!(selected.contains("copy user"), "{selected:?}");
-    // Short completed thinking now renders inline (v0.8.42 thinking-preview
-    // change); it should be selectable/copyable as visible transcript text.
+    // Calm keeps settled reasoning behind its disclosure. Copying the
+    // collapsed transcript must not reveal a body the reader cannot see.
     assert!(
-        selected.contains("copy thinking"),
-        "short completed thinking should be visible inline: {selected:?}"
+        !selected.contains("copy thinking"),
+        "collapsed reasoning leaked into the selection: {selected:?}"
     );
-    // Short thinking that fits entirely inline doesn't need the Ctrl+O
-    // affordance; only truncated or explicit-summary thinking shows it.
+    // Disclosure controls are UI chrome, not conversation content.
     assert!(
         !selected.contains("Ctrl+O"),
-        "short completed thinking should not show the detail affordance: {selected:?}"
+        "detail affordance leaked into the selection: {selected:?}"
     );
     assert!(selected.contains("run Done · cargo check"), "{selected:?}");
     assert!(selected.contains("copy assistant"), "{selected:?}");
@@ -4437,6 +4440,30 @@ fn selection_to_text_copies_rendered_transcript_block() {
             "line {idx} retained tool-card rail prefix: {line:?}"
         );
     }
+
+    // The same stored body becomes selectable when the reader expands it.
+    // This distinguishes correct folding from losing reasoning altogether.
+    app.thinking_folds.insert(2, ThinkingFold::Expanded);
+    app.viewport.transcript_cache.ensure_split(
+        &[&app.history],
+        &app.history_revisions,
+        80,
+        app.transcript_render_options(),
+        &app.thinking_folds,
+        None,
+        None,
+    );
+    assert!(
+        app.viewport
+            .transcript_cache
+            .lines()
+            .iter()
+            .any(|line| line.to_string().contains("copy thinking")),
+        "expanded reasoning must be rendered before it can be copied"
+    );
+    select_full_transcript(&mut app);
+    let expanded = selection_to_text(&app).expect("expanded selection text");
+    assert!(expanded.contains("copy thinking"), "{expanded:?}");
 }
 
 #[test]
@@ -7903,7 +7930,7 @@ async fn session_denied_cache_notice_renders_host_scope_in_zh_hans() {
             _ => None,
         })
         .expect("localized persistent auto-deny explanation");
-    assert!(notice.contains("本轮"));
+    assert!(notice.contains("本回合"), "{notice}");
     assert!(notice.contains("匹配请求"));
     assert!(!notice.contains("example.com"));
 

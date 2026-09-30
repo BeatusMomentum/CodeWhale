@@ -6909,14 +6909,11 @@ mod tests {
                 Locale::ZhHans,
                 MessageId::SubagentsCurrentSessionFleetWorkersTitle
             ),
-            "当前会话的舰队工作器"
+            "本会话的智能体"
         );
+        assert!(zh_hans_compact.contains("本会话的智能体"), "{zh_hans_text}");
         assert!(
-            zh_hans_compact.contains("当前会话的舰队工作器"),
-            "{zh_hans_text}"
-        );
-        assert!(
-            zh_hans_compact.contains("子代理角色是当前会话的舰队工作器角色。"),
+            zh_hans_compact.contains("所示角色为本会话中智能体的角色。"),
             "{zh_hans_text}"
         );
         assert!(
@@ -6999,21 +6996,21 @@ mod tests {
             .filter(|ch| !ch.is_whitespace())
             .collect::<String>();
         for expected in [
-            "当前会话的舰队工作器",
+            "本会话的智能体",
             "运行中：1",
             "已中断：1",
-            "名册设置工作器",
-            "实时工作器状态·角色·目标·模型·已用时间",
+            "Fleet设置智能体",
+            "实时智能体状态·角色·目标·模型·已用时间",
             "运行中（1）",
             "构建者",
             "原因：manualreview",
             "角色：release",
-            "权限：网络=开·Shell=只读·写入=开",
+            "访问级别：网络=开·Shell=只读·写入=开",
             "Git：分支feature/localize@fleet-workers",
             "目标：verifylocalizedrow",
             "结果：allcheckspassed",
             "刷新",
-            "名册/设置",
+            "fleet/setup",
         ] {
             assert!(
                 zh_hans_compact.contains(expected),
