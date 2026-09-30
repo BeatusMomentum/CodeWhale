@@ -85,8 +85,8 @@ fn capture_prefix(name: &str, case: &Value) -> Result<Prefix, String> {
         .cloned()
         .unwrap_or_else(default_script);
     let (record, provider) = run_scripted_turn(&sandbox, case, &script);
-    if record.timed_out {
-        return Err("the turn did not complete".to_string());
+    if let Some(error) = record.failure {
+        return Err(error);
     }
     let requests = provider.captured();
     let first = requests

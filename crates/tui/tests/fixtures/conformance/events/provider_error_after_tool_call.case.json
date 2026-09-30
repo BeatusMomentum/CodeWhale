@@ -120,11 +120,5 @@
     {
       "max_model_requests": 1
     }
-  ],
-  "expected_to_change": {
-    "finding": "C02-05",
-    "issue": "#6561",
-    "owner": "opus/0101-audit-core",
-    "reason": "Current source still executes tool calls collected before a terminal stream error; the core audit slice makes the turn settle them as not-started. When that lands, re-record this golden and delete this block."
-  }
+  ]
 }

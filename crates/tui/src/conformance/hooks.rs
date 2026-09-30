@@ -124,6 +124,12 @@ fn tool_outcome(case: &Value) -> Result<ToolResult, ToolError> {
 }
 
 fn run_case(name: &str, case: &Value, failures: &mut Failures) {
+    assert!(
+        case["hooks"]
+            .as_array()
+            .is_some_and(|hooks| !hooks.is_empty()),
+        "hook case must contain a hook"
+    );
     let sandbox = Sandbox::new(case);
     let capture = sandbox.workspace.join(".conformance-capture");
     std::fs::create_dir_all(&capture).expect("capture dir");
@@ -178,7 +184,9 @@ fn run_case(name: &str, case: &Value, failures: &mut Failures) {
                 "success": result.success,
                 "exit_code": result.exit_code,
                 "background": result.background,
-                "stdout": result.stdout.trim(),
+                "stdout": result.stdout,
+                "stderr": result.stderr,
+                "error": result.error,
             })).collect::<Vec<_>>() })
         }
         other => panic!("unknown hook event `{other}`"),
@@ -196,6 +204,10 @@ fn run_case(name: &str, case: &Value, failures: &mut Failures) {
         })
         .collect();
     let mut golden_value = json!({ "outcome": outcome, "hooks": hooks });
+    if !hooks.iter().any(|hook| hook["ran"] == true) {
+        failures.push(name, "no configured hook produced a capture");
+        return;
+    }
     let mut masker = sandbox
         .masker(&[])
         .literal(executor.session_id(), "<HOOK_SESSION>");

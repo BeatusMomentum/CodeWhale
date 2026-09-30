@@ -64,13 +64,12 @@ pub(super) fn update_mode() -> bool {
 /// instead. Returns a failure description rather than panicking so a family
 /// can report every drifted case in one run.
 pub(super) fn check_golden(path: &Path, actual: &str) -> Result<(), String> {
-    let expected = std::fs::read_to_string(path)
-        .ok()
-        .map(|text| text.replace("\r\n", "\n"));
+    let update = update_mode();
+    let expected = std::fs::read_to_string(path).ok();
     if expected.as_deref() == Some(actual) {
         return Ok(());
     }
-    if update_mode() {
+    if update {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).expect("create golden dir");
         }
@@ -89,6 +88,18 @@ pub(super) fn check_golden(path: &Path, actual: &str) -> Result<(), String> {
         path.display(),
         first_difference(&expected, actual)
     ))
+}
+
+/// A harness deadline is missing evidence, never a provider outcome or a
+/// recordable golden. Keep this boundary shared by every asynchronous family.
+pub(super) async fn complete_within<T>(
+    operation: &str,
+    deadline: std::time::Duration,
+    future: impl std::future::Future<Output = T>,
+) -> Result<T, String> {
+    tokio::time::timeout(deadline, future)
+        .await
+        .map_err(|_| format!("harness timeout: {operation} did not complete within {deadline:?}"))
 }
 
 /// Line-oriented first difference with a little context — enough to see what
@@ -266,8 +277,8 @@ impl Masker {
     }
 }
 
-/// Stable snake_case name of a `ToolError` variant; the variant, not the
-/// message wording, is the cross-implementation contract.
+/// Stable snake_case name of a `ToolError` variant. The golden also pins its
+/// full detail bytes; migration does not weaken either part of the contract.
 pub(super) fn tool_error_kind(error: &ToolError) -> &'static str {
     match error {
         ToolError::InvalidInput { .. } => "invalid_input",
@@ -357,6 +368,9 @@ pub(super) fn write_workspace(workspace: &Path, case: &Value) {
 pub(super) struct Failures(Vec<String>);
 
 impl Failures {
+    pub(super) fn contains(&self, message: &str) -> bool {
+        self.0.iter().any(|failure| failure.contains(message))
+    }
     pub(super) fn record(&mut self, case: &str, result: Result<(), String>) {
         if let Err(message) = result {
             self.0.push(format!("[{case}] {message}"));
@@ -368,6 +382,7 @@ impl Failures {
     }
 
     pub(super) fn finish(self, family: &str, cases: usize) {
+        assert!(cases > 0, "conformance family `{family}` ran no cases");
         assert!(
             self.0.is_empty(),
             "conformance family `{family}`: {} of {cases} case(s) failed\n\n{}",
@@ -376,4 +391,30 @@ impl Failures {
         );
         eprintln!("conformance family `{family}`: {cases} case(s) matched");
     }
+}
+
+#[test]
+fn golden_comparison_rejects_changed_bytes_and_missing_output() {
+    let _lock = lock_test_env();
+    let _update = EnvVarGuard::set(UPDATE_ENV, "0");
+    let dir = tempfile::tempdir().expect("temporary golden");
+    let path = dir.path().join("case.golden.txt");
+    std::fs::write(&path, "expected\n").expect("write golden");
+    assert!(check_golden(&path, "expected\n").is_ok());
+    assert!(
+        check_golden(&path, "different\n")
+            .unwrap_err()
+            .contains("golden drift")
+    );
+    assert!(check_golden(&path, "expected\r\n").is_err());
+    assert!(check_golden(&dir.path().join("missing"), "").is_err());
+    // A CRLF golden must not be silently normalized either.
+    std::fs::write(&path, "expected\r\n").expect("write CRLF golden");
+    assert!(check_golden(&path, "expected\n").is_err());
+}
+
+#[test]
+#[should_panic(expected = "ran no cases")]
+fn empty_family_cannot_pass() {
+    Failures::default().finish("empty_control", 0);
 }

@@ -16,7 +16,7 @@
 //!
 //! Normalization: the server URL/port is masked; results are
 //! `{"ok": {success, content, metadata, content_blocks}}` with JSON content
-//! parsed, or `{"err": {kind, detail}}` where `detail` is informative text.
+//! parsed, or `{"err": {kind, detail}}` with exact detail bytes.
 //! `server_received` lists the side-effecting requests the server saw
 //! (`tools/call`, `resources/read`, `prompts/get`) — a call that must not be
 //! sent, or must not be replayed, shows up there.
@@ -60,6 +60,28 @@ trait McpDispatchUnderTest: Send + Sync {
         cancel: CancellationToken,
     ) -> Result<RichToolResult, ToolError>;
     async fn shutdown(&self);
+}
+
+#[tokio::test]
+async fn harness_timeout_rejects_a_real_unanswered_mcp_call() {
+    let mut case = golden::read_case(FAMILY, "tools_resources_prompts");
+    let held = case["steps"]
+        .as_array()
+        .expect("steps")
+        .iter()
+        .find(|step| step["cancel"] == "after_server_holds")
+        .expect("held-call fixture")
+        .clone();
+    let mut held = held;
+    held.as_object_mut().expect("step").remove("cancel");
+    case["steps"] = json!([held]);
+    let _sandbox = Sandbox::new(&Value::Null);
+    let outcome =
+        run_transcript_with_deadline(&case, McpPoolDispatch::boxed, Duration::from_secs(1)).await;
+    assert!(
+        matches!(outcome, Err(error) if error.contains("harness timeout: MCP call")),
+        "an unanswered MCP call became recordable output"
+    );
 }
 
 type DispatchFactory = fn(config: McpConfig) -> Box<dyn McpDispatchUnderTest>;
@@ -159,13 +181,18 @@ impl TranscriptServer {
         let spec = Arc::new(spec);
         let (log, notify) = (Arc::clone(&received), Arc::clone(&held));
         let task = tokio::spawn(async move {
+            let mut connections = tokio::task::JoinSet::new();
             loop {
-                let Ok((socket, _)) = listener.accept().await else {
+                let accepted = tokio::select! {
+                    accepted = listener.accept() => accepted,
+                    _ = connections.join_next(), if !connections.is_empty() => continue,
+                };
+                let Ok((socket, _)) = accepted else {
                     break;
                 };
                 let (spec, log, notify) =
                     (Arc::clone(&spec), Arc::clone(&log), Arc::clone(&notify));
-                tokio::spawn(async move {
+                connections.spawn(async move {
                     answer(socket, &spec, &log, &notify).await;
                 });
             }
@@ -342,7 +369,22 @@ fn normalize_call(result: &Result<RichToolResult, ToolError>) -> Value {
     }
 }
 
-async fn run_transcript(case: &Value, factory: DispatchFactory) -> (Value, TranscriptServer) {
+async fn run_transcript(
+    case: &Value,
+    factory: DispatchFactory,
+) -> Result<(Value, TranscriptServer), String> {
+    run_transcript_with_deadline(case, factory, CALL_DEADLINE).await
+}
+
+async fn run_transcript_with_deadline(
+    case: &Value,
+    factory: DispatchFactory,
+    deadline: Duration,
+) -> Result<(Value, TranscriptServer), String> {
+    let scripted_steps = case["steps"].as_array().expect("case.steps");
+    if scripted_steps.is_empty() {
+        return Err("MCP transcript has no host steps".to_string());
+    }
     let server = TranscriptServer::start(case["server"].clone()).await;
     let server_name = case["server_name"].as_str().unwrap_or("conformance");
     let config: McpConfig = serde_json::from_value(json!({
@@ -355,15 +397,18 @@ async fn run_transcript(case: &Value, factory: DispatchFactory) -> (Value, Trans
     .expect("transcript MCP config");
     let dispatch = factory(config);
     let mut steps = Vec::new();
-    let boot = match dispatch.boot().await {
+    let boot = match golden::complete_within("MCP boot", deadline, dispatch.boot()).await? {
         Ok(()) => json!("ok"),
         Err(detail) => json!({ "err": { "detail": detail } }),
     };
     steps.push(json!({ "op": "boot", "outcome": boot }));
-    for step in case["steps"].as_array().expect("case.steps") {
+    for step in scripted_steps {
         match step["op"].as_str().expect("step.op") {
             "catalog" => {
-                let catalog = serde_json::to_value(dispatch.catalog().await).expect("catalog");
+                let catalog = serde_json::to_value(
+                    golden::complete_within("MCP catalog", deadline, dispatch.catalog()).await?,
+                )
+                .expect("catalog");
                 steps.push(json!({ "op": "catalog", "tools": catalog }));
             }
             "call" => {
@@ -377,31 +422,27 @@ async fn run_transcript(case: &Value, factory: DispatchFactory) -> (Value, Trans
                             cancel.cancel();
                         })
                     });
-                let outcome = tokio::time::timeout(
-                    CALL_DEADLINE,
+                let outcome = golden::complete_within(
+                    "MCP call",
+                    deadline,
                     dispatch.call(tool, step["input"].clone(), cancel),
                 )
                 .await;
                 if let Some(canceller) = canceller {
                     canceller.abort();
                 }
-                let outcome = match outcome {
-                    Ok(result) => normalize_call(&result),
-                    Err(_) => {
-                        json!({ "harness_timeout": format!("no answer within {CALL_DEADLINE:?}") })
-                    }
-                };
+                let outcome = normalize_call(&outcome?);
                 steps.push(json!({ "op": "call", "tool": tool, "outcome": outcome }));
             }
             other => panic!("unknown transcript op `{other}`"),
         }
     }
-    dispatch.shutdown().await;
+    golden::complete_within("MCP shutdown", deadline, dispatch.shutdown()).await?;
     let received = server.received.lock().expect("log").clone();
-    (
+    Ok((
         json!({ "steps": steps, "server_received": received }),
         server,
-    )
+    ))
 }
 
 #[test]
@@ -418,7 +459,13 @@ fn mcp_transcripts_match_goldens_for_every_dispatch() {
                 .enable_all()
                 .build()
                 .expect("runtime");
-            let (mut outcome, server) = runtime.block_on(run_transcript(&case, *factory));
+            let (mut outcome, server) = match runtime.block_on(run_transcript(&case, *factory)) {
+                Ok(completed) => completed,
+                Err(error) => {
+                    failures.push(&format!("{name} via {dispatch}"), error);
+                    continue;
+                }
+            };
             let mut masker = sandbox
                 .masker(&[])
                 .literal(&server.url, "<SERVER_URL>")

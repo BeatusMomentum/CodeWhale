@@ -25,8 +25,8 @@
 //! must reproduce.
 //!
 //! Known limits, stated so nobody assumes them: the harness pins what the
-//! Rust side does today, including the one behavior an audit slice is
-//! changing (see `events/provider_error_after_tool_call.case.json`); it runs
+//! Rust side does today. A provider error after a collected tool call must
+//! settle it without executing it (C02-05); the invariant is mandatory. It runs
 //! no real provider, MCP server binary, or Node host. The `events`, `prompt`
 //! and `hooks` goldens were recorded on Unix and are compiled only there:
 //! hook fixtures are POSIX shell, and a Windows turn differs in shell and

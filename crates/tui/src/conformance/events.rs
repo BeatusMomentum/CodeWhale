@@ -81,6 +81,10 @@ pub(super) struct ScriptedProvider {
 
 impl ScriptedProvider {
     pub(super) fn from_script(model: &str, script: &Value) -> Self {
+        assert!(
+            script.as_array().is_some_and(|steps| !steps.is_empty()),
+            "provider_script must contain at least one response"
+        );
         let steps = script
             .as_array()
             .expect("provider_script is an array")
@@ -251,7 +255,7 @@ fn workspace_listing(workspace: &Path) -> BTreeMap<String, String> {
 
 pub(super) struct TurnRecord {
     pub(super) events: Vec<Event>,
-    pub(super) timed_out: bool,
+    pub(super) failure: Option<String>,
 }
 
 /// Drive one scripted turn inside `sandbox` on a fresh current-thread
@@ -261,6 +265,15 @@ pub(super) fn run_scripted_turn(
     sandbox: &Sandbox,
     case: &Value,
     script: &Value,
+) -> (TurnRecord, std::sync::Arc<ScriptedProvider>) {
+    run_scripted_turn_with_deadline(sandbox, case, script, event_deadline())
+}
+
+fn run_scripted_turn_with_deadline(
+    sandbox: &Sandbox,
+    case: &Value,
+    script: &Value,
+    deadline: Duration,
 ) -> (TurnRecord, std::sync::Arc<ScriptedProvider>) {
     let model = case["model"].as_str().expect("case.model");
     let provider = std::sync::Arc::new(ScriptedProvider::from_script(model, script));
@@ -281,7 +294,7 @@ pub(super) fn run_scripted_turn(
         let client: crate::core::model_client::SharedModelClient = provider.clone();
         let (engine, handle) = Engine::new_with_model_client(engine_config, &config, client);
         let op = send_message_op(case, &config);
-        drive_turn(engine, handle, op, &driver).await
+        drive_turn(engine, handle, op, &driver, deadline).await
     });
     drop(runtime);
     (record, provider)
@@ -294,22 +307,35 @@ async fn drive_turn(
     handle: crate::core::engine::EngineHandle,
     op: Op,
     driver: &[Value],
+    deadline: Duration,
 ) -> TurnRecord {
-    let run = tokio::spawn(engine.run());
+    let mut run = tokio::spawn(engine.run());
     handle.send(op).await.expect("send conformance turn");
     let rx = handle.rx_event.clone();
     let ids = protocol_ids();
     let mut events = Vec::new();
     let mut fired = vec![false; driver.len()];
-    let mut timed_out = false;
+    let mut failure = None;
+    let mut completed = false;
+    let expires = tokio::time::Instant::now() + deadline;
     loop {
-        let next =
-            tokio::time::timeout(event_deadline(), async { rx.write().await.recv().await }).await;
+        if tokio::time::Instant::now() >= expires {
+            failure = Some(format!(
+                "harness timeout: engine turn did not complete within {deadline:?}"
+            ));
+            break;
+        }
+        let next = golden::complete_within(
+            "engine turn",
+            expires.saturating_duration_since(tokio::time::Instant::now()),
+            async { rx.write().await.recv().await },
+        )
+        .await;
         let event = match next {
             Ok(Some(event)) => event,
             Ok(None) => break,
-            Err(_) => {
-                timed_out = true;
+            Err(error) => {
+                failure = Some(error);
                 break;
             }
         };
@@ -338,16 +364,45 @@ async fn drive_turn(
         let terminal = matches!(event, Event::TurnComplete { .. });
         events.push(event);
         if terminal {
+            completed = true;
             break;
         }
     }
-    let _ = handle.send(Op::Shutdown).await;
-    let _ = tokio::time::timeout(event_deadline(), run).await;
+    if !completed && failure.is_none() {
+        failure = Some("engine closed before TurnComplete".to_string());
+    }
+    handle.cancel();
+    match golden::complete_within(
+        "engine shutdown request",
+        deadline,
+        handle.send(Op::Shutdown),
+    )
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            failure.get_or_insert_with(|| format!("engine shutdown request failed: {error}"));
+        }
+        Err(error) => {
+            failure.get_or_insert(error);
+        }
+    }
+    match golden::complete_within("engine shutdown", deadline, &mut run).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => {
+            failure.get_or_insert_with(|| format!("engine task failed: {error}"));
+        }
+        Err(error) => {
+            failure.get_or_insert(error);
+            run.abort();
+            let _ = run.await;
+        }
+    }
     let mut rx = rx.write().await;
     while let Ok(event) = rx.try_recv() {
         events.push(event);
     }
-    TurnRecord { events, timed_out }
+    TurnRecord { events, failure }
 }
 
 fn rule_matches(when: &Value, projected: &Value) -> bool {
@@ -447,44 +502,31 @@ fn check_invariants(case: &Value, workspace: &Path, provider: &ScriptedProvider)
 }
 
 fn run_case(name: &str, case: &Value, failures: &mut Failures) {
+    run_case_with_deadline(name, case, failures, event_deadline());
+}
+
+fn run_case_with_deadline(name: &str, case: &Value, failures: &mut Failures, deadline: Duration) {
     let sandbox = Sandbox::new(case);
     let workspace = sandbox.workspace.clone();
-    let (record, provider) = run_scripted_turn(&sandbox, case, &case["provider_script"]);
+    let (record, provider) =
+        run_scripted_turn_with_deadline(&sandbox, case, &case["provider_script"], deadline);
+    if let Some(error) = record.failure {
+        failures.push(name, error);
+        return;
+    }
     let mut masker = sandbox.masker(VOLATILE_KEYS);
     let mut lines = normalize_events(&record.events, &mut masker);
-    let mut summary = json!({
+    let summary = json!({
         "model_requests": provider.stream_requests(),
         "non_streaming_requests": provider.other_requests(),
         "workspace_after": workspace_listing(&workspace),
     });
-    if record.timed_out {
-        summary["harness_timeout"] =
-            json!(format!("no engine event within {:?}", event_deadline()));
-    }
     lines.push(json!({ "harness_summary": summary }));
 
     let violations = check_invariants(case, &workspace, &provider);
-    let expected_change = case.get("expected_to_change");
-    match (violations.is_empty(), expected_change) {
-        (false, None) => {
-            failures.push(name, format!("invariant broken: {}", violations.join("; ")))
-        }
-        (false, Some(change)) => eprintln!(
-            "conformance: `{name}` pins current behavior that {} is changing ({}): {}",
-            change["owner"].as_str().unwrap_or("an audit slice"),
-            change["finding"].as_str().unwrap_or("unnamed finding"),
-            violations.join("; ")
-        ),
-        (true, Some(change)) if !golden::update_mode() => failures.push(
-            name,
-            format!(
-                "the invariant now holds, so {} has landed: re-record this golden with {}=1 \
-                 and delete `expected_to_change` from the case",
-                change["finding"].as_str().unwrap_or("the expected change"),
-                golden::UPDATE_ENV
-            ),
-        ),
-        _ => {}
+    if !violations.is_empty() {
+        failures.push(name, format!("invariant broken: {}", violations.join("; ")));
+        return;
     }
 
     failures.record(
@@ -493,6 +535,25 @@ fn run_case(name: &str, case: &Value, failures: &mut Failures) {
             &golden::family_dir(FAMILY).join(format!("{name}.golden.jsonl")),
             &golden::jsonl(&lines),
         ),
+    );
+}
+
+#[test]
+fn harness_timeout_rejects_a_real_stalled_turn() {
+    let mut case = golden::read_case(FAMILY, "plain_answer");
+    case["provider_script"][0]["then"] = json!("hang");
+    case["provider_script"][0]["events"] = json!([]);
+    let mut failures = Failures::default();
+    // This is the same recording path as normal cases. In update mode it must
+    // still fail and must not create this deliberately absent golden.
+    let name = "harness_timeout_control";
+    let path = golden::family_dir(FAMILY).join(format!("{name}.golden.jsonl"));
+    assert!(!path.exists());
+    run_case_with_deadline(name, &case, &mut failures, Duration::from_secs(1));
+    assert!(failures.contains("harness timeout"));
+    assert!(
+        !path.exists(),
+        "an incomplete turn was recorded as a golden"
     );
 }
 

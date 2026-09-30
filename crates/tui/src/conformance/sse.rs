@@ -6,7 +6,7 @@
 //! wire adapter yields. The first golden line is the request the adapter
 //! sent (method and path only — the body is the prompt family's business);
 //! every later line is one normalized [`super::stream_json`] event, or one
-//! `stream_failure` / `open_failure` record whose `detail` is informative.
+//! `stream_failure` / `open_failure` record with exact `detail` bytes.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -33,6 +33,18 @@ struct ReceivedRequest {
     path: String,
 }
 
+#[tokio::test]
+async fn harness_timeout_rejects_a_real_stalled_sse_connection() {
+    let mut case = golden::read_case(FAMILY, "anthropic_thinking_text_usage");
+    case["hold_open"] = json!(true);
+    case["framing"] = json!("chunked");
+    let outcome = replay_with_deadline(&case, Vec::new(), Duration::from_secs(1)).await;
+    assert!(
+        matches!(outcome, Err(error) if error.contains("harness timeout: SSE replay")),
+        "a stalled SSE connection became recordable output"
+    );
+}
+
 /// One-shot-per-connection loopback server that answers every request with
 /// the recording. `close` framing ends the body by closing the socket (a
 /// provider that stops sending); `chunked` framing uses HTTP chunks, and
@@ -55,6 +67,7 @@ struct Framing {
     chunked: bool,
     transport_cut: bool,
     chunk_bytes: usize,
+    hold_open: bool,
 }
 
 impl LoopbackRecording {
@@ -66,14 +79,19 @@ impl LoopbackRecording {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let captured = Arc::clone(&requests);
         let task = tokio::spawn(async move {
+            let mut connections = tokio::task::JoinSet::new();
             loop {
-                let Ok((socket, _)) = listener.accept().await else {
+                let accepted = tokio::select! {
+                    accepted = listener.accept() => accepted,
+                    _ = connections.join_next(), if !connections.is_empty() => continue,
+                };
+                let Ok((socket, _)) = accepted else {
                     break;
                 };
                 let body = body.clone();
                 let framing = framing.clone();
                 let captured = Arc::clone(&captured);
-                tokio::spawn(async move {
+                connections.spawn(async move {
                     serve(socket, body, framing, captured).await;
                 });
             }
@@ -152,6 +170,11 @@ async fn serve(
         }
         // Give the client a chance to observe a split line before the rest.
         tokio::task::yield_now().await;
+    }
+    if framing.hold_open {
+        // A stalled provider for the harness timeout regression. The listener
+        // owns this task, so dropping the replay cancels the open socket too.
+        std::future::pending::<()>().await;
     }
     if framing.chunked && !framing.transport_cut {
         let _ = socket.write_all(b"0\r\n\r\n").await;
@@ -250,11 +273,20 @@ fn request_for_case(case: &Value) -> MessageRequest {
     }
 }
 
-async fn replay(case: &Value, recording: Vec<u8>) -> Vec<Value> {
+async fn replay(case: &Value, recording: Vec<u8>) -> Result<Vec<Value>, String> {
+    replay_with_deadline(case, recording, STREAM_DEADLINE).await
+}
+
+async fn replay_with_deadline(
+    case: &Value,
+    recording: Vec<u8>,
+    deadline: Duration,
+) -> Result<Vec<Value>, String> {
     let framing = Framing {
         chunked: case["framing"].as_str() == Some("chunked"),
         transport_cut: case["transport_cut"].as_bool().unwrap_or(false),
         chunk_bytes: case["chunk_bytes"].as_u64().unwrap_or(0) as usize,
+        hold_open: case["hold_open"].as_bool().unwrap_or(false),
     };
     let server = LoopbackRecording::start(recording, framing).await;
     let route = case["route"].as_str().expect("case.route");
@@ -268,7 +300,7 @@ async fn replay(case: &Value, recording: Vec<u8>) -> Vec<Value> {
     };
 
     let mut lines = Vec::new();
-    let outcome = tokio::time::timeout(STREAM_DEADLINE, async {
+    let events = golden::complete_within("SSE replay", deadline, async {
         let mut events = Vec::new();
         match client.create_message_stream(request_for_case(case)).await {
             Err(error) => events.push(json!({
@@ -289,13 +321,10 @@ async fn replay(case: &Value, recording: Vec<u8>) -> Vec<Value> {
         }
         events
     })
-    .await;
-    let events = outcome.unwrap_or_else(|_| {
-        vec![json!({
-            "type": "harness_timeout",
-            "detail": format!("stream did not end within {STREAM_DEADLINE:?}"),
-        })]
-    });
+    .await?;
+    if events.is_empty() {
+        return Err("SSE replay produced no event or provider error".to_string());
+    }
 
     let requests = server.requests.lock().expect("request log").clone();
     lines.push(json!({
@@ -305,7 +334,7 @@ async fn replay(case: &Value, recording: Vec<u8>) -> Vec<Value> {
             .collect::<Vec<_>>(),
     }));
     lines.extend(events);
-    lines
+    Ok(lines)
 }
 
 #[tokio::test]
@@ -320,7 +349,13 @@ async fn recorded_sse_streams_match_goldens() {
             .map_or_else(|| format!("{name}.sse"), str::to_string);
         let recording = std::fs::read(dir.join(&recording_name))
             .unwrap_or_else(|error| panic!("read {recording_name}: {error}"));
-        let mut lines = replay(&case, recording).await;
+        let mut lines = match replay(&case, recording).await {
+            Ok(lines) => lines,
+            Err(error) => {
+                failures.push(name, error);
+                continue;
+            }
+        };
         let mut masker = golden::Masker::new(&[]);
         for line in &mut lines {
             masker.value(line);
@@ -329,7 +364,7 @@ async fn recorded_sse_streams_match_goldens() {
         // the events family can feed these goldens straight back in.
         for line in lines.iter().skip(1) {
             let kind = line["type"].as_str().unwrap_or_default();
-            if matches!(kind, "stream_failure" | "open_failure" | "harness_timeout") {
+            if matches!(kind, "stream_failure" | "open_failure") {
                 continue;
             }
             if let Err(message) = stream_json::round_trips(line) {

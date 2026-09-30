@@ -20,7 +20,10 @@ CODEWHALE_CONFORMANCE_UPDATE=1 cargo test -p codewhale-tui --lib -- conformance:
 
 Default is compare-only. Update mode rewrites drifted goldens and refuses to
 run when `CI` is set. A golden change is a behavior change and is reviewed as
-one.
+one. Harness deadlines, incomplete turns, broken invariants, and empty cases
+are failures in both modes and cannot be recorded as goldens. Provider timeout
+errors are legitimate observable outcomes; a harness timing out is missing
+evidence.
 
 Platforms: `sse` and `mcp` run everywhere. `events`, `prompt` and `hooks`
 goldens were recorded on Unix and compile only there — hook fixtures are POSIX
@@ -83,10 +86,9 @@ left in the workspace (path → sha256 prefix). `invariants` in a case are
 checked independently of the golden (`workspace_file_absent`,
 `workspace_file_present`, `max_model_requests`).
 
-A case with `expected_to_change` pins current behavior that a named change is
-fixing. Its invariant is expected to fail today; when the invariant starts to
-hold, the runner fails until the golden is re-recorded and the block deleted.
-`events/provider_error_after_tool_call` is that case for C02-05 (#6561).
+`events/provider_error_after_tool_call` requires the C02-05 (#6561) authority:
+a failed response executes no collected tool call and issues no retry. Its
+invariants are checked before recording, with no exemption for known defects.
 
 ### MCP transcripts (`mcp` goldens)
 
@@ -127,7 +129,8 @@ in a command runs a helper that saves the hook's stdin and every documented
 environment variable (`CODEWHALE_*` / `DEEPSEEK_*`, see `HOOK_ENV_CONTRACT`).
 The golden records the outcome — `{"admit": {requires_approval, updated_input,
 additional_context}}` or `{"refuse": {kind, detail}}` for `tool_call_before`,
-the observer results for `tool_call_after` — and, per hook, whether it ran,
+the observer results (including exact stdout, stderr and error) for
+`tool_call_after` — and, per hook, whether it ran,
 its stdin (the schema-1 document, parsed) and its contract environment. The
 hook session id and temp paths are masked. POSIX shell: Unix only.
 
@@ -153,6 +156,7 @@ case, and by passing the Rust runner once it is wired in:
   regression net around it while its edges move. A host-side consumer of
   `EventMsg` can read these goldens as its contract.
 
-Fields named `detail` carry human-readable error text; the Rust runner
-compares them exactly, a second implementation may compare them loosely (the
-`kind` / `type` beside them is the contract).
+Fields named `detail` carry human-readable error text and are compared exactly,
+including by a second implementation. Only the explicitly documented masks
+apply. No whitespace, line-ending, error-text, or event-order normalization may
+be added to make a drift pass. `.gitattributes` pins fixture checkout bytes to LF.
