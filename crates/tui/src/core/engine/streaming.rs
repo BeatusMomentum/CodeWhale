@@ -7,6 +7,21 @@
 use codewhale_models::ToolCaller;
 use std::time::Duration;
 
+impl super::Engine {
+    /// Forward a nonterminal stream observation through the existing event
+    /// queue. Backpressure remains lossless while the turn is live; cancellation
+    /// drops a pending observation so a stalled consumer cannot keep the model
+    /// stream alive. Terminal settlement still owns ordered, lossless delivery
+    /// and may wait for a consumer that never drains this bounded queue.
+    pub(super) async fn send_stream_event(&self, event: super::Event) -> bool {
+        tokio::select! {
+            biased;
+            () = self.cancel_token.cancelled() => false,
+            result = self.tx_event.send(event) => result.is_ok(),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ContentBlockKind {
     Text,
@@ -40,6 +55,23 @@ impl ToolUseState {
 
 /// Maximum total bytes of text, reasoning and tool-argument content before aborting the stream.
 pub(super) const STREAM_MAX_CONTENT_BYTES: usize = 10 * 1024 * 1024; // 10 MB
+/// A response can contain many empty tool starts without spending the byte
+/// budget. Bound that batch before any call is retained or admitted. A lower
+/// configured per-turn tool budget remains authoritative at execution.
+pub(super) const MAX_TOOL_CALLS_PER_RESPONSE: usize = 256;
+
+pub(super) fn tool_call_limit_error() -> crate::error_taxonomy::ErrorEnvelope {
+    crate::error_taxonomy::ErrorEnvelope::new(
+        crate::error_taxonomy::ErrorCategory::InvalidInput,
+        crate::error_taxonomy::ErrorSeverity::Error,
+        false,
+        "response_tool_call_limit",
+        format!(
+            "Model response exceeded the maximum of {MAX_TOOL_CALLS_PER_RESPONSE} tool calls; no call from this response was executed"
+        ),
+    )
+}
+
 /// Sanity backstop for total stream wall-clock duration. **Not** a routine
 /// kill switch — the stream chunk idle timeout is the primary stall
 /// detector. The wall-clock cap is here only to bound pathological cases
