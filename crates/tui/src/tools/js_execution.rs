@@ -417,7 +417,6 @@ mod tests {
     #[tokio::test]
     async fn timeout_kills_the_node_child_instead_of_orphaning_it() {
         if !node_present() {
-            eprintln!("skipping: node not present");
             return;
         }
         let workspace = tempdir().expect("workspace tempdir");
@@ -462,7 +461,6 @@ mod tests {
     #[tokio::test]
     async fn timeout_returns_promptly_even_when_a_grandchild_holds_the_pipes() {
         if !node_present() {
-            eprintln!("skipping: node not present");
             return;
         }
         let workspace = tempdir().expect("workspace tempdir");
