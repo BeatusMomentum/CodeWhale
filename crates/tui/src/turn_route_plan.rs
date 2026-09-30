@@ -386,6 +386,7 @@ mod tests {
         let spent_in = crate::cost_status::scope_token();
         let _closed = crate::cost_status::close_current_scope();
         let batch = crate::cost_status::RuntimeUsageBatch {
+            decisions: Vec::new(),
             records: batch
                 .records
                 .iter()
