@@ -334,7 +334,7 @@ async fn reconcile_does_not_recover_an_unpublished_or_unsettled_seed() {
             let mut thread = opened.load_thread(&thread_id).unwrap();
             thread.latest_turn_id = None;
             opened.save_thread(&thread).unwrap();
-            let journal = json!({
+            let journal = serde_json::json!({
                 "thread_id": thread_id,
                 "previous_latest_turn_id": null,
                 "turn_ids": turns.iter().map(|turn| turn.id.clone()).collect::<Vec<_>>(),
