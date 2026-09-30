@@ -11730,6 +11730,74 @@ async fn live_goal_progress_is_revision_fenced_and_settled_once() -> Result<()> 
 }
 
 #[tokio::test]
+async fn startup_discards_an_unpublished_partial_seed_and_keeps_a_committed_one() -> Result<()> {
+    let runtime_dir = test_runtime_dir();
+    let manager = test_manager(runtime_dir.clone())?;
+    let messages: Vec<Message> = serde_json::from_value(json!([
+        {"role":"user","content":[{"type":"text","text":"SEEDED"}]},
+        {"role":"assistant","content":[{"type":"text","text":"SEEDED ANSWER"}]}
+    ]))?;
+    let mut fixtures = Vec::new();
+    for _ in 0..2 {
+        let thread = manager
+            .create_thread(CreateThreadRequest::default())
+            .await?;
+        manager
+            .seed_thread_from_messages(&thread.id, &messages)
+            .await?;
+        assert!(
+            !manager.store.seed_journal_path(&thread.id)?.exists(),
+            "a committed seed leaves no journal"
+        );
+        let turns = manager.store.list_turns_for_thread(&thread.id)?;
+        assert_eq!(turns.len(), 1);
+        let items = manager.store.list_items_for_turn(&turns[0].id)?;
+        assert_eq!(items.len(), 2);
+        // Fault fixture: the journal the seed wrote before its first record.
+        manager.store.save_seed_journal(&SeedJournal {
+            thread_id: thread.id.clone(),
+            previous_latest_turn_id: None,
+            turn_ids: turns.iter().map(|turn| turn.id.clone()).collect(),
+            item_ids: items.iter().map(|item| item.id.clone()).collect(),
+        })?;
+        fixtures.push((thread.id, turns, items));
+    }
+    // The first thread crashed before its commit record: every turn and item
+    // is on disk, but the thread pointer never advanced.
+    let (partial_id, partial_turns, partial_items) = &fixtures[0];
+    let mut uncommitted = manager.store.load_thread(partial_id)?;
+    uncommitted.latest_turn_id = None;
+    manager.store.save_thread(&uncommitted)?;
+    drop(manager);
+
+    let reopened = test_manager(runtime_dir)?;
+    assert!(
+        reopened.store.list_turns_for_thread(partial_id)?.is_empty(),
+        "an unpublished partial seed must not be restored as history"
+    );
+    for item in partial_items {
+        assert!(!reopened.store.item_path(&item.id)?.exists());
+    }
+    assert!(!reopened.store.turn_path(&partial_turns[0].id)?.exists());
+    assert_eq!(reopened.store.load_thread(partial_id)?.latest_turn_id, None);
+    assert!(!reopened.store.seed_journal_path(partial_id)?.exists());
+
+    // The second crashed after its commit, before removing the journal.
+    let (committed_id, committed_turns, _) = &fixtures[1];
+    assert_eq!(
+        reopened.store.list_turns_for_thread(committed_id)?.len(),
+        1,
+        "a committed seed survives recovery"
+    );
+    assert_eq!(
+        reopened.store.load_thread(committed_id)?.latest_turn_id,
+        Some(committed_turns[0].id.clone())
+    );
+    assert!(!reopened.store.seed_journal_path(committed_id)?.exists());
+    Ok(())
+}
+
+#[tokio::test]
 async fn transition_goal_status_commits_only_the_read_revision() -> Result<()> {
     let manager = test_manager(test_runtime_dir())?;
     let thread = manager

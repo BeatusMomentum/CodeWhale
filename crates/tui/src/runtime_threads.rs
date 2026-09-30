@@ -2855,6 +2855,102 @@ impl RuntimeThreadStore {
         Ok(())
     }
 
+    /// Journal for one history seed into an existing thread (#6555), kept
+    /// beside the thread record as `<thread>.seed` (listings read only
+    /// `.json`). It names every record the seed will write before the first
+    /// one lands; the thread record — the seed's commit record — is written
+    /// after them, and the journal is removed last.
+    fn seed_journal_path(&self, thread_id: &str) -> Result<PathBuf> {
+        Self::record_path(&self.threads_dir, thread_id, "seed", "thread id")
+    }
+
+    fn save_seed_journal(&self, journal: &SeedJournal) -> Result<()> {
+        let path = self.seed_journal_path(&journal.thread_id)?;
+        reject_symlinked_store_file(&path)?;
+        write_json_atomic(&path, journal)
+            .with_context(|| format!("Failed to write seed journal {}", path.display()))
+    }
+
+    fn remove_seed_journal(&self, thread_id: &str) -> Result<()> {
+        remove_file_if_exists(&self.seed_journal_path(thread_id)?)
+    }
+
+    /// Remove every record an uncommitted seed named, then its journal. Ids in
+    /// a journal were minted fresh for that seed, so nothing else is touched.
+    fn discard_seed(&self, journal: &SeedJournal) -> Result<()> {
+        for turn_id in &journal.turn_ids {
+            self.remove_turn(turn_id)?;
+        }
+        for item_id in &journal.item_ids {
+            self.remove_item(item_id)?;
+        }
+        self.remove_seed_journal(&journal.thread_id)
+    }
+
+    /// Startup half of the seed transaction: a journal whose thread pointer
+    /// never moved past the one it recorded is an unpublished partial seed and
+    /// is discarded, so recovery can never restore it as history. A journal
+    /// whose pointer moved belongs to a committed seed and is simply removed.
+    fn settle_seed_journals(&self) -> Result<()> {
+        let threads_dir = checked_existing_runtime_store_dir(&self.threads_dir)?;
+        for entry in fs::read_dir(&threads_dir)
+            .with_context(|| format!("Failed to read {}", threads_dir.display()))?
+        {
+            let path = entry?.path();
+            if path.extension().is_none_or(|ext| ext != "seed") {
+                continue;
+            }
+            // The journal is written with an atomic replace, so an unreadable
+            // one was damaged outside this writer; report it rather than let
+            // it stop every thread's recovery.
+            let journal = match read_store_file(&path).and_then(|raw| {
+                serde_json::from_str::<SeedJournal>(&raw)
+                    .with_context(|| format!("Failed to parse {}", path.display()))
+            }) {
+                Ok(journal)
+                    if self
+                        .seed_journal_path(&journal.thread_id)
+                        .is_ok_and(|expected| expected.file_name() == path.file_name()) =>
+                {
+                    journal
+                }
+                Ok(_) => {
+                    tracing::warn!(
+                        target: "runtime",
+                        "seed journal {} names another thread; left in place",
+                        path.display()
+                    );
+                    continue;
+                }
+                Err(error) => {
+                    tracing::warn!(target: "runtime", "unreadable seed journal left in place: {error:#}");
+                    continue;
+                }
+            };
+            let committed = match self.load_thread(&journal.thread_id) {
+                Ok(thread) => thread.latest_turn_id != journal.previous_latest_turn_id,
+                Err(_) if !self.thread_path(&journal.thread_id)?.exists() => false,
+                Err(error) => {
+                    // An unreadable thread is skipped by recovery as well, so
+                    // none of these records can be published; keep the journal
+                    // for the pass that can read the thread.
+                    tracing::warn!(
+                        target: "runtime",
+                        thread_id = %journal.thread_id,
+                        "seed journal left for a thread that could not be read: {error:#}"
+                    );
+                    continue;
+                }
+            };
+            if committed {
+                self.remove_seed_journal(&journal.thread_id)?;
+            } else {
+                self.discard_seed(&journal)?;
+            }
+        }
+        Ok(())
+    }
+
     fn remove_turn(&self, turn_id: &str) -> Result<()> {
         remove_file_if_exists(&self.turn_path(turn_id)?)
     }
@@ -6211,6 +6307,17 @@ impl RuntimeThreadManager {
                 .load(std::sync::atomic::Ordering::SeqCst),
         )
     }
+}
+
+/// Durable intent of one `seed_thread_from_messages` transaction (#6555).
+/// The seed committed exactly when the thread's `latest_turn_id` moved off
+/// `previous_latest_turn_id`; see [`RuntimeThreadStore::settle_seed_journals`].
+#[derive(Debug, Serialize, Deserialize)]
+struct SeedJournal {
+    thread_id: String,
+    previous_latest_turn_id: Option<String>,
+    turn_ids: Vec<String>,
+    item_ids: Vec<String>,
 }
 
 /// Helper types for `seed_thread_from_messages` — intermediate representation
@@ -11266,6 +11373,9 @@ impl RuntimeThreadManager {
             }
         }
 
+        let previous_latest_turn_id = thread.latest_turn_id.clone();
+        let mut seed_items: Vec<TurnItemRecord> = Vec::new();
+        let mut seed_turns: Vec<TurnRecord> = Vec::new();
         for turn_seed in turns {
             let turn_at = next_seed_stamp();
             let turn_id = runtime_record_id("turn");
@@ -11295,7 +11405,7 @@ impl RuntimeThreadManager {
                     item.set_image_content(turn_seed.image_content.clone());
                     thread.schema_version = IMAGE_RUNTIME_SCHEMA_VERSION;
                 }
-                self.store.save_item(&item)?;
+                seed_items.push(item);
                 item_ids.push(item_id);
             }
 
@@ -11310,7 +11420,7 @@ impl RuntimeThreadManager {
                         } else {
                             text.clone()
                         };
-                        self.store.save_item(&TurnItemRecord {
+                        seed_items.push(TurnItemRecord {
                             schema_version: CURRENT_RUNTIME_SCHEMA_VERSION,
                             id: item_id.clone(),
                             turn_id: turn_id.clone(),
@@ -11323,7 +11433,7 @@ impl RuntimeThreadManager {
                             artifacts: Vec::new(),
                             started_at: Some(item_at),
                             ended_at: Some(item_at),
-                        })?;
+                        });
                     }
                     SeedItem::Thinking(thinking) => {
                         let thinking_summary = if thinking.len() > SUMMARY_LIMIT {
@@ -11331,7 +11441,7 @@ impl RuntimeThreadManager {
                         } else {
                             thinking.clone()
                         };
-                        self.store.save_item(&TurnItemRecord {
+                        seed_items.push(TurnItemRecord {
                             schema_version: CURRENT_RUNTIME_SCHEMA_VERSION,
                             id: item_id.clone(),
                             turn_id: turn_id.clone(),
@@ -11344,7 +11454,7 @@ impl RuntimeThreadManager {
                             artifacts: Vec::new(),
                             started_at: Some(item_at),
                             ended_at: Some(item_at),
-                        })?;
+                        });
                     }
                     SeedItem::ToolUse {
                         id: tool_id,
@@ -11364,7 +11474,7 @@ impl RuntimeThreadManager {
                                 s.clone()
                             }
                         });
-                        self.store.save_item(&TurnItemRecord {
+                        seed_items.push(TurnItemRecord {
                             schema_version: CURRENT_RUNTIME_SCHEMA_VERSION,
                             id: item_id.clone(),
                             turn_id: turn_id.clone(),
@@ -11393,7 +11503,7 @@ impl RuntimeThreadManager {
                             artifacts: Vec::new(),
                             started_at: Some(item_at),
                             ended_at: Some(item_at),
-                        })?;
+                        });
                     }
                     SeedItem::ToolResult {
                         tool_use_id,
@@ -11421,7 +11531,7 @@ impl RuntimeThreadManager {
                             metadata
                                 .insert("content_blocks".to_string(), Value::Array(blocks.clone()));
                         }
-                        self.store.save_item(&TurnItemRecord {
+                        seed_items.push(TurnItemRecord {
                             schema_version: CURRENT_RUNTIME_SCHEMA_VERSION,
                             id: item_id.clone(),
                             turn_id: turn_id.clone(),
@@ -11438,7 +11548,7 @@ impl RuntimeThreadManager {
                             artifacts: Vec::new(),
                             started_at: Some(item_at),
                             ended_at: Some(item_at),
-                        })?;
+                        });
                     }
                 }
                 item_ids.push(item_id);
@@ -11446,7 +11556,7 @@ impl RuntimeThreadManager {
 
             // Only create a turn if there's content.
             if !item_ids.is_empty() {
-                self.store.save_turn(&TurnRecord {
+                seed_turns.push(TurnRecord {
                     max_output_tokens: None,
                     schema_version: if turn_seed.image_content.is_empty() {
                         CURRENT_RUNTIME_SCHEMA_VERSION
@@ -11489,14 +11599,49 @@ impl RuntimeThreadManager {
                     artifacts: Vec::new(),
                     workspace: None,
                     workspace_snapshots: Vec::new(),
-                })?;
+                });
 
                 thread.latest_turn_id = Some(turn_id);
                 thread.updated_at = turn_at;
             }
         }
 
-        self.store.save_thread(&thread)?;
+        // One journaled transaction (#6555): the journal names every record
+        // first, then items, their turns, and last the thread record — the
+        // commit record that advances `latest_turn_id`. A crash in between
+        // leaves a journal whose pointer never moved, and startup recovery
+        // discards those records instead of restoring a partial history.
+        let journal = SeedJournal {
+            thread_id: thread_id.to_string(),
+            previous_latest_turn_id,
+            turn_ids: seed_turns.iter().map(|turn| turn.id.clone()).collect(),
+            item_ids: seed_items.iter().map(|item| item.id.clone()).collect(),
+        };
+        self.store.save_seed_journal(&journal)?;
+        let published = (|| -> Result<()> {
+            self.store
+                .save_items_batch(&seed_items.iter().collect::<Vec<_>>())?;
+            for turn in &seed_turns {
+                self.store.save_turn(turn)?;
+            }
+            self.store.save_thread(&thread)
+        })();
+        if let Err(error) = published {
+            // Roll back now; a rollback that fails leaves the journal, and
+            // startup finishes it.
+            if let Err(cleanup) = self.store.discard_seed(&journal) {
+                tracing::warn!(
+                    target: "runtime",
+                    thread_id,
+                    "partial seed left for startup recovery: {cleanup:#}"
+                );
+            }
+            return Err(error);
+        }
+        // Committed. A journal that outlives this line is settled as committed.
+        if let Err(error) = self.store.remove_seed_journal(thread_id) {
+            tracing::warn!(target: "runtime", thread_id, "seed journal not removed: {error:#}");
+        }
         drop(thread_mutation);
         self.emit_event(
             thread_id,
@@ -16551,6 +16696,9 @@ impl RuntimeThreadManager {
     }
 
     fn recover_interrupted_state(&self) -> Result<()> {
+        // Unpublished history seeds go first: the pointer recomputation below
+        // would otherwise publish their turns as recovered history (#6555).
+        self.store.settle_seed_journals()?;
         let now = Utc::now();
         let mut threads = self
             .store
