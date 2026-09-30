@@ -2607,7 +2607,7 @@ fn when_to_use_merged_into_trigger() {
         "Short summary. Use when: fixing a failing build"
     );
     let (summary, trigger) = super::split_trigger(&skill.description);
-    assert_eq!(summary.trim(), "Short summary.");
+    assert_eq!(summary.trim(), "Short summary");
     assert!(trigger.unwrap().contains("fixing a failing build"));
 }
 
