@@ -643,6 +643,34 @@ export interface ConstitutionDict {
   configuration: string;
 }
 
+/** `app/[locale]/runtime/page.tsx`. */
+export interface RuntimeDict {
+  metaTitle: string;
+  metaDescription: string;
+  kicker: string;
+  /** Page H1. */
+  title: string;
+  /** The H1 again in the other script, set beside it (the bilingual Han title). */
+  titleAside: string;
+  /** BCP 47 language of `titleAside`. */
+  titleAsideLang: string;
+  lede: string;
+  integrationsTitle: string;
+  /** Status label on an experimental integration. */
+  experimental: string;
+  trustTitle: string;
+  factsTitle: string;
+  version: string;
+  toolCount: string;
+  sandboxBackends: string;
+  /** Summary of the maintainer-facing disclosure (crates, source revision). */
+  details: string;
+  sourceRevision: string;
+  docsLead: string;
+  runtimeApiDoc: string;
+  mcpDoc: string;
+}
+
 export type DocsHooksDict = DocsPageDict;
 
 export type DocsTroubleshootingDict = DocsPageDict;
