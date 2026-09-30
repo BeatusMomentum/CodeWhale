@@ -2728,10 +2728,7 @@ mod tests {
         let mut usage = Usage::default();
 
         let result = compact_messages_safe(&client, &messages, None, &envelope, &mut usage).await;
-        assert!(
-            result.is_ok(),
-            "the retry after shrinking must succeed: {result:?}"
-        );
+        assert!(result.is_ok(), "the retry after shrinking must succeed");
 
         let requests = client.requests.lock().expect("requests").clone();
         assert_eq!(requests.len(), 2, "one rejection, one retry");
@@ -2769,7 +2766,7 @@ mod tests {
         let result = compact_messages_safe(&client, &messages, None, &envelope, &mut usage).await;
         assert!(
             result.is_ok(),
-            "the retry after replacing images must succeed: {result:?}"
+            "the retry after replacing images must succeed"
         );
 
         let requests = client.requests.lock().expect("requests").clone();
@@ -2809,7 +2806,7 @@ mod tests {
         let result = compact_messages_safe(&client, &messages, None, &envelope, &mut usage).await;
         assert!(
             result.is_ok(),
-            "the gateway-page rejection must enter the ladder: {result:?}"
+            "the gateway-page rejection must enter the ladder"
         );
         let requests = client.requests.lock().expect("requests").clone();
         assert_eq!(requests.len(), 2, "one rejection, one retry");
@@ -2848,7 +2845,7 @@ mod tests {
         let result = compact_messages_safe(&client, &messages, None, &envelope, &mut usage).await;
         assert!(
             result.is_ok(),
-            "in-budget images must still let the ladder finish: {result:?}"
+            "in-budget images must still let the ladder finish"
         );
         let requests = client.requests.lock().expect("requests").clone();
         assert_eq!(requests.len(), 2, "replace directly, no identical retry");
