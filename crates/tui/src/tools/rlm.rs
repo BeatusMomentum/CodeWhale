@@ -511,9 +511,7 @@ impl RlmTool {
                 tokio::time::timeout_at(bridge.deadline(), kernel.run(code, Some(&bridge)))
                     .await
                     .unwrap_or_else(|_| {
-                        Err(anyhow::anyhow!(
-                            "RLM evaluation reached the parent turn deadline"
-                        ))
+                        Err("RLM evaluation reached the parent turn deadline".into())
                     });
             let usage = bridge.usage_snapshot().await;
             let round = match round_result {
