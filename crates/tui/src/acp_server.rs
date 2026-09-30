@@ -672,7 +672,7 @@ struct PreparedAcpTool {
 /// carve-out: a remembered exact allow rule may clear the ordinary tool hold,
 /// but the built-in safety floor and repository law can always re-add a prompt
 /// or hard block afterwards.
-fn prepare_acp_tool_admission(
+async fn prepare_acp_tool_admission(
     config: &Config,
     registry: &ToolRegistry,
     call: &PendingToolCall,
@@ -745,14 +745,14 @@ fn prepare_acp_tool_admission(
     } else {
         crate::tui::auto_review::RunOrigin::Headless
     };
-    let review_context = crate::tui::auto_review::AutoReviewContext::from_tool_call(
+    let review_context = crate::tui::auto_review::AutoReviewContext::from_tool_call_async(
         &call.name,
         &prepared.input,
         run_origin,
         approval_mode,
-        crate::config::is_workspace_trusted(workspace),
         Some(workspace),
-    );
+    )
+    .await?;
     let (auto_review, _audit) =
         auto_review_plan_decision_for_context(&config.auto_review_policy(), &review_context);
     match auto_review {
@@ -828,7 +828,8 @@ async fn prepare_acp_tool_with_hooks(
     if let Some(updated_input) = hook_outcome.updated_input {
         final_call.input = updated_input;
     }
-    let (prepared, mut admission) = prepare_acp_tool_admission(config, registry, &final_call)?;
+    let (prepared, mut admission) =
+        prepare_acp_tool_admission(config, registry, &final_call).await?;
     if hook_outcome.requires_approval && matches!(admission, AcpToolAdmission::Auto) {
         admission = AcpToolAdmission::RequestPermission(
             "A ToolCallBefore hook requires explicit approval for this call.".to_string(),
@@ -3218,8 +3219,8 @@ mod tests {
         assert_eq!(acp_approval_mode(&Config::default()), ApprovalMode::Suggest);
     }
 
-    #[test]
-    fn yolo_admission_auto_executes_write_without_permission_round_trip() {
+    #[tokio::test]
+    async fn yolo_admission_auto_executes_write_without_permission_round_trip() {
         // #6337: an unattended `--yolo` session must execute tools instead of
         // stalling on permission requests no headless client answers.
         let (dir, registry) = workspace_registry();
@@ -3231,13 +3232,15 @@ mod tests {
             "File",
             json!({"action": "write", "path": "yolo.txt", "content": "yolo"}),
         );
-        let (_, admission) = prepare_acp_tool_admission(&config, &registry, &call).unwrap();
+        let (_, admission) = prepare_acp_tool_admission(&config, &registry, &call)
+            .await
+            .unwrap();
         assert_eq!(admission, AcpToolAdmission::Auto);
         assert_eq!(registry.context().workspace, dir.path());
     }
 
-    #[test]
-    fn default_admission_still_requests_permission_for_write() {
+    #[tokio::test]
+    async fn default_admission_still_requests_permission_for_write() {
         // Pins the Ask default the yolo test above contrasts with: without
         // `--yolo`, a write surfaces a permission request to the client.
         let (_dir, registry) = workspace_registry();
@@ -3245,8 +3248,9 @@ mod tests {
             "File",
             json!({"action": "write", "path": "ask.txt", "content": "ask"}),
         );
-        let (_, admission) =
-            prepare_acp_tool_admission(&Config::default(), &registry, &call).unwrap();
+        let (_, admission) = prepare_acp_tool_admission(&Config::default(), &registry, &call)
+            .await
+            .unwrap();
         assert!(matches!(admission, AcpToolAdmission::RequestPermission(_)));
     }
 
@@ -4429,7 +4433,9 @@ mod tests {
         );
         let registry = build_acp_tool_registry(&config, dir.path(), false);
         let raw = pending_call("File", json!({"action": "read", "path": "safe.txt"}));
-        let (_, raw_admission) = prepare_acp_tool_admission(&config, &registry, &raw).unwrap();
+        let (_, raw_admission) = prepare_acp_tool_admission(&config, &registry, &raw)
+            .await
+            .unwrap();
         assert_eq!(raw_admission, AcpToolAdmission::Auto);
 
         let prepared = prepare_acp_tool_with_hooks(&config, "test-model", &registry, &raw)
@@ -4443,8 +4449,8 @@ mod tests {
         assert!(!dir.path().join("rewritten.txt").exists());
     }
 
-    #[test]
-    fn acp_admission_is_input_specific_and_has_no_workspace_write_carve_out() {
+    #[tokio::test]
+    async fn acp_admission_is_input_specific_and_has_no_workspace_write_carve_out() {
         let (dir, registry) = workspace_registry();
         let config = Config::default();
         let read = pending_call("File", json!({"action": "read", "path": "src/lib.rs"}));
@@ -4453,8 +4459,12 @@ mod tests {
             json!({"action": "write", "path": "src/lib.rs", "content": "new"}),
         );
 
-        let (_, read_admission) = prepare_acp_tool_admission(&config, &registry, &read).unwrap();
-        let (_, write_admission) = prepare_acp_tool_admission(&config, &registry, &write).unwrap();
+        let (_, read_admission) = prepare_acp_tool_admission(&config, &registry, &read)
+            .await
+            .unwrap();
+        let (_, write_admission) = prepare_acp_tool_admission(&config, &registry, &write)
+            .await
+            .unwrap();
 
         assert_eq!(read_admission, AcpToolAdmission::Auto);
         assert!(matches!(
@@ -4464,8 +4474,8 @@ mod tests {
         assert_eq!(registry.context().workspace, dir.path());
     }
 
-    #[test]
-    fn acp_admission_folds_typed_rules_then_headless_safety_floor() {
+    #[tokio::test]
+    async fn acp_admission_folds_typed_rules_then_headless_safety_floor() {
         let (dir, registry) = workspace_registry();
         let workspace = dir.path().to_string_lossy().into_owned();
         let input = json!({"action": "write", "path": "allowed.txt", "content": "new"});
@@ -4474,12 +4484,16 @@ mod tests {
         let allow = codewhale_execpolicy::ToolAskRule::file_path("write_file", "allowed.txt")
             .into_exact_workspace_allow(workspace.clone());
         let (_, admission) =
-            prepare_acp_tool_admission(&config_with_policy_rule(allow), &registry, &call).unwrap();
+            prepare_acp_tool_admission(&config_with_policy_rule(allow), &registry, &call)
+                .await
+                .unwrap();
         assert_eq!(admission, AcpToolAdmission::Auto);
 
         let ask = codewhale_execpolicy::ToolAskRule::file_path("write_file", "allowed.txt");
         let (_, admission) =
-            prepare_acp_tool_admission(&config_with_policy_rule(ask), &registry, &call).unwrap();
+            prepare_acp_tool_admission(&config_with_policy_rule(ask), &registry, &call)
+                .await
+                .unwrap();
         assert!(matches!(
             admission,
             AcpToolAdmission::RequestPermission(reason) if reason.contains("requires approval")
@@ -4490,7 +4504,9 @@ mod tests {
             ..codewhale_execpolicy::ToolAskRule::file_path("write_file", "allowed.txt")
         };
         let (_, admission) =
-            prepare_acp_tool_admission(&config_with_policy_rule(deny), &registry, &call).unwrap();
+            prepare_acp_tool_admission(&config_with_policy_rule(deny), &registry, &call)
+                .await
+                .unwrap();
         assert!(matches!(admission, AcpToolAdmission::Block(_)));
 
         let command = "rm -rf ~/";
@@ -4502,6 +4518,7 @@ mod tests {
             &registry,
             &shell_call,
         )
+        .await
         .unwrap();
         assert!(matches!(
             admission,
@@ -4510,8 +4527,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn acp_admission_blocks_detached_and_stateful_bash_inputs() {
+    #[tokio::test]
+    async fn acp_admission_blocks_detached_and_stateful_bash_inputs() {
         let (_dir, registry) = workspace_registry();
         for input in [
             json!({"command": "sleep 30", "background": true}),
@@ -4524,8 +4541,9 @@ mod tests {
             json!({"action": "cancel", "task_id": "shell-1"}),
         ] {
             let call = pending_call("Bash", input);
-            let (_, admission) =
-                prepare_acp_tool_admission(&Config::default(), &registry, &call).unwrap();
+            let (_, admission) = prepare_acp_tool_admission(&Config::default(), &registry, &call)
+                .await
+                .unwrap();
             assert!(matches!(
                 admission,
                 AcpToolAdmission::Block(reason)
@@ -4535,8 +4553,8 @@ mod tests {
         assert!(!acp_shell_command_requests_detach("echo '&' && echo done"));
     }
 
-    #[test]
-    fn acp_admission_auto_review_and_repo_law_override_typed_allow() {
+    #[tokio::test]
+    async fn acp_admission_auto_review_and_repo_law_override_typed_allow() {
         let (dir, registry) = workspace_registry();
         let workspace = dir.path().to_string_lossy().into_owned();
         let command = "cargo test";
@@ -4557,6 +4575,7 @@ mod tests {
             &registry,
             &pending_call("Bash", json!({"command": command})),
         )
+        .await
         .unwrap();
         assert!(matches!(
             admission,
@@ -4584,7 +4603,9 @@ mod tests {
                 "File",
                 json!({"action": "write", "path": path, "content": "new"}),
             );
-            let (_, admission) = prepare_acp_tool_admission(&config, &registry, &call).unwrap();
+            let (_, admission) = prepare_acp_tool_admission(&config, &registry, &call)
+                .await
+                .unwrap();
             if expected_block {
                 assert!(matches!(
                     admission,

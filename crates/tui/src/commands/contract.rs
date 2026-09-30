@@ -3099,19 +3099,33 @@ impl CommandSkillGroupContext for SkillGroupAdapter<'_> {
 
     fn restore_snapshot(&mut self, id: &str) -> Result<(), String> {
         let workspace = self.host.app.borrow().workspace.clone();
-        let repo = match crate::snapshot::SnapshotRepo::open_or_init(&workspace) {
-            Ok(repo) => repo,
-            Err(err) => {
-                return Err(format!(
-                    "Snapshot repo unavailable for {}: {err}",
-                    workspace.display(),
-                ));
-            }
+        let id = id.to_owned();
+        let restore = move || {
+            let repo = match crate::snapshot::SnapshotRepo::open_or_init(&workspace) {
+                Ok(repo) => repo,
+                Err(err) => {
+                    return Err(format!(
+                        "Snapshot repo unavailable for {}: {err}",
+                        workspace.display(),
+                    ));
+                }
+            };
+            let id = crate::snapshot::SnapshotId::parse(&id)
+                .map_err(|err| format!("Restore failed: {err}"))?;
+            repo.restore(&id)
+                .map_err(|err| format!("Restore failed: {err}"))
         };
-        let id = crate::snapshot::SnapshotId::parse(id)
-            .map_err(|err| format!("Restore failed: {err}"))?;
-        repo.restore(&id)
-            .map_err(|err| format!("Restore failed: {err}"))
+        // Standalone synchronous hosts have no runtime worker to protect.
+        // Live TUI dispatch uses the existing bridge and blocking pool for
+        // the entire restore, including its mandatory safety snapshot.
+        if tokio::runtime::Handle::try_current().is_err() {
+            return restore();
+        }
+        run_async(async move {
+            tokio::task::spawn_blocking(restore)
+                .await
+                .map_err(|error| format!("Restore task failed: {error}"))?
+        })
     }
 
     fn approval_state(&self) -> CommandApprovalState {
@@ -6037,28 +6051,48 @@ mod tests {
 
     #[test]
     fn skill_group_snapshot_list_and_restore_roundtrip() {
-        let tmp = TempDir::new().unwrap();
-        let _home = scoped_home(&tmp);
-        let skills_dir = tmp.path().join("skills");
-        let file = tmp.path().join("a.txt");
-        let repo = crate::snapshot::SnapshotRepo::open_or_init(tmp.path()).unwrap();
-        std::fs::write(&file, b"v1").unwrap();
-        repo.snapshot("pre-turn:1").unwrap();
-        std::fs::write(&file, b"v2").unwrap();
-        let mut app = skill_test_app(&tmp, &skills_dir);
-        {
-            let mut bundle = app.command_contexts();
-            let group = bundle
-                .parts()
-                .skill_group
-                .expect("skill_group facet must be present");
-            let entries = group.snapshot_list(20).unwrap();
-            assert_eq!(entries.len(), 1);
-            assert_eq!(entries[0].label, "pre-turn:1");
-            assert!(!entries[0].id.is_empty());
-            group.restore_snapshot(&entries[0].id).unwrap();
+        for in_runtime in [false, true] {
+            let tmp = TempDir::new().unwrap();
+            let _home = scoped_home(&tmp);
+            let skills_dir = tmp.path().join("skills");
+            let file = tmp.path().join("a.txt");
+            let repo = crate::snapshot::SnapshotRepo::open_or_init(tmp.path()).unwrap();
+            std::fs::write(&file, b"v1").unwrap();
+            repo.snapshot("pre-turn:1").unwrap();
+            std::fs::write(&file, b"v2").unwrap();
+            let mut app = skill_test_app(&tmp, &skills_dir);
+            {
+                let mut bundle = app.command_contexts();
+                let group = bundle
+                    .parts()
+                    .skill_group
+                    .expect("skill_group facet must be present");
+                let entries = group.snapshot_list(20).unwrap();
+                assert_eq!(entries.len(), 1);
+                assert_eq!(entries[0].label, "pre-turn:1");
+                assert!(!entries[0].id.is_empty());
+                let mut restore = || {
+                    group.restore_snapshot(&entries[0].id).unwrap();
+                    assert!(
+                        group
+                            .restore_snapshot("not-a-snapshot")
+                            .unwrap_err()
+                            .starts_with("Restore failed:")
+                    );
+                };
+                if in_runtime {
+                    tokio::runtime::Builder::new_multi_thread()
+                        .worker_threads(1)
+                        .enable_all()
+                        .build()
+                        .unwrap()
+                        .block_on(async { restore() });
+                } else {
+                    restore();
+                }
+            }
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), "v1");
         }
-        assert_eq!(std::fs::read_to_string(&file).unwrap(), "v1");
     }
 
     #[test]

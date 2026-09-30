@@ -865,30 +865,72 @@ impl SnapshotRepo {
 
     /// Restore the workspace to the state at `id`.
     ///
-    /// Uses `git checkout <sha> -- :/` which checks out every path in the
-    /// snapshot tree relative to the workspace root. We do NOT touch the
-    /// user's own `.git` — snapshots only contain working-tree files.
+    /// Requires a durable safety snapshot before changing files. A failed
+    /// restore attempts to put those files back; if that also fails, the
+    /// error identifies the retained safety snapshot for recovery. This is
+    /// not atomic against an external editor changing the live workspace.
+    /// File/directory transitions are refused before checkout because the
+    /// replaced directory may contain files excluded from the backup.
+    /// We never touch the user's own `.git`.
     pub fn restore(&self, id: &SnapshotId) -> io::Result<()> {
         self.with_write_lock(|| self.restore_locked(id))
     }
 
     fn restore_locked(&self, id: &SnapshotId) -> io::Result<()> {
-        // Restore is the one destructive operation with no undo of its own.
-        // Capture the pre-restore state first so the restore itself can be
-        // reversed (2026-08-04 snapshot hunt: makes several other findings
-        // recoverable instead of final). The `pre-restore:` prefix is
-        // deliberately not a `/undo` or `revert_turn` candidate label, so the
-        // safety net never changes snapshot selection. Best-effort: a failed
-        // safety snapshot must never block the restore the user asked for.
+        // The backup label is deliberately not an undo/revert-turn candidate.
         let target_short = &id.as_str()[..id.as_str().len().min(12)];
-        if let Err(e) = self.snapshot_with_session(&format!("pre-restore:{target_short}"), None) {
-            tracing::warn!(
-                target: "snapshot",
-                "pre-restore safety snapshot failed (restore will proceed): {e}"
-            );
-        }
-        let current_paths = self.tree_paths("HEAD")?;
+        let backup = self
+            .snapshot_with_session(&format!("pre-restore:{target_short}"), None)
+            .map_err(|error| {
+                io_other(format!(
+                    "pre-restore safety snapshot failed; no workspace files were changed: {error}"
+                ))
+            })?;
+        let current_paths = self.tree_paths(backup.as_str())?;
         let target_paths = self.tree_paths(id.as_str())?;
+        for rel in &target_paths {
+            match std::fs::symlink_metadata(self.work_tree.join(rel)) {
+                Ok(metadata) if metadata.is_dir() => {
+                    return Err(io_other(format!(
+                        "'{}' requires a file/directory transition; nothing was restored",
+                        rel.display()
+                    )));
+                }
+                Ok(_) if !current_paths.contains(rel) => {
+                    return Err(io_other(format!(
+                        "'{}' was excluded from the safety snapshot; nothing was restored",
+                        rel.display()
+                    )));
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotADirectory => {
+                    return Err(io_other(format!(
+                        "'{}' requires a file/directory transition; nothing was restored",
+                        rel.display()
+                    )));
+                }
+                Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
+                _ => {}
+            }
+        }
+        if let Err(error) = self.restore_tree(id, &current_paths, &target_paths) {
+            let recovery = match self.restore_tree(&backup, &target_paths, &current_paths) {
+                Ok(()) => "previous snapshot files were restored".to_string(),
+                Err(rollback) => format!("rollback also failed: {rollback}"),
+            };
+            return Err(io_other(format!(
+                "restore failed: {error}; {recovery}; safety snapshot {} retains the previous files",
+                backup.as_str()
+            )));
+        }
+        Ok(())
+    }
+
+    fn restore_tree(
+        &self,
+        id: &SnapshotId,
+        current_paths: &HashSet<PathBuf>,
+        target_paths: &HashSet<PathBuf>,
+    ) -> io::Result<()> {
         // An empty target (the first snapshot of an empty directory) has no
         // path for `:/` to match, and git refuses the checkout outright; there
         // is nothing to write back, only the later files to remove.
@@ -905,8 +947,7 @@ impl SnapshotRepo {
                 )));
             }
         }
-        self.remove_paths_missing_from_target(&current_paths, &target_paths)?;
-        Ok(())
+        self.remove_paths_missing_from_target(current_paths, target_paths)
     }
 
     /// File restore never traverses symlinks, directories, or Git metadata.
@@ -1474,9 +1515,8 @@ impl SnapshotRepo {
             .difference(target_paths)
             .filter(|rel| is_safe_relative_path(rel))
             .collect();
-        // The removal list comes from the side repo, not the live tree. When
-        // the pre-restore safety snapshot failed it is the previous HEAD's, so
-        // a directory it names can have been replaced by a symlink since, and
+        // The removal list comes from the side repo, not the live tree. A
+        // directory may have been replaced by a symlink since the backup, and
         // `remove_file` would follow it and delete outside the workspace.
         // Refuse the whole removal before deleting anything.
         for rel in &removals {
@@ -1488,11 +1528,18 @@ impl SnapshotRepo {
                 continue;
             }
             let path = self.work_tree.join(rel);
-            let Ok(metadata) = std::fs::symlink_metadata(&path) else {
-                continue;
+            let metadata = match std::fs::symlink_metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
             };
             if metadata.file_type().is_dir() {
-                let _ = std::fs::remove_dir(&path);
+                // A file-to-directory transition can make this path a
+                // required parent of files just restored from the target.
+                if target_paths.iter().any(|target| target.starts_with(rel)) {
+                    continue;
+                }
+                std::fs::remove_dir(&path)?;
             } else {
                 std::fs::remove_file(&path)?;
             }
@@ -2572,10 +2619,129 @@ mod tests {
         );
     }
 
-    /// When the pre-restore safety snapshot fails, the removal list is the
-    /// previous HEAD's. A directory it names that was replaced by a symlink
-    /// since used to be followed, deleting the same-named file outside the
-    /// workspace (reachable once restore to an empty tree skipped checkout).
+    #[test]
+    fn restore_keeps_current_files_when_safety_snapshot_fails() {
+        let tmp = tempdir().unwrap();
+        let (repo, _home) = make_repo(tmp.path());
+        let empty = repo.snapshot("pre-turn:1").unwrap();
+        let file = repo.work_tree().join("new-work.txt");
+        std::fs::write(&file, b"only copy of new work").unwrap();
+        repo.snapshot("post-turn:1").unwrap();
+        std::fs::write(repo.git_dir().join("index.lock"), b"").unwrap();
+
+        let error = repo.restore(&empty).expect_err("backup is mandatory");
+        assert!(
+            error.to_string().contains("safety snapshot failed"),
+            "{error}"
+        );
+        assert_eq!(std::fs::read(&file).unwrap(), b"only copy of new work");
+    }
+
+    #[test]
+    fn restore_rolls_back_files_after_a_partial_checkout_error() {
+        let tmp = tempdir().unwrap();
+        let (repo, _home) = make_repo(tmp.path());
+        let first = repo.work_tree().join("a.txt");
+        let last_dir = repo.work_tree().join("z");
+        let last = last_dir.join("last.txt");
+        std::fs::create_dir(&last_dir).unwrap();
+        std::fs::write(&first, b"old first").unwrap();
+        std::fs::write(&last, b"old last").unwrap();
+        let target = repo.snapshot("pre-turn:1").unwrap();
+        let object = run_git(
+            repo.git_dir(),
+            repo.work_tree(),
+            &["rev-parse", &format!("{}:z/last.txt", target.as_str())],
+        )
+        .unwrap();
+        assert!(object.status.success());
+        let object = String::from_utf8(object.stdout).unwrap();
+        let object = object.trim();
+        std::fs::write(&first, b"new first").unwrap();
+        std::fs::remove_file(&last).unwrap();
+        let before = repo.snapshot("before-restore-proof").unwrap();
+        // A missing target-only blob makes Git fail after it writes a.txt.
+        // The backup needs neither that blob nor z/last.txt for recovery.
+        std::fs::remove_file(
+            repo.git_dir()
+                .join("objects")
+                .join(&object[..2])
+                .join(&object[2..]),
+        )
+        .unwrap();
+
+        // Prove the failure fixture really permits a partial overwrite.
+        let partial = run_git(
+            repo.git_dir(),
+            repo.work_tree(),
+            &["checkout", target.as_str(), "--", ":/"],
+        )
+        .unwrap();
+        assert!(!partial.status.success());
+        assert_eq!(std::fs::read(&first).unwrap(), b"old first");
+        let reset = run_git(
+            repo.git_dir(),
+            repo.work_tree(),
+            &["checkout", before.as_str(), "--", ":/"],
+        )
+        .unwrap();
+        assert!(reset.status.success());
+        assert_eq!(std::fs::read(&first).unwrap(), b"new first");
+
+        let error = repo.restore(&target).expect_err("target blob is missing");
+        assert!(error.to_string().contains("unable to read"), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("previous snapshot files were restored"),
+            "{error}"
+        );
+        assert!(error.to_string().contains("safety snapshot"), "{error}");
+        assert_eq!(std::fs::read(&first).unwrap(), b"new first");
+        assert!(!last.exists());
+    }
+
+    #[test]
+    fn restore_refuses_file_directory_transitions_without_changing_files() {
+        for target_is_dir in [false, true] {
+            let tmp = tempdir().unwrap();
+            let (repo, _home) = make_repo(tmp.path());
+            let path = repo.work_tree().join("a");
+            let child = path.join("child");
+            if target_is_dir {
+                std::fs::create_dir(&path).unwrap();
+                std::fs::write(&child, b"old child").unwrap();
+            } else {
+                std::fs::write(&path, b"old file").unwrap();
+            }
+            let target = repo.snapshot("pre-turn:1").unwrap();
+            if target_is_dir {
+                std::fs::remove_file(&child).unwrap();
+                std::fs::remove_dir(&path).unwrap();
+                std::fs::write(&path, b"new file").unwrap();
+            } else {
+                std::fs::remove_file(&path).unwrap();
+                std::fs::create_dir(&path).unwrap();
+                std::fs::write(&child, b"new child").unwrap();
+            }
+
+            let error = repo
+                .restore(&target)
+                .expect_err("type transition is refused");
+            assert!(
+                error.to_string().contains("file/directory transition"),
+                "{error}"
+            );
+            if target_is_dir {
+                assert_eq!(std::fs::read(&path).unwrap(), b"new file");
+            } else {
+                assert_eq!(std::fs::read(&child).unwrap(), b"new child");
+            }
+        }
+    }
+
+    /// A failed safety snapshot refuses before a symlinked parent could be
+    /// followed, even when restoring to an empty target skips checkout.
     #[cfg(unix)]
     #[test]
     fn restore_refuses_to_remove_through_a_symlinked_parent() {
@@ -2593,14 +2759,13 @@ mod tests {
         std::fs::write(&sentinel, b"outside").unwrap();
         std::fs::remove_dir_all(&src).unwrap();
         std::os::unix::fs::symlink(outside.path(), &src).unwrap();
-        // A stale index lock makes the pre-restore safety snapshot fail, so
-        // restore works from the previous HEAD's path list.
+        // A stale index lock makes the mandatory safety snapshot fail.
         std::fs::write(repo.git_dir().join("index.lock"), b"").unwrap();
 
         let err = repo
             .restore(&empty)
             .expect_err("a removal through a symlinked parent is refused");
-        assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{err}");
+        assert!(err.to_string().contains("safety snapshot failed"), "{err}");
         assert_eq!(
             std::fs::read(&sentinel).unwrap(),
             b"outside",

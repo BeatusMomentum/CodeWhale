@@ -249,6 +249,48 @@ mod tests {
     use crate::tools::spec::ToolSpec;
 
     #[test]
+    fn close_refuses_when_git_cannot_determine_worktree_status() {
+        use crate::dependencies::{ExternalTool, Git};
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        assert!(
+            Git::output(&["init", "-q"], tmp.path())
+                .unwrap()
+                .status
+                .success()
+        );
+        let context = ToolContext::new(tmp.path());
+        assert!(
+            super::cli::git_status_porcelain(&context)
+                .unwrap()
+                .is_empty()
+        );
+        std::fs::write(tmp.path().join("work.txt"), "uncommitted work").unwrap();
+        assert!(
+            !super::cli::git_status_porcelain(&context)
+                .unwrap()
+                .is_empty()
+        );
+        // A real Git failure can have empty stdout; that is not a clean tree.
+        std::fs::write(tmp.path().join(".git/index"), "invalid index").unwrap();
+        let input = json!({
+            "number": 424_242,
+            "dry_run": true,
+            "acceptance_criteria": ["done"],
+            "evidence": {
+                "files_changed": ["work.txt"],
+                "tests_run": ["local fixture"],
+                "final_status": "green"
+            }
+        });
+        let error = close_github_thread(input, &context, GithubCloseTarget::Issue)
+            .expect_err("unknown worktree state must not authorize closure")
+            .to_string();
+        assert!(error.contains("git status failed"), "{error}");
+        assert!(error.contains("cannot verify"), "{error}");
+    }
+
+    #[test]
     fn close_schema_requires_structured_evidence() {
         let schema = GithubTool::alias("github_close_issue", "close_issue").input_schema();
         assert!(

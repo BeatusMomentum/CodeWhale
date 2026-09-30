@@ -9,6 +9,7 @@
 use crate::tui::approval::{RiskLevel, ToolCategory, classify_risk, get_tool_category_for_call};
 use codewhale_execpolicy::ApprovalMode;
 use serde_json::{Value, json};
+use std::borrow::Cow;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AutoReviewAction {
@@ -92,6 +93,9 @@ impl ToolActionKind {
 
     /// `workspace`, when known, lets a forced delete of a path inside it stay
     /// ordinary work instead of a catastrophic system-path delete.
+    /// A workspace enables filesystem evidence, so runtime callers must use
+    /// the blocking-pool context constructor. UI-only classification passes
+    /// `None` and does no filesystem I/O.
     #[must_use]
     pub fn from_tool_call(
         tool_name: &str,
@@ -398,7 +402,7 @@ impl RunOrigin {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AutoReviewContext<'a> {
-    pub tool_name: &'a str,
+    pub tool_name: Cow<'a, str>,
     pub category: ToolCategory,
     pub risk: RiskLevel,
     pub action_kind: ToolActionKind,
@@ -415,6 +419,42 @@ pub struct AutoReviewContext<'a> {
 }
 
 impl<'a> AutoReviewContext<'a> {
+    /// Resolve filesystem and Git evidence on the blocking pool. Worker
+    /// failure is an admission error, never evidence that a call is safe.
+    pub async fn from_tool_call_async(
+        tool_name: &str,
+        params: &Value,
+        run_origin: RunOrigin,
+        approval_mode: ApprovalMode,
+        workspace: Option<&std::path::Path>,
+    ) -> Result<Self, crate::tools::spec::ToolError> {
+        let tool_name = tool_name.to_owned();
+        let params = params.clone();
+        let workspace = workspace.map(std::path::Path::to_path_buf);
+        tokio::task::spawn_blocking(move || {
+            let trusted = workspace
+                .as_deref()
+                .is_some_and(crate::config::is_workspace_trusted);
+            AutoReviewContext::<'static>::from_tool_call_inner(
+                Cow::Owned(tool_name),
+                &params,
+                run_origin,
+                approval_mode,
+                trusted,
+                workspace.as_deref(),
+            )
+        })
+        .await
+        .map_err(|error| {
+            crate::tools::spec::ToolError::execution_failed(format!(
+                "Auto-review evidence could not be prepared: {error}"
+            ))
+        })
+    }
+
+    /// Synchronous construction is reserved for focused policy tests. Runtime
+    /// callers must use the blocking-pool constructor above.
+    #[cfg(test)]
     #[must_use]
     pub fn from_tool_call(
         tool_name: &'a str,
@@ -424,19 +464,37 @@ impl<'a> AutoReviewContext<'a> {
         workspace_trusted: bool,
         workspace: Option<&std::path::Path>,
     ) -> Self {
-        let category = get_tool_category_for_call(tool_name, params);
+        Self::from_tool_call_inner(
+            Cow::Borrowed(tool_name),
+            params,
+            run_origin,
+            approval_mode,
+            workspace_trusted,
+            workspace,
+        )
+    }
+
+    fn from_tool_call_inner(
+        tool_name: Cow<'a, str>,
+        params: &Value,
+        run_origin: RunOrigin,
+        approval_mode: ApprovalMode,
+        workspace_trusted: bool,
+        workspace: Option<&std::path::Path>,
+    ) -> Self {
+        let name = tool_name.as_ref();
+        let category = get_tool_category_for_call(name, params);
         // A read-category name that also says it mutates is not benign, or
         // the read-only allow would wave it through before any review (V3).
         let risk = if matches!(category, ToolCategory::Safe | ToolCategory::McpRead)
-            && read_prefixed_name_mutates(&action_qualified_tool_name(tool_name, params))
+            && read_prefixed_name_mutates(&action_qualified_tool_name(name, params))
         {
             RiskLevel::Destructive
         } else {
-            classify_risk(tool_name, category, params)
+            classify_risk(name, category, params)
         };
-        let action_kind = ToolActionKind::from_tool_call(tool_name, params, category, workspace);
+        let action_kind = ToolActionKind::from_tool_call(name, params, category, workspace);
         Self {
-            tool_name,
             category,
             risk,
             action_kind,
@@ -446,18 +504,18 @@ impl<'a> AutoReviewContext<'a> {
             approval_mode,
             workspace_trusted,
             outbound_web_request: matches!(
-                crate::tools::canonical_action::canonical_action_alias(tool_name, params),
+                crate::tools::canonical_action::canonical_action_alias(name, params),
                 "web_search" | "fetch_url" | "web_run" | "web.run"
             ),
             write_targets_bounded: workspace
-                .zip(file_write_target_paths(tool_name, params))
+                .zip(file_write_target_paths(name, params))
                 .is_some_and(|(workspace, paths)| {
                     crate::core::authority::paths_within_workspace_write_carve_out(
                         workspace, &paths,
                     )
                 }),
             unrecoverable_deletes: {
-                let deletes = file_write_delete_paths(tool_name, params, workspace);
+                let deletes = file_write_delete_paths(name, params, workspace);
                 if deletes.is_empty() {
                     deletes
                 } else {
@@ -466,6 +524,7 @@ impl<'a> AutoReviewContext<'a> {
                         .unwrap_or(deletes)
                 }
             },
+            tool_name,
         }
     }
 }
@@ -513,7 +572,7 @@ impl AutoReviewRule {
 
     fn matches(&self, ctx: &AutoReviewContext<'_>) -> bool {
         if let Some(tool_name) = self.tool_name.as_deref()
-            && tool_name != ctx.tool_name
+            && tool_name != ctx.tool_name.as_ref()
         {
             return false;
         }
@@ -906,9 +965,9 @@ pub(crate) fn build_reviewer_context(
     use codewhale_secrets::redact::{redact_json_model_bound_secrets, redact_model_bound_secrets};
 
     let input = redact_json_model_bound_secrets(tool_input);
-    let tool = redact_model_bound_secrets(ctx.tool_name);
+    let tool = redact_model_bound_secrets(ctx.tool_name.as_ref());
     let hold_reason = redact_model_bound_secrets(held_reason);
-    let credentials_masked = input != *tool_input || tool != ctx.tool_name;
+    let credentials_masked = input != *tool_input || tool != ctx.tool_name.as_ref();
     serde_json::to_string(&serde_json::json!({
         "proposed_tool_call": {
             "tool": tool,
@@ -2628,6 +2687,81 @@ mod tests {
             true,
             Some(workspace),
         )
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn auto_review_filesystem_evidence_does_not_park_runtime() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::time::{Duration, Instant};
+
+        let dir = patch_workspace();
+        let config_path = dir.path().join(".git/config");
+        let saved_config_path = dir.path().join(".git/config.saved");
+        std::fs::rename(&config_path, &saved_config_path).unwrap();
+        let path = std::ffi::CString::new(config_path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: a live, NUL-terminated path inside this test's private repo.
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        let (opened_tx, opened_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            // Nonblocking writer-open bounds the case where admission never
+            // reaches Git. Once Git reads the FIFO, an independent OS-thread
+            // watchdog also releases it if the current-thread runtime stalls.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let pipe = loop {
+                match std::fs::OpenOptions::new()
+                    .write(true)
+                    .custom_flags(libc::O_NONBLOCK)
+                    .open(&config_path)
+                {
+                    Ok(pipe) => break Some(pipe),
+                    Err(_) if Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break None,
+                }
+            };
+            let peer_released = if pipe.is_some() {
+                let _ = opened_tx.send(());
+                release_rx.recv_timeout(Duration::from_secs(5)).is_ok()
+            } else {
+                false
+            };
+            // Replace the FIFO atomically before closing this writer: later
+            // Git opens see the original regular file, while the waiting
+            // reader receives EOF. No restoration write can block on a FIFO.
+            let restored = std::fs::rename(&saved_config_path, &config_path);
+            drop(pipe);
+            restored.unwrap();
+            peer_released
+        });
+
+        let workspace = dir.path().to_path_buf();
+        let params = delete_patch("untracked.txt", "only copy");
+        let review = tokio::spawn(async move {
+            AutoReviewContext::from_tool_call_async(
+                "apply_patch",
+                &params,
+                RunOrigin::Interactive,
+                ApprovalMode::Auto,
+                Some(&workspace),
+            )
+            .await
+        });
+        let opened = tokio::time::timeout(Duration::from_secs(12), opened_rx).await;
+        let peer_ran_before_watchdog =
+            opened.is_ok_and(|result| result.is_ok()) && release_tx.send(()).is_ok();
+        let context = review.await.unwrap().unwrap();
+        let released_by_peer = writer.join().unwrap();
+        assert!(
+            peer_ran_before_watchdog && released_by_peer,
+            "the runtime must release filesystem evidence before the OS-thread watchdog"
+        );
+        assert_eq!(context.tool_name, "apply_patch");
+        assert_eq!(context.unrecoverable_deletes, vec!["untracked.txt"]);
+        assert!(context.write_targets_bounded);
     }
 
     #[test]

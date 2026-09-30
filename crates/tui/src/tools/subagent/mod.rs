@@ -18956,7 +18956,6 @@ impl SubAgentToolRegistry {
         {
             return ChildGateVerdict::Deny(reason);
         }
-        let workspace_trusted = crate::config::is_workspace_trusted(&workspace);
         // Destructive work nobody is watching holds in every posture: a call
         // that starts detached, or any call of an agent that runs detached
         // (no foreground turn owns it). A foreground agent's call is judged
@@ -18966,14 +18965,31 @@ impl SubAgentToolRegistry {
                 .registry
                 .get(name)
                 .is_some_and(|spec| spec.starts_detached_for(input));
-        let review_context = AutoReviewContext::from_tool_call(
+        let review_context = match AutoReviewContext::from_tool_call_async(
             name,
             input,
             auto_review_run_origin_for_plan(detached),
             approval_mode,
-            workspace_trusted,
             Some(&workspace),
-        );
+        )
+        .await
+        {
+            Ok(context) => context,
+            Err(error) => {
+                let reason = error.to_string();
+                self.emit_child_gate_receipt(
+                    agent_id,
+                    tool_id,
+                    name,
+                    ToolGate::AutoReviewDeterministic,
+                    ToolGateVerdict::Denied,
+                    None,
+                    &reason,
+                )
+                .await;
+                return ChildGateVerdict::Deny(reason);
+            }
+        };
         let (decision, _audit) = auto_review_plan_decision_for_context(
             &self.gate_runtime.auto_review_policy,
             &review_context,

@@ -866,7 +866,7 @@ impl Engine {
             )),
             super::reviewer::ReviewerOutcome::Cancelled => None,
         };
-        let result = review.outcome.into_tool_result(context.tool_name);
+        let result = review.outcome.into_tool_result(context.tool_name.as_ref());
         emit_tool_audit(json!({
             "event": "tool.auto_review",
             "gate": "guardian",
@@ -3818,72 +3818,79 @@ impl Engine {
             }
 
             if blocked_error.is_none() {
-                let review_context = crate::tui::auto_review::AutoReviewContext::from_tool_call(
-                    &tool_name,
-                    &tool_input,
-                    auto_review_run_origin_for_plan(detached_start),
-                    self.session.approval_mode,
-                    crate::config::is_workspace_trusted(&self.session.workspace),
-                    Some(&self.session.workspace),
-                );
-                let (decision, audit_event) = auto_review_plan_decision_for_context(
-                    &self.config.auto_review_policy,
-                    &review_context,
-                );
-                emit_tool_audit(json!({
-                    "event": "tool.auto_review",
-                    "gate": "deterministic",
-                    "tool_id": tool_id.clone(),
-                    "auto_review": audit_event,
-                }));
-                match decision {
-                    AutoReviewPlanDecision::NoChange => {}
-                    AutoReviewPlanDecision::Allow => {
-                        if !hook_requires_approval && !approval_force_prompt {
-                            approval_required = false;
-                        }
-                    }
-                    AutoReviewPlanDecision::ForcePrompt(reason) => {
-                        // The built-in safety floor is deliberately
-                        // non-bypassable. Ask/Auto-Review surface the hold;
-                        // Full Access turns this disposition into a hard
-                        // block below, without opening a modal.
-                        approval_required = true;
-                        approval_description = reason;
-                        approval_force_prompt = true;
-                    }
-                    AutoReviewPlanDecision::Block(reason) => {
-                        approval_required = false;
-                        approval_force_prompt = false;
-                        let _ = self
-                            .tx_event
-                            .send(Event::ToolGateDecision {
-                                agent_id: None,
-                                tool_id: tool_id.clone(),
-                                tool_name: tool_name.clone(),
-                                gate: crate::core::events::ToolGate::AutoReviewDeterministic,
-                                decision: crate::core::events::ToolGateVerdict::Denied,
-                                risk: None,
-                                reason: crate::core::events::bounded_gate_reason(&reason),
-                            })
-                            .await;
-                        blocked_error = Some(auto_review_block_tool_error(&reason));
-                    }
-                    AutoReviewPlanDecision::ConsultReviewer(held_reason) => {
-                        if let Err(error) = self
-                            .consult_auto_review_guardian(
-                                client,
-                                &review_context,
-                                &tool_input,
-                                &held_reason,
-                                &tool_id,
-                                turn,
-                            )
-                            .await
-                        {
-                            blocked_error = Some(error);
-                        } else if !hook_requires_approval && !approval_force_prompt {
-                            approval_required = false;
+                let review_context =
+                    crate::tui::auto_review::AutoReviewContext::from_tool_call_async(
+                        &tool_name,
+                        &tool_input,
+                        auto_review_run_origin_for_plan(detached_start),
+                        self.session.approval_mode,
+                        Some(&self.session.workspace),
+                    )
+                    .await;
+                match review_context {
+                    Err(error) => blocked_error = Some(error),
+                    Ok(review_context) => {
+                        let (decision, audit_event) = auto_review_plan_decision_for_context(
+                            &self.config.auto_review_policy,
+                            &review_context,
+                        );
+                        emit_tool_audit(json!({
+                            "event": "tool.auto_review",
+                            "gate": "deterministic",
+                            "tool_id": tool_id.clone(),
+                            "auto_review": audit_event,
+                        }));
+                        match decision {
+                            AutoReviewPlanDecision::NoChange => {}
+                            AutoReviewPlanDecision::Allow => {
+                                if !hook_requires_approval && !approval_force_prompt {
+                                    approval_required = false;
+                                }
+                            }
+                            AutoReviewPlanDecision::ForcePrompt(reason) => {
+                                // The built-in safety floor is deliberately
+                                // non-bypassable. Ask/Auto-Review surface the hold;
+                                // Full Access turns this disposition into a hard
+                                // block below, without opening a modal.
+                                approval_required = true;
+                                approval_description = reason;
+                                approval_force_prompt = true;
+                            }
+                            AutoReviewPlanDecision::Block(reason) => {
+                                approval_required = false;
+                                approval_force_prompt = false;
+                                let _ = self
+                                    .tx_event
+                                    .send(Event::ToolGateDecision {
+                                        agent_id: None,
+                                        tool_id: tool_id.clone(),
+                                        tool_name: tool_name.clone(),
+                                        gate:
+                                            crate::core::events::ToolGate::AutoReviewDeterministic,
+                                        decision: crate::core::events::ToolGateVerdict::Denied,
+                                        risk: None,
+                                        reason: crate::core::events::bounded_gate_reason(&reason),
+                                    })
+                                    .await;
+                                blocked_error = Some(auto_review_block_tool_error(&reason));
+                            }
+                            AutoReviewPlanDecision::ConsultReviewer(held_reason) => {
+                                if let Err(error) = self
+                                    .consult_auto_review_guardian(
+                                        client,
+                                        &review_context,
+                                        &tool_input,
+                                        &held_reason,
+                                        &tool_id,
+                                        turn,
+                                    )
+                                    .await
+                                {
+                                    blocked_error = Some(error);
+                                } else if !hook_requires_approval && !approval_force_prompt {
+                                    approval_required = false;
+                                }
+                            }
                         }
                     }
                 }

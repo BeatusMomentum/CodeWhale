@@ -2073,7 +2073,7 @@ pub fn is_literal_rm_invocation(command: &str) -> bool {
 ///
 /// Deliberately over-inclusive (`echo rm -rf /etc` yields an `rm` argv too):
 /// callers use it to *hold* catastrophic commands, never to allow anything.
-/// `None` when words nest deeper than [`MAX_WRAPPER_DEPTH`]: fail closed.
+/// `None` when words nest deeper than `MAX_WRAPPER_DEPTH`: fail closed.
 pub fn command_invocations(command: &str) -> Option<Vec<Vec<String>>> {
     fn collect(command: &str, depth: usize, out: &mut Vec<Vec<String>>) -> bool {
         if depth > MAX_WRAPPER_DEPTH {

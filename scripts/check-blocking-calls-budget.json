@@ -399,7 +399,7 @@
   },
   "crates/tui/src/snapshot/repo.rs": {
     "path_canonicalize": 4,
-    "std_fs": 17,
+    "std_fs": 18,
     "thread_sleep": 1
   },
   "crates/tui/src/tools/git.rs": {
@@ -491,6 +491,9 @@
   },
   "crates/tui/src/tui/app/init.rs": {
     "std_fs": 1
+  },
+  "crates/tui/src/tui/auto_review.rs": {
+    "path_canonicalize": 3
   },
   "crates/tui/src/tui/clipboard.rs": {
     "std_fs": 2
