@@ -14430,24 +14430,29 @@ async fn switch_provider_waiting_for_config_lock_keeps_the_async_worker_running(
 
     let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
     let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let safety_timeout = ci_scaled(Duration::from_secs(3));
     let locker = std::thread::spawn(move || {
         codewhale_config::with_config_write_lock(&config_file, |_| {
             let _ = entered_tx.send(());
             // A reverted synchronous implementation must fail promptly,
             // rather than leave this current-thread runtime deadlocked.
-            let _ = release_rx.recv_timeout(Duration::from_secs(3));
+            let _ = release_rx.recv_timeout(safety_timeout);
             Ok(())
         })
     });
     entered_rx.await?;
 
     let client = crate::tls::reqwest_client();
-    let request =
-        tokio::spawn(
-            async move { post_switch_provider(&client, &addr, "deepseek", &json!({})).await },
-        );
-    let started = std::time::Instant::now();
+    let switch_client = client.clone();
+    let request = tokio::spawn(async move {
+        post_switch_provider(&switch_client, &addr, "deepseek", &json!({})).await
+    });
     tokio::time::sleep(Duration::from_millis(150)).await;
+    // The helper serves on a separate product-stack current-thread runtime.
+    // Probe that same server, not a timer on this test's client runtime:
+    // a blocking config save must not prevent an unrelated health request.
+    let started = std::time::Instant::now();
+    let health = client.get(format!("http://{addr}/health")).send().await;
     let elapsed = started.elapsed();
     let was_waiting = !request.is_finished();
     let _ = release_tx.send(());
@@ -14456,9 +14461,10 @@ async fn switch_provider_waiting_for_config_lock_keeps_the_async_worker_running(
     handle.abort();
 
     assert!(
-        elapsed < Duration::from_secs(1),
-        "the async worker must run while the provider switch waits for a filesystem lock: {elapsed:?}"
+        elapsed < ci_scaled(Duration::from_secs(1)),
+        "the serving async worker must run while the provider switch waits for a filesystem lock: {elapsed:?}"
     );
+    assert_eq!(health?.status(), StatusCode::OK);
     assert!(
         was_waiting,
         "the real switch must await the held config lock"
