@@ -1108,8 +1108,14 @@ fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
 fn push_update_path(paths: &mut Vec<PathBuf>, path: PathBuf, current_exe: &Path) {
     // Keep a same-target symlink as a symlink. Replacing its target refreshes
     // the alias too. Foreign/broken links stay in the plan and fail validation.
+    // Compare canonical paths on both sides: `current_exe()` is not
+    // canonicalized on macOS, so an install dir reached through a symlinked
+    // directory would otherwise never match its own alias.
     let same_target_link = std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_symlink())
-        && std::fs::canonicalize(&path).is_ok_and(|resolved| resolved == current_exe);
+        && match [path.as_path(), current_exe].map(std::fs::canonicalize) {
+            [Ok(resolved), exe] => resolved == current_exe || exe.is_ok_and(|exe| resolved == exe),
+            _ => false,
+        };
     if !same_target_link {
         push_unique_path(paths, path);
     }
@@ -2685,6 +2691,24 @@ mod tests {
             assert!(validate_update_target(&alias, &identity).is_err());
             assert!(std::fs::symlink_metadata(&alias).unwrap().is_symlink());
         }
+    }
+
+    #[cfg(all(unix, not(target_os = "android")))]
+    #[test]
+    fn same_target_symlink_is_kept_when_the_install_dir_is_reached_through_a_symlink() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let real_dir = root.join("real-bin");
+        std::fs::create_dir(&real_dir).unwrap();
+        let linked_dir = root.join("linked-bin");
+        symlink(&real_dir, &linked_dir).unwrap();
+        // `current_exe()` on macOS reports the path as reached, not resolved.
+        let primary = linked_dir.join("codewhale");
+        write_installed_binary(&primary, b"running bytes");
+        symlink("codewhale", linked_dir.join("codew")).unwrap();
+        let plan = update_plan_for_exe(&primary);
+        assert_eq!(plan.target_paths.as_slice(), std::slice::from_ref(&primary));
     }
 
     #[test]

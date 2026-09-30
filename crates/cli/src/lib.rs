@@ -829,7 +829,8 @@ struct LaneStartRequest {
 
 fn start_lane(request: LaneStartRequest) -> Result<()> {
     use codewhale_lane::{
-        LaneRegistry, LaneStartSpec, RuntimeBackendKind, WorktreeProvision, resolve_backend,
+        LaneRegistry, LaneStartSpec, LaneStatus, RuntimeBackendKind, WorktreeProvision,
+        resolve_backend,
     };
 
     let LaneStartRequest {
@@ -889,6 +890,18 @@ fn start_lane(request: LaneStartRequest) -> Result<()> {
     println!("log:     {}", record.log_path.display());
     if let Some(attach) = backend.attach_command(&record) {
         println!("attach:  {attach}");
+    }
+    // The inline runtime runs the command to completion inside `start`, so its
+    // terminal status is final here. A lane that did not complete must fail
+    // the command, or `workflow run --runtime inline` gates in CI pass on a
+    // failed run. Tmux lanes are still running, so their status says nothing.
+    if kind == RuntimeBackendKind::Inline && record.status != LaneStatus::Completed {
+        bail!(
+            "lane {} {} (log: {})",
+            record.id,
+            record.status.as_str(),
+            record.log_path.display()
+        );
     }
     Ok(())
 }
@@ -1761,7 +1774,7 @@ enum ModelCommand {
         #[arg(long, value_parser = parse_catalog_route)]
         provider: Option<ProviderKind>,
     },
-    /// Set the default model (e.g. "pro", "flash", "deepseek-v4-pro").
+    /// Set the default model (e.g. "deepseek-v4-pro"; "pro"/"flash" on routes that serve DeepSeek).
     Set { model: String },
 }
 
@@ -2438,12 +2451,14 @@ fn run() -> Result<()> {
         }
         Some(Commands::Sandbox(args)) => run_sandbox_command(args.command),
         Some(Commands::AppServer(args)) => {
-            // The HTTP/mobile runtime API is delegated to the mature `serve` path
-            // in the TUI binary, which reads the *global* --config. app-server has
-            // historically taken a subcommand-level --config, so bridge it before
-            // resolving runtime options (provider/keyring) for the delegated run.
-            if (args.http || args.mobile) && cli.config.is_none() && args.config.is_some() {
-                cli.config = args.config.clone();
+            // Every transport loads the same file: the subcommand's --config,
+            // else the global one. The HTTP/mobile runtime API is delegated to
+            // the `serve` path in the TUI binary, which reads only the *global*
+            // --config, and runtime options (provider/keyring) resolve from it
+            // too, so bridge the choice there before resolving them.
+            let config_path = app_server_config_path(&cli, &args);
+            if config_path != cli.config {
+                cli.config = config_path;
                 store = ConfigStore::load(cli.config.clone())?;
             }
             let resolved_runtime = resolve_runtime_for_dispatch(&mut store, &runtime_overrides);
@@ -2842,31 +2857,33 @@ fn no_keyring_secrets() -> Secrets {
     ))
 }
 
+/// Clear one provider's credential. `Ok(Some(message))` means the config leg
+/// was saved but the secret store kept the key; the caller must exit non-zero.
 fn clear_auth_provider(
     store: &mut ConfigStore,
     secrets: &Secrets,
     provider: ProviderKind,
-) -> Result<()> {
+) -> Result<Option<String>> {
     if provider == ProviderKind::Antigravity {
-        return clear_legacy_antigravity_config(store, secrets);
+        return clear_legacy_antigravity_config(store, secrets).map(|()| None);
     }
     let outcome = codewhale_config::credentials::clear_provider_api_key(store, secrets, provider)?;
     let slot = outcome.slot;
     // The secret-store leg used to fail silently here, which meant `auth clear`
-    // could print success while the key was still in the keyring. Say so
-    // instead; the config no longer advertises a key the backend may hold.
+    // could print success while the key was still in the keyring. The config
+    // no longer advertises a key the backend may hold, but the credential is
+    // not revoked, so this is a failure rather than a note on stdout.
     if let Some(error) = &outcome.secret_store_error {
-        println!(
-            "cleared API key for {slot} from config, but the secret store refused the delete: {error}"
-        );
-        return Ok(());
+        return Ok(Some(format!(
+            "cleared API key for {slot} from config, but the secret store refused the delete: {error}; the key may still be stored there"
+        )));
     }
     if provider == ProviderKind::Xai {
         println!("cleared xAI credentials from config, secret store, and owned OAuth storage");
     } else {
         println!("cleared API key for {slot} from config and secret store");
     }
-    Ok(())
+    Ok(None)
 }
 
 /// Remove only Codewhale-owned state for the retired Antigravity route.
@@ -4428,7 +4445,7 @@ fn run_auth_command_with_secrets_and_runtime(
             let api_key = match (api_key, api_key_stdin) {
                 (Some(v), _) => v,
                 (None, true) => read_api_key_from_stdin()?,
-                (None, false) => prompt_api_key(slot)?,
+                (None, false) => prompt_api_key(provider)?,
             };
             let mut credential_store =
                 codewhale_config::credentials::credential_metadata_store(store)?;
@@ -4467,13 +4484,20 @@ fn run_auth_command_with_secrets_and_runtime(
             })
         }
         AuthCommand::Clear { provider } => {
-            if provider == ProviderKind::Xai {
+            let incomplete = if provider == ProviderKind::Xai {
                 codewhale_config::with_xai_oauth_revocation_transaction(|| {
                     clear_auth_provider(store, secrets, provider)
-                })
+                })?
             } else {
-                clear_auth_provider(store, secrets, provider)
+                clear_auth_provider(store, secrets, provider)?
+            };
+            // Reported after the xAI transaction commits: the config leg is
+            // saved, so failing inside it would roll back a revocation that
+            // already happened.
+            if let Some(message) = incomplete {
+                bail!(message);
             }
+            Ok(())
         }
         AuthCommand::List => {
             for line in auth_list_lines_with_runtime(store, secrets, runtime_overrides) {
@@ -4569,18 +4593,71 @@ fn keyring_status_short(state: Option<bool>) -> &'static str {
     }
 }
 
-fn prompt_api_key(slot: &str) -> Result<String> {
-    use std::io::{IsTerminal, Write};
-    eprint!("Enter API key for {slot}: ");
-    io::stderr().flush().ok();
-    if !io::stdin().is_terminal() {
-        // Non-interactive: read directly without prompting twice.
-        return read_api_key_from_stdin();
+fn prompt_api_key(provider: ProviderKind) -> Result<String> {
+    use std::io::IsTerminal;
+    read_prompted_api_key(
+        provider.as_str(),
+        io::stdin().is_terminal(),
+        |prompt| {
+            // The help promises the key is not echoed: a plain `read_line`
+            // would leave it on screen, in scrollback, and in recordings.
+            // `read_secure_line` returns "" on a stream that is not a
+            // terminal, so prompt on whichever of stderr/stdout is one.
+            let term = match hidden_prompt_stream(
+                io::stderr().is_terminal(),
+                io::stdout().is_terminal(),
+            ) {
+                Some(PromptStream::Stderr) => console::Term::stderr(),
+                Some(PromptStream::Stdout) => console::Term::stdout(),
+                None => {
+                    return Err(io::Error::other(
+                        "both stdout and stderr are redirected, so the key cannot be read \
+                         without echo; pipe it on stdin instead",
+                    ));
+                }
+            };
+            term.write_str(prompt)?;
+            // Ends the line itself once the key is read.
+            term.read_secure_line()
+        },
+        read_api_key_from_stdin,
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PromptStream {
+    Stderr,
+    Stdout,
+}
+
+fn hidden_prompt_stream(
+    stderr_is_terminal: bool,
+    stdout_is_terminal: bool,
+) -> Option<PromptStream> {
+    if stderr_is_terminal {
+        Some(PromptStream::Stderr)
+    } else if stdout_is_terminal {
+        Some(PromptStream::Stdout)
+    } else {
+        None
     }
-    let mut buf = String::new();
-    io::stdin()
-        .read_line(&mut buf)
-        .context("failed to read API key from stdin")?;
+}
+
+fn read_prompted_api_key(
+    provider_id: &str,
+    stdin_is_terminal: bool,
+    read_hidden_line: impl FnOnce(&str) -> io::Result<String>,
+    read_piped: impl FnOnce() -> Result<String>,
+) -> Result<String> {
+    use std::io::Write;
+    let prompt = format!("Enter API key for {provider_id}: ");
+    if !stdin_is_terminal {
+        // Non-interactive: read directly without prompting twice.
+        eprint!("{prompt}");
+        io::stderr().flush().ok();
+        return read_piped();
+    }
+    let buf = read_hidden_line(&prompt).context("failed to read API key from the terminal")?;
     let key = buf.trim().to_string();
     if key.is_empty() {
         bail!("empty API key provided");
@@ -5119,6 +5196,39 @@ fn canonical_model_for_set(model: &str) -> &str {
     }
 }
 
+/// The provider (and its endpoint) whose model `model set` writes.
+///
+/// A home config gets `[providers.<saved route>] model`, so the saved route in
+/// that file decides. A workspace-scoped config gets a root `model` that
+/// applies to whatever route is in effect, which that file alone may not name.
+fn model_set_route(
+    store: &ConfigStore,
+    resolved_runtime: &ResolvedRuntimeOptions,
+) -> Result<Option<(ProviderKind, String)>> {
+    if codewhale_config::config_path_is_workspace_scoped(store.path()) {
+        return Ok(Some((
+            resolved_runtime.provider,
+            resolved_runtime.base_url.clone(),
+        )));
+    }
+    let (route, _, _) = codewhale_tui::route_preferences::selected_route(store.path())?;
+    Ok(ProviderKind::parse_config_identity(&route).map(|provider| {
+        let base_url = store
+            .config
+            .providers
+            .for_provider(provider)
+            .base_url
+            .clone()
+            .filter(|base| !base.trim().is_empty())
+            .unwrap_or_else(|| {
+                codewhale_config::provider::provider_for_kind(provider)
+                    .default_base_url()
+                    .to_string()
+            });
+        (provider, base_url)
+    }))
+}
+
 fn run_model_command(
     store: &mut ConfigStore,
     command: ModelCommand,
@@ -5229,7 +5339,21 @@ fn run_model_command(
             if trimmed.is_empty() {
                 bail!("Model name cannot be empty");
             }
-            let canonical = canonical_model_for_set(trimmed);
+            // The short names are DeepSeek's. They expand wherever a DeepSeek
+            // id is servable (DeepSeek itself and the hosts that serve its
+            // models, such as OpenRouter or Together). On a vendor that only
+            // serves its own family (OpenAI, Anthropic, ...) `pro` is that
+            // vendor's own name, so it is stored as typed.
+            let expanded = canonical_model_for_set(trimmed);
+            let canonical = if expanded != trimmed
+                && model_set_route(store, resolved_runtime)?.is_some_and(|(provider, base_url)| {
+                    codewhale_config::known_foreign_model_owner(provider, expanded, &base_url)
+                        .is_some()
+                }) {
+                trimmed
+            } else {
+                expanded
+            };
             codewhale_tui::route_preferences::set(store.path(), "model", canonical)?;
             store.reload()?;
             println!("Default model set to '{canonical}'");
@@ -5275,7 +5399,15 @@ fn run_thread_command(
         let resolved_runtime = resolve_runtime_for_dispatch(store, runtime_overrides);
         return run_tui_in_process(cli, &resolved_runtime, passthrough);
     }
-    let state = StateStore::open(None)?;
+    run_thread_store_command(&StateStore::open(None)?, command)
+}
+
+fn run_thread_store_command(state: &StateStore, command: ThreadCommand) -> Result<()> {
+    let require_thread = |thread_id: &str| -> Result<codewhale_state::ThreadMetadata> {
+        state
+            .get_thread(thread_id)?
+            .with_context(|| format!("thread not found: {thread_id}"))
+    };
     match command {
         ThreadCommand::List { all, limit } => {
             let threads = state.list_threads(ThreadListFilters {
@@ -5297,27 +5429,29 @@ fn run_thread_command(
             Ok(())
         }
         ThreadCommand::Read { thread_id } => {
-            let thread = state.get_thread(&thread_id)?;
+            let thread = require_thread(&thread_id)?;
             println!("{}", serde_json::to_string_pretty(&thread)?);
             Ok(())
         }
         ThreadCommand::Resume { .. } | ThreadCommand::Fork { .. } => {
             unreachable!("thread_delegation routes resume and fork before this match")
         }
+        // The store updates by id and reports nothing for an unknown one, so
+        // check first rather than print success for a no-op.
         ThreadCommand::Archive { thread_id } => {
+            require_thread(&thread_id)?;
             state.mark_archived(&thread_id)?;
             println!("archived {thread_id}");
             Ok(())
         }
         ThreadCommand::Unarchive { thread_id } => {
+            require_thread(&thread_id)?;
             state.mark_unarchived(&thread_id)?;
             println!("unarchived {thread_id}");
             Ok(())
         }
         ThreadCommand::SetName { thread_id, name } => {
-            let mut thread = state
-                .get_thread(&thread_id)?
-                .with_context(|| format!("thread not found: {thread_id}"))?;
+            let mut thread = require_thread(&thread_id)?;
             thread.name = Some(name);
             thread.updated_at = chrono::Utc::now().timestamp();
             state.upsert_thread(&thread)?;
@@ -5325,9 +5459,7 @@ fn run_thread_command(
             Ok(())
         }
         ThreadCommand::ClearName { thread_id } => {
-            let mut thread = state
-                .get_thread(&thread_id)?
-                .with_context(|| format!("thread not found: {thread_id}"))?;
+            let mut thread = require_thread(&thread_id)?;
             thread.name = None;
             thread.updated_at = chrono::Utc::now().timestamp();
             state.upsert_thread(&thread)?;
@@ -5378,11 +5510,11 @@ fn run_app_server_command(
     // Everything below runs the app-server *in this process*, which is why the
     // surface cannot be derived from the executable: `current_exe()` would
     // report every one of these sessions as `cli`.
-    let session = start_cli_telemetry(
-        resolved_runtime,
-        args.config.clone().or_else(|| cli.config.clone()),
-        Surface::AppServer,
-    );
+    //
+    // `codewhale --config X app-server --stdio` must load X too: the global
+    // flag is the fallback for every in-process transport, not only telemetry.
+    let config_path = app_server_config_path(cli, &args);
+    let session = start_cli_telemetry(resolved_runtime, config_path.clone(), Surface::AppServer);
 
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -5397,14 +5529,14 @@ fn run_app_server_command(
         }
     };
     if args.stdio {
-        let outcome = runtime.block_on(run_app_server_stdio(args.config));
+        let outcome = runtime.block_on(run_app_server_stdio(config_path));
         finish_cli_telemetry(session, &outcome);
         return outcome;
     }
     if args.socket {
         let outcome = runtime.block_on(run_daemon_socket(DaemonSocketOptions {
             socket_path: args.socket_path,
-            config_path: args.config,
+            config_path,
         }));
         finish_cli_telemetry(session, &outcome);
         return outcome;
@@ -5423,7 +5555,7 @@ fn run_app_server_command(
         .and_then(|listen| {
             runtime.block_on(run_app_server(AppServerOptions {
                 listen,
-                config_path: args.config,
+                config_path,
                 auth_token: args.auth_token.or_else(app_server_token_from_env),
                 insecure_no_auth: args.insecure_no_auth,
                 cors_origins: args.cors_origin,
@@ -5431,6 +5563,12 @@ fn run_app_server_command(
         });
     finish_cli_telemetry(session, &outcome);
     outcome
+}
+
+/// The config file an in-process app-server loads: the subcommand's own
+/// `--config`, else the global one.
+fn app_server_config_path(cli: &Cli, args: &AppServerArgs) -> Option<PathBuf> {
+    args.config.clone().or_else(|| cli.config.clone())
 }
 
 /// Build the `serve` argv forwarded to the TUI binary for
@@ -6993,6 +7131,323 @@ verbosity = "concise"
             canonical_model_for_set("deepseek-v4-flash-vision-exp"),
             "deepseek-v4-flash-vision-exp"
         );
+    }
+
+    #[test]
+    fn model_set_keeps_short_names_literal_off_deepseek_routes() {
+        let _env = env_lock();
+        let home = tempfile::tempdir().expect("isolated home");
+        let _home = ScopedEnvVar::set("CODEWHALE_HOME", &home.path().to_string_lossy());
+        let _config_path = ScopedEnvVar::remove("CODEWHALE_CONFIG_PATH");
+        let _legacy_config_path = ScopedEnvVar::remove("DEEPSEEK_CONFIG_PATH");
+        let path = home.path().join("config.toml");
+        for (provider, expected) in [
+            (ProviderKind::Openai, "pro"),
+            (ProviderKind::Anthropic, "pro"),
+            (ProviderKind::Deepseek, "deepseek-v4-pro"),
+            // Hosts that serve DeepSeek but do not resolve `pro` themselves.
+            (ProviderKind::Openrouter, "deepseek-v4-pro"),
+            (ProviderKind::Together, "deepseek-v4-pro"),
+        ] {
+            std::fs::write(&path, format!("provider = \"{}\"\n", provider.as_str())).unwrap();
+            let mut store = ConfigStore::load(Some(path.clone())).unwrap();
+            let runtime = resolved_runtime_for_test(provider, ProviderSource::Config);
+            run_model_command(
+                &mut store,
+                ModelCommand::Set {
+                    model: "pro".into(),
+                },
+                None,
+                &runtime,
+            )
+            .unwrap();
+            assert_eq!(store.config.provider, provider);
+            assert_eq!(
+                store
+                    .config
+                    .providers
+                    .for_provider(provider)
+                    .model
+                    .as_deref(),
+                Some(expected),
+                "{provider:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn model_set_in_a_workspace_config_follows_the_effective_route() {
+        let _env = env_lock();
+        let home = tempfile::tempdir().expect("isolated home");
+        let _home = ScopedEnvVar::set("CODEWHALE_HOME", &home.path().to_string_lossy());
+        let _config_path = ScopedEnvVar::remove("CODEWHALE_CONFIG_PATH");
+        let _legacy_config_path = ScopedEnvVar::remove("DEEPSEEK_CONFIG_PATH");
+        // A project config that names no provider: its root `model` applies to
+        // the route in effect (OpenAI here, from the global config), not to
+        // the DeepSeek default this file alone would suggest.
+        let repo = home.path().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(repo.join(".codewhale")).unwrap();
+        let path = repo.join(".codewhale").join("config.toml");
+        assert!(codewhale_config::config_path_is_workspace_scoped(&path));
+        for (provider, expected) in [
+            (ProviderKind::Openai, "pro"),
+            (ProviderKind::Deepseek, "deepseek-v4-pro"),
+        ] {
+            std::fs::write(&path, "").unwrap();
+            let mut store = ConfigStore::load(Some(path.clone())).unwrap();
+            let mut runtime = resolved_runtime_for_test(provider, ProviderSource::Config);
+            runtime.base_url = codewhale_config::provider::provider_for_kind(provider)
+                .default_base_url()
+                .to_string();
+            run_model_command(
+                &mut store,
+                ModelCommand::Set {
+                    model: "pro".into(),
+                },
+                None,
+                &runtime,
+            )
+            .unwrap();
+            let saved = std::fs::read_to_string(&path).unwrap();
+            assert!(
+                saved.contains(&format!("model = \"{expected}\"")),
+                "{provider:?}: {saved}"
+            );
+        }
+    }
+
+    #[test]
+    fn thread_commands_refuse_unknown_ids_instead_of_reporting_success() {
+        let dir = tempfile::tempdir().expect("state dir");
+        let state = StateStore::open(Some(dir.path().join("state.db"))).expect("open state");
+        for command in [
+            ThreadCommand::Archive {
+                thread_id: "missing".into(),
+            },
+            ThreadCommand::Unarchive {
+                thread_id: "missing".into(),
+            },
+            ThreadCommand::Read {
+                thread_id: "missing".into(),
+            },
+        ] {
+            let label = format!("{command:?}");
+            let error = run_thread_store_command(&state, command)
+                .expect_err("an unknown thread id must fail");
+            assert!(
+                format!("{error:#}").contains("thread not found: missing"),
+                "{label}: {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn app_server_in_process_transports_honor_the_global_config() {
+        let cli = parse_ok(&[
+            "codewhale",
+            "--config",
+            "/tmp/global-config.toml",
+            "app-server",
+            "--stdio",
+        ]);
+        let Some(Commands::AppServer(args)) = &cli.command else {
+            panic!("expected app-server");
+        };
+        assert_eq!(
+            app_server_config_path(&cli, args),
+            Some(PathBuf::from("/tmp/global-config.toml"))
+        );
+
+        let cli = parse_ok(&[
+            "codewhale",
+            "--config",
+            "/tmp/global-config.toml",
+            "app-server",
+            "--config",
+            "/tmp/app-server-config.toml",
+            "--socket",
+        ]);
+        let Some(Commands::AppServer(args)) = &cli.command else {
+            panic!("expected app-server");
+        };
+        assert_eq!(
+            app_server_config_path(&cli, args),
+            Some(PathBuf::from("/tmp/app-server-config.toml"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inline_lane_start_exits_nonzero_when_the_lane_fails() {
+        let _env = env_lock();
+        let home = tempfile::tempdir().expect("isolated home");
+        let _home = ScopedEnvVar::set("CODEWHALE_HOME", &home.path().to_string_lossy());
+        let request = |script: &str| LaneStartRequest {
+            workflow: None,
+            fleet: None,
+            issue: None,
+            goal: None,
+            runtime: "inline".to_string(),
+            worktree_repo: None,
+            branch: None,
+            worktree_path: None,
+            worktree_ttl_secs: None,
+            command: vec!["sh".into(), "-c".into(), script.to_string()],
+            environment: Vec::new(),
+            cwd: None,
+        };
+        let error = start_lane(request("exit 3")).expect_err("a failed inline lane must fail");
+        assert!(format!("{error:#}").contains(" failed"), "{error:#}");
+        start_lane(request("exit 0")).expect("a completed inline lane succeeds");
+    }
+
+    #[test]
+    fn interactive_api_key_prompt_reads_through_the_hidden_reader() {
+        let key = read_prompted_api_key(
+            "deepseek",
+            true,
+            |prompt| {
+                assert_eq!(prompt, "Enter API key for deepseek: ");
+                Ok("  sk-hidden-fixture \n".to_string())
+            },
+            || panic!("terminal input must not use the plain reader"),
+        )
+        .unwrap();
+        assert_eq!(key, "sk-hidden-fixture");
+        let key = read_prompted_api_key(
+            "deepseek",
+            false,
+            |_| panic!("piped input has no terminal to hide"),
+            || Ok("sk-piped-fixture".to_string()),
+        )
+        .unwrap();
+        assert_eq!(key, "sk-piped-fixture");
+        assert!(
+            read_prompted_api_key("deepseek", true, |_| Ok("  \n".into()), || unreachable!())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn hidden_key_prompt_uses_a_terminal_stream_when_stderr_is_redirected() {
+        // `read_secure_line` on a non-terminal stream returns "" without
+        // reading, so `auth set 2>err.log` must prompt on stdout instead.
+        assert_eq!(hidden_prompt_stream(true, true), Some(PromptStream::Stderr));
+        assert_eq!(
+            hidden_prompt_stream(true, false),
+            Some(PromptStream::Stderr)
+        );
+        assert_eq!(
+            hidden_prompt_stream(false, true),
+            Some(PromptStream::Stdout)
+        );
+        assert_eq!(hidden_prompt_stream(false, false), None);
+    }
+
+    #[test]
+    fn auth_clear_fails_when_the_secret_store_keeps_the_key() {
+        use codewhale_secrets::{KeyringStore, SecretsError};
+        use std::sync::Arc;
+
+        struct UndeletableStore(Option<&'static str>);
+
+        impl KeyringStore for UndeletableStore {
+            fn get(&self, _key: &str) -> Result<Option<String>, SecretsError> {
+                Ok(self.0.map(str::to_string))
+            }
+
+            fn set(&self, _key: &str, _value: &str) -> Result<(), SecretsError> {
+                Err(SecretsError::ReadOnly)
+            }
+
+            fn delete(&self, _key: &str) -> Result<(), SecretsError> {
+                Err(SecretsError::Keyring("test delete failure".to_string()))
+            }
+
+            fn backend_name(&self) -> &'static str {
+                "undeletable test store"
+            }
+        }
+
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        let clear = |held: Option<&'static str>| {
+            let mut store = ConfigStore::load(Some(path.clone())).expect("load config");
+            store.config.providers.deepseek.api_key = Some("sk-config-fixture".to_string());
+            store.save().unwrap();
+            let secrets = Secrets::new(Arc::new(UndeletableStore(held)));
+            let outcome = run_auth_command_with_secrets(
+                &mut store,
+                AuthCommand::Clear {
+                    provider: ProviderKind::Deepseek,
+                },
+                &secrets,
+            );
+            assert!(store.config.providers.deepseek.api_key.is_none());
+            outcome
+        };
+
+        let error = clear(Some("sk-keyring-fixture")).expect_err("a kept key is not cleared");
+        let message = format!("{error:#}");
+        assert!(message.contains("refused the delete"), "{message}");
+        assert!(!message.contains("sk-keyring-fixture"), "{message}");
+        clear(None).expect("nothing stored means nothing left to revoke");
+    }
+
+    #[test]
+    fn xai_auth_clear_reports_a_kept_key_after_the_revocation_commits() {
+        use codewhale_secrets::{KeyringStore, SecretsError};
+        use std::sync::Arc;
+
+        struct UndeletableStore;
+
+        impl KeyringStore for UndeletableStore {
+            fn get(&self, _key: &str) -> Result<Option<String>, SecretsError> {
+                Ok(Some("xai-keyring-fixture".to_string()))
+            }
+
+            fn set(&self, _key: &str, _value: &str) -> Result<(), SecretsError> {
+                Err(SecretsError::ReadOnly)
+            }
+
+            fn delete(&self, _key: &str) -> Result<(), SecretsError> {
+                Err(SecretsError::Keyring("test delete failure".to_string()))
+            }
+
+            fn backend_name(&self) -> &'static str {
+                "undeletable test store"
+            }
+        }
+
+        let _env = env_lock();
+        let home = tempfile::tempdir().expect("isolated home");
+        // The owned credentials directory is opened without following links,
+        // so the home must not sit behind one (macOS `/var` -> `/private/var`).
+        let home_path = home.path().canonicalize().expect("canonical home");
+        let _home = ScopedEnvVar::set("CODEWHALE_HOME", &home_path.to_string_lossy());
+        let path = home_path.join("config.toml");
+        let mut store = ConfigStore::load(Some(path.clone())).expect("load config");
+        store.config.providers.xai.api_key = Some("xai-config-fixture".to_string());
+        store.config.providers.xai.auth_mode = Some("api_key".to_string());
+        store.save().unwrap();
+        let secrets = Secrets::new(Arc::new(UndeletableStore));
+        let error = run_auth_command_with_secrets(
+            &mut store,
+            AuthCommand::Clear {
+                provider: ProviderKind::Xai,
+            },
+            &secrets,
+        )
+        .expect_err("a kept xAI key is not cleared");
+        let message = format!("{error:#}");
+        assert!(message.contains("refused the delete"), "{message}");
+        assert!(!message.contains("xai-keyring-fixture"), "{message}");
+        // The error is raised after the transaction commits, so the saved
+        // config leg is not rolled back.
+        let saved = ConfigStore::load(Some(path)).expect("reload config");
+        assert!(saved.config.providers.xai.api_key.is_none());
+        assert!(saved.config.providers.xai.auth_mode.is_none());
     }
 
     #[test]

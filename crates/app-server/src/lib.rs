@@ -1488,8 +1488,8 @@ async fn handle_stdio_thread_message<W: AsyncWrite + Unpin>(
     Ok(result)
 }
 
-/// Resuming or forking a thread the runtime reports as `missing` must fail
-/// with a named not-found error. Recording the null model/workspace of that
+/// Resuming, forking, archiving or unarchiving a thread the runtime reports
+/// as `missing` must fail with a named not-found error. Recording the null model/workspace of that
 /// response as a stdio hint would clobber any previously cached hint for
 /// the same thread id (#5171).
 fn ensure_thread_found(response: &ThreadResponse) -> std::result::Result<(), JsonRpcError> {
@@ -2525,6 +2525,7 @@ async fn dispatch_stdio_request_with_writer<W: AsyncWrite + Unpin>(
                 },
             )
             .await?;
+            ensure_thread_found(&response)?;
             StdioDispatchResult {
                 result: serde_json::to_value(response)
                     .map_err(|err| JsonRpcError::internal(err.to_string()))?,
@@ -2540,6 +2541,7 @@ async fn dispatch_stdio_request_with_writer<W: AsyncWrite + Unpin>(
                 },
             )
             .await?;
+            ensure_thread_found(&response)?;
             StdioDispatchResult {
                 result: serde_json::to_value(response)
                     .map_err(|err| JsonRpcError::internal(err.to_string()))?,
@@ -4438,6 +4440,26 @@ mod tests {
         let hint = hints.get("ghost-thread").expect("cached hint survives");
         assert_eq!(hint.model.as_deref(), Some("deepseek-v4-pro"));
         assert_eq!(hint.workspace.as_deref(), Some(workspace.as_path()));
+    }
+
+    #[tokio::test]
+    async fn stdio_archive_of_missing_thread_fails_instead_of_reporting_success() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config_path = tmp.path().join("config.toml");
+        fs::write(&config_path, "").expect("write config");
+        let state = build_state(Some(config_path), None).expect("state");
+        for method in ["thread/archive", "thread/unarchive"] {
+            let err =
+                dispatch_stdio_request(&state, method, json!({ "thread_id": "ghost-thread" }))
+                    .await
+                    .expect_err("an unknown thread id must fail");
+            assert_eq!(err.code, -32004, "{method}");
+            assert!(
+                err.message.contains("ghost-thread"),
+                "{method}: {}",
+                err.message
+            );
+        }
     }
 
     fn sse_frame(event: &str, payload: Value) -> String {
