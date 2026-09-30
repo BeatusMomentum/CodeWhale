@@ -186,7 +186,7 @@ fn computer(id: &str, status: &str) -> serde_json::Value {
 }
 
 fn agent(id: &str, name: &str) -> serde_json::Value {
-    json!({ "id": id, "name": name, "status": "active", "projectId": "project-codewhale" })
+    json!({ "id": id, "name": name, "status": "active", "projectId": "project-codewhale", "revision": 1 })
 }
 
 fn agent_thread(id: &str, agent_id: &str, title: &str) -> serde_json::Value {
@@ -208,6 +208,25 @@ fn parses_cloud_command_matrix_and_rejects_inline_keys() {
     assert!(matches!(
         command(&["codewhale", "account", "status"]),
         CloudCommand::Status
+    ));
+    assert!(matches!(
+        command(&["codewhale", "account", "projects", "list"]),
+        CloudCommand::Projects(CloudProjectsArgs {
+            command: CloudProjectsCommand::List { json: false }
+        })
+    ));
+    assert!(matches!(
+        command(&[
+            "codewhale",
+            "account",
+            "agents",
+            "bind-project",
+            "Whale",
+            "project-codewhale"
+        ]),
+        CloudCommand::Agents(CloudAgentsArgs {
+            command: CloudAgentsCommand::BindProject { .. }
+        })
     ));
     assert!(matches!(
         command(&["codewhale", "cloud", "login", "--no-open"]),
@@ -2118,6 +2137,8 @@ fn account_agents_create_model_bound_thread_and_send_with_same_session() {
             "agents",
             "create",
             "Whale",
+            "--project-id",
+            "project-codewhale",
             "--operation-key",
             "create-1",
         ],
@@ -2199,7 +2220,7 @@ fn account_agents_create_model_bound_thread_and_send_with_same_session() {
     );
     assert_eq!(
         serde_json::from_slice::<serde_json::Value>(requests[1].body.as_ref().unwrap()).unwrap(),
-        json!({ "name": "Whale", "operationKey": "create-1" })
+        json!({ "name": "Whale", "projectId": "project-codewhale", "operationKey": "create-1" })
     );
     assert_eq!(
         serde_json::from_slice::<serde_json::Value>(requests[3].body.as_ref().unwrap()).unwrap(),
@@ -2226,6 +2247,189 @@ fn account_agents_create_model_bound_thread_and_send_with_same_session() {
     assert!(output.contains("Status: completed"));
     assert!(output.contains("Answer:\nDone."));
     assert!(!output.contains("access-secret"));
+}
+
+#[test]
+fn account_projects_list_and_agent_binding_use_the_saved_revision() {
+    let (secrets, _) = test_secrets();
+    let auth_transport = FakeTransport::new(vec![]);
+    CloudClient::new(&auth_transport, &secrets, "default", DEFAULT_API_BASE)
+        .save_auth(auth("access-secret", "refresh-secret", "acct-123"))
+        .unwrap();
+    let mut unbound = agent("agent-1", "Whale");
+    unbound["projectId"] = json!("");
+    let bound = agent("agent-1", "Whale");
+    let projects = json!({ "projects": [{ "id": "project-codewhale", "name": "Codewhale" }] });
+    let transport = FakeTransport::new(vec![
+        response(200, projects.clone()),
+        response(200, json!({ "agents": [unbound] })),
+        response(200, projects),
+        response(200, json!({ "agent": bound })),
+    ]);
+    let client = CloudClient::new(&transport, &secrets, "default", DEFAULT_API_BASE);
+    let mut output = Vec::new();
+    run_projects(
+        CloudProjectsCommand::List { json: false },
+        &client,
+        &machine::MachineKeyEnv::default(),
+        &mut output,
+    )
+    .unwrap();
+    run_agents(
+        CloudAgentsCommand::BindProject {
+            agent: "Whale".into(),
+            project_id: "project-codewhale".into(),
+        },
+        &client,
+        &machine::MachineKeyEnv::default(),
+        &mut output,
+    )
+    .unwrap();
+    let requests = transport.requests();
+    assert_eq!(
+        requests
+            .iter()
+            .map(|request| request.path.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "/api/projects",
+            "/api/agents",
+            "/api/projects",
+            "/api/agents/agent-1"
+        ]
+    );
+    assert!(requests[3].method == HttpMethod::Patch);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(requests[3].body.as_ref().unwrap()).unwrap(),
+        json!({ "projectId": "project-codewhale", "revision": 1 })
+    );
+    let output = String::from_utf8(output).unwrap();
+    assert!(output.contains("Codewhale — project-codewhale"));
+    assert!(output.contains("Agent Whale is bound to Project project-codewhale."));
+}
+
+#[test]
+fn account_agent_binding_refuses_an_unavailable_project_before_writing() {
+    let (secrets, _) = test_secrets();
+    let auth_transport = FakeTransport::new(vec![]);
+    CloudClient::new(&auth_transport, &secrets, "default", DEFAULT_API_BASE)
+        .save_auth(auth("access-secret", "refresh-secret", "acct-123"))
+        .unwrap();
+    let transport = FakeTransport::new(vec![
+        response(200, json!({ "agents": [agent("agent-1", "Whale")] })),
+        response(200, json!({ "projects": [] })),
+    ]);
+    let client = CloudClient::new(&transport, &secrets, "default", DEFAULT_API_BASE);
+    let error = run_agents(
+        CloudAgentsCommand::BindProject {
+            agent: "Whale".into(),
+            project_id: "project-unknown".into(),
+        },
+        &client,
+        &machine::MachineKeyEnv::default(),
+        &mut Vec::new(),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("not available on this account"));
+    assert_eq!(transport.requests().len(), 2);
+}
+
+#[test]
+fn account_agent_send_refuses_closed_billing_modes_before_network() {
+    let (secrets, _) = test_secrets();
+    let transport = FakeTransport::new(vec![]);
+    let client = CloudClient::new(&transport, &secrets, "default", DEFAULT_API_BASE);
+    let thread: AgentThread =
+        serde_json::from_value(agent_thread("thread-1", "agent-1", "Main")).unwrap();
+    for mode in ["membership_included", "managed_wallet"] {
+        let error = client
+            .send_agent_turn(&thread, "Build this", mode, "message-1")
+            .err()
+            .expect("billing mode should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("unavailable under the current launch policy")
+        );
+    }
+    assert!(transport.requests().is_empty());
+}
+
+#[test]
+fn account_agent_send_uses_its_only_active_conversation_regardless_of_title() {
+    let (secrets, _) = test_secrets();
+    let auth_transport = FakeTransport::new(vec![]);
+    CloudClient::new(&auth_transport, &secrets, "default", DEFAULT_API_BASE)
+        .save_auth(auth("access-secret", "refresh-secret", "acct-123"))
+        .unwrap();
+    let transport = FakeTransport::new(vec![
+        response(200, json!({ "agents": [agent("agent-1", "Whale")] })),
+        response(
+            200,
+            json!([agent_thread("thread-1", "agent-1", "Whale Trial · main")]),
+        ),
+        response(
+            202,
+            json!({ "turn": { "id": "turn-1", "status": "pending" } }),
+        ),
+    ]);
+    let client = CloudClient::new(&transport, &secrets, "default", DEFAULT_API_BASE);
+    let mut output = Vec::new();
+    run_agents(
+        CloudAgentsCommand::Send {
+            agent: "Whale".into(),
+            prompt: "Continue".into(),
+            thread: None,
+            billing_mode: "byok_external".into(),
+            operation_key: "message-1".into(),
+        },
+        &client,
+        &machine::MachineKeyEnv::default(),
+        &mut output,
+    )
+    .unwrap();
+    let requests = transport.requests();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[2].path, "/v1/threads/thread-1/turns");
+    assert!(
+        String::from_utf8(output)
+            .unwrap()
+            .contains("Turn ID: turn-1")
+    );
+}
+
+#[test]
+fn account_agent_send_refuses_a_conversation_from_a_previous_project() {
+    let (secrets, _) = test_secrets();
+    let auth_transport = FakeTransport::new(vec![]);
+    CloudClient::new(&auth_transport, &secrets, "default", DEFAULT_API_BASE)
+        .save_auth(auth("access-secret", "refresh-secret", "acct-123"))
+        .unwrap();
+    let mut rebound = agent("agent-1", "Whale");
+    rebound["projectId"] = json!("project-new");
+    let transport = FakeTransport::new(vec![
+        response(200, json!({ "agents": [rebound] })),
+        response(
+            200,
+            json!({ "thread": agent_thread("thread-1", "agent-1", "Main") }),
+        ),
+    ]);
+    let client = CloudClient::new(&transport, &secrets, "default", DEFAULT_API_BASE);
+    let error = run_agents(
+        CloudAgentsCommand::Send {
+            agent: "Whale".into(),
+            prompt: "Continue".into(),
+            thread: Some("thread-1".into()),
+            billing_mode: "byok_external".into(),
+            operation_key: "message-1".into(),
+        },
+        &client,
+        &machine::MachineKeyEnv::default(),
+        &mut Vec::new(),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("different Project"));
+    assert_eq!(transport.requests().len(), 2);
 }
 
 #[test]
@@ -2355,7 +2559,7 @@ fn account_agents_refuse_foreign_threads_ambiguous_main_and_machine_keys() {
             .contains("interactive Codewhale account login")
     );
     assert!(transport.requests().is_empty());
-    assert!(client.create_agent("Whale", "invalid/key").is_err());
+    assert!(client.create_agent("Whale", None, "invalid/key").is_err());
     assert!(transport.requests().is_empty());
 
     client

@@ -59,6 +59,8 @@ enum CloudCommand {
     Keys(CloudKeysArgs),
     /// Manage Computers in this signed-in Codewhale account.
     Computers(CloudComputersArgs),
+    /// List Projects available to this signed-in Codewhale account.
+    Projects(CloudProjectsArgs),
     /// Manage named Agents and their account conversations.
     Agents(CloudAgentsArgs),
     /// Manage Codewhale account API keys: machine tokens for CI.
@@ -120,6 +122,21 @@ struct CloudAgentsArgs {
     command: CloudAgentsCommand,
 }
 
+#[derive(Debug, Args)]
+struct CloudProjectsArgs {
+    #[command(subcommand)]
+    command: CloudProjectsCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum CloudProjectsCommand {
+    /// List account Projects; use an ID when binding an Agent.
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+}
+
 #[derive(Debug, Subcommand)]
 enum CloudAgentsCommand {
     /// List active Agents in this account.
@@ -130,9 +147,14 @@ enum CloudAgentsCommand {
     /// Create a named Agent. Reuse the operation key if a response is lost.
     Create {
         name: String,
+        /// Assign an existing account Project to this Agent.
+        #[arg(long)]
+        project_id: Option<String>,
         #[arg(long)]
         operation_key: String,
     },
+    /// Assign an existing Project to an Agent, checking its saved revision.
+    BindProject { agent: String, project_id: String },
     /// List recent, active conversations for a named Agent or Agent ID.
     Threads {
         agent: String,
@@ -155,10 +177,10 @@ enum CloudAgentsCommand {
     Send {
         agent: String,
         prompt: String,
-        /// Select a specific thread; otherwise the Agent must have exactly one active Main thread.
+        /// Select a specific conversation; otherwise use its only active one, or a unique Main.
         #[arg(long)]
         thread: Option<String>,
-        /// Explicit payer: byok_external, membership_included, or managed_wallet.
+        /// Explicit payer. Only byok_external is available under the current launch policy.
         #[arg(long)]
         billing_mode: String,
         /// Stable message ID for safe retry after an uncertain response.
@@ -284,6 +306,17 @@ struct ComputerDeleteResponse {
     computer_id: String,
 }
 
+#[derive(Deserialize)]
+struct AccountProject {
+    id: String,
+    name: String,
+}
+
+#[derive(Deserialize)]
+struct ProjectListResponse {
+    projects: Vec<AccountProject>,
+}
+
 #[derive(Serialize)]
 struct ComputerCreateRequest<'a> {
     name: &'a str,
@@ -297,6 +330,7 @@ struct AccountAgent {
     status: String,
     #[serde(default)]
     project_id: String,
+    revision: u64,
 }
 
 #[derive(Deserialize)]
@@ -412,6 +446,7 @@ fn validate_provider_id(value: &str) -> Result<String> {
 enum HttpMethod {
     Get,
     Post,
+    Patch,
     Put,
     Delete,
 }
@@ -466,6 +501,7 @@ impl CloudTransport for ReqwestTransport {
         let method = match request.method {
             HttpMethod::Get => reqwest::Method::GET,
             HttpMethod::Post => reqwest::Method::POST,
+            HttpMethod::Patch => reqwest::Method::PATCH,
             HttpMethod::Put => reqwest::Method::PUT,
             HttpMethod::Delete => reqwest::Method::DELETE,
         };
@@ -707,18 +743,55 @@ impl<'a, T: CloudTransport> CloudClient<'a, T> {
         expect_json(response, &[200])
     }
 
-    fn create_agent(&self, name: &str, operation_key: &str) -> Result<AccountAgent> {
+    fn projects(&self) -> Result<serde_json::Value> {
+        let response = self.execute_authenticated(HttpMethod::Get, "/api/projects", None)?;
+        expect_json(response, &[200])
+    }
+
+    fn create_agent(
+        &self,
+        name: &str,
+        project_id: Option<&str>,
+        operation_key: &str,
+    ) -> Result<AccountAgent> {
         let name = validate_named_text(name, "Agent name", 80)?;
         let operation_key = validate_operation_key(operation_key)?;
+        let mut body = serde_json::json!({
+            "name": name,
+            "operationKey": operation_key,
+        });
+        if let Some(project_id) = project_id {
+            body["projectId"] = serde_json::json!(validate_resource_id(project_id, "Project")?);
+        }
+        let response =
+            self.execute_authenticated(HttpMethod::Post, "/api/agents", Some(json_body(&body)?))?;
+        let result: AgentResponse = expect_json(response, &[200, 201])?;
+        Ok(result.agent)
+    }
+
+    fn bind_agent_project(
+        &self,
+        agent_id: &str,
+        project_id: &str,
+        revision: u64,
+    ) -> Result<AccountAgent> {
+        let agent_id = validate_resource_id(agent_id, "Agent")?;
+        let project_id = validate_resource_id(project_id, "Project")?;
+        if revision == 0 {
+            bail!("The Codewhale service returned an Agent without a valid revision");
+        }
         let response = self.execute_authenticated(
-            HttpMethod::Post,
-            "/api/agents",
+            HttpMethod::Patch,
+            &format!("/api/agents/{agent_id}"),
             Some(json_body(&serde_json::json!({
-                "name": name,
-                "operationKey": operation_key,
+                "projectId": project_id,
+                "revision": revision,
             }))?),
         )?;
-        let result: AgentResponse = expect_json(response, &[200, 201])?;
+        let result: AgentResponse = expect_json(response, &[200])?;
+        if result.agent.id != agent_id || result.agent.project_id != project_id {
+            bail!("The Codewhale service returned an unexpected Agent Project binding");
+        }
         Ok(result.agent)
     }
 
@@ -1101,9 +1174,12 @@ fn validate_operation_key(value: &str) -> Result<&str> {
 fn validate_billing_mode(value: &str) -> Result<&str> {
     match value.trim() {
         "byok_external" => Ok("byok_external"),
-        "membership_included" => Ok("membership_included"),
-        "managed_wallet" => Ok("managed_wallet"),
-        _ => bail!("Billing mode must be byok_external, membership_included, or managed_wallet"),
+        "membership_included" | "managed_wallet" => {
+            bail!(
+                "Codewhale-managed model billing is unavailable under the current launch policy. Use --billing-mode byok_external with your own provider key"
+            )
+        }
+        _ => bail!("Billing mode must be byok_external under the current launch policy"),
     }
 }
 
@@ -1236,6 +1312,35 @@ fn write_agent_thread<W: Write>(out: &mut W, thread: &AgentThread) -> Result<()>
     Ok(())
 }
 
+fn run_projects<T: CloudTransport, W: Write>(
+    command: CloudProjectsCommand,
+    client: &CloudClient<'_, T>,
+    machine: &machine::MachineKeyEnv,
+    out: &mut W,
+) -> Result<()> {
+    if machine.is_present() {
+        bail!(
+            "Projects require an interactive Codewhale account login; unset CODEWHALE_API_KEY and run `codewhale login`"
+        );
+    }
+    match command {
+        CloudProjectsCommand::List { json } => {
+            let response = client.projects()?;
+            if json {
+                return write_computer_json(out, &response);
+            }
+            let listing: ProjectListResponse = serde_json::from_value(response)
+                .context("The Codewhale service returned an invalid Project list")?;
+            writeln!(out, "Codewhale Projects ({})", listing.projects.len())?;
+            for project in listing.projects {
+                validate_resource_id(&project.id, "Project")?;
+                writeln!(out, "{} — {}", printable(&project.name), project.id)?;
+            }
+            Ok(())
+        }
+    }
+}
+
 fn run_agents<T: CloudTransport, W: Write>(
     command: CloudAgentsCommand,
     client: &CloudClient<'_, T>,
@@ -1264,16 +1369,67 @@ fn run_agents<T: CloudTransport, W: Write>(
         }
         CloudAgentsCommand::Create {
             name,
+            project_id,
             operation_key,
         } => {
-            let agent = client.create_agent(&name, &operation_key)?;
+            let agent = client.create_agent(&name, project_id.as_deref(), &operation_key)?;
             validate_resource_id(&agent.id, "Agent")?;
+            if let Some(project_id) = project_id.as_deref() {
+                if agent.project_id != validate_resource_id(project_id, "Project")? {
+                    bail!("The Codewhale service returned an unexpected Agent Project binding");
+                }
+            }
             writeln!(out, "Agent: {}", printable(&agent.name))?;
             writeln!(out, "ID: {}", agent.id)?;
+            if !agent.project_id.is_empty() {
+                writeln!(
+                    out,
+                    "Project ID: {}",
+                    validate_resource_id(&agent.project_id, "Project")?
+                )?;
+            }
             writeln!(
                 out,
                 "Create request ID: {}",
                 validate_operation_key(&operation_key)?
+            )?;
+            if agent.project_id.is_empty() {
+                writeln!(
+                    out,
+                    "Bind this Agent to a Project before creating a conversation. Run `codewhale account projects list` to find one."
+                )?;
+            }
+            Ok(())
+        }
+        CloudAgentsCommand::BindProject { agent, project_id } => {
+            let listing: AgentListResponse = serde_json::from_value(client.agents()?)
+                .context("The Codewhale service returned an invalid Agent list")?;
+            let selected = resolve_account_agent(&listing.agents, &agent)?;
+            let project_id = validate_resource_id(&project_id, "Project")?;
+            let projects: ProjectListResponse = serde_json::from_value(client.projects()?)
+                .context("The Codewhale service returned an invalid Project list")?;
+            if !projects
+                .projects
+                .iter()
+                .any(|project| project.id == project_id)
+            {
+                bail!(
+                    "Project {project_id} is not available on this account. Run `codewhale account projects list`"
+                );
+            }
+            if selected.project_id == project_id {
+                writeln!(
+                    out,
+                    "Agent {} is already bound to Project {project_id}.",
+                    printable(&selected.name)
+                )?;
+                return Ok(());
+            }
+            let bound = client.bind_agent_project(&selected.id, project_id, selected.revision)?;
+            writeln!(
+                out,
+                "Agent {} is bound to Project {project_id}.",
+                printable(&bound.name)
             )?;
             Ok(())
         }
@@ -1365,24 +1521,36 @@ fn run_agents<T: CloudTransport, W: Write>(
                         printable(&selected.name)
                     );
                 }
-                let mut main = threads.into_iter().filter(|thread| {
-                    active_agent_thread(thread, &selected.id) && thread.title == "Main"
-                });
-                let first = main.next().ok_or_else(|| anyhow!(
-                    "Agent {} has no active Main conversation. Run `codewhale account agents new-thread` first, or pass --thread",
-                    printable(&selected.name)
-                ))?;
-                if main.next().is_some() {
-                    bail!(
-                        "Agent {} has several Main conversations; pass --thread with an ID",
+                let mut active = threads
+                    .into_iter()
+                    .filter(|thread| active_agent_thread(thread, &selected.id))
+                    .collect::<Vec<_>>();
+                if active.len() == 1 {
+                    active.remove(0)
+                } else {
+                    let mut main = active.into_iter().filter(|thread| thread.title == "Main");
+                    let first = main.next().ok_or_else(|| anyhow!(
+                        "Agent {} has no unique active conversation. Run `codewhale account agents new-thread` first, or pass --thread",
                         printable(&selected.name)
-                    );
+                    ))?;
+                    if main.next().is_some() {
+                        bail!(
+                            "Agent {} has several Main conversations; pass --thread with an ID",
+                            printable(&selected.name)
+                        );
+                    }
+                    first
                 }
-                first
             };
             if !active_agent_thread(&selected_thread, &selected.id) {
                 bail!(
                     "That conversation is not active or does not belong to Agent {}",
+                    printable(&selected.name)
+                );
+            }
+            if selected.project_id.is_empty() || selected_thread.project_id != selected.project_id {
+                bail!(
+                    "That conversation belongs to a different Project than Agent {} currently owns. Bind the Agent and create a new conversation in its Project before sending",
                     printable(&selected.name)
                 );
             }
@@ -1779,6 +1947,7 @@ fn run_with<T: CloudTransport, W: Write>(
         CloudCommand::Computers(computers) => {
             run_computers(computers.command, &client, machine, out)
         }
+        CloudCommand::Projects(projects) => run_projects(projects.command, &client, machine, out),
         CloudCommand::Agents(agents) => run_agents(agents.command, &client, machine, out),
         CloudCommand::ApiKeys(api_keys) => {
             machine::run_api_keys(api_keys, &client, machine, provider_secrets, out, sleeper)
