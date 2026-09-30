@@ -4145,6 +4145,99 @@ fn work_quote_refuses_before_quoting_anything_it_cannot_launch_or_would_charge_f
 }
 
 #[test]
+fn work_confirmation_stdin_is_exposed_without_a_token_in_argv() {
+    let parsed = command(&[
+        "codewhale",
+        "account",
+        "agents",
+        "work-launch",
+        WORK_ID,
+        "--operation-key",
+        "launch-stdin",
+        "--confirmation",
+        "-",
+        "--confirm-eu-compute",
+    ]);
+    assert!(matches!(parsed, CloudCommand::Agents(CloudAgentsArgs {
+        command: CloudAgentsCommand::WorkLaunch { confirmation, confirm_eu_compute: true, .. }
+    }) if confirmation == "-"));
+    let help = Cli::try_parse_from(["codewhale", "account", "agents", "work-launch", "--help"])
+        .unwrap_err()
+        .to_string();
+    assert!(help.contains("bounded piped stdin"));
+}
+
+#[test]
+fn work_confirmation_stdin_accepts_a_single_proof_with_optional_line_ending() {
+    for input in [
+        "consent.abc-123_DEF",
+        "consent.abc-123_DEF\n",
+        "consent.abc-123_DEF\r\n",
+    ] {
+        assert_eq!(
+            work::read_confirmation(input.as_bytes()).unwrap(),
+            "consent.abc-123_DEF"
+        );
+    }
+    let maximum = "A".repeat(4096);
+    assert_eq!(
+        work::read_confirmation(format!("{maximum}\r\n").as_bytes()).unwrap(),
+        maximum
+    );
+}
+
+#[test]
+fn work_confirmation_stdin_rejects_untrusted_input_without_echo_and_bounds_reads() {
+    for input in [
+        "",
+        "consent SECRET",
+        "consent.$(SECRET)",
+        "consent.SECRET\nsecond",
+        "consent.SECRET\n\n",
+        "consent.SECRET\r",
+    ] {
+        let error = chain(&work::read_confirmation(input.as_bytes()).unwrap_err());
+        assert!(!error.contains("SECRET"));
+    }
+    assert!(
+        work::read_confirmation(&[0xff][..])
+            .unwrap_err()
+            .to_string()
+            .contains("UTF-8")
+    );
+    let mut huge = std::io::Cursor::new(vec![b'A'; 1_000_000]);
+    let error = chain(&work::read_confirmation(&mut huge).unwrap_err());
+    assert!(error.contains("too long"));
+    assert_eq!(
+        huge.position(),
+        4099,
+        "read is bounded even if the pipe contains arbitrarily much input"
+    );
+}
+
+#[test]
+fn work_confirmation_stdin_proof_reaches_only_the_confirmed_request() {
+    let secrets = signed_in();
+    let transport = ScriptedTransport::new(vec![
+        reply(200, work_run("queued")),
+        agents_step(),
+        projects_step(),
+        reply(201, cloud_session()),
+    ]);
+    let client = CloudClient::new(&transport, &secrets, "default", DEFAULT_API_BASE);
+    let proof = work::read_confirmation(&b"consent.private-proof\n"[..]).unwrap();
+    let mut output = Vec::new();
+    work::launch(&client, &mut output, WORK_ID, "launch-stdin", &proof, true).unwrap();
+    assert_eq!(
+        body_of(&transport.requests()[3])["launchQuoteConfirmation"],
+        proof
+    );
+    let output = String::from_utf8(output).unwrap();
+    assert!(!output.contains(&proof));
+    assert!(!output.contains("access-secret") && !output.contains("refresh-secret"));
+}
+
+#[test]
 fn work_launch_requires_eu_consent_and_sends_the_confirmed_c5_request() {
     let secrets = signed_in();
     // No consent flag: nothing is read or sent.
