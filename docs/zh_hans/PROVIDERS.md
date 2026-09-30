@@ -58,7 +58,7 @@ Codex 自己控制其上游缓存策略；`model/list` 不提供强制刷新选�
 
 Codewhale 观察到的 Codex 名单绑定到确切的文件系统 home 和其 `auth.json` 的元数据版本；为该缓存绑定从不读取令牌。更换该登录会使此次观察失效。在观察到登录文件变化之前获取的 Codex 原生缓存同样视为过期。没有可观察登录文件的、仅存于系统密钥环的账户仍可加载实时名单，但回执会报告 `codex_observation_not_persisted`，并且不会保留 Codewhale 的观察记录。当无法观察到登录文件版本时，单独归属的、由 Codex 拥有的原生缓存保持其原有的新鲜度策略；这并不能证明外部密钥环中的账户身份。
 
-规范的提供商 ID 是 `ProviderKind::ALL`（`crates/config/src/provider_kind.rs`）的 44 个条目，按该顺序排列：
+规范的提供商 ID 是 `ProviderKind::ALL`（`crates/config/src/provider_kind.rs`）的 46 个条目，按该顺序排列：
 
 `deepseek`, `nvidia-nim`, `openai`, `atlascloud`, `wanjie-ark`, `volcengine`,
 `openrouter`, `orcarouter`, `xiaomi-mimo`, `novita`, `fireworks`, `siliconflow`, `arcee`,

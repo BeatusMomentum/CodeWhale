@@ -289,7 +289,7 @@ TUI-DOG-017）——保持原样。
 3. **已落地。** `palette` → `codewhale-palette`；`command_safety` →
    `codewhale-execpolicy`（它本来就拥有 `ApprovalMode`，所以这次迁移是去掉一条
    依赖边，而不是新增）。
-4. `client/`（各提供商（provider）的线上协议适配器）→ `codewhale-client`：**被第 1 条卡住，
+4. `client/`（各提供商（provider）的传输协议适配器）→ `codewhale-client`：**被第 1 条卡住，
    不只是排在它后面而已。** 排除文档注释和 `#[cfg(test)]` 块之后，`client` 仍有
    20 条生产代码里的 `crate::` 依赖边。其中三条很难处理：
    - `crate::config`——`Config`、`ProvidersConfig`、`ProviderConfig`、`TuiConfig`、

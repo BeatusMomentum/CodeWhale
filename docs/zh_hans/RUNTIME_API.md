@@ -1472,7 +1472,11 @@ Engine 并不知道的终端。输入可按路由归因：
   "tty"?, "env"? }` → `201 { "job" }`；在线程投影出的沙箱策略下作为后台 shell 运行。
   `tty: true` 会把 stderr 合并进 stdout，
   并给命令一个终端（交互式程序必需）；
-  后台作业永不会在 `timeout_ms` 时被杀掉
+  后台作业永不会在 `timeout_ms` 时被杀掉。相对 `cwd` 在线程工作区内解析。
+  未开启信任模式时，解析符号链接后的 `cwd` 必须仍在该工作区内，否则返回 `403`：
+  与 shell 工具不同，此路由不采用 `workspace_follow_symlinks` 或 `/trust add` 根目录，
+  所以指向工作区外的符号链接会被拒绝。作业在已解析并检查过的目录中运行，
+  之后重定向符号链接不会改变其运行目录；`cwd` 解析为非 UTF-8 路径时返回 `400`
 - `GET /v1/threads/{id}/jobs/{job_id}` — 单个作业的状态 + 元数据
 - `GET /v1/threads/{id}/jobs/{job_id}/output?stream=<stdout|stderr>&cursor=
   <bytes>&max_bytes=<1-512KiB>&wait_ms=<0-30s>&format=<base64|text>` —
@@ -1601,7 +1605,7 @@ Engine 并不知道的终端。输入可按路由归因：
   （仅已跟踪路径——没有 `all`，未跟踪路径失败关闭）；
   `POST /v1/git/commit` `{ "message", "all"? }`；stage、unstage、discard
   与 commit 还接受一个可选的 `expect`（见下文）；`POST /v1/git/push`
-  `{ "remote"?, "set_upstream"? }`；`POST /v1/git/branch`
+  `{ "remote"?, "set_upstream"? }`（`remote`，或仅提供 `set_upstream` 时使用的 `origin`，必须是已配置的远端名称）；`POST /v1/git/branch`
   `{ "name", "create"? }`
 
 diff 与前置条件令牌的读取通过加固过的审阅命令运行（过滤器、fsmonitor、钩子、

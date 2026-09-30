@@ -167,8 +167,10 @@ JSON 把凭据的 `source`（来源）与字面的 `availability`（可用性）
 - 头部（Header）：当前会话、活动模型、模式和总体状态。
 - 转录区（对话记录，Transcript）：对话、工具调用、命令输出摘要和模型回复。
 - 输入区（Composer）：你在这里输入提示、斜杠命令和文件提及。
-- 工作栏（Workbar）：输入区下方的一条（或可选的侧栏），承载活动目标、待办列表和子智能体。行会保持整个会话——已完成的工作显示为"已完成"而不是消失——点击某一行（或对它按 `Enter`）会打开它的详情。
+- 任务面板（Tasks panel）：输入区下方的一条（或可选的侧栏），承载活动目标、待办列表和子智能体。行会保持整个会话——已完成的工作显示为"已完成"而不是消失——点击某一行（或对它按 `Enter`）会打开它的详情。
 - 状态与底部区域：实时活动、排队的后续动作和简短命令提示。
+
+当模型通过 `request_user_input` 提问时，问题面板会从对话记录底部展开，上方的对话仍然可见。面板打开时，可用 `PageUp` / `PageDown`、`Home` / `End`，或带 `Ctrl`、`Alt`、`Shift` 修饰键的 `↑` / `↓` 浏览对话记录。鼠标位于面板上方时，滚轮滚动对话记录；位于面板内时，滚动问题内容。滚轮浏览后，移动选项或开始输入会让当前内容重新进入视野。用 `↑` / `↓` 选择、`Enter` 确认、`←` / `h` 返回上一题，`Esc` 取消整组问题。每题都有可填写自定义回答的“其他”选项，输入文字时内容保持可见。相关按键见 [KEYBINDINGS.md](KEYBINDINGS.md)。
 
 底部区域可配置。运行 `/statusline` 选择哪些内容可见，或在 `config.toml` 里设置 `[tui].status_items`。每个键只对应屏幕上的一样东西：`mode` 是姿态栏（posture bar）的 plan/act/operate 片区，而 `model`、`context_percent`、`cost`、`balance`（仅限预付费提供商：DeepSeek、DeepSeekCN、OpenRouter、SiliconFlow）、`cache`、`tokens`、`ttft`、`output_rate`、`workspace` 和 `git_branch` 是它下方指标行的片区。
 省略 `status_items` 以保持内置默认；把它设为 `[]` 只保留帮助提示。

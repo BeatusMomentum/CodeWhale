@@ -370,7 +370,7 @@ codewhale mcp tools codewhale
 - `command`（字符串，必需）
 - `args`（字符串数组，可选）
 - `env`（对象，可选）
-- `connect_timeout`、`execute_timeout`、`read_timeout`（秒，可选）
+- `connect_timeout`、`execute_timeout`、`read_timeout`（秒，可选）。`connect_timeout` 默认为 30 秒，覆盖进程启动、`initialize` 及首次 `tools/list`，因此冷启动时 `uvx`/`npx` 下载包的时间也计入其中。
 - `disabled`（布尔值，可选）
 - `enabled`（布尔值，可选，默认 `true`）
 - `required`（布尔值，可选）：如果该服务器无法初始化，启动/连接验证会失败。

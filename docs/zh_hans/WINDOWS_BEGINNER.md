@@ -1,6 +1,6 @@
 # Codewhale Beginner Guide for Windows (简体中文)
 
-> 本文面向**完全没接触过 AI 编程智能体、使用 Windows 系统**的初学者。所有命令和路径均已在 Windows 环境实际验证。
+> 本文面向**完全没接触过 AI 编程智能体、使用 Windows 系统**的初学者。命令和路径按当前实现整理；本次文档更新未重新进行 Windows 实机验证。
 >
 > 本文为中文原创文档（无对应英文版），2026-08-11 首发，2026-09-29 依据当前代码与英文文档复核并更新。
 
@@ -12,9 +12,9 @@
 |---|---|
 | Codewhale 是什么？ | 装在你自己电脑上的"编程智能体"，能读文件、改代码、跑命令、自己验证结果 |
 | 要花钱吗？ | 软件开源免费，但模型要你自己带 API key（默认 DeepSeek） |
-| 在哪干活？ | 在哪个文件夹启动它，它就只动哪个文件夹（工作区） |
+| 在哪干活？ | 启动文件夹是工作区；具体读写范围由权限与工具检查决定。Windows 当前不提供 OS 级命令沙箱 |
 | 第一步做什么？ | 装好后建一个空文件夹 → `cd` 进去 → 运行 `codewhale` |
-| 会不会乱动我的文件？ | 默认 Ask 权限：需要审批的操作都会先问你，不批不动 |
+| 会不会乱动我的文件？ | 默认 Ask 会为需要审批的工具调用提问；工作区内的普通文件编辑可以直接执行并显示 diff，先提交或备份重要改动 |
 | 做小工具要用哪个模式？ | Plan（先出方案）+ Work（再动手），Ask 权限，全程足够 |
 | 用哪个模型？ | `auto` 是路由策略，不是模型：默认每回合仍用你设定的默认模型；只有你配置了路由器或 `cost_saving` 才会自动换模型（见 7.2 节） |
 | 对话能导出吗？ | 能：`/export file 文件名.md` |
@@ -25,7 +25,7 @@
 |---|---|
 | 双击运行提示找不到 VCRUNTIME140_1.dll | 装 VC++ 运行库（见 2.4 节） |
 | 终端里输入 codewhale 提示"不是命令" | 环境变量没配好或终端没重开（见 2.3 节） |
-| 提示"禁止运行脚本" | 执行一次 PowerShell 执行策略命令（见第 3 节） |
+| 提示"禁止运行脚本" | 先检查 PowerShell 的有效执行策略（见第 3 节） |
 | 配置了 pro 却显示在用 flash | 多半是用了 `/model auto` 并开启了 `[auto] cost_saving`，或配置了 `[auto.router]`，不是 bug（见 7.2 节） |
 | 界面停在奇怪的模式 | 按 `Tab` 切回，或输入 `/mode work` |
 | 改完配置突然连不上 | 检查 `provider` 和 `base_url` 是否被改坏，改回默认 |
@@ -53,7 +53,7 @@ codewhale auth set --provider deepseek
 
 除 DeepSeek 外，Codewhale 还内置支持下面这些**常用提供商**（`provider` 后面的英文 ID 是配置和命令行里要用的名字，来自官方文档）。提供商列表更新很快，完整且最新的清单以 [PROVIDERS.md](PROVIDERS.md) 为准：
 
-**国内提供商（中国大陆可直接访问）**
+**面向中国大陆的提供商示例（可达性以实际网络和账户为准）**
 
 | Provider ID | 提供商 | 说明 |
 |---|---|---|
@@ -103,7 +103,7 @@ codewhale auth set --provider deepseek
 | `concentrate` | Concentrate | 聚合网关（OpenAI Responses 协议） |
 | `codewhale` | Codewhale | 使用 Codewhale 账户，按账户的模型目录选择协议 |
 
-**本地/自建（免费，不需要 API key）**
+**本地/自建（是否需要 API key 取决于服务配置）**
 
 | Provider ID | 说明 |
 |---|---|
@@ -253,26 +253,26 @@ https://learn.microsoft.com/zh-cn/windows/terminal/install
 
 ## 3. 首次启动设置
 
-第一次运行 `codewhale` 会走一个简短的设置流程：
+首次启动只询问本次安装仍缺少的决定：无法推断语言时选择语言，没有可用路由时配置提供商（也可选择离线路由），当前文件夹需要信任决定时确认工作区信任。就绪后进入编辑器；命令行中传入的任务会保留，也可以从当前文件夹的任务建议开始。
 
-1. 选择语言
-2. 配置模型 / API key（DeepSeek 是默认提供商）
-3. 确认权限姿态（permission posture）
-4. 创建或确认你的宪章（constitution）
-
-这些设置随时可以用 `/setup` 重新打开修改。
+之后可用 `/setup` 重新打开设置，用 `/constitution` 管理宪章。
 
 **Windows 常见问题：PowerShell 执行策略**
 
-Codewhale 需要运行临时 PowerShell 脚本，如果系统提示"禁止运行脚本"，在 PowerShell 里执行一次：
+运行脚本时若出现“禁止运行脚本”，先查看当前的有效策略及各作用域：
 
 ```powershell
-Set-ExecutionPolicy -Scope CurrentUser RemoteSigned -Force
+Get-ExecutionPolicy
+Get-ExecutionPolicy -List
 ```
 
-只影响当前用户，不需要管理员权限，之后临时脚本就能正常跑了。
+在你自己管理的电脑上，如果确认需要允许运行本地脚本，可将当前用户的策略设为 `RemoteSigned`：
 
-> **此设置只执行一次，永久生效**，不需要每次启动都重复执行；换新电脑或新 Windows 账户时才需要重新设置。如果之后又遇到"禁止运行脚本"报错，先检查是不是开错了终端或换了账户，而不是盲目重复执行命令。
+```powershell
+Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
+```
+
+这会持久更改当前用户的设置，直到再次修改；它不保证所有脚本都能运行。`RemoteSigned` 仍限制来自互联网的未签名脚本，组织的组策略也可以覆盖用户设置。具体行为和恢复方式见 [Microsoft 的执行策略说明](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.core/about/about_execution_policies)。
 
 ---
 
@@ -300,8 +300,8 @@ Set-ExecutionPolicy -Scope CurrentUser RemoteSigned -Force
 
 ### 5.2 Work 模式——动手干活
 
-- 普通的多步执行模式，能改文件、跑命令；是否弹窗问你，取决于第 6 节的权限姿态（默认 Ask 会先问）
-- 权限 = 你批准什么它做什么
+- 普通的多步执行模式，能改文件、跑命令；是否弹窗问你，取决于第 6 节的权限姿态（默认 Ask 对需要审批的调用会先问）
+- 批准一次调用不等于绕过后续的工具路径检查或其他安全限制
 - **新手第二步：方案满意后切到 Work，让它逐项实现**
 
 ### 5.3 Operate 模式——当老板派活
@@ -319,8 +319,8 @@ Set-ExecutionPolicy -Scope CurrentUser RemoteSigned -Force
 
 | 姿态 | 行为 | 建议 |
 |---|---|---|
-| **Ask** | 每一步都弹窗问你 | **新手默认，最安全** |
-| Auto-Review | 自主运行、不向你提问；确定性规则判定安全的操作直接放行，拿不准的交给一次性的模型复核，高风险仍会被拦下 | 熟悉后可用 |
+| **Ask** | 需要审批的调用会先询问；工作区内的普通文件编辑可以直接执行 | 默认档位；先保留重要文件的备份 |
+| Auto-Review | 自动审查工具调用；确定性规则判定安全的操作直接放行，其余可审查的拦截交给一次性模型复核，高风险仍会被拦下。模型仍可为需要你决定的事项提问 | 熟悉后可用 |
 | Full Access（完全访问） | 普通工具调用不再弹审批（仓库规则等硬性拦截仍然生效） | 只用于完全信任的文件夹 |
 
 ---

@@ -288,7 +288,7 @@ Chat Completions 驱动回合。
 
 1. 客户端入队任务（`/task add ...` 或 `POST /v1/tasks`）
 2. `task_manager.rs` 在 `~/.codewhale/tasks` 下持久化任务 + 队列条目
-3. worker 从有界的 worker 池中取出排队任务，状态转为 `running`
+3. 有界 worker 池中的 worker 领取排队任务，状态转为 `running`
 4. 任务创建/使用一个运行时线程，并启动一个运行时回合
 5. `runtime_threads.rs` 持久化线程/回合/条目记录 + 单调递增的事件序列
 6. 时间线/工具摘要/产物引用增量持久化

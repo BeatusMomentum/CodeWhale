@@ -24,7 +24,7 @@ user_input_timeout_seconds = 0
 
 Codewhale 有多个指令层级（instruction surfaces）。它们刻意保持分离，这样个人宪章、仓库策略、项目指令和运行时安全控制就不会被混淆。
 
-- **内置全局宪章(Bundled global Constitution)**——编译进二进制的基础法律。它是每个会话的默认底线。
+- **内置全局宪章(Bundled global Constitution)**——编译进二进制的基础规则。它是每个会话的默认底线。
 - **用户全局宪章(User-global constitution)**——常规引导式设置的产物。用 `/constitution` 或 `/setup` 管理；Codewhale 把结构化数据存放在 `$CODEWHALE_HOME/constitution.json`(默认 `~/.codewhale/constitution.json`)，并渲染成独立的 `<codewhale_user_constitution>` 散文块（prose block）。它可以表达偏好和停止条件，但不会改变运行时审批策略、沙箱、shell、网络、信任或 MCP 权限。
 - **仓库本地宪章(Repo-local constitution)**——可选的 `.codewhale/constitution.json` 项目策略，见下文。
 - **`AGENTS.md`**——跨智能体**项目指令**(散文)。这是"智能体应如何在这个仓库工作"的规范文件。运行 `/init` 生成一份。`CLAUDE.md` 和 `.claude/instructions.md` 作为兼容回退被读取。
@@ -39,9 +39,9 @@ Codewhale 有多个指令层级（instruction surfaces）。它们刻意保持�
 - **`1`–`6`** 调整引导式草稿。**`G`** 预览它，再次按 **`G`** 批准并保存一份新的结构化 `constitution.json`。
 - **`A`**(仅在已配置 provider 时显示)让你配置的第一个模型起草宪章。起草**不是**保存：草稿会通过同样的预览渲染，你仍然要按 **`G`** 批准后才会持久化任何内容。
 - **`K`** 保持你现有的已加载宪章不变(仅在已有有效文件时显示)。
-- **`U`**(或 `/constitution bundled`)记录内置/默认法律。
+- **`U`**(或 `/constitution bundled`)记录内置/默认宪章。
 
-`/constitution`(别名 `/law`)是设置完成后主要的管理面。子命令：`status`(默认)、`preview`、`review`、`repo`(仓库本地法律块)、`explain`、`edit`/`guided`、`repair`、`posture` 和 `bundled`。管理宪章永远不会改变运行时审批、沙箱、shell、网络、信任、默认模式或 MCP 权威——这些都留在运行时权限档位/配置里。
+`/constitution`(别名 `/law`)是设置完成后主要的管理面。子命令：`status`(默认)、`preview`、`review`、`repo`(仓库本地宪章)、`explain`、`edit`/`guided`、`repair`、`posture` 和 `bundled`。管理宪章永远不会改变运行时审批、沙箱、shell、网络、信任、默认模式或 MCP 权威——这些都留在运行时权限档位/配置里。
 
 每个仓库可以携带两个不同且互补的文件：
 
@@ -74,15 +74,15 @@ Codewhale 有多个指令层级（instruction surfaces）。它们刻意保持�
 
   所有字段都是可选的。存在时，该文件会被渲染进系统提示，作为更高权威块中的简洁散文。旧的 `WHALE.md` 文件会被忽略，并报告为仅迁移诊断。
 
-  每个 `protected_invariants` 条目可以是普通字符串(建议性散文，历史形态)，也可以是携带路径 glob 的对象，后者会在工具门禁中额外被**机械强制执行**。见下文[强制执行的仓库法不变项](#强制执行的仓库法不变项)。
+  每个 `protected_invariants` 条目可以是普通字符串(建议性散文，历史形态)，也可以是携带路径 glob 的对象，后者会在工具门禁中额外被**机械强制执行**。见下文[强制执行的仓库保护规则](#强制执行的仓库保护规则)。
 
-  这是 Codewhale 层级中的**仓库本地法律**层：*内置全局宪章* → *用户全局宪章*(`$CODEWHALE_HOME/constitution.json`，渲染为散文)→ *仓库宪章*(`.codewhale/constitution.json`，即本文件)→ *AGENTS/项目指令* → *记忆与交接* → *当前回合的当前请求与实时证据*。运行时策略(在代码中强制执行的权限/沙箱/成本上限)与所有这些提示层是分离的。仓库宪章给出项目决策规则；它不取代内置宪章、用户全局宪章或当前用户请求。
+  这是 Codewhale 层级中的**仓库本地宪章**层：*内置全局宪章* → *用户全局宪章*(`$CODEWHALE_HOME/constitution.json`，渲染为散文)→ *仓库宪章*(`.codewhale/constitution.json`，即本文件)→ *AGENTS/项目指令* → *记忆与交接* → *当前回合的当前请求与实时证据*。运行时策略(在代码中强制执行的权限/沙箱/成本上限)与所有这些提示层是分离的。仓库宪章给出项目决策规则；它不取代内置宪章、用户全局宪章或当前用户请求。
 
 > **`WHALE.md` 已弃用。** 它与 `AGENTS.md` 混淆重叠。Codewhale 不再把 `WHALE.md` 作为项目或全局上下文读取。如果存在，setup/上下文诊断会报告它被忽略，以便你迁移它。把普通指令移到 `AGENTS.md`，把 Codewhale 特有的权威策略移到 `.codewhale/constitution.json`。个人常驻指引属于 `/constitution` / `$CODEWHALE_HOME/constitution.json`。(随模型提示一起提供的全局 Codewhale 宪章是另一回事，不受影响。)
 
-### 强制执行的仓库法不变项
+### 强制执行的仓库保护规则
 
-默认情况下，`protected_invariants` 条目是建议性散文：它被渲染进提示，作为智能体应遵守的指引，但没有任何东西会阻止写入。写成**带 `paths` 的对象**的条目则不同——它会编译成机械写入拦阻(hold)，由引擎的工具门禁在写入运行之前评估。法律变成机制，而不只是请求。
+默认情况下，`protected_invariants` 条目是建议性散文：它被渲染进提示，作为智能体应遵守的指引，但没有任何东西会阻止写入。写成**带 `paths` 的对象**的条目则不同——它会编译成机械写入拦阻(hold)，由引擎的工具门禁在写入运行之前评估。这些规则由代码强制执行，不再只是提示中的要求。
 
 强制条目具有这样的形态：
 
@@ -111,13 +111,13 @@ Codewhale 有多个指令层级（instruction surfaces）。它们刻意保持�
 
 语义：
 
-- **只收紧(Tighten-only)。** schema 没有 allow/widen 形态，所以法律只能*增加*拦阻——精心构造的宪章永远不能授予权威或削弱其上的门禁。
+- **只收紧(Tighten-only)。** schema 没有 allow/widen 形态，所以规则只能*增加*拦阻——精心构造的宪章永远不能授予权威或削弱其上的门禁。
 - **模式不能绕过。** 与内置安全底线一样，`ask` 拦阻在 Ask 和 Auto-Review 中强制弹窗。Full Access 从不打开审批模态框，所以同样的拦阻按失败即阻断(fail closed)处理为硬阻断；`block` 总是拒绝。模式无法关掉拦阻。
 - **仅仓库本地。** 只有仓库的 `.codewhale/constitution.json` 参与。用户全局宪章保持建议性散文，永远不进入这个机制。
 - **失败安全。** 文件缺失、解析错误或无效 glob 会退化为更少或零规则——绝不会在未受保护的路径上产生拦阻，也绝不会让门禁中毒。跨匹配时最强的动作胜出，所以 `block` 高于 `ask`。
 - **留下回执(receipt)。** 每次拦阻都会发出 `tool.repo_law_decision` 工具审计事件，指名不变项、匹配的路径和源文件；批准/拒绝理由也会指名不变项。
 
-**覆盖范围刻意有限。** 拦阻只对写入工具 `write_file`、`edit_file`、`apply_patch` 和 `fim_edit` 评估，并且只针对它们输入中指定的文件系统目标(`path`/`target`/`destination`/`file_path`、`changes[].path`，以及 unified-diff / `apply_patch`-envelope 头)。一条写入受保护路径的 shell 命令**不会**被仓库法拦阻——这类写入仍由普通审批、沙箱和 shell 写入门禁管辖，不由这个机制管辖。
+**覆盖范围刻意有限。** 拦阻只对写入工具 `write_file`、`edit_file`、`apply_patch` 和 `fim_edit` 评估，并且只针对它们输入中指定的文件系统目标(`path`/`target`/`destination`/`file_path`、`changes[].path`，以及 unified-diff / `apply_patch`-envelope 头)。一条写入受保护路径的 shell 命令**不会**被仓库保护规则拦阻——这类写入仍由普通审批、沙箱和 shell 写入门禁管辖，不由这个机制管辖。
 
 ### 专家级完整基础提示覆盖(#3638)
 
@@ -189,7 +189,7 @@ allow_shell = true
 
 ### 可移植配置包（Portable config bundles）
 
-`codewhale config export --portable [--project] [--out FILE]` 写出一份可移植、不含机密的配置包：排序后的 TOML，其中凭据和机器特有的键（API key、base URL、socket 路径）会被丢弃，绝不会用脱敏占位符顶替。不带 `--out` 时，配置包输出到 stdout。类型化的表、数组、数字、布尔值和日期时间保持其类型。与机器绑定的权限刻意设为不可移植：项目信任覆盖、凭据读取器、会自动运行的 hooks、可执行的 LSP 定义和本地路径绑定都会被省略，而不是复制到新主机。信任相关设置（`yolo`、`allow_shell`、`approval_policy`、`sandbox_mode`、`sandbox_network_access` 以及沙箱读取拒绝列表路径）以及本地端点或可执行文件（`[lifecycle_outbox]`、`[extension_host]`、`[control_socket]`）同样如此。带有凭据的 URL——含 userinfo、含名为 token 的查询参数，或 Slack/Discord/Teams webhook 路径——按凭据处理。
+`codewhale config export --portable [--project] [--out FILE]` 写出一份可移植、不含机密的配置包：排序后的 TOML，其中凭据和机器特有的键（API key、base URL、socket 路径）会被丢弃，绝不会用脱敏占位符顶替。不带 `--out` 时，配置包输出到 stdout。类型化的表、数组、数字、布尔值和日期时间保持其类型。与机器绑定的权限刻意设为不可移植：项目信任覆盖、凭据读取器、会自动运行的 hooks、可执行的 LSP 定义和本地路径绑定都会被省略，而不是复制到新主机。信任相关设置（`yolo`、`allow_shell`、`approval_policy`、`sandbox_mode`、`sandbox_network_access` 以及沙箱读取拒绝列表路径）以及本地端点或可执行文件（`[lifecycle_outbox]`、`[extension_host]`、`[control_socket]`）同样如此。带有凭据的 URL——含 userinfo、含名称表明它携带令牌的查询参数，或 Slack/Discord/Teams webhook 路径——按凭据处理。
 
 `codewhale config import <FILE|HTTPS_URL|-> [--dry-run] [--yes] [--project]` 应用一份配置包。信封是严格的（`schema_version = 1`，kind 为 `codewhale.portable-config`；未知字段会失败）。导入会打印一份确定性的计划——新增 / 更改 / 跳过 / 冲突 / 拒绝——然后征求同意，除非给了 `--yes`；无头使用则必须带它。形似凭据的条目会按键名和值的形态被拒绝；拒绝信息会指出字段，绝不会指出值。远程配置包只允许来自 HTTPS（loopback 的 http 除外），上限 5 MiB。应用时会把目标文档备份到 `<config>.bundle-backup-<timestamp>-<random>`，任何失败都会回滚，并且重新导入已应用过的配置包不会改变任何东西。
 
@@ -1193,7 +1193,7 @@ DeepSeek V4 前缀缓存让 token 标签变得重要。这些数量保持分离�
   ```
 
 - `sandbox_mode`（字符串，可选）：`read-only`、`workspace-write`、`danger-full-access`、`external-sandbox`。各平台的支持并不相同。macOS 在其运行时探测成功时使用 Seatbelt。Linux 只在 `prefer_bwrap = true` 且 `/usr/bin/bwrap` 可执行时使用 bubblewrap；没有这一选择加入时，它会报告没有 OS 命令沙箱。Windows 目前不宣称有 OS 沙箱；其规划中的辅助程序契约只从进程树隔离开始，在只读文件系统隔离、workspace-write 强制、网络阻断、注册表隔离或 AppContainer 隔离真正实现之前，不得被描述成这些能力。
-- 模式准入、hooks、已注册工具的要求、类型化规则、Auto-Review、仓库法、人工审批和执行沙箱之间的跨层关系，定义在[授权顺序](../AUTHORIZATION_ORDER.md)中。
+- 模式准入、hooks、已注册工具的要求、类型化规则、Auto-Review、仓库保护规则、人工审批和执行沙箱之间的跨层关系，定义在[授权顺序](../AUTHORIZATION_ORDER.md)中。
 - **读取拒绝列表。** 每一种沙箱档位——包括 `read-only`——都授予对整个文件系统的读取权限；这些档位的区别在于它们可以*写入*什么，以及能否访问网络。读取拒绝列表会收窄这一点：
   - `sandbox_read_denylist_defaults`（bool，默认 `true`）：应用内置的凭据存储集合——`~/.ssh`、`~/.gnupg`、云凭据目录（`~/.aws`、`~/.config/gcloud`、`~/.azure`、`~/.kube` 等）、`~/.netrc`、`~/.npmrc`、`~/.git-credentials`、macOS 钥匙串、浏览器配置文件、Codewhale 自己的机密存储，以及 `.env` 文件（但不包括 `.env.example` 之类）。普通源码、`Cargo.toml`、`~/.gitconfig`、`~/.cargo` 和 `~/.npm` 保持可读，因此构建和测试仍能工作。设为 `false` 可恢复 0.9.12 之前的整盘读取行为。
   - `sandbox_denied_read_paths`（路径列表）：额外被拒绝的子路径。`~` 会展开。这些永远不能被豁免。
@@ -1209,7 +1209,7 @@ DeepSeek V4 前缀缓存让 token 标签变得重要。这些数量保持分离�
 
   在受支持的审批卡片中，按 `S` 允许该请求一次，并把精确的 `action = "ask"` 规则追加到这个文件。对于符合条件的安全请求，选择**始终允许本仓库中的这条确切规则**(快捷键 `P`)来追加带当前绝对 `workspace` 作用域的 `action = "allow"` 规则。记住的 shell 授予设置 `command_exact = true`，所以之后带额外参数的命令不会继承该授予。文件和补丁授予保留现有验证路径产生的精确工作区相对路径。受支持的保存刻意很窄：`exec_shell` 存储确切批准的命令字符串；`write_file` 和 `edit_file` 存储确切工作区相对文件路径；`apply_patch` 为 apply-patch 预检验证过的每个触碰文件存储一条确切的工作区相对 `path` 规则。现有 exec 命令匹配对手工编写的前缀规则保持 arity 感知；审批卡片允许授予使用完整命令匹配。文件路径规范化为运行时匹配使用的同一工作区相对形式。
 
-  `read_file` 规则仍可手工编写，当你希望未来对特定路径的读取询问、允许或拒绝时，但审批 UI 不保存 `read_file` 规则。被分类为需要审批或危险的命令、关键审批卡片和仓库法提示不能保存允许授予，继续需要审查。
+  `read_file` 规则仍可手工编写，当你希望未来对特定路径的读取询问、允许或拒绝时，但审批 UI 不保存 `read_file` 规则。被分类为需要审批或危险的命令、关键审批卡片和仓库保护规则提示不能保存允许授予，继续需要审查。
 
   `/permissions`(或 `/permissions list`)是窄规则管理面。它列出每个编号规则，带活动用户文件来源、确切有效匹配器(工具级、命令前缀、确切命令或确切规范化路径)、全局或仓库作用域，以及该作用域是否在当前工作区应用。`/config ask-rules` 仍是同一列表的兼容入口。
 
@@ -1317,6 +1317,9 @@ DeepSeek V4 前缀缓存让 token 标签变得重要。这些数量保持分离�
   - `[retry].initial_delay`(float 秒，默认 `1.0`)
   - `[retry].max_delay`(float 秒，默认 `60.0`)
   - `[retry].exponential_base`（float，默认 `2.0`）
+  - `[retry].jitter`（bool，默认 `true`）：为每次退避延迟加入随机变化
+  - `[retry].jitter_factor`（float，默认 `0.1`，即 ±10%；钳制到 `0.0..=1.0`）
+  - `[retry].respect_retry_after`（bool，默认 `true`）：按服务器的 `Retry-After` 响应头等待，而不是使用计算出的退避延迟
 
   `[retry]` 安排客户端内部的 HTTP 请求重试。位于其上一层的流级预算——一个回合对流未能打开或中途断掉的请求重新发起多少次——是下面的 `tui.stream_max_*` 键。
 
@@ -1357,6 +1360,8 @@ DeepSeek V4 前缀缓存让 token 标签变得重要。这些数量保持分离�
 - `tui.stream_open_timeout_secs`（int，可选，默认 `45`）：等待流式请求响应头的时间（含连接建立）。HTTP/2 上的响应头停滞会以同样的等待时间在 HTTP/1.1 上重试一次。省略或为 `0` 时回退到 `CODEWHALE_STREAM_OPEN_TIMEOUT_SECS`，再回退到默认值；值钳制到 `5..=300`。
 
 - `tui.connect_timeout_secs`（int，可选，默认 `30`）：模型 HTTP 客户端的 TCP/TLS 连接超时。省略或为 `0` 使用默认值；值钳制到 `1..=300`。
+
+- `tui.force_http1`（bool，可选，默认 `false`）：将模型 HTTP 客户端固定为 HTTP/1.1，适用于无法正确处理长期 HTTP/2 流的提供商边缘服务或代理。`CODEWHALE_FORCE_HTTP1=1` 的作用相同；任一项启用即可固定协议。
 
 - `tui.stream_max_content_mb`（int，可选，默认 `10`）和 `tui.stream_max_duration_secs`（int，可选，默认 `1800`）：单条流累计内容与墙钟时长的逐步上限。`0` 选择默认值；值分别钳制到 `1..=512` MB 和 `10..=86400` 秒。
 
@@ -1642,11 +1647,11 @@ user_input_max_options = 4     # default 4, clamped to 2..=10
 
 ### 用户输入等待超时
 
-`request_user_input` 的提问只会等待有限的时间，然后以超时取消（#6003）。默认是 300 秒。当你离开或需要仔细阅读时可以调高它，或设为 `0` 一直等待（通宵自动化、长时间的人工审阅）。无头的 `exec` 运行没有应答者，因此默认不提供 `request_user_input`：模型会报告该工具不存在并直接结束，而不是卡住。
+`request_user_input` 的提问默认一直等待用户回答或取消（#6003）。省略 `user_input_timeout_seconds` 或设为 `0` 都不设置超时；正数则限定本次等待的秒数，超时后取消。大于 86,400 秒（24 小时）的值会被限制为 86,400 秒。无头的 `exec` 运行没有应答者，因此默认不提供 `request_user_input`：模型会报告该工具不存在并直接结束，而不是卡住。
 
 ```toml
 [tools]
-user_input_timeout_seconds = 300   # default 300; 0 disables the timeout; clamped to 86400 (24h)
+user_input_timeout_seconds = 300   # optional 5-minute limit; omitted or 0 waits indefinitely; max 86400 (24h)
 ```
 
 这个键只管辖提问的等待。审批有它自己的时钟 `[approval] timeout_seconds`，除非你设置它，否则会无限期等待。其他地方的墙钟时间和流保护不受影响。
@@ -1667,6 +1672,8 @@ code_mode = true # execute_tools composes MCP/plugin/native calls; false defers 
 ```
 
 `code_mode` 默认开启：`execute_tools` 从第一个请求起就会公布，嵌套调用与直接调用一样经过同一个权限门（见[工具表面](TOOL_SURFACE.md#代码模式execute_tools)）。设置 `code_mode = false` 可再次把它延后到 `tool_search` 之后。
+
+每个功能标志在功能注册表 [`docs/features.toml`](../features.toml) 中都有对应条目；标志与条目不一致时，测试会失败。
 
 你也可以为单次运行覆盖功能：
 

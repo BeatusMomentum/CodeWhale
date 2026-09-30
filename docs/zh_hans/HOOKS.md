@@ -205,6 +205,18 @@ Observer 并**不**意味着无副作用。observer hook 是以你的凭据运�
 - **仅供 hook 使用。** 回执不写入持久化的 Runtime API 条目记录；该记录已包含工具输出。
 - 失败的运行与成功的运行同样设置，因此 shell 调用失败时的 `on_error` 也带有它。其他变量均不变。
 
+对于 `tool_call_after`，同一份执行证据还会作为带版本号的 JSON 文档通过 stdin 传递，前台和后台 hook 均会收到：
+
+```json
+{"schema_version":1,"event":"tool_call_after","tool_name":"bash","session_id":"session-id","tool_call_id":"call-id","session_id_truncated":false,"tool_call_id_truncated":false,"tool_name_truncated":false,"execution_receipt":{"schema_version":1,"command":"printf hello","cwd":"/absolute/workspace","command_truncated":false,"cwd_truncated":false,"execution":"started","completion":"completed","exit_code":0,"stdout":"hello","stderr":"","stdout_truncated":false,"stderr_truncated":false,"output_mode":"combined"}}
+```
+
+stdin 载荷不会改变上述环境变量中的回执。`completion` 表示观察到的终态：`completed`、`failed`、`killed` 或 `timed_out`；非零退出对应 `failed`。`exit_code` 保持为有符号 64 位整数或 `null`。`output_mode` 沿用现有回执的 `output_kind`，值为 `separate` 或 `combined`。输出合并时，空的 `stderr` 并不表示命令没有向 stderr 写入内容。
+
+完整文档的上限为 64 KiB。关联标识符各自最多保留 1,024 个 UTF-8 字节，另加截断标记，并携带各自的截断标志；缺失的标识符为 `null`。shell 名称保持精确。执行的 `command` 和 `cwd` 仍遵守上述“要么精确，要么不存在”的规则，因此它们的截断标志始终为 `false`。输出截断标志同时反映捕获阶段与预览阶段丢弃的内容。
+
+只有带有有效且已落定回执的原生 shell 调用才会生成这份 stdin 文档。不支持或未观察到结果的路径不会生成文档；缺失仍表示未知。hook 仍然只观察结果：其 stdout 不能允许、拒绝或改写已完成的调用，后台 hook 也不会被等待。`on_error` 继续只接收环境变量中的回执。
+
 **模式拼写说明。** UI 触发的事件（`session_start`、`session_end`、`message_submit`、`tool_call_after`、`mode_change`、`on_error`、`turn_end`、`subagent_*`、`session_busy`、`session_idle`、`session_error`、`waiting_for_user`）会将 `DEEPSEEK_MODE` 设为 UI 标签——`ACT`、`PLAN`、`OPERATE`。`tool_call_before` 在引擎内部触发，并使用引擎自己的模式拼写（`Agent`、`Plan`、`Operate`）。`mode` 条件不区分大小写比较，因此 `{ type = "mode", mode = "plan" }` 两者都能匹配，但精确字符串匹配 `$DEEPSEEK_MODE` 的 hook 应同时接受两种拼写。
 
 **`shell_env` 是受限的那个。** 它只接收 `DEEPSEEK_TOOL_NAME` 和 `DEEPSEEK_TOOL_ARGS`——没有会话 id、工作区、模型或模式。因此，`shell_env` hook 上的 `{ type = "mode", … }` 条件会在加载时被拒绝；请改用 `tool_name` 或 `tool_category` 来限定作用域。
@@ -301,7 +313,9 @@ condition = { type = "tool_category", category = "shell" }
 
 `turn_end`、`subagent_spawn`、`subagent_complete`、`session_busy`、`session_idle`、`session_error` 和 `waiting_for_user` 除了环境变量外，还会在 stdin 上接收 JSON。它们的 stdout 被忽略。这些事件的后台形式会在 stdin 上收到相同的载荷。
 
-其余 observer 事件——`session_start`、`session_end`、`tool_call_after`、`mode_change`、`on_error`——无论前台还是后台形式，都只接收环境变量，没有 stdin 载荷。
+`tool_call_after` 在原生 shell 调用结束且具有已记录的[执行回执](#执行回执)时，也会通过 stdin 接收 JSON，前台和后台形式均如此。其他工具调用没有 stdin 文档。
+
+其余 observer 事件——`session_start`、`session_end`、`mode_change`、`on_error`——无论前台还是后台形式，都只接收环境变量，没有 stdin 载荷。
 
 ### 会话状态转换
 
