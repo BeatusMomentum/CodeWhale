@@ -2123,26 +2123,28 @@ fn bun_manager(
 }
 
 #[test]
-fn a_table_that_sets_only_node_keeps_running_node() {
+fn node_is_the_default_runtime_and_bun_is_an_opt_in() {
     use crate::config::{ExtensionHostConfig, ExtensionHostRuntime as Choice};
     let parse = |text: &str| toml::from_str::<ExtensionHostConfig>(text).unwrap();
-    assert_eq!(parse("").effective_runtime(), Choice::Auto);
-    // A pre-Bun config that pinned its Node keeps it.
+    // Bun is not the default until it is qualified on every platform.
+    assert_eq!(parse("").effective_runtime(), Choice::Node);
     assert_eq!(
         parse("node = \"/opt/node\"").effective_runtime(),
         Choice::Node
     );
-    assert_eq!(
-        parse("bun = \"/opt/bun\"").effective_runtime(),
-        Choice::Auto
-    );
+    // A table that names only a Bun asks for Bun.
+    assert_eq!(parse("bun = \"/opt/bun\"").effective_runtime(), Choice::Bun);
     assert_eq!(
         parse("node = \"/n\"\nbun = \"/b\"").effective_runtime(),
-        Choice::Auto
+        Choice::Node
     );
     assert_eq!(
         parse("runtime = \"bun\"\nnode = \"/n\"").effective_runtime(),
         Choice::Bun
+    );
+    assert_eq!(
+        parse("runtime = \"auto\"").effective_runtime(),
+        Choice::Auto
     );
     assert!(toml::from_str::<ExtensionHostConfig>("runtime = \"deno\"").is_err());
     let options = ExtensionHostOptions::from_config(Some(&parse("node = \"~/node\"")));
@@ -2150,8 +2152,9 @@ fn a_table_that_sets_only_node_keeps_running_node() {
     assert!(!options.node_override.unwrap().starts_with("~"));
     assert_eq!(
         ExtensionHostOptions::from_config(None).runtime,
-        Choice::Auto
+        Choice::Node
     );
+    assert_eq!(ExtensionHostOptions::default().runtime, Choice::Node);
 }
 
 #[test]

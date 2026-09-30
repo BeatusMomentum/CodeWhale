@@ -190,7 +190,8 @@ fn materialize_bundle(root: &Path) -> Result<PathBuf, String> {
 /// Options fixed for the life of one manager.
 #[derive(Debug, Clone, Default)]
 pub struct ExtensionHostOptions {
-    /// `[extension_host] runtime`: `auto` (Bun first), `bun` or `node`.
+    /// `[extension_host] runtime`: `node` (the default), `bun`, or `auto`
+    /// (Bun first).
     pub runtime: crate::config::ExtensionHostRuntime,
     /// `[extension_host] node`: tried before every `node` on `PATH`.
     pub node_override: Option<PathBuf>,
