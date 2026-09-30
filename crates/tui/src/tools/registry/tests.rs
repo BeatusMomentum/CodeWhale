@@ -570,17 +570,19 @@ fn script_and_command_overrides_cannot_replace_builtins() {
         ("my_patcher".to_string(), command()),
     ]);
 
+    let mut refused = Vec::new();
     let errors = capture_registration_warnings(|| {
-        registry.apply_overrides(&overrides, tmp.path(), &builtins)
+        refused = registry.apply_overrides(&overrides, tmp.path(), &builtins);
     });
 
     assert!(Arc::ptr_eq(&registry.get("File").unwrap(), &file));
     assert!(Arc::ptr_eq(&registry.get("apply_patch").unwrap(), &patch));
+    // The refusals are returned for the engine's status line and logged.
+    refused.sort();
+    assert_eq!(refused, ["File", "apply_patch"]);
     for name in ["File", "apply_patch"] {
         assert!(
-            errors.contains(&format!(
-                "Refusing [tools.overrides.{name}]: a script or command override cannot replace the built-in tool '{name}', which stays active"
-            )),
+            errors.contains(&super::override_refusal_notice(name)),
             "{errors}"
         );
     }
