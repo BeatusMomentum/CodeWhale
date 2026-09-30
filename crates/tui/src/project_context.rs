@@ -27,8 +27,8 @@ use self::constitution::{load_repo_constitution_block, repo_constitution_candida
 use self::pack::generate_bounded_project_overview;
 pub use self::pack::generate_project_context_pack;
 pub use self::types::ProjectContext;
-pub(crate) use self::types::project_instructions_source_label;
 use self::types::ProjectContextError;
+pub(crate) use self::types::project_instructions_source_label;
 
 /// Names of project context files to look for, in priority order.
 ///
