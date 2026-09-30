@@ -3165,6 +3165,30 @@ fn relative_codewhale_home_is_a_hard_error() {
     assert!(message.contains("absolute"), "{message}");
 }
 
+/// Audit R04-05: a relative `HOME` must not relocate global state into the
+/// working directory.
+#[test]
+fn relative_user_home_is_a_hard_error() {
+    let _lock = env_lock();
+    let _env = StateEnvRestore {
+        home: env::var_os("HOME"),
+        userprofile: env::var_os("USERPROFILE"),
+        codewhale_home: env::var_os("CODEWHALE_HOME"),
+    };
+    // Safety: test-only environment mutation is serialized by env_lock().
+    unsafe {
+        env::set_var("HOME", "relative-home");
+        env::remove_var("USERPROFILE");
+        env::remove_var("CODEWHALE_HOME");
+    }
+
+    assert_eq!(codewhale_paths::user_home(), None);
+    let error = codewhale_home().expect_err("relative HOME must fail closed");
+    let message = format!("{error:#}");
+    assert!(message.contains("HOME"), "{message}");
+    assert!(message.contains("absolute"), "{message}");
+}
+
 #[test]
 fn migrate_config_reports_copied_legacy_path() {
     let _lock = env_lock();
