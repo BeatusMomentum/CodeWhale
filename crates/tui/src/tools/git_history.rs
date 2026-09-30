@@ -891,11 +891,11 @@ async fn run_git_command_async(
 /// Run git under a hard deadline. `Ok(None)` means the deadline passed and the
 /// child was killed, so a timed-out fetch never lingers.
 ///
-/// On unix git runs in its own process group and the whole group is killed at
-/// the deadline: git hands the network to a transport child (`git-remote-http`,
-/// `ssh`) that survives a SIGKILL to git alone and would otherwise keep the
-/// stalled connection open indefinitely. `kill_on_drop` still covers the
-/// leader everywhere else.
+/// git runs contained ([`crate::process_tree::contained_output`]) and the whole
+/// tree is killed at the deadline or when the call is cancelled: git hands the
+/// network to a transport child (`git-remote-http`, `ssh`) that survives a
+/// SIGKILL to git alone and would otherwise keep the stalled connection open
+/// indefinitely.
 async fn run_git_command_bounded(
     working_dir: &Path,
     args: &[String],
@@ -906,49 +906,18 @@ async fn run_git_command_bounded(
             "git is not installed or not in PATH",
         ));
     };
-    cmd.args(args)
-        .current_dir(working_dir)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true);
-    #[cfg(unix)]
-    cmd.process_group(0);
-    let child = match cmd.spawn() {
-        Ok(child) => child,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Err(ToolError::not_available(
-                "git is not installed or not in PATH",
-            ));
-        }
-        Err(e) => {
-            return Err(ToolError::execution_failed(format!(
-                "Failed to run git: {e}"
-            )));
-        }
-    };
-    let process_group = child.id();
-    match tokio::time::timeout(timeout, child.wait_with_output()).await {
+    cmd.args(args).current_dir(working_dir);
+    match tokio::time::timeout(timeout, crate::process_tree::contained_output(&mut cmd)).await {
         Ok(Ok(output)) => Ok(Some(output)),
+        Ok(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => Err(ToolError::not_available(
+            "git is not installed or not in PATH",
+        )),
         Ok(Err(e)) => Err(ToolError::execution_failed(format!(
             "Failed to run git: {e}"
         ))),
-        Err(_) => {
-            #[cfg(unix)]
-            if let Some(pgid) = process_group
-                .and_then(|id| libc::pid_t::try_from(id).ok())
-                .filter(|pgid| *pgid > 0)
-            {
-                // SAFETY: kill(2) dereferences no pointers; a negative pid
-                // targets the group this call created with process_group(0).
-                unsafe {
-                    libc::kill(-pgid, libc::SIGKILL);
-                }
-            }
-            #[cfg(not(unix))]
-            let _ = process_group;
-            Ok(None)
-        }
+        // The elapsed deadline dropped the contained run, which killed git's
+        // whole tree.
+        Err(_) => Ok(None),
     }
 }
 
@@ -1485,5 +1454,28 @@ mod tests {
             .expect("git should spawn");
         assert!(output.status.success());
         String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    /// A cancelled call kills git's whole tree, not only at the deadline.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelled_bounded_git_run_kills_what_git_started() {
+        if !git_available() {
+            return;
+        }
+        let tmp = tempdir().expect("tempdir");
+        init_git_repo(tmp.path());
+        let pid_file = tmp.path().join("hang.pid");
+        let args = [
+            "-c".to_string(),
+            "alias.hang=!sleep 300 & echo $! > hang.pid; wait".to_string(),
+            "hang".to_string(),
+        ];
+        let run = run_git_command_bounded(tmp.path(), &args, std::time::Duration::from_secs(600));
+        let grandchild = crate::process_tree::drop_once_pid_written(run, &pid_file).await;
+        assert!(
+            crate::process_tree::wait_for_pid_exit(grandchild, std::time::Duration::from_secs(5)),
+            "a process git started outlived the cancelled call"
+        );
     }
 }

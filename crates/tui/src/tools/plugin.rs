@@ -25,7 +25,6 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::Value;
-use tokio::io::AsyncWriteExt;
 
 use super::spec::{
     ApprovalRequirement, ToolCapability, ToolContext, ToolError, ToolResult, ToolSpec,
@@ -300,32 +299,17 @@ async fn run_plugin_child_raw(
     let input_bytes = serde_json::to_vec(&input)
         .map_err(|e| ToolError::invalid_input(format!("failed to serialize input: {e}")))?;
 
-    cmd.stdin(std::process::Stdio::piped());
-    cmd.stdout(std::process::Stdio::piped());
-    cmd.stderr(std::process::Stdio::piped());
-
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| ToolError::execution_failed(format!("failed to spawn {label}: {e}")))?;
-
-    let stdin_writer = child.stdin.take().map(|mut stdin| {
-        tokio::spawn(async move {
-            if stdin.write_all(&input_bytes).await.is_ok() {
-                let _ = stdin.shutdown().await;
-            }
-        })
-    });
-
-    let output = tokio::time::timeout(PLUGIN_EXECUTION_TIMEOUT, child.wait_with_output())
-        .await
-        .map_err(|_| ToolError::Timeout {
-            seconds: PLUGIN_EXECUTION_TIMEOUT.as_secs(),
-        })?
-        .map_err(|e| ToolError::execution_failed(format!("process error: {e}")))?;
-
-    if let Some(stdin_writer) = stdin_writer {
-        let _ = stdin_writer.await;
-    }
+    // Contained: a timed-out or cancelled plugin takes everything it started
+    // down with it, not just the interpreter that `kill_on_drop` would reach.
+    let output = tokio::time::timeout(
+        PLUGIN_EXECUTION_TIMEOUT,
+        crate::process_tree::contained_output_with_input(cmd, input_bytes),
+    )
+    .await
+    .map_err(|_| ToolError::Timeout {
+        seconds: PLUGIN_EXECUTION_TIMEOUT.as_secs(),
+    })?
+    .map_err(|e| ToolError::execution_failed(format!("failed to run {label}: {e}")))?;
 
     if output.status.success() {
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
@@ -726,6 +710,25 @@ echo hello
 
         assert!(result.success);
         assert!(result.content.len() > 64 * 1024);
+    }
+
+    /// A cancelled (or timed-out) plugin call kills what the plugin started,
+    /// not just the interpreter.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropped_plugin_call_kills_the_plugin_process_tree() {
+        let tmp = TempDir::new().unwrap();
+        let pid_file = tmp.path().join("grandchild.pid");
+        let mut cmd = tokio::process::Command::new("/bin/sh");
+        cmd.arg("-c")
+            .arg("sleep 300 & echo $! > grandchild.pid; wait")
+            .current_dir(tmp.path());
+        let run = run_plugin_child_raw(&mut cmd, "hanging plugin", serde_json::json!({}));
+        let grandchild = crate::process_tree::drop_once_pid_written(run, &pid_file).await;
+        assert!(
+            crate::process_tree::wait_for_pid_exit(grandchild, Duration::from_secs(5)),
+            "a process started by the cancelled plugin is still running"
+        );
     }
 
     #[test]
