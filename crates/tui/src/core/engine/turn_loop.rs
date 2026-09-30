@@ -7984,7 +7984,7 @@ mod tests {
             ] {
                 let tmp = tempdir().expect("tempdir");
                 let (mut engine, model, mut rx) = stream_backpressure_fixture(tmp.path(), 4);
-                let events = (0..count).map(|index| StreamEvent::ContentBlockStart {
+                let events = (0..count).map(move |index| StreamEvent::ContentBlockStart {
                     index: u32::try_from(index).unwrap(),
                     content_block: if server_tool {
                         ContentBlockStart::ServerToolUse {
