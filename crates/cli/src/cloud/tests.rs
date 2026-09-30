@@ -2751,6 +2751,69 @@ fn account_agent_send_uses_its_only_active_conversation_regardless_of_title() {
 }
 
 #[test]
+fn account_agent_work_records_one_idempotent_request_without_allocating_compute() {
+    let (secrets, _) = test_secrets();
+    let auth_transport = FakeTransport::new(vec![]);
+    CloudClient::new(&auth_transport, &secrets, "default", DEFAULT_API_BASE)
+        .save_auth(auth("access-secret", "refresh-secret", "acct-123"))
+        .unwrap();
+    let transport = FakeTransport::new(vec![
+        response(200, json!({ "agents": [agent("agent-1", "Whale")] })),
+        response(
+            200,
+            json!({
+                "intent": "actionable",
+                "work": { "id": "run-1", "agentId": "agent-1", "status": "queued", "objective": "Fix the build" },
+                "queuedWork": []
+            }),
+        ),
+        response(
+            200,
+            json!({ "run": { "id": "run-1", "state": "queued", "title": "Fix the build" } }),
+        ),
+    ]);
+    let client = CloudClient::new(&transport, &secrets, "default", DEFAULT_API_BASE);
+    let mut output = Vec::new();
+    run_agents(
+        CloudAgentsCommand::Work {
+            agent: "Whale".into(),
+            objective: "Fix the build".into(),
+            message_id: "work-request-1".into(),
+        },
+        &client,
+        &machine::MachineKeyEnv::default(),
+        &mut output,
+    )
+    .unwrap();
+    run_agents(
+        CloudAgentsCommand::WorkStatus { id: "run-1".into() },
+        &client,
+        &machine::MachineKeyEnv::default(),
+        &mut output,
+    )
+    .unwrap();
+    let requests = transport.requests();
+    assert_eq!(
+        requests
+            .iter()
+            .map(|request| request.path.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "/api/agents",
+            "/api/agents/agent-1/messages",
+            "/api/runs/run-1"
+        ]
+    );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(requests[1].body.as_ref().unwrap()).unwrap(),
+        json!({ "messageId": "work-request-1", "text": "Fix the build" })
+    );
+    let shown = String::from_utf8(output).unwrap();
+    assert!(shown.contains("Work ID: run-1"));
+    assert!(shown.contains("Hosted compute needs a separate reviewed quote and launch."));
+}
+
+#[test]
 fn account_agent_send_allows_an_unbound_agent_conversation() {
     let (secrets, _) = test_secrets();
     let auth_transport = FakeTransport::new(vec![]);

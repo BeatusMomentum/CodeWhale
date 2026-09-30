@@ -221,6 +221,16 @@ enum CloudAgentsCommand {
         #[arg(long, default_value_t = 0)]
         since_seq: u64,
     },
+    /// Give a named Agent durable repository Work. This records a request; it does not start compute.
+    Work {
+        agent: String,
+        objective: String,
+        /// Stable message ID for safe retry after an uncertain response.
+        #[arg(long)]
+        message_id: String,
+    },
+    /// Read the account-owned status of a Work request.
+    WorkStatus { id: String },
 }
 
 #[derive(Debug, Subcommand)]
@@ -448,6 +458,25 @@ struct TurnReceipt {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct AccountAgentWork {
+    id: String,
+    agent_id: String,
+    status: String,
+    #[serde(default)]
+    objective: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentWorkMessageResponse {
+    intent: String,
+    work: Option<AccountAgentWork>,
+    #[serde(default)]
+    queued_work: Vec<AccountAgentWork>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct AgentTurnEvent {
     seq: u64,
     #[serde(rename = "type")]
@@ -511,7 +540,7 @@ fn validate_provider_id(value: &str) -> Result<String> {
     Ok(trimmed.to_string())
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum HttpMethod {
     Get,
     Post,
@@ -1011,6 +1040,36 @@ impl<'a, T: CloudTransport> CloudClient<'a, T> {
             return Err(response_error(&response));
         }
         parse_agent_turn_events(&response.body, turn_id, since_seq)
+    }
+
+    fn assign_agent_work(
+        &self,
+        agent_id: &str,
+        objective: &str,
+        message_id: &str,
+    ) -> Result<AgentWorkMessageResponse> {
+        let agent_id = validate_resource_id(agent_id, "Agent")?;
+        let objective = objective.trim();
+        if objective.is_empty() || objective.chars().count() > 32_000 {
+            bail!("Work objective must contain 1-32000 characters");
+        }
+        let message_id = validate_operation_key(message_id)?;
+        let response = self.execute_authenticated(
+            HttpMethod::Post,
+            &format!("/api/agents/{agent_id}/messages"),
+            Some(json_body(&serde_json::json!({
+                "messageId": message_id,
+                "text": objective,
+            }))?),
+        )?;
+        expect_json(response, &[200, 201, 202])
+    }
+
+    fn agent_work_status(&self, id: &str) -> Result<serde_json::Value> {
+        let id = validate_resource_id(id, "Work")?;
+        let response =
+            self.execute_authenticated(HttpMethod::Get, &format!("/api/runs/{id}"), None)?;
+        expect_json(response, &[200])
     }
 
     fn computer(&self, id: &str) -> Result<serde_json::Value> {
@@ -1830,6 +1889,77 @@ fn run_agents<T: CloudTransport, W: Write>(
             }
             if result.status == "pending" || result.status == "not_seen" {
                 writeln!(out, "Run this result command again to read later events.")?;
+            }
+            Ok(())
+        }
+        CloudAgentsCommand::Work {
+            agent,
+            objective,
+            message_id,
+        } => {
+            let listing: AgentListResponse = serde_json::from_value(client.agents()?)
+                .context("The Codewhale service returned an invalid Agent list")?;
+            let selected = resolve_account_agent(&listing.agents, &agent)?;
+            if selected.project_id.is_empty() {
+                bail!(
+                    "Agent {} needs a repository Project before it can do Work",
+                    printable(&selected.name)
+                );
+            }
+            let receipt = client.assign_agent_work(&selected.id, &objective, &message_id)?;
+            writeln!(out, "Intent: {}", printable(&receipt.intent))?;
+            let mut work = receipt.work.into_iter().chain(receipt.queued_work);
+            let mut recorded = 0;
+            for item in work.by_ref() {
+                validate_resource_id(&item.id, "Work")?;
+                if item.agent_id != selected.id {
+                    bail!("The Codewhale service returned Work for a different Agent");
+                }
+                writeln!(out, "Work ID: {}", item.id)?;
+                writeln!(out, "Status: {}", printable(&item.status))?;
+                if !item.objective.is_empty() {
+                    writeln!(out, "Objective: {}", printable(&item.objective))?;
+                }
+                recorded += 1;
+            }
+            if recorded == 0 {
+                writeln!(
+                    out,
+                    "No Work was created. The Agent classified this message as {}.",
+                    printable(&receipt.intent)
+                )?;
+            } else {
+                writeln!(
+                    out,
+                    "Work is recorded. Hosted compute needs a separate reviewed quote and launch."
+                )?;
+            }
+            writeln!(out, "Message ID: {}", validate_operation_key(&message_id)?)?;
+            Ok(())
+        }
+        CloudAgentsCommand::WorkStatus { id } => {
+            let result = client.agent_work_status(&id)?;
+            let run = result
+                .get("run")
+                .filter(|run| run.is_object())
+                .ok_or_else(|| anyhow!("The Codewhale service returned no Work record"))?;
+            if run.get("id").and_then(|value| value.as_str())
+                != Some(validate_resource_id(&id, "Work")?)
+            {
+                bail!("The Codewhale service returned a different Work record");
+            }
+            writeln!(out, "Work ID: {}", validate_resource_id(&id, "Work")?)?;
+            writeln!(
+                out,
+                "Status: {}",
+                printable(
+                    run.get("state")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("unknown")
+                )
+            )?;
+            if let Some(title) = run.get("title").and_then(|value| value.as_str()) {
+                writeln!(out, "Objective: {}", printable(title))?;
             }
             Ok(())
         }
