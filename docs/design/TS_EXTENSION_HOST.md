@@ -142,8 +142,12 @@ differences from the text below:
   `extension:<plugin>`, sends no `tool/call` before approval, returns the
   result on allow and fails only that call on deny. Direct
   `execute_tools_tool` with no gate still refuses it before any host call.
-- **The handshake timeout is 5 s**, not the 2 s §1.4 and §8 state
-  (`supervisor::HANDSHAKE_DEADLINE`).
+- **The handshake timeout is 30 s**, not the 2 s §1.4 and §8 state
+  (`supervisor::HANDSHAKE_DEADLINE`). 5 s failed on loaded Windows CI with a
+  silent host (a cold `node` start plus an antivirus scan of the freshly
+  materialized bundle), and a miss fails the host for the whole session. The
+  handshake is off the first-prompt path, so 30 s (the MCP stdio handshake
+  budget) costs nothing when the host is healthy.
 - **A failed host is retried by a new engine, not by `/plugin enable`
   itself.** In the TUI every plugin change respawns the engine, and
   `Engine::new` calls `begin_session()`, which resets a failed host. On the

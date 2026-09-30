@@ -28365,14 +28365,22 @@ async fn an_isolated_chat_engine_never_revokes_another_engines_extension() {
         std::sync::Arc::new(MockLlmClient::new(Vec::new()));
     let (workspace_engine, _workspace_handle) =
         Engine::new_with_model_client(workspace_config, &config, idle_client);
-    let deadline = Instant::now() + Duration::from_secs(20);
+    // Outlast the host's own handshake and activation budgets, so a slow
+    // runner fails inside the host with its reason, never on this clock.
+    let deadline = Instant::now()
+        + crate::extension_host::supervisor::HANDSHAKE_DEADLINE
+        + crate::extension_host::supervisor::ACTIVATE_DEADLINE
+        + Duration::from_secs(10);
     while manager.owner_state(&plugin_id)
         != Some(crate::extension_host::registry::OwnerState::Active)
     {
+        let diagnostics = manager.diagnostics();
         assert!(
-            Instant::now() < deadline,
-            "the workspace engine never activated its plugin: {:?}",
-            manager.diagnostics()
+            Instant::now() < deadline
+                && !diagnostics
+                    .iter()
+                    .any(|line| line.contains("failed to start")),
+            "the workspace engine never activated its plugin: {diagnostics:?}"
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }

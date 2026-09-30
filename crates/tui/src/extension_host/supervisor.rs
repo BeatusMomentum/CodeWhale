@@ -33,10 +33,19 @@ use super::protocol::{
     RegisterResult, error_code,
 };
 
-/// Budget for `host/hello` → `host/initialize` → `host/ready`. The design's
-/// 2 s target is kept for warm starts (measured ~40 ms); the hard limit is
-/// wider so a cold, loaded CI machine does not fail the handshake.
-pub const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(5);
+/// Budget for spawn → `host/hello` → `host/initialize` → `host/ready`.
+///
+/// A warm start takes well under 100 ms, but the first start of a freshly
+/// materialized bundle pays for a cold `node` launch, and on Windows for an
+/// on-access antivirus scan of both. Windows CI under full test load missed
+/// the former 5 s budget with the host silent on stderr (four runs on
+/// 2026-09-29) while the same tests normally finish in about 1 s.
+/// A miss is sticky: the host is marked failed until the next session, so
+/// a too-tight budget disables every extension for that session. The
+/// handshake runs in the background, off the first-prompt path, so a wider
+/// budget costs nothing when the host is healthy; 30 s matches the MCP stdio
+/// handshake (`codewhale_mcp::stdio_client::HANDSHAKE_TIMEOUT`).
+pub const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(30);
 pub const ACTIVATE_DEADLINE: Duration = Duration::from_secs(5);
 pub const DISPOSE_DEADLINE: Duration = Duration::from_secs(2);
 /// Grace between `$/cancel` and resolving a call as cancelled on this side.
