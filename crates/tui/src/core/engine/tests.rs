@@ -393,6 +393,82 @@ async fn event_capacity_nested_vm_fanout_is_bounded_per_program_not_per_turn() {
 }
 
 #[tokio::test]
+async fn event_capacity_admitted_user_shell_cancels_before_side_effect_and_settles_without_drain() {
+    let workspace = tempdir().unwrap();
+    let marker = workspace.path().join("shell-must-not-start.txt");
+    let mut engine_config = deterministic_engine_config(workspace.path());
+    engine_config.features.disable(Feature::Mcp);
+    let (engine, handle) = Engine::new(engine_config, &Config::default());
+    // Leave precisely the two lifecycle slots free. TurnStarted fills one;
+    // the reserved terminal owns the other. The next tool observation must
+    // wait before the human-provenance command can reach its executor.
+    for _ in 0..engine.tx_event.max_capacity() - 2 {
+        engine
+            .tx_event
+            .try_send(Event::status("prior receipt"))
+            .unwrap();
+    }
+    let controls = Arc::clone(&engine.turn_controls);
+    handle
+        .send(Op::RunShellCommand {
+            command: format!("echo must-not-run > \"{}\"", marker.display()),
+            mode: AppMode::Agent,
+            allow_shell: true,
+            trust_mode: true,
+            auto_approve: true,
+            approval_mode: ApprovalMode::Bypass,
+        })
+        .await
+        .unwrap();
+    let task = tokio::spawn(engine.run());
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if controls.lock().unwrap().active.is_some() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    handle.cancel();
+    tokio::time::timeout(Duration::from_secs(2), handle.get_session_snapshot())
+        .await
+        .expect("shell cancellation settles before any event drain")
+        .unwrap();
+    assert!(
+        !marker.exists(),
+        "cancellation preserves the execution gate"
+    );
+    assert!(controls.lock().unwrap().active.is_none());
+    let mut events = handle.rx_event.write().await;
+    let mut started = 0;
+    let mut completed = 0;
+    let mut terminal_was_last = false;
+    while let Ok(event) = events.try_recv() {
+        assert!(!terminal_was_last);
+        match event {
+            Event::TurnStarted { .. } => started += 1,
+            Event::TurnComplete { status, usage, .. } => {
+                completed += 1;
+                terminal_was_last = true;
+                assert_eq!(status, TurnOutcomeStatus::Interrupted);
+                assert_eq!(usage, Usage::default());
+            }
+            _ => {}
+        }
+    }
+    assert_eq!((started, completed), (1, 1));
+    assert!(terminal_was_last);
+    drop(events);
+    handle.send(Op::Shutdown).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), task)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
 async fn event_capacity_cancelled_repl_child_keeps_unknown_cost_and_discards_kernel() {
     use crate::llm_client::mock::{MockLlmClient, canned};
     struct ReplClient {
