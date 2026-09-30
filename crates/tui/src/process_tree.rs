@@ -700,6 +700,12 @@ mod tests {
         assert!(contained_exit_groups().contains(&leader_group));
         drop(run);
         assert!(!contained_exit_groups().contains(&leader_group));
-        assert!(wait_for_pid_exit(leader, Duration::from_secs(5)));
+        // Let this current-thread runtime poll Tokio's orphan reaper while the
+        // cleanup probe waits; kill(pid, 0) still sees an unreaped macOS child.
+        assert!(
+            tokio::task::spawn_blocking(move || wait_for_pid_exit(leader, Duration::from_secs(5)))
+                .await
+                .expect("cleanup probe")
+        );
     }
 }
