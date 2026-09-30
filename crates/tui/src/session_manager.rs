@@ -4884,6 +4884,7 @@ mod tests {
     #[test]
     fn external_mutations_keep_the_live_lease_until_the_blocked_write_finishes() {
         let _env = crate::test_support::lock_test_env();
+        let mut failures = Vec::new();
         for operation in ["rename", "archive", "delete"] {
             let tmp = tempdir().expect("tempdir");
             let manager = std::sync::Arc::new(
@@ -4934,16 +4935,18 @@ mod tests {
                 .join()
                 .expect("mutation worker")
                 .expect("mutation succeeds");
-            assert!(holds_lease, "{operation}: released its lease before commit");
-            assert!(
-                attach_refused,
-                "{operation}: admitted a competing session owner"
-            );
+            if !holds_lease {
+                failures.push(format!("{operation}: released its lease before commit"));
+            }
+            if !attach_refused {
+                failures.push(format!("{operation}: admitted a competing session owner"));
+            }
             assert!(
                 !manager.is_session_live_anywhere(id),
                 "{operation}: leaked its lease"
             );
         }
+        assert!(failures.is_empty(), "{failures:?}");
     }
 
     #[cfg(unix)]
