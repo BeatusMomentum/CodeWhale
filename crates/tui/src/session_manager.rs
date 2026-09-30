@@ -386,9 +386,10 @@ fn is_not_archived(archived: &bool) -> bool {
 /// the id here and any external writer is refused.
 ///
 /// A static registry rather than a field on `RuntimeApiState` because the
-/// embedded Runtime API runs inside the TUI process; a standalone
-/// `codewhale web` has an empty registry and is therefore never blocked, which
-/// is exactly right — there is no TUI holding anything.
+/// embedded Runtime API runs inside the TUI process. A standalone
+/// `codewhale web` has an empty registry, so external writers consult
+/// [`SessionManager::is_session_live_anywhere`], which also sees the
+/// cross-process lease a TUI in another process holds.
 static LIVE_SESSIONS: std::sync::OnceLock<std::sync::RwLock<std::collections::HashSet<String>>> =
     std::sync::OnceLock::new();
 
@@ -2746,7 +2747,7 @@ impl SessionManager {
         archived: bool,
         mutator: SessionMutator,
     ) -> std::io::Result<SessionMetadata> {
-        if mutator == SessionMutator::External && is_live_session(id) {
+        if mutator == SessionMutator::External && self.is_session_live_anywhere(id) {
             return Err(live_session_conflict(id));
         }
         let mut session = self.load_session(id)?;
@@ -2804,7 +2805,7 @@ impl SessionManager {
         mutator: SessionMutator,
     ) -> std::io::Result<SessionMetadata> {
         let title = normalize_session_title(title)?;
-        if mutator == SessionMutator::External && is_live_session(id) {
+        if mutator == SessionMutator::External && self.is_session_live_anywhere(id) {
             return Err(live_session_conflict(id));
         }
         let mut session = self.load_session(id)?;
@@ -4617,6 +4618,37 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn external_writers_are_refused_while_another_process_holds_the_live_lease() {
+        let tmp = tempdir().expect("tempdir");
+        let manager = SessionManager::new(tmp.path().join("sessions")).expect("manager");
+        let id = "77777777-7777-4777-8777-777777777777";
+        save_late_usage_test_session(&manager, id);
+        let snapshot = manager.validated_session_path(id).expect("snapshot path");
+        let original = fs::read(&snapshot).expect("original bytes");
+        // Another process's TUI: an OS lock on its own open file
+        // description. This process's in-memory registry knows nothing.
+        let lease = open_private_lock_file(&manager.live_lease_path(id, true).expect("lease"))
+            .expect("open lease");
+        assert!(crate::runtime_threads::try_lock_file_exclusive(&lease).expect("lock lease"));
+        assert!(!is_live_session(id));
+
+        let rename = manager
+            .rename_session(id, "Renamed elsewhere", SessionMutator::External)
+            .expect_err("a rename would be reverted by the owner's next autosave");
+        assert_eq!(rename.kind(), io::ErrorKind::ResourceBusy);
+        let archive = manager
+            .set_session_archived(id, true, SessionMutator::External)
+            .expect_err("an archive would be reverted by the owner's next autosave");
+        assert_eq!(archive.kind(), io::ErrorKind::ResourceBusy);
+        assert_eq!(fs::read(&snapshot).expect("bytes"), original);
+
+        drop(lease);
+        manager
+            .rename_session(id, "Renamed after close", SessionMutator::External)
+            .expect("an unowned session accepts external writes");
     }
 
     #[test]
