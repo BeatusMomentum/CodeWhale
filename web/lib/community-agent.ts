@@ -556,6 +556,42 @@ export async function clearDraftResolution(
   await kv.delete(resolutionKey(type, id));
 }
 
+// A post whose GitHub outcome was unknown (network error, 5xx, 408, 429).
+// GitHub has no idempotency key, so this outlives the 15-minute claim: the
+// next attempt looks for the post the earlier one may have created before
+// posting again, however late the retry comes.
+const POST_UNKNOWN_PREFIX = "draft-post-unknown:";
+const POST_UNKNOWN_TTL_SEC = 60 * 60 * 24 * 30;
+
+function postUnknownKey(type: AgentDraftType, id: string): string {
+  return POST_UNKNOWN_PREFIX + draftKey(type, id).slice("draft:".length);
+}
+
+export async function markPostOutcomeUnknown(kv: KVNamespace | undefined, type: AgentDraftType, id: string): Promise<void> {
+  if (!kv) return;
+  await kv.put(postUnknownKey(type, id), JSON.stringify({ at: new Date().toISOString() }), {
+    expirationTtl: POST_UNKNOWN_TTL_SEC,
+  });
+}
+
+/** When the earliest unresolved unknown-outcome attempt happened, if any. */
+export async function getPostOutcomeUnknown(kv: KVNamespace | undefined, type: AgentDraftType, id: string): Promise<string | null> {
+  if (!kv) return null;
+  const raw = await kv.get(postUnknownKey(type, id));
+  if (!raw) return null;
+  try {
+    const at = (JSON.parse(raw) as { at?: unknown }).at;
+    if (typeof at === "string" && Number.isFinite(Date.parse(at))) return at;
+  } catch { /* fall through */ }
+  // An unreadable marker still means "look first"; look back its full life.
+  return new Date(Date.now() - POST_UNKNOWN_TTL_SEC * 1000).toISOString();
+}
+
+export async function clearPostOutcomeUnknown(kv: KVNamespace | undefined, type: AgentDraftType, id: string): Promise<void> {
+  if (!kv) return;
+  await kv.delete(postUnknownKey(type, id));
+}
+
 // --- Public weekly digest records ---
 //
 // The cron writes the structured digest unapproved; only the maintainer's

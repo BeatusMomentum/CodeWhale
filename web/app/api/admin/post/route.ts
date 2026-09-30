@@ -5,6 +5,9 @@ import {
   approveDigestRecord,
   claimDraft,
   clearDraftResolution,
+  clearPostOutcomeUnknown,
+  getPostOutcomeUnknown,
+  markPostOutcomeUnknown,
   deleteDigestRecord,
   deleteDraft,
   getAgentEnv,
@@ -237,6 +240,38 @@ export async function POST(req: Request) {
 
     const commentBody = editedBody ?? originalBody;
 
+    // GitHub has no idempotency key. If an earlier attempt's outcome was
+    // unknown, the post it may have created is looked for (from shortly
+    // before that attempt) instead of posting blind a second time.
+    const unknownAt = await getPostOutcomeUnknown(env.CURATED_KV, parsedKey.type, parsedKey.id).catch(() => null);
+    const lookSince = unknownAt ? new Date(Date.parse(unknownAt) - 10 * 60 * 1000).toISOString() : null;
+    const githubList = async (url: string, authScheme: "token" | "Bearer"): Promise<Record<string, unknown>[]> => {
+      const res = await fetch(url, {
+        headers: {
+          Accept: "application/vnd.github+json",
+          Authorization: `${authScheme} ${env.MAINTAINER_GITHUB_PAT}`,
+          "X-GitHub-Api-Version": "2022-11-28",
+        },
+        signal: AbortSignal.timeout(15_000),
+      });
+      if (!res.ok) throw new Error(`GitHub ${res.status}`);
+      const list: unknown = await res.json();
+      if (!Array.isArray(list)) throw new Error("GitHub returned no list");
+      return list.filter((item): item is Record<string, unknown> => !!item && typeof item === "object");
+    };
+    // This request posted nothing, so the draft is free again.
+    const lookupFailed = async () => {
+      try {
+        await clearDraftResolution(env.CURATED_KV, parsedKey.type, parsedKey.id);
+        await releaseDraftClaim(env.CURATED_KV, heldClaim);
+      } catch { /* the claim expires on its own */ }
+      return NextResponse.json(
+        { error: "could not check GitHub for the post an earlier attempt may have created; nothing was posted, retry" },
+        { status: 502 }
+      );
+    };
+    const alreadyPosted = "An earlier attempt whose outcome was unknown had already posted this; it was not posted again.";
+
     // After GitHub accepted the post, bookkeeping failures must not turn into
     // an error the maintainer would "fix" by posting again.
     const recordPosted = async (): Promise<string | undefined> => {
@@ -245,6 +280,7 @@ export async function POST(req: Request) {
         // The marker now carries the decision, so a later claim sees it; a
         // reopened draft (new activity clears the marker) is postable again.
         await releaseDraftClaim(env.CURATED_KV, heldClaim, { recorded: true }).catch(() => undefined);
+        await clearPostOutcomeUnknown(env.CURATED_KV, parsedKey.type, parsedKey.id).catch(() => undefined);
         await env.CURATED_KV?.put(draftKey, JSON.stringify(draft), { expirationTtl: 60 * 60 * 24 * 7 });
         return undefined;
       } catch (e) {
@@ -270,11 +306,14 @@ export async function POST(req: Request) {
         return null;
       }
     };
-    const unknownOutcome = (detail: string) =>
-      NextResponse.json(
+    const unknownOutcome = async (detail: string) => {
+      // Remembered past the claim, so a later retry looks before posting.
+      await markPostOutcomeUnknown(env.CURATED_KV, parsedKey.type, parsedKey.id).catch(() => undefined);
+      return NextResponse.json(
         { error: `${detail}; check GitHub before retrying (retry unlocks in 15 minutes)` },
         { status: 502 }
       );
+    };
     const githubFailed = async (res: Response) => {
       const text = await res.text().catch(() => "");
       if (!githubDefinitelyRejected(res.status)) {
@@ -296,16 +335,36 @@ export async function POST(req: Request) {
       const digestRepo = env.GITHUB_REPO ?? "Hmbown/CodeWhale";
       const issuesUrl = `https://api.github.com/repos/${digestRepo}/issues`;
 
-      const digestRes = await postToGitHub(issuesUrl, { title, body: digestBody, labels: ["digest"] }, "token");
-      if (!digestRes) return unknownOutcome("GitHub request failed");
-      if (!digestRes.ok) return githubFailed(digestRes);
-
-      const issue = await digestRes.json().catch(() => ({})) as { number?: number; html_url?: string };
+      let issue: { number?: number; html_url?: string } | undefined;
+      if (lookSince) {
+        try {
+          const listUrl = `${issuesUrl}?labels=digest&state=all&since=${encodeURIComponent(lookSince)}&per_page=100`;
+          const found = (await githubList(listUrl, "token")).find(
+            (item) => !item.pull_request && item.title === title && item.body === digestBody
+          );
+          if (found) {
+            issue = {
+              number: typeof found.number === "number" ? found.number : undefined,
+              html_url: typeof found.html_url === "string" ? found.html_url : undefined,
+            };
+          }
+        } catch {
+          return lookupFailed();
+        }
+      }
+      const reconciled = issue !== undefined;
+      if (!issue) {
+        const digestRes = await postToGitHub(issuesUrl, { title, body: digestBody, labels: ["digest"] }, "token");
+        if (!digestRes) return unknownOutcome("GitHub request failed");
+        if (!digestRes.ok) return githubFailed(digestRes);
+        issue = await digestRes.json().catch(() => ({})) as { number?: number; html_url?: string };
+      }
 
       draft.posted = true;
       if (typeof issue.number === "number") draft.targetNumber = issue.number;
       if (typeof issue.html_url === "string") draft.targetUrl = issue.html_url;
       let warning = await recordPosted();
+      if (reconciled) warning ??= alreadyPosted;
 
       // Publishing to /digest is the approval, for the language shown to the
       // maintainer only, and only of the record that renders to exactly the
@@ -342,13 +401,24 @@ export async function POST(req: Request) {
     const repo = env.GITHUB_REPO ?? "Hmbown/CodeWhale";
     const commentUrl = `https://api.github.com/repos/${repo}/issues/${draft.targetNumber}/comments`;
 
-    const ghRes = await postToGitHub(commentUrl, { body: commentBody }, "Bearer");
-    if (!ghRes) return unknownOutcome("GitHub request failed");
-    if (!ghRes.ok) return githubFailed(ghRes);
+    let reconciled = false;
+    if (lookSince) {
+      try {
+        const listUrl = `${commentUrl}?since=${encodeURIComponent(lookSince)}&per_page=100`;
+        reconciled = (await githubList(listUrl, "Bearer")).some((comment) => comment.body === commentBody);
+      } catch {
+        return lookupFailed();
+      }
+    }
+    if (!reconciled) {
+      const ghRes = await postToGitHub(commentUrl, { body: commentBody }, "Bearer");
+      if (!ghRes) return unknownOutcome("GitHub request failed");
+      if (!ghRes.ok) return githubFailed(ghRes);
+    }
 
     // Mark as posted
     draft.posted = true;
-    const warning = await recordPosted();
+    const warning = (await recordPosted()) ?? (reconciled ? alreadyPosted : undefined);
 
     return NextResponse.json({ ok: true, action: "posted", ...(warning ? { warning } : {}) });
   }

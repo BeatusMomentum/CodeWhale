@@ -26,6 +26,11 @@ suffix over the finding's full identity, max 80 chars — so unchanged findings
 dedup and changed findings land as new drafts. Semantic-drift model output is
 validated and capped (10 drafts/run) before any KV writes.
 
+A post whose GitHub outcome was unknown (network error, 5xx, 408, 429) leaves
+  draft-post-unknown:<type>:<id>              (30 days; the next post of that
+                                               draft first looks on GitHub for
+                                               the earlier attempt's post)
+
 Usage logged to (one record per model call; sum the day's prefix):
   usage:<YYYY-MM-DD>:<timestamp>:<uuid>
 ```

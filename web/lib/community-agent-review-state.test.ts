@@ -149,11 +149,15 @@ function stubAdminEnv(kv: FakeKv, lock?: FakeDraftClaimLock) {
   });
 }
 
-/** GitHub stub that records every comment/issue creation. */
-function stubGitHub(status = 201) {
+/**
+ * GitHub stub that records every comment/issue creation. Reads (the lookup
+ * for an earlier unknown-outcome post) answer `existing` and are not posts.
+ */
+function stubGitHub(status = 201, existing: unknown[] = []) {
   const posts: string[] = [];
-  const fetchMock = vi.fn(async (input: string | URL | Request) => {
+  const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
     const url = inputUrl(input);
+    if ((init?.method ?? "GET") === "GET") return jsonResponse(existing);
     posts.push(url);
     if (url.endsWith("/issues")) {
       return jsonResponse({ number: 900, html_url: "https://github.com/Hmbown/CodeWhale/issues/900" }, status);
@@ -309,6 +313,26 @@ describe("weekly digest publication requires maintainer approval", () => {
     expect(payload.ok).toBeUndefined();
     expect(payload.error).toMatch(/^GitHub 422/);
     expect(isPublishedDigest(JSON.parse(kv.values.get(onlyKey(kv, "digest:weekly-"))!))).toBe(false);
+  });
+
+  it("finds a digest issue an unknown-outcome attempt created and publishes without a second issue", async () => {
+    const kv = new FakeKv();
+    stubDigestSources();
+    mocks.agentChat.mockResolvedValue({ content: JSON.stringify(DIGEST_MODEL_OUTPUT), usage: { input: 1, output: 1 } });
+    await runDigest({ CURATED_KV: kv, DEEPSEEK_API_KEY: "k" });
+    stubAdminEnv(kv);
+    const draftKey = onlyKey(kv, "draft:digest:");
+    stubGitHub(504);
+    expect((await act(kv, { action: "post", draftKey, lang: "en" })).status).toBe(502);
+    // The claim and "posting" marker lapse (15 minutes in production).
+    for (const key of [...kv.values.keys()]) if (/^draft-(claim|resolved):digest:/.test(key)) kv.values.delete(key);
+
+    const body = JSON.parse(kv.values.get(draftKey)!).bodyEn as string;
+    const title = body.split("\n")[0].replace(/^#+\s*/, "").trim();
+    const posts = stubGitHub(201, [{ number: 901, html_url: "https://github.com/Hmbown/CodeWhale/issues/901", title, body }]);
+    const retry = await act(kv, { action: "post", draftKey, lang: "en" });
+    await expect(retry.json()).resolves.toMatchObject({ ok: true, number: 901, published: true });
+    expect(posts).toEqual([]);
   });
 
   it("never publishes an older record when a later run saved its draft but not its record", async () => {
@@ -838,6 +862,45 @@ describe("admin claims with the DRAFT_CLAIM_LOCK Durable Object bound", () => {
 
     // ...until it expires, so the draft is not wedged for good.
     lock.now += 15 * 60 * 1000;
+    const retryPosts = stubGitHub();
+    expect((await act(kv, { action: "post", draftKey: KEY })).status).toBe(200);
+    expect(retryPosts).toHaveLength(1);
+  });
+
+  it("looks for the earlier attempt's comment after an unknown outcome instead of posting it twice", async () => {
+    const { kv, lock } = await lockedAdmin(502);
+    expect((await act(kv, { action: "post", draftKey: KEY })).status).toBe(502);
+    lock.now += 15 * 60 * 1000;
+    kv.values.delete("draft-resolved:triage:42");
+
+    // GitHub did create it: the late retry records it and posts nothing.
+    const posts = stubGitHub(201, [{ id: 7, body: "English body" }]);
+    const retry = await act(kv, { action: "post", draftKey: KEY });
+    expect(retry.status).toBe(200);
+    await expect(retry.json()).resolves.toMatchObject({ ok: true, action: "posted", warning: expect.stringContaining("not posted again") });
+    expect(posts).toEqual([]);
+    expect(JSON.parse(kv.values.get("draft-resolved:triage:42")!).state).toBe("posted");
+    expect(kv.values.has("draft-post-unknown:triage:42")).toBe(false);
+  });
+
+  it("posts nothing when the lookup for an earlier attempt fails, and frees the draft", async () => {
+    const { kv, lock } = await lockedAdmin(502);
+    expect((await act(kv, { action: "post", draftKey: KEY })).status).toBe(502);
+    lock.now += 15 * 60 * 1000;
+    kv.values.delete("draft-resolved:triage:42");
+
+    const posts: string[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      if ((init?.method ?? "GET") === "GET") return jsonResponse({ message: "down" }, 503);
+      posts.push(inputUrl(input));
+      return jsonResponse({ id: 1 }, 201);
+    }));
+    const blocked = await act(kv, { action: "post", draftKey: KEY });
+    expect(blocked.status).toBe(502);
+    await expect(blocked.json()).resolves.toMatchObject({ error: expect.stringContaining("nothing was posted") });
+    expect(posts).toEqual([]);
+
+    // Once GitHub answers and has no such comment, the retry posts once.
     const retryPosts = stubGitHub();
     expect((await act(kv, { action: "post", draftKey: KEY })).status).toBe(200);
     expect(retryPosts).toHaveLength(1);
