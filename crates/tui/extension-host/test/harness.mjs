@@ -15,6 +15,19 @@ export function sha256File(path) {
   return createHash('sha256').update(readFileSync(path)).digest('hex')
 }
 
+/** The runtime running these tests also runs the host: `node --test` or `bun test`. */
+export const IS_BUN = typeof process.versions.bun === 'string'
+
+/**
+ * The runtime flags the Rust core passes (`supervisor::runtime_args`); keep
+ * these two lists in sync. Bun ignores Node's heap and `__proto__` flags, so it
+ * gets its own: never auto-install packages, and ignore `bunfig.toml` and
+ * `.env` files in the working directory.
+ */
+export const HOST_ARGS = IS_BUN
+  ? ['--no-install', '--no-env-file', `--config=${process.platform === 'win32' ? 'NUL' : '/dev/null'}`, '--no-addons']
+  : ['--max-old-space-size=256', '--disable-proto=throw', '--no-addons']
+
 export const LIMITS = { max_frame: 32 * 1024 * 1024, max_inflight: 256, dispose_deadline_ms: 2000, activate_deadline_ms: 5000 }
 
 /**
@@ -25,7 +38,7 @@ export async function startHost({ admit, env, ownGroup = false } = {}) {
   const started = performance.now()
   // `ownGroup` spawns the host as a process-group leader and tells it so, as
   // the Rust core does on Unix.
-  const child = spawn(process.execPath, ['--max-old-space-size=256', '--disable-proto=throw', '--no-addons', BUNDLE], {
+  const child = spawn(process.execPath, [...HOST_ARGS, BUNDLE], {
     stdio: ['pipe', 'pipe', 'pipe'],
     env: { ...process.env, ...env, ...(ownGroup ? { CODEWHALE_HOST_PROCESS_GROUP: '1' } : {}) },
     detached: ownGroup,

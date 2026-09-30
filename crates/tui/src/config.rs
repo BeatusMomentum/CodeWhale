@@ -1742,10 +1742,40 @@ pub fn model_completion_names_for_provider(provider: ApiProvider) -> Vec<&'stati
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ExtensionHostConfig {
+    /// Which runtime runs the host: `auto` (default: Bun when a supported one
+    /// is found, else Node), `bun`, or `node`. An explicit choice never falls
+    /// back to the other runtime.
+    #[serde(default)]
+    pub runtime: ExtensionHostRuntime,
     /// Path to a Node.js runtime (>= 22.19). Tried before every `node` on
     /// `PATH`; each candidate must actually run and meet the floor.
     #[serde(default)]
     pub node: Option<String>,
+    /// Path to a Bun runtime (>= 1.4.0). Tried before every `bun` on `PATH`
+    /// and `~/.bun/bin/bun`.
+    #[serde(default)]
+    pub bun: Option<String>,
+}
+
+/// `[extension_host] runtime`.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ExtensionHostRuntime {
+    #[default]
+    Auto,
+    Bun,
+    Node,
+}
+
+impl ExtensionHostRuntime {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Bun => "bun",
+            Self::Node => "node",
+        }
+    }
 }
 
 /// Raw retry configuration loaded from config files.

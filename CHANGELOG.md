@@ -89,6 +89,7 @@ quieter, and Fleet runs can be checked before they spend anything.
 
 ### Added
 
+- Experimental extension host: Bun is now the default runtime when Bun 1.4.0 or newer is installed, with Node as the fallback. `[extension_host] runtime = "auto" | "bun" | "node"` chooses; an explicit choice never falls back, and restarts keep the runtime the session started with. `codewhale doctor` and `/plugin` show which runtime runs the host and why. Under Bun the host never auto-installs packages and ignores `.env`/`bunfig.toml` in its data directory. `bun:ffi` and `process.dlopen` are blocked on both runtimes. The host is capped at 1 GiB: the kernel enforces it on Linux, a heartbeat check kills the host past the cap on macOS, and Windows has no cap yet ([#6600](https://github.com/Hmbown/Codewhale/pull/6600)).
 - `docs/features.toml` lists every user feature with its status, first
   release, docs page and owning code. A test fails when a `[features]` flag
   and its row disagree, or when a listed docs page or code path is missing.

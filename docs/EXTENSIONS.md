@@ -1,7 +1,7 @@
 # Writing an extension tool
 
 The experimental TypeScript extension host runs reviewed plugin code in a
-shared Node process. Rust still owns sessions, tool admission, approval and
+shared Bun or Node process. Rust still owns sessions, tool admission, approval and
 execution. Extensions currently contribute tools; they cannot provide an
 approval service, run a second agent loop or replace built-in tools.
 
@@ -32,10 +32,32 @@ User bundles live under `~/.codewhale/plugins/`; workspace bundles live under
 fail validation when the host is enabled. With the flag off, native entries
 remain inventory-only.
 
-Node must satisfy `^22.19 || >=24`. `.mts` supports Node's built-in removal of
-erasable types; enums, decorators and syntax needing transformation require a
-separate author build to JavaScript. Do not assume Node reads `tsconfig.json`.
-See [Node's TypeScript rules](https://nodejs.org/docs/latest-v22.x/api/typescript.html).
+## Runtime
+
+`[extension_host] runtime` selects what runs the host:
+
+```toml
+[extension_host]
+runtime = "auto"   # default: Bun >= 1.4.0 if one is found, otherwise Node
+# runtime = "bun"  # Bun only; fails rather than falling back to Node
+# runtime = "node" # Node only
+# bun = "~/.bun/bin/bun"      # tried before `bun` on PATH and ~/.bun/bin/bun
+# node = "/opt/homebrew/bin/node" # tried before every `node` on PATH
+```
+
+Node must satisfy `^22.19 || >=24`; Bun must be 1.4.0 or newer. The choice is
+made once, at the host's first launch in a Codewhale process, and restarts
+reuse it. `codewhale doctor` and `/plugin` show which runtime runs the host,
+its version and path, and, when `auto` fell back to Node, why Bun was not used.
+
+Write extensions for both runtimes. Use Node's APIs (Bun implements them) and
+only erasable TypeScript in `.mts`. Enums, decorators and syntax that needs
+transformation require a separate author build to JavaScript. Bun would accept
+more, but Node would not. Neither runtime reads your `tsconfig.json` for the
+host. See [Node's TypeScript rules](https://nodejs.org/docs/latest-v22.x/api/typescript.html).
+Under Bun the host runs with `--no-install`: a missing package fails the import;
+it is never downloaded. `bun:ffi` and `process.dlopen` are unavailable on both
+runtimes.
 Include local imports in the bundle; trust stages reviewed content, and the
 entry is rehashed before import. Changes to reviewed bytes or capabilities
 require another review. See [bundle rules](PLUGIN_BUNDLES.md).
@@ -90,7 +112,7 @@ errors, activation/refusal/fault messages and teardown outcomes are attributed
 to the plugin when known. Display text is escaped. `/plugin list` includes
 overall host health and bounded diagnostics.
 
-Do not block Node's event loop. Heartbeats mark an unanswered host Unresponsive
+Do not block the event loop. Heartbeats mark an unanswered host Unresponsive
 after 3 seconds and kill it after 10 seconds. Unexpected exits restart with a
 short backoff; the third crash within 5 minutes stops automatic recovery.
 Opening another engine does not reset that budget. Explicit plugin changes or
@@ -116,7 +138,12 @@ before enabling third-party code.
 
 ## Limits
 
-The host has a 256 MiB Node heap limit, 32 MiB frame limit, 256 in-flight request
+The host process has a 1 GiB memory cap. On Linux the kernel enforces it
+(`RLIMIT_DATA`), so an allocation past it fails. On macOS, which has no
+unprivileged kernel limit, Codewhale checks the host's resident size at each
+3-second heartbeat and kills the host past the cap. Windows has no cap yet.
+Under Node the JavaScript heap is also limited to 256 MiB. The host has a
+32 MiB frame limit, 256 in-flight request
 limit (plus a reserved heartbeat), 128 tools per owner and 1024 per host. Tool
 descriptions are at most 4 KiB and schemas 64 KiB. Tool calls have a 120-second
 deadline. The feature stays Experimental and off by default; local fixture

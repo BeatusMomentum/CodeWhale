@@ -16,6 +16,22 @@
 //! and Mach services are not restricted, so this is defense-in-depth, not a
 //! containment boundary. Elsewhere (Linux, Windows) the host runs unsandboxed
 //! with the user's permissions, and `/plugin` says so.
+//!
+//! **Runtime.** Bun (preferred) or Node, chosen once per manager
+//! (`[extension_host] runtime`). Each gets its own flags ([`runtime_args`]);
+//! Bun silently ignores Node's heap and `__proto__` flags.
+//!
+//! **Memory cap.** On Linux the kernel enforces it: `RLIMIT_DATA` is set in
+//! the child before exec, so an allocation past the cap fails, on either
+//! runtime. macOS rejects `setrlimit(RLIMIT_DATA/RLIMIT_AS)` with `EINVAL`.
+//! Its per-task jetsam limit (`memorystatus_control`) is not permitted
+//! unprivileged, and Bun's JSC heap options (`BUN_JSC_gcMaxHeapSize`,
+//! `forceRAMSize`) do not stop growth (all measured 2026-09-29, macOS 26.1).
+//! So on macOS the supervisor checks the host's resident size at every
+//! heartbeat and kills it past the cap. That is enforced, but only as often as
+//! the heartbeat runs, and it does not count the plugins' own child processes.
+//! Windows has no cap yet. Node still gets `--max-old-space-size=256` on every
+//! platform.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -27,6 +43,8 @@ use std::time::Duration;
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
+
+use crate::dependencies::{HostRuntime, HostRuntimeKind};
 
 use super::protocol::{
     self, CoreRequest, HostLimits, HostMessage, HostNotification, HostRequest, InitializeParams,
@@ -78,6 +96,53 @@ pub(crate) struct HostLaunch {
     pub sandbox: Option<String>,
     /// Environment the sandbox wrapper adds (`CODEWHALE_SANDBOX`, …).
     pub sandbox_env: Vec<(String, String)>,
+    /// The runtime inside the wrapper; `host/hello` must report the same one.
+    pub runtime: HostRuntime,
+    /// Bytes; see the module docs for how each platform enforces it.
+    pub memory_cap: u64,
+}
+
+/// The default memory cap. Measured on Linux (2026-09-29): under
+/// `RLIMIT_DATA` Node 24 aborts when it creates the host's watchdog Worker
+/// at 512 MiB, and Bun 1.4 aborts at startup at 256 MiB. Both start and run
+/// normally at 1 GiB and fail an allocation past it. An idle host uses
+/// 34–67 MB resident.
+pub const HOST_MEMORY_CAP: u64 = 1 << 30;
+
+/// Runtime flags, before the bundle path. Keep in sync with
+/// `extension-host/test/harness.mjs` (`HOST_ARGS`).
+///
+/// - Node: a 256 MB old-space cap, `__proto__` throws, no native addons.
+/// - Bun ignores all of those except `--no-addons`. Instead it gets
+///   `--no-install`, because Bun otherwise fetches a missing package from npm
+///   while plugin code is running. It also gets `--no-env-file` and
+///   `--config=<null device>`, because Bun otherwise loads `.env` and
+///   `bunfig.toml` (which can preload code) from the working directory, and
+///   that directory is the host's writable data dir. `bun:ffi` is locked in
+///   the host itself (`src/runtime.ts`).
+#[must_use]
+pub(crate) fn runtime_args(kind: HostRuntimeKind) -> &'static [&'static str] {
+    match kind {
+        HostRuntimeKind::Node => &[
+            "--max-old-space-size=256",
+            "--disable-proto=throw",
+            "--no-addons",
+        ],
+        #[cfg(windows)]
+        HostRuntimeKind::Bun => &[
+            "--no-install",
+            "--no-env-file",
+            "--config=NUL",
+            "--no-addons",
+        ],
+        #[cfg(not(windows))]
+        HostRuntimeKind::Bun => &[
+            "--no-install",
+            "--no-env-file",
+            "--config=/dev/null",
+            "--no-addons",
+        ],
+    }
 }
 
 /// Top-level entries of a Codewhale home the host may read: its own bundle
@@ -178,33 +243,36 @@ pub(crate) fn host_denied_read_paths(home: &Path) -> Vec<PathBuf> {
 
 /// Plan the host launch. Blocking (creates the data dir, canonicalizes the
 /// deny-list); call from `spawn_blocking`.
-pub(crate) fn plan_launch(node: &Path, bundle: &Path, home: &Path) -> Result<HostLaunch, String> {
+pub(crate) fn plan_launch(
+    runtime: &HostRuntime,
+    bundle: &Path,
+    home: &Path,
+    memory_cap: u64,
+) -> Result<HostLaunch, String> {
     use crate::sandbox::{CommandSpec, SandboxManager, SandboxPolicy, SandboxType};
     let data = home.join("extension-host").join("data");
     std::fs::create_dir_all(&data)
         .map_err(|error| format!("cannot create {}: {error}", data.display()))?;
-    let args: Vec<String> = [
-        "--max-old-space-size=256",
-        "--disable-proto=throw",
-        "--no-addons",
-    ]
-    .into_iter()
-    .map(str::to_string)
-    .chain(std::iter::once(bundle.to_string_lossy().into_owned()))
-    .collect();
+    let args: Vec<String> = runtime_args(runtime.kind)
+        .iter()
+        .map(|arg| (*arg).to_string())
+        .chain(std::iter::once(bundle.to_string_lossy().into_owned()))
+        .collect();
     let unsandboxed = HostLaunch {
-        program: node.to_path_buf(),
+        program: runtime.path.clone(),
         args: args.clone(),
         cwd: data.clone(),
         sandbox: None,
         sandbox_env: Vec::new(),
+        runtime: runtime.clone(),
+        memory_cap,
     };
     if cfg!(windows) {
         // The Windows helper is process containment only; ProcessTree already
         // provides that, and it must not be reported as isolation.
         return Ok(unsandboxed);
     }
-    let spec = CommandSpec::program(&node.to_string_lossy(), args, data, Duration::ZERO)
+    let spec = CommandSpec::program(&runtime.path.to_string_lossy(), args, data, Duration::ZERO)
         .with_policy(SandboxPolicy::WorkspaceWrite {
             writable_roots: Vec::new(),
             network_access: false,
@@ -227,7 +295,73 @@ pub(crate) fn plan_launch(node: &Path, bundle: &Path, home: &Path) -> Result<Hos
         cwd: env.cwd,
         sandbox: Some(env.sandbox_type.to_string()),
         sandbox_env: env.env.into_iter().collect(),
+        runtime: runtime.clone(),
+        memory_cap,
     })
+}
+
+/// The kernel-enforced part of the memory cap: `RLIMIT_DATA` on Linux (see
+/// the module docs for why nothing equivalent exists on macOS). Applied in
+/// the child between fork and exec, so only the host is limited.
+#[cfg(target_os = "linux")]
+fn limit_child_memory(command: &mut tokio::process::Command, cap: u64) {
+    // SAFETY: the closure runs in the forked child before exec and calls only
+    // `setrlimit`, which is async-signal-safe; it allocates nothing.
+    unsafe {
+        command.pre_exec(move || {
+            let limit = libc::rlimit {
+                rlim_cur: cap as libc::rlim_t,
+                rlim_max: cap as libc::rlim_t,
+            };
+            if libc::setrlimit(libc::RLIMIT_DATA, &raw const limit) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn limit_child_memory(_command: &mut tokio::process::Command, _cap: u64) {}
+
+/// Resident size of `pid` in bytes, for the macOS memory-cap check.
+#[cfg(target_os = "macos")]
+pub(crate) fn resident_bytes(pid: u32) -> Option<u64> {
+    let mut info = std::mem::MaybeUninit::<libc::proc_taskinfo>::zeroed();
+    let size = std::mem::size_of::<libc::proc_taskinfo>() as libc::c_int;
+    // SAFETY: `info` is a correctly sized, writable `proc_taskinfo` buffer.
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid as libc::c_int,
+            libc::PROC_PIDTASKINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size,
+        )
+    };
+    // SAFETY: a full-size write initialized the struct.
+    (written == size).then(|| unsafe { info.assume_init() }.pti_resident_size)
+}
+
+/// Platforms without a supervisor-side check (Linux uses `RLIMIT_DATA`).
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn resident_bytes(_pid: u32) -> Option<u64> {
+    None
+}
+
+/// How the memory cap is enforced here, for `/plugin` and doctor.
+#[must_use]
+pub fn memory_cap_posture(cap: u64) -> String {
+    let mib = cap / (1024 * 1024);
+    if cfg!(target_os = "linux") {
+        format!("memory cap {mib} MiB (kernel RLIMIT_DATA)")
+    } else if cfg!(target_os = "macos") {
+        format!(
+            "memory cap {mib} MiB (resident size checked at each heartbeat; macOS offers no unprivileged kernel limit)"
+        )
+    } else {
+        "no memory cap on this platform".to_string()
+    }
 }
 
 /// Callbacks from the channel into the manager.
@@ -258,7 +392,11 @@ struct Handshake {
 
 pub(crate) struct HostProcess {
     pub pid: Option<u32>,
-    pub node_version: std::sync::OnceLock<String>,
+    /// The runtime the Rust side launched; `host/hello` must agree.
+    pub runtime: HostRuntime,
+    /// Runtime version as reported by the host in `host/hello`.
+    pub runtime_version: std::sync::OnceLock<String>,
+    pub memory_cap: u64,
     /// `seatbelt` / `bwrap`, or `None` when unsandboxed.
     pub sandbox: Option<String>,
     tree: Arc<crate::process_tree::ProcessTree>,
@@ -329,6 +467,7 @@ impl HostProcess {
         }
         #[cfg(unix)]
         command.process_group(0);
+        limit_child_memory(&mut command, launch.memory_cap);
 
         let mut child = command
             .spawn()
@@ -461,7 +600,9 @@ impl HostProcess {
 
         let host = Arc::new(Self {
             pid,
-            node_version: std::sync::OnceLock::new(),
+            runtime: launch.runtime.clone(),
+            runtime_version: std::sync::OnceLock::new(),
+            memory_cap: launch.memory_cap,
             sandbox: launch.sandbox.clone(),
             tree,
             outbound,
@@ -487,6 +628,15 @@ impl HostProcess {
                     protocol::PROTOCOL_VERSION
                 ));
             }
+            // Never a silent runtime switch: the host must be running on
+            // the runtime this process chose and launched.
+            if hello.runtime.name != launch.runtime.kind.name() {
+                return Err(format!(
+                    "host reports runtime {} but {} was launched",
+                    hello.runtime.name,
+                    launch.runtime.kind.name()
+                ));
+            }
             if hello.bundle_sha256 != expected_sha256 {
                 return Err(format!(
                     "host bundle digest {} does not match the materialized bundle {}",
@@ -508,12 +658,12 @@ impl HostProcess {
             ready_rx
                 .await
                 .map_err(|_| "host exited before host/ready".to_string())?;
-            Ok(hello.node_version)
+            Ok(hello.runtime.version)
         })
         .await;
         match handshake_result {
-            Ok(Ok(node_version)) => {
-                let _ = host.node_version.set(node_version);
+            Ok(Ok(runtime_version)) => {
+                let _ = host.runtime_version.set(runtime_version);
                 Ok(host)
             }
             Ok(Err(reason)) => {

@@ -8,6 +8,84 @@
 > from the text that follows. Where they disagree, the newest "As built"
 > section and the code are current; the rest is the plan for later phases.
 
+## As built: Bun runtime (2026-09-29)
+
+Bun is now the default runtime for the host, Bun-first: `[extension_host]
+runtime = "auto" | "bun" | "node"`, default `auto`. It follows CURRENT_DECISIONS
+§26 and the 2026-09-29 Bun-vs-Node spike. The same embedded bundle runs on
+either runtime.
+
+- **Selection** (`dependencies::resolve_extension_host_runtime`). `auto` runs
+  each Bun candidate (the `[extension_host] bun` override, then `bun` on
+  `PATH`, then `$BUN_INSTALL/bin` or `~/.bun/bin`) and takes the first at or
+  above **1.4.0**, the validated floor. Without one it uses the Node ladder
+  (`^22.19 || >=24`) and records why Bun was not used. `bun` and `node` try
+  only that runtime and never fall back.
+- **Pinned for the process.** The first launch pins the runtime. Every
+  restart reuses it, and it is never resolved again, so a session cannot
+  switch runtime. The handshake also refuses a host whose `host/hello`
+  reports a different runtime than the one launched. `codewhale doctor`
+  prints the resolution (what, which version, where, and the fallback
+  reason). `/plugin` shows `running · pid … · bun 1.4.0 · …` and a
+  `runtime:` line with the summary and memory-cap posture.
+- **Protocol.** `host/hello.node_version` is replaced by
+  `runtime: {name: "bun" | "node", version}`, read from `process.versions.bun`
+  first (Bun emulates `process.versions.node`). The protocol integer stays 1:
+  the bundle and the core always ship together, and the corpus was updated
+  (`01`, `21`, `31`, `32`).
+- **Flags** (`supervisor::runtime_args`). Node keeps
+  `--max-old-space-size=256 --disable-proto=throw --no-addons`. Bun ignores
+  all three except `--no-addons`, so it gets
+  `--no-install --no-env-file --config=/dev/null --no-addons`. Bun otherwise
+  fetches a missing package from npm while plugin code runs, and loads
+  `.env` and `bunfig.toml` (which can preload code) from the working
+  directory. That directory is the host's writable data dir, so a plugin
+  could plant a preload for the next start. A host JS test proves
+  `--no-install` against a local recording registry. A control run without
+  the flag does contact it. No network is used.
+- **Module resolution** (`src/dsh/resolve-hooks.ts`). Bun has no
+  `module.registerHooks`, and its runtime `onResolve` is not called for bare
+  package names. So the Bun branch uses `Bun.plugin` in three pieces:
+  `build.module` serves each singleton by exact name. `onResolve` classifies
+  the subpaths Bun does pass it. `onLoad` refuses any file under a
+  `node_modules` copy of a peer (a second Cordis, a shipped
+  `@deepseek-ai/dsh-*`). A peer that is not installed at all is mapped from
+  Bun's `Cannot find package` to the same ``requires `X` `` error
+  (`explainImportError`).
+- **Native code** (`src/runtime.ts`). `process.dlopen` throws on both
+  runtimes. Bun will not let a plugin replace the builtin `bun:ffi`, but its
+  export object is shared by `import` and `require` and can be changed. Every
+  export becomes a throwing getter and the object is frozen, before any
+  plugin loads. `import … from 'bun:ffi'`, dynamic import and
+  `require('bun:ffi')` all fail. Seatbelt stays the outer boundary on macOS.
+  This is defense in depth: plugin code can still spawn processes, as it can
+  under Node.
+- **Memory cap** (1 GiB, both runtimes). On Linux, `RLIMIT_DATA` is set
+  between fork and exec, so the kernel fails an allocation past it. This was
+  measured in containers: Node 24 cannot create the host's watchdog Worker at
+  512 MiB, and Bun 1.4 aborts at startup at 256 MiB. Both run normally at
+  1 GiB. On macOS nothing unprivileged is enforceable (measured on macOS
+  26.1): `setrlimit(RLIMIT_DATA/RLIMIT_AS/RLIMIT_RSS)` returns `EINVAL`,
+  `memorystatus_control` jetsam limits return `EPERM`, and
+  `BUN_JSC_gcMaxHeapSize` / `BUN_JSC_forceRAMSize` let a probe grow past
+  3 GB. So the supervisor reads the host's resident size (`proc_pidinfo`) at
+  each heartbeat and kills the host past the cap. That enforcement lags by
+  up to one heartbeat interval and does not cover the plugins' own child
+  processes. **Windows has no cap yet**; a Job Object memory limit is the
+  obvious next step. Node's 256 MB heap flag still applies on every platform.
+- **Tests.** The host JS suite runs under `node --test` and `bun test`
+  (`npm run test:bun`). Each run also spawns the host on the runtime running
+  the suite. Two tests that matched V8 wording now accept JSC's too. CI adds a
+  Bun leg pinned to 1.4.0 and keeps the Node leg. Rust covers the selection
+  matrix, the per-runtime launch flags, the runtime-mismatch refusal, a Bun
+  end-to-end run with a crash restart that stays on Bun, and the memory cap on
+  both runtimes.
+
+Not done: DSH's own loader, HMR and inspector bridge stay Node-only (spike §2).
+The Codewhale host does not use them. Bun on Linux/Windows is unsandboxed
+exactly as Node is. The Rust CI job still runs the Rust integration tests on
+Node only; the Bun ones skip there unless `CODEWHALE_EXT_HOST_BUN_TESTS` is set.
+
 ## As built: phase 2a supervision (2026-09-29)
 
 The experimental host now has bounded lifecycle supervision. It uses the same

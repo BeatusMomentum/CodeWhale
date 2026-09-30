@@ -17,6 +17,7 @@ import { installResolveHooks } from './dsh/resolve-hooks.ts'
 import { ErrorCode, FrameDecoder, encodeFrame, PROTOCOL_VERSION, type Message } from './protocol.ts'
 import { RpcError, RpcPeer } from './rpc.ts'
 import { HostRoot, ownerStorage } from './root.ts'
+import { RUNTIME, denyNativeCode } from './runtime.ts'
 
 export const HOST_VERSION = '0.1.0'
 
@@ -47,6 +48,9 @@ installResolveHooks({
   'dsh-util-values': dshUtilValues as unknown as Record<string, unknown>,
   'dsh-tools': dshToolsCompat as unknown as Record<string, unknown>,
 })
+
+// 3a. No in-process native code for plugins: `process.dlopen`, and `bun:ffi` under Bun.
+denyNativeCode()
 
 function bundleDigest(): string {
   try {
@@ -185,5 +189,5 @@ rpc.notify('host/hello', {
   protocol: { min: PROTOCOL_VERSION, max: PROTOCOL_VERSION },
   host_version: HOST_VERSION,
   bundle_sha256: bundleDigest(),
-  node_version: process.versions.node,
+  runtime: RUNTIME,
 })

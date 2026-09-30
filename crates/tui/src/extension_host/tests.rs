@@ -22,6 +22,10 @@ use crate::plugins::activation::TestPolicyGuard;
 use crate::plugins::discovery::{DiscoveryConfig, discover_with_config};
 use crate::tools::spec::{ApprovalRequirement, ToolContext, ToolError, ToolSpec};
 
+/// The integration tests below run the host on Node unless they say
+/// otherwise; the Bun ones pin Bun (`bun_for_tests`).
+const NODE: crate::config::ExtensionHostRuntime = crate::config::ExtensionHostRuntime::Node;
+
 fn fixtures_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/extension_host")
 }
@@ -387,6 +391,7 @@ impl FixturePlugins {
 
     pub(crate) fn manager(&self, node: PathBuf) -> Arc<ExtensionHostManager> {
         Arc::new(ExtensionHostManager::new(ExtensionHostOptions {
+            runtime: NODE,
             node_override: Some(node),
             root: Some(self.root.clone()),
             ..Default::default()
@@ -1329,7 +1334,9 @@ fn fast_supervision() -> super::SupervisionOptions {
 
 fn supervised_manager(fixture: &FixturePlugins, node: PathBuf) -> Arc<ExtensionHostManager> {
     Arc::new(ExtensionHostManager::new(ExtensionHostOptions {
+        runtime: NODE,
         node_override: Some(node),
+        bun_override: None,
         root: Some(fixture.root.clone()),
         supervision: fast_supervision(),
     }))
@@ -1437,7 +1444,9 @@ async fn ordinary_exit_rejects_requests_from_a_drained_calls_waker() {
     let _policy = TestPolicyGuard::extension_host(true);
     let fixture = FixturePlugins::new(&["slow-tool"]).await;
     let manager = Arc::new(ExtensionHostManager::new(ExtensionHostOptions {
+        runtime: NODE,
         node_override: Some(node),
+        bun_override: None,
         root: Some(fixture.root.clone()),
         supervision: super::SupervisionOptions {
             heartbeat_interval: Duration::from_secs(60),
@@ -1982,7 +1991,9 @@ async fn replay_rechecks_persisted_disable_and_keeps_workspace_tools_separate() 
     let a = FixturePlugins::new(&["crash-tool"]).await;
     let b = FixturePlugins::new(&["clash-script"]).await;
     let manager = Arc::new(ExtensionHostManager::new(ExtensionHostOptions {
+        runtime: NODE,
         node_override: Some(node),
+        bun_override: None,
         root: Some(a.root.clone()),
         supervision: super::SupervisionOptions {
             restart_backoff: Duration::from_secs(1),
@@ -2066,4 +2077,291 @@ async fn explicit_retry_refreshes_same_byte_authority_without_inheriting_old_han
         "a healthy process need not restart"
     );
     manager.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// Runtime selection (Bun / Node) and the memory cap
+// ---------------------------------------------------------------------------
+
+/// A Bun >= 1.4.0 for the Bun integration tests, or `None` (skip) unless
+/// `CODEWHALE_EXT_HOST_BUN_TESTS` requires one.
+fn bun_for_tests(test: &str) -> Option<PathBuf> {
+    let resolution = crate::dependencies::resolve_extension_host_runtime(
+        crate::config::ExtensionHostRuntime::Bun,
+        None,
+        None,
+    );
+    match resolution.selected {
+        Some(runtime) => Some(runtime.path),
+        None if std::env::var_os("CODEWHALE_EXT_HOST_BUN_TESTS").is_some() => panic!(
+            "{test}: CODEWHALE_EXT_HOST_BUN_TESTS is set but {}",
+            resolution.failure()
+        ),
+        None => {
+            eprintln!("skipping {test}: {}", resolution.failure());
+            None
+        }
+    }
+}
+
+fn bun_manager(
+    fixture: &FixturePlugins,
+    bun: PathBuf,
+    supervision: super::SupervisionOptions,
+) -> Arc<ExtensionHostManager> {
+    Arc::new(ExtensionHostManager::new(ExtensionHostOptions {
+        runtime: crate::config::ExtensionHostRuntime::Bun,
+        node_override: None,
+        bun_override: Some(bun),
+        root: Some(fixture.root.clone()),
+        supervision,
+    }))
+}
+
+#[test]
+fn launch_plan_gives_each_runtime_its_own_flags() {
+    use crate::dependencies::{HostRuntime, HostRuntimeKind};
+    let home = tempfile::tempdir().unwrap();
+    let bundle = home.path().join("codewhale-extension-host.mjs");
+    for (kind, expected) in [
+        (
+            HostRuntimeKind::Bun,
+            vec!["--no-install", "--no-env-file", "--config=", "--no-addons"],
+        ),
+        (
+            HostRuntimeKind::Node,
+            vec![
+                "--max-old-space-size=256",
+                "--disable-proto=throw",
+                "--no-addons",
+            ],
+        ),
+    ] {
+        let runtime = HostRuntime {
+            kind,
+            path: PathBuf::from("/opt/runtime/bin").join(kind.name()),
+            version: (1, 4, 0),
+        };
+        let launch =
+            super::supervisor::plan_launch(&runtime, &bundle, home.path(), 1 << 30).unwrap();
+        // Wrapped or not, the runtime's flags come right before the bundle.
+        let at = launch
+            .args
+            .iter()
+            .position(|arg| Path::new(arg) == bundle)
+            .expect("bundle in argv");
+        let flags = &launch.args[at - expected.len()..at];
+        for (flag, want) in flags.iter().zip(&expected) {
+            assert!(flag.starts_with(want), "{kind:?}: {flags:?}");
+        }
+        assert_eq!(launch.runtime, runtime);
+        assert_eq!(launch.memory_cap, 1 << 30);
+        if kind == HostRuntimeKind::Bun {
+            assert!(
+                !launch
+                    .args
+                    .iter()
+                    .any(|arg| arg.starts_with("--max-old-space"))
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn handshake_refuses_a_host_on_a_different_runtime_than_launched() {
+    let Some(node) = node_for_tests("handshake_refuses_a_different_runtime") else {
+        return;
+    };
+    use crate::dependencies::{HostRuntime, HostRuntimeKind};
+    let home = tempfile::tempdir().unwrap();
+    let bundle = super::materialize_bundle(home.path()).unwrap();
+    let runtime = HostRuntime {
+        kind: HostRuntimeKind::Node,
+        path: node,
+        version: (24, 0, 0),
+    };
+    let mut launch =
+        super::supervisor::plan_launch(&runtime, &bundle, home.path(), 1 << 30).unwrap();
+    // The core believes it launched Bun; the host truthfully says Node.
+    launch.runtime.kind = HostRuntimeKind::Bun;
+    struct NoEvents;
+    impl super::supervisor::HostEvents for NoEvents {
+        fn register(&self, _: &protocol::RegisterParams) -> protocol::RegisterResult {
+            unreachable!()
+        }
+        fn unregister(&self, _: &protocol::UnregisterParams) {}
+        fn faulted(&self, _: &protocol::FaultedParams) {}
+        fn log(&self, _: &protocol::LogParams) {}
+        fn exited(&self, _: u64, _: String, _: String) {}
+    }
+    let error = match super::supervisor::HostProcess::spawn(
+        1,
+        &launch,
+        super::bundle_sha256(),
+        Arc::new(NoEvents),
+    )
+    .await
+    {
+        Ok(_) => panic!("a runtime mismatch must fail the handshake"),
+        Err(error) => error,
+    };
+    assert!(
+        error.contains("host reports runtime node but bun was launched"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn bun_host_runs_the_dsh_plugin_reports_bun_and_restarts_on_bun() {
+    let Some(bun) = bun_for_tests("bun_host_runs_the_dsh_plugin") else {
+        return;
+    };
+    let _policy = TestPolicyGuard::extension_host(true);
+    let fixture = FixturePlugins::new(&["dsh-workspace-deps"]).await;
+    let manager = bun_manager(&fixture, bun.clone(), fast_supervision());
+    let engine = manager.attach(fixture.registry());
+    engine.sync().await.unwrap();
+    let HostStatus::Ready {
+        runtime,
+        runtime_version,
+        ..
+    } = manager.status()
+    else {
+        panic!("{:?} {:?}", manager.status(), manager.diagnostics());
+    };
+    assert_eq!(runtime, "bun");
+    let banner = std::process::Command::new(&bun)
+        .arg("--version")
+        .output()
+        .unwrap();
+    assert_eq!(
+        runtime_version,
+        String::from_utf8_lossy(&banner.stdout).trim()
+    );
+    let summary = manager.runtime_summary().unwrap();
+    assert!(summary.starts_with("bun "), "{summary}");
+    assert!(summary.contains("(runtime = \"bun\")"), "{summary}");
+    let report = super::render_status(&manager);
+    assert!(
+        report.contains(&format!("· bun {runtime_version} ·")),
+        "{report}"
+    );
+    assert!(report.contains("runtime: bun "), "{report}");
+
+    let tool = host_tool(&engine, fixture.workspace(), "load_workspace_dependencies");
+    let context = ToolContext::new(fixture.workspace());
+    let result = tool.execute(json!({}), &context).await.unwrap();
+    assert!(result.success, "{}", result.content);
+    let payload: Value = serde_json::from_str(&result.content).unwrap();
+    assert_eq!(payload["pythonDistributions"]["numpy"], "2.1.0");
+
+    // A crash restarts on the pinned runtime; it is never re-resolved.
+    let pid = manager.host_pid().unwrap();
+    #[cfg(unix)]
+    assert!(
+        std::process::Command::new("kill")
+            .args(["-9", &pid.to_string()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    #[cfg(windows)]
+    assert!(
+        std::process::Command::new("taskkill")
+            .args(["/F", "/PID", &pid.to_string()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    wait_host(&manager, || {
+        manager.spawn_attempts() == 2 && matches!(manager.status(), HostStatus::Ready { .. })
+    })
+    .await;
+    assert!(matches!(
+        manager.status(),
+        HostStatus::Ready { runtime: "bun", .. }
+    ));
+    assert_eq!(manager.runtime_summary().unwrap(), summary);
+    manager.shutdown().await;
+}
+
+/// The cap holds for memory outside the JS heap too (Buffers), which Node's
+/// `--max-old-space-size` never bounded. Linux: the kernel fails the
+/// allocation at 1 GiB. macOS: the heartbeat check kills the host.
+async fn memory_hog_is_stopped(manager: Arc<ExtensionHostManager>, fixture: &FixturePlugins) {
+    let engine = manager.attach(fixture.registry());
+    engine.sync().await.unwrap();
+    let tool = host_tool(&engine, fixture.workspace(), "memory_hog");
+    let context = ToolContext::new(fixture.workspace());
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(60),
+        tool.execute(json!({"mib": 2048}), &context),
+    )
+    .await
+    .expect("the hog is stopped well before 60 s");
+    match &outcome {
+        Ok(result) => assert!(
+            !result.success,
+            "allocating 2 GiB must not succeed under the cap: {}",
+            result.content
+        ),
+        Err(ToolError::NotAvailable { message }) => {
+            assert!(message.contains("extension host exited"), "{message}");
+        }
+        Err(other) => panic!("unexpected error: {other:?}"),
+    }
+    if cfg!(target_os = "macos") {
+        assert!(
+            manager
+                .diagnostics()
+                .iter()
+                .any(|line| line.contains("exceeded its memory cap")),
+            "{:?}",
+            manager.diagnostics()
+        );
+    }
+    manager.shutdown().await;
+}
+
+fn memory_cap_supervision() -> super::SupervisionOptions {
+    super::SupervisionOptions {
+        // Linux cannot start either runtime under much less than 1 GiB of
+        // RLIMIT_DATA (see `HOST_MEMORY_CAP`); macOS checks resident size.
+        memory_cap: if cfg!(target_os = "macos") {
+            400 << 20
+        } else {
+            super::supervisor::HOST_MEMORY_CAP
+        },
+        ..fast_supervision()
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test]
+async fn memory_cap_stops_a_node_host() {
+    let Some(node) = node_for_tests("memory_cap_stops_a_node_host") else {
+        return;
+    };
+    let _policy = TestPolicyGuard::extension_host(true);
+    let fixture = FixturePlugins::new(&["memory-hog"]).await;
+    let manager = Arc::new(ExtensionHostManager::new(ExtensionHostOptions {
+        runtime: NODE,
+        node_override: Some(node),
+        bun_override: None,
+        root: Some(fixture.root.clone()),
+        supervision: memory_cap_supervision(),
+    }));
+    memory_hog_is_stopped(manager, &fixture).await;
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test]
+async fn memory_cap_stops_a_bun_host() {
+    let Some(bun) = bun_for_tests("memory_cap_stops_a_bun_host") else {
+        return;
+    };
+    let _policy = TestPolicyGuard::extension_host(true);
+    let fixture = FixturePlugins::new(&["memory-hog"]).await;
+    let manager = bun_manager(&fixture, bun, memory_cap_supervision());
+    memory_hog_is_stopped(manager, &fixture).await;
 }

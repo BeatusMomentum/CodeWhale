@@ -347,6 +347,18 @@ jobs:
           npm run typecheck
           npm run build
           git diff --exit-code -- dist
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          # The validated floor (`BUN_MIN_VERSION_FOR_EXTENSION_HOST`).
+          bun-version: 1.4.0
+      - name: Run extension host suites on Bun
+        # Bun is the host's default runtime; the same suites spawn the
+        # committed bundle under `bun test`, with Bun's launch flags. The
+        # Node leg above stays until Node support is dropped.
+        run: |
+          set -euo pipefail
+          cd crates/tui/extension-host
+          npm run test:bun
 
   vscode-extension:
     name: VS Code extension

@@ -148,7 +148,17 @@ pub struct HelloParams {
     pub protocol: ProtocolRange,
     pub host_version: String,
     pub bundle_sha256: String,
-    pub node_version: String,
+    /// The runtime actually running the host. Under Bun this comes from
+    /// `process.versions.bun`, not the Node version Bun emulates.
+    pub runtime: HelloRuntime,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HelloRuntime {
+    /// `bun` or `node`.
+    pub name: String,
+    pub version: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -316,7 +326,14 @@ pub fn parse_host_message(value: Value) -> Result<HostMessage, ProtocolError> {
         },
         "host/hello" => {
             expect_notification(&method, id)?;
-            HostMessage::Notification(HostNotification::Hello(params(&method, p)?))
+            let hello: HelloParams = params(&method, p)?;
+            if !matches!(hello.runtime.name.as_str(), "bun" | "node") {
+                return Err(perr(format!(
+                    "host/hello.runtime.name: unknown runtime `{}`",
+                    hello.runtime.name
+                )));
+            }
+            HostMessage::Notification(HostNotification::Hello(hello))
         }
         "host/ready" => {
             expect_notification(&method, id)?;

@@ -3881,7 +3881,33 @@ var ToolOutputError = class extends HarnessError {
 };
 
 // src/dsh/resolve-hooks.ts
-import { registerHooks } from "node:module";
+import * as nodeModule from "node:module";
+
+// src/runtime.ts
+import { createRequire } from "node:module";
+var RUNTIME = typeof process.versions.bun === "string" ? { name: "bun", version: process.versions.bun } : { name: "node", version: process.versions.node };
+function refuse(what) {
+  throw new Error(`${what} is not available to extensions`);
+}
+function denyNativeCode() {
+  Object.defineProperty(process, "dlopen", {
+    value: () => refuse("process.dlopen"),
+    writable: false,
+    configurable: false
+  });
+  if (RUNTIME.name !== "bun") return;
+  const ffi = createRequire(import.meta.url)("bun:ffi");
+  for (const name of Object.keys(ffi)) {
+    Object.defineProperty(ffi, name, {
+      get: () => refuse("`bun:ffi`"),
+      enumerable: true,
+      configurable: false
+    });
+  }
+  Object.freeze(ffi);
+}
+
+// src/dsh/resolve-hooks.ts
 var SCHEME = "codewhale-host:";
 var REGISTRY_KEY = /* @__PURE__ */ Symbol.for("codewhale.extension-host.modules");
 var SINGLETONS = {
@@ -3926,12 +3952,47 @@ function virtualSource(key, namespace) {
   if ("default" in namespace) lines.push("export default ns.default;");
   return lines.join("\n");
 }
+var PEER_PATH = /[\\/]node_modules[\\/]((?:@deepseek-ai[\\/](?:dsh-[^\\/]+|cordis(?:-[^\\/]+)?|schemastery|cosmokit))|cosmokit)[\\/]/;
+function explainImportError(error) {
+  const match = error instanceof Error ? /Cannot find package '([^']+)'/.exec(error.message) : null;
+  if (!match) return error;
+  try {
+    classifySpecifier(match[1]);
+  } catch (unsupported) {
+    return unsupported;
+  }
+  return error;
+}
+function installBunResolver(modules) {
+  const bun = globalThis.Bun;
+  bun.plugin({
+    name: "codewhale-host-modules",
+    setup(build) {
+      for (const [specifier, key] of Object.entries(SINGLETONS)) {
+        if (key in modules) build.module(specifier, () => ({ exports: modules[key], loader: "object" }));
+      }
+      build.onResolve({ filter: /^[^./]/ }, (args) => {
+        const key = classifySpecifier(args.path);
+        if (key !== null && !(key in modules)) throw new UnsupportedPeerError(args.path);
+        return void 0;
+      });
+      build.onLoad({ filter: PEER_PATH }, (args) => {
+        const match = PEER_PATH.exec(args.path);
+        throw new UnsupportedPeerError((match?.[1] ?? args.path).replaceAll("\\", "/"));
+      });
+    }
+  });
+}
 var installed = false;
 function installResolveHooks(modules) {
   if (installed) return;
   installed = true;
   globalThis[REGISTRY_KEY] = modules;
-  registerHooks({
+  if (RUNTIME.name === "bun") {
+    installBunResolver(modules);
+    return;
+  }
+  nodeModule.registerHooks({
     resolve(specifier, context, nextResolve) {
       const key = classifySpecifier(specifier);
       if (key !== null) {
@@ -4076,8 +4137,14 @@ var PARAMS = {
   // host → core
   "host/hello": {
     dir: "host",
-    required: { protocol: "object", host_version: "string", bundle_sha256: "string", node_version: "string" },
-    check: (p, strict) => checkShape("host/hello.protocol", p.protocol, { min: "u64", max: "u64" }, {}, strict)
+    required: { protocol: "object", host_version: "string", bundle_sha256: "string", runtime: "object" },
+    check: (p, strict) => {
+      checkShape("host/hello.protocol", p.protocol, { min: "u64", max: "u64" }, {}, strict);
+      checkShape("host/hello.runtime", p.runtime, { name: "string", version: "string" }, {}, strict);
+      if (p.runtime.name !== "bun" && p.runtime.name !== "node") {
+        throw new ProtocolError(`host/hello.runtime.name: unknown runtime \`${p.runtime.name}\``);
+      }
+    }
   },
   "host/ready": { dir: "host", required: {} },
   "registry/register": {
@@ -4444,7 +4511,9 @@ var HostRoot = class {
       if (digest !== params.entry.sha256) {
         throw new Error(`entry ${params.entry.path} changed after review (sha256 ${digest.slice(0, 12)}…)`);
       }
-      const module = await ownerStorage.run(owner, () => import(pathToFileURL(params.entry.path).href));
+      const module = await ownerStorage.run(owner, () => import(pathToFileURL(params.entry.path).href)).catch((error) => {
+        throw explainImportError(error);
+      });
       const plugin = pickPlugin(module);
       const missing = Object.keys(Inject.resolve(plugin.inject)).filter((name) => !PROVIDED_SERVICES.has(name));
       if (missing.length > 0) {
@@ -4607,6 +4676,7 @@ installResolveHooks({
   "dsh-util-values": lib_exports4,
   "dsh-tools": dsh_tools_compat_exports
 });
+denyNativeCode();
 function bundleDigest() {
   try {
     return createHash2("sha256").update(readFileSync(fileURLToPath(import.meta.url))).digest("hex");
@@ -4720,7 +4790,7 @@ rpc.notify("host/hello", {
   protocol: { min: PROTOCOL_VERSION, max: PROTOCOL_VERSION },
   host_version: HOST_VERSION,
   bundle_sha256: bundleDigest(),
-  node_version: process.versions.node
+  runtime: RUNTIME
 });
 export {
   HOST_VERSION

@@ -5528,6 +5528,52 @@ async fn run_doctor(
         }
     }
 
+    {
+        // The runtime the TypeScript extension host would use, resolved the
+        // same way the host launcher does (`[extension_host] runtime`).
+        let table = config.extension_host.clone().unwrap_or_default();
+        let expand = |path: Option<String>| {
+            path.map(|path| PathBuf::from(shellexpand::tilde(&path).as_ref()))
+        };
+        let resolution = crate::dependencies::resolve_extension_host_runtime(
+            table.runtime,
+            expand(table.node).as_deref(),
+            expand(table.bun).as_deref(),
+        );
+        let enabled = config
+            .features()
+            .enabled(crate::features::Feature::ExtensionHost);
+        let state = if enabled {
+            ""
+        } else {
+            " (unused: [features] extension_host is off)"
+        };
+        match resolution.selected {
+            Some(_) => {
+                println!(
+                    "  {} Extension host runtime: {}{state}",
+                    "✓".truecolor(aqua_r, aqua_g, aqua_b),
+                    resolution.summary(),
+                );
+                println!(
+                    "    {}",
+                    crate::extension_host::supervisor::memory_cap_posture(
+                        crate::extension_host::supervisor::HOST_MEMORY_CAP
+                    )
+                );
+            }
+            None => println!(
+                "  {} Extension host runtime: {}{state}",
+                if enabled {
+                    "✗".truecolor(red_r, red_g, red_b)
+                } else {
+                    "·".dimmed()
+                },
+                resolution.failure(),
+            ),
+        }
+    }
+
     match crate::dependencies::resolve_pandoc() {
         Some(_) => println!(
             "  {} pandoc: present → pandoc_convert tool registered",
@@ -8806,7 +8852,7 @@ fn load_structural_config_from_cli(cli: &Cli) -> Result<Config> {
 }
 
 /// Select the plugin activation policy (v3, or v4 with the experimental
-/// extension host) and the host's Node override, once per process, before
+/// extension host) and the host's runtime settings, once per process, before
 /// any plugin discovery. Later config reloads never flip either.
 fn install_extension_host_boot_config(config: &Config) {
     let enabled = config
@@ -8814,12 +8860,14 @@ fn install_extension_host_boot_config(config: &Config) {
         .enabled(crate::features::Feature::ExtensionHost);
     crate::plugins::activation::install_extension_host_policy(enabled);
     if enabled {
+        let table = config.extension_host.clone().unwrap_or_default();
+        let expand = |path: Option<String>| {
+            path.map(|path| PathBuf::from(shellexpand::tilde(&path).as_ref()))
+        };
         crate::extension_host::configure(crate::extension_host::ExtensionHostOptions {
-            node_override: config
-                .extension_host
-                .as_ref()
-                .and_then(|table| table.node.as_deref())
-                .map(|node| PathBuf::from(shellexpand::tilde(node).as_ref())),
+            runtime: table.runtime,
+            node_override: expand(table.node),
+            bun_override: expand(table.bun),
             root: None,
             ..Default::default()
         });

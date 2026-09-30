@@ -13,6 +13,7 @@ import { pathToFileURL } from 'node:url'
 import { Context, Inject, Service } from '@deepseek-ai/cordis'
 import { ErrorCode, type ContentBlockWire, type Json, type OwnerRef, type ToolResultWire } from './protocol.ts'
 import { RpcError, type RpcPeer } from './rpc.ts'
+import { explainImportError } from './dsh/resolve-hooks.ts'
 
 /** Context key carrying the owner record; inherited by every nested fiber. */
 export const OWNER = Symbol.for('codewhale.extension-host.owner')
@@ -246,7 +247,9 @@ export class HostRoot {
       if (digest !== params.entry.sha256) {
         throw new Error(`entry ${params.entry.path} changed after review (sha256 ${digest.slice(0, 12)}…)`)
       }
-      const module = await ownerStorage.run(owner, () => import(pathToFileURL(params.entry.path).href))
+      const module = await ownerStorage.run(owner, () => import(pathToFileURL(params.entry.path).href)).catch((error) => {
+        throw explainImportError(error)
+      })
       const plugin = pickPlugin(module)
       const missing = Object.keys(Inject.resolve(plugin.inject)).filter((name) => !PROVIDED_SERVICES.has(name))
       if (missing.length > 0) {
