@@ -36,8 +36,7 @@ impl Engine {
         message: String,
     ) {
         let _ = self
-            .tx_event
-            .send(Event::CompactionStarted { id, auto, message })
+            .send_event(Event::CompactionStarted { id, auto, message })
             .await;
     }
 
@@ -78,8 +77,7 @@ impl Engine {
         )
         .await;
         let _ = self
-            .tx_event
-            .send(Event::CompactionCompleted {
+            .send_event(Event::CompactionCompleted {
                 id,
                 auto,
                 message,
@@ -117,8 +115,7 @@ impl Engine {
         message: String,
     ) {
         let _ = self
-            .tx_event
-            .send(Event::CompactionCancelled { id, auto, message })
+            .send_event(Event::CompactionCancelled { id, auto, message })
             .await;
     }
 
@@ -143,8 +140,7 @@ impl Engine {
 
     pub(super) async fn emit_compaction_failed(&mut self, id: String, auto: bool, message: String) {
         let _ = self
-            .tx_event
-            .send(Event::CompactionFailed { id, auto, message })
+            .send_event(Event::CompactionFailed { id, auto, message })
             .await;
     }
 
@@ -227,8 +223,7 @@ impl Engine {
             let message = "Making room stopped before it started".to_string();
             self.emit_compaction_cancelled(id, false, message).await;
             let _ = self
-                .tx_event
-                .send(Event::TurnComplete {
+                .send_event(Event::TurnComplete {
                     usage: Usage::default(),
                     parent_route_usage: Usage::default(),
                     routed_usage_dropped_records: 0,
@@ -247,8 +242,7 @@ impl Engine {
             self.emit_compaction_failed(id, false, message.clone())
                 .await;
             let _ = self
-                .tx_event
-                .send(Event::error(ErrorEnvelope::fatal_auth(message)))
+                .send_event(Event::error(ErrorEnvelope::fatal_auth(message)))
                 .await;
             return;
         }
@@ -261,8 +255,7 @@ impl Engine {
             return;
         }
         let _ = self
-            .tx_event
-            .send(Event::RoutedTurnUsage {
+            .send_event(Event::RoutedTurnUsage {
                 usage: usage.clone(),
                 duration_ms: u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
                 first_token_ms: None,
@@ -287,12 +280,10 @@ impl Engine {
             self.emit_compaction_failed(id, false, message.clone())
                 .await;
             let _ = self
-                .tx_event
-                .send(Event::error(ErrorEnvelope::fatal_auth(message.clone())))
+                .send_event(Event::error(ErrorEnvelope::fatal_auth(message.clone())))
                 .await;
             let _ = self
-                .tx_event
-                .send(Event::TurnComplete {
+                .send_event(Event::TurnComplete {
                     usage: zero_usage,
                     parent_route_usage: Usage::default(),
                     routed_usage_dropped_records: 0,
@@ -342,8 +333,7 @@ impl Engine {
             )
             .await;
             let _ = self
-                .tx_event
-                .send(Event::TurnComplete {
+                .send_event(Event::TurnComplete {
                     usage: compaction_usage,
                     parent_route_usage: Usage::default(),
                     routed_usage_dropped_records: 0,
@@ -370,8 +360,7 @@ impl Engine {
                         )
                         .await;
                         let _ = self
-                            .tx_event
-                            .send(Event::TurnComplete {
+                            .send_event(Event::TurnComplete {
                                 usage: compaction_usage,
                                 parent_route_usage: Usage::default(),
                                 routed_usage_dropped_records: 0,
@@ -436,7 +425,7 @@ impl Engine {
                 );
                 self.emit_compaction_failed(id.clone(), false, message.clone())
                     .await;
-                let _ = self.tx_event.send(Event::status(message.clone())).await;
+                let _ = self.send_event(Event::status(message.clone())).await;
                 turn_status = TurnOutcomeStatus::Failed;
                 turn_error = Some(message);
             }
@@ -445,8 +434,7 @@ impl Engine {
         self.finish_compaction(&id);
 
         let _ = self
-            .tx_event
-            .send(Event::TurnComplete {
+            .send_event(Event::TurnComplete {
                 usage: compaction_usage,
                 parent_route_usage: Usage::default(),
                 routed_usage_dropped_records: 0,
@@ -650,7 +638,7 @@ impl Engine {
                 },
             )
             .await;
-            let _ = self.tx_event.send(Event::status(details)).await;
+            let _ = self.send_event(Event::status(details)).await;
             self.finish_compaction(&id);
             return true;
         }
@@ -675,7 +663,7 @@ impl Engine {
         };
         self.emit_compaction_failed(id.clone(), true, message.clone())
             .await;
-        let _ = self.tx_event.send(Event::status(message)).await;
+        let _ = self.send_event(Event::status(message)).await;
         self.finish_compaction(&id);
         false
     }

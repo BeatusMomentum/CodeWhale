@@ -24,6 +24,807 @@ use std::time::{Duration, Instant};
 use tempfile::tempdir;
 
 const WORKING_SET_SUMMARY_MARKER: &str = "## Repo Working Set";
+
+#[tokio::test]
+async fn event_capacity_cancel_before_admission_has_no_started_turn_and_keeps_classifier_cost() {
+    use crate::llm_client::mock::{MockLlmClient, canned};
+    let _cost = crate::cost_status::test_scope();
+    let workspace = tempdir().unwrap();
+    let config = Config::default();
+    let mock = Arc::new(MockLlmClient::new(vec![canned::simple_text_turn(
+        "must not run",
+    )]));
+    let mut engine_config = deterministic_engine_config(workspace.path());
+    engine_config.features.disable(Feature::Mcp);
+    let (mut engine, handle) = Engine::new_with_model_client(engine_config, &config, mock.clone());
+    let (tx, rx) = mpsc::channel(1);
+    engine.tx_event = tx;
+    let mut handle = handle;
+    handle.rx_event = Arc::new(RwLock::new(rx));
+    engine
+        .tx_event
+        .try_send(Event::status("existing idle receipt"))
+        .unwrap();
+    let mut op = external_user_message_op("not admitted", AppMode::Agent, &config);
+    let Op::SendMessage(spec) = &mut op else {
+        unreachable!()
+    };
+    spec.initial_routed_usage
+        .records
+        .push(crate::cost_status::RuntimeUsageRecord {
+            source_id: "event-capacity:classifier".into(),
+            usage: crate::cost_status::EffectiveRouteUsage {
+                route: crate::cost_status::EffectiveRouteEnvelope::capture(
+                    None,
+                    ApiProvider::Openai,
+                    "openai",
+                    "classifier",
+                    None,
+                    chrono::Utc::now(),
+                ),
+                usage: Usage {
+                    input_tokens: 7,
+                    output_tokens: 3,
+                    ..Usage::default()
+                },
+            },
+        });
+    let controls = Arc::clone(&engine.turn_controls);
+    handle.send(op).await.unwrap();
+    let task = tokio::spawn(engine.run());
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if controls.lock().unwrap().active.is_some() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("queued op enters the existing control scope");
+    handle.cancel();
+    // The oneshot snapshot can settle while the event receiver remains full.
+    let snapshot = tokio::time::timeout(Duration::from_secs(2), handle.get_session_snapshot())
+        .await
+        .expect("cancel releases admission reservation")
+        .unwrap();
+    assert!(
+        snapshot.messages.is_empty(),
+        "no session mutation before admission"
+    );
+    assert_eq!(mock.call_count(), 0);
+    assert!(controls.lock().unwrap().active.is_none());
+    let cost = crate::cost_status::drain();
+    assert!(
+        cost.usage_source_fingerprints
+            .contains(&crate::cost_status::usage_source_fingerprint(
+                "event-capacity:classifier"
+            ),),
+        "already billed classifier work remains accounted"
+    );
+    let mut events = handle.rx_event.write().await;
+    assert!(matches!(events.try_recv(), Ok(Event::Status { .. })));
+    assert!(
+        events.try_recv().is_err(),
+        "unadmitted work has no fabricated terminal event"
+    );
+    drop(events);
+    handle.send(Op::Shutdown).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), task)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn event_capacity_admitted_full_channel_settles_once_with_partial_usage_without_drain() {
+    use crate::llm_client::mock::{MockLlmClient, canned};
+    let _cost = crate::cost_status::test_scope();
+    let workspace = tempdir().unwrap();
+    let config = Config::default();
+    let mock = Arc::new(MockLlmClient::new(Vec::new()));
+    let mut engine_config = deterministic_engine_config(workspace.path());
+    engine_config.features.disable(Feature::Mcp);
+    let (engine, handle) = Engine::new_with_model_client(engine_config, &config, mock.clone());
+    let tx = engine.tx_event.clone();
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let filled = Arc::clone(&entered);
+    mock.push_factory(move |_| {
+        while tx.try_send(Event::status("backpressure receipt")).is_ok() {}
+        filled.notify_one();
+        vec![
+            canned::message_start("billed-before-cancel"),
+            canned::message_delta(
+                "end_turn",
+                Some(Usage {
+                    input_tokens: 11,
+                    output_tokens: 5,
+                    ..Usage::default()
+                }),
+            ),
+            canned::text_block_start(0),
+            canned::text_delta(0, "must not render after cancellation"),
+            canned::message_stop(),
+        ]
+    });
+    let controls = Arc::clone(&engine.turn_controls);
+    let task = tokio::spawn(engine.run());
+    handle
+        .send(external_user_message_op(
+            "admitted",
+            AppMode::Agent,
+            &config,
+        ))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), entered.notified())
+        .await
+        .unwrap();
+    handle.cancel();
+    let snapshot = tokio::time::timeout(Duration::from_secs(2), handle.get_session_snapshot())
+        .await
+        .expect("admitted cancellation settles before any event drain")
+        .unwrap();
+    assert_eq!(mock.call_count(), 1);
+    assert_eq!(
+        snapshot.total_tokens, 16,
+        "known partial provider usage survives cancellation"
+    );
+    assert!(controls.lock().unwrap().active.is_none());
+    let mut events = handle.rx_event.write().await;
+    let mut started = 0;
+    let mut completed = 0;
+    let mut terminal_was_last = false;
+    while let Ok(event) = events.try_recv() {
+        assert!(
+            !terminal_was_last,
+            "completion stays after prior accepted observations"
+        );
+        match event {
+            Event::TurnStarted { .. } => started += 1,
+            Event::TurnComplete {
+                status,
+                usage,
+                parent_route_usage,
+                error,
+                ..
+            } => {
+                completed += 1;
+                terminal_was_last = true;
+                assert_eq!(status, TurnOutcomeStatus::Interrupted);
+                assert!(
+                    error.is_none(),
+                    "cancellation is not a provider failure: {error:?}"
+                );
+                assert_eq!((usage.input_tokens, usage.output_tokens), (11, 5));
+                assert_eq!(usage, parent_route_usage);
+            }
+            Event::MessageDelta { content, .. } => assert!(!content.contains("must not render")),
+            _ => {}
+        }
+    }
+    assert_eq!((started, completed), (1, 1));
+    assert!(terminal_was_last);
+    drop(events);
+    handle.send(Op::Shutdown).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), task)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn event_capacity_invalid_images_release_queued_control_and_keep_classifier_receipt() {
+    use crate::llm_client::mock::MockLlmClient;
+    for full in [false, true] {
+        let _cost = crate::cost_status::test_scope();
+        let workspace = tempdir().unwrap();
+        let config = Config::default();
+        let mock = Arc::new(MockLlmClient::new(Vec::new()));
+        let mut engine_config = deterministic_engine_config(workspace.path());
+        engine_config.features.disable(Feature::Mcp);
+        let (engine, handle) = Engine::new_with_model_client(engine_config, &config, mock.clone());
+        if full {
+            while engine.tx_event.try_send(Event::status("occupied")).is_ok() {}
+        }
+        let controls = Arc::clone(&engine.turn_controls);
+        let mut op = external_user_message_op("invalid attachment", AppMode::Agent, &config);
+        let Op::SendMessage(spec) = &mut op else {
+            unreachable!()
+        };
+        spec.images
+            .push(codewhale_protocol::runtime::RuntimeImageInput {
+                mime: "image/png".into(),
+                data_base64: "invalid@base64".into(),
+            });
+        spec.initial_routed_usage
+            .records
+            .push(crate::cost_status::RuntimeUsageRecord {
+                source_id: "event-capacity:invalid-image-classifier".into(),
+                usage: crate::cost_status::EffectiveRouteUsage {
+                    route: crate::cost_status::EffectiveRouteEnvelope::capture(
+                        None,
+                        ApiProvider::Openai,
+                        "openai",
+                        "classifier",
+                        None,
+                        chrono::Utc::now(),
+                    ),
+                    usage: Usage {
+                        input_tokens: 7,
+                        output_tokens: 3,
+                        ..Usage::default()
+                    },
+                },
+            });
+        handle.send(op).await.unwrap();
+        let task = tokio::spawn(engine.run());
+        if full {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if controls.lock().unwrap().active.is_some() {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            handle.cancel();
+        }
+        let snapshot = tokio::time::timeout(Duration::from_secs(2), handle.get_session_snapshot())
+            .await
+            .expect("rejected input releases the current control")
+            .unwrap();
+        assert!(snapshot.messages.is_empty());
+        assert_eq!(mock.call_count(), 0);
+        assert!(controls.lock().unwrap().active.is_none());
+        let cost = crate::cost_status::drain();
+        assert!(cost.usage_source_fingerprints.contains(
+            &crate::cost_status::usage_source_fingerprint(
+                "event-capacity:invalid-image-classifier"
+            ),
+        ));
+        let mut events = handle.rx_event.write().await;
+        let mut invalid_errors = 0;
+        while let Ok(event) = events.try_recv() {
+            assert!(!matches!(
+                event,
+                Event::TurnStarted { .. } | Event::TurnComplete { .. }
+            ));
+            if let Event::Error { envelope, .. } = event {
+                assert_eq!(envelope.code, "image_input_invalid");
+                invalid_errors += 1;
+            }
+        }
+        assert_eq!(
+            invalid_errors,
+            usize::from(!full),
+            "a cancelled full-channel rejection is not fabricated as delivered"
+        );
+        drop(events);
+        handle.send(Op::Shutdown).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn event_capacity_releases_all_admitted_senders_and_keeps_idle_receipts_lossless() {
+    let workspace = tempdir().unwrap();
+    let (mut engine, _handle) = Engine::new(
+        deterministic_engine_config(workspace.path()),
+        &Config::default(),
+    );
+    let (tx, mut rx) = mpsc::channel(1);
+    engine.tx_event = tx;
+    engine.tx_event.try_send(Event::status("occupied")).unwrap();
+    let turn = engine.begin_turn_control();
+    let mut senders =
+        Box::pin(futures_util::future::join_all((0..8).map(|_| {
+            engine.send_event(Event::status("admitted observation"))
+        })));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), &mut senders)
+            .await
+            .is_err()
+    );
+    engine.cancel_token.cancel();
+    let outcomes = tokio::time::timeout(Duration::from_secs(1), &mut senders)
+        .await
+        .unwrap();
+    assert_eq!(outcomes, vec![Err(streaming::EventSendError::Cancelled); 8]);
+    drop(senders);
+    assert!(matches!(rx.try_recv(), Ok(Event::Status { .. })));
+    // A cancelled turn still delivers its usage/status receipts when they
+    // fit immediately. The stream suffix remains strictly cancelled.
+    engine
+        .send_event(Event::status(
+            "cancelled turn receipt with available capacity",
+        ))
+        .await
+        .unwrap();
+    assert!(
+        matches!(rx.try_recv(), Ok(Event::Status { message, .. }) if message == "cancelled turn receipt with available capacity")
+    );
+    assert!(
+        !engine
+            .send_stream_event(Event::status("forbidden stream suffix"))
+            .await
+    );
+    assert!(rx.try_recv().is_err());
+    engine
+        .tx_event
+        .try_send(Event::status("occupied before idle receipt"))
+        .unwrap();
+    drop(turn);
+    let mut idle = Box::pin(engine.send_event(Event::status("idle receipt after cancelled turn")));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), &mut idle)
+            .await
+            .is_err()
+    );
+    assert!(matches!(rx.try_recv(), Ok(Event::Status { .. })));
+    tokio::time::timeout(Duration::from_secs(1), &mut idle)
+        .await
+        .unwrap()
+        .unwrap();
+    drop(idle);
+    assert!(
+        matches!(rx.try_recv(), Ok(Event::Status { message, .. }) if message == "idle receipt after cancelled turn")
+    );
+    assert!(rx.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn event_capacity_nested_vm_fanout_is_bounded_per_program_not_per_turn() {
+    struct Counter(std::sync::atomic::AtomicUsize);
+    #[async_trait::async_trait]
+    impl codewhale_workflow_js::ToolInvoker for Counter {
+        async fn invoke(
+            &self,
+            _: codewhale_workflow_js::ToolCallRequest,
+        ) -> Result<codewhale_workflow_js::ToolCallResponse, codewhale_workflow_js::DriverError>
+        {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            tokio::task::yield_now().await;
+            Ok(codewhale_workflow_js::ToolCallResponse {
+                ok: true,
+                result: json!(null),
+            })
+        }
+    }
+    let invoker = Arc::new(Counter(std::sync::atomic::AtomicUsize::new(0)));
+    for program in 1..=2 {
+        let result = codewhale_workflow_js::WorkflowVm::new().run_tools_script(
+            r#"const calls = await Promise.allSettled(Array.from({length:256}, () => tools.call('read', {})));
+               return {ok:calls.filter(x=>x.status==='fulfilled').length,
+                       rejected:calls.filter(x=>x.status==='rejected' && x.reason.kind==='admission').length};"#,
+            json!(null),
+            Arc::new(codewhale_workflow_js::testing::FakeDriver::new()),
+            invoker.clone(), codewhale_workflow_js::WorkflowRunCancel::new(),
+        ).await.unwrap();
+        assert_eq!(result, json!({"ok":50,"rejected":206}));
+        assert_eq!(
+            invoker.0.load(std::sync::atomic::Ordering::SeqCst),
+            50 * program
+        );
+    }
+}
+
+#[tokio::test]
+async fn event_capacity_admitted_user_shell_cancels_before_side_effect_and_settles_without_drain() {
+    let workspace = tempdir().unwrap();
+    let marker = workspace.path().join("shell-must-not-start.txt");
+    let mut engine_config = deterministic_engine_config(workspace.path());
+    engine_config.features.disable(Feature::Mcp);
+    let (engine, handle) = Engine::new(engine_config, &Config::default());
+    // Leave precisely the two lifecycle slots free. TurnStarted fills one;
+    // the reserved terminal owns the other. The next tool observation must
+    // wait before the human-provenance command can reach its executor.
+    for _ in 0..engine.tx_event.max_capacity() - 2 {
+        engine
+            .tx_event
+            .try_send(Event::status("prior receipt"))
+            .unwrap();
+    }
+    let controls = Arc::clone(&engine.turn_controls);
+    handle
+        .send(Op::RunShellCommand {
+            command: format!("echo must-not-run > \"{}\"", marker.display()),
+            mode: AppMode::Agent,
+            allow_shell: true,
+            trust_mode: true,
+            auto_approve: true,
+            approval_mode: ApprovalMode::Bypass,
+        })
+        .await
+        .unwrap();
+    let task = tokio::spawn(engine.run());
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if controls.lock().unwrap().active.is_some() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    handle.cancel();
+    tokio::time::timeout(Duration::from_secs(2), handle.get_session_snapshot())
+        .await
+        .expect("shell cancellation settles before any event drain")
+        .unwrap();
+    assert!(
+        !marker.exists(),
+        "cancellation preserves the execution gate"
+    );
+    assert!(controls.lock().unwrap().active.is_none());
+    let mut events = handle.rx_event.write().await;
+    let mut started = 0;
+    let mut completed = 0;
+    let mut terminal_was_last = false;
+    while let Ok(event) = events.try_recv() {
+        assert!(!terminal_was_last);
+        match event {
+            Event::TurnStarted { .. } => started += 1,
+            Event::TurnComplete { status, usage, .. } => {
+                completed += 1;
+                terminal_was_last = true;
+                assert_eq!(status, TurnOutcomeStatus::Interrupted);
+                assert_eq!(usage, Usage::default());
+            }
+            _ => {}
+        }
+    }
+    assert_eq!((started, completed), (1, 1));
+    assert!(terminal_was_last);
+    drop(events);
+    handle.send(Op::Shutdown).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), task)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn event_capacity_cancelled_repl_child_keeps_unknown_cost_and_discards_kernel() {
+    use crate::llm_client::mock::{MockLlmClient, canned};
+    struct ReplClient {
+        inner: MockLlmClient,
+        child_entered: Arc<tokio::sync::Notify>,
+        child_dropped: Arc<std::sync::atomic::AtomicBool>,
+    }
+    #[async_trait::async_trait]
+    impl crate::core::model_client::ModelClient for ReplClient {
+        fn provider_name(&self) -> &str {
+            "backpressure-repl-fixture"
+        }
+        fn model(&self) -> &str {
+            "mock-model"
+        }
+        async fn create_message(
+            &self,
+            _: codewhale_models::MessageRequest,
+        ) -> anyhow::Result<codewhale_models::MessageResponse> {
+            let _drop = DropSignal(Arc::clone(&self.child_dropped));
+            self.child_entered.notify_one();
+            std::future::pending().await
+        }
+        async fn create_message_stream(
+            &self,
+            request: codewhale_models::MessageRequest,
+        ) -> anyhow::Result<crate::llm_client::StreamEventBox> {
+            crate::core::model_client::ModelClient::create_message_stream(&self.inner, request)
+                .await
+        }
+        async fn health_check(&self) -> anyhow::Result<bool> {
+            Ok(true)
+        }
+    }
+    let _cost = crate::cost_status::test_scope();
+    let workspace = tempdir().unwrap();
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut response = canned::simple_text_turn(
+        "```repl\nchild = sub_query('hang until cancelled')\nfinalize(child)\n```",
+    );
+    for event in &mut response {
+        if let codewhale_models::StreamEvent::MessageDelta { usage, .. } = event {
+            *usage = Some(Usage {
+                input_tokens: 11,
+                output_tokens: 5,
+                ..Usage::default()
+            });
+        }
+    }
+    let client = Arc::new(ReplClient {
+        inner: MockLlmClient::new(vec![response]),
+        child_entered: Arc::clone(&entered),
+        child_dropped: Arc::clone(&dropped),
+    });
+    let (mut engine, handle) = Engine::new_with_model_client(
+        deterministic_engine_config(workspace.path()),
+        &Config::default(),
+        client.clone(),
+    );
+    engine.session.auto_approve = true;
+    engine.session.add_message(Message {
+        role: Role::User,
+        content: vec![ContentBlock::Text {
+            text: "run cancellable REPL".into(),
+            cache_control: None,
+        }],
+    });
+    let registry = crate::tools::ToolRegistry::new(crate::tools::ToolContext::new(
+        workspace.path().to_owned(),
+    ));
+    let policy = test_tool_surface(
+        &engine,
+        registry,
+        Some(vec![catalog_tool(CODE_EXECUTION_TOOL_NAME)]),
+        AppMode::Agent,
+    );
+    let turn_guard = engine.begin_turn_control();
+    let tx = engine.tx_event.clone();
+    let mut turn = TurnContext::new(4);
+    let mut run = Box::pin(engine.run_turn(&mut turn, policy, None, None));
+    tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::select! {
+            result = &mut run => panic!("REPL did not enter the child provider request: {result:?}"),
+            () = entered.notified() => {},
+        }
+    }).await.expect("actual Python kernel dispatches the pending child request");
+    while tx
+        .try_send(Event::status("full during nested REPL"))
+        .is_ok()
+    {}
+    handle.cancel();
+    let (status, error) = tokio::time::timeout(Duration::from_secs(2), &mut run)
+        .await
+        .expect("cancel drops the pending REPL round even with a full queue");
+    drop(run);
+    assert_eq!(status, TurnOutcomeStatus::Interrupted, "{error:?}");
+    assert!(error.is_none());
+    assert!(
+        dropped.load(std::sync::atomic::Ordering::SeqCst),
+        "nested provider future is released"
+    );
+    assert!(
+        engine.repl_kernel.is_none(),
+        "a cancelled round cannot preserve an executing process"
+    );
+    assert_eq!((turn.usage.input_tokens, turn.usage.output_tokens), (11, 5));
+    let cost = crate::cost_status::drain();
+    assert!(
+        cost.unpriced_reasons
+            .contains("provider_success_missing_usage"),
+        "pending child usage stays unknown, never zero"
+    );
+    assert_eq!(
+        client.inner.call_count(),
+        1,
+        "no next root provider request after cancellation"
+    );
+    drop(turn_guard);
+}
+#[tokio::test]
+async fn event_capacity_cancelled_parallel_tool_keeps_completed_span_and_call_when_available() {
+    use crate::llm_client::mock::{MockLlmClient, canned};
+    use crate::tools::spec::{
+        ApprovalRequirement, PreparedToolCall, ResourceClaim, ToolCapability, ToolSpec,
+    };
+    use codewhale_protocol::engine_owner::OwnerOperationOutcome;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct CompleteThenCancel {
+        cancel: tokio_util::sync::CancellationToken,
+        tx: mpsc::Sender<Event>,
+        fill_queue: bool,
+        executed: Arc<AtomicUsize>,
+    }
+    #[async_trait::async_trait]
+    impl ToolSpec for CompleteThenCancel {
+        // Registered under the canonical read identity so the engine's
+        // central resource authority (not this fixture) grants the disjoint
+        // ReadPath claims that form one real parallel chunk.
+        fn name(&self) -> &str {
+            "read_file"
+        }
+        fn description(&self) -> &str {
+            "Finish an observed operation before firing its turn cancellation token."
+        }
+        fn input_schema(&self) -> Value {
+            json!({"type": "object"})
+        }
+        fn capabilities(&self) -> Vec<ToolCapability> {
+            vec![ToolCapability::ReadOnly]
+        }
+        fn supports_parallel(&self) -> bool {
+            true
+        }
+        fn prepare(
+            &self,
+            input: Value,
+            context: &ToolContext,
+        ) -> Result<PreparedToolCall, ToolError> {
+            let path = input["path"].as_str().expect("fixture path");
+            Ok(PreparedToolCall {
+                name: self.name().to_string(),
+                description: self.description().to_string(),
+                read_only: true,
+                supports_parallel: true,
+                starts_detached: false,
+                approval: ApprovalRequirement::Auto,
+                // Replaced by `registered_resource_claims`; kept honest anyway.
+                resources: vec![ResourceClaim::ReadPath(context.workspace.join(path))],
+                input,
+            })
+        }
+        async fn execute(&self, _: Value, _: &ToolContext) -> Result<ToolResult, ToolError> {
+            self.executed.fetch_add(1, Ordering::SeqCst);
+            if self.fill_queue {
+                while self
+                    .tx
+                    .try_send(Event::status("full at tool completion"))
+                    .is_ok()
+                {}
+            }
+            self.cancel.cancel();
+            Ok(ToolResult::success("completed before cancellation"))
+        }
+    }
+
+    for fill_queue in [false, true] {
+        let workspace = tempdir().unwrap();
+        for path in ["one", "two"] {
+            std::fs::write(workspace.path().join(path), path).unwrap();
+        }
+        let mock = Arc::new(MockLlmClient::new(vec![
+            tool_batch_turn(&[
+                ("one", "read_file", r#"{"path":"one"}"#),
+                ("two", "read_file", r#"{"path":"two"}"#),
+            ]),
+            canned::simple_text_turn("must not run after cancellation"),
+        ]));
+        let (mut engine, handle) = Engine::new_with_model_client(
+            deterministic_engine_config(workspace.path()),
+            &Config::default(),
+            mock.clone(),
+        );
+        let turn_guard = engine.begin_turn_control();
+        let executed = Arc::new(AtomicUsize::new(0));
+        let mut registry = crate::tools::ToolRegistry::new(ToolContext::new(workspace.path()));
+        registry.register(Arc::new(CompleteThenCancel {
+            cancel: engine.cancel_token.clone(),
+            tx: engine.tx_event.clone(),
+            fill_queue,
+            executed: executed.clone(),
+        }));
+        let tools = Some(registry.to_api_tools_with_cache(true));
+        let policy = test_tool_surface(&engine, registry, tools, AppMode::Agent);
+        let mut turn = TurnContext::new(4);
+        let (status, error) = tokio::time::timeout(
+            Duration::from_secs(2),
+            engine.run_turn(&mut turn, policy, None, None),
+        )
+        .await
+        .expect("actual parallel tool completion cannot park on a full cancelled queue");
+        assert_eq!(status, TurnOutcomeStatus::Interrupted, "{error:?}");
+        assert!(error.is_none());
+        assert_eq!(
+            executed.load(Ordering::SeqCst),
+            1,
+            "the peer never executes"
+        );
+        assert_eq!(
+            mock.call_count(),
+            1,
+            "no provider continuation after cancellation"
+        );
+        let mut rx = handle.rx_event.write().await;
+        let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(events.iter().any(|event| matches!(event,
+            Event::Status { message } if message == "Executing 2 read-only tools in 1 parallel chunk(s)"
+        )), "fixture must exercise one actual two-tool parallel chunk");
+        let starts: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::OperationActivityStarted {
+                    span_id,
+                    activity_kind,
+                } => Some((span_id, activity_kind)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(starts.len(), 1, "one actual tool activity was admitted");
+        let completed: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::OperationActivityCompleted {
+                    span_id,
+                    activity_kind,
+                    outcome,
+                } => Some((span_id, activity_kind, outcome)),
+                _ => None,
+            })
+            .collect();
+        let calls: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::ToolCallComplete {
+                    id,
+                    model_call,
+                    result,
+                    ..
+                } => Some((id, model_call, result)),
+                _ => None,
+            })
+            .collect();
+        if fill_queue {
+            assert!(
+                completed.is_empty() && calls.is_empty(),
+                "cancelled full waits release without inventing delivery"
+            );
+        } else {
+            assert_eq!(
+                completed.len(),
+                1,
+                "preserve the completed activity after cancellation"
+            );
+            assert_eq!(completed[0].0, starts[0].0, "retain the span relationship");
+            assert_eq!(completed[0].1, starts[0].1);
+            assert_eq!(*completed[0].2, OwnerOperationOutcome::Succeeded);
+            assert_eq!(
+                calls.len(),
+                2,
+                "completed call and cancelled peer both settle exactly once"
+            );
+            let succeeded: Vec<_> = calls
+                .iter()
+                .filter(|(_, _, result)| result.as_ref().is_ok_and(|result| result.success))
+                .collect();
+            assert_eq!(succeeded.len(), 1);
+            let cancelled_peer = calls
+                .iter()
+                .find(|(_, _, result)| !result.as_ref().is_ok_and(|result| result.success))
+                .expect("cancelled peer has its own completion");
+            let peer = cancelled_peer
+                .2
+                .as_ref()
+                .expect("legacy cancelled peer result");
+            assert_eq!(peer.metadata.as_ref().unwrap()["cancelled"], true);
+            assert_eq!(peer.metadata.as_ref().unwrap()["cleanup_confirmed"], false);
+            assert_eq!(
+                succeeded[0].2.as_ref().unwrap().content,
+                "completed before cancellation"
+            );
+            assert!(
+                starts[0].0.starts_with(&format!("{}#", succeeded[0].0)),
+                "span retains its completed execution identity"
+            );
+            let provider_ids: HashSet<_> = calls
+                .iter()
+                .map(|(_, model_call, _)| model_call.as_ref().unwrap().provider_id.as_str())
+                .collect();
+            assert_eq!(provider_ids, HashSet::from(["one", "two"]));
+            let call_starts: HashSet<_> = events
+                .iter()
+                .filter_map(|event| match event {
+                    Event::ToolCallStarted { id, .. } => Some(id),
+                    _ => None,
+                })
+                .collect();
+            assert!(calls.iter().all(|(id, _, _)| call_starts.contains(id)));
+        }
+        drop(rx);
+        drop(turn_guard);
+    }
+}
+
 const REPRESENTATIVE_FIXTURE_ID: &str = "representative-v1";
 const REPRESENTATIVE_PROJECT_AUTHORITY: &str = "REPRESENTATIVE_PROJECT_AUTHORITY";
 const REPRESENTATIVE_PROJECT_AUTHORITY_BODY: &str = concat!(
@@ -22460,6 +23261,7 @@ async fn dropped_operation_span_completes_as_cancelled() {
         tx_event,
         "call-x",
         OwnerActivityKind::Editing,
+        None,
     )
     .await;
     drop(span);

@@ -24,18 +24,19 @@ fn inherited_interactive_shell_refusal(tool_name: &str, interactive: bool) -> Op
         .map(|message| ToolError::execution_failed(message.to_string()))
 }
 
-/// Pairs one `OperationActivityStarted` with exactly one
-/// `OperationActivityCompleted`.
+/// Pairs an observed `OperationActivityStarted` with at most one completion.
 ///
 /// The turn loop drops an in-flight tool future when the user cancels
 /// (`tokio::select!` on the cancel token, or `drop(tool_tasks)` for a parallel
 /// batch), so a Completed sent inline after the await would never be sent.
 /// Dropping an unfinished span sends `Completed { Cancelled }` with
 /// `try_send`: best effort, like the other guards here, because `Drop` cannot
-/// await a full channel.
+/// await a full channel. Cancellation may release a completion parked on a
+/// full queue; the turn's reserved terminal observation settles its lifecycle.
 pub(super) struct OperationSpanGuard {
     tx: mpsc::Sender<Event>,
     span: Option<(String, codewhale_protocol::engine_owner::OwnerActivityKind)>,
+    cancel: Option<CancellationToken>,
 }
 
 impl OperationSpanGuard {
@@ -52,33 +53,48 @@ impl OperationSpanGuard {
         tx: mpsc::Sender<Event>,
         call_id: &str,
         activity_kind: codewhale_protocol::engine_owner::OwnerActivityKind,
+        cancel: Option<CancellationToken>,
     ) -> Self {
         let span_id = Self::span_id(call_id);
-        // `Sender::send` is cancel safe: if this future is dropped the event
+        // Reservation is cancel safe: if this future is dropped the event
         // was either sent or not, and the guard is armed only once it was.
-        let sent = tx
-            .send(Event::OperationActivityStarted {
-                span_id: span_id.clone(),
-                activity_kind,
-            })
-            .await
-            .is_ok();
+        let sent = match super::streaming::reserve_event_capacity(
+            &tx,
+            cancel.as_ref(),
+            super::streaming::EventReservationPolicy::Strict,
+        )
+        .await
+        {
+            Ok(permit) => {
+                permit.send(Event::OperationActivityStarted {
+                    span_id: span_id.clone(),
+                    activity_kind,
+                });
+                true
+            }
+            Err(_) => false,
+        };
         Self {
             tx,
             span: sent.then_some((span_id, activity_kind)),
+            cancel,
         }
     }
 
     async fn complete(mut self, outcome: codewhale_protocol::engine_owner::OwnerOperationOutcome) {
-        if let Some((span_id, activity_kind)) = self.span.take() {
-            let _ = self
-                .tx
-                .send(Event::OperationActivityCompleted {
-                    span_id,
-                    activity_kind,
-                    outcome,
-                })
-                .await;
+        if let Some((span_id, activity_kind)) = self.span.take()
+            && let Ok(permit) = super::streaming::reserve_event_capacity(
+                &self.tx,
+                self.cancel.as_ref(),
+                super::streaming::EventReservationPolicy::Receipt,
+            )
+            .await
+        {
+            permit.send(Event::OperationActivityCompleted {
+                span_id,
+                activity_kind,
+                outcome,
+            });
         }
     }
 }
@@ -161,13 +177,11 @@ impl Drop for ToolHeartbeatGuard {
 /// wheel scrolls the host terminal instead of the transcript, and the TUI
 /// renders at the bottom of cooked-mode output.
 ///
-/// `Drop` runs synchronously and can't await, so we first use `try_send` on a
-/// **clone of the event channel** to push `ResumeEvents` non-blockingly. If the
-/// channel is full we enqueue the resume on the active Tokio runtime instead of
-/// dropping it; otherwise a burst of engine events can strand the UI in the
-/// paused terminal state.
+/// Reserve the matching resume before pausing. `Drop` consumes that permit
+/// synchronously, including on cancellation and a full channel. No detached
+/// sender can outlive the tool or compete with the turn's terminal event.
 pub(super) struct InteractiveTerminalGuard {
-    tx: Option<mpsc::Sender<Event>>,
+    resume: Option<(mpsc::Sender<Event>, mpsc::OwnedPermit<Event>)>,
 }
 
 impl InteractiveTerminalGuard {
@@ -176,87 +190,70 @@ impl InteractiveTerminalGuard {
     pub(super) async fn engage(
         tx: mpsc::Sender<Event>,
         interactive: bool,
+        cancel: Option<CancellationToken>,
     ) -> Result<Self, ToolError> {
         if !interactive {
-            return Ok(Self { tx: None });
+            return Ok(Self { resume: None });
         }
-        // Arm before the send/ack awaits. Cancellation can drop this future
-        // at either await point; the guard must still queue ResumeEvents if a
-        // PauseEvents raced into the UI first.
-        let guard = Self {
-            tx: Some(tx.clone()),
-        };
+        let resume = super::streaming::reserve_event_capacity(
+            &tx,
+            cancel.as_ref(),
+            super::streaming::EventReservationPolicy::Strict,
+        )
+        .await
+        .map_err(terminal_handoff_send_error)?;
         let ack = Arc::new(tokio::sync::Notify::new());
-        match tx
-            .send(Event::PauseEvents {
-                ack: Some(ack.clone()),
-            })
-            .await
-        {
-            Ok(()) => {
-                if tokio::time::timeout(Duration::from_millis(750), ack.notified())
-                    .await
-                    .is_err()
-                {
-                    // `guard` drops on return and queues the matching resume.
-                    return Err(ToolError::execution_failed(
-                        "Terminal handoff was not acknowledged; interactive tool was not launched.",
-                    ));
+        let pause = super::streaming::reserve_event_capacity(
+            &tx,
+            cancel.as_ref(),
+            super::streaming::EventReservationPolicy::Strict,
+        )
+        .await
+        .map_err(terminal_handoff_send_error)?;
+        // No await separates the pause send and guard installation. A
+        // cancelled reservation above never paused and needs no resume.
+        pause.send(Event::PauseEvents {
+            ack: Some(ack.clone()),
+        });
+        let guard = Self {
+            resume: Some((tx, resume)),
+        };
+        let acknowledged = match cancel.as_ref() {
+            Some(cancel) => tokio::select! {
+                biased;
+                () = cancel.cancelled() => {
+                    return Err(ToolError::cancelled("Terminal handoff cancelled; interactive tool was not launched."));
                 }
-            }
-            Err(err) => {
-                tracing::debug!(
-                    target: "engine.tool_execution",
-                    ?err,
-                    "InteractiveTerminalGuard: event channel closed before PauseEvents"
-                );
-                return Err(ToolError::execution_failed(
-                    "Terminal handoff channel closed; interactive tool was not launched.",
-                ));
-            }
+                result = tokio::time::timeout(Duration::from_millis(750), ack.notified()) => result,
+            },
+            None => tokio::time::timeout(Duration::from_millis(750), ack.notified()).await,
+        };
+        if acknowledged.is_err() {
+            return Err(ToolError::execution_failed(
+                "Terminal handoff was not acknowledged; interactive tool was not launched.",
+            ));
         }
         Ok(guard)
     }
 }
 
+fn terminal_handoff_send_error(reason: super::streaming::EventSendError) -> ToolError {
+    match reason {
+        super::streaming::EventSendError::Cancelled => {
+            ToolError::cancelled("Terminal handoff cancelled; interactive tool was not launched.")
+        }
+        super::streaming::EventSendError::Closed => ToolError::execution_failed(
+            "Terminal handoff channel closed; interactive tool was not launched.",
+        ),
+    }
+}
+
 impl Drop for InteractiveTerminalGuard {
     fn drop(&mut self) {
-        if let Some(tx) = self.tx.take() {
-            match tx.try_send(Event::ResumeEvents) {
-                Ok(()) => {}
-                Err(tokio::sync::mpsc::error::TrySendError::Full(event)) => {
-                    match tokio::runtime::Handle::try_current() {
-                        Ok(handle) => {
-                            handle.spawn(async move {
-                                if let Err(err) = tx.send(event).await {
-                                    tracing::warn!(
-                                        target: "engine.tool_execution",
-                                        ?err,
-                                        "InteractiveTerminalGuard: async send(ResumeEvents) failed; \
-                                         terminal may stay in paused state until the next \
-                                         pause/resume cycle"
-                                    );
-                                }
-                            });
-                        }
-                        Err(err) => {
-                            tracing::warn!(
-                                target: "engine.tool_execution",
-                                ?err,
-                                "InteractiveTerminalGuard: event channel full and no Tokio runtime \
-                                 available to queue ResumeEvents; terminal may stay paused until \
-                                 the next pause/resume cycle"
-                            );
-                        }
-                    }
-                }
-                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                    tracing::debug!(
-                        target: "engine.tool_execution",
-                        "InteractiveTerminalGuard: event channel closed before ResumeEvents"
-                    );
-                }
-            }
+        if let Some((tx, resume)) = self.resume.take()
+            && !tx.is_closed()
+        {
+            resume.send(Event::ResumeEvents);
         }
     }
 }
@@ -319,6 +316,7 @@ impl Engine {
         // call yet.
         let auth_target = pool.lock().await.authenticate_tool_target(name);
         if let Some(server) = auth_target {
+            let mut notice_task = None;
             let mut result = crate::mcp::authenticate_tool_via_pool(&pool, &server, |url| {
                 // The model cannot relay the URL until the call returns, and
                 // the call returns only after the sign-in completes — so the
@@ -329,16 +327,25 @@ impl Engine {
                 let server = server.clone();
                 let url = url.to_string();
                 let tx = tx_event.clone();
-                tokio::spawn(async move {
-                    let _ = tx
-                        .send(Event::status(format!(
+                notice_task = Some(super::turn_heartbeat::AbortOnDrop(tokio::spawn(async move {
+                    if let Ok(permit) = super::streaming::reserve_event_capacity(
+                        &tx,
+                        None,
+                        super::streaming::EventReservationPolicy::Receipt,
+                    )
+                    .await
+                    {
+                        permit.send(Event::status(format!(
                             "◆ auth required: sign in to MCP server '{server}' in your browser — {url}"
-                        )))
-                        .await;
-                });
+                        )));
+                    }
+                })));
             })
             .await
             .map_err(|e| ToolError::execution_failed(format!("MCP tool failed: {e}")))?;
+            if let Some(task) = notice_task.as_mut() {
+                let _ = (&mut task.0).await;
+            }
             McpPool::filter_authenticate_result(&mut result, disallowed_tools);
             let mut rich = crate::tools::registry::mcp_result_to_bounded_rich_tool_result(result);
             if rich.result.success {
@@ -441,10 +448,20 @@ impl Engine {
             "tool.exec.start",
         );
 
-        let _guard = if supports_parallel {
-            ToolExecGuard::Read(lock.read().await)
-        } else {
-            ToolExecGuard::Write(lock.write().await)
+        let acquire = async {
+            if supports_parallel {
+                ToolExecGuard::Read(lock.read().await)
+            } else {
+                ToolExecGuard::Write(lock.write().await)
+            }
+        };
+        let _guard = match cancel_token.as_ref() {
+            Some(cancel) => tokio::select! {
+                biased;
+                () = cancel.cancelled() => return Err(ToolError::cancelled("Tool lock wait cancelled.")),
+                guard = acquire => guard,
+            },
+            None => acquire.await,
         };
 
         // RAII pause/resume: ensures `Event::ResumeEvents` always fires on
@@ -452,7 +469,9 @@ impl Engine {
         // `InteractiveTerminalGuard` doc-comment for the regression this
         // closes (parent terminal scrollback hijacking the TUI after a
         // cancelled interactive tool).
-        let _terminal = InteractiveTerminalGuard::engage(tx_event.clone(), interactive).await?;
+        let _terminal =
+            InteractiveTerminalGuard::engage(tx_event.clone(), interactive, cancel_token.clone())
+                .await?;
 
         if cancel_token
             .as_ref()
@@ -526,11 +545,23 @@ impl Engine {
                 }),
         };
         let operation_span = match (activity_call_id.as_deref(), activity_kind) {
-            (Some(call_id), Some(activity_kind)) => {
-                Some(OperationSpanGuard::start(tx_event.clone(), call_id, activity_kind).await)
-            }
+            (Some(call_id), Some(activity_kind)) => Some(
+                OperationSpanGuard::start(
+                    tx_event.clone(),
+                    call_id,
+                    activity_kind,
+                    cancel_token.clone(),
+                )
+                .await,
+            ),
             _ => None,
         };
+        if cancel_token
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled)
+        {
+            return Err(ToolError::cancelled("Tool activity admission cancelled."));
+        }
 
         let outcome: Result<RichToolResult, ToolError> = if McpPool::is_mcp_tool(&tool_name) {
             if let Some(pool) = mcp_pool {
@@ -677,6 +708,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn event_capacity_cancelled_activity_preserves_exact_outcomes_and_releases_full_queue() {
+        use codewhale_protocol::engine_owner::{OwnerActivityKind, OwnerOperationOutcome};
+        for outcome in [
+            OwnerOperationOutcome::Succeeded,
+            OwnerOperationOutcome::Failed,
+            OwnerOperationOutcome::Denied,
+            OwnerOperationOutcome::Cancelled,
+        ] {
+            let (tx, mut rx) = mpsc::channel(2);
+            let cancel = CancellationToken::new();
+            let span = OperationSpanGuard::start(
+                tx,
+                "completed-call",
+                OwnerActivityKind::Tool,
+                Some(cancel.clone()),
+            )
+            .await;
+            cancel.cancel();
+            tokio::time::timeout(Duration::from_millis(100), span.complete(outcome))
+                .await
+                .expect("completed activity preserves available capacity after cancellation");
+            let Event::OperationActivityStarted {
+                span_id,
+                activity_kind,
+            } = rx.try_recv().unwrap()
+            else {
+                panic!("activity start");
+            };
+            let Event::OperationActivityCompleted {
+                span_id: completed_span,
+                activity_kind: completed_kind,
+                outcome: completed_outcome,
+            } = rx
+                .try_recv()
+                .expect("cancellation must not discard the completion")
+            else {
+                panic!("activity completion");
+            };
+            assert_eq!(completed_span, span_id);
+            assert_eq!(completed_kind, activity_kind);
+            assert_eq!(
+                completed_outcome, outcome,
+                "retain the observed outcome exactly"
+            );
+            assert!(rx.try_recv().is_err(), "exactly one completion");
+        }
+
+        let (tx, mut rx) = mpsc::channel(1);
+        let cancel = CancellationToken::new();
+        let span = OperationSpanGuard::start(
+            tx,
+            "full-call",
+            OwnerActivityKind::Tool,
+            Some(cancel.clone()),
+        )
+        .await;
+        cancel.cancel();
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            span.complete(OwnerOperationOutcome::Succeeded),
+        )
+        .await
+        .expect("a full queue cannot retain a cancelled activity sender");
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            Event::OperationActivityStarted { .. }
+        ));
+        assert!(
+            rx.try_recv().is_err(),
+            "no sender survives to publish after draining"
+        );
+    }
+
+    #[tokio::test]
     async fn tool_heartbeat_is_delayed_for_fast_tool() {
         let (tx, mut rx) = mpsc::channel(4);
 
@@ -729,10 +834,13 @@ mod tests {
 
     #[tokio::test]
     async fn terminal_guard_queues_resume_when_event_channel_is_full() {
-        let (tx, mut rx) = mpsc::channel(1);
+        let (tx, mut rx) = mpsc::channel(2);
+        let resume = tx.clone().reserve_owned().await.expect("resume capacity");
         tx.try_send(Event::status("filler")).expect("fill channel");
 
-        drop(InteractiveTerminalGuard { tx: Some(tx) });
+        drop(InteractiveTerminalGuard {
+            resume: Some((tx, resume)),
+        });
 
         assert!(matches!(rx.recv().await, Some(Event::Status { .. })));
         let resumed = tokio::time::timeout(Duration::from_secs(1), rx.recv())
@@ -740,12 +848,13 @@ mod tests {
             .expect("queued resume event")
             .expect("event channel still open");
         assert!(matches!(resumed, Event::ResumeEvents));
+        assert!(rx.try_recv().is_err(), "restoration is exactly once");
     }
 
     #[tokio::test]
     async fn terminal_guard_waits_for_pause_ack_before_returning() {
         let (tx, mut rx) = mpsc::channel(4);
-        let task = tokio::spawn(InteractiveTerminalGuard::engage(tx, true));
+        let task = tokio::spawn(InteractiveTerminalGuard::engage(tx, true, None));
 
         let event = tokio::time::timeout(Duration::from_secs(1), rx.recv())
             .await
@@ -777,7 +886,7 @@ mod tests {
     #[tokio::test]
     async fn terminal_guard_refuses_child_and_queues_resume_when_pause_is_not_acknowledged() {
         let (tx, mut rx) = mpsc::channel(4);
-        let task = tokio::spawn(InteractiveTerminalGuard::engage(tx, true));
+        let task = tokio::spawn(InteractiveTerminalGuard::engage(tx, true, None));
 
         let event = tokio::time::timeout(Duration::from_secs(1), rx.recv())
             .await
@@ -811,7 +920,7 @@ mod tests {
     #[tokio::test]
     async fn terminal_guard_cancellation_during_pause_ack_still_queues_resume() {
         let (tx, mut rx) = mpsc::channel(4);
-        let task = tokio::spawn(InteractiveTerminalGuard::engage(tx, true));
+        let task = tokio::spawn(InteractiveTerminalGuard::engage(tx, true, None));
 
         let event = tokio::time::timeout(Duration::from_secs(1), rx.recv())
             .await
@@ -834,6 +943,97 @@ mod tests {
             .expect("queued resume event")
             .expect("event channel still open");
         assert!(matches!(resumed, Event::ResumeEvents));
+    }
+
+    #[tokio::test]
+    async fn terminal_guard_cancelled_capacity_reservations_never_pause_or_restore() {
+        for capacity in [1, 2] {
+            let (tx, mut rx) = mpsc::channel(capacity);
+            tx.try_send(Event::status("occupied")).unwrap();
+            let cancel = CancellationToken::new();
+            let mut engage = Box::pin(InteractiveTerminalGuard::engage(
+                tx.clone(),
+                true,
+                Some(cancel.clone()),
+            ));
+            assert!(
+                tokio::time::timeout(Duration::from_millis(20), &mut engage)
+                    .await
+                    .is_err()
+            );
+            // Capacity 1 stalls the resume reservation; capacity 2 stalls
+            // the pause reservation while the first permit is held.
+            cancel.cancel();
+            assert!(
+                tokio::time::timeout(Duration::from_secs(1), &mut engage)
+                    .await
+                    .unwrap()
+                    .is_err()
+            );
+            drop(engage);
+            assert!(matches!(rx.try_recv(), Ok(Event::Status { .. })));
+            assert!(
+                rx.try_recv().is_err(),
+                "a pause that never entered needs no resume"
+            );
+            assert_eq!(
+                tx.capacity(),
+                capacity,
+                "cancelled waits release every permit"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_guard_cancelled_ack_restores_once_without_detached_sender() {
+        let (tx, mut rx) = mpsc::channel(3);
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(InteractiveTerminalGuard::engage(
+            tx.clone(),
+            true,
+            Some(cancel.clone()),
+        ));
+        assert!(matches!(rx.recv().await, Some(Event::PauseEvents { .. })));
+        tx.try_send(Event::status("fill after pause")).unwrap();
+        cancel.cancel();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_err()
+        );
+        assert!(matches!(rx.try_recv(), Ok(Event::Status { .. })));
+        assert!(matches!(rx.try_recv(), Ok(Event::ResumeEvents)));
+        assert!(rx.try_recv().is_err());
+        assert_eq!(tx.capacity(), 3);
+    }
+
+    #[tokio::test]
+    async fn terminal_guard_closed_receiver_refuses_or_releases_held_restoration() {
+        let (tx, rx) = mpsc::channel(3);
+        drop(rx);
+        assert!(
+            InteractiveTerminalGuard::engage(tx, true, None)
+                .await
+                .is_err()
+        );
+
+        let (tx, mut rx) = mpsc::channel(3);
+        let task = tokio::spawn(InteractiveTerminalGuard::engage(tx.clone(), true, None));
+        let Some(Event::PauseEvents { ack: Some(ack) }) = rx.recv().await else {
+            panic!("pause with acknowledgement");
+        };
+        ack.notify_one();
+        let guard = task.await.unwrap().unwrap();
+        drop(rx);
+        drop(guard);
+        assert!(tx.is_closed());
+        assert_eq!(
+            tx.capacity(),
+            3,
+            "receiver closure cannot strand restoration capacity"
+        );
     }
 
     #[cfg(unix)]

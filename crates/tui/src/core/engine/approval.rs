@@ -161,7 +161,7 @@ impl Engine {
     ) -> Result<ApprovalResult, ToolError> {
         self.commit_approval_receipt(ApprovalReceipt::asked(tool_id, tool_name))
             .await?;
-        if self.tx_event.send(event).await.is_err() {
+        if self.send_event(event).await.is_err() {
             self.commit_approval_outcome(
                 tool_id,
                 ApprovalOutcome::Unavailable,
@@ -222,7 +222,7 @@ impl Engine {
                     tracing::warn!(tool_id, waited_secs = waited.as_secs(), "{message}");
                     if !announced {
                         announced = true;
-                        let _ = self.tx_event.send(Event::Status { message }).await;
+                        let _ = self.send_event(Event::Status { message }).await;
                     }
                 }
                 _ = self.cancel_token.cancelled() => {
@@ -291,8 +291,7 @@ impl Engine {
         // it. Fail now instead of waiting out the timeout — which by default
         // is no timeout at all.
         if self
-            .tx_event
-            .send(Event::UserInputRequired {
+            .send_event(Event::UserInputRequired {
                 id: tool_id.to_string(),
                 request,
             })
@@ -342,7 +341,7 @@ impl Engine {
                     tracing::warn!(tool_id, waited_secs = waited.as_secs(), "{message}");
                     if !announced {
                         announced = true;
-                        let _ = self.tx_event.send(Event::Status { message }).await;
+                        let _ = self.send_event(Event::Status { message }).await;
                     }
                 }
                 _ = self.cancel_token.cancelled() => {
@@ -380,9 +379,7 @@ impl Engine {
                         }
                         Err(_) => {
                             let seconds = wait.map(|wait| wait.as_secs()).unwrap_or(0);
-                            let _ = self
-                                .tx_event
-                                .send(Event::Status {
+                            let _ = self.send_event(Event::Status {
                                     message: format!("User input timed out after {seconds}s"),
                                 })
                                 .await;
