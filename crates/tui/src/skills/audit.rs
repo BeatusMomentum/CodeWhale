@@ -605,17 +605,13 @@ fn parse_skill_md_bounded(
         }
     };
 
-    match SkillRegistry::parse_skill(path, &content) {
-        Ok(skill) => {
+    match SkillRegistry::parse_verified_content(path, &content) {
+        Ok((skill, warnings)) => {
             let desc = if skill.description.is_empty() {
                 None
             } else {
                 Some(truncate_desc(&skill.description))
             };
-            let mut warnings = Vec::new();
-            if skill.description.is_empty() {
-                warnings.push("missing description".into());
-            }
             let parser = if warnings.is_empty() {
                 ParserState::Valid
             } else {

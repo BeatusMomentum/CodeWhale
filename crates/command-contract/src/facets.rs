@@ -1151,6 +1151,10 @@ pub enum SkillActivationError {
         available: Vec<String>,
         warnings: Vec<String>,
     },
+    InvocationRejected {
+        name: String,
+        reason: String,
+    },
     PluginRejected {
         name: String,
         reason: String,

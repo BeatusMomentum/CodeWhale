@@ -2440,6 +2440,11 @@ reasoning contract, and all four membership ids omit generic sampling fields.
   scans `<workspace>/.codewhale/skills`, `~/.codewhale/skills`, and any explicit
   `skills_dir` override. The Skills Manager can still toggle a local compatible
   audit scan independently of this runtime knob — see [SKILLS.md](SKILLS.md).
+- `[skills].flat_workspace_root` (bool, default `false`): opt in to the flat
+  `<workspace>/skills` compatibility root after workspace trust. Without this
+  opt-in it is an audit candidate only; an explicit `skills_dir` remains an
+  alternative. `scan_codewhale_only = true` excludes the flat compatibility
+  root regardless of this flag, unless it is the explicit `skills_dir`.
 - `[skills].registry_url` / `[skills].max_install_size_bytes` (optional): used by
   `/skills --remote`, `/skills suggest <task>`, `/skills sync`, and `/skill
   install|update`. The default manager open path does not contact the registry.

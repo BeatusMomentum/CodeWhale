@@ -423,6 +423,12 @@ fn parse_skill_snapshots(
             let (skill, parse_warnings) =
                 crate::skills::SkillRegistry::parse_verified_content(&skill.path, content)?;
             for warning in parse_warnings {
+                if diagnostics
+                    .iter()
+                    .any(|diagnostic: &PluginDiagnostic| diagnostic.message.ends_with(&warning))
+                {
+                    continue;
+                }
                 diagnostics.push(PluginDiagnostic::warning(
                     "skill-invalid",
                     warning,
@@ -436,6 +442,7 @@ fn parse_skill_snapshots(
                 localized_descriptions: skill.localized_descriptions.clone(),
                 invocation: skill.invocation,
                 aliases: skill.aliases.clone(),
+                argument_hint: skill.argument_hint.clone(),
                 body: skill.body.clone(),
                 path: skill.path.clone(),
                 source_hash: actual_hash,

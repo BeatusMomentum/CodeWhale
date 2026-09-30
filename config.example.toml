@@ -1151,6 +1151,7 @@ base_url = "https://api.deepseek.com/beta"
 # registry_url = "https://raw.githubusercontent.com/Hmbown/deepseek-skills/main/index.json"
 # max_install_size_bytes = 5_242_880
 # scan_codewhale_only = false # true: ignore Claude/OpenCode/Cursor/agentskills.io skill dirs
+# flat_workspace_root = false # true: opt in to trusted <workspace>/skills content
 
 # Model-stream budgets and HTTP transport. `config dump` shows effective values.
 # Legacy [tui] stream_* keys remain fallbacks when a canonical field is absent.

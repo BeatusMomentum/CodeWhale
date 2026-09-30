@@ -3684,9 +3684,18 @@ pub struct SkillsConfig {
     /// directories from other AI tools such as Claude, OpenCode, or Cursor.
     #[serde(default, alias = "scanCodewhaleOnly")]
     pub scan_codewhale_only: Option<bool>,
+    /// Opt in to discovery from `<workspace>/skills` after workspace trust.
+    /// Otherwise the flat root is visible only to compatible audit.
+    #[serde(default)]
+    pub flat_workspace_root: Option<bool>,
 }
 
 impl SkillsConfig {
+    #[must_use]
+    pub fn flat_workspace_root(&self) -> bool {
+        self.flat_workspace_root.unwrap_or(false)
+    }
+
     /// Resolve whether session-time discovery should ignore cross-tool skill
     /// directories. Defaults to the compatibility-preserving broad scan.
     #[must_use]
@@ -11650,6 +11659,9 @@ fn merge_skills_config(
             scan_codewhale_only: override_cfg
                 .scan_codewhale_only
                 .or(base.scan_codewhale_only),
+            flat_workspace_root: override_cfg
+                .flat_workspace_root
+                .or(base.flat_workspace_root),
         }),
     }
 }
