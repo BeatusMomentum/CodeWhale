@@ -17,6 +17,7 @@ import type {
   ChromeDict,
   ContributeDict,
   ConstitutionDict,
+  RuntimeDict,
   ComputerUseDict,
   DocsAuthDict,
   DocsComputersDict,
@@ -124,6 +125,8 @@ import { contribute as enContribute } from "./en/contribute";
 import { contribute as zhContribute } from "./zh/contribute";
 import { constitution as enConstitution } from "./en/constitution";
 import { constitution as zhConstitution } from "./zh/constitution";
+import { runtime as enRuntime } from "./en/runtime";
+import { runtime as zhRuntime } from "./zh/runtime";
 import { chrome as zhChrome } from "./zh/chrome";
 import { home as zhHome } from "./zh/home";
 import { chrome as jaChrome } from "./ja/chrome";
@@ -319,10 +322,10 @@ const DOCS_VOCABULARY: Record<string, DocsVocabularyDict> = {
 
 /**
  * Shared surface states, the changelog page, the two legal pages, the digest,
- * feed and community pages, the FAQ, the roadmap, the contribute page and the
- * constitution page follow the same optional per-locale rule as the docs page
- * dictionaries: English is the reference, every other locale falls back to it
- * at lookup time.
+ * feed and community pages, the FAQ, the roadmap, and the contribute,
+ * constitution and runtime pages follow the same optional per-locale rule as
+ * the docs page dictionaries: English is the reference, every other locale
+ * falls back to it at lookup time.
  */
 const STATES: Record<string, StatesDict> = {
   zh: zhStates,
@@ -366,6 +369,10 @@ const CONTRIBUTE: Record<string, ContributeDict> = {
 
 const CONSTITUTION: Record<string, ConstitutionDict> = {
   zh: zhConstitution,
+};
+
+const RUNTIME: Record<string, RuntimeDict> = {
+  zh: zhRuntime,
 };
 
 export function getChrome(locale: string): ChromeDict {
@@ -496,6 +503,10 @@ export function getConstitution(locale: string): ConstitutionDict {
   return CONSTITUTION[locale] ?? enConstitution;
 }
 
+export function getRuntime(locale: string): RuntimeDict {
+  return RUNTIME[locale] ?? enRuntime;
+}
+
 /**
  * Select one side of a legacy `{ en, zh }` content pair by locale. This is
  * the transitional bridge for `web/lib/content/` modules that still carry
@@ -545,6 +556,7 @@ export const EN_FAQ = enFaq;
 export const EN_ROADMAP = enRoadmap;
 export const EN_CONTRIBUTE = enContribute;
 export const EN_CONSTITUTION = enConstitution;
+export const EN_RUNTIME = enRuntime;
 
 /** Interpolate `{name}` tokens in a dictionary template. Unknown tokens are
  * left intact so a template/variable drift is visible in review, not silent. */
