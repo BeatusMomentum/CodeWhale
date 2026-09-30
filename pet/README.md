@@ -129,7 +129,9 @@ Live recording continues in segments. At 216,000 buckets (24 hours) or 64 MiB,
 the recorder syncs the completed file, preserves it as
 `OUTPUT.segment-000001.jsonl` (then `000002`, etc.), and atomically replaces the
 same live pathname. Each segment starts at sequence zero and replays independently.
-Use `--segment-buckets=N` to rotate sooner. Followers establish a new baseline
+Use `--segment-buckets=N` to rotate sooner. A stall or suspension shorter than
+one segment is recorded as unknown buckets; a longer one starts a new segment
+whose first bucket is unknown, as `--resume` does, and only reports its length. Followers establish a new baseline
 after replacement, then accept subsequent appends as current observations.
 
 The live importer retains unfinished lifetimes and 16 seconds of completed
