@@ -1,0 +1,307 @@
+//! Fixture discovery, golden comparison, the update mode, and the masking
+//! rules every family shares. Masking is deliberately small and named: a mask
+//! hides a fact that genuinely varies between hosts or runs (temp paths,
+//! UUIDs, clocks), never a fact the migration could change by accident.
+
+use std::collections::{BTreeMap, HashMap};
+use std::path::{Path, PathBuf};
+
+use serde_json::Value;
+
+use crate::tools::spec::ToolError;
+
+/// `CODEWHALE_CONFORMANCE_UPDATE=1` rewrites goldens from the current source.
+pub(super) const UPDATE_ENV: &str = "CODEWHALE_CONFORMANCE_UPDATE";
+
+pub(super) fn fixture_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("conformance")
+}
+
+pub(super) fn family_dir(family: &str) -> PathBuf {
+    fixture_root().join(family)
+}
+
+/// Case names (`<name>.case.json`) in one family, sorted. Panics on an empty
+/// family: a filter that silently runs zero cases is not a pass.
+pub(super) fn case_names(family: &str) -> Vec<String> {
+    let dir = family_dir(family);
+    let mut names: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap_or_else(|error| panic!("read fixture dir {}: {error}", dir.display()))
+        .filter_map(|entry| {
+            let name = entry.ok()?.file_name().into_string().ok()?;
+            name.strip_suffix(".case.json").map(str::to_string)
+        })
+        .collect();
+    names.sort();
+    assert!(
+        !names.is_empty(),
+        "conformance family `{family}` has no *.case.json fixtures in {}",
+        dir.display()
+    );
+    names
+}
+
+pub(super) fn read_case(family: &str, name: &str) -> Value {
+    let path = family_dir(family).join(format!("{name}.case.json"));
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+    serde_json::from_str(&text).unwrap_or_else(|error| panic!("parse {}: {error}", path.display()))
+}
+
+pub(super) fn update_mode() -> bool {
+    let requested = std::env::var(UPDATE_ENV).is_ok_and(|value| value == "1");
+    if requested && std::env::var_os("CI").is_some_and(|value| !value.is_empty()) {
+        panic!("{UPDATE_ENV}=1 is refused under CI: goldens are reviewed source, not build output");
+    }
+    requested
+}
+
+/// Compare `actual` with the golden at `path`; in update mode write it
+/// instead. Returns a failure description rather than panicking so a family
+/// can report every drifted case in one run.
+pub(super) fn check_golden(path: &Path, actual: &str) -> Result<(), String> {
+    let expected = std::fs::read_to_string(path)
+        .ok()
+        .map(|text| text.replace("\r\n", "\n"));
+    if expected.as_deref() == Some(actual) {
+        return Ok(());
+    }
+    if update_mode() {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("create golden dir");
+        }
+        std::fs::write(path, actual).expect("write golden");
+        eprintln!("conformance: rewrote {}", path.display());
+        return Ok(());
+    }
+    let Some(expected) = expected else {
+        return Err(format!(
+            "missing golden {}; review the output and record it with {UPDATE_ENV}=1",
+            path.display()
+        ));
+    };
+    Err(format!(
+        "golden drift at {}\n{}\nIf this change is intended, re-record with {UPDATE_ENV}=1 and review the diff.",
+        path.display(),
+        first_difference(&expected, actual)
+    ))
+}
+
+/// Line-oriented first difference with a little context — enough to see what
+/// moved without dumping a whole transcript into the failure.
+fn first_difference(expected: &str, actual: &str) -> String {
+    let expected_lines: Vec<&str> = expected.lines().collect();
+    let actual_lines: Vec<&str> = actual.lines().collect();
+    let index = expected_lines
+        .iter()
+        .zip(&actual_lines)
+        .position(|(left, right)| left != right)
+        .unwrap_or_else(|| expected_lines.len().min(actual_lines.len()));
+    let show = |lines: &[&str]| {
+        lines
+            .get(index)
+            .map_or_else(|| "<end of file>".to_string(), |line| truncate(line, 600))
+    };
+    format!(
+        "first difference at line {} (expected {} lines, got {}):\n  expected: {}\n  actual:   {}",
+        index + 1,
+        expected_lines.len(),
+        actual_lines.len(),
+        show(&expected_lines),
+        show(&actual_lines)
+    )
+}
+
+fn truncate(line: &str, max: usize) -> String {
+    if line.chars().count() <= max {
+        return line.to_string();
+    }
+    let head: String = line.chars().take(max).collect();
+    format!("{head}…")
+}
+
+/// Rebuild every object with keys in sorted order. Used where map order is an
+/// implementation accident (HashMap-backed metadata); the prompt family does
+/// not use it, because there key order is part of the cached prefix bytes.
+pub(super) fn canonical(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let sorted: BTreeMap<&String, &Value> = map.iter().collect();
+            Value::Object(
+                sorted
+                    .into_iter()
+                    .map(|(key, value)| (key.clone(), canonical(value)))
+                    .collect(),
+            )
+        }
+        Value::Array(items) => Value::Array(items.iter().map(canonical).collect()),
+        other => other.clone(),
+    }
+}
+
+/// One compact JSON document per line, trailing newline.
+pub(super) fn jsonl(lines: &[Value]) -> String {
+    let mut out = String::new();
+    for line in lines {
+        out.push_str(&serde_json::to_string(line).expect("serialize golden line"));
+        out.push('\n');
+    }
+    out
+}
+
+pub(super) fn pretty(value: &Value) -> String {
+    let mut out = serde_json::to_string_pretty(value).expect("serialize golden");
+    out.push('\n');
+    out
+}
+
+/// Replaces host- and run-specific substrings in every string of a JSON tree.
+///
+/// - literal path prefixes (workspace, home) → `<WORKSPACE>` / `<HOME>`,
+///   including their canonicalized spellings (`/private/var` on macOS);
+/// - UUIDs → `<uuid:N>`, numbered by first appearance so that two events
+///   naming the same id still visibly agree;
+/// - RFC 3339 timestamps → `<timestamp>`;
+/// - values of the named volatile keys (durations, clocks) → `"<masked>"`.
+pub(super) struct Masker {
+    literals: Vec<(String, String)>,
+    volatile_keys: &'static [&'static str],
+    uuids: HashMap<String, String>,
+    uuid_re: regex::Regex,
+    timestamp_re: regex::Regex,
+}
+
+impl Masker {
+    pub(super) fn new(volatile_keys: &'static [&'static str]) -> Self {
+        Self {
+            literals: Vec::new(),
+            volatile_keys,
+            uuids: HashMap::new(),
+            uuid_re: regex::Regex::new(
+                r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+            )
+            .expect("uuid regex"),
+            timestamp_re: regex::Regex::new(
+                r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})",
+            )
+            .expect("timestamp regex"),
+        }
+    }
+
+    /// Mask `path` (and its canonical spelling) as `label`. Longer literals
+    /// are applied first so a home nested in a workspace cannot half-match.
+    pub(super) fn path(mut self, path: &Path, label: &str) -> Self {
+        let mut spellings = vec![path.to_string_lossy().into_owned()];
+        if let Ok(canonical) = path.canonicalize() {
+            spellings.push(canonical.to_string_lossy().into_owned());
+        }
+        for spelling in spellings {
+            if !spelling.is_empty() && !self.literals.iter().any(|(known, _)| *known == spelling) {
+                self.literals.push((spelling, label.to_string()));
+            }
+        }
+        self.literals
+            .sort_by(|(left, _), (right, _)| right.len().cmp(&left.len()).then(left.cmp(right)));
+        self
+    }
+
+    /// Mask an arbitrary literal (a random session id, say).
+    pub(super) fn literal(mut self, literal: &str, label: &str) -> Self {
+        if !literal.is_empty() {
+            self.literals.push((literal.to_string(), label.to_string()));
+            self.literals.sort_by(|(left, _), (right, _)| {
+                right.len().cmp(&left.len()).then(left.cmp(right))
+            });
+        }
+        self
+    }
+
+    pub(super) fn text(&mut self, text: &str) -> String {
+        let mut out = text.to_string();
+        for (literal, label) in &self.literals {
+            if out.contains(literal.as_str()) {
+                out = out.replace(literal.as_str(), label);
+            }
+        }
+        let uuids = &mut self.uuids;
+        let out = self
+            .uuid_re
+            .replace_all(&out, |captures: &regex::Captures<'_>| {
+                let raw = captures[0].to_ascii_lowercase();
+                let next = uuids.len() + 1;
+                uuids
+                    .entry(raw)
+                    .or_insert_with(|| format!("<uuid:{next}>"))
+                    .clone()
+            })
+            .into_owned();
+        self.timestamp_re
+            .replace_all(&out, "<timestamp>")
+            .into_owned()
+    }
+
+    pub(super) fn value(&mut self, value: &mut Value) {
+        match value {
+            Value::String(text) => *text = self.text(text),
+            Value::Array(items) => {
+                for item in items {
+                    self.value(item);
+                }
+            }
+            Value::Object(map) => {
+                for (key, item) in map.iter_mut() {
+                    if self.volatile_keys.contains(&key.as_str()) && !item.is_null() {
+                        *item = Value::String("<masked>".to_string());
+                    } else {
+                        self.value(item);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Stable snake_case name of a `ToolError` variant; the variant, not the
+/// message wording, is the cross-implementation contract.
+pub(super) fn tool_error_kind(error: &ToolError) -> &'static str {
+    match error {
+        ToolError::InvalidInput { .. } => "invalid_input",
+        ToolError::MissingField { .. } => "missing_field",
+        ToolError::PathEscape { .. } => "path_escape",
+        ToolError::ExecutionFailed { .. } => "execution_failed",
+        ToolError::Timeout { .. } => "timeout",
+        ToolError::Cancelled { .. } => "cancelled",
+        ToolError::NotAvailable { .. } => "not_available",
+        ToolError::PermissionDenied { .. } => "permission_denied",
+    }
+}
+
+/// Collects per-case failures so one run reports every drifted case.
+#[derive(Default)]
+pub(super) struct Failures(Vec<String>);
+
+impl Failures {
+    pub(super) fn record(&mut self, case: &str, result: Result<(), String>) {
+        if let Err(message) = result {
+            self.0.push(format!("[{case}] {message}"));
+        }
+    }
+
+    pub(super) fn push(&mut self, case: &str, message: impl Into<String>) {
+        self.0.push(format!("[{case}] {}", message.into()));
+    }
+
+    pub(super) fn finish(self, family: &str, cases: usize) {
+        assert!(
+            self.0.is_empty(),
+            "conformance family `{family}`: {} of {cases} case(s) failed\n\n{}",
+            self.0.len(),
+            self.0.join("\n\n")
+        );
+        eprintln!("conformance family `{family}`: {cases} case(s) matched");
+    }
+}

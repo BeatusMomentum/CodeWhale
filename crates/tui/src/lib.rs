@@ -36,6 +36,7 @@ pub mod computer_meter;
 mod config;
 pub mod config_keys;
 mod config_persistence;
+mod conformance;
 mod context_report;
 mod core;
 mod cost_status;

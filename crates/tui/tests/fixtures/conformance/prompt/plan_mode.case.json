@@ -1,0 +1,11 @@
+{
+  "description": "Plan mode: the read-only tool surface and the Plan prompt layer.",
+  "model": "deepseek-v4-pro",
+  "mode": "plan",
+  "approval_mode": "suggest",
+  "allow_shell": true,
+  "user_message": "make a plan",
+  "workspace_files": {
+    "README.md": "conformance fixture\n"
+  }
+}

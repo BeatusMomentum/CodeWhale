@@ -1,0 +1,5 @@
+{
+  "description": "OpenAI Responses (ChatGPT Codex route): a reasoning item with summary text and encrypted continuity, then output text; response.completed carries cached and reasoning token usage.",
+  "route": "openai-codex",
+  "model": "gpt-5.5"
+}
