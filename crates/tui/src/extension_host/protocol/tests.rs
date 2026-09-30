@@ -231,8 +231,11 @@ fn kind(ty: &Ty, defs: &BTreeMap<String, Def>) -> String {
     }
 }
 
-fn kinds<'a>(fields: impl Iterator<Item = &'a Field>, defs: &BTreeMap<String, Def>) -> String {
+/// The kinds of the `fields` that are (or are not) `required`.
+fn kinds(fields: &[Field], required: bool, defs: &BTreeMap<String, Def>) -> String {
     let rendered: Vec<String> = fields
+        .iter()
+        .filter(|field| field.required == required)
         .map(|field| format!("{}: {}", field.name, kind(&field.ty, defs)))
         .collect();
     if rendered.is_empty() {
@@ -252,6 +255,14 @@ fn ts(ty: &Ty) -> String {
         Ty::Ref(name) => name.clone(),
         Ty::Const(value) => quote(value),
         Ty::Array(item) => format!("{}[]", ts(item)),
+    }
+}
+
+/// An array's item type, however deeply nested.
+fn innermost(ty: &Ty) -> &Ty {
+    match ty {
+        Ty::Array(item) => innermost(item),
+        ty => ty,
     }
 }
 
@@ -327,11 +338,7 @@ fn render() -> String {
             && validated.insert(name.clone())
         {
             for field in fields {
-                let mut ty = &field.ty;
-                while let Ty::Array(item) = ty {
-                    ty = item;
-                }
-                if let Ty::Ref(name) = ty {
+                if let Ty::Ref(name) = innermost(&field.ty) {
                     pending.push(name.clone());
                 }
             }
@@ -372,16 +379,8 @@ fn render() -> String {
         };
         let _ = writeln!(out, "  {name}: {{");
         let _ = writeln!(out, "    strict: {strict},");
-        let _ = writeln!(
-            out,
-            "    required: {},",
-            kinds(fields.iter().filter(|field| field.required), &defs)
-        );
-        let _ = writeln!(
-            out,
-            "    optional: {},",
-            kinds(fields.iter().filter(|field| !field.required), &defs)
-        );
+        let _ = writeln!(out, "    required: {},", kinds(fields, true, &defs));
+        let _ = writeln!(out, "    optional: {},", kinds(fields, false, &defs));
         out.push_str("  },\n");
     }
     out.push_str(
