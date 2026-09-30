@@ -19,7 +19,6 @@ use crate::runtime_handoff::{
 };
 use crate::tool_inspection::TurnStopReason;
 use crate::tools::canonical_action::canonical_action_alias;
-use crate::tools::spec::ToolTerminalStatus;
 use crate::tools::tool_call_budget::ToolCallBudget;
 use codewhale_core::request::{PrimaryTurnRequest, prepare_primary_turn_request};
 use codewhale_models::Role;

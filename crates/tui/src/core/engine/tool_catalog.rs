@@ -23,7 +23,6 @@ use crate::dependencies::ExternalTool;
 use crate::features::{Feature, Features};
 use crate::regex_cache::compile_user_regex;
 
-#[cfg(test)]
 pub(crate) const MULTI_TOOL_PARALLEL_NAME: &str = "multi_tool_use.parallel";
 pub(crate) const REQUEST_USER_INPUT_NAME: &str = "request_user_input";
 pub(super) const CODE_EXECUTION_TOOL_NAME: &str = "code_execution";
