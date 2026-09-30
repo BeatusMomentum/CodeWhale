@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Script tools can no longer approve themselves or replace built-in tools
+  (founder decision D4). A `# approval: auto` line in a script under
+  `~/.codewhale/tools` (or `[tools].plugin_dir`) is ignored: the tool follows
+  the session's approval setting like a script with no `approval:` line, and
+  the runtime log and `/plugin tools` name each script that still declares it.
+  A `[tools.overrides]` entry of `type = "script"` or `type = "command"` keyed
+  by a built-in tool name is refused with an error in the runtime log naming
+  the key, and the built-in stays active. `type = "disabled"` still turns a
+  built-in off, and script or command overrides under a new name still work.
+  To keep a wrapper such as an audited shell, disable the built-in and give
+  the wrapper its own name
+  ([configuration](docs/CONFIGURATION.md#script-tools-and-overrides)).
+
 ### Contributors
 
 - **[@SparkofSpike](https://github.com/SparkofSpike)** — translated seventeen Tier-2 guides and thirteen developer and internal docs into Simplified Chinese, and connected the localized documentation ([#6662](https://github.com/Hmbown/Codewhale/pull/6662), [#6663](https://github.com/Hmbown/Codewhale/pull/6663)).

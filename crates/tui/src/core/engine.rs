@@ -5307,7 +5307,7 @@ impl Engine {
 
         // Load plugin tools from the user's tools directory and apply any
         // config.toml overrides. Explicit overrides win over auto-discovered
-        // scripts with the same tool name.
+        // scripts with the same tool name; neither may replace a built-in.
         let extension_host = self
             .extension_host
             .as_ref()
@@ -7951,7 +7951,9 @@ fn configure_plugin_tools(
     tool_registry: &mut crate::tools::ToolRegistry,
     tools_config: Option<&crate::config::ToolsConfig>,
 ) -> std::collections::HashSet<String> {
-    let names_before: std::collections::HashSet<String> = tool_registry
+    // Everything registered before the plugin directory loads is built in
+    // (native and host-dynamic tools); no script tool may replace it (D4).
+    let builtin_names: std::collections::HashSet<String> = tool_registry
         .names()
         .into_iter()
         .map(|s| s.to_string())
@@ -7963,7 +7965,7 @@ fn configure_plugin_tools(
     if let Some(tools_config) = tools_config
         && let Some(ref overrides) = tools_config.overrides
     {
-        tool_registry.apply_overrides(overrides, &plugin_dir);
+        tool_registry.apply_overrides(overrides, &plugin_dir, &builtin_names);
     }
 
     let names_after: std::collections::HashSet<String> = tool_registry
@@ -7971,7 +7973,7 @@ fn configure_plugin_tools(
         .into_iter()
         .map(|s| s.to_string())
         .collect();
-    &names_after - &names_before
+    &names_after - &builtin_names
 }
 
 fn system_prompt_hash(prompt: Option<&SystemPrompt>) -> u64 {

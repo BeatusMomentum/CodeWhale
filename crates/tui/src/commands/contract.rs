@@ -4061,11 +4061,30 @@ impl CommandPluginContext for PluginAdapter<'_> {
         if !dir.exists() {
             return Ok(None);
         }
-        let tools = crate::tools::plugin::scan_plugin_dir(&dir)
-            .into_iter()
-            .map(|(path, metadata)| portable_legacy_tool(&path, &metadata))
+        let discovered = crate::tools::plugin::scan_plugin_dir(&dir);
+        let diagnostics = discovered
+            .iter()
+            .filter(|(_, metadata)| metadata.auto_approval_ignored)
+            .map(|(path, metadata)| PluginDiagnostic {
+                level: PluginDiagnosticLevel::Warning,
+                code: "script_tool_auto_approval_ignored".to_string(),
+                message: format!(
+                    "script tool '{}': {}",
+                    metadata.name,
+                    crate::tools::plugin::AUTO_APPROVAL_UNSUPPORTED
+                ),
+                path: Some(path.clone()),
+            })
             .collect();
-        Ok(Some(PluginLegacyScan { dir, tools }))
+        let tools = discovered
+            .iter()
+            .map(|(path, metadata)| portable_legacy_tool(path, metadata))
+            .collect();
+        Ok(Some(PluginLegacyScan {
+            dir,
+            tools,
+            diagnostics,
+        }))
     }
 
     fn managed_scan(&self, home_override: Option<&Path>) -> Result<PluginManagedScan, String> {

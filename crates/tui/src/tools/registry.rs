@@ -367,14 +367,24 @@ impl ToolRegistry {
     /// Apply config.toml tool overrides to this registry.
     ///
     /// For each entry in `overrides`:
-    /// - `Disabled` removes the tool.
-    /// - `Script` / `Command` replaces the tool with the user's implementation.
+    /// - `Disabled` removes the tool, built-ins included.
+    /// - `Script` / `Command` registers the user's implementation under a name
+    ///   no built-in owns: a new tool, or a replacement for a drop-in plugin
+    ///   script of that name.
+    /// - `Script` / `Command` keyed by a name in `builtin_names` is refused and
+    ///   the built-in stays active: script tools cannot shadow built-ins (D4,
+    ///   CURRENT_DECISIONS §26).
+    ///
+    /// Known limitation: like a drop-in name collision in [`Self::load_plugins`],
+    /// the refusal is an error in the runtime log only. `/plugin` does not list
+    /// `[tools.overrides]` entries, so it cannot show the refusal there.
     ///
     /// `plugin_dir` is used as the base for relative script paths.
     pub fn apply_overrides(
         &mut self,
         overrides: &std::collections::HashMap<String, crate::config::ToolOverride>,
         plugin_dir: &Path,
+        builtin_names: &std::collections::HashSet<String>,
     ) {
         for (tool_name, override_cfg) in overrides {
             match override_cfg {
@@ -384,6 +394,12 @@ impl ToolRegistry {
                     } else {
                         tracing::warn!("Cannot disable tool '{}': not registered", tool_name);
                     }
+                }
+                _ if builtin_names.contains(tool_name) => {
+                    tracing::error!(
+                        "Refusing [tools.overrides.{name}]: a script or command override cannot replace the built-in tool '{name}', which stays active; set type = \"disabled\" to turn it off, or key the override by a new tool name",
+                        name = crate::safe_label::SafeLabel::identifier(tool_name)
+                    );
                 }
                 _ => {
                     // Script and Command overrides create replacement tools.
@@ -415,8 +431,8 @@ impl ToolRegistry {
     /// Load and register plugin tools from a directory.
     ///
     /// Each script with valid frontmatter (`# name:`, `# description:`, etc.)
-    /// becomes a registered `ScriptPluginTool`. Name collisions are refused;
-    /// replacing a registered tool requires an explicit config override.
+    /// becomes a registered `ScriptPluginTool`. Name collisions are refused:
+    /// a script tool never replaces a registered tool.
     pub fn load_plugins(&mut self, plugin_dir: &Path) {
         if !plugin_dir.exists() {
             tracing::debug!(
@@ -432,7 +448,7 @@ impl ToolRegistry {
                 tracing::error!(
                     previous_origin = ?previous.registration_origin(),
                     plugin_origin = ?tool.registration_origin(),
-                    "Cannot load plugin tool '{}': name is already registered; use an explicit tool override",
+                    "Cannot load plugin tool '{}': name is already registered; script tools cannot replace a registered tool, so give the script its own name",
                     crate::safe_label::SafeLabel::identifier(tool.name())
                 );
                 continue;

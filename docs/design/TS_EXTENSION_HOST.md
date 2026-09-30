@@ -8,6 +8,18 @@
 > from the text that follows. Where they disagree, the newest "As built"
 > section and the code are current; the rest is the plan for later phases.
 
+## As built: script tools lose self-approval and shadowing (2026-09-30)
+
+CURRENT_DECISIONS §26 D4 landed in Rust ahead of phase 4, so R1 below and
+D9 describe the old behaviour. In `crates/tui/src/tools/plugin.rs` and
+`ToolRegistry::apply_overrides`: a script's `# approval: auto` is ignored and
+the tool gets the default a script with no `approval:` line gets (`Suggest`),
+reported in the runtime log and `/plugin tools`; a `[tools.overrides]`
+`script` / `command` entry keyed by a built-in is refused with a logged error
+and the built-in stays active (`disabled` still works). D9(a) planned
+`Required`, rememberable per tool: `Suggest` and `Required` resolve the same
+way in `resolve_tool_permission`, and per-tool remembering was not built.
+
 ## As built: Bun runtime (2026-09-30)
 
 The host can run on Bun as an opt-in: `[extension_host] runtime = "node" |

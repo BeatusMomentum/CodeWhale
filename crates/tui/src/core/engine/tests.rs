@@ -7747,6 +7747,15 @@ fn configure_plugin_tools_applies_overrides_after_discovered_plugins() {
             args: None,
         },
     );
+    // Everything registered before configuration is built in: D4 refuses a
+    // replacement for it.
+    overrides.insert(
+        "File".to_string(),
+        crate::config::ToolOverride::Command {
+            command: "configured-file".to_string(),
+            args: None,
+        },
+    );
     let tools_config = crate::config::ToolsConfig {
         plugin_dir: Some(plugin_dir.to_string_lossy().to_string()),
         overrides: Some(overrides),
@@ -7754,13 +7763,21 @@ fn configure_plugin_tools_applies_overrides_after_discovered_plugins() {
     };
 
     let ctx = crate::tools::ToolContext::new(tmp.path().to_path_buf());
-    let mut registry = crate::tools::ToolRegistry::new(ctx);
+    let mut registry = crate::tools::ToolRegistryBuilder::new()
+        .with_file_tools()
+        .build(ctx);
+    let file = registry.get("File").expect("built-in File");
 
     let plugin_names = configure_plugin_tools(&mut registry, Some(&tools_config));
 
     let tool = registry.get("same_tool").expect("same_tool registered");
     assert!(tool.description().contains("configured-command"));
     assert!(plugin_names.contains("same_tool"));
+    assert!(Arc::ptr_eq(
+        &registry.get("File").expect("File kept"),
+        &file
+    ));
+    assert!(!plugin_names.contains("File"));
 }
 
 fn make_plan(
