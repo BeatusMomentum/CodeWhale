@@ -64,6 +64,9 @@ pub(crate) enum AutoRouterSetupIssue {
     Incomplete,
     /// The route is complete but its credential is missing.
     MissingKey,
+    /// `thinking` is not a reasoning tier; the classifier call would carry
+    /// an effort the provider rejects or silently reinterprets.
+    InvalidThinking,
 }
 
 impl AutoRouterSetupIssue {
@@ -76,6 +79,9 @@ impl AutoRouterSetupIssue {
             }
             Self::Incomplete => "[auto.router] needs a known provider and a model",
             Self::MissingKey => "no API key for the router route",
+            Self::InvalidThinking => {
+                "[auto.router] thinking must be auto, off, minimal, low, medium, high, xhigh, ultra, or max"
+            }
         }
     }
 }
@@ -322,20 +328,28 @@ impl ModelInventory {
                 router_setup_issue = Some(AutoRouterSetupIssue::UnknownKind);
                 None
             }
-            Some(AutoRouterKind::Chat) => router_provider_setting
-                .and_then(ApiProvider::parse)
-                .zip(router_model_setting)
-                .map(|(provider, model)| {
-                    (
-                        provider,
-                        model.to_string(),
-                        router_table
-                            .and_then(|router| router.thinking.as_deref())
-                            .map(str::trim)
-                            .filter(|t| !t.is_empty())
-                            .map(str::to_string),
-                    )
-                }),
+            Some(AutoRouterKind::Chat) => {
+                let thinking = router_table
+                    .and_then(|router| router.thinking.as_deref())
+                    .map(str::trim)
+                    .filter(|t| !t.is_empty());
+                // A typo here would otherwise ride every classifier request
+                // as an effort string the provider rejects, failing Auto back
+                // to the local fallback on every turn.
+                if thinking.is_some_and(|thinking| {
+                    crate::reasoning_preference::ReasoningEffort::parse_strict(thinking).is_err()
+                }) {
+                    router_setup_issue = Some(AutoRouterSetupIssue::InvalidThinking);
+                    None
+                } else {
+                    router_provider_setting
+                        .and_then(ApiProvider::parse)
+                        .zip(router_model_setting)
+                        .map(|(provider, model)| {
+                            (provider, model.to_string(), thinking.map(str::to_string))
+                        })
+                }
+            }
             Some(AutoRouterKind::Decision) => {
                 match router_provider_setting.map(DecisionRouterRoute::parse) {
                     Some(None) => {
@@ -1505,6 +1519,30 @@ mod decision_router_inventory_tests {
             zai.router_setup_issue,
             Some(AutoRouterSetupIssue::UnsupportedDecisionProvider)
         );
+    }
+
+    #[test]
+    fn a_chat_router_with_an_unknown_thinking_tier_is_not_configured() {
+        let _env = hermetic();
+        let chat = |thinking: &str| crate::config::AutoRouterConfig {
+            kind: Some("chat".to_string()),
+            provider: Some("openrouter".to_string()),
+            model: Some("openai/gpt-5-mini".to_string()),
+            thinking: Some(thinking.to_string()),
+            ..Default::default()
+        };
+        let typo = ModelInventory::from_config(&with_router(chat("hgih"), true));
+        assert!(!typo.router_configured);
+        assert!(!typo.router_available);
+        assert_eq!(
+            typo.router_setup_issue,
+            Some(AutoRouterSetupIssue::InvalidThinking)
+        );
+
+        let valid = ModelInventory::from_config(&with_router(chat("low"), true));
+        assert!(valid.router_available);
+        assert_eq!(valid.router_setup_issue, None);
+        assert_eq!(valid.router_thinking.as_deref(), Some("low"));
     }
 
     #[test]

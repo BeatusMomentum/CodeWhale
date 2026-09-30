@@ -1222,6 +1222,17 @@ pub type RetryCallback = Box<dyn Fn(&LlmError, u32, Duration) + Send + Sync>;
 /// * `Ok(T)` - The successful result from the operation
 /// * `Err(RetryError)` - All retries exhausted or non-retryable error encountered
 ///
+/// # Known limitation: ambiguous failures are replayed
+///
+/// A timeout or connection loss after the request was written is retried
+/// like a connect failure, so a provider that already accepted the first
+/// attempt may bill a second completion. Every caller sends model inference
+/// (messages, FIM, translation, speech, provider web search): a replay costs
+/// compute but has no external side effect, and the provider APIs used here
+/// expose no idempotency key for these requests that could dedupe it. An
+/// operation with an external side effect must not be retried through this
+/// helper without an idempotency key the server honors.
+///
 /// # Example
 ///
 /// ```ignore
