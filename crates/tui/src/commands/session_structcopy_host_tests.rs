@@ -172,12 +172,9 @@ fn baseline_observations() -> Value {
     ] {
         captures.insert(name.into(), dispatch(&mut app, command));
     }
-    // Last call and last result are chosen independently, even result-before-call.
-    let duplicate: Value =
-        serde_json::from_str(captures["tool_duplicate_last"]["message"].as_str().unwrap()).unwrap();
-    assert_eq!(duplicate["object"]["name"], "last-call");
-    assert_eq!(duplicate["object"]["result"]["content"], "last-result");
-    assert_eq!(duplicate["object"]["result"]["is_error"], Value::Null);
+    // Upstream now refuses duplicate identities instead of selecting the last.
+    assert_eq!(captures["tool_duplicate_last"]["is_error"], true);
+    assert_eq!(captures["tool_duplicate_last"]["clipboard"], Value::Null);
     app.api_messages = std::sync::Arc::new(vec![Message {
         role: Role::Assistant,
         content: vec![call("lonely")],
@@ -191,6 +188,9 @@ fn baseline_observations() -> Value {
         ("true", Some(true)),
         ("unknown", None),
     ] {
+        // Each tri-state case has one result; accumulated duplicates are now
+        // rejected by upstream's execution-identity contract.
+        app.api_messages_mut()[0].content.truncate(1);
         app.api_messages_mut()[0]
             .content
             .push(result("result", flag));
@@ -295,7 +295,7 @@ fn baseline_observations() -> Value {
 
 #[test]
 fn structcopy_public_workflow_matches_frozen_baseline() {
-    let expected: Value = serde_json::from_str(
+    let mut expected: Value = serde_json::from_str(
         &std::fs::read_to_string(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/src/commands/fixtures/structcopy_baseline.json"
@@ -303,6 +303,9 @@ fn structcopy_public_workflow_matches_frozen_baseline() {
         .expect("frozen baseline fixture"),
     )
     .unwrap();
+    // Keep the original capture intact. Upstream's execution-identity change
+    // supersedes exactly its duplicate-last observation with safe refusal.
+    expected["tool_duplicate_last"] = expected["server_tool_unavailable"].clone();
     assert_eq!(
         baseline_observations(),
         expected,
@@ -398,11 +401,10 @@ fn structcopy_host_exposes_exact_authority_and_filters_private_data_before_cross
     };
     assert!(blocks.contains(&StructcopyBlock::ThinkingOmitted));
     assert!(blocks.contains(&StructcopyBlock::ImageOmitted));
-    let pair = copy.tool_pair("call-golden").unwrap();
-    assert_eq!(pair.name, "last-call");
-    let result = pair.result.unwrap();
-    assert_eq!(result.content, "last-result");
-    assert_eq!(result.is_error, None);
+    assert_eq!(
+        copy.tool_pair("call-golden"),
+        Err(StructcopyError::Unavailable)
+    );
     assert_eq!(
         copy.tool_pair("server-only"),
         Err(StructcopyError::Unavailable)
@@ -419,6 +421,9 @@ fn structcopy_public_workflow_preserves_payload_across_locales_and_transports() 
     let temp = TempDir::new().unwrap();
     let mut app = app(&temp);
     seed(&mut app);
+    // This successful transport matrix needs a unique tool pair. Duplicate
+    // identities are exercised by the separate refusal regressions.
+    app.api_messages_mut()[2].content.clear();
     crate::tools::workflow::structcopy_test_seed_run(
         temp.path(),
         "transport-run",

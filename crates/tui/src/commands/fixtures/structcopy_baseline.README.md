@@ -18,3 +18,14 @@ Capture command and original source/log hashes are retained in the external
 FEAT-026 MemoryBank evidence/P2 directory. Numeric test counts do not substitute
 for these comparisons. A modified expected receipt is used as a negative control
 and then restored byte-for-byte; ordinary tests never write their expectations.
+
+## Current-main reconciliation (2026-09-30)
+
+Upstream added explicit host execution identities and rejects duplicate or
+inconsistent tool-call matches. The original fixture remains byte-identical.
+The assertion replaces only the historical `tool_duplicate_last` expectation
+with the existing tool-unavailable receipt. Tri-state fixtures now contain one
+result each, rather than accumulating duplicates. The upstream tests
+`tool_copy_selects_execution_when_provider_reuses_wire_id` and
+`tool_copy_refuses_ambiguous_or_inconsistent_identity` move unchanged into
+`session_structcopy_regression_tests.rs` and protect the new identity rules.

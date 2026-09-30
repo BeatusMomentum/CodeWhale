@@ -42,9 +42,15 @@ impl CommandSessionStructcopyContext for SessionStructcopyAdapter<'_> {
         }
         // Preserve upstream execution identity, including ambiguous local/legacy
         // collisions. An explicit execution ID never falls back to a wire ID.
-        let mut calls = app.api_messages.iter().flat_map(|message| &message.content)
+        let mut calls = app
+            .api_messages
+            .iter()
+            .flat_map(|message| &message.content)
             .filter_map(|block| match block {
-                ContentBlock::ToolUse { id, name, input, .. } => block.tool_call_key()
+                ContentBlock::ToolUse {
+                    id, name, input, ..
+                } => block
+                    .tool_call_key()
                     .filter(|key| key.as_str() == call_id)
                     .map(|key| (key, id, name, input)),
                 _ => None,
@@ -60,14 +66,29 @@ impl CommandSessionStructcopyContext for SessionStructcopyAdapter<'_> {
             if block.tool_call_key() != Some(key) {
                 continue;
             }
-            if let ContentBlock::ToolResult { tool_use_id, content, is_error, content_blocks, .. } = block {
+            if let ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+                content_blocks,
+                ..
+            } = block
+            {
                 if tool_use_id != provider_id || result.is_some() {
                     return Err(StructcopyError::Unavailable);
                 }
-                result = Some(project_result(content, *is_error, content_blocks.as_deref()));
+                result = Some(project_result(
+                    content,
+                    *is_error,
+                    content_blocks.as_deref(),
+                ));
             }
         }
-        Ok(StructcopyToolPair { name: name.clone(), input: input.clone(), result })
+        Ok(StructcopyToolPair {
+            name: name.clone(),
+            input: input.clone(),
+            result,
+        })
     }
 
     fn plan_snapshot(&self) -> Result<StructcopyPlan, StructcopyError> {

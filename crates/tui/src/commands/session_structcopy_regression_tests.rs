@@ -1665,4 +1665,3 @@ fn tool_copy_refuses_ambiguous_or_inconsistent_identity() {
         );
     }
 }
-
