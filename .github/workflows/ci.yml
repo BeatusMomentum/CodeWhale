@@ -822,6 +822,25 @@ jobs:
             sleep 15
           done
           sudo apt-get install -y libdbus-1-dev pkg-config
+      - name: Ubuntu build headroom
+        # The combined wave/0.10.1-next workspace build was terminated
+        # mid-compile on every PR run ("runner has received a shutdown
+        # signal", exit 143, no newer push to cancel it) while single-fix PRs
+        # finished the same build in ~10 minutes. Drop preinstalled SDKs this
+        # job never uses and add swap so the full --all-features test build
+        # has disk and memory headroom; the Run tests step logs both.
+        if: needs.changes.outputs.heavy == 'true' && matrix.os == 'ubuntu-latest' && (github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request')
+        shell: bash
+        run: |
+          df -h / /mnt; free -m
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          if sudo fallocate -l 8G /mnt/cw-swapfile && sudo chmod 600 /mnt/cw-swapfile \
+            && sudo mkswap /mnt/cw-swapfile >/dev/null && sudo swapon /mnt/cw-swapfile; then
+            echo "Added 8 GiB swap at /mnt/cw-swapfile"
+          else
+            echo "::warning::Could not add swap; continuing with the runner default"
+          fi
+          df -h / /mnt; free -m
       - uses: Swatinem/rust-cache@v2
         if: needs.changes.outputs.heavy == 'true' && (matrix.os != 'ubuntu-latest' || github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request')
         with:
@@ -879,7 +898,20 @@ jobs:
         # one. nextest does not run doctests — the next step keeps them.
         if: needs.changes.outputs.heavy == 'true' && (matrix.os != 'ubuntu-latest' || github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request') && !(github.event_name == 'workflow_dispatch' && inputs.workspace_test_mode == 'shared-process-twice')
         shell: bash
-        run: sh scripts/with-hermetic-test-home.sh cargo nextest run --workspace --all-features --locked --profile ci
+        run: |
+          monitor=
+          if [ "$RUNNER_OS" = Linux ]; then
+            # Headroom trace: if the runner is terminated again, the last lines
+            # say whether memory or disk ran out.
+            ( while sleep 30; do
+                echo "[headroom] $(free -m | awk '/^Mem:/{print "mem used " $3 "/" $2 " MiB"} /^Swap:/{print "swap used " $3 "/" $2 " MiB"}' | paste -sd ' ') disk free $(df -h / | awk 'NR==2{print $4}')"
+              done ) &
+            monitor=$!
+          fi
+          status=0
+          sh scripts/with-hermetic-test-home.sh cargo nextest run --workspace --all-features --locked --profile ci || status=$?
+          if [ -n "$monitor" ]; then kill "$monitor" 2>/dev/null || true; fi
+          exit "$status"
         env:
           CODEWHALE_EXT_HOST_TESTS: '1'
           # sccache 0.17 panics resolving its config directory under the
