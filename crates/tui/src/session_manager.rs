@@ -4882,6 +4882,103 @@ mod tests {
     }
 
     #[test]
+    fn external_mutations_keep_the_live_lease_until_the_blocked_write_finishes() {
+        let _env = crate::test_support::lock_test_env();
+        for operation in ["rename", "archive", "delete"] {
+            let tmp = tempdir().expect("tempdir");
+            let manager = std::sync::Arc::new(
+                SessionManager::new(tmp.path().join("sessions")).expect("manager"),
+            );
+            let id = "88888888-8888-4888-8888-888888888888";
+            save_late_usage_test_session(&manager, id);
+            // Hold the actual persistence lock so the shipping mutation stays
+            // between admission and commit while another surface tries attach.
+            let (_, lock_path) = manager.ensure_late_usage_paths(id).expect("paths");
+            let mut lock = fd_lock::RwLock::new(open_private_lock_file(&lock_path).unwrap());
+            let write_guard = lock.write().expect("hold persistence lock");
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            let worker_manager = manager.clone();
+            let ticket = crate::test_support::env_scope_ticket();
+            let worker = std::thread::spawn(move || {
+                let _membership = crate::test_support::join_env_scope(ticket);
+                entered_tx.send(()).unwrap();
+                match operation {
+                    "rename" => worker_manager
+                        .rename_session(id, "Atomic rename", SessionMutator::External)
+                        .map(|_| ()),
+                    "archive" => worker_manager
+                        .set_session_archived(id, true, SessionMutator::External)
+                        .map(|_| ()),
+                    "delete" => worker_manager.delete_session(id),
+                    _ => unreachable!(),
+                }
+            });
+            entered_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while !manager.is_session_live_anywhere(id)
+                && !worker.is_finished()
+                && std::time::Instant::now() < deadline
+            {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            let holds_lease = manager.is_session_live_anywhere(id);
+            let attach_refused = manager
+                .reserve_session_for_attach(id)
+                .is_err_and(|error| error.kind() == io::ErrorKind::ResourceBusy);
+            // Release and join before asserting, even in the fixes-off case;
+            // no failed assertion may leave a blocked mutation behind.
+            drop(write_guard);
+            worker
+                .join()
+                .expect("mutation worker")
+                .expect("mutation succeeds");
+            assert!(holds_lease, "{operation}: released its lease before commit");
+            assert!(
+                attach_refused,
+                "{operation}: admitted a competing session owner"
+            );
+            assert!(
+                !manager.is_session_live_anywhere(id),
+                "{operation}: leaked its lease"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn uncertain_live_lease_refuses_external_mutations_without_changing_history() {
+        let tmp = tempdir().expect("tempdir");
+        let manager = SessionManager::new(tmp.path().join("sessions")).expect("manager");
+        let id = "99999999-9999-4999-8999-999999999999";
+        save_late_usage_test_session(&manager, id);
+        let snapshot = manager.validated_session_path(id).unwrap();
+        let original = fs::read(&snapshot).unwrap();
+        let target = tmp.path().join("untouched");
+        fs::write(&target, b"unrelated bytes").unwrap();
+        let live_path = manager.live_lease_path(id, true).unwrap();
+        std::os::unix::fs::symlink(&target, &live_path).unwrap();
+        assert!(
+            manager.is_session_live_anywhere(id),
+            "uncertain ownership is not free"
+        );
+        assert!(
+            manager
+                .rename_session(id, "Unsafe", SessionMutator::External)
+                .is_err()
+        );
+        assert!(
+            manager
+                .set_session_archived(id, true, SessionMutator::External)
+                .is_err()
+        );
+        assert!(manager.delete_session(id).is_err());
+        assert_eq!(fs::read(snapshot).unwrap(), original);
+        assert_eq!(fs::read(target).unwrap(), b"unrelated bytes");
+    }
+
+    #[test]
     fn retention_fails_closed_on_an_unreadable_legacy_checkpoint_origin() {
         let tmp = tempdir().expect("tempdir");
         let manager = SessionManager::new(tmp.path().join("sessions")).expect("manager");
