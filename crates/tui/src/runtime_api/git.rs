@@ -2552,7 +2552,12 @@ mod tests {
         let ws = tmp.path();
         git(ws, &["config", "filter.up.clean", "tr a-z A-Z"]);
         fs::write(ws.join(".gitattributes"), "*.txt filter=up\n").unwrap();
-        git(ws, &["add", ".gitattributes", "a.txt"]);
+        git(ws, &["add", ".gitattributes"]);
+        // The tracked file is unchanged since the initial commit. Apply the
+        // new attributes explicitly instead of depending on Git's cached
+        // stat entry deciding to run the newly configured clean filter.
+        git(ws, &["add", "--renormalize", "a.txt"]);
+        assert_eq!(run_git_sync(ws, &["show", ":a.txt"]).unwrap(), "ONE\n");
         git(ws, &["commit", "-q", "-m", "filtered"]);
         fs::File::options()
             .write(true)
