@@ -2637,8 +2637,21 @@ impl Engine {
                         .await;
                 }
                 if !repl_blocks.is_empty() && repl_fence_skip_reason.is_none() {
+                    let child_deadline = tokio::time::Instant::now()
+                        + crate::tools::subagent::DEFAULT_CHILD_WALL_TIME;
+                    let repl_deadline = self
+                        .nested_work_deadline()
+                        .map_or(child_deadline, |parent| parent.min(child_deadline));
                     if self.repl_kernel.is_none() {
-                        self.repl_kernel = match crate::repl::runtime::PythonRuntime::new().await {
+                        let startup = tokio::time::timeout_at(
+                            repl_deadline,
+                            crate::repl::runtime::PythonRuntime::new(),
+                        )
+                        .await
+                        .unwrap_or_else(|_| {
+                            Err("parent turn deadline reached during REPL startup".into())
+                        });
+                        self.repl_kernel = match startup {
                             Ok(runtime) => Some(runtime),
                             Err(e) => {
                                 let _ = self
@@ -2652,12 +2665,17 @@ impl Engine {
                     }
 
                     let kernel_context = self.repl_kernel_context();
-                    let refresh_result = self
-                        .repl_kernel
-                        .as_mut()
-                        .expect("REPL kernel initialized above")
-                        .replace_context(&kernel_context)
-                        .await;
+                    let refresh_result = tokio::time::timeout_at(
+                        repl_deadline,
+                        self.repl_kernel
+                            .as_mut()
+                            .expect("REPL kernel initialized above")
+                            .replace_context(&kernel_context),
+                    )
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err("parent turn deadline reached during REPL context refresh".into())
+                    });
                     if let Err(e) = refresh_result {
                         // A broken subprocess cannot be trusted to retain
                         // state. Drop it so a later model step gets a clean,
@@ -2695,7 +2713,7 @@ impl Engine {
                         // A nested `rlm_query` reports on this turn's stream,
                         // so its model calls are part of the record (#6511).
                         .with_events(self.tx_event.clone())
-                        .with_deadline(self.nested_work_deadline())
+                        .with_deadline(Some(repl_deadline))
                     });
                     let repl_cost_scope = crate::cost_status::scope_token();
                     let repl_started = Instant::now();
@@ -2712,28 +2730,17 @@ impl Engine {
                             )))
                             .await;
 
-                        let round_result = match bridge.as_ref() {
-                            Some(bridge) => tokio::time::timeout_at(
-                                bridge.deadline(),
-                                self.repl_kernel
-                                    .as_mut()
-                                    .expect("REPL kernel stays alive during a round")
-                                    .run(&block.code, Some(bridge)),
-                            )
-                            .await
-                            .unwrap_or_else(|_| {
-                                Err(anyhow::anyhow!(
-                                    "REPL execution reached the parent turn deadline"
-                                ))
-                            }),
-                            None => {
-                                self.repl_kernel
-                                    .as_mut()
-                                    .expect("REPL kernel stays alive during a round")
-                                    .execute(&block.code)
-                                    .await
-                            }
-                        };
+                        let round_result = tokio::time::timeout_at(
+                            repl_deadline,
+                            self.repl_kernel
+                                .as_mut()
+                                .expect("REPL kernel stays alive during a round")
+                                .run(&block.code, bridge.as_ref()),
+                        )
+                        .await
+                        .unwrap_or_else(|_| {
+                            Err("REPL execution reached the parent turn deadline".into())
+                        });
 
                         match round_result {
                             Ok(round) => {

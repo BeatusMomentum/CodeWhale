@@ -475,16 +475,22 @@ impl RlmTool {
                  Example: {\"name\": \"<ctx>\", \"code\": \"print(len(content))\"}; call FINAL(value) to return a result handle.",
             )
         })?;
-        if context
-            .turn_deadline
-            .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
-        {
+        let deadline = context.turn_deadline.unwrap_or_else(|| {
+            tokio::time::Instant::now() + crate::tools::subagent::DEFAULT_CHILD_WALL_TIME
+        });
+        if tokio::time::Instant::now() >= deadline {
             return Err(ToolError::execution_failed(
                 "RLM parent turn deadline exhausted before execution",
             ));
         }
-        let session = get_session(context, name).await?;
-        let mut session = session.lock().await;
+        let mut session = tokio::time::timeout_at(deadline, async {
+            let session = get_session(context, name).await?;
+            Ok::<_, ToolError>(session.lock_owned().await)
+        })
+        .await
+        .map_err(|_| {
+            ToolError::execution_failed("RLM parent turn deadline exhausted waiting for context")
+        })??;
         let config = session.config.clone();
 
         let Some(kernel) = session.kernel.as_mut() else {
@@ -494,9 +500,6 @@ impl RlmTool {
         };
 
         let started = Instant::now();
-        let deadline = context.turn_deadline.unwrap_or_else(|| {
-            tokio::time::Instant::now() + crate::tools::subagent::DEFAULT_CHILD_WALL_TIME
-        });
         let (round, child_usage_batch, nested_events) = if let Some(client) = self.client.clone() {
             let bridge = RlmBridge::new(
                 Arc::new(client),
@@ -1446,6 +1449,59 @@ mod tests {
                 .is_none(),
             "a failed interpreter must not be reused"
         );
+    }
+
+    #[tokio::test]
+    async fn parent_deadline_bounds_rlm_session_lock_waits() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut context = ToolContext::new(temp.path());
+        let tool = RlmTool::new("rlm", None);
+        tool.execute(
+            json!({"action": "open", "name": "contended", "content": "fixture"}),
+            &context,
+        )
+        .await
+        .unwrap();
+        let session = get_session(&context, "contended").await.unwrap();
+        let marker = temp.path().join("must-not-exist");
+        let code = format!(
+            "open({}, 'w').write('ran')",
+            serde_json::to_string(&marker.to_string_lossy()).unwrap()
+        );
+        for registry_locked in [true, false] {
+            context.turn_deadline = Some(tokio::time::Instant::now() + Duration::from_millis(50));
+            let registry_guard = if registry_locked {
+                Some(context.runtime.rlm_sessions.lock().await)
+            } else {
+                None
+            };
+            let session_guard = if registry_locked {
+                None
+            } else {
+                Some(session.lock().await)
+            };
+            let error = tokio::time::timeout(
+                Duration::from_secs(2),
+                tool.execute(
+                    json!({"action": "eval", "name": "contended", "code": code}),
+                    &context,
+                ),
+            )
+            .await
+            .expect("lock waits must obey the parent deadline")
+            .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("deadline exhausted waiting for context")
+            );
+            assert!(!marker.exists());
+            drop(session_guard);
+            drop(registry_guard);
+        }
+        tool.execute(json!({"action": "close", "name": "contended"}), &context)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
