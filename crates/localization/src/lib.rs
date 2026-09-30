@@ -6004,8 +6004,8 @@ mod tests {
             (Locale::Ru, "Воркеры флота текущего сеанса:"),
             (Locale::Uk, "Воркери флоту поточного сеансу:"),
             (Locale::Vi, "Worker hạm đội của phiên hiện tại:"),
-            (Locale::ZhHans, "当前会话的舰队工作器："),
-            (Locale::ZhHant, "目前工作階段的艦隊工作器："),
+            (Locale::ZhHans, "本会话的智能体："),
+            (Locale::ZhHant, "本工作階段的代理："),
         ];
         assert_eq!(expected.len(), Locale::shipped_complete().len());
 

@@ -134,7 +134,7 @@ Codewhale observation is retained. The separately attributed Codex-owned
 native cache keeps its existing freshness policy when no login-file version
 can be observed; this is not proof of account identity in an external keyring.
 
-The canonical provider IDs are the 44 entries of `ProviderKind::ALL`
+The canonical provider IDs are the entries of `ProviderKind::ALL`
 (`crates/config/src/provider_kind.rs`), in that order:
 
 `deepseek`, `nvidia-nim`, `openai`, `atlascloud`, `wanjie-ark`, `volcengine`,

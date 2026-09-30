@@ -3033,16 +3033,16 @@ either resize the batch or tell the user which setting to change.
 
 ### User-input wait timeout
 
-Questions from `request_user_input` wait a bounded time and then cancel with
-a timeout (#6003). The default is 300 seconds.
-Raise it when you step away or read carefully, or set `0` to wait forever
-(overnight automation, long human review). Headless `exec` runs have no
+Questions from `request_user_input` wait until answered or canceled by default
+(#6003). An omitted setting or `0` leaves the wait unbounded; a positive value
+cancels the question when that many seconds pass, capped at 86,400 (24 hours).
+Headless `exec` runs have no
 responder, so `request_user_input` is withheld there by default:
 the model reports the tool absent and finishes instead of stalling.
 
 ```toml
 [tools]
-user_input_timeout_seconds = 300   # default 300; 0 disables the timeout; clamped to 86400 (24h)
+user_input_timeout_seconds = 300   # opt into 5 minutes; omitted or 0 waits indefinitely; maximum 86400
 ```
 
 This key governs question waits only. Approvals have their own clock,
