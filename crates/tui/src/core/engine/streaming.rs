@@ -7,18 +7,60 @@
 use codewhale_models::ToolCaller;
 use std::time::Duration;
 
-impl super::Engine {
-    /// Forward a nonterminal stream observation through the existing event
-    /// queue. Backpressure remains lossless while the turn is live; cancellation
-    /// drops a pending observation so a stalled consumer cannot keep the model
-    /// stream alive. Terminal settlement still owns ordered, lossless delivery
-    /// and may wait for a consumer that never drains this bounded queue.
-    pub(super) async fn send_stream_event(&self, event: super::Event) -> bool {
-        tokio::select! {
+/// A send that did not enter the existing event queue. Cancellation is not
+/// evidence that the consumer closed, and neither is user-visible delivery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum EventSendError {
+    Cancelled,
+    Closed,
+}
+
+/// Reserve from the one event queue. A terminal reservation is held by its
+/// turn; ordinary sends consume theirs immediately. A live turn retains
+/// lossless backpressure, cancellation releases its wait, and idle sends have
+/// no turn token to cancel them.
+pub(super) async fn reserve_event_capacity(
+    tx: &tokio::sync::mpsc::Sender<super::Event>,
+    cancel: Option<&tokio_util::sync::CancellationToken>,
+) -> Result<tokio::sync::mpsc::OwnedPermit<super::Event>, EventSendError> {
+    let reserve = tx.clone().reserve_owned();
+    match cancel {
+        Some(cancel) => tokio::select! {
             biased;
-            () = self.cancel_token.cancelled() => false,
-            result = self.tx_event.send(event) => result.is_ok(),
+            () = cancel.cancelled() => Err(EventSendError::Cancelled),
+            result = reserve => result.map_err(|_| EventSendError::Closed),
+        },
+        None => reserve.await.map_err(|_| EventSendError::Closed),
+    }
+}
+
+impl super::Engine {
+    /// Stream observations always belong to the decoder's current turn,
+    /// including direct test/embedding calls that do not enqueue an Op.
+    pub(super) async fn send_stream_event(&self, event: super::Event) -> bool {
+        match reserve_event_capacity(&self.tx_event, Some(&self.cancel_token)).await {
+            Ok(permit) => {
+                permit.send(event);
+                true
+            }
+            Err(_) => false,
         }
+    }
+
+    /// Every instance emitter uses the same queue authority. The existing
+    /// TurnControl owns cancellation; an idle refresh must not inherit the
+    /// token of an earlier interrupted turn.
+    pub(super) async fn send_event(&self, event: super::Event) -> Result<(), EventSendError> {
+        let cancel = self
+            .turn_controls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .active
+            .as_ref()
+            .map(|control| control.cancel.clone());
+        let permit = reserve_event_capacity(&self.tx_event, cancel.as_ref()).await?;
+        permit.send(event);
+        Ok(())
     }
 }
 

@@ -864,8 +864,7 @@ impl Engine {
             format!(" ({failed} failed)")
         };
         let _ = self
-            .tx_event
-            .send(Event::status(format!(
+            .send_event(Event::status(format!(
                 "Resuming turn with {count} {prefix}sub-agent completion(s){failure_suffix}"
             )))
             .await;
@@ -904,8 +903,7 @@ impl Engine {
         let context_text =
             crate::tui::auto_review::build_reviewer_context(context, held_reason, tool_input);
         let _ = self
-            .tx_event
-            .send(Event::status(format!(
+            .send_event(Event::status(format!(
                 "Auto-Review checking '{}'",
                 context.tool_name
             )))
@@ -927,8 +925,7 @@ impl Engine {
             if usage_has_reported_data(usage) {
                 let request_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
                 let _ = self
-                    .tx_event
-                    .send(Event::RoutedTurnUsage {
+                    .send_event(Event::RoutedTurnUsage {
                         usage: usage.clone(),
                         duration_ms: request_ms,
                         first_token_ms: None,
@@ -972,8 +969,7 @@ impl Engine {
         }));
         if let Some((verdict, reason)) = receipt {
             let _ = self
-                .tx_event
-                .send(Event::ToolGateDecision {
+                .send_event(Event::ToolGateDecision {
                     agent_id: None,
                     tool_id: tool_id.to_string(),
                     tool_name: context.tool_name.to_string(),
@@ -1114,7 +1110,7 @@ impl Engine {
 
         loop {
             if self.cancel_token.is_cancelled() {
-                let _ = self.tx_event.send(Event::status("Request cancelled")).await;
+                let _ = self.send_event(Event::status("Request cancelled")).await;
                 return (TurnOutcomeStatus::Interrupted, None);
             }
             self.turn_heartbeat.enter(
@@ -1133,7 +1129,7 @@ impl Engine {
             // never a clean success — the turn ends `Failed` with the limit
             // named, matching how the step ceiling below reports.
             if let Some(error) = self.turn_wall_clock_exhausted_error() {
-                let _ = self.tx_event.send(Event::status(error.clone())).await;
+                let _ = self.send_event(Event::status(error.clone())).await;
                 return (TurnOutcomeStatus::Failed, Some(error));
             }
 
@@ -1160,8 +1156,7 @@ impl Engine {
                 self.add_session_message(self.user_text_message_with_turn_metadata(steer.clone()))
                     .await;
                 let _ = self
-                    .tx_event
-                    .send(Event::status(format!(
+                    .send_event(Event::status(format!(
                         "Steer input accepted: {}",
                         summarize_text(&steer, 120)
                     )))
@@ -1215,8 +1210,7 @@ impl Engine {
                 self.add_session_message(self.user_text_message_with_turn_metadata(notice))
                     .await;
                 let _ = self
-                    .tx_event
-                    .send(Event::status(
+                    .send_event(Event::status(
                         "Soft landing: wrap up with your final report",
                     ))
                     .await;
@@ -1239,8 +1233,7 @@ impl Engine {
                     self.add_session_message(self.user_text_message_with_turn_metadata(notice))
                         .await;
                     let _ = self
-                        .tx_event
-                        .send(Event::status(
+                        .send_event(Event::status(
                             "Model budget exhausted — final report requested",
                         ))
                         .await;
@@ -1252,7 +1245,7 @@ impl Engine {
                         turn.max_steps,
                         turn.budget_source.key_label(),
                     );
-                    let _ = self.tx_event.send(Event::status(error.clone())).await;
+                    let _ = self.send_event(Event::status(error.clone())).await;
                     return (TurnOutcomeStatus::Failed, Some(error));
                 }
             }
@@ -1270,9 +1263,7 @@ impl Engine {
                 && let Some(budget) = snapshot.token_budget
                 && snapshot.tokens_used >= u64::from(budget)
             {
-                let _ = self
-                    .tx_event
-                    .send(Event::status(format!(
+                let _ = self.send_event(Event::status(format!(
                         "Goal over token budget ({} / {budget} tokens) — continuing (unbounded); verify or /goal clear when done.",
                         snapshot.tokens_used
                     )))
@@ -1354,7 +1345,7 @@ impl Engine {
                                 billed = ?billed_input_tokens,
                                 "auto-compaction refused under pressure"
                             );
-                            let _ = self.tx_event.send(Event::status(message)).await;
+                            let _ = self.send_event(Event::status(message)).await;
                         }
                         false
                     }
@@ -1493,7 +1484,7 @@ impl Engine {
                                 message.clone(),
                             )
                             .await;
-                            let _ = self.tx_event.send(Event::status(message)).await;
+                            let _ = self.send_event(Event::status(message)).await;
                         }
                     }
                     Err(err) => {
@@ -1507,7 +1498,7 @@ impl Engine {
                         );
                         self.emit_compaction_failed(compaction_id.clone(), true, message.clone())
                             .await;
-                        let _ = self.tx_event.send(Event::status(message)).await;
+                        let _ = self.send_event(Event::status(message)).await;
                     }
                 }
                 self.finish_compaction(&compaction_id);
@@ -1515,7 +1506,7 @@ impl Engine {
                 // turn's. Recheck the wall clock before it can authorize the
                 // provider request below.
                 if let Some(error) = self.turn_wall_clock_exhausted_error() {
-                    let _ = self.tx_event.send(Event::status(error.clone())).await;
+                    let _ = self.send_event(Event::status(error.clone())).await;
                     return (TurnOutcomeStatus::Failed, Some(error));
                 }
             }
@@ -1593,8 +1584,7 @@ impl Engine {
                         );
                         turn_error = Some(message.clone());
                         let _ = self
-                            .tx_event
-                            .send(Event::error(ErrorEnvelope::context_overflow(message)))
+                            .send_event(Event::error(ErrorEnvelope::context_overflow(message)))
                             .await;
                         return (TurnOutcomeStatus::Failed, turn_error);
                     }
@@ -1627,7 +1617,7 @@ impl Engine {
                             display_message.clone(),
                         );
                         envelope.message = display_message.clone();
-                        let _ = self.tx_event.send(Event::error(envelope)).await;
+                        let _ = self.send_event(Event::error(envelope)).await;
                         return (TurnOutcomeStatus::Failed, Some(display_message));
                     }
                     let message = if crate::compaction::has_compactable_history(
@@ -1649,8 +1639,7 @@ impl Engine {
                         )
                     };
                     let _ = self
-                        .tx_event
-                        .send(Event::error(ErrorEnvelope::context_overflow(
+                        .send_event(Event::error(ErrorEnvelope::context_overflow(
                             message.clone(),
                         )))
                         .await;
@@ -1770,7 +1759,7 @@ impl Engine {
                         }
                     }
                 };
-                let _ = self.tx_event.send(event).await;
+                let _ = self.send_event(event).await;
             }
 
             // Three-zone prefix contract (#2264): freeze baseline on first
@@ -1808,8 +1797,7 @@ impl Engine {
                     );
                     let frozen = pinned.freeze();
                     let _ = self
-                        .tx_event
-                        .send(Event::PrefixCacheChange {
+                        .send_event(Event::PrefixCacheChange {
                             description: format!("frozen: {}", frozen.short_id()),
                             system_prompt_changed: false,
                             tools_changed: false,
@@ -1898,7 +1886,7 @@ impl Engine {
                     )
                     .replace("{model}", &self.session.model)
                     .replace("{count}", &fresh_images.to_string());
-                    let _ = self.tx_event.send(Event::status(status)).await;
+                    let _ = self.send_event(Event::status(status)).await;
                 }
             }
             let tool_request_snapshot =
@@ -1920,8 +1908,7 @@ impl Engine {
             // when the wire dies before any content was streamed (#103).
             let stream_request = request;
             let _ = self
-                .tx_event
-                .send(Event::ToolRequestSnapshot {
+                .send_event(Event::ToolRequestSnapshot {
                     snapshot: tool_request_snapshot,
                 })
                 .await;
@@ -1929,8 +1916,7 @@ impl Engine {
                 // The "Continuing — " prefix classifies the receipt as
                 // internal: durable clients keep it, collapsed.
                 let _ = self
-                    .tx_event
-                    .send(Event::status(format!(
+                    .send_event(Event::status(format!(
                         "{REQUEST_NUDGE_RECEIPT_PREFIX}{nudge}"
                     )))
                     .await;
@@ -1958,8 +1944,7 @@ impl Engine {
                         });
                 }
                 let _ = self
-                    .tx_event
-                    .send(Event::RouteDispatched {
+                    .send_event(Event::RouteDispatched {
                         turn_id: turn.id.clone(),
                         route,
                     })
@@ -1981,7 +1966,7 @@ impl Engine {
             let stream_result = tokio::select! {
                 biased;
                 () = self.cancel_token.cancelled() => {
-                    let _ = self.tx_event.send(Event::status("Request cancelled")).await;
+                    let _ = self.send_event(Event::status("Request cancelled")).await;
                     return (TurnOutcomeStatus::Interrupted, None);
                 }
                 result = async {
@@ -2038,7 +2023,7 @@ impl Engine {
                             codewhale_localization::MessageId::ImageInputRejectedResent,
                         )
                         .replace("{model}", &self.session.model);
-                        let _ = self.tx_event.send(Event::status(status)).await;
+                        let _ = self.send_event(Event::status(status)).await;
                         continue;
                     }
                     let display_message = self.decorate_auth_error_message(
@@ -2070,7 +2055,7 @@ impl Engine {
                         turn.stop_diagnostics.stream_resumes =
                             turn.stop_diagnostics.stream_resumes.saturating_add(1);
                         if attempt == 2 {
-                            let _ = self.tx_event.send(Event::status("Reconnecting…")).await;
+                            let _ = self.send_event(Event::status("Reconnecting…")).await;
                         }
                         crate::logging::warn(format!(
                             "Stream failed to open (attempt {attempt}/{}); retrying request: {message}",
@@ -2092,7 +2077,7 @@ impl Engine {
                         self.emit_session_updated().await;
                     }
                     turn_error = Some(display_message);
-                    let _ = self.tx_event.send(Event::error(envelope)).await;
+                    let _ = self.send_event(Event::error(envelope)).await;
                     return (TurnOutcomeStatus::Failed, turn_error);
                 }
             };
@@ -2169,8 +2154,7 @@ impl Engine {
             self.session.latest_parent_input_tokens = turn.latest_parent_input_tokens;
             if usage_reported {
                 let _ = self
-                    .tx_event
-                    .send(Event::TurnUsage {
+                    .send_event(Event::TurnUsage {
                         max_output_tokens: turn
                             .max_output_tokens
                             .map(|_| stream_request.max_tokens),
@@ -2208,7 +2192,7 @@ impl Engine {
             }
 
             if self.cancel_token.is_cancelled() {
-                let _ = self.tx_event.send(Event::status("Request cancelled")).await;
+                let _ = self.send_event(Event::status("Request cancelled")).await;
                 self.add_interrupted_assistant_text(&current_text_visible)
                     .await;
                 return (TurnOutcomeStatus::Interrupted, None);
@@ -2288,7 +2272,7 @@ impl Engine {
                 // show one calm progress notice; diagnostics retain every
                 // attempt and an exhausted budget still fails visibly.
                 if attempt == 2 {
-                    let _ = self.tx_event.send(Event::status("Reconnecting…")).await;
+                    let _ = self.send_event(Event::status("Reconnecting…")).await;
                 }
                 match resume {
                     StreamResume::AfterSleep => {
@@ -2300,7 +2284,7 @@ impl Engine {
                         // appending to the pre-sleep fragment.
                         if pending_message_complete {
                             let index = last_text_index.unwrap_or(0);
-                            let _ = self.tx_event.send(Event::MessageComplete { index }).await;
+                            let _ = self.send_event(Event::MessageComplete { index }).await;
                         }
                     }
                     StreamResume::HeadlessNetworkDrop => {
@@ -2370,7 +2354,7 @@ impl Engine {
                             // fresh cell instead of appending to an
                             // unfinished one.
                             if let Some(index) = last_text_index {
-                                let _ = self.tx_event.send(Event::MessageComplete { index }).await;
+                                let _ = self.send_event(Event::MessageComplete { index }).await;
                             }
                             // Persist the fragment the operator already saw —
                             // exactly one assistant cell for it, and no
@@ -2470,8 +2454,7 @@ impl Engine {
 
             for tool in &tool_uses {
                 let _ = self
-                    .tx_event
-                    .send(Event::ToolCallStarted {
+                    .send_event(Event::ToolCallStarted {
                         id: tool.execution_id.clone(),
                         model_call: Some(tool.model_call()),
                         name: tool.name.clone(),
@@ -2572,7 +2555,7 @@ impl Engine {
 
             if pending_message_complete {
                 let index = last_text_index.unwrap_or(0);
-                let _ = self.tx_event.send(Event::MessageComplete { index }).await;
+                let _ = self.send_event(Event::MessageComplete { index }).await;
             }
 
             // RLM is a structured tool call (`rlm_query`) handled by the
@@ -2653,8 +2636,7 @@ impl Engine {
                 )
                 .await;
                 let _ = self
-                    .tx_event
-                    .send(Event::status(
+                    .send_event(Event::status(
                         "Continuing — provider output limit reached; asking the model to continue"
                             .to_string(),
                     ))
@@ -2686,8 +2668,7 @@ impl Engine {
                             .await;
                     }
                     let _ = self
-                        .tx_event
-                        .send(Event::status("Continuing — queued steer input".to_string()))
+                        .send_event(Event::status("Continuing — queued steer input".to_string()))
                         .await;
                     turn.next_step();
                     continue;
@@ -2698,7 +2679,7 @@ impl Engine {
                     self.add_session_message(shell_completion_runtime_message(&shell_completions))
                         .await;
                     if let Some(status) = shell_completion_status_text(&shell_completions, "") {
-                        let _ = self.tx_event.send(Event::status(status)).await;
+                        let _ = self.send_event(Event::status(status)).await;
                     }
                 }
 
@@ -2709,8 +2690,7 @@ impl Engine {
                 let subagent_completions = self.drain_subagent_completion_events("").await;
                 if subagent_completions > 0 {
                     let _ = self
-                        .tx_event
-                        .send(Event::status(format!(
+                        .send_event(Event::status(format!(
                             "Continuing — {subagent_completions} sub-agent(s) completed"
                         )))
                         .await;
@@ -2775,8 +2755,7 @@ impl Engine {
                 }
                 if let Some(reason) = repl_fence_skip_reason.as_deref() {
                     let _ = self
-                        .tx_event
-                        .send(Event::status(format!("REPL block not run: {reason}")))
+                        .send_event(Event::status(format!("REPL block not run: {reason}")))
                         .await;
                 }
                 if !repl_blocks.is_empty() && repl_fence_skip_reason.is_none() {
@@ -2786,20 +2765,23 @@ impl Engine {
                         .nested_work_deadline()
                         .map_or(child_deadline, |parent| parent.min(child_deadline));
                     if self.repl_kernel.is_none() {
-                        let startup = tokio::time::timeout_at(
-                            repl_deadline,
-                            crate::repl::runtime::PythonRuntime::new(),
-                        )
-                        .await
-                        .unwrap_or_else(|_| {
-                            Err("parent turn deadline reached during REPL startup".into())
-                        });
+                        let startup = tokio::select! {
+                            biased;
+                            () = self.cancel_token.cancelled() => {
+                                Err("REPL startup cancelled".into())
+                            }
+                            result = tokio::time::timeout_at(
+                                repl_deadline,
+                                crate::repl::runtime::PythonRuntime::new(),
+                            ) => result.unwrap_or_else(|_| {
+                                Err("parent turn deadline reached during REPL startup".into())
+                            }),
+                        };
                         self.repl_kernel = match startup {
                             Ok(runtime) => Some(runtime),
                             Err(e) => {
                                 let _ = self
-                                    .tx_event
-                                    .send(Event::status(format!("REPL init failed: {e}")))
+                                    .send_event(Event::status(format!("REPL init failed: {e}")))
                                     .await;
                                 turn_error = Some(format!("REPL init failed: {e}"));
                                 break;
@@ -2808,17 +2790,21 @@ impl Engine {
                     }
 
                     let kernel_context = self.repl_kernel_context();
-                    let refresh_result = tokio::time::timeout_at(
-                        repl_deadline,
-                        self.repl_kernel
-                            .as_mut()
-                            .expect("REPL kernel initialized above")
-                            .replace_context(&kernel_context),
-                    )
-                    .await
-                    .unwrap_or_else(|_| {
-                        Err("parent turn deadline reached during REPL context refresh".into())
-                    });
+                    let refresh_result = tokio::select! {
+                        biased;
+                        () = self.cancel_token.cancelled() => {
+                            Err("REPL context refresh cancelled".into())
+                        }
+                        result = tokio::time::timeout_at(
+                            repl_deadline,
+                            self.repl_kernel
+                                .as_mut()
+                                .expect("REPL kernel initialized above")
+                                .replace_context(&kernel_context),
+                        ) => result.unwrap_or_else(|_| {
+                            Err("parent turn deadline reached during REPL context refresh".into())
+                        }),
+                    };
                     if let Err(e) = refresh_result {
                         // A broken subprocess cannot be trusted to retain
                         // state. Drop it so a later model step gets a clean,
@@ -2826,8 +2812,7 @@ impl Engine {
                         // hidden failure.
                         self.repl_kernel = None;
                         let _ = self
-                            .tx_event
-                            .send(Event::status(format!("REPL context refresh failed: {e}")))
+                            .send_event(Event::status(format!("REPL context refresh failed: {e}")))
                             .await;
                         turn_error = Some(format!("REPL context refresh failed: {e}"));
                         break;
@@ -2867,30 +2852,36 @@ impl Engine {
                     for (i, block) in repl_blocks.iter().enumerate() {
                         let round_num = i + 1;
                         let _ = self
-                            .tx_event
-                            .send(Event::status(format!(
+                            .send_event(Event::status(format!(
                                 "REPL round {round_num}: executing..."
                             )))
                             .await;
 
-                        let round_result = tokio::time::timeout_at(
-                            repl_deadline,
-                            self.repl_kernel
-                                .as_mut()
-                                .expect("REPL kernel stays alive during a round")
-                                .run(&block.code, bridge.as_ref()),
-                        )
-                        .await
-                        .unwrap_or_else(|_| {
-                            Err("REPL execution reached the parent turn deadline".into())
-                        });
+                        // Dropping the cancelled round also stops its owned
+                        // RPC/forwarder futures. The ledger below still
+                        // accounts completed and pending provider requests;
+                        // the kernel is discarded after any round failure.
+                        let round_result = tokio::select! {
+                            biased;
+                            () = self.cancel_token.cancelled() => {
+                                Err("REPL execution cancelled".into())
+                            }
+                            result = tokio::time::timeout_at(
+                                repl_deadline,
+                                self.repl_kernel
+                                    .as_mut()
+                                    .expect("REPL kernel stays alive during a round")
+                                    .run(&block.code, bridge.as_ref()),
+                            ) => result.unwrap_or_else(|_| {
+                                Err("REPL execution reached the parent turn deadline".into())
+                            }),
+                        };
 
                         match round_result {
                             Ok(round) => {
                                 if let Some(val) = &round.final_value {
                                     let _ = self
-                                        .tx_event
-                                        .send(Event::status(format!(
+                                        .send_event(Event::status(format!(
                                             "REPL round {round_num}: FINAL result obtained"
                                         )))
                                         .await;
@@ -2960,8 +2951,7 @@ impl Engine {
                             }
                             Err(e) => {
                                 let _ = self
-                                    .tx_event
-                                    .send(Event::status(format!(
+                                    .send_event(Event::status(format!(
                                         "REPL round {round_num} failed: {e}"
                                     )))
                                     .await;
@@ -3000,8 +2990,7 @@ impl Engine {
                         turn.add_routed_usage_dropped_records(residual_dropped_records);
                         if usage_has_reported_data(&snapshot.usage) {
                             let _ = self
-                                .tx_event
-                                .send(Event::RoutedTurnUsage {
+                                .send_event(Event::RoutedTurnUsage {
                                     usage: snapshot.usage.clone(),
                                     duration_ms: u64::try_from(repl_started.elapsed().as_millis())
                                         .unwrap_or(u64::MAX),
@@ -3054,9 +3043,7 @@ impl Engine {
                     }
 
                     // No FINAL — let the model iterate with the feedback.
-                    let _ = self
-                        .tx_event
-                        .send(Event::status(format!(
+                    let _ = self.send_event(Event::status(format!(
                             "Continuing — REPL round feedback (consecutive_empty={consecutive_empty_repl_rounds})"
                         )))
                         .await;
@@ -3086,14 +3073,13 @@ impl Engine {
                     if let Some(status) =
                         shell_completion_status_text(&late_shell_completions, "late")
                     {
-                        let _ = self.tx_event.send(Event::status(status)).await;
+                        let _ = self.send_event(Event::status(status)).await;
                     }
                 }
 
                 if self.drain_subagent_completion_events("late").await > 0 {
                     let _ = self
-                        .tx_event
-                        .send(Event::status(
+                        .send_event(Event::status(
                             "Continuing — late sub-agent completion".to_string(),
                         ))
                         .await;
@@ -3128,8 +3114,7 @@ impl Engine {
                     ))
                     .await;
                     let _ = self
-                        .tx_event
-                        .send(Event::status(format!(
+                        .send_event(Event::status(format!(
                             "Continuing — goal still active (pass {goal_continuations_this_turn})"
                         )))
                         .await;
@@ -3186,8 +3171,7 @@ impl Engine {
                         "Model returned only reasoning with no answer or tool call (attempt {attempt}/{max_reprompts}); {how}"
                     ));
                     let _ = self
-                        .tx_event
-                        .send(Event::status(format!(
+                        .send_event(Event::status(format!(
                             "Model returned only reasoning; {how} ({attempt}/{max_reprompts})"
                         )))
                         .await;
@@ -3240,9 +3224,7 @@ impl Engine {
                     crate::logging::warn(format!(
                         "Model returned terminal stop reason `{reason}` with no answer or tool call (attempt {attempt}/{EMPTY_STOP_MAX_RETRIES}); {how}"
                     ));
-                    let _ = self
-                        .tx_event
-                        .send(Event::status(format!(
+                    let _ = self.send_event(Event::status(format!(
                             "Model returned an empty response; {how} ({attempt}/{EMPTY_STOP_MAX_RETRIES})"
                         )))
                         .await;
@@ -3294,8 +3276,7 @@ impl Engine {
                     crate::logging::warn(&message);
                     turn_error = Some(message.clone());
                     let _ = self
-                        .tx_event
-                        .send(Event::error(ErrorEnvelope::classify(message, true)))
+                        .send_event(Event::error(ErrorEnvelope::classify(message, true)))
                         .await;
                 }
 
@@ -3328,10 +3309,7 @@ impl Engine {
 
             // Execute tools
             if self.shared_paused.lock().is_ok_and(|paused| *paused) {
-                let _ = self
-                    .tx_event
-                    .send(Event::status("Request was Paused"))
-                    .await;
+                let _ = self.send_event(Event::status("Request was Paused")).await;
                 self.add_interrupted_assistant_text(&current_text_visible)
                     .await;
                 return (TurnOutcomeStatus::Interrupted, None);
@@ -3345,7 +3323,7 @@ impl Engine {
                 match self.ensure_mcp_pool().await {
                     Ok(pool) => Some(pool),
                     Err(err) => {
-                        let _ = self.tx_event.send(Event::status(err.to_string())).await;
+                        let _ = self.send_event(Event::status(err.to_string())).await;
                         None
                     }
                 }
@@ -3474,7 +3452,7 @@ impl Engine {
                     turn.stop_diagnostics.reason = Some(TurnStopReason::NoProgress);
                     FLEET_NO_PROGRESS_STOP.to_string()
                 };
-                let _ = self.tx_event.send(Event::status(error.clone())).await;
+                let _ = self.send_event(Event::status(error.clone())).await;
                 return (TurnOutcomeStatus::Failed, Some(error));
             } else {
                 let notice = match denial_action {
@@ -3521,8 +3499,7 @@ impl Engine {
             // synthetic resume. Declared per-task tool budgets and max_steps
             // remain the explicit limits for tool-driven work.
             let _ = self
-                .tx_event
-                .send(Event::status("Continuing — tool results".to_string()))
+                .send_event(Event::status("Continuing — tool results".to_string()))
                 .await;
             turn.next_step();
         }
@@ -3535,9 +3512,7 @@ impl Engine {
                 .as_ref()
                 .map_or(0, |registry| registry.active_count());
             if running > 0 {
-                let _ = self
-                    .tx_event
-                    .send(Event::status(format!(
+                let _ = self.send_event(Event::status(format!(
                         "Turn failed with {running} turn-owned sub-agent(s) still running; cancelling them."
                     )))
                     .await;
@@ -3548,9 +3523,7 @@ impl Engine {
             .as_ref()
             .map_or(0, |registry| registry.active_count());
         if running > 0 {
-            let _ = self
-                .tx_event
-                .send(Event::status(format!(
+            let _ = self.send_event(Event::status(format!(
                     "Turn ending with {running} turn-owned sub-agent(s) still running; keeping them running in the background."
                 )))
                 .await;
@@ -3565,9 +3538,7 @@ impl Engine {
             turn_detached_child_count(manager.running_count_for_session(&self.session.id), running)
         };
         if detached_running > 0 {
-            let _ = self
-                .tx_event
-                .send(Event::status(format!(
+            let _ = self.send_event(Event::status(format!(
                     "Turn ending with {detached_running} detached sub-agent(s) still running in the background; they'll report when done."
                 )))
                 .await;
@@ -4007,8 +3978,7 @@ impl Engine {
                                 approval_required = false;
                                 approval_force_prompt = false;
                                 let _ = self
-                                    .tx_event
-                                    .send(Event::ToolGateDecision {
+                                    .send_event(Event::ToolGateDecision {
                                         agent_id: None,
                                         tool_id: tool_id.clone(),
                                         tool_name: tool_name.clone(),
@@ -4314,16 +4284,13 @@ impl Engine {
                 "read-only tools"
             };
             let _ = self
-                .tx_event
-                .send(Event::status(format!(
+                .send_event(Event::status(format!(
                     "Executing {parallel_tool_count} {tool_kind} in {} parallel chunk(s)",
                     parallel_chunks.len(),
                 )))
                 .await;
         } else if plan_count > 1 {
-            let _ = self
-                .tx_event
-                .send(Event::status(
+            let _ = self.send_event(Event::status(
                     "Executing tools sequentially (writes, approvals, or non-parallel tools detected)",
                 ))
                 .await;
@@ -4352,8 +4319,7 @@ impl Engine {
                             .to_string(),
                     ));
                     let _ = self
-                        .tx_event
-                        .send(Event::ToolCallComplete {
+                        .send_event(Event::ToolCallComplete {
                             model_call: plan.model_call.clone(),
                             id: plan.id.clone(),
                             name: plan.name.clone(),
@@ -4392,8 +4358,7 @@ impl Engine {
                     let terminal = ToolExecutionOutcome::cancelled(interrupted_tool_result());
                     let result = terminal.legacy_result();
                     let _ = self
-                        .tx_event
-                        .send(Event::ToolCallComplete {
+                        .send_event(Event::ToolCallComplete {
                             model_call: plan.model_call.clone(),
                             id: plan.id.clone(),
                             name: plan.name.clone(),
@@ -4438,8 +4403,7 @@ impl Engine {
                     if let Some(result) = plan.guard_result.clone() {
                         let result = Ok(result);
                         let _ = self
-                            .tx_event
-                            .send(Event::ToolCallComplete {
+                            .send_event(Event::ToolCallComplete {
                                 model_call: plan.model_call.clone(),
                                 id: plan.id.clone(),
                                 name: plan.name.clone(),
@@ -4461,8 +4425,7 @@ impl Engine {
                     }
                     if let Some(err) = plan.blocked_error.clone() {
                         let _ = self
-                            .tx_event
-                            .send(Event::ToolCallComplete {
+                            .send_event(Event::ToolCallComplete {
                                 id: plan.id.clone(),
                                 model_call: plan.model_call.clone(),
                                 name: plan.name.clone(),
@@ -4509,7 +4472,7 @@ impl Engine {
                             plan.supports_parallel || plan.detached_start,
                             plan.interactive,
                             tx_event.clone(),
-                            Some(cancel_token),
+                            Some(cancel_token.clone()),
                             plan.name.clone(),
                             Some(plan.id.clone()),
                             plan.input.clone(),
@@ -4558,14 +4521,17 @@ impl Engine {
                             .map(|result| result.content_blocks.clone())
                             .unwrap_or_default();
                         let legacy_result = result.map(RichToolResult::into_result);
-                        let _ = tx_event
-                            .send(Event::ToolCallComplete {
+                        if let Ok(permit) =
+                            super::streaming::reserve_event_capacity(&tx_event, Some(&cancel_token))
+                                .await
+                        {
+                            permit.send(Event::ToolCallComplete {
                                 model_call: plan.model_call.clone(),
                                 id: plan.id.clone(),
                                 name: plan.name.clone(),
                                 result: legacy_result.clone(),
-                            })
-                            .await;
+                            });
+                        }
 
                         ToolExecOutcome {
                             model_call: plan.model_call.clone(),
@@ -4610,8 +4576,7 @@ impl Engine {
                         );
                         let result = terminal.legacy_result();
                         let _ = self
-                            .tx_event
-                            .send(Event::ToolCallComplete {
+                            .send_event(Event::ToolCallComplete {
                                 model_call: model_call.clone(),
                                 id: id.clone(),
                                 name: name.clone(),
@@ -4641,8 +4606,7 @@ impl Engine {
                     if let Some(result) = plan.guard_result.clone() {
                         let result = Ok(result);
                         let _ = self
-                            .tx_event
-                            .send(Event::ToolCallComplete {
+                            .send_event(Event::ToolCallComplete {
                                 model_call: plan.model_call.clone(),
                                 id: tool_id.clone(),
                                 name: tool_name.clone(),
@@ -4666,8 +4630,7 @@ impl Engine {
                     if let Some(err) = plan.blocked_error.clone() {
                         let result = Err(err);
                         let _ = self
-                            .tx_event
-                            .send(Event::ToolCallComplete {
+                            .send_event(Event::ToolCallComplete {
                                 model_call: plan.model_call.clone(),
                                 id: tool_id.clone(),
                                 name: tool_name.clone(),
@@ -4708,8 +4671,7 @@ impl Engine {
                         }
 
                         let _ = self
-                            .tx_event
-                            .send(Event::ToolCallComplete {
+                            .send_event(Event::ToolCallComplete {
                                 model_call: plan.model_call.clone(),
                                 id: tool_id.clone(),
                                 name: tool_name.clone(),
@@ -4747,8 +4709,7 @@ impl Engine {
                         };
 
                         let _ = self
-                            .tx_event
-                            .send(Event::ToolCallComplete {
+                            .send_event(Event::ToolCallComplete {
                                 model_call: plan.model_call.clone(),
                                 id: tool_id.clone(),
                                 name: tool_name.clone(),
@@ -5111,8 +5072,7 @@ impl Engine {
                         .unwrap_or_default();
                     let legacy_result = result.map(RichToolResult::into_result);
                     let _ = self
-                        .tx_event
-                        .send(Event::ToolCallComplete {
+                        .send_event(Event::ToolCallComplete {
                             model_call: plan.model_call.clone(),
                             id: tool_id.clone(),
                             name: tool_name.clone(),
@@ -5566,8 +5526,7 @@ impl Engine {
                     };
                     if usage_has_reported_data(&routed_usage) {
                         let _ = self
-                            .tx_event
-                            .send(Event::RoutedTurnUsage {
+                            .send_event(Event::RoutedTurnUsage {
                                 usage: routed_usage,
                                 duration_ms: routed_duration_ms,
                                 first_token_ms: None,
@@ -6454,8 +6413,7 @@ impl Engine {
     async fn settle_unadmitted_tool_calls(&self, tool_uses: &[ToolUseState], result: &ToolResult) {
         for tool in tool_uses {
             let _ = self
-                .tx_event
-                .send(Event::ToolCallStarted {
+                .send_event(Event::ToolCallStarted {
                     id: tool.execution_id.clone(),
                     model_call: Some(tool.model_call()),
                     name: tool.name.clone(),
@@ -6463,8 +6421,7 @@ impl Engine {
                 })
                 .await;
             let _ = self
-                .tx_event
-                .send(Event::ToolCallComplete {
+                .send_event(Event::ToolCallComplete {
                     id: tool.execution_id.clone(),
                     model_call: Some(tool.model_call()),
                     name: tool.name.clone(),
@@ -6565,7 +6522,7 @@ impl Engine {
         );
         if let crate::goal_loop::ContinuationDecision::Stop(reason) = decision {
             let message = format!("Goal continuation stopped: {reason:?}.");
-            let _ = self.tx_event.send(Event::status(message)).await;
+            let _ = self.send_event(Event::status(message)).await;
             return None;
         }
         Some(snapshot)
@@ -6604,8 +6561,7 @@ impl Engine {
         let was_delayed = wait.is_some();
         if let Some(wait) = wait {
             let _ = self
-                .tx_event
-                .send(Event::GoalContinuationWaiting {
+                .send_event(Event::GoalContinuationWaiting {
                     delay_seconds: wait.as_secs(),
                 })
                 .await;
@@ -6614,15 +6570,13 @@ impl Engine {
             == crate::goal_loop::ContinuationWaitOutcome::Cancelled
         {
             let _ = self
-                .tx_event
-                .send(Event::GoalContinuationWaitEnded { interrupted: true })
+                .send_event(Event::GoalContinuationWaitEnded { interrupted: true })
                 .await;
             return None;
         }
         if was_delayed {
             let _ = self
-                .tx_event
-                .send(Event::GoalContinuationWaitEnded { interrupted: false })
+                .send_event(Event::GoalContinuationWaitEnded { interrupted: false })
                 .await;
         }
 
@@ -6650,14 +6604,12 @@ impl Engine {
             }
         }
         let _ = self
-            .tx_event
-            .send(Event::GoalUpdated {
+            .send_event(Event::GoalUpdated {
                 snapshot: snapshot.clone(),
             })
             .await;
         let _ = self
-            .tx_event
-            .send(Event::status(format!(
+            .send_event(Event::status(format!(
                 "Continuing active goal (pass {} this turn, {} total)",
                 *continuations_this_turn, snapshot.continuation_count
             )))

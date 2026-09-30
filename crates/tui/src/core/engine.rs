@@ -1453,8 +1453,7 @@ impl Engine {
                 &self.config.locale_tag,
             ));
             let _ = self
-                .tx_event
-                .send(Event::SnapshotsDisabled {
+                .send_event(Event::SnapshotsDisabled {
                     workspace: notice.workspace,
                     reason,
                 })
@@ -2163,6 +2162,11 @@ impl Engine {
         approval_mode: ApprovalMode,
     ) {
         let turn_control = self.begin_turn_control();
+        let Ok(terminal_permit) =
+            streaming::reserve_event_capacity(&self.tx_event, Some(&self.cancel_token)).await
+        else {
+            return;
+        };
         self.turn_counter = self.turn_counter.saturating_add(1);
 
         let turn_id = format!(
@@ -2188,8 +2192,7 @@ impl Engine {
         self.apply_runtime_mode_policy(&authority);
 
         let _ = self
-            .tx_event
-            .send(Event::TurnStarted {
+            .send_event(Event::TurnStarted {
                 turn_id: turn_id.clone(),
                 created_at: chrono::Utc::now(),
                 route: None,
@@ -2209,8 +2212,7 @@ impl Engine {
         self.emit_pending_snapshot_notices().await;
 
         let _ = self
-            .tx_event
-            .send(Event::ToolCallStarted {
+            .send_event(Event::ToolCallStarted {
                 model_call: None,
                 id: tool_id.clone(),
                 name: tool_name.clone(),
@@ -2300,8 +2302,7 @@ impl Engine {
         let error = result.as_ref().err().map(ToString::to_string);
 
         let _ = self
-            .tx_event
-            .send(Event::ToolCallComplete {
+            .send_event(Event::ToolCallComplete {
                 model_call: None,
                 id: tool_id,
                 name: tool_name,
@@ -2315,25 +2316,23 @@ impl Engine {
         self.post_turn_snapshot_before_complete(&snapshot_prompt)
             .await;
         let pending_post_turn = self.reserve_post_turn_snapshot();
-        drop(turn_control);
-        let _ = self
-            .tx_event
-            .send(Event::TurnComplete {
-                usage: Usage::default(),
-                parent_route_usage: Usage::default(),
-                routed_usage_dropped_records: 0,
-                status,
-                error,
-                tool_catalog: None,
-                base_url: None,
-            })
-            .await;
+        let status = terminal_turn_status_at_settlement(status, self.cancel_token.is_cancelled());
+        terminal_permit.send(Event::TurnComplete {
+            usage: Usage::default(),
+            parent_route_usage: Usage::default(),
+            routed_usage_dropped_records: 0,
+            status,
+            error,
+            tool_catalog: None,
+            base_url: None,
+        });
 
         self.post_turn_snapshot_after_complete(
             "post-shell-turn-snapshot",
             snapshot_prompt,
             pending_post_turn,
         );
+        drop(turn_control);
     }
 
     /// Take one workspace snapshot for the running turn and report it as an
@@ -2386,8 +2385,7 @@ impl Engine {
                 .collect()
         });
         let _ = self
-            .tx_event
-            .send(Event::WorkspaceSnapshotTaken { snapshot })
+            .send_event(Event::WorkspaceSnapshotTaken { snapshot })
             .await;
         true
     }
@@ -2477,8 +2475,7 @@ impl Engine {
         }
         self.emit_session_updated().await;
         let _ = self
-            .tx_event
-            .send(Event::status(format!(
+            .send_event(Event::status(format!(
                 // Payload first, and short enough for the posture bar's right
                 // slot. "Runtime policy changed to: X / Y" sheds at the colon —
                 // the bar's notice shedder cuts at clause joints and keeps the
@@ -2612,8 +2609,7 @@ impl Engine {
             self.try_flush_pending_goal_continuation();
             if should_announce {
                 let _ = self
-                    .tx_event
-                    .send(Event::GoalContinuationWaiting { delay_seconds })
+                    .send_event(Event::GoalContinuationWaiting { delay_seconds })
                     .await;
             }
             return;
@@ -2631,8 +2627,7 @@ impl Engine {
         self.try_flush_pending_goal_continuation();
         if delay_seconds > 0 {
             let _ = self
-                .tx_event
-                .send(Event::GoalContinuationWaiting { delay_seconds })
+                .send_event(Event::GoalContinuationWaiting { delay_seconds })
                 .await;
         }
     }
@@ -2644,8 +2639,7 @@ impl Engine {
             );
             if scheduled.was_delayed {
                 let _ = self
-                    .tx_event
-                    .send(Event::GoalContinuationWaitEnded { interrupted })
+                    .send_event(Event::GoalContinuationWaitEnded { interrupted })
                     .await;
             }
         }
@@ -2935,7 +2929,7 @@ impl Engine {
                                 && scheduled.ready_at == Some(ready_at)
                             {
                                 scheduled.ready_at = None;
-                                let _ = self.tx_event.send(Event::GoalContinuationWaitEnded {
+                                let _ = self.send_event(Event::GoalContinuationWaitEnded {
                                     interrupted: false,
                                 }).await;
                             }
@@ -3052,8 +3046,7 @@ impl Engine {
             .unwrap_or(false);
         if goal_active {
             let _ = self
-                .tx_event
-                .send(Event::status(
+                .send_event(Event::status(
                     "Background shell work finished; continuing the active goal".to_string(),
                 ))
                 .await;
@@ -3076,9 +3069,7 @@ impl Engine {
                             .len()
                     })
                     .unwrap_or(0);
-                let _ = self
-                    .tx_event
-                    .send(Event::error(ErrorEnvelope::fatal_auth(format!(
+                let _ = self.send_event(Event::error(ErrorEnvelope::fatal_auth(format!(
                         "{finished} background shell task(s) finished, but the turn cannot resume because the provider route is no longer valid: {err}. Their output stays available via /jobs."
                     ))))
                     .await;
@@ -3086,8 +3077,7 @@ impl Engine {
             }
         };
         let _ = self
-            .tx_event
-            .send(Event::status(
+            .send_event(Event::status(
                 "Background shell work finished; resuming the turn".to_string(),
             ))
             .await;
@@ -3259,9 +3249,7 @@ impl Engine {
                                 let message = format!(
                                     "Goal continuation blocked because its provider route is no longer valid: {err}. Fix the route, then resume the goal."
                                 );
-                                let _ = self
-                                    .tx_event
-                                    .send(Event::error(ErrorEnvelope::fatal_auth(format!(
+                                let _ = self.send_event(Event::error(ErrorEnvelope::fatal_auth(format!(
                                         "Goal continuation stopped because its provider route is no longer valid: {err}"
                                     ))))
                                     .await;
@@ -3354,8 +3342,7 @@ impl Engine {
                             }
                         };
                         let _ = self
-                            .tx_event
-                            .send(Event::RequestManifestReady { rendered })
+                            .send_event(Event::RequestManifestReady { rendered })
                             .await;
                     }
                     Op::ListSubAgents => {
@@ -3459,8 +3446,7 @@ impl Engine {
                             (outcome, agent_list_event(&manager, &active_session_id))
                         };
                         let _ = self
-                            .tx_event
-                            .send(Event::SubAgentFollowUp {
+                            .send_event(Event::SubAgentFollowUp {
                                 owner_session_id: active_session_id,
                                 agent_id,
                                 outcome,
@@ -3509,8 +3495,7 @@ impl Engine {
                         self.refresh_system_prompt_with_reason("model");
                         self.emit_session_updated().await;
                         let _ = self
-                            .tx_event
-                            .send(Event::status(format!(
+                            .send_event(Event::status(format!(
                                 "Model set to: {}",
                                 self.session.model
                             )))
@@ -3529,8 +3514,7 @@ impl Engine {
                         self.config.compaction = config;
                         if switched {
                             let _ = self
-                                .tx_event
-                                .send(Event::status(format!(
+                                .send_event(Event::status(format!(
                                     "Make room automatically: {}",
                                     if enabled { "on" } else { "off" }
                                 )))
@@ -3540,8 +3524,7 @@ impl Engine {
                     Op::SetStreamChunkTimeout { timeout_secs } => {
                         self.config.stream_chunk_timeout = Duration::from_secs(timeout_secs);
                         let _ = self
-                            .tx_event
-                            .send(Event::status(format!(
+                            .send_event(Event::status(format!(
                                 "Stream chunk timeout set to {timeout_secs}s"
                             )))
                             .await;
@@ -3578,9 +3561,7 @@ impl Engine {
                         } else {
                             "; launch_concurrency takes full effect after active sub-agents finish or the session restarts"
                         };
-                        let _ = self
-                            .tx_event
-                            .send(Event::status(format!(
+                        let _ = self.send_event(Event::status(format!(
                                 "Sub-agent runtime updated: enabled={enabled}, max_subagents={}, launch_concurrency={}, max_depth={}{}",
                                 self.config.max_subagents,
                                 self.config.launch_concurrency,
@@ -3592,8 +3573,7 @@ impl Engine {
                     Op::SetFleetRoster { roster } => {
                         self.config.fleet_roster = roster;
                         let _ = self
-                            .tx_event
-                            .send(Event::status(
+                            .send_event(Event::status(
                                 "Fleet roster refreshed for subsequent turns".to_string(),
                             ))
                             .await;
@@ -3917,9 +3897,7 @@ impl Engine {
                     Op::SetAdvisorEnabled { enabled } => {
                         self.config.advisor_config.enabled = enabled;
                         let state = if enabled { "enabled" } else { "disabled" };
-                        let _ = self
-                            .tx_event
-                            .send(Event::status(format!(
+                        let _ = self.send_event(Event::status(format!(
                                 "Advisor watcher {state}. Notes will appear after turns with tool calls."
                             )))
                             .await;
@@ -3986,8 +3964,7 @@ impl Engine {
 
     async fn emit_session_updated(&self) {
         let _ = self
-            .tx_event
-            .send(Event::SessionUpdated {
+            .send_event(Event::SessionUpdated {
                 session_id: self.session.id.clone(),
                 messages: self.session.messages.snapshot(),
                 system_prompt: self.session.system_prompt.clone(),
@@ -4012,7 +3989,7 @@ impl Engine {
 
     async fn emit_goal_updated(&self) {
         if let Some(snapshot) = self.goal_snapshot_for_event() {
-            let _ = self.tx_event.send(Event::GoalUpdated { snapshot }).await;
+            let _ = self.send_event(Event::GoalUpdated { snapshot }).await;
         }
     }
 
@@ -4525,9 +4502,7 @@ impl Engine {
                 for agent_id in claimed_ids {
                     self.delivered_subagent_completion_ids.remove(&agent_id);
                 }
-                let _ = self
-                    .tx_event
-                    .send(Event::error(ErrorEnvelope::fatal_auth(format!(
+                let _ = self.send_event(Event::error(ErrorEnvelope::fatal_auth(format!(
                         "Cannot resume the turn because its provider route is no longer valid: {err}"
                     ))))
                     .await;
@@ -4563,8 +4538,7 @@ impl Engine {
         };
 
         let _ = self
-            .tx_event
-            .send(Event::status(format!(
+            .send_event(Event::status(format!(
                 "Resuming turn with {count} idle sub-agent completion(s){failure_suffix}"
             )))
             .await;
@@ -4712,10 +4686,9 @@ impl Engine {
     /// releases their busy state and closes the admitted operation.
     async fn reject_edit_last_turn(&mut self, envelope: ErrorEnvelope) {
         let message = envelope.message.clone();
-        let _ = self.tx_event.send(Event::error(envelope)).await;
+        let _ = self.send_event(Event::error(envelope)).await;
         let _ = self
-            .tx_event
-            .send(Event::TurnComplete {
+            .send_event(Event::TurnComplete {
                 usage: Usage::default(),
                 parent_route_usage: Usage::default(),
                 routed_usage_dropped_records: 0,
@@ -4771,7 +4744,7 @@ impl Engine {
                 } else {
                     "Turn interrupted."
                 };
-                let _ = self.tx_event.send(Event::status(message.to_string())).await;
+                let _ = self.send_event(Event::status(message.to_string())).await;
             }
             SendMessageOutcome::Finished {
                 status: TurnOutcomeStatus::Completed,
@@ -4846,8 +4819,8 @@ impl Engine {
         self.config.goal_status = GoalStatus::Blocked;
         self.refresh_system_prompt_with_reason("goal");
         self.emit_session_updated().await;
-        let _ = self.tx_event.send(Event::GoalUpdated { snapshot }).await;
-        let _ = self.tx_event.send(Event::status(message)).await;
+        let _ = self.send_event(Event::GoalUpdated { snapshot }).await;
+        let _ = self.send_event(Event::status(message)).await;
     }
 
     /// Resume the shared goal when its only blocker was a runtime stop and it
@@ -4871,10 +4844,9 @@ impl Engine {
         };
         self.config.goal_status = GoalStatus::Active;
         self.emit_session_updated().await;
-        let _ = self.tx_event.send(Event::GoalUpdated { snapshot }).await;
+        let _ = self.send_event(Event::GoalUpdated { snapshot }).await;
         let _ = self
-            .tx_event
-            .send(Event::status(
+            .send_event(Event::status(
                 "Goal resumed: your message continues the work the earlier turn stopped",
             ))
             .await;
@@ -4906,8 +4878,8 @@ impl Engine {
         self.config.goal_status = GoalStatus::Paused;
         self.refresh_system_prompt_with_reason("goal");
         self.emit_session_updated().await;
-        let _ = self.tx_event.send(Event::GoalUpdated { snapshot }).await;
-        let _ = self.tx_event.send(Event::status(message)).await;
+        let _ = self.send_event(Event::GoalUpdated { snapshot }).await;
+        let _ = self.send_event(Event::status(message)).await;
     }
 
     /// Handle `/goal pause|resume|clear|complete|blocked` by writing the new
@@ -4977,7 +4949,7 @@ impl Engine {
         // the UI while still letting the clear win over a preceding active
         // TurnComplete snapshot.
         let snapshot_has_objective = snapshot.objective.is_some();
-        let _ = self.tx_event.send(Event::GoalUpdated { snapshot }).await;
+        let _ = self.send_event(Event::GoalUpdated { snapshot }).await;
 
         let label = if clear {
             "cleared"
@@ -4990,8 +4962,7 @@ impl Engine {
             }
         };
         let _ = self
-            .tx_event
-            .send(Event::status(format!("Goal {label}.")))
+            .send_event(Event::status(format!("Goal {label}.")))
             .await;
 
         // Resuming an objective-bearing goal restarts the runtime's own
@@ -5017,8 +4988,7 @@ impl Engine {
     ) {
         let Some(objective) = normalized_goal_objective(Some(&objective)) else {
             let _ = self
-                .tx_event
-                .send(Event::status(
+                .send_event(Event::status(
                     "Goal not set: the objective is empty after trimming.".to_string(),
                 ))
                 .await;
@@ -5043,10 +5013,9 @@ impl Engine {
                 return;
             }
         };
-        let _ = self.tx_event.send(Event::GoalUpdated { snapshot }).await;
+        let _ = self.send_event(Event::GoalUpdated { snapshot }).await;
         let _ = self
-            .tx_event
-            .send(Event::status("Goal set; starting goal work.".to_string()))
+            .send_event(Event::status("Goal set; starting goal work.".to_string()))
             .await;
         self.schedule_goal_continuation(Vec::new()).await;
     }
@@ -5461,8 +5430,7 @@ impl Engine {
             Err(error) => {
                 let message = error.to_string();
                 let _ = self
-                    .tx_event
-                    .send(Event::error(ErrorEnvelope::new(
+                    .send_event(Event::error(ErrorEnvelope::new(
                         crate::error_taxonomy::ErrorCategory::InvalidInput,
                         crate::error_taxonomy::ErrorSeverity::Error,
                         true,
@@ -5481,6 +5449,26 @@ impl Engine {
             return SendMessageOutcome::NotStarted { error: None };
         }
         let initial_usage_owner = compaction.runtime_cost_owner.clone();
+        let terminal_permit =
+            match streaming::reserve_event_capacity(&self.tx_event, Some(&self.cancel_token)).await
+            {
+                Ok(permit) => permit,
+                Err(reason) => {
+                    // A queued operation is not an admitted turn. No TurnStarted,
+                    // session mutation or provider dispatch happened, but an Auto
+                    // classifier may already have produced billed routed usage.
+                    crate::cost_status::report_runtime_usage_batch(
+                        crate::cost_status::scope_token(),
+                        initial_usage_owner.as_deref(),
+                        &initial_routed_usage,
+                    );
+                    return SendMessageOutcome::NotStarted {
+                        error: (reason == streaming::EventSendError::Closed).then(|| {
+                            "Cannot start the turn because its event consumer is closed".to_string()
+                        }),
+                    };
+                }
+            };
 
         // Goals are created by the model (`create_goal`) or by the leading
         // `/goal <objective>` command; the host never infers one from
@@ -5520,8 +5508,7 @@ impl Engine {
                 &initial_routed_usage,
             );
             let _ = self
-                .tx_event
-                .send(Event::error(ErrorEnvelope::fatal_auth(format!(
+                .send_event(Event::error(ErrorEnvelope::fatal_auth(format!(
                     "Cannot start the turn because its provider route is not ready: {err}"
                 ))))
                 .await;
@@ -5547,7 +5534,7 @@ impl Engine {
             if let Some(status) =
                 crate::core::engine::turn_loop::shell_completion_status_text(&shell_completions, "")
             {
-                let _ = self.tx_event.send(Event::status(status)).await;
+                let _ = self.send_event(Event::status(status)).await;
             }
         }
 
@@ -5591,7 +5578,7 @@ impl Engine {
         // it), then rendered to the UI from that same value.
         self.last_policy_narrowing = input_policy.narrowing.clone();
         if let Some(status) = input_policy.status() {
-            let _ = self.tx_event.send(Event::status(status)).await;
+            let _ = self.send_event(Event::status(status)).await;
         }
 
         // Track the complete effective mode policy so mid-turn metadata, `/edit`,
@@ -5698,8 +5685,7 @@ impl Engine {
         // active. The snapshot below can take 30+ seconds on slow filesystems
         // (e.g. WSL2 /mnt/c) and must not delay the TurnStarted event.
         let _ = self
-            .tx_event
-            .send(Event::TurnStarted {
+            .send_event(Event::TurnStarted {
                 turn_id: turn.id.clone(),
                 created_at: turn_started_at,
                 route: Some(turn_route),
@@ -5734,8 +5720,7 @@ impl Engine {
                 &record.usage.usage,
             );
             let _ = self
-                .tx_event
-                .send(Event::RoutedTurnUsage {
+                .send_event(Event::RoutedTurnUsage {
                     usage: record.usage.usage.clone(),
                     duration_ms: 0,
                     first_token_ms: None,
@@ -5789,21 +5774,17 @@ impl Engine {
                 .map(|err| format!("Failed to send message: {err}"))
                 .unwrap_or_else(|| "Failed to send message: API client not configured".to_string());
             let _ = self
-                .tx_event
-                .send(Event::error(ErrorEnvelope::fatal_auth(message.clone())))
+                .send_event(Event::error(ErrorEnvelope::fatal_auth(message.clone())))
                 .await;
-            let _ = self
-                .tx_event
-                .send(Event::TurnComplete {
-                    usage: turn.usage.clone(),
-                    parent_route_usage: turn.parent_route_usage.clone(),
-                    routed_usage_dropped_records: turn.routed_usage_dropped_records,
-                    status: TurnOutcomeStatus::Failed,
-                    error: Some(message.clone()),
-                    tool_catalog: None,
-                    base_url: None,
-                })
-                .await;
+            terminal_permit.send(Event::TurnComplete {
+                usage: turn.usage.clone(),
+                parent_route_usage: turn.parent_route_usage.clone(),
+                routed_usage_dropped_records: turn.routed_usage_dropped_records,
+                status: TurnOutcomeStatus::Failed,
+                error: Some(message.clone()),
+                tool_catalog: None,
+                base_url: None,
+            });
             self.sync_unstarted_goal_for_terminal_projection(
                 goal_objective.as_deref(),
                 goal_token_budget,
@@ -6043,8 +6024,7 @@ impl Engine {
         if status_at_settlement != status {
             status = status_at_settlement;
             let _ = self
-                .tx_event
-                .send(Event::status(
+                .send_event(Event::status(
                     "Request cancelled while settling turn-owned sub-agents",
                 ))
                 .await;
@@ -6064,9 +6044,7 @@ impl Engine {
                 // than withholding `TurnComplete` forever (#6184).
                 let unsettled = barrier.cancel_and_flush().await;
                 if !unsettled.is_empty() {
-                    let _ = self
-                        .tx_event
-                        .send(Event::status(format!(
+                    let _ = self.send_event(Event::status(format!(
                             "Turn ended while sub-agent(s) were still shutting down: {}. Their late receipts were dropped.",
                             unsettled.join(", ")
                         )))
@@ -6103,31 +6081,29 @@ impl Engine {
         }
         if let Some(snapshot) = turn.terminal_request_snapshot(status) {
             let _ = self
-                .tx_event
-                .send(Event::ToolRequestSnapshot { snapshot })
+                .send_event(Event::ToolRequestSnapshot { snapshot })
                 .await;
         }
         self.post_turn_snapshot_before_complete(&snapshot_prompt_post)
             .await;
         let pending_post_turn = self.reserve_post_turn_snapshot();
-        drop(turn_control);
+        // Cancellation still owns the decision while mailbox/snapshot
+        // bookkeeping runs. The reserved completion itself never waits.
+        status = terminal_turn_status_at_settlement(status, self.cancel_token.is_cancelled());
         // `event_sent` means the TurnComplete event reached the UI channel —
         // never that the user saw model output. (#6184: the old `delivered`
         // name was read as user-visible delivery on Interrupted turns that
         // rendered nothing.)
-        let turn_complete_event_sent = self
-            .tx_event
-            .send(Event::TurnComplete {
-                usage: turn.usage,
-                parent_route_usage: turn.parent_route_usage,
-                routed_usage_dropped_records: turn.routed_usage_dropped_records,
-                status,
-                error: error.clone(),
-                tool_catalog: tool_catalog_for_event,
-                base_url: base_url_for_event,
-            })
-            .await
-            .is_ok();
+        let completion_sender = terminal_permit.send(Event::TurnComplete {
+            usage: turn.usage,
+            parent_route_usage: turn.parent_route_usage,
+            routed_usage_dropped_records: turn.routed_usage_dropped_records,
+            status,
+            error: error.clone(),
+            tool_catalog: tool_catalog_for_event,
+            base_url: base_url_for_event,
+        });
+        let turn_complete_event_sent = !completion_sender.is_closed();
         tracing::info!(
             target: "engine.turn",
             status = ?status,
@@ -6243,6 +6219,7 @@ impl Engine {
         } else {
             self.reconcile_non_completed_goal_turn(&outcome).await;
         }
+        drop(turn_control);
         outcome
     }
 
@@ -6256,12 +6233,10 @@ impl Engine {
             let message = "Purge unavailable: API client not configured".to_string();
             emit_purge_failed(&self.tx_event, message.clone()).await;
             let _ = self
-                .tx_event
-                .send(Event::error(ErrorEnvelope::fatal_auth(message.clone())))
+                .send_event(Event::error(ErrorEnvelope::fatal_auth(message.clone())))
                 .await;
             let _ = self
-                .tx_event
-                .send(Event::TurnComplete {
+                .send_event(Event::TurnComplete {
                     usage: zero_usage,
                     parent_route_usage: Usage::default(),
                     routed_usage_dropped_records: 0,
@@ -6320,8 +6295,7 @@ impl Engine {
         };
 
         let _ = self
-            .tx_event
-            .send(Event::TurnComplete {
+            .send_event(Event::TurnComplete {
                 usage: zero_usage,
                 parent_route_usage: Usage::default(),
                 routed_usage_dropped_records: 0,
@@ -6364,9 +6338,7 @@ impl Engine {
         if survivors.is_empty() {
             return;
         }
-        let _ = self
-            .tx_event
-            .send(Event::status(format!(
+        let _ = self.send_event(Event::status(format!(
                 "Turn interrupted, but {} background shell job(s) continue and may still write files: {}. Use /jobs to inspect or kill.",
                 survivors.len(),
                 survivors.join(", ")
@@ -6779,9 +6751,7 @@ impl Engine {
             })
         });
         if let Some(reason) = load_failure {
-            let _ = self
-                .tx_event
-                .send(Event::status(format!(
+            let _ = self.send_event(Event::status(format!(
                     "MCP config could not be loaded, so none of its servers are available: {reason}. Fix it, then run /mcp reload."
                 )))
                 .await;
@@ -7713,7 +7683,7 @@ impl Engine {
                 names.join(", ")
             )
         };
-        let _ = self.tx_event.send(Event::status(status)).await;
+        let _ = self.send_event(Event::status(status)).await;
     }
 
     /// Recompose the stable system prompt from current context. When the bytes
