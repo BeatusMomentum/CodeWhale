@@ -760,36 +760,41 @@ pub fn confirm_job(
     credentials: &CredentialState,
     machine_token: &MachineTokenState,
 ) -> Result<DispatchOutcome> {
-    let mut job = store.load(id)?;
-    if job.status != CloudJobStatus::Proposed {
-        bail!(
-            "Cloud job {} is {} and cannot be confirmed.",
-            job.id,
-            status_label(job.status)
-        );
-    }
-    job.confirmed = true;
-    if matches!(credentials, CredentialState::Missing) {
-        job.status = CloudJobStatus::Refused;
-        job.refusal = Some(missing_credentials_message());
-        job.note = missing_credentials_message();
-        job.finished_unix = Some(unix_now());
-        store.save(&job)?;
-        return Ok(DispatchOutcome::Refused(job));
-    }
-    if matches!(machine_token, MachineTokenState::Missing) {
-        job.status = CloudJobStatus::Refused;
-        job.refusal = Some(missing_machine_token_message());
-        job.note = missing_machine_token_message();
-        job.finished_unix = Some(unix_now());
-        store.save(&job)?;
-        return Ok(DispatchOutcome::Refused(job));
-    }
+    // One locked read-modify-write, as in `cancel_job`: two racing confirms
+    // cannot both pass the `proposed` check (two sandboxes, two PRs), and a
+    // cancel that lands mid-confirm cannot be overwritten back to `launching`.
+    store.with_job_lock(id, || {
+        let mut job = store.load(id)?;
+        if job.status != CloudJobStatus::Proposed {
+            bail!(
+                "Cloud job {} is {} and cannot be confirmed.",
+                job.id,
+                status_label(job.status)
+            );
+        }
+        job.confirmed = true;
+        if matches!(credentials, CredentialState::Missing) {
+            job.status = CloudJobStatus::Refused;
+            job.refusal = Some(missing_credentials_message());
+            job.note = missing_credentials_message();
+            job.finished_unix = Some(unix_now());
+            store.write_record(&job)?;
+            return Ok(DispatchOutcome::Refused(job));
+        }
+        if matches!(machine_token, MachineTokenState::Missing) {
+            job.status = CloudJobStatus::Refused;
+            job.refusal = Some(missing_machine_token_message());
+            job.note = missing_machine_token_message();
+            job.finished_unix = Some(unix_now());
+            store.write_record(&job)?;
+            return Ok(DispatchOutcome::Refused(job));
+        }
 
-    job.status = CloudJobStatus::Launching;
-    job.note = "Cloud agent confirmed; the sandbox is launching and the runner will raise the branch and open the PR. Watch `codewhale dispatch --show` or `/dispatch show`.".to_string();
-    store.save(&job)?;
-    Ok(DispatchOutcome::Accepted(job))
+        job.status = CloudJobStatus::Launching;
+        job.note = "Cloud agent confirmed; the sandbox is launching and the runner will raise the branch and open the PR. Watch `codewhale dispatch --show` or `/dispatch show`.".to_string();
+        store.write_record(&job)?;
+        Ok(DispatchOutcome::Accepted(job))
+    })
 }
 
 /// True while the job may still hold a live sandbox.
@@ -815,9 +820,14 @@ pub fn cancel_job(
     // the sandbox id the runner just recorded).
     let flipped = store.with_job_lock(id, || {
         let mut job = store.load(id)?;
+        // Terminal records stay as they are. `done` above all: its PR exists,
+        // and relabeling it `canceled` would misstate the outcome.
         if matches!(
             job.status,
-            CloudJobStatus::Canceled | CloudJobStatus::Failed | CloudJobStatus::Refused
+            CloudJobStatus::Canceled
+                | CloudJobStatus::Failed
+                | CloudJobStatus::Refused
+                | CloudJobStatus::Done
         ) {
             return Ok((job, false));
         }
@@ -3278,6 +3288,59 @@ mod tests {
                 .exists(),
             "records are written through unique temporaries"
         );
+    }
+
+    #[test]
+    fn a_confirm_waits_for_a_cancel_holding_the_job_lock() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = CloudJobStore::from_path(temp.path().join("jobs"));
+        let mut job = stored_job(CloudJobStatus::Proposed, 10_000_000);
+        job.confirmed = false;
+        store.save(&job).unwrap();
+
+        // A confirm that loaded `proposed` before the cancel wrote must not
+        // then overwrite the cancel with `launching` (and start a runner).
+        let confirm = store
+            .with_job_lock(&job.id, || {
+                let confirm_store = store.clone();
+                let id = job.id.clone();
+                let confirm = std::thread::spawn(move || {
+                    confirm_job(
+                        &confirm_store,
+                        &id,
+                        &CredentialState::Present {
+                            source: CredentialSource::Env,
+                        },
+                        &MachineTokenState::Present,
+                    )
+                });
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                let mut canceled = store.load(&job.id)?;
+                canceled.status = CloudJobStatus::Canceled;
+                store.write_record(&canceled)?;
+                Ok(confirm)
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+        assert!(confirm.is_err(), "a canceled proposal cannot be confirmed");
+        assert_eq!(
+            store.load(&job.id).unwrap().status,
+            CloudJobStatus::Canceled
+        );
+    }
+
+    #[test]
+    fn cancel_leaves_a_done_job_and_its_pr_alone() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = CloudJobStore::from_path(temp.path().join("jobs"));
+        let mut done = stored_job(CloudJobStatus::Done, 10_000_000);
+        done.pr_url = Some("https://github.com/org/repo/pull/7".to_string());
+        store.save(&done).unwrap();
+        let after = cancel_job(&store, &done.id, &NoopLauncher).unwrap();
+        assert_eq!(after.status, CloudJobStatus::Done);
+        assert_eq!(after.pr_url, done.pr_url);
+        assert_eq!(store.load(&done.id).unwrap().status, CloudJobStatus::Done);
     }
 
     #[test]
