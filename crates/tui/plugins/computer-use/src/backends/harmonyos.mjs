@@ -105,12 +105,22 @@ export function create({ exec }) {
     return { action_sent: true, strategy: "event", backend: "uitest" };
   }
 
+  /**
+   * Re-find an observed element in a fresh dump. uitest indexes are
+   * positional and shift whenever a sibling appears, so the index alone can
+   * name a different control; the element is addressed by its observed tree
+   * path and must still carry the observed role and label, or nothing is sent.
+   */
   async function centerOf(target) {
     rejectAppSelectors(target);
+    const stale = (why) => Object.assign(new ExecError(`element_stale — ${why}; re-run get_app_state (uitest indexes change with the UI)`), { code: "element_stale" });
+    if (!Array.isArray(target?.path)) throw stale("the element target carries no observed tree path");
     const tree = await dumpLayout();
-    const els = flatten(tree);
-    const el = els[target.index];
-    if (!el || !el.bounds) throw new ExecError("element_stale — re-run get_app_state; uitest indexes change with the UI");
+    const key = JSON.stringify(target.path);
+    const el = flatten(tree).find((candidate) => JSON.stringify(candidate.path) === key);
+    if (!el || !el.bounds) throw stale("the observed element is gone");
+    if (target.role !== undefined && el.role !== target.role) throw stale(`role changed (${target.role} → ${el.role})`);
+    if (target.label !== undefined && el.label !== target.label) throw stale(`label changed (${target.label} → ${el.label})`);
     return el.bounds;
   }
 
