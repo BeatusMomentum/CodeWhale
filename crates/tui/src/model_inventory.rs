@@ -67,6 +67,10 @@ pub(crate) enum AutoRouterSetupIssue {
     /// `thinking` is not a reasoning tier; the classifier call would carry
     /// an effort the provider rejects or silently reinterprets.
     InvalidThinking,
+    /// `model` is not one the chat router's provider serves (checked where
+    /// the provider's model namespace is known; pass-through providers such
+    /// as OpenRouter or a custom endpoint are validated upstream).
+    InvalidModel,
 }
 
 impl AutoRouterSetupIssue {
@@ -82,6 +86,7 @@ impl AutoRouterSetupIssue {
             Self::InvalidThinking => {
                 "[auto.router] thinking must be auto, off, minimal, low, medium, high, xhigh, ultra, or max"
             }
+            Self::InvalidModel => "[auto.router] model is not served by the router provider",
         }
     }
 }
@@ -342,12 +347,22 @@ impl ModelInventory {
                     router_setup_issue = Some(AutoRouterSetupIssue::InvalidThinking);
                     None
                 } else {
-                    router_provider_setting
+                    let route = router_provider_setting
                         .and_then(ApiProvider::parse)
-                        .zip(router_model_setting)
-                        .map(|(provider, model)| {
+                        .zip(router_model_setting);
+                    // Same check a session route gets: a model the provider
+                    // cannot serve would 404 every classifier call and fall
+                    // back to local routing on every turn.
+                    if route.is_some_and(|(provider, model)| {
+                        crate::config::validate_route(provider, model).is_err()
+                    }) {
+                        router_setup_issue = Some(AutoRouterSetupIssue::InvalidModel);
+                        None
+                    } else {
+                        route.map(|(provider, model)| {
                             (provider, model.to_string(), thinking.map(str::to_string))
                         })
+                    }
                 }
             }
             Some(AutoRouterKind::Decision) => {
@@ -1543,6 +1558,35 @@ mod decision_router_inventory_tests {
         assert!(valid.router_available);
         assert_eq!(valid.router_setup_issue, None);
         assert_eq!(valid.router_thinking.as_deref(), Some("low"));
+    }
+
+    #[test]
+    fn a_chat_router_whose_provider_cannot_serve_the_model_is_not_configured() {
+        let _env = hermetic();
+        let chat = |provider: &str, model: &str| crate::config::AutoRouterConfig {
+            kind: Some("chat".to_string()),
+            provider: Some(provider.to_string()),
+            model: Some(model.to_string()),
+            ..Default::default()
+        };
+        // A model from another provider's namespace, either direction.
+        for (provider, model) in [("deepseek", "gpt-5-mini"), ("zai", "deepseek-v4-flash")] {
+            let wrong = ModelInventory::from_config(&with_router(chat(provider, model), true));
+            assert!(!wrong.router_configured, "{provider}/{model}");
+            assert_eq!(
+                wrong.router_setup_issue,
+                Some(AutoRouterSetupIssue::InvalidModel),
+                "{provider}/{model}"
+            );
+        }
+
+        let valid =
+            ModelInventory::from_config(&with_router(chat("deepseek", "deepseek-v4-flash"), true));
+        assert!(valid.router_configured);
+        assert_ne!(
+            valid.router_setup_issue,
+            Some(AutoRouterSetupIssue::InvalidModel)
+        );
     }
 
     #[test]
