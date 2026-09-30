@@ -9190,6 +9190,253 @@ async fn json_rpc_session_error_on_tool_call_is_not_replayed() {
     assert_eq!(server_call_count(&call_log), 2);
 }
 
+/// A sequential stdio server for the `tools/call` deadline fixtures. Every
+/// `initialize` appends `init <pid>` to `$INIT_LOG`, so a test can tell a
+/// reused connection from a rebuilt one; every `tools/call` appends
+/// `<tool> <id>` to `$CALL_LOG` before it runs, and its reply text is that
+/// same line, so a test can tell which request a reply answers. `slow` sleeps
+/// `$SLOW_SECS` before replying, `hang` never replies, `fast` replies at once.
+#[cfg(unix)]
+const DEADLINE_STDIO_SERVER: &str = r#"#!/bin/sh
+while IFS= read -r line; do
+    id=$(printf '%s\n' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+    case "$line" in
+        *'"method":"notifications/'*)
+            ;;
+        *'"method":"initialize"'*)
+            echo "init $$" >> "$INIT_LOG"
+            printf '{"jsonrpc":"2.0","id":"%s","result":{"protocolVersion":"2024-11-05","serverInfo":{"name":"deadline","version":"1.0.0"},"capabilities":{"tools":{}}}}\n' "$id"
+            ;;
+        *'"method":"tools/list"'*)
+            printf '{"jsonrpc":"2.0","id":"%s","result":{"tools":[{"name":"slow","inputSchema":{"type":"object"}},{"name":"fast","inputSchema":{"type":"object"}},{"name":"hang","inputSchema":{"type":"object"}}]}}\n' "$id"
+            ;;
+        *'"method":"tools/call"'*)
+            tool=$(printf '%s\n' "$line" | sed -n 's/.*"name":"\([^"]*\)".*/\1/p')
+            echo "$tool $id" >> "$CALL_LOG"
+            case "$tool" in
+                slow) sleep "$SLOW_SECS" ;;
+                hang) while :; do sleep 0.05; done ;;
+            esac
+            printf '{"jsonrpc":"2.0","id":"%s","result":{"content":[{"type":"text","text":"%s %s"}]}}\n' "$id" "$tool" "$id"
+            ;;
+        *)
+            [ -n "$id" ] && printf '{"jsonrpc":"2.0","id":"%s","result":{}}\n' "$id"
+            ;;
+    esac
+done
+"#;
+
+/// A pool with one `deadline` stdio server; returns it with the call and
+/// init log paths.
+#[cfg(unix)]
+fn deadline_stdio_pool(
+    dir: &Path,
+    slow_secs: &str,
+    configure: impl FnOnce(&mut McpServerConfig),
+) -> (McpPool, PathBuf, PathBuf) {
+    let script = dir.join("server.sh");
+    fs::write(&script, DEADLINE_STDIO_SERVER).unwrap();
+    let call_log = dir.join("calls.log");
+    let init_log = dir.join("inits.log");
+    let mut server = test_server_config();
+    server.command = Some("sh".to_string());
+    server.args = vec![script.to_string_lossy().into_owned()];
+    for (key, value) in [
+        ("CALL_LOG", call_log.to_string_lossy().into_owned()),
+        ("INIT_LOG", init_log.to_string_lossy().into_owned()),
+        ("SLOW_SECS", slow_secs.to_string()),
+    ] {
+        server.env.insert(key.to_string(), value);
+    }
+    configure(&mut server);
+    let mut cfg = McpConfig::default();
+    cfg.servers.insert("deadline".to_string(), server);
+    (McpPool::new(cfg), call_log, init_log)
+}
+
+#[cfg(unix)]
+fn log_lines(path: &Path) -> Vec<String> {
+    fs::read_to_string(path)
+        .map(|log| log.lines().map(str::to_string).collect())
+        .unwrap_or_default()
+}
+
+/// The result `DEADLINE_STDIO_SERVER` returns for the call it logged as `call`.
+#[cfg(unix)]
+fn deadline_reply(call: &str) -> serde_json::Value {
+    serde_json::json!({ "content": [{ "type": "text", "text": call }] })
+}
+
+/// #6741 over a real stdio child: a `tools/call` whose reply arrives after
+/// the read knob — the receive budget every request used to get — but inside
+/// the execute budget completes, and the next call on the same connection gets
+/// its own reply. The late frame is consumed once, by the request it answers;
+/// nothing is replayed and the child is not restarted.
+#[cfg(unix)]
+#[tokio::test]
+async fn stdio_tool_reply_after_the_read_knob_completes_within_the_execute_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut pool, call_log, init_log) = deadline_stdio_pool(dir.path(), "3", |server| {
+        server.read_timeout = Some(1);
+        server.execute_timeout = Some(30);
+    });
+
+    let started = std::time::Instant::now();
+    let slow = pool
+        .call_tool("mcp_deadline_slow", serde_json::json!({}))
+        .await
+        .expect("a reply inside the execute budget must not be cut off at the read knob");
+    assert!(
+        started.elapsed() >= Duration::from_secs(3),
+        "the reply must really have outlived the 1s read knob"
+    );
+    let fast = pool
+        .call_tool("mcp_deadline_fast", serde_json::json!({}))
+        .await
+        .expect("the next call on the same connection must get its own reply");
+
+    let calls = log_lines(&call_log);
+    assert_eq!(calls.len(), 2, "neither call may be replayed: {calls:?}");
+    assert!(calls[0].starts_with("slow ") && calls[1].starts_with("fast "));
+    assert_eq!(slow, deadline_reply(&calls[0]));
+    assert_eq!(fast, deadline_reply(&calls[1]));
+    assert_eq!(
+        log_lines(&init_log).len(),
+        1,
+        "both calls must share one connection and child"
+    );
+}
+
+/// An explicit `execute_timeout` shorter than the read knob still governs a
+/// real stdio `tools/call`: the call fails at its own 2s budget, not at the
+/// 120s read knob or the 1800s default. The request is abandoned, not the
+/// connection: the child's late reply to it reaches the pipe ahead of the
+/// next call's reply and is skipped, so the next call gets its own reply on
+/// the same child.
+#[cfg(unix)]
+#[tokio::test]
+async fn explicit_shorter_execute_budget_ends_a_stdio_tool_call_and_skips_its_late_reply() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut pool, call_log, init_log) = deadline_stdio_pool(dir.path(), "3", |server| {
+        server.execute_timeout = Some(2);
+    });
+    pool.get_or_connect("deadline").await.unwrap();
+
+    let started = std::time::Instant::now();
+    let error = pool
+        .call_tool("mcp_deadline_slow", serde_json::json!({}))
+        .await
+        .expect_err("an explicit shorter budget must end the call");
+    let elapsed = started.elapsed();
+    assert!(
+        format!("{error:#}")
+            .contains("MCP method 'tools/call' on server 'deadline' timed out after 2s"),
+        "unexpected error: {error:#}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "the explicit budget, not the 3s reply, must end the call: {elapsed:?}"
+    );
+
+    let fast = pool
+        .call_tool("mcp_deadline_fast", serde_json::json!({}))
+        .await
+        .expect("the kept connection must answer the next call");
+    let calls = log_lines(&call_log);
+    assert_eq!(calls.len(), 2, "neither call may be replayed: {calls:?}");
+    assert!(calls[0].starts_with("slow ") && calls[1].starts_with("fast "));
+    assert_eq!(
+        fast,
+        deadline_reply(&calls[1]),
+        "the abandoned call's late reply must not answer the next call"
+    );
+    assert_eq!(
+        log_lines(&init_log).len(),
+        1,
+        "an expired request must not rebuild the connection"
+    );
+}
+
+/// Owned cancellation of an in-flight stdio `tools/call` under the default
+/// 1800s execute budget: cancelling the connection's own token ends the call
+/// promptly instead of waiting out the budget, and marks the connection dead.
+/// The next call rebuilds it on a fresh child, the cancelled call's child is
+/// terminated rather than left running, and the cancelled call is not replayed.
+#[cfg(unix)]
+#[tokio::test]
+async fn cancelling_an_inflight_stdio_tool_call_does_not_wait_for_the_execute_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut pool, call_log, init_log) = deadline_stdio_pool(dir.path(), "0", |_| {});
+    assert_eq!(
+        pool.config.servers["deadline"].effective_execute_timeout(&pool.config.timeouts),
+        1800,
+        "the fixture must run under the default execute budget"
+    );
+    pool.get_or_connect("deadline").await.unwrap();
+    let cancel = pool.connections["deadline"].cancel_token.clone();
+
+    let call = tokio::spawn(async move {
+        let result = pool
+            .call_tool("mcp_deadline_hang", serde_json::json!({}))
+            .await;
+        (pool, result)
+    });
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while log_lines(&call_log).is_empty() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the child never received the call");
+
+    cancel.cancel();
+    let (mut pool, result) = tokio::time::timeout(Duration::from_secs(5), call)
+        .await
+        .expect("cancellation must not wait for the execute budget")
+        .expect("the call task panicked");
+    let error = result.expect_err("a cancelled call must not report success");
+    assert!(
+        format!("{error:#}").contains("MCP connection 'deadline' was cancelled"),
+        "unexpected error: {error:#}"
+    );
+    assert!(
+        pool.connected_servers().is_empty(),
+        "a cancelled connection must not be reused"
+    );
+
+    let fast = pool
+        .call_tool("mcp_deadline_fast", serde_json::json!({}))
+        .await
+        .expect("the next call must rebuild the connection");
+    let calls = log_lines(&call_log);
+    assert_eq!(
+        calls.len(),
+        2,
+        "the cancelled call must not be replayed: {calls:?}"
+    );
+    assert!(calls[0].starts_with("hang ") && calls[1].starts_with("fast "));
+    assert_eq!(fast, deadline_reply(&calls[1]));
+
+    let inits = log_lines(&init_log);
+    assert_eq!(
+        inits.len(),
+        2,
+        "the next call must run on a fresh child: {inits:?}"
+    );
+    let cancelled_pid: i32 = inits[0]
+        .strip_prefix("init ")
+        .and_then(|pid| pid.parse().ok())
+        .expect("the init log records the child pid");
+    tokio::time::timeout(STDIO_SHUTDOWN_GRACE + Duration::from_secs(1), async {
+        // SAFETY: signal zero only checks whether the pid still exists.
+        while unsafe { libc::kill(cancelled_pid, 0) } == 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the cancelled call's child must be terminated, not left running");
+}
+
 /// A Streamable HTTP server that reads the whole `tools/call` POST and then
 /// drops the connection may have run it: the call runs once and the next
 /// call succeeds on a rebuilt connection.
