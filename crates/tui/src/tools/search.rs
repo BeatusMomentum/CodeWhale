@@ -175,7 +175,9 @@ impl ToolSpec for GrepFilesTool {
             pattern_str.to_string()
         };
 
-        let regex = Regex::new(&regex_pattern)
+        // Model-supplied: compile through the bounded cache (length cap,
+        // program/DFA size limits, invalid patterns remembered).
+        let regex = crate::regex_cache::compile_user_regex(&regex_pattern)
             .map_err(|e| ToolError::invalid_input(format!("Invalid regex pattern: {e}")))?;
 
         // Resolve search path
