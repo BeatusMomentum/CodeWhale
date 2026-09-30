@@ -9642,16 +9642,19 @@ context_window = 262144
     fn a_pending_worker_row_reads_queued_not_running() {
         use crate::tools::subagent::AgentWorkerStatus;
         assert_eq!(
-            lifecycle_worker_status(AgentLifecycle::Pending),
+            super::lifecycle_worker_status(AgentLifecycle::Pending),
             Some(AgentWorkerStatus::Queued)
         );
-        assert_eq!(lifecycle_worker_status(AgentLifecycle::Running), None);
-        let (queued, ..) = format_agent_status(
+        assert_eq!(
+            super::lifecycle_worker_status(AgentLifecycle::Running),
+            None
+        );
+        let (queued, ..) = super::format_agent_status(
             Locale::En,
             &SubAgentStatus::Running,
             Some(AgentWorkerStatus::Queued),
         );
-        let (running, ..) = format_agent_status(Locale::En, &SubAgentStatus::Running, None);
+        let (running, ..) = super::format_agent_status(Locale::En, &SubAgentStatus::Running, None);
         assert_eq!(queued, tr(Locale::En, MessageId::AutomationRunStatusQueued));
         assert_ne!(queued, running);
     }
