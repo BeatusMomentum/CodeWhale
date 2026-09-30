@@ -5575,15 +5575,21 @@ async fn run_doctor(
 
     {
         // The runtime the TypeScript extension host would use, resolved the
-        // same way the host launcher does (`[extension_host] runtime`).
+        // same way the host launcher does (`[extension_host] runtime`). The
+        // resolver runs each candidate runtime, so it stays off the async
+        // runtime. Known limit: the probes have no timeout, so a runtime
+        // binary that hangs on `--version` stalls doctor here.
         let options = crate::extension_host::ExtensionHostOptions::from_config(
             config.extension_host.as_ref(),
         );
-        let resolution = crate::dependencies::resolve_extension_host_runtime(
-            options.runtime,
-            options.node_override.as_deref(),
-            options.bun_override.as_deref(),
-        );
+        let resolution = tokio::task::spawn_blocking(move || {
+            crate::dependencies::resolve_extension_host_runtime(
+                options.runtime,
+                options.node_override.as_deref(),
+                options.bun_override.as_deref(),
+            )
+        })
+        .await;
         let enabled = config
             .features()
             .enabled(crate::features::Feature::ExtensionHost);
@@ -5592,27 +5598,32 @@ async fn run_doctor(
         } else {
             " (unused: [features] extension_host is off)"
         };
-        match &resolution.selected {
-            Some(runtime) => {
-                println!(
-                    "  {} Extension host runtime: {}{state}",
-                    "✓".truecolor(aqua_r, aqua_g, aqua_b),
-                    resolution.summary(),
-                );
-                println!(
-                    "    {}",
-                    crate::extension_host::supervisor::MemoryEnforcement::planned(runtime.kind)
-                        .describe(crate::extension_host::supervisor::HOST_MEMORY_CAP)
-                );
-            }
-            None => println!(
-                "  {} Extension host runtime: {}{state}",
-                if enabled {
-                    "✗".truecolor(red_r, red_g, red_b)
-                } else {
-                    "·".dimmed()
-                },
-                resolution.failure(),
+        let failed = if enabled {
+            "✗".truecolor(red_r, red_g, red_b)
+        } else {
+            "·".dimmed()
+        };
+        match resolution {
+            Ok(resolution) => match &resolution.selected {
+                Some(runtime) => {
+                    println!(
+                        "  {} Extension host runtime: {}{state}",
+                        "✓".truecolor(aqua_r, aqua_g, aqua_b),
+                        resolution.summary(),
+                    );
+                    println!(
+                        "    {}",
+                        crate::extension_host::supervisor::MemoryEnforcement::planned(runtime.kind)
+                            .describe(crate::extension_host::supervisor::HOST_MEMORY_CAP)
+                    );
+                }
+                None => println!(
+                    "  {failed} Extension host runtime: {}{state}",
+                    resolution.failure(),
+                ),
+            },
+            Err(error) => println!(
+                "  {failed} Extension host runtime: the runtime probe did not finish ({error}){state}"
             ),
         }
     }
