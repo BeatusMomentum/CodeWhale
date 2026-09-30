@@ -169,6 +169,24 @@ pub(crate) fn render_underwater_surface(
     inner
 }
 
+/// Render wrapped detail text scrolled by *rendered* rows and return the
+/// largest useful scroll. Clamping by logical lines before wrapping left the
+/// wrapped tail unreachable and made each step jump a whole wrapped line.
+pub(crate) fn render_wrapped_detail(
+    lines: Vec<Line<'static>>,
+    area: Rect,
+    buf: &mut Buffer,
+    requested_scroll: usize,
+) -> usize {
+    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
+    let max_scroll = paragraph
+        .line_count(area.width.max(1))
+        .saturating_sub(usize::from(area.height).max(1));
+    let scroll = u16::try_from(requested_scroll.min(max_scroll)).unwrap_or(u16::MAX);
+    paragraph.scroll((scroll, 0)).render(area, buf);
+    max_scroll
+}
+
 /// Paint a scrollbar on the exact right edge of the panel it controls and
 /// return the content rect with that rail reserved. Nothing is drawn when all
 /// rows fit, so narrow surfaces do not spend a column on a fictional control.
@@ -5754,7 +5772,7 @@ pub(crate) fn subagent_view_agents(
                 agents.push(live_subagent_result(
                     &card.agent_id,
                     agent_type,
-                    lifecycle_to_subagent_status(card.status),
+                    lifecycle_to_subagent_status(card.status, card.summary.as_deref()),
                     card.summary.as_deref().unwrap_or(card.agent_type.as_str()),
                     Some("transcript"),
                     None, // transcript-derived rows get nickname from manager on render
@@ -5771,7 +5789,7 @@ pub(crate) fn subagent_view_agents(
                         agents.push(live_subagent_result(
                             &worker.agent_id,
                             FleetRole::Worker,
-                            lifecycle_to_subagent_status(worker.status),
+                            lifecycle_to_subagent_status(worker.status, None),
                             &objective,
                             Some(card.kind.as_str()),
                             None, // fanout worker rows get nickname from manager on render
@@ -5814,14 +5832,27 @@ pub(crate) fn subagent_view_agents(
     agents
 }
 
-fn lifecycle_to_subagent_status(status: AgentLifecycle) -> SubAgentStatus {
+/// Project a transcript card's lifecycle onto the manager status vocabulary.
+/// A failure or interruption keeps the reason the card recorded from its
+/// terminal envelope; only a card that recorded none gets the generic line.
+///
+/// Known limitation: `SubAgentStatus` has no pending state, so a spawned but
+/// not yet started worker reads as running here.
+fn lifecycle_to_subagent_status(status: AgentLifecycle, reason: Option<&str>) -> SubAgentStatus {
+    let reason = |fallback: &str| {
+        reason
+            .map(str::trim)
+            .filter(|reason| !reason.is_empty())
+            .unwrap_or(fallback)
+            .to_string()
+    };
     match status {
         AgentLifecycle::Pending | AgentLifecycle::Running => SubAgentStatus::Running,
         AgentLifecycle::Completed => SubAgentStatus::Completed,
-        AgentLifecycle::Failed => SubAgentStatus::Failed("failed in transcript".to_string()),
+        AgentLifecycle::Failed => SubAgentStatus::Failed(reason("failed in transcript")),
         AgentLifecycle::Cancelled => SubAgentStatus::Cancelled,
         AgentLifecycle::Interrupted => {
-            SubAgentStatus::Interrupted("interrupted in transcript".to_string())
+            SubAgentStatus::Interrupted(reason("interrupted in transcript"))
         }
     }
 }

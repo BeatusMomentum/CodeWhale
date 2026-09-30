@@ -131,6 +131,40 @@ pub enum Notice {
     /// fetch failed and it is reconnecting. Only this marks the pet offline.
     Unreachable(String),
 }
+/// Producer events queued for the next `/v1/producer` post. The owner caps a
+/// batch at 64 events *and* its request body at [`owner::MAX_REQUEST_BYTES`];
+/// a batch that exceeds either is a coverage gap, never a post the owner must
+/// refuse (a 64-event batch of 16 KiB events is far over the body limit).
+#[derive(Default)]
+struct Batch {
+    events: Vec<Value>,
+    bytes: usize,
+}
+
+impl Batch {
+    const MAX_EVENTS: usize = 64;
+    /// Room left for the post's envelope (identity, epoch, source, sequence).
+    const MAX_EVENT_BYTES: usize = owner::MAX_REQUEST_BYTES - 4 * 1024;
+
+    /// Queue one event. `Ok(false)` means it does not fit: the caller drops
+    /// the batch and restarts the lease rather than posting a partial one.
+    fn push(&mut self, text: &str) -> io::Result<bool> {
+        // `+ 1` counts the separating comma in the posted JSON array.
+        let bytes = self.bytes + text.len() + 1;
+        if self.events.len() >= Self::MAX_EVENTS || bytes > Self::MAX_EVENT_BYTES {
+            return Ok(false);
+        }
+        self.events.push(serde_json::from_str(text)?);
+        self.bytes = bytes;
+        Ok(true)
+    }
+
+    fn clear(&mut self) {
+        self.events.clear();
+        self.bytes = 0;
+    }
+}
+
 pub struct Worker {
     pub tx: mpsc::SyncSender<Command>,
     pub latest: Arc<Mutex<Option<Presentation>>>,
@@ -214,11 +248,17 @@ impl Client {
     }
     fn request(&self, path: &str, body: Option<&Value>) -> io::Result<Value> {
         let url = format!("http://127.0.0.1:{}{path}", self.descriptor.port);
-        let request = if let Some(body) = body {
+        let mut request = if let Some(body) = body {
             self.http.post(url).json(body)
         } else {
             self.http.get(url)
         };
+        if path == "/v1/export" {
+            // The owner serializes the recording on its world thread for up
+            // to its own work bound; giving up sooner abandons an export the
+            // owner still completes. Other calls keep the 2 s client bound.
+            request = request.timeout(owner::WORK_REPLY_TIMEOUT + Duration::from_secs(1));
+        }
         let response = request
             .bearer_auth(&self.descriptor.token)
             .send()
@@ -262,7 +302,9 @@ impl Client {
         #[cfg(target_os = "macos")]
         {
             use std::process::{Command as Process, Stdio};
-            let mut process = Process::new("open");
+            // The system launcher by absolute path: a bare `open` resolves
+            // through `PATH`, where a workspace entry could shadow it.
+            let mut process = Process::new("/usr/bin/open");
             if let Some(path) = std::env::var_os("CODEWHALE_PET_APP") {
                 process.arg(path);
             } else {
@@ -341,7 +383,7 @@ fn run(
     let mut changed = Instant::now();
     let mut fetched = Instant::now() - Duration::from_secs(1);
     let mut encoded = Instant::now() - Duration::from_secs(1);
-    let mut events = Vec::new();
+    let mut events = Batch::default();
     let mut producer_seq = None;
     let mut sequence = 0u64;
     let mut action: Option<Value> = None;
@@ -357,9 +399,9 @@ fn run(
         match rx.recv_timeout(Duration::from_millis(2)) {
             Ok(command) => match command {
                 Command::Observe(text) => {
-                    if events.len() < 64 {
-                        events.push(serde_json::from_str::<Value>(&text)?)
-                    } else {
+                    if !events.push(&text)? {
+                        // Overflow is a coverage gap, never a truncated batch:
+                        // restart the lease from sequence zero.
                         events.clear();
                         producer_seq = None;
                     }
@@ -489,7 +531,7 @@ fn run(
             if seq == 0 {
                 events.clear();
             }
-            let body = json!({"identity":s.identity,"epoch":s.epoch,"client":id,"source":s.source,"source_revision":s.source_revision,"seq":seq,"waiting":view.waiting,"events":events});
+            let body = json!({"identity":s.identity,"epoch":s.epoch,"client":id,"source":s.source,"source_revision":s.source_revision,"seq":seq,"waiting":view.waiting,"events":events.events});
             producer_seq = client.post("/v1/producer", &body).ok().map(|_| seq);
             events.clear();
             last_produce = Instant::now();
@@ -554,5 +596,33 @@ fn run(
             }
             encoded = began;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// U06-03: a producer batch is bounded by the owner's request body limit,
+    /// not only by its event count, so the worker never posts a body the
+    /// owner must refuse (64 events of 16 KiB each is ~1 MiB).
+    #[test]
+    fn producer_batch_fits_the_owner_body_limit() {
+        let mut batch = Batch::default();
+        let large = format!("{{\"event\":\"x\",\"id\":\"{}\"}}", "a".repeat(16_000));
+        let mut accepted = 0;
+        while batch.push(&large).unwrap() {
+            accepted += 1;
+        }
+        assert!(accepted > 0 && accepted < Batch::MAX_EVENTS, "{accepted}");
+        let posted = serde_json::to_vec(&json!({"seq": u64::MAX, "events": batch.events})).unwrap();
+        assert!(posted.len() <= owner::MAX_REQUEST_BYTES, "{}", posted.len());
+
+        batch.clear();
+        let small = "{\"event\":\"tool_call_heartbeat\"}";
+        for _ in 0..Batch::MAX_EVENTS {
+            assert!(batch.push(small).unwrap());
+        }
+        assert!(!batch.push(small).unwrap(), "the event count still bounds");
     }
 }

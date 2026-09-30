@@ -503,7 +503,18 @@ pub(crate) fn apply_follow_up_receipt(
     } else {
         crate::tui::app::StatusToastLevel::Warning
     };
-    if let Some(focus) = app.agent_focus.as_mut() {
+    // The receipt belongs to the agent it names (or the fork focus followed
+    // above). A delayed receipt for another agent must not land in whichever
+    // transcript happens to be focused now; the toast still reports it.
+    let receipt_target = outcome
+        .as_ref()
+        .ok()
+        .map(|receipt| receipt.target_agent_id.as_str());
+    if let Some(focus) = app
+        .agent_focus
+        .as_mut()
+        .filter(|focus| focus.is(agent_id) || receipt_target.is_some_and(|id| focus.is(id)))
+    {
         focus.local_cells.push(HistoryCell::System {
             content: note.clone(),
         });
@@ -1273,6 +1284,31 @@ mod tests {
                 .as_deref()
                 .is_some_and(|status| status.contains("status is cancelled"))
         );
+    }
+
+    /// U05-05: a delayed follow-up receipt for another agent must not be
+    /// appended to whichever transcript happens to be focused when it lands.
+    #[test]
+    fn delayed_follow_up_receipt_stays_out_of_another_agents_focus() {
+        let tmp = tempdir().expect("tempdir");
+        let mut app = test_app(tmp.path().to_path_buf());
+        focus_agent(&mut app, "agent_b");
+        let outcome = Ok(crate::tools::subagent::UserFollowUpOutcome {
+            agent_id: "agent_a".to_string(),
+            target_agent_id: "agent_a".to_string(),
+            delivered: true,
+            resumed: false,
+            note: "delivered".to_string(),
+        });
+        apply_follow_up_receipt(&mut app, "agent_a", &outcome);
+        let focus = app.agent_focus.as_ref().expect("focus kept");
+        assert_eq!(focus.agent_id, "agent_b");
+        assert!(
+            focus.local_cells.is_empty(),
+            "another agent's receipt leaked into this transcript: {:?}",
+            focus.local_cells
+        );
+        assert!(app.status_message.is_some(), "the toast still reports it");
     }
 
     #[test]

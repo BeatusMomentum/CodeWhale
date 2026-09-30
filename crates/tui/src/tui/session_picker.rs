@@ -64,6 +64,10 @@ impl PreviewCache {
         self.entries.back().map(|(_, lines)| lines)
     }
 
+    fn remove(&mut self, id: &str) {
+        self.entries.retain(|(key, _)| key != id);
+    }
+
     fn insert(&mut self, id: String, lines: Vec<String>) {
         self.entries.retain(|(key, _)| *key != id);
         self.entries.push_back((id, lines));
@@ -93,9 +97,30 @@ struct PendingPreview {
     cell: Arc<Mutex<Option<PreviewLoad>>>,
 }
 
+/// The session-store listing running off the event loop (U08-09). The
+/// store's metadata scan grows with every saved session, so the picker opens
+/// at once and fills in when the listing lands.
+struct PendingSessionList {
+    cell: Arc<Mutex<Option<Result<Vec<SessionMetadata>, String>>>>,
+    /// Row to land on once the list arrives (`new_selecting`).
+    select: Option<String>,
+}
+
+/// What the list pane says in place of rows it does not have yet.
+#[derive(Debug, Clone, Copy)]
+enum ListNotice<'a> {
+    Loading,
+    Failed(&'a str),
+}
+
 pub struct SessionPickerView {
     /// Every session loaded from disk. The picker filters from this set.
     sessions: Vec<SessionMetadata>,
+    /// The store listing still in flight, if any.
+    pending_list: Option<PendingSessionList>,
+    /// The store could not be listed. Shown instead of "no saved sessions",
+    /// which would claim an empty store nobody observed.
+    load_error: Option<String>,
     filtered: Vec<SessionMetadata>,
     selected: usize,
     list_scroll: Cell<usize>,
@@ -148,10 +173,67 @@ impl SessionPickerView {
     /// other workspaces are hidden by default — press `a` inside the
     /// picker to expand to all workspaces (#1395).
     pub fn new(workspace: &Path, locale: Locale) -> Self {
-        let sessions = SessionManager::default_location()
-            .and_then(|manager| manager.list_sessions())
-            .unwrap_or_default();
-        Self::from_session_list(workspace, locale, sessions)
+        Self::load(workspace, locale, None)
+    }
+
+    /// Open over the session store. Listing it is blocking disk I/O that
+    /// grows with the store, so inside a runtime it runs on the blocking pool
+    /// and lands through `tick`; outside one (unit tests, headless callers)
+    /// there is no loop to stall, so it loads inline.
+    fn load(workspace: &Path, locale: Locale, select: Option<String>) -> Self {
+        let mut view = Self::from_session_list(workspace, locale, Vec::new());
+        if tokio::runtime::Handle::try_current().is_err() {
+            view.apply_session_list(list_session_store(), select);
+            return view;
+        }
+        let cell = Arc::new(Mutex::new(None));
+        let slot = Arc::clone(&cell);
+        crate::utils::spawn_blocking_supervised("session-picker-list", move || {
+            let listed = list_session_store();
+            if let Ok(mut guard) = slot.lock() {
+                *guard = Some(listed);
+            }
+        });
+        view.pending_list = Some(PendingSessionList { cell, select });
+        view
+    }
+
+    /// Install a finished store listing. A failure is shown as a failure —
+    /// never as an empty store — and the list stays empty.
+    fn apply_session_list(
+        &mut self,
+        listed: Result<Vec<SessionMetadata>, String>,
+        select: Option<String>,
+    ) {
+        match listed {
+            Ok(sessions) => {
+                self.sessions = sessions;
+                self.load_error = None;
+                self.apply_sort_and_filter();
+                if let Some(session_id) = select {
+                    self.select_with_fallback(&session_id);
+                }
+            }
+            Err(error) => {
+                self.sessions.clear();
+                self.load_error =
+                    Some(tr(self.locale, MessageId::SessionsOpenFailed).replace("{error}", &error));
+                self.apply_sort_and_filter();
+            }
+        }
+    }
+
+    /// Apply the store listing once it lands. Returns whether the view changed.
+    fn poll_session_list(&mut self) -> bool {
+        let Some(pending) = self.pending_list.as_ref() else {
+            return false;
+        };
+        let Some(listed) = pending.cell.lock().ok().and_then(|mut guard| guard.take()) else {
+            return false;
+        };
+        let select = self.pending_list.take().and_then(|pending| pending.select);
+        self.apply_session_list(listed, select);
+        true
     }
 
     /// Construct a picker scoped to `workspace` over an explicit session list.
@@ -177,6 +259,8 @@ impl SessionPickerView {
     fn from_session_list(workspace: &Path, locale: Locale, sessions: Vec<SessionMetadata>) -> Self {
         let mut view = Self {
             sessions,
+            pending_list: None,
+            load_error: None,
             filtered: Vec::new(),
             selected: 0,
             list_scroll: Cell::new(0),
@@ -218,9 +302,7 @@ impl SessionPickerView {
     /// anything, so widening the view cannot cross a workspace boundary
     /// behind the user's back.
     pub fn new_selecting(workspace: &Path, locale: Locale, session_id: &str) -> Self {
-        let mut view = Self::new(workspace, locale);
-        view.select_with_fallback(session_id);
-        view
+        Self::load(workspace, locale, Some(session_id.to_string()))
     }
 
     /// Land the selection on `session_id`, widening one browse filter at a
@@ -486,6 +568,16 @@ impl SessionPickerView {
         );
     }
 
+    /// What the list pane shows in place of rows it has not got: the listing
+    /// is still in flight, or the store could not be listed.
+    fn list_notice(&self) -> Option<ListNotice<'_>> {
+        if self.pending_list.is_some() {
+            Some(ListNotice::Loading)
+        } else {
+            self.load_error.as_deref().map(ListNotice::Failed)
+        }
+    }
+
     fn sort_label(&self) -> String {
         match self.sort_mode {
             SessionSortMode::Recent => tr(self.locale, MessageId::SessionsSortRecent),
@@ -649,10 +741,12 @@ impl SessionPickerView {
             );
             return ViewAction::None;
         }
-        // Update our local metadata cache.
+        // Update our local metadata cache. The cached preview renders the old
+        // title, so it is dropped rather than shown again (U08-09).
         if let Some(meta) = self.sessions.iter_mut().find(|s| s.id == session.id) {
             meta.title = new_title.to_string();
         }
+        self.preview_cache.remove(&session.id);
         self.apply_sort_and_filter();
         self.refresh_preview();
         self.status =
@@ -749,6 +843,14 @@ impl SessionPickerView {
     }
 }
 
+/// List the saved-session store. Blocking; runs on the blocking pool when a
+/// runtime is available.
+fn list_session_store() -> Result<Vec<SessionMetadata>, String> {
+    SessionManager::default_location()
+        .and_then(|manager| manager.list_sessions())
+        .map_err(|error| error.to_string())
+}
+
 /// Read one saved session and render its preview. Blocking; runs on the
 /// blocking pool when a runtime is available.
 fn load_preview(session_id: &str, locale: Locale) -> PreviewLoad {
@@ -791,7 +893,8 @@ impl ModalView for SessionPickerView {
     }
 
     fn tick(&mut self) -> ViewAction {
-        if self.poll_preview() {
+        let listed = self.poll_session_list();
+        if self.poll_preview() || listed {
             ViewAction::Redraw
         } else {
             ViewAction::None
@@ -1041,6 +1144,7 @@ impl ModalView for SessionPickerView {
                 self.rename_mode,
                 &self.rename_input,
                 self.status.as_deref(),
+                self.list_notice(),
                 self.current_session_id.as_deref(),
                 self.locale,
             );
@@ -1116,6 +1220,7 @@ impl ModalView for SessionPickerView {
             self.rename_mode,
             &self.rename_input,
             self.status.as_deref(),
+            self.list_notice(),
             self.current_session_id.as_deref(),
             self.locale,
         );
@@ -1174,6 +1279,7 @@ fn build_list_lines(
     rename_mode: bool,
     rename_input: &str,
     status: Option<&str>,
+    notice: Option<ListNotice<'_>>,
     current_session_id: Option<&str>,
     locale: Locale,
 ) -> Vec<Line<'static>> {
@@ -1208,6 +1314,23 @@ fn build_list_lines(
     }
 
     if sessions.is_empty() {
+        match notice {
+            Some(ListNotice::Loading) => {
+                lines.push(Line::from(Span::styled(
+                    "\u{2026}",
+                    Style::default().fg(palette::TEXT_MUTED),
+                )));
+                return lines;
+            }
+            Some(ListNotice::Failed(error)) => {
+                lines.push(Line::from(Span::styled(
+                    truncate(error, width),
+                    Style::default().fg(palette::STATUS_ERROR),
+                )));
+                return lines;
+            }
+            None => {}
+        }
         lines.push(Line::from(Span::styled(
             tr(locale, MessageId::SessionsEmptyTitle),
             Style::default().fg(palette::TEXT_MUTED),
@@ -1616,6 +1739,8 @@ mod tests {
         let workspace_scope = scope.map(PathBuf::from);
         let mut view = SessionPickerView {
             sessions: sessions.clone(),
+            pending_list: None,
+            load_error: None,
             filtered: sessions,
             selected: 0,
             list_scroll: Cell::new(0),
@@ -1710,8 +1835,24 @@ mod tests {
         saved.metadata.title = "Before".to_string();
         manager.save_session(&saved).expect("save session");
         let mut view = picker_with(vec![saved.metadata.clone()], None);
+        assert!(
+            view.current_preview
+                .iter()
+                .any(|line| line == "Title: Before"),
+            "{:?}",
+            view.current_preview
+        );
 
         let action = view.rename_selected("After");
+        // U08-09: the cached preview rendered the old title; it must not be
+        // shown again after the rename.
+        assert!(
+            view.current_preview
+                .iter()
+                .any(|line| line == "Title: After"),
+            "{:?}",
+            view.current_preview
+        );
 
         let ViewAction::Emit(ViewEvent::SessionRenamed { metadata }) = action else {
             panic!("expected SessionRenamed event");
@@ -1898,6 +2039,7 @@ mod tests {
             false,
             false,
             "",
+            None,
             None,
             Some("session-01"),
             Locale::En,
@@ -2171,6 +2313,7 @@ mod tests {
             "",
             None,
             None,
+            None,
             Locale::En,
         );
 
@@ -2201,6 +2344,7 @@ mod tests {
             false,
             false,
             "",
+            None,
             None,
             None,
             Locale::En,
@@ -2409,6 +2553,7 @@ mod tests {
             "",
             None,
             None,
+            None,
             Locale::En,
         );
 
@@ -2443,6 +2588,7 @@ mod tests {
             "",
             None,
             None,
+            None,
             Locale::En,
         );
 
@@ -2474,6 +2620,7 @@ mod tests {
             false,
             false,
             "",
+            None,
             None,
             None,
             Locale::En,
@@ -2608,6 +2755,8 @@ mod tests {
 
         let mut view = SessionPickerView {
             sessions: sessions.clone(),
+            pending_list: None,
+            load_error: None,
             filtered: sessions,
             selected: 0,
             list_scroll: Cell::new(0),
@@ -2847,5 +2996,47 @@ mod tests {
             !stack.tick().redraw,
             "an idle tick after the preview landed must not keep repainting"
         );
+    }
+
+    /// U08-09: a session store that cannot be listed is reported as such,
+    /// never painted as "No saved sessions yet".
+    #[test]
+    fn unreadable_session_store_is_reported_not_shown_empty() {
+        let _lock = crate::test_support::lock_test_env();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // A regular file where the store directory belongs cannot be listed.
+        std::fs::write(tmp.path().join("sessions"), b"not a directory").expect("file");
+        let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", tmp.path());
+        let view = SessionPickerView::new(tmp.path(), Locale::En);
+        assert!(view.load_error.is_some(), "the listing failure was dropped");
+        let lines = build_list_lines(
+            &view.filtered,
+            0,
+            120,
+            0,
+            5,
+            false,
+            "",
+            "recent",
+            false,
+            false,
+            "",
+            None,
+            view.list_notice(),
+            None,
+            Locale::En,
+        );
+        let text = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("Could not open sessions"), "{text}");
+        assert!(!text.contains("No saved sessions yet"), "{text}");
     }
 }

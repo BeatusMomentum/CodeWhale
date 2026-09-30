@@ -653,7 +653,7 @@ fn deliver_fleet_draft_result(
                 let installed = boxed
                     .as_any_mut()
                     .downcast_mut::<crate::tui::views::fleet_setup::FleetSetupView>()
-                    .map(|wizard| {
+                    .and_then(|wizard| {
                         wizard.install_model_draft(
                             draft,
                             model_label.clone(),

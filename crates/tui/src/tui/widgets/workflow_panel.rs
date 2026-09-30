@@ -558,11 +558,13 @@ impl WorkflowPanelEvent {
                 at_ms,
             }),
             "run_completed" => {
+                // A terminal receipt without a readable status is not
+                // evidence of success; it fails closed like an unknown one.
                 let status = value
                     .get("status")
                     .and_then(Value::as_str)
                     .map(lifecycle_from_status)
-                    .unwrap_or(WorkflowPanelLifecycle::Succeeded);
+                    .unwrap_or(WorkflowPanelLifecycle::Failed);
                 Some(Self::RunCompleted {
                     status,
                     error: opt_str(value, "error"),
@@ -599,7 +601,7 @@ impl WorkflowPanelEvent {
                     .get("status")
                     .and_then(Value::as_str)
                     .map(WorkflowRowStatus::from_ir_status)
-                    .unwrap_or(WorkflowRowStatus::Succeeded);
+                    .unwrap_or(WorkflowRowStatus::Failed);
                 Some(Self::TaskCompleted {
                     task_id: opt_str(value, "task_id")?,
                     status,
@@ -1409,8 +1411,10 @@ impl WorkflowPanel {
                 if self.lifecycle == WorkflowPanelLifecycle::Cancelled {
                     return;
                 }
-                self.lifecycle = if matches!(status, WorkflowPanelLifecycle::Running) {
-                    WorkflowPanelLifecycle::Succeeded
+                // A completion receipt that still says running/pending is
+                // contradictory, not a success.
+                self.lifecycle = if status.is_running() {
+                    WorkflowPanelLifecycle::Failed
                 } else {
                     status
                 };
@@ -1442,13 +1446,22 @@ impl WorkflowPanel {
                 route,
                 at_ms,
             } => {
+                // A settled run is final. A child launch that raced the
+                // cancel (or any late same-run start) is recorded, but it
+                // never reopens the run or resets a row that already settled.
+                let settled = self.lifecycle.is_terminal();
+                if settled && self.find_row_mut(&task_id).is_some() {
+                    return;
+                }
                 if self.phases.is_empty() {
                     self.phases.push(WorkflowPanelPhase::new("Work"));
                     self.selected_phase = 0;
                 }
-                let phase_idx = self.selected_phase.min(self.phases.len().saturating_sub(1));
+                // Tasks join the runtime's newest phase. `selected_phase` is
+                // the render cursor and never routes an arriving task.
+                let phase_idx = self.phases.len().saturating_sub(1);
                 let display_model = resolved_model.or(model);
-                let row = WorkflowPanelRow {
+                let mut row = WorkflowPanelRow {
                     task_id: task_id.clone(),
                     label: label
                         .filter(|s| !s.trim().is_empty())
@@ -1466,12 +1479,20 @@ impl WorkflowPanel {
                     route: *route,
                     usage: None,
                 };
+                if self.lifecycle == WorkflowPanelLifecycle::Cancelled {
+                    // Same finalization the cancel applied to running rows.
+                    row.status = WorkflowRowStatus::Cancelled;
+                    row.completed_at_ms = Some(at_ms);
+                    row.usage = Some(WorkflowRowUsage::default());
+                }
                 if let Some(existing) = self.find_row_mut(&task_id) {
                     *existing = row;
                 } else if let Some(phase) = self.phases.get_mut(phase_idx) {
                     phase.rows.push(row);
                 }
-                self.lifecycle = WorkflowPanelLifecycle::Running;
+                if !settled {
+                    self.lifecycle = WorkflowPanelLifecycle::Running;
+                }
             }
             WorkflowPanelEvent::TaskCompleted {
                 task_id,
@@ -1525,7 +1546,7 @@ impl WorkflowPanel {
                     if self.phases.is_empty() {
                         self.phases.push(WorkflowPanelPhase::new("Work"));
                     }
-                    let phase_idx = self.selected_phase.min(self.phases.len().saturating_sub(1));
+                    let phase_idx = self.phases.len().saturating_sub(1);
                     if let Some(phase) = self.phases.get_mut(phase_idx) {
                         phase.rows.push(WorkflowPanelRow {
                             task_id,
@@ -2705,6 +2726,77 @@ mod tests {
             panel.find_row_mut("t1").expect("row").status,
             WorkflowRowStatus::Cancelled
         );
+    }
+
+    /// U05-01: a child launch that raced the cancel (or any late same-run
+    /// `task_started`) lands after the run settled. It is recorded, but it
+    /// never reopens the run, and a settled row is never reset to running.
+    #[test]
+    fn late_task_started_never_reopens_a_settled_run() {
+        let mut panel = started_panel();
+        panel.apply_json_event(&json!({
+            "type": "run_cancelled", "run_id": "workflow_abc",
+            "reason": "stopped by you", "at_ms": 2_000,
+        }));
+        panel.apply_json_event(&task_started_json("t2", "deepseek", "flash"));
+        panel.apply_json_event(&task_started_json("t1", "deepseek", "flash"));
+        assert_eq!(panel.lifecycle, WorkflowPanelLifecycle::Cancelled);
+        assert_eq!(
+            panel.find_row_mut("t1").expect("t1").status,
+            WorkflowRowStatus::Cancelled
+        );
+        assert_eq!(
+            panel
+                .find_row_mut("t2")
+                .expect("late t2 is recorded")
+                .status,
+            WorkflowRowStatus::Cancelled
+        );
+
+        let mut panel = started_panel();
+        panel.apply_json_event(&json!({
+            "type": "task_completed", "run_id": "workflow_abc",
+            "task_id": "t1", "status": "succeeded", "at_ms": 1_500,
+        }));
+        panel.apply_json_event(&json!({
+            "type": "run_completed", "run_id": "workflow_abc",
+            "status": "completed", "at_ms": 1_600,
+        }));
+        panel.apply_json_event(&task_started_json("t1", "deepseek", "flash"));
+        assert_eq!(panel.lifecycle, WorkflowPanelLifecycle::Succeeded);
+        assert_eq!(
+            panel.find_row_mut("t1").expect("t1").status,
+            WorkflowRowStatus::Succeeded
+        );
+    }
+
+    /// U05-02: a terminal receipt with a missing or contradictory status is
+    /// not evidence of success; it fails closed like an unknown status.
+    #[test]
+    fn malformed_completion_status_never_reads_as_success() {
+        for status in [None, Some("running"), Some("pending")] {
+            let mut panel = started_panel();
+            let mut completed = json!({
+                "type": "run_completed", "run_id": "workflow_abc", "at_ms": 2_000,
+            });
+            if let Some(status) = status {
+                completed["status"] = json!(status);
+            }
+            panel.apply_json_event(&json!({
+                "type": "task_completed", "run_id": "workflow_abc",
+                "task_id": "t1", "at_ms": 1_900,
+            }));
+            panel.apply_json_event(&completed);
+            assert_eq!(
+                panel.lifecycle,
+                WorkflowPanelLifecycle::Failed,
+                "{status:?}"
+            );
+            assert_eq!(
+                panel.find_row_mut("t1").expect("row").status,
+                WorkflowRowStatus::Failed
+            );
+        }
     }
 
     /// #4208: every decorative glyph the run map emits — expand marks, role

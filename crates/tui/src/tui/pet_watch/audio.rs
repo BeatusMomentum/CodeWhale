@@ -46,6 +46,10 @@ impl Target {
         self.requested.elapsed() <= Duration::from_millis(500)
     }
 
+    /// `Ok` means the samples were valid and the stream is live, not that they
+    /// were played: a full queue or a stale request drops them. Live audio is
+    /// a bounded real-time sink — late samples never queue behind the world
+    /// clock — so an overrun is a dropout, not a stream failure.
     pub fn send(&self, channels: [Vec<f32>; 2]) -> Result<(), ()> {
         let length = channels[0].len();
         if length > MAX_FRAMES
@@ -104,31 +108,7 @@ impl Output {
 
     #[cfg(not(test))]
     pub fn start() -> io::Result<Self> {
-        let mut command = Command::new("ffplay");
-        command.args([
-            "-nodisp",
-            "-autoexit",
-            "-loglevel",
-            "error",
-            "-probesize",
-            "32",
-            "-analyzeduration",
-            "0",
-            "-f",
-            "f32le",
-            "-sample_rate",
-            "48000",
-            "-ch_layout",
-            "stereo",
-            "-i",
-            "pipe:0",
-        ]);
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            command.creation_flags(0x08000000); // CREATE_NO_WINDOW
-        }
-        Self::spawn(command)
+        Self::spawn(player_command()?)
     }
 
     #[cfg(test)]
@@ -192,6 +172,38 @@ impl Drop for Output {
             let _ = child.kill();
         }
     }
+}
+
+/// The pet's PCM player: `ffplay` from a fixed install prefix, never from the
+/// ambient `PATH` (see [`crate::notify::audio::trusted_player`]). A player
+/// that is not installed there fails the start and Watch reports audio as
+/// unavailable.
+fn player_command() -> io::Result<Command> {
+    let mut command = Command::new(crate::notify::audio::trusted_player("ffplay")?);
+    command.args([
+        "-nodisp",
+        "-autoexit",
+        "-loglevel",
+        "error",
+        "-probesize",
+        "32",
+        "-analyzeduration",
+        "0",
+        "-f",
+        "f32le",
+        "-sample_rate",
+        "48000",
+        "-ch_layout",
+        "stereo",
+        "-i",
+        "pipe:0",
+    ]);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    }
+    Ok(command)
 }
 
 fn play(command: &mut Command, rx: mpsc::Receiver<Packet>, control: &Control) -> io::Result<()> {
@@ -351,6 +363,21 @@ mod tests {
             // player thread must have returned after killing and reaping it.
             wait_until(|| Arc::strong_count(&control) == 2);
             assert!(control.child.lock().unwrap().is_none());
+        }
+    }
+
+    /// U06-06: the player is an absolute path from a trusted prefix or it is
+    /// refused — never a bare name the ambient `PATH` resolves, where an empty
+    /// or repository-local entry would run a workspace-planted `ffplay`.
+    #[test]
+    fn pet_player_is_never_resolved_through_path() {
+        match player_command() {
+            Ok(command) => assert!(
+                std::path::Path::new(command.get_program()).is_absolute(),
+                "player resolved through PATH: {:?}",
+                command.get_program()
+            ),
+            Err(error) => assert_eq!(error.kind(), io::ErrorKind::NotFound),
         }
     }
 

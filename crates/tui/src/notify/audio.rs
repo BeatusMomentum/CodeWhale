@@ -2,9 +2,8 @@
 //! bell for a missing/unsupported WAV. Tests inject a sink and never call an OS
 //! player. A single in-flight WAV keeps repeated categories from stacking audio.
 use super::sound_policy::SoundCue;
-#[cfg(not(test))]
-use std::io;
-use std::io::Write;
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AudioOutcome {
@@ -29,6 +28,85 @@ pub fn emit_terminal(cue: &SoundCue, out: &mut dyn Write) -> AudioOutcome {
 }
 
 pub const WHALE_WAV: &[u8] = include_bytes!("../../assets/audio/codewhale-whale-call.wav");
+
+/// Resolve an external audio player (`aplay`, the pet's `ffplay`) from fixed
+/// install prefixes. The ambient `PATH` is never consulted: an empty (`::`),
+/// relative (`.`) or repository-local entry would let a checked-out workspace
+/// plant a player that Codewhale then runs with the user's authority.
+///
+/// Known limitation: a player installed only outside these prefixes (a
+/// custom `~/bin`, a version manager shim) is refused and the caller reports
+/// audio as unavailable. That is deliberate — there is no `PATH` fallback.
+pub(crate) fn trusted_player(name: &str) -> io::Result<PathBuf> {
+    trusted_player_in(name, &trusted_player_dirs())
+}
+
+fn trusted_player_in(name: &str, dirs: &[PathBuf]) -> io::Result<PathBuf> {
+    let file = if cfg!(windows) {
+        format!("{name}.exe")
+    } else {
+        name.to_owned()
+    };
+    dirs.iter()
+        .filter(|dir| dir.is_absolute())
+        .map(|dir| dir.join(&file))
+        .find(|candidate| is_executable_file(candidate))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "audio player is not installed in a trusted system location",
+            )
+        })
+}
+
+fn trusted_player_dirs() -> Vec<PathBuf> {
+    #[cfg(unix)]
+    {
+        [
+            "/usr/bin",
+            "/bin",
+            "/usr/local/bin",
+            "/opt/homebrew/bin",
+            "/home/linuxbrew/.linuxbrew/bin",
+            "/run/current-system/sw/bin",
+        ]
+        .into_iter()
+        .map(PathBuf::from)
+        .collect()
+    }
+    #[cfg(windows)]
+    {
+        // Package-manager shim directories from known folders, never PATH.
+        let mut found = Vec::new();
+        if let Some(local) = dirs::data_local_dir() {
+            found.push(local.join("Microsoft").join("WinGet").join("Links"));
+        }
+        if let Some(home) = dirs::home_dir() {
+            found.push(home.join("scoop").join("shims"));
+        }
+        if let Some(data) = std::env::var_os("ProgramData") {
+            found.push(PathBuf::from(data).join("chocolatey").join("bin"));
+        }
+        found
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        Vec::new()
+    }
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        path.metadata()
+            .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+    }
+    #[cfg(not(unix))]
+    {
+        path.is_file()
+    }
+}
 
 #[cfg(not(test))]
 pub fn dispatch(cue: &SoundCue, out: &mut dyn Write) -> AudioOutcome {
@@ -140,9 +218,9 @@ fn play_file(path: &std::path::Path) -> io::Result<()> {
 #[cfg(all(not(test), any(target_os = "macos", target_os = "linux")))]
 fn play_file(path: &std::path::Path) -> io::Result<()> {
     #[cfg(target_os = "macos")]
-    let player = "/usr/bin/afplay";
+    let player = PathBuf::from("/usr/bin/afplay");
     #[cfg(target_os = "linux")]
-    let player = "aplay";
+    let player = trusted_player("aplay")?;
     let status = std::process::Command::new(player)
         .arg(path)
         .stdin(std::process::Stdio::null())
@@ -217,6 +295,31 @@ mod tests {
             assert_eq!(emit_terminal(&cue, &mut out), AudioOutcome::Unsupported);
             assert!(out.is_empty());
         }
+    }
+
+    #[test]
+    fn trusted_player_needs_an_executable_file_under_an_absolute_prefix() {
+        assert!(trusted_player_dirs().iter().all(|dir| dir.is_absolute()));
+        let dir = tempfile::tempdir().unwrap();
+        let name = "codewhale-test-player";
+        let file = dir.path().join(if cfg!(windows) {
+            format!("{name}.exe")
+        } else {
+            name.to_string()
+        });
+        let prefixes = [dir.path().to_path_buf()];
+        assert!(trusted_player_in(name, &prefixes).is_err(), "absent");
+        std::fs::write(&file, b"").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert!(
+                trusted_player_in(name, &prefixes).is_err(),
+                "a non-executable file is not a player"
+            );
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        assert_eq!(trusted_player_in(name, &prefixes).unwrap(), file);
     }
 
     #[test]
