@@ -38,6 +38,7 @@
   "PetOffline": "オフライン — codewhale pet serve で起こせます",
   "PetDozing": "うたた寝",
   "PetWatchUnavailable": "ペットの計測が一時停止しました。/pet on で再試行します。",
+  "ConversationChangedBeforeUndo": "取り消しが完了する前に会話が変更されました。取り消しも再試行の送信も行っていません。現在の会話を確認してから、もう一度お試しください。",
   "SessionArchiveExported": "セッションをエクスポートしました",
   "SessionArchiveSizes": "項目数 / 非圧縮サイズ / アーカイブサイズ",
   "SessionArchiveNoArtifacts": "このセッションに通常のアーティファクトファイルはありません。",

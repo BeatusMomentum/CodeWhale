@@ -38,6 +38,7 @@
   "PetOffline": "fora de línia — codewhale pet serve el desperta",
   "PetDozing": "endormiscat",
   "PetWatchUnavailable": "La telemetria de la mascota està en pausa. /pet on ho torna a intentar.",
+  "ConversationChangedBeforeUndo": "La conversa ha canviat abans de completar l’acció de desfer. No s’ha desfet res ni s’ha enviat cap nou intent. Revisa la conversa actual abans de tornar-ho a provar.",
   "SessionArchiveExported": "Sessió exportada",
   "SessionArchiveSizes": "elements / mida sense comprimir / arxiu",
   "SessionArchiveNoArtifacts": "No s’han trobat fitxers d’artefactes regulars en aquesta sessió.",

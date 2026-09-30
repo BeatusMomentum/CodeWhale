@@ -52,6 +52,18 @@ async fn settled(app: &mut App, handle: &EngineHandle, answer: &str) {
     });
 }
 
+fn sync_snapshot(snapshot: &crate::core::ops::SessionSnapshot) -> Op {
+    Op::SyncSession {
+        session_id: Some(snapshot.session_id.clone()),
+        messages: snapshot.messages.clone(),
+        system_prompt: snapshot.system_prompt.clone(),
+        system_prompt_override: false,
+        model: snapshot.model.clone(),
+        workspace: snapshot.workspace.clone(),
+        mode: AppMode::parse(&snapshot.mode).unwrap(),
+    }
+}
+
 async fn flush_persistence(actor: &persistence_actor::PersistActorHandle) {
     let (reply, receive) = tokio::sync::oneshot::channel();
     assert!(actor.try_send(PersistRequest::FlushAndReport { reply }));
@@ -168,6 +180,30 @@ fn undo_retry_apply_path_keeps_engine_request_and_reopened_session_consistent() 
             .unwrap();
             settled(&mut app, &handle, answer).await;
         }
+        // Seed the Engine's typed compaction format, then consume the real
+        // SessionUpdated projection. Current projections strip the legacy
+        // system-prompt carrier; history must retain the checkpoint on undo.
+        let checkpoint_text = format!("{}\nRetained earlier facts", crate::compaction::SUMMARY_HEADER);
+        let checkpoint = crate::compaction::compaction_checkpoint_message(
+            &SystemPrompt::Text(checkpoint_text.clone()),
+        );
+        let mut compacted = handle.get_session_snapshot().await.unwrap();
+        let stable_prompt = compacted.system_prompt.as_ref()
+            .map(crate::compaction::summary_prompt_text).unwrap_or_default();
+        compacted.messages.insert(0, checkpoint.clone());
+        compacted.system_prompt = Some(SystemPrompt::Text(format!(
+            "{stable_prompt}\n\n<!-- compaction-summary:begin -->\n{checkpoint_text}\n<!-- compaction-summary:end -->"
+        )));
+        handle.send(sync_snapshot(&compacted)).await.unwrap();
+        loop {
+            let event = handle.rx_event.write().await.recv().await.unwrap();
+            if matches!(&event, EngineEvent::SessionUpdated { messages, .. } if messages.contains(&checkpoint)) {
+                assert!(super::super::event_loop::apply_engine_session_projection(&mut app, &config, event));
+                break;
+            }
+        }
+        assert!(crate::compaction::extract_compaction_summary(app.system_prompt.as_ref()).is_none());
+        assert!(app.api_messages.contains(&checkpoint));
         let id = app.current_session_id.clone().unwrap();
         let old = build_session_snapshot(&mut app, &manager).unwrap();
         let path = manager.save_session(&old).unwrap();
@@ -206,12 +242,14 @@ fn undo_retry_apply_path_keeps_engine_request_and_reopened_session_consistent() 
             let requests = mock.captured_requests();
             let last = requests.last().unwrap();
             assert_eq!(prompts(&last.messages), ["keep this", "retry this"]);
+            assert!(last.messages.contains(&checkpoint), "retry request lost retained checkpoint");
             assert!(
                 !serde_json::to_string(&last.messages)
                     .unwrap()
                     .contains("undone answer")
             );
             let reopened = manager.load_session(&id).unwrap();
+            assert!(reopened.messages.contains(&checkpoint), "durable undo lost retained checkpoint");
             assert_eq!(
                 prompts(&reopened.messages),
                 ["keep this"],
@@ -229,6 +267,96 @@ fn undo_retry_apply_path_keeps_engine_request_and_reopened_session_consistent() 
             assert!(!checkpoint_text.contains("retry answer"));
         }
         assert_eq!(mock.captured_requests().len(), 4);
+
+        // Force a real Engine update between successful UI preflight and the
+        // rewind operation. The proxy only orders mailbox operations: snapshots,
+        // mutation, refusal and provider calls still belong to the real Engine.
+        // Same-length history changes must be caught, as must each context field.
+        let alternate_workspace = TempDir::new().unwrap();
+        for (changed_field, before_preflight) in [
+            ("messages", false), ("identity", false), ("model", false),
+            ("workspace", false), ("prompt", false), ("mode", false),
+            ("prompt", true), ("mode", true),
+        ] {
+            let original = handle.get_session_snapshot().await.unwrap();
+            let mut newer = original.clone();
+            match changed_field {
+                "messages" => {
+                    let ContentBlock::Text { text, .. } =
+                        &mut newer.messages.last_mut().unwrap().content[0]
+                    else {
+                        panic!("fixture answer should be text");
+                    };
+                    *text = "a newer owned answer".into();
+                }
+                "identity" => newer.session_id = "newer-conversation".into(),
+                "model" => newer.model = "newer-model".into(),
+                "workspace" => newer.workspace = alternate_workspace.path().to_path_buf(),
+                "prompt" => newer.system_prompt = Some(SystemPrompt::Text("newer instructions".into())),
+                "mode" => newer.mode = AppMode::Plan.as_setting().into(),
+                _ => unreachable!(),
+            }
+            let replacement = sync_snapshot(&newer);
+            let real_handle = handle.clone();
+            let queued = real_handle.clone();
+            let (proxy_tx, mut proxy_rx) = tokio::sync::mpsc::channel(8);
+            handle.tx_op = proxy_tx;
+            let interleaving = tokio::spawn(async move {
+                let mut replacement = Some(replacement);
+                while let Some(op) = proxy_rx.recv().await {
+                    let is_preflight = matches!(&op, Op::GetSessionSnapshot { .. });
+                    if is_preflight && before_preflight && let Some(replacement) = replacement.take() {
+                        queued.send(replacement).await.unwrap();
+                    }
+                    queued.send(op).await.unwrap();
+                    if is_preflight && let Some(replacement) = replacement.take() {
+                        // FIFO puts B after snapshot A, but before the UI can
+                        // enqueue its conditional rewind through this proxy.
+                        queued.send(replacement).await.unwrap();
+                    }
+                }
+                assert!(replacement.is_none(), "preflight snapshot must have run");
+            });
+            app.input = "keep this unsent draft".into();
+            app.cursor_position = 7;
+            let visible = app.api_messages.clone();
+            let visible_id = app.current_session_id.clone();
+            let visible_model = app.model.clone();
+            let visible_workspace = app.workspace.clone();
+            let visible_prompt = app.system_prompt.clone();
+            let history_len = app.history.len();
+            let result = commands::execute("/retry", &mut app);
+            apply_command_result(
+                &mut terminal,
+                &mut app,
+                &mut handle,
+                &tasks,
+                &mut config,
+                result,
+            )
+            .await
+            .unwrap();
+            handle = real_handle;
+            interleaving.await.unwrap();
+            let current = handle.get_session_snapshot().await.unwrap();
+            assert!(current == newer, "queued {changed_field} update must not be overwritten");
+            assert!(app.api_messages == visible, "visible history changed on refusal");
+            assert!(app.current_session_id == visible_id, "visible identity changed on refusal");
+            assert!(app.model == visible_model, "visible model changed on refusal");
+            assert!(app.workspace == visible_workspace, "visible workspace changed on refusal");
+            assert!(app.system_prompt == visible_prompt, "visible prompt changed on refusal");
+            assert_eq!(app.history.len(), history_len);
+            assert!(matches!(app.history.last(), Some(HistoryCell::Assistant { content, .. }) if content == "retry answer two"));
+            assert_eq!(app.input, "keep this unsent draft");
+            assert_eq!(app.cursor_position, 7);
+            assert_eq!(mock.captured_requests().len(), 4, "refusal must not dispatch retry inference");
+            assert!(app.status_toasts.back().unwrap().text.contains(
+                app.tr(MessageId::ConversationChangedBeforeUndo).as_ref()
+            ));
+            // Restore only the fixture between independent race cases.
+            handle.send(sync_snapshot(&original)).await.unwrap();
+            assert!(handle.get_session_snapshot().await.unwrap() == original);
+        }
 
         // Runtime Chat ownership and a locally active turn must refuse before
         // even staging a different Engine history or altering the transcript.
@@ -329,6 +457,7 @@ fn undo_retry_apply_path_keeps_engine_request_and_reopened_session_consistent() 
         settled(&mut app, &handle, "answer after reopen").await;
         let requests = mock.captured_requests();
         assert_eq!(requests.len(), 5);
+        assert!(requests.last().unwrap().messages.contains(&checkpoint), "reopened provider request lost checkpoint");
         assert_eq!(
             prompts(&requests.last().unwrap().messages),
             ["keep this", "after reopen"]
@@ -380,7 +509,7 @@ fn undo_retry_apply_path_keeps_engine_request_and_reopened_session_consistent() 
                 .contains("session save failed")
         );
         assert!(
-            app.api_messages.is_empty(),
+            app.api_messages.as_slice() == [checkpoint.clone()],
             "acknowledged undo remains visible after save failure"
         );
         assert!(
@@ -388,8 +517,7 @@ fn undo_retry_apply_path_keeps_engine_request_and_reopened_session_consistent() 
                 .get_session_snapshot()
                 .await
                 .unwrap()
-                .messages
-                .is_empty()
+                .messages == [checkpoint]
         );
 
         handle.send(Op::Shutdown).await.unwrap();

@@ -38,6 +38,7 @@
   "PetOffline": "luring — codewhale pet serve membangunkannya",
   "PetDozing": "terlelap",
   "PetWatchUnavailable": "Telemetri hewan peliharaan dijeda. /pet on mencoba lagi.",
+  "ConversationChangedBeforeUndo": "Percakapan berubah sebelum pembatalan selesai. Tidak ada yang dibatalkan dan tidak ada permintaan coba lagi yang dikirim. Periksa percakapan saat ini sebelum mencoba lagi.",
   "SessionArchiveExported": "Sesi diekspor",
   "SessionArchiveSizes": "jumlah entri / ukuran tanpa kompresi / arsip",
   "SessionArchiveNoArtifacts": "Tidak ditemukan berkas artefak biasa untuk sesi ini.",

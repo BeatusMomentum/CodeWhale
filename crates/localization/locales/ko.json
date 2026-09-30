@@ -38,6 +38,7 @@
   "PetOffline": "오프라인 — codewhale pet serve로 깨울 수 있어요",
   "PetDozing": "졸고 있음",
   "PetWatchUnavailable": "펫 원격 측정이 일시 중지되었습니다. /pet on 으로 재시도합니다.",
+  "ConversationChangedBeforeUndo": "실행 취소가 완료되기 전에 대화가 변경되었습니다. 취소된 내용이 없으며 재시도 요청도 보내지 않았습니다. 현재 대화를 확인한 후 다시 시도하세요.",
   "SessionArchiveExported": "세션을 내보냈습니다",
   "SessionArchiveSizes": "항목 수 / 압축 전 크기 / 아카이브 크기",
   "SessionArchiveNoArtifacts": "이 세션에 일반 산출물 파일이 없습니다.",

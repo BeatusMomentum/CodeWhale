@@ -38,6 +38,7 @@
   "PetOffline": "sin conexión — codewhale pet serve lo despierta",
   "PetDozing": "dormitando",
   "PetWatchUnavailable": "La telemetría de la mascota está en pausa. /pet on reintenta.",
+  "ConversationChangedBeforeUndo": "La conversación cambió antes de completar la acción de deshacer. No se deshizo nada ni se envió un nuevo intento. Revisa la conversación actual antes de volver a intentarlo.",
   "SessionArchiveExported": "Sesión exportada",
   "SessionArchiveSizes": "elementos / tamaño sin comprimir / archivo",
   "SessionArchiveNoArtifacts": "No se encontraron archivos de artefactos regulares en esta sesión.",

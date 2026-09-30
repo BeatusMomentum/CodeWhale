@@ -1162,6 +1162,14 @@ pub fn op_to_protocol(op: &Op) -> wire_op::Op {
             workspace: workspace.clone(),
             mode: app_mode_str(*mode).to_string(),
         },
+        Op::RewindConversation {
+            expected,
+            messages,
+            tx: _,
+        } => wire_op::Op::RewindConversation {
+            expected: to_value(expected),
+            messages: messages.iter().map(to_value).collect(),
+        },
         Op::CompactContext {
             id,
             route,
@@ -1552,6 +1560,35 @@ mod tests {
         let error = serde_json::to_value(error.to_protocol(&ids)).unwrap();
         assert_eq!(error["category"], "rate_limit");
         assert_eq!(error["severity"], "warning");
+    }
+
+    #[test]
+    fn conditional_rewind_projection_preserves_expected_state_and_reply_owner() {
+        let expected = crate::core::ops::SessionSnapshot {
+            session_id: "observed-conversation".into(),
+            messages: vec![],
+            total_tokens: 9,
+            model: "observed-model".into(),
+            model_provider: "deepseek".into(),
+            model_provider_id: Some("configured-provider".into()),
+            workspace: std::path::PathBuf::from("/observed/workspace"),
+            system_prompt: None,
+            mode: "agent".into(),
+        };
+        let (tx, mut receive) = tokio::sync::oneshot::channel();
+        let op = Op::RewindConversation {
+            expected: Box::new(expected.clone()),
+            messages: vec![],
+            tx,
+        };
+        let value = serde_json::to_value(op.to_protocol()).unwrap();
+        assert_eq!(value["kind"], "rewind_conversation");
+        assert!(value["expected"] == to_value(&expected));
+        assert!(value.get("tx").is_none());
+        assert!(matches!(
+            receive.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
     }
 
     #[test]

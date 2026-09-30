@@ -1202,7 +1202,9 @@ pub(crate) fn classify_user_turn_prompt(message: &Message) -> UserTurnPromptKind
     }) {
         return UserTurnPromptKind::NotPrompt;
     }
-    if is_runtime_owned_user_message(message) {
+    if is_runtime_owned_user_message(message)
+        || crate::compaction::is_wire_compaction_checkpoint_message(message)
+    {
         return UserTurnPromptKind::NotPrompt;
     }
 
@@ -1586,6 +1588,32 @@ mod tests {
         assert_eq!(
             classify_user_turn_prompt(&prompt),
             UserTurnPromptKind::Editable
+        );
+
+        let checkpoint = crate::compaction::compaction_checkpoint_message(
+            &codewhale_models::SystemPrompt::Text(format!(
+                "{}\nRetained earlier facts",
+                crate::compaction::SUMMARY_HEADER
+            )),
+        );
+        assert_eq!(
+            classify_user_turn_prompt(&checkpoint),
+            UserTurnPromptKind::NotPrompt
+        );
+        assert_eq!(
+            edit_last_turn_target(std::slice::from_ref(&checkpoint)),
+            EditLastTurnTarget::Missing
+        );
+        assert_eq!(
+            edit_last_turn_target(&[prompt.clone(), checkpoint.clone()]),
+            EditLastTurnTarget::Editable(0)
+        );
+        let mut quoted_checkpoint = checkpoint;
+        quoted_checkpoint.content.pop();
+        assert_eq!(
+            classify_user_turn_prompt(&quoted_checkpoint),
+            UserTurnPromptKind::Editable,
+            "a user quoting checkpoint text without provenance remains a real turn"
         );
 
         let tool_result = Message {

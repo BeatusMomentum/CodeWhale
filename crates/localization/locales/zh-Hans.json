@@ -38,6 +38,7 @@
   "PetOffline": "离线 — 运行 codewhale pet serve 唤醒它",
   "PetDozing": "打盹",
   "PetWatchUnavailable": "宠物遥测已暂停。/pet on 重试。",
+  "ConversationChangedBeforeUndo": "撤销完成前，会话已发生变化。未撤销任何内容，也未发送重试请求。请先检查当前会话，再重试。",
   "SessionArchiveExported": "会话已导出",
   "SessionArchiveSizes": "条目数 / 未压缩大小 / 归档大小",
   "SessionArchiveNoArtifacts": "此会话没有常规产物文件。",

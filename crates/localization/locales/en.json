@@ -38,6 +38,7 @@
   "PetOffline": "offline — codewhale pet serve wakes it",
   "PetDozing": "dozing",
   "PetWatchUnavailable": "Pet telemetry paused. /pet on retries.",
+  "ConversationChangedBeforeUndo": "The conversation changed before undo could finish. Nothing was undone and no retry was sent. Review the current conversation before trying again.",
   "SessionArchiveExported": "Exported session",
   "SessionArchiveSizes": "members / uncompressed / archive",
   "SessionArchiveNoArtifacts": "No regular artifacts found for this session.",

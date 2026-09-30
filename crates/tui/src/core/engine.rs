@@ -2689,6 +2689,95 @@ impl Engine {
         &self.session.id
     }
 
+    /// Install one restored history and invalidate every dependent prompt/token
+    /// cache. Resume and conditional undo share this exact implementation.
+    fn restore_session_history(
+        &mut self,
+        messages: Vec<codewhale_models::Message>,
+        system_prompt: Option<codewhale_models::SystemPrompt>,
+        system_prompt_override: bool,
+    ) {
+        self.session.tool_activation_cache.clear();
+        let compaction_checkpoint = extract_compaction_summary_prompt(system_prompt.clone())
+            .or_else(|| {
+                // Current Engine projections carry the checkpoint in history,
+                // with a stripped system prompt. Only the existing structural
+                // validator can authorize a history block as that checkpoint.
+                messages.iter().rev().find_map(|message| {
+                    if !crate::compaction::is_wire_compaction_checkpoint_message(message) {
+                        return None;
+                    }
+                    match &message.content[0] {
+                        codewhale_models::ContentBlock::Text { text, .. } => {
+                            Some(codewhale_models::SystemPrompt::Text(text.clone()))
+                        }
+                        _ => None,
+                    }
+                })
+            });
+        // The op owns the synced history: move each message
+        // through the projection instead of cloning the whole
+        // conversation and dropping the original (M3).
+        let restored_messages =
+            crate::runtime_handoff::project_owned_messages_for_restore(messages);
+        // Replace the checkpoint in place so turns after the
+        // compaction boundary keep their chronology.
+        let restored_messages = crate::compaction::restore_compaction_checkpoint(
+            restored_messages,
+            compaction_checkpoint.as_ref(),
+        );
+        self.session.messages = restored_messages.into();
+        // Direct field assignment bypasses `add_message` /
+        // `replace_messages`, which own the messages-revision
+        // bump the token-estimate cache keys on (#perf-r5).
+        // Without this bump the first estimate after a
+        // session restore is computed against whatever
+        // history revision was current before the sync — a
+        // stale number can flow into capacity checkpoints.
+        self.session.bump_messages_revision();
+        self.session.latest_parent_input_tokens = None;
+        self.session.compaction_summary_prompt = compaction_checkpoint;
+        self.session.system_prompt =
+            crate::compaction::strip_compaction_summaries(system_prompt.as_ref());
+        self.session.last_system_prompt_hash =
+            Some(system_prompt_hash(self.session.system_prompt.as_ref()));
+        // Prompt pins and drift baselines describe the
+        // conversation that was active before this sync. The
+        // next submitted turn must establish the installed
+        // conversation's own full prefix instead of comparing
+        // it with that stale baseline and emitting a
+        // `<context_update>` from an empty/restored prompt.
+        // Host-owned overrides remain byte-stable because the
+        // refresh path exits early while the override is set.
+        self.session.pinned_prompt_context = None;
+        self.session.context_update_baseline = None;
+        // A session sync installs a new (or restored) prefix.
+        // Declare it so the next request re-pins the KV-cache
+        // prefix under a logged `resume` reason instead of
+        // reporting undeclared drift.
+        self.session.pending_prefix_change_reason = Some("resume".to_string());
+        // Host-supplied prompts are persisted prefixes. Keep them
+        // byte-stable; mode/runtime state is projected per request.
+        self.session.system_prompt_override =
+            system_prompt_override && self.session.system_prompt.is_some();
+    }
+
+    fn session_snapshot(&self) -> SessionSnapshot {
+        let total_tokens =
+            self.session.total_usage.input_tokens + self.session.total_usage.output_tokens;
+        SessionSnapshot {
+            session_id: self.session.id.clone(),
+            messages: self.session.messages.to_vec(),
+            total_tokens,
+            model: self.session.model.clone(),
+            model_provider: self.api_provider.as_str().to_string(),
+            model_provider_id: self.api_provider_id.clone(),
+            workspace: self.session.workspace.clone(),
+            system_prompt: self.session.system_prompt.clone(),
+            mode: self.current_mode.as_setting().to_string(),
+        }
+    }
+
     fn install_synced_session_id(&mut self, next_session_id: String) -> Option<String> {
         let previous_session_id = self.session.id.clone();
         if next_session_id == previous_session_id {
@@ -3505,12 +3594,6 @@ impl Engine {
                         workspace,
                         mode,
                     } => {
-                        // Deferred tool activations belong to one
-                        // conversation. SyncSession installs a conversation's
-                        // identity, history, and workspace (including the
-                        // generated-ID new-session path), so never carry the
-                        // previous conversation's toolbox across this edge.
-                        self.session.tool_activation_cache.clear();
                         let plugin_workspace_changed =
                             self.plugin_registry.workspace() != workspace.as_path();
                         let previous_session_id = self.session.id.clone();
@@ -3545,53 +3628,11 @@ impl Engine {
                                 );
                             }
                         }
-                        let compaction_checkpoint =
-                            extract_compaction_summary_prompt(system_prompt.clone());
-                        // The op owns the synced history: move each message
-                        // through the projection instead of cloning the whole
-                        // conversation and dropping the original (M3).
-                        let restored_messages =
-                            crate::runtime_handoff::project_owned_messages_for_restore(messages);
-                        // Replace the checkpoint in place so turns after the
-                        // compaction boundary keep their chronology.
-                        let restored_messages = crate::compaction::restore_compaction_checkpoint(
-                            restored_messages,
-                            compaction_checkpoint.as_ref(),
+                        self.restore_session_history(
+                            messages,
+                            system_prompt,
+                            system_prompt_override,
                         );
-                        self.session.messages = restored_messages.into();
-                        // Direct field assignment bypasses `add_message` /
-                        // `replace_messages`, which own the messages-revision
-                        // bump the token-estimate cache keys on (#perf-r5).
-                        // Without this bump the first estimate after a
-                        // session restore is computed against whatever
-                        // history revision was current before the sync — a
-                        // stale number can flow into capacity checkpoints.
-                        self.session.bump_messages_revision();
-                        self.session.latest_parent_input_tokens = None;
-                        self.session.compaction_summary_prompt = compaction_checkpoint;
-                        self.session.system_prompt =
-                            crate::compaction::strip_compaction_summaries(system_prompt.as_ref());
-                        self.session.last_system_prompt_hash =
-                            Some(system_prompt_hash(self.session.system_prompt.as_ref()));
-                        // Prompt pins and drift baselines describe the
-                        // conversation that was active before this sync. The
-                        // next submitted turn must establish the installed
-                        // conversation's own full prefix instead of comparing
-                        // it with that stale baseline and emitting a
-                        // `<context_update>` from an empty/restored prompt.
-                        // Host-owned overrides remain byte-stable because the
-                        // refresh path exits early while the override is set.
-                        self.session.pinned_prompt_context = None;
-                        self.session.context_update_baseline = None;
-                        // A session sync installs a new (or restored) prefix.
-                        // Declare it so the next request re-pins the KV-cache
-                        // prefix under a logged `resume` reason instead of
-                        // reporting undeclared drift.
-                        self.session.pending_prefix_change_reason = Some("resume".to_string());
-                        // Host-supplied prompts are persisted prefixes. Keep them
-                        // byte-stable; mode/runtime state is projected per request.
-                        self.session.system_prompt_override =
-                            system_prompt_override && self.session.system_prompt.is_some();
                         self.session.auto_model = model.trim().eq_ignore_ascii_case("auto");
                         self.session.model = model;
                         self.session.workspace = workspace.clone();
@@ -3623,6 +3664,31 @@ impl Engine {
                         // would immediately cover the host's confirmed resume receipt.
                         self.emit_session_updated().await;
                     }
+                    Op::RewindConversation {
+                        expected,
+                        messages,
+                        tx,
+                    } => {
+                        // Compare at the Engine mailbox boundary, not only in
+                        // the UI: queued work may have changed the conversation
+                        // since preflight. Refuse before touching any state.
+                        if self.session_snapshot() != *expected
+                            || messages.len() >= expected.messages.len()
+                            || !expected.messages.starts_with(&messages)
+                        {
+                            let _ = tx.send(None);
+                            continue;
+                        }
+                        self.restore_session_history(
+                            messages,
+                            self.session.system_prompt.clone(),
+                            self.session.system_prompt_override,
+                        );
+                        self.session.rebuild_working_set();
+                        self.reconcile_restored_work_bindings().await;
+                        let _ = tx.send(Some(self.session_snapshot()));
+                        self.emit_session_updated().await;
+                    }
                     Op::CompactContext {
                         id,
                         route,
@@ -3638,19 +3704,7 @@ impl Engine {
                         self.finish_compaction(&id);
                     }
                     Op::GetSessionSnapshot { tx } => {
-                        let total_tokens = self.session.total_usage.input_tokens
-                            + self.session.total_usage.output_tokens;
-                        let snapshot = SessionSnapshot {
-                            session_id: self.session.id.clone(),
-                            messages: self.session.messages.to_vec(),
-                            total_tokens,
-                            model: self.session.model.clone(),
-                            model_provider: self.api_provider.as_str().to_string(),
-                            model_provider_id: self.api_provider_id.clone(),
-                            workspace: self.session.workspace.clone(),
-                            system_prompt: self.session.system_prompt.clone(),
-                            mode: self.current_mode.as_setting().to_string(),
-                        };
+                        let snapshot = self.session_snapshot();
                         if let Some(tx) = tx.lock().ok().and_then(|mut g| g.take()) {
                             let _ = tx.send(snapshot);
                         }

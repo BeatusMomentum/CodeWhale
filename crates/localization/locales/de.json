@@ -38,6 +38,7 @@
   "PetOffline": "offline — codewhale pet serve weckt ihn",
   "PetDozing": "dösend",
   "PetWatchUnavailable": "Die Haustier-Telemetrie pausiert. /pet on versucht es erneut.",
+  "ConversationChangedBeforeUndo": "Die Unterhaltung wurde geändert, bevor das Rückgängigmachen abgeschlossen war. Es wurde nichts rückgängig gemacht und kein erneuter Versuch gesendet. Prüfe die aktuelle Unterhaltung, bevor du es erneut versuchst.",
   "SessionArchiveExported": "Sitzung exportiert",
   "SessionArchiveSizes": "Einträge / unkomprimierte Größe / Archivgröße",
   "SessionArchiveNoArtifacts": "Keine regulären Artefaktdateien für diese Sitzung gefunden.",

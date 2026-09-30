@@ -40,6 +40,12 @@ quieter, and Fleet runs can be checked before they spend anything.
 
 ### Fixed
 
+- TUI undo and retry rewind the Engine conversation and saved session before
+  replacement inference. If the conversation or its settings change while
+  undo is being prepared, it refuses without overwriting that newer state or
+  changing the draft. Retained compaction summaries survive the rewind and
+  cannot be selected as editable user prompts
+  ([#6788](https://github.com/Hmbown/Codewhale/issues/6788)).
 - Agents follow the Permissions you choose while they run: switching to
   Full Access reaches an agent that is already working, instead of leaving
   it with the Auto-Review guardian that denied it. Tightening reaches it too.

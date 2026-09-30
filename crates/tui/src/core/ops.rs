@@ -18,7 +18,7 @@ pub const USER_SHELL_TOOL_ID_PREFIX: &str = "user_shell_";
 
 /// Snapshot of session state for saving to disk.
 /// Returned by `Op::GetSessionSnapshot` via a oneshot channel.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct SessionSnapshot {
     /// The live conversation id this engine session is running under.
     ///
@@ -361,6 +361,15 @@ pub enum Op {
         model: String,
         workspace: PathBuf,
         mode: AppMode,
+    },
+
+    /// Rewind only the exact conversation observed by the caller. The Engine
+    /// compares the full expected state before changing history or caches.
+    /// A rejected rewind returns None and performs no mutation or inference.
+    RewindConversation {
+        expected: Box<SessionSnapshot>,
+        messages: Vec<Message>,
+        tx: tokio::sync::oneshot::Sender<Option<SessionSnapshot>>,
     },
 
     /// Run context compaction on one exact, structurally resolved provider

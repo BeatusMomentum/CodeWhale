@@ -38,6 +38,7 @@
   "PetOffline": "ngoại tuyến — codewhale pet serve sẽ đánh thức nó",
   "PetDozing": "ngủ gật",
   "PetWatchUnavailable": "Đã tạm dừng dữ liệu thú cưng. /pet on sẽ thử lại.",
+  "ConversationChangedBeforeUndo": "Cuộc trò chuyện đã thay đổi trước khi hoàn tất hoàn tác. Không có nội dung nào bị hoàn tác và không gửi yêu cầu thử lại. Hãy kiểm tra cuộc trò chuyện hiện tại trước khi thử lại.",
   "SessionArchiveExported": "Đã xuất phiên",
   "SessionArchiveSizes": "số mục / dung lượng chưa nén / tệp lưu trữ",
   "SessionArchiveNoArtifacts": "Không tìm thấy tệp sản phẩm thông thường trong phiên này.",

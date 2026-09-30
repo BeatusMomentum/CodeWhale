@@ -1327,6 +1327,8 @@ async fn apply_conversation_undo(
         "wait for the active turn to finish before undoing its conversation"
     );
     let before = engine.get_session_snapshot().await?;
+    let before_prompt =
+        crate::compaction::strip_compaction_summaries(before.system_prompt.as_ref());
     anyhow::ensure!(
         app.current_session_id
             .as_deref()
@@ -1334,31 +1336,38 @@ async fn apply_conversation_undo(
             && sync.session_id == app.current_session_id
             && sync.workspace == before.workspace
             && sync.model == before.model
+            && before.mode == app.mode.as_setting()
+            && crate::compaction::strip_compaction_summaries(app.system_prompt.as_ref())
+                == before_prompt
+            && crate::compaction::strip_compaction_summaries(sync.system_prompt.as_ref())
+                == before_prompt
             && before.messages.as_slice() == app.api_messages.as_slice()
             && sync.messages.len() < before.messages.len()
             && before.messages.starts_with(&sync.messages),
-        "the active conversation changed; refresh it before retrying"
+        "{}",
+        app.tr(MessageId::ConversationChangedBeforeUndo)
     );
-    let id = before.session_id;
-    let checkpoint = crate::compaction::extract_compaction_summary(sync.system_prompt.as_ref());
-    let expected = crate::compaction::restore_compaction_checkpoint(
-        crate::runtime_handoff::project_owned_messages_for_restore(sync.messages.clone()),
-        checkpoint.as_ref(),
-    );
+    let id = before.session_id.clone();
+    // A live rewind retains the checkpoint already owned by these messages.
+    // The Engine alone restores it and invalidates dependent caches.
+    let expected =
+        crate::runtime_handoff::project_owned_messages_for_restore(sync.messages.clone());
+    let (tx, receive) = tokio::sync::oneshot::channel();
     engine
-        .send(Op::SyncSession {
-            session_id: Some(id.clone()),
+        .send(Op::RewindConversation {
+            expected: Box::new(before),
             messages: sync.messages,
-            system_prompt: sync.system_prompt,
-            system_prompt_override: false,
-            model: sync.model,
-            workspace: sync.workspace,
-            mode: app.mode,
+            tx,
         })
         .await?;
-    // The snapshot is ordered after SyncSession on the same Engine channel.
-    // A send alone is not an acknowledgement that the engine adopted history.
-    let installed = engine.get_session_snapshot().await?;
+    // This receipt comes from the same Engine operation that compares and
+    // installs history. A queued update between preflight and rewind refuses.
+    let installed = receive.await?.ok_or_else(|| {
+        anyhow::anyhow!(
+            app.tr(MessageId::ConversationChangedBeforeUndo)
+                .into_owned()
+        )
+    })?;
     anyhow::ensure!(
         installed.session_id == id && installed.messages == expected,
         "the Engine did not acknowledge the conversation rollback"
