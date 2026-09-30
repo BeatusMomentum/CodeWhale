@@ -3166,18 +3166,19 @@ async fn a_wedged_request_fails_at_its_own_budget_and_keeps_the_connection() {
 async fn a_request_blocked_inside_send_ends_at_its_own_budget() {
     let mut connection = test_connection(Box::new(HangingSendTransport));
     connection.read_timeout_secs = 30;
-    let started = std::time::Instant::now();
-    let error = connection
-        .read_resource("file:///wedged-post", 1)
-        .await
-        .expect_err("a POST that never completes must end at the request budget");
+    let error = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        connection.read_resource("file:///wedged-post", 1),
+    )
+    .await
+    .expect("the request budget, not the transport, must end a blocked send")
+    .expect_err("a POST that never completes must end at the request budget");
     assert!(
         error
             .to_string()
             .contains("MCP method 'resources/read' on server 'mock' timed out after 1s"),
         "{error:#}"
     );
-    assert!(started.elapsed() < std::time::Duration::from_secs(10));
     assert!(
         !connection.is_ready(),
         "a send abandoned mid-write leaves the frame boundary unknown, so the connection is rebuilt"
