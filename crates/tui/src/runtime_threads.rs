@@ -2878,6 +2878,35 @@ impl RuntimeThreadStore {
     /// Remove every record an uncommitted seed named, then its journal. Ids in
     /// a journal were minted fresh for that seed, so nothing else is touched.
     fn discard_seed(&self, journal: &SeedJournal) -> Result<()> {
+        // Validate the whole deletion set first. A damaged journal must not
+        // retire records from another thread, even when some earlier records
+        // in its list were legitimate members of this seed.
+        for turn_id in &journal.turn_ids {
+            match self.load_turn(turn_id) {
+                Ok(turn) if turn.id == *turn_id && turn.thread_id == journal.thread_id => {}
+                Ok(_) => anyhow::bail!("seed journal names a turn outside its thread"),
+                Err(error)
+                    if error
+                        .downcast_ref::<io::Error>()
+                        .is_some_and(|error| error.kind() == io::ErrorKind::NotFound) => {}
+                Err(error) => {
+                    return Err(error).context("cannot validate seed turn before cleanup");
+                }
+            }
+        }
+        for item_id in &journal.item_ids {
+            match self.load_item(item_id) {
+                Ok(item) if item.id == *item_id && journal.turn_ids.contains(&item.turn_id) => {}
+                Ok(_) => anyhow::bail!("seed journal names an item outside its turns"),
+                Err(error)
+                    if error
+                        .downcast_ref::<io::Error>()
+                        .is_some_and(|error| error.kind() == io::ErrorKind::NotFound) => {}
+                Err(error) => {
+                    return Err(error).context("cannot validate seed item before cleanup");
+                }
+            }
+        }
         for turn_id in &journal.turn_ids {
             self.remove_turn(turn_id)?;
         }
@@ -2888,9 +2917,10 @@ impl RuntimeThreadStore {
     }
 
     /// Startup half of the seed transaction: a journal whose thread pointer
-    /// never moved past the one it recorded is an unpublished partial seed and
+    /// still matches the one it recorded is an unpublished partial seed and
     /// is discarded, so recovery can never restore it as history. A journal
-    /// whose pointer moved belongs to a committed seed and is simply removed.
+    /// whose pointer names its final turn belongs to a committed seed and is
+    /// simply removed. Uncertain intent or ownership prevents recovery.
     fn settle_seed_journals(&self) -> Result<()> {
         let threads_dir = checked_existing_runtime_store_dir(&self.threads_dir)?;
         for entry in fs::read_dir(&threads_dir)
@@ -2900,46 +2930,42 @@ impl RuntimeThreadStore {
             if path.extension().is_none_or(|ext| ext != "seed") {
                 continue;
             }
-            // The journal is written with an atomic replace, so an unreadable
-            // one was damaged outside this writer; report it rather than let
-            // it stop every thread's recovery.
-            let journal = match read_store_file(&path).and_then(|raw| {
-                serde_json::from_str::<SeedJournal>(&raw)
-                    .with_context(|| format!("Failed to parse {}", path.display()))
-            }) {
-                Ok(journal)
-                    if self
-                        .seed_journal_path(&journal.thread_id)
-                        .is_ok_and(|expected| expected.file_name() == path.file_name()) =>
-                {
-                    journal
-                }
-                Ok(_) => {
-                    tracing::warn!(
-                        target: "runtime",
-                        "seed journal {} names another thread; left in place",
+            // Recovery recomputes latest-turn pointers from every turn file.
+            // Without readable intent it cannot distinguish an unpublished
+            // seed from accepted history. Refuse startup and preserve evidence
+            // instead of publishing the incomplete transaction.
+            let journal = read_store_file(&path)
+                .and_then(|raw| {
+                    serde_json::from_str::<SeedJournal>(&raw)
+                        .with_context(|| format!("Failed to parse {}", path.display()))
+                })
+                .with_context(|| {
+                    format!(
+                        "seed recovery refused; preserve {} for repair",
                         path.display()
-                    );
-                    continue;
-                }
-                Err(error) => {
-                    tracing::warn!(target: "runtime", "unreadable seed journal left in place: {error:#}");
-                    continue;
-                }
-            };
+                    )
+                })?;
+            if self.seed_journal_path(&journal.thread_id)?.file_name() != path.file_name() {
+                anyhow::bail!(
+                    "seed journal {} names another thread; recovery refused",
+                    path.display()
+                );
+            }
             let committed = match self.load_thread(&journal.thread_id) {
-                Ok(thread) => thread.latest_turn_id != journal.previous_latest_turn_id,
-                Err(_) if !self.thread_path(&journal.thread_id)?.exists() => false,
+                Ok(thread) if thread.latest_turn_id == journal.previous_latest_turn_id => false,
+                Ok(thread) if journal.turn_ids.last() == thread.latest_turn_id.as_ref() => true,
+                Ok(_) => {
+                    anyhow::bail!("seed journal commit pointer is inconsistent; recovery refused")
+                }
+                Err(error)
+                    if error
+                        .downcast_ref::<io::Error>()
+                        .is_some_and(|error| error.kind() == io::ErrorKind::NotFound) =>
+                {
+                    false
+                }
                 Err(error) => {
-                    // An unreadable thread is skipped by recovery as well, so
-                    // none of these records can be published; keep the journal
-                    // for the pass that can read the thread.
-                    tracing::warn!(
-                        target: "runtime",
-                        thread_id = %journal.thread_id,
-                        "seed journal left for a thread that could not be read: {error:#}"
-                    );
-                    continue;
+                    return Err(error).context("seed thread cannot be read; recovery refused");
                 }
             };
             if committed {
@@ -6310,8 +6336,9 @@ impl RuntimeThreadManager {
 }
 
 /// Durable intent of one `seed_thread_from_messages` transaction (#6555).
-/// The seed committed exactly when the thread's `latest_turn_id` moved off
-/// `previous_latest_turn_id`; see [`RuntimeThreadStore::settle_seed_journals`].
+/// The seed committed when the thread's `latest_turn_id` moved from
+/// `previous_latest_turn_id` to the final journaled turn; see
+/// [`RuntimeThreadStore::settle_seed_journals`].
 #[derive(Debug, Serialize, Deserialize)]
 struct SeedJournal {
     thread_id: String,
