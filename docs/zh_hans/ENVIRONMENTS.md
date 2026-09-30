@@ -1,7 +1,7 @@
 # 特定环境的注意事项
 
 > 英文原文：[ENVIRONMENTS.md](../ENVIRONMENTS.md)。
-> 最后与英文同步日期（last synced with English revision）：2026-09-27。
+> 最后与英文同步日期（last synced with English revision）：2026-09-29。
 
 标准的构建/测试/运行命令放在 `AGENTS.md` 和 `CONTRIBUTING.md`。本文件只记录
 特定环境里那些不明显的怪癖，免得在永远碰不到它们的机器上占用上下文。
@@ -13,19 +13,19 @@
   错误，就是缺这个依赖。
 - **必须设置 `rustup default`：** 有些测试和运行时（runtime）路径会在本检出
   目录*之外*的临时目录里拉起 shell（例如 `run_verifiers_background_*`、
-  子代理（subagent）工作树）。这些被拉起的 shell 只有在 `/workspace` 内部
+  子智能体（subagent）工作树）。这些被拉起的 shell 只有在 `/workspace` 内部
   才能看到仓库的 `rust-toolchain.toml` 覆盖设置，所以没有全局默认值时，
   它们会以“rustup could not choose a version of rustc to run”失败。
   更新脚本会运行 `rustup default stable` 来修复这一点。
 - **`/workspace` 上已知的环境相关测试失败（不是代码缺陷）：** 因为检出目录
-  直接位于 `/` 之下，有两个 `codewhale-tui` 子代理测试会在这里失败——
+  直接位于 `/` 之下，有两个 `codewhale-tui` 子智能体测试会在这里失败——
   `git_repo_root_reports_attempted_paths_when_no_repo_found`（无法在不可写的
   父目录 `/` 里创建临时目录）和
   `create_isolated_worktree_reports_friendly_error_when_no_repo_found`
-  （向上遍历到 `/` 时会把 `/workspace` 本身当成仓库）。当仓库检出一个正常
+  （向上遍历到 `/` 时会把 `/workspace` 本身当成仓库）。当仓库检出到一个正常
   可写的父目录下时，这两个测试都会通过。
 
-## 在没有提供商 API key 的情况下运行代理
+## 在没有提供商 API key 的情况下运行智能体
 
 通过免密钥的 `vllm`/`ollama`/`sglang` 提供商（provider），把 Codewhale
 指向任意本地 OpenAI 兼容端点：
@@ -35,7 +35,7 @@ CODEWHALE_PROVIDER=vllm VLLM_BASE_URL=http://127.0.0.1:8000/v1 VLLM_MODEL=<id> \
   codewhale exec --auto "..."
 ```
 
-`codewhale exec`（加上 `--auto` 可启用工具调用）是跑通完整代理循环的非交互路径。
+`codewhale exec`（加上 `--auto` 可启用工具调用）是跑通完整智能体循环的非交互路径。
 
 ## 在回合期间让主机保持唤醒
 
@@ -60,5 +60,5 @@ CODEWHALE_PROVIDER=vllm VLLM_BASE_URL=http://127.0.0.1:8000/v1 VLLM_MODEL=<id> \
 ## 统一的运行时命令
 
 当前的 `codewhale` 二进制在进程内运行 TUI。发布安装器会把同样的字节复制到
-可选的 `codew` 短命令；不再需要并列的 `codewhale-tui` 可执行文件。
+可选的 `codew` 短命令；不需要另外的 `codewhale-tui` 可执行文件。
 `DEEPSEEK_TUI_BIN` 仍是遗留的回放/迁移设置，不是当前安装所必需的。

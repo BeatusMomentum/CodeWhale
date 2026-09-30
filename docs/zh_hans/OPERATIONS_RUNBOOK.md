@@ -1,7 +1,7 @@
 # codewhale 运维手册（Operations Runbook）
 
 > 英文原文：[OPERATIONS_RUNBOOK.md](../OPERATIONS_RUNBOOK.md)。
-> 最后与英文同步日期（last synced with English revision）：2026-09-27。
+> 最后与英文同步日期（last synced with English revision）：2026-09-29。
 
 本手册覆盖本地 CLI/TUI 运行时（runtime）的实用调试与事故响应。
 
@@ -22,7 +22,7 @@
 
 症状：
 - TUI 一直停在加载状态
-- 助手输出不完整且没有结束
+- 智能体输出不完整且没有结束
 
 检查：
 1. 查看重试／健康日志（`codewhale_tui::client`）
@@ -32,7 +32,7 @@
 
 处置：
 1. 如果有一个前台 shell 命令正在运行，按 `Ctrl+B` 把它移到后台（回合继续运行，该命令会变成 `/jobs` 下的后台作业）；如果你要取消这个回合，就改用 `Ctrl+C`。
-2. 如果该命令是在后台启动的，请让助手用 `Bash` 加上 `action: "cancel"` 和返回的进程 id 来取消。
+2. 如果该命令是在后台启动的，请让智能体用 `Bash` 加上 `action: "cancel"` 和返回的进程 id 来取消。
 3. 当你要停掉请求本身时，用 `Esc` 或 `Ctrl+C` 中断当前回合。
 4. 重试提示词（prompt）；如果仍然失败，重启 TUI。
 5. 重启后，确认之前排队中／在途的运行时回合显示为已中断，而不是仍处于运行状态。

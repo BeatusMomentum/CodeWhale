@@ -61,7 +61,7 @@ prefer_bwrap = true`,
           codeTerms: true,
         },
         {
-          p: "前两种模式只有在沙箱可用时才会真正生效——在没有 bubblewrap 的 Linux 上，以及在 Windows 上，它们只是设置，背后没有操作系统沙箱。仓库自带的配置只能让模式更严格，不能更宽松。对单次无界面运行，可以给 `codewhale exec` 传 `--sandbox <模式>`；`--auto` 只会自动批准工具，绝不会放宽沙箱。",
+          p: "前两种模式只有在沙箱可用时才会真正生效——在没有 bubblewrap 的 Linux 上，以及在 Windows 上，它们只是设置，背后没有操作系统沙箱。仓库自带的配置只能让模式更严格，不能更宽松。对单次无界面运行，可以给 `codewhale exec` 传 `--sandbox <mode>`；`--auto` 只会自动批准工具，绝不会放宽沙箱。",
         },
       ],
     },

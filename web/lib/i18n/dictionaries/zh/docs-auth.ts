@@ -60,7 +60,7 @@ codewhale auth status --provider deepseek`,
       title: "使用其他提供商或本地模型",
       blocks: [
         {
-          p: "`codewhale auth list` 会列出 Codewhale 支持的所有提供商，以及每个提供商是否已有密钥。所有提供商的用法都一样：`codewhale auth set --provider <名称>`，或者设置该提供商的环境变量。",
+          p: "`codewhale auth list` 会列出 Codewhale 支持的所有提供商，以及每个提供商是否已有密钥。所有提供商的用法都一样：`codewhale auth set --provider <name>`，或者设置该提供商的环境变量。",
         },
         {
           p: "本地运行器——Ollama、vLLM 和 SGLang——默认不需要密钥，你的提示词也不会离开本机。先启动运行器，再选择它：",
@@ -80,7 +80,7 @@ codewhale --provider ollama --model <model-tag>`,
       title: "登录 Codewhale 账户（可选）",
       blocks: [
         {
-          p: "提供商密钥和 Codewhale 账户是两回事。账户只用于账户相关的功能，比如云端 Agent、在网页应用里接着使用某个会话。安装 Codewhale 和在本地工作都不需要账户。",
+          p: "提供商密钥和 Codewhale 账户是两回事。账户只用于账户相关的功能，比如云端智能体、在网页应用里接着使用某个会话。安装 Codewhale 和在本地工作都不需要账户。",
         },
         {
           rows: [

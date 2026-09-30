@@ -1,7 +1,7 @@
 # 工具表面（tool surface）
 
 > 英文原文：[TOOL_SURFACE.md](../TOOL_SURFACE.md)。
-> 最后与英文同步日期（last synced with English revision）：2026-09-28。
+> 最后与英文同步日期（last synced with English revision）：2026-09-29。
 
 本文描述当前面向模型的工具（tool）契约。产生它的 v0.9.1 切换记录在
 `docs/RUNTIME_SIMPLIFICATION_DESIGN.md` 中；工作区版本请从 `Cargo.toml` 读取，
@@ -11,7 +11,7 @@
 
 实现来源：
 
-- `crates/tui/src/core/engine/tool_catalog.rs` 掌管急切（eager）与延迟（deferred）目录。
+- `crates/tui/src/core/engine/tool_catalog.rs` 掌管预加载（eager）与延迟（deferred）目录。
 - `crates/tui/src/tools/registry.rs` 注册规范工具与隐藏别名。
 - `crates/tui/src/tools/{file,file_tool,shell}.rs` 掌管小型前台原语的行为与 schema；
   其余原生工具仍可被搜索。
@@ -19,7 +19,7 @@
 
 ## 默认激活契约
 
-新回合开始时带有十一个急切的原生名称，外加合成的 `tool_search`：
+新回合开始时带有十一个预加载（eager）的原生名称，外加合成的 `tool_search`：
 
 1. `read`
 2. `write`
@@ -37,7 +37,7 @@
 这十一个原生名称就是 `crates/tui/src/core/engine/tool_catalog.rs` 里的
 `DEFAULT_ACTIVE_NATIVE_TOOLS`，由
 `default_active_contract_keeps_discovery_and_core_tools_eager` 固定住。
-权威边界（authority boundary）可以在子级最大深度处移除 `agent`，
+权限边界（authority boundary）可以在子智能体达到最大深度时移除 `agent`，
 但仅凭路由大小不得改变这套核心词汇。
 
 直接 schema 刻意保持精简：
@@ -48,9 +48,9 @@
 | `write` | `path`、`content` | 创建或替换文件。 |
 | `edit` | `path`、`edits` | 针对同一份原始快照应用一处或多处无歧义的文本替换。 |
 | `bash` | `command`、可选的 `timeout` | 运行一条可取消的前台 shell 命令，并返回有界的尾部输出。 |
-| `agent` | 被委派的任务以及可选的作用域/上下文控制项 | 启动或查看聚焦的子级工作。 |
-| `workflow` | plan/script/source_path 加上运行控制项 | 用依赖关系和完成检查来协调多代理（agent）阶段。 |
-| `todo_write` | `{content, status}` 条目的完整替换列表 | 为真正的多步工作保留可选的、由代理自己维护的进度笔记。 |
+| `agent` | 被委派的任务以及可选的作用域/上下文控制项 | 启动或查看专注的子智能体任务。 |
+| `workflow` | plan/script/source_path 加上运行控制项 | 用依赖关系和完成检查来协调多智能体阶段。 |
+| `todo_write` | `{content, status}` 条目的完整替换列表 | 为真正的多步工作保留可选的、由智能体自己维护的进度笔记。 |
 | `create_goal` | 目标文本以及可选预算 | 启动本回合所追求的会话目标（goal）。 |
 | `get_goal` | 无 | 读取当前生效的目标及其进度。 |
 | `update_goal` | 终态状态 | 把目标标记为完成或受阻。 |
@@ -58,8 +58,8 @@
 
 模式是一项权威决定，而不是同义词体系。Plan、Work 和 Operate 使用同一套原语身份。
 Plan 在中心位置拒绝 `write`、`edit` 和 `bash`；Work 与 Operate 仍会让这些调用通过
-审批（approval）、沙箱（sandbox）、受信任路径、仓库法则和管理策略等闸门。
-Full Access 会改变常规审批行为，但不会绕过硬性安全或仓库法则。
+审批（approval）、沙箱（sandbox）、受信任路径、仓库规则（repository law）和托管策略等闸门。
+Full Access（完全访问）会改变常规审批行为，但不会绕过硬性安全限制或仓库规则。
 
 `update_plan` 仅为已保存工件（artifact）的兼容性而保留注册，对模型不可见。
 `tasks`、`Git`、`Run`、`Web`、`remember` 以及其他专门能力都是可搜索的，
@@ -68,8 +68,8 @@ Full Access 会改变常规审批行为，但不会绕过硬性安全或仓库�
 ## 延迟与动态工具
 
 `Web` 是有条件的、延迟的。只有当生效的策略与运行时（runtime）后端允许时，
-它才能通过 `tool_search` 被发现。只读子级仍保留其只读的搜索/抓取证据路径；
-只读权威并不意味着“无法做研究”。
+它才能通过 `tool_search` 被发现。只读子智能体仍保留其只读的搜索/抓取证据路径；
+只读权限并不意味着“无法做研究”。
 
 可持久使用的 `github`、`automation` 和 `rlm` 动作族默认也是延迟的。
 `rlm` 掌管一个持久本地 Python 会话（一个清理过环境变量的子进程，而不是操作系统级沙箱）的
@@ -88,12 +88,12 @@ MCP 工具是动态的。连接成功的服务器会从 `~/.codewhale/mcp.json` 
 `execute_tools` 与合成的解释器工具一样由引擎注入。它运行一个 JavaScript 程序，
 该程序唯一的宿主表面是 `await tools.call(name, args)`；它也是组合多次工具调用
 ——包括 MCP 与插件工具——的默认方式，无需让每个中间结果都在对话里往返一遍。
-它在 Plan 模式下被隐藏，在 worker 权威信封下会被拒绝。
+它在 Plan 模式下被隐藏，在 worker 的权限范围（authority envelope）内会被拒绝。
 
 - **一道闸门。** 在会话（session）回合中，每个嵌套调用都会被送回回合循环，
   并像直接调用一样被规划：拒绝/允许清单、准备工作
   （MCP 的 `readOnlyHint`/`destructiveHint`）、`tool_call_before` 钩子（hook）、
-  ask 规则、Auto-Review、仓库法则，以及 Computer Use 同意拒绝。
+  ask 规则、Auto-Review、仓库规则，以及 Computer Use 的同意拒绝。
   MCP 调用走会话 MCP 池。批准程序本身不会授予任何权限，所以
   `execute_tools` 自身是自动批准的。如果程序运行期间权限姿态（posture）发生变化，
   它余下的嵌套调用会被拒绝（已批准的调用只有在姿态相同或更宽时才能存活，
@@ -115,10 +115,10 @@ MCP 工具是动态的。连接成功的服务器会从 `~/.codewhale/mcp.json` 
   同意与脚本，以及 MCP 登录（`mcp_<server>_authenticate`）。
 
 代码模式默认开启（`[features] code_mode = true`），这会让 `execute_tools`
-从第一次请求起就是急切的；直接工具和 `tool_search` 两种情况下都保持可用。
+从第一次请求起就是预加载的；直接工具和 `tool_search` 两种情况下都保持可用。
 把 `code_mode = false`（或用 `--disable code_mode` 运行）设回去，
 `execute_tools` 就又会被延迟到 `tool_search` 之后。该开关属于会话配置，
-因此提示词（prompt）前缀在一个会话内保持稳定。在没有引擎回合（子代理（subagent））时，
+因此提示词（prompt）前缀在一个会话内保持稳定。在没有引擎回合时（子智能体），
 程序保持保守配置：只读、仅自动批准的原生调用，不使用 MCP。
 
 ### 对话工具箱缓存
@@ -126,12 +126,12 @@ MCP 工具是动态的。连接成功的服务器会从 `~/.codewhale/mcp.json` 
 一次成功的搜索激活会按名称记入当前对话。缓存最多保存八个延迟名称和
 16 KiB 的序列化 schema，按最近最少使用淘汰条目，并在再次对外告知之前，
 让每个条目对照当前目录与策略重新校验。会话同步会清空它。
-缓存无法让已移除、已被拒绝或刚刚变为急切的工具复活。
+缓存无法让已移除、已被拒绝或刚刚变为预加载的工具复活。
 
-每个子代理都有自己的、经策略过滤的延迟目录，始终存在的 `tool_search`，
+每个子智能体都有自己的、经策略过滤的延迟目录，始终存在的 `tool_search`，
 以及有界的激活缓存。分叉出来的消息和指令仍留在上下文（context）中，
-但子级缓存从空开始，并在本地发现工具；分叉的上下文和缓存都不能变成发现白名单。
-子级仍能搜索自己的权威所允许的每一个工具，包括只读研究角色使用的 Web 搜索/抓取。
+但子智能体的缓存从空开始，并在本地发现工具；分叉的上下文和缓存都不能变成发现白名单。
+子智能体仍能搜索其自身权限所允许的每一个工具，包括只读研究角色使用的 Web 搜索/抓取。
 
 ## 检查模型客户端请求里的工具载荷
 
@@ -143,8 +143,8 @@ MCP 工具是动态的。连接成功的服务器会从 `~/.codewhale/mcp.json` 
 快照把“工具字段缺失”与“存在但为空数组”区分开来。只有当测量值落在
 1 MiB 的检查上限之内时，它才会报告模型客户端工具 JSON 的确切字节数和
 SHA-256 摘要；更大的载荷保持不可用。提供商（provider）适配器在构建
-提供商专属的线上请求体时，可能会转换、净化或省略这些字段，因此 `/tools`
-会把提供商投递和线上载荷标记为不可用。捕获与渲染都是有界的：保留的 schema、
+提供商专属的实际传输请求体时，可能会转换、净化或省略这些字段，因此 `/tools`
+会把提供商投递和实际传输的载荷标记为不可用。捕获与渲染都是有界的：保留的 schema、
 描述、调用方列表、目录行、回合 ID 和载荷测量，都带有明确的截断、省略或不可用回执。
 快照只在当前会话期间留在内存里，并在每次准备好请求时被替换。
 
@@ -159,9 +159,9 @@ SHA-256 摘要；更大的载荷保持不可用。提供商（provider）适配�
 - **Plan** 保持稳定的原语词汇，但在中心位置拒绝 shell 执行和文件改动。
 - **Work** 是常规的交互式执行。
 - **Operate** 使用与 Work 相同的直接工具权威。小规模工作保持直接进行；
-  多步委派使用一个紧凑的工作流（workflow）计划，带依赖关系、有界范围和完成证据。
-  Fleet 管理同一批子代理和角色。一个独立的有界任务可以使用直接的代理；
-  `followup` 会复用该代理继续工作。
+  多步委派使用一个紧凑的 Workflow 计划，带依赖关系、有界范围和完成证据。
+  Fleet（智能体团队）管理同一批智能体和角色。一个独立的有界任务可以直接使用 `agent`；
+  `followup` 会复用该智能体继续工作。
 - **Ask**、**Auto-Review** 和 **Full Access** 控制在具备行动能力的模式内的审批行为。
   它们绝不会把 Plan 放宽为写入或 shell 访问。
 
@@ -192,7 +192,7 @@ SHA-256 摘要；更大的载荷保持不可用。提供商（provider）适配�
 
 ## 并行扇出
 
-子代理容量的唯一事实来源是 `crates/tui/src/config/subagent_limits.rs`：
+智能体（子智能体）容量的唯一事实来源是 `crates/tui/src/config/subagent_limits.rs`：
 
 - 默认配置并发数：**64**；
 - 最大配置并发数：**128**；
@@ -225,7 +225,7 @@ RLM 的子查询批处理属于另一种更便宜的成本类别。它的 `sub_q
 
 两类事实被分开保留：
 
-- **线上事实**来自准备好的请求：名称、描述、schema、`defer_loading` / `strict` /
+- **传输事实**来自准备好的请求：名称、描述、schema、`defer_loading` / `strict` /
   `allowed_callers` / `cache_control`、字节统计，以及目录摘要。
 - **表面事实**来自 `ToolSurfaceContext`：来源（`builtin` / `plugin` / `mcp` /
   `synthetic` / `unknown`）、MCP 服务器身份、声明的能力、声明的审批要求，

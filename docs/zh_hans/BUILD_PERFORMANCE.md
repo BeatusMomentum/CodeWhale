@@ -1,7 +1,7 @@
 # 构建与测试性能
 
 > 英文原文：[BUILD_PERFORMANCE.md](../BUILD_PERFORMANCE.md)。
-> 最后与英文同步日期（last synced with English revision）：2026-09-26。
+> 最后与英文同步日期（last synced with English revision）：2026-09-29。
 
 这篇文档记录实测数据：Codewhale 的构建和测试各要多久，为了让贡献者的开发循环
 更快做了哪些改动，哪些又推迟了。数字来自一台机器（Apple Silicon，14 核，rustc 1.97.0，
@@ -289,7 +289,7 @@ TUI-DOG-017）——保持原样。
 3. **已落地。** `palette` → `codewhale-palette`；`command_safety` →
    `codewhale-execpolicy`（它本来就拥有 `ApprovalMode`，所以这次迁移是去掉一条
    依赖边，而不是新增）。
-4. `client/`（提供商（provider）的线路适配器）→ `codewhale-client`：**被第 1 条卡住，
+4. `client/`（各提供商（provider）的线上协议适配器）→ `codewhale-client`：**被第 1 条卡住，
    不只是排在它后面而已。** 排除文档注释和 `#[cfg(test)]` 块之后，`client` 仍有
    20 条生产代码里的 `crate::` 依赖边。其中三条很难处理：
    - `crate::config`——`Config`、`ProvidersConfig`、`ProviderConfig`、`TuiConfig`、
@@ -322,7 +322,7 @@ TUI-DOG-017）——保持原样。
 
 `scripts/dev-cargo.sh` 和 `scripts/dev-test.sh` 在整个 Cargo 调用期间持有机器级
 独占构建锁（`<cache root>/build.lock`，由 `scripts/build-lock.py` 实现）。Cargo
-自带的锁是按 target 目录分的，所以两个代理（agent）往不同的 target 目录构建时依然会并发
+自带的锁是按 target 目录分的，所以两个智能体（agent）往不同的 target 目录构建时依然会并发
 跑起来，把内存吃光。第二个构建会等待，并打印出锁在谁手里。设置
 `CODEWHALE_BUILD_LOCK=0` 可以跳过锁，设置 `CODEWHALE_BUILD_LOCK_FILE` 可以指定
 锁文件。同一台机器上如果跑着自托管 CI runner，而它的 `.env` 把

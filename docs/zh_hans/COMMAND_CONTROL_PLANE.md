@@ -1,25 +1,25 @@
 # 共享命令/控制平面契约
 
 > 英文原文：[COMMAND_CONTROL_PLANE.md](../COMMAND_CONTROL_PLANE.md)。
-> 最后与英文同步日期（last synced with English revision）：2026-09-27。
+> 最后与英文同步日期（last synced with English revision）：2026-09-29。
 
 Issue #1888 和 #4022。
 
 Codewhale 在三个表面上暴露同一套生命周期操作：输入到输入区（composer）的斜杠命令、
 绑定的热栏（hotbar）槽位，以及一个 CLI 入口点。在这份契约之前，这三个表面可能——也确实——
-发生了漂移：`/fleet status` 显示的是当前会话的子代理（subagent），而
+发生了漂移：`/fleet status` 显示的是当前会话的子智能体（subagent），而
 `codewhale fleet status` 读取的是持久账本；CLI 的 Lane 动词则完全没有对应的斜杠命令。
 
 契约就是一张类型化的描述符表，加上每个域一个执行器，位于
 [`crates/lane/src/control.rs`](../../crates/lane/src/control.rs) 和
 [`crates/tui/src/fleet/control.rs`](../../crates/tui/src/fleet/control.rs)。
 `codewhale-lane` 是薄 CLI 门面和 TUI 都已经依赖的最低层 crate，
-所以契约只有放在这里才既唯一、又不必分叉。
+所以契约放在这里，既只有一份，又不必分叉。
 
 ## 词汇
 
 以下定义不变且承重：**Fleet = 谁**，**Workflow = 顺序**，**Lane = 一个运行中的 Workflow**，
-**Runtime = 在哪/如何**。Auto-Review 是一种权限姿态（posture），绝不是评审角色。
+**Runtime = 在哪/如何**。Auto-Review 是一种权限档位（posture），绝不是评审角色。
 没有“Operation”这个产品名词；内部的 `ControlOperation` 类型命名的是控制平面*动词*，
 绝不出现在面向用户的文案里。
 
@@ -31,7 +31,7 @@ Codewhale 在三个表面上暴露同一套生命周期操作：输入到输入�
 | 字段 | 含义 |
 | --- | --- |
 | `id` | `lane.status`、`fleet.interrupt`……——在每个表面上、每份回执（receipt）里都是同一个字符串 |
-| `authority` | `read` 或 `write`。这不是权限姿态：它说明该动词是观察持久状态还是改变持久状态 |
+| `authority` | `read` 或 `write`。这不是权限档位：它说明该动词是观察持久状态还是改变持久状态 |
 | `persistence` | 效果落在哪个持久存储（`lane_registry`、`fleet_ledger`） |
 | `target` | 它作用于哪个确切的身份（`none`、`lane_run`、`fleet_worker`、`fleet_run`） |
 | `retry` | `idempotent` 或 `unsafe` |
@@ -78,7 +78,7 @@ codewhale lane interrupt lane-a1b2c3d4@3
 ```
 
 如果持久记录已经越过序号 3，该动词会以 `conflict` 失败并给出所观察到的序号，
-而不是去停下此刻碰巧在那里的东西。
+而不是去停止此刻碰巧在那里的对象。
 
 ## 回执
 
@@ -94,7 +94,7 @@ Lane 动词上的 `--json` 输出的也是同一个结构体。
 其中 reason 为 `not_recorded`、`not_applicable` 或 `redacted`，并且渲染为 `<not_recorded>`，
 而不是空白或看似合理的默认值。
 
-具体来说：fleet 回执的 `FleetResolvedRoute` 只记录**生效**的推理档位，
+具体来说：fleet 回执的 `FleetResolvedRoute` 只记录**生效**的思考档位（reasoning tier），
 所以 `requested_reasoning` 是 `not_recorded`——它不会用生效值回填，
 `reasoning_downgraded()` 返回 `None` 而不是猜测。Lane 注册表完全不记录路由或用量，
 因此那些字段一律是 `not_recorded`。fleet 运行是按任务、而非按运行加栅栏，
@@ -112,7 +112,7 @@ Lane 动词上的 `--json` 输出的也是同一个结构体。
 
 ## 模型可见的工具表面
 
-未变。这项工作不新增任何工具、任何工具参数、任何提示词文本；面向模型的子代理表面仍然只有
+未变。这项工作不新增任何工具、任何工具参数、任何提示词文本；面向模型的子智能体表面仍然只有
 `agent`。不需要做工具 schema 的回归度量。
 
 ## 测试
@@ -125,6 +125,6 @@ Lane 动词上的 `--json` 输出的也是同一个结构体。
   在账本缺失时如实报告而不创建、仅 CLI 的 `fleet.restart`，以及 `fleet.status`
   的跨表面身份一致。
 - `crates/tui/src/commands/groups/core/lane.rs` 和 `…/fleet.rs`——斜杠动词映射到共享操作，
-  `/fleet status` 读取持久账本而不是会话子代理，并且裸派发（热栏触发的形式）是只读的。
+  `/fleet status` 读取持久账本而不是会话子智能体，并且裸派发（热栏触发的形式）是只读的。
 - `crates/cli/src/lib.rs`——CLI 在相同的 id 下恰好暴露所声明的 Lane 动词，
   且 `lane stop` 是 `lane interrupt` 的兼容写法。

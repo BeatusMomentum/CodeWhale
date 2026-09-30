@@ -1,7 +1,7 @@
 # 本地化矩阵
 
 > 英文原文：[LOCALIZATION.md](../LOCALIZATION.md)。
-> 最后与英文同步日期（last synced with English revision）：2026-09-26。
+> 最后与英文同步日期（last synced with English revision）：2026-09-29。
 
 凡 Codewhale 已发布、正在构建、已排期或明确搁置的区域设置（locale），都以本文档为准。
 
@@ -16,6 +16,7 @@
 
 面向客户的文案还要遵守 [Codewhale 语气与终端章程](./VOICE.md)；
 命令、按键名和字形仍由代码决定，本地化只动周围的文字。
+中文译名以 [中文术语表](./GLOSSARY.md) 为准（草案，待维护者确认）；同一英文术语在一篇文档内只用一个中文译法。
 
 最后更新：2026-08-18（docs/zh_hans/ 重构；按 #5482，文档翻译状态在本矩阵之外跟踪）。
 权威 README：`README.md`（英文，#3087 之后）。
@@ -53,8 +54,8 @@
 | 法语 | `fr.json` | 全部 | **shipped** | 完整（#4788）。等待母语者审核。 |
 | 印尼语 | `id.json` | 全部 | **shipped** | 完整（#4789）。等待母语者审核。 |
 | 印地语 | `hi.json` | 全部 | **shipped** | 完整（#4790）。天城文排版验证（Devanagari shaping spike，已在 `7242381022` 移出本仓库）只给出代码层面的保证；终端视觉 QA 和母语者审核仍未完成。 |
-| 俄语 | `ru.json` | 全部 | **shipped** | 完整（#3092）。西里尔文字种夹具防止混入其他语言的文案。等待母语者审核。 |
-| 乌克兰语 | `uk.json` | 全部 | **shipped** | 完整（#4791）。西里尔文字种夹具确保它与俄语区分开（不含 ы/э/ъ；含 і/ї/є/ґ）。等待母语者审核。 |
+| 俄语 | `ru.json` | 全部 | **shipped** | 完整（#3092）。西里尔字母夹具防止混入其他语言的文案。等待母语者审核。 |
+| 乌克兰语 | `uk.json` | 全部 | **shipped** | 完整（#4791）。西里尔字母夹具确保它与俄语区分开（不含 ы/э/ъ；含 і/ї/є/ґ）。等待母语者审核。 |
 
 ## 网站区域设置
 
@@ -70,7 +71,7 @@
 **从 #4934（v0.9.4）起，每个有路由的区域设置都走同一条词典路径，中文也不例外。**
 `web/app/[locale]/page.tsx`、`web/components/nav.tsx` 和 `web/components/footer.tsx`
 不再保留 `isZh` / `foreign` 的文案分支：它们改为读取 `getHome(locale)` 和
-`getChrome(locale)`。`web/lib/i18n/dictionaries/zh/` 到这时才存在（以前是内联 TSX），
+`getChrome(locale)`。`web/lib/i18n/dictionaries/zh/` 现已存在（以前是内联 TSX），
 导航和页脚的链接集统一在 `web/lib/i18n/links.ts` 里生成一次，
 这样每个区域设置得到的路由形状完全一致。
 
@@ -153,7 +154,7 @@ partial 区域设置在网站上还差的范围（下一波）：首页之外的
 | `Accept-Language` 确定性地路由到每个有路由的区域设置 | `web/lib/i18n/detect.test.ts`（中间件委托给 `lib/i18n/detect.ts`） | **Shipped**（#3091） |
 | 区域设置选择器列出每个有路由的区域设置，并带 partial 标记 | `web/lib/i18n/config.test.ts`（切换器和路由都派生自同一个注册表） | **Shipped**（#3091） |
 | hreflang 备用链接覆盖每个有路由的区域设置 | `web/lib/page-meta.test.ts` | **Shipped**（#3091） |
-| 西里尔语言包保持字种纯净（不混入其他语言文案，ru≠uk） | `crates/localization/src/lib.rs` 里的 `cyrillic_packs_have_script_purity_and_no_mixed_language_fixtures` + `dictionaries.test.ts` | **Shipped**（#3092/#4791） |
+| 西里尔语言包保持字母纯净（不混入其他语言文案，ru≠uk） | `crates/localization/src/lib.rs` 里的 `cyrillic_packs_have_script_purity_and_no_mixed_language_fixtures` + `dictionaries.test.ts` | **Shipped**（#3092/#4791） |
 | 天城文在 40/60/80 列宽下按字素安全截断/折行 | `crates/localization/src/lib.rs` 里的 `truncate_to_width_never_splits_devanagari_clusters` + 宽度夹具 | **Shipped**（#4790） |
 | 新增 UI 区域设置不会改变模型可见的提示词字节 | `crates/tui/src/prompts.rs` 里的 `v092_locales_add_no_prompt_bookends_so_prompt_bytes_stay_stable` | **Shipped**（缓存稳定性契约） |
 | 已发布的区域设置都不会渲染出缺失消息标记 | `crates/localization/src/lib.rs` 里的 `no_shipped_locale_renders_a_missing_message_marker` | **Shipped** |

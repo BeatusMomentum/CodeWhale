@@ -2,7 +2,7 @@
 
 > 本文面向**完全没接触过 AI 编程智能体、使用 Windows 系统**的初学者。所有命令和路径均已在 Windows 环境实际验证。
 >
-> 本文为中文原创文档（无对应英文版），2026-08-11 最后更新。
+> 本文为中文原创文档（无对应英文版），2026-08-11 首发，2026-09-29 依据当前代码与英文文档复核并更新。
 
 ---
 
@@ -14,9 +14,9 @@
 | 要花钱吗？ | 软件开源免费，但模型要你自己带 API key（默认 DeepSeek） |
 | 在哪干活？ | 在哪个文件夹启动它，它就只动哪个文件夹（工作区） |
 | 第一步做什么？ | 装好后建一个空文件夹 → `cd` 进去 → 运行 `codewhale` |
-| 会不会乱动我的文件？ | 默认 Ask 模式：每一步操作都会弹窗问你，不批不动 |
-| 做小工具要用哪个模式？ | Plan（先出方案）+ Act（再动手），Ask 权限，全程足够 |
-| 用哪个模型？ | 默认 auto：简单任务自动用 flash（便宜快），复杂自动升 pro |
+| 会不会乱动我的文件？ | 默认 Ask 权限：需要审批的操作都会先问你，不批不动 |
+| 做小工具要用哪个模式？ | Plan（先出方案）+ Work（再动手），Ask 权限，全程足够 |
+| 用哪个模型？ | `auto` 是路由策略，不是模型：默认每回合仍用你设定的默认模型；只有你配置了路由器或 `cost_saving` 才会自动换模型（见 7.2 节） |
 | 对话能导出吗？ | 能：`/export file 文件名.md` |
 
 **操作问题速查**
@@ -26,8 +26,8 @@
 | 双击运行提示找不到 VCRUNTIME140_1.dll | 装 VC++ 运行库（见 2.4 节） |
 | 终端里输入 codewhale 提示"不是命令" | 环境变量没配好或终端没重开（见 2.3 节） |
 | 提示"禁止运行脚本" | 执行一次 PowerShell 执行策略命令（见第 3 节） |
-| 配置了 pro 却显示在用 flash | auto 路由正常现象，不是 bug（见 7.2 节） |
-| 界面停在奇怪的模式 | 按 `Tab` 切回，或输入 `/mode act` |
+| 配置了 pro 却显示在用 flash | 多半是用了 `/model auto` 并开启了 `[auto] cost_saving`，或配置了 `[auto.router]`，不是 bug（见 7.2 节） |
+| 界面停在奇怪的模式 | 按 `Tab` 切回，或输入 `/mode work` |
 | 改完配置突然连不上 | 检查 `provider` 和 `base_url` 是否被改坏，改回默认 |
 | cmd 里运行显示异常或崩溃 | 改用 Windows Terminal（见 2.5 节） |
 | GitHub 打不开/下载失败 | 需要配置系统代理后重试 |
@@ -51,13 +51,13 @@ Codewhale 不是开箱即用的服务，你需要一个模型提供商的 API ke
 codewhale auth set --provider deepseek
 ```
 
-除 DeepSeek 外，Codewhale 内置支持以下**全部厂商**（`provider` 后面的英文 ID 是配置和命令行里要用的名字，来自官方文档）：
+除 DeepSeek 外，Codewhale 还内置支持下面这些**常用提供商**（`provider` 后面的英文 ID 是配置和命令行里要用的名字，来自官方文档）。提供商列表更新很快，完整且最新的清单以 [PROVIDERS.md](PROVIDERS.md) 为准：
 
-**国内厂商（中国大陆可直接访问）**
+**国内提供商（中国大陆可直接访问）**
 
-| Provider ID | 厂商 | 说明 |
+| Provider ID | 提供商 | 说明 |
 |---|---|---|
-| `deepseek` | 深度求索 DeepSeek | 默认厂商，V4 pro / flash |
+| `deepseek` | 深度求索 DeepSeek | 默认提供商，V4 pro / flash |
 | `moonshot` | 月之暗面 | Kimi 系列 |
 | `zai` | 智谱 Z.ai | GLM 系列 |
 | `stepfun` | 阶跃星辰 | Step 系列 |
@@ -71,10 +71,12 @@ codewhale auth set --provider deepseek
 | `modelscope` | 魔搭社区 | 大模型开源社区 |
 | `longcat` | 美团 | LongCat 系列 |
 | `telecomjs` | 中国电信 | 天翼 AI 网关 |
+| `csdn` | CSDN | OpenAI 兼容接口 |
+| `modelstudio-token-plan` / `modelstudio-coding-plan` | 阿里云百炼（Model Studio） | Token Plan / Coding Plan 套餐；对应的 `-anthropic` ID 走 Anthropic 消息协议 |
 
-**国际厂商（可能需要代理访问）**
+**国际提供商（可能需要代理访问）**
 
-| Provider ID | 厂商 | 说明 |
+| Provider ID | 提供商 | 说明 |
 |---|---|---|
 | `openai` | OpenAI | GPT 系列；也可用于任何 OpenAI 兼容网关 |
 | `anthropic` | Anthropic | Claude 系列 |
@@ -92,7 +94,14 @@ codewhale auth set --provider deepseek
 | `atlascloud` | AtlasCloud | OpenAI 兼容托管 |
 | `sakana` | Sakana AI | Fugu 系列 |
 | `openai-codex` | OpenAI Codex | Codex 编程模型 |
-| `opencode-go` / `opencode-zen` | OpenCode Zen | Zen 通道 |
+| `opencode-go` / `opencode-zen` | OpenCode | Go 订阅通道 / Zen 模型网关 |
+| `ollama-cloud` | Ollama Cloud | Ollama 托管推理（需要 API key） |
+| `mistral` | Mistral AI | Mistral 系列 |
+| `google` | Google | Gemini 系列（官方 OpenAI 兼容接口） |
+| `edenai` | Eden AI | 模型聚合平台 |
+| `zenmux` | ZenMux | 模型聚合平台 |
+| `concentrate` | Concentrate | 聚合网关（OpenAI Responses 协议） |
+| `codewhale` | Codewhale | 使用 Codewhale 账户，按账户的模型目录选择协议 |
 
 **本地/自建（免费，不需要 API key）**
 
@@ -109,11 +118,11 @@ codewhale auth set --provider deepseek
 | `deepseek-anthropic` | DeepSeek 走 Anthropic 消息协议（给只认 Claude 格式的工具用，模型和 API key 都不变） |
 | `minimax-anthropic` | MiniMax 走 Anthropic 消息协议（同上） |
 
-> 切换厂商：界面里用 `/provider` 命令选，或改配置文件 `provider = "厂商ID"`。国内用户最常组合：`deepseek`（省钱）、`moonshot`/`zai`（备选）、`ollama`（本地免费）。
+> 切换提供商：界面里用 `/provider` 命令选，或改配置文件 `provider = "提供商ID"`。国内用户最常组合：`deepseek`（省钱）、`moonshot`/`zai`（备选）、`ollama`（本地免费）。
 
 ### 1.2.1 实战案例：切换到 Kimi（moonshot）中国区
 
-以切换 Kimi（月之暗面）中国区为例，完整走一遍"换厂家"的流程（本案例经过实际验证）。
+以切换 Kimi（月之暗面）中国区为例，完整走一遍"换提供商"的流程（本案例经过实际验证）。
 
 **前置：先去拿 key**
 
@@ -143,7 +152,7 @@ codewhale auth set --provider moonshot --api-key "你的中国区Kimi API key"
 
 **第三步：在 Codewhale 里切换**
 
-1. 输入 `/provider` 打开厂商选择器 → 选 **moonshot**（可能显示 missing key，不用管，继续选）
+1. 输入 `/provider` 打开提供商选择器 → 选 **moonshot**（可能显示 missing key，不用管，继续选）
 2. 如果提示输入 key，就粘贴你的中国区 key
 3. 选模型：`/model kimi-k3`（最强，1M 上下文）或 `/model kimi-k2.7-code`（默认稳定）
 4. 发一条测试消息，能正常回复就说明切换成功
@@ -153,7 +162,7 @@ codewhale auth set --provider moonshot --api-key "你的中国区Kimi API key"
 
 | 模型 ID | 说明 |
 |---|---|
-| `kimi-k3` | 最强，永远思考，1M 上下文；推理档位选 `off` 会被自动当作 `low` |
+| `kimi-k3` | 最强，永远思考，1M 上下文；思考强度选 `off` 会被自动当作 `low` |
 | `kimi-k2.7-code` | 编程版，默认稳定，推荐先用这个 |
 | `kimi-k2.6` | 更轻量 |
 
@@ -247,9 +256,9 @@ https://learn.microsoft.com/zh-cn/windows/terminal/install
 第一次运行 `codewhale` 会走一个简短的设置流程：
 
 1. 选择语言
-2. 配置模型 / API key（DeepSeek 是默认服务商）
-3. 确认运行时姿势（权限）
-4. 创建或确认你的 constitution（行为准则）
+2. 配置模型 / API key（DeepSeek 是默认提供商）
+3. 确认权限姿态（permission posture）
+4. 创建或确认你的宪章（constitution）
 
 这些设置随时可以用 `/setup` 重新打开修改。
 
@@ -275,48 +284,48 @@ Set-ExecutionPolicy -Scope CurrentUser RemoteSigned -Force
 4. 方案满意后，说"按方案实现，每步改动前告诉我"——它会开始写代码，你逐个批准
 5. 让它"运行并验证给我看"，确认可用后，小工具就做好了
 
-**新手安全口诀：先 Plan 出方案 → 切 Act 动手 → 全程保持 Ask。**
+**新手安全口诀：先 Plan 出方案 → 切 Work 动手 → 全程保持 Ask。**
 
 ---
 
 ## 5. 三种模式：Plan / Work / Operate
 
-按 `Tab` 键循环切换（输入框为空时），或输入 `/mode plan|act|operate` 直接切换。
+按 `Tab` 键循环切换（输入框为空时），或输入 `/mode plan|work|operate` 直接切换（`act` 仍是 Work 的兼容别名）。
 
-### 5.1 Plan（计划模式）——只读，先出方案
+### 5.1 Plan 模式——只读，先出方案
 
 - 只能看文件和设计，**不能改文件、不能跑命令**
 - 用途：先让它"出方案给你看"，满意再动手
 - **新手做小工具的第一步：先切到 Plan 让它出方案**
 
-### 5.2 Act（行动模式）——动手干活
+### 5.2 Work 模式——动手干活
 
-- 能改文件、跑命令，但每一步高风险操作都弹窗问你
-- 默认的干活模式，权限 = 你批准什么它做什么
-- **新手第二步：方案满意后切到 Act，让它逐项实现**
+- 普通的多步执行模式，能改文件、跑命令；是否弹窗问你，取决于第 6 节的权限姿态（默认 Ask 会先问）
+- 权限 = 你批准什么它做什么
+- **新手第二步：方案满意后切到 Work，让它逐项实现**
 
-### 5.3 Operate（多任务指挥模式）——当老板派活
+### 5.3 Operate 模式——当老板派活
 
-- 权限和 Act 完全一样，区别是大任务时会派出多个后台 worker 并行干
+- 工具和执行权限与 Work 完全一样（不会更宽松），区别在于调度：大任务会先列出步骤、依赖和完成检查，再派出多个智能体并行干
 - **新手现阶段不用碰**，等做大工程再说
 
-> 模式会被记住：切过的模式写进配置，下次启动默认还是它。如果发现界面"停在奇怪的模式"，按 `Tab` 切回或输入 `/mode act`。
+> 模式会被记住：切过的模式写进配置，下次启动默认还是它。如果发现界面"停在奇怪的模式"，按 `Tab` 切回或输入 `/mode work`。
 
 ---
 
 ## 6. 权限与安全（小白最重要的保护）
 
-按 `Shift+Tab` 循环切换三种权限姿态：
+按 `Shift+Tab` 循环切换三种权限姿态（permission posture）：
 
 | 姿态 | 行为 | 建议 |
 |---|---|---|
 | **Ask** | 每一步都弹窗问你 | **新手默认，最安全** |
-| Auto-Review | 自动执行、事后汇报 | 熟悉后可用 |
-| Full Access | 全自动不问你 | 只用于完全信任的文件夹 |
+| Auto-Review | 自主运行、不向你提问；确定性规则判定安全的操作直接放行，拿不准的交给一次性的模型复核，高风险仍会被拦下 | 熟悉后可用 |
+| Full Access（完全访问） | 普通工具调用不再弹审批（仓库规则等硬性拦截仍然生效） | 只用于完全信任的文件夹 |
 
 ---
 
-## 7. 模型与推理强度（最多人困惑的部分）
+## 7. 模型与思考强度（最多人困惑的部分）
 
 ### 7.1 模型：pro 和 flash 是什么
 
@@ -325,11 +334,13 @@ Set-ExecutionPolicy -Scope CurrentUser RemoteSigned -Force
 
 ### 7.2 "auto" 不是模型，是路由策略
 
-你可能发现：配置里明明写的是 pro，会话里却在用 flash——这是因为处于 **auto 路由模式**：
+你可能发现：配置里明明写的是 pro，会话里却在用 flash。原因是 **`auto` 路由**：
 
-- auto 模式下，根据内置的算法（基于请求复杂度的启发式路由）自动判断任务复杂度
-- 简单任务 → 派 flash（省钱）；复杂任务 → 升级到 pro
-- 会话顶部显示的 `Auto model route: deepseek-v4-flash` 就是这个结果，**不是 bug**
+- 用 `/model auto`（或 `model = "auto"`）时，每回合默认仍用你**声明的默认模型**。Codewhale 不会再根据请求的措辞或长度去猜"该用便宜还是强的模型"（旧的关键词/长度启发式已经移除，也没有默认的分类器）
+- 只有你自己配置了下面两项之一，auto 才会换模型：
+  - `[auto.router]`：你指定一个分类器（提供商 + 模型），由它逐回合挑选模型；可用 `/router` 设置
+  - `[auto] cost_saving = true`：优先选用当前提供商的快速版本（如 flash）
+- 会话顶部显示的 `Auto model route: deepseek-v4-flash` 就是 auto 的结果；用 `/status` 可以看到这一回合走的是哪条路径。这**不是 bug**
 
 ### 7.3 怎么切换模型
 
@@ -338,7 +349,7 @@ Set-ExecutionPolicy -Scope CurrentUser RemoteSigned -Force
 ```
 /model deepseek-v4-pro     固定用 pro（最强）
 /model deepseek-v4-flash   固定用 flash（最快）
-/model auto                恢复自动路由（默认推荐）
+/model auto                改用 auto 路由（见 7.2 节）
 ```
 
 只输入 `/model` 会打开选择器，上下键选模型回车确认。
@@ -349,27 +360,29 @@ Set-ExecutionPolicy -Scope CurrentUser RemoteSigned -Force
 default_text_model = "deepseek-v4-pro"
 ```
 
-### 7.4 推理强度：max / high / low / off
+### 7.4 思考强度：max / high / low / off
 
-这是另一个独立旋钮：**模型决定"谁在回答"，推理强度决定"回答前想多深"**。
+这是另一个独立旋钮：**模型决定"谁在回答"，思考强度决定"回答前想多深"**。
 
 | 档位 | 含义 | 适合场景 |
 |---|---|---|
 | off | 不思考，直接给结果 | 最快最便宜，简单查询 |
 | low / medium / high | 思考深度递增 | 常规任务 |
 | max | 思考到最深 | 架构设计、疑难 bug |
-| auto | 系统每轮自动挑 | 默认推荐 |
+| auto | 系统每回合自动挑 | 默认推荐 |
 
+- 完整取值还包括 `minimal`、`xhigh`、`ultra` 等，不同提供商的支持范围不同，以 [CONFIGURATION.md](CONFIGURATION.md) 为准
 - 切换：键盘 **`Ctrl+T`** 循环切换，或在 `/model` 选择器里选
 - 最强组合 = `deepseek-v4-pro` + `max`；最省组合 = flash + off（产品内部叫 "Fin" 路径）
 
-> 注意：配置模板注释里写 "Shift+Tab 循环推理强度"，但 0.9.3 里 `Shift+Tab` 循环的是**权限姿态**，推理强度改由 `Ctrl+T` 负责。
+> 注意：旧版配置模板注释里写过 "Shift+Tab 循环推理强度"，但现在 `Shift+Tab` 循环的是**权限姿态**，思考强度由 `Ctrl+T` 负责。
 
 ---
 
 ## 8. 配置文件在哪
 
 - 全局配置：`C:\Users\你的用户名\.codewhale\config.toml`
+- 模式、模型、思考强度等交互式选择会另外保存到 `~/.codewhale/settings.toml`（Windows 上位于 `C:\Users\你的用户名\.codewhale\`）
 - 界面编辑：输入 `/config` 打开配置编辑器
 - 查看哪些配置能改、能保存：`/config audit`
 
@@ -378,11 +391,11 @@ default_text_model = "deepseek-v4-pro"
 | 配置键 | 含义 | 新手建议 |
 |---|---|---|
 | `default_text_model` | 默认模型（pro/flash） | 保持默认或 auto |
-| `provider` | API 服务商 | 保持默认 |
-| `reasoning_effort` | 推理强度 | 保持 `auto` |
-| `[projects.路径] trust_level` | 项目信任标记 | **不认识的文件夹别标 trusted** |
-| `approval_policy` | 审批策略 | 新手保持严格 |
-| `base_url` | API 地址 | **别乱改**，改错会连不上 API |
+| `provider` | API 提供商 | 保持默认 |
+| `reasoning_effort` | 思考强度 | 保持 `auto` |
+| `[projects."路径"] trust_level` | 项目信任标记 | **不认识的文件夹别标 trusted** |
+| `approval_policy` | 审批策略（`on-request` / `untrusted` / `never`） | 新手保持默认 `on-request`，想更严格可用 `untrusted` |
+| `base_url`（写在 `[providers.xxx]` 下） | API 地址 | **别乱改**，改错会连不上 API |
 
 ---
 
@@ -392,9 +405,9 @@ default_text_model = "deepseek-v4-pro"
 
 | 命令 | 作用 |
 |---|---|
-| `/model` | 切换模型/推理强度（如 `/model deepseek-v4-pro`、`/model auto`） |
-| `/provider` | 切换 API 服务商 |
-| `/mode` | 切换模式（plan/act/operate） |
+| `/model` | 切换模型/思考强度（如 `/model deepseek-v4-pro`、`/model auto`） |
+| `/provider` | 切换 API 提供商 |
+| `/mode` | 切换模式（plan/work/operate） |
 | `/config` | 编辑配置（`/config audit` 查看可编辑项） |
 | `/setup` | 重新打开首次设置流程 |
 | `/compact` | 对话太长时压缩上下文、省 token |
@@ -402,16 +415,16 @@ default_text_model = "deepseek-v4-pro"
 | `/skills` | 打开技能管理器 |
 | `/status` | 查看当前模型/路由等状态 |
 | `/export` | 导出对话 |
-| `/constitution` | 管理行为准则（高级） |
+| `/constitution` | 管理宪章（高级） |
 
 ### 快捷键
 
 | 按键 | 作用 |
 |---|---|
-| `Tab` | 循环模式 Plan → Act → Operate |
+| `Tab` | 输入框为空时循环模式 Plan → Work → Operate |
 | `Shift+Tab` | 循环权限姿态 Ask → Auto-Review → Full Access |
-| `Ctrl+T` | 循环推理强度 |
-| `Ctrl+Alt+O` | 打开 Turn Inspector（查看每轮用了哪个模型、为什么） |
+| `Ctrl+T` | 循环思考强度 |
+| `Ctrl+Alt+O` | 打开 Turn Inspector（查看每回合用了哪个模型、为什么） |
 
 ---
 
@@ -439,9 +452,9 @@ default_text_model = "deepseek-v4-pro"
 | `/export clipboard` | 同上，显式写法 |
 | `/export file 文件名.md` | 整个对话导出为 md 文件 |
 | `/export file --force 文件名.md` | 文件已存在时强制覆盖（不加 `--force` 会拒绝覆盖） |
-| `/export turn` | 只导出当前这一轮（handoff）到剪贴板 |
-| `/export turn file 文件名.md` | 只导出当前这一轮为 md 文件 |
-| `/export turn file --force 文件名.md` | 当前一轮导出并强制覆盖 |
+| `/export turn` | 只导出当前这一回合（handoff）到剪贴板 |
+| `/export turn file 文件名.md` | 只导出当前这一回合为 md 文件 |
+| `/export turn file --force 文件名.md` | 当前这一回合导出并强制覆盖 |
 | `/daochu` | `/export` 的中文别名，完全等价 |
 
 > 兼容旧写法：`/export 路径.md` 和 `/export turn 路径.md` 也可以直接用（等价于带 `file` 的写法）。
@@ -455,9 +468,9 @@ default_text_model = "deepseek-v4-pro"
 
 - Exported: 2026-08-02T...   （导出时间）
 - Session: xxxx              （会话 ID）
-- Provider: moonshot         （当前厂商）
+- Provider: moonshot         （当前提供商）
 - Model: kimi-k3             （当前模型）
-- Mode: agent                （当前模式）
+- Mode: agent                （当前模式；Work 模式在内部记作 agent）
 - Workspace: superpower      （工作区名）
 - Messages: N                （消息条数）
 ```

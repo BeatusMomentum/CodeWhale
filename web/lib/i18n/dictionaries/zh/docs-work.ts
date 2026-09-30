@@ -4,18 +4,18 @@ import type { DocsWorkDict } from "../types";
 export const docsWork: DocsWorkDict = {
   metaTitle: "跟踪进度 · Codewhale 文档",
   metaDescription:
-    "在工作栏中跟踪多步骤任务：目标、To-do 列表和子 Agent。设定一个跨回合持续的目标，并在不丢失进度的情况下把工作交给新的会话。",
+    "在工作栏中跟踪多步骤任务：目标、To-do 列表和子智能体。设定一个跨回合持续的目标，并在不丢失进度的情况下把工作交给新的会话。",
   bodyClassName: "text-ink-soft leading-[1.9] tracking-wide",
   title: "跟踪进度",
   lede:
-    "当一个任务需要不止一步时，Codewhale 会维护一份 To-do 列表，并把它显示在工作栏里，旁边是目标和各个子 Agent。对话记录一路往下滚动的同时，你始终能看到哪些已完成、哪些正在进行、还剩哪些。",
+    "当一个任务需要不止一步时，Codewhale 会维护一份 To-do 列表，并把它显示在工作栏里，旁边是目标和各个子智能体。对话记录一路往下滚动的同时，你始终能看到哪些已完成、哪些正在进行、还剩哪些。",
   sections: [
     {
       id: "workbar",
       title: "看懂工作栏",
       blocks: [
         {
-          p: "工作栏默认位于输入框下方，显示当前目标、To-do 列表，以及为本次会话工作的子 Agent。已完成的条目会以“已完成”的状态保留，而不是消失。选中某一行，或在该行上按 Enter，即可打开详情。",
+          p: "工作栏默认位于输入框下方，显示当前目标、To-do 列表，以及为本次会话工作的子智能体。已完成的条目会以“已完成”的状态保留，而不是消失。选中某一行，或在该行上按 Enter，即可打开详情。",
         },
         {
           rows: [
@@ -62,7 +62,7 @@ export const docsWork: DocsWorkDict = {
         },
         { code: "/relay finish the Windows test fixes", lang: "Codewhale" },
         {
-          p: "带着父会话上下文启动的子 Agent 也会收到同一份列表，因此它们同样知道哪些已经做完。",
+          p: "带着父会话上下文启动的子智能体也会收到同一份列表，因此它们同样知道哪些已经做完。",
         },
       ],
     },
@@ -82,8 +82,8 @@ export const docsWork: DocsWorkDict = {
   next: [
     {
       href: "/docs/subagents",
-      label: "并行运行 Agent",
-      note: "把彼此独立的 To-do 条目交给子 Agent。",
+      label: "并行运行智能体",
+      note: "把彼此独立的 To-do 条目交给子智能体。",
     },
     {
       href: "/docs/modes",

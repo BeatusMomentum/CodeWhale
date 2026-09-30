@@ -1,6 +1,8 @@
 # MCP（外部工具服务器）
 
-> 本文翻译自英文版 [MCP.md](../MCP.md)，与英文修订 `4d915398f`（2026-08-19）同步。
+> 本文翻译自英文版 [MCP.md](../MCP.md)，与英文源文件同步于 2026-09-29。
+
+在终端中，`/mcp`（也可用 `/mcps`）会打开 **Extensions → MCP**。按 Enter 会对所选服务器执行恢复操作，或打开只读详情。清单为空时会提供服务器建议；浏览这些建议不会安装任何内容。`/mcp status`、`/mcp doctor`、`/mcp login`、`/mcp add` 等显式子命令的行为保持不变。
 
 codewhale 可以通过 MCP（Model Context Protocol，模型上下文协议）加载额外工具。MCP 服务器可以是 TUI 启动的本地 stdio 进程，也可以是使用 Streamable HTTP（带传统 SSE 回退）的远程基于 URL 的服务器。
 
@@ -9,9 +11,9 @@ codewhale 可以通过 MCP（Model Context Protocol，模型上下文协议）�
 - `web_search`、`fetch_url` 和 `wait_for_dev_server` 是隐藏的仅回放别名。新的提示和集成应使用 `Web`。
 
 服务器模式说明：
-- `codewhale-tui serve --mcp` 运行 MCP stdio 服务器。
-- `codewhale-tui serve --http` 运行运行时 HTTP/SSE API（独立模式）。
-- `codewhale` 调度器将 `codewhale mcp-server` 作为等价的 stdio 入口点暴露出来，供独立分发的 CLI 使用。
+- `codewhale serve --mcp` 运行 MCP stdio 服务器。
+- `codewhale serve --http` 运行运行时 HTTP/SSE API（独立模式）。
+- `codewhale mcp-server` 是同一个统一运行时上等价的 stdio 入口。
 
 ## 设置向导与手动 MCP 设置（#3407）
 
@@ -43,26 +45,28 @@ codewhale 可以通过 MCP（Model Context Protocol，模型上下文协议）�
 在解析出的 MCP 路径处创建一份入门 MCP 配置：
 
 ```bash
-codewhale-tui mcp init
+codewhale mcp init
 ```
 
-`codewhale-tui setup --mcp` 会在技能设置的同时执行相同的 MCP 引导。
+`codewhale setup --mcp` 会在技能设置的同时执行相同的 MCP 引导。
 
 常用管理命令：
 
 ```bash
-codewhale-tui mcp list
-codewhale-tui mcp tools [server]
-codewhale-tui mcp add <name> --command "<cmd>" --arg "<arg>"
-codewhale-tui mcp add <name> --url "http://localhost:3000/mcp"
-codewhale-tui mcp add <name> --url "https://example.com/mcp" --bearer-token-env-var MCP_TOKEN
-codewhale-tui mcp login <name>
-codewhale-tui mcp logout <name>
-codewhale-tui mcp enable <name>
-codewhale-tui mcp disable <name>
-codewhale-tui mcp remove <name>
-codewhale-tui mcp validate
+codewhale mcp list
+codewhale mcp tools [server]
+codewhale mcp add <name> --command "<cmd>" --arg "<arg>"
+codewhale mcp add <name> --url "http://localhost:3000/mcp"
+codewhale mcp add <name> --url "https://example.com/mcp" --bearer-token-env-var MCP_TOKEN
+codewhale mcp login <name>
+codewhale mcp logout <name>
+codewhale mcp enable <name>
+codewhale mcp disable <name>
+codewhale mcp remove <name>
+codewhale mcp validate
 ```
+
+`codewhale mcp logout <name>`（以及 `/mcp logout`）只会清除本地存储的 OAuth 凭据——提供商可能仍保留其既有授权。下一次登录会强制显示授权确认页，因此可以更换所授权的账号/工作区；若要在远端彻底撤销授权，请在提供商的账号设置中撤销该应用。
 
 ## TUI 内管理器
 
@@ -111,6 +115,27 @@ v0.9.10 的产品建议使用这些经过审查的固定版本定义。Plugins �
 
 无头界面是例外：`ConfigReload` 应用服务器请求**不会**刷新 MCP 连接，因此无头运行时在 MCP 配置变更后仍然需要重启。
 
+## 远程网络权限
+
+直接发往公网主机名的 HTTP/SSE 请求会校验每一条 DNS 应答，并把连接固定到公网地址。这同样适用于已配置的服务器、重定向以及 OAuth HTTP 请求。已配置的网络允许/拒绝策略不仅作用于 MCP 工具请求，也作用于登录和令牌刷新。
+
+配置为 `localhost` 名称或私网 IP 字面量，即显式允许该本地端点。对于私有 DNS 名称，需要在服务器配置中主动选择启用：
+
+```json
+{
+  "mcpServers": {
+    "internal": {
+      "url": "https://mcp.internal.example/mcp",
+      "allow_private_network": true
+    }
+  }
+}
+```
+
+`allow_private_network` 默认为 false。该例外只适用于所配置的源站（协议、主机和端口）；它不会授权其他重定向源站或 OAuth 源站。模型在会话中自行添加的服务器不能使用该例外，即使其配置中包含该标志也一样。
+
+由运维方配置的服务器继续遵循 `HTTP_PROXY`、`HTTPS_PROXY` 和 `NO_PROXY`。当为已配置的源站选用了代理服务器时，目标地址的 DNS 解析和私网过滤会交给这个由运维方选定的代理服务器处理；本地的 DNS 固定无法约束代理服务器自身的解析。命中 `NO_PROXY` 时，则改用受保护的直连。模型添加的服务器、已审查的插件远程端点，以及次级的重定向/OAuth 源站，都不会继承环境中的代理权限。
+
 ## 远程 HTTP 认证
 
 基于 URL 的 MCP 服务器可以使用静态请求头、环境变量派生的请求头、bearer-token 环境变量或 OAuth。授权优先级是保守的：
@@ -135,8 +160,8 @@ v0.9.10 的产品建议使用这些经过审查的固定版本定义。Plugins �
 对于通用的远程 MCP OAuth，添加 URL 服务器并运行登录：
 
 ```bash
-codewhale-tui mcp add remote --url "https://example.com/mcp"
-codewhale-tui mcp login remote
+codewhale mcp add remote --url "https://example.com/mcp"
+codewhale mcp login remote
 ```
 
 Codewhale 会发现服务器的 OAuth 元数据，在你的浏览器中打开授权 URL，监听本地回调，交换授权码，并通过 Codewhale 的机密后端存储令牌响应。存储的 OAuth 令牌会按服务器名称加 URL 查找，并在可能的情况下于请求前刷新。登录期间，CLI 会打印授权 URL 和等待状态，同时本地回调监听器处于活动状态。如果基于 URL 的服务器在连接/发现期间返回 401 或 Unauthorized，`codewhale mcp connect <name>` 会报告需要 OAuth 认证，并指向 `codewhale mcp login <name>`。资源辅助工具的列表还会为认证类失败显示 `authentication_required` 条目，而不是静默地看起来为空。
@@ -203,7 +228,7 @@ Codewhale 同时读取 `servers` 和 `mcpServers`，因此设置页生成的片�
 /hf concepts
 ```
 
-`/hf mcp status` 会检查已配置的 MCP 文件，查找常见的 Hugging Face 服务器名称或 Hugging Face MCP URL。`/hf concepts` 解释 Hugging Face provider 路由、Hugging Face MCP 和显式 Hub 工作流之间的区别。
+`/hf mcp status` 会检查已配置的 MCP 文件，查找常见的 Hugging Face 服务器名称或 Hugging Face MCP URL。`/hf concepts` 解释 Hugging Face 提供商路由、Hugging Face MCP 和显式 Hub 工作流之间的区别。
 
 官方文档：<https://huggingface.co/docs/hub/hf-mcp-server>
 
@@ -218,7 +243,7 @@ Codewhale 同时读取 `servers` 和 `mcpServers`，因此设置页生成的片�
 - 配置项：`mcp_config_path = "/path/to/mcp.json"`
 - 环境变量：`DEEPSEEK_MCP_CONFIG=/path/to/mcp.json`
 
-`codewhale-tui mcp init`（以及 `codewhale-tui setup --mcp`）会写入这个解析出的路径。
+`codewhale mcp init`（以及 `codewhale setup --mcp`）会写入这个解析出的路径。
 
 交互式 `/config` 编辑器也会暴露 `mcp_config_path`。在 TUI 中更改它，会更新 `/mcp` 使用的路径，并将连接池标记为需要重载；随后 `/mcp reload` 会把实时连接池切换到新的配置来源。
 
@@ -272,10 +297,10 @@ Codewhale 同时读取 `servers` 和 `mcpServers`，因此设置页生成的片�
 ### 快速设置
 
 ```bash
-codewhale-tui mcp add-self
+codewhale mcp add-self
 ```
 
-这会解析当前二进制路径，生成一个运行 `codewhale-tui serve --mcp` 的配置条目，并将其写入你的 MCP 配置文件。默认服务器名称是 `codewhale`。
+这会解析当前二进制路径，生成一个运行 `codewhale serve --mcp` 的配置条目，并将其写入你的 MCP 配置文件。默认服务器名称是 `codewhale`。
 
 选项：
 
@@ -298,7 +323,7 @@ codewhale-tui mcp add-self
 }
 ```
 
-`codewhale-tui` 二进制直接支持 `serve --mcp`。`codewhale` 调度器提供等价的 `codewhale mcp-server` stdio 入口点。使用你 `PATH` 中的那一个（运行 `which codewhale` 或 `which codewhale-tui` 找到完整路径）。`mcp add-self` 命令会自动解析出正确的二进制。
+统一的 `codewhale` 运行时直接支持 `serve --mcp`，同时也提供等价的 `codewhale mcp-server` stdio 入口。发行版安装器会把同一个运行时以 `codew` 暴露出来；`mcp add-self` 会自动解析出调用它的那条命令。
 
 ### 前提条件
 
@@ -316,23 +341,27 @@ codewhale-tui mcp add-self
 
 ### MCP 服务器 vs HTTP/SSE API vs ACP
 
-| | `codewhale-tui serve --mcp` | `codewhale-tui serve --http` | `codewhale-tui serve --acp` |
+| | `codewhale serve --mcp` | `codewhale serve --http` | `codewhale serve --acp` |
 |---|---|---|---|
 | **协议** | MCP stdio | HTTP/SSE JSON-RPC | ACP stdio |
-| **用例** | 面向 MCP 客户端的工具服务器 | 面向应用的运行时 API | 面向 Zed/自定义 ACP 客户端的编辑器代理 |
+| **用例** | 面向 MCP 客户端的工具服务器 | 面向应用的运行时 API | 面向 Zed/自定义 ACP 客户端的编辑器智能体 |
 | **配置** | `~/.codewhale/mcp.json` 条目 | 直接 URL 连接 | 编辑器的 `agent_servers` 自定义命令 |
-| **生命周期** | 按客户端会话生成 | 长时间运行的守护进程 | 按编辑器代理会话生成 |
+| **生命周期** | 按客户端会话生成 | 长时间运行的守护进程 | 按编辑器智能体会话生成 |
 
-当你希望 Codewhale 工具对其他 MCP 客户端可用时，使用 `mcp add-self`。在构建直接消费 API 的应用时，使用 `serve --http`。当编辑器想以 ACP 代理身份与 Codewhale 对话时，使用 `serve --acp`。
+当你希望 Codewhale 工具对其他 MCP 客户端可用时，使用 `mcp add-self`。在构建直接消费 API 的应用时，使用 `serve --http`。当编辑器想以 ACP 智能体身份与 Codewhale 对话时，使用 `serve --acp`。
 
 ### 验证
 
 添加之后，测试连接：
 
 ```bash
-codewhale-tui mcp validate
-codewhale-tui mcp tools codewhale
+codewhale mcp validate
+codewhale mcp tools codewhale
 ```
+
+## 连接生命周期
+
+会话启动是惰性的（#6033）：已配置的服务器在有东西请求它之前不会被启动——这些请求包括：某个回合的 `allowed_tools`/`tools.always_load` 选择覆盖了它的 `mcp_<server>_*` 名称、某次模型调用解析到它的某个工具，或是显式的 `/mcp` 连接/重试。标记为 `required` 的服务器仍会在启动时立即连接，以便其失败在第一个回合之前暴露出来。已配置但尚未启动的服务器显示为 `configured`，绝不会显示 `connecting`；`connecting` 标签只描述实际正在进行中的握手。
 
 ## 服务器字段
 
@@ -348,6 +377,7 @@ codewhale-tui mcp tools codewhale
 - `enabled_tools`（数组，可选）：该服务器的工具名称允许列表。
 - `disabled_tools`（数组，可选）：在 `enabled_tools` 之后应用的拒绝列表。
 - `url`（字符串，可选）：远程 MCP 服务器的 Streamable HTTP 端点。
+- `allow_private_network`（布尔值，默认 false）：运维方为该已配置源站上的私有 DNS 地址主动选择启用的开关；对模型添加的服务器无效。
 - `transport`（字符串，可选）：对于传统 SSE 端点，设为 `"sse"`。
 - `headers`（对象，可选）：基于 URL 的服务器使用的字面量 HTTP 请求头。
 - `env_headers` 或 `env_http_headers`（对象，可选）：请求头名称到环境变量名称的映射。
@@ -364,8 +394,8 @@ MCP 工具与内置工具走相同的审批框架。只读的 MCP 辅助工具�
 
 ## 故障排查
 
-- 运行 `codewhale-tui doctor` 确认它解析出的 MCP 配置路径以及该路径是否存在。
+- 运行 `codewhale doctor` 确认它解析出的 MCP 配置路径以及该路径是否存在。
 - 在 TUI 中运行 `/mcp validate` 刷新可见的服务器/工具快照。
 - 如果配置或凭据变更后模型的目录中缺少工具，运行 `/mcp reload` —— `/mcp validate` 只刷新 UI 快照。
-- 如果 MCP 配置缺失，运行 `codewhale-tui mcp init --force` 重新生成它。
+- 如果 MCP 配置缺失，运行 `codewhale mcp init --force` 重新生成它。
 - 如果工具没有出现，请验证服务器命令能否在你的 shell 中工作，以及服务器是否支持 MCP 的 `tools/list`。

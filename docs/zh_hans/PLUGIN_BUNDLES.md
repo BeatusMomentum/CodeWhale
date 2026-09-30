@@ -1,7 +1,7 @@
 # 插件包
 
 > 英文原文：[PLUGIN_BUNDLES.md](../PLUGIN_BUNDLES.md)。
-> 最后与英文同步日期（last synced with English revision）：2026-09-26。
+> 最后与英文同步日期（last synced with English revision）：2026-09-29。
 
 Codewhale 的插件包边界刻意划得很小。这条边界在 v0.9.1 划下，v0.9.10 又审慎扩展：
 插件包可以借助 Codewhale 已有的引擎，贡献声明式的 Skills、MCP 配置、Commands、
@@ -174,7 +174,7 @@ Hooks 使用 `HooksConfig` TOML 文件。一个组件可以指向单个文件，
 path = "lsp"
 
 [native]        # TOML alias: [native_extension]
-path = "native"
+path = "native/index.mjs"
 
 [capabilities]
 filesystem_roots = ["workspace"]
@@ -193,10 +193,20 @@ lifecycle_mutation = true
   驱动这些标签、运行时适配器和能力哈希。将来某个 Codewhale 版本开始执行 LSP
   或原生代码时，必须修改该策略；策略一变，能力哈希随之改变，就会强制重新审查。
   v1 和 v2 信任回执会以 `capabilities-changed` 失败关闭。
+- **实验性扩展宿主下的 `native`。** 开启 `[features] extension_host` 后，策略升级为
+  v4，`native` 成为已生效的适配器：每个条目是一个 `.mjs`、`.js` 或 `.mts` ES 模块文件，
+  由 TypeScript 扩展宿主导入。指向目录或其他任何文件时，`/plugin validate` 和审查界面
+  都会报错，并阻止激活。它的工具始终使用 `Required` 审批；Full Access（完全访问）、
+  Bypass，或针对该已审查构建的精确会话授权，都可以满足这一要求而不再弹出审批。
+  切换该开关会使每个插件都需要重新审查。详见
+  [设计文档](../design/TS_EXTENSION_HOST.md#as-built-phase-1-2026-09-25)。
+  [扩展作者指南](../EXTENSIONS.md)包含经过测试的类型化示例、诊断流程，
+  以及 Node 可擦除 TypeScript 语法的限制。
 - **已识别但未生效**的声明（`lsp`、`native`、非空的
   `capabilities.filesystem_roots`，或 `capabilities.lifecycle_mutation = true`）
   会像其他组件一样解析、校验（位于包内、存在、无链接）。它会计入清单，
-  参与能力回执的哈希计算，在审查界面和 `/plugin show` 里显示为未生效。它永不执行。
+  参与能力回执的哈希计算，在审查界面和 `/plugin show` 里显示为未生效，并且永不执行
+  （对 `native` 而言，仅限于扩展宿主开关处于关闭状态时）。
   经过审查、受信任且适用的混合插件包仍可启用：受支持的声明式组件照常生效，
   未生效的组件面仍旧标为未生效。
 - **全部不受支持**的插件包可以审查、可以信任，但 `/plugin enable` 会失败关闭，
@@ -243,7 +253,7 @@ lifecycle_mutation = true
 （`/plugin install`、`update` 和 `uninstall` 负责把文件本身放好、替换和删除，
 最后总会落到同一套审查上——见 [PLUGINS.md](./PLUGINS.md)。
 `/plugin suggest` 会对已安装的插件包，以及本地添加的市场目录排序；发送匹配的任务时，
-可以 toast 出同样的下一步，但不安装任何东西。模型的请求里不会写入任何插件推广内容；
+可以用 toast 提示弹出同样的下一步，但不安装任何东西。模型的请求里不会写入任何插件推广内容；
 完整的推荐策略见 [PLUGINS.md](./PLUGINS.md#codewhale-如何推荐插件)。）
 
 信任、启用、停用、撤销和重新加载都会立即重建当前工作区的 Skills、MCP、Commands、
@@ -320,9 +330,9 @@ Agent profiles 和 Hooks。每次持久化的状态变更，都会在稳定的�
 联邦式市场目录（`/plugin marketplace add|list|show|remove|install`）
 会解析本地 Kimi、Claude、Codex 和 Codewhale 格式的目录文档，见下面的市场小节
 （`/plugin install` 只拉取一个经过审查的来源，`/plugin suggest` 只对已安装的插件包排序）。
-此外还明确没有：环境兼容性发现；也不自动信任，没有插件贡献的 MCP OAuth、LSP 适配器、
-原生扩展运行时和 MCP 订阅适配器；不导入外部的可执行插件运行时，
-也不把旧版 `plugin.toml` 自动迁移到磁盘上的 `plugin.json`。显式的离线
+此外，以下这些同样明确不做：环境兼容性发现、自动信任、插件贡献的 MCP OAuth、
+LSP 适配器和 MCP 订阅适配器；除实验性的 `extension_host` 开关之外，没有原生扩展运行时；
+不导入外部的可执行插件运行时；也不把旧版 `plugin.toml` 自动迁移为磁盘上的 `plugin.json`。显式的离线
 [OpenCode/DSH 转换器](./PLUGIN_AUTHORING.md#转换现有插件)支持选定的可移植 Skills、
 静态的 Streamable HTTP MCP 声明，以及用 `--stdio-root` 明确选中的已打包 Node
 `.mjs`、`.js` 或 `.cjs` MCP 服务器。转换时会把本地源码和依赖一并复制，

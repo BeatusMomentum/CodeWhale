@@ -45,7 +45,7 @@ codewhale mcp add tracker --url "https://example.com/mcp" --bearer-token-env-var
           lang: "终端",
         },
         {
-          p: "显式设置的 Authorization 请求头始终优先：先应用配置中的请求头，其次是 bearer token 环境变量，最后才是已保存的 OAuth 登录。`codewhale mcp logout <name>` 会删除本机保存的登录信息；提供方那边的授权可能仍然有效，需要到提供方处撤销。",
+          p: "显式设置的 Authorization 请求头始终优先：先应用配置中的请求头，其次是 bearer token 环境变量，最后才是已保存的 OAuth 登录。`codewhale mcp logout <name>` 会删除本机保存的登录信息；提供商那边的授权可能仍然有效，需要到提供商处撤销。",
         },
       ],
     },

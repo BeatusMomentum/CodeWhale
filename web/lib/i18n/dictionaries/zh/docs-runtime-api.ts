@@ -115,7 +115,7 @@ curl -N "$API/v1/threads/$THREAD/events?since_seq=0" -H "$AUTH"`,
     },
     {
       href: "/docs/fleet",
-      label: "运行 Workflow",
+      label: "运行工作流",
       note: "可在任何终端查看的持久多步骤运行。",
     },
   ],

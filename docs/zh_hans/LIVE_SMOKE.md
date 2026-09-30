@@ -1,7 +1,7 @@
 # 可选的实时冒烟运行
 
 > 英文原文：[LIVE_SMOKE.md](../LIVE_SMOKE.md)。
-> 最后与英文同步日期（last synced with English revision）：2026-09-27。
+> 最后与英文同步日期（last synced with English revision）：2026-09-29。
 
 本页是**手动、可选、绝不自动化**的。CI 里没有任何东西、没有测试、没有构建脚本、
 也没有技能（skill）会运行这些命令。仓库的自动化测试套件在设计上就不含提供商（provider）；
@@ -153,7 +153,7 @@ CW_SMOKE_MODEL="deepseek-v4-pro"
 | `provider`、`model` | 与你传入的标志一致 |
 | `route_source` | 记录*为什么*选中了那条路由 |
 | `reasoning_tokens` | 当回执报告推理时出现；缺失可能反映模型/提供商行为、配置，或 harness 的遗漏，需要旁证 |
-| `tool_catalog_sha256` | 当提供了工具表面时出现 |
+| `tool_catalog_sha256` | 当提供了工具表面（tool surface）时出现 |
 | `approval_posture`、`sandbox_posture` | 与你传入的标志一致 |
 | `duration_ms`、`input_tokens`、`output_tokens` | 一次完成的运行中会出现 |
 
@@ -172,5 +172,5 @@ unset CW_SMOKE_CODEWHALE_HOME CW_SMOKE_CRED_VAR \
 
 一次绿色的实时冒烟运行是证据，说明所配置的实时尝试今天完成了。它本身并不能证明端点身份、
 账号的持久权益，也不能证明不存在 harness 缺陷；那些主张需要另行旁证。它也没有说明技能选择、
-别名解析、区域路由或提示词预算——这些都由 `crates/tui/src/skills/catalog_matrix.rs`
+别名解析、语言区域（locale）路由或提示词预算——这些都由 `crates/tui/src/skills/catalog_matrix.rs`
 以确定性、无提供商的方式覆盖。
