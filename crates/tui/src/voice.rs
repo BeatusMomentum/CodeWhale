@@ -421,7 +421,16 @@ pub(crate) async fn transcribe_local_whisper(audio_samples: &[i16]) -> Result<St
 }
 
 fn transcribe_local_whisper_blocking(wav: &[u8]) -> Result<String, String> {
-    let tmp = std::env::temp_dir().join(format!("cw-voice-{}.wav", std::process::id()));
+    // C01-10: a fresh, exclusively created file per call. The old
+    // `cw-voice-<pid>.wav` name was shared by every transcription in the
+    // process (an interim pass, the final pass, a runtime-API dictation) and
+    // predictable in a shared temp dir. Dropping `audio` removes it.
+    let audio = tempfile::Builder::new()
+        .prefix("cw-voice-")
+        .suffix(".wav")
+        .tempfile()
+        .map_err(|e| e.to_string())?;
+    let tmp = audio.path().to_path_buf();
     std::fs::write(&tmp, wav).map_err(|e| e.to_string())?;
     // Try each local binary until one succeeds; whisper.cpp outputs to stdout or file.
     for bin in LOCAL_WHISPER_BINS {
@@ -437,7 +446,6 @@ fn transcribe_local_whisper_blocking(wav: &[u8]) -> Result<String, String> {
             && out.status.success()
         {
             let txt = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            let _ = std::fs::remove_file(&tmp);
             if !txt.is_empty() {
                 return Ok(txt);
             }
@@ -445,14 +453,12 @@ fn transcribe_local_whisper_blocking(wav: &[u8]) -> Result<String, String> {
             let sidecar = tmp.with_extension("txt");
             if let Ok(s) = std::fs::read_to_string(&sidecar) {
                 let _ = std::fs::remove_file(&sidecar);
-                let _ = std::fs::remove_file(&tmp);
                 if !s.trim().is_empty() {
                     return Ok(s.trim().to_string());
                 }
             }
         }
     }
-    let _ = std::fs::remove_file(&tmp);
     Err("local whisper not available".into())
 }
 
@@ -467,28 +473,39 @@ pub(crate) async fn transcribe_groq(audio_samples: &[i16]) -> Result<String, Str
 }
 
 /// Resolve ASR model/provider preference.
-/// Priority: explicit config `voice.asr_model` > env `CODEWHALE_ASR_MODEL` > auto-detect (local-whisper > groq > xiaomi).
+/// Priority: env `CODEWHALE_ASR_MODEL` > auto-detect (local-whisper > groq >
+/// provider). Known limitation (C01-10): there is no config-file ASR setting
+/// yet — `config` is accepted for the day one exists and is not read, so the
+/// env var is the only explicit override.
 pub(crate) fn resolve_asr_choice(_config: &Config) -> (String, String) {
-    // Check explicit env override first (free, cross-platform)
-    if let Ok(m) = std::env::var("CODEWHALE_ASR_MODEL") {
-        let m = m.trim().to_ascii_lowercase();
-        if m.contains("groq") || m.contains("whisper") {
-            return ("groq".into(), GROQ_ASR_MODEL.into());
-        }
-        if m.contains("local") || m.contains("whisper.cpp") {
-            return ("local-whisper".into(), "tiny".into());
-        }
-        if m.contains("mimo") || m.contains("xiaomi") {
-            return ("provider".into(), ASR_MODEL.into());
-        }
+    let explicit = std::env::var("CODEWHALE_ASR_MODEL")
+        .ok()
+        .and_then(|value| explicit_asr_choice(&value));
+    // Auto-detect best free: local whisper (offline, no key) > Groq free
+    // tier > provider ASR (needs key).
+    let (kind, model) = explicit.unwrap_or_else(|| match detect_free_asr() {
+        "local-whisper" => ("local-whisper", "tiny"),
+        "groq" => ("groq", GROQ_ASR_MODEL),
+        _ => ("provider", ASR_MODEL),
+    });
+    (kind.to_string(), model.to_string())
+}
+
+/// Map an explicit `CODEWHALE_ASR_MODEL` value to (kind, model). Local
+/// spellings are tested first: `local-whisper` and `whisper.cpp` both contain
+/// "whisper", which on its own names Groq's hosted Whisper (C01-10).
+fn explicit_asr_choice(value: &str) -> Option<(&'static str, &'static str)> {
+    let m = value.trim().to_ascii_lowercase();
+    if m.contains("local") || m.contains("whisper.cpp") || m.contains("whisper-cpp") {
+        return Some(("local-whisper", "tiny"));
     }
-    // Auto-detect best free: local whisper (offline, no key) > Groq free tier > Xiaomi ASR (needs key)
-    let free = detect_free_asr();
-    match free {
-        "local-whisper" => ("local-whisper".into(), "tiny".into()),
-        "groq" => ("groq".into(), GROQ_ASR_MODEL.into()),
-        _ => ("provider".into(), ASR_MODEL.into()),
+    if m.contains("groq") || m.contains("whisper") {
+        return Some(("groq", GROQ_ASR_MODEL));
     }
+    if m.contains("mimo") || m.contains("xiaomi") {
+        return Some(("provider", ASR_MODEL));
+    }
+    None
 }
 
 // --- Headless capture (HTTP/native-client path) ----------------------------
@@ -715,6 +732,28 @@ mod tests {
         }
         let independent: serde_json::Value = serde_json::from_slice(&requests[2].body).unwrap();
         assert!(independent.get("provider").is_none());
+    }
+
+    #[test]
+    fn explicit_local_whisper_is_not_routed_to_groq() {
+        // C01-10: every local spelling contains "whisper"; none may reach the
+        // hosted Groq backend (which needs a key and sends audio off-host).
+        for local in ["local-whisper", "whisper.cpp", "whisper-cpp", " LOCAL "] {
+            assert_eq!(
+                explicit_asr_choice(local),
+                Some(("local-whisper", "tiny")),
+                "{local}"
+            );
+        }
+        for hosted in ["groq", "whisper", "whisper-large-v3-turbo"] {
+            assert_eq!(
+                explicit_asr_choice(hosted),
+                Some(("groq", GROQ_ASR_MODEL)),
+                "{hosted}"
+            );
+        }
+        assert_eq!(explicit_asr_choice("mimo"), Some(("provider", ASR_MODEL)));
+        assert_eq!(explicit_asr_choice("something-else"), None);
     }
 
     #[test]

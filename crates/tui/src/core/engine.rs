@@ -917,6 +917,10 @@ pub struct Engine {
     /// cleanup is conditional on this exact value so an older pass can never
     /// clear a newer receiver.
     mcp_boot_generation: Option<u64>,
+    /// Abort handle for the boot pass that owns `mcp_boot_generation`. A
+    /// session or workspace boundary drops the pool that pass is dialing
+    /// into, so it aborts the pass instead of letting it run on (C02-08).
+    mcp_boot_task: Option<tokio::task::AbortHandle>,
     /// Monotonic generation for engine-authored MCP session snapshots. Boot
     /// task updates retain their spawn generation so later passes can reject
     /// only genuinely stale work.
@@ -2062,6 +2066,7 @@ impl Engine {
             mcp_supervisor_rx: None,
             mcp_boot_done: None,
             mcp_boot_generation: None,
+            mcp_boot_task: None,
             mcp_event_generation: 0,
             plugin_registry,
             extension_host,
@@ -2789,7 +2794,12 @@ impl Engine {
         // Runtime-added MCP servers are conversation capabilities even when
         // both conversations use the same workspace. Configured servers can
         // reconnect lazily after the new session is installed.
-        self.mcp_pool = None;
+        self.drop_mcp_pool();
+        // C02-17: cumulative usage belongs to the conversation that spent
+        // it. The sync carries no prior total for the installed session, so
+        // it starts from zero instead of inheriting the previous session's
+        // tokens into its snapshot and saved `total_tokens`.
+        self.session.total_usage = Default::default();
         self.session.id = next_session_id;
         Some(previous_session_id)
     }
@@ -3645,7 +3655,7 @@ impl Engine {
                             self.config.plugin_registry = Some(Arc::clone(&self.plugin_registry));
                             // A pool may contain plugin servers and authority
                             // receipts from the previous workspace snapshot.
-                            self.mcp_pool = None;
+                            self.drop_mcp_pool();
                             if let Some(attachment) = &self.extension_host {
                                 attachment.set_plugins(Arc::clone(&self.plugin_registry));
                                 attachment.sync_in_background();
@@ -3841,39 +3851,65 @@ impl Engine {
                                 continue;
                             }
                         };
+                        // C02-02: stage the cut. The removed exchange is kept
+                        // until the replacement turn actually starts; a send
+                        // that never starts puts it back (below).
+                        let removed_exchange = self
+                            .session
+                            .messages
+                            .get(idx..)
+                            .map(<[_]>::to_vec)
+                            .unwrap_or_default();
                         self.session.messages.truncate_to(idx);
                         self.session.bump_messages_revision();
                         // Now dispatch the new message as a normal send,
                         // reusing the engine's stored mode/model config.
                         let mode = self.current_mode;
-                        self.handle_send_message(TurnSpec {
-                            content: new_message.clone(),
-                            mode,
-                            route: Box::new(route),
-                            compaction: Box::new(self.config.compaction.clone()),
-                            initial_routed_usage: Box::new(
-                                crate::cost_status::RuntimeUsageBatch::default(),
-                            ),
-                            goal_objective: self.config.goal_objective.clone(),
-                            goal_token_budget: self.config.goal_token_budget,
-                            goal_status: self.config.goal_status,
-                            reasoning_effort: self.session.reasoning_effort.clone(),
-                            reasoning_effort_auto: self.session.reasoning_effort_auto,
-                            auto_model: self.session.auto_model,
-                            allow_shell: self.session.allow_shell,
-                            trust_mode: self.session.trust_mode,
-                            auto_approve: self.session.auto_approve,
-                            approval_mode: self.session.approval_mode,
-                            translation_enabled: self.config.translation_enabled,
-                            allowed_tools: self.config.allowed_tools.clone(),
-                            dynamic_tools: Vec::new(),
-                            hook_executor: self.config.hook_executor.clone(),
-                            verbosity: self.config.verbosity.clone(),
-                            provenance: UserInputProvenance::ExternalUser,
-                            images: Vec::new(),
-                            max_output_tokens: None,
-                        })
-                        .await;
+                        let outcome = self
+                            .handle_send_message(TurnSpec {
+                                content: new_message.clone(),
+                                mode,
+                                route: Box::new(route),
+                                compaction: Box::new(self.config.compaction.clone()),
+                                initial_routed_usage: Box::new(
+                                    crate::cost_status::RuntimeUsageBatch::default(),
+                                ),
+                                goal_objective: self.config.goal_objective.clone(),
+                                goal_token_budget: self.config.goal_token_budget,
+                                goal_status: self.config.goal_status,
+                                reasoning_effort: self.session.reasoning_effort.clone(),
+                                reasoning_effort_auto: self.session.reasoning_effort_auto,
+                                auto_model: self.session.auto_model,
+                                allow_shell: self.session.allow_shell,
+                                trust_mode: self.session.trust_mode,
+                                auto_approve: self.session.auto_approve,
+                                approval_mode: self.session.approval_mode,
+                                translation_enabled: self.config.translation_enabled,
+                                allowed_tools: self.config.allowed_tools.clone(),
+                                dynamic_tools: Vec::new(),
+                                hook_executor: self.config.hook_executor.clone(),
+                                verbosity: self.config.verbosity.clone(),
+                                provenance: UserInputProvenance::ExternalUser,
+                                images: Vec::new(),
+                                max_output_tokens: None,
+                            })
+                            .await;
+                        if matches!(outcome, SendMessageOutcome::NotStarted { .. }) {
+                            // Anything the failed send appended after the cut
+                            // (a drained shell-completion notice) stays, after
+                            // the restored exchange.
+                            let appended = self
+                                .session
+                                .messages
+                                .get(idx..)
+                                .map(<[_]>::to_vec)
+                                .unwrap_or_default();
+                            self.session.messages.truncate_to(idx);
+                            self.session.messages.push_batch(removed_exchange);
+                            self.session.messages.push_batch(appended);
+                            self.session.bump_messages_revision();
+                            self.emit_session_updated().await;
+                        }
                     }
                     Op::SetAdvisorEnabled { enabled } => {
                         self.config.advisor_config.enabled = enabled;
@@ -6711,29 +6747,42 @@ impl Engine {
             self.ensure_mcp_supervisor();
             return Ok(pool);
         }
+        // C02-18: misconfiguration fails loud. A missing file is an ordinary
+        // empty config (`load_config` returns the default); an unreadable or
+        // malformed one still yields an empty, source-aware pool so a fixed
+        // file and `/mcp reload` recover in-process — but the person is told
+        // that the configured servers are gone, not left to find no tools.
+        let mut load_failure = None;
         let mut pool = McpPool::from_config_path_with_workspace_and_plugins(
             &self.session.mcp_config_path,
             &self.session.workspace,
             Arc::clone(&self.plugin_registry),
         )
         .unwrap_or_else(|e| {
-            tracing::debug!(
-                "MCP config unavailable: {}",
-                crate::mcp::format_mcp_error_for_display(&e)
-            );
+            let reason = crate::mcp::format_mcp_error_for_display(&e);
+            tracing::warn!("MCP config unavailable: {reason}");
+            load_failure = Some(reason);
             McpPool::empty_with_workspace_config_sources(
                 &self.session.mcp_config_path,
                 &self.session.workspace,
                 Arc::clone(&self.plugin_registry),
             )
             .unwrap_or_else(|fallback_error| {
-                tracing::debug!(
+                tracing::warn!(
                     "MCP reload source setup failed: {}",
                     crate::mcp::format_mcp_error_for_display(&fallback_error)
                 );
                 McpPool::new(McpConfig::default())
             })
         });
+        if let Some(reason) = load_failure {
+            let _ = self
+                .tx_event
+                .send(Event::status(format!(
+                    "MCP config could not be loaded, so none of its servers are available: {reason}. Fix it, then run /mcp reload."
+                )))
+                .await;
+        }
         pool = pool.with_disallowed_tools(self.config.disallowed_tools.clone().unwrap_or_default());
         if let Some(decider) = self.config.network_policy.as_ref() {
             pool = pool.with_network_policy(decider.clone());
@@ -6886,10 +6935,28 @@ impl Engine {
             return false;
         }
         self.mcp_boot_generation = None;
+        self.mcp_boot_task = None;
         self.mcp_boot_in_flight = false;
         self.mcp_boot_rx = None;
         self.mcp_boot_done = None;
         true
+    }
+
+    /// Drop the engine-owned MCP pool at a session or workspace boundary.
+    /// The in-flight boot pass dials into the dropped pool: abort it and
+    /// clear its generation, receiver and diagnoses, so the next pool starts
+    /// clean instead of waiting on — or adopting progress and connection
+    /// errors from — the previous conversation's pass (C02-08).
+    fn drop_mcp_pool(&mut self) {
+        self.mcp_pool = None;
+        if let Some(task) = self.mcp_boot_task.take() {
+            task.abort();
+        }
+        self.mcp_boot_generation = None;
+        self.mcp_boot_in_flight = false;
+        self.mcp_boot_rx = None;
+        self.mcp_boot_done = None;
+        self.mcp_connection_errors.clear();
     }
 
     async fn emit_mcp_session_boot(&self, generation: u64, finished: bool) {
@@ -7337,7 +7404,7 @@ impl Engine {
         self.emit_mcp_session_boot(generation, false).await;
 
         let pool_for_task = Arc::clone(&pool);
-        spawn_supervised(
+        let boot_task = spawn_supervised(
             "mcp-session-boot",
             std::panic::Location::caller(),
             async move {
@@ -7419,6 +7486,7 @@ impl Engine {
                 let _ = done_tx.send(true);
             },
         );
+        self.mcp_boot_task = Some(boot_task.abort_handle());
 
         Ok(generation)
     }
