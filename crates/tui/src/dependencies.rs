@@ -273,6 +273,8 @@ pub fn resolve_pandoc() -> Option<String> {
 /// a converter, an OCR engine) is available: `probe` decides, except that a
 /// conformance replay answers with the recorded host's set so goldens do not
 /// depend on what the machine running them has installed (test builds only).
+// `tool` is read only by the test-build replay below.
+#[cfg_attr(not(all(test, unix)), allow(unused_variables))]
 pub(crate) fn host_tool_available(tool: &str, probe: impl FnOnce() -> bool) -> bool {
     #[cfg(all(test, unix))]
     if let Some(available) = RECORDED_HOST_TOOLS.with(|cell| {
