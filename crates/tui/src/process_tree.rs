@@ -11,10 +11,9 @@
 //! * **Windows:** the child is assigned to a Job Object configured with
 //!   `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, so closing the job kills every
 //!   process in it. Hooks are created suspended and resumed only after the
-//!   assignment, so no descendant can escape; the extension host is not
-//!   (tokio's `Command` does not expose a suspended spawn), which leaves a
-//!   window of microseconds before assignment in which Node has not yet run
-//!   any plugin code.
+//!   assignment. Tokio children are assigned after spawning and can start
+//!   descendants before assignment. This bounds ordinary process lifetimes;
+//!   it is not a security sandbox.
 //!
 //! Dropping the guard kills the tree. That is deliberate: the guard's lifetime
 //! is the tree's lifetime, unless [`ProcessTree::release`] explicitly lets the
@@ -197,7 +196,7 @@ pub(crate) async fn contained_output_until(
     cmd: &mut tokio::process::Command,
     stop: impl std::future::Future<Output = ()>,
 ) -> std::io::Result<ContainedOutput> {
-    contained_run(cmd, None, stop).await
+    contained_run(cmd, None, stop, ProcessTree::attach_tokio).await
 }
 
 /// [`contained_output`] for a command that reads a request on stdin (a plugin
@@ -207,15 +206,21 @@ pub(crate) async fn contained_output_with_input(
     cmd: &mut tokio::process::Command,
     input: Vec<u8>,
 ) -> std::io::Result<std::process::Output> {
-    contained_run(cmd, Some(input), std::future::pending())
-        .await
-        .map(|run| run.output)
+    contained_run(
+        cmd,
+        Some(input),
+        std::future::pending(),
+        ProcessTree::attach_tokio,
+    )
+    .await
+    .map(|run| run.output)
 }
 
 async fn contained_run(
     cmd: &mut tokio::process::Command,
     input: Option<Vec<u8>>,
     stop: impl std::future::Future<Output = ()>,
+    attach: impl FnOnce(&tokio::process::Child) -> std::io::Result<ProcessTree>,
 ) -> std::io::Result<ContainedOutput> {
     use std::process::Stdio;
     cmd.stdin(if input.is_some() {
@@ -229,8 +234,9 @@ async fn contained_run(
     #[cfg(unix)]
     cmd.process_group(0);
     let mut child = cmd.spawn()?;
-    // Best effort: without the tree guard, `kill_on_drop` still ends the child.
-    let tree = ProcessTree::attach_tokio(&child).ok();
+    // Never report a contained run when attachment failed. The child's
+    // kill-on-drop guard still cleans up the direct child on this error path.
+    let tree = attach(&child)?;
     // Declared after `tree`, so a dropped future unlists the group first and
     // the tree guard then kills it.
     #[cfg(unix)]
@@ -271,9 +277,7 @@ async fn contained_run(
     };
     let (status, stopped) = match exited {
         Some(status) => {
-            if let Some(tree) = tree {
-                tree.release();
-            }
+            tree.release();
             (status, false)
         }
         None => {
@@ -522,6 +526,39 @@ pub(crate) async fn drop_once_pid_written<F: std::future::Future>(
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn failed_containment_attachment_is_reported_and_kills_the_child() {
+        let pid = std::cell::Cell::new(None);
+        let mut cmd = tokio::process::Command::new("/bin/sleep");
+        cmd.arg("300");
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            contained_run(&mut cmd, None, std::future::pending(), |child| {
+                pid.set(child.id());
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "injected containment attachment failure",
+                ))
+            }),
+        )
+        .await;
+        let pid = libc::pid_t::try_from(pid.get().expect("child spawned")).expect("pid");
+        // Let Tokio reap while checking cleanup; the helper kills the fixture
+        // itself if the child ever outlives this failed run.
+        assert!(
+            tokio::task::spawn_blocking(move || wait_for_pid_exit(pid, Duration::from_secs(5)))
+                .await
+                .expect("cleanup probe"),
+            "the direct child outlived failed containment attachment"
+        );
+        let error = result
+            .expect("attachment failure must return without running the command to completion")
+            .err()
+            .expect("a containment failure must not be accepted as a successful run");
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(error.to_string(), "injected containment attachment failure");
+    }
 
     #[tokio::test]
     async fn dropping_contained_output_kills_the_whole_tree() {
