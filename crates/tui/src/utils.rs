@@ -1730,7 +1730,8 @@ mod spawn_supervised_tests {
         );
     }
 
-    /// The public writer path keeps the crash log in the selected profile.
+    /// The public writer keeps its named log in the selected profile even
+    /// when another supervised task also writes a crash there.
     #[test]
     fn write_panic_dump_writes_named_log() {
         let _lock = crate::test_support::lock_test_env();
@@ -1738,21 +1739,55 @@ mod spawn_supervised_tests {
         let _profile = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", tmp.path());
         let crash_dir = tmp.path().join("crashes");
         let location = std::panic::Location::caller();
-        write_panic_dump("panic-fixture", location, "boom").expect("write dump");
 
+        // Crash directories hold multiple tasks' logs. The other supervised
+        // panic tests can write here while this process-wide profile is set.
+        write_panic_dump("another-task", location, "other boom").expect("write other dump");
+        let other_entries: Vec<_> = std::fs::read_dir(&crash_dir)
+            .expect("crashes dir exists")
+            .collect::<std::io::Result<Vec<_>>>()
+            .expect("read crash entries")
+            .into_iter()
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with("-another-task.log")
+            })
+            .collect();
+        assert_eq!(
+            other_entries.len(),
+            1,
+            "exactly one other-task log expected"
+        );
+        let other_path = other_entries[0].path();
+        let other_dump = std::fs::read(&other_path).expect("read other dump");
+
+        write_panic_dump("panic-fixture", location, "boom").expect("write dump");
         let entries: Vec<_> = std::fs::read_dir(&crash_dir)
             .expect("crashes dir exists")
-            .flatten()
+            .collect::<std::io::Result<Vec<_>>>()
+            .expect("read crash entries")
+            .into_iter()
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with("-panic-fixture.log")
+            })
             .collect();
-        assert_eq!(entries.len(), 1, "exactly one crash dump expected");
+        assert_eq!(entries.len(), 1, "exactly one panic-fixture log expected");
         let dump = std::fs::read_to_string(entries[0].path()).expect("read dump");
+        assert!(dump.lines().any(|line| line == "Task: panic-fixture"));
         assert!(
-            dump.contains("panic-fixture"),
-            "dump must include the task name; got: {dump}"
+            dump.lines()
+                .any(|line| line == format!("Location: {location}"))
         );
-        assert!(
-            dump.contains("boom"),
-            "dump must include the panic message; got: {dump}"
+        assert!(dump.lines().any(|line| line == "Panic: boom"));
+        assert_eq!(
+            std::fs::read(other_path).expect("other dump remains"),
+            other_dump,
+            "writing a named crash must preserve other tasks' logs"
         );
     }
 }

@@ -501,7 +501,7 @@ mod tests {
         assert_eq!(std::fs::read_to_string(settings_path)?, settings);
         // An unrelated typed store write must preserve the migration receipt.
         let mut store = codewhale_config::ConfigStore::load(Some(path.clone()))?;
-        store.config.set_value("verbosity", "quiet")?;
+        store.config.set_value("verbosity", "concise")?;
         store.save()?;
         assert_eq!(
             document(&path)["route_preferences_version"].as_integer(),

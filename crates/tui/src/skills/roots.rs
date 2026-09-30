@@ -296,20 +296,6 @@ impl SkillRootCatalog {
                 "registry-cache",
                 false,
             );
-        } else {
-            // Match legacy fallback when HOME is unavailable.
-            push_descriptor(
-                &mut roots,
-                &mut precedence,
-                SkillRootKind::CodeWhaleGlobal,
-                SkillRootAccess::WritableOwned,
-                SkillScope::Global,
-                PathBuf::from("/tmp/codewhale/skills"),
-                true,
-                true,
-                "global-codewhale-fallback",
-                true,
-            );
         }
 
         if let Some(configured) = configured_skills_dir {
@@ -423,8 +409,12 @@ impl SkillRootCatalog {
 /// workspace is not trusted, so discovery can say so instead of dropping them
 /// silently.
 #[must_use]
-pub fn untrusted_project_skill_dirs(workspace: &Path, home_dir: Option<&Path>) -> Vec<PathBuf> {
-    let catalog = SkillRootCatalog::build(workspace, home_dir, None);
+pub fn untrusted_project_skill_dirs(
+    workspace: &Path,
+    home_dir: Option<&Path>,
+    configured_skills_dir: Option<&Path>,
+) -> Vec<PathBuf> {
+    let catalog = SkillRootCatalog::build(workspace, home_dir, configured_skills_dir);
     let present: Vec<PathBuf> = catalog
         .roots
         .iter()
@@ -439,6 +429,23 @@ pub fn untrusted_project_skill_dirs(workspace: &Path, home_dir: Option<&Path>) -
         return Vec::new();
     }
     present
+}
+
+/// Whether `skills_dir` may load right now. A directory in project scope
+/// (repository-supplied, resolving inside the workspace) is held to the same
+/// workspace-trust gate as [`SkillRootCatalog::runtime_directories`], so an
+/// explicit or resolved skills dir cannot re-admit what the catalog filtered.
+/// A session rooted at the home directory is exempt: every path under it is
+/// the user's own global content, which the catalog also loads as global.
+#[must_use]
+pub fn skills_dir_allowed_by_workspace_trust(
+    workspace: &Path,
+    home_dir: Option<&Path>,
+    skills_dir: &Path,
+) -> bool {
+    classify_configured_skills_dir(workspace, home_dir, skills_dir).2 != SkillScope::Project
+        || home_dir.is_some_and(|home| paths_refer_to_same_dir(home, workspace))
+        || crate::config::is_workspace_trusted(workspace)
 }
 
 /// Resolve candidate skill directories for runtime discovery (existing paths
@@ -765,6 +772,22 @@ mod tests {
 
     fn write_dir(path: &Path) {
         std::fs::create_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn unavailable_home_has_no_ambient_global_or_cache_root() {
+        let tmp = TempDir::new().unwrap();
+        let catalog = SkillRootCatalog::build(tmp.path(), None, None);
+        assert!(
+            catalog
+                .roots
+                .iter()
+                .all(|root| root.scope == SkillScope::Project)
+        );
+        let owned = catalog.owned_writable_roots();
+        assert_eq!(owned.len(), 1);
+        assert_eq!(owned[0].kind, SkillRootKind::CodeWhaleProject);
+        assert_eq!(owned[0].path, tmp.path().join(".codewhale/skills"));
     }
 
     #[test]

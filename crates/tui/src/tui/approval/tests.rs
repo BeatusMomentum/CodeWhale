@@ -1517,6 +1517,59 @@ fn test_approval_view_navigation_keys() {
 }
 
 #[test]
+fn approval_modified_chords_and_nonpress_keys_cannot_answer() {
+    for request in [benign_request(), shell_request(), destructive_request()] {
+        let mut view = ApprovalView::new(request);
+        // Saving is available and has actually been painted: rejecting these
+        // chords must come from input admission, not an off-screen preview.
+        render_lines(&view, 120, 40);
+        for modifiers in [
+            KeyModifiers::ALT,
+            KeyModifiers::CONTROL,
+            KeyModifiers::SUPER,
+        ] {
+            for modifiers in [modifiers, modifiers | KeyModifiers::SHIFT] {
+                for code in "yaYAsSpPnNdDeEgG123jk".chars().map(KeyCode::Char).chain([
+                    KeyCode::Enter,
+                    KeyCode::Up,
+                    KeyCode::Down,
+                    KeyCode::Tab,
+                    KeyCode::Esc,
+                ]) {
+                    let selected = view.selected;
+                    let collapsed = view.collapsed;
+                    assert!(
+                        matches!(
+                            view.handle_key(KeyEvent::new(code, modifiers)),
+                            ViewAction::None
+                        ),
+                        "{code:?} with {modifiers:?}"
+                    );
+                    assert_eq!(view.selected, selected);
+                    assert_eq!(view.collapsed, collapsed);
+                }
+            }
+        }
+        for kind in [
+            crossterm::event::KeyEventKind::Repeat,
+            crossterm::event::KeyEventKind::Release,
+        ] {
+            for code in [
+                KeyCode::Char('y'),
+                KeyCode::Char('a'),
+                KeyCode::Char('s'),
+                KeyCode::Char('p'),
+                KeyCode::Enter,
+            ] {
+                let mut key = create_key_event(code);
+                key.kind = kind;
+                assert!(matches!(view.handle_key(key), ViewAction::None));
+            }
+        }
+    }
+}
+
+#[test]
 fn test_approval_view_view_params() {
     // Bare `v` must not open details (TUI-DOG-002).
     let mut view = ApprovalView::new(benign_request());
@@ -1534,6 +1587,12 @@ fn test_approval_view_view_params() {
         action,
         ViewAction::Emit(ViewEvent::OpenTextPager { .. })
     ));
+    if cfg!(target_os = "macos") {
+        assert!(matches!(
+            view.handle_key(create_key_event(KeyCode::Char('√'))),
+            ViewAction::Emit(ViewEvent::OpenTextPager { .. })
+        ));
+    }
 }
 
 #[test]
@@ -2156,109 +2215,179 @@ fn render_takeover_card_fills_most_of_area() {
 
 #[test]
 fn test_elevation_view_initial_state() {
-    let request =
-        ElevationRequest::for_shell("test-id", "cargo build", "network blocked", true, false);
-    let view = ElevationView::new(request, Locale::En);
-    assert_eq!(view.selected, 0);
+    for (network, write) in [(true, false), (false, true), (true, true), (false, false)] {
+        let request =
+            ElevationRequest::for_shell("test-id", "cargo build", "blocked", network, write);
+        let view = ElevationView::new(request, Locale::En);
+        assert_eq!(
+            view.request().options[view.selected],
+            ElevationOption::Abort
+        );
+        assert_eq!(
+            view.approval_request_id(),
+            None,
+            "elevation is not an initial approval"
+        );
+    }
 }
 
 #[test]
-fn test_elevation_view_keybindings() {
-    let request =
-        ElevationRequest::for_shell("test-id", "cargo test", "write blocked", false, true);
-    let mut view = ElevationView::new(request, Locale::En);
+fn elevation_ordinary_typing_then_enter_aborts() {
+    for (network, write) in [(true, false), (false, true), (true, true), (false, false)] {
+        let request =
+            ElevationRequest::for_shell("test-id", "cargo build", "blocked", network, write);
+        let mut view = ElevationView::new(request, Locale::En);
+        // Includes every former letter shortcut and navigation letter. The
+        // user meant to submit this to the composer when the card appeared.
+        for ch in "fix the parser; make a new file now 123 NJKWFA".chars() {
+            assert!(matches!(
+                view.handle_key(create_key_event(KeyCode::Char(ch))),
+                ViewAction::None
+            ));
+            assert_eq!(
+                view.request().options[view.selected],
+                ElevationOption::Abort
+            );
+        }
+        assert!(matches!(
+            view.handle_key(create_key_event(KeyCode::Enter)),
+            ViewAction::EmitAndClose(ViewEvent::ElevationDecision {
+                option: ElevationOption::Abort,
+                ..
+            })
+        ));
+    }
+}
 
-    let action = view.handle_key(create_key_event(KeyCode::Char('n')));
-    assert!(matches!(
-        action,
-        ViewAction::EmitAndClose(ViewEvent::ElevationDecision {
-            option: ElevationOption::WithNetwork,
-            ..
-        })
-    ));
-
-    let request =
-        ElevationRequest::for_shell("test-id", "cargo build", "write blocked", false, true);
-    let mut view = ElevationView::new(request, Locale::En);
-    let action = view.handle_key(create_key_event(KeyCode::Char('w')));
-    assert!(matches!(
-        action,
-        ViewAction::EmitAndClose(ViewEvent::ElevationDecision {
-            option: ElevationOption::WithWriteAccess(_),
-            ..
-        })
-    ));
-
-    let request = ElevationRequest::for_shell("test-id", "cargo build", "blocked", false, false);
-    let mut view = ElevationView::new(request, Locale::En);
-    let action = view.handle_key(create_key_event(KeyCode::Char('f')));
-    assert!(matches!(
-        action,
-        ViewAction::EmitAndClose(ViewEvent::ElevationDecision {
-            option: ElevationOption::FullAccess,
-            ..
-        })
-    ));
-
-    let request = ElevationRequest::for_shell("test-id", "cargo build", "blocked", false, false);
-    let mut view = ElevationView::new(request, Locale::En);
-    let action = view.handle_key(create_key_event(KeyCode::Esc));
-    assert!(matches!(
-        action,
-        ViewAction::EmitAndClose(ViewEvent::ElevationDecision {
-            option: ElevationOption::Abort,
-            ..
-        })
-    ));
-
-    let request = ElevationRequest::for_shell("test-id", "cargo build", "blocked", false, false);
-    let mut view = ElevationView::new(request, Locale::En);
-    let action = view.handle_key(create_key_event(KeyCode::Char('a')));
-    assert!(matches!(
-        action,
-        ViewAction::EmitAndClose(ViewEvent::ElevationDecision {
-            option: ElevationOption::Abort,
-            ..
-        })
-    ));
+#[test]
+fn elevation_modified_and_nonpress_keys_do_not_select_or_grant() {
+    let mut view = ElevationView::new(elevation_shell_request(), Locale::En);
+    for modifiers in [
+        KeyModifiers::ALT,
+        KeyModifiers::CONTROL,
+        KeyModifiers::SUPER,
+        KeyModifiers::SHIFT,
+    ] {
+        for code in [
+            KeyCode::Up,
+            KeyCode::Down,
+            KeyCode::Enter,
+            KeyCode::Esc,
+            KeyCode::Char('f'),
+        ] {
+            let selected = view.selected;
+            assert!(matches!(
+                view.handle_key(KeyEvent::new(code, modifiers)),
+                ViewAction::None
+            ));
+            assert_eq!(view.selected, selected);
+        }
+    }
+    // Repeat/release must not confirm a deliberately selected grant either.
+    view.handle_key(create_key_event(KeyCode::Up));
+    assert_eq!(
+        view.request().options[view.selected],
+        ElevationOption::FullAccess
+    );
+    for kind in [
+        crossterm::event::KeyEventKind::Repeat,
+        crossterm::event::KeyEventKind::Release,
+    ] {
+        for code in [KeyCode::Up, KeyCode::Down, KeyCode::Enter, KeyCode::Esc] {
+            let mut key = create_key_event(code);
+            key.kind = kind;
+            let selected = view.selected;
+            assert!(matches!(view.handle_key(key), ViewAction::None));
+            assert_eq!(view.selected, selected);
+        }
+    }
 }
 
 #[test]
 fn test_elevation_view_navigation() {
-    let request = ElevationRequest::for_shell("test-id", "cargo build", "blocked", true, false);
-    let mut view = ElevationView::new(request, Locale::En);
-
-    assert_eq!(view.selected, 0);
-
+    let mut view = ElevationView::new(elevation_shell_request(), Locale::En);
+    assert_eq!(
+        view.request().options[view.selected],
+        ElevationOption::Abort
+    );
     view.handle_key(create_key_event(KeyCode::Down));
-    assert_eq!(view.selected, 1);
-
+    assert_eq!(
+        view.request().options[view.selected],
+        ElevationOption::WithNetwork
+    );
     view.handle_key(create_key_event(KeyCode::Up));
-    assert_eq!(view.selected, 0);
-
-    view.handle_key(create_key_event(KeyCode::Char('j')));
-    assert_eq!(view.selected, 1);
-
-    view.handle_key(create_key_event(KeyCode::Char('k')));
-    assert_eq!(view.selected, 0);
+    assert_eq!(
+        view.request().options[view.selected],
+        ElevationOption::Abort
+    );
+    view.handle_key(create_key_event(KeyCode::Up));
+    assert_eq!(
+        view.request().options[view.selected],
+        ElevationOption::FullAccess
+    );
 }
 
 #[test]
 fn test_elevation_view_enter_uses_selected_option() {
-    let request = ElevationRequest::for_shell("test-id", "cargo build", "blocked", true, false);
+    let request = ElevationRequest::for_shell("test-id", "cargo build", "blocked", true, true);
+    for expected in request.options.clone() {
+        let mut view = ElevationView::new(request.clone(), Locale::En);
+        while view.request().options[view.selected] != expected {
+            assert!(matches!(
+                view.handle_key(create_key_event(KeyCode::Down)),
+                ViewAction::None
+            ));
+        }
+        let ViewAction::EmitAndClose(ViewEvent::ElevationDecision {
+            option, tool_id, ..
+        }) = view.handle_key(create_key_event(KeyCode::Enter))
+        else {
+            panic!("Enter should commit the selected offered option");
+        };
+        assert_eq!(option, expected);
+        assert_eq!(tool_id, "test-id");
+    }
     let mut view = ElevationView::new(request, Locale::En);
-
-    view.handle_key(create_key_event(KeyCode::Down));
-    assert_eq!(view.selected, 1);
-
-    let action = view.handle_key(create_key_event(KeyCode::Enter));
     assert!(matches!(
-        action,
+        view.handle_key(create_key_event(KeyCode::Esc)),
         ViewAction::EmitAndClose(ViewEvent::ElevationDecision {
-            option: ElevationOption::FullAccess,
+            option: ElevationOption::Abort,
             ..
         })
     ));
+}
+
+#[test]
+fn elevation_mouse_commits_the_visible_offered_row() {
+    let request = ElevationRequest::for_shell("test-id", "cargo build", "blocked", true, true);
+    for (w, h) in [(40, 12), (60, 16), (70, 22), (80, 24), (100, 32), (140, 40)] {
+        for expected in request.options.clone() {
+            let mut view = ElevationView::new(request.clone(), Locale::En);
+            let lines = render_elevation_lines(&view, w, h);
+            let (row, column) = lines
+                .iter()
+                .enumerate()
+                .find_map(|(row, line)| {
+                    // The full-access description may wrap at 40 columns.
+                    line.find(expected.label().split(" (").next().expect("label"))
+                        .map(|byte| (row, line[..byte].chars().count()))
+                })
+                .expect("offered option is visible");
+            let ViewAction::EmitAndClose(ViewEvent::ElevationDecision {
+                option, tool_id, ..
+            }) = view.handle_mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: column as u16,
+                row: row as u16,
+                modifiers: KeyModifiers::NONE,
+            })
+            else {
+                panic!("{w}x{h}: clicking the visible label must decide its row");
+            };
+            assert_eq!(option, expected, "{w}x{h}");
+            assert_eq!(tool_id, "test-id");
+        }
+    }
 }
 
 fn render_elevation_lines(view: &ElevationView, w: u16, h: u16) -> Vec<String> {
@@ -2307,19 +2436,46 @@ fn elevation_always_paints_every_option_including_the_safe_exit() {
     // `Abort` — the only choice that grants nothing — was unreachable by sight
     // at every terminal size. Options are reserved now; the denial detail is
     // what shortens.
-    let view = ElevationView::new(elevation_shell_request(), Locale::En);
-    for (w, h) in [(70, 22), (80, 24), (100, 32), (140, 40), (60, 16)] {
-        let joined = compact_elevation_text(&render_elevation_lines(&view, w, h));
-        for option in ["Abort", "Fullaccess", "Allowoutboundnetwork"] {
+    let mut original = elevation_shell_request();
+    original
+        .options
+        .insert(1, ElevationOption::WithWriteAccess(vec![]));
+    let mut long = original.clone();
+    long.command = Some("cargo build --package codewhale-tui ".repeat(40));
+    long.denial_reason = "Network blocked; retry requires an explicit choice. ".repeat(80);
+    for request in [original, long] {
+        let view = ElevationView::new(request, Locale::En);
+        for (w, h) in [(40, 12), (60, 16), (70, 22), (80, 24), (100, 32), (140, 40)] {
+            let joined = compact_elevation_text(&render_elevation_lines(&view, w, h));
+            for option in [
+                "Abort",
+                "Fullaccess",
+                "Allowoutboundnetwork",
+                "Allowextrawriteaccess",
+            ] {
+                assert!(
+                    joined.contains(option),
+                    "{w}x{h}: option '{option}' is not on screen:\n{joined}"
+                );
+            }
             assert!(
-                joined.contains(option),
-                "{w}x{h}: option '{option}' is not on screen:\n{joined}"
+                joined.contains("SandboxDenied") || joined.contains("SandboxElevationRequired"),
+                "{w}x{h}: the card lost its title:\n{joined}"
             );
+            for key in ["↑/↓", "Enter", "Esc"] {
+                assert!(
+                    joined.contains(key),
+                    "{w}x{h}: missing keyboard access {key}:\n{joined}"
+                );
+            }
+            assert!(
+                joined.contains(&format!("{}Abort", crate::tui::glyphs::SELECTION)),
+                "{w}x{h}: Abort needs a visible marker, not only a color change:\n{joined}"
+            );
+            for old_hint in ["[n]", "[w]", "[f]", "[a]"] {
+                assert!(!joined.contains(old_hint), "obsolete shortcut {old_hint}");
+            }
         }
-        assert!(
-            joined.contains("SandboxDenied"),
-            "{w}x{h}: the card lost its title:\n{joined}"
-        );
     }
 }
 

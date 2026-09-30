@@ -919,6 +919,11 @@ pub struct Engine {
     mcp_event_generation: u64,
     /// Workspace-scoped immutable plugin catalogue and authority receipts.
     plugin_registry: Arc<crate::plugins::PluginRegistry>,
+    /// This engine's hold on the process-wide extension host (`[features]
+    /// extension_host`), carrying `plugin_registry`. `None` with the flag off
+    /// and for engines without a plugin snapshot of their own (isolated
+    /// chats), which must never revoke another engine's plugins.
+    extension_host: Option<crate::extension_host::HostAttachment>,
     api_provider: ApiProvider,
     /// Exact configured route key. Named custom providers share the `Custom`
     /// enum, so the enum alone cannot prove that the active client is current.
@@ -1700,19 +1705,26 @@ impl Engine {
         let compaction_cancellation =
             Arc::new(StdMutex::new(CompactionCancellationState::default()));
         let tool_exec_lock = Arc::new(RwLock::new(()));
-        let plugin_registry = config
+        let own_plugin_registry = config
             .plugin_registry
             .as_ref()
             .filter(|registry| registry.workspace() == config.workspace)
-            .cloned()
-            .unwrap_or_else(|| Arc::new(crate::plugins::PluginRegistry::empty(&config.workspace)));
+            .cloned();
         // Experimental extension host: start in the background, never on the
-        // first-prompt path. Its tools join at the next turn's rebuild.
-        if config.features.enabled(Feature::ExtensionHost) {
-            let manager = crate::extension_host::manager();
-            manager.begin_session();
-            manager.sync_in_background(Arc::clone(&plugin_registry));
-        }
+        // first-prompt path. Its tools join at the next turn's rebuild. Only
+        // an engine with its own plugin snapshot attaches; the empty fallback
+        // below would desire nothing and must not affect other engines.
+        let extension_host = own_plugin_registry
+            .as_ref()
+            .filter(|_| config.features.enabled(Feature::ExtensionHost))
+            .map(|registry| {
+                let manager = crate::extension_host::manager();
+                let attachment = manager.attach(Arc::clone(registry));
+                attachment.sync_in_background();
+                attachment
+            });
+        let plugin_registry = own_plugin_registry
+            .unwrap_or_else(|| Arc::new(crate::plugins::PluginRegistry::empty(&config.workspace)));
 
         // Create clients for both providers
         let (codewhale_client, codewhale_client_error) = match CodewhaleClient::new(api_config) {
@@ -1944,6 +1956,7 @@ impl Engine {
             mcp_boot_generation: None,
             mcp_event_generation: 0,
             plugin_registry,
+            extension_host,
             api_provider,
             api_provider_identity,
             api_provider_id,
@@ -2081,6 +2094,7 @@ impl Engine {
         let _ = self
             .tx_event
             .send(Event::ToolCallStarted {
+                model_call: None,
                 id: tool_id.clone(),
                 name: tool_name.clone(),
                 input: tool_input.clone(),
@@ -2171,6 +2185,7 @@ impl Engine {
         let _ = self
             .tx_event
             .send(Event::ToolCallComplete {
+                model_call: None,
                 id: tool_id,
                 name: tool_name,
                 result,
@@ -3519,6 +3534,10 @@ impl Engine {
                             // A pool may contain plugin servers and authority
                             // receipts from the previous workspace snapshot.
                             self.mcp_pool = None;
+                            if let Some(attachment) = &self.extension_host {
+                                attachment.set_plugins(Arc::clone(&self.plugin_registry));
+                                attachment.sync_in_background();
+                            }
                         }
                         let ctx =
                             crate::project_context::load_project_context_with_parents(&workspace);
@@ -3529,11 +3548,9 @@ impl Engine {
                         };
                         self.session.rebuild_working_set();
                         self.reconcile_restored_work_bindings().await;
+                        // SessionUpdated acknowledges the sync. A generic status
+                        // would immediately cover the host's confirmed resume receipt.
                         self.emit_session_updated().await;
-                        let _ = self
-                            .tx_event
-                            .send(Event::status("Session context synced".to_string()))
-                            .await;
                     }
                     Op::CompactContext {
                         id,
@@ -5131,21 +5148,23 @@ impl Engine {
         // config.toml overrides. Explicit overrides win over auto-discovered
         // scripts with the same tool name.
         let extension_host = self
-            .config
-            .features
-            .enabled(Feature::ExtensionHost)
-            .then(crate::extension_host::manager);
-        if let Some(manager) = &extension_host {
+            .extension_host
+            .as_ref()
+            .filter(|_| self.config.features.enabled(Feature::ExtensionHost));
+        if let Some(attachment) = extension_host {
             // Natives only: scripts are added next and must not count as built-ins.
-            manager.note_native_names(tool_registry.names());
-            manager.sync_in_background(Arc::clone(&self.plugin_registry));
+            attachment
+                .manager()
+                .note_native_names(tool_registry.names());
+            attachment.sync_in_background();
         }
         let mut plugin_tool_names =
             configure_plugin_tools(&mut tool_registry, self.config.tools.as_ref());
         // Extension tools go in last and never replace a name already present
-        // (`ToolRegistry::register` would overwrite it silently).
-        if let Some(manager) = &extension_host {
-            plugin_tool_names.extend(manager.install_tools(&mut tool_registry));
+        // (`ToolRegistry::register` would overwrite it silently). Only this
+        // engine's own plugins' tools are installed.
+        if let Some(attachment) = extension_host {
+            plugin_tool_names.extend(attachment.install_tools(&mut tool_registry));
         }
 
         let mcp_state = if self.config.features.enabled(Feature::Mcp) {
@@ -7413,7 +7432,10 @@ impl Engine {
     // KV-cache effect: append-only user history. SessionUpdated persists this
     // warning even when an explicit prompt rebuild replaces the system prefix.
     fn record_project_trust_warning(&mut self) {
-        let warning = crate::skills::untrusted_project_skills_warning(&self.session.workspace);
+        let warning = crate::skills::untrusted_project_skills_warning(
+            &self.session.workspace,
+            Some(&self.config.skills_dir),
+        );
         let previous = self
             .session
             .messages
@@ -7875,6 +7897,12 @@ pub(crate) fn file_tool_ask_rule_decision_for_policy(
         crate::tools::canonical_action::canonical_action_alias(tool_name, tool_input);
     let paths = file_tool_permission_paths(policy_tool_name, tool_input)?;
     if paths.is_empty() {
+        if matches!(policy_tool_name, "write_file" | "edit_file" | "apply_patch") {
+            return Some(ToolAskRuleDecision::Block(
+                "File write has no resolvable target; provide an explicit path or valid patch."
+                    .to_string(),
+            ));
+        }
         return tool_ask_rule_decision_for_context(
             exec_policy_engine,
             policy_tool_name,
@@ -7957,15 +7985,32 @@ fn tool_ask_rule_decision_for_context(
     }
 }
 
+/// Every path the file tool will act on. The tools fold `file_path` /
+/// `filePath` onto `path` before executing, so each alias spelling is read
+/// here too; a rule keyed on `path` would otherwise never see that target.
 fn file_tool_permission_paths(tool_name: &str, input: &Value) -> Option<Vec<String>> {
+    let path_arguments = || {
+        let mut paths: Vec<String> = crate::tools::file::path_argument_keys()
+            .filter_map(|key| string_field(input, key))
+            .collect();
+        paths.dedup();
+        paths
+    };
     match tool_name {
         "read_file" | "write_file" | "edit_file" | "file_search" | "grep_files" => {
-            Some(string_field(input, "path").into_iter().collect())
+            Some(path_arguments())
         }
-        "list_dir" => Some(vec![
-            string_field(input, "path").unwrap_or_else(|| ".".to_string()),
-        ]),
-        "apply_patch" => Some(apply_patch_permission_paths(input)),
+        "list_dir" => {
+            let paths = path_arguments();
+            Some(if paths.is_empty() {
+                vec![".".to_string()]
+            } else {
+                paths
+            })
+        }
+        "apply_patch" => Some(apply_patch_permission_paths(
+            &crate::tools::file::with_canonical_path_argument(input),
+        )),
         _ => None,
     }
 }

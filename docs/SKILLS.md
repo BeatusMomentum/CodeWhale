@@ -50,6 +50,11 @@ Configured `skills_dir` that is not one of the owned Codewhale roots stays
 read-only. Discovery and the manager can list it; mutations still target owned
 project/global roots only.
 
+Every root inside the workspace — owned, compatible, or a configured
+`skills_dir` that resolves there — loads only once the workspace is trusted
+(`/trust on --save`). Until then discovery names the skipped directories in its
+warning, and the session's skills directory falls back to the global one.
+
 ## Slash commands
 
 | Command | Behavior |
@@ -140,6 +145,37 @@ Missing or unknown invocation values retain the historical `model+user`
 behavior. Canonical names win over aliases when a collision exists. Loading a
 skill reports its canonical invocation and aliases so receipts remain
 inspectable.
+
+### Non-ASCII names and saved activation
+
+ASCII names keep their existing command spelling. A name containing non-ASCII
+characters gets a stable ASCII ID: a shortened old slug plus 32 hexadecimal
+SHA-256 digits, at most 64 characters per skill-name segment. The hash uses
+trimmed UTF-8 with ASCII case folding; it does not transliterate or merge Unicode
+normalization forms. Unqualified raw names and those IDs select the same body.
+Package directories stay in place. Qualified lookup requires the declared canonical
+namespace, with ASCII case folding and no punctuation folding: `Team.Plugin:技能`
+cannot select a skill in `team-plugin`.
+
+Previously disabled lossy names such as `skill` or `pdf` continue to suppress
+every corresponding renamed skill. Enabling one exact catalog ID enables only
+that identity, including a literal ASCII skill named `skill`; it does not enable
+its formerly colliding siblings. Toggle requests use the exact ID returned by
+`GET /v1/skills`. Plugin bundle trust remains a separate gate.
+
+Activation still uses one `skills_state.toml` file and its `disabled` array.
+Reserved `!codewhale-skill-state:1:*` entries preserve legacy veto history and
+exact enable choices through older writers, using the same lock and atomic
+write. Listing/discovery do not rewrite the file. Unknown versions or malformed
+reserved entries are errors and are left untouched; existing recovery behavior
+keeps native skills available but hides reviewed plugin skills when policy
+cannot be read.
+
+This is **not simultaneous-version activation compatibility**. v0.10.0 readers
+cannot enforce new per-identity disables, and their lossy or no-op toggles cannot
+express every new choice. Upgrade every runtime sharing the state directory
+before relying on consistent controls. Retaining marker strings through an old
+write does not give that old binary the new identity semantics.
 
 ### Starter-pack parity decisions
 

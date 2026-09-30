@@ -804,17 +804,32 @@ impl ThreadManager {
         self.store.delete_thread_goal(&params.thread_id)
     }
 
+    fn knows_thread(&self, thread_id: &str) -> Result<bool> {
+        Ok(self.running_threads.contains_key(thread_id)
+            || self.store.get_thread(thread_id)?.is_some())
+    }
+
     /// Archives a thread so it no longer appears in default listings.
-    pub fn archive_thread(&mut self, thread_id: &str) -> Result<()> {
+    ///
+    /// Returns `false` for an unknown id: the store updates by id and reports
+    /// nothing for one it does not have, so the caller must not claim success.
+    pub fn archive_thread(&mut self, thread_id: &str) -> Result<bool> {
+        if !self.knows_thread(thread_id)? {
+            return Ok(false);
+        }
         self.store.mark_archived(thread_id)?;
         if let Some(thread) = self.running_threads.get_mut(thread_id) {
             thread.status = ThreadStatus::Archived;
         }
-        Ok(())
+        Ok(true)
     }
 
-    /// Restores an archived thread to active status.
-    pub fn unarchive_thread(&mut self, thread_id: &str) -> Result<()> {
+    /// Restores an archived thread to active status. Returns `false` for an
+    /// unknown id.
+    pub fn unarchive_thread(&mut self, thread_id: &str) -> Result<bool> {
+        if !self.knows_thread(thread_id)? {
+            return Ok(false);
+        }
         self.store.mark_unarchived(thread_id)?;
         if let Some(metadata) = self.store.get_thread(thread_id)? {
             let thread = to_protocol_thread(metadata);
@@ -822,7 +837,7 @@ impl ThreadManager {
                 *cached = thread;
             }
         }
-        Ok(())
+        Ok(true)
     }
 
     /// Records a user message in a thread and updates its preview and timestamp.
@@ -1220,10 +1235,10 @@ impl Runtime {
                 }
             }
             ThreadRequest::Archive { thread_id } => {
-                self.thread_manager.archive_thread(&thread_id)?;
+                let found = self.thread_manager.archive_thread(&thread_id)?;
                 Ok(ThreadResponse {
                     thread_id,
-                    status: "archived".to_string(),
+                    status: if found { "archived" } else { "missing" }.to_string(),
                     thread: None,
                     threads: Vec::new(),
                     goal: None,
@@ -1233,14 +1248,18 @@ impl Runtime {
                     approval_policy: None,
                     sandbox: None,
                     events: Vec::new(),
-                    data: json!({}),
+                    data: if found {
+                        json!({})
+                    } else {
+                        json!({"error":"thread not found"})
+                    },
                 })
             }
             ThreadRequest::Unarchive { thread_id } => {
-                self.thread_manager.unarchive_thread(&thread_id)?;
+                let found = self.thread_manager.unarchive_thread(&thread_id)?;
                 Ok(ThreadResponse {
                     thread_id,
-                    status: "unarchived".to_string(),
+                    status: if found { "unarchived" } else { "missing" }.to_string(),
                     thread: None,
                     threads: Vec::new(),
                     goal: None,
@@ -1250,7 +1269,11 @@ impl Runtime {
                     approval_policy: None,
                     sandbox: None,
                     events: Vec::new(),
-                    data: json!({}),
+                    data: if found {
+                        json!({})
+                    } else {
+                        json!({"error":"thread not found"})
+                    },
                 })
             }
             // A thread message is a *turn*, and this type is not the turn
@@ -2446,6 +2469,51 @@ mod tests {
             .expect("thread persisted");
         assert_eq!(persisted.sandbox_policy.as_deref(), Some("workspace-write"));
         assert_eq!(persisted.approval_mode.as_deref(), Some("on-request"));
+    }
+
+    #[tokio::test]
+    async fn archiving_an_unknown_thread_reports_missing_instead_of_success() {
+        let mut runtime = Runtime::new(
+            ConfigToml::default(),
+            temp_core_state("archive-unknown"),
+            Arc::new(McpManager::default()),
+            HookDispatcher::default(),
+        );
+        for request in [
+            ThreadRequest::Archive {
+                thread_id: "no-such-thread".to_string(),
+            },
+            ThreadRequest::Unarchive {
+                thread_id: "no-such-thread".to_string(),
+            },
+        ] {
+            let response = runtime.handle_thread(request).await.expect("handled");
+            assert_eq!(response.status, "missing");
+            assert_eq!(response.data["error"], "thread not found");
+        }
+
+        let spawned = runtime
+            .thread_manager
+            .spawn_thread_with_history(
+                "deepseek".to_string(),
+                PathBuf::from("/tmp/codewhale"),
+                InitialHistory::New,
+                true,
+            )
+            .expect("spawn thread");
+        let thread_id = spawned.thread.id.clone();
+        let response = runtime
+            .handle_thread(ThreadRequest::Archive {
+                thread_id: thread_id.clone(),
+            })
+            .await
+            .expect("handled");
+        assert_eq!(response.status, "archived");
+        let response = runtime
+            .handle_thread(ThreadRequest::Unarchive { thread_id })
+            .await
+            .expect("handled");
+        assert_eq!(response.status, "unarchived");
     }
 
     #[tokio::test]

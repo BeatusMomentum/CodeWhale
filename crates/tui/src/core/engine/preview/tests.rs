@@ -385,6 +385,7 @@ fn context_pressure_delta_matches_clone_and_push_reference() {
                 state: None,
             },
             ContentBlock::ToolUse {
+                execution_id: None,
                 id: "call_1".to_string(),
                 name: "bash".to_string(),
                 input: json!({"command": "echo hello"}),
@@ -402,6 +403,7 @@ fn context_pressure_delta_matches_clone_and_push_reference() {
                 state: None,
             },
             ContentBlock::ToolUse {
+                execution_id: None,
                 id: "call_2".to_string(),
                 name: "read".to_string(),
                 input: json!({"path": "x"}), // 13-byte JSON -> 3

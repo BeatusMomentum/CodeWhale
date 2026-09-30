@@ -31,9 +31,9 @@ pub use config::{
     PROJECT_HOOKS_TEMPLATE, workspace_allows_project_hooks,
 };
 pub(crate) use executor::{
-    HOOK_CONTEXT_AGGREGATE_MAX_CHARS, HOOK_LABEL_MAX_CHARS, generic_unavailable_detail,
-    parse_tool_call_before_stdout, sanitize_hook_denial_reason, sanitize_hook_label,
-    sanitize_hook_line, sanitize_hook_text,
+    HOOK_CONTEXT_AGGREGATE_MAX_CHARS, HOOK_EXECUTION_RECEIPT_MAX_BYTES, HOOK_LABEL_MAX_CHARS,
+    generic_unavailable_detail, parse_tool_call_before_stdout, sanitize_hook_denial_reason,
+    sanitize_hook_label, sanitize_hook_line, sanitize_hook_text,
 };
 #[cfg(test)]
 pub(crate) use executor::{

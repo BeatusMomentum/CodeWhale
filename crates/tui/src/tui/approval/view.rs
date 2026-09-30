@@ -8,7 +8,9 @@ use std::cell::{Cell, RefCell};
 use std::time::{Duration, Instant};
 
 use codewhale_config::ToolAskRule;
-use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{
+    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use ratatui::layout::Rect;
 
 use crate::config::ApprovalDefaultSelection;
@@ -339,6 +341,17 @@ impl ModalView for ApprovalView {
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> ViewAction {
+        if key.kind != KeyEventKind::Press {
+            return ViewAction::None;
+        }
+        // Details is the intentional modified-key action; it cannot grant
+        // authority. Editing/mode chords must never answer this card.
+        if crate::tui::shell_key_routing::is_tool_details_shortcut(&key) {
+            return self.emit_params_pager();
+        }
+        if !key.modifiers.difference(KeyModifiers::SHIFT).is_empty() {
+            return ViewAction::None;
+        }
         match key.code {
             KeyCode::Tab => {
                 self.collapsed = !self.collapsed;
@@ -394,10 +407,6 @@ impl ModalView for ApprovalView {
                 } else {
                     self.commit_option(ApprovalOption::Deny)
                 }
-            }
-            // Details is Alt+V / Option+V only; bare `v` is never a shortcut.
-            _ if crate::tui::shell_key_routing::is_tool_details_shortcut(&key) => {
-                self.emit_params_pager()
             }
             // A child's card hides on Esc: the request stays pending (footer
             // row, `/agents`) and the parent's turn is never cancelled.

@@ -1138,6 +1138,9 @@ impl From<RetryPolicy> for RetryConfig {
             initial_delay: policy.initial_delay,
             max_delay: policy.max_delay,
             exponential_base: policy.exponential_base,
+            jitter: policy.jitter,
+            jitter_factor: policy.jitter_factor,
+            respect_retry_after: policy.respect_retry_after,
             ..Default::default()
         }
     }
@@ -1152,6 +1155,9 @@ impl From<RetryConfig> for RetryPolicy {
             initial_delay: config.initial_delay,
             max_delay: config.max_delay,
             exponential_base: config.exponential_base,
+            jitter: config.jitter,
+            jitter_factor: config.jitter_factor,
+            respect_retry_after: config.respect_retry_after,
         }
     }
 }
@@ -1755,6 +1761,9 @@ mod tests {
             initial_delay: 2.0,
             max_delay: 30.0,
             exponential_base: 3.0,
+            jitter: false,
+            jitter_factor: 0.25,
+            respect_retry_after: false,
         };
 
         let config: RetryConfig = policy.clone().into();
@@ -1764,10 +1773,19 @@ mod tests {
         assert_f64_eq(config.max_delay, policy.max_delay);
         assert_f64_eq(config.exponential_base, policy.exponential_base);
 
+        // #6700: the jitter and Retry-After knobs survive the conversion
+        // instead of silently resetting to `RetryConfig::default()`.
+        assert!(!config.jitter);
+        assert_f64_eq(config.jitter_factor, 0.25);
+        assert!(!config.respect_retry_after);
+
         // Convert back
         let policy2: RetryPolicy = config.into();
         assert_eq!(policy2.enabled, policy.enabled);
         assert_eq!(policy2.max_retries, policy.max_retries);
+        assert_eq!(policy2.jitter, policy.jitter);
+        assert_f64_eq(policy2.jitter_factor, policy.jitter_factor);
+        assert_eq!(policy2.respect_retry_after, policy.respect_retry_after);
     }
 
     #[tokio::test]

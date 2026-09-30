@@ -323,6 +323,26 @@ fn load_plugin(
             Some(manifest_path.to_path_buf()),
         ));
     }
+    // Under the extension-host policy a `native` entry is executable host
+    // code. Report invalid entries during validation and review, before
+    // activation refuses the bundle because it has an error diagnostic.
+    if super::activation::PluginActivationPolicy::current()
+        .is_supported(super::activation::PluginActivationCapability::Native)
+    {
+        for entry in &validated.components.native {
+            // Every regular bundle file is hashed; a directory is not.
+            let is_regular_file = entry
+                .strip_prefix(&validated.canonical_root)
+                .is_ok_and(|relative| validated.file_hashes.contains_key(relative));
+            if let Some(problem) = super::runtime::native_entry_problem(entry, is_regular_file) {
+                diagnostics.push(PluginDiagnostic::error(
+                    "native-entry-invalid",
+                    format!("native entry {}: {problem}", entry.display()),
+                    Some(entry.clone()),
+                ));
+            }
+        }
+    }
 
     // Skill parsing happens after hashing. Revalidate once so a concurrent
     // bundle edit cannot pair a reviewed hash with different in-memory Skill
@@ -411,6 +431,7 @@ fn parse_skill_snapshots(
             }
             skill_snapshots.push(PluginSkillSnapshot {
                 name: skill.name.clone(),
+                legacy_activation_name: skill.legacy_activation_name.clone(),
                 description: skill.description.clone(),
                 localized_descriptions: skill.localized_descriptions.clone(),
                 invocation: skill.invocation,

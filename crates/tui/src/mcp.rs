@@ -54,6 +54,18 @@ pub(crate) const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
 /// answering or requesting any of these continues the handshake.
 pub(crate) const MCP_SUPPORTED_PROTOCOL_VERSIONS: &[&str] =
     &[MCP_PROTOCOL_VERSION, "2025-03-26", "2024-11-05"];
+/// Revisions a *server* may answer our client `initialize` with, newest first.
+/// Servers built on current SDKs (Pi, OMP and the 2025-11-25 TypeScript and
+/// Python SDKs) answer `2025-11-25` even when offered an older revision; the
+/// message shapes our client uses are unchanged in that revision, so ending
+/// the handshake there only turns a working server into a failed row. Our own
+/// MCP server still negotiates from `MCP_SUPPORTED_PROTOCOL_VERSIONS` alone.
+pub(crate) const MCP_CLIENT_ACCEPTED_PROTOCOL_VERSIONS: &[&str] = &[
+    "2025-11-25",
+    MCP_PROTOCOL_VERSION,
+    "2025-03-26",
+    "2024-11-05",
+];
 
 fn validate_mcp_config_path(path: &Path) -> Result<()> {
     if path.as_os_str().is_empty() {
@@ -513,8 +525,12 @@ pub struct McpTimeouts {
     pub read_timeout: u64,
 }
 
+/// Covers spawn, `initialize` and the first `tools/list` together. A cold
+/// `uvx`/`npx` start resolves and downloads the package inside this window,
+/// which routinely takes longer than 10 s; 30 s matches Codex, opencode, OMP
+/// and Claude Code's `MCP_TIMEOUT` default.
 fn default_connect_timeout() -> u64 {
-    10
+    30
 }
 // 30 minutes: an MCP tool call legitimately runs minutes — builds, test
 // suites, scrapes, remote jobs. The old 60s default returned "timed out" to
@@ -1542,8 +1558,8 @@ pub trait McpTransport: Send + Sync {
     /// [`McpConnection::is_ready`] so a crashed stdio child stops reading
     /// as "ready" before the next call fails (#6187). Must never block and
     /// never spawn — a contended lock reads as alive; the next call observes
-    /// the death. HTTP/SSE transports have no child to observe, so the
-    /// default is "alive".
+    /// the death. The default is "alive"; Streamable HTTP has no long-lived
+    /// channel to observe, while legacy SSE reports its closed event stream.
     fn probe_dead(&self) -> bool {
         false
     }
@@ -1993,37 +2009,51 @@ impl McpConnection {
                     "name": "codewhale-tui",
                     "version": env!("CARGO_PKG_VERSION")
                 },
-                "capabilities": {
-                    "tools": {},
-                    "resources": {},
-                    "prompts": {}
-                }
+                // Client capabilities name what the *client* offers the server
+                // (roots, sampling, elicitation). `tools`/`resources`/`prompts`
+                // are server capabilities; declaring them here is off-spec and
+                // strict servers reject the handshake with -32602. We offer
+                // none of the client features yet, so the object is empty.
+                "capabilities": {}
             }
         }))
         .await?;
 
         let response = self.recv(init_id, self.read_timeout_secs).await?;
-        if let Some(error) = response.get("error")
-            && self.config.reviewed_plugin.is_none()
-        {
+        if let Some(error) = response.get("error") {
             // A JSON-RPC error on `initialize` is the server refusing the
             // handshake, not a transport fault: name the server and what was
             // launched, and carry the child's last stderr line, which is
             // usually the real reason (an MCP proxy that cannot reach its
             // upstream answers -32602 and explains itself only on stderr).
-            let launched = match (&self.config.command, &self.config.url) {
-                (Some(command), _) => format!("command `{}`", mcp_display_target("stdio", command)),
-                (None, Some(_)) => "HTTP endpoint".to_string(),
-                (None, None) => "server".to_string(),
-            };
             let stderr = self
                 .transport
                 .last_stderr_line()
                 .await
                 .map(|line| format!("; server stderr: {line}"))
                 .unwrap_or_default();
+            // Classified from the raw error and stderr *before* any
+            // suppression, so a reviewed plugin's AWS server (the aws-core
+            // plugin ships one) still learns its login expired. Only our own
+            // fixed hint text leaves this branch, never the server's words.
+            let raw = format!("{error}{stderr}");
+            let hint = if mcp_error_is_aws_login(&raw, mcp_server_oauth_capable(&self.config)) {
+                format!("; {}", aws_login_hint(&self.config, &self.name, &raw))
+            } else {
+                String::new()
+            };
+            if self.config.reviewed_plugin.is_some() {
+                anyhow::bail!(
+                    "Reviewed plugin MCP server returned an error in 'initialize' (server details suppressed to protect environment-backed credentials){hint}"
+                );
+            }
+            let launched = match (&self.config.command, &self.config.url) {
+                (Some(command), _) => format!("command `{}`", mcp_display_target("stdio", command)),
+                (None, Some(_)) => "HTTP endpoint".to_string(),
+                (None, None) => "server".to_string(),
+            };
             anyhow::bail!(
-                "MCP server '{}' rejected initialize ({launched}): {error}{stderr}",
+                "MCP server '{}' rejected initialize ({launched}): {error}{stderr}{hint}",
                 self.name
             );
         }
@@ -2045,10 +2075,10 @@ impl McpConnection {
                 )
             })?;
         anyhow::ensure!(
-            MCP_SUPPORTED_PROTOCOL_VERSIONS.contains(&negotiated),
+            MCP_CLIENT_ACCEPTED_PROTOCOL_VERSIONS.contains(&negotiated),
             "MCP server '{}' negotiated unsupported protocol version '{negotiated}' (supported: {})",
             self.name,
-            MCP_SUPPORTED_PROTOCOL_VERSIONS.join(", ")
+            MCP_CLIENT_ACCEPTED_PROTOCOL_VERSIONS.join(", ")
         );
         self.transport.set_protocol_version(negotiated);
         self.server_capabilities = McpServerCapabilities::from_initialize_response(&response);
@@ -2447,8 +2477,16 @@ impl McpConnection {
 
         if let Some(error) = response.get("error") {
             if self.config.reviewed_plugin.is_some() {
+                // Preserve only the fixed recovery class, just as initialize
+                // does; raw server details may contain plugin credentials.
+                let raw = error.to_string();
+                let hint = if mcp_error_is_aws_login(&raw, mcp_server_oauth_capable(&self.config)) {
+                    format!("; {}", aws_login_hint(&self.config, &self.name, &raw))
+                } else {
+                    String::new()
+                };
                 anyhow::bail!(
-                    "Reviewed plugin MCP server returned an error in '{method}' (server details suppressed to protect environment-backed credentials)"
+                    "Reviewed plugin MCP server returned an error in '{method}' (server details suppressed to protect environment-backed credentials){hint}"
                 );
             }
             return Err(anyhow::anyhow!(
@@ -2608,8 +2646,13 @@ impl McpConnection {
             if response_id_matches(value.get("id"), &expected_id) {
                 // Marks the connection stale so it is rebuilt, but this is a
                 // reply to the request, so it never qualifies for a replay.
+                // An expired AWS *SSO session* is the server's upstream
+                // credential, not our MCP session: rebuilding the connection
+                // cannot renew it, and the stale-session wording would hide
+                // the one fact the user can act on.
                 if let Some(error) = value.get("error")
                     && is_mcp_stale_session_body(&error.to_string())
+                    && !error_text_looks_aws_credentials_expired(&error.to_string())
                 {
                     anyhow::bail!("MCP session expired: {error}");
                 }
@@ -3522,7 +3565,7 @@ impl McpPool {
         entry.retry_after =
             std::time::Instant::now() + connect_backoff_delay(entry.consecutive_failures);
         entry.last_error = format_mcp_error_for_display(error);
-        let changed = if oauth::error_looks_auth_required(error) {
+        let changed = if self.error_needs_oauth_login(name, error) {
             self.needs_auth_servers.insert(name.to_string())
         } else {
             self.needs_auth_servers.remove(name)
@@ -3530,6 +3573,21 @@ impl McpPool {
         if changed {
             self.needs_auth_generation = self.needs_auth_generation.wrapping_add(1);
         }
+    }
+
+    /// Whether `error` from `name` is an OAuth-style auth-required failure.
+    /// An expired AWS login on a server that is not OAuth-capable often says
+    /// `401`/`Unauthorized` too, but `/mcp login` and the synthetic
+    /// authenticate tool cannot renew it: it is excluded here so the
+    /// needs-auth set (and every surface derived from it) never misroutes it.
+    fn error_needs_oauth_login(&self, name: &str, error: &anyhow::Error) -> bool {
+        if !oauth::error_looks_auth_required(error) {
+            return false;
+        }
+        let oauth_capable = self
+            .server_config(name)
+            .is_some_and(|config| mcp_server_oauth_capable(&config));
+        !mcp_error_is_aws_login(&format!("{error:#}"), oauth_capable)
     }
 
     /// Current needs-auth surface generation. Compare across a tool call to
@@ -4305,13 +4363,24 @@ impl McpPool {
         format!("MCP server '{server_name}' requires authentication (◆ auth required); {recovery}")
     }
 
-    /// Route an auth-required failure from a live tool call into the same
+    /// Route an auth-required failure from a live request into the same
     /// typed state a failed connect produces: drop the connection (its
     /// credential is no longer accepted), mark the server needs-auth so the
     /// next catalog offers the synthetic login tool, and name the recovery on
     /// the error. Any other error passes through untouched.
     fn note_live_call_failure(&mut self, server_name: &str, error: anyhow::Error) -> anyhow::Error {
-        if !oauth::error_looks_auth_required(&error) {
+        if !self.error_needs_oauth_login(server_name, &error) {
+            // An expired AWS login on a live call names its own recovery
+            // instead of passing through as a bare 401.
+            let text = format!("{error:#}");
+            if let Some(config) = self.server_config(server_name)
+                && mcp_error_is_aws_login(&text, mcp_server_oauth_capable(&config))
+            {
+                let hint = aws_login_hint(&config, server_name, &text);
+                self.drop_connection(server_name, "AWS credentials expired on live call");
+                self.note_connect_failure(server_name, &error);
+                return error.context(hint);
+            }
             return error;
         }
         self.drop_connection(server_name, "auth required on live call");
@@ -4459,8 +4528,8 @@ impl McpPool {
         let errors = self.connect_all().await;
         for (server, err) in errors {
             tracing::warn!("Failed to connect MCP server '{server}' for resources: {err:#}");
-            if oauth::error_looks_auth_required(&err) {
-                items.push(self.mcp_auth_required_error_item(&server));
+            if let Some(item) = self.mcp_recovery_error_item(&server, &err) {
+                items.push(item);
             }
         }
         for (server, conn) in &self.connections {
@@ -4508,8 +4577,8 @@ impl McpPool {
             tracing::warn!(
                 "Failed to connect MCP server '{server}' for resource templates: {err:#}"
             );
-            if oauth::error_looks_auth_required(&err) {
-                items.push(self.mcp_auth_required_error_item(&server));
+            if let Some(item) = self.mcp_recovery_error_item(&server, &err) {
+                items.push(item);
             }
         }
         for (server, conn) in &self.connections {
@@ -4527,6 +4596,27 @@ impl McpPool {
             }
         }
         Ok(items)
+    }
+
+    /// Project recoverable connection failures for every resource listing.
+    /// AWS CLI credentials cannot be renewed by the synthetic OAuth tool.
+    fn mcp_recovery_error_item(
+        &self,
+        server: &str,
+        error: &anyhow::Error,
+    ) -> Option<serde_json::Value> {
+        let text = format!("{error:#}");
+        if let Some(config) = self.server_config(server)
+            && mcp_error_is_aws_login(&text, mcp_server_oauth_capable(&config))
+        {
+            return Some(serde_json::json!({
+                "error": "aws_login_required",
+                "server": server,
+                "message": aws_login_hint(&config, server, &text),
+            }));
+        }
+        self.error_needs_oauth_login(server, error)
+            .then(|| self.mcp_auth_required_error_item(server))
     }
 
     /// Listing-time error item for a needs-auth server. Carries the same
@@ -4578,7 +4668,9 @@ impl McpPool {
             anyhow::bail!("MCP resource URI '{uri}' was not advertised by server '{server_name}'");
         }
         let timeout = conn.config().effective_read_timeout(&global_timeouts);
-        conn.read_resource(uri, timeout).await
+        conn.read_resource(uri, timeout)
+            .await
+            .map_err(|error| self.note_live_call_failure(server_name, error))
     }
 
     /// Get a prompt from a specific server
@@ -4600,7 +4692,9 @@ impl McpPool {
             );
         }
         let timeout = conn.config().effective_execute_timeout(&global_timeouts);
-        conn.get_prompt(prompt_name, arguments, timeout).await
+        conn.get_prompt(prompt_name, arguments, timeout)
+            .await
+            .map_err(|error| self.note_live_call_failure(server_name, error))
     }
 
     /// Parse a prefixed name into (server_name, tool_name)
@@ -4976,12 +5070,17 @@ impl McpPool {
                 };
                 match result {
                     Ok(mut resources) => items.append(&mut resources),
-                    Err(error) if oauth::error_looks_auth_required(&error) => {
-                        let mut item = self.mcp_auth_required_error_item(&server);
+                    Err(error) => {
+                        let Some(mut item) = self.mcp_recovery_error_item(&server, &error) else {
+                            tracing::warn!("MCP resource discovery failed: {error:#}");
+                            continue;
+                        };
                         let auth_name = Self::mcp_model_tool_name(&server, AUTHENTICATE_TOOL_NAME);
-                        if crate::core::engine::tool_catalog::tool_matches_any_rule(
-                            rules, &auth_name,
-                        ) {
+                        if item.get("authenticate_tool").is_some()
+                            && crate::core::engine::tool_catalog::tool_matches_any_rule(
+                                rules, &auth_name,
+                            )
+                        {
                             item.as_object_mut()
                                 .expect("error item object")
                                 .remove("authenticate_tool");
@@ -4990,7 +5089,6 @@ impl McpPool {
                         }
                         items.push(item);
                     }
-                    Err(error) => tracing::warn!("MCP resource discovery failed: {error:#}"),
                 }
             }
             let field = if name == "list_mcp_resources" {
@@ -5448,6 +5546,12 @@ pub enum McpRecoveryKind {
     Reconnect,
     Reauth,
     Diagnose,
+    /// The server's AWS credentials (an SSO session or a temporary token)
+    /// expired. The fix is outside Codewhale — `aws sso login` in a terminal
+    /// (see [`aws_login_hint`]) — and `/mcp login` cannot help: it is an
+    /// OAuth flow for HTTP servers, and a stdio AWS proxy is not one. The row
+    /// action is the single-server retry to run once the login is done.
+    AwsLogin,
 }
 
 impl McpRecoveryKind {
@@ -5461,12 +5565,12 @@ impl McpRecoveryKind {
             // healthy connection, and the row the user aimed at is still
             // pending when the list comes back. `/mcp retry <name>` reaches
             // `retry_mcp_server`, which reconnects exactly that server.
-            Self::Connect | Self::Reconnect if mcp_name_is_command_safe(name) => {
+            Self::Connect | Self::Reconnect | Self::AwsLogin if mcp_name_is_command_safe(name) => {
                 format!("/mcp retry {name}")
             }
             // A name the command line cannot carry safely still gets the
             // blunt instrument rather than a quoted-argument hazard.
-            Self::Connect | Self::Reconnect => "/mcp reload".to_string(),
+            Self::Connect | Self::Reconnect | Self::AwsLogin => "/mcp reload".to_string(),
             Self::Reauth => format!("/mcp login {name}"),
             Self::Diagnose if mcp_name_is_command_safe(name) => format!("/mcp validate {name}"),
             Self::Diagnose => "/mcp validate".to_string(),
@@ -5480,6 +5584,12 @@ impl McpRecoveryKind {
             Self::Connect => codewhale_localization::MessageId::ExtensionsActionConnect,
             Self::Reconnect => codewhale_localization::MessageId::ExtensionsActionReconnect,
             Self::Reauth => codewhale_localization::MessageId::ExtensionsActionReauth,
+            // The row action is `/mcp retry <name>` in place, not a login
+            // flow, so it is labelled for what it runs. The why (run
+            // `aws login` first) is carried in the row detail, which the
+            // snapshot guarantees names the command (see
+            // `snapshot_from_config`).
+            Self::AwsLogin => codewhale_localization::MessageId::ExtensionsActionReconnect,
             Self::Diagnose => codewhale_localization::MessageId::ExtensionsActionDiagnose,
         }
     }
@@ -5517,8 +5627,9 @@ pub fn mcp_display_target(transport: &str, command_or_url: &str) -> String {
 
 #[must_use]
 pub fn mcp_server_oauth_capable(config: &McpServerConfig) -> bool {
-    config.url.is_some()
-        && (config.oauth.is_some() || !config.scopes.is_empty() || config.oauth_resource.is_some())
+    // Use the login path's own authority, including discovery-only HTTP
+    // servers, manual Authorization and the reviewed-plugin restriction.
+    oauth::server_supports_oauth_login(config)
 }
 
 #[must_use]
@@ -5533,6 +5644,15 @@ pub fn mcp_recovery_kind(
         return Some(McpRecoveryKind::Enable);
     }
     if let Some(error) = error {
+        // Before the OAuth classifier: an expired AWS token often surfaces as
+        // `UnauthorizedException`/`401`, which would otherwise route to
+        // `/mcp login` — an OAuth flow that cannot renew an AWS session.
+        // Gated on the server not being OAuth-capable: an OAuth server
+        // fronted by corporate SSO saying "SSO token expired" needs its own
+        // login, not `aws sso login`.
+        if mcp_error_is_aws_login(error, oauth_capable) {
+            return Some(McpRecoveryKind::AwsLogin);
+        }
         if oauth::error_text_looks_auth_required(error) {
             return Some(McpRecoveryKind::Reauth);
         }
@@ -5554,6 +5674,94 @@ pub fn mcp_recovery_kind(
     Some(McpRecoveryKind::Reconnect)
 }
 
+/// Whether an MCP server's error (usually its forwarded stderr line) says the
+/// AWS credentials it launched with have expired. The founder's `aws` server
+/// failed `initialize` with -32602 whose only real cause was an expired SSO
+/// login; the generic "diagnose" gave no way forward. Every pattern is
+/// anchored to AWS CLI / SDK wording so an unrelated "token expired" from an
+/// OAuth server still reaches the OAuth classifier.
+#[must_use]
+pub fn error_text_looks_aws_credentials_expired(text: &str) -> bool {
+    let text = text.to_ascii_lowercase();
+    let expired = text.contains("expired") || text.contains("invalid");
+    // botocore / AWS CLI v2 SSO wording ("The SSO session associated with
+    // this profile has expired or is otherwise invalid", "Error loading SSO
+    // Token: Token for … does not exist").
+    let sso = ["sso session", "sso token", "sso login", "sso oidc"]
+        .iter()
+        .any(|phrase| text.contains(phrase));
+    let mentions_aws = text
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .any(|word| word == "aws");
+    (sso && (expired || text.contains("does not exist")))
+        // AWS CLI 2.32+ `aws login` sessions: "LoginRefreshRequired: Please
+        // reauthenticate using aws login" (the founder's -32602 case).
+        || text.contains("loginrefreshrequired")
+        // Our own hint, so a reviewed plugin's suppressed error (which keeps
+        // only this fixed text) still classifies on every later surface.
+        || text.contains("aws credentials expired:")
+        || text.contains("reauthenticate using aws login")
+        // STS / service error codes for expired temporary credentials.
+        || text.contains("expiredtoken")
+        || text.contains("security token included in the request is expired")
+        || text.contains("tokenrefreshrequired")
+        || (mentions_aws && text.contains("token") && text.contains("expired"))
+}
+
+/// Whether an MCP error means "renew the AWS login in a terminal". Only a
+/// server that is not OAuth-capable qualifies: an OAuth server's expired
+/// token is renewed by `/mcp login`, whatever words its SSO front uses.
+#[must_use]
+pub fn mcp_error_is_aws_login(text: &str, oauth_capable: bool) -> bool {
+    !oauth_capable && error_text_looks_aws_credentials_expired(text)
+}
+
+/// The terminal command that renews an expired AWS login for `config`, with
+/// the follow-up retry. `error_text` picks the command: a CLI 2.32+
+/// `aws login` session (`LoginRefreshRequired`) renews with `aws login`,
+/// everything else with `aws sso login`. The profile comes from the server's
+/// own `--profile` argument, else its `AWS_PROFILE` env entry (not for a
+/// reviewed plugin, whose env stays out of every surface); with neither the
+/// plain command uses the default profile, which is what the server does.
+#[must_use]
+pub fn aws_login_hint(config: &McpServerConfig, server: &str, error_text: &str) -> String {
+    let profile = config
+        .args
+        .iter()
+        .position(|arg| arg == "--profile")
+        .and_then(|index| config.args.get(index + 1))
+        .map(String::as_str)
+        .or_else(|| {
+            config
+                .args
+                .iter()
+                .find_map(|arg| arg.strip_prefix("--profile="))
+        })
+        .or_else(|| {
+            config
+                .reviewed_plugin
+                .is_none()
+                .then(|| config.env.get("AWS_PROFILE").map(String::as_str))
+                .flatten()
+        })
+        .filter(|profile| !profile.starts_with('-') && mcp_name_is_command_safe(profile));
+    let lower = error_text.to_ascii_lowercase();
+    let command = if lower.contains("loginrefreshrequired")
+        || lower.contains("using aws login")
+        || lower.contains("run `aws login")
+    {
+        "aws login"
+    } else {
+        "aws sso login"
+    };
+    let login = match profile {
+        Some(profile) => format!("{command} --profile {profile}"),
+        None => command.to_string(),
+    };
+    let retry = McpRecoveryKind::AwsLogin.slash_command(server);
+    format!("AWS credentials expired: run `{login}` in a terminal, then `{retry}`")
+}
+
 pub fn load_config(path: &Path) -> Result<McpConfig> {
     validate_mcp_config_path(path)?;
     let Some(contents) = read_mcp_config_file(path)? else {
@@ -5571,6 +5779,12 @@ pub fn load_config(path: &Path) -> Result<McpConfig> {
 const MAX_MCP_CONFIG_BYTES: u64 = 1024 * 1024;
 
 fn read_mcp_config_file(path: &Path) -> Result<Option<String>> {
+    read_bounded_mcp_config_file(path, MAX_MCP_CONFIG_BYTES)
+}
+
+/// [`read_mcp_config_file`] with a caller-chosen size bound, for foreign files
+/// such as `~/.claude.json` that carry far more than an MCP server map.
+fn read_bounded_mcp_config_file(path: &Path, max_bytes: u64) -> Result<Option<String>> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -5587,11 +5801,15 @@ fn read_mcp_config_file(path: &Path) -> Result<Option<String>> {
     let file = open_mcp_config_file(path)
         .with_context(|| format!("Failed to read MCP config {}", path.display()))?;
     let mut contents = String::new();
-    file.take(MAX_MCP_CONFIG_BYTES + 1)
+    file.take(max_bytes + 1)
         .read_to_string(&mut contents)
         .with_context(|| format!("Failed to read MCP config {}", path.display()))?;
-    if contents.len() as u64 > MAX_MCP_CONFIG_BYTES {
-        anyhow::bail!("MCP config {} exceeds the 1 MiB limit", path.display());
+    if contents.len() as u64 > max_bytes {
+        anyhow::bail!(
+            "MCP config {} exceeds the {} MiB limit",
+            path.display(),
+            max_bytes / (1024 * 1024)
+        );
     }
     Ok(Some(contents))
 }
@@ -6575,19 +6793,45 @@ fn snapshot_from_config(
             };
 
             if let Some((pool, errors)) = discovery {
-                if let Some(error) = errors.get(name) {
+                if let Some(error) = pool
+                    .connect_backoff
+                    .get(name)
+                    .map(|backoff| &backoff.last_error)
+                    .or_else(|| errors.get(name))
+                {
                     snapshot.error = Some(error.clone());
                 }
                 // The pool's needs-auth set is the authority; the error text
                 // fallback keeps a boot-time error map (held by the engine
                 // after the pool's live state was rebuilt) on the same
                 // classification instead of downgrading to a plain failure.
+                let oauth_capable = mcp_server_oauth_capable(server);
+                let aws_login = snapshot
+                    .error
+                    .as_deref()
+                    .is_some_and(|error| mcp_error_is_aws_login(error, oauth_capable));
+                // An expired AWS login is never `◆ auth required`: the
+                // needs-auth set already excludes it, and the text fallback
+                // must too, or a `401`-worded AWS error reaches `/mcp login`.
                 snapshot.auth_required = server.is_enabled()
                     && (pool.server_needs_auth(name)
-                        || snapshot
-                            .error
-                            .as_deref()
-                            .is_some_and(oauth::error_text_looks_auth_required));
+                        || (!aws_login
+                            && snapshot
+                                .error
+                                .as_deref()
+                                .is_some_and(oauth::error_text_looks_auth_required)));
+                // The row's retry is only useful once the user has run the
+                // AWS login. Errors from paths other than `initialize` (child
+                // exit, EOF, tools/list) carry no hint, so name it here or
+                // the retry fails the same way and says nothing.
+                if aws_login
+                    && let Some(error) = snapshot.error.as_mut()
+                    && !error.contains("AWS credentials expired:")
+                {
+                    let hint = aws_login_hint(server, name, error);
+                    error.push_str("; ");
+                    error.push_str(&hint);
+                }
                 if let Some(conn) = pool.connections.get(name) {
                     snapshot.connected = conn.is_ready();
                     snapshot.capability_metadata = conn.server_capabilities.map_or(

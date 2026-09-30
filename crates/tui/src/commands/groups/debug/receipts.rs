@@ -1,17 +1,35 @@
-//! `/receipts`: what this session did, from the same builder as
-//! `codewhale receipts` and `GET /v1/threads/{id}/receipt`.
-//!
-//! It reads the session's transcript as it stands (the messages the next save
-//! writes) and the session's approval log. It does not read display cells, so
-//! the terminal and the saved record cannot tell two stories.
+//! Portable `/receipts` parsing and rendering. The host reads the authoritative
+//! session/approval records and projects their shared receipt shape.
 
-use crate::commands::CommandResult;
-use crate::receipts::{
-    ReceiptSource, SourceKind, render_json_block, render_markdown, session_receipt,
-};
-use crate::tui::app::App;
+use super::CommandResult;
+use crate::diagnostics_reports::receipts::{render_json_block, render_markdown};
+use codewhale_command_contract::facets::DebugReceiptError;
+use codewhale_command_contract::handler::{CommandCapabilities, CommandContexts, CommandHandler};
+use codewhale_command_contract::metadata::{CommandInfo, RegisterCommand};
 
-pub fn receipts(app: &mut App, arg: Option<&str>) -> CommandResult {
+pub(in crate::commands) struct ReceiptsCmd;
+impl RegisterCommand<CommandResult> for ReceiptsCmd {
+    fn info() -> &'static CommandInfo {
+        &CommandInfo {
+            name: "receipts",
+            aliases: &["receipt"],
+            usage: "/receipts [json] [<turn>]",
+            description_key: "cmd_receipts_description",
+        }
+    }
+    fn handler() -> CommandHandler<CommandResult> {
+        CommandHandler::Contextual {
+            capabilities: CommandCapabilities::DEBUG_RECEIPTS,
+            handler: receipts,
+        }
+    }
+}
+
+pub(super) fn receipts(contexts: CommandContexts<'_>, arg: Option<&str>) -> CommandResult {
+    let mut parts = contexts.into_parts();
+    let Some(receipts) = parts.debug_receipts.as_deref_mut() else {
+        return CommandResult::error("Command capability unavailable: debug_receipts");
+    };
     let mut json = false;
     let mut turn: Option<&str> = None;
     for word in arg.unwrap_or_default().split_whitespace() {
@@ -25,34 +43,12 @@ pub fn receipts(app: &mut App, arg: Option<&str>) -> CommandResult {
             }
         }
     }
-    let approvals = match app.current_session_id.as_deref() {
-        Some(id) => match crate::approval_log::ApprovalReceiptStore::default_location()
-            .and_then(|store| store.load(id))
-        {
-            Ok(receipts) => receipts,
-            Err(error) => {
-                return CommandResult::error(format!(
-                    "Could not read this session's approval log: {error}"
-                ));
-            }
-        },
-        None => Vec::new(),
-    };
-    let source = ReceiptSource {
-        kind: SourceKind::Session,
-        id: app
-            .current_session_id
-            .clone()
-            .unwrap_or_else(|| "unsaved".to_string()),
-        title: app.session_title.clone(),
-        workspace: Some(app.workspace.display().to_string()),
-        model: Some(app.model.clone()),
-        started_at: Some(app.session_started_at),
-        updated_at: None,
-    };
-    match session_receipt(source, &app.api_messages, &approvals, turn) {
+    match receipts.receipt(turn) {
         Ok(receipt) if json => CommandResult::message(render_json_block(&receipt)),
         Ok(receipt) => CommandResult::message(render_markdown(&receipt).trim_end().to_string()),
-        Err(error) => CommandResult::error(error.to_string()),
+        Err(DebugReceiptError::ApprovalLog(error)) => CommandResult::error(format!(
+            "Could not read this session's approval log: {error}"
+        )),
+        Err(DebugReceiptError::Build(error)) => CommandResult::error(error),
     }
 }

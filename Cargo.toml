@@ -27,6 +27,7 @@ members = [
     "crates/tui",
     "crates/workflow",
     "crates/workflow-js",
+    "tests/portable-debug-diagnostics",
 ]
 default-members = ["crates/cli"]
 resolver = "2"

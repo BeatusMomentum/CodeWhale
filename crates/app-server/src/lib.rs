@@ -1359,8 +1359,8 @@ async fn handle_stdio_thread_message<W: AsyncWrite + Unpin>(
     Ok(result)
 }
 
-/// Resuming or forking a thread the runtime reports as `missing` must fail
-/// with a named not-found error. Recording the null model/workspace of that
+/// Resuming, forking, archiving or unarchiving a thread the runtime reports
+/// as `missing` must fail with a named not-found error. Recording the null model/workspace of that
 /// response as a stdio hint would clobber any previously cached hint for
 /// the same thread id (#5171).
 fn ensure_thread_found(response: &ThreadResponse) -> std::result::Result<(), JsonRpcError> {
@@ -2316,6 +2316,7 @@ async fn dispatch_stdio_request_with_writer<W: AsyncWrite + Unpin>(
                 },
             )
             .await?;
+            ensure_thread_found(&response)?;
             StdioDispatchResult {
                 result: serde_json::to_value(response)
                     .map_err(|err| JsonRpcError::internal(err.to_string()))?,
@@ -2331,6 +2332,7 @@ async fn dispatch_stdio_request_with_writer<W: AsyncWrite + Unpin>(
                 },
             )
             .await?;
+            ensure_thread_found(&response)?;
             StdioDispatchResult {
                 result: serde_json::to_value(response)
                     .map_err(|err| JsonRpcError::internal(err.to_string()))?,
@@ -2480,6 +2482,11 @@ async fn process_app_request(
             if ok {
                 apply_config_update(state, snapshot, true).await;
             }
+            let value = if ok {
+                value
+            } else {
+                codewhale_config::persistence::redact_secrets(&value)
+            };
             AppResponse {
                 ok,
                 data: json!({ "key": key, "value": value, "error": message }),
@@ -2978,38 +2985,76 @@ mod tests {
         let config_path = tmp.path().join("config.toml");
         fs::write(&config_path, "model = \"deepseek-chat\"\n").expect("write config");
         let state = build_state(Some(config_path.clone()), None).expect("state");
-        *state.runtime_bridge.lock().await = Some(sentinel_bridge());
+        let bridge = sentinel_bridge();
+        *state.runtime_bridge.lock().await = Some(bridge.clone());
         state
             .runtime_thread_map
             .lock()
             .await
             .insert("stdio-1".to_string(), "runtime-1".to_string());
 
-        let response = process_app_request(
-            &state,
-            AppRequest::ConfigSet {
-                key: "telemetry".to_string(),
-                value: "not-a-bool".to_string(),
-            },
-            AppTransport::Stdio,
-        )
-        .await;
-        assert!(!response.ok, "invalid value must fail: {response:?}");
-
-        assert!(
-            state.runtime_bridge.lock().await.is_some(),
-            "bridge must survive a failed config/set",
-        );
-        assert_eq!(
-            state
-                .runtime_thread_map
-                .lock()
-                .await
-                .get("stdio-1")
-                .map(String::as_str),
-            Some("runtime-1"),
-            "the live thread map must be intact",
-        );
+        let disk_before = fs::read(&config_path).unwrap();
+        let config_before = serde_json::to_value(&*state.config.read().await).unwrap();
+        let runtime_before = serde_json::to_value(&state.runtime.read().await.config).unwrap();
+        let token = ["sk-live-", "Z7qX4mNb2Vc9Lk3PwR8t"].concat();
+        for (key, value) in [
+            ("telemetry", "not-a-bool"),
+            ("approval_policy", "ask"),
+            ("sandbox_mode", "full"),
+            ("verbosity", "quiet"),
+            ("approval_policy", token.as_str()),
+            ("sandbox_mode", token.as_str()),
+            ("verbosity", token.as_str()),
+        ] {
+            let response = process_app_request(
+                &state,
+                AppRequest::ConfigSet {
+                    key: key.into(),
+                    value: value.into(),
+                },
+                AppTransport::Stdio,
+            )
+            .await;
+            assert!(!response.ok, "invalid {key} must fail");
+            assert!(response.data["error"].is_string(), "refusal detail");
+            let rendered = serde_json::to_string(&response).unwrap();
+            assert!(
+                !rendered.contains(&token),
+                "credential must not enter diagnostics or the echoed value"
+            );
+            assert_eq!(
+                response.data["value"].as_str(),
+                Some(if value == token { "[redacted]" } else { value })
+            );
+            assert_eq!(fs::read(&config_path).unwrap(), disk_before);
+            assert_eq!(
+                serde_json::to_value(&*state.config.read().await).unwrap(),
+                config_before
+            );
+            assert_eq!(
+                serde_json::to_value(&state.runtime.read().await.config).unwrap(),
+                runtime_before
+            );
+            assert!(
+                state
+                    .runtime_bridge
+                    .lock()
+                    .await
+                    .as_ref()
+                    .is_some_and(|cached| Arc::ptr_eq(cached, &bridge)),
+                "the same bridge must survive a failed config/set",
+            );
+            assert_eq!(
+                state
+                    .runtime_thread_map
+                    .lock()
+                    .await
+                    .get("stdio-1")
+                    .map(String::as_str),
+                Some("runtime-1"),
+                "the live thread map must be intact",
+            );
+        }
     }
 
     #[tokio::test]
@@ -3033,6 +3078,7 @@ mod tests {
         )
         .await;
         assert!(response.ok, "valid set should succeed: {response:?}");
+        assert_eq!(response.data["value"], "deepseek-reasoner");
         assert!(
             state.runtime_bridge.lock().await.is_none(),
             "a successful config change must invalidate the cached bridge",
@@ -3492,6 +3538,26 @@ mod tests {
         let hint = hints.get("ghost-thread").expect("cached hint survives");
         assert_eq!(hint.model.as_deref(), Some("deepseek-v4-pro"));
         assert_eq!(hint.workspace.as_deref(), Some(workspace.as_path()));
+    }
+
+    #[tokio::test]
+    async fn stdio_archive_of_missing_thread_fails_instead_of_reporting_success() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config_path = tmp.path().join("config.toml");
+        fs::write(&config_path, "").expect("write config");
+        let state = build_state(Some(config_path), None).expect("state");
+        for method in ["thread/archive", "thread/unarchive"] {
+            let err =
+                dispatch_stdio_request(&state, method, json!({ "thread_id": "ghost-thread" }))
+                    .await
+                    .expect_err("an unknown thread id must fail");
+            assert_eq!(err.code, -32004, "{method}");
+            assert!(
+                err.message.contains("ghost-thread"),
+                "{method}: {}",
+                err.message
+            );
+        }
     }
 
     fn sse_frame(event: &str, payload: Value) -> String {

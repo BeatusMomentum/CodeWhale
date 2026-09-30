@@ -24,6 +24,11 @@ crates/tui/src/tui/goldens/*.txt text eol=lf
 # builds with LF, so a CRLF checkout failed the four Windows golden tests with a
 # pure \r\n diff (Windows CI caught this; Linux cannot see it).
 crates/tui/src/commands/fixtures/*.md text eol=lf
+# FEAT-029 debug diagnostics baselines (crates/tui/src/commands/fixtures/
+# diagnostics/*) are compared byte for byte against command output joined
+# with LF, so a CRLF checkout failed every Windows baseline parity test with a
+# pure \r\n diff.
+crates/tui/src/commands/fixtures/diagnostics/* text eol=lf
 crates/*/assets/**/*.json text eol=lf
 crates/*/assets/**/*.md text eol=lf
 crates/*/locales/*.json text eol=lf

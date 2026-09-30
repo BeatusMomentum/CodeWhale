@@ -360,7 +360,11 @@ pub fn classify_error_message(message: &str) -> ErrorCategory {
     }
     if lower.contains("rate limit")
         || lower.contains("too many requests")
-        || lower.contains("429")
+        // Status codes are standalone tokens, not digits inside a URL or ID.
+        || lower.split_whitespace().any(|part| {
+            part.trim_matches(['(', ')', '[', ']', '{', '}', ':', ';', ',', '.', '\'', '"'])
+                == "429"
+        })
         || lower.contains("quota")
         || lower.contains("usage limit")
         // Prepaid gateways answer an exhausted balance with HTTP 402; that is
@@ -614,6 +618,44 @@ mod tests {
             ),
             ErrorCategory::Authentication
         );
+    }
+
+    #[test]
+    fn standalone_rate_limit_status_beats_authentication() {
+        for msg in [
+            "429",
+            "HTTP 429: rejected",
+            "upstream response (429)",
+            "[429]: rejected",
+            "HTTP 429: Invalid API key",
+        ] {
+            assert_eq!(classify(msg), ErrorCategory::RateLimit, "{msg}");
+        }
+    }
+
+    #[test]
+    fn numbers_in_urls_and_identifiers_are_not_rate_limit_statuses() {
+        for location in [
+            "http://127.0.0.1:42981/v1/responses",
+            "http://127.0.0.1:14290/v1/responses",
+            "http://127.0.0.1:429/v1/responses",
+            "https://example.test/429",
+            "https://example.test/?request_id=429",
+            "/429",
+            "request_429",
+            "request-429",
+            "14290",
+        ] {
+            let msg = format!(
+                "Responses API error (HTTP 401 Unauthorized) at {location}: Invalid API key"
+            );
+            assert_eq!(classify(&msg), ErrorCategory::Authentication, "{msg}");
+        }
+        assert_eq!(
+            classify("Network request failed for https://example.test/429"),
+            ErrorCategory::Network
+        );
+        assert_eq!(classify("request_429 failed"), ErrorCategory::Internal);
     }
 
     #[test]

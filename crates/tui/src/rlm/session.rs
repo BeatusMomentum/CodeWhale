@@ -370,6 +370,7 @@ fn compact_content_block(block: &ContentBlock) -> Value {
             content,
             is_error,
             content_blocks,
+            ..
         } => {
             let chars = content.chars().count();
             let large = chars > 2_000;
@@ -525,6 +526,7 @@ mod tests {
             vec![Message {
                 role: Role::User,
                 content: vec![ContentBlock::ToolResult {
+                    execution_id: None,
                     tool_use_id: "call_1".to_string(),
                     content: large.clone(),
                     is_error: None,

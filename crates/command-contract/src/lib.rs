@@ -9,6 +9,7 @@
 pub mod facets;
 pub mod handler;
 pub mod metadata;
+pub mod outcome;
 pub mod types;
 
 pub use facets::*;

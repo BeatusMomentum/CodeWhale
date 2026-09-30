@@ -58,7 +58,7 @@ use crate::tools::todo::new_shared_todo_list;
 use codewhale_config::AppMode;
 use codewhale_execpolicy::ApprovalMode;
 use codewhale_models::Role;
-use codewhale_models::{ContentBlock, Message, SystemPrompt, Usage};
+use codewhale_models::{ContentBlock, Message, SystemPrompt, ToolCallKey, ToolCaller, Usage};
 use codewhale_protocol::agent_mail::{
     AGENT_MAIL_EVENT_CANCELED, AGENT_MAIL_EVENT_DELIVERED, AGENT_MAIL_EVENT_DELIVERING,
     AGENT_MAIL_EVENT_DELIVERY_FAILED, AGENT_MAIL_EVENT_QUEUED, AGENT_MAIL_EVENT_READ,
@@ -1049,9 +1049,19 @@ fn session_recovery_projection(messages: &[Message]) -> Vec<Value> {
                     projection.push(json!(["thinking", thinking]))
                 }
                 ContentBlock::ToolUse {
-                    id, name, input, ..
+                    id,
+                    name,
+                    input,
+                    execution_id,
+                    ..
+                } if role == "assistant" => {
+                    let mut row = json!(["tool_use", id, name, input]);
+                    if let Some(id) = execution_id {
+                        row.as_array_mut().expect("projection row").push(json!(id));
+                    }
+                    projection.push(row);
                 }
-                | ContentBlock::ServerToolUse {
+                ContentBlock::ServerToolUse {
                     id, name, input, ..
                 } if role == "assistant" => projection.push(json!(["tool_use", id, name, input])),
                 ContentBlock::ToolResult {
@@ -1059,13 +1069,20 @@ fn session_recovery_projection(messages: &[Message]) -> Vec<Value> {
                     content,
                     is_error,
                     content_blocks,
-                } if role == "user" => projection.push(json!([
-                    "tool_result",
-                    tool_use_id,
-                    content,
-                    is_error.unwrap_or(false),
-                    content_blocks
-                ])),
+                    execution_id,
+                } if role == "user" => {
+                    let mut row = json!([
+                        "tool_result",
+                        tool_use_id,
+                        content,
+                        is_error.unwrap_or(false),
+                        content_blocks
+                    ]);
+                    if let Some(id) = execution_id {
+                        row.as_array_mut().expect("projection row").push(json!(id));
+                    }
+                    projection.push(row);
+                }
                 _ => {}
             }
         }
@@ -1109,6 +1126,124 @@ fn saved_transcript_is_compacted(
     })
 }
 
+/// Stored item correlation is a projection of the existing history identity.
+/// Explicit executions never fall back to legacy provider ids. New non-model
+/// events carry an execution id but no provider id and do not enter history.
+#[derive(Clone, Copy)]
+struct RuntimeToolIdentity<'a> {
+    execution_id: Option<&'a str>,
+    provider_id: &'a str,
+}
+
+impl<'a> RuntimeToolIdentity<'a> {
+    fn read(metadata: Option<&'a Value>, side: &str) -> Result<Option<Self>> {
+        let Some(meta) = metadata else {
+            return Ok(None);
+        };
+        let Some(local) = meta.get(side) else {
+            return Ok(None);
+        };
+        let local = local.as_str().context("Invalid stored tool correlation")?;
+        let Some(execution) = meta.get("execution_id") else {
+            return Ok((!local.is_empty()).then_some(Self {
+                execution_id: None,
+                provider_id: local,
+            }));
+        };
+        let execution = execution
+            .as_str()
+            .filter(|id| !id.is_empty())
+            .context("Invalid stored tool execution identity")?;
+        anyhow::ensure!(
+            local == execution,
+            "Stored tool execution identity mismatch"
+        );
+        let Some(provider) = meta.get("provider_tool_use_id") else {
+            return Ok(None);
+        };
+        let provider = provider
+            .as_str()
+            .filter(|id| !id.is_empty())
+            .context("Invalid stored provider tool identity")?;
+        Ok(Some(Self {
+            execution_id: Some(execution),
+            provider_id: provider,
+        }))
+    }
+
+    fn key(self) -> (ToolCallKey<'a>, &'a str) {
+        (
+            self.execution_id.map_or(
+                ToolCallKey::LegacyProvider(self.provider_id),
+                ToolCallKey::Execution,
+            ),
+            self.provider_id,
+        )
+    }
+}
+
+/// A persisted execution cannot acquire a different provider pairing on a
+/// later result, turn, or import block. This is a transient validation index,
+/// never a grant or another history store; legacy wire-only keys stay unchanged.
+fn check_execution_provider(
+    bindings: &mut HashMap<String, String>,
+    execution: Option<&str>,
+    provider: &str,
+) -> Result<()> {
+    if let Some(execution) = execution {
+        anyhow::ensure!(
+            !execution.is_empty() && !provider.is_empty(),
+            "Invalid stored tool execution identity"
+        );
+        if let Some(previous) = bindings.get(execution) {
+            anyhow::ensure!(
+                previous == provider,
+                "Stored tool execution has inconsistent provider identity"
+            );
+        } else {
+            bindings.insert(execution.to_string(), provider.to_string());
+        }
+    }
+    Ok(())
+}
+
+/// Only the admitted start supplies correlation, even when an optional value
+/// was absent. Tool output cannot manufacture those missing fields.
+fn retain_started_tool_metadata(
+    output: &mut serde_json::Map<String, Value>,
+    started: Option<&Value>,
+) {
+    for key in [
+        "tool_use_id",
+        "tool_name",
+        "tool_input",
+        "visibility",
+        "execution_id",
+        "provider_tool_use_id",
+        "tool_caller",
+        "tool_thought_signature",
+    ] {
+        output.remove(key);
+        if let Some(value) = started.and_then(|meta| meta.get(key)) {
+            output.insert(key.to_string(), value.clone());
+        }
+    }
+}
+
+/// Legacy item reconstruction covered generic tool rows only. New model
+/// correlation survives the UI's shell/file classification as well; a local
+/// non-model record is still excluded by RuntimeToolIdentity::read.
+fn projects_tool_history(item: &TurnItemRecord) -> bool {
+    item.kind == TurnItemKind::ToolCall
+        || (matches!(
+            item.kind,
+            TurnItemKind::FileChange | TurnItemKind::CommandExecution
+        ) && item
+            .metadata
+            .as_ref()
+            .is_some_and(|meta| meta.get("execution_id").is_some()))
+}
+
 /// The result a rebuilt history must give a tool call whose outcome the turn
 /// store never recorded, or `None` when nothing is missing.
 ///
@@ -1136,11 +1271,14 @@ fn saved_transcript_is_compacted(
 /// coming — so this answers only the terminal failures.
 fn unanswered_call_result(
     item: &TurnItemRecord,
-    call_id: &str,
+    identity: RuntimeToolIdentity<'_>,
     call_name: &str,
-    recorded_results: &HashSet<String>,
+    recorded_results: &HashSet<(ToolCallKey<'_>, &str)>,
 ) -> Option<String> {
-    if call_id.is_empty() || call_name.is_empty() || recorded_results.contains(call_id) {
+    if identity.provider_id.is_empty()
+        || call_name.is_empty()
+        || recorded_results.contains(&identity.key())
+    {
         return None;
     }
     match item.status {
@@ -6076,11 +6214,15 @@ enum SeedItem {
     Thinking(String),
     ToolUse {
         id: String,
+        execution_id: Option<String>,
         name: String,
         input: serde_json::Value,
+        caller: Option<ToolCaller>,
+        thought_signature: Option<String>,
     },
     ToolResult {
         tool_use_id: String,
+        execution_id: Option<String>,
         content: String,
         is_error: bool,
         content_blocks: Option<Vec<serde_json::Value>>,
@@ -10972,12 +11114,14 @@ impl RuntimeThreadManager {
                             }
                             ContentBlock::ToolResult {
                                 tool_use_id,
+                                execution_id,
                                 content,
                                 is_error,
                                 content_blocks,
                             } => {
                                 tool_results.push(SeedItem::ToolResult {
                                     tool_use_id: tool_use_id.clone(),
+                                    execution_id: execution_id.clone(),
                                     content: content.clone(),
                                     is_error: is_error.unwrap_or(false),
                                     content_blocks: content_blocks.clone(),
@@ -11037,12 +11181,20 @@ impl RuntimeThreadManager {
                                 turn.items.push(SeedItem::Thinking(thinking.clone()));
                             }
                             ContentBlock::ToolUse {
-                                id, name, input, ..
+                                id,
+                                execution_id,
+                                name,
+                                input,
+                                caller,
+                                thought_signature,
                             } => {
                                 turn.items.push(SeedItem::ToolUse {
                                     id: id.clone(),
+                                    execution_id: execution_id.clone(),
                                     name: name.clone(),
                                     input: input.clone(),
+                                    caller: caller.clone(),
+                                    thought_signature: thought_signature.clone(),
                                 });
                             }
                             ContentBlock::ServerToolUse {
@@ -11050,8 +11202,11 @@ impl RuntimeThreadManager {
                             } => {
                                 turn.items.push(SeedItem::ToolUse {
                                     id: id.clone(),
+                                    execution_id: None,
                                     name: name.clone(),
                                     input: input.clone(),
+                                    caller: None,
+                                    thought_signature: None,
                                 });
                             }
                             // Skip other block types (image_url, etc.)
@@ -11070,9 +11225,29 @@ impl RuntimeThreadManager {
 
         // Validate the entire import before the first durable write. Saved local
         // images keep their 5 MiB ceiling; no path or remote URL is dereferenced.
+        let mut execution_providers = HashMap::new();
         for turn_seed in &turns {
             if !turn_seed.image_content.is_empty() {
                 crate::image_attach::validate_stored_image_content(&turn_seed.image_content)?;
+            }
+            for item in &turn_seed.items {
+                if let SeedItem::ToolUse {
+                    execution_id,
+                    id: provider,
+                    ..
+                }
+                | SeedItem::ToolResult {
+                    execution_id,
+                    tool_use_id: provider,
+                    ..
+                } = item
+                {
+                    check_execution_provider(
+                        &mut execution_providers,
+                        execution_id.as_deref(),
+                        provider,
+                    )?;
+                }
             }
         }
 
@@ -11158,8 +11333,11 @@ impl RuntimeThreadManager {
                     }
                     SeedItem::ToolUse {
                         id: tool_id,
+                        execution_id,
                         name,
                         input,
+                        caller,
+                        thought_signature,
                     } => {
                         let input_str =
                             serde_json::to_string(input).unwrap_or_else(|_| input.to_string());
@@ -11179,15 +11357,23 @@ impl RuntimeThreadManager {
                             status: TurnItemLifecycleStatus::Completed,
                             summary: tool_summary,
                             detail: Some(input_str),
-                            metadata: Some(serde_json::Value::Object(
-                                serde_json::json!({
-                                    "tool_use_id": tool_id,
+                            metadata: Some({
+                                let mut meta = json!({
+                                    "tool_use_id": execution_id.as_ref().unwrap_or(tool_id),
                                     "tool_name": name,
-                                })
-                                .as_object()
-                                .unwrap()
-                                .clone(),
-                            )),
+                                });
+                                if let Some(id) = execution_id {
+                                    meta["execution_id"] = json!(id);
+                                    meta["provider_tool_use_id"] = json!(tool_id);
+                                }
+                                if let Some(caller) = caller {
+                                    meta["tool_caller"] = json!(caller);
+                                }
+                                if let Some(signature) = thought_signature {
+                                    meta["tool_thought_signature"] = json!(signature);
+                                }
+                                meta
+                            }),
                             artifact_refs: Vec::new(),
                             artifacts: Vec::new(),
                             started_at: Some(item_at),
@@ -11196,6 +11382,7 @@ impl RuntimeThreadManager {
                     }
                     SeedItem::ToolResult {
                         tool_use_id,
+                        execution_id,
                         content,
                         is_error,
                         content_blocks,
@@ -11206,7 +11393,14 @@ impl RuntimeThreadManager {
                             content.clone()
                         };
                         let mut metadata = serde_json::Map::new();
-                        metadata.insert("tool_result_for".to_string(), json!(tool_use_id));
+                        metadata.insert(
+                            "tool_result_for".to_string(),
+                            json!(execution_id.as_ref().unwrap_or(tool_use_id)),
+                        );
+                        if let Some(id) = execution_id {
+                            metadata.insert("execution_id".to_string(), json!(id));
+                            metadata.insert("provider_tool_use_id".to_string(), json!(tool_use_id));
+                        }
                         metadata.insert("is_error".to_string(), json!(is_error));
                         if let Some(blocks) = content_blocks {
                             metadata
@@ -13863,11 +14057,12 @@ impl RuntimeThreadManager {
         Self::reconstruct_messages_from_turns_with(turns, &items_by_turn)
     }
 
-    fn reconstruct_messages_from_turns_with(
+    pub(crate) fn reconstruct_messages_from_turns_with(
         turns: &[TurnRecord],
         items_by_turn: &HashMap<String, Vec<TurnItemRecord>>,
     ) -> Result<Vec<Message>> {
         let mut messages = Vec::new();
+        let mut execution_providers = HashMap::new();
         for turn in turns {
             let stored_items = items_by_turn.get(&turn.id).cloned().unwrap_or_default();
             let items = if turn.item_ids.is_empty() {
@@ -13892,24 +14087,30 @@ impl RuntimeThreadManager {
                 ordered
             };
 
-            // The calls this turn already answers with a result item of their
-            // own. Only a `tool_call` item is rebuilt into a result — a
-            // `file_change` item records its own call and result, and the
-            // rebuild reads neither — so this set names exactly the answers a
-            // rebuild will emit, and a call in it must not be answered twice.
-            // A call item may carry its result (the completed live shape) or a
-            // sibling `tool_result_for` item may (seeded history, and the
-            // repair's own notice); both are `tool_call` items.
-            let recorded_results: HashSet<String> = items
+            for item in items.iter().filter(|item| projects_tool_history(item)) {
+                for side in ["tool_use_id", "tool_result_for"] {
+                    if let Some(identity) = RuntimeToolIdentity::read(item.metadata.as_ref(), side)?
+                    {
+                        check_execution_provider(
+                            &mut execution_providers,
+                            identity.execution_id,
+                            identity.provider_id,
+                        )?;
+                    }
+                }
+            }
+
+            // Only results this same projection will emit can settle a call.
+            // New execution and legacy provider key domains remain disjoint;
+            // provider identity must also agree with an explicit execution.
+            let recorded_results: HashSet<_> = items
                 .iter()
-                .filter(|item| item.kind == TurnItemKind::ToolCall)
-                .filter_map(|item| {
-                    item.metadata
-                        .as_ref()?
-                        .get("tool_result_for")?
-                        .as_str()
-                        .map(str::to_string)
-                })
+                .filter(|item| projects_tool_history(item))
+                .map(|item| RuntimeToolIdentity::read(item.metadata.as_ref(), "tool_result_for"))
+                .collect::<Result<Vec<_>>>()?
+                .into_iter()
+                .flatten()
+                .map(RuntimeToolIdentity::key)
                 .collect();
 
             let mut assistant_blocks: Vec<ContentBlock> = Vec::new();
@@ -13930,7 +14131,7 @@ impl RuntimeThreadManager {
                     });
                 }
             };
-            for item in items {
+            for item in &items {
                 match item.kind {
                     TurnItemKind::UserMessage => {
                         // A steer the engine never committed is recorded
@@ -13949,7 +14150,7 @@ impl RuntimeThreadManager {
                     }
                     TurnItemKind::AgentMessage => {
                         flush_user(&mut user_blocks, &mut messages);
-                        let text = item.detail.unwrap_or(item.summary);
+                        let text = item.detail.clone().unwrap_or_else(|| item.summary.clone());
                         if !text.trim().is_empty() {
                             assistant_blocks.push(ContentBlock::Text {
                                 text,
@@ -13959,7 +14160,7 @@ impl RuntimeThreadManager {
                     }
                     TurnItemKind::AgentReasoning => {
                         flush_user(&mut user_blocks, &mut messages);
-                        let thinking = item.detail.unwrap_or(item.summary);
+                        let thinking = item.detail.clone().unwrap_or_else(|| item.summary.clone());
                         if !thinking.trim().is_empty() {
                             assistant_blocks.push(ContentBlock::Thinking {
                                 thinking,
@@ -13968,7 +14169,7 @@ impl RuntimeThreadManager {
                             });
                         }
                     }
-                    TurnItemKind::ToolCall => {
+                    _ if projects_tool_history(item) => {
                         let meta = item.metadata.as_ref();
                         let meta_str = |key: &str| {
                             meta.and_then(|m| m.get(key))
@@ -13976,20 +14177,17 @@ impl RuntimeThreadManager {
                                 .unwrap_or_default()
                                 .to_string()
                         };
-                        let tool_use_id = meta_str("tool_use_id");
+                        let call = RuntimeToolIdentity::read(meta, "tool_use_id")?;
+                        let result = RuntimeToolIdentity::read(meta, "tool_result_for")?;
                         let tool_name = meta_str("tool_name");
-                        let tool_result_for = meta_str("tool_result_for");
                         // A call whose own outcome the store never recorded is
                         // answered with the outcome it does hold, decided while
                         // the id is still borrowed — see
                         // `unanswered_call_result`.
-                        let unanswered = unanswered_call_result(
-                            &item,
-                            &tool_use_id,
-                            &tool_name,
-                            &recorded_results,
-                        )
-                        .map(|content| (tool_use_id.clone(), content));
+                        let unanswered = call.and_then(|identity| {
+                            unanswered_call_result(item, identity, &tool_name, &recorded_results)
+                                .map(|content| (identity, content))
+                        });
                         // Completed live turns persist the call and its result
                         // on one item; seeded history persists them as two.
                         // Both shapes must rebuild the paired tool_call /
@@ -13997,7 +14195,7 @@ impl RuntimeThreadManager {
                         // was durable carry neither side: skip them rather than
                         // replay an empty tool_call shell that strict
                         // OpenAI-compatible endpoints reject (#5823).
-                        if !tool_use_id.is_empty() && !tool_name.is_empty() {
+                        if let Some(identity) = call.filter(|_| !tool_name.is_empty()) {
                             flush_user(&mut user_blocks, &mut messages);
                             let input_str = meta
                                 .and_then(|m| m.get("tool_input"))
@@ -14008,16 +14206,29 @@ impl RuntimeThreadManager {
                             let input: serde_json::Value =
                                 serde_json::from_str(&input_str).unwrap_or(serde_json::Value::Null);
                             assistant_blocks.push(ContentBlock::ToolUse {
-                                id: tool_use_id,
+                                execution_id: identity.execution_id.map(str::to_string),
+                                id: identity.provider_id.to_string(),
                                 name: tool_name,
                                 input,
-                                caller: None,
-                                thought_signature: None,
+                                caller: meta
+                                    .and_then(|m| m.get("tool_caller"))
+                                    .map(|value| serde_json::from_value(value.clone()))
+                                    .transpose()
+                                    .context("Invalid stored tool caller")?,
+                                thought_signature: meta
+                                    .and_then(|m| m.get("tool_thought_signature"))
+                                    .map(|value| {
+                                        value
+                                            .as_str()
+                                            .map(str::to_string)
+                                            .context("Invalid stored tool thought signature")
+                                    })
+                                    .transpose()?,
                             });
                         }
-                        if !tool_result_for.is_empty() {
+                        if let Some(identity) = result {
                             flush_assistant(&mut assistant_blocks, &mut messages);
-                            let content = item.detail.unwrap_or_default();
+                            let content = item.detail.clone().unwrap_or_default();
                             let is_error = meta
                                 .and_then(|m| m.get("is_error"))
                                 .and_then(Value::as_bool)
@@ -14027,18 +14238,20 @@ impl RuntimeThreadManager {
                                 .and_then(Value::as_array)
                                 .cloned();
                             user_blocks.push(ContentBlock::ToolResult {
-                                tool_use_id: tool_result_for,
+                                execution_id: identity.execution_id.map(str::to_string),
+                                tool_use_id: identity.provider_id.to_string(),
                                 content,
                                 is_error: if is_error { Some(true) } else { None },
                                 content_blocks,
                             });
-                        } else if let Some((call_id, content)) = unanswered {
+                        } else if let Some((identity, content)) = unanswered {
                             // The call above had no recorded outcome: pair it
                             // here, in the position the live transcript held
                             // its result, so the rebuilt turn is complete.
                             flush_assistant(&mut assistant_blocks, &mut messages);
                             user_blocks.push(ContentBlock::ToolResult {
-                                tool_use_id: call_id,
+                                execution_id: identity.execution_id.map(str::to_string),
+                                tool_use_id: identity.provider_id.to_string(),
                                 content,
                                 is_error: Some(true),
                                 content_blocks: None,
@@ -14507,7 +14720,12 @@ impl RuntimeThreadManager {
                         .await?;
                     }
                 }
-                EngineEvent::ToolCallStarted { id, name, input } => {
+                EngineEvent::ToolCallStarted {
+                    id,
+                    name,
+                    input,
+                    model_call,
+                } => {
                     let item_id = runtime_record_id("item");
                     tool_items.insert(id.clone(), item_id.clone());
                     let kind = tool_kind_for_name(&name);
@@ -14531,7 +14749,17 @@ impl RuntimeThreadManager {
                                 "tool_use_id": id.clone(),
                                 "tool_name": name.clone(),
                                 "tool_input": input_str,
+                                "execution_id": id.clone(),
                             });
+                            if let Some(model_call) = model_call {
+                                meta["provider_tool_use_id"] = json!(model_call.provider_id);
+                                if let Some(caller) = model_call.caller {
+                                    meta["tool_caller"] = json!(caller);
+                                }
+                                if let Some(signature) = model_call.thought_signature {
+                                    meta["tool_thought_signature"] = json!(signature);
+                                }
+                            }
                             // Tool discovery is engine plumbing, not work the
                             // user asked for: clients collapse it by default.
                             if crate::core::engine::tool_catalog::is_tool_search_tool(&name) {
@@ -14555,7 +14783,9 @@ impl RuntimeThreadManager {
                     )
                     .await?;
                 }
-                EngineEvent::ToolCallComplete { id, name, result } => {
+                EngineEvent::ToolCallComplete {
+                    id, name, result, ..
+                } => {
                     if let Some(hooks) = thread_hooks.as_deref() {
                         fire_runtime_tool_completion_hooks(hooks, &thread_id, &id, &name, &result);
                     }
@@ -14671,20 +14901,7 @@ impl RuntimeThreadManager {
                                         _ => json!({}),
                                     };
                                     if let Some(obj) = meta.as_object_mut() {
-                                        if let Some(started) =
-                                            item.metadata.as_ref().and_then(Value::as_object)
-                                        {
-                                            for key in [
-                                                "tool_use_id",
-                                                "tool_name",
-                                                "tool_input",
-                                                "visibility",
-                                            ] {
-                                                if let Some(value) = started.get(key) {
-                                                    obj.insert(key.to_string(), value.clone());
-                                                }
-                                            }
-                                        }
+                                        retain_started_tool_metadata(obj, item.metadata.as_ref());
                                         // A first call to a deferred tool only
                                         // loads its schema; the model retries.
                                         // That hand-off is not a user-facing step.
@@ -14698,6 +14915,12 @@ impl RuntimeThreadManager {
                                         }
                                         obj.insert("tool_result_for".to_string(), json!(id));
                                         obj.insert("is_error".to_string(), json!(!output.success));
+                                        // The shell execution receipt (#6689) is
+                                        // for completion hooks, which already
+                                        // read it from the live result; it
+                                        // repeats output previews `detail`
+                                        // holds, so it is never persisted.
+                                        obj.remove("execution_receipt");
                                     }
                                     // Failed calls count too: a large error
                                     // output spills like any other.

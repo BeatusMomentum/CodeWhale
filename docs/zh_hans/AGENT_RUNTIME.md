@@ -77,7 +77,7 @@ Workflow IR 另有默认五层嵌套节点的结构验证限制。该限制约�
 
 fleet 账本持久化的是 worker 自身的事件流，而不是另一套模拟的分类法。`codewhale exec --output-format stream-json` 会发出 `{"type": "content" | "tool_use" | "tool_result" | "sandbox_denied" | "workflow_event" | "session_capture" | "turn_usage" | "metadata" | "done" | "error"}` 行，它们映射到 fleet 账本的 `FleetWorkerEventPayload`（`RunningTool`、`WorkflowEvent`、`Running`、`Completed`、`Failed` 等）。`workflow_event` 在 Workflow 飞行期间携带类型化的 run/phase/task/gate 回执，并作为类型化的 `WorkflowEvent` 保留在 Fleet 账本中；外层 worker 仍然拥有终态 `done` 或 `error`。一套词汇，两个表面。
 
-`session_capture` 在 exec 运行把自己的对话记录持久化为已保存会话时发出一次，并且只在这一个地方携带可恢复的 id：
+`session_capture` 在 exec 运行把自己的转录持久化为已保存会话时发出一次，并且只在这一个地方携带可恢复的 id：
 
 ```json
 {"type": "session_capture", "schema": "codewhale.exec-stream", "schema_version": 1,
@@ -147,7 +147,7 @@ CodeWhale 应该在**形态**上与 Claude Code 收敛，而不是在品牌上�
 - `CODEWHALE_HOME` 设置为全新的每运行目录；
 - `CODEWHALE_SECRET_BACKEND=file`;`
 - `CODEWHALE_MCP_CONFIG` 指向一个生成的每运行 MCP JSON 文件，其中只包含 harness 提供的任务服务器（`{"mcpServers":{"task-tools":{"url":""}}}`；`mcpServers` 别名和基于 URL 的 Streamable HTTP / SSE 传输已经存在）；
-- `CODEWHALE_MEMORY=false` 和 `CODEWHALE_TELEMETRY=false`。当前 0.9.12 源码默认开启匿名用量计数并提供退出。每个封闭的 harness 必须显式设置运行级 kill 开关，避免从新建或复用的 home 采集和发送统计；普通已启用会话可能把聚合计数发送到第一方端点（`https://telemetry.codewhale.net/v1/telemetry`），而不是本地文件。这是一个硬底线——环境中显式的 "off" 胜过 `--telemetry true` 和配置里的 `telemetry = true`。如果 harness 想让已启用的 home 继续本地缓冲而不联系任何东西，则改为设置 `CODEWHALE_TELEMETRY_ENDPOINT=`（空）。参见 [`docs/TELEMETRY.md`](../TELEMETRY.md)；
+- `CODEWHALE_MEMORY=false` 和 `CODEWHALE_TELEMETRY=false`。当前 0.9.12 源码默认开启匿名用量计数并提供退出。每个封闭的 harness 必须显式设置运行级 kill 开关，避免从新建或复用的 home 采集和发送统计；普通已启用会话可能把聚合计数发送到第一方端点（`https://telemetry.codewhale.net/v1/telemetry`），而不是本地文件。这是一个硬底线——环境中显式的 "off" 胜过 `--telemetry true` 和配置里的 `telemetry = true`。如果 harness 想让已启用的 home 继续本地缓冲而不联系任何东西，则改为设置 `CODEWHALE_TELEMETRY_ENDPOINT=`（空）。参见 [`docs/TELEMETRY.md`](./TELEMETRY.md)；
 - `CODEWHALE_ALLOW_INSECURE_HTTP=1` **仅当** harness 提供受信任的 `http://` 拦截端点时设置（容器/隧道端点不总是回环）；
 - 当调用者提供 `--append-system-prompt` 和 `--disallowed-tools` 时使用它们。
 

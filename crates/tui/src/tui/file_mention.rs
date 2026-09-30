@@ -103,6 +103,26 @@ pub fn partial_file_mention_at_cursor(input: &str, cursor_chars: usize) -> Optio
     Some((byte_start, partial))
 }
 
+/// The mention body for `path`: bare when [`extract_file_mentions`] reads
+/// it back unchanged, otherwise wrapped in the quoted form it also parses
+/// (`@"My Docs/notes.md"`). A bare path with a space would split into a
+/// missing-file mention for its first word.
+pub(crate) fn file_mention_body(path: &str) -> String {
+    let bare_round_trips = !path.is_empty()
+        && !path.chars().any(char::is_whitespace)
+        && !path.starts_with(['"', '\''])
+        && trim_unquoted_mention(path) == path;
+    if bare_round_trips {
+        path.to_string()
+    } else if !path.contains('"') {
+        format!("\"{path}\"")
+    } else if !path.contains('\'') {
+        format!("'{path}'")
+    } else {
+        path.to_string()
+    }
+}
+
 /// Cwd-aware completion entry point. Shares its walker with the future
 /// Ctrl+P fuzzy picker (#97); see [`Workspace::completions`] for the
 /// ranking + display rules.
@@ -306,7 +326,7 @@ pub fn apply_mention_menu_selection(app: &mut App, entries: &[String]) -> bool {
     // #441: bump this path's frecency before we splice it in. The store
     // persists asynchronously, so this never blocks input handling.
     super::file_frecency::record_mention(replacement);
-    replace_file_mention(app, byte_start, &partial, replacement);
+    replace_file_mention(app, byte_start, &partial, &file_mention_body(replacement));
     app.mention_menu_hidden = false;
     app.status_message = Some(format!("Attached @{replacement}"));
     true
@@ -337,12 +357,24 @@ pub fn try_autocomplete_file_mention(app: &mut App) -> bool {
     if candidates.len() == 1 {
         // #441: a unique-match completion is also a "mention" for ranking.
         super::file_frecency::record_mention(&candidates[0]);
-        replace_file_mention(app, byte_start, &partial, &candidates[0]);
+        replace_file_mention(
+            app,
+            byte_start,
+            &partial,
+            &file_mention_body(&candidates[0]),
+        );
         app.status_message = Some(format!("Attached @{}", candidates[0]));
         return true;
     }
     let candidate_refs: Vec<&str> = candidates.iter().map(String::as_str).collect();
+    // Extend only up to the first whitespace: the partial token ends there,
+    // so `@My Do` would leave a missing `@My` mention and a dead next Tab.
+    // Paths with spaces are completed whole (and quoted) by the unique-match
+    // branch or the mention menu.
     let shared = longest_common_prefix(&candidate_refs);
+    let shared = shared
+        .find(char::is_whitespace)
+        .map_or(shared, |idx| &shared[..idx]);
     if shared.len() > partial.len() {
         replace_file_mention(app, byte_start, &partial, shared);
         app.status_message = Some(format!("@{shared}…"));
@@ -749,8 +781,8 @@ fn is_screencapture_temp_path(path: &Path) -> bool {
             .any(|c| c.contains(SCREENCAPTURE_TEMP_DIR_MARKERS[1]))
 }
 
-/// The `[Attached …]` parser splits at " at ", so a stable copy must not
-/// reintroduce that separator in its name.
+/// Keep " at " out of a stable copy's name: `[Attached …: <desc> at <path>]`
+/// uses it as the separator, and older parsers split at its last occurrence.
 fn stable_attachment_name(file_name: &std::ffi::OsStr) -> String {
     file_name.to_string_lossy().replace(" at ", "-")
 }
@@ -1457,6 +1489,25 @@ fn is_media_path(path: &Path) -> bool {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn inserted_mention_bodies_parse_back_to_the_whole_path() {
+        for path in [
+            "src/main.rs",
+            "My Docs/notes.md",
+            "Screenshot 2026-09-28 at 10.00.00.png",
+            "notes)",
+            "say \"hi\" now.md",
+        ] {
+            let input = format!("look at @{} please", file_mention_body(path));
+            assert_eq!(
+                extract_file_mentions(&input),
+                vec![path.to_string()],
+                "{input}"
+            );
+        }
+        assert_eq!(file_mention_body("src/main.rs"), "src/main.rs");
+    }
 
     /// #101 regression — workspace-vs-cwd divergence: `@bar.txt` typed from
     /// the cwd `<root>/sub` MUST resolve to `<root>/sub/bar.txt`, never to

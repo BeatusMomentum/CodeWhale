@@ -1,4 +1,4 @@
-import { pickText } from "@/lib/i18n/dictionaries";
+import { getConstitution, pickText } from "@/lib/i18n/dictionaries";
 import { Icon } from "./icon";
 /**
  * "See how it decides" — a terminal-styled pane that illustrates how the
@@ -66,10 +66,8 @@ export const SCENES: Scene[] = [
   },
 ];
 
-/** The label every scene carries (see the note at the top of this file). */
-const ILLUSTRATION = { en: "Illustration", zh: "示意" };
-
 export function ThinkingTrace({ locale = "en" }: { locale?: string }) {
+  const t = getConstitution(locale);
   return (
     <div className="grid-3">
       {SCENES.map((s, i) => (
@@ -77,7 +75,7 @@ export function ThinkingTrace({ locale = "en" }: { locale?: string }) {
           <figcaption className="trace-head">
             <span className="status status-accent">
               <span className="status-dot" aria-hidden="true" />
-              {pickText(ILLUSTRATION, locale)}
+              {t.illustration}
             </span>
             <span className="trace-context">{pickText(s.context, locale)}</span>
           </figcaption>

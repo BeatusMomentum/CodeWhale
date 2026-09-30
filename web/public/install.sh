@@ -328,17 +328,78 @@ say "  $install_dir/codew"
 say ""
 say "Use this installation: \"$install_dir/codewhale\""
 say "Future updates: \"$install_dir/codewhale\" update"
+path_selected=1
 for command_name in codewhale codew; do
   resolved="$(command -v "$command_name" 2>/dev/null || true)"
   if [ "$resolved" != "$install_dir/$command_name" ]; then
     say "PATH selects ${resolved:-no $command_name command}; this install is $install_dir/$command_name"
+    path_selected=0
   fi
 done
-say "To use this directory in the current shell, then verify the commands:"
-say "  export PATH=\"$install_dir:\$PATH\""
-say "  hash -r"
-say "  command -v codewhale codew"
-say "Keep the directory first in your shell profile after verifying it."
+if [ "$path_selected" -eq 0 ]; then
+  # Print the persistent line for the user's login shell. The installer never
+  # edits shell profiles itself; the user runs the line once.
+  path_dir="$install_dir"
+  if [ -n "${HOME:-}" ] && [ "$install_dir" = "$(cd -P "$HOME/.local/bin" 2>/dev/null && pwd)" ]; then
+    path_dir="\$HOME/.local/bin"
+  fi
+  shell_name="${SHELL:-}"
+  shell_name="${shell_name##*/}"
+  say ""
+  case "$path_dir" in
+    *[\'\"\`\\\$]*|*"
+"*)
+      # Only the literal $HOME form may carry a shell-special character. Any
+      # other one would break the printed quoting, or run as a command on
+      # every shell start once the line is in a profile.
+      if [ "$path_dir" != "\$HOME/.local/bin" ]; then
+        shell_name="unsafe-path"
+      fi
+      ;;
+  esac
+  case "$shell_name" in
+    fish)
+      say "Put $install_dir first on PATH in future shells (run once; this installer does not edit shell profiles):"
+      say "  fish_add_path \"$path_dir\""
+      say "It takes effect in this fish shell and in new ones (fish 3.2 or newer)."
+      ;;
+    zsh|bash|sh|dash|ksh|mksh|ash|"")
+      case "$shell_name" in
+        zsh) profile=".zshrc" ;;
+        bash)
+          case "$target" in
+            # Login bash reads the first of these that exists; creating
+            # ~/.bash_profile would stop an existing ~/.profile from loading.
+            macos-*)
+              profile=".bash_profile"
+              for candidate in .bash_profile .bash_login .profile; do
+                if [ -n "${HOME:-}" ] && [ -e "$HOME/$candidate" ]; then
+                  profile="$candidate"
+                  break
+                fi
+              done
+              ;;
+            *) profile=".bashrc" ;;
+          esac
+          ;;
+        *) profile=".profile" ;;
+      esac
+      say "Put $install_dir first on PATH in future shells (run once; this installer does not edit shell profiles):"
+      say "  echo 'export PATH=\"$path_dir:\$PATH\"' >> ~/$profile"
+      say "Then run: . ~/$profile   (or open a new terminal)"
+      say "Or for this shell only:"
+      say "  export PATH=\"$path_dir:\$PATH\"; hash -r"
+      ;;
+    unsafe-path)
+      say "Add $install_dir first to PATH in your shell's startup file; its name contains shell-special characters, so no command line is printed for it."
+      ;;
+    *)
+      say "Add $install_dir first to PATH in your shell's startup file; this installer has no PATH line for $shell_name."
+      ;;
+  esac
+  say "Verify: command -v codewhale codew"
+  say "PATH help: https://github.com/Hmbown/CodeWhale/blob/main/docs/INSTALL.md#put-it-on-your-path"
+fi
 if ! command -v node >/dev/null 2>&1; then
   say "Computer Use is included and needs Node.js 20 or newer on PATH."
   say "Install Node.js from https://nodejs.org/, then restart Codewhale to enable Computer Use."

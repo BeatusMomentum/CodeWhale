@@ -156,6 +156,11 @@ Installed checksummed release commands:
   /home/you/.local/bin/codew
 …
 PATH selects no codewhale command; this install is /home/you/.local/bin/codewhale
+…
+Put /home/you/.local/bin first on PATH in future shells (run once; this installer does not edit shell profiles):
+  echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
+Then run: . ~/.bashrc   (or open a new terminal)
+…
 ```
 
 ### macOS notes
@@ -176,8 +181,13 @@ Re-checked on macOS 26.1, Apple silicon (`macos-arm64`), with a fresh `HOME`:
 
 ### Put it on your PATH
 
-If the last lines say `PATH selects no codewhale command`, `~/.local/bin` isn't
-on your PATH **in this shell**. On Ubuntu and Debian, `~/.profile` adds
+If the installer says `PATH selects no codewhale command`, `~/.local/bin` isn't
+on your PATH **in this shell**. The `codewhale.net/install.sh` installer then
+prints the matching line from the block below for your `$SHELL` (zsh, bash,
+fish, or a POSIX `sh`; for any other shell, or a directory name with quotes,
+`$`, backticks or backslashes, it tells you to add the directory yourself). It
+never edits a shell profile itself. The `install.sh` inside a release archive
+prints only the current-shell `export` line. On Ubuntu and Debian, `~/.profile` adds
 `~/.local/bin`, but only if the directory existed when you *logged in*. So:
 
 * a new SSH or login shell picks it up automatically;
@@ -188,7 +198,7 @@ on your PATH **in this shell**. On Ubuntu and Debian, `~/.profile` adds
 Fix it once:
 
 ```bash
-echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc   # bash
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc   # bash (macOS login bash: ~/.bash_profile, or ~/.profile if only that exists)
 # echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc  # zsh
 # fish_add_path ~/.local/bin                               # fish (untested on this VM)
 export PATH="$HOME/.local/bin:$PATH"; hash -r
@@ -595,8 +605,11 @@ export DEEPSEEK_API_KEY=sk-...          # add to ~/.bashrc / ~/.zshenv to persis
 ```bash
 codewhale auth set --provider deepseek                         # prompts: "Enter API key for deepseek:"
 printf '%s\n' "$KEY" | codewhale auth set --provider deepseek --api-key-stdin   # scripted
-# -> saved API key for deepseek to file-based (~/.codewhale/secrets/) (config contains metadata only)
+# -> saved API key for deepseek to file-based ("/home/you/.codewhale/secrets/secrets.json") (config contains metadata only)
 ```
+The file-based message prints the resolved secret-store path; an explicit
+`CODEWHALE_HOME` changes that location.
+
 On Linux, the key is stored in **plaintext** in
 `~/.codewhale/secrets/secrets.json`, with mode 0600. It is not in an OS
 keyring. Note that in v0.10.0, `auth set` also writes
@@ -1576,4 +1589,3 @@ Use one of these paths:
    binaries from the [Releases page](https://github.com/Hmbown/CodeWhale/releases),
    place them in a directory on `PATH`, and make them executable. See
    [Section 6](#3-manual-download-from-github-releases).
-

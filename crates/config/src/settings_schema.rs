@@ -40,6 +40,9 @@
 //! here so `/config` and `/effort` cannot disagree; the live settings screen
 //! still narrows that list to the active route's rungs.
 
+/// Fresh terminal installs, theme resets and the settings schema share this default.
+pub const DEFAULT_TUI_THEME: &str = "underwater";
+
 /// One selectable value of a [`SettingKind::Enum`] (or a boolean override).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SettingOption {
@@ -502,7 +505,7 @@ pub const SETTINGS_SCHEMA: &[SettingDef] = &[
     def(
         "theme",
         SettingKind::String,
-        "shoreline",
+        DEFAULT_TUI_THEME,
         ui(
             TAB_APPEARANCE,
             "display",
@@ -1365,6 +1368,39 @@ pub const SETTINGS_SCHEMA: &[SettingDef] = &[
     def("fast_model", SettingKind::String, "", None),
     // A transport timeout; advanced networking, available through `/set` only.
     def("stream_chunk_timeout_secs", SettingKind::Int, "900", None),
+    // Canonical transport keys. Runtime resolution stays in TUI Config.
+    def("stream.open_timeout_secs", SettingKind::Int, "45", None),
+    def("stream.chunk_timeout_secs", SettingKind::Int, "900", None),
+    def("stream.max_resumes", SettingKind::Int, "3", None),
+    def(
+        "stream.max_transparent_retries",
+        SettingKind::Int,
+        "2",
+        None,
+    ),
+    def("stream.max_stream_errors", SettingKind::Int, "5", None),
+    def("stream.max_duration_secs", SettingKind::Int, "1800", None),
+    def("stream.max_content_mb", SettingKind::Int, "10", None),
+    def("stream.connect_timeout_secs", SettingKind::Int, "30", None),
+    def("stream.tcp_keepalive_secs", SettingKind::Int, "30", None),
+    def(
+        "stream.http2_keep_alive_interval_secs",
+        SettingKind::Int,
+        "15",
+        None,
+    ),
+    def(
+        "stream.http2_keep_alive_timeout_secs",
+        SettingKind::Int,
+        "20",
+        None,
+    ),
+    def(
+        "stream.force_http1",
+        SettingKind::Bool(ON_OFF),
+        "false",
+        None,
+    ),
     // DeepSeek-only legacy fallback: the runtime still reads it, but it is
     // not a live choice, so it stays settable through `/set` without a row.
     def("default_model", SettingKind::String, "", None),

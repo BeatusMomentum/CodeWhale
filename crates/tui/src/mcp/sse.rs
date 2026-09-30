@@ -111,7 +111,7 @@ impl SseTransport {
             _ = cancel_token.cancelled() => {
                 anyhow::bail!("MCP SSE connect cancelled before the request completed")
             }
-            response = client.send(request) => response.with_context(|| {
+            response = client.send_event_stream(request) => response.with_context(|| {
                 format!(
                     "MCP SSE connect failed (transport=http url={})",
                     mask_url_secrets(&url),
@@ -324,6 +324,14 @@ impl McpTransport for SseTransport {
         }
     }
 
+    /// The event stream is the only inbound channel: once its task has
+    /// ended (server closed it, network error, oversize frame), POSTs may
+    /// still be accepted while every reply is lost. Report it dead so the
+    /// pool reconnects before dispatching instead of losing a tool result.
+    fn probe_dead(&self) -> bool {
+        self.sse_task.is_finished()
+    }
+
     async fn shutdown(&mut self) {
         self.sse_task.abort();
     }
@@ -410,5 +418,100 @@ mod endpoint_tests {
             .await
             .expect_err("pre-endpoint message must fail closed");
         assert!(error.to_string().contains("before declaring its endpoint"));
+    }
+
+    /// Serve one legacy SSE stream: the endpoint event at once, then each
+    /// `(delay, frame)` in order, then close the stream or hold it open.
+    async fn serve_sse_stream(frames: Vec<(Duration, &'static [u8])>, close: bool) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/sse", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buf = [0; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let n = socket.read(&mut buf).await.unwrap();
+                assert!(n > 0, "client closed before sending its request");
+                request.extend_from_slice(&buf[..n]);
+            }
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\nevent: endpoint\ndata: /messages\n\n")
+                .await
+                .unwrap();
+            for (delay, frame) in frames {
+                tokio::time::sleep(delay).await;
+                if socket.write_all(frame).await.is_err() {
+                    return;
+                }
+            }
+            if !close {
+                std::future::pending::<()>().await;
+            }
+        });
+        url
+    }
+
+    async fn connect_with_read_timeout(url: String, read_timeout: Duration) -> SseTransport {
+        crate::tls::ensure_rustls_crypto_provider();
+        let client = McpHttpClient::new(
+            &url,
+            false,
+            false,
+            false,
+            None,
+            Duration::from_secs(5),
+            read_timeout,
+        )
+        .unwrap();
+        SseTransport::connect(
+            client,
+            url,
+            McpHttpAuth::default(),
+            tokio_util::sync::CancellationToken::new(),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn event_stream_outlives_the_request_read_timeout() {
+        use crate::mcp::McpTransport as _;
+        let _env = crate::test_support::lock_test_env();
+        let _no_proxy = crate::test_support::EnvVarGuard::set("NO_PROXY", "*");
+        // A quiet stream for longer than read_timeout is healthy, not dead.
+        let url = serve_sse_stream(
+            vec![(
+                Duration::from_millis(900),
+                b"event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1}\n\n",
+            )],
+            false,
+        )
+        .await;
+        let mut transport = connect_with_read_timeout(url, Duration::from_millis(300)).await;
+        let message = tokio::time::timeout(Duration::from_secs(5), transport.recv())
+            .await
+            .expect("stream message within the test bound")
+            .expect("stream still open after read_timeout");
+        assert_eq!(message, br#"{"jsonrpc":"2.0","id":1}"#);
+        assert!(!transport.probe_dead());
+    }
+
+    #[tokio::test]
+    async fn closed_event_stream_reads_as_dead() {
+        use crate::mcp::McpTransport as _;
+        let _env = crate::test_support::lock_test_env();
+        let _no_proxy = crate::test_support::EnvVarGuard::set("NO_PROXY", "*");
+        let url = serve_sse_stream(Vec::new(), true).await;
+        let transport = connect_with_read_timeout(url, Duration::from_secs(5)).await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !transport.probe_dead() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "a closed SSE stream must stop reading as alive"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 }

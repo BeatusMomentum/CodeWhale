@@ -115,6 +115,11 @@ function requireInitialized() {
   if (!initialized) throw new RpcError(ErrorCode.InvalidRequest, 'host is not initialized')
 }
 
+rpc.onRequest('host/ping', () => {
+  requireInitialized()
+  return {}
+})
+
 rpc.onRequest('ext/activate', async (params: any) => {
   requireInitialized()
   return host.activate(params)

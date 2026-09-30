@@ -89,7 +89,8 @@ pub(crate) fn repo_law_plan_decision(
 }
 
 /// Extract workspace-relative write targets from a tool input. Covers the
-/// `path`/`target`/`destination`/`file_path` params, canonical
+/// `path`/`target`/`destination` params and every path alias the file tools
+/// fold onto `path` (`file_path`, `filePath`), canonical
 /// `replace[].path`, legacy `changes[].path`, and
 /// every unified-diff / codex-envelope header shape the patch tools accept —
 /// old (`--- `) and new (`+++ `) paths, with or without an `a/`/`b/` prefix,
@@ -98,7 +99,7 @@ pub(crate) fn repo_law_plan_decision(
 /// bypass, so this deliberately over-collects candidate paths.
 fn write_target_paths(workspace: &Path, input: &Value) -> Vec<String> {
     let mut targets = Vec::new();
-    for key in ["path", "target", "destination", "file_path"] {
+    for key in crate::tools::file::path_argument_keys().chain(["target", "destination"]) {
         if let Some(path) = input.get(key).and_then(Value::as_str) {
             push_normalized(&mut targets, workspace, path);
         }
@@ -302,6 +303,32 @@ mod tests {
             }),
         );
         assert!(matches!(held, Some(RepoLawPlanDecision::ForcePrompt(_))));
+    }
+
+    #[test]
+    fn path_alias_spellings_receive_the_same_holds() {
+        let tmp = TempDir::new().unwrap();
+        write_law(tmp.path(), LAW);
+        for (tool, input) in [
+            (
+                "write_file",
+                json!({"filePath": "crates/protocol/wire.rs", "content": "x"}),
+            ),
+            (
+                "write_file",
+                json!({"file_path": "crates/protocol/wire.rs", "content": "x"}),
+            ),
+            (
+                "File",
+                json!({"action": "edit", "filePath": "crates/protocol/wire.rs", "search": "a", "replace": "b"}),
+            ),
+        ] {
+            let decision = repo_law_plan_decision(tmp.path(), tool, &input);
+            assert!(
+                matches!(decision, Some(RepoLawPlanDecision::Block(_))),
+                "{tool} {input}: {decision:?}"
+            );
+        }
     }
 
     #[test]

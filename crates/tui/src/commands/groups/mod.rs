@@ -35,7 +35,7 @@ pub fn all_command_groups() -> &'static [&'static dyn CommandGroup] {
                 &core::CoreCommands,
                 &session::SessionCommands,
                 &config::ConfigCommands,
-                &debug::DebugCommands,
+                &super::debug_group::DebugCommands,
                 &project::ProjectCommands,
                 &skills::SkillsCommands,
                 &memory::MemoryCommands,

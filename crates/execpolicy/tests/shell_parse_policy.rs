@@ -102,6 +102,39 @@ const HIDDEN_RM: &[&str] = &[
     "pwsh -NoProfile -Command rm x",
     "powershell -enc cgBtACAAeAA=",
     "wsl -e rm x",
+    // Options may follow `-c`; the command string is the first operand.
+    "bash -c -e 'rm -rf /'",
+    "sh -c -- 'rm -rf /'",
+    "bash -c -o pipefail 'rm x'",
+    // A script operand that names stdin reads the pipe or here-string.
+    "echo 'rm x' | bash /dev/stdin",
+    "bash /dev/stdin <<< 'rm x'",
+    ". /dev/stdin <<< 'rm x'",
+    "sh /proc/self/fd/0 <<< 'rm x'",
+    // Launchers that run their operands as a command.
+    "pkexec rm x",
+    "pkexec --user root rm x",
+    "run0 -u root rm x",
+    "fakeroot rm -rf /",
+    "taskset -c 0 rm x",
+    "taskset 0x3 rm x",
+    "strace -f -o /tmp/t rm x",
+    "ltrace rm x",
+    "chrt 1 rm -rf /",
+    "chrt -r 10 rm x",
+    "prlimit --nofile=10 rm -rf /",
+    "systemd-run --user --scope rm x",
+    "numactl -N 0 rm x",
+    "firejail --noprofile rm x",
+    "xvfb-run -a rm x",
+    "dbus-launch --exit-with-session rm x",
+    "proxychains -q rm x",
+    "eatmydata rm x",
+    "cpulimit -l 50 rm x",
+    "sg wheel -c 'rm x'",
+    "sg wheel 'rm x'",
+    "gtimeout 5 rm x",
+    "gnice -n 5 rm x",
 ];
 
 /// Literal spellings that were already denied and must stay denied.
@@ -323,4 +356,30 @@ fn parallel_read_only_rejects_parentheses() {
             "{command:?} was classified read-only"
         );
     }
+}
+
+#[test]
+fn typed_deny_rule_skips_global_options_before_the_subcommand() {
+    let engine = ExecPolicyEngine::with_rulesets(vec![
+        Ruleset::user(vec![], vec![]).with_ask_rules(vec![ToolAskRule {
+            action: PermissionAction::Deny,
+            workspace: Some("/workspace".to_string()),
+            ..ToolAskRule::exec_shell("git push")
+        }]),
+    ]);
+    for command in [
+        "git push",
+        "git -C . push",
+        "git -c a=b push origin main",
+        "git --no-pager push",
+    ] {
+        assert!(denied(&engine, command), "{command} must be denied");
+    }
+    assert!(!denied(&engine, "git -C . status"));
+    // The rule stays scoped to its workspace.
+    let elsewhere = ExecPolicyContext {
+        cwd: "/other",
+        ..context("git -C . push", AskForApproval::Never)
+    };
+    assert!(engine.check(elsewhere).expect("policy check").allow);
 }

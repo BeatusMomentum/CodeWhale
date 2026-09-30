@@ -49,8 +49,20 @@ export function LocaleSwitcher({ current }: { current: string }) {
   // 3+ routed locales: a globe icon over a native <select>, which keeps the
   // platform picker, keyboard and screen-reader behavior. The select is
   // transparent and covers the icon, so the whole icon is the hit target.
-  // Partial packs carry a visible badge in the list so the incomplete scope
-  // is honest at the point of selection.
+  // Partial packs sit under a visible group label so the incomplete scope is
+  // honest at the point of selection. Each option names its language in its
+  // own script, so it carries that language's `lang` (and `dir`); the badge
+  // stays in the page language on the <optgroup> instead of being mixed into
+  // the option text.
+  const option = (l: (typeof ROUTED)[number]) => (
+    <option key={l.code} value={l.code} lang={l.code} dir={l.dir === "rtl" ? "rtl" : undefined}>
+      {l.label}
+    </option>
+  );
+  const partial = ROUTED.filter((l) => l.status === "partial");
+  // The badge is written as an inline "(partial)"; as a group heading it reads
+  // better without its (ASCII or full-width) brackets.
+  const partialHeading = chrome.partialBadge.replace(/^[(（]\s*|\s*[)）]$/g, "");
   return (
     <span className="nav-icon-button nav-locale">
       <Icon name="globe" className="nav-icon" />
@@ -59,11 +71,8 @@ export function LocaleSwitcher({ current }: { current: string }) {
         onChange={(e) => switchLocale(e.target.value)}
         aria-label={chrome.switcherLabel}
       >
-        {ROUTED.map((l) => (
-          <option key={l.code} value={l.code}>
-            {l.status === "partial" ? `${l.label} ${chrome.partialBadge}` : l.label}
-          </option>
-        ))}
+        {ROUTED.filter((l) => l.status !== "partial").map(option)}
+        {partial.length > 0 && <optgroup label={partialHeading}>{partial.map(option)}</optgroup>}
       </select>
     </span>
   );

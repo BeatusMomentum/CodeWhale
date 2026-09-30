@@ -4,9 +4,9 @@ import { PageHeader } from "@/components/page-header";
 import { UsagePreferenceControl } from "@/components/usage-counting";
 import { USAGE_COUNTING_COPY } from "@/lib/content/usage-counting";
 import { BUILD_FACTS } from "@/lib/facts";
-import { fill, getLegalPrivacy, pickText } from "@/lib/i18n/dictionaries";
+import { fill, getChrome, getLegalPrivacy, pickText } from "@/lib/i18n/dictionaries";
 import { buildPageMetadata } from "@/lib/page-meta";
-import { LEGAL_UPDATED, PRIVACY_SECTIONS } from "@/lib/legal-copy";
+import { formatLegalUpdated, PRIVACY_SECTIONS } from "@/lib/legal-copy";
 
 export async function generateMetadata({ params }: { params: Promise<{ locale: string }> }) {
   const { locale } = await params;
@@ -27,7 +27,7 @@ export default async function PrivacyPage({ params }: { params: Promise<{ locale
       <PageHeader
         kicker={t.kicker}
         title={t.title}
-        meta={fill(t.updated, { date: LEGAL_UPDATED })}
+        meta={fill(t.updated, { date: formatLegalUpdated(getChrome(locale).dateLocale) })}
       />
       <div className="page-body">
         <div className="page-body-narrow">

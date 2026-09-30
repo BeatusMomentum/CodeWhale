@@ -26,7 +26,7 @@ pub(crate) const MAX_STREAM_OPEN_TIMEOUT_SECS: u64 = 300;
 
 /// Resolve the response-header wait shared by every streaming adapter.
 ///
-/// A positive `[tui].stream_open_timeout_secs` wins (#6700); omitted or `0`
+/// A positive `[stream].open_timeout_secs` (legacy `[tui]` fallback) wins; omitted or `0`
 /// falls back to the env override (`CODEWHALE_STREAM_OPEN_TIMEOUT_SECS`,
 /// legacy `DEEPSEEK_STREAM_OPEN_TIMEOUT_SECS`), then the 45s default. Every
 /// source clamps to `5..=300`.
@@ -146,7 +146,7 @@ pub(crate) fn body_timeout_message(
 pub enum StreamHttpPolicy {
     /// Prefer the dual client (H2 primary, H1 twin for fallback).
     DualWithH1Fallback,
-    /// Force HTTP/1.1 only (env pin or prior H2 stall).
+    /// Force HTTP/1.1 only (config/env pin or prior H2 stall).
     Http1Only,
 }
 
@@ -159,10 +159,12 @@ pub struct StreamOpenRequest {
 }
 
 impl StreamOpenRequest {
+    /// `force_http1` is the client's resolved pin (`Config::force_http1`:
+    /// `[stream].force_http1`, legacy `[tui]`, or `CODEWHALE_FORCE_HTTP1`), never re-read here.
     #[must_use]
-    pub fn new(open_timeout: Duration, idle_timeout: Duration) -> Self {
+    pub fn new(force_http1: bool, open_timeout: Duration, idle_timeout: Duration) -> Self {
         Self {
-            policy: if super::force_http1_from_env() {
+            policy: if force_http1 {
                 StreamHttpPolicy::Http1Only
             } else {
                 StreamHttpPolicy::DualWithH1Fallback
@@ -177,6 +179,19 @@ impl StreamOpenRequest {
     pub fn with_h1_only(mut self) -> Self {
         self.policy = StreamHttpPolicy::Http1Only;
         self
+    }
+}
+
+impl super::CodewhaleClient {
+    /// The open request every streaming adapter starts from, carrying this
+    /// client's resolved HTTP/1.1 pin and timeouts (#6700).
+    #[must_use]
+    pub(super) fn stream_open_request(&self) -> StreamOpenRequest {
+        StreamOpenRequest::new(
+            self.force_http1,
+            self.stream_open_timeout,
+            self.stream_idle_timeout,
+        )
     }
 }
 
@@ -470,6 +485,58 @@ mod tests {
             .mount(&server)
             .await;
         server
+    }
+
+    #[test]
+    fn configured_http1_pin_controls_open_attempts_and_survives_clone() {
+        let _pin_env = super::super::tests::FORCE_HTTP1_ENV_LOCK.lock().unwrap();
+        let _env = crate::test_support::lock_test_env();
+        let _codewhale = crate::test_support::EnvVarGuard::remove("CODEWHALE_FORCE_HTTP1");
+        let _deepseek = crate::test_support::EnvVarGuard::remove("DEEPSEEK_FORCE_HTTP1");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        for pinned in [true, false] {
+            let config: crate::config::Config = toml::from_str(&format!(
+                r#"
+provider = "zai"
+[providers.zai]
+api_key = "stream-open-fixture-key"
+[tui]
+force_http1 = {pinned}
+"#
+            ))
+            .unwrap();
+            let client = super::super::CodewhaleClient::new(&config).unwrap();
+            for client in [client.clone(), client] {
+                let attempts = AtomicUsize::new(0);
+                let result =
+                    runtime.block_on(open_sse_response(&client.stream_open_request(), |policy| {
+                        let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                        async move {
+                            if attempt == 0 {
+                                // Only a genuinely dual-protocol request may
+                                // retry this failure on its HTTP/1.1 twin.
+                                return Err(anyhow::Error::new(LlmError::NetworkError(
+                                    "connection reset before response headers".into(),
+                                )));
+                            }
+                            assert_eq!(policy, StreamHttpPolicy::Http1Only);
+                            Ok(reqwest::Response::from(
+                                axum::http::Response::builder().status(200).body("")?,
+                            ))
+                        }
+                    }));
+                if pinned {
+                    assert!(result.is_err(), "config pin must forbid a second send");
+                    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+                } else {
+                    assert_eq!(result.unwrap().status(), 200);
+                    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+                }
+            }
+        }
     }
 
     #[tokio::test]

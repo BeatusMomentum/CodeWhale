@@ -2,11 +2,56 @@
 
 > **Repository copy.** This is the design as reviewed on 2026-09-25, copied from
 > the private release plan (`codewhale-ops/releases/0.10.1/plans-20260925/`) so
-> the code and its design live together. Section "As built: phase 1" below
-> records where the phase-1 implementation (`crates/tui/extension-host/`,
+> the code and its design live together. The "As built" sections below
+> record where the implementation (`crates/tui/extension-host/`,
 > `crates/tui/src/extension_host/`, behind `[features] extension_host`) differs
-> from the text that follows. Where they disagree, that section and the code
-> are current; the rest is the plan for later phases.
+> from the text that follows. Where they disagree, the newest "As built"
+> section and the code are current; the rest is the plan for later phases.
+
+## As built: phase 2a supervision (2026-09-29)
+
+The experimental host now has bounded lifecycle supervision. It uses the same
+Rust manager, owner registry, attachment snapshots, and approval gate:
+
+- `host/ping` runs every 3 seconds. A ping unanswered for 3 seconds marks the
+  host **Unresponsive**; after 10 seconds the existing process-tree supervisor
+  kills it. A pong restores Ready only for that generation. Deadlines use a
+  monotonic clock; laptop suspend/resume behavior has not been qualified.
+- Unexpected exits, protocol violations and hang kills share one crash budget.
+  Below 3 crashes in 5 minutes, the manager waits 250 ms then revalidates current
+  attachments and replays eligible owners with fresh generations and tokens.
+  The third crash stops recovery and retains the failure/stderr diagnostic.
+  Opening another engine and replaying a host never reset this budget.
+- In-flight tool calls fail with the existing typed unavailable error; they
+  are **never replayed**. Failed/faulted receipts remain suppressed. A crash
+  during the sole activating owner's initialization is attributed to that
+  receipt, so other valid plugins can recover.
+- Explicit plugin changes/reload clear the crash budget and retry failed
+  receipts through the existing `plugins_changed` path. Start failures also
+  permit a new engine attachment to retry once the one-minute cooldown has
+  elapsed. There is no automatic handshake/start-failure loop.
+- Old-generation callbacks and recovery tickets cannot mutate a newer host.
+  Planned shutdown is not a crash. Native-entry, staged-byte, persisted-state,
+  approval-grant and platform sandbox rules remain unchanged.
+- Two incomplete, leaking, malformed or failed teardowns in ten minutes request
+  one planned restart. The existing monitor waits until reconciliation and
+  all non-heartbeat requests are idle, then atomically closes request admission
+  before retiring the process tree. Current valid owners replay with fresh
+  tokens; calls are never replayed. This maintenance neither consumes nor
+  resets the unexpected-crash budget. Late old-process outcomes cannot dirty
+  the replacement.
+
+The authoring follow-up adds an escaped `/plugin show` owner section with state,
+live tools and up to 20 recent attributed messages from the bounded 64-entry
+shared diagnostic ring. Regular `.mts` entries use the same reviewed-byte and
+discovery rules as `.mjs`/`.js`; Node strips erasable types. The executable
+[hello extension](../examples/plugins/hello-extension/hello.mts) and
+[author guide](../EXTENSIONS.md) describe the actual services and trust loop.
+
+`exec.cwd` remains deferred: the current execution context does not expose the
+caller's workspace path. Commands, hooks, MCP, `core/call`, and sandbox parity
+also remain subsequent work. The following phase-1 section is its historical
+receipt, including the earlier lack of heartbeat/restart and `.mts` support.
 
 ## As built: phase 1 (2026-09-25)
 
@@ -66,6 +111,53 @@ differences from the text below:
 - **DSH references** are pinned to `refs/dsh` commit `00102833`
   (`0.1.7-alpha.2`); the local checkout's HEAD has since moved to `0d1f50007f`.
 
+**Phase-1 fixes (2026-09-28).**
+
+- **Engines attach; they do not own the host.** The host and its owner
+  registry are process-wide, but each engine holds a `HostAttachment` with
+  its own workspace plugin snapshot. Reconcile activates the union of what
+  every attached snapshot desires, re-verifying each snapshot against
+  persisted plugin state (so a disable or revoke through any registry
+  revokes everywhere), and revokes only owners no attachment desires. An
+  engine installs only the tools of owners its own snapshot desires. Engines
+  without a snapshot of their own (isolated chats, the empty fallback) do not
+  attach, and dropping an attachment detaches without revoking. Before this,
+  every engine's `sync` revoked whatever *its* registry did not desire, so
+  two workspaces, or one isolated chat, cancelled each other's in-flight
+  calls. The native-name set is now additive across engines.
+- **Session grants are bound to the reviewed build (§4.3).** Extension tools
+  key both the exact and the session-grant approval key as
+  `ext:<plugin_id>@<content_hash>:<name>:<hash(input)>`, through the
+  `ToolSpec::approval_scope` hook, so an updated plugin, or another plugin
+  that later takes the same tool name, is asked again. This only narrows
+  grants; widening them is an open decision.
+- **The native-entry rule is checked at review time.** "One `.mjs` or `.js`
+  file" is one function (`plugins::runtime::native_entry_problem`). With the
+  flag on, discovery reports a violating entry as an error diagnostic, so
+  `/plugin validate` and the review screen fail it, and activation refuses it.
+- **Code mode suspends extension tools for approval.** Lane 6562 landed
+  (#6583) before phase 1 (#6600), so acceptance 2's code-mode assertion is
+  "suspends for approval": an `execute_tools` call of an extension tool in a
+  main-session turn raises `<call>.<seq>` approval attributed to
+  `extension:<plugin>`, sends no `tool/call` before approval, returns the
+  result on allow and fails only that call on deny. Direct
+  `execute_tools_tool` with no gate still refuses it before any host call.
+- **The handshake timeout is 30 s**, not the 2 s §1.4 and §8 state
+  (`supervisor::HANDSHAKE_DEADLINE`). 5 s failed on loaded Windows CI with a
+  silent host (a cold `node` start plus an antivirus scan of the freshly
+  materialized bundle), and a miss fails the host for the whole session. The
+  handshake is off the first-prompt path, so 30 s (the MCP stdio handshake
+  budget) costs nothing when the host is healthy.
+- **A failed host is retried by a new engine, not by `/plugin enable`
+  itself.** In the TUI every plugin change respawns the engine, and
+  `Engine::new` calls `begin_session()`, which resets a failed host. On the
+  runtime-API path a plugin action retries a failed host only when it makes
+  a plugin the process has not yet seen desired; otherwise the host stays
+  failed until a new thread engine starts. Explicit retry is phase-2
+  supervision work.
+- **`hyperfine` was never run** for acceptance 7; the flag-off guarantees
+  rest on the never-spawned test and the pinned v3 policy digest.
+
 
 Status: **proposal**, 2026-09-25. Written for the founder direction of that date: move plugins, hooks, commands, custom tools, agent presets and MCP to TypeScript, using the same model as the DSH (DeepSeek Harness) plugin system, and make only that part of Codewhale extensible.
 
@@ -110,7 +202,7 @@ Checked against `/private/tmp/cw-wt-6446` @ `8a835d7c4`, lane `feat/code-mode-mc
 |---|---|---|---|
 | R1 | **A second custom-tool system already ships, outside plugin trust.** Scripts in `~/.codewhale/tools/` become model-visible tools on every turn. Each declares its own approval in frontmatter (`# approval: auto`). `ToolRegistry::register` *overwrites* a built-in of the same name with only a `warn!`. `[tools.overrides]` `Script` / `Command` entries replace built-ins on purpose. | `tools/plugin.rs:1-20,111`; `tools/registry.rs:53-63,375-414`; `core/engine.rs:4910,7360-7385` | Today, a script already approves itself and shadows built-ins. The founder's "only the TS host is extensible" requires moving this, so it is added to the deletion plan (§7) and decision D9. The host must not be weaker than this path, and must not copy it either. |
 | R2 | **Registry tools are the existing seam for extension tools; `ExternalToolDispatch` is not needed in phase 1.** The registry is rebuilt every turn (`build_turn_tool_registry_and_catalog`). Tools outside `DEFAULT_ACTIVE_NATIVE_TOOLS` are deferred by default (`tool_catalog.rs:136-149`). On main, code mode already sees registry tools and refuses the ones that need approval (`codemode.rs:233-238`). The lane gates "native, plugin, or MCP" nested calls with approval suspension (lane `codemode.rs:1-25`). | as cited | Phase-1 extension tools are `ToolSpec` adapters registered next to `configure_plugin_tools`. They get plan mode, the authority envelope, deferral, approval and code-mode gating from code that already exists. **Phase 1 does not depend on the unmerged lane.** `ExternalToolDispatch` is left as an MCP-only interface that the lane may adopt (§5.2). |
-| R3 | **The lane is not merged.** `origin/main` has code-mode Phase 1 (`e23ce514c`, which runs Auto-only nested calls and refuses MCP). The lane is 3 commits ahead. | `git log origin/main..feat/code-mode-mcp-6562` | Phase-1 acceptance cannot require "gated identically from `execute_tools` with `<parent>.<seq>` ids". On main, the assertion is "refused as needs-approval". Once the lane lands, it is "suspends for approval". |
+| R3 | **The lane is not merged.** `origin/main` has code-mode Phase 1 (`e23ce514c`, which runs Auto-only nested calls and refuses MCP). The lane is 3 commits ahead. | `git log origin/main..feat/code-mode-mcp-6562` | Phase-1 acceptance cannot require "gated identically from `execute_tools` with `<parent>.<seq>` ids". On main, the assertion is "refused as needs-approval". Once the lane lands, it is "suspends for approval". **Resolved:** the lane landed first (#6583, then #6600), and the phase-1 fixes assert "suspends for approval" (`execute_tools_gates_an_extension_tool_before_any_host_call`). |
 | R4 | **The self-declared read-only hint is an auto-approve.** `approval_hint_for` → `TrustedReadOnly` → `ApprovalRequirement::Auto` (`mcp.rs:1265-1274`, `tool_preparation.rs:46-48`, test at `:537-540`). | as cited | If extension tools honoured `presentCall` / `kind: 'read'` (old §4.3), a plugin would switch off approval for its own tools, and those tools run arbitrary Node. **Removed.** Extension tools are always `Required` (§4.3). |
 | R5 | **Secrets are on disk, readable by any same-user process.** The default secret backend is `~/.codewhale/secrets/` (`crates/secrets/src/lib.rs:64-69`). MCP OAuth tokens are re-read "from the on-disk credential" (`mcp/oauth.rs:749-752`). | as cited | "Tokens never enter Node" and "one gate *even if the host is compromised*" (old §4.4, §5.1) are false until the phase-5 sandbox denies those paths. They are restated as protocol properties, not containment (§4.1, §4.4). |
 | R6 | **The protocol names a mechanism that does not exist.** No `change:tool_surface` exists anywhere in `crates/tui/src`. | grep | Removed. Per-turn rebuild plus a liveness check at dispatch time is enough (§3.3). |
@@ -739,7 +831,7 @@ This follows "migrate the last consumer or do not start". Every phase's exit cri
    - the tool is **deferred** and reachable through `tool_search`;
    - the approval request is raised (`Required`), and its text names `extension:dsh-workspace-deps`;
    - after approval, the result JSON comes from the fixture payload;
-   - the same call from `execute_tools` on **main** is refused as needs-approval, with a receipt and no host `tool/call` sent. (Once lane 6562 lands, this assertion becomes "suspends for approval, `<parent>.<seq>` id"; that edit belongs to whichever of the two PRs lands second.)
+   - the same call from `execute_tools` in a main-session turn suspends for approval with a `<parent>.<seq>` id attributed to `extension:<plugin>`, and no host `tool/call` is sent before approval; allow returns the result to the program and deny fails only that nested call. (Lane 6562 landed first, as #6583; the assertion was updated in the phase-1 fixes. Without a gate, `execute_tools` still refuses it as needs-approval.)
 3. Disabling the plugin mid-call: Rust's registry drops the handle at once; the in-flight call resolves as cancelled within 500 ms; the host acks `disposed` only after the async disposer settles, and `leaked` is empty.
 4. `kill -9` on the host: the in-flight call fails with the typed `not_available("extension host exited")`; `/plugin` shows *failed* with the stderr tail; nothing respawns until the next session or `/plugin enable`.
 5. The `refuses-approval` fixture FAILS activation with a diagnostic, and no registration survives on either side.

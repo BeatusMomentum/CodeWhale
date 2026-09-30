@@ -2546,3 +2546,102 @@ async fn tools_call_cap_rejects_runaway_loops() {
         "unexpected: {message}"
     );
 }
+
+/// A platform-native absolute path for `unix_path` (`/a/b`): unchanged on
+/// Unix, `C:\a\b` on Windows, where `/a/b` has no drive and is not absolute.
+fn native_abs(unix_path: &str) -> String {
+    if cfg!(windows) {
+        format!("C:{}", unix_path.replace('/', "\\"))
+    } else {
+        unix_path.to_string()
+    }
+}
+
+/// An absolute `cwd` inside the run's workspace normalizes to the
+/// repo-relative form; outside it, through `..`, or with no known workspace
+/// it is still refused (the trust boundary is unchanged).
+#[test]
+fn absolute_cwd_inside_the_workspace_normalizes_and_outside_is_refused() {
+    use codewhale_workflow_js::{normalize_task_cwd, normalize_task_cwd_in};
+    use std::path::PathBuf;
+    let workspace = PathBuf::from(native_abs("/Volumes/VIXinSSD/CW"));
+    let workspace = Some(workspace.as_path());
+    assert_eq!(
+        normalize_task_cwd_in(&native_abs("/Volumes/VIXinSSD/CW/codewhale"), workspace).unwrap(),
+        "codewhale"
+    );
+    assert_eq!(
+        normalize_task_cwd_in(&native_abs("/Volumes/VIXinSSD/CW/./crates/tui"), workspace).unwrap(),
+        "crates/tui"
+    );
+    assert_eq!(
+        normalize_task_cwd_in(&native_abs("/Volumes/VIXinSSD/CW/"), workspace).unwrap(),
+        "."
+    );
+    assert_eq!(
+        normalize_task_cwd_in("crates/tui", workspace).unwrap(),
+        normalize_task_cwd("crates/tui").unwrap()
+    );
+    for outside in [
+        native_abs("/Volumes/VIXinSSD/CW-other/codewhale"),
+        native_abs("/Volumes/VIXinSSD"),
+        native_abs("/etc"),
+        native_abs("/Volumes/VIXinSSD/CW/../secrets"),
+        native_abs("/Volumes/VIXinSSD/CW/codewhale/../../secrets"),
+        native_abs("/Volumes/VIXinSSD/X/../CW/codewhale"),
+    ] {
+        let error = normalize_task_cwd_in(&outside, workspace).unwrap_err();
+        assert!(
+            error.contains("outside the workspace") || error.contains("parent traversal"),
+            "{outside}: {error}"
+        );
+    }
+    let error =
+        normalize_task_cwd_in(&native_abs("/Volumes/VIXinSSD/CW/codewhale"), None).unwrap_err();
+    assert!(error.contains("bounded repo-relative paths"), "{error}");
+}
+
+/// Windows spellings of the same workspace path: a verbatim `\\?\` prefix on
+/// either side, forward slashes, and a different case all match; another
+/// drive or a sibling directory does not.
+#[cfg(windows)]
+#[test]
+fn absolute_cwd_matches_windows_spellings_of_the_workspace() {
+    use codewhale_workflow_js::normalize_task_cwd_in;
+    use std::path::Path;
+    let plain = Path::new(r"C:\Users\dev\CW");
+    let verbatim = Path::new(r"\\?\C:\Users\dev\CW");
+    for workspace in [plain, verbatim] {
+        for inside in [
+            r"C:\Users\dev\CW\codewhale",
+            "C:/Users/dev/CW/codewhale",
+            r"c:\users\DEV\cw\codewhale",
+            r"\\?\C:\Users\dev\CW\codewhale",
+        ] {
+            assert_eq!(
+                normalize_task_cwd_in(inside, Some(workspace)).unwrap(),
+                "codewhale",
+                "{inside} in {}",
+                workspace.display()
+            );
+        }
+        for outside in [
+            r"D:\Users\dev\CW\codewhale",
+            r"C:\Users\dev\CW-other",
+            r"C:\Users\dev\CW\..\secrets",
+            r"\\server\share\Users\dev\CW",
+        ] {
+            let error = normalize_task_cwd_in(outside, Some(workspace)).unwrap_err();
+            assert!(
+                error.contains("outside the workspace") || error.contains("parent traversal"),
+                "{outside}: {error}"
+            );
+        }
+    }
+    // A UNC workspace matches its own share, case-insensitively.
+    let unc = Path::new(r"\\Server\Share\CW");
+    assert_eq!(
+        normalize_task_cwd_in(r"\\server\share\cw\codewhale", Some(unc)).unwrap(),
+        "codewhale"
+    );
+}

@@ -256,10 +256,7 @@ impl CodewhaleClient {
         body: &Value,
     ) -> Result<reqwest::Response> {
         let url = self.messages_transport_url(url);
-        let open_req = super::stream_entry::StreamOpenRequest::new(
-            self.stream_open_timeout,
-            self.stream_idle_timeout,
-        );
+        let open_req = self.stream_open_request();
         let opened = super::stream_entry::open_sse_response(&open_req, |policy| {
             let url = url.clone();
             async move {
@@ -407,15 +404,33 @@ impl CodewhaleClient {
         let response = self
             .send_anthropic_request(&prepared.endpoint.url, &prepared.body)
             .await?;
-        let mut value: Value = response
+        let value: Value = response
             .json()
             .await
             .context("Failed to parse Anthropic Messages response")?;
-        if let Some(usage) = value.get_mut("usage") {
-            *usage = json!(parse_anthropic_usage(usage));
-        }
-        serde_json::from_value(value).context("Failed to decode Anthropic Messages response")
+        decode_anthropic_message(value)
     }
+}
+
+fn discard_provider_execution_ids(value: &mut Value) {
+    // Shared history retains execution ids on disk. Incoming provider content
+    // cannot choose one, including a value that would not deserialize as the
+    // host field. Live execution must mint its own correlation instead.
+    if let Some(blocks) = value.get_mut("content").and_then(Value::as_array_mut) {
+        for block in blocks {
+            if let Some(block) = block.as_object_mut() {
+                block.remove("execution_id");
+            }
+        }
+    }
+}
+
+fn decode_anthropic_message(mut value: Value) -> Result<MessageResponse> {
+    discard_provider_execution_ids(&mut value);
+    if let Some(usage) = value.get_mut("usage") {
+        *usage = json!(parse_anthropic_usage(usage));
+    }
+    serde_json::from_value(value).context("Failed to decode Anthropic Messages response")
 }
 
 /// Build the `/v1/messages` endpoint URL, tolerating base URLs that already
@@ -745,6 +760,7 @@ fn content_block_to_anthropic(block: &ContentBlock) -> Option<Value> {
             content,
             is_error,
             content_blocks,
+            ..
         } => {
             let mut value = json!({
                 "type": "tool_result",
@@ -923,11 +939,11 @@ fn convert_anthropic_sse_usage_event(trimmed: &str) -> Option<Result<StreamEvent
 
     match value.get("type").and_then(Value::as_str) {
         Some("message_start") => {
-            if let Some(usage) = value
-                .get_mut("message")
-                .and_then(|message| message.get_mut("usage"))
-            {
-                *usage = json!(parse_anthropic_usage(usage));
+            if let Some(message) = value.get_mut("message") {
+                discard_provider_execution_ids(message);
+                if let Some(usage) = message.get_mut("usage") {
+                    *usage = json!(parse_anthropic_usage(usage));
+                }
             }
         }
         Some("message_delta") => {
@@ -1006,6 +1022,67 @@ mod tests {
     use codewhale_models::Role;
     use codewhale_models::{CacheControl, Message, SystemBlock, SystemPrompt, Tool};
 
+    #[test]
+    fn provider_messages_cannot_supply_host_execution_identity() {
+        for supplied in [json!("forged-local"), json!({"invalid": "host id"})] {
+            let value = json!({
+                "id": "provider-message", "type": "message", "role": "assistant",
+                "model": "claude-sonnet-4-6", "stop_reason": "tool_use",
+                "content": [
+                    {"type": "tool_use", "id": "wire-call", "name": "read",
+                     "input": {"execution_id": "ordinary argument"},
+                     "execution_id": supplied,
+                     "caller": {"type": "code_execution", "tool_id": "parent-wire"},
+                     "thought_signature": "provider-signature"},
+                    {"type": "tool_result", "tool_use_id": "wire-call", "content": "result",
+                     "execution_id": supplied},
+                ],
+                "usage": {"input_tokens": 3, "output_tokens": 2},
+            });
+            let decoded = decode_anthropic_message(value.clone()).unwrap();
+            let event = convert_anthropic_sse_data(
+                &json!({
+                    "type": "message_start", "message": value,
+                })
+                .to_string(),
+            )
+            .unwrap()
+            .unwrap();
+            let StreamEvent::MessageStart { message: streamed } = event else {
+                panic!("expected message start")
+            };
+            for message in [decoded, streamed] {
+                let ContentBlock::ToolUse {
+                    id,
+                    input,
+                    execution_id,
+                    caller,
+                    thought_signature,
+                    ..
+                } = &message.content[0]
+                else {
+                    panic!("expected tool use")
+                };
+                assert!(execution_id.is_none());
+                assert_eq!(id, "wire-call");
+                assert_eq!(input["execution_id"], "ordinary argument");
+                assert_eq!(
+                    caller.as_ref().unwrap().tool_id.as_deref(),
+                    Some("parent-wire")
+                );
+                assert_eq!(thought_signature.as_deref(), Some("provider-signature"));
+                assert!(matches!(
+                    &message.content[1],
+                    ContentBlock::ToolResult {
+                        execution_id: None,
+                        ..
+                    }
+                ));
+                assert_eq!(message.usage.input_tokens, 3);
+            }
+        }
+    }
+
     fn request_with(
         model: &str,
         reasoning_effort: Option<&str>,
@@ -1053,6 +1130,7 @@ mod tests {
         let client = test_client();
         let mut request = request_with("claude-sonnet-4-6", None, None, None);
         let tool_use = |id: &str, path: &str| ContentBlock::ToolUse {
+            execution_id: None,
             id: id.to_string(),
             name: "read".to_string(),
             input: json!({ "path": path }),
@@ -1060,6 +1138,7 @@ mod tests {
             thought_signature: None,
         };
         let tool_result = |id: &str, content: &str| ContentBlock::ToolResult {
+            execution_id: None,
             tool_use_id: id.to_string(),
             content: content.to_string(),
             is_error: None,
@@ -1381,6 +1460,7 @@ mod tests {
                 role: Role::Assistant,
                 content: vec![
                     ContentBlock::ToolUse {
+                        execution_id: None,
                         id: "toolu_ok".to_string(),
                         name: "read_file".to_string(),
                         input: json!({"path": "a.txt"}),
@@ -1388,6 +1468,7 @@ mod tests {
                         thought_signature: None,
                     },
                     ContentBlock::ToolUse {
+                        execution_id: None,
                         id: "toolu_orphan".to_string(),
                         name: "task".to_string(),
                         input: json!({}),
@@ -1400,6 +1481,7 @@ mod tests {
             Message {
                 role: Role::User,
                 content: vec![ContentBlock::ToolResult {
+                    execution_id: None,
                     tool_use_id: "toolu_ok".to_string(),
                     content: "contents".to_string(),
                     is_error: None,
@@ -1410,6 +1492,7 @@ mod tests {
             Message {
                 role: Role::Assistant,
                 content: vec![ContentBlock::ToolUse {
+                    execution_id: None,
                     id: "toolu_tail".to_string(),
                     name: "task".to_string(),
                     input: json!({}),
@@ -1709,6 +1792,7 @@ mod tests {
                         state: None,
                     },
                     ContentBlock::ToolUse {
+                        execution_id: None,
                         id: "toolu_1".to_string(),
                         name: "read_file".to_string(),
                         input: json!({"path": "a.txt"}),
@@ -1720,6 +1804,7 @@ mod tests {
             Message {
                 role: Role::User,
                 content: vec![ContentBlock::ToolResult {
+                    execution_id: None,
                     tool_use_id: "toolu_1".to_string(),
                     content: "contents".to_string(),
                     is_error: None,

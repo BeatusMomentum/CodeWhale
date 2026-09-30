@@ -288,7 +288,10 @@ shell grant all judge `bash` calls by the same read-only grammar:
 - the text filters `sort`, `uniq`, `cut`, `tr` and `comm`, and literal
   `echo`/`printf`;
 - with a network grant, `gh` issue/pr/release/repo/run/workflow view or list
-  reads and `npm view`.
+  reads.
+
+`npm view` is refused even with a network grant: npm configuration can select
+executable helpers, so package metadata reads are outside this bounded grammar.
 
 Admitted commands can be joined with `|`, `&&`, `||` and `;`, for example
 `git diff HEAD && echo '=== FILES ===' && ls -la`. A leading `cd <dir> &&`

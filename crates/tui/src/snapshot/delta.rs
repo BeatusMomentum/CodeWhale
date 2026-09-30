@@ -90,7 +90,9 @@ fn safe_display(path: &[u8]) -> Option<String> {
     let mut parts = Vec::new();
     for component in Path::new(text).components() {
         match component {
-            Component::Normal(name) if name != ".git" => parts.push(name.to_str()?),
+            Component::Normal(name) if !super::is_git_metadata_name(name) => {
+                parts.push(name.to_str()?)
+            }
             _ => return None,
         }
     }

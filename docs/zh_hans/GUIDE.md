@@ -14,7 +14,7 @@ Codewhale 是一个终端编码智能体（agent）。你从某个工作区运�
 
 - 它让活动工作区和会话保持可见。
 - 它把每一轮都路由到明确的模式与审批规则。
-- 它在对话记录中展示工具调用，而不是把工作藏起来。
+- 它在转录中展示工具调用，而不是把工作藏起来。
 - 它可以保存会话、分叉对话，并在之后继续。
 - 它可以运行子智能体来执行专注的后台工作。
 
@@ -262,7 +262,7 @@ Operate 保持直接的工具面及其审批、沙箱、shell、ask 规则和仓
 
 软自动多智能体工作：[AUTOMATIC_WORKFLOWS.md](../AUTOMATIC_WORKFLOWS.md)。
 
-面向持久多 worker 工作的下一步：[FLEET_WORKFLOW_TUTORIAL.md](../FLEET_WORKFLOW_TUTORIAL.md) 带你走一遍 fleet 任务规格、监控和 Workflow 编写。
+面向持久多 worker 工作的下一步：[FLEET_WORKFLOW_TUTORIAL.md](./FLEET_WORKFLOW_TUTORIAL.md) 带你走一遍 fleet 任务规格、监控和 Workflow 编写。
 
 想让 Codewhale 每回合自己选模型和思考级别时，用 `/model auto`。当 DeepSeek 路由模型可用时，Auto 可以在脱敏清单中选取任何可运行的 provider/模型组合。该分类会把最新请求（上限 4,000 字符）加上最多六条最近上下文行的有界摘要（每条 900 字符）发送到 `DeepSeek / deepseek-v4-flash`。凭据、端点和提供商错误文本不会包含在清单里。没有该路由器时，Auto 使用本地的、感知提供商的启发式方法，不发送任何路由请求。如果分类尝试未通过验证或出错，Auto 回退到该启发式方法，同时把尝试过的分类器数据路径保留在回合回执中。
 
@@ -272,7 +272,7 @@ Operate 保持直接的工具面及其审批、沙箱、shell、ask 规则和仓
 
 本指南有意不列出每条命令。命令面比上手流程变化更频繁，你在会话里时，TUI 命令面板才是事实来源。
 
-下一步：[CONFIGURATION.md](CONFIGURATION.md) 涵盖运行时设置，[MCP.md](MCP.md) 涵盖模型上下文协议（MCP，Model Context Protocol）集成。[PLUGIN_BUNDLES.md](../PLUGIN_BUNDLES.md) 涵盖默认禁用的包清单、能力审查和带命名空间的 Skill/MCP 激活边界。
+下一步：[CONFIGURATION.md](CONFIGURATION.md) 涵盖运行时设置，[MCP.md](MCP.md) 涵盖模型上下文协议（MCP，Model Context Protocol）集成。[PLUGIN_BUNDLES.md](./PLUGIN_BUNDLES.md) 涵盖默认禁用的包清单、能力审查和带命名空间的 Skill/MCP 激活边界。
 
 ## 7. 使用工具
 
@@ -303,9 +303,9 @@ Codewhale 的工具是结构化操作。模型不只是产出文字，还能调�
 如果失败，报告失败并在扩大测试范围之前停止。
 ```
 
-避免在专注修复期间要求广泛的清理。较小的工具范围使对话记录更易于审查，最终的差异更易于合并。
+避免在专注修复期间要求广泛的清理。较小的工具范围使转录更易于审查，最终的差异更易于合并。
 
-下一步：[TOOL_SURFACE.md](../TOOL_SURFACE.md) 列出工具面，[SANDBOX.md](../SANDBOX.md) 讲解沙箱行为。
+下一步：[TOOL_SURFACE.md](../TOOL_SURFACE.md) 列出工具面，[SANDBOX.md](./SANDBOX.md) 讲解沙箱行为。
 
 ## 8. 子智能体与并行工作
 

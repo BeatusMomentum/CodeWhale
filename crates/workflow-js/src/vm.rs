@@ -946,7 +946,8 @@ async fn task_host_inner(
     spawned: Rc<Cell<u64>>,
 ) -> Result<serde_json::Value, TaskError> {
     let admission = |message: String| TaskError::new(TaskErrorKind::Admission, message);
-    let request = parse_task_options(&opts_json)
+    let workspace = driver.workspace_root();
+    let request = parse_task_options(&opts_json, workspace.as_deref())
         .map_err(|message| admission(reject_task(&driver, &opts_json, message)))?;
     // Compile the schema before spawning so a malformed one fails fast
     // instead of burning a subagent.
@@ -1180,7 +1181,10 @@ struct TaskOptions {
     phase: Option<String>,
 }
 
-fn parse_task_options(opts_json: &str) -> Result<TaskRequest, String> {
+fn parse_task_options(
+    opts_json: &str,
+    workspace: Option<&std::path::Path>,
+) -> Result<TaskRequest, String> {
     let mut options: TaskOptions =
         serde_json::from_str(opts_json).map_err(|err| format!("task(): invalid options: {err}"))?;
     if let Some(policy) = options.workspace_policy.take() {
@@ -1220,7 +1224,11 @@ fn parse_task_options(opts_json: &str) -> Result<TaskRequest, String> {
         .map_err(|err| format!("task(): {err}"))?;
     options.write_roots = normalize_task_paths("writeRoots", options.write_roots, 32)?;
     options.exact_files = normalize_task_paths("exactFiles", options.exact_files, 32)?;
-    let cwd = options.cwd.as_deref().map(normalize_task_cwd).transpose()?;
+    let cwd = options
+        .cwd
+        .as_deref()
+        .map(|cwd| normalize_task_cwd_in(cwd, workspace))
+        .transpose()?;
     options.coordination_contracts =
         normalize_task_string_list("coordinationContracts", options.coordination_contracts, 16)?;
     options.dependencies = normalize_task_string_list("dependencies", options.dependencies, 8)?;
@@ -1323,6 +1331,122 @@ fn normalize_task_string_list(
 /// The same bounded repo-relative policy applies to both entry points.
 pub fn normalize_task_cwd(value: &str) -> Result<String, String> {
     normalize_task_paths("cwd", vec![value.to_owned()], 1).map(|mut paths| paths.remove(0))
+}
+
+/// [`normalize_task_cwd`] for a run that knows its workspace root. An
+/// absolute path that lies inside `workspace` is rewritten to the same
+/// bounded repo-relative form; an absolute path outside it, or one that
+/// escapes through `..`, is still rejected. Without a workspace every
+/// absolute path is rejected, exactly as before.
+///
+/// The comparison is lexical and component-wise (no filesystem access), so
+/// `/ws-other` is never inside `/ws`. On Windows a drive letter or UNC share
+/// matches with or without the verbatim `\\?\` prefix, `/` and `\` are both
+/// separators, and components compare case-insensitively.
+pub fn normalize_task_cwd_in(
+    value: &str,
+    workspace: Option<&std::path::Path>,
+) -> Result<String, String> {
+    let raw = value.trim();
+    let path = std::path::Path::new(raw);
+    let Some(workspace) = workspace.filter(|_| path.is_absolute()) else {
+        return normalize_task_cwd(value);
+    };
+    let outside = || {
+        format!(
+            "task(): cwd {raw:?} is outside the workspace {}; cwd entries must be bounded repo-relative paths or absolute paths inside the workspace",
+            workspace.display()
+        )
+    };
+    let mut remainder = path_keys(path).ok_or_else(outside)?.into_iter();
+    for expected in path_keys(workspace).ok_or_else(outside)? {
+        match remainder.next() {
+            Some(actual) if actual.matches(&expected) => {}
+            // `..` right after the workspace prefix is an escape, not a
+            // different root: name it as traversal.
+            Some(PathKey::Parent) => {
+                return Err("task(): cwd paths cannot contain parent traversal".to_string());
+            }
+            _ => return Err(outside()),
+        }
+    }
+    let mut segments = Vec::new();
+    for key in remainder {
+        match key {
+            PathKey::Name { original, .. } => segments.push(original),
+            PathKey::Parent => {
+                return Err("task(): cwd paths cannot contain parent traversal".to_string());
+            }
+            PathKey::Root => return Err(outside()),
+        }
+    }
+    if segments.is_empty() {
+        return Ok(".".to_string());
+    }
+    normalize_task_cwd(&segments.join("/"))
+}
+
+/// One lexical path component, keyed for comparison: a drive or UNC prefix
+/// with its verbatim marker dropped, and names case-folded on Windows.
+#[derive(Debug)]
+enum PathKey {
+    Root,
+    Parent,
+    Name { key: String, original: String },
+}
+
+impl PathKey {
+    fn matches(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Root, Self::Root) | (Self::Parent, Self::Parent) => true,
+            (Self::Name { key: left, .. }, Self::Name { key: right, .. }) => left == right,
+            _ => false,
+        }
+    }
+}
+
+fn path_keys(path: &std::path::Path) -> Option<Vec<PathKey>> {
+    use std::path::{Component, Prefix};
+    let fold = |value: &str| {
+        if cfg!(windows) {
+            value.to_lowercase()
+        } else {
+            value.to_string()
+        }
+    };
+    let mut keys = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => {
+                let key = match prefix.kind() {
+                    Prefix::Disk(drive) | Prefix::VerbatimDisk(drive) => {
+                        format!("{}:", drive.to_ascii_lowercase() as char)
+                    }
+                    Prefix::UNC(server, share) | Prefix::VerbatimUNC(server, share) => format!(
+                        "//{}/{}",
+                        server.to_str()?.to_lowercase(),
+                        share.to_str()?.to_lowercase()
+                    ),
+                    _ => prefix.as_os_str().to_str()?.to_lowercase(),
+                };
+                keys.push(PathKey::Name {
+                    original: key.clone(),
+                    key,
+                });
+            }
+            Component::RootDir => keys.push(PathKey::Root),
+            Component::CurDir => {}
+            Component::ParentDir => keys.push(PathKey::Parent),
+            Component::Normal(name) => {
+                let original = name.to_str()?.to_string();
+                keys.push(PathKey::Name {
+                    key: fold(&original),
+                    original,
+                });
+            }
+        }
+    }
+    Some(keys)
 }
 
 fn normalize_task_paths(

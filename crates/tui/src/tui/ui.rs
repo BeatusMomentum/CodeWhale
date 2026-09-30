@@ -62,7 +62,7 @@ use crate::config::{
 };
 use crate::core::engine::{EngineConfig, EngineHandle, spawn_engine};
 use crate::core::events::Event as EngineEvent;
-use crate::core::ops::{Op, ProviderRuntimeStatus, USER_SHELL_TOOL_ID_PREFIX, UserInputProvenance};
+use crate::core::ops::{Op, ProviderRuntimeStatus, UserInputProvenance};
 use crate::hooks::{HookEvent, HookExecutor, TurnEndPayloadInput, TurnEndTotals};
 use crate::llm_client::LlmClient;
 use crate::prompts;
@@ -262,7 +262,7 @@ const REQUIRED_RELEASE_ASSETS: &[&str] = &[
 
 type AppTerminal = Terminal<ColorCompatBackend<Stdout>>;
 
-type PendingToolUses = Vec<(String, String, serde_json::Value)>;
+type PendingToolUses = Vec<ContentBlock>;
 
 #[derive(Debug)]
 enum TranslationEvent {
@@ -767,10 +767,6 @@ pub(crate) struct UserDispatchOutcome {
     effective_provider_label: String,
     effective_reasoning_effort: EffectiveReasoningEffort,
     auto_selection: Option<crate::model_routing::AutoRouteSelection>,
-}
-
-fn is_model_visible_tool_call(id: &str) -> bool {
-    !id.starts_with(USER_SHELL_TOOL_ID_PREFIX)
 }
 
 /// Tell the operator that an explicit "make this my default" request did not

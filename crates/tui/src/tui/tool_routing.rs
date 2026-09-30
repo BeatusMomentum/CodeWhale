@@ -2308,6 +2308,97 @@ mod tests {
         assert_eq!(app.history.len(), 1);
     }
 
+    fn workflow_card(record: serde_json::Value) -> HistoryCell {
+        HistoryCell::Tool(ToolCell::Generic(GenericToolCell {
+            name: "workflow".to_string(),
+            status: ToolStatus::Success,
+            input_summary: None,
+            output: Some(record.to_string()),
+            prompts: None,
+            spillover_path: None,
+            output_summary: None,
+            is_diff: false,
+        }))
+    }
+
+    fn is_finish_card(cell: &HistoryCell) -> bool {
+        let HistoryCell::Tool(ToolCell::Generic(tool)) = cell else {
+            return false;
+        };
+        tool.output
+            .as_deref()
+            .and_then(|out| serde_json::from_str::<serde_json::Value>(out).ok())
+            .is_some_and(|value| value.get("transcript_line").is_some())
+    }
+
+    fn settle_run(app: &mut App, run_id: &str) {
+        for event in [
+            json!({"type": "run_started", "workflow_goal": "quick", "at_ms": 1_000}),
+            json!({"type": "run_completed", "status": "failed", "error": "script error", "at_ms": 1_355}),
+        ] {
+            apply_workflow_ui_event(app, run_id, &event);
+        }
+    }
+
+    #[test]
+    fn a_status_poll_that_returned_the_settled_record_is_the_only_finish() {
+        let mut app = crate::test_support::test_app_with_options(
+            crate::test_support::test_tui_options(std::path::PathBuf::from(".")),
+        );
+        let mut active = crate::tui::active_cell::ActiveCell::new();
+        active.push_untracked(workflow_card(
+            json!({"run_id": "run-x", "workflow_goal": "quick", "status": "running"}),
+        ));
+        active.push_untracked(workflow_card(
+            json!({"run_id": "run-x", "workflow_goal": "quick", "status": "failed"}),
+        ));
+        app.active_cell = Some(active);
+        settle_run(&mut app, "run-x");
+        app.flush_active_cell();
+
+        assert_eq!(app.history.len(), 2, "no extra finish appended");
+        assert!(
+            !app.history.iter().any(is_finish_card),
+            "the poll already shows the finish; the start card must not repeat it"
+        );
+    }
+
+    #[test]
+    fn the_finish_rewrites_the_start_card_not_a_later_status_poll() {
+        let mut app = crate::test_support::test_app_with_options(
+            crate::test_support::test_tui_options(std::path::PathBuf::from(".")),
+        );
+        let running = json!({"run_id": "run-x", "workflow_goal": "quick", "status": "running"});
+        app.add_message(workflow_card(running.clone()));
+        app.add_message(workflow_card(running));
+        settle_run(&mut app, "run-x");
+
+        assert_eq!(app.history.len(), 2);
+        assert!(is_finish_card(&app.history[0]), "the start card settles");
+        assert!(!is_finish_card(&app.history[1]), "the poll is left alone");
+    }
+
+    #[test]
+    fn a_run_that_settles_after_the_conversation_moved_on_finishes_at_the_tail() {
+        let mut app = crate::test_support::test_app_with_options(
+            crate::test_support::test_tui_options(std::path::PathBuf::from(".")),
+        );
+        app.add_message(workflow_card(
+            json!({"run_id": "run-x", "workflow_goal": "quick", "status": "running"}),
+        ));
+        app.add_message(HistoryCell::User {
+            content: "meanwhile, something else".to_string(),
+        });
+        settle_run(&mut app, "run-x");
+
+        assert_eq!(app.history.len(), 3, "the finish is appended");
+        assert!(!is_finish_card(&app.history[0]));
+        assert!(
+            is_finish_card(&app.history[2]),
+            "the finish sits at the tail"
+        );
+    }
+
     #[cfg(unix)]
     fn hook_log_lines_eventually(path: &std::path::Path, expected: usize) -> Vec<String> {
         for _ in 0..100 {

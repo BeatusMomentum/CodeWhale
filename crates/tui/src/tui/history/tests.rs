@@ -2111,6 +2111,7 @@ fn replay_routes_repair_receipts_and_plan_calls_to_typed_cells() {
     let plan = Message {
         role: Role::Assistant,
         content: vec![ContentBlock::ToolUse {
+            execution_id: None,
             id: "plan-1".to_string(),
             name: "update_plan".to_string(),
             input: serde_json::json!({

@@ -118,6 +118,9 @@ async fn fixture(mode: &'static str, first_tokens: u64, max_steps: u32) -> Fixtu
             initial_delay: Some(0.0),
             max_delay: Some(0.0),
             exponential_base: Some(1.0),
+            jitter: None,
+            jitter_factor: None,
+            respect_retry_after: None,
         }),
         ..Default::default()
     }
@@ -1048,6 +1051,7 @@ fn assistant_message(content: Vec<ContentBlock>) -> Message {
 
 fn tool_use(name: &str, input: Value) -> ContentBlock {
     ContentBlock::ToolUse {
+        execution_id: None,
         id: format!("call_{name}"),
         name: name.to_string(),
         input,
@@ -1133,4 +1137,22 @@ fn fallback_partial_text_is_silent_only_when_nothing_was_recorded() {
         budget_handback::fallback_partial_text(&user_only)
             .contains("No assistant text was recorded")
     );
+}
+
+#[test]
+fn budget_repair_only_rewrites_the_newly_synthesized_final_execution() {
+    for (first, last) in [(Some("first"), Some("last")), (None, None)] {
+        let mut messages: Vec<Message> = serde_json::from_value(json!([
+            {"role":"assistant","content":[{"type":"tool_use","id":"reused","execution_id":first,"name":"read","input":{}}]},
+            {"role":"user","content":[{"type":"tool_result","tool_use_id":"reused","execution_id":first,"content":"earlier completed output"}]},
+            {"role":"assistant","content":[{"type":"tool_use","id":"reused","execution_id":last,"name":"read","input":{}}]}
+        ])).unwrap();
+        let earlier = messages[..2].to_vec();
+        budget_handback::repair_stopped_tool_calls(&mut messages, "fixture deadline");
+        assert_eq!(&messages[..2], earlier.as_slice());
+        assert!(
+            matches!(&messages[3].content[0], ContentBlock::ToolResult { execution_id, content, .. }
+            if execution_id.as_deref() == last && content.contains("budget_exhausted"))
+        );
+    }
 }

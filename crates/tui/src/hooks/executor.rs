@@ -47,6 +47,10 @@ pub struct HookContext {
     /// command usually has no exit code, so this is how a hook tells it apart
     /// from a tool that reported nothing.
     pub tool_status: Option<String>,
+    /// Serialized post-admission shell execution receipt (#6689), exported as
+    /// `DEEPSEEK_TOOL_EXECUTION_RECEIPT`. Complete JSON or absent — never a
+    /// truncated document — and at most [`HOOK_EXECUTION_RECEIPT_MAX_BYTES`].
+    pub tool_execution_receipt: Option<String>,
     /// Whether tool succeeded
     pub tool_success: Option<bool>,
     /// Current mode
@@ -115,6 +119,7 @@ impl HookContext {
         };
         let mut context = self.with_tool_result(&text, success, reported_tool_exit_code(result));
         context.tool_status = reported_tool_status(result).map(str::to_string);
+        context.tool_execution_receipt = reported_tool_execution_receipt(result);
         context
     }
 
@@ -179,6 +184,15 @@ impl HookContext {
         bound(&mut self.message, HOOK_MESSAGE_CONTEXT_MAX_BYTES);
         bound(&mut self.error_message, HOOK_ERROR_CONTEXT_MAX_BYTES);
         bound(&mut self.model, HOOK_OBSERVER_METADATA_MAX_BYTES);
+        // A receipt is complete JSON or nothing: truncating it would export a
+        // broken document, so an oversized one is dropped instead.
+        if self
+            .tool_execution_receipt
+            .as_ref()
+            .is_some_and(|receipt| receipt.len() > HOOK_EXECUTION_RECEIPT_MAX_BYTES)
+        {
+            self.tool_execution_receipt = None;
+        }
         if let Some(workspace) = self.workspace.take() {
             self.workspace = Some(PathBuf::from(truncate_env_value(
                 &workspace.to_string_lossy(),
@@ -224,6 +238,14 @@ impl HookContext {
         }
         if let Some(ref status) = self.tool_status {
             env.insert("DEEPSEEK_TOOL_STATUS".to_string(), status.clone());
+        }
+        if let Some(ref receipt) = self.tool_execution_receipt
+            && receipt.len() <= HOOK_EXECUTION_RECEIPT_MAX_BYTES
+        {
+            env.insert(
+                "DEEPSEEK_TOOL_EXECUTION_RECEIPT".to_string(),
+                receipt.clone(),
+            );
         }
         if let Some(ref mode) = self.mode {
             env.insert("DEEPSEEK_MODE".to_string(), mode.clone());
@@ -404,6 +426,12 @@ const HOOK_TOOL_ARGS_ENV_MAX_BYTES: usize = 10_000;
 
 /// Largest raw tool result retained in an observer job before enqueue.
 const HOOK_TOOL_RESULT_CONTEXT_MAX_BYTES: usize = 10_000;
+
+/// Largest serialized shell execution receipt exported through
+/// `DEEPSEEK_TOOL_EXECUTION_RECEIPT`. The shell tool fits its output previews
+/// beneath this bound; the hook boundary drops anything larger rather than
+/// truncate a JSON document.
+pub(crate) const HOOK_EXECUTION_RECEIPT_MAX_BYTES: usize = 32 * 1024;
 
 /// Largest error retained in an observer job before enqueue.
 const HOOK_ERROR_CONTEXT_MAX_BYTES: usize = 5_000;
@@ -1435,6 +1463,9 @@ impl HookExecutor {
             // raw_arg: cmd.exe does not parse the CRT-style \" escapes that
             // Command::arg would insert, so pass the command line verbatim.
             cmd.arg("/C").raw_arg(command);
+            // Only this call's context may supply a receipt. In particular,
+            // a Codewhale launched from another hook must not inherit one.
+            cmd.env_remove("DEEPSEEK_TOOL_EXECUTION_RECEIPT");
             cmd
         }
         #[cfg(not(windows))]
@@ -1446,6 +1477,9 @@ impl HookExecutor {
                 use std::os::unix::process::CommandExt as _;
                 cmd.process_group(0);
             }
+            // Only this call's context may supply a receipt. In particular,
+            // a Codewhale launched from another hook must not inherit one.
+            cmd.env_remove("DEEPSEEK_TOOL_EXECUTION_RECEIPT");
             cmd
         }
     }
@@ -3009,6 +3043,24 @@ fn reported_tool_status(
         "Running" => Some("running"),
         _ => None,
     }
+}
+
+/// Read the post-admission execution receipt a shell tool recorded (#6689),
+/// serialized for `DEEPSEEK_TOOL_EXECUTION_RECEIPT`.
+///
+/// Only a schema-1 object within the size bound counts. The receipt is built
+/// by the shell tool from what its process manager recorded at spawn; it is
+/// never reconstructed here from the before-hook input, which can differ from
+/// what actually ran.
+fn reported_tool_execution_receipt(
+    result: &Result<crate::tools::spec::ToolResult, crate::tools::spec::ToolError>,
+) -> Option<String> {
+    let receipt = reported_tool_metadata(result)?.get("execution_receipt")?;
+    if receipt.get("schema_version")?.as_u64()? != 1 {
+        return None;
+    }
+    let encoded = serde_json::to_string(receipt).ok()?;
+    (encoded.len() <= HOOK_EXECUTION_RECEIPT_MAX_BYTES).then_some(encoded)
 }
 
 /// Read the process exit code a tool reported, when it reported one.
@@ -5615,6 +5667,130 @@ command = "echo project"
             error,
             "turn_end observer hook dispatcher is unavailable; event was not submitted"
         );
+    }
+
+    /// #6689: `DEEPSEEK_TOOL_EXECUTION_RECEIPT` is read from the metadata a
+    /// shell tool recorded — on a failed call as well as a successful one —
+    /// and is complete JSON or absent. The existing variables do not change.
+    #[test]
+    fn execution_receipt_env_is_complete_json_or_absent() {
+        use crate::tools::spec::{ToolError, ToolResult};
+
+        let receipt = json!({"schema_version": 1, "command": "printf effective",
+            "cwd": "/tmp", "state": "completed", "scope": "local", "exit_code": 7,
+            "stdout": "\u{1f40b}", "stderr": "", "stdout_truncated": false,
+            "stderr_truncated": false, "output_kind": "separate"});
+        let plain = HookContext::new()
+            .with_tool_name("Bash")
+            .with_tool_outcome(&Ok(ToolResult::success("out")));
+        let legacy = plain.to_env_vars();
+        assert!(!legacy.contains_key("DEEPSEEK_TOOL_EXECUTION_RECEIPT"));
+
+        let with_receipt = HookContext::new()
+            .with_tool_name("Bash")
+            .with_tool_outcome(&Ok(
+                ToolResult::success("out").with_metadata(json!({"execution_receipt": receipt}))
+            ));
+        let mut env = with_receipt.to_env_vars();
+        let encoded = env
+            .remove("DEEPSEEK_TOOL_EXECUTION_RECEIPT")
+            .expect("receipt exported");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&encoded).unwrap(),
+            receipt
+        );
+        assert_eq!(env, legacy, "existing variables are unchanged");
+
+        let failed =
+            HookContext::new().with_tool_outcome(&Err(ToolError::execution_failed_with_metadata(
+                "boom",
+                json!({"exit_code": 7, "execution_receipt": receipt}),
+            )));
+        assert!(
+            failed
+                .to_env_vars()
+                .contains_key("DEEPSEEK_TOOL_EXECUTION_RECEIPT")
+        );
+
+        // An unknown schema or an oversized document is dropped, not cut.
+        for bad in [
+            json!({"schema_version": 2, "command": "x"}),
+            json!({"command": "x"}),
+            json!({"schema_version": 1,
+                "stdout": "x".repeat(super::HOOK_EXECUTION_RECEIPT_MAX_BYTES)}),
+        ] {
+            let context = HookContext::new().with_tool_outcome(&Ok(
+                ToolResult::success("out").with_metadata(json!({"execution_receipt": bad}))
+            ));
+            assert!(context.tool_execution_receipt.is_none());
+        }
+        let oversized = HookContext {
+            tool_execution_receipt: Some("x".repeat(super::HOOK_EXECUTION_RECEIPT_MAX_BYTES + 1)),
+            ..HookContext::new()
+        };
+        assert!(
+            !oversized
+                .to_env_vars()
+                .contains_key("DEEPSEEK_TOOL_EXECUTION_RECEIPT")
+        );
+        assert!(
+            oversized
+                .bounded_for_observer()
+                .tool_execution_receipt
+                .is_none()
+        );
+    }
+
+    /// An absent receipt must be absent in the actual child environment,
+    /// even when a nested Codewhale inherited an outer hook's receipt.
+    #[cfg(unix)]
+    #[test]
+    fn execution_receipt_never_inherits_another_calls_environment() {
+        let _env = lock_test_env();
+        let _stale = EnvVarGuard::set("DEEPSEEK_TOOL_EXECUTION_RECEIPT", "stale-outer-receipt");
+        let current = r#"{"schema_version":1,"command":"current call"}"#;
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("receipt-env.txt");
+        let command = write_hook_script(
+            &dir,
+            "capture_receipt_env.sh",
+            &format!(
+                "#!/bin/sh\nprintf '%s' \"${{DEEPSEEK_TOOL_EXECUTION_RECEIPT-unset}}\" > {}\n",
+                out.display()
+            ),
+        );
+        for background in [false, true] {
+            let mut hook = Hook::new(HookEvent::ToolCallAfter, &command);
+            hook.background = background;
+            let executor = HookExecutor::new(
+                HooksConfig {
+                    enabled: true,
+                    hooks: vec![hook],
+                    ..HooksConfig::default()
+                },
+                dir.path().to_path_buf(),
+            );
+            for (receipt, expected) in [
+                (None, "unset"),
+                (
+                    Some("x".repeat(HOOK_EXECUTION_RECEIPT_MAX_BYTES + 1)),
+                    "unset",
+                ),
+                (Some(current.to_string()), current),
+            ] {
+                if out.exists() {
+                    std::fs::remove_file(&out).unwrap();
+                }
+                let context = HookContext {
+                    tool_execution_receipt: receipt,
+                    ..HookContext::new()
+                };
+                let results = executor.execute(HookEvent::ToolCallAfter, &context);
+                assert_eq!(results.len(), 1);
+                assert!(results[0].success);
+                assert_eq!(wait_for_captured_output(&out), expected);
+            }
+        }
     }
 
     #[test]

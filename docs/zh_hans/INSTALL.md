@@ -40,7 +40,7 @@ command -v codewhale codew
 验证路径和版本后，将所选目录放到 shell 配置的 PATH 最前面。今后使用该目录中
 `codewhale` 的完整路径运行 `update`。Windows 使用官方 GitHub Release 安装器或压缩包，
 并通过 `Get-Command codewhale, codew -All` 检查路径。完整迁移说明见
-[英文安装指南](../INSTALL.md#recommended-official-github-releases)。
+[英文安装指南](../INSTALL.md#2-recommended-installer-curl--sh)。
 
 ---
 
@@ -94,7 +94,7 @@ cargo install codewhale-cli --locked   # 安装 codewhale
 > 使用HarmonyOS 轻薄本、Asahi Linux、树莓派(Raspberry Pi)、AWS Graviton 等的用户会从 `npm i -g codewhale` 看到 `Unsupported architecture: arm64`。
 > v0.8.8 发布了 `codewhale-linux-arm64`，因此普通的 `npm i -g codewhale` 可在任何基于 glibc 的 ARM64 Linux 上工作。
 > 如果你还卡在 v0.8.7，直接跳到[从源码构建](#7-从源码构建)——`cargo install` 完全可用。
-> HarmonyOS PC 与 OpenHarmony 交叉构建设置，见 [HarmonyOS 与 OpenHarmony](../HarmonyOS.md)。
+> HarmonyOS PC 与 OpenHarmony 交叉构建设置，见 [HarmonyOS 与 OpenHarmony](./HarmonyOS.md)。
 
 ### Android / Termux arm64
 

@@ -51,8 +51,8 @@ or contact external services.
 `hello-codewhale:hello`，同时不调用工具、不运行命令、不读写文件、不联系外部服务。
 Codewhale 会自动发现 `skills/`。`explicit-only` 表示此示例不进入模型的自动
 skill 目录，而是由你按名称加载。调用元数据见
-[Skills](../SKILLS.md#invocation-and-alias-metadata)，清单格式以
-[插件包契约](../PLUGIN_BUNDLES.md#manifest)为准。
+[Skills](./SKILLS.md#调用与别名元数据)，清单格式以
+[插件包契约](./PLUGIN_BUNDLES.md#清单)为准。
 新原生插件使用 `plugin.json` 即可，无需再写另一份清单。
 
 ## 2. 安装、检查并信任
@@ -122,7 +122,7 @@ Codewhale 确认激活后，再发送普通消息 `请打个招呼。`。
 
 卸载只删除已安装的副本，保留原始示例源文件。审查新的令牌，确认信任后再启用。
 从远程来源安装的插件使用 `/plugin update <name>`；详情见
-[插件安装指南](../PLUGINS.md#update-and-uninstall)。
+[插件安装指南](./PLUGINS.md#更新与卸载)。
 
 直接修改已发现插件目录内的文件后，使用 `/plugin reload` 刷新注册表。
 即使版本号没变，内容变化也会使旧信任记录失效。重新加载不会授予信任。
@@ -134,24 +134,31 @@ Codewhale 确认激活后，再发送普通消息 `请打个招呼。`。
 
 | 组件 | 编写方式 |
 | --- | --- |
-| Skills | `skills/<name>/SKILL.md`；参见[指令与调用契约](../SKILLS.md)。 |
-| MCP | 与清单同级的 `mcp.json`；参见[插件传输与凭据规则](../PLUGIN_BUNDLES.md#validation-both-formats)。 |
+| Skills | `skills/<name>/SKILL.md`；参见[指令与调用契约](./SKILLS.md)。 |
+| MCP | 与清单同级的 `mcp.json`；参见[插件传输与凭据规则](./PLUGIN_BUNDLES.md#校验两种格式)。 |
 | Commands | Markdown 命令文件；参见[命令元数据](../architecture/command-dispatch.md#user-commands)。 |
-| Agent profiles | Fleet TOML 配置文件；参见[Fleet 编写指南](../FLEET.md#authoring-agent-profiles-fleet-setup)。 |
-| Hooks | `HooksConfig` TOML 文件；参见[事件与进程行为](../HOOKS.md)。 |
+| Agent profiles | Fleet TOML 配置文件；参见[Fleet 编写指南](./FLEET.md#编写-agent-配置fleet-setup)。 |
+| Hooks | `HooksConfig` TOML 文件；参见[事件与进程行为](./HOOKS.md)。 |
 
 Commands、Agents 和 Hooks 的路径声明放在 `plugin.json` 的
 `extensions["net.codewhale"]` 中，详见
-[插件组件契约](../PLUGIN_BUNDLES.md#active-and-inactive-component-surfaces)。
+[插件组件契约](./PLUGIN_BUNDLES.md#生效与未生效的组件面)。
 不要把 MCP 服务器字段或任意运行时入口放在清单根级。
-LSP 和原生扩展可以列入清单，但目前没有可执行的插件适配器。
+LSP 可以列入清单，但目前没有可执行的适配器。`native` 原生扩展默认只列入清单；
+开启实验性的 `[features] extension_host` 后，它必须指向一个 `.mjs`、`.js` 或 `.mts`
+ES 模块文件，由 TypeScript 扩展宿主运行，`/plugin validate` 会拒绝其他入口。
+其工具始终使用 `Required` 审批要求，不采信插件自行声明的只读提示；
+Full Access、Bypass 或针对该已审查版本和精确调用的会话授权可满足要求而不再弹出审批
+（[设计文档](../design/TS_EXTENSION_HOST.md#as-built-phase-1-2026-09-25)）。
+可运行的类型化示例、生命周期和按插件归属显示的诊断见
+[扩展工具编写指南](../EXTENSIONS.md)。`.mts` 仅支持 Node 可直接擦除的类型语法。
 
 插件信任**不是操作系统沙箱**。本地 MCP 服务器或 hook 可以启动进程；
 启用前需审查其代码和权限。Skills 不授予权限：仓库指令、权限规则、沙箱策略
 和工具审批仍然适用。不要在插件包或命令参数中保存凭据。
-MCP 使用[插件验证契约](../PLUGIN_BUNDLES.md#validation-both-formats)规定的、
+MCP 使用[插件验证契约](./PLUGIN_BUNDLES.md#校验两种格式)规定的、
 经过审查的环境变量引用；添加 hook 前，请阅读独立的
-[hook 环境契约](../HOOKS.md#the-hook-process-environment)。
+[hook 环境契约](./HOOKS.md#hook-进程环境)。
 
 ## 转换现有插件
 

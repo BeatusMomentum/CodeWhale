@@ -1756,6 +1756,18 @@ pub struct RetryConfig {
     pub initial_delay: Option<f64>,
     pub max_delay: Option<f64>,
     pub exponential_base: Option<f64>,
+    /// #6700: randomize each backoff delay by `jitter_factor`. Default `true`.
+    #[serde(default)]
+    pub jitter: Option<bool>,
+    /// #6700: jitter spread as a fraction of the delay (`0.1` = ±10%).
+    /// Default `0.1`; values clamp to `0.0..=1.0`, non-finite values use the
+    /// default.
+    #[serde(default)]
+    pub jitter_factor: Option<f64>,
+    /// #6700: honor a server `Retry-After` header instead of the computed
+    /// backoff. Default `true`.
+    #[serde(default)]
+    pub respect_retry_after: Option<bool>,
 }
 
 /// Deserialize `status_items` tolerantly: skip keys unknown to this build
@@ -1778,6 +1790,29 @@ where
             })
             .collect()
     }))
+}
+
+/// Canonical model-stream and transport settings. The existing `Config`
+/// accessors own resolution; `[tui]` spellings remain read-only compatibility.
+/// Transport changes apply to newly constructed clients, not active requests.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct StreamConfig {
+    pub open_timeout_secs: Option<u64>,
+    pub chunk_timeout_secs: Option<u64>,
+    pub force_http1: Option<bool>,
+    pub max_resumes: Option<u32>,
+    pub max_transparent_retries: Option<u32>,
+    pub max_stream_errors: Option<u32>,
+    pub max_duration_secs: Option<u64>,
+    pub max_content_mb: Option<u64>,
+    pub connect_timeout_secs: Option<u64>,
+    /// Omitted keeps 30 seconds; zero disables TCP keepalive.
+    pub tcp_keepalive_secs: Option<u64>,
+    /// Omitted keeps 15 seconds; zero disables HTTP/2 PINGs.
+    pub http2_keep_alive_interval_secs: Option<u64>,
+    /// Omitted or zero keeps the 20-second PING acknowledgement deadline.
+    pub http2_keep_alive_timeout_secs: Option<u64>,
 }
 
 /// UI configuration loaded from config files.
@@ -1831,6 +1866,10 @@ pub struct TuiConfig {
     /// #6700: TCP/TLS connect timeout for the model HTTP client, in seconds.
     /// Omitted or `0` resolve to the default (30); values clamp to `1..=300`.
     pub connect_timeout_secs: Option<u64>,
+    /// #6700: pin the model HTTP client to HTTP/1.1 (config form of
+    /// `CODEWHALE_FORCE_HTTP1`). Omitted or `false` leaves HTTP/2 on unless
+    /// the env var is truthy; either one pins.
+    pub force_http1: Option<bool>,
     /// Ordered list of footer items the user wants visible. `None` (the field
     /// missing from `config.toml`) means "use the built-in default order"; an
     /// empty `Some(vec![])` means "show nothing in the footer".
@@ -2350,6 +2389,9 @@ pub struct RetryPolicy {
     pub initial_delay: f64,
     pub max_delay: f64,
     pub exponential_base: f64,
+    pub jitter: bool,
+    pub jitter_factor: f64,
+    pub respect_retry_after: bool,
 }
 
 /// Context management configuration.
@@ -3092,6 +3134,7 @@ pub struct Config {
     #[serde(alias = "maxSubagents")]
     pub max_subagents: Option<usize>,
     pub retry: Option<RetryConfig>,
+    pub stream: Option<StreamConfig>,
     pub features: Option<FeaturesToml>,
     /// Experimental TypeScript extension host settings.
     #[serde(default)]
@@ -5219,52 +5262,40 @@ impl Config {
             )
             .into());
         }
-        if let Some(policy) = self.approval_policy.as_deref() {
-            let normalized = policy.trim().to_ascii_lowercase();
-            if !matches!(
-                normalized.as_str(),
-                "on-request" | "untrusted" | "never" | "auto" | "suggest"
-            ) {
+        // One vocabulary with `codewhale config set`, which refuses the same
+        // values before writing them (`codewhale_config::config_toml_choices`).
+        for (key, value, replacement, env_var) in [
+            (
+                "approval_policy",
+                self.approval_policy.as_deref(),
+                "on-request",
+                Some("CODEWHALE_APPROVAL_POLICY"),
+            ),
+            ("verbosity", self.verbosity.as_deref(), "normal", None),
+            (
+                "sandbox_mode",
+                self.sandbox_mode.as_deref(),
+                "workspace-write",
+                Some("CODEWHALE_SANDBOX_MODE"),
+            ),
+        ] {
+            let (Some(value), Some(choices)) = (value, codewhale_config::config_toml_choices(key))
+            else {
+                continue;
+            };
+            if !choices.contains(&value.trim().to_ascii_lowercase().as_str()) {
+                let expected = match choices.split_last() {
+                    Some((last, [])) => (*last).to_string(),
+                    Some((last, [only])) => format!("{only} or {last}"),
+                    Some((last, rest)) => format!("{}, or {last}", rest.join(", ")),
+                    None => String::new(),
+                };
+                let displayed_value = codewhale_secrets::redact::redact_secrets(value);
                 return Err(SafeConfigDiagnostic::invalid_value(
-                    "approval_policy",
-                    policy,
-                    "on-request, untrusted, never, auto, or suggest",
-                    user_config_fix(
-                        "approval_policy",
-                        "on-request",
-                        Some("CODEWHALE_APPROVAL_POLICY"),
-                    ),
-                )
-                .into());
-            }
-        }
-        if let Some(v) = self.verbosity.as_deref() {
-            let normalized = v.trim().to_ascii_lowercase();
-            if !matches!(normalized.as_str(), "normal" | "concise") {
-                return Err(SafeConfigDiagnostic::invalid_value(
-                    "verbosity",
-                    v,
-                    "normal or concise",
-                    user_config_fix("verbosity", "normal", None),
-                )
-                .into());
-            }
-        }
-        if let Some(mode) = self.sandbox_mode.as_deref() {
-            let normalized = mode.trim().to_ascii_lowercase();
-            if !matches!(
-                normalized.as_str(),
-                "read-only" | "workspace-write" | "danger-full-access" | "external-sandbox"
-            ) {
-                return Err(SafeConfigDiagnostic::invalid_value(
-                    "sandbox_mode",
-                    mode,
-                    "read-only, workspace-write, danger-full-access, or external-sandbox",
-                    user_config_fix(
-                        "sandbox_mode",
-                        "workspace-write",
-                        Some("CODEWHALE_SANDBOX_MODE"),
-                    ),
+                    key,
+                    &displayed_value,
+                    &expected,
+                    user_config_fix(key, replacement, env_var),
                 )
                 .into());
             }
@@ -7997,7 +8028,7 @@ impl Config {
 
     /// Resolved per-SSE-chunk idle timeout in seconds.
     ///
-    /// Reads `[tui].stream_chunk_timeout_secs`, falling back to the
+    /// Reads `[stream].chunk_timeout_secs`, then legacy `[tui]`, then the
     /// `CODEWHALE_STREAM_IDLE_TIMEOUT_SECS` env var (legacy alias:
     /// `DEEPSEEK_STREAM_IDLE_TIMEOUT_SECS`) when the config key is
     /// omitted. `None` or `0` resolve to the default 900 seconds; explicit
@@ -8005,9 +8036,14 @@ impl Config {
     #[must_use]
     pub fn stream_chunk_timeout_secs(&self) -> u64 {
         let raw = self
-            .tui
+            .stream
             .as_ref()
-            .and_then(|cfg| cfg.stream_chunk_timeout_secs)
+            .and_then(|cfg| cfg.chunk_timeout_secs)
+            .or_else(|| {
+                self.tui
+                    .as_ref()
+                    .and_then(|cfg| cfg.stream_chunk_timeout_secs)
+            })
             .or_else(|| {
                 std::env::var(STREAM_CHUNK_TIMEOUT_ENV)
                     .or_else(|_| std::env::var(LEGACY_STREAM_CHUNK_TIMEOUT_ENV))
@@ -8063,7 +8099,10 @@ impl Config {
     #[must_use]
     pub fn stream_max_content_bytes(&self) -> usize {
         crate::core::engine::turn_budget::resolve_stream_max_content_bytes(
-            self.tui.as_ref().and_then(|cfg| cfg.stream_max_content_mb),
+            self.stream
+                .as_ref()
+                .and_then(|cfg| cfg.max_content_mb)
+                .or_else(|| self.tui.as_ref().and_then(|cfg| cfg.stream_max_content_mb)),
         )
     }
 
@@ -8072,22 +8111,33 @@ impl Config {
     pub fn stream_max_duration(&self) -> std::time::Duration {
         std::time::Duration::from_secs(
             crate::core::engine::turn_budget::resolve_stream_max_duration_secs(
-                self.tui
+                self.stream
                     .as_ref()
-                    .and_then(|cfg| cfg.stream_max_duration_secs),
+                    .and_then(|cfg| cfg.max_duration_secs)
+                    .or_else(|| {
+                        self.tui
+                            .as_ref()
+                            .and_then(|cfg| cfg.stream_max_duration_secs)
+                    }),
             ),
         )
     }
 
-    /// #6700: resolved stream retry budgets (`[tui].stream_max_resumes`,
-    /// `stream_max_transparent_retries`, `stream_max_errors`).
+    /// Resolved `[stream]` retry budgets, falling back to legacy `[tui]` keys.
     #[must_use]
     pub fn stream_retry_limits(&self) -> crate::core::engine::turn_budget::StreamRetryLimits {
         let tui = self.tui.as_ref();
+        let stream = self.stream.as_ref();
         crate::core::engine::turn_budget::resolve_stream_retry_limits(
-            tui.and_then(|cfg| cfg.stream_max_resumes),
-            tui.and_then(|cfg| cfg.stream_max_transparent_retries),
-            tui.and_then(|cfg| cfg.stream_max_errors),
+            stream
+                .and_then(|cfg| cfg.max_resumes)
+                .or_else(|| tui.and_then(|cfg| cfg.stream_max_resumes)),
+            stream
+                .and_then(|cfg| cfg.max_transparent_retries)
+                .or_else(|| tui.and_then(|cfg| cfg.stream_max_transparent_retries)),
+            stream
+                .and_then(|cfg| cfg.max_stream_errors)
+                .or_else(|| tui.and_then(|cfg| cfg.stream_max_errors)),
         )
     }
 
@@ -8095,20 +8145,98 @@ impl Config {
     #[must_use]
     pub fn stream_open_timeout(&self) -> std::time::Duration {
         crate::client::resolve_stream_open_timeout(
-            self.tui
+            self.stream
                 .as_ref()
-                .and_then(|cfg| cfg.stream_open_timeout_secs),
+                .and_then(|cfg| cfg.open_timeout_secs)
+                .or_else(|| {
+                    self.tui
+                        .as_ref()
+                        .and_then(|cfg| cfg.stream_open_timeout_secs)
+                }),
         )
+    }
+
+    /// #6700: whether the model HTTP client is pinned to HTTP/1.1 —
+    /// `[stream].force_http1` (legacy `[tui]` fallback), OR the environment pin.
+    #[must_use]
+    pub fn force_http1(&self) -> bool {
+        self.stream
+            .as_ref()
+            .and_then(|cfg| cfg.force_http1)
+            .or_else(|| self.tui.as_ref().and_then(|cfg| cfg.force_http1))
+            .unwrap_or(false)
+            || crate::client::force_http1_from_env()
     }
 
     /// #6700: resolved TCP/TLS connect timeout for the model HTTP client.
     #[must_use]
     pub fn connect_timeout(&self) -> std::time::Duration {
-        let secs = match self.tui.as_ref().and_then(|cfg| cfg.connect_timeout_secs) {
+        let secs = match self
+            .stream
+            .as_ref()
+            .and_then(|cfg| cfg.connect_timeout_secs)
+            .or_else(|| self.tui.as_ref().and_then(|cfg| cfg.connect_timeout_secs))
+        {
             None | Some(0) => DEFAULT_CONNECT_TIMEOUT_SECS,
             Some(secs) => secs.clamp(MIN_CONNECT_TIMEOUT_SECS, MAX_CONNECT_TIMEOUT_SECS),
         };
         std::time::Duration::from_secs(secs)
+    }
+
+    /// TCP keepalive idle time. Zero disables; positive values clamp to 1..=3600.
+    pub fn tcp_keepalive(&self) -> Option<std::time::Duration> {
+        let secs = self
+            .stream
+            .as_ref()
+            .and_then(|cfg| cfg.tcp_keepalive_secs)
+            .unwrap_or(30);
+        (secs > 0).then(|| std::time::Duration::from_secs(secs.min(3600)))
+    }
+
+    /// HTTP/2 PING interval for active connections (not idle pooled connections).
+    pub fn http2_keep_alive_interval(&self) -> Option<std::time::Duration> {
+        let secs = self
+            .stream
+            .as_ref()
+            .and_then(|cfg| cfg.http2_keep_alive_interval_secs)
+            .unwrap_or(15);
+        (secs > 0).then(|| std::time::Duration::from_secs(secs.min(3600)))
+    }
+
+    pub fn http2_keep_alive_timeout(&self) -> std::time::Duration {
+        let secs = match self
+            .stream
+            .as_ref()
+            .and_then(|cfg| cfg.http2_keep_alive_timeout_secs)
+        {
+            None | Some(0) => 20,
+            Some(secs) => secs.min(3600),
+        };
+        std::time::Duration::from_secs(secs)
+    }
+
+    /// Non-secret effective settings for `config dump`/`get`. This projection
+    /// calls the runtime accessors, so aliases, environment and clamps cannot
+    /// acquire a second policy in the dispatcher. It does not save defaults.
+    pub fn resolved_stream_settings(&self) -> StreamConfig {
+        let limits = self.stream_retry_limits();
+        StreamConfig {
+            open_timeout_secs: Some(self.stream_open_timeout().as_secs()),
+            chunk_timeout_secs: Some(self.stream_chunk_timeout_secs()),
+            force_http1: Some(self.force_http1()),
+            max_resumes: Some(limits.max_resumes),
+            max_transparent_retries: Some(limits.max_transparent_retries),
+            max_stream_errors: Some(limits.max_errors),
+            max_duration_secs: Some(self.stream_max_duration().as_secs()),
+            max_content_mb: Some((self.stream_max_content_bytes() / (1024 * 1024)) as u64),
+            connect_timeout_secs: Some(self.connect_timeout().as_secs()),
+            tcp_keepalive_secs: Some(self.tcp_keepalive().map_or(0, |value| value.as_secs())),
+            http2_keep_alive_interval_secs: Some(
+                self.http2_keep_alive_interval()
+                    .map_or(0, |value| value.as_secs()),
+            ),
+            http2_keep_alive_timeout_secs: Some(self.http2_keep_alive_timeout().as_secs()),
+        }
     }
 
     /// Raw sub-agent model override map. Values are validated at spawn time
@@ -8359,6 +8487,9 @@ impl Config {
             initial_delay: 1.0,
             max_delay: 60.0,
             exponential_base: 2.0,
+            jitter: true,
+            jitter_factor: 0.1,
+            respect_retry_after: true,
         };
 
         let Some(cfg) = &self.retry else {
@@ -8371,6 +8502,14 @@ impl Config {
             initial_delay: cfg.initial_delay.unwrap_or(defaults.initial_delay),
             max_delay: cfg.max_delay.unwrap_or(defaults.max_delay),
             exponential_base: cfg.exponential_base.unwrap_or(defaults.exponential_base),
+            jitter: cfg.jitter.unwrap_or(defaults.jitter),
+            jitter_factor: cfg
+                .jitter_factor
+                .filter(|factor| factor.is_finite())
+                .map_or(defaults.jitter_factor, |factor| factor.clamp(0.0, 1.0)),
+            respect_retry_after: cfg
+                .respect_retry_after
+                .unwrap_or(defaults.respect_retry_after),
         }
     }
 }
@@ -11389,6 +11528,30 @@ fn merge_config(base: Config, override_cfg: Config) -> Config {
         requirements_path: override_cfg.requirements_path.or(base.requirements_path),
         max_subagents: override_cfg.max_subagents.or(base.max_subagents),
         retry: override_cfg.retry.or(base.retry),
+        stream: match (base.stream, override_cfg.stream) {
+            (Some(base), Some(over)) => Some(StreamConfig {
+                open_timeout_secs: over.open_timeout_secs.or(base.open_timeout_secs),
+                chunk_timeout_secs: over.chunk_timeout_secs.or(base.chunk_timeout_secs),
+                force_http1: over.force_http1.or(base.force_http1),
+                max_resumes: over.max_resumes.or(base.max_resumes),
+                max_transparent_retries: over
+                    .max_transparent_retries
+                    .or(base.max_transparent_retries),
+                max_stream_errors: over.max_stream_errors.or(base.max_stream_errors),
+                max_duration_secs: over.max_duration_secs.or(base.max_duration_secs),
+                max_content_mb: over.max_content_mb.or(base.max_content_mb),
+                connect_timeout_secs: over.connect_timeout_secs.or(base.connect_timeout_secs),
+                tcp_keepalive_secs: over.tcp_keepalive_secs.or(base.tcp_keepalive_secs),
+                http2_keep_alive_interval_secs: over
+                    .http2_keep_alive_interval_secs
+                    .or(base.http2_keep_alive_interval_secs),
+                http2_keep_alive_timeout_secs: over
+                    .http2_keep_alive_timeout_secs
+                    .or(base.http2_keep_alive_timeout_secs),
+            }),
+            (base, over) => over.or(base),
+        },
+
         auto_review: override_cfg.auto_review.or(base.auto_review),
         tui: override_cfg.tui.or(base.tui),
         transcript: override_cfg.transcript.or(base.transcript),
@@ -12785,9 +12948,7 @@ fn save_api_key_for_identity_unlocked(
 ) -> Result<SavedCredential> {
     let provider = identity.provider;
     if provider == ApiProvider::OpenaiCodex {
-        anyhow::bail!(
-            "OpenAI Codex uses OAuth. Sign in with ChatGPT via `codewhale auth chatgpt` (subscription billing, Codewhale-owned tokens). The openai API-key route is a different billing owner. Alternatively run `codex login`, then grant exact read-only access with `codewhale auth external-consent --provider openai-codex --mode read-only`, or set OPENAI_CODEX_ACCESS_TOKEN for this process; Codewhale does not store an API key for this provider."
-        );
+        anyhow::bail!(codewhale_config::credentials::OPENAI_CODEX_API_KEY_REFUSAL);
     }
     let is_legacy_literal_custom = provider == ApiProvider::Custom
         && identity.key.trim() == ApiProvider::Custom.as_str()

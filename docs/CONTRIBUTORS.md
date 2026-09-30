@@ -28,15 +28,27 @@ notes, and relevant issue/PR comments.
 ## Contributors by time
 
 <details open>
+<summary><strong>Unreleased</strong></summary>
+
+**Merged or adapted contributions**
+
+- **[SparkofSpike](https://github.com/SparkofSpike)** — translated seventeen more guides into Simplified Chinese, among them plugins, memory, sandbox, workflow authoring, Docker, Termux and HarmonyOS, and brought the existing zh_hans docs onto one terminology standard ([#6662](https://github.com/Hmbown/Codewhale/pull/6662)), then translated thirteen developer and internal docs, among them the runtime API, architecture, tool surface, authorization order, operations runbook and Workroom security ([#6663](https://github.com/Hmbown/Codewhale/pull/6663)).
+- **[harryvgiunta](https://github.com/harryvgiunta)** — added Yolo-Auto as a bundled OpenAI-compatible host descriptor, with its billing basis recorded as unreviewed rather than guessed ([#6408](https://github.com/Hmbown/Codewhale/pull/6408)).
+
+</details>
+
+<details open>
 <summary><strong>v0.10.1 — reliability and first-run fixes</strong></summary>
 
 **Merged or adapted contributions**
 
 - **[gaord](https://github.com/gaord)** — let a client fork a thread at a named turn ([#6580](https://github.com/Hmbown/Codewhale/pull/6580)), let undo roll back files for the turn it is undoing ([#6483](https://github.com/Hmbown/Codewhale/pull/6483)), stopped resume and fork from duplicating threads and sessions ([#6406](https://github.com/Hmbown/Codewhale/pull/6406)), exposed user-defined provider routes to native clients ([#6404](https://github.com/Hmbown/Codewhale/pull/6404)), and kept a fork going when a turn lost its tool call ([#6664](https://github.com/Hmbown/Codewhale/pull/6664)).
-- **[Lstarsky0](https://github.com/Lstarsky0)** — moved the docs/work, legal, digest and FAQ pages onto the dictionary spine ([#6405](https://github.com/Hmbown/Codewhale/pull/6405), [#6417](https://github.com/Hmbown/Codewhale/pull/6417), [#6499](https://github.com/Hmbown/Codewhale/pull/6499), [#6574](https://github.com/Hmbown/Codewhale/pull/6574)), tightened the Chinese-branching ceiling to 18 ([#6403](https://github.com/Hmbown/Codewhale/pull/6403)), and made Fleet publish without a two-link window ([#6431](https://github.com/Hmbown/Codewhale/pull/6431)).
+- **[Lstarsky0](https://github.com/Lstarsky0)** — moved the docs/work, legal, digest and FAQ pages onto the dictionary spine ([#6405](https://github.com/Hmbown/Codewhale/pull/6405), [#6417](https://github.com/Hmbown/Codewhale/pull/6417), [#6499](https://github.com/Hmbown/Codewhale/pull/6499), [#6574](https://github.com/Hmbown/Codewhale/pull/6574)), tightened the Chinese-branching ceiling to 18 ([#6403](https://github.com/Hmbown/Codewhale/pull/6403)), and made Fleet publish without a two-link window ([#6431](https://github.com/Hmbown/Codewhale/pull/6431)). Also moved the constitution page onto the dictionary spine and kept its install link in the selected locale ([#6733](https://github.com/Hmbown/Codewhale/pull/6733)).
 - **[aboimpinto](https://github.com/aboimpinto)** — restored a green Linux full-workspace test gate without loosening any test, twice ([#6581](https://github.com/Hmbown/Codewhale/pull/6581), [#6666](https://github.com/Hmbown/Codewhale/pull/6666)).
 - **[dajiaohuang](https://github.com/dajiaohuang)** — validated `config set` values against the settings schema ([#6568](https://github.com/Hmbown/Codewhale/pull/6568)).
 - **[Water-Run](https://github.com/Water-Run)** — ingested namespaced model-only catalog entries so models present only in the canonical `models` map reach the offering list ([#6400](https://github.com/Hmbown/Codewhale/pull/6400)), and retired the blanket dead-code allowance and its unused feature stages, tightening the budget to match ([#6402](https://github.com/Hmbown/Codewhale/pull/6402)).
+- **[wuisabel-gif](https://github.com/wuisabel-gif)** — designed the `tool_call_after` execution-receipt contract and its tests on a reference branch, which landed re-implemented on the current hook seam ([#6689](https://github.com/Hmbown/Codewhale/issues/6689), [#6713](https://github.com/Hmbown/Codewhale/pull/6713)).
+- **[Sh1Zuku / SparkofSpike](https://github.com/SparkofSpike)** — let making room survive a provider request-body limit (HTTP 413) by shrinking, then replacing, inline images for that one summary pass ([#6642](https://github.com/Hmbown/Codewhale/pull/6642)).
 
 **Reports and reproductions**
 
