@@ -305,13 +305,7 @@ pub struct NodeResolution {
 }
 
 impl NodeResolution {
-    /// One-line human summary of why no runtime was selected.
-    #[must_use]
-    pub fn describe_rejections(&self) -> String {
-        self.describe_rejections_of("node")
-    }
-
-    /// [`Self::describe_rejections`] for a runtime named `program`.
+    /// One-line human summary of why runtime `program` was not selected.
     #[must_use]
     pub fn describe_rejections_of(&self, program: &str) -> String {
         if self.rejected.is_empty() {
@@ -531,21 +525,6 @@ fn probe_runtime_version(kind: HostRuntimeKind, path: &Path) -> Result<(u32, u32
     let banner = String::from_utf8_lossy(&output.stdout);
     kind.parse(&banner)
         .ok_or_else(|| format!("unrecognized version banner `{}`", banner.trim()))
-}
-
-/// Resolve a Node.js runtime for the extension host by trying candidates in
-/// order and keeping the first that *runs* and meets the version floor:
-/// the `[extension_host] node` override, then every `node` on `PATH` (not
-/// only the first — a broken Homebrew node ahead of a working one is a real
-/// failure mode). Blocking: call from `spawn_blocking` in async code.
-///
-/// [`resolve_node`] keeps its single-probe contract for `js_execution`.
-#[must_use]
-pub fn resolve_node_for_extension_host(override_path: Option<&Path>) -> NodeResolution {
-    select_runtime(
-        HostRuntimeKind::Node,
-        runtime_candidates(HostRuntimeKind::Node, override_path),
-    )
 }
 
 /// The override, then every `program` on `PATH`; for Bun also its default

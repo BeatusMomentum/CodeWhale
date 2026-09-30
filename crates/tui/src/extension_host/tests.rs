@@ -291,17 +291,21 @@ fn registry_enforces_schema_and_count_caps() {
 /// A Node for the integration tests, or `None` (skip) when there is none and
 /// the tests were not explicitly required.
 pub(crate) fn node_for_tests(test: &str) -> Option<PathBuf> {
-    let resolution = crate::dependencies::resolve_node_for_extension_host(None);
-    match resolution.selected {
-        Some((path, _)) => Some(path),
+    let resolution = crate::dependencies::resolve_extension_host_runtime(
+        crate::config::ExtensionHostRuntime::Node,
+        None,
+        None,
+    );
+    match resolution.selected.as_ref() {
+        Some(runtime) => Some(runtime.path.clone()),
         None if std::env::var_os("CODEWHALE_EXT_HOST_TESTS").is_some() => panic!(
             "{test}: CODEWHALE_EXT_HOST_TESTS is set but no Node ^22.19 || >=24 was found: {}",
-            resolution.describe_rejections()
+            resolution.failure()
         ),
         None => {
             eprintln!(
                 "skipping {test}: no Node ^22.19 || >=24 ({})",
-                resolution.describe_rejections()
+                resolution.failure()
             );
             None
         }
