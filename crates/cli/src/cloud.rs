@@ -816,31 +816,30 @@ impl<'a, T: CloudTransport> CloudClient<'a, T> {
     fn create_agent_thread(
         &self,
         agent_id: &str,
-        project_id: &str,
+        project_id: Option<&str>,
         title: &str,
         provider: &str,
         model: &str,
         operation_key: &str,
     ) -> Result<AgentThread> {
         let agent_id = validate_resource_id(agent_id, "Agent")?;
-        let project_id = validate_resource_id(project_id, "Project")?;
         let title = validate_named_text(title, "Conversation title", 120)?;
         let (provider, model) = validate_model_route(provider, model)?;
         let operation_key = validate_operation_key(operation_key)?;
-        let response = self.execute_authenticated(
-            HttpMethod::Post,
-            "/v1/threads",
-            Some(json_body(&serde_json::json!({
-                "title": title,
-                "productMode": "chat",
-                "mode": "chat",
-                "agentId": agent_id,
-                "projectId": project_id,
-                "modelProvider": provider,
-                "model": model,
-                "operationKey": operation_key,
-            }))?),
-        )?;
+        let mut body = serde_json::json!({
+            "title": title,
+            "productMode": "chat",
+            "mode": "chat",
+            "agentId": agent_id,
+            "modelProvider": provider,
+            "model": model,
+            "operationKey": operation_key,
+        });
+        if let Some(project_id) = project_id {
+            body["projectId"] = serde_json::json!(validate_resource_id(project_id, "Project")?);
+        }
+        let response =
+            self.execute_authenticated(HttpMethod::Post, "/v1/threads", Some(json_body(&body)?))?;
         let result: ThreadResponse = expect_json(response, &[200, 201])?;
         Ok(result.thread)
     }
@@ -1396,7 +1395,7 @@ fn run_agents<T: CloudTransport, W: Write>(
             if agent.project_id.is_empty() {
                 writeln!(
                     out,
-                    "Bind this Agent to a Project before creating a conversation. Run `codewhale account projects list` to find one."
+                    "This Agent can chat now. Bind a Project for repository Work; run `codewhale account projects list` to find one."
                 )?;
             }
             Ok(())
@@ -1467,15 +1466,13 @@ fn run_agents<T: CloudTransport, W: Write>(
                 .context("The Codewhale service returned an invalid Agent list")?;
             let selected = resolve_account_agent(&listing.agents, &agent)?;
             let project_id = selected.project_id.trim();
-            if project_id.is_empty() {
-                bail!(
-                    "Bind Agent {} to a Project before creating its conversation",
-                    printable(&selected.name)
-                );
-            }
             let thread = client.create_agent_thread(
                 &selected.id,
-                project_id,
+                if project_id.is_empty() {
+                    None
+                } else {
+                    Some(project_id)
+                },
                 &title,
                 &provider,
                 &model,
@@ -1484,7 +1481,7 @@ fn run_agents<T: CloudTransport, W: Write>(
             if !active_agent_thread(&thread, &selected.id) {
                 bail!("The Codewhale service did not return an active conversation for this Agent");
             }
-            if thread.project_id != project_id {
+            if !project_id.is_empty() && thread.project_id != project_id {
                 bail!(
                     "The Codewhale service created this conversation in a different Project; verify the Agent's Project before sending"
                 );
@@ -1548,7 +1545,8 @@ fn run_agents<T: CloudTransport, W: Write>(
                     printable(&selected.name)
                 );
             }
-            if selected.project_id.is_empty() || selected_thread.project_id != selected.project_id {
+            if !selected.project_id.is_empty() && selected_thread.project_id != selected.project_id
+            {
                 bail!(
                     "That conversation belongs to a different Project than Agent {} currently owns. Bind the Agent and create a new conversation in its Project before sending",
                     printable(&selected.name)

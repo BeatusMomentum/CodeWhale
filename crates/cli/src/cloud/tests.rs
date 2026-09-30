@@ -2399,6 +2399,48 @@ fn account_agent_send_uses_its_only_active_conversation_regardless_of_title() {
 }
 
 #[test]
+fn account_agent_send_allows_an_unbound_agent_conversation() {
+    let (secrets, _) = test_secrets();
+    let auth_transport = FakeTransport::new(vec![]);
+    CloudClient::new(&auth_transport, &secrets, "default", DEFAULT_API_BASE)
+        .save_auth(auth("access-secret", "refresh-secret", "acct-123"))
+        .unwrap();
+    let mut unbound_agent = agent("agent-1", "Whale");
+    unbound_agent["projectId"] = json!("");
+    let mut default_project_thread = agent_thread("thread-1", "agent-1", "Whale Trial · main");
+    default_project_thread["projectId"] = json!("project-general");
+    let transport = FakeTransport::new(vec![
+        response(200, json!({ "agents": [unbound_agent] })),
+        response(200, json!([default_project_thread])),
+        response(
+            202,
+            json!({ "turn": { "id": "turn-1", "status": "pending" } }),
+        ),
+    ]);
+    let client = CloudClient::new(&transport, &secrets, "default", DEFAULT_API_BASE);
+    let mut output = Vec::new();
+    run_agents(
+        CloudAgentsCommand::Send {
+            agent: "Whale".into(),
+            prompt: "Continue".into(),
+            thread: None,
+            billing_mode: "byok_external".into(),
+            operation_key: "message-1".into(),
+        },
+        &client,
+        &machine::MachineKeyEnv::default(),
+        &mut output,
+    )
+    .unwrap();
+    assert_eq!(transport.requests()[2].path, "/v1/threads/thread-1/turns");
+    assert!(
+        String::from_utf8(output)
+            .unwrap()
+            .contains("Turn ID: turn-1")
+    );
+}
+
+#[test]
 fn account_agent_send_refuses_a_conversation_from_a_previous_project() {
     let (secrets, _) = test_secrets();
     let auth_transport = FakeTransport::new(vec![]);
@@ -2433,7 +2475,7 @@ fn account_agent_send_refuses_a_conversation_from_a_previous_project() {
 }
 
 #[test]
-fn account_agents_new_thread_requires_and_preserves_agent_project() {
+fn account_agents_new_thread_omits_an_unbound_project_and_preserves_a_bound_one() {
     let (secrets, _) = test_secrets();
     let auth_transport = FakeTransport::new(vec![]);
     let client_session = CloudClient::new(&auth_transport, &secrets, "default", DEFAULT_API_BASE);
@@ -2450,17 +2492,30 @@ fn account_agents_new_thread_requires_and_preserves_agent_project() {
 
     let mut unbound_agent = agent("agent-1", "Whale");
     unbound_agent["projectId"] = json!("");
-    let unbound = FakeTransport::new(vec![response(200, json!({ "agents": [unbound_agent] }))]);
+    let mut default_project_thread = agent_thread("thread-1", "agent-1", "Main");
+    default_project_thread["projectId"] = json!("project-general");
+    let unbound = FakeTransport::new(vec![
+        response(200, json!({ "agents": [unbound_agent] })),
+        response(201, json!({ "thread": default_project_thread })),
+    ]);
     let unbound_client = CloudClient::new(&unbound, &secrets, "default", DEFAULT_API_BASE);
-    let error = run_agents(
+    let mut unbound_output = Vec::new();
+    run_agents(
         new_thread(),
         &unbound_client,
         &machine::MachineKeyEnv::default(),
-        &mut Vec::new(),
+        &mut unbound_output,
     )
-    .unwrap_err();
-    assert!(error.to_string().contains("Bind Agent Whale to a Project"));
-    assert_eq!(unbound.requests().len(), 1);
+    .unwrap();
+    assert!(
+        String::from_utf8(unbound_output)
+            .unwrap()
+            .contains("ID: thread-1")
+    );
+    assert_eq!(unbound.requests().len(), 2);
+    let unbound_body: serde_json::Value =
+        serde_json::from_slice(unbound.requests()[1].body.as_ref().unwrap()).unwrap();
+    assert!(unbound_body.get("projectId").is_none());
 
     let mut foreign_thread = agent_thread("thread-1", "agent-1", "Main");
     foreign_thread["projectId"] = json!("project-other");
