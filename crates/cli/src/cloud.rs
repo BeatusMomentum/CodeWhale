@@ -1443,10 +1443,10 @@ fn parse_agent_turn_events(body: &[u8], turn_id: &str, since_seq: u64) -> Result
     for frame in normalized.split("\n\n") {
         let mut data = None;
         for line in frame.lines() {
-            if let Some(value) = line.strip_prefix("data:") {
-                if data.replace(value.trim_start_matches(' ')).is_some() {
-                    bail!("The Codewhale service returned a malformed conversation event");
-                }
+            if let Some(value) = line.strip_prefix("data:")
+                && data.replace(value.trim_start_matches(' ')).is_some()
+            {
+                bail!("The Codewhale service returned a malformed conversation event");
             }
         }
         let Some(data) = data else { continue };
@@ -1650,10 +1650,10 @@ fn run_agents<T: CloudTransport, W: Write>(
         } => {
             let agent = client.create_agent(&name, project_id.as_deref(), &operation_key)?;
             validate_resource_id(&agent.id, "Agent")?;
-            if let Some(project_id) = project_id.as_deref() {
-                if agent.project_id != validate_resource_id(project_id, "Project")? {
-                    bail!("The Codewhale service returned an unexpected Agent Project binding");
-                }
+            if let Some(project_id) = project_id.as_deref()
+                && agent.project_id != validate_resource_id(project_id, "Project")?
+            {
+                bail!("The Codewhale service returned an unexpected Agent Project binding");
             }
             writeln!(out, "Agent: {}", printable(&agent.name))?;
             writeln!(out, "ID: {}", agent.id)?;
