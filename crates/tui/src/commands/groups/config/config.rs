@@ -2121,7 +2121,7 @@ pub fn set_config_value(app: &mut App, key: &str, value: &str, persist: bool) ->
                     provider_id,
                     Some(&model),
                 ) {
-                    Ok(path) => Some(path),
+                    Ok((path, _)) => Some(path),
                     Err(error) => {
                         return CommandResult::error(format!("Failed to save model: {error}"));
                     }

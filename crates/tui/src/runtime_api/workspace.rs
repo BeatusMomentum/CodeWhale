@@ -708,8 +708,11 @@ fn write_workspace_file(
         _ => {}
     }
     // Parents are created only for a new file, and only through the confined
-    // opener, which refuses links at every component.
-    let file = open_confined_file(&root, relative, created)?;
+    // opener, which refuses links at every component. This is the user's own
+    // file, not a private store: keep its mode on edit, follow the umask on
+    // creation.
+    let file = crate::fleet::files::WorkspaceFile::open_shared(&root, relative, created)
+        .map_err(|error| map_fs_error(error, "file"))?;
     if let Some(expected) = expected_revision {
         let current = read_confined_bytes(&file)?;
         if current.revision != expected {

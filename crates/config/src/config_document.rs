@@ -32,6 +32,31 @@ pub fn mutate_config_document_with_migration<T, F>(path: &Path, mutate: F) -> Re
 where
     F: FnOnce(&mut toml_edit::DocumentMut, &crate::legacy_root::LegacyRootMigration) -> Result<T>,
 {
+    mutate_locked(path, mutate).map(|(result, _)| result)
+}
+
+/// [`mutate_config_document`], also returning what undoes exactly this write.
+///
+/// Both halves are taken under the lock: the bytes this call left on disk and
+/// the document as it stood just before `mutate` ran (after this writer's own
+/// one-way repairs), or the file's absence. A caller whose follow-up step is
+/// refused can then take back only its own change with
+/// [`ConfigDocumentUndo::undo`].
+pub fn mutate_config_document_undoable<T, F>(
+    path: &Path,
+    mutate: F,
+) -> Result<(T, ConfigDocumentUndo)>
+where
+    F: FnOnce(&mut toml_edit::DocumentMut) -> Result<T>,
+{
+    mutate_locked(path, |doc, _| mutate(doc))
+}
+
+fn mutate_locked<T, F>(path: &Path, mutate: F) -> Result<(T, ConfigDocumentUndo)>
+where
+    F: FnOnce(&mut toml_edit::DocumentMut, &crate::legacy_root::LegacyRootMigration) -> Result<T>,
+{
+    let requested = path.to_path_buf();
     with_config_write_lock(path, |path| {
         let original = read_optional_config(path)?;
         let mut document = match original.as_deref() {
@@ -51,11 +76,17 @@ where
         // unless this very write changes the table side.
         let moved = crate::legacy_root::apply_to_document(&mut document, None);
         let conflicts = crate::legacy_root::conflict_snapshot(&document);
+        let restore = original.as_ref().map(|_| document.to_string());
         let result = mutate(&mut document, &moved)?;
         crate::legacy_root::settle_conflicts_after_write(&mut document, conflicts);
         let body = document.to_string();
         if original.as_deref() == Some(body.as_str()) || (original.is_none() && body.is_empty()) {
-            return Ok(result);
+            let undo = ConfigDocumentUndo {
+                path: requested,
+                written: original,
+                restore,
+            };
+            return Ok((result, undo));
         }
         if moved.changes_file()
             && let Some(original) = original.as_deref()
@@ -63,8 +94,47 @@ where
             crate::note_legacy_root_file_migration(path, original)?;
         }
         persist_locked(path, original.as_deref(), body.as_bytes())?;
-        Ok(result)
+        let undo = ConfigDocumentUndo {
+            path: requested,
+            written: Some(body),
+            restore,
+        };
+        Ok((result, undo))
     })
+}
+
+/// Takes back one [`mutate_config_document_undoable`] write, and only that.
+#[derive(Debug, Clone)]
+pub struct ConfigDocumentUndo {
+    path: PathBuf,
+    /// The bytes that write left on disk; `None` when the file stayed absent.
+    written: Option<String>,
+    /// What `undo` puts back; `None` removes the file that write created.
+    restore: Option<String>,
+}
+
+impl ConfigDocumentUndo {
+    /// Put the document back as it was before the write, but only while the
+    /// file still holds exactly the bytes that write left: any newer save
+    /// wins. Returns `false` when the file changed since and was left alone.
+    pub fn undo(&self) -> Result<bool> {
+        with_config_write_lock(&self.path, |path| {
+            let current = read_optional_config(path)?;
+            if current == self.restore {
+                return Ok(true);
+            }
+            if current != self.written {
+                return Ok(false);
+            }
+            match self.restore.as_deref() {
+                Some(body) => persist_locked(path, current.as_deref(), body.as_bytes())?,
+                None => fs::remove_file(path).with_context(|| {
+                    format!("failed to remove config at {}", crate::quote_os_path(path))
+                })?,
+            }
+            Ok(true)
+        })
+    }
 }
 
 /// Lift keys trapped under literal `[extras]` tables back to the top level.
@@ -526,6 +596,61 @@ fn table_like_at_path_mut<'a>(
 
 #[cfg(test)]
 mod tests {
+    fn set_model(doc: &mut toml_edit::DocumentMut, model: &str) -> anyhow::Result<()> {
+        super::set_config_document_value(doc, &["model"], model)
+    }
+
+    #[test]
+    fn undo_restores_the_document_and_removes_a_file_it_created() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("config.toml");
+        let before = "# keep me\nmodel = \"a\"\n";
+        std::fs::write(&path, before).expect("write fixture");
+        let ((), undo) = super::mutate_config_document_undoable(&path, |doc| set_model(doc, "b"))
+            .expect("write");
+        assert!(
+            std::fs::read_to_string(&path)
+                .expect("read")
+                .contains("\"b\"")
+        );
+        assert!(undo.undo().expect("undo"));
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), before);
+
+        // A file this write created goes away again, not left behind empty.
+        let absent = tmp.path().join("fresh.toml");
+        let ((), undo) = super::mutate_config_document_undoable(&absent, |doc| set_model(doc, "b"))
+            .expect("write");
+        assert!(absent.exists());
+        assert!(undo.undo().expect("undo"));
+        assert!(!absent.exists(), "undo must not leave an empty config file");
+    }
+
+    #[test]
+    fn undo_never_overwrites_a_newer_save() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("config.toml");
+        std::fs::write(&path, "model = \"a\"\n").expect("write fixture");
+        let ((), undo) = super::mutate_config_document_undoable(&path, |doc| set_model(doc, "b"))
+            .expect("write");
+        super::mutate_config_document(&path, |doc| set_model(doc, "c")).expect("newer save");
+        assert!(!undo.undo().expect("undo"), "a changed file is reported");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            "model = \"c\"\n"
+        );
+
+        // The same holds when the newer save removed a file the write created.
+        let absent = tmp.path().join("fresh.toml");
+        let ((), undo) = super::mutate_config_document_undoable(&absent, |doc| set_model(doc, "b"))
+            .expect("write");
+        std::fs::write(&absent, "model = \"c\"\n").expect("newer save");
+        assert!(!undo.undo().expect("undo"));
+        assert_eq!(
+            std::fs::read_to_string(&absent).expect("read"),
+            "model = \"c\"\n"
+        );
+    }
+
     #[test]
     fn healing_keeps_a_non_table_extras_key_it_cannot_lift() {
         // `extras` is where the config structs flatten unknown keys, so a

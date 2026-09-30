@@ -206,14 +206,19 @@ pub(crate) fn set_provider_model_document(
 }
 
 /// One persistent owner and atomic write for an explicitly saved route.
+///
+/// Also returns the undo for exactly this write, taken under the config lock,
+/// so a caller whose follow-up apply step is rejected can take back only the
+/// switch.
 pub(crate) fn persist_provider_selection(
     config_path: Option<&Path>,
     provider: ApiProvider,
     provider_identity: &str,
     model: Option<&str>,
-) -> anyhow::Result<PathBuf> {
+) -> anyhow::Result<(PathBuf, codewhale_config::ConfigDocumentUndo)> {
     let path = config_toml_path(config_path)?;
-    mutate_config_document(&path, |doc| {
+    let ((), undo) = codewhale_config::mutate_config_document_undoable(&path, |doc| {
+        migrate_legacy_route_preferences(&path, doc)?;
         let config = crate::config::parse_config_base(&doc.to_string())
             .map_err(|_| anyhow::anyhow!("Could not parse destination route; contents omitted"))?;
         let identity = config
@@ -238,7 +243,7 @@ pub(crate) fn persist_provider_selection(
         )?;
         reconcile_root_model_aliases(doc, &config, &identity)
     })?;
-    Ok(path)
+    Ok((path, undo))
 }
 
 /// Keep a root `default_text_model` alias from stranding a route switch,
