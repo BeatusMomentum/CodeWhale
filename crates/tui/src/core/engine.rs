@@ -1468,8 +1468,9 @@ impl Engine {
     /// Replay the execution-boundary facts a conformance golden was recorded
     /// under. They reach the model only through `<turn_meta>`'s sandbox
     /// posture line; production engines always probe this host at
-    /// construction, and never call this.
-    #[cfg(test)]
+    /// construction, and never call this. Its only caller, the scripted
+    /// conformance families, is Unix-only.
+    #[cfg(all(test, unix))]
     pub(crate) fn pin_recorded_platform_posture(
         &mut self,
         enforcement: crate::sandbox::policy::SandboxEnforcement,
