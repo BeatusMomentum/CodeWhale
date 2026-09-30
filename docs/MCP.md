@@ -495,7 +495,7 @@ Per-server settings:
   - `execute_timeout` (default 1800) is the budget for each `tools/call` and `prompts/get`. An explicit shorter value is respected, and `read_timeout` never cuts a running tool short.
   - `read_timeout` (default 120) bounds each reply wait during the handshake and tool discovery, and is the budget for `resources/read`.
   - A request that runs out of budget fails with a timeout. The connection is kept, and a reply that arrives later is discarded instead of being handed to another call. Interrupting the turn stops the wait at once, but Codewhale does not send `notifications/cancelled` yet, so a server that handles one request at a time finishes the abandoned call before it answers the next one.
-  - Streamable HTTP servers return the reply inside the POST itself, which is bounded by the larger of `read_timeout` and `execute_timeout`.
+  - Streamable HTTP servers return the reply inside the POST itself; the request's own budget bounds that POST too. A request that expires while still sending closes the connection, which is rebuilt before the next call.
 - `disabled` (bool, optional)
 - `enabled` (bool, optional, default `true`)
 - `required` (bool, optional): startup/connect validation fails if this server cannot initialize.

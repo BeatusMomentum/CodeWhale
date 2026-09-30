@@ -346,7 +346,7 @@ codewhale-tui mcp tools codewhale
   - `execute_timeout`（默认 1800）是每次 `tools/call` 和 `prompts/get` 的预算。显式设置的更短值会被遵守，`read_timeout` 不会提前截断正在运行的工具。
   - `read_timeout`（默认 120）限制握手和工具发现期间每次等待回复的时间，也是 `resources/read` 的预算。
   - 请求超出预算时以超时错误失败。连接会被保留，之后迟到的回复会被丢弃，不会被交给其他调用。中断当前轮次会立即停止等待，但 Codewhale 目前还不会发送 `notifications/cancelled`，因此一次只处理一个请求的服务器会先完成被放弃的调用，再回答下一个请求。
-  - Streamable HTTP 服务器在 POST 响应中直接返回回复，其时长上限为 `read_timeout` 与 `execute_timeout` 中的较大者。
+  - Streamable HTTP 服务器在 POST 响应中直接返回回复；该 POST 同样受请求自身时限约束。若请求在发送阶段超时，连接会被关闭，并在下一次调用前重建。
 - `disabled`（布尔值，可选）
 - `enabled`（布尔值，可选，默认 `true`）
 - `required`（布尔值，可选）：如果该服务器无法初始化，启动/连接验证会失败。
