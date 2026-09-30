@@ -33,6 +33,7 @@ notes, and relevant issue/PR comments.
 **Merged or adapted contributions**
 
 - **[SparkofSpike](https://github.com/SparkofSpike)** — translated seventeen more guides into Simplified Chinese, among them plugins, memory, sandbox, workflow authoring, Docker, Termux and HarmonyOS, and brought the existing zh_hans docs onto one terminology standard ([#6662](https://github.com/Hmbown/Codewhale/pull/6662)), then translated thirteen developer and internal docs, among them the runtime API, architecture, tool surface, authorization order, operations runbook and Workroom security ([#6663](https://github.com/Hmbown/Codewhale/pull/6663)).
+- **[harryvgiunta](https://github.com/harryvgiunta)** — added Yolo-Auto as a bundled OpenAI-compatible host descriptor, with its billing basis recorded as unreviewed rather than guessed ([#6408](https://github.com/Hmbown/Codewhale/pull/6408)).
 
 </details>
 

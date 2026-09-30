@@ -1,14 +1,5 @@
-/** Binding legal text for Shannon Labs / Codewhale. Same body as app.codewhale.net/legal. */
-
-/** Last revision of the terms and privacy text, as an ISO date. */
-export const LEGAL_UPDATED = "2026-09-04";
-
-/** LEGAL_UPDATED rendered for a locale's `chrome.dateLocale` (UTC, so the day never shifts). */
-export function formatLegalUpdated(dateLocale: string): string {
-  return new Intl.DateTimeFormat(dateLocale, { dateStyle: "long", timeZone: "UTC" }).format(
-    new Date(`${LEGAL_UPDATED}T00:00:00Z`),
-  );
-}
+/** Existing legal body text. Publication status comes from the shared platform contract. */
+export { LEGAL_DOCUMENTS, formatLegalDocumentStatus } from "../vendor/legal-documents/legal-documents.js";
 
 export const TERMS_SECTIONS = [
   {

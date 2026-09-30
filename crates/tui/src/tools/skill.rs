@@ -86,8 +86,7 @@ impl ToolSpec for LoadSkillTool {
         // tool's lookup mirrors what the system-prompt skills block
         // already lists, so the model never asks for a name it
         // can't find.
-        let discovery_mode =
-            SkillDiscoveryMode::from_codewhale_only(context.skills_scan_codewhale_only);
+        let discovery_mode = context.skills_discovery_mode;
         let registry = if let Some(skills_dir) = context.skills_dir.as_deref() {
             discover_for_workspace_and_dir_with_mode_and_plugins(
                 &context.workspace,
@@ -118,6 +117,7 @@ impl ToolSpec for LoadSkillTool {
             let all = registry.list();
             let skills: Vec<&_> = all
                 .iter()
+                .filter(|skill| skill.invocation.model_invocable())
                 .filter(|skill| {
                     query.is_empty()
                         || skill.name.to_lowercase().contains(&query)
@@ -147,7 +147,12 @@ impl ToolSpec for LoadSkillTool {
         }
 
         let Some(skill) = registry.get(name) else {
-            let available: Vec<&str> = registry.list().iter().map(|s| s.name.as_str()).collect();
+            let available: Vec<&str> = registry
+                .list()
+                .iter()
+                .filter(|s| s.invocation.model_invocable())
+                .map(|s| s.name.as_str())
+                .collect();
             let hint = if available.is_empty() {
                 let dirs: Vec<String> = context
                     .skills_dir
@@ -166,7 +171,7 @@ impl ToolSpec for LoadSkillTool {
                     .map(|p| p.display().to_string())
                     .collect();
                 if dirs.is_empty() {
-                    if context.skills_scan_codewhale_only {
+                    if context.skills_discovery_mode == SkillDiscoveryMode::CodeWhaleOnly {
                         "no skills directories found; install skills under `<workspace>/.codewhale/skills/<name>/SKILL.md` or `~/.codewhale/skills/<name>/SKILL.md`"
                             .to_string()
                     } else {
@@ -185,6 +190,12 @@ impl ToolSpec for LoadSkillTool {
             return Err(ToolError::execution_failed(hint));
         };
 
+        if !skill.invocation.model_invocable() {
+            return Err(ToolError::execution_failed(format!(
+                "Skill `{}` does not allow model invocation; ask the user to invoke an enabled skill explicitly",
+                skill.name
+            )));
+        }
         ensure_reviewed_plugin_skill_is_current(skill, &context.workspace)?;
         ensure_native_skill_file_present(skill)?;
         let body = format_skill_body(skill);
@@ -277,6 +288,8 @@ fn format_skill_body(skill: &Skill) -> String {
     let invocation = match skill.invocation {
         crate::skills::SkillInvocation::ModelAndUser => "model+user",
         crate::skills::SkillInvocation::ExplicitOnly => "explicit-only",
+        crate::skills::SkillInvocation::ModelOnly => "model-only",
+        crate::skills::SkillInvocation::Disabled => "disabled",
     };
     out.push_str(&format!("Invocation: `{invocation}`\n"));
     if !skill.aliases.is_empty() {
@@ -423,6 +436,7 @@ mod tests {
             localized_descriptions: std::collections::HashMap::new(),
             invocation: crate::skills::SkillInvocation::ModelAndUser,
             aliases: Vec::new(),
+            argument_hint: None,
             body: "cached body".to_string(),
             path: missing.clone(),
             source: SkillSource::Native,
@@ -479,6 +493,7 @@ mod tests {
             localized_descriptions: std::collections::HashMap::new(),
             invocation: crate::skills::SkillInvocation::ModelAndUser,
             aliases: Vec::new(),
+            argument_hint: None,
             body: "reviewed body".to_string(),
             path: skill_path.clone(),
             source: SkillSource::Plugin {
@@ -731,7 +746,10 @@ mod tests {
             "Body content marker.",
         );
 
-        let context = ToolContext::new(workspace).with_skills_config(codewhale_dir, true);
+        let context = ToolContext::new(workspace).with_skills_config(
+            codewhale_dir,
+            crate::skills::SkillDiscoveryMode::CodeWhaleOnly,
+        );
         let tool = LoadSkillTool;
 
         let result = tool
@@ -769,7 +787,10 @@ mod tests {
         // `crate::config::effective_home_dir()` cannot be redirected reliably after process start
         // on Windows. The injected-home discovery test in `skills::tests`
         // separately proves that ~/.codewhale/skills enters the default catalog.
-        let context = ToolContext::new(&workspace).with_skills_config(global_skills.clone(), false);
+        let context = ToolContext::new(&workspace).with_skills_config(
+            global_skills.clone(),
+            crate::skills::SkillDiscoveryMode::Compatible,
+        );
         assert!(!context.trust_mode);
         assert!(
             context
@@ -814,6 +835,59 @@ mod tests {
         assert!(
             msg.contains("imaginary") && msg.contains("real-one"),
             "error must name the missing skill and list available ones: {msg}"
+        );
+    }
+    #[tokio::test]
+    async fn model_load_and_listing_obey_independent_invocation_gates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().join("workspace");
+        crate::test_support::trust_workspace(&workspace);
+        let root = workspace.join(".codewhale/skills");
+        for (name, policy) in [
+            ("explicit", "disable-model-invocation: true"),
+            (
+                "disabled",
+                "disable-model-invocation: true\nuser-invocable: false",
+            ),
+            ("model", "user-invocable: false"),
+        ] {
+            let dir = root.join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("SKILL.md"), format!("---\nname: {name}\ndescription: routing\n{policy}\n---\nsecret steps for {name}")).unwrap();
+        }
+        let context = ToolContext::new(&workspace)
+            .with_skills_config(&root, SkillDiscoveryMode::CodeWhaleOnly);
+        let tool = LoadSkillTool;
+        for name in ["explicit", "disabled"] {
+            let error = tool
+                .execute(json!({"name":name}), &context)
+                .await
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("does not allow model invocation")
+            );
+        }
+        let listing = tool
+            .execute(json!({"name":"list"}), &context)
+            .await
+            .unwrap();
+        assert!(listing.content.contains("model"));
+        assert!(!listing.content.contains("explicit"));
+        assert!(!listing.content.contains("disabled"));
+        let query = tool
+            .execute(json!({"query":"explicit"}), &context)
+            .await
+            .unwrap();
+        assert!(!query.content.contains("secret steps"));
+        assert!(!query.content.contains("  - explicit"));
+        assert!(
+            tool.execute(json!({"name":"model"}), &context)
+                .await
+                .unwrap()
+                .content
+                .contains("secret steps for model")
         );
     }
 }

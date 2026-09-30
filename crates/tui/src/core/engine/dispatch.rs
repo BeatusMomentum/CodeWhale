@@ -5,7 +5,6 @@
 //!
 //! * Streaming-buffer parsing into a finalized `serde_json::Value` tool input
 //!   (`final_tool_input`, `parse_tool_input`, fenced/JSON segment helpers).
-//! * The `multi_tool_use.parallel` payload parser.
 //! * Policy predicates the turn loop consults — when a batch can run in
 //!   parallel and the small set of read-only MCP tools that are safe to run
 //!   in parallel.
@@ -296,20 +295,6 @@ pub(super) struct ToolExecutionPlan {
 pub(super) enum ToolExecutionBatch {
     Parallel(Vec<ToolExecutionPlan>),
     Serial(Box<ToolExecutionPlan>),
-}
-
-#[derive(Debug, serde::Serialize)]
-pub(super) struct ParallelToolResultEntry {
-    pub(super) tool_name: String,
-    pub(super) success: bool,
-    pub(super) content: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) error: Option<String>,
-}
-
-#[derive(Debug, serde::Serialize)]
-pub(super) struct ParallelToolResult {
-    pub(super) results: Vec<ParallelToolResultEntry>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -724,52 +709,6 @@ fn extract_balanced_segment(text: &str, open: char, close: char) -> Option<Strin
         }
     }
     end.map(|end_idx| text[start..end_idx].to_string())
-}
-
-fn normalize_parallel_tool_name(raw: &str) -> String {
-    let mut name = raw.trim();
-    for prefix in ["functions.", "tools.", "tool."] {
-        if let Some(stripped) = name.strip_prefix(prefix) {
-            name = stripped;
-            break;
-        }
-    }
-    name.to_string()
-}
-
-pub(super) fn parse_parallel_tool_calls(
-    input: &serde_json::Value,
-) -> Result<Vec<(String, serde_json::Value)>, ToolError> {
-    let tool_uses = input
-        .get("tool_uses")
-        .and_then(|v| v.as_array())
-        .ok_or_else(|| ToolError::missing_field("tool_uses"))?;
-    if tool_uses.is_empty() {
-        return Err(ToolError::invalid_input(
-            "multi_tool_use.parallel requires at least one tool call",
-        ));
-    }
-
-    let mut calls = Vec::with_capacity(tool_uses.len());
-    for item in tool_uses {
-        let name = item
-            .get("recipient_name")
-            .or_else(|| item.get("tool_name"))
-            .or_else(|| item.get("name"))
-            .or_else(|| item.get("tool"))
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| ToolError::missing_field("recipient_name"))?;
-        let params = item
-            .get("parameters")
-            .or_else(|| item.get("input"))
-            .or_else(|| item.get("args"))
-            .or_else(|| item.get("arguments"))
-            .cloned()
-            .unwrap_or_else(|| json!({}));
-        calls.push((normalize_parallel_tool_name(name), params));
-    }
-
-    Ok(calls)
 }
 
 // === Dispatch policy ==================================================

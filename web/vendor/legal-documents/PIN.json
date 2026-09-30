@@ -1,0 +1,16 @@
+{
+  "sourceRepository": "Hmbown/codewhale-platform",
+  "sourceCommit": "623abea63cad431bfa9cd4c60b579a7cb0328206",
+  "files": [
+    {
+      "source": "packages/contracts/src/legal-documents.js",
+      "path": "legal-documents.js",
+      "sha256": "680cff7561450eaefff5c597632e35f008dba38619d3f5392ba87221152de363"
+    },
+    {
+      "source": "packages/contracts/src/legal-documents.d.ts",
+      "path": "legal-documents.d.ts",
+      "sha256": "ff356a67ec2692fd84dac4b1d475360123f3a4856e127830231d04c93d431408"
+    }
+  ]
+}

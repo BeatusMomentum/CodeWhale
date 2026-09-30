@@ -162,6 +162,7 @@ pub struct PluginSkillSnapshot {
     pub localized_descriptions: HashMap<String, String>,
     pub invocation: crate::skills::SkillInvocation,
     pub aliases: Vec<String>,
+    pub argument_hint: Option<String>,
     pub body: String,
     pub path: PathBuf,
     /// Digest of the exact UTF-8 bytes parsed into this snapshot. This is the
