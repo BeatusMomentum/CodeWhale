@@ -435,3 +435,145 @@ fn typescript_protocol_is_generated_from_the_rust_types() {
         );
     }
 }
+
+/// Authority only the core may hold (CURRENT_DECISIONS §26): the event
+/// authority, the store, approval, secrets and credentials, the turn loop,
+/// sessions and the prompt. A method whose name mentions any of these is
+/// refused outright, whatever its reviewed reason.
+const CORE_ONLY: &[&str] = &[
+    "event",
+    "store",
+    "approv",
+    "secret",
+    "credential",
+    "token",
+    "auth",
+    "turn",
+    "loop",
+    "session",
+    "prompt",
+];
+
+/// Every method, with why it gives the host no core authority. Adding a
+/// method means adding its row here, in review, with that reason.
+const REVIEWED: &[(&str, &str, &str)] = &[
+    (
+        "core_to_host",
+        "host/initialize",
+        "the core states its limits; the host answers `{}`",
+    ),
+    (
+        "core_to_host",
+        "host/ping",
+        "heartbeat; the host answers `{}`",
+    ),
+    (
+        "core_to_host",
+        "host/shutdown",
+        "bounded teardown, sent by tests only",
+    ),
+    (
+        "core_to_host",
+        "ext/activate",
+        "the core names the reviewed entry and its hash; the host reports tool names",
+    ),
+    (
+        "core_to_host",
+        "ext/deactivate",
+        "sent after the core has already revoked the owner",
+    ),
+    (
+        "core_to_host",
+        "tool/call",
+        "sent only after the core's approval gate has passed the call",
+    ),
+    (
+        "core_to_host",
+        "$/cancel",
+        "the core withdraws its own request",
+    ),
+    (
+        "host_to_core",
+        "host/hello",
+        "handshake facts the core checks against what it launched",
+    ),
+    (
+        "host_to_core",
+        "host/ready",
+        "handshake completion; no payload",
+    ),
+    (
+        "host_to_core",
+        "registry/register",
+        "a proposal the core admits or refuses; an admitted tool always needs approval",
+    ),
+    (
+        "host_to_core",
+        "registry/unregister",
+        "the host can only withdraw its own owner's registration",
+    ),
+    (
+        "host_to_core",
+        "ext/faulted",
+        "a report; the core revokes the owner",
+    ),
+    (
+        "host_to_core",
+        "log",
+        "diagnostic text the core bounds and escapes",
+    ),
+    (
+        "host_to_core",
+        "$/cancel",
+        "ignored: phase 1 has no host-originated requests to cancel",
+    ),
+];
+
+/// The CI lint for the host protocol. It covers both directions, host→core
+/// requests included: [`METHODS`] is every method either parser admits, and
+/// the TypeScript validator admits only its generated copy, so the host can
+/// neither send nor answer anything outside it.
+#[test]
+fn host_protocol_never_gains_core_authority() {
+    for spec in METHODS {
+        let name = spec.name.to_ascii_lowercase();
+        for word in CORE_ONLY {
+            assert!(
+                !name.contains(word),
+                "{} method `{}` reaches for core-only authority (`{word}`); \
+                 the extension host must never hold it (CURRENT_DECISIONS §26)",
+                spec.direction.as_str(),
+                spec.name
+            );
+        }
+    }
+    let table: BTreeSet<(&str, &str)> = METHODS
+        .iter()
+        .map(|spec| (spec.direction.as_str(), spec.name))
+        .collect();
+    let reviewed: BTreeSet<(&str, &str)> = REVIEWED
+        .iter()
+        .map(|(direction, name, _)| (*direction, *name))
+        .collect();
+    assert_eq!(
+        table, reviewed,
+        "the method table changed: review each method in REVIEWED with why it gives the host no core authority"
+    );
+    // Nothing is decoded or sent outside the table: every method-shaped
+    // literal in this module is a table row.
+    let literal = regex::Regex::new(r#""([A-Za-z$][\w$]*/[A-Za-z_]+)""#).expect("regex");
+    let source = include_str!("../protocol.rs");
+    let mut seen = 0;
+    for capture in literal.captures_iter(source) {
+        let name = &capture[1];
+        assert!(
+            METHODS.iter().any(|spec| spec.name == name),
+            "protocol.rs uses method `{name}` outside METHODS"
+        );
+        seen += 1;
+    }
+    assert!(
+        seen >= METHODS.len(),
+        "the source scan matched only {seen} literals"
+    );
+}
