@@ -43,9 +43,10 @@ const EVENT_CATCHUP_POLL: Duration = Duration::from_millis(200);
 // ignore its eligibility or generation fence.
 const CURRENT_TASK_SCHEMA_VERSION: u32 = 4;
 const STORE_REFRESH_INTERVAL: Duration = Duration::from_millis(200);
-/// An idle worker re-reads an unchanged store at most this often. In-process
-/// submissions wake workers immediately through `notify`; this fallback only
-/// bounds how long a write the fingerprint cannot see may wait (#6573).
+/// Retry an empty claim while queue metadata is missing or too recent to
+/// distinguish writes on a coarse-mtime filesystem. Once settled, idle workers
+/// wait for admission notifications or queue changes instead of reloading every
+/// task record on a timer (#6728).
 const STORE_IDLE_POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// Ceiling for the retry delay after a claim fails (e.g. "Task store is busy").
 /// A failed claim has already waited out `lock_store`'s 5s deadline, so work
@@ -1412,9 +1413,10 @@ pub struct TaskManager {
 /// it before promoting the task record, and claims, cancels and startup
 /// recovery write it too. Running tasks flush their records into `tasks/`
 /// every few hundred milliseconds but leave the queue alone, so the tasks
-/// directory is deliberately not part of the fingerprint. Queued records that
-/// `load_state` rebuilds without a queue entry, and unreadable metadata
-/// (which compares as `None`), are covered by the idle fallback poll.
+/// directory is deliberately not part of the fingerprint. Startup still rebuilds
+/// missing queue entries from durable records. Failed claims retry independently,
+/// including a queue removal whose task-status write failed. Missing or recent
+/// metadata keeps a fallback deadline until it can be trusted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct StoreFingerprint(Option<(std::time::SystemTime, u64, u64)>);
 
@@ -1466,15 +1468,15 @@ impl ReadSnapshot {
 /// When an idle worker should next claim from the shared store (#6573).
 ///
 /// A worker claims when it was notified in-process, when the queue
-/// fingerprint changed since its last attempt, or when its deadline passed.
-/// The deadline is the idle fallback poll after an empty claim, and an
-/// exponential backoff after a failed one ("Task store is busy"). Workers
+/// fingerprint changed since its last attempt, or when a retry deadline passed.
+/// Settled empty claims have no deadline. Unreadable/recent metadata gets a
+/// fallback and failed claims get exponential backoff ("Task store is busy"). Workers
 /// keep checking the fingerprint every tick during a backoff, so a queue
 /// write from another process still gets an early retry.
 #[derive(Debug)]
 struct ClaimSchedule {
     seen: Option<StoreFingerprint>,
-    next_claim: Instant,
+    next_claim: Option<Instant>,
     failure_backoff: Duration,
 }
 
@@ -1482,24 +1484,33 @@ impl ClaimSchedule {
     fn new(now: Instant) -> Self {
         Self {
             seen: None,
-            next_claim: now,
+            next_claim: Some(now),
             failure_backoff: STORE_REFRESH_INTERVAL,
         }
     }
 
     fn should_claim(&self, fingerprint: &StoreFingerprint, now: Instant, woken: bool) -> bool {
-        woken || self.seen.as_ref() != Some(fingerprint) || now >= self.next_claim
+        woken
+            || self.seen.as_ref() != Some(fingerprint)
+            || self.next_claim.is_some_and(|deadline| now >= deadline)
     }
 
     fn claimed_task(&mut self, now: Instant) {
         self.seen = None;
-        self.next_claim = now;
+        self.next_claim = Some(now);
         self.failure_backoff = STORE_REFRESH_INTERVAL;
     }
 
     fn found_nothing(&mut self, fingerprint: StoreFingerprint, now: Instant) {
+        // Re-read a recent stamp after its coarse mtime tick has passed before
+        // trusting it indefinitely. Missing metadata never proves no change.
+        let settled = fingerprint.0.as_ref().is_some_and(|(modified, _, _)| {
+            std::time::SystemTime::now()
+                .duration_since(*modified)
+                .is_ok_and(|age| age >= STORE_IDLE_POLL_INTERVAL)
+        });
         self.seen = Some(fingerprint);
-        self.next_claim = now + STORE_IDLE_POLL_INTERVAL;
+        self.next_claim = (!settled).then_some(now + STORE_IDLE_POLL_INTERVAL);
         self.failure_backoff = STORE_REFRESH_INTERVAL;
     }
 
@@ -1507,7 +1518,7 @@ impl ClaimSchedule {
     fn claim_failed(&mut self, fingerprint: StoreFingerprint, now: Instant) -> Duration {
         let delay = self.failure_backoff;
         self.seen = Some(fingerprint);
-        self.next_claim = now + delay;
+        self.next_claim = Some(now + delay);
         self.failure_backoff = (delay * 2).min(STORE_BUSY_BACKOFF_MAX);
         delay
     }
@@ -2400,8 +2411,9 @@ impl TaskManager {
     /// Several processes can share one data dir, and every claim takes the
     /// cross-process store lock and reloads the whole store. An idle worker
     /// therefore only claims when it was notified in-process, when the store
-    /// fingerprint changed, or when the idle fallback poll is due; a failed
-    /// claim backs off exponentially instead of retrying every tick (#6573).
+    /// fingerprint changed, or when unreadable/recent metadata needs a retry.
+    /// A settled empty queue does no periodic full reload; failed claims still
+    /// back off exponentially instead of retrying every tick (#6573, #6728).
     async fn worker_loop(self: Arc<Self>) {
         let mut schedule = ClaimSchedule::new(Instant::now());
         let mut woken = true;
@@ -3888,7 +3900,7 @@ mod tests {
         let second =
             TaskManager::start_with_executor_in_scope(config(), Arc::new(MockExecutor), "second")
                 .await?;
-        sleep(Duration::from_millis(300)).await;
+        sleep(STORE_IDLE_POLL_INTERVAL + Duration::from_millis(300)).await;
         for manager in [&first, &second] {
             manager.store_loads.store(0, Ordering::Relaxed);
         }
@@ -3897,10 +3909,10 @@ mod tests {
         sleep(window).await;
         let loads =
             first.store_loads.load(Ordering::Relaxed) + second.store_loads.load(Ordering::Relaxed);
-        // Four idle workers polling every 200ms would load ~40 times here;
-        // the idle fallback allows at most one reload per worker per window.
+        // Once the queue stamp settles, unchanged stores never reload just
+        // because time passed. The former 2s fallback reloads in this window.
         assert!(
-            loads <= 8,
+            loads == 0,
             "idle workers reloaded the shared store {loads} times in {window:?}"
         );
 
@@ -4023,7 +4035,7 @@ mod tests {
             "idle",
         )
         .await?;
-        sleep(Duration::from_millis(300)).await;
+        sleep(STORE_IDLE_POLL_INTERVAL + Duration::from_millis(300)).await;
         idle.store_loads.store(0, Ordering::Relaxed);
         let record = root.path().join("tasks").join(format!("{}.json", task.id));
         let flushed_before = fs::metadata(&record)?.modified()?;
@@ -4036,10 +4048,10 @@ mod tests {
             flushed_before,
             "the running task should have flushed its record during the window"
         );
-        // Two workers ticking every 200ms would reload ~20 times; the idle
-        // fallback allows about one reload per worker per window.
+        // Task-event writes never change queue eligibility, so settled idle
+        // workers do not need to re-read them.
         assert!(
-            loads <= 4,
+            loads == 0,
             "idle workers reloaded the shared store {loads} times in {window:?} while a task ran elsewhere"
         );
 
@@ -4075,14 +4087,94 @@ mod tests {
         assert!(schedule.should_claim(&fingerprint(2), now, false));
         assert!(schedule.should_claim(&fingerprint(1), now, true));
 
-        // An empty claim resets the backoff and waits for the idle fallback.
+        // An empty claim on a settled queue resets backoff without scheduling
+        // another scan, however long the worker stays idle.
         schedule.found_nothing(fingerprint(2), now);
         assert!(!schedule.should_claim(&fingerprint(2), now, false));
-        assert!(schedule.should_claim(&fingerprint(2), now + STORE_IDLE_POLL_INTERVAL, false));
+        assert!(!schedule.should_claim(&fingerprint(2), now + Duration::from_secs(86_400), false));
         assert_eq!(
             schedule.claim_failed(fingerprint(2), now),
             STORE_REFRESH_INTERVAL
         );
+    }
+
+    #[test]
+    fn claim_schedule_retries_unknown_or_recent_queue_metadata() {
+        let now = Instant::now();
+        for fingerprint in [
+            StoreFingerprint(None),
+            StoreFingerprint(Some((std::time::SystemTime::now(), 1, 1))),
+        ] {
+            let mut schedule = ClaimSchedule::new(now);
+            schedule.found_nothing(fingerprint.clone(), now);
+            assert!(!schedule.should_claim(&fingerprint, now, false));
+            assert!(schedule.should_claim(&fingerprint, now + STORE_IDLE_POLL_INTERVAL, false));
+        }
+    }
+
+    #[tokio::test]
+    async fn settled_idle_workers_notice_external_queue_writes_without_notify() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let executions = Arc::new(AtomicUsize::new(0));
+        let manager = TaskManager::start_with_executor(
+            TaskManagerConfig {
+                worker_count: 2,
+                ..test_config(root.path().to_path_buf())
+            },
+            Arc::new(AdmissionCountingExecutor(executions.clone())),
+        )
+        .await?;
+        sleep(STORE_IDLE_POLL_INTERVAL + Duration::from_millis(300)).await;
+
+        let mut task = sample_task_record();
+        task.status = TaskStatus::Queued;
+        task.started_at = None;
+        let mut second = task.clone();
+        second.id = "task_0123456789abcdee".into();
+        {
+            // Simulate another process's durable admission, under the real
+            // cross-process transaction lock. No local state or Notify changes.
+            let _transaction = manager.lock_store().await?;
+            manager.persist_task_locked(&task)?;
+            manager.persist_task_locked(&second)?;
+            manager.persist_queue_locked(&VecDeque::from([task.id.clone(), second.id.clone()]))?;
+        }
+        for id in [&task.id, &second.id] {
+            let done = wait_for_terminal_state(&manager, id, Duration::from_secs(2)).await?;
+            assert_eq!(done.status, TaskStatus::Completed);
+        }
+        assert_eq!(executions.load(Ordering::SeqCst), 2);
+        manager.shutdown_and_wait().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn running_task_observes_durable_cancel_without_a_queue_change() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let manager = TaskManager::start_with_executor(
+            test_config(root.path().to_path_buf()),
+            Arc::new(CooperativeIdleCancelExecutor),
+        )
+        .await?;
+        let task = manager
+            .add_task(NewTaskRequest::from_prompt("durable cancel"))
+            .await?;
+        wait_for_running(&manager, &task.id, Duration::from_secs(2)).await?;
+        let queue_before = StoreFingerprint::read(&manager.queue_path);
+        {
+            let _transaction = manager.lock_store().await?;
+            let mut task = manager
+                .read_bound_task(&task.id)?
+                .context("running fixture")?;
+            task.lifecycle_seq += 1;
+            task.cancel_requested_seq = task.lifecycle_seq;
+            manager.persist_task_locked(&task)?;
+        }
+        let done = wait_for_terminal_state(&manager, &task.id, Duration::from_secs(2)).await?;
+        assert_eq!(done.status, TaskStatus::Canceled);
+        assert_eq!(StoreFingerprint::read(&manager.queue_path), queue_before);
+        manager.shutdown_and_wait().await?;
+        Ok(())
     }
 
     #[tokio::test]
