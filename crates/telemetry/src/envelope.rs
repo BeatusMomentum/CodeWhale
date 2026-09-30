@@ -128,8 +128,9 @@ pub fn now_rfc3339() -> String {
 /// The build sha of a release-CI binary, or `None`.
 ///
 /// Sourced from `CODEWHALE_RELEASE_BUILD_SHA`, a rustc-env this crate's build
-/// script emits **only** when `CODEWHALE_BUILD_SHA`, its legacy build-only
-/// alias, or `GITHUB_SHA` was present in the build environment. `null` for
+/// script emits **only** when `CODEWHALE_BUILD_SHA` or its legacy build-only
+/// alias was present in the build environment (never the ambient
+/// `GITHUB_SHA` every Actions job carries). `null` for
 /// every locally built binary, unconditionally, with no runtime lookup of any
 /// kind.
 ///
