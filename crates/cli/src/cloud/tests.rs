@@ -166,13 +166,14 @@ fn computer(id: &str, status: &str) -> serde_json::Value {
 }
 
 fn agent(id: &str, name: &str) -> serde_json::Value {
-    json!({ "id": id, "name": name, "status": "active" })
+    json!({ "id": id, "name": name, "status": "active", "projectId": "project-codewhale" })
 }
 
 fn agent_thread(id: &str, agent_id: &str, title: &str) -> serde_json::Value {
     json!({
         "id": id,
         "agentId": agent_id,
+        "projectId": "project-codewhale",
         "title": title,
         "model": "deepseek-flash",
         "modelProvider": "deepseek",
@@ -2162,7 +2163,8 @@ fn account_agents_create_model_bound_thread_and_send_with_same_session() {
         serde_json::from_slice::<serde_json::Value>(requests[3].body.as_ref().unwrap()).unwrap(),
         json!({
             "title": "Main", "productMode": "chat", "mode": "chat",
-            "agentId": "agent-1", "modelProvider": "deepseek",
+            "agentId": "agent-1", "projectId": "project-codewhale",
+            "modelProvider": "deepseek",
             "model": "deepseek-flash", "operationKey": "thread-1"
         })
     );
@@ -2180,6 +2182,61 @@ fn account_agents_create_model_bound_thread_and_send_with_same_session() {
     assert!(output.contains("Turn ID: turn-1"));
     assert!(output.contains("Status: pending"));
     assert!(!output.contains("access-secret"));
+}
+
+#[test]
+fn account_agents_new_thread_requires_and_preserves_agent_project() {
+    let (secrets, _) = test_secrets();
+    let auth_transport = FakeTransport::new(vec![]);
+    let client_session = CloudClient::new(&auth_transport, &secrets, "default", DEFAULT_API_BASE);
+    client_session
+        .save_auth(auth("access-secret", "refresh-secret", "acct-123"))
+        .unwrap();
+    let new_thread = || CloudAgentsCommand::NewThread {
+        agent: "Whale".into(),
+        title: "Main".into(),
+        provider: "deepseek".into(),
+        model: "deepseek-flash".into(),
+        operation_key: "thread-project-1".into(),
+    };
+
+    let mut unbound_agent = agent("agent-1", "Whale");
+    unbound_agent["projectId"] = json!("");
+    let unbound = FakeTransport::new(vec![response(200, json!({ "agents": [unbound_agent] }))]);
+    let unbound_client = CloudClient::new(&unbound, &secrets, "default", DEFAULT_API_BASE);
+    let error = run_agents(
+        new_thread(),
+        &unbound_client,
+        &machine::MachineKeyEnv::default(),
+        &mut Vec::new(),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("Bind Agent Whale to a Project"));
+    assert_eq!(unbound.requests().len(), 1);
+
+    let mut foreign_thread = agent_thread("thread-1", "agent-1", "Main");
+    foreign_thread["projectId"] = json!("project-other");
+    let foreign = FakeTransport::new(vec![
+        response(200, json!({ "agents": [agent("agent-1", "Whale")] })),
+        response(201, json!({ "thread": foreign_thread })),
+    ]);
+    let foreign_client = CloudClient::new(&foreign, &secrets, "default", DEFAULT_API_BASE);
+    let mut output = Vec::new();
+    let error = run_agents(
+        new_thread(),
+        &foreign_client,
+        &machine::MachineKeyEnv::default(),
+        &mut output,
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("different Project"));
+    assert!(output.is_empty());
+    let requests = foreign.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(requests[1].body.as_ref().unwrap()).unwrap()["projectId"],
+        "project-codewhale"
+    );
 }
 
 #[test]

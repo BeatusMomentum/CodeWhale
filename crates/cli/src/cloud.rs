@@ -286,6 +286,8 @@ struct AccountAgent {
     id: String,
     name: String,
     status: String,
+    #[serde(default)]
+    project_id: String,
 }
 
 #[derive(Deserialize)]
@@ -303,6 +305,8 @@ struct AgentResponse {
 struct AgentThread {
     id: String,
     agent_id: String,
+    #[serde(default)]
+    project_id: String,
     title: String,
     model: String,
     model_provider: String,
@@ -708,12 +712,14 @@ impl<'a, T: CloudTransport> CloudClient<'a, T> {
     fn create_agent_thread(
         &self,
         agent_id: &str,
+        project_id: &str,
         title: &str,
         provider: &str,
         model: &str,
         operation_key: &str,
     ) -> Result<AgentThread> {
         let agent_id = validate_resource_id(agent_id, "Agent")?;
+        let project_id = validate_resource_id(project_id, "Project")?;
         let title = validate_named_text(title, "Conversation title", 120)?;
         let (provider, model) = validate_model_route(provider, model)?;
         let operation_key = validate_operation_key(operation_key)?;
@@ -725,6 +731,7 @@ impl<'a, T: CloudTransport> CloudClient<'a, T> {
                 "productMode": "chat",
                 "mode": "chat",
                 "agentId": agent_id,
+                "projectId": project_id,
                 "modelProvider": provider,
                 "model": model,
                 "operationKey": operation_key,
@@ -1167,8 +1174,16 @@ fn run_agents<T: CloudTransport, W: Write>(
             let listing: AgentListResponse = serde_json::from_value(client.agents()?)
                 .context("The Codewhale service returned an invalid Agent list")?;
             let selected = resolve_account_agent(&listing.agents, &agent)?;
+            let project_id = selected.project_id.trim();
+            if project_id.is_empty() {
+                bail!(
+                    "Bind Agent {} to a Project before creating its conversation",
+                    printable(&selected.name)
+                );
+            }
             let thread = client.create_agent_thread(
                 &selected.id,
+                project_id,
                 &title,
                 &provider,
                 &model,
@@ -1176,6 +1191,11 @@ fn run_agents<T: CloudTransport, W: Write>(
             )?;
             if !active_agent_thread(&thread, &selected.id) {
                 bail!("The Codewhale service did not return an active conversation for this Agent");
+            }
+            if thread.project_id != project_id {
+                bail!(
+                    "The Codewhale service created this conversation in a different Project; verify the Agent's Project before sending"
+                );
             }
             write_agent_thread(out, &thread)?;
             writeln!(
