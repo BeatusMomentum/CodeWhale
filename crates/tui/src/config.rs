@@ -1750,12 +1750,17 @@ pub struct ExtensionHostConfig {
     /// `bun` means `bun` ([`Self::effective_runtime`]).
     #[serde(default)]
     pub runtime: Option<ExtensionHostRuntime>,
-    /// Path to a Node.js runtime (>= 22.19). Tried before every `node` on
-    /// `PATH`; each candidate must actually run and meet the floor.
+    /// Path to a Node.js runtime (`^22.19 || >=24`). When set it is the only
+    /// Node candidate: if it does not run or is below the floor, Node
+    /// resolution fails with that reason instead of searching `PATH`.
+    /// Unset, every `node` on `PATH` is tried in order, skipping any inside
+    /// a `node_modules` directory or the working directory.
     #[serde(default)]
     pub node: Option<String>,
-    /// Path to a Bun runtime (>= 1.4.0). Tried before every `bun` on `PATH`
-    /// and `~/.bun/bin/bun`.
+    /// Path to a Bun runtime (>= 1.4.0). When set it is the only Bun
+    /// candidate, as for `node`. Unset, `bun` on `PATH` and then
+    /// `$BUN_INSTALL/bin` (default `~/.bun/bin`) are tried, with the same
+    /// skips.
     #[serde(default)]
     pub bun: Option<String>,
 }

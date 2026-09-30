@@ -305,11 +305,11 @@ pub struct NodeResolution {
 }
 
 impl NodeResolution {
-    /// One-line human summary of why runtime `program` was not selected.
+    /// One-line human summary of why no `kind` candidate was selected.
     #[must_use]
-    pub fn describe_rejections_of(&self, program: &str) -> String {
+    pub fn describe_rejections(&self, kind: HostRuntimeKind) -> String {
         if self.rejected.is_empty() {
-            return format!("no `{program}` found on PATH");
+            return format!("no `{}` found {}", kind.name(), kind.search_scope());
         }
         self.rejected
             .iter()
@@ -319,15 +319,20 @@ impl NodeResolution {
     }
 }
 
-/// Parse `node --version` output (`v22.20.0`).
-#[must_use]
-pub fn parse_node_version(banner: &str) -> Option<(u32, u32, u32)> {
-    let version = banner.trim().strip_prefix('v')?;
-    let mut parts = version.split(['.', '-']);
+/// `major.minor.patch` at the start of `text`, ignoring any pre-release or
+/// build suffix (`1.4.2-canary.3+abc`).
+fn parse_version_triple(text: &str) -> Option<(u32, u32, u32)> {
+    let mut parts = text.split(['.', '-', '+']);
     let major = parts.next()?.parse().ok()?;
     let minor = parts.next()?.parse().ok()?;
     let patch = parts.next()?.parse().ok()?;
     Some((major, minor, patch))
+}
+
+/// Parse `node --version` output (`v22.20.0`).
+#[must_use]
+pub fn parse_node_version(banner: &str) -> Option<(u32, u32, u32)> {
+    parse_version_triple(banner.trim().strip_prefix('v')?)
 }
 
 /// Whether `version` satisfies the extension host floor `^22.19 || >=24`
@@ -341,19 +346,16 @@ pub fn node_version_supported_for_extension_host(version: (u32, u32, u32)) -> bo
 /// Parse `bun --version` output (`1.4.0`, or `1.4.0-canary.1+abc`).
 #[must_use]
 pub fn parse_bun_version(banner: &str) -> Option<(u32, u32, u32)> {
-    let mut parts = banner.trim().split(['.', '-', '+']);
-    let major = parts.next()?.parse().ok()?;
-    let minor = parts.next()?.parse().ok()?;
-    let patch = parts.next()?.parse().ok()?;
-    Some((major, minor, patch))
+    parse_version_triple(banner.trim())
 }
 
-/// The oldest Bun the extension host is validated on: the release the
-/// `Bun.plugin` module shim, `--no-install`, `--no-env-file`, the macOS
-/// memory limit and the native-code lockdown were tested against (1.4.0 on
-/// macOS, 1.4.2 on Linux). CI pins its Bun leg to this version. A newer Bun
-/// on which a lock no longer holds fails the host's start
-/// (`extension-host/src/runtime.ts`).
+/// The oldest Bun the extension host accepts. The `Bun.plugin` module shim,
+/// `--no-install`, `--no-env-file`, the macOS jetsam memory limit and the
+/// native-code lockdown were measured against Bun 1.4.0 on macOS 26.1 arm64
+/// only. CI's JS host-suite leg installs Bun 1.4.0 on `ubuntu-latest`; the
+/// Rust host integration tests do not run on Bun in CI, and no Windows Bun
+/// run is recorded. A newer Bun on which a lock no longer holds fails the
+/// host's start (`extension-host/src/runtime.ts`).
 pub const BUN_MIN_VERSION_FOR_EXTENSION_HOST: (u32, u32, u32) = (1, 4, 0);
 
 /// Node flags that switch off builtins able to load native code in-process:
@@ -389,10 +391,22 @@ impl HostRuntimeKind {
         }
     }
 
-    fn floor(self) -> &'static str {
+    fn floor(self) -> String {
         match self {
-            Self::Bun => ">=1.4.0",
-            Self::Node => "^22.19 || >=24",
+            Self::Bun => {
+                let (major, minor, patch) = BUN_MIN_VERSION_FOR_EXTENSION_HOST;
+                format!(">={major}.{minor}.{patch}")
+            }
+            // `node_version_supported_for_extension_host`.
+            Self::Node => "^22.19 || >=24".to_string(),
+        }
+    }
+
+    /// Where a search for this runtime looks ([`runtime_candidates`]).
+    fn search_scope(self) -> &'static str {
+        match self {
+            Self::Bun => "on PATH or in $BUN_INSTALL/bin (default ~/.bun/bin)",
+            Self::Node => "on PATH",
         }
     }
 
@@ -442,7 +456,8 @@ pub struct HostRuntimeResolution {
 
 impl HostRuntimeResolution {
     /// One line: what runs the host and why, including why Bun was passed
-    /// over when `auto` fell back to Node.
+    /// over when `auto` fell back to Node, and every candidate of the chosen
+    /// runtime that was skipped or rejected on the way.
     #[must_use]
     pub fn summary(&self) -> String {
         let choice = self.choice.as_str();
@@ -459,8 +474,21 @@ impl HostRuntimeResolution {
             && let Some(bun) = &self.bun
         {
             line.push_str(&format!(
-                "; Bun >= 1.4.0 not used: {}",
-                bun.describe_rejections_of("bun")
+                "; Bun {} not used: {}",
+                HostRuntimeKind::Bun.floor(),
+                bun.describe_rejections(HostRuntimeKind::Bun)
+            ));
+        }
+        let probed = match runtime.kind {
+            HostRuntimeKind::Bun => self.bun.as_ref(),
+            HostRuntimeKind::Node => self.node.as_ref(),
+        };
+        if let Some(probed) = probed
+            && !probed.rejected.is_empty()
+        {
+            line.push_str(&format!(
+                "; passed over: {}",
+                probed.describe_rejections(runtime.kind)
             ));
         }
         line
@@ -471,20 +499,27 @@ impl HostRuntimeResolution {
     pub fn failure(&self) -> String {
         let mut reasons = Vec::new();
         if let Some(bun) = &self.bun {
-            reasons.push(format!("bun: {}", bun.describe_rejections_of("bun")));
+            reasons.push(format!(
+                "bun: {}",
+                bun.describe_rejections(HostRuntimeKind::Bun)
+            ));
         }
         if let Some(node) = &self.node {
-            reasons.push(format!("node: {}", node.describe_rejections_of("node")));
+            reasons.push(format!(
+                "node: {}",
+                node.describe_rejections(HostRuntimeKind::Node)
+            ));
         }
+        let (bun, node) = (HostRuntimeKind::Bun.floor(), HostRuntimeKind::Node.floor());
         let wanted = match self.choice {
             crate::config::ExtensionHostRuntime::Auto => {
-                "Bun >= 1.4.0 or Node.js ^22.19 || >=24 (set `[extension_host] bun` or `node`)"
+                format!("Bun {bun} or Node.js {node} (set `[extension_host] bun` or `node`)")
             }
             crate::config::ExtensionHostRuntime::Bun => {
-                "Bun >= 1.4.0 (`runtime = \"bun\"`; set `[extension_host] bun`)"
+                format!("Bun {bun} (`runtime = \"bun\"`; set `[extension_host] bun`)")
             }
             crate::config::ExtensionHostRuntime::Node => {
-                "Node.js ^22.19 || >=24 (set `[extension_host] node`)"
+                format!("Node.js {node} (set `[extension_host] node`)")
             }
         };
         format!("the extension host needs {wanted}; {}", reasons.join("; "))
@@ -527,16 +562,14 @@ fn probe_runtime_version(kind: HostRuntimeKind, path: &Path) -> Result<(u32, u32
         .ok_or_else(|| format!("unrecognized version banner `{}`", banner.trim()))
 }
 
-/// The override, then every `program` on `PATH`; for Bun also its default
-/// install location (`$BUN_INSTALL/bin`, else `~/.bun/bin`), which the Bun
-/// installer adds to shell profiles but a GUI-launched process may not see.
-fn runtime_candidates(kind: HostRuntimeKind, override_path: Option<&Path>) -> Vec<PathBuf> {
-    let mut candidates: Vec<PathBuf> = override_path.map(Path::to_path_buf).into_iter().collect();
-    candidates.extend(
-        executable_path_candidates(kind.program())
-            .into_iter()
-            .filter(|candidate| candidate.is_file()),
-    );
+/// Every `program` on `PATH`; for Bun also its default install location
+/// (`$BUN_INSTALL/bin`, else `~/.bun/bin`), which the Bun installer adds to
+/// shell profiles but a GUI-launched process may not see.
+fn runtime_candidates(kind: HostRuntimeKind) -> Vec<PathBuf> {
+    let mut candidates: Vec<PathBuf> = executable_path_candidates(kind.program())
+        .into_iter()
+        .filter(|candidate| candidate.is_file())
+        .collect();
     if kind == HostRuntimeKind::Bun {
         let install = std::env::var_os("BUN_INSTALL")
             .map(PathBuf::from)
@@ -548,6 +581,86 @@ fn runtime_candidates(kind: HostRuntimeKind, override_path: Option<&Path>) -> Ve
         }
     }
     candidates
+}
+
+/// Why a runtime found by *searching* must not be run: it sits in a
+/// `node_modules` tree (a package's bin shim, such as
+/// `node_modules/.bin/bun`), or inside the current working directory (usually
+/// the workspace), where a repository could plant it. Either would run
+/// unsandboxed as a version probe and then host plugin code. A configured
+/// override is never checked: naming a path is the opt-in.
+///
+/// Known limits: a working directory that contains the user's home (a
+/// launch from `~`, or from `/` as GUI apps are) is not treated as a
+/// workspace, because every user-level install lives under it, so a runtime
+/// planted directly there is not caught. The `node_modules` test reads the
+/// `PATH` spelling, not the resolved target, so a global npm install reached
+/// through a symlink outside `node_modules` still counts as trusted.
+fn untrusted_location(
+    kind: HostRuntimeKind,
+    candidate: &Path,
+    cwd: Option<&Path>,
+    home: Option<&Path>,
+) -> Option<String> {
+    let opt_in = format!("set `[extension_host] {}` to use it anyway", kind.name());
+    if candidate
+        .components()
+        .any(|part| part.as_os_str().eq_ignore_ascii_case("node_modules"))
+    {
+        return Some(format!(
+            "inside a `node_modules` directory; skipped ({opt_in})"
+        ));
+    }
+    let cwd = cwd?;
+    let contains_home = |home: &Path| {
+        home.starts_with(cwd) || std::fs::canonicalize(home).is_ok_and(|home| home.starts_with(cwd))
+    };
+    if cwd.parent().is_none() || home.is_some_and(contains_home) {
+        return None;
+    }
+    // `current_dir` is the resolved path; a `PATH` entry may be spelled
+    // through a symlink (`/tmp` on macOS), so compare its resolved directory.
+    let inside = candidate.starts_with(cwd)
+        || candidate
+            .parent()
+            .and_then(|dir| std::fs::canonicalize(dir).ok())
+            .is_some_and(|dir| dir.starts_with(cwd));
+    inside.then(|| {
+        format!(
+            "inside the working directory {}; skipped ({opt_in})",
+            cwd.display()
+        )
+    })
+}
+
+/// Resolve one runtime. A configured override is the only candidate: one
+/// that does not run or is below the floor fails resolution for this
+/// runtime with its reason, rather than falling through to a search.
+/// Otherwise the search candidates, minus those in an [`untrusted_location`],
+/// which are recorded as rejected without being run. Blocking.
+fn resolve_runtime(kind: HostRuntimeKind, override_path: Option<&Path>) -> NodeResolution {
+    if let Some(path) = override_path {
+        return select_runtime(kind, vec![path.to_path_buf()]);
+    }
+    let cwd = std::env::current_dir().ok();
+    let home = codewhale_paths::user_home();
+    let mut skipped = Vec::new();
+    let candidates = runtime_candidates(kind)
+        .into_iter()
+        .filter(|candidate| {
+            match untrusted_location(kind, candidate, cwd.as_deref(), home.as_deref()) {
+                Some(reason) => {
+                    skipped.push((candidate.clone(), reason));
+                    false
+                }
+                None => true,
+            }
+        })
+        .collect();
+    let mut resolution = select_runtime(kind, candidates);
+    skipped.append(&mut resolution.rejected);
+    resolution.rejected = skipped;
+    resolution
 }
 
 /// Choose the extension host's runtime for `[extension_host] runtime`:
@@ -562,15 +675,15 @@ pub fn resolve_extension_host_runtime(
 ) -> HostRuntimeResolution {
     select_host_runtime(
         choice,
-        || runtime_candidates(HostRuntimeKind::Bun, bun_override),
-        || runtime_candidates(HostRuntimeKind::Node, node_override),
+        || resolve_runtime(HostRuntimeKind::Bun, bun_override),
+        || resolve_runtime(HostRuntimeKind::Node, node_override),
     )
 }
 
 fn select_host_runtime(
     choice: crate::config::ExtensionHostRuntime,
-    bun_candidates: impl FnOnce() -> Vec<PathBuf>,
-    node_candidates: impl FnOnce() -> Vec<PathBuf>,
+    probe_bun: impl FnOnce() -> NodeResolution,
+    probe_node: impl FnOnce() -> NodeResolution,
 ) -> HostRuntimeResolution {
     use crate::config::ExtensionHostRuntime as Choice;
     let mut resolution = HostRuntimeResolution {
@@ -591,12 +704,12 @@ fn select_host_runtime(
         })
     };
     if matches!(choice, Choice::Auto | Choice::Bun) {
-        let bun = select_runtime(HostRuntimeKind::Bun, bun_candidates());
+        let bun = probe_bun();
         resolution.selected = pick(HostRuntimeKind::Bun, &bun);
         resolution.bun = Some(bun);
     }
     if resolution.selected.is_none() && matches!(choice, Choice::Auto | Choice::Node) {
-        let node = select_runtime(HostRuntimeKind::Node, node_candidates());
+        let node = probe_node();
         resolution.selected = pick(HostRuntimeKind::Node, &node);
         resolution.node = Some(node);
     }
@@ -1204,10 +1317,18 @@ mod tests {
             "case \"$1\" in --no-experimental-ffi) echo 'bad option' >&2; exit 9;; esac\necho v24.1.0",
         );
 
-        // auto: a supported Bun wins, and Node is never probed.
+        let probe = |kind, candidates: &[&PathBuf]| {
+            select_runtime(
+                kind,
+                candidates.iter().map(|path| (*path).clone()).collect(),
+            )
+        };
+
+        // auto: a supported Bun wins, and Node is never probed. The Bun
+        // passed over on the way is in the summary.
         let auto = select_host_runtime(
             Choice::Auto,
-            || vec![old_bun.clone(), bun.clone()],
+            || probe(HostRuntimeKind::Bun, &[&old_bun, &bun]),
             || panic!("node must not be probed when Bun is usable"),
         );
         let selected = auto.selected.clone().unwrap();
@@ -1215,18 +1336,19 @@ mod tests {
         assert_eq!(selected.path, bun);
         assert_eq!(selected.version_string(), "1.4.0");
         assert!(selected.native_code_flags.is_empty());
+        let summary = auto.summary();
+        assert!(summary.starts_with("bun 1.4.0 at "), "{summary}");
+        assert!(summary.contains("(runtime = \"auto\")"), "{summary}");
         assert!(
-            auto.summary().starts_with("bun 1.4.0 at "),
-            "{}",
-            auto.summary()
+            summary.contains("passed over: ") && summary.contains("1.3.14 is below"),
+            "{summary}"
         );
-        assert!(auto.summary().contains("(runtime = \"auto\")"));
 
         // auto without a supported Bun: Node, and the summary says why.
         let fallback = select_host_runtime(
             Choice::Auto,
-            || vec![old_bun.clone()],
-            || vec![node.clone()],
+            || probe(HostRuntimeKind::Bun, &[&old_bun]),
+            || probe(HostRuntimeKind::Node, &[&node]),
         );
         assert_eq!(
             fallback.selected.as_ref().unwrap().kind,
@@ -1234,23 +1356,32 @@ mod tests {
         );
         let summary = fallback.summary();
         assert!(summary.starts_with("node 24.1.0 at "), "{summary}");
-        assert!(summary.contains("Bun >= 1.4.0 not used"), "{summary}");
+        assert!(summary.contains("Bun >=1.4.0 not used"), "{summary}");
         assert!(
             summary.contains("1.3.14 is below the >=1.4.0 floor"),
             "{summary}"
         );
-        let none_found = select_host_runtime(Choice::Auto, Vec::new, || vec![node.clone()]);
-        assert!(none_found.summary().contains("no `bun` found on PATH"));
+        // Nothing found: the message names every place that was searched.
+        let none_found = select_host_runtime(Choice::Auto, NodeResolution::default, || {
+            probe(HostRuntimeKind::Node, &[&node])
+        });
+        assert!(
+            none_found
+                .summary()
+                .contains("no `bun` found on PATH or in $BUN_INSTALL/bin (default ~/.bun/bin)"),
+            "{}",
+            none_found.summary()
+        );
 
         // runtime = "bun": no Node fallback, even when Node works.
         let bun_only = select_host_runtime(
             Choice::Bun,
-            || vec![old_bun.clone()],
+            || probe(HostRuntimeKind::Bun, &[&old_bun]),
             || panic!("runtime = \"bun\" must not probe node"),
         );
         assert!(bun_only.selected.is_none());
         assert!(
-            bun_only.failure().contains("needs Bun >= 1.4.0"),
+            bun_only.failure().contains("needs Bun >=1.4.0"),
             "{}",
             bun_only.failure()
         );
@@ -1259,7 +1390,7 @@ mod tests {
         let node_only = select_host_runtime(
             Choice::Node,
             || panic!("runtime = \"node\" must not probe bun"),
-            || vec![node.clone()],
+            || probe(HostRuntimeKind::Node, &[&node]),
         );
         let node_runtime = node_only.selected.unwrap();
         assert_eq!(node_runtime.kind, HostRuntimeKind::Node);
@@ -1269,6 +1400,100 @@ mod tests {
             vec!["--no-experimental-sqlite"]
         );
         assert!(node_only.bun.is_none());
+    }
+
+    /// A runtime found by searching that a repository could have planted is
+    /// never run; a configured override is exempt from that check but is
+    /// final: when it fails, resolution fails with its reason.
+    #[cfg(unix)]
+    #[test]
+    fn untrusted_search_candidates_are_skipped_and_a_failing_override_is_final() {
+        use crate::config::ExtensionHostRuntime as Choice;
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let script = |name: &str, body: &str| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            path
+        };
+        let kind = HostRuntimeKind::Bun;
+        let home = dir.path().join("home");
+        let workspace = dir.path().join("workspace");
+        std::fs::create_dir_all(workspace.join("bin")).unwrap();
+        // `current_dir` is resolved; the temp dir may be spelled through a
+        // symlink (`/var` → `/private/var` on macOS).
+        let cwd = std::fs::canonicalize(&workspace).unwrap();
+
+        let shim = Path::new("/opt/tools/node_modules/.bin/bun");
+        let reason = untrusted_location(kind, shim, None, None).unwrap();
+        assert!(reason.contains("`node_modules`"), "{reason}");
+        let reason = untrusted_location(
+            kind,
+            &workspace.join("bin/bun"),
+            Some(cwd.as_path()),
+            Some(home.as_path()),
+        )
+        .unwrap();
+        assert!(reason.contains("inside the working directory"), "{reason}");
+        assert!(reason.contains("`[extension_host] bun`"), "{reason}");
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(workspace.join("bin"), &link).unwrap();
+        assert!(
+            untrusted_location(
+                kind,
+                &link.join("bun"),
+                Some(cwd.as_path()),
+                Some(home.as_path())
+            )
+            .is_some()
+        );
+        assert_eq!(
+            untrusted_location(
+                kind,
+                &dir.path().join("elsewhere/bun"),
+                Some(cwd.as_path()),
+                Some(home.as_path())
+            ),
+            None
+        );
+        // A working directory that contains the home is not a workspace.
+        let user_bun = home.join(".bun/bin/bun");
+        assert_eq!(
+            untrusted_location(kind, &user_bun, Some(home.as_path()), Some(home.as_path())),
+            None
+        );
+        assert_eq!(
+            untrusted_location(kind, &user_bun, Some(Path::new("/")), Some(home.as_path())),
+            None
+        );
+
+        // A failing override never falls through to a search.
+        let broken = script("broken-bun", "exit 3");
+        let bun_only = resolve_extension_host_runtime(Choice::Bun, None, Some(broken.as_path()));
+        assert!(bun_only.selected.is_none());
+        let failure = bun_only.failure();
+        assert!(
+            failure.contains(&format!("{}: does not run", broken.display())),
+            "{failure}"
+        );
+        assert_eq!(bun_only.bun.as_ref().unwrap().rejected.len(), 1);
+        // Under `auto` the Node that runs instead says why the Bun did not.
+        let node = script("node", "echo v24.1.0");
+        let auto = resolve_extension_host_runtime(
+            Choice::Auto,
+            Some(node.as_path()),
+            Some(broken.as_path()),
+        );
+        let summary = auto.summary();
+        assert!(summary.starts_with("node 24.1.0 at "), "{summary}");
+        assert!(
+            summary.contains(&format!(
+                "Bun >=1.4.0 not used: {}: does not run",
+                broken.display()
+            )),
+            "{summary}"
+        );
     }
 
     #[test]
