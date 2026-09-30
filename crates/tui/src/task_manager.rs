@@ -6602,7 +6602,16 @@ mod tests {
     /// window longer than the idle deadline fed only by ToolHeartbeat, then
     /// completion. Pins the supervisor side of the heartbeat chain — the
     /// worker idle watchdog must count heartbeats as progress.
+    ///
+    /// Margins: heartbeats every 30 ms across a 1.2 s window against a 500 ms
+    /// idle deadline. The window still outlasts the deadline (so the test
+    /// fails if heartbeats stop counting), while a loaded runner would need a
+    /// half-second stall to starve it; the 150 ms default deadline did starve
+    /// on hosted Windows.
     struct ToolHeartbeatExecutor;
+
+    const HEARTBEAT_TEST_IDLE_PROGRESS: Duration = Duration::from_millis(500);
+    const HEARTBEAT_TEST_TICKS: u32 = 40;
 
     #[async_trait]
     impl TaskExecutor for ToolHeartbeatExecutor {
@@ -6619,7 +6628,7 @@ mod tests {
                     input: serde_json::json!({}),
                 })
                 .await;
-            for _ in 0..12 {
+            for _ in 0..HEARTBEAT_TEST_TICKS {
                 sleep(Duration::from_millis(30)).await;
                 if cancel.is_cancelled() {
                     return TaskExecutionResult {
@@ -6653,7 +6662,8 @@ mod tests {
     async fn worker_supervisor_honors_tool_heartbeats_during_silent_tools() -> Result<()> {
         let root = tempfile::tempdir()?;
         let mut config = short_test_config(root.path().to_path_buf());
-        config.execution_limits.wall_time = Duration::from_secs(2);
+        config.execution_limits.wall_time = Duration::from_secs(5);
+        config.execution_limits.idle_progress = HEARTBEAT_TEST_IDLE_PROGRESS;
         let manager =
             TaskManager::start_with_executor(config, Arc::new(ToolHeartbeatExecutor)).await?;
 
