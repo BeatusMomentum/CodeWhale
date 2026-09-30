@@ -78,7 +78,7 @@ fn mark_workspace_trusted(workspace: &Path) -> WorkspaceTrustConfigGuard {
 #[test]
 fn test_mcp_config_defaults() {
     let config = McpConfig::default();
-    assert_eq!(config.timeouts.connect_timeout, 10);
+    assert_eq!(config.timeouts.connect_timeout, 30);
     assert_eq!(config.timeouts.execute_timeout, 60);
     assert_eq!(config.timeouts.read_timeout, 120);
     assert!(config.servers.is_empty());
@@ -6683,6 +6683,419 @@ fn removed_runtime_server_config_can_be_retried_with_same_name() {
         .expect("rollback must release the deterministic runtime name");
 }
 
+#[tokio::test]
+async fn mcp_initialize_sends_empty_client_capabilities_and_accepts_2025_11_25() {
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let transport = ScriptedValueTransport {
+        sent: Arc::clone(&sent),
+        responses: VecDeque::from([json_frame(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "protocolVersion": "2025-11-25",
+                "serverInfo": {"name": "current-sdk", "version": "1.0.0"},
+                "capabilities": {"tools": {}}
+            }
+        }))]),
+    };
+    let mut conn = test_connection(Box::new(transport));
+
+    conn.initialize()
+        .await
+        .expect("a 2025-11-25 server must complete the handshake");
+
+    let sent = sent.lock().unwrap();
+    let initialize = sent
+        .iter()
+        .find(|message| message["method"] == "initialize")
+        .expect("initialize sent");
+    assert_eq!(
+        initialize["params"],
+        serde_json::json!({
+            "protocolVersion": MCP_PROTOCOL_VERSION,
+            "clientInfo": {"name": "codewhale-tui", "version": env!("CARGO_PKG_VERSION")},
+            "capabilities": {}
+        }),
+        "client capabilities must not declare server-side tools/resources/prompts"
+    );
+}
+
+#[tokio::test]
+async fn mcp_initialize_rejection_from_expired_aws_sso_names_the_login_command() {
+    let transport = ScriptedValueTransport {
+        sent: Arc::new(Mutex::new(Vec::new())),
+        responses: VecDeque::from([json_frame(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "error": {
+                "code": -32602,
+                "message": "Error retrieving credentials: The SSO session associated with this profile has expired or is otherwise invalid."
+            }
+        }))]),
+    };
+    let mut conn = test_connection(Box::new(transport));
+    conn.config.args = vec![
+        "mcp-proxy-for-aws@1.6.4".to_string(),
+        "--profile".to_string(),
+        "work-sso".to_string(),
+    ];
+
+    let error = format!("{:#}", conn.initialize().await.expect_err("rejected"));
+    assert!(
+        error.contains(
+            "run `aws sso login --profile work-sso` in a terminal, then `/mcp retry mock`"
+        ),
+        "{error}"
+    );
+    assert_eq!(
+        mcp_recovery_kind(true, true, false, Some(&error), false),
+        Some(McpRecoveryKind::AwsLogin)
+    );
+}
+
+#[test]
+fn mcp_recovery_kind_routes_expired_aws_credentials_to_external_login() {
+    for stderr in [
+        "The SSO session associated with this profile has expired or is otherwise invalid. To refresh this SSO session run aws sso login with the corresponding profile.",
+        "Error loading SSO Token: Token for my-sso does not exist",
+        "An error occurred (ExpiredTokenException) when calling the GetCallerIdentity operation: The security token included in the request is expired",
+        // An expired AWS token that also says 401/Unauthorized must not be
+        // routed to `/mcp login`, an OAuth flow that cannot renew it.
+        "UnauthorizedException (401): AWS token has expired",
+    ] {
+        assert_eq!(
+            mcp_recovery_kind(true, true, false, Some(stderr), false),
+            Some(McpRecoveryKind::AwsLogin),
+            "{stderr}"
+        );
+    }
+    // Unrelated text that merely shares substrings stays where it was.
+    for (stderr, expected) in [
+        ("processor token invalid", McpRecoveryKind::Diagnose),
+        ("401 Unauthorized", McpRecoveryKind::Reauth),
+        (
+            "oauth token expired; invalid_grant",
+            McpRecoveryKind::Reauth,
+        ),
+        (
+            "laws of token expiry were expired",
+            McpRecoveryKind::Diagnose,
+        ),
+    ] {
+        assert_eq!(
+            mcp_recovery_kind(true, true, false, Some(stderr), false),
+            Some(expected),
+            "{stderr}"
+        );
+    }
+    assert_eq!(
+        McpRecoveryKind::AwsLogin.slash_command("aws"),
+        "/mcp retry aws"
+    );
+    assert_eq!(
+        McpRecoveryKind::AwsLogin.slash_command("name with spaces"),
+        "/mcp reload"
+    );
+
+    let mut config = test_server_config();
+    assert_eq!(
+        aws_login_hint(&config, "aws", ""),
+        "AWS credentials expired: run `aws sso login` in a terminal, then `/mcp retry aws`"
+    );
+    config
+        .env
+        .insert("AWS_PROFILE".to_string(), "from-env".to_string());
+    assert!(aws_login_hint(&config, "aws", "").contains("aws sso login --profile from-env"));
+    config.args = vec!["--profile=from-arg".to_string()];
+    assert!(aws_login_hint(&config, "aws", "").contains("aws sso login --profile from-arg"));
+    // A profile the shell could misread is left out rather than quoted.
+    config.args = vec!["--profile".to_string(), "x; rm -rf ~".to_string()];
+    config.env.clear();
+    assert!(aws_login_hint(&config, "aws", "").contains("run `aws sso login` in"));
+    config.args = vec!["--profile=--no-sign-request".to_string()];
+    assert!(aws_login_hint(&config, "aws", "").contains("run `aws sso login` in"));
+}
+
+/// Review of #6789: the AWS-before-OAuth ordering lived only in the free
+/// classifier, while the panel read the typed needs-auth flag first. A stdio
+/// AWS proxy whose token expired with `401`/`Unauthorized` wording must not
+/// enter the needs-auth set, must not read `auth_required`, and its row must
+/// route to the in-place retry with the login command in the detail.
+#[test]
+fn expired_aws_login_with_401_wording_never_reaches_oauth_needs_auth() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = McpConfig::default();
+    let mut server = test_server_config();
+    server.args = vec!["--profile".to_string(), "work".to_string()];
+    config.servers.insert("aws".to_string(), server);
+    let mut pool = McpPool::new(config);
+
+    // Not the initialize branch: no hint was appended to this error.
+    let error = anyhow::anyhow!("UnauthorizedException (401): AWS token has expired");
+    pool.note_connect_failure("aws", &error);
+    assert!(!pool.server_needs_auth("aws"));
+
+    let errors = HashMap::from([("aws".to_string(), format_mcp_error_for_display(&error))]);
+    let snapshot = pool.manager_snapshot(&dir.path().join("mcp.json"), false, &errors);
+    let aws = snapshot
+        .servers
+        .iter()
+        .find(|server| server.name == "aws")
+        .expect("aws in snapshot");
+    assert!(!aws.auth_required, "{aws:?}");
+    let recovery = aws
+        .recovery_kind(false)
+        .expect("a failed server has a recovery");
+    assert_eq!(recovery, McpRecoveryKind::AwsLogin);
+    assert_eq!(recovery.slash_command("aws"), "/mcp retry aws");
+    // Labelled for what it runs, not "re-auth".
+    assert_eq!(
+        recovery.label_key(),
+        codewhale_localization::MessageId::ExtensionsActionReconnect
+    );
+    let detail = aws.error.as_deref().unwrap_or_default();
+    assert!(
+        detail.contains("run `aws sso login --profile work` in a terminal, then `/mcp retry aws`"),
+        "{detail}"
+    );
+
+    // A genuine OAuth 401 on the same pool still enters the needs-auth set.
+    pool.note_connect_failure("aws", &anyhow::anyhow!("HTTP 401 Unauthorized"));
+    assert!(pool.server_needs_auth("aws"));
+}
+
+#[tokio::test]
+async fn live_aws_expiry_retires_the_catalog_and_lists_external_recovery() {
+    for method in ["tools/call", "resources/read", "prompts/get"] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = McpConfig::default();
+        let server = test_server_config();
+        config.servers.insert("aws".to_string(), server.clone());
+        let mut pool = McpPool::new(config);
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let mut connection = test_connection(Box::new(ScriptedValueTransport {
+            sent: Arc::clone(&sent),
+            responses: VecDeque::from([json_frame(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "error": { "code": -32000, "message": "UnauthorizedException (401): AWS token has expired" }
+            }))]),
+        }));
+        connection.name = "aws".to_string();
+        connection.config = server;
+        connection.catalog_generation = pool.current_catalog_generation();
+        connection.tools.push(McpTool {
+            name: "lookup".to_string(),
+            description: None,
+            input_schema: serde_json::json!({"type": "object"}),
+            annotations: None,
+        });
+        connection.resources.push(McpResource {
+            uri: "aws://example".to_string(),
+            name: "example".to_string(),
+            description: None,
+            mime_type: None,
+        });
+        connection.prompts.push(McpPrompt {
+            name: "lookup".to_string(),
+            description: None,
+            arguments: Vec::new(),
+        });
+        pool.store_ready_connection("aws".to_string(), connection)
+            .unwrap();
+
+        let result = match method {
+            "tools/call" => {
+                pool.call_tool("mcp_aws_lookup", serde_json::json!({}))
+                    .await
+            }
+            "resources/read" => pool.read_resource("aws", "aws://example").await,
+            "prompts/get" => {
+                pool.get_prompt("aws", "lookup", serde_json::json!({}))
+                    .await
+            }
+            _ => unreachable!(),
+        };
+        let error = result.expect_err("expired AWS credentials fail the call");
+        assert!(format!("{error:#}").contains("aws sso login"));
+        assert_eq!(sent.lock().unwrap().len(), 1, "never replay the call");
+        assert!(!pool.connected_servers().contains(&"aws"));
+        assert!(!pool.server_needs_auth("aws"));
+        assert!(
+            pool.to_api_tools()
+                .iter()
+                .all(|tool| !tool.name.starts_with("mcp_aws_"))
+        );
+
+        // No external boot error map: the latest pool failure owns this row.
+        let snapshot = pool.manager_snapshot(&dir.path().join("mcp.json"), false, &HashMap::new());
+        let row = &snapshot.servers[0];
+        assert!(!row.connected && !row.auth_required);
+        assert_eq!(row.recovery_kind(false), Some(McpRecoveryKind::AwsLogin));
+        assert!(
+            row.error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("aws sso login")
+        );
+
+        // Backoff reuses the recorded failure, so neither listing spawns a
+        // process or logs in. Both model surfaces name the external recovery.
+        for items in [
+            pool.list_resources(None).await.unwrap(),
+            pool.list_resource_templates(None).await.unwrap(),
+        ] {
+            let item = items
+                .iter()
+                .find(|item| item["server"] == "aws")
+                .expect("AWS failure item");
+            assert_eq!(item["error"], "aws_login_required");
+            assert!(item.get("authenticate_tool").is_none());
+            let message = item["message"].as_str().unwrap();
+            assert!(message.contains("aws sso login") && message.contains("/mcp retry aws"));
+            assert!(!message.contains("/mcp login"));
+        }
+    }
+}
+
+#[test]
+fn sso_wording_on_an_oauth_capable_server_stays_on_the_oauth_route() {
+    // Corporate SSO in front of an OAuth HTTP server: `aws sso login` cannot
+    // help it, `/mcp login` can.
+    assert!(!mcp_error_is_aws_login(
+        "401 Unauthorized: SSO token expired",
+        true
+    ));
+    assert_eq!(
+        mcp_recovery_kind(
+            true,
+            true,
+            false,
+            Some("401 Unauthorized: SSO token expired"),
+            true
+        ),
+        Some(McpRecoveryKind::Reauth)
+    );
+    assert_eq!(
+        mcp_recovery_kind(true, true, false, Some("SSO token expired"), true),
+        Some(McpRecoveryKind::Diagnose)
+    );
+    // The same text from a stdio server is still the AWS route.
+    assert_eq!(
+        mcp_recovery_kind(true, true, false, Some("SSO token expired"), false),
+        Some(McpRecoveryKind::AwsLogin)
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = McpConfig::default();
+    let mut server = test_server_config();
+    server.command = None;
+    server.url = Some("https://mcp.example.test/mcp".to_string());
+    // Automatic OAuth discovery works without explicit scopes/client config.
+    assert!(mcp_server_oauth_capable(&server));
+    config.servers.insert("corp".to_string(), server);
+    let mut pool = McpPool::new(config);
+    pool.note_connect_failure(
+        "corp",
+        &anyhow::anyhow!("401 Unauthorized: SSO token expired"),
+    );
+    assert!(pool.server_needs_auth("corp"));
+    let errors = HashMap::new();
+    let snapshot = pool.manager_snapshot(&dir.path().join("mcp.json"), false, &errors);
+    let corp = &snapshot.servers[0];
+    assert!(corp.auth_required);
+    assert_eq!(corp.recovery_kind(true), Some(McpRecoveryKind::Reauth));
+}
+
+/// Review of #6789: a reviewed plugin's initialize/live error is suppressed to
+/// protect environment-backed credentials, which also hid the AWS wording
+/// the recovery keys on. The classification now runs on the raw text first
+/// and only our fixed hint survives — never the server's own words, and
+/// never the plugin's `AWS_PROFILE` env value.
+#[tokio::test]
+async fn reviewed_plugin_rejection_keeps_aws_recovery_but_not_server_text() {
+    let dir = tempfile::tempdir().unwrap();
+    let plugins_root = dir.path().join("plugins");
+    let plugin_base = plugins_root.join("aws-guard");
+    fs::create_dir_all(&plugin_base).unwrap();
+    fs::create_dir_all(dir.path().join("project")).unwrap();
+    fs::write(
+        plugin_base.join("plugin.toml"),
+        "schema_version = 1\n[plugin]\nname = \"aws-guard\"\nversion = \"1.0.0\"\n",
+    )
+    .unwrap();
+    let discovery = crate::plugins::discovery::DiscoveryConfig {
+        workspace: dir.path().join("project"),
+        user_plugins_dir: plugins_root,
+        workspace_plugins_dir: dir.path().join("workspace-plugins-unused"),
+        builtin_plugin_dirs: Vec::new(),
+        state_path: dir.path().join("plugin-state/state.json"),
+    };
+    let mut registry = crate::plugins::discovery::discover_with_config(&discovery);
+    registry.trust("aws-guard").unwrap();
+    registry.enable("aws-guard").unwrap();
+    let authority = registry.authority_for("aws-guard").unwrap();
+
+    let mut config = test_server_config();
+    config
+        .env
+        .insert("AWS_PROFILE".to_string(), "env-profile-secret".to_string());
+    config.reviewed_plugin = Some(
+        ReviewedPluginMcpSource::from_authority(
+            authority,
+            None,
+            Arc::new(crate::plugins::HostEnvironment::capture()),
+        )
+        .unwrap(),
+    );
+
+    for initialize in [true, false] {
+        for (server_error, login) in [
+            (
+                "Error retrieving credentials for acct-SECRET-123: The SSO session associated with this profile has expired or is otherwise invalid.",
+                "aws sso login",
+            ),
+            (
+                "acct-SECRET-123 LoginRefreshRequired: Please reauthenticate using aws login",
+                "aws login",
+            ),
+        ] {
+            let transport = ScriptedValueTransport {
+                sent: Arc::new(Mutex::new(Vec::new())),
+                responses: VecDeque::from([json_frame(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "error": { "code": -32602, "message": server_error }
+                }))]),
+            };
+            let mut conn = test_connection(Box::new(transport));
+            conn.config = config.clone();
+            let error = if initialize {
+                conn.initialize().await.expect_err("initialize rejected")
+            } else {
+                conn.call_method("tools/call", serde_json::json!({}), 5)
+                    .await
+                    .expect_err("live call rejected")
+            };
+            let error = format!("{error:#}");
+            assert!(error.contains("server details suppressed"), "{error}");
+            assert!(!error.contains("acct-SECRET-123"), "{error}");
+            assert!(!error.contains("env-profile-secret"), "{error}");
+            let hint = format!(
+                "AWS credentials expired: run `{login}` in a terminal, then `/mcp retry mock`"
+            );
+            assert!(error.contains(&hint), "{error}");
+            assert_eq!(
+                mcp_recovery_kind(true, true, false, Some(&error), false),
+                Some(McpRecoveryKind::AwsLogin)
+            );
+            // Pool/snapshot/listing classification sees only sanitized text;
+            // it must preserve aws login versus aws sso login on that pass.
+            assert_eq!(aws_login_hint(&config, "mock", &error), hint);
+        }
+    }
+}
+
 #[test]
 fn mcp_recovery_kind_names_real_login_and_reload_commands() {
     assert_eq!(
@@ -9161,6 +9574,14 @@ async fn initialize_rejection_names_the_server_command_and_its_stderr_reason() {
     assert!(text.contains("-32602"), "{text}");
     assert!(
         text.contains("server stderr: LoginRefreshRequired: Please reauthenticate using aws login"),
+        "{text}"
+    );
+    // The founder's exact stderr is an AWS CLI `aws login` session, renewed
+    // with `aws login` (not `aws sso login`).
+    assert!(
+        text.contains(
+            "AWS credentials expired: run `aws login` in a terminal, then `/mcp retry aws`"
+        ),
         "{text}"
     );
 }
