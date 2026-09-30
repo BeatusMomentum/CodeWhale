@@ -163,6 +163,36 @@ exec /bin/ln "$@"
     f.untouched();
   });
 
+  test(`${kind}: a failed second publication removes the command this run published`, t => {
+    const f = fixture(t, kind);
+    // Another writer claims codew between preflight and its publication.
+    executable(path.join(f.bin, "ln"), `#!/bin/sh
+case "$(basename "$1")" in codew) printf 'another writer' > "$2codew" ;; esac
+exec /bin/ln "$@"
+`);
+    const result = f.run();
+    assert.notEqual(result.status, 0, result.stdout);
+    assert.equal(fs.existsSync(path.join(f.destination, "codewhale")), false, "no half-installed pair is left behind");
+    assert.equal(fs.readFileSync(path.join(f.destination, "codew"), "utf8"), "another writer");
+    assert.match(result.stderr, /did not complete/);
+    assert.equal(fs.readdirSync(f.destination).some(name => name.startsWith(".codewhale-install.")), false);
+    f.untouched();
+  });
+
+  test(`${kind}: rollback never removes a command that was already installed`, t => {
+    const f = fixture(t, kind);
+    assert.equal(f.run().status, 0);
+    fs.unlinkSync(path.join(f.destination, "codew"));
+    const kept = fs.statSync(path.join(f.destination, "codewhale")).ino;
+    executable(path.join(f.bin, "ln"), `#!/bin/sh
+case "$(basename "$1")" in codew) printf 'another writer' > "$2codew" ;; esac
+exec /bin/ln "$@"
+`);
+    assert.notEqual(f.run().status, 0);
+    assert.equal(fs.statSync(path.join(f.destination, "codewhale")).ino, kept);
+    f.untouched();
+  });
+
   for (const collision of ["directory", "directory symlink"]) {
     test(`${kind}: a raced ${collision} cannot redirect publication`, t => {
       const f = fixture(t, kind);

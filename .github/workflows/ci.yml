@@ -269,6 +269,7 @@ jobs:
           node .github/scripts/release-workflows.test.js
           node --test scripts/release/assemble-release-assets.test.js
           node --test scripts/release/ensure-release-assets-absent.test.js
+          node --test scripts/release/verify-release-inventory.test.js
       - name: Run runtime web client tests
         # crates/tui/tests/runtime_web_client.test.mjs exercises the embedded
         # web client's event/snapshot state machine; it ran nowhere before.
