@@ -1,0 +1,2 @@
+{"request":[]}
+{"type":"open_failure","detail":"DeepSeek model \"deepseek-v4-pro\" uses ChatCompletions, but this client is bound to Responses; resolve a new model route before sending"}

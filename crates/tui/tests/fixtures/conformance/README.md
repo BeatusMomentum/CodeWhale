@@ -157,6 +157,32 @@ case, and by passing the Rust runner once it is wired in:
   `EventMsg` can read these goldens as its contract.
 
 Fields named `detail` carry human-readable error text and are compared exactly,
-including by a second implementation. Only the explicitly documented masks
-apply. No whitespace, line-ending, error-text, or event-order normalization may
+including by a second implementation. Only the explicitly documented masks and
+projections apply. No whitespace, line-ending, error-text, or event-order normalization may
 be added to make a drift pass. `.gitattributes` pins fixture checkout bytes to LF.
+
+## Coverage boundaries
+
+The initial corpus contains 28 scenarios: 6 turns, 6 hooks, 2 MCP transcripts,
+3 prefixes, and 11 SSE recordings. Each SSE case must reach its loopback server
+and produce a normalized stream event; an incorrectly bound client that fails
+before sending is missing evidence. Client construction resolves the case model
+through the production route authority. Harness stalls are tested separately
+using a hung Engine provider, an unanswered real MCP call, and an open SSE socket.
+
+This is the Rust reference corpus, not TypeScript parity evidence. No TypeScript
+dispatch is registered yet. The MCP cases use the production direct-call seam;
+full-turn MCP admission, credentials/OAuth, stdio servers, reconnect/retry races,
+and hosted server binaries need separate fixtures. Hook cases cover before-tool
+admission and synchronous after-tool observers; message-submit/session hooks,
+background observers, cancellation and process-tree teardown are not covered.
+The turns do not qualify persistence/resume, nested multi-tool cardinality,
+non-draining client backpressure, or every client projection. Slash-command,
+script-tool, and migrated adapter calls need their own fixtures before flipping.
+
+The prefix runner names unavailable host-probed tools explicitly. A skipped
+definition (`code_execution`, `image_ocr`, `js_execution`, `pandoc_convert`) is
+unchecked, even when the family passes; a host offering it needs a reviewed
+`host_probed_tools.golden.json` entry. Windows turn/hook/prefix fixtures, Linux
+replay, hosted CI, native app behavior, and real-provider acceptance are separate
+evidence. This corpus supplies none of those receipts by itself.

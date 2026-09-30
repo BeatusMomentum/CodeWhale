@@ -109,6 +109,9 @@ fn capture_prefix(name: &str, case: &Value) -> Result<Prefix, String> {
         Some(codewhale_models::SystemPrompt::Text(_)) => 1,
         None => 0,
     };
+    if system_blocks == 0 {
+        return Err(format!("{name}: the captured system prefix is empty"));
+    }
 
     let mut tools = Vec::new();
     let mut probed = BTreeMap::new();
@@ -121,6 +124,9 @@ fn capture_prefix(name: &str, case: &Value) -> Result<Prefix, String> {
         } else {
             tools.push(value);
         }
+    }
+    if tools.is_empty() && probed.is_empty() {
+        return Err(format!("{name}: the captured tool catalog is empty"));
     }
     Ok(Prefix {
         system_json,
@@ -168,11 +174,17 @@ fn model_visible_prefix_bytes_match_goldens() {
         match capture_prefix(name, &case) {
             Ok(again) if again.system_json == prefix.system_json && again.tools == prefix.tools => {
             }
-            Ok(_) => failures.push(
-                name,
-                "the prefix differs between two identical sessions in one process",
-            ),
-            Err(message) => failures.push(name, message),
+            Ok(_) => {
+                failures.push(
+                    name,
+                    "the prefix differs between two identical sessions in one process",
+                );
+                continue;
+            }
+            Err(message) => {
+                failures.push(name, message);
+                continue;
+            }
         }
         for (tool, definition) in &prefix.probed {
             if let Some(previous) = probed_seen.get(tool)

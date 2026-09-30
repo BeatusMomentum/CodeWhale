@@ -45,6 +45,15 @@ async fn harness_timeout_rejects_a_real_stalled_sse_connection() {
     );
 }
 
+#[tokio::test]
+async fn empty_sse_recording_cannot_be_qualified() {
+    let case = golden::read_case(FAMILY, "anthropic_thinking_text_usage");
+    assert!(
+        replay(&case, Vec::new()).await.is_err(),
+        "empty recording became a passing case"
+    );
+}
+
 /// One-shot-per-connection loopback server that answers every request with
 /// the recording. `close` framing ends the body by closing the socket (a
 /// provider that stops sending); `chunked` framing uses HTTP chunks, and
@@ -183,10 +192,10 @@ async fn serve(
     let _ = socket.shutdown().await;
 }
 
-fn client_for_route(route: &str, base: &str) -> CodewhaleClient {
+fn client_for_route(route: &str, base: &str, model: &str) -> CodewhaleClient {
     let _ = rustls::crypto::ring::default_provider().install_default();
-    match route {
-        "anthropic" => CodewhaleClient::new(&Config {
+    let config = match route {
+        "anthropic" => Config {
             provider: Some("anthropic".to_string()),
             providers: Some(ProvidersConfig {
                 anthropic: ProviderConfig {
@@ -197,9 +206,8 @@ fn client_for_route(route: &str, base: &str) -> CodewhaleClient {
                 ..ProvidersConfig::default()
             }),
             ..Config::default()
-        })
-        .expect("anthropic client"),
-        "openai" => CodewhaleClient::new(&Config {
+        },
+        "openai" => Config {
             provider: Some("openai".to_string()),
             providers: Some(ProvidersConfig {
                 openai: ProviderConfig {
@@ -210,26 +218,18 @@ fn client_for_route(route: &str, base: &str) -> CodewhaleClient {
                 ..ProvidersConfig::default()
             }),
             ..Config::default()
-        })
-        .expect("openai client"),
-        // The DeepSeek route keeps its exact semantic endpoint (route shaping
-        // reads it) and only the transport goes to the loopback server.
-        "deepseek" => {
-            let mut client = CodewhaleClient::new(
-                &Config {
-                    provider: Some("deepseek".to_string()),
-                    ..Config::default()
-                }
-                .with_legacy_root(
-                    Some("conformance-key".to_string()),
-                    Some("https://api.deepseek.com/v1".to_string()),
-                ),
-            )
-            .expect("deepseek client");
-            client.set_test_chat_transport_base_url(base.to_string());
-            client
+        },
+        // Keep DeepSeek's semantic endpoint for route shaping; redirect only
+        // its transport through the existing test seam below.
+        "deepseek" => Config {
+            provider: Some("deepseek".to_string()),
+            ..Config::default()
         }
-        "openai-codex" => CodewhaleClient::new(&Config {
+        .with_legacy_root(
+            Some("conformance-key".to_string()),
+            Some("https://api.deepseek.com/v1".to_string()),
+        ),
+        "openai-codex" => Config {
             provider: Some("openai-codex".to_string()),
             providers: Some(ProvidersConfig {
                 openai_codex: ProviderConfig {
@@ -239,10 +239,21 @@ fn client_for_route(route: &str, base: &str) -> CodewhaleClient {
                 ..ProvidersConfig::default()
             }),
             ..Config::default()
-        })
-        .expect("openai-codex client"),
+        },
         other => panic!("sse fixture names unknown route `{other}`"),
+    };
+    // The fixture model and the client must share the production resolver.
+    // Constructing from Config's default model can bind a different wire
+    // format and record an open_failure without exercising the recording.
+    let resolved =
+        crate::route_runtime::resolve_runtime_route(&config, config.api_provider(), Some(model))
+            .expect("resolve fixture route");
+    let mut client = CodewhaleClient::from_candidate(&resolved.config, &resolved.candidate)
+        .expect("fixture client");
+    if route == "deepseek" {
+        client.set_test_chat_transport_base_url(base.to_string());
     }
+    client
 }
 
 fn request_for_case(case: &Value) -> MessageRequest {
@@ -296,7 +307,11 @@ async fn replay_with_deadline(
         let _env = lock_test_env();
         let _codex = EnvVarGuard::set("OPENAI_CODEX_ACCESS_TOKEN", "conformance-token");
         let _legacy_codex = EnvVarGuard::remove("CODEX_ACCESS_TOKEN");
-        client_for_route(route, &server.base)
+        client_for_route(
+            route,
+            &server.base,
+            case["model"].as_str().expect("case.model"),
+        )
     };
 
     let mut lines = Vec::new();
@@ -327,6 +342,16 @@ async fn replay_with_deadline(
     }
 
     let requests = server.requests.lock().expect("request log").clone();
+    if requests.is_empty()
+        || !events
+            .iter()
+            .any(|event| stream_json::from_json(event).is_ok())
+    {
+        return Err(
+            "SSE recording was not exercised: no loopback request or normalized stream event"
+                .to_string(),
+        );
+    }
     lines.push(json!({
         "request": requests
             .iter()

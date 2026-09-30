@@ -11,7 +11,7 @@
 //! [`DISPATCHES`] is the seam for the TypeScript migration
 //! (TS-EXTENSION-HOST-DESIGN §5.2, §9.3): today it holds the Rust pool path
 //! production uses (`Engine::execute_mcp_tool_with_pool`); `HostMcpDispatch`
-//! joins it in phase 3 and must produce the *same* golden, because the
+//! joins it in Phase 2 and must produce the *same* golden, because the
 //! golden does not name the dispatch. Production MCP code is not touched.
 //!
 //! Normalization: the server URL/port is masked; results are
@@ -78,10 +78,12 @@ async fn harness_timeout_rejects_a_real_unanswered_mcp_call() {
     let _sandbox = Sandbox::new(&Value::Null);
     let outcome =
         run_transcript_with_deadline(&case, McpPoolDispatch::boxed, Duration::from_secs(1)).await;
-    assert!(
-        matches!(outcome, Err(error) if error.contains("harness timeout: MCP call")),
-        "an unanswered MCP call became recordable output"
-    );
+    let mut failures = Failures::default();
+    match outcome {
+        Err(error) => failures.push("unanswered_call", error),
+        Ok(_) => panic!("an unanswered MCP call became recordable output"),
+    }
+    assert!(failures.contains("harness timeout: MCP call"));
 }
 
 type DispatchFactory = fn(config: McpConfig) -> Box<dyn McpDispatchUnderTest>;
@@ -399,7 +401,7 @@ async fn run_transcript_with_deadline(
     let mut steps = Vec::new();
     let boot = match golden::complete_within("MCP boot", deadline, dispatch.boot()).await? {
         Ok(()) => json!("ok"),
-        Err(detail) => json!({ "err": { "detail": detail } }),
+        Err(detail) => return Err(format!("MCP transcript could not boot: {detail}")),
     };
     steps.push(json!({ "op": "boot", "outcome": boot }));
     for step in scripted_steps {

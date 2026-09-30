@@ -385,7 +385,7 @@ impl Failures {
         assert!(cases > 0, "conformance family `{family}` ran no cases");
         assert!(
             self.0.is_empty(),
-            "conformance family `{family}`: {} of {cases} case(s) failed\n\n{}",
+            "conformance family `{family}`: {} failure(s) across {cases} case(s)\n\n{}",
             self.0.len(),
             self.0.join("\n\n")
         );
@@ -417,4 +417,16 @@ fn golden_comparison_rejects_changed_bytes_and_missing_output() {
 #[should_panic(expected = "ran no cases")]
 fn empty_family_cannot_pass() {
     Failures::default().finish("empty_control", 0);
+}
+
+#[test]
+#[should_panic(expected = "is refused under CI")]
+fn update_mode_is_refused_under_ci_even_for_matching_bytes() {
+    let _lock = lock_test_env();
+    let _update = EnvVarGuard::set(UPDATE_ENV, "1");
+    let _ci = EnvVarGuard::set("CI", "1");
+    let dir = tempfile::tempdir().expect("temporary golden");
+    let path = dir.path().join("matching.golden.txt");
+    std::fs::write(&path, "matching\n").expect("write golden");
+    let _ = check_golden(&path, "matching\n");
 }

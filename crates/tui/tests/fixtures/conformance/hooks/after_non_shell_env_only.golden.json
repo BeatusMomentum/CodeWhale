@@ -20,8 +20,10 @@
     "observers": [
       {
         "background": false,
+        "error": null,
         "exit_code": 0,
         "name": "observer",
+        "stderr": "",
         "stdout": "",
         "success": true
       }
