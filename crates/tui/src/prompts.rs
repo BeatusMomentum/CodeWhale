@@ -189,11 +189,7 @@ fn translation_target_language_for_tag(locale_tag: &str) -> &'static str {
 /// churned the otherwise-static prefix on every release. The live workspace
 /// path is delivered per-turn via `<turn_meta>` (see `turn_metadata_block`).
 pub(crate) fn render_environment_block(_workspace: &Path, locale_tag: &str) -> String {
-    let platform = std::env::consts::OS;
-    let shell = crate::shell_dispatcher::global_dispatcher()
-        .kind()
-        .binary()
-        .to_string();
+    let (platform, shell) = environment_host_facts();
 
     format!(
         "## Environment\n\
@@ -202,6 +198,50 @@ pub(crate) fn render_environment_block(_workspace: &Path, locale_tag: &str) -> S
          - platform: {platform}\n\
          - shell: {shell}"
     )
+}
+
+/// The host facts the `## Environment` block names: this process's OS and
+/// the shell commands run under. Conformance goldens recorded on one host
+/// replay that host's facts on the recording thread
+/// ([`pin_recorded_environment`]); production always reports this host.
+fn environment_host_facts() -> (String, String) {
+    #[cfg(test)]
+    if let Some(recorded) = RECORDED_ENVIRONMENT.with(|cell| cell.borrow().clone()) {
+        return recorded;
+    }
+    (
+        std::env::consts::OS.to_string(),
+        crate::shell_dispatcher::global_dispatcher()
+            .kind()
+            .binary()
+            .to_string(),
+    )
+}
+
+#[cfg(test)]
+thread_local! {
+    static RECORDED_ENVIRONMENT: std::cell::RefCell<Option<(String, String)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Replay a recorded host's OS and shell in this thread's environment block
+/// until the guard drops. The only caller, the scripted conformance families,
+/// is Unix-only and runs its engine on this thread's runtime.
+#[cfg(all(test, unix))]
+pub(crate) fn pin_recorded_environment(os: &str, shell: &str) -> RecordedEnvironmentGuard {
+    RECORDED_ENVIRONMENT
+        .with(|cell| *cell.borrow_mut() = Some((os.to_string(), shell.to_string())));
+    RecordedEnvironmentGuard
+}
+
+#[cfg(all(test, unix))]
+pub(crate) struct RecordedEnvironmentGuard;
+
+#[cfg(all(test, unix))]
+impl Drop for RecordedEnvironmentGuard {
+    fn drop(&mut self) {
+        RECORDED_ENVIRONMENT.with(|cell| *cell.borrow_mut() = None);
+    }
 }
 
 /// Source for an `EngineConfig.instructions` entry. Either a disk file (loaded

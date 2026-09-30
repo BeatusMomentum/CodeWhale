@@ -38,7 +38,10 @@ flag does not exist, otherwise a bool). The Engine names this posture to the
 model in `<turn_meta>`, so the harness replays the recorded facts instead of
 probing the runner. Without that, a macOS-recorded golden fails on a Linux
 runner for a fact about the machine, not the Engine. A case that omits the
-field fails loud. Production always probes the host. The per-platform label
+field fails loud. The same record carries `os` and `shell` (`macos`, `zsh`),
+which the `## Environment` block renders into the frozen prompt prefix and so
+into `prefix_cache_change`'s prefix hash; the harness replays those too.
+Production always probes the host. The per-platform label
 text is owned and tested in `sandbox::policy`. All current cases were
 recorded on macOS. A Linux- or Windows-recorded golden is separate evidence.
 

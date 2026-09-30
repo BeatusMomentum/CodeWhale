@@ -284,6 +284,10 @@ fn run_scripted_turn_with_deadline(
         .enable_all()
         .build()
         .expect("runtime");
+    let (os, shell) = recorded_environment(case);
+    // Held across the whole turn: the engine builds and refreshes its system
+    // prompt on this thread's current-thread runtime.
+    let _environment = crate::prompts::pin_recorded_environment(&os, &shell);
     let record = runtime.block_on(async {
         let config = Config::default();
         let engine_config = EngineConfig {
@@ -331,6 +335,24 @@ fn recorded_platform(case: &Value) -> (crate::sandbox::policy::SandboxEnforcemen
         other => panic!("recorded_platform.no_new_privs_active must be null or a bool: {other:?}"),
     };
     (enforcement, no_new_privs_active)
+}
+
+/// The OS and shell the golden's `## Environment` block was recorded with.
+/// They enter the frozen prompt prefix, and so its hash in
+/// `prefix_cache_change`; a case without them fails loud.
+fn recorded_environment(case: &Value) -> (String, String) {
+    let platform = case
+        .get("recorded_platform")
+        .expect("scripted conformance case must declare `recorded_platform`");
+    let field = |name: &str| {
+        platform
+            .get(name)
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| panic!("recorded_platform.{name} must be a non-empty string"))
+            .to_string()
+    };
+    (field("os"), field("shell"))
 }
 
 /// Run one turn and return every engine event up to and including

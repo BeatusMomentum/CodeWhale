@@ -6,6 +6,8 @@
   "allow_shell": true,
   "recorded_platform": {
     "recorded_on": "macOS",
+    "os": "macos",
+    "shell": "zsh",
     "sandbox_enforcement": "local_os",
     "no_new_privs_active": null
   },
