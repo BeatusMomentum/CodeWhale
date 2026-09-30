@@ -660,7 +660,10 @@ impl App {
             plugin_registry.as_ref(),
         );
 
-        let input_history = crate::composer_history::load_history();
+        // The recall cap applies from the first keystroke, not only after the
+        // first submit: the persisted file keeps its own larger cap (U01-m2).
+        let mut input_history = crate::composer_history::load_history();
+        input_history.drain(..input_history.len().saturating_sub(max_input_history));
         let mention_cwd = std::env::current_dir().ok();
         let start_remote_control = matches!(initial_input, Some(InitialInput::RemoteControl));
         let (initial_input_text, initial_input_cursor, auto_submit_initial_input) =
@@ -1116,6 +1119,7 @@ impl App {
             cumulative_turn_duration: std::time::Duration::ZERO,
             session_metrics: crate::tui::session_metrics::SessionMetrics::default(),
             balance_cell: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            balance_route: None,
             draft_gen: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             fleet_draft_cell: std::sync::Arc::new(std::sync::Mutex::new(None)),
             constitution_draft_cell: std::sync::Arc::new(std::sync::Mutex::new(None)),

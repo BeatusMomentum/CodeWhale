@@ -307,17 +307,47 @@ pub(crate) fn should_fetch_provider_balance(app: &App) -> bool {
         && crate::config::provider_has_balance_api(app.api_provider)
 }
 
+/// The balance cell for this route. A reading belongs to the route that
+/// fetched it: when the provider, endpoint or key changes, a fresh cell
+/// replaces the old one, so a response still in flight for the previous route
+/// lands in a cell nothing reads (U03-08), and the new route is not held behind
+/// the previous route's fetch cooldown.
+pub(crate) fn balance_cell_for_route(
+    app: &mut App,
+    provider: ApiProvider,
+    api_key: &str,
+    base_url: &str,
+) -> std::sync::Arc<std::sync::Mutex<Option<crate::pricing::BalanceInfo>>> {
+    use std::hash::{Hash, Hasher};
+    let mut key_fingerprint = std::collections::hash_map::DefaultHasher::new();
+    api_key.hash(&mut key_fingerprint);
+    let route = format!(
+        "{}\u{1f}{base_url}\u{1f}{:016x}",
+        provider.as_str(),
+        key_fingerprint.finish()
+    );
+    if app.balance_route.as_deref() != Some(route.as_str()) {
+        app.balance_cell = std::sync::Arc::new(std::sync::Mutex::new(None));
+        app.balance_route = Some(route);
+        app.last_balance_fetch = None;
+    }
+    app.balance_cell.clone()
+}
+
 /// Kick a background remaining-credit fetch for the live route.
 ///
 /// `force` skips the status-item gate (used by `/balance`). Providers without
 /// a known endpoint clear the parked chip so a previous route cannot linger.
 pub(crate) fn schedule_balance_fetch(app: &mut App, api_key: &str, base_url: &str, force: bool) {
     if !crate::config::provider_has_balance_api(app.api_provider) {
-        if let Ok(mut guard) = app.balance_cell.lock() {
-            *guard = None;
-        }
+        // A fresh cell, not a cleared one: a fetch still in flight for the
+        // previous route holds the old cell and cannot repaint the chip.
+        app.balance_cell = std::sync::Arc::new(std::sync::Mutex::new(None));
+        app.balance_route = None;
         return;
     }
+    let provider = app.api_provider;
+    let cell = balance_cell_for_route(app, provider, api_key, base_url);
     if !force && !should_fetch_provider_balance(app) {
         return;
     }
@@ -332,8 +362,6 @@ pub(crate) fn schedule_balance_fetch(app: &mut App, api_key: &str, base_url: &st
         return;
     }
     app.last_balance_fetch = Some(Instant::now());
-    let cell = app.balance_cell.clone();
-    let provider = app.api_provider;
     let api_key = api_key.to_string();
     let base_url = base_url.to_string();
     tokio::spawn(async move {

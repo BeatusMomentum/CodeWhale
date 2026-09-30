@@ -2378,6 +2378,10 @@ pub struct App {
     /// DeepSeek account balance, refreshed once per turn completion.
     /// Shared cell updated by background fetch tasks; read lock in the UI thread.
     pub balance_cell: std::sync::Arc<std::sync::Mutex<Option<crate::pricing::BalanceInfo>>>,
+    /// The route `balance_cell` belongs to (provider, endpoint, key
+    /// fingerprint). A route change swaps in a fresh cell; see
+    /// `provider_routes::balance_cell_for_route`.
+    pub balance_route: Option<String>,
     /// Shared cell for async fleet-profile model-draft delivery. A background
     /// task fills it (model label + drafted profile or a failure reason) so
     /// the drafting network call never parks the event loop (#3757 review).
@@ -3872,7 +3876,13 @@ impl App {
     /// contaminate the replacement session after clear/load/new.
     #[must_use]
     pub fn session_transition_blocked(&self) -> bool {
+        // A dispatch still resolving its route, and a locally cancelled turn
+        // whose terminal event has not landed, both belong to this session:
+        // switching now would hand the next session a stale suppression that
+        // cancels its first turn, or a dispatch bound to the old one (U02-10).
         self.is_loading
+            || self.dispatch_in_flight
+            || self.suppress_stream_events_until_turn_complete
             || self.runtime_turn_status.as_deref() == Some("in_progress")
             || self.is_compacting
             || self.manual_compaction_queued

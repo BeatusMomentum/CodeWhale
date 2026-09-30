@@ -332,6 +332,18 @@ pub(crate) fn apply_message_submit_outcome(
     match outcome {
         crate::hooks::MessageSubmitOutcome::Unchanged { .. } => true,
         crate::hooks::MessageSubmitOutcome::Replaced { text, .. } => {
+            // A queued message was already echoed with its pre-hook text.
+            // Retarget that one cell so dispatch reuses it instead of adding a
+            // second User cell beside the stale echo (U02-03).
+            if message.history_echoed
+                && let Some(idx) =
+                    crate::tui::ui::dispatch::echoed_user_turn_cell(app, &message.display)
+            {
+                app.history[idx] = HistoryCell::User {
+                    content: text.clone(),
+                };
+                app.bump_history_cell(idx);
+            }
             message.display = text;
             true
         }
@@ -1963,7 +1975,10 @@ async fn apply_command_result_inner(
                         let base_url = config.active_route_base_url();
                         match fetch_provider_balance(provider, &api_key, &base_url).await {
                             Some(info) => {
-                                if let Ok(mut guard) = app.balance_cell.lock() {
+                                if let Ok(mut guard) =
+                                    balance_cell_for_route(app, provider, &api_key, &base_url)
+                                        .lock()
+                                {
                                     *guard = Some(info.clone());
                                 }
                                 app.last_balance_fetch = Some(Instant::now());

@@ -2275,6 +2275,12 @@ impl RemoteControlController {
         gate
     }
 
+    pub fn pending_approval_tool_id(&self, gate: &str) -> Option<String> {
+        self.pending_approvals
+            .get(gate)
+            .map(|approval| approval.tool_id.clone())
+    }
+
     pub fn take_pending_approval(&mut self, gate: &str) -> Option<String> {
         self.pending_approvals
             .remove(gate)

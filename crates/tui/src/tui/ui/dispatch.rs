@@ -89,22 +89,26 @@ pub(crate) fn paint_user_turn_cell(
     content: String,
 ) -> usize {
     if message.history_echoed
-        && let Some(idx) = app
-            .history
-            .iter()
-            .enumerate()
-            .rev()
-            .find_map(|(idx, cell)| match cell {
-                HistoryCell::User { content } if content == &message.display => Some(idx),
-                _ => None,
-            })
+        && let Some(idx) = echoed_user_turn_cell(app, &message.display)
     {
         app.history[idx] = HistoryCell::User { content };
-        app.needs_redraw = true;
+        app.bump_history_cell(idx);
         return idx;
     }
     app.add_message(HistoryCell::User { content });
     app.history.len().saturating_sub(1)
+}
+
+/// The newest transcript cell that queue-time echo painted for `display`.
+pub(crate) fn echoed_user_turn_cell(app: &App, display: &str) -> Option<usize> {
+    app.history
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(idx, cell)| match cell {
+            HistoryCell::User { content } if content == display => Some(idx),
+            _ => None,
+        })
 }
 
 pub(crate) fn enqueue_offline_message(app: &mut App, message: QueuedMessage) {

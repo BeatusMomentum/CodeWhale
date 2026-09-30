@@ -117,6 +117,14 @@ fn current_session_fleet_workers_status(
     .replace("{count}", &count.to_string())
 }
 
+/// A turn is unsettled until its authoritative terminal event lands. A local
+/// cancel clears `is_loading` at once, but the engine's `TurnComplete` is still
+/// owed: until it arrives the recovery checkpoint is the only complete record
+/// of that turn, so shutdown must not declare the session settled (U02-09).
+fn turn_unsettled_for_shutdown(app: &App) -> bool {
+    app.is_loading || app.dispatch_in_flight || app.suppress_stream_events_until_turn_complete
+}
+
 /// Host state can change without a model turn, including learning the Runtime
 /// binding of a resumed legacy session. Commit that state before clearing its
 /// recovery checkpoint; an unfinished turn keeps its checkpoint untouched.
@@ -124,7 +132,7 @@ pub(super) fn persist_settled_session_on_shutdown(
     app: &mut App,
     handle: &persistence_actor::PersistActorHandle,
 ) -> Result<bool, String> {
-    if app.is_loading || app.dispatch_in_flight || app.current_session_id.is_none() {
+    if turn_unsettled_for_shutdown(app) || app.current_session_id.is_none() {
         return Ok(false);
     }
     let manager = SessionManager::default_location().map_err(|error| error.to_string())?;
@@ -1260,7 +1268,7 @@ pub async fn run_tui(
         // A quit key can leave the frame before its usual queue comparison.
         // Capture the final edited draft before the shutdown durability barrier.
         persist_offline_queue_state(&app);
-        let turn_in_flight = app.is_loading || app.dispatch_in_flight;
+        let turn_in_flight = turn_unsettled_for_shutdown(&app);
         if turn_in_flight {
             tracing::info!(
                 target: "persistence",
@@ -2180,6 +2188,12 @@ pub(crate) async fn run_event_loop(
                         break;
                     }
                 };
+                // Count every received event before any filter can `continue`
+                // past it (U02-02). Filtered deltas, suppressed post-cancel
+                // events and stale requests used to skip the counter, so a
+                // producer flooding them never tripped the drain budget and
+                // the loop never returned to render or read the cancel key.
+                events_drained = events_drained.saturating_add(1);
                 // #3033: remember whether an EARLIER event in this drain batch
                 // already requested a redraw. The AgentProgress throttle below
                 // may opt the current event out of repainting, but it must not
@@ -2798,7 +2812,20 @@ pub(crate) async fn run_event_loop(
                         // (#6190).
                         crate::tui::ui::dispatch::settle_unaccepted_steers_at_turn_end(app);
                         let completed_turn = app.active_turn.take();
-                        app.unanswered_submission = None;
+                        // TurnComplete carries no turn id. After a local
+                        // cancel the UI is idle, so `is_loading` can only be
+                        // true again because a newer dispatch set it: this
+                        // terminal event belongs to the cancelled turn and
+                        // must not close the newer one's loading, dispatch,
+                        // status or unanswered-submission state, nor drain
+                        // the queue ahead of it (U02-07). The engine runs one
+                        // turn at a time, so the newer turn's own TurnStarted
+                        // and TurnComplete follow this event.
+                        let newer_dispatch_owns_turn_state =
+                            app.suppress_stream_events_until_turn_complete && app.is_loading;
+                        if !newer_dispatch_owns_turn_state {
+                            app.unanswered_submission = None;
+                        }
                         // The in-flight provisional estimate hands off to the
                         // authoritative cumulative price accrued below; the
                         // high-water mark keeps the displayed total monotonic
@@ -2842,8 +2869,10 @@ pub(crate) async fn run_event_loop(
                         } else {
                             app.flush_active_cell();
                         }
-                        app.is_loading = false;
-                        app.dispatch_started_at = None;
+                        if !newer_dispatch_owns_turn_state {
+                            app.is_loading = false;
+                            app.dispatch_started_at = None;
+                        }
                         app.pending_provider_switch = None;
                         app.offline_mode = false;
                         app.streaming_state.reset();
@@ -2872,7 +2901,7 @@ pub(crate) async fn run_event_loop(
                         // turn's chunks pull the view down again until the
                         // user opts out by scrolling up.
                         app.user_scrolled_during_stream = false;
-                        app.runtime_turn_status = Some(match status {
+                        let turn_status_label = match status {
                             crate::core::events::TurnOutcomeStatus::Completed => {
                                 app.ocean_completion_started_at = Some(Instant::now());
                                 app.ocean_receipt_settle_start =
@@ -2889,7 +2918,10 @@ pub(crate) async fn run_event_loop(
                                 app.ocean_receipt_settle_start = None;
                                 "failed".to_string()
                             }
-                        });
+                        };
+                        if !newer_dispatch_owns_turn_state {
+                            app.runtime_turn_status = Some(turn_status_label.clone());
+                        }
                         if matches!(
                             status,
                             crate::core::events::TurnOutcomeStatus::Interrupted
@@ -3305,8 +3337,7 @@ pub(crate) async fn run_event_loop(
                         // `turn.interrupted` for locally cancelled ones.
                         // No-op when the feature is disabled.
                         {
-                            let outbox_status =
-                                app.runtime_turn_status.as_deref().unwrap_or("unknown");
+                            let outbox_status = turn_status_label.as_str();
                             let kind = match outbox_status {
                                 "completed" => "turn.completed",
                                 "failed" => "turn.failed",
@@ -3333,7 +3364,7 @@ pub(crate) async fn run_event_loop(
                             });
                         }
 
-                        if queued_to_send.is_none() {
+                        if queued_to_send.is_none() && !newer_dispatch_owns_turn_state {
                             queued_to_send = app.pop_queued_message();
                         }
                     }
@@ -4265,7 +4296,6 @@ pub(crate) async fn run_event_loop(
                         }
                     }
                 }
-                events_drained = events_drained.saturating_add(1);
             }
         }
         if let Some(rollback) = fallback_after_engine_error {

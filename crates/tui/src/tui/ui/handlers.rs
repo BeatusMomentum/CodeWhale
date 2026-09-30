@@ -1664,16 +1664,17 @@ pub(crate) async fn handle_view_events(
                 apply_user_input_submission_result(app, &tool_id, result);
             }
             ViewEvent::UserInputCancelled { tool_id } => {
-                if engine_handle
-                    .cancel_user_input(tool_id.clone())
-                    .await
-                    .is_ok()
-                {
-                    settle_user_input_request(app, &tool_id);
+                // A cancel is an answer too: when it cannot reach the engine
+                // the question is still pending there, so reopen it the way a
+                // failed submit does instead of recording a cancel (U02-04).
+                let result = engine_handle.cancel_user_input(tool_id.clone()).await;
+                let delivered = result.is_ok();
+                apply_user_input_submission_result(app, &tool_id, result);
+                if delivered {
+                    app.add_message(HistoryCell::System {
+                        content: "User input cancelled".to_string(),
+                    });
                 }
-                app.add_message(HistoryCell::System {
-                    content: "User input cancelled".to_string(),
-                });
             }
             ViewEvent::SessionSelected { session_id } => {
                 let manager = match SessionManager::default_location() {
