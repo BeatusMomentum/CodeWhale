@@ -1408,6 +1408,58 @@ fn dirty_teardown_window_is_bounded_and_a_requested_restart_waits_for_idle() {
 }
 
 #[tokio::test]
+async fn a_call_past_its_method_deadline_is_cancelled_and_the_host_stays_usable() {
+    let Some(node) = node_for_tests("method deadline") else {
+        return;
+    };
+    let _policy = TestPolicyGuard::extension_host(true);
+    let fixture = FixturePlugins::new(&["slow-tool", "clash-script"]).await;
+    let manager = Arc::new(ExtensionHostManager::new(ExtensionHostOptions {
+        runtime: NODE,
+        node_override: Some(node),
+        bun_override: None,
+        root: Some(fixture.root.clone()),
+        supervision: super::SupervisionOptions {
+            tool_call_deadline: Duration::from_millis(300),
+            ..Default::default()
+        },
+    }));
+    let engine = manager.attach(fixture.registry());
+    engine.sync().await.unwrap();
+    let pid = manager.host_pid();
+    let context = ToolContext::new(fixture.workspace());
+    // `slow_wait` answers after 30 s unless it is cancelled.
+    let slow = host_tool(&engine, fixture.workspace(), "slow_wait");
+    let started = Instant::now();
+    let outcome = tokio::time::timeout(Duration::from_secs(5), slow.execute(json!({}), &context))
+        .await
+        .expect("the method deadline bounds the call");
+    let elapsed = started.elapsed();
+    assert!(
+        matches!(outcome, Err(ToolError::Timeout { .. })),
+        "{outcome:?}"
+    );
+    assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
+    // The same host takes the next call.
+    let quick = host_tool(&engine, fixture.workspace(), "fixture_script_tool");
+    let result = quick.execute(json!({}), &context).await.unwrap();
+    assert!(result.success, "{}", result.content);
+    assert_eq!(manager.host_pid(), pid);
+    assert_eq!(manager.spawn_attempts(), 1);
+    // `slow-tool`'s disposer awaits its in-flight call, so a clean teardown
+    // proves the host received `$/cancel` and aborted the timed-out call
+    // (uncancelled, it outlives the host's 2 s dispose deadline).
+    engine.set_plugins(fixture.disable("slow-tool"));
+    engine.sync().await.unwrap();
+    let diagnostics = manager.diagnostics();
+    assert!(
+        !diagnostics.iter().any(|line| line.contains("teardown")),
+        "{diagnostics:?}"
+    );
+    manager.shutdown().await;
+}
+
+#[tokio::test]
 async fn ordinary_exit_rejects_requests_from_a_drained_calls_waker() {
     use std::future::Future;
     use std::pin::Pin;
@@ -1474,9 +1526,7 @@ async fn ordinary_exit_rejects_requests_from_a_drained_calls_waker() {
         .unwrap();
     // A following response proves the writer flushed the slow call and is
     // waiting for another frame, so a closed outbound queue cannot mask the bug.
-    host.request_with_deadline(protocol::CoreRequest::Ping, None, Duration::from_secs(5))
-        .await
-        .unwrap();
+    host.call(protocol::CoreRequest::Ping, None).await.unwrap();
     let probe = Arc::new(AdmissionProbe {
         host: Arc::clone(&host),
         result: Mutex::new(None),

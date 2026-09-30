@@ -36,6 +36,11 @@
 //!   explicit plugin change/reload to retry. Two dirty teardowns within ten
 //!   minutes retire the process once non-heartbeat calls are idle, without
 //!   resetting or consuming the unexpected-crash budget.
+//! * Every awaited core→host request is bounded by its method's deadline
+//!   (`protocol::CoreRequest::deadline`) and then cancelled with `$/cancel`
+//!   (`supervisor::HostProcess::call`). Cancellation is a request: a plugin
+//!   that ignores its abort signal keeps running in the host until the host
+//!   is torn down, though the core has already failed the call.
 //! * One host per engine process and one trust tier. On macOS (Seatbelt) the
 //!   host has no direct network, and cannot read the Codewhale home (except
 //!   the bundle, its data dir and plugin code), the Codex and DSH credential
@@ -106,7 +111,7 @@ use self::protocol::{
     OwnerRef, RegisterResult,
 };
 use self::registry::{OwnerRegistry, OwnerState, ToolRegistration};
-use self::supervisor::{ACTIVATE_DEADLINE, DISPOSE_DEADLINE, HostEvents, HostProcess};
+use self::supervisor::{HostEvents, HostProcess};
 use crate::plugins::PluginRegistry;
 use crate::plugins::activation::{self, PluginActivationCapability};
 use crate::plugins::types::PluginAuthority;
@@ -223,6 +228,10 @@ pub struct SupervisionOptions {
     pub dirty_limit: usize,
     /// Host memory cap in bytes (`supervisor::HOST_MEMORY_CAP`).
     pub memory_cap: u64,
+    /// How long one extension tool call may take before the core cancels it
+    /// (`tool::TOOL_CALL_DEADLINE`); sent to the host as `deadline_ms`. The
+    /// other methods' deadlines are fixed (`CoreRequest::deadline`).
+    pub tool_call_deadline: Duration,
 }
 
 impl ExtensionHostOptions {
@@ -246,7 +255,7 @@ impl Default for SupervisionOptions {
         Self {
             heartbeat_interval: Duration::from_secs(3),
             ping_timeout: Duration::from_secs(3),
-            hang_timeout: Duration::from_secs(10),
+            hang_timeout: supervisor::PING_DEADLINE,
             restart_backoff: Duration::from_millis(250),
             crash_window: Duration::from_secs(5 * 60),
             crash_limit: 3,
@@ -254,6 +263,7 @@ impl Default for SupervisionOptions {
             dirty_window: Duration::from_secs(10 * 60),
             dirty_limit: 2,
             memory_cap: supervisor::HOST_MEMORY_CAP,
+            tool_call_deadline: tool::TOOL_CALL_DEADLINE,
         }
     }
 }
@@ -431,12 +441,11 @@ fn prepare_launch(
 impl ManagerShared {
     async fn deactivate_owner(&self, host: &Arc<HostProcess>, owner: &OwnerRef) {
         let diagnostic = match host
-            .request_with_deadline(
+            .call(
                 CoreRequest::Deactivate(DeactivateParams {
                     owner: owner.clone(),
                 }),
                 None,
-                DISPOSE_DEADLINE + Duration::from_millis(500),
             )
             .await
             .map(serde_json::from_value::<DeactivateResult>)
@@ -1292,13 +1301,7 @@ impl ExtensionHostManager {
                 },
                 config: json!({}),
             });
-            let outcome = host
-                .request_with_deadline(
-                    request,
-                    Some(plugin_id.to_string()),
-                    ACTIVATE_DEADLINE + std::time::Duration::from_secs(1),
-                )
-                .await;
+            let outcome = host.call(request, Some(plugin_id.to_string())).await;
             match outcome.map(serde_json::from_value::<ActivateResult>) {
                 Ok(Ok(ActivateResult::Ok { tools: mut names })) => tools.append(&mut names),
                 Ok(Ok(ActivateResult::Failed { diagnostic })) => {

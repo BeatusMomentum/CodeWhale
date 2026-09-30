@@ -84,6 +84,9 @@ use super::protocol::{
 pub const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(30);
 pub const ACTIVATE_DEADLINE: Duration = Duration::from_secs(5);
 pub const DISPOSE_DEADLINE: Duration = Duration::from_secs(2);
+/// A `host/ping` answer later than this means a hung host: the heartbeat's
+/// default `hang_timeout`, and the bound for any other ping.
+pub const PING_DEADLINE: Duration = Duration::from_secs(10);
 /// Grace between `$/cancel` and resolving a call as cancelled on this side.
 pub const CANCEL_GRACE: Duration = Duration::from_millis(500);
 const STDERR_TAIL_BYTES: usize = 8 * 1024;
@@ -97,8 +100,11 @@ pub enum HostCallError {
     Exited(String),
     #[error("cancelled: {0}")]
     Cancelled(String),
-    #[error("timed out after {0:?}")]
-    Timeout(Duration),
+    #[error("`{method}` timed out after {after:?}; the host was told to cancel it")]
+    Timeout {
+        method: &'static str,
+        after: Duration,
+    },
     #[error("extension host channel is full")]
     Busy,
 }
@@ -858,7 +864,7 @@ impl HostProcess {
                     activate_deadline_ms: ACTIVATE_DEADLINE.as_millis() as u64,
                 },
             });
-            host.request(initialize, None)
+            host.call(initialize, None)
                 .await
                 .map_err(|error| format!("host/initialize failed: {error}"))?;
             ready_rx
@@ -996,34 +1002,37 @@ impl HostProcess {
         Ok((id, rx))
     }
 
-    pub(crate) async fn request(
+    /// Send `request` and wait at most its method's deadline
+    /// ([`CoreRequest::deadline`]) for the answer. On expiry the host is sent
+    /// `$/cancel`, the call is forgotten (a late answer is dropped) and the
+    /// caller gets [`HostCallError::Timeout`]. Dropping the returned future
+    /// (a turn interrupt) cancels the same way. Every awaited core→host
+    /// request goes through here; only the heartbeat drives
+    /// [`Self::start_request`] itself, under its own timeouts.
+    pub(crate) async fn call(
         &self,
         request: CoreRequest,
         owner: Option<String>,
     ) -> Result<Value, HostCallError> {
-        let (_, rx) = self.start_request(request, owner)?;
-        rx.await
-            .unwrap_or_else(|_| Err(HostCallError::Exited("channel closed".to_string())))
-    }
-
-    /// Request with a deadline; on expiry the call is cancelled host-side.
-    pub(crate) async fn request_with_deadline(
-        &self,
-        request: CoreRequest,
-        owner: Option<String>,
-        deadline: Duration,
-    ) -> Result<Value, HostCallError> {
+        let method = request.method();
+        let deadline = request.deadline();
         let (id, rx) = self.start_request(request, owner)?;
-        match tokio::time::timeout(deadline, rx).await {
-            Ok(result) => {
-                result.unwrap_or_else(|_| Err(HostCallError::Exited("channel closed".to_string())))
-            }
-            Err(_) => {
-                self.cancel(id);
-                self.pending.lock().expect("pending lock").remove(&id);
-                Err(HostCallError::Timeout(deadline))
-            }
-        }
+        let mut guard = CancelOnDrop {
+            host: self,
+            id,
+            armed: true,
+        };
+        let Ok(answer) = tokio::time::timeout(deadline, rx).await else {
+            // `guard` is still armed: dropping it sends `$/cancel`.
+            return Err(HostCallError::Timeout {
+                method,
+                after: deadline,
+            });
+        };
+        // Answered, drained at exit, or resolved by revocation: nothing left
+        // to cancel.
+        guard.armed = false;
+        answer.unwrap_or_else(|_| Err(HostCallError::Exited("channel closed".to_string())))
     }
 
     /// Fire `$/cancel`. Best effort: a full or closed channel is fine, the
@@ -1070,11 +1079,7 @@ impl HostProcess {
     /// process group at 3 s total.
     #[cfg(test)]
     pub(crate) async fn shutdown(&self) {
-        let _ = tokio::time::timeout(
-            Duration::from_secs(2),
-            self.request(CoreRequest::Shutdown, None),
-        )
-        .await;
+        let _ = self.call(CoreRequest::Shutdown, None).await;
         let mut exited = self.exited.clone();
         let waited = tokio::time::timeout(Duration::from_secs(1), async {
             while !*exited.borrow() {
@@ -1086,6 +1091,23 @@ impl HostProcess {
         .await;
         if waited.is_err() {
             let _ = self.tree.kill();
+        }
+    }
+}
+
+/// Cancels a [`HostProcess::call`] that stops waiting before its answer:
+/// deadline expiry, or the caller's future being dropped.
+struct CancelOnDrop<'a> {
+    host: &'a HostProcess,
+    id: u64,
+    armed: bool,
+}
+
+impl Drop for CancelOnDrop<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.host.cancel(self.id);
+            self.host.forget(self.id);
         }
     }
 }

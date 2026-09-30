@@ -25,6 +25,8 @@
 //! admitted or refused, and tool calls only flow core→host after the gate.
 //! The authority lint in `protocol/tests.rs` keeps [`METHODS`] that way.
 
+use std::time::Duration;
+
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value, json};
@@ -605,6 +607,35 @@ impl CoreRequest {
             Self::Activate(p) => to_value(p),
             Self::Deactivate(p) => to_value(p),
             Self::ToolCall(p) => to_value(p),
+        }
+    }
+
+    /// How long the core waits for this request's answer before it sends
+    /// `$/cancel`, forgets the call and fails it with
+    /// `HostCallError::Timeout` (`HostProcess::call`). The match is
+    /// exhaustive, so no request can be added without a deadline.
+    ///
+    /// | method | deadline | why |
+    /// |---|---|---|
+    /// | `host/initialize` | `HANDSHAKE_DEADLINE` (30 s) | the whole handshake has the same budget |
+    /// | `host/ping` | `PING_DEADLINE` (10 s) | the heartbeat supervises pings with its own `ping_timeout`/`hang_timeout` and kills a silent host; this bounds any other caller |
+    /// | `host/shutdown` | 2 s | tests only |
+    /// | `ext/activate` | `ACTIVATE_DEADLINE` + 1 s | the host enforces activation's own deadline; 1 s for its answer to arrive |
+    /// | `ext/deactivate` | `DISPOSE_DEADLINE` + 500 ms | the same, for disposal |
+    /// | `tool/call` | its `deadline_ms` | the host is told the bound the core enforces (`SupervisionOptions::tool_call_deadline`, 120 s) |
+    #[must_use]
+    pub fn deadline(&self) -> Duration {
+        use super::supervisor::{
+            ACTIVATE_DEADLINE, DISPOSE_DEADLINE, HANDSHAKE_DEADLINE, PING_DEADLINE,
+        };
+        match self {
+            Self::Ping => PING_DEADLINE,
+            Self::Initialize(_) => HANDSHAKE_DEADLINE,
+            #[cfg(test)]
+            Self::Shutdown => Duration::from_secs(2),
+            Self::Activate(_) => ACTIVATE_DEADLINE + Duration::from_secs(1),
+            Self::Deactivate(_) => DISPOSE_DEADLINE + Duration::from_millis(500),
+            Self::ToolCall(params) => Duration::from_millis(params.deadline_ms),
         }
     }
 
