@@ -251,6 +251,56 @@ async fn tool_argument_bytes_count_toward_the_stream_content_cap() {
 }
 
 #[tokio::test]
+async fn text_fallback_tool_calls_share_the_response_tool_limit() {
+    // C02-14: calls parsed from text markers obey the same per-response
+    // ceiling as native tool starts. An over-limit batch fails the turn
+    // before any call is announced, planned or run.
+    let workspace = tempdir().unwrap();
+    let over_limit = super::super::streaming::MAX_TOOL_CALLS_PER_RESPONSE + 1;
+    let text: String = (0..over_limit)
+        .map(|_| format!(r#"[TOOL_CALL]{{"tool": "{WRITE_TOOL}", "args": {{}}}}[/TOOL_CALL]"#))
+        .collect();
+    let mock = Arc::new(MockLlmClient::new(vec![
+        canned::simple_text_turn(&text),
+        canned::simple_text_turn("this second request must never be issued"),
+    ]));
+    let (mut engine, handle) = Engine::new_with_model_client(
+        deterministic_engine_config(workspace.path()),
+        &Config::default(),
+        mock.clone(),
+    );
+    engine.session.auto_approve = true;
+    let executions = Arc::new(AtomicUsize::new(0));
+    let surface = write_surface(&engine, workspace.path(), executions.clone());
+    let mut turn = crate::core::turn::TurnContext::new(4);
+
+    // Undrained, an admitted over-limit batch cannot even be announced: its
+    // 257 starts overflow the event queue. Bound the wait so that is a
+    // failure, not a hang.
+    let (status, _error) = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        engine.run_turn(&mut turn, surface, None, None),
+    )
+    .await
+    .expect("an over-limit text batch must be refused, not admitted");
+
+    assert_eq!(executions.load(Ordering::SeqCst), 0, "no parsed call runs");
+    assert_eq!(status, TurnOutcomeStatus::Failed);
+    assert_eq!(mock.call_count(), 1);
+    assert_eq!(
+        turn.stop_diagnostics.last_response_tool_calls_suppressed,
+        Some(over_limit)
+    );
+    assert!(
+        !drain_events(&handle)
+            .await
+            .iter()
+            .any(|event| matches!(event, Event::ToolCallStarted { .. })),
+        "no over-limit call is announced"
+    );
+}
+
+#[tokio::test]
 async fn step_budget_final_report_is_report_only() {
     // C02-10: the one response granted after the step budget is spent asks
     // for no tools, and a call it returns anyway is refused, not executed.
