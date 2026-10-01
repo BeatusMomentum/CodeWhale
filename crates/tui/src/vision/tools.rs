@@ -349,6 +349,10 @@ mod tests {
         }
     }
 
+    /// The cap reads the `*_MAX_OUTPUT_TOKENS` override from the process
+    /// environment, as the payload does. Tests that compare the two hold the
+    /// test env lock, so an engine test setting the override cannot land
+    /// between the two reads in a shared process.
     fn standalone_vision_cap(model: &str) -> u64 {
         u64::from(
             crate::route_budget::effective_max_output_tokens_for_route(
@@ -395,6 +399,7 @@ mod tests {
 
     #[test]
     fn generic_vision_payload_uses_max_tokens() {
+        let _env = crate::test_support::lock_test_env();
         let tool = ImageAnalyzeTool::new(fake_config());
 
         let payload = tool.request_payload("describe", "abc123", "image/png");
@@ -409,6 +414,7 @@ mod tests {
 
     #[test]
     fn xiaomi_mimo_vision_payload_uses_max_completion_tokens() {
+        let _env = crate::test_support::lock_test_env();
         let mut config = fake_config();
         config.model = "mimo-v2.5".to_string();
         config.base_url = Some("https://api.xiaomimimo.com/v1".to_string());
@@ -426,6 +432,7 @@ mod tests {
 
     #[test]
     fn xiaomi_mimo_vision_payload_uses_max_completion_tokens_with_custom_proxy() {
+        let _env = crate::test_support::lock_test_env();
         let mut config = fake_config();
         config.model = "mimo-v2.5".to_string();
         config.base_url = Some("https://vision-proxy.example.invalid/v1".to_string());
