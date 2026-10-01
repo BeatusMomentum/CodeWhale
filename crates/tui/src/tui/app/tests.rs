@@ -7931,3 +7931,22 @@ fn skills_cache_hides_model_only_and_preserves_argument_hint() {
             .any(|(name, description)| name == "user" && description.contains("[path]"))
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn oversized_paste_is_not_written_through_a_linked_pastes_directory() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let outside = tempfile::TempDir::new().expect("outside");
+    std::os::unix::fs::symlink(outside.path(), tmp.path().join(".codewhale")).expect("link");
+    let mut opts = test_options(false);
+    opts.workspace = tmp.path().to_path_buf();
+    let mut app = App::new(opts, &Config::default());
+    app.insert_paste_text(&"y".repeat(MAX_SUBMITTED_INPUT_CHARS + 256));
+
+    let _ = app.submit_input();
+
+    assert!(
+        std::fs::read_dir(outside.path()).unwrap().next().is_none(),
+        "the pasted text must not land outside the workspace"
+    );
+}

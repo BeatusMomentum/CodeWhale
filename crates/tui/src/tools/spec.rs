@@ -1092,8 +1092,16 @@ impl ToolContext {
         trust_mode: Option<bool>,
         auto_approve: Option<bool>,
     ) -> (Option<bool>, Option<bool>, Option<bool>) {
+        let holds_shell = self.shell_policy == ShellPolicy::Full;
         (
-            allow_shell.map(|requested| requested && self.shell_policy == ShellPolicy::Full),
+            // An omitted flag falls back to the host's configured default, so
+            // a session without full shell must say "no" for it rather than
+            // leave it unset.
+            match allow_shell {
+                Some(requested) => Some(requested && holds_shell),
+                None if holds_shell => None,
+                None => Some(false),
+            },
             trust_mode.map(|requested| requested && self.trust_mode),
             auto_approve.map(|requested| requested && self.approval_mode == ApprovalMode::Bypass),
         )

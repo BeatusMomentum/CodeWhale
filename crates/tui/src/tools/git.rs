@@ -719,13 +719,20 @@ fn parse_diff(diff_output: &str) -> Vec<ChangedFile> {
 
 /// Synthesize an all-additions hunk for an untracked text file so its
 /// symbols take part in grouping. Binary, oversized, or unreadable files
-/// yield `None` and are listed by path only.
+/// yield `None` and are listed by path only. So does a path that is a link
+/// or sits under one: an untracked link must not make this read-only tool
+/// return text from outside the repository.
 fn untracked_hunk(repo_root: &Path, path: &str) -> Option<Hunk> {
+    use std::io::Read as _;
     let full = repo_root.join(path);
-    if fs::metadata(&full).ok()?.len() > MAX_UNTRACKED_BYTES {
+    let file = crate::fs_confined::open_read(repo_root, &full).ok()?;
+    if file.metadata().ok()?.len() > MAX_UNTRACKED_BYTES {
         return None;
     }
-    let bytes = fs::read(&full).ok()?;
+    let mut bytes = Vec::new();
+    file.take(MAX_UNTRACKED_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
     if bytes.iter().take(8000).any(|byte| *byte == 0) {
         return None;
     }
@@ -1950,5 +1957,21 @@ Binary files a/image.png and b/image.png differ
             .expect("git_blame");
         no_marker("git_blame");
         assert!(blame.success, "{}", blame.content);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn untracked_links_are_listed_by_path_and_never_read() {
+        let outside = tempdir().expect("outside");
+        let secret = outside.path().join("secret.txt");
+        fs::write(&secret, "fn outside_marker() {}\n").expect("write");
+        let repo = tempdir().expect("repo");
+        fs::write(repo.path().join("plain.rs"), "fn inside() {}\n").expect("write");
+        std::os::unix::fs::symlink(&secret, repo.path().join("link.rs")).expect("link");
+        std::os::unix::fs::symlink(outside.path(), repo.path().join("dir")).expect("link");
+
+        assert!(untracked_hunk(repo.path(), "plain.rs").is_some());
+        assert!(untracked_hunk(repo.path(), "link.rs").is_none());
+        assert!(untracked_hunk(repo.path(), "dir/secret.txt").is_none());
     }
 }

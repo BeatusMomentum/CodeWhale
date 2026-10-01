@@ -215,7 +215,12 @@ fn write_temp_ps1(shell_command: &str) -> std::io::Result<String> {
             .unwrap_or(0)
     );
     let path = dir.join(name);
-    let mut file = std::fs::File::create(&path)?;
+    // Create-new: never write the script through a file or link that someone
+    // else placed at this name in the shared temporary directory.
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)?;
     // UTF-8 with BOM helps Windows PowerShell 5.1 decode non-ASCII scripts.
     file.write_all(&[0xEF, 0xBB, 0xBF])?;
     file.write_all(shell_command.as_bytes())?;

@@ -1951,10 +1951,10 @@ impl App {
         let filename = format!("paste-{}-{}.md", now.format("%Y-%m-%d-%H%M%S"), suffix);
         let rel_path = format!(".codewhale/pastes/{filename}");
 
-        let pastes_dir = self.workspace.join(".codewhale/pastes");
+        // Confined to the workspace: a linked `.codewhale` or `pastes`
+        // directory must not send the pasted text somewhere else.
         let file_path = self.workspace.join(&rel_path);
-        let written = std::fs::create_dir_all(&pastes_dir)
-            .and_then(|()| std::fs::write(&file_path, &self.input));
+        let written = crate::fs_confined::write(&self.workspace, &file_path, self.input.as_bytes());
         if let Err(error) = written {
             let reason = self
                 .tr(MessageId::ComposerOversizedSubmitHeld)

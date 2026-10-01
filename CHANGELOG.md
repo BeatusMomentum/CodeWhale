@@ -85,6 +85,14 @@ quieter, and Fleet runs can be checked before they spend anything.
   pending approval. After upgrading, approvals for turns that were already
   running are decided from the TUI, and WeCom `/allow` no longer takes
   `remember`.
+- More file and network paths are confined. A task or automation created by a
+  session without full shell access no longer inherits the host's shell
+  default. The commit planner and oversized-paste backup do not read or write
+  through links that leave the workspace. Audit and approval logs are created
+  owner-only and are not opened through a link. Lane ids must be plain names.
+  A session file is refused when it records a different session id than its
+  name. The updater does not follow a redirect from HTTPS to plain HTTP and
+  stops reading a response larger than 512 MB.
 
 ### Fixed
 

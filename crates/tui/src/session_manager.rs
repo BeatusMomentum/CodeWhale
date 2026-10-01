@@ -2839,6 +2839,19 @@ impl SessionManager {
             ));
         }
 
+        // The file name is the identity callers asked for. A document that
+        // names another session would attach that session's receipts, lease
+        // and later saves to the wrong record.
+        if session.metadata.id != id.trim() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "Session file {} records a different session id",
+                    path.display()
+                ),
+            ));
+        }
+
         session.system_prompt = strip_legacy_truncation_note(session.system_prompt);
         session.ensure_journal();
         self.hydrate_approval_receipts(&mut session)?;
@@ -7431,6 +7444,23 @@ mod tests {
 
         assert!(!path.exists());
         assert!(unrelated.exists(), "a file behind the link is untouched");
+    }
+
+    #[test]
+    fn a_session_file_naming_another_session_is_refused() {
+        let tmp = tempdir().expect("tempdir");
+        let manager = SessionManager::new(tmp.path().join("sessions")).expect("new");
+        let session = create_saved_session(&[], "test-model", tmp.path(), 0, None);
+        manager.save_session(&session).expect("save");
+        let id = session.metadata.id.clone();
+        let source = manager.validated_session_path(&id).expect("path");
+        std::fs::copy(&source, source.with_file_name("impostor.json")).expect("copy");
+
+        assert_eq!(manager.load_session(&id).expect("own id").metadata.id, id);
+        let err = manager
+            .load_session("impostor")
+            .expect_err("mismatched id must fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 
     #[test]

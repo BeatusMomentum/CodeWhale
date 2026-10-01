@@ -1300,8 +1300,36 @@ fn update_http_client_with_timeout(
     builder
         .user_agent(UPDATE_USER_AGENT)
         .timeout(timeout)
+        .redirect(update_redirect_policy())
         .build()
         .context("failed to build update HTTP client")
+}
+
+fn redirect_leaves_https(previous: &[reqwest::Url], next: &reqwest::Url) -> bool {
+    next.scheme() != "https" && previous.iter().any(|url| url.scheme() == "https")
+}
+
+/// Most redirects an update request follows.
+const UPDATE_MAX_REDIRECTS: usize = 10;
+
+/// Largest update response held in memory. Release archives are tens of
+/// megabytes; a server that keeps sending is cut off instead of exhausting
+/// memory before the checksum is ever compared.
+const UPDATE_MAX_RESPONSE_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Follow redirects, but never from HTTPS down to plain HTTP: a request that
+/// started encrypted must not finish over a channel anyone on the path can
+/// rewrite.
+fn update_redirect_policy() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        if attempt.previous().len() > UPDATE_MAX_REDIRECTS {
+            return attempt.error("too many redirects");
+        }
+        if redirect_leaves_https(attempt.previous(), attempt.url()) {
+            return attempt.error("update redirect left HTTPS");
+        }
+        attempt.follow()
+    })
 }
 
 /// Fetch the latest release metadata from GitHub.
@@ -1601,11 +1629,17 @@ fn download_url_once(
         .send()
         .with_context(|| format!("failed to download {url}"))?;
     let status = response.status();
-    let bytes = response
-        .bytes()
-        .with_context(|| format!("failed to read response body from {url}"))?;
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(
+        &mut std::io::Read::take(response, UPDATE_MAX_RESPONSE_BYTES + 1),
+        &mut bytes,
+    )
+    .with_context(|| format!("failed to read response body from {url}"))?;
+    if bytes.len() as u64 > UPDATE_MAX_RESPONSE_BYTES {
+        bail!("response from {url} exceeds the {UPDATE_MAX_RESPONSE_BYTES}-byte update limit");
+    }
 
-    Ok((status, bytes.to_vec()))
+    Ok((status, bytes))
 }
 
 /// Compute the SHA256 hex digest of data.
@@ -4257,5 +4291,22 @@ E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855  *codewhale-win
             "got {request:?}"
         );
         handle.join().expect("test server thread");
+    }
+
+    #[test]
+    fn update_redirects_never_leave_https() {
+        let url = |s: &str| reqwest::Url::parse(s).expect("url");
+        let https = [url("https://github.com/a")];
+        assert!(redirect_leaves_https(&https, &url("http://example.test/a")));
+        assert!(!redirect_leaves_https(
+            &https,
+            &url("https://example.test/a")
+        ));
+        // A plain-HTTP mirror the operator configured may redirect as before.
+        let http = [url("http://127.0.0.1:9/a")];
+        assert!(!redirect_leaves_https(&http, &url("http://127.0.0.1:9/b")));
+        // Once any hop was HTTPS, a later plain hop is refused.
+        let mixed = [url("http://mirror.test/a"), url("https://cdn.test/a")];
+        assert!(redirect_leaves_https(&mixed, &url("http://mirror.test/b")));
     }
 }
