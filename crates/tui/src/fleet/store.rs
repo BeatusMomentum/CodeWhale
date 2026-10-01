@@ -43,6 +43,7 @@ const MAX_MEMBER_ID_CHARS: usize = 64;
 const MAX_MEMBER_ROLE_CHARS: usize = 80;
 const MAX_ROUTE_FIELD_CHARS: usize = 256;
 const MAX_MEMBER_INSTRUCTIONS_CHARS: usize = 32 * 1024;
+const MAX_FLEET_DESCRIPTION_CHARS: usize = 32 * 1024;
 
 /// A value that reaches selectors, receipts, and terminal rendering: printable
 /// and bounded. `multiline` admits newlines and tabs (instruction overlays)
@@ -316,7 +317,35 @@ impl FleetFile {
                 "fleet name must not be empty".to_string(),
             ));
         }
-        validate_text("fleet name", name, MAX_FLEET_NAME_CHARS, false)?;
+        // The stored name, not its trimmed view: a control character before
+        // or after the name reaches selectors and terminal rendering too.
+        validate_text("fleet name", &self.name, MAX_FLEET_NAME_CHARS, false)?;
+        if let Some(description) = self.description.as_deref() {
+            validate_text(
+                "fleet description",
+                description,
+                MAX_FLEET_DESCRIPTION_CHARS,
+                true,
+            )?;
+        }
+        // The operator route flows into every inheriting member's route, so
+        // it is bounded exactly like a member's pin.
+        if let Some(operator) = &self.operator {
+            for (field, value) in [
+                ("provider", Some(operator.provider.as_str())),
+                ("model", Some(operator.model.as_str())),
+                ("reasoning", operator.reasoning.as_deref()),
+            ] {
+                if let Some(value) = value {
+                    validate_text(
+                        &format!("operator {field}"),
+                        value,
+                        MAX_ROUTE_FIELD_CHARS,
+                        false,
+                    )?;
+                }
+            }
+        }
         let mut seen: BTreeMap<String, String> = BTreeMap::new();
         for member in &self.members {
             let member_id = member.id.trim();
@@ -1351,6 +1380,28 @@ mod tests {
         let mut fleet = sample_fleet();
         fleet.name = "Team\u{7}".to_string();
         assert!(fleet.validate().is_err());
+        // F01-04: the rest of the document's free text is bounded too.
+        let mut fleet = sample_fleet();
+        fleet.name = "Team\n".to_string();
+        assert!(
+            fleet.validate().is_err(),
+            "a trailing control is still a control"
+        );
+        let mut fleet = sample_fleet();
+        fleet.description = Some("about\u{7}".to_string());
+        assert!(fleet.validate().is_err());
+        fleet.description = Some("line one\nline two".to_string());
+        fleet.validate().expect("a description may span lines");
+        fleet.description = Some("x".repeat(MAX_FLEET_DESCRIPTION_CHARS + 1));
+        assert!(fleet.validate().is_err());
+        let mut fleet = sample_fleet();
+        fleet.operator = Some(FleetOperator {
+            provider: "deepseek".to_string(),
+            model: "deepseek-v4\u{1b}[2J".to_string(),
+            reasoning: None,
+        });
+        let err = fleet.validate().unwrap_err();
+        assert!(err.to_string().contains("operator model"), "{err}");
         let mut fleet = sample_fleet();
         fleet.members[0].instructions = Some("line one\nline two\ttabbed".to_string());
         fleet.validate().expect("instructions may span lines");
