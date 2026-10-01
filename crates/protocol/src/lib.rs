@@ -898,3 +898,6 @@ pub enum EventFrame {
         message: String,
     },
 }
+
+pub mod request;
+pub mod role;

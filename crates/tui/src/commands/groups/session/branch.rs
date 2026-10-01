@@ -76,7 +76,7 @@ pub(in crate::commands) fn branch_portable(
                 "Branched to entry {entry_id} (leaf now {}); journal entries {} (history preserved, leaf moved only)",
                 outcome.leaf_display, outcome.journal_entries_before
             ),
-            super::sync_session_action(outcome.sync),
+            codewhale_command_contract::outcome::SessionAction::SyncSession(outcome.sync),
         ),
         Err(error) => CommandResult::error(error),
     }

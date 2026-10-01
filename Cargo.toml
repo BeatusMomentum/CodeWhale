@@ -21,6 +21,7 @@ members = [
     "crates/release",
     "crates/runtime",
     "crates/secrets",
+    "crates/sanitize",
     "crates/state",
     "crates/telemetry",
     "crates/tools",
@@ -28,6 +29,7 @@ members = [
     "crates/workflow",
     "crates/workflow-js",
     "tests/portable-debug-diagnostics",
+    "tests/portable-session",
 ]
 default-members = ["crates/cli"]
 resolver = "2"

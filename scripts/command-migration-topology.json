@@ -280,7 +280,6 @@
   },
   "frontier": [
     "config",
-    "core",
-    "session"
+    "core"
   ]
 }

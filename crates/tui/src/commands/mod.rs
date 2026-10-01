@@ -35,6 +35,10 @@ mod session_acceptance;
 mod session_control_regression_tests;
 #[cfg(test)]
 mod session_export_regression_tests;
+#[cfg(test)]
+mod session_structcopy_host_tests;
+#[cfg(test)]
+mod session_structcopy_regression_tests;
 // FEAT-025 Phase 5: public command-surface parity lives at the `commands` root
 // for the same extraction reason as the host regressions above.
 #[cfg(test)]
@@ -79,6 +83,7 @@ mod debug_change_host_tests;
 mod debug_group;
 #[cfg(test)]
 mod debug_mutation_host_tests;
+mod session_group;
 
 use crate::tui::app::{App, AppAction};
 use codewhale_config::AppMode;
@@ -2087,6 +2092,8 @@ mod tests {
             "title",
             // FEAT-025 session export slice.
             "export",
+            // FEAT-026 completes the session structural-copy slice.
+            "structcopy",
             // FEAT-029 complete debug group, including receipts and mutation.
             "tokens",
             "cost",
@@ -2806,17 +2813,17 @@ mod tests {
                 "/{name} must be pure (no host context bundle)"
             );
         }
-        // Out-of-scope session command remains legacy for FEAT-026.
+        // FEAT-026 completes the final session command adoption.
         assert!(
-            !registry().has_contextual_handler("structcopy"),
-            "/structcopy must stay on the legacy dispatch until its owning FEAT"
+            registry().has_contextual_handler("structcopy"),
+            "/structcopy must use the shared command boundary"
         );
     }
 
     // ---------------------------------------------------------------------
     // FEAT-024: session control entries register through the portable bridge
     // (D3/D6) — five declare SESSION_CONTROL only; `/remote-env` declares
-    // control plus presentation; export/structcopy remain legacy.
+    // control plus presentation; export/structcopy have independent authority.
     // ---------------------------------------------------------------------
 
     #[test]
@@ -2855,10 +2862,10 @@ mod tests {
             CommandCapabilities::SESSION_CONTROL.union(CommandCapabilities::PRESENTATION),
             "/remote-env declares control plus presentation only"
         );
-        // FEAT-026 leaf remains legacy until its owning FEAT.
+        // FEAT-026 also registers structcopy through its own narrow boundary.
         assert!(
-            !registry().has_contextual_handler("structcopy"),
-            "/structcopy must stay on the legacy dispatch"
+            registry().has_contextual_handler("structcopy"),
+            "/structcopy must use the shared command boundary"
         );
     }
 
@@ -3033,9 +3040,8 @@ mod tests {
             "only /export and /share may declare SESSION_EXPORT"
         );
 
-        // The legacy function registration was removed for export only: the
-        // contextual entry has no direct host fallback, while `/structcopy`
-        // keeps its concrete-App `FunctionCommand` until FEAT-026.
+        // Export has no direct host fallback. Structcopy also uses the
+        // contract route after FEAT-026, with its own independent authority.
         let mut app = create_test_app();
         let legacy = registry()
             .get("export")
@@ -3047,8 +3053,8 @@ mod tests {
             "/export must not keep a legacy function registration"
         );
         assert!(
-            !registry().has_contextual_handler("structcopy"),
-            "/structcopy must stay on the legacy dispatch until FEAT-026"
+            registry().has_contextual_handler("structcopy"),
+            "/structcopy must use the shared command boundary"
         );
     }
 

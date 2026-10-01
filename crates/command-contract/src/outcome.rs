@@ -69,3 +69,26 @@ pub enum DebugAction {
 }
 
 pub type DebugCommandResult = CommandResult<DebugAction>;
+
+/// Structural copy cannot request a host action.
+pub type StructcopyCommandResult = CommandResult<std::convert::Infallible>;
+
+/// Complete session-group vocabulary. Hosts execute these requests after dispatch.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SessionAction {
+    CompactContext { focus: Option<String> },
+    PurgeContext,
+    LoadSession(std::path::PathBuf),
+    SyncSession(SessionSyncPayload),
+    SendMessage(String),
+    RemoteControl(SessionRemoteControlAction),
+    OpenExternalUrl { url: String, label: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionRemoteControlAction {
+    Start,
+    Stop,
+}
+
+pub type SessionCommandResult = CommandResult<SessionAction>;
