@@ -2158,7 +2158,6 @@ impl Engine {
     /// client. The event loop, prompt assembly, tool registry/execution,
     /// cancellation, and session projection are unchanged; only the model I/O
     /// boundary is replaced.
-    #[allow(dead_code)] // Production injection seam; currently exercised by deterministic Engine tests.
     pub fn new_with_model_client(
         config: EngineConfig,
         api_config: &Config,

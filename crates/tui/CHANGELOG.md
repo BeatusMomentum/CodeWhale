@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.1] - 2026-10-01
+
+The website's not-found page now uses the Codwhale poster and typo joke,
+with English/Chinese recovery links to home and docs
+([#6419](https://github.com/Hmbown/Codewhale/issues/6419),
+[#6420](https://github.com/Hmbown/Codewhale/pull/6420)).
+
+Codewhale v0.10.1 source candidate focuses on reliability and first-run behavior.
+Turns that
+stall now say so, approvals keep what you approved, plugin suggestions are
+quieter, and Fleet runs can be checked before they spend anything.
+
 ### Changed
 
 - Script tools can no longer approve themselves or replace built-in tools
@@ -29,22 +41,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ([#6792](https://github.com/Hmbown/Codewhale/issues/6792),
   [#6145](https://github.com/Hmbown/Codewhale/issues/6145)).
 
-### Contributors
+### Release reliability
 
-- **[@SparkofSpike](https://github.com/SparkofSpike)** — translated seventeen Tier-2 guides and thirteen developer and internal docs into Simplified Chinese, and connected the localized documentation ([#6662](https://github.com/Hmbown/Codewhale/pull/6662), [#6663](https://github.com/Hmbown/Codewhale/pull/6663)).
-- **[@harryvgiunta](https://github.com/harryvgiunta)** — added Yolo-Auto as a bundled OpenAI-compatible host, starting on the vendor's recommended `qwen3.8-flash` model ([#6408](https://github.com/Hmbown/Codewhale/pull/6408)).
-
-## [0.10.1] - Unreleased candidate
-
-The website's not-found page now uses the Codwhale poster and typo joke,
-with English/Chinese recovery links to home and docs
-([#6419](https://github.com/Hmbown/Codewhale/issues/6419),
-[#6420](https://github.com/Hmbown/Codewhale/pull/6420)).
-
-Codewhale v0.10.1 source candidate focuses on reliability and first-run behavior.
-Turns that
-stall now say so, approvals keep what you approved, plugin suggestions are
-quieter, and Fleet runs can be checked before they spend anything.
+- Upload the complete release into a private draft, verify every asset's size
+  and SHA-256 digest, then publish. An interrupted retry cannot reuse stale
+  same-size bytes. CNB and GHCR version tags follow canonical publication.
+- Ubuntu Lighthouse bootstrap requires trusted SSH source CIDRs or an explicit
+  public-SSH opt-in before changing the host; malformed IPv6 and broad default
+  networks are refused.
 
 ### Security
 
@@ -101,23 +105,18 @@ quieter, and Fleet runs can be checked before they spend anything.
 - A turn no longer stops after an hour of work. The cumulative per-turn wall
   clock is unlimited by default, like model steps; set
   `[tui].turn_wall_clock_secs` to cap it.
-- Stream limits and transport settings share a typed `[stream]` configuration
-  table, including retry budgets, TCP keepalive and HTTP/2 keepalive. Explicit
-  values take precedence over legacy `[tui]` aliases; omitted values preserve
-  existing defaults and environment behavior. A configured HTTP/1 pin stays
-  pinned during recovery. `/config stream_chunk_timeout_secs ... --save`
-  updates the canonical setting so it survives reopening a configuration
-  that already had a timeout. Transport changes apply when a client is built
-  ([#6700](https://github.com/Hmbown/Codewhale/issues/6700)).
 
 ### Contributors
 
+- **[@harryvgiunta](https://github.com/harryvgiunta)** — added Yolo-Auto as a bundled OpenAI-compatible host, starting on the vendor's recommended `qwen3.8-flash` model ([#6408](https://github.com/Hmbown/Codewhale/pull/6408)).
+- **[@asto18089](https://github.com/asto18089)** — contributed the integrated runtime liveness, context, search, JavaScript execution, stopship scout and pet repairs, preserving their original contributor commits ([#6799](https://github.com/Hmbown/Codewhale/pull/6799)).
+- **[@qiuYliangM](https://github.com/qiuYliangM)** — made provider-bound project instruction and constitution labels stable across directory moves and kept their absolute paths in operator reports ([#6799](https://github.com/Hmbown/Codewhale/pull/6799)).
 - **[@zhuowp](https://github.com/zhuowp)** — supplied the process-scoped PowerShell execution-policy repair adapted for Codewhale, preserving machine and user Group Policy precedence ([#6745](https://github.com/Hmbown/Codewhale/issues/6745)).
 - **[@Andrea-Bruno](https://github.com/Andrea-Bruno)** — designed the Superfast Decision Gate and contributed its off-by-default shadow classifier ([#6604](https://github.com/Hmbown/Codewhale/pull/6604), [#6603](https://github.com/Hmbown/Codewhale/issues/6603)).
 - **[@aiapienthusiast](https://github.com/aiapienthusiast)** — added Cheaper Inference to the bundled provider catalog ([#6761](https://github.com/Hmbown/Codewhale/pull/6761)).
 - **[@gaord](https://github.com/gaord)** — let a client fork a thread at a named turn ([#6580](https://github.com/Hmbown/Codewhale/pull/6580)), let undo roll back files for the turn it is undoing ([#6483](https://github.com/Hmbown/Codewhale/pull/6483)), stopped resume and fork from duplicating threads and sessions ([#6406](https://github.com/Hmbown/Codewhale/pull/6406)), exposed user-defined provider routes to native clients ([#6404](https://github.com/Hmbown/Codewhale/pull/6404)), and kept a fork going when a turn lost its tool call ([#6664](https://github.com/Hmbown/Codewhale/pull/6664)).
 - **[@Lstarsky0](https://github.com/Lstarsky0)** — moved the docs/work, legal, digest and FAQ pages onto the dictionary spine ([#6405](https://github.com/Hmbown/Codewhale/pull/6405), [#6417](https://github.com/Hmbown/Codewhale/pull/6417), [#6499](https://github.com/Hmbown/Codewhale/pull/6499), [#6574](https://github.com/Hmbown/Codewhale/pull/6574)), tightened the Chinese-branching ceiling to 18 ([#6403](https://github.com/Hmbown/Codewhale/pull/6403)), and made Fleet publish without a two-link window ([#6431](https://github.com/Hmbown/Codewhale/pull/6431)). Also moved the constitution page onto the dictionary spine and kept its install link in the selected locale ([#6733](https://github.com/Hmbown/Codewhale/pull/6733)).
-- **[@aboimpinto](https://github.com/aboimpinto)** — restored a green Linux full-workspace test gate without loosening any test, twice ([#6581](https://github.com/Hmbown/Codewhale/pull/6581), [#6666](https://github.com/Hmbown/Codewhale/pull/6666)).
+- **[@aboimpinto](https://github.com/aboimpinto)** — restored a green Linux full-workspace test gate without loosening any test, twice ([#6581](https://github.com/Hmbown/Codewhale/pull/6581), [#6666](https://github.com/Hmbown/Codewhale/pull/6666)). Completed the seventeen-command portable session group, including `/structcopy` ([#6793](https://github.com/Hmbown/Codewhale/pull/6793)).
 - **[@dajiaohuang](https://github.com/dajiaohuang)** — `codewhale config set` checks a known setting's value against its schema type before saving it ([#6568](https://github.com/Hmbown/Codewhale/pull/6568)).
 - **[@cenab](https://github.com/cenab)** — requested the Tsubasa provider row and supplied its endpoint, key and model values ([#6695](https://github.com/Hmbown/Codewhale/issues/6695)).
 - **[@BX166](https://github.com/BX166)** — reported the AICraft provider row missing its key console, docs link and guidance, and supplied the values ([#6616](https://github.com/Hmbown/Codewhale/issues/6616)).
