@@ -21730,7 +21730,14 @@ const READ_ONLY_CHILD_ENVELOPE_BYTE_CEILING: usize = 89_000;
 // (105ad9d3e).
 // The agent schema's `fork_context` property (2026-09-25) fit under this
 // ceiling by trimming the `resume_from` and `wall_time_secs` descriptions.
-const PARENT_SURFACE_BYTE_CEILING: usize = 88_715;
+// Re-measured 2026-10-01 at 88,824B on macOS, +162B over 88,662B, both from
+// audit fixes: +106B because composition branches keep their `required`
+// lists (D04-11, 46835a2fc; `apply_patch`'s `oneOf` had degraded to three
+// unsatisfiable `{}` branches), and +56B for the finance timeout description
+// now saying the budget is shared with the chart fallback (D03-m3,
+// 7c36620d4). Linux measured 13B above macOS last time, so the ceiling is
+// 88,837B until a hosted Linux run re-measures it.
+const PARENT_SURFACE_BYTE_CEILING: usize = 88_837;
 
 #[tokio::test]
 async fn read_only_child_envelope_stays_within_measured_ceiling() {
