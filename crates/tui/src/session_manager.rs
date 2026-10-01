@@ -2891,10 +2891,45 @@ impl SessionManager {
     /// `ResourceBusy` when another process has it open
     /// ([`Self::reserve_session_for_attach`]). The caller commits the
     /// returned lease once the session is applied.
+    ///
+    /// A session that was interrupted mid-turn is attached in its interrupted
+    /// state: its crash checkpoint, when newer than the saved document, is
+    /// promoted first. Attaching the older document instead dropped the
+    /// in-flight turn, and the next autosave then cleared the only record of
+    /// it while the turn's file edits stayed on disk.
     pub fn attach_session(&self, id: &str) -> std::io::Result<(SessionRecovery, SessionLease)> {
         let lease = self.reserve_session_for_attach(id)?;
+        self.promote_interrupted_checkpoint(id);
         let recovery = self.resume_session(id)?;
         Ok((recovery, lease))
+    }
+
+    /// Persist `id`'s crash checkpoint as its saved document when the
+    /// checkpoint is the newer of the two (or there is no document yet), then
+    /// consume it. Callers hold the session's attach lease. A stale checkpoint
+    /// never replaces a newer document; an unreadable document and a failed
+    /// save leave both files as they were.
+    fn promote_interrupted_checkpoint(&self, id: &str) {
+        let Ok(Some(checkpoint)) = self.load_session_checkpoint(id) else {
+            return;
+        };
+        match self.load_session(id) {
+            Ok(saved) if saved.metadata.updated_at >= checkpoint.metadata.updated_at => {}
+            Ok(_) => {
+                if self.save_session(&checkpoint).is_err() {
+                    return;
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if self.save_session(&checkpoint).is_err() {
+                    return;
+                }
+            }
+            // A document that exists but cannot be read is not ours to
+            // replace here; the attach reports it and the checkpoint stays.
+            Err(_) => return,
+        }
+        let _ = self.clear_session_checkpoint(id);
     }
 
     /// [`Self::attach_session`] with a partial-ID prefix.
@@ -8205,6 +8240,61 @@ mod tests {
                 .interrupted_workspace_session(&workspace, None)
                 .map(|meta| meta.id),
             Some("sess-running".to_string())
+        );
+    }
+
+    /// Attaching a session that crashed mid-turn opens the interrupted turn
+    /// from its crash checkpoint; a stale checkpoint never replaces a newer
+    /// saved document.
+    #[test]
+    fn attach_promotes_the_sessions_newer_crash_checkpoint() {
+        let _env = crate::test_support::lock_test_env();
+        let tmp = tempdir().expect("tempdir");
+        let manager = SessionManager::new(tmp.path().join("sessions")).expect("manager");
+        let workspace = tmp.path().join("ws");
+        fs::create_dir_all(&workspace).expect("workspace");
+        let user = |text: &str| Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text {
+                text: text.to_string(),
+                cache_control: None,
+            }],
+        };
+        let saved = create_saved_session(&[user("first")], "test-model", &workspace, 0, None);
+        let id = saved.metadata.id.clone();
+        manager.save_session(&saved).expect("save session");
+        let mut interrupted = saved.clone();
+        interrupted.messages.push(user("in-flight turn"));
+        interrupted.metadata.updated_at = saved.metadata.updated_at + chrono::Duration::seconds(5);
+        manager
+            .save_checkpoint(&interrupted)
+            .expect("save checkpoint");
+
+        let (recovery, lease) = manager.attach_session(&id).expect("attach");
+        assert_eq!(
+            recovery.session.messages.len(),
+            2,
+            "the interrupted turn is part of the attached session"
+        );
+        assert!(
+            manager
+                .load_session_checkpoint(&id)
+                .expect("load checkpoint")
+                .is_none(),
+            "the recovered checkpoint is consumed"
+        );
+        drop(lease);
+
+        let mut stale = saved.clone();
+        stale.metadata.updated_at = saved.metadata.updated_at - chrono::Duration::seconds(5);
+        manager
+            .save_checkpoint(&stale)
+            .expect("save stale checkpoint");
+        let (recovery, _lease) = manager.attach_session(&id).expect("attach again");
+        assert_eq!(
+            recovery.session.messages.len(),
+            2,
+            "a stale checkpoint never replaces the newer document"
         );
     }
 

@@ -2895,9 +2895,6 @@ async fn run_async_main_dispatch(
             io::stdin().is_terminal() && io::stdout().is_terminal(),
         )
     } else if let Some(id) = cli.resume.clone() {
-        if io::stdin().is_terminal() && io::stdout().is_terminal() {
-            promote_interrupted_checkpoint_for_session(&id);
-        }
         Some(id)
     } else if !cli.fresh {
         let workspace = resolve_workspace(&cli);
@@ -11747,36 +11744,6 @@ fn recover_interrupted_checkpoint_for_resume(launch_workspace: &Path) -> Option<
     eprintln!("Recovered interrupted session ({age_str}). Use --fresh to start fresh.",);
 
     Some(session_id)
-}
-
-/// `--resume <id>` of a session that was interrupted mid-turn opens the
-/// interrupted state, as `--continue` does. Resuming the older saved document
-/// instead dropped the in-flight turn, and the next save then cleared the
-/// only record of it while the turn's file edits stayed on disk.
-///
-/// Only an exact session id finds its checkpoint; a session open in another
-/// terminal, or a saved document at least as new, is left alone.
-fn promote_interrupted_checkpoint_for_session(session_id: &str) {
-    let Ok(manager) = session_manager::SessionManager::default_location() else {
-        return;
-    };
-    if manager.is_session_live_anywhere(session_id) {
-        return;
-    }
-    let Ok(Some(checkpoint)) = manager.load_session_checkpoint(session_id) else {
-        return;
-    };
-    // Same order as `--continue`: hold the session before touching its files.
-    match manager.reserve_session_for_attach(session_id) {
-        Ok(lease) => lease.commit(),
-        Err(_) => return,
-    }
-    if !saved_session_is_newer(&manager, &checkpoint) && manager.save_session(&checkpoint).is_err()
-    {
-        return;
-    }
-    let _ = manager.clear_session_checkpoint(session_id);
-    eprintln!("Recovered this session's interrupted turn from its crash checkpoint.");
 }
 
 /// Whether a regular session file for the checkpoint's id already exists and
@@ -21760,72 +21727,6 @@ mod setup_helper_tests {
                 "an interactive --continue consumes the checkpoint"
             );
             assert!(manager.load_session(&session_id).is_ok());
-        });
-    }
-
-    /// `--resume <id>` after a crash opens the interrupted turn, not the
-    /// older saved document, and never replaces a newer document.
-    #[test]
-    fn explicit_resume_promotes_that_sessions_newer_crash_checkpoint() {
-        let _guard = crate::test_support::lock_test_env();
-        let tmp = TempDir::new().unwrap();
-        let workspace = tmp.path().join("workspace");
-        std::fs::create_dir_all(&workspace).unwrap();
-
-        with_home(tmp.path(), || {
-            let manager = SessionManager::default_location().expect("manager");
-            let user = |text: &str| Message {
-                role: Role::User,
-                content: vec![ContentBlock::Text {
-                    text: text.to_string(),
-                    cache_control: None,
-                }],
-            };
-            let saved = create_saved_session(&[user("first")], "test-model", &workspace, 0, None);
-            let session_id = saved.metadata.id.clone();
-            manager.save_session(&saved).expect("save session");
-
-            let mut interrupted = saved.clone();
-            interrupted.messages.push(user("in-flight turn"));
-            interrupted.metadata.updated_at =
-                saved.metadata.updated_at + chrono::Duration::seconds(5);
-            manager
-                .save_checkpoint(&interrupted)
-                .expect("save checkpoint");
-
-            promote_interrupted_checkpoint_for_session(&session_id);
-            assert_eq!(
-                manager
-                    .load_session(&session_id)
-                    .expect("session")
-                    .messages
-                    .len(),
-                2,
-                "the interrupted turn is part of the resumed session"
-            );
-            assert!(
-                manager
-                    .load_session_checkpoint(&session_id)
-                    .expect("load checkpoint")
-                    .is_none(),
-                "the recovered checkpoint is consumed"
-            );
-
-            // A stale checkpoint never replaces a newer saved document.
-            let mut stale = saved.clone();
-            stale.metadata.updated_at = saved.metadata.updated_at - chrono::Duration::seconds(5);
-            manager
-                .save_checkpoint(&stale)
-                .expect("save stale checkpoint");
-            promote_interrupted_checkpoint_for_session(&session_id);
-            assert_eq!(
-                manager
-                    .load_session(&session_id)
-                    .expect("session")
-                    .messages
-                    .len(),
-                2
-            );
         });
     }
 

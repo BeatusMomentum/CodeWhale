@@ -12,10 +12,11 @@
 //! `thread_id`/`session_id` routing envelope is dropped; liveness heartbeats
 //! are dropped; UUIDs, timestamps, temp paths and durations are masked; the
 //! system prompt and tool catalog bodies are replaced by a marker because the
-//! prompt family owns those bytes; runs of adjacent `tool_call_complete`
-//! events are ordered by tool call id because parallel completions race.
-//! Adjacent `operation_activity_completed` observations are likewise ordered
-//! by their established span id. No start, error, or other event is crossed.
+//! prompt family owns those bytes; an uninterrupted run of completion events
+//! is put in a canonical order because parallel completions race and their
+//! pairs interleave: `operation_activity_completed` by span id, then
+//! `tool_call_complete` by tool call id. No start, error, or other event is
+//! crossed.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::path::Path;
@@ -524,25 +525,38 @@ pub(super) fn normalize_events(events: &[Event], masker: &mut Masker) -> Vec<Val
     lines
 }
 
+/// Parallel tools race to report: each emits its activity completion and then
+/// its tool completion, and under load the two tools' pairs interleave. One
+/// uninterrupted run of completion events is therefore put in a canonical
+/// order: activity completions by span, then tool completions by call id.
+/// Every event, its outcome and the run's boundaries are kept; only the order
+/// inside the run is normalized.
 fn order_parallel_completions(lines: &mut [Value]) {
+    fn completion(line: &Value) -> Option<(u8, &'static str)> {
+        match line["event"].as_str() {
+            Some("operation_activity_completed") => Some((0, "span_id")),
+            Some("tool_call_complete") => Some((1, "tool_call_id")),
+            _ => None,
+        }
+    }
     let mut start = 0;
     while start < lines.len() {
-        let (kind, key) = match lines[start]["event"].as_str() {
-            Some("tool_call_complete") => ("tool_call_complete", "tool_call_id"),
-            Some("operation_activity_completed") => ("operation_activity_completed", "span_id"),
-            _ => {
-                start += 1;
-                continue;
-            }
-        };
+        if completion(&lines[start]).is_none() {
+            start += 1;
+            continue;
+        }
         let mut end = start;
-        while end < lines.len() && lines[end]["event"] == kind {
+        while end < lines.len() && completion(&lines[end]).is_some() {
             end += 1;
         }
-        if end - start > 1 {
-            lines[start..end].sort_by(|left, right| left[key].as_str().cmp(&right[key].as_str()));
-        }
-        start = end.max(start + 1);
+        lines[start..end].sort_by(|left, right| {
+            let (left_kind, left_key) = completion(left).unwrap_or((0, "span_id"));
+            let (right_kind, right_key) = completion(right).unwrap_or((0, "span_id"));
+            left_kind
+                .cmp(&right_kind)
+                .then_with(|| left[left_key].as_str().cmp(&right[right_key].as_str()))
+        });
+        start = end;
     }
 }
 
@@ -574,6 +588,27 @@ fn parallel_completion_projection_keeps_outcomes_spans_and_causal_boundaries() {
     order_parallel_completions(&mut normalized);
     assert_eq!(normalized, expected);
     assert_eq!(normalized.len(), original.len());
+
+    // Two tools' completion pairs interleaved under load normalize to the
+    // same order as the uninterleaved run.
+    let tool = |id: &str| json!({"event": "tool_call_complete", "tool_call_id": id});
+    let activity = |span: &str| json!({"event": "operation_activity_completed", "span_id": span, "outcome": "succeeded"});
+    let mut interleaved = vec![
+        activity("call_b#2"),
+        tool("call_b"),
+        activity("call_a#1"),
+        tool("call_a"),
+    ];
+    order_parallel_completions(&mut interleaved);
+    assert_eq!(
+        interleaved,
+        vec![
+            activity("call_a#1"),
+            activity("call_b#2"),
+            tool("call_a"),
+            tool("call_b")
+        ]
+    );
 
     let mut wrong_outcome = original.clone();
     wrong_outcome[1]["outcome"] = json!("succeeded");
