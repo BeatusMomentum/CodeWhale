@@ -597,10 +597,19 @@ impl WorkflowPanelEvent {
                 at_ms,
             }),
             "task_completed" => {
+                // Like `run_completed`: a missing status, or a completion
+                // receipt that still says running/pending, is contradictory
+                // and fails closed rather than leaving a live-looking row.
                 let status = value
                     .get("status")
                     .and_then(Value::as_str)
                     .map(WorkflowRowStatus::from_ir_status)
+                    .filter(|status| {
+                        !matches!(
+                            status,
+                            WorkflowRowStatus::Running | WorkflowRowStatus::Pending
+                        )
+                    })
                     .unwrap_or(WorkflowRowStatus::Failed);
                 Some(Self::TaskCompleted {
                     task_id: opt_str(value, "task_id")?,
@@ -2791,6 +2800,28 @@ mod tests {
         );
     }
 
+    /// U05-m1: an arriving task joins the runtime's newest phase, never the
+    /// phase the user's cursor happens to rest on.
+    #[test]
+    fn arriving_task_joins_the_newest_phase_not_the_selected_one() {
+        let mut panel = started_panel();
+        panel.apply_event(WorkflowPanelEvent::PhaseStarted {
+            title: "Verify".to_string(),
+            at_ms: 1_300,
+        });
+        panel.selected_phase = 0;
+        panel.apply_json_event(&task_started_json("t2", "deepseek", "flash"));
+        let ids = |phase: &WorkflowPanelPhase| {
+            phase
+                .rows
+                .iter()
+                .map(|row| row.task_id.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids(&panel.phases[0]), ["t1"]);
+        assert_eq!(ids(&panel.phases[1]), ["t2"]);
+    }
+
     /// U05-02: a terminal receipt with a missing or contradictory status is
     /// not evidence of success; it fails closed like an unknown status.
     #[test]
@@ -2800,13 +2831,15 @@ mod tests {
             let mut completed = json!({
                 "type": "run_completed", "run_id": "workflow_abc", "at_ms": 2_000,
             });
-            if let Some(status) = status {
-                completed["status"] = json!(status);
-            }
-            panel.apply_json_event(&json!({
+            let mut task_completed = json!({
                 "type": "task_completed", "run_id": "workflow_abc",
                 "task_id": "t1", "at_ms": 1_900,
-            }));
+            });
+            if let Some(status) = status {
+                completed["status"] = json!(status);
+                task_completed["status"] = json!(status);
+            }
+            panel.apply_json_event(&task_completed);
             panel.apply_json_event(&completed);
             assert_eq!(
                 panel.lifecycle,

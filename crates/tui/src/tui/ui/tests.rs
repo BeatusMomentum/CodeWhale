@@ -16775,6 +16775,78 @@ fn fanout_started_sibling_bumps_existing_card_revision() {
     }
 }
 
+/// U05-04: a terminal envelope that lands before the worker's `Started` opens
+/// its fanout slot settled, and a late Started/tool envelope for a settled
+/// agent never moves the running count or its Work-row activity back.
+#[test]
+fn late_or_completion_first_mailbox_never_reopens_a_settled_agent() {
+    use crate::tools::subagent::MailboxMessage;
+    use crate::tui::app::AgentCurrentActivityStatus;
+    let mut app = create_test_app();
+    app.pending_subagent_dispatch = Some("rlm".to_string());
+
+    handle_subagent_mailbox(
+        &mut app,
+        1,
+        &MailboxMessage::Started {
+            agent_id: "fanout-a".to_string(),
+            agent_type: "default".to_string(),
+        },
+    );
+    handle_subagent_mailbox(
+        &mut app,
+        2,
+        &MailboxMessage::Completed {
+            agent_id: "fanout-b".to_string(),
+            summary: "done".to_string(),
+        },
+    );
+    assert_eq!(
+        crate::tui::subagent_routing::active_fanout_counts(&app),
+        Some((1, 2)),
+        "a completion-first worker is settled, not running"
+    );
+
+    handle_subagent_mailbox(
+        &mut app,
+        3,
+        &MailboxMessage::Completed {
+            agent_id: "fanout-a".to_string(),
+            summary: "done".to_string(),
+        },
+    );
+    let late = [
+        MailboxMessage::Started {
+            agent_id: "fanout-a".to_string(),
+            agent_type: "default".to_string(),
+        },
+        MailboxMessage::ToolCallStarted {
+            agent_id: "fanout-a".to_string(),
+            tool_name: "read_file".to_string(),
+            step: 4,
+        },
+        MailboxMessage::ToolCallCompleted {
+            agent_id: "fanout-a".to_string(),
+            tool_name: "read_file".to_string(),
+            step: 4,
+            ok: true,
+        },
+    ];
+    for (seq, message) in late.iter().enumerate() {
+        handle_subagent_mailbox(&mut app, 10 + seq as u64, message);
+    }
+    assert_eq!(
+        crate::tui::subagent_routing::active_fanout_counts(&app),
+        Some((0, 2))
+    );
+    let status = app
+        .agent_progress_meta
+        .get("fanout-a")
+        .and_then(|meta| meta.current_activity.as_ref())
+        .map(|activity| activity.status);
+    assert_eq!(status, Some(AgentCurrentActivityStatus::Done));
+}
+
 #[test]
 fn fanout_interrupted_mailbox_drops_running_count() {
     let mut app = create_test_app();
