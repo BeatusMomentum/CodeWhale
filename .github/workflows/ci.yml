@@ -300,6 +300,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+      - name: Check Lighthouse SSH policy
+        run: python3 scripts/tencent-lighthouse/test_bootstrap_ssh.py
       - uses: actions/setup-node@v7
         with:
           node-version: 22
