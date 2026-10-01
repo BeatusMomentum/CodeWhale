@@ -4154,8 +4154,10 @@ mod tests {
             },
             AppTransport::Http,
         );
+        // Long enough for the save to reach disk on a slow runner: 200 ms was
+        // not, once, on hosted Windows.
         assert!(
-            tokio::time::timeout(Duration::from_millis(200), request)
+            tokio::time::timeout(Duration::from_secs(2), request)
                 .await
                 .is_err(),
             "the set waits for the runtime",
