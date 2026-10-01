@@ -5925,6 +5925,51 @@ mod tests {
         }
     }
 
+    /// #6715 review: the sign-in account summary is filled by `{provider}` and
+    /// `{account}` substitution, so a pack that drops a placeholder or ships the
+    /// English sentence would silently name no account or stay untranslated.
+    #[test]
+    fn auth_sign_in_copy_is_translated_and_keeps_its_placeholders() {
+        let english = raw_locale_messages(Locale::En);
+        let auth_keys = [
+            "AuthSignedInAs",
+            "AuthSignedInWithoutEmail",
+            "AuthReplacedPreviousSignInAs",
+            "AuthReplacedPreviousSignIn",
+            "AuthSameAccountAsBefore",
+            "AuthEnvTokenOutranksSignIn",
+        ];
+
+        for locale in Locale::shipped_complete() {
+            if *locale == Locale::En {
+                continue;
+            }
+            let pack = raw_locale_messages(*locale);
+            for key in auth_keys {
+                let english_value = english
+                    .get(key)
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_else(|| panic!("English {key} must be a string"));
+                let translated = pack
+                    .get(key)
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_else(|| panic!("{} is missing raw key {key}", locale.tag()));
+                assert_eq!(
+                    message_placeholders(translated),
+                    message_placeholders(english_value),
+                    "{} changed placeholders for {key}",
+                    locale.tag()
+                );
+                assert_ne!(
+                    translated,
+                    english_value,
+                    "{} ships English for {key}",
+                    locale.tag()
+                );
+            }
+        }
+    }
+
     #[test]
     fn current_session_pod_worker_copy_has_complete_locale_and_placeholder_parity() {
         let current_session_ids = [
