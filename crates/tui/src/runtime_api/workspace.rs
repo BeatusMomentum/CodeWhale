@@ -898,6 +898,7 @@ pub(super) async fn workspace_instructions(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use crate::dependencies::ExternalTool as _;
 
     #[cfg(unix)]
