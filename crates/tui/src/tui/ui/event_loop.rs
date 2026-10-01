@@ -1603,25 +1603,47 @@ async fn submit_decided_composer_input(
         // message, undo the last exchange before dispatching the
         // replacement. Sync the engine session so it also drops the old
         // exchange.
-        if app.edit_in_progress {
-            crate::commands::execute("/undo", app);
-            app.edit_in_progress = false;
-            let _ = engine_handle
-                .send(Op::SyncSession {
-                    session_id: app.current_session_id.clone(),
-                    messages: app.api_messages.as_ref().clone(),
-                    system_prompt: app.system_prompt.clone(),
-                    system_prompt_override: false,
-                    model: app.model.clone(),
-                    workspace: app.workspace.clone(),
-                    mode: app.mode,
-                })
-                .await;
+        if let Some(result) = edit_replacement_result(app, &input) {
+            return apply_command_result(
+                terminal,
+                app,
+                engine_handle,
+                task_manager,
+                config,
+                result,
+            )
+            .await;
         }
         let (queued, recovery) = message_from_submitted_input(app, input);
         dispatch_composer_message(app, config, engine_handle, queued, recovery, action).await?;
     }
     Ok(false)
+}
+
+/// The replacement for an exchange being revised with `/edit`: roll the last
+/// exchange back through the same Engine-acknowledged, durably saved path as
+/// `/retry`, then send `input` in its place. `None` when no edit is pending
+/// or there is nothing to replace, so the input is sent as a normal turn.
+///
+/// The rollback is staged, not applied, by the command layer (#6788); running
+/// `/undo` here and discarding its result left the old exchange in the
+/// transcript, the model context and the saved session.
+pub(super) fn edit_replacement_result(
+    app: &mut App,
+    input: &str,
+) -> Option<commands::CommandResult> {
+    if !std::mem::take(&mut app.edit_in_progress) {
+        return None;
+    }
+    let sync = crate::commands::staged_conversation_undo(app)?;
+    Some(commands::CommandResult {
+        message: None,
+        action: Some(AppAction::ConversationUndo {
+            sync,
+            retry_input: Some(input.to_string()),
+        }),
+        is_error: false,
+    })
 }
 
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]

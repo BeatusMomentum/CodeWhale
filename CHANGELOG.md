@@ -15,6 +15,13 @@ quieter, and Fleet runs can be checked before they spend anything.
 
 ### Changed
 
+- On Windows, every PowerShell command Codewhale starts now passes
+  `-ExecutionPolicy Bypass` for that process only, so a local `Restricted` or
+  `AllSigned` policy no longer blocks multi-line commands. A policy set by
+  Group Policy still wins and the command is refused with PowerShell's own
+  message. Scripts that a command invokes run under the same process-scoped
+  setting. Not verified on a native Windows machine
+  ([#6745](https://github.com/Hmbown/Codewhale/issues/6745)).
 - The website's not-found page now uses the Codwhale poster and typo joke,
   with English/Chinese recovery links to home and docs
   ([#6419](https://github.com/Hmbown/Codewhale/issues/6419),
@@ -122,6 +129,11 @@ quieter, and Fleet runs can be checked before they spend anything.
   changing the draft. Retained compaction summaries survive the rewind and
   cannot be selected as editable user prompts
   ([#6788](https://github.com/Hmbown/Codewhale/issues/6788)).
+- `/edit` replaces the exchange it revises through the same rollback: the old
+  prompt and its answer leave the transcript, the model's context and the
+  saved session before the edited prompt is sent.
+- A session can still be resumed by its id when a stray copy of its file sits
+  in the sessions directory; before, the id was reported as ambiguous.
 - Agents follow the Permissions you choose while they run: switching to
   Full Access reaches an agent that is already working, instead of leaving
   it with the Auto-Review guardian that denied it. Tightening reaches it too.

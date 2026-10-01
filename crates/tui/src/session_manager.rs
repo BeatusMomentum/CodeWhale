@@ -3014,10 +3014,14 @@ impl SessionManager {
     pub(crate) fn resolve_session_id_prefix(&self, prefix: &str) -> std::io::Result<String> {
         let sessions = self.list_sessions()?;
 
-        let matches: Vec<_> = sessions
+        // One session listed more than once (a stray copy of its file under
+        // another name) is still one session, not an ambiguous prefix.
+        let mut matches: Vec<_> = sessions
             .into_iter()
             .filter(|s| s.id.starts_with(prefix))
             .collect();
+        matches.sort_by(|a, b| a.id.cmp(&b.id));
+        matches.dedup_by(|a, b| a.id == b.id);
 
         match matches.len() {
             0 => Err(std::io::Error::new(
@@ -7457,6 +7461,15 @@ mod tests {
         std::fs::copy(&source, source.with_file_name("impostor.json")).expect("copy");
 
         assert_eq!(manager.load_session(&id).expect("own id").metadata.id, id);
+        // The stray copy does not make the real session ambiguous.
+        assert_eq!(
+            manager
+                .load_session_by_prefix(&id)
+                .expect("resume by id with a copy present")
+                .metadata
+                .id,
+            id
+        );
         let err = manager
             .load_session("impostor")
             .expect_err("mismatched id must fail");

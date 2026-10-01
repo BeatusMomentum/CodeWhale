@@ -53,6 +53,15 @@ mod session_lifecycle_regression_tests;
 use std::sync::OnceLock;
 
 pub(crate) use groups::config::config::set_workspace_trust;
+
+/// Stage a rollback of the last exchange for the UI to apply, or `None` when
+/// there is no user message to roll back. Nothing is mutated here.
+pub(crate) fn staged_conversation_undo(
+    app: &mut crate::tui::app::App,
+) -> Option<codewhale_command_contract::facets::SessionSyncPayload> {
+    let undone = contract::debug_operations::undo_conversation_for_engine(app);
+    (undone.removed > 0).then_some(undone.sync)
+}
 pub use traits::CommandInfo;
 
 // Long-standing public paths that predate the group layout.

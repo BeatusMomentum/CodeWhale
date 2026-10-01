@@ -125,6 +125,7 @@ fn undo_retry_apply_path_keeps_engine_request_and_reopened_session_consistent() 
             canned::simple_text_turn("retry answer one"),
             canned::simple_text_turn("retry answer two"),
             canned::simple_text_turn("answer after reopen"),
+            canned::simple_text_turn("edited answer"),
         ]));
         let (engine, mut handle) = Engine::new_with_model_client(
             EngineConfig {
@@ -467,6 +468,46 @@ fn undo_retry_apply_path_keeps_engine_request_and_reopened_session_consistent() 
         assert!(!inbound.contains("undone answer"));
         assert!(!inbound.contains("retry answer"));
 
+        // `/edit` then submit replaces the last exchange: the old prompt and
+        // its answer leave the transcript, the provider request and the saved
+        // session, and the edited prompt takes their place.
+        let loaded = commands::execute("/edit", &mut app);
+        assert!(!loaded.is_error, "{:?}", loaded.message);
+        assert_eq!(app.input, "after reopen");
+        assert!(app.edit_in_progress);
+        let result = super::super::event_loop::edit_replacement_result(&mut app, "edited prompt")
+            .expect("a pending edit stages a replacement");
+        assert!(!app.edit_in_progress);
+        apply_command_result(
+            &mut terminal,
+            &mut app,
+            &mut handle,
+            &tasks,
+            &mut config,
+            result,
+        )
+        .await
+        .unwrap();
+        settled(&mut app, &handle, "edited answer").await;
+        let requests = mock.captured_requests();
+        assert_eq!(requests.len(), 6);
+        assert_eq!(
+            prompts(&requests.last().unwrap().messages),
+            ["keep this", "edited prompt"]
+        );
+        let inbound = serde_json::to_string(&requests.last().unwrap().messages).unwrap();
+        assert!(!inbound.contains("after reopen"));
+        assert_eq!(prompts(&app.api_messages), ["keep this", "edited prompt"]);
+        assert_eq!(
+            prompts(&manager.load_session(&id).unwrap().messages),
+            ["keep this"],
+            "the edit rollback is durable before the replacement turn"
+        );
+        // With no edit pending, a submit is an ordinary turn.
+        assert!(
+            super::super::event_loop::edit_replacement_result(&mut app, "plain").is_none()
+        );
+
         // Return to the retained exchange before probing durable-save failure.
         let result = commands::execute("/undo", &mut app);
         apply_command_result(
@@ -498,7 +539,7 @@ fn undo_retry_apply_path_keeps_engine_request_and_reopened_session_consistent() 
         .unwrap();
         assert_eq!(
             mock.captured_requests().len(),
-            5,
+            6,
             "save failure must forbid retry inference"
         );
         assert!(
@@ -549,7 +590,7 @@ fn undo_retry_apply_path_keeps_engine_request_and_reopened_session_consistent() 
                 .text
                 .contains("retry was not sent")
         );
-        assert_eq!(mock.captured_requests().len(), 5);
+        assert_eq!(mock.captured_requests().len(), 6);
         tasks.shutdown_and_wait().await.unwrap();
         assert!(actor.try_send(PersistRequest::Shutdown));
         actor_task.await.unwrap();
