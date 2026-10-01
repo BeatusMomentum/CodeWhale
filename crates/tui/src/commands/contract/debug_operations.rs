@@ -497,7 +497,26 @@ const POST_TURN_SNAPSHOT_WAIT: std::time::Duration = std::time::Duration::from_s
 ///
 /// Posts a `HistoryCell::System` entry so the user can see what was
 /// reverted in the transcript.
+/// Why workspace files may not be rolled back right now, if they may not.
+///
+/// A running turn is reading and writing this workspace: restoring files
+/// under it discards the turn's in-flight work and leaves the model's view of
+/// the files wrong. `/undo` and `/restore` refuse while one is active, like
+/// the Runtime's restore routes.
+pub(in crate::commands) fn active_turn_restore_refusal(app: &App) -> Option<String> {
+    let turn_active = app.is_loading
+        || app.is_compacting
+        || matches!(app.runtime_turn_status.as_deref(), Some("in_progress"));
+    turn_active.then(|| {
+        "A turn is still running in this workspace, so files were not restored and nothing was changed. Wait for it to finish, or press Esc to stop it, then run the command again."
+            .to_string()
+    })
+}
+
 pub(in crate::commands) fn undo_files(app: &mut App) -> DebugUndoOutcome {
+    if let Some(refusal) = active_turn_restore_refusal(app) {
+        return DebugUndoOutcome::RestoreBlocked(refusal);
+    }
     let workspace = app.workspace.clone();
 
     let repo = match crate::snapshot::SnapshotRepo::open_or_init(&workspace) {

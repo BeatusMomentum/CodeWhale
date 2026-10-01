@@ -30266,6 +30266,11 @@ async fn run_computer_use_live_card_case(
 
 #[tokio::test]
 async fn computer_use_human_card_allows_the_exact_live_call() {
+    // The bundled Computer Use plugin applies only to macOS hosts; elsewhere
+    // there is no live plugin to start.
+    if !cfg!(target_os = "macos") {
+        return;
+    }
     let _env = lock_test_env();
     run_computer_use_live_card_case(
         ApprovalMode::Suggest,
@@ -30278,6 +30283,11 @@ async fn computer_use_human_card_allows_the_exact_live_call() {
 
 #[tokio::test]
 async fn computer_use_session_rule_and_posture_cannot_mint_a_human_decision() {
+    // The bundled Computer Use plugin applies only to macOS hosts; elsewhere
+    // there is no live plugin to start.
+    if !cfg!(target_os = "macos") {
+        return;
+    }
     let _env = lock_test_env();
     for decider in [
         crate::approval_log::ApprovalDecider::SessionRule,
@@ -30289,6 +30299,11 @@ async fn computer_use_session_rule_and_posture_cannot_mint_a_human_decision() {
 
 #[tokio::test]
 async fn computer_use_autonomous_postures_block_before_the_plugin() {
+    // The bundled Computer Use plugin applies only to macOS hosts; elsewhere
+    // there is no live plugin to start.
+    if !cfg!(target_os = "macos") {
+        return;
+    }
     let _env = lock_test_env();
     for posture in [
         ApprovalMode::Bypass,

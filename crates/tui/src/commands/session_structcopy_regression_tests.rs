@@ -587,7 +587,9 @@ fn hostile_object_keys_are_scrubbed_bounded_and_deduped_deterministically() {
         long_a.clone(): 1,
         long_b.clone(): 2,
         long_c.clone(): 3,
-        "\u{1b}[31mansi\u{1b}[0m\nkey": 4,
+        // Not a credential-shaped name: a key ending in `key` is redacted by
+        // the shared vocabulary, which other tests cover.
+        "\u{1b}[31mansi\u{1b}[0m\nlabel": 4,
         format!("at {workspace}/src"): 5,
     });
     app.api_messages = std::sync::Arc::new(vec![Message {

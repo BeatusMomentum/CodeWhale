@@ -771,6 +771,9 @@ mod tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    // Unix only: the fixture redirects the home directory through `HOME`,
+    // and Windows resolves the profile through the known-folder API instead.
+    #[cfg(unix)]
     #[test]
     fn sandbox_read_guard_denies_active_and_known_agent_credentials_in_real_file_tool() {
         use crate::tools::spec::{ToolContext, ToolSpec};

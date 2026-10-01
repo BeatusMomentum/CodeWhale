@@ -1439,11 +1439,21 @@ fn import_session_container(
     };
     let model = app.model.clone();
     let workspace = app.workspace.clone();
-    let imported =
+    let mut imported =
         match crate::session_manager::SavedSession::import_foreign(container, workspace, model) {
             Ok(s) => s,
             Err(e) => return Err(format!("foreign import failed: {e}")),
         };
+    // The import takes this window's model, so it takes this window's route
+    // too. Left at the record default it named a different provider, and
+    // opening the imported session sent its whole history there.
+    let (provider, provider_id) = (
+        app.provider_identity_for_persistence().to_string(),
+        app.provider_id_for_persistence().map(str::to_string),
+    );
+    imported
+        .metadata
+        .set_model_provider_route(&provider, provider_id.as_deref());
     let new_id = imported.metadata.id.clone();
     let queue_transition = crate::tui::ui::prepare_offline_queue_transition(app, &new_id)?;
     if let Err(e) = manager.save_session(&imported) {
@@ -3138,6 +3148,11 @@ impl CommandSkillGroupContext for SkillGroupAdapter<'_> {
     }
 
     fn restore_snapshot(&mut self, id: &str) -> Result<(), String> {
+        if let Some(refusal) =
+            debug_operations::active_turn_restore_refusal(&self.host.app.borrow())
+        {
+            return Err(refusal);
+        }
         let workspace = self.host.app.borrow().workspace.clone();
         let id = id.to_owned();
         let restore = move || {
@@ -7244,6 +7259,8 @@ mod tests {
         let import_file = tmpdir.path().join("foreign-export.json");
         std::fs::write(&import_file, &json).unwrap();
 
+        // This window is on a non-default route; the import must bind to it.
+        app.api_provider = crate::config::ApiProvider::Openai;
         let receipt = {
             let mut bundle = app.command_contexts();
             let mut parts = bundle.parts();
@@ -7261,6 +7278,10 @@ mod tests {
         // (fresh id/title), matching the baseline import path exactly.
         assert_eq!(saved.metadata.title, "New Session");
         assert_ne!(saved.metadata.id, "foreign-source");
+        assert_eq!(
+            saved.metadata.model_provider, "openai",
+            "an imported session runs on this window's route, not a default one"
+        );
         assert!(
             manager
                 .sessions_dir()

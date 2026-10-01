@@ -10330,6 +10330,11 @@ pub(crate) fn computer_use_test_fixture() -> (
 
 #[tokio::test]
 async fn computer_use_real_plugin_host_handshake_rejects_tamper_replay_and_late_keys() {
+    // The bundled Computer Use plugin applies only to macOS hosts; elsewhere
+    // there is no live plugin to start.
+    if !cfg!(target_os = "macos") {
+        return;
+    }
     let _env = crate::test_support::lock_test_env();
     let (root, _registry, mut pool, server) = computer_use_test_fixture();
     let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", root.path());

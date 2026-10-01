@@ -309,7 +309,27 @@ fn test_patch_undo_requests_session_resync_after_restore() {
         }],
     });
 
+    // A running turn owns the workspace: nothing is restored under it.
+    app.is_loading = true;
+    let refused = patch_undo(&mut app);
+    assert!(
+        refused
+            .message
+            .as_deref()
+            .is_some_and(|message| message.contains("still running")),
+        "{:?}",
+        refused.message
+    );
+    assert!(refused.action.is_none());
+    assert_eq!(
+        std::fs::read(workspace.join("a.txt")).unwrap(),
+        b"modified",
+        "a refused undo changes no file"
+    );
+    app.is_loading = false;
+
     let result = patch_undo(&mut app);
+    assert_eq!(std::fs::read(workspace.join("a.txt")).unwrap(), b"original");
 
     assert!(!result.is_error);
     assert!(matches!(
