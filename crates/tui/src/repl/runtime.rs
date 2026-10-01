@@ -396,6 +396,14 @@ impl PythonRuntime {
     ///
     /// Returns once Python emits `__RLM_DONE_<sid>__` or the round timeout
     /// elapses (whichever happens first).
+    ///
+    /// Known limitations (F02-07): the sentinels share stdout with the code
+    /// they frame, and `_SID`/`_DONE` are ordinary Python globals, so code in
+    /// this round (or a subprocess inheriting fd 1) can still print its own
+    /// round's DONE line and end the round early; only another round's DONE
+    /// is refused. A failed or timed-out round kills the interpreter process
+    /// itself, not its process group, so a grandchild it spawned may outlive
+    /// the kernel. Closing either needs an out-of-band protocol channel.
     pub async fn run<D>(&mut self, code: &str, bridge: Option<&D>) -> Result<ReplRound, String>
     where
         D: RpcDispatcher + ?Sized,
