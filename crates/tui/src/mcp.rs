@@ -532,8 +532,15 @@ pub struct McpTimeouts {
 fn default_connect_timeout() -> u64 {
     30
 }
+// 30 minutes: an MCP tool call legitimately runs minutes — builds, test
+// suites, scrapes, remote jobs. The old 60s default returned "timed out" to
+// the model for healthy-but-slow tools, which then retried and compounded
+// the cost. Per-server and global `execute_timeout` overrides still win.
+// Scope note: `prompts/get` also routes through `effective_execute_timeout`,
+// so it inherits this default; its server-side template work is normally
+// fast, but the override knob is the intended way to keep it tight.
 fn default_execute_timeout() -> u64 {
-    60
+    1800
 }
 fn default_read_timeout() -> u64 {
     120
@@ -1756,6 +1763,20 @@ impl Drop for PendingAuthorityWatch {
     }
 }
 
+/// Total request ceiling handed to the HTTP client: it must cover the longest
+/// request the connection carries (`tools/call` at the execute budget), so a
+/// raised `execute_timeout` governs HTTP servers too. This is a ceiling for
+/// the transport, not the read knob.
+///
+/// Streamable HTTP reads the reply inside the POST; `call_method` bounds the
+/// send and the receive with the request's own budget, so this ceiling is
+/// only the transport's outer safety net for requests without one.
+fn http_request_ceiling_secs(config: &McpServerConfig, global: &McpTimeouts) -> u64 {
+    config
+        .effective_read_timeout(global)
+        .max(config.effective_execute_timeout(global))
+}
+
 impl McpConnection {
     /// Connect to an MCP server and initialize it.
     ///
@@ -1817,7 +1838,12 @@ impl McpConnection {
                 config.allow_private_network,
                 network_policy,
                 Duration::from_secs(connect_timeout_secs),
-                Duration::from_secs(read_timeout_secs),
+                // Transport total-request ceiling, not the read knob: it must
+                // cover the longest request this connection carries
+                // (`tools/call` at the execute budget), so a raised
+                // `execute_timeout` governs HTTP servers too. The read knob
+                // itself stays intact for the connection-level waits below.
+                Duration::from_secs(http_request_ceiling_secs(&config, global_timeouts)),
             )?;
             let oauth_runtime = if config.reviewed_plugin.is_some() {
                 None
@@ -2408,31 +2434,67 @@ impl McpConnection {
         }
 
         let call_id = self.next_id();
-        if let Err(error) = self
-            .send(serde_json::json!({
+        // One deadline bounds the whole request. Streamable HTTP reads the
+        // reply inside the POST, so a budget on the receive alone would leave
+        // that transport to its client-wide ceiling (the larger of the read
+        // and execute knobs) instead of this request's own budget.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
+        let expired_error = anyhow::anyhow!(
+            "MCP method '{}' on server '{}' timed out after {}s",
+            method,
+            self.name,
+            timeout_secs
+        );
+        match tokio::time::timeout_at(
+            deadline,
+            self.send(serde_json::json!({
                 "jsonrpc": "2.0",
                 "id": &call_id,
                 "method": method,
                 "params": params
-            }))
-            .await
+            })),
+        )
+        .await
         {
-            return self.finish_guarded_error(error).await;
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => return self.finish_guarded_error(error).await,
+            Err(_) => {
+                // A send abandoned mid-write can leave a partial frame on a
+                // stream transport, so the frame boundary is unknown: rebuild
+                // the connection rather than reuse it.
+                self.state = ConnectionState::Disconnected;
+                return self.finish_guarded_error(expired_error).await;
+            }
         }
 
-        let response =
-            match tokio::time::timeout(Duration::from_secs(timeout_secs), self.recv(call_id))
-                .await
-                .with_context(|| {
-                    format!(
-                        "MCP method '{}' on server '{}' timed out after {}s",
-                        method, self.name, timeout_secs
-                    )
-                }) {
-                Ok(Ok(response)) => response,
-                Ok(Err(error)) => return self.finish_guarded_error(error).await,
-                Err(error) => return self.finish_guarded_error(error).await,
-            };
+        // The request's own budget is its only receive deadline. A per-frame
+        // read-knob wait here either undercut it — a server is silent for the
+        // whole execution of a tool call, so the knob fired first, marked the
+        // connection Disconnected, and capped a raised `execute_timeout` — or
+        // tied with it, leaving the connection's fate to timer order. On
+        // expiry the request is abandoned and the connection kept: a late
+        // reply carries the abandoned id and the next receive skips it.
+        //
+        // Known limitation: the server is never told a request was abandoned
+        // (no `notifications/cancelled`), whether by this budget or by the
+        // caller dropping the call (turn cancellation). A server that handles
+        // requests one at a time answers the next call only after finishing
+        // the abandoned one, so that call can wait up to its own budget —
+        // 1800s for `tools/call` by default. Cancelling `cancel_token` instead
+        // marks the connection dead, so the pool rebuilds it (a new child for
+        // stdio) before the next call.
+        let response = match tokio::time::timeout_at(deadline, self.recv_reply(call_id, None))
+            .await
+            .with_context(|| {
+                format!(
+                    "MCP method '{}' on server '{}' timed out after {}s",
+                    method, self.name, timeout_secs
+                )
+            }) {
+            Ok(Ok(response)) => response,
+            Ok(Err(error)) => return self.finish_guarded_error(error).await,
+            Err(error) => return self.finish_guarded_error(error).await,
+        };
 
         if let Some(error) = response.get("error") {
             if self.config.reviewed_plugin.is_some() {
@@ -2551,34 +2613,53 @@ impl McpConnection {
         result
     }
 
+    /// Handshake and discovery receive: each frame wait is bounded by the read
+    /// knob, and a server that stays silent past it is treated as dead.
     async fn recv(&mut self, expected_id: String) -> Result<serde_json::Value> {
-        loop {
-            let bytes = match tokio::time::timeout(
-                Duration::from_secs(self.read_timeout_secs),
-                async {
-                    tokio::select! {
-                        biased;
-                        _ = self.cancel_token.cancelled() => {
-                            anyhow::bail!("MCP connection '{}' was cancelled", self.name)
-                        }
-                        result = self.transport.recv() => result,
-                    }
-                },
-            )
+        self.recv_reply(expected_id, Some(self.read_timeout_secs))
             .await
-            {
-                Ok(result) => result.inspect_err(|_e| {
-                    self.state = ConnectionState::Disconnected;
-                })?,
-                Err(_) => {
-                    self.state = ConnectionState::Disconnected;
-                    anyhow::bail!(
-                        "Timed out waiting for MCP JSON-RPC response from server '{}' after {}s",
-                        self.name,
-                        self.read_timeout_secs
-                    );
+    }
+
+    /// The next transport frame, unless the connection is cancelled first.
+    async fn next_frame(&mut self) -> Result<Vec<u8>> {
+        tokio::select! {
+            biased;
+            _ = self.cancel_token.cancelled() => {
+                anyhow::bail!("MCP connection '{}' was cancelled", self.name)
+            }
+            result = self.transport.recv() => result,
+        }
+    }
+
+    /// Receive the reply to `expected_id`, skipping notifications and replies
+    /// to other (abandoned) requests. `frame_timeout_secs` bounds each frame
+    /// wait and treats its expiry as a dead connection; `None` leaves the
+    /// whole wait to the caller's own request budget.
+    async fn recv_reply(
+        &mut self,
+        expected_id: String,
+        frame_timeout_secs: Option<u64>,
+    ) -> Result<serde_json::Value> {
+        loop {
+            let frame = match frame_timeout_secs {
+                Some(secs) => {
+                    match tokio::time::timeout(Duration::from_secs(secs), self.next_frame()).await {
+                        Ok(frame) => frame,
+                        Err(_) => {
+                            self.state = ConnectionState::Disconnected;
+                            anyhow::bail!(
+                                "Timed out waiting for MCP JSON-RPC response from server '{}' after {}s",
+                                self.name,
+                                secs
+                            );
+                        }
+                    }
                 }
+                None => self.next_frame().await,
             };
+            let bytes = frame.inspect_err(|_e| {
+                self.state = ConnectionState::Disconnected;
+            })?;
             let value: serde_json::Value = match serde_json::from_slice(&bytes) {
                 Ok(value) => value,
                 Err(err) => {
