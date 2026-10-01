@@ -89,7 +89,21 @@ jobs:
         # same source, and every one of them passes in isolation. Match the lane
         # that gates every merge; doctests are the next step, because nextest
         # does not run them.
-        run: sh scripts/with-hermetic-test-home.sh cargo nextest run --workspace --all-features --locked --profile ci
+        # The runner has been shut down during this step's build on several
+        # candidates (exit 143, no test result). The same headroom trace as
+        # ci.yml's test step records whether memory or disk ran out, starting
+        # with what the earlier check and clippy steps left behind.
+        shell: bash
+        run: |
+          echo "[headroom] before tests: $(free -m | awk '/^Mem:/{print "mem used " $3 "/" $2 " MiB"} /^Swap:/{print "swap used " $3 "/" $2 " MiB"}' | paste -sd ' ') disk free $(df -h / | awk 'NR==2{print $4}') target $(du -sh target 2>/dev/null | cut -f1)"
+          ( while sleep 30; do
+              echo "[headroom] $(free -m | awk '/^Mem:/{print "mem used " $3 "/" $2 " MiB"} /^Swap:/{print "swap used " $3 "/" $2 " MiB"}' | paste -sd ' ') disk free $(df -h / | awk 'NR==2{print $4}')"
+            done ) &
+          monitor=$!
+          status=0
+          sh scripts/with-hermetic-test-home.sh cargo nextest run --workspace --all-features --locked --profile ci || status=$?
+          kill "$monitor" 2>/dev/null || true
+          exit "$status"
         env:
           # Match the CI test lane: test threads get the same stack the product
           # gives itself (main.rs CODEWHALE_MAIN_STACK_BYTES). See the note in
