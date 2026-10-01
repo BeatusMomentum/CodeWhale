@@ -726,6 +726,19 @@ function recordConfirmation(token) {
   return entry;
 }
 
+/**
+ * A spawned desktop belongs to the session that spawned it, and the registry
+ * is shared between MCP processes: another session may not replace its entry
+ * (register or spawn under the same id) any more than it may remove it.
+ */
+function assertNotOwnedElsewhere(id) {
+  let prev = null;
+  try { prev = registry.get(id); } catch { return; }
+  if (prev.owned === true && prev.spawnedBy !== SESSION_ID) {
+    throw new ServerError("computer_owned_elsewhere", `computer "${id}" was spawned by another session and is still its disposable desktop — choose another id. If that session is gone, remove the container with docker rm -f ${prev.container}, then computer remove "${id}".`);
+  }
+}
+
 // ---------- tool dispatch ----------
 async function callTool(params) {
   const requested = params.name;
@@ -845,6 +858,7 @@ async function callTool(params) {
 
   if (name === "computer_register") {
     try {
+      assertNotOwnedElsewhere(args.computer);
       const entry = registry.register({ id: args.computer, transport: args.transport, label: args.label, host: args.host, port: args.port, user: args.user, target: args.target });
       await bindComputer(entry);
       let installed = null;
@@ -873,6 +887,7 @@ async function callTool(params) {
   if (name === "computer_spawn") {
     try {
       if (args.transport !== "docker") throw new ServerError("bad_args", `spawn transport must be "docker" (got ${JSON.stringify(args.transport)})`);
+      assertNotOwnedElsewhere(args.computer);
       const spawned = await spawnDockerComputer({ id: args.computer, image: args.image });
       let entry;
       try {

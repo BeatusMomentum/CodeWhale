@@ -428,7 +428,9 @@ export class CodewhaleRuntimeTrace {
           payload: { input_summary: clip(turn.input_summary) }, raw: rec,
         };
         if (existing >= 0) {
-          const prior = events[existing]!; this.measure(prior, { ...next, startTime: prior.startTime });
+          // The kept start can follow a skewed completion time; never end before it.
+          const prior = events[existing]!;
+          this.measure(prior, { ...next, startTime: prior.startTime, endTime: Math.max(prior.startTime, next.endTime) });
         }
         else this.push(next);
         continue;

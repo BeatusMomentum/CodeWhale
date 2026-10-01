@@ -56,7 +56,7 @@ Never retry a refusal unchanged — re-observe, re-target, or change route.
 | `spawn_failed` | provisioning failed or the desktop did not become ready | read the message; the failed container is removed automatically — fix the cause and spawn again |
 | `invalid_container` | a docker registry entry lacks a valid container name | register it through `computer spawn`, never by hand |
 | `cleanup_failed` | `docker rm` failed while tearing down a spawned computer | the registry entry is still removed; check `docker ps` for the labeled container and remove it manually |
-| `computer_owned_elsewhere` | `computer remove` named a desktop another session spawned | leave it; its session removes it at exit (the message names the container if that session is gone) |
+| `computer_owned_elsewhere` | `computer remove`, `register` or `spawn` named a desktop another session spawned | leave it; its session removes it at exit (the message names the container if that session is gone) |
 | `script_error` | osascript exited non-zero; stderr is in the message | read the error, check the app's scripting dictionary (`sdef`), fix the script |
 | `script_timeout` | the script — or a consent dialog — was still open at the deadline | narrow the script; a consent prompt is the person's choice, report it |
 | `script_cancelled` | the script's own dialog was cancelled (-128) | the user declined in-app; stop or ask |

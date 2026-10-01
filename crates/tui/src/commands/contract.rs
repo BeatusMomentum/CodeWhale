@@ -448,6 +448,17 @@ impl CommandSessionLifecycleContext for SessionLifecycleAdapter<'_> {
         session.make_storage_compatible();
         let queue_transition =
             crate::tui::ui::prepare_offline_queue_transition(&app, &session.metadata.id)?;
+        // C01-09: an explicit path may replace a saved session (a re-save),
+        // never an arbitrary file. Whatever exists there must read as one.
+        if let Some(path) = explicit_save_path.as_deref()
+            && path.symlink_metadata().is_ok()
+            && crate::session_manager::SessionManager::load_session_metadata(path).is_err()
+        {
+            return Err(format!(
+                "Refusing to overwrite {}: it is not a saved Codewhale session. Choose a new path, or move that file first.",
+                path.display()
+            ));
+        }
         let save_path = explicit_save_path.unwrap_or_else(|| {
             let dir = crate::session_manager::default_sessions_dir()
                 .unwrap_or_else(|_| app.workspace.clone());
