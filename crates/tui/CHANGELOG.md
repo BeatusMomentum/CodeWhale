@@ -22,6 +22,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the wrapper its own name
   ([configuration](docs/CONFIGURATION.md#script-tools-and-overrides)).
 
+- Complete the session slash-command group’s shared command boundary, including
+  `/structcopy`, so all seventeen commands can compile independently of the TUI.
+  Host operations remain behind capability interfaces; command behavior and
+  upstream tool-execution identity safeguards are preserved
+  ([#6792](https://github.com/Hmbown/Codewhale/issues/6792),
+  [#6145](https://github.com/Hmbown/Codewhale/issues/6145)).
+
 ### Contributors
 
 - **[@SparkofSpike](https://github.com/SparkofSpike)** — translated seventeen Tier-2 guides and thirteen developer and internal docs into Simplified Chinese, and connected the localized documentation ([#6662](https://github.com/Hmbown/Codewhale/pull/6662), [#6663](https://github.com/Hmbown/Codewhale/pull/6663)).

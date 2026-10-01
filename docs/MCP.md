@@ -385,8 +385,8 @@ The CLI also exposes helper tools when MCP is enabled:
 ```json
 {
   "timeouts": {
-    "connect_timeout": 10,
-    "execute_timeout": 60,
+    "connect_timeout": 30,
+    "execute_timeout": 1800,
     "read_timeout": 120
   },
   "servers": {
@@ -497,7 +497,12 @@ Per-server settings:
 - `command` (string, required)
 - `args` (array of strings, optional)
 - `env` (object, optional)
-- `connect_timeout`, `execute_timeout`, `read_timeout` (seconds, optional). `connect_timeout` defaults to 30 and covers spawn, `initialize` and the first `tools/list`, so a cold `uvx`/`npx` package download counts against it.
+- `connect_timeout`, `execute_timeout`, `read_timeout` (seconds, optional). A per-server value overrides the global `timeouts` block, and each budget is independent of the others:
+  - `connect_timeout` (default 30) covers spawn, `initialize` and the first `tools/list`, so a cold `uvx`/`npx` package download counts against it.
+  - `execute_timeout` (default 1800) is the budget for each `tools/call` and `prompts/get`. An explicit shorter value is respected, and `read_timeout` never cuts a running tool short.
+  - `read_timeout` (default 120) bounds each reply wait during the handshake and tool discovery, and is the budget for `resources/read`.
+  - A request that runs out of budget fails with a timeout. The connection is kept, and a reply that arrives later is discarded instead of being handed to another call. Interrupting the turn stops the wait at once, but Codewhale does not send `notifications/cancelled` yet, so a server that handles one request at a time finishes the abandoned call before it answers the next one.
+  - Streamable HTTP servers return the reply inside the POST itself; the request's own budget bounds that POST too. A request that expires while still sending closes the connection, which is rebuilt before the next call.
 - `disabled` (bool, optional)
 - `enabled` (bool, optional, default `true`)
 - `required` (bool, optional): startup/connect validation fails if this server cannot initialize.

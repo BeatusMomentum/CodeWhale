@@ -285,6 +285,7 @@ async fn edit_last_turn_restores_the_exchange_when_the_replacement_never_starts(
     handle
         .send(Op::EditLastTurn {
             new_message: "edited prompt".to_string(),
+            submission_id: None,
         })
         .await
         .unwrap();

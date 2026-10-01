@@ -79,7 +79,7 @@ fn mark_workspace_trusted(workspace: &Path) -> WorkspaceTrustConfigGuard {
 fn test_mcp_config_defaults() {
     let config = McpConfig::default();
     assert_eq!(config.timeouts.connect_timeout, 30);
-    assert_eq!(config.timeouts.execute_timeout, 60);
+    assert_eq!(config.timeouts.execute_timeout, 1800);
     assert_eq!(config.timeouts.read_timeout, 120);
     assert!(config.servers.is_empty());
 }
@@ -2847,7 +2847,10 @@ fn test_server_effective_timeouts() {
     };
 
     assert_eq!(server_with_override.effective_connect_timeout(&global), 20);
-    assert_eq!(server_with_override.effective_execute_timeout(&global), 60); // global default
+    assert_eq!(
+        server_with_override.effective_execute_timeout(&global),
+        1800
+    ); // global default
     assert_eq!(server_with_override.effective_read_timeout(&global), 180);
 }
 
@@ -2923,6 +2926,21 @@ impl McpTransport for ScriptedThenHangingTransport {
             Some(response) => Ok(response),
             None => std::future::pending().await,
         }
+    }
+}
+
+/// A transport that answers inside `send`, as Streamable HTTP reads the reply
+/// within the POST, and never finishes that send.
+struct HangingSendTransport;
+
+#[async_trait::async_trait]
+impl McpTransport for HangingSendTransport {
+    async fn send(&mut self, _msg: Vec<u8>) -> Result<()> {
+        std::future::pending().await
+    }
+
+    async fn recv(&mut self) -> Result<Vec<u8>> {
+        std::future::pending().await
     }
 }
 
@@ -3088,6 +3106,126 @@ IFS= read -r keep_open
 
 fn json_frame(value: serde_json::Value) -> Vec<u8> {
     serde_json::to_vec(&value).unwrap()
+}
+
+#[test]
+fn http_request_ceiling_covers_the_execute_budget() {
+    let mut config = test_server_config();
+    config.execute_timeout = Some(1800);
+    config.read_timeout = Some(120);
+    let global = McpTimeouts {
+        connect_timeout: 10,
+        execute_timeout: 1800,
+        read_timeout: 120,
+    };
+    assert_eq!(http_request_ceiling_secs(&config, &global), 1800);
+
+    // A per-server read knob above both stays intact.
+    config.read_timeout = Some(3600);
+    assert_eq!(http_request_ceiling_secs(&config, &global), 3600);
+}
+
+/// A transport that stays silent for a fixed delay, then answers with a
+/// matching result — the shape of an MCP server executing a long tool call.
+struct DelayedResponseTransport {
+    delay: Duration,
+    pending: Option<Vec<u8>>,
+}
+
+#[async_trait::async_trait]
+impl McpTransport for DelayedResponseTransport {
+    async fn send(&mut self, msg: Vec<u8>) -> Result<()> {
+        // Echo the request id so every call gets its matching response.
+        let request: serde_json::Value = serde_json::from_slice(&msg)?;
+        let response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": request["id"].clone(),
+            "result": {"ok": true}
+        });
+        self.pending = Some(json_frame(response));
+        Ok(())
+    }
+
+    async fn recv(&mut self) -> Result<Vec<u8>> {
+        tokio::time::sleep(self.delay).await;
+        self.pending.take().context("delayed transport exhausted")
+    }
+}
+
+#[tokio::test]
+async fn a_tool_response_after_the_read_knob_still_completes_within_the_execute_budget() {
+    let mut connection = test_connection(Box::new(DelayedResponseTransport {
+        // The response arrives after the read knob (1s) but well inside the
+        // execute budget (30s): the read knob must not bound a request's
+        // receive and mark the connection dead before the reply lands.
+        delay: Duration::from_millis(1500),
+        pending: None,
+    }));
+    connection.read_timeout_secs = 1;
+    let result = connection
+        .call_tool("slow", serde_json::json!({}), 30)
+        .await
+        .expect("a silent tool execution must not be cut off by the read knob");
+    assert_eq!(result, serde_json::json!({"ok": true}));
+    assert!(
+        connection.is_ready(),
+        "a completed call keeps the connection"
+    );
+}
+
+/// A wedged server fails a request at the request's own budget, and the
+/// request is abandoned, not the connection: its late reply carries the
+/// abandoned id and is skipped (see the stdio fixtures below). The read knob
+/// (1s) and the budget (2s) are distinct on purpose: equal deadlines used to
+/// race, and whichever timer won decided whether the connection survived.
+/// The per-frame read-knob disconnect is still pinned for the handshake by
+/// `recv_times_out_waiting_for_mcp_response_and_disconnects`.
+#[tokio::test]
+async fn a_wedged_request_fails_at_its_own_budget_and_keeps_the_connection() {
+    let mut connection = test_connection(Box::new(HangingValueTransport {
+        sent: Arc::new(Mutex::new(Vec::new())),
+    }));
+    connection.read_timeout_secs = 1;
+    let error = connection
+        .read_resource("file:///wedged", 2)
+        .await
+        .expect_err("a wedged server must fail the request at its budget");
+    assert!(
+        error
+            .to_string()
+            .contains("MCP method 'resources/read' on server 'mock' timed out after 2s"),
+        "the request budget, not the read knob, must end the request: {error:#}"
+    );
+    assert!(
+        connection.is_ready(),
+        "an expired request must not declare the connection dead"
+    );
+}
+
+/// A request whose transport blocks inside `send` (Streamable HTTP) still
+/// ends at its own budget, not at the transport's larger client ceiling, and
+/// the connection is rebuilt because the abandoned write may be partial.
+#[tokio::test]
+async fn a_request_blocked_inside_send_ends_at_its_own_budget() {
+    let mut connection = test_connection(Box::new(HangingSendTransport));
+    connection.read_timeout_secs = 30;
+    let error = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        connection.read_resource("file:///wedged-post", 1),
+    )
+    .await
+    .expect("the request budget, not the transport, must end a blocked send")
+    .expect_err("a POST that never completes must end at the request budget");
+    assert!(
+        error
+            .to_string()
+            .contains("MCP method 'resources/read' on server 'mock' timed out after 1s"),
+        "{error:#}"
+    );
+    assert!(
+        !connection.is_ready(),
+        "a send abandoned mid-write leaves the frame boundary unknown, so the connection is rebuilt"
+    );
 }
 
 #[tokio::test]
@@ -9136,6 +9274,253 @@ async fn json_rpc_session_error_on_tool_call_is_not_replayed() {
         serde_json::json!({ "content": [{ "type": "text", "text": "ok" }] })
     );
     assert_eq!(server_call_count(&call_log), 2);
+}
+
+/// A sequential stdio server for the `tools/call` deadline fixtures. Every
+/// `initialize` appends `init <pid>` to `$INIT_LOG`, so a test can tell a
+/// reused connection from a rebuilt one; every `tools/call` appends
+/// `<tool> <id>` to `$CALL_LOG` before it runs, and its reply text is that
+/// same line, so a test can tell which request a reply answers. `slow` sleeps
+/// `$SLOW_SECS` before replying, `hang` never replies, `fast` replies at once.
+#[cfg(unix)]
+const DEADLINE_STDIO_SERVER: &str = r#"#!/bin/sh
+while IFS= read -r line; do
+    id=$(printf '%s\n' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+    case "$line" in
+        *'"method":"notifications/'*)
+            ;;
+        *'"method":"initialize"'*)
+            echo "init $$" >> "$INIT_LOG"
+            printf '{"jsonrpc":"2.0","id":"%s","result":{"protocolVersion":"2024-11-05","serverInfo":{"name":"deadline","version":"1.0.0"},"capabilities":{"tools":{}}}}\n' "$id"
+            ;;
+        *'"method":"tools/list"'*)
+            printf '{"jsonrpc":"2.0","id":"%s","result":{"tools":[{"name":"slow","inputSchema":{"type":"object"}},{"name":"fast","inputSchema":{"type":"object"}},{"name":"hang","inputSchema":{"type":"object"}}]}}\n' "$id"
+            ;;
+        *'"method":"tools/call"'*)
+            tool=$(printf '%s\n' "$line" | sed -n 's/.*"name":"\([^"]*\)".*/\1/p')
+            echo "$tool $id" >> "$CALL_LOG"
+            case "$tool" in
+                slow) sleep "$SLOW_SECS" ;;
+                hang) while :; do sleep 0.05; done ;;
+            esac
+            printf '{"jsonrpc":"2.0","id":"%s","result":{"content":[{"type":"text","text":"%s %s"}]}}\n' "$id" "$tool" "$id"
+            ;;
+        *)
+            [ -n "$id" ] && printf '{"jsonrpc":"2.0","id":"%s","result":{}}\n' "$id"
+            ;;
+    esac
+done
+"#;
+
+/// A pool with one `deadline` stdio server; returns it with the call and
+/// init log paths.
+#[cfg(unix)]
+fn deadline_stdio_pool(
+    dir: &Path,
+    slow_secs: &str,
+    configure: impl FnOnce(&mut McpServerConfig),
+) -> (McpPool, PathBuf, PathBuf) {
+    let script = dir.join("server.sh");
+    fs::write(&script, DEADLINE_STDIO_SERVER).unwrap();
+    let call_log = dir.join("calls.log");
+    let init_log = dir.join("inits.log");
+    let mut server = test_server_config();
+    server.command = Some("sh".to_string());
+    server.args = vec![script.to_string_lossy().into_owned()];
+    for (key, value) in [
+        ("CALL_LOG", call_log.to_string_lossy().into_owned()),
+        ("INIT_LOG", init_log.to_string_lossy().into_owned()),
+        ("SLOW_SECS", slow_secs.to_string()),
+    ] {
+        server.env.insert(key.to_string(), value);
+    }
+    configure(&mut server);
+    let mut cfg = McpConfig::default();
+    cfg.servers.insert("deadline".to_string(), server);
+    (McpPool::new(cfg), call_log, init_log)
+}
+
+#[cfg(unix)]
+fn log_lines(path: &Path) -> Vec<String> {
+    fs::read_to_string(path)
+        .map(|log| log.lines().map(str::to_string).collect())
+        .unwrap_or_default()
+}
+
+/// The result `DEADLINE_STDIO_SERVER` returns for the call it logged as `call`.
+#[cfg(unix)]
+fn deadline_reply(call: &str) -> serde_json::Value {
+    serde_json::json!({ "content": [{ "type": "text", "text": call }] })
+}
+
+/// #6741 over a real stdio child: a `tools/call` whose reply arrives after
+/// the read knob — the receive budget every request used to get — but inside
+/// the execute budget completes, and the next call on the same connection gets
+/// its own reply. The late frame is consumed once, by the request it answers;
+/// nothing is replayed and the child is not restarted.
+#[cfg(unix)]
+#[tokio::test]
+async fn stdio_tool_reply_after_the_read_knob_completes_within_the_execute_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut pool, call_log, init_log) = deadline_stdio_pool(dir.path(), "3", |server| {
+        server.read_timeout = Some(1);
+        server.execute_timeout = Some(30);
+    });
+
+    let started = std::time::Instant::now();
+    let slow = pool
+        .call_tool("mcp_deadline_slow", serde_json::json!({}))
+        .await
+        .expect("a reply inside the execute budget must not be cut off at the read knob");
+    assert!(
+        started.elapsed() >= Duration::from_secs(3),
+        "the reply must really have outlived the 1s read knob"
+    );
+    let fast = pool
+        .call_tool("mcp_deadline_fast", serde_json::json!({}))
+        .await
+        .expect("the next call on the same connection must get its own reply");
+
+    let calls = log_lines(&call_log);
+    assert_eq!(calls.len(), 2, "neither call may be replayed: {calls:?}");
+    assert!(calls[0].starts_with("slow ") && calls[1].starts_with("fast "));
+    assert_eq!(slow, deadline_reply(&calls[0]));
+    assert_eq!(fast, deadline_reply(&calls[1]));
+    assert_eq!(
+        log_lines(&init_log).len(),
+        1,
+        "both calls must share one connection and child"
+    );
+}
+
+/// An explicit `execute_timeout` shorter than the read knob still governs a
+/// real stdio `tools/call`: the call fails at its own 2s budget, not at the
+/// 120s read knob or the 1800s default. The request is abandoned, not the
+/// connection: the child's late reply to it reaches the pipe ahead of the
+/// next call's reply and is skipped, so the next call gets its own reply on
+/// the same child.
+#[cfg(unix)]
+#[tokio::test]
+async fn explicit_shorter_execute_budget_ends_a_stdio_tool_call_and_skips_its_late_reply() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut pool, call_log, init_log) = deadline_stdio_pool(dir.path(), "3", |server| {
+        server.execute_timeout = Some(2);
+    });
+    pool.get_or_connect("deadline").await.unwrap();
+
+    let started = std::time::Instant::now();
+    let error = pool
+        .call_tool("mcp_deadline_slow", serde_json::json!({}))
+        .await
+        .expect_err("an explicit shorter budget must end the call");
+    let elapsed = started.elapsed();
+    assert!(
+        format!("{error:#}")
+            .contains("MCP method 'tools/call' on server 'deadline' timed out after 2s"),
+        "unexpected error: {error:#}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "the explicit budget, not the 3s reply, must end the call: {elapsed:?}"
+    );
+
+    let fast = pool
+        .call_tool("mcp_deadline_fast", serde_json::json!({}))
+        .await
+        .expect("the kept connection must answer the next call");
+    let calls = log_lines(&call_log);
+    assert_eq!(calls.len(), 2, "neither call may be replayed: {calls:?}");
+    assert!(calls[0].starts_with("slow ") && calls[1].starts_with("fast "));
+    assert_eq!(
+        fast,
+        deadline_reply(&calls[1]),
+        "the abandoned call's late reply must not answer the next call"
+    );
+    assert_eq!(
+        log_lines(&init_log).len(),
+        1,
+        "an expired request must not rebuild the connection"
+    );
+}
+
+/// Owned cancellation of an in-flight stdio `tools/call` under the default
+/// 1800s execute budget: cancelling the connection's own token ends the call
+/// promptly instead of waiting out the budget, and marks the connection dead.
+/// The next call rebuilds it on a fresh child, the cancelled call's child is
+/// terminated rather than left running, and the cancelled call is not replayed.
+#[cfg(unix)]
+#[tokio::test]
+async fn cancelling_an_inflight_stdio_tool_call_does_not_wait_for_the_execute_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut pool, call_log, init_log) = deadline_stdio_pool(dir.path(), "0", |_| {});
+    assert_eq!(
+        pool.config.servers["deadline"].effective_execute_timeout(&pool.config.timeouts),
+        1800,
+        "the fixture must run under the default execute budget"
+    );
+    pool.get_or_connect("deadline").await.unwrap();
+    let cancel = pool.connections["deadline"].cancel_token.clone();
+
+    let call = tokio::spawn(async move {
+        let result = pool
+            .call_tool("mcp_deadline_hang", serde_json::json!({}))
+            .await;
+        (pool, result)
+    });
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while log_lines(&call_log).is_empty() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the child never received the call");
+
+    cancel.cancel();
+    let (mut pool, result) = tokio::time::timeout(Duration::from_secs(5), call)
+        .await
+        .expect("cancellation must not wait for the execute budget")
+        .expect("the call task panicked");
+    let error = result.expect_err("a cancelled call must not report success");
+    assert!(
+        format!("{error:#}").contains("MCP connection 'deadline' was cancelled"),
+        "unexpected error: {error:#}"
+    );
+    assert!(
+        pool.connected_servers().is_empty(),
+        "a cancelled connection must not be reused"
+    );
+
+    let fast = pool
+        .call_tool("mcp_deadline_fast", serde_json::json!({}))
+        .await
+        .expect("the next call must rebuild the connection");
+    let calls = log_lines(&call_log);
+    assert_eq!(
+        calls.len(),
+        2,
+        "the cancelled call must not be replayed: {calls:?}"
+    );
+    assert!(calls[0].starts_with("hang ") && calls[1].starts_with("fast "));
+    assert_eq!(fast, deadline_reply(&calls[1]));
+
+    let inits = log_lines(&init_log);
+    assert_eq!(
+        inits.len(),
+        2,
+        "the next call must run on a fresh child: {inits:?}"
+    );
+    let cancelled_pid: i32 = inits[0]
+        .strip_prefix("init ")
+        .and_then(|pid| pid.parse().ok())
+        .expect("the init log records the child pid");
+    tokio::time::timeout(STDIO_SHUTDOWN_GRACE + Duration::from_secs(1), async {
+        // SAFETY: signal zero only checks whether the pid still exists.
+        while unsafe { libc::kill(cancelled_pid, 0) } == 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the cancelled call's child must be terminated, not left running");
 }
 
 /// A Streamable HTTP server that reads the whole `tools/call` POST and then

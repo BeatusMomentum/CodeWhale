@@ -7,6 +7,9 @@
 
 use std::path::{Path, PathBuf};
 
+mod session_structcopy;
+pub use session_structcopy::*;
+
 mod debug_operations;
 pub mod debug_receipts;
 pub use debug_operations::*;
@@ -17,7 +20,7 @@ mod diagnostics_tools;
 pub use diagnostics_report::*;
 pub use diagnostics_tools::*;
 
-use codewhale_core::request::{Message, SystemPrompt};
+use codewhale_protocol::request::{Message, SystemPrompt};
 use serde_json::Value;
 
 use crate::types::{CommandApprovalMode, CommandCurrency, CommandMode, CommandProviderId};
@@ -1274,11 +1277,9 @@ pub trait CommandSkillGroupContext {
 // the handlers retain exact message composition (D2/D5).
 // ---------------------------------------------------------------------------
 
-/// Portable synchronization fields a lifecycle handler maps into the
-/// temporary `SyncSession` action payload. The conversation and prompt types
-/// are `codewhale-core` request types shared by the contract and the TUI
-/// (FEAT-037 will move shared outcome ownership; FEAT-023 keeps the bounded
-/// reference only for `/fork` and `/new` transitions, D6).
+/// Portable synchronization fields carried by shared session and debug actions.
+/// Conversation and prompt types are protocol-owned shapes; concrete runtime
+/// state and host action conversion remain outside the command contract.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SessionSyncPayload {
     pub session_id: Option<String>,

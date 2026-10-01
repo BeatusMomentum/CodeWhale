@@ -905,6 +905,8 @@ pub(crate) async fn spawned_dispatch_inner(
         hook_executor: prepare.hook_executor.clone(),
         verbosity: prepare.verbosity.clone(),
         provenance: prepare.provenance,
+        // Interactive TUI submissions do not correlate submissions.
+        submission_id: None,
     });
     // Reserve capacity off the render thread, but do not let Engine start
     // until the completion callback has installed the UI's acceptance state.

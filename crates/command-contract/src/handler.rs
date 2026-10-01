@@ -10,8 +10,8 @@ use crate::facets::{
     CommandDebugUndoContext, CommandMediaContext, CommandMemoryContext, CommandModePolicyContext,
     CommandModelContext, CommandPluginContext, CommandPresentationContext, CommandProjectContext,
     CommandSessionContext, CommandSessionControlContext, CommandSessionExportContext,
-    CommandSessionLifecycleContext, CommandSkillGroupContext, CommandSkillsContext,
-    CommandSystemPromptContext, CommandWorkspaceContext,
+    CommandSessionLifecycleContext, CommandSessionStructcopyContext, CommandSkillGroupContext,
+    CommandSkillsContext, CommandSystemPromptContext, CommandWorkspaceContext,
 };
 
 /// Exact host capabilities exposed to one contextual command handler.
@@ -79,6 +79,9 @@ impl CommandCapabilities {
     /// Debug undo authority; independent from diagnostics and other debug operations.
     pub const DEBUG_UNDO: Self = Self(1 << 21);
 
+    /// One human-selected structural copy; independent from export/recovery.
+    pub const SESSION_STRUCTCOPY: Self = Self(1 << 22);
+
     /// Raw bit pattern, for tests that pin the capability-space capacity.
     ///
     /// Kept `#[cfg(test)]` so the `u32` backing stays an implementation detail
@@ -137,6 +140,7 @@ pub struct CommandContexts<'a> {
     lifecycle: Option<&'a mut dyn CommandSessionLifecycleContext>,
     control: Option<&'a mut dyn CommandSessionControlContext>,
     export: Option<&'a mut dyn CommandSessionExportContext>,
+    structcopy: Option<&'a mut dyn CommandSessionStructcopyContext>,
     debug_receipts: Option<&'a mut dyn CommandDebugReceiptsContext>,
     debug_change: Option<&'a mut dyn CommandDebugChangeContext>,
     debug_history: Option<&'a mut dyn CommandDebugHistoryContext>,
@@ -163,6 +167,7 @@ pub struct ContextParts<'a> {
     pub lifecycle: Option<&'a mut dyn CommandSessionLifecycleContext>,
     pub control: Option<&'a mut dyn CommandSessionControlContext>,
     pub export: Option<&'a mut dyn CommandSessionExportContext>,
+    pub structcopy: Option<&'a mut dyn CommandSessionStructcopyContext>,
     pub debug_receipts: Option<&'a mut dyn CommandDebugReceiptsContext>,
     pub debug_change: Option<&'a mut dyn CommandDebugChangeContext>,
     pub debug_history: Option<&'a mut dyn CommandDebugHistoryContext>,
@@ -190,6 +195,7 @@ impl<'a> CommandContexts<'a> {
             lifecycle: None,
             control: None,
             export: None,
+            structcopy: None,
             debug_receipts: None,
             debug_change: None,
             debug_history: None,
@@ -217,6 +223,7 @@ impl<'a> CommandContexts<'a> {
             lifecycle: self.lifecycle,
             control: self.control,
             export: self.export,
+            structcopy: self.structcopy,
             debug_receipts: self.debug_receipts,
             debug_change: self.debug_change,
             debug_history: self.debug_history,
@@ -339,6 +346,14 @@ impl<'a> CommandContexts<'a> {
         assert!(
             self.control.replace(value).is_none(),
             "control facet already set"
+        );
+        self
+    }
+
+    pub fn with_structcopy(mut self, value: &'a mut dyn CommandSessionStructcopyContext) -> Self {
+        assert!(
+            self.structcopy.replace(value).is_none(),
+            "structcopy facet already set"
         );
         self
     }

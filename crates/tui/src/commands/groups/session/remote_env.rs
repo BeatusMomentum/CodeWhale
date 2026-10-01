@@ -109,7 +109,7 @@ fn open_hosted_work(
     };
     CommandResult::with_message_and_action(
         message,
-        crate::tui::app::AppAction::OpenExternalUrl {
+        codewhale_command_contract::outcome::SessionAction::OpenExternalUrl {
             url: target.url,
             label,
         },
@@ -195,7 +195,7 @@ mod tests {
         );
         assert!(matches!(
             result.action,
-            Some(crate::tui::app::AppAction::OpenExternalUrl { ref url, ref label })
+            Some(codewhale_command_contract::outcome::SessionAction::OpenExternalUrl { ref url, ref label })
                 if url == "https://app.codewhale.net/work?repo=A%2FB&branch=main" && label == "Label"
         ));
         assert_eq!(

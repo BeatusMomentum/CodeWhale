@@ -130,14 +130,14 @@
   "crates/tui/src/commands/groups/project/init.rs": {
     "std_fs": 13
   },
-  "crates/tui/src/commands/groups/session/structcopy.rs": {
-    "path_canonicalize": 1
-  },
   "crates/tui/src/commands/session_acceptance.rs": {
     "std_fs": 6
   },
   "crates/tui/src/commands/session_export_host.rs": {
     "std_fs": 4
+  },
+  "crates/tui/src/commands/session_structcopy_host.rs": {
+    "path_canonicalize": 1
   },
   "crates/tui/src/commands/user_commands.rs": {
     "std_fs": 5

@@ -30,6 +30,7 @@ name = "codewhale-tui"
 path = "src/main.rs"
 
 [dependencies]
+codewhale-sanitize = { path = "../sanitize", version = "0.10.1" }
 codewhale-memory = { path = "../memory", version = "0.10.1" }
 ahash = "0.8"
 anyhow.workspace = true
@@ -107,6 +108,8 @@ unicode-width = "0.2"
 unicode-segmentation = "1.12"
 unicode-normalization = "0.1"
 urlencoding = "2.1"
+# Structcopy uses the URL parser directly so its portable closure needs no HTTP client.
+url = "2.5"
 uuid.workspace = true
 chrono.workspace = true
 tempfile.workspace = true

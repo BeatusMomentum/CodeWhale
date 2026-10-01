@@ -65,8 +65,8 @@ pub(in crate::commands) fn remote_control_portable(
                 } else {
                     "Starting account-owned web remote control…"
                 },
-                crate::tui::app::AppAction::RemoteControl(
-                    crate::remote_control::RemoteControlAction::Start,
+                codewhale_command_contract::outcome::SessionAction::RemoteControl(
+                    codewhale_command_contract::outcome::SessionRemoteControlAction::Start,
                 ),
             )
         }
@@ -100,8 +100,8 @@ pub(in crate::commands) fn remote_control_portable(
             }
             CommandResult::with_message_and_action(
                 "Stopping web remote control…",
-                crate::tui::app::AppAction::RemoteControl(
-                    crate::remote_control::RemoteControlAction::Stop,
+                codewhale_command_contract::outcome::SessionAction::RemoteControl(
+                    codewhale_command_contract::outcome::SessionRemoteControlAction::Stop,
                 ),
             )
         }
@@ -141,9 +141,11 @@ mod tests {
             );
             assert!(matches!(
                 result.action,
-                Some(crate::tui::app::AppAction::RemoteControl(
-                    crate::remote_control::RemoteControlAction::Start
-                ))
+                Some(
+                    codewhale_command_contract::outcome::SessionAction::RemoteControl(
+                        codewhale_command_contract::outcome::SessionRemoteControlAction::Start
+                    )
+                )
             ));
         }
         fake.start_info = Some(RemoteStartInfo { connecting: false });
@@ -260,9 +262,11 @@ mod tests {
         assert!(!stopped.is_error);
         assert!(matches!(
             stopped.action,
-            Some(crate::tui::app::AppAction::RemoteControl(
-                crate::remote_control::RemoteControlAction::Stop
-            ))
+            Some(
+                codewhale_command_contract::outcome::SessionAction::RemoteControl(
+                    codewhale_command_contract::outcome::SessionRemoteControlAction::Stop
+                )
+            )
         ));
 
         let unknown = remote_control_portable(&mut fake, Some("frobnicate"));

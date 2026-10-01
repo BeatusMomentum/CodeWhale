@@ -385,6 +385,10 @@ fn compaction_to_wire(config: &CompactionConfig) -> wire_op::CompactionPolicy {
 /// fields (`initial_routed_usage`, `hook_executor`) and resolved routes are
 /// stripped; only their non-secret receipts cross.
 fn turn_spec_to_wire(spec: &crate::core::ops::TurnSpec) -> wire_op::TurnSpec {
+    // `spec.submission_id` is deliberately not projected: the token is
+    // host-process-local by design and the wire op has no correlation twin,
+    // so wire submitters observe `TurnStarted.submission_id` always absent
+    // and cannot correlate submissions on that channel.
     wire_op::TurnSpec {
         max_output_tokens: spec.max_output_tokens,
         content: spec.content.clone(),
@@ -541,12 +545,14 @@ pub fn event_to_protocol(event: &Event, ids: &ProtocolIds) -> wire::EventMsg {
             turn_id,
             created_at,
             route,
+            submission_id,
         } => wire::EventMsg::TurnStarted {
             thread_id,
             session_id,
             turn_id: turn_id.clone(),
             created_at: *created_at,
             route: route.as_ref().map(route_to_wire),
+            submission_id: submission_id.clone(),
         },
         Event::ToolRequestSnapshot { snapshot } => wire::EventMsg::ToolRequestSnapshot {
             thread_id,
@@ -1191,7 +1197,10 @@ pub fn op_to_protocol(op: &Op) -> wire_op::Op {
             config_path: config_path.clone(),
         },
         Op::PurgeContext => wire_op::Op::PurgeContext,
-        Op::EditLastTurn { new_message } => wire_op::Op::EditLastTurn {
+        Op::EditLastTurn {
+            new_message,
+            submission_id: _,
+        } => wire_op::Op::EditLastTurn {
             new_message: new_message.clone(),
         },
         Op::SetAdvisorEnabled { enabled } => wire_op::Op::SetAdvisorEnabled { enabled: *enabled },
@@ -1451,6 +1460,9 @@ mod tests {
                 turn_id: "turn-1".into(),
                 created_at: chrono::Utc::now(),
                 route: None,
+                // A host-stamped token, not `None`: the projection must carry
+                // it verbatim or the assertion on `events[7]` below fails.
+                submission_id: Some("sub-host-1".into()),
             },
             Event::TurnComplete {
                 usage: usage.clone(),
@@ -1548,6 +1560,13 @@ mod tests {
         assert_eq!(
             serde_json::to_value(events[6].to_protocol(&ids)).unwrap()["result"],
             json!({"outcome": "err", "error": {"kind": "timeout", "seconds": 9}})
+        );
+        // The host correlation token must cross the projection verbatim: the
+        // app forwarder binds its submit-window actions to this echo, so a
+        // silently dropped mapping would defeat the contract.
+        assert_eq!(
+            serde_json::to_value(events[7].to_protocol(&ids)).unwrap()["submission_id"],
+            json!("sub-host-1")
         );
         assert_eq!(
             serde_json::to_value(events[8].to_protocol(&ids)).unwrap()["status"],
@@ -1647,6 +1666,7 @@ mod tests {
             Op::PurgeContext,
             Op::EditLastTurn {
                 new_message: "again".into(),
+                submission_id: None,
             },
             Op::SetAdvisorEnabled { enabled: true },
             Op::GetSubAgentSettlement {

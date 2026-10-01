@@ -1979,6 +1979,7 @@ async fn exact_turn_snapshot_restores_custom_endpoint_and_turn_receipt_after_bui
             hook_executor: None,
             verbosity: None,
             provenance: UserInputProvenance::ExternalUser,
+            submission_id: None,
         }))
         .await
         .expect("send exact custom turn");
@@ -2155,6 +2156,7 @@ async fn main_turn_dispatch_freezes_declared_custom_model_rate() {
             hook_executor: None,
             verbosity: None,
             provenance: UserInputProvenance::ExternalUser,
+            submission_id: None,
         }))
         .await
         .expect("send declared custom turn");
@@ -2470,6 +2472,7 @@ async fn goal_continuation_preserves_goal_and_resolves_updated_authoritative_rou
             hook_executor: None,
             verbosity: None,
             provenance: UserInputProvenance::ExternalUser,
+            submission_id: None,
         }))
         .await
         .expect("send first goal turn");
@@ -2752,6 +2755,7 @@ async fn saturated_mailbox_does_not_deadlock_goal_continuation_self_dispatch() {
             hook_executor: None,
             verbosity: None,
             provenance: UserInputProvenance::ExternalUser,
+            submission_id: None,
         }))
         .await
         .expect("send saturated goal turn");
@@ -2884,6 +2888,7 @@ async fn queued_ordinary_turn_does_not_multiply_engine_goal_continuations() {
             hook_executor: None,
             verbosity: None,
             provenance: UserInputProvenance::ExternalUser,
+            submission_id: None,
         })
     };
 
@@ -4171,6 +4176,7 @@ async fn cross_turn_token_budget_exhaustion_does_not_pause_goal() {
             hook_executor: None,
             verbosity: None,
             provenance: UserInputProvenance::ExternalUser,
+            submission_id: None,
         }))
         .await
         .expect("send budgeted goal turn");
@@ -4631,6 +4637,7 @@ async fn ordinary_prose_never_activates_a_goal() {
             hook_executor: None,
             verbosity: None,
             provenance: UserInputProvenance::ExternalUser,
+            submission_id: None,
         }))
         .await
         .expect("send explicit natural goal turn");
@@ -4731,6 +4738,7 @@ async fn operate_goal_probe(mode: AppMode, prompt: &str) -> (Option<String>, boo
             hook_executor: None,
             verbosity: None,
             provenance: UserInputProvenance::ExternalUser,
+            submission_id: None,
         }))
         .await
         .expect("send probe turn");
@@ -4916,6 +4924,7 @@ async fn operate_contract_is_appended_once_and_an_existing_goal_is_never_replace
             hook_executor: None,
             verbosity: None,
             provenance: UserInputProvenance::ExternalUser,
+            submission_id: None,
         })
     };
 
@@ -5745,6 +5754,7 @@ async fn host_managed_engine_does_not_self_dispatch_goal_continuation() {
             hook_executor: None,
             verbosity: None,
             provenance: UserInputProvenance::ExternalUser,
+            submission_id: None,
         }))
         .await
         .expect("send host-owned goal turn");
@@ -6021,6 +6031,7 @@ async fn host_managed_engine_defers_idle_subagent_completion_to_explicit_turn() 
             hook_executor: None,
             verbosity: None,
             provenance: UserInputProvenance::ExternalUser,
+            submission_id: None,
         }))
         .await
         .expect("send explicit host turn");
@@ -6051,6 +6062,127 @@ async fn host_managed_engine_defers_idle_subagent_completion_to_explicit_turn() 
 
     handle.send(Op::Shutdown).await.expect("shutdown engine");
     run_task.await.expect("engine task");
+}
+
+/// A host-submitted turn echoes the correlation token it was submitted with,
+/// while a runtime self-started turn (idle sub-agent completion resume) never
+/// carries one. With this contract a host can tell "my pending submission
+/// started" apart from "an autonomous follow-up overtook it in the event
+/// stream" and only ever consume a deferred submit-window action on the
+/// former.
+#[tokio::test]
+async fn turn_started_echoes_submission_id_and_self_starts_stay_none() {
+    use crate::llm_client::mock::{MockLlmClient, canned};
+    use crate::tools::subagent::SubAgentCompletion;
+
+    let workspace = tempdir().unwrap();
+    let config = Config::default();
+    let mock = Arc::new(MockLlmClient::new(vec![
+        canned::simple_text_turn("submitted turn finished."),
+        canned::simple_text_turn("self-started continuation finished."),
+    ]));
+    let (engine, handle) = Engine::new_with_model_client(
+        deterministic_engine_config(workspace.path()),
+        &config,
+        mock.clone(),
+    );
+    let owner_session_id = engine.session.id.clone();
+    let completion_tx = engine.tx_subagent_completion.clone();
+    let mut op = external_user_message_op("Watch the child agent.", AppMode::Agent, &config);
+    if let Op::SendMessage(TurnSpec { submission_id, .. }) = &mut op {
+        *submission_id = Some("sub-host-1".to_string());
+    }
+    let run_task = tokio::spawn(engine.run());
+    handle.send(op).await.expect("send correlated turn");
+
+    // The submitted turn's start echoes the token verbatim.
+    let submitted_turn_id = {
+        let mut rx = handle.rx_event.write().await;
+        loop {
+            let event = tokio::time::timeout(model_turn_event_timeout(), rx.recv())
+                .await
+                .expect("timed out waiting for the submitted turn")
+                .expect("engine event");
+            if let Event::TurnStarted {
+                turn_id,
+                submission_id,
+                ..
+            } = event
+            {
+                assert_eq!(
+                    submission_id.as_deref(),
+                    Some("sub-host-1"),
+                    "the submitted turn's TurnStarted must echo its correlation token"
+                );
+                break turn_id;
+            }
+        }
+    };
+    {
+        let mut rx = handle.rx_event.write().await;
+        loop {
+            let event = tokio::time::timeout(model_turn_event_timeout(), rx.recv())
+                .await
+                .expect("timed out waiting for the submitted turn to complete")
+                .expect("engine event");
+            if let Event::TurnComplete { status, error, .. } = event {
+                assert_eq!(status, TurnOutcomeStatus::Completed, "{error:?}");
+                break;
+            }
+        }
+    }
+
+    // An idle child completion self-starts the follow-up without any host
+    // submission; its start must not present a token.
+    completion_tx
+        .try_send(SubAgentCompletion {
+            owner_session_id,
+            agent_id: "idle-child".to_string(),
+            payload: "child finished its work".to_string(),
+        })
+        .expect("inject idle sub-agent completion");
+    {
+        let mut rx = handle.rx_event.write().await;
+        loop {
+            let event = tokio::time::timeout(model_turn_event_timeout(), rx.recv())
+                .await
+                .expect("timed out waiting for the self-started turn")
+                .expect("engine event");
+            if let Event::TurnStarted {
+                turn_id,
+                submission_id,
+                ..
+            } = event
+            {
+                assert_ne!(
+                    turn_id, submitted_turn_id,
+                    "the idle child completion must self-start a new turn"
+                );
+                assert!(
+                    submission_id.is_none(),
+                    "a runtime self-started turn must not present a submission id"
+                );
+                break;
+            }
+        }
+    }
+    {
+        let mut rx = handle.rx_event.write().await;
+        loop {
+            let event = tokio::time::timeout(model_turn_event_timeout(), rx.recv())
+                .await
+                .expect("timed out waiting for the self-started turn to complete")
+                .expect("engine event");
+            if let Event::TurnComplete { status, error, .. } = event {
+                assert_eq!(status, TurnOutcomeStatus::Completed, "{error:?}");
+                break;
+            }
+        }
+    }
+
+    handle.send(Op::Shutdown).await.expect("shutdown engine");
+    run_task.await.expect("engine task");
+    assert_eq!(mock.call_count(), 2);
 }
 
 #[test]
@@ -7947,6 +8079,7 @@ fn active_goal_message_op(
         hook_executor: None,
         verbosity: None,
         provenance: UserInputProvenance::ExternalUser,
+        submission_id: None,
     })
 }
 
@@ -7986,6 +8119,7 @@ fn external_user_message_op(content: &str, mode: AppMode, config: &Config) -> Op
         hook_executor: None,
         verbosity: None,
         provenance: UserInputProvenance::ExternalUser,
+        submission_id: None,
     })
 }
 
@@ -8014,6 +8148,7 @@ fn auto_review_message_op(content: &str, config: &Config) -> Op {
         hook_executor: None,
         verbosity: None,
         provenance: UserInputProvenance::ExternalUser,
+        submission_id: None,
     })
 }
 
@@ -14603,6 +14738,7 @@ async fn deferred_tool_first_use_does_not_emit_a_retry_status() {
             hook_executor: None,
             verbosity: None,
             provenance: UserInputProvenance::ExternalUser,
+            submission_id: None,
         }))
         .await
         .expect("send model turn");
@@ -15386,6 +15522,7 @@ async fn operate_model_shell_uses_normal_approval_and_workspace_sandbox() {
             hook_executor: None,
             verbosity: None,
             provenance: UserInputProvenance::ExternalUser,
+            submission_id: None,
         }))
         .await
         .expect("send Operate model turn");
@@ -15541,6 +15678,7 @@ async fn posture_change_during_approval_wait(
             hook_executor: None,
             verbosity: None,
             provenance: UserInputProvenance::ExternalUser,
+            submission_id: None,
         }))
         .await
         .expect("send model turn");
@@ -15757,6 +15895,7 @@ async fn full_access_subagent_handoff_keeps_model_shell_free_of_approval_prompts
             hook_executor: None,
             verbosity: None,
             provenance: UserInputProvenance::SubAgentHandoff,
+            submission_id: None,
         }))
         .await
         .expect("send model turn");
@@ -15893,6 +16032,7 @@ async fn assert_full_access_model_tool_batch_is_blocked(
             hook_executor: None,
             verbosity: None,
             provenance: UserInputProvenance::ExternalUser,
+            submission_id: None,
         }))
         .await
         .expect("send Full Access model turn");
@@ -16100,6 +16240,7 @@ async fn assert_full_access_model_tool_batch_runs(
             hook_executor: None,
             verbosity: None,
             provenance: UserInputProvenance::ExternalUser,
+            submission_id: None,
         }))
         .await
         .expect("send Full Access model turn");
@@ -16426,6 +16567,7 @@ async fn auto_review_asks_the_user_and_returns_the_answer() {
             hook_executor: None,
             verbosity: None,
             provenance: UserInputProvenance::ExternalUser,
+            submission_id: None,
         }))
         .await
         .expect("send Auto-Review model turn");
@@ -16612,6 +16754,7 @@ async fn full_access_permission_allow_cannot_bypass_background_catastrophic_floo
             hook_executor: None,
             verbosity: None,
             provenance: UserInputProvenance::ExternalUser,
+            submission_id: None,
         }))
         .await
         .expect("send model turn");
@@ -16754,6 +16897,7 @@ async fn yolo_mode_does_not_prompt_for_background_shell() {
             hook_executor: None,
             verbosity: None,
             provenance: UserInputProvenance::ExternalUser,
+            submission_id: None,
         }))
         .await
         .expect("send model turn");
@@ -16892,6 +17036,7 @@ async fn yolo_mode_executes_publish_like_shell_without_prompt() {
             hook_executor: None,
             verbosity: None,
             provenance: UserInputProvenance::ExternalUser,
+            submission_id: None,
         }))
         .await
         .expect("send model turn");
@@ -17034,6 +17179,7 @@ async fn yolo_mode_does_not_prompt_for_mcp_action() {
             hook_executor: None,
             verbosity: None,
             provenance: UserInputProvenance::ExternalUser,
+            submission_id: None,
         }))
         .await
         .expect("send model turn");
@@ -19616,9 +19762,29 @@ async fn edit_last_turn_preserves_current_mode() {
     handle
         .send(Op::EditLastTurn {
             new_message: "revise this in plan mode".to_string(),
+            submission_id: Some("sub-edit-1".to_string()),
         })
         .await
         .expect("send edit");
+    // The replacement turn the edit replays must echo the edit's own
+    // correlation token, not the one of any earlier turn.
+    {
+        let mut rx = handle.rx_event.write().await;
+        loop {
+            let event = tokio::time::timeout(model_turn_event_timeout(), rx.recv())
+                .await
+                .expect("timed out waiting for the edited turn")
+                .expect("engine event");
+            if let Event::TurnStarted { submission_id, .. } = event {
+                assert_eq!(
+                    submission_id.as_deref(),
+                    Some("sub-edit-1"),
+                    "the edit's replacement turn must echo its correlation token"
+                );
+                break;
+            }
+        }
+    }
 
     let (tx, rx) = tokio::sync::oneshot::channel();
     handle
@@ -19743,6 +19909,7 @@ async fn edit_last_turn_cuts_at_user_prompt_before_tool_results() {
     handle
         .send(Op::EditLastTurn {
             new_message: "edited prompt".to_string(),
+            submission_id: None,
         })
         .await
         .expect("send edit");
@@ -19854,6 +20021,7 @@ async fn edit_last_turn_without_user_prompt_errors_and_sends_nothing() {
     handle
         .send(Op::EditLastTurn {
             new_message: "edited prompt".to_string(),
+            submission_id: None,
         })
         .await
         .expect("send edit");
@@ -19956,6 +20124,7 @@ async fn edit_last_turn_without_user_prompt_errors_and_sends_nothing() {
     handle
         .send(Op::EditLastTurn {
             new_message: "must not replace the older prompt".to_string(),
+            submission_id: None,
         })
         .await
         .expect("send unsupported edit");
@@ -24732,6 +24901,7 @@ async fn run_headless_turn_with_flaky_network(
             hook_executor: None,
             verbosity: None,
             provenance: UserInputProvenance::ExternalUser,
+            submission_id: None,
         }))
         .await
         .expect("send flaky-network turn");
@@ -25074,6 +25244,7 @@ async fn terminal_output_limit_followed_by_stream_error_is_charged_and_not_retri
             hook_executor: None,
             verbosity: None,
             provenance: UserInputProvenance::ExternalUser,
+            submission_id: None,
         }))
         .await
         .expect("send terminal-then-drop turn");
@@ -25181,6 +25352,7 @@ async fn midstream_error_frame_stops_the_stream_and_drops_trailing_deltas() {
             hook_executor: None,
             verbosity: None,
             provenance: UserInputProvenance::ExternalUser,
+            submission_id: None,
         }))
         .await
         .expect("send midstream-error turn");
@@ -25433,6 +25605,7 @@ async fn run_interactive_turn_with_flaky_network(
             hook_executor: None,
             verbosity: None,
             provenance: UserInputProvenance::ExternalUser,
+            submission_id: None,
         }))
         .await
         .expect("send interactive flaky-network turn");
@@ -25664,6 +25837,7 @@ async fn interactive_thinking_only_drop_preserves_nothing_and_never_claims_it_di
             hook_executor: None,
             verbosity: None,
             provenance: UserInputProvenance::ExternalUser,
+            submission_id: None,
         }))
         .await
         .expect("send thinking-only drop turn");
@@ -25894,6 +26068,7 @@ async fn run_reasoning_only_turn_with_reprompts(
             hook_executor: None,
             verbosity: None,
             provenance: UserInputProvenance::ExternalUser,
+            submission_id: None,
         }))
         .await
         .expect("send reasoning-only turn");

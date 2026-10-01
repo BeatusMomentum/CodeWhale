@@ -18115,6 +18115,7 @@ fn turn_started_route_is_captured_before_cancel_suppression() {
     let event = EngineEvent::TurnStarted {
         turn_id: "turn_cancel_race".to_string(),
         created_at,
+        submission_id: None,
         route: Some(crate::core::events::TurnRoute {
             provider: ApiProvider::Openai,
             provider_identity: "openai".to_string(),
@@ -18198,6 +18199,7 @@ fn turn_started_suggestion_authority_comes_from_the_route_receipt_not_config() {
             base_url: String::new(),
             billing_product: crate::route_billing::RouteProduct::Unproven,
         }),
+        submission_id: None,
     };
 
     capture_turn_started_metadata(&mut app, &event);
@@ -18242,6 +18244,7 @@ fn turn_started_without_a_route_receipt_captures_no_suggestion_authority() {
             base_url: String::new(),
             billing_product: crate::route_billing::RouteProduct::Unproven,
         }),
+        submission_id: None,
     };
 
     capture_turn_started_metadata(&mut app, &event);
@@ -18280,6 +18283,7 @@ fn engine_error_health_accounting_uses_active_turn_route() {
             base_url: String::new(),
             billing_product: crate::route_billing::RouteProduct::Unproven,
         }),
+        submission_id: None,
     };
     capture_turn_started_metadata(&mut app, &event);
 
@@ -27427,6 +27431,7 @@ async fn keyless_engine_error_stays_visible_after_a_config_ack() {
             hook_executor: None,
             verbosity: None,
             provenance: UserInputProvenance::ExternalUser,
+            submission_id: None,
         }))
         .await
         .expect("submit to the real Engine");

@@ -279,8 +279,8 @@ Codewhale 同时读取 `servers` 和 `mcpServers`，因此设置页生成的片�
 ```json
 {
   "timeouts": {
-    "connect_timeout": 10,
-    "execute_timeout": 60,
+    "connect_timeout": 30,
+    "execute_timeout": 1800,
     "read_timeout": 120
   },
   "servers": {
@@ -376,7 +376,12 @@ codewhale mcp tools codewhale
 - `command`（字符串，必需）
 - `args`（字符串数组，可选）
 - `env`（对象，可选）
-- `connect_timeout`、`execute_timeout`、`read_timeout`（秒，可选）。`connect_timeout` 默认为 30 秒，覆盖进程启动、`initialize` 及首次 `tools/list`，因此冷启动时 `uvx`/`npx` 下载包的时间也计入其中。
+- `connect_timeout`、`execute_timeout`、`read_timeout`（秒，可选）。服务器级的值会覆盖全局 `timeouts` 块，三个预算彼此独立：
+  - `connect_timeout`（默认 30）覆盖进程启动、`initialize` 和首次 `tools/list`，因此首次通过 `uvx`/`npx` 下载包的时间也计入其中。
+  - `execute_timeout`（默认 1800）是每次 `tools/call` 和 `prompts/get` 的预算。显式设置的更短值会被遵守，`read_timeout` 不会提前截断正在运行的工具。
+  - `read_timeout`（默认 120）限制握手和工具发现期间每次等待回复的时间，也是 `resources/read` 的预算。
+  - 请求超出预算时以超时错误失败。连接会被保留，之后迟到的回复会被丢弃，不会被交给其他调用。中断当前轮次会立即停止等待，但 Codewhale 目前还不会发送 `notifications/cancelled`，因此一次只处理一个请求的服务器会先完成被放弃的调用，再回答下一个请求。
+  - Streamable HTTP 服务器在 POST 响应中直接返回回复；该 POST 同样受请求自身时限约束。若请求在发送阶段超时，连接会被关闭，并在下一次调用前重建。
 - `disabled`（布尔值，可选）
 - `enabled`（布尔值，可选，默认 `true`）
 - `required`（布尔值，可选）：如果该服务器无法初始化，启动/连接验证会失败。
