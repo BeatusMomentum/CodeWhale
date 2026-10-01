@@ -3468,7 +3468,7 @@ fn xai_lookup_order(diagnostics: &XaiAuthDiagnostics) -> String {
 fn xai_get_line(diagnostics: &XaiAuthDiagnostics, api_key: Option<&XaiRuntimeApiKey>) -> String {
     match diagnostics.route {
         XaiAuthDiagnosticRoute::OwnedOAuth => {
-            "xai: configured (source: Codewhale-owned OAuth generation; valid pointer; storage unprobed)".to_string()
+            "xai: configured (source: Codewhale-owned OAuth generation; valid pointer; token availability unprobed)".to_string()
         }
         XaiAuthDiagnosticRoute::NeedsRepair => {
             let api_key = match api_key.and_then(XaiRuntimeApiKey::source_name) {
@@ -4185,7 +4185,7 @@ fn xai_auth_status_lines_for_provider(
         XaiOAuthGenerationPointer::Valid
             if diagnostics.route == XaiAuthDiagnosticRoute::OwnedOAuth =>
         {
-            "xAI OAuth generation: configured Codewhale-owned pointer (read for the account label only; availability not probed)"
+            "xAI OAuth generation: configured Codewhale-owned pointer (opened to read the account label only; token availability not probed)"
                 .to_string()
         }
         XaiOAuthGenerationPointer::Valid => {
@@ -9673,7 +9673,7 @@ verbosity = "concise"
         assert!(scoped.contains("external credentials: blocked by the configured Codewhale-owned xAI OAuth generation"), "{scoped}");
         assert!(
             scoped.contains(
-                "xAI OAuth generation: configured Codewhale-owned pointer (read for the account label only; availability not probed)"
+                "xAI OAuth generation: configured Codewhale-owned pointer (opened to read the account label only; token availability not probed)"
             ),
             "{scoped}"
         );
@@ -9718,6 +9718,12 @@ verbosity = "concise"
         );
         assert!(!get.starts_with("xai: set"), "{get}");
         assert!(!get.contains("fallback"), "{get}");
+        // #6715 review: no surface says "storage unprobed" for a route whose
+        // generation `auth status` opens for the account label; only the
+        // token's availability is left unverified.
+        assert!(get.contains("token availability unprobed"), "{get}");
+        assert!(!get.contains("storage unprobed"), "{get}");
+        assert!(!scoped.contains("storage unprobed"), "{scoped}");
         assert!(
             !keyring.queried().iter().any(|slot| slot == "xai"),
             "owned OAuth diagnostics must not query the xAI API-key store: {:?}",
