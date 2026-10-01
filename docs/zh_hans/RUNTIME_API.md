@@ -1743,6 +1743,9 @@ basename 校验（无分隔符、无 `..`），列表有上限，读取是
 录音是每台主机一次阻塞式采集（请求串行化；输家得到
 `ok:false`/`no_speech`，而不是一个被争抢的设备）。提供商 ASR 惰性解析其
 密钥，因此本地 whisper 与 Groq 路径无需提供商认证即可工作。
+中间和最终转写均使用已选择的 ASR 后端。本地 whisper 或 Groq 失败时，
+错误保留在该后端；运行时不会把录音或输入区文本改发给当前模型提供商重试。
+如需使用该提供商，必须显式选择提供商 ASR。
 失败也是数据：`no_recorder`、`no_speech`、`no_provider_auth`、
 `transcription_failed`。`CODEWHALE_DISABLE_VOICE=1` 是操作者
 开关——无头的 `serve --http` 主机会报告 `available: false`，

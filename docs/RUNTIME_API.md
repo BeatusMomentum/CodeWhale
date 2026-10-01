@@ -1925,6 +1925,10 @@ implementation the TUI's `/voice` commands run, headless. Recording is one
 blocking capture per host (requests serialize; the loser gets
 `ok:false`/`no_speech`, not a fought-over device). Provider ASR resolves its
 key lazily so local-whisper and Groq paths work without provider auth.
+Interim and final transcription use the selected ASR backend. If local whisper
+or Groq fails, the error stays on that backend: the runtime never retries the
+recording or composer text with the active model provider. Select provider ASR
+explicitly to use that route.
 Failure is data: `no_recorder`, `no_speech`, `no_provider_auth`,
 `transcription_failed`. `CODEWHALE_DISABLE_VOICE=1` is an operator
 kill-switch — a headless `serve --http` host reports `available: false` and

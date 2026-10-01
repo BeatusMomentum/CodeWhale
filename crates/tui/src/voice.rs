@@ -533,7 +533,7 @@ pub enum DictateError {
     NoRecorder,
     /// Recording produced no usable speech segment.
     NoSpeech,
-    /// The selected/fallback ASR needs a provider key that isn't configured.
+    /// The selected provider ASR needs an API key that is not configured.
     NoProviderAuth,
     /// ASR request or transcription failed.
     Transcription(String),
@@ -608,61 +608,12 @@ pub async fn dictate_once(
         .ok_or(DictateError::NoSpeech)?;
 
     let (asr_kind, asr_model) = resolve_asr_choice(config);
-    let base_url = config.active_route_base_url();
-    let openrouter_vendor = config
-        .openrouter_vendor()
-        .map_err(|e| DictateError::Transcription(e.to_string()))?;
-    let provider_key = || {
-        config
-            .active_route_api_key()
-            .map_err(|_| DictateError::NoProviderAuth)
+    let assisted = asr_kind == "provider" && matches!(&mode, DictateMode::Control(_));
+    let composer = match &mode {
+        DictateMode::Control(composer) => Some(composer.as_str()),
+        _ => None,
     };
-
-    let mut assisted = false;
-    let text = match asr_kind.as_str() {
-        "local-whisper" => match transcribe_local_whisper(&samples).await {
-            Ok(v) => v,
-            Err(_) => transcribe(
-                &provider_key()?,
-                &base_url,
-                &samples,
-                openrouter_vendor.as_deref(),
-            )
-            .await
-            .map_err(DictateError::Transcription)?,
-        },
-        "groq" => match transcribe_groq(&samples).await {
-            Ok(v) => v,
-            Err(_) => transcribe(
-                &provider_key()?,
-                &base_url,
-                &samples,
-                openrouter_vendor.as_deref(),
-            )
-            .await
-            .map_err(DictateError::Transcription)?,
-        },
-        _ => {
-            let api_key = provider_key()?;
-            match &mode {
-                DictateMode::Control(composer) => {
-                    assisted = true;
-                    process_voice_control(
-                        &api_key,
-                        &base_url,
-                        &samples,
-                        composer,
-                        openrouter_vendor.as_deref(),
-                    )
-                    .await
-                    .map_err(DictateError::Transcription)?
-                }
-                _ => transcribe(&api_key, &base_url, &samples, openrouter_vendor.as_deref())
-                    .await
-                    .map_err(DictateError::Transcription)?,
-            }
-        }
-    };
+    let text = transcribe_selected(config, &asr_kind, &samples, composer).await?;
 
     let clean = text.trim().to_string();
     let (text, send) = match mode {
@@ -681,8 +632,40 @@ pub async fn dictate_once(
     })
 }
 
+/// One selected ASR route for both native/HTTP and TUI capture. A failure
+/// stays on that route: it must not upload the recording to another provider.
+pub(crate) async fn transcribe_selected(
+    config: &Config,
+    kind: &str,
+    samples: &[i16],
+    composer: Option<&str>,
+) -> Result<String, DictateError> {
+    let text = match kind {
+        "local-whisper" => transcribe_local_whisper(samples).await,
+        "groq" => transcribe_groq(samples).await,
+        _ => {
+            let key = config
+                .active_route_api_key()
+                .map_err(|_| DictateError::NoProviderAuth)?;
+            let base = config.active_route_base_url();
+            let vendor = config
+                .openrouter_vendor()
+                .map_err(|error| DictateError::Transcription(error.to_string()))?;
+            match composer {
+                Some(composer) => {
+                    process_voice_control(&key, &base, samples, composer, vendor.as_deref()).await
+                }
+                None => transcribe(&key, &base, samples, vendor.as_deref()).await,
+            }
+        }
+    };
+    text.map_err(DictateError::Transcription)
+}
+
 #[cfg(test)]
 mod tests {
+    mod selected_asr;
+
     use super::*;
 
     #[tokio::test]
