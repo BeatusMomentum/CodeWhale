@@ -8973,6 +8973,8 @@ mod streaming;
 mod token_estimate_cache;
 pub(crate) mod tool_catalog;
 mod tool_execution;
+#[cfg(all(test, unix))]
+pub(crate) use tool_execution::pin_replay_span_sequence;
 mod tool_media;
 mod tool_preparation;
 mod tool_setup;

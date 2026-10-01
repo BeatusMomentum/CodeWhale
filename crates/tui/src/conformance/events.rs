@@ -679,6 +679,10 @@ fn harness_timeout_rejects_a_real_stalled_turn() {
 
 #[test]
 fn golden_turn_events_match() {
+    // The goldens carry the span numbers of one pass over the cases in an
+    // otherwise idle process (`one_tool_call` #1, `parallel_tool_calls` #2
+    // and #3); replay that numbering whatever else this process runs.
+    let _spans = crate::core::engine::pin_replay_span_sequence();
     let names = golden::case_names(FAMILY);
     let mut failures = Failures::default();
     for name in &names {
