@@ -4657,10 +4657,15 @@ impl Engine {
             // (turnBudget per-task, resumable): token/time are telemetry only
             // unless `[goal] enforce_token_budget` opts a set budget into a
             // hard stop (#6013); otherwise only Completed/Blocked/
-            // ContinuationLimit pause the loop.
-            crate::goal_loop::GoalBudget::unbounded()
-                .with_enforced_token_budget(self.config.goal_enforce_token_budget)
-                .with_max_continuations(self.config.goal_max_continuations),
+            // ContinuationLimit pause the loop. The goal's own budget must be
+            // carried here: `unbounded()` has none, which left the enforced
+            // stop unreachable on this cross-turn gate (T08-03).
+            crate::goal_loop::GoalBudget {
+                token_budget: snapshot.token_budget.map(u64::from),
+                time_budget_seconds: None,
+                enforce_token_budget: self.config.goal_enforce_token_budget,
+                max_continuations: self.config.goal_max_continuations,
+            },
         );
 
         match decision {

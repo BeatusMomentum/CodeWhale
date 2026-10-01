@@ -5205,6 +5205,51 @@ async fn goal_continues_past_legacy_ten_pass_cap_when_budget_remains() {
     );
 }
 
+/// T08-03: the cross-turn continuation gate stops at an *enforced* token
+/// budget, the same stop the intra-turn gate and the host take, and keeps
+/// the default advisory behavior when enforcement is off.
+#[tokio::test]
+async fn cross_turn_goal_continuation_stops_at_an_enforced_token_budget() {
+    let config = Config::default();
+    for enforce in [true, false] {
+        let (engine, _handle) = Engine::new(
+            EngineConfig {
+                snapshots_enabled: false,
+                terminal_chrome_enabled: false,
+                goal_objective: Some("stop at the enforced budget".to_string()),
+                goal_token_budget: Some(100),
+                goal_enforce_token_budget: enforce,
+                ..EngineConfig::default()
+            },
+            &config,
+        );
+        engine
+            .config
+            .goal_state
+            .lock()
+            .expect("goal lock")
+            .record_usage(100, 0);
+        let action = engine.goal_continuation_if_active();
+        if enforce {
+            assert!(
+                matches!(
+                    action,
+                    GoalContinuationAction::Stopped {
+                        reason: crate::tools::goal::GoalPauseReason::BudgetLimit,
+                        ..
+                    }
+                ),
+                "an exhausted enforced budget must not dispatch another turn: {action:?}"
+            );
+        } else {
+            assert!(
+                matches!(action, GoalContinuationAction::Dispatch { .. }),
+                "an advisory budget keeps the goal running: {action:?}"
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn invalid_route_blocks_active_goal_and_refreshes_projections() {
     let config = goal_custom_route_config();

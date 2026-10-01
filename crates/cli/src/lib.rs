@@ -3107,12 +3107,15 @@ fn provider_keyring_set(secrets: &Secrets, provider: ProviderKind) -> bool {
     provider_keyring_api_key(secrets, provider).is_some()
 }
 
-/// Delete the keyring credential of every provider that has one stored.
+/// Delete the keyring credential of every provider that may have one stored.
 ///
 /// Returns a human-readable entry per slot whose deletion failed, so the
 /// caller can report the failure instead of claiming a clean logout while
 /// credentials linger in the keyring. Slots shared by several providers
-/// (e.g. the historical `siliconflow` slot) are deleted once.
+/// (e.g. the historical `siliconflow` slot) are deleted once. Only a slot the
+/// store reports empty is skipped: an unreadable slot may still hold a key,
+/// so its delete is attempted, and a refused delete is a failure unless the
+/// store then reports the slot empty (the rule `auth clear` applies too).
 fn clear_all_provider_api_keys_from_keyring(secrets: &Secrets) -> Vec<String> {
     let mut failures = Vec::new();
     let mut cleared_slots = std::collections::HashSet::new();
@@ -3121,10 +3124,12 @@ fn clear_all_provider_api_keys_from_keyring(secrets: &Secrets) -> Vec<String> {
         if !cleared_slots.insert(slot) {
             continue;
         }
-        if !provider_keyring_set(secrets, provider) {
+        if matches!(secrets.get(slot), Ok(None)) {
             continue;
         }
-        if let Err(error) = secrets.delete(slot) {
+        if let Err(error) = secrets.delete(slot)
+            && !matches!(secrets.get(slot), Ok(None))
+        {
             failures.push(format!("{slot}: {error}"));
         }
     }
@@ -6099,6 +6104,8 @@ mod tests {
         gets: Mutex<Vec<String>>,
         values: Mutex<std::collections::BTreeMap<String, String>>,
         fail_delete_slot: Option<&'static str>,
+        /// A slot whose reads fail (a locked or access-denied keyring entry).
+        fail_get_slot: Option<&'static str>,
     }
 
     impl RecordingKeyringStore {
@@ -6123,6 +6130,11 @@ mod tests {
                 .lock()
                 .expect("recording gets lock")
                 .push(key.to_string());
+            if self.fail_get_slot == Some(key) {
+                return Err(codewhale_secrets::SecretsError::Keyring(
+                    "test read failure".into(),
+                ));
+            }
             Ok(self
                 .values
                 .lock()
@@ -11073,6 +11085,34 @@ verbosity = "concise"
                 .oauth_credential_generation
                 .is_none()
         );
+    }
+
+    /// R02-08: a slot the keyring cannot read may still hold a key. Logout
+    /// must attempt its delete and report the failure, never print success.
+    #[test]
+    fn logout_reports_a_key_it_could_neither_read_nor_delete() {
+        let _lock = env_lock();
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let home = dir
+            .path()
+            .canonicalize()
+            .expect("canonical temp root")
+            .join("codewhale-home");
+        let _home = ScopedEnvVar::set("CODEWHALE_HOME", &home.to_string_lossy());
+        let _api_base = ScopedEnvVar::remove(codewhale_secrets::account::ACCOUNT_API_BASE_ENV);
+        let mut store = ConfigStore::load(Some(home.join("config.toml"))).expect("load config");
+        let locked_slot = provider_slot(ProviderKind::Deepseek);
+        let keyring = RecordingKeyringStore {
+            fail_get_slot: Some(locked_slot),
+            fail_delete_slot: Some(locked_slot),
+            ..RecordingKeyringStore::default()
+        };
+        keyring.set_value(locked_slot, "test-credential");
+        let secrets = Secrets::new(std::sync::Arc::new(keyring));
+        let error = run_logout_command_with_secrets(&mut store, &secrets, None)
+            .expect_err("an unconfirmed deletion must fail logout");
+        assert!(error.to_string().contains("logout incomplete"), "{error}");
+        assert!(error.to_string().contains(locked_slot), "{error}");
     }
 
     #[test]
