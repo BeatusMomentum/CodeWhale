@@ -585,6 +585,16 @@ enum TuiAuthCommand {
     /// Revoke Codewhale-owned ChatGPT tokens. Codex CLI consent is unchanged.
     #[command(name = "chatgpt-revoke")]
     ChatgptRevoke,
+    /// Sign in to a provider contributed by an enabled, reviewed plugin.
+    PluginLogin {
+        #[arg(long)]
+        provider: String,
+    },
+    /// Remove credentials for one plugin provider without changing trust.
+    PluginLogout {
+        #[arg(long)]
+        provider: String,
+    },
 }
 
 const CODEWHALE_TOOL_SURFACE_ENV: &str = "CODEWHALE_TOOL_SURFACE";
@@ -2022,6 +2032,8 @@ fn run_with_args(args: Vec<String>) -> Result<()> {
     let plugin_registry = plugin_registry
         .expect("plugin discovery initialization must precede workspace dotenv loading");
 
+    crate::plugins::providers::install_startup_registry(plugin_registry.clone());
+
     // The interactive runtime intentionally carries a large state machine:
     // terminal rendering, modal dispatch, provider setup, and fleet/workflow
     // events all share one async owner. Debug builds retain enough stack
@@ -2512,6 +2524,34 @@ async fn run_async_main_dispatch(
                 TuiAuthCommand::XaiDevice => run_xai_device_auth(cli.config.as_deref()).await,
                 TuiAuthCommand::Chatgpt => run_chatgpt_pkce_auth(cli.config.as_deref()).await,
                 TuiAuthCommand::ChatgptRevoke => run_chatgpt_pkce_revoke(cli.config.as_deref()),
+                TuiAuthCommand::PluginLogin { provider } => {
+                    let entry = plugin_auth_entry_from_cli(&cli, &provider).await?;
+                    crate::oauth::plugin_oauth_login(
+                        provider,
+                        entry.base_url.clone().unwrap(),
+                        entry.oauth.clone().unwrap(),
+                        entry.plugin_authority.clone().unwrap(),
+                    )
+                    .await
+                }
+                TuiAuthCommand::PluginLogout { provider } => {
+                    let entry = plugin_auth_entry_from_cli(&cli, &provider).await?;
+                    let policy = crate::plugins::activation::extension_host_policy_enabled();
+                    tokio::task::spawn_blocking(move || {
+                        let _scope = crate::plugins::activation::PolicyScope::propagate(policy);
+                        crate::plugins::registry::verify_plugin_component_authority(
+                            entry.plugin_authority.as_ref().unwrap(),
+                            crate::plugins::activation::PluginActivationCapability::Providers,
+                        )
+                        .map_err(anyhow::Error::msg)?;
+                        crate::oauth::plugin_oauth_logout(
+                            &provider,
+                            entry.base_url.as_deref().unwrap(),
+                            entry.oauth.as_ref().unwrap(),
+                        )
+                    })
+                    .await?
+                }
             },
             Commands::Models(args) => {
                 let config = load_config_from_cli(&cli)?;
@@ -8799,6 +8839,44 @@ pub(crate) fn initialize_cloud_facts(config: &Config) {
     }
 }
 
+async fn plugin_auth_entry_from_cli(
+    cli: &Cli,
+    provider: &str,
+) -> Result<crate::config::ProviderConfig> {
+    let path = cli.config.clone();
+    let profile = effective_config_profile(cli);
+    let features = cli.feature_toggles.clone();
+    let provider = provider.to_owned();
+    let policy = crate::plugins::activation::extension_host_policy_enabled();
+    tokio::task::spawn_blocking(move || {
+        let _scope = crate::plugins::activation::PolicyScope::propagate(policy);
+        let config = load_config_with_cli_preferences(path, profile.as_deref(), &features)?;
+        plugin_auth_entry(&config, &provider)
+    })
+    .await?
+}
+
+fn plugin_auth_entry(config: &Config, provider: &str) -> Result<crate::config::ProviderConfig> {
+    let mut entry = config
+        .providers
+        .as_ref()
+        .and_then(|providers| providers.custom_provider_config(provider))
+        .ok_or_else(|| anyhow!("No enabled plugin contributes provider `{provider}`"))?
+        .clone();
+    entry
+        .plugin_authority
+        .as_ref()
+        .ok_or_else(|| anyhow!("Provider `{provider}` is not contributed by a reviewed plugin"))?;
+    if entry.base_url.is_none() || entry.oauth.is_none() {
+        return Err(anyhow!("Plugin provider has no OAuth route"));
+    }
+    // Login, logout, readiness and inference must address the same normalized
+    // route, even when a declaration includes a trailing slash.
+    entry.base_url =
+        Some(config.base_url_for_route_identity(crate::config::ApiProvider::Custom, provider));
+    Ok(entry)
+}
+
 fn load_config_from_cli(cli: &Cli) -> Result<Config> {
     load_config_from_cli_with_effective_profile(cli).map(|(config, _)| config)
 }
@@ -8825,7 +8903,7 @@ fn load_structural_config_from_cli(cli: &Cli) -> Result<Config> {
     Ok(config)
 }
 
-/// Select the plugin activation policy (v3, or v4 with the experimental
+/// Select the plugin activation policy (v5, or v6 with the experimental
 /// extension host) and the host's Node override, once per process, before
 /// any plugin discovery. Later config reloads never flip either.
 fn install_extension_host_boot_config(config: &Config) {
@@ -8855,21 +8933,34 @@ fn effective_config_profile(cli: &Cli) -> Option<String> {
 
 fn load_config_from_cli_with_effective_profile(cli: &Cli) -> Result<(Config, Option<String>)> {
     let profile = effective_config_profile(cli);
-    let mut config = Config::load(cli.config.clone(), profile.as_deref())?;
+    let config = load_config_with_cli_preferences(
+        cli.config.clone(),
+        profile.as_deref(),
+        &cli.feature_toggles,
+    )?;
+    Ok((config, profile))
+}
+
+fn load_config_with_cli_preferences(
+    path: Option<PathBuf>,
+    profile: Option<&str>,
+    features: &FeatureToggles,
+) -> Result<Config> {
+    let mut config = Config::load(path, profile)?;
     // Config loading is shared by diagnostics and mutating runtimes. Read the
     // saved preference without migrating or creating state here; interactive
     // startup performs any permitted migration later through `Settings::load`.
     if let Ok(settings) = crate::settings::Settings::load_read_only() {
         apply_saved_reasoning_preference(&mut config, &settings);
     }
-    cli.feature_toggles.apply(&mut config)?;
+    features.apply(&mut config)?;
     install_extension_host_boot_config(&config);
     // Install the foreign-instruction opt-in before anything can load project
     // context. This is the single funnel every runtime goes through — TUI,
     // exec, ACP, and the app-server passthrough all resolve config here — so
     // the loader never has to be handed the setting at each of its call sites.
     install_foreign_instruction_imports(&config);
-    Ok((config, profile))
+    Ok(config)
 }
 
 /// Apply the selected v2 Fleet's operator to a fresh root session.
