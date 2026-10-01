@@ -338,6 +338,7 @@ impl UnixSocketHookSink {
 /// dispatcher awaits its sinks in order, so a listener that accepts and never
 /// reads would otherwise stall every later sink, and the emitting turn, as
 /// soon as the socket buffer filled.
+#[cfg(unix)]
 const UNIX_SOCKET_SINK_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[async_trait]
