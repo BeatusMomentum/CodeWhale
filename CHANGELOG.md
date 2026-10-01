@@ -103,6 +103,12 @@ quieter, and Fleet runs can be checked before they spend anything.
   under the stream retry budget when nothing had streamed; authentication and
   invalid-model frames still fail at once
   ([#6795](https://github.com/Hmbown/Codewhale/issues/6795)).
+- Long sessions no longer start every turn late. Once a workspace held more
+  than 50 undo snapshots (around the sixteenth turn), each new snapshot rebuilt
+  the whole snapshot history before the provider request, about 2.8 s per turn
+  in a small workspace. Old snapshots are now dropped half a window at a time.
+- Resuming a crashed session from inside the TUI recovers its interrupted
+  turn too.
 - Release builds compile on Rust 1.99.
 - TUI undo and retry rewind the Engine conversation and saved session before
   replacement inference. If the conversation or its settings change while

@@ -1897,11 +1897,22 @@ impl SnapshotRepo {
     /// The survivors are rebuilt as a fresh orphan chain; each keeps its
     /// tree, label, session id and timestamp, and the dropped ones become
     /// unreachable for gc to reclaim.
+    #[cfg(test)]
     pub fn prune_keep_last_n(&self, max_count: usize) -> io::Result<usize> {
-        self.with_write_lock(|| self.prune_keep_last_n_locked(max_count))
+        self.with_write_lock(|| self.prune_keep_last_n_locked(max_count, 1))
     }
 
-    fn prune_keep_last_n_locked(&self, max_count: usize) -> io::Result<usize> {
+    /// [`Self::prune_keep_last_n`] for the prune that follows every snapshot:
+    /// it waits until half a window of snapshots is due to go and drops them
+    /// together. Rebuilding the survivor chain costs two git processes per
+    /// survivor, and doing that after every snapshot past the cap put seconds
+    /// in front of every later turn's provider request. The store then holds
+    /// at most half a window more than [`Self::prune_keep_last_n`] would keep.
+    pub fn prune_keep_last_n_batched(&self, max_count: usize) -> io::Result<usize> {
+        self.with_write_lock(|| self.prune_keep_last_n_locked(max_count, (max_count / 2).max(1)))
+    }
+
+    fn prune_keep_last_n_locked(&self, max_count: usize, min_removed: usize) -> io::Result<usize> {
         let snapshots = self.list(usize::MAX)?;
         if snapshots.len() <= max_count {
             return Ok(0);
@@ -1923,7 +1934,7 @@ impl SnapshotRepo {
             .map(|(_, snapshot)| snapshot.clone())
             .collect();
         let removed = snapshots.len() - survivors.len();
-        if removed == 0 || survivors.is_empty() {
+        if removed < min_removed || survivors.is_empty() {
             return Ok(0);
         }
         self.rebuild_survivor_chain(&survivors, &snapshots[0].id)?;
@@ -3798,6 +3809,30 @@ mod tests {
         std::fs::write(repo.work_tree().join("f.txt"), "fresh").unwrap();
         repo.snapshot("turn:new").unwrap();
         assert_eq!(repo.list(usize::MAX).unwrap().len(), 2);
+    }
+
+    /// The per-snapshot prune drops half a window at once instead of
+    /// rebuilding the chain for every snapshot past the cap.
+    #[test]
+    fn batched_prune_waits_for_half_a_window_then_drops_it_together() {
+        let tmp = tempdir().unwrap();
+        let (repo, _home) = make_repo(tmp.path());
+        let max = 4;
+        for n in 0..max + 1 {
+            std::fs::write(repo.work_tree().join("f.txt"), format!("{n}")).unwrap();
+            repo.snapshot(&format!("tool:{n}")).unwrap();
+        }
+        // One over the cap: the plain prune would rebuild now, the batched
+        // one waits.
+        assert_eq!(repo.prune_keep_last_n_batched(max).unwrap(), 0);
+        assert_eq!(repo.list(usize::MAX).unwrap().len(), max + 1);
+
+        std::fs::write(repo.work_tree().join("f.txt"), "last").unwrap();
+        repo.snapshot("tool:last").unwrap();
+        assert_eq!(repo.prune_keep_last_n_batched(max).unwrap(), 2);
+        let kept = repo.list(usize::MAX).unwrap();
+        assert_eq!(kept.len(), max);
+        assert_eq!(kept[0].label, "tool:last", "the newest snapshots survive");
     }
 
     #[test]
