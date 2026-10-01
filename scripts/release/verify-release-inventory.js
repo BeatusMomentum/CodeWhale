@@ -5,7 +5,9 @@
 //   --draft --asset-dir artifacts --publish
 // which requires the draft to carry exactly the authoritative inventory
 // (allReleaseAssetNames), every asset fully uploaded with the local byte
-// size, and only then flips draft -> published. The whole set becomes public
+// size and SHA-256 digest, and only then flips draft -> published. A rerun
+// can reuse draft assets only when their bytes match the verified local set.
+// The whole set becomes public
 // at once; an upload that dies halfway leaves a draft nobody can install from,
 // not a public partial release.
 //
@@ -17,6 +19,7 @@
 // Set GH_BIN to choose the GitHub CLI binary (tests use a fake).
 
 const { execFileSync } = require("node:child_process");
+const crypto = require("node:crypto");
 const fs = require("node:fs");
 const path = require("node:path");
 
@@ -54,8 +57,11 @@ function findRelease(repo, tag, { draft }, gh) {
     if (!release || release.draft) throw new Error(`GitHub Release ${tag} is not published`);
     return release;
   }
-  const listed = JSON.parse(gh(["api", `repos/${repo}/releases?per_page=100`]));
-  if (!Array.isArray(listed)) throw new Error("GitHub did not return a release list");
+  const pages = JSON.parse(gh(["api", `repos/${repo}/releases?per_page=100`, "--paginate", "--slurp"]));
+  if (!Array.isArray(pages) || pages.some((page) => !Array.isArray(page))) {
+    throw new Error("GitHub did not return a paginated release list");
+  }
+  const listed = pages.flat();
   const drafts = listed.filter((release) => release && release.draft === true && release.tag_name === tag);
   if (drafts.length !== 1) {
     throw new Error(
@@ -66,7 +72,7 @@ function findRelease(repo, tag, { draft }, gh) {
   return drafts[0];
 }
 
-/** Exact names, each fully uploaded, and (with a local directory) the same byte size. */
+/** Exact names, each fully uploaded, and matching local size and SHA-256. */
 function assertInventory(release, tag, expectedNames, assetDir) {
   if (!release || !Array.isArray(release.assets)) {
     throw new Error(`GitHub Release ${tag} did not provide an asset inventory`);
@@ -97,6 +103,10 @@ function assertInventory(release, tag, expectedNames, assetDir) {
       const local = fs.statSync(path.join(assetDir, name)).size;
       if (asset.size !== local) {
         throw new Error(`GitHub Release ${tag} asset ${name} has ${asset.size} bytes; the verified local asset has ${local}`);
+      }
+      const digest = `sha256:${crypto.hash("sha256", fs.readFileSync(path.join(assetDir, name)))}`;
+      if (asset.digest !== digest) {
+        throw new Error(`GitHub Release ${tag} asset ${name} has a missing or mismatched SHA-256 digest; refusing stale draft bytes`);
       }
     }
   }
@@ -129,7 +139,7 @@ function run(argv, gh = ghRunner(), log = console.log) {
     else if (arg === "--asset-dir") flags.assetDir = argv[++i];
     else positional.push(arg);
   }
-  if (positional.length !== 2 || (flags.publish && !flags.draft) || (flags.manifest && (flags.draft || flags.assetDir))) {
+  if (positional.length !== 2 || (flags.publish && (!flags.draft || !flags.assetDir)) || (flags.manifest && (flags.draft || flags.assetDir))) {
     throw new Error(usage());
   }
   const [repo, tag] = positional;

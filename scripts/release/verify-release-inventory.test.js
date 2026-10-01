@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 const assert = require("node:assert/strict");
+const crypto = require("node:crypto");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
@@ -20,11 +21,12 @@ function localAssets(t) {
 }
 
 function uploaded(names, sizeOf = (index) => index + 1) {
-  return names.map((name, index) => ({ name, state: "uploaded", size: sizeOf(index) }));
+  return names.map((name, index) => ({ name, state: "uploaded", size: sizeOf(index),
+    digest: `sha256:${crypto.hash("sha256", "x".repeat(sizeOf(index)))}` }));
 }
 
 /** A gh double over one repository's releases; records every call. */
-function fakeGh(releases, { manifest = "" } = {}) {
+function fakeGh(releases, { manifest = "", pages = [releases] } = {}) {
   const calls = [];
   const gh = (args) => {
     calls.push(args.join(" "));
@@ -40,7 +42,10 @@ function fakeGh(releases, { manifest = "" } = {}) {
       if (!found) throw new Error("gh api failed: HTTP 404");
       return JSON.stringify(found);
     }
-    if (endpoint.startsWith(`repos/${REPO}/releases?`)) return JSON.stringify(releases);
+    if (endpoint.startsWith(`repos/${REPO}/releases?`)) {
+      assert.ok(args.includes("--paginate") && args.includes("--slurp"));
+      return JSON.stringify(pages);
+    }
     throw new Error(`unexpected gh call: ${args.join(" ")}`);
   };
   return { gh, calls };
@@ -79,7 +84,7 @@ test("zero or several drafts for the tag need a maintainer, not a guess", () => 
   for (const drafts of [[], [1, 2]]) {
     const releases = drafts.map((id) => ({ id, tag_name: TAG, draft: true, assets: uploaded(allReleaseAssetNames()) }));
     const { gh } = fakeGh(releases);
-    assert.throws(() => run(["--draft", "--publish", REPO, TAG], gh, () => {}), /Expected exactly one draft release/);
+    assert.throws(() => run(["--draft", REPO, TAG], gh, () => {}), /Expected exactly one draft release/);
   }
 });
 
@@ -94,5 +99,33 @@ test("republish derives only from a release carrying exactly its own checksum ma
 
 test("usage refuses publish without draft and manifest with a local directory", () => {
   assert.throws(() => run(["--publish", REPO, TAG], () => "[]", () => {}), /Usage/);
+  assert.throws(() => run(["--draft", "--publish", REPO, TAG], () => "[]", () => {}), /Usage/);
   assert.throws(() => run(["--manifest", "--asset-dir", "x", REPO, TAG], () => "[]", () => {}), /Usage/);
+});
+
+test("same-size stale bytes and missing digests cannot publish a draft", (t) => {
+  const dir = localAssets(t);
+  for (const digest of [`sha256:${crypto.hash("sha256", "y")}`, null]) {
+    const assets = uploaded(allReleaseAssetNames());
+    assets[0].digest = digest;
+    const releases = [{ id: 7, tag_name: TAG, draft: true, assets }];
+    const { gh, calls } = fakeGh(releases);
+    assert.throws(() => run(["--draft", "--asset-dir", dir, "--publish", REPO, TAG], gh, () => {}), /SHA-256 digest/);
+    assert.equal(releases[0].draft, true);
+    assert.equal(calls.some((call) => call.includes("PATCH")), false);
+  }
+});
+
+test("drafts beyond the first release page are verified and duplicates refused", (t) => {
+  const dir = localAssets(t);
+  const draft = { id: 7, tag_name: TAG, draft: true, assets: uploaded(allReleaseAssetNames()) };
+  const older = Array.from({ length: 100 }, (_, id) => ({ id: 100 + id, tag_name: `v0.9.${id}`, draft: false }));
+  const { gh } = fakeGh([draft], { pages: [older, [draft]] });
+  run(["--draft", "--asset-dir", dir, "--publish", REPO, TAG], gh, () => {});
+  assert.equal(draft.draft, false);
+  draft.draft = true;
+  const duplicate = { ...draft, id: 8 };
+  const second = fakeGh([draft, duplicate], { pages: [[draft], [duplicate]] });
+  assert.throws(() => run(["--draft", "--asset-dir", dir, "--publish", REPO, TAG], second.gh, () => {}), /found 2/);
+  assert.equal(second.calls.some((call) => call.includes("PATCH")), false);
 });

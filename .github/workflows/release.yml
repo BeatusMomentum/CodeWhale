@@ -437,6 +437,19 @@ jobs:
             --draft --asset-dir artifacts --publish \
             "${GITHUB_REPOSITORY}" "${TAG}"
 
+  # CNB tag pushes start its public binary pipeline, so mirror only after
+  # the canonical release is complete. Calling the reusable workflow here
+  # also works when GITHUB_TOKEN publication suppresses release events.
+  cnb:
+    needs: [release, resolve]
+    if: ${{ !cancelled() && needs.release.result == 'success' }}
+    uses: ./.github/workflows/sync-cnb.yml
+    with:
+      release_tag: ${{ needs.resolve.outputs.tag }}
+      source_sha: ${{ needs.resolve.outputs.sha }}
+    secrets:
+      CNB_GIT_TOKEN: ${{ secrets.CNB_GIT_TOKEN }}
+
   npm:
     timeout-minutes: 20
     needs: [release, resolve]
