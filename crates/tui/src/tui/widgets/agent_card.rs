@@ -1549,7 +1549,9 @@ mod tests {
     fn fanout_header_fits_zero_and_one_column_renders() {
         let ids: Vec<String> = (0..5).map(|i| format!("w_{i}")).collect();
         let card = FanoutCard::new("rlm").with_workers(ids.iter().cloned());
-        for width in [0_u16, 1, 2, 3] {
+        // Every width from nothing up past the header, including the ones
+        // where the count is truncated and the grid wraps.
+        for width in 0_u16..=16 {
             let lines = render_to_strings(&card.render_lines(width, &codewhale_palette::UI_THEME));
             assert!(!lines.is_empty(), "{width}");
             for line in &lines {
