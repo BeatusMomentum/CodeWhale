@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 
 use super::protocol::{
-    self, OwnerRef, RegisterKind, RegisterParams, ToolSpecWire, parse_core_message,
+    self, OwnerRef, RegisterKind, RegisterParams, RegisterSpecWire, parse_core_message,
     parse_host_message,
 };
 use super::registry::{OwnerRegistry, OwnerState};
@@ -122,13 +122,13 @@ fn register(registry: &mut OwnerRegistry, owner: &OwnerRef, name: &str) -> Resul
     registry.register_tool(&RegisterParams {
         owner: owner.clone(),
         kind: RegisterKind::Tool,
-        spec: ToolSpecWire {
+        spec: RegisterSpecWire {
             name: name.to_string(),
             description: "d".to_string(),
             input_schema: json!({"type": "object", "properties": {}})
                 .as_object()
-                .unwrap()
-                .clone(),
+                .cloned(),
+            argument_hint: None,
         },
     })
 }
@@ -243,10 +243,11 @@ fn registry_enforces_schema_and_count_caps() {
     let mut params = RegisterParams {
         owner: a.clone(),
         kind: RegisterKind::Tool,
-        spec: ToolSpecWire {
+        spec: RegisterSpecWire {
             name: "big".to_string(),
             description: "x".repeat(super::registry::MAX_DESCRIPTION_BYTES + 1),
-            input_schema: json!({"type": "object"}).as_object().unwrap().clone(),
+            input_schema: json!({"type": "object"}).as_object().cloned(),
+            argument_hint: None,
         },
     };
     assert!(
@@ -259,15 +260,14 @@ fn registry_enforces_schema_and_count_caps() {
     params.spec.input_schema =
         json!({"type": "object", "description": "y".repeat(super::registry::MAX_SCHEMA_BYTES)})
             .as_object()
-            .unwrap()
-            .clone();
+            .cloned();
     assert!(
         registry
             .register_tool(&params)
             .unwrap_err()
             .contains("schema")
     );
-    params.spec.input_schema = json!({"type": "string"}).as_object().unwrap().clone();
+    params.spec.input_schema = json!({"type": "string"}).as_object().cloned();
     assert!(
         registry
             .register_tool(&params)
@@ -2802,4 +2802,740 @@ async fn memory_cap_stops_a_bun_host() {
     let fixture = FixturePlugins::new(&["memory-hog"]).await;
     let manager = bun_manager(&fixture, bun, memory_cap_supervision());
     memory_hog_is_stopped(manager, &fixture, crate::dependencies::HostRuntimeKind::Bun).await;
+}
+
+// ---------------------------------------------------------------------------
+// Extension commands
+// ---------------------------------------------------------------------------
+
+fn register_command(
+    registry: &mut OwnerRegistry,
+    owner: &OwnerRef,
+    name: &str,
+    hint: Option<&str>,
+) -> Result<u64, String> {
+    registry.register(&RegisterParams {
+        owner: owner.clone(),
+        kind: RegisterKind::Command,
+        spec: RegisterSpecWire {
+            name: name.to_string(),
+            description: "d".to_string(),
+            input_schema: None,
+            argument_hint: hint.map(str::to_string),
+        },
+    })
+}
+
+#[test]
+fn command_registry_refuses_shadowing_and_undoes_exactly_one_entry() {
+    let mut registry = OwnerRegistry::new();
+    let a = registry.begin_owner("a", "a", fake_authority("a"), "hash-a");
+    let b = registry.begin_owner("b", "b", fake_authority("b"), "hash-b");
+
+    // Built-in names, their aliases, and the fixed mode aliases.
+    let builtin_alias = crate::commands::command_infos()
+        .iter()
+        .find_map(|info| info.aliases.first().copied())
+        .expect("some built-in has an alias");
+    for name in ["help", "trust", "model", "jihua", "zidong", builtin_alias] {
+        let refused = register_command(&mut registry, &a, name, None)
+            .expect_err(&format!("/{name} must be refused"));
+        assert!(refused.contains("built-in command"), "{name}: {refused}");
+    }
+    // Names outside DSH's grammar (upper case, a leading digit or slash,
+    // spaces), and over-long ones.
+    for name in [
+        "Hello",
+        "9lives",
+        "/slash",
+        "two words",
+        "",
+        &"x".repeat(65),
+    ] {
+        let refused = register_command(&mut registry, &a, name, None)
+            .expect_err(&format!("{name:?} must be refused"));
+        assert!(refused.contains("invalid"), "{name:?}: {refused}");
+    }
+    // A command has no input schema; descriptions and hints are bounded,
+    // non-empty, single-line text.
+    let mut params = RegisterParams {
+        owner: a.clone(),
+        kind: RegisterKind::Command,
+        spec: RegisterSpecWire {
+            name: "ok-name".to_string(),
+            description: "fine".to_string(),
+            input_schema: json!({"type": "object"}).as_object().cloned(),
+            argument_hint: None,
+        },
+    };
+    assert!(
+        registry
+            .register(&params)
+            .unwrap_err()
+            .contains("input schema")
+    );
+    params.spec.input_schema = None;
+    for (description, hint, expect) in [
+        ("  ", None, "needs a description"),
+        ("two\nlines", None, "control characters"),
+        ("fine", Some(""), "must not be empty"),
+        ("fine", Some("\u{1b}[31m<x>"), "control characters"),
+    ] {
+        params.spec.description = description.to_string();
+        params.spec.argument_hint = hint.map(str::to_string);
+        let refused = registry.register(&params).unwrap_err();
+        assert!(
+            refused.contains(expect),
+            "{description:?}/{hint:?}: {refused}"
+        );
+    }
+    params.spec.description = "x".repeat(super::registry::MAX_COMMAND_DESCRIPTION_BYTES + 1);
+    params.spec.argument_hint = None;
+    assert!(
+        registry
+            .register(&params)
+            .unwrap_err()
+            .contains("description")
+    );
+    params.spec.description = "fine".to_string();
+    params.spec.argument_hint = Some("h".repeat(super::registry::MAX_COMMAND_HINT_BYTES + 1));
+    assert!(
+        registry
+            .register(&params)
+            .unwrap_err()
+            .contains("argument hint")
+    );
+
+    let first = register_command(&mut registry, &a, "shared-name", Some("<x>")).unwrap();
+    // Another plugin cannot take it.
+    let refused = register_command(&mut registry, &b, "shared-name", None).unwrap_err();
+    assert!(
+        refused.contains("already registered by extension"),
+        "{refused}"
+    );
+    // Commands and tools are separate namespaces: the model calls one, the
+    // user the other.
+    register(&mut registry, &b, "shared_name_tool").unwrap();
+    register(&mut registry, &a, "shared-name").unwrap();
+    // The same owner re-registering retires the old handle.
+    let second = register_command(&mut registry, &a, "shared-name", None).unwrap();
+    assert_ne!(first, second);
+    registry.mark_active(&a);
+    registry.unregister(&a, first); // stale: must not remove the newer entry
+    let live = registry.live_commands();
+    assert_eq!(live.len(), 1);
+    assert_eq!(live[0].handle, second);
+    assert!(registry.live_command(second, "a", a.generation).is_some());
+    // A foreign owner cannot unregister it, and a stale generation finds nothing.
+    registry.unregister(&b, second);
+    assert!(registry.live_command(second, "a", a.generation).is_some());
+    assert!(
+        registry
+            .live_command(second, "a", a.generation + 1)
+            .is_none()
+    );
+    assert!(registry.live_command(second, "b", a.generation).is_none());
+    // Unregistering a command leaves the same owner's tool alone.
+    registry.unregister(&a, second);
+    assert!(registry.live_commands().is_empty());
+    let tools = registry.live_tools();
+    assert_eq!(tools.len(), 1, "b is not active yet; a's tool stays");
+    assert_eq!(tools[0].name, "shared-name");
+
+    // Caps.
+    for index in 0..super::registry::MAX_COMMANDS_PER_OWNER {
+        register_command(&mut registry, &a, &format!("c{index}"), None).unwrap();
+    }
+    assert!(
+        register_command(&mut registry, &a, "one-too-many", None)
+            .unwrap_err()
+            .contains("at most")
+    );
+
+    // Revocation is synchronous and total, and a revoked owner cannot register.
+    registry.mark_active(&a);
+    assert_eq!(
+        registry.live_commands().len(),
+        super::registry::MAX_COMMANDS_PER_OWNER
+    );
+    assert_eq!(registry.revoke_owner("a"), Some(a.clone()));
+    assert!(registry.live_commands().is_empty());
+    assert!(register_command(&mut registry, &a, "after-revoke", None).is_err());
+
+    // A host crash drops every command, whoever owned it.
+    registry.mark_active(&b);
+    let handle = register_command(&mut registry, &b, "survivor", None).unwrap();
+    assert!(registry.live_command(handle, "b", b.generation).is_some());
+    registry.host_exited("exited");
+    assert!(registry.live_commands().is_empty());
+    assert!(registry.live_command(handle, "b", b.generation).is_none());
+}
+
+/// The host protocol gains `command/run` without gaining any core
+/// authority: the lint that guards `METHODS` runs in `protocol::tests`; this
+/// pins what the new method's request and its answer look like.
+#[test]
+fn command_run_and_its_answers_have_the_documented_shapes() {
+    let request = protocol::CoreRequest::CommandRun(protocol::CommandRunParams {
+        handle: 7,
+        command_id: "c".to_string(),
+        raw_input: "args".to_string(),
+        deadline_ms: 30_000,
+    });
+    assert_eq!(request.method(), "command/run");
+    assert_eq!(request.deadline(), Duration::from_secs(30));
+    for (value, expect) in [
+        (
+            json!({"kind": "success", "text": "t"}),
+            protocol::CommandResultWire::Success {
+                text: Some("t".into()),
+            },
+        ),
+        (
+            json!({"kind": "success"}),
+            protocol::CommandResultWire::Success { text: None },
+        ),
+        (
+            json!({"kind": "error", "text": "no"}),
+            protocol::CommandResultWire::Error { text: "no".into() },
+        ),
+        (
+            json!({"kind": "submit", "prompt": "p"}),
+            protocol::CommandResultWire::Submit {
+                prompt: "p".into(),
+                text: None,
+            },
+        ),
+    ] {
+        let parsed: protocol::CommandResultWire = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(parsed, expect);
+        assert_eq!(serde_json::to_value(&parsed).unwrap(), value);
+    }
+    assert!(
+        serde_json::from_value::<protocol::CommandResultWire>(json!({"kind": "approve"})).is_err()
+    );
+}
+
+/// What a command shows is plugin-controlled text: escape sequences are
+/// stripped, and a prompt too large to submit whole is refused, not cut.
+#[tokio::test]
+async fn command_output_is_stripped_bounded_and_oversized_prompts_are_refused() {
+    use super::command::{self, CommandOutcome};
+    // The wire-to-outcome mapping needs a host to answer, so run it against
+    // a stub that returns canned results for `command/run`.
+    let Some(node) = node_for_tests("command_output") else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let plugin = dir.path().join("canned");
+    std::fs::create_dir_all(&plugin).unwrap();
+    std::fs::write(
+        plugin.join("plugin.json"),
+        r#"{"$schema":"https://agent-plugins.org/schemas/plugin.json","name":"canned","version":"0.1.0","description":"canned results","license":"MIT","extensions":{"net.codewhale":{"native":{"path":"index.mjs"}}}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        plugin.join("index.mjs"),
+        format!(
+            r#"export const name = 'canned'
+export const inject = ['commands']
+export function apply(ctx) {{
+  ctx.commands.register({{ name: 'big-text', description: 'd', handler: () => 'x'.repeat({}) }})
+  ctx.commands.register({{ name: 'big-prompt', description: 'd', handler: () => ({{ kind: 'submit', prompt: 'p'.repeat({}) }}) }})
+  ctx.commands.register({{ name: 'blank-prompt', description: 'd', handler: () => ({{ kind: 'submit', prompt: '  \u001b[0m ' }}) }})
+  ctx.commands.register({{ name: 'bad-result', description: 'd', handler: () => ({{ kind: 'approve' }}) }})
+}}
+"#,
+            command::MAX_TEXT_BYTES * 2,
+            command::MAX_PROMPT_BYTES + 1
+        ),
+    )
+    .unwrap();
+    let _policy = TestPolicyGuard::extension_host(true);
+    let fixture = FixturePlugins::new(&[]).await;
+    crate::plugins::install::install(
+        crate::plugins::install::PluginInstallSource::LocalPath(plugin),
+        &fixture.config.user_plugins_dir,
+        crate::plugins::install::DEFAULT_MAX_SIZE_BYTES,
+        &crate::network_policy::NetworkPolicy::default(),
+        false,
+        &|_| None,
+    )
+    .await
+    .unwrap();
+    let mut plugins = discover_with_config(&fixture.config);
+    plugins.trust("canned").unwrap();
+    plugins.enable("canned").unwrap();
+    let manager = fixture.manager(node);
+    let engine = manager.attach(Arc::new(plugins));
+    engine.sync().await.unwrap();
+    let run = |name: &'static str| {
+        let manager = Arc::clone(&manager);
+        async move {
+            let entry = manager
+                .commands_for_workspace(&manager_workspace(&manager))
+                .into_iter()
+                .find(|entry| entry.registration.name == name)
+                .unwrap_or_else(|| panic!("{name} is not live"));
+            command::run(&manager.shared, &entry.reference(), "").await
+        }
+    };
+    match run("big-text").await.unwrap() {
+        CommandOutcome::Show { text } => {
+            assert!(
+                text.ends_with("(output truncated)"),
+                "{}",
+                &text[text.len() - 40..]
+            );
+            assert!(text.len() < command::MAX_TEXT_BYTES + 64);
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(
+        run("big-prompt")
+            .await
+            .unwrap_err()
+            .contains("not submitted")
+    );
+    assert!(
+        run("blank-prompt")
+            .await
+            .unwrap_err()
+            .contains("empty prompt")
+    );
+    assert!(
+        run("bad-result")
+            .await
+            .unwrap_err()
+            .contains("unknown result kind")
+    );
+    manager.shutdown().await;
+}
+
+/// The workspace the single attached engine was given.
+fn manager_workspace(manager: &ExtensionHostManager) -> PathBuf {
+    manager
+        .shared
+        .attachments
+        .lock()
+        .unwrap()
+        .values()
+        .next()
+        .expect("an attached engine")
+        .plugins
+        .workspace()
+        .to_path_buf()
+}
+
+/// Commands registered by real plugins in a real host: what the user
+/// registry loads, what dispatch returns, and what running each one gives.
+#[tokio::test]
+async fn extension_commands_run_end_to_end_through_the_user_command_registry() {
+    use super::command::CommandOutcome;
+    use crate::tui::app::{App, AppAction, TuiOptions};
+
+    let Some(node) = node_for_tests("extension_commands_run_end_to_end") else {
+        return;
+    };
+    let _policy = TestPolicyGuard::extension_host(true);
+    let fixture = FixturePlugins::new(&["ext-commands"]).await;
+    let manager = fixture.manager(node);
+    let _manager = super::TestManagerGuard::install(Arc::clone(&manager));
+    let engine = manager.attach(fixture.registry());
+    // Nothing is visible before the host has registered anything.
+    assert!(manager.live_command_names().is_empty());
+    engine.sync().await.unwrap();
+    let mut live = manager.live_command_names();
+    live.sort();
+    assert_eq!(
+        live,
+        [
+            "ext-ansi",
+            "ext-ask",
+            "ext-dsh",
+            "ext-echo",
+            "ext-fail",
+            "ext-slow",
+            "ext-throw"
+        ]
+    );
+    // Commands are not tools.
+    assert!(manager.live_tool_names().is_empty());
+    assert!(installed(&engine, fixture.workspace()).is_empty());
+
+    // The user registry loads them for this workspace (and no other).
+    let hint = |name: &str| {
+        crate::commands::user_registry::with_registry_for_workspace(
+            Some(fixture.workspace()),
+            |registry| {
+                registry
+                    .get(name)
+                    .map(|command| (command.argument_hint.clone(), command.takes_arguments()))
+            },
+        )
+    };
+    assert_eq!(hint("ext-echo"), Some((Some("<text>".to_string()), true)));
+    assert_eq!(hint("ext-ask"), Some((Some("<topic>".to_string()), true)));
+    assert_eq!(hint("ext-fail"), Some((None, false)));
+    let other = fixture.workspace().join("elsewhere");
+    assert!(
+        crate::commands::user_registry::with_registry_for_workspace(Some(&other), |registry| {
+            registry.get("ext-echo").is_none()
+        }),
+        "another workspace never sees this workspace's extension commands"
+    );
+    // Discovery lists them.
+    let described = crate::commands::user_registry::with_registry_for_workspace(
+        Some(fixture.workspace()),
+        |registry| {
+            registry
+                .iter()
+                .filter(|command| command.extension.is_some())
+                .count()
+        },
+    );
+    assert_eq!(described, 7);
+
+    // Dispatch is the ordinary slash-command path, and returns the action
+    // the UI loop runs; the arguments arrive trimmed.
+    let mut app = App::new(
+        TuiOptions {
+            workspace: fixture.workspace().to_path_buf(),
+            ..crate::test_support::test_tui_options(fixture.workspace())
+        },
+        &crate::config::Config::default(),
+    );
+    let help = crate::commands::execute("/help ext-echo", &mut app);
+    assert!(
+        help.message
+            .as_deref()
+            .is_some_and(|text| text.contains("Echo the arguments.")),
+        "{help:?}"
+    );
+    let dispatched = |app: &mut App, input: &str| match crate::commands::execute(input, app).action
+    {
+        Some(AppAction::RunExtensionCommand {
+            command,
+            name,
+            input,
+        }) => (command, name, input),
+        other => panic!("{input}: expected an extension command action, got {other:?}"),
+    };
+    let (echo, name, args) = dispatched(&mut app, "/ext-echo   hello   there ");
+    assert_eq!(
+        (name.as_str(), args.as_str()),
+        ("ext-echo", "hello   there")
+    );
+    assert_eq!(echo.origin, "extension:ext-commands");
+    assert_eq!(
+        super::run_command(&echo, &args).await,
+        Ok(CommandOutcome::Show {
+            text: "echo: hello   there".to_string()
+        })
+    );
+    let (ask, _, args) = dispatched(&mut app, "/EXT-ASK tokens");
+    assert_eq!(
+        super::run_command(&ask, &args).await,
+        Ok(CommandOutcome::Submit {
+            prompt: "Summarize: tokens".to_string(),
+            note: Some("Asking the model.".to_string())
+        })
+    );
+    let (fail, _, args) = dispatched(&mut app, "/ext-fail");
+    assert_eq!(
+        super::run_command(&fail, &args).await,
+        Err("unknown topic".to_string())
+    );
+    let (thrown, _, args) = dispatched(&mut app, "/ext-throw");
+    let error = super::run_command(&thrown, &args).await.unwrap_err();
+    assert!(
+        error.starts_with("failed:") && error.contains("boom"),
+        "{error}"
+    );
+    // Escape sequences never reach the transcript.
+    let (ansi, _, args) = dispatched(&mut app, "/ext-ansi");
+    assert_eq!(
+        super::run_command(&ansi, &args).await,
+        Ok(CommandOutcome::Show {
+            text: "plain red end".to_string()
+        })
+    );
+    // The DSH-shaped `rawInput` keeps its leading separator.
+    let (dsh, _, args) = dispatched(&mut app, "/ext-dsh a b");
+    assert_eq!(
+        super::run_command(&dsh, &args).await,
+        Ok(CommandOutcome::Show {
+            text: "\" a b\"".to_string()
+        })
+    );
+
+    // Disabling the plugin removes every command at once: the registry stops
+    // listing them, and the reference a user (or palette) still holds fails
+    // closed instead of reaching the host.
+    engine.set_plugins(fixture.disable("ext-commands"));
+    engine.sync().await.unwrap();
+    assert!(manager.live_command_names().is_empty());
+    assert_eq!(hint("ext-echo"), None);
+    let error = super::run_command(&echo, "x").await.unwrap_err();
+    assert!(error.contains("no longer registered"), "{error}");
+    manager.shutdown().await;
+}
+
+/// A command may never take a built-in's name or another plugin's: the
+/// registration is refused with a reason and that plugin fails to activate,
+/// without disturbing the plugin that already holds the name.
+#[tokio::test]
+async fn extension_commands_never_shadow_built_ins_or_other_plugins() {
+    let Some(node) = node_for_tests("extension_commands_never_shadow") else {
+        return;
+    };
+    let _policy = TestPolicyGuard::extension_host(true);
+    let fixture = FixturePlugins::new(&[
+        "ext-commands",
+        "commands-clash-builtin",
+        "commands-clash-plugin",
+    ])
+    .await;
+    let manager = fixture.manager(node);
+    let engine = manager.attach(fixture.registry());
+    engine.sync().await.unwrap();
+    let state = |name: &str| manager.owner_state(&plugin_id(&fixture, name)).unwrap();
+    match state("commands-clash-builtin") {
+        OwnerState::Failed(reason) => {
+            assert!(
+                reason.contains("collides with a built-in command"),
+                "{reason}"
+            )
+        }
+        other => panic!("{other:?}"),
+    }
+    // Activation order between the other two is not fixed: exactly one holds
+    // `/ext-echo`, and the other failed on it.
+    let (winner, loser) = match (state("ext-commands"), state("commands-clash-plugin")) {
+        (OwnerState::Active, OwnerState::Failed(reason)) => ("ext-commands", reason),
+        (OwnerState::Failed(reason), OwnerState::Active) => ("commands-clash-plugin", reason),
+        other => panic!("{other:?}"),
+    };
+    assert!(loser.contains("already registered by extension"), "{loser}");
+    let live = manager.live_command_names();
+    assert_eq!(live.iter().filter(|name| *name == "ext-echo").count(), 1);
+    assert!(!live.contains(&"help".to_string()));
+    let holder = manager
+        .shared
+        .registry
+        .lock()
+        .unwrap()
+        .live_commands()
+        .into_iter()
+        .find(|command| command.name == "ext-echo")
+        .unwrap();
+    assert_eq!(holder.plugin_name, winner);
+    let diagnostics = manager.diagnostics().join("\n");
+    assert!(
+        diagnostics.contains("command `help` refused"),
+        "{diagnostics}"
+    );
+    manager.shutdown().await;
+
+    // The user registry is the last line: a command already defined by a
+    // markdown source, or by a built-in, wins the spelling and the extension
+    // one is left out with a load error naming why.
+    let mut registry = crate::commands::user_registry::UserCommandRegistry::from_loaded(vec![(
+        "ext-echo".to_string(),
+        "markdown wins".to_string(),
+    )]);
+    let entry = |name: &str| super::command::ExtensionCommandEntry {
+        registration: super::registry::CommandRegistration {
+            handle: 1,
+            owner: protocol::OwnerRef {
+                plugin_id: "p".into(),
+                generation: 1,
+                owner_token: "t".into(),
+            },
+            plugin_name: "p".into(),
+            content_hash: "h".into(),
+            name: name.to_string(),
+            description: "d".into(),
+            argument_hint: None,
+        },
+        authority: fake_authority("p"),
+    };
+    registry.load_extension_commands(vec![entry("ext-echo"), entry("help")]);
+    let errors: Vec<String> = registry
+        .load_errors()
+        .iter()
+        .map(|error| error.message.clone())
+        .collect();
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("'/ext-echo' collides with another command")),
+        "{errors:?}"
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("'/help' collides with a built-in command")),
+        "{errors:?}"
+    );
+    assert!(registry.get("ext-echo").unwrap().extension.is_none());
+}
+
+/// A command from a host that is down says so immediately instead of
+/// hanging, and a revoked registration cannot be run.
+#[tokio::test]
+async fn a_command_from_a_dead_host_reports_host_down() {
+    let policy = TestPolicyGuard::extension_host(true);
+    let manager = Arc::new(ExtensionHostManager::new(ExtensionHostOptions::default()));
+    let reference = {
+        let mut registry = manager.shared.registry.lock().unwrap();
+        let owner = registry.begin_owner("probe", "probe", fake_authority("probe"), "hash");
+        registry.mark_active(&owner);
+        let handle = register_command(&mut registry, &owner, "probe-cmd", None).unwrap();
+        super::command::ExtensionCommandRef {
+            handle,
+            plugin_id: "probe".into(),
+            generation: owner.generation,
+            origin: "extension:probe".into(),
+        }
+    };
+    let refused = "start failed: no runtime";
+    for (slot, why) in [
+        (
+            super::HostSlot::Restarting {
+                reason: "exited with signal: 9 (SIGKILL)".into(),
+            },
+            "restarting after: exited with signal: 9 (SIGKILL)".to_string(),
+        ),
+        (
+            super::HostSlot::Failed {
+                reason: refused.into(),
+                stderr_tail: String::new(),
+            },
+            format!("{refused} (change or reload a plugin to retry)"),
+        ),
+        (super::HostSlot::Idle, "not started".to_string()),
+    ] {
+        *manager.shared.host.lock().unwrap() = slot;
+        let started = Instant::now();
+        let error = super::command::run(&manager.shared, &reference, "")
+            .await
+            .unwrap_err();
+        assert!(
+            error.starts_with(&format!("extension host is down: {why}")),
+            "{error}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+    drop(policy);
+    let _off = TestPolicyGuard::extension_host(false);
+    let error = super::command::run(&manager.shared, &reference, "")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error,
+        "extension host is down: disabled by config ([features] extension_host is off)"
+    );
+    assert!(super::live_commands_for(Path::new("/w")).is_empty());
+}
+
+/// The call is bounded by `command_run_deadline` and cancelled in the host,
+/// which stays usable; an in-flight command fails with "host down" when the
+/// host is killed, and after the restart only a fresh reference works.
+#[tokio::test]
+async fn a_slow_command_is_cancelled_and_a_killed_host_fails_it_as_down() {
+    let Some(node) = node_for_tests("slow_command") else {
+        return;
+    };
+    let _policy = TestPolicyGuard::extension_host(true);
+    let fixture = FixturePlugins::new(&["ext-commands"]).await;
+    let manager = Arc::new(ExtensionHostManager::new(ExtensionHostOptions {
+        runtime: NODE,
+        node_override: Some(node),
+        bun_override: None,
+        root: Some(fixture.root.clone()),
+        supervision: super::SupervisionOptions {
+            command_run_deadline: Duration::from_millis(300),
+            ..fast_supervision()
+        },
+    }));
+    let engine = manager.attach(fixture.registry());
+    engine.sync().await.unwrap();
+    let reference = |name: &str| {
+        manager
+            .commands_for_workspace(fixture.workspace())
+            .into_iter()
+            .find(|entry| entry.registration.name == name)
+            .unwrap_or_else(|| panic!("{name} is not live"))
+            .reference()
+    };
+    let pid = manager.host_pid();
+    let slow = reference("ext-slow");
+    let started = Instant::now();
+    let error = tokio::time::timeout(
+        Duration::from_secs(5),
+        super::command::run(&manager.shared, &slow, "30000"),
+    )
+    .await
+    .expect("the deadline bounds the command")
+    .unwrap_err();
+    assert!(error.contains("timed out"), "{error}");
+    assert!(started.elapsed() < Duration::from_secs(2));
+    // The same host takes the next command.
+    let echo = reference("ext-echo");
+    assert_eq!(
+        super::command::run(&manager.shared, &echo, "again").await,
+        Ok(super::command::CommandOutcome::Show {
+            text: "echo: again".to_string()
+        })
+    );
+    assert_eq!(manager.host_pid(), pid);
+
+    // Kill the host under a running command with a longer deadline.
+    let manager2 = Arc::clone(&manager);
+    // The kill lands well inside the 300 ms deadline.
+    let running = {
+        let slow = slow.clone();
+        tokio::spawn(async move { super::command::run(&manager2.shared, &slow, "30000").await })
+    };
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    #[cfg(unix)]
+    let status = std::process::Command::new("kill")
+        .args(["-9", &pid.unwrap().to_string()])
+        .status()
+        .unwrap();
+    #[cfg(windows)]
+    let status = std::process::Command::new("taskkill")
+        .args(["/F", "/PID", &pid.unwrap().to_string()])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let error = tokio::time::timeout(Duration::from_secs(2), running)
+        .await
+        .expect("the call resolves")
+        .unwrap()
+        .unwrap_err();
+    assert!(
+        error.starts_with("extension host is down: exited:"),
+        "{error}"
+    );
+    // The supervisor restarts the host and replays the plugin under a new
+    // generation: the old reference is stale, a fresh one works.
+    wait_host(&manager, || {
+        manager.spawn_attempts() == 2 && manager.live_command_names().contains(&"ext-echo".into())
+    })
+    .await;
+    let error = super::command::run(&manager.shared, &echo, "old")
+        .await
+        .unwrap_err();
+    assert!(error.contains("no longer registered"), "{error}");
+    let fresh = reference("ext-echo");
+    assert_ne!(fresh.generation, echo.generation);
+    assert_eq!(
+        super::command::run(&manager.shared, &fresh, "new").await,
+        Ok(super::command::CommandOutcome::Show {
+            text: "echo: new".to_string()
+        })
+    );
+    manager.shutdown().await;
 }

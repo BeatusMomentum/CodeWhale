@@ -23,6 +23,7 @@ var METHODS = [
   { name: "ext/activate", direction: "core_to_host", request: true, params: "ActivateParams" },
   { name: "ext/deactivate", direction: "core_to_host", request: true, params: "DeactivateParams" },
   { name: "tool/call", direction: "core_to_host", request: true, params: "ToolCallParams" },
+  { name: "command/run", direction: "core_to_host", request: true, params: "CommandRunParams" },
   { name: "$/cancel", direction: "core_to_host", request: false, params: "CancelParams" },
   { name: "host/hello", direction: "host_to_core", request: false, params: "HelloParams" },
   { name: "host/ready", direction: "host_to_core", request: false, params: "EmptyParams" },
@@ -41,6 +42,11 @@ var SHAPES = {
   CancelParams: {
     strict: true,
     required: { id: "uint" },
+    optional: {}
+  },
+  CommandRunParams: {
+    strict: false,
+    required: { handle: "uint", command_id: "string", raw_input: "string", deadline_ms: "uint" },
     optional: {}
   },
   DeactivateParams: {
@@ -100,8 +106,13 @@ var SHAPES = {
   },
   RegisterParams: {
     strict: true,
-    required: { owner: { ref: "OwnerRef" }, kind: { enum: ["tool"] }, spec: { ref: "ToolSpecWire" } },
+    required: { owner: { ref: "OwnerRef" }, kind: { enum: ["tool", "command"] }, spec: { ref: "RegisterSpecWire" } },
     optional: {}
+  },
+  RegisterSpecWire: {
+    strict: true,
+    required: { name: "string", description: "string" },
+    optional: { input_schema: "object", argument_hint: "string" }
   },
   RpcErrorWire: {
     strict: true,
@@ -111,11 +122,6 @@ var SHAPES = {
   ToolCallParams: {
     strict: false,
     required: { handle: "uint", call_id: "string", input: "json", deadline_ms: "uint" },
-    optional: {}
-  },
-  ToolSpecWire: {
-    strict: true,
-    required: { name: "string", description: "string", input_schema: "object" },
     optional: {}
   },
   UnregisterParams: {
@@ -247,6 +253,11 @@ function validateMessage(value, direction) {
     checkShape(method, params, SHAPES[spec.params]);
     if (method === "host/hello" && params.runtime.name !== "bun" && params.runtime.name !== "node") {
       throw new ProtocolError(`host/hello.runtime.name: unknown runtime \`${params.runtime.name}\``);
+    }
+    if (method === "registry/register") {
+      const { kind, spec: spec2 } = params;
+      const reason = kind === "tool" && spec2.input_schema == null ? "a tool registration needs `spec.input_schema`" : kind === "tool" && spec2.argument_hint != null ? "a tool registration has no `spec.argument_hint`" : kind === "command" && spec2.input_schema != null ? "a command registration has no `spec.input_schema`" : void 0;
+      if (reason !== void 0) throw new ProtocolError(`${method}: ${reason}`);
     }
     return value;
   }

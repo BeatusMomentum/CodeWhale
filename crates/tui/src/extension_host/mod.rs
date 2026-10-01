@@ -27,9 +27,15 @@
 //! plugin snapshot of their own (isolated chats, the empty fallback) never
 //! attach.
 //!
-//! Known limitations (phase 1, by design — see the design doc §8):
-//! * Tools only: no commands, hooks, skills, prompt sections, MCP, or
-//!   `core/call` (the host cannot ask the core to do anything).
+//! Commands: a plugin may also contribute slash commands ([`command`]). They
+//! are owned registrations like tools, loaded into the user command registry
+//! at the lowest precedence, and run by `command/run` only when the user
+//! invokes them.
+//!
+//! Known limitations (by design — see the design doc §8 and its "As built"
+//! sections):
+//! * Tools and slash commands only: no hooks, skills, prompt sections, MCP,
+//!   or `core/call` (the host cannot ask the core to do anything).
 //! * Heartbeat and bounded automatic restart preserve the shared crash budget
 //!   across engine creation and replay. Dead-host calls fail with a typed
 //!   error and are never replayed. Three crashes in five minutes require an
@@ -92,6 +98,7 @@
 //!   files in the staged snapshot are covered by Rust's per-call receipt
 //!   check, not re-hashed by the host.
 
+pub(crate) mod command;
 pub(crate) mod protocol;
 pub(crate) mod registry;
 pub(crate) mod supervisor;
@@ -112,9 +119,9 @@ use sha2::{Digest, Sha256};
 
 use self::protocol::{
     ActivateParams, ActivateResult, CoreRequest, DeactivateParams, DeactivateResult, EntryRef,
-    OwnerRef, RegisterResult,
+    OwnerRef, RegisterKind, RegisterResult,
 };
-use self::registry::{OwnerRegistry, OwnerState, ToolRegistration};
+use self::registry::{CommandRegistration, OwnerRegistry, OwnerState, ToolRegistration};
 use self::supervisor::{HostEvents, HostProcess};
 use crate::plugins::PluginRegistry;
 use crate::plugins::activation::{self, PluginActivationCapability};
@@ -236,6 +243,10 @@ pub struct SupervisionOptions {
     /// (`tool::TOOL_CALL_DEADLINE`); sent to the host as `deadline_ms`. The
     /// other methods' deadlines are fixed (`CoreRequest::deadline`).
     pub tool_call_deadline: Duration,
+    /// How long the user waits for one extension command before the core
+    /// cancels it (`command::COMMAND_RUN_DEADLINE`); sent to the host as
+    /// `deadline_ms`.
+    pub command_run_deadline: Duration,
 }
 
 impl ExtensionHostOptions {
@@ -268,6 +279,7 @@ impl Default for SupervisionOptions {
             dirty_limit: 2,
             memory_cap: supervisor::HOST_MEMORY_CAP,
             tool_call_deadline: tool::TOOL_CALL_DEADLINE,
+            command_run_deadline: command::COMMAND_RUN_DEADLINE,
         }
     }
 }
@@ -598,9 +610,12 @@ impl ManagerShared {
     /// a running host (first, so a call to a host that is down says why),
     /// exact owner generation, the reviewed receipt and staged bytes, the
     /// Native adapter in this build's policy, and the host again.
-    pub(crate) async fn live_host_for(
+    ///
+    /// `owner_if_live` runs under the registry lock and names the owner
+    /// generation the call belongs to, or why it is no longer registered.
+    async fn live_host(
         &self,
-        registration: &ToolRegistration,
+        owner_if_live: impl FnOnce(&OwnerRegistry) -> Result<OwnerRef, String>,
     ) -> Result<Arc<HostProcess>, String> {
         let policy = activation::extension_host_policy_enabled();
         if !policy {
@@ -609,14 +624,9 @@ impl ManagerShared {
         self.ready_host().map_err(|status| host_down(&status))?;
         let authority = {
             let registry = self.registry.lock().expect("registry lock");
-            if !registry.is_live(registration.handle, &registration.owner) {
-                return Err(format!(
-                    "extension tool `{}` from `{}` is no longer registered",
-                    registration.name, registration.plugin_name
-                ));
-            }
+            let owner = owner_if_live(&registry)?;
             registry
-                .authority_for(&registration.owner)
+                .authority_for(&owner)
                 .ok_or_else(|| "extension owner has no authority".to_string())?
         };
         tokio::task::spawn_blocking(move || {
@@ -629,6 +639,48 @@ impl ManagerShared {
         .await
         .map_err(|error| format!("authority check failed: {error}"))??;
         self.ready_host().map_err(|status| host_down(&status))
+    }
+
+    pub(crate) async fn live_host_for(
+        &self,
+        registration: &ToolRegistration,
+    ) -> Result<Arc<HostProcess>, String> {
+        self.live_host(|registry| {
+            if registry.is_live(registration.handle, &registration.owner) {
+                Ok(registration.owner.clone())
+            } else {
+                Err(format!(
+                    "extension tool `{}` from `{}` is no longer registered",
+                    registration.name, registration.plugin_name
+                ))
+            }
+        })
+        .await
+    }
+
+    /// [`Self::live_host`] for a command the user just invoked: the exact
+    /// registration (handle and owner generation) must still be admitted.
+    pub(crate) async fn live_host_for_command(
+        &self,
+        command: &command::ExtensionCommandRef,
+    ) -> Result<(Arc<HostProcess>, CommandRegistration), String> {
+        let mut found = None;
+        let host = self
+            .live_host(|registry| {
+                let registration = registry
+                    .live_command(command.handle, &command.plugin_id, command.generation)
+                    .ok_or_else(|| {
+                        format!(
+                            "extension command from `{}` is no longer registered (the plugin was reloaded, disabled or lost trust)",
+                            command.plugin_id
+                        )
+                    })?;
+                let owner = registration.owner.clone();
+                found = Some(registration);
+                Ok(owner)
+            })
+            .await?;
+        Ok((host, found.expect("set when the owner was found")))
     }
 }
 
@@ -661,15 +713,19 @@ impl HostEvents for Events {
             .registry
             .lock()
             .expect("registry lock")
-            .register_tool(params);
+            .register(params);
         drop(slot);
         match result {
             Ok(handle) => RegisterResult::Admitted { handle },
             Err(reason) => {
+                let kind = match params.kind {
+                    RegisterKind::Tool => "tool",
+                    RegisterKind::Command => "command",
+                };
                 shared.plugin_diagnostic(
                     &params.owner.plugin_id,
                     format!(
-                        "extension `{}` tool `{}` refused: {reason}",
+                        "extension `{}` {kind} `{}` refused: {reason}",
                         params.owner.plugin_id, params.spec.name
                     ),
                 );
@@ -1072,6 +1128,19 @@ impl ExtensionHostManager {
 
     #[cfg(test)]
     #[must_use]
+    pub fn live_command_names(&self) -> Vec<String> {
+        self.shared
+            .registry
+            .lock()
+            .expect("registry lock")
+            .live_commands()
+            .into_iter()
+            .map(|command| command.name)
+            .collect()
+    }
+
+    #[cfg(test)]
+    #[must_use]
     pub fn owner_state(&self, plugin_id: &str) -> Option<OwnerState> {
         self.shared
             .registry
@@ -1145,6 +1214,7 @@ impl ExtensionHostManager {
                     desired: BTreeMap::new(),
                 },
             );
+        command::bump_epoch();
         HostAttachment {
             id,
             manager: Arc::clone(self),
@@ -1176,6 +1246,7 @@ impl ExtensionHostManager {
                 state.desired.clear();
             }
         }
+        command::bump_epoch();
     }
 
     /// Add the live tools of the owners attachment `id` desires to
@@ -1236,6 +1307,53 @@ impl ExtensionHostManager {
             )));
         }
         installed
+    }
+
+    /// The live commands of the owners that engines attached for `workspace`
+    /// desire, each bound to the reviewed bytes that engine desires: what the
+    /// user registry loads for that workspace. A workspace never sees another
+    /// workspace's project plugins' commands.
+    pub(crate) fn commands_for_workspace(
+        &self,
+        workspace: &Path,
+    ) -> Vec<command::ExtensionCommandEntry> {
+        let mut desired: BTreeSet<(String, String)> = BTreeSet::new();
+        for state in self
+            .shared
+            .attachments
+            .lock()
+            .expect("attachments lock")
+            .values()
+            .filter(|state| state.plugins.workspace() == workspace)
+        {
+            desired.extend(
+                state
+                    .desired
+                    .iter()
+                    .map(|(plugin_id, hash)| (plugin_id.clone(), hash.clone())),
+            );
+        }
+        if desired.is_empty() {
+            return Vec::new();
+        }
+        let registry = self.shared.registry.lock().expect("registry lock");
+        registry
+            .live_commands()
+            .into_iter()
+            .filter(|command| {
+                desired.contains(&(
+                    command.owner.plugin_id.clone(),
+                    command.content_hash.clone(),
+                ))
+            })
+            .filter_map(|registration| {
+                let authority = registry.authority_for(&registration.owner)?;
+                Some(command::ExtensionCommandEntry {
+                    registration,
+                    authority,
+                })
+            })
+            .collect()
     }
 
     /// Reconcile without waiting (turn builds, session start,
@@ -1361,6 +1479,7 @@ impl ExtensionHostManager {
         );
         let mut failure = None;
         let mut tools = Vec::new();
+        let mut commands = Vec::new();
         for (path, sha256) in &want.entries {
             let request = CoreRequest::Activate(ActivateParams {
                 owner: owner.clone(),
@@ -1373,7 +1492,13 @@ impl ExtensionHostManager {
             });
             let outcome = host.call(request, Some(plugin_id.to_string())).await;
             match outcome.map(serde_json::from_value::<ActivateResult>) {
-                Ok(Ok(ActivateResult::Ok { tools: mut names })) => tools.append(&mut names),
+                Ok(Ok(ActivateResult::Ok {
+                    tools: mut names,
+                    commands: mut slash,
+                })) => {
+                    tools.append(&mut names);
+                    commands.append(&mut slash);
+                }
                 Ok(Ok(ActivateResult::Failed { diagnostic })) => {
                     failure = Some(diagnostic);
                     break;
@@ -1399,9 +1524,14 @@ impl ExtensionHostManager {
                     shared.plugin_diagnostic(
                         plugin_id,
                         format!(
-                            "extension `{}` active (tools: {})",
+                            "extension `{}` active (tools: {}; commands: {})",
                             want.plugin_name,
-                            tools.join(", ")
+                            tools.join(", "),
+                            commands
+                                .iter()
+                                .map(|name| format!("/{name}"))
+                                .collect::<Vec<_>>()
+                                .join(", ")
                         ),
                     );
                 }
@@ -1657,13 +1787,13 @@ pub(crate) fn render_status(manager: &ExtensionHostManager) -> String {
         manager.spawn_attempts(),
         manager.attached_engines()
     );
-    let (tools, owners) = {
+    let (tools, commands, owners) = {
         let registry = manager.shared.registry.lock().expect("registry lock");
         let owners = registry
             .owners()
             .filter(|entry| entry.state == OwnerState::Active)
             .count();
-        (registry.live_tools(), owners)
+        (registry.live_tools(), registry.live_commands(), owners)
     };
     if owners > 1 {
         let _ = write!(
@@ -1676,6 +1806,13 @@ pub(crate) fn render_status(manager: &ExtensionHostManager) -> String {
             out,
             "\n  tool {} (extension:{}; needs approval, which your approval mode or a session grant for this exact call of this plugin build may give)",
             tool.name, tool.plugin_name
+        );
+    }
+    for command in commands {
+        let _ = write!(
+            out,
+            "\n  command /{} (extension:{}; runs only when you invoke it)",
+            command.name, command.plugin_name
         );
     }
     let diagnostics = manager.diagnostics();
@@ -1695,6 +1832,25 @@ pub fn plugins_changed(plugins: Arc<PluginRegistry>) {
         manager.retry();
         manager.reconcile_in_background();
     }
+}
+
+/// The live extension commands of `workspace`'s reviewed plugins, for the user
+/// command registry. Empty with the flag off. Never starts the host.
+#[must_use]
+pub(crate) fn live_commands_for(workspace: &Path) -> Vec<command::ExtensionCommandEntry> {
+    if !activation::extension_host_policy_enabled() {
+        return Vec::new();
+    }
+    manager().commands_for_workspace(workspace)
+}
+
+/// Run an extension command the user invoked; see [`command::run`]. Errors
+/// are the text to show.
+pub async fn run_command(
+    command: &command::ExtensionCommandRef,
+    raw_input: &str,
+) -> Result<command::CommandOutcome, String> {
+    command::run(&manager().shared, command, raw_input).await
 }
 
 /// The `/plugin` section. With the experimental host off it is one line
@@ -1790,6 +1946,7 @@ impl DesiredScan {
         for (id, _, desired) in self.attachments {
             current.get_mut(&id).expect("validated attachment").desired = desired;
         }
+        command::bump_epoch();
         Some((self.owners, self.errors))
     }
 }
@@ -1865,6 +2022,7 @@ impl HostAttachment {
             state.plugins = plugins;
             state.desired.clear();
         }
+        command::bump_epoch();
     }
 
     /// Reconcile the host against every attachment, waiting for it.
@@ -1889,6 +2047,7 @@ impl Drop for HostAttachment {
         if let Ok(mut attachments) = self.manager.shared.attachments.lock() {
             attachments.remove(&self.id);
         }
+        command::bump_epoch();
     }
 }
 

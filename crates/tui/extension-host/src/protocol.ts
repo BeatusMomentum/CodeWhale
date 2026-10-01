@@ -1,5 +1,5 @@
 /**
- * Codewhale extension-host protocol, version 1 (phase 1 subset).
+ * Codewhale extension-host protocol, version 1.
  *
  * The Rust serde types in `crates/tui/src/extension_host/protocol.rs` are the
  * source of truth. The constants, the method table, every params shape and the
@@ -171,6 +171,19 @@ export function validateMessage(value: unknown, direction: Direction): Message {
     // Rust checks this after decoding `HelloParams` (`parse_host_message`).
     if (method === 'host/hello' && params.runtime.name !== 'bun' && params.runtime.name !== 'node') {
       throw new ProtocolError(`host/hello.runtime.name: unknown runtime \`${params.runtime.name}\``)
+    }
+    // Which spec fields each kind uses: `RegisterParams::check_spec`.
+    if (method === 'registry/register') {
+      const { kind, spec } = params
+      const reason =
+        kind === 'tool' && spec.input_schema == null
+          ? 'a tool registration needs `spec.input_schema`'
+          : kind === 'tool' && spec.argument_hint != null
+            ? 'a tool registration has no `spec.argument_hint`'
+            : kind === 'command' && spec.input_schema != null
+              ? 'a command registration has no `spec.input_schema`'
+              : undefined
+      if (reason !== undefined) throw new ProtocolError(`${method}: ${reason}`)
     }
     return value as Message
   }

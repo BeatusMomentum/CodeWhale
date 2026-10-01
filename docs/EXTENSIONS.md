@@ -1,9 +1,10 @@
-# Writing an extension tool
+# Writing an extension tool or command
 
 The experimental TypeScript extension host runs reviewed plugin code in a
 shared Node process (or, as an opt-in, Bun). Rust still owns sessions, tool admission, approval and
-execution. Extensions currently contribute tools; they cannot provide an
-approval service, run a second agent loop or replace built-in tools.
+execution. Extensions currently contribute tools and slash commands; they
+cannot provide an approval service, run a second agent loop or replace
+built-in tools or commands.
 
 ## Quick start
 
@@ -19,6 +20,8 @@ files or use the network.
    Read the review and personally run its exact `/plugin trust <token>` command,
    then enable the plugin. Trust alone does not execute the code.
 5. Ask Codewhale to use `hello_greet`. The tool follows the normal approval gate.
+6. Run `/hello-greet Codewhale`. The command runs when you type it, and shows
+   its answer in the transcript with its origin, `extension:hello-extension`.
 
 An authoring agent should stop after installation and validation and present
 the review to the person. Do not trust or enable a bundle automatically.
@@ -107,9 +110,9 @@ require another review. See [bundle rules](PLUGIN_BUNDLES.md).
 
 Export a Cordis plugin function or an object with `apply`. The host supplies
 one shared Cordis and the supported DSH compatibility services. The example's
-`inject = ['tools']` asks for the existing tool registry. The supplied service
-names are `tools`, `logger`, `events`, `reflect` and `registry`; commands,
-`core/call`, persistent extension storage,
+`inject = ['tools', 'commands']` asks for the tool and command registries. The
+supplied service names are `tools`, `commands`, `logger`, `events`, `reflect`
+and `registry`; `core/call`, persistent extension storage,
 hooks, skills and prompt providers are not host services yet. A required
 service that is unavailable fails activation with a diagnostic.
 
@@ -134,6 +137,59 @@ tool configuration. Registration never grants permission to execute it.
 Return a JSON value or text; the host renders it into ordinary tool output.
 Avoid secrets in descriptions, logs and results. An approval card's wording
 and identity come from Rust, never from plugin-supplied labels.
+
+## Command rules
+
+Register a slash command with `ctx.commands.register`, which returns an
+idempotent disposer (the registration is also removed when the plugin unloads):
+
+```ts
+ctx.commands.register({
+  name: 'hello-greet',            // /hello-greet
+  description: 'Greet someone.',  // one line, shown in the palette and /help
+  argumentHint: '[name]',         // optional; a command with a hint waits in
+                                  // the composer for arguments
+  handler({ args, signal }) {
+    return { kind: 'success', text: `Hello, ${args || 'world'}!` }
+  },
+})
+```
+
+Names are lower case, start with a letter and use only `a-z`, `0-9`, `_` and
+`-` (at most 64 characters). A command can never take the name of a built-in
+command (or one of its aliases) or of another plugin's command: the
+registration is refused, activation fails, and the reason is in `/plugin`.
+A user, workspace or plugin-manifest markdown command with the same name wins
+the spelling and the extension command is left out of the registry. Descriptions
+(1 KiB) and hints (256 bytes) are single-line text.
+
+A handler runs only when the **user** types the command; invoking it is the
+user's own action and needs no approval. It can only return an answer:
+
+- a string, or `{ kind: 'success', text? }`: shown in the transcript;
+- `{ kind: 'error', text }` or a thrown error: shown as a failure;
+- `{ kind: 'submit', prompt, text? }`: `prompt` is sent as the user's next
+  message, visibly, through the ordinary turn. Whatever the model then does,
+  including every tool call, is gated as usual. `text` is shown beside it.
+
+The handler cannot call the model, a tool or approval. Output is stripped of
+terminal escape sequences and cut at 64 KiB; a prompt over 128 KiB is refused,
+not truncated. A command has 30 seconds: past it Codewhale cancels the call
+(`signal` aborts) and reports a timeout. If the host is down, the command
+fails at once with why.
+
+`args` is what follows the command name, trimmed. The invocation also carries
+`signal`, a `commandId` and an empty `attachments`. DSH plugins using
+`ctx.commands.register({ name, description, input: { hint }, handler })` and
+returning `{ kind: 'success' | 'error', text }` run unchanged, including
+`import { CommandDefinitionId } from '@deepseek-ai/dsh-commands/brand'` (the
+only `dsh-commands` import the host resolves; `definitionId` is accepted and
+ignored). DSH's `rawInput` is provided (it keeps the leading separator,
+`' name'`). Not
+provided: DSH's `agent` (the host has no agent or session handle),
+attachments (`input.attachments: true` fails activation), a `list`/`find`/
+`execute` surface, and command lifecycle events in a session log. Commands are
+TUI-only: the Runtime API does not list or run them.
 
 ## Execution context
 
@@ -196,7 +252,8 @@ covered. A Node host on macOS has no kernel limit: Codewhale checks its
 resident size at each 3-second heartbeat and kills it past the cap. Under Node
 the JavaScript heap is also limited to 256 MiB. The host has a
 32 MiB frame limit, 256 in-flight request
-limit (plus a reserved heartbeat), 128 tools per owner and 1024 per host. Tool
+limit (plus a reserved heartbeat), 128 tools per owner and 1024 per host, and
+64 commands per owner and 256 per host. Tool
 descriptions are at most 4 KiB and schemas 64 KiB. Tool calls have a 120-second
-deadline. The feature stays Experimental and off by default; local fixture
+deadline and commands a 30-second one. The feature stays Experimental and off by default; local fixture
 tests do not establish sandbox parity, provider behavior or release readiness.

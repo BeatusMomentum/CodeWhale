@@ -15,6 +15,7 @@ import {
   ErrorCode,
   type ActivateParams,
   type ActivateResult,
+  type CommandResultWire,
   type ContentBlockWire,
   type DeactivateResult,
   type Json,
@@ -23,14 +24,24 @@ import {
 } from './protocol.ts'
 import { RpcError, type RpcPeer } from './rpc.ts'
 import { explainImportError } from './dsh/resolve-hooks.ts'
+import { OwnedRegistrations } from './shims/owned.ts'
+import {
+  commandSpec,
+  defineCommandsService,
+  makeInvocation,
+  normalizeResult,
+  type LocalCommand,
+  type NormalizedCommand,
+} from './shims/commands.ts'
 
 /** Context key carrying the owner record; inherited by every nested fiber. */
 export const OWNER = Symbol.for('codewhale.extension-host.owner')
 
 /**
  * Service names a plugin may never provide: each is one authority the Rust
- * core owns (§4.3 of the design). `tools` and `logger` are provided by the
- * host root as shims and are refused to plugins for the same reason.
+ * core owns (§4.3 of the design). `tools`, `commands` and `logger` are
+ * provided by the host root as shims and are refused to plugins for the same
+ * reason.
  */
 export const REFUSED_SERVICES = new Set([
   'approval',
@@ -49,7 +60,7 @@ export const REFUSED_SERVICES = new Set([
 ])
 
 /** Services the root provides; `inject` of anything else fails activation. */
-const PROVIDED_SERVICES = new Set(['tools', 'logger', 'events', 'reflect', 'registry'])
+const PROVIDED_SERVICES = new Set(['tools', 'commands', 'logger', 'events', 'reflect', 'registry'])
 
 const ACTIVATE_DEADLINE_MS = 5_000
 const DISPOSE_DEADLINE_MS = 2_000
@@ -62,6 +73,7 @@ export interface OwnerRecord {
   pendingRegistrations: Set<Promise<void>>
   refusals: string[]
   tools: Map<number, LocalTool>
+  commands: Map<number, LocalCommand<OwnerRecord>>
   disposing?: Promise<void>
   state: 'activating' | 'active' | 'failed' | 'disposed'
 }
@@ -111,27 +123,42 @@ function isJson(value: unknown, depth = 0): value is Json {
 export class HostRoot {
   readonly root: any
   readonly owners = new Map<string, OwnerRecord>()
-  private readonly toolsByHandle = new Map<number, LocalTool>()
+  private readonly toolRegistrations: OwnedRegistrations<OwnerRecord, LocalTool>
+  private readonly commandRegistrations: OwnedRegistrations<OwnerRecord, LocalCommand<OwnerRecord>>
 
   constructor(private readonly rpc: RpcPeer) {
     const root: any = new Context()
     this.root = root
     const host = this
+    this.toolRegistrations = new OwnedRegistrations(
+      rpc,
+      'tool',
+      (owner) => owner.tools,
+      (message, owner) => this.log('warn', message, owner),
+    )
+    this.commandRegistrations = new OwnedRegistrations(
+      rpc,
+      'command',
+      (owner) => owner.commands,
+      (message, owner) => this.log('warn', message, owner),
+    )
 
     // Refuse core service names before any plugin can run. The refusal does
     // not depend on who calls: `ctx.root.provide(...)` runs with the root as
     // its context, so an owner check alone could be sidestepped. The one
-    // exception is the host's own `tools` shim, provided once, below.
+    // exception is each host shim of its own name, provided once, below.
+    const shimClasses = new Map<string, Function>()
+    const shimsProvided = new Set<string>()
     const reflect = root.reflect
     const originalProvide = reflect.provide
-    let toolsShimProvided = false
     reflect.provide = function (this: any, name: string, value: unknown, ...rest: unknown[]) {
       if (REFUSED_SERVICES.has(name)) {
-        const hostShim = name === 'tools' && !toolsShimProvided && value instanceof ToolsShim
+        const shim = shimClasses.get(name)
+        const hostShim = shim !== undefined && !shimsProvided.has(name) && value instanceof (shim as any)
         if (!hostShim) {
           throw new Error(`extension may not provide core service \`${name}\`: the Codewhale core owns it`)
         }
-        toolsShimProvided = true
+        shimsProvided.add(name)
       }
       return originalProvide.call(this, name, value, ...rest)
     }
@@ -162,11 +189,18 @@ export class HostRoot {
       }
     }
     // Plugins share one process, so the owner token is not a boundary
-    // between them (design §4.4, threat 3). Freezing the shim at least stops
+    // between them (design §4.4, threat 3). Freezing a shim at least stops
     // the direct route of one plugin rewriting `register` for every other
     // plugin; shared globals remain, and the approval card says so.
     Object.freeze(ToolsShim.prototype)
+    const CommandsShim = defineCommandsService<OwnerRecord>({
+      ownerOf: (ctx) => ctx[OWNER],
+      addCommand: (owner, command) => host.addCommand(owner, command),
+    })
+    shimClasses.set('tools', ToolsShim)
+    shimClasses.set('commands', CommandsShim)
     root.plugin(ToolsShim)
+    root.plugin(CommandsShim)
   }
 
   log(level: string, msg: string, owner?: OwnerRecord) {
@@ -178,54 +212,16 @@ export class HostRoot {
   /** Called inside the owner's effect; returns the effect's cleanup. */
   private addTool(owner: OwnerRecord, definition: any): () => void {
     const local: LocalTool = { owner, name: definition.name, definition, disposed: false }
-    const registration = this.rpc
-      .request('registry/register', {
-        owner: owner.ref,
-        kind: 'tool',
-        spec: {
-          name: definition.name,
-          description: String(definition.description ?? ''),
-          input_schema: definition.parameters ?? { type: 'object', properties: {} },
-        },
-      })
-      .then(
-        (result: any) => {
-          if (typeof result?.handle === 'number') {
-            local.handle = result.handle
-            if (local.disposed) {
-              void this.unregister(local)
-              return
-            }
-            owner.tools.set(result.handle, local)
-            this.toolsByHandle.set(result.handle, local)
-          } else {
-            const reason = typeof result?.refused === 'string' ? result.refused : 'refused without a reason'
-            owner.refusals.push(`tool \`${definition.name}\` refused: ${reason}`)
-            if (owner.state === 'active') this.log('warn', `tool \`${definition.name}\` refused: ${reason}`, owner)
-          }
-        },
-        (error: unknown) => {
-          owner.refusals.push(`tool \`${definition.name}\` registration failed: ${describeError(error)}`)
-        },
-      )
-      .finally(() => owner.pendingRegistrations.delete(registration))
-    owner.pendingRegistrations.add(registration)
-    return () => {
-      if (local.disposed) return
-      local.disposed = true
-      if (local.handle !== undefined) void this.unregister(local)
-    }
+    return this.toolRegistrations.add(local, {
+      name: definition.name,
+      description: String(definition.description ?? ''),
+      input_schema: definition.parameters ?? { type: 'object', properties: {} },
+    })
   }
 
-  private async unregister(local: LocalTool) {
-    const handle = local.handle!
-    local.owner.tools.delete(handle)
-    this.toolsByHandle.delete(handle)
-    try {
-      await this.rpc.request('registry/unregister', { owner: local.owner.ref, handle })
-    } catch {
-      // The core revokes first; a failed unregister after revocation is expected.
-    }
+  private addCommand(owner: OwnerRecord, definition: NormalizedCommand): () => void {
+    const local: LocalCommand<OwnerRecord> = { owner, name: definition.name, definition, disposed: false }
+    return this.commandRegistrations.add(local, commandSpec(definition))
   }
 
   async activate(params: ActivateParams): Promise<ActivateResult> {
@@ -238,6 +234,7 @@ export class HostRoot {
       pendingRegistrations: new Set(),
       refusals: [],
       tools: new Map(),
+      commands: new Map(),
       state: 'activating',
     }
     this.owners.set(key, owner)
@@ -268,7 +265,11 @@ export class HostRoot {
       }
       if (owner.refusals.length > 0) throw new Error(owner.refusals.join('; '))
       owner.state = 'active'
-      return { status: 'ok', tools: [...owner.tools.values()].map((tool) => tool.name).sort() }
+      return {
+        status: 'ok',
+        tools: [...owner.tools.values()].map((tool) => tool.name).sort(),
+        commands: [...owner.commands.values()].map((command) => command.name).sort(),
+      }
     } catch (error) {
       owner.state = 'failed'
       // All-or-nothing: dispose the partial fiber, rolling back every registration.
@@ -298,11 +299,15 @@ export class HostRoot {
     } catch {
       disposed = false
     }
-    const leaked = [...owner.tools.values()].map((tool) => `tool:${tool.name}`)
+    const leaked = [
+      ...[...owner.tools.values()].map((tool) => `tool:${tool.name}`),
+      ...[...owner.commands.values()].map((command) => `command:${command.name}`),
+    ]
     for (const fiber of owner.fibers) {
       for (const effect of fiber.getEffects?.() ?? []) leaked.push(`effect:${effect.label}`)
     }
-    for (const tool of owner.tools.values()) this.toolsByHandle.delete(tool.handle!)
+    this.toolRegistrations.forget(owner)
+    this.commandRegistrations.forget(owner)
     this.owners.delete(ref.owner_token)
     return { disposed, leaked }
   }
@@ -316,22 +321,40 @@ export class HostRoot {
   }
 
   async callTool(handle: number, input: unknown, callId: string, signal: AbortSignal): Promise<ToolResultWire> {
-    const local = this.toolsByHandle.get(handle)
+    const local = this.toolRegistrations.byHandle.get(handle)
     if (!local || local.disposed || local.owner.state !== 'active') {
       throw new RpcError(ErrorCode.NotAvailable, `tool handle ${handle} is not live`)
     }
     const definition = local.definition
-    const aborted = new Promise<never>((_, reject) => {
-      const onAbort = () => reject(new RpcError(ErrorCode.Cancelled, 'cancelled'))
-      if (signal.aborted) onAbort()
-      else signal.addEventListener('abort', onAbort, { once: true })
-    })
     const run = ownerStorage.run(local.owner, async () => {
       const value = await definition.execute(input, { signal, callId, args: input })
       return renderResult(definition, input, value)
     })
-    return Promise.race([run, aborted])
+    return Promise.race([run, abortedBy(signal)])
   }
+
+  /** `command/run`: only for a handle the core admitted, and only on a user's own invocation. */
+  async callCommand(handle: number, rawInput: string, commandId: string, signal: AbortSignal): Promise<CommandResultWire> {
+    const local = this.commandRegistrations.byHandle.get(handle)
+    if (!local || local.disposed || local.owner.state !== 'active') {
+      throw new RpcError(ErrorCode.NotAvailable, `command handle ${handle} is not live`)
+    }
+    const { definition } = local
+    const run = ownerStorage.run(local.owner, async () => {
+      const value = await definition.handler(makeInvocation(rawInput, commandId, signal))
+      return normalizeResult(definition.name, value)
+    })
+    return Promise.race([run, abortedBy(signal)])
+  }
+}
+
+/** Rejects as cancelled when `signal` aborts. */
+function abortedBy(signal: AbortSignal): Promise<never> {
+  return new Promise<never>((_, reject) => {
+    const onAbort = () => reject(new RpcError(ErrorCode.Cancelled, 'cancelled'))
+    if (signal.aborted) onAbort()
+    else signal.addEventListener('abort', onAbort, { once: true })
+  })
 }
 
 function renderResult(definition: any, input: unknown, value: unknown): ToolResultWire {

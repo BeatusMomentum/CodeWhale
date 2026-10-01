@@ -1807,6 +1807,55 @@ async fn apply_command_result_inner(
                     .await?;
                 }
             }
+            AppAction::RunExtensionCommand {
+                command,
+                name,
+                input,
+            } => {
+                use crate::extension_host::command::CommandOutcome;
+                // The origin labels the output: it is the plugin's text, not
+                // Codewhale's.
+                let origin = command.origin.clone();
+                app.status_message = Some(format!("Running /{name} ({origin})..."));
+                // Awaited here like `/balance`; the call is bounded by its
+                // deadline and cancelled in the host when it expires.
+                match crate::extension_host::run_command(&command, &input).await {
+                    Ok(CommandOutcome::Show { text }) => {
+                        if text.trim().is_empty() {
+                            app.status_message = Some(format!("/{name} completed"));
+                        } else {
+                            app.status_message = None;
+                            app.add_message(HistoryCell::System {
+                                content: format!("/{name} ({origin})\n{text}"),
+                            });
+                        }
+                    }
+                    Ok(CommandOutcome::Submit { prompt, note }) => {
+                        app.status_message = None;
+                        let mut content = format!("/{name} ({origin}) submitted a prompt");
+                        if let Some(note) = note {
+                            content.push_str(&format!("\n{note}"));
+                        }
+                        app.add_message(HistoryCell::System { content });
+                        let queued = build_queued_message(app, prompt);
+                        dispatch_composer_message(
+                            app,
+                            config,
+                            engine_handle,
+                            queued,
+                            DispatchRecovery::Immediate,
+                            ComposerSubmitAction::Submit(app.decide_submit_disposition()),
+                        )
+                        .await?;
+                    }
+                    Err(error) => {
+                        app.status_message = None;
+                        app.add_message(HistoryCell::System {
+                            content: format!("Error: /{name} ({origin}): {error}"),
+                        });
+                    }
+                }
+            }
             AppAction::SendMessage(content) => {
                 let queued = build_queued_message(app, content);
                 dispatch_composer_message(

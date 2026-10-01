@@ -67,17 +67,21 @@ test('the documented typed hello extension activates and executes unchanged', as
   t.after(() => host.stop())
   const entry = fileURLToPath(new URL('../../../../docs/examples/plugins/hello-extension/hello.mts', import.meta.url))
   const { result } = await activate(host, 'hello-extension', entry)
-  assert.deepEqual(result, { status: 'ok', tools: ['hello_greet'] })
-  const tool = host.registry.find((entry) => entry.op === 'register')
+  assert.deepEqual(result, { status: 'ok', tools: ['hello_greet'], commands: ['hello-greet'] })
+  const tool = host.registry.find((entry) => entry.op === 'register' && entry.kind === 'tool')
   const output = await host.call('tool/call', { handle: tool.handle, call_id: 'hello-1', input: { name: 'Codewhale' }, deadline_ms: 5000 })
   assert.deepEqual(output.structured, { greeting: 'Hello, Codewhale!', callId: 'hello-1' })
+  const command = host.registry.find((entry) => entry.op === 'register' && entry.kind === 'command')
+  assert.deepEqual(command.spec, { name: 'hello-greet', description: command.spec.description, argument_hint: '[name]' })
+  const said = await host.call('command/run', { handle: command.handle, command_id: 'c-1', raw_input: 'Codewhale', deadline_ms: 5000 })
+  assert.deepEqual(said, { kind: 'success', text: 'Hello, Codewhale!' })
 })
 
 test('the published DSH plugin runs unmodified and returns its payload', async (t) => {
   const host = await startHost()
   t.after(() => host.stop())
   const { result } = await activate(host, 'dsh-workspace-deps')
-  assert.deepEqual(result, { status: 'ok', tools: ['load_workspace_dependencies'] })
+  assert.deepEqual(result, { status: 'ok', tools: ['load_workspace_dependencies'], commands: [] })
   const registration = host.registry.find((entry) => entry.op === 'register')
   assert.equal(registration.kind, 'tool')
   assert.deepEqual(registration.spec.input_schema, { type: 'object', properties: {} })
@@ -133,11 +137,11 @@ test('cancel aborts a running tool, and deactivate waits for the async disposer'
 
 test('injecting a service the host does not provide fails with its name', async (t) => {
   const host = await startHost()
-  const plugin = tempPlugin("export const name = 'needs-commands'\nexport const inject = ['commands']\nexport function apply() {}\n")
+  const plugin = tempPlugin("export const name = 'needs-skills'\nexport const inject = ['skills']\nexport function apply() {}\n")
   t.after(async () => { await host.stop(); plugin.cleanup() })
-  const { result } = await activate(host, 'needs-commands', plugin.entry)
+  const { result } = await activate(host, 'needs-skills', plugin.entry)
   assert.equal(result.status, 'failed')
-  assert.match(result.diagnostic, /requires `commands`/)
+  assert.match(result.diagnostic, /requires `skills`/)
 })
 
 test('an unsupported DSH peer fails the import loudly', async (t) => {
@@ -300,7 +304,7 @@ test('plugins share one Cordis and one schemastery with the host', async (t) => 
   )
   t.after(async () => { await host.stop(); plugin.cleanup() })
   const { result } = await activate(host, 'shared', plugin.entry)
-  assert.deepEqual(result, { status: 'ok', tools: ['shared_ok'] })
+  assert.deepEqual(result, { status: 'ok', tools: ['shared_ok'], commands: [] })
 })
 
 test('a changed entry file is refused before import', async (t) => {
@@ -324,7 +328,7 @@ test('console and stdout writes from plugins cannot corrupt the channel', async 
   )
   t.after(async () => { await host.stop(); plugin.cleanup() })
   const { result } = await activate(host, 'noisy', plugin.entry)
-  assert.deepEqual(result, { status: 'ok', tools: [] })
+  assert.deepEqual(result, { status: 'ok', tools: [], commands: [] })
   assert.match(host.stderr, /noise/)
   assert.match(host.stderr, /raw bytes/)
 })
@@ -471,4 +475,185 @@ test('a host stuck in plugin code dies with its parent', { skip: process.platfor
   assert.ok(dead, 'a blocked host must not outlive its parent')
   // Diagnostic only: the watchdog polls every 500 ms.
   console.error(`# blocked host died ${Date.now() - started} ms after its parent`)
+})
+
+// ---------------------------------------------------------------------------
+// Commands: `ctx.commands.register`, `command/run`
+// ---------------------------------------------------------------------------
+
+const commandsOf = (host) => host.registry.filter((entry) => entry.op === 'register' && entry.kind === 'command')
+const commandNamed = (host, name) => commandsOf(host).find((entry) => entry.spec.name === name)
+const runCommand = (host, name, rawInput = '') =>
+  host.call('command/run', { handle: commandNamed(host, name).handle, command_id: `c-${name}`, raw_input: rawInput, deadline_ms: 5000 })
+
+test('commands register as commands, run, and report each kind of answer', async (t) => {
+  const host = await startHost()
+  t.after(() => host.stop())
+  const { result } = await activate(host, 'ext-commands')
+  assert.deepEqual(result, {
+    status: 'ok',
+    tools: [],
+    commands: ['ext-ansi', 'ext-ask', 'ext-dsh', 'ext-echo', 'ext-fail', 'ext-slow', 'ext-throw'],
+  })
+  // A command registration carries a hint (native `argumentHint` or DSH `input.hint`) and no schema.
+  assert.deepEqual(commandNamed(host, 'ext-echo').spec, { name: 'ext-echo', description: 'Echo the arguments.', argument_hint: '<text>' })
+  assert.equal(commandNamed(host, 'ext-ask').spec.argument_hint, '<topic>')
+  assert.equal('argument_hint' in commandNamed(host, 'ext-fail').spec, false)
+  for (const entry of commandsOf(host)) assert.equal('input_schema' in entry.spec, false)
+
+  assert.deepEqual(await runCommand(host, 'ext-echo', 'hello there'), { kind: 'success', text: 'echo: hello there' })
+  assert.deepEqual(await runCommand(host, 'ext-ask', 'tokens'), { kind: 'submit', prompt: 'Summarize: tokens', text: 'Asking the model.' })
+  assert.deepEqual(await runCommand(host, 'ext-fail'), { kind: 'error', text: 'unknown topic' })
+  // A bare string is success text; escapes are the core's to strip.
+  assert.deepEqual(await runCommand(host, 'ext-ansi'), { kind: 'success', text: 'plain \u001b[31mred\u001b[0m \u001b]0;title\u0007end' })
+  // DSH's `rawInput` keeps the separator before the arguments.
+  assert.deepEqual(await runCommand(host, 'ext-dsh', 'a b'), { kind: 'success', text: '" a b"' })
+  assert.deepEqual(await runCommand(host, 'ext-dsh', ''), { kind: 'success', text: '""' })
+  // A throwing handler is an execution failure, not a host fault.
+  await assert.rejects(runCommand(host, 'ext-throw'), (error) => error.code === -32000 && /boom/.test(error.message))
+  assert.deepEqual(host.faulted, [])
+})
+
+test('cancel aborts a running command', async (t) => {
+  const host = await startHost()
+  t.after(() => host.stop())
+  await activate(host, 'ext-commands')
+  const { id, promise } = host.request('command/run', {
+    handle: commandNamed(host, 'ext-slow').handle,
+    command_id: 'c-slow',
+    raw_input: '60000',
+    deadline_ms: 60000,
+  })
+  const cancelledAt = performance.now()
+  setTimeout(() => host.cancel(id), 50)
+  await assert.rejects(promise, (error) => error.code === -32800)
+  assert.ok(performance.now() - cancelledAt < 500, 'cancel resolves well inside the 500 ms grace')
+})
+
+test('a refused command registration fails activation, and an unknown handle is not live', async (t) => {
+  const host = await startHost({ admit: (spec) => (spec.name === 'help' ? { refused: 'command `/help` collides with a built-in command' } : undefined) })
+  t.after(() => host.stop())
+  const { result } = await activate(host, 'commands-clash-builtin')
+  assert.equal(result.status, 'failed')
+  assert.match(result.diagnostic, /command `help` refused: command `\/help` collides with a built-in command/)
+  await assert.rejects(
+    host.call('command/run', { handle: 999, command_id: 'c', raw_input: '', deadline_ms: 1000 }),
+    (error) => error.code === -32001,
+  )
+})
+
+test('disposing a command registration removes exactly that handle, and deactivation removes the rest', async (t) => {
+  const host = await startHost()
+  const plugin = tempPlugin(`export const name = 'two-commands'
+export const inject = ['commands']
+export function apply(ctx) {
+  const dispose = ctx.commands.register({ name: 'first', description: 'first', handler: () => '1' })
+  ctx.commands.register({ name: 'second', description: 'second', handler: () => '2' })
+  setTimeout(() => { dispose(); dispose() }, 20)
+}
+`)
+  t.after(async () => { await host.stop(); plugin.cleanup() })
+  const { ref, result } = await activate(host, 'two-commands', plugin.entry)
+  assert.deepEqual(result.commands, ['first', 'second'])
+  const first = commandNamed(host, 'first').handle
+  const second = commandNamed(host, 'second').handle
+  // The early, idempotent disposer unregisters `first` once and leaves `second`.
+  await host.waitFor((message) => message.method === 'registry/unregister', 2000)
+  await new Promise((resolve) => setTimeout(resolve, 50))
+  const unregisters = host.registry.filter((entry) => entry.op === 'unregister')
+  assert.deepEqual(unregisters.map((entry) => entry.handle), [first])
+  await assert.rejects(host.call('command/run', { handle: first, command_id: 'a', raw_input: '', deadline_ms: 1000 }), (e) => e.code === -32001)
+  assert.deepEqual(await host.call('command/run', { handle: second, command_id: 'b', raw_input: '', deadline_ms: 1000 }), { kind: 'success', text: '2' })
+
+  const ack = await host.call('ext/deactivate', { owner: ref })
+  assert.deepEqual(ack, { disposed: true, leaked: [] })
+  assert.ok(host.registry.some((entry) => entry.op === 'unregister' && entry.handle === second), 'deactivation unregisters the rest')
+  await assert.rejects(host.call('command/run', { handle: second, command_id: 'c', raw_input: '', deadline_ms: 1000 }), (e) => e.code === -32001)
+})
+
+test('an invalid command definition fails activation with its reason', async (t) => {
+  const host = await startHost()
+  t.after(() => host.stop())
+  const failing = async (label, body) => {
+    const plugin = tempPlugin(`export const inject = ['commands']\nexport function apply(ctx) { ${body} }\n`)
+    t.after(plugin.cleanup)
+    const { result } = await activate(host, label, plugin.entry)
+    assert.equal(result.status, 'failed', label)
+    return result.diagnostic
+  }
+  assert.match(await failing('bad-name', "ctx.commands.register({ name: 'Bad Name', description: 'd', handler() {} })"), /command name "Bad Name" must match/)
+  assert.match(await failing('no-description', "ctx.commands.register({ name: 'ok', description: ' ', handler() {} })"), /needs a non-empty description/)
+  assert.match(await failing('no-handler', "ctx.commands.register({ name: 'ok', description: 'd' })"), /handler must be a function/)
+  assert.match(await failing('attachments', "ctx.commands.register({ name: 'ok', description: 'd', input: { hint: 'h', attachments: true }, handler() {} })"), /attachments are not supported/)
+  assert.match(await failing('empty-hint', "ctx.commands.register({ name: 'ok', description: 'd', argumentHint: '', handler() {} })"), /argument hint must be a non-empty string/)
+  assert.equal(commandsOf(host).length, 0, 'nothing reached the core')
+
+  // A handler's bad answer is an execution failure at run time.
+  const plugin = tempPlugin(`export const inject = ['commands']
+export function apply(ctx) {
+  ctx.commands.register({ name: 'wrong-kind', description: 'd', handler: () => ({ kind: 'approve' }) })
+  ctx.commands.register({ name: 'empty-submit', description: 'd', handler: () => ({ kind: 'submit', prompt: '' }) })
+  ctx.commands.register({ name: 'silent', description: 'd', handler() {} })
+}
+`)
+  t.after(plugin.cleanup)
+  const { result } = await activate(host, 'bad-answers', plugin.entry)
+  assert.equal(result.status, 'ok')
+  await assert.rejects(runCommand(host, 'wrong-kind'), (error) => error.code === -32000 && /unknown result kind/.test(error.message))
+  await assert.rejects(runCommand(host, 'empty-submit'), (error) => error.code === -32000 && /submit prompt must be a non-empty string/.test(error.message))
+  assert.deepEqual(await runCommand(host, 'silent'), { kind: 'success' })
+})
+
+test('plugins cannot provide `commands`, or rewrite the shim every plugin registers through', async (t) => {
+  const host = await startHost()
+  t.after(() => host.stop())
+  const provider = tempPlugin(`export const inject = ['tools']
+export function apply(ctx) { ctx.root.provide('commands', { register() {} }) }
+`)
+  t.after(provider.cleanup)
+  const refused = await activate(host, 'commands-provider', provider.entry)
+  assert.equal(refused.result.status, 'failed')
+  assert.match(refused.result.diagnostic, /may not provide core service `commands`/)
+
+  const hijack = tempPlugin(`export const inject = ['commands']
+export function apply(ctx) {
+  const proto = Object.getPrototypeOf(ctx.root.commands)
+  proto.register = function () { return () => {} }
+}
+`)
+  t.after(hijack.cleanup)
+  const { result } = await activate(host, 'commands-hijack', hijack.entry)
+  assert.equal(result.status, 'failed')
+  assert.match(result.diagnostic, /read ?only|read-only|not extensible|Cannot assign/i)
+})
+
+test('a DSH-style command plugin registers through the compatible `commands` shim', async (t) => {
+  const host = await startHost()
+  t.after(() => host.stop())
+  const plugin = tempPlugin(`import { CommandDefinitionId, CommandId } from '@deepseek-ai/dsh-commands/brand'
+export const name = 'dsh-style'
+export const inject = ['commands']
+export function apply(ctx) {
+  ctx.commands.register({
+    definitionId: CommandDefinitionId('dsh-style/echo'),
+    name: 'dsh-echo',
+    description: 'Echo, DSH style.',
+    input: { hint: '<text>' },
+    recordInput: false,
+    handler: ({ rawInput }) => ({ kind: 'success', text: CommandId(rawInput.trim()) }),
+  })
+}
+`)
+  t.after(plugin.cleanup)
+  const { result } = await activate(host, 'dsh-style', plugin.entry)
+  assert.deepEqual(result, { status: 'ok', tools: [], commands: ['dsh-echo'] })
+  assert.deepEqual(commandNamed(host, 'dsh-echo').spec, { name: 'dsh-echo', description: 'Echo, DSH style.', argument_hint: '<text>' })
+  assert.deepEqual(await runCommand(host, 'dsh-echo', 'hi there'), { kind: 'success', text: 'hi there' })
+
+  // Only the brand helpers are provided; the rest of the package still fails loudly.
+  const whole = tempPlugin("import '@deepseek-ai/dsh-commands'\nexport function apply() {}\n")
+  t.after(whole.cleanup)
+  const refused = await activate(host, 'dsh-whole', whole.entry)
+  assert.equal(refused.result.status, 'failed')
+  assert.match(refused.result.diagnostic, /requires `@deepseek-ai\/dsh-commands`/)
 })

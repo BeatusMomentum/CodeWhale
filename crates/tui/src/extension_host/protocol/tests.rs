@@ -28,6 +28,7 @@ fn params_schema(method: &str, generator: &mut SchemaGenerator) -> Schema {
         "ext/activate" => generator.subschema_for::<ActivateParams>(),
         "ext/deactivate" => generator.subschema_for::<DeactivateParams>(),
         "tool/call" => generator.subschema_for::<ToolCallParams>(),
+        "command/run" => generator.subschema_for::<CommandRunParams>(),
         "$/cancel" => generator.subschema_for::<CancelParams>(),
         "host/hello" => generator.subschema_for::<HelloParams>(),
         "registry/register" => generator.subschema_for::<RegisterParams>(),
@@ -319,6 +320,7 @@ fn render() -> String {
     let _ = generator.subschema_for::<ActivateResult>();
     let _ = generator.subschema_for::<DeactivateResult>();
     let _ = generator.subschema_for::<ToolResultWire>();
+    let _ = generator.subschema_for::<CommandResultWire>();
     let defs: BTreeMap<String, Def> = generator
         .definitions()
         .iter()
@@ -488,6 +490,11 @@ const REVIEWED: &[(&str, &str, &str)] = &[
     ),
     (
         "core_to_host",
+        "command/run",
+        "sent only when the user runs the command themselves; the answer is text or a prompt that the core shows or submits through the ordinary turn",
+    ),
+    (
+        "core_to_host",
         "$/cancel",
         "the core withdraws its own request",
     ),
@@ -504,7 +511,7 @@ const REVIEWED: &[(&str, &str, &str)] = &[
     (
         "host_to_core",
         "registry/register",
-        "a proposal the core admits or refuses; an admitted tool always needs approval",
+        "a proposal the core admits or refuses; an admitted tool always needs approval, and an admitted command only runs when the user invokes it",
     ),
     (
         "host_to_core",

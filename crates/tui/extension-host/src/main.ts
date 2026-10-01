@@ -51,6 +51,8 @@ installResolveHooks({
   cosmokit: cosmokit as unknown as Record<string, unknown>,
   'dsh-util-values': dshUtilValues as unknown as Record<string, unknown>,
   'dsh-tools': dshToolsCompat as unknown as Record<string, unknown>,
+  // `@deepseek-ai/dsh-commands/brand`: the brands are plain strings at runtime.
+  'dsh-commands-brand': { CommandDefinitionId: (id: string) => id, CommandId: (id: string) => id },
 })
 
 function bundleDigest(): string {
@@ -145,6 +147,11 @@ rpc.onRequest('ext/deactivate', async (params: any) => {
 rpc.onRequest('tool/call', async (params: any, cx) => {
   requireInitialized()
   return host.callTool(params.handle, params.input, params.call_id, cx.signal)
+})
+
+rpc.onRequest('command/run', async (params: any, cx) => {
+  requireInitialized()
+  return host.callCommand(params.handle, params.raw_input, params.command_id, cx.signal)
 })
 
 rpc.onRequest('host/shutdown', async () => {

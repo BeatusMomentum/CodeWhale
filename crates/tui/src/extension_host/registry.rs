@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use serde_json::Value;
 
-use super::protocol::{OwnerRef, RegisterParams};
+use super::protocol::{OwnerRef, RegisterKind, RegisterParams};
 use crate::plugins::types::PluginAuthority;
 
 /// Largest accepted tool input schema, serialized.
@@ -19,6 +19,12 @@ pub const MAX_SCHEMA_BYTES: usize = 64 * 1024;
 pub const MAX_DESCRIPTION_BYTES: usize = 4 * 1024;
 pub const MAX_TOOLS_PER_OWNER: usize = 128;
 pub const MAX_TOOLS_PER_HOST: usize = 1024;
+/// Commands are listed in the palette and `/help`, so the caps are tighter.
+pub const MAX_COMMANDS_PER_OWNER: usize = 64;
+pub const MAX_COMMANDS_PER_HOST: usize = 256;
+/// A command description is one palette line; a hint is a short placeholder.
+pub const MAX_COMMAND_DESCRIPTION_BYTES: usize = 1024;
+pub const MAX_COMMAND_HINT_BYTES: usize = 256;
 
 /// Name prefixes no extension may use: MCP's namespace, and one kept free
 /// for future core-issued extension names.
@@ -70,6 +76,21 @@ pub struct ToolRegistration {
     pub input_schema: Value,
 }
 
+/// An admitted slash command. Owned exactly like a tool: one owner
+/// generation, a never-reused handle, removed with its owner.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CommandRegistration {
+    pub handle: u64,
+    pub owner: OwnerRef,
+    pub plugin_name: String,
+    /// The reviewed bundle content hash of the registering owner.
+    pub content_hash: String,
+    /// The slash-command name, without the slash (lower case).
+    pub name: String,
+    pub description: String,
+    pub argument_hint: Option<String>,
+}
+
 #[derive(Debug, Default)]
 pub struct OwnerRegistry {
     next_handle: u64,
@@ -78,6 +99,10 @@ pub struct OwnerRegistry {
     tools: BTreeMap<u64, ToolRegistration>,
     /// Lower-cased tool name → handle, so `Read` cannot impersonate `read`.
     by_name: HashMap<String, u64>,
+    commands: BTreeMap<u64, CommandRegistration>,
+    /// Command name → handle. Commands and tools are separate namespaces: a
+    /// tool is called by the model, a command by the user.
+    commands_by_name: HashMap<String, u64>,
     /// Lower-cased names of every native tool any engine's turn build has
     /// reported, plus the static set. Only ever grows: engines in one
     /// process build different native surfaces, and a name that is native
@@ -99,6 +124,21 @@ fn valid_tool_name(name: &str) -> bool {
     matches!(chars.next(), Some(first) if first.is_ascii_alphabetic())
         && name.len() <= 64
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+/// DSH's command grammar (`^[a-z][a-z0-9_-]*$`), bounded. Lower case only:
+/// the user's input is lower-cased before it is looked up.
+fn valid_command_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    matches!(chars.next(), Some(first) if first.is_ascii_lowercase())
+        && name.len() <= 64
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+}
+
+/// Whether a built-in command answers to `name`: a canonical name, an alias,
+/// or one of the fixed mode aliases dispatched ahead of the registry.
+fn builtin_command(name: &str) -> bool {
+    matches!(name, "jihua" | "zidong") || crate::commands::registry().get(name).is_some()
 }
 
 /// Why the core would treat a tool called `name` as something other than an
@@ -218,6 +258,7 @@ impl OwnerRegistry {
         match self.owners.get_mut(&owner.plugin_id) {
             Some(entry) if entry.owner == *owner && entry.state == OwnerState::Activating => {
                 entry.state = OwnerState::Active;
+                super::command::bump_epoch();
                 true
             }
             _ => false,
@@ -231,7 +272,7 @@ impl OwnerRegistry {
             .get(&owner.plugin_id)
             .is_some_and(|entry| entry.owner == *owner);
         if matches {
-            self.remove_tools_of(&owner.plugin_id);
+            self.remove_registrations_of(&owner.plugin_id);
             if let Some(entry) = self.owners.get_mut(&owner.plugin_id) {
                 entry.state = state;
             }
@@ -239,7 +280,122 @@ impl OwnerRegistry {
         matches
     }
 
-    /// Admit or refuse one `registry/register`.
+    /// Admit or refuse one `registry/register`, whatever its kind.
+    pub fn register(&mut self, params: &RegisterParams) -> Result<u64, String> {
+        match params.kind {
+            RegisterKind::Tool => self.register_tool(params),
+            RegisterKind::Command => self.register_command(params),
+        }
+    }
+
+    /// Admit or refuse one command registration. An extension command never
+    /// shadows a built-in command or another plugin's command; a clash with
+    /// a user, workspace or manifest (markdown) command is resolved when the
+    /// user registry loads (the markdown command wins and the extension
+    /// command is not loaded), because only that registry knows the workspace.
+    pub fn register_command(&mut self, params: &RegisterParams) -> Result<u64, String> {
+        let entry = self
+            .current(&params.owner)
+            .ok_or_else(|| "stale or unknown owner".to_string())?;
+        let plugin_name = entry.plugin_name.clone();
+        let content_hash = entry.content_hash.clone();
+        let spec = &params.spec;
+        let name = spec.name.as_str();
+        const COMMAND_HINT: &str = "a command name is lower case, starts with a letter, and uses only a-z, 0-9, `_` and `-` (at most 64 characters)";
+        if !valid_command_name(name) {
+            return Err(format!(
+                "command name `{}` is invalid: {COMMAND_HINT}",
+                crate::safe_label::SafeLabel::identifier(name)
+            ));
+        }
+        if builtin_command(name) {
+            return Err(format!(
+                "command `/{name}` collides with a built-in command; extensions never shadow core commands; use a plugin-specific name, for example `/myplugin-{name}`"
+            ));
+        }
+        if spec.input_schema.is_some() {
+            return Err(format!("command `/{name}` has no input schema"));
+        }
+        let description = spec.description.trim();
+        if description.is_empty() {
+            return Err(format!("command `/{name}` needs a description"));
+        }
+        if description.len() > MAX_COMMAND_DESCRIPTION_BYTES {
+            return Err(format!(
+                "command `/{name}` description exceeds {MAX_COMMAND_DESCRIPTION_BYTES} bytes"
+            ));
+        }
+        let hint = spec.argument_hint.as_deref().map(str::trim);
+        if hint.is_some_and(str::is_empty) {
+            return Err(format!("command `/{name}` argument hint must not be empty"));
+        }
+        if hint.is_some_and(|hint| hint.len() > MAX_COMMAND_HINT_BYTES) {
+            return Err(format!(
+                "command `/{name}` argument hint exceeds {MAX_COMMAND_HINT_BYTES} bytes"
+            ));
+        }
+        // The palette, `/help` and the composer print these verbatim.
+        if description.chars().any(char::is_control)
+            || hint.is_some_and(|h| h.chars().any(char::is_control))
+        {
+            return Err(format!(
+                "command `/{name}` description and argument hint must be single-line text without control characters"
+            ));
+        }
+        let mut replaced = None;
+        if let Some(existing) = self
+            .commands_by_name
+            .get(name)
+            .and_then(|handle| self.commands.get(handle))
+        {
+            if existing.owner.plugin_id != params.owner.plugin_id {
+                return Err(format!(
+                    "command `/{name}` is already registered by extension `{}`; use a plugin-specific name",
+                    existing.plugin_name
+                ));
+            }
+            // Same owner re-registering a name: the new handle retires the old.
+            replaced = Some(existing.handle);
+        }
+        let owned = self
+            .commands
+            .values()
+            .filter(|command| command.owner.plugin_id == params.owner.plugin_id)
+            .count()
+            - usize::from(replaced.is_some());
+        if owned >= MAX_COMMANDS_PER_OWNER {
+            return Err(format!(
+                "an extension may register at most {MAX_COMMANDS_PER_OWNER} commands"
+            ));
+        }
+        if self.commands.len() - usize::from(replaced.is_some()) >= MAX_COMMANDS_PER_HOST {
+            return Err(format!(
+                "the extension host holds at most {MAX_COMMANDS_PER_HOST} commands"
+            ));
+        }
+        if let Some(old) = replaced {
+            self.commands.remove(&old);
+        }
+        self.next_handle += 1;
+        let handle = self.next_handle;
+        self.commands.insert(
+            handle,
+            CommandRegistration {
+                handle,
+                owner: params.owner.clone(),
+                plugin_name,
+                content_hash,
+                name: name.to_string(),
+                description: description.to_string(),
+                argument_hint: hint.map(str::to_string),
+            },
+        );
+        self.commands_by_name.insert(name.to_string(), handle);
+        super::command::bump_epoch();
+        Ok(handle)
+    }
+
+    /// Admit or refuse one tool registration.
     pub fn register_tool(&mut self, params: &RegisterParams) -> Result<u64, String> {
         let entry = self
             .current(&params.owner)
@@ -278,7 +434,11 @@ impl OwnerRegistry {
                 "tool `{name}` description exceeds {MAX_DESCRIPTION_BYTES} bytes"
             ));
         }
-        let schema = Value::Object(spec.input_schema.clone());
+        let schema = Value::Object(
+            spec.input_schema
+                .clone()
+                .ok_or_else(|| format!("tool `{name}` needs an input schema"))?,
+        );
         let schema_bytes = serde_json::to_vec(&schema)
             .map(|bytes| bytes.len())
             .unwrap_or(usize::MAX);
@@ -346,6 +506,18 @@ impl OwnerRegistry {
 
     /// Undo exactly one registration. Idempotent; a stale or foreign handle is a no-op.
     pub fn unregister(&mut self, owner: &OwnerRef, handle: u64) {
+        if self
+            .commands
+            .get(&handle)
+            .is_some_and(|command| command.owner == *owner)
+            && let Some(command) = self.commands.remove(&handle)
+        {
+            if self.commands_by_name.get(&command.name) == Some(&handle) {
+                self.commands_by_name.remove(&command.name);
+            }
+            super::command::bump_epoch();
+            return;
+        }
         let owned = self
             .tools
             .get(&handle)
@@ -361,7 +533,27 @@ impl OwnerRegistry {
         }
     }
 
-    fn remove_tools_of(&mut self, plugin_id: &str) -> Vec<u64> {
+    fn remove_commands_of(&mut self, plugin_id: &str) {
+        // Called by `remove_registrations_of`, so every revocation path that
+        // drops an owner's tools drops its commands too.
+        let handles: Vec<u64> = self
+            .commands
+            .values()
+            .filter(|command| command.owner.plugin_id == plugin_id)
+            .map(|command| command.handle)
+            .collect();
+        for handle in handles {
+            if let Some(command) = self.commands.remove(&handle)
+                && self.commands_by_name.get(&command.name) == Some(&handle)
+            {
+                self.commands_by_name.remove(&command.name);
+            }
+        }
+        super::command::bump_epoch();
+    }
+
+    fn remove_registrations_of(&mut self, plugin_id: &str) -> Vec<u64> {
+        self.remove_commands_of(plugin_id);
         let handles: Vec<u64> = self
             .tools
             .values()
@@ -381,7 +573,7 @@ impl OwnerRegistry {
 
     /// Revoke an owner synchronously. Returns the owner that was live, if any.
     pub fn revoke_owner(&mut self, plugin_id: &str) -> Option<OwnerRef> {
-        self.remove_tools_of(plugin_id);
+        self.remove_registrations_of(plugin_id);
         let entry = self.owners.get_mut(plugin_id)?;
         let was_live = matches!(entry.state, OwnerState::Activating | OwnerState::Active);
         entry.state = OwnerState::Revoked;
@@ -390,7 +582,7 @@ impl OwnerRegistry {
 
     /// Forget an owner entirely (after revocation, when its plugin is gone).
     pub fn forget_owner(&mut self, plugin_id: &str) {
-        self.remove_tools_of(plugin_id);
+        self.remove_registrations_of(plugin_id);
         self.owners.remove(plugin_id);
     }
 
@@ -407,6 +599,9 @@ impl OwnerRegistry {
     pub fn host_exited(&mut self, reason: &str) {
         self.tools.clear();
         self.by_name.clear();
+        self.commands.clear();
+        self.commands_by_name.clear();
+        super::command::bump_epoch();
         let activating: Vec<_> = self
             .owners
             .values()
@@ -427,6 +622,9 @@ impl OwnerRegistry {
     pub fn revoke_all(&mut self, reason: &str) {
         self.tools.clear();
         self.by_name.clear();
+        self.commands.clear();
+        self.commands_by_name.clear();
+        super::command::bump_epoch();
         for entry in self.owners.values_mut() {
             if matches!(entry.state, OwnerState::Activating | OwnerState::Active) {
                 entry.state = OwnerState::Failed(reason.to_string());
@@ -446,6 +644,40 @@ impl OwnerRegistry {
             })
             .cloned()
             .collect()
+    }
+
+    /// Commands of active owners, in handle order.
+    #[must_use]
+    pub fn live_commands(&self) -> Vec<CommandRegistration> {
+        self.commands
+            .values()
+            .filter(|command| {
+                self.owners
+                    .get(&command.owner.plugin_id)
+                    .is_some_and(|entry| {
+                        entry.owner == command.owner && entry.state == OwnerState::Active
+                    })
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// The command behind `handle`, if it is still admitted for exactly this
+    /// owner generation of `plugin_id`. A stale reference finds nothing.
+    #[must_use]
+    pub fn live_command(
+        &self,
+        handle: u64,
+        plugin_id: &str,
+        generation: u64,
+    ) -> Option<CommandRegistration> {
+        let command = self.commands.get(&handle)?;
+        (command.owner.plugin_id == plugin_id
+            && command.owner.generation == generation
+            && self.owners.get(plugin_id).is_some_and(|entry| {
+                entry.owner == command.owner && entry.state == OwnerState::Active
+            }))
+        .then(|| command.clone())
     }
 
     /// Whether `handle` is still admitted for exactly this owner generation.
