@@ -12808,6 +12808,8 @@ impl RuntimeThreadManager {
             approval_mode: policy.permission,
             verbosity,
             provenance: input_source.provenance(),
+            // Durable-runtime submissions carry no host correlation token.
+            submission_id: None,
         });
 
         // Reserve mailbox capacity before claiming or persisting anything.
@@ -14634,6 +14636,7 @@ impl RuntimeThreadManager {
                     turn_id: started_turn_id,
                     created_at,
                     route,
+                    submission_id: _,
                 } => {
                     saw_turn_started = true;
                     engine_turn_id = Some(started_turn_id);

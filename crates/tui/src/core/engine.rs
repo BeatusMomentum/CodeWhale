@@ -2076,6 +2076,9 @@ impl Engine {
                 turn_id: turn_id.clone(),
                 created_at: chrono::Utc::now(),
                 route: None,
+                // A composer shell command has no host submission envelope to
+                // correlate with.
+                submission_id: None,
             })
             .await;
 
@@ -2945,6 +2948,9 @@ impl Engine {
                 provenance: UserInputProvenance::Runtime,
                 images: Vec::new(),
                 max_output_tokens: None,
+                // Background shell completion wake: no host submission to
+                // correlate with.
+                submission_id: None,
             })
             .await;
     }
@@ -3124,6 +3130,9 @@ impl Engine {
                                 provenance: UserInputProvenance::Runtime,
                                 images: Vec::new(),
                                 max_output_tokens: None,
+                                // Engine-scheduled goal continuation: no host
+                                // submission to correlate with.
+                                submission_id: None,
                             })
                             .await;
                     }
@@ -3665,7 +3674,10 @@ impl Engine {
                         }
                         self.handle_purge().await;
                     }
-                    Op::EditLastTurn { new_message } => {
+                    Op::EditLastTurn {
+                        new_message,
+                        submission_id,
+                    } => {
                         let route = match self.current_runtime_route() {
                             Ok(route) => route,
                             Err(err) => {
@@ -3747,6 +3759,7 @@ impl Engine {
                             provenance: UserInputProvenance::ExternalUser,
                             images: Vec::new(),
                             max_output_tokens: None,
+                            submission_id,
                         })
                         .await;
                     }
@@ -4430,6 +4443,9 @@ impl Engine {
                 provenance: UserInputProvenance::SubAgentHandoff,
                 images: Vec::new(),
                 max_output_tokens: None,
+                // Idle sub-agent completion resume: no host submission to
+                // correlate with.
+                submission_id: None,
             })
             .await;
         if !outcome.started() {
@@ -5287,6 +5303,7 @@ impl Engine {
             hook_executor,
             verbosity,
             provenance,
+            submission_id,
         } = spec;
         let route = *route;
         let compaction = *compaction;
@@ -5540,6 +5557,10 @@ impl Engine {
                 turn_id: turn.id.clone(),
                 created_at: turn_started_at,
                 route: Some(turn_route),
+                // Echo the host's correlation token (`None` when this turn was
+                // self-started without one) so the host can bind its
+                // submit-window actions to the turn that actually started.
+                submission_id,
             })
             .await;
 

@@ -764,6 +764,8 @@ pub(crate) async fn run_exec_agent(
             },
             verbosity: execution_config.verbosity.clone(),
             provenance: crate::core::ops::UserInputProvenance::ExternalUser,
+            // Headless exec does not correlate submissions.
+            submission_id: None,
         }))
         .await?;
 

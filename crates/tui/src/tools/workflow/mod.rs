@@ -11187,9 +11187,19 @@ reviewer = "reviewer"
             let codewhale_workflow::WorkflowNode::Leaf(leaf) = node else {
                 panic!("stopship role chain must contain only leaves");
             };
+            for path in &leaf.file_scope {
+                assert!(
+                    repo_root.join(path).is_file(),
+                    "{} scopes a file that does not exist: {path}",
+                    leaf.id
+                );
+            }
             let tools = leaf_allowed_tools(leaf).expect("lower stopship child tools");
             if index == 0 {
-                assert!(tools.as_ref().is_some_and(|tools| !tools.is_empty()));
+                // No explicit list: the scout keeps its read-only catalog, and
+                // `scout_surface_keeps_tool_search_grep_files_activation_path`
+                // pins the tool_search -> deferred grep_files route it uses.
+                assert_eq!(tools, None, "the scout keeps its read-only catalog");
             } else {
                 assert_eq!(
                     tools,
