@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `codewhale integrations dsh` now reads current DeepSeek Harness prerelease
+  versions such as `0.1.7-alpha.2` as semver. They were reported as `offline`
+  and refused; they now show as `stale-version` (launchable once connected,
+  clearly unverified). Only `0.1.0-rc.6` is still the verified version, and text
+  that is not a version is still `offline`.
+
 ## [0.10.1] - 2026-10-01
 
 Codewhale v0.10.1 focuses on reliability and first-run behavior. Turns that

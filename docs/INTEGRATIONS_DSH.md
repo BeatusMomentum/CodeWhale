@@ -19,10 +19,13 @@ preview that warns of compatibility-breaking changes.
 What the code enforces (`crates/tui/src/integrations/dsh/detect.rs`): an older
 `dsh`, or any `dsh` that does not advertise `--patch`, is `incompatible` and
 refused. A newer `dsh` that parses and advertises `--patch` is reported as
-`stale-version`: a connected profile still launches, unverified. Only
-`MAJOR.MINOR.PATCH` with an optional `-rc.N` suffix parses, so a version such as
-`0.1.7-alpha.2` is read as unparseable and reported as `offline`, which is
-refused.
+`stale-version`: a connected profile still launches, unverified. The version is
+read as semver, so current prerelease tags such as `0.1.7-alpha.2` parse and
+order correctly (`alpha` < `beta` < `rc` < the bare release, within a core
+version): `0.1.7-alpha.2` is newer than the verified `0.1.0-rc.6`, reported as
+`stale-version`, and never presented as verified. Only text that is not a
+semver version at all (for example `nightly` or `0.1`) is reported as
+`offline`, which is refused.
 
 This is an external-launcher integration: it runs the user's installed `dsh`
 with a Codewhale-written overlay. It is not [`/plugin import dsh`](PLUGIN_AUTHORING.md#deepseek-harness-dsh),
@@ -83,7 +86,7 @@ Codewhale **never**:
 | State | Meaning | Launch |
 | --- | --- | --- |
 | `not-installed` | `dsh` not on `PATH` | refused |
-| `offline` | `dsh` exists but `--version` failed or printed text that does not parse | refused |
+| `offline` | `dsh` exists but `--version` failed or printed text that is not a semver version | refused |
 | `incompatible` | older than 0.1.0-rc.6 or no `--patch` | refused |
 | `detected` | usable dsh, no Codewhale overlay | refused (`connect` first) |
 | `connected` | overlay matches the current Codewhale route | allowed |
