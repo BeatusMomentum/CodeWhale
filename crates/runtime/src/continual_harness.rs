@@ -230,10 +230,54 @@ pub fn journal_path(state_path: &Path) -> PathBuf {
 
 fn state_path_for_write(workspace: &Path) -> Result<PathBuf> {
     let existing = state_path_for_read(workspace)?;
-    if existing.is_file() {
-        return Ok(existing);
+    let path = if existing.is_file() {
+        existing
+    } else {
+        // Check the parents that already exist before creating anything
+        // through them.
+        let planned = workspace
+            .canonicalize()
+            .unwrap_or_else(|_| workspace.to_path_buf())
+            .join(codewhale_config::CODEWHALE_APP_DIR)
+            .join("harness")
+            .join("state.json");
+        reject_linked_state_path(workspace, &planned)?;
+        codewhale_config::ensure_project_state_dir(workspace, "harness")?.join("state.json")
+    };
+    reject_linked_state_path(workspace, &path)?;
+    reject_linked_state_path(workspace, &journal_path(&path))?;
+    Ok(path)
+}
+
+/// Harness writes carry model-authored text. Refuse them when the state
+/// directory, the state file or the journal is a link, so a workspace that
+/// ships a linked `.codewhale` cannot send them outside the workspace.
+fn reject_linked_state_path(workspace: &Path, path: &Path) -> Result<()> {
+    let workspace = workspace
+        .canonicalize()
+        .unwrap_or_else(|_| workspace.to_path_buf());
+    let Ok(relative) = path.strip_prefix(&workspace) else {
+        bail!(
+            "continual harness state {} is outside the workspace",
+            path.display()
+        );
+    };
+    let mut current = workspace;
+    for component in relative.components() {
+        current.push(component);
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => bail!(
+                "continual harness state path {} is a link; refusing to write through it",
+                current.display()
+            ),
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            Err(error) => {
+                return Err(error).with_context(|| format!("inspect {}", current.display()));
+            }
+        }
     }
-    Ok(codewhale_config::ensure_project_state_dir(workspace, "harness")?.join("state.json"))
+    Ok(())
 }
 
 fn load_state(path: &Path) -> Result<HarnessState> {
@@ -514,5 +558,32 @@ mod tests {
             journal.contains("reviewer asked for provenance twice"),
             "{journal}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refinement_is_refused_through_linked_state_paths() {
+        use std::os::unix::fs::symlink;
+
+        // A linked `.codewhale` directory.
+        let outside = tempdir().expect("outside");
+        let tmp = tempdir().expect("tempdir");
+        symlink(outside.path(), tmp.path().join(".codewhale")).expect("link");
+        assert!(refine(tmp.path(), refinement(HarnessEntryKind::PromptNote)).is_err());
+        assert!(fs::read_dir(outside.path()).unwrap().next().is_none());
+
+        // A linked journal beside a real state file.
+        let tmp = tempdir().expect("tempdir");
+        refine(tmp.path(), refinement(HarnessEntryKind::PromptNote)).expect("first");
+        let state = state_path_for_read(tmp.path()).expect("state path");
+        let journal = journal_path(&state);
+        let target = outside.path().join("target.md");
+        fs::write(&target, "keep").expect("write");
+        fs::remove_file(&journal).expect("remove journal");
+        symlink(&target, &journal).expect("link");
+        let mut other = refinement(HarnessEntryKind::SkillHint);
+        other.title = "Another title".to_string();
+        assert!(refine(tmp.path(), other).is_err());
+        assert_eq!(fs::read_to_string(&target).unwrap(), "keep");
     }
 }
