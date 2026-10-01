@@ -8238,6 +8238,103 @@ mod tests {
         );
     }
 
+    /// #6715 review: a consented Grok CLI import is a sign-in the user can
+    /// switch away from, and its quota error must name the account the Grok
+    /// file holds (the credential this client sends), not a Codewhale-owned
+    /// account that sent nothing.
+    #[test]
+    fn xai_quota_guidance_names_the_consented_grok_import_that_sent_the_request() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _env = crate::test_support::lock_test_env();
+        let home = tempfile::tempdir().expect("temp home");
+        let root = home.path().canonicalize().expect("canonical temp root");
+        let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", &root);
+        let _key = crate::test_support::EnvVarGuard::remove("XAI_API_KEY");
+        let _base = crate::test_support::EnvVarGuard::remove("XAI_BASE_URL");
+        let path = root.join("grok-auth.json");
+        let token = crate::test_support::future_test_jwt("grok-cli");
+        let scope = format!(
+            "{}::{}",
+            crate::oauth::XAI_OIDC_ISSUER,
+            crate::oauth::GROK_OIDC_CLIENT_ID
+        );
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&json!({
+                scope: {
+                    "key": token.clone(),
+                    "expires_at": (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339(),
+                    "id_token": test_id_token("grok-cli@example.com"),
+                    "oidc_issuer": crate::oauth::XAI_OIDC_ISSUER,
+                    "oidc_client_id": crate::oauth::GROK_OIDC_CLIENT_ID,
+                    "auth_mode": "oidc",
+                }
+            }))
+            .expect("serialize fixture"),
+        )
+        .expect("write fixture");
+        let _auth_path = crate::test_support::EnvVarGuard::set("GROK_AUTH_PATH", &path);
+        let config = Config {
+            provider: Some(ApiProvider::Xai.as_str().to_string()),
+            providers: Some(ProvidersConfig {
+                xai: ProviderConfig {
+                    auth_mode: Some("oauth".to_string()),
+                    external_credentials: Some(
+                        codewhale_config::ExternalCredentialConsentToml::read_only(
+                            codewhale_config::ProviderKind::Xai,
+                            codewhale_config::ExternalCredentialSource::GrokCli,
+                            path.clone(),
+                        ),
+                    ),
+                    ..ProviderConfig::default()
+                },
+                ..ProvidersConfig::default()
+            }),
+            ..Config::default()
+        };
+        let client = CodewhaleClient::new(&config).expect("xai client");
+        assert_eq!(client.api_key, token);
+        assert_eq!(client.api_key_source, crate::config::XAI_OAUTH_KEY_SOURCE);
+        let guidance = client
+            .subscription_limit_guidance
+            .as_deref()
+            .expect("sign-in guidance");
+        assert!(
+            guidance.contains("xAI account grok-cli@example.com"),
+            "{guidance}"
+        );
+        assert!(!guidance.contains(&token), "{guidance}");
+    }
+
+    /// A process token outranks every ChatGPT sign-in, so re-running the
+    /// login would not change the account that sent the request: no
+    /// guidance, even when a Codewhale-owned sign-in exists.
+    #[test]
+    fn codex_process_token_gets_no_sign_in_guidance() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _env = crate::test_support::lock_test_env();
+        let home = tempfile::tempdir().expect("temp home");
+        let root = home.path().canonicalize().expect("canonical temp root");
+        let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", &root);
+        let token = crate::test_support::future_test_jwt("process-token");
+        let _access = crate::test_support::EnvVarGuard::set("OPENAI_CODEX_ACCESS_TOKEN", &token);
+        let _legacy_access = crate::test_support::EnvVarGuard::remove("CODEX_ACCESS_TOKEN");
+        let config = Config {
+            provider: Some(ApiProvider::OpenaiCodex.as_str().to_string()),
+            providers: Some(ProvidersConfig {
+                openai_codex: ProviderConfig {
+                    auth_mode: Some("oauth".to_string()),
+                    ..ProviderConfig::default()
+                },
+                ..ProvidersConfig::default()
+            }),
+            ..Config::default()
+        };
+        let client = CodewhaleClient::new(&config).expect("Codex client");
+        assert_eq!(client.api_key, token);
+        assert_eq!(client.subscription_limit_guidance, None);
+    }
+
     fn concentrate_client(server: &MockServer, model: &str) -> CodewhaleClient {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let config = Config {
