@@ -434,7 +434,7 @@ owner = "crates/localization"
 [[feature]]
 id = "voice"
 name = "Voice input"
-summary = "/voice dictates into the composer; /voicecontrol and /voicesend add control and auto-send. The selected ASR backend never falls back to another provider."
+summary = "/voice, /voicecontrol and /voicesend use the selected ASR backend without switching providers."
 status = "stable"
 surfaces = { tui = "stable", api = "stable" }
 owner = "crates/tui/src/voice.rs"
