@@ -31,8 +31,11 @@
 //!   deployment or user overlays.
 //! * Only MCP-client and skill-filesystem rows convert. Runtime `inject`,
 //!   `intercept`, isolation, policy plugins, prompts, commands and UI modules
-//!   are skipped outcomes that need a manual port; arbitrary DSH TypeScript
-//!   execution is outside this compatibility scope.
+//!   are skipped outcomes that need a manual port. This importer never
+//!   executes DSH TypeScript. Plugin code runs only through the separate,
+//!   experimental TypeScript extension host (`[features] extension_host`, off
+//!   by default), which covers tools only; see `docs/EXTENSIONS.md` and
+//!   `docs/design/TS_EXTENSION_HOST.md`.
 //! * A stdio server whose entry lies outside the package is skipped; host
 //!   paths are never copied.
 //! * Plain YAML scalars follow the YAML 1.2 core schema (DSH's own parser),

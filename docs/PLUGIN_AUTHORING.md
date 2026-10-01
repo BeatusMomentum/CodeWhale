@@ -260,6 +260,11 @@ package directory as a plain `/plugin install <dir>` routes to the same importer
 replaces the bundle and invalidates its trust receipt. The Runtime API exposes
 the same review as `POST /v1/apps/plugins/import/dsh/preview`, whose
 `install_source` and `content_hash` go to `POST /v1/apps/plugins/install`.
+Those two are the only import surfaces today: the TUI slash command
+(`/plugin import dsh <dir>` and `approve`) and the Runtime API. There is no
+`codewhale plugin` CLI subcommand for DSH import. This static import is also
+not the external-launcher integration `codewhale integrations dsh`, which runs
+the user's installed `dsh` (see [INTEGRATIONS_DSH.md](INTEGRATIONS_DSH.md)).
 
 `dsh.bundle.patch` may name one patch file or an ordered list of files. The
 importer reads only contained, non-linked package files (at most 64 files and
@@ -277,7 +282,8 @@ enabled. Unsupported entry policy/dependency fields, including `inject`,
 `intercept` and `isolate`, also refuse the import on those rows or their groups.
 Preserve their activation and authority rules in a manual port.
 
-Foreign runtime plugins and `dsh.client` UI code are not executed or translated.
+The importer never executes plugin code. Foreign runtime plugins and
+`dsh.client` UI code are not executed or translated.
 Other unrepresentable components are reported in the bundle's `CONVERSION.md` and
 structured `CONVERSION.json`, with source package/version, manifest and
 ordered-layer SHA-256 hashes, converter version, per-row outcomes and required
@@ -293,7 +299,11 @@ package is skipped, and host paths are never copied. Rows of
 `@deepseek-ai/dsh-skill-filesystem` contribute their literal `customSkillDirs`
 children only when those directories live inside the package. Default user and
 project skill roots, watchers and foreign service dependencies are not imported.
-Arbitrary DSH TypeScript plugin execution is outside this compatibility scope.
+Arbitrary DSH TypeScript plugin execution is outside this importer's scope.
+DSH TypeScript plugin code runs only through the experimental TypeScript
+extension host (`[features] extension_host`, off by default), which covers
+tools only; see [EXTENSIONS.md](EXTENSIONS.md) and
+[design/TS_EXTENSION_HOST.md](design/TS_EXTENSION_HOST.md).
 
 ### Local Node MCP servers
 
@@ -391,9 +401,14 @@ at `d6855b6b47`, and DSH's [MCP client reference](https://github.com/deepseek-ai
 at `c389f96bf3`. Bundle patch semantics were rechecked against DSH
 [`00102833df`](https://github.com/deepseek-ai/deepseek-harness/tree/00102833dfaee1da9f48a3a8eae9d34005a75218)
 (`0.1.7-alpha.2`); `scripts/fixtures/dsh-web-app` retains its real five-file package
-as parser-only test data, not as an importable native plugin. CI runs the offline
-converter corpus with Python/PyYAML and synthetic Node fixtures. Upstream supports
-more than this deliberately bounded converter.
+as pinned test data, not as an importable native plugin. The Rust tests in
+`crates/tui/src/plugins/install/dsh_tests.rs` load that package through the native
+importer and assert that no row is promoted to a converted component; they run in
+the workspace `Test` job. The CI `Plugin conversion` job runs only
+`scripts/test_convert_plugin.py` (the OpenCode and static DSH MCP-entry converter)
+with Python/PyYAML and synthetic Node fixtures, and the script's `--bundle` path
+refuses and points to `/plugin import dsh`. Upstream supports more than this
+deliberately bounded converter.
 
 ## Community context
 
