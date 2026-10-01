@@ -647,6 +647,47 @@ fn catalog_names_are_validated_and_duplicates_fail_closed() {
 }
 
 #[test]
+fn catalog_archive_sources_must_be_remote() {
+    // F01-03: a non-local source's spec is re-parsed by the installer, which
+    // reads any unprefixed value as a local directory. An archive `url` that
+    // is really a path must not reach it as one.
+    use super::document::{
+        CatalogInstallResolution, load_catalog_document, resolve_candidate_install,
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("marketplace.json");
+    std::fs::write(
+        &path,
+        r#"{"name":"n","owner":{"name":"t"},"plugins":[
+            {"name":"absolute","source":{"source":"archive","url":"/etc"}},
+            {"name":"parent","source":{"source":"archive","url":"../../outside"}},
+            {"name":"prefixed","source":{"source":"archive","url":"path:/etc"}},
+            {"name":"remote","source":{"source":"archive","url":"https://x.example.com/p.tgz"}}
+        ]}"#,
+    )
+    .unwrap();
+    let loaded = load_catalog_document("n", tmp.path(), path.to_str().unwrap()).unwrap();
+    assert_eq!(loaded.entry.catalog.format, MarketplaceFormat::Claude);
+    let registry = crate::plugins::PluginRegistry::empty(tmp.path());
+    for name in ["absolute", "parent", "prefixed"] {
+        let candidate = loaded.entry.catalog.candidate_by_name(name).unwrap();
+        match resolve_candidate_install(&loaded.entry, candidate, &registry) {
+            CatalogInstallResolution::Unsupported { reason } => {
+                assert!(reason.contains("is not a remote"), "{reason}");
+            }
+            _ => panic!("archive `{name}` must not resolve to a local install"),
+        }
+    }
+    let remote = loaded.entry.catalog.candidate_by_name("remote").unwrap();
+    let CatalogInstallResolution::Supported { spec, .. } =
+        resolve_candidate_install(&loaded.entry, remote, &registry)
+    else {
+        panic!("a remote archive stays installable")
+    };
+    assert_eq!(spec, "https://x.example.com/p.tgz");
+}
+
+#[test]
 fn catalog_local_sources_cannot_leave_the_catalog_directory() {
     use super::document::{
         CatalogInstallResolution, load_catalog_document, resolve_candidate_install,

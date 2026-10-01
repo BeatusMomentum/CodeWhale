@@ -211,7 +211,17 @@ fn resolve_spec(
         };
         return Ok(format!("path:{}", dir.join(path).display()));
     }
-    Ok(spec.to_string())
+    // Every other source kind (GitHub, archive/tarball URL) is remote. The
+    // installer parses the spec again, and any value it does not recognise
+    // as remote is a local directory there — so an archive `url` of `/etc`
+    // or `../..` would bypass the containment check above. Only a spec the
+    // installer's own parser reads as remote is installable from a catalog.
+    match crate::plugins::install::PluginInstallSource::parse(spec) {
+        Ok(crate::plugins::install::PluginInstallSource::Remote(_)) => Ok(spec.to_string()),
+        _ => Err(format!(
+            "Catalog source `{spec}` is not a remote (github: or http(s)://) source; a catalog may name a local directory only as a path inside the catalog"
+        )),
+    }
 }
 
 /// Resolve a user-supplied document path to an existing regular file without
