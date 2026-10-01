@@ -90,9 +90,13 @@ pub fn legacy_deepseek_home_override() -> Option<PathBuf> {
 /// process runs in. [`codewhale_home`] names that case as an error.
 #[must_use]
 pub fn user_home() -> Option<PathBuf> {
-    path_env("HOME")
+    // An explicit invalid home is an error, not permission to fall back to
+    // the ambient Windows profile and escape a caller's isolation boundary.
+    if let Some(home) = path_env("HOME") {
+        return home.is_absolute().then_some(home);
+    }
+    path_env("USERPROFILE")
         .filter(|path| path.is_absolute())
-        .or_else(|| path_env("USERPROFILE").filter(|path| path.is_absolute()))
         .or_else(windows_home_from_environment)
         .or_else(dirs::home_dir)
         .filter(|path| path.is_absolute())

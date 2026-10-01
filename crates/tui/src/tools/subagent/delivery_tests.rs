@@ -730,9 +730,11 @@ fn checkpoint_commits_only_worker_paths_at_any_inventory_size() {
         let tmp = tempdir().unwrap();
         let root = tmp.path();
         repository(root);
+        let literal_glob = "[foreign].rs";
         for name in [
             "foreign_edit.rs",
             "foreign_staged.rs",
+            "f.rs",
             "removed.rs",
             "renamed.rs",
         ] {
@@ -742,13 +744,15 @@ fn checkpoint_commits_only_worker_paths_at_any_inventory_size() {
         git(root, &["commit", "--quiet", "-m", "fixtures"]);
         // Someone else's work, present before the worker starts.
         fs::write(root.join("foreign_edit.rs"), "base\nforeign\n").unwrap();
+        // This platform-valid glob spelling would also match this foreign edit.
+        fs::write(root.join("f.rs"), "base\nforeign\n").unwrap();
         fs::write(root.join("foreign_staged.rs"), "base\nstaged elsewhere\n").unwrap();
         git(root, &["add", "--", "foreign_staged.rs"]);
 
         let evidence = DeliveryEvidence::capture_for_handle(root, true);
 
         fs::write(root.join("src/lib.rs"), "baseline\nworker\n").unwrap();
-        fs::write(root.join("*.rs"), "a literal name, not a glob\n").unwrap();
+        fs::write(root.join(literal_glob), "a literal name, not a glob\n").unwrap();
         git(root, &["rm", "--quiet", "--", "removed.rs"]);
         git(root, &["mv", "--", "renamed.rs", "moved.rs"]);
         fs::create_dir_all(root.join("gen")).unwrap();
@@ -770,16 +774,22 @@ fn checkpoint_commits_only_worker_paths_at_any_inventory_size() {
             root,
             &["show", "--no-renames", "--name-only", "--format=", "HEAD"],
         );
-        let mut expected: BTreeSet<String> =
-            ["src/lib.rs", "*.rs", "removed.rs", "renamed.rs", "moved.rs"]
-                .into_iter()
-                .map(str::to_string)
-                .collect();
+        let mut expected: BTreeSet<String> = [
+            "src/lib.rs",
+            literal_glob,
+            "removed.rs",
+            "renamed.rs",
+            "moved.rs",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
         expected.extend((0..worker_files).map(|index| format!("gen/f{index}.rs")));
         assert_eq!(committed, expected, "{worker_files} files");
         assert_eq!(
             git_lines(root, &["status", "--porcelain=v1"]),
             BTreeSet::from([
+                " M f.rs".to_string(),
                 " M foreign_edit.rs".to_string(),
                 "M  foreign_staged.rs".to_string(),
             ]),
