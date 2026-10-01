@@ -91,7 +91,7 @@
     "std_fs": 1
   },
   "crates/tui/src/artifacts.rs": {
-    "std_fs": 4
+    "std_fs": 2
   },
   "crates/tui/src/automation_manager.rs": {
     "path_canonicalize": 4
@@ -477,9 +477,6 @@
   "crates/tui/src/tools/workflow/report.rs": {
     "std_fs": 4
   },
-  "crates/tui/src/tui/app/composer.rs": {
-    "std_fs": 2
-  },
   "crates/tui/src/tui/app/init.rs": {
     "std_fs": 1
   },
@@ -531,7 +528,7 @@
   },
   "crates/tui/src/tui/ui/activity_detail.rs": {
     "path_canonicalize": 2,
-    "std_fs": 3
+    "std_fs": 2
   },
   "crates/tui/src/tui/ui/apply.rs": {
     "std_fs": 2
@@ -567,7 +564,7 @@
     "path_canonicalize": 2
   },
   "crates/tui/src/utils.rs": {
-    "std_fs": 12,
+    "std_fs": 14,
     "thread_sleep": 1
   },
   "crates/tui/src/vision/tools.rs": {

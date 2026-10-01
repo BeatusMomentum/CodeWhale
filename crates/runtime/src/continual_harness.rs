@@ -229,23 +229,29 @@ pub fn journal_path(state_path: &Path) -> PathBuf {
 }
 
 fn state_path_for_write(workspace: &Path) -> Result<PathBuf> {
-    let existing = state_path_for_read(workspace)?;
+    // The resolver returns `<workspace>/<app dir>/harness` under the
+    // workspace as it normalizes it; link checks walk down from that root.
+    let (_, dir) = codewhale_config::resolve_project_state_dir(workspace, "harness")?;
+    let root = dir
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| anyhow!("continual harness directory {} has no root", dir.display()))?
+        .to_path_buf();
+    let existing = dir.join("state.json");
     let path = if existing.is_file() {
         existing
     } else {
         // Check the parents that already exist before creating anything
         // through them.
-        let planned = workspace
-            .canonicalize()
-            .unwrap_or_else(|_| workspace.to_path_buf())
+        let planned = root
             .join(codewhale_config::CODEWHALE_APP_DIR)
             .join("harness")
             .join("state.json");
-        reject_linked_state_path(workspace, &planned)?;
+        reject_linked_state_path(&root, &planned)?;
         codewhale_config::ensure_project_state_dir(workspace, "harness")?.join("state.json")
     };
-    reject_linked_state_path(workspace, &path)?;
-    reject_linked_state_path(workspace, &journal_path(&path))?;
+    reject_linked_state_path(&root, &path)?;
+    reject_linked_state_path(&root, &journal_path(&path))?;
     Ok(path)
 }
 
@@ -253,16 +259,13 @@ fn state_path_for_write(workspace: &Path) -> Result<PathBuf> {
 /// directory, the state file or the journal is a link, so a workspace that
 /// ships a linked `.codewhale` cannot send them outside the workspace.
 fn reject_linked_state_path(workspace: &Path, path: &Path) -> Result<()> {
-    let workspace = workspace
-        .canonicalize()
-        .unwrap_or_else(|_| workspace.to_path_buf());
-    let Ok(relative) = path.strip_prefix(&workspace) else {
+    let Ok(relative) = path.strip_prefix(workspace) else {
         bail!(
             "continual harness state {} is outside the workspace",
             path.display()
         );
     };
-    let mut current = workspace;
+    let mut current = workspace.to_path_buf();
     for component in relative.components() {
         current.push(component);
         match fs::symlink_metadata(&current) {
