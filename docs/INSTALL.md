@@ -378,7 +378,7 @@ sudo apt-get install -y build-essential pkg-config libdbus-1-dev git
 # Rust via rustup (the distro's cargo is too old for this edition-2024 workspace)
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 source "$HOME/.cargo/env"
-rustc --version            # the workspace declares rust-version = 1.88
+rustc --version            # the workspace declares rust-version = 1.89
 ```
 
 `libdbus-1-dev` **is required**. Without it the build fails after about a
@@ -407,7 +407,8 @@ Tested result: **works**, with current stable Rust (1.98.1).
 * `codewhale --version` prints `codewhale 0.10.0`, with no commit hash.
 * Headless and TUI smoke tests passed.
 
-> **The docs say "Rust 1.88+". That's wrong for v0.10.0.** With 1.88.0 the
+> **v0.10.0 declared "Rust 1.88+", which was wrong.** The workspace now
+> declares 1.89, the version CI's MSRV job builds. With 1.88.0 the v0.10.0
 > install fails in seconds:
 > `rustc 1.88.0 is not supported by the following package: serde-saphyr@1.3.0 requires rustc 1.89`.
 > Use current stable (`rustup update stable`).
@@ -1377,7 +1378,7 @@ Building on Windows requires the **MSVC C toolchain** from
 
 1. Install Visual Studio 2022 Build Tools — select the **"Desktop development
    with C++"** workload.
-2. Install [Rust](https://rustup.rs) 1.88+ (see the
+2. Install [Rust](https://rustup.rs) 1.89+ (see the
    [China mirror instructions](#china--mirror-friendly-install) above if
    downloading from mainland China).
 3. Install [Git for Windows](https://git-scm.com/download/win) (provides `git`

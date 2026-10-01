@@ -37,11 +37,11 @@ resolver = "2"
 [workspace.package]
 version = "0.10.1"
 edition = "2024"
-# Rust 1.88 stabilized `let_chains` in `if`/`while` conditions, which the
-# codebase relies on extensively. Cargo enforces this so users on older
-# toolchains get a clear "package requires rustc 1.88+" error instead of a
-# confusing E0658 from rustc.
-rust-version = "1.88"
+# The floor is what CI's MSRV job builds (1.89): Rust 1.88 stabilized the
+# `let_chains` the codebase relies on, but a locked dependency
+# (serde-saphyr) needs 1.89. Cargo enforces this so users on older toolchains
+# get a clear "package requires rustc 1.89+" error.
+rust-version = "1.89"
 license = "MIT"
 repository = "https://github.com/Hmbown/CodeWhale"
 
