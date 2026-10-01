@@ -232,11 +232,22 @@ fn record_ui_stall(app: &App, phase: &str, since_progress: Duration, bound: Dura
 /// The UI watchdog, supervised by the engine heartbeat (#6184). Suspect
 /// sub-agents no longer veto recovery, and an engine-reported stall is shown
 /// with the phase it stalled in.
+///
+/// Recovering a turn that had started is all-or-nothing (#6800): the engine's
+/// turn is cancelled with the UI's, through the cancellation the cancel key
+/// issues. Clearing only the UI left the engine owning the turn, so the next
+/// message was refused and no outcome was ever recorded. The engine's
+/// terminal event for that turn then arrives as it does after a local cancel.
+///
+/// Known limitation: a turn wedged somewhere that does not observe
+/// cancellation still holds the engine; this only removes the disagreement.
 pub(crate) fn reconcile_turn_liveness_supervised(
     app: &mut App,
     now: Instant,
     heartbeat: &crate::core::engine::turn_heartbeat::HeartbeatSnapshot,
+    engine: &EngineHandle,
 ) -> bool {
+    let turn_in_progress = matches!(app.runtime_turn_status.as_deref(), Some("in_progress"));
     if (app.is_loading || matches!(app.runtime_turn_status.as_deref(), Some("in_progress")))
         && let Some(stall) = heartbeat.stall.as_ref()
     {
@@ -245,7 +256,12 @@ pub(crate) fn reconcile_turn_liveness_supervised(
         app.push_status_toast(text, StatusToastLevel::Error, None);
     }
     let has_live_agents = live_running_agent_count(app, now) > 0;
-    reconcile_turn_liveness_with(app, now, has_live_agents, Some(heartbeat))
+    let recovered = reconcile_turn_liveness_with(app, now, has_live_agents, Some(heartbeat));
+    if recovered && turn_in_progress && app.runtime_turn_status.is_none() {
+        engine.cancel_with_reason(crate::core::engine::CancelReason::Stalled);
+        app.suppress_stream_events_until_turn_complete = true;
+    }
+    recovered
 }
 
 /// Unsupervised form (no engine heartbeat), kept for focused tests.

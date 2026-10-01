@@ -25,7 +25,8 @@ ROOT = Path(__file__).resolve().parent.parent
 # Bots and the maintainer account: real authors of most commits, never
 # "contributors" in the credit sense this file guards.
 SKIP = {
-    "codewhale bot", "claude", "codex", "dependabot[bot]", "codewhale-maint",
+    "codewhale bot", "codewhalebot", "claude", "codex", "dependabot[bot]",
+    "codewhale-maint",
     "hunter bown", "hunter b", "hmbown", "deepseek-v41-flash", "devin",
 }
 

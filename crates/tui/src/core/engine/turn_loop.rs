@@ -6335,9 +6335,28 @@ impl Engine {
                         .get("message")
                         .and_then(Value::as_str)
                         .unwrap_or("provider stream error");
-                    let envelope = ErrorEnvelope::classify(message.to_string(), true);
                     crate::logging::warn(format!("Provider stream error event: {message}"));
-                    let _ = self.send_stream_event(Event::error(envelope)).await;
+                    // #6795: a gateway can report a transient upstream failure
+                    // as an error frame inside a 200. With nothing actionable
+                    // streamed that is a no-content stream death like a
+                    // transport error or a stall: count it so the existing
+                    // retry budget re-issues the request, and keep it as the
+                    // prospective outcome so an exhausted budget fails the
+                    // turn with the provider's reason. No error event yet: a
+                    // retry that succeeds must not leave a terminal-looking
+                    // card behind. Auth, invalid-model and every other class
+                    // stays terminal on the first frame, as does any frame
+                    // after content (replaying would duplicate side effects).
+                    let transient = matches!(
+                        crate::error_taxonomy::classify_error_message(message),
+                        ErrorCategory::Network | ErrorCategory::Timeout
+                    );
+                    if transient && !any_content_received {
+                        stream_errors = stream_errors.saturating_add(1);
+                    } else {
+                        let envelope = ErrorEnvelope::classify(message.to_string(), false);
+                        let _ = self.send_stream_event(Event::error(envelope)).await;
+                    }
                     stream_error.get_or_insert(message.to_string());
                     break;
                 }

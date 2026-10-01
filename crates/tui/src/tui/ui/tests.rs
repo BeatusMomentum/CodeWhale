@@ -15224,8 +15224,9 @@ fn stall_engine_report_shows_phase_and_held_queue() {
         Some(stall_report("while streaming the model response")),
     );
 
-    reconcile_turn_liveness_supervised(&mut app, Instant::now(), &stalled);
-    reconcile_turn_liveness_supervised(&mut app, Instant::now(), &stalled);
+    let engine = crate::core::engine::mock_engine_handle();
+    reconcile_turn_liveness_supervised(&mut app, Instant::now(), &stalled, &engine.handle);
+    reconcile_turn_liveness_supervised(&mut app, Instant::now(), &stalled, &engine.handle);
 
     let stall_toasts: Vec<_> = app
         .status_toasts
@@ -15274,8 +15275,22 @@ fn stall_parked_subagent_past_bound_is_suspect_not_a_veto() {
         vec!["agent_ghost".to_string()]
     );
     assert_eq!(live_running_agent_count(&app, now), 0);
-    assert!(reconcile_turn_liveness_supervised(&mut app, now, &idle));
+    let engine = crate::core::engine::mock_engine_handle();
+    assert!(!engine.handle.is_cancelled());
+    assert!(reconcile_turn_liveness_supervised(
+        &mut app,
+        now,
+        &idle,
+        &engine.handle
+    ));
     assert!(!app.is_loading);
+    // #6800: the engine's turn ends with the UI's, and its late terminal
+    // event is handled like a local cancel's.
+    assert!(
+        engine.handle.is_cancelled(),
+        "recovery must cancel the engine's turn, not only reset the UI"
+    );
+    assert!(app.suppress_stream_events_until_turn_complete);
     assert!(
         app.status_toasts
             .iter()
@@ -15300,8 +15315,18 @@ fn stall_parked_subagent_past_bound_is_suspect_not_a_veto() {
     );
     fresh.started_at = Some(now);
     app.subagent_cache = vec![fresh];
-    assert!(!reconcile_turn_liveness_supervised(&mut app, now, &idle));
+    let engine = crate::core::engine::mock_engine_handle();
+    assert!(!reconcile_turn_liveness_supervised(
+        &mut app,
+        now,
+        &idle,
+        &engine.handle
+    ));
     assert!(app.is_loading);
+    assert!(
+        !engine.handle.is_cancelled(),
+        "a turn that is still live is never cancelled"
+    );
     set_test_stall_record_dir(None);
 }
 

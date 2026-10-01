@@ -702,6 +702,8 @@ pub enum CancelReason {
     /// Engine internals tore down the turn (drop, channel close,
     /// shutdown). Rare — surfaced as an internal error.
     Internal,
+    /// The UI watchdog ended a turn that stopped making progress.
+    Stalled,
 }
 
 impl CancelReason {
@@ -711,6 +713,7 @@ impl CancelReason {
             Self::External => "request cancelled by external caller",
             Self::Preempted => "request was preempted by a new turn",
             Self::Internal => "engine torn down before approval resolved",
+            Self::Stalled => "the turn stalled and was ended by the watchdog",
         }
     }
 }

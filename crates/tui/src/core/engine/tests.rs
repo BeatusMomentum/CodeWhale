@@ -25511,6 +25511,126 @@ async fn terminal_output_limit_followed_by_stream_error_is_charged_and_not_retri
     run_task.await.expect("engine task");
 }
 
+/// Run one user turn against scripted streams; returns its events and how
+/// many model requests were made.
+async fn error_frame_turn_events(turns: Vec<Vec<StreamEvent>>) -> (Vec<Event>, usize) {
+    let model = std::sync::Arc::new(crate::llm_client::mock::MockLlmClient::new(turns));
+    let client: crate::core::model_client::SharedModelClient = model.clone();
+    let config = Config::default();
+    let engine_config = EngineConfig {
+        max_steps: 1,
+        snapshots_enabled: false,
+        subagents_enabled: false,
+        terminal_chrome_enabled: false,
+        ..EngineConfig::default()
+    };
+    let (engine, handle) = Engine::new_with_model_client(engine_config, &config, client);
+    let run_task = tokio::spawn(engine.run());
+    handle
+        .send(Op::SendMessage(TurnSpec {
+            max_output_tokens: None,
+            content: "solve the task".to_string(),
+            images: Vec::new(),
+            mode: AppMode::Agent,
+            route: resolved_route_for_test(&config, crate::config::DEFAULT_TEXT_MODEL),
+            compaction: Box::new(CompactionConfig::default()),
+            initial_routed_usage: Box::default(),
+            goal_objective: None,
+            goal_token_budget: None,
+            goal_status: crate::tools::goal::GoalStatus::Active,
+            reasoning_effort: None,
+            reasoning_effort_auto: false,
+            auto_model: false,
+            allow_shell: false,
+            trust_mode: false,
+            auto_approve: false,
+            approval_mode: ApprovalMode::Suggest,
+            translation_enabled: false,
+            allowed_tools: None,
+            dynamic_tools: Vec::new(),
+            hook_executor: None,
+            verbosity: None,
+            provenance: UserInputProvenance::ExternalUser,
+            submission_id: None,
+        }))
+        .await
+        .expect("send turn");
+    let mut events = Vec::new();
+    loop {
+        let event = tokio::time::timeout(model_turn_event_timeout(), async {
+            handle.rx_event.write().await.recv().await
+        })
+        .await
+        .expect("turn event timeout")
+        .expect("turn event");
+        let terminal = matches!(event, Event::TurnComplete { .. });
+        events.push(event);
+        if terminal {
+            break;
+        }
+    }
+    handle.send(Op::Shutdown).await.expect("shutdown engine");
+    run_task.await.expect("engine task");
+    (events, model.call_count())
+}
+
+/// #6795: a transient upstream failure delivered as an error frame inside a
+/// successful response, before anything streamed, is retried like every other
+/// no-content stream death. A terminal-class frame still fails on the first
+/// request.
+#[tokio::test]
+async fn transient_error_frame_with_no_content_is_retried_and_terminal_frame_is_not() {
+    use crate::llm_client::mock::canned;
+    let frame = |message: &str| {
+        vec![StreamEvent::Error {
+            error: serde_json::json!({ "message": message }),
+        }]
+    };
+
+    let (events, requests) = error_frame_turn_events(vec![
+        frame("Provider returned an empty response"),
+        canned::simple_text_turn("recovered answer"),
+    ])
+    .await;
+    assert_eq!(requests, 2, "the empty-upstream frame is re-issued once");
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            Event::TurnComplete {
+                status: TurnOutcomeStatus::Completed,
+                error: None,
+                ..
+            }
+        )),
+        "a successful retry completes the turn"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, Event::Error { .. })),
+        "a retried frame leaves no error card behind"
+    );
+
+    let (events, requests) = error_frame_turn_events(vec![
+        frame("Model not exist."),
+        canned::simple_text_turn("must never be requested"),
+    ])
+    .await;
+    assert_eq!(requests, 1, "a terminal-class frame is never retried");
+    assert!(events.iter().any(|event| matches!(
+        event,
+        Event::TurnComplete {
+            status: TurnOutcomeStatus::Failed,
+            ..
+        }
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        Event::Error { envelope, .. }
+            if envelope.message.contains("Model not exist.") && !envelope.recoverable
+    )));
+}
+
 #[tokio::test]
 async fn midstream_error_frame_stops_the_stream_and_drops_trailing_deltas() {
     // The reported incident: a provider delivered a chunk-level error
