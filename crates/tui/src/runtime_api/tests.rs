@@ -8103,7 +8103,12 @@ async fn file_revert_route_probes_as_available_and_404s_unknown_threads() -> Res
 /// any case.
 #[tokio::test]
 async fn file_revert_route_validates_body_then_trust_then_ownership() -> Result<()> {
+    // The route opens the snapshot store under the resolved home. Seal the
+    // process environment and own that home, so a concurrent test's temporary
+    // HOME (deleted when it ends) can never host or remove this store mid-request.
+    let _env = lock_test_env();
     let root = std::env::temp_dir().join(format!("deepseek-file-revert-gates-{}", Uuid::new_v4()));
+    let _home = EnvVarGuard::set("CODEWHALE_HOME", root.join("home"));
     let sessions_dir = root.join("sessions");
     let Some((addr, runtime_threads, handle)) =
         spawn_test_server_with_root(root.clone(), sessions_dir).await?
@@ -8167,7 +8172,12 @@ async fn file_revert_route_validates_body_then_trust_then_ownership() -> Result<
 /// workspace, and admit again once it settles. Nothing is changed on refusal.
 #[tokio::test]
 async fn restore_routes_refuse_an_active_turn_in_the_workspace() -> Result<()> {
+    // The route opens the snapshot store under the resolved home. Seal the
+    // process environment and own that home, so a concurrent test's temporary
+    // HOME (deleted when it ends) can never host or remove this store mid-request.
+    let _env = lock_test_env();
     let root = std::env::temp_dir().join(format!("deepseek-restore-active-{}", Uuid::new_v4()));
+    let _home = EnvVarGuard::set("CODEWHALE_HOME", root.join("home"));
     let sessions_dir = root.join("sessions");
     let Some((addr, runtime_threads, handle)) =
         spawn_test_server_with_root(root.clone(), sessions_dir).await?
@@ -8234,8 +8244,9 @@ async fn restore_routes_refuse_an_active_turn_in_the_workspace() -> Result<()> {
         .json(&revert_body)
         .send()
         .await?;
-    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let status = resp.status();
     let text = resp.text().await?;
+    assert_eq!(status, StatusCode::CONFLICT, "got: {text}");
     assert!(text.contains("refresh the change record"), "got: {text}");
     assert_eq!(fs::read_to_string(&file)?, "live");
 

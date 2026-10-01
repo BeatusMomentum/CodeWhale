@@ -3424,15 +3424,18 @@ mod tests {
             State(f): State<RecordingRuntime>,
             AxumPath(thread_id): AxumPath<String>,
         ) -> StatusCode {
-            if f.lookup_failures
-                .fetch_update(
-                    std::sync::atomic::Ordering::SeqCst,
-                    std::sync::atomic::Ordering::SeqCst,
-                    |remaining| remaining.checked_sub(1),
-                )
-                .is_ok()
-            {
-                return StatusCode::SERVICE_UNAVAILABLE;
+            use std::sync::atomic::Ordering::SeqCst;
+            let mut remaining = f.lookup_failures.load(SeqCst);
+            while remaining > 0 {
+                match f.lookup_failures.compare_exchange_weak(
+                    remaining,
+                    remaining - 1,
+                    SeqCst,
+                    SeqCst,
+                ) {
+                    Ok(_) => return StatusCode::SERVICE_UNAVAILABLE,
+                    Err(current) => remaining = current,
+                }
             }
             if thread_id == "thr_minted" {
                 StatusCode::OK

@@ -1972,11 +1972,16 @@ impl SubAgentInput {
     /// Mark this input as consumed by the child loop.
     fn mark_taken(&self) {
         if let Some(pending) = self.pending.as_ref() {
-            let _ = pending.fetch_update(
-                std::sync::atomic::Ordering::AcqRel,
-                std::sync::atomic::Ordering::Acquire,
-                |value| Some(value.saturating_sub(1)),
-            );
+            // Saturating decrement as a compare-exchange loop: `fetch_update`
+            // is deprecated from Rust 1.99 and `try_update` is newer than the MSRV.
+            use std::sync::atomic::Ordering::{AcqRel, Acquire};
+            let mut value = pending.load(Acquire);
+            while value > 0 {
+                match pending.compare_exchange_weak(value, value - 1, AcqRel, Acquire) {
+                    Ok(_) => break,
+                    Err(current) => value = current,
+                }
+            }
         }
     }
 }

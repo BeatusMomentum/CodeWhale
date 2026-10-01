@@ -4799,15 +4799,26 @@ impl SubAgentWorkflowDriver {
             }
         };
         self.ensure_admission_open()?;
-        let workflow_child_index = self
-            .child_counter
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
-                (count < self.max_children).then_some(count + 1)
-            })
-            .map_err(|_| DriverError::Rejected(format!(
-                "workflow.max_children limit ({}) reached; reduce remaining work or start a new reviewed plan",
-                self.max_children
-            )))?;
+        // A plain compare-exchange loop: `fetch_update` is deprecated from
+        // Rust 1.99 and its `try_update` replacement is newer than the MSRV.
+        let mut count = self.child_counter.load(Ordering::SeqCst);
+        let workflow_child_index = loop {
+            if count >= self.max_children {
+                return Err(DriverError::Rejected(format!(
+                    "workflow.max_children limit ({}) reached; reduce remaining work or start a new reviewed plan",
+                    self.max_children
+                )));
+            }
+            match self.child_counter.compare_exchange_weak(
+                count,
+                count + 1,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(reserved) => break reserved,
+                Err(current) => count = current,
+            }
+        };
         let handoffs = WorkflowHandoffReservation {
             board: self.gate_board.clone(),
             artifacts: self.prepare_request_for_gates(&mut request)?,
