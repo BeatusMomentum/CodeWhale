@@ -64,9 +64,21 @@ export function runInfoPath() { return path.join(stateDir(), "app-run.json"); }
 export function readRegistration() {
   try {
     const reg = JSON.parse(fs.readFileSync(registrationPath(), "utf8"));
-    if (!Array.isArray(reg?.launch) || reg.launch.length === 0 || typeof reg.launch[0] !== "string") return null;
+    if (!launchArgv(reg)) return null;
     return reg;
   } catch { return null; }
+}
+
+/**
+ * The argv that starts the registered app: always the bundle's own launcher,
+ * derived from its path. app.json is a file any process of this user can
+ * write, so a `launch` argv stored there is never run.
+ */
+export function launchArgv(reg, platform = process.platform) {
+  const bundle = reg?.path;
+  if (typeof bundle !== "string" || !path.isAbsolute(bundle) || bundle.includes("\0")) return null;
+  if (platform === "darwin" && !/\.app\/?$/i.test(bundle)) return null;
+  return defaultLaunch(bundle, platform);
 }
 
 export function writeRegistration(reg) {
@@ -182,7 +194,9 @@ export function defaultLaunch(bundlePath, platform = process.platform) {
 
 /** Start the registered app detached (LaunchServices on macOS so TCC attributes it to the app). */
 export function launchApp(reg) {
-  const [cmd, ...args] = reg.launch;
+  const argv = launchArgv(reg);
+  if (!argv) return null;
+  const [cmd, ...args] = argv;
   const child = spawn(cmd, args, { detached: true, stdio: "ignore", windowsHide: true });
   child.on("error", () => {});
   child.unref();

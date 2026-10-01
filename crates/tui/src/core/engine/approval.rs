@@ -75,11 +75,47 @@ pub(super) enum UserInputDecision {
     },
 }
 
+/// A person pressed Allow on an approval card for this call.
+///
+/// Only the engine's card resolver can build one; auto-approval, Full
+/// Access, Auto-Review and session grants never do. Tools that act on a
+/// person's behalf (the Computer Use consent and script calls) forward it to
+/// the plugin as an attested decision.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct HumanDecision {
+    tool_name: String,
+    arguments: serde_json::Value,
+}
+
+impl HumanDecision {
+    pub(super) fn from_card_allow(tool_name: &str, arguments: &serde_json::Value) -> Self {
+        Self {
+            tool_name: tool_name.to_string(),
+            arguments: arguments.clone(),
+        }
+    }
+
+    pub(crate) fn authorizes(&self, tool_name: &str, arguments: &serde_json::Value) -> bool {
+        self.tool_name == tool_name && self.arguments == *arguments
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(tool_name: &str, arguments: &serde_json::Value) -> Self {
+        Self::from_card_allow(tool_name, arguments)
+    }
+}
+
+impl std::fmt::Debug for HumanDecision {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("HumanDecision(card allow)")
+    }
+}
+
 /// Result of awaiting tool approval from the user.
 #[derive(Debug)]
 pub(super) enum ApprovalResult {
     /// User approved the tool execution.
-    Approved,
+    Approved(ApprovalDecider),
     /// User denied the tool execution.
     Denied,
     /// The approval card expired unanswered. Nobody refused the call, so it
@@ -245,7 +281,7 @@ impl Engine {
                     match decision {
                         ApprovalDecision::Approved { id, by } if id == tool_id => {
                             self.commit_approval_outcome(tool_id, ApprovalOutcome::ApprovedOnce, Some(by)).await?;
-                            return Ok(ApprovalResult::Approved);
+                            return Ok(ApprovalResult::Approved(by));
                         }
                         ApprovalDecision::Denied { id, by } if id == tool_id => {
                             self.commit_approval_outcome(tool_id, ApprovalOutcome::Denied, Some(by)).await?;
@@ -1762,7 +1798,7 @@ mod tests {
             let result = task.await.expect("approval task");
             match expected {
                 ApprovalOutcome::ApprovedOnce => {
-                    assert!(matches!(result, Ok(ApprovalResult::Approved)));
+                    assert!(matches!(result, Ok(ApprovalResult::Approved(_))));
                 }
                 ApprovalOutcome::Denied => {
                     assert!(matches!(result, Ok(ApprovalResult::Denied)));

@@ -26,7 +26,7 @@ import {
   processUpdateBatch,
 } from "./lib.mjs";
 import { renderQrToText } from "./qr.mjs";
-import { ThreadStore as CoreThreadStore, writeFileDurable } from "../../bridge-core/src/lib.mjs";
+import { ThreadStore as CoreThreadStore, writeFileDurable, ApprovalOwnershipError, decideApproval as decideRuntimeApproval } from "../../bridge-core/src/lib.mjs";
 
 // ============================================================================
 // ThreadStore — JSON 文件持久化（与 feishu/telegram/wechat bridge 一致）
@@ -343,6 +343,10 @@ async function ensureThread(chatId, { forceNew = false } = {}) {
   return state;
 }
 
+function turnActor(chatId) {
+  return chatId ? `weixin-user:${chatId}` : "";
+}
+
 async function runPrompt(chatId, prompt) {
   if (!prompt.trim()) {
     await sendText(chatId, helpText());
@@ -384,6 +388,11 @@ async function runPrompt(chatId, prompt) {
   );
 
   const turnId = turnResponse.turn?.id;
+  // A turn the Runtime accepted keeps streaming even when its origin cannot be
+  // recorded; its approvals then fail closed and are decided from the TUI.
+  if (turnId && turnActor(chatId)) {
+    await threadStore.recordTurnOrigin(chatId, state.threadId, turnId, turnActor(chatId));
+  }
   await threadStore.patchChat(chatId, {
     activeTurnId: turnId || null,
     lastSeq: sinceSeq,
@@ -653,18 +662,16 @@ async function decideApproval(chatId, action) {
     return;
   }
   try {
-    await runtimeJson(
-      `/v1/approvals/${encodeURIComponent(approvalId)}`,
-      {
-        method: "POST",
-        body: { decision, remember },
-      }
-    );
+    await decideRuntimeApproval(runtimeJson, { store: threadStore, chatId, actorId: turnActor(chatId), approvalId, decision, remember });
     await sendText(
       chatId,
       `Approval ${approvalId}: ${decision}${remember ? " and remember" : ""}`
     );
   } catch (error) {
+    if (error instanceof ApprovalOwnershipError) {
+      await sendText(chatId, `Approval ${approvalId} is not waiting in this chat.`);
+      return;
+    }
     await sendText(chatId, `Approval failed: ${error.message}`);
   }
 }

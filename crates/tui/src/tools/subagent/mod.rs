@@ -18977,6 +18977,14 @@ impl SubAgentToolRegistry {
         use crate::core::events::{ToolGate, ToolGateVerdict};
         use crate::tui::auto_review::AutoReviewContext;
 
+        if crate::tools::approval_cache::computer_use_user_gate(name, input).is_some()
+            || crate::tools::approval_cache::computer_use_batch_hidden_gate(name, input).is_some()
+        {
+            return ChildGateVerdict::Deny(format!(
+                "Computer Use call {name} needs the user's own approval and cannot run in a sub-agent. Ask the parent to run it."
+            ));
+        }
+
         // Approval posture is separate from authority: it can remove a
         // prompt, never restore a tool removed by role, scope, or envelope.
         let approval_mode = crate::core::authority::agent_approval_mode_for_turn(

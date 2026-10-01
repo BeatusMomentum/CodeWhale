@@ -1166,7 +1166,7 @@ impl ToolRegistryBuilder {
     pub fn with_rlm_tool(self, client: Option<CodewhaleClient>, root_model: String) -> Self {
         use super::rlm::RlmTool;
         self.with_tool(Arc::new(
-            RlmTool::new("rlm", client).with_root_model(root_model),
+            RlmTool::new(super::rlm::RLM_TOOL_NAME, client).with_root_model(root_model),
         ))
     }
 
@@ -1648,7 +1648,12 @@ impl ToolSpec for McpToolAdapter {
     ) -> Result<RichToolResult, ToolError> {
         let mut pool = self.pool.lock().await;
         let result = pool
-            .call_tool_with_disallowed(&self.name, input, &context.disallowed_tools)
+            .call_tool_with_disallowed(
+                &self.name,
+                input,
+                &context.disallowed_tools,
+                context.human_decision.as_ref(),
+            )
             .await
             .map_err(|e| ToolError::execution_failed(format!("MCP tool failed: {e}")))?;
         Ok(mcp_result_to_bounded_rich_tool_result(result))

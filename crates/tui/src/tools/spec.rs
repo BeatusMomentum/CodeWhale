@@ -586,6 +586,8 @@ pub struct ToolContext {
 pub struct ToolExecutionState {
     /// Effective session/ancestor tool ceiling, carried to MCP dispatch and runtime registration.
     pub(crate) disallowed_tools: Vec<String>,
+    /// Set only on the context of one call a person approved on a card.
+    pub(crate) human_decision: Option<crate::core::engine::HumanDecision>,
     /// Shared shell manager for background tasks and streaming IO.
     pub shell_manager: SharedShellManager,
     /// Per-session snapshots for files successfully observed by `read_file`.
@@ -787,6 +789,7 @@ impl ToolContext {
             workspace,
             execution: Box::new(ToolExecutionState {
                 disallowed_tools: Vec::new(),
+                human_decision: None,
                 shell_manager,
                 file_read_tracker: new_shared_file_read_tracker(),
                 owner_agent_id: None,
@@ -1324,6 +1327,16 @@ impl ToolContext {
     /// with elevated permissions.
     pub fn with_elevated_sandbox_policy(mut self, policy: crate::sandbox::SandboxPolicy) -> Self {
         self.elevated_sandbox_policy = Some(policy);
+        self
+    }
+
+    /// Carry a person's card decision to the one call it approved.
+    #[must_use]
+    pub(crate) fn with_human_decision(
+        mut self,
+        decision: crate::core::engine::HumanDecision,
+    ) -> Self {
+        self.human_decision = Some(decision);
         self
     }
 

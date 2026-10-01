@@ -146,6 +146,8 @@ impl McpDispatchUnderTest for McpPoolDispatch {
                 model_name,
                 input,
                 &[],
+                // Conformance probes cannot supply a person's card decision.
+                None,
             ) => result,
         }
     }

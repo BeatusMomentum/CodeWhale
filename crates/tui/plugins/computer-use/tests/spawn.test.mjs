@@ -1,6 +1,7 @@
 // Spawned computers: registry shape, executor wiring, docker lifecycle, and
 // the MCP spawn/remove path. Docker tests are integration tests — they run
 // real containers when a daemon is present and skip otherwise.
+import { hostKeysLine, attest, attestParams } from "./fixtures/host-decision.mjs";
 import { test, after } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
@@ -127,7 +128,7 @@ function rpc(method, params) {
   return new Promise((resolve, reject) => {
     const t = setTimeout(() => { pending.delete(id); reject(new Error(`timeout: ${method}`)); }, 90_000);
     pending.set(id, (msg) => { clearTimeout(t); resolve(msg); });
-    server.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n");
+    server.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method, params: attestParams(method, params) }) + "\n");
   });
 }
 const call = async (name, args = {}) => JSON.parse((await rpc("tools/call", { name, arguments: args })).result.content[0].text);
@@ -137,6 +138,7 @@ test("computer spawn registers an owned docker computer, acts on it, and remove 
     env: { ...process.env, CODEWHALE_CU_STATE_DIR: tmp },
     stdio: ["pipe", "pipe", "pipe"],
   });
+  server.stdin.write(hostKeysLine());
   server.stdout.on("data", (c) => {
     buf += c.toString();
     let i;

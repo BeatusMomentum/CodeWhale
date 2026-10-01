@@ -6,6 +6,7 @@
 //  - hdc:   HarmonyOS device over `hdc` shell / file push-pull
 import { run, runOk, runInputLease, ExecError, currentSignal } from "./exec.mjs";
 import { ensureApp, appSessionRequest } from "./app-socket.mjs";
+import { sshArgv, sshDestination, sshOptions, validateSshTarget } from "./ssh-args.mjs";
 import { spawn } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
@@ -201,10 +202,9 @@ function attachPersistentChannel(ex, binding, serveArgv) {
 
 /** ssh executor: speaks to the remote agent installed by installRemoteAgent(). */
 export function sshExec(computer, binding) {
-  const userHost = computer.user ? `${computer.user}@${computer.host}` : computer.host;
-  const portArgs = computer.port ? ["-p", String(computer.port)] : [];
+  const userHost = sshDestination(computer);
   const remoteAgent = safeRemotePath(computer.agentPath ?? ".codewhale-cu/agent/agent.mjs");
-  const base = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "-o", "StrictHostKeyChecking=accept-new", ...portArgs, userHost];
+  const base = sshArgv(computer);
   const ex = {
     kind: "ssh",
     base,
@@ -286,7 +286,8 @@ export async function installRemoteAgent(computer) {
   for (const rel of rels) {
     const localPath = rel === "agent.mjs" ? path.join(PLUGIN_ROOT, "agent.mjs") : path.join(srcDir, rel.slice(4));
     const dest = safeRemotePath(`${marker}/${rel}`);
-    r = await run("scp", [...(computer.port ? ["-P", String(computer.port)] : []), localPath, `${ex.userHost}:${dest}`], { timeoutMs: 30_000 });
+    validateSshTarget(computer);
+    r = await run("scp", [...sshOptions(computer, { portFlag: "-P" }), "--", localPath, `${ex.userHost}:${dest}`], { timeoutMs: 30_000 });
     if (r.code !== 0) throw new ExecError(`scp ${rel} failed: ${r.stderr.trim().slice(0, 300)}`, r);
   }
   // Probe remote platform via the agent itself.
@@ -372,7 +373,7 @@ export function routeFingerprint(computer) {
   if (computer.transport === "docker") route.push(computer.container || null);
   if (computer.transport === "hdc") route.push(computer.target || null);
   if (computer.transport === "ssh") route.push(computer.host, computer.user || null,
-    computer.port || null, computer.agentPath ?? ".codewhale-cu/agent/agent.mjs");
+    computer.port || null, computer.knownHosts || null, computer.agentPath ?? ".codewhale-cu/agent/agent.mjs");
   return JSON.stringify(route);
 }
 

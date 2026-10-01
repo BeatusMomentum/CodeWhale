@@ -2221,7 +2221,9 @@ impl Engine {
             auto_approve,
             approval_mode,
         );
+        let prior = self.applied_runtime_authority();
         self.apply_runtime_mode_policy(&authority);
+        self.discard_kernels_if_narrowed(&prior).await;
 
         start_permit.send(Event::TurnStarted {
             turn_id: turn_id.clone(),
@@ -2500,8 +2502,10 @@ impl Engine {
                 != (authority.auto_approve || effective_approval == ApprovalMode::Bypass)
             || self.session.approval_mode != effective_approval
             || self.api_config.sandbox_mode != configured_sandbox_mode;
+        let prior = self.applied_runtime_authority();
         self.api_config.sandbox_mode = configured_sandbox_mode;
         self.apply_runtime_mode_policy(&authority);
+        self.discard_kernels_if_narrowed(&prior).await;
         if !changed {
             return false;
         }
@@ -2598,6 +2602,28 @@ impl Engine {
             state.authority = applied;
             state.applied_revision = state.revision;
         }
+    }
+
+    /// A Python kernel keeps whatever it imported, opened or started under the
+    /// posture it ran in. Once the posture grants less than `prior`, drop the
+    /// session kernel and every persistent RLM kernel so later code starts in
+    /// a fresh interpreter. Nothing takes a kernel out and puts it back, so a
+    /// round already in flight cannot restore one.
+    ///
+    /// Known limitation: these interpreters are approval-gated local
+    /// subprocesses, not OS-sandboxed; discarding them bounds reuse, it does
+    /// not undo effects of code that already ran.
+    async fn discard_kernels_if_narrowed(&mut self, prior: &LiveRuntimeAuthority) {
+        if !self.applied_runtime_authority().narrows(prior) {
+            return;
+        }
+        self.repl_kernel = None;
+        self.config
+            .runtime_services
+            .rlm_sessions
+            .lock()
+            .await
+            .clear();
     }
 
     fn apply_runtime_mode_policy(&mut self, authority: &TurnAuthority) {
@@ -5683,7 +5709,9 @@ impl Engine {
         // Track the complete effective mode policy so mid-turn metadata, `/edit`,
         // idle worker resumptions, and approval gates cannot read a stale policy
         // after the UI changed modes (#3568).
+        let prior = self.applied_runtime_authority();
         self.apply_runtime_mode_policy(&input_policy);
+        self.discard_kernels_if_narrowed(&prior).await;
 
         // Create turn context first so start event includes a stable turn id.
         // An active goal gets the host's goal allowance (#5994); turns with
@@ -8998,6 +9026,7 @@ mod tool_setup;
 pub(crate) mod turn_budget;
 pub(crate) mod turn_heartbeat;
 pub(crate) mod turn_loop;
+pub(crate) use approval::HumanDecision;
 pub(crate) use dispatch::{
     FLEET_FINAL_REPORT_NOTICE, FLEET_NO_PROGRESS_STOP, FLEET_STRATEGY_SWITCH_NOTICE,
     FleetDenialAction, FleetDenialBatch, FleetDenialGuard, content_without_approval_note,

@@ -144,6 +144,7 @@ pub(crate) fn run_rlm_turn_inner(
         max_depth,
         RlmUsageAccumulator::new(),
         tokio::time::Instant::now() + crate::tools::subagent::DEFAULT_CHILD_WALL_TIME,
+        Some(crate::tools::codemode::NestedCallGate::admitting_for_test()),
     )
 }
 
@@ -159,6 +160,7 @@ pub(crate) fn run_rlm_turn_inner_with_usage(
     max_depth: u32,
     usage: RlmUsageAccumulator,
     deadline: tokio::time::Instant,
+    gate: Option<crate::tools::codemode::NestedCallGate>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = RlmTurnResult> + Send>> {
     Box::pin(async move {
         let mut result = run_rlm_turn_impl(
@@ -171,6 +173,7 @@ pub(crate) fn run_rlm_turn_inner_with_usage(
             max_depth,
             usage.clone(),
             deadline,
+            gate,
         )
         .await;
         let snapshot = usage.snapshot().await;
@@ -185,6 +188,37 @@ pub(crate) fn run_rlm_turn_inner_with_usage(
 // ---------------------------------------------------------------------------
 // Implementation
 // ---------------------------------------------------------------------------
+
+/// Why one round of model-written Python may not run, or `None` when the
+/// serving turn admitted exactly `code`.
+///
+/// Known limitation: time spent waiting on an approval counts against the
+/// RLM turn's absolute deadline.
+async fn round_refusal(
+    gate: Option<&crate::tools::codemode::NestedCallGate>,
+    code: &str,
+) -> Option<String> {
+    use crate::tools::codemode::NestedCallVerdict;
+    let tool_name = crate::core::engine::tool_catalog::CODE_EXECUTION_TOOL_NAME;
+    let Some(gate) = gate else {
+        return Some("no permission gate is serving this RLM turn".to_string());
+    };
+    match gate
+        .ask(tool_name.to_string(), serde_json::json!({ "code": code }))
+        .await
+    {
+        NestedCallVerdict::Run { name, input, .. }
+            if name == tool_name
+                && input.get("code").and_then(serde_json::Value::as_str) == Some(code) =>
+        {
+            None
+        }
+        NestedCallVerdict::Run { .. } | NestedCallVerdict::Answered { .. } => {
+            Some("the admitted call was not this code".to_string())
+        }
+        NestedCallVerdict::Refused { error, .. } => Some(error.to_string()),
+    }
+}
 
 /// Record at the producing loop, before forwarding. Recording at each bridge
 /// would duplicate deeper events as they pass through their ancestors.
@@ -228,6 +262,7 @@ async fn run_rlm_turn_impl(
     max_depth: u32,
     routed_usage: RlmUsageAccumulator,
     deadline: tokio::time::Instant,
+    gate: Option<crate::tools::codemode::NestedCallGate>,
 ) -> RlmTurnResult {
     let start = Instant::now();
     let tx_event = RlmEventSender {
@@ -296,7 +331,8 @@ async fn run_rlm_turn_impl(
             routed_usage.clone(),
         )
         .with_events(tx_event.sender.clone())
-        .with_deadline(Some(deadline));
+        .with_deadline(Some(deadline))
+        .with_gate(gate.clone());
 
         tx_event
             .send(Event::status(format!(
@@ -531,7 +567,33 @@ async fn run_rlm_turn_impl(
                     })
                     .await;
 
-                // 4d. Execute the code in the REPL with the bridge servicing
+                // 4d. Model-written Python runs only after the serving turn
+                //     admits this exact code, like a `code_execution` call
+                //     carrying it. No gate, a refusal, or an answer for any
+                //     other input ends the turn with nothing run.
+                if let Some(reason) = round_refusal(gate.as_ref(), &code_to_run).await {
+                    tx_event
+                        .send(Event::status(format!(
+                            "RLM round {} not run: {reason}",
+                            iteration + 1
+                        )))
+                        .await;
+                    break 'turn RlmTurnResult {
+                        answer: String::new(),
+                        iterations: iteration + 1,
+                        duration: start.elapsed(),
+                        error: Some(format!("RLM code was not run: {reason}")),
+                        usage: total_usage.clone(),
+                        routed_usage: Vec::new(),
+                        routed_usage_drop_records: Vec::new(),
+                        routed_usage_dropped_records: 0,
+                        termination: RlmTermination::Error,
+                        trace: trace.clone(),
+                        total_rpcs,
+                    };
+                }
+
+                // 4e. Execute the code in the REPL with the bridge servicing
                 //     llm_query / rlm_query callbacks.
                 let round = match repl.run(&code_to_run, Some(&bridge)).await {
                     Ok(r) => r,
@@ -1048,6 +1110,89 @@ mod tests {
     use crate::llm_client::mock::MockLlmClient;
     use codewhale_models::MessageResponse;
 
+    /// One model round whose code writes a marker file, run under `gate`.
+    async fn marker_round(
+        gate: Option<crate::tools::codemode::NestedCallGate>,
+    ) -> (RlmTurnResult, bool) {
+        let workspace = tempfile::tempdir().expect("tempdir");
+        let marker = workspace.path().join("rlm-round-executed.txt");
+        let marker_literal = serde_json::to_string(&marker.to_string_lossy()).expect("literal");
+        let mock = Arc::new(MockLlmClient::new(Vec::new()));
+        mock.push_message_response(MessageResponse {
+            id: "mock_gated_rlm".to_string(),
+            r#type: "message".to_string(),
+            role: "assistant".to_string(),
+            content: vec![ContentBlock::Text {
+                text: format!(
+                    "```repl\nfrom pathlib import Path\nPath({marker_literal}).write_text('executed')\nFINAL('ran')\n```"
+                ),
+                cache_control: None,
+            }],
+            model: "mock-model".to_string(),
+            stop_reason: Some("end_turn".to_string()),
+            stop_sequence: None,
+            container: None,
+            usage: Usage::default(),
+        });
+        let client: Arc<dyn RlmLlmClient> = mock;
+        let (tx, _rx) = mpsc::channel(8);
+        let result = run_rlm_turn_inner_with_usage(
+            client,
+            "root-model".to_string(),
+            "long context".to_string(),
+            None,
+            "child-model".to_string(),
+            tx,
+            0,
+            RlmUsageAccumulator::new(),
+            tokio::time::Instant::now() + Duration::from_secs(60),
+            gate,
+        )
+        .await;
+        (result, marker.exists())
+    }
+
+    #[tokio::test]
+    async fn code_round_runs_only_when_the_gate_admits_exactly_that_code() {
+        use crate::tools::codemode::{NestedCallGate, NestedCallVerdict, NestedDecision};
+
+        let (result, ran) = marker_round(Some(NestedCallGate::admitting_for_test())).await;
+        assert!(ran, "an admitted round runs: {:?}", result.error);
+        assert_eq!(result.termination, RlmTermination::Final);
+
+        let (result, ran) = marker_round(None).await;
+        assert!(!ran, "no gate, no code");
+        assert_eq!(result.termination, RlmTermination::Error);
+        let error = result.error.expect("refusal is reported");
+        assert!(error.contains("no permission gate"), "{error}");
+
+        let refusing = NestedCallGate::answering_for_test(|_, _| NestedCallVerdict::Refused {
+            error: crate::tools::spec::ToolError::permission_denied("not approved"),
+            decision: NestedDecision::Denied,
+        });
+        let (result, ran) = marker_round(Some(refusing)).await;
+        assert!(!ran, "a refused round does not run");
+        let error = result.error.expect("refusal is reported");
+        assert!(error.contains("not approved"), "{error}");
+
+        // A hook-rewritten or otherwise different admitted input is not
+        // permission for the code the model wrote.
+        let rewriting = NestedCallGate::answering_for_test(|name, _| NestedCallVerdict::Run {
+            name: name.to_string(),
+            input: serde_json::json!({ "code": "print('something else')" }),
+            supports_parallel: false,
+            decision: NestedDecision::Auto,
+            hook_context: None,
+        });
+        let (result, ran) = marker_round(Some(rewriting)).await;
+        assert!(!ran, "a different admitted input does not run this code");
+        assert!(
+            result
+                .error
+                .is_some_and(|error| error.contains("was not this code"))
+        );
+    }
+
     #[tokio::test]
     async fn max_tokens_complete_repl_is_not_executed_or_accepted() {
         let workspace = tempfile::tempdir().expect("tempdir");
@@ -1295,6 +1440,7 @@ mod tests {
                     0,
                     usage.clone(),
                     tokio::time::Instant::now() + Duration::from_secs(1),
+                    Some(crate::tools::codemode::NestedCallGate::admitting_for_test()),
                 ),
             )
             .await
@@ -1352,6 +1498,7 @@ mod tests {
                 0,
                 RlmUsageAccumulator::new(),
                 tokio::time::Instant::now() + Duration::from_secs(1),
+                Some(crate::tools::codemode::NestedCallGate::admitting_for_test()),
             ),
         )
         .await

@@ -185,12 +185,52 @@ export class ThreadStore {
     return this.data.chats[chatId];
   }
 
-  async putAction(action) {
+  /**
+   * Record only a turn accepted by Runtime, before its events are delivered.
+   * A later sender cannot overwrite that turn's origin. Records use the chat's
+   * existing lifecycle and action retention bound; retired records fail closed.
+   * This does not authenticate the platform SDK or pin replacement credentials.
+   */
+  async recordTurnOrigin(chatId, threadId, turnId, actorId) {
+    const current = this.data.chats[chatId];
+    if (!current || current.threadId !== threadId || !turnId || !actorId) {
+      throw new ApprovalOwnershipError("accepted turn needs its current chat, thread and initiating human");
+    }
+    const origins = Array.isArray(current.turnOrigins) ? current.turnOrigins : [];
+    const existing = origins.find((origin) => origin.threadId === threadId && origin.turnId === turnId);
+    if (existing) {
+      if (existing.actorId !== actorId) throw new ApprovalOwnershipError("turn origin cannot change");
+      return existing;
+    }
+    const origin = { threadId, turnId, actorId };
+    // patchChat mutates synchronously before saving, preserving concurrent turns.
+    await this.patchChat(chatId, {
+      turnOrigins: [...origins.filter((entry) => entry.threadId === threadId), origin].slice(-this.options.actionLimit)
+    });
+    return origin;
+  }
+
+  turnOrigin(chatId, threadId, turnId) {
+    const state = this.data.chats[chatId];
+    if (!state || state.threadId !== threadId || !turnId) return null;
+    return (Array.isArray(state.turnOrigins) ? state.turnOrigins : [])
+      .find((origin) => origin.threadId === threadId && origin.turnId === turnId && origin.actorId) || null;
+  }
+
+  async putAction(action, owner) {
     if (!this.options.actions) return "";
     this.ensureShape();
+    const binding = actionOwner(owner);
+    if (!binding.chatId) throw new ApprovalOwnershipError("button action needs its receiving chat");
+    if (action.kind === "approval" &&
+        (!binding.threadId || !binding.turnId || !binding.actorId ||
+         this.turnOrigin(binding.chatId, binding.threadId, binding.turnId)?.actorId !== binding.actorId)) {
+      throw new ApprovalOwnershipError("approval button needs the accepted turn and initiating human");
+    }
     const token = randomBytes(16).toString("hex");
     this.data.actions[token] = {
       ...action,
+      owner: binding,
       createdAt: new Date().toISOString()
     };
     this.pruneActions();
@@ -198,14 +238,22 @@ export class ThreadStore {
     return token;
   }
 
-  async getAction(token) {
+  async getAction(token, owner = null) {
     if (!token || !this.options.actions) return null;
     this.ensureShape();
-    return this.data.actions[token] || null;
+    this.pruneActions();
+    const action = this.data.actions[token] || null;
+    if (!action) return null;
+    // Legacy unbound buttons cannot prove which chat received authority.
+    if (!action.owner || !sameOwner(action.owner, owner)) return null;
+    if (action.kind === "approval" &&
+        (!action.owner.threadId || !action.owner.turnId || !action.owner.actorId ||
+         this.turnOrigin(action.owner.chatId, action.owner.threadId, action.owner.turnId)?.actorId !== action.owner.actorId)) return null;
+    return action;
   }
 
-  async takeAction(token) {
-    const action = await this.getAction(token);
+  async takeAction(token, owner = null) {
+    const action = await this.getAction(token, owner);
     if (action) {
       delete this.data.actions[token];
       await this.save();
@@ -252,6 +300,70 @@ export class ThreadStore {
     await writeFileDurable(this.filePath, `${JSON.stringify(this.data, null, 2)}\n`, { mode: 0o600 });
     if (this.options.privateMode) await chmodBestEffort(this.filePath, 0o600);
   }
+}
+
+function actionOwner(owner) {
+  return {
+    chatId: String(owner?.chatId ?? ""),
+    ...(owner?.threadId ? { threadId: String(owner.threadId) } : {}),
+    ...(owner?.turnId ? { turnId: String(owner.turnId) } : {}),
+    ...(owner?.actorId ? { actorId: String(owner.actorId) } : {})
+  };
+}
+
+function sameOwner(stored, owner) {
+  if (!owner) return false;
+  const wanted = actionOwner(owner);
+  if (!stored.chatId || stored.chatId !== wanted.chatId) return false;
+  return (!stored.threadId || stored.threadId === wanted.threadId) &&
+    (!stored.actorId || stored.actorId === wanted.actorId) &&
+    (!stored.turnId || !wanted.turnId || stored.turnId === wanted.turnId);
+}
+
+export class ApprovalOwnershipError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "ApprovalOwnershipError";
+  }
+}
+
+/**
+ * Runtime owns pending approvals and their turn ids. The existing chat store
+ * owns the immutable human who initiated that accepted turn. Admission to a
+ * group, a newer sender or a legacy unbound button does not grant this authority.
+ */
+export async function decideApproval(runtimeJson, { store, chatId, actorId, approvalId, decision, remember = false, turnId = null }) {
+  if (decision !== "allow" && decision !== "deny") throw new ApprovalOwnershipError("decision must be allow or deny");
+  const state = await store.getChat(chatId);
+  const threadId = state?.threadId;
+  if (!threadId) throw new ApprovalOwnershipError("this chat has no Runtime thread yet");
+  if (!actorId) throw new ApprovalOwnershipError("missing initiating human");
+  if (!approvalId) throw new ApprovalOwnershipError("missing approval id");
+  const detail = await runtimeJson(`/v1/threads/${encodeURIComponent(threadId)}`);
+  const pending = detail?.pending_approvals ?? detail?.thread?.pending_approvals ?? [];
+  const approval = pending.find((entry) => (entry?.id ?? entry?.approval_id) === approvalId);
+  const pendingTurnId = approval?.turn_id;
+  if (!pendingTurnId || (turnId && pendingTurnId !== turnId) ||
+      store.turnOrigin(chatId, threadId, pendingTurnId)?.actorId !== actorId) {
+    throw new ApprovalOwnershipError("approval needs its accepted turn's initiating human in this chat");
+  }
+  await runtimeJson(`/v1/approvals/${encodeURIComponent(approvalId)}`, {
+    method: "POST",
+    body: { decision, remember: remember === true }
+  });
+}
+
+/**
+ * Settle a stored approval button: look it up for this owner, deliver the
+ * decision, and consume the token only once the Runtime accepted it. A failed
+ * POST leaves the button usable.
+ */
+export async function settleStoredApproval(store, token, owner, deliver) {
+  const stored = await store.getAction(token, owner);
+  if (!stored || stored.kind !== "approval") return null;
+  await deliver(stored);
+  await store.takeAction(token, owner);
+  return stored;
 }
 
 export function envFirst(env, ...names) {

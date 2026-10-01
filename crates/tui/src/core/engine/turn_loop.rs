@@ -293,6 +293,19 @@ pub(super) fn registered_tool_forces_prompt(
         && registered_tool_requires_non_bypassable_approval(tool_name)
 }
 
+/// A Computer Use consent, script or computer registration call carries the
+/// person's decision to the plugin, so only an approval card may answer it:
+/// the prompt is forced, and no session grant, remembered rule or runtime
+/// grant pre-answers it.
+pub(super) fn call_forces_prompt(
+    tool_name: &str,
+    input: &serde_json::Value,
+    requirement: ApprovalRequirement,
+) -> bool {
+    registered_tool_forces_prompt(tool_name, requirement)
+        || crate::tools::approval_cache::computer_use_user_gate(tool_name, input).is_some()
+}
+
 /// Repo-law `ask` rules require a human decision. Only Ask posture can open
 /// that decision; every autonomous or no-prompt posture must fail closed.
 pub(super) fn repo_law_must_block_without_prompt(
@@ -549,6 +562,21 @@ pub(super) fn replace_runtime_mcp_tools(
     *tool_catalog != catalog_before || *active_tool_names != active_before
 }
 
+/// Whether model-written Python may run on this turn at all: `code_execution`
+/// is on the turn's surface and neither Plan mode nor the allow/deny lists
+/// withhold it. Inline fences and nested RLM rounds share this rule.
+fn code_execution_offered(
+    mode: AppMode,
+    tool_catalog: &[codewhale_models::Tool],
+    tool_policy: &ToolSurfacePolicy,
+) -> bool {
+    let name = super::tool_catalog::CODE_EXECUTION_TOOL_NAME;
+    mode != AppMode::Plan
+        && tool_catalog.iter().any(|tool| tool.name == name)
+        && tool_policy.passes_allow_list(name)
+        && !tool_policy.denies_tool(name)
+}
+
 impl Engine {
     /// Inline ```repl blocks run model-written Python in the session kernel,
     /// so they are admitted exactly like a `code_execution` call carrying
@@ -561,6 +589,9 @@ impl Engine {
     async fn repl_fence_blocked_reason(
         &mut self,
         blocks: &[crate::repl::ReplBlock],
+        // What the approval card says would run, e.g. "the reply's ```repl
+        // block(s) in the session REPL kernel".
+        what_runs: &str,
         approval_id: &str,
         client: &dyn crate::core::model_client::ModelClient,
         turn: &mut TurnContext,
@@ -633,8 +664,7 @@ impl Engine {
                 approval_grouping_key: approval_grouping_key.0,
                 input: plan.input,
                 description: format!(
-                    "Run the reply's ```repl block(s) in the session REPL kernel (a local \
-                     subprocess, not OS-sandboxed): {}",
+                    "Run {what_runs} (a local subprocess, not OS-sandboxed): {}",
                     plan.approval_description
                 ),
                 intent_summary: None,
@@ -648,14 +678,14 @@ impl Engine {
                 "tool_id": approval_id,
                 "tool_name": tool_name,
                 "decision": match decision {
-                    Ok(ApprovalResult::Approved) => "approved",
+                    Ok(ApprovalResult::Approved(_)) => "approved",
                     Ok(ApprovalResult::TimedOut) => "timeout",
                     _ => "denied",
                 },
                 "caller": "repl_fence",
             }));
             let refusal = match decision {
-                Ok(ApprovalResult::Approved) => None,
+                Ok(ApprovalResult::Approved(_)) => None,
                 Ok(ApprovalResult::Denied) => Some("not approved".to_string()),
                 // An expired card is not the user's denial (#6601).
                 Ok(ApprovalResult::TimedOut) => {
@@ -2506,12 +2536,7 @@ impl Engine {
                 // on this turn's surface, and only after the same approval.
                 let repl_fence_present = has_sendable_assistant_content
                     && crate::repl::sandbox::has_repl_block(&current_text_visible);
-                let repl_fence_offered = mode != AppMode::Plan
-                    && tool_catalog
-                        .iter()
-                        .any(|tool| tool.name == super::tool_catalog::CODE_EXECUTION_TOOL_NAME)
-                    && tool_policy.passes_allow_list(super::tool_catalog::CODE_EXECUTION_TOOL_NAME)
-                    && !tool_policy.denies_tool(super::tool_catalog::CODE_EXECUTION_TOOL_NAME);
+                let repl_fence_offered = code_execution_offered(mode, &tool_catalog, &tool_policy);
                 let mut repl_fence_skip_reason = (repl_fence_present && !repl_fence_offered)
                     .then(|| "code execution is not available on this turn".to_string());
                 let repl_blocks = if repl_fence_present && repl_fence_offered {
@@ -2524,6 +2549,7 @@ impl Engine {
                     repl_fence_skip_reason = self
                         .repl_fence_blocked_reason(
                             &repl_blocks,
+                            "the reply's ```repl block(s) in the session REPL kernel",
                             &approval_id,
                             client.as_ref(),
                             turn,
@@ -3593,7 +3619,7 @@ impl Engine {
 
             if let Some(prepared) = prepared_policy {
                 let registered_non_bypassable =
-                    registered_tool_forces_prompt(&tool_name, prepared.call.approval);
+                    call_forces_prompt(&tool_name, &prepared.call.input, prepared.call.approval);
                 approval_required = registered_tool_approval_required(
                     &tool_name,
                     prepared.call.approval,
@@ -3936,6 +3962,24 @@ impl Engine {
                     }
                     Ok(None) => {}
                     Err(error) => blocked_error = Some(error),
+                }
+            }
+
+            // Consent is an exact human decision, never a standing grant or
+            // autonomous approval. Keep existing hard blocks authoritative.
+            if blocked_error.is_none()
+                && crate::tools::approval_cache::computer_use_user_gate(&tool_name, &tool_input)
+                    .is_some()
+            {
+                if batch_approval_mode == ApprovalMode::Suggest {
+                    approval_required = true;
+                    approval_force_prompt = true;
+                } else {
+                    approval_required = false;
+                    approval_force_prompt = false;
+                    blocked_error = Some(ToolError::permission_denied(
+                        "Computer Use consent, scripting and registration require the user's exact approval in Ask posture.".to_string()
+                    ));
                 }
             }
 
@@ -4579,7 +4623,7 @@ impl Engine {
                             .request_tool_approval(&tool_id, &tool_name, approval_event)
                             .await
                         {
-                            Ok(ApprovalResult::Approved) => {
+                            Ok(ApprovalResult::Approved(by)) => {
                                 let decision = if model_requested_policy.is_some() {
                                     "approved_with_requested_policy"
                                 } else {
@@ -4604,6 +4648,31 @@ impl Engine {
                                         None,
                                         elevated_context,
                                         Some(ToolApprovalStamp::ApprovedWithPolicy),
+                                    )
+                                } else if by == crate::approval_log::ApprovalDecider::User
+                                    && plan.approval_force_prompt
+                                    && crate::tools::approval_cache::computer_use_user_gate(
+                                        &tool_name,
+                                        &tool_input,
+                                    )
+                                    .is_some()
+                                {
+                                    // The person just approved this exact
+                                    // Computer Use call on its card: that
+                                    // decision travels with the call.
+                                    let decided_context =
+                                        batch_tool_context.clone().map(|context| {
+                                            context.with_human_decision(
+                                                super::approval::HumanDecision::from_card_allow(
+                                                    &tool_name,
+                                                    &tool_input,
+                                                ),
+                                            )
+                                        });
+                                    (
+                                        None,
+                                        decided_context,
+                                        Some(ToolApprovalStamp::ApprovedByUser),
                                     )
                                 } else {
                                     (None, None, Some(ToolApprovalStamp::ApprovedByUser))
@@ -4770,11 +4839,13 @@ impl Engine {
                         result_override
                     {
                         (result_override.map(RichToolResult::plain), false)
-                    } else if tool_name == EXECUTE_TOOLS_TOOL_NAME
+                    } else if (tool_name == EXECUTE_TOOLS_TOOL_NAME
+                        || tool_name == crate::tools::rlm::RLM_TOOL_NAME)
                         && let Some(context) = call_context.clone()
                     {
                         self.execute_tools_with_nested_gate(
                             nested_gate_env,
+                            &tool_name,
                             &tool_id,
                             tool_input.clone(),
                             tool_exec_lock.clone(),
@@ -4910,7 +4981,9 @@ impl Engine {
         (outcomes, authority_changed)
     }
 
-    /// Run one `execute_tools` call while serving its nested-call gate.
+    /// Run one `execute_tools` (or `rlm`) call while serving its nested-call
+    /// gate. An `rlm` call's nested requests are the code rounds of its
+    /// recursive sub-turns, decided by [`Self::gate_rlm_round`].
     ///
     /// The program runs on the ordinary executor; each nested call it makes
     /// arrives here and is planned by `plan_tool_calls` (source: code mode)
@@ -4921,6 +4994,7 @@ impl Engine {
     async fn execute_tools_with_nested_gate(
         &mut self,
         nested_gate_env: &mut NestedGateEnv<'_>,
+        tool_name: &str,
         tool_id: &str,
         tool_input: serde_json::Value,
         tool_exec_lock: Arc<RwLock<()>>,
@@ -4944,7 +5018,7 @@ impl Engine {
             false,
             self.tx_event.clone(),
             Some(cancel.clone()),
-            EXECUTE_TOOLS_TOOL_NAME.to_string(),
+            tool_name.to_string(),
             Some(tool_id.to_string()),
             tool_input,
             self.session.workspace.clone(),
@@ -4963,8 +5037,8 @@ impl Engine {
                 result = &mut run => return (result, false),
                 Some(request) = requests.recv() => {
                     seq += 1;
-                    let verdict = self
-                        .gate_nested_call(
+                    let verdict = if tool_name == crate::tools::rlm::RLM_TOOL_NAME {
+                        self.gate_rlm_round(
                             nested_gate_env,
                             tool_id,
                             seq,
@@ -4975,7 +5049,21 @@ impl Engine {
                             tool_registry,
                             mode,
                         )
-                        .await;
+                        .await
+                    } else {
+                        self.gate_nested_call(
+                            nested_gate_env,
+                            tool_id,
+                            seq,
+                            request.name,
+                            request.input,
+                            tool_catalog,
+                            active_tool_names,
+                            tool_registry,
+                            mode,
+                        )
+                        .await
+                    };
                     let _ = request.reply.send(verdict);
                 }
             }
@@ -4990,6 +5078,83 @@ impl Engine {
             .budget()
             .saturating_sub(self.turn_wall_clock.spent())
             .max(Duration::from_secs(1))
+    }
+
+    /// Decide one code round of an `rlm` call's recursive sub-turn. The round
+    /// is model-written Python, so it is admitted exactly like an inline
+    /// ```repl block carrying the same code; the admitted input is returned
+    /// unchanged and the sub-turn runs nothing else.
+    #[allow(clippy::too_many_arguments)]
+    async fn gate_rlm_round(
+        &mut self,
+        nested_gate_env: &mut NestedGateEnv<'_>,
+        parent_id: &str,
+        seq: usize,
+        name: String,
+        input: serde_json::Value,
+        tool_catalog: &[codewhale_models::Tool],
+        active_tool_names: &mut std::collections::HashSet<String>,
+        tool_registry: Option<&crate::tools::ToolRegistry>,
+        mode: AppMode,
+    ) -> crate::tools::codemode::NestedCallVerdict {
+        use crate::tools::codemode::{NestedCallVerdict, NestedDecision};
+        let refused = |reason: String| NestedCallVerdict::Refused {
+            error: ToolError::permission_denied(reason),
+            decision: NestedDecision::Refused,
+        };
+
+        // Same rule as a nested program call: once the posture the `rlm`
+        // call started under has changed, no later round runs on it.
+        if !nested_gate_env.authority_changed && self.apply_pending_runtime_authority().await {
+            nested_gate_env.authority_changed = true;
+        }
+        if nested_gate_env.authority_changed {
+            return refused(
+                "permissions changed while this rlm call was running; retry it with the current permissions".to_string(),
+            );
+        }
+        let code = match input.get("code").and_then(Value::as_str) {
+            Some(code) if name == super::tool_catalog::CODE_EXECUTION_TOOL_NAME => code.to_string(),
+            _ => return refused("an rlm call may only ask to run a code round".to_string()),
+        };
+        if !code_execution_offered(mode, tool_catalog, nested_gate_env.tool_policy) {
+            return refused("code execution is not available on this turn".to_string());
+        }
+        let block = crate::repl::ReplBlock {
+            code,
+            start_offset: 0,
+            end_offset: 0,
+        };
+        let posture_before = self.applied_runtime_authority();
+        let reason = self
+            .repl_fence_blocked_reason(
+                std::slice::from_ref(&block),
+                "a recursive RLM round's Python in a child kernel",
+                &format!("{parent_id}.{seq}"),
+                nested_gate_env.client,
+                nested_gate_env.turn,
+                nested_gate_env.tool_policy,
+                tool_catalog,
+                tool_registry,
+                active_tool_names,
+                nested_gate_env.tool_call_budget,
+                mode,
+                nested_gate_env.fleet_denial_guard,
+            )
+            .await;
+        if self.applied_runtime_authority() != posture_before {
+            nested_gate_env.authority_changed = true;
+        }
+        match reason {
+            Some(reason) => refused(reason),
+            None => NestedCallVerdict::Run {
+                name,
+                input,
+                supports_parallel: false,
+                decision: NestedDecision::Auto,
+                hook_context: None,
+            },
+        }
     }
 
     /// Decide one nested `execute_tools` call through the direct-call gate.
@@ -5115,7 +5280,7 @@ impl Engine {
                 .request_tool_approval(&nested_id, &plan.name, approval_event)
                 .await;
             let (decision, refusal) = match answer {
-                Ok(ApprovalResult::Approved) => (NestedDecision::Approved, None),
+                Ok(ApprovalResult::Approved(_)) => (NestedDecision::Approved, None),
                 Ok(ApprovalResult::Denied) => (
                     NestedDecision::Denied,
                     Some(ToolError::permission_denied(format!(

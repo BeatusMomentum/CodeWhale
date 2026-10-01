@@ -1251,6 +1251,7 @@ dependencies = [
  "ratatui",
  "regex",
  "reqwest",
+ "ring",
  "rio-vt",
  "rmcp",
  "rquickjs",

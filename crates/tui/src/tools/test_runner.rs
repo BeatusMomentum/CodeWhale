@@ -162,15 +162,21 @@ async fn run_cargo(
     context: &ToolContext,
     timeout: Duration,
 ) -> Result<crate::process_tree::ContainedOutput, ToolError> {
-    let Some(mut cmd) = crate::dependencies::Cargo::tokio_command() else {
+    let Some(cargo) = crate::dependencies::Cargo::resolve() else {
         return Err(ToolError::not_available(
             "cargo is not installed or not in PATH",
         ));
     };
-    cmd.args(args).current_dir(workspace);
-    // `cargo test` builds and runs workspace code; do not hand it parent
+    // `cargo test` builds and runs workspace code: it starts like an
+    // `exec_shell` command, inside this session's sandbox and without parent
     // credentials.
-    crate::child_env::apply_to_tokio_command(&mut cmd, std::iter::empty::<(&str, &str)>());
+    let mut cmd = crate::tools::shell::sandboxed_runner_command(
+        context,
+        &cargo,
+        args.to_vec(),
+        workspace,
+        timeout,
+    )?;
     let run = crate::process_tree::contained_output_until(&mut cmd, tokio::time::sleep(timeout));
     let cancelled = async {
         match context.cancel_token.as_ref() {

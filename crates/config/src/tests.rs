@@ -10799,3 +10799,112 @@ fn stream_settings_are_typed_nested_and_fail_without_mutation() {
         Some(0)
     );
 }
+
+#[test]
+fn config_backup_shared_vocabulary_preserves_safe_values_and_comments_on_disk() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join(CONFIG_FILE_NAME);
+    let canonical = "model = \"current-model\"\n";
+    fs::write(&path, canonical).expect("canonical config");
+    let raw = r#"# ordinary header stays
+# privateKey = "comment-s10-synthetic"
+model = "fixture-model" # clientSecret=inline-s10-synthetic
+max_tokens = 4096 # ordinary inline stays
+public_key = "public-value"
+endpoint_key = "endpoint-label"
+base_url = "https://api.example.com"
+# ordinary URL https://api.example.com
+[providers.fixture] # cookie=table-inline-s10-synthetic
+privateKey = "private-s10-synthetic"
+clientSecret = "client-s10-synthetic"
+api_key_env = "SYNTHETIC_KEY_ENV"
+auth_mode = "api_key"
+headers = { "Set-Cookie" = "cookie-s10-synthetic", "X-Trace" = "kept-trace" }
+[future_section]
+profiles = [{ accessToken = "access-s10-synthetic", label = "kept-profile" }]
+args = ["--flag", "clientSecret=array-s10-synthetic", "https://api.example.com"]
+webhook_url = "https://hooks.example.com/?sas=url-s10-synthetic"
+# trailing ordinary comment stays
+"#;
+    let backup_path = config_backup_path(&path);
+    fs::write(&backup_path, raw).expect("seed historical backup");
+    scrub_plaintext_api_keys_from_config_backup(&path).expect("scrub persisted backup");
+    let backup = fs::read_to_string(&backup_path).expect("persisted backup");
+    for marker in [
+        "comment-s10-synthetic",
+        "inline-s10-synthetic",
+        "table-inline-s10-synthetic",
+        "private-s10-synthetic",
+        "client-s10-synthetic",
+        "cookie-s10-synthetic",
+        "access-s10-synthetic",
+        "array-s10-synthetic",
+        "url-s10-synthetic",
+    ] {
+        assert!(
+            !backup.contains(marker),
+            "credential survived in persisted backup"
+        );
+    }
+    for kept in [
+        "ordinary header stays",
+        "ordinary inline stays",
+        "trailing ordinary comment stays",
+        "max_tokens = 4096",
+        "public-value",
+        "endpoint-label",
+        "https://api.example.com",
+        "ordinary URL",
+        "SYNTHETIC_KEY_ENV",
+        "auth_mode",
+        "kept-trace",
+        "kept-profile",
+        "--flag",
+    ] {
+        assert!(backup.contains(kept), "ordinary backup data lost: {kept}");
+    }
+    backup
+        .parse::<toml_edit::DocumentMut>()
+        .expect("still valid TOML");
+    assert_eq!(fs::read_to_string(&path).unwrap(), canonical);
+}
+
+#[test]
+fn config_dump_shared_vocabulary_redacts_camel_case() {
+    for key in [
+        "accessToken",
+        "clientSecret",
+        "privateKey",
+        "refreshToken",
+        "Set-Cookie",
+        "sas",
+        "Ocp-Apim-Subscription-Key",
+    ] {
+        assert!(is_sensitive_config_key(key), "{key}");
+        assert!(
+            is_sensitive_config_key(&format!("providers.fixture.{key}")),
+            "{key}"
+        );
+    }
+    for key in [
+        "max_tokens",
+        "token_budget",
+        "api_key_source",
+        "authMode",
+        "publicKey",
+        "endpoint_key",
+    ] {
+        assert!(!is_sensitive_config_key(key), "{key}");
+    }
+    let value: toml::Value = toml::from_str(
+        r#"privateKey = "private-s10-synthetic"
+clientSecret = "client-s10-synthetic"
+model = "fixture-model"
+"#,
+    )
+    .unwrap();
+    let shown = redact_toml_value_for_display("providers.fixture", &value);
+    assert!(!shown.contains("private-s10-synthetic"));
+    assert!(!shown.contains("client-s10-synthetic"));
+    assert!(shown.contains("fixture-model"));
+}

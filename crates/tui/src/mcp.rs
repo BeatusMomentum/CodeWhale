@@ -1694,6 +1694,9 @@ pub struct McpConnection {
     /// Pool catalog generation that created/last authorized this connection.
     /// Directly constructed test connections use zero until inserted.
     catalog_generation: u64,
+    /// Key this host shares with the built-in Computer Use plugin over the
+    /// connection itself, to attest a person's card decision on a call.
+    decision_key: Option<[u8; 32]>,
 }
 
 struct PendingAuthorityWatch {
@@ -1982,7 +1985,33 @@ impl McpConnection {
             authority_revocation_reason,
             authority_watch,
             catalog_generation: 0,
+            decision_key: None,
         };
+
+        // The built-in Computer Use plugin accepts consent and script calls
+        // only with a decision attested by its host. Its keys travel as the
+        // first message on the plugin's own stdin, never in its environment.
+        if conn.config.url.is_none()
+            && conn.config.command.is_some()
+            && conn
+                .config
+                .reviewed_plugin
+                .as_ref()
+                .is_some_and(|source| source.plugin_name() == COMPUTER_USE_PLUGIN_NAME)
+        {
+            let decision_key = random_key()?;
+            let ledger_key = computer_use_ledger_key().await;
+            conn.send(serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": COMPUTER_USE_HOST_KEYS_METHOD,
+                "params": {
+                    "decision_key": hex_encode(&decision_key),
+                    "ledger_key": ledger_key,
+                }
+            }))
+            .await?;
+            conn.decision_key = Some(decision_key);
+        }
 
         // Initialize with timeout
         tokio::time::timeout(Duration::from_secs(connect_timeout_secs), conn.initialize())
@@ -2375,21 +2404,38 @@ impl McpConnection {
     }
 
     /// Call a tool on this MCP server
+    #[cfg(test)]
     pub async fn call_tool(
         &mut self,
         tool_name: &str,
         arguments: serde_json::Value,
         timeout_secs: u64,
     ) -> Result<serde_json::Value> {
-        self.call_method(
-            "tools/call",
-            serde_json::json!({
-                "name": tool_name,
-                "arguments": arguments
-            }),
-            timeout_secs,
-        )
-        .await
+        self.call_tool_decided(tool_name, arguments, timeout_secs, None)
+            .await
+    }
+
+    /// Call a tool, attaching an attested person's decision when there is
+    /// one and this server shares a decision key with the host.
+    async fn call_tool_decided(
+        &mut self,
+        tool_name: &str,
+        arguments: serde_json::Value,
+        timeout_secs: u64,
+        decision: Option<&crate::core::engine::HumanDecision>,
+    ) -> Result<serde_json::Value> {
+        let mut params = serde_json::json!({
+            "name": tool_name,
+            "arguments": arguments
+        });
+        if decision.is_some()
+            && let Some(key) = self.decision_key.as_ref()
+        {
+            params["_meta"] = serde_json::json!({
+                COMPUTER_USE_DECISION_META: attest_decision(key, tool_name, &params["arguments"])?,
+            });
+        }
+        self.call_method("tools/call", params, timeout_secs).await
     }
 
     /// Read a resource from this MCP server
@@ -4573,6 +4619,7 @@ impl McpPool {
             authority_revocation_reason: Arc::new(std::sync::Mutex::new(None)),
             authority_watch: None,
             catalog_generation: 0,
+            decision_key: None,
         };
         self.connections.insert(server.to_string(), conn);
     }
@@ -5187,6 +5234,7 @@ impl McpPool {
         name: &str,
         input: serde_json::Value,
         rules: &[String],
+        decision: Option<&crate::core::engine::HumanDecision>,
     ) -> Result<serde_json::Value> {
         Self::authorize_call(&self.disallowed_tools, name, &input)?;
         Self::authorize_call(rules, name, &input)?;
@@ -5241,7 +5289,7 @@ impl McpPool {
             return Ok(serde_json::json!({ field: items }));
         }
         let synthetic_auth = self.authenticate_tool_target(name).is_some();
-        let mut result = self.call_tool(name, input).await?;
+        let mut result = self.call_tool_with_decision(name, input, decision).await?;
         if synthetic_auth {
             Self::filter_authenticate_result(&mut result, rules);
         }
@@ -5262,12 +5310,27 @@ impl McpPool {
     }
 
     /// Call a tool by its prefixed name (mcp_{server}_{tool})
+    #[cfg(test)]
     pub async fn call_tool(
         &mut self,
         prefixed_name: &str,
         arguments: serde_json::Value,
     ) -> Result<serde_json::Value> {
+        self.call_tool_with_decision(prefixed_name, arguments, None)
+            .await
+    }
+
+    /// Call a tool, carrying a person's card decision for this exact call.
+    pub(crate) async fn call_tool_with_decision(
+        &mut self,
+        prefixed_name: &str,
+        arguments: serde_json::Value,
+        decision: Option<&crate::core::engine::HumanDecision>,
+    ) -> Result<serde_json::Value> {
         Self::authorize_call(&self.disallowed_tools, prefixed_name, &arguments)?;
+        if decision.is_some_and(|decision| !decision.authorizes(prefixed_name, &arguments)) {
+            anyhow::bail!("Human approval does not authorize this exact MCP call");
+        }
         if prefixed_name == "list_mcp_resources" {
             let server = arguments
                 .get("server")
@@ -5365,7 +5428,10 @@ impl McpPool {
             anyhow::bail!("MCP tool '{tool_name}' is disabled for server '{server_name}'");
         }
         let timeout = conn.config().effective_execute_timeout(&global_timeouts);
-        let result = match conn.call_tool(&tool_name, arguments.clone(), timeout).await {
+        let result = match conn
+            .call_tool_decided(&tool_name, arguments.clone(), timeout, decision)
+            .await
+        {
             Ok(result) => Ok(result),
             // A rejected credential is not a stale session: reconnecting
             // replays the same rejection, so it takes the auth-required
@@ -5403,7 +5469,8 @@ impl McpPool {
                             ))
                         } else {
                             let timeout = conn.config().effective_execute_timeout(&global_timeouts);
-                            conn.call_tool(&tool_name, arguments, timeout).await
+                            conn.call_tool_decided(&tool_name, arguments, timeout, decision)
+                                .await
                         }
                     }
                     // A reconnect that fails must not swallow the call error
@@ -6058,6 +6125,100 @@ pub fn resolve_server_scope(global_path: &Path, workspace: &Path, name: &str) ->
 
 /// Plugin name of the built-in Computer Use bundle.
 const COMPUTER_USE_PLUGIN_NAME: &str = "computer-use";
+
+/// First message the host sends the built-in Computer Use plugin: its
+/// per-connection decision key and the persisted-ledger key.
+const COMPUTER_USE_HOST_KEYS_METHOD: &str = "codewhale/host_keys";
+
+/// `_meta` key carrying an attested person's decision on a `tools/call`.
+const COMPUTER_USE_DECISION_META: &str = "codewhale/user_decision";
+
+/// Secret-store slot of the key that signs remembered Computer Use grants.
+const COMPUTER_USE_LEDGER_KEY_SLOT: &str = "codewhale_cu_ledger_key";
+
+fn random_key() -> Result<[u8; 32]> {
+    use ring::rand::SecureRandom as _;
+    let mut key = [0_u8; 32];
+    ring::rand::SystemRandom::new()
+        .fill(&mut key)
+        .map_err(|_| {
+            anyhow::anyhow!("System randomness is unavailable for Computer Use approval")
+        })?;
+    Ok(key)
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    bytes
+        .iter()
+        .fold(String::with_capacity(bytes.len() * 2), |mut out, byte| {
+            let _ = write!(out, "{byte:02x}");
+            out
+        })
+}
+
+/// `{nonce, args_json, mac}` for one call: `mac` is HMAC-SHA256 over
+/// `tool \0 args_json \0 nonce`, and the plugin checks that `args_json`
+/// parses to the arguments it received.
+fn attest_decision(
+    key: &[u8; 32],
+    tool_name: &str,
+    arguments: &serde_json::Value,
+) -> Result<serde_json::Value> {
+    let nonce = hex_encode(&random_key()?[..16]);
+    let args_json = serde_json::to_string(arguments)?;
+    let message = [
+        tool_name.as_bytes(),
+        b"\0",
+        args_json.as_bytes(),
+        b"\0",
+        nonce.as_bytes(),
+    ]
+    .concat();
+    let tag = ring::hmac::sign(
+        &ring::hmac::Key::new(ring::hmac::HMAC_SHA256, key),
+        &message,
+    );
+    Ok(serde_json::json!({
+        "nonce": nonce,
+        "args_json": args_json,
+        "mac": hex_encode(tag.as_ref()),
+    }))
+}
+
+/// The key that signs remembered Computer Use grants, created once in the
+/// secret store. `None` when the store is unavailable: remembered grants
+/// then do not survive the session.
+async fn computer_use_ledger_key() -> Option<String> {
+    if cfg!(test) {
+        return None;
+    }
+    tokio::task::spawn_blocking(|| {
+        let secrets = codewhale_secrets::Secrets::auto_detect();
+        // Concurrent connection starts must use the same persisted key;
+        // reading and replacing it share the secret store's entry authority.
+        secrets
+            .with_entry_transaction(COMPUTER_USE_LEDGER_KEY_SLOT, |stored| {
+                if let Some(key) = stored.as_ref()
+                    && key.len() == 64
+                    && key.bytes().all(|b| b.is_ascii_hexdigit())
+                {
+                    return Ok(Some(key.clone()));
+                }
+                let Ok(bytes) = random_key() else {
+                    return Ok(None);
+                };
+                let key = hex_encode(&bytes);
+                *stored = Some(key.clone());
+                Ok(Some(key))
+            })
+            .ok()
+            .flatten()
+    })
+    .await
+    .ok()
+    .flatten()
+}
 
 /// User-configured servers that launch the same Computer Use plugin as the
 /// enabled built-in `computer-use` bundle, with the argument that gave each
@@ -7091,3 +7252,5 @@ mod qualified_plugin_server_name_tests {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+pub(crate) use tests::computer_use_test_fixture;

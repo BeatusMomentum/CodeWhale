@@ -782,6 +782,28 @@ fn runtime_token_scenario() {
     }
 }
 
+/// Port 0 lets a supervised loopback Runtime own an ephemeral endpoint and
+/// report it. Anything a client is handed a fixed address for keeps a real port.
+#[test]
+fn ephemeral_port_is_only_for_a_plain_loopback_runtime() {
+    let ephemeral = |host: &str, web: bool, mobile: bool| RuntimeApiOptions {
+        host: host.to_string(),
+        port: 0,
+        web,
+        mobile,
+        ..RuntimeApiOptions::default()
+    };
+    assert!(validate_runtime_listener_security(&ephemeral("127.0.0.1", false, false)).is_ok());
+    for refused in [
+        ephemeral("0.0.0.0", false, false),
+        ephemeral("127.0.0.1", true, false),
+        ephemeral("127.0.0.1", false, true),
+    ] {
+        let err = validate_runtime_listener_security(&refused).unwrap_err();
+        assert!(err.to_string().contains("Port must be > 0"), "{err}");
+    }
+}
+
 #[test]
 fn mobile_listener_fails_closed_outside_loopback_without_verified_transport() {
     let non_loopback = RuntimeApiOptions {

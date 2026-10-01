@@ -10699,6 +10699,42 @@ fn duplicate_computer_use_warning(name: &str) -> String {
     )
 }
 
+/// Credential-safe launch summary used by the actual `mcp list` path.
+fn mcp_server_listing(command: Option<&str>, args: &[String], url: Option<&str>) -> String {
+    use codewhale_secrets::sanitize::{
+        is_sensitive_key_name, redact_url_for_display, sanitize_text,
+    };
+    let flag_name = |arg: &str| arg.trim_start_matches('-').to_string();
+    let mut shown = Vec::with_capacity(args.len());
+    let mut mask_next = false;
+    for arg in args {
+        if mask_next {
+            shown.push("***".to_string());
+            mask_next = false;
+            continue;
+        }
+        if arg.starts_with('-') {
+            if let Some((flag, _)) = arg.split_once('=') {
+                if is_sensitive_key_name(&flag_name(flag)) {
+                    shown.push(format!("{flag}=***"));
+                    continue;
+                }
+            } else if is_sensitive_key_name(&flag_name(arg)) {
+                mask_next = true;
+            }
+        }
+        // Each argument on its own, so a masked value never swallows the
+        // arguments after it.
+        shown.push(sanitize_text(arg));
+    }
+    match (command, url) {
+        (Some(command), _) if shown.is_empty() => sanitize_text(command),
+        (Some(command), _) => format!("{} {}", sanitize_text(command), shown.join(" ")),
+        (None, Some(url)) => sanitize_text(&redact_url_for_display(url)),
+        (None, None) => "unknown".to_string(),
+    }
+}
+
 async fn run_mcp_command(
     config: &Config,
     workspace: &Path,
@@ -10768,18 +10804,11 @@ async fn run_mcp_command(
                             .replace(' ', "-")
                     )
                 };
-                let args = if server.args.is_empty() {
-                    "".to_string()
-                } else {
-                    format!(" {}", server.args.join(" "))
-                };
-                let cmd_str = if let Some(cmd) = server.command {
-                    format!("{cmd}{args}")
-                } else if let Some(url) = server.url {
-                    url
-                } else {
-                    "unknown".to_string()
-                };
+                let cmd_str = mcp_server_listing(
+                    server.command.as_deref(),
+                    &server.args,
+                    server.url.as_deref(),
+                );
                 let required = if server.required { " required" } else { "" };
                 println!("  - {name} [{status}{required}{auth}] {cmd_str}");
             }
@@ -22321,3 +22350,37 @@ mod telemetry_surface_tests;
 #[cfg(test)]
 #[path = "tests/telemetry_counters.rs"]
 mod telemetry_counter_tests;
+
+#[cfg(test)]
+mod private_listing_tests {
+    use super::mcp_server_listing;
+    #[test]
+    fn mcp_listing_shared_vocabulary_never_echoes_flag_or_url_credentials() {
+        let args = [
+            "server.js",
+            "--privateKey",
+            "private-s10-synthetic",
+            "--clientSecret=client-s10-synthetic",
+            "--token-budget",
+            "4096",
+            "--port",
+            "8080",
+        ]
+        .map(str::to_string);
+        let listing = mcp_server_listing(Some("node"), &args, None);
+        assert!(!listing.contains("private-s10-synthetic"));
+        assert!(!listing.contains("client-s10-synthetic"));
+        assert!(listing.contains("--port 8080"));
+        assert!(listing.contains("--token-budget 4096"));
+        let url = mcp_server_listing(
+            None,
+            &[],
+            Some(
+                "https://user:url-s10-synthetic@mcp.example.com/sse?privateKey=query-s10-synthetic&team=core",
+            ),
+        );
+        assert!(!url.contains("url-s10-synthetic"));
+        assert!(!url.contains("query-s10-synthetic"));
+        assert!(url.contains("team=core"));
+    }
+}

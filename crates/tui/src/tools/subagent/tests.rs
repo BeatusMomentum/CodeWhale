@@ -26288,3 +26288,60 @@ async fn late_launch_permit_still_gets_the_full_work_budget() {
         "saved deadline {saved_deadline_ms} must start from launch, not spawn ({spawned_at_ms})"
     );
 }
+
+#[tokio::test]
+async fn computer_use_consent_is_denied_in_child_gate_every_mode() {
+    let tmp = tempdir().expect("tempdir");
+    for (auto_approve, approval_mode) in [
+        (true, codewhale_execpolicy::ApprovalMode::Bypass),
+        (false, codewhale_execpolicy::ApprovalMode::Auto),
+        (false, codewhale_execpolicy::ApprovalMode::Suggest),
+        (false, codewhale_execpolicy::ApprovalMode::Never),
+    ] {
+        let mut runtime = stub_runtime();
+        runtime.context = ToolContext::new(tmp.path());
+        runtime.context.auto_approve = auto_approve;
+        runtime.context.execution.approval_mode = approval_mode;
+        runtime.worker_profile = WorkerRuntimeProfile::for_role(FleetRole::Worker);
+        let registry = SubAgentToolRegistry::new(
+            runtime,
+            FleetRole::Worker,
+            None,
+            crate::tools::todo::new_shared_todo_list(),
+            crate::tools::plan::new_shared_plan_state(),
+        );
+        for (name, input) in [
+            (
+                "mcp_codewhale-cu_consent",
+                json!({"action": "allow", "app": "Safari", "remember": true}),
+            ),
+            ("mcp_codewhale-cu_consent_allow", json!({"app": "Terminal"})),
+            (
+                "mcp_codewhale-cu_app_script",
+                json!({"script": "tell application \"Finder\" to activate"}),
+            ),
+            (
+                "mcp_codewhale-cu_computer_register",
+                json!({"computer": "box", "transport": "ssh", "host": "box.example"}),
+            ),
+            (
+                "mcp_codewhale-cu_run_actions",
+                json!({"steps": [{"tool": "codewhale-cu_consent_allow", "arguments": {"app": "Safari"}}]}),
+            ),
+        ] {
+            let verdict = registry
+                .gate_held_call(
+                    "agent_child",
+                    "call_1",
+                    name,
+                    &input,
+                    registry.registry.context(),
+                )
+                .await;
+            assert!(
+                matches!(verdict, ChildGateVerdict::Deny(ref reason) if reason.contains("own approval")),
+                "{approval_mode:?} {name}: {verdict:?}"
+            );
+        }
+    }
+}

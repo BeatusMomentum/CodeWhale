@@ -854,6 +854,17 @@ pub(super) fn mcp_tool_approval_description(name: &str, input: &serde_json::Valu
                 &script_sha256[..16]
             );
         }
+        Some(ComputerUseUserGate::Computer {
+            action,
+            transport,
+            destination,
+        }) => {
+            let transport = transport.as_deref().unwrap_or("default");
+            let destination = destination.as_deref().unwrap_or("<not given>");
+            return format!(
+                "Computer Use: {action} a computer the model will then drive (transport {transport}, {destination}). Approve only if you want this machine controlled."
+            );
+        }
         None => {}
     }
     match crate::mcp::mcp_tool_approval_hint(name) {

@@ -337,6 +337,7 @@ impl Engine {
         name: &str,
         input: serde_json::Value,
         disallowed_tools: &[String],
+        decision: Option<&super::HumanDecision>,
     ) -> Result<RichToolResult, ToolError> {
         McpPool::authorize_call(disallowed_tools, name, &input)
             .map_err(|error| ToolError::not_available(error.to_string()))?;
@@ -391,7 +392,7 @@ impl Engine {
         let result = pool
             .lock()
             .await
-            .call_tool_with_disallowed(name, input, disallowed_tools)
+            .call_tool_with_disallowed(name, input, disallowed_tools, decision)
             .await;
         match result {
             Ok(result) => {
@@ -604,12 +605,18 @@ impl Engine {
                     .or_else(|| registry.map(|registry| registry.context()))
                     .map(|context| context.disallowed_tools.as_slice())
                     .unwrap_or_default();
+                // Only a per-call override can carry a person's decision; the
+                // registry's shared context never does.
+                let decision = context_override
+                    .as_ref()
+                    .and_then(|context| context.human_decision.as_ref());
                 Engine::execute_mcp_tool_with_pool(
                     pool,
                     &tx_event,
                     &tool_name,
                     tool_input,
                     disallowed_tools,
+                    decision,
                 )
                 .await
             } else {

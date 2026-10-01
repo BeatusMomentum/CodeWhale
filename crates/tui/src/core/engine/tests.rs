@@ -3,7 +3,7 @@ use super::*;
 use super::context::COMPACTION_SUMMARY_MARKER;
 use super::streaming::{TOOL_CALL_END_MARKERS, TOOL_CALL_MARKER_PAIRS};
 use super::turn_loop::{
-    auto_review_block_tool_error, initial_stream_error_user_message,
+    auto_review_block_tool_error, call_forces_prompt, initial_stream_error_user_message,
     preview_request_error_user_message, registered_tool_approval_required,
     registered_tool_forces_prompt, replace_runtime_mcp_tools, repo_law_must_block_without_prompt,
     requested_sandbox_escalation, sandbox_escalation_denial, workspace_write_carve_out_applies,
@@ -8538,6 +8538,182 @@ async fn normal_repl_kernel_persists_across_user_turns() {
     );
 }
 
+/// A recursive `rlm_query` makes a child model write Python. That round runs
+/// only after the turn serving the `rlm` call admits it like `code_execution`:
+/// outside Full Access it waits on a card of its own, beyond the approval the
+/// direct `rlm` call already took. Denied, nothing runs; approved, it runs.
+#[tokio::test]
+async fn recursive_rlm_round_waits_on_the_code_execution_gate() {
+    use crate::llm_client::mock::{MockLlmClient, canned};
+    use codewhale_models::{ContentBlock, Message};
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    for approve in [false, true] {
+        let workspace = tempdir().expect("tempdir");
+        let marker = workspace.path().join("nested-round-ran");
+        let nested = format!(
+            "```repl\nopen({:?}, 'w').write('x')\nFINAL('nested done')\n```",
+            marker.display().to_string()
+        );
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "nested-model-response", "object": "chat.completion",
+                "model": "deepseek-v4-flash",
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": nested},
+                    "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 7, "completion_tokens": 9, "total_tokens": 16}
+            })))
+            .mount(&server)
+            .await;
+        let child_config = Config::default()
+            .with_legacy_root(Some("loopback-fixture-key".into()), Some(server.uri()));
+        let child_client = crate::client::CodewhaleClient::new(&child_config).expect("client");
+
+        let rlm = crate::tools::rlm::RLM_TOOL_NAME;
+        let mock = std::sync::Arc::new(MockLlmClient::new(vec![
+            canned::tool_call_turn(
+                "rlm-open",
+                rlm,
+                r#"{"action":"open","name":"ctx","content":"fixture context"}"#,
+            ),
+            canned::tool_call_turn(
+                "rlm-eval",
+                rlm,
+                r#"{"action":"eval","name":"ctx","code":"print(rlm_query('nested context'))"}"#,
+            ),
+            canned::simple_text_turn("Done."),
+        ]));
+        let client: crate::core::model_client::SharedModelClient = mock.clone();
+        let (mut engine, handle) = Engine::new_with_model_client(
+            deterministic_engine_config(workspace.path()),
+            &Config::default(),
+            client,
+        );
+        engine.session.auto_approve = false;
+        engine.session.approval_mode = ApprovalMode::Suggest;
+        engine.session.add_message(Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text {
+                text: "Recurse.".to_string(),
+                cache_control: None,
+            }],
+        });
+        let registry = crate::tools::ToolRegistryBuilder::new()
+            .with_rlm_tool(Some(child_client), "deepseek-v4-flash".to_string())
+            .build(engine.build_tool_context(engine.current_mode, engine.session.auto_approve));
+        let policy = test_tool_surface(
+            &engine,
+            registry,
+            Some(vec![
+                catalog_tool(rlm),
+                catalog_tool(CODE_EXECUTION_TOOL_NAME),
+            ]),
+            AppMode::Agent,
+        );
+        let task = tokio::spawn(async move {
+            let mut turn = crate::core::turn::TurnContext::new(6);
+            engine.run_turn(&mut turn, policy, None, None).await
+        });
+
+        let events = handle.rx_event.clone();
+        let nested_card = tokio::time::timeout(Duration::from_secs(30), async {
+            let mut rx = events.write().await;
+            while let Some(event) = rx.recv().await {
+                if let Event::ApprovalRequired { id, tool_name, .. } = event {
+                    if tool_name == CODE_EXECUTION_TOOL_NAME {
+                        return id;
+                    }
+                    // The direct `rlm` call's own approval.
+                    handle.approve_tool_call(&id).await.expect("approve rlm");
+                }
+            }
+            panic!("event stream closed before the nested round asked for approval");
+        })
+        .await
+        .expect("the nested round must wait on its own approval card");
+        assert!(
+            nested_card.ends_with(".1"),
+            "the round is the rlm call's first nested request: {nested_card}"
+        );
+        assert!(!marker.exists(), "nothing runs before the decision");
+
+        if approve {
+            handle
+                .approve_tool_call(&nested_card)
+                .await
+                .expect("approve");
+        } else {
+            handle.deny_tool_call(&nested_card).await.expect("deny");
+        }
+        let (status, error) = tokio::time::timeout(Duration::from_secs(60), task)
+            .await
+            .expect("turn deadline")
+            .expect("turn task");
+        assert_eq!(status, TurnOutcomeStatus::Completed, "{error:?}");
+        assert_eq!(marker.exists(), approve, "approve={approve}");
+    }
+}
+
+/// A kernel keeps what it loaded under the posture it ran in, so a narrower
+/// posture starts later code in a fresh interpreter; an unchanged or broader
+/// posture keeps the working kernel.
+#[tokio::test]
+async fn narrowing_the_posture_discards_python_kernels() {
+    use crate::llm_client::mock::MockLlmClient;
+
+    let workspace = tempdir().expect("tempdir");
+    let client: crate::core::model_client::SharedModelClient =
+        std::sync::Arc::new(MockLlmClient::new(Vec::new()));
+    let (mut engine, _handle) = Engine::new_with_model_client(
+        deterministic_engine_config(workspace.path()),
+        &Config::default(),
+        client,
+    );
+    // Without a Python interpreter there is no kernel to discard.
+    let Ok(kernel) = crate::repl::runtime::PythonRuntime::new().await else {
+        return;
+    };
+    engine.repl_kernel = Some(kernel);
+    let posture = engine.applied_runtime_authority();
+
+    // Re-applying the same posture is not a narrowing.
+    engine
+        .apply_change_mode(
+            posture.mode,
+            posture.allow_shell,
+            posture.trust_mode,
+            posture.auto_approve,
+            posture.approval_mode,
+            posture.configured_sandbox_mode.clone(),
+        )
+        .await;
+    assert!(
+        engine.repl_kernel.is_some(),
+        "an unchanged posture keeps the kernel"
+    );
+
+    engine
+        .apply_change_mode(
+            posture.mode,
+            posture.allow_shell,
+            posture.trust_mode,
+            posture.auto_approve,
+            posture.approval_mode,
+            Some("read-only".to_string()),
+        )
+        .await;
+    assert!(
+        engine.applied_runtime_authority().narrows(&posture),
+        "fixture must actually narrow"
+    );
+    assert!(
+        engine.repl_kernel.is_none(),
+        "a narrower posture drops the kernel"
+    );
+}
+
 /// A turn dropped mid-round leaves its kernel broken, and a broken kernel
 /// refuses every later round. The next turn starts a fresh kernel instead of
 /// failing once on the stale one.
@@ -11769,6 +11945,44 @@ fn rlm_eval_required_approval_is_auto_approved_in_full_access() {
         ApprovalRequirement::Required,
         true
     ));
+}
+
+/// A remembered grant for a Computer Use consent must not answer a later,
+/// identical call: the prompt is forced, so only a card decides it.
+#[test]
+fn computer_use_decisions_always_force_the_card() {
+    let consent = serde_json::json!({"app": "Safari", "bundle_id": "com.apple.Safari"});
+    for name in [
+        "mcp_codewhale-cu_consent_allow",
+        "mcp_codewhale-cu_consent_revoke",
+    ] {
+        assert!(
+            call_forces_prompt(name, &consent, ApprovalRequirement::Required),
+            "{name}"
+        );
+    }
+    assert!(call_forces_prompt(
+        "mcp_codewhale-cu_app_script",
+        &serde_json::json!({"script": "tell application \"Finder\" to activate"}),
+        ApprovalRequirement::Required,
+    ));
+    assert!(!call_forces_prompt(
+        "mcp_codewhale-cu_consent_status",
+        &serde_json::json!({}),
+        ApprovalRequirement::Required,
+    ));
+    let ask = crate::core::authority::TurnAuthority::from_effective_fields(
+        AppMode::Agent,
+        true,
+        false,
+        false,
+        ApprovalMode::Suggest,
+    );
+    assert_eq!(
+        crate::core::authority::resolve_approval_request_disposition(&ask, true, false, true),
+        crate::core::authority::ApprovalRequestDisposition::Prompt,
+        "a session grant must not pre-answer a forced prompt"
+    );
 }
 
 #[test]
@@ -29820,4 +30034,153 @@ async fn mcp_server_instructions_reach_the_request_labelled_once_and_only_for_vi
         crate::runtime_handoff::mcp_server_instructions_display(recorded[1])
             .is_some_and(|text| text.contains("no longer applies"))
     );
+}
+
+async fn run_computer_use_live_card_case(
+    posture: ApprovalMode,
+    decider: crate::approval_log::ApprovalDecider,
+    expected_prompt: bool,
+    expected_allowed: bool,
+) {
+    use crate::llm_client::mock::{MockLlmClient, canned};
+    let (root, plugins, mut pool, server) = crate::mcp::computer_use_test_fixture();
+    let _home = EnvVarGuard::set("CODEWHALE_HOME", root.path());
+    let _backend = EnvVarGuard::set("CODEWHALE_SECRET_BACKEND", "file");
+    pool.get_or_connect(&server)
+        .await
+        .expect("connect real isolated CU plugin");
+    let name = pool
+        .to_api_tools()
+        .into_iter()
+        .find(|tool| tool.name.ends_with("_consent"))
+        .unwrap()
+        .name;
+    let mock = Arc::new(MockLlmClient::new(vec![
+        canned::tool_call_turn(
+            "call-consent",
+            &name,
+            r#"{"action":"allow","scope":"foreground","remember":false}"#,
+        ),
+        canned::simple_text_turn("Recorded the result."),
+    ]));
+    let config = Config::default();
+    let mut cfg = deterministic_engine_config(&root.path().join("workspace"));
+    cfg.plugin_registry = Some(plugins);
+    cfg.mcp_config_path = root.path().join("mcp.json");
+    let (mut engine, handle) = Engine::new_with_model_client(cfg, &config, mock);
+    engine.mcp_pool = Some(Arc::new(tokio::sync::Mutex::new(pool)));
+    let task = tokio::spawn(engine.run());
+    let mut op = external_user_message_op("Decide foreground consent.", AppMode::Agent, &config);
+    if let Op::SendMessage(turn) = &mut op {
+        turn.approval_mode = posture;
+        turn.auto_approve = posture == ApprovalMode::Bypass;
+        turn.trust_mode = posture == ApprovalMode::Bypass;
+    }
+    handle.send(op).await.unwrap();
+    let mut prompts = 0;
+    let mut completed = None;
+    let mut rx = handle.rx_event.write().await;
+    loop {
+        match tokio::time::timeout(model_turn_event_timeout(), rx.recv())
+            .await
+            .expect("bounded engine event")
+            .expect("engine event")
+        {
+            Event::ApprovalRequired {
+                id,
+                tool_name,
+                approval_force_prompt,
+                ..
+            } if tool_name == name => {
+                assert!(approval_force_prompt, "this must be an exact forced card");
+                prompts += 1;
+                handle.approve_tool_call_by(id, decider).await.unwrap();
+            }
+            Event::ToolCallComplete {
+                name: tool, result, ..
+            } if tool == name => completed = Some(result),
+            Event::TurnComplete { .. } => break,
+            _ => {}
+        }
+    }
+    drop(rx);
+    assert_eq!(
+        prompts > 0,
+        expected_prompt,
+        "posture={posture:?}, decider={decider:?}"
+    );
+    let result = completed.expect("consent call has a paired completion");
+    if posture != ApprovalMode::Suggest {
+        assert!(
+            result.is_err(),
+            "autonomous posture must block before plugin execution: {result:?}"
+        );
+    }
+    let allowed = result.as_ref().is_ok_and(|result| {
+        let envelope: serde_json::Value =
+            serde_json::from_str(content_without_approval_note(result)).expect("MCP envelope");
+        let outcome: serde_json::Value = if result.success {
+            serde_json::from_str(
+                envelope["content"][0]["text"]
+                    .as_str()
+                    .expect("plugin result text"),
+            )
+            .expect("plugin result JSON")
+        } else {
+            // The shared MCP adapter preserves failure text verbatim.
+            assert_eq!(envelope["error"]["code"], "consent_needs_user");
+            envelope
+        };
+        result.success
+            && outcome["ok"] == true
+            && outcome["scope"] == "foreground"
+            && outcome["decision"] == "allow"
+    });
+    assert_eq!(
+        allowed, expected_allowed,
+        "posture={posture:?}, decider={decider:?}: {result:?}"
+    );
+    handle.send(Op::Shutdown).await.unwrap();
+    task.await.unwrap();
+}
+
+#[tokio::test]
+async fn computer_use_human_card_allows_the_exact_live_call() {
+    let _env = lock_test_env();
+    run_computer_use_live_card_case(
+        ApprovalMode::Suggest,
+        crate::approval_log::ApprovalDecider::User,
+        true,
+        true,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn computer_use_session_rule_and_posture_cannot_mint_a_human_decision() {
+    let _env = lock_test_env();
+    for decider in [
+        crate::approval_log::ApprovalDecider::SessionRule,
+        crate::approval_log::ApprovalDecider::Posture,
+    ] {
+        run_computer_use_live_card_case(ApprovalMode::Suggest, decider, true, false).await;
+    }
+}
+
+#[tokio::test]
+async fn computer_use_autonomous_postures_block_before_the_plugin() {
+    let _env = lock_test_env();
+    for posture in [
+        ApprovalMode::Bypass,
+        ApprovalMode::Auto,
+        ApprovalMode::Never,
+    ] {
+        run_computer_use_live_card_case(
+            posture,
+            crate::approval_log::ApprovalDecider::User,
+            false,
+            false,
+        )
+        .await;
+    }
 }

@@ -5890,6 +5890,10 @@ fn config_toml_without_plaintext_api_keys(raw: &str) -> Result<String> {
             )
         })?;
     remove_plaintext_api_keys_recursive(document.as_table_mut());
+    scrub_backup_decor(document.as_table_mut().decor_mut());
+    if let Some(trailing) = document.trailing().as_str().map(scrub_backup_comments) {
+        document.set_trailing(trailing);
+    }
     Ok(document.to_string())
 }
 
@@ -5900,17 +5904,27 @@ fn config_toml_without_plaintext_api_keys(raw: &str) -> Result<String> {
 fn remove_plaintext_api_keys_recursive(table: &mut dyn toml_edit::TableLike) {
     let sensitive: Vec<String> = table
         .iter()
-        .filter(|(key, _)| is_sensitive_config_key(key))
+        .filter(|(key, item)| {
+            is_sensitive_config_key(key) || item.as_value().is_some_and(backup_value_carries_secret)
+        })
         .map(|(key, _)| key.to_owned())
         .collect();
     for key in sensitive {
         // Keep a comment written above the key (often the file header).
         config_document::remove_key_preserving_leading_decor(table, &key);
     }
-    for (_, item) in table.iter_mut() {
+    for (mut key, item) in table.iter_mut() {
+        scrub_backup_decor(key.leaf_decor_mut());
+        if let toml_edit::Item::Table(nested) = item {
+            scrub_backup_decor(nested.decor_mut());
+        }
+        if let toml_edit::Item::Value(value) = item {
+            scrub_backup_decor(value.decor_mut());
+        }
         match item {
             toml_edit::Item::ArrayOfTables(tables) => {
                 for nested in tables.iter_mut() {
+                    scrub_backup_decor(nested.decor_mut());
                     remove_plaintext_api_keys_recursive(nested);
                 }
             }
@@ -5927,13 +5941,55 @@ fn remove_plaintext_api_keys_recursive(table: &mut dyn toml_edit::TableLike) {
 }
 
 fn remove_plaintext_api_keys_in_array(array: &mut toml_edit::Array) {
+    array.retain(|value| !backup_value_carries_secret(value));
     for value in array.iter_mut() {
+        scrub_backup_decor(value.decor_mut());
         match value {
             toml_edit::Value::InlineTable(table) => remove_plaintext_api_keys_recursive(table),
             toml_edit::Value::Array(nested) => remove_plaintext_api_keys_in_array(nested),
             _ => {}
         }
     }
+}
+
+fn backup_value_carries_secret(value: &toml_edit::Value) -> bool {
+    value
+        .as_str()
+        .is_some_and(codewhale_secrets::sanitize::contains_secret)
+}
+
+fn scrub_backup_decor(decor: &mut toml_edit::Decor) {
+    let prefix = decor
+        .prefix()
+        .and_then(|text| text.as_str())
+        .map(scrub_backup_comments);
+    let suffix = decor
+        .suffix()
+        .and_then(|text| text.as_str())
+        .map(scrub_backup_comments);
+    if let Some(prefix) = prefix {
+        decor.set_prefix(prefix);
+    }
+    if let Some(suffix) = suffix {
+        decor.set_suffix(suffix);
+    }
+}
+
+fn scrub_backup_comments(text: &str) -> String {
+    text.split_inclusive('\n')
+        .filter(|line| {
+            !line
+                .trim_start()
+                .strip_prefix('#')
+                .map(str::trim)
+                .is_some_and(|comment| {
+                    comment
+                        .split_once('=')
+                        .is_some_and(|(key, _)| is_sensitive_config_key(key))
+                        || codewhale_secrets::sanitize::contains_secret(comment)
+                })
+        })
+        .collect()
 }
 
 /// Merge comments and formatting from an original TOML file into a
@@ -7072,49 +7128,9 @@ fn redact_secret(secret: &str) -> String {
 
 #[must_use]
 pub fn is_sensitive_config_key(key: &str) -> bool {
-    let Some(segment) = key.rsplit('.').next() else {
-        return false;
-    };
-    let normalized = segment
-        .trim()
-        .trim_matches('"')
-        .replace('-', "_")
-        .to_ascii_lowercase();
-
-    matches!(
-        normalized.as_str(),
-        "api_key"
-            | "apikey"
-            | "api_keys"
-            | "authorization"
-            | "bearer"
-            | "client_secret"
-            | "credential"
-            | "credentials"
-            | "id_token"
-            | "password"
-            | "passwords"
-            | "passwd"
-            | "proxy_authorization"
-            | "refresh_token"
-            | "secret"
-            | "secrets"
-            | "token"
-            | "tokens"
-            | "cookie"
-            | "set_cookie"
-            | "sas"
-    ) || normalized.ends_with("_authorization")
-        || normalized.ends_with("_cookie")
-        || normalized.ends_with("_password")
-        || normalized.ends_with("_secret")
-        || normalized.ends_with("_token")
-        // `*_key` covers `api_key`, `secret_key`, `access_key`,
-        // `private_key` and header spellings such as
-        // `Ocp-Apim-Subscription-Key`. Only names known to hold no secret
-        // are exempt.
-        || (normalized.ends_with("_key")
-            && !matches!(normalized.as_str(), "public_key" | "endpoint_key"))
+    key.rsplit('.')
+        .next()
+        .is_some_and(codewhale_secrets::sanitize::is_sensitive_key_name)
 }
 
 /// Resolve dotted paths without treating a dotted key as a top-level literal.

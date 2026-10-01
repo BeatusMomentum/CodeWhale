@@ -1609,6 +1609,7 @@ where
 /// the turn registry across the request.
 async fn interrupt_turn_request(turn: &InFlightTurn) -> std::result::Result<bool, JsonRpcError> {
     let mut request = codewhale_release::platform_http_client_builder()
+        .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(10))
         .build()
         .map_err(|err| JsonRpcError::internal(err.to_string()))?
@@ -1681,25 +1682,35 @@ async fn invalidate_runtime_bridge(state: &AppState) {
 impl RuntimeBridge {
     async fn start(config_path: Option<&Path>) -> Result<Self> {
         install_rustls_crypto_provider();
-        let port = reserve_runtime_port()?;
         let auth_token = format!("cwrt_{}", Uuid::new_v4().simple());
-        let child = Self::runtime_command(config_path, port, &auth_token)?
+        // The bearer token only ever goes to the endpoint the child itself
+        // reports, and never follows a redirect away from it.
+        let client = codewhale_release::platform_http_client_builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .context("failed to build runtime API client")?;
+        let mut child = Self::runtime_command(config_path, &auth_token)?
             .spawn()
             .context("failed to start runtime API bridge")?;
+        let stdout = child.stdout.take();
+        // Owned by the bridge from here on, so every failure below reaps it.
         let mut bridge = Self {
-            base_url: format!("http://127.0.0.1:{port}"),
-            client: codewhale_release::platform_http_client_builder()
-                .build()
-                .context("failed to build runtime API client")?,
+            base_url: String::new(),
+            client,
             auth_token: Some(auth_token),
             child: Some(child),
             last_seq_by_thread: HashMap::new(),
         };
+        let stdout = stdout.context("runtime API bridge has no stdout to report its endpoint")?;
+        let endpoint = runtime_child_endpoint(stdout, Duration::from_secs(15)).await?;
+        bridge.base_url = format!("http://{endpoint}");
         bridge.wait_until_ready().await?;
         Ok(bridge)
     }
 
-    fn runtime_command(config_path: Option<&Path>, port: u16, auth_token: &str) -> Result<Command> {
+    /// The child binds an ephemeral loopback port itself (`--port 0`) and
+    /// reports it on stdout; the parent never reserves a port for it to race.
+    fn runtime_command(config_path: Option<&Path>, auth_token: &str) -> Result<Command> {
         let current_exe = std::env::current_exe().ok();
         let mut command = if let Some(path) = current_exe {
             Command::new(path)
@@ -1716,11 +1727,11 @@ impl RuntimeBridge {
             .arg("--host")
             .arg("127.0.0.1")
             .arg("--port")
-            .arg(port.to_string())
+            .arg("0")
             .env("CODEWHALE_RUNTIME_TOKEN", auth_token)
             .env("DEEPSEEK_RUNTIME_TOKEN", auth_token)
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
+            .stdout(Stdio::piped())
             .stderr(Stdio::null());
         if let Some(config_path) = config_path {
             command.arg("--config").arg(config_path);
@@ -2225,9 +2236,68 @@ impl Drop for RuntimeBridge {
     }
 }
 
-fn reserve_runtime_port() -> Result<u16> {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
-    Ok(listener.local_addr()?.port())
+/// The line the Runtime prints once it holds its listener (the Runtime's
+/// `RUNTIME_LISTENING_PREFIX`; this crate does not depend on that one).
+const RUNTIME_LISTENING_PREFIX: &str = "Runtime API listening on http://";
+/// The endpoint line is short and comes first; anything larger is not it.
+const RUNTIME_READY_MAX_BYTES: usize = 1024;
+
+/// The endpoint a Runtime child reports for itself: exactly a nonzero port on
+/// `127.0.0.1`, the host the parent asked it to bind.
+fn parse_runtime_endpoint(line: &str) -> Result<std::net::SocketAddr> {
+    let address = line
+        .trim_end()
+        .strip_prefix(RUNTIME_LISTENING_PREFIX)
+        .context("runtime API bridge did not report its endpoint")?;
+    let endpoint: std::net::SocketAddr = address
+        .parse()
+        .context("runtime API bridge reported an invalid endpoint")?;
+    if endpoint.ip() != std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST) || endpoint.port() == 0
+    {
+        bail!("runtime API bridge reported an endpoint that is not a loopback port");
+    }
+    Ok(endpoint)
+}
+
+/// Read the first stdout line, bounded.
+fn read_runtime_ready_line(stdout: &mut impl std::io::Read) -> Result<String> {
+    let mut line = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        if stdout.read(&mut byte)? == 0 {
+            bail!("runtime API bridge closed stdout before reporting its endpoint");
+        }
+        if byte[0] == b'\n' {
+            break;
+        }
+        if line.len() >= RUNTIME_READY_MAX_BYTES {
+            bail!("runtime API bridge sent an oversized readiness line");
+        }
+        line.push(byte[0]);
+    }
+    String::from_utf8(line).context("runtime API bridge readiness line is not UTF-8")
+}
+
+/// Wait for the child to report the endpoint it bound. The reader thread then
+/// keeps draining stdout for the child's lifetime, so the child's later
+/// prints neither block on a full pipe nor fail on a closed one. On error the
+/// caller drops the bridge, which kills and reaps the child.
+async fn runtime_child_endpoint(
+    mut stdout: std::process::ChildStdout,
+    wait: Duration,
+) -> Result<std::net::SocketAddr> {
+    let (ready, endpoint) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        let _ = ready.send(
+            read_runtime_ready_line(&mut stdout).and_then(|line| parse_runtime_endpoint(&line)),
+        );
+        let _ = std::io::copy(&mut stdout, &mut std::io::sink());
+    });
+    match tokio::time::timeout(wait, endpoint).await {
+        Ok(Ok(endpoint)) => endpoint,
+        Ok(Err(_)) => bail!("runtime API bridge readiness reader ended unexpectedly"),
+        Err(_) => bail!("timed out waiting for the runtime API bridge to report its endpoint"),
+    }
 }
 
 fn install_rustls_crypto_provider() {
@@ -5629,15 +5699,48 @@ mod tests {
     }
 
     #[test]
+    fn runtime_child_endpoint_must_be_a_reported_loopback_port() {
+        let ok = parse_runtime_endpoint("Runtime API listening on http://127.0.0.1:49152\r\n")
+            .expect("loopback endpoint");
+        assert_eq!(ok.port(), 49152);
+        for bad in [
+            "Runtime API listening on http://127.0.0.1:0",
+            "Runtime API listening on http://10.0.0.5:7878",
+            "Runtime API listening on http://[::1]:7878",
+            "Runtime API listening on http://example.com:80",
+            "Runtime API listening on http://127.0.0.1:80/redirect",
+            "listening on http://127.0.0.1:7878",
+            "",
+        ] {
+            assert!(parse_runtime_endpoint(bad).is_err(), "{bad:?}");
+        }
+
+        let mut first_line_only: &[u8] =
+            b"Runtime API listening on http://127.0.0.1:5000\nRuntime API listening on http://127.0.0.1:6000\n";
+        assert_eq!(
+            read_runtime_ready_line(&mut first_line_only).unwrap(),
+            "Runtime API listening on http://127.0.0.1:5000"
+        );
+        let mut closed: &[u8] = b"Runtime API listening on http://127.0.0.1:5000";
+        assert!(read_runtime_ready_line(&mut closed).is_err(), "no newline");
+        let oversized = vec![b'a'; RUNTIME_READY_MAX_BYTES + 1];
+        assert!(read_runtime_ready_line(&mut oversized.as_slice()).is_err());
+    }
+
+    #[test]
     fn runtime_bridge_command_keeps_auth_token_out_of_argv() {
         // FR001-C001: runtime auth token must not appear on the child argv
         // (visible via local `ps`); pass it via env instead.
         let token = "cwrt_unit_test_secret_token_not_for_argv";
-        let cmd = RuntimeBridge::runtime_command(None, 18787, token).expect("command");
+        let cmd = RuntimeBridge::runtime_command(None, token).expect("command");
         let argv: Vec<String> = cmd
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
+        assert!(
+            argv.windows(2).any(|pair| pair == ["--port", "0"]),
+            "the child picks and reports its own port: {argv:?}"
+        );
         assert!(
             !argv
                 .iter()

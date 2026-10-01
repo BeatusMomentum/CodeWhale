@@ -134,6 +134,8 @@ tar = "0.4"
 liblzma = { version = "0.4", features = ["static"] }
 flate2 = "1.1"
 sha2.workspace = true
+# Reuse the locked cryptographic implementation for exact-call user decisions.
+ring = "0.17"
 semver.workspace = true
 codewhale-localization = { path = "../localization", version = "0.10.1" }
 shell-words = "1.1.1"

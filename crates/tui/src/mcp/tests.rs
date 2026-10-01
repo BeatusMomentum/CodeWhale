@@ -3027,6 +3027,7 @@ fn test_connection(transport: Box<dyn McpTransport>) -> McpConnection {
         authority_revocation_reason: Arc::new(std::sync::Mutex::new(None)),
         authority_watch: None,
         catalog_generation: 0,
+        decision_key: None,
     }
 }
 
@@ -8804,13 +8805,13 @@ async fn mcp_ceiling_child_scoped_meta_calls_do_not_widen_or_mutate_sibling_poli
         ("list_mcp_resource_templates", "templates"),
     ] {
         let child = pool
-            .call_tool_with_disallowed(method, serde_json::json!({}), &child_rules)
+            .call_tool_with_disallowed(method, serde_json::json!({}), &child_rules, None)
             .await
             .unwrap();
         assert_eq!(child[field].as_array().unwrap().len(), 1);
         assert_eq!(child[field][0]["server"], "public");
         let sibling = pool
-            .call_tool_with_disallowed(method, serde_json::json!({}), &[])
+            .call_tool_with_disallowed(method, serde_json::json!({}), &[], None)
             .await
             .unwrap();
         assert_eq!(sibling[field].as_array().unwrap().len(), 2);
@@ -8819,19 +8820,25 @@ async fn mcp_ceiling_child_scoped_meta_calls_do_not_widen_or_mutate_sibling_poli
         pool.call_tool_with_disallowed(
             "read_mcp_resource",
             serde_json::json!({"server":"private_a","uri":"memory://one"}),
-            &child_rules
+            &child_rules,
+            None
         )
         .await
         .is_err()
     );
     assert!(
-        pool.call_tool_with_disallowed("mcp_private_a_read", serde_json::json!({}), &child_rules)
-            .await
-            .is_err()
+        pool.call_tool_with_disallowed(
+            "mcp_private_a_read",
+            serde_json::json!({}),
+            &child_rules,
+            None
+        )
+        .await
+        .is_err()
     );
     assert!(sent.lock().unwrap().is_empty());
     assert_eq!(
-        pool.call_tool_with_disallowed("mcp_private_a_read", serde_json::json!({}), &[])
+        pool.call_tool_with_disallowed("mcp_private_a_read", serde_json::json!({}), &[], None)
             .await
             .unwrap(),
         serde_json::json!({"ok":true})
@@ -8906,7 +8913,8 @@ async fn mcp_ceiling_preserves_ordinary_tool_result_tools_field() {
         pool.call_tool_with_disallowed(
             "mcp_public_read",
             serde_json::json!({}),
-            &["mcp_private_*".to_string()]
+            &["mcp_private_*".to_string()],
+            None
         )
         .await
         .unwrap(),
@@ -10171,4 +10179,232 @@ async fn mcp_server_instructions_exclude_servers_whose_tools_are_all_denied() {
         pool.model_server_instructions(visible),
         vec![("guided".to_string(), "Use search.".to_string())]
     );
+}
+
+#[tokio::test]
+async fn computer_use_call_carries_an_attested_decision_only_when_a_person_approved() {
+    let respond = |id: u64| {
+        json_frame(serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {"ok": true}}))
+    };
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let mut connection = test_connection(Box::new(ScriptedValueTransport {
+        sent: Arc::clone(&sent),
+        responses: VecDeque::from([respond(1), respond(2), respond(3)]),
+    }));
+    let key = [7_u8; 32];
+    connection.decision_key = Some(key);
+    let args = serde_json::json!({"action": "allow", "app": "Safari", "remember": 1.0});
+    let decision = crate::core::engine::HumanDecision::for_test("mcp_fixture_consent", &args);
+    connection
+        .call_tool_decided("consent", args.clone(), 5, Some(&decision))
+        .await
+        .expect("decided call");
+    connection
+        .call_tool_decided("consent", args.clone(), 5, None)
+        .await
+        .expect("plain call");
+    connection.decision_key = None;
+    connection
+        .call_tool_decided("consent", args.clone(), 5, Some(&decision))
+        .await
+        .expect("call without a shared key");
+
+    let sent = sent.lock().unwrap().clone();
+    let attested = &sent[0]["params"]["_meta"][COMPUTER_USE_DECISION_META];
+    let nonce = attested["nonce"].as_str().expect("nonce");
+    let args_json = attested["args_json"].as_str().expect("args_json");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(args_json).unwrap(),
+        sent[0]["params"]["arguments"]
+    );
+    let message = [
+        b"consent".as_slice(),
+        b"\0",
+        args_json.as_bytes(),
+        b"\0",
+        nonce.as_bytes(),
+    ]
+    .concat();
+    let expected = ring::hmac::sign(
+        &ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &key),
+        &message,
+    );
+    assert_eq!(attested["mac"], hex_encode(expected.as_ref()));
+    assert!(sent[1]["params"].get("_meta").is_none(), "{}", sent[1]);
+    assert!(sent[2]["params"].get("_meta").is_none(), "{}", sent[2]);
+}
+
+#[tokio::test]
+async fn copied_human_decision_cannot_authorize_another_mcp_call() {
+    let input = serde_json::json!({"action": "allow", "app": "Safari"});
+    let decision = crate::core::engine::HumanDecision::for_test("mcp_fixture_consent", &input);
+    let mut pool = McpPool::new(McpConfig::default());
+    for (name, arguments) in [
+        (
+            "mcp_fixture_consent",
+            serde_json::json!({"action": "allow", "app": "Terminal"}),
+        ),
+        ("mcp_other_consent", input.clone()),
+    ] {
+        let error = pool
+            .call_tool_with_decision(name, arguments, Some(&decision))
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("does not authorize this exact MCP call"),
+            "{error:#}"
+        );
+    }
+    assert!(decision.authorizes("mcp_fixture_consent", &input));
+}
+
+/// Actual shipped plugin, reviewed and staged by the normal plugin authority.
+/// Every backend and state path is isolated; this fixture never drives a real app.
+pub(crate) fn computer_use_test_fixture() -> (
+    tempfile::TempDir,
+    Arc<crate::plugins::PluginRegistry>,
+    McpPool,
+    String,
+) {
+    let root = tempfile::tempdir().expect("private fixture root");
+    let workspace = root.path().join("workspace");
+    fs::create_dir(&workspace).unwrap();
+    let plugin_base = root.path().join("plugins/computer-use");
+    let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("plugins/computer-use");
+    let mut pending = vec![(source, plugin_base.clone())];
+    while let Some((from, to)) = pending.pop() {
+        fs::create_dir_all(&to).unwrap();
+        for entry in fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            let destination = to.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                pending.push((entry.path(), destination));
+            } else {
+                fs::copy(entry.path(), destination).unwrap();
+            }
+        }
+    }
+    let state = root.path().join("cu-state");
+    let recordings = root.path().join("recordings");
+    let fake = plugin_base.join("tests/fixtures/fake-backend.mjs");
+    fs::write(
+        plugin_base.join("plugin.toml"),
+        format!(
+            "schema_version = 1\n[plugin]\nname = \"computer-use\"\nversion = \"1.0.0\"\n\
+             [mcp_servers.local]\ncommand = \"node\"\nargs = [\"mcp/server.mjs\"]\nconnect_timeout = 5\n\
+             [mcp_servers.local.env]\nCODEWHALE_CU_APP = \"off\"\n\
+             CODEWHALE_CU_STATE_DIR = {}\nCODEWHALE_CU_RECORDINGS_DIR = {}\nCODEWHALE_CU_TEST_BACKEND = {}\n",
+            serde_json::to_string(&state.to_string_lossy()).unwrap(),
+            serde_json::to_string(&recordings.to_string_lossy()).unwrap(),
+            serde_json::to_string(&fake.to_string_lossy()).unwrap(),
+        ),
+    )
+    .unwrap();
+    let discovery = crate::plugins::discovery::DiscoveryConfig {
+        workspace,
+        user_plugins_dir: root.path().join("plugins"),
+        workspace_plugins_dir: root.path().join("unused-workspace-plugins"),
+        builtin_plugin_dirs: Vec::new(),
+        state_path: root.path().join("plugin-state/state.json"),
+    };
+    let mut registry = crate::plugins::discovery::discover_with_config(&discovery);
+    registry.trust("computer-use").unwrap();
+    registry.enable("computer-use").unwrap();
+    let plugin = registry.get("computer-use").unwrap().clone();
+    let authority = registry.authority_for("computer-use").unwrap();
+    let config = merge_plugin_mcp_servers_from_plugins(
+        McpConfig::default(),
+        vec![("computer-use".to_string(), plugin, authority)],
+    )
+    .unwrap();
+    let server = config
+        .servers
+        .keys()
+        .next()
+        .expect("plugin MCP server")
+        .clone();
+    (root, Arc::new(registry), McpPool::new(config), server)
+}
+
+#[tokio::test]
+async fn computer_use_real_plugin_host_handshake_rejects_tamper_replay_and_late_keys() {
+    let _env = crate::test_support::lock_test_env();
+    let (root, _registry, mut pool, server) = computer_use_test_fixture();
+    let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", root.path());
+    let _backend = crate::test_support::EnvVarGuard::set("CODEWHALE_SECRET_BACKEND", "file");
+    let connection = pool
+        .get_or_connect(&server)
+        .await
+        .expect("actual reviewed Node plugin");
+    let key = connection
+        .decision_key
+        .expect("first-message key from the host");
+    let args = serde_json::json!({"scope":"foreground", "remember":false});
+    let decision = crate::core::engine::HumanDecision::for_test("mcp_fixture_consent_allow", &args);
+    let decode = |result: serde_json::Value| {
+        serde_json::from_str::<serde_json::Value>(result["content"][0]["text"].as_str().unwrap())
+            .unwrap()
+    };
+    let unsigned = decode(
+        connection
+            .call_tool_decided("consent_allow", args.clone(), 5, None)
+            .await
+            .unwrap(),
+    );
+    assert_eq!(
+        unsigned["error"]["code"], "consent_needs_user",
+        "{unsigned}"
+    );
+    let approved = decode(
+        connection
+            .call_tool_decided("consent_allow", args.clone(), 5, Some(&decision))
+            .await
+            .unwrap(),
+    );
+    assert_eq!(approved["ok"], true, "{approved}");
+
+    // A later key notification must not replace the first connection key.
+    let wrong_key = [8_u8; 32];
+    connection.send(serde_json::json!({"jsonrpc":"2.0","method":COMPUTER_USE_HOST_KEYS_METHOD,"params":{"decision_key":hex_encode(&wrong_key)}})).await.unwrap();
+    let fresh = attest_decision(&key, "consent_revoke", &args).unwrap();
+    for (tool, arguments, tag) in [
+        (
+            "consent_revoke",
+            args.clone(),
+            attest_decision(&wrong_key, "consent_revoke", &args).unwrap(),
+        ),
+        (
+            "consent_revoke",
+            serde_json::json!({"scope":"foreground","remember":true}),
+            fresh.clone(),
+        ),
+        ("consent_allow", args.clone(), fresh.clone()),
+    ] {
+        let rejected = decode(connection.call_method("tools/call", serde_json::json!({"name":tool,"arguments":arguments,"_meta":{COMPUTER_USE_DECISION_META:tag}}), 5).await.unwrap());
+        assert_eq!(
+            rejected["error"]["code"], "consent_needs_user",
+            "{rejected}"
+        );
+    }
+    let exact = serde_json::json!({"name":"consent_revoke","arguments":args,"_meta":{COMPUTER_USE_DECISION_META:fresh}});
+    let allowed = decode(
+        connection
+            .call_method("tools/call", exact.clone(), 5)
+            .await
+            .unwrap(),
+    );
+    assert_eq!(
+        allowed["ok"], true,
+        "the original key remains authoritative: {allowed}"
+    );
+    let replay = decode(
+        connection
+            .call_method("tools/call", exact, 5)
+            .await
+            .unwrap(),
+    );
+    assert_eq!(replay["error"]["code"], "consent_needs_user", "{replay}");
+    pool.shutdown_all().await;
 }

@@ -39,6 +39,8 @@ Never retry a refusal unchanged — re-observe, re-target, or change route.
 | `not_granted` | the session's capability grant (`CODEWHALE_CU_GRANT`) does not include this tool | work inside the grant; the host narrowed it deliberately |
 | `consent_required` | no user decision exists for this app on the local computer | ask the user, then record it: `consent {action:"allow"\|"deny", app:"…"}` |
 | `app_denied` | the user denied this app — the deny covers every spelling of it | do not work around it; only they can `consent {action:"revoke"}` |
+| `consent_needs_user` | a consent allow/revoke, a `confirm`, `app_script`, or computer register/spawn was called without the user's own decision | ask the user; the host shows them the exact call — never retry it as a model call or a `run_actions` step |
+| `consent_declined` | the user declined the host's prompt for that call | do not retry; continue without it or ask them |
 | `foreground_consent_required` | `activate:true` needs the separate foreground decision | ask, then `consent {action:"allow"\|"deny", scope:"foreground"}` — or keep working background (`activate:false`) |
 | `confirmation_required` | the click or press would activate a pay/buy/order/send/transfer/delete control | stop and show the user exactly what will happen; only on their approval, `consent {action:"allow", confirm:"<token>"}` and repeat the identical call |
 | `confirmation_unknown` | the confirmation token is unknown, used, or expired | repeat the original call for a fresh token and ask the user again |

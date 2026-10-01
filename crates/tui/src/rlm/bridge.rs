@@ -330,6 +330,10 @@ pub struct RlmBridge {
     /// best-effort stream (#6511).
     events: Option<tokio::sync::mpsc::Sender<crate::core::events::Event>>,
     deadline: tokio::time::Instant,
+    /// The serving turn's permission gate. A nested RLM turn runs each round
+    /// of model-written Python only after this gate admits that exact code;
+    /// without one the nested turn runs no code at all.
+    gate: Option<crate::tools::codemode::NestedCallGate>,
 }
 
 impl RlmBridge {
@@ -359,7 +363,18 @@ impl RlmBridge {
             usage,
             events: None,
             deadline: tokio::time::Instant::now() + crate::tools::subagent::DEFAULT_CHILD_WALL_TIME,
+            gate: None,
         }
+    }
+
+    /// Admit nested RLM code rounds through the serving turn's gate.
+    #[must_use]
+    pub(crate) fn with_gate(
+        mut self,
+        gate: Option<crate::tools::codemode::NestedCallGate>,
+    ) -> Self {
+        self.gate = gate;
+        self
     }
 
     /// Clamp recursive work to the already-spent parent budget. An unbounded
@@ -586,6 +601,7 @@ impl RlmBridge {
             self.depth_remaining.saturating_sub(1),
             self.usage.clone(),
             self.deadline,
+            self.gate.clone(),
         )
         .await;
 
@@ -751,7 +767,9 @@ mod tests {
 
     fn bridge_for(mock: Arc<MockLlmClient>, depth_remaining: u32) -> RlmBridge {
         let client: Arc<dyn RlmLlmClient> = mock;
-        RlmBridge::new(client, "child-model".to_string(), depth_remaining)
+        RlmBridge::new(client, "child-model".to_string(), depth_remaining).with_gate(Some(
+            crate::tools::codemode::NestedCallGate::admitting_for_test(),
+        ))
     }
 
     #[tokio::test]

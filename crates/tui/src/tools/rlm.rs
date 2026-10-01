@@ -29,6 +29,8 @@ use crate::tools::spec::{
     ApprovalRequirement, ToolCapability, ToolContext, ToolError, ToolResult, ToolSpec,
 };
 
+/// Registered name of the persistent RLM session tool.
+pub(crate) const RLM_TOOL_NAME: &str = "rlm";
 const DEFAULT_CHILD_MODEL: &str = "deepseek-v4-flash";
 const MAX_INLINE_CONTENT_CHARS: usize = 200_000;
 const FULL_STDOUT_HEAD_CHARS: usize = 4_096;
@@ -506,7 +508,8 @@ impl RlmTool {
                 self.root_model.clone(),
                 config.sub_rlm_max_depth.min(HARD_SUB_RLM_DEPTH_CAP),
             )
-            .with_deadline(Some(deadline));
+            .with_deadline(Some(deadline))
+            .with_gate(context.execution.nested_call_gate.clone());
             let round_result =
                 tokio::time::timeout_at(bridge.deadline(), kernel.run(code, Some(&bridge)))
                     .await
@@ -1360,7 +1363,9 @@ mod tests {
         let client = CodewhaleClient::new(&config).unwrap();
         let tool = RlmTool::new("rlm", Some(client)).with_root_model("deepseek-v4-flash".into());
         let temp = tempfile::tempdir().unwrap();
-        let context = ToolContext::new(temp.path());
+        let mut context = ToolContext::new(temp.path());
+        context.execution.nested_call_gate =
+            Some(crate::tools::codemode::NestedCallGate::admitting_for_test());
         tool.execute(
             json!({"action": "open", "name": "receipts", "content": "fixture context"}),
             &context,

@@ -6,6 +6,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 import * as registry from "../src/registry.mjs";
 import * as consent from "../src/consent.mjs";
 import { backendFor, installRemoteAgent, executorFor, closeAppSession, routeFingerprint, closeSshChannel, SESSION_ID } from "../src/transport.mjs";
@@ -87,6 +88,89 @@ function assertLease(name) {
 // batched decision would pass as one the user just made.
 const CONSENT_DECISIONS = new Set(["consent_allow", "consent_deny", "consent_revoke"]);
 const isConsentDecision = (tool, args) => CONSENT_DECISIONS.has(tool) || (tool === "consent" && args?.action !== "status");
+
+// ---------- the user's own decisions ----------
+// Widening the ledger (allow, revoke, an irreversible-action confirm), running
+// an app_script, and registering or spawning a computer are the user's calls,
+// never the model's. Each needs one of:
+//  - a decision the host attests: Codewhale sends a per-connection key as the
+//    first stdin message (codewhale/host_keys) and attaches
+//    _meta["codewhale/user_decision"] = {nonce, args_json, mac} only after the
+//    user approved that exact call on its card;
+//  - or, under another host, an MCP elicitation the client shows its user.
+// Otherwise the call is refused with consent_needs_user.
+const NEEDS_USER_DECISION = new Set(["consent_allow", "consent_revoke", "app_script", "computer_register", "computer_spawn"]);
+const wireName = (tool, args) => { try { return resolveTool(tool, args ?? {}).name; } catch { return tool; } };
+const needsUserDecision = (tool, args) => NEEDS_USER_DECISION.has(wireName(tool, args));
+let hostDecisionKey = null;
+let sawFirstMessage = false;
+let clientElicitation = false;
+const seenDecisionNonces = new Set();
+
+/** First-message key delivery from the host (never from later messages). */
+function acceptHostKeys(params) {
+  const decision = typeof params?.decision_key === "string" && /^[0-9a-f]{64}$/i.test(params.decision_key) ? Buffer.from(params.decision_key, "hex") : null;
+  if (!decision) return;
+  hostDecisionKey = decision;
+  if (typeof params?.ledger_key === "string" && /^[0-9a-f]{64}$/i.test(params.ledger_key)) consent.setLedgerKey(Buffer.from(params.ledger_key, "hex"));
+}
+
+/** Whether `meta` carries a fresh host attestation for exactly this call. */
+function verifyUserDecision(tool, args, meta) {
+  const d = meta?.["codewhale/user_decision"];
+  if (!hostDecisionKey || !d || typeof d.nonce !== "string" || typeof d.mac !== "string" || typeof d.args_json !== "string") return false;
+  if (!/^[0-9a-f]{16,128}$/i.test(d.nonce) || seenDecisionNonces.has(d.nonce)) return false;
+  const expected = crypto.createHmac("sha256", hostDecisionKey)
+    .update(Buffer.concat([Buffer.from(String(tool)), Buffer.from([0]), Buffer.from(d.args_json), Buffer.from([0]), Buffer.from(d.nonce)]))
+    .digest();
+  const given = /^[0-9a-f]+$/i.test(d.mac) ? Buffer.from(d.mac, "hex") : Buffer.alloc(0);
+  if (given.length !== expected.length || !crypto.timingSafeEqual(given, expected)) return false;
+  let attested;
+  try { attested = JSON.parse(d.args_json); } catch { return false; }
+  if (!isDeepStrictEqual(attested, args ?? {})) return false;
+  seenDecisionNonces.add(d.nonce);
+  return true;
+}
+
+// Requests this server sends its client (elicitation), keyed by id.
+const serverRequests = new Map();
+let serverRequestSeq = 0;
+function clientRequest(method, params) {
+  const signal = currentSignal();
+  throwIfAborted(signal);
+  const id = `codewhale-cu-${++serverRequestSeq}`;
+  return new Promise((resolve, reject) => {
+    const finish = (settle, value) => {
+      serverRequests.delete(id);
+      signal?.removeEventListener("abort", abort);
+      settle(value);
+    };
+    const abort = () => {
+      finish(reject, new ServerError("cancelled", "the request ended before the user decided"));
+      process.stdout.write(JSON.stringify({ jsonrpc: "2.0", method: "notifications/cancelled", params: { requestId: id } }) + "\n");
+    };
+    serverRequests.set(id, {
+      resolve: value => finish(resolve, value),
+      reject: error => finish(reject, error),
+    });
+    signal?.addEventListener("abort", abort, { once: true });
+    process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n");
+  });
+}
+
+/** Resolve with nothing when the user decided this call; throw otherwise. */
+async function requireUserDecision(params, name, args) {
+  if (verifyUserDecision(params.name, params.arguments ?? {}, params._meta)) return;
+  if (clientElicitation) {
+    const answer = await clientRequest("elicitation/create", {
+      message: `Computer Use asks for your decision: ${name} ${JSON.stringify(args).slice(0, 400)}`,
+      requestedSchema: { type: "object", properties: {} },
+    });
+    if (answer?.action === "accept") return;
+    throw new ServerError("consent_declined", "the user did not approve this — do not retry it; continue without it or ask them");
+  }
+  throw new ServerError("consent_needs_user", `${name} is the user's own decision: it runs only when the host shows them the exact call and they approve it. A model tool call cannot make it. Ask the user.`);
+}
 const mayDeliverInput = (requestName) => requestName === "run_actions" || requestName === "trajectory_replay"
   || LEASE_GATED_TOOLS.has(requestName) || (MERGED_EXPANSION[requestName] ?? []).some((wire) => LEASE_GATED_TOOLS.has(wire));
 const cancelledCode = () => (controlStopped ? "control_stopped" : leasePreempted.has(currentSignal()) ? HUMAN_DRIVING : "cancelled");
@@ -771,6 +855,14 @@ async function callTool(params) {
       return { content: [{ type: "text", text: JSON.stringify(fail(null, "bad_args", `${requested} requires "${field}"`)) }], isError: true };
     }
   }
+  if (NEEDS_USER_DECISION.has(name)) {
+    try {
+      await requireUserDecision(params, name, args);
+      throwIfAborted();
+    } catch (err) {
+      return { content: [{ type: "text", text: JSON.stringify(fail(null, err.code ?? "consent_needs_user", err.message ?? String(err), { tool: requested })) }], isError: true };
+    }
+  }
 
   if (name === "stop_computer_control") {
     controlStopped = true;
@@ -827,7 +919,7 @@ async function callTool(params) {
           if (controlStopped && !READ_ONLY_TOOLS.has(call.tool)) { results.push({ tool: call.tool, ok: false, code: "control_stopped" }); break; }
           // A redacted step carries a placeholder, not what was entered —
           // replaying it would type "[redacted]" into the app.
-          if (call.replayable === false || call.redacted === true || isConsentDecision(call.tool, call.args)) { results.push({ tool: call.tool, ok: false, code: "not_replayable" }); break; }
+          if (call.replayable === false || call.redacted === true || isConsentDecision(call.tool, call.args) || needsUserDecision(call.tool, call.args)) { results.push({ tool: call.tool, ok: false, code: "not_replayable" }); break; }
           let body = null;
           try {
             const r = await callTool({ name: call.tool, arguments: call.args ?? {} });
@@ -843,7 +935,7 @@ async function callTool(params) {
       } finally { replaying = false; }
     }
     const failed = results.filter((r) => r.ok === false).length;
-    return { content: [{ type: "text", text: JSON.stringify(receipt(null, { ok: true, tool: "trajectory_replay", trajectory: path.basename(file), dry_run: dryRun, turns_in_file: calls.length, replayed: results.length, failed, ...(dryRun ? { plan: calls.map((c) => c.tool), not_replayable: calls.flatMap((c, i) => (c.replayable === false || c.redacted === true || isConsentDecision(c.tool, c.args)) ? [i] : []) } : { results }), note: dryRun ? "Nothing was executed. Run again without dry_run:true to replay through the normal gates." : "Replay re-entered the normal pipeline; grants, permissions and the kill switch still apply." })) }] };
+    return { content: [{ type: "text", text: JSON.stringify(receipt(null, { ok: true, tool: "trajectory_replay", trajectory: path.basename(file), dry_run: dryRun, turns_in_file: calls.length, replayed: results.length, failed, ...(dryRun ? { plan: calls.map((c) => c.tool), not_replayable: calls.flatMap((c, i) => (c.replayable === false || c.redacted === true || isConsentDecision(c.tool, c.args) || needsUserDecision(c.tool, c.args)) ? [i] : []) } : { results }), note: dryRun ? "Nothing was executed. Run again without dry_run:true to replay through the normal gates." : "Replay re-entered the normal pipeline; grants, permissions and the kill switch still apply." })) }] };
   }
 
   if (name === "computer_list") {
@@ -859,19 +951,18 @@ async function callTool(params) {
   if (name === "computer_register") {
     try {
       assertNotOwnedElsewhere(args.computer);
-      const entry = registry.register({ id: args.computer, transport: args.transport, label: args.label, host: args.host, port: args.port, user: args.user, target: args.target });
-      await bindComputer(entry);
+      const entry = registry.register({ id: args.computer, transport: args.transport, label: args.label, host: args.host, port: args.port, user: args.user, knownHosts: args.knownHosts, target: args.target });      await bindComputer(entry);
       let installed = null;
       if (entry.transport === "ssh" && args.installAgent !== false) {
         installed = await installRemoteAgent(entry);
-        registry.register({ id: entry.id, transport: "ssh", host: entry.host, port: entry.port, user: entry.user, platformHint: installed.remotePlatform, agentPath: installed.agentPath });
+        registry.register({ id: entry.id, transport: "ssh", host: entry.host, port: entry.port, user: entry.user, knownHosts: entry.knownHosts, platformHint: installed.remotePlatform, agentPath: installed.agentPath });
       }
       if (entry.transport === "ssh" && args.installAgent === false && !entry.platformHint) {
         // Probe cheaply through the agent; if it is missing, registration still succeeds.
         try {
           const ex = await executorFor(entry);
           const reply = await ex.remote({ tool: "platform" });
-          registry.register({ id: entry.id, transport: "ssh", host: entry.host, port: entry.port, user: entry.user, platformHint: reply.platform });
+          registry.register({ id: entry.id, transport: "ssh", host: entry.host, port: entry.port, user: entry.user, knownHosts: entry.knownHosts, platformHint: reply.platform });
         } catch {}
       }
       const fresh = registry.get(entry.id);
@@ -1018,6 +1109,7 @@ async function callTool(params) {
         if (!step || typeof step.tool !== "string") throw new ServerError("bad_args", `step ${i} needs a tool name`);
         if (step.tool === "run_actions") throw new ServerError("bad_args", "run_actions cannot nest");
         if (isConsentDecision(step.tool, step.arguments)) throw new ServerError("bad_args", "consent decisions cannot be a run_actions step — record each one as its own consent call after the user answers");
+        if (needsUserDecision(step.tool, step.arguments)) throw new ServerError("consent_needs_user", `${step.tool} needs the user's own approval as its own call, not a run_actions step`);
         if (!TOOL_NAMES.has(step.tool)) throw new ServerError("unknown_tool", `unknown tool "${step.tool}"`);
         const result = await callTool({ name: step.tool, arguments: { ...(step.arguments ?? {}), computer: computer.id } });
         const body = JSON.parse(result.content[0].text);
@@ -1428,6 +1520,7 @@ async function callToolRecorded(params) {
 
 const HANDLERS = {
   initialize(params) {
+    clientElicitation = params?.capabilities?.elicitation != null;
     return {
       protocolVersion: params?.protocolVersion ?? "2025-06-18",
       capabilities: {
@@ -1581,7 +1674,23 @@ async function handleLine(line) {
   const msg = tryJson(line, null);
   if (!msg || typeof msg !== "object") return;
   const { id, method, params } = msg;
-  if (!method) return; // response to a server request — we never issue any
+  const first = !sawFirstMessage;
+  sawFirstMessage = true;
+  if (method === "codewhale/host_keys") {
+    // Only the host that spawned us writes the first line of our stdin.
+    if (first && id == null) acceptHostKeys(params);
+    return;
+  }
+  if (!method) {
+    // A response to a request this server sent (elicitation).
+    const pending = serverRequests.get(id);
+    if (pending) {
+      serverRequests.delete(id);
+      if (msg.error) pending.reject(Object.assign(new Error(msg.error.message ?? "client refused"), { code: "consent_declined" }));
+      else pending.resolve(msg.result);
+    }
+    return;
+  }
   const handler = HANDLERS[method];
   if (!handler) {
     if (id != null) respondError(id, -32601, `method not found: ${method}`);
