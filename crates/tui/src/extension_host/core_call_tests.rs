@@ -961,7 +961,7 @@ fn action_families_and_registered_process_or_network_tools_always_force_a_prompt
     let registry = crate::tools::registry::ToolRegistryBuilder::new()
         .with_file_tools()
         .with_git_tools()
-        .with_validation_tools()
+        .with_test_runner_tool()
         .with_runtime_task_tools()
         .with_web_tools()
         .build(ToolContext::new(Path::new("/w")));

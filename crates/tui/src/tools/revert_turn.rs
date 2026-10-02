@@ -81,7 +81,11 @@ impl ToolSpec for RevertTurnTool {
         let workspace = context.workspace.clone();
         let label = format!("revert_turn(offset={offset})");
         let session = context.state_namespace.clone();
+        #[cfg(test)]
+        let env_scope = crate::test_support::env_scope_ticket();
         let result = tokio::task::spawn_blocking(move || -> Result<String, String> {
+            #[cfg(test)]
+            let _env_scope = crate::test_support::join_env_scope(env_scope);
             let repo = SnapshotRepo::open_or_init(&workspace)
                 .map_err(|e| format!("Snapshot repo init failed: {e}"))?;
             // Find pre-turn:* snapshots only — those mark the start of

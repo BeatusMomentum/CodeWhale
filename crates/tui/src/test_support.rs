@@ -37,7 +37,9 @@ pub(crate) fn isolated_test_state_root() -> &'static Path {
                 root.display()
             )
         });
-        root
+        // Match resolvers that canonicalize their root (macOS aliases /var to
+        // /private/var). Every fence must name the same physical test store.
+        root.canonicalize().expect("canonical test state root")
     })
 }
 
