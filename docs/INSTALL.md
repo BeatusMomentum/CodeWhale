@@ -1494,6 +1494,22 @@ The mirror directory must contain `codewhale-artifacts-sha256.txt` and the
 platform binaries from the GitHub release. The legacy
 `DEEPSEEK_TUI_RELEASE_BASE_URL` mirror variable remains supported as an alias.
 
+`codewhale update` only talks HTTPS, and only to GitHub's release hosts, the CNB
+mirror, and the host of the `CODEWHALE_RELEASE_BASE_URL` you set; every
+redirect hop is held to the same rule, so a plain-`http://` mirror is refused.
+A private mirror therefore works as soon as its base URL is HTTPS. If that
+mirror redirects asset downloads to a separate download host (a CDN or an
+object-store domain), name that host too:
+
+```bash
+CODEWHALE_UPDATE_ALLOWED_HOSTS=cdn.your-mirror.example.com,objects.example.net \
+CODEWHALE_RELEASE_BASE_URL=https://your-mirror.example.com/CodeWhale/vX.Y.Z/ \
+CODEWHALE_VERSION=X.Y.Z \
+codewhale update
+```
+
+The error message for a refused host names it and this variable.
+
 ### Windows and npm-download troubleshooting
 
 #### Windows: `TLS handshake eof` or `CRYPT_E_REVOCATION_OFFLINE` from `rustup-init`
