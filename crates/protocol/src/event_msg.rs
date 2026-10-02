@@ -830,6 +830,7 @@ pub const EVENT_KINDS: &[&str] = &[
     "pause_events",
     "resume_events",
     "approval_required",
+    "approval_withdrawn",
     "user_input_required",
     "session_updated",
     "elevation_required",
