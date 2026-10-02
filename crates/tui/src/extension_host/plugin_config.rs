@@ -57,8 +57,8 @@ impl PluginConfig {
         Self { value, hash }
     }
 
-    /// What a plugin with no settings is given.
-    fn empty() -> Self {
+    /// What a plugin with no settings is given (and what a built-in module is).
+    pub(crate) fn empty() -> Self {
         Self::new(Value::Object(serde_json::Map::new()))
     }
 }

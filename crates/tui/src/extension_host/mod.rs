@@ -53,7 +53,11 @@
 //!   (`supervisor::HostProcess::call`). Cancellation is a request: a plugin
 //!   that ignores its abort signal keeps running in the host until the host
 //!   is torn down, though the core has already failed the call.
-//! * One host per engine process and one trust tier. Under its OS sandbox
+//! * One host per engine process and trust tier ([`tier`]): the plugin tier
+//!   hosts reviewed third-party plugins, the builtin tier (tier 0) is for
+//!   Codewhale's own host code and starts only for a row of
+//!   [`tier::BUILTIN_MODULES`], which is empty, so only the plugin host ever
+//!   runs. Under its OS sandbox
 //!   (Seatbelt on macOS; bubblewrap on Linux when a launch-time probe shows it
 //!   works) the host has no direct network, and cannot read the Codewhale
 //!   home (except the bundle, its data dir and plugin code), the Codex and
@@ -109,6 +113,7 @@ pub(crate) mod plugin_config;
 pub(crate) mod protocol;
 pub(crate) mod registry;
 pub(crate) mod supervisor;
+pub(crate) mod tier;
 pub(crate) mod tool;
 
 #[cfg(test)]
@@ -129,6 +134,7 @@ use self::protocol::{
 };
 use self::registry::{CommandRegistration, OwnerRegistry, OwnerState, ToolRegistration};
 use self::supervisor::{HostEvents, HostProcess};
+use self::tier::{BuiltinModule, HostTier};
 use crate::plugins::PluginRegistry;
 use crate::plugins::activation::{self, PluginActivationCapability};
 use crate::plugins::types::PluginAuthority;
@@ -444,9 +450,48 @@ impl HostSlot {
     }
 }
 
+/// One tier's host process, and everything that goes with supervising it: the
+/// slot, the generation that makes old callbacks harmless, the spawn count and
+/// the crash/restart bookkeeping. The two tiers each own one, so a crash,
+/// restart or failed launch of one never touches the other. The owner
+/// registry, the runtime pin and the attachments stay shared.
+struct TierRuntime {
+    host: Mutex<HostSlot>,
+    host_generation: AtomicU64,
+    spawn_attempts: AtomicU64,
+    /// Lock order: see [`ManagerShared`].
+    supervision: Mutex<SupervisionState>,
+}
+
+impl TierRuntime {
+    fn new() -> Self {
+        Self {
+            host: Mutex::new(HostSlot::Idle),
+            host_generation: AtomicU64::new(0),
+            spawn_attempts: AtomicU64::new(0),
+            supervision: Mutex::new(SupervisionState::default()),
+        }
+    }
+}
+
 struct DesiredOwner {
     plugin_name: String,
     authority: PluginAuthority,
+    entries: Vec<(PathBuf, String)>,
+}
+
+/// What [`ExtensionHostManager::activate_owner`] activates, on either tier:
+/// a plugin's reviewed bytes, or a built-in module's pinned source.
+struct Activation {
+    tier: HostTier,
+    owner_id: String,
+    /// The plugin's manifest name, or the module's name.
+    name: String,
+    /// The reviewed plugin authority; `None` for a built-in module.
+    authority: Option<PluginAuthority>,
+    /// What the owner is bound to: the plugin's content hash, or the module's
+    /// pinned source digest.
+    content_hash: String,
     entries: Vec<(PathBuf, String)>,
 }
 
@@ -457,21 +502,38 @@ struct AttachmentState {
     desired: BTreeMap<String, String>,
 }
 
+/// Lock order, outermost first, everywhere in this module:
+///
+/// 1. `sync_lock` (async; the only lock held across an await, and it only
+///    serializes reconciliation);
+/// 2. one tier's `host` slot, then that same tier's `supervision`;
+/// 3. `registry`.
+///
+/// No code holds both tiers' slots or both tiers' supervision state at once:
+/// a path that must visit both tiers visits one, releases it, then the other.
+/// `attachments`, `runtime`, `plugin_configs` and `diagnostics` are leaf
+/// locks, never held together with another lock (`diagnostics` is only ever
+/// taken last, from the `diagnostic` helpers). No lock but `sync_lock` is held
+/// across an await.
 pub(crate) struct ManagerShared {
     options: ExtensionHostOptions,
+    /// The built-in host modules this manager may start the builtin tier for:
+    /// [`tier::BUILTIN_MODULES`] (empty) in production; a test substitutes its
+    /// own through [`ExtensionHostManager::with_builtin_modules`].
+    builtin_modules: &'static [BuiltinModule],
     attachments: Mutex<BTreeMap<u64, AttachmentState>>,
     next_attachment: AtomicU64,
+    /// One registry for both tiers: an owner's entry records which.
     registry: Mutex<OwnerRegistry>,
-    host: Mutex<HostSlot>,
-    host_generation: AtomicU64,
-    spawn_attempts: AtomicU64,
+    /// Tier 1: reviewed third-party plugins.
+    plugin: TierRuntime,
+    /// Tier 0: Codewhale's own host code. Starts only for a built-in module.
+    builtin: TierRuntime,
     sync_lock: tokio::sync::Mutex<()>,
     diagnostics: Mutex<VecDeque<Diagnostic>>,
-    /// Lock order: host, supervision, registry. Never held across await.
-    supervision: Mutex<SupervisionState>,
-    /// Never held with another lock.
+    /// Which runtime every host (of either tier) runs on.
     runtime: Mutex<RuntimePin>,
-    /// User settings per plugin name. Never held with another lock.
+    /// User settings per plugin name.
     plugin_configs: Mutex<plugin_config::PluginConfigs>,
 }
 
@@ -496,6 +558,7 @@ struct RuntimePin {
 /// Blocking.
 fn prepare_launch(
     options: &ExtensionHostOptions,
+    tier: HostTier,
     pinned: Option<(crate::dependencies::HostRuntime, String)>,
     bun_failed: bool,
 ) -> Result<(supervisor::HostLaunch, Option<String>), String> {
@@ -527,7 +590,13 @@ fn prepare_launch(
     };
     let root = host_root(options)?;
     let bundle = materialize_bundle(&root)?;
-    let launch = supervisor::plan_launch(&runtime, &bundle, &root, options.supervision.memory_cap)?;
+    let launch = supervisor::plan_launch(
+        tier,
+        &runtime,
+        &bundle,
+        &root,
+        options.supervision.memory_cap,
+    )?;
     Ok((launch, summary))
 }
 
@@ -540,17 +609,26 @@ fn host_root(options: &ExtensionHostOptions) -> Result<PathBuf, String> {
     }
 }
 
-/// The OS sandbox a host started now on `runtime` would run under, planned —
-/// and on Linux probed — exactly as a launch does (for doctor). Blocking;
-/// creates the host's data dir, as a launch would.
+/// The OS sandbox the plugin host started now on `runtime` would run under,
+/// planned — and on Linux probed — exactly as a launch does (for doctor). The
+/// plugin tier is the one that runs in production. Blocking; creates the
+/// host's data dir, as a launch would.
 pub(crate) fn planned_sandbox(
     options: &ExtensionHostOptions,
     runtime: &crate::dependencies::HostRuntime,
 ) -> Result<supervisor::HostSandbox, String> {
-    supervisor::planned_sandbox(runtime, &host_root(options)?)
+    supervisor::planned_sandbox(HostTier::Plugin, runtime, &host_root(options)?)
 }
 
 impl ManagerShared {
+    /// The supervision state of `tier`'s host.
+    fn tier_runtime(&self, tier: HostTier) -> &TierRuntime {
+        match tier {
+            HostTier::Plugin => &self.plugin,
+            HostTier::Builtin => &self.builtin,
+        }
+    }
+
     async fn deactivate_owner(&self, host: &Arc<HostProcess>, owner: &OwnerRef) {
         let diagnostic = match host
             .call(
@@ -578,13 +656,15 @@ impl ManagerShared {
     }
 
     fn record_dirty_teardown(&self, host: &Arc<HostProcess>) {
-        let slot = self.host.lock().expect("host lock");
+        let runtime = self.tier_runtime(host.tier);
+        let slot = runtime.host.lock().expect("host lock");
         if !matches!(&*slot, HostSlot::Ready(current) | HostSlot::Unresponsive(current)
             if Arc::ptr_eq(current, host))
         {
             return;
         }
-        self.supervision
+        runtime
+            .supervision
             .lock()
             .expect("supervision lock")
             .record_dirty_teardown(Instant::now(), &self.options.supervision);
@@ -612,9 +692,9 @@ impl ManagerShared {
         }
     }
 
-    /// The host, when it can take a call; otherwise why not.
-    fn ready_host(&self) -> Result<Arc<HostProcess>, HostStatus> {
-        match &*self.host.lock().expect("host lock") {
+    /// `tier`'s host, when it can take a call; otherwise why not.
+    fn ready_host(&self, tier: HostTier) -> Result<Arc<HostProcess>, HostStatus> {
+        match &*self.tier_runtime(tier).host.lock().expect("host lock") {
             HostSlot::Ready(host) if !host.has_exited() && !host.is_retiring() => {
                 Ok(Arc::clone(host))
             }
@@ -623,45 +703,66 @@ impl ManagerShared {
     }
 
     /// Re-check everything a call depends on, immediately before it is sent:
-    /// a running host (first, so a call to a host that is down says why),
-    /// exact owner generation, the reviewed receipt and staged bytes, the
-    /// Native adapter in this build's policy, and the host again.
+    /// a running host of the owner's tier (first, so a call to a host that is
+    /// down says why), exact owner generation on that tier, for a plugin the
+    /// reviewed receipt and staged bytes and the Native adapter in this
+    /// build's policy (a built-in module has no receipt: its source was
+    /// checked against the Rust table's digest when it activated), and the
+    /// host again.
     ///
     /// `owner_if_live` runs under the registry lock and names the owner
     /// generation the call belongs to, or why it is no longer registered.
     async fn live_host(
         &self,
+        tier: HostTier,
         owner_if_live: impl FnOnce(&OwnerRegistry) -> Result<OwnerRef, String>,
     ) -> Result<Arc<HostProcess>, String> {
         let policy = activation::extension_host_policy_enabled();
         if !policy {
-            return Err(host_down(&HostStatus::Disabled));
+            return Err(host_down(tier, &HostStatus::Disabled));
         }
-        self.ready_host().map_err(|status| host_down(&status))?;
+        self.ready_host(tier)
+            .map_err(|status| host_down(tier, &status))?;
         let authority = {
             let registry = self.registry.lock().expect("registry lock");
             let owner = owner_if_live(&registry)?;
-            registry
-                .authority_for(&owner)
-                .ok_or_else(|| "extension owner has no authority".to_string())?
+            let owner_tier = registry
+                .tier_of(&owner)
+                .ok_or_else(|| "extension owner has no authority".to_string())?;
+            if owner_tier != tier {
+                return Err(format!(
+                    "extension owner `{}` belongs to the {} tier, not the {} tier",
+                    owner.plugin_id,
+                    owner_tier.name(),
+                    tier.name()
+                ));
+            }
+            match (tier, registry.authority_for(&owner)) {
+                (HostTier::Plugin, Some(authority)) => Some(authority),
+                (HostTier::Builtin, None) => None,
+                _ => return Err("extension owner has no authority".to_string()),
+            }
         };
-        tokio::task::spawn_blocking(move || {
-            let _scope = activation::PolicyScope::propagate(policy);
-            crate::plugins::registry::verify_plugin_component_authority(
-                &authority,
-                PluginActivationCapability::Native,
-            )
-        })
-        .await
-        .map_err(|error| format!("authority check failed: {error}"))??;
-        self.ready_host().map_err(|status| host_down(&status))
+        if let Some(authority) = authority {
+            tokio::task::spawn_blocking(move || {
+                let _scope = activation::PolicyScope::propagate(policy);
+                crate::plugins::registry::verify_plugin_component_authority(
+                    &authority,
+                    PluginActivationCapability::Native,
+                )
+            })
+            .await
+            .map_err(|error| format!("authority check failed: {error}"))??;
+        }
+        self.ready_host(tier)
+            .map_err(|status| host_down(tier, &status))
     }
 
     pub(crate) async fn live_host_for(
         &self,
         registration: &ToolRegistration,
     ) -> Result<Arc<HostProcess>, String> {
-        self.live_host(|registry| {
+        self.live_host(registration.tier, |registry| {
             if registry.is_live(registration.handle, &registration.owner) {
                 Ok(registration.owner.clone())
             } else {
@@ -682,7 +783,7 @@ impl ManagerShared {
     ) -> Result<(Arc<HostProcess>, CommandRegistration), String> {
         let mut found = None;
         let host = self
-            .live_host(|registry| {
+            .live_host(HostTier::Plugin, |registry| {
                 let registration = registry
                     .live_command(command.handle, &command.plugin_id, command.generation)
                     .ok_or_else(|| {
@@ -700,15 +801,17 @@ impl ManagerShared {
     }
 }
 
-/// The error a host tool call gets while the host cannot take it.
-fn host_down(status: &HostStatus) -> String {
-    format!("extension host is down: {status}")
+/// The error a call gets while the host of `tier` cannot take it.
+fn host_down(tier: HostTier, status: &HostStatus) -> String {
+    format!("{} is down: {status}", tier.host_label())
 }
 
 /// Channel callbacks. Holds a `Weak` so the host process (which owns the
-/// callbacks) never keeps the manager alive.
+/// callbacks) never keeps the manager alive. Each belongs to one tier's host
+/// process and generation.
 struct Events {
     shared: Weak<ManagerShared>,
+    tier: HostTier,
     generation: u64,
 }
 
@@ -719,17 +822,32 @@ impl HostEvents for Events {
                 refused: "extension host manager is gone".to_string(),
             };
         };
-        let slot = shared.host.lock().expect("host lock");
-        if shared.host_generation.load(Ordering::SeqCst) != self.generation {
+        let runtime = shared.tier_runtime(self.tier);
+        let slot = runtime.host.lock().expect("host lock");
+        if runtime.host_generation.load(Ordering::SeqCst) != self.generation {
             return RegisterResult::Refused {
                 refused: "stale host generation".to_string(),
             };
         }
-        let result = shared
-            .registry
-            .lock()
-            .expect("registry lock")
-            .register(params);
+        let mut foreign_owner = false;
+        let result = {
+            let mut registry = shared.registry.lock().expect("registry lock");
+            // A host registers only for owners it was asked to activate: one
+            // of its own tier. The owner token already makes another tier's
+            // owner unreachable; this says so out loud.
+            match registry.owner(&params.owner.plugin_id) {
+                Some(entry) if entry.tier != self.tier => {
+                    foreign_owner = true;
+                    Err(format!(
+                        "owner `{}` belongs to the {} tier, not this host's {} tier",
+                        params.owner.plugin_id,
+                        entry.tier.name(),
+                        self.tier.name()
+                    ))
+                }
+                _ => registry.register(params),
+            }
+        };
         drop(slot);
         match result {
             Ok(handle) => RegisterResult::Admitted { handle },
@@ -738,13 +856,17 @@ impl HostEvents for Events {
                     RegisterKind::Tool => "tool",
                     RegisterKind::Command => "command",
                 };
-                shared.plugin_diagnostic(
-                    &params.owner.plugin_id,
-                    format!(
-                        "extension `{}` {kind} `{}` refused: {reason}",
-                        params.owner.plugin_id, params.spec.name
-                    ),
+                let message = format!(
+                    "extension `{}` {kind} `{}` refused: {reason}",
+                    params.owner.plugin_id, params.spec.name
                 );
+                // A host naming the other tier's owner does not get to write
+                // under that owner's id: the refusal is a global diagnostic.
+                if foreign_owner {
+                    shared.diagnostic(message);
+                } else {
+                    shared.plugin_diagnostic(&params.owner.plugin_id, message);
+                }
                 RegisterResult::Refused { refused: reason }
             }
         }
@@ -764,8 +886,9 @@ impl HostEvents for Events {
         let Some(shared) = self.shared.upgrade() else {
             return;
         };
-        let slot = shared.host.lock().expect("host lock");
-        if shared.host_generation.load(Ordering::SeqCst) != self.generation {
+        let runtime = shared.tier_runtime(self.tier);
+        let slot = runtime.host.lock().expect("host lock");
+        if runtime.host_generation.load(Ordering::SeqCst) != self.generation {
             return;
         }
         if !shared
@@ -793,14 +916,15 @@ impl HostEvents for Events {
         let Some(shared) = self.shared.upgrade() else {
             return;
         };
+        let runtime = shared.tier_runtime(self.tier);
         let retry = {
-            let mut slot = shared.host.lock().expect("host lock");
-            if shared.host_generation.load(Ordering::SeqCst) != host_generation
+            let mut slot = runtime.host.lock().expect("host lock");
+            if runtime.host_generation.load(Ordering::SeqCst) != host_generation
                 || !matches!(&*slot, HostSlot::Ready(_) | HostSlot::Unresponsive(_))
             {
                 return;
             }
-            let mut supervision = shared.supervision.lock().expect("supervision lock");
+            let mut supervision = runtime.supervision.lock().expect("supervision lock");
             let planned = supervision.planned_restart.take() == Some(host_generation)
                 && reason == DIRTY_RESTART_REASON;
             let restart = if planned {
@@ -813,7 +937,7 @@ impl HostEvents for Events {
                 .registry
                 .lock()
                 .expect("registry lock")
-                .host_exited(&reason);
+                .host_exited(self.tier, &reason);
             *slot = if restart {
                 HostSlot::Restarting {
                     reason: reason.clone(),
@@ -826,9 +950,9 @@ impl HostEvents for Events {
             };
             restart.then_some((supervision.retry_ticket, supervision.policy))
         };
-        shared.diagnostic(format!("extension host {reason}"));
+        shared.diagnostic(format!("{} {reason}", self.tier.host_label()));
         if let Some((ticket, policy)) = retry {
-            schedule_restart(&shared, host_generation, ticket, policy);
+            schedule_restart(&shared, self.tier, host_generation, ticket, policy);
         }
     }
 
@@ -842,14 +966,17 @@ impl HostEvents for Events {
         let Some(shared) = self.shared.upgrade() else {
             return;
         };
-        let _slot = shared.host.lock().expect("host lock");
-        if shared.host_generation.load(Ordering::SeqCst) != self.generation
-            || shared
+        let runtime = shared.tier_runtime(self.tier);
+        let _slot = runtime.host.lock().expect("host lock");
+        // Only for an owner of this host's own tier: a host cannot put
+        // diagnostics under the other tier's owner ids.
+        if runtime.host_generation.load(Ordering::SeqCst) != self.generation
+            || !shared
                 .registry
                 .lock()
                 .expect("registry lock")
                 .owner(plugin_id)
-                .is_none()
+                .is_some_and(|entry| entry.tier == self.tier)
         {
             return;
         }
@@ -859,7 +986,13 @@ impl HostEvents for Events {
 
 /// One scheduled retry owns a ticket, so explicit retry/shutdown and a newer
 /// host generation invalidate it. The existing reconcile lock owns replay.
-fn schedule_restart(shared: &Arc<ManagerShared>, generation: u64, ticket: u64, policy: bool) {
+fn schedule_restart(
+    shared: &Arc<ManagerShared>,
+    tier: HostTier,
+    generation: u64,
+    ticket: u64,
+    policy: bool,
+) {
     let weak = Arc::downgrade(shared);
     let backoff = shared.options.supervision.restart_backoff;
     tokio::spawn(async move {
@@ -869,9 +1002,10 @@ fn schedule_restart(shared: &Arc<ManagerShared>, generation: u64, ticket: u64, p
         };
         {
             let _serial = shared.sync_lock.lock().await;
-            let mut slot = shared.host.lock().expect("host lock");
-            if shared.host_generation.load(Ordering::SeqCst) != generation
-                || shared
+            let runtime = shared.tier_runtime(tier);
+            let mut slot = runtime.host.lock().expect("host lock");
+            if runtime.host_generation.load(Ordering::SeqCst) != generation
+                || runtime
                     .supervision
                     .lock()
                     .expect("supervision lock")
@@ -890,9 +1024,15 @@ fn schedule_restart(shared: &Arc<ManagerShared>, generation: u64, ticket: u64, p
     });
 }
 
-fn set_host_health(shared: &ManagerShared, generation: u64, unresponsive: bool) -> bool {
-    let mut slot = shared.host.lock().expect("host lock");
-    if shared.host_generation.load(Ordering::SeqCst) != generation {
+fn set_host_health(
+    shared: &ManagerShared,
+    tier: HostTier,
+    generation: u64,
+    unresponsive: bool,
+) -> bool {
+    let runtime = shared.tier_runtime(tier);
+    let mut slot = runtime.host.lock().expect("host lock");
+    if runtime.host_generation.load(Ordering::SeqCst) != generation {
         return false;
     }
     let host = match &*slot {
@@ -916,13 +1056,14 @@ fn restart_dirty_host_when_idle(
     let Ok(_serial) = shared.sync_lock.try_lock() else {
         return false;
     };
-    let slot = shared.host.lock().expect("host lock");
-    if shared.host_generation.load(Ordering::SeqCst) != generation
+    let runtime = shared.tier_runtime(host.tier);
+    let slot = runtime.host.lock().expect("host lock");
+    if runtime.host_generation.load(Ordering::SeqCst) != generation
         || !matches!(&*slot, HostSlot::Ready(current) if Arc::ptr_eq(current, host))
     {
         return false;
     }
-    let mut supervision = shared.supervision.lock().expect("supervision lock");
+    let mut supervision = runtime.supervision.lock().expect("supervision lock");
     if !supervision.dirty_restart_pending || !host.terminate_if_idle(DIRTY_RESTART_REASON) {
         return false;
     }
@@ -933,6 +1074,7 @@ fn restart_dirty_host_when_idle(
 /// A monitor never owns the manager. Dropping the manager or changing host
 /// generation stops its monitor; pending calls are never retried here.
 fn monitor_host(shared: &Arc<ManagerShared>, host: &Arc<HostProcess>, generation: u64) {
+    let tier = host.tier;
     let weak = Arc::downgrade(shared);
     let host = Arc::clone(host);
     let options = shared.options.supervision.clone();
@@ -943,7 +1085,13 @@ fn monitor_host(shared: &Arc<ManagerShared>, host: &Arc<HostProcess>, generation
             let Some(shared) = weak.upgrade() else {
                 return;
             };
-            if shared.host_generation.load(Ordering::SeqCst) != generation || host.has_exited() {
+            if shared
+                .tier_runtime(tier)
+                .host_generation
+                .load(Ordering::SeqCst)
+                != generation
+                || host.has_exited()
+            {
                 return;
             }
             if restart_dirty_host_when_idle(&shared, &host, generation) {
@@ -955,7 +1103,8 @@ fn monitor_host(shared: &Arc<ManagerShared>, host: &Arc<HostProcess>, generation
                 && resident > host.memory_cap
             {
                 shared.diagnostic(format!(
-                    "extension host exceeded its memory cap ({} MiB resident, cap {} MiB); killed",
+                    "{} exceeded its memory cap ({} MiB resident, cap {} MiB); killed",
+                    tier.host_label(),
                     resident / (1024 * 1024),
                     host.memory_cap / (1024 * 1024)
                 ));
@@ -981,7 +1130,7 @@ fn monitor_host(shared: &Arc<ManagerShared>, host: &Arc<HostProcess>, generation
                         let Some(shared) = weak.upgrade() else {
                             return;
                         };
-                        if !set_host_health(&shared, generation, true) {
+                        if !set_host_health(&shared, tier, generation, true) {
                             return;
                         }
                     }
@@ -996,7 +1145,7 @@ fn monitor_host(shared: &Arc<ManagerShared>, host: &Arc<HostProcess>, generation
                         host.forget(id);
                         return;
                     };
-                    if !set_host_health(&shared, generation, true) {
+                    if !set_host_health(&shared, tier, generation, true) {
                         host.forget(id);
                         return;
                     }
@@ -1023,14 +1172,16 @@ fn monitor_host(shared: &Arc<ManagerShared>, host: &Arc<HostProcess>, generation
             let Some(shared) = weak.upgrade() else {
                 return;
             };
-            if !set_host_health(&shared, generation, false) {
+            if !set_host_health(&shared, tier, generation, false) {
                 return;
             }
         }
     });
 }
 
-/// Supervises at most one extension host for this engine process.
+/// Supervises at most one extension host per trust tier for this engine
+/// process: the plugin tier's, and the builtin tier's once a built-in module
+/// asks for it (none does yet).
 pub struct ExtensionHostManager {
     shared: Arc<ManagerShared>,
 }
@@ -1038,27 +1189,49 @@ pub struct ExtensionHostManager {
 impl ExtensionHostManager {
     #[must_use]
     pub fn new(options: ExtensionHostOptions) -> Self {
+        Self::with_builtin_modules(options, tier::BUILTIN_MODULES)
+    }
+
+    /// A manager with its own built-in module table. Production passes the
+    /// const table through [`Self::new`]; a test passes one of its own to
+    /// exercise tier 0 without a production row.
+    fn with_builtin_modules(
+        options: ExtensionHostOptions,
+        builtin_modules: &'static [BuiltinModule],
+    ) -> Self {
         Self {
             shared: Arc::new(ManagerShared {
                 options,
+                builtin_modules,
                 attachments: Mutex::new(BTreeMap::new()),
                 next_attachment: AtomicU64::new(0),
                 registry: Mutex::new(OwnerRegistry::new()),
-                host: Mutex::new(HostSlot::Idle),
-                host_generation: AtomicU64::new(0),
-                spawn_attempts: AtomicU64::new(0),
+                plugin: TierRuntime::new(),
+                builtin: TierRuntime::new(),
                 sync_lock: tokio::sync::Mutex::new(()),
                 diagnostics: Mutex::new(VecDeque::new()),
-                supervision: Mutex::new(SupervisionState::default()),
                 runtime: Mutex::new(RuntimePin::default()),
                 plugin_configs: Mutex::new(plugin_config::PluginConfigs::default()),
             }),
         }
     }
 
+    /// The plugin host's state: what `/plugin` and the error a plugin's tool
+    /// call gets while it is down report.
     #[must_use]
     pub fn status(&self) -> HostStatus {
-        self.shared.host.lock().expect("host lock").status()
+        self.tier_status(HostTier::Plugin)
+    }
+
+    /// The state of `tier`'s host.
+    #[must_use]
+    fn tier_status(&self, tier: HostTier) -> HostStatus {
+        self.shared
+            .tier_runtime(tier)
+            .host
+            .lock()
+            .expect("host lock")
+            .status()
     }
 
     /// The pinned runtime's one-line summary, once a host on it has completed
@@ -1074,10 +1247,23 @@ impl ExtensionHostManager {
             .map(|(_, summary)| summary.clone())
     }
 
-    /// How many times this manager has tried to start a host process.
+    /// How many times this manager has tried to start a host process, both
+    /// tiers together.
     #[must_use]
     pub fn spawn_attempts(&self) -> u64 {
-        self.shared.spawn_attempts.load(Ordering::SeqCst)
+        HostTier::ALL
+            .into_iter()
+            .map(|tier| self.tier_spawn_attempts(tier))
+            .sum()
+    }
+
+    /// How many times this manager has tried to start `tier`'s host.
+    #[must_use]
+    fn tier_spawn_attempts(&self, tier: HostTier) -> u64 {
+        self.shared
+            .tier_runtime(tier)
+            .spawn_attempts
+            .load(Ordering::SeqCst)
     }
 
     #[must_use]
@@ -1228,16 +1414,20 @@ impl ExtensionHostManager {
     /// An explicit plugin mutation retries failed receipts and clears the
     /// shared crash budget. Merely opening another engine never does this.
     pub fn retry(&self) {
-        let mut slot = self.shared.host.lock().expect("host lock");
-        let mut supervision = self.shared.supervision.lock().expect("supervision lock");
-        supervision.crashes.clear();
-        supervision.launch_failed = false;
-        supervision.retry_ticket += 1;
-        if matches!(
-            &*slot,
-            HostSlot::Failed { .. } | HostSlot::Restarting { .. }
-        ) {
-            *slot = HostSlot::Idle;
+        // One tier at a time, so no two tiers' locks are ever held together.
+        for tier in HostTier::ALL {
+            let runtime = self.shared.tier_runtime(tier);
+            let mut slot = runtime.host.lock().expect("host lock");
+            let mut supervision = runtime.supervision.lock().expect("supervision lock");
+            supervision.crashes.clear();
+            supervision.launch_failed = false;
+            supervision.retry_ticket += 1;
+            if matches!(
+                &*slot,
+                HostSlot::Failed { .. } | HostSlot::Restarting { .. }
+            ) {
+                *slot = HostSlot::Idle;
+            }
         }
         self.shared
             .registry
@@ -1247,16 +1437,19 @@ impl ExtensionHostManager {
     }
 
     fn retry_launch_on_attach(&self) {
-        let mut slot = self.shared.host.lock().expect("host lock");
-        let mut supervision = self.shared.supervision.lock().expect("supervision lock");
-        if matches!(&*slot, HostSlot::Failed { .. })
-            && supervision.launch_failed
-            && supervision.last_start.is_some_and(|at| {
-                at.elapsed() >= self.shared.options.supervision.start_retry_cooldown
-            })
-        {
-            *slot = HostSlot::Idle;
-            supervision.retry_ticket += 1;
+        for tier in HostTier::ALL {
+            let runtime = self.shared.tier_runtime(tier);
+            let mut slot = runtime.host.lock().expect("host lock");
+            let mut supervision = runtime.supervision.lock().expect("supervision lock");
+            if matches!(&*slot, HostSlot::Failed { .. })
+                && supervision.launch_failed
+                && supervision.last_start.is_some_and(|at| {
+                    at.elapsed() >= self.shared.options.supervision.start_retry_cooldown
+                })
+            {
+                *slot = HostSlot::Idle;
+                supervision.retry_ticket += 1;
+            }
         }
     }
 
@@ -1516,19 +1709,23 @@ impl ExtensionHostManager {
                 .collect()
         };
 
-        // 1. Revoke first — never waits for the host.
+        // 1. Revoke first — never waits for the host. Plugin-tier owners only:
+        // the builtin tier's modules are not plugins, are never desired by an
+        // attachment, and the table that wants them is fixed for the
+        // manager's life, so no plugin change revokes one.
         let mut revoked: Vec<OwnerRef> = Vec::new();
         let mut to_activate: Vec<(String, DesiredOwner)> = Vec::new();
         {
             let mut registry = shared.registry.lock().expect("registry lock");
             let existing: Vec<(String, PluginAuthority, String)> = registry
                 .owners()
-                .map(|entry| {
-                    (
+                .filter(|entry| entry.tier == HostTier::Plugin)
+                .filter_map(|entry| {
+                    Some((
                         entry.owner.plugin_id.clone(),
-                        entry.authority.clone(),
+                        entry.authority.clone()?,
                         entry.config_hash.clone(),
-                    )
+                    ))
                 })
                 .collect();
             for (plugin_id, authority, config_hash) in &existing {
@@ -1559,7 +1756,7 @@ impl ExtensionHostManager {
                 }
             }
         }
-        let host = shared.ready_host().ok();
+        let host = shared.ready_host(HostTier::Plugin).ok();
         for owner in revoked {
             shared.plugin_diagnostic(
                 &owner.plugin_id,
@@ -1571,36 +1768,178 @@ impl ExtensionHostManager {
             }
         }
 
-        if to_activate.is_empty() {
+        // The plugin tier first, then the builtin tier; each only when it has
+        // something to activate, so with no plugin and no module no host
+        // starts. One tier's failure never stops the other's.
+        let plugins = async {
+            if to_activate.is_empty() {
+                return Ok::<(), String>(());
+            }
+            let host = self.ensure_host(HostTier::Plugin, policy).await?;
+            for (plugin_id, want) in to_activate {
+                if host.has_exited() {
+                    break;
+                }
+                let content_hash = want.authority.content_hash.clone();
+                self.activate_owner(
+                    &host,
+                    Activation {
+                        tier: HostTier::Plugin,
+                        owner_id: plugin_id,
+                        name: want.plugin_name,
+                        authority: Some(want.authority),
+                        content_hash,
+                        entries: want.entries,
+                    },
+                )
+                .await;
+            }
+            Ok(())
+        }
+        .await;
+        let builtin = if policy {
+            self.reconcile_builtin(policy).await
+        } else {
+            Ok(())
+        };
+        match (plugins, builtin) {
+            (Err(error), Err(other)) => {
+                shared.diagnostic(other);
+                Err(error)
+            }
+            (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+            (Ok(()), Ok(())) => Ok(()),
+        }
+    }
+
+    /// Tier 0: activate every row of the built-in module table that is not
+    /// yet an owner, starting the builtin host if there is one to activate.
+    /// With the production table (empty) this does nothing and starts
+    /// nothing. A module whose source is missing, or whose SHA-256 is not the
+    /// one the table pins, is recorded as a failed owner with the reason, and
+    /// is not retried until an explicit plugin change.
+    async fn reconcile_builtin(&self, policy: bool) -> Result<(), String> {
+        let shared = &self.shared;
+        let wanted: Vec<&'static BuiltinModule> = {
+            let registry = shared.registry.lock().expect("registry lock");
+            shared
+                .builtin_modules
+                .iter()
+                .filter(|module| registry.owner(&module.owner_id()).is_none())
+                .collect()
+        };
+        if wanted.is_empty() {
             return Ok(());
         }
-        let host = self.ensure_host(policy).await?;
-        for (plugin_id, want) in to_activate {
+        let root = host_root(&shared.options)?;
+        let mut activations = Vec::new();
+        for module in wanted {
+            // The module's source, accepted only if its SHA-256 is the one the
+            // table pins: the path and digest to activate it with.
+            let source = {
+                let root = root.clone();
+                tokio::task::spawn_blocking(move || {
+                    let path = builtin_source_path(&root, module);
+                    let bytes = std::fs::read(&path).map_err(|error| {
+                        format!(
+                            "cannot read the source of built-in module `{}` at {}: {error}",
+                            module.id,
+                            path.display()
+                        )
+                    })?;
+                    let digest = hex(Sha256::digest(&bytes));
+                    if digest != module.source_sha256 {
+                        return Err(format!(
+                            "the source of built-in module `{}` at {} has sha256 {digest}, not the {} the core pins",
+                            module.id,
+                            path.display(),
+                            module.source_sha256
+                        ));
+                    }
+                    Ok((path, digest))
+                })
+                .await
+                .map_err(|error| format!("built-in module scan failed: {error}"))?
+            };
+            let owner_id = module.owner_id();
+            match source {
+                Ok(entry) => activations.push(Activation {
+                    tier: HostTier::Builtin,
+                    owner_id,
+                    name: module.id.to_string(),
+                    authority: None,
+                    content_hash: module.source_sha256.to_string(),
+                    entries: vec![entry],
+                }),
+                Err(reason) => {
+                    let mut registry = shared.registry.lock().expect("registry lock");
+                    if let Ok(owner) = registry.begin_owner(
+                        HostTier::Builtin,
+                        &owner_id,
+                        module.id,
+                        None,
+                        module.source_sha256,
+                    ) {
+                        registry.mark_failed(&owner, OwnerState::Failed(reason.clone()));
+                    }
+                    drop(registry);
+                    shared.plugin_diagnostic(
+                        &owner_id,
+                        format!(
+                            "built-in module `{}` failed to activate: {reason}",
+                            module.id
+                        ),
+                    );
+                }
+            }
+        }
+        if activations.is_empty() {
+            return Ok(());
+        }
+        let host = self.ensure_host(HostTier::Builtin, policy).await?;
+        for activation in activations {
             if host.has_exited() {
                 break;
             }
-            self.activate_owner(&host, &plugin_id, want).await;
+            self.activate_owner(&host, activation).await;
         }
         Ok(())
     }
 
-    async fn activate_owner(&self, host: &Arc<HostProcess>, plugin_id: &str, want: DesiredOwner) {
+    async fn activate_owner(&self, host: &Arc<HostProcess>, want: Activation) {
         let shared = &self.shared;
-        let owner = shared.registry.lock().expect("registry lock").begin_owner(
+        let plugin_id = want.owner_id.as_str();
+        let begun = shared.registry.lock().expect("registry lock").begin_owner(
+            want.tier,
             plugin_id,
-            &want.plugin_name,
+            &want.name,
             want.authority.clone(),
-            &want.authority.content_hash,
+            &want.content_hash,
         );
-        // What the plugin is given: its settings and its own directory. A
+        let owner = match begun {
+            Ok(owner) => owner,
+            Err(reason) => {
+                shared.plugin_diagnostic(
+                    plugin_id,
+                    format!("extension `{}` was not activated: {reason}", want.name),
+                );
+                return;
+            }
+        };
+        // What the owner is given: its settings and its own directory. A
         // config that is refused, or a directory that cannot be made, fails the
         // activation with the reason; the plugin is never started with
-        // different settings than the user wrote.
-        let selection = shared
-            .plugin_configs
-            .lock()
-            .expect("plugin configs lock")
-            .select(&want.plugin_name);
+        // different settings than the user wrote. A built-in module takes no
+        // user settings: `[plugins]` is keyed by plugin name and is not read
+        // for tier 0.
+        let selection = match want.tier {
+            HostTier::Plugin => shared
+                .plugin_configs
+                .lock()
+                .expect("plugin configs lock")
+                .select(&want.name),
+            HostTier::Builtin => Ok(plugin_config::PluginConfig::empty()),
+        };
         shared
             .registry
             .lock()
@@ -1608,7 +1947,7 @@ impl ExtensionHostManager {
             .set_config_hash(&owner, &plugin_config::activation_hash(&selection));
         let context = match selection {
             Ok(config) => self
-                .plugin_data_dir(plugin_id, &want.plugin_name)
+                .owner_data_dir(want.tier, plugin_id, &want.name)
                 .await
                 .map(|data_dir| (config, data_dir)),
             Err(reason) => Err(reason),
@@ -1623,10 +1962,7 @@ impl ExtensionHostManager {
                     .mark_failed(&owner, OwnerState::Failed(reason.clone()));
                 shared.plugin_diagnostic(
                     plugin_id,
-                    format!(
-                        "extension `{}` failed to activate: {reason}",
-                        want.plugin_name
-                    ),
+                    format!("extension `{}` failed to activate: {reason}", want.name),
                 );
                 return;
             }
@@ -1642,7 +1978,7 @@ impl ExtensionHostManager {
         for (path, sha256) in &want.entries {
             let request = CoreRequest::Activate(ActivateParams {
                 owner: owner.clone(),
-                plugin_name: want.plugin_name.clone(),
+                plugin_name: want.name.clone(),
                 entry: EntryRef {
                     path: path.to_string_lossy().into_owned(),
                     sha256: sha256.clone(),
@@ -1685,7 +2021,7 @@ impl ExtensionHostManager {
                         plugin_id,
                         format!(
                             "extension `{}` active (tools: {}; commands: {})",
-                            want.plugin_name,
+                            want.name,
                             tools.iter().cloned().collect::<Vec<_>>().join(", "),
                             commands
                                 .iter()
@@ -1706,21 +2042,28 @@ impl ExtensionHostManager {
                     .mark_failed(&owner, OwnerState::Failed(reason.clone()));
                 shared.plugin_diagnostic(
                     plugin_id,
-                    format!(
-                        "extension `{}` failed to activate: {reason}",
-                        want.plugin_name
-                    ),
+                    format!("extension `{}` failed to activate: {reason}", want.name),
                 );
                 shared.deactivate_owner(host, &owner).await;
             }
         }
     }
 
-    /// Create (if needed) and name the plugin's own directory inside the
-    /// host's data dir, the host sandbox's writable root.
-    async fn plugin_data_dir(&self, plugin_id: &str, plugin_name: &str) -> Result<String, String> {
-        let path =
-            supervisor::plugin_data_dir(&host_root(&self.shared.options)?, plugin_id, plugin_name);
+    /// Create (if needed) and name an owner's own directory inside its tier's
+    /// data dir, the host sandbox's writable root: a plugin's at its
+    /// long-standing path, a built-in module's under the builtin tier's.
+    async fn owner_data_dir(
+        &self,
+        tier: HostTier,
+        plugin_id: &str,
+        plugin_name: &str,
+    ) -> Result<String, String> {
+        let path = supervisor::owner_data_dir(
+            &host_root(&self.shared.options)?,
+            tier,
+            plugin_id,
+            plugin_name,
+        );
         let mut builder = tokio::fs::DirBuilder::new();
         builder.recursive(true);
         #[cfg(unix)]
@@ -1739,48 +2082,53 @@ impl ExtensionHostManager {
         })
     }
 
-    async fn ensure_host(&self, policy: bool) -> Result<Arc<HostProcess>, String> {
+    /// `tier`'s host, started (lazily, once per generation) if it is idle.
+    async fn ensure_host(&self, tier: HostTier, policy: bool) -> Result<Arc<HostProcess>, String> {
         let shared = &self.shared;
+        let runtime = shared.tier_runtime(tier);
+        let label = tier.host_label();
         let mut generation = {
-            let mut slot = shared.host.lock().expect("host lock");
+            let mut slot = runtime.host.lock().expect("host lock");
             match &*slot {
                 HostSlot::Ready(host) if !host.has_exited() && !host.is_retiring() => {
                     return Ok(Arc::clone(host));
                 }
                 HostSlot::Idle => {}
-                other => return Err(host_down(&other.status())),
+                other => return Err(host_down(tier, &other.status())),
             }
             *slot = HostSlot::Starting;
-            let mut supervision = shared.supervision.lock().expect("supervision lock");
+            let mut supervision = runtime.supervision.lock().expect("supervision lock");
             supervision.last_start = Some(Instant::now());
             supervision.policy = policy;
             supervision.launch_failed = false;
             supervision.dirty_teardowns.clear();
             supervision.dirty_restart_pending = false;
             supervision.planned_restart = None;
-            shared.host_generation.fetch_add(1, Ordering::SeqCst) + 1
+            runtime.host_generation.fetch_add(1, Ordering::SeqCst) + 1
         };
         // At most two launches: under `auto`, before anything is pinned, a
         // Bun that cannot start is reported once and Node is resolved for the
         // rest of the session. An explicit `bun` or `node` never falls back.
         let spawned = loop {
-            shared.spawn_attempts.fetch_add(1, Ordering::SeqCst);
+            runtime.spawn_attempts.fetch_add(1, Ordering::SeqCst);
             let options = shared.options.clone();
             let (pinned, bun_failed) = {
                 let runtime = shared.runtime.lock().expect("runtime lock");
                 (runtime.pinned.clone(), runtime.bun_failed)
             };
-            let prepared =
-                tokio::task::spawn_blocking(move || prepare_launch(&options, pinned, bun_failed))
-                    .await
-                    .map_err(|error| format!("extension host preparation failed: {error}"))
-                    .and_then(|result| result);
+            let prepared = tokio::task::spawn_blocking(move || {
+                prepare_launch(&options, tier, pinned, bun_failed)
+            })
+            .await
+            .map_err(|error| format!("extension host preparation failed: {error}"))
+            .and_then(|result| result);
             let (launch, summary) = match prepared {
                 Ok(prepared) => prepared,
                 Err(error) => break Err(error),
             };
             let events: Arc<dyn HostEvents> = Arc::new(Events {
                 shared: Arc::downgrade(shared),
+                tier,
                 generation,
             });
             let reason =
@@ -1796,31 +2144,31 @@ impl ExtensionHostManager {
             }
             shared.runtime.lock().expect("runtime lock").bun_failed = true;
             shared.diagnostic(format!(
-                "extension host: Bun {} at {} failed to start ({reason}); runtime = \"auto\" uses Node for the rest of this session",
+                "{label}: Bun {} at {} failed to start ({reason}); runtime = \"auto\" uses Node for the rest of this session",
                 launch.runtime.version_string(),
                 launch.runtime.path.display()
             ));
             // A fresh generation, so the failed Bun host's exit report can
             // never be taken for the Node host's.
             generation = {
-                let slot = shared.host.lock().expect("host lock");
-                if shared.host_generation.load(Ordering::SeqCst) != generation
+                let slot = runtime.host.lock().expect("host lock");
+                if runtime.host_generation.load(Ordering::SeqCst) != generation
                     || !matches!(&*slot, HostSlot::Starting)
                 {
-                    break Err("extension host startup was superseded".into());
+                    break Err(format!("{label} startup was superseded"));
                 }
-                shared.host_generation.fetch_add(1, Ordering::SeqCst) + 1
+                runtime.host_generation.fetch_add(1, Ordering::SeqCst) + 1
             };
         };
-        let mut slot = shared.host.lock().expect("host lock");
-        if shared.host_generation.load(Ordering::SeqCst) != generation
+        let mut slot = runtime.host.lock().expect("host lock");
+        if runtime.host_generation.load(Ordering::SeqCst) != generation
             || !matches!(&*slot, HostSlot::Starting)
         {
             drop(slot);
             if let Ok((host, _)) = spawned {
                 host.terminate("host startup superseded".into());
             }
-            return Err("extension host startup was superseded".into());
+            return Err(format!("{label} startup was superseded"));
         }
         match spawned {
             Ok((host, summary)) => {
@@ -1839,6 +2187,7 @@ impl ExtensionHostManager {
                 if host.has_exited() {
                     Events {
                         shared: Arc::downgrade(shared),
+                        tier,
                         generation,
                     }
                     .exited(
@@ -1846,11 +2195,11 @@ impl ExtensionHostManager {
                         "exited immediately after handshake".into(),
                         host.stderr_tail(),
                     );
-                    return Err("extension host exited immediately after handshake".into());
+                    return Err(format!("{label} exited immediately after handshake"));
                 }
                 monitor_host(shared, &host, generation);
                 shared.diagnostic(format!(
-                    "extension host started (pid {}, {} {}, sandbox {})",
+                    "{label} started (pid {}, {} {}, sandbox {})",
                     host.pid
                         .map_or_else(|| "?".to_string(), |pid| pid.to_string()),
                     host.runtime.kind.name(),
@@ -1860,7 +2209,7 @@ impl ExtensionHostManager {
                 Ok(host)
             }
             Err(reason) => {
-                shared
+                runtime
                     .supervision
                     .lock()
                     .expect("supervision lock")
@@ -1870,53 +2219,60 @@ impl ExtensionHostManager {
                     stderr_tail: String::new(),
                 };
                 drop(slot);
-                shared.diagnostic(format!("extension host failed to start: {reason}"));
+                shared.diagnostic(format!("{label} failed to start: {reason}"));
                 Err(reason)
             }
         }
     }
 
-    /// Bounded shutdown of the host process, if one is running. Production
-    /// has no such call: the host is shared by every engine in the process,
-    /// so no single engine's shutdown may stop it. When this process ends the
-    /// host sees stdin EOF and kills its own process tree; if a plugin blocks
-    /// its event loop, its watchdog thread does so when the parent changes.
+    /// Bounded shutdown of each tier's host process, if one is running.
+    /// Production has no such call: the hosts are shared by every engine in
+    /// the process, so no single engine's shutdown may stop them. When this
+    /// process ends a host sees stdin EOF and kills its own process tree; if a
+    /// plugin blocks its event loop, its watchdog thread does so when the
+    /// parent changes.
     #[cfg(test)]
     pub async fn shutdown(&self) {
-        let host = {
-            let mut slot = self.shared.host.lock().expect("host lock");
-            self.shared.host_generation.fetch_add(1, Ordering::SeqCst);
-            self.shared
-                .supervision
-                .lock()
-                .expect("supervision lock")
-                .retry_ticket += 1;
-            match std::mem::replace(&mut *slot, HostSlot::Idle) {
-                HostSlot::Ready(host) | HostSlot::Unresponsive(host) => Some(host),
-                _ => None,
+        for tier in HostTier::ALL {
+            let runtime = self.shared.tier_runtime(tier);
+            let host = {
+                let mut slot = runtime.host.lock().expect("host lock");
+                runtime.host_generation.fetch_add(1, Ordering::SeqCst);
+                runtime
+                    .supervision
+                    .lock()
+                    .expect("supervision lock")
+                    .retry_ticket += 1;
+                match std::mem::replace(&mut *slot, HostSlot::Idle) {
+                    HostSlot::Ready(host) | HostSlot::Unresponsive(host) => Some(host),
+                    _ => None,
+                }
+            };
+            if let Some(host) = host {
+                self.shared
+                    .registry
+                    .lock()
+                    .expect("registry lock")
+                    .revoke_all(tier, "extension host shut down");
+                host.shutdown().await;
             }
-        };
-        if let Some(host) = host {
-            self.shared
-                .registry
-                .lock()
-                .expect("registry lock")
-                .revoke_all("extension host shut down");
-            host.shutdown().await;
         }
     }
 
     #[cfg(test)]
     pub(crate) fn host_requests_started(&self) -> Option<u64> {
         self.shared
-            .ready_host()
+            .ready_host(HostTier::Plugin)
             .ok()
             .map(|host| host.requests_started())
     }
 
     #[cfg(test)]
     pub(crate) fn host_pid(&self) -> Option<u32> {
-        self.shared.ready_host().ok().and_then(|host| host.pid)
+        self.shared
+            .ready_host(HostTier::Plugin)
+            .ok()
+            .and_then(|host| host.pid)
     }
 }
 
@@ -1970,13 +2326,45 @@ pub(crate) fn render_status(manager: &ExtensionHostManager) -> String {
         manager.spawn_attempts(),
         manager.attached_engines()
     );
+    // The built-in host is shown only once something has started it (nothing
+    // does yet); the lists and the shared-process count below are the plugin
+    // host's.
+    match manager.tier_status(HostTier::Builtin) {
+        HostStatus::Idle => {}
+        HostStatus::Ready {
+            pid,
+            runtime,
+            runtime_version,
+            sandbox,
+            memory: _,
+        } => {
+            let _ = write!(
+                out,
+                "\n  built-in host (tier 0): running · pid {} · {runtime} {runtime_version} · {sandbox}",
+                pid.map_or_else(|| "?".to_string(), |pid| pid.to_string()),
+            );
+        }
+        other => {
+            let _ = write!(out, "\n  built-in host (tier 0): {other}");
+        }
+    }
     let (tools, commands, owners) = {
         let registry = manager.shared.registry.lock().expect("registry lock");
         let owners = registry
             .owners()
-            .filter(|entry| entry.state == OwnerState::Active)
+            .filter(|entry| entry.tier == HostTier::Plugin && entry.state == OwnerState::Active)
             .count();
-        (registry.live_tools(), registry.live_commands(), owners)
+        let tools: Vec<_> = registry
+            .live_tools()
+            .into_iter()
+            .filter(|tool| tool.tier == HostTier::Plugin)
+            .collect();
+        let commands: Vec<_> = registry
+            .live_commands()
+            .into_iter()
+            .filter(|command| command.tier == HostTier::Plugin)
+            .collect();
+        (tools, commands, owners)
     };
     if owners > 1 {
         let _ = write!(
@@ -2084,6 +2472,15 @@ pub fn owner_report(plugin_id: &str) -> Option<OwnerReport> {
     manager().owner_report(plugin_id)
 }
 
+/// Where a built-in module's source is expected:
+/// `<bundle dir>/builtin/<module>.mjs`, beside the bundle that was
+/// materialized for this build.
+fn builtin_source_path(root: &Path, module: &BuiltinModule) -> PathBuf {
+    supervisor::bundle_dir(root, bundle_sha256())
+        .join("builtin")
+        .join(format!("{}.mjs", module.id))
+}
+
 /// Reviewed, enabled plugins with `native` entries, keyed by plugin id, read
 /// from Codewhale's immutable staged snapshot. Blocking.
 fn desired_owners(plugins: &PluginRegistry) -> (BTreeMap<String, DesiredOwner>, Vec<String>) {
@@ -2095,6 +2492,18 @@ fn desired_owners(plugins: &PluginRegistry) -> (BTreeMap<String, DesiredOwner>, 
     let mut broken: BTreeSet<String> = BTreeSet::new();
     for source in sources {
         let plugin_id = source.authority.plugin_id.as_str().to_string();
+        // A plugin id can never be a tier-0 owner id. Discovery builds ids as
+        // `<scope>/<hex>/<name>` and a manifest name cannot hold `:`, so this
+        // cannot fire; it is the last check before an id reaches the host.
+        if let Err(reason) = HostTier::Plugin.check_owner_id(&plugin_id) {
+            errors.push(format!(
+                "Plugin `{}` native entry {} was denied: {reason}",
+                source.plugin_name,
+                source.path.display()
+            ));
+            broken.insert(plugin_id);
+            continue;
+        }
         // The rule discovery reports, re-checked on the staged copy: the
         // name here, and file-ness by the read itself.
         let bytes = match crate::plugins::runtime::native_entry_problem(&source.path, true) {

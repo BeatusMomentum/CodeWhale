@@ -5,10 +5,14 @@
 //! mode (which suspends gated calls for approval and refuses ungated calls
 //! before any host call). Four rules are specific to extension tools:
 //!
-//! * **Always `ApprovalRequirement::Required`.** A plugin's own read-only
-//!   hint (`presentCall` `kind: 'read'`, MCP-style annotations) is display
-//!   data at most. Honouring it would let a plugin switch approval off for a
-//!   tool whose body runs arbitrary Node — self-approval.
+//! * **A plugin's tool is always `ApprovalRequirement::Required`.** A plugin's
+//!   own read-only hint (`presentCall` `kind: 'read'`, MCP-style annotations)
+//!   is display data at most. Honouring it would let a plugin switch approval
+//!   off for a tool whose body runs arbitrary Node — self-approval. A tool of
+//!   a built-in module (tier 0, owner `host:<module>`) gets the approval the
+//!   Rust table [`super::tier::BUILTIN_MODULES`] lists for it and nothing the
+//!   module says; unlisted is `Required`. It is still never read-only for
+//!   plan mode.
 //! * **Approval grants are receipt-bound.** Keys are
 //!   `ext:<plugin_id>@<content_hash>:<name>:<hash(input)>` for both the exact
 //!   and the session-grant key ([`ToolSpec::approval_scope`]), so an updated
@@ -32,6 +36,7 @@ use super::ManagerShared;
 use super::protocol::{ContentBlockWire, CoreRequest, ToolCallParams, ToolResultWire};
 use super::registry::ToolRegistration;
 use super::supervisor::HostCallError;
+use super::tier::{self, HostTier};
 use crate::tools::spec::{
     ApprovalRequirement, PreparedToolCall, ToolCapability, ToolContext, ToolError, ToolResult,
     ToolSpec,
@@ -54,10 +59,28 @@ impl HostToolSpec {
         }
     }
 
-    /// `extension:<plugin>`: the origin shown in approval cards and diagnostics.
+    /// `extension:<plugin>` (or the module's owner id, `host:<module>`): the
+    /// origin shown in approval cards and diagnostics.
     #[must_use]
     pub fn origin(&self) -> String {
-        format!("extension:{}", self.registration.plugin_name)
+        match self.registration.tier {
+            HostTier::Plugin => format!("extension:{}", self.registration.plugin_name),
+            HostTier::Builtin => self.registration.owner.plugin_id.clone(),
+        }
+    }
+
+    /// The approval this tool needs: always `Required` for a plugin's tool;
+    /// for a built-in module's, what the Rust table says and `Required` when
+    /// it says nothing.
+    fn approval(&self) -> ApprovalRequirement {
+        match self.registration.tier {
+            HostTier::Plugin => ApprovalRequirement::Required,
+            HostTier::Builtin => tier::tool_approval(
+                self.manager.builtin_modules,
+                &self.registration.owner.plugin_id,
+                &self.registration.name,
+            ),
+        }
     }
 
     /// Check `input` against the schema the plugin registered the tool with.
@@ -80,6 +103,14 @@ impl HostToolSpec {
     /// so the card says when this one is not alone (design §4.4, threat 3).
     #[must_use]
     pub fn approval_text(&self) -> String {
+        if self.registration.tier == HostTier::Builtin {
+            return format!(
+                "Tool `{}` of built-in host module `{}` ({}) runs on Codewhale's built-in extension host",
+                self.registration.name,
+                self.registration.plugin_name,
+                self.origin()
+            );
+        }
         let others = self
             .manager
             .registry
@@ -174,18 +205,19 @@ impl ToolSpec for HostToolSpec {
     }
 
     fn capabilities(&self) -> Vec<ToolCapability> {
-        vec![
-            ToolCapability::ExecutesCode,
-            ToolCapability::RequiresApproval,
-        ]
+        let mut capabilities = vec![ToolCapability::ExecutesCode];
+        if self.approval() != ApprovalRequirement::Auto {
+            capabilities.push(ToolCapability::RequiresApproval);
+        }
+        capabilities
     }
 
     fn approval_requirement(&self) -> ApprovalRequirement {
-        ApprovalRequirement::Required
+        self.approval()
     }
 
     fn approval_requirement_for(&self, _input: &Value) -> ApprovalRequirement {
-        ApprovalRequirement::Required
+        self.approval()
     }
 
     fn is_read_only(&self) -> bool {
@@ -219,7 +251,7 @@ impl ToolSpec for HostToolSpec {
             read_only: false,
             supports_parallel: false,
             starts_detached: false,
-            approval: ApprovalRequirement::Required,
+            approval: self.approval(),
             resources: vec![crate::tools::spec::ResourceClaim::GlobalExclusive],
             input,
         })

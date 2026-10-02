@@ -25,6 +25,7 @@ import {
 import { RpcError, type RpcPeer } from './rpc.ts'
 import { explainImportError } from './dsh/resolve-hooks.ts'
 import { OwnedRegistrations } from './shims/owned.ts'
+import { ownerTier, type HostTier } from './tier.ts'
 import {
   commandSpec,
   defineCommandsService,
@@ -130,7 +131,11 @@ export class HostRoot {
   private readonly toolRegistrations: OwnedRegistrations<OwnerRecord, LocalTool>
   private readonly commandRegistrations: OwnedRegistrations<OwnerRecord, LocalCommand<OwnerRecord>>
 
-  constructor(private readonly rpc: RpcPeer) {
+  constructor(
+    private readonly rpc: RpcPeer,
+    /** The trust tier this process serves; it activates only owners of that tier. */
+    readonly tier: HostTier,
+  ) {
     const root: any = new Context()
     this.root = root
     const host = this
@@ -238,6 +243,15 @@ export class HostRoot {
    * included, are disposed and the owner forgotten (all-or-nothing).
    */
   async activate(params: ActivateParams): Promise<ActivateResult> {
+    // This process serves one tier. An owner of the other tier is refused
+    // outright, before anything of it is read or loaded.
+    const wanted = ownerTier(params.owner.plugin_id)
+    if (wanted !== this.tier) {
+      throw new RpcError(
+        ErrorCode.InvalidParams,
+        `owner ${JSON.stringify(params.owner.plugin_id)} belongs to the ${wanted} tier, but this host serves the ${this.tier} tier`,
+      )
+    }
     const key = params.owner.owner_token
     const existing = this.owners.get(key)
     if (existing) {

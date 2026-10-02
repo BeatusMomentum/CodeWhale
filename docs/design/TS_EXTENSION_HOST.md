@@ -8,6 +8,100 @@
 > from the text that follows. Where they disagree, the newest "As built"
 > section and the code are current; the rest is the plan for later phases.
 
+## As built: trust tiers (2026-10-02)
+
+Slice A1 of the tier plan (CURRENT_DECISIONS §26 D3, §1.5 above): the host is
+now two processes' worth of machinery, one per trust tier, and nothing else
+about it changed. No wire change, no new behaviour for a plugin author. What
+exists:
+
+- **Two tiers** (`extension_host/tier.rs`, `HostTier { Plugin, Builtin }`).
+  *Plugin* hosts reviewed third-party plugins; its owner ids are the plugin ids
+  discovery builds (`<scope>/<12 hex>/<name>`). *Builtin* (tier 0) is for
+  Codewhale's own host code and its owner ids are `host:<module>`. The id
+  spaces cannot meet: `OwnerRegistry::begin_owner` takes the tier and refuses a
+  `host:` id on the plugin tier and any other id on the builtin tier, and an
+  authority that does not fit (a plugin owner needs its reviewed plugin
+  authority, a module has none); every owner entry, tool and command
+  registration records its tier. Discovery cannot produce a `host:` id (a
+  manifest name cannot hold `:`, and an id starts with a scope name), a test
+  shows such a plugin failing validation, and `desired_owners` checks the id
+  once more before it reaches the host.
+- **An empty production table.** `BUILTIN_MODULES` (`BuiltinModule { id,
+  source_sha256, tools: &[Tier0Tool { name, approval }] }`) is empty, so
+  nothing asks for the builtin tier and **it never spawns**; plugins behave
+  exactly as before. "Needed" currently means "has a row". A tier-0 tool's
+  approval comes only from this Rust table (`Auto` or `Required`); an unlisted
+  tool or module is `Required`, and the module's own say changes nothing. It is
+  still never read-only for plan mode. The manager holds the table
+  (`ManagerShared::builtin_modules`, the production const unless a test builds
+  the manager with `with_builtin_modules`), so a test exercises tier 0 without
+  a production row. A module's source is
+  expected at `<bundle dir>/builtin/<module>.mjs` and is activated only if its
+  SHA-256 is the pinned one (otherwise a failed owner with the reason, no host
+  started); nothing materializes such a file yet because there is no module.
+- **Per-tier supervision.** `ManagerShared` holds two `TierRuntime`s (host
+  slot, generation, spawn count, crash and restart state), lazily spawned. The
+  owner registry, the runtime pin, the attachments and plugin settings stay
+  shared, so both hosts run on the same pinned runtime and one registry says
+  which tier an owner is in. A host's exit, restart, heartbeat and dirty
+  teardown touch only its own tier (`OwnerRegistry::host_exited(tier, ..)`).
+  A host answers `registry/*`, `log` and the like only for owners of its own
+  tier. Lock order, restated at `ManagerShared` and kept: `sync_lock`, then one
+  tier's host slot, then that tier's supervision state, then the registry; no
+  path holds both tiers' slots, and the other locks are leaves.
+- **Supervisor.** `plan_launch` and the sandbox plan take a tier. The argv ends
+  `<bundle> --tier=plugin|builtin`. The plugin tier's data directory, working
+  directory and writable root are what they always were,
+  `extension-host/data`, so the per-plugin directories under it
+  (`data/plugins/<name>-<hex>`, unchanged and pinned by a test) keep their
+  data. The builtin tier's is **`extension-host/data-builtin`**, a sibling and
+  not `data/builtin`: a child would lie inside the plugin tier's writable root,
+  and the host sandbox has no per-subpath write deny, so plugin code could
+  then write tier-0 state. The plugin tier's read deny list names the builtin
+  directory explicitly (unit test on the path function). A built-in module's
+  own directory is `data-builtin/modules/<module>`. Under bubblewrap a builtin
+  directory that did not exist when the plugin host started cannot be masked;
+  Seatbelt denies it by name before it exists.
+- **Host.** `--tier=` is parsed before anything else; an unknown value, a bare
+  `--tier` or a tier named twice exits with 64 before `host/hello` (no
+  `--tier` means `plugin`, the least-privileged). `ext/activate` for an owner
+  of the other tier (decided by the `host:` prefix) is refused with
+  `InvalidParams`, before anything is read or loaded. `dist/` was rebuilt.
+- **Drift check.** `build.mjs` builds each `src/builtin/<id>.ts` to
+  `dist/builtin/<id>.mjs` and writes the SHA-256 of each to
+  `dist/builtin-modules.json` (`{"modules": {}}` today); a Rust test
+  (`tier::tests::table_matches_the_host_build`) fails when `BUILTIN_MODULES` and
+  that file disagree in either direction. A module that would bundle a
+  `node_modules` package fails the build until its licence notice is handled.
+- **Activation policy** is untouched: v4 and its pinned digest test pass
+  without change, because tier-0 modules are not plugins and no installed
+  plugin is re-reviewed.
+- **Tests.** Rust: owner/tier refusals and per-tier crash isolation in the
+  registry, a host answering only for its own tier, a `host:`-named manifest
+  failing validation, launch plans (argv, data directories, deny list, the
+  unchanged per-plugin path), the drift test, the table's approval lookup, a
+  tampered or missing module refused with no host started, production never
+  spawning the builtin tier, and (test table) a tier-0 host spawning apart from
+  the plugin host, activating `host:tier0-module`, its tools' approval
+  following the table, a call through it, and a plugin-host crash leaving it
+  alone. JS: refusal of bad `--tier` values, each tier refusing the other's
+  owners, `host:` activation on the builtin tier, and the dist digest file
+  matching `dist/builtin/`.
+
+Not done, and not claimed: any real tier-0 module (the MCP move, §5, is the
+first consumer); `host/hello` reporting a tier or module digests and a
+per-method tier allow-list (slice A2: until then the core cannot tell what
+tier a host believes it serves beyond its argv, and a tier-1 host is not
+refused `proc/*`, `net/*` or `mcp/*` because none of those exist); capability
+tickets (they land with their first redeemer, `core/call`); embedding or
+materializing a module's source; a bundled tier-0 executable (D1); a demand
+predicate that defers the builtin spawn until something needs it; the builtin
+tier's sandbox denying the plugin tier's data directory (it can read it today);
+`/plugin` listing the builtin host's modules and tools beyond one status line;
+tier-0 commands or tools being offered to the model (an engine installs plugin
+owners' tools only).
+
 ## As built: plugin context, several entries, input validation, notices (2026-10-01)
 
 A review of the commands slice found four defects and one gap in what an author

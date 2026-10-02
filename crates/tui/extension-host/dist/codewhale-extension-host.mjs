@@ -4647,6 +4647,26 @@ var OwnedRegistrations = class {
   }
 };
 
+// src/tier.ts
+var HOST_OWNER_PREFIX = "host:";
+var TIERS = ["plugin", "builtin"];
+function parseTier(argv) {
+  let found;
+  for (const arg of argv) {
+    if (arg !== "--tier" && !arg.startsWith("--tier=")) continue;
+    const value = arg.startsWith("--tier=") ? arg.slice("--tier=".length) : "";
+    if (!TIERS.includes(value)) {
+      throw new Error(`unknown host tier ${JSON.stringify(value)} (expected --tier=plugin or --tier=builtin)`);
+    }
+    if (found !== void 0) throw new Error("the host tier was given more than once");
+    found = value;
+  }
+  return found ?? "plugin";
+}
+function ownerTier(ownerId) {
+  return ownerId.startsWith(HOST_OWNER_PREFIX) ? "builtin" : "plugin";
+}
+
 // src/shims/commands.ts
 var COMMAND_NAME = /^[a-z][a-z0-9_-]*$/u;
 var NO_ATTACHMENTS = Object.freeze([]);
@@ -4793,8 +4813,9 @@ function isJson(value, depth = 0) {
   }
 }
 var HostRoot = class {
-  constructor(rpc2) {
+  constructor(rpc2, tier) {
     this.rpc = rpc2;
+    this.tier = tier;
     const root = new Context();
     this.root = root;
     const host2 = this;
@@ -4858,6 +4879,7 @@ var HostRoot = class {
     root.plugin(CommandsShim);
   }
   rpc;
+  tier;
   root;
   owners = /* @__PURE__ */ new Map();
   toolRegistrations;
@@ -4890,6 +4912,13 @@ var HostRoot = class {
    * included, are disposed and the owner forgotten (all-or-nothing).
    */
   async activate(params) {
+    const wanted = ownerTier(params.owner.plugin_id);
+    if (wanted !== this.tier) {
+      throw new RpcError(
+        ErrorCode.InvalidParams,
+        `owner ${JSON.stringify(params.owner.plugin_id)} belongs to the ${wanted} tier, but this host serves the ${this.tier} tier`
+      );
+    }
     const key = params.owner.owner_token;
     const existing = this.owners.get(key);
     if (existing) {
@@ -5096,6 +5125,15 @@ function pendingFibers(fiber) {
 
 // src/main.ts
 var HOST_VERSION = "0.1.0";
+var TIER = (() => {
+  try {
+    return parseTier(process.argv.slice(2));
+  } catch (error) {
+    process.stderr.write(`codewhale-extension-host: ${error.message}
+`);
+    return process.exit(64);
+  }
+})();
 var MEMORY_LIMIT_MIB = applyMemoryLimit();
 var channelWrite = process.stdout.write.bind(process.stdout);
 var stderrWrite = process.stderr.write.bind(process.stderr);
@@ -5156,7 +5194,7 @@ function shutdownNow(code) {
 var rpc = new RpcPeer((message) => {
   channelWrite(encodeFrame(message));
 });
-var host = new HostRoot(rpc);
+var host = new HostRoot(rpc, TIER);
 var initialized = false;
 rpc.onRequest("host/initialize", (params) => {
   if (params.protocol !== PROTOCOL_VERSION) {

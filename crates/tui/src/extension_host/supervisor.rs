@@ -4,13 +4,20 @@
 //! The existing Rust manager owns heartbeat, crash budget, generation changes,
 //! and receipt-checked replay; this channel never replays a tool call.
 //!
+//! **Tiers** ([`HostTier`]). The host is two processes, one per trust tier,
+//! started from the same bundle with `--tier=plugin|builtin` as the last
+//! argument. Each has its own data directory ([`tier_data_dir`]) and its own
+//! sandbox plan; the plugin tier's also denies reads of the builtin tier's
+//! data directory ([`host_denied_read_paths`]). Only the plugin tier starts
+//! in production today.
+//!
 //! **OS sandbox** ([`HostSandbox`]: the one value `/plugin`, doctor and the
 //! start diagnostic report). The host runs under Codewhale's command sandbox
-//! with a workspace-write policy rooted at
-//! `$CODEWHALE_HOME/extension-host/data`: no direct network, writes only
-//! there and in the temp dirs, and **no reads** of the Codewhale homes
-//! (everything but the bundle, its data dir and plugin code), the Codex and
-//! DSH credential homes, and the credential-store default deny-list
+//! with a workspace-write policy rooted at its tier's data directory (the
+//! plugin tier's is `$CODEWHALE_HOME/extension-host/data`): no direct network,
+//! writes only there and in the temp dirs, and **no reads** of the Codewhale
+//! homes (everything but the bundle, its data dir and plugin code), the Codex
+//! and DSH credential homes, and the credential-store default deny-list
 //! (`sandbox::read_guard`). Other user-readable files stay readable —
 //! including `.env` files, whose filename rule has no Seatbelt subpath or
 //! bubblewrap mount form — so this is defense-in-depth, not a containment
@@ -93,6 +100,7 @@ use super::protocol::{
     self, CoreRequest, HostLimits, HostMessage, HostNotification, HostRequest, InitializeParams,
     RegisterResult, error_code,
 };
+use super::tier::HostTier;
 
 /// Budget for spawn → `host/hello` → `host/initialize` → `host/ready`.
 ///
@@ -138,6 +146,8 @@ pub enum HostCallError {
 /// available), its working directory, and which sandbox applies.
 #[derive(Debug, Clone)]
 pub(crate) struct HostLaunch {
+    /// The trust tier this host process serves (`--tier=` in its argv).
+    pub tier: HostTier,
     pub program: PathBuf,
     pub args: Vec<String>,
     pub cwd: PathBuf,
@@ -371,7 +381,14 @@ const HOST_DENIED_HOME_ENTRIES: &[&str] = &[
 /// is denied whole and its readable entries come back as exceptions to bind
 /// again. Without it (Seatbelt, which matches paths that do not exist yet)
 /// every other entry is denied by name and there are no exceptions.
+///
+/// The plugin tier also denies the builtin tier's data directory, which lies
+/// inside the readable `extension-host/` entry: plugin code never reads
+/// tier-0 state. (Under bubblewrap a directory that does not exist when the
+/// plugin host starts cannot be masked, so tier-0 state created later is
+/// visible to a plugin host that was already running.)
 pub(crate) fn host_denied_read_paths(
+    tier: HostTier,
     home: &Path,
     whole_homes: bool,
 ) -> (Vec<PathBuf>, Vec<PathBuf>) {
@@ -390,12 +407,19 @@ pub(crate) fn host_denied_read_paths(
         roots.push(user.join(".deepseek"));
     }
     for root in roots {
+        // The builtin tier's data directory, inside the readable
+        // `extension-host/` entry of every Codewhale home: not for plugin code.
+        let tier_zero_data =
+            (tier == HostTier::Plugin).then(|| tier_data_dir(&root, HostTier::Builtin));
         if whole_homes {
             for entry in HOST_READABLE_HOME_ENTRIES {
                 let readable = root.join(entry);
                 if !exceptions.contains(&readable) {
                     exceptions.push(readable);
                 }
+            }
+            if let Some(dir) = tier_zero_data {
+                push(dir);
             }
             push(root);
             continue;
@@ -416,6 +440,12 @@ pub(crate) fn host_denied_read_paths(
         // exist yet cannot be canonicalized later, so deny it under both the
         // given and the resolved spelling of its (existing) root.
         let resolved = std::fs::canonicalize(&root).ok();
+        if let Some(dir) = tier_zero_data {
+            if let Some(resolved) = &resolved {
+                push(tier_data_dir(resolved, HostTier::Builtin));
+            }
+            push(dir);
+        }
         for name in names {
             let readable = name
                 .to_str()
@@ -443,32 +473,75 @@ pub(crate) fn host_denied_read_paths(
     (paths, exceptions)
 }
 
-/// Plan the host launch. Blocking (creates the data dir, canonicalizes the
-/// deny-list, and on Linux runs the bwrap probe); call from `spawn_blocking`.
+/// Plan the host launch for `tier`: the runtime's flags, the bundle, then the
+/// tier (`--tier=plugin|builtin`, which the host reads from its own argv).
+/// Blocking (creates the tier's data dir, canonicalizes the deny-list, and on
+/// Linux runs the bwrap probe); call from `spawn_blocking`.
 pub(crate) fn plan_launch(
+    tier: HostTier,
     runtime: &HostRuntime,
     bundle: &Path,
     home: &Path,
     memory_cap: u64,
 ) -> Result<HostLaunch, String> {
-    let data = host_data_dir(home)?;
+    let data = host_data_dir(home, tier)?;
     let mut args = runtime_args(runtime);
     args.push(bundle.to_string_lossy().into_owned());
-    let wrapped = wrap_host(&runtime.path, &args, &data, home);
-    host_launch(runtime, args, data, memory_cap, wrapped)
+    args.push(tier.argv_flag());
+    let wrapped = wrap_host(tier, &runtime.path, &args, &data, home);
+    host_launch(tier, runtime, args, data, memory_cap, wrapped)
 }
 
-/// The sandbox a host started now would get, planned (and on Linux probed)
-/// exactly as [`plan_launch`] does, for doctor. Blocking; creates the data
-/// dir, as a launch would.
-pub(crate) fn planned_sandbox(runtime: &HostRuntime, home: &Path) -> Result<HostSandbox, String> {
-    let data = host_data_dir(home)?;
+/// The sandbox a `tier` host started now would get, planned (and on Linux
+/// probed) exactly as [`plan_launch`] does, for doctor. Blocking; creates the
+/// data dir, as a launch would.
+pub(crate) fn planned_sandbox(
+    tier: HostTier,
+    runtime: &HostRuntime,
+    home: &Path,
+) -> Result<HostSandbox, String> {
+    let data = host_data_dir(home, tier)?;
     Ok(
-        match wrap_host(&runtime.path, &runtime_args(runtime), &data, home) {
+        match wrap_host(tier, &runtime.path, &runtime_args(runtime), &data, home) {
             Ok(wrapped) => HostSandbox::Wrapped(wrapped.name),
             Err(reason) => HostSandbox::Unsandboxed(reason),
         },
     )
+}
+
+/// A tier's data directory: its host's working directory and, under the OS
+/// sandbox, its only writable root. Pure.
+///
+/// The plugin tier keeps the directory it has always had,
+/// `extension-host/data`, because the per-plugin directories under it
+/// ([`plugin_data_dir`]) hold installed plugins' data and moving it would lose
+/// that. The builtin tier's is a sibling, `extension-host/data-builtin`, not a
+/// child: a child would lie inside the plugin tier's writable root, and the
+/// host sandbox has no per-subpath write deny, so plugin code could then write
+/// tier-0 state.
+pub(crate) fn tier_data_dir(home: &Path, tier: HostTier) -> PathBuf {
+    let base = home.join("extension-host");
+    match tier {
+        HostTier::Plugin => base.join("data"),
+        HostTier::Builtin => base.join("data-builtin"),
+    }
+}
+
+/// The directory an owner's code is given as its own: a plugin's
+/// ([`plugin_data_dir`], unchanged), or `modules/<module>` under the builtin
+/// tier's data directory for a built-in module (`plugin_name` is the module
+/// name, which [`HostTier::check_owner_id`] has restricted to a plain name).
+/// Pure.
+pub(crate) fn owner_data_dir(
+    home: &Path,
+    tier: HostTier,
+    plugin_id: &str,
+    plugin_name: &str,
+) -> PathBuf {
+    match tier {
+        HostTier::Plugin => plugin_data_dir(home, plugin_id, plugin_name),
+        HostTier::Builtin => tier_data_dir(home, tier).join("modules").join(plugin_name),
+    }
 }
 
 /// One plugin's own directory inside the host's data dir, which is the host
@@ -501,8 +574,8 @@ pub(crate) fn plugin_data_dir(home: &Path, plugin_id: &str, plugin_name: &str) -
         .join(format!("{name}-{short}"))
 }
 
-fn host_data_dir(home: &Path) -> Result<PathBuf, String> {
-    let data = home.join("extension-host").join("data");
+fn host_data_dir(home: &Path, tier: HostTier) -> Result<PathBuf, String> {
+    let data = tier_data_dir(home, tier);
     std::fs::create_dir_all(&data)
         .map_err(|error| format!("cannot create {}: {error}", data.display()))?;
     Ok(data)
@@ -524,7 +597,13 @@ const WINDOWS_UNSANDBOXED: &str = "Windows has no host sandbox yet; its Job Obje
 
 /// Wrap `program args` in the host's OS sandbox (module docs), or say why it
 /// has none here. Blocking.
-fn wrap_host(program: &Path, args: &[String], data: &Path, home: &Path) -> Result<Wrapped, String> {
+fn wrap_host(
+    tier: HostTier,
+    program: &Path,
+    args: &[String],
+    data: &Path,
+    home: &Path,
+) -> Result<Wrapped, String> {
     use crate::sandbox::{CommandSpec, SandboxManager, SandboxPolicy, SandboxType};
     if cfg!(windows) {
         return Err(WINDOWS_UNSANDBOXED.to_string());
@@ -545,7 +624,7 @@ fn wrap_host(program: &Path, args: &[String], data: &Path, home: &Path) -> Resul
     };
     let bwrap = cfg!(all(target_os = "linux", not(target_env = "ohos")));
     let mut manager = SandboxManager::with_bwrap_preference(bwrap);
-    let (denied, exceptions) = host_denied_read_paths(home, bwrap);
+    let (denied, exceptions) = host_denied_read_paths(tier, home, bwrap);
     manager.set_denied_read_subpaths(denied);
     manager.set_denied_read_exceptions(exceptions);
     let env = manager.prepare(&spec(args.to_vec()));
@@ -571,6 +650,7 @@ fn wrap_host(program: &Path, args: &[String], data: &Path, home: &Path) -> Resul
 /// The launch for a [`wrap_host`] outcome: the wrapper's argv, or the
 /// runtime itself, unsandboxed, carrying the reason `/plugin` shows. Pure.
 fn host_launch(
+    tier: HostTier,
     runtime: &HostRuntime,
     args: Vec<String>,
     data: PathBuf,
@@ -598,6 +678,7 @@ fn host_launch(
         ),
     };
     Ok(HostLaunch {
+        tier,
         program,
         args,
         cwd: data,
@@ -813,6 +894,8 @@ struct Handshake {
 }
 
 pub(crate) struct HostProcess {
+    /// The tier this process was launched for.
+    pub tier: HostTier,
     pub pid: Option<u32>,
     /// The runtime the Rust side launched; `host/hello` must agree.
     pub runtime: HostRuntime,
@@ -1055,6 +1138,7 @@ impl HostProcess {
         }
 
         let host = Arc::new(Self {
+            tier: launch.tier,
             pid,
             runtime: launch.runtime.clone(),
             runtime_version: std::sync::OnceLock::new(),
@@ -1534,6 +1618,7 @@ mod tests {
             "{refused}"
         );
         let launch = host_launch(
+            HostTier::Plugin,
             &runtime,
             args.clone(),
             data.clone(),
@@ -1570,6 +1655,7 @@ mod tests {
             .chain(args.iter().cloned())
             .collect();
         let launch = host_launch(
+            HostTier::Plugin,
             &runtime,
             args.clone(),
             data.clone(),
@@ -1598,6 +1684,59 @@ mod tests {
         );
     }
 
+    /// Each tier has its own data directory, and neither is inside the other:
+    /// the data directory is the host's only writable root, so a nested
+    /// builtin directory would be writable by plugin code. The plugin tier
+    /// keeps the path it has always had, and the plugin tier's sandbox denies
+    /// reads of the builtin tier's directory.
+    #[test]
+    fn each_tier_has_its_own_data_directory_and_the_plugin_tier_cannot_read_the_builtin_one() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        std::fs::create_dir_all(tier_data_dir(&home, HostTier::Builtin)).unwrap();
+        let plugin = tier_data_dir(&home, HostTier::Plugin);
+        let builtin = tier_data_dir(&home, HostTier::Builtin);
+        assert_ne!(plugin, builtin);
+        assert!(!builtin.starts_with(&plugin) && !plugin.starts_with(&builtin));
+        assert_eq!(plugin, home.join("extension-host").join("data"));
+
+        for whole_homes in [false, true] {
+            let (denied, _) = host_denied_read_paths(HostTier::Plugin, &home, whole_homes);
+            assert!(
+                denied.contains(&builtin),
+                "plugin tier (whole_homes {whole_homes}) must deny {}",
+                builtin.display()
+            );
+            assert!(!denied.contains(&plugin));
+            let (denied, _) = host_denied_read_paths(HostTier::Builtin, &home, whole_homes);
+            assert!(
+                !denied.contains(&builtin),
+                "the builtin tier reads its own directory"
+            );
+        }
+    }
+
+    /// The per-plugin directory plugin config and context introduced keeps its
+    /// path, so an installed plugin's data survives the tier split; a built-in
+    /// module's is under the builtin tier's directory.
+    #[test]
+    fn the_per_plugin_data_directory_keeps_its_path() {
+        let home = PathBuf::from("/home/u/.codewhale");
+        let id = "user/0123456789ab/demo";
+        assert_eq!(
+            plugin_data_dir(&home, id, "demo"),
+            home.join("extension-host/data/plugins/demo-e9f63c6f1a7f")
+        );
+        assert_eq!(
+            owner_data_dir(&home, HostTier::Plugin, id, "demo"),
+            plugin_data_dir(&home, id, "demo")
+        );
+        assert_eq!(
+            owner_data_dir(&home, HostTier::Builtin, "host:mcp", "mcp"),
+            home.join("extension-host/data-builtin/modules/mcp")
+        );
+    }
+
     /// bubblewrap can mask only what exists, so under it each Codewhale home
     /// is denied whole (an entry created later is then denied too) and its
     /// readable entries come back as exceptions; Seatbelt's form is unchanged.
@@ -1608,7 +1747,7 @@ mod tests {
         std::fs::create_dir_all(home.join("extension-host")).unwrap();
         std::fs::write(home.join("config.toml.bak-1"), "").unwrap();
 
-        let (seatbelt, none) = host_denied_read_paths(&home, false);
+        let (seatbelt, none) = host_denied_read_paths(HostTier::Plugin, &home, false);
         assert!(none.is_empty());
         assert!(seatbelt.contains(&home.join("config.toml.bak-1")));
         assert!(
@@ -1618,7 +1757,7 @@ mod tests {
         assert!(!seatbelt.contains(&home));
         assert!(!seatbelt.contains(&home.join("extension-host")));
 
-        let (bwrap, exceptions) = host_denied_read_paths(&home, true);
+        let (bwrap, exceptions) = host_denied_read_paths(HostTier::Plugin, &home, true);
         assert!(bwrap.contains(&home));
         assert!(!bwrap.contains(&home.join("config.toml.bak-1")));
         for entry in HOST_READABLE_HOME_ENTRIES {
