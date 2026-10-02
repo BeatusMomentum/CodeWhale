@@ -83,7 +83,7 @@ pub(crate) enum RouteShape {
     KimiCodeK3,
     /// The exact pay-as-you-go Moonshot K3 route (fixed sampling).
     DirectMoonshotK3,
-    /// The ChatGPT backend Responses path used by the Codex provider.
+    /// The ChatGPT plan Responses path; identifier retained for saved receipts.
     CodexResponses,
     /// OpenCode Zen, whose model route re-resolves the wire model per request.
     OpencodeZen,
@@ -553,7 +553,20 @@ impl<'a> WireBodyView<'a> {
             let canonical_tools = canonical_json(tools);
             view.tool_schema_bytes = canonical_tools.len();
             view.tool_schema_sha256 = crate::hashing::sha256_hex(canonical_tools.as_bytes());
-            view.tool_count = tools.as_array().map(Vec::len).unwrap_or(0);
+            view.tool_count = tools.as_array().map_or(0, |tools| {
+                tools
+                    .iter()
+                    .map(|tool| {
+                        if tool.get("type").and_then(Value::as_str) == Some("namespace") {
+                            tool.get("tools")
+                                .and_then(Value::as_array)
+                                .map_or(0, Vec::len)
+                        } else {
+                            1
+                        }
+                    })
+                    .sum()
+            });
         }
 
         if let Some(items_value) = object.get(items_key) {
@@ -1569,16 +1582,20 @@ mod dialect_seam_tests {
         }
     }
 
-    /// Codex resolves its bearer through OAuth, so the test pins a token the
-    /// same way the Responses adapter's own tests do.
+    /// The official plan route requires Codewhale's own protected grant.
     fn codex_client() -> CodewhaleClient {
         let _env_lock = crate::test_support::lock_test_env();
-        let _codex_token =
-            crate::test_support::EnvVarGuard::set("OPENAI_CODEX_ACCESS_TOKEN", "test-token");
-        let _legacy_codex_token = crate::test_support::EnvVarGuard::remove("CODEX_ACCESS_TOKEN");
-        client("openai-codex", |providers| {
-            providers.openai_codex = configured("", None, "gpt-5-codex");
-        })
+        let home = tempfile::tempdir().expect("isolated ChatGPT credential home");
+        let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", home.path());
+        let mut config = Config {
+            provider: Some("openai-codex".to_string()),
+            ..Config::default()
+        };
+        config
+            .provider_config_for_mut(ApiProvider::OpenaiCodex)
+            .model = Some("gpt-5-codex".into());
+        crate::oauth::install_test_chatgpt_registration(&mut config).expect("official test grant");
+        CodewhaleClient::new(&config).expect("official ChatGPT client")
     }
 
     #[test]
@@ -1590,6 +1607,18 @@ mod dialect_seam_tests {
 
         assert_eq!(prepared.dialect, WireDialect::OpenAiResponses);
         assert_eq!(prepared.endpoint.shape, RouteShape::CodexResponses);
+        assert_eq!(prepared.endpoint.url, "https://api.openai.com/v1/responses");
+        assert_eq!(prepared.body["tools"][0]["type"], "namespace");
+        assert_eq!(prepared.body["tools"][0]["name"], "codewhale");
+        assert_eq!(
+            prepared.body["tools"][0]["tools"].as_array().unwrap().len(),
+            2
+        );
+        assert_eq!(
+            prepared.wire_view().tool_count,
+            2,
+            "namespace wrappers are not executable tools"
+        );
 
         let reference = super::super::responses::build_responses_body(&preprocessed(
             &client,
