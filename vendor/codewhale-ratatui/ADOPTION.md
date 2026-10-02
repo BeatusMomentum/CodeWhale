@@ -21,3 +21,11 @@ remain independent without modifying pinned source. Mounted composer,
 dock, transcript, pending input,
 ocean and character remain in the Engine until their keyboard, mouse,
 localization and layout contracts can move together.
+
+The Ocean compatibility slice adopts the complete ramp/column pure
+sampling facade with explicit live colors, retaining the Engine's monotonic
+clocks, life-presence policy and actual-ramp cache identity. Host semantic
+finishing still follows the current ColorCompatBackend policy. This is not
+yet adoption of the kit's guarded apply/apply_matching path: its known-dark
+truecolor-only gate and refusal of unreadable or unknown foregrounds require
+explicit reconciliation with current host painting before that move.
