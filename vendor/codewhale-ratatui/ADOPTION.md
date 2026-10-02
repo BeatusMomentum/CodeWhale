@@ -33,6 +33,22 @@ PendingCard routes the complete composer pending-input facade through the
 kit's measured row plan, shared with its existing generic PendingInputPreview.
 Engine-owned queue/context/child-request facts, localized copy, exact palette
 styles and terminal backend remain authoritative. The host compositor/wrapping
-helpers are deleted; ApprovalWidget and decision settlement remain outside
-this slice. The existing context action suffixes retain their current English
+helpers are deleted; decision settlement remains outside this rendering slice. The existing context action suffixes retain their current English
 copy; other native card labels use the Engine localization catalogue.
+
+DecisionBand adopts the complete bottom-anchored ApprovalWidget paint and
+geometry through one kit plan: wrapped controls, full/compact validated rule
+coverage, persistent-action visibility, body truncation and option-order
+mouse rectangles. The host band compositor and save-preview fitting are
+deleted. The existing ElevationWidget row measurements also use the kit's
+shared Ratatui wrapping helper. Engine request facts, badges, dossier/command
+preview formatting, localization, exact palette styles and keyboard/mouse
+decisions remain authoritative. Default Enter and timeout still deny; parent
+Escape aborts, child Escape hides, and modified/non-press keys cannot grant.
+Persistent keys and mouse targets follow the last painted save coverage;
+collapsed and empty frames retain canonical empty slots and withdraw stale
+geometry. Every styled span and rule-coverage string is display-safe before
+measurement and painting. The generic bordered ApprovalCard keeps
+its separate verbatim-subject/input contract, and the native band does not
+claim its invisible-token encoding. Mounted composer, ElevationWidget painting
+and transcript are still outside this slice.
