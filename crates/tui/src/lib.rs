@@ -8851,30 +8851,9 @@ async fn plugin_auth_entry_from_cli(
     tokio::task::spawn_blocking(move || {
         let _scope = crate::plugins::activation::PolicyScope::propagate(policy);
         let config = load_config_with_cli_preferences(path, profile.as_deref(), &features)?;
-        plugin_auth_entry(&config, &provider)
+        crate::plugins::providers::plugin_auth_entry(&config, &provider)
     })
     .await?
-}
-
-fn plugin_auth_entry(config: &Config, provider: &str) -> Result<crate::config::ProviderConfig> {
-    let mut entry = config
-        .providers
-        .as_ref()
-        .and_then(|providers| providers.custom_provider_config(provider))
-        .ok_or_else(|| anyhow!("No enabled plugin contributes provider `{provider}`"))?
-        .clone();
-    entry
-        .plugin_authority
-        .as_ref()
-        .ok_or_else(|| anyhow!("Provider `{provider}` is not contributed by a reviewed plugin"))?;
-    if entry.base_url.is_none() || entry.oauth.is_none() {
-        return Err(anyhow!("Plugin provider has no OAuth route"));
-    }
-    // Login, logout, readiness and inference must address the same normalized
-    // route, even when a declaration includes a trailing slash.
-    entry.base_url =
-        Some(config.base_url_for_route_identity(crate::config::ApiProvider::Custom, provider));
-    Ok(entry)
 }
 
 fn load_config_from_cli(cli: &Cli) -> Result<Config> {

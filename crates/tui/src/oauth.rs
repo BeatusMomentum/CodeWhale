@@ -6293,7 +6293,11 @@ mod plugin_oauth_tests {
                     ("X-Unreviewed".into(), "ambient-global".into()),
                 ])), ..Config::default() };
                 crate::plugins::providers::apply_providers(&mut live, &registry).unwrap();
-                let auth_entry = crate::plugin_auth_entry(&live, "fixture-gateway").unwrap();
+                let auth_entry = crate::plugins::providers::plugin_auth_entry(
+                    &live,
+                    "fixture-gateway",
+                )
+                .unwrap();
                 let base_url = auth_entry.base_url.unwrap();
                 assert_eq!(base_url, format!("{issuer}/v1"));
                 assert_eq!(base_url, live.base_url_for_route_identity(crate::config::ApiProvider::Custom, "fixture-gateway"));

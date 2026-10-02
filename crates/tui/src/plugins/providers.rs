@@ -170,6 +170,25 @@ pub fn apply_startup_providers(config: &mut Config) -> anyhow::Result<()> {
     Ok(())
 }
 
+pub(crate) fn plugin_auth_entry(config: &Config, provider: &str) -> anyhow::Result<ProviderConfig> {
+    let mut entry = config
+        .providers
+        .as_ref()
+        .and_then(|providers| providers.custom_provider_config(provider))
+        .ok_or_else(|| anyhow::anyhow!("No enabled plugin contributes provider `{provider}`"))?
+        .clone();
+    entry.plugin_authority.as_ref().ok_or_else(|| {
+        anyhow::anyhow!("Provider `{provider}` is not contributed by a reviewed plugin")
+    })?;
+    if entry.base_url.is_none() || entry.oauth.is_none() {
+        return Err(anyhow::anyhow!("Plugin provider has no OAuth route"));
+    }
+    // Login, logout, readiness and inference must address the same normalized
+    // route, even when a declaration includes a trailing slash.
+    entry.base_url = Some(config.base_url_for_route_identity(ApiProvider::Custom, provider));
+    Ok(entry)
+}
+
 /// Bind an effective route to the exact reviewed declaration, not merely to
 /// a still-valid receipt. Call this on a blocking worker at the use boundary.
 /// `None` skips public-header comparison for login/logout; inference must pass
