@@ -1,6 +1,6 @@
 {
   "repository": "https://github.com/Hmbown/codewhale-ratatui",
-  "commit": "9328ea9441bab6411625da718bf5f36779e677cc",
+  "commit": "5088b61834e78f4abddf2de7fa42fc210f7e4a21",
   "version": "0.1.0",
   "license": "MIT",
   "files": {
@@ -45,7 +45,7 @@
     "src/components/list.rs": "95f34d857fa97da872b3221db507af1a9eedb1da5fb47b0b3d82b7a7e704c4aa",
     "src/components/mod.rs": "c543ac683f04ca5ec15ba6dc7e18320b1221ef06df54ee749c73a8ea8eefc26e",
     "src/components/motion.rs": "596a03b8f9e8a5667ad42b146c05949e2369ce61250bf992ce6842dd10064af2",
-    "src/components/native_chrome.rs": "2bbc71678586a34d4ed0003dc547edbe73a234e213119f27d99405c32b4be3b2",
+    "src/components/native_chrome.rs": "5b5dfb2352cf004d174575284138aa8dd0b3dcf0e9cdb523ebab44d327e8bbfb",
     "src/components/pending_input.rs": "5f14b41d937fac375f8de8adc973d8bc878a78789fbdf9a5fa7e7468c07d6e37",
     "src/components/picker.rs": "a24221805f46a2fb9f29363d08f0714d5c9d98996614eebb000c27e689c017b0",
     "src/components/posture.rs": "a86664c80fcbadfe4680b4aee9b25672f86e1d3b790a9f03d8962a155bb8cff7",
