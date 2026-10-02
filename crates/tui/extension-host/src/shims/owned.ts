@@ -40,13 +40,23 @@ export class OwnedRegistrations<O extends OwnerBase, T extends OwnedEntry<O>> {
   /** Admitted entries by core handle. */
   readonly byHandle = new Map<number, T>()
 
+  private readonly rpc: RpcPeer
+  private readonly kind: 'tool' | 'command' | 'hook' | 'prompt_section' | 'skill_root'
+  /** The owner's own index of this kind, for the leak report at deactivation. */
+  private readonly ownedBy: (owner: O) => Map<number, T>
+  private readonly warn: (message: string, owner: O) => void
+
   constructor(
-    private readonly rpc: RpcPeer,
-    private readonly kind: 'tool' | 'command' | 'hook' | 'prompt_section',
-    /** The owner's own index of this kind, for the leak report at deactivation. */
-    private readonly ownedBy: (owner: O) => Map<number, T>,
-    private readonly warn: (message: string, owner: O) => void,
-  ) {}
+    rpc: RpcPeer,
+    kind: 'tool' | 'command' | 'hook' | 'prompt_section' | 'skill_root',
+    ownedBy: (owner: O) => Map<number, T>,
+    warn: (message: string, owner: O) => void,
+  ) {
+    this.rpc = rpc
+    this.kind = kind
+    this.ownedBy = ownedBy
+    this.warn = warn
+  }
 
   /** Called inside the owner's effect; returns the effect's cleanup. */
   add(entry: T, spec: RegisterSpec): () => void {

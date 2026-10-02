@@ -159,7 +159,7 @@ export const SHAPES: { readonly [name: string]: Shape } = {
   },
   RegisterParams: {
     strict: true,
-    required: { owner: { ref: 'OwnerRef' }, kind: { enum: ['tool', 'command', 'hook', 'prompt_section'] }, spec: { ref: 'RegisterSpecWire' } },
+    required: { owner: { ref: 'OwnerRef' }, kind: { enum: ['tool', 'command', 'hook', 'prompt_section', 'skill_root'] }, spec: { ref: 'RegisterSpecWire' } },
     optional: {},
   },
   RegisterSpecWire: {
@@ -312,7 +312,7 @@ export interface ProtocolRange {
   max: number
 }
 
-export type RegisterKind = 'tool' | 'command' | 'hook' | 'prompt_section'
+export type RegisterKind = 'tool' | 'command' | 'hook' | 'prompt_section' | 'skill_root'
 
 export interface RegisterParams {
   owner: OwnerRef

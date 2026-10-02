@@ -32,6 +32,7 @@ import { OwnedRegistrations } from './shims/owned.ts'
 import { hookExecution, hookVerdict, type LocalHook } from './shims/hooks.ts'
 import { PromptSections, definePromptService, type LocalPromptSection } from './shims/prompt.ts'
 import { createStorage, type PluginStorage } from './shims/storage.ts'
+import { SkillRoots, defineSkillsService, type LocalSkillRoot } from './shims/skills.ts'
 import { ownerTier, type HostTier } from './tier.ts'
 import {
   commandSpec,
@@ -70,7 +71,7 @@ export const REFUSED_SERVICES = new Set([
 ])
 
 /** Services the root provides; `inject` of anything else fails activation. */
-const PROVIDED_SERVICES = new Set(['tools', 'commands', 'prompt', 'storage', 'logger', 'events', 'reflect', 'registry'])
+const PROVIDED_SERVICES = new Set(['tools', 'commands', 'prompt', 'storage', 'skills', 'logger', 'events', 'reflect', 'registry'])
 
 const ACTIVATE_DEADLINE_MS = 5_000
 const DISPOSE_DEADLINE_MS = 2_000
@@ -86,6 +87,7 @@ export interface OwnerRecord {
   commands: Map<number, LocalCommand<OwnerRecord>>
   hooks: Map<number, LocalHook<OwnerRecord>>
   promptSections: Map<number, LocalPromptSection<OwnerRecord>>
+  skillRoots: Map<number, LocalSkillRoot<OwnerRecord>>
   storage?: PluginStorage
   warnedAllow?: boolean
   /** Entry modules activated under this owner so far (a plugin may declare several). */
@@ -127,6 +129,7 @@ export class HostRoot {
   private readonly commandRegistrations: OwnedRegistrations<OwnerRecord, LocalCommand<OwnerRecord>>
   private readonly hookRegistrations: OwnedRegistrations<OwnerRecord, LocalHook<OwnerRecord>>
   private readonly promptSections: PromptSections<OwnerRecord>
+  private readonly skillRoots: SkillRoots<OwnerRecord>
 
   constructor(
     private readonly rpc: RpcPeer,
@@ -151,6 +154,8 @@ export class HostRoot {
     this.hookRegistrations = new OwnedRegistrations(rpc, 'hook', (owner) => owner.hooks,
       (message, owner) => this.log('warn', message, owner))
     this.promptSections = new PromptSections(rpc, (owner) => owner.promptSections,
+      (message, owner) => this.log('warn', message, owner))
+    this.skillRoots = new SkillRoots(rpc, (owner) => owner.skillRoots,
       (message, owner) => this.log('warn', message, owner))
 
     // Cordis already owns listener effects and teardown. Intercept this one
@@ -224,6 +229,7 @@ export class HostRoot {
       ownerOf: (ctx) => ctx[OWNER],
       promptSections: this.promptSections,
     })
+    const SkillsShim = defineSkillsService<OwnerRecord>({ ownerOf: (ctx) => ctx[OWNER], skillRoots: this.skillRoots })
     class StorageShim extends Service {
       constructor(ctx: any) { super(ctx, 'storage') }
       private api(): PluginStorage {
@@ -244,10 +250,12 @@ export class HostRoot {
     shimClasses.set('commands', CommandsShim)
     shimClasses.set('prompt', PromptShim)
     shimClasses.set('storage', StorageShim)
+    shimClasses.set('skills', SkillsShim)
     root.plugin(ToolsShim)
     root.plugin(CommandsShim)
     root.plugin(PromptShim)
     root.plugin(StorageShim)
+    root.plugin(SkillsShim)
   }
 
   log(level: string, msg: string, owner?: OwnerRecord) {
@@ -312,6 +320,7 @@ export class HostRoot {
       commands: new Map(),
       hooks: new Map(),
       promptSections: new Map(),
+      skillRoots: new Map(),
       entries: new Set(),
       ...(params.data_dir === undefined ? {} : { dataDir: params.data_dir }),
       state: 'activating',
@@ -354,6 +363,7 @@ export class HostRoot {
       owner.state = 'failed'
       // All-or-nothing: dispose the partial fiber, rolling back every registration.
       await this.disposeOwner(owner).catch(() => undefined)
+      this.skillRoots.forget(owner)
       this.owners.delete(key)
       return { status: 'failed', diagnostic: describeError(error) }
     }
@@ -385,6 +395,7 @@ export class HostRoot {
       ...[...owner.commands.values()].map((command) => `command:${command.name}`),
       ...[...owner.hooks.values()].map((hook) => `hook:${hook.name}`),
       ...[...owner.promptSections.values()].map((section) => `prompt_section:${section.name}`),
+      ...[...owner.skillRoots.values()].map((root) => `skill_root:${root.name}`),
     ]
     for (const fiber of owner.fibers) {
       for (const effect of fiber.getEffects?.() ?? []) leaked.push(`effect:${effect.label}`)
@@ -393,6 +404,7 @@ export class HostRoot {
     this.commandRegistrations.forget(owner)
     this.hookRegistrations.forget(owner)
     this.promptSections.forget(owner)
+    this.skillRoots.forget(owner)
     this.owners.delete(ref.owner_token)
     return { disposed, leaked }
   }
