@@ -10,7 +10,10 @@ Publishing codewhale-tui to crates.io requires this kit version on crates.io;
 that publication remains a separate release gate requiring founder approval.
 
 Adoption is deliberately incremental: each migrated renderer deletes its
-predecessor. Workflow progress and working/verification indicators use the
-kit; mounted composer, dock, posture/metrics, transcript, pending input,
+predecessor. Workflow progress, working/verification indicators and the
+metrics row use the kit. MetricsLine owns its complete shed, projection,
+render and pointer geometry; the Engine supplies measured facts, localized
+labels and hints, live/custom theme ink and action dispatch. Mounted composer,
+dock, posture, transcript, pending input,
 ocean and character remain in the Engine until their keyboard, mouse,
 localization and layout contracts can move together.
