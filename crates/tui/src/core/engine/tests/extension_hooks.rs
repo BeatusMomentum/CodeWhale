@@ -62,13 +62,14 @@ async fn typescript_mod_rewrites_denies_and_regates_native_tools_on_the_real_eng
             .unwrap()
             .unwrap()
         {
-            Event::ApprovalRequired {
-                id, description, ..
-            } => {
+            Event::ApprovalRequired { id, input, .. } => {
                 approvals += 1;
-                assert!(
-                    description.contains("rewritten.txt"),
-                    "the revised write must be prepared again: {description}"
+                assert_eq!(
+                    input,
+                    serde_json::json!({
+                        "action": "write", "path": "rewritten.txt", "content": "requires fresh approval"
+                    }),
+                    "the approval must be for the re-prepared revised write"
                 );
                 handle.deny_tool_call(id).await.unwrap();
             }
