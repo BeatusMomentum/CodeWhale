@@ -10266,8 +10266,19 @@ verbosity = "concise"
         // #6715 review: no surface says "storage unprobed" for a route whose
         // generation `auth status` opens for the account label; only the
         // token's availability is left unverified.
-        assert!(get.contains("token availability unprobed"), "{get}");
-        assert!(!get.contains("storage unprobed"), "{get}");
+        // The assertion messages deliberately do not interpolate `get`: it is
+        // built from fixed source labels only, but it flows from the runtime
+        // API-key resolver, so CodeQL's cleartext-logging query treats a
+        // formatted copy as a credential sink. The two asserts above already
+        // print the line on failure.
+        assert!(
+            get.contains("token availability unprobed"),
+            "the xAI get line must say only token availability is unprobed"
+        );
+        assert!(
+            !get.contains("storage unprobed"),
+            "the xAI get line must not say storage is unprobed"
+        );
         assert!(!scoped.contains("storage unprobed"), "{scoped}");
         assert!(
             !keyring.queried().iter().any(|slot| slot == "xai"),
