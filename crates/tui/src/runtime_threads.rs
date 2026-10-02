@@ -6389,6 +6389,15 @@ pub(crate) struct RuntimeProcessOwnerLock {
 /// Upper bound on the bytes read back from a lock file's holder record.
 const OWNER_LOCK_HOLDER_MAX_BYTES: u64 = 128;
 
+/// The Windows byte range `LockFile` takes: `(offset low, offset high, length
+/// low, length high)`. A Windows byte-range lock is mandatory, so locking the
+/// whole file would stop a contender reading the holder record at the front
+/// (#6573). The range starts after the record and still overlaps the
+/// whole-file range older builds take, so mixed versions exclude each other.
+#[cfg(windows)]
+const OWNER_LOCK_RANGE: (u32, u32, u32, u32) =
+    (OWNER_LOCK_HOLDER_MAX_BYTES as u32, 0, u32::MAX, 0x7FFF_FFFF);
+
 impl RuntimeProcessOwnerLock {
     /// Reuse the Runtime's protected OS lease for task-store ownership. A
     /// missing existing lease is uncertainty, never proof that an owner died.
@@ -6493,8 +6502,9 @@ impl RuntimeProcessOwnerLock {
     }
 
     /// Read the holder recorded by [`Self::record_holder`]: its pid and how
-    /// long it has held the lock. Never blocks (advisory locks do not stop
-    /// reads) and never fails: anything unreadable or malformed is `None`.
+    /// long it has held the lock. Never blocks (the lock does not cover the
+    /// record: `flock` is advisory, and the Windows range starts after it) and
+    /// never fails: anything unreadable or malformed is `None`.
     pub(crate) fn read_holder(path: &Path) -> Option<(u32, Duration)> {
         let file = open_runtime_store_file(path, "Owner lock holder record", |options| {
             options.read(true);
@@ -6550,8 +6560,18 @@ impl RuntimeProcessOwnerLock {
         {
             use std::os::windows::io::AsRawHandle as _;
             use windows_sys::Win32::Storage::FileSystem::LockFile;
+            let (offset_low, offset_high, length_low, length_high) = OWNER_LOCK_RANGE;
             // SAFETY: `file` owns a valid handle retained by this guard.
-            if unsafe { LockFile(file.as_raw_handle() as _, 0, 0, u32::MAX, u32::MAX) } == 0 {
+            if unsafe {
+                LockFile(
+                    file.as_raw_handle() as _,
+                    offset_low,
+                    offset_high,
+                    length_low,
+                    length_high,
+                )
+            } == 0
+            {
                 return Err(std::io::Error::last_os_error());
             }
             Ok(())
@@ -6584,9 +6604,16 @@ impl Drop for RuntimeProcessOwnerLock {
         {
             use std::os::windows::io::AsRawHandle as _;
             use windows_sys::Win32::Storage::FileSystem::UnlockFile;
+            let (offset_low, offset_high, length_low, length_high) = OWNER_LOCK_RANGE;
             // SAFETY: Drop runs only while `_file` still owns this handle.
             unsafe {
-                UnlockFile(self._file.as_raw_handle() as _, 0, 0, u32::MAX, u32::MAX);
+                UnlockFile(
+                    self._file.as_raw_handle() as _,
+                    offset_low,
+                    offset_high,
+                    length_low,
+                    length_high,
+                );
             }
         }
     }
