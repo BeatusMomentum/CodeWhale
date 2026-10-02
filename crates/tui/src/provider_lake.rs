@@ -1101,7 +1101,7 @@ pub fn all_catalog_models_for_provider_identity(
 ) -> Vec<String> {
     // ChatGPT OAuth availability is account-scoped. A generic OpenAI or
     // Models.dev catalog is not evidence that a model can be routed through
-    // the Codex backend, so this provider owns a separate secret-free source.
+    // a ChatGPT plan, so this provider owns a registration-scoped source.
     if provider == ApiProvider::OpenaiCodex {
         return codex_model_cache::model_roster().model_ids();
     }
@@ -1258,6 +1258,9 @@ pub(crate) fn configured_catalog_models_for_route(
     identity: &str,
     base_url: &str,
 ) -> Vec<String> {
+    if provider == ApiProvider::OpenaiCodex {
+        return codex_model_cache::model_roster_for(config).model_ids();
+    }
     let mut ids = catalog_models_for_route(provider, identity, base_url);
     if provider != ApiProvider::OpenaiCodex {
         let models = config.custom_models.as_deref().unwrap_or_default();
@@ -1511,8 +1514,8 @@ fn catalog_identities(
     Ok(identities)
 }
 
-fn codex_receipt(identity: &ProviderIdentity) -> CatalogUpdateReceipt {
-    let roster = codex_model_cache::model_roster();
+fn codex_receipt(config: &Config, identity: &ProviderIdentity) -> CatalogUpdateReceipt {
+    let roster = codex_model_cache::model_roster_for(config);
     codex_roster_receipt(identity, &roster)
 }
 
@@ -1539,31 +1542,13 @@ fn codex_roster_receipt(
         base_url_fingerprint: None,
         model_count: roster.models.len(),
         error: if !fresh {
-            Some("codex_cache_unavailable")
-        } else if roster.source == "codex_app_server" && !roster.observation_persisted {
-            Some("codex_observation_not_persisted")
+            Some("chatgpt_catalog_unavailable")
+        } else if !roster.observation_persisted {
+            Some("chatgpt_catalog_not_persisted")
         } else {
             None
         },
     }
-}
-
-fn codex_route_matches_cli_account(config: &Config) -> bool {
-    if config.provider_uses_custom_endpoint(ApiProvider::OpenaiCodex)
-        || [
-            "OPENAI_CODEX_ACCESS_TOKEN",
-            "CODEX_ACCESS_TOKEN",
-            "OPENAI_CODEX_ACCOUNT_ID",
-            "CODEX_ACCOUNT_ID",
-        ]
-        .iter()
-        .any(|name| std::env::var(name).is_ok_and(|value| !value.trim().is_empty()))
-    {
-        return false;
-    }
-    let cli_auth_path = codex_model_cache::codex_home_path().join("auth.json");
-    let cli_auth_path = std::fs::canonicalize(&cli_auth_path).unwrap_or(cli_auth_path);
-    crate::oauth::auth_file_path() == cli_auth_path
 }
 
 /// Whether a provider-scoped live listing can never exist for this route.
@@ -1583,20 +1568,16 @@ pub(crate) async fn update_provider_catalog(
     identity: &ProviderIdentity,
 ) -> CatalogUpdateReceipt {
     if identity.provider == ApiProvider::OpenaiCodex {
-        if !codex_route_matches_cli_account(config) {
-            let mut receipt = codex_receipt(identity);
-            receipt.outcome = "skipped";
-            receipt.error = Some("codex_account_route_mismatch");
-            return receipt;
-        }
-        return match codex_model_cache::update_from_codex_cli().await {
+        let mut route_config = config.clone();
+        route_config.scope_to_provider_identity(identity);
+        return match codex_model_cache::update_from_chatgpt(&route_config).await {
             Ok(roster) => {
                 let mut receipt = codex_roster_receipt(identity, &roster);
-                receipt.outcome = "loaded";
+                receipt.outcome = "updated";
                 receipt
             }
             Err(error) => {
-                let mut receipt = codex_receipt(identity);
+                let mut receipt = codex_receipt(&route_config, identity);
                 receipt.outcome = "failed";
                 receipt.error = Some(error);
                 receipt
@@ -1827,12 +1808,6 @@ pub(crate) async fn run_models(
                         .map_or_else(String::new, |error| format!("\terror={error}"))
                 );
             }
-            if receipts
-                .iter()
-                .any(|receipt| matches!(receipt.source, "codex_cli_cache" | "codex_app_server"))
-            {
-                println!("{}", tr(locale, MessageId::ModelsCodexHint));
-            }
         }
         if failed > 0 {
             anyhow::bail!("{}", tr(locale, MessageId::ModelsUpdatePartial));
@@ -1843,23 +1818,34 @@ pub(crate) async fn run_models(
     let mut route_config = config.clone();
     route_config.scope_to_provider_identity(identity);
     let mut models = configured_catalog_models_for_route(
-        config,
+        &route_config,
         identity.provider,
         &identity.key,
         &route_config.active_route_base_url(),
     );
     let default_model = route_config.default_model();
-    if !default_model.is_empty() && !default_model.eq_ignore_ascii_case("auto") {
+    if identity.provider != ApiProvider::OpenaiCodex
+        && !default_model.is_empty()
+        && !default_model.eq_ignore_ascii_case("auto")
+    {
         push_unique_model(&mut models, &default_model);
     }
-    models.sort();
-    models.dedup();
+    if identity.provider != ApiProvider::OpenaiCodex {
+        models.sort();
+        models.dedup();
+    }
     if json {
         // Preserve the existing array + AvailableModel field shape.
+        let chatgpt_roster = (identity.provider == ApiProvider::OpenaiCodex)
+            .then(|| codex_model_cache::model_roster_for(&route_config));
         let rows: Vec<_> = models
             .iter()
             .map(|id| crate::client::AvailableModel {
                 id: id.clone(),
+                display_name: chatgpt_roster
+                    .as_ref()
+                    .and_then(|roster| roster.metadata_for(id))
+                    .and_then(|model| model.display_name.clone()),
                 owned_by: None,
                 created: None,
             })
@@ -1873,7 +1859,7 @@ pub(crate) async fn run_models(
                 .replace("{model}", &default_model)
         );
         let receipt = if identity.provider == ApiProvider::OpenaiCodex {
-            codex_receipt(identity)
+            codex_receipt(&route_config, identity)
         } else {
             cached_receipt(&route_config, identity)
         };
@@ -2171,36 +2157,19 @@ mod tests {
         );
     }
 
-    #[test]
-    fn codex_update_does_not_attribute_another_accounts_roster_to_overridden_credentials() {
+    #[tokio::test]
+    async fn chatgpt_catalog_refresh_rejects_unregistered_legacy_credentials() {
         let _env = crate::test_support::lock_test_env();
-        let home = tempfile::tempdir().unwrap();
-        let _home = crate::test_support::EnvVarGuard::set("CODEX_HOME", home.path());
-        let _overrides: Vec<_> = [
-            "OPENAI_CODEX_AUTH_FILE",
-            "OPENAI_CODEX_ACCESS_TOKEN",
-            "CODEX_ACCESS_TOKEN",
-            "OPENAI_CODEX_ACCOUNT_ID",
-            "CODEX_ACCOUNT_ID",
-        ]
-        .iter()
-        .map(|name| crate::test_support::EnvVarGuard::remove(name))
-        .collect();
+        let _token = crate::test_support::EnvVarGuard::set("CODEX_ACCESS_TOKEN", "legacy-token");
         let config = Config {
             provider: Some("openai-codex".to_string()),
             ..Default::default()
         };
-        assert!(codex_route_matches_cli_account(&config));
-        {
-            let _token =
-                crate::test_support::EnvVarGuard::set("CODEX_ACCESS_TOKEN", "standalone-token");
-            assert!(!codex_route_matches_cli_account(&config));
-        }
-        let _other = crate::test_support::EnvVarGuard::set(
-            "OPENAI_CODEX_AUTH_FILE",
-            home.path().join("other-auth.json"),
-        );
-        assert!(!codex_route_matches_cli_account(&config));
+        let identity = config.resolve_provider_identity("openai-codex").unwrap();
+        let receipt = update_provider_catalog(&config, &identity).await;
+        assert_eq!(receipt.outcome, "failed");
+        assert_eq!(receipt.error, Some("chatgpt_plan_permission_required"));
+        assert_eq!(receipt.model_count, 0);
     }
 
     #[test]
@@ -2213,12 +2182,12 @@ mod tests {
             freshness: codex_model_cache::CodexModelCacheFreshness::Fresh,
             fetched_at: None,
             observed_at: Some(chrono::Utc::now()),
-            source: "codex_app_server",
+            source: "chatgpt_plan_api",
             observation_persisted: false,
         };
         let receipt = codex_roster_receipt(&identity, &roster);
         assert_eq!(receipt.status, CatalogStatus::Fresh);
-        assert_eq!(receipt.error, Some("codex_observation_not_persisted"));
+        assert_eq!(receipt.error, Some("chatgpt_catalog_not_persisted"));
         assert_eq!(receipt.fetched_at, None);
         assert!(receipt.observed_at.is_some());
     }
@@ -2367,7 +2336,7 @@ mod tests {
         clear_live_snapshot();
         for &provider in ApiProvider::all() {
             let legacy_len = model_completion_names_for_provider(provider).len();
-            if legacy_len == 0 {
+            if legacy_len == 0 || provider == ApiProvider::OpenaiCodex {
                 continue;
             }
             assert!(
@@ -2388,19 +2357,8 @@ mod tests {
         let _codex_home = crate::test_support::EnvVarGuard::set("CODEX_HOME", codex_home.path());
         let _live = lock_live_snapshot();
         clear_live_snapshot();
-        let openai_codex = all_catalog_models_for_provider(ApiProvider::OpenaiCodex);
-        assert!(
-            !openai_codex.is_empty(),
-            "openai-codex must keep a default model offline: {openai_codex:?}"
-        );
-        assert_eq!(
-            openai_codex,
-            model_completion_names_for_provider(ApiProvider::OpenaiCodex)
-                .iter()
-                .map(|m| (*m).to_string())
-                .collect::<Vec<_>>(),
-            "openai-codex should come from the compatibility fallback table"
-        );
+        // A public model table cannot attest account plan permission.
+        assert!(all_catalog_models_for_provider(ApiProvider::OpenaiCodex).is_empty());
 
         // Ollama intentionally has an empty legacy table (user-supplied ids);
         // the lake must still return empty rather than inventing rows.

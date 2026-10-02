@@ -514,7 +514,7 @@ impl ModelPickerView {
                 vec![self.initial_model.clone()],
                 self.initial_provider,
                 config,
-                &codex_model_cache::model_roster(),
+                &codex_model_cache::model_roster_for(config),
                 &app.provider_health,
             );
         }
@@ -2088,7 +2088,7 @@ fn picker_model_rows_for_app(app: &App, config: &Config) -> Vec<ModelPickerRow> 
     push_auto_model_row(&mut rows, app, config, &auto_hint);
     // One snapshot supplies both IDs, capabilities, and freshness so a cache
     // replacement cannot produce mixed-generation picker rows.
-    let codex_roster = codex_model_cache::model_roster();
+    let codex_roster = codex_model_cache::model_roster_for(config);
     let mut active_model_ids = if app.api_provider == ApiProvider::OpenaiCodex {
         let mut models = vec!["auto".to_string()];
         for id in codex_roster.model_ids() {
@@ -3702,7 +3702,7 @@ fn effective_picker_metadata_with_codex(
         reasoning,
         vision,
         pricing,
-        display_name: None,
+        display_name: codex_metadata.and_then(|model| model.display_name.clone()),
         reasoning_unknown: false,
         declared_input_price: None,
         source: card.map(|card| card.source),
@@ -4568,13 +4568,9 @@ fn route_picker_efforts(
         return KIMI_CODE_K3_PICKER_EFFORTS.to_vec();
     }
     if provider == ApiProvider::OpenaiCodex {
-        // The OAuth roster publishes a per-model ladder, and the models differ:
-        // gpt-5.6-sol/terra go up to `ultra`, gpt-5.6-luna stops at `max`, and
-        // gpt-5.5 and older stop at `xhigh`. Returning one static list for the
-        // whole provider offered tiers a model does not have and hid tiers it
-        // does. Fall back to the static ladder only when the roster is missing
-        // or published no levels for this model.
-        return codex_picker_efforts(wire_model).unwrap_or_else(|| CODEX_PICKER_EFFORTS.to_vec());
+        // The official account list publishes IDs and display labels, not
+        // effort tiers. Keep the existing wire-compatible route ladder.
+        return CODEX_PICKER_EFFORTS.to_vec();
     }
     if let Some(catalog_efforts) = catalog_picker_efforts(provider, wire_model) {
         return catalog_efforts;
@@ -4586,24 +4582,6 @@ fn route_picker_efforts(
         return DEEPSEEK_PICKER_EFFORTS.to_vec();
     }
     DEFAULT_PICKER_EFFORTS.to_vec()
-}
-
-/// Thinking tiers for one Codex model, taken from the OAuth roster's
-/// `supported_reasoning_levels`. `None` when the roster does not describe the
-/// model, so the caller keeps the static Codex ladder rather than inventing
-/// tiers.
-fn codex_picker_efforts(wire_model: &str) -> Option<Vec<ReasoningEffort>> {
-    let roster = crate::codex_model_cache::model_roster();
-    let metadata = roster.metadata_for(wire_model)?;
-    let mut efforts = Vec::new();
-    for raw in &metadata.efforts {
-        if let Some(effort) = catalog_effort_value(raw)
-            && !efforts.contains(&effort)
-        {
-            efforts.push(effort);
-        }
-    }
-    (!efforts.is_empty()).then_some(efforts)
 }
 
 /// Build thinking-tier rows from Models.dev `reasoning_options` when present.

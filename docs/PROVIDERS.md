@@ -106,8 +106,7 @@ and never changes the saved provider or model. A command-line API key is
 confined to the active provider; other routes are reported as skipped for
 that invocation.
 
-Plain `models` lists the active provider's saved catalog without provider requests or
-authentication checks. Successful refreshes are saved under Codewhale's
+Plain `models` lists the active provider's saved catalog without provider requests. Successful refreshes are saved under Codewhale's
 catalog directory and used by the model/provider pickers. Cache files are
 scoped to provider identity and endpoint; a failed refresh preserves prior
 rows. Text output reports source, last successful fetch time (Unix seconds),
@@ -116,32 +115,54 @@ partial failures return a nonzero exit code after writing those receipts.
 Ordinary `models --json` keeps its model-array format. Bundled/configured
 fallbacks are not proof that an account can use every listed model.
 
-`codewhale models --update --provider openai-codex` asks the installed Codex
-CLI for its signed-in ChatGPT account's model list through the documented
-[app-server stdio API](https://learn.chatgpt.com/docs/app-server). Pagination
-and supported reasoning efforts are preserved. This requires a Codex version
-with `account/read` and `model/list` support. It starts no conversation, imports
-no tokens, and sends no Codewhale provider keys to Codex. Standalone credential
-overrides or custom endpoints that could select a different account are skipped.
+### Sign in with ChatGPT
 
-Codex controls its own upstream cache policy; `model/list` does not expose a
-force-refresh option. Receipts therefore count the result as `loaded`, with an
-`observed_at` lookup time and no claimed upstream `fetched_at`. The observed
-roster is saved for offline listing and pickers, alongside the existing Codex
-cache fallback. A new model, such as GPT-6 Astra, appears only if that account's
-roster supplies its exact ID. Codewhale never guesses availability or substitutes
-a different billing route. Missing/stale rosters, CLI failures, and unsupported
-OAuth catalogs are reported explicitly.
+The `openai-codex` provider ID now uses OpenAI's official open-source
+[Sign in with ChatGPT flow](https://developers.openai.com/siwc/token-sharing-open-source).
+Sign in and refresh the selected account's catalog:
 
-Codewhale's observed Codex rosters are bound to the exact filesystem home
-and the metadata version of its `auth.json`; tokens are never read for this
-cache binding. Replacing that login invalidates the observation. A native
-Codex cache fetched before an observed login-file change is also stale.
-Keyring-only accounts without an observable login file can still load a live
-roster, but the receipt reports `codex_observation_not_persisted` and no
-Codewhale observation is retained. The separately attributed Codex-owned
-native cache keeps its existing freshness policy when no login-file version
-can be observed; this is not proof of account identity in an external keyring.
+```sh
+codewhale auth chatgpt
+codewhale models --update --provider openai-codex
+codewhale --provider openai-codex
+```
+
+Sign-in opens your system browser, uses a loopback callback and PKCE, validates
+the returned identity, and stores the issued registration and renewable tokens
+in Codewhale's protected credential storage. Permission to use your ChatGPT
+plan is separate from identity sign-in. A declined or missing plan grant stops
+inference; choose another provider explicitly if you want another billing path.
+`codewhale auth chatgpt-revoke` signs out of the Codewhale-owned session.
+
+Model discovery uses your granted bearer token at
+`GET https://api.openai.com/v1/models`; inference uses the public
+`POST https://api.openai.com/v1/responses` endpoint. The model picker keeps
+OpenAI's display labels and order and lists only entries with `visibility: list`.
+The catalog contains no credentials and is bound to the verified issuer,
+issued client ID, and account subject. Another account or workspace never
+inherits those model choices. Missing, invalid, or older-than-one-day rosters
+are reported explicitly and provide no account entitlement evidence. Run the
+refresh command after signing in. Neither model discovery nor ordinary listing
+starts an inference request. Imported Codex CLI tokens and legacy process-token
+variables cannot authorize this official plan route.
+
+Eligible requests consume your ChatGPT plan or credits. ChatGPT Plus's
+five-hour allowance is shared across apps; each app receives no separate
+allowance. The documented five-hour limit does not apply to Pro. App-specific
+limits can also apply. Review limits and access in
+[ChatGPT usage settings](https://chatgpt.com/#settings/Usage). Codewhale does
+not silently switch to an API key or another provider when a limit is reached.
+
+This is an OpenAI preview for open-source/local apps. It does not grant access
+to ChatGPT conversation history. Requests stream with `store: false` and
+`stream: true`, while Codewhale retains its own session history and tools.
+OpenAI-hosted image generation, file search, Code Interpreter, native computer
+use, hosted MCP/connectors, and Responses `tool_search` are unavailable on this
+route; Codewhale's own tools use supported function/custom tool calls.
+See [preview limitations](https://developers.openai.com/siwc/token-sharing-open-source/preview-limitations).
+Paid or remotely hosted applications require the
+[commercial partner interest process](https://openai.com/form/sign-in-with-chatgpt-interest/);
+this local integration is not commercial approval.
 
 The canonical provider IDs are the entries of `ProviderKind::ALL`
 (`crates/config/src/provider_kind.rs`), in that order:
@@ -240,7 +261,7 @@ the listed provider env vars.
 | `modelscope` | `[providers.modelscope]` | OpenAI Chat Completions | `MODELSCOPE_API_KEY` |
 | `together` | `[providers.together]` | OpenAI Chat Completions | `TOGETHER_API_KEY` |
 | `qianfan` | `[providers.qianfan]` | OpenAI Chat Completions | `QIANFAN_API_KEY`, `BAIDU_QIANFAN_API_KEY` |
-| `openai-codex` | `[providers.openai_codex]` | OpenAI Responses | Native ChatGPT PKCE (`codewhale auth chatgpt`), `OPENAI_CODEX_ACCESS_TOKEN`, `CODEX_ACCESS_TOKEN`, or explicit Codex CLI consent |
+| `openai-codex` | `[providers.openai_codex]` | OpenAI Responses | Official Sign in with ChatGPT (`codewhale auth chatgpt`) with a validated Codewhale-owned plan grant |
 | `anthropic` | `[providers.anthropic]` | Anthropic Messages | `ANTHROPIC_API_KEY` |
 | `openmodel` | `[providers.openmodel]` | Anthropic Messages | `OPENMODEL_API_KEY` |
 | `zai` | `[providers.zai]` | OpenAI Chat Completions | `ZAI_API_KEY`, `Z_AI_API_KEY` |
@@ -605,7 +626,7 @@ configuration path instead of guessing a vendor page.
 | `qianfan` | [Baidu Cloud access keys](https://console.bce.baidu.com/iam/#/iam/accesslist) |
 | `anthropic` | [Anthropic API keys](https://console.anthropic.com/settings/keys) |
 | `openmodel` | [OpenModel console](https://console.openmodel.ai/) ([authentication guide](https://docs.openmodel.ai/en/docs/getting-started/authentication)) |
-| `openai-codex` | Sign in with ChatGPT via `codewhale auth chatgpt` (subscription billing, Codewhale-owned tokens). The `openai` API-key route is a different billing owner. Codex CLI import remains an explicit alternative after `codex login` plus `codewhale auth external-consent`. |
+| `openai-codex` | Official Sign in with ChatGPT via `codewhale auth chatgpt` (eligible ChatGPT plan or credits, Codewhale-owned tokens). The `openai` API-key route has separate billing. Legacy imported Codex credentials do not authorize this route. |
 | `sglang`, `vllm` | Local OpenAI-compatible endpoints are keyless by default; configure a key only when the server requires one. |
 | `ollama` | Local Ollama is keyless by default; configure a key only when the local server requires one. |
 | `ollama-cloud` | Create an [Ollama API key](https://ollama.com/settings/keys), save it with `codewhale auth set --provider ollama-cloud`, or set `OLLAMA_CLOUD_API_KEY` / `OLLAMA_API_KEY` in that precedence order. |
@@ -757,7 +778,7 @@ overlay and lets DSH resolve its own keys.
 | `deepinfra` | `[providers.deepinfra]` | `DEEPINFRA_API_KEY`, `DEEPINFRA_TOKEN` | `DEEPINFRA_BASE_URL`; default `https://api.deepinfra.com/v1/openai` | `deepseek-ai/DeepSeek-V4-Pro`, `deepseek-ai/DeepSeek-V4-Flash` | DeepInfra OpenAI-compatible route. Drop-in replacement for OpenAI SDK. |
 | `together` | `[providers.together]` | `TOGETHER_API_KEY` | `TOGETHER_BASE_URL`; default `https://api.together.xyz/v1` | `deepseek-ai/DeepSeek-V4-Pro`, `deepseek-ai/DeepSeek-V4-Flash`, `thinkingmachines/inkling` | Together AI OpenAI-compatible route. `TOGETHER_MODEL` is accepted. Model aliases `deepseek-v4-pro` and `deepseek-v4-flash` normalize to Together's org-prefixed IDs; `inkling` and `together-inkling` normalize to Together's published lowercase Inkling wire ID. Inkling uses the exact `none`/`minimal`/`low`/`medium`/`high`/`max` reasoning vocabulary from Thinking Machines' [official model repository](https://huggingface.co/thinkingmachines/Inkling). Together's [launch post](https://www.together.ai/blog/together-ai-brings-thinking-machines-labs-new-model-inkling-on-day-0) currently says Inkling is live with 1M context, while its [model detail page](https://www.together.ai/models/inkling) says coming soon with 256K context and publishes no price. Until Together's active `/models` endpoint and the Models.dev catalog resolve that conflict, Inkling is not seeded into Codewhale's offline picker and no route-specific context or cost is inferred. |
 | `qianfan` | `[providers.qianfan]` | `QIANFAN_API_KEY`, `BAIDU_QIANFAN_API_KEY` | `QIANFAN_BASE_URL`, `BAIDU_QIANFAN_BASE_URL`; default `https://api.baiduqianfan.ai/v1` | `ernie-4.0-turbo-8k`; provider-scoped custom Qianfan service/model IDs pass through | Baidu Qianfan OpenAI-compatible route. Requests use Bearer auth and Chat Completions payloads. `QIANFAN_MODEL` and `BAIDU_QIANFAN_MODEL` are accepted; aliases `baidu-qianfan`, `baidu_qianfan`, and `baidu` resolve to this provider. Tool/function calling is model-scoped in Qianfan docs, so Codewhale preserves the selected wire model and leaves live capability proof to follow-up route/capability work. |
-| `openai-codex` | `[providers.openai_codex]` | Native ChatGPT PKCE (`codewhale auth chatgpt` / `/provider setup openai-codex`), process token via `OPENAI_CODEX_ACCESS_TOKEN`/`CODEX_ACCESS_TOKEN`, or exact-path read-only consent after `codex login` | `OPENAI_CODEX_BASE_URL`/`CODEX_BASE_URL`; default `https://chatgpt.com/backend-api` | `gpt-5.6` (default) | **Experimental.** Talks to the OpenAI Responses API at `/codex/responses`. Native Sign in with ChatGPT stores refreshable tokens in Codewhale-owned storage and bills the ChatGPT subscription; the `openai` API-key route is a different billing owner. Codex CLI files remain disabled by default; `codewhale auth external-consent --provider openai-codex --mode read-only` is an explicit import alternative. Codewhale never refreshes or rewrites that external file, and expired external tokens fail closed. Revoke owned tokens with `codewhale auth chatgpt-revoke`. `OPENAI_CODEX_MODEL`/`CODEX_MODEL` and `OPENAI_CODEX_ACCOUNT_ID`/`CODEX_ACCOUNT_ID` are accepted. Codewhale budgets this route with the 400K Codex-family effective context window even when the public API model table lists a larger native `gpt-5.5` window. OpenAI has not published a third-party client registration for this public Codex OAuth client; the adapter uses the published issuer, PKCE S256, honest `originator=codewhale`, and does not call unpublished device-auth endpoints. |
+| `openai-codex` | `[providers.openai_codex]` | Official Sign in with ChatGPT (`codewhale auth chatgpt` / `/provider setup openai-codex`) | Official `https://api.openai.com/v1` | Selected account catalog; configured model IDs remain explicit selections | **Experimental.** Public Responses endpoint (`/v1/responses`) with a validated `chatgpt.tokens.use.direct` grant. Dynamic OSS registration issues a client ID for the selected account/workspace; Codewhale protects and renews its own tokens. The account catalog supplies selectable models; public model lists and legacy Codex tokens do not establish plan permission. No silent billing fallback. See [Sign in with ChatGPT](#sign-in-with-chatgpt) for setup, usage limits, and preview boundaries. |
 | `anthropic` | `[providers.anthropic]` | `ANTHROPIC_API_KEY` | `ANTHROPIC_BASE_URL`; default `https://api.anthropic.com` | `claude-opus-4-8`, `claude-sonnet-4-6` (default), `claude-haiku-4-5` | Native Anthropic Messages API route (`/v1/messages`, `x-api-key` + `anthropic-version: 2023-06-01`) — not OpenAI-compatible. Prompt caching via `cache_control` breakpoints, adaptive thinking + `output_config.effort`, signed thinking blocks replayed verbatim, cache telemetry normalized per #2961. `ANTHROPIC_MODEL` is accepted. |
 | `openmodel` | `[providers.openmodel]` | `OPENMODEL_API_KEY` | `OPENMODEL_BASE_URL`; default `https://api.openmodel.ai` | `deepseek-v4-flash`; provider-scoped custom model IDs pass through | OpenModel Anthropic-compatible Messages route. Uses `/v1/messages`, Bearer auth, and `anthropic-version: 2023-06-01`; OpenModel selects DeepSeek, DashScope, Xiaomi, Claude, and other routes by model id. `OPENMODEL_MODEL` is accepted. |
 | `sakana` | `[providers.sakana]` | `FUGU_API_KEY`, `SAKANA_API_KEY` | `SAKANA_BASE_URL`; default `https://api.sakana.ai/v1` | `fugu` (default), `fugu-ultra-20260615` | Sakana AI Fugu OpenAI-compatible route. Standard Chat Completions wire protocol; streaming supported. `fugu-ultra-20260615` is the heavy/reasoning variant. Env var aliases: `FUGU_API_KEY` (primary), `SAKANA_API_KEY`; provider aliases: `sakana-ai`, `sakana_ai`, `fugu`. |
@@ -1107,7 +1128,7 @@ while bare `k3` can use an entitled 1M override.
 | Anthropic API `claude-opus-5`, `claude-opus-4-8`, `claude-sonnet-5`, `claude-sonnet-4-6`, `claude-fable-5` | 1,000,000 | 128,000 | yes | yes | not documented in code |
 | Google Gemini API `gemini-3.7-flash`, `gemini-3.6-flash`, `gemini-3.5-flash`, `gemini-3.5-flash-lite`, `gemini-3.1-pro-preview`, `gemini-2.5-pro`, `gemini-2.5-flash` | 1,048,576 | 65,536 | model-dependent | no | not documented in code |
 | Meta Model API `muse-spark-1.2` | 1,000,000 | 32,000 | yes | no | not documented in code |
-| OpenAI Codex / ChatGPT route (`openai-codex`) | 400,000 effective | 128,000 | yes | no | route uses Responses payload at `/codex/responses` |
+| ChatGPT plan route (`openai-codex`) | conservatively budgeted; account listing does not state a window | no output cap sent in preview | model dependent | no | public `/v1/responses`; no context limit is inferred from account eligibility |
 | OpenModel default/custom model IDs | 200,000 fallback unless model metadata or config overrides it | 64,000 fallback | model-dependent | no | route uses Messages payload at `/v1/messages` |
 | Wanjie Ark `reasoner` / `r1` model IDs | 128,000 | unknown (no documented maximum) | yes | no | not documented in code |
 | Direct Arcee API `trinity-large-thinking` | 262,144 | 262,144 | yes | no | not documented in code |

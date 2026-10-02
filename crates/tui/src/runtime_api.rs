@@ -8832,7 +8832,7 @@ fn provider_model_entry_for_api(
         return entry;
     }
     if provider == ApiProvider::OpenaiCodex {
-        let roster = crate::codex_model_cache::model_roster();
+        let roster = crate::codex_model_cache::model_roster_for(config);
         if roster.freshness != crate::codex_model_cache::CodexModelCacheFreshness::Fresh {
             return entry;
         }
