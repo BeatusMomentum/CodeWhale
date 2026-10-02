@@ -360,7 +360,7 @@ pub enum LlmError {
     ///
     /// Unlike an ordinary 429 rate limit, retrying the same request after a short
     /// backoff cannot resolve this condition. This variant is constructed only at
-    /// the provider HTTP response boundary from explicit quota evidence.
+    /// a provider HTTP or structured stream-event boundary from explicit quota evidence.
     QuotaExhausted(QuotaExhaustionError),
 
     /// Server error (HTTP 5xx)
@@ -469,6 +469,13 @@ impl LlmError {
     /// - Status code (429 = rate limit, 401/403 = auth, 499/5xx = transient upstream error)
     /// - Response body keywords (`context_length`, `content_policy`, safety, etc.)
     pub fn from_http_response(status: u16, body: &str) -> Self {
+        if let Some(error) = explicit_quota_code(body)
+            .or_else(|| explicit_quota_code_marker(body))
+            .as_deref()
+            .and_then(Self::from_subscription_sharing_error_code)
+        {
+            return error;
+        }
         if matches!(status, 400 | 402 | 429) && has_explicit_quota_evidence(body) {
             return LlmError::QuotaExhausted(QuotaExhaustionError::from_http_message(
                 body.to_string(),
@@ -545,6 +552,24 @@ impl LlmError {
         }
     }
 
+    /// Official structured ChatGPT plan errors are terminal account states.
+    /// Plain text containing quota words is never enough to mint this type.
+    #[must_use]
+    pub(crate) fn from_subscription_sharing_error_code(code: &str) -> Option<Self> {
+        let message = match code {
+            "subscription_sharing_usage_limit_exceeded" => {
+                "ChatGPT plan usage limit reached. Check ChatGPT Settings > Usage for your remaining allowance and reset time."
+            }
+            "subscription_sharing_usage_unavailable" => {
+                "ChatGPT plan usage is unavailable. Check ChatGPT Settings > Usage and reconnect if needed."
+            }
+            _ => return None,
+        };
+        Some(Self::QuotaExhausted(
+            QuotaExhaustionError::from_http_message(message.to_string()),
+        ))
+    }
+
     #[must_use]
     pub fn authentication_error(message: impl Into<String>) -> Self {
         LlmError::AuthenticationError(AuthenticationErrorDetail::new(message))
@@ -589,6 +614,10 @@ impl LlmError {
         body: &str,
         auth_context: Option<AuthenticationErrorContext>,
     ) -> Self {
+        let classified = Self::from_http_response(status, body);
+        if matches!(classified, Self::QuotaExhausted(_)) {
+            return classified;
+        }
         match status {
             401 => Self::authentication_error_with_context(body, auth_context),
             403 => {
@@ -598,7 +627,7 @@ impl LlmError {
                     LlmError::AuthorizationError(body.to_string())
                 }
             }
-            _ => Self::from_http_response(status, body),
+            _ => classified,
         }
     }
 
@@ -762,7 +791,7 @@ pub(crate) fn is_context_length_message(lower: &str) -> bool {
 /// callers holding a stringified error must never promote it to this type.
 fn has_explicit_quota_evidence(body: &str) -> bool {
     explicit_quota_code(body).is_some()
-        || has_explicit_quota_code_marker(body)
+        || explicit_quota_code_marker(body).is_some()
         || has_explicit_quota_phrase(body)
 }
 
@@ -803,20 +832,22 @@ fn is_explicit_quota_code(code: &str) -> bool {
             // Same backend, same branch: the signed-in plan does not include
             // Codex. Retrying cannot help; switching accounts can.
             | "usagenotincluded"
+            | "subscriptionsharingusagelimitexceeded"
+            | "subscriptionsharingusageunavailable"
     )
 }
 
-fn has_explicit_quota_code_marker(body: &str) -> bool {
+fn explicit_quota_code_marker(body: &str) -> Option<String> {
     let lower = body.to_ascii_lowercase();
     let Some((_, suffix)) = lower.split_once("provider error code:") else {
-        return false;
+        return None;
     };
     let code = suffix
         .trim_start()
         .split(|ch: char| !(ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-')))
         .next()
         .unwrap_or_default();
-    is_explicit_quota_code(code)
+    is_explicit_quota_code(code).then(|| code.to_string())
 }
 
 fn has_explicit_quota_phrase(body: &str) -> bool {
@@ -1413,6 +1444,41 @@ mod quota_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn official_chatgpt_usage_codes_are_terminal_across_http_boundaries() {
+        for code in [
+            "subscription_sharing_usage_limit_exceeded",
+            "subscription_sharing_usage_unavailable",
+        ] {
+            let body = serde_json::json!({"error":{"code":code,"message":"opaque"}}).to_string();
+            for status in [400, 403, 429] {
+                for safe_body in [body.clone(), sanitize_http_error_body(None, status, &body)] {
+                    let error =
+                        LlmError::from_http_response_with_auth_context(status, &safe_body, None);
+                    assert!(matches!(error, LlmError::QuotaExhausted(_)), "{error:?}");
+                    assert!(!error.is_retryable());
+                    assert!(error.to_string().contains("ChatGPT Settings > Usage"));
+                    let envelope = crate::error_taxonomy::envelope_for_llm_error(
+                        error.into(),
+                        "allowance unavailable".into(),
+                    );
+                    assert!(!envelope.recoverable);
+                    assert_eq!(envelope.code, "llm_quota_exhausted");
+                }
+            }
+        }
+        for body in [
+            "usage limit reached",
+            r#"{"error":{"code":"subscription_sharing_usage_limit_exceeded_later"}}"#,
+        ] {
+            assert!(matches!(
+                LlmError::from_http_response(429, body),
+                LlmError::RateLimited { .. }
+            ));
+            assert!(LlmError::from_http_response(429, body).is_retryable());
+        }
+    }
 
     fn assert_f64_eq(actual: f64, expected: f64) {
         assert!(
