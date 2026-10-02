@@ -122,10 +122,10 @@ require another review. See [bundle rules](PLUGIN_BUNDLES.md).
 Export a Cordis plugin function or an object with `apply`. The host supplies
 one shared Cordis and the supported DSH compatibility services. The example's
 `inject = ['tools', 'commands']` asks for the tool and command registries. The
-supplied service names are `tools`, `commands`, `prompt`, `storage`, `logger`,
+supplied service names are `tools`, `commands`, `prompt`, `storage`, `skills`, `logger`,
 `events`, `reflect` and `registry`. A tool can ask the core to run a core tool through
 `exec.core` (see [Asking the core to run a tool](#asking-the-core-to-run-a-tool));
-skills and MCP are not host services yet. Programmable pre-execute
+MCP is not a host service yet. Programmable pre-execute
 listeners use `ctx.on` as described below. A required
 service that is unavailable fails activation with a diagnostic.
 
@@ -152,6 +152,45 @@ disposal begins, symlinked storage, corrupt data and writes that exceed its
 bounded key/value/owner limits. It does not expose session history or secrets.
 Tool and command invocations also expose frozen `sessionId`, `agentId` and
 `originTurnId` strings when Rust supplies them for that particular call.
+
+## Skill roots
+
+`ctx.skills.registerRoot({ path: 'profiles/review-skills' })` returns an
+idempotent disposer and contributes reviewed instructions to Rust's existing
+skill catalog. Include `skills` in the entry's `inject` list. For example:
+
+```js
+export const inject = ['skills']
+export function apply(ctx) {
+  ctx.skills.registerRoot({ path: 'profiles/review-skills' })
+}
+```
+
+Place each skill in a child package directory such as
+`profiles/review-skills/quick-check/SKILL.md`. Paths are bundle-relative,
+at most 512 UTF-8 bytes, with normal slash-separated components. Absolute
+paths, links, empty components, `.` and `..` are refused. Rust parses only
+files covered by the reviewed bundle inventory, through the existing
+[frontmatter and invocation contract](SKILLS.md#invocation-and-alias-metadata).
+The existing nesting rules apply: hidden child directories are skipped, and
+a package containing `SKILL.md` claims its nested examples. An invalid skill
+or an empty root refuses admission. Native review covers this registration;
+the entry does not need a separate declarative Skills component.
+
+Pending and admitted roots count toward the host shim's limits: 8 roots per
+owner and 64 per host. Rust stops each root proposal at 128 candidate
+`SKILL.md` files or 4 MiB of raw input. Retained instruction fields are also
+limited to 128 skills / 4 MiB per owner and 1,024 skills / 32 MiB per host.
+These are logical catalog limits. Duplicate owner-local root paths require
+disposing the earlier root first.
+
+Disposal, disable, revocation and host exit remove the root from later
+discovery. Loading a selected skill rechecks the reviewed Native receipt and
+the live registration. Queued selections also recheck it; selections saved
+before a process or host restart require selecting the skill again. Completed
+session history remains the record of instructions already used. Roots have
+no watcher, companion-file access or tool permission grant; core approval and
+sandbox policy continue to apply.
 
 ## Tool rules
 

@@ -178,7 +178,7 @@ review and trust its exact content/capability hashes before enabling it. With
 the feature off, native code remains inventory-only. Source changes require
 another review; `/plugin reload` is explicit, not a hot-reload watcher.
 
-The available author services are `tools`, `commands`, `prompt`, `storage`,
+The available author services are `tools`, `commands`, `prompt`, `storage`, `skills`,
 `logger`, and Cordis lifecycle facilities. `ctx.on('tools/pre-execute', ...)`
 may abstain, deny, ask, revise object input or annotate context. Rust folds those
 proposals and repeats planning and admission checks for revised input. `allow`
@@ -194,7 +194,17 @@ credentials. Tool and command invocations expose optional frozen `sessionId`,
 `agentId` and `originTurnId` labels supplied for that call, not runtime handles.
 The public author SDK is not published; the example uses the documented shims.
 
-Custom Ratatui/GPUI widgets, DSH browser UI slots, skill-root registration,
+`ctx.skills.registerRoot({path: 'profiles/review-skills'})` contributes child
+`SKILL.md` packages from the reviewed bundle to the existing Rust skill
+catalog. Its disposer retires the root; disable, revoke and host exit do the
+same. Rust checks the Native receipt, file hashes and current registration
+when discovering or loading a skill, including queued user selections. A
+process or host restart invalidates a saved Native selection. Bundle-relative
+paths, parser rules and count/byte limits are documented in
+[the skill-root contract](EXTENSIONS.md#skill-roots). This API adds instructions;
+tool permissions remain with the shared engine.
+
+Custom Ratatui/GPUI widgets, DSH browser UI slots,
 native `dsh.bundle.patch` execution and DSH's agent runtime are not provided.
 The static importer described below still converts only its portable subset.
 Compatible Claude bundles still use the existing declarative component adapters;

@@ -57,7 +57,7 @@ Node 是默认运行时，要求 `^22.19 || >=24`。Bun 要求至少 1.4.0，目
 导入打包在已审查包内；激活时不应安装包或获取代码。
 
 宿主提供同一个 Cordis、schemastery、cosmokit 及有限的 DSH 兼容导出。支持的服务名为
-`tools`、`commands`、`prompt`、`storage`、`logger`、`events`、`reflect`、`registry`。
+`tools`、`commands`、`prompt`、`storage`、`skills`、`logger`、`events`、`reflect`、`registry`。
 需要未提供服务的插件会激活失败，并显示原因。目前没有已发布的插件编写 SDK；
 普通 ESM 示例使用这些文档规定的适配服务。
 
@@ -158,6 +158,38 @@ key 最多 128 UTF-8 字节，单个值最多 128 KiB；所有者当前可见记
 写入是最后写入生效，不是事务或跨进程原子增量计数。`mod_counter` 另外串行化自身的
 读/改/写队列。损坏状态不会被自动覆盖，应明确选择恢复或删除。
 
+## 注册技能目录
+
+`ctx.skills.registerRoot({path: 'profiles/review-skills'})` 把已审查包内的技能
+交给 Rust 现有的 skill catalog，并返回可重复调用的 disposer。入口的 `inject`
+列表需包含 `skills`：
+
+```js
+export const inject = ['skills']
+export function apply(ctx) {
+  ctx.skills.registerRoot({path: 'profiles/review-skills'})
+}
+```
+
+每个技能放在根目录下的独立子目录中，例如
+`profiles/review-skills/quick-check/SKILL.md`。路径相对于插件包，最多 512 个
+UTF-8 字节，只能使用正常的 `/` 分隔路径段；绝对路径、链接、空路径段、`.` 和 `..`
+会被拒绝。Rust 仅解析已审查字节清单覆盖的文件，复用现有的
+[frontmatter 与调用契约](./SKILLS.md#调用与别名元数据)。隐藏子目录会跳过，
+含 `SKILL.md` 的技能包会占有其嵌套示例；无效技能或空目录会导致注册被拒绝。
+该接口归于已审查 Native 入口，无需额外声明 Skills 组件。
+
+等待注册及已注册目录均占用宿主配额：每个所有者最多 8 个目录，宿主最多 64 个。
+Rust 解析每次目录提议时最多读取 128 个候选 `SKILL.md`、4 MiB 原始输入；保留的
+指令字段总量每个所有者最多 128 个技能、4 MiB，宿主最多 1,024 个技能、32 MiB。
+这些是 catalog 的逻辑配额。相同所有者要重新注册同一路径，需先调用旧 disposer。
+
+清理、停用、撤销信任及宿主退出会从后续发现结果中移除目录。加载时会重新检查
+Native 审查凭据和当前注册；排队中的用户选择也会重新检查。进程或宿主重启后，
+先前保存的 Native 技能选择需重新选择。已完成的会话历史继续记录当时用过的指令。
+该接口不监视文件，不提供配套文件访问，也不授予工具权限；核心审批及沙箱策略
+继续生效。
+
 ## 请求核心执行工具
 
 工具在直接模型调用、由共享 turn gate 管理本次执行时，可能获得 `exec.core`：
@@ -194,6 +226,6 @@ DSH 静态导入器只转换其 MCP/skill 可移植子集，报告不支持的�
 已明确编写并审查的 Native 入口可使用受支持的 Cordis/DSH 适配导出；这不等于加载
 原生 `dsh.bundle.patch`、`!!js`、DSH agent runtime 或浏览器 UI。
 
-目前还没有作者可用的自定义 Ratatui/GPUI 控件、UI slots、skill-root 注册及 MCP
+目前还没有作者可用的自定义 Ratatui/GPUI 控件、UI slots 及 MCP
 宿主服务。插件不能替换核心的 tools、commands、systemPrompt、审批、会话或凭据服务。
 当前功能边界和安装流程见[插件编写指南](./PLUGIN_AUTHORING.md)及[插件包契约](./PLUGIN_BUNDLES.md)。
