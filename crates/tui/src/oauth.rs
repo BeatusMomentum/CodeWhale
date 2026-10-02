@@ -977,6 +977,10 @@ pub async fn login_with_config(
     }
     let selected = official_chatgpt_registration(config).ok();
     let inputs = oauth_provider_params(provider).resolve_inputs();
+    anyhow::ensure!(
+        inputs.issuer == CHATGPT_OAUTH_ISSUER,
+        "Official ChatGPT sign-in requires https://auth.openai.com; remove the issuer override"
+    );
     tokio::task::spawn_blocking(move || pkce_login_with_selected(provider, &inputs, selected))
         .await
         .context("ChatGPT PKCE login worker failed")?
@@ -1664,6 +1668,12 @@ pub async fn pkce_login(provider: OAuthProvider) -> Result<PendingOAuthLogin> {
         );
     }
     let inputs = params.resolve_inputs();
+    if provider == OAuthProvider::Chatgpt {
+        anyhow::ensure!(
+            inputs.issuer == CHATGPT_OAUTH_ISSUER,
+            "Official ChatGPT sign-in requires https://auth.openai.com; remove the issuer override"
+        );
+    }
     let display_name = params.display_name;
     tokio::task::spawn_blocking(move || pkce_login_with(provider, &inputs))
         .await
@@ -1718,6 +1728,13 @@ fn pkce_login_with_selected(
         let mut url = reqwest::Url::parse(&request.authorize_url)?;
         url.query_pairs_mut()
             .append_pair("ext_agent_host_id", &host.host_id);
+        if let Some(email) = host
+            .registration
+            .as_ref()
+            .and_then(|registration| registration.email.as_deref())
+        {
+            url.query_pairs_mut().append_pair("login_hint", email);
+        }
         request.authorize_url = url.to_string();
     }
     eprintln!("{display_name} sign-in (PKCE)");
