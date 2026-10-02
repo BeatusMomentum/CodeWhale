@@ -146,12 +146,12 @@ rpc.onRequest('ext/deactivate', async (params: any) => {
 
 rpc.onRequest('tool/call', async (params: any, cx) => {
   requireInitialized()
-  return host.callTool(params.handle, params.input, params.call_id, cx.signal)
+  return host.callTool(params.handle, params.input, params.call_id, cx.signal, params.workspace)
 })
 
 rpc.onRequest('command/run', async (params: any, cx) => {
   requireInitialized()
-  return host.callCommand(params.handle, params.raw_input, params.command_id, cx.signal)
+  return host.callCommand(params.handle, params.raw_input, params.command_id, cx.signal, params.workspace)
 })
 
 rpc.onRequest('host/shutdown', async () => {

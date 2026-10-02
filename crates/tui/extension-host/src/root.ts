@@ -74,6 +74,10 @@ export interface OwnerRecord {
   refusals: string[]
   tools: Map<number, LocalTool>
   commands: Map<number, LocalCommand<OwnerRecord>>
+  /** Entry modules activated under this owner so far (a plugin may declare several). */
+  entries: Set<string>
+  /** The plugin's own writable directory, as the core named it at activation. */
+  dataDir?: string
   disposing?: Promise<void>
   state: 'activating' | 'active' | 'failed' | 'disposed'
 }
@@ -224,10 +228,29 @@ export class HostRoot {
     return this.commandRegistrations.add(local, commandSpec(definition))
   }
 
+  /**
+   * `ext/activate`: load one `native` entry of a plugin under its owner. A
+   * manifest may declare several entries; the core sends one `ext/activate`
+   * per entry, in order, under the same owner token, and every entry becomes a
+   * fiber of that one owner. A further entry is accepted only after the
+   * previous one finished activating, for the same plugin, and only once per
+   * path. Any failure fails the whole owner: its fibers, the earlier entries'
+   * included, are disposed and the owner forgotten (all-or-nothing).
+   */
   async activate(params: ActivateParams): Promise<ActivateResult> {
     const key = params.owner.owner_token
-    if (this.owners.has(key)) return { status: 'failed', diagnostic: 'owner token already active' }
-    const owner: OwnerRecord = {
+    const existing = this.owners.get(key)
+    if (existing) {
+      if (existing.state !== 'active') return { status: 'failed', diagnostic: 'owner token already active' }
+      if (existing.ref.plugin_id !== params.owner.plugin_id || existing.pluginName !== params.plugin_name) {
+        return { status: 'failed', diagnostic: 'owner token already active for another plugin' }
+      }
+      if (existing.entries.has(params.entry.path)) {
+        return { status: 'failed', diagnostic: `entry ${params.entry.path} is already activated under this owner` }
+      }
+      existing.state = 'activating'
+    }
+    const owner: OwnerRecord = existing ?? {
       ref: params.owner,
       pluginName: params.plugin_name,
       fibers: [],
@@ -235,9 +258,12 @@ export class HostRoot {
       refusals: [],
       tools: new Map(),
       commands: new Map(),
+      entries: new Set(),
+      ...(params.data_dir === undefined ? {} : { dataDir: params.data_dir }),
       state: 'activating',
     }
-    this.owners.set(key, owner)
+    if (!existing) this.owners.set(key, owner)
+    owner.entries.add(params.entry.path)
     try {
       const bytes = await readFile(params.entry.path)
       const digest = createHash('sha256').update(bytes).digest('hex')
@@ -320,31 +346,42 @@ export class HostRoot {
     ).catch(() => undefined)
   }
 
-  async callTool(handle: number, input: unknown, callId: string, signal: AbortSignal): Promise<ToolResultWire> {
+  async callTool(handle: number, input: unknown, callId: string, signal: AbortSignal, workspace?: string): Promise<ToolResultWire> {
     const local = this.toolRegistrations.byHandle.get(handle)
     if (!local || local.disposed || local.owner.state !== 'active') {
       throw new RpcError(ErrorCode.NotAvailable, `tool handle ${handle} is not live`)
     }
     const definition = local.definition
+    // `workspace` is the calling session's workspace, per call; `dataDir` is
+    // this plugin's own directory. Both are read-only strings.
+    const exec = Object.freeze({ signal, callId, args: input, ...callContext(local.owner, workspace) })
     const run = ownerStorage.run(local.owner, async () => {
-      const value = await definition.execute(input, { signal, callId, args: input })
+      const value = await definition.execute(input, exec)
       return renderResult(definition, input, value)
     })
     return Promise.race([run, abortedBy(signal)])
   }
 
   /** `command/run`: only for a handle the core admitted, and only on a user's own invocation. */
-  async callCommand(handle: number, rawInput: string, commandId: string, signal: AbortSignal): Promise<CommandResultWire> {
+  async callCommand(handle: number, rawInput: string, commandId: string, signal: AbortSignal, workspace?: string): Promise<CommandResultWire> {
     const local = this.commandRegistrations.byHandle.get(handle)
     if (!local || local.disposed || local.owner.state !== 'active') {
       throw new RpcError(ErrorCode.NotAvailable, `command handle ${handle} is not live`)
     }
     const { definition } = local
     const run = ownerStorage.run(local.owner, async () => {
-      const value = await definition.handler(makeInvocation(rawInput, commandId, signal))
+      const value = await definition.handler(makeInvocation(rawInput, commandId, signal, callContext(local.owner, workspace)))
       return normalizeResult(definition.name, value)
     })
     return Promise.race([run, abortedBy(signal)])
+  }
+}
+
+/** The read-only context a call carries beyond its input; a field the core did not send is absent. */
+function callContext(owner: OwnerRecord, workspace: string | undefined): { workspace?: string; dataDir?: string } {
+  return {
+    ...(workspace === undefined ? {} : { workspace }),
+    ...(owner.dataDir === undefined ? {} : { dataDir: owner.dataDir }),
   }
 }
 

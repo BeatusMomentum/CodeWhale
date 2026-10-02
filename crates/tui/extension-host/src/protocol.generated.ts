@@ -66,7 +66,7 @@ export const SHAPES: { readonly [name: string]: Shape } = {
   ActivateParams: {
     strict: false,
     required: { owner: { ref: 'OwnerRef' }, plugin_name: 'string', entry: { ref: 'EntryRef' } },
-    optional: { config: 'json' },
+    optional: { config: 'json', data_dir: 'string' },
   },
   CancelParams: {
     strict: true,
@@ -76,7 +76,7 @@ export const SHAPES: { readonly [name: string]: Shape } = {
   CommandRunParams: {
     strict: false,
     required: { handle: 'uint', command_id: 'string', raw_input: 'string', deadline_ms: 'uint' },
-    optional: {},
+    optional: { workspace: 'string' },
   },
   DeactivateParams: {
     strict: false,
@@ -151,7 +151,7 @@ export const SHAPES: { readonly [name: string]: Shape } = {
   ToolCallParams: {
     strict: false,
     required: { handle: 'uint', call_id: 'string', input: 'json', deadline_ms: 'uint' },
-    optional: {},
+    optional: { workspace: 'string' },
   },
   UnregisterParams: {
     strict: true,
@@ -167,6 +167,7 @@ export interface ActivateParams {
   plugin_name: string
   entry: EntryRef
   config?: Json
+  data_dir?: string
 }
 
 export type ActivateResult = { status: 'ok'; tools: string[]; commands?: string[] } | { status: 'failed'; diagnostic: string }
@@ -182,6 +183,7 @@ export interface CommandRunParams {
   command_id: string
   raw_input: string
   deadline_ms: number
+  workspace?: string
 }
 
 export type ContentBlockWire = { type: 'text'; text: string }
@@ -277,6 +279,7 @@ export interface ToolCallParams {
   call_id: string
   input: Json
   deadline_ms: number
+  workspace?: string
 }
 
 export interface ToolResultWire {

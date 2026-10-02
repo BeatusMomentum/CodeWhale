@@ -3208,9 +3208,11 @@ request and nested calls go through the same permission gate as direct calls
 `code_mode = false` to defer it behind `tool_search` again.
 
 `extension_host` is experimental and off by default. Turning it on lets reviewed
-plugins run their `native` TypeScript/JavaScript tool code in a Node sidecar;
-toggling it in either direction changes the plugin activation policy, so every
-plugin is reviewed again after a restart. See
+plugins run their `native` TypeScript/JavaScript tool and slash-command code in
+a separate Node (or, opt-in, Bun) process; toggling it in either direction
+changes the plugin activation policy, so every plugin is reviewed again after a
+restart. Its `[extension_host]` table (`runtime`, `node`, `bun`) and what the
+host's sandbox does on each platform are in
 [Writing an extension tool](EXTENSIONS.md).
 
 Every flag has a row in [`docs/features.toml`](features.toml), the feature

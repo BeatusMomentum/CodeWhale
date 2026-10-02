@@ -7,6 +7,7 @@
 //! reused, so undoing one registration can never touch a newer one.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::Arc;
 
 use serde_json::Value;
 
@@ -60,7 +61,87 @@ pub struct OwnerEntry {
     pub plugin_name: String,
     pub authority: PluginAuthority,
     pub content_hash: String,
+    /// Digest of the plugin config this activation was given (empty until
+    /// [`OwnerRegistry::set_config_hash`]). A change of config is a different
+    /// activation: reconcile revokes the owner and activates a new generation.
+    pub config_hash: String,
     pub state: OwnerState,
+}
+
+/// Most schema violations one refused call reports back to the model.
+const MAX_REPORTED_INPUT_ERRORS: usize = 5;
+/// Bound on the refusal text (violations quote the offending values).
+const MAX_INPUT_ERROR_BYTES: usize = 2048;
+
+/// A tool's input schema, compiled once at registration. The core checks every
+/// call's input against it before anything is sent to the host: a plugin that
+/// registers a plain object receives only input its own schema admits, without
+/// having to validate it itself.
+///
+/// Compiled by `jsonschema` (already linked for Workflow `responseSchema`),
+/// which resolves no external `$ref` here (no network or file resolver is
+/// enabled); a schema it cannot compile is refused at registration.
+#[derive(Clone)]
+pub struct InputValidator(Arc<jsonschema::Validator>);
+
+impl InputValidator {
+    /// Compile `schema`, or say why it cannot be.
+    pub fn compile(schema: &Value) -> Result<Self, String> {
+        jsonschema::validator_for(schema)
+            .map(|validator| Self(Arc::new(validator)))
+            .map_err(|error| error.to_string())
+    }
+
+    /// `Ok` when `input` satisfies the schema; otherwise the violations, as
+    /// text a model can correct its call from.
+    pub fn check(&self, input: &Value) -> Result<(), String> {
+        let mut errors = self.0.iter_errors(input);
+        let Some(first) = errors.next() else {
+            return Ok(());
+        };
+        let describe = |error: &jsonschema::ValidationError<'_>| {
+            let at = error.instance_path().to_string();
+            if at.is_empty() {
+                error.to_string()
+            } else {
+                format!("{error} (at {at})")
+            }
+        };
+        let mut reasons = vec![describe(&first)];
+        let mut more = 0usize;
+        for error in errors {
+            if reasons.len() < MAX_REPORTED_INPUT_ERRORS {
+                reasons.push(describe(&error));
+            } else {
+                more += 1;
+            }
+        }
+        let mut text = reasons.join("; ");
+        if more > 0 {
+            text.push_str(&format!("; and {more} more"));
+        }
+        if text.len() > MAX_INPUT_ERROR_BYTES {
+            let mut end = MAX_INPUT_ERROR_BYTES;
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            text.truncate(end);
+            text.push('…');
+        }
+        Err(text)
+    }
+}
+
+impl PartialEq for InputValidator {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl std::fmt::Debug for InputValidator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InputValidator").finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -74,6 +155,8 @@ pub struct ToolRegistration {
     pub name: String,
     pub description: String,
     pub input_schema: Value,
+    /// `input_schema`, compiled: every call is checked against it.
+    pub input_validator: InputValidator,
 }
 
 /// An admitted slash command. Owned exactly like a tool: one owner
@@ -231,10 +314,20 @@ impl OwnerRegistry {
                 plugin_name: plugin_name.to_string(),
                 authority,
                 content_hash: content_hash.to_string(),
+                config_hash: String::new(),
                 state: OwnerState::Activating,
             },
         );
         owner
+    }
+
+    /// Record which config `owner`'s activation was given.
+    pub fn set_config_hash(&mut self, owner: &OwnerRef, hash: &str) {
+        if let Some(entry) = self.owners.get_mut(&owner.plugin_id)
+            && entry.owner == *owner
+        {
+            entry.config_hash = hash.to_string();
+        }
     }
 
     #[must_use]
@@ -452,6 +545,9 @@ impl OwnerRegistry {
                 "tool `{name}` input schema must be a JSON object schema (`\"type\": \"object\"`)"
             ));
         }
+        let input_validator = InputValidator::compile(&schema).map_err(|reason| {
+            format!("tool `{name}` input schema is not a valid JSON Schema: {reason}")
+        })?;
         let mut replaced = None;
         if let Some(existing) = self
             .by_name
@@ -498,6 +594,7 @@ impl OwnerRegistry {
                 name: name.to_string(),
                 description: spec.description.clone(),
                 input_schema: schema,
+                input_validator,
             },
         );
         self.by_name.insert(key, handle);

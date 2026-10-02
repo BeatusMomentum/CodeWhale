@@ -123,6 +123,10 @@ shlex = "2.0.1"
 globset = "0.4"
 ignore = "0.4"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
+# Already a regular dependency of codewhale-workflow-js (so already linked into
+# this binary); the extension host validates tool input against the schema the
+# plugin registered with it.
+jsonschema.workspace = true
 htmd = "0.5.4"
 # lru >= 0.18.2 fixes RUSTSEC-2026-0253 (panic-unsafe `pop()`).
 lru = "0.18"
@@ -154,7 +158,6 @@ codewhale-models = { path = "../models", version = "0.10.1", features = [
     "test-support",
 ] }
 cucumber = "0.23.0"
-jsonschema.workspace = true
 wiremock = "0.6"
 tiny_http = "0.12"
 pretty_assertions = "1.4"

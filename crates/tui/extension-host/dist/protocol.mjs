@@ -37,7 +37,7 @@ var SHAPES = {
   ActivateParams: {
     strict: false,
     required: { owner: { ref: "OwnerRef" }, plugin_name: "string", entry: { ref: "EntryRef" } },
-    optional: { config: "json" }
+    optional: { config: "json", data_dir: "string" }
   },
   CancelParams: {
     strict: true,
@@ -47,7 +47,7 @@ var SHAPES = {
   CommandRunParams: {
     strict: false,
     required: { handle: "uint", command_id: "string", raw_input: "string", deadline_ms: "uint" },
-    optional: {}
+    optional: { workspace: "string" }
   },
   DeactivateParams: {
     strict: false,
@@ -122,7 +122,7 @@ var SHAPES = {
   ToolCallParams: {
     strict: false,
     required: { handle: "uint", call_id: "string", input: "json", deadline_ms: "uint" },
-    optional: {}
+    optional: { workspace: "string" }
   },
   UnregisterParams: {
     strict: true,

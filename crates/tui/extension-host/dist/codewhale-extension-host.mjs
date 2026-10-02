@@ -4233,7 +4233,7 @@ var SHAPES = {
   ActivateParams: {
     strict: false,
     required: { owner: { ref: "OwnerRef" }, plugin_name: "string", entry: { ref: "EntryRef" } },
-    optional: { config: "json" }
+    optional: { config: "json", data_dir: "string" }
   },
   CancelParams: {
     strict: true,
@@ -4243,7 +4243,7 @@ var SHAPES = {
   CommandRunParams: {
     strict: false,
     required: { handle: "uint", command_id: "string", raw_input: "string", deadline_ms: "uint" },
-    optional: {}
+    optional: { workspace: "string" }
   },
   DeactivateParams: {
     strict: false,
@@ -4318,7 +4318,7 @@ var SHAPES = {
   ToolCallParams: {
     strict: false,
     required: { handle: "uint", call_id: "string", input: "json", deadline_ms: "uint" },
-    optional: {}
+    optional: { workspace: "string" }
   },
   UnregisterParams: {
     strict: true,
@@ -4688,13 +4688,14 @@ function commandSpec(command) {
     ...command.argumentHint === void 0 ? {} : { argument_hint: command.argumentHint }
   };
 }
-function makeInvocation(args, commandId, signal) {
+function makeInvocation(args, commandId, signal, context = {}) {
   return Object.freeze({
     commandId,
     args,
     rawInput: args === "" ? "" : ` ${args}`,
     attachments: NO_ATTACHMENTS,
-    signal
+    signal,
+    ...context
   });
 }
 function normalizeResult(command, value) {
@@ -4879,10 +4880,29 @@ var HostRoot = class {
     const local = { owner, name: definition.name, definition, disposed: false };
     return this.commandRegistrations.add(local, commandSpec(definition));
   }
+  /**
+   * `ext/activate`: load one `native` entry of a plugin under its owner. A
+   * manifest may declare several entries; the core sends one `ext/activate`
+   * per entry, in order, under the same owner token, and every entry becomes a
+   * fiber of that one owner. A further entry is accepted only after the
+   * previous one finished activating, for the same plugin, and only once per
+   * path. Any failure fails the whole owner: its fibers, the earlier entries'
+   * included, are disposed and the owner forgotten (all-or-nothing).
+   */
   async activate(params) {
     const key = params.owner.owner_token;
-    if (this.owners.has(key)) return { status: "failed", diagnostic: "owner token already active" };
-    const owner = {
+    const existing = this.owners.get(key);
+    if (existing) {
+      if (existing.state !== "active") return { status: "failed", diagnostic: "owner token already active" };
+      if (existing.ref.plugin_id !== params.owner.plugin_id || existing.pluginName !== params.plugin_name) {
+        return { status: "failed", diagnostic: "owner token already active for another plugin" };
+      }
+      if (existing.entries.has(params.entry.path)) {
+        return { status: "failed", diagnostic: `entry ${params.entry.path} is already activated under this owner` };
+      }
+      existing.state = "activating";
+    }
+    const owner = existing ?? {
       ref: params.owner,
       pluginName: params.plugin_name,
       fibers: [],
@@ -4890,9 +4910,12 @@ var HostRoot = class {
       refusals: [],
       tools: /* @__PURE__ */ new Map(),
       commands: /* @__PURE__ */ new Map(),
+      entries: /* @__PURE__ */ new Set(),
+      ...params.data_dir === void 0 ? {} : { dataDir: params.data_dir },
       state: "activating"
     };
-    this.owners.set(key, owner);
+    if (!existing) this.owners.set(key, owner);
+    owner.entries.add(params.entry.path);
     try {
       const bytes = await readFile(params.entry.path);
       const digest = createHash("sha256").update(bytes).digest("hex");
@@ -4970,32 +4993,39 @@ var HostRoot = class {
       "shutdown"
     ).catch(() => void 0);
   }
-  async callTool(handle, input, callId, signal) {
+  async callTool(handle, input, callId, signal, workspace) {
     const local = this.toolRegistrations.byHandle.get(handle);
     if (!local || local.disposed || local.owner.state !== "active") {
       throw new RpcError(ErrorCode.NotAvailable, `tool handle ${handle} is not live`);
     }
     const definition = local.definition;
+    const exec = Object.freeze({ signal, callId, args: input, ...callContext(local.owner, workspace) });
     const run = ownerStorage.run(local.owner, async () => {
-      const value = await definition.execute(input, { signal, callId, args: input });
+      const value = await definition.execute(input, exec);
       return renderResult(definition, input, value);
     });
     return Promise.race([run, abortedBy(signal)]);
   }
   /** `command/run`: only for a handle the core admitted, and only on a user's own invocation. */
-  async callCommand(handle, rawInput, commandId, signal) {
+  async callCommand(handle, rawInput, commandId, signal, workspace) {
     const local = this.commandRegistrations.byHandle.get(handle);
     if (!local || local.disposed || local.owner.state !== "active") {
       throw new RpcError(ErrorCode.NotAvailable, `command handle ${handle} is not live`);
     }
     const { definition } = local;
     const run = ownerStorage.run(local.owner, async () => {
-      const value = await definition.handler(makeInvocation(rawInput, commandId, signal));
+      const value = await definition.handler(makeInvocation(rawInput, commandId, signal, callContext(local.owner, workspace)));
       return normalizeResult(definition.name, value);
     });
     return Promise.race([run, abortedBy(signal)]);
   }
 };
+function callContext(owner, workspace) {
+  return {
+    ...workspace === void 0 ? {} : { workspace },
+    ...owner.dataDir === void 0 ? {} : { dataDir: owner.dataDir }
+  };
+}
 function abortedBy(signal) {
   return new Promise((_, reject) => {
     const onAbort = () => reject(new RpcError(ErrorCode.Cancelled, "cancelled"));
@@ -5156,11 +5186,11 @@ rpc.onRequest("ext/deactivate", async (params) => {
 });
 rpc.onRequest("tool/call", async (params, cx) => {
   requireInitialized();
-  return host.callTool(params.handle, params.input, params.call_id, cx.signal);
+  return host.callTool(params.handle, params.input, params.call_id, cx.signal, params.workspace);
 });
 rpc.onRequest("command/run", async (params, cx) => {
   requireInitialized();
-  return host.callCommand(params.handle, params.raw_input, params.command_id, cx.signal);
+  return host.callCommand(params.handle, params.raw_input, params.command_id, cx.signal, params.workspace);
 });
 rpc.onRequest("host/shutdown", async () => {
   await host.deactivateAll(2e3);

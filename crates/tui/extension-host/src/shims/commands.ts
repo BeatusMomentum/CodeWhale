@@ -28,7 +28,9 @@
  * The invocation carries `args` (what follows the name, trimmed), `rawInput`
  * (DSH's spelling: the text after the name including its leading separator,
  * so `' hello'`), `commandId`, `signal` (aborted when the core cancels the
- * call) and an always-empty `attachments`. Not provided: DSH's `agent`
+ * call), an always-empty `attachments`, and the read-only strings `workspace`
+ * (where the user ran the command) and `dataDir` (the plugin's own writable
+ * directory). Not provided: DSH's `agent`
  * (the host has no agent or session handle), attachments (`input.attachments`
  * is refused), `recordInput`/`definitionId` (accepted, ignored: the core logs
  * nothing about a command), `list`/`find`/`execute`, and `sourceEventSeq`
@@ -62,6 +64,10 @@ export interface CommandInvocation {
   readonly rawInput: string
   readonly attachments: readonly never[]
   readonly signal: AbortSignal
+  /** The workspace the user ran the command in (absent if the core did not say). */
+  readonly workspace?: string
+  /** This plugin's own writable directory. */
+  readonly dataDir?: string
 }
 
 /** Reject an invalid definition before it reaches the core, with a message that names the problem. */
@@ -106,13 +112,19 @@ export function commandSpec(command: NormalizedCommand) {
   }
 }
 
-export function makeInvocation(args: string, commandId: string, signal: AbortSignal): CommandInvocation {
+export function makeInvocation(
+  args: string,
+  commandId: string,
+  signal: AbortSignal,
+  context: { workspace?: string; dataDir?: string } = {},
+): CommandInvocation {
   return Object.freeze({
     commandId,
     args,
     rawInput: args === '' ? '' : ` ${args}`,
     attachments: NO_ATTACHMENTS,
     signal,
+    ...context,
   })
 }
 

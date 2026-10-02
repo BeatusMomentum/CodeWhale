@@ -592,8 +592,14 @@ pub struct ActivateParams {
     pub owner: OwnerRef,
     pub plugin_name: String,
     pub entry: EntryRef,
+    /// The plugin's settings (`[plugins."<name>".config]`), delivered as the
+    /// second argument of `apply`. Always an object; `{}` when none.
     #[serde(default = "empty_object")]
     pub config: Value,
+    /// The plugin's own writable directory (read-only string to the plugin).
+    /// The same for every entry of one owner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_dir: Option<String>,
 }
 
 fn empty_object() -> Value {
@@ -613,6 +619,10 @@ pub struct ToolCallParams {
     pub call_id: String,
     pub input: Value,
     pub deadline_ms: u64,
+    /// The workspace of the session the call comes from, and no other. Absent
+    /// when its path is not valid UTF-8.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
 }
 
 /// One user invocation of a registered command. `raw_input` is what follows
@@ -624,6 +634,9 @@ pub struct CommandRunParams {
     pub command_id: String,
     pub raw_input: String,
     pub deadline_ms: u64,
+    /// The workspace the user ran the command in, and no other.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

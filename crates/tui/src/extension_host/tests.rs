@@ -5,6 +5,7 @@
 //! they skip with a printed reason when none is found, unless
 //! `CODEWHALE_EXT_HOST_TESTS=1` is set (CI), where a missing Node fails.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -284,6 +285,267 @@ fn registry_enforces_schema_and_count_caps() {
     );
 }
 
+/// A tool registered through the real admission path, as the registry hands it
+/// to `HostToolSpec`, with `schema` as its input schema.
+fn admitted_tool(schema: Value) -> Result<super::registry::ToolRegistration, String> {
+    let mut registry = OwnerRegistry::new();
+    let owner = registry.begin_owner("probe", "probe", fake_authority("probe"), "hash-probe");
+    registry.register_tool(&RegisterParams {
+        owner: owner.clone(),
+        kind: RegisterKind::Tool,
+        spec: RegisterSpecWire {
+            name: "probe_tool".to_string(),
+            description: "d".to_string(),
+            input_schema: schema.as_object().cloned(),
+            argument_hint: None,
+        },
+    })?;
+    assert!(registry.mark_active(&owner));
+    Ok(registry.live_tools().remove(0))
+}
+
+#[test]
+fn an_uncompilable_tool_schema_is_refused_at_registration_with_a_reason() {
+    for (label, schema) in [
+        (
+            "an unknown type",
+            json!({"type": "object", "properties": {"a": {"type": "nonsense"}}}),
+        ),
+        (
+            "an external $ref the core will not fetch",
+            json!({"type": "object", "properties": {"a": {"$ref": "https://example.invalid/schema.json"}}}),
+        ),
+        (
+            "a required list that is not a list",
+            json!({"type": "object", "required": "a"}),
+        ),
+    ] {
+        let reason = admitted_tool(schema).expect_err(label);
+        assert!(
+            reason.contains("probe_tool") && reason.contains("not a valid JSON Schema"),
+            "{label}: {reason}"
+        );
+    }
+    admitted_tool(json!({"type": "object", "properties": {"a": {"type": "string"}}}))
+        .expect("a valid schema is admitted");
+}
+
+/// What the model gets back, and what the host never sees: the tool checks the
+/// input against its registered schema in `prepare` (before any approval
+/// card) and again in `execute`.
+#[tokio::test]
+async fn tool_input_is_checked_against_the_registered_schema_before_approval_and_execution() {
+    let registration = admitted_tool(json!({
+        "type": "object",
+        "properties": {
+            "name": {"type": "string"},
+            "count": {"type": "integer", "minimum": 0}
+        },
+        "required": ["name"],
+        "additionalProperties": false
+    }))
+    .unwrap();
+    // No host is running: a call that reached it would say so (`NotAvailable`).
+    let manager = ExtensionHostManager::new(ExtensionHostOptions::default());
+    let tool = super::tool::HostToolSpec::new(registration, Arc::clone(&manager.shared));
+    let context = ToolContext::new(Path::new("/w"));
+
+    let rejected = |input: Value, expect: &[&str]| {
+        let error = tool.prepare(input.clone(), &context).unwrap_err();
+        let ToolError::InvalidInput { message } = error else {
+            panic!("{input}: not an invalid-input error: {error:?}");
+        };
+        assert!(
+            message.contains("probe_tool") && expect.iter().all(|part| message.contains(part)),
+            "{input}: {message}"
+        );
+        input
+    };
+    // Valid input passes `prepare`, with the Rust-composed approval card.
+    let prepared = tool
+        .prepare(json!({"name": "x", "count": 2}), &context)
+        .expect("valid input is admitted");
+    assert_eq!(prepared.approval, ApprovalRequirement::Required);
+    // An extra property.
+    let extra = rejected(json!({"name": "x", "surprise": true}), &["surprise"]);
+    // A wrong type, and the path of the field.
+    let wrong_type = rejected(json!({"name": 7}), &["name"]);
+    rejected(json!({"name": "x", "count": -1}), &["count"]);
+    // A missing required field, and a non-object.
+    rejected(json!({}), &["name"]);
+    rejected(json!("name"), &[]);
+
+    // `execute` refuses the same inputs without touching the host (which is
+    // not running, so reaching it would be `NotAvailable`)...
+    for input in [extra, wrong_type] {
+        let error = tool.execute(input.clone(), &context).await.unwrap_err();
+        assert!(
+            matches!(error, ToolError::InvalidInput { .. }),
+            "{input}: {error:?}"
+        );
+    }
+    assert_eq!(manager.spawn_attempts(), 0);
+    // ...while valid input gets past the check and meets the dead host.
+    let error = tool
+        .execute(json!({"name": "x"}), &context)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, ToolError::NotAvailable { .. }), "{error:?}");
+}
+
+// ---------------------------------------------------------------------------
+// Licence notices for the embedded bundle
+// ---------------------------------------------------------------------------
+
+/// Every `node_modules/<package>` the bundle was built from, read from the
+/// bundler's own `// node_modules/...` markers in the embedded bundle (not
+/// from the generator that writes the notices).
+fn bundled_packages() -> BTreeSet<String> {
+    let text = std::str::from_utf8(super::BUNDLE).expect("the bundle is UTF-8");
+    let mut packages = BTreeSet::new();
+    for line in text.lines() {
+        let Some(path) = line.strip_prefix("// ") else {
+            continue;
+        };
+        let Some((_, after)) = path.rsplit_once("node_modules/") else {
+            continue;
+        };
+        let mut parts = after.split('/');
+        let first = parts.next().unwrap_or_default();
+        let name = if first.starts_with('@') {
+            format!("{first}/{}", parts.next().unwrap_or_default())
+        } else {
+            first.to_string()
+        };
+        packages.insert(name);
+    }
+    packages
+}
+
+/// `name@version` of every package the embedded notices list.
+fn noticed_packages() -> Vec<(String, String)> {
+    let text = std::str::from_utf8(super::NOTICES).expect("the notices are UTF-8");
+    let listed = text
+        .split_once("\nPackages:\n")
+        .expect("the notices list their packages")
+        .1;
+    listed
+        .lines()
+        .take_while(|line| line.starts_with("  "))
+        .map(|line| {
+            let entry = line.trim().split(" (").next().unwrap();
+            let (name, version) = entry.rsplit_once('@').expect("name@version");
+            (name.to_string(), version.to_string())
+        })
+        .collect()
+}
+
+#[test]
+fn materialized_bundle_directory_carries_its_licence_notices() {
+    let home = tempfile::tempdir().unwrap();
+    let bundle = super::materialize_bundle(home.path()).unwrap();
+    let dir = bundle.parent().unwrap().to_path_buf();
+    assert_eq!(
+        dir,
+        super::supervisor::bundle_dir(home.path(), super::bundle_sha256()),
+        "the notices live in the bundle's own digest-named directory"
+    );
+    let notices = dir.join("LICENSES.txt");
+    assert_eq!(std::fs::read(&notices).unwrap(), super::NOTICES);
+    assert_eq!(std::fs::read(&bundle).unwrap(), super::BUNDLE);
+    assert!(
+        std::str::from_utf8(super::NOTICES)
+            .unwrap()
+            .contains("Copyright (c) 2021-present Shigma"),
+        "the notices carry the licence text, not only package names"
+    );
+    // Written like the bundle: read-only, no staging files left behind.
+    #[cfg(unix)]
+    for path in [&bundle, &notices] {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o400,
+            "{}",
+            path.display()
+        );
+    }
+    let mut names: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    assert_eq!(names, ["LICENSES.txt", "codewhale-extension-host.mjs"]);
+
+    // A directory from a build that wrote only the bundle gets its notices; a
+    // tampered or replaced notices file is rewritten, never trusted.
+    std::fs::remove_file(&notices).unwrap();
+    super::materialize_bundle(home.path()).unwrap();
+    assert_eq!(std::fs::read(&notices).unwrap(), super::NOTICES);
+    std::fs::remove_file(&notices).unwrap();
+    std::fs::write(&notices, "tampered").unwrap();
+    super::materialize_bundle(home.path()).unwrap();
+    assert_eq!(std::fs::read(&notices).unwrap(), super::NOTICES);
+    #[cfg(unix)]
+    {
+        let elsewhere = home.path().join("elsewhere.txt");
+        std::fs::write(&elsewhere, "not the notices").unwrap();
+        std::fs::remove_file(&notices).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &notices).unwrap();
+        super::materialize_bundle(home.path()).unwrap();
+        assert!(
+            !std::fs::symlink_metadata(&notices)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "a symlink at the notices name is replaced, not followed"
+        );
+        assert_eq!(std::fs::read(&notices).unwrap(), super::NOTICES);
+        assert_eq!(
+            std::fs::read_to_string(&elsewhere).unwrap(),
+            "not the notices",
+            "the symlink's target is never written through"
+        );
+    }
+}
+
+#[test]
+fn every_package_in_the_bundle_has_a_licence_notice_and_a_third_party_entry() {
+    let bundled = bundled_packages();
+    assert!(
+        bundled.contains("@deepseek-ai/cordis"),
+        "the scan of the bundle found no packages: {bundled:?}"
+    );
+    let noticed = noticed_packages();
+    let third_party = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../THIRD_PARTY_NOTICES.md"),
+    )
+    .expect("THIRD_PARTY_NOTICES.md");
+    let notice_text = std::str::from_utf8(super::NOTICES).unwrap();
+    for package in &bundled {
+        let Some((_, version)) = noticed.iter().find(|(name, _)| name == package) else {
+            panic!("`{package}` is in the host bundle but not in dist/LICENSES.txt: {noticed:?}");
+        };
+        assert!(
+            third_party.contains(&format!("`{package}` {version}")),
+            "`{package}` {version} is bundled but THIRD_PARTY_NOTICES.md does not list it"
+        );
+        let heading = format!("{package}@{version} (");
+        assert!(
+            notice_text.matches(&heading).count() >= 2,
+            "dist/LICENSES.txt lists `{package}` but carries no section with its licence text"
+        );
+    }
+    // The verbatim excerpts are not node_modules inputs; the notices still
+    // name them, and THIRD_PARTY_NOTICES.md must too.
+    for (package, version) in &noticed {
+        assert!(
+            third_party.contains(&format!("`{package}` {version}")),
+            "`{package}` {version} is in dist/LICENSES.txt but not in THIRD_PARTY_NOTICES.md"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Integration: real Node, real bundle
 // ---------------------------------------------------------------------------
@@ -551,6 +813,370 @@ async fn dsh_plugin_runs_end_to_end_behind_the_approval_gate() {
     let payload: Value = serde_json::from_str(&result.content).unwrap();
     assert_eq!(payload["pythonDistributions"]["numpy"], "2.1.0");
     assert!(payload["python"].as_str().unwrap().contains("dependencies"));
+    manager.shutdown().await;
+}
+
+/// A manifest may declare several `native` entries. They activate under one
+/// owner, in order, and are torn down together; a failing entry fails the whole
+/// plugin and nothing of an earlier entry stays registered.
+#[tokio::test]
+async fn a_plugin_with_two_native_entries_activates_both_under_one_owner() {
+    let Some(node) = node_for_tests("a_plugin_with_two_native_entries") else {
+        return;
+    };
+    let _policy = TestPolicyGuard::extension_host(true);
+    let fixture = FixturePlugins::new(&["two-entries", "two-entries-failing"]).await;
+    let manager = fixture.manager(node);
+    let engine = manager.attach(fixture.registry());
+    engine.sync().await.unwrap();
+    let registry = fixture.registry();
+    let id = |name: &str| registry.get(name).unwrap().id.as_str().to_string();
+
+    // Both entries are live under the one owner.
+    assert_eq!(
+        manager.owner_state(&id("two-entries")),
+        Some(OwnerState::Active)
+    );
+    assert_eq!(manager.live_tool_names(), ["two_first", "two_second"]);
+    assert_eq!(manager.live_command_names(), ["two-hello"]);
+    let report = manager.owner_report(&id("two-entries")).unwrap();
+    assert!(
+        report.diagnostics.iter().any(
+            |line| line.contains("tools: two_first, two_second") && line.contains("/two-hello")
+        ),
+        "{:?}",
+        report.diagnostics
+    );
+    let context = ToolContext::new(fixture.workspace());
+    for (name, answer) in [("two_first", "first"), ("two_second", "second")] {
+        let result = host_tool(&engine, fixture.workspace(), name)
+            .execute(json!({}), &context)
+            .await
+            .unwrap();
+        assert_eq!(result.content, answer);
+    }
+
+    // The failing plugin: its second entry throws, so the owner failed, the
+    // first entry's tool is not live, and the reason names the second entry.
+    let failing = id("two-entries-failing");
+    assert!(
+        matches!(manager.owner_state(&failing), Some(OwnerState::Failed(ref reason))
+            if reason.contains("second entry refuses to start")),
+        "{:?}",
+        manager.owner_state(&failing)
+    );
+    assert!(
+        !manager.live_tool_names().contains(&"tef_first".to_string()),
+        "{:?}",
+        manager.live_tool_names()
+    );
+    // The healthy plugin sharing the host is untouched, and a later reconcile
+    // does not retry the failed bytes.
+    engine.sync().await.unwrap();
+    assert_eq!(manager.live_tool_names(), ["two_first", "two_second"]);
+    manager.shutdown().await;
+}
+
+fn plugin_settings(
+    name: &str,
+    config: &str,
+) -> std::collections::BTreeMap<String, crate::config::PluginSettings> {
+    std::collections::BTreeMap::from([(
+        name.to_string(),
+        crate::config::PluginSettings {
+            config: Some(toml::from_str(config).expect("config TOML")),
+        },
+    )])
+}
+
+/// Run an extension tool and parse its JSON answer.
+async fn call_json(tool: &Arc<dyn ToolSpec>, input: Value, workspace: &Path) -> Value {
+    let result = tool
+        .execute(input, &ToolContext::new(workspace))
+        .await
+        .unwrap_or_else(|error| panic!("{error:?}"));
+    serde_json::from_str(&result.content).expect("a JSON answer")
+}
+
+/// The plugin's settings come from the user's config file, are bounded, and
+/// the keys (never the values) are what `/plugin show` can list.
+#[test]
+fn plugin_settings_are_read_from_the_user_config_and_bounded() {
+    use super::plugin_config::{MAX_PLUGIN_CONFIG_BYTES, PluginConfigs};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    // Other keys are none of this reader's business; `[plugins]` is.
+    std::fs::write(
+        &path,
+        "model = \"x\"\n[plugins.\"greeter\".config]\ngreeting = \"Hi\"\nlimit = 3\n[plugins.\"greeter\".config.nested]\ntags = [\"a\", \"b\"]\n[plugins.\"quiet\"]\n",
+    )
+    .unwrap();
+    let settings = crate::config::read_plugin_settings(&path).unwrap();
+    let mut configs = PluginConfigs::default();
+    configs.replace(&settings, Some(path.clone()));
+    assert_eq!(configs.source(), Some(path.clone()));
+    let greeter = configs.select("greeter").unwrap();
+    assert_eq!(
+        greeter.value,
+        json!({"greeting": "Hi", "limit": 3, "nested": {"tags": ["a", "b"]}})
+    );
+    // Keys only, in order; a plugin with a table but no config has nothing to list.
+    assert_eq!(
+        configs.summary("greeter").unwrap().unwrap(),
+        ["greeting", "limit", "nested"]
+    );
+    assert!(configs.summary("quiet").is_none());
+    assert!(configs.summary("nobody").is_none());
+    // No settings is an empty object, with a digest of its own.
+    let none = configs.select("nobody").unwrap();
+    assert_eq!(none.value, json!({}));
+    assert_ne!(none.hash, greeter.hash);
+    // The digest follows the value: equal for the same settings, new for a change.
+    let mut again = PluginConfigs::default();
+    again.replace(&settings, None);
+    assert_eq!(again.select("greeter").unwrap().hash, greeter.hash);
+    assert_eq!(again.source(), None, "a reload names no new source");
+    configs.replace_reloaded(&plugin_settings("greeter", "greeting = \"Yo\""));
+    assert_ne!(configs.select("greeter").unwrap().hash, greeter.hash);
+    assert_eq!(
+        configs.source(),
+        Some(path.clone()),
+        "the source survives a reload"
+    );
+
+    // A missing file has no settings; an unreadable shape or a stray key fails loudly.
+    assert!(
+        crate::config::read_plugin_settings(&dir.path().join("absent.toml"))
+            .unwrap()
+            .is_empty()
+    );
+    std::fs::write(&path, "[plugins.\"greeter\"]\nenabled = true\n").unwrap();
+    assert!(
+        crate::config::read_plugin_settings(&path)
+            .unwrap_err()
+            .contains("cannot parse")
+    );
+
+    // Refusals name the plugin and the rule; the config is never half-delivered.
+    let refuse = |config: &str| -> String {
+        let mut configs = PluginConfigs::default();
+        configs.replace(&plugin_settings("greeter", config), None);
+        configs.select("greeter").unwrap_err()
+    };
+    let big = refuse(&format!(
+        "blob = \"{}\"",
+        "x".repeat(MAX_PLUGIN_CONFIG_BYTES)
+    ));
+    assert!(
+        big.contains("greeter") && big.contains("byte limit"),
+        "{big}"
+    );
+    let at_limit = format!("blob = \"{}\"", "x".repeat(MAX_PLUGIN_CONFIG_BYTES - 20));
+    let mut ok = PluginConfigs::default();
+    ok.replace(&plugin_settings("greeter", &at_limit), None);
+    assert!(
+        ok.select("greeter").is_ok(),
+        "just under the cap is accepted"
+    );
+    let when = refuse("when = 1979-05-27T07:32:00Z");
+    assert!(when.contains("date-time"), "{when}");
+    let deep = refuse(&format!("x = {}1{}", "[".repeat(20), "]".repeat(20)));
+    assert!(deep.contains("nests deeper"), "{deep}");
+    // A refused config has a digest too, so it is not retried every turn but is once the file changes.
+    let refused: Result<super::plugin_config::PluginConfig, String> = Err(big);
+    assert!(super::plugin_config::activation_hash(&refused).starts_with("refused:"));
+}
+
+/// The plugin's context in a real host: its settings (checked by its own
+/// `Config` schema), the workspace of each call, and its own data directory;
+/// a change of settings re-activates it under a new generation; a refused one
+/// fails it with the reason.
+#[tokio::test]
+async fn plugin_context_reaches_the_plugin_and_changed_settings_reactivate_it() {
+    let Some(node) = node_for_tests("plugin_context_reaches_the_plugin") else {
+        return;
+    };
+    let _policy = TestPolicyGuard::extension_host(true);
+    let fixture = FixturePlugins::new(&["plugin-context"]).await;
+    let manager = fixture.manager(node);
+    let _manager = super::TestManagerGuard::install(Arc::clone(&manager));
+    let id = fixture
+        .registry()
+        .get("plugin-context")
+        .unwrap()
+        .id
+        .as_str()
+        .to_string();
+    let generation = |manager: &ExtensionHostManager| {
+        manager
+            .shared
+            .registry
+            .lock()
+            .unwrap()
+            .owner(&id)
+            .map(|entry| entry.owner.generation)
+    };
+    manager.set_plugin_settings(
+        &plugin_settings("plugin-context", "greeting = \"Hi\""),
+        None,
+    );
+    let engine = manager.attach(fixture.registry());
+    engine.sync().await.unwrap();
+    assert_eq!(manager.owner_state(&id), Some(OwnerState::Active));
+    let first_generation = generation(&manager).unwrap();
+
+    let data_dir = super::supervisor::plugin_data_dir(&fixture.root, &id, "plugin-context");
+    assert!(
+        data_dir.is_dir(),
+        "the core made the plugin's directory before activation"
+    );
+    assert!(
+        data_dir.starts_with(fixture.root.join("extension-host/data/plugins")),
+        "{}",
+        data_dir.display()
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&data_dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+    }
+
+    let probe = host_tool(&engine, fixture.workspace(), "ctx_probe");
+    let seen = call_json(&probe, json!({}), fixture.workspace()).await;
+    // The plugin's own schema supplied the default for `limit`.
+    assert_eq!(seen["config"], json!({"greeting": "Hi", "limit": 3}));
+    assert_eq!(seen["workspace"], fixture.workspace().to_str().unwrap());
+    assert_eq!(seen["dataDir"], data_dir.to_str().unwrap());
+    // The workspace is the call's own, not the process's or the plugin's.
+    let elsewhere = fixture.workspace().join("elsewhere");
+    let seen = call_json(&probe, json!({}), &elsewhere).await;
+    assert_eq!(seen["workspace"], elsewhere.to_str().unwrap());
+    // Nothing else about the machine is in the context.
+    assert_eq!(
+        seen["keys"],
+        json!(["args", "callId", "dataDir", "signal", "workspace"])
+    );
+    // The schema refuses an unknown field before the host is asked.
+    let error = probe
+        .execute(
+            json!({"home": true}),
+            &ToolContext::new(fixture.workspace()),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, ToolError::InvalidInput { .. }), "{error:?}");
+
+    // The plugin can write in its own directory, inside the host's sandbox.
+    let note = host_tool(&engine, fixture.workspace(), "ctx_note");
+    let written = call_json(&note, json!({"text": "remember"}), fixture.workspace()).await;
+    assert_eq!(written["file"], data_dir.join("note.txt").to_str().unwrap());
+    assert_eq!(
+        std::fs::read_to_string(data_dir.join("note.txt")).unwrap(),
+        "remember"
+    );
+
+    // A command is told the workspace it was loaded for, and the same directory.
+    let entries = manager.commands_for_workspace(fixture.workspace());
+    let command = entries
+        .first()
+        .expect("the plugin's command is live")
+        .reference();
+    let super::command::CommandOutcome::Show { text } =
+        super::command::run(&manager.shared, &command, "")
+            .await
+            .unwrap()
+    else {
+        panic!("a show answer");
+    };
+    let said: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(said["workspace"], fixture.workspace().to_str().unwrap());
+    assert_eq!(said["dataDir"], data_dir.to_str().unwrap());
+    assert_eq!(said["config"]["greeting"], "Hi");
+
+    // What `/plugin show` can list: keys, not values.
+    assert_eq!(
+        manager
+            .plugin_config_summary("plugin-context")
+            .unwrap()
+            .unwrap(),
+        ["greeting"]
+    );
+
+    // Unchanged settings never churn the owner...
+    manager.set_plugin_settings(
+        &plugin_settings("plugin-context", "greeting = \"Hi\""),
+        None,
+    );
+    engine.sync().await.unwrap();
+    assert_eq!(generation(&manager), Some(first_generation));
+    // ...a changed value is a new generation with the new value...
+    manager.set_plugin_settings(
+        &plugin_settings("plugin-context", "greeting = \"Yo\""),
+        None,
+    );
+    engine.sync().await.unwrap();
+    assert_eq!(manager.owner_state(&id), Some(OwnerState::Active));
+    assert!(generation(&manager).unwrap() > first_generation);
+    let probe = host_tool(&engine, fixture.workspace(), "ctx_probe");
+    assert_eq!(
+        call_json(&probe, json!({}), fixture.workspace()).await["config"]["greeting"],
+        "Yo"
+    );
+    // The same directory serves every generation: the note survived.
+    assert_eq!(
+        std::fs::read_to_string(data_dir.join("note.txt")).unwrap(),
+        "remember"
+    );
+
+    // ...a config the plugin's own schema refuses fails it with the field named
+    // and leaves nothing live...
+    manager.set_plugin_settings(&plugin_settings("plugin-context", "limit = 99"), None);
+    engine.sync().await.unwrap();
+    assert!(
+        matches!(manager.owner_state(&id), Some(OwnerState::Failed(ref reason)) if reason.contains("limit")),
+        "{:?}",
+        manager.owner_state(&id)
+    );
+    assert!(manager.live_tool_names().is_empty());
+    assert!(
+        manager
+            .commands_for_workspace(fixture.workspace())
+            .is_empty()
+    );
+    // ...so does one over the size cap (refused before the host is asked), and
+    // `/plugin show` says why...
+    manager.set_plugin_settings(
+        &plugin_settings(
+            "plugin-context",
+            &format!(
+                "blob = \"{}\"",
+                "x".repeat(super::plugin_config::MAX_PLUGIN_CONFIG_BYTES)
+            ),
+        ),
+        None,
+    );
+    engine.sync().await.unwrap();
+    assert!(
+        matches!(manager.owner_state(&id), Some(OwnerState::Failed(ref reason)) if reason.contains("byte limit")),
+        "{:?}",
+        manager.owner_state(&id)
+    );
+    assert!(
+        manager
+            .plugin_config_summary("plugin-context")
+            .unwrap()
+            .is_err()
+    );
+    // ...and fixing the settings brings it back, without a restart.
+    manager.set_plugin_settings(
+        &plugin_settings("plugin-context", "greeting = \"Hello again\""),
+        None,
+    );
+    engine.sync().await.unwrap();
+    assert_eq!(manager.owner_state(&id), Some(OwnerState::Active));
     manager.shutdown().await;
 }
 
@@ -1256,6 +1882,30 @@ async fn typed_author_example_is_reviewed_before_its_tool_can_execute() {
     let payload: Value = serde_json::from_str(&result.content).unwrap();
     assert_eq!(payload["greeting"], "Hello, Codewhale!");
     assert!(payload["callId"].as_str().is_some_and(|id| !id.is_empty()));
+
+    // The example registers a plain object whose schema says
+    // `additionalProperties: false` and `name: string`. The core enforces it;
+    // the example's own `execute` would have accepted either input. Neither
+    // call reaches the host.
+    let sent = manager.host_requests_started();
+    for input in [
+        json!({"name": "Codewhale", "surprise": true}),
+        json!({"name": 7}),
+    ] {
+        let error = tool
+            .execute(input.clone(), &ToolContext::new(fixture.workspace()))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, ToolError::InvalidInput { ref message } if message.contains("hello_greet")),
+            "{input}: {error:?}"
+        );
+    }
+    assert_eq!(
+        manager.host_requests_started(),
+        sent,
+        "a call the schema refuses sends the host nothing"
+    );
     manager.shutdown().await;
 }
 
@@ -1612,6 +2262,7 @@ async fn ordinary_exit_rejects_requests_from_a_drained_calls_waker() {
                 call_id: "exit-admission".into(),
                 input: json!({"ms": 30_000}),
                 deadline_ms: 60_000,
+                workspace: None,
             }),
             Some(registration.owner.plugin_id),
         )
@@ -1667,6 +2318,7 @@ async fn idle_retirement_seals_admission_and_does_not_wait_for_heartbeat() {
                 call_id: "idle-admission".into(),
                 input: json!({"ms": 100}),
                 deadline_ms: 5000,
+                workspace: None,
             }),
             Some(registration.owner.plugin_id),
         )
@@ -1750,6 +2402,7 @@ async fn two_dirty_teardowns_wait_for_a_live_call_then_replay_without_spending_c
                 call_id: "survives-dirty-teardown".into(),
                 input: json!({"ms": 4000}),
                 deadline_ms: 10000,
+                workspace: None,
             }),
             Some(registration.owner.plugin_id.clone()),
         )
@@ -2981,6 +3634,7 @@ fn command_run_and_its_answers_have_the_documented_shapes() {
         command_id: "c".to_string(),
         raw_input: "args".to_string(),
         deadline_ms: 30_000,
+        workspace: None,
     });
     assert_eq!(request.method(), "command/run");
     assert_eq!(request.deadline(), Duration::from_secs(30));
@@ -3359,6 +4013,7 @@ async fn extension_commands_never_shadow_built_ins_or_other_plugins() {
             argument_hint: None,
         },
         authority: fake_authority("p"),
+        workspace: PathBuf::from("/w"),
     };
     registry.load_extension_commands(vec![entry("ext-echo"), entry("help")]);
     let errors: Vec<String> = registry
@@ -3397,6 +4052,7 @@ async fn a_command_from_a_dead_host_reports_host_down() {
             plugin_id: "probe".into(),
             generation: owner.generation,
             origin: "extension:probe".into(),
+            workspace: PathBuf::from("/w"),
         }
     };
     let refused = "start failed: no runtime";

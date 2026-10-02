@@ -3,7 +3,7 @@
 //! Because it is a registry tool, every existing gate applies unchanged:
 //! plan mode, the authority envelope, deferral, hooks, approval, and code
 //! mode (which suspends gated calls for approval and refuses ungated calls
-//! before any host call). Three rules are specific to extension tools:
+//! before any host call). Four rules are specific to extension tools:
 //!
 //! * **Always `ApprovalRequirement::Required`.** A plugin's own read-only
 //!   hint (`presentCall` `kind: 'read'`, MCP-style annotations) is display
@@ -14,6 +14,10 @@
 //!   and the session-grant key ([`ToolSpec::approval_scope`]), so an updated
 //!   plugin, or a different plugin that later takes the same tool name, never
 //!   inherits a grant.
+//! * **Input is checked against the tool's registered JSON Schema** before
+//!   approval and again before anything is sent to the host
+//!   ([`super::registry::InputValidator`]). A schema that cannot be compiled is
+//!   refused at registration.
 //! * **Liveness is re-checked at call time**: the plugin's reviewed receipt,
 //!   the Native adapter in this build's policy, and the exact owner
 //!   generation. A revocation mid-turn fails the call closed.
@@ -54,6 +58,21 @@ impl HostToolSpec {
     #[must_use]
     pub fn origin(&self) -> String {
         format!("extension:{}", self.registration.plugin_name)
+    }
+
+    /// Check `input` against the schema the plugin registered the tool with.
+    /// The error is the ordinary invalid-input tool error, so the model sees
+    /// what to correct; the host is never reached.
+    fn check_input(&self, input: &Value) -> Result<(), ToolError> {
+        self.registration
+            .input_validator
+            .check(input)
+            .map_err(|reason| {
+                ToolError::invalid_input(format!(
+                    "extension tool `{}` rejected the input: {reason}",
+                    self.registration.name
+                ))
+            })
     }
 
     /// The approval-card text. Rust composes it; the extension supplies none.
@@ -190,6 +209,9 @@ impl ToolSpec for HostToolSpec {
     }
 
     fn prepare(&self, input: Value, _context: &ToolContext) -> Result<PreparedToolCall, ToolError> {
+        // Before the user is asked to approve it: a call the schema refuses is
+        // returned to the model to correct and never becomes an approval card.
+        self.check_input(&input)?;
         Ok(PreparedToolCall {
             name: self.registration.name.clone(),
             // Rust composes the card; the extension cannot supply approval text.
@@ -205,6 +227,9 @@ impl ToolSpec for HostToolSpec {
 
     async fn execute(&self, input: Value, context: &ToolContext) -> Result<ToolResult, ToolError> {
         let registration = &self.registration;
+        // Again here: `execute` is also reached without `prepare`, and nothing
+        // that fails the schema may be sent to the host.
+        self.check_input(&input)?;
         let host = self
             .manager
             .live_host_for(registration)
@@ -224,6 +249,9 @@ impl ToolSpec for HostToolSpec {
             call_id,
             input,
             deadline_ms: u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX),
+            // The calling session's workspace and no other: the plugin never
+            // learns where else this process has workspaces.
+            workspace: context.workspace.to_str().map(str::to_owned),
         });
         let value = host
             .call(request, Some(registration.owner.plugin_id.clone()))

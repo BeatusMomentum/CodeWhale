@@ -13,7 +13,9 @@ Start with [hello-extension](examples/plugins/hello-extension/hello.mts) and its
 executed unchanged by the host tests. It returns a greeting and does not read
 files or use the network.
 
-1. Explicitly enable `[features] extension_host = true` in your configuration.
+1. Explicitly enable `[features] extension_host = true` in your configuration,
+   or start Codewhale with `codewhale --enable extension_host` (the flag goes
+   before any subcommand).
 2. Install the example's directory using `/plugin install <local-directory>`.
 3. Run `/plugin validate hello-extension`, then `/plugin show hello-extension`.
 4. Run `/plugin enable hello-extension` to open its content/capability review.
@@ -34,6 +36,15 @@ User bundles live under `~/.codewhale/plugins/`; workspace bundles live under
 `.mjs`, `.js` or `.mts` file inside the bundle. Directories and other extensions
 fail validation when the host is enabled. With the flag off, native entries
 remain inventory-only.
+
+A plugin may split its code across several entries with `native.paths` (up to
+64, alone or beside `path`). They are activated in the order declared, as the
+fibers of one plugin: they share one owner, so one disable, review change or
+crash tears all of them down together. Each entry is a separate module with its
+own `apply`, and tool and command names must be unique across them. If any entry
+fails to activate (throws, requires a service the host does not provide, or has
+a registration refused), the whole plugin fails and nothing from the entries
+before it stays registered. Listing the same file twice is one entry.
 
 ## Runtime
 
@@ -112,8 +123,9 @@ Export a Cordis plugin function or an object with `apply`. The host supplies
 one shared Cordis and the supported DSH compatibility services. The example's
 `inject = ['tools', 'commands']` asks for the tool and command registries. The
 supplied service names are `tools`, `commands`, `logger`, `events`, `reflect`
-and `registry`; `core/call`, persistent extension storage,
-hooks, skills and prompt providers are not host services yet. A required
+and `registry`; `core/call`, a storage service (a plugin has its own
+`dataDir` to write to), hooks, skills and prompt providers are not host
+services yet. A required
 service that is unavailable fails activation with a diagnostic.
 
 Package runtime dependencies and local imports within the reviewed bundle.
@@ -133,6 +145,17 @@ plugin's claim. Full Access, Bypass or an exact session grant for the reviewed
 plugin receipt may satisfy that requirement without another prompt. Tools are
 deferred by default; `[tools].always_load` can pin a tool through the normal
 tool configuration. Registration never grants permission to execute it.
+
+The core checks every call's input against that schema (JSON Schema, draft
+2020-12 unless the schema names another) before it asks for approval and again
+before anything is sent to the host, so `additionalProperties: false`,
+`required`, types and bounds hold even when `execute` does not check them. A
+call that fails is returned to the model as an invalid-input error naming what to
+correct, and the host never sees it. A schema that cannot be compiled (an
+invalid keyword value, or a `$ref` to anything outside the schema itself;
+nothing is fetched) is refused at registration, which fails activation with the
+reason. Declare the narrowest schema you can: it is both what the model sees
+and what is enforced.
 
 Return a JSON value or text; the host renders it into ordinary tool output.
 Avoid secrets in descriptions, logs and results. An approval card's wording
@@ -193,12 +216,72 @@ TUI-only: the Runtime API does not list or run them.
 
 ## Execution context
 
-`exec.signal` is the call's cancellation signal; check it and propagate it to
-asynchronous operations. `exec.callId` identifies the call, and `exec.args`
-contains its input. Neither a call id nor plugin trust grants new privileges.
-The calling workspace path is not currently exposed as an execution field;
-the host process's working directory is its data directory, not the caller's
-workspace. Do not use `process.chdir` in this shared process.
+A tool's `execute(input, exec)` gets, in `exec`:
+
+- `signal`, the call's cancellation signal; check it and propagate it to
+  asynchronous operations;
+- `callId`, which identifies the call, and `args`, its input (also the first
+  argument);
+- `workspace`, the root path of the workspace of the session that made the
+  call, and no other (it is absent only if that path is not valid UTF-8);
+- `dataDir`, the plugin's own directory.
+
+A command's handler gets `workspace` (where the user ran it) and `dataDir` in
+its invocation beside `args`, `signal` and `commandId`. All of these are
+read-only strings (`exec` and the invocation are frozen). Nothing else about the
+machine is passed: no home directory, no other workspace, no credential path.
+A call id or plugin trust grants no new privileges.
+
+The workspace is where the *call* comes from, so read it per call: one host
+serves every session in the Codewhale process, and a tool called from another
+workspace sees that one. The host process's working directory is its data
+directory, not the caller's workspace; do not use `process.chdir` in this
+shared process, and resolve relative paths against `exec.workspace` yourself.
+Reading a workspace file is your code's own filesystem access, under the host's
+sandbox, not something the core checks per file.
+
+`dataDir` is `~/.codewhale/extension-host/data/plugins/<name>-<id>`, created by
+Codewhale (mode 0700 on Unix) before the plugin activates, and the same
+directory for every generation and every entry of that plugin, so it keeps
+files across restarts and updates. It sits inside the host's one writable
+root, which is where the sandbox allows writes. It is not a boundary between
+plugins: they share a process, and one can write into another's directory.
+Codewhale never deletes it, including on uninstall.
+
+## Configuration
+
+A user configures a plugin in their own `config.toml`, keyed by the plugin's
+manifest name:
+
+```toml
+[plugins."hello-extension".config]
+greeting = "Howdy"
+```
+
+That table is delivered as the second argument of `apply(ctx, config)`
+(`{}` when there is none). If the entry module exports a `Config` schema
+(`import Schema from '@deepseek-ai/schemastery'`; `export const Config =
+Schema.object({ ... })`), the host validates the table against it before
+`apply` runs, applies its defaults, and a mismatch fails activation with the
+reason, so the plugin only ever sees a config its own schema accepts. Every
+entry of a multi-entry plugin gets the same table and checks it against its own
+`Config`. [hello.mts](examples/plugins/hello-extension/hello.mts) reads one
+such setting.
+
+- It is the user's data, not part of what was reviewed: the user can change
+  it without a new trust review, which is why only the user's config can set it
+  (a project's `.codewhale/config.toml` cannot).
+- Plain TOML values only (a date-time is refused), at most 16 KiB serialized
+  and 16 levels deep. A table over a limit fails that plugin's activation with
+  the reason, in `/plugin show`; it is never delivered cut short.
+- `/plugin show <name>` lists the configured keys (not the values) and says
+  when the config is refused. Do not put a secret in it: the plugin's code
+  reads every value, and so does any other plugin in the shared process.
+- Codewhale reads `[plugins]` at start, and again at `/plugin reload` (or any
+  plugin command that changes plugins). A plugin whose table changed is revoked
+  and activated again as a new generation, with the new values; one whose table
+  did not change is left alone. A file that cannot be read keeps the previous
+  settings.
 
 ## Lifecycle, diagnostics and restarts
 
@@ -227,11 +310,30 @@ Dispose within 2 seconds and avoid leaving background work behind.
 
 Trust is not a complete security boundary. Plugins share one process and can
 interfere with each other. On macOS the existing Seatbelt profile, and on Linux
-bubblewrap (`/usr/bin/bwrap`), deny direct network access, writes outside host
-data/temp paths and reads of the protected credential locations. Other
-user-readable files, including project `.env` files, remain readable. On Linux
-each start first checks that bwrap actually runs; where it is missing or cannot
-create its namespaces (for example Ubuntu 24.04's
+bubblewrap (`/usr/bin/bwrap`), deny direct network access, writes outside the
+host's data and temp paths and reads of the protected credential locations.
+Other user-readable files, including project `.env` files, remain readable.
+
+The macOS profile is the one every Seatbelt-sandboxed Codewhale command gets,
+under a workspace-write policy rooted at the host's data directory
+(`~/.codewhale/extension-host/data`). Besides that directory and the temp
+directories it therefore also allows writes to:
+
+- the per-user Darwin cache directory (`confstr(_CS_DARWIN_USER_CACHE_DIR)`,
+  under `/var/folders/`);
+- `~/.cargo/registry` and `~/.cargo/git` (under `$CARGO_HOME` when set);
+- the npm cache, `~/.npm` (or `$NPM_CONFIG_CACHE`).
+
+They exist in the shared profile so that `cargo` and `npx`-launched tools work
+inside the shell sandbox (`sandbox/seatbelt.rs`). The extension host needs none
+of them and the sandbox tests do not probe them, but a plugin, or a process it
+starts, can write there. The cargo and npm entries are present only when
+`CARGO_HOME`/`NPM_CONFIG_CACHE` or `HOME` is set in Codewhale's environment.
+The bubblewrap sandbox on Linux has no equivalent
+allowances.
+
+On Linux each start first checks that bwrap actually runs; where it is missing
+or cannot create its namespaces (for example Ubuntu 24.04's
 `kernel.apparmor_restrict_unprivileged_userns`), the host runs with the user's
 permissions and `/plugin`, `codewhale doctor` and the start diagnostic say
 `UNSANDBOXED` with bwrap's own error. Under bubblewrap a default credential

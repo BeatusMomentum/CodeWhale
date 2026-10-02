@@ -31,7 +31,9 @@
 //!   registration-time refusal, because only the user registry knows the
 //!   workspace: the markdown command wins and the extension command is left
 //!   out with a load error.
-//! * The handler gets no agent or session handle, and no attachments.
+//! * The handler gets no agent or session handle, and no attachments. It is
+//!   told the workspace the command was loaded for (`ExtensionCommandRef`) and
+//!   its plugin's data directory, both read-only strings.
 //! * A command's result text is bounded and stripped of terminal escapes; a
 //!   prompt over [`MAX_PROMPT_BYTES`] is refused, never truncated.
 
@@ -78,6 +80,9 @@ pub struct ExtensionCommandRef {
     pub generation: u64,
     /// `extension:<plugin>`, the origin shown beside the command's output.
     pub origin: String,
+    /// The workspace whose user registry loaded the command: what the handler
+    /// is told as the place the user ran it.
+    pub workspace: std::path::PathBuf,
 }
 
 /// One live command as the user registry loads it.
@@ -87,6 +92,8 @@ pub struct ExtensionCommandEntry {
     /// The owner's reviewed authority, so the user registry hides the command
     /// the moment the plugin is disabled or loses trust.
     pub authority: PluginAuthority,
+    /// The workspace this entry was loaded for.
+    pub workspace: std::path::PathBuf,
 }
 
 impl ExtensionCommandEntry {
@@ -97,6 +104,7 @@ impl ExtensionCommandEntry {
             plugin_id: self.registration.owner.plugin_id.clone(),
             generation: self.registration.owner.generation,
             origin: format!("extension:{}", self.registration.plugin_name),
+            workspace: self.workspace.clone(),
         }
     }
 }
@@ -166,6 +174,7 @@ pub(crate) async fn run(
         command_id: uuid::Uuid::new_v4().simple().to_string(),
         raw_input: raw_input.to_string(),
         deadline_ms: u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX),
+        workspace: command.workspace.to_str().map(str::to_owned),
     });
     let value: Value = host
         .call(request, Some(registration.owner.plugin_id.clone()))

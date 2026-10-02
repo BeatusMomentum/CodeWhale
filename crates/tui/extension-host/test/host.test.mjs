@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { execFileSync, spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
-import { BUNDLE, HOST_ARGS, IS_BUN, activate, sha256File, startHost } from './harness.mjs'
+import { BUNDLE, FIXTURES, HOST_ARGS, IS_BUN, activate, owner, sha256File, startHost } from './harness.mjs'
 import { encodeFrame } from '../dist/protocol.mjs'
 
 // Budgets for a cold host start (the first host this file starts), gated in
@@ -75,6 +75,23 @@ test('the documented typed hello extension activates and executes unchanged', as
   assert.deepEqual(command.spec, { name: 'hello-greet', description: command.spec.description, argument_hint: '[name]' })
   const said = await host.call('command/run', { handle: command.handle, command_id: 'c-1', raw_input: 'Codewhale', deadline_ms: 5000 })
   assert.deepEqual(said, { kind: 'success', text: 'Hello, Codewhale!' })
+})
+
+test('the typed hello example reads its one setting, validated by its own Config schema', async (t) => {
+  const host = await startHost()
+  t.after(() => host.stop())
+  const entry = fileURLToPath(new URL('../../../../docs/examples/plugins/hello-extension/hello.mts', import.meta.url))
+  const { result } = await activate(host, 'hello-extension', entry, { config: { greeting: 'Howdy' } })
+  assert.equal(result.status, 'ok')
+  const tool = host.registry.find((entry) => entry.op === 'register' && entry.kind === 'tool')
+  const output = await host.call('tool/call', { handle: tool.handle, call_id: 'hello-2', input: { name: 'Codewhale' }, deadline_ms: 5000 })
+  assert.deepEqual(output.structured, { greeting: 'Howdy, Codewhale!', callId: 'hello-2' })
+  const command = host.registry.find((entry) => entry.op === 'register' && entry.kind === 'command')
+  assert.deepEqual(await host.call('command/run', { handle: command.handle, command_id: 'c-2', raw_input: '', deadline_ms: 5000 }), { kind: 'success', text: 'Howdy, world!' })
+  // A value of the wrong type fails activation, naming the field.
+  const bad = await activate(host, 'hello-extension', entry, { config: { greeting: 3 } })
+  assert.equal(bad.result.status, 'failed')
+  assert.match(bad.result.diagnostic, /greeting/)
 })
 
 test('the published DSH plugin runs unmodified and returns its payload', async (t) => {
@@ -656,4 +673,119 @@ export function apply(ctx) {
   const refused = await activate(host, 'dsh-whole', whole.entry)
   assert.equal(refused.result.status, 'failed')
   assert.match(refused.result.diagnostic, /requires `@deepseek-ai\/dsh-commands`/)
+})
+
+/** Activate several entries of one plugin under one owner, as the core does: one `ext/activate` per entry, in order. */
+async function activateEntries(host, name, files) {
+  const ref = owner(name)
+  const results = []
+  for (const file of files) {
+    const path = join(FIXTURES, name, file)
+    const result = await host.call('ext/activate', { owner: ref, plugin_name: name, entry: { path, sha256: sha256File(path) }, config: {} })
+    results.push(result)
+    if (result.status !== 'ok') break
+  }
+  return { ref, results }
+}
+
+test('a plugin with two entries activates both under one owner and tears both down together', async (t) => {
+  const host = await startHost()
+  t.after(() => host.stop())
+  const { ref, results } = await activateEntries(host, 'two-entries', ['tools.mjs', 'commands.mjs'])
+  assert.deepEqual(results[0], { status: 'ok', tools: ['two_first'], commands: [] })
+  // The second answer lists everything the owner has registered so far.
+  assert.deepEqual(results[1], { status: 'ok', tools: ['two_first', 'two_second'], commands: ['two-hello'] })
+  const registered = host.registry.filter((entry) => entry.op === 'register')
+  assert.deepEqual(registered.map((entry) => entry.spec.name), ['two_first', 'two_second', 'two-hello'])
+  assert.ok(registered.every((entry) => entry.owner.owner_token === ref.owner_token), 'one owner for every entry')
+  const second = registered.find((entry) => entry.spec.name === 'two_second')
+  assert.equal((await host.call('tool/call', { handle: second.handle, call_id: 'c1', input: {}, deadline_ms: 5000 })).content[0].text, 'second')
+
+  // Neither entry can be activated twice, and no other plugin can join the owner.
+  const again = await host.call('ext/activate', {
+    owner: ref,
+    plugin_name: 'two-entries',
+    entry: { path: join(FIXTURES, 'two-entries', 'tools.mjs'), sha256: sha256File(join(FIXTURES, 'two-entries', 'tools.mjs')) },
+    config: {},
+  })
+  assert.equal(again.status, 'failed')
+  assert.match(again.diagnostic, /already activated under this owner/)
+  const stranger = await host.call('ext/activate', {
+    owner: ref,
+    plugin_name: 'someone-else',
+    entry: { path: join(FIXTURES, 'two-entries', 'commands.mjs'), sha256: sha256File(join(FIXTURES, 'two-entries', 'commands.mjs')) },
+    config: {},
+  })
+  assert.equal(stranger.status, 'failed')
+
+  // One deactivate disposes the fibers of both entries.
+  assert.deepEqual(await host.call('ext/deactivate', { owner: ref }), { disposed: true, leaked: [] })
+  for (const entry of registered.filter((r) => r.kind === 'tool')) {
+    assert.ok(host.registry.some((e) => e.op === 'unregister' && e.handle === entry.handle), `${entry.spec.name} was unregistered`)
+  }
+})
+
+test('a failing second entry fails the owner and rolls back the first entry', async (t) => {
+  const host = await startHost()
+  t.after(() => host.stop())
+  const { ref, results } = await activateEntries(host, 'two-entries-failing', ['first.mjs', 'second.mjs'])
+  assert.equal(results[0].status, 'ok')
+  assert.equal(results[1].status, 'failed')
+  assert.match(results[1].diagnostic, /second entry refuses to start/)
+  const first = host.registry.find((entry) => entry.op === 'register' && entry.spec.name === 'tef_first')
+  assert.ok(first, 'the first entry registered its tool')
+  for (let i = 0; i < 40 && !host.registry.some((entry) => entry.op === 'unregister' && entry.handle === first.handle); i++) {
+    await new Promise((resolve) => setTimeout(resolve, 50))
+  }
+  assert.ok(host.registry.some((entry) => entry.op === 'unregister' && entry.handle === first.handle), "rollback unregistered the first entry's tool")
+  await assert.rejects(host.call('tool/call', { handle: first.handle, call_id: 'c1', input: {}, deadline_ms: 1000 }), (error) => error.code === -32001)
+  // The owner is gone: deactivating it is an idempotent success.
+  assert.deepEqual(await host.call('ext/deactivate', { owner: ref }), { disposed: true, leaked: [] })
+})
+
+test('a plugin is given its config, validated by its own Config schema, and each call carries the workspace and data directory', async (t) => {
+  const host = await startHost()
+  t.after(() => host.stop())
+  const dataDir = mkdtempSync(join(tmpdir(), 'cw-ext-data-'))
+  t.after(() => rmSync(dataDir, { recursive: true, force: true }))
+  const entry = join(FIXTURES, 'plugin-context', 'index.mjs')
+
+  // The plugin's `Config` schema fills the default for `limit`.
+  const { result } = await activate(host, 'plugin-context', entry, { config: { greeting: 'Hi' }, data_dir: dataDir })
+  assert.deepEqual(result, { status: 'ok', tools: ['ctx_frozen', 'ctx_note', 'ctx_probe'], commands: ['ctx-probe'] })
+  const handleOf = (name) => host.registry.find((e) => e.op === 'register' && e.spec.name === name).handle
+  const call = (name, input = {}, extra = {}) =>
+    host.call('tool/call', { handle: handleOf(name), call_id: 'c1', input, deadline_ms: 5000, ...extra })
+
+  const probe = await call('ctx_probe', {}, { workspace: '/w/project' })
+  assert.deepEqual(probe.structured, {
+    config: { greeting: 'Hi', limit: 3 },
+    workspace: '/w/project',
+    dataDir,
+    keys: ['args', 'callId', 'dataDir', 'signal', 'workspace'],
+  })
+  // The workspace is per call: a call that names none gets none.
+  const bare = await call('ctx_probe')
+  assert.equal(bare.structured.workspace, null)
+  assert.deepEqual(bare.structured.keys, ['args', 'callId', 'dataDir', 'signal'])
+  const other = await call('ctx_probe', {}, { workspace: '/w/other' })
+  assert.equal(other.structured.workspace, '/w/other')
+
+  // The data directory is the plugin's own to write.
+  const note = await call('ctx_note', { text: 'remember' })
+  assert.deepEqual(note.structured, { file: join(dataDir, 'note.txt'), text: 'remember' })
+  // The context is read-only.
+  assert.deepEqual((await call('ctx_frozen')).structured, { changed: false })
+
+  const command = host.registry.find((e) => e.op === 'register' && e.kind === 'command')
+  const said = await host.call('command/run', { handle: command.handle, command_id: 'c-1', raw_input: '', deadline_ms: 5000, workspace: '/w/project' })
+  assert.deepEqual(JSON.parse(said.text), { config: { greeting: 'Hi', limit: 3 }, workspace: '/w/project', dataDir })
+
+  // A config the plugin's own schema refuses fails the activation, naming the field.
+  const bad = await activate(host, 'plugin-context', entry, { config: { limit: 99 }, data_dir: dataDir })
+  assert.equal(bad.result.status, 'failed')
+  assert.match(bad.result.diagnostic, /limit/)
+  // And an activation with no config or data dir (an older core) still works.
+  const bare2 = await activate(host, 'plugin-context', entry)
+  assert.equal(bare2.result.status, 'ok')
 })
