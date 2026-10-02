@@ -171,6 +171,10 @@ libc = "0.2"
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = ["Wdk_Storage_FileSystem", "Win32_System_IO", "Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Pipes", "Win32_System_Threading"] }
 
+[target.'cfg(all(target_os = "windows", target_arch = "x86_64"))'.dependencies]
+# JWT verification uses upstream assembly objects when NASM is unavailable.
+aws-lc-rs = { version = "1.18.1", default-features = false, features = ["prebuilt-nasm"] }
+
 [target.'cfg(any(target_os = "macos", target_os = "windows", all(target_os = "linux", not(target_env = "ohos"))))'.dependencies]
 arboard = { version = "3.4", features = ["wayland-data-control"] }
 
