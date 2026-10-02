@@ -1,7 +1,7 @@
 # 本地浏览器客户端
 
 > 英文原文：[WEB.md](../WEB.md)。
-> 最后与英文同步日期（last synced with English revision）：2026-09-22。
+> 最后与英文同步日期（last synced with English revision）：2026-09-29。
 
 `codewhale web` 通过统一的 Runtime API 打开 Codewhale 内嵌的浏览器客户端。
 这是一个本地界面：服务器始终绑定到 `127.0.0.1`，不能改为局域网地址，
@@ -21,7 +21,7 @@ codewhale web
 codewhale web --port 8788
 ```
 
-Codewhale 会启动 Runtime API，提供随已安装二进制文件内嵌、无需额外依赖的客户端，
+Codewhale 会启动 Runtime API，提供已内嵌在所安装二进制文件中、无需额外依赖的客户端，
 打印一个只能使用一次的启动 URL，并请求操作系统在默认浏览器中打开它。
 如果浏览器没有自动打开，请在十分钟内使用打印出的 URL。
 按 `Ctrl+C` 停止进程，浏览器会话也会随之结束。
@@ -34,7 +34,7 @@ Codewhale 会启动 Runtime API，提供随已安装二进制文件内嵌、无�
 以及回答 Runtime 发起的用户输入请求。
 
 浏览器是同一个本地 Runtime 的另一种视图。
-它不会创建第二个云账户、将模型提供方的凭据复制到浏览器存储中，
+它不会创建第二个云账户、把提供商（provider）的凭据复制到浏览器存储中，
 也不会降低已配置的审批和沙箱策略要求。
 
 ## 身份验证边界
@@ -68,8 +68,8 @@ Runtime token 不会出现在渲染后的 HTML、浏览器存储、URL 查询参
 - 如果端口 `7878` 已被占用，通过 `--port` 指定一个未使用的端口。
 - 如果浏览器没有打开，请在十分钟内将打印出的一次性引导 URL 复制到同一台机器上的浏览器中。
   如果该 URL 已使用或已过期，请重新启动 `codewhale web`。
-- 如果页面可以打开，但模型提供方不可用，请检查 `codewhale doctor` 和 `/provider`。
-  web 命令不会配置或迁移模型提供方的凭据。
+- 如果页面可以打开，但提供商不可用，请检查 `codewhale doctor` 和 `/provider`。
+  web 命令不会配置或迁移提供商的凭据。
 - 如果会话已过期，请停止并重新启动 `codewhale web`，以创建一个仅对新进程有效的会话。
   重复使用旧的引导 URL 应当失败。
 

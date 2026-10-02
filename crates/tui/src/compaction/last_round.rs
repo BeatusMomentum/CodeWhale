@@ -292,44 +292,61 @@ pub(super) fn bound_last_round(messages: &[Message]) -> Vec<Message> {
     round
 }
 
-fn tool_result_ids(message: &Message) -> Vec<String> {
+fn tool_result_ids(message: &Message) -> Vec<(codewhale_models::ToolCallKey<'_>, &str)> {
     message
         .content
         .iter()
         .filter_map(|block| match block {
-            ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.clone()),
+            ContentBlock::ToolResult { tool_use_id, .. } => {
+                block.tool_call_key().map(|key| (key, tool_use_id.as_str()))
+            }
             _ => None,
         })
         .collect()
 }
 
-fn has_tool_result_id(message: &Message, id: &str) -> bool {
+fn has_tool_result_id(message: &Message, id: &(codewhale_models::ToolCallKey<'_>, &str)) -> bool {
+    if id.0.as_str().trim().is_empty() {
+        return false;
+    }
     message.content.iter().any(|block| {
         matches!(
             block,
-            ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == id
+            ContentBlock::ToolResult { tool_use_id, .. } if block.tool_call_key() == Some(id.0) && tool_use_id == id.1
         )
     })
 }
 
-fn tool_use_ids(message: &Message) -> Vec<String> {
+fn tool_use_ids(message: &Message) -> Vec<(codewhale_models::ToolCallKey<'_>, &str)> {
     message
         .content
         .iter()
         .filter_map(|block| match block {
-            ContentBlock::ToolUse { id, .. } => Some(id.clone()),
+            ContentBlock::ToolUse { id, .. } => block.tool_call_key().map(|key| (key, id.as_str())),
             _ => None,
         })
         .collect()
 }
 
-fn has_tool_use_id(message: &Message, id: &str) -> bool {
+fn has_tool_use_id(message: &Message, id: &(codewhale_models::ToolCallKey<'_>, &str)) -> bool {
+    if id.0.as_str().trim().is_empty() {
+        return false;
+    }
     message.content.iter().any(|block| {
         matches!(
             block,
-            ContentBlock::ToolUse { id: seen, .. } if seen == id
+            ContentBlock::ToolUse { id: provider, .. } if block.tool_call_key() == Some(id.0) && provider == id.1
         )
     })
+}
+
+fn tool_call_identity_label(id: &(codewhale_models::ToolCallKey<'_>, &str)) -> String {
+    match id.0 {
+        codewhale_models::ToolCallKey::Execution(execution_id) => {
+            format!("execution {execution_id} (provider call {})", id.1)
+        }
+        codewhale_models::ToolCallKey::LegacyProvider(provider_id) => provider_id.to_string(),
+    }
 }
 
 fn assistant_text_of(message: &Message) -> Option<String> {
@@ -383,8 +400,9 @@ pub(crate) fn validate_last_round_coverage(
             .iter()
             .any(|message| has_tool_result_id(message, &id))
         {
+            let label = tool_call_identity_label(&id);
             anyhow::bail!(
-                "Making room stopped: last-round tool result {id} was dropped; history was not replaced."
+                "Making room stopped: last-round tool result {label} was dropped; history was not replaced."
             );
         }
     }
@@ -395,8 +413,9 @@ pub(crate) fn validate_last_round_coverage(
             .iter()
             .any(|message| has_tool_use_id(message, &id))
         {
+            let label = tool_call_identity_label(&id);
             anyhow::bail!(
-                "Making room stopped: last-round tool call {id} was dropped; history was not replaced."
+                "Making room stopped: last-round tool call {label} was dropped; history was not replaced."
             );
         }
     }
@@ -521,6 +540,50 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn coverage_requires_the_original_execution_and_provider_pair() {
+        let original: Vec<Message> = serde_json::from_value(json!([
+            {"role":"user","content":[{"type":"text","text":"keep this exchange"}]},
+            {"role":"assistant","content":[{"type":"tool_use","id":"wire","execution_id":"local","name":"read","input":{}}]},
+            {"role":"user","content":[{"type":"tool_result","tool_use_id":"wire","execution_id":"local","content":"kept"}]}
+        ])).unwrap();
+        assert!(validate_last_round_coverage(&original, &original).is_ok());
+        for identity in [None, Some("different")] {
+            let mut replacement = original.clone();
+            for block in replacement
+                .iter_mut()
+                .flat_map(|message| &mut message.content)
+            {
+                match block {
+                    ContentBlock::ToolUse { execution_id, .. }
+                    | ContentBlock::ToolResult { execution_id, .. } => {
+                        *execution_id = identity.map(str::to_string)
+                    }
+                    _ => {}
+                }
+            }
+            assert!(validate_last_round_coverage(&original, &replacement).is_err());
+        }
+        let mut replacement = original.clone();
+        if let ContentBlock::ToolResult { tool_use_id, .. } = &mut replacement[2].content[0] {
+            *tool_use_id = "wrong-wire".to_string();
+        }
+        let error = validate_last_round_coverage(&original, &replacement).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Making room stopped: last-round tool result execution local (provider call wire) was dropped; history was not replaced."
+        );
+        let mut replacement = original.clone();
+        if let ContentBlock::ToolUse { id, .. } = &mut replacement[1].content[0] {
+            *id = "wrong-wire".to_string();
+        }
+        let error = validate_last_round_coverage(&original, &replacement).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Making room stopped: last-round tool call execution local (provider call wire) was dropped; history was not replaced."
+        );
+    }
+
+    #[test]
     fn confined_pinned_anchors_require_workspace_trust() {
         use crate::test_support::{EnvVarGuard, lock_test_env};
         let _lock = lock_test_env();
@@ -601,6 +664,7 @@ mod tests {
         Message {
             role: Role::Assistant,
             content: vec![ContentBlock::ToolUse {
+                execution_id: None,
                 id: id.to_string(),
                 name: name.to_string(),
                 input,
@@ -614,6 +678,7 @@ mod tests {
         Message {
             role: Role::User,
             content: vec![ContentBlock::ToolResult {
+                execution_id: None,
                 tool_use_id: id.to_string(),
                 content: content.to_string(),
                 is_error: None,
@@ -644,7 +709,11 @@ mod tests {
             tool_result("third", &long_output),
         ];
         let kept = replacement_messages(&original, 20_000);
-        let kept_ids: Vec<String> = kept.iter().flat_map(tool_result_ids).collect();
+        let kept_ids: Vec<&str> = kept
+            .iter()
+            .flat_map(tool_result_ids)
+            .map(|(_, wire)| wire)
+            .collect();
         assert_eq!(kept_ids, ["second", "third"], "earlier steps are dropped");
         assert!(
             kept.iter()
@@ -876,16 +945,20 @@ mod tests {
                 user_text_of(message).as_deref() == Some(long_question.as_str())
             })
         );
-        assert!(
-            second
-                .iter()
-                .any(|message| has_tool_use_id(message, "call_1"))
-        );
-        assert!(
-            second
-                .iter()
-                .any(|message| has_tool_result_id(message, "call_1"))
-        );
+        assert!(second.iter().any(|message| has_tool_use_id(
+            message,
+            &(
+                codewhale_models::ToolCallKey::LegacyProvider("call_1"),
+                "call_1"
+            )
+        )));
+        assert!(second.iter().any(|message| has_tool_result_id(
+            message,
+            &(
+                codewhale_models::ToolCallKey::LegacyProvider("call_1"),
+                "call_1"
+            )
+        )));
         let without_question = second
             .iter()
             .filter(|message| user_text_of(message).as_deref() != Some(long_question.as_str()))

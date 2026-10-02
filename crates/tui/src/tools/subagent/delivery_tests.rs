@@ -82,6 +82,22 @@ fn complete(manager: &mut SubAgentManager, id: &str, report: &str) -> AgentRunVe
 }
 
 #[test]
+fn declared_deliverables_exclude_git_metadata_by_the_shared_rule() {
+    let mut refused = vec![".GIT/config", "sub/.Git/HEAD"];
+    if cfg!(windows) {
+        refused.extend([".git./config", ".git /config", "GIT~1/config"]);
+    }
+    for path in refused {
+        let error = delivery::declared_paths(&[path.to_string()], None).expect_err(path);
+        assert!(error.contains("git metadata"), "{path}: {error}");
+    }
+    assert_eq!(
+        delivery::declared_paths(&[".github/report.md".to_string()], None).unwrap(),
+        [".github/report.md"]
+    );
+}
+
+#[test]
 fn declared_deliverables_narrow_default_scope_and_reject_invalid_input() {
     let request = parse_spawn_request(&json!({
         "type": "implement", "prompt": "write outputs", "deliverables": ["tmp/a/report.md", "tmp/b/report.md"]
@@ -682,4 +698,102 @@ async fn detail_projection_heals_pending_delivery_verification() {
             .delivery_evidence
             .checked
     );
+}
+
+fn git_lines(root: &Path, args: &[&str]) -> BTreeSet<String> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .output()
+        .expect("git");
+    assert!(
+        output.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// #6557 D02-11: the budget-death checkpoint owns exactly the worker's
+/// inventory at every size. Past 1000 paths it used to widen to
+/// `git add -A` and sweep a foreign edit into the salvage commit; below that
+/// a plain `git commit` took whatever someone else had staged, a glob-shaped
+/// name staged every matching file, and a `git rm` failed the whole add.
+#[test]
+fn checkpoint_commits_only_worker_paths_at_any_inventory_size() {
+    for worker_files in [1001_usize, 3] {
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
+        repository(root);
+        let literal_glob = "[foreign].rs";
+        for name in [
+            "foreign_edit.rs",
+            "foreign_staged.rs",
+            "f.rs",
+            "removed.rs",
+            "renamed.rs",
+        ] {
+            fs::write(root.join(name), "base\n").unwrap();
+        }
+        git(root, &["add", "--", "."]);
+        git(root, &["commit", "--quiet", "-m", "fixtures"]);
+        // Someone else's work, present before the worker starts.
+        fs::write(root.join("foreign_edit.rs"), "base\nforeign\n").unwrap();
+        // This platform-valid glob spelling would also match this foreign edit.
+        fs::write(root.join("f.rs"), "base\nforeign\n").unwrap();
+        fs::write(root.join("foreign_staged.rs"), "base\nstaged elsewhere\n").unwrap();
+        git(root, &["add", "--", "foreign_staged.rs"]);
+
+        let evidence = DeliveryEvidence::capture_for_handle(root, true);
+
+        fs::write(root.join("src/lib.rs"), "baseline\nworker\n").unwrap();
+        fs::write(root.join(literal_glob), "a literal name, not a glob\n").unwrap();
+        git(root, &["rm", "--quiet", "--", "removed.rs"]);
+        git(root, &["mv", "--", "renamed.rs", "moved.rs"]);
+        fs::create_dir_all(root.join("gen")).unwrap();
+        for index in 0..worker_files {
+            fs::write(root.join(format!("gen/f{index}.rs")), "x\n").unwrap();
+        }
+
+        let changed = evidence.changed_paths(root).expect("inventory");
+        assert!(changed.len() > worker_files, "{worker_files}: {changed:?}");
+        match evidence.checkpoint_uncommitted(&changed, "worker", "wall_time_budget", true) {
+            delivery::BudgetCheckpointOutcome::Committed { .. } => {}
+            delivery::BudgetCheckpointOutcome::Failed { reason } => {
+                panic!("{worker_files} files: checkpoint failed: {reason}")
+            }
+            _ => panic!("{worker_files} files: checkpoint did not commit"),
+        }
+
+        let committed = git_lines(
+            root,
+            &["show", "--no-renames", "--name-only", "--format=", "HEAD"],
+        );
+        let mut expected: BTreeSet<String> = [
+            "src/lib.rs",
+            literal_glob,
+            "removed.rs",
+            "renamed.rs",
+            "moved.rs",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        expected.extend((0..worker_files).map(|index| format!("gen/f{index}.rs")));
+        assert_eq!(committed, expected, "{worker_files} files");
+        assert_eq!(
+            git_lines(root, &["status", "--porcelain=v1"]),
+            BTreeSet::from([
+                " M f.rs".to_string(),
+                " M foreign_edit.rs".to_string(),
+                "M  foreign_staged.rs".to_string(),
+            ]),
+            "{worker_files} files: foreign work stays where it was"
+        );
+    }
 }

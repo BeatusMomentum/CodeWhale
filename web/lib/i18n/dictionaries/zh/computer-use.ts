@@ -27,7 +27,7 @@ export const computerUse: ComputerUseDict = {
     { title: "安装应用", body: "打开下载的磁盘映像，将 Codewhale Computer Use 拖入“应用程序”。从“应用程序”中打开它，然后点击菜单栏中的鲸鱼图标，选择 Computer Use。" },
     { title: "检查权限", body: "通过设置按钮打开系统设置中的“辅助功能”和“屏幕录制”。由你决定授予哪些权限。" },
     { title: "运行后台检查", body: "助手会打开一个临时练习窗口，输入文本并截取该窗口，同时检查运行期间指针或前台应用是否发生变化。" },
-    { title: "连接 Codewhale", body: "在 Codewhale 插件市场中审查、信任并启用 Computer Use。请使用 0.3.1 或更高版本，确保本地操作受助手的暂停和停止控制。" },
+    { title: "连接 Codewhale", body: "在 Codewhale 插件市场中审查、信任并启用 Computer Use。请使用插件 0.3.1 或更高版本，确保本地操作受助手的暂停和停止控制。" },
   ],
   controlsTitle: "继续工作，掌握控制权。",
   controlsBody: "受支持的操作可在选定应用的后台完成。需要前台控制的应用或手势必须得到你的授权。菜单会显示目标应用与输入模式；Pause 暂停助手输入，Stop 结束助手的现有会话。",

@@ -230,7 +230,7 @@ export const DOC_TOPICS: DocTopic[] = [
       en: "Find, install, review, and trust plugin bundles.",
       zh: "查找、安装、审查并信任插件包。",
     },
-    repoSource: ["docs/PLUGINS.md", "docs/PLUGIN_BUNDLES.md"],
+    repoSource: ["docs/PLUGINS.md", "docs/PLUGIN_BUNDLES.md", "docs/EXTENSIONS.md"],
     hasPage: false,
     category: "extending",
   },

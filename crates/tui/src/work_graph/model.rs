@@ -753,6 +753,15 @@ impl CompatProjectionState {
     pub fn is_empty(&self) -> bool {
         self.plan.is_empty() && self.plan_order.is_empty() && self.todos.is_empty()
     }
+
+    /// Whether `node` is still part of the live Plan or To-do projection.
+    /// Replacing either list drops bindings but keeps the old plan-step nodes
+    /// in the graph (there is no node removal), so presentation must treat an
+    /// unreferenced plan step as retired, not as live work (#6546).
+    #[must_use]
+    pub fn projects(&self, node: &WorkNodeId) -> bool {
+        self.plan_order.contains(node) || self.todos.iter().any(|binding| &binding.node == node)
+    }
 }
 
 /// Idempotency key for owner-reported observations: `(binding, seq)`. Applied

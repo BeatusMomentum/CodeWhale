@@ -89,22 +89,26 @@ pub(crate) fn paint_user_turn_cell(
     content: String,
 ) -> usize {
     if message.history_echoed
-        && let Some(idx) = app
-            .history
-            .iter()
-            .enumerate()
-            .rev()
-            .find_map(|(idx, cell)| match cell {
-                HistoryCell::User { content } if content == &message.display => Some(idx),
-                _ => None,
-            })
+        && let Some(idx) = echoed_user_turn_cell(app, &message.display)
     {
         app.history[idx] = HistoryCell::User { content };
-        app.needs_redraw = true;
+        app.bump_history_cell(idx);
         return idx;
     }
     app.add_message(HistoryCell::User { content });
     app.history.len().saturating_sub(1)
+}
+
+/// The newest transcript cell that queue-time echo painted for `display`.
+pub(crate) fn echoed_user_turn_cell(app: &App, display: &str) -> Option<usize> {
+    app.history
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(idx, cell)| match cell {
+            HistoryCell::User { content } if content == display => Some(idx),
+            _ => None,
+        })
 }
 
 pub(crate) fn enqueue_offline_message(app: &mut App, message: QueuedMessage) {
@@ -132,15 +136,7 @@ pub(crate) fn push_assistant_message(
             cache_control: None,
         });
     }
-    for (id, name, input) in tool_uses {
-        blocks.push(ContentBlock::ToolUse {
-            id,
-            name,
-            input,
-            caller: None,
-            thought_signature: None,
-        });
-    }
+    blocks.extend(tool_uses);
 
     let has_sendable_content = blocks.iter().any(|block| {
         matches!(
@@ -909,6 +905,8 @@ pub(crate) async fn spawned_dispatch_inner(
         hook_executor: prepare.hook_executor.clone(),
         verbosity: prepare.verbosity.clone(),
         provenance: prepare.provenance,
+        // Interactive TUI submissions do not correlate submissions.
+        submission_id: None,
     });
     // Reserve capacity off the render thread, but do not let Engine start
     // until the completion callback has installed the UI's acceptance state.

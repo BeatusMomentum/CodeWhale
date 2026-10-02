@@ -325,20 +325,35 @@ pub(super) fn spillover_pager_section(app: &App, cell_index: usize) -> Option<St
     Some(format!("── Full output ──\n\n{body}"))
 }
 
+// Pager reads are bounded; larger artifacts remain on disk and the existing
+// unavailable-output state is shown. This is not a persistence size limit.
+const MAX_SESSION_ARTIFACT_DISPLAY_BYTES: u64 = 64 * 1024 * 1024;
+
 fn read_owned_session_artifact(artifact: &crate::artifacts::ArtifactRecord) -> Option<String> {
-    if artifact.storage_path.is_absolute() {
+    use std::io::Read;
+
+    if !artifact
+        .storage_path
+        .starts_with(crate::artifacts::ARTIFACTS_DIR_NAME)
+    {
         return None;
     }
-    let root = crate::artifacts::session_artifact_absolute_path(
-        &artifact.session_id,
-        std::path::Path::new(crate::artifacts::ARTIFACTS_DIR_NAME),
-    )?;
-    let candidate = crate::artifacts::session_artifact_absolute_path(
+    let file = crate::artifacts::open_session_relative(
         &artifact.session_id,
         &artifact.storage_path,
-    )?;
-    let path = canonical_owned_file(&candidate, &root)?;
-    std::fs::read_to_string(path).ok()
+        false,
+    )
+    .ok()?
+    .open_file()
+    .ok()?;
+    let mut bytes = Vec::new();
+    file.take(MAX_SESSION_ARTIFACT_DISPLAY_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() as u64 > MAX_SESSION_ARTIFACT_DISPLAY_BYTES {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
 }
 
 fn read_owned_legacy_spillover(path: &std::path::Path, session_id: &str) -> Option<String> {
@@ -2145,5 +2160,112 @@ mod tests {
                 "answer copy leaked {excluded:?}"
             );
         }
+    }
+    struct PrivateArtifactRoot(Option<PathBuf>);
+    impl PrivateArtifactRoot {
+        fn set(path: PathBuf) -> Self {
+            Self(crate::artifacts::set_test_artifact_sessions_root(Some(
+                path,
+            )))
+        }
+    }
+    impl Drop for PrivateArtifactRoot {
+        fn drop(&mut self) {
+            crate::artifacts::set_test_artifact_sessions_root(self.0.take());
+        }
+    }
+    fn owned_artifact_fixture() -> crate::artifacts::ArtifactRecord {
+        crate::artifacts::record_tool_output_artifact(
+            "session-a",
+            "call-fixture",
+            "bash",
+            PathBuf::from("artifacts/mutable.txt"),
+            "fixture",
+        )
+    }
+
+    #[test]
+    fn owned_artifact_pager_reads_regular_exact_session_output() {
+        let _guard = crate::artifacts::TEST_ARTIFACT_SESSIONS_GUARD
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let temp = tempfile::tempdir().unwrap();
+        let _root = PrivateArtifactRoot::set(temp.path().join("sessions"));
+        crate::artifacts::write_session_artifact("session-a", "mutable", "exact pager output")
+            .unwrap();
+        assert_eq!(
+            read_owned_session_artifact(&owned_artifact_fixture()).as_deref(),
+            Some("exact pager output")
+        );
+        let mut malformed = owned_artifact_fixture();
+        malformed.storage_path = PathBuf::from("other/mutable.txt");
+        assert!(read_owned_session_artifact(&malformed).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owned_artifact_pager_refuses_linked_session_parent() {
+        let _guard = crate::artifacts::TEST_ARTIFACT_SESSIONS_GUARD
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let temp = tempfile::tempdir().unwrap();
+        let sessions = temp.path().join("sessions");
+        let _root = PrivateArtifactRoot::set(sessions.clone());
+        std::fs::create_dir(&sessions).unwrap();
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(outside.join("artifacts")).unwrap();
+        std::fs::write(
+            outside.join("artifacts/mutable.txt"),
+            b"outside-pager-synthetic",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&outside, sessions.join("session-a")).unwrap();
+        assert!(
+            read_owned_session_artifact(&owned_artifact_fixture()).is_none(),
+            "pager accepted output from a linked outside session"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owned_artifact_pager_refuses_hardlinked_outside_bytes() {
+        let _guard = crate::artifacts::TEST_ARTIFACT_SESSIONS_GUARD
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let temp = tempfile::tempdir().unwrap();
+        let sessions = temp.path().join("sessions");
+        let _root = PrivateArtifactRoot::set(sessions.clone());
+        std::fs::create_dir_all(sessions.join("session-a/artifacts")).unwrap();
+        let outside = temp.path().join("outside.txt");
+        std::fs::write(&outside, b"outside-hardlink-synthetic").unwrap();
+        std::fs::hard_link(&outside, sessions.join("session-a/artifacts/mutable.txt")).unwrap();
+        assert!(
+            read_owned_session_artifact(&owned_artifact_fixture()).is_none(),
+            "pager exposed outside hardlinked bytes"
+        );
+    }
+
+    #[test]
+    fn owned_artifact_pager_refuses_oversized_output_without_deleting_it() {
+        let _guard = crate::artifacts::TEST_ARTIFACT_SESSIONS_GUARD
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let temp = tempfile::tempdir().unwrap();
+        let sessions = temp.path().join("sessions");
+        let _root = PrivateArtifactRoot::set(sessions.clone());
+        let directory = sessions.join("session-a/artifacts");
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("mutable.txt");
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(MAX_SESSION_ARTIFACT_DISPLAY_BYTES + 1)
+            .unwrap();
+        assert!(
+            read_owned_session_artifact(&owned_artifact_fixture()).is_none(),
+            "pager allocated oversized session output"
+        );
+        assert_eq!(
+            std::fs::metadata(path).unwrap().len(),
+            MAX_SESSION_ARTIFACT_DISPLAY_BYTES + 1
+        );
     }
 }

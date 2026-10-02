@@ -1910,6 +1910,7 @@ mod tests {
         let msg = Message {
             role: Role::User,
             content: vec![ContentBlock::ToolResult {
+                execution_id: None,
                 tool_use_id: "tool_1".to_string(),
                 content: "Changed src/compaction.rs".to_string(),
                 is_error: None,

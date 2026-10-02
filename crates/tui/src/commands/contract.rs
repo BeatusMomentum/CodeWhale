@@ -14,9 +14,9 @@
 //!
 //! ## Authoritative host-proxy design (D1)
 //!
-//! `CommandContexts` holds sixteen independently borrowed facet objects, while
-//! important behavior (mode transitions, model invalidation, cost accounting,
-//! skill refresh) is authoritative on `App`. The adapters therefore share a
+//! `CommandContexts` has twenty-two independently optional facet slots, all
+//! constructed here. The diagnostics adapter joins the host bundle in FEAT-029. Important behavior (mode transitions, model
+//! invalidation, cost accounting, skill refresh) is authoritative on `App`. The adapters therefore share a
 //! synchronous TUI-owned host proxy. Each trait call borrows `App` only for the
 //! duration of that call and delegates to the real operation; handlers still
 //! receive only portable facets and can never name concrete TUI state.
@@ -30,6 +30,16 @@
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+
+mod debug_diagnostics;
+pub(in crate::commands) mod debug_operations;
+use debug_operations::DebugOperationsAdapter;
+mod diagnostics_messages;
+#[cfg(test)]
+pub(crate) use debug_diagnostics::CostComponents as DebugCostComponents;
+use debug_diagnostics::DebugDiagnosticsAdapter;
+#[cfg(test)]
+pub(crate) use debug_diagnostics::warmup_key as project_debug_warmup_key;
 
 use codewhale_command_contract::facets::{
     CommandApprovalState, CommandCostContext, CommandMediaContext, CommandMemoryContext,
@@ -91,7 +101,7 @@ use codewhale_localization::{MessageId, tr};
 /// (`scripts/check-command-migration-manifest.py`) reads this exact
 /// declaration by source regex and the Rust frontier tests assert it.
 #[cfg_attr(not(test), expect(dead_code))]
-pub(crate) const PENDING_GROUPS: &[&str] = &["config", "core", "debug", "session"];
+pub(crate) const PENDING_GROUPS: &[&str] = &["config", "core"];
 
 // ---------------------------------------------------------------------------
 // Boundary-value mappings (D8)
@@ -218,6 +228,7 @@ pub(crate) fn key_to_message_id(key: &'static str) -> Option<MessageId> {
         "cmd_rename_description" => MessageId::CmdRenameDescription,
         "cmd_restore_description" => MessageId::CmdRestoreDescription,
         "cmd_resume_description" => MessageId::CmdResumeDescription,
+        "cmd_receipts_description" => MessageId::CmdReceiptsDescription,
         "cmd_retry_description" => MessageId::CmdRetryDescription,
         "cmd_review_description" => MessageId::CmdReviewDescription,
         "cmd_rlm_description" => MessageId::CmdRlmDescription,
@@ -263,8 +274,7 @@ pub(crate) fn key_to_message_id(key: &'static str) -> Option<MessageId> {
 
 /// Shared TUI host hidden behind the portable command facets.
 ///
-/// The envelope needs sixteen independently borrowed facet objects, while the
-/// authoritative mutation methods live on `App`. Each adapter therefore owns
+/// The envelope has twenty-two optional facet slots; authoritative mutation methods live on `App`. Each adapter therefore owns
 /// an `Rc` clone of this synchronous host proxy. Trait calls borrow `App` only
 /// for the duration of one method, delegate to the real TUI authority, and
 /// return owned values. Command handlers never receive or name `App`.
@@ -273,6 +283,10 @@ struct CommandHost<'a> {
 }
 
 type SharedCommandHost<'a> = Rc<CommandHost<'a>>;
+
+#[path = "session_structcopy_host.rs"]
+pub(in crate::commands) mod structcopy_host;
+use structcopy_host::SessionStructcopyAdapter;
 
 // ---------------------------------------------------------------------------
 // Session lifecycle adapter (FEAT-023 D4)
@@ -438,6 +452,17 @@ impl CommandSessionLifecycleContext for SessionLifecycleAdapter<'_> {
         session.make_storage_compatible();
         let queue_transition =
             crate::tui::ui::prepare_offline_queue_transition(&app, &session.metadata.id)?;
+        // C01-09: an explicit path may replace a saved session (a re-save),
+        // never an arbitrary file. Whatever exists there must read as one.
+        if let Some(path) = explicit_save_path.as_deref()
+            && path.symlink_metadata().is_ok()
+            && crate::session_manager::SessionManager::load_session_metadata(path).is_err()
+        {
+            return Err(format!(
+                "Refusing to overwrite {}: it is not a saved Codewhale session. Choose a new path, or move that file first.",
+                path.display()
+            ));
+        }
         let save_path = explicit_save_path.unwrap_or_else(|| {
             let dir = crate::session_manager::default_sessions_dir()
                 .unwrap_or_else(|_| app.workspace.clone());
@@ -1414,11 +1439,21 @@ fn import_session_container(
     };
     let model = app.model.clone();
     let workspace = app.workspace.clone();
-    let imported =
+    let mut imported =
         match crate::session_manager::SavedSession::import_foreign(container, workspace, model) {
             Ok(s) => s,
             Err(e) => return Err(format!("foreign import failed: {e}")),
         };
+    // The import takes this window's model, so it takes this window's route
+    // too. Left at the record default it named a different provider, and
+    // opening the imported session sent its whole history there.
+    let (provider, provider_id) = (
+        app.provider_identity_for_persistence().to_string(),
+        app.provider_id_for_persistence().map(str::to_string),
+    );
+    imported
+        .metadata
+        .set_model_provider_route(&provider, provider_id.as_deref());
     let new_id = imported.metadata.id.clone();
     let queue_transition = crate::tui::ui::prepare_offline_queue_transition(app, &new_id)?;
     if let Err(e) = manager.save_session(&imported) {
@@ -1631,6 +1666,7 @@ fn project_block(block: &ContentBlock) -> ExportBlock {
             content,
             is_error,
             content_blocks,
+            ..
         } => ExportBlock::ToolResult {
             tool_use_id: tool_use_id.clone(),
             content: content.clone(),
@@ -2016,6 +2052,7 @@ impl CommandPresentationContext for PresentationAdapter<'_> {
             .or_else(|| key_to_project_message_id(key))
             .or_else(|| key_to_plugin_message_id(key))
             .or_else(|| key_to_session_message_id(key))
+            .or_else(|| diagnostics_messages::resolve(key))
         else {
             return Err("unknown translation key".to_string());
         };
@@ -2026,11 +2063,22 @@ impl CommandPresentationContext for PresentationAdapter<'_> {
     }
 }
 
-/// Resolve a stable session-control message key to the current catalog id
-/// (FEAT-024 D6). Only `/remote-env` makes runtime catalog calls; the other
-/// five control commands keep their metadata-only `description_key` usage.
+/// Resolve session-control and structural-copy runtime keys to the current
+/// catalog. Other session commands retain metadata-only localization.
 pub(crate) fn key_to_session_message_id(key: &str) -> Option<MessageId> {
     Some(match key {
+        "cmd_structcopy_kind_turn" => MessageId::CmdStructcopyKindTurn,
+        "cmd_structcopy_kind_tool" => MessageId::CmdStructcopyKindTool,
+        "cmd_structcopy_kind_plan" => MessageId::CmdStructcopyKindPlan,
+        "cmd_structcopy_kind_workflow" => MessageId::CmdStructcopyKindWorkflow,
+        "cmd_structcopy_usage_error" => MessageId::CmdStructcopyUsageError,
+        "cmd_structcopy_unavailable" => MessageId::CmdStructcopyUnavailable,
+        "cmd_structcopy_busy" => MessageId::CmdStructcopyBusy,
+        "cmd_structcopy_prepare_failed" => MessageId::CmdStructcopyPrepareFailed,
+        "cmd_structcopy_receipt_too_large" => MessageId::CmdStructcopyReceiptTooLarge,
+        "cmd_structcopy_clipboard_queued" => MessageId::CmdStructcopyClipboardQueued,
+        "cmd_structcopy_clipboard_accepted" => MessageId::CmdStructcopyClipboardAccepted,
+        "cmd_structcopy_clipboard_failed" => MessageId::CmdStructcopyClipboardFailed,
         "cmd_remote_env_overview" => MessageId::CmdRemoteEnvOverview,
         "cmd_remote_env_opening" => MessageId::CmdRemoteEnvOpening,
         "cmd_remote_env_unavailable" => MessageId::CmdRemoteEnvUnavailable,
@@ -2049,6 +2097,13 @@ pub(crate) fn key_to_plugin_message_id(key: &str) -> Option<MessageId> {
     Some(match key {
         "cmd_plugin_action_failed" => MessageId::CmdPluginActionFailed,
         "cmd_plugin_bundle_detail" => MessageId::CmdPluginBundleDetail,
+        "cmd_plugin_owner_report" => MessageId::CmdPluginOwnerReport,
+        "cmd_plugin_owner_activating" => MessageId::CmdPluginOwnerActivating,
+        "cmd_plugin_owner_active" => MessageId::CmdPluginOwnerActive,
+        "cmd_plugin_owner_failed" => MessageId::CmdPluginOwnerFailed,
+        "cmd_plugin_owner_faulted" => MessageId::CmdPluginOwnerFaulted,
+        "cmd_plugin_owner_revoked" => MessageId::CmdPluginOwnerRevoked,
+        "cmd_plugin_owner_inactive" => MessageId::CmdPluginOwnerInactive,
         "cmd_plugin_bundle_diagnostics_header" => MessageId::CmdPluginBundleDiagnosticsHeader,
         "cmd_plugin_bundle_list_header" => MessageId::CmdPluginBundleListHeader,
         "cmd_plugin_bundle_mutation_success" => MessageId::CmdPluginBundleMutationSuccess,
@@ -2527,6 +2582,65 @@ fn installer_settings() -> (NetworkPolicy, u64, String) {
     (network, max_size, registry_url)
 }
 
+/// Resolve the cache destination before loading settings or entering the network bridge.
+fn sync_registry_to_cache(cache_dir: Option<PathBuf>) -> Result<SkillSyncOutcome, String> {
+    use crate::skills::install::{SkillSyncOutcome as TuiSyncOutcome, SyncResult};
+    let cache_dir =
+        cache_dir.ok_or_else(|| "global skill mutations require a home directory".to_string())?;
+    let (network, max_size, registry_url) = installer_settings();
+    let result = run_async(async move {
+        crate::skills::install::sync_registry(&network, &registry_url, &cache_dir, max_size).await
+    });
+    match result {
+        Ok(SyncResult::RegistryDenied(host)) => Ok(SkillSyncOutcome::RegistryDenied(host)),
+        Ok(SyncResult::RegistryNeedsApproval(host)) => {
+            Ok(SkillSyncOutcome::RegistryNeedsApproval(host))
+        }
+        Ok(SyncResult::Done { outcomes }) => {
+            let total = outcomes.len();
+            let mut downloaded = 0usize;
+            let mut fresh = 0usize;
+            let mut failed = 0usize;
+            let entries = outcomes
+                .into_iter()
+                .map(|outcome| match outcome {
+                    TuiSyncOutcome::Downloaded { name, path } => {
+                        downloaded += 1;
+                        SkillSyncEntry::Downloaded {
+                            name,
+                            path: path.display().to_string(),
+                        }
+                    }
+                    TuiSyncOutcome::Fresh { name } => {
+                        fresh += 1;
+                        SkillSyncEntry::Fresh { name }
+                    }
+                    TuiSyncOutcome::Failed { name, reason } => {
+                        failed += 1;
+                        SkillSyncEntry::Failed { name, reason }
+                    }
+                    TuiSyncOutcome::Denied { name, host } => {
+                        failed += 1;
+                        SkillSyncEntry::Denied { name, host }
+                    }
+                    TuiSyncOutcome::NeedsApproval { name, host } => {
+                        failed += 1;
+                        SkillSyncEntry::NeedsApproval { name, host }
+                    }
+                })
+                .collect();
+            Ok(SkillSyncOutcome::Done {
+                total,
+                downloaded,
+                fresh,
+                failed,
+                entries,
+            })
+        }
+        Err(err) => Err(format_registry_error("Sync failed", &err)),
+    }
+}
+
 /// Inspect an anyhow chain and surface a one-line hint pointing at the most
 /// common cause of a registry fetch failure (DNS, refused, TLS, HTTP status,
 /// timeout). Mirrors `groups/skills/skills.rs::registry_fetch_error_hint`.
@@ -2588,7 +2702,7 @@ fn discover_visible(app: &App) -> crate::skills::SkillRegistry {
     crate::skills::discover_for_workspace_and_dir_with_mode_and_plugins(
         &app.workspace,
         &app.skills_dir,
-        crate::skills::SkillDiscoveryMode::from_codewhale_only(app.skills_scan_codewhale_only),
+        app.skills_discovery_mode,
         Some(app.plugin_registry.as_ref()),
     )
     .into_enabled()
@@ -2694,8 +2808,7 @@ fn network_denied_message(host: &str) -> String {
 impl CommandSkillGroupContext for SkillGroupAdapter<'_> {
     fn skill_registry_projection(&self) -> SkillRegistryProjection {
         let app = self.host.app.borrow();
-        let mode =
-            crate::skills::SkillDiscoveryMode::from_codewhale_only(app.skills_scan_codewhale_only);
+        let mode = app.skills_discovery_mode;
         let dirs = crate::skills::skill_directories_for_workspace_and_dir(
             &app.workspace,
             &app.skills_dir,
@@ -2704,6 +2817,9 @@ impl CommandSkillGroupContext for SkillGroupAdapter<'_> {
         let registry = discover_visible(&app);
         let mode_label = match mode {
             crate::skills::SkillDiscoveryMode::Compatible => "compatible",
+            crate::skills::SkillDiscoveryMode::CompatibleWithFlatWorkspace => {
+                "compatible (flat workspace enabled)"
+            }
             crate::skills::SkillDiscoveryMode::CodeWhaleOnly => "codewhale-only",
         };
         SkillRegistryProjection {
@@ -2726,6 +2842,12 @@ impl CommandSkillGroupContext for SkillGroupAdapter<'_> {
             discover_visible(&app)
         };
         if let Some(skill) = registry.get(name) {
+            if !skill.invocation.user_invocable() {
+                return Err(SkillActivationError::InvocationRejected {
+                    name: skill.name.clone(),
+                    reason: "frontmatter does not allow user invocation".into(),
+                });
+            }
             let plugin_provenance = match &skill.source {
                 crate::skills::SkillSource::Native => None,
                 crate::skills::SkillSource::Plugin { authority, .. } => {
@@ -2948,61 +3070,7 @@ impl CommandSkillGroupContext for SkillGroupAdapter<'_> {
     }
 
     fn sync_registry(&mut self) -> Result<SkillSyncOutcome, String> {
-        use crate::skills::install::{SkillSyncOutcome as TuiSyncOutcome, SyncResult};
-        let (network, max_size, registry_url) = installer_settings();
-        let cache_dir = crate::skills::install::default_cache_skills_dir();
-        let result = run_async(async move {
-            crate::skills::install::sync_registry(&network, &registry_url, &cache_dir, max_size)
-                .await
-        });
-        match result {
-            Ok(SyncResult::RegistryDenied(host)) => Ok(SkillSyncOutcome::RegistryDenied(host)),
-            Ok(SyncResult::RegistryNeedsApproval(host)) => {
-                Ok(SkillSyncOutcome::RegistryNeedsApproval(host))
-            }
-            Ok(SyncResult::Done { outcomes }) => {
-                let total = outcomes.len();
-                let mut downloaded = 0usize;
-                let mut fresh = 0usize;
-                let mut failed = 0usize;
-                let entries = outcomes
-                    .into_iter()
-                    .map(|outcome| match outcome {
-                        TuiSyncOutcome::Downloaded { name, path } => {
-                            downloaded += 1;
-                            SkillSyncEntry::Downloaded {
-                                name,
-                                path: path.display().to_string(),
-                            }
-                        }
-                        TuiSyncOutcome::Fresh { name } => {
-                            fresh += 1;
-                            SkillSyncEntry::Fresh { name }
-                        }
-                        TuiSyncOutcome::Failed { name, reason } => {
-                            failed += 1;
-                            SkillSyncEntry::Failed { name, reason }
-                        }
-                        TuiSyncOutcome::Denied { name, host } => {
-                            failed += 1;
-                            SkillSyncEntry::Denied { name, host }
-                        }
-                        TuiSyncOutcome::NeedsApproval { name, host } => {
-                            failed += 1;
-                            SkillSyncEntry::NeedsApproval { name, host }
-                        }
-                    })
-                    .collect();
-                Ok(SkillSyncOutcome::Done {
-                    total,
-                    downloaded,
-                    fresh,
-                    failed,
-                    entries,
-                })
-            }
-            Err(err) => Err(format_registry_error("Sync failed", &err)),
-        }
+        sync_registry_to_cache(crate::skills::install::default_cache_skills_dir())
     }
 
     fn run_review(&mut self) -> Result<ReviewOutcome, String> {
@@ -3024,6 +3092,12 @@ impl CommandSkillGroupContext for SkillGroupAdapter<'_> {
 
         match skill {
             Some(skill) => {
+                if !skill.invocation.user_invocable() {
+                    return Err(format!(
+                        "Skill '{}' does not allow user invocation",
+                        skill.name
+                    ));
+                }
                 // Host-side side effects (D2): session-message insertion and
                 // active-skill mutation are authoritative App operations; the
                 // portable handler renders no success message (baseline emits
@@ -3074,20 +3148,39 @@ impl CommandSkillGroupContext for SkillGroupAdapter<'_> {
     }
 
     fn restore_snapshot(&mut self, id: &str) -> Result<(), String> {
+        if let Some(refusal) =
+            debug_operations::active_turn_restore_refusal(&self.host.app.borrow())
+        {
+            return Err(refusal);
+        }
         let workspace = self.host.app.borrow().workspace.clone();
-        let repo = match crate::snapshot::SnapshotRepo::open_or_init(&workspace) {
-            Ok(repo) => repo,
-            Err(err) => {
-                return Err(format!(
-                    "Snapshot repo unavailable for {}: {err}",
-                    workspace.display(),
-                ));
-            }
+        let id = id.to_owned();
+        let restore = move || {
+            let repo = match crate::snapshot::SnapshotRepo::open_or_init(&workspace) {
+                Ok(repo) => repo,
+                Err(err) => {
+                    return Err(format!(
+                        "Snapshot repo unavailable for {}: {err}",
+                        workspace.display(),
+                    ));
+                }
+            };
+            let id = crate::snapshot::SnapshotId::parse(&id)
+                .map_err(|err| format!("Restore failed: {err}"))?;
+            repo.restore(&id)
+                .map_err(|err| format!("Restore failed: {err}"))
         };
-        let id = crate::snapshot::SnapshotId::parse(id)
-            .map_err(|err| format!("Restore failed: {err}"))?;
-        repo.restore(&id)
-            .map_err(|err| format!("Restore failed: {err}"))
+        // Standalone synchronous hosts have no runtime worker to protect.
+        // Live TUI dispatch uses the existing bridge and blocking pool for
+        // the entire restore, including its mandatory safety snapshot.
+        if tokio::runtime::Handle::try_current().is_err() {
+            return restore();
+        }
+        run_async(async move {
+            tokio::task::spawn_blocking(restore)
+                .await
+                .map_err(|error| format!("Restore task failed: {error}"))?
+        })
     }
 
     fn approval_state(&self) -> CommandApprovalState {
@@ -4009,11 +4102,30 @@ impl CommandPluginContext for PluginAdapter<'_> {
         if !dir.exists() {
             return Ok(None);
         }
-        let tools = crate::tools::plugin::scan_plugin_dir(&dir)
-            .into_iter()
-            .map(|(path, metadata)| portable_legacy_tool(&path, &metadata))
+        let discovered = crate::tools::plugin::scan_plugin_dir(&dir);
+        let diagnostics = discovered
+            .iter()
+            .filter(|(_, metadata)| metadata.auto_approval_ignored)
+            .map(|(path, metadata)| PluginDiagnostic {
+                level: PluginDiagnosticLevel::Warning,
+                code: "script_tool_auto_approval_ignored".to_string(),
+                message: format!(
+                    "script tool '{}': {}",
+                    metadata.name,
+                    crate::tools::plugin::AUTO_APPROVAL_UNSUPPORTED
+                ),
+                path: Some(path.clone()),
+            })
             .collect();
-        Ok(Some(PluginLegacyScan { dir, tools }))
+        let tools = discovered
+            .iter()
+            .map(|(path, metadata)| portable_legacy_tool(path, metadata))
+            .collect();
+        Ok(Some(PluginLegacyScan {
+            dir,
+            tools,
+            diagnostics,
+        }))
     }
 
     fn managed_scan(&self, home_override: Option<&Path>) -> Result<PluginManagedScan, String> {
@@ -4305,7 +4417,7 @@ fn default_codewhale_tools_dir() -> Option<PathBuf> {
 // Envelope construction (D1)
 // ---------------------------------------------------------------------------
 
-/// Owns sixteen facet objects sharing one synchronous TUI host proxy.
+/// Owns twenty-three facet objects sharing one synchronous TUI host proxy.
 ///
 /// Handlers borrow only these adapters. Every method delegates to the real App
 /// authority and releases its `RefCell` borrow before returning, so facets can
@@ -4327,6 +4439,13 @@ pub(crate) struct CommandContextBundle<'a> {
     lifecycle: SessionLifecycleAdapter<'a>,
     control: SessionControlAdapter<'a>,
     export: SessionExportAdapter<'a>,
+    structcopy: SessionStructcopyAdapter<'a>,
+    debug_receipts: DebugOperationsAdapter<'a>,
+    debug_change: DebugOperationsAdapter<'a>,
+    debug_history: DebugOperationsAdapter<'a>,
+    debug_diff: DebugOperationsAdapter<'a>,
+    debug_undo: DebugOperationsAdapter<'a>,
+    debug_diagnostics: DebugDiagnosticsAdapter<'a>,
 }
 
 impl<'a> CommandContextBundle<'a> {
@@ -4378,8 +4497,29 @@ impl<'a> CommandContextBundle<'a> {
         if capabilities.contains(CommandCapabilities::SESSION_CONTROL) {
             contexts = contexts.with_control(&mut self.control);
         }
+        if capabilities.contains(CommandCapabilities::SESSION_STRUCTCOPY) {
+            contexts = contexts.with_structcopy(&mut self.structcopy);
+        }
         if capabilities.contains(CommandCapabilities::SESSION_EXPORT) {
             contexts = contexts.with_export(&mut self.export);
+        }
+        if capabilities.contains(CommandCapabilities::DEBUG_RECEIPTS) {
+            contexts = contexts.with_debug_receipts(&mut self.debug_receipts);
+        }
+        if capabilities.contains(CommandCapabilities::DEBUG_CHANGE) {
+            contexts = contexts.with_debug_change(&mut self.debug_change);
+        }
+        if capabilities.contains(CommandCapabilities::DEBUG_HISTORY) {
+            contexts = contexts.with_debug_history(&mut self.debug_history);
+        }
+        if capabilities.contains(CommandCapabilities::DEBUG_DIFF) {
+            contexts = contexts.with_debug_diff(&mut self.debug_diff);
+        }
+        if capabilities.contains(CommandCapabilities::DEBUG_UNDO) {
+            contexts = contexts.with_debug_undo(&mut self.debug_undo);
+        }
+        if capabilities.contains(CommandCapabilities::DEBUG_DIAGNOSTICS) {
+            contexts = contexts.with_debug_diagnostics(&mut self.debug_diagnostics);
         }
         contexts
     }
@@ -4402,7 +4542,14 @@ impl<'a> CommandContextBundle<'a> {
             .union(CommandCapabilities::PLUGIN)
             .union(CommandCapabilities::SESSION_LIFECYCLE)
             .union(CommandCapabilities::SESSION_CONTROL)
-            .union(CommandCapabilities::SESSION_EXPORT);
+            .union(CommandCapabilities::SESSION_EXPORT)
+            .union(CommandCapabilities::SESSION_STRUCTCOPY)
+            .union(CommandCapabilities::DEBUG_RECEIPTS)
+            .union(CommandCapabilities::DEBUG_CHANGE)
+            .union(CommandCapabilities::DEBUG_HISTORY)
+            .union(CommandCapabilities::DEBUG_DIFF)
+            .union(CommandCapabilities::DEBUG_UNDO)
+            .union(CommandCapabilities::DEBUG_DIAGNOSTICS);
         self.contexts(all_test_capabilities).into_parts()
     }
 }
@@ -4430,7 +4577,14 @@ impl App {
             plugin: PluginAdapter { host: host.clone() },
             lifecycle: SessionLifecycleAdapter { host: host.clone() },
             control: SessionControlAdapter { host: host.clone() },
-            export: SessionExportAdapter { host },
+            export: SessionExportAdapter { host: host.clone() },
+            structcopy: SessionStructcopyAdapter { host: host.clone() },
+            debug_receipts: DebugOperationsAdapter { host: host.clone() },
+            debug_change: DebugOperationsAdapter { host: host.clone() },
+            debug_history: DebugOperationsAdapter { host: host.clone() },
+            debug_diff: DebugOperationsAdapter { host: host.clone() },
+            debug_undo: DebugOperationsAdapter { host: host.clone() },
+            debug_diagnostics: DebugDiagnosticsAdapter { host },
         }
     }
 }
@@ -4446,6 +4600,17 @@ mod tests {
         crate::test_support::test_app_with_options(crate::test_support::test_tui_options(
             PathBuf::from("."),
         ))
+    }
+
+    #[test]
+    fn skill_registry_sync_without_home_refuses_before_the_network_bridge() {
+        // No Tokio runtime is present: entering run_async would panic rather
+        // than downloading a registry into an undiscoverable temporary root.
+        let result = sync_registry_to_cache(None);
+        assert_eq!(
+            result.unwrap_err(),
+            "global skill mutations require a home directory"
+        );
     }
 
     /// A 1x1 PNG for media adapter tests.
@@ -4657,6 +4822,336 @@ mod tests {
         assert!(parts.workspace.is_some());
         assert!(parts.presentation.is_some());
         assert!(parts.media.is_some());
+    }
+
+    #[test]
+    fn diagnostics_envelope_exposes_only_declared_authority() {
+        let mut harness =
+            crate::commands::debug_diagnostics_test_support::DiagnosticsHarness::new();
+        let mut bundle = harness.app.command_contexts();
+        let parts = bundle
+            .contexts(CommandCapabilities::DEBUG_DIAGNOSTICS)
+            .into_parts();
+        assert!(parts.debug_diagnostics.is_some());
+        for (name, present) in [
+            ("session", parts.session.is_some()),
+            ("model", parts.model.is_some()),
+            ("cost", parts.cost.is_some()),
+            ("mode_policy", parts.mode_policy.is_some()),
+            ("system_prompt", parts.system_prompt.is_some()),
+            ("skills", parts.skills.is_some()),
+            ("workspace", parts.workspace.is_some()),
+            ("presentation", parts.presentation.is_some()),
+            ("media", parts.media.is_some()),
+            ("memory", parts.memory.is_some()),
+            ("project", parts.project.is_some()),
+            ("skill_group", parts.skill_group.is_some()),
+            ("plugin", parts.plugin.is_some()),
+            ("lifecycle", parts.lifecycle.is_some()),
+            ("control", parts.control.is_some()),
+            ("export", parts.export.is_some()),
+        ] {
+            assert!(
+                !present,
+                "{name} must not be exposed to diagnostics-only commands"
+            );
+        }
+        let parts = bundle.contexts(CommandCapabilities::NONE).into_parts();
+        assert!(parts.debug_diagnostics.is_none());
+    }
+
+    #[test]
+    fn diagnostics_adapter_projects_host_balance_system_and_optional_usage() {
+        let mut harness =
+            crate::commands::debug_diagnostics_test_support::DiagnosticsHarness::new();
+        harness.app.system_prompt = Some(SystemPrompt::Text("policy".to_string()));
+        harness.app.session.last_prompt_tokens = None;
+        harness.app.session.last_completion_tokens = Some(0);
+        let expected_provider = harness.app.api_provider.display_name().to_string();
+        let expected_support = crate::config::provider_has_balance_api(harness.app.api_provider);
+        let mut bundle = harness.app.command_contexts();
+        let mut parts = bundle
+            .contexts(CommandCapabilities::DEBUG_DIAGNOSTICS)
+            .into_parts();
+        let diagnostics = parts
+            .debug_diagnostics
+            .as_mut()
+            .expect("declared diagnostics");
+        let balance = diagnostics.balance_projection();
+        assert_eq!(balance.provider_display_name, expected_provider);
+        assert_eq!(balance.supports_balance_api, expected_support);
+        let system = diagnostics.system_projection();
+        assert_eq!(
+            system.prompt,
+            codewhale_command_contract::facets::DebugSystemPrompt::Text("policy".into())
+        );
+        let usage = diagnostics.token_projection();
+        assert_eq!(usage.last_input, None);
+        assert_eq!(usage.last_output, Some(0));
+        assert_eq!(usage.cost, diagnostics.cost_projection());
+        assert!(diagnostics.tool_snapshot().is_none());
+        assert!(diagnostics.cache_telemetry().history.is_empty());
+    }
+
+    #[test]
+    fn diagnostics_adapter_cost_and_cache_telemetry_preserve_real_distinctions() {
+        let mut harness =
+            crate::commands::debug_diagnostics_test_support::DiagnosticsHarness::new();
+        let app = &mut harness.app;
+        app.session.cost_priced_turns = 1;
+        app.accrue_session_cost_estimate(crate::pricing::CostEstimate {
+            usd: 0.05,
+            cny: 0.0,
+        });
+        app.accrue_subagent_cost_estimate(crate::pricing::CostEstimate {
+            usd: 0.02,
+            cny: 0.0,
+        });
+        app.session.displayed_cost_high_water = 0.10;
+        app.push_turn_cache_record(crate::tui::app::TurnCacheRecord {
+            provider: None,
+            provider_identity: None,
+            model: None,
+            auto_model: false,
+            input_tokens: 120,
+            output_tokens: 0,
+            cache_hit_tokens: Some(0),
+            cache_miss_tokens: None,
+            cache_write_tokens: None,
+            reasoning_tokens: None,
+            reasoning_replay_tokens: None,
+            cost_audit: None,
+            recorded_at: std::time::Instant::now(),
+        });
+        let expected_total =
+            app.displayed_session_cost_for_currency(crate::pricing::CostCurrency::Usd);
+        let mut bundle = app.command_contexts();
+        let mut parts = bundle
+            .contexts(CommandCapabilities::DEBUG_DIAGNOSTICS)
+            .into_parts();
+        let diagnostic = parts.debug_diagnostics.as_mut().unwrap();
+        let cost = diagnostic.cost_projection();
+        assert_eq!(cost.parent_turns, 0.05);
+        assert_eq!(cost.subagents, 0.02);
+        assert!(cost.display_floor > 0.0);
+        assert_eq!(
+            cost.parent_turns + cost.subagents + cost.display_floor,
+            expected_total
+        );
+        let telemetry = diagnostic.cache_telemetry();
+        assert_eq!(telemetry.history.len(), 1);
+        let turn = &telemetry.history[0];
+        assert_eq!(
+            turn.cache_hit_tokens,
+            Some(0),
+            "reported zero is not missing telemetry"
+        );
+        assert_eq!(turn.cache_miss_tokens, None);
+        assert_eq!(turn.priced_amount, None, "no audit is not priced zero");
+        assert_eq!(turn.priced_cache_miss, 120);
+        assert!(turn.age_seconds < 3);
+        assert!(
+            diagnostic.tool_snapshot().is_none(),
+            "no request differs from an empty catalog"
+        );
+    }
+
+    #[test]
+    fn diagnostics_adapter_limits_sensitive_content_to_declared_operations() {
+        let mut harness =
+            crate::commands::debug_diagnostics_test_support::DiagnosticsHarness::new();
+        let secret = "DIAGNOSTICS-PRIVATE-SYSTEM-SENTINEL";
+        harness.app.system_prompt = Some(SystemPrompt::Text(secret.into()));
+        let mut bundle = harness.app.command_contexts();
+        let mut parts = bundle
+            .contexts(CommandCapabilities::DEBUG_DIAGNOSTICS)
+            .into_parts();
+        let diagnostics = parts.debug_diagnostics.as_mut().unwrap();
+        for public_projection in [
+            format!("{:?}", diagnostics.balance_projection()),
+            format!("{:?}", diagnostics.cost_projection()),
+            format!("{:?}", diagnostics.token_projection()),
+            format!("{:?}", diagnostics.cache_telemetry()),
+        ] {
+            assert!(
+                !public_projection.contains(secret),
+                "unrelated operation must not include the prompt"
+            );
+        }
+        let system = diagnostics.system_projection();
+        assert_eq!(
+            system.prompt,
+            codewhale_command_contract::facets::DebugSystemPrompt::Text(secret.into())
+        );
+        assert!(
+            serde_json::to_string(&diagnostics.prompt_context())
+                .unwrap()
+                .contains(secret)
+        );
+    }
+
+    #[test]
+    fn diagnostics_adapter_retains_full_tool_snapshot_schema() {
+        let mut harness =
+            crate::commands::debug_diagnostics_test_support::DiagnosticsHarness::new();
+        let snapshot = crate::tool_inspection::ToolInspectionSnapshot::from_prepared_request(
+            "turn-1",
+            2,
+            Some(&[]),
+        );
+        harness.app.session.last_tool_request_snapshot = Some(snapshot.clone());
+        let mut bundle = harness.app.command_contexts();
+        let mut parts = bundle
+            .contexts(CommandCapabilities::DEBUG_DIAGNOSTICS)
+            .into_parts();
+        let projected = parts
+            .debug_diagnostics
+            .as_mut()
+            .unwrap()
+            .tool_snapshot()
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&projected).unwrap(),
+            serde_json::to_value(&snapshot).unwrap()
+        );
+        assert_eq!(projected.tool_count, 0);
+    }
+
+    #[test]
+    fn diagnostics_adapter_projects_full_context_and_prepared_tool_json() {
+        let mut harness =
+            crate::commands::debug_diagnostics_test_support::DiagnosticsHarness::new();
+        harness.app.system_prompt = Some(SystemPrompt::Text("source-map policy".into()));
+        let tool = codewhale_models::Tool {
+            tool_type: Some("function".into()),
+            name: "search".into(),
+            description: "Find records".into(),
+            input_schema: serde_json::json!({"type":"object","properties":{"q":{"type":"string"}}}),
+            allowed_callers: Some(vec!["assistant".into()]),
+            defer_loading: Some(false),
+            input_examples: None,
+            strict: Some(true),
+            cache_control: None,
+        };
+        harness.app.session.last_tool_catalog = Some(vec![tool.clone()]);
+        let original_context = crate::context_report::build_prompt_context(&harness.app);
+        let original_snapshot =
+            crate::tool_inspection::ToolInspectionSnapshot::from_prepared_request(
+                "turn",
+                3,
+                Some(&[tool]),
+            );
+        harness.app.session.last_tool_request_snapshot = Some(original_snapshot.clone());
+        let mut bundle = harness.app.command_contexts();
+        let mut parts = bundle
+            .contexts(CommandCapabilities::DEBUG_DIAGNOSTICS)
+            .into_parts();
+        let diagnostics = parts.debug_diagnostics.as_mut().unwrap();
+        let projected_context = diagnostics.prompt_context();
+        let actual = crate::commands::debug_diagnostics_test_support::normalize_generated_at(
+            &serde_json::to_string_pretty(&projected_context).unwrap(),
+        );
+        let expected = crate::commands::debug_diagnostics_test_support::normalize_generated_at(
+            &serde_json::to_string_pretty(&original_context).unwrap(),
+        );
+        assert_eq!(projected_context.tools.len(), 1);
+        assert_eq!(projected_context.tools[0].name, "search");
+        assert_eq!(
+            actual, expected,
+            "projection retains the full ordered prompt JSON"
+        );
+        let projected_snapshot = diagnostics.tool_snapshot().unwrap();
+        assert_eq!(
+            serde_json::to_value(projected_snapshot).unwrap(),
+            serde_json::to_value(original_snapshot).unwrap()
+        );
+    }
+
+    #[test]
+    fn diagnostics_adapter_inspection_failure_does_not_write_and_success_commits_once() {
+        let mut harness =
+            crate::commands::debug_diagnostics_test_support::DiagnosticsHarness::new();
+        harness.app.auto_model = true;
+        harness.app.model = "auto".into();
+        {
+            let mut bundle = harness.app.command_contexts();
+            let mut parts = bundle
+                .contexts(CommandCapabilities::DEBUG_DIAGNOSTICS)
+                .into_parts();
+            let diagnostics = parts.debug_diagnostics.as_mut().unwrap();
+            assert_eq!(diagnostics.inspect_cache(), Err(codewhale_command_contract::facets::DebugCacheInspectionUnavailable::NoConcreteRoute));
+        }
+        assert!(harness.app.session.last_cache_inspection.is_none());
+        harness.app.auto_model = false;
+        harness.app.model = "deepseek-v4-pro".into();
+        harness.app.active_route_base_url = "https://example.invalid/v1".into();
+        let first = {
+            let mut bundle = harness.app.command_contexts();
+            let mut parts = bundle
+                .contexts(CommandCapabilities::DEBUG_DIAGNOSTICS)
+                .into_parts();
+            let diagnostics = parts.debug_diagnostics.as_mut().unwrap();
+            let observation = diagnostics.inspect_cache().expect("concrete local route");
+            assert!(observation.previous.is_none());
+            assert!(
+                diagnostics.inspect_cache().unwrap().previous.is_none(),
+                "observation must not commit itself"
+            );
+            diagnostics.remember_cache_inspection(observation.current.clone());
+            observation.current
+        };
+        assert_eq!(
+            harness
+                .app
+                .session
+                .last_cache_inspection
+                .as_ref()
+                .unwrap()
+                .base_static_prefix_hash,
+            first.base_static_prefix_hash
+        );
+        harness.app.active_route_base_url.clear();
+        {
+            let mut bundle = harness.app.command_contexts();
+            let mut parts = bundle
+                .contexts(CommandCapabilities::DEBUG_DIAGNOSTICS)
+                .into_parts();
+            assert_eq!(
+                parts.debug_diagnostics.as_mut().unwrap().inspect_cache(),
+                Err(codewhale_command_contract::facets::DebugCacheInspectionUnavailable::MissingCapturedEndpoint),
+            );
+        }
+        assert_eq!(
+            harness
+                .app
+                .session
+                .last_cache_inspection
+                .as_ref()
+                .unwrap()
+                .base_static_prefix_hash,
+            first.base_static_prefix_hash,
+            "failed endpoint lookup must not write"
+        );
+        harness.app.active_route_base_url = "https://example.invalid/v1".into();
+        harness.app.system_prompt = Some(SystemPrompt::Text("changed".into()));
+        let mut bundle = harness.app.command_contexts();
+        let mut parts = bundle
+            .contexts(CommandCapabilities::DEBUG_DIAGNOSTICS)
+            .into_parts();
+        let observation = parts
+            .debug_diagnostics
+            .as_mut()
+            .unwrap()
+            .inspect_cache()
+            .unwrap();
+        assert_eq!(
+            observation.previous.unwrap().base_static_prefix_hash,
+            first.base_static_prefix_hash
+        );
+        assert_ne!(
+            observation.current.base_static_prefix_hash,
+            first.base_static_prefix_hash
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -5423,7 +5918,10 @@ mod tests {
         }
     }
 
+    /// The fixture's skills dir lives inside its workspace, so the workspace
+    /// must be trusted for those skills to load.
     fn skill_test_app(tmp: &TempDir, skills_dir: &Path) -> App {
+        crate::test_support::trust_workspace(tmp.path());
         let mut options = crate::test_support::test_tui_options(tmp.path());
         options.skills_dir = skills_dir.to_path_buf();
         crate::test_support::test_app_with_options(options)
@@ -5633,28 +6131,48 @@ mod tests {
 
     #[test]
     fn skill_group_snapshot_list_and_restore_roundtrip() {
-        let tmp = TempDir::new().unwrap();
-        let _home = scoped_home(&tmp);
-        let skills_dir = tmp.path().join("skills");
-        let file = tmp.path().join("a.txt");
-        let repo = crate::snapshot::SnapshotRepo::open_or_init(tmp.path()).unwrap();
-        std::fs::write(&file, b"v1").unwrap();
-        repo.snapshot("pre-turn:1").unwrap();
-        std::fs::write(&file, b"v2").unwrap();
-        let mut app = skill_test_app(&tmp, &skills_dir);
-        {
-            let mut bundle = app.command_contexts();
-            let group = bundle
-                .parts()
-                .skill_group
-                .expect("skill_group facet must be present");
-            let entries = group.snapshot_list(20).unwrap();
-            assert_eq!(entries.len(), 1);
-            assert_eq!(entries[0].label, "pre-turn:1");
-            assert!(!entries[0].id.is_empty());
-            group.restore_snapshot(&entries[0].id).unwrap();
+        for in_runtime in [false, true] {
+            let tmp = TempDir::new().unwrap();
+            let _home = scoped_home(&tmp);
+            let skills_dir = tmp.path().join("skills");
+            let file = tmp.path().join("a.txt");
+            let repo = crate::snapshot::SnapshotRepo::open_or_init(tmp.path()).unwrap();
+            std::fs::write(&file, b"v1").unwrap();
+            repo.snapshot("pre-turn:1").unwrap();
+            std::fs::write(&file, b"v2").unwrap();
+            let mut app = skill_test_app(&tmp, &skills_dir);
+            {
+                let mut bundle = app.command_contexts();
+                let group = bundle
+                    .parts()
+                    .skill_group
+                    .expect("skill_group facet must be present");
+                let entries = group.snapshot_list(20).unwrap();
+                assert_eq!(entries.len(), 1);
+                assert_eq!(entries[0].label, "pre-turn:1");
+                assert!(!entries[0].id.is_empty());
+                let mut restore = || {
+                    group.restore_snapshot(&entries[0].id).unwrap();
+                    assert!(
+                        group
+                            .restore_snapshot("not-a-snapshot")
+                            .unwrap_err()
+                            .starts_with("Restore failed:")
+                    );
+                };
+                if in_runtime {
+                    tokio::runtime::Builder::new_multi_thread()
+                        .worker_threads(1)
+                        .enable_all()
+                        .build()
+                        .unwrap()
+                        .block_on(async { restore() });
+                } else {
+                    restore();
+                }
+            }
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), "v1");
         }
-        assert_eq!(std::fs::read_to_string(&file).unwrap(), "v1");
     }
 
     #[test]
@@ -6741,6 +7259,8 @@ mod tests {
         let import_file = tmpdir.path().join("foreign-export.json");
         std::fs::write(&import_file, &json).unwrap();
 
+        // This window is on a non-default route; the import must bind to it.
+        app.api_provider = crate::config::ApiProvider::Openai;
         let receipt = {
             let mut bundle = app.command_contexts();
             let mut parts = bundle.parts();
@@ -6758,6 +7278,10 @@ mod tests {
         // (fresh id/title), matching the baseline import path exactly.
         assert_eq!(saved.metadata.title, "New Session");
         assert_ne!(saved.metadata.id, "foreign-source");
+        assert_eq!(
+            saved.metadata.model_provider, "openai",
+            "an imported session runs on this window's route, not a default one"
+        );
         assert!(
             manager
                 .sessions_dir()

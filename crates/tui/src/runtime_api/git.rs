@@ -42,7 +42,6 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path as FsPath, PathBuf};
-use std::process::Stdio;
 use std::time::Duration;
 
 use axum::Json;
@@ -112,8 +111,12 @@ async fn git_read(workspace: &FsPath, args: &[&str]) -> Result<GitRun, ApiError>
         .map_err(|_| ApiError::internal("git read setup failed"))?
         .map_err(|error| ApiError::internal(format!("git is unavailable: {error}")))?;
     let mut command = tokio::process::Command::from(command);
-    command.args(args).kill_on_drop(true);
-    finish_git(command.output(), GIT_READ_TIMEOUT).await
+    command.args(args);
+    finish_git(
+        crate::process_tree::contained_output(&mut command),
+        GIT_READ_TIMEOUT,
+    )
+    .await
 }
 
 /// Write path for operator-driven mutations. Non-interactive by contract:
@@ -124,12 +127,14 @@ async fn git_read(workspace: &FsPath, args: &[&str]) -> Result<GitRun, ApiError>
 async fn git_write(workspace: &FsPath, args: Vec<String>) -> Result<GitRun, ApiError> {
     let mut command = Git::tokio_command()
         .ok_or_else(|| ApiError::internal("git is not installed or not in PATH"))?;
-    command
-        .args(&args)
-        .current_dir(workspace)
-        .stdin(Stdio::null())
-        .kill_on_drop(true);
-    finish_git(command.output(), GIT_WRITE_TIMEOUT).await
+    command.args(&args).current_dir(workspace);
+    // Contained: hooks and filters run here, and a timeout or a dropped
+    // request must end them too, not only the `git` process itself.
+    finish_git(
+        crate::process_tree::contained_output(&mut command),
+        GIT_WRITE_TIMEOUT,
+    )
+    .await
 }
 
 async fn finish_git(
@@ -1101,10 +1106,7 @@ pub(super) async fn git_diff(
     require_repo(&workspace)?;
     let base = diff_base(&workspace).await?;
     let path_arg = path.to_string_lossy().into_owned();
-    let mut args = vec!["diff", "--no-color"];
-    args.extend(Git::REVIEW_DIFF_ARGS);
-    args.extend([base.as_str(), "--", &path_arg]);
-    let run = git_read(&workspace, &args).await?;
+    let run = git_read(&workspace, &file_diff_args(&base, &path_arg)).await?;
     if !run.status_success {
         return Err(ApiError::internal(format!(
             "git diff failed: {}",
@@ -1116,6 +1118,7 @@ pub(super) async fn git_diff(
         let status = git_read(
             &workspace,
             &[
+                "--literal-pathspecs",
                 "status",
                 "--porcelain=v1",
                 "-z",
@@ -1140,6 +1143,16 @@ pub(super) async fn git_diff(
         "diff": diff,
         "truncated": truncated,
     })))
+}
+
+/// One file's diff against `base`. The path is literal, never pathspec magic
+/// or a glob, so `:/…`/`:(top)…` cannot reach outside a workspace that is a
+/// subdirectory of its repository.
+fn file_diff_args<'a>(base: &'a str, path: &'a str) -> Vec<&'a str> {
+    let mut args = vec!["--literal-pathspecs", "diff", "--no-color"];
+    args.extend(Git::REVIEW_DIFF_ARGS);
+    args.extend([base, "--", path]);
+    args
 }
 
 #[derive(Deserialize)]
@@ -1836,28 +1849,59 @@ pub(super) async fn git_commit(
     guarded_write(&state, expect, args).await
 }
 
-pub(super) async fn git_push(
-    State(state): State<RuntimeApiState>,
-    Json(request): Json<GitPushRequest>,
-) -> Result<Json<Value>, ApiError> {
-    let workspace = canonical_workspace(&state.workspace)?;
-    require_repo(&workspace)?;
-    let remote = request
-        .remote
-        .as_deref()
-        .map(str::trim)
-        .filter(|remote| !remote.is_empty())
-        .map(str::to_string);
-    if let Some(remote) = &remote
-        && !remote
+/// A push target must be one of the repository's configured remotes: never an
+/// option lookalike (`--force`, `--mirror`) and never a path or URL.
+fn validate_push_remote(remote: &str, configured: &str) -> Result<(), ApiError> {
+    let shaped = !remote.starts_with('-')
+        && remote
             .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'/'))
-    {
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'/'));
+    if !shaped {
         return Err(ApiError::bad_request("remote must be a remote name"));
     }
+    if !configured.lines().any(|name| name.trim() == remote) {
+        return Err(ApiError::bad_request(format!(
+            "remote {remote} is not configured in this repository"
+        )));
+    }
+    Ok(())
+}
+
+/// A bounded async read that must succeed; its stdout. Discovery for request
+/// validation goes through [`git_read`] so it never blocks a runtime worker.
+async fn git_read_ok(workspace: &FsPath, args: &[&str]) -> Result<String, ApiError> {
+    let run = git_read(workspace, args).await?;
+    if !run.status_success {
+        return Err(ApiError::internal(format!(
+            "git {} failed: {}",
+            args.first().copied().unwrap_or(""),
+            run.stderr.trim()
+        )));
+    }
+    Ok(run.stdout)
+}
+
+/// `git push` arguments for a request. The remote that will be pushed to —
+/// the requested one, or `origin` when only `set_upstream` is asked — must be
+/// a configured remote, and `--` keeps it from ever parsing as an option.
+async fn push_args(
+    workspace: &FsPath,
+    remote: Option<&str>,
+    set_upstream: bool,
+) -> Result<Vec<String>, ApiError> {
+    let remote = remote.map(str::trim).filter(|remote| !remote.is_empty());
+    let remote = match (remote, set_upstream) {
+        (Some(remote), _) => Some(remote),
+        (None, true) => Some("origin"),
+        (None, false) => None,
+    };
     let mut args = vec!["push".to_string()];
-    if request.set_upstream {
-        let branch = run_git_sync(&workspace, &["rev-parse", "--abbrev-ref", "HEAD"])?;
+    let Some(remote) = remote else {
+        return Ok(args);
+    };
+    validate_push_remote(remote, &git_read_ok(workspace, &["remote"]).await?)?;
+    if set_upstream {
+        let branch = git_read_ok(workspace, &["rev-parse", "--abbrev-ref", "HEAD"]).await?;
         let branch = branch.trim();
         if branch.is_empty() || branch == "HEAD" {
             return Err(ApiError::bad_request(
@@ -1865,11 +1909,20 @@ pub(super) async fn git_push(
             ));
         }
         args.push("--set-upstream".to_string());
-        args.push(remote.unwrap_or_else(|| "origin".to_string()));
-        args.push(branch.to_string());
-    } else if let Some(remote) = remote {
-        args.push(remote);
+        args.extend(["--".to_string(), remote.to_string(), branch.to_string()]);
+    } else {
+        args.extend(["--".to_string(), remote.to_string()]);
     }
+    Ok(args)
+}
+
+pub(super) async fn git_push(
+    State(state): State<RuntimeApiState>,
+    Json(request): Json<GitPushRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let workspace = canonical_workspace(&state.workspace)?;
+    require_repo(&workspace)?;
+    let args = push_args(&workspace, request.remote.as_deref(), request.set_upstream).await?;
     // Push stays outside the write lock: it crosses the network under a
     // 120 s bound and only moves a remote ref, never the index or worktree.
     mutation_response(&workspace, git_write(&workspace, args).await?).await
@@ -2499,7 +2552,12 @@ mod tests {
         let ws = tmp.path();
         git(ws, &["config", "filter.up.clean", "tr a-z A-Z"]);
         fs::write(ws.join(".gitattributes"), "*.txt filter=up\n").unwrap();
-        git(ws, &["add", ".gitattributes", "a.txt"]);
+        git(ws, &["add", ".gitattributes"]);
+        // The tracked file is unchanged since the initial commit. Apply the
+        // new attributes explicitly instead of depending on Git's cached
+        // stat entry deciding to run the newly configured clean filter.
+        git(ws, &["add", "--renormalize", "a.txt"]);
+        assert_eq!(run_git_sync(ws, &["show", ":a.txt"]).unwrap(), "ONE\n");
         git(ws, &["commit", "-q", "-m", "filtered"]);
         fs::File::options()
             .write(true)
@@ -2637,5 +2695,125 @@ mod tests {
         )
         .unwrap();
         assert_eq!(ok.files.unwrap().keys().collect::<Vec<_>>(), vec!["a.txt"]);
+    }
+
+    /// A dropped (or timed-out) write takes down what git started — a hook, a
+    /// filter, an alias — not just the `git` process.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropped_git_write_kills_what_git_started() {
+        let tmp = repo();
+        let pid_file = tmp.path().join("hang.pid");
+        let args = vec![
+            "-c".to_string(),
+            "alias.hang=!sleep 300 & echo $! > hang.pid; wait".to_string(),
+            "hang".to_string(),
+        ];
+        let grandchild =
+            crate::process_tree::drop_once_pid_written(git_write(tmp.path(), args), &pid_file)
+                .await;
+        assert!(
+            crate::process_tree::wait_for_pid_exit(grandchild, Duration::from_secs(5)),
+            "a process git started outlived the dropped request"
+        );
+    }
+
+    #[test]
+    fn file_diff_reads_the_path_literally_inside_a_subdirectory_workspace() {
+        let tmp = repo();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("apps/web")).unwrap();
+        fs::create_dir_all(root.join("apps/other")).unwrap();
+        fs::write(root.join("apps/web/w.txt"), "w\n").unwrap();
+        fs::write(root.join("apps/other/secret.txt"), "old\n").unwrap();
+        git(root, &["add", "apps"]);
+        git(root, &["commit", "-q", "-m", "apps"]);
+        fs::write(root.join("apps/web/w.txt"), "w2\n").unwrap();
+        fs::write(root.join("apps/other/secret.txt"), "new\n").unwrap();
+        let workspace = root.join("apps/web");
+        let diff = |path: &str| {
+            let output = Git::review_command(&workspace)
+                .unwrap()
+                .args(file_diff_args("HEAD", path))
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            String::from_utf8_lossy(&output.stdout).into_owned()
+        };
+        assert!(diff("w.txt").contains("+w2"), "in-workspace diff works");
+        for path in [
+            ":/apps/other/secret.txt",
+            ":(top)apps/other/secret.txt",
+            "*",
+        ] {
+            let body = diff(path);
+            assert!(!body.contains("secret"), "{path} escaped: {body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn push_args_validate_the_effective_remote_and_end_options() {
+        let tmp = repo();
+        let root = tmp.path();
+        let status = |error: ApiError| error.status;
+
+        // No remote configured: plain `push` stays git's call, but an
+        // upstream push defaults to `origin`, which must exist too.
+        assert_eq!(push_args(root, None, false).await.unwrap(), ["push"]);
+        assert_eq!(push_args(root, Some("  "), false).await.unwrap(), ["push"]);
+        assert_eq!(
+            push_args(root, None, true)
+                .await
+                .map_err(status)
+                .unwrap_err(),
+            StatusCode::BAD_REQUEST
+        );
+
+        let bare = tempfile::tempdir().unwrap();
+        git(bare.path(), &["init", "-q", "--bare"]);
+        git(
+            root,
+            &["remote", "add", "origin", &bare.path().to_string_lossy()],
+        );
+        assert_eq!(
+            push_args(root, Some(" origin "), false).await.unwrap(),
+            ["push", "--", "origin"]
+        );
+        for remote in ["--mirror", "fork", "../other"] {
+            assert_eq!(
+                push_args(root, Some(remote), true)
+                    .await
+                    .map_err(status)
+                    .unwrap_err(),
+                StatusCode::BAD_REQUEST,
+                "{remote}"
+            );
+        }
+        let args = push_args(root, None, true).await.unwrap();
+        assert_eq!(args, ["push", "--set-upstream", "--", "origin", "main"]);
+
+        // The built arguments are ones git accepts: the push lands in the
+        // bare remote and records the upstream.
+        git(root, &args.iter().map(String::as_str).collect::<Vec<_>>());
+        let upstream = run_git_sync(root, &["rev-parse", "--abbrev-ref", "@{upstream}"]).unwrap();
+        assert_eq!(upstream.trim(), "origin/main");
+    }
+
+    #[test]
+    fn push_remote_must_be_a_configured_remote_name() {
+        let configured = "origin\nupstream\n";
+        assert!(validate_push_remote("origin", configured).is_ok());
+        assert!(validate_push_remote("upstream", configured).is_ok());
+        for remote in [
+            "--force",
+            "--mirror",
+            "-f",
+            "--delete",
+            "../other-repo",
+            "fork",
+        ] {
+            let error = validate_push_remote(remote, configured).expect_err(remote);
+            assert_eq!(error.status, StatusCode::BAD_REQUEST, "{remote}");
+        }
     }
 }

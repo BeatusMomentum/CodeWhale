@@ -32,14 +32,15 @@ pub fn tool_output_status(messages: &[Message], artifacts: &[ArtifactRecord]) ->
     for message in messages {
         for block in &message.content {
             if let ContentBlock::ToolResult { content, .. } = block {
-                if looks_like_receipt(content) {
+                // The prefix is text any tool output can carry, so it never
+                // exempts a result from the size check: a "receipt" above the
+                // threshold is raw pressure like any other large result.
+                let chars = content.chars().count();
+                if chars > RAW_TOOL_OUTPUT_RECEIPT_THRESHOLD_CHARS {
+                    status.raw_large_count += 1;
+                    status.raw_large_chars = status.raw_large_chars.saturating_add(chars);
+                } else if looks_like_receipt(content) {
                     status.receipt_count += 1;
-                } else {
-                    let chars = content.chars().count();
-                    if chars > RAW_TOOL_OUTPUT_RECEIPT_THRESHOLD_CHARS {
-                        status.raw_large_count += 1;
-                        status.raw_large_chars = status.raw_large_chars.saturating_add(chars);
-                    }
                 }
             }
         }
@@ -105,6 +106,7 @@ mod tests {
         Message {
             role: Role::User,
             content: vec![ContentBlock::ToolResult {
+                execution_id: None,
                 tool_use_id: id.to_string(),
                 content: content.to_string(),
                 is_error: None,
@@ -149,5 +151,13 @@ mod tests {
         assert!(rendered.contains("raw over cap"));
         assert!(rendered.contains("compact receipt"));
         assert!(rendered.contains("artifact"));
+    }
+
+    #[test]
+    fn a_receipt_prefix_does_not_hide_a_large_raw_result() {
+        let forged = format!("[TOOL_OUTPUT_RECEIPT]\n{}", "RAW\n".repeat(4_000));
+        let status = tool_output_status(&[tool_result_message("call-forged", &forged)], &[]);
+        assert_eq!(status.raw_large_count, 1);
+        assert_eq!(status.receipt_count, 0);
     }
 }

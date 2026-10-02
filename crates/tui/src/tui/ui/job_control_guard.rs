@@ -80,6 +80,13 @@ static RESTORED: AtomicBool = AtomicBool::new(false);
 #[cfg(unix)]
 static ORIGINAL_TERMIOS: OnceLock<libc::termios> = OnceLock::new();
 
+/// The cooked snapshot above, for the fatal-signal guard: one snapshot, taken
+/// once before raw mode, serves every signal-time restore.
+#[cfg(unix)]
+pub(crate) fn original_termios() -> Option<&'static libc::termios> {
+    ORIGINAL_TERMIOS.get()
+}
+
 /// Install the job-control guard. POSIX only; no-op elsewhere.
 ///
 /// Call once on the main thread, after the foreground-ownership check (the

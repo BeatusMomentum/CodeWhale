@@ -1108,8 +1108,14 @@ fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
 fn push_update_path(paths: &mut Vec<PathBuf>, path: PathBuf, current_exe: &Path) {
     // Keep a same-target symlink as a symlink. Replacing its target refreshes
     // the alias too. Foreign/broken links stay in the plan and fail validation.
+    // Compare canonical paths on both sides: `current_exe()` is not
+    // canonicalized on macOS, so an install dir reached through a symlinked
+    // directory would otherwise never match its own alias.
     let same_target_link = std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_symlink())
-        && std::fs::canonicalize(&path).is_ok_and(|resolved| resolved == current_exe);
+        && match [path.as_path(), current_exe].map(std::fs::canonicalize) {
+            [Ok(resolved), exe] => resolved == current_exe || exe.is_ok_and(|exe| resolved == exe),
+            _ => false,
+        };
     if !same_target_link {
         push_unique_path(paths, path);
     }
@@ -1183,30 +1189,22 @@ fn release_asset_stem_for(current_exe: &Path, os: &str, rust_arch: &str) -> Stri
     release_asset_stem_for_prefix("codewhale", os, rust_arch)
 }
 
-pub(crate) fn asset_matches_platform(asset_name: &str, binary_name: &str) -> bool {
-    if asset_name.ends_with(".sha256") {
-        return false;
-    }
-    asset_name == binary_name
-        || asset_name == format!("{binary_name}.exe")
-        || asset_name.starts_with(&format!("{binary_name}."))
-}
-
 fn asset_is_exact_platform_binary(asset_name: &str, binary_name: &str) -> bool {
     asset_name == binary_name || asset_name == format!("{binary_name}.exe")
 }
 
+/// The raw platform executable, and nothing else.
+///
+/// The updater writes the downloaded bytes straight over the running binary;
+/// it never unpacks. An archive, signature, or sidecar that merely shares the
+/// stem (`codewhale-macos-arm64.tar.gz`) would pass the checksum — the manifest
+/// lists it too — and then replace the executable with a non-executable. A
+/// release without the raw binary has no asset for this platform.
 fn select_platform_asset<'a>(release: &'a Release, binary_name: &str) -> Option<&'a Asset> {
     release
         .assets
         .iter()
         .find(|asset| asset_is_exact_platform_binary(&asset.name, binary_name))
-        .or_else(|| {
-            release
-                .assets
-                .iter()
-                .find(|asset| asset_matches_platform(&asset.name, binary_name))
-        })
 }
 
 fn select_checksum_manifest_asset(release: &Release) -> Option<&Asset> {
@@ -1302,8 +1300,36 @@ fn update_http_client_with_timeout(
     builder
         .user_agent(UPDATE_USER_AGENT)
         .timeout(timeout)
+        .redirect(update_redirect_policy())
         .build()
         .context("failed to build update HTTP client")
+}
+
+fn redirect_leaves_https(previous: &[reqwest::Url], next: &reqwest::Url) -> bool {
+    next.scheme() != "https" && previous.iter().any(|url| url.scheme() == "https")
+}
+
+/// Most redirects an update request follows.
+const UPDATE_MAX_REDIRECTS: usize = 10;
+
+/// Largest update response held in memory. Release archives are tens of
+/// megabytes; a server that keeps sending is cut off instead of exhausting
+/// memory before the checksum is ever compared.
+const UPDATE_MAX_RESPONSE_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Follow redirects, but never from HTTPS down to plain HTTP: a request that
+/// started encrypted must not finish over a channel anyone on the path can
+/// rewrite.
+fn update_redirect_policy() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        if attempt.previous().len() > UPDATE_MAX_REDIRECTS {
+            return attempt.error("too many redirects");
+        }
+        if redirect_leaves_https(attempt.previous(), attempt.url()) {
+            return attempt.error("update redirect left HTTPS");
+        }
+        attempt.follow()
+    })
 }
 
 /// Fetch the latest release metadata from GitHub.
@@ -1603,11 +1629,17 @@ fn download_url_once(
         .send()
         .with_context(|| format!("failed to download {url}"))?;
     let status = response.status();
-    let bytes = response
-        .bytes()
-        .with_context(|| format!("failed to read response body from {url}"))?;
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(
+        &mut std::io::Read::take(response, UPDATE_MAX_RESPONSE_BYTES + 1),
+        &mut bytes,
+    )
+    .with_context(|| format!("failed to read response body from {url}"))?;
+    if bytes.len() as u64 > UPDATE_MAX_RESPONSE_BYTES {
+        bail!("response from {url} exceeds the {UPDATE_MAX_RESPONSE_BYTES}-byte update limit");
+    }
 
-    Ok((status, bytes.to_vec()))
+    Ok((status, bytes))
 }
 
 /// Compute the SHA256 hex digest of data.
@@ -2687,6 +2719,24 @@ mod tests {
         }
     }
 
+    #[cfg(all(unix, not(target_os = "android")))]
+    #[test]
+    fn same_target_symlink_is_kept_when_the_install_dir_is_reached_through_a_symlink() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let real_dir = root.join("real-bin");
+        std::fs::create_dir(&real_dir).unwrap();
+        let linked_dir = root.join("linked-bin");
+        symlink(&real_dir, &linked_dir).unwrap();
+        // `current_exe()` on macOS reports the path as reached, not resolved.
+        let primary = linked_dir.join("codewhale");
+        write_installed_binary(&primary, b"running bytes");
+        symlink("codewhale", linked_dir.join("codew")).unwrap();
+        let plan = update_plan_for_exe(&primary);
+        assert_eq!(plan.target_paths.as_slice(), std::slice::from_ref(&primary));
+    }
+
     #[test]
     fn legacy_binary_message_gives_copy_pasteable_migration_steps() {
         let message = legacy_binary_message(Path::new("/usr/local/bin/deepseek-tui"));
@@ -2878,27 +2928,34 @@ mod tests {
     }
 
     #[test]
-    fn test_asset_matching_accepts_binary_assets_and_rejects_checksums() {
-        assert!(asset_matches_platform(
-            "codewhale-macos-arm64",
-            "codewhale-macos-arm64"
-        ));
-        assert!(asset_matches_platform(
-            "codewhale-macos-arm64.tar.gz",
-            "codewhale-macos-arm64"
-        ));
-        assert!(asset_matches_platform(
-            "codewhale-tui-windows-x64.exe",
-            "codewhale-tui-windows-x64"
-        ));
-        assert!(!asset_matches_platform(
-            "codewhale-tui-windows-x64.exe.sha256",
-            "codewhale-tui-windows-x64"
-        ));
-        assert!(!asset_matches_platform(
-            "codewhale-macos-aarch64.tar.gz",
-            "codewhale-macos-arm64"
-        ));
+    fn test_asset_matching_accepts_only_the_raw_binary() {
+        for (asset, binary, expected) in [
+            ("codewhale-macos-arm64", "codewhale-macos-arm64", true),
+            (
+                "codewhale-tui-windows-x64.exe",
+                "codewhale-tui-windows-x64",
+                true,
+            ),
+            (
+                "codewhale-macos-arm64.tar.gz",
+                "codewhale-macos-arm64",
+                false,
+            ),
+            ("codewhale-macos-arm64.zip", "codewhale-macos-arm64", false),
+            ("codewhale-macos-arm64.sig", "codewhale-macos-arm64", false),
+            (
+                "codewhale-tui-windows-x64.exe.sha256",
+                "codewhale-tui-windows-x64",
+                false,
+            ),
+            ("codewhale-macos-aarch64", "codewhale-macos-arm64", false),
+        ] {
+            assert_eq!(
+                asset_is_exact_platform_binary(asset, binary),
+                expected,
+                "{asset} vs {binary}"
+            );
+        }
     }
 
     #[test]
@@ -2926,22 +2983,26 @@ mod tests {
         assert_eq!(asset.name, "codewhale-macos-arm64");
     }
 
+    /// Audit R02-04: the updater installs the downloaded bytes verbatim, so a
+    /// release that ships only an archive/signature/sidecar for this platform
+    /// has no installable asset rather than one that bricks the binary.
     #[test]
-    fn select_platform_asset_falls_back_to_archive_when_bare_binary_is_missing() {
+    fn select_platform_asset_never_substitutes_an_archive_or_sidecar() {
         let release = Release {
             tag_name: "v0.8.8".to_string(),
             prerelease: false,
-            assets: vec![Asset {
-                name: "codewhale-macos-arm64.tar.gz".to_string(),
-                browser_download_url: "https://example.invalid/codewhale-macos-arm64.tar.gz"
-                    .to_string(),
-            }],
+            assets: ["tar.gz", "zip", "sig", "sbom.json"]
+                .into_iter()
+                .map(|ext| Asset {
+                    name: format!("codewhale-macos-arm64.{ext}"),
+                    browser_download_url: format!(
+                        "https://example.invalid/codewhale-macos-arm64.{ext}"
+                    ),
+                })
+                .collect(),
         };
 
-        let asset =
-            select_platform_asset(&release, "codewhale-macos-arm64").expect("platform asset");
-
-        assert_eq!(asset.name, "codewhale-macos-arm64.tar.gz");
+        assert!(select_platform_asset(&release, "codewhale-macos-arm64").is_none());
     }
 
     #[test]
@@ -4230,5 +4291,22 @@ E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855  *codewhale-win
             "got {request:?}"
         );
         handle.join().expect("test server thread");
+    }
+
+    #[test]
+    fn update_redirects_never_leave_https() {
+        let url = |s: &str| reqwest::Url::parse(s).expect("url");
+        let https = [url("https://github.com/a")];
+        assert!(redirect_leaves_https(&https, &url("http://example.test/a")));
+        assert!(!redirect_leaves_https(
+            &https,
+            &url("https://example.test/a")
+        ));
+        // A plain-HTTP mirror the operator configured may redirect as before.
+        let http = [url("http://127.0.0.1:9/a")];
+        assert!(!redirect_leaves_https(&http, &url("http://127.0.0.1:9/b")));
+        // Once any hop was HTTPS, a later plain hop is refused.
+        let mixed = [url("http://mirror.test/a"), url("https://cdn.test/a")];
+        assert!(redirect_leaves_https(&mixed, &url("http://mirror.test/b")));
     }
 }

@@ -440,18 +440,7 @@ impl RenderedStrip {
     }
 }
 
-/// Prompt-cache hit rates, each labelled by whose requests it covers (#6565).
-///
-/// `parent` is this conversation's own requests: the footer `cache N%` and it
-/// never change meaning. `agents` covers sub-agent and other background
-/// requests. `combined` weights both by their tokens. Each is `None` when its
-/// requests reported no cache telemetry; no report is never 0%.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct CacheRates {
-    pub parent: Option<u8>,
-    pub agents: Option<u8>,
-    pub combined: Option<u8>,
-}
+pub use codewhale_command_contract::facets::DebugCacheRates as CacheRates;
 
 fn hit_percent(hit: u64, miss: u64, write: u64) -> Option<u8> {
     let total = hit.saturating_add(miss).saturating_add(write);
@@ -478,29 +467,6 @@ pub fn cache_rates(app: &crate::tui::app::App) -> CacheRates {
                 parent_write.saturating_add(agent_write),
             )
         }),
-    }
-}
-
-impl CacheRates {
-    /// `parent 82% · agents 64% · combined 75%` with the given words, or just
-    /// `82%` when only the parent reported. `None` when nothing did.
-    #[must_use]
-    pub fn labelled(&self, parent: &str, agents: &str, combined: &str) -> Option<String> {
-        match (self.parent, self.agents) {
-            (Some(pct), None) => Some(format!("{pct}%")),
-            (None, None) => None,
-            _ => Some(
-                [
-                    (parent, self.parent),
-                    (agents, self.agents),
-                    (combined, self.combined),
-                ]
-                .into_iter()
-                .filter_map(|(word, pct)| pct.map(|pct| format!("{word} {pct}%")))
-                .collect::<Vec<_>>()
-                .join(" · "),
-            ),
-        }
     }
 }
 

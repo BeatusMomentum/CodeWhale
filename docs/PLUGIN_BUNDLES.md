@@ -1,5 +1,7 @@
 # Plugin bundles
 
+> 阅读简体中文版：[zh_hans/PLUGIN_BUNDLES.md](zh_hans/PLUGIN_BUNDLES.md)。
+
 Codewhale supports a deliberately small plugin-bundle boundary. The boundary
 was drawn in v0.9.1 and is extended deliberately in v0.9.10: a bundle may
 contribute declarative Skills, MCP configuration, Commands, Agent profiles,
@@ -199,7 +201,7 @@ and no longer disable the whole bundle:
 path = "lsp"
 
 [native]        # TOML alias: [native_extension]
-path = "native"
+path = "native/index.mjs"
 
 [capabilities]
 filesystem_roots = ["workspace"]
@@ -217,16 +219,28 @@ The accept/reject behavior is deliberately loud, never silent:
   activate beside named inactive surfaces, and `unsupported` when the bundle
   only declares surfaces Codewhale cannot activate yet. The same versioned
   activation policy (v3) drives those labels, the runtime adapters, and the
-  capability hash. A future Codewhale that starts executing LSP or native code
-  must change that policy, which changes the capability hash and forces
-  re-review. v1 and v2 trust receipts fail closed as
-  `capabilities-changed`.
+  capability hash. Executing LSP or native code must change that policy,
+  which changes the capability hash and forces re-review. v1 and v2 trust
+  receipts fail closed as `capabilities-changed`.
+- **`native` under the experimental extension host.** With
+  `[features] extension_host` on, the policy becomes v4 and `native` is an
+  active adapter: each entry is one `.mjs`, `.js` or `.mts` ES module file that the
+  TypeScript extension host imports. A directory or any other file reports
+  an error in `/plugin validate` and review and prevents activation. Its tools
+  always use `Required` approval;
+  Full Access, Bypass, or an exact session grant for the reviewed build can
+  satisfy that gate without a prompt. Toggling the flag
+  re-reviews every plugin. See
+  [the design](design/TS_EXTENSION_HOST.md#as-built-phase-1-2026-09-25).
+  The [extension author guide](EXTENSIONS.md) includes a tested typed example,
+  diagnostic workflow and Node's erasable-TypeScript restrictions.
 - A **recognized-but-inactive** declaration (`lsp`, `native`, a non-empty
   `capabilities.filesystem_roots`, or
   `capabilities.lifecycle_mutation = true`) parses and is validated like any
   component (contained, present, link-free). It is counted in the inventory,
   hashed into the capability receipt, shown in review and `/plugin show` as
-  inactive, and never executed. A reviewed, trusted, applicable mixed bundle
+  inactive, and never executed (for `native`, only while the extension host
+  flag is off). A reviewed, trusted, applicable mixed bundle
   can still be enabled: supported declarative components become active, and
   the inactive surfaces stay named as inactive.
 - An **all-unsupported** bundle can be reviewed and trusted, but `/plugin
@@ -375,7 +389,9 @@ structural argv as lossless JSON strings and environment provenance without
 values. Credential-bearing argv is rejected at manifest validation;
 plugin-originated errors suppress URL query, authentication, argv, and
 environment material. Legacy executable tools under `[tools].plugin_dir`
-remain a distinct system and are listed under `/plugin tools`.
+remain a distinct system and are listed under `/plugin tools`; they cannot
+approve themselves or replace built-in tools (see
+[CONFIGURATION.md](CONFIGURATION.md#script-tools-and-overrides)).
 
 ## Explicit non-goals as of v0.9.10
 
@@ -384,8 +400,8 @@ parse local Kimi-, Claude-, Codex-, and Codewhale-format catalog documents; see
 the marketplace section below (`/plugin install` fetches
 one reviewed source, and `/plugin suggest` ranks only what is already
 installed), no ambient compatibility discovery, no automatic trust, no
-plugin-contributed MCP OAuth, no LSP adapter, native extension runtime, or MCP
-subscription adapter, no
+plugin-contributed MCP OAuth, no LSP adapter or MCP subscription adapter, no
+native extension runtime outside the experimental `extension_host` flag, no
 foreign executable plugin runtime import, and no on-disk auto-migration of a
 legacy `plugin.toml` to `plugin.json`. The explicit offline
 [OpenCode/DSH converter](PLUGIN_AUTHORING.md#convert-an-existing-plugin) supports

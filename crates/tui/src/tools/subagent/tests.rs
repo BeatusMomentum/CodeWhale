@@ -258,7 +258,14 @@ fn child_approval_ids_stay_unique_within_and_across_manager_boots() {
 
     let mut first_ids = Vec::new();
     for _ in 0..3 {
-        let (id, _rx) = first.register_child_approval("resumed-agent-7", "bash", "fixture");
+        let (id, _rx) = first
+            .register_child_approval(
+                "resumed-agent-7",
+                &new_child_execution_id("resumed-agent-7"),
+                "bash",
+                "fixture",
+            )
+            .unwrap();
         assert!(
             SubAgentManager::is_child_approval_id(&id),
             "routing hint must still recognize {id}"
@@ -277,7 +284,14 @@ fn child_approval_ids_stay_unique_within_and_across_manager_boots() {
     let mut second = SubAgentManager::new(tmp.path().to_path_buf(), 4);
     let mut second_ids = Vec::new();
     for _ in 0..3 {
-        let (id, _rx) = second.register_child_approval("resumed-agent-7", "bash", "fixture");
+        let (id, _rx) = second
+            .register_child_approval(
+                "resumed-agent-7",
+                &new_child_execution_id("resumed-agent-7"),
+                "bash",
+                "fixture",
+            )
+            .unwrap();
         assert!(SubAgentManager::is_child_approval_id(&id));
         second_ids.push(id);
     }
@@ -287,6 +301,46 @@ fn child_approval_ids_stay_unique_within_and_across_manager_boots() {
             "id {id} from the second manager collides with the first boot's ids"
         );
     }
+}
+
+#[tokio::test]
+async fn child_execution_identity_cannot_replace_a_waiter_or_answer_a_later_call() {
+    let tmp = tempdir().unwrap();
+    let mut manager = SubAgentManager::new(tmp.path().to_path_buf(), 2);
+    let first = new_child_execution_id("child");
+    let second = new_child_execution_id("child");
+    let (registered, receiver) = manager
+        .register_child_approval("child", &first, "bash", "one")
+        .unwrap();
+    assert_eq!(registered, first);
+    assert!(
+        manager
+            .register_child_approval("child", &first, "bash", "replacement")
+            .is_err()
+    );
+    assert!(
+        manager
+            .register_child_approval("other", &first, "bash", "wrong owner")
+            .is_err()
+    );
+    assert!(manager.resolve_child_approval(&first, ChildApprovalOutcome::Denied));
+    assert!(matches!(
+        receiver.await.unwrap(),
+        ChildApprovalOutcome::Denied
+    ));
+    let (_, mut receiver) = manager
+        .register_child_approval("child", &second, "bash", "two")
+        .unwrap();
+    assert!(!manager.resolve_child_approval(&first, ChildApprovalOutcome::Approved));
+    assert!(matches!(
+        receiver.try_recv(),
+        Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+    ));
+    assert!(manager.resolve_child_approval(&second, ChildApprovalOutcome::Approved));
+    assert!(matches!(
+        receiver.await.unwrap(),
+        ChildApprovalOutcome::Approved
+    ));
 }
 
 #[test]
@@ -2936,6 +2990,9 @@ async fn always_rate_limited_chat_client() -> (CodewhaleClient, Arc<AtomicUsize>
             initial_delay: Some(0.0),
             max_delay: Some(0.0),
             exponential_base: Some(1.0),
+            jitter: None,
+            jitter_factor: None,
+            respect_retry_after: None,
         }),
         ..crate::config::Config::default()
     }
@@ -2988,6 +3045,9 @@ async fn always_invalid_request_chat_client() -> (CodewhaleClient, Arc<AtomicUsi
             initial_delay: Some(0.0),
             max_delay: Some(0.0),
             exponential_base: Some(1.0),
+            jitter: None,
+            jitter_factor: None,
+            respect_retry_after: None,
         }),
         ..crate::config::Config::default()
     }
@@ -6767,6 +6827,56 @@ async fn full_event_channel_still_delivers_agent_complete() {
     ));
 }
 
+/// #6560 D02-06: a nested parent's completion inbox is bounded and has no
+/// terminal-results synthesis behind it, so a completion that meets a full
+/// inbox must wait for capacity rather than be dropped.
+#[tokio::test]
+async fn full_nested_completion_inbox_still_delivers_child_completion() {
+    let tmp = tempdir().expect("tempdir");
+    let mut manager = SubAgentManager::new(tmp.path().to_path_buf(), 2);
+    let agent_id = "agent_full_inbox".to_string();
+    let (input_tx, _input_rx) = mpsc::unbounded_channel();
+    let mut agent = SubAgent::new(
+        agent_id.clone(),
+        FleetRole::Worker,
+        "finish while the parent inbox is full".to_string(),
+        make_assignment(),
+        "deepseek-v4-flash".to_string(),
+        None,
+        None,
+        input_tx,
+        tmp.path().to_path_buf(),
+        manager.current_session_boot_id.clone(),
+    );
+    agent.task_handle = Some(tokio::spawn(async {
+        tokio::time::sleep(Duration::from_secs(60)).await;
+    }));
+
+    let (completion_tx, mut completion_rx) = mpsc::channel::<SubAgentCompletion>(1);
+    completion_tx
+        .try_send(SubAgentCompletion {
+            owner_session_id: String::new(),
+            agent_id: "earlier_sibling".to_string(),
+            payload: "already queued".to_string(),
+        })
+        .expect("fill the only slot");
+    let runtime = runtime_with_depth(2, Some(completion_tx));
+    agent.terminal_delivery = Some(SubAgentTerminalDeliveryContext::from_runtime(&runtime));
+    manager.agents.insert(agent_id.clone(), agent);
+    manager.register_worker(make_worker_spec(&agent_id, tmp.path().to_path_buf()));
+
+    let result = manager.cancel_agent(&agent_id).expect("stop");
+    assert_eq!(result.status, SubAgentStatus::Cancelled);
+
+    let filler = completion_rx.recv().await.expect("filler completion");
+    assert_eq!(filler.agent_id, "earlier_sibling");
+    let delivered = tokio::time::timeout(Duration::from_secs(5), completion_rx.recv())
+        .await
+        .expect("child completion is not dropped")
+        .expect("inbox open");
+    assert_eq!(delivered.agent_id, agent_id);
+}
+
 #[tokio::test]
 async fn model_wait_cancel_fans_in_once_and_preserves_checkpoint() {
     use tokio_util::sync::CancellationToken;
@@ -8078,7 +8188,14 @@ async fn execute_surface_tool(
 ) -> Result<String> {
     let request_active = surface.active_names.clone();
     registry
-        .execute_from_surface("agent_test", "", surface, &request_active, name, input)
+        .execute_from_surface(
+            "agent_test",
+            &new_child_execution_id("agent_test"),
+            surface,
+            &request_active,
+            name,
+            input,
+        )
         .await
         .map(|result| result.result.content)
 }
@@ -8240,6 +8357,7 @@ async fn small_surface_fork_context_survives_fresh_child_discovery() {
             Message {
                 role: Role::Assistant,
                 content: vec![ContentBlock::ToolUse {
+                    execution_id: None,
                     id: "search-1".to_string(),
                     name: TOOL_SEARCH_NAME.to_string(),
                     input: json!({"query": "web"}),
@@ -8250,6 +8368,7 @@ async fn small_surface_fork_context_survives_fresh_child_discovery() {
             Message {
                 role: Role::User,
                 content: vec![ContentBlock::ToolResult {
+                    execution_id: None,
                     tool_use_id: "search-1".to_string(),
                     content: json!({
                         "type": "tool_search_tool_search_result",
@@ -8579,10 +8698,10 @@ fn seed_read_only_role_deny_list(runtime: &mut SubAgentRuntime) {
 }
 
 /// #5426 acceptance point 1, gate-level: a live scout must be able to run
-/// the three canonical read-only inspection commands DIRECTLY through
-/// canonical `bash` — `git -C ... log`, `find ... | head`, `npm view` — with
+/// the canonical read-only inspection commands DIRECTLY through
+/// canonical `bash` — `git -C ... log`, `find ... | head` — with
 /// no child spawn. The first live dogfood against a #5428 binary denied all
-/// three at `posture_permits_tool`: the Required branch demanded
+/// these at `posture_permits_tool`: the Required branch demanded
 /// `ShellPolicy::Full`, and #5428's relaxed agent classifier was unreachable
 /// from the gate (it only guards `BashTool::execute`, which the gate
 /// precedes). This test pins the gate↔classifier agreement the catalog
@@ -8608,7 +8727,6 @@ fn scout_posture_gate_admits_agent_readonly_bash_commands() {
     let admitted = [
         "git -C /Volumes/VIXinSSD/CW/worktrees/demo log --oneline -3",
         "find /Volumes/VIXinSSD/CW/worktrees/demo/crates -name offering.rs -maxdepth 4 | head -3",
-        "npm view @deepseek-ai/dsh version",
     ];
     for command in admitted {
         let input = serde_json::json!({ "command": command });
@@ -8616,6 +8734,20 @@ fn scout_posture_gate_admits_agent_readonly_bash_commands() {
             registry.posture_permits_tool("bash", Some(&input)),
             "scout posture gate must admit agent-read-only bash directly: {command}"
         );
+    }
+    // npm's project/user configuration can redirect its destination, so a
+    // network-enabled Scout still cannot grant it automatic shell authority.
+    for command in [
+        "npm view @deepseek-ai/dsh version",
+        "npm view x --json",
+        "npm view owner/repo",
+    ] {
+        let input = serde_json::json!({"command": command});
+        assert!(
+            !registry.posture_permits_tool("bash", Some(&input)),
+            "{command}"
+        );
+        assert!(!registry.envelope_permits("bash", &input), "{command}");
     }
 
     // Mutation still refused at the gate, legacy `Bash` stays raw-shell-denied
@@ -12357,8 +12489,12 @@ fn annotate_child_model_error_adds_actionable_hint() {
     let auth = annotate_child_model_error("403 Forbidden", "kimi-k2", provider, &inherit);
     assert!(auth.contains("kimi-k2"), "names the model: {auth}");
     assert!(
-        auth.contains("child model override"),
+        auth.contains("child-agent model config"),
         "names the recovery path: {auth}"
+    );
+    assert!(
+        !auth.contains("explicit child model override"),
+        "an inherited route never blames an override nobody gave: {auth}"
     );
     assert!(
         auth.contains("403 Forbidden"),
@@ -12519,11 +12655,14 @@ async fn rate_limit_pause_blocks_subagent_spawn() {
     let _clear = ClearRateLimitOnDrop;
     crate::retry_status::clear();
     crate::retry_status::clear_rate_limit();
-    crate::retry_status::note_rate_limit(Duration::from_secs(30));
 
     let tmp = tempdir().expect("tempdir");
     let mut runtime = stub_runtime();
     runtime.context = ToolContext::new(tmp.path().to_path_buf());
+    crate::retry_status::note_rate_limit(
+        &runtime.client.rate_limit_scope(),
+        Duration::from_secs(30),
+    );
     let manager = new_shared_subagent_manager(tmp.path().to_path_buf(), 2);
 
     let err = spawn_subagent_from_input(
@@ -14950,6 +15089,7 @@ pub(crate) fn stub_runtime() -> SubAgentRuntime {
         reasoning_effort_auto: false,
         role_models: std::collections::HashMap::new(),
         route_replacements: Vec::new(),
+        route_origin: None,
         context,
         allow_shell: true,
         accept_edits: false,
@@ -14969,7 +15109,6 @@ pub(crate) fn stub_runtime() -> SubAgentRuntime {
         parent_completion_tx: None,
         fork_context: None,
         parent_mode: AppMode::Agent,
-        approval_mode: ApprovalMode::Suggest,
         auto_review_policy: std::sync::Arc::new(
             crate::tui::auto_review::AutoReviewPolicy::default(),
         ),
@@ -16400,6 +16539,9 @@ async fn tool_call_then_invalid_request_chat_client() -> (CodewhaleClient, Arc<A
             initial_delay: Some(0.0),
             max_delay: Some(0.0),
             exponential_base: Some(1.0),
+            jitter: None,
+            jitter_factor: None,
+            respect_retry_after: None,
         }),
         ..crate::config::Config::default()
     }
@@ -16660,6 +16802,9 @@ async fn denied_call_then_report_chat_client() -> (CodewhaleClient, Arc<AtomicUs
             initial_delay: Some(0.0),
             max_delay: Some(0.0),
             exponential_base: Some(1.0),
+            jitter: None,
+            jitter_factor: None,
+            respect_retry_after: None,
         }),
         ..crate::config::Config::default()
     }
@@ -18362,6 +18507,32 @@ async fn spawn_budget_capped_worker(
     Arc<AtomicUsize>,
     tokio::task::JoinHandle<()>,
 ) {
+    spawn_budget_capped_worker_with_pause(
+        workspace,
+        prompt_tokens,
+        completion_tokens,
+        max_steps,
+        wall_time,
+        None,
+    )
+    .await
+}
+
+/// As [`spawn_budget_capped_worker`], optionally opening a rate-limit pause
+/// on the worker's own route before it starts.
+async fn spawn_budget_capped_worker_with_pause(
+    workspace: &Path,
+    prompt_tokens: u64,
+    completion_tokens: u64,
+    max_steps: u32,
+    wall_time: Duration,
+    pause: Option<Duration>,
+) -> (
+    Arc<RwLock<SubAgentManager>>,
+    String,
+    Arc<AtomicUsize>,
+    tokio::task::JoinHandle<()>,
+) {
     let manager = Arc::new(RwLock::new(SubAgentManager::new(
         workspace.to_path_buf(),
         2,
@@ -18410,6 +18581,9 @@ async fn spawn_budget_capped_worker(
         launch_gate: None,
         _foreground_child_registration: None,
     };
+    if let Some(pause) = pause {
+        crate::retry_status::note_rate_limit(&runtime.client.rate_limit_scope(), pause);
+    }
     let task_handle = tokio::spawn(run_subagent_task(task));
     (manager, agent_id, calls, task_handle)
 }
@@ -18689,11 +18863,17 @@ async fn worker_is_not_stranded_by_transient_global_rate_limit_window() {
     // in-flight requests promptly.
     let _guard = crate::retry_status::test_guard();
     let _clear = ClearRateLimitOnDrop;
-    crate::retry_status::note_rate_limit(Duration::from_secs(30));
 
     let tmp = tempdir().expect("tempdir");
-    let (manager, agent_id, _calls, task_handle) =
-        spawn_budget_capped_worker(tmp.path(), 60, 40, 4, DEFAULT_CHILD_WALL_TIME).await;
+    let (manager, agent_id, _calls, task_handle) = spawn_budget_capped_worker_with_pause(
+        tmp.path(),
+        60,
+        40,
+        4,
+        DEFAULT_CHILD_WALL_TIME,
+        Some(Duration::from_secs(30)),
+    )
+    .await;
 
     // Simulate the concurrent test finishing: the window closes shortly
     // after the worker's first request has already observed it.
@@ -19429,8 +19609,14 @@ async fn agent_wait_returns_early_with_needs_approval() {
     let mut inner = SubAgentManager::new(PathBuf::from("."), 1);
     let agent_id = insert_running_agent(&mut inner, "test_agent_wait_needs_person");
     // The child is blocked on the Ask prompt for a shell call.
-    let (_approval_id, _rx) =
-        inner.register_child_approval(&agent_id, "bash", "Tool bash requires approval\nand more");
+    let (_approval_id, _rx) = inner
+        .register_child_approval(
+            &agent_id,
+            &new_child_execution_id(&agent_id),
+            "bash",
+            "Tool bash requires approval\nand more",
+        )
+        .unwrap();
     let manager = Arc::new(RwLock::new(inner));
 
     let context = ToolContext::new(".");
@@ -19471,7 +19657,14 @@ async fn agent_wait_returns_early_with_needs_approval() {
 async fn agent_wait_does_not_rewake_on_reported_request() {
     let mut inner = SubAgentManager::new(PathBuf::from("."), 1);
     let agent_id = insert_running_agent(&mut inner, "test_agent_wait_no_rewake");
-    let (_approval_id, _rx) = inner.register_child_approval(&agent_id, "bash", "held");
+    let (_approval_id, _rx) = inner
+        .register_child_approval(
+            &agent_id,
+            &new_child_execution_id(&agent_id),
+            "bash",
+            "held",
+        )
+        .unwrap();
     let manager = Arc::new(RwLock::new(inner));
     let context = ToolContext::new(".");
 
@@ -19508,11 +19701,16 @@ async fn agent_wait_does_not_rewake_on_reported_request() {
     assert!(joined.get("needs_person").is_none(), "{joined}");
 
     // A new request wakes the join.
-    let (_next_id, _next_rx) =
-        manager
-            .write()
-            .await
-            .register_child_approval(&agent_id, "write_file", "held again");
+    let (_next_id, _next_rx) = manager
+        .write()
+        .await
+        .register_child_approval(
+            &agent_id,
+            &new_child_execution_id(&agent_id),
+            "write_file",
+            "held again",
+        )
+        .unwrap();
     let joined = coord::dispatch_wait(
         &json!({"until": "all", "timeout_secs": 30}),
         Arc::clone(&manager),
@@ -19537,7 +19735,14 @@ async fn status_waiting_is_derived_from_pending_store() {
         "workspace",
         None,
     );
-    let (approval_id, _rx) = inner.register_child_approval(&agent_id, "bash", "held");
+    let (approval_id, _rx) = inner
+        .register_child_approval(
+            &agent_id,
+            &new_child_execution_id(&agent_id),
+            "bash",
+            "held",
+        )
+        .unwrap();
     // The WaitingForUser progress write was skipped under contention; the
     // store still makes the record waiting, with the request and the action.
     let record = inner.get_worker_record(&agent_id).expect("worker record");
@@ -20410,7 +20615,7 @@ async fn read_only_web_evidence_keeps_the_parent_approval_gate() {
         let mut runtime =
             stub_runtime().with_agent_tool_surface_options(enabled_agent_surface_options());
         runtime.context = ToolContext::new(tmp.path());
-        runtime.approval_mode = ApprovalMode::Never;
+        runtime.context.approval_mode = ApprovalMode::Never;
         runtime.worker_profile = WorkerRuntimeProfile::for_role(role.clone());
         runtime.worker_profile.permissions.network = true;
         let registry = SubAgentToolRegistry::new(
@@ -20439,7 +20644,13 @@ async fn read_only_web_evidence_keeps_the_parent_approval_gate() {
             assert!(
                 matches!(
                     registry
-                        .gate_held_call("agent_scout", "test-web", name, &input)
+                        .gate_held_call(
+                            "agent_scout",
+                            "test-web",
+                            name,
+                            &input,
+                            registry.registry.context(),
+                        )
                         .await,
                     ChildGateVerdict::Deny(_)
                 ),
@@ -20658,6 +20869,11 @@ fn a_network_denied_child_cannot_address_a_remote_location_through_any_tool() {
         ("bash", json!({"command": "gh pr view 1 | head"})),
         ("bash", json!({"command": "ls && gh issue list"})),
         ("bash", json!({"command": "npm view x | head"})),
+        ("bash", json!({"command": "npm view owner/repo"})),
+        (
+            "bash",
+            json!({"command": "npm view @scope/pkg --registry=https://registry.example/"}),
+        ),
         // A leading `cd` is moved into `cwd` before the command runs, so the
         // read behind it is judged too.
         ("bash", json!({"command": "cd . && gh pr view 1"})),
@@ -21514,7 +21730,14 @@ const READ_ONLY_CHILD_ENVELOPE_BYTE_CEILING: usize = 89_000;
 // (105ad9d3e).
 // The agent schema's `fork_context` property (2026-09-25) fit under this
 // ceiling by trimming the `resume_from` and `wall_time_secs` descriptions.
-const PARENT_SURFACE_BYTE_CEILING: usize = 88_715;
+// Re-measured 2026-10-01 at 88,824B on macOS, +162B over 88,662B, both from
+// audit fixes: +106B because composition branches keep their `required`
+// lists (D04-11, 46835a2fc; `apply_patch`'s `oneOf` had degraded to three
+// unsatisfiable `{}` branches), and +56B for the finance timeout description
+// now saying the budget is shared with the chart fallback (D03-m3,
+// 7c36620d4). Linux measured 13B above macOS last time, so the ceiling is
+// 88,837B until a hosted Linux run re-measures it.
+const PARENT_SURFACE_BYTE_CEILING: usize = 88_837;
 
 #[tokio::test]
 async fn read_only_child_envelope_stays_within_measured_ceiling() {
@@ -23010,6 +23233,235 @@ fn user_follow_up_to_completed_child_requires_a_runtime_to_resume() {
     assert!(err.to_string().contains("no runtime"), "{err}");
 }
 
+/// A finished worker's unchanged isolated worktree is removed, but its
+/// checkpoint stays continuable. Continuing it used to start a child inside
+/// the missing directory, where every tool failed.
+#[tokio::test]
+async fn continuing_a_child_whose_worktree_was_removed_fails_with_the_reason() {
+    let tmp = tempdir().expect("tempdir");
+    let worktree = tmp.path().join("removed-worktree");
+    std::fs::create_dir_all(&worktree).expect("worktree dir");
+    let manager = new_shared_subagent_manager(tmp.path().to_path_buf(), 4);
+    let agent_id = {
+        let mut guard = manager.write().await;
+        let (id, _) = guard.insert_test_interrupted_continuable_agent(
+            "read_mostly",
+            &worktree,
+            vec![text_message("user", "prior work")],
+        );
+        guard.agents.get_mut(&id).expect("agent").status = SubAgentStatus::Completed;
+        id
+    };
+    std::fs::remove_dir(&worktree).expect("worktree removed on completion");
+    let mut runtime = stub_runtime();
+    runtime.manager = Arc::clone(&manager);
+
+    let result = {
+        let mut guard = manager.write().await;
+        guard.continue_child_from_user(Arc::clone(&manager), Some(runtime), &agent_id, "more")
+    };
+    let err = result.expect_err("a child whose workspace is gone cannot be continued");
+    assert!(err.to_string().contains("no longer exists"), "{err}");
+    assert_eq!(
+        manager.read().await.agents.len(),
+        1,
+        "no continuation child was started"
+    );
+}
+
+/// A finished worker's unchanged worktree is removed on the blocking pool, and
+/// an interrupt can win while that runs. A continuation started then passed
+/// the existence check and could lose its directory to the removal. It now
+/// waits until the claimed removal has settled.
+#[tokio::test]
+async fn continuation_is_refused_while_its_worktree_removal_is_claimed() {
+    let tmp = tempdir().expect("tempdir");
+    let workspace = tmp.path().join("worktree");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    let manager = new_shared_subagent_manager(tmp.path().to_path_buf(), 4);
+    let (agent_id, claim) = {
+        let mut guard = manager.write().await;
+        let (id, _) = guard.insert_test_interrupted_continuable_agent(
+            "claimed",
+            &workspace,
+            vec![text_message("user", "prior work")],
+        );
+        let claim = guard
+            .claim_worktree_cleanup(&id, &workspace)
+            .expect("the removal is claimed");
+        assert!(
+            guard.claim_worktree_cleanup(&id, &workspace).is_none(),
+            "one removal per path at a time"
+        );
+        (id, claim)
+    };
+    let mut runtime = stub_runtime();
+    runtime.manager = Arc::clone(&manager);
+
+    let refused = {
+        let mut guard = manager.write().await;
+        guard.continue_child_from_user(
+            Arc::clone(&manager),
+            Some(runtime.clone()),
+            &agent_id,
+            "more",
+        )
+    };
+    let err = refused.expect_err("no successor starts while the removal is claimed");
+    assert!(err.to_string().contains("checked for removal"), "{err}");
+    assert_eq!(manager.read().await.agents.len(), 1);
+
+    drop(claim);
+    let resumed = {
+        let mut guard = manager.write().await;
+        guard.continue_child_from_user(Arc::clone(&manager), Some(runtime), &agent_id, "more")
+    };
+    resumed.expect("continues once the removal settled and kept the workspace");
+    assert!(workspace.is_dir());
+    assert_eq!(manager.read().await.agents.len(), 2);
+}
+
+/// The removal decides when it runs, not when its inputs were read before
+/// the terminal commit: a worker an interrupt made continuable in between
+/// keeps its worktree, and a completed one's is removed.
+#[tokio::test]
+async fn finished_worktree_removal_keeps_a_worker_that_became_continuable() {
+    let (_harness, repo) = git_repo_in_harness();
+    let make = |name: &str| {
+        create_isolated_worktree(
+            &repo,
+            &SubAgentWorktreeRequest {
+                branch: Some(format!("codex/agent-{name}")),
+                path: Some(PathBuf::from(name)),
+                base_ref: None,
+            },
+            Some(name),
+            &FleetRole::Builder,
+        )
+        .expect("worktree should be created")
+    };
+    let kept = make("interrupted");
+    let removed = make("completed");
+    let manager = new_shared_subagent_manager(repo.clone(), 4);
+    let (interrupted_id, completed_id, claims) = {
+        let mut guard = manager.write().await;
+        let (interrupted_id, _) = guard.insert_test_interrupted_continuable_agent(
+            "interrupted",
+            &kept,
+            vec![text_message("user", "prior work")],
+        );
+        let completed_id = guard.insert_test_running_agent("completed", &removed);
+        guard.agents.get_mut(&completed_id).expect("agent").status = SubAgentStatus::Completed;
+        let claims = (
+            guard
+                .claim_worktree_cleanup(&interrupted_id, &kept)
+                .expect("claim"),
+            guard
+                .claim_worktree_cleanup(&completed_id, &removed)
+                .expect("claim"),
+        );
+        (interrupted_id, completed_id, claims)
+    };
+    let shared = Arc::clone(&manager);
+    let outcome = tokio::task::spawn_blocking(move || {
+        let empty = std::collections::BTreeSet::new();
+        (
+            remove_finished_worktree(&shared, &interrupted_id, claims.0, Some(&empty)),
+            remove_finished_worktree(&shared, &completed_id, claims.1, Some(&empty)),
+        )
+    })
+    .await
+    .expect("blocking removal");
+    assert_eq!(outcome, (false, true));
+    assert!(kept.is_dir(), "the continuable worker keeps its worktree");
+    assert!(!removed.exists(), "the completed worker's is removed");
+    let guard = manager.read().await;
+    assert!(
+        !guard.worktree_cleanup_pending(&kept) && !guard.worktree_cleanup_pending(&removed),
+        "both claims are released"
+    );
+}
+
+/// A spawn refused after its isolated worktree was created used to leave the
+/// checkout and its branch behind, one more per failed attempt.
+#[tokio::test]
+async fn failed_spawn_removes_the_worktree_it_created() {
+    let repo = init_subagent_git_repo();
+    refuse_worktree_spawn_and_expect_cleanup(&repo, "codex/agent-rollback-probe").await;
+}
+
+/// Post-checkout hooks (and line-ending or LFS filters) can leave files in a
+/// fresh checkout. The rollback used to require a pristine `git status`, so
+/// in such repos every refused spawn still left its worktree behind.
+#[cfg(unix)]
+#[tokio::test]
+async fn failed_spawn_removes_its_worktree_despite_post_checkout_hook_output() {
+    use std::os::unix::fs::PermissionsExt;
+    let repo = init_subagent_git_repo();
+    let hook = repo.path().join(".git").join("hooks").join("post-checkout");
+    std::fs::create_dir_all(hook.parent().unwrap()).expect("hooks dir");
+    std::fs::write(&hook, "#!/bin/sh\necho generated > hook-output.txt\n").expect("hook");
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    refuse_worktree_spawn_and_expect_cleanup(&repo, "codex/agent-hook-probe").await;
+}
+
+async fn refuse_worktree_spawn_and_expect_cleanup(repo: &tempfile::TempDir, branch: &str) {
+    let mut runtime = stub_runtime();
+    runtime.context = ToolContext::new(repo.path().to_path_buf());
+    let manager = new_shared_subagent_manager(repo.path().to_path_buf(), 4);
+    let source = {
+        let mut guard = manager.write().await;
+        let source = guard.insert_test_running_agent("busy-source", repo.path());
+        assign_test_session_owner(&mut guard, &source, &runtime.context.state_namespace);
+        source
+    };
+    let worktree_path = format!("{}-path", branch.replace('/', "-"));
+    let err = spawn_subagent_from_input(
+        json!({
+            "prompt": "continue the review",
+            "type": "scout",
+            "worktree": true,
+            "worktree_branch": branch,
+            "worktree_path": worktree_path,
+            "resume_from": source,
+        }),
+        Arc::clone(&manager),
+        runtime,
+        false,
+        None,
+    )
+    .await
+    .expect_err("a running resume source refuses the spawn");
+    assert!(err.to_string().contains("still running"), "{err}");
+
+    // The removal runs on the blocking pool, off the async worker.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let worktrees = loop {
+        let worktrees = git_stdout(repo.path(), &["worktree", "list", "--porcelain"]);
+        let count = worktrees
+            .lines()
+            .filter(|line| line.starts_with("worktree "))
+            .count();
+        let branch_gone = git_stdout(repo.path(), &["branch", "--list", branch]).is_empty();
+        if (count == 1 && branch_gone) || std::time::Instant::now() >= deadline {
+            break worktrees;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert_eq!(
+        worktrees
+            .lines()
+            .filter(|line| line.starts_with("worktree "))
+            .count(),
+        1,
+        "only the main checkout remains: {worktrees}"
+    );
+    assert!(
+        git_stdout(repo.path(), &["branch", "--list", branch]).is_empty(),
+        "the spawn's branch is removed too"
+    );
+}
+
 // === child permission gate: the session posture applied to a worker's calls ===
 
 mod child_permission_gate {
@@ -23030,6 +23482,26 @@ mod child_permission_gate {
         tokio::sync::mpsc::Receiver<Event>,
         SharedSubAgentManager,
     ) {
+        worker_registry_with_live_posture(
+            approval_mode,
+            auto_approve,
+            parent_can_prompt,
+            client,
+            None,
+        )
+    }
+
+    fn worker_registry_with_live_posture(
+        approval_mode: ApprovalMode,
+        auto_approve: bool,
+        parent_can_prompt: bool,
+        client: Option<CodewhaleClient>,
+        live_posture: Option<crate::core::engine::LivePosture>,
+    ) -> (
+        SubAgentToolRegistry,
+        tokio::sync::mpsc::Receiver<Event>,
+        SharedSubAgentManager,
+    ) {
         let tmp = tempdir().expect("tempdir");
         let (tx, rx) = tokio::sync::mpsc::channel(32);
         let mut runtime = stub_runtime();
@@ -23040,13 +23512,14 @@ mod child_permission_gate {
         let session_id = format!("child_gate_{}", uuid::Uuid::new_v4().simple());
         runtime.context = ToolContext::new(workspace.clone()).with_state_namespace(session_id);
         runtime.context.auto_approve = auto_approve;
+        runtime.context.approval_mode = approval_mode;
+        runtime.context.live_posture = live_posture;
         runtime.allow_shell = true;
         runtime.event_tx = Some(tx);
         runtime = runtime.with_approval_receipt_store(Ok(
             crate::approval_log::ApprovalReceiptStore::new(tmp.path().join("sessions")),
         ));
         runtime = runtime.with_permission_posture(
-            approval_mode,
             std::sync::Arc::new(crate::tui::auto_review::AutoReviewPolicy::default()),
             parent_can_prompt,
         );
@@ -23475,6 +23948,8 @@ mod child_permission_gate {
             let receipt_store_for_answer = receipt_store.clone();
             let session_id_for_answer = session_id.clone();
             let manager_for_answer = Arc::clone(&manager);
+            let execution_id = new_child_execution_id("agent_gate");
+            let expected_id = execution_id.clone();
             let answerer = tokio::spawn(async move {
                 // Wait for the prompt, then answer it exactly like the engine
                 // does when the person decides in the parent's UI.
@@ -23497,6 +23972,7 @@ mod child_permission_gate {
                     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                 }
                 let approval_id = approval_id.expect("child prompt must reach the host");
+                assert_eq!(approval_id, expected_id);
                 let replay_before_decision = receipt_store_for_answer
                     .replay(&session_id_for_answer)
                     .expect("the durable ask replays before the prompt is answered");
@@ -23517,8 +23993,14 @@ mod child_permission_gate {
                 replay_before_decision
             });
             let result = registry
-                .execute("agent_gate", "bash", json!({"command": "echo gated"}))
-                .await;
+                .execute_full(
+                    "agent_gate",
+                    &execution_id,
+                    "bash",
+                    json!({"command": "echo gated"}),
+                )
+                .await
+                .map(|output| output.result.content);
             let replay_before_decision = answerer.await.expect("answerer task");
             assert_eq!(replay_before_decision.unmatched_asks.len(), 1);
             assert!(replay_before_decision.completed.is_empty());
@@ -23809,7 +24291,14 @@ mod child_permission_gate {
         let (registry, _rx, manager) = worker_registry(ApprovalMode::Suggest, false, true, None);
         let agent_id = running_gate_agent(&registry, &manager, "old_session_child").await;
         let mut manager = manager.write().await;
-        let (_id, receiver) = manager.register_child_approval(&agent_id, "bash", "held");
+        let (_id, receiver) = manager
+            .register_child_approval(
+                &agent_id,
+                &new_child_execution_id(&agent_id),
+                "bash",
+                "held",
+            )
+            .unwrap();
         assert!(manager.finalize_session_close_for_session("workspace") > 0);
         assert_eq!(
             manager.pending_child_approvals(),
@@ -24254,6 +24743,167 @@ mod child_permission_gate {
         assert!(receipts[0].2.is_none());
     }
 
+    /// Linux report against 0.10.0: "even when I give maximum permissions to
+    /// one of the agents, it doesn't take them (the guardian denies)". A
+    /// running agent kept the posture it was spawned under, so switching the
+    /// session to Full Access left an Auto-Review agent asking — and, with no
+    /// reachable guardian, being denied by — the guardian. The agent's next
+    /// call now runs under the posture the person just chose, both ways.
+    #[tokio::test]
+    async fn a_posture_switch_reaches_an_already_running_agent() {
+        let live =
+            crate::core::engine::LivePosture::for_tests(&std::env::temp_dir(), ApprovalMode::Auto);
+        let (registry, mut rx, _) = worker_registry_with_live_posture(
+            ApprovalMode::Auto,
+            false,
+            true,
+            Some(unreachable_client()),
+            Some(live.clone()),
+        );
+        let call = json!({"command": GUARDIAN_PIPELINE});
+        let err = registry
+            .execute("agent_gate", "bash", call.clone())
+            .await
+            .expect_err("Auto-Review with no reachable guardian fails closed");
+        assert!(err.to_string().contains("fail closed"), "{err}");
+        assert_eq!(drain_gate_receipts(&mut rx).len(), 1);
+
+        live.switch_for_tests(ApprovalMode::Bypass);
+        let output = registry
+            .execute("agent_gate", "bash", call.clone())
+            .await
+            .expect("the same running agent runs the call once Full Access is granted");
+        assert!(output.contains("built"), "{output}");
+        assert!(
+            drain_gate_receipts(&mut rx).is_empty(),
+            "Full Access consults no guardian"
+        );
+
+        live.switch_for_tests(ApprovalMode::Auto);
+        registry
+            .execute("agent_gate", "bash", call)
+            .await
+            .expect_err("narrowing back to Auto-Review reaches the agent too");
+    }
+
+    /// Linux report against 0.10.0: an agent given Full Access still had its
+    /// calls denied by the "safety gate". Every child call was judged as
+    /// detached background work, so an ordinary absolute-path cleanup — which
+    /// the same session runs without a word in its own turn — failed closed in
+    /// the agent. Full Access judges the agent's call exactly like the
+    /// parent's: only a genuinely detached start keeps the floor.
+    #[tokio::test]
+    async fn full_access_child_runs_what_the_parent_turn_runs() {
+        let (mut registry, mut rx, _) = worker_registry(ApprovalMode::Bypass, true, true, None);
+        // A foreground agent: the parent turn owns and waits on it.
+        registry.gate_runtime.foreground_children = Some(Arc::new(ForegroundChildRegistry::new()));
+        let workspace = registry.gate_runtime.context.workspace.clone();
+        let build = workspace.join("build");
+        std::fs::create_dir_all(build.join("out")).unwrap();
+        #[cfg(windows)]
+        let command = format!(
+            "Remove-Item -LiteralPath '{}' -Recurse -Force",
+            build.to_string_lossy().replace('\'', "''")
+        );
+        #[cfg(not(windows))]
+        let command = format!(
+            "rm -rf {}",
+            shlex::try_quote(&build.to_string_lossy()).unwrap()
+        );
+        // Parent classification is covered in tui::auto_review; this runtime
+        // test proves the child actually executes and preserves the gate receipt.
+        registry
+            .execute("agent_gate", "bash", json!({"command": command}))
+            .await
+            .expect("a Full Access agent runs what its Full Access session runs");
+        assert!(!build.exists(), "the cleanup actually ran");
+        assert!(drain_gate_receipts(&mut rx).is_empty());
+    }
+
+    /// Review finding on d1655c424: judging agent calls as foreground let a
+    /// detached agent run catastrophic work. Nobody watches a detached agent,
+    /// so the floor holds for it in every posture, Full Access included.
+    #[tokio::test]
+    async fn a_detached_agents_catastrophic_shell_is_held_in_every_posture() {
+        for mode in [
+            ApprovalMode::Bypass,
+            ApprovalMode::Auto,
+            ApprovalMode::Suggest,
+            ApprovalMode::Never,
+        ] {
+            let (registry, mut rx, _) = worker_registry(
+                mode,
+                mode == ApprovalMode::Bypass,
+                false,
+                Some(unreachable_client()),
+            );
+            assert!(registry.gate_runtime.foreground_children.is_none());
+            for command in [
+                "dd if=/dev/zero of=/dev/null count=0",
+                "rm -rf /home/me",
+                "bash -c 'rm -rf /etc'",
+            ] {
+                let err = registry
+                    .execute("agent_gate", "bash", json!({ "command": command }))
+                    .await
+                    .expect_err("a detached agent's catastrophic write is held");
+                // Ask turns the hold into a prompt no person can answer here;
+                // every other posture blocks it outright. Either way it never runs.
+                assert!(
+                    err.to_string().contains("destructive background")
+                        || (mode == ApprovalMode::Suggest
+                            && err.to_string().contains("cannot raise a prompt")),
+                    "{mode:?} {command}: {err}"
+                );
+            }
+            let receipts = drain_gate_receipts(&mut rx);
+            assert!(
+                receipts
+                    .iter()
+                    .all(|receipt| receipt.0 == ToolGate::AutoReviewDeterministic),
+                "{mode:?}: the floor never reaches a guardian: {receipts:?}"
+            );
+        }
+    }
+
+    /// Review finding on d1655c424: the posture was read once, before the
+    /// gate. A person who tightened Permissions while an agent's prompt was
+    /// open still had that call run under the old posture once approved.
+    #[tokio::test]
+    async fn a_posture_narrowed_during_a_prompt_regates_the_call() {
+        let live = crate::core::engine::LivePosture::for_tests(
+            &std::env::temp_dir(),
+            ApprovalMode::Suggest,
+        );
+        let (registry, mut rx, manager) = worker_registry_with_live_posture(
+            ApprovalMode::Suggest,
+            false,
+            true,
+            None,
+            Some(live.clone()),
+        );
+        let call = registry.execute("agent_gate", "bash", json!({"command": "echo held | cat"}));
+        let answer = async {
+            let id = loop {
+                match rx.recv().await.expect("event stream") {
+                    Event::ApprovalRequired { id, .. } => break id,
+                    _ => continue,
+                }
+            };
+            // The person tightens Permissions, then answers the open card.
+            live.switch_for_tests(ApprovalMode::Never);
+            assert!(
+                manager
+                    .write()
+                    .await
+                    .resolve_child_approval(&id, ChildApprovalOutcome::Approved)
+            );
+        };
+        let (result, ()) = tokio::join!(call, answer);
+        let err = result.expect_err("the call is gated again under the narrower posture");
+        assert!(err.to_string().contains("requires approval"), "{err}");
+    }
+
     #[tokio::test]
     async fn full_access_runs_ordinary_shell_but_still_hard_blocks_the_safety_floor() {
         let (registry, mut rx, _) = worker_registry(ApprovalMode::Bypass, true, true, None);
@@ -24263,8 +24913,9 @@ mod child_permission_gate {
             .expect("Full Access runs ordinary shell without a prompt");
         assert!(output.contains("full-access"), "{output}");
         assert!(drain_gate_receipts(&mut rx).is_empty());
-        // Destructive detached work holds in every posture (children are
-        // background workers), so Full Access still fails closed here.
+        // This harness agent is detached (no foreground turn owns it), and
+        // destructive detached work holds in every posture, exactly as it
+        // does for a detached parent start: Full Access fails closed here.
         let err = registry
             .execute("agent_gate", "bash", json!({"command": "rm -rf /usr"}))
             .await
@@ -24627,6 +25278,180 @@ async fn agent_claim_is_withheld_from_a_role_with_no_write_authority() {
     assert!(refusal.contains("no write authority to widen"), "{refusal}");
 }
 
+// Regression (stopship scout repair): the workflow's read-only scout
+// activates `grep_files` with one `tool_search` call before searching. That
+// two-step path only works while the scout surface keeps a first-turn-active
+// `tool_search` and a deferred, searchable `grep_files`; the hidden `File`
+// alias the brief cited before is filtered from every model-visible catalog
+// (`to_api_tools`), which is what silently broke the release-acceptance
+// explore gate. The registry is built with the scope the fixture scout really
+// runs under (`leaf_allowed_tools` lowers a read-only leaf to `["File"]`), so
+// the guard also pins the alias-family intersection that keeps `grep_files`
+// discoverable under that legacy rule. If a surface reshape fails this test,
+// re-work the fixture brief in the same change instead of leaving it
+// instructing calls the child cannot make.
+#[tokio::test]
+async fn scout_surface_keeps_tool_search_grep_files_activation_path() {
+    let tmp = tempdir().expect("tempdir");
+    let mut runtime =
+        stub_runtime().with_agent_tool_surface_options(enabled_agent_surface_options());
+    runtime.context = ToolContext::new(tmp.path().to_path_buf());
+    let todo_list = crate::tools::todo::new_shared_todo_list();
+    let plan_state = crate::tools::plan::new_shared_plan_state();
+    let registry = SubAgentToolRegistry::new(
+        runtime,
+        FleetRole::Scout,
+        Some(vec!["File".to_string()]),
+        todo_list,
+        plan_state,
+    );
+
+    let catalog = registry.deferred_catalog_for_model(&FleetRole::Scout);
+    let search = catalog
+        .iter()
+        .find(|tool| tool.name == "tool_search")
+        .expect("scout must keep an active tool_search");
+    let grep = catalog
+        .iter()
+        .find(|tool| tool.name == "grep_files")
+        .expect("scout must keep a deferred, searchable grep_files");
+    assert_eq!(
+        search.defer_loading,
+        Some(false),
+        "tool_search must be first-turn active on the scout"
+    );
+    assert_eq!(
+        grep.defer_loading,
+        Some(true),
+        "grep_files must be deferred so the taught tool_search activation is required"
+    );
+    assert!(
+        !catalog.iter().any(|tool| tool.name == "File"),
+        "the hidden File alias must stay out of scout catalogs"
+    );
+}
+
+// Regression (stopship scout repair, phantom-tool class): fleet workflow
+// briefs are model-facing text too. The scout brief must name tools the child
+// catalog can actually see (`tool_search`, `grep_files`) and never cite the
+// hidden `File` alias or its retired `search_content` action — that wording
+// failed the release-acceptance explore gate exactly the way the
+// bundled-skills `File` citations stalled real reasoning loops.
+#[test]
+fn workflow_briefs_name_catalog_visible_tools() {
+    const STOPSHIP: &str = include_str!("../../../../../workflows/stopship.workflow.js");
+    // Guard the fixture definition, not the maintainer header comment.
+    let body = STOPSHIP
+        .split_once("export default")
+        .expect("workflow module must export its definition")
+        .1;
+    assert!(
+        body.contains("`tool_search`") && body.contains("`grep_files`"),
+        "the scout brief must teach the two-step activation path:\n{body}"
+    );
+    // Every catalog-invisible execution name (hidden replay aliases and the
+    // retired `search_content` action) is denied as a whole word, so an
+    // unbackticked or renamed citation cannot slip past the guard. `list_dir`
+    // and the lowercase primitives stay legal: they are model-visible.
+    const HIDDEN_EXEC_NAMES: [&str; 8] = [
+        "File",
+        "Bash",
+        "TodoWrite",
+        "work_update",
+        "read_file",
+        "write_file",
+        "edit_file",
+        "search_content",
+    ];
+    let cited: Vec<&str> = body
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .filter(|word| HIDDEN_EXEC_NAMES.iter().any(|hidden| hidden == word))
+        .collect();
+    assert!(
+        cited.is_empty(),
+        "workflow briefs must not command calls a catalog can never return: {cited:?}"
+    );
+}
+
+// Behavioral counterpart to the two composition guards above: on the scout's
+// live surface, one `tool_search` call must make the deferred `grep_files`
+// dispatchable through the same gate the child step loop uses, while the
+// hidden `File` alias the old brief commanded must keep failing the catalog
+// gate. Composition can drift from behavior; this cannot.
+#[tokio::test]
+async fn scout_activation_makes_grep_files_dispatchable() {
+    let tmp = tempdir().expect("tempdir");
+    let mut runtime =
+        stub_runtime().with_agent_tool_surface_options(enabled_agent_surface_options());
+    runtime.context = ToolContext::new(tmp.path().to_path_buf());
+    let todo_list = crate::tools::todo::new_shared_todo_list();
+    let plan_state = crate::tools::plan::new_shared_plan_state();
+    let registry = SubAgentToolRegistry::new(
+        runtime,
+        FleetRole::Scout,
+        Some(vec!["File".to_string()]),
+        todo_list,
+        plan_state,
+    );
+    // Mirror the spawn loop: filtered catalog, then a cold surface.
+    let mut surface =
+        SubAgentToolSurface::new(registry.deferred_catalog_for_model(&FleetRole::Scout), &[]);
+
+    let active_names: std::collections::HashSet<String> = surface.active_names.clone();
+    let file_error = registry
+        .execute_from_surface(
+            "agent_unknown",
+            "",
+            &mut surface,
+            &active_names,
+            "File",
+            serde_json::json!({"action": "search_content", "path": "."}),
+        )
+        .await
+        .expect_err("the hidden File alias must fail the scout catalog gate");
+    assert!(
+        file_error
+            .to_string()
+            .contains("not in this child's policy-filtered catalog"),
+        "{file_error}"
+    );
+
+    let active_names: std::collections::HashSet<String> = surface.active_names.clone();
+    registry
+        .execute_from_surface(
+            "agent_unknown",
+            "",
+            &mut surface,
+            &active_names,
+            "tool_search",
+            serde_json::json!({"query": "grep_files"}),
+        )
+        .await
+        .expect("tool_search activation must succeed on the scout surface");
+    assert!(
+        surface.active_names.contains("grep_files"),
+        "activation must admit grep_files into the same surface the dispatch gate reads"
+    );
+
+    let active_names: std::collections::HashSet<String> = surface.active_names.clone();
+    registry
+        .execute_from_surface(
+            "agent_unknown",
+            "",
+            &mut surface,
+            &active_names,
+            "grep_files",
+            serde_json::json!({
+                "path": ".",
+                "pattern": "stopship",
+                "max_results": 5,
+                "context_lines": 1
+            }),
+        )
+        .await
+        .expect("grep_files must dispatch through the real tool after the taught activation");
+}
+
 #[test]
 fn agent_tool_description_names_only_schema_roles() {
     // Every `type=<token>` and every role in the "type selects the Fleet role:"
@@ -24833,22 +25658,38 @@ mod readonly_shell_6015 {
         commands: Vec<&'static str>,
         report: &'static str,
     ) -> (CodewhaleClient, Arc<AtomicUsize>) {
+        scripted_bash_calls_with_pairing(commands, report, None).await
+    }
+
+    async fn scripted_bash_calls_with_pairing(
+        commands: Vec<&'static str>,
+        report: &'static str,
+        invalid_ids: Option<[&'static str; 2]>,
+    ) -> (CodewhaleClient, Arc<AtomicUsize>) {
         let calls = Arc::new(AtomicUsize::new(0));
         let app = Router::new().route(
             "/{*path}",
             post({
                 let calls = Arc::clone(&calls);
-                move |Json(_body): Json<Value>| {
+                move |Json(request): Json<Value>| {
                     let calls = Arc::clone(&calls);
                     let commands = commands.clone();
                     async move {
                         let attempt = calls.fetch_add(1, Ordering::SeqCst);
+                        let serialized = request.to_string();
+                        assert!(!serialized.contains("execution_id"));
+                        assert!(!serialized.contains(":approval:"));
+                        for message in request["messages"].as_array().unwrap() {
+                            if message["role"] == "tool" {
+                                assert_eq!(message["tool_call_id"], "call_ro_reused");
+                            }
+                        }
                         let usage = json!({
                             "prompt_tokens": 10,
                             "completion_tokens": 5,
                             "total_tokens": 15
                         });
-                        let body = match commands.get(attempt) {
+                        let mut body = match commands.get(attempt) {
                             Some(command) => json!({
                                 "id": format!("chatcmpl-ro-{attempt}"),
                                 "model": "deepseek-v4-flash",
@@ -24858,7 +25699,8 @@ mod readonly_shell_6015 {
                                         "role": "assistant",
                                         "content": null,
                                         "tool_calls": [{
-                                            "id": format!("call_ro_{attempt}"),
+                                            "id": "call_ro_reused",
+                                            "execution_id": "provider-forged-local",
                                             "type": "function",
                                             "function": {
                                                 "name": "bash",
@@ -24881,6 +25723,16 @@ mod readonly_shell_6015 {
                                 "usage": usage
                             }),
                         };
+                        if let Some(ids) = invalid_ids {
+                            body["choices"][0]["message"]["content"] =
+                                json!("Text retained from the refused tool response.");
+                            let prototype = body["choices"][0]["message"]["tool_calls"][0].clone();
+                            body["choices"][0]["message"]["tool_calls"] = json!(ids.map(|id| {
+                                let mut call = prototype.clone();
+                                call["id"] = json!(id);
+                                call
+                            }));
+                        }
                         Json(body).into_response()
                     }
                 }
@@ -24900,6 +25752,9 @@ mod readonly_shell_6015 {
                 initial_delay: Some(0.0),
                 max_delay: Some(0.0),
                 exponential_base: Some(1.0),
+                jitter: None,
+                jitter_factor: None,
+                respect_retry_after: None,
             }),
             ..crate::config::Config::default()
         }
@@ -24989,6 +25844,96 @@ mod readonly_shell_6015 {
                 _ => None,
             })
             .collect()
+    }
+
+    #[tokio::test]
+    async fn ambiguous_child_batch_keeps_text_and_usage_without_executing_calls() {
+        for ids in [["same", "same"], ["valid", ""]] {
+            let tmp = tempdir().unwrap();
+            let (client, calls) =
+                scripted_bash_calls_with_pairing(vec!["pwd"], "no further round", Some(ids)).await;
+            let result = run_scout(tmp.path(), client, "agent_bad_identity").await;
+            assert!(
+                matches!(&result.status, SubAgentStatus::Failed(error) if error.contains("pairing id")),
+                "{:?}",
+                result.status
+            );
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                1,
+                "invalid batch is terminal before dispatch"
+            );
+            assert!(
+                result.usage.as_ref().and_then(|usage| usage.total_tokens) == Some(15),
+                "billed usage must survive refusal"
+            );
+            let checkpoint = result
+                .checkpoint
+                .as_ref()
+                .expect("refused response checkpoint");
+            assert!(checkpoint.messages.iter().flat_map(|m| &m.content).any(
+                |block| matches!(block, ContentBlock::Text { text, .. } if text == "Text retained from the refused tool response.")
+            ));
+            assert!(
+                checkpoint
+                    .messages
+                    .iter()
+                    .flat_map(|m| &m.content)
+                    .all(|block| !matches!(
+                        block,
+                        ContentBlock::ToolUse { .. } | ContentBlock::ToolResult { .. }
+                    ))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn reused_provider_ids_keep_child_execution_history_distinct() {
+        let tmp = tempdir().unwrap();
+        let (client, calls) = scripted_bash_calls_client(vec!["pwd", "pwd"], "read twice").await;
+        let result = run_scout(tmp.path(), client, "agent_identity").await;
+        assert_eq!(
+            result.status,
+            SubAgentStatus::Completed,
+            "{:?}",
+            result.result
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        let checkpoint = result.checkpoint.as_ref().expect("real child checkpoint");
+        let mut ids = Vec::new();
+        let mut results = Vec::new();
+        for block in checkpoint.messages.iter().flat_map(|m| &m.content) {
+            match block {
+                ContentBlock::ToolUse {
+                    id, execution_id, ..
+                } => {
+                    assert_eq!(id, "call_ro_reused");
+                    let local = execution_id.clone().expect("host identity");
+                    assert!(SubAgentManager::is_child_approval_id(&local));
+                    assert_ne!(local, "provider-forged-local");
+                    ids.push(local);
+                }
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    execution_id,
+                    ..
+                } => {
+                    assert_eq!(tool_use_id, "call_ro_reused");
+                    results.push(execution_id.clone().expect("result identity"));
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(ids.len(), 2);
+        assert_ne!(ids[0], ids[1]);
+        assert_eq!(ids, results);
+        assert_ne!(
+            child_guardian_usage_source_id("agent_identity", &ids[0]),
+            child_guardian_usage_source_id("agent_identity", &ids[1])
+        );
+        let restored: SubAgentCheckpoint =
+            serde_json::from_slice(&serde_json::to_vec(checkpoint).unwrap()).unwrap();
+        assert_eq!(restored.messages, checkpoint.messages);
     }
 
     // Only the unix-gated tests build a git fixture; ungated, Windows
@@ -25243,6 +26188,9 @@ async fn late_launch_permit_still_gets_the_full_work_budget() {
                 initial_delay: Some(0.0),
                 max_delay: Some(0.0),
                 exponential_base: Some(1.0),
+                jitter: None,
+                jitter_factor: None,
+                respect_retry_after: None,
             }),
             ..crate::config::Config::default()
         }
@@ -25339,4 +26287,61 @@ async fn late_launch_permit_still_gets_the_full_work_budget() {
         saved_deadline_ms >= spawned_at_ms + hold_ms + wall_ms,
         "saved deadline {saved_deadline_ms} must start from launch, not spawn ({spawned_at_ms})"
     );
+}
+
+#[tokio::test]
+async fn computer_use_consent_is_denied_in_child_gate_every_mode() {
+    let tmp = tempdir().expect("tempdir");
+    for (auto_approve, approval_mode) in [
+        (true, codewhale_execpolicy::ApprovalMode::Bypass),
+        (false, codewhale_execpolicy::ApprovalMode::Auto),
+        (false, codewhale_execpolicy::ApprovalMode::Suggest),
+        (false, codewhale_execpolicy::ApprovalMode::Never),
+    ] {
+        let mut runtime = stub_runtime();
+        runtime.context = ToolContext::new(tmp.path());
+        runtime.context.auto_approve = auto_approve;
+        runtime.context.execution.approval_mode = approval_mode;
+        runtime.worker_profile = WorkerRuntimeProfile::for_role(FleetRole::Worker);
+        let registry = SubAgentToolRegistry::new(
+            runtime,
+            FleetRole::Worker,
+            None,
+            crate::tools::todo::new_shared_todo_list(),
+            crate::tools::plan::new_shared_plan_state(),
+        );
+        for (name, input) in [
+            (
+                "mcp_codewhale-cu_consent",
+                json!({"action": "allow", "app": "Safari", "remember": true}),
+            ),
+            ("mcp_codewhale-cu_consent_allow", json!({"app": "Terminal"})),
+            (
+                "mcp_codewhale-cu_app_script",
+                json!({"script": "tell application \"Finder\" to activate"}),
+            ),
+            (
+                "mcp_codewhale-cu_computer_register",
+                json!({"computer": "box", "transport": "ssh", "host": "box.example"}),
+            ),
+            (
+                "mcp_codewhale-cu_run_actions",
+                json!({"steps": [{"tool": "codewhale-cu_consent_allow", "arguments": {"app": "Safari"}}]}),
+            ),
+        ] {
+            let verdict = registry
+                .gate_held_call(
+                    "agent_child",
+                    "call_1",
+                    name,
+                    &input,
+                    registry.registry.context(),
+                )
+                .await;
+            assert!(
+                matches!(verdict, ChildGateVerdict::Deny(ref reason) if reason.contains("own approval")),
+                "{approval_mode:?} {name}: {verdict:?}"
+            );
+        }
+    }
 }

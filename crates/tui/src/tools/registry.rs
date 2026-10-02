@@ -38,6 +38,15 @@ pub struct ToolRegistry {
     api_cache: OnceLock<Vec<Tool>>,
 }
 
+/// The one sentence naming a `[tools.overrides]` entry that D4 refused, shared
+/// by the runtime log and the engine's user-facing status line.
+pub(crate) fn override_refusal_notice(tool_name: &str) -> String {
+    format!(
+        "Refused [tools.overrides.{name}]: a script or command override cannot replace the built-in tool '{name}', which stays active. Set type = \"disabled\" to turn it off, or key the override by a new tool name.",
+        name = crate::safe_label::SafeLabel::identifier(tool_name)
+    )
+}
+
 impl ToolRegistry {
     /// Create a new empty registry with the given context.
     #[must_use]
@@ -367,15 +376,27 @@ impl ToolRegistry {
     /// Apply config.toml tool overrides to this registry.
     ///
     /// For each entry in `overrides`:
-    /// - `Disabled` removes the tool.
-    /// - `Script` / `Command` replaces the tool with the user's implementation.
+    /// - `Disabled` removes the tool, built-ins included.
+    /// - `Script` / `Command` registers the user's implementation under a name
+    ///   no built-in owns: a new tool, or a replacement for a drop-in plugin
+    ///   script of that name.
+    /// - `Script` / `Command` keyed by a name in `builtin_names` is refused and
+    ///   the built-in stays active: script tools cannot shadow built-ins (D4,
+    ///   CURRENT_DECISIONS §26).
+    ///
+    /// Returns the refused override names so the engine can name each one to
+    /// the user ([`override_refusal_notice`]); the runtime log records every
+    /// refusal. `/plugin` does not list `[tools.overrides]` entries, so it
+    /// cannot show them there.
     ///
     /// `plugin_dir` is used as the base for relative script paths.
     pub fn apply_overrides(
         &mut self,
         overrides: &std::collections::HashMap<String, crate::config::ToolOverride>,
         plugin_dir: &Path,
-    ) {
+        builtin_names: &std::collections::HashSet<String>,
+    ) -> Vec<String> {
+        let mut refused = Vec::new();
         for (tool_name, override_cfg) in overrides {
             match override_cfg {
                 crate::config::ToolOverride::Disabled => {
@@ -384,6 +405,10 @@ impl ToolRegistry {
                     } else {
                         tracing::warn!("Cannot disable tool '{}': not registered", tool_name);
                     }
+                }
+                _ if builtin_names.contains(tool_name) => {
+                    tracing::error!("{}", override_refusal_notice(tool_name));
+                    refused.push(tool_name.clone());
                 }
                 _ => {
                     // Script and Command overrides create replacement tools.
@@ -410,13 +435,14 @@ impl ToolRegistry {
                 }
             }
         }
+        refused
     }
 
     /// Load and register plugin tools from a directory.
     ///
     /// Each script with valid frontmatter (`# name:`, `# description:`, etc.)
-    /// becomes a registered `ScriptPluginTool`. Name collisions are refused;
-    /// replacing a registered tool requires an explicit config override.
+    /// becomes a registered `ScriptPluginTool`. Name collisions are refused:
+    /// a script tool never replaces a registered tool.
     pub fn load_plugins(&mut self, plugin_dir: &Path) {
         if !plugin_dir.exists() {
             tracing::debug!(
@@ -432,7 +458,7 @@ impl ToolRegistry {
                 tracing::error!(
                     previous_origin = ?previous.registration_origin(),
                     plugin_origin = ?tool.registration_origin(),
-                    "Cannot load plugin tool '{}': name is already registered; use an explicit tool override",
+                    "Cannot load plugin tool '{}': name is already registered; script tools cannot replace a registered tool, so give the script its own name",
                     crate::safe_label::SafeLabel::identifier(tool.name())
                 );
                 continue;
@@ -768,12 +794,36 @@ impl ToolRegistryBuilder {
         self
     }
 
+    /// Add client-executed runtime tools. A dynamic tool never replaces a
+    /// tool already in the builder (#6559 D04-10): `with_tool` treats a
+    /// repeated name as a planned upgrade, which let a client's `exec_shell`
+    /// or `read` silently take over the builtin handler and its approval
+    /// policy. The model-facing name is the bare `name`, so a second dynamic
+    /// tool with the same name in another namespace is refused the same way.
+    /// Both refusals are logged with the two origins.
+    ///
+    /// Known limitation: the refusal reaches the log, not the runtime client
+    /// that sent the spec; rejecting it at the API boundary, and exposing a
+    /// namespaced model-facing name, are protocol changes.
     #[must_use]
     pub fn with_dynamic_tools(mut self, dynamic_tools: &[DynamicToolSpec]) -> Self {
-        for tool in dynamic_tools {
-            self = self.with_tool(Arc::new(super::dynamic::RuntimeDynamicTool::new(
-                tool.clone(),
-            )));
+        for spec in dynamic_tools {
+            let tool: Arc<dyn ToolSpec> =
+                Arc::new(super::dynamic::RuntimeDynamicTool::new(spec.clone()));
+            if let Some(existing) = self
+                .tools
+                .iter()
+                .find(|existing| existing.name() == tool.name())
+            {
+                tracing::warn!(
+                    existing_origin = ?existing.registration_origin(),
+                    refused_origin = ?tool.registration_origin(),
+                    "Refusing runtime dynamic tool that collides with a registered tool: {}",
+                    crate::safe_label::SafeLabel::identifier(tool.name())
+                );
+                continue;
+            }
+            self.tools.push(tool);
         }
         self
     }
@@ -906,7 +956,9 @@ impl ToolRegistryBuilder {
     /// sees a binary it can't actually use.
     #[must_use]
     pub fn with_pandoc_tools(self) -> Self {
-        if crate::dependencies::resolve_pandoc().is_some() {
+        if crate::dependencies::host_tool_available("pandoc_convert", || {
+            crate::dependencies::resolve_pandoc().is_some()
+        }) {
             use super::pandoc::PandocConvertTool;
             self.with_tool(Arc::new(PandocConvertTool))
         } else {
@@ -919,7 +971,7 @@ impl ToolRegistryBuilder {
     /// Tesseract when installed.
     #[must_use]
     pub fn with_image_ocr_tools(self) -> Self {
-        if super::image_ocr::ocr_available() {
+        if crate::dependencies::host_tool_available("image_ocr", super::image_ocr::ocr_available) {
             use super::image_ocr::ImageOcrTool;
             self.with_tool(Arc::new(ImageOcrTool))
         } else {
@@ -1114,7 +1166,7 @@ impl ToolRegistryBuilder {
     pub fn with_rlm_tool(self, client: Option<CodewhaleClient>, root_model: String) -> Self {
         use super::rlm::RlmTool;
         self.with_tool(Arc::new(
-            RlmTool::new("rlm", client).with_root_model(root_model),
+            RlmTool::new(super::rlm::RLM_TOOL_NAME, client).with_root_model(root_model),
         ))
     }
 
@@ -1596,7 +1648,12 @@ impl ToolSpec for McpToolAdapter {
     ) -> Result<RichToolResult, ToolError> {
         let mut pool = self.pool.lock().await;
         let result = pool
-            .call_tool_with_disallowed(&self.name, input, &context.disallowed_tools)
+            .call_tool_with_disallowed(
+                &self.name,
+                input,
+                &context.disallowed_tools,
+                context.human_decision.as_ref(),
+            )
             .await
             .map_err(|e| ToolError::execution_failed(format!("MCP tool failed: {e}")))?;
         Ok(mcp_result_to_bounded_rich_tool_result(result))

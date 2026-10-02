@@ -28,6 +28,44 @@ fn tarball(entries: &[(&str, &[u8])]) -> Vec<u8> {
     encoder.finish().unwrap()
 }
 
+#[cfg(unix)]
+#[test]
+fn remote_plugin_stage_preserves_only_owner_executable_intent() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    let mut builder = tar::Builder::new(encoder);
+    for (path, body, mode) in [
+        (
+            "repo/plugin.toml",
+            &b"schema_version = 1\n[plugin]\nname = \"demo\"\nversion = \"1.0.0\"\n"[..],
+            0o644,
+        ),
+        ("repo/bin/server", &b"#!/bin/sh\nexit 0\n"[..], 0o6755),
+        ("repo/data.txt", &b"data"[..], 0o666),
+    ] {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(body.len() as u64);
+        header.set_mode(mode);
+        header.set_cksum();
+        builder.append_data(&mut header, path, body).unwrap();
+    }
+    let bytes = builder.into_inner().unwrap().finish().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let staged = stage_tarball(&bytes, tmp.path(), DEFAULT_MAX_SIZE_BYTES, None).unwrap();
+    for (path, expected) in [("bin/server", 0o700), ("data.txt", 0o600)] {
+        assert_eq!(
+            fs::metadata(staged.staged_path.join(path))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            expected,
+            "{path}"
+        );
+    }
+}
+
 fn symlink_tarball(link_path: &str, target: &str, manifest: &str) -> Vec<u8> {
     let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
     let mut builder = tar::Builder::new(encoder);

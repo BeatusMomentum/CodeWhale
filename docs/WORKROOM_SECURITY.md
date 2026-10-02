@@ -1,5 +1,7 @@
 # Workroom Security Model
 
+> 阅读简体中文版：[zh_hans/WORKROOM_SECURITY.md](zh_hans/WORKROOM_SECURITY.md)。
+
 ## Scope
 
 This document covers the security boundaries of Codewhale Workrooms — the

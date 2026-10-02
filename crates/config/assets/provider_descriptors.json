@@ -45,6 +45,21 @@
       "credential_url": "https://cloud.cerebras.ai"
     },
     {
+      "id": "cheaperinference",
+      "label": "Cheaper Inference",
+      "wire": "openai-compatible",
+      "base_url": "https://api.cheaperinference.com/v1",
+      "api_key_env": "CHEAPER_INFERENCE_API_KEY",
+      "default_model": "gpt-5.4-mini",
+      "discovery": "models_endpoint",
+      "docs_url": "https://cheaperinference.com/docs",
+      "credential_url": "https://cheaperinference.com/signup",
+      "guidance": "OpenAI-compatible host (Chat Completions + GET /v1/models). Live /v1/models is the model authority: ids are bare, such as gpt-5.4-mini, claude-sonnet-5 and gemini-3.1-pro. Store CHEAPER_INFERENCE_API_KEY, not a raw key.",
+      "aliases": [
+        "cheaper-inference"
+      ]
+    },
+    {
       "id": "command-code",
       "label": "Command Code",
       "wire": "openai-compatible",
@@ -101,6 +116,30 @@
         "sense-nova",
         "meituan-sensenova",
         "meituan-sensenova-cn"
+      ]
+    },
+    {
+      "id": "tsubasa",
+      "label": "Tsubasa",
+      "wire": "openai-compatible",
+      "base_url": "https://api.tsubasa.sh/v1",
+      "api_key_env": "TSUBASA_API_KEY",
+      "default_model": "tsubasa-pro",
+      "discovery": "models_endpoint",
+      "docs_url": "https://tsubasa.sh/docs",
+      "guidance": "OpenAI-compatible host (Chat Completions + GET /v1/models only). Public model ids: tsubasa-pro and tsubasa-fast, both with a 32,768-token context, so set context_window = 32768 on [providers.tsubasa]. Store TSUBASA_API_KEY, not a raw key."
+    },
+    {
+      "id": "yolo-auto",
+      "label": "Yolo-Auto",
+      "wire": "openai-compatible",
+      "base_url": "https://yolo-auto.com/v1",
+      "api_key_env": "YOLO_AUTO_API_KEY",
+      "default_model": "qwen3.8-flash",
+      "discovery": "models_endpoint",
+      "docs_url": "https://yolo-auto.com/docs",
+      "aliases": [
+        "yolo"
       ]
     }
   ]

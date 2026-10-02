@@ -8,6 +8,56 @@ use std::fs;
 use std::path::Path;
 use tempfile::TempDir;
 
+#[test]
+fn extension_owner_report_escapes_every_plugin_controlled_field() {
+    struct Presentation(Locale);
+    impl CommandPresentationContext for Presentation {
+        fn translate(&self, key: &str, replacements: &[(&str, &str)]) -> Result<String, String> {
+            let id = crate::commands::contract::key_to_plugin_message_id(key).unwrap();
+            let mut output = codewhale_localization::tr(self.0, id).to_string();
+            for (name, value) in replacements {
+                output = output.replace(&format!("{{{name}}}"), value);
+            }
+            Ok(output)
+        }
+    }
+    let mut output = String::new();
+    append_host_owner_report(
+        &Presentation(Locale::En),
+        &mut output,
+        &crate::extension_host::OwnerReport {
+            state: Some(crate::extension_host::registry::OwnerState::Failed(
+                "\u{1b}[31m<script>".into(),
+            )),
+            tools: vec!["[tool](https://example.invalid)".into()],
+            diagnostics: vec!["\n# approved\u{202e}".into()],
+        },
+    );
+    assert!(output.contains("Extension host:"));
+    for value in [
+        "\u{1b}[31m<script>",
+        "[tool](https://example.invalid)",
+        "\n# approved\u{202e}",
+    ] {
+        assert!(output.contains(&escape_review_text(value)));
+        assert!(!output.contains(value));
+    }
+    let mut localized = String::new();
+    append_host_owner_report(
+        &Presentation(Locale::ZhHans),
+        &mut localized,
+        &crate::extension_host::OwnerReport {
+            state: None,
+            tools: vec![],
+            diagnostics: vec![],
+        },
+    );
+    assert_eq!(
+        localized,
+        "\n扩展宿主：\n  状态：未激活\n  活动工具（0）：—"
+    );
+}
+
 fn create_test_app(root: &Path) -> (App, TempDir) {
     let temp = TempDir::new().expect("tempdir");
     let config_path = temp.path().join("config.toml");
@@ -422,6 +472,47 @@ fn legacy_tool_detail_remains_available_under_tools_namespace() {
     let message = result.message.unwrap();
     assert!(message.contains("Say hello"));
     assert!(message.contains("required"));
+}
+
+/// D4: `/plugin tools` names a script whose `approval: auto` was ignored and
+/// shows the approval it actually runs with.
+#[test]
+fn legacy_tools_report_ignored_auto_approval() {
+    let _lock = crate::test_support::lock_test_env();
+    let root = TempDir::new().unwrap();
+    let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", root.path().join("home"));
+    let (mut app, _temp) = create_test_app(root.path());
+    fs::write(
+        root.path().join("tools/greet.sh"),
+        "# name: greet\n# description: Say hello\n# approval: auto\n",
+    )
+    .unwrap();
+    fs::write(
+        root.path().join("tools/audit.sh"),
+        "# name: audit\n# description: Audit\n# approval: required\n",
+    )
+    .unwrap();
+    // The renderer escapes Markdown in plugin-controlled text.
+    let warning = "[script_tool_auto_approval_ignored]: script tool 'greet': \\`approval: auto\\` is no longer supported for script tools";
+
+    let list = plugins_with_kimi_home_override(&mut app, Some("tools"), None)
+        .message
+        .unwrap();
+    assert!(list.contains(warning), "{list}");
+    assert!(!list.contains("script tool 'audit'"), "{list}");
+
+    let detail = plugins_with_kimi_home_override(&mut app, Some("tools greet"), None)
+        .message
+        .unwrap();
+    assert!(detail.contains("suggest"), "{detail}");
+    assert!(detail.contains(warning), "{detail}");
+    let other = plugins_with_kimi_home_override(&mut app, Some("tools audit"), None)
+        .message
+        .unwrap();
+    assert!(
+        !other.contains("script_tool_auto_approval_ignored"),
+        "{other}"
+    );
 }
 
 #[test]

@@ -28,18 +28,34 @@ notes, and relevant issue/PR comments.
 ## Contributors by time
 
 <details open>
+<summary><strong>Unreleased</strong></summary>
+
+**Merged or adapted contributions**
+
+</details>
+
+<details open>
 <summary><strong>v0.10.1 — reliability and first-run fixes</strong></summary>
 
 **Merged or adapted contributions**
 
+- **[harryvgiunta](https://github.com/harryvgiunta)** — added Yolo-Auto as a bundled OpenAI-compatible host descriptor, with its billing basis recorded as unreviewed rather than guessed ([#6408](https://github.com/Hmbown/Codewhale/pull/6408)).
+- **[asto18089](https://github.com/asto18089)** — contributed the integrated runtime liveness, context, search, JavaScript execution, stopship scout and pet repairs, preserving the original contributor commits ([#6799](https://github.com/Hmbown/Codewhale/pull/6799)).
+- **[qiuYliangM](https://github.com/qiuYliangM)** — made provider-bound project instruction and constitution labels stable across directory moves and kept their absolute paths in operator reports ([#6799](https://github.com/Hmbown/Codewhale/pull/6799)).
+- **[zhuowp](https://github.com/zhuowp)** — supplied the process-scoped PowerShell execution-policy repair adapted for Codewhale; machine and user Group Policy still take precedence ([#6745](https://github.com/Hmbown/Codewhale/issues/6745)).
+- **[Andrea-Bruno](https://github.com/Andrea-Bruno)** — designed the Superfast Decision Gate and contributed its off-by-default shadow classifier ([#6604](https://github.com/Hmbown/Codewhale/pull/6604), [#6603](https://github.com/Hmbown/Codewhale/issues/6603)).
+- **[aiapienthusiast](https://github.com/aiapienthusiast)** — added Cheaper Inference to the bundled provider catalog ([#6761](https://github.com/Hmbown/Codewhale/pull/6761)).
 - **[gaord](https://github.com/gaord)** — let a client fork a thread at a named turn ([#6580](https://github.com/Hmbown/Codewhale/pull/6580)), let undo roll back files for the turn it is undoing ([#6483](https://github.com/Hmbown/Codewhale/pull/6483)), stopped resume and fork from duplicating threads and sessions ([#6406](https://github.com/Hmbown/Codewhale/pull/6406)), exposed user-defined provider routes to native clients ([#6404](https://github.com/Hmbown/Codewhale/pull/6404)), and kept a fork going when a turn lost its tool call ([#6664](https://github.com/Hmbown/Codewhale/pull/6664)).
-- **[Lstarsky0](https://github.com/Lstarsky0)** — moved the docs/work, legal, digest and FAQ pages onto the dictionary spine ([#6405](https://github.com/Hmbown/Codewhale/pull/6405), [#6417](https://github.com/Hmbown/Codewhale/pull/6417), [#6499](https://github.com/Hmbown/Codewhale/pull/6499), [#6574](https://github.com/Hmbown/Codewhale/pull/6574)), tightened the Chinese-branching ceiling to 18 ([#6403](https://github.com/Hmbown/Codewhale/pull/6403)), and made Fleet publish without a two-link window ([#6431](https://github.com/Hmbown/Codewhale/pull/6431)).
-- **[aboimpinto](https://github.com/aboimpinto)** — restored a green Linux full-workspace test gate without loosening any test, twice ([#6581](https://github.com/Hmbown/Codewhale/pull/6581), [#6666](https://github.com/Hmbown/Codewhale/pull/6666)).
+- **[Lstarsky0](https://github.com/Lstarsky0)** — moved the docs/work, legal, digest and FAQ pages onto the dictionary spine ([#6405](https://github.com/Hmbown/Codewhale/pull/6405), [#6417](https://github.com/Hmbown/Codewhale/pull/6417), [#6499](https://github.com/Hmbown/Codewhale/pull/6499), [#6574](https://github.com/Hmbown/Codewhale/pull/6574)), tightened the Chinese-branching ceiling to 18 ([#6403](https://github.com/Hmbown/Codewhale/pull/6403)), and made Fleet publish without a two-link window ([#6431](https://github.com/Hmbown/Codewhale/pull/6431)). Also moved the constitution page onto the dictionary spine and kept its install link in the selected locale ([#6733](https://github.com/Hmbown/Codewhale/pull/6733)).
+- **[aboimpinto](https://github.com/aboimpinto)** — restored a green Linux full-workspace test gate without loosening any test, twice ([#6581](https://github.com/Hmbown/Codewhale/pull/6581), [#6666](https://github.com/Hmbown/Codewhale/pull/6666)), and completed the session command group's shared boundary ([#6793](https://github.com/Hmbown/Codewhale/pull/6793)).
 - **[dajiaohuang](https://github.com/dajiaohuang)** — validated `config set` values against the settings schema ([#6568](https://github.com/Hmbown/Codewhale/pull/6568)).
 - **[Water-Run](https://github.com/Water-Run)** — ingested namespaced model-only catalog entries so models present only in the canonical `models` map reach the offering list ([#6400](https://github.com/Hmbown/Codewhale/pull/6400)), and retired the blanket dead-code allowance and its unused feature stages, tightening the budget to match ([#6402](https://github.com/Hmbown/Codewhale/pull/6402)).
+- **[wuisabel-gif](https://github.com/wuisabel-gif)** — designed the `tool_call_after` execution-receipt contract and its tests on a reference branch, which landed re-implemented on the current hook seam ([#6689](https://github.com/Hmbown/Codewhale/issues/6689), [#6713](https://github.com/Hmbown/Codewhale/pull/6713)).
+- **[Sh1Zuku / SparkofSpike](https://github.com/SparkofSpike)** — let making room survive a provider request-body limit (HTTP 413) by shrinking, then replacing, inline images for that one summary pass ([#6642](https://github.com/Hmbown/Codewhale/pull/6642)). Also translated seventeen more guides into Simplified Chinese, among them plugins, memory, sandbox, workflow authoring, Docker, Termux and HarmonyOS, and brought the existing zh_hans docs onto one terminology standard ([#6662](https://github.com/Hmbown/Codewhale/pull/6662)), then translated thirteen developer and internal docs, among them the runtime API, architecture, tool surface, authorization order, operations runbook and Workroom security ([#6663](https://github.com/Hmbown/Codewhale/pull/6663)).
 
 **Reports and reproductions**
 
+- **[cenab](https://github.com/cenab)** — requested the Tsubasa provider row and supplied its endpoint, key and model values ([#6695](https://github.com/Hmbown/Codewhale/issues/6695)).
 - **[BX166](https://github.com/BX166)** — reported the AICraft provider row missing its key console, docs link and guidance, and supplied the values ([#6616](https://github.com/Hmbown/Codewhale/issues/6616)); the report also surfaced that no bundled descriptor's links reached the setup form.
 
 </details>

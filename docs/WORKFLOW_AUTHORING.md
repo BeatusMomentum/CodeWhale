@@ -1,5 +1,7 @@
 # Workflow Authoring
 
+> 阅读简体中文版：[zh_hans/WORKFLOW_AUTHORING.md](zh_hans/WORKFLOW_AUTHORING.md)。
+
 > **Ordinary multi-agent work does not require this file.** In Operate, send
 > normal messages. Small work stays direct; multiple delegated steps use a
 > compact Workflow plan with dependencies, bounded scopes, and completion

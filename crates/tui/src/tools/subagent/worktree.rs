@@ -159,6 +159,28 @@ pub(super) fn remove_unchanged_worktree(
     !worktree.exists()
 }
 
+/// Remove the isolated worktree (and its new branch) of a spawn refused
+/// before its child started. No agent ever ran in it, so everything it holds
+/// came from the checkout itself, including what post-checkout hooks,
+/// line-ending filters or LFS wrote there. Requiring a pristine
+/// `git status`, as [`remove_unchanged_worktree`] does for a finished
+/// worker, kept exactly those checkouts behind. The removal still goes
+/// through the lane implementation, which deletes only a path git lists as a
+/// linked worktree, and the branch only when merged.
+pub(super) fn remove_unstarted_worktree(worktree: &Path) {
+    let outcome = codewhale_lane::remove_worktree_if_expired(worktree, Some(0), None);
+    if outcome.is_err() || worktree.exists() {
+        tracing::warn!(
+            "could not remove the worktree of a refused sub-agent spawn {}: {}",
+            worktree.display(),
+            outcome.err().map_or_else(
+                || "git did not list it as a linked worktree".to_string(),
+                |err| format!("{err:#}")
+            )
+        );
+    }
+}
+
 pub(super) fn git_repo_root(workspace: &Path) -> Result<PathBuf, ToolError> {
     const MAX_PARENT_LEVELS: usize = 4;
     let start = workspace
@@ -261,14 +283,25 @@ fn validate_git_branch_name(repo_root: &Path, branch: &str) -> Result<(), ToolEr
     .map_err(|err| ToolError::invalid_input(format!("Invalid worktree_branch '{branch}': {err}")))
 }
 
+/// Longest seed slug a default branch carries. The default checkout path is
+/// the branch slug, which [`sanitize_worktree_slug`] caps at 48 characters;
+/// `codex/agent-` (12) + seed + `-` + an 8-character unique suffix must fit,
+/// or a long agent name truncated the suffix away and every retry of that
+/// name (or any name sharing its first 27 characters) reused one path.
+const DEFAULT_BRANCH_SEED_MAX: usize = 27;
+
 fn default_worktree_branch(session_name: Option<&str>, agent_type: &FleetRole) -> String {
     let seed = session_name
         .map(str::trim)
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| agent_type.as_str());
+    // The slug is ASCII, so truncating by bytes cannot split a character.
+    let mut seed = sanitize_worktree_slug(seed);
+    seed.truncate(DEFAULT_BRANCH_SEED_MAX);
+    let seed = seed.trim_end_matches(['-', '.', '_']);
     format!(
         "codex/agent-{}-{}",
-        sanitize_worktree_slug(seed),
+        if seed.is_empty() { "task" } else { seed },
         &Uuid::new_v4().to_string()[..8]
     )
 }
@@ -304,7 +337,7 @@ fn resolve_worktree_path(
                 }
             }
         }
-        None => default_root.join(sanitize_worktree_slug(branch)),
+        None => default_root.join(branch_worktree_slug(branch)),
     };
     let normalized = normalize_path_lexically(&path);
     let repo_canonical = repo_root
@@ -414,7 +447,36 @@ fn default_worktree_root(repo_root: &Path) -> PathBuf {
     normalize_path_lexically(&parent.join(SUBAGENT_WORKTREE_ROOT_DIR).join(repo_name))
 }
 
+/// The default checkout directory for `branch`: its slug, or, when the slug
+/// had to be cut to [`WORKTREE_SLUG_MAX`], the cut slug with a short hash of
+/// the whole branch name, so two long branches sharing a prefix get their own
+/// checkouts instead of the second spawn failing on an existing path.
+fn branch_worktree_slug(branch: &str) -> String {
+    let slug = sanitize_worktree_slug(branch);
+    if slug == sanitize_worktree_slug_within(branch, usize::MAX) {
+        return slug;
+    }
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(branch.as_bytes());
+    let suffix: String = digest[..4]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    // The slug is ASCII, so cutting by bytes cannot split a character.
+    let mut prefix = slug;
+    prefix.truncate(WORKTREE_SLUG_MAX - suffix.len() - 1);
+    let prefix = prefix.trim_end_matches(['-', '.', '_']);
+    format!("{prefix}-{suffix}")
+}
+
+/// Longest sub-agent worktree path slug.
+const WORKTREE_SLUG_MAX: usize = 48;
+
 fn sanitize_worktree_slug(input: &str) -> String {
+    sanitize_worktree_slug_within(input, WORKTREE_SLUG_MAX)
+}
+
+fn sanitize_worktree_slug_within(input: &str, max: usize) -> String {
     let mut slug = String::new();
     for ch in input.chars() {
         let normalized = if ch.is_ascii_alphanumeric() {
@@ -428,7 +490,7 @@ fn sanitize_worktree_slug(input: &str) -> String {
             continue;
         }
         slug.push(normalized);
-        if slug.len() >= 48 {
+        if slug.len() >= max {
             break;
         }
     }
@@ -479,6 +541,61 @@ fn run_git_checked(workspace: &Path, args: &[String], action: &str) -> Result<St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A long agent name used to push the unique suffix past the 48-character
+    /// path slug, so a retry of the same name collided with the checkout the
+    /// previous run kept.
+    #[test]
+    fn default_worktree_paths_stay_unique_for_long_agent_names() {
+        let name = "audit-authentication-middleware-a";
+        let first = default_worktree_branch(Some(name), &FleetRole::Worker);
+        let second = default_worktree_branch(Some(name), &FleetRole::Worker);
+        let sibling = default_worktree_branch(
+            Some("audit-authentication-middleware-b"),
+            &FleetRole::Worker,
+        );
+        assert!(
+            first.starts_with("codex/agent-audit-authentication-midd"),
+            "{first}"
+        );
+        let paths = [&first, &second, &sibling].map(|branch| branch_worktree_slug(branch));
+        for (branch, path) in [&first, &second, &sibling].into_iter().zip(&paths) {
+            assert_eq!(
+                path.as_str(),
+                branch.replace('/', "-"),
+                "the default path slug keeps the whole branch, suffix included"
+            );
+        }
+        assert_ne!(paths[0], paths[1], "a retry must get its own checkout");
+        assert_ne!(
+            paths[0], paths[2],
+            "names sharing a prefix must not collide"
+        );
+    }
+
+    /// An explicit branch with no worktree_path gets its path from the branch
+    /// slug, cut at 48 characters. Two long branches sharing that prefix used
+    /// to map to one checkout, and the second spawn failed on it.
+    #[test]
+    fn long_explicit_branches_sharing_a_prefix_get_distinct_paths() {
+        let a = "feature/very-long-shared-prefix-authentication-work-a";
+        let b = "feature/very-long-shared-prefix-authentication-work-b";
+        let (path_a, path_b) = (branch_worktree_slug(a), branch_worktree_slug(b));
+        assert_ne!(path_a, path_b);
+        for path in [&path_a, &path_b] {
+            assert!(path.len() <= WORKTREE_SLUG_MAX, "{path}");
+            assert!(
+                path.starts_with("feature-very-long-shared-prefix"),
+                "{path}"
+            );
+        }
+        assert_eq!(path_a, branch_worktree_slug(a), "the path is stable");
+        assert_eq!(
+            branch_worktree_slug("feature/short"),
+            "feature-short",
+            "a branch that fits keeps its plain slug"
+        );
+    }
 
     #[test]
     fn cwd_errors_name_the_allowed_root() {

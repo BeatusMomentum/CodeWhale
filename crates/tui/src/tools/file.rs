@@ -151,6 +151,33 @@ const fn alias(alias: &'static str, canonical: &'static str) -> ParamAlias {
 pub(super) const PATH_ALIASES: &[ParamAlias] =
     &[alias("file_path", "path"), alias("filePath", "path")];
 
+/// `input` with [`PATH_ALIASES`] folded onto `path`, exactly as the file
+/// tools' `execute` does before touching disk.
+///
+/// Policy gates (typed file rules, the workspace-write carve-out, repo law,
+/// Auto-Review) must judge the path the tool will act on. Reading only the
+/// raw `path` key misses accepted `file_path`/`filePath` spellings. A
+/// conflicting pair, which `execute` refuses, is returned unchanged.
+pub(crate) fn with_canonical_path_argument(input: &Value) -> Cow<'_, Value> {
+    if !PATH_ALIASES
+        .iter()
+        .any(|ParamAlias { alias, .. }| input.get(*alias).is_some())
+    {
+        return Cow::Borrowed(input);
+    }
+    let mut folded = input.clone();
+    match apply_param_aliases(&mut folded, PATH_ALIASES, "path") {
+        Ok(()) => Cow::Owned(folded),
+        Err(_) => Cow::Borrowed(input),
+    }
+}
+
+/// `path` and every spelling [`PATH_ALIASES`] folds onto it, for gates that
+/// deliberately over-collect candidate targets.
+pub(crate) fn path_argument_keys() -> impl Iterator<Item = &'static str> {
+    std::iter::once("path").chain(PATH_ALIASES.iter().map(|ParamAlias { alias, .. }| *alias))
+}
+
 /// Edit-specific spellings. Ordered most- to least-common.
 const EDIT_ALIASES: &[ParamAlias] = &[
     alias("old_string", "search"),
@@ -545,6 +572,103 @@ const READ_REQUEST_MAX_BYTES: usize = 500_000;
 /// override, and therefore on any read result.
 const READ_RESULT_ABSOLUTE_MAX_BYTES: usize = 2 * 1024 * 1024;
 
+/// Whole-source processing bound, independent of the model-visible read budget.
+/// The lowercase primitives accept only regular, single-link files. Hidden
+/// compatibility readers and PDF extraction keep their existing contracts.
+const CONTRACT_FILE_MAX_BYTES: usize = 16 * 1024 * 1024;
+
+fn check_contract_file_size(size: usize) -> Result<(), ToolError> {
+    if size > CONTRACT_FILE_MAX_BYTES {
+        return Err(ToolError::execution_failed(
+            "File content exceeds the supported 16 MiB processing cap. Split or export a smaller file, or use an appropriate separately authorized tool.",
+        ));
+    }
+    Ok(())
+}
+
+fn check_contract_cancelled(token: Option<&CancellationToken>) -> Result<(), ToolError> {
+    if token.is_some_and(CancellationToken::is_cancelled) {
+        return Err(ToolError::cancelled("Operation aborted"));
+    }
+    Ok(())
+}
+
+/// Read at most cap+1 actual bytes, including files that grow after metadata.
+/// Cancellation is polled between bounded reads; it cannot interrupt an OS
+/// syscall already in progress. This worker never mutates the file.
+fn read_contract_source(
+    reader: &mut impl std::io::Read,
+    cancel: Option<&CancellationToken>,
+) -> Result<Vec<u8>, ToolError> {
+    let mut bytes = Vec::new();
+    let mut chunk = [0_u8; 64 * 1024];
+    loop {
+        check_contract_cancelled(cancel)?;
+        let remaining = CONTRACT_FILE_MAX_BYTES + 1 - bytes.len();
+        let read_len = remaining.min(chunk.len());
+        let count = match reader.read(&mut chunk[..read_len]) {
+            Ok(count) => count,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => {
+                return Err(ToolError::execution_failed(format!(
+                    "Failed to read file: {error}"
+                )));
+            }
+        };
+        check_contract_cancelled(cancel)?;
+        if count == 0 {
+            return Ok(bytes);
+        }
+        bytes.extend_from_slice(&chunk[..count]);
+        check_contract_file_size(bytes.len())?;
+    }
+}
+
+async fn load_contract_source(
+    path: &Path,
+    writable: bool,
+    context: &ToolContext,
+) -> Result<Option<Vec<u8>>, ToolError> {
+    check_file_operation_cancelled(context)?;
+    let path = path.to_path_buf();
+    let cancel = context.cancel_token.clone();
+    let mut worker = tokio::task::spawn_blocking(move || {
+        check_contract_cancelled(cancel.as_ref())?;
+        let open_error = |error| {
+            if writable {
+                ToolError::execution_failed(format!(
+                    "Could not edit file {}: target must be readable and writable ({error})",
+                    path.display()
+                ))
+            } else {
+                ToolError::execution_failed(format!("Failed to read {}: {error}", path.display()))
+            }
+        };
+        let Some(mut file) = crate::plugins::registry::open_existing_regular_file(&path, writable)
+            .map_err(open_error)?
+        else {
+            return Ok(None);
+        };
+        let metadata = file
+            .metadata()
+            .map_err(|error| open_error(error.to_string()))?;
+        if metadata.len() > CONTRACT_FILE_MAX_BYTES as u64 {
+            check_contract_file_size(CONTRACT_FILE_MAX_BYTES + 1)?;
+        }
+        read_contract_source(&mut file, cancel.as_ref()).map(Some)
+    });
+    let result = if let Some(cancel) = context.cancel_token.as_ref() {
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => return Err(ToolError::cancelled("Operation aborted")),
+            result = &mut worker => result,
+        }
+    } else {
+        worker.await
+    };
+    result.map_err(|error| ToolError::execution_failed(format!("File read task: {error}")))?
+}
+
 /// Resolve the byte budget for one `read` call from the three layers that can
 /// set it, highest wins:
 ///
@@ -625,14 +749,7 @@ async fn run_blocking_write_atomic(path: &Path, contents: Vec<u8>) -> Result<(),
 }
 
 fn check_file_operation_cancelled(context: &ToolContext) -> Result<(), ToolError> {
-    if context
-        .cancel_token
-        .as_ref()
-        .is_some_and(CancellationToken::is_cancelled)
-    {
-        return Err(ToolError::cancelled("Operation aborted"));
-    }
-    Ok(())
+    check_contract_cancelled(context.cancel_token.as_ref())
 }
 
 /// One `mutation.files[]` receipt entry. `size` and `sha256` describe the
@@ -733,15 +850,11 @@ struct ContractReadWindow {
 /// file that fits: every retained line costs at least its own newline, so
 /// `max_bytes` already bounds the line count as well.
 fn contract_read_window(content: &str, max_bytes: usize) -> ContractReadWindow {
-    let mut lines = if content.is_empty() {
-        Vec::new()
-    } else {
-        content.split('\n').collect::<Vec<_>>()
-    };
-    if content.ends_with('\n') {
-        let _ = lines.pop();
-    }
-    if lines.first().is_some_and(|line| line.len() > max_bytes) {
+    if content
+        .split('\n')
+        .next()
+        .is_some_and(|line| line.len() > max_bytes)
+    {
         return ContractReadWindow {
             content: String::new(),
             shown_lines: 0,
@@ -749,29 +862,26 @@ fn contract_read_window(content: &str, max_bytes: usize) -> ContractReadWindow {
             first_line_too_large: true,
         };
     }
-
     if content.len() <= max_bytes {
         return ContractReadWindow {
             content: content.to_string(),
-            shown_lines: lines.len(),
+            shown_lines: content.split_terminator('\n').count(),
             truncated: false,
             first_line_too_large: false,
         };
     }
-
-    let mut kept = Vec::new();
+    let mut shown_lines = 0;
     let mut bytes = 0usize;
-    for line in &lines {
-        let next = line.len() + usize::from(!kept.is_empty());
+    for line in content.split_terminator('\n') {
+        let next = line.len() + usize::from(shown_lines > 0);
         if bytes.saturating_add(next) > max_bytes {
             break;
         }
-        kept.push(*line);
+        shown_lines += 1;
         bytes += next;
     }
-    let shown_lines = kept.len();
     ContractReadWindow {
-        content: kept.join("\n"),
+        content: content[..bytes].to_string(),
         shown_lines,
         truncated: true,
         first_line_too_large: false,
@@ -804,9 +914,14 @@ impl ReadFileTool {
         // cwd is not the workspace.
         let file_path = resolve_guarded_read_path(context, path_str, "read")?;
         check_file_operation_cancelled(context)?;
-        let bytes = tokio::fs::read(&file_path).await.map_err(|error| {
-            ToolError::execution_failed(format!("Failed to read {}: {error}", file_path.display()))
-        })?;
+        let bytes = load_contract_source(&file_path, false, context)
+            .await?
+            .ok_or_else(|| {
+                ToolError::execution_failed(format!(
+                    "Failed to read {}: file not found",
+                    file_path.display()
+                ))
+            })?;
         // #6283: every read response carries the file's byte size, line
         // count, and truncation flag so the caller can page deliberately
         // instead of discovering a huge file one window at a time.
@@ -826,31 +941,42 @@ impl ReadFileTool {
         // The small-contract reader decodes non-image buffers as UTF-8 text with replacement
         // characters instead of refusing the whole read on one invalid byte.
         let text = String::from_utf8_lossy(&bytes);
-        let all_lines = text.split('\n').collect::<Vec<_>>();
+        // Count and select with byte boundaries, without a pointer per newline.
+        let line_count = text.bytes().filter(|byte| *byte == b'\n').count() + 1;
         let requested_offset = offset.unwrap_or(1);
         let start = requested_offset.saturating_sub(1);
-        if start >= all_lines.len() {
+        if start >= line_count {
             return Err(ToolError::execution_failed(format!(
-                "Offset {requested_offset} is beyond end of file ({} lines total)",
-                all_lines.len()
+                "Offset {requested_offset} is beyond end of file ({line_count} lines total)"
             )));
         }
-
-        let available = &all_lines[start..];
-        let selected = match limit {
-            Some(limit) => &available[..available.len().min(limit)],
-            None => available,
+        let start_byte = if start == 0 {
+            0
+        } else {
+            text.match_indices('\n')
+                .nth(start - 1)
+                .expect("line count validated offset")
+                .0
+                + 1
         };
-        let selected_content = selected.join("\n");
-        let window = contract_read_window(&selected_content, max_bytes);
+        let selected_lines = limit.unwrap_or(usize::MAX).min(line_count - start);
+        let end_byte = if selected_lines == 0 {
+            start_byte
+        } else {
+            text[start_byte..]
+                .match_indices('\n')
+                .nth(selected_lines - 1)
+                .map_or(text.len(), |(index, _)| start_byte + index)
+        };
+        let selected_content = &text[start_byte..end_byte];
+        let window = contract_read_window(selected_content, max_bytes);
         // Truncated means the file holds more than this response shows:
         // either the byte budget cut the window, or a bounded range stopped
         // before EOF. A whole file that fits is never truncated.
-        let truncated =
-            window.truncated || limit.is_some() && start + selected.len() < all_lines.len();
+        let truncated = window.truncated || limit.is_some() && start + selected_lines < line_count;
         let first_display = start + 1;
         let mut output = if window.first_line_too_large {
-            let size = selected.first().map_or(0, |line| line.len());
+            let size = selected_content.split('\n').next().map_or(0, str::len);
             format!(
                 "[Line {first_display} is {}, exceeds the {max_bytes}-byte output budget for this call. Use bash: sed -n '{first_display}p' {path_str} | head -c {max_bytes}]",
                 contract_format_size(size)
@@ -879,13 +1005,13 @@ impl ReadFileTool {
             };
             output.push_str(&format!(
                 "\n\n[Showing lines {first_display}-{last_display} of {} ({} total, {max_bytes}-byte output budget). Use {hint} to continue{raise}.]",
-                all_lines.len(),
+                line_count,
                 contract_format_size(size_bytes)
             ));
         } else if limit.is_some() {
-            let consumed = selected.len();
-            if start + consumed < all_lines.len() {
-                let remaining = all_lines.len() - (start + consumed);
+            let consumed = selected_lines;
+            if start + consumed < line_count {
+                let remaining = line_count - (start + consumed);
                 let next_offset = start + consumed + 1;
                 output.push_str(&format!(
                     "\n\n[{remaining} more lines in file ({} total). Use offset={next_offset} to continue.]",
@@ -910,7 +1036,7 @@ impl ReadFileTool {
                 // holds more than this response shows.
                 "size": size_bytes,
                 "truncated": truncated,
-                "line_count": all_lines.len()
+                "line_count": line_count
             })),
         ))
     }
@@ -1515,21 +1641,14 @@ impl WriteFileTool {
         reject_primitive_unknown(&input, "write", &["path", "content"])?;
         let path_str = required_str(&input, "path")?;
         let file_content = required_str(&input, "content")?;
+        check_contract_file_size(file_content.len())?;
         let file_path = context.resolve_path(path_str)?;
         let mutation_guard = acquire_file_mutation(&file_path, context).await?;
         check_file_operation_cancelled(context)?;
 
-        let existed_before = tokio::fs::try_exists(&file_path).await.unwrap_or(false);
-        let prior_bytes = if existed_before {
-            tokio::fs::read(&file_path).await.map_err(|error| {
-                ToolError::execution_failed(format!(
-                    "Failed to read {}: {error}",
-                    file_path.display()
-                ))
-            })?
-        } else {
-            Vec::new()
-        };
+        let prior = load_contract_source(&file_path, false, context).await?;
+        let existed_before = prior.is_some();
+        let prior_bytes = prior.unwrap_or_default();
         let prior_contents = String::from_utf8_lossy(&prior_bytes);
 
         if let Some(parent) = file_path.parent() {
@@ -1544,7 +1663,19 @@ impl WriteFileTool {
         // Preserve the existing file's line-ending style on overwrite (see
         // `preserve_prior_line_endings`); otherwise a CRLF (Windows) file is
         // silently rewritten with LF line endings.
-        let mut written = preserve_prior_line_endings(file_content, &prior_contents);
+        let mut written = if prior_contents.is_empty() {
+            file_content.to_string()
+        } else {
+            let normalized = normalize_contract_line_endings(file_content);
+            let ending = contract_line_ending(&prior_contents);
+            let extra = if ending == "\r\n" {
+                normalized.bytes().filter(|byte| *byte == b'\n').count()
+            } else {
+                0
+            };
+            check_contract_file_size(normalized.len().saturating_add(extra))?;
+            restore_contract_line_endings(&normalized, ending)
+        };
         guard_edit(
             &file_path,
             path_str,
@@ -1556,8 +1687,10 @@ impl WriteFileTool {
         {
             written = normalized;
         }
-        run_blocking_write_atomic(&file_path, written.clone().into_bytes()).await?;
+        check_contract_file_size(written.len())?;
         check_file_operation_cancelled(context)?;
+        // Once replacement starts, report its actual completion even if cancelled.
+        run_blocking_write_atomic(&file_path, written.clone().into_bytes()).await?;
         context.note_file_read(&file_path);
         drop(mutation_guard);
 
@@ -1636,8 +1769,15 @@ impl ToolSpec for WriteFileTool {
         let file_path = context.resolve_path(path_str)?;
 
         // Snapshot the existing contents (if any) before we overwrite — used
-        // to render an inline diff in the tool result.
-        let existed_before = tokio::fs::try_exists(&file_path).await.unwrap_or(false);
+        // to render an inline diff in the tool result. Only a genuinely
+        // absent path is "new": a stat that fails for any other reason must
+        // not let an existing file be overwritten as if it were empty.
+        let existed_before = tokio::fs::try_exists(&file_path).await.map_err(|error| {
+            ToolError::execution_failed(format!(
+                "Failed to inspect {}: {error}",
+                file_path.display()
+            ))
+        })?;
         let prior_contents = if existed_before {
             tokio::fs::read_to_string(&file_path)
                 .await
@@ -1841,6 +1981,36 @@ fn encode_lossless_text(text: &str) -> Vec<u8> {
     out
 }
 
+// Raw-byte placeholders use four UTF-8 bytes in memory but encode as one.
+fn contract_encoded_size(text: &str, has_raw_bytes: bool) -> usize {
+    if has_raw_bytes {
+        text.chars()
+            .map(|ch| {
+                if is_raw_byte_placeholder(ch) {
+                    1
+                } else {
+                    ch.len_utf8()
+                }
+            })
+            .sum()
+    } else {
+        text.len()
+    }
+}
+
+fn append_contract_text(
+    result: &mut String,
+    encoded_size: &mut usize,
+    text: &str,
+    has_raw_bytes: bool,
+) -> Result<(), ToolError> {
+    let next = encoded_size.saturating_add(contract_encoded_size(text, has_raw_bytes));
+    check_contract_file_size(next)?;
+    result.push_str(text);
+    *encoded_size = next;
+    Ok(())
+}
+
 /// The line terminator of each line in `text`, in order (`\r\n`, `\n` or a
 /// lone `\r`). The k-th entry ends the k-th line of the LF-normalized text.
 fn line_terminators(text: &str) -> Vec<&'static str> {
@@ -1876,15 +2046,25 @@ fn restore_line_endings_per_line(
     normalized_original: &str,
     updated: &str,
     fallback: &str,
-) -> String {
+    has_raw_bytes: bool,
+) -> Result<String, ToolError> {
     let terminators = line_terminators(original);
     if terminators.iter().all(|ending| *ending == fallback) {
-        return restore_contract_line_endings(updated, fallback);
+        let extra = if fallback == "\r\n" {
+            updated.bytes().filter(|byte| *byte == b'\n').count()
+        } else {
+            0
+        };
+        check_contract_file_size(
+            contract_encoded_size(updated, has_raw_bytes).saturating_add(extra),
+        )?;
+        return Ok(restore_contract_line_endings(updated, fallback));
     }
     let diff = similar::TextDiff::configure()
         .timeout(std::time::Duration::from_secs(1))
         .diff_lines(normalized_original, updated);
-    let mut out = String::with_capacity(updated.len() + terminators.len());
+    let mut out = String::new();
+    let mut encoded_size = 0;
     for change in diff.iter_all_changes() {
         let ending = match change.tag() {
             similar::ChangeTag::Delete => continue,
@@ -1897,13 +2077,13 @@ fn restore_line_endings_per_line(
         let line = change.value();
         match line.strip_suffix('\n') {
             Some(body) => {
-                out.push_str(body);
-                out.push_str(ending);
+                append_contract_text(&mut out, &mut encoded_size, body, has_raw_bytes)?;
+                append_contract_text(&mut out, &mut encoded_size, ending, has_raw_bytes)?;
             }
-            None => out.push_str(line),
+            None => append_contract_text(&mut out, &mut encoded_size, line, has_raw_bytes)?,
         }
     }
-    out
+    Ok(out)
 }
 
 /// Rewrite `content` to match the line-ending style of an existing file's
@@ -1926,11 +2106,14 @@ fn preserve_prior_line_endings(content: &str, prior: &str) -> String {
 /// exact-text replacement rather than teaching a second edit mode.
 fn normalize_contract_fuzzy(text: &str) -> String {
     let compatible = text.nfkc().collect::<String>();
-    compatible
-        .split('\n')
-        .map(str::trim_end)
-        .collect::<Vec<_>>()
-        .join("\n")
+    let mut trimmed = String::with_capacity(compatible.len());
+    for (index, line) in compatible.split('\n').enumerate() {
+        if index > 0 {
+            trimmed.push('\n');
+        }
+        trimmed.push_str(line.trim_end());
+    }
+    trimmed
         .chars()
         .map(|ch| match ch {
             '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}' => '\'',
@@ -1978,6 +2161,14 @@ fn contract_edit_duplicate(path: &str, index: usize, total: usize, matches: usiz
 }
 
 fn prepare_contract_edit_input(mut input: Value) -> Result<Value, ToolError> {
+    for key in ["oldText", "newText"] {
+        if let Some(text) = input.get(key).and_then(Value::as_str) {
+            check_contract_file_size(text.len())?;
+        }
+    }
+    if let Some(encoded) = input.get("edits").and_then(Value::as_str) {
+        check_contract_file_size(encoded.len())?;
+    }
     let object = input
         .as_object_mut()
         .ok_or_else(|| ToolError::invalid_input("edit input must be an object"))?;
@@ -1998,11 +2189,10 @@ fn prepare_contract_edit_input(mut input: Value) -> Result<Value, ToolError> {
         .map(str::to_string);
     if let (Some(old_text), Some(new_text)) = (legacy_old, legacy_new) {
         let legacy = json!({"oldText": old_text, "newText": new_text});
-        let mut edits = object
-            .get("edits")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
+        let mut edits = match object.remove("edits") {
+            Some(Value::Array(edits)) => edits,
+            _ => Vec::new(),
+        };
         edits.push(legacy);
         object.insert("edits".to_string(), Value::Array(edits));
         object.remove("oldText");
@@ -2021,12 +2211,20 @@ fn parse_contract_edits(input: &Value) -> Result<Vec<ContractEdit>, ToolError> {
             "edit requires at least one replacement in edits",
         ));
     }
+    let mut replacement_bytes = 0usize;
     raw.iter()
         .enumerate()
         .map(|(index, edit)| {
             reject_primitive_unknown(edit, &format!("edits[{index}]"), &["oldText", "newText"])?;
             let old_text = required_str(edit, "oldText")?;
             let new_text = required_str(edit, "newText")?;
+            check_contract_file_size(old_text.len())?;
+            check_contract_file_size(new_text.len())?;
+            // All non-overlapping replacements survive into the output. Count
+            // normalized bytes before copying another large replacement.
+            replacement_bytes = replacement_bytes
+                .saturating_add(new_text.len() - new_text.match_indices("\r\n").count());
+            check_contract_file_size(replacement_bytes)?;
             if old_text.is_empty() {
                 return Err(ToolError::invalid_input(format!(
                     "edits[{index}].oldText must not be empty"
@@ -2041,15 +2239,34 @@ fn parse_contract_edits(input: &Value) -> Result<Vec<ContractEdit>, ToolError> {
         .collect()
 }
 
-fn apply_resolved_edits(base: &str, edits: &[ResolvedContractEdit], offset: usize) -> String {
+fn apply_resolved_edits(
+    base: &str,
+    edits: &[ResolvedContractEdit],
+    offset: usize,
+    has_raw_bytes: bool,
+) -> Result<String, ToolError> {
+    let mut encoded_size = contract_encoded_size(base, has_raw_bytes);
+    check_contract_file_size(encoded_size)?;
     let mut updated = base.to_string();
     for edit in edits.iter().rev() {
-        updated.replace_range(
-            edit.start.saturating_sub(offset)..edit.end.saturating_sub(offset),
-            &edit.replacement,
-        );
+        let range = edit.start.saturating_sub(offset)..edit.end.saturating_sub(offset);
+        let removed = &updated[range.clone()];
+        let projected_string_size = updated
+            .len()
+            .saturating_sub(removed.len())
+            .saturating_add(edit.replacement.len());
+        encoded_size = encoded_size
+            .saturating_sub(contract_encoded_size(removed, has_raw_bytes))
+            .saturating_add(contract_encoded_size(&edit.replacement, has_raw_bytes));
+        // Reject each intermediate replacement before String::replace_range
+        // allocates; raw-byte placeholders are at most four bytes in memory.
+        check_contract_file_size(encoded_size)?;
+        if projected_string_size > CONTRACT_FILE_MAX_BYTES * if has_raw_bytes { 4 } else { 1 } {
+            check_contract_file_size(CONTRACT_FILE_MAX_BYTES + 1)?;
+        }
+        updated.replace_range(range, &edit.replacement);
     }
-    updated
+    Ok(updated)
 }
 
 fn lines_with_endings(text: &str) -> Vec<&str> {
@@ -2096,6 +2313,7 @@ fn apply_fuzzy_edits_preserving_other_lines(
     original: &str,
     normalized: &str,
     edits: &[ResolvedContractEdit],
+    has_raw_bytes: bool,
 ) -> Result<String, ToolError> {
     let original_lines = lines_with_endings(original);
     let spans = line_spans(normalized);
@@ -2130,22 +2348,25 @@ fn apply_fuzzy_edits_preserving_other_lines(
     }
 
     let mut result = String::new();
+    let mut encoded_size = 0;
     let mut original_line = 0usize;
     for group in groups {
         for line in &original_lines[original_line..group.start_line] {
-            result.push_str(line);
+            append_contract_text(&mut result, &mut encoded_size, line, has_raw_bytes)?;
         }
         let group_start = spans[group.start_line].0;
         let group_end = spans[group.end_line - 1].1;
-        result.push_str(&apply_resolved_edits(
+        let replacement = apply_resolved_edits(
             &normalized[group_start..group_end],
             &group.edits,
             group_start,
-        ));
+            has_raw_bytes,
+        )?;
+        append_contract_text(&mut result, &mut encoded_size, &replacement, has_raw_bytes)?;
         original_line = group.end_line;
     }
     for line in &original_lines[original_line..] {
-        result.push_str(line);
+        append_contract_text(&mut result, &mut encoded_size, line, has_raw_bytes)?;
     }
     Ok(result)
 }
@@ -2154,6 +2375,7 @@ fn apply_contract_edits(
     base: &str,
     edits: &[ContractEdit],
     path: &str,
+    has_raw_bytes: bool,
 ) -> Result<String, ToolError> {
     let fuzzy_base = normalize_contract_fuzzy(base);
     let initial = edits
@@ -2219,9 +2441,9 @@ fn apply_contract_edits(
     }
 
     let updated = if use_fuzzy {
-        apply_fuzzy_edits_preserving_other_lines(base, replacement_base, &resolved)?
+        apply_fuzzy_edits_preserving_other_lines(base, replacement_base, &resolved, has_raw_bytes)?
     } else {
-        apply_resolved_edits(replacement_base, &resolved, 0)
+        apply_resolved_edits(replacement_base, &resolved, 0, has_raw_bytes)?
     };
     if updated == base {
         return Err(ToolError::execution_failed(format!(
@@ -2244,20 +2466,13 @@ impl EditFileTool {
         let mutation_guard = acquire_file_mutation(&file_path, context).await?;
         check_file_operation_cancelled(context)?;
 
-        tokio::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&file_path)
-            .await
-            .map_err(|error| {
+        let raw_bytes = load_contract_source(&file_path, true, context)
+            .await?
+            .ok_or_else(|| {
                 ToolError::execution_failed(format!(
-                    "Could not edit file {path_str}: target must be readable and writable ({error})"
+                    "Could not edit file {path_str}: file not found"
                 ))
             })?;
-        check_file_operation_cancelled(context)?;
-        let raw_bytes = tokio::fs::read(&file_path).await.map_err(|error| {
-            ToolError::execution_failed(format!("Could not edit file {path_str}: {error}"))
-        })?;
         check_file_operation_cancelled(context)?;
         // Bytes that are not UTF-8 ride through the edit as placeholders and
         // are written back unchanged (B6), instead of becoming U+FFFD.
@@ -2267,24 +2482,36 @@ impl EditFileTool {
             .map_or(("", raw.as_str()), |text| ("\u{FEFF}", text));
         let ending = contract_line_ending(without_bom);
         let normalized = normalize_contract_line_endings(without_bom);
-        let updated = apply_contract_edits(&normalized, &edits, path_str)?;
+        let updated = apply_contract_edits(&normalized, &edits, path_str, has_raw_bytes)?;
         check_file_operation_cancelled(context)?;
-        let mut final_content = format!(
-            "{bom}{}",
-            restore_line_endings_per_line(without_bom, &normalized, &updated, ending)
-        );
+        let restored = restore_line_endings_per_line(
+            without_bom,
+            &normalized,
+            &updated,
+            ending,
+            has_raw_bytes,
+        )?;
+        check_contract_file_size(
+            bom.len()
+                .saturating_add(contract_encoded_size(&restored, has_raw_bytes)),
+        )?;
+        let mut final_content = format!("{bom}{restored}");
         guard_edit(&file_path, path_str, Some(&raw), &final_content)?;
         if let Some(normalized) = normalize_edit(&file_path, &raw, &final_content).await {
             final_content = normalized;
         }
 
+        check_contract_file_size(contract_encoded_size(&final_content, has_raw_bytes))?;
+        check_file_operation_cancelled(context)?;
         let bytes = if has_raw_bytes {
             encode_lossless_text(&final_content)
         } else {
             final_content.clone().into_bytes()
         };
-        run_blocking_write_atomic(&file_path, bytes.clone()).await?;
+        check_contract_file_size(bytes.len())?;
         check_file_operation_cancelled(context)?;
+        // The mutation worker owns completion after atomic replacement starts.
+        run_blocking_write_atomic(&file_path, bytes.clone()).await?;
         context.note_file_read(&file_path);
         drop(mutation_guard);
 

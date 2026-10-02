@@ -54,6 +54,7 @@ paths             cargo test -p codewhale-paths --lib --locked
 protocol          cargo test -p codewhale-protocol --lib --locked
 release           cargo test -p codewhale-release --lib --locked
 runtime           cargo test -p codewhale-runtime --lib --locked
+sanitize          cargo test -p codewhale-sanitize --lib --locked
 secrets           cargo test -p codewhale-secrets --lib --locked
 state             cargo test -p codewhale-state --lib --locked
 telemetry         cargo test -p codewhale-telemetry --lib --locked
@@ -183,6 +184,7 @@ case $area in
   protocol) pkg=codewhale-protocol ;;
   release) pkg=codewhale-release ;;
   runtime) pkg=codewhale-runtime ;;
+  sanitize) pkg=codewhale-sanitize ;;
   secrets) pkg=codewhale-secrets ;;
   state) pkg=codewhale-state ;;
   telemetry) pkg=codewhale-telemetry ;;

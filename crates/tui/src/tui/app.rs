@@ -49,7 +49,7 @@ use crate::tui::streaming::StreamingState;
 use crate::tui::transcript::TranscriptViewCache;
 use crate::tui::views::ViewStack;
 use codewhale_localization::{Locale, MessageId, resolve_locale, tr};
-use codewhale_models::{Message, SystemPrompt, Tool, Usage};
+use codewhale_models::{ContentBlock, Message, SystemPrompt, Tool, Usage};
 use codewhale_palette::{self as palette, UiTheme};
 
 mod composer;
@@ -95,6 +95,20 @@ pub(crate) struct PendingMcpLogin {
 pub(crate) enum McpLoginProgress {
     AuthorizationUrl(String),
     Finished(Result<(), String>),
+}
+
+/// One `/mcp retry <name>` in flight. The retry runs as an engine op from a
+/// background task, so a running turn queues it in the engine mailbox instead
+/// of parking the UI loop (#6159) or asking the person to press it again; the
+/// outcome lands in `result` and `poll_mcp_retries` reports it.
+pub(crate) struct PendingMcpRetry {
+    pub server: String,
+    /// A turn owned the engine when the retry was requested, so it waits for
+    /// that turn to finish before it connects.
+    pub queued: bool,
+    pub result: std::sync::Arc<
+        std::sync::Mutex<Option<Result<crate::core::ops::McpManagerUpdate, String>>>,
+    >,
 }
 
 impl Drop for PendingMcpLogin {
@@ -173,32 +187,47 @@ pub enum OnboardingState {
     None,
 }
 
+/// Pick the session's primary skills dir. A workspace directory is chosen only
+/// when the workspace-trust gate admits it; an untrusted repository falls back
+/// to the global dir so its skills neither load nor become the install target.
 pub(crate) fn resolve_skills_dir(
     workspace: &Path,
     global_skills_dir: &Path,
     config: &Config,
 ) -> PathBuf {
+    let admitted =
+        |dir: &Path| crate::skills::skills_dir_allowed_by_workspace_trust(workspace, dir);
     if config.skills_config().scan_codewhale_only() {
         if config.skills_dir.is_some() {
             return global_skills_dir.to_path_buf();
         }
         if let Some(codewhale_skills_dir) = crate::skills::codewhale_workspace_skills_dir(workspace)
+            && admitted(&codewhale_skills_dir)
         {
             return codewhale_skills_dir;
         }
         return global_skills_dir.to_path_buf();
     }
 
-    let agents_skills_dir = workspace.join(".agents").join("skills");
-    if agents_skills_dir.exists() {
-        return agents_skills_dir;
+    for local_skills_dir in [
+        workspace.join(".codewhale/skills"),
+        workspace.join(".agents/skills"),
+        workspace.join(".claude/skills"),
+        workspace.join(".opencode/skills"),
+        workspace.join(".cursor/skills"),
+    ] {
+        if local_skills_dir.exists() && admitted(&local_skills_dir) {
+            return local_skills_dir;
+        }
     }
 
-    let local_skills_dir = workspace.join("skills");
-    if local_skills_dir.exists() {
-        return local_skills_dir;
+    let flat = workspace.join("skills");
+    if config.skills_config().flat_workspace_root() && flat.exists() && admitted(&flat) {
+        return flat;
     }
-
+    if global_skills_dir.exists() {
+        return global_skills_dir.to_path_buf();
+    }
     if config.skills_dir.is_none()
         && let Some(global_agents) = crate::skills::agents_global_skills_dir()
         && global_agents.exists()
@@ -951,6 +980,8 @@ impl Default for ComposerState {
 pub struct ViewportState {
     pub transcript_scroll: TranscriptScroll,
     pub pending_scroll_delta: i32,
+    /// Applied inside the next synchronized frame, including resize clears.
+    pub(crate) pending_terminal_size: Option<ratatui::layout::Size>,
     pub mouse_scroll: MouseScrollState,
     pub transcript_cache: TranscriptViewCache,
     pub transcript_selection: TranscriptSelection,
@@ -1008,6 +1039,7 @@ impl Default for ViewportState {
         Self {
             transcript_scroll: TranscriptScroll::to_bottom(),
             pending_scroll_delta: 0,
+            pending_terminal_size: None,
             mouse_scroll: MouseScrollState::new(),
             transcript_cache: TranscriptViewCache::new(),
             transcript_selection: TranscriptSelection::default(),
@@ -1570,6 +1602,10 @@ pub struct App {
     /// that `TurnComplete { error: .. }` would otherwise emit on top of
     /// the in-transcript error cell.
     pub turn_error_posted: bool,
+    /// Text of the error cell posted for the current turn, when
+    /// `turn_error_posted`. A turn that then ends `Failed` persists exactly
+    /// this text, so resume shows what the live transcript showed.
+    pub(crate) turn_error_notice: Option<String>,
     /// Legacy status text sink retained for compatibility with existing call sites.
     pub status_message: Option<String>,
     /// Recent status toasts (ephemeral, newest at back).
@@ -1730,7 +1766,7 @@ pub struct App {
     pub legacy_plugin_tools_dir: Option<PathBuf>,
     pub mcp_config_path: PathBuf,
     pub skills_dir: PathBuf,
-    pub skills_scan_codewhale_only: bool,
+    pub skills_discovery_mode: crate::skills::SkillDiscoveryMode,
     /// Whether the optional project context pack was enabled when this
     /// session loaded its configuration. Context diagnostics consult this
     /// source of truth even before the first system prompt is assembled.
@@ -2134,6 +2170,9 @@ pub struct App {
     pub(crate) current_session_metadata: Option<SessionMetadata>,
     /// Metadata-only registry of large tool outputs produced in this session.
     pub session_artifacts: Vec<ArtifactRecord>,
+    /// Turns in this session that ended `Failed`, persisted with the session
+    /// so the reason survives the TUI closing.
+    pub(crate) session_turn_outcomes: Vec<crate::session_manager::SavedTurnOutcome>,
     /// Trust mode - allow access outside workspace
     pub trust_mode: bool,
     /// Translation mode — when enabled, the model is instructed to respond in
@@ -2295,7 +2334,7 @@ pub struct App {
     /// Last completed reasoning block
     pub last_reasoning: Option<String>,
     /// Tool calls captured for the pending assistant message
-    pub pending_tool_uses: Vec<(String, String, Value)>,
+    pub pending_tool_uses: Vec<ContentBlock>,
     /// One-line permission receipts (`tool_id`, text) for decisions nobody
     /// was prompted for, held until that tool's card completes so the note
     /// lands directly under the card instead of splitting a running tool run.
@@ -2339,6 +2378,10 @@ pub struct App {
     /// DeepSeek account balance, refreshed once per turn completion.
     /// Shared cell updated by background fetch tasks; read lock in the UI thread.
     pub balance_cell: std::sync::Arc<std::sync::Mutex<Option<crate::pricing::BalanceInfo>>>,
+    /// The route `balance_cell` belongs to (provider, endpoint, key
+    /// fingerprint). A route change swaps in a fresh cell; see
+    /// `provider_routes::balance_cell_for_route`.
+    pub balance_route: Option<String>,
     /// Shared cell for async fleet-profile model-draft delivery. A background
     /// task fills it (model label + drafted profile or a failure reason) so
     /// the drafting network call never parks the event loop (#3757 review).
@@ -2384,6 +2427,8 @@ pub struct App {
     /// Discovery, registration and the browser callback all run in the
     /// background. Esc or dropping the app cancels the entire operation.
     pub(crate) mcp_login: Option<PendingMcpLogin>,
+    /// `/mcp retry` requests still waiting on the engine, one per server.
+    pub(crate) mcp_retries: Vec<PendingMcpRetry>,
     /// Shared cell for async prompt suggestion delivery from background task.
     pub prompt_suggestion_cell: std::sync::Arc<std::sync::Mutex<Option<(u64, String)>>>,
     /// Tracks whether the initial balance fetch has been attempted for this session.
@@ -2584,7 +2629,13 @@ pub(crate) struct ToolRunCache {
     pub(crate) threshold: usize,
     pub(crate) mode: ToolCollapseMode,
     pub(crate) calm_mode: bool,
-    pub(crate) runs: Vec<crate::tui::history::ToolRun>,
+    #[cfg(test)]
+    pub(crate) projection_builds: usize,
+    pub(crate) history_len: usize,
+    pub(crate) expanded_runs: HashSet<usize>,
+    pub(crate) summaries: HashMap<usize, (HistoryCell, u64)>,
+    pub(crate) hidden_indices: HashSet<usize>,
+    pub(crate) superseded_todos: HashSet<usize>,
 }
 
 impl Default for ToolRunCache {
@@ -2596,7 +2647,13 @@ impl Default for ToolRunCache {
             threshold: usize::MAX,
             mode: ToolCollapseMode::Expanded,
             calm_mode: false,
-            runs: Vec::new(),
+            #[cfg(test)]
+            projection_builds: 0,
+            history_len: usize::MAX,
+            expanded_runs: HashSet::new(),
+            summaries: HashMap::new(),
+            hidden_indices: HashSet::new(),
+            superseded_todos: HashSet::new(),
         }
     }
 }
@@ -2997,19 +3054,20 @@ impl App {
     fn discover_cached_skills(
         workspace: &std::path::Path,
         skills_dir: &std::path::Path,
-        scan_codewhale_only: bool,
+        discovery_mode: crate::skills::SkillDiscoveryMode,
         plugins: &crate::plugins::PluginRegistry,
     ) -> Vec<(String, String)> {
         crate::skills::discover_for_workspace_and_dir_with_mode_and_plugins(
             workspace,
             skills_dir,
-            crate::skills::SkillDiscoveryMode::from_codewhale_only(scan_codewhale_only),
+            discovery_mode,
             Some(plugins),
         )
         .into_enabled()
         .list()
         .iter()
-        .map(|s| (s.name.clone(), s.description.clone()))
+        .filter(|s| s.invocation.user_invocable())
+        .map(|s| (s.name.clone(), s.user_menu_description()))
         .collect()
     }
 
@@ -3019,7 +3077,7 @@ impl App {
         let cached_skills = Self::discover_cached_skills(
             &self.workspace,
             &skills_dir,
-            self.skills_scan_codewhale_only,
+            self.skills_discovery_mode,
             self.plugin_registry.as_ref(),
         );
         self.hotbar_actions.replace_skills(&cached_skills);
@@ -3818,7 +3876,13 @@ impl App {
     /// contaminate the replacement session after clear/load/new.
     #[must_use]
     pub fn session_transition_blocked(&self) -> bool {
+        // A dispatch still resolving its route, and a locally cancelled turn
+        // whose terminal event has not landed, both belong to this session:
+        // switching now would hand the next session a stale suppression that
+        // cancels its first turn, or a dispatch bound to the old one (U02-10).
         self.is_loading
+            || self.dispatch_in_flight
+            || self.suppress_stream_events_until_turn_complete
             || self.runtime_turn_status.as_deref() == Some("in_progress")
             || self.is_compacting
             || self.manual_compaction_queued
@@ -4782,6 +4846,7 @@ impl App {
         self.context_references_by_cell.clear();
         self.session_context_references.clear();
         self.session_artifacts.clear();
+        self.session_turn_outcomes.clear();
         self.prune_transcript_index_state(0);
         self.history_version = self.history_version.wrapping_add(1);
         self.needs_redraw = true;
@@ -4998,13 +5063,6 @@ impl App {
             .resize_with(self.api_messages.len(), Utc::now);
         self.api_messages_mut().push(message);
         self.api_message_stamps.push(stamp);
-    }
-
-    pub fn pop_api_message(&mut self) -> Option<Message> {
-        self.api_message_stamps
-            .resize_with(self.api_messages.len(), Utc::now);
-        self.api_message_stamps.pop();
-        self.api_messages_mut().pop()
     }
 
     /// `created_at` of each `api_messages` entry, paired positionally.
@@ -5523,11 +5581,20 @@ impl App {
         if let Some(error) = run_failure
             && !already_failed
         {
-            let detail = error
-                .as_deref()
-                .map(str::trim)
-                .filter(|detail| !detail.is_empty());
-            let message = match detail {
+            // The same reason the workbar and the finish row show: a failed
+            // agent's own cause ("Authorization failed: …") when nothing
+            // succeeded, not the run's aggregate summary.
+            let detail = self
+                .workflow_run(event_run_id)
+                .and_then(WorkflowPanel::outcome_reason)
+                .or_else(|| {
+                    error
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|detail| !detail.is_empty())
+                        .map(str::to_string)
+                });
+            let message = match detail.as_deref() {
                 Some(detail) => format!(
                     "{} · {}",
                     self.tr(MessageId::WorkflowRunFailedToast),
@@ -5610,9 +5677,11 @@ impl App {
     /// reuses the card renderer and expands in Transcript mode.
     ///
     /// One row per run: when the call that started the run is already in
-    /// history (its call returned, its record still says running), that card
-    /// becomes the finish — the final state replaces `started` rather than
-    /// stacking a second row under it. The card's tool-detail record is keyed
+    /// history (its call returned, its record still says running) and the
+    /// conversation has not moved past it, that card becomes the finish — the
+    /// final state replaces `started` rather than stacking a second row under
+    /// it. A run that settles after a later user message gets its finish at
+    /// the tail, where it is seen. The card's tool-detail record is keyed
     /// separately and still holds what the model saw.
     ///
     /// While a `workflow` card is still in the active group (a foreground
@@ -5663,26 +5732,40 @@ impl App {
                     )
             })
         };
-        // The returned `start` card for this run, still showing `started`. A
-        // card whose call is still running is left alone: its result would
-        // overwrite the finish.
+        // The card that started this run, when it is still showing `started`
+        // and still in the current exchange. The first card naming a run is
+        // the one that launched it (the id does not exist before `start`); a
+        // later `status` poll returns the same running shape and must not be
+        // mistaken for it. Once the conversation has moved on (a user message
+        // after the card), rewriting a row far up in scrollback would leave
+        // nothing at the tail to say the run settled, so the finish is
+        // appended instead. A card whose call is still running is left alone:
+        // its result would overwrite the finish.
         let start_card = |history: &[HistoryCell], run_id: &str| {
-            history.iter().rposition(|cell| {
+            let first = history.iter().position(|cell| {
                 let HistoryCell::Tool(ToolCell::Generic(tool)) = cell else {
                     return false;
                 };
-                if tool.name != "workflow" || tool.status == ToolStatus::Running {
-                    return false;
-                }
-                record_of(tool).is_some_and(|value| {
-                    value.get("run_id").and_then(serde_json::Value::as_str) == Some(run_id)
-                        && value.get("transcript_line").is_none()
-                        && matches!(
-                            value.get("status").and_then(serde_json::Value::as_str),
-                            None | Some("running" | "pending" | "started")
-                        )
-                })
-            })
+                tool.name == "workflow"
+                    && record_of(tool).is_some_and(|value| {
+                        value.get("run_id").and_then(serde_json::Value::as_str) == Some(run_id)
+                            && value.get("transcript_line").is_none()
+                    })
+            })?;
+            let HistoryCell::Tool(ToolCell::Generic(tool)) = &history[first] else {
+                return None;
+            };
+            let still_started = tool.status != ToolStatus::Running
+                && record_of(tool).is_some_and(|value| {
+                    matches!(
+                        value.get("status").and_then(serde_json::Value::as_str),
+                        None | Some("running" | "pending" | "started")
+                    )
+                });
+            let same_exchange = !history[first + 1..]
+                .iter()
+                .any(|cell| matches!(cell, HistoryCell::User { .. }));
+            (still_started && same_exchange).then_some(first)
         };
         let mut replaced = Vec::new();
         let mut lines = Vec::new();
@@ -5691,10 +5774,13 @@ impl App {
                 continue;
             }
             run.finish_announced = true;
-            let start = start_card(&self.history, &run.run_id);
-            if start.is_none() && card_owns_finish(&self.history, &run.run_id) {
+            // A later card (a `status` poll, a foreground `run`) that returned
+            // the settled record already shows the finish; rewriting the start
+            // card too would say it twice.
+            if card_owns_finish(&self.history, &run.run_id) {
                 continue;
             }
+            let start = start_card(&self.history, &run.run_id);
             let mut output = run.to_run_json();
             output["transcript_line"] = serde_json::Value::from("finished");
             let status = match run.lifecycle {
@@ -5917,16 +6003,16 @@ impl App {
             spacing: self.transcript_spacing,
             palette_mode: self.ui_theme.mode,
             prose_measure: self.prose_measure,
-            reasoning_preview_extra_lines: 0,
-            reasoning_preview_viewport_lines: None,
         }
     }
 
     /// Handle terminal resize event.
-    pub fn handle_resize(&mut self, _width: u16, _height: u16) {
+    pub fn handle_resize(&mut self, width: u16, height: u16) {
         let preserved_scroll = (!self.viewport.transcript_scroll.is_at_tail())
             .then_some(self.viewport.last_transcript_top);
-        self.viewport.transcript_cache = TranscriptViewCache::new();
+        // Wrapped rows already key themselves by width and render options.
+        // Height changes only affect the final reasoning preview (#6652).
+        self.viewport.pending_terminal_size = Some(ratatui::layout::Size::new(width, height));
 
         if let Some(top) = preserved_scroll {
             self.viewport.transcript_scroll = TranscriptScroll::at_line(top);
@@ -5940,12 +6026,12 @@ impl App {
         self.viewport.last_transcript_top = 0;
         // Seed visible height from the resize event so paging keys use a
         // useful page size immediately, before the next render updates it.
-        self.viewport.last_transcript_visible = (_height as usize).saturating_sub(2).max(1);
+        self.viewport.last_transcript_visible = (height as usize).saturating_sub(2).max(1);
         self.viewport.last_transcript_total = 0;
         self.viewport.last_transcript_padding_top = 0;
         self.viewport.jump_to_latest_button_area = None;
 
-        self.mark_history_updated();
+        self.needs_redraw = true;
     }
 
     pub fn scroll_up(&mut self, amount: usize) {

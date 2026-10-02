@@ -425,6 +425,10 @@ fn redact_absolute_paths(text: &str) -> String {
     let res = regex_cache(
         &PATTERNS,
         [
+            // Windows UNC and extended paths reveal server/share names.
+            r"(^|[^A-Za-z0-9_\\])(\\\\(?:\?\\)?[^\\/\s]+\\[^\\/\s]+(?:\\[^\\/\s]*)*)",
+            // Leave the double slash after a URL scheme alone.
+            r"(^|[^A-Za-z0-9_:/])(//[^/\s]+/[^/\s]+(?:/[^/\s]*)*)",
             // POSIX: at least two components so a bare `/tmp` or a lone
             // slash in prose is not mangled.
             r"(^|[^A-Za-z0-9_:/\\])((?:/[A-Za-z0-9._~%+@\-]+){2,}/?)",
@@ -689,5 +693,23 @@ mod tests {
     fn empty_input_still_yields_a_headline() {
         let payload = NotificationPayload::turn_complete("   \n  ");
         assert_eq!(payload.headline(), FALLBACK_HEADLINE);
+    }
+    #[test]
+    fn notification_payload_masks_unc_server_share_and_directories() {
+        for path in [
+            r"\\fileserver\share\clients\case.txt",
+            r"\\?\C:\Users\fixture\clients\case.txt",
+            "//fileserver/share/clients/case.txt",
+        ] {
+            let payload =
+                NotificationPayload::turn_complete("Turn complete").with_preview(Some(path));
+            let preview = payload.preview().expect("preview");
+            assert_eq!(preview, "…/case.txt");
+            assert!(!preview.contains("fileserver"));
+            assert!(!preview.contains("clients"));
+        }
+        let payload = NotificationPayload::turn_complete("Turn complete")
+            .with_preview(Some("see https://example.com/docs/page"));
+        assert_eq!(payload.preview(), Some("see https://example.com/docs/page"));
     }
 }

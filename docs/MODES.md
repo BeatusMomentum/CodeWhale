@@ -192,10 +192,11 @@ Legacy note: `/set approval_mode ...` was retired in favor of `/config`.
 - `suggest` (**Ask**, default): tool approvals may interrupt, and Codewhale asks
   when an unresolved user choice materially changes authority, cost, scope, or
   outcome.
-- `auto` (**Auto-Review**): the fully autonomous posture. It never opens a user
-  question; the model resolves ambiguity from context, chooses a safe reversible
-  interpretation, or reports that it cannot proceed safely. Tool safety holds
-  remain separate from user questions. Two layers decide approvals. The
+- `auto` (**Auto-Review**): reviews tool calls automatically. Deliberate user
+  questions remain available in interactive sessions through `request_user_input`;
+  a question parks the turn until answered, canceled, or its configured timeout
+  expires. Headless `exec` withholds that tool because it has no responder.
+  Tool safety holds remain separate from user questions. Two layers decide approvals. The
   **deterministic floor** (configured block rules plus the built-in safety
   floor) allows proven-safe calls and hard-blocks publish-like actions and
   destructive background/headless work; it is never model-reviewed. Fallback
@@ -228,8 +229,8 @@ also has no LLM reviewer. Its ordered
 [permission policy](https://github.com/MoonshotAI/kimi-code/blob/1414d4602898f406e540b23342cb18db23ff9efc/packages/agent-core-v2/src/agent/permissionPolicy/permissionPolicyService.ts)
 applies explicit deny rules and then its
 [Auto policy](https://github.com/MoonshotAI/kimi-code/blob/1414d4602898f406e540b23342cb18db23ff9efc/packages/agent-core-v2/src/agent/permissionPolicy/policies/auto-mode-approve.ts)
-returns `approve` directly. Codewhale borrows Kimi's no-question autonomous UX,
-not that blanket approval rule.
+returns `approve` directly. Codewhale uses the deterministic floor and guardian
+described above, while keeping deliberate user questions available.
 
 The sandbox and escalation baseline is grounded in DeepSeek Harness
 `0.1.0-rc.5` at

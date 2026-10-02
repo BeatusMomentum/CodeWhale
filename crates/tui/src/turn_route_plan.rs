@@ -112,15 +112,16 @@ fn reasoning_effort_for_route_selection(
     }
 }
 
+/// Settle the classifier usage of a turn whose route then failed, into the
+/// cost scope that was current when the classifier call was made. A fresh
+/// token taken here would bill it to whatever session is current by now:
+/// after a `/new` or session load during the call, a different one.
 fn settle_failed_parent_route(
+    cost_scope: crate::cost_status::CostScopeToken,
     error: String,
     initial_routed_usage: &crate::cost_status::RuntimeUsageBatch,
 ) -> String {
-    crate::cost_status::report_runtime_usage_batch(
-        crate::cost_status::scope_token(),
-        None,
-        initial_routed_usage,
-    );
+    crate::cost_status::report_runtime_usage_batch(cost_scope, None, initial_routed_usage);
     error
 }
 
@@ -141,6 +142,9 @@ fn settle_failed_parent_route(
 pub(crate) async fn plan_turn_route(
     request: TurnRoutePlanRequest<'_>,
 ) -> Result<PlannedTurnRoute, String> {
+    // Taken before the classifier call so its usage settles into the scope
+    // it was spent in, not the one current when a failure is noticed.
+    let cost_scope = crate::cost_status::scope_token();
     let mut auto_selection = if request.should_auto_resolve {
         Some(
             crate::model_routing::resolve_auto_route_with_inventory_for_session_and_cache_policy(
@@ -186,6 +190,7 @@ pub(crate) async fn plan_turn_route(
     let initial_routed_usage = auto_selection
         .as_mut()
         .map(|selection| crate::cost_status::RuntimeUsageBatch {
+            decisions: Vec::new(),
             records: std::mem::take(&mut selection.routed_usage),
             drop_records: std::mem::take(&mut selection.routed_usage_drop_records),
             dropped_records: std::mem::take(&mut selection.routed_usage_dropped_records),
@@ -210,6 +215,7 @@ pub(crate) async fn plan_turn_route(
         Ok(route) => route,
         Err(err) => {
             return Err(settle_failed_parent_route(
+                cost_scope,
                 err.to_string(),
                 &initial_routed_usage,
             ));
@@ -219,7 +225,11 @@ pub(crate) async fn plan_turn_route(
         match turn_route.preflight() {
             Ok(route) => route,
             Err(err) => {
-                return Err(settle_failed_parent_route(err, &initial_routed_usage));
+                return Err(settle_failed_parent_route(
+                    cost_scope,
+                    err,
+                    &initial_routed_usage,
+                ));
             }
         }
     } else {
@@ -339,6 +349,7 @@ mod tests {
             chrono::Utc::now(),
         );
         let batch = crate::cost_status::RuntimeUsageBatch {
+            decisions: Vec::new(),
             records: vec![crate::cost_status::RuntimeUsageRecord {
                 source_id: "auto-router:plan-usage".to_string(),
                 usage: crate::cost_status::EffectiveRouteUsage {
@@ -357,16 +368,43 @@ mod tests {
             dropped_records: 1,
         };
 
+        let scope = crate::cost_status::scope_token();
         assert_eq!(
-            settle_failed_parent_route("route failed".to_string(), &batch),
+            settle_failed_parent_route(scope, "route failed".to_string(), &batch),
             "route failed"
         );
-        settle_failed_parent_route("route failed".to_string(), &batch);
+        settle_failed_parent_route(scope, "route failed".to_string(), &batch);
         let pending = crate::cost_status::drain();
         assert_eq!(
             pending.usage_source_fingerprints.len(),
             2,
             "both exact classifier outcomes persist, and replay is idempotent"
+        );
+
+        // The classifier ran in one session; `/new` closed it before the
+        // route failed. Its cost belongs to the closed session, never the new.
+        let spent_in = crate::cost_status::scope_token();
+        let _closed = crate::cost_status::close_current_scope();
+        let batch = crate::cost_status::RuntimeUsageBatch {
+            decisions: Vec::new(),
+            records: batch
+                .records
+                .iter()
+                .cloned()
+                .map(|mut record| {
+                    record.source_id = "auto-router:plan-usage-after-new".to_string();
+                    record
+                })
+                .collect(),
+            drop_records: Vec::new(),
+            dropped_records: 0,
+        };
+        settle_failed_parent_route(spent_in, "route failed".to_string(), &batch);
+        assert!(
+            crate::cost_status::drain()
+                .usage_source_fingerprints
+                .is_empty(),
+            "classifier cost leaked into the session opened after it was spent"
         );
     }
 

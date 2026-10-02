@@ -82,15 +82,26 @@ async fn engine_cancel_stops_started_foreground_descendants_and_preserves_backgr
     handle.cancel();
 
     let mut receipts = Vec::new();
+    let mut foreground_execution_id = None;
     let mut skipped = false;
     tokio::time::timeout(Duration::from_secs(10), async {
         let mut events = handle.rx_event.write().await;
         loop {
             match events.recv().await.expect("engine remains alive") {
-                Event::ToolCallComplete { id, result, .. } if id == "call-foreground" => {
+                Event::ToolCallComplete {
+                    id,
+                    result,
+                    model_call: Some(model_call),
+                    ..
+                } if model_call.provider_id == "call-foreground" => {
+                    foreground_execution_id = Some(id);
                     receipts.push(result.expect("model-visible cancellation receipt"));
                 }
-                Event::ToolCallComplete { id, result, .. } if id == "call-skipped" => {
+                Event::ToolCallComplete {
+                    model_call: Some(model_call),
+                    result,
+                    ..
+                } if model_call.provider_id == "call-skipped" => {
                     let result = result.unwrap();
                     assert_eq!(result.metadata.unwrap()["executed"], false);
                     assert!(result.content.contains("before this tool ran"));
@@ -135,7 +146,7 @@ async fn engine_cancel_stops_started_foreground_descendants_and_preserves_backgr
         let jobs = manager.list_jobs_for_session(&session_id);
         let foreground = jobs
             .iter()
-            .find(|job| job.origin_tool_call_id.as_deref() == Some("call-foreground"))
+            .find(|job| job.origin_tool_call_id.as_deref() == foreground_execution_id.as_deref())
             .expect("the exact foreground owner remains inspectable");
         assert_eq!(foreground.status, crate::tools::shell::ShellStatus::Killed);
         assert!(foreground.stdout_tail.contains("foreground-started"));
@@ -263,7 +274,11 @@ async fn returned_tool_failure_reaches_next_model_request_as_error() {
     let mut events = handle.rx_event.write().await;
     let results = std::iter::from_fn(|| events.try_recv().ok())
         .filter_map(|event| match event {
-            Event::ToolCallComplete { id, result, .. } => Some((id, result)),
+            Event::ToolCallComplete {
+                model_call: Some(model_call),
+                result,
+                ..
+            } => Some((model_call.provider_id, result)),
             _ => None,
         })
         .collect::<Vec<_>>();

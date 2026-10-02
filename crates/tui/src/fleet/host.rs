@@ -220,6 +220,14 @@ impl LocalProcessFleetHostAdapter {
                     request.worker_id
                 )));
             }
+            // A draining worker's dispatcher exited but its tree still runs;
+            // forgetting it here would overlap a replacement with it.
+            if matches!(status.state, FleetHostWorkerState::Draining) {
+                return Err(FleetHostError::retryable(format!(
+                    "worker {} is still draining; stop it before starting a replacement",
+                    request.worker_id
+                )));
+            }
             self.processes.remove(&request.worker_id);
         }
 
@@ -440,9 +448,10 @@ impl FleetHostAdapter for LocalProcessFleetHostAdapter {
             .get(worker_id)
             .map(|process| process.request.clone())
             .ok_or_else(|| FleetHostError::terminal(format!("unknown worker {worker_id}")))?;
-        let _ = self.stop_worker(worker_id);
-        self.processes.remove(worker_id);
-        self.start_worker(request)
+        restart_after_confirmed_stop(self, worker_id, |adapter| {
+            adapter.processes.remove(worker_id);
+            adapter.start_worker(request)
+        })
     }
 
     fn stop_worker(&mut self, worker_id: &str) -> FleetHostResult<FleetHostWorkerStatus> {
@@ -561,6 +570,13 @@ impl SshFleetHostConfig {
                 "SSH Fleet host requires an explicit host",
             ));
         }
+        // The destination is a single ssh argument. A leading '-' would be read
+        // as an ssh option, and whitespace/control characters would change what
+        // ssh or the remote shell receives.
+        validate_ssh_destination_part("host", &self.host)?;
+        if let Some(user) = self.user.as_ref().filter(|user| !user.trim().is_empty()) {
+            validate_ssh_destination_part("user", user)?;
+        }
         if self.codewhale_binary.trim().is_empty() {
             return Err(FleetHostError::configuration(
                 "SSH Fleet host requires an explicit codewhale binary path",
@@ -663,6 +679,8 @@ impl SshFleetHostAdapter {
             args.push("-i".to_string());
             args.push(identity.display().to_string());
         }
+        // End option parsing so the destination can never be read as an option.
+        args.push("--".to_string());
         args.push(self.config.target());
         args.push(self.remote_command(request));
         Ok(FleetWorkerCommand::new(
@@ -730,9 +748,10 @@ impl FleetHostAdapter for SshFleetHostAdapter {
             .get(worker_id)
             .map(|process| process.request.clone())
             .ok_or_else(|| FleetHostError::terminal(format!("unknown worker {worker_id}")))?;
-        let _ = self.stop_worker(worker_id);
-        self.local.processes.remove(worker_id);
-        self.local.start_with_kind(request, FleetHostKind::Ssh)
+        restart_after_confirmed_stop(self, worker_id, |adapter| {
+            adapter.local.processes.remove(worker_id);
+            adapter.local.start_with_kind(request, FleetHostKind::Ssh)
+        })
     }
 
     fn stop_worker(&mut self, worker_id: &str) -> FleetHostResult<FleetHostWorkerStatus> {
@@ -742,6 +761,51 @@ impl FleetHostAdapter for SshFleetHostAdapter {
     fn cleanup_worker(&mut self, worker_id: &str) -> FleetHostResult<()> {
         self.local.cleanup_worker(worker_id)
     }
+}
+
+/// Restart policy shared by the process-backed adapters. The previous worker
+/// is released — and `replace` spawns its successor — only once a stop has
+/// confirmed the whole worker tree is gone. A failed or unconfirmed stop keeps
+/// the old handle so status, logs, and cleanup still reach a worker that may
+/// be running, and no replacement starts beside it (duplicate execution). The
+/// process-tree lifecycle in `stop_worker` stays the authority on "gone".
+///
+/// Known limitations:
+/// - For [`SshFleetHostAdapter`], "confirmed stopped" proves only that the
+///   local `ssh` client's process tree is gone. The remote `codewhale`
+///   process is not observed: if the remote side does not tear the command
+///   down when the connection drops, a restart can start a second remote
+///   worker beside it.
+/// - `start_worker` on an id the adapter still holds refuses only `Running`
+///   and `Draining` (see `LocalProcessFleetHostAdapter::start_with_kind`),
+///   while this restart also refuses `Unknown`. The process-backed adapters
+///   never report `Unknown`, so the gap is latent; an adapter that does must
+///   refuse `Unknown` in its start path too, or a start can overlap a worker
+///   in an unknown state.
+fn restart_after_confirmed_stop<A: FleetHostAdapter>(
+    adapter: &mut A,
+    worker_id: &str,
+    replace: impl FnOnce(&mut A) -> FleetHostResult<FleetWorkerHandle>,
+) -> FleetHostResult<FleetWorkerHandle> {
+    let stopped = adapter.stop_worker(worker_id).map_err(|err| FleetHostError {
+        kind: err.kind,
+        message: format!(
+            "restart of worker {worker_id} refused: the previous worker was not confirmed stopped ({})",
+            err.message
+        ),
+    })?;
+    if matches!(
+        stopped.state,
+        FleetHostWorkerState::Running
+            | FleetHostWorkerState::Draining
+            | FleetHostWorkerState::Unknown
+    ) {
+        return Err(FleetHostError::retryable(format!(
+            "restart of worker {worker_id} refused: the previous worker is still {:?} after stop",
+            stopped.state
+        )));
+    }
+    replace(adapter)
 }
 
 fn open_worker_log(path: &Path) -> FleetHostResult<File> {
@@ -1405,6 +1469,28 @@ fn filtered_env(
         .collect())
 }
 
+/// Characters OpenSSH itself refuses in a command-line user or host name
+/// because an `ssh_config` `%h`/`%r` expansion can hand them to a shell.
+const SSH_DESTINATION_METACHARACTERS: &str = "'`\"$\\;&<>|(){}";
+
+fn validate_ssh_destination_part(label: &str, value: &str) -> FleetHostResult<()> {
+    let allowed = |ch: char| {
+        if label == "host" {
+            // Host names, IPv4/IPv6 literals (with a zone id) and ssh_config
+            // aliases. `@` would move the user/host split.
+            ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_' | ':' | '%')
+        } else {
+            ch.is_ascii_graphic() && !SSH_DESTINATION_METACHARACTERS.contains(ch)
+        }
+    };
+    if value.starts_with('-') || !value.chars().all(allowed) {
+        return Err(FleetHostError::configuration(format!(
+            "SSH Fleet {label} must not start with '-' or contain whitespace, control, non-ASCII or shell characters"
+        )));
+    }
+    Ok(())
+}
+
 fn validate_env_allowlist(allowlist: &BTreeSet<String>) -> FleetHostResult<()> {
     for key in allowlist {
         if !is_safe_env_key(key) {
@@ -1443,19 +1529,24 @@ fn ssh_client_env() -> BTreeMap<String, String> {
 }
 
 fn process_base_env() -> BTreeMap<String, String> {
-    let mut env = BTreeMap::new();
-    for key in [
-        "HOME",
-        "PATH",
-        "SYSTEMROOT",
-        "SystemRoot",
-        "COMSPEC",
-        "ComSpec",
-    ] {
-        if let Ok(value) = std::env::var(key) {
-            env.insert(key.to_string(), value);
-        }
-    }
+    base_env_from(std::env::vars_os())
+}
+
+/// The worker's inherited environment: the repository's scrubbed child-env
+/// allowlist (`child_env`), so proxy routing, CA bundles, temp directories,
+/// Windows system/profile roots, locale and toolchain paths survive
+/// `env_clear()` while provider keys and other secret-shaped names do not.
+/// Proxy URLs keep their credentials for the worker process itself; see
+/// [`crate::child_env::sanitized_runtime_env_from`] for that policy.
+fn base_env_from<K, V>(parent: impl IntoIterator<Item = (K, V)>) -> BTreeMap<String, String>
+where
+    K: AsRef<std::ffi::OsStr>,
+    V: AsRef<std::ffi::OsStr>,
+{
+    let mut env: BTreeMap<String, String> = crate::child_env::sanitized_runtime_env_from(parent)
+        .into_iter()
+        .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
+        .collect();
     force_worker_telemetry_off(&mut env);
     env
 }
@@ -1987,6 +2078,95 @@ mod tests {
         adapter.stop_worker("local-restart").unwrap();
     }
 
+    /// A host whose stop outcome is scripted: `None` fails the stop, `Some`
+    /// reports that state. Only the restart path is exercised.
+    struct ScriptedStopHost {
+        stop_state: Option<FleetHostWorkerState>,
+        owned: bool,
+        spawned: usize,
+    }
+
+    impl FleetHostAdapter for ScriptedStopHost {
+        fn start_worker(
+            &mut self,
+            request: FleetWorkerStartRequest,
+        ) -> FleetHostResult<FleetWorkerHandle> {
+            self.spawned += 1;
+            self.owned = true;
+            Ok(FleetWorkerHandle {
+                worker_id: request.worker_id,
+                host_kind: FleetHostKind::LocalProcess,
+                pid: None,
+                log_path: PathBuf::new(),
+            })
+        }
+        fn read_status(&mut self, _: &str) -> FleetHostResult<FleetHostWorkerStatus> {
+            unreachable!("restart must not consult status outside stop")
+        }
+        fn read_logs(&self, _: &str, _: usize) -> FleetHostResult<String> {
+            unreachable!()
+        }
+        fn interrupt_worker(&mut self, _: &str) -> FleetHostResult<FleetHostWorkerStatus> {
+            unreachable!()
+        }
+        fn restart_worker(&mut self, worker_id: &str) -> FleetHostResult<FleetWorkerHandle> {
+            restart_after_confirmed_stop(self, worker_id, |host| {
+                host.owned = false;
+                host.start_worker(FleetWorkerStartRequest::new(
+                    worker_id,
+                    shell_command("true"),
+                ))
+            })
+        }
+        fn stop_worker(&mut self, worker_id: &str) -> FleetHostResult<FleetHostWorkerStatus> {
+            let Some(state) = self.stop_state else {
+                return Err(FleetHostError::retryable(
+                    "Fleet session still has a live tracked leader after SIGKILL",
+                ));
+            };
+            Ok(FleetHostWorkerStatus {
+                worker_id: worker_id.to_string(),
+                state,
+                pid: Some(4242),
+                exit_code: None,
+                memory_mb: None,
+                retryable: false,
+            })
+        }
+        fn cleanup_worker(&mut self, _: &str) -> FleetHostResult<()> {
+            unreachable!()
+        }
+    }
+
+    #[test]
+    fn fleet_host_restart_keeps_the_old_worker_when_stop_is_unconfirmed() {
+        for stop_state in [None, Some(FleetHostWorkerState::Draining)] {
+            let mut host = ScriptedStopHost {
+                stop_state,
+                owned: true,
+                spawned: 0,
+            };
+            let err = host
+                .restart_worker("overlap")
+                .expect_err("an unconfirmed stop must refuse the restart");
+            assert!(err.message.contains("refused"), "{}", err.message);
+            assert_eq!(
+                host.spawned, 0,
+                "no replacement may start beside a surviving worker ({stop_state:?})"
+            );
+            assert!(host.owned, "the old worker's handle is kept");
+        }
+
+        let mut host = ScriptedStopHost {
+            stop_state: Some(FleetHostWorkerState::Stopped),
+            owned: true,
+            spawned: 0,
+        };
+        host.restart_worker("overlap")
+            .expect("a confirmed stop restarts");
+        assert_eq!(host.spawned, 1);
+    }
+
     #[cfg(unix)]
     #[test]
     fn fleet_host_local_adapter_reports_running_worker_memory_usage() {
@@ -2103,6 +2283,126 @@ mod tests {
         assert!(argv.contains("/usr/local/bin/codewhale"));
         assert!(argv.contains("fleet-worker"));
         assert!(!argv.contains("super-secret-profile-value"));
+        // Option parsing ends right before the destination.
+        let target = command
+            .args
+            .iter()
+            .position(|arg| arg == "fleet@builder.example.test")
+            .expect("destination argument");
+        assert_eq!(command.args[target - 1], "--");
+    }
+
+    #[test]
+    fn fleet_host_ssh_refuses_option_like_or_malformed_destination() {
+        let tmp = TempDir::new().unwrap();
+        for host in [
+            "-oProxyCommand=true",
+            "builder example.test",
+            "builder\nexample.test",
+            "builder\0example.test",
+            "builder;true",
+            "builder$(true)",
+            "builder`true`",
+            "fleet@builder.example.test",
+            "builder\u{202e}.example.test",
+        ] {
+            let config = SshFleetHostConfig::new(host, "/srv/codewhale");
+            let err = SshFleetHostAdapter::new(tmp.path(), config)
+                .expect_err("malformed SSH host must be refused");
+            assert_eq!(err.kind, FleetHostErrorKind::Configuration, "{host:?}");
+            assert!(err.message.contains("SSH Fleet host"), "{}", err.message);
+        }
+        for user in [
+            "-oProxyCommand=true",
+            "fleet user",
+            "fleet\tuser",
+            "fleet\0user",
+            "fleet;true",
+            "fleet$(true)",
+            "fleet|true",
+            "fl\u{e9}et",
+        ] {
+            let mut config = SshFleetHostConfig::new("builder.example.test", "/srv/codewhale");
+            config.user = Some(user.to_string());
+            let err = SshFleetHostAdapter::new(tmp.path(), config)
+                .expect_err("malformed SSH user must be refused");
+            assert_eq!(err.kind, FleetHostErrorKind::Configuration, "{user:?}");
+            assert!(err.message.contains("SSH Fleet user"), "{}", err.message);
+        }
+        let spec = FleetHostSpec::Ssh {
+            host: "-oProxyCommand=true".to_string(),
+            port: None,
+            user: None,
+            identity: None,
+            known_hosts: None,
+            host_key_fingerprint: None,
+            working_directory: Some(PathBuf::from("/srv/codewhale")),
+            env_allowlist: Vec::new(),
+            codewhale_binary: Some("codewhale".to_string()),
+        };
+        assert!(SshFleetHostConfig::from_host_spec(&spec).is_err());
+
+        // Ordinary destinations stay accepted, including a directory-style
+        // user name and IPv6 literals with a zone id.
+        for (user, host) in [
+            (Some("fleet"), "builder.example.test"),
+            (Some("alice@corp.example"), "10.0.0.7"),
+            (None, "fe80::1%en0"),
+            (Some("ci_bot-2"), "build_box-01"),
+        ] {
+            let mut config = SshFleetHostConfig::new(host, "/srv/codewhale");
+            config.user = user.map(str::to_string);
+            SshFleetHostAdapter::new(tmp.path(), config)
+                .unwrap_or_else(|err| panic!("{user:?}@{host} must be accepted: {err:?}"));
+        }
+    }
+
+    #[test]
+    fn worker_base_env_uses_the_child_env_allowlist_and_keeps_proxy_route() {
+        let parent = [
+            ("HTTPS_PROXY", "http://fleet:pass@proxy.example.test:8080"),
+            ("no_proxy", "localhost"),
+            ("SSL_CERT_FILE", "/etc/ssl/corp.pem"),
+            ("CURL_CA_BUNDLE", "/etc/ssl/corp.pem"),
+            ("REQUESTS_CA_BUNDLE", "/etc/ssl/corp.pem"),
+            ("NODE_EXTRA_CA_CERTS", "/etc/ssl/corp.pem"),
+            ("PATHEXT", ".COM;.EXE;.BAT"),
+            ("WINDIR", "C:\\Windows"),
+            ("ProgramFiles", "C:\\Program Files"),
+            ("USERPROFILE", "C:\\Users\\fleet"),
+            ("TEMP", "C:\\Temp"),
+            ("USER", "fleet"),
+            ("TERM", "xterm-256color"),
+            ("CARGO_HOME", "/home/fleet/.cargo"),
+            ("CARGO_TARGET_DIR", "/tmp/target"),
+            ("DEEPSEEK_API_KEY", "secret"),
+            ("GITHUB_TOKEN", "secret"),
+            ("AWS_SECRET_ACCESS_KEY", "secret"),
+            ("CARGO_REGISTRY_TOKEN", "secret"),
+            ("DATABASE_URL", "postgres://u:secret@db/app"),
+            ("CODEWHALE_TELEMETRY", "true"),
+        ];
+        let env = base_env_from(parent);
+        for (key, value) in &parent[..15] {
+            assert_eq!(
+                env.get(*key).map(String::as_str),
+                Some(*value),
+                "{key} must reach the worker unchanged"
+            );
+        }
+        for key in [
+            "DEEPSEEK_API_KEY",
+            "GITHUB_TOKEN",
+            "AWS_SECRET_ACCESS_KEY",
+            "CARGO_REGISTRY_TOKEN",
+            "DATABASE_URL",
+        ] {
+            assert!(!env.contains_key(key), "{key} must not reach the worker");
+        }
+        assert_eq!(
+            env.get("CODEWHALE_TELEMETRY").map(String::as_str),
+            Some("false")
+        );
     }
 
     #[test]
@@ -2159,23 +2459,26 @@ mod tests {
 
     #[test]
     fn runtime_surface_review_documented_ssh_host_loads() {
-        // Windows checkouts may carry CRLF line endings.
-        let docs = include_str!("../../../../docs/zh_hans/FLEET.md").replace("\r\n", "\n");
-        let example = docs
-            .split_once("### Worker 认证")
-            .expect("worker authentication guidance")
-            .1
-            .split("```json\n")
-            .skip(1)
-            .filter_map(|block| {
-                serde_json::from_str::<serde_json::Value>(block.split("```").next()?).ok()
-            })
-            .find(|value| value["id"] == "builder-1")
-            .expect("documented SSH worker example");
-        let host: FleetHostSpec = serde_json::from_value(example["host"].clone()).unwrap();
-        let config = SshFleetHostConfig::from_host_spec(&host)
-            .expect("documented host must load without migration errors");
-        assert!(config.known_hosts.is_some());
+        for docs in [
+            include_str!("../../../../docs/FLEET.md"),
+            include_str!("../../../../docs/zh_hans/FLEET.md"),
+        ] {
+            // Match the actual example, not a translated section heading.
+            // Windows checkouts may carry CRLF line endings.
+            let docs = docs.replace("\r\n", "\n");
+            let example = docs
+                .split("```json\n")
+                .skip(1)
+                .filter_map(|block| {
+                    serde_json::from_str::<serde_json::Value>(block.split("```").next()?).ok()
+                })
+                .find(|value| value["id"] == "builder-1")
+                .expect("documented SSH worker example");
+            let host: FleetHostSpec = serde_json::from_value(example["host"].clone()).unwrap();
+            let config = SshFleetHostConfig::from_host_spec(&host)
+                .expect("documented host must load without migration errors");
+            assert!(config.known_hosts.is_some());
+        }
     }
 
     #[test]

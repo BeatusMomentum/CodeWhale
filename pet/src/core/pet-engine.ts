@@ -225,6 +225,9 @@ export class PetEngineTelemetry {
     return next;
   }
 
+  /** Mutates in place: clock, freshness and the event window change before
+   * type-specific fields are checked. Callers that continue after a throw must
+   * observe on a clone() and swap it in on success, as PetNative does. */
   observe(value: unknown, at: number): void {
     if (!Number.isFinite(at) || at < this.lastTime || at > PET_MAX_SECONDS * 1000)
       throw new Error('Invalid Engine pet clock.');

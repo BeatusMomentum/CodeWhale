@@ -263,6 +263,7 @@ fn contract_bash_nonzero_is_an_error_with_status_after_output() {
         },
         None,
         &ToolContext::new("."),
+        None,
     )
     .expect_err("nonzero must be a failed tool call");
     assert!(
@@ -290,6 +291,250 @@ async fn lowercase_bash_returns_one_ordered_stream() {
         .await
         .expect("bash");
     assert_eq!(result.content, "out-1err-2out-3");
+}
+
+/// #6689: the receipt is exact-or-absent, fits the hook bound after JSON
+/// escaping, and reports how the run ended without inventing an exit code.
+#[test]
+fn execution_receipt_is_bounded_and_reports_truthful_state() {
+    let tmp = tempdir().unwrap();
+    let identity = |command: &str, cwd: &Path| ShellExecutionIdentity {
+        command: command.to_string(),
+        cwd: cwd.to_path_buf(),
+    };
+    let cwd = tmp.path().canonicalize().unwrap();
+    let mut result = failed_network_shell_result(
+        &"\u{1f40b}\n\"\u{1}".repeat(12_000),
+        &"err\n".repeat(12_000),
+    );
+    result.sandboxed = false;
+    result.sandbox_type = None;
+    result.stdout_truncated = true;
+    result.exit_code = None;
+    result.status = ShellStatus::Killed;
+
+    let receipt = shell_execution_receipt(&identity("printf hi", &cwd), &result, "separate")
+        .expect("receipt");
+    let encoded = serde_json::to_string(&receipt).unwrap();
+    assert!(encoded.len() <= crate::hooks::HOOK_EXECUTION_RECEIPT_MAX_BYTES);
+    assert_eq!(serde_json::from_str::<Value>(&encoded).unwrap(), receipt);
+    assert_eq!(receipt["schema_version"], 1);
+    assert_eq!(receipt["command"], "printf hi");
+    assert_eq!(receipt["cwd"], cwd.to_str().unwrap());
+    assert_eq!(receipt["state"], "interrupted");
+    assert!(receipt["exit_code"].is_null());
+    assert_eq!(receipt["stdout_truncated"], true);
+    assert_eq!(receipt["stderr_truncated"], true);
+    assert!(
+        receipt["stderr"]
+            .as_str()
+            .unwrap()
+            .contains("[receipt preview truncated]")
+    );
+
+    // A nonzero exit is a completed run, and a 64-bit code survives.
+    result.status = ShellStatus::Failed;
+    result.exit_code = Some(3_221_225_477);
+    let receipt = shell_execution_receipt(&identity("x", &cwd), &result, "combined").unwrap();
+    assert_eq!(receipt["state"], "completed");
+    assert_eq!(receipt["exit_code"], 3_221_225_477_i64);
+    assert_eq!(receipt["output_kind"], "combined");
+
+    result.status = ShellStatus::TimedOut;
+    result.exit_code = None;
+    let receipt = shell_execution_receipt(&identity("x", &cwd), &result, "separate").unwrap();
+    assert_eq!(receipt["state"], "interrupted");
+
+    // Absent, never truncated or guessed.
+    result.status = ShellStatus::Running;
+    assert!(shell_execution_receipt(&identity("x", &cwd), &result, "separate").is_none());
+    result.status = ShellStatus::Completed;
+    for command in ["", "bad\0command"] {
+        assert!(shell_execution_receipt(&identity(command, &cwd), &result, "separate").is_none());
+    }
+    let long = "x".repeat(EXECUTION_RECEIPT_IDENTITY_MAX_BYTES + 1);
+    assert!(shell_execution_receipt(&identity(&long, &cwd), &result, "separate").is_none());
+    let long_cwd = PathBuf::from(format!("/{long}"));
+    assert!(shell_execution_receipt(&identity("x", &long_cwd), &result, "separate").is_none());
+    assert!(
+        shell_execution_receipt(&identity("x", Path::new("relative")), &result, "separate")
+            .is_none()
+    );
+    result.sandboxed = true;
+    assert!(shell_execution_receipt(&identity("x", &cwd), &result, "separate").is_none());
+}
+
+/// #6689: a settled foreground run records the command and directory the
+/// process manager spawned, on success and on failure, and background runs
+/// carry no receipt. The workspace is opened through a symlink so the default
+/// directory and an explicit `cwd` would otherwise be spelled differently.
+#[cfg(unix)]
+#[tokio::test]
+async fn foreground_shell_results_carry_the_spawned_execution_receipt() {
+    let tmp = tempdir().unwrap();
+    let real = tmp.path().join("real");
+    std::fs::create_dir_all(real.join("child")).unwrap();
+    let workspace = tmp.path().join("link");
+    std::os::unix::fs::symlink(&real, &workspace).unwrap();
+    let mut context = ToolContext::new(workspace.clone())
+        .with_elevated_sandbox_policy(ExecutionSandboxPolicy::DangerFullAccess);
+    context.auto_approve = true;
+    let tool = BashTool::new("Bash");
+
+    // No completion hook registered: nothing reads a receipt, so none rides
+    // along in the metadata the Runtime API persists.
+    let unobserved = tool
+        .execute(json!({"command": "pwd"}), &context)
+        .await
+        .unwrap();
+    assert!(
+        unobserved
+            .metadata
+            .as_ref()
+            .unwrap()
+            .get("execution_receipt")
+            .is_none()
+    );
+
+    let hooks = crate::hooks::HookExecutor::new(
+        crate::hooks::HooksConfig {
+            enabled: true,
+            hooks: vec![crate::hooks::Hook::new(
+                crate::hooks::HookEvent::ToolCallAfter,
+                "true",
+            )],
+            ..crate::hooks::HooksConfig::default()
+        },
+        workspace.clone(),
+    );
+    context.runtime.hook_executor = Some(std::sync::Arc::new(hooks));
+    // Exact strings, not re-canonicalized: both spellings must already agree.
+    let real = real.canonicalize().unwrap();
+    let real_str = real.to_str().unwrap();
+    let child_str = real.join("child");
+    let child_str = child_str.to_str().unwrap();
+
+    let default_dir = tool
+        .execute(json!({"command": "pwd"}), &context)
+        .await
+        .unwrap();
+    let explicit_dir = tool
+        .execute(json!({"command": "pwd", "cwd": "."}), &context)
+        .await
+        .unwrap();
+    for result in [&default_dir, &explicit_dir] {
+        assert_eq!(
+            result.metadata.as_ref().unwrap()["execution_receipt"]["cwd"],
+            real_str
+        );
+    }
+
+    let command = "printf effective; printf diagnostic >&2; exit 7";
+    let result = tool
+        .execute(json!({"command": command, "cwd": "child"}), &context)
+        .await
+        .unwrap();
+    let receipt = &result.metadata.as_ref().unwrap()["execution_receipt"];
+    assert_eq!(receipt["command"], command);
+    assert_eq!(receipt["cwd"], child_str);
+    assert_eq!(receipt["stdout"], "effective");
+    assert_eq!(receipt["stderr"], "diagnostic");
+    assert_eq!(receipt["exit_code"], 7);
+    assert_eq!(receipt["state"], "completed");
+    assert_eq!(receipt["output_kind"], "separate");
+
+    let interrupted = tool
+        .execute(json!({"command": "kill -TERM $$"}), &context)
+        .await
+        .unwrap();
+    let receipt = &interrupted.metadata.as_ref().unwrap()["execution_receipt"];
+    assert_eq!(receipt["state"], "interrupted");
+    assert!(receipt["exit_code"].is_null());
+
+    let background = tool
+        .execute(
+            json!({"command": "printf background", "background": true}),
+            &context,
+        )
+        .await
+        .unwrap();
+    assert!(
+        background
+            .metadata
+            .as_ref()
+            .unwrap()
+            .get("execution_receipt")
+            .is_none()
+    );
+
+    // Lowercase `bash` shares one pipe: the preview is combined output, and a
+    // failing command's error still carries the receipt for hooks.
+    let result = LowercaseBashTool
+        .execute(
+            json!({"command": "printf merged; printf diagnostic >&2"}),
+            &context,
+        )
+        .await
+        .unwrap();
+    let receipt = &result.metadata.as_ref().unwrap()["execution_receipt"];
+    assert_eq!(receipt["output_kind"], "combined");
+    assert_eq!(receipt["stdout"], "mergeddiagnostic");
+    assert_eq!(receipt["stderr"], "");
+    assert_eq!(receipt["state"], "completed");
+    let error = LowercaseBashTool
+        .execute(json!({"command": "printf partial; exit 3"}), &context)
+        .await
+        .expect_err("nonzero exit is a failed bash call");
+    let receipt = &error.metadata().expect("failure metadata")["execution_receipt"];
+    assert_eq!(receipt["command"], "printf partial; exit 3");
+    assert_eq!(receipt["exit_code"], 3);
+    assert_eq!(receipt["state"], "completed");
+    assert_eq!(receipt["cwd"], real_str);
+}
+
+/// A post-run lookup of a retargeted workspace symlink would falsely name
+/// the replacement directory. The receipt must keep the actual spawn path.
+#[cfg(unix)]
+#[tokio::test]
+async fn execution_receipt_keeps_spawn_cwd_when_the_command_retargets_the_workspace() {
+    let tmp = tempdir().unwrap();
+    let real = tmp.path().join("real");
+    let other = tmp.path().join("other");
+    std::fs::create_dir(&real).unwrap();
+    std::fs::create_dir(&other).unwrap();
+    let workspace = tmp.path().join("link");
+    std::os::unix::fs::symlink(&real, &workspace).unwrap();
+    let mut context = ToolContext::new(workspace.clone())
+        .with_elevated_sandbox_policy(ExecutionSandboxPolicy::DangerFullAccess);
+    context.auto_approve = true;
+    context.runtime.hook_executor = Some(std::sync::Arc::new(crate::hooks::HookExecutor::new(
+        crate::hooks::HooksConfig {
+            enabled: true,
+            hooks: vec![crate::hooks::Hook::new(
+                crate::hooks::HookEvent::ToolCallAfter,
+                "true",
+            )],
+            ..crate::hooks::HooksConfig::default()
+        },
+        workspace.clone(),
+    )));
+    let command = "pwd -P; rm ../link; ln -s other ../link; pwd -P";
+    let result = BashTool::new("Bash")
+        .execute(json!({"command": command}), &context)
+        .await
+        .unwrap();
+    assert!(result.success);
+    let receipt = &result.metadata.as_ref().unwrap()["execution_receipt"];
+    let actual = real.canonicalize().unwrap();
+    let actual = actual.to_str().unwrap();
+    assert_eq!(receipt["command"], command);
+    assert_eq!(receipt["cwd"], actual);
+    assert_eq!(receipt["stdout"], format!("{actual}\n{actual}\n"));
+    assert_eq!(receipt["exit_code"], 0);
+    assert_eq!(
+        workspace.canonicalize().unwrap(),
+        other.canonicalize().unwrap()
+    );
 }
 
 #[cfg(unix)]
@@ -1268,15 +1513,23 @@ fn readonly_github_shell_calls_obey_the_host_network_policy_before_spawn() {
         .to_string();
     assert!(prompted.contains("requires network approval"));
 
-    // Read-only agents: every segment is judged, and npm reads count too.
+    // Read-only agents: every admitted network segment is judged.
     let readonly_deny = context(crate::network_policy::DecisionToml::Deny)
         .with_shell_policy(crate::worker_profile::ShellPolicy::ReadOnly);
-    for command in ["gh pr view 1 | head", "ls && gh issue list", "npm view x"] {
+    for command in ["gh pr view 1 | head", "ls && gh issue list"] {
         let denied = enforce_readonly_network_reads(command, &readonly_deny)
             .expect_err("a network read inside a composition is still judged")
             .to_string();
         assert!(denied.contains("blocked"), "{command}: {denied}");
     }
+    // npm is refused by the command authority before a configured registry
+    // could be mistaken for the fixed public-registry network label.
+    let npm = json!({"command": "npm view x"});
+    let refusal = exec_shell_input_agent_readonly_verdict(&npm).expect_err("npm needs approval");
+    assert!(refusal.detail.contains("configuration"));
+    // An ordinary full shell retains its existing policy/approval path.
+    enforce_readonly_network_reads("npm view x", &deny)
+        .expect("npm is not granted or refused by full-shell read-only detection");
     // A full shell keeps its historical scope: only a lone gh read.
     enforce_readonly_network_reads("gh pr view 1 | head", &deny)
         .expect("full shell pipelines are governed elsewhere");
@@ -2538,7 +2791,7 @@ fn contract_bash_denial_surfaces_the_escalation_shape() {
     let mut result = failed_network_shell_result("", "Operation not permitted");
     result.sandbox_denied = true;
 
-    let error = finish_contract_bash_result(result, None, &ctx)
+    let error = finish_contract_bash_result(result, None, &ctx, None)
         .expect_err("sandbox denial is a failed call");
 
     assert!(
@@ -3774,6 +4027,7 @@ fn killed_shell_does_not_wait_for_blocked_reader_threads() {
         lifecycle_seq: 0,
         last_lifecycle_status: None,
         last_lifecycle_bytes: 0,
+        wait_failed: false,
     };
 
     let started = std::time::Instant::now();
@@ -3799,12 +4053,210 @@ fn test_list_jobs_cleans_up_completed_old_processes() {
     // Both the completed job and any tracking state should be present.
     assert!(!manager.processes.is_empty());
 
-    // cleanup(ZERO) removes all completed processes immediately.
+    // cleanup(ZERO) removes every delivered completed process immediately.
+    manager.drain_finished_jobs_with_evidence();
     manager.cleanup(Duration::ZERO);
     assert!(
         manager.processes.is_empty(),
         "completed processes should be evicted by cleanup"
     );
+}
+
+/// A job that ran longer than the retention age must survive until its
+/// completion is delivered: age counts from the finish, not the start.
+#[test]
+fn cleanup_ages_jobs_from_finish() {
+    let tmp = tempdir().expect("tempdir");
+    let mut manager = ShellManager::new(tmp.path().to_path_buf());
+    let long_run = FINISHED_SHELL_MAX_AGE + Duration::from_secs(600);
+    manager.seed_finished_record_for_test("long-job", long_run);
+
+    // Started 70 minutes ago, finished just now, not yet delivered.
+    manager.list_jobs();
+    assert!(
+        manager.inspect_job("long-job").is_ok(),
+        "a long job must not be evicted the moment it finishes"
+    );
+    let delivered = manager.drain_finished_jobs_with_evidence();
+    assert_eq!(delivered.len(), 1, "the completion must still be delivered");
+    assert_eq!(delivered[0].event.task_id, "long-job");
+
+    // Delivered and recently finished: still inside the retention window.
+    manager.cleanup(FINISHED_SHELL_MAX_AGE);
+    assert!(manager.inspect_job("long-job").is_ok());
+
+    // Delivered and finished longer ago than the window: evicted.
+    let shell = manager.processes.get_mut("long-job").expect("record");
+    shell.finished_at = Instant::now().checked_sub(long_run);
+    manager.cleanup(FINISHED_SHELL_MAX_AGE);
+    assert!(manager.inspect_job("long-job").is_err());
+}
+
+/// Nothing ever drains a completion owned by a Runtime API scope or by a
+/// session that is no longer active, so an undelivered job must still age out
+/// (counted from when it finished) instead of staying until the count cap.
+#[test]
+fn cleanup_ages_out_undelivered_completions_after_finish() {
+    let tmp = tempdir().expect("tempdir");
+    let mut manager = ShellManager::new(tmp.path().to_path_buf());
+    let max_age = Duration::from_secs(30);
+    manager.seed_finished_record_for_test("api-job", Duration::from_secs(50));
+    let shell = manager.processes.get_mut("api-job").expect("record");
+    shell.owner_session_id = "api:thread-1".to_string();
+    shell.finished_at = Instant::now().checked_sub(Duration::from_secs(40));
+    assert!(!shell.completion_reported);
+
+    manager.cleanup(max_age);
+    assert!(
+        manager.inspect_job("api-job").is_err(),
+        "an undelivered completion finished longer ago than max_age must age out"
+    );
+}
+
+/// The count ceiling evicts the records that finished longest ago, the same
+/// clock the age rule uses: a long job that just finished is not "oldest".
+#[test]
+fn finished_job_bounds_evict_by_finish_time() {
+    let tmp = tempdir().expect("tempdir");
+    let mut manager = ShellManager::new(tmp.path().to_path_buf());
+    let now = Instant::now();
+    for index in 0..MAX_FINISHED_SHELL_RECORDS {
+        let id = format!("short-{index:03}");
+        // Started 20 s ago, finished 10 s ago.
+        manager.seed_finished_record_for_test(id.clone(), Duration::from_secs(20));
+        let shell = manager.processes.get_mut(&id).expect("record");
+        shell.finished_at = now.checked_sub(Duration::from_secs(10));
+        shell.completion_reported = true;
+    }
+    // Started 60 s ago, finished just now.
+    manager.seed_finished_record_for_test("long-job", Duration::from_secs(60));
+    manager
+        .processes
+        .get_mut("long-job")
+        .expect("record")
+        .completion_reported = true;
+
+    manager.cleanup(FINISHED_SHELL_MAX_AGE);
+    assert_eq!(manager.tracked_job_count(), MAX_FINISHED_SHELL_RECORDS);
+    assert!(
+        manager.inspect_job("long-job").is_ok(),
+        "the most recently finished job was evicted first"
+    );
+}
+
+/// The synchronous path closes stdin when there is no input: `cat` gets EOF
+/// instead of reading, or blocking on, Codewhale's own stdin.
+#[cfg(unix)]
+#[test]
+fn sync_command_without_input_gets_eof_not_inherited_stdin() {
+    let tmp = tempdir().expect("tempdir");
+    let mut manager = ShellManager::new(tmp.path().to_path_buf());
+    let started = Instant::now();
+    let result = manager
+        .execute_with_options_env(
+            "cat; echo after-eof",
+            None,
+            15_000,
+            false,
+            None,
+            false,
+            None,
+            HashMap::new(),
+        )
+        .expect("run");
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "stdin read blocked for {:?}",
+        started.elapsed()
+    );
+    assert!(result.stdout.contains("after-eof"), "{}", result.stdout);
+}
+
+/// A backgrounded lowercase `bash` job: each read returns only output the
+/// caller has not seen, not the whole retained tail again.
+#[cfg(unix)]
+#[test]
+fn bounded_job_delta_returns_only_new_output() {
+    let tmp = tempdir().expect("tempdir");
+    let mut manager = ShellManager::new(tmp.path().to_path_buf());
+    let started = manager
+        .execute_with_options_env_for_owner_and_work(
+            "printf 'first-chunk\\n'; while [ ! -e go ]; do sleep 0.05; done; printf 'second-chunk\\n'",
+            None,
+            60_000,
+            true,
+            None,
+            false,
+            None,
+            HashMap::new(),
+            None,
+            String::new(),
+            None,
+            None,
+            None,
+            None,
+            false,
+            (1, BASH_MAX_TIMEOUT_MS),
+        )
+        .expect("spawn bounded job");
+    let task_id = started.task_id.expect("task id");
+    assert!(
+        manager.processes[&task_id].bounded_output.is_some(),
+        "fixture must exercise the bounded accumulator"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut seen = String::new();
+    while !seen.contains("first-chunk") {
+        assert!(Instant::now() < deadline, "first chunk never arrived");
+        let delta = manager
+            .get_output_delta(&task_id, false, 0)
+            .expect("first delta");
+        seen.push_str(&delta.result.stdout);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(seen.matches("first-chunk").count(), 1, "{seen}");
+    // The fixture writes its second chunk only now, so the first delta cannot
+    // have raced past it.
+    std::fs::write(tmp.path().join("go"), "").expect("release fixture");
+
+    let rest = manager
+        .get_output_delta(&task_id, true, 10_000)
+        .expect("remaining delta");
+    assert_ne!(rest.result.status, ShellStatus::Running);
+    assert!(
+        rest.result.stdout.contains("second-chunk"),
+        "{}",
+        rest.result.stdout
+    );
+    assert!(
+        !rest.result.stdout.contains("first-chunk"),
+        "a delta must not repeat output already returned: {:?}",
+        rest.result.stdout
+    );
+}
+
+/// A foreground command that reads stdin gets EOF instead of blocking until
+/// the timeout kills it.
+#[cfg(unix)]
+#[tokio::test]
+async fn foreground_command_reading_stdin_gets_eof() {
+    let tmp = tempdir().expect("tempdir");
+    let ctx = ToolContext::new(tmp.path());
+    let started = Instant::now();
+    let result = BashTool::new("Bash")
+        .execute(
+            json!({"command": "cat; echo after-eof", "timeout_ms": 15_000}),
+            &ctx,
+        )
+        .await
+        .expect("execute");
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "stdin read blocked for {:?}",
+        started.elapsed()
+    );
+    assert!(result.content.contains("after-eof"), "{}", result.content);
 }
 
 /// Regression for #1691: a `git commit -m "feat: complete sub-pages"` shell
@@ -5058,6 +5510,18 @@ fn pty_resize_updates_live_terminal_and_rejects_finished_or_pipe_jobs() {
         }
         assert!(Instant::now() < deadline, "PTY did not become ready");
     }
+    // Reopening a client after an idle minute must retain this live PTY's
+    // identity and resize eligibility; output silence is normal at a prompt.
+    manager.processes.get_mut(&id).unwrap().last_output_at =
+        Instant::now() - STALE_NO_OUTPUT_AFTER - Duration::from_millis(1);
+    let idle = manager.inspect_job(&id).unwrap().snapshot;
+    assert_eq!(idle.status, ShellStatus::Running);
+    assert!(idle.stdin_available);
+    assert!(!idle.stale, "an idle live PTY must remain reconnectable");
+    assert!(
+        idle.elapsed_since_output_ms
+            .is_some_and(|ms| ms >= STALE_NO_OUTPUT_AFTER.as_millis() as u64)
+    );
     let size = PtyDimensions {
         rows: 37,
         cols: 111,

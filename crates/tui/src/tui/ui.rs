@@ -62,7 +62,7 @@ use crate::config::{
 };
 use crate::core::engine::{EngineConfig, EngineHandle, spawn_engine};
 use crate::core::events::Event as EngineEvent;
-use crate::core::ops::{Op, ProviderRuntimeStatus, USER_SHELL_TOOL_ID_PREFIX, UserInputProvenance};
+use crate::core::ops::{Op, ProviderRuntimeStatus, UserInputProvenance};
 use crate::hooks::{HookEvent, HookExecutor, TurnEndPayloadInput, TurnEndTotals};
 use crate::llm_client::LlmClient;
 use crate::prompts;
@@ -262,7 +262,7 @@ const REQUIRED_RELEASE_ASSETS: &[&str] = &[
 
 type AppTerminal = Terminal<ColorCompatBackend<Stdout>>;
 
-type PendingToolUses = Vec<(String, String, serde_json::Value)>;
+type PendingToolUses = Vec<ContentBlock>;
 
 #[derive(Debug)]
 enum TranslationEvent {
@@ -606,7 +606,9 @@ fn deliver_constitution_draft_result(
                 let preview = boxed
                     .as_any_mut()
                     .downcast_mut::<crate::tui::setup::SetupWizardView>()
-                    .map(|wizard| wizard.install_model_draft(constitution, model_label.clone()));
+                    .and_then(|wizard| {
+                        wizard.install_model_draft(constitution, model_label.clone())
+                    });
                 app.view_stack.push_boxed(boxed);
                 if let Some((title, content)) = preview {
                     open_text_pager(app, title, content);
@@ -653,7 +655,7 @@ fn deliver_fleet_draft_result(
                 let installed = boxed
                     .as_any_mut()
                     .downcast_mut::<crate::tui::views::fleet_setup::FleetSetupView>()
-                    .map(|wizard| {
+                    .and_then(|wizard| {
                         wizard.install_model_draft(
                             draft,
                             model_label.clone(),
@@ -767,10 +769,6 @@ pub(crate) struct UserDispatchOutcome {
     effective_provider_label: String,
     effective_reasoning_effort: EffectiveReasoningEffort,
     auto_selection: Option<crate::model_routing::AutoRouteSelection>,
-}
-
-fn is_model_visible_tool_call(id: &str) -> bool {
-    !id.starts_with(USER_SHELL_TOOL_ID_PREFIX)
 }
 
 /// Tell the operator that an explicit "make this my default" request did not

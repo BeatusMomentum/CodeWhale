@@ -141,6 +141,14 @@ pub trait RpcDispatcher: Send + Sync {
 // ---------------------------------------------------------------------------
 
 const DEFAULT_STDOUT_LIMIT: usize = 8_192;
+/// Longest single stdout line (protocol or plain output) held in memory. An
+/// RPC request is one line, so this also bounds what a request can make Rust
+/// deserialize before the bridge's own caps apply; an over-long request is
+/// truncated, fails to parse, and is answered with an error.
+const MAX_STDOUT_LINE_BYTES: usize = 32 * 1024 * 1024;
+/// Most stdout one round retains (`full_stdout`); the rest is counted and
+/// reported, never buffered.
+const MAX_ROUND_STDOUT_BYTES: usize = 32 * 1024 * 1024;
 const ROUND_TIMEOUT: Duration = Duration::from_secs(180);
 #[cfg(not(windows))]
 const SPAWN_READY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -165,6 +173,13 @@ pub struct PythonRuntime {
     round_count: u64,
     started: Instant,
     round_timeout: Option<Duration>,
+    /// Set while a round has not yet read its own DONE sentinel, and kept
+    /// when a round ends without it (timeout, I/O failure, or a caller that
+    /// dropped the round mid-flight). The protocol stream is then out of step
+    /// — the interrupted round may still print — so a failed round kills the
+    /// interpreter and every later round refuses instead of reading another
+    /// round's output as its own.
+    broken: Option<String>,
 }
 
 impl PythonRuntime {
@@ -250,6 +265,7 @@ impl PythonRuntime {
             round_count: 0,
             started: Instant::now(),
             round_timeout,
+            broken: None,
         };
 
         // Wait for `__RLM_READY_<sid>__` before handing control back. If
@@ -289,18 +305,43 @@ impl PythonRuntime {
         }
     }
 
+    /// One stdout line, holding at most [`MAX_STDOUT_LINE_BYTES`] of it: the
+    /// rest of an over-long line is consumed and replaced by an omission note.
     async fn read_stdout_line_lossy(&mut self) -> Result<Option<String>, String> {
         let mut buf = Vec::new();
-        let n = self
-            .stdout
-            .read_until(b'\n', &mut buf)
-            .await
-            .map_err(|e| format!("stdout read: {e}"))?;
-        if n == 0 {
-            Ok(None)
-        } else {
-            Ok(Some(String::from_utf8_lossy(&buf).into_owned()))
+        let mut omitted = 0usize;
+        loop {
+            let available = self
+                .stdout
+                .fill_buf()
+                .await
+                .map_err(|e| format!("stdout read: {e}"))?;
+            if available.is_empty() {
+                break;
+            }
+            let (take, ends_line) = match available.iter().position(|&byte| byte == b'\n') {
+                Some(index) => (index + 1, true),
+                None => (available.len(), false),
+            };
+            let keep = take.min(MAX_STDOUT_LINE_BYTES.saturating_sub(buf.len()));
+            buf.extend_from_slice(&available[..keep]);
+            omitted += take - keep;
+            self.stdout.consume(take);
+            if ends_line {
+                break;
+            }
         }
+        if buf.is_empty() && omitted == 0 {
+            return Ok(None);
+        }
+        let mut line = String::from_utf8_lossy(&buf).into_owned();
+        if omitted > 0 {
+            line.truncate(line.trim_end_matches(['\n', '\r']).len());
+            line.push_str(&format!(
+                "[... {omitted} bytes of this line omitted by the REPL line limit ...]\n"
+            ));
+        }
+        Ok(Some(line))
     }
 
     /// Execute a Python code block with no RPC dispatcher. Used for inline
@@ -355,13 +396,30 @@ impl PythonRuntime {
     ///
     /// Returns once Python emits `__RLM_DONE_<sid>__` or the round timeout
     /// elapses (whichever happens first).
+    ///
+    /// Known limitations (F02-07): the sentinels share stdout with the code
+    /// they frame, and `_SID`/`_DONE` are ordinary Python globals, so code in
+    /// this round (or a subprocess inheriting fd 1) can still print its own
+    /// round's DONE line and end the round early; only another round's DONE
+    /// is refused. A failed or timed-out round kills the interpreter process
+    /// itself, not its process group, so a grandchild it spawned may outlive
+    /// the kernel. Closing either needs an out-of-band protocol channel.
     pub async fn run<D>(&mut self, code: &str, bridge: Option<&D>) -> Result<ReplRound, String>
     where
         D: RpcDispatcher + ?Sized,
     {
+        if let Some(reason) = &self.broken {
+            return Err(format!(
+                "Python REPL is unusable after an earlier round failed ({reason}); start a new REPL"
+            ));
+        }
+        // Pessimistic until this round reads its own DONE: a caller that
+        // drops this future mid-round leaves the stream out of step too.
+        self.broken = Some("an earlier round was cancelled before it finished".to_string());
         let started = Instant::now();
         self.round_count += 1;
         let round_id = self.round_count;
+        let round_tag = round_id.to_string();
 
         // Send the code header + body + end marker in one write.
         let header = format!("__RLM_RUN_{}__::{round_id}\n", self.session_id);
@@ -383,6 +441,7 @@ impl PythonRuntime {
         let done_prefix = format!("__RLM_DONE_{}__::", self.session_id);
 
         let mut stdout_buf = String::new();
+        let mut stdout_omitted = 0usize;
         let mut final_value: Option<String> = None;
         let mut final_json: Option<Value> = None;
         let mut final_confidence: Option<Value> = None;
@@ -401,8 +460,13 @@ impl PythonRuntime {
                 let trimmed = line.trim_end_matches(['\n', '\r']);
 
                 if let Some(rest) = trimmed.strip_prefix(&done_prefix) {
-                    let _ = rest;
-                    break;
+                    if rest == round_tag {
+                        break;
+                    }
+                    // Another round's completion (or user output imitating
+                    // one) never ends this round.
+                    push_bounded(&mut stdout_buf, &line, &mut stdout_omitted);
+                    continue;
                 }
                 if let Some(rest) = trimmed.strip_prefix(&final_prefix) {
                     // New sessions emit an object with value/confidence;
@@ -442,7 +506,11 @@ impl PythonRuntime {
                     let traceback =
                         serde_json::from_str::<String>(rest).unwrap_or_else(|_| rest.to_string());
                     had_error = true;
-                    stdout_buf.push_str(&format!("[traceback]\n{traceback}\n"));
+                    push_bounded(
+                        &mut stdout_buf,
+                        &format!("[traceback]\n{traceback}\n"),
+                        &mut stdout_omitted,
+                    );
                     continue;
                 }
                 if let Some(rest) = trimmed.strip_prefix(&req_prefix) {
@@ -470,24 +538,35 @@ impl PythonRuntime {
                     continue;
                 }
 
-                stdout_buf.push_str(&line);
+                push_bounded(&mut stdout_buf, &line, &mut stdout_omitted);
             }
             Ok::<_, String>(())
         };
 
-        if let Some(round_timeout) = round_timeout {
-            match tokio::time::timeout(round_timeout, read_loop).await {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => return Err(e),
-                Err(_) => {
-                    return Err(format!(
+        let outcome = match round_timeout {
+            Some(round_timeout) => tokio::time::timeout(round_timeout, read_loop)
+                .await
+                .unwrap_or_else(|_| {
+                    Err(format!(
                         "REPL round timed out after {}s",
                         round_timeout.as_secs()
-                    ));
-                }
-            }
-        } else {
-            read_loop.await?;
+                    ))
+                }),
+            None => read_loop.await,
+        };
+        if let Err(error) = outcome {
+            // The interpreter may still be executing this round. Kill it now
+            // (the handle is reaped on drop) rather than leave it running and
+            // let its late output land in a later round.
+            let _ = self.child.start_kill();
+            self.broken = Some(error.clone());
+            return Err(error);
+        }
+        self.broken = None;
+        if stdout_omitted > 0 {
+            stdout_buf.push_str(&format!(
+                "\n[... REPL round output capped: {stdout_omitted} bytes omitted ...]\n"
+            ));
         }
 
         let stderr = self.drain_stderr().await;
@@ -543,6 +622,13 @@ impl PythonRuntime {
         };
         let _ = fut.await;
         String::from_utf8_lossy(&buf).to_string()
+    }
+
+    /// True once a round failed or was dropped before reading its own DONE
+    /// sentinel. Every later round refuses, so a holder that wants to keep
+    /// going replaces the kernel instead of reusing it.
+    pub fn is_broken(&self) -> bool {
+        self.broken.is_some()
     }
 
     /// Total rounds executed.
@@ -1038,6 +1124,22 @@ _main_loop()
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Append to a round's retained stdout without exceeding
+/// [`MAX_ROUND_STDOUT_BYTES`]; whatever does not fit is only counted.
+fn push_bounded(buf: &mut String, text: &str, omitted: &mut usize) {
+    let room = MAX_ROUND_STDOUT_BYTES.saturating_sub(buf.len());
+    if text.len() <= room {
+        buf.push_str(text);
+        return;
+    }
+    let cut = (0..=room)
+        .rev()
+        .find(|&index| text.is_char_boundary(index))
+        .unwrap_or(0);
+    buf.push_str(&text[..cut]);
+    *omitted += text.len() - cut;
+}
+
 fn truncate_stdout(stdout: &str, limit: usize) -> String {
     if stdout.len() <= limit {
         return stdout.to_string();
@@ -1349,6 +1451,50 @@ mod tests {
             rt.round_timeout().is_none(),
             "RLM context runs must not inherit the old 180s REPL round timeout"
         );
+        rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn timed_out_round_kills_the_interpreter_and_refuses_later_rounds() {
+        let mut rt = PythonRuntime::new().await.expect("spawn");
+        rt.round_timeout = Some(Duration::from_millis(300));
+        let error = rt
+            .execute("import time\ntime.sleep(30)\nprint('late output')")
+            .await
+            .expect_err("the round must time out");
+        assert!(error.contains("timed out"), "{error}");
+
+        let refused = rt
+            .execute("print('next round')")
+            .await
+            .expect_err("a desynchronized REPL must not run another round");
+        assert!(refused.contains("unusable"), "{refused}");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while rt.child.try_wait().expect("child status").is_none() {
+            assert!(
+                Instant::now() < deadline,
+                "the timed-out interpreter must be killed"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn another_rounds_done_sentinel_does_not_end_this_round() {
+        let mut rt = PythonRuntime::new().await.expect("spawn");
+        let round = rt
+            .execute("print(_DONE + '999')\nprint('still this round')")
+            .await
+            .expect("execute");
+        assert!(
+            round.stdout.contains("still this round"),
+            "{}",
+            round.stdout
+        );
+        let next = rt.execute("print('second')").await.expect("next round");
+        assert!(next.stdout.contains("second"), "{}", next.stdout);
+        assert!(!next.stdout.contains("still this round"), "{}", next.stdout);
         rt.shutdown().await;
     }
 

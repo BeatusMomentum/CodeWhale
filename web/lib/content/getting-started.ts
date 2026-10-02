@@ -34,8 +34,8 @@ export const GETTING_STARTED_STEPS: GuideStep[] = [
     id: "install",
     title: { en: "Install Codewhale", zh: "安装 Codewhale" },
     body: {
-      en: "The command below installs the latest published release on macOS or Linux. Use the install guide for Windows, package managers, or building the unreleased source candidate.",
-      zh: "下方命令会在 macOS 或 Linux 上安装最新发布版本。Windows、包管理器以及未发布候选版的源码构建方式，请参阅安装指南。",
+      en: "The command below installs the latest published release on macOS or Linux into ~/.local/bin. If that folder is not on your PATH yet, the installer prints the one line to add for your shell; run it before the next steps. Use the install guide for Windows, package managers, or building the unreleased source candidate.",
+      zh: "下方命令会在 macOS 或 Linux 上把最新发布版本安装到 ~/.local/bin。如果该目录还不在 PATH 中，安装程序会打印适用于你所用 shell 的一行命令；请先运行它，再进行后续步骤。Windows、包管理器以及未发布候选版的源码构建方式，请参阅安装指南。",
     },
     commands: ["curl -fsSL https://codewhale.net/install.sh | sh"],
     link: {
@@ -60,8 +60,8 @@ export const GETTING_STARTED_STEPS: GuideStep[] = [
     id: "first-session",
     title: { en: "Give it a task", zh: "交给它一项任务" },
     body: {
-      en: "Open Codewhale in your project folder and ask for something concrete. Start in /mode plan to have it explain the project without changing anything, then switch to /mode work for edits and commands. It shows each edit as a diff and asks before running a shell command.",
-      zh: "在项目文件夹中打开 Codewhale，交给它一件具体的事。可以先用 /mode plan 让它在不改动任何东西的前提下讲解项目，需要修改文件或运行命令时再切换到 /mode work。它会以 diff 展示每一处修改，并在运行 shell 命令前先征求你的同意。",
+      en: "Open Codewhale in your project folder and ask for something concrete. (If codewhale is not found, add ~/.local/bin to your PATH as in step 1.) Start in /mode plan to have it explain the project without changing anything, then switch to /mode work for edits and commands. It shows each edit as a diff and asks before running a shell command.",
+      zh: "在项目文件夹中打开 Codewhale，交给它一件具体的事。（如果找不到 codewhale 命令，请按第 1 步把 ~/.local/bin 加入 PATH。）可以先用 /mode plan 让它在不改动任何东西的前提下讲解项目，需要修改文件或运行命令时再切换到 /mode work。它会以 diff 展示每一处修改，并在运行 shell 命令前先征求你的同意。",
     },
     commands: ["codewhale"],
     link: {

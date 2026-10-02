@@ -316,6 +316,58 @@ async fn reconcile_recovers_threads_in_an_unbound_store_bound_to_a_missing_docum
     assert!(!again.changed(), "{again:?}");
 }
 
+/// #6555: reconcile judges seed journals exactly as Runtime startup does,
+/// but never settles them. An unpublished seed's turns are not history, and
+/// a thread whose journal cannot be settled is not recovered.
+#[tokio::test]
+async fn reconcile_does_not_recover_an_unpublished_or_unsettled_seed() {
+    let _env = lock_test_env();
+    for journal_state in ["uncommitted", "unreadable"] {
+        let fx = Fixture::new();
+        let (store, thread_id) = fx.store_with_thread("seeding-anchor").await;
+        let journal_path = store.join("threads").join(format!("{thread_id}.seed"));
+        {
+            let opened = RuntimeThreadStore::open(store.clone()).unwrap();
+            let turns = opened.list_turns_for_thread(&thread_id).unwrap();
+            let items = opened.list_items_for_turn(&turns[0].id).unwrap();
+            // The process stopped between the seed's records and its commit.
+            let mut thread = opened.load_thread(&thread_id).unwrap();
+            thread.latest_turn_id = None;
+            opened.save_thread(&thread).unwrap();
+            let journal = serde_json::json!({
+                "thread_id": thread_id,
+                "previous_latest_turn_id": null,
+                "turn_ids": turns.iter().map(|turn| turn.id.clone()).collect::<Vec<_>>(),
+                "item_ids": items.iter().map(|item| item.id.clone()).collect::<Vec<_>>(),
+            });
+            let bytes = match journal_state {
+                "uncommitted" => serde_json::to_vec(&journal).unwrap(),
+                _ => b"{truncated seed intent".to_vec(),
+            };
+            fs::write(&journal_path, bytes).unwrap();
+        }
+
+        let summary = fx.run();
+        assert_eq!(
+            summary.sessions_recovered, 0,
+            "{journal_state}: {summary:?}"
+        );
+        assert_eq!(
+            summary.stores_kept_with_work, 1,
+            "{journal_state}: {summary:?}"
+        );
+        assert!(
+            journal_path.is_file(),
+            "{journal_state}: reconcile leaves the journal for Runtime startup"
+        );
+        let thread = RuntimeThreadStore::open(store.clone())
+            .unwrap()
+            .load_thread(&thread_id)
+            .unwrap();
+        assert_eq!(thread.session_id, None, "{journal_state}");
+    }
+}
+
 /// R1: an unreadable document is set aside with its hash; a document from a
 /// newer build is left alone.
 #[test]

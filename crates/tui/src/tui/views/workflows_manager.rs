@@ -56,11 +56,26 @@ fn status_style(status: &str) -> Style {
     }
 }
 
+/// One glyph per projected child state. Only a real failure reads as `✗`:
+/// a cancellation is not a failure, and a state this view does not know
+/// must not borrow the failure mark (U09-m3).
 fn child_state_glyph(state: &str) -> &'static str {
     match state {
         "running" | "pending" => "•",
         "succeeded" => "✓",
-        _ => "✗",
+        "failed" | "budget_exceeded" => "✗",
+        "cancelled" => "–",
+        _ => "?",
+    }
+}
+
+/// A child with no completion receipt in a settled run did not finish as far
+/// as this record shows; it is not still running (U09-m3).
+fn child_display_state(child: &HostWorkflowChildRow, run_active: bool) -> &'static str {
+    if !run_active && matches!(child.state, "running" | "pending") {
+        "unknown"
+    } else {
+        child.state
     }
 }
 
@@ -80,6 +95,8 @@ pub struct WorkflowsManagerView {
     row: usize,
     detail_open: bool,
     detail_scroll: usize,
+    /// Largest useful detail scroll in rendered rows, from the last paint.
+    detail_max_scroll: Cell<usize>,
     /// Receipt line for the last host action (cancel), shown under the header.
     status: Option<String>,
     workspace: PathBuf,
@@ -99,6 +116,7 @@ impl WorkflowsManagerView {
             row: 0,
             detail_open: false,
             detail_scroll: 0,
+            detail_max_scroll: Cell::new(usize::MAX),
             status: None,
             workspace: app.workspace.clone(),
             owner_session_id: app.current_session_id.clone(),
@@ -334,7 +352,7 @@ impl WorkflowsManagerView {
                 Style::default().fg(palette::TEXT_PRIMARY).bold(),
             )));
             for child in &detail.children {
-                lines.push(child_row_line(child));
+                lines.push(child_row_line(child, detail.line.active));
             }
             lines.push(Line::from(""));
         }
@@ -377,24 +395,25 @@ impl WorkflowsManagerView {
             return;
         };
         let lines = self.detail_lines(detail);
-        let visible = usize::from(area.height).max(1);
-        let max_scroll = lines.len().saturating_sub(visible);
-        let scroll = self.detail_scroll.min(max_scroll);
-        Paragraph::new(lines.iter().skip(scroll).cloned().collect::<Vec<_>>())
-            .wrap(Wrap { trim: false })
-            .render(area, buf);
+        self.detail_max_scroll.set(super::render_wrapped_detail(
+            lines,
+            area,
+            buf,
+            self.detail_scroll,
+        ));
     }
 }
 
-fn child_row_line(child: &HostWorkflowChildRow) -> Line<'static> {
+fn child_row_line(child: &HostWorkflowChildRow, run_active: bool) -> Line<'static> {
     let name = child.label.clone().unwrap_or_else(|| child.task_id.clone());
+    let state = child_display_state(child, run_active);
     let mut spans = vec![
         Span::styled(
-            format!("    {} ", child_state_glyph(child.state)),
-            status_style(child.state),
+            format!("    {} ", child_state_glyph(state)),
+            status_style(state),
         ),
         Span::styled(name, Style::default().fg(palette::TEXT_SECONDARY)),
-        Span::styled(format!(" · {}", child.state), status_style(child.state)),
+        Span::styled(format!(" · {state}"), status_style(state)),
     ];
     let mut meta = Vec::new();
     if let Some(role) = child.role.as_deref() {
@@ -446,8 +465,11 @@ impl ModalView for WorkflowsManagerView {
             }
             KeyCode::Down | KeyCode::Char('j') => {
                 if self.detail_open {
-                    // The render path clamps to the last scrollable line.
-                    self.detail_scroll = self.detail_scroll.saturating_add(1);
+                    // Stop at the last rendered (wrapped) row of the detail.
+                    self.detail_scroll = self
+                        .detail_scroll
+                        .saturating_add(1)
+                        .min(self.detail_max_scroll.get());
                 } else {
                     self.move_row(1);
                 }
@@ -549,5 +571,35 @@ impl ModalView for WorkflowsManagerView {
         } else {
             self.render_list(chunks[1], buf);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn child(state: &'static str) -> HostWorkflowChildRow {
+        HostWorkflowChildRow {
+            task_id: "t1".to_string(),
+            label: None,
+            role: None,
+            model: None,
+            phase: None,
+            state,
+        }
+    }
+
+    /// U09-m3: a child with no completion receipt in a settled run is not
+    /// "running", a cancellation is not a failure, and an unknown state never
+    /// borrows the failure mark.
+    #[test]
+    fn child_rows_keep_their_source_of_truth_state() {
+        assert_eq!(child_display_state(&child("running"), true), "running");
+        assert_eq!(child_display_state(&child("running"), false), "unknown");
+        assert_eq!(child_display_state(&child("succeeded"), false), "succeeded");
+        assert_eq!(child_state_glyph("unknown"), "?");
+        assert_eq!(child_state_glyph("cancelled"), "–");
+        assert_eq!(child_state_glyph("failed"), "✗");
+        assert_eq!(child_state_glyph("budget_exceeded"), "✗");
     }
 }

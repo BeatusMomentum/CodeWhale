@@ -586,6 +586,8 @@ pub struct ToolContext {
 pub struct ToolExecutionState {
     /// Effective session/ancestor tool ceiling, carried to MCP dispatch and runtime registration.
     pub(crate) disallowed_tools: Vec<String>,
+    /// Set only on the context of one call a person approved on a card.
+    pub(crate) human_decision: Option<crate::core::engine::HumanDecision>,
     /// Shared shell manager for background tasks and streaming IO.
     pub shell_manager: SharedShellManager,
     /// Per-session snapshots for files successfully observed by `read_file`.
@@ -618,7 +620,7 @@ pub struct ToolExecutionState {
     /// Explicit skills directory used for model-visible skill discovery.
     pub skills_dir: Option<PathBuf>,
     /// Restrict skill discovery to CodeWhale-owned roots plus `skills_dir`.
-    pub skills_scan_codewhale_only: bool,
+    pub skills_discovery_mode: crate::skills::SkillDiscoveryMode,
     /// Immutable registry snapshot for this workspace/engine context.
     pub plugin_registry: Option<Arc<crate::plugins::PluginRegistry>>,
     /// Elevated sandbox policy override (used when retrying after sandbox denial).
@@ -676,6 +678,9 @@ pub struct ToolExecutionState {
     /// Cancellation token for the active engine turn. Tools that may wait on
     /// external work should observe this so UI cancel can interrupt them.
     pub cancel_token: Option<CancellationToken>,
+    /// Absolute deadline inherited from the active Engine turn after approval.
+    /// Nested model/code work may narrow this bound but must never reset it.
+    pub(crate) turn_deadline: Option<tokio::time::Instant>,
     /// Optional external sandbox backend for shell execution.
     /// When set, exec_shell routes commands through this instead of spawning
     /// a local process.
@@ -720,6 +725,9 @@ pub struct ToolExecutionState {
     /// hosts without an engine turn), where code mode keeps its read-only,
     /// auto-approved profile.
     pub(crate) nested_call_gate: Option<crate::tools::codemode::NestedCallGate>,
+    /// Where the session's live permission posture lives. Set by the engine;
+    /// every agent call re-reads it (`None` keeps the posture above as is).
+    pub(crate) live_posture: Option<crate::core::engine::LivePosture>,
 }
 
 impl std::ops::Deref for ToolContext {
@@ -781,6 +789,7 @@ impl ToolContext {
             workspace,
             execution: Box::new(ToolExecutionState {
                 disallowed_tools: Vec::new(),
+                human_decision: None,
                 shell_manager,
                 file_read_tracker: new_shared_file_read_tracker(),
                 owner_agent_id: None,
@@ -793,7 +802,7 @@ impl ToolContext {
                 notes_path: notes_path.into(),
                 mcp_config_path: mcp_config_path.into(),
                 skills_dir: None,
-                skills_scan_codewhale_only: false,
+                skills_discovery_mode: crate::skills::SkillDiscoveryMode::Compatible,
                 plugin_registry: None,
                 elevated_sandbox_policy: None,
                 persist_services_enabled: false,
@@ -810,6 +819,7 @@ impl ToolContext {
                 runtime: RuntimeToolServices::default(),
                 session_objects: None,
                 cancel_token: None,
+                turn_deadline: None,
                 sandbox_backend: None,
                 memory_path: None,
                 lsp_manager: None,
@@ -820,6 +830,7 @@ impl ToolContext {
                 provider_native_search: None,
                 route_capabilities: codewhale_config::route::RouteCapabilities::default(),
                 nested_call_gate: None,
+                live_posture: None,
             }),
         }
     }
@@ -853,6 +864,27 @@ impl ToolContext {
     pub fn with_runtime_services(mut self, runtime: RuntimeToolServices) -> Self {
         self.runtime = runtime;
         self
+    }
+
+    /// Re-read the session's live permission posture (see `live_posture`) and
+    /// return what was read; `None` when this context has no live source.
+    pub(crate) fn refresh_live_posture(
+        &mut self,
+    ) -> Option<crate::core::engine::LiveRuntimeAuthority> {
+        let live = self.live_posture.clone()?;
+        Some(live.apply(self))
+    }
+
+    /// Resolves once the live posture differs from what it is now; never for
+    /// a context without a live source.
+    pub(crate) async fn live_posture_moved(&self) {
+        let Some(live) = self.live_posture.as_ref() else {
+            return std::future::pending().await;
+        };
+        let start = live.read();
+        while live.read() == start {
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
     }
 
     /// Stamp tool work with the sub-agent that owns it.
@@ -907,10 +939,10 @@ impl ToolContext {
     pub fn with_skills_config(
         mut self,
         skills_dir: impl Into<PathBuf>,
-        scan_codewhale_only: bool,
+        discovery_mode: crate::skills::SkillDiscoveryMode,
     ) -> Self {
         self.skills_dir = Some(skills_dir.into());
-        self.skills_scan_codewhale_only = scan_codewhale_only;
+        self.skills_discovery_mode = discovery_mode;
         self
     }
 
@@ -1060,8 +1092,16 @@ impl ToolContext {
         trust_mode: Option<bool>,
         auto_approve: Option<bool>,
     ) -> (Option<bool>, Option<bool>, Option<bool>) {
+        let holds_shell = self.shell_policy == ShellPolicy::Full;
         (
-            allow_shell.map(|requested| requested && self.shell_policy == ShellPolicy::Full),
+            // An omitted flag falls back to the host's configured default, so
+            // a session without full shell must say "no" for it rather than
+            // leave it unset.
+            match allow_shell {
+                Some(requested) => Some(requested && holds_shell),
+                None if holds_shell => None,
+                None => Some(false),
+            },
             trust_mode.map(|requested| requested && self.trust_mode),
             auto_approve.map(|requested| requested && self.approval_mode == ApprovalMode::Bypass),
         )
@@ -1295,6 +1335,16 @@ impl ToolContext {
     /// with elevated permissions.
     pub fn with_elevated_sandbox_policy(mut self, policy: crate::sandbox::SandboxPolicy) -> Self {
         self.elevated_sandbox_policy = Some(policy);
+        self
+    }
+
+    /// Carry a person's card decision to the one call it approved.
+    #[must_use]
+    pub(crate) fn with_human_decision(
+        mut self,
+        decision: crate::core::engine::HumanDecision,
+    ) -> Self {
+        self.human_decision = Some(decision);
         self
     }
 
@@ -1550,6 +1600,17 @@ pub trait ToolSpec: Send + Sync {
             resources: vec![ResourceClaim::GlobalExclusive],
             input,
         })
+    }
+
+    /// The approval-grant scope this tool's calls are keyed under instead of
+    /// the name-derived key families, if it has one. `None` (every built-in,
+    /// script and MCP tool) keeps [`crate::tools::approval_cache`]'s keys.
+    ///
+    /// Extension tools return `ext:<plugin_id>@<content_hash>`, so a session
+    /// grant covers one reviewed plugin build: an updated plugin, or another
+    /// plugin that later registers the same name, is asked again.
+    fn approval_scope(&self) -> Option<String> {
+        None
     }
 
     /// Returns whether this tool should be excluded from the model-visible

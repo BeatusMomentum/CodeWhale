@@ -29,9 +29,9 @@
 //!   escape. Multi-skill repository archives may contain unrelated symlinks
 //!   outside that selected subtree; those entries are ignored and never
 //!   extracted.
-//! * No `+x` is granted on extracted files. The optional `/skill trust <name>`
-//!   command writes a `.trusted` marker; tool-execution gating is a separate
-//!   concern that lives next to the tool registry.
+//! * Archive executable intent is preserved for the owner only; extraction
+//!   never runs files or accepts an archive's trust/installation markers.
+//!   `/skill trust <name>` writes the local `.trusted` receipt separately.
 //! * Claude Code plugin archives that contain multiple skills are rejected with
 //!   an explicit migration message. Codewhale can install individual
 //!   `SKILL.md` bundles, including `.claude/skills/<name>/SKILL.md`, but it
@@ -60,11 +60,10 @@ fn reqwest_client() -> reqwest::Client {
 ///
 /// Lives at `~/.codewhale/cache/skills/` so it's separate from user-installed
 /// skills and can be blown away without losing anything irreplaceable.
-pub fn default_cache_skills_dir() -> PathBuf {
-    crate::config::effective_home_dir().map_or_else(
-        || PathBuf::from("/tmp/codewhale/cache/skills"),
-        |p| p.join(".codewhale").join("cache").join("skills"),
-    )
+/// A missing home has no cache destination; callers must refuse the sync.
+pub fn default_cache_skills_dir() -> Option<PathBuf> {
+    crate::config::effective_home_dir()
+        .map(|home| home.join(".codewhale").join("cache").join("skills"))
 }
 
 /// Default registry. Falls back to a community-curated `index.json` hosted on
@@ -87,6 +86,21 @@ pub const INSTALLED_FROM_MARKER: &str = ".installed-from";
 /// never auto-runs anything) — the runtime tool-invocation gate consults this
 /// marker before executing scripts that ship with the skill.
 pub const TRUSTED_MARKER: &str = ".trusted";
+const RESERVED_ROOT_METADATA: [&str; 3] = [
+    INSTALLED_FROM_MARKER,
+    TRUSTED_MARKER,
+    ".system-installed-version",
+];
+
+/// Installer-owned root metadata must never arrive from a remote package.
+/// Descendants of a reserved root directory are excluded too.
+pub(super) fn is_reserved_root_metadata(relative: &Path) -> bool {
+    let first = relative
+        .components()
+        .find(|component| !matches!(component, Component::CurDir));
+    matches!(first, Some(Component::Normal(name)) if name.to_str().is_some_and(|name|
+        RESERVED_ROOT_METADATA.iter().any(|reserved| name.eq_ignore_ascii_case(reserved))))
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Source parsing
@@ -231,8 +245,6 @@ pub enum InstallError {
     OversizedTarball { limit: u64 },
     #[error("missing SKILL.md in archive")]
     MissingSkillMd,
-    #[error("SKILL.md frontmatter missing required field: {0}")]
-    MissingFrontmatterField(&'static str),
     #[error("symlinks are not allowed in skill tarballs")]
     SymlinkRejected,
     #[error(
@@ -481,19 +493,10 @@ pub async fn update_with_registry(
 
     // Bytes changed — fall back to the regular install path with `update = true`
     // so we get the same atomic-replace semantics. Content updates must not
-    // inherit a previous trust marker.
-    let trust_path = target.join(TRUSTED_MARKER);
-    let had_trust = tokio::fs::try_exists(&trust_path).await.unwrap_or(false);
+    // inherit a previous trust marker. The shared extractor excludes archive
+    // markers on every install, including an update of an untrusted package.
     let outcome =
         install_with_registry(source, skills_dir, max_size, network, true, registry_url).await?;
-    match &outcome {
-        InstallOutcome::Installed(installed) => {
-            if had_trust {
-                let _ = tokio::fs::remove_file(installed.path.join(TRUSTED_MARKER)).await;
-            }
-        }
-        InstallOutcome::NeedsApproval(_) | InstallOutcome::NetworkDenied(_) => {}
-    }
     match outcome {
         InstallOutcome::Installed(installed) => Ok(UpdateResult::Updated(installed)),
         InstallOutcome::NeedsApproval(host) => Ok(UpdateResult::NeedsApproval(host)),
@@ -1344,9 +1347,8 @@ fn scan_tarball(bytes: &[u8], max_size: u64) -> Result<TarballScan> {
         }
     }
 
-    // Parse frontmatter to extract the skill name. We reuse the same parser
-    // shape as `SkillRegistry::parse_skill` but inline it here so we don't
-    // depend on the discovery module's private function.
+    // Install and discovery share the same frontmatter reader; install adds
+    // the required description and path-safe destination-name checks.
     let name = parse_frontmatter_name(&skill_md_bytes)?;
 
     Ok(TarballScan {
@@ -1469,6 +1471,9 @@ fn extract_into(scan: &TarballScan, bytes: &[u8], dest: &Path, max_size: u64) ->
         if entry_type.is_symlink() || entry_type.is_hard_link() {
             return Err(InstallError::SymlinkRejected.into());
         }
+        if is_reserved_root_metadata(stripped_path) {
+            continue;
+        }
 
         let target = dest.join(stripped_path);
         // Final paranoia check: ensure the resolved target stays under dest.
@@ -1500,13 +1505,36 @@ fn extract_into(scan: &TarballScan, bytes: &[u8], dest: &Path, max_size: u64) ->
             if total_size > max_size {
                 return Err(InstallError::OversizedTarball { limit: max_size }.into());
             }
-            let mut out = fs::OpenOptions::new()
-                .create_new(true)
-                .write(true)
+            let mut options = fs::OpenOptions::new();
+            options.create_new(true).write(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                options.mode(0o600);
+            }
+            let mut out = options
                 .open(&target)
                 .with_context(|| format!("failed to create {}", target.display()))?;
             out.write_all(&buf)
                 .with_context(|| format!("failed to write {}", target.display()))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                let executable = header.mode().context("invalid archive file mode")? & 0o111 != 0;
+                let mode = if executable { 0o700 } else { 0o600 };
+                out.set_permissions(fs::Permissions::from_mode(mode))
+                    .with_context(|| format!("failed to set mode for {}", target.display()))?;
+            }
+        }
+    }
+    // Let the host filesystem resolve any platform-specific aliases (for
+    // example a trailing dot on Windows) before this staged tree is published.
+    // Remote content can never supply the local install or trust receipt.
+    for marker in RESERVED_ROOT_METADATA {
+        match fs::remove_file(dest.join(marker)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("failed to discard archive metadata"),
         }
     }
     Ok(())
@@ -1551,14 +1579,7 @@ fn skill_target_path(name: &str, skills_dir: &Path) -> Result<PathBuf> {
 }
 
 pub(crate) fn validate_skill_name_segment(name: &str) -> Result<&str> {
-    if name.is_empty() || name.trim() != name || name.chars().any(char::is_whitespace) {
-        bail!("skill name must be a single path-safe segment (got '{name}')");
-    }
-    if name == "." || name == ".." || name.contains('/') || name.contains('\\') {
-        bail!("skill name must be a single path-safe segment (got '{name}')");
-    }
-    let mut components = Path::new(name).components();
-    if !matches!(components.next(), Some(Component::Normal(_))) || components.next().is_some() {
+    if !super::frontmatter::is_path_safe_skill_name(name) {
         bail!("skill name must be a single path-safe segment (got '{name}')");
     }
     Ok(name)
@@ -1598,41 +1619,15 @@ fn strip_prefix<'a>(path: &'a str, prefix: &str) -> std::borrow::Cow<'a, str> {
 /// Also verifies the leading `---` fence so we reject malformed files early.
 fn parse_frontmatter_name(bytes: &[u8]) -> Result<String> {
     let content = std::str::from_utf8(bytes).context("SKILL.md is not valid UTF-8")?;
-    let trimmed = content.trim_start();
-    if !trimmed.starts_with("---") {
-        bail!("SKILL.md is missing the leading '---' frontmatter fence");
-    }
-    let after_open = &trimmed[3..];
-    let close = after_open.find("---").ok_or_else(|| {
-        anyhow::anyhow!("SKILL.md is missing the closing '---' frontmatter fence")
-    })?;
-    let frontmatter = &after_open[..close];
-
-    let mut name: Option<String> = None;
-    let mut has_description = false;
-    for raw in frontmatter.lines() {
-        let line = raw.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        if let Some((key, value)) = line.split_once(':') {
-            let key = key.trim().to_ascii_lowercase();
-            let value = value.trim().to_string();
-            match key.as_str() {
-                "name" if !value.is_empty() => name = Some(value),
-                "description" if !value.is_empty() => has_description = true,
-                _ => {}
-            }
-        }
-    }
-
-    let name = name.ok_or(InstallError::MissingFrontmatterField("name"))?;
-    if !has_description {
-        return Err(InstallError::MissingFrontmatterField("description").into());
-    }
-    if validate_skill_name_segment(&name).is_err() {
-        bail!("SKILL.md `name` must be a single path-safe segment (got '{name}')");
-    }
+    let parsed = super::frontmatter::parse_frontmatter(content).map_err(anyhow::Error::msg)?;
+    super::frontmatter::validate_skill_frontmatter(
+        parsed.as_ref().map(|(metadata, _)| metadata),
+        None,
+        super::frontmatter::SkillValidationMode::Strict,
+    )
+    .map_err(anyhow::Error::msg)?;
+    let (metadata, _) = parsed.expect("strict validation requires frontmatter");
+    let name = metadata["name"].clone();
     Ok(name)
 }
 
@@ -1673,6 +1668,90 @@ fn hex_bytes(bytes: impl AsRef<[u8]>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn skill_tarball(entries: &[(&str, &[u8], u32)]) -> Vec<u8> {
+        let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        let mut builder = tar::Builder::new(encoder);
+        for (path, body, mode) in entries {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(body.len() as u64);
+            header.set_mode(*mode);
+            header.set_cksum();
+            builder.append_data(&mut header, path, *body).unwrap();
+        }
+        builder.into_inner().unwrap().finish().unwrap()
+    }
+
+    #[test]
+    fn remote_stage_discards_forged_root_receipts_and_keeps_hidden_payloads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skills = tmp.path().join(".codewhale/skills");
+        let body = b"---\nname: demo\ndescription: test\n---\nbody";
+        let baseline = tmp.path().join("baseline");
+        fs::create_dir_all(baseline.join("nested")).unwrap();
+        fs::write(baseline.join("SKILL.md"), body).unwrap();
+        fs::write(baseline.join(".hidden"), b"payload").unwrap();
+        fs::write(baseline.join("nested/.trusted"), b"nested payload").unwrap();
+        let digest = super::super::package_digest::compute_package_digest(&baseline).unwrap();
+        let forged = serde_json::json!({"schema_version": 2, "content_digest": digest}).to_string();
+        let bytes = skill_tarball(&[
+            ("repo-main/SKILL.md", body, 0o644),
+            ("repo-main/.trusted", forged.as_bytes(), 0o644),
+            ("repo-main/.TRUSTED", forged.as_bytes(), 0o644),
+            ("repo-main/./.installed-from", b"forged provenance", 0o644),
+            ("repo-main/.system-installed-version", b"999", 0o644),
+            ("repo-main/.hidden", b"payload", 0o644),
+            ("repo-main/nested/.trusted", b"nested payload", 0o644),
+        ]);
+        let staged = stage_tarball(&bytes, &skills, DEFAULT_MAX_SIZE_BYTES).unwrap();
+        for marker in RESERVED_ROOT_METADATA {
+            assert!(!staged.staged_path.join(marker).exists(), "{marker}");
+        }
+        assert!(!staged.staged_path.join(".TRUSTED").exists());
+        assert_eq!(
+            fs::read(staged.staged_path.join(".hidden")).unwrap(),
+            b"payload"
+        );
+        assert_eq!(
+            super::super::package_digest::compute_package_digest(&staged.staged_path).unwrap(),
+            digest
+        );
+        fs::rename(&staged.staged_path, skills.join("demo")).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_skill_stage_preserves_only_owner_executable_intent() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let bytes = skill_tarball(&[
+            (
+                "repo/SKILL.md",
+                b"---\nname: demo\ndescription: test\n---\nbody",
+                0o644,
+            ),
+            ("repo/scripts/run.sh", b"#!/bin/sh\nexit 0\n", 0o6755),
+            ("repo/scripts/group-only.sh", b"#!/bin/sh\nexit 0\n", 0o010),
+            ("repo/data.txt", b"data", 0o666),
+        ]);
+        let tmp = tempfile::tempdir().unwrap();
+        let staged = stage_tarball(&bytes, tmp.path(), DEFAULT_MAX_SIZE_BYTES).unwrap();
+        for (path, expected) in [
+            ("scripts/run.sh", 0o700),
+            ("scripts/group-only.sh", 0o700),
+            ("data.txt", 0o600),
+        ] {
+            assert_eq!(
+                fs::metadata(staged.staged_path.join(path))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o7777,
+                expected,
+                "{path}"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn registry_sync_refuses_a_key_that_is_not_a_single_segment() {
@@ -1862,6 +1941,17 @@ mod tests {
     fn parse_frontmatter_extracts_name() {
         let body = b"---\nname: hello\ndescription: greeter\n---\nbody\n";
         assert_eq!(parse_frontmatter_name(body).unwrap(), "hello");
+    }
+
+    #[test]
+    fn installer_uses_shared_frontmatter_without_weakening_name_checks() {
+        let body = "\u{feff}---\r\nname: 'hello'\r\ndescription: Deploy --- safely\r\n  with details: here\r\n---\r\nbody";
+        assert_eq!(parse_frontmatter_name(body.as_bytes()).unwrap(), "hello");
+        assert!(parse_frontmatter_name(body.replace("'hello'", "'../escape'").as_bytes()).is_err());
+        assert!(parse_frontmatter_name(b"---\nname: hello\ndescription: ''\n---\n").is_err());
+        assert!(
+            parse_frontmatter_name(b"---\nname: hello\ndescription: missing --- fence").is_err()
+        );
     }
 
     #[test]

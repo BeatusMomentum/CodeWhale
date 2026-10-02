@@ -1,3 +1,4 @@
+import { FakeDraftClaimLock } from "./draft-claim-lock.fake";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const securityMocks = vi.hoisted(() => ({
@@ -27,6 +28,7 @@ vi.mock("@/lib/github", async (importOriginal) => {
 
 import { POST as adminPost } from "../app/api/admin/post/route";
 import { GET as publicFeed } from "../app/api/github/feed/route";
+import { reviewedBodyHash } from "./community-agent";
 import { runPrReview, runTriage } from "./community-agent-tasks";
 
 class FakeKv {
@@ -144,7 +146,7 @@ describe("public security boundaries", () => {
     });
     vi.stubGlobal("fetch", triageFetch);
 
-    const triageEnv = { CURATED_KV: triageKv, DEEPSEEK_API_KEY: "test-key" };
+    const triageEnv = { CURATED_KV: triageKv, DRAFT_CLAIM_LOCK: new FakeDraftClaimLock(), DEEPSEEK_API_KEY: "test-key" };
     await expect(runTriage(triageEnv)).resolves.toMatchObject({ processed: 1, skipped: 0 });
     expect(securityMocks.agentChat).toHaveBeenCalledOnce();
     securityMocks.agentChat.mockClear();
@@ -170,7 +172,7 @@ describe("public security boundaries", () => {
     });
     vi.stubGlobal("fetch", prFetch);
 
-    const prEnv = { CURATED_KV: prKv, DEEPSEEK_API_KEY: "test-key" };
+    const prEnv = { CURATED_KV: prKv, DRAFT_CLAIM_LOCK: new FakeDraftClaimLock(), DEEPSEEK_API_KEY: "test-key" };
     await expect(runPrReview(prEnv)).resolves.toMatchObject({ processed: 1, skipped: 0 });
     expect(securityMocks.agentChat).toHaveBeenCalledOnce();
     securityMocks.agentChat.mockClear();
@@ -218,7 +220,12 @@ describe("public security boundaries", () => {
         cookie: "mt_sid=test-session",
         origin: "https://codewhale.net",
       },
-      body: JSON.stringify({ action: "post", draftKey: "draft:triage:42", lang: "zh" }),
+      body: JSON.stringify({
+        action: "post",
+        draftKey: "draft:triage:42",
+        lang: "zh",
+        reviewedSha256: await reviewedBodyHash("中文正文"),
+      }),
     }));
 
     await expect(response.json()).resolves.toMatchObject({ ok: true });

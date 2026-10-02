@@ -1,4 +1,4 @@
-<!-- source: README.md sha256:ccb7a0b00317 -->
+<!-- source: README.md sha256:925619135f77 -->
 # Codewhale
 
 Codewhale adalah agen sumber terbuka yang membaca proyek, mengedit berkas, menjalankan perintah, dan memeriksa hasil kerjanya dengan model yang dihosting atau model lokal pilihan Anda. Mulailah dengan satu tugas di terminal. Untuk pekerjaan yang lebih besar, bagikan sebagian pekerjaan kepada agen dengan model dan peran yang berbeda.
@@ -23,6 +23,8 @@ curl -fsSL https://codewhale.net/install.sh | sh
 "$HOME/.local/bin/codewhale"
 ```
 
+Jika menjalankan `codewhale` saja menampilkan "command not found", berarti `~/.local/bin` belum ada di PATH Anda: jalankan satu baris perintah yang dicetak installer untuk shell Anda, atau lihat [Menambahkannya ke PATH](docs/INSTALL.md#put-it-on-your-path).
+
 Installer memilih rilis terbaru yang sudah dipublikasikan. [Catatan perubahan](CHANGELOG.md) juga menjelaskan kandidat yang belum dipublikasikan untuk rilis berikutnya; perubahan tersebut baru disertakan dalam unduhan publik setelah rilisnya tersedia.
 
 Di Windows, unduh installer atau arsip yang sesuai dari [GitHub Releases](https://github.com/Hmbown/CodeWhale/releases/latest). Untuk instalasi biner langsung yang sudah ada, jalankan `codewhale update`, atau `codewhale update --check` untuk memeriksa tanpa memasang. Updater menampilkan jalur executable dan mempertahankan build yang lebih baru. npm dan Cargo adalah pilihan sekunder; lihat [panduan instalasi](docs/INSTALL.md) untuk migrasi dari pengelola paket dan pengaturan PATH.
@@ -33,7 +35,7 @@ Penyelesaian Tab cukup diaktifkan dengan satu perintah per shell — `codewhale 
 
 ## Penggunaan
 
-Buka terminal di folder proyek Anda dan jalankan `codewhale`. Pilih penyedia dengan `/provider` dan model dengan `/model`. Lalu jelaskan tugas yang konkret:
+Buka terminal di folder proyek Anda dan jalankan `codewhale` (setelah [ada di PATH](docs/INSTALL.md#put-it-on-your-path)). Pilih penyedia dengan `/provider` dan model dengan `/model`. Lalu jelaskan tugas yang konkret:
 
 ```text
 Fix the failing tests and explain what changed.
@@ -76,6 +78,7 @@ Baca [urutan otorisasi](docs/AUTHORIZATION_ORDER.md) untuk susunan kebijakan yan
 
 ## Dokumentasi
 
+- [Penyiapan peninjauan PR GitHub](docs/GITHUB_ACTION.md)
 - [Penyedia dan model lokal](docs/PROVIDERS.md)
 - [Tim agen](docs/FLEET.md)
 - [MCP](docs/MCP.md), [hook](docs/HOOKS.md), dan [konfigurasi](docs/CONFIGURATION.md)

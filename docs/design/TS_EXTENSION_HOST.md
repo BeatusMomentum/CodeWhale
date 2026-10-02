@@ -2,11 +2,204 @@
 
 > **Repository copy.** This is the design as reviewed on 2026-09-25, copied from
 > the private release plan (`codewhale-ops/releases/0.10.1/plans-20260925/`) so
-> the code and its design live together. Section "As built: phase 1" below
-> records where the phase-1 implementation (`crates/tui/extension-host/`,
+> the code and its design live together. The "As built" sections below
+> record where the implementation (`crates/tui/extension-host/`,
 > `crates/tui/src/extension_host/`, behind `[features] extension_host`) differs
-> from the text that follows. Where they disagree, that section and the code
-> are current; the rest is the plan for later phases.
+> from the text that follows. Where they disagree, the newest "As built"
+> section and the code are current; the rest is the plan for later phases.
+
+## As built: script tools lose self-approval and shadowing (2026-09-30)
+
+CURRENT_DECISIONS §26 D4 landed in Rust ahead of phase 4, so R1 below and
+D9 describe the old behaviour. In `crates/tui/src/tools/plugin.rs` and
+`ToolRegistry::apply_overrides`: a script's `# approval: auto` is ignored and
+the tool gets the default a script with no `approval:` line gets (`Suggest`),
+reported in the runtime log and `/plugin tools`; a `[tools.overrides]`
+`script` / `command` entry keyed by a built-in is refused, named once in a
+status line and in the runtime log, and the built-in stays active (`disabled` still works). D9(a) planned
+`Required`, rememberable per tool: `Suggest` and `Required` resolve the same
+way in `resolve_tool_permission`, and per-tool remembering was not built.
+
+## As built: Bun runtime (2026-09-30)
+
+The host can run on Bun as an opt-in: `[extension_host] runtime = "node" |
+"bun" | "auto"`, default `node`. It follows CURRENT_DECISIONS §26 (D1/D2 and
+the 2026-09-29 update "go to bun asap") and the 2026-09-29 Bun-vs-Node spike.
+Bun may become the default only after four gates are proven on every
+platform, followed by an explicit, recorded cutover. The table below is the
+record, measured on macOS 26.1 arm64 with Bun 1.4.0 and Node 22.20, 24.19 and
+26.10; there is no Linux or Windows Bun proof, so Node stays the default and
+the diagnosed fallback. The same embedded bundle runs on either runtime.
+
+| Gate | How it is closed | Evidence |
+| --- | --- | --- |
+| 1. `--no-install` always | `supervisor::runtime_args` passes `--no-install --no-env-file --config=<null device> --no-addons` to Bun | host test against a local recording registry (a control run without the flag does contact it); Rust launch-plan test |
+| 2. OS-enforced memory cap | Linux `RLIMIT_DATA`; Windows Job Object per-process limit; macOS + Bun: a fatal jetsam limit the host applies to itself | host test (Bun on macOS: `memory_limit_mib` reported, same pid, SIGKILL at 300 MiB); Rust `memory_cap_stops_a_{bun,node}_host` |
+| 3. FFI policy in the loader | `src/runtime.ts` locks `bun:ffi`, `Bun.FFI`, SQLite, Workers and ShadowRealm; the host refuses to start if a lock does not hold | host test with 13 entry points; each one is reachable when the lockdown is removed |
+| 4. `host/hello` reports the real runtime | `runtime: {name, version}` from `process.versions.bun` first; the handshake refuses a runtime or version mismatch | corpus 01/21/31–35; Rust handshake-mismatch test; host handshake test |
+
+- **Selection** (`dependencies::resolve_extension_host_runtime`). Unset
+  means `node`, or `bun` when the table sets only a `bun` path
+  (`ExtensionHostConfig::effective_runtime`). A configured `node`/`bun` path is
+  the only candidate for its runtime and fails resolution with its reason
+  rather than falling through. Otherwise each `bun` on `PATH`, then
+  `$BUN_INSTALL/bin` or `~/.bun/bin` (or each `node` on `PATH`) is run, and
+  the first at or above the floor (Bun **1.4.0**, Node `^22.19 || >=24`) is
+  taken. A searched candidate inside a `node_modules` directory or the working
+  directory is skipped without being run (not applied when the working
+  directory contains the user's home). `auto` tries Bun first and records why
+  Bun was not used when it takes Node. `bun` and `node` try only that runtime
+  and never fall back. For Node the resolver also probes which of
+  `--no-experimental-sqlite` and `--no-experimental-ffi` the binary accepts
+  (`node <flag> --version`).
+- **Pinned for the process.** The runtime is pinned once a host on it
+  completes the handshake. Every restart reuses it without resolving it
+  again, so a session cannot switch runtime. Under `auto`, a Bun host that
+  fails to launch or handshake before anything is pinned is reported once and
+  Node is resolved for the rest of the session. The handshake refuses a host
+  whose `host/hello` reports a different runtime, or a different version than
+  the pinned probe saw (the binary was replaced mid-session). `codewhale doctor`
+  prints the resolution (what, which version, where, the fallback reason and
+  how the memory cap is enforced). `/plugin` shows `running · pid … · bun
+  1.4.0 · …` and a `runtime:` line with the summary and memory posture.
+- **Protocol.** `host/hello.node_version` is replaced by
+  `runtime: {name: "bun" | "node", version}`, read from `process.versions.bun`
+  first (Bun emulates `process.versions.node`), plus an optional
+  `memory_limit_mib` (below). The protocol integer stays 1: the bundle and the
+  core always ship together. Corpus: `01`, `21`, `31`–`35`.
+- **Flags and environment** (`supervisor::runtime_args`, `runtime_env`). Node
+  keeps `--max-old-space-size=256 --disable-proto=throw --no-addons` and gets
+  whichever of `--no-experimental-sqlite --no-experimental-ffi` it accepts.
+  Bun ignores Node's heap and `__proto__` flags, so it gets `--no-install
+  --no-env-file --config=/dev/null --no-addons` and `BUN_JSC_useShadowRealm=0`.
+  Without them Bun fetches a missing package from npm while plugin code runs,
+  and loads `.env` and `bunfig.toml` (which can preload code) from the working
+  directory, which is the host's writable data dir.
+- **Module resolution** (`src/dsh/resolve-hooks.ts`). Bun has no
+  `module.registerHooks`, and its runtime `onResolve` is not called for bare
+  package names. So the Bun branch uses `Bun.plugin` in three pieces:
+  `build.module` serves each singleton by exact name. `onResolve` classifies
+  the subpaths Bun does pass it. `onLoad` refuses any file under a
+  `node_modules` copy of a peer (a second Cordis, a shipped
+  `@deepseek-ai/dsh-*`). A peer that is not installed at all is mapped from
+  Bun's `Cannot find package` to the same ``requires `X` `` error
+  (`explainImportError`).
+- **Native code** (`src/runtime.ts`, `denyNativeCode`). The checkpoint only
+  locked the `bun:ffi` export object. Probing found five ways around that:
+  `Bun.FFI` is a separate object with `dlopen`, `linkSymbols` and raw pointer
+  reads and writes; a Web Worker or `worker_threads` Worker is a new realm
+  with an untouched `bun:ffi`; `ShadowRealm#importValue('bun:ffi')` loads a
+  fresh copy, and a `node:vm` context hands out a working `ShadowRealm`
+  constructor even after the global is deleted; `bun:sqlite`
+  `setCustomSQLite` and SQLite extensions `dlopen` arbitrary libraries. Node
+  had gaps of its own: Node 26.10 ships `node:ffi` enabled, `--no-addons` does
+  not cover it or `node:sqlite` extension loading, and a Worker given its own
+  `execArgv` drops `--no-experimental-*`. Now, before any plugin loads:
+  `process.dlopen`, `process.execve` (which would drop the flags and the
+  macOS limit) and Worker threads are refused on both runtimes; under Bun,
+  the `bun:ffi`, `Bun.FFI`, `bun:sqlite` and `node:sqlite` exports are
+  throwing getters (for `node:sqlite`, whose ESM namespace Bun builds early,
+  every prototype method throws) and ShadowRealm is off engine-wide; under
+  Node, the two builtins are switched off by flags. The host then verifies
+  each Bun lock through a real `import()`, and checks ShadowRealm and the Node
+  builtins, and exits with an error rather than run with a lock that does not
+  hold. A process a plugin starts is outside this policy (as under Node);
+  Seatbelt stays the outer boundary on macOS. Known limit: this is a list of
+  the entry points found; one a newer runtime adds is not covered until it is
+  added.
+- **Memory cap** (1 GiB, `supervisor::MemoryEnforcement`). Linux:
+  `RLIMIT_DATA` between fork and exec (clamped to a lower inherited hard
+  limit), so the kernel fails an allocation past it; measured once in a Linux
+  container (2026-09-29), Node 24 cannot create the watchdog Worker at
+  512 MiB and Bun 1.4 aborts at startup at 256 MiB, and both run at 1 GiB.
+  Windows: the Job Object's per-process limit (`JOB_OBJECT_LIMIT_PROCESS_MEMORY`),
+  set just after spawn when the host joins its job. Both apply to every process
+  a plugin starts as well. macOS: `setrlimit(RLIMIT_AS/RLIMIT_DATA)` below the
+  current mapping size returns `EINVAL`, and `memorystatus_control` returns
+  `EPERM`. A fatal jetsam limit set as a `posix_spawn` attribute
+  (`posix_spawnattr_setjetsam_ext`, libSystem SPI) works unprivileged, but any
+  later `exec` clears it, so the core cannot set it on `sandbox-exec`. The Bun
+  host therefore re-executes itself in place (`POSIX_SPAWN_SETEXEC`: same pid,
+  process group, stdio and Seatbelt sandbox) with the limit, before any plugin
+  loads, using `bun:ffi` before the lockdown takes it away, and reports
+  `memory_limit_mib` in `host/hello`. The core accepts only the value it asked
+  for (`CODEWHALE_HOST_MEMORY_LIMIT_MIB`). Past the limit the kernel SIGKILLs
+  the host; the exit reason reports the SIGKILL and the configured limit but
+  not a cause, since any SIGKILL looks the same. Processes the host starts are not
+  covered. A Bun host that cannot apply the requested kernel limit is refused
+  before initialization, with the reason retained in its stderr and `/plugin`
+  diagnostics. A Node host on macOS is checked at each heartbeat instead,
+  which lags by up to one interval. Node's 256 MB heap
+  flag still applies everywhere.
+- **Tests.** The host JS suite runs under `node --test` and `bun test`
+  (`npm run test:bun`); each run spawns the host on the runtime running the
+  suite. CI adds a JS-suite Bun leg pinned to 1.4.0 on Linux and keeps the
+  Node leg. Rust covers the selection matrix and flag probe, the default and
+  config rule, the per-runtime launch flags and environment, the runtime and
+  version mismatch refusals, the `auto` fallback when Bun fails to start, a
+  Bun end-to-end run with a crash restart that stays on Bun, and the memory
+  cap: CI runs it with Node on Linux, macOS and Windows; the Bun case has run
+  on macOS only.
+
+Not done: the bundled single-executable host (`bun build --compile`, D1) is
+not built, signed or shipped; the host still runs on a user-installed Bun or
+Node. DSH's own loader, HMR and inspector bridge stay Node-only (spike §2); the
+Codewhale host does not use them. Bun on Linux runs under the same bwrap
+wrapper as Node, and on Windows is unsandboxed exactly as Node is. The Windows Job Object limit and the Linux `RLIMIT_DATA`
+path were not run on this machine; CI runs the memory-cap tests there. The
+Rust CI job still runs the Rust integration tests on Node only; the Bun ones
+skip there unless `CODEWHALE_EXT_HOST_BUN_TESTS` is set. So the Bun default
+cutover is not done: Node stays the default until the four gates hold on
+Linux and Windows too. Under Bun, a `tsconfig.json` next to or above a
+plugin's files (including one above the reviewed bundle) steers its imports
+through `paths`/`baseUrl`; Node ignores it. The Linux `RLIMIT_DATA` path
+clamps to a lower inherited hard limit and still reports the configured cap.
+The native-code lockdown covers the entry points found so far.
+
+## As built: phase 2a supervision (2026-09-29)
+
+The experimental host now has bounded lifecycle supervision. It uses the same
+Rust manager, owner registry, attachment snapshots, and approval gate:
+
+- `host/ping` runs every 3 seconds. A ping unanswered for 3 seconds marks the
+  host **Unresponsive**; after 10 seconds the existing process-tree supervisor
+  kills it. A pong restores Ready only for that generation. Deadlines use a
+  monotonic clock; laptop suspend/resume behavior has not been qualified.
+- Unexpected exits, protocol violations and hang kills share one crash budget.
+  Below 3 crashes in 5 minutes, the manager waits 250 ms then revalidates current
+  attachments and replays eligible owners with fresh generations and tokens.
+  The third crash stops recovery and retains the failure/stderr diagnostic.
+  Opening another engine and replaying a host never reset this budget.
+- In-flight tool calls fail with the existing typed unavailable error; they
+  are **never replayed**. Failed/faulted receipts remain suppressed. A crash
+  during the sole activating owner's initialization is attributed to that
+  receipt, so other valid plugins can recover.
+- Explicit plugin changes/reload clear the crash budget and retry failed
+  receipts through the existing `plugins_changed` path. Start failures also
+  permit a new engine attachment to retry once the one-minute cooldown has
+  elapsed. There is no automatic handshake/start-failure loop.
+- Old-generation callbacks and recovery tickets cannot mutate a newer host.
+  Planned shutdown is not a crash. Native-entry, staged-byte, persisted-state,
+  approval-grant and platform sandbox rules remain unchanged.
+- Two incomplete, leaking, malformed or failed teardowns in ten minutes request
+  one planned restart. The existing monitor waits until reconciliation and
+  all non-heartbeat requests are idle, then atomically closes request admission
+  before retiring the process tree. Current valid owners replay with fresh
+  tokens; calls are never replayed. This maintenance neither consumes nor
+  resets the unexpected-crash budget. Late old-process outcomes cannot dirty
+  the replacement.
+
+The authoring follow-up adds an escaped `/plugin show` owner section with state,
+live tools and up to 20 recent attributed messages from the bounded 64-entry
+shared diagnostic ring. Regular `.mts` entries use the same reviewed-byte and
+discovery rules as `.mjs`/`.js`; Node strips erasable types. The executable
+[hello extension](../examples/plugins/hello-extension/hello.mts) and
+[author guide](../EXTENSIONS.md) describe the actual services and trust loop.
+
+`exec.cwd` remains deferred: the current execution context does not expose the
+caller's workspace path. Commands, hooks, MCP, `core/call`, and sandbox parity
+also remain subsequent work. The following phase-1 section is its historical
+receipt, including the earlier lack of heartbeat/restart and `.mts` support.
 
 ## As built: phase 1 (2026-09-25)
 
@@ -30,8 +223,13 @@ differences from the text below:
   **What it does not do:** other user-readable files, including project `.env`
   files, stay readable (the `.env` filename rule has no Seatbelt subpath form),
   and Mach services and `exec` are not restricted, so this is defense in depth,
-  not the §4.5 containment. Linux and Windows run the host unsandboxed, and
-  `/plugin` says so. §4.5 remains the plan for real containment.
+  not the §4.5 containment. On Linux the same policy runs under bubblewrap
+  when a launch-time probe shows bwrap works; each Codewhale home is masked
+  whole and its readable entries bound again, since bwrap cannot deny a path
+  that does not exist yet (`extension_host::supervisor` lists what that does
+  not cover). Where bwrap is missing or cannot start, and on Windows, the host
+  runs unsandboxed, and `/plugin` and doctor say why. §4.5 remains the plan
+  for real containment.
 - **Extension tool names that the approval path keys by name are refused.**
   Approval keys (`approval_cache`), approval-card summaries and the approval /
   auto-review category are derived from the tool name. A plugin tool named
@@ -65,6 +263,53 @@ differences from the text below:
   thread (53 MB without it). `hyperfine` was not run.
 - **DSH references** are pinned to `refs/dsh` commit `00102833`
   (`0.1.7-alpha.2`); the local checkout's HEAD has since moved to `0d1f50007f`.
+
+**Phase-1 fixes (2026-09-28).**
+
+- **Engines attach; they do not own the host.** The host and its owner
+  registry are process-wide, but each engine holds a `HostAttachment` with
+  its own workspace plugin snapshot. Reconcile activates the union of what
+  every attached snapshot desires, re-verifying each snapshot against
+  persisted plugin state (so a disable or revoke through any registry
+  revokes everywhere), and revokes only owners no attachment desires. An
+  engine installs only the tools of owners its own snapshot desires. Engines
+  without a snapshot of their own (isolated chats, the empty fallback) do not
+  attach, and dropping an attachment detaches without revoking. Before this,
+  every engine's `sync` revoked whatever *its* registry did not desire, so
+  two workspaces, or one isolated chat, cancelled each other's in-flight
+  calls. The native-name set is now additive across engines.
+- **Session grants are bound to the reviewed build (§4.3).** Extension tools
+  key both the exact and the session-grant approval key as
+  `ext:<plugin_id>@<content_hash>:<name>:<hash(input)>`, through the
+  `ToolSpec::approval_scope` hook, so an updated plugin, or another plugin
+  that later takes the same tool name, is asked again. This only narrows
+  grants; widening them is an open decision.
+- **The native-entry rule is checked at review time.** "One `.mjs` or `.js`
+  file" is one function (`plugins::runtime::native_entry_problem`). With the
+  flag on, discovery reports a violating entry as an error diagnostic, so
+  `/plugin validate` and the review screen fail it, and activation refuses it.
+- **Code mode suspends extension tools for approval.** Lane 6562 landed
+  (#6583) before phase 1 (#6600), so acceptance 2's code-mode assertion is
+  "suspends for approval": an `execute_tools` call of an extension tool in a
+  main-session turn raises `<call>.<seq>` approval attributed to
+  `extension:<plugin>`, sends no `tool/call` before approval, returns the
+  result on allow and fails only that call on deny. Direct
+  `execute_tools_tool` with no gate still refuses it before any host call.
+- **The handshake timeout is 30 s**, not the 2 s §1.4 and §8 state
+  (`supervisor::HANDSHAKE_DEADLINE`). 5 s failed on loaded Windows CI with a
+  silent host (a cold `node` start plus an antivirus scan of the freshly
+  materialized bundle), and a miss fails the host for the whole session. The
+  handshake is off the first-prompt path, so 30 s (the MCP stdio handshake
+  budget) costs nothing when the host is healthy.
+- **A failed host is retried by a new engine, not by `/plugin enable`
+  itself.** In the TUI every plugin change respawns the engine, and
+  `Engine::new` calls `begin_session()`, which resets a failed host. On the
+  runtime-API path a plugin action retries a failed host only when it makes
+  a plugin the process has not yet seen desired; otherwise the host stays
+  failed until a new thread engine starts. Explicit retry is phase-2
+  supervision work.
+- **`hyperfine` was never run** for acceptance 7; the flag-off guarantees
+  rest on the never-spawned test and the pinned v3 policy digest.
 
 
 Status: **proposal**, 2026-09-25. Written for the founder direction of that date: move plugins, hooks, commands, custom tools, agent presets and MCP to TypeScript, using the same model as the DSH (DeepSeek Harness) plugin system, and make only that part of Codewhale extensible.
@@ -110,7 +355,7 @@ Checked against `/private/tmp/cw-wt-6446` @ `8a835d7c4`, lane `feat/code-mode-mc
 |---|---|---|---|
 | R1 | **A second custom-tool system already ships, outside plugin trust.** Scripts in `~/.codewhale/tools/` become model-visible tools on every turn. Each declares its own approval in frontmatter (`# approval: auto`). `ToolRegistry::register` *overwrites* a built-in of the same name with only a `warn!`. `[tools.overrides]` `Script` / `Command` entries replace built-ins on purpose. | `tools/plugin.rs:1-20,111`; `tools/registry.rs:53-63,375-414`; `core/engine.rs:4910,7360-7385` | Today, a script already approves itself and shadows built-ins. The founder's "only the TS host is extensible" requires moving this, so it is added to the deletion plan (§7) and decision D9. The host must not be weaker than this path, and must not copy it either. |
 | R2 | **Registry tools are the existing seam for extension tools; `ExternalToolDispatch` is not needed in phase 1.** The registry is rebuilt every turn (`build_turn_tool_registry_and_catalog`). Tools outside `DEFAULT_ACTIVE_NATIVE_TOOLS` are deferred by default (`tool_catalog.rs:136-149`). On main, code mode already sees registry tools and refuses the ones that need approval (`codemode.rs:233-238`). The lane gates "native, plugin, or MCP" nested calls with approval suspension (lane `codemode.rs:1-25`). | as cited | Phase-1 extension tools are `ToolSpec` adapters registered next to `configure_plugin_tools`. They get plan mode, the authority envelope, deferral, approval and code-mode gating from code that already exists. **Phase 1 does not depend on the unmerged lane.** `ExternalToolDispatch` is left as an MCP-only interface that the lane may adopt (§5.2). |
-| R3 | **The lane is not merged.** `origin/main` has code-mode Phase 1 (`e23ce514c`, which runs Auto-only nested calls and refuses MCP). The lane is 3 commits ahead. | `git log origin/main..feat/code-mode-mcp-6562` | Phase-1 acceptance cannot require "gated identically from `execute_tools` with `<parent>.<seq>` ids". On main, the assertion is "refused as needs-approval". Once the lane lands, it is "suspends for approval". |
+| R3 | **The lane is not merged.** `origin/main` has code-mode Phase 1 (`e23ce514c`, which runs Auto-only nested calls and refuses MCP). The lane is 3 commits ahead. | `git log origin/main..feat/code-mode-mcp-6562` | Phase-1 acceptance cannot require "gated identically from `execute_tools` with `<parent>.<seq>` ids". On main, the assertion is "refused as needs-approval". Once the lane lands, it is "suspends for approval". **Resolved:** the lane landed first (#6583, then #6600), and the phase-1 fixes assert "suspends for approval" (`execute_tools_gates_an_extension_tool_before_any_host_call`). |
 | R4 | **The self-declared read-only hint is an auto-approve.** `approval_hint_for` → `TrustedReadOnly` → `ApprovalRequirement::Auto` (`mcp.rs:1265-1274`, `tool_preparation.rs:46-48`, test at `:537-540`). | as cited | If extension tools honoured `presentCall` / `kind: 'read'` (old §4.3), a plugin would switch off approval for its own tools, and those tools run arbitrary Node. **Removed.** Extension tools are always `Required` (§4.3). |
 | R5 | **Secrets are on disk, readable by any same-user process.** The default secret backend is `~/.codewhale/secrets/` (`crates/secrets/src/lib.rs:64-69`). MCP OAuth tokens are re-read "from the on-disk credential" (`mcp/oauth.rs:749-752`). | as cited | "Tokens never enter Node" and "one gate *even if the host is compromised*" (old §4.4, §5.1) are false until the phase-5 sandbox denies those paths. They are restated as protocol properties, not containment (§4.1, §4.4). |
 | R6 | **The protocol names a mechanism that does not exist.** No `change:tool_surface` exists anywhere in `crates/tui/src`. | grep | Removed. Per-turn rebuild plus a liveness check at dispatch time is enough (§3.3). |
@@ -167,7 +412,8 @@ The package goes at **`crates/tui/extension-host/`**, named `@codewhale/extensio
 crates/tui/extension-host/
   package.json          engines.node "^22.19.0 || >=24.0.0"; build + test scripts
   src/main.ts           boot: framing, console rebinding, parent watchdog, crash attribution
-  src/protocol.gen.ts   GENERATED from Rust (phase 2; hand-written + conformance corpus in phase 1)
+  src/protocol.generated.ts  GENERATED from the Rust protocol types (constants, method table, params shapes, types)
+  src/protocol.ts       frame codec + envelope checks over the generated shapes
   src/root.ts           Cordis root, shim services, refusal list
   src/shims/{tools,commands,skills,system-prompt,mcp-resources,logger}.ts
   src/dsh/{resolve-hooks,profile,dsh-tools-compat}.ts
@@ -293,11 +539,11 @@ Rust then respawns the host and replays activations from its own record of which
 - **Rust serde types are the source of truth.** They go in `crates/tui/src/extension_host/protocol.rs`, not `crates/protocol`, because the host protocol is private to the engine process and the app-server has no reason to see it.
   - Host → core types use `#[serde(deny_unknown_fields, tag = "kind")]`, because host output is untrusted input.
   - Core → host types are tolerant.
-- **Generated TypeScript.** `schemars` (already a `crates/tui` dependency) generates `extension-host-protocol.schema.json`. `json-schema-to-typescript` turns that into `src/protocol.gen.ts`, which is committed, with a CI drift check. Phase 1 uses hand-written TS types plus a shared JSON fixture corpus (`crates/tui/tests/fixtures/extension_host/*.json`) that both sides must parse and round-trip.
+- **Generated TypeScript.** `schemars` (already a `crates/tui` dependency, derived on the wire types under `cfg(test)`) reads each type's serde shape, and a Rust test (`crates/tui/src/extension_host/protocol/tests.rs`) renders `src/protocol.generated.ts` from it and from the Rust method table (`protocol::METHODS`): constants, error codes, the method table, every params shape the host validates, and the wire types. The file is committed and the test fails on drift (re-record with `CODEWHALE_CONFORMANCE_UPDATE=1`, then rebuild `dist/`); no npm generator is involved. Both sides still parse and round-trip the shared JSON fixture corpus (`crates/tui/tests/fixtures/extension_host/protocol/*.json`).
 - **Handshake:**
 
   ```
-  host → core  host/hello      {protocol: {min: 1, max: 1}, host_version, bundle_sha256, node_version,
+  host → core  host/hello      {protocol: {min: 1, max: 1}, host_version, bundle_sha256, runtime: {name, version},
                                 required_caps: [...], optional_caps: [...]}
   core → host  host/initialize {protocol: 1, session_runtime_id, workspace_roots, caps_granted: [...],
                                 limits: {max_frame, max_inflight, hook_deadline_ms, dispose_deadline_ms}}
@@ -656,10 +902,10 @@ This follows "migrate the last consumer or do not start". Every phase's exit cri
 
 | Order | Deleted | ≈ prod lines | Consumers that must migrate first |
 |---|---|---|---|
-| **0** (independent, now) | `crates/mcp` client half: `McpManager`, `InMemoryMcpClient`, `ChildProcessMcpClient` (`stdio_client.rs`), plus the `McpManager::default()` wiring in `crates/core/src/lib.rs:2460` and `crates/app-server/src/lib.rs:823` | ~1,730 | No live *server registration* (`register_server` has no production caller). **But there are live readers that must migrate in the same PR:** the `mcp_manager` field and the `McpManagerStartupStatus` → `codewhale_protocol::McpStartupStatus` mapping (`crates/core/src/lib.rs:24,902,914,1278-1285`); the app-server `/mcp/startup` route, which is also in `ADVERTISED_ROUTES` (`crates/app-server/src/lib.rs:376,394`); and its row in `docs/RUNTIME_API.md:55`. Either `/mcp/startup` reads the engine's `McpManagerSnapshot`, or it is removed from the route, the advertised list and the doc together. (No GPUI app caller was found by grep.) Closes SHA-6521 / #6142 |
+| **0** | `crates/mcp` client pool, `InMemoryMcpClient`, `ChildProcessMcpClient` and legacy CLI aggregation proxy | Removed in the 0.10.1 completion source | The earlier "no production caller" premise was false: the CLI proxy spawned registered child clients. Under the recorded founder D5 decision, that proxy is removed and `mcp-server` delegates to existing native `serve --mcp`. The unused Core/App-server pool and `/mcp/startup` route/docs were removed together. The small shared bounded instruction sanitizer remains; saved legacy definitions are preserved without a new reader/writer. Hosted and package acceptance are separate pending receipts. |
 | **1** (no deletion) | Nothing. Phase 1 adds the host behind the flag and deletes nothing, because no consumer has moved yet. The `ExternalToolDispatch` seam is the lane's option or phase 3's work (§5.2) | 0 | — |
 | **3** (MCP move) | `McpConnection`, transport trait, discovery, pool connect / supervise / backoff / reconnect / stale retry / route (`mcp.rs` ~1466–2660 and most of 2709–5240); `mcp/{sse, streamable_http, http, http_client, wire, headers}.rs`; stdio framing (spawn moves to the broker); about half of `mcp/tests.rs` | ~4,700 | `core/engine.rs`, `turn_loop.rs`, `tool_execution.rs`, `tool_preparation.rs`, `dispatch.rs`, `runtime_api.rs`, `hooks/executor.rs`, `tools/subagent/mod.rs`, `tools/runtime_mcp.rs`, `tools/registry.rs`, `codemode.rs`, `lib.rs`, `tui/views/extensions.rs`, `tui/command_palette.rs`, `tui/setup/tools_mcp.rs`. All of them go through `HostMcpClient`'s snapshot API or `ExternalToolDispatch` |
-| **3** | `crates/mcp` `run_stdio_server` (CLI `mcp-server` aggregating proxy) | ~900 | **Founder call:** re-host it with the SDK server package in the host, or drop it |
+| **0** | Legacy `run_stdio_server` aggregating proxy | Removed with its last CLI consumer | Founder D5 drops the proxy. The CLI spelling remains an alias of the native server and introduces no SDK proxy or second client pool. |
 | **4** (hooks) | `hooks/executor.rs` orchestration: matching, env building, sync and background runs, observers, message-submit transform; part of `hooks/config.rs` validation | ~2,450 | Turn-loop fire points (kept), `tui/ui/observer_hooks.rs`, `exec_agent`. **Kept in Rust:** the verdict fold, `authority.rs` project-hook receipts, output sanitizers, and the process tree (moved into the broker) |
 | **4** (script tools, new row, R1) | `tools/plugin.rs` (`ScriptPluginTool`, `CommandPluginTool`, frontmatter parser; 893 lines incl. tests), `ToolRegistry::load_plugins`, the non-`Disabled` arms of `apply_overrides`, `configure_plugin_tools` (`core/engine.rs:7360-7400`) | ~700 | Users' `~/.codewhale/tools/*` scripts and `[tools.overrides]` `Script` / `Command` entries. They become one `builtin:script-tools` host plugin: each script is registered as an extension tool, spawned through the broker (the same executor as shell hooks, which is why this lands with phase 4). **Two user-visible changes are decision D9:** `# approval: auto` is no longer honoured (Required, rememberable), and a script can no longer replace a built-in. `[tools.overrides] X = "disabled"` stays in Rust: it is configuration, not extensibility |
 | **5** (DSH native) | The conversion half of `install/dsh.rs` and `commands/groups/plugins/dsh_import.rs`, `dsh_tests.rs`; the DSH dialects of `scripts/convert-plugin.py` (the OpenCode dialect stays) | ~2,010 + ~200 py | `/plugin import dsh` and `POST /v1/apps/plugins/import/dsh/preview` become install-and-review of a host package |
@@ -739,7 +985,7 @@ This follows "migrate the last consumer or do not start". Every phase's exit cri
    - the tool is **deferred** and reachable through `tool_search`;
    - the approval request is raised (`Required`), and its text names `extension:dsh-workspace-deps`;
    - after approval, the result JSON comes from the fixture payload;
-   - the same call from `execute_tools` on **main** is refused as needs-approval, with a receipt and no host `tool/call` sent. (Once lane 6562 lands, this assertion becomes "suspends for approval, `<parent>.<seq>` id"; that edit belongs to whichever of the two PRs lands second.)
+   - the same call from `execute_tools` in a main-session turn suspends for approval with a `<parent>.<seq>` id attributed to `extension:<plugin>`, and no host `tool/call` is sent before approval; allow returns the result to the program and deny fails only that nested call. (Lane 6562 landed first, as #6583; the assertion was updated in the phase-1 fixes. Without a gate, `execute_tools` still refuses it as needs-approval.)
 3. Disabling the plugin mid-call: Rust's registry drops the handle at once; the in-flight call resolves as cancelled within 500 ms; the host acks `disposed` only after the async disposer settles, and `leaked` is empty.
 4. `kill -9` on the host: the in-flight call fails with the typed `not_available("extension host exited")`; `/plugin` shows *failed* with the stderr tail; nothing respawns until the next session or `/plugin enable`.
 5. The `refuses-approval` fixture FAILS activation with a diagnostic, and no registration survives on either side.
@@ -857,7 +1103,7 @@ This follows the evidence rules in AGENTS.md: match the evidence to the surface.
   - (c) Keep a Rust MCP fallback. **This reintroduces two stacks; I advise against it.**
 - **D2. Node floor.** `^22.19 || >=24` for the host, matching DSH. I recommend it: Node 20 is end-of-life, and `module.registerHooks` needs ≥22.15. Computer Use is a separate MCP server process (R7) and keeps its own `>=20` floor. Several CI jobs still pin Node 20 (`ci.yml` version-drift and conversion jobs, release workflows), and none of them run host code.
 - **D3. Stdio secrets.** Relayed broker, which I recommend; or a `direct_stdio` ticket for builtin servers only if the phase-3 latency gate fails.
-- **D4. `crates/mcp run_stdio_server`** (the `codewhale mcp-server` proxy): re-host it in TS or drop it.
+- **D4. Legacy stdio proxy:** resolved by Ops CURRENT_DECISIONS §26 D5: drop it. The native `serve --mcp` server remains.
 - **D5. Third-party host plugins that need ambient network or exec** under the phase-5 sandbox: refuse them, or offer an explicit "unsandboxed host" tier with its own warning.
 - **D6. Native addons (`.node`) in host packages.** Refuse them in v1, which I recommend: they defeat the closure hash and the sandbox story.
 - **D7. `integrations/dsh` external launcher:** keep it or delete it once native loading lands.

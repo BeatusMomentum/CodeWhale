@@ -57,6 +57,7 @@ use crate::tui::selection::{SelectionAutoscroll, TranscriptSelectionPoint};
 use codewhale_models::Role;
 use tempfile::TempDir;
 
+mod conversation_undo;
 mod model_picker_actions;
 mod runtime_store_binding;
 
@@ -72,6 +73,7 @@ fn failed_engine_channel_settles_classifier_batch_once() {
         chrono::Utc::now(),
     );
     let batch = crate::cost_status::RuntimeUsageBatch {
+        decisions: Vec::new(),
         records: vec![crate::cost_status::RuntimeUsageRecord {
             source_id: "auto-router:dispatch-usage".to_string(),
             usage: crate::cost_status::EffectiveRouteUsage {
@@ -880,6 +882,10 @@ fn bracketed_paste_returns_dock_focus_to_the_visible_composer() {
 /// One representative terminal encoding per shell binding.
 fn shell_binding_probe(id: ShellBindingId) -> KeyEvent {
     match id {
+        ShellBindingId::ElevationUp => KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+        ShellBindingId::ElevationDown => KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+        ShellBindingId::ElevationConfirm => KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        ShellBindingId::ElevationAbort => KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
         ShellBindingId::PetResultUp => KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
         ShellBindingId::PetResultDown => KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
         ShellBindingId::PetResultPageUp => KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE),
@@ -2524,6 +2530,47 @@ fn failed_workflow_run_raises_a_sticky_error() {
 }
 
 #[test]
+fn failed_workflow_toast_names_the_agents_cause_not_the_aggregate() {
+    let mut app = create_test_app();
+    app.current_session_id = Some("session-a".to_string());
+    let events = [
+        serde_json::json!({"type": "run_started", "at_ms": 1, "workflow_goal": "Audit"}),
+        serde_json::json!({"type": "task_started", "at_ms": 2, "task_id": "t1", "label": "a"}),
+        serde_json::json!({"type": "task_started", "at_ms": 2, "task_id": "t2", "label": "b"}),
+        serde_json::json!({
+            "type": "task_completed", "at_ms": 300, "task_id": "t1", "status": "failed",
+            "reason": "[auth] Authorization failed: You have run out of credits or need a Grok subscription. Top up."
+        }),
+        serde_json::json!({
+            "type": "task_completed", "at_ms": 300, "task_id": "t2", "status": "failed",
+            "reason": "[auth] Authorization failed: You have run out of credits or need a Grok subscription. Top up."
+        }),
+        serde_json::json!({
+            "type": "run_completed", "at_ms": 356, "status": "failed",
+            "error": "no task produced a result: all 2 task(s) failed and 1 fan-out(s) lost every slot"
+        }),
+    ];
+    for event in &events {
+        assert!(apply_owned_workflow_ui_event(
+            &mut app,
+            "session-a",
+            "workflow-auth",
+            event,
+        ));
+    }
+    let sticky = app.sticky_status.as_ref().expect("failed run is loud");
+    // The toast text still passes the key-based secret redactor, which masks
+    // whatever follows an `Authorization …:` key; the cause's name survives.
+    assert!(
+        sticky.text.contains("Authorization failed")
+            && !sticky.text.contains("no task produced a result")
+            && !sticky.text.contains("[auth]"),
+        "the toast must carry the same cause as the workbar: {:?}",
+        sticky.text
+    );
+}
+
+#[test]
 fn successful_workflow_run_raises_no_failure_toast() {
     let mut app = create_test_app();
     app.current_session_id = Some("session-a".to_string());
@@ -2883,8 +2930,86 @@ async fn mcp_mutations_while_turn_running_defer_the_live_pool_refresh() {
     )));
 }
 
+fn mcp_retry_snapshot_row(
+    name: &str,
+    connected: bool,
+    error: Option<&str>,
+    auth_required: bool,
+    tools: usize,
+) -> crate::mcp::McpServerSnapshot {
+    crate::mcp::McpServerSnapshot {
+        name: name.into(),
+        enabled: true,
+        required: false,
+        transport: "stdio".into(),
+        command_or_url: "fixture-mcp".into(),
+        connect_timeout: 5,
+        execute_timeout: 5,
+        read_timeout: 5,
+        connected,
+        error: error.map(str::to_string),
+        auth_required,
+        capability_metadata: if connected {
+            crate::mcp::McpServerCapabilityMetadata::LegacyFallback
+        } else {
+            crate::mcp::McpServerCapabilityMetadata::NotObserved
+        },
+        tools: (0..tools)
+            .map(|index| crate::mcp::McpDiscoveredItem {
+                name: format!("tool{index}"),
+                model_name: format!("mcp_{name}_tool{index}"),
+                description: None,
+            })
+            .collect(),
+        resources: Vec::new(),
+        prompts: Vec::new(),
+    }
+}
+
+/// Answer the next `/mcp retry` op the background task sends, then poll the
+/// UI until the outcome is delivered.
+async fn answer_mcp_retry(
+    app: &mut App,
+    mock: &mut crate::core::engine::MockEngineHandle,
+    expected: &str,
+    row: crate::mcp::McpServerSnapshot,
+) {
+    let op = tokio::time::timeout(Duration::from_secs(2), mock.rx_op.recv())
+        .await
+        .expect("the retry op reaches the engine mailbox")
+        .expect("engine mailbox open");
+    let Op::RetryMcpServer { name, tx } = op else {
+        panic!("expected RetryMcpServer");
+    };
+    assert_eq!(name, expected);
+    let sender = tx.lock().unwrap().take().expect("retry reply sender");
+    sender
+        .send(Ok(crate::core::ops::McpManagerUpdate {
+            snapshot: crate::mcp::McpManagerSnapshot {
+                config_path: PathBuf::from("mcp.json"),
+                config_exists: true,
+                reload_required: false,
+                servers: vec![row],
+            },
+            generation: app.mcp_snapshot_generation + 1,
+        }))
+        .unwrap();
+    for _ in 0..200 {
+        poll_mcp_retries(app);
+        if app.mcp_retries.is_empty() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    panic!("the retry outcome was never delivered");
+}
+
+/// Founder run: Enter on `reconnect` while a turn ran printed "run /mcp
+/// retry linear again after the turn finishes" and did nothing else. The
+/// retry is now queued behind the turn (the engine mailbox is the queue), the
+/// panel says so, and the outcome is reported when it lands.
 #[tokio::test]
-async fn mcp_retry_while_turn_running_names_the_deferral_and_never_awaits() {
+async fn mcp_retry_while_turn_running_is_queued_then_reports_its_outcome() {
     use crate::tui::app::McpUiAction;
 
     let mut app = create_test_app();
@@ -2903,11 +3028,123 @@ async fn mcp_retry_while_turn_running_names_the_deferral_and_never_awaits() {
     )
     .await
     .expect("retry must not park the UI loop behind the running turn (#6159)");
-    assert!(mock.rx_op.try_recv().is_err());
-    assert!(app.history.iter().any(|cell| matches!(
-        cell,
-        HistoryCell::System { content } if content.contains("/mcp retry flaky")
-    )));
+    assert_eq!(app.mcp_retries.len(), 1);
+    assert!(app.mcp_retries[0].queued);
+    let notice = app.status_toasts.back().unwrap().text.clone();
+    assert!(
+        notice.contains("flaky will reconnect as soon as it finishes"),
+        "{notice}"
+    );
+    assert!(
+        !notice.contains("again"),
+        "the person asked once; they are not told to ask again: {notice}"
+    );
+
+    // A second press while it is pending does not stack a second op.
+    handle_mcp_ui_action(
+        &mut app,
+        &mock.handle,
+        &Config::default(),
+        McpUiAction::Retry {
+            name: "flaky".to_string(),
+        },
+    )
+    .await;
+    assert_eq!(app.mcp_retries.len(), 1);
+
+    answer_mcp_retry(
+        &mut app,
+        &mut mock,
+        "flaky",
+        mcp_retry_snapshot_row(
+            "flaky",
+            false,
+            Some("MCP server 'flaky' rejected initialize (command `uvx`): -32602"),
+            false,
+            0,
+        ),
+    )
+    .await;
+    assert!(
+        mock.rx_op.try_recv().is_err(),
+        "exactly one retry op for one pending row"
+    );
+    let receipt = app.status_toasts.back().unwrap();
+    assert_eq!(receipt.level, StatusToastLevel::Error);
+    assert!(
+        receipt
+            .text
+            .contains("flaky did not connect: MCP server 'flaky' rejected initialize"),
+        "{}",
+        receipt.text
+    );
+    let observed = &app.mcp_snapshot.as_ref().unwrap().servers[0];
+    assert!(observed.error.is_some(), "the panel reads the same outcome");
+}
+
+#[tokio::test]
+async fn mcp_retry_reports_connected_and_needs_login_outcomes() {
+    use crate::tui::app::McpUiAction;
+
+    let mut app = create_test_app();
+    let mut mock = mock_engine_handle();
+    handle_mcp_ui_action(
+        &mut app,
+        &mock.handle,
+        &Config::default(),
+        McpUiAction::Retry {
+            name: "github".to_string(),
+        },
+    )
+    .await;
+    assert!(!app.mcp_retries[0].queued, "an idle engine connects now");
+    assert!(
+        app.status_toasts
+            .back()
+            .unwrap()
+            .text
+            .contains("Connecting github")
+    );
+    answer_mcp_retry(
+        &mut app,
+        &mut mock,
+        "github",
+        mcp_retry_snapshot_row("github", true, None, false, 3),
+    )
+    .await;
+    let receipt = app.status_toasts.back().unwrap();
+    assert_eq!(receipt.level, StatusToastLevel::Success);
+    assert!(
+        receipt.text.contains("github connected: 3 tool(s)"),
+        "{}",
+        receipt.text
+    );
+
+    handle_mcp_ui_action(
+        &mut app,
+        &mock.handle,
+        &Config::default(),
+        McpUiAction::Retry {
+            name: "stripe".to_string(),
+        },
+    )
+    .await;
+    answer_mcp_retry(
+        &mut app,
+        &mut mock,
+        "stripe",
+        mcp_retry_snapshot_row("stripe", false, Some("HTTP 401 Unauthorized"), true, 0),
+    )
+    .await;
+    let receipt = app.status_toasts.back().unwrap();
+    assert_eq!(receipt.level, StatusToastLevel::Warning);
+    assert!(
+        receipt
+            .text
+            .contains("stripe needs a login: run /mcp login stripe"),
+        "{}",
+        receipt.text
+    );
 }
 
 #[tokio::test]
@@ -4127,6 +4364,10 @@ fn selection_to_text_strips_nested_blockquote_rails() {
 #[test]
 fn selection_to_text_copies_rendered_transcript_block() {
     let mut app = create_test_app();
+    app.calm_mode = true;
+    app.show_thinking = true;
+    app.verbose_transcript = false;
+    app.thinking_default_expanded = false;
     app.history = vec![
         HistoryCell::System {
             content: "copy system".to_string(),
@@ -4178,17 +4419,16 @@ fn selection_to_text_copies_rendered_transcript_block() {
     let selected = selection_to_text(&app).expect("selection text");
     assert!(selected.contains("Note copy system"), "{selected:?}");
     assert!(selected.contains("copy user"), "{selected:?}");
-    // Short completed thinking now renders inline (v0.8.42 thinking-preview
-    // change); it should be selectable/copyable as visible transcript text.
+    // Calm keeps settled reasoning behind its disclosure. Copying the
+    // collapsed transcript must not reveal a body the reader cannot see.
     assert!(
-        selected.contains("copy thinking"),
-        "short completed thinking should be visible inline: {selected:?}"
+        !selected.contains("copy thinking"),
+        "collapsed reasoning leaked into the selection: {selected:?}"
     );
-    // Short thinking that fits entirely inline doesn't need the Ctrl+O
-    // affordance; only truncated or explicit-summary thinking shows it.
+    // Disclosure controls are UI chrome, not conversation content.
     assert!(
         !selected.contains("Ctrl+O"),
-        "short completed thinking should not show the detail affordance: {selected:?}"
+        "detail affordance leaked into the selection: {selected:?}"
     );
     assert!(selected.contains("run Done · cargo check"), "{selected:?}");
     assert!(selected.contains("copy assistant"), "{selected:?}");
@@ -4201,6 +4441,30 @@ fn selection_to_text_copies_rendered_transcript_block() {
             "line {idx} retained tool-card rail prefix: {line:?}"
         );
     }
+
+    // The same stored body becomes selectable when the reader expands it.
+    // This distinguishes correct folding from losing reasoning altogether.
+    app.thinking_folds.insert(2, ThinkingFold::Expanded);
+    app.viewport.transcript_cache.ensure_split(
+        &[&app.history],
+        &app.history_revisions,
+        80,
+        app.transcript_render_options(),
+        &app.thinking_folds,
+        None,
+        None,
+    );
+    assert!(
+        app.viewport
+            .transcript_cache
+            .lines()
+            .iter()
+            .any(|line| line.to_string().contains("copy thinking")),
+        "expanded reasoning must be rendered before it can be copied"
+    );
+    select_full_transcript(&mut app);
+    let expanded = selection_to_text(&app).expect("expanded selection text");
+    assert!(expanded.contains("copy thinking"), "{expanded:?}");
 }
 
 #[test]
@@ -6347,7 +6611,7 @@ fn completed_answer_clears_stale_reasoning_expand_hint() {
 #[test]
 fn selected_reasoning_hint_and_space_share_one_owner() {
     let mut app = create_test_app();
-    app.history = vec![oversized_reasoning("selected", false)];
+    app.history = vec![oversized_reasoning("selected", true)];
     app.resync_history_revisions();
     let _ = render_underwater_test_app(&mut app, 100, 32);
     select_original_cell(&mut app, 0);
@@ -6401,6 +6665,19 @@ fn selected_reasoning_hint_and_space_share_one_owner() {
         })
     );
 
+    app.history[0] = oversized_reasoning("selected", false);
+    app.bump_history_cell(0);
+    let _ = render_underwater_test_app(&mut app, 100, 32);
+    assert_eq!(app.thinking_folds.get(&0), Some(&ThinkingFold::Expanded));
+    assert!(
+        app.viewport
+            .transcript_cache
+            .lines()
+            .iter()
+            .any(|line| line.to_string().contains("selected line 40")),
+        "settling must not override the user's explicit expansion"
+    );
+
     assert!(handle_transcript_space(&mut app));
     assert_eq!(
         app.thinking_folds.get(&0),
@@ -6431,8 +6708,8 @@ fn selected_reasoning_actions_roundtrip_for_every_expansion_baseline() {
                     app.thinking_folds.insert(0, fold);
                 }
                 app.resync_history_revisions();
-                // The adaptive preview fills spare viewport rows. Keep the
-                // 40-line body larger than the pane so both actions exist.
+                // Keep a long body so expanded and collapsed states are
+                // observably different under every preference baseline.
                 let _ = render_underwater_test_app(&mut app, 100, 32);
                 select_original_cell(&mut app, 0);
 
@@ -6661,41 +6938,38 @@ fn latest_streaming_reasoning_owns_space_after_an_older_tool() {
 }
 
 #[test]
-fn reasoning_preview_spends_available_viewport_rows_before_truncating() {
-    for streaming in [false, true] {
-        let mut roomy = create_test_app();
-        roomy.history = vec![reasoning_with_lines("roomy", 20, streaming)];
-        roomy.resync_history_revisions();
-        let roomy_surface = render_underwater_test_app(&mut roomy, 100, 32);
-
-        assert!(roomy_surface.contains("roomy line 01"), "{roomy_surface}");
-        assert!(roomy_surface.contains("roomy line 20"), "{roomy_surface}");
-        assert!(
-            !roomy_surface.contains("Space:expand"),
-            "a body that fits the live viewport must not be truncated: {roomy_surface}"
-        );
-        assert!(
-            roomy.viewport.last_transcript_total <= roomy.viewport.last_transcript_visible,
-            "the complete reasoning body should fit without scrolling"
-        );
-
-        let mut compact = create_test_app();
-        compact.history = vec![reasoning_with_lines("compact", 20, streaming)];
-        compact.resync_history_revisions();
-        let compact_surface = render_underwater_test_app(&mut compact, 60, 12);
-        assert!(
-            compact_surface.contains("Space:expand"),
-            "{compact_surface}"
-        );
-        assert_eq!(
-            compact.viewport.last_transcript_total,
-            if streaming {
-                14
+#[allow(clippy::print_stderr)]
+fn calm1_reasoning_frames_keep_fixed_budgets_and_explicit_expansion() {
+    for (width, height) in [(40, 12), (60, 16), (80, 24), (140, 40)] {
+        for (streaming, expanded) in [(true, false), (false, false), (false, true)] {
+            let mut app = create_test_app();
+            app.calm_mode = true;
+            app.history = vec![reasoning_with_lines("fixture", 20, streaming)];
+            app.resync_history_revisions();
+            if expanded {
+                app.thinking_folds.insert(0, ThinkingFold::Expanded);
+            }
+            let surface = render_underwater_test_app(&mut app, width, height);
+            let rows = app.viewport.last_transcript_total;
+            if expanded {
+                assert!(rows >= 21);
+                assert_eq!(app.thinking_folds.get(&0), Some(&ThinkingFold::Expanded));
+                assert!(surface.contains("fixture line 20"), "{surface}");
             } else {
-                compact.viewport.last_transcript_visible
-            },
-            "streaming keeps its 12-row fallback while completed thought spends the visible viewport before truncating: {compact_surface}"
-        );
+                assert_eq!(rows, if streaming { 4 } else { 1 }, "{surface}");
+                assert_eq!(reasoning_hint_cells(&app), vec![0]);
+                if rows <= app.viewport.last_transcript_visible {
+                    assert!(surface.contains("Space:expand"), "{surface}");
+                }
+                assert!(!surface.contains("fixture line 01"), "{surface}");
+                if streaming {
+                    assert!(surface.contains("fixture line 20"), "{surface}");
+                }
+            }
+            eprintln!(
+                "calm1 frame {width}x{height}: streaming={streaming} expanded={expanded}, transcript_rows={rows}"
+            );
+        }
     }
 }
 
@@ -7047,10 +7321,25 @@ fn pending_scroll_retargets_reasoning_in_the_same_frame() {
     app.resync_history_revisions();
     let _ = render_underwater_test_app(&mut app, 60, 8);
     assert_eq!(reasoning_hint_cells(&app), vec![1]);
+    assert_eq!(app.viewport.last_transcript_top, 0);
+    assert!(app.viewport.last_transcript_total <= app.viewport.last_transcript_visible);
+    // Both compact headers fit. Scrolling an already fitting transcript must
+    // keep the newest visible owner, not invent a hidden newer cell.
     app.viewport.pending_scroll_delta = -1_000_000;
     let _ = render_underwater_test_app(&mut app, 60, 8);
+    assert_eq!(reasoning_hint_cells(&app), vec![1]);
+
+    // Now force a real viewport boundary and prove the fixture's geometry.
+    app.viewport.transcript_scroll = TranscriptScroll::to_bottom();
+    let _ = render_underwater_test_app(&mut app, 60, 5);
+    assert_eq!(app.viewport.last_transcript_visible, 1);
+    assert!(app.viewport.last_transcript_top > 0);
+    assert_eq!(reasoning_hint_cells(&app), vec![1]);
+    app.viewport.pending_scroll_delta = -1_000_000;
+    let surface = render_underwater_test_app(&mut app, 60, 5);
     assert_eq!(app.viewport.last_transcript_top, 0);
     assert_eq!(reasoning_hint_cells(&app), vec![0]);
+    assert!(surface.contains("Space:expand"), "{surface}");
     assert_eq!(
         app.viewport
             .transcript_cache
@@ -7065,18 +7354,19 @@ fn visible_older_reasoning_owns_space_over_a_newer_offscreen_tool() {
     let mut app = create_test_app();
     app.history = vec![long_reasoning("visible", false), running_exec_cell()];
     app.resync_history_revisions();
-    let _ = render_underwater_test_app(&mut app, 60, 8);
+    let _ = render_underwater_test_app(&mut app, 60, 5);
+    assert_eq!(app.viewport.last_transcript_visible, 1);
     assert_eq!(
         app.transcript_action_owner().map(|owner| owner.cell_index),
         Some(1)
     );
 
-    // The configurable two-line completed preview puts the Space affordance
-    // immediately after the header + body, so scroll one row to keep that
-    // action visible while the newer tool remains below the viewport.
-    app.viewport.transcript_scroll = TranscriptScroll::at_line(1);
-    let surface = render_underwater_test_app(&mut app, 60, 8);
-    assert_eq!(app.viewport.last_transcript_top, 1);
+    // The settled calm header owns Space when the newer tool is genuinely
+    // outside the viewport. A 60x8 frame now fits both compact cells.
+    app.viewport.transcript_scroll = TranscriptScroll::at_line(0);
+    let surface = render_underwater_test_app(&mut app, 60, 5);
+    assert_eq!(app.viewport.last_transcript_top, 0);
+    assert!(first_line_for_cell(&app, 1) >= app.viewport.last_transcript_visible);
     assert_eq!(reasoning_hint_cells(&app), vec![0]);
     assert!(surface.contains("Space:expand"), "{surface}");
     assert_eq!(
@@ -7641,12 +7931,16 @@ async fn session_denied_cache_notice_renders_host_scope_in_zh_hans() {
             _ => None,
         })
         .expect("localized persistent auto-deny explanation");
-    assert!(notice.contains("本轮"));
+    assert!(notice.contains("本回合"), "{notice}");
     assert!(notice.contains("匹配请求"));
     assert!(!notice.contains("example.com"));
 
     let rendered = render_underwater_test_app(&mut app, 60, 16);
+    // Join wrapped body text without the transcript rail between its lines.
     let rendered_compact = rendered
+        .lines()
+        .map(|line| line.trim_start().trim_start_matches('▏'))
+        .collect::<String>()
         .chars()
         .filter(|ch| !ch.is_whitespace())
         .collect::<String>();
@@ -8759,6 +9053,7 @@ fn saved_session_with_messages(messages: Vec<Message>) -> SavedSession {
         work_state: None,
         window_title: None,
         last_auto_route: None,
+        turn_outcomes: Vec::new(),
     }
 }
 
@@ -8861,6 +9156,7 @@ fn apply_loaded_session_never_restores_background_shell_event_as_composer_draft(
             Message {
                 role: Role::Assistant,
                 content: vec![ContentBlock::ToolUse {
+                    execution_id: None,
                     id: "plan-complete".to_string(),
                     name: "update_plan".to_string(),
                     input: serde_json::json!({"plan": [{"step": "Check the output", "status": "completed"}]}),
@@ -8871,6 +9167,7 @@ fn apply_loaded_session_never_restores_background_shell_event_as_composer_draft(
             Message {
                 role: Role::User,
                 content: vec![ContentBlock::ToolResult {
+                    execution_id: None,
                     tool_use_id: "plan-complete".to_string(),
                     content: "Plan updated".to_string(),
                     is_error: None,
@@ -14927,8 +15224,9 @@ fn stall_engine_report_shows_phase_and_held_queue() {
         Some(stall_report("while streaming the model response")),
     );
 
-    reconcile_turn_liveness_supervised(&mut app, Instant::now(), &stalled);
-    reconcile_turn_liveness_supervised(&mut app, Instant::now(), &stalled);
+    let engine = crate::core::engine::mock_engine_handle();
+    reconcile_turn_liveness_supervised(&mut app, Instant::now(), &stalled, &engine.handle);
+    reconcile_turn_liveness_supervised(&mut app, Instant::now(), &stalled, &engine.handle);
 
     let stall_toasts: Vec<_> = app
         .status_toasts
@@ -14977,8 +15275,22 @@ fn stall_parked_subagent_past_bound_is_suspect_not_a_veto() {
         vec!["agent_ghost".to_string()]
     );
     assert_eq!(live_running_agent_count(&app, now), 0);
-    assert!(reconcile_turn_liveness_supervised(&mut app, now, &idle));
+    let engine = crate::core::engine::mock_engine_handle();
+    assert!(!engine.handle.is_cancelled());
+    assert!(reconcile_turn_liveness_supervised(
+        &mut app,
+        now,
+        &idle,
+        &engine.handle
+    ));
     assert!(!app.is_loading);
+    // #6800: the engine's turn ends with the UI's, and its late terminal
+    // event is handled like a local cancel's.
+    assert!(
+        engine.handle.is_cancelled(),
+        "recovery must cancel the engine's turn, not only reset the UI"
+    );
+    assert!(app.suppress_stream_events_until_turn_complete);
     assert!(
         app.status_toasts
             .iter()
@@ -15003,8 +15315,18 @@ fn stall_parked_subagent_past_bound_is_suspect_not_a_veto() {
     );
     fresh.started_at = Some(now);
     app.subagent_cache = vec![fresh];
-    assert!(!reconcile_turn_liveness_supervised(&mut app, now, &idle));
+    let engine = crate::core::engine::mock_engine_handle();
+    assert!(!reconcile_turn_liveness_supervised(
+        &mut app,
+        now,
+        &idle,
+        &engine.handle
+    ));
     assert!(app.is_loading);
+    assert!(
+        !engine.handle.is_cancelled(),
+        "a turn that is still live is never cancelled"
+    );
     set_test_stall_record_dir(None);
 }
 
@@ -16478,6 +16800,78 @@ fn fanout_started_sibling_bumps_existing_card_revision() {
     }
 }
 
+/// U05-04: a terminal envelope that lands before the worker's `Started` opens
+/// its fanout slot settled, and a late Started/tool envelope for a settled
+/// agent never moves the running count or its Work-row activity back.
+#[test]
+fn late_or_completion_first_mailbox_never_reopens_a_settled_agent() {
+    use crate::tools::subagent::MailboxMessage;
+    use crate::tui::app::AgentCurrentActivityStatus;
+    let mut app = create_test_app();
+    app.pending_subagent_dispatch = Some("rlm".to_string());
+
+    handle_subagent_mailbox(
+        &mut app,
+        1,
+        &MailboxMessage::Started {
+            agent_id: "fanout-a".to_string(),
+            agent_type: "default".to_string(),
+        },
+    );
+    handle_subagent_mailbox(
+        &mut app,
+        2,
+        &MailboxMessage::Completed {
+            agent_id: "fanout-b".to_string(),
+            summary: "done".to_string(),
+        },
+    );
+    assert_eq!(
+        crate::tui::subagent_routing::active_fanout_counts(&app),
+        Some((1, 2)),
+        "a completion-first worker is settled, not running"
+    );
+
+    handle_subagent_mailbox(
+        &mut app,
+        3,
+        &MailboxMessage::Completed {
+            agent_id: "fanout-a".to_string(),
+            summary: "done".to_string(),
+        },
+    );
+    let late = [
+        MailboxMessage::Started {
+            agent_id: "fanout-a".to_string(),
+            agent_type: "default".to_string(),
+        },
+        MailboxMessage::ToolCallStarted {
+            agent_id: "fanout-a".to_string(),
+            tool_name: "read_file".to_string(),
+            step: 4,
+        },
+        MailboxMessage::ToolCallCompleted {
+            agent_id: "fanout-a".to_string(),
+            tool_name: "read_file".to_string(),
+            step: 4,
+            ok: true,
+        },
+    ];
+    for (seq, message) in late.iter().enumerate() {
+        handle_subagent_mailbox(&mut app, 10 + seq as u64, message);
+    }
+    assert_eq!(
+        crate::tui::subagent_routing::active_fanout_counts(&app),
+        Some((0, 2))
+    );
+    let status = app
+        .agent_progress_meta
+        .get("fanout-a")
+        .and_then(|meta| meta.current_activity.as_ref())
+        .map(|activity| activity.status);
+    assert_eq!(status, Some(AgentCurrentActivityStatus::Done));
+}
+
 #[test]
 fn fanout_interrupted_mailbox_drops_running_count() {
     let mut app = create_test_app();
@@ -16725,12 +17119,6 @@ async fn empty_bang_shell_input_is_consumed_with_usage_error() {
         app.status_message.as_deref(),
         Some("Error: Usage: ! <shell command>")
     );
-}
-
-#[test]
-fn local_bang_shell_tool_ids_are_not_model_visible() {
-    assert!(!is_model_visible_tool_call("user_shell_1"));
-    assert!(is_model_visible_tool_call("toolu_01abc"));
 }
 
 fn complete_release_json(tag: &str) -> serde_json::Value {
@@ -17652,6 +18040,82 @@ fn an_engine_stopped_turn_keeps_its_reason_in_the_transcript() {
     );
 }
 
+/// Founder run 2026-09-28: two turns ended `Failed` and the session record
+/// kept only the user prompts, so the reason was gone once the TUI closed.
+/// The failure the transcript showed is persisted (redacted) with the session
+/// and replayed in place on resume.
+#[test]
+fn a_failed_turn_reason_is_persisted_and_replayed_on_resume() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let manager =
+        crate::session_manager::SessionManager::new(tmp.path().join("sessions")).expect("manager");
+    let mut app = create_test_app();
+    app.api_messages_mut()
+        .push(text_message("user", "first question"));
+    app.api_messages_mut()
+        .push(text_message("assistant", "first answer"));
+    app.api_messages_mut()
+        .push(text_message("user", "second question"));
+    let reason = "provider rejected the request: invalid key sk-live1234567890abcdef";
+    super::event_loop::present_turn_failure(
+        &mut app,
+        crate::core::events::TurnOutcomeStatus::Failed,
+        Some(reason),
+    );
+    let shown = app
+        .history
+        .iter()
+        .find_map(|cell| match cell {
+            HistoryCell::Error { message, .. } => Some(message.clone()),
+            _ => None,
+        })
+        .expect("the failure is in the live transcript");
+
+    let snapshot = build_session_snapshot(&mut app, &manager).expect("session snapshot");
+    assert_eq!(snapshot.turn_outcomes.len(), 1);
+    let outcome = &snapshot.turn_outcomes[0];
+    assert_eq!(
+        outcome.status,
+        crate::core::events::TurnOutcomeStatus::Failed
+    );
+    assert_eq!(outcome.after_message_count, 3);
+    assert!(outcome.error.contains("provider rejected the request"));
+    assert!(
+        !outcome.error.contains("sk-live1234567890abcdef"),
+        "the persisted reason is redacted: {}",
+        outcome.error
+    );
+    assert_eq!(
+        outcome.error,
+        codewhale_secrets::redact::redact_secrets(&shown),
+        "the record is what the live transcript showed"
+    );
+
+    // Survives a disk round trip and comes back in place on resume.
+    manager.save_session(&snapshot).expect("save");
+    let loaded = manager
+        .load_session(&snapshot.metadata.id)
+        .expect("load session");
+    assert_eq!(loaded.turn_outcomes, snapshot.turn_outcomes);
+    let mut resumed = create_test_app();
+    apply_loaded_session(&mut resumed, &mut Config::default(), &loaded).expect("resume");
+    assert_eq!(resumed.session_turn_outcomes, loaded.turn_outcomes);
+    let replayed = resumed
+        .history
+        .iter()
+        .position(
+            |cell| matches!(cell, HistoryCell::Error { message, .. } if *message == outcome.error),
+        )
+        .expect("the failure is replayed on resume");
+    assert!(
+        matches!(
+            &resumed.history[replayed - 1],
+            HistoryCell::User { content } if content.contains("second question")
+        ),
+        "the failure is replayed after the prompt it failed on"
+    );
+}
+
 #[test]
 fn turn_started_route_is_captured_before_cancel_suppression() {
     let mut app = create_test_app();
@@ -17676,6 +18140,7 @@ fn turn_started_route_is_captured_before_cancel_suppression() {
     let event = EngineEvent::TurnStarted {
         turn_id: "turn_cancel_race".to_string(),
         created_at,
+        submission_id: None,
         route: Some(crate::core::events::TurnRoute {
             provider: ApiProvider::Openai,
             provider_identity: "openai".to_string(),
@@ -17759,6 +18224,7 @@ fn turn_started_suggestion_authority_comes_from_the_route_receipt_not_config() {
             base_url: String::new(),
             billing_product: crate::route_billing::RouteProduct::Unproven,
         }),
+        submission_id: None,
     };
 
     capture_turn_started_metadata(&mut app, &event);
@@ -17803,6 +18269,7 @@ fn turn_started_without_a_route_receipt_captures_no_suggestion_authority() {
             base_url: String::new(),
             billing_product: crate::route_billing::RouteProduct::Unproven,
         }),
+        submission_id: None,
     };
 
     capture_turn_started_metadata(&mut app, &event);
@@ -17841,6 +18308,7 @@ fn engine_error_health_accounting_uses_active_turn_route() {
             base_url: String::new(),
             billing_product: crate::route_billing::RouteProduct::Unproven,
         }),
+        submission_id: None,
     };
     capture_turn_started_metadata(&mut app, &event);
 
@@ -19473,6 +19941,47 @@ fn steer_reuses_queued_echo_cell_instead_of_doubling() {
     assert_eq!(idx, 0, "the rewritten cell keeps the queue-time index");
 }
 
+/// U02-03: a message_submit hook that rewrites a queued message retargets
+/// the queue-time echo, so dispatch reuses it instead of adding a second
+/// User cell beside the stale pre-hook text.
+#[test]
+fn hook_replaced_queued_message_keeps_one_user_cell() {
+    let mut app = create_test_app();
+    let mut message = QueuedMessage::new("draft as typed".to_string(), None);
+    echo_queued_user_turn(&mut app, &mut message);
+    assert!(apply_message_submit_outcome(
+        &mut app,
+        &mut message,
+        crate::hooks::MessageSubmitOutcome::replaced("draft as rewritten".to_string()),
+    ));
+
+    paint_user_turn_cell(&mut app, &message, message.display.clone());
+
+    let user_cells: Vec<String> = app
+        .history
+        .iter()
+        .filter_map(|cell| match cell {
+            HistoryCell::User { content } => Some(content.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(user_cells, vec!["draft as rewritten".to_string()]);
+}
+
+/// U02-10: a dispatch still in flight, or a locally cancelled turn whose
+/// terminal event has not landed, holds the session: switching now would
+/// carry the stale cancellation into the next session's first turn.
+#[test]
+fn session_transition_waits_for_pending_dispatch_and_cancelled_turn() {
+    let mut app = create_test_app();
+    assert!(!app.session_transition_blocked());
+    app.suppress_stream_events_until_turn_complete = true;
+    assert!(app.session_transition_blocked());
+    app.suppress_stream_events_until_turn_complete = false;
+    app.dispatch_in_flight = true;
+    assert!(app.session_transition_blocked());
+}
+
 #[test]
 fn engine_drain_budget_respects_event_and_time_limits() {
     let start = Instant::now();
@@ -20757,6 +21266,52 @@ fn try_autocomplete_file_mention_extends_to_common_prefix() {
 }
 
 #[test]
+fn try_autocomplete_file_mention_common_prefix_stops_at_whitespace() {
+    let tmpdir = TempDir::new().expect("tempdir");
+    std::fs::create_dir_all(tmpdir.path().join("My Docs")).unwrap();
+    std::fs::create_dir_all(tmpdir.path().join("My Dogs")).unwrap();
+    std::fs::write(tmpdir.path().join("My Docs/a.md"), "a").unwrap();
+    std::fs::write(tmpdir.path().join("My Dogs/b.md"), "b").unwrap();
+
+    let mut app = create_test_app();
+    app.workspace = tmpdir.path().to_path_buf();
+    app.input = "@My".to_string();
+    app.cursor_position = app.input.chars().count();
+
+    let _ = await_visible_mention_entries(&mut app, 64);
+    assert!(try_autocomplete_file_mention(&mut app));
+    // `@My Do` would split into a missing `@My` mention and leave the next
+    // Tab with no partial to complete.
+    assert_eq!(app.input, "@My");
+    assert!(
+        app.status_message
+            .as_deref()
+            .is_some_and(|status| status.starts_with("Matches:")),
+        "{:?}",
+        app.status_message
+    );
+}
+
+#[test]
+fn launch_submit_holds_oversized_draft_before_creating_a_session() {
+    let tmpdir = TempDir::new().expect("tempdir");
+    // `.codewhale` is a file, so `.codewhale/pastes` cannot be created.
+    std::fs::write(tmpdir.path().join(".codewhale"), "not a dir").unwrap();
+    let mut app = create_test_app();
+    app.workspace = tmpdir.path().to_path_buf();
+    let draft = "z".repeat(crate::tui::app::MAX_SUBMITTED_INPUT_CHARS + 1);
+    app.input = draft.clone();
+    app.cursor_position = app.input.chars().count();
+
+    assert!(super::event_loop::launch_submit_held(&mut app));
+    assert_eq!(app.input, draft, "the full text stays in the composer");
+
+    app.input = "hello".to_string();
+    app.cursor_position = app.input.chars().count();
+    assert!(!super::event_loop::launch_submit_held(&mut app));
+}
+
+#[test]
 fn try_autocomplete_file_mention_no_match_reports_status() {
     let tmpdir = TempDir::new().expect("tempdir");
     std::fs::write(tmpdir.path().join("README.md"), "x").unwrap();
@@ -21010,6 +21565,22 @@ fn apply_mention_menu_selection_splices_selected_entry() {
         input = app.input,
     );
     // Cursor should land at the end of the spliced token.
+    assert_eq!(app.cursor_position, app.input.chars().count());
+}
+
+#[test]
+fn apply_mention_menu_selection_quotes_a_path_with_spaces() {
+    // A bare `@My Docs/notes.md` parses as a missing `@My` mention; the
+    // quoted form is the one the send-time parser reads back whole.
+    let mut app = create_test_app();
+    app.input = "open @My".to_string();
+    app.cursor_position = app.input.chars().count();
+    app.mention_menu_selected = 0;
+    assert!(apply_mention_menu_selection(
+        &mut app,
+        &["My Docs/notes.md".to_string()]
+    ));
+    assert_eq!(app.input, "open @\"My Docs/notes.md\"");
     assert_eq!(app.cursor_position, app.input.chars().count());
 }
 
@@ -21557,6 +22128,7 @@ fn routed_missing_usage_batch_prices_exact_routes_and_only_residual_as_generic()
     local_route.provider_identity = "local-computer".to_string();
     local_route.billing_mode = crate::cost_status::RouteBillingMode::Local;
     let batch = crate::cost_status::RuntimeUsageBatch {
+        decisions: Vec::new(),
         records: Vec::new(),
         drop_records: vec![
             crate::cost_status::RuntimeUsageDropRecord {
@@ -25014,11 +25586,14 @@ fn message_complete_drain_preserves_thinking_when_thinking_complete_lost() {
 #[test]
 fn approval_prompt_uses_event_input_after_message_complete_drain() {
     let mut app = create_test_app();
-    app.pending_tool_uses.push((
-        "tool-1".to_string(),
-        "exec_shell".to_string(),
-        serde_json::json!({"command": "stale value from drained list"}),
-    ));
+    app.pending_tool_uses.push(ContentBlock::ToolUse {
+        execution_id: Some("tool-1".to_string()),
+        id: "provider-tool-1".to_string(),
+        name: "exec_shell".to_string(),
+        input: serde_json::json!({"command": "stale value from drained list"}),
+        caller: None,
+        thought_signature: None,
+    });
 
     // Mirror the old race: MessageComplete drains pending tool uses before
     // ApprovalRequired is handled. The approval modal must still show the
@@ -26388,6 +26963,54 @@ fn typeahead_before_card_does_not_answer() {
 }
 
 #[test]
+fn stale_keys_cannot_answer_a_raised_or_revealed_elevation() {
+    use crate::tui::approval::ElevationOption;
+
+    let mut app = ask_posture_app();
+    let typed_before = Instant::now() - Duration::from_secs(1);
+    app.view_stack.push(ElevationView::new(
+        ElevationRequest::for_shell("elevation-id", "cargo test", "blocked", true, false),
+        codewhale_localization::Locale::En,
+    ));
+    let up = KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
+    assert!(route_key_to_view_stack(&mut app, up, typed_before).is_none());
+    assert_eq!(app.view_stack.top_approval_id(), None);
+    // Deliberately select Full Access, then cover it with another decision.
+    assert!(route_key_to_view_stack(&mut app, up, Instant::now()).is_some());
+    push_approval_request_view(
+        &mut app,
+        "approval-id",
+        "exec_shell",
+        "Run a command",
+        &serde_json::json!({"command": "cargo test"}),
+        "k",
+        "g",
+        None,
+        crate::config::ApprovalDefaultSelection::AllowOnce,
+        None,
+    );
+    let queued_enter = Instant::now();
+    std::thread::sleep(Duration::from_millis(2));
+    let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+    let events = route_key_to_view_stack(&mut app, enter, queued_enter).expect("visible approval");
+    assert!(
+        matches!(events.as_slice(), [ViewEvent::ApprovalDecision { tool_id, .. }] if tool_id == "approval-id")
+    );
+    assert_eq!(app.view_stack.top_kind(), Some(ModalKind::Elevation));
+    assert!(
+        route_key_to_view_stack(&mut app, enter, queued_enter).is_none(),
+        "Enter queued for the previous card must not elevate the newly revealed one"
+    );
+    assert_eq!(app.view_stack.top_kind(), Some(ModalKind::Elevation));
+    let events =
+        route_key_to_view_stack(&mut app, enter, Instant::now()).expect("fresh confirmation");
+    assert!(matches!(events.as_slice(), [ViewEvent::ElevationDecision {
+        tool_id, option: ElevationOption::FullAccess, ..
+    }] if tool_id == "elevation-id"));
+    assert!(app.view_stack.is_empty());
+}
+
+#[test]
 fn second_quick_y_does_not_answer_the_card_it_reveals() {
     let mut app = ask_posture_app();
     for (id, command) in [
@@ -26833,6 +27456,7 @@ async fn keyless_engine_error_stays_visible_after_a_config_ack() {
             hook_executor: None,
             verbosity: None,
             provenance: UserInputProvenance::ExternalUser,
+            submission_id: None,
         }))
         .await
         .expect("submit to the real Engine");
@@ -29435,6 +30059,7 @@ fn backtrack_cut_index_skips_tool_result_user_messages() {
         Message {
             role: Role::Assistant,
             content: vec![ContentBlock::ToolUse {
+                execution_id: None,
                 id: "t1".into(),
                 name: "read_file".into(),
                 input: serde_json::json!({"path":"x"}),
@@ -29445,6 +30070,7 @@ fn backtrack_cut_index_skips_tool_result_user_messages() {
         Message {
             role: Role::User,
             content: vec![ContentBlock::ToolResult {
+                execution_id: None,
                 tool_use_id: "t1".into(),
                 content: "data".into(),
                 is_error: None,
@@ -30601,6 +31227,169 @@ fn a_scroll_burst_is_folded_into_one_frame() {
         pending.front().map(|observed| &observed.event),
         Some(Event::Key(_))
     ));
+}
+
+fn observed_key(c: char) -> ObservedTerminalEvent {
+    ObservedTerminalEvent::new(
+        Event::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)),
+        Instant::now(),
+    )
+}
+
+fn idle_input_pump() -> TerminalInputPump {
+    let (_tx, rx) = std::sync::mpsc::channel();
+    TerminalInputPump {
+        rx,
+        stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        paused: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        paused_ack: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        handle: None,
+        last_alive_at: std::cell::Cell::new(Instant::now()),
+    }
+}
+
+fn pending_key_chars(pending: &VecDeque<ObservedTerminalEvent>) -> String {
+    pending
+        .iter()
+        .filter_map(|observed| match &observed.event {
+            Event::Key(KeyEvent {
+                code: KeyCode::Char(c),
+                ..
+            }) => Some(*c),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Typing while the wheel scrolls: the loop has already drained the burst and
+/// the keys into `pending`. The key that ends the burst goes back to the head,
+/// so the composer receives "abc", not "bca".
+#[test]
+fn a_scroll_burst_keeps_following_input_in_order() {
+    let mut app = create_test_app();
+    app.launch.visible = false;
+    app.viewport.last_transcript_area = Some(Rect::new(0, 0, 80, 20));
+    let scroll = crossterm::event::MouseEvent {
+        kind: crossterm::event::MouseEventKind::ScrollDown,
+        column: 10,
+        row: 5,
+        modifiers: KeyModifiers::NONE,
+    };
+    let input = idle_input_pump();
+    let mut pending: VecDeque<ObservedTerminalEvent> = VecDeque::new();
+    pending.push_back(ObservedTerminalEvent::new(
+        Event::Mouse(scroll),
+        Instant::now(),
+    ));
+    for c in ['a', 'b', 'c'] {
+        pending.push_back(observed_key(c));
+    }
+
+    super::event_loop::coalesce_scroll_burst(&mut app, scroll, &input, &mut pending)
+        .expect("coalesce");
+
+    assert_eq!(pending_key_chars(&pending), "abc");
+}
+
+#[test]
+fn a_resize_burst_keeps_following_input_in_order() {
+    let input = idle_input_pump();
+    let mut pending: VecDeque<ObservedTerminalEvent> = VecDeque::new();
+    pending.push_back(ObservedTerminalEvent::new(
+        Event::Resize(120, 40),
+        Instant::now(),
+    ));
+    pending.push_back(observed_key('a'));
+    pending.push_back(observed_key('b'));
+
+    let size =
+        super::event_loop::coalesce_resize_burst(100, 30, &input, &mut pending).expect("coalesce");
+
+    assert_eq!(size, (120, 40), "the final queued size wins");
+    assert_eq!(pending_key_chars(&pending), "ab");
+}
+
+/// A failing session save reaches the user, not only the log, and the notice
+/// is withdrawn once a later save of that session lands.
+#[test]
+fn a_failing_session_save_shows_an_error_until_a_save_lands() {
+    use crate::tui::persistence_actor::SaveHealthReading;
+    let mut app = create_test_app();
+    let mut seen = 0;
+    let failing = SaveHealthReading {
+        generation: 1,
+        failing: Some((
+            "toast-probe".to_string(),
+            std::io::ErrorKind::PermissionDenied,
+        )),
+    };
+    let save_errors = |app: &App| {
+        app.status_toasts
+            .iter()
+            .filter(|toast| toast.level == StatusToastLevel::Error)
+            .count()
+    };
+
+    super::event_loop::surface_session_save_health(&mut app, Some(failing.clone()), &mut seen);
+    assert_eq!(seen, 1);
+    assert_eq!(save_errors(&app), 1, "a failing save is visible");
+    assert!(
+        app.status_toasts
+            .iter()
+            .any(|toast| toast.text.contains("toast-pr")),
+        "{:?}",
+        app.status_toasts
+    );
+
+    // Polling the same reading again does not repeat it.
+    super::event_loop::surface_session_save_health(&mut app, Some(failing), &mut seen);
+    assert_eq!(save_errors(&app), 1);
+
+    // The failure outlives any toast lifetime: well past the sticky TTL, and
+    // behind a full queue of newer notices, it is still there and shown once
+    // they expire, because nothing has recovered.
+    for toast in app.status_toasts.iter_mut() {
+        toast.created_at = std::time::Instant::now()
+            - std::time::Duration::from_millis(App::STICKY_ERROR_TTL_MS * 10);
+    }
+    for i in 0..30 {
+        app.push_status_toast(format!("newer {i}"), StatusToastLevel::Info, Some(1));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    let shown = app
+        .active_status_toast(crate::tui::underwater::ShellPhase::Idle)
+        .expect("a toast is shown");
+    assert!(shown.text.contains("toast-pr"), "{}", shown.text);
+    assert_eq!(save_errors(&app), 1, "a standing failure does not expire");
+
+    let healed = SaveHealthReading {
+        generation: 2,
+        failing: None,
+    };
+    super::event_loop::surface_session_save_health(&mut app, Some(healed), &mut seen);
+    assert_eq!(save_errors(&app), 0, "a later successful save withdraws it");
+}
+
+#[test]
+fn shutdown_reports_only_a_save_that_is_still_failing() {
+    use crate::tui::persistence_actor::SaveHealthReading;
+    let locale = codewhale_localization::Locale::En;
+    let healthy = SaveHealthReading {
+        generation: 4,
+        failing: None,
+    };
+    assert_eq!(
+        super::event_loop::shutdown_persistence_notice(locale, &healthy),
+        None,
+        "failures later replaced by a successful save are not reported"
+    );
+    let failing = SaveHealthReading {
+        generation: 5,
+        failing: Some(("session-a".to_string(), std::io::ErrorKind::StorageFull)),
+    };
+    let notice = super::event_loop::shutdown_persistence_notice(locale, &failing)
+        .expect("a failing save produces an exit notice");
+    assert!(notice.contains("session-a"), "{notice}");
 }
 
 // ---------------------------------------------------------------------------
@@ -31861,4 +32650,223 @@ async fn provider_switch_back_lands_on_root_default_owned_by_that_provider() {
     );
     assert_eq!(app.api_provider, ApiProvider::Openai);
     assert_eq!(app.model, "gpui-fixture");
+}
+
+#[test]
+fn transient_assistant_history_preserves_provider_and_local_tool_identity() {
+    let mut app = create_test_app();
+    let block = ContentBlock::ToolUse {
+        id: "wire-reused".to_string(),
+        execution_id: Some("local-fresh".to_string()),
+        name: "read".to_string(),
+        input: serde_json::json!({"path":"README.md"}),
+        caller: Some(codewhale_models::ToolCaller {
+            caller_type: "code_execution".to_string(),
+            tool_id: Some("provider-parent".to_string()),
+        }),
+        thought_signature: Some("provider-signature".to_string()),
+    };
+    push_assistant_message(&mut app, String::new(), None, vec![block.clone()]);
+    assert_eq!(app.api_messages.last().unwrap().content, vec![block]);
+}
+
+fn long_session_history(turns: usize) -> Vec<HistoryCell> {
+    let mut cells = Vec::with_capacity(turns * 4);
+    for turn in 0..turns {
+        cells.push(HistoryCell::User {
+            content: format!("question {turn}: please look at the render path"),
+        });
+        cells.push(HistoryCell::Thinking {
+            content: (0..8)
+                .map(|row| format!("reasoning {turn}.{row} about the transcript"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            streaming: false,
+            duration_secs: Some(1.0),
+        });
+        cells.push(HistoryCell::Tool(ToolCell::Generic(GenericToolCell {
+            name: "exec_shell".to_string(),
+            status: ToolStatus::Success,
+            input_summary: Some(format!("cargo check {turn}")),
+            output: Some("ok\nfinished".to_string()),
+            prompts: None,
+            spillover_path: None,
+            output_summary: None,
+            is_diff: false,
+        })));
+        cells.push(HistoryCell::Assistant {
+            content: format!(
+                "Answer {turn}.\n\n- point one\n- point two\n\n```rust\nfn f() {{}}\n```"
+            ),
+            streaming: false,
+        });
+    }
+    cells
+}
+
+/// Full-frame scroll benchmark for #6652; run with `--ignored --nocapture`.
+#[test]
+#[ignore = "timing benchmark, not a correctness gate"]
+#[allow(clippy::print_stderr)]
+fn bench_full_frame_scroll_cost_by_history_length() {
+    for turns in [100usize, 1_000] {
+        let mut app = create_test_app();
+        app.history = long_session_history(turns);
+        app.resync_history_revisions();
+        let config = Config::default();
+        let mut terminal = Terminal::new(TestBackend::new(140, 40)).unwrap();
+        terminal
+            .draw(|frame| {
+                let _ = super::frame::render(frame, &mut app, &config);
+            })
+            .unwrap();
+        let frames = 200u32;
+        let started = Instant::now();
+        for _ in 0..frames {
+            app.viewport.pending_scroll_delta = -3;
+            app.needs_redraw = true;
+            terminal
+                .draw(|frame| {
+                    let _ = super::frame::render(frame, &mut app, &config);
+                })
+                .unwrap();
+        }
+        let elapsed = started.elapsed();
+        eprintln!(
+            "#6652 full-frame: {} cells, {} lines, {:?}/scroll frame",
+            app.history.len(),
+            app.viewport.transcript_cache.total_lines(),
+            elapsed / frames
+        );
+        // Chrome that grows or shrinks (composer lines, toasts, turn rows)
+        // changes the transcript height without changing its width.
+        let started = Instant::now();
+        for frame in 0..frames {
+            let height = if frame % 2 == 0 { 41 } else { 40 };
+            terminal.backend_mut().resize(140, height);
+            app.needs_redraw = true;
+            terminal
+                .draw(|frame| {
+                    let _ = super::frame::render(frame, &mut app, &config);
+                })
+                .unwrap();
+        }
+        eprintln!(
+            "#6652 full-frame: {} cells, {:?}/height-change frame",
+            app.history.len(),
+            started.elapsed() / frames
+        );
+    }
+}
+
+#[test]
+fn g3_wheel_and_scrollbar_use_interactive_cadence() {
+    use crate::tui::display_refresh::DrawCadenceTier;
+    let mut app = create_test_app();
+    app.viewport.pending_scroll_delta = -3;
+    assert_eq!(
+        super::event_loop::transcript_cadence_tier(&app, false),
+        DrawCadenceTier::Interactive
+    );
+    app.viewport.pending_scroll_delta = 0;
+    app.viewport.transcript_scrollbar_dragging = true;
+    assert_eq!(
+        super::event_loop::transcript_cadence_tier(&app, false),
+        DrawCadenceTier::Interactive
+    );
+}
+
+#[test]
+fn g3_scroll_burst_preserves_the_first_non_scroll_before_later_input() {
+    let mut app = create_test_app();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let input = TerminalInputPump {
+        rx,
+        stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        paused: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        paused_ack: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        handle: None,
+        last_alive_at: std::cell::Cell::new(Instant::now()),
+    };
+    let mut pending = VecDeque::from(['a', 'b'].map(|c| {
+        ObservedTerminalEvent::new(
+            Event::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)),
+            Instant::now(),
+        )
+    }));
+    let first = crossterm::event::MouseEvent {
+        kind: crossterm::event::MouseEventKind::ScrollDown,
+        column: 10,
+        row: 5,
+        modifiers: KeyModifiers::NONE,
+    };
+    super::event_loop::coalesce_scroll_burst(&mut app, first, &input, &mut pending).unwrap();
+    for expected in ['a', 'b'] {
+        let observed = try_next_terminal_event(&input, &mut pending)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            observed.event,
+            Event::Key(KeyEvent::new(KeyCode::Char(expected), KeyModifiers::NONE))
+        );
+    }
+    drop(tx);
+}
+
+#[test]
+fn g3_real_height_resize_keeps_wrapped_rows_and_tool_projection() {
+    let mut app = create_test_app();
+    app.history = long_session_history(10);
+    app.resync_history_revisions();
+    let _ = crate::tui::widgets::ChatWidget::new(&mut app, Rect::new(0, 0, 80, 20));
+    let lines = app.viewport.transcript_cache.total_lines();
+    let version = app.history_version;
+    app.handle_resize(80, 30);
+    assert_eq!(app.viewport.transcript_cache.total_lines(), lines);
+    assert_eq!(app.history_version, version);
+    assert_eq!(app.viewport.pending_terminal_size, Some(Size::new(80, 30)));
+    let _ = crate::tui::widgets::ChatWidget::new(&mut app, Rect::new(0, 0, 80, 30));
+    assert_eq!(app.viewport.transcript_cache.total_lines(), lines);
+}
+
+#[test]
+fn g3_resize_clear_and_failure_are_inside_synchronized_output() {
+    #[derive(Clone, Default)]
+    struct Capture(std::rc::Rc<std::cell::RefCell<Vec<u8>>>);
+    impl std::io::Write for Capture {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.borrow_mut().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    for fail in [false, true] {
+        let capture = Capture::default();
+        let mut backend = crate::tui::color_compat::ColorCompatBackend::new(
+            capture.clone(),
+            codewhale_palette::ColorDepth::TrueColor,
+            codewhale_palette::PaletteMode::Dark,
+        );
+        backend.force_size(Size::new(80, 24));
+        let mut terminal = Terminal::new(backend).unwrap();
+        capture.0.borrow_mut().clear();
+        let result = super::frame::synchronized_frame(&mut terminal, true, |terminal| {
+            terminal.resize(Rect::new(0, 0, 80, 30))?;
+            if fail {
+                anyhow::bail!("injected draw failure");
+            }
+            terminal.backend_mut().write_all(b"frame after resize")?;
+            Ok(())
+        });
+        assert_eq!(result.is_err(), fail);
+        let output = capture.0.borrow();
+        assert!(output.starts_with(BEGIN_SYNC_UPDATE));
+        assert!(output.ends_with(END_SYNC_UPDATE));
+        assert!(
+            output.windows(4).any(|bytes| bytes == b"\x1b[2J"),
+            "resize must emit a clear"
+        );
+    }
 }

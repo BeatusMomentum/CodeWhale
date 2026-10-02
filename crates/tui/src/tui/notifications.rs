@@ -369,6 +369,7 @@ pub fn notify_done(
     threshold: Duration,
     elapsed: Duration,
 ) -> DeliveryOutcome {
+    let reserved = std::cell::Cell::new(None);
     notify_with_sinks(
         method,
         in_tmux,
@@ -379,13 +380,31 @@ pub fn notify_done(
         attention_delivery_allowed(),
         &mut io::stdout(),
         &mut |kind, bell| {
-            crate::notify::sound_policy::decide(
-                kind,
-                crate::notify::sound_policy::epoch_millis_now(),
-                bell,
-            )
+            let now_ms = crate::notify::sound_policy::epoch_millis_now();
+            let decision = crate::notify::sound_policy::decide(kind, now_ms, bell);
+            if matches!(
+                decision,
+                crate::notify::sound_policy::SoundDecision::Play(_)
+            ) {
+                reserved.set(Some((kind, now_ms)));
+            }
+            decision
         },
-        &mut crate::notify::audio::dispatch,
+        &mut |cue, sink| {
+            let outcome = crate::notify::audio::dispatch(cue, sink);
+            // A cue that never played must not spend the category's repeat
+            // window: the next notification may try again (U06-m3).
+            if matches!(
+                outcome,
+                crate::notify::audio::AudioOutcome::Busy
+                    | crate::notify::audio::AudioOutcome::Unsupported
+                    | crate::notify::audio::AudioOutcome::Failed
+            ) && let Some((kind, reserved_ms)) = reserved.take()
+            {
+                crate::notify::sound_policy::release(kind, reserved_ms);
+            }
+            outcome
+        },
         &mut dispatch_native,
     )
 }

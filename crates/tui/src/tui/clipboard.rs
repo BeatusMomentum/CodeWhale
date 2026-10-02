@@ -1366,10 +1366,22 @@ exit 42
         perms.set_mode(0o755);
         std::fs::set_permissions(&script, perms).unwrap();
 
-        let err = write_text_with_tmux_using_argv(script.to_str().unwrap(), &[], "copy")
-            .expect_err("non-zero tmux status should fail");
+        // Another test thread may fork while this one still had the script
+        // open for writing; the child keeps that descriptor until it execs,
+        // and running the script meanwhile fails with "Text file busy". That
+        // is the test's own race, not the behavior under test, so wait it out.
+        let mut attempts = 0;
+        let err = loop {
+            let err = write_text_with_tmux_using_argv(script.to_str().unwrap(), &[], "copy")
+                .expect_err("non-zero tmux status should fail");
+            attempts += 1;
+            if attempts >= 100 || !err.to_string().contains("Text file busy") {
+                break err;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
 
-        assert!(err.to_string().contains("exited with"));
+        assert!(err.to_string().contains("exited with"), "{err}");
         assert!(err.to_string().contains("clipboard denied"));
     }
 

@@ -145,7 +145,9 @@ export class TraceLibrary {
       request.onsuccess = () => {
         const previous: HabitatEntry | undefined = request.result;
         if (previous?.revision !== expectedRevision) {
-          fail(new Error('Another pet tab saved this habitat. Save a replay file to keep this version, or reload the saved habitat.')); return;
+          // Named so the page stops autosaving only for this unrecoverable case.
+          fail(Object.assign(new Error('Another pet tab saved this habitat. Save a replay file to keep this version, or reload the saved habitat.'),
+            { name: 'PetHabitatConflict' })); return;
         }
         const revision = (previous?.revision ?? 0) + 1;
         if (archive) {

@@ -102,7 +102,12 @@ async fn runtime_store_binding_exit_preserves_inflight_recovery() -> anyhow::Res
     let root = tempfile::tempdir()?;
     let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", root.path());
     let sessions = SessionManager::default_location()?;
-    for (loading, dispatch) in [(true, false), (false, true)] {
+    // U02-09: a locally cancelled turn still owes its terminal event.
+    for (loading, dispatch, cancelled) in [
+        (true, false, false),
+        (false, true, false),
+        (false, false, true),
+    ] {
         let original = crate::session_manager::create_saved_session_with_mode(
             &[],
             "deepseek-v4-pro",
@@ -119,6 +124,7 @@ async fn runtime_store_binding_exit_preserves_inflight_recovery() -> anyhow::Res
         app.current_session_id = Some(original.metadata.id.clone());
         app.is_loading = loading;
         app.dispatch_in_flight = dispatch;
+        app.suppress_stream_events_until_turn_complete = cancelled;
         let (handle, actor) =
             persistence_actor::spawn_persistence_actor(SessionManager::default_location()?);
         assert!(
@@ -907,17 +913,27 @@ async fn picker_adopts_existing_empty_unheld_store() -> anyhow::Result<()> {
     assert_eq!(durable.messages, saved.messages);
     // #6144 P1a: the store the conversation left is set aside where it was
     // abandoned, not left on disk with nothing pointing at it. The switch
-    // hands that off the UI runtime, so wait for it.
+    // hands that off the UI runtime. Moving the store precedes writing its
+    // manifest, so wait for both rather than treating the move as completion.
     let abandoned = root.path().join("sessions/previous/runtime");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while abandoned.exists() && std::time::Instant::now() < deadline {
+    let set_aside = loop {
+        let manifest = std::fs::read_dir(root.path().join("sessions/.set-aside"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|run| {
+                std::fs::read_to_string(run.path().join("MANIFEST.jsonl")).unwrap_or_default()
+            })
+            .collect::<String>();
+        if (!abandoned.exists() && manifest.contains("previous"))
+            || std::time::Instant::now() >= deadline
+        {
+            break manifest;
+        }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
+    };
     assert!(!abandoned.exists());
-    let set_aside = std::fs::read_dir(root.path().join("sessions/.set-aside"))?
-        .flatten()
-        .map(|run| std::fs::read_to_string(run.path().join("MANIFEST.jsonl")).unwrap_or_default())
-        .collect::<String>();
     assert!(set_aside.contains("previous"), "{set_aside}");
     tasks.shutdown_and_wait().await?;
     Ok(())

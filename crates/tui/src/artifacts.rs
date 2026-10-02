@@ -148,10 +148,7 @@ pub fn write_session_artifact(
                 "could not resolve session artifact path (missing home directory)",
             )
         })?;
-    if let Some(parent) = absolute_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    crate::utils::write_atomic(&absolute_path, content.as_bytes())?;
+    open_session_relative(session_id, &relative_path, true)?.replace(content.as_bytes())?;
     Ok((absolute_path, relative_path))
 }
 
@@ -237,10 +234,7 @@ pub fn write_session_artifact_bytes(
                 "could not resolve session artifact path (missing home directory)",
             )
         })?;
-    if let Some(parent) = absolute_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    crate::utils::write_atomic(&absolute_path, content)?;
+    open_session_relative(session_id, &relative_path, true)?.replace(content)?;
     Ok((absolute_path, relative_path))
 }
 
@@ -430,5 +424,108 @@ mod tests {
 
         assert!(write_session_relative_immutable("session-a", &relative, b"payload").is_err());
         assert!(!sessions.join("session-a/artifacts/art_failed.txt").exists());
+    }
+    #[cfg(unix)]
+    fn check_mutable_parent_links(binary: bool) {
+        let _guard = TEST_ARTIFACT_SESSIONS_GUARD
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        for linked_session in [true, false] {
+            let temp = tempfile::tempdir().unwrap();
+            let sessions = temp.path().join("sessions");
+            let _root = set_test_sessions_root(sessions.clone());
+            std::fs::create_dir_all(&sessions).unwrap();
+            let outside = temp.path().join("outside");
+            let outside_artifacts = if linked_session {
+                outside.join("artifacts")
+            } else {
+                outside.clone()
+            };
+            std::fs::create_dir_all(&outside_artifacts).unwrap();
+            let extension = if binary { "bin" } else { "txt" };
+            let canary = outside_artifacts.join(format!("mutable.{extension}"));
+            std::fs::write(&canary, b"old-exact-artifact-canary").unwrap();
+            if linked_session {
+                std::os::unix::fs::symlink(&outside, sessions.join("session-a")).unwrap();
+            } else {
+                std::fs::create_dir(sessions.join("session-a")).unwrap();
+                std::os::unix::fs::symlink(&outside, sessions.join("session-a/artifacts")).unwrap();
+            }
+            let result = if binary {
+                write_session_artifact_bytes("session-a", "mutable", extension, b"new-byte-payload")
+            } else {
+                write_session_artifact("session-a", "mutable", "new-text-payload")
+            };
+            assert_eq!(
+                std::fs::read(&canary).unwrap(),
+                b"old-exact-artifact-canary",
+                "mutable artifact overwrote a linked outside destination"
+            );
+            assert!(result.is_err(), "linked mutable artifact parent accepted");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mutable_text_artifact_refuses_linked_session_and_artifacts_parents() {
+        check_mutable_parent_links(false);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mutable_byte_artifact_refuses_linked_session_and_artifacts_parents() {
+        check_mutable_parent_links(true);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mutable_artifacts_replace_exact_bytes_without_following_leaf_links() {
+        use std::os::unix::fs::PermissionsExt;
+        let _guard = TEST_ARTIFACT_SESSIONS_GUARD
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let temp = tempfile::tempdir().unwrap();
+        let sessions = temp.path().join("sessions");
+        let _root = set_test_sessions_root(sessions.clone());
+        let outside = temp.path().join("outside.txt");
+        std::fs::write(&outside, b"outside-leaf-canary").unwrap();
+        for binary in [false, true] {
+            let extension = if binary { "bin" } else { "txt" };
+            let relative = PathBuf::from(format!("artifacts/mutable.{extension}"));
+            let directory = sessions.join("session-a/artifacts");
+            std::fs::create_dir_all(&directory).unwrap();
+            let path = sessions.join("session-a").join(&relative);
+            std::os::unix::fs::symlink(&outside, &path).unwrap();
+            let (absolute, recorded) = if binary {
+                write_session_artifact_bytes(
+                    "session-a",
+                    "mutable",
+                    extension,
+                    b"\0exact-byte-payload",
+                )
+            } else {
+                write_session_artifact("session-a", "mutable", "exact-text-payload")
+            }
+            .unwrap();
+            assert_eq!(absolute, path);
+            assert_eq!(recorded, relative);
+            let expected: &[u8] = if binary {
+                b"\0exact-byte-payload"
+            } else {
+                b"exact-text-payload"
+            };
+            assert_eq!(std::fs::read(&absolute).unwrap(), expected);
+            assert!(
+                !std::fs::symlink_metadata(&absolute)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+            assert_eq!(
+                std::fs::metadata(&absolute).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            assert_eq!(std::fs::read(&outside).unwrap(), b"outside-leaf-canary");
+        }
     }
 }

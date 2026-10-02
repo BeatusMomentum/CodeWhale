@@ -71,7 +71,7 @@ const COMPACTION_THRESHOLD_PERCENT: u32 = 80;
 pub use codewhale_core::request::{
     CacheControl, ContentBlock, INTERRUPTED_ASSISTANT_CONTEXT_PREFIX, INTERRUPTED_ASSISTANT_ROLE,
     ImageUrlContent, Message, MessageRequest, OpaqueReasoningState, SystemBlock, SystemPrompt,
-    Tool, ToolCaller,
+    Tool, ToolCallKey, ToolCaller,
 };
 #[allow(unused_imports)]
 pub use codewhale_core::role::Role;

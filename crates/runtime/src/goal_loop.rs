@@ -268,9 +268,10 @@ pub const fn continuation_wait(delay_seconds: u64) -> Option<Duration> {
 }
 
 /// Wait out the between-continuation quiet period, honoring cancellation.
-/// `None` resolves to `Elapsed` immediately so callers have a single dispatch
-/// gate. Cancellation is biased and always wins over a racing expiry — the
-/// same semantics as the interactive cadence (#5508). Two dispatchers await
+/// `None` resolves immediately so callers have a single dispatch gate: to
+/// `Cancelled` when the token is already cancelled, otherwise `Elapsed`.
+/// Cancellation is biased and always wins over a racing expiry — the same
+/// semantics as the interactive cadence (#5508), including a zero delay. Two dispatchers await
 /// this gate: the turn loop's intra-turn passes (every session), and the
 /// runtime host's cross-turn re-arm for host-managed engines
 /// (`RuntimeThreadManager::spawn_goal_continuation`), which never
@@ -279,6 +280,9 @@ pub async fn await_continuation_wait(
     wait: Option<Duration>,
     cancel_token: &tokio_util::sync::CancellationToken,
 ) -> ContinuationWaitOutcome {
+    if cancel_token.is_cancelled() {
+        return ContinuationWaitOutcome::Cancelled;
+    }
     let Some(wait) = wait else {
         return ContinuationWaitOutcome::Elapsed;
     };
@@ -289,14 +293,19 @@ pub async fn await_continuation_wait(
     }
 }
 
-/// Whether the durable token usage has reached the active goal's budget.
-///
-/// Budgets are telemetry-only in unbounded goal mode. Keeping this shared
-/// predicate false ensures preview and the live continuation loop agree that
-/// crossing a token budget does not close the outbound gate.
+/// Whether the durable token usage has reached an *enforced* token budget —
+/// the same condition on which [`decide_continuation`] stops with
+/// [`StopReason::BudgetLimit`]. Budgets are telemetry-only unless
+/// `[goal] enforce_token_budget` opts in, so without it this stays false and
+/// crossing a budget never closes the outbound gate. Preview and the live
+/// continuation loop share this predicate so they cannot disagree about spend.
 #[must_use]
-pub const fn token_budget_exhausted(_progress: GoalProgress, _budget: GoalBudget) -> bool {
-    false
+pub const fn token_budget_exhausted(progress: GoalProgress, budget: GoalBudget) -> bool {
+    budget.enforce_token_budget
+        && match budget.token_budget {
+            Some(limit) => progress.tokens_used >= limit,
+            None => false,
+        }
 }
 
 /// Whether a stop reason represents success (Completed) vs. an early/forced exit.
@@ -570,6 +579,39 @@ mod tests {
             .await,
             ContinuationWaitOutcome::Cancelled,
             "an explicit cancel during the quiet period must win and never dispatch"
+        );
+    }
+
+    #[test]
+    fn exhausted_budget_predicate_matches_the_live_stop() {
+        let progress = GoalProgress {
+            tokens_used: 1_000,
+            ..GoalProgress::default()
+        };
+        for enforce in [false, true] {
+            let budget = GoalBudget {
+                token_budget: Some(1_000),
+                time_budget_seconds: None,
+                enforce_token_budget: enforce,
+                max_continuations: 0,
+            };
+            assert_eq!(
+                token_budget_exhausted(progress, budget),
+                decide_continuation(GoalRunStatus::Active, progress, budget)
+                    == ContinuationDecision::Stop(StopReason::BudgetLimit),
+                "preview must report exactly the budget stop the live loop takes (enforce={enforce})"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_wins_over_a_zero_delay() {
+        let cancel_token = tokio_util::sync::CancellationToken::new();
+        cancel_token.cancel();
+        assert_eq!(
+            await_continuation_wait(continuation_wait(0), &cancel_token).await,
+            ContinuationWaitOutcome::Cancelled,
+            "a cancelled goal with no quiet period must never dispatch"
         );
     }
 

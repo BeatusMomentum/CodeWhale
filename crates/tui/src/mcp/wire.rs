@@ -10,7 +10,7 @@ pub(super) const MAX_SSE_FRAME_BYTES: usize = 8 * 1024 * 1024;
 /// or malicious server could otherwise stream an unbounded body (or a
 /// newline-free multi-GB "line") and OOM the process at transport-read time,
 /// before any transcript-level spillover applies.
-pub(super) const MAX_MCP_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+pub(crate) const MAX_MCP_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 
 pub(super) fn is_mcp_stale_session_body(body: &str) -> bool {
     let body = body.to_ascii_lowercase();

@@ -75,11 +75,47 @@ pub(super) enum UserInputDecision {
     },
 }
 
+/// A person pressed Allow on an approval card for this call.
+///
+/// Only the engine's card resolver can build one; auto-approval, Full
+/// Access, Auto-Review and session grants never do. Tools that act on a
+/// person's behalf (the Computer Use consent and script calls) forward it to
+/// the plugin as an attested decision.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct HumanDecision {
+    tool_name: String,
+    arguments: serde_json::Value,
+}
+
+impl HumanDecision {
+    pub(super) fn from_card_allow(tool_name: &str, arguments: &serde_json::Value) -> Self {
+        Self {
+            tool_name: tool_name.to_string(),
+            arguments: arguments.clone(),
+        }
+    }
+
+    pub(crate) fn authorizes(&self, tool_name: &str, arguments: &serde_json::Value) -> bool {
+        self.tool_name == tool_name && self.arguments == *arguments
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(tool_name: &str, arguments: &serde_json::Value) -> Self {
+        Self::from_card_allow(tool_name, arguments)
+    }
+}
+
+impl std::fmt::Debug for HumanDecision {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("HumanDecision(card allow)")
+    }
+}
+
 /// Result of awaiting tool approval from the user.
 #[derive(Debug)]
 pub(super) enum ApprovalResult {
     /// User approved the tool execution.
-    Approved,
+    Approved(ApprovalDecider),
     /// User denied the tool execution.
     Denied,
     /// The approval card expired unanswered. Nobody refused the call, so it
@@ -161,7 +197,7 @@ impl Engine {
     ) -> Result<ApprovalResult, ToolError> {
         self.commit_approval_receipt(ApprovalReceipt::asked(tool_id, tool_name))
             .await?;
-        if self.tx_event.send(event).await.is_err() {
+        if self.send_event(event).await.is_err() {
             self.commit_approval_outcome(
                 tool_id,
                 ApprovalOutcome::Unavailable,
@@ -222,7 +258,7 @@ impl Engine {
                     tracing::warn!(tool_id, waited_secs = waited.as_secs(), "{message}");
                     if !announced {
                         announced = true;
-                        let _ = self.tx_event.send(Event::Status { message }).await;
+                        let _ = self.send_event(Event::Status { message }).await;
                     }
                 }
                 _ = self.cancel_token.cancelled() => {
@@ -245,7 +281,7 @@ impl Engine {
                     match decision {
                         ApprovalDecision::Approved { id, by } if id == tool_id => {
                             self.commit_approval_outcome(tool_id, ApprovalOutcome::ApprovedOnce, Some(by)).await?;
-                            return Ok(ApprovalResult::Approved);
+                            return Ok(ApprovalResult::Approved(by));
                         }
                         ApprovalDecision::Denied { id, by } if id == tool_id => {
                             self.commit_approval_outcome(tool_id, ApprovalOutcome::Denied, Some(by)).await?;
@@ -272,12 +308,10 @@ impl Engine {
                             ).await?;
                             return Ok(ApprovalResult::RetryWithPolicy(policy));
                         }
-                        // A child prompt answered while the parent itself is
-                        // waiting: hand it to the child instead of dropping it.
-                        other => {
-                            self.route_child_approval_decision(other).await;
-                            continue;
-                        }
+                        // A stale answer for another call: no waiter here. (An
+                        // agent's answer never arrives here; the handle hands
+                        // it to the agent directly.)
+                        _ => continue,
                     }
                 }
             }
@@ -289,14 +323,35 @@ impl Engine {
         tool_id: &str,
         request: UserInputRequest,
     ) -> Result<UserInputResponse, ToolError> {
-        let _ = self
-            .tx_event
-            .send(Event::UserInputRequired {
+        // C02-19: a question that never reached a host has nobody to answer
+        // it. Fail now instead of waiting out the timeout — which by default
+        // is no timeout at all.
+        if self
+            .send_event(Event::UserInputRequired {
                 id: tool_id.to_string(),
                 request,
             })
-            .await;
+            .await
+            .is_err()
+        {
+            return Err(ToolError::execution_failed(
+                "User input request could not reach its host, so nobody was asked. \
+                 Continue without the answer or ask in your reply instead."
+                    .to_string(),
+            ));
+        }
+        // R1, as for tool approval: the per-turn wall-clock budget bounds the
+        // agent's own time, not how long a person takes to answer.
+        self.turn_wall_clock.begin_human_wait();
+        let response = self.await_user_input_decision(tool_id).await;
+        self.turn_wall_clock.end_human_wait();
+        response
+    }
 
+    async fn await_user_input_decision(
+        &mut self,
+        tool_id: &str,
+    ) -> Result<UserInputResponse, ToolError> {
         // #6003: `[tools] user_input_timeout_seconds`. Absent, or an explicit
         // 0, waits until the person answers or cancels. A positive value is
         // one absolute deadline for the whole wait: `select!` drops the
@@ -322,7 +377,7 @@ impl Engine {
                     tracing::warn!(tool_id, waited_secs = waited.as_secs(), "{message}");
                     if !announced {
                         announced = true;
-                        let _ = self.tx_event.send(Event::Status { message }).await;
+                        let _ = self.send_event(Event::Status { message }).await;
                     }
                 }
                 _ = self.cancel_token.cancelled() => {
@@ -360,9 +415,7 @@ impl Engine {
                         }
                         Err(_) => {
                             let seconds = wait.map(|wait| wait.as_secs()).unwrap_or(0);
-                            let _ = self
-                                .tx_event
-                                .send(Event::Status {
+                            let _ = self.send_event(Event::Status {
                                     message: format!("User input timed out after {seconds}s"),
                                 })
                                 .await;
@@ -490,18 +543,37 @@ mod tests {
         ]
     }
 
+    fn fixture_execution_id(events: &[Event], provider_id: &str) -> String {
+        let ids = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::ToolCallStarted {
+                    id,
+                    model_call: Some(model_call),
+                    ..
+                } if model_call.provider_id == provider_id => Some(id),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(ids.len(), 1, "one execution starts for {provider_id}");
+        let id = ids[0];
+        assert_ne!(id, provider_id, "provider IDs cannot authorize executions");
+        uuid::Uuid::parse_str(id).expect("host-generated execution UUID");
+        id.clone()
+    }
+
     async fn wait_for_fixture_approval(
         events: &Arc<tokio::sync::RwLock<tokio::sync::mpsc::Receiver<Event>>>,
-        expected_id: &str,
-    ) -> Vec<Event> {
+        provider_id: &str,
+    ) -> (String, Vec<Event>) {
         tokio::time::timeout(Duration::from_secs(5), async {
             let mut seen = Vec::new();
             let mut events = events.write().await;
             while let Some(event) = events.recv().await {
                 if let Event::ApprovalRequired { id, tool_name, .. } = &event {
-                    assert_eq!(id, expected_id);
+                    assert_eq!(id, &fixture_execution_id(&seen, provider_id));
                     assert_eq!(tool_name, COUNTER_TOOL);
-                    return seen;
+                    return (id.clone(), seen);
                 }
                 seen.push(event);
             }
@@ -567,14 +639,14 @@ mod tests {
         });
 
         // Reach the gate and answer nothing: this is the park.
-        let _ = wait_for_fixture_approval(&events, CURRENT_CALL).await;
+        let (execution_id, _) = wait_for_fixture_approval(&events, CURRENT_CALL).await;
 
         let announced = tokio::time::timeout(Duration::from_secs(5), async {
             let mut rx = events.write().await;
             while let Some(event) = rx.recv().await {
                 if let Event::Status { message } = &event
                     && message.contains("Still waiting for tool approval")
-                    && message.contains(CURRENT_CALL)
+                    && message.contains(&execution_id)
                 {
                     return true;
                 }
@@ -733,8 +805,10 @@ mod tests {
                 .await
         });
 
+        let mut current_execution_id = None;
         if !full_access {
-            let seen = wait_for_fixture_approval(&events, CURRENT_CALL).await;
+            let (execution_id, seen) = wait_for_fixture_approval(&events, CURRENT_CALL).await;
+            current_execution_id = Some(execution_id.clone());
             match source {
                 ClaimSource::Assistant => assert!(seen.iter().any(|event| matches!(event, Event::MessageDelta { content, .. } if content.contains(INVENTED_APPROVAL)))),
                 ClaimSource::ToolOutput => {
@@ -754,18 +828,20 @@ mod tests {
             let pending = store.replay(&session_id).expect("pending receipt");
             assert!(pending.completed.is_empty());
             assert!(
-                matches!(pending.unmatched_asks.as_slice(), [ApprovalReceipt::Asked { approval_id, tool_call_id, tool_name, .. }] if approval_id == CURRENT_CALL && tool_call_id == CURRENT_CALL && tool_name == COUNTER_TOOL)
+                matches!(pending.unmatched_asks.as_slice(), [ApprovalReceipt::Asked { approval_id, tool_call_id, tool_name, .. }] if approval_id == &execution_id && tool_call_id == &execution_id && tool_name == COUNTER_TOOL)
             );
             match action {
                 HostAction::AllowOnce => {
                     let host = handle.as_ref().unwrap();
-                    host.approve_tool_call(CURRENT_CALL)
+                    host.approve_tool_call(&execution_id)
                         .await
                         .expect("matching typed allow");
-                    host.approve_tool_call(CURRENT_CALL)
+                    host.approve_tool_call(&execution_id)
                         .await
                         .expect("duplicate old decision");
-                    wait_for_fixture_approval(&events, NEXT_CALL).await;
+                    let (next_execution_id, _) =
+                        wait_for_fixture_approval(&events, NEXT_CALL).await;
+                    assert_ne!(next_execution_id, execution_id);
                     assert!(
                         tokio::time::timeout(Duration::from_millis(25), &mut task)
                             .await
@@ -773,14 +849,14 @@ mod tests {
                         "old approval cannot authorize the next call"
                     );
                     assert_eq!(executions.load(Ordering::SeqCst), 1);
-                    host.deny_tool_call(NEXT_CALL)
+                    host.deny_tool_call(&next_execution_id)
                         .await
                         .expect("deny next call");
                 }
                 HostAction::Deny => handle
                     .as_ref()
                     .unwrap()
-                    .deny_tool_call(CURRENT_CALL)
+                    .deny_tool_call(&execution_id)
                     .await
                     .expect("typed deny"),
                 HostAction::StaleThenDeny => {
@@ -788,6 +864,9 @@ mod tests {
                     host.approve_tool_call("counter-stale")
                         .await
                         .expect("stale typed allow");
+                    host.approve_tool_call(CURRENT_CALL)
+                        .await
+                        .expect("provider ID is not host approval authority");
                     assert!(
                         tokio::time::timeout(Duration::from_millis(25), &mut task)
                             .await
@@ -798,7 +877,7 @@ mod tests {
                         store.replay(&session_id).unwrap().unmatched_asks,
                         pending.unmatched_asks
                     );
-                    host.deny_tool_call(CURRENT_CALL)
+                    host.deny_tool_call(&execution_id)
                         .await
                         .expect("close pending call");
                 }
@@ -832,6 +911,7 @@ mod tests {
                 assert!(!matches!(event, Event::ApprovalRequired { .. }));
             }
         } else {
+            let execution_id = current_execution_id.expect("observed approval execution");
             let expected = match action {
                 HostAction::AllowOnce => {
                     vec![ApprovalOutcome::ApprovedOnce, ApprovalOutcome::Denied]
@@ -850,7 +930,7 @@ mod tests {
                 expected
             );
             assert!(
-                matches!(&replay.completed[0].ask, ApprovalReceipt::Asked { approval_id, tool_call_id, tool_name, .. } if approval_id == CURRENT_CALL && tool_call_id == CURRENT_CALL && tool_name == COUNTER_TOOL)
+                matches!(&replay.completed[0].ask, ApprovalReceipt::Asked { approval_id, tool_call_id, tool_name, .. } if approval_id == &execution_id && tool_call_id == &execution_id && tool_name == COUNTER_TOOL)
             );
         }
     }
@@ -1096,7 +1176,12 @@ mod tests {
 
         let mut seen = Vec::new();
         let (id, tool_name, description) = next_approval(&events, &mut seen).await;
-        assert_eq!(id, "exec-1.1", "the program itself is not a prompt");
+        let execution_id = fixture_execution_id(&seen, "exec-1");
+        assert_eq!(
+            id,
+            format!("{execution_id}.1"),
+            "the program itself is not a prompt"
+        );
         assert_eq!(tool_name, COUNTER_TOOL);
         assert!(
             description.contains("execute_tools program call"),
@@ -1109,17 +1194,17 @@ mod tests {
             "the program is suspended on its nested call"
         );
         assert_eq!(executions.load(Ordering::SeqCst), 0);
-        handle.approve_tool_call("exec-1.1").await.expect("allow");
+        handle.approve_tool_call(&id).await.expect("allow");
 
         let (id, tool_name, _) = next_approval(&events, &mut seen).await;
-        assert_eq!(id, "exec-1.2");
+        assert_eq!(id, format!("{execution_id}.2"));
         assert_eq!(tool_name, COUNTER_TOOL);
         assert_eq!(
             executions.load(Ordering::SeqCst),
             1,
             "allow resumed the program"
         );
-        handle.deny_tool_call("exec-1.2").await.expect("deny");
+        handle.deny_tool_call(&id).await.expect("deny");
 
         let store = turn.store.clone();
         let session_id = turn.session_id.clone();
@@ -1153,6 +1238,99 @@ mod tests {
         );
     }
 
+    /// Extension host acceptance 2 with code mode's gate (#6562 landed before
+    /// #6600): an `execute_tools` program calling an extension tool in a
+    /// main-session turn suspends for approval under a `<call>.<seq>` id,
+    /// attributed to `extension:<plugin>`, and no `tool/call` reaches the host
+    /// before a person allows it. Allow returns the host's result to the
+    /// program; deny fails only that nested call.
+    #[tokio::test]
+    async fn execute_tools_gates_an_extension_tool_before_any_host_call() {
+        let Some(node) = crate::extension_host::tests::node_for_tests(
+            "execute_tools_gates_an_extension_tool_before_any_host_call",
+        ) else {
+            return;
+        };
+        let _policy = crate::plugins::activation::TestPolicyGuard::extension_host(true);
+        let fixture = crate::extension_host::tests::FixturePlugins::new(&["slow-tool"]).await;
+        let manager = fixture.manager(node);
+        let attachment = manager.attach(fixture.registry());
+        attachment.sync().await.expect("host activation");
+        let tool =
+            crate::extension_host::tests::host_tool(&attachment, fixture.workspace(), "slow_wait");
+        let sent_before = manager.host_requests_started().expect("host running");
+
+        let code = "const first = await tools.call('slow_wait', { ms: 20 }); \
+             let denied = null; \
+             try { await tools.call('slow_wait', { ms: 20 }); } \
+             catch (e) { denied = String(e.message || e); } \
+             return { first: first.content, denied };";
+        let mut turn = start_nested_program_turn_with(
+            code,
+            NestedTurnOptions {
+                tools: vec![tool],
+                ..NestedTurnOptions::default()
+            },
+        );
+        let events = turn.events.clone();
+        let handle = turn.handle.clone();
+
+        let mut seen = Vec::new();
+        let (id, tool_name, description) = next_approval(&events, &mut seen).await;
+        let execution_id = fixture_execution_id(&seen, "exec-1");
+        assert_eq!(id, format!("{execution_id}.1"));
+        assert_eq!(tool_name, "slow_wait");
+        assert!(
+            description.contains("execute_tools program call")
+                && description.contains("extension:slow-tool"),
+            "{description}"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut turn.task)
+                .await
+                .is_err(),
+            "the program is suspended on its nested call"
+        );
+        assert_eq!(
+            manager.host_requests_started(),
+            Some(sent_before),
+            "no tool/call before approval"
+        );
+        handle.approve_tool_call(&id).await.expect("allow");
+
+        let (id, _, _) = next_approval(&events, &mut seen).await;
+        assert_eq!(id, format!("{execution_id}.2"));
+        assert_eq!(
+            manager.host_requests_started(),
+            Some(sent_before + 1),
+            "allow sent exactly one tool/call"
+        );
+        handle.deny_tool_call(&id).await.expect("deny");
+
+        let receipt = finish_nested_program_turn(&mut turn, &mut seen).await;
+        assert_eq!(receipt["success"], true, "{receipt}");
+        assert_eq!(
+            receipt["body"]["return"]["first"]["waited"], 20,
+            "the host's result reached the program: {receipt}"
+        );
+        assert!(
+            receipt["body"]["return"]["denied"]
+                .as_str()
+                .is_some_and(|message| message.contains("denied by user")),
+            "{receipt}"
+        );
+        assert_eq!(receipt["calls"][0]["decision"], "approved");
+        assert_eq!(receipt["calls"][0]["status"], "ok");
+        assert_eq!(receipt["calls"][1]["decision"], "denied");
+        assert_eq!(receipt["calls"][1]["status"], "refused");
+        assert_eq!(
+            manager.host_requests_started(),
+            Some(sent_before + 1),
+            "the denied call never reached the host"
+        );
+        manager.shutdown().await;
+    }
+
     /// #6562: a nested call never runs on a posture the user has since
     /// narrowed. Narrowing while a nested approval card is open fails that
     /// call even though it was approved (same rule as a direct call), and
@@ -1175,7 +1353,8 @@ mod tests {
 
         let mut seen = Vec::new();
         let (id, _, _) = next_approval(&events, &mut seen).await;
-        assert_eq!(id, "exec-1.1");
+        let execution_id = fixture_execution_id(&seen, "exec-1");
+        assert_eq!(id, format!("{execution_id}.1"));
         // The user narrows Work/Ask to Plan while the card is open, then
         // approves the card.
         handle.publish_turn_authority(
@@ -1186,7 +1365,7 @@ mod tests {
             ApprovalMode::Suggest,
             None,
         );
-        handle.approve_tool_call("exec-1.1").await.expect("allow");
+        handle.approve_tool_call(&id).await.expect("allow");
 
         let receipt = finish_nested_program_turn(&mut turn, &mut seen).await;
         assert_eq!(executions.load(Ordering::SeqCst), 0, "nothing ran");
@@ -1211,7 +1390,7 @@ mod tests {
         assert!(
             !seen.iter().any(|event| matches!(
                 event,
-                Event::ApprovalRequired { id, .. } if id == "exec-1.2"
+                Event::ApprovalRequired { id, .. } if id == &format!("{execution_id}.2")
             )),
             "the second call is refused without a prompt"
         );
@@ -1619,7 +1798,7 @@ mod tests {
             let result = task.await.expect("approval task");
             match expected {
                 ApprovalOutcome::ApprovedOnce => {
-                    assert!(matches!(result, Ok(ApprovalResult::Approved)));
+                    assert!(matches!(result, Ok(ApprovalResult::Approved(_))));
                 }
                 ApprovalOutcome::Denied => {
                     assert!(matches!(result, Ok(ApprovalResult::Denied)));

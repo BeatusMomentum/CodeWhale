@@ -82,6 +82,9 @@ fn test_codex_config(server: &MockServer) -> Config {
             initial_delay: Some(0.0),
             max_delay: Some(0.0),
             exponential_base: Some(1.0),
+            jitter: None,
+            jitter_factor: None,
+            respect_retry_after: None,
         }),
         providers: Some(ProvidersConfig {
             openai_codex: ProviderConfig {
@@ -229,6 +232,82 @@ async fn responses_stream_retries_upstream_499_before_streaming() {
     .expect("Responses retry stream should finish after [DONE]");
 
     assert_eq!(attempts.load(Ordering::SeqCst), 2);
+}
+
+async fn collect_responses_stream(sse_body: &'static str) -> Vec<Result<StreamEvent>> {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(CODEX_RESPONSES_PATH))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Content-Type", "text/event-stream")
+                .set_body_string(sse_body),
+        )
+        .mount(&server)
+        .await;
+    let client = {
+        let _env_lock = crate::test_support::lock_test_env();
+        let _codex_token =
+            crate::test_support::EnvVarGuard::set("OPENAI_CODEX_ACCESS_TOKEN", "test-token");
+        let _legacy_codex_token = crate::test_support::EnvVarGuard::remove("CODEX_ACCESS_TOKEN");
+        CodewhaleClient::new(&test_codex_config(&server)).unwrap()
+    };
+    let stream = client
+        .handle_responses_stream(
+            &client
+                .prepare_outbound_request(minimal_responses_request(), true)
+                .expect("responses request prepares"),
+        )
+        .await
+        .expect("Responses stream opens");
+    tokio::time::timeout(std::time::Duration::from_secs(5), stream.collect())
+        .await
+        .expect("stream ends")
+}
+
+#[tokio::test]
+async fn responses_stream_eof_without_a_terminal_event_is_an_error() {
+    let events = collect_responses_stream(concat!(
+        "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"message\",\"id\":\"m\"}}\n\n",
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n",
+    ))
+    .await;
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, Ok(StreamEvent::MessageStop))),
+        "a truncated stream must not report MessageStop: {events:?}"
+    );
+    assert!(
+        events
+            .last()
+            .is_some_and(|event| event.as_ref().is_err_and(|error| error
+                .to_string()
+                .contains("closed before response.completed"))),
+        "{events:?}"
+    );
+}
+
+#[tokio::test]
+async fn responses_stream_joins_multiline_data_fields_into_one_event() {
+    let events = collect_responses_stream(concat!(
+        "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"message\",\"id\":\"m\"}}\n\n",
+        "data: {\"type\":\"response.output_text.delta\",\n",
+        "data: \"delta\":\"joined\"}\n\n",
+        "data: [DONE]\n\n",
+    ))
+    .await;
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            Ok(StreamEvent::ContentBlockDelta {
+                delta: Delta::TextDelta { text },
+                ..
+            }) if text == "joined"
+        )),
+        "the split event was lost: {events:?}"
+    );
+    assert!(matches!(events.last(), Some(Ok(StreamEvent::MessageStop))));
 }
 
 #[tokio::test]
@@ -1156,6 +1235,7 @@ fn responses_input_includes_user_role_tool_results() {
             Message {
                 role: Role::Assistant,
                 content: vec![ContentBlock::ToolUse {
+                    execution_id: None,
                     id: "call_abc|fc_123".to_string(),
                     name: "checklist_write".to_string(),
                     input: json!({"items": []}),
@@ -1166,6 +1246,7 @@ fn responses_input_includes_user_role_tool_results() {
             Message {
                 role: Role::User,
                 content: vec![ContentBlock::ToolResult {
+                    execution_id: None,
                     tool_use_id: "call_abc|fc_123".to_string(),
                     content: "<6 items>".to_string(),
                     is_error: None,
@@ -1202,6 +1283,7 @@ fn responses_input_encodes_tool_call_names() {
         messages: vec![Message {
             role: Role::Assistant,
             content: vec![ContentBlock::ToolUse {
+                execution_id: None,
                 id: "call_abc|fc_123".to_string(),
                 name: "web.run".to_string(),
                 input: json!({}),
@@ -1378,6 +1460,7 @@ fn tool_result_image_becomes_native_function_output_content() {
         Message {
             role: Role::Assistant,
             content: vec![ContentBlock::ToolUse {
+                execution_id: None,
                 id: "call_image_1".to_string(),
                 name: "read".to_string(),
                 input: serde_json::json!({"path": "shot.png"}),
@@ -1388,6 +1471,7 @@ fn tool_result_image_becomes_native_function_output_content() {
         Message {
             role: Role::User,
             content: vec![ContentBlock::ToolResult {
+                execution_id: None,
                 tool_use_id: "call_image_1".to_string(),
                 content: "screenshot captured".to_string(),
                 is_error: Some(false),

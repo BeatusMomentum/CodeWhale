@@ -648,12 +648,22 @@ impl ScorecardMetrics {
     /// Flag metrics that grew more than `threshold_pct` over `baseline`. Cost
     /// and token counts are "lower is better", so only *increases* are
     /// regressions. (Cache-hit ratio is the opposite, reported separately.)
+    ///
+    /// Fails closed on values that cannot be compared: a non-finite threshold
+    /// admits no growth at all (it is treated as 0%), and a metric whose
+    /// change is `NaN` counts as regressed. Every `NaN` comparison is false,
+    /// so without this a `NaN` threshold would pass any run.
     #[must_use]
     pub fn regressions_against(
         &self,
         baseline: &ScorecardMetrics,
         threshold_pct: f64,
     ) -> Vec<Regression> {
+        let threshold_pct = if threshold_pct.is_finite() {
+            threshold_pct
+        } else {
+            0.0
+        };
         let mut out = Vec::new();
         // A partial/unknown subtotal is not comparable to a complete baseline,
         // but losing completeness is itself a regression. Otherwise removing
@@ -711,7 +721,7 @@ impl ScorecardMetrics {
             let drop_pct = (baseline.cache_hit_ratio - self.cache_hit_ratio)
                 / baseline.cache_hit_ratio
                 * 100.0;
-            if drop_pct > threshold_pct {
+            if drop_pct.is_nan() || drop_pct > threshold_pct {
                 out.push(Regression {
                     metric: "cache_hit_ratio_drop".to_string(),
                     baseline: baseline.cache_hit_ratio,
@@ -733,7 +743,7 @@ fn push_regression(
 ) {
     if base > 0.0 {
         let pct = (cur - base) / base * 100.0;
-        if pct > threshold_pct {
+        if pct.is_nan() || pct > threshold_pct {
             out.push(Regression {
                 metric: metric.to_string(),
                 baseline: base,
@@ -1906,6 +1916,53 @@ mod tests {
         assert!(names.contains(&"total_cost_usd"));
         assert!(names.contains(&"total_output_tokens"));
         assert!(!names.contains(&"total_input_tokens")); // under threshold
+    }
+
+    #[test]
+    fn a_non_finite_threshold_cannot_pass_a_regressed_run() {
+        let baseline = ScorecardMetrics {
+            turns: 1,
+            money_metered_turns: 1,
+            unpriced_turns: 0,
+            cny_unpriced_turns: 0,
+            cost_complete: true,
+            cny_cost_complete: true,
+            unpriced_classes: Vec::new(),
+            total_input_tokens: 1000,
+            total_output_tokens: 1000,
+            total_cache_read_tokens: 0,
+            total_cache_write_tokens: 0,
+            total_reasoning_tokens: 0,
+            total_cost_usd: 0.10,
+            total_cost_cny: 0.7,
+            cache_hit_ratio: 0.5,
+        };
+        let current = ScorecardMetrics {
+            total_output_tokens: 2000,
+            ..baseline.clone()
+        };
+        for threshold in [f64::NAN, f64::INFINITY] {
+            let names: Vec<String> = current
+                .regressions_against(&baseline, threshold)
+                .into_iter()
+                .map(|r| r.metric)
+                .collect();
+            assert!(
+                names.iter().any(|name| name == "total_output_tokens"),
+                "threshold {threshold} passed a +100% regression: {names:?}"
+            );
+        }
+        // A metric whose change cannot be computed is not a pass either.
+        let unknown = ScorecardMetrics {
+            cache_hit_ratio: f64::NAN,
+            ..baseline.clone()
+        };
+        assert!(
+            unknown
+                .regressions_against(&baseline, 5.0)
+                .iter()
+                .any(|r| r.metric == "cache_hit_ratio_drop")
+        );
     }
 
     #[test]

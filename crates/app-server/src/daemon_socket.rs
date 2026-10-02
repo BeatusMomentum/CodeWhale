@@ -276,7 +276,7 @@ mod platform {
     };
     use crate::{
         AppState, AppTransport, JsonRpcError, ParsedStdioLine, ShutdownAuthority, StdioLoopExit,
-        StdioLoopPolicy, build_state_with_transport, dispatch_stdio_request_with_writer,
+        StdioLoopPolicy, build_state_off_runtime, dispatch_stdio_request_with_writer,
         jsonrpc_error, jsonrpc_result, legacy_deepseek_compat, params_or_object, parse_params,
         parse_stdio_line, run_stdio_loop, write_stdio_line,
     };
@@ -430,7 +430,7 @@ mod platform {
                 shutdown: DaemonShutdownHandle(Arc::clone(&shutdown)),
             };
             let mut shutdown_rx = shutdown.subscribe();
-            let mut connections = JoinSet::new();
+            let mut connections = ConnectionTasks::default();
 
             loop {
                 if *shutdown_rx.borrow() {
@@ -457,8 +457,30 @@ mod platform {
             // The owner's `shutdown` reply was flushed before its loop
             // returned, so aborting what is left loses nothing a client
             // still needs.
-            connections.shutdown().await;
+            connections.0.shutdown().await;
             Ok(())
+        }
+    }
+
+    /// The daemon's connection tasks. A `JoinSet` keeps every finished task
+    /// until it is joined, so a long-lived daemon used to retain one task per
+    /// past client (health polls, re-attaches) for its whole lifetime.
+    /// [`Self::spawn`] is the only way in and reaps finished tasks first, so
+    /// the set is bounded by the live connections plus those that ended since
+    /// the last accept. A panicked connection is logged, not fatal.
+    #[derive(Default)]
+    struct ConnectionTasks(JoinSet<()>);
+
+    impl ConnectionTasks {
+        fn spawn(&mut self, task: impl std::future::Future<Output = ()> + Send + 'static) {
+            while let Some(joined) = self.0.try_join_next() {
+                if let Err(err) = joined
+                    && err.is_panic()
+                {
+                    tracing::warn!(error = %err, "daemon connection task panicked");
+                }
+            }
+            self.0.spawn(task);
         }
     }
 
@@ -485,7 +507,8 @@ mod platform {
                 source,
             })?;
 
-        let state = build_state_with_transport(options.config_path, None, AppTransport::Socket)
+        let state = build_state_off_runtime(options.config_path, None, AppTransport::Socket)
+            .await
             .map_err(DaemonSocketError::State)?;
         let (shutdown, _) = watch::channel(false);
         Ok(DaemonSocket {
@@ -740,6 +763,33 @@ mod platform {
                 version: None,
                 pid: None,
             }
+        }
+
+        #[tokio::test]
+        async fn finished_connection_tasks_are_reaped() {
+            let mut connections = ConnectionTasks::default();
+            let mut handles = Vec::new();
+            for _ in 0..3 {
+                handles.push(connections.0.spawn(async {}));
+            }
+            handles.push(
+                connections
+                    .0
+                    .spawn(async { panic!("fixture connection panic") }),
+            );
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !handles.iter().all(tokio::task::AbortHandle::is_finished) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("fixture connections finish");
+
+            // Accepting the next client reaps every finished connection,
+            // including the panicked one, and keeps only the new live one.
+            connections.spawn(std::future::pending::<()>());
+            assert_eq!(connections.0.len(), 1, "only the live connection is kept");
+            connections.0.abort_all();
         }
 
         #[test]

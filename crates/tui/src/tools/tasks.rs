@@ -1,7 +1,6 @@
 //! Durable task, gate, and PR-attempt tools.
 
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::time::Instant;
 
 use async_trait::async_trait;
@@ -37,17 +36,16 @@ fn build_gate_command_parts(command: &str) -> (String, Vec<String>) {
     )
 }
 
-fn build_gate_command(command: &str, cwd: &Path) -> Command {
+/// Gate commands run workspace code, so they start like an `exec_shell`
+/// command: inside this session's sandbox, from the sanitized environment.
+fn build_gate_command(
+    command: &str,
+    cwd: &Path,
+    context: &ToolContext,
+    timeout: std::time::Duration,
+) -> Result<Command, ToolError> {
     let (program, args) = build_gate_command_parts(command);
-    let mut cmd = Command::new(program);
-    cmd.args(args)
-        .current_dir(cwd)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    // Gate commands run workspace code; start them from the sanitized child
-    // environment, like `exec_shell`, so parent credentials are not inherited.
-    crate::child_env::apply_to_tokio_command(&mut cmd, std::iter::empty::<(&str, &str)>());
-    cmd
+    crate::tools::shell::sandboxed_runner_command(context, &program, args, cwd, timeout)
 }
 
 fn task_shell_wait_input(mut input: Value) -> Value {
@@ -673,27 +671,41 @@ impl TasksTool {
         }
 
         let started = Instant::now();
-        let mut cmd = build_gate_command(&command, &cwd);
-        let output =
-            tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), cmd.output()).await;
+        let mut cmd = build_gate_command(
+            &command,
+            &cwd,
+            context,
+            std::time::Duration::from_millis(timeout_ms),
+        )?;
+        // Contained: when the timeout elapses the gate's whole process tree
+        // is killed, instead of leaving it running behind a "timeout" result,
+        // and what it wrote until then still reaches the log.
+        let output = crate::process_tree::contained_output_until(
+            &mut cmd,
+            tokio::time::sleep(std::time::Duration::from_millis(timeout_ms)),
+        )
+        .await;
 
         let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         let (exit_code, stdout, stderr, timed_out, spawn_error) = match output {
-            Ok(Ok(out)) => (
-                out.status.code(),
-                String::from_utf8_lossy(&out.stdout).to_string(),
-                String::from_utf8_lossy(&out.stderr).to_string(),
-                false,
+            Ok(run) => (
+                if run.stopped {
+                    None
+                } else {
+                    run.output.status.code()
+                },
+                String::from_utf8_lossy(&run.output.stdout).to_string(),
+                String::from_utf8_lossy(&run.output.stderr).to_string(),
+                run.stopped,
                 None,
             ),
-            Ok(Err(err)) => (
+            Err(err) => (
                 None,
                 String::new(),
                 String::new(),
                 false,
                 Some(err.to_string()),
             ),
-            Err(_) => (None, String::new(), String::new(), true, None),
         };
 
         let full_log = format!(
@@ -1789,6 +1801,42 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timed_out_gate_run_kills_the_gate_process_tree() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let context = ToolContext::new(workspace.path())
+            .with_shell_policy(crate::worker_profile::ShellPolicy::Full);
+        let result = TasksTool::new("tasks")
+            .execute(
+                json!({
+                    "action": "gate_run",
+                    "gate": "test",
+                    "command": "echo gate-started; sleep 300 & echo $! > gate-child.pid; wait",
+                    "timeout_ms": 5_000
+                }),
+                &context,
+            )
+            .await
+            .expect("gate runs");
+        let metadata = result.metadata.expect("metadata");
+        assert_eq!(metadata["timed_out"], true, "{metadata}");
+        // What the gate wrote before the timeout is kept.
+        assert!(
+            result.content.contains("gate-started"),
+            "{}",
+            result.content
+        );
+        let child = crate::process_tree::read_pid_file(
+            &workspace.path().join("gate-child.pid"),
+            std::time::Duration::from_secs(5),
+        );
+        assert!(
+            crate::process_tree::wait_for_pid_exit(child, std::time::Duration::from_secs(5)),
+            "the timed-out gate's process is still running"
+        );
+    }
+
     #[test]
     fn gate_command_uses_non_login_shell_invocation() {
         // A login shell would source profile files that can re-export
@@ -1796,6 +1844,38 @@ mod tests {
         let (program, args) = build_gate_command_parts("echo hello");
         assert_eq!(program, "/bin/sh");
         assert_eq!(args, vec!["-c".to_string(), "echo hello".to_string()]);
+    }
+
+    /// A gate command is workspace code: under a read-only posture it either
+    /// runs inside the enforcing sandbox, where its write fails, or is refused
+    /// outright where no enforcing sandbox exists. It never runs raw.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn gate_command_is_confined_by_the_session_sandbox() {
+        let tmp = crate::test_support::sandbox_visible_tempdir();
+        let written = tmp.path().join("written-by-gate.txt");
+        let mut context = ToolContext::new(tmp.path());
+        context.elevated_sandbox_policy = Some(crate::sandbox::SandboxPolicy::ReadOnly);
+        let command = format!(
+            "printf ran; printf x > '{}' 2>/dev/null; true",
+            written.display()
+        );
+        match build_gate_command(
+            &command,
+            tmp.path(),
+            &context,
+            std::time::Duration::from_secs(30),
+        ) {
+            Ok(mut cmd) => {
+                let output = cmd.output().await.expect("sandboxed gate command runs");
+                assert_eq!(String::from_utf8_lossy(&output.stdout), "ran");
+            }
+            Err(error) => assert!(
+                error.to_string().contains("nothing was run"),
+                "only a missing enforcing sandbox may refuse: {error}"
+            ),
+        }
+        assert!(!written.exists(), "a read-only posture must stop the write");
     }
 
     #[cfg(unix)]
@@ -1808,7 +1888,10 @@ mod tests {
         let output = build_gate_command(
             "printf 'secret=%s\\n' \"${CODEWHALE_TEST_GATE_SECRET-unset}\"; printf 'path-ok\\n'",
             tmp.path(),
+            &ToolContext::new(tmp.path()),
+            std::time::Duration::from_secs(30),
         )
+        .expect("gate command builds")
         .output()
         .await
         .expect("gate command runs");

@@ -116,9 +116,15 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> Option<Option<SidebarRowActio
                 .iter()
                 .position(|panel| *panel == app.work_surface.panel)
                 .unwrap_or(0);
+            // Only a bare ←/→ walks the dock tabs. Ctrl/Alt/Super+←/→ are the
+            // composer's word-navigation chords; they fall through below and
+            // return ownership to the composer like printable input.
+            let bare = !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER);
             let next = match key.code {
-                KeyCode::Left => Some((current + tabs.len() - 1) % tabs.len()),
-                KeyCode::Right => Some((current + 1) % tabs.len()),
+                KeyCode::Left if bare => Some((current + tabs.len() - 1) % tabs.len()),
+                KeyCode::Right if bare => Some((current + 1) % tabs.len()),
                 _ => None,
             };
             if let Some(next) = next {
@@ -128,10 +134,13 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> Option<Option<SidebarRowActio
         }
     }
 
-    if matches!(key.code, KeyCode::Char(_))
-        && !key
-            .modifiers
-            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+    let navigation_chord = key
+        .modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER);
+    if (matches!(key.code, KeyCode::Char(_)) && !navigation_chord)
+        || (app.work_surface.focused
+            && navigation_chord
+            && matches!(key.code, KeyCode::Left | KeyCode::Right))
     {
         release_focus(app);
         return None;

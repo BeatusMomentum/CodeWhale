@@ -1331,16 +1331,32 @@ pub(crate) fn upsert_keepalive(
 /// Cancel tears the operation down *including* its keepalive: an unattended
 /// hourly lead run after cancel is pure cost. The automation is paused
 /// (never deleted) so its run history survives and a later start reactivates
-/// it. A missing keepalive is not an error.
+/// it. A missing keepalive is not an error; any other failure to establish
+/// its state is. A requested spending stop that cannot confirm the record is
+/// paused must never look like one that happened — an unreadable record may
+/// still be Active and scheduled.
 pub fn pause_keepalive(manager: &AutomationManager) -> Result<()> {
-    match manager.get_automation(OPERATE_KEEPALIVE_ID) {
-        Ok(record) if matches!(record.status, AutomationStatus::Active) => {
-            manager.pause_automation(OPERATE_KEEPALIVE_ID)?;
-            Ok(())
+    let record = match manager.get_automation(OPERATE_KEEPALIVE_ID) {
+        Ok(record) => record,
+        Err(error) if is_not_found(&error) => return Ok(()),
+        Err(error) => {
+            return Err(error.context(
+                "Operate keepalive state could not be established; it may still be scheduled",
+            ));
         }
-        Ok(_) => Ok(()),
-        Err(_) => Ok(()),
+    };
+    if matches!(record.status, AutomationStatus::Active) {
+        manager.pause_automation(OPERATE_KEEPALIVE_ID)?;
     }
+    Ok(())
+}
+
+fn is_not_found(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+    })
 }
 
 /// Pull the next keepalive lead run to the next scheduler tick (for example
@@ -1982,6 +1998,28 @@ api_key_env = "CW_OPERATE_MISSING_TEST_KEY"
         assert!(kick_keepalive(&manager).expect("kick"));
         pause_keepalive(&manager).expect("pause");
         assert!(!kick_keepalive(&manager).expect("kick paused"));
+    }
+
+    #[test]
+    fn pause_keepalive_refuses_to_report_a_stop_it_cannot_confirm() {
+        let dir = TempDir::new().expect("temp");
+        let manager = AutomationManager::open_for_test(dir.path().to_path_buf()).expect("manager");
+        upsert_keepalive(&manager, dir.path(), false, &route_fixture_config(), None)
+            .expect("upsert");
+        // Fault fixture: the keepalive record exists but cannot be parsed, so
+        // whether it is still Active (and spending) is unknown.
+        let record = dir
+            .path()
+            .join("automations")
+            .join(format!("{OPERATE_KEEPALIVE_ID}.json"));
+        assert!(record.exists(), "fixture targets the real record path");
+        fs::write(&record, b"{\"status\": \"active\", truncated").expect("corrupt record");
+
+        let error = pause_keepalive(&manager).expect_err("an unconfirmed stop must fail");
+        assert!(
+            format!("{error:#}").contains("could not be established"),
+            "{error:#}"
+        );
     }
 
     #[test]

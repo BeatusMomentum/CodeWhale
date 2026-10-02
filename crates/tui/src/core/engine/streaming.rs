@@ -7,6 +7,94 @@
 use codewhale_models::ToolCaller;
 use std::time::Duration;
 
+/// A send that did not enter the existing event queue. Cancellation is not
+/// evidence that the consumer closed, and neither is user-visible delivery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum EventSendError {
+    Cancelled,
+    Closed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum EventReservationPolicy {
+    /// Cancellation wins before admitting work or a new stream observation.
+    Strict,
+    /// Preserve a completed observation when capacity is already available.
+    Receipt,
+}
+
+/// Reserve from the one event queue. Lifecycle and terminal handoff permits
+/// are held locally; ordinary receipts consume theirs immediately. Receipts
+/// may enter available capacity after cancellation, but cancellation always
+/// releases a wait on a full queue. Idle sends have no turn token to cancel.
+pub(super) async fn reserve_event_capacity(
+    tx: &tokio::sync::mpsc::Sender<super::Event>,
+    cancel: Option<&tokio_util::sync::CancellationToken>,
+    policy: EventReservationPolicy,
+) -> Result<tokio::sync::mpsc::OwnedPermit<super::Event>, EventSendError> {
+    if policy == EventReservationPolicy::Receipt {
+        match tx.clone().try_reserve_owned() {
+            Ok(permit) => return Ok(permit),
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                return Err(EventSendError::Closed);
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {}
+        }
+    }
+    let reserve = tx.clone().reserve_owned();
+    match cancel {
+        Some(cancel) => tokio::select! {
+            biased;
+            () = cancel.cancelled() => Err(EventSendError::Cancelled),
+            result = reserve => result.map_err(|_| EventSendError::Closed),
+        },
+        None => reserve.await.map_err(|_| EventSendError::Closed),
+    }
+}
+
+impl super::Engine {
+    /// Stream observations always belong to the decoder's current turn,
+    /// including direct test/embedding calls that do not enqueue an Op.
+    pub(super) async fn send_stream_event(&self, event: super::Event) -> bool {
+        match reserve_event_capacity(
+            &self.tx_event,
+            Some(&self.cancel_token),
+            EventReservationPolicy::Strict,
+        )
+        .await
+        {
+            Ok(permit) => {
+                permit.send(event);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Every instance emitter uses the same queue authority. Available
+    /// capacity preserves post-cancel usage/status receipts; cancellation
+    /// releases a wait for capacity. An idle refresh must not inherit the
+    /// token of an earlier interrupted turn. Stream/admission/terminal handoff
+    /// reservations retain their strict cancellation floor.
+    pub(super) async fn send_event(&self, event: super::Event) -> Result<(), EventSendError> {
+        let cancel = self
+            .turn_controls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .active
+            .as_ref()
+            .map(|control| control.cancel.clone());
+        let permit = reserve_event_capacity(
+            &self.tx_event,
+            cancel.as_ref(),
+            EventReservationPolicy::Receipt,
+        )
+        .await?;
+        permit.send(event);
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ContentBlockKind {
     Text,
@@ -17,6 +105,7 @@ pub(super) enum ContentBlockKind {
 #[derive(Debug, Clone)]
 pub(super) struct ToolUseState {
     pub(super) id: String,
+    pub(super) execution_id: String,
     pub(super) name: String,
     pub(super) input: serde_json::Value,
     pub(super) caller: Option<ToolCaller>,
@@ -27,8 +116,35 @@ pub(super) struct ToolUseState {
     pub(super) input_parse_error: Option<String>,
 }
 
-/// Maximum total bytes of text/thinking content before aborting the stream.
+impl ToolUseState {
+    pub(super) fn model_call(&self) -> crate::core::events::ModelToolCall {
+        crate::core::events::ModelToolCall {
+            provider_id: self.id.clone(),
+            caller: self.caller.clone(),
+            thought_signature: self.thought_signature.clone(),
+        }
+    }
+}
+
+/// Maximum total bytes of text, reasoning and tool-argument content before aborting the stream.
 pub(super) const STREAM_MAX_CONTENT_BYTES: usize = 10 * 1024 * 1024; // 10 MB
+/// A response can contain many empty tool starts without spending the byte
+/// budget. Bound that batch before any call is retained or admitted. A lower
+/// configured per-turn tool budget remains authoritative at execution.
+pub(super) const MAX_TOOL_CALLS_PER_RESPONSE: usize = 256;
+
+pub(super) fn tool_call_limit_error() -> crate::error_taxonomy::ErrorEnvelope {
+    crate::error_taxonomy::ErrorEnvelope::new(
+        crate::error_taxonomy::ErrorCategory::InvalidInput,
+        crate::error_taxonomy::ErrorSeverity::Error,
+        false,
+        "response_tool_call_limit",
+        format!(
+            "Model response exceeded the maximum of {MAX_TOOL_CALLS_PER_RESPONSE} tool calls; no call from this response was executed"
+        ),
+    )
+}
+
 /// Sanity backstop for total stream wall-clock duration. **Not** a routine
 /// kill switch — the stream chunk idle timeout is the primary stall
 /// detector. The wall-clock cap is here only to bound pathological cases
@@ -44,12 +160,14 @@ pub(super) const STREAM_MAX_DURATION_SECS: u64 = 1800; // 30 minutes (was 300s; 
 /// Hard cap on consecutive recoverable stream errors before we surface a turn
 /// failure. Bumped 3 → 5 in v0.6.7 along with the HTTP/2 keepalive defaults
 /// (#103) — keepalive should make spurious decode errors rarer, so we can
-/// tolerate a longer streak before giving up on the turn.
+/// tolerate a longer streak before giving up on the turn. This is the
+/// default; `[tui].stream_max_errors` overrides it (#6700).
 pub(super) const MAX_STREAM_ERRORS_BEFORE_FAIL: u32 = 5;
 /// Cap on transparent stream-level retries — these only happen when the wire
 /// dies before any content was streamed. The user has seen nothing, but
 /// provider usage or billing may already exist. Two attempts can ride out a
-/// flaky edge node without amplifying real outages (#103).
+/// flaky edge node without amplifying real outages (#103). This is the
+/// default; `[tui].stream_max_transparent_retries` overrides it (#6700).
 pub(super) const MAX_TRANSPARENT_STREAM_RETRIES: u32 = 2;
 
 /// Decide whether a stream error is eligible for a transparent retry.
@@ -58,7 +176,9 @@ pub(super) const MAX_TRANSPARENT_STREAM_RETRIES: u32 = 2;
 /// 1. No content has been received on the current attempt. Reissuing after
 ///    visible partial deltas needs a separate recovery policy. This content
 ///    check is not evidence that the provider consumed or billed zero tokens.
-/// 2. We still have transparent-retry budget remaining.
+/// 2. We still have transparent-retry budget remaining (`max_attempts`,
+///    `[tui].stream_max_transparent_retries`, default
+///    [`MAX_TRANSPARENT_STREAM_RETRIES`]).
 /// 3. The turn has not been cancelled.
 ///
 /// Extracted as a pure function so the four #103 retry cases can be exercised
@@ -66,14 +186,16 @@ pub(super) const MAX_TRANSPARENT_STREAM_RETRIES: u32 = 2;
 pub(super) fn should_transparently_retry_stream(
     any_content_received: bool,
     transparent_attempts: u32,
+    max_attempts: u32,
     cancelled: bool,
 ) -> bool {
-    !any_content_received && transparent_attempts < MAX_TRANSPARENT_STREAM_RETRIES && !cancelled
+    !any_content_received && transparent_attempts < max_attempts && !cancelled
 }
 
-/// Budget for re-issuing the whole request after a dead stream. Shared by the
-/// nothing-streamed outer retry (#103 Phase 3) and the sleep-resume retry
-/// (#2990).
+/// Default budget for re-issuing the whole request after a dead stream.
+/// Shared by the nothing-streamed outer retry (#103 Phase 3), the
+/// sleep-resume retry (#2990), the network-drop resumes, and stream-open
+/// failures (#6699). Overridable via `[tui].stream_max_resumes` (#6700).
 pub(super) const MAX_STREAM_RETRIES: u32 = 3;
 
 /// Typed, engine-internal state for one mid-stream drop recovery.
@@ -113,15 +235,33 @@ pub(super) enum StreamResume {
 /// Bounded authorization for drop-resume retries.
 ///
 /// Mechanism, not comment: [`StreamRetryBudget::authorize`] is the only way
-/// to spend a resume and it returns `None` once [`MAX_STREAM_RETRIES`]
-/// resumes have been issued, so no call site can loop past the budget even
-/// if a guard predicate is relaxed. A healthy stream round resets it.
-#[derive(Debug, Default)]
+/// to spend a resume and it returns `None` once `limit` resumes (default
+/// [`MAX_STREAM_RETRIES`]) have been issued, so no call site can loop past
+/// the budget even if a guard predicate is relaxed. A healthy stream round
+/// resets it.
+#[derive(Debug)]
 pub(super) struct StreamRetryBudget {
     spent: u32,
+    limit: u32,
+}
+
+impl Default for StreamRetryBudget {
+    fn default() -> Self {
+        Self::with_limit(MAX_STREAM_RETRIES)
+    }
 }
 
 impl StreamRetryBudget {
+    /// A fresh budget allowing at most `limit` resumes.
+    pub(super) fn with_limit(limit: u32) -> Self {
+        Self { spent: 0, limit }
+    }
+
+    /// The configured resume ceiling.
+    pub(super) fn limit(&self) -> u32 {
+        self.limit
+    }
+
     /// Drop-resumes already issued without a healthy round in between.
     pub(super) fn spent(&self) -> u32 {
         self.spent
@@ -130,7 +270,7 @@ impl StreamRetryBudget {
     /// Spend one resume and return its 1-based attempt number, or `None`
     /// when the budget is exhausted.
     pub(super) fn authorize(&mut self) -> Option<u32> {
-        if self.spent >= MAX_STREAM_RETRIES {
+        if self.spent >= self.limit {
             return None;
         }
         self.spent = self.spent.saturating_add(1);
@@ -170,9 +310,10 @@ pub(super) fn sleep_gap_detected(monotonic_elapsed: Duration, wallclock_elapsed:
 pub(super) fn should_resume_after_sleep(
     sleep_detected: bool,
     retry_attempts: u32,
+    retry_limit: u32,
     cancelled: bool,
 ) -> bool {
-    sleep_detected && retry_attempts < MAX_STREAM_RETRIES && !cancelled
+    sleep_detected && retry_attempts < retry_limit && !cancelled
 }
 
 /// Decide whether a failed stream should be re-issued after a mid-stream
@@ -194,9 +335,10 @@ pub(super) fn should_resume_after_network_drop(
     headless_host: bool,
     network_class_error: bool,
     retry_attempts: u32,
+    retry_limit: u32,
     cancelled: bool,
 ) -> bool {
-    headless_host && network_class_error && retry_attempts < MAX_STREAM_RETRIES && !cancelled
+    headless_host && network_class_error && retry_attempts < retry_limit && !cancelled
 }
 
 /// Decide whether an interactive TUI stream should be re-issued after a
@@ -219,13 +361,14 @@ pub(super) fn should_resume_interactive_after_network_drop(
     any_content_received: bool,
     tool_uses_empty: bool,
     retry_attempts: u32,
+    retry_limit: u32,
     cancelled: bool,
 ) -> bool {
     terminal_chrome_enabled
         && network_class_error
         && any_content_received
         && tool_uses_empty
-        && retry_attempts < MAX_STREAM_RETRIES
+        && retry_attempts < retry_limit
         && !cancelled
 }
 

@@ -37,20 +37,14 @@ use std::collections::{BTreeSet, HashMap};
 use chrono::{DateTime, Utc};
 use codewhale_execpolicy::ApprovalMode;
 use codewhale_models::{ContentBlock, Message};
-use serde::Serialize;
 use serde_json::Value;
 
-use crate::approval_log::{ApprovalDecider, ApprovalOutcome, ApprovalReceipt, ApprovalReplay};
+use crate::approval_log::{ApprovalOutcome, ApprovalReceipt, ApprovalReplay};
 use crate::runtime_threads::{
     RuntimeEventRecord, RuntimeTurnStatus, ThreadRecord, TurnItemKind, TurnItemLifecycleStatus,
     TurnItemRecord, TurnRecord,
 };
 
-pub const RECEIPT_SCHEMA_ID: &str = "codewhale.receipt/v1";
-
-/// Most actions one receipt lists. Totals always cover every action; only the
-/// list is cut, and `omitted_actions` says by how many.
-pub const MAX_RECEIPT_ACTIONS: usize = 2_000;
 const MAX_COMMAND_CHARS: usize = 200;
 const MAX_ERROR_CHARS: usize = 160;
 const MAX_QUERY_CHARS: usize = 120;
@@ -73,282 +67,7 @@ const CLAIM_CEILING: [&str; 3] = [
 // Output shape
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize, PartialEq)]
-pub struct Receipt {
-    pub schema_id: &'static str,
-    pub source: ReceiptSource,
-    /// Set when the receipt covers one turn instead of the whole session.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub turn: Option<String>,
-    /// Permission postures the covered turns ran under, in first-seen order
-    /// (`Ask`, `Auto-Review`, `Full Access`, `Never`). Read from each turn's
-    /// own record; empty when no turn recorded one.
-    pub postures: Vec<&'static str>,
-    pub totals: ReceiptTotals,
-    pub actions: Vec<ReceiptAction>,
-    /// Actions left off the list because it hit [`MAX_RECEIPT_ACTIONS`].
-    pub omitted_actions: usize,
-    /// Facts this record does not hold, stated instead of guessed.
-    pub not_recorded: Vec<String>,
-    pub claim_ceiling: [&'static str; 3],
-}
-
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum SourceKind {
-    /// A terminal session (saved transcript + approval log).
-    Session,
-    /// A Runtime thread (turn/item records + event log).
-    Thread,
-}
-
-#[derive(Debug, Clone, Serialize, PartialEq)]
-pub struct ReceiptSource {
-    pub kind: SourceKind,
-    pub id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub title: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub workspace: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub started_at: Option<DateTime<Utc>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub updated_at: Option<DateTime<Utc>>,
-}
-
-#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
-pub struct ReceiptTotals {
-    /// Distinct paths changed, by file tools or (from the turn's workspace
-    /// snapshots) by anything else during the turn.
-    pub files_changed: usize,
-    /// Of `files_changed`, paths no file tool changed: a command, a build, or
-    /// another process wrote them during the turn.
-    pub files_changed_outside_file_tools: usize,
-    pub files_created: usize,
-    pub files_deleted: usize,
-    /// Sum over changes whose line counts are recorded.
-    pub lines_added: u64,
-    pub lines_removed: u64,
-    /// False when at least one file change has no recorded line counts, so
-    /// the sums above are a floor.
-    pub line_counts_complete: bool,
-    pub commands: usize,
-    pub commands_failed: usize,
-    pub code_runs: usize,
-    pub network: usize,
-    pub mcp_calls: usize,
-    pub plugin_calls: usize,
-    pub subagents: usize,
-    pub approvals: ApprovalTotals,
-    /// File changes, commands, code runs, web and MCP calls, and agents that
-    /// ran with no approval on record: the posture, an allow rule, or a
-    /// remembered grant let them run without a prompt. A call Codewhale
-    /// refused before it started, or one the record does not show starting,
-    /// is not counted. Zero, with a `not_recorded` note, for a session older
-    /// than its approval log.
-    pub ran_without_asking: usize,
-    /// Actions that ran and failed, plus failed turns.
-    pub failures: usize,
-    /// Calls Codewhale refused before they started: an Auto-Review or
-    /// guardian block, a tool-policy or allow-list denial, a sandbox
-    /// escalation the posture cannot grant, invalid input, or a tool that is
-    /// not available. Not counted as run, as failed, or as ran without asking.
-    pub blocked: usize,
-    /// Reads, searches, and other calls that are counted but not listed
-    /// unless they failed.
-    pub other_tool_calls: usize,
-}
-
-#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
-pub struct ApprovalTotals {
-    pub total: usize,
-    pub approved: usize,
-    pub denied: usize,
-    pub timed_out: usize,
-    /// Cancelled, or resolved by Codewhale because nobody could be asked
-    /// (the turn had ended or stopped). Never a person's no.
-    pub not_answered: usize,
-    pub pending: usize,
-    /// Who gave each approval counted in `approved`.
-    pub approved_by: DeciderCounts,
-    /// Who gave each denial counted in `denied`.
-    pub denied_by: DeciderCounts,
-}
-
-#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
-pub struct DeciderCounts {
-    pub you: usize,
-    pub session_rule: usize,
-    pub posture: usize,
-    /// The record predates Codewhale keeping who decided, or came from a
-    /// sub-agent's request, which does not carry it yet.
-    pub not_recorded: usize,
-}
-
-#[derive(Debug, Clone, Serialize, PartialEq)]
-pub struct ReceiptAction {
-    /// 1-based position in the session's action order.
-    pub seq: usize,
-    /// Runtime turn id, or the 1-based turn number in a terminal session.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub turn: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub at: Option<DateTime<Utc>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub call_id: Option<String>,
-    /// The tool name exactly as called.
-    pub tool: String,
-    #[serde(flatten)]
-    pub what: ActionKind,
-    pub status: ActionStatus,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub duration_ms: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub approval: Option<ApprovalFact>,
-    /// First line of the failure, bounded and redacted.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, PartialEq)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum ActionKind {
-    FileChange {
-        files: Vec<FileTouch>,
-    },
-    /// Files that changed in the workspace during a turn with no file tool
-    /// naming them, read from the turn's before/after snapshots. A command
-    /// changed them, or something else writing to the workspace did.
-    WorkspaceChange {
-        files: Vec<FileTouch>,
-        /// More paths changed than are listed.
-        #[serde(skip_serializing_if = "std::ops::Not::not")]
-        truncated: bool,
-    },
-    Command {
-        command: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        cwd: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        exit_code: Option<i64>,
-    },
-    Code {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        exit_code: Option<i64>,
-        /// Tool calls the program made (`execute_tools`), when recorded.
-        #[serde(skip_serializing_if = "Vec::is_empty")]
-        nested: Vec<NestedCall>,
-    },
-    Network {
-        action: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        host: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        query: Option<String>,
-    },
-    Mcp {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        server: Option<String>,
-        plugin: bool,
-    },
-    Subagent {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        name: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        agent_id: Option<String>,
-        /// Last status the record holds for this agent.
-        #[serde(skip_serializing_if = "Option::is_none")]
-        outcome: Option<String>,
-    },
-    /// An approval with no matching call in the record (for example a
-    /// sub-agent's request).
-    Approval,
-    /// Any other tool. Listed only when it failed.
-    Tool,
-    /// A Runtime turn that ended in failure.
-    TurnFailed,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum FileChangeKind {
-    Edited,
-    Created,
-    Deleted,
-    /// Written whole; the record does not say whether the file existed.
-    Written,
-}
-
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-pub struct FileTouch {
-    pub path: String,
-    pub change: FileChangeKind,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub lines_added: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub lines_removed: Option<u64>,
-}
-
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-pub struct NestedCall {
-    pub tool: String,
-    pub ok: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub elapsed_ms: Option<u64>,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ActionStatus {
-    Ok,
-    /// Ran and failed.
-    Failed,
-    /// Did not run: held at approval (denied, timed out, never answered).
-    NotRun,
-    /// Did not run: Codewhale refused it before it started (an Auto-Review
-    /// or guardian block, a policy or allow-list denial, a sandbox escalation
-    /// the posture cannot grant, invalid input, a tool that is not
-    /// available). `error` carries the reason.
-    Blocked,
-    Interrupted,
-    Running,
-    /// The record does not show whether it ran: there is no result, or a
-    /// command returned an error with no exit code or shell status.
-    Unknown,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ApprovalDecisionLabel {
-    Approved,
-    /// Approved with a wider sandbox after a sandbox denial.
-    ApprovedWithPolicy,
-    Denied,
-    TimedOut,
-    Cancelled,
-    /// The host answered because nobody could be asked.
-    Unavailable,
-    Pending,
-}
-
-impl ApprovalDecisionLabel {
-    fn ran(self) -> bool {
-        matches!(self, Self::Approved | Self::ApprovedWithPolicy)
-    }
-}
-
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
-pub struct ApprovalFact {
-    pub decision: ApprovalDecisionLabel,
-    /// `None` when the decision names its own cause (timeout, pending) or the
-    /// record predates deciders.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub decided_by: Option<ApprovalDecider>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub at: Option<DateTime<Utc>>,
-}
+pub use codewhale_command_contract::facets::debug_receipts::*;
 
 // ---------------------------------------------------------------------------
 // Normalized input
@@ -713,7 +432,28 @@ pub(crate) fn run_receipts_command(
 /// block) comes back too: it labels the turn's workspace snapshots.
 fn steps_from_messages(messages: &[Message]) -> (Vec<ToolStep>, Vec<TurnPosture>, Vec<TurnPrompt>) {
     let mut steps: Vec<ToolStep> = Vec::new();
-    let mut by_id: HashMap<String, usize> = HashMap::new();
+    let mut by_id = HashMap::new();
+    let mut call_counts = HashMap::<codewhale_models::ToolCallKey<'_>, usize>::new();
+    let mut raw_counts = HashMap::<&str, usize>::new();
+    let mut results = HashMap::new();
+    for block in messages.iter().flat_map(|message| &message.content) {
+        let Some(key) = block.tool_call_key() else {
+            continue;
+        };
+        match block {
+            ContentBlock::ToolUse { .. } | ContentBlock::ServerToolUse { .. } => {
+                *call_counts.entry(key).or_default() += 1;
+                *raw_counts.entry(key.as_str()).or_default() += 1;
+            }
+            ContentBlock::ToolResult { tool_use_id, .. } => {
+                results
+                    .entry(key)
+                    .and_modify(|entry| *entry = None)
+                    .or_insert(Some(tool_use_id.as_str()));
+            }
+            _ => {}
+        }
+    }
     let mut turn_postures: Vec<TurnPosture> = Vec::new();
     let mut turn_prompts: Vec<TurnPrompt> = Vec::new();
     let mut turn = 0usize;
@@ -731,10 +471,19 @@ fn steps_from_messages(messages: &[Message]) -> (Vec<ToolStep>, Vec<TurnPosture>
                     id, name, input, ..
                 }
                 | ContentBlock::ServerToolUse { id, name, input } => {
-                    by_id.insert(id.clone(), steps.len());
+                    let key = block.tool_call_key().expect("tool use key");
+                    let unambiguous = !key.as_str().trim().is_empty()
+                        && call_counts.get(&key) == Some(&1)
+                        && raw_counts.get(key.as_str()) == Some(&1)
+                        && results
+                            .get(&key)
+                            .is_none_or(|result| result.as_deref() == Some(id.as_str()));
+                    if unambiguous {
+                        by_id.insert(key, (steps.len(), id.as_str()));
+                    }
                     steps.push(ToolStep {
                         turn: (turn > 0).then(|| turn.to_string()),
-                        call_id: Some(id.clone()),
+                        call_id: unambiguous.then(|| key.as_str().to_string()),
                         name: name.clone(),
                         input: input.clone(),
                         outcome: StepOutcome::Unknown,
@@ -750,7 +499,10 @@ fn steps_from_messages(messages: &[Message]) -> (Vec<ToolStep>, Vec<TurnPosture>
                     is_error,
                     ..
                 } => {
-                    if let Some(&index) = by_id.get(tool_use_id) {
+                    if let Some(&(index, provider_id)) =
+                        block.tool_call_key().and_then(|key| by_id.get(&key))
+                        && provider_id == tool_use_id
+                    {
                         let step = &mut steps[index];
                         step.outcome = if is_error.unwrap_or(false) {
                             StepOutcome::Failed
@@ -1897,14 +1649,7 @@ fn redact(text: &str) -> String {
     codewhale_secrets::redact::redact_secrets(text)
 }
 
-fn bounded(text: &str, max: usize) -> String {
-    if text.chars().count() <= max {
-        return text.to_string();
-    }
-    let mut out: String = text.chars().take(max.saturating_sub(1)).collect();
-    out.push('…');
-    out
-}
+use crate::diagnostics_reports::receipts::{bounded, plural};
 
 fn first_error_line(output: Option<&str>) -> Option<String> {
     let line = output?
@@ -1944,11 +1689,26 @@ fn assemble(
         turn_postures,
         approvals_recorded,
     } = scope;
-    let mut approvals_by_call: HashMap<String, usize> = HashMap::new();
+    let mut approvals_by_call = HashMap::new();
+    let mut calls_by_id = HashMap::<&str, usize>::new();
+    for step in &steps {
+        if let Some(id) = step.call_id.as_deref() {
+            *calls_by_id.entry(id).or_default() += 1;
+        }
+    }
     for (index, approval) in approvals.iter().enumerate() {
         if let Some(call_id) = &approval.call_id {
-            approvals_by_call.insert(call_id.clone(), index);
+            approvals_by_call
+                .entry(call_id.as_str())
+                .and_modify(|entry| *entry = None)
+                .or_insert(Some(index));
         }
+    }
+    if steps.iter().any(|step| step.call_id.is_none())
+        || calls_by_id.values().any(|count| *count > 1)
+        || approvals_by_call.values().any(Option::is_none)
+    {
+        notes.insert("Tool identity: missing, mismatched or repeated call identities cannot establish a unique approval association.".to_string());
     }
     let mut approval_used = vec![false; approvals.len()];
     let mut totals = ReceiptTotals {
@@ -1962,8 +1722,9 @@ fn assemble(
     for step in &steps {
         let approval_index = step
             .call_id
-            .as_ref()
-            .and_then(|id| approvals_by_call.get(id).copied());
+            .as_deref()
+            .filter(|id| !id.trim().is_empty() && calls_by_id.get(id) == Some(&1))
+            .and_then(|id| approvals_by_call.get(id).copied().flatten());
         if let Some(index) = approval_index {
             approval_used[index] = true;
         }
@@ -2159,7 +1920,14 @@ fn assemble(
     if approvals_recorded {
         totals.ran_without_asking = actions
             .iter()
-            .filter(|action| action.ran_without_asking())
+            .filter(|action| {
+                action.ran_without_asking()
+                    && action.call_id.as_deref().is_some_and(|id| {
+                        !id.trim().is_empty()
+                            && calls_by_id.get(id) == Some(&1)
+                            && approvals_by_call.get(id).is_none_or(Option::is_some)
+                    })
+            })
             .count();
     }
     let mut postures: Vec<&'static str> = Vec::new();
@@ -2201,33 +1969,6 @@ fn assemble(
         omitted_actions,
         not_recorded: notes.into_iter().collect(),
         claim_ceiling: CLAIM_CEILING,
-    }
-}
-
-impl ReceiptAction {
-    /// A change, command, code run, web or MCP call, or agent that ran with
-    /// no approval on record.
-    fn ran_without_asking(&self) -> bool {
-        // `Unknown`, `NotRun`, and `Blocked` are left out: the call did not
-        // start, or the record does not show that it did. A workspace change
-        // is not a call.
-        self.approval.is_none()
-            && matches!(
-                self.status,
-                ActionStatus::Ok
-                    | ActionStatus::Failed
-                    | ActionStatus::Interrupted
-                    | ActionStatus::Running
-            )
-            && matches!(
-                self.what,
-                ActionKind::FileChange { .. }
-                    | ActionKind::Command { .. }
-                    | ActionKind::Code { .. }
-                    | ActionKind::Network { .. }
-                    | ActionKind::Mcp { .. }
-                    | ActionKind::Subagent { .. }
-            )
     }
 }
 
@@ -2332,491 +2073,11 @@ fn tally(actions: &[ReceiptAction], totals: &mut ReceiptTotals) {
 // Rendering
 // ---------------------------------------------------------------------------
 
-/// One line of totals, verbs first: `Changed 4 files · ran 7 commands · 2
-/// approved by you · 9 ran without asking under Full Access · 1 denied by
-/// you`.
-#[must_use]
-pub fn totals_line(receipt: &Receipt) -> String {
-    let totals = &receipt.totals;
-    let mut parts: Vec<String> = Vec::new();
-    if totals.files_changed > 0 {
-        let mut part = format!("changed {}", plural(totals.files_changed, "file", "files"));
-        if totals.line_counts_complete {
-            part.push_str(&format!(
-                " (+{} −{})",
-                totals.lines_added, totals.lines_removed
-            ));
-        }
-        if totals.files_changed_outside_file_tools > 0 {
-            part.push_str(&format!(
-                ", {} outside file tools",
-                totals.files_changed_outside_file_tools
-            ));
-        }
-        parts.push(part);
-    }
-    if totals.commands > 0 {
-        let mut part = format!("ran {}", plural(totals.commands, "command", "commands"));
-        if totals.commands_failed > 0 {
-            part.push_str(&format!(" ({} failed)", totals.commands_failed));
-        }
-        parts.push(part);
-    }
-    if totals.code_runs > 0 {
-        parts.push(format!(
-            "ran code {}",
-            plural(totals.code_runs, "time", "times")
-        ));
-    }
-    if totals.network > 0 {
-        parts.push(format!(
-            "made {}",
-            plural(totals.network, "web request", "web requests")
-        ));
-    }
-    if totals.mcp_calls > 0 {
-        parts.push(format!(
-            "made {}",
-            plural(totals.mcp_calls, "MCP call", "MCP calls")
-        ));
-    }
-    if totals.subagents > 0 {
-        parts.push(format!(
-            "started {}",
-            plural(totals.subagents, "agent", "agents")
-        ));
-    }
-    let approvals = &totals.approvals;
-    let by_decider = |verb: &str, by: &DeciderCounts| -> Vec<String> {
-        [
-            (by.you, "by you"),
-            (by.session_rule, "by session rule"),
-            (by.posture, "by posture"),
-            (by.not_recorded, "(decider not recorded)"),
-        ]
-        .into_iter()
-        .filter(|(count, _)| *count > 0)
-        .map(|(count, who)| format!("{count} {verb} {who}"))
-        .collect()
-    };
-    parts.extend(by_decider("approved", &approvals.approved_by));
-    if totals.ran_without_asking > 0 {
-        let mut part = format!("{} ran without asking", totals.ran_without_asking);
-        if !receipt.postures.is_empty() {
-            part.push_str(&format!(" under {}", receipt.postures.join(" and ")));
-        }
-        parts.push(part);
-    }
-    parts.extend(by_decider("denied", &approvals.denied_by));
-    if approvals.timed_out > 0 {
-        parts.push(format!("{} timed out", approvals.timed_out));
-    }
-    if approvals.not_answered > 0 {
-        parts.push(format!("{} not answered", approvals.not_answered));
-    }
-    if approvals.pending > 0 {
-        parts.push(format!("{} waiting", approvals.pending));
-    }
-    if totals.blocked > 0 {
-        parts.push(format!("{} blocked before running", totals.blocked));
-    }
-    let failures_beyond_commands = totals.failures.saturating_sub(totals.commands_failed);
-    if failures_beyond_commands > 0 {
-        parts.push(plural(
-            failures_beyond_commands,
-            "other failure",
-            "other failures",
-        ));
-    }
-    if parts.is_empty() {
-        return if totals.other_tool_calls > 0 {
-            format!(
-                "Only read or looked things up ({}).",
-                plural(totals.other_tool_calls, "call", "calls")
-            )
-        } else {
-            "No actions recorded.".to_string()
-        };
-    }
-    let mut line = parts.join(" · ");
-    if let Some(first) = line.get(0..1) {
-        line = first.to_uppercase() + &line[1..];
-    }
-    line
-}
-
-fn plural(count: usize, one: &str, many: &str) -> String {
-    if count == 1 {
-        format!("1 {one}")
-    } else {
-        format!("{count} {many}")
-    }
-}
-
-fn decider_label(decider: ApprovalDecider) -> &'static str {
-    match decider {
-        ApprovalDecider::User => "you",
-        ApprovalDecider::SessionRule => "session rule",
-        ApprovalDecider::Posture => "posture",
-        ApprovalDecider::Host => "Codewhale",
-    }
-}
-
-fn approval_phrase(fact: &ApprovalFact) -> String {
-    let by = fact
-        .decided_by
-        .map(|by| format!(" by {}", decider_label(by)))
-        .unwrap_or_default();
-    match fact.decision {
-        ApprovalDecisionLabel::Approved => format!("approved{by}"),
-        ApprovalDecisionLabel::ApprovedWithPolicy => format!("approved{by} with a wider sandbox"),
-        ApprovalDecisionLabel::Denied => format!("denied{by}"),
-        ApprovalDecisionLabel::TimedOut => "approval timed out".to_string(),
-        ApprovalDecisionLabel::Cancelled => "turn stopped while waiting".to_string(),
-        ApprovalDecisionLabel::Unavailable => "nobody could be asked".to_string(),
-        ApprovalDecisionLabel::Pending => "waiting for approval".to_string(),
-    }
-}
-
-fn counts(added: Option<u64>, removed: Option<u64>) -> String {
-    match (added, removed) {
-        (Some(added), Some(removed)) => format!(" (+{added} −{removed})"),
-        _ => String::new(),
-    }
-}
-
-fn file_phrase(file: &FileTouch) -> String {
-    let verb = match file.change {
-        FileChangeKind::Edited => "edited",
-        FileChangeKind::Created => "created",
-        FileChangeKind::Deleted => "deleted",
-        FileChangeKind::Written => "wrote",
-    };
-    let counts = if file.change == FileChangeKind::Deleted {
-        String::new()
-    } else {
-        counts(file.lines_added, file.lines_removed)
-    };
-    format!("{verb} {}{counts}", code_span(&file.path))
-}
-
-/// `text` on one line with nothing a terminal acts on: control characters
-/// (newline, carriage return, escape), Unicode line separators, and bidi
-/// overrides show as `\u{…}`-style escapes. Paths, commands, and error text
-/// come from the workspace and from tools, so a file a command named
-/// `x\n- Ran …` cannot forge a receipt line, and one holding `ESC ]` cannot
-/// drive the terminal that prints the receipt.
-fn one_line(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    for ch in text.chars() {
-        let hidden = ch.is_control()
-            || matches!(
-                ch,
-                '\u{2028}'
-                    | '\u{2029}'
-                    | '\u{200e}'
-                    | '\u{200f}'
-                    | '\u{202a}'..='\u{202e}'
-                    | '\u{2066}'..='\u{2069}'
-            );
-        if hidden {
-            out.extend(ch.escape_default());
-        } else {
-            out.push(ch);
-        }
-    }
-    out
-}
-
-/// Inline code that survives backticks in the text: the fence is one
-/// backtick longer than the longest run inside it.
-fn code_span(text: &str) -> String {
-    let longest = text.split(|ch| ch != '`').map(str::len).max().unwrap_or(0);
-    let fence = "`".repeat(longest + 1);
-    let pad = if text.starts_with('`') || text.ends_with('`') {
-        " "
-    } else {
-        ""
-    };
-    format!("{fence}{pad}{text}{pad}{fence}")
-}
-
-/// What the action did (or would have done), past tense and verb first.
-/// Every phrase starts with one of [`PHRASE_VERBS`], so a call that did not
-/// run can say so in the same words.
-fn action_phrase(action: &ReceiptAction) -> String {
-    match &action.what {
-        ActionKind::FileChange { files } => match files.as_slice() {
-            [file] => file_phrase(file),
-            files if action.status == ActionStatus::Ok => format!(
-                "changed {} files: {}",
-                files.len(),
-                files.iter().map(file_phrase).collect::<Vec<_>>().join(", ")
-            ),
-            files => format!(
-                "changed {} files: {}",
-                files.len(),
-                files
-                    .iter()
-                    .map(|file| code_span(&file.path))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
-        },
-        ActionKind::WorkspaceChange { files, truncated } => {
-            let mut text = format!(
-                "changed outside file tools (a command or another process): {}",
-                files.iter().map(file_phrase).collect::<Vec<_>>().join(", ")
-            );
-            if *truncated {
-                text.push_str(", and more");
-            }
-            text
-        }
-        ActionKind::Command {
-            command,
-            cwd,
-            exit_code,
-        } => {
-            let mut text = format!("ran {}", code_span(command));
-            if let Some(cwd) = cwd {
-                text.push_str(&format!(" in {cwd}"));
-            }
-            if let Some(code) = exit_code {
-                text.push_str(&format!(" — exit {code}"));
-            }
-            text
-        }
-        ActionKind::Code { exit_code, nested } => {
-            let mut text = format!("ran code ({})", action.tool);
-            if let Some(code) = exit_code {
-                text.push_str(&format!(" — exit {code}"));
-            }
-            if !nested.is_empty() {
-                let calls = nested
-                    .iter()
-                    .map(|call| format!("{}{}", call.tool, if call.ok { "" } else { " ✗" }))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                text.push_str(&format!(" — called {calls}"));
-            }
-            text
-        }
-        ActionKind::Network {
-            action: kind,
-            host,
-            query,
-        } => match (kind.as_str(), host, query) {
-            ("search", _, Some(query)) => format!("searched the web for “{query}”"),
-            ("search", _, None) => "searched the web".to_string(),
-            ("fetch", Some(host), _) => format!("fetched {host}"),
-            ("git_fetch", Some(remote), _) => format!("fetched git remote {remote}"),
-            (other, Some(host), _) => format!("called {host}: {}", other.replace('_', " ")),
-            (other, None, _) => format!("made a web request ({other})"),
-        },
-        ActionKind::Mcp { server, .. } => {
-            let tool = server
-                .as_deref()
-                .and_then(|server| {
-                    action
-                        .tool
-                        .strip_prefix("mcp_")
-                        .and_then(|rest| rest.strip_prefix(server))
-                        .map(|rest| rest.trim_start_matches('_'))
-                })
-                .filter(|tool| !tool.is_empty());
-            match (server, tool) {
-                (Some(server), Some(tool)) => format!("called {server} · {tool}"),
-                _ => format!("called {}", action.tool),
-            }
-        }
-        ActionKind::Subagent {
-            name,
-            agent_id,
-            outcome,
-        } => {
-            let who = name
-                .as_deref()
-                .or(agent_id.as_deref())
-                .unwrap_or("an agent");
-            match outcome {
-                Some(outcome) => format!("started agent {who} — {outcome}"),
-                None => format!("started agent {who}"),
-            }
-        }
-        ActionKind::Approval => format!("asked to use {}", action.tool),
-        ActionKind::Tool => format!("called {}", action.tool),
-        ActionKind::TurnFailed => "turn failed".to_string(),
-    }
-}
-
-/// The past-tense verbs [`action_phrase`] starts with, and their base form.
-const PHRASE_VERBS: [(&str, &str); 11] = [
-    ("ran ", "run "),
-    ("edited ", "edit "),
-    ("created ", "create "),
-    ("deleted ", "delete "),
-    ("wrote ", "write "),
-    ("changed ", "change "),
-    ("searched ", "search "),
-    ("fetched ", "fetch "),
-    ("called ", "call "),
-    ("started ", "start "),
-    ("made ", "make "),
-];
-
-/// `ran `x`` becomes `did not run `x`` (lead `did not`) or `tried to run
-/// `x`` (lead `tried to`).
-fn with_base_verb(lead: &str, phrase: &str) -> String {
-    PHRASE_VERBS
-        .iter()
-        .find_map(|(past, base)| {
-            phrase
-                .strip_prefix(past)
-                .map(|rest| format!("{lead} {base}{rest}"))
-        })
-        .unwrap_or_else(|| format!("{lead} run: {phrase}"))
-}
-
-fn duration_label(ms: u64) -> String {
-    if ms < 1_000 {
-        format!("{ms}ms")
-    } else if ms < 60_000 {
-        format!("{:.1}s", ms as f64 / 1_000.0)
-    } else {
-        format!("{}m{:02}s", ms / 60_000, (ms % 60_000) / 1_000)
-    }
-}
-
-/// One line per action. Plain text that also reads as Markdown; whatever
-/// the record holds cannot break it onto a second line ([`one_line`]).
-#[must_use]
-pub fn action_line(action: &ReceiptAction) -> String {
-    let mut line = action_phrase(action);
-    match action.status {
-        // An approval line already reads as a request, not a run.
-        ActionStatus::NotRun if action.what == ActionKind::Approval => {}
-        ActionStatus::NotRun => line = with_base_verb("did not", &line),
-        ActionStatus::Blocked => {
-            line = with_base_verb("did not", &line);
-            line.push_str(" — blocked");
-            if let Some(error) = &action.error {
-                line.push_str(&format!(": {error}"));
-            }
-        }
-        ActionStatus::Failed => {
-            line.push_str(" — failed");
-            if let Some(error) = &action.error {
-                line.push_str(&format!(": {error}"));
-            }
-        }
-        ActionStatus::Interrupted => line.push_str(" — interrupted"),
-        ActionStatus::Running if action.what != ActionKind::Approval => {
-            line.push_str(" — still running")
-        }
-        ActionStatus::Unknown => {
-            line = with_base_verb("tried to", &line);
-            match &action.error {
-                Some(error) => line.push_str(&format!(" — error, no exit code: {error}")),
-                None => line.push_str(" — no result recorded"),
-            }
-        }
-        _ => {}
-    }
-    if let Some(ms) = action.duration_ms
-        && !matches!(action.status, ActionStatus::NotRun | ActionStatus::Blocked)
-    {
-        line.push_str(&format!(" · {}", duration_label(ms)));
-    }
-    if let Some(fact) = &action.approval {
-        line.push_str(&format!(" · {}", approval_phrase(fact)));
-    }
-    one_line(&line)
-}
-
-/// The readable receipt: header, totals, one line per action, then what the
-/// record does not hold. Valid Markdown and plain enough for a terminal.
-#[must_use]
-pub fn render_markdown(receipt: &Receipt) -> String {
-    let source = &receipt.source;
-    let noun = match source.kind {
-        SourceKind::Session => "session",
-        SourceKind::Thread => "thread",
-    };
-    let mut out = String::new();
-    let title = source
-        .title
-        .as_deref()
-        .map(|title| bounded(title.trim(), 80))
-        .filter(|title| !title.is_empty());
-    match title {
-        Some(title) => out.push_str(&format!("# Receipt: {}\n\n", one_line(&title))),
-        None => out.push_str(&format!("# Receipt: {noun} {}\n\n", one_line(&source.id))),
-    }
-    let mut facts = vec![format!("{noun} {}", source.id)];
-    if let Some(turn) = &receipt.turn {
-        facts.push(format!("turn {turn} only"));
-    }
-    if let Some(workspace) = &source.workspace {
-        facts.push(workspace.clone());
-    }
-    if let Some(model) = &source.model {
-        facts.push(model.clone());
-    }
-    if !receipt.postures.is_empty() {
-        facts.push(receipt.postures.join(", "));
-    }
-    if let (Some(start), Some(end)) = (source.started_at, source.updated_at) {
-        facts.push(format!(
-            "{} → {}",
-            start.format("%Y-%m-%d %H:%M UTC"),
-            end.format("%Y-%m-%d %H:%M UTC")
-        ));
-    }
-    out.push_str(&one_line(&facts.join(" · ")));
-    out.push_str("\n\n");
-    out.push_str(&one_line(&totals_line(receipt)));
-    out.push_str("\n\n");
-    let width = receipt.actions.len().to_string().len();
-    for action in &receipt.actions {
-        out.push_str(&format!(
-            "{:>width$}. {}\n",
-            action.seq,
-            action_line(action),
-            width = width
-        ));
-    }
-    if receipt.omitted_actions > 0 {
-        out.push_str(&format!(
-            "\n{} more actions are counted above but not listed.\n",
-            receipt.omitted_actions
-        ));
-    }
-    if !receipt.not_recorded.is_empty() {
-        out.push_str("\nNot recorded:\n");
-        for note in &receipt.not_recorded {
-            out.push_str(&format!("- {}\n", one_line(note)));
-        }
-    }
-    out
-}
-
-#[must_use]
-pub fn render_json(receipt: &Receipt) -> String {
-    serde_json::to_string_pretty(receipt).unwrap_or_else(|_| "{}".to_string())
-}
-
-/// [`render_json`] inside a fenced code block, for a surface that renders
-/// Markdown (the terminal's note cell): the fence keeps `$`, `*`, and `_` in
-/// commands from being read as math or emphasis, and it is longer than any
-/// backtick run a command holds, so the JSON copies out whole.
-#[must_use]
-pub fn render_json_block(receipt: &Receipt) -> String {
-    let json = render_json(receipt);
-    let longest = json.split(|ch| ch != '`').map(str::len).max().unwrap_or(0);
-    let fence = "`".repeat(longest.max(2) + 1);
-    format!("{fence}json\n{json}\n{fence}")
-}
+#[cfg(test)]
+use crate::diagnostics_reports::receipts::code_span;
+#[cfg(test)]
+use crate::diagnostics_reports::receipts::{action_line, totals_line};
+pub use crate::diagnostics_reports::receipts::{render_json, render_markdown};
 
 #[cfg(test)]
 #[path = "receipts/tests.rs"]

@@ -44,7 +44,7 @@ const MAX_EMPTY_SESSION_STUBS: usize = 10;
 /// Maximum session title length, in `char`s. Matches the bound the session
 /// picker's rename prompt has always enforced.
 pub const MAX_SESSION_TITLE_CHARS: usize = 100;
-const WORK_GRAPH_IMPORT_ARCHIVE_DIR: &str = ".work-graph-import-archive";
+pub(crate) const WORK_GRAPH_IMPORT_ARCHIVE_DIR: &str = ".work-graph-import-archive";
 const SESSION_GOALS_DIR: &str = ".goals";
 const CURRENT_SESSION_GOAL_SCHEMA_VERSION: u32 = 2;
 const MAX_SESSION_GOAL_OBJECTIVE_CHARS: usize = 8_192;
@@ -71,6 +71,8 @@ struct LateUsageRecord {
     route: crate::cost_status::EffectiveRouteEnvelope,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     usage: Option<codewhale_models::Usage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    decision: Option<crate::cost_status::RuntimeDecisionReceipt>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -386,9 +388,10 @@ fn is_not_archived(archived: &bool) -> bool {
 /// the id here and any external writer is refused.
 ///
 /// A static registry rather than a field on `RuntimeApiState` because the
-/// embedded Runtime API runs inside the TUI process; a standalone
-/// `codewhale web` has an empty registry and is therefore never blocked, which
-/// is exactly right — there is no TUI holding anything.
+/// embedded Runtime API runs inside the TUI process. A standalone
+/// `codewhale web` has an empty registry, so external writers consult
+/// [`SessionManager::is_session_live_anywhere`], which also sees the
+/// cross-process lease a TUI in another process holds.
 static LIVE_SESSIONS: std::sync::OnceLock<std::sync::RwLock<std::collections::HashSet<String>>> =
     std::sync::OnceLock::new();
 
@@ -444,6 +447,47 @@ pub fn set_live_session(session_id: Option<&str>) {
 /// not be taken (another process holds it), so it is not retried per save.
 static LIVE_SESSION_LEASE: std::sync::Mutex<Option<(String, Option<fs::File>)>> =
     std::sync::Mutex::new(None);
+
+/// Lock attempts [`SessionManager::reserve_session_for_attach`] makes
+/// before it treats contention as a running owner.
+const LIVE_LEASE_ATTACH_ATTEMPTS: u32 = 3;
+
+/// The refusal for attaching to a session another process has open.
+pub(crate) fn session_open_elsewhere(session_id: &str) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::ResourceBusy,
+        format!(
+            "session {session_id} is open in another Codewhale window. \
+             Continue it there, or run `codewhale fork {session_id}` to work on a copy"
+        ),
+    )
+}
+
+/// A reservation of a session's cross-process live lease, taken by
+/// [`SessionManager::reserve_session_for_attach`] before a surface attaches.
+/// Dropping it releases the reservation; [`Self::commit`] makes the session
+/// this process's live session and releases the previous one's lease.
+#[must_use = "an uncommitted reservation is released when dropped"]
+#[derive(Debug)]
+pub struct SessionLease {
+    id: String,
+    /// `None` when this process already holds the session's lease.
+    file: Option<fs::File>,
+}
+
+impl SessionLease {
+    /// Make the reserved session this process's live session. Called after
+    /// the attach has been validated and applied, so a failed attach never
+    /// costs the session this process already owns its lease.
+    pub fn commit(self) {
+        set_live_session(Some(&self.id));
+        if let Some(file) = self.file
+            && let Ok(mut lease) = LIVE_SESSION_LEASE.lock()
+        {
+            *lease = Some((self.id, Some(file)));
+        }
+    }
+}
 
 /// Is this session currently owned by **this process's** interactive surface?
 ///
@@ -921,6 +965,62 @@ pub(crate) struct SavedAutoRouteReceipt {
     pub(crate) effective_reasoning_effort: Option<ReasoningEffortTier>,
 }
 
+/// Most turn outcomes one session record keeps; the oldest drop first.
+pub(crate) const MAX_SAVED_TURN_OUTCOMES: usize = 64;
+/// Longest error text one saved outcome keeps, in `char`s.
+const MAX_SAVED_TURN_OUTCOME_ERROR_CHARS: usize = 4_000;
+
+/// A turn that ended `Failed`, as the person saw it end.
+///
+/// The transcript only holds messages, so before this record a failed turn
+/// left nothing but the user's prompt behind: once the TUI closed, resume,
+/// export, and the app had no way to say why the turn stopped. The error is
+/// the text the live transcript showed, passed through the shared secret
+/// redactor before it is stored.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SavedTurnOutcome {
+    pub status: crate::core::events::TurnOutcomeStatus,
+    /// User-facing error text, secrets redacted.
+    pub error: String,
+    pub ended_at: DateTime<Utc>,
+    /// Transcript messages that existed when the turn ended. Resume places
+    /// the notice after that many messages (clamped to the transcript).
+    pub after_message_count: usize,
+}
+
+impl SavedTurnOutcome {
+    /// Build the persisted record for a failed turn. Redacts before bounding
+    /// so a cut can never leave half a secret behind.
+    pub(crate) fn failed(error: &str, after_message_count: usize) -> Self {
+        let redacted = codewhale_secrets::redact::redact_secrets(error.trim());
+        let error = if redacted.chars().count() > MAX_SAVED_TURN_OUTCOME_ERROR_CHARS {
+            let mut cut: String = redacted
+                .chars()
+                .take(MAX_SAVED_TURN_OUTCOME_ERROR_CHARS)
+                .collect();
+            cut.push('…');
+            cut
+        } else {
+            redacted
+        };
+        Self {
+            status: crate::core::events::TurnOutcomeStatus::Failed,
+            error,
+            ended_at: Utc::now(),
+            after_message_count,
+        }
+    }
+}
+
+/// Append `outcome`, keeping only the newest [`MAX_SAVED_TURN_OUTCOMES`].
+pub(crate) fn push_turn_outcome(outcomes: &mut Vec<SavedTurnOutcome>, outcome: SavedTurnOutcome) {
+    outcomes.push(outcome);
+    if outcomes.len() > MAX_SAVED_TURN_OUTCOMES {
+        let excess = outcomes.len() - MAX_SAVED_TURN_OUTCOMES;
+        outcomes.drain(..excess);
+    }
+}
+
 /// A saved session containing full conversation history
 /// Starting with v0.9.5 (#5262) the canonical history is the append-only entry journal (`journal` / `leaf_id`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -964,6 +1064,11 @@ pub struct SavedSession {
     /// is `auto`. Optional for backward-compatible session loads.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) last_auto_route: Option<SavedAutoRouteReceipt>,
+    /// Turns that ended `Failed`, oldest first, bounded to
+    /// [`MAX_SAVED_TURN_OUTCOMES`]. Not model context: the terminal-outcome
+    /// record resume, export, and the Runtime API read back.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) turn_outcomes: Vec<SavedTurnOutcome>,
 }
 impl SavedSession {
     /// Drop the journal-derived compatibility projection before an async
@@ -1141,6 +1246,7 @@ impl SavedSession {
             work_state: None,
             window_title: None,
             last_auto_route: None,
+            turn_outcomes: Vec::new(),
         })
     }
 }
@@ -1265,8 +1371,12 @@ impl SessionManager {
     }
 
     fn hydrate_approval_receipts(&self, session: &mut SavedSession) -> io::Result<()> {
-        let durable = self.approval_receipt_store().load(&session.metadata.id)?;
-        if !durable.is_empty() {
+        if let Some(durable) = self
+            .approval_receipt_store()
+            .load_if_present(&session.metadata.id)?
+        {
+            // Only a missing log permits legacy embedded evidence to stand.
+            // An empty or torn-first log must not resurrect an old approval.
             session.approval_receipts = durable;
         }
         ApprovalReplay::from_receipts(&session.approval_receipts)
@@ -1431,25 +1541,41 @@ impl SessionManager {
     /// Claim `session_id` for this process's interactive surface: the
     /// in-process registry ([`set_live_session`]) plus the cross-process
     /// lease in this store, so writers in other processes see it too.
+    ///
+    /// Known limitation: this claim is best-effort. Attach paths reserve the
+    /// lease up front ([`Self::reserve_session_for_attach`]), but a session
+    /// that starts fresh is claimed only at its first snapshot, and a claim
+    /// that loses the lock to another process's probe or external write, or
+    /// cannot open the lease file, runs unleased until a later snapshot
+    /// retries it (an open failure is logged only at debug). In that window
+    /// another process's external writer can take the lease and write, and
+    /// this session's next autosave reverts that write.
     pub fn claim_live_session(&self, session_id: &str) {
         set_live_session(Some(session_id));
         let id = session_id.trim();
         let Ok(mut lease) = LIVE_SESSION_LEASE.lock() else {
             return;
         };
-        if lease.as_ref().is_some_and(|(held, _)| held == id) {
-            return;
-        }
+        // A lease already held is kept. One that could not be taken is tried
+        // again: another process's liveness probe briefly holds the same lock,
+        // and a claim that lost that race once must not run unleased for the
+        // rest of the session.
+        let retry = match lease.as_ref() {
+            Some((held, Some(_))) if held == id => return,
+            Some((held, None)) => held == id,
+            _ => false,
+        };
         let file = self.live_lease_path(id, true).and_then(|path| {
             let file = open_private_lock_file(&path)?;
             Ok(crate::runtime_threads::try_lock_file_exclusive(&file)?.then_some(file))
         });
         match &file {
             Ok(Some(_)) => {}
-            Ok(None) => tracing::warn!(
+            Ok(None) if !retry => tracing::warn!(
                 session_id = id,
                 "another Codewhale process already holds this session open"
             ),
+            Ok(None) => {}
             Err(error) => {
                 tracing::debug!(session_id = id, %error, "session live lease unavailable");
             }
@@ -1457,28 +1583,134 @@ impl SessionManager {
         *lease = Some((id.to_string(), file.ok().flatten()));
     }
 
+    /// Reserve `session_id` before attaching to it (`resume`, `--continue`,
+    /// `exec --resume`, the session picker, `/load`). Unlike
+    /// [`Self::claim_live_session`], which records whatever it gets, this
+    /// refuses with `ResourceBusy` when another process holds the session
+    /// open: attaching anyway gives the document two autosaving writers, and
+    /// the last save silently drops the other's turns. Taking the lock is the
+    /// check, so nothing can claim the session between a check and the attach.
+    ///
+    /// The reservation does not touch the session this process owns now: that
+    /// claim and its lease stay until [`SessionLease::commit`], which the
+    /// caller runs only once the new session is loaded and applied. Dropping
+    /// the reservation (a load or apply that failed) releases it and leaves
+    /// the current session leased.
+    ///
+    /// It fails closed: a lease that cannot be opened or locked is an error,
+    /// not an unguarded attach.
+    pub fn reserve_session_for_attach(&self, session_id: &str) -> io::Result<SessionLease> {
+        let id = self.validated_session_id(session_id)?;
+        if LIVE_SESSION_LEASE
+            .lock()
+            .is_ok_and(|lease| matches!(lease.as_ref(), Some((held, Some(_))) if held == id))
+        {
+            return Ok(SessionLease {
+                id: id.to_string(),
+                file: None,
+            });
+        }
+        let lease_unavailable = |error: io::Error| {
+            io::Error::new(
+                error.kind(),
+                format!("could not take session {id}'s live lease: {error}"),
+            )
+        };
+        let file = self
+            .live_lease_path(id, true)
+            .and_then(|path| open_private_lock_file(&path))
+            .map_err(lease_unavailable)?;
+        // A liveness probe from another process holds this lock for a moment;
+        // a few short retries tell that apart from a running owner.
+        for attempt in 0..LIVE_LEASE_ATTACH_ATTEMPTS {
+            if crate::runtime_threads::try_lock_file_exclusive(&file).map_err(lease_unavailable)? {
+                return Ok(SessionLease {
+                    id: id.to_string(),
+                    file: Some(file),
+                });
+            }
+            if attempt + 1 < LIVE_LEASE_ATTACH_ATTEMPTS {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+        Err(session_open_elsewhere(id))
+    }
+
+    /// Hold the existing live lease throughout an external mutation. A
+    /// liveness probe releases its lock before returning and cannot protect
+    /// the subsequent read/write from another surface attaching meanwhile.
+    ///
+    /// Refuses with `ResourceBusy` when an interactive session in this or
+    /// another process holds the session, and with `InvalidInput` for a
+    /// malformed id. It may sleep briefly between lock attempts (see
+    /// [`Self::reserve_session_for_attach`]), so async callers run it under
+    /// `spawn_blocking`. Keep the returned lease alive until the write lands.
+    pub(crate) fn reserve_session_for_external_write(&self, id: &str) -> io::Result<SessionLease> {
+        let live = live_sessions()
+            .read()
+            .map_err(|_| io::Error::other("session ownership registry unavailable"))?;
+        if live.contains(id.trim()) {
+            return Err(live_session_conflict(id));
+        }
+        drop(live);
+        let lease = self.reserve_session_for_attach(id)?;
+        // A same-process attach may have committed after the registry read.
+        // Its already-held lease is borrowed, never ours to mutate through.
+        if lease.file.is_none() {
+            return Err(live_session_conflict(id));
+        }
+        Ok(lease)
+    }
+
     /// Is `session_id` open in an interactive session in this process *or any
-    /// other*? External writers (the Runtime API, retention) check this before
-    /// rewriting or deleting a document, because the process holding it would
-    /// revert the change at its next autosave (#6144).
+    /// other*? A read-only hint for listings and recovery candidates (the
+    /// session picker, interrupted-work discovery, retention's candidate
+    /// scan). It never authorizes a write: the probe releases its lock before
+    /// returning, so every mutation — rename, archive, delete, the Runtime
+    /// API's export and save, `scrub-secrets` — holds
+    /// [`Self::reserve_session_for_external_write`] across its load and save
+    /// instead (#6144).
+    ///
+    /// Fails closed: a malformed id, or a lease that cannot be opened, reads
+    /// as live, so a caller skips it rather than acting on it. Callers that
+    /// must tell a malformed id apart (a 400, not a 409) validate first or
+    /// reserve the lease, which reports `InvalidInput`.
+    ///
+    /// Known limitation: startup's stale-checkpoint pruning
+    /// (`load_recent_checkpoints` in `lib.rs`) still clears a checkpoint
+    /// older than a day after this released probe. A session that attached
+    /// in that gap and is mid-turn refreshes its checkpoint, so only a
+    /// day-old checkpoint of a session attached in the same instant is
+    /// exposed.
     #[must_use]
     pub fn is_session_live_anywhere(&self, session_id: &str) -> bool {
         if is_live_session(session_id) {
             return true;
         }
         let Ok(path) = self.live_lease_path(session_id, false) else {
-            return false;
+            return true;
         };
         let file = match open_private_read_file(&path) {
             Ok(file) => file,
-            Err(_) => return false,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return false,
+            Err(_) => return true,
         };
         // Contention means a live holder; acquiring proves none, and the
         // probe's lock is released when `file` drops here.
-        matches!(
+        !matches!(
             crate::runtime_threads::try_lock_file_exclusive(&file),
-            Ok(false)
+            Ok(true)
         )
+    }
+
+    /// Hold `session_id`'s live lease the way another running Codewhale
+    /// process does: an OS lock on its own open file description.
+    #[cfg(test)]
+    pub(crate) fn hold_live_lease_elsewhere(&self, session_id: &str) -> fs::File {
+        let path = self.live_lease_path(session_id, true).expect("lease path");
+        let lease = open_private_lock_file(&path).expect("open lease");
+        assert!(crate::runtime_threads::try_lock_file_exclusive(&lease).expect("lock lease"));
+        lease
     }
 
     /// Whether a saved document exists for `session_id`.
@@ -1615,6 +1847,7 @@ impl SessionManager {
             || ledger.records.iter().any(|record| {
                 !is_sha256_fingerprint(&record.source_fingerprint)
                     || !is_sha256_fingerprint(&record.turn_fingerprint)
+                    || record.decision.as_ref().is_some_and(|r| !r.is_bounded())
             })
         {
             return Err(io::Error::new(
@@ -1642,15 +1875,25 @@ impl SessionManager {
 
     /// Run an out-of-band rewrite of a session's files (`scrub-secrets`)
     /// under the same per-session lock every save takes, so it cannot
-    /// interleave with a live session's save. `None` when the session was
-    /// deleted; an invalid id is an `InvalidInput` error.
+    /// interleave with a save, and while holding the session's live lease, so
+    /// no interactive session holds the conversation in memory to put the old
+    /// content back on its next autosave. `None` when the session was
+    /// deleted; an invalid id is an `InvalidInput` error, and a session open
+    /// in an interactive surface is `ResourceBusy`, left untouched.
+    ///
+    /// The lease is taken inside the save lock with non-blocking attempts, so
+    /// the reverse order elsewhere (lease, then a save) cannot deadlock: one
+    /// side reports busy instead.
     pub(crate) fn with_session_file_lock<T>(
         &self,
         session_id: &str,
         rewrite: impl FnOnce() -> io::Result<T>,
     ) -> io::Result<Option<T>> {
         let session_id = self.validated_session_id(session_id)?;
-        self.with_session_write_admission(session_id, rewrite)
+        self.with_session_write_admission(session_id, || {
+            let _lease = self.reserve_session_for_external_write(session_id)?;
+            rewrite()
+        })
     }
 
     /// Serialize active accounting admission with deletion of its origin.
@@ -1676,6 +1919,7 @@ impl SessionManager {
         source_id: &str,
         route: &crate::cost_status::EffectiveRouteEnvelope,
         usage: Option<&codewhale_models::Usage>,
+        decision: Option<&crate::cost_status::RuntimeDecisionReceipt>,
     ) -> io::Result<bool> {
         let (path, lock_path) = self.ensure_late_usage_paths(session_id)?;
         let lock_file = open_private_lock_file(&lock_path)?;
@@ -1687,11 +1931,21 @@ impl SessionManager {
         }
         let mut ledger = Self::load_late_usage_unlocked(&path)?;
         let source_fingerprint = crate::cost_status::usage_source_fingerprint(source_id);
-        if ledger
+        if let Some(record) = ledger
             .records
-            .iter()
-            .any(|record| record.source_fingerprint == source_fingerprint)
+            .iter_mut()
+            .find(|record| record.source_fingerprint == source_fingerprint)
         {
+            if let Some(decision) = decision {
+                if !decision.is_bounded() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "decision receipt exceeds its bound",
+                    ));
+                }
+                record.decision = Some(decision.sanitized());
+                Self::write_late_usage_ledger(&path, &ledger)?;
+            }
             return Ok(true);
         }
         if ledger.records.len() == MAX_LATE_USAGE_RECORDS_PER_SESSION {
@@ -1706,9 +1960,46 @@ impl SessionManager {
             turn_fingerprint: crate::cost_status::usage_source_fingerprint(turn_id),
             route: route.sanitized_for_persistence(),
             usage: usage.cloned(),
+            decision: decision.map(crate::cost_status::RuntimeDecisionReceipt::sanitized),
         });
         Self::write_late_usage_ledger(&path, &ledger)?;
         Ok(true)
+    }
+
+    pub(crate) fn persist_late_decision_receipt(
+        &self,
+        session_id: &str,
+        turn_id: &str,
+        receipt: &crate::cost_status::RuntimeDecisionReceipt,
+    ) -> io::Result<bool> {
+        if !receipt.is_bounded() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "decision receipt exceeds its bound",
+            ));
+        }
+        self.persist_late_usage_record(
+            session_id,
+            turn_id,
+            &receipt.source_id,
+            &receipt.route,
+            receipt.usage.as_ref().filter(|_| receipt.usage_complete),
+            Some(receipt),
+        )
+    }
+
+    /// Read the bounded provider decision evidence from the existing origin ledger.
+    #[cfg(test)]
+    pub(crate) fn decision_receipts_for_session(
+        &self,
+        session_id: &str,
+    ) -> io::Result<Vec<crate::cost_status::RuntimeDecisionReceipt>> {
+        Ok(self
+            .load_late_usage(session_id)?
+            .records
+            .into_iter()
+            .filter_map(|record| record.decision)
+            .collect())
     }
 
     pub(crate) fn persist_late_runtime_usage(
@@ -1723,6 +2014,7 @@ impl SessionManager {
             &record.source_id,
             &record.usage.route,
             Some(&record.usage.usage),
+            None,
         )
     }
 
@@ -1732,7 +2024,14 @@ impl SessionManager {
         turn_id: &str,
         record: &crate::cost_status::RuntimeUsageDropRecord,
     ) -> io::Result<bool> {
-        self.persist_late_usage_record(session_id, turn_id, &record.source_id, &record.route, None)
+        self.persist_late_usage_record(
+            session_id,
+            turn_id,
+            &record.source_id,
+            &record.route,
+            None,
+            None,
+        )
     }
 
     fn with_session_read_lock<T>(
@@ -1797,6 +2096,14 @@ impl SessionManager {
             }
         };
         for record in ledger.records {
+            if let Some(receipt) = &record.decision
+                && receipt.is_bounded()
+            {
+                metadata
+                    .cost
+                    .route_receipts
+                    .insert(receipt.diagnostic_receipt());
+            }
             let source_fingerprint = record.source_fingerprint.clone();
             let source_id = format!("late:{}", record.source_fingerprint);
             let mut pending = if let Some(usage) = record.usage.as_ref() {
@@ -2204,7 +2511,7 @@ impl SessionManager {
         self.read_checkpoint_file(&path)
     }
 
-    fn legacy_checkpoint_origin(&self) -> io::Result<Option<String>> {
+    pub(crate) fn legacy_checkpoint_origin(&self) -> io::Result<Option<String>> {
         use std::io::Read as _;
 
         let path = self.checkpoints_dir().join(LEGACY_CHECKPOINT_FILE);
@@ -2318,7 +2625,12 @@ impl SessionManager {
             let CheckpointSource::Session(id) = checkpoint.source else {
                 continue;
             };
-            if Some(id.as_str()) == exclude || !self.session_from_prior_instance(&id) {
+            // A checkpoint another running session is still refreshing is
+            // that session's in-flight work, not a prior crash.
+            if Some(id.as_str()) == exclude
+                || !self.session_from_prior_instance(&id)
+                || self.is_session_live_anywhere(&id)
+            {
                 continue;
             }
             // One malformed id or unreadable record must not hide a later
@@ -2527,6 +2839,19 @@ impl SessionManager {
             ));
         }
 
+        // The file name is the identity callers asked for. A document that
+        // names another session would attach that session's receipts, lease
+        // and later saves to the wrong record.
+        if session.metadata.id != id.trim() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "Session file {} records a different session id",
+                    path.display()
+                ),
+            ));
+        }
+
         session.system_prompt = strip_legacy_truncation_note(session.system_prompt);
         session.ensure_journal();
         self.hydrate_approval_receipts(&mut session)?;
@@ -2574,6 +2899,84 @@ impl SessionManager {
         Ok(recovery)
     }
 
+    /// [`Self::resume_session`] for a surface that will own and autosave the
+    /// session: it first reserves the session's live lease, and refuses with
+    /// `ResourceBusy` when another process has it open
+    /// ([`Self::reserve_session_for_attach`]). The caller commits the
+    /// returned lease once the session is applied.
+    ///
+    /// A session that was interrupted mid-turn is attached in its interrupted
+    /// state: its crash checkpoint, when newer than the saved document, is
+    /// promoted first. Attaching the older document instead dropped the
+    /// in-flight turn, and the next autosave then cleared the only record of
+    /// it while the turn's file edits stayed on disk.
+    pub fn attach_session(&self, id: &str) -> std::io::Result<(SessionRecovery, SessionLease)> {
+        let lease = self.reserve_session_for_attach(id)?;
+        self.promote_interrupted_checkpoint(id);
+        let recovery = self.resume_session(id)?;
+        Ok((recovery, lease))
+    }
+
+    /// Persist `id`'s crash checkpoint as its saved document when the
+    /// checkpoint is the newer of the two (or there is no document yet), then
+    /// consume it. Callers hold the session's attach lease. A stale checkpoint
+    /// never replaces a newer document; an unreadable document and a failed
+    /// save leave both files as they were.
+    fn promote_interrupted_checkpoint(&self, id: &str) {
+        let Ok(Some(checkpoint)) = self.load_session_checkpoint(id) else {
+            return;
+        };
+        match self.load_session(id) {
+            Ok(saved) if saved.metadata.updated_at >= checkpoint.metadata.updated_at => {}
+            Ok(_) => {
+                if self.save_session(&checkpoint).is_err() {
+                    return;
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if self.save_session(&checkpoint).is_err() {
+                    return;
+                }
+            }
+            // A document that exists but cannot be read is not ours to
+            // replace here; the attach reports it and the checkpoint stays.
+            Err(_) => return,
+        }
+        let _ = self.clear_session_checkpoint(id);
+    }
+
+    /// [`Self::attach_session`] with a partial-ID prefix.
+    pub fn attach_session_by_prefix(
+        &self,
+        prefix: &str,
+    ) -> std::io::Result<(SessionRecovery, SessionLease)> {
+        self.attach_session(&self.resolve_session_id_prefix(prefix)?)
+    }
+
+    /// [`Self::attach_session`] for a session file `/load` has already read.
+    /// Either way the surface becomes the writer of the id the file names, so
+    /// a managed record and a foreign file take the same contract: the id's
+    /// live lease is reserved first and refused while another window has it
+    /// open. A managed record then resumes through the manager so its repair
+    /// is persisted in place; a foreign file is not ours to rewrite, so its
+    /// journal projection and repair stay in memory.
+    pub fn attach_session_file(
+        &self,
+        parsed: SavedSession,
+        path: &Path,
+    ) -> std::io::Result<(SavedSession, SessionLease)> {
+        if self.owns_session_path(&parsed.metadata.id, path) {
+            return self
+                .attach_session(&parsed.metadata.id)
+                .map(|(recovery, lease)| (recovery.session, lease));
+        }
+        let lease = self.reserve_session_for_attach(&parsed.metadata.id)?;
+        let mut session = parsed;
+        session.ensure_journal();
+        repair_recovered_session(&mut session);
+        Ok((session, lease))
+    }
+
     /// [`Self::resume_session`] with a partial-ID prefix.
     pub fn resume_session_by_prefix(&self, prefix: &str) -> std::io::Result<SessionRecovery> {
         self.resume_session(&self.resolve_session_id_prefix(prefix)?)
@@ -2611,10 +3014,14 @@ impl SessionManager {
     pub(crate) fn resolve_session_id_prefix(&self, prefix: &str) -> std::io::Result<String> {
         let sessions = self.list_sessions()?;
 
-        let matches: Vec<_> = sessions
+        // One session listed more than once (a stray copy of its file under
+        // another name) is still one session, not an ambiguous prefix.
+        let mut matches: Vec<_> = sessions
             .into_iter()
             .filter(|s| s.id.starts_with(prefix))
             .collect();
+        matches.sort_by(|a, b| a.id.cmp(&b.id));
+        matches.dedup_by(|a, b| a.id == b.id);
 
         match matches.len() {
             0 => Err(std::io::Error::new(
@@ -2635,6 +3042,17 @@ impl SessionManager {
 
     /// List all saved sessions, sorted by most recently updated
     pub fn list_sessions(&self) -> std::io::Result<Vec<SessionMetadata>> {
+        Ok(self
+            .list_session_records()?
+            .into_iter()
+            .map(|(_, metadata)| metadata)
+            .collect())
+    }
+
+    /// [`Self::list_sessions`], keeping the file each record was read from.
+    /// A record's file is not always `<id>.json`: early builds wrote
+    /// `session_<timestamp>.json`, and retention must address those by path.
+    fn list_session_records(&self) -> std::io::Result<Vec<(PathBuf, SessionMetadata)>> {
         let mut sessions = Vec::new();
 
         for entry in fs::read_dir(&self.sessions_dir)? {
@@ -2645,12 +3063,12 @@ impl SessionManager {
                 && let Ok(mut session) = Self::load_session_metadata(&path)
             {
                 self.apply_late_usage_to_metadata(&mut session);
-                sessions.push(session);
+                sessions.push((path, session));
             }
         }
 
         // Sort by updated_at descending (most recent first)
-        sessions.sort_by_key(|s| std::cmp::Reverse(s.updated_at));
+        sessions.sort_by_key(|(_, s)| std::cmp::Reverse(s.updated_at));
 
         Ok(sessions)
     }
@@ -2669,9 +3087,9 @@ impl SessionManager {
         archived: bool,
         mutator: SessionMutator,
     ) -> std::io::Result<SessionMetadata> {
-        if mutator == SessionMutator::External && is_live_session(id) {
-            return Err(live_session_conflict(id));
-        }
+        let _lease = (mutator == SessionMutator::External)
+            .then(|| self.reserve_session_for_external_write(id))
+            .transpose()?;
         let mut session = self.load_session(id)?;
         if session.metadata.archived == archived {
             return Ok(session.metadata);
@@ -2727,9 +3145,9 @@ impl SessionManager {
         mutator: SessionMutator,
     ) -> std::io::Result<SessionMetadata> {
         let title = normalize_session_title(title)?;
-        if mutator == SessionMutator::External && is_live_session(id) {
-            return Err(live_session_conflict(id));
-        }
+        let _lease = (mutator == SessionMutator::External)
+            .then(|| self.reserve_session_for_external_write(id))
+            .transpose()?;
         let mut session = self.load_session(id)?;
         if session.metadata.title == title {
             return Ok(session.metadata);
@@ -2785,13 +3203,76 @@ impl SessionManager {
         Ok(metadata)
     }
 
+    /// Whether `remove_session` has anything of `id`'s to act on: its
+    /// document, a recovery checkpoint (its own, or the legacy slot it
+    /// originated), or a deletion marker whose cleanup a retry finishes. The
+    /// same test `remove_session` repeats under the session's lock, made
+    /// before any lease or lock file is created for the id.
+    fn session_may_have_records(&self, id: &str, path: &Path) -> io::Result<bool> {
+        match fs::symlink_metadata(path) {
+            Ok(_) => return Ok(true),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        if let Ok(checkpoint) = self.validated_checkpoint_path(id)
+            && checkpoint.try_exists()?
+        {
+            return Ok(true);
+        }
+        if matches!(self.legacy_checkpoint_origin(), Ok(Some(origin)) if origin == id.trim()) {
+            return Ok(true);
+        }
+        let (late_path, _) = self.late_usage_paths(id)?;
+        Self::late_usage_is_deleted(&late_path)
+    }
+
     /// Delete a session and its recovery checkpoints, retiring its origin.
     pub fn delete_session(&self, id: &str) -> std::io::Result<()> {
         self.remove_session(id, SessionRemoval::Explicit)
     }
 
+    /// Remove the pre-import copy of `session_path` that the first
+    /// graph-bearing write kept (see `archive_before_first_graph_write`): it is
+    /// the same transcript, so a deleted session must not survive in it.
+    ///
+    /// A linked archive directory is not followed, as the late-usage store
+    /// refuses one: deletion must not reach a same-named file elsewhere.
+    fn remove_import_archive_copy(&self, session_path: &Path) -> io::Result<()> {
+        let Some(name) = session_path.file_name() else {
+            return Ok(());
+        };
+        let dir = self.sessions_dir.join(WORK_GRAPH_IMPORT_ARCHIVE_DIR);
+        match fs::symlink_metadata(&dir) {
+            Ok(metadata) if crate::plugins::metadata_is_link_or_reparse(&metadata) => {
+                tracing::warn!(
+                    path = %dir.display(),
+                    "work-graph import archive is a link; its copies were not removed"
+                );
+                return Ok(());
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        }
+        match fs::remove_file(dir.join(name)) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
     fn remove_session(&self, id: &str, removal: SessionRemoval) -> std::io::Result<()> {
         let path = self.validated_session_path(id)?;
+        // Reserving the lease creates `.late-usage/<id>.live`; an id with
+        // nothing to remove must not leave one behind. The authoritative
+        // check below repeats this under the session's lock.
+        if !self.session_may_have_records(id, &path)? {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("Session '{}' not found", id.trim()),
+            ));
+        }
+        let _lease = self.reserve_session_for_external_write(id)?;
         // Older ordinary snapshots may use a name reserved by the checkpoint
         // directory. Such a name must never address its shared legacy files.
         let checkpoint = self.validated_checkpoint_path(id).ok();
@@ -2817,18 +3298,32 @@ impl SessionManager {
                 Err(error) => return Err(error),
             }
         }
-        if matches!(removal, SessionRemoval::Retention)
-            && (has_recovery || legacy_origin.is_err())
-            && !already_deleted
-        {
+        if matches!(removal, SessionRemoval::Retention) && !already_deleted {
+            // Retention never acts on an uncertain origin. An unreadable
+            // legacy checkpoint may be this id's crash recovery, and a
+            // damaged recovery leaves the ordinary snapshot as the only
+            // readable copy of the conversation. Fail closed: keep every byte
+            // and let the caller skip this record.
+            if let Err(error) = &legacy_origin {
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!(
+                        "retention left session '{}' untouched: the legacy checkpoint's origin is unreadable ({error})",
+                        id.trim()
+                    ),
+                ));
+            }
+        }
+        if matches!(removal, SessionRemoval::Retention) && has_recovery && !already_deleted {
             // Retention owns the ordinary snapshot, not crash recovery. Keep
             // the origin and its accounting/evidence writable for resume.
-            // An unreadable legacy origin cannot justify retiring any id.
-            return match fs::remove_file(&path) {
-                Ok(()) => Ok(()),
-                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-                Err(error) => Err(error),
-            };
+            match fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+            // The pre-import copy is an older ordinary snapshot, not recovery.
+            return self.remove_import_archive_copy(&path);
         }
         // The store this document is bound to is named by its binding, not by
         // its id: a host store usually sits under another conversation's
@@ -2867,6 +3362,7 @@ impl SessionManager {
                 Err(error) => return Err(error),
             }
         }
+        self.remove_import_archive_copy(&path)?;
         self.clear_session_boot_owner(id);
         let session_dir = self.sessions_dir.join(id.trim());
         if session_dir.exists() {
@@ -2956,7 +3452,7 @@ impl SessionManager {
     }
 
     fn cleanup_old_sessions_inner(&self, keep: Option<&str>) -> std::io::Result<()> {
-        let sessions = self.list_sessions()?;
+        let records = self.list_session_records()?;
 
         // What retention owes each class (#6136/#6137): archived records are
         // already outside the cap; empty auto-created stubs are junk the
@@ -2964,13 +3460,13 @@ impl SessionManager {
         // occupy a transcript's slot; everything else carries the
         // MAX_SESSIONS window.
         let mut active: Vec<&SessionMetadata> = Vec::new();
-        let mut stubs: Vec<&SessionMetadata> = Vec::new();
-        for session in &sessions {
+        let mut stubs: Vec<(&Path, &SessionMetadata)> = Vec::new();
+        for (path, session) in &records {
             if session.archived {
                 continue;
             }
             if is_empty_auto_created_session(session) {
-                stubs.push(session);
+                stubs.push((path, session));
             } else {
                 active.push(session);
             }
@@ -2993,11 +3489,11 @@ impl SessionManager {
             }
         }
 
-        for session in stubs.iter().skip(MAX_EMPTY_SESSION_STUBS) {
+        for (listed_path, session) in stubs.iter().skip(MAX_EMPTY_SESSION_STUBS) {
             if keep.is_some_and(|id| id == session.id) {
                 continue;
             }
-            if let Err(err) = self.remove_session(&session.id, SessionRemoval::Retention) {
+            if let Err(err) = self.retire_empty_stub(listed_path, &session.id) {
                 tracing::warn!(
                     target: "session",
                     session = session.id,
@@ -3014,6 +3510,31 @@ impl SessionManager {
         // other directories from an absent transcript or process-local claim.
 
         Ok(())
+    }
+
+    /// Retire one empty auto-created stub that retention listed at
+    /// `listed_path`.
+    ///
+    /// Early builds wrote records as `session_<timestamp>.json`, so the file
+    /// retention listed is not always `<id>.json`. Removing such a stub by id
+    /// could never find it: it was listed again, failed with `NotFound`, and
+    /// warned on every launch forever. That record has no id-addressed
+    /// accounting, checkpoint, or directory (nothing could reach it by id), so
+    /// retiring it is removing exactly the file that was listed. A stub that
+    /// is already gone when removal runs (another process's retention got
+    /// there first) is already removed, not an error.
+    fn retire_empty_stub(&self, listed_path: &Path, id: &str) -> std::io::Result<()> {
+        let canonical = self.validated_session_path(id)?;
+        let result = if listed_path == canonical {
+            self.remove_session(id, SessionRemoval::Retention)
+        } else {
+            let _lease = self.reserve_session_for_external_write(id)?;
+            fs::remove_file(listed_path)
+        };
+        match result {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            other => other,
+        }
     }
 
     /// Remove session files whose `updated_at` is older than `max_age`
@@ -3507,6 +4028,7 @@ fn create_saved_session_inner(
         work_state: None,
         window_title: None,
         last_auto_route: None,
+        turn_outcomes: Vec::new(),
     }
 }
 
@@ -3653,6 +4175,25 @@ fn json_object_end(bytes: &[u8], start: usize) -> Option<usize> {
     None
 }
 
+/// The longest valid UTF-8 prefix of `buf`. A fixed-size read prefix can end
+/// inside a multi-byte character (routine for CJK or emoji transcripts, which
+/// serde writes unescaped); rejecting the whole buffer then forced a full-file
+/// read of every such session on each listing.
+///
+/// Only a character cut at the very end is trimmed. An invalid byte anywhere
+/// else means a damaged file, and an empty prefix sends it down the full read,
+/// which reports it.
+fn utf8_prefix(buf: &[u8]) -> &str {
+    match std::str::from_utf8(buf) {
+        Ok(s) => s,
+        // `valid_up_to` marks a char boundary, so this slice is valid.
+        Err(error) if error.error_len().is_none() => {
+            std::str::from_utf8(&buf[..error.valid_up_to()]).unwrap_or_default()
+        }
+        Err(_) => "",
+    }
+}
+
 /// String-scan a JSON byte buffer for the top-level `"metadata":{...}`
 /// block and return it parsed. Returns `None` if no balanced metadata
 /// object is present in the buffer.
@@ -3662,7 +4203,7 @@ fn json_object_end(bytes: &[u8], start: usize) -> Option<usize> {
 /// `}` appearing inside a string literal doesn't perturb the depth
 /// count.
 fn extract_top_level_metadata(buf: &[u8]) -> Option<SessionMetadata> {
-    let s = std::str::from_utf8(buf).ok()?;
+    let s = utf8_prefix(buf);
     let bytes = s.as_bytes();
     const KEY: &[u8] = b"\"metadata\"";
     let start = json_value_start(bytes, find_json_key(bytes, KEY)?, KEY.len(), b'{')?;
@@ -3674,9 +4215,7 @@ fn extract_top_level_metadata(buf: &[u8]) -> Option<SessionMetadata> {
 /// whether the array was seen to end. A message the prefix cut in half is
 /// simply absent; nothing is reconstructed.
 fn extract_leading_messages(buf: &[u8], max: usize) -> (Vec<Message>, bool) {
-    let Ok(s) = std::str::from_utf8(buf) else {
-        return (Vec::new(), false);
-    };
+    let s = utf8_prefix(buf);
     let bytes = s.as_bytes();
     const KEY: &[u8] = b"\"messages\"";
     let Some(key_offset) = find_json_key(bytes, KEY) else {
@@ -4044,6 +4583,114 @@ mod tests {
                 },
             },
         }
+    }
+
+    #[test]
+    fn decision_receipt_survives_restart_replay_and_session_deletion() {
+        let tmp = tempdir().expect("tempdir");
+        let manager = SessionManager::new(tmp.path().join("sessions")).expect("manager");
+        save_late_usage_test_session(&manager, "decision-origin");
+        let receipt = crate::cost_status::decision_receipt_fixture("raw-decision-response-id");
+        manager
+            .persist_late_decision_receipt("decision-origin", "origin-turn", &receipt)
+            .expect("decision append");
+        manager
+            .persist_late_runtime_usage(
+                "decision-origin",
+                "origin-turn",
+                &crate::cost_status::RuntimeUsageRecord {
+                    source_id: receipt.source_id.clone(),
+                    usage: crate::cost_status::EffectiveRouteUsage {
+                        route: receipt.route.clone(),
+                        usage: receipt.usage.clone().expect("usage"),
+                    },
+                },
+            )
+            .expect("token append dedupes");
+        drop(manager);
+        let manager = SessionManager::new(tmp.path().join("sessions")).expect("restart");
+        let retained = manager
+            .decision_receipts_for_session("decision-origin")
+            .expect("receipts");
+        assert_eq!(retained, vec![receipt.sanitized()]);
+        let mut restored = manager
+            .load_session_snapshot("decision-origin")
+            .expect("restore");
+        assert_eq!(restored.metadata.total_tokens, 13);
+        assert_eq!(
+            restored.metadata.cost.unpriced_turns, 1,
+            "unknown TypeSafe billing remains explicit"
+        );
+        assert!(
+            restored
+                .metadata
+                .cost
+                .route_receipts
+                .iter()
+                .any(|r| r.contains("0.000012054"))
+        );
+        manager.apply_late_usage_to_metadata(&mut restored.metadata);
+        assert_eq!(
+            restored.metadata.total_tokens, 13,
+            "replay must not count tokens twice"
+        );
+        assert_eq!(restored.metadata.cost.unpriced_turns, 1);
+        manager.save_session(&restored).expect("save overlay");
+        assert_eq!(
+            manager
+                .load_session_snapshot("decision-origin")
+                .expect("resume again")
+                .metadata
+                .total_tokens,
+            13
+        );
+        let (ledger, _) = manager.late_usage_paths("decision-origin").expect("paths");
+        assert!(
+            !fs::read_to_string(&ledger)
+                .expect("ledger")
+                .contains("raw-decision-response-id")
+        );
+        save_late_usage_test_session(&manager, "decision-partial-origin");
+        let mut partial = receipt.clone();
+        partial.source_id = "partial-provider-response-id".into();
+        partial.usage_complete = false;
+        partial.usage.as_mut().expect("partial usage").output_tokens = 0;
+        manager
+            .persist_late_decision_receipt("decision-partial-origin", "partial-turn", &partial)
+            .expect("partial diagnostic append");
+        let partial_session = manager
+            .load_session_snapshot("decision-partial-origin")
+            .expect("partial replay");
+        assert_eq!(
+            partial_session.metadata.total_tokens, 0,
+            "partial provider counters remain diagnostic rather than an authoritative subtotal"
+        );
+        assert_eq!(partial_session.metadata.cost.unpriced_turns, 1);
+        assert!(
+            partial_session
+                .metadata
+                .cost
+                .route_receipts
+                .iter()
+                .any(|r| r.contains("0.000012054"))
+        );
+        manager.delete_session("decision-origin").expect("delete");
+        assert!(
+            manager
+                .persist_late_decision_receipt("decision-origin", "origin-turn", &receipt)
+                .expect("retired replay")
+        );
+        assert!(
+            !ledger.exists(),
+            "late evidence must never recreate a deleted origin"
+        );
+        let mut oversized = receipt;
+        oversized.evidence.response_model = Some("x".repeat(129));
+        assert!(
+            manager
+                .persist_late_decision_receipt("decision-origin", "origin-turn", &oversized)
+                .is_err()
+        );
     }
 
     #[test]
@@ -4503,6 +5150,174 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn external_writers_are_refused_while_another_process_holds_the_live_lease() {
+        let tmp = tempdir().expect("tempdir");
+        let manager = SessionManager::new(tmp.path().join("sessions")).expect("manager");
+        let id = "77777777-7777-4777-8777-777777777777";
+        save_late_usage_test_session(&manager, id);
+        let snapshot = manager.validated_session_path(id).expect("snapshot path");
+        let original = fs::read(&snapshot).expect("original bytes");
+        // Another process's TUI holds the lease; this process's in-memory
+        // registry knows nothing about it.
+        let lease = manager.hold_live_lease_elsewhere(id);
+        assert!(!is_live_session(id));
+
+        let rename = manager
+            .rename_session(id, "Renamed elsewhere", SessionMutator::External)
+            .expect_err("a rename would be reverted by the owner's next autosave");
+        assert_eq!(rename.kind(), io::ErrorKind::ResourceBusy);
+        let archive = manager
+            .set_session_archived(id, true, SessionMutator::External)
+            .expect_err("an archive would be reverted by the owner's next autosave");
+        assert_eq!(archive.kind(), io::ErrorKind::ResourceBusy);
+        assert_eq!(fs::read(&snapshot).expect("bytes"), original);
+
+        drop(lease);
+        manager
+            .rename_session(id, "Renamed after close", SessionMutator::External)
+            .expect("an unowned session accepts external writes");
+    }
+
+    #[test]
+    fn external_mutations_keep_the_live_lease_until_the_blocked_write_finishes() {
+        let _env = crate::test_support::lock_test_env();
+        let mut failures = Vec::new();
+        for operation in ["rename", "archive", "delete"] {
+            let tmp = tempdir().expect("tempdir");
+            let manager = std::sync::Arc::new(
+                SessionManager::new(tmp.path().join("sessions")).expect("manager"),
+            );
+            let id = "88888888-8888-4888-8888-888888888888";
+            save_late_usage_test_session(&manager, id);
+            // Hold the actual persistence lock so the shipping mutation stays
+            // between admission and commit while another surface tries attach.
+            let (_, lock_path) = manager.ensure_late_usage_paths(id).expect("paths");
+            let mut lock = fd_lock::RwLock::new(open_private_lock_file(&lock_path).unwrap());
+            let write_guard = lock.write().expect("hold persistence lock");
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            let worker_manager = manager.clone();
+            let ticket = crate::test_support::env_scope_ticket();
+            let worker = std::thread::spawn(move || {
+                let _membership = crate::test_support::join_env_scope(ticket);
+                entered_tx.send(()).unwrap();
+                match operation {
+                    "rename" => worker_manager
+                        .rename_session(id, "Atomic rename", SessionMutator::External)
+                        .map(|_| ()),
+                    "archive" => worker_manager
+                        .set_session_archived(id, true, SessionMutator::External)
+                        .map(|_| ()),
+                    "delete" => worker_manager.delete_session(id),
+                    _ => unreachable!(),
+                }
+            });
+            entered_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while !manager.is_session_live_anywhere(id)
+                && !worker.is_finished()
+                && std::time::Instant::now() < deadline
+            {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            let holds_lease = manager.is_session_live_anywhere(id);
+            let attach_refused = manager
+                .reserve_session_for_attach(id)
+                .is_err_and(|error| error.kind() == io::ErrorKind::ResourceBusy);
+            // Release and join before asserting, even in the fixes-off case;
+            // no failed assertion may leave a blocked mutation behind.
+            drop(write_guard);
+            worker
+                .join()
+                .expect("mutation worker")
+                .expect("mutation succeeds");
+            if !holds_lease {
+                failures.push(format!("{operation}: released its lease before commit"));
+            }
+            if !attach_refused {
+                failures.push(format!("{operation}: admitted a competing session owner"));
+            }
+            assert!(
+                !manager.is_session_live_anywhere(id),
+                "{operation}: leaked its lease"
+            );
+        }
+        assert!(failures.is_empty(), "{failures:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn uncertain_live_lease_refuses_external_mutations_without_changing_history() {
+        let tmp = tempdir().expect("tempdir");
+        let manager = SessionManager::new(tmp.path().join("sessions")).expect("manager");
+        let id = "99999999-9999-4999-8999-999999999999";
+        save_late_usage_test_session(&manager, id);
+        let snapshot = manager.validated_session_path(id).unwrap();
+        let original = fs::read(&snapshot).unwrap();
+        let target = tmp.path().join("untouched");
+        fs::write(&target, b"unrelated bytes").unwrap();
+        let live_path = manager.live_lease_path(id, true).unwrap();
+        std::os::unix::fs::symlink(&target, &live_path).unwrap();
+        assert!(
+            manager.is_session_live_anywhere(id),
+            "uncertain ownership is not free"
+        );
+        assert!(
+            manager
+                .rename_session(id, "Unsafe", SessionMutator::External)
+                .is_err()
+        );
+        assert!(
+            manager
+                .set_session_archived(id, true, SessionMutator::External)
+                .is_err()
+        );
+        assert!(manager.delete_session(id).is_err());
+        assert_eq!(fs::read(snapshot).unwrap(), original);
+        assert_eq!(fs::read(target).unwrap(), b"unrelated bytes");
+    }
+
+    #[test]
+    fn retention_fails_closed_on_an_unreadable_legacy_checkpoint_origin() {
+        let tmp = tempdir().expect("tempdir");
+        let manager = SessionManager::new(tmp.path().join("sessions")).expect("manager");
+        let id = "66666666-6666-4666-8666-666666666666";
+        let mut old = save_late_usage_test_session(&manager, id);
+        old.metadata.updated_at = Utc::now() - chrono::Duration::days(60);
+        manager.save_session(&old).expect("old snapshot");
+        let snapshot = manager.validated_session_path(id).expect("snapshot path");
+        let original = fs::read(&snapshot).expect("original snapshot bytes");
+        // Fault fixture: a legacy checkpoint whose owner cannot be read. It
+        // may be this session's (damaged) recovery.
+        fs::create_dir_all(manager.checkpoints_dir()).expect("checkpoints");
+        let legacy = manager.checkpoints_dir().join(LEGACY_CHECKPOINT_FILE);
+        let corrupt: &[u8] = b"{\"messages\": [truncated";
+        write_atomic(&legacy, corrupt).expect("corrupt legacy checkpoint");
+        assert!(manager.legacy_checkpoint_origin().is_err());
+
+        assert_eq!(
+            manager
+                .prune_sessions_older_than(std::time::Duration::from_secs(24 * 3600))
+                .expect("age prune"),
+            0,
+            "an uncertain origin must not be pruned"
+        );
+        assert_eq!(
+            fs::read(&snapshot).expect("snapshot survives retention"),
+            original,
+            "the ordinary snapshot keeps its original bytes"
+        );
+        assert_eq!(fs::read(&legacy).expect("legacy survives"), corrupt);
+        let (ledger, _) = manager.late_usage_paths(id).expect("ledger paths");
+        assert!(!SessionManager::late_usage_is_deleted(&ledger).expect("not retired"));
+
+        // Explicit deletion remains the user's decision.
+        manager.delete_session(id).expect("explicit delete");
+        assert!(!snapshot.exists());
     }
 
     #[test]
@@ -5261,6 +6076,7 @@ mod tests {
             work_state: None,
             window_title: None,
             last_auto_route: None,
+            turn_outcomes: Vec::new(),
         };
         manager.save_session(&session).expect("save");
     }
@@ -5303,6 +6119,7 @@ mod tests {
             work_state: None,
             window_title: None,
             last_auto_route: None,
+            turn_outcomes: Vec::new(),
         };
         manager.save_session(&session).expect("save empty");
     }
@@ -5513,6 +6330,221 @@ mod tests {
     }
 
     #[test]
+    fn saved_history_keeps_execution_identity_in_snapshots_and_journal() {
+        let tmp = tempdir().unwrap();
+        let manager = SessionManager::new(tmp.path().join("sessions")).unwrap();
+        let mut messages = vec![make_test_message("user", "inspect")];
+        for execution in ["execution-a", "execution-b"] {
+            messages.push(Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::ToolUse {
+                    id: "reused-provider-id".to_string(),
+                    execution_id: Some(execution.to_string()),
+                    name: "read".to_string(),
+                    input: serde_json::json!({"path": "README.md"}),
+                    caller: Some(codewhale_models::ToolCaller {
+                        caller_type: "code_execution".to_string(),
+                        tool_id: Some("provider-parent".to_string()),
+                    }),
+                    thought_signature: Some("provider-signature".to_string()),
+                }],
+            });
+            messages.push(Message {
+                role: Role::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "reused-provider-id".to_string(),
+                    execution_id: Some(execution.to_string()),
+                    content: format!("result for {execution}"),
+                    is_error: None,
+                    content_blocks: None,
+                }],
+            });
+        }
+        let session = create_saved_session(&messages, "test-model", tmp.path(), 0, None);
+        manager.save_session(&session).unwrap();
+        manager.save_checkpoint(&session).unwrap();
+        let snapshot = manager.load_session_snapshot(&session.metadata.id).unwrap();
+        let checkpoint = manager
+            .load_session_checkpoint(&session.metadata.id)
+            .unwrap()
+            .unwrap();
+        for restored in [snapshot, checkpoint] {
+            assert_eq!(restored.messages, messages);
+            assert_eq!(
+                restored.journal.as_ref().unwrap().active_messages(false),
+                messages
+            );
+            let first = restored.messages[1].content[0].tool_call_key();
+            let second = restored.messages[3].content[0].tool_call_key();
+            assert_ne!(first, second);
+            assert_eq!(first, restored.messages[2].content[0].tool_call_key());
+            assert_eq!(second, restored.messages[4].content[0].tool_call_key());
+        }
+    }
+
+    #[test]
+    fn approval_hydration_distinguishes_missing_and_present_logs_on_disk() {
+        let ask = ApprovalReceipt::asked("receipt-hydration", "exec_shell");
+        let decision = ApprovalReceipt::decided("receipt-hydration", ApprovalOutcome::ApprovedOnce);
+        let embedded = vec![ask.clone(), decision];
+        let mut prefix_with_torn_decision = serde_json::to_vec(&ask).unwrap();
+        prefix_with_torn_decision.extend_from_slice(b"\n{\"phase\":\"decided\"");
+        let cases = [
+            ("missing", None, embedded.clone()),
+            ("empty", Some(Vec::new()), Vec::new()),
+            (
+                "torn-first",
+                Some(b"{\"phase\":\"asked\"".to_vec()),
+                Vec::new(),
+            ),
+            (
+                "asked-prefix",
+                Some(prefix_with_torn_decision),
+                vec![ask.clone()],
+            ),
+        ];
+        for with_lock in [false, true] {
+            for (name, log_bytes, expected) in &cases {
+                let tmp = tempdir().unwrap();
+                let sessions_dir = tmp.path().join("sessions");
+                let manager = SessionManager::new(sessions_dir.clone()).unwrap();
+                let mut session = create_saved_session(
+                    &[make_test_message("user", "receipt recovery")],
+                    "test-model",
+                    tmp.path(),
+                    0,
+                    None,
+                );
+                session.approval_receipts = embedded.clone();
+                let id = &session.metadata.id;
+                // Persist legacy embedded evidence while no sidecar exists.
+                let saved_path = manager.save_session(&session).unwrap();
+                let checkpoint_path = manager.save_checkpoint(&session).unwrap();
+                let saved_before = fs::read(&saved_path).unwrap();
+                let checkpoint_before = fs::read(&checkpoint_path).unwrap();
+                let store = ApprovalReceiptStore::new(sessions_dir.clone());
+                let log_path = sessions_dir.join(id).join("approval_receipts.jsonl");
+                if with_lock {
+                    // Exercise the live-writer lock path as well as an imported
+                    // log without a lock, then simulate its final on-disk bytes.
+                    store.append(id, &ask).unwrap();
+                }
+                if let Some(bytes) = log_bytes {
+                    fs::create_dir_all(log_path.parent().unwrap()).unwrap();
+                    fs::write(&log_path, bytes).unwrap();
+                } else if with_lock {
+                    fs::remove_file(&log_path).unwrap();
+                }
+                let resumed = manager.load_session_snapshot(id).unwrap();
+                let checkpoint = manager.load_session_checkpoint(id).unwrap().unwrap();
+                for loaded in [&resumed, &checkpoint] {
+                    assert_eq!(
+                        &loaded.approval_receipts, expected,
+                        "{name}, lock={with_lock}"
+                    );
+                    assert_eq!(loaded.messages, session.messages);
+                    let replay = ApprovalReplay::from_receipts(&loaded.approval_receipts).unwrap();
+                    assert_eq!(
+                        replay.completed.len(),
+                        usize::from(*name == "missing"),
+                        "{name}"
+                    );
+                    assert_eq!(
+                        replay.unmatched_asks.len(),
+                        usize::from(*name == "asked-prefix"),
+                        "{name}"
+                    );
+                }
+                assert_eq!(
+                    fs::read(&saved_path).unwrap(),
+                    saved_before,
+                    "read-only snapshot"
+                );
+                assert_eq!(
+                    fs::read(&checkpoint_path).unwrap(),
+                    checkpoint_before,
+                    "read-only checkpoint"
+                );
+                // Saving the old in-memory snapshot must hydrate too, so stale
+                // approvals cannot be reintroduced into either persisted file.
+                manager.save_session(&session).unwrap();
+                manager.save_checkpoint(&session).unwrap();
+                for path in [&saved_path, &checkpoint_path] {
+                    let saved: SavedSession =
+                        serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+                    assert_eq!(
+                        &saved.approval_receipts, expected,
+                        "persisted {name}, lock={with_lock}"
+                    );
+                }
+                match log_bytes {
+                    Some(bytes) => assert_eq!(fs::read(&log_path).unwrap(), *bytes, "{name}"),
+                    None => assert!(!log_path.exists(), "missing log must not be created"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn approval_hydration_rejects_complete_corruption_without_replacing_saved_evidence() {
+        let ask = ApprovalReceipt::asked("receipt-invalid", "exec_shell");
+        let decision = ApprovalReceipt::decided("receipt-invalid", ApprovalOutcome::ApprovedOnce);
+        let embedded = vec![ask.clone(), decision.clone()];
+        let mut interior = b"not-json\n".to_vec();
+        interior.extend_from_slice(&serde_json::to_vec(&ask).unwrap());
+        interior.push(b'\n');
+        let mut orphan_decision = serde_json::to_vec(&decision).unwrap();
+        orphan_decision.push(b'\n');
+        for bytes in [
+            b"not-json\n".to_vec(),
+            interior,
+            b"{\"phase\":\"unknown\"}".to_vec(),
+            orphan_decision,
+        ] {
+            let tmp = tempdir().unwrap();
+            let sessions_dir = tmp.path().join("sessions");
+            let manager = SessionManager::new(sessions_dir.clone()).unwrap();
+            let mut session = create_saved_session(
+                &[make_test_message("user", "invalid receipt recovery")],
+                "test-model",
+                tmp.path(),
+                0,
+                None,
+            );
+            session.approval_receipts = embedded.clone();
+            let id = &session.metadata.id;
+            let saved_path = manager.save_session(&session).unwrap();
+            let checkpoint_path = manager.save_checkpoint(&session).unwrap();
+            let saved_before = fs::read(&saved_path).unwrap();
+            let checkpoint_before = fs::read(&checkpoint_path).unwrap();
+            ApprovalReceiptStore::new(sessions_dir.clone())
+                .append(id, &ask)
+                .unwrap();
+            let log_path = sessions_dir.join(id).join("approval_receipts.jsonl");
+            fs::write(&log_path, &bytes).unwrap();
+            assert_eq!(
+                manager.load_session_snapshot(id).unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
+            assert_eq!(
+                manager.load_session_checkpoint(id).unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
+            assert_eq!(
+                manager.save_session(&session).unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
+            assert_eq!(
+                manager.save_checkpoint(&session).unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
+            assert_eq!(fs::read(&saved_path).unwrap(), saved_before);
+            assert_eq!(fs::read(&checkpoint_path).unwrap(), checkpoint_before);
+            assert_eq!(fs::read(&log_path).unwrap(), bytes);
+        }
+    }
+
+    #[test]
     fn session_boot_owner_stamps_only_the_creating_instance() {
         let tmp = tempdir().expect("tempdir");
         let manager = SessionManager::new(tmp.path().to_path_buf()).expect("manager");
@@ -5683,6 +6715,7 @@ mod tests {
         let messages = vec![Message {
             role: Role::Assistant,
             content: vec![ContentBlock::ToolUse {
+                execution_id: None,
                 id: "call-in-flight".to_string(),
                 name: "read_file".to_string(),
                 input: serde_json::json!({"path": "README.md"}),
@@ -5718,6 +6751,7 @@ mod tests {
         let messages = vec![Message {
             role: Role::Assistant,
             content: vec![ContentBlock::ToolUse {
+                execution_id: None,
                 id: "call-crashed".to_string(),
                 name: "read_file".to_string(),
                 input: serde_json::json!({"path": "README.md"}),
@@ -5755,6 +6789,7 @@ mod tests {
         let messages = vec![Message {
             role: Role::Assistant,
             content: vec![ContentBlock::ToolUse {
+                execution_id: None,
                 id: "call-crashed".to_string(),
                 name: "read_file".to_string(),
                 input: serde_json::json!({"path": "README.md"}),
@@ -5785,6 +6820,7 @@ mod tests {
         let messages = vec![Message {
             role: Role::Assistant,
             content: vec![ContentBlock::ToolUse {
+                execution_id: None,
                 id: "call-crashed".to_string(),
                 name: "read_file".to_string(),
                 input: serde_json::json!({"path": "README.md"}),
@@ -5839,6 +6875,7 @@ mod tests {
             Message {
                 role: Role::Assistant,
                 content: vec![ContentBlock::ToolUse {
+                    execution_id: None,
                     id: "plan-1".to_string(),
                     name: "update_plan".to_string(),
                     input: serde_json::json!({
@@ -5859,6 +6896,7 @@ mod tests {
             Message {
                 role: Role::User,
                 content: vec![ContentBlock::ToolResult {
+                    execution_id: None,
                     tool_use_id: "plan-1".to_string(),
                     content: "Plan updated".to_string(),
                     is_error: None,
@@ -5897,6 +6935,7 @@ mod tests {
             Message {
                 role: Role::Assistant,
                 content: vec![ContentBlock::ToolUse {
+                    execution_id: None,
                     id: "call-big".to_string(),
                     name: "exec_shell".to_string(),
                     input: serde_json::json!({"command": "cargo test -p codewhale-tui"}),
@@ -5907,6 +6946,7 @@ mod tests {
             Message {
                 role: Role::User,
                 content: vec![ContentBlock::ToolResult {
+                    execution_id: None,
                     tool_use_id: "call-big".to_string(),
                     content: raw.clone(),
                     is_error: None,
@@ -5950,6 +6990,7 @@ mod tests {
             Message {
                 role: Role::Assistant,
                 content: vec![ContentBlock::ToolUse {
+                    execution_id: None,
                     id: "call-legacy".to_string(),
                     name: "exec_shell".to_string(),
                     input: serde_json::json!({"command": "cargo check"}),
@@ -5960,6 +7001,7 @@ mod tests {
             Message {
                 role: Role::User,
                 content: vec![ContentBlock::ToolResult {
+                    execution_id: None,
                     tool_use_id: "call-legacy".to_string(),
                     content: raw.clone(),
                     is_error: None,
@@ -6309,6 +7351,129 @@ mod tests {
 
         assert!(!sessions_dir.join(format!("{session_id}.json")).exists());
         assert!(!sessions_dir.join(&session_id).exists());
+    }
+
+    #[test]
+    fn delete_session_removes_its_work_graph_import_archive() {
+        let tmp = tempdir().expect("tempdir");
+        let sessions_dir = tmp.path().join("sessions");
+        let manager = SessionManager::new(sessions_dir.clone()).expect("new");
+        let session = create_saved_session(
+            &[make_test_message("user", "archived transcript")],
+            "test-model",
+            tmp.path(),
+            0,
+            None,
+        );
+        let session_id = session.metadata.id.clone();
+        let path = manager.save_session(&session).expect("save");
+        let archive_dir = sessions_dir.join(WORK_GRAPH_IMPORT_ARCHIVE_DIR);
+        fs::create_dir_all(&archive_dir).expect("archive dir");
+        let archive = archive_dir.join(path.file_name().expect("file name"));
+        fs::copy(&path, &archive).expect("archive copy");
+        let other = archive_dir.join("other-session.json");
+        fs::write(&other, "{}").expect("other archive");
+
+        manager.delete_session(&session_id).expect("delete");
+
+        assert!(
+            !archive.exists(),
+            "the deleted transcript's copy is removed"
+        );
+        assert!(other.exists(), "other sessions' copies are untouched");
+    }
+
+    /// Retention keeps a session's crash-recovery checkpoint but retires the
+    /// ordinary snapshot, and the pre-import copy is an ordinary snapshot.
+    #[test]
+    fn retention_removes_the_import_archive_copy_of_a_recoverable_session() {
+        let tmp = tempdir().expect("tempdir");
+        let sessions_dir = tmp.path().join("sessions");
+        let manager = SessionManager::new(sessions_dir.clone()).expect("new");
+        let session = create_saved_session(
+            &[make_test_message("user", "archived transcript")],
+            "test-model",
+            tmp.path(),
+            0,
+            None,
+        );
+        let session_id = session.metadata.id.clone();
+        let path = manager.save_session(&session).expect("save");
+        manager.save_checkpoint(&session).expect("checkpoint");
+        let archive_dir = sessions_dir.join(WORK_GRAPH_IMPORT_ARCHIVE_DIR);
+        fs::create_dir_all(&archive_dir).expect("archive dir");
+        let archive = archive_dir.join(path.file_name().expect("file name"));
+        fs::copy(&path, &archive).expect("archive copy");
+
+        manager
+            .remove_session(&session_id, SessionRemoval::Retention)
+            .expect("retention");
+
+        assert!(!path.exists(), "the ordinary snapshot is retired");
+        assert!(!archive.exists(), "so is its pre-import copy");
+        assert!(
+            manager
+                .load_session_checkpoint(&session_id)
+                .expect("checkpoint")
+                .is_some(),
+            "crash recovery is kept"
+        );
+    }
+
+    /// Deletion does not follow a linked archive directory to a same-named
+    /// file somewhere else.
+    #[cfg(unix)]
+    #[test]
+    fn delete_does_not_follow_a_linked_import_archive() {
+        let tmp = tempdir().expect("tempdir");
+        let sessions_dir = tmp.path().join("sessions");
+        let manager = SessionManager::new(sessions_dir.clone()).expect("new");
+        let session = create_saved_session(
+            &[make_test_message("user", "transcript")],
+            "test-model",
+            tmp.path(),
+            0,
+            None,
+        );
+        let session_id = session.metadata.id.clone();
+        let path = manager.save_session(&session).expect("save");
+        let elsewhere = tmp.path().join("elsewhere");
+        fs::create_dir_all(&elsewhere).expect("elsewhere");
+        let unrelated = elsewhere.join(path.file_name().expect("file name"));
+        fs::write(&unrelated, "{}").expect("unrelated file");
+        std::os::unix::fs::symlink(&elsewhere, sessions_dir.join(WORK_GRAPH_IMPORT_ARCHIVE_DIR))
+            .expect("link");
+
+        manager.delete_session(&session_id).expect("delete");
+
+        assert!(!path.exists());
+        assert!(unrelated.exists(), "a file behind the link is untouched");
+    }
+
+    #[test]
+    fn a_session_file_naming_another_session_is_refused() {
+        let tmp = tempdir().expect("tempdir");
+        let manager = SessionManager::new(tmp.path().join("sessions")).expect("new");
+        let session = create_saved_session(&[], "test-model", tmp.path(), 0, None);
+        manager.save_session(&session).expect("save");
+        let id = session.metadata.id.clone();
+        let source = manager.validated_session_path(&id).expect("path");
+        std::fs::copy(&source, source.with_file_name("impostor.json")).expect("copy");
+
+        assert_eq!(manager.load_session(&id).expect("own id").metadata.id, id);
+        // The stray copy does not make the real session ambiguous.
+        assert_eq!(
+            manager
+                .load_session_by_prefix(&id)
+                .expect("resume by id with a copy present")
+                .metadata
+                .id,
+            id
+        );
+        let err = manager
+            .load_session("impostor")
+            .expect_err("mismatched id must fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 
     #[test]
@@ -7090,6 +8255,260 @@ mod tests {
         );
     }
 
+    fn hold_live_lease(manager: &SessionManager, id: &str) -> fs::File {
+        manager.hold_live_lease_elsewhere(id)
+    }
+
+    #[test]
+    fn interrupted_workspace_session_skips_a_session_live_elsewhere() {
+        let tmp = tempdir().expect("tempdir");
+        let manager = SessionManager::new(tmp.path().join("sessions")).expect("manager");
+        let workspace = tmp.path().join("ws");
+        fs::create_dir_all(&workspace).expect("workspace");
+        write_prior_interrupted_session(&manager, "sess-crashed", &workspace);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        write_prior_interrupted_session(&manager, "sess-running", &workspace);
+
+        let lease = hold_live_lease(&manager, "sess-running");
+        assert_eq!(
+            manager
+                .interrupted_workspace_session(&workspace, None)
+                .map(|meta| meta.id),
+            Some("sess-crashed".to_string()),
+            "a checkpoint another terminal is refreshing is not a crash"
+        );
+        drop(lease);
+        assert_eq!(
+            manager
+                .interrupted_workspace_session(&workspace, None)
+                .map(|meta| meta.id),
+            Some("sess-running".to_string())
+        );
+    }
+
+    /// Attaching a session that crashed mid-turn opens the interrupted turn
+    /// from its crash checkpoint; a stale checkpoint never replaces a newer
+    /// saved document.
+    #[test]
+    fn attach_promotes_the_sessions_newer_crash_checkpoint() {
+        let _env = crate::test_support::lock_test_env();
+        let tmp = tempdir().expect("tempdir");
+        let manager = SessionManager::new(tmp.path().join("sessions")).expect("manager");
+        let workspace = tmp.path().join("ws");
+        fs::create_dir_all(&workspace).expect("workspace");
+        let user = |text: &str| Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text {
+                text: text.to_string(),
+                cache_control: None,
+            }],
+        };
+        let saved = create_saved_session(&[user("first")], "test-model", &workspace, 0, None);
+        let id = saved.metadata.id.clone();
+        manager.save_session(&saved).expect("save session");
+        let mut interrupted = saved.clone();
+        interrupted.messages.push(user("in-flight turn"));
+        interrupted.metadata.updated_at = saved.metadata.updated_at + chrono::Duration::seconds(5);
+        manager
+            .save_checkpoint(&interrupted)
+            .expect("save checkpoint");
+
+        let (recovery, lease) = manager.attach_session(&id).expect("attach");
+        assert_eq!(
+            recovery.session.messages.len(),
+            2,
+            "the interrupted turn is part of the attached session"
+        );
+        assert!(
+            manager
+                .load_session_checkpoint(&id)
+                .expect("load checkpoint")
+                .is_none(),
+            "the recovered checkpoint is consumed"
+        );
+        drop(lease);
+
+        let mut stale = saved.clone();
+        stale.metadata.updated_at = saved.metadata.updated_at - chrono::Duration::seconds(5);
+        manager
+            .save_checkpoint(&stale)
+            .expect("save stale checkpoint");
+        let (recovery, _lease) = manager.attach_session(&id).expect("attach again");
+        assert_eq!(
+            recovery.session.messages.len(),
+            2,
+            "a stale checkpoint never replaces the newer document"
+        );
+    }
+
+    /// Attaching to a session another process has open is refused, naming
+    /// it, rather than giving the document a second autosaving writer.
+    #[test]
+    fn attach_refuses_a_session_open_in_another_process() {
+        let _env = crate::test_support::lock_test_env();
+        let tmp = tempdir().expect("tempdir");
+        let manager = SessionManager::new(tmp.path().join("sessions")).expect("manager");
+        let workspace = tmp.path().join("ws");
+        fs::create_dir_all(&workspace).expect("workspace");
+        write_prior_interrupted_session(&manager, "sess-open", &workspace);
+
+        let lease = hold_live_lease(&manager, "sess-open");
+        let error = manager
+            .reserve_session_for_attach("sess-open")
+            .expect_err("a session open elsewhere is refused");
+        assert_eq!(error.kind(), io::ErrorKind::ResourceBusy);
+        assert!(error.to_string().contains("sess-open"), "{error}");
+        assert!(!is_live_session("sess-open"), "nothing was claimed");
+
+        drop(lease);
+        let (_, reserved) = manager
+            .attach_session("sess-open")
+            .expect("attach once the other window has closed");
+        assert!(
+            !try_lock_elsewhere(&manager, "sess-open"),
+            "the attach holds the lease from the start"
+        );
+        reserved.commit();
+        assert!(is_live_session("sess-open"));
+        assert!(!try_lock_elsewhere(&manager, "sess-open"));
+        set_live_session(None);
+    }
+
+    /// Switching from session A to B must not give up A until B is applied:
+    /// a reservation that is dropped (B failed to load or apply) leaves A
+    /// claimed and leased, and B free.
+    #[test]
+    fn a_failed_attach_keeps_the_current_sessions_lease() {
+        let _env = crate::test_support::lock_test_env();
+        let tmp = tempdir().expect("tempdir");
+        let manager = SessionManager::new(tmp.path().join("sessions")).expect("manager");
+        let workspace = tmp.path().join("ws");
+        fs::create_dir_all(&workspace).expect("workspace");
+        write_prior_interrupted_session(&manager, "sess-a", &workspace);
+        write_prior_interrupted_session(&manager, "sess-b", &workspace);
+        manager.claim_live_session("sess-a");
+        assert!(!try_lock_elsewhere(&manager, "sess-a"), "A is leased");
+
+        let reserved = manager
+            .reserve_session_for_attach("sess-b")
+            .expect("reserve B");
+        assert!(is_live_session("sess-a"), "A stays claimed while B loads");
+        assert!(!try_lock_elsewhere(&manager, "sess-a"), "and leased");
+        drop(reserved);
+        assert!(is_live_session("sess-a"));
+        assert!(!try_lock_elsewhere(&manager, "sess-a"), "A is still leased");
+        assert!(try_lock_elsewhere(&manager, "sess-b"), "B was released");
+
+        // A B whose document cannot be loaded is refused the same way.
+        let b_path = manager.validated_session_path("sess-b").expect("path");
+        fs::write(&b_path, "{ not json").expect("corrupt B");
+        manager
+            .attach_session("sess-b")
+            .expect_err("a corrupt B fails to attach");
+        assert!(is_live_session("sess-a"));
+        assert!(!try_lock_elsewhere(&manager, "sess-a"), "A is still leased");
+        assert!(try_lock_elsewhere(&manager, "sess-b"), "B was released");
+        set_live_session(None);
+    }
+
+    /// `/load` takes the same contract as `resume`: a managed record and a
+    /// foreign file naming a session open in another window are both
+    /// refused, and neither is claimed.
+    #[test]
+    fn load_of_a_session_open_elsewhere_is_refused_for_managed_and_foreign_files() {
+        let _env = crate::test_support::lock_test_env();
+        let tmp = tempdir().expect("tempdir");
+        let manager = SessionManager::new(tmp.path().join("sessions")).expect("manager");
+        let workspace = tmp.path().join("ws");
+        fs::create_dir_all(&workspace).expect("workspace");
+        let session = write_prior_interrupted_session(&manager, "sess-load", &workspace);
+        let managed = manager.validated_session_path("sess-load").expect("path");
+        let foreign = tmp.path().join("exported.json");
+        fs::write(&foreign, serde_json::to_vec(&session).expect("json")).expect("export");
+
+        let lease = hold_live_lease(&manager, "sess-load");
+        for path in [&managed, &foreign] {
+            let error = manager
+                .attach_session_file(session.clone(), path)
+                .expect_err("a session open elsewhere is not loaded");
+            assert_eq!(
+                error.kind(),
+                io::ErrorKind::ResourceBusy,
+                "{}",
+                path.display()
+            );
+        }
+        assert!(!is_live_session("sess-load"), "nothing was claimed");
+
+        drop(lease);
+        for path in [&managed, &foreign] {
+            let (loaded, reserved) = manager
+                .attach_session_file(session.clone(), path)
+                .expect("loads once the other window has closed");
+            assert_eq!(loaded.metadata.id, "sess-load");
+            assert!(
+                !try_lock_elsewhere(&manager, "sess-load"),
+                "the load holds the lease"
+            );
+            drop(reserved);
+        }
+        set_live_session(None);
+    }
+
+    /// A lease that cannot be taken is an error, not an unguarded attach.
+    #[cfg(unix)]
+    #[test]
+    fn attach_fails_closed_when_the_lease_cannot_be_taken() {
+        let _env = crate::test_support::lock_test_env();
+        let tmp = tempdir().expect("tempdir");
+        let sessions_dir = tmp.path().join("sessions");
+        let manager = SessionManager::new(sessions_dir.clone()).expect("manager");
+        let workspace = tmp.path().join("ws");
+        fs::create_dir_all(&workspace).expect("workspace");
+        write_prior_interrupted_session(&manager, "sess-x", &workspace);
+        // The lease directory is a regular file: no lock file can be opened.
+        let _ = fs::remove_dir_all(sessions_dir.join(LATE_USAGE_DIR));
+        fs::write(sessions_dir.join(LATE_USAGE_DIR), "").expect("block lease dir");
+
+        let error = manager
+            .attach_session("sess-x")
+            .expect_err("no lease, no attach");
+        assert!(error.to_string().contains("live lease"), "{error}");
+        assert!(!is_live_session("sess-x"), "nothing was claimed");
+    }
+
+    /// A liveness probe from another process briefly holds the lease lock. A
+    /// claim that lost that race once must take the lease on a later save,
+    /// not run unleased for the whole session.
+    #[test]
+    fn a_claim_that_lost_a_probe_race_takes_the_lease_later() {
+        let _env = crate::test_support::lock_test_env();
+        let tmp = tempdir().expect("tempdir");
+        let manager = SessionManager::new(tmp.path().join("sessions")).expect("manager");
+
+        let probe = hold_live_lease(&manager, "sess-a");
+        manager.claim_live_session("sess-a");
+        drop(probe);
+        assert!(
+            try_lock_elsewhere(&manager, "sess-a"),
+            "the first claim lost"
+        );
+
+        manager.claim_live_session("sess-a");
+        assert!(
+            !try_lock_elsewhere(&manager, "sess-a"),
+            "the next claim takes the lease"
+        );
+        set_live_session(None);
+    }
+
+    /// Whether another open file description can lock `id`'s lease now.
+    fn try_lock_elsewhere(manager: &SessionManager, id: &str) -> bool {
+        let lease = open_private_read_file(&manager.live_lease_path(id, false).expect("path"))
+            .expect("lease file");
+        crate::runtime_threads::try_lock_file_exclusive(&lease).expect("lock")
+    }
+
     #[test]
     fn interrupted_workspace_session_ignores_settled_sessions() {
         let tmp = tempdir().expect("tempdir");
@@ -7510,6 +8929,41 @@ mod tests {
         assert_eq!(extracted.total_tokens, 4096);
     }
 
+    /// A 64 KB read prefix routinely ends inside a multi-byte character in a
+    /// CJK or emoji transcript. The metadata ahead of the cut is intact and
+    /// must still be read from the prefix, not force a full-file read.
+    #[test]
+    fn extract_top_level_metadata_survives_a_prefix_cut_inside_a_character() {
+        let json = format!(
+            r#"{{"schema_version":1,"metadata":{{"id":"cjk-1","title":"会话","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-02T00:00:00Z","message_count":3,"total_tokens":10,"model":"m","workspace":"/tmp"}},"messages":[{{"role":"user","content":"{}"}}]}}"#,
+            "中文".repeat(100)
+        );
+        let bytes = json.as_bytes();
+        let body_start = json.find("中文").expect("body");
+        // One byte into a three-byte character.
+        let cut = &bytes[..body_start + 1];
+        assert!(
+            std::str::from_utf8(cut).is_err(),
+            "the cut splits a character"
+        );
+
+        let extracted = extract_top_level_metadata(cut).expect("metadata from the cut prefix");
+        assert_eq!(extracted.id, "cjk-1");
+        assert_eq!(extracted.title, "会话");
+    }
+
+    /// Only a cut at the end of the prefix is trimmed. An invalid byte ahead
+    /// of it is a damaged file, left to the full read to report.
+    #[test]
+    fn extract_top_level_metadata_rejects_invalid_utf8_inside_the_prefix() {
+        let json = r#"{"schema_version":1,"metadata":{"id":"bad-1","title":"t","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-02T00:00:00Z","message_count":3,"total_tokens":10,"model":"m","workspace":"/tmp"},"messages":[{"role":"user","content":"AB"}]}"#;
+        let mut bytes = json.as_bytes().to_vec();
+        let body = json.find("AB").expect("body");
+        bytes[body] = 0xFF;
+
+        assert!(extract_top_level_metadata(&bytes).is_none());
+    }
+
     #[test]
     fn extract_top_level_metadata_handles_braces_inside_strings() {
         // A title containing `{` and `}` inside the metadata block must
@@ -7754,6 +9208,61 @@ mod tests {
     }
 
     #[test]
+    fn stub_retention_removes_legacy_named_stub_instead_of_warning_forever() {
+        // Founder run 2026-09-28: `session_<timestamp>.json` stubs from early
+        // builds carry a uuid id, so removal by id hit NotFound and the same
+        // two stubs were re-listed and warned about on every launch.
+        let tmp = tempdir().expect("tempdir");
+        let manager = SessionManager::new(tmp.path().join("sessions")).expect("manager");
+        let legacy_id = Uuid::new_v4().to_string();
+        write_empty_session_record(
+            &manager,
+            &legacy_id,
+            Path::new("/tmp"),
+            Utc::now() - chrono::Duration::days(120),
+        );
+        let legacy_path = manager.sessions_dir.join("session_20260526_133732.json");
+        fs::rename(
+            manager.validated_session_path(&legacy_id).expect("path"),
+            &legacy_path,
+        )
+        .expect("rename to legacy name");
+        for index in 0..MAX_EMPTY_SESSION_STUBS {
+            write_empty_session_record(
+                &manager,
+                &Uuid::new_v4().to_string(),
+                Path::new("/tmp"),
+                Utc::now() - chrono::Duration::minutes(index as i64),
+            );
+        }
+        // Every save runs retention, so the newer stubs above already pushed
+        // the legacy one past the stub cap; run it once more explicitly.
+        manager.cleanup_old_sessions().expect("retention");
+
+        assert!(
+            !legacy_path.exists(),
+            "retention retires the file it listed, not `<id>.json`"
+        );
+        let listed = manager.list_sessions().expect("sessions");
+        assert_eq!(listed.len(), MAX_EMPTY_SESSION_STUBS);
+        assert!(listed.iter().all(|session| session.id != legacy_id));
+    }
+
+    #[test]
+    fn stub_retention_treats_an_already_removed_stub_as_removed() {
+        let tmp = tempdir().expect("tempdir");
+        let manager = SessionManager::new(tmp.path().join("sessions")).expect("manager");
+        let id = Uuid::new_v4().to_string();
+        let canonical = manager.validated_session_path(&id).expect("path");
+        manager
+            .retire_empty_stub(&canonical, &id)
+            .expect("a stub gone before removal ran is already removed");
+        manager
+            .retire_empty_stub(&manager.sessions_dir.join("session_gone.json"), &id)
+            .expect("a legacy stub gone before removal ran is already removed");
+    }
+
+    #[test]
     fn prune_sessions_older_than_returns_zero_for_empty_dir() {
         let tmp = tempdir().expect("tempdir");
         let manager = SessionManager::new(tmp.path().join("sessions")).expect("new");
@@ -7846,10 +9355,19 @@ mod tests {
         let manager = SessionManager::new(sessions_dir.clone()).expect("new");
         let checkpoint_dir = sessions_dir.join("checkpoints");
         fs::create_dir_all(&checkpoint_dir).expect("mkdir checkpoints");
-        // Drop a stale-looking JSON inside the checkpoint dir; prune
-        // should leave it alone.
-        let checkpoint_file = checkpoint_dir.join("latest.json");
-        fs::write(&checkpoint_file, "{}").expect("write checkpoint");
+        // Drop a legacy checkpoint inside the checkpoint dir; prune should
+        // leave it alone. It belongs to a readable, unrelated origin: an
+        // unreadable origin makes retention fail closed instead (see
+        // `retention_fails_closed_on_an_unreadable_legacy_checkpoint_origin`).
+        let checkpoint_file = checkpoint_dir.join(LEGACY_CHECKPOINT_FILE);
+        let unrelated = save_late_usage_test_session(&manager, "unrelated-origin");
+        write_atomic(
+            &checkpoint_file,
+            serialize_saved_session(unrelated)
+                .expect("legacy bytes")
+                .as_bytes(),
+        )
+        .expect("write checkpoint");
 
         write_session_with_updated_at(&manager, "stale", Utc::now() - chrono::Duration::days(60));
         let pruned = manager

@@ -10,9 +10,16 @@ on:
   workflow_dispatch:
     inputs:
       expected_sha:
-        description: Exact 40-character commit selected by --ref (manual runs always force full CI)
+        description: Exact 40-character commit selected by --ref (manual runs force all CI gates)
         required: true
         type: string
+      workspace_test_mode:
+        description: Workspace runner (shared-process qualification uses Ubuntu only; other gates still run)
+        type: choice
+        default: nextest
+        options:
+          - nextest
+          - shared-process-twice
 
 permissions:
   contents: read
@@ -152,10 +159,10 @@ jobs:
             # heavy by default. .github/scripts/release-workflows.test.js
             # fails if an include_str!/include_bytes! target classifies light.
             case "${path}" in
-              scripts/release/npm-wrapper-smoke.js|scripts/mobile-smoke.sh|scripts/check-provider-registry.py)
+              scripts/release/npm-wrapper-smoke.js|scripts/mobile-smoke.sh|scripts/check-provider-registry.py|scripts/check-config-example.py)
                 heavy=true
                 ;;
-              crates/*|docs/HOOKS.md|docs/KEYBINDINGS.md|docs/TELEMETRY.md|docs/FLEET_WORKFLOW_TUTORIAL.md|docs/zh_hans/FLEET.md|docs/2512.24601v2.pdf|docs/cloud-facts/*|docs/examples/*)
+              crates/*|docs/HOOKS.md|docs/KEYBINDINGS.md|docs/TELEMETRY.md|docs/FLEET.md|docs/FLEET_WORKFLOW_TUTORIAL.md|docs/zh_hans/FLEET.md|docs/2512.24601v2.pdf|docs/cloud-facts/*|docs/examples/*)
                 heavy=true
                 ;;
               docs/*|*.md|packaging/aur/*|.github/PULL_REQUEST_TEMPLATE.md|.github/ISSUE_TEMPLATE/*|.github/scripts/agent-task-metadata.test.sh|.github/workflows/agent-task-labels.yml|.github/workflows/auto-tag.yml|.github/workflows/stale.yml|.github/workflows/triage.yml|scripts/release/check-versions.sh|scripts/release/check-ohos-deps.sh|scripts/release/install-dogfood.sh|scripts/release/install-dogfood.test.sh|scripts/release/prepare-release.sh|scripts/release/prepare-release.test.sh|scripts/dev-cache.sh|scripts/dev-cache.test.sh|scripts/dev-cargo.sh|scripts/dev-test.sh)
@@ -180,7 +187,7 @@ jobs:
                 ;;
             esac
             case "${path}" in
-              .github/workflows/*|.github/actionlint.yml)
+              .github/workflows/*|.github/actionlint.yml|action.yml|scripts/github-action/*)
                 actions=true
                 ;;
             esac
@@ -262,6 +269,7 @@ jobs:
           node .github/scripts/release-workflows.test.js
           node --test scripts/release/assemble-release-assets.test.js
           node --test scripts/release/ensure-release-assets-absent.test.js
+          node --test scripts/release/verify-release-inventory.test.js
       - name: Run runtime web client tests
         # crates/tui/tests/runtime_web_client.test.mjs exercises the embedded
         # web client's event/snapshot state machine; it ran nowhere before.
@@ -292,9 +300,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+      - name: Check Lighthouse SSH policy
+        run: python3 scripts/tencent-lighthouse/test_bootstrap_ssh.py
       - uses: actions/setup-node@v7
         with:
           node-version: 22
+      - name: Test reusable GitHub review action
+        run: node --test scripts/github-action/*.test.mjs
       - name: Run Runtime SDK runtime and type tests
         run: |
           npm ci --ignore-scripts --workspace @codewhale/runtime-sdk
@@ -338,6 +350,19 @@ jobs:
           npm run typecheck
           npm run build
           git diff --exit-code -- dist
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          # The validated floor (`BUN_MIN_VERSION_FOR_EXTENSION_HOST`).
+          bun-version: 1.4.0
+      - name: Run extension host suites on Bun
+        # Bun is an opt-in host runtime (`runtime = "bun"` or `"auto"`);
+        # Node stays the default. The same suites spawn the committed bundle
+        # under `bun test`, with Bun's launch flags. This leg runs the JS
+        # suites only; the Rust host tests run on Node.
+        run: |
+          set -euo pipefail
+          cd crates/tui/extension-host
+          npm run test:bun
 
   vscode-extension:
     name: VS Code extension
@@ -490,7 +515,9 @@ jobs:
         run: sccache --show-stats
       - name: Check provider registry drift
         if: needs.changes.outputs.heavy == 'true'
-        run: python3 scripts/check-provider-registry.py
+        run: |
+          python3 scripts/check-provider-registry.py
+          python3 scripts/check-config-example.py
       - name: Check the offline model seed is generated
         if: needs.changes.outputs.heavy == 'true'
         # crates/config/assets/models_dev.bundled.json is rendered from
@@ -734,8 +761,10 @@ jobs:
       fail-fast: false
       matrix:
         # Linux workspace tests run directly for pull requests. CNB remains
-        # the Linux lane for non-PR release/main pushes.
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        # the Linux lane for non-PR release/main pushes. The explicit manual
+        # libtest qualification uses one hosted Ubuntu job, never a fork PR or
+        # self-hosted runner; normal dispatches and PRs keep all three legs.
+        os: ${{ fromJSON(github.event_name == 'workflow_dispatch' && inputs.workspace_test_mode == 'shared-process-twice' && '["ubuntu-latest"]' || '["ubuntu-latest","macos-latest","windows-latest"]') }}
     steps:
       - name: Skip tests for light change
         if: needs.changes.outputs.heavy != 'true'
@@ -809,6 +838,25 @@ jobs:
             sleep 15
           done
           sudo apt-get install -y libdbus-1-dev pkg-config
+      - name: Ubuntu build headroom
+        # The combined wave/0.10.1-next workspace build was terminated
+        # mid-compile on every PR run ("runner has received a shutdown
+        # signal", exit 143, no newer push to cancel it) while single-fix PRs
+        # finished the same build in ~10 minutes. Drop preinstalled SDKs this
+        # job never uses and add swap so the full --all-features test build
+        # has disk and memory headroom; the Run tests step logs both.
+        if: needs.changes.outputs.heavy == 'true' && matrix.os == 'ubuntu-latest' && (github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request')
+        shell: bash
+        run: |
+          df -h / /mnt; free -m
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          if sudo fallocate -l 8G /mnt/cw-swapfile && sudo chmod 600 /mnt/cw-swapfile \
+            && sudo mkswap /mnt/cw-swapfile >/dev/null && sudo swapon /mnt/cw-swapfile; then
+            echo "Added 8 GiB swap at /mnt/cw-swapfile"
+          else
+            echo "::warning::Could not add swap; continuing with the runner default"
+          fi
+          df -h / /mnt; free -m
       - uses: Swatinem/rust-cache@v2
         if: needs.changes.outputs.heavy == 'true' && (matrix.os != 'ubuntu-latest' || github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request')
         with:
@@ -864,9 +912,22 @@ jobs:
         # binary and bounds the integration binary that spawns the real
         # executable; retries are off, so a flake is a red run, not a hidden
         # one. nextest does not run doctests — the next step keeps them.
-        if: needs.changes.outputs.heavy == 'true' && (matrix.os != 'ubuntu-latest' || github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request')
+        if: needs.changes.outputs.heavy == 'true' && (matrix.os != 'ubuntu-latest' || github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request') && !(github.event_name == 'workflow_dispatch' && inputs.workspace_test_mode == 'shared-process-twice')
         shell: bash
-        run: sh scripts/with-hermetic-test-home.sh cargo nextest run --workspace --all-features --locked --profile ci
+        run: |
+          monitor=
+          if [ "$RUNNER_OS" = Linux ]; then
+            # Headroom trace: if the runner is terminated again, the last lines
+            # say whether memory or disk ran out.
+            ( while sleep 30; do
+                echo "[headroom] $(free -m | awk '/^Mem:/{print "mem used " $3 "/" $2 " MiB"} /^Swap:/{print "swap used " $3 "/" $2 " MiB"}' | paste -sd ' ') disk free $(df -h / | awk 'NR==2{print $4}')"
+              done ) &
+            monitor=$!
+          fi
+          status=0
+          sh scripts/with-hermetic-test-home.sh cargo nextest run --workspace --all-features --locked --profile ci || status=$?
+          if [ -n "$monitor" ]; then kill "$monitor" 2>/dev/null || true; fi
+          exit "$status"
         env:
           CODEWHALE_EXT_HOST_TESTS: '1'
           # sccache 0.17 panics resolving its config directory under the
@@ -890,8 +951,117 @@ jobs:
           # forced 32 MiB lives in spawned binaries, which size their own
           # stacks explicitly and never read this variable.
           RUST_MIN_STACK: '16777216'
+      - name: Shared-process workspace qualification
+        if: github.event_name == 'workflow_dispatch' && inputs.workspace_test_mode == 'shared-process-twice' && matrix.os == 'ubuntu-latest'
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ inputs.expected_sha }}
+          CODEWHALE_EXT_HOST_TESTS: '1'
+          RUST_MIN_STACK: '16777216'
+          RUSTFLAGS: ''
+          CARGO_ENCODED_RUSTFLAGS: ''
+          RUSTC_WRAPPER: ''
+          CARGO_TERM_COLOR: never
+        run: |
+          set -euo pipefail
+          umask 077
+          evidence="$RUNNER_TEMP/shared-process-workspace"
+          mkdir -p "$evidence"
+          unset RUST_TEST_THREADS
+          if [[ ! "$EXPECTED_SHA" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "::error::expected_sha must be a full 40-character commit SHA." | tee "$evidence/preflight-error.txt"
+            exit 1
+          fi
+          expected="$(printf '%s' "$EXPECTED_SHA" | tr '[:upper:]' '[:lower:]')"
+          if [[ "$(git rev-parse HEAD)" != "$expected" || "$GITHUB_SHA" != "$expected" ]]; then
+            echo "::error::Qualification checkout does not match the exact dispatch SHA." | tee "$evidence/preflight-error.txt"
+            exit 1
+          fi
+          {
+            printf 'commit=%s\ntree=%s\n' "$expected" "$(git rev-parse 'HEAD^{tree}')"
+            rustc -Vv
+            cargo -V
+            uname -a
+            printf 'available_cpus=%s\n' "$(getconf _NPROCESSORS_ONLN)"
+            printf 'runner_os=%s\nrunner_arch=%s\n' "$RUNNER_OS" "$RUNNER_ARCH"
+            printf 'image_os=%s\nimage_version=%s\n' "${ImageOS:-unknown}" "${ImageVersion:-unknown}"
+            printf 'RUST_MIN_STACK=%s\nCARGO_INCREMENTAL=%s\nCARGO_BUILD_JOBS=%s\n' \
+              "$RUST_MIN_STACK" "${CARGO_INCREMENTAL:-default}" "${CARGO_BUILD_JOBS:-default}"
+            printf '%s\n' 'RUST_TEST_THREADS=unset (default libtest concurrency)' \
+              'RUSTFLAGS=empty; CARGO_ENCODED_RUSTFLAGS=empty; RUSTC_WRAPPER=empty' \
+              'command=sh scripts/with-hermetic-test-home.sh cargo test --workspace --all-features --locked -- --format=pretty'
+          } > "$evidence/environment.txt"
+          cat > "$evidence/required-tests.txt" <<'EOF'
+          remote_control::tests::classic_recovery_uses_persisted_seq_floor_and_ignores_older_terminal
+          remote_control::tests::actual_start_reclaims_runtime_chat_writer_before_worker_spawn
+          remote_control::tests::separate_predispatch_crashes_on_one_run_get_distinct_recovery_turn_ids
+          runtime_api::tests::events_endpoint_respects_since_seq_cursor
+          runtime_threads::tests::approval_required_awaits_external_decision_allow
+          runtime_threads::tests::approval_remember_grants_tool_class_without_changing_posture
+          tools::subagent::budget_handback_tests::budget_handback_inflight_wall_timeout_persists_unreported_usage
+          tools::subagent::tests::child_permission_gate::wall_deadline_ends_pending_wait_with_receipt
+          tools::subagent::tests::resume_keeps_recorded_reasoning_in_manifest_and_request_after_parent_changes
+          EOF
+          failed=0
+          # Two fixed attempts, not retry-until-green. Preserve both native
+          # outcomes even when the first run fails; missing identities fail too.
+          for run in 1 2; do
+            if [[ "$(git rev-parse HEAD)" != "$expected" ]] || \
+              ! git diff --quiet || ! git diff --cached --quiet; then
+              printf 'run=%s not_run=source_changed\n' "$run" >> "$evidence/results.txt"
+              failed=1
+              continue
+            fi
+            qualification_tmp=$(mktemp -d /tmp/cw69.XXXXXX)
+            printf 'run=%s start=%s tmpdir=%s\n' "$run" "$(date -u +%FT%TZ)" "$qualification_tmp" >> "$evidence/results.txt"
+            set +e
+            TMPDIR="$qualification_tmp" sh scripts/with-hermetic-test-home.sh cargo test --workspace --all-features --locked -- --format=pretty \
+              2>&1 | tee "$evidence/run-$run.log"
+            pipeline_status=("${PIPESTATUS[@]}")
+            set -e
+            printf 'run=%s cargo_exit=%s log_exit=%s end=%s\n' \
+              "$run" "${pipeline_status[0]}" "${pipeline_status[1]}" "$(date -u +%FT%TZ)" >> "$evidence/results.txt"
+            if [[ "${pipeline_status[0]}" != 0 || "${pipeline_status[1]}" != 0 ]]; then
+              failed=1
+            fi
+            while IFS= read -r identity; do
+              if grep -Fxq "test $identity ... ok" "$evidence/run-$run.log"; then
+                printf 'run=%s test=%s result=ok\n' "$run" "$identity" >> "$evidence/results.txt"
+              else
+                printf 'run=%s test=%s result=missing_pass\n' "$run" "$identity" >> "$evidence/results.txt"
+                failed=1
+              fi
+            done < "$evidence/required-tests.txt"
+            if [[ "$(git rev-parse HEAD)" != "$expected" ]] || \
+              ! git diff --quiet || ! git diff --cached --quiet; then
+              printf 'run=%s source_changed=true\n' "$run" >> "$evidence/results.txt"
+              failed=1
+            fi
+            # Plugin fixtures can leave read-only directories outside HOME.
+            # Change only owned directories; never follow links or chmod files.
+            permission_exit=0
+            find -P "$qualification_tmp" -type d -exec chmod u+w {} + || permission_exit=$?
+            cleanup_exit=0
+            rm -rf -- "$qualification_tmp" || cleanup_exit=$?
+            printf 'run=%s permission_exit=%s cleanup_exit=%s\n' \
+              "$run" "$permission_exit" "$cleanup_exit" >> "$evidence/results.txt"
+            if [[ "$permission_exit" != 0 || "$cleanup_exit" != 0 ]]; then
+              failed=1
+            fi
+          done
+          cat "$evidence/results.txt"
+          exit "$failed"
+      - name: Retain shared-process qualification evidence
+        if: always() && github.event_name == 'workflow_dispatch' && inputs.workspace_test_mode == 'shared-process-twice' && matrix.os == 'ubuntu-latest'
+        uses: actions/upload-artifact@v7
+        with:
+          name: shared-process-workspace-${{ github.sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/shared-process-workspace/
+          if-no-files-found: error
+          retention-days: 30
       - name: Run doctests
-        if: needs.changes.outputs.heavy == 'true' && (matrix.os != 'ubuntu-latest' || github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request')
+        # The shared-process command already includes every workspace doctest.
+        if: needs.changes.outputs.heavy == 'true' && (matrix.os != 'ubuntu-latest' || github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request') && !(github.event_name == 'workflow_dispatch' && inputs.workspace_test_mode == 'shared-process-twice')
         shell: bash
         run: sh scripts/with-hermetic-test-home.sh cargo test --workspace --all-features --locked --doc
         env:
@@ -947,7 +1117,9 @@ jobs:
     # main still runs it; a regression shows up on the merge that caused it.
     name: macOS budget and eval (fork PR)
     needs: changes
-    if: needs.changes.outputs.heavy == 'true' && github.event_name != 'pull_request' && !(needs.changes.outputs.trusted == 'true' && vars.CW_SELF_HOSTED_MAC == 'true')
+    # The explicit Ubuntu-only qualification has no warm Test macOS leg, so
+    # retain these gates on the hosted fallback even when self-hosting is on.
+    if: needs.changes.outputs.heavy == 'true' && github.event_name != 'pull_request' && ((github.event_name == 'workflow_dispatch' && inputs.workspace_test_mode == 'shared-process-twice') || !(needs.changes.outputs.trusted == 'true' && vars.CW_SELF_HOSTED_MAC == 'true'))
     timeout-minutes: 75
     runs-on: macos-latest
     steps:

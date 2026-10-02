@@ -228,6 +228,9 @@ pub struct RuntimeApiState {
     /// branch) so a precondition check and its write are atomic with respect
     /// to other windows on the same server (#6647).
     git_writes: Arc<tokio::sync::Mutex<()>>,
+    /// Serializes provider switches: each one saves, applies and, when the
+    /// apply is refused, takes back its own save before the next one starts.
+    provider_switches: Arc<tokio::sync::Mutex<()>>,
     #[cfg(test)]
     compat_stream_test_hook: Option<tokio::sync::mpsc::UnboundedSender<CompatStreamTestPoint>>,
 }
@@ -1046,6 +1049,9 @@ fn open_runtime_threads_for_server(
     Ok((manager, workshop_activation))
 }
 
+/// Prefix of the first line the Runtime prints once it holds its listener.
+pub const RUNTIME_LISTENING_PREFIX: &str = "Runtime API listening on http://";
+
 /// Start the runtime API server.
 pub async fn run_http_server(
     config: Config,
@@ -1054,6 +1060,17 @@ pub async fn run_http_server(
     options: RuntimeApiOptions,
 ) -> Result<()> {
     validate_runtime_listener_security(&options)?;
+
+    // Own the endpoint before building anything that names it: with an
+    // ephemeral port (`--port 0`) the kernel picks the port, and the address
+    // this process reports is the one it actually holds.
+    let addr = runtime_bind_address(&options.host, options.port)?;
+    let listener = TcpListener::bind(addr)
+        .await
+        .with_context(|| format!("Failed to bind {addr}"))?;
+    let bound_addr = listener
+        .local_addr()
+        .context("Failed to read Runtime API listener address")?;
 
     // Keep the server usable before a local catalog arrives. Omitted API
     // requests are checked at admission; background tasks keep the auto sentinel.
@@ -1119,6 +1136,17 @@ pub async fn run_http_server(
         .context("load persistent Skill activation state for Runtime API")?;
     let sub_agent_manager = runtime_api_sub_agent_manager(&workspace, options.workers);
     let shutdown = RuntimeServerShutdown::default();
+    // Opening a thread is every client's first read, and the store can only
+    // answer it after one pass over the whole items directory (an item's
+    // filename names the item, not its turn). Every open used to pay that pass;
+    // here it is paid once, while the server is starting and nobody is waiting
+    // for it. See [`RuntimeThreadStore::ensure_item_index`].
+    let warm_threads = runtime_threads.clone();
+    tokio::task::spawn_blocking(move || {
+        if let Err(error) = warm_threads.warm_item_index() {
+            tracing::warn!(%error, "thread item index warm-up failed");
+        }
+    });
     let state = RuntimeApiState {
         config: Arc::new(parking_lot::RwLock::new(config.clone())),
         workspace,
@@ -1135,7 +1163,7 @@ pub async fn run_http_server(
         skill_state: Arc::new(Mutex::new(skill_state)),
         auth_required: auth_enabled,
         bind_host: options.host.clone(),
-        bind_port: options.port,
+        bind_port: bound_addr.port(),
         mobile_enabled: options.mobile,
         mobile,
         web,
@@ -1145,20 +1173,16 @@ pub async fn run_http_server(
         computer: computer_display::ComputerState::from_env(),
         shutdown: shutdown.clone(),
         git_writes: Arc::new(tokio::sync::Mutex::new(())),
+        provider_switches: Arc::new(tokio::sync::Mutex::new(())),
         #[cfg(test)]
         compat_stream_test_hook: None,
     };
     let app = build_router(state);
 
-    let addr = runtime_bind_address(&options.host, options.port)?;
-    let listener = TcpListener::bind(addr)
-        .await
-        .with_context(|| format!("Failed to bind {addr}"))?;
-
-    let bound_addr = listener
-        .local_addr()
-        .context("Failed to read Runtime API listener address")?;
-    println!("Runtime API listening on http://{bound_addr}");
+    // First stdout line, flushed: a supervising parent reads the endpoint
+    // from here instead of guessing a port (stdout is block-buffered on a pipe).
+    println!("{RUNTIME_LISTENING_PREFIX}{bound_addr}");
+    let _ = std::io::Write::flush(&mut std::io::stdout());
     for line in runtime_auth_status_lines(&resolved_auth) {
         println!("{line}");
     }
@@ -1201,7 +1225,7 @@ pub async fn run_http_server(
         println!(
             "  /v1/runtime/info reports bind_host={host:?}, port={port}, auth_required={auth}.",
             host = options.host,
-            port = options.port,
+            port = bound_addr.port(),
             auth = auth_enabled,
         );
     }
@@ -1220,7 +1244,10 @@ pub async fn run_http_server(
 /// overlay transport, so a non-loopback listener would expose the Runtime API
 /// to peers that can observe or replay browser traffic.
 fn validate_runtime_listener_security(options: &RuntimeApiOptions) -> Result<()> {
-    if options.port == 0 {
+    // Port 0 asks the kernel for an ephemeral port. Only a plain loopback
+    // Runtime may use it: web and mobile clients are given a fixed endpoint.
+    if options.port == 0 && (options.web || options.mobile || !is_loopback_bind_host(&options.host))
+    {
         bail!("Port must be > 0");
     }
     if options.web && options.host != "127.0.0.1" {
@@ -3761,9 +3788,7 @@ async fn list_skills(
     let (skills_dir, mode) = {
         let config = state.config.read();
         let skills_dir = resolve_skills_dir(&config, &state.workspace);
-        let mode = crate::skills::SkillDiscoveryMode::from_codewhale_only(
-            config.skills_config().scan_codewhale_only(),
-        );
+        let mode = crate::skills::SkillDiscoveryMode::from_config(&config.skills_config());
         (skills_dir, mode)
     };
     let plugin_registry = state
@@ -3812,7 +3837,8 @@ async fn list_skills(
                 plugin_id,
                 plugin_generation,
                 plugin_content_hash,
-                enabled: skill_state.is_enabled(&skill.name),
+                enabled: skill_state
+                    .is_enabled_with_legacy(&skill.name, skill.legacy_activation_name.as_deref()),
                 is_bundled: skill_entry_is_bundled(skill, &skills_dir),
             }
         })
@@ -3833,9 +3859,7 @@ async fn set_skill_enabled(
     let (skills_dir, mode) = {
         let config = state.config.read();
         let skills_dir = resolve_skills_dir(&config, &state.workspace);
-        let mode = crate::skills::SkillDiscoveryMode::from_codewhale_only(
-            config.skills_config().scan_codewhale_only(),
-        );
+        let mode = crate::skills::SkillDiscoveryMode::from_config(&config.skills_config());
         (skills_dir, mode)
     };
     let plugin_registry = state
@@ -7155,6 +7179,7 @@ async fn complete_thread_goal(
         .transition_goal_status(
             &id,
             &goal.goal_id,
+            goal.status.clone(),
             codewhale_protocol::ThreadGoalStatus::Complete,
         )
         .await
@@ -7207,6 +7232,7 @@ async fn block_thread_goal(
         .transition_goal_status(
             &id,
             &goal.goal_id,
+            goal.status.clone(),
             codewhale_protocol::ThreadGoalStatus::Blocked,
         )
         .await
@@ -8159,6 +8185,10 @@ fn resolve_skills_dir(config: &Config, workspace: &std::path::Path) -> PathBuf {
             return config.skills_dir();
         }
         if let Some(codewhale_skills_dir) = crate::skills::codewhale_workspace_skills_dir(workspace)
+            && crate::skills::skills_dir_allowed_by_workspace_trust(
+                workspace,
+                &codewhale_skills_dir,
+            )
             && let Ok(canonical_skills) = fs::canonicalize(&codewhale_skills_dir)
         {
             return canonical_skills;
@@ -8175,8 +8205,11 @@ fn resolve_skills_dir(config: &Config, workspace: &std::path::Path) -> PathBuf {
         Err(_) => return config.skills_dir(),
     };
     for candidate in [
-        canonical_workspace.join(".agents").join("skills"),
-        canonical_workspace.join("skills"),
+        canonical_workspace.join(".codewhale/skills"),
+        canonical_workspace.join(".agents/skills"),
+        canonical_workspace.join(".claude/skills"),
+        canonical_workspace.join(".opencode/skills"),
+        canonical_workspace.join(".cursor/skills"),
     ] {
         // Re-canonicalize the candidate so a `.agents/skills` symlink to e.g.
         // `/etc` cannot promote arbitrary filesystem locations into the
@@ -8185,9 +8218,19 @@ fn resolve_skills_dir(config: &Config, workspace: &std::path::Path) -> PathBuf {
         if let Ok(canon) = fs::canonicalize(&candidate)
             && canon.starts_with(&canonical_workspace)
             && canon.is_dir()
+            && crate::skills::skills_dir_allowed_by_workspace_trust(workspace, &canon)
         {
             return canon;
         }
+    }
+    let flat = canonical_workspace.join("skills");
+    if config.skills_config().flat_workspace_root()
+        && let Ok(canonical) = fs::canonicalize(&flat)
+        && canonical.starts_with(&canonical_workspace)
+        && canonical.is_dir()
+        && crate::skills::skills_dir_allowed_by_workspace_trust(workspace, &canonical)
+    {
+        return canonical;
     }
     config.skills_dir()
 }
@@ -9375,6 +9418,9 @@ struct SwitchProviderResponse {
 ///   are committed together through the canonical Config writer.
 /// - Config is reloaded from disk and synced to active engines via
 ///   `runtime_threads.reload_config`, exactly like `POST /v1/config/reload`.
+/// - A reload that fails or is rejected rolls the persisted selection back
+///   (only while the file still holds what this write left), so disk and the
+///   running config never disagree about the provider. The error says which.
 async fn switch_provider(
     State(state): State<RuntimeApiState>,
     Path(id): Path<String>,
@@ -9454,43 +9500,89 @@ async fn switch_provider(
     // model arg) MUST NOT write a `model` key, otherwise the user's
     // per-provider `[providers.<id>].model` config gets overwritten with
     // whatever the runtime resolves as the default.
-    config_persistence::persist_provider_selection(
-        state.config_path.as_deref(),
-        target,
-        &provider_identity,
-        model_override.as_deref(),
-    )
-    .map_err(|e| ApiError::internal(format!("Failed to persist provider selection: {e}")))?;
+    // The save, the reload and the undo of a refused save run as one task
+    // detached from this request: a client that disconnects or times out
+    // mid-reload drops only its wait, never the undo, and never leaves the
+    // engines on the new config while `state.config` keeps the old one.
+    let task_state = state.clone();
+    let task_identity = provider_identity.clone();
+    let task_model = model_override.clone();
+    let runtime = tokio::runtime::Handle::current();
+    #[cfg(test)]
+    let env_ticket = crate::test_support::env_scope_ticket();
+    let (active_provider, active_model) = tokio::spawn(async move {
+        let state = task_state;
+        let _one_switch_at_a_time = state.provider_switches.lock().await;
+        // Keep the cancellation-safe owned switch, while all filesystem and
+        // keyring work runs off the async worker under the same serialization.
+        tokio::task::spawn_blocking(move || {
+            #[cfg(test)]
+            let _membership = crate::test_support::join_env_scope(env_ticket);
+            let (config_toml, undo) = config_persistence::persist_provider_selection(
+                state.config_path.as_deref(),
+                target,
+                &task_identity,
+                task_model.as_deref(),
+            )
+            .map_err(|e| ApiError::internal(format!("Failed to persist provider selection: {e}")))?;
 
-    // Reload config from disk and sync to active engines. This matches
-    // `POST /v1/config/reload` exactly: load → validate thread routes →
-    // swap in the new config. A failure here means an active thread's
-    // route is invalid under the new provider — surface it so the GUI can
-    // tell the user to fix their config.
-    let mut reloaded = Config::load(state.config_path.clone(), state.config_profile.as_deref())
-        .map_err(|e| ApiError::internal(format!("Failed to reload config: {e}")))?;
-    reloaded.account_model_access = state.config.read().account_model_access.clone();
-    state
-        .runtime_threads
-        .reload_config(reloaded.clone())
+            // Reload config from disk and sync to active engines. This matches
+            // `POST /v1/config/reload` exactly: load → validate thread routes →
+            // swap in the new config. A failure here means an active thread's
+            // route is invalid under the new provider — surface it so the GUI can
+            // tell the user to fix their config.
+            let applied =
+                match Config::load(state.config_path.clone(), state.config_profile.as_deref()) {
+                    Ok(mut reloaded) => {
+                        reloaded.account_model_access =
+                            state.config.read().account_model_access.clone();
+                        match runtime.block_on(state.runtime_threads.reload_config(reloaded.clone())) {
+                            Ok(_) => Ok(reloaded),
+                            Err(err) => Err(ApiError::bad_request(format!(
+                                "Config reload rejected: {err}"
+                            ))),
+                        }
+                    }
+                    Err(e) => Err(ApiError::internal(format!("Failed to reload config: {e}"))),
+                };
+            match applied {
+                // Report the route this switch applied, not whatever a later
+                // switch leaves in `state.config` by the time this reply is built.
+                Ok(reloaded) => {
+                    let provider = reloaded.api_provider();
+                    let model = provider_default_model_for_api(&reloaded, provider, provider);
+                    *state.config.write() = reloaded;
+                    Ok::<_, ApiError>((provider, model))
+                }
+                // A rejected switch must not stay on disk, or the next restart or
+                // reload silently applies the switch this response reports as
+                // refused. Only this save is taken back; a newer one wins.
+                Err(mut error) => {
+                    let path = config_toml.display();
+                    match undo.undo() {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            error.message = format!(
+                                "{}; {path} changed after this switch was saved, so the newer contents were kept",
+                                error.message
+                            );
+                        }
+                        Err(restore) => {
+                            error.message = format!(
+                                "{}; the provider selection could not be reverted in {path}: {restore}",
+                                error.message
+                            );
+                        }
+                    }
+                    Err(error)
+                }
+            }
+        })
         .await
-        .map_err(|err| ApiError::bad_request(format!("Config reload rejected: {err}")))?;
-    {
-        let mut config = state.config.write();
-        *config = reloaded;
-    }
-
-    // Read the resolved active model + provider from the freshly reloaded
-    // config. This is the value the GUI must display — NOT the catalog
-    // default and NOT the previously-active model.
-    let (active_provider, active_model) = {
-        let config = state.config.read();
-        let provider = config.api_provider();
-        (
-            provider,
-            provider_default_model_for_api(&config, provider, provider),
-        )
-    };
+        .map_err(|_| ApiError::internal("provider switch blocking task failed"))?
+    })
+    .await
+    .map_err(|_| ApiError::internal("provider switch task failed"))??;
 
     let model_available = !active_model.is_empty();
     // Name the route the user selected, not the kind it routes through: a
@@ -10600,7 +10692,8 @@ fn memory_hit_to_record(
 }
 
 /// Resolve a scope query parameter into a `MemoryScope` filter and an
-/// optional workspace_id.  `"all"` / absent → `(None, None)`.
+/// optional workspace_id. `"all"` / absent → `(None, None)`: each caller
+/// decides what "all" spans (see `list_memory` and `clear_memory`).
 fn resolve_memory_scope(
     scope_param: &Option<String>,
     workspace: &FsPath,
@@ -10610,10 +10703,15 @@ fn resolve_memory_scope(
         "global" => Ok((Some(crate::native_memory::MemoryScope::Global), None)),
         "workspace" => {
             let workspace_id = crate::native_memory::NativeMemoryStore::workspace_id(workspace)
-                .map_err(|e| ApiError::internal(format!("resolve workspace id: {e}")))?;
+                .map_err(|e| ApiError::internal(format!("resolve workspace id: {e}")))?
+                .ok_or_else(|| {
+                    ApiError::bad_request(
+                        "workspace scope requires a git repository with a remote origin",
+                    )
+                })?;
             Ok((
                 Some(crate::native_memory::MemoryScope::Workspace),
-                workspace_id,
+                Some(workspace_id),
             ))
         }
         other => Err(ApiError::bad_request(format!(
@@ -10626,7 +10724,8 @@ fn resolve_memory_scope(
 /// filtering.
 ///
 /// Query params:
-/// - `scope` — `"global"`, `"workspace"`, or `"all"` (default)
+/// - `scope` — `"global"`, `"workspace"`, or `"all"` (default: global memory
+///   plus this repository's workspace memory)
 /// - `q` — FTS search query (max 256 chars; omit to list all)
 /// - `limit` — max results (default 50, max 200)
 async fn list_memory(
@@ -10647,7 +10746,17 @@ async fn list_memory(
 
     let store = native_store_for_state(&state);
     let root = store.root().to_path_buf();
-    let (scope_filter, workspace_id) = resolve_memory_scope(&query.scope, &state.workspace)?;
+    let (scope_filter, mut workspace_id) = resolve_memory_scope(&query.scope, &state.workspace)?;
+    if scope_filter.is_none() {
+        // "all" is global memory plus this repository's. With no identity
+        // (no origin remote, or git unavailable) there is no workspace memory
+        // to show, and the listing still serves global memory.
+        workspace_id = crate::native_memory::NativeMemoryStore::workspace_id(&state.workspace)
+            .unwrap_or_else(|error| {
+                tracing::warn!("memory list shows global memory only: {error}");
+                None
+            });
+    }
 
     let hits = if let Some(ref q) = query.q {
         let q = q.trim();
@@ -10655,6 +10764,9 @@ async fn list_memory(
             return Err(ApiError::bad_request("q must be 1–256 characters"));
         }
         match scope_filter {
+            None if workspace_id.is_some() => {
+                store.search_in_workspace(workspace_id.as_deref(), &state.workspace, q, limit)
+            }
             None => store.search(q, limit),
             Some(crate::native_memory::MemoryScope::Global) => store.search(q, limit).map(|h| {
                 h.into_iter()
@@ -10750,7 +10862,9 @@ async fn create_memory_entry(
 /// `DELETE /v1/memory` — clear all memory entries for the given scope.
 ///
 /// The `scope` query parameter is required: `"global"`, `"workspace"`, or
-/// `"all"`.  This is a destructive, non-reversible operation.
+/// `"all"`. `"all"` clears every local scope, including other repositories'
+/// workspace memory, which is wider than what `GET` lists for `"all"`. This
+/// is a destructive, non-reversible operation.
 async fn clear_memory(
     State(state): State<RuntimeApiState>,
     Query(query): Query<ClearMemoryQuery>,
@@ -10819,6 +10933,7 @@ fn cors_layer(extra_origins: &[String]) -> CorsLayer {
         .allow_methods([
             Method::GET,
             Method::POST,
+            Method::PUT,
             Method::PATCH,
             Method::DELETE,
             Method::OPTIONS,
@@ -11130,6 +11245,7 @@ base_url = "http://127.0.0.1:9/v1"
             computer: computer_display::ComputerState::from_env(),
             shutdown: RuntimeServerShutdown::default(),
             git_writes: Arc::new(tokio::sync::Mutex::new(())),
+            provider_switches: Arc::new(tokio::sync::Mutex::new(())),
             compat_stream_test_hook: None,
         };
         let router = build_router(state.clone());

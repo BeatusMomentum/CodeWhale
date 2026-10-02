@@ -280,12 +280,12 @@ fn delete_lane_branch(repo_root: &Path, branch: &str) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::process::Command;
     use tempfile::tempdir;
 
-    fn init_repo(root: &Path) {
+    pub(crate) fn init_repo(root: &Path) {
         assert!(
             Command::new("git")
                 .args(["init", "-b", "main"])

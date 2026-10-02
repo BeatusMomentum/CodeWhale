@@ -1,10 +1,12 @@
 # CNB Cool mirror
 
+> 阅读简体中文版：[zh_hans/CNB_MIRROR.md](zh_hans/CNB_MIRROR.md)。
+
 `cnb.cool/codewhale.net/codewhale` is a one-way mirror of this
 GitHub repository for users on networks where GitHub is slow or blocked
 (primarily mainland China). The mirror receives every push to `main`, every
 `fix/*`, `rebrand/*`, and `work/v*` branch used for first-party release work,
-and every `v*` release tag.
+and each `v*` release tag after its complete GitHub Release is published.
 
 ## Provenance
 
@@ -29,10 +31,11 @@ sha256sum -c codewhale-artifacts-sha256.txt --ignore-missing
 The mirror is maintained by the [`Sync to CNB`](../.github/workflows/sync-cnb.yml)
 GitHub Actions workflow:
 
-- **Trigger:** `push` to `main`, `push` of any `v*` tag,
+- **Trigger:** `push` to `main`, the release workflow after canonical publication,
   release work branches matching `work/v*`, first-party fix and rebrand
   branches matching `fix/*` and `rebrand/*`, or `workflow_dispatch` for manual
-  recovery.
+  recovery. A tag push alone does not mirror a release tag. Manual tag recovery
+  also verifies the complete public GitHub asset inventory and immutable source.
 - **Auth:** HTTPS basic auth as user `cnb` with the `CNB_GIT_TOKEN`
   repository secret as the password.
 - **Scope:** only the ref that triggered the run is pushed. Tag pushes
@@ -65,6 +68,9 @@ release assets from source and publishes a CNB release with:
 This gives users who can reach CNB but not GitHub a CNB-native release path.
 GitHub remains the canonical macOS/Windows release matrix; the CNB tag pipeline
 is the China-friendly Linux x64 fallback.
+The GitHub release workflow calls the mirror only after publishing its complete,
+verified asset set. CNB cannot publish a version whose canonical release failed.
+An existing CNB tag must match; recovery never force-updates a release tag.
 
 ## CNB Linux CI and release preflight
 
@@ -210,7 +216,7 @@ Users behind GitHub-blocking networks can also select a source explicitly:
   `codewhale-tui` install is not required.
   Linux build-time dependencies (`build-essential`, `pkg-config`,
   `libdbus-1-dev` on Debian/Ubuntu) are required — see
-  [INSTALL.md](INSTALL.md#4-install-via-cargo-any-tier-1-rust-target).
+  [INSTALL.md](INSTALL.md#5-cargo-and-building-from-source).
 
 - **CNB release assets** for Linux x64, when the matching CNB tag pipeline has
   completed successfully. Download `codewhale-linux-x64`, `codew-linux-x64`,

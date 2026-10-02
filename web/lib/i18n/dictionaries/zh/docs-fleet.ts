@@ -1,14 +1,14 @@
 import type { DocsFleetDict } from "../types";
 
-/** 「运行 Workflow」页的简体中文词典；与 `en/docs-fleet.ts` 逐段对应。 */
+/** 「运行工作流」页的简体中文词典；与 `en/docs-fleet.ts` 逐段对应。 */
 export const docsFleet: DocsFleetDict = {
-  metaTitle: "运行 Workflow · Codewhale 文档",
+  metaTitle: "运行工作流 · Codewhale 文档",
   metaDescription:
-    "在 Fleet 中保存角色和模型，编写可重复的 Workflow，把它作为可查看、可停止的 Lane 运行，并用持久的 worker 批量执行任务。",
+    "在 Fleet 中保存角色和模型，编写可重复的工作流，把它作为可查看、可停止的 Lane 运行，并用持久的智能体批量执行任务。",
   bodyClassName: "text-ink-soft leading-[1.9] tracking-wide",
-  title: "运行 Workflow",
+  title: "运行工作流",
   lede:
-    "大多数多步骤工作，直接提出来就行：在 Operate 模式下，Codewhale 会自己规划步骤，并把彼此独立的步骤并行执行。如果你希望每次都按同一套有序计划来做——分阶段、并行分支、最后汇总——并且每次运行都留有记录，就写一个 Workflow。",
+    "大多数多步骤工作，直接提出来就行：在 Operate 模式下，Codewhale 会自己规划步骤，并把彼此独立的步骤并行执行。如果你希望每次都按同一套有序计划来做——分阶段、并行分支、最后汇总——并且每次运行都留有记录，就写一个工作流。",
   sections: [
     {
       id: "fleet",
@@ -22,16 +22,16 @@ export const docsFleet: DocsFleetDict = {
           p: "`/fleet setup` 会带你选定一个角色、它使用的模型（或“沿用会话的模型”），以及保存位置：当前项目，或者对所有仓库都生效的个人配置。写入之前你会看到完整的文件内容。`/fleet` 显示当前所选 Fleet 的成员，`/fleet saved` 用于在已命名的 Fleet 之间切换。",
         },
         {
-          p: "Fleet 只决定由谁来做。一个 worker 能读、能写、能运行什么，仍然取决于你的工作区信任、[审批设置](/docs/modes)和沙箱。",
+          p: "Fleet 只决定由谁来做。一个智能体能读、能写、能运行什么，仍然取决于你的工作区信任、[审批设置](/docs/modes)和沙箱。",
         },
       ],
     },
     {
       id: "write",
-      title: "编写 Workflow",
+      title: "编写工作流",
       blocks: [
         {
-          p: "Workflow 是放在仓库 `workflows/` 文件夹中的一个 JavaScript 文件。它只描述步骤，本身不干活。下面这个例子先并行审查两个部分，再汇总结论。把它保存为 `workflows/docs_readiness.workflow.js`：",
+          p: "工作流是放在仓库 `workflows/` 文件夹中的一个 JavaScript 文件。它只描述步骤，本身不干活。下面这个例子先并行审查两个部分，再汇总结论。把它保存为 `workflows/docs_readiness.workflow.js`：",
         },
         {
           code: `export default workflow({
@@ -62,10 +62,10 @@ export const docsFleet: DocsFleetDict = {
           lang: "workflows/docs_readiness.workflow.js",
         },
         {
-          p: "可用的步骤类型有 `agent`、`branch`、`sequence`、`reduce`、`loop_until`、`cond`、`expand` 和 `teacher_review`。Workflow 文件本身不能访问文件、shell 或网络，`import`、`fetch`、`eval` 和 `async` 都会被拒绝。真正干活的是它启动的 Agent，它们按你平常的权限运行。",
+          p: "可用的步骤类型有 `agent`、`branch`、`sequence`、`reduce`、`loop_until`、`cond`、`expand` 和 `teacher_review`。工作流文件本身不能访问文件、shell 或网络，`import`、`fetch`、`eval` 和 `async` 都会被拒绝。真正干活的是它启动的智能体，它们按你平常的权限运行。",
         },
         {
-          note: "一次运行最多可启动 1,000 个 Agent，同时工作的最多 16 个，其余排队等待。循环必须声明 `max_iterations`。",
+          note: "一次运行最多可启动 1,000 个智能体，同时工作的最多 16 个，其余排队等待。循环必须声明 `max_iterations`。",
         },
       ],
     },
@@ -79,13 +79,13 @@ codewhale workflow run docs-readiness --goal "prepare the 1.2 release" --verify`
           lang: "终端",
         },
         {
-          p: "Codewhale 会根据名字找到 `workflows/docs_readiness.workflow.js`，检查后启动。`--runtime inline` 在当前终端中运行；默认的 `tmux` 则在一个独立的 tmux 会话中运行，关闭终端后也会继续。`--verify` 会在成功完成后运行验证关卡，`--fleet <名称>` 则使用指定的 Fleet 而不是内置角色。",
+          p: "Codewhale 会根据名字找到 `workflows/docs_readiness.workflow.js`，检查后启动。`--runtime inline` 在当前终端中运行；默认的 `tmux` 则在一个独立的 tmux 会话中运行，关闭终端后也会继续。`--verify` 会在成功完成后运行验证关卡，`--fleet <name>` 则使用指定的 Fleet 而不是内置角色。",
         },
         {
-          p: "如果不想动到当前的工作副本，加上 `--worktree-repo . --branch <名称>`：这次运行会拥有自己的 git 工作树和分支。",
+          p: "如果不想动到当前的工作副本，加上 `--worktree-repo . --branch <name>`：这次运行会拥有自己的 git 工作树和分支。",
         },
         {
-          p: "在会话中，`/workflow` 用于启动 Workflow，`/workflows` 用于列出或取消本会话中的运行。",
+          p: "在会话中，`/workflow` 用于启动工作流，`/workflows` 用于列出或取消本会话中的运行。",
         },
       ],
     },
@@ -103,7 +103,7 @@ codewhale lane interrupt <lane-id>`,
           lang: "终端",
         },
         {
-          p: "`lane list`、`lane status` 和 `lane interrupt` 都支持 `--json`，会输出一份机器可读的收据。在会话中，`/lane` 提供同样的操作，结果也完全一致。",
+          p: "`lane list`、`lane status` 和 `lane interrupt` 都支持 `--json`，会输出一份机器可读的回执。在会话中，`/lane` 提供同样的操作，结果也完全一致。",
         },
       ],
     },
@@ -124,7 +124,7 @@ codewhale fleet stop --all`,
           lang: "终端",
         },
         {
-          p: "`fleet status` 会根据当前工作区的运行记录，统计排队中、运行中、已完成和失败的工作。笔记本休眠或管理进程退出后，`fleet resume` 能接着原来的运行继续，而不会新开一次。如果只想看挂在当前会话上的 Agent，用 `/fleet workers`（或 `/subagents`）。",
+          p: "`fleet status` 会根据当前工作区的运行记录，统计排队中、运行中、已完成和失败的工作。笔记本休眠或管理进程退出后，`fleet resume` 能接着原来的运行继续，而不会新开一次。如果只想看挂在当前会话上的智能体，用 `/fleet workers`（或 `/subagents`）。",
         },
       ],
     },
@@ -132,8 +132,8 @@ codewhale fleet stop --all`,
   next: [
     {
       href: "/docs/subagents",
-      label: "并行运行 Agent",
-      note: "不写 Workflow，也能把一个任务中彼此独立的部分交给子 Agent。",
+      label: "并行运行智能体",
+      note: "不写工作流，也能把一个任务中彼此独立的部分交给子智能体。",
     },
     {
       href: "/docs/review",

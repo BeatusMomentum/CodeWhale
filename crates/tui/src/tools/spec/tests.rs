@@ -744,3 +744,25 @@ fn test_tool_context_resolve_path_no_shell_expansion() {
         .expect("should treat as workspace child");
     assert!(resolved_other.to_string_lossy().contains("~otheruser"));
 }
+
+#[test]
+fn delegated_shell_is_refused_outright_when_the_session_lacks_it() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let mut ctx = ToolContext::new(workspace.path());
+
+    // Leaving the flag out would fall back to the host default, which may
+    // allow shell: a session without full shell must store an explicit "no".
+    ctx.shell_policy = crate::worker_profile::ShellPolicy::None;
+    assert_eq!(ctx.cap_delegated_authority(None, None, None).0, Some(false));
+    assert_eq!(
+        ctx.cap_delegated_authority(Some(true), None, None).0,
+        Some(false)
+    );
+
+    ctx.shell_policy = crate::worker_profile::ShellPolicy::Full;
+    assert_eq!(ctx.cap_delegated_authority(None, None, None).0, None);
+    assert_eq!(
+        ctx.cap_delegated_authority(Some(true), None, None).0,
+        Some(true)
+    );
+}

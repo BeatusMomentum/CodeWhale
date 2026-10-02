@@ -1,5 +1,7 @@
 # Environment-specific caveats
 
+> 阅读简体中文版：[zh_hans/ENVIRONMENTS.md](zh_hans/ENVIRONMENTS.md)。
+
 Standard build/test/run commands live in `AGENTS.md` and `CONTRIBUTING.md`.
 This file records only the non-obvious quirks of particular environments, so
 they do not cost context on machines that will never hit them.
@@ -59,6 +61,24 @@ If a turn is suspended anyway, the engine notices on wake — wall-clock elapsed
 diverging from monotonic elapsed by more than the suspend threshold — reports
 `System sleep detected; connection lost — retrying request`, and re-issues the
 request instead of failing the turn (#2990).
+
+## Windows PowerShell execution policy
+
+The shell tool runs PowerShell with `-ExecutionPolicy Bypass`. That sets only
+the policy of the child process it launches: nothing is persisted, no
+administrator rights are needed, and your own PowerShell windows keep their
+policy. Without it, a machine whose local policy is `Restricted` (the Windows
+client default) or `AllSigned` refuses the temporary `.ps1` script Codewhale
+writes for multiline commands (#6745).
+
+A policy set by Group Policy (the `MachinePolicy` or `UserPolicy` rows of
+`Get-ExecutionPolicy -List`) outranks the process scope. On such a machine,
+multiline commands are still refused and PowerShell's refusal is returned as
+the command's error; Codewhale does not work around an administrator-enforced
+policy. Single-line commands run through `-Command`, which the execution
+policy does not govern. Scripts that a command itself calls run under the same
+process scope; the shell tool's approval and sandbox settings, not the
+execution policy, decide what may run.
 
 ## Consolidated runtime commands
 

@@ -144,11 +144,13 @@ async fn approving_the_first_of_three_queued_calls_cancels_none_of_them() {
             hook_executor: None,
             verbosity: None,
             provenance: UserInputProvenance::ExternalUser,
+            submission_id: None,
         }))
         .await
         .expect("send model turn");
 
     let mut approvals = 0usize;
+    let mut starts = Vec::new();
     let mut results = Vec::new();
     let mut rx = handle.rx_event.write().await;
     while let Some(event) = tokio::time::timeout(event_timeout(), rx.recv())
@@ -156,7 +158,21 @@ async fn approving_the_first_of_three_queued_calls_cancels_none_of_them() {
         .expect("timed out waiting for turn event")
     {
         match event {
+            Event::ToolCallStarted {
+                id,
+                name,
+                model_call,
+                ..
+            } if name == "Bash" => {
+                let model_call = model_call.expect("model call correlation");
+                uuid::Uuid::parse_str(&id).expect("host execution id");
+                assert!(!CALLS.contains(&id.as_str()));
+                assert!(!starts.iter().any(|(started, _)| started == &id));
+                starts.push((id, model_call.provider_id));
+            }
             Event::ApprovalRequired { id, .. } => {
+                assert!(starts.iter().any(|(started, _)| started == &id));
+                assert!(!CALLS.contains(&id.as_str()));
                 approvals += 1;
                 if approvals == 1 {
                     // The desktop client republishes its unchanged posture
@@ -175,8 +191,17 @@ async fn approving_the_first_of_three_queued_calls_cancels_none_of_them() {
                 }
                 handle.approve_tool_call(id).await.expect("approve call");
             }
-            Event::ToolCallComplete { id, name, result } if name == "Bash" => {
-                results.push((id, result));
+            Event::ToolCallComplete {
+                id,
+                name,
+                result,
+                model_call,
+            } if name == "Bash" => {
+                let model_call = model_call.expect("model call correlation");
+                assert!(starts.iter().any(
+                    |(started, provider)| started == &id && provider == &model_call.provider_id
+                ));
+                results.push((id, model_call.provider_id, result));
             }
             Event::TurnComplete { .. } => break,
             _ => {}
@@ -195,7 +220,7 @@ async fn approving_the_first_of_three_queued_calls_cancels_none_of_them() {
         CALLS.len(),
         "every queued call reported a result: {results:?}"
     );
-    for (id, result) in &results {
+    for (id, _, result) in &results {
         let result = result
             .as_ref()
             .unwrap_or_else(|err| panic!("{id} failed after an approval: {err}"));
@@ -207,8 +232,24 @@ async fn approving_the_first_of_three_queued_calls_cancels_none_of_them() {
             result.content
         );
     }
-    let order: Vec<&str> = results.iter().map(|(id, _)| id.as_str()).collect();
+    let order: Vec<&str> = results
+        .iter()
+        .map(|(_, provider, _)| provider.as_str())
+        .collect();
     assert_eq!(order, CALLS, "queued calls run in the order the model gave");
+    assert_eq!(
+        starts
+            .iter()
+            .map(|(_, provider)| provider.as_str())
+            .collect::<Vec<_>>(),
+        CALLS,
+        "admitted calls retain the model's order and provider identities"
+    );
+    assert_eq!(
+        results.iter().map(|(id, _, _)| id).collect::<Vec<_>>(),
+        starts.iter().map(|(id, _)| id).collect::<Vec<_>>(),
+        "each admitted execution completes exactly once in queue order"
+    );
     for id in CALLS {
         assert!(
             workspace.path().join(format!("{id}.txt")).exists(),

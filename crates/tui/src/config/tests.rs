@@ -8255,6 +8255,7 @@ fn profile_skills_config_merges_individual_fields() {
         Config {
             skills: Some(SkillsConfig {
                 scan_codewhale_only: Some(true),
+                flat_workspace_root: Some(false),
                 ..Default::default()
             }),
             ..Default::default()
@@ -8265,6 +8266,7 @@ fn profile_skills_config_merges_individual_fields() {
             skills: Some(SkillsConfig {
                 registry_url: Some("https://registry.example/skills.json".to_string()),
                 max_install_size_bytes: Some(1234),
+                flat_workspace_root: Some(true),
                 ..Default::default()
             }),
             ..Default::default()
@@ -8281,6 +8283,7 @@ fn profile_skills_config_merges_individual_fields() {
     );
     assert_eq!(skills.max_install_size_bytes, Some(1234));
     assert_eq!(skills.scan_codewhale_only, Some(true));
+    assert_eq!(skills.flat_workspace_root, Some(false));
 }
 
 #[test]
@@ -15520,4 +15523,219 @@ fn no_parse_leaves_a_top_level_key_behind() -> Result<()> {
     let table: toml::Table = toml::from_str(&text)?;
     assert!(!codewhale_config::legacy_root::has_legacy_root_keys(&table));
     Ok(())
+}
+
+#[test]
+fn config_set_provider_typo_reuses_the_invalid_provider_wording() {
+    let config = Config::default();
+    let error = config
+        .resolve_provider_selection_identity("deepsek")
+        .expect_err("a typo is not a provider");
+    assert!(
+        error.starts_with("Invalid provider 'deepsek': expected deepseek"),
+        "{error}"
+    );
+    assert!(!error.contains("saved session"), "{error}");
+    // The resume path keeps its own saved-session wording.
+    let resume = config
+        .resolve_provider_pin_identity("deepsek")
+        .expect_err("missing custom route");
+    assert!(resume.starts_with("saved session requires"), "{resume}");
+    assert_eq!(
+        config
+            .resolve_provider_selection_identity("deepseek")
+            .expect("built-in provider")
+            .provider,
+        ApiProvider::Deepseek
+    );
+}
+
+#[test]
+fn deepseek_missing_key_message_keeps_commands_copyable_and_harness_advice_conditional() {
+    let plain = deepseek_missing_key_message();
+    assert!(
+        plain.contains("\n  codewhale auth set --provider deepseek\n"),
+        "{plain}"
+    );
+    assert!(
+        plain.contains("If you already use DeepSeek Harness, grant read-only access:"),
+        "{plain}"
+    );
+    assert!(
+        plain.ends_with("\n  codewhale auth external-consent --provider deepseek --mode read-only"),
+        "{plain}"
+    );
+}
+
+#[test]
+fn invalid_value_fixes_are_commands_that_work_and_name_overriding_layers() {
+    let error = Config {
+        tui: Some(TuiConfig {
+            alternate_screen: Some("sometimes".to_string()),
+            ..TuiConfig::default()
+        }),
+        ..Config::default()
+    }
+    .validate()
+    .expect_err("unknown alternate_screen");
+    let diagnostic = SafeConfigDiagnostic::find_in(&error).expect("safe diagnostic");
+    // `config set` refuses dotted keys, so the fix edits the table instead.
+    assert_eq!(
+        diagnostic.fix(),
+        Some(
+            "set alternate_screen = \"auto\" in the [tui] table of config.toml (if a profile or managed config sets it, correct it there)"
+        )
+    );
+
+    let error = Config {
+        sandbox_mode: Some("bogus".to_string()),
+        ..Config::default()
+    }
+    .validate()
+    .expect_err("unknown sandbox_mode");
+    let fix = SafeConfigDiagnostic::find_in(&error)
+        .and_then(SafeConfigDiagnostic::fix)
+        .expect("fix");
+    assert!(
+        fix.starts_with("codewhale config set sandbox_mode workspace-write (if CODEWHALE_SANDBOX_MODE, a profile, or managed config sets it"),
+        "{fix}"
+    );
+}
+
+#[test]
+fn missing_profile_diagnostic_does_not_show_the_requested_name() {
+    let mut profiles = HashMap::new();
+    profiles.insert("work".to_string(), Config::default());
+    let config = ConfigFile {
+        base: Box::default(),
+        profiles: Some(profiles),
+        legacy_root: Default::default(),
+    };
+    let error = apply_profile(config, Some("sk-pasted-token")).expect_err("no such profile");
+    let diagnostic = SafeConfigDiagnostic::find_in(&error).expect("safe diagnostic");
+    let shown = diagnostic.display_message();
+    assert_eq!(
+        shown,
+        "Profile not found (name not shown). Available profiles: work"
+    );
+    // The local error keeps the typed name for the person at the terminal.
+    assert!(error.to_string().contains("sk-pasted-token"), "{error}");
+}
+
+/// #6700: `[retry].jitter`, `jitter_factor` and `respect_retry_after` reach
+/// the resolved policy (and the client's `RetryConfig`) instead of being
+/// dropped for compiled-in defaults.
+#[test]
+fn retry_policy_reads_jitter_and_retry_after_keys() {
+    let parse = |body: &str| toml::from_str::<Config>(body).expect("config parses");
+
+    let defaults = parse("[retry]\nmax_retries = 2\n").retry_policy();
+    assert!(defaults.jitter);
+    assert!((defaults.jitter_factor - 0.1).abs() < f64::EPSILON);
+    assert!(defaults.respect_retry_after);
+
+    let tuned =
+        parse("[retry]\njitter = false\njitter_factor = 0.3\nrespect_retry_after = false\n")
+            .retry_policy();
+    assert!(!tuned.jitter);
+    assert!((tuned.jitter_factor - 0.3).abs() < f64::EPSILON);
+    assert!(!tuned.respect_retry_after);
+    let client: crate::llm_client::RetryConfig = tuned.into();
+    assert!(!client.jitter);
+    assert!((client.jitter_factor - 0.3).abs() < f64::EPSILON);
+    assert!(!client.respect_retry_after);
+
+    let high = parse("[retry]\njitter_factor = 7.5\n").retry_policy();
+    assert!((high.jitter_factor - 1.0).abs() < f64::EPSILON);
+    let negative = parse("[retry]\njitter_factor = -0.5\n").retry_policy();
+    assert!(negative.jitter_factor.abs() < f64::EPSILON);
+}
+
+/// #6700: `[tui].force_http1 = true` pins HTTP/1.1 without the env var.
+/// (The env-only path is covered by `force_http1_scenario` under its lock.)
+#[test]
+fn tui_force_http1_key_pins_http1() {
+    let config: Config = toml::from_str("[tui]\nforce_http1 = true\n").expect("config parses");
+    assert!(config.force_http1());
+}
+
+#[test]
+fn canonical_stream_config_preserves_legacy_resolution_and_precedence() {
+    let _lock = lock_test_env();
+    let _pin = EnvVarGuard::remove("CODEWHALE_FORCE_HTTP1");
+    let _legacy_pin = EnvVarGuard::remove("DEEPSEEK_FORCE_HTTP1");
+    let legacy = "[tui]\nstream_open_timeout_secs=80\nstream_chunk_timeout_secs=120\nforce_http1=true\nstream_max_resumes=4\nstream_max_transparent_retries=3\nstream_max_errors=7\nstream_max_duration_secs=900\nstream_max_content_mb=12\nconnect_timeout_secs=60\n";
+    let canonical = "[stream]\nopen_timeout_secs=80\nchunk_timeout_secs=120\nforce_http1=true\nmax_resumes=4\nmax_transparent_retries=3\nmax_stream_errors=7\nmax_duration_secs=900\nmax_content_mb=12\nconnect_timeout_secs=60\n";
+    let parse = |body: &str| toml::from_str::<Config>(body).unwrap();
+    assert_eq!(
+        toml::Value::try_from(parse(legacy).resolved_stream_settings()).unwrap(),
+        toml::Value::try_from(parse(canonical).resolved_stream_settings()).unwrap(),
+    );
+    let mixed = parse(&format!(
+        "{legacy}\n[stream]\nmax_resumes=0\nforce_http1=false\n"
+    ));
+    assert_eq!(mixed.stream_retry_limits().max_resumes, 0);
+    assert_eq!(mixed.stream_retry_limits().max_errors, 7);
+    assert_eq!(mixed.stream_open_timeout(), Duration::from_secs(80));
+    assert!(!mixed.force_http1());
+    let _pin = EnvVarGuard::set("CODEWHALE_FORCE_HTTP1", "1");
+    assert!(
+        mixed.force_http1(),
+        "the existing environment pin still wins"
+    );
+}
+
+#[test]
+fn canonical_stream_config_env_clamps_and_keepalive_disable() {
+    let _lock = lock_test_env();
+    let _open = EnvVarGuard::set("CODEWHALE_STREAM_OPEN_TIMEOUT_SECS", "70");
+    let _idle = EnvVarGuard::set("CODEWHALE_STREAM_IDLE_TIMEOUT_SECS", "90");
+    let config: Config = toml::from_str("[stream]\nopen_timeout_secs=0\nchunk_timeout_secs=0\nmax_resumes=99\nmax_transparent_retries=99\nmax_stream_errors=0\nmax_duration_secs=999999\nmax_content_mb=999999\nconnect_timeout_secs=999999\ntcp_keepalive_secs=0\nhttp2_keep_alive_interval_secs=0\nhttp2_keep_alive_timeout_secs=0\n").unwrap();
+    assert_eq!(config.stream_open_timeout(), Duration::from_secs(70));
+    assert_eq!(
+        config.stream_chunk_timeout_secs(),
+        900,
+        "zero retains idle default semantics"
+    );
+    assert_eq!(config.stream_retry_limits().max_resumes, 10);
+    assert_eq!(config.stream_retry_limits().max_transparent_retries, 10);
+    assert_eq!(config.stream_retry_limits().max_errors, 5);
+    assert_eq!(config.stream_max_duration(), Duration::from_secs(86400));
+    assert_eq!(config.stream_max_content_bytes(), 512 * 1024 * 1024);
+    assert_eq!(config.connect_timeout(), Duration::from_secs(300));
+    assert_eq!(config.tcp_keepalive(), None);
+    assert_eq!(config.http2_keep_alive_interval(), None);
+    assert_eq!(config.http2_keep_alive_timeout(), Duration::from_secs(20));
+    let positive: Config = toml::from_str("[stream]\nopen_timeout_secs=12\nchunk_timeout_secs=14\ntcp_keepalive_secs=9000\nhttp2_keep_alive_interval_secs=9000\nhttp2_keep_alive_timeout_secs=9000\n").unwrap();
+    assert_eq!(positive.stream_open_timeout(), Duration::from_secs(12));
+    assert_eq!(positive.stream_chunk_timeout_secs(), 14);
+    assert_eq!(positive.tcp_keepalive(), Some(Duration::from_secs(3600)));
+    assert_eq!(
+        positive.http2_keep_alive_interval(),
+        Some(Duration::from_secs(3600))
+    );
+    assert_eq!(
+        positive.http2_keep_alive_timeout(),
+        Duration::from_secs(3600)
+    );
+    for invalid in [
+        "open_timeout_secs=-1",
+        "max_resumes=4294967296",
+        "force_http1='yes'",
+        "open_timout_secs=45",
+    ] {
+        assert!(
+            toml::from_str::<Config>(&format!("[stream]\n{invalid}\n")).is_err(),
+            "{invalid}"
+        );
+    }
+}
+
+#[test]
+fn canonical_stream_config_profile_merges_independent_keys() {
+    let config = parse_config_file("[stream]\nmax_resumes=7\ntcp_keepalive_secs=41\n[profiles.mobile.stream]\nopen_timeout_secs=180\n").unwrap();
+    let resolved = apply_profile(config, Some("mobile")).unwrap();
+    assert_eq!(resolved.stream_retry_limits().max_resumes, 7);
+    assert_eq!(resolved.tcp_keepalive(), Some(Duration::from_secs(41)));
+    assert_eq!(resolved.stream_open_timeout(), Duration::from_secs(180));
 }

@@ -17,7 +17,6 @@ serde.workspace = true
 thiserror.workspace = true
 codewhale-config = { path = "../config", version = "0.10.1" }
 codewhale-hooks = { path = "../hooks", version = "0.10.1" }
-codewhale-mcp = { path = "../mcp", version = "0.10.1" }
 codewhale-protocol = { path = "../protocol", version = "0.10.1" }
 codewhale-state = { path = "../state", version = "0.10.1" }
 regex = "1.11"

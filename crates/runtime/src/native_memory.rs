@@ -417,7 +417,18 @@ impl NativeMemoryStore {
         limit: usize,
     ) -> Result<Vec<MemoryHit>> {
         let id = Self::workspace_id(workspace)?;
-        self.search_scoped(id.as_deref(), Some(workspace), query, limit)
+        self.search_in_workspace(id.as_deref(), workspace, query, limit)
+    }
+    /// [`Self::search_for_workspace`] for a caller that already resolved the
+    /// workspace's memory identity.
+    pub fn search_in_workspace(
+        &self,
+        workspace_id: Option<&str>,
+        workspace: &Path,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<MemoryHit>> {
+        self.search_scoped(workspace_id, Some(workspace), query, limit)
     }
     fn search_scoped(
         &self,

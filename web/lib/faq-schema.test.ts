@@ -70,6 +70,12 @@ describe("FAQPage structured data", () => {
     expect(faqPage).toContain('type="application/ld+json"');
     expect(faqPage).toContain("serializeJsonLd(jsonLd)");
   });
+
+  it("keeps every internal answer link on the reader's locale", () => {
+    // Every locale without its own FAQ reads the English answers, so a
+    // literal `/en/...` link sent a /ja reader to the English site (W01-02).
+    expect(faqPage).not.toMatch(/href=\{?["'`]\/[a-z]{2}(?:-[A-Za-z]+)?\//);
+  });
 });
 
 describe("extractText", () => {

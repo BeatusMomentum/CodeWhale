@@ -10,8 +10,13 @@
  * `@deepseek-ai/dsh-tools` resolves to the definition-side compat module.
  * Any other `@deepseek-ai/dsh-*` package fails the import loudly: the host
  * does not provide it, and a silent partial load would be worse.
+ *
+ * Node: `module.registerHooks`. Bun has no `registerHooks` (a named import of
+ * it fails at link time, so it is read off the namespace). Bun gets the same
+ * rules through `Bun.plugin`, with three pieces (see `installBunResolver`).
  */
-import { registerHooks } from 'node:module'
+import * as nodeModule from 'node:module'
+import { RUNTIME } from '../runtime.ts'
 
 const SCHEME = 'codewhale-host:'
 const REGISTRY_KEY = Symbol.for('codewhale.extension-host.modules')
@@ -63,6 +68,60 @@ function virtualSource(key: string, namespace: Record<string, unknown>): string 
   return lines.join('\n')
 }
 
+/**
+ * A path inside a `node_modules` copy of a package the host owns or refuses:
+ * the singletons and every `@deepseek-ai/dsh-*` / `@deepseek-ai/cordis-*` peer.
+ */
+const PEER_PATH =
+  /[\\/]node_modules[\\/]((?:@deepseek-ai[\\/](?:dsh-[^\\/]+|cordis(?:-[^\\/]+)?|schemastery|cosmokit))|cosmokit)[\\/]/
+
+/**
+ * Bun reports a bare import it cannot find as `Cannot find package 'X'`,
+ * where Node would have run the resolve hook and thrown `UnsupportedPeerError`.
+ * This gives the same error for unsupported peers. Other errors pass through.
+ */
+export function explainImportError(error: unknown): unknown {
+  const match = error instanceof Error ? /Cannot find package '([^']+)'/.exec(error.message) : null
+  if (!match) return error
+  try {
+    classifySpecifier(match[1])
+  } catch (unsupported) {
+    return unsupported
+  }
+  return error
+}
+
+/**
+ * Bun 1.4: runtime `onResolve` is not called for bare package names, only for
+ * some subpaths. So:
+ * 1. `build.module` serves each singleton by its exact name.
+ * 2. `onResolve` applies `classifySpecifier` to every bare specifier Bun does
+ *    pass it, which catches subpaths such as `@deepseek-ai/cordis/lib/x`.
+ * 3. `onLoad` refuses any file under a `node_modules` copy of a peer. A second
+ *    Cordis, or a dsh peer that a plugin ships itself, never loads.
+ *    `explainImportError` covers peers that are not installed at all.
+ */
+function installBunResolver(modules: Record<string, Record<string, unknown>>) {
+  const bun = (globalThis as any).Bun
+  bun.plugin({
+    name: 'codewhale-host-modules',
+    setup(build: any) {
+      for (const [specifier, key] of Object.entries(SINGLETONS)) {
+        if (key in modules) build.module(specifier, () => ({ exports: modules[key], loader: 'object' }))
+      }
+      build.onResolve({ filter: /^[^./]/ }, (args: { path: string }) => {
+        const key = classifySpecifier(args.path)
+        if (key !== null && !(key in modules)) throw new UnsupportedPeerError(args.path)
+        return undefined
+      })
+      build.onLoad({ filter: PEER_PATH }, (args: { path: string }) => {
+        const match = PEER_PATH.exec(args.path)
+        throw new UnsupportedPeerError((match?.[1] ?? args.path).replaceAll('\\', '/'))
+      })
+    },
+  })
+}
+
 let installed = false
 
 /**
@@ -73,7 +132,11 @@ export function installResolveHooks(modules: Record<string, Record<string, unkno
   if (installed) return
   installed = true
   ;(globalThis as any)[REGISTRY_KEY] = modules
-  registerHooks({
+  if (RUNTIME.name === 'bun') {
+    installBunResolver(modules)
+    return
+  }
+  nodeModule.registerHooks({
     resolve(specifier, context, nextResolve) {
       const key = classifySpecifier(specifier)
       if (key !== null) {

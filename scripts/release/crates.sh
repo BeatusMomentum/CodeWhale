@@ -7,6 +7,7 @@ release_crates=(
   codewhale-paths
   codewhale-protocol
   codewhale-release
+  codewhale-sanitize
   codewhale-secrets
   codewhale-state
   codewhale-workflow
@@ -21,8 +22,7 @@ release_crates=(
   codewhale-lane
   codewhale-agent
   codewhale-core
-  # Prototype command boundary depends on core; future TUI/commands adapters
-  # consume it without changing current production dispatch in FEAT-014.
+  # Shared command shapes depend on protocol, never on core/runtime services.
   codewhale-command-contract
   # TUI support crates added in 0.9.13: localization (i18n), models (catalog
   # facade), palette (design tokens). Only tui consumes them, so they sit

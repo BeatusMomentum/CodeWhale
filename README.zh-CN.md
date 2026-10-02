@@ -1,4 +1,4 @@
-<!-- source: README.md sha256:ccb7a0b00317 -->
+<!-- source: README.md sha256:925619135f77 -->
 # Codewhale
 
 Codewhale 是一款开源智能体，可使用你选择的托管模型或本地模型读取项目、编辑文件、运行命令并检查自己的工作。从终端中的一项任务开始。对于较大的工作，可以将其中的部分任务交给使用不同模型、承担不同角色的智能体。
@@ -23,6 +23,8 @@ curl -fsSL https://codewhale.net/install.sh | sh
 "$HOME/.local/bin/codewhale"
 ```
 
+如果直接运行 `codewhale` 提示 "command not found"，说明 `~/.local/bin` 还不在你的 PATH 中：运行安装器为你的 shell 打印的那一行命令，或参阅[将它加入 PATH](docs/INSTALL.md#put-it-on-your-path)。
+
 安装器会选择最新的已发布版本。[更新日志](CHANGELOG.md)也描述了下一版本尚未发布的候选构建；只有在该版本正式发布后，已发布的下载包才会包含这些变更。
 
 Windows 请使用 [GitHub Releases](https://github.com/Hmbown/CodeWhale/releases/latest)
@@ -36,7 +38,7 @@ Windows 请使用 [GitHub Releases](https://github.com/Hmbown/CodeWhale/releases
 
 ## 使用
 
-在项目文件夹中打开终端并运行 `codewhale`。使用 `/provider` 选择提供商，使用 `/model` 选择模型，然后描述一项具体任务：
+在项目文件夹中打开终端并运行 `codewhale`（前提是它已[在你的 PATH 中](docs/INSTALL.md#put-it-on-your-path)）。使用 `/provider` 选择提供商，使用 `/model` 选择模型，然后描述一项具体任务：
 
 ```text
 Fix the failing tests and explain what changed.
@@ -79,6 +81,7 @@ Codewhale 在你的机器上运行，并仅拥有你授予的访问权限。审�
 
 ## 文档
 
+- [GitHub PR 审查设置](docs/GITHUB_ACTION.md)
 - [提供商和本地模型](docs/PROVIDERS.md)
 - [智能体团队](docs/FLEET.md)
 - [MCP](docs/MCP.md)、[钩子](docs/HOOKS.md)和[配置](docs/CONFIGURATION.md)

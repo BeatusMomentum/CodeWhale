@@ -1,5 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { deriveFactsFromRemote } from "./facts-drift";
+import { PROVIDER_LABEL_MAP } from "../scripts/facts-lib.mjs";
+import { isRepoFacts } from "./facts";
+import { deriveFactsFromRemote, PROVIDER_LABELS, runFactsDrift } from "./facts-drift";
 
 const REVISION = "b".repeat(40);
 
@@ -7,7 +9,14 @@ function response(body: string, status = 200): Response {
   return new Response(body, { status });
 }
 
-function installGitHubFixture(toolCountSource: string | null): void {
+const VALID_GENERATED_FACTS =
+  'export const FACTS: RepoFacts = {"toolCount":73,"models":[]};';
+
+function installGitHubFixture(
+  toolCountSource: string | null,
+  releaseHtmlUrl = "https://github.com/Hmbown/CodeWhale/releases/tag/v0.9.0",
+  sourceOverrides: Record<string, string> = {},
+): void {
   vi.stubGlobal(
     "fetch",
     vi.fn(async (input: string | URL | Request) => {
@@ -25,7 +34,7 @@ function installGitHubFixture(toolCountSource: string | null): void {
           JSON.stringify({
             tag_name: "v0.9.0",
             published_at: "2026-07-16T20:05:39Z",
-            html_url: "https://github.com/Hmbown/CodeWhale/releases/tag/v0.9.0",
+            html_url: releaseHtmlUrl,
           }),
         );
       }
@@ -43,6 +52,7 @@ function installGitHubFixture(toolCountSource: string | null): void {
         `,
         "npm/codewhale/package.json": JSON.stringify({ engines: { node: ">=18" } }),
         LICENSE: "MIT License\n",
+        ...sourceOverrides,
       };
       if (rawPath === "web/lib/facts.generated.ts") {
         return toolCountSource === null ? response("not found", 404) : response(toolCountSource);
@@ -104,5 +114,87 @@ describe("deriveFactsFromRemote", () => {
     );
 
     await expect(deriveFactsFromRemote()).resolves.toBeNull();
+  });
+
+  it("stores a canonical release URL when GitHub answers with the repo's other casing", async () => {
+    installGitHubFixture(
+      VALID_GENERATED_FACTS,
+      "https://github.com/Hmbown/Codewhale/releases/tag/v0.9.0",
+    );
+
+    const facts = await deriveFactsFromRemote();
+
+    expect(facts?.latestPublishedRelease?.url).toBe(
+      "https://github.com/Hmbown/CodeWhale/releases/tag/v0.9.0",
+    );
+    expect(isRepoFacts(facts)).toBe(true);
+  });
+});
+
+describe("runFactsDrift", () => {
+  it("writes a KV snapshot that getFacts() accepts", async () => {
+    installGitHubFixture(
+      VALID_GENERATED_FACTS,
+      "https://github.com/Hmbown/Codewhale/releases/tag/v0.9.0",
+    );
+    const store = new Map<string, string>();
+    const kv = {
+      get: async (key: string) => store.get(key) ?? null,
+      put: async (key: string, value: string) => {
+        store.set(key, value);
+      },
+    };
+
+    const result = await runFactsDrift({ CURATED_KV: kv });
+
+    expect(result.ok).toBe(true);
+    expect(isRepoFacts(JSON.parse(store.get("facts:current") ?? "null"))).toBe(true);
+  });
+
+  it("never replaces a snapshot from a newer source commit with an older one", async () => {
+    installGitHubFixture(VALID_GENERATED_FACTS);
+    const newer = JSON.stringify({ sourceCommittedAt: "2026-07-22T00:00:00Z", version: "9.9.9" });
+    const store = new Map<string, string>([["facts:current", newer]]);
+    const kv = {
+      get: async (key: string) => store.get(key) ?? null,
+      put: async (key: string, value: string) => { store.set(key, value); },
+    };
+    // The fixture's source commit is 2026-07-21T23:00:00Z: an overlapping,
+    // slower run finishing after a newer one.
+    expect(await runFactsDrift({ CURATED_KV: kv })).toEqual({ ok: true, changed: false });
+    expect(store.get("facts:current")).toBe(newer);
+  });
+
+  // The scheduled handler discards the result, so the log line is the only
+  // signal that the cron stopped refreshing KV.
+  it("warns and writes nothing when the derived facts fail validation", async () => {
+    installGitHubFixture(VALID_GENERATED_FACTS, undefined, {
+      // A non-string engines.node survives derivation but fails isRepoFacts.
+      "npm/codewhale/package.json": JSON.stringify({ engines: { node: 18 } }),
+    });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const store = new Map<string, string>();
+    const kv = {
+      get: async (key: string) => store.get(key) ?? null,
+      put: async (key: string, value: string) => {
+        store.set(key, value);
+      },
+    };
+
+    const result = await runFactsDrift({ CURATED_KV: kv });
+
+    expect(result).toEqual({ ok: false, reason: "remote facts failed validation" });
+    expect(store.size).toBe(0);
+    expect(warn).toHaveBeenCalledWith(
+      expect.stringContaining("[facts-drift] remote facts failed validation"),
+    );
+    warn.mockRestore();
+  });
+});
+
+describe("PROVIDER_LABELS", () => {
+  it("matches the build-time PROVIDER_LABEL_MAP, so cron snapshots keep every provider", () => {
+    expect(Object.keys(PROVIDER_LABEL_MAP).length).toBeGreaterThan(0);
+    expect(PROVIDER_LABELS).toEqual(PROVIDER_LABEL_MAP);
   });
 });

@@ -419,11 +419,57 @@ class LiveGateTests(unittest.TestCase):
         self.assertEqual(frontier, sorted(frontier))
         self.assertEqual(len(frontier), len(set(frontier)))
         # FEAT-018 removed utility, FEAT-019 removed memory, FEAT-020 removed plugins,
-        # FEAT-021 removed project, and FEAT-022 removed skills; four groups stay pending.
+        # FEAT-021 removed project, FEAT-022 removed skills, FEAT-029 completed debug,
+        # and FEAT-026 completed session; config/core remain.
         self.assertEqual(
             set(frontier),
-            {"session", "config", "debug", "core"},
+            {"config", "core"},
         )
+
+
+class DebugGroupFrontierTests(unittest.TestCase):
+    def test_complete_debug_inventory_has_no_pending_host_handlers(self) -> None:
+        doc = mod.load_topology()
+        debug = doc["topology"]["debug"]
+        actual = {p.relative_to(ROOT).as_posix() for p in
+                  (ROOT / "crates/tui/src/commands/groups/debug").rglob("*.rs")}
+        self.assertEqual(set(mod.group_source_scope("debug", debug, ROOT)), actual)
+        self.assertNotIn("debug", doc["frontier"])
+        self.assertNotIn("debug", mod.load_pending_groups())
+        self.assertEqual(mod.check_source_frontier({"debug": debug}, [], ROOT), [])
+        self.assertIn("crates/tui/src/commands/groups/debug/receipts.rs", actual)
+
+    def test_omitted_receipts_and_new_nested_commands_fail_inventory(self) -> None:
+        for filename in ["receipts.rs", "new/command.rs"]:
+            with self.subTest(filename=filename), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                directory = root / "crates/tui/src/commands/groups/debug"
+                directory.mkdir(parents=True)
+                (directory / "mod.rs").write_text("// complete portable module\n")
+                omitted = directory / filename
+                omitted.parent.mkdir(parents=True, exist_ok=True)
+                omitted.write_text("pub fn receipt(app: &mut App) {}\n")
+                scope = [(directory / "mod.rs").relative_to(root).as_posix()]
+                topology = {"debug": {"kind": "group", "scope": scope, "slices": []}}
+                violations = mod.check_source_frontier(topology, [], root)
+                self.assertTrue(any(v.category == "stale-removal" and
+                                    v.location.endswith("::receipt")
+                                    for v in violations), violations)
+                # Adding the historical scope entry cannot declare the handler portable.
+                scope.append(omitted.relative_to(root).as_posix())
+                violations = mod.check_source_frontier(topology, [], root)
+                self.assertTrue(any(v.category == "stale-removal" for v in violations), violations)
+
+    def test_omitted_pure_file_is_automatically_included_in_scan(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            directory = root / "crates/tui/src/commands/groups/debug"
+            directory.mkdir(parents=True)
+            (directory / "future.rs").write_text("pub fn future() {}\n")
+            node = {"kind": "group", "scope": [], "slices": []}
+            self.assertEqual(mod.group_source_scope("debug", node, root),
+                             ["crates/tui/src/commands/groups/debug/future.rs"])
+            self.assertEqual(mod.check_source_frontier({"debug": node}, [], root), [])
 
 
 class SourceScanTests(unittest.TestCase):

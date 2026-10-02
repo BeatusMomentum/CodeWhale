@@ -2275,6 +2275,12 @@ impl RemoteControlController {
         gate
     }
 
+    pub fn pending_approval_tool_id(&self, gate: &str) -> Option<String> {
+        self.pending_approvals
+            .get(gate)
+            .map(|approval| approval.tool_id.clone())
+    }
+
     pub fn take_pending_approval(&mut self, gate: &str) -> Option<String> {
         self.pending_approvals
             .remove(gate)
@@ -3290,6 +3296,9 @@ async fn relay_worker(
     sync_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut runtime_retry_delay = RUNTIME_UPLOAD_RETRY_INTERVAL;
     let mut runtime_retry_not_before = Instant::now();
+    // One credential refresh per rejection streak (see
+    // `RUNTIME_REFRESHED_CREDENTIAL_REFUSED`).
+    let mut runtime_refreshed_since_accept = false;
 
     loop {
         tokio::select! {
@@ -3412,11 +3421,15 @@ async fn relay_worker(
                     RuntimeFlushOutcome::Accepted { run_id, cursor } => {
                         runtime_retry_delay = RUNTIME_UPLOAD_RETRY_INTERVAL;
                         runtime_retry_not_before = Instant::now();
+                        runtime_refreshed_since_accept = false;
                         event_tx
                             .send(RemoteEvent::RuntimeCursor { run_id, cursor })
                             .map_err(|_| "The terminal remote-control owner stopped.".to_string())?;
                     }
                     RuntimeFlushOutcome::AccessTokenExpired => {
+                        if std::mem::replace(&mut runtime_refreshed_since_accept, true) {
+                            return Err(RUNTIME_REFRESHED_CREDENTIAL_REFUSED.to_string());
+                        }
                         refresh_enrollment_and_reconnect(
                             &client,
                             &mut enrollment,
@@ -3694,6 +3707,12 @@ impl RuntimeTransportOutbox {
     }
 }
 
+/// A runtime event refused (401/403) again right after a successful
+/// credential refresh is a terminal rejection, not an expired token: a
+/// revoked runner or a run this runner may not write. Refreshing again would
+/// loop at the upload retry interval forever.
+const RUNTIME_REFRESHED_CREDENTIAL_REFUSED: &str = "The remote-control server refused runtime events again with a freshly refreshed credential; stopping instead of retrying.";
+
 /// Flushes every queued runtime envelope through the server-confirmed cursor
 /// before a stop may be acknowledged. Emits `RuntimeCursor` events so the
 /// controller compacts its journal as acknowledgements land. Failing to drain
@@ -3710,6 +3729,7 @@ async fn drain_runtime_outbox_for_stop(
     deadline: Instant,
 ) -> Result<(), String> {
     let mut delay = RUNTIME_UPLOAD_RETRY_INTERVAL;
+    let mut refreshed_since_accept = false;
     while !outbox.events.is_empty() {
         if Instant::now() >= deadline {
             return Err(
@@ -3721,6 +3741,7 @@ async fn drain_runtime_outbox_for_stop(
             RuntimeFlushOutcome::Idle => break,
             RuntimeFlushOutcome::Accepted { run_id, cursor } => {
                 delay = RUNTIME_UPLOAD_RETRY_INTERVAL;
+                refreshed_since_accept = false;
                 let _ = event_tx.send(RemoteEvent::RuntimeCursor { run_id, cursor });
             }
             RuntimeFlushOutcome::Retryable => {
@@ -3728,6 +3749,9 @@ async fn drain_runtime_outbox_for_stop(
                 delay = delay.saturating_mul(2).min(RUNTIME_UPLOAD_MAX_BACKOFF);
             }
             RuntimeFlushOutcome::AccessTokenExpired => {
+                if std::mem::replace(&mut refreshed_since_accept, true) {
+                    return Err(RUNTIME_REFRESHED_CREDENTIAL_REFUSED.to_string());
+                }
                 refresh_enrollment_and_reconnect(client, enrollment, runner_id, start, event_tx)
                     .await?;
             }
@@ -6421,6 +6445,7 @@ mod tests {
             content: "existing turn output".to_string(),
         });
         controller.observe_engine_event(&EngineEvent::ToolCallStarted {
+            model_call: None,
             id: "tool_existing".to_string(),
             name: "shell".to_string(),
             input: json!({ "never": "relayed" }),
@@ -6510,6 +6535,7 @@ mod tests {
             turn_id: "turn_started_later".to_string(),
             created_at: chrono::Utc::now(),
             route: None,
+            submission_id: None,
         });
         let WorkerCommand::Upload { envelopes, .. } =
             worker_rx.try_recv().expect("one typed turn start")
@@ -7938,6 +7964,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stop_drain_stops_when_a_fresh_credential_is_refused_again() {
+        let _env = crate::test_support::lock_test_env();
+        let secrets_root = tempfile::tempdir().expect("isolated remote-control secrets");
+        let _codewhale_home =
+            crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", secrets_root.path());
+        let server = MockServer::start().await;
+        // A terminal refusal: the runner may not write this run, and a new
+        // access token does not change that.
+        Mock::given(method("POST"))
+            .and(path(
+                "/api/local-runners/runner_fixture/runs/run_fixture/events",
+            ))
+            .respond_with(ResponseTemplate::new(403))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let access_token = crate::test_support::future_test_jwt(&"a".repeat(40));
+        Mock::given(method("POST"))
+            .and(path("/api/runner/enrollments/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "enrollment": {
+                    "id": "enrollment_fixture",
+                    "userId": "account_fixture",
+                    "deviceId": "device_fixture",
+                    "runtimeVersion": "0.9.6",
+                    "runtimeCommit": "a".repeat(40),
+                    "capabilities": CAPABILITIES,
+                },
+                "credential": { "accessToken": access_token },
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/local-runners/connect"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(fixture_connection_response()))
+            .mount(&server)
+            .await;
+        let mut enrollment = fixture_enrollment(&format!("{}/", server.uri()));
+        let mut runner_id = "runner_fixture".to_string();
+        let client = crate::tls::reqwest_client_builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("fixture client");
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let mut outbox = RuntimeTransportOutbox::default();
+        outbox
+            .enqueue(
+                "run_fixture",
+                runtime_envelope(
+                    1,
+                    "turn.completed",
+                    Some("turn_fixture"),
+                    "2026-08-08T12:00:00Z".to_string(),
+                    json!({ "turn": { "status": "completed", "usage": {} } }),
+                ),
+            )
+            .expect("queue terminal envelope");
+
+        let error = drain_runtime_outbox_for_stop(
+            &client,
+            &mut enrollment,
+            &mut runner_id,
+            &fixture_start(),
+            &event_tx,
+            &mut outbox,
+            Instant::now() + Duration::from_secs(5),
+        )
+        .await
+        .expect_err("a refusal that survives a refresh must end the drain");
+        assert_eq!(error, RUNTIME_REFRESHED_CREDENTIAL_REFUSED);
+        assert!(
+            !outbox.events.is_empty(),
+            "the refused envelope stays queued for a later, authorized resend"
+        );
+    }
+
+    #[tokio::test]
     async fn stop_drain_deadline_failure_refuses_to_confirm_stop() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -8800,6 +8904,7 @@ mod tests {
         );
 
         controller.observe_engine_event(&EngineEvent::ToolCallStarted {
+            model_call: None,
             id: "tool_fixture".to_string(),
             name: "shell".to_string(),
             input: json!({}),

@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::runtime_threads::{
-    CreateThreadRequest, RuntimeTurnStatus, ThreadDetail, ThreadListFilter, TurnItemKind,
+    CreateThreadRequest, RuntimeThreadManager, RuntimeTurnStatus, ThreadDetail, ThreadListFilter,
     TurnItemLifecycleStatus,
 };
 use crate::session_manager::{
@@ -17,10 +17,9 @@ use crate::session_manager::{
 };
 use crate::session_peek::{MAX_PEEK_ENTRIES, SessionPeek, build_peek};
 use crate::session_projection::{SessionQuery, SessionSortMode, SessionSummary, project_sessions};
-use codewhale_models::{ContentBlock, Message};
+use codewhale_models::{Message, Role};
 
 use super::{ApiError, RuntimeApiState, map_thread_err, truncate_text};
-use codewhale_models::Role;
 
 #[derive(Debug, Serialize)]
 pub(super) struct SessionsResponse {
@@ -32,6 +31,10 @@ pub(super) struct SessionDetailResponse {
     pub(super) metadata: SessionMetadata,
     pub(super) messages: Vec<Value>,
     pub(super) system_prompt: Option<String>,
+    /// Turns that ended `Failed`, with the redacted reason the transcript
+    /// showed. Absent when none did.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(super) turn_outcomes: Vec<crate::session_manager::SavedTurnOutcome>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -203,12 +206,26 @@ pub(super) async fn patch_session(
             "PATCH /v1/sessions/{id} requires at least one of `title` or `archived`",
         ));
     }
-    let manager = SessionManager::new(state.sessions_dir.clone())
+    // The single writers hold the session's live lease across their load and
+    // save; taking it may retry with short sleeps. Keep all of it off the
+    // async worker (#6149).
+    tokio::task::spawn_blocking(move || patch_session_blocking(state.sessions_dir, &id, &req))
+        .await
+        .map_err(|_| ApiError::internal("session update failed"))?
+        .map(Json)
+}
+
+fn patch_session_blocking(
+    sessions_dir: PathBuf,
+    id: &str,
+    req: &PatchSessionRequest,
+) -> Result<PatchSessionResponse, ApiError> {
+    let manager = SessionManager::new(sessions_dir)
         .map_err(|e| ApiError::internal(format!("Failed to open sessions dir: {e}")))?;
 
     let before = manager
-        .load_session(&id)
-        .map_err(|e| map_session_err(&id, e, "read"))?
+        .load_session(id)
+        .map_err(|e| map_session_err(id, e, "read"))?
         .metadata;
     let mut metadata = before.clone();
     let mut changes: HashMap<String, Value> = HashMap::new();
@@ -220,25 +237,48 @@ pub(super) async fn patch_session(
         crate::session_manager::normalize_session_title(title)
             .map_err(|e| ApiError::bad_request(e.to_string()))?;
         metadata = manager
-            .rename_session(&id, title, SessionMutator::External)
-            .map_err(|e| map_session_err(&id, e, "rename"))?;
+            .rename_session(id, title, SessionMutator::External)
+            .map_err(|e| map_session_err(id, e, "rename"))?;
         if metadata.title != before.title {
             changes.insert("title".to_string(), json!(metadata.title));
         }
     }
     if let Some(archived) = req.archived {
         metadata = manager
-            .set_session_archived(&id, archived, SessionMutator::External)
-            .map_err(|e| map_session_err(&id, e, "archive"))?;
+            .set_session_archived(id, archived, SessionMutator::External)
+            .map_err(|e| map_session_err(id, e, "archive"))?;
         if metadata.archived != before.archived {
             changes.insert("archived".to_string(), json!(metadata.archived));
         }
     }
 
-    Ok(Json(PatchSessionResponse {
+    Ok(PatchSessionResponse {
         session: metadata,
         changes,
-    }))
+    })
+}
+
+/// Hold `id`'s live lease across an external load and save, refusing (409)
+/// as rename, archive and delete do when an interactive session holds the
+/// document open — its next autosave would revert the write — and rejecting
+/// a malformed id (400). A released liveness probe cannot protect the write
+/// that follows it (#6144). Taking the lease may retry with short sleeps, so
+/// it runs off the async worker; drop the lease only after the save.
+async fn reserve_external_session_write(
+    state: &RuntimeApiState,
+    id: &str,
+    action: &'static str,
+) -> Result<crate::session_manager::SessionLease, ApiError> {
+    let sessions_dir = state.sessions_dir.clone();
+    let id = id.to_string();
+    tokio::task::spawn_blocking(move || {
+        SessionManager::new(sessions_dir)
+            .map_err(|e| ApiError::internal(format!("Failed to open sessions dir: {e}")))?
+            .reserve_session_for_external_write(&id)
+            .map_err(|e| map_session_err(&id, e, action))
+    })
+    .await
+    .map_err(|_| ApiError::internal("session lease reservation failed"))?
 }
 
 /// `GET /v1/sessions/{id}` query options.
@@ -440,7 +480,9 @@ pub(super) async fn create_session_from_thread(
         });
     }
 
-    let messages = messages_from_thread_detail(&detail);
+    let messages = messages_from_thread_detail(&detail).map_err(|error| {
+        ApiError::internal(format!("Failed to reconstruct thread history: {error}"))
+    })?;
     if messages.is_empty() {
         return Err(ApiError::bad_request(format!(
             "Thread {thread_id} has no user or assistant messages to save"
@@ -464,13 +506,7 @@ pub(super) async fn create_session_from_thread(
     // this thread's lossier projection would drop its images, tool work and
     // system prompt. Export leaves that document untouched.
     let session_handle = crate::runtime_threads::thread_session_id(&detail.thread.id);
-    if manager.is_session_live_anywhere(&session_handle) {
-        return Err(map_session_err(
-            &session_handle,
-            crate::session_manager::live_session_conflict(&session_handle),
-            "export",
-        ));
-    }
+    let _lease = reserve_external_session_write(&state, &session_handle, "export").await?;
     let existing = match manager.load_session(&session_handle) {
         Ok(existing) => Some(existing),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
@@ -602,130 +638,15 @@ fn thread_detail_has_live_work(detail: &ThreadDetail) -> bool {
     })
 }
 
-pub(super) fn messages_from_thread_detail(detail: &ThreadDetail) -> Vec<Message> {
-    let items_by_id: HashMap<&str, _> = detail
-        .items
-        .iter()
-        .map(|item| (item.id.as_str(), item))
-        .collect();
-    let mut messages = Vec::new();
-
-    for turn in &detail.turns {
-        let mut assistant_blocks: Vec<ContentBlock> = Vec::new();
-        let mut user_blocks: Vec<ContentBlock> = Vec::new();
-        let flush_assistant = |blocks: &mut Vec<ContentBlock>, msgs: &mut Vec<Message>| {
-            if !blocks.is_empty() {
-                msgs.push(Message {
-                    role: Role::Assistant,
-                    content: std::mem::take(blocks),
-                });
-            }
-        };
-        let flush_user = |blocks: &mut Vec<ContentBlock>, msgs: &mut Vec<Message>| {
-            if !blocks.is_empty() {
-                msgs.push(Message {
-                    role: Role::User,
-                    content: std::mem::take(blocks),
-                });
-            }
-        };
-
-        for item_id in &turn.item_ids {
-            let Some(item) = items_by_id.get(item_id.as_str()) else {
-                continue;
-            };
-            match item.kind {
-                TurnItemKind::UserMessage => {
-                    flush_assistant(&mut assistant_blocks, &mut messages);
-
-                    let text = item.detail.as_deref().map(str::trim).unwrap_or("");
-                    if !text.is_empty() {
-                        user_blocks.push(ContentBlock::Text {
-                            text: text.to_string(),
-                            cache_control: None,
-                        });
-                    }
-                }
-                TurnItemKind::AgentMessage => {
-                    flush_user(&mut user_blocks, &mut messages);
-                    let text = item.detail.as_deref().map(str::trim).unwrap_or("");
-                    if !text.is_empty() {
-                        assistant_blocks.push(ContentBlock::Text {
-                            text: text.to_string(),
-                            cache_control: None,
-                        });
-                    }
-                }
-                TurnItemKind::AgentReasoning => {
-                    flush_user(&mut user_blocks, &mut messages);
-                    let thinking = item.detail.as_deref().map(str::trim).unwrap_or("");
-                    if !thinking.is_empty() {
-                        assistant_blocks.push(ContentBlock::Thinking {
-                            thinking: thinking.to_string(),
-                            signature: None,
-                            state: None,
-                        });
-                    }
-                }
-                TurnItemKind::ToolCall => {
-                    // Check metadata to distinguish tool_use from tool_result.
-                    let meta = item.metadata.as_ref();
-                    let is_tool_result = meta.and_then(|m| m.get("tool_result_for")).is_some();
-                    if is_tool_result {
-                        flush_assistant(&mut assistant_blocks, &mut messages);
-
-                        let tool_use_id = meta
-                            .and_then(|m| m.get("tool_result_for"))
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        let content = item.detail.as_deref().unwrap_or("").to_string();
-                        let is_error = meta
-                            .and_then(|m| m.get("is_error"))
-                            .and_then(|v| v.as_bool())
-                            .unwrap_or(false);
-                        let content_blocks = meta
-                            .and_then(|m| m.get("content_blocks"))
-                            .and_then(|v| v.as_array())
-                            .cloned();
-                        user_blocks.push(ContentBlock::ToolResult {
-                            tool_use_id,
-                            content,
-                            is_error: if is_error { Some(true) } else { None },
-                            content_blocks,
-                        });
-                    } else {
-                        flush_user(&mut user_blocks, &mut messages);
-                        let tool_use_id = meta
-                            .and_then(|m| m.get("tool_use_id"))
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        let tool_name = meta
-                            .and_then(|m| m.get("tool_name"))
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        let input_str = item.detail.as_deref().unwrap_or("{}");
-                        let input: Value = serde_json::from_str(input_str).unwrap_or(Value::Null);
-                        assistant_blocks.push(ContentBlock::ToolUse {
-                            id: tool_use_id,
-                            name: tool_name,
-                            input,
-                            caller: None,
-                            thought_signature: None,
-                        });
-                    }
-                }
-                // Skip other item kinds (file_change, command_execution, etc.)
-                _ => {}
-            }
-        }
-        flush_assistant(&mut assistant_blocks, &mut messages);
-        flush_user(&mut user_blocks, &mut messages);
+pub(super) fn messages_from_thread_detail(detail: &ThreadDetail) -> anyhow::Result<Vec<Message>> {
+    let mut items_by_turn = HashMap::new();
+    for item in &detail.items {
+        items_by_turn
+            .entry(item.turn_id.clone())
+            .or_insert_with(Vec::new)
+            .push(item.clone());
     }
-
-    messages
+    RuntimeThreadManager::reconstruct_messages_from_turns_with(&detail.turns, &items_by_turn)
 }
 
 /// Merge the thread's authoritative cost into a session about to be saved.
@@ -892,13 +813,7 @@ pub(super) async fn save_current_session(
             .session_id
             .unwrap_or_else(|| snapshot.session_id.clone()),
     };
-    if manager.is_session_live_anywhere(&document_id) {
-        return Err(map_session_err(
-            &document_id,
-            crate::session_manager::live_session_conflict(&document_id),
-            "save",
-        ));
-    }
+    let _lease = reserve_external_session_write(&state, &document_id, "save").await?;
 
     // Build or update the session, mirroring TUI's `build_session_snapshot`.
     // Only `io::ErrorKind::NotFound` falls back to creating a new session;
@@ -998,26 +913,26 @@ pub(super) async fn delete_session(
     State(state): State<RuntimeApiState>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    let manager = SessionManager::new(state.sessions_dir.clone())
-        .map_err(|e| ApiError::internal(format!("Failed to open sessions dir: {e}")))?;
-    // Deleting a document an interactive session holds open would be undone
-    // by its next autosave, in whichever process holds it.
-    if manager.is_session_live_anywhere(&id) {
-        return Err(map_session_err(
-            &id,
-            crate::session_manager::live_session_conflict(&id),
-            "delete",
-        ));
-    }
-    manager
-        .delete_session(&id)
-        .map_err(|e| map_session_err(&id, e, "delete"))?;
-    // Threads bound to the document keep their turns; drop the dead link so
-    // they load from those instead of failing (#6144).
-    if let Err(error) = state.runtime_threads.unbind_session_threads(&id) {
-        tracing::warn!(session_id = %id, %error, "deleted session's threads were not unbound");
-    }
-    Ok(StatusCode::NO_CONTENT)
+    // Deletion validates the id (400), refuses an unknown one (404) before
+    // creating any lease file, and holds the session's live lease, refusing
+    // (409) a document an interactive session holds open: its next autosave,
+    // in whichever process holds it, would undo the delete. Taking the lease
+    // may retry with short sleeps, so all of it runs off the async worker.
+    tokio::task::spawn_blocking(move || {
+        let manager = SessionManager::new(state.sessions_dir.clone())
+            .map_err(|e| ApiError::internal(format!("Failed to open sessions dir: {e}")))?;
+        manager
+            .delete_session(&id)
+            .map_err(|e| map_session_err(&id, e, "delete"))?;
+        // Threads bound to the document keep their turns; drop the dead link
+        // so they load from those instead of failing (#6144).
+        if let Err(error) = state.runtime_threads.unbind_session_threads(&id) {
+            tracing::warn!(session_id = %id, %error, "deleted session's threads were not unbound");
+        }
+        Ok::<_, ApiError>(StatusCode::NO_CONTENT)
+    })
+    .await
+    .map_err(|_| ApiError::internal("session delete failed"))?
 }
 
 /// `GET /v1/sessions/repair`: what the last session-store repair did (#6144).
@@ -1104,6 +1019,7 @@ pub(super) fn session_to_detail(session: SavedSession) -> SessionDetailResponse 
         metadata: session.metadata,
         messages,
         system_prompt: session.system_prompt,
+        turn_outcomes: session.turn_outcomes,
     }
 }
 

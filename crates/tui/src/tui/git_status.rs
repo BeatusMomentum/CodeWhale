@@ -27,8 +27,8 @@
 
 #![allow(dead_code)] // Public API; worktree manager wiring continues post-render polish.
 
+use crate::dependencies::{ExternalTool, Git};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -113,8 +113,11 @@ impl ChangeCounts {
             self.untracked = self.untracked.saturating_add(1);
             return;
         }
+        // An unmerged path is a conflict and nothing else: its two letters
+        // name the merge sides, not a staged and a worktree change (U08-m2).
         if unmerged {
             self.conflicts = self.conflicts.saturating_add(1);
+            return;
         }
         if x != ' ' && x != '?' {
             self.staged = self.staged.saturating_add(1);
@@ -283,6 +286,7 @@ pub fn probe_workspace_status(workspace: &Path) -> Result<PorcelainStatus, Strin
             "--branch",
             "-z",
             "--untracked-files=normal",
+            "--ignore-submodules=dirty",
         ],
     )
     .ok();
@@ -296,7 +300,12 @@ pub fn probe_workspace_status(workspace: &Path) -> Result<PorcelainStatus, Strin
 fn legacy_workspace_status(workspace: &Path) -> Result<PorcelainStatus, String> {
     let raw = git_output(
         workspace,
-        &["status", "--porcelain", "--untracked-files=normal"],
+        &[
+            "status",
+            "--porcelain",
+            "--untracked-files=normal",
+            "--ignore-submodules=dirty",
+        ],
     )?;
     let (changes, changed_paths, changed_path_count) = parse_porcelain_v1(&raw);
     let head = git_output(workspace, &["symbolic-ref", "--short", "HEAD"])
@@ -537,17 +546,24 @@ fn parse_worktree_list(porcelain: &str) -> Vec<WorktreeEntry> {
 }
 
 fn git_output(cwd: &Path, args: &[&str]) -> Result<String, String> {
-    let output = Command::new("git")
+    // Shared read policy disables repository-selected helpers and lazy
+    // fetch while keeping the sanitized environment and optional locks off.
+    let output = Git::review_command(cwd)
+        .map_err(|e| format!("{e:#}"))?
+        .args(["-c", "log.showSignature=false"])
         .args(args)
-        // This probe runs against the user's own repository every two
-        // seconds. `git status` opportunistically refreshes the index, and
-        // that refresh takes `.git/index.lock` — colliding with a `git
-        // commit` the user runs in their own shell (#5617). Optional locks
-        // are exactly what we do not want here: we only ever read.
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .current_dir(cwd)
         .output()
         .map_err(|e| e.to_string())?;
+    finish_git_output(output)
+}
+
+// Explicit writes keep the user's own configured behavior. The shared Git
+// command still scrubs parent credentials and never opens a hidden prompt.
+fn git_write(cwd: &Path, args: &[&str]) -> Result<String, String> {
+    finish_git_output(Git::output(args, cwd).map_err(|e| e.to_string())?)
+}
+
+fn finish_git_output(output: std::process::Output) -> Result<String, String> {
     if !output.status.success() {
         return Err(String::from_utf8_lossy(&output.stderr).into_owned());
     }
@@ -653,7 +669,7 @@ pub fn create_worktree(
         args.push(path.to_str().ok_or("invalid path")?);
         args.push(branch);
     }
-    git_output(repo, &args).map(|_| ())?;
+    git_write(repo, &args).map(|_| ())?;
     force_refresh(repo);
     Ok(())
 }
@@ -849,8 +865,10 @@ locked
         assert_eq!(
             status.changes,
             ChangeCounts {
-                staged: 3,
-                modified: 2,
+                // The UU record is a conflict only, not also staged and
+                // modified (U08-m2).
+                staged: 2,
+                modified: 1,
                 untracked: 1,
                 conflicts: 1,
             }
@@ -872,7 +890,7 @@ locked
         );
         assert_eq!(
             status_line(&status).as_deref(),
-            Some("main | 3 staged, 2 modified, 1 untracked, 1 conflicts")
+            Some("main | 2 staged, 1 modified, 1 untracked, 1 conflicts")
         );
     }
 
@@ -884,9 +902,15 @@ locked
             );
             let status = parse_porcelain_v2(&raw).unwrap();
             assert_eq!(status.changes.conflicts, 1, "{code}");
+            assert_eq!(
+                (status.changes.staged, status.changes.modified),
+                (0, 0),
+                "{code} is not also staged or modified"
+            );
             assert!(status_line(&status).unwrap().contains("1 conflicts"));
             let (legacy, _, _) = parse_porcelain_v1(&format!("{code} conflict.rs\n"));
             assert_eq!(legacy.conflicts, 1, "legacy {code}");
+            assert_eq!((legacy.staged, legacy.modified), (0, 0), "legacy {code}");
         }
     }
 
@@ -955,7 +979,147 @@ locked
             "commit.gpgsign=false",
         ];
         all.extend_from_slice(args);
-        git_output(dir, &all).expect("git");
+        git_write(dir, &all).expect("git");
+    }
+
+    /// Even status may run repository-selected fsmonitor or clean-filter
+    /// code. A background read must neither run it nor expose parent env.
+    #[cfg(unix)]
+    #[test]
+    fn automatic_git_status_does_not_execute_repository_helpers() {
+        use std::os::unix::fs::PermissionsExt;
+        let _lock = crate::test_support::lock_test_env();
+        let _sentinel = crate::test_support::EnvVarGuard::set(
+            "CODEWHALE_TEST_GIT_POLL_SECRET",
+            "git-poll-sentinel",
+        );
+        let dir = tempfile::tempdir().expect("repo");
+        let hooks = tempfile::tempdir().expect("private hooks");
+        let repo = dir.path();
+        git(repo, &["init", "--initial-branch=main"]);
+        std::fs::write(repo.join("tracked.txt"), "one\n").unwrap();
+        std::fs::write(repo.join(".gitattributes"), "*.txt filter=fixture\n").unwrap();
+        git(repo, &["add", "."]);
+        git(repo, &["commit", "-m", "first commit"]);
+        let fsmonitor_seen = hooks.path().join("fsmonitor-seen");
+        let filter_seen = hooks.path().join("filter-seen");
+        for (name, marker, ending) in [
+            ("fsmonitor.sh", &fsmonitor_seen, "exit 1"),
+            ("clean.sh", &filter_seen, "cat"),
+        ] {
+            let script = hooks.path().join(name);
+            std::fs::write(
+                &script,
+                format!(
+                    "#!/bin/sh\nprintf 'leak=%s\\n' \"${{CODEWHALE_TEST_GIT_POLL_SECRET-unset}}\" >> '{}'\n{ending}\n",
+                    marker.display(),
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        git(
+            repo,
+            &[
+                "config",
+                "core.fsmonitor",
+                &hooks.path().join("fsmonitor.sh").to_string_lossy(),
+            ],
+        );
+        git(
+            repo,
+            &[
+                "config",
+                "filter.fixture.clean",
+                &hooks.path().join("clean.sh").to_string_lossy(),
+            ],
+        );
+        git(repo, &["config", "filter.fixture.required", "true"]);
+        // Same length forces content comparison instead of the cheap size check.
+        std::fs::write(repo.join("tracked.txt"), "two\n").unwrap();
+        let snapshot = probe_status(repo);
+        assert_eq!(snapshot.error, None);
+        assert_eq!(snapshot.branch.as_deref(), Some("main"));
+        assert!(
+            snapshot.dirty && snapshot.changes.modified >= 1,
+            "{snapshot:?}"
+        );
+        for marker in [&fsmonitor_seen, &filter_seen] {
+            assert!(
+                !marker.exists(),
+                "automatic read ran a repository helper: {}",
+                std::fs::read_to_string(marker).unwrap_or_default(),
+            );
+        }
+    }
+
+    /// log.showSignature can run the repository's gpg.program even with
+    /// captured stdout. Recent-commit polling never requests verification.
+    #[cfg(unix)]
+    #[test]
+    fn automatic_git_log_does_not_execute_a_signature_helper() {
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Stdio;
+        let _lock = crate::test_support::lock_test_env();
+        let _sentinel = crate::test_support::EnvVarGuard::set(
+            "CODEWHALE_TEST_GIT_POLL_SECRET",
+            "git-poll-sentinel",
+        );
+        let dir = tempfile::tempdir().expect("repo");
+        let hooks = tempfile::tempdir().expect("private hooks");
+        let repo = dir.path();
+        git(repo, &["init", "--initial-branch=main"]);
+        std::fs::write(repo.join("tracked.txt"), "one\n").unwrap();
+        git(repo, &["add", "."]);
+        git(repo, &["commit", "-m", "first commit"]);
+        let unsigned = git_write(repo, &["cat-file", "commit", "HEAD"]).unwrap();
+        let (headers, message) = unsigned.split_once("\n\n").unwrap();
+        let signed = format!(
+            "{headers}\ngpgsig -----BEGIN PGP SIGNATURE-----\n fixture\n -----END PGP SIGNATURE-----\n\n{message}"
+        );
+        let mut child = Git::command()
+            .expect("git available")
+            .args(["hash-object", "-t", "commit", "-w", "--stdin"])
+            .current_dir(repo)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(signed.as_bytes())
+            .unwrap();
+        let object = child.wait_with_output().unwrap();
+        assert!(object.status.success());
+        let oid = String::from_utf8(object.stdout).unwrap();
+        git(repo, &["update-ref", "HEAD", oid.trim()]);
+        let marker = hooks.path().join("signature-seen");
+        let script = hooks.path().join("signature.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf 'leak=%s\\n' \"${{CODEWHALE_TEST_GIT_POLL_SECRET-unset}}\" >> '{}'\nexit 1\n",
+                marker.display(),
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        git(repo, &["config", "gpg.program", &script.to_string_lossy()]);
+        git(
+            repo,
+            &["config", "gpg.openpgp.program", &script.to_string_lossy()],
+        );
+        git(repo, &["config", "log.showSignature", "true"]);
+        let log = git_output(repo, &["log", "-1", "--format=%s"]).unwrap();
+        assert!(log.contains("first commit"), "{log}");
+        assert!(
+            !marker.exists(),
+            "automatic log ran a signature helper: {}",
+            std::fs::read_to_string(marker).unwrap_or_default(),
+        );
     }
 
     /// One probe of a real repository: branch, changes, commits, and the

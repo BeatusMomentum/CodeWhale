@@ -112,6 +112,13 @@ pub(crate) fn assert_only_export_facet_exposed(parts: ContextParts<'_>) {
         lifecycle,
         control,
         export,
+        structcopy,
+        debug_receipts,
+        debug_change,
+        debug_history,
+        debug_diff,
+        debug_undo,
+        debug_diagnostics,
     } = parts;
 
     assert!(export.is_some(), "the export facet must be exposed");
@@ -132,6 +139,13 @@ pub(crate) fn assert_only_export_facet_exposed(parts: ContextParts<'_>) {
         ("plugin", plugin.is_some()),
         ("lifecycle", lifecycle.is_some()),
         ("control", control.is_some()),
+        ("structcopy", structcopy.is_some()),
+        ("debug_receipts", debug_receipts.is_some()),
+        ("debug_change", debug_change.is_some()),
+        ("debug_history", debug_history.is_some()),
+        ("debug_diff", debug_diff.is_some()),
+        ("debug_undo", debug_undo.is_some()),
+        ("debug_diagnostics", debug_diagnostics.is_some()),
     ];
     for (facet, present) in unrelated {
         assert!(

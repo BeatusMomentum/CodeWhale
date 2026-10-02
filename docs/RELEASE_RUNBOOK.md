@@ -3,6 +3,14 @@
 This runbook is the source of truth for shipping Rust crates, GitHub release assets,
 and the `codewhale` npm wrapper.
 
+GitHub assets are uploaded into a draft and published only after every expected
+asset's name, upload state, size and GitHub SHA-256 digest match the verified
+local set. A failed upload leaves an unpublished draft. Reruns may reuse matching
+draft assets; missing or mismatched digests stop publication for maintainer
+review. Public assets are never replaced. Draft lookup checks every release page.
+CNB release tags and GHCR version/latest tags follow canonical publication;
+manual CNB tag recovery also requires a complete public GitHub asset inventory.
+
 Current packaging note:
 - `codewhale-tui` is the live runtime crate linked into the installed
   `codewhale`/`codew` commands; it is not a third installed command.

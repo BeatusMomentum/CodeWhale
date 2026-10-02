@@ -1,5 +1,7 @@
 # User Memory
 
+> 阅读简体中文版：[zh_hans/MEMORY.md](zh_hans/MEMORY.md)。
+
 User memory gives the model a small, persistent, local store of
 preferences and conventions that should survive across sessions —
 "I prefer pytest over unittest", "this codebase uses 4-space

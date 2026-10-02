@@ -200,7 +200,12 @@ fn drive(
     // can never be resurrected into a later phase — above all never into
     // the branch push / PR open.
     job.sandbox_pending = true;
-    store.save(job)?;
+    if !store.save_unless_canceled(job)? {
+        // Canceled before any sandbox exists: nothing to tear down, and the
+        // canceled record on disk stays the truth.
+        *job = store.load(&job.id)?;
+        return Ok(());
+    }
     let receipt = launcher.create_sandbox(job)?;
     job.status = CloudJobStatus::Running;
     job.sandbox_pending = false;
@@ -244,6 +249,12 @@ fn drive(
 
     // OpeningPr → Done: push the branch and open the PR. The cancel check
     // is the last gate before money-adjacent side effects on the forge.
+    //
+    // Known limitation: the push and PR open are remote side effects with no
+    // transaction to join, so a cancel that lands after this check cannot
+    // stop them. The outcome is then stated, not hidden: the record stays
+    // `canceled` (the user's word) and carries the PR URL the forge returned.
+    // A `done` job is terminal; a cancel after it changes nothing.
     if cancel_requested(store, job)? {
         return finish_canceled(store, job, launcher, &receipt);
     }
@@ -258,15 +269,15 @@ fn drive(
         teardown_note(launcher, &receipt)
     );
     if !store.save_unless_canceled(job)? {
-        // A cancel landed while the PR was opening. The PR may well exist —
-        // keep its URL and say exactly that rather than claiming success or
-        // silently dropping the receipt.
+        // A cancel landed while the PR was opening. The forge accepted it,
+        // so the PR exists: keep its URL and say exactly that rather than
+        // claiming success or silently dropping the receipt.
         let mut canceled = store.load(&job.id)?;
         canceled.pr_url = job.pr_url.clone();
         canceled.agent_summary = job.agent_summary.clone();
         canceled.finished_unix = Some(canceled.finished_unix.unwrap_or_else(unix_timestamp));
         canceled.note = format!(
-            "Canceled as the PR was opening; it may still have landed at {}. {}",
+            "Canceled after the PR had already opened at {}; close it on the forge if it is unwanted. {}",
             opened.url,
             teardown_note(launcher, &receipt)
         );
@@ -1078,6 +1089,33 @@ mod tests {
         let persisted = store.load(&job.id).unwrap();
         assert_eq!(persisted.status, CloudJobStatus::Canceled);
         assert!(persisted.finished_unix.is_some());
+    }
+
+    #[test]
+    fn cancel_before_the_sandbox_intent_save_never_creates_a_sandbox() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = CloudJobStore::from_path(temp.path().join("jobs"));
+        let job = confirmed_job(&store);
+        // The runner loaded the job; the cancel lands before its first save.
+        let mut runner_copy = store.load(&job.id).unwrap();
+        crate::cloud_dispatch::cancel_job(
+            &store,
+            &job.id,
+            &RecordingLauncher::new("unused", fixture_patch()),
+        )
+        .unwrap();
+        let launcher = RecordingLauncher::new("sandbox_never", fixture_patch());
+        let forge = RecordingForgePr::new("https://github.com/org/repo/pull/9");
+
+        drive(&store, &mut runner_copy, &launcher, &forge).unwrap();
+
+        assert!(launcher.calls().is_empty(), "{:?}", launcher.calls());
+        assert!(forge.opened().is_empty());
+        assert_eq!(runner_copy.status, CloudJobStatus::Canceled);
+        assert_eq!(
+            store.load(&job.id).unwrap().status,
+            CloudJobStatus::Canceled
+        );
     }
 
     #[test]

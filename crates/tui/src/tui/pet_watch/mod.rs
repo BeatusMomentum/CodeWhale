@@ -741,6 +741,7 @@ mod tests {
                 turn_id: "preview-turn".into(),
                 created_at: chrono::Utc::now(),
                 route: None,
+                submission_id: None,
             },
             Instant::now(),
         );
@@ -817,6 +818,7 @@ mod tests {
                 turn_id: "turn".into(),
                 created_at: chrono::Utc::now(),
                 route: None,
+                submission_id: None,
             },
             Instant::now(),
         );
@@ -885,6 +887,7 @@ mod tests {
                 turn_id: "turn".into(),
                 created_at: chrono::Utc::now(),
                 route: None,
+                submission_id: None,
             },
             Instant::now(),
         );
@@ -923,6 +926,7 @@ mod tests {
                     turn_id: format!("turn-{:?}", status),
                     created_at: chrono::Utc::now(),
                     route: None,
+                    submission_id: None,
                 },
                 Instant::now(),
             );
@@ -936,6 +940,7 @@ mod tests {
                 turn_id: "turn-completed".into(),
                 created_at: chrono::Utc::now(),
                 route: None,
+                submission_id: None,
             },
             Instant::now(),
         );
@@ -961,6 +966,7 @@ mod tests {
                 turn_id: "turn-b".into(),
                 created_at: chrono::Utc::now(),
                 route: None,
+                submission_id: None,
             },
             Some("session-b"),
             Instant::now(),
@@ -999,6 +1005,7 @@ mod tests {
     fn foreground_projection_forwards_only_typed_owner_metadata() {
         let call = metadata(
             &Event::ToolCallStarted {
+                model_call: None,
                 id: "call-a".into(),
                 name: "exec_command".into(),
                 input: json!({"command":"PRIVATE TOOL INPUT"}),

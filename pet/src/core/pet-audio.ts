@@ -68,7 +68,7 @@ function noise(seed: number, sample: number): number {
   return ((x ^ x >>> 14) >>> 0) / 2147483648 - 1;
 }
 
-export function renderPetPCM(voices: readonly PetVoice[], startSample: number, length: number, sampleRate = 48_000): { left: Float32Array; right: Float32Array } {
+export function renderPetPCM(voices: readonly PetVoice[], startSample: number, length: number, sampleRate = 48_000) {
   if (!Number.isInteger(sampleRate) || sampleRate < 8000 || sampleRate > 96000
     || !Number.isSafeInteger(startSample) || startSample < 0 || !Number.isInteger(length) || length < 0 || length > sampleRate * 120)
     throw new Error('Invalid pet PCM range.');

@@ -280,8 +280,6 @@
   },
   "frontier": [
     "config",
-    "core",
-    "debug",
-    "session"
+    "core"
   ]
 }
