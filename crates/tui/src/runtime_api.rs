@@ -3826,6 +3826,7 @@ async fn list_skills(
                         plugin_id,
                         plugin_name,
                         authority,
+                        ..
                     } => (
                         None,
                         format!("reviewed-plugin-snapshot:{plugin_name}"),

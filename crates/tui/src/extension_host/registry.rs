@@ -226,6 +226,7 @@ pub struct OwnerRegistry {
     commands_by_name: HashMap<String, u64>,
     hooks: BTreeMap<u64, HookRegistration>,
     prompt_sections: BTreeMap<u64, PromptSectionRegistration>,
+    skill_roots: BTreeMap<u64, super::skills::SkillRootRegistration>,
     /// Lower-cased names of every native tool any engine's turn build has
     /// reported, plus the static set. Only ever grows: engines in one
     /// process build different native surfaces, and a name that is native
@@ -434,7 +435,127 @@ impl OwnerRegistry {
             RegisterKind::Command => self.register_command(params),
             RegisterKind::Hook => self.register_hook(params),
             RegisterKind::PromptSection => self.register_prompt_section(params),
+            RegisterKind::SkillRoot => {
+                Err("skill roots require reviewed snapshot admission".to_string())
+            }
         }
+    }
+
+    pub(crate) fn register_skill_root(
+        &mut self,
+        params: &RegisterParams,
+        snapshots: Vec<crate::plugins::types::PluginSkillSnapshot>,
+        host_generation: u64,
+    ) -> Result<u64, String> {
+        use super::skills::*;
+        params.check_spec()?;
+        root_path(&params.spec.name)?;
+        if params.kind != RegisterKind::SkillRoot || !params.spec.description.is_empty() {
+            return Err("invalid skill root spec".to_string());
+        }
+        let entry = self
+            .current(&params.owner)
+            .ok_or_else(|| "stale or unknown skill owner".to_string())?;
+        if entry.tier != HostTier::Plugin {
+            return Err("skill root owner has no reviewed bundle".to_string());
+        }
+        let content_hash = entry.content_hash.clone();
+        let owned: Vec<_> = self
+            .skill_roots
+            .values()
+            .filter(|root| root.owner == params.owner)
+            .collect();
+        let bytes = snapshots.iter().map(snapshot_bytes).sum::<usize>();
+        if snapshots.is_empty() || owned.iter().any(|root| root.path == params.spec.name) {
+            return Err(
+                "skill root is empty or already registered; dispose it before registering it again"
+                    .to_string(),
+            );
+        }
+        let names: HashSet<_> = owned
+            .iter()
+            .flat_map(|root| root.snapshots.iter().map(|skill| &skill.name))
+            .collect();
+        if snapshots.iter().any(|skill| names.contains(&skill.name)) {
+            return Err("skill name is duplicated across this owner's roots".to_string());
+        }
+        if owned.len() >= MAX_ROOTS_PER_OWNER
+            || self.skill_roots.len() >= MAX_ROOTS_PER_HOST
+            || owned.iter().map(|root| root.snapshots.len()).sum::<usize>() + snapshots.len()
+                > MAX_SKILLS_PER_OWNER
+            || self
+                .skill_roots
+                .values()
+                .map(|root| root.snapshots.len())
+                .sum::<usize>()
+                + snapshots.len()
+                > MAX_SKILLS_PER_HOST
+            || owned.iter().map(|root| root.bytes).sum::<usize>() + bytes > MAX_BYTES_PER_OWNER
+            || self
+                .skill_roots
+                .values()
+                .map(|root| root.bytes)
+                .sum::<usize>()
+                + bytes
+                > MAX_BYTES_PER_HOST
+        {
+            return Err(
+                "skill root owner or host count/instruction-byte limit reached".to_string(),
+            );
+        }
+        self.next_handle += 1;
+        let handle = self.next_handle;
+        self.skill_roots.insert(
+            handle,
+            SkillRootRegistration {
+                handle,
+                owner: params.owner.clone(),
+                host_generation,
+                content_hash,
+                path: params.spec.name.clone(),
+                snapshots,
+                bytes,
+            },
+        );
+        super::command::bump_epoch();
+        Ok(handle)
+    }
+
+    pub(crate) fn live_skill_roots(&self) -> Vec<super::skills::SkillRootRegistration> {
+        self.skill_roots
+            .values()
+            .filter(|root| {
+                self.owners.get(&root.owner.plugin_id).is_some_and(|entry| {
+                    entry.owner == root.owner && entry.state == OwnerState::Active
+                })
+            })
+            .cloned()
+            .collect()
+    }
+
+    pub(crate) fn is_live_skill_root(
+        &self,
+        handle: u64,
+        plugin_id: &str,
+        generation: u64,
+        host_generation: u64,
+        content_hash: &str,
+        state_generation: u64,
+    ) -> bool {
+        self.skill_roots.get(&handle).is_some_and(|root| {
+            root.owner.plugin_id == plugin_id
+                && root.owner.generation == generation
+                && root.host_generation == host_generation
+                && root.content_hash == content_hash
+                && self.owners.get(plugin_id).is_some_and(|entry| {
+                    entry.owner == root.owner
+                        && entry.state == OwnerState::Active
+                        && entry
+                            .authority
+                            .as_ref()
+                            .is_some_and(|authority| authority.state_generation == state_generation)
+                })
+        })
     }
 
     pub(crate) fn register_prompt_section(
@@ -769,6 +890,15 @@ impl OwnerRegistry {
     /// Undo exactly one registration. Idempotent; a stale or foreign handle is a no-op.
     pub fn unregister(&mut self, owner: &OwnerRef, handle: u64) {
         if self
+            .skill_roots
+            .get(&handle)
+            .is_some_and(|root| root.owner == *owner)
+        {
+            self.skill_roots.remove(&handle);
+            super::command::bump_epoch();
+            return;
+        }
+        if self
             .prompt_sections
             .get(&handle)
             .is_some_and(|section| section.owner == *owner)
@@ -831,6 +961,8 @@ impl OwnerRegistry {
     }
 
     fn remove_registrations_of(&mut self, plugin_id: &str) -> Vec<u64> {
+        self.skill_roots
+            .retain(|_, root| root.owner.plugin_id != plugin_id);
         self.prompt_sections
             .retain(|_, section| section.owner.plugin_id != plugin_id);
         self.hooks
@@ -878,6 +1010,9 @@ impl OwnerRegistry {
     /// Drop every registration owned by `tier`'s host: the host that held
     /// them is gone, and the other tier's host is not.
     fn clear_tier_registrations(&mut self, tier: HostTier) {
+        if tier == HostTier::Plugin {
+            self.skill_roots.clear();
+        }
         self.prompt_sections
             .retain(|_, section| section.tier != tier);
         self.hooks.retain(|_, hook| hook.tier != tier);

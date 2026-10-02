@@ -12140,6 +12140,7 @@ fn subagent_skill_catalog(context: &ToolContext) -> String {
                 plugin_id,
                 plugin_name,
                 authority,
+                ..
             } => format!(
                 "reviewed plugin {plugin_name} id={plugin_id} generation={} content={}",
                 authority.state_generation,

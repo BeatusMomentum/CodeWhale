@@ -1503,6 +1503,17 @@ fn try_persist_route_as_startup_default(
     .map(|_| ())
 }
 
+/// Caller scope captured by a background catalog scan; results never install
+/// into a different workspace, plugin snapshot or extension lifetime.
+#[derive(Clone)]
+pub(crate) struct SkillCacheScope {
+    pub(crate) epoch: u64,
+    pub(crate) workspace: std::path::PathBuf,
+    pub(crate) skills_dir: std::path::PathBuf,
+    pub(crate) mode: crate::skills::SkillDiscoveryMode,
+    pub(crate) plugins: std::sync::Arc<crate::plugins::PluginRegistry>,
+}
+
 pub struct App {
     pub mode: AppMode,
     /// Registered hotbar actions available for future slot config/render layers.
@@ -2249,7 +2260,7 @@ pub struct App {
     pub active_skill: Option<String>,
     /// Content-bound plugin authority carried with `active_skill`, when the
     /// selected skill came from a reviewed plugin bundle.
-    pub active_skill_provenance: Option<crate::plugins::types::PluginAuthority>,
+    pub active_skill_provenance: Option<crate::skills::SkillProvenance>,
     /// Cached (name, description) pairs from the skill registry.
     /// Populated once at startup and refreshed on install/uninstall so
     /// the slash menu can show skills without filesystem I/O on every keystroke.
@@ -3110,7 +3121,7 @@ impl App {
         tr(self.ui_locale, id)
     }
 
-    fn discover_cached_skills(
+    pub(crate) fn discover_cached_skills(
         workspace: &std::path::Path,
         skills_dir: &std::path::Path,
         discovery_mode: crate::skills::SkillDiscoveryMode,
@@ -3139,6 +3150,39 @@ impl App {
             self.skills_discovery_mode,
             self.plugin_registry.as_ref(),
         );
+        self.install_skill_cache(cached_skills);
+    }
+
+    pub(crate) fn skill_cache_scope(&self, epoch: u64) -> SkillCacheScope {
+        SkillCacheScope {
+            epoch,
+            workspace: self.workspace.clone(),
+            skills_dir: self.skills_dir.clone(),
+            mode: self.skills_discovery_mode,
+            plugins: std::sync::Arc::clone(&self.plugin_registry),
+        }
+    }
+
+    pub(crate) fn install_skill_cache_if_current(
+        &mut self,
+        scope: &SkillCacheScope,
+        epoch: u64,
+        cached_skills: Vec<(String, String)>,
+    ) -> bool {
+        if scope.epoch != epoch
+            || scope.workspace != self.workspace
+            || scope.skills_dir != self.skills_dir
+            || scope.mode != self.skills_discovery_mode
+            || !std::sync::Arc::ptr_eq(&scope.plugins, &self.plugin_registry)
+        {
+            return false;
+        }
+        self.install_skill_cache(cached_skills);
+        self.needs_redraw = true;
+        true
+    }
+
+    pub(crate) fn install_skill_cache(&mut self, cached_skills: Vec<(String, String)>) {
         self.hotbar_actions.replace_skills(&cached_skills);
         self.cached_skills = cached_skills;
     }

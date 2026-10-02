@@ -10156,7 +10156,7 @@ fn persisted_queued_plugin_skill_is_denied_after_cross_process_revocation() {
         "finish it".to_string(),
         Some("Do the queued work.".to_string()),
     )
-    .with_skill_provenance(Some(authority));
+    .with_skill_provenance(Some(authority.into()));
     let serialized = serde_json::to_string(&queued_ui_to_session(&queued)).unwrap();
     let persisted: QueuedSessionMessage = serde_json::from_str(&serialized).unwrap();
     let restored = queued_session_to_ui(persisted);
@@ -33047,4 +33047,72 @@ fn g3_resize_clear_and_failure_are_inside_synchronized_output() {
             "resize must emit a clear"
         );
     }
+}
+
+#[test]
+fn background_skill_cache_refuses_stale_epoch_workspace_and_plugin_snapshot() {
+    let mut app = create_test_app();
+    app.cached_skills = vec![("existing".into(), "kept".into())];
+    let current = app.skill_cache_scope(7);
+    let result = vec![("new".into(), "reviewed".into())];
+    assert!(!app.install_skill_cache_if_current(&current, 8, result.clone()));
+    let mut stale_workspace = current.clone();
+    stale_workspace.workspace = app.workspace.join("different");
+    assert!(!app.install_skill_cache_if_current(&stale_workspace, 7, result.clone()));
+    let mut stale_dir = current.clone();
+    stale_dir.skills_dir = app.skills_dir.join("different");
+    assert!(!app.install_skill_cache_if_current(&stale_dir, 7, result.clone()));
+    let mut stale_mode = current.clone();
+    stale_mode.mode = if app.skills_discovery_mode == crate::skills::SkillDiscoveryMode::Compatible
+    {
+        crate::skills::SkillDiscoveryMode::CodeWhaleOnly
+    } else {
+        crate::skills::SkillDiscoveryMode::Compatible
+    };
+    assert!(!app.install_skill_cache_if_current(&stale_mode, 7, result.clone()));
+    let mut stale_plugins = current.clone();
+    stale_plugins.plugins = Arc::new(crate::plugins::PluginRegistry::empty(&app.workspace));
+    assert!(!app.install_skill_cache_if_current(&stale_plugins, 7, result.clone()));
+    assert_eq!(app.cached_skills, [("existing".into(), "kept".into())]);
+    assert!(app.install_skill_cache_if_current(&current, 7, result.clone()));
+    assert_eq!(app.cached_skills, result);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn persisted_queued_native_skill_is_denied_after_host_withdrawal() {
+    use crate::extension_host::tests::{FixturePlugins, node_for_tests};
+    let Some(node) =
+        node_for_tests("persisted_queued_native_skill_is_denied_after_host_withdrawal")
+    else {
+        return;
+    };
+    let _home = crate::test_support::SealedHome::new();
+    let _policy = crate::plugins::activation::TestPolicyGuard::extension_host(true);
+    let fixture = FixturePlugins::new(&["skills-root"]).await;
+    let plugins = fixture.registry();
+    let manager = fixture.manager(node);
+    let _manager = crate::extension_host::TestManagerGuard::install(Arc::clone(&manager));
+    let engine = manager.attach(Arc::clone(&plugins));
+    engine.sync().await.unwrap();
+    let catalog = crate::skills::discover_in_workspace_with_mode_and_plugins(
+        fixture.workspace(),
+        crate::skills::SkillDiscoveryMode::CodeWhaleOnly,
+        Some(&plugins),
+    );
+    let skill = catalog.get("skills-root:quick-check").unwrap();
+    let queued = QueuedMessage::new("finish the check".into(), Some(skill.body.clone()))
+        .with_skill_provenance(skill.source.provenance());
+    let serialized = serde_json::to_string(&queued_ui_to_session(&queued)).unwrap();
+    let restored =
+        queued_session_to_ui(serde_json::from_str::<QueuedSessionMessage>(&serialized).unwrap());
+    let mut app = create_test_app();
+    app.workspace = fixture.workspace().to_path_buf();
+    let mut git = crate::tui::git_mention::GitMentionCache::default();
+    assert!(
+        queued_message_content_for_app(&app, &restored, None, &mut git)
+            .unwrap()
+            .contains("Inspect the exact source")
+    );
+    manager.shutdown().await;
+    assert!(queued_message_content_for_app(&app, &restored, None, &mut git).is_err());
 }

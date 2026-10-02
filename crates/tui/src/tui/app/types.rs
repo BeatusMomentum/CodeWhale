@@ -277,7 +277,7 @@ impl VimMode {}
 pub struct QueuedMessage {
     pub display: String,
     pub skill_instruction: Option<String>,
-    pub skill_provenance: Option<crate::plugins::types::PluginAuthority>,
+    pub skill_provenance: Option<crate::skills::SkillProvenance>,
     /// True once this turn has been painted into `history` as `HistoryCell::User`.
     /// Queue/offline submit echoes before the model runs; Immediate prepare skips
     /// a second paint when this is set so drained queued turns do not double.
@@ -409,7 +409,7 @@ impl QueuedMessage {
     #[must_use]
     pub fn with_skill_provenance(
         mut self,
-        provenance: Option<crate::plugins::types::PluginAuthority>,
+        provenance: Option<crate::skills::SkillProvenance>,
     ) -> Self {
         self.skill_provenance = provenance;
         self

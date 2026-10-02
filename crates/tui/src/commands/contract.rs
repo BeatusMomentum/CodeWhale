@@ -1996,7 +1996,7 @@ impl CommandSkillsContext for SkillsAdapter<'_> {
             .borrow()
             .active_skill_provenance
             .as_ref()
-            .map(|authority| authority.plugin_name.clone())
+            .map(|provenance| provenance.authority().plugin_name.clone())
     }
 
     fn refresh_skill_cache(&mut self) {
@@ -2848,21 +2848,15 @@ impl CommandSkillGroupContext for SkillGroupAdapter<'_> {
                     reason: "frontmatter does not allow user invocation".into(),
                 });
             }
-            let plugin_provenance = match &skill.source {
-                crate::skills::SkillSource::Native => None,
-                crate::skills::SkillSource::Plugin { authority, .. } => {
-                    if let Err(reason) = crate::plugins::registry::verify_plugin_component_authority(
-                        authority,
-                        crate::plugins::activation::PluginActivationCapability::Skills,
-                    ) {
-                        return Err(SkillActivationError::PluginRejected {
-                            name: skill.name.clone(),
-                            reason,
-                        });
-                    }
-                    Some(authority.as_ref().clone())
+            let plugin_provenance = skill.source.provenance();
+            if let Some(provenance) = &plugin_provenance {
+                if let Err(reason) = provenance.verify(&self.host.app.borrow().workspace) {
+                    return Err(SkillActivationError::PluginRejected {
+                        name: skill.name.clone(),
+                        reason,
+                    });
                 }
-            };
+            }
             let skill = skill.clone();
             let instruction = format!(
                 "You are now using a skill. Follow these instructions:\n\n# Skill: {}\n\n{}\n\n---\n\nNow respond to the user's request following the above skill instructions.",

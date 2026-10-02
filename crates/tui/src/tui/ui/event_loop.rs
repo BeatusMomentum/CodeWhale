@@ -1716,6 +1716,11 @@ pub(crate) async fn run_event_loop(
     // idle poll, the automation scan and the git probe all back off from it,
     // and all return to full cadence the moment it moves.
     let mut last_ui_activity = Instant::now();
+    let mut skill_registry_epoch = None;
+    let mut skill_cache_refresh: Option<(
+        crate::tui::app::SkillCacheScope,
+        tokio::task::JoinHandle<Vec<(String, String)>>,
+    )> = None;
     // Whether the previous iteration found the UI quiescent and quiet (see
     // `ui_state_is_quiescent`). The 2.5 s task block runs before this
     // iteration's facts exist, so it reads the previous one.
@@ -4391,6 +4396,42 @@ pub(crate) async fn run_event_loop(
                 })
                 .await;
             app.status_message = Some(rollback_warning);
+        }
+        let current_skill_epoch = crate::extension_host::command::epoch();
+        if skill_cache_refresh
+            .as_ref()
+            .is_some_and(|(_, job)| job.is_finished())
+        {
+            let (scope, job) = skill_cache_refresh.take().expect("finished skill refresh");
+            if let Ok(skills) = job.await
+                && app.install_skill_cache_if_current(&scope, current_skill_epoch, skills)
+            {
+                skill_registry_epoch = Some(scope.epoch);
+            }
+        }
+        if skill_cache_refresh.is_none() && skill_registry_epoch != Some(current_skill_epoch) {
+            let scope = app.skill_cache_scope(current_skill_epoch);
+            let scan = scope.clone();
+            let policy = crate::plugins::activation::extension_host_policy_enabled();
+            #[cfg(test)]
+            let env_scope = crate::test_support::env_scope_ticket();
+            #[cfg(test)]
+            let manager = crate::extension_host::manager();
+            let job = tokio::task::spawn_blocking(move || {
+                #[cfg(test)]
+                let _env_scope = crate::test_support::join_env_scope(env_scope);
+                #[cfg(test)]
+                let _manager = crate::extension_host::TestManagerGuard::install(manager);
+                let _policy = crate::plugins::activation::PolicyScope::propagate(policy);
+                crate::skills::clear_skill_discovery_cache();
+                App::discover_cached_skills(
+                    &scan.workspace,
+                    &scan.skills_dir,
+                    scan.mode,
+                    &scan.plugins,
+                )
+            });
+            skill_cache_refresh = Some((scope, job));
         }
         if commit_streaming_display_tick(app, &mut stream_display_clock, Instant::now()) {
             transcript_batch_updated = true;

@@ -125,6 +125,7 @@ pub(crate) mod plugin_config;
 pub(crate) mod prompt;
 pub(crate) mod protocol;
 pub(crate) mod registry;
+pub(crate) mod skills;
 pub(crate) mod supervisor;
 pub(crate) mod ticket;
 pub(crate) mod tier;
@@ -550,6 +551,9 @@ pub(crate) struct ManagerShared {
     /// Tier 0: Codewhale's own host code. Starts only for a built-in module.
     builtin: TierRuntime,
     sync_lock: tokio::sync::Mutex<()>,
+    /// Bound native root parsing independently of reconciliation (activation
+    /// itself calls admission while reconciliation owns sync_lock).
+    skill_admission: Arc<tokio::sync::Semaphore>,
     diagnostics: Mutex<VecDeque<Diagnostic>>,
     /// Which runtime every host (of either tier) runs on.
     runtime: Mutex<RuntimePin>,
@@ -764,7 +768,11 @@ impl ManagerShared {
             }
         };
         if let Some(authority) = authority {
+            #[cfg(test)]
+            let env_scope = crate::test_support::env_scope_ticket();
             tokio::task::spawn_blocking(move || {
+                #[cfg(test)]
+                let _env_scope = crate::test_support::join_env_scope(env_scope);
                 let _scope = activation::PolicyScope::propagate(policy);
                 crate::plugins::registry::verify_plugin_component_authority(
                     &authority,
@@ -865,6 +873,14 @@ impl HostEvents for Events {
                     .serve(&shared, self.tier, self.generation, params, cx)
                     .await
             }
+            protocol::HostRequest::Register(params) if params.kind == RegisterKind::SkillRoot => {
+                let Some(shared) = self.shared.upgrade() else {
+                    return Err(refuse("extension host manager is gone"));
+                };
+                let result =
+                    skills::admit_root(&shared, self.tier, self.generation, params, &cx).await;
+                Ok(serde_json::to_value(result).expect("registration result is JSON"))
+            }
             other => supervisor::registry_host_request(self, other, &cx),
         }
     }
@@ -910,6 +926,7 @@ impl HostEvents for Events {
                     RegisterKind::Command => "command",
                     RegisterKind::Hook => "hook",
                     RegisterKind::PromptSection => "prompt section",
+                    RegisterKind::SkillRoot => "skill root",
                 };
                 let message = format!(
                     "extension `{}` {kind} `{}` refused: {reason}",
@@ -1268,6 +1285,7 @@ impl ExtensionHostManager {
                 plugin: TierRuntime::new(),
                 builtin: TierRuntime::new(),
                 sync_lock: tokio::sync::Mutex::new(()),
+                skill_admission: Arc::new(tokio::sync::Semaphore::new(1)),
                 diagnostics: Mutex::new(VecDeque::new()),
                 runtime: Mutex::new(RuntimePin::default()),
                 plugin_configs: Mutex::new(plugin_config::PluginConfigs::default()),
@@ -1748,7 +1766,11 @@ impl ExtensionHostManager {
                 .iter()
                 .map(|(id, state)| (*id, Arc::clone(&state.plugins)))
                 .collect();
+            #[cfg(test)]
+            let env_scope = crate::test_support::env_scope_ticket();
             let scan = tokio::task::spawn_blocking(move || {
+                #[cfg(test)]
+                let _env_scope = crate::test_support::join_env_scope(env_scope);
                 let _scope = activation::PolicyScope::propagate(policy);
                 union_of_desired_owners(snapshots)
             })
@@ -2188,7 +2210,11 @@ impl ExtensionHostManager {
                 let runtime = shared.runtime.lock().expect("runtime lock");
                 (runtime.pinned.clone(), runtime.bun_failed)
             };
+            #[cfg(test)]
+            let env_scope = crate::test_support::env_scope_ticket();
             let prepared = tokio::task::spawn_blocking(move || {
+                #[cfg(test)]
+                let _env_scope = crate::test_support::join_env_scope(env_scope);
                 prepare_launch(&options, tier, pinned, bun_failed)
             })
             .await

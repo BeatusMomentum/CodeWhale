@@ -382,6 +382,7 @@ pub enum RegisterKind {
     Command,
     Hook,
     PromptSection,
+    SkillRoot,
 }
 
 /// What a registration proposes. The fields a kind uses are fixed by
@@ -429,11 +430,11 @@ impl RegisterParams {
             RegisterKind::Command if spec.input_schema.is_some() => {
                 Err("a command registration has no `spec.input_schema`".to_string())
             }
-            RegisterKind::Hook | RegisterKind::PromptSection
+            RegisterKind::Hook | RegisterKind::PromptSection | RegisterKind::SkillRoot
                 if spec.input_schema.is_some() || spec.argument_hint.is_some() =>
             {
                 Err(
-                    "a hook or prompt registration has no input schema or argument hint"
+                    "a hook, prompt or skill root registration has no input schema or argument hint"
                         .to_string(),
                 )
             }

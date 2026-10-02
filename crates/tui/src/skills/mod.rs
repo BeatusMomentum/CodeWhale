@@ -324,7 +324,74 @@ pub enum SkillSource {
         plugin_id: String,
         plugin_name: String,
         authority: Box<crate::plugins::types::PluginAuthority>,
+        native_registration: Option<crate::extension_host::skills::NativeSkillRef>,
     },
+}
+
+/// Legacy declarative receipts retain their serialized shape. Native roots
+/// carry only public lifetime facts beside the same reviewed bundle receipt.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(untagged)]
+pub enum SkillProvenance {
+    NativeRoot(NativeSkillProvenance),
+    Plugin(crate::plugins::types::PluginAuthority),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeSkillProvenance {
+    pub authority: crate::plugins::types::PluginAuthority,
+    pub registration: crate::extension_host::skills::NativeSkillRef,
+}
+
+impl From<crate::plugins::types::PluginAuthority> for SkillProvenance {
+    fn from(authority: crate::plugins::types::PluginAuthority) -> Self {
+        Self::Plugin(authority)
+    }
+}
+
+impl SkillProvenance {
+    pub fn authority(&self) -> &crate::plugins::types::PluginAuthority {
+        match self {
+            Self::Plugin(authority) => authority,
+            Self::NativeRoot(source) => &source.authority,
+        }
+    }
+    pub(crate) fn verify(&self, workspace: &Path) -> Result<(), String> {
+        let authority = self.authority();
+        if authority.workspace != workspace {
+            return Err("plugin skill belongs to a different workspace".to_string());
+        }
+        match self {
+            Self::Plugin(authority) => crate::plugins::registry::verify_plugin_component_authority(
+                authority,
+                crate::plugins::activation::PluginActivationCapability::Skills,
+            ),
+            Self::NativeRoot(source) => crate::extension_host::skills::verify_native_skill(
+                &source.authority,
+                &source.registration,
+            ),
+        }
+    }
+}
+
+impl SkillSource {
+    pub(crate) fn provenance(&self) -> Option<SkillProvenance> {
+        match self {
+            Self::Native => None,
+            Self::Plugin {
+                authority,
+                native_registration,
+                ..
+            } => Some(match native_registration {
+                Some(registration) => SkillProvenance::NativeRoot(NativeSkillProvenance {
+                    authority: authority.as_ref().clone(),
+                    registration: registration.clone(),
+                }),
+                None => SkillProvenance::Plugin(authority.as_ref().clone()),
+            }),
+        }
+    }
 }
 
 impl Skill {
@@ -444,7 +511,7 @@ impl SkillRegistry {
     /// Defends against pathological configurations (e.g. a user pointing
     /// `skills_dir` at `~`) without artificially limiting realistic
     /// vendored layouts like `<root>/<org>/<repo>/<skill>/SKILL.md`.
-    const MAX_DISCOVERY_DEPTH: usize = 8;
+    pub(crate) const MAX_DISCOVERY_DEPTH: usize = 8;
 
     /// Discover skills from the given directory.
     ///
@@ -1231,6 +1298,18 @@ fn merge_plugin_skills(
 ) -> SkillRegistry {
     if let Some(plugins) = plugins {
         merge_active_plugin_skills(&mut merged, plugins);
+        for (root, authority, reference) in
+            crate::extension_host::skills::roots_for_plugins(plugins)
+        {
+            merge_plugin_skill_snapshots(
+                &mut merged,
+                &authority.plugin_id.to_string(),
+                &authority.plugin_name.clone(),
+                &authority,
+                root.snapshots,
+                Some(reference),
+            );
+        }
     }
     merged
 }
@@ -1369,41 +1448,59 @@ fn merge_plugin_skills_from_plugins(
         {
             continue;
         }
-        let plugin_id = plugin.id.to_string();
         let plugin_name = plugin.name().to_string();
-        for snapshot in plugin.skill_snapshots {
-            let qualified_name = format!("{plugin_name}:{}", snapshot.name);
-            if let Some(existing) = registry
-                .skills
-                .iter()
-                .find(|skill| skill.name == qualified_name)
-            {
-                registry.push_warning(format!(
-                    "Plugin skill `{qualified_name}` at {} is shadowed by {}.",
-                    snapshot.path.display(),
-                    existing.path.display()
-                ));
-                continue;
-            }
-            registry.skills.push(Skill {
-                name: qualified_name,
-                legacy_activation_name: snapshot
-                    .legacy_activation_name
-                    .map(|legacy| format!("{plugin_name}:{legacy}")),
-                description: snapshot.description,
-                localized_descriptions: snapshot.localized_descriptions,
-                invocation: snapshot.invocation,
-                aliases: snapshot.aliases,
-                argument_hint: snapshot.argument_hint,
-                body: snapshot.body,
-                path: snapshot.path,
-                source: SkillSource::Plugin {
-                    plugin_id: plugin_id.clone(),
-                    plugin_name: plugin_name.clone(),
-                    authority: Box::new(authority.clone()),
-                },
-            });
+        merge_plugin_skill_snapshots(
+            registry,
+            &plugin.id.to_string(),
+            &plugin_name,
+            &authority,
+            plugin.skill_snapshots,
+            None,
+        );
+    }
+}
+
+fn merge_plugin_skill_snapshots(
+    registry: &mut SkillRegistry,
+    plugin_id: &str,
+    plugin_name: &str,
+    authority: &crate::plugins::types::PluginAuthority,
+    snapshots: Vec<crate::plugins::types::PluginSkillSnapshot>,
+    native_registration: Option<crate::extension_host::skills::NativeSkillRef>,
+) {
+    for snapshot in snapshots {
+        let qualified_name = format!("{plugin_name}:{}", snapshot.name);
+        if let Some(existing) = registry
+            .skills
+            .iter()
+            .find(|skill| skill.name == qualified_name)
+        {
+            registry.push_warning(format!(
+                "Plugin skill `{qualified_name}` at {} is shadowed by {}.",
+                snapshot.path.display(),
+                existing.path.display()
+            ));
+            continue;
         }
+        registry.skills.push(Skill {
+            name: qualified_name,
+            legacy_activation_name: snapshot
+                .legacy_activation_name
+                .map(|legacy| format!("{plugin_name}:{legacy}")),
+            description: snapshot.description,
+            localized_descriptions: snapshot.localized_descriptions,
+            invocation: snapshot.invocation,
+            aliases: snapshot.aliases,
+            argument_hint: snapshot.argument_hint,
+            body: snapshot.body,
+            path: snapshot.path,
+            source: SkillSource::Plugin {
+                plugin_id: plugin_id.to_string(),
+                plugin_name: plugin_name.to_string(),
+                authority: Box::new(authority.clone()),
+                native_registration: native_registration.clone(),
+            },
+        });
     }
 }
 
