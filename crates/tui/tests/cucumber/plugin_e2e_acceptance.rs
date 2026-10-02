@@ -2,7 +2,9 @@
 //!
 //! Tests the plugin frontmatter scanner end-to-end from the binary level:
 //! - Scripts with valid `# name:` frontmatter are discovered
-//! - Approval levels (auto, suggest, required) are parsed correctly
+//! - Approval levels (suggest, required) are parsed correctly, and a script's
+//!   `approval: auto` falls back to suggest (D4: script tools cannot approve
+//!   themselves)
 //! - Hidden files and README.md are ignored
 //! - Empty and missing directories are handled gracefully
 //! - The distributed binary still loads after the plugin module migration
@@ -51,7 +53,6 @@ struct TestPluginMeta {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum TestApproval {
-    Auto,
     Suggest,
     Required,
 }
@@ -83,8 +84,8 @@ fn parse_frontmatter(content: &str) -> Option<TestPluginMeta> {
         return None;
     }
 
+    // D4: `auto` is not honoured for script tools; it gets the default.
     let approval = match approval_str.to_lowercase().as_str() {
-        "auto" => TestApproval::Auto,
         "required" => TestApproval::Required,
         _ => TestApproval::Suggest,
     };
@@ -321,7 +322,6 @@ fn scanned_plugin_should_have_approval(
         .unwrap_or_else(|| panic!("plugin \"{name}\" not found in scan results"));
 
     let actual = match meta.approval {
-        TestApproval::Auto => "auto",
         TestApproval::Suggest => "suggest",
         TestApproval::Required => "required",
     };

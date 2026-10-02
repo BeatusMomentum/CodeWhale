@@ -2086,6 +2086,23 @@ impl ShellManager {
         self.sandbox_manager.configured_sandbox()
     }
 
+    /// Prepare a program for a tool that runs workspace code outside
+    /// `exec_shell`, under the policy and sandbox configuration a shell
+    /// command would get in this session.
+    fn prepare_runner(
+        &self,
+        program: &str,
+        args: Vec<String>,
+        cwd: &Path,
+        timeout: Duration,
+        policy_override: Option<ExecutionSandboxPolicy>,
+    ) -> ExecEnv {
+        let policy = policy_override.unwrap_or_else(|| self.sandbox_policy.clone());
+        let spec =
+            CommandSpec::program(program, args, cwd.to_path_buf(), timeout).with_policy(policy);
+        self.sandbox_manager.prepare(&spec)
+    }
+
     /// Request that the active foreground shell wait detach and leave its
     /// process running in the background job table.
     pub fn request_foreground_background(&mut self) {
@@ -4174,6 +4191,59 @@ fn is_native_readonly_sandbox(sandbox_type: SandboxType) -> bool {
         SandboxType::LinuxBubblewrap => true,
         _ => false,
     }
+}
+
+/// Build the child for a tool that runs workspace code outside `exec_shell`
+/// (gate commands, the cargo test runner). It gets exactly the confinement a
+/// shell command gets in this session: the same policy, the same OS sandbox
+/// wrapper, and the sanitized child environment. Callers keep their own
+/// process-tree containment, timeout and cancellation.
+///
+/// Known limitations: where the platform has no enforcing sandbox configured
+/// (Linux without bubblewrap, Windows) a workspace-write policy runs
+/// unsandboxed, as it does for `exec_shell`; a read-only policy refuses there.
+/// A session whose commands run in an external sandbox backend cannot run
+/// these local children at all.
+pub(crate) fn sandboxed_runner_command(
+    context: &crate::tools::spec::ToolContext,
+    program: &str,
+    args: Vec<String>,
+    cwd: &Path,
+    timeout: Duration,
+) -> std::result::Result<tokio::process::Command, crate::tools::spec::ToolError> {
+    use crate::tools::spec::ToolError;
+    if context.sandbox_backend.is_some() {
+        return Err(ToolError::not_available(
+            "this tool starts a local process, and this session runs commands in an external sandbox; run the command through the shell tool instead",
+        ));
+    }
+    let exec_env = context
+        .shell_manager
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .prepare_runner(
+            program,
+            args,
+            cwd,
+            timeout,
+            context.elevated_sandbox_policy.clone(),
+        );
+    if matches!(exec_env.policy, ExecutionSandboxPolicy::ReadOnly) {
+        require_native_readonly_execution(&exec_env)
+            .map_err(|error| ToolError::permission_denied(error.to_string()))?;
+    }
+    let mut cmd = tokio::process::Command::new(exec_env.program());
+    crate::utils::suppress_tokio_console_window(&mut cmd);
+    cmd.args(exec_env.args())
+        .current_dir(&exec_env.cwd)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    // Workspace code never inherits parent credentials.
+    crate::child_env::apply_to_tokio_command(
+        &mut cmd,
+        crate::child_env::string_map_env(&exec_env.env),
+    );
+    Ok(cmd)
 }
 
 fn require_native_readonly_execution(exec_env: &ExecEnv) -> Result<()> {

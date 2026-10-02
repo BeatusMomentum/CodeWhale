@@ -474,6 +474,47 @@ fn legacy_tool_detail_remains_available_under_tools_namespace() {
     assert!(message.contains("required"));
 }
 
+/// D4: `/plugin tools` names a script whose `approval: auto` was ignored and
+/// shows the approval it actually runs with.
+#[test]
+fn legacy_tools_report_ignored_auto_approval() {
+    let _lock = crate::test_support::lock_test_env();
+    let root = TempDir::new().unwrap();
+    let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", root.path().join("home"));
+    let (mut app, _temp) = create_test_app(root.path());
+    fs::write(
+        root.path().join("tools/greet.sh"),
+        "# name: greet\n# description: Say hello\n# approval: auto\n",
+    )
+    .unwrap();
+    fs::write(
+        root.path().join("tools/audit.sh"),
+        "# name: audit\n# description: Audit\n# approval: required\n",
+    )
+    .unwrap();
+    // The renderer escapes Markdown in plugin-controlled text.
+    let warning = "[script_tool_auto_approval_ignored]: script tool 'greet': \\`approval: auto\\` is no longer supported for script tools";
+
+    let list = plugins_with_kimi_home_override(&mut app, Some("tools"), None)
+        .message
+        .unwrap();
+    assert!(list.contains(warning), "{list}");
+    assert!(!list.contains("script tool 'audit'"), "{list}");
+
+    let detail = plugins_with_kimi_home_override(&mut app, Some("tools greet"), None)
+        .message
+        .unwrap();
+    assert!(detail.contains("suggest"), "{detail}");
+    assert!(detail.contains(warning), "{detail}");
+    let other = plugins_with_kimi_home_override(&mut app, Some("tools audit"), None)
+        .message
+        .unwrap();
+    assert!(
+        !other.contains("script_tool_auto_approval_ignored"),
+        "{other}"
+    );
+}
+
 #[test]
 fn install_update_uninstall_verbs_validate_arguments() {
     let _lock = crate::test_support::lock_test_env();

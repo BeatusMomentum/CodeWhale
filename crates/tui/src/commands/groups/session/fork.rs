@@ -78,7 +78,7 @@ pub(in crate::commands) fn fork_portable(
                     "Forked session {} -> {} (spawn_depth {})",
                     receipt.parent_label, receipt.fork_label, receipt.spawn_depth
                 ),
-                super::sync_session_action(receipt.sync),
+                codewhale_command_contract::outcome::SessionAction::SyncSession(receipt.sync),
             ),
             Err(error) => CommandResult::error(error),
         };
@@ -95,7 +95,7 @@ pub(in crate::commands) fn fork_portable(
                 "Forked session {} -> {}",
                 receipt.parent_label, receipt.fork_label
             ),
-            super::sync_session_action(receipt.sync),
+            codewhale_command_contract::outcome::SessionAction::SyncSession(receipt.sync),
         ),
         Err(error) => CommandResult::error(error),
     }

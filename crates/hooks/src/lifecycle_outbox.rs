@@ -136,7 +136,7 @@ impl LifecycleOutbox {
         webhook_token: Option<String>,
     ) -> Self {
         let path = match path {
-            Some(path) if !path.as_os_str().is_empty() => path,
+            Some(path) if !path.as_os_str().is_empty() => crate::expand_home(path),
             _ => return Self::disabled(),
         };
         let webhook = webhook_url
@@ -415,17 +415,7 @@ impl WriterState {
     /// needed here; the queue already serializes. The whole batch shares one
     /// open and one flush; each line still lands as its own complete record.
     async fn append_lines(&mut self, lines: &[String]) -> Result<()> {
-        if let Some(parent) = self.path.parent() {
-            tokio::fs::create_dir_all(parent).await.with_context(|| {
-                format!("failed to create outbox directory {}", parent.display())
-            })?;
-        }
-        let mut file = tokio::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)
-            .await
-            .with_context(|| format!("failed to open outbox {}", self.path.display()))?;
+        let mut file = crate::open_private_append(&self.path).await?;
         // Line + newline in a single `write_all` per record: with O_APPEND
         // each `write` lands contiguously, so even a second process appending
         // to the same file can interleave lines but can never splice one

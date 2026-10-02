@@ -448,20 +448,33 @@ pub(crate) fn pause_terminal(
     // silently ignore the pop. Matches the shutdown and panic paths.
     pop_keyboard_enhancement_flags(terminal.backend_mut());
     disable_alternate_scroll_mode(terminal.backend_mut());
-    execute!(terminal.backend_mut(), DisableFocusChange)?;
-    disable_raw_mode()?;
+    // Every teardown step is attempted even when an earlier one fails: one
+    // failed write must not leave mouse capture or raw mode on for the child
+    // (U03-09). The first failure is still returned so the caller refuses the
+    // handoff.
+    let mut first_error: Option<io::Error> = None;
+    let mut attempt = |result: io::Result<()>| {
+        if let Err(error) = result {
+            first_error.get_or_insert(error);
+        }
+    };
+    attempt(execute!(terminal.backend_mut(), DisableFocusChange));
+    attempt(disable_raw_mode());
     if use_alt_screen {
-        leave_alt_screen(terminal.backend_mut())?;
+        attempt(leave_alt_screen(terminal.backend_mut()));
         #[cfg(windows)]
         crate::logging::restore_verbose_state();
     }
     if use_mouse_capture {
-        execute!(terminal.backend_mut(), DisableMouseCapture)?;
+        attempt(execute!(terminal.backend_mut(), DisableMouseCapture));
     }
     if use_bracketed_paste {
         disable_bracketed_paste_mode(terminal.backend_mut());
     }
-    Ok(())
+    match first_error {
+        Some(error) => Err(error.into()),
+        None => Ok(()),
+    }
 }
 
 pub(crate) fn resume_terminal(

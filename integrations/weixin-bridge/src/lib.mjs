@@ -35,6 +35,33 @@ export {
   splitMessage,
 };
 
+/**
+ * Handle one getUpdates batch, then advance the poll cursor. The cursor moves
+ * only after every message in the batch was handled, so a crash replays the
+ * batch from iLink instead of dropping a prompt. Each message is claimed
+ * durably first: on replay, finished messages are skipped, and one a crashed
+ * process was still handling is reported through `interrupted` rather than
+ * run twice (its effect is unknown).
+ */
+export async function processUpdateBatch({ messages, nextCursor, store, keyOf, handle, interrupted, commitCursor }) {
+  for (const msg of messages || []) {
+    const key = keyOf(msg);
+    if (!key) continue;
+    const claim = await store.claimMessage(key);
+    if (claim === "done") continue;
+    if (claim === "interrupted") {
+      await interrupted(msg);
+      continue;
+    }
+    try {
+      await handle(msg);
+    } finally {
+      await store.completeMessage(key);
+    }
+  }
+  if (nextCursor) await commitCursor(nextCursor);
+}
+
 export function randomUin() {
   const uint32 = crypto.randomBytes(4).readUInt32BE(0);
   return Buffer.from(String(uint32), "utf-8").toString("base64");

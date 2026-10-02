@@ -99,6 +99,8 @@ export function isAgentDraft(value: unknown): value is AgentDraft {
   );
 }
 
+const MODEL_TIMEOUT_MS = 180_000;
+
 export async function agentChat(
   messages: ChatMessage[],
   apiKey: string,
@@ -109,6 +111,9 @@ export async function agentChat(
   const model = dsEnv?.model ?? process.env.DEEPSEEK_MODEL ?? FALLBACK_MODEL;
   const res = await fetch(`${base}/v1/chat/completions`, {
     method: "POST",
+    // Bounded so a stalled provider cannot hold a cron run until the
+    // platform kills it; generous because high-effort reasoning is slow.
+    signal: AbortSignal.timeout(MODEL_TIMEOUT_MS),
     headers: {
       "Content-Type": "application/json",
       Authorization: `Bearer ${apiKey}`,
@@ -556,6 +561,52 @@ export async function clearDraftResolution(
   await kv.delete(resolutionKey(type, id));
 }
 
+// A post whose GitHub outcome was unknown (network error, 5xx, 408, 429).
+// GitHub has no idempotency key, so this outlives the 15-minute claim: the
+// next attempt looks for the post the earlier one may have created before
+// posting again, however late the retry comes.
+const POST_UNKNOWN_PREFIX = "draft-post-unknown:";
+
+function postUnknownKey(type: AgentDraftType, id: string): string {
+  return POST_UNKNOWN_PREFIX + draftKey(type, id).slice("draft:".length);
+}
+
+export async function markPostOutcomeUnknown(stores: DraftClaimStores, type: AgentDraftType, id: string, claim: DraftClaim, identity: string): Promise<void> {
+  const attempt = { at: new Date().toISOString(), identity };
+  // Receipt before dispatch: a crash or an unavailable KV write must never
+  // allow a blind resend. The existing claim object is the strong authority.
+  if (claim.lock) await claim.lock.act({ op: "remember-post", token: claim.token, attempt });
+  if (!stores.CURATED_KV) throw new Error("post receipt storage unavailable");
+  const previous = await stores.CURATED_KV.get(postUnknownKey(type, id));
+  await stores.CURATED_KV.put(postUnknownKey(type, id), previous ?? JSON.stringify(attempt));
+}
+
+/** Read failures propagate. Absence is never inferred from unavailable storage. */
+export async function getPostOutcomeUnknown(stores: DraftClaimStores, type: AgentDraftType, id: string, identity: string): Promise<string | null> {
+  if (stores.DRAFT_CLAIM_LOCK) {
+    const lock = stores.DRAFT_CLAIM_LOCK.get(stores.DRAFT_CLAIM_LOCK.idFromName(claimKey(type, id)));
+    const result = await lock.act({ op: "post-status" });
+    if (!result.ok) throw new Error("post receipt unavailable");
+    if (result.attempt) {
+      if (typeof result.attempt.at !== "string" || !Number.isFinite(Date.parse(result.attempt.at))) throw new Error("invalid durable post receipt");
+      if (result.attempt.identity !== identity) throw new Error("unresolved post has different text or target");
+      return result.attempt.at;
+    }
+  }
+  if (!stores.CURATED_KV) throw new Error("post receipt storage unavailable");
+  const raw = await stores.CURATED_KV.get(postUnknownKey(type, id));
+  if (!raw) return null;
+  const attempt = JSON.parse(raw) as { at?: unknown; identity?: unknown };
+  if (attempt.identity !== undefined && attempt.identity !== identity) throw new Error("unresolved post has different text or target");
+  if (typeof attempt.at !== "string" || !Number.isFinite(Date.parse(attempt.at))) throw new Error("invalid post receipt");
+  return attempt.at;
+}
+
+export async function clearPostOutcomeUnknown(stores: DraftClaimStores, type: AgentDraftType, id: string, claim: DraftClaim): Promise<void> {
+  await stores.CURATED_KV?.delete(postUnknownKey(type, id));
+  if (claim.lock) await claim.lock.act({ op: "forget-post", token: claim.token });
+}
+
 // --- Public weekly digest records ---
 //
 // The cron writes the structured digest unapproved; only the maintainer's
@@ -810,16 +861,15 @@ export async function logUsage(
   outputTokens: number
 ): Promise<void> {
   if (!kv) return;
-  const date = new Date().toISOString().slice(0, 10);
-  const key = `usage:${date}`;
-  const raw = await kv.get(key);
-  const existing: UsageLog = raw
-    ? JSON.parse(raw)
-    : { date, calls: 0, inputTokens: 0, outputTokens: 0 };
-  existing.calls += 1;
-  existing.inputTokens += inputTokens;
-  existing.outputTokens += outputTokens;
-  await kv.put(key, JSON.stringify(existing), { expirationTtl: 60 * 60 * 24 * 90 }); // 90 days
+  // One record per model call under the day's prefix. KV has no atomic
+  // increment, so a shared daily counter that overlapping cron tasks read,
+  // bumped and wrote back lost calls; an append-only record cannot.
+  const at = new Date().toISOString();
+  const date = at.slice(0, 10);
+  const record: UsageLog = { date, calls: 1, inputTokens, outputTokens };
+  await kv.put(`usage:${date}:${at}:${crypto.randomUUID()}`, JSON.stringify(record), {
+    expirationTtl: 60 * 60 * 24 * 90, // 90 days
+  });
 }
 
 /**

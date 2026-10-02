@@ -40,6 +40,7 @@ const parityWorkflow = read(".github/workflows/release-parity.yml");
 const republish = read(".github/workflows/release-republish.yml");
 const releaseDockerfile = read("packaging/docker/Dockerfile.release");
 const cnb = read(".cnb.yml");
+const cnbSync = read(".github/workflows/sync-cnb.yml");
 const bundles = read("scripts/release/create-release-bundles.sh");
 const archiveInstaller = read("scripts/release/install.sh");
 const cliDispatcher = read("crates/cli/src/lib.rs");
@@ -498,6 +499,38 @@ assert.equal(
 );
 assert.match(release, /overwrite_files:\s*false/);
 assert.match(release, /fail_on_unmatched_files:\s*true/);
+// Assets land in a draft; the whole verified set becomes public at once, and
+// derived channels (the tagged container manifest) follow the canonical release.
+assert.match(release, /files: artifacts\/\*\n\s+draft: true\n/);
+assert.match(
+  namedStep(release, "Verify the draft's exact asset set, then publish it at once"),
+  /verify-release-inventory\.js \\\n\s+--draft --asset-dir artifacts --publish/,
+);
+const releaseJob = release.match(/\n  release:\n([\s\S]*?)\n  npm:\n/);
+assert.ok(releaseJob, "public release must retain its release job");
+assert.match(releaseJob[1], /^    needs: \[artifacts, docker-build, resolve\]$/m);
+const dockerJob = release.match(/\n  docker:\n([\s\S]*?)\n  release:\n/);
+assert.ok(dockerJob, "public release must retain its container manifest job");
+assert.match(dockerJob[1], /^    needs: \[docker-build, release, resolve\]$/m);
+assert.match(dockerJob[1], /needs\.release\.result == 'success'/);
+const cnbJob = release.match(/\n  cnb:\n([\s\S]*?)\n  npm:\n/);
+assert.ok(cnbJob, "CNB tag publication must follow the canonical release");
+assert.match(cnbJob[1], /^    needs: \[release, resolve\]$/m);
+assert.match(cnbJob[1], /needs\.release\.result == 'success'/);
+assert.match(cnbJob[1], /uses: \.\/\.github\/workflows\/sync-cnb\.yml/);
+assert.doesNotMatch(cnbSync, /^\s+tags:/m, "a tag push alone must not start CNB publication");
+assert.match(cnbSync, /^  workflow_call:/m);
+const cnbPush = namedStep(cnbSync, "Push triggering ref to CNB");
+const cnbPublicGate = cnbPush.indexOf("node scripts/release/verify-release-inventory.js --manifest");
+const cnbTagPush = cnbPush.indexOf('push_with_retry "tag ${TAG}"');
+assert.ok(cnbPublicGate >= 0 && cnbTagPush > cnbPublicGate,
+  "manual and called tag mirrors must verify the published inventory before pushing");
+assert.match(cnbPush, /verify-remote-tag\.sh/);
+assert.doesNotMatch(cnbPush, /\+refs\/tags\//, "published mirror tags must not be rewritten");
+assert.match(
+  namedStep(republish, "Require a complete published release"),
+  /verify-release-inventory\.js --manifest/,
+);
 
 assert.match(release, /^  docker-build:\n/m);
 assert.match(release, /^  docker:\n/m);

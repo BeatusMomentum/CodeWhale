@@ -2487,6 +2487,11 @@ reasoning contract, and all four membership ids omit generic sampling fields.
   scans `<workspace>/.codewhale/skills`, `~/.codewhale/skills`, and any explicit
   `skills_dir` override. The Skills Manager can still toggle a local compatible
   audit scan independently of this runtime knob — see [SKILLS.md](SKILLS.md).
+- `[skills].flat_workspace_root` (bool, default `false`): opt in to the flat
+  `<workspace>/skills` compatibility root after workspace trust. Without this
+  opt-in it is an audit candidate only; an explicit `skills_dir` remains an
+  alternative. `scan_codewhale_only = true` excludes the flat compatibility
+  root regardless of this flag, unless it is the explicit `skills_dir`.
 - `[skills].registry_url` / `[skills].max_install_size_bytes` (optional): used by
   `/skills --remote`, `/skills suggest <task>`, `/skills sync`, and `/skill
   install|update`. The default manager open path does not contact the registry.
@@ -3102,6 +3107,45 @@ tools loaded on every request, add them to `[tools].always_load`:
 always_load = ["Git", "notify"]
 ```
 
+### Script tools and overrides
+
+Scripts in `~/.codewhale/tools/` (or `[tools].plugin_dir`) that start with a
+`# name:` header become model-visible tools, and `/plugin tools` lists them.
+The script reads the tool's JSON input on stdin and writes a JSON
+`ToolResult` (`{"content": "...", "success": true}`) on stdout.
+
+```sh
+#!/usr/bin/env sh
+# name: word_count
+# description: Count words in the given text
+# schema: {"type":"object","properties":{"text":{"type":"string"}}}
+# approval: required
+```
+
+`# approval:` takes `suggest` (the default) or `required`; either way the
+tool follows the session's approval setting. A script cannot approve itself:
+`approval: auto` is no longer supported, so such a script gets the default,
+and the runtime log (`~/.codewhale/logs/`) and `/plugin tools` name it.
+
+A script cannot replace a built-in tool either. A script whose `# name:` is
+already registered is not loaded. `[tools.overrides]` may disable a built-in,
+or add a script or command tool under a name of its own:
+
+```toml
+[tools.overrides]
+"Web" = { type = "disabled" }                                   # turn a built-in off
+"audited_shell" = { type = "script", path = "audit-shell.sh" }  # a new tool
+"Bash" = { type = "script", path = "audit-shell.sh" }           # refused: Bash is built in
+```
+
+A `script` or `command` override keyed by a built-in is refused, and the
+built-in stays active. A status line names the key once per session, and the
+runtime log records it. To route a
+built-in through your own wrapper, disable the built-in and register the
+wrapper under a new name. An override keyed by a drop-in script's name still
+replaces that script. Relative `path` values resolve against the plugin
+directory.
+
 ### `request_user_input` limits
 
 `request_user_input` asks the user a short batch of multiple-choice questions.
@@ -3122,16 +3166,16 @@ either resize the batch or tell the user which setting to change.
 
 ### User-input wait timeout
 
-Questions from `request_user_input` wait a bounded time and then cancel with
-a timeout (#6003). The default is 300 seconds.
-Raise it when you step away or read carefully, or set `0` to wait forever
-(overnight automation, long human review). Headless `exec` runs have no
+Questions from `request_user_input` wait until answered or canceled by default
+(#6003). An omitted setting or `0` leaves the wait unbounded; a positive value
+cancels the question when that many seconds pass, capped at 86,400 (24 hours).
+Headless `exec` runs have no
 responder, so `request_user_input` is withheld there by default:
 the model reports the tool absent and finishes instead of stalling.
 
 ```toml
 [tools]
-user_input_timeout_seconds = 300   # default 300; 0 disables the timeout; clamped to 86400 (24h)
+user_input_timeout_seconds = 300   # opt into 5 minutes; omitted or 0 waits indefinitely; maximum 86400
 ```
 
 This key governs question waits only. Approvals have their own clock,
@@ -3153,12 +3197,24 @@ apply_patch = true
 mcp = true
 exec_policy = true
 code_mode = true # execute_tools composes MCP/plugin/native calls; false defers it behind tool_search
+verify_tool = true # agent-callable `verify` self-critique; false removes it from the tool catalog
+vision_model = false # true routes image analysis to the [vision_model] model (see above)
+extension_host = false # experimental: run reviewed plugins' native code (see EXTENSIONS.md)
 ```
 
 `code_mode` is on by default: `execute_tools` is advertised from the first
 request and nested calls go through the same permission gate as direct calls
 (see [Tool surface](TOOL_SURFACE.md#code-mode-execute_tools)). Set
 `code_mode = false` to defer it behind `tool_search` again.
+
+`extension_host` is experimental and off by default. Turning it on lets reviewed
+plugins run their `native` TypeScript/JavaScript tool code in a Node sidecar;
+toggling it in either direction changes the plugin activation policy, so every
+plugin is reviewed again after a restart. See
+[Writing an extension tool](EXTENSIONS.md).
+
+Every flag has a row in [`docs/features.toml`](features.toml), the feature
+registry; a test fails when a flag and its row disagree.
 
 You can also override features for a single run:
 
@@ -3193,7 +3249,7 @@ route. `[search] native` decides the order:
 
 - unset (default): native search leads only when no search provider is
   configured; a provider chosen in `[search] provider`,
-  `CODEWHALE_SEARCH_PROVIDER`, a Tavily key, or `/search` in-session wins;
+  `CODEWHALE_SEARCH_PROVIDER`, or a Tavily key wins;
 - `native = true`: native search leads even when a provider is pinned;
 - `native = false`: native search is never used.
 

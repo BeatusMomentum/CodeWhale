@@ -31,7 +31,6 @@ use codewhale_config::{
     classify_config_api_key_value, provider_base_url_is_official,
 };
 use codewhale_execpolicy::{AskForApproval, ExecPolicyContext, ExecPolicyEngine};
-use codewhale_mcp::{McpServerDefinition, run_stdio_server};
 use codewhale_secrets::Secrets;
 use codewhale_state::{StateStore, ThreadListFilters};
 use codewhale_telemetry::{
@@ -851,6 +850,10 @@ fn start_lane(request: LaneStartRequest) -> Result<()> {
     // Validate the worktree flags before creating the pending record, so a
     // bad pairing never leaves an orphaned `pending` lane in the registry.
     let worktree_request = validate_lane_worktree_flags(worktree_repo, branch, worktree_path)?;
+    let log_proxy = (kind == RuntimeBackendKind::Tmux)
+        .then(std::env::current_exe)
+        .transpose()
+        .context("resolve current Codewhale executable for tmux log proxy")?;
     let reg = LaneRegistry::open_default()?;
     let mut record = reg.create_pending(workflow, fleet, issue, goal, kind, worktree_ttl_secs)?;
     let worktree = worktree_request.map(|(repo_root, branch_name, worktree_path)| {
@@ -876,14 +879,18 @@ fn start_lane(request: LaneStartRequest) -> Result<()> {
         command: cmd,
         cwd,
         environment,
-        log_proxy: (kind == RuntimeBackendKind::Tmux)
-            .then(std::env::current_exe)
-            .transpose()
-            .context("resolve current Codewhale executable for tmux log proxy")?,
+        log_proxy,
         worktree,
     };
     let backend = resolve_backend(kind);
-    backend.start(&reg, &mut record, &spec)?;
+    if let Err(error) = backend.start(&reg, &mut record, &spec) {
+        // A start that failed before launch (worktree provisioning, the
+        // first log write) left the lane `pending` forever; reconcile skips
+        // pending lanes. Close it as failed. A lane a backend already made
+        // terminal is left as it is.
+        let _ = reg.mark_terminal_if_active(&mut record, LaneStatus::Failed);
+        return Err(error);
+    }
     println!("started {}", record.id);
     println!("status:  {}", record.status.as_str());
     println!("runtime: {}", record.runtime.as_str());
@@ -980,9 +987,56 @@ fn run_lane_control(
     emit_control_receipt(&receipt, json)
 }
 
+/// Read size for [`read_tail_lines`]; one chunk covers any ordinary tail.
+const LANE_LOG_TAIL_CHUNK_BYTES: u64 = 64 * 1024;
+
+/// The last `tail` non-empty lines of `file`, read backwards `chunk` bytes at
+/// a time, so allocation and disk work scale with the requested tail rather
+/// than with the whole (append-only, unbounded) lane log. Leaves the file
+/// positioned at the end it measured, where `--follow` continues.
+fn read_tail_lines(
+    file: &mut std::fs::File,
+    tail: usize,
+    chunk: u64,
+) -> std::io::Result<Vec<Vec<u8>>> {
+    use std::io::{Seek, SeekFrom};
+
+    let end = file.seek(SeekFrom::End(0))?;
+    let mut pos = end;
+    let mut buf: Vec<u8> = Vec::new();
+    loop {
+        // Until the read reaches the start of the file, the bytes before the
+        // first newline may be the tail of a longer line: never count them.
+        let complete = if pos == 0 {
+            &buf[..]
+        } else {
+            buf.iter()
+                .position(|byte| *byte == b'\n')
+                .map_or(&[][..], |index| &buf[index + 1..])
+        };
+        let lines: Vec<&[u8]> = complete
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .collect();
+        if pos == 0 || lines.len() >= tail {
+            let start = lines.len().saturating_sub(tail);
+            let tail_lines = lines[start..].iter().map(|line| line.to_vec()).collect();
+            file.seek(SeekFrom::Start(end))?;
+            return Ok(tail_lines);
+        }
+        let read = chunk.max(1).min(pos);
+        pos -= read;
+        file.seek(SeekFrom::Start(pos))?;
+        let mut block = vec![0; usize::try_from(read).unwrap_or(usize::MAX)];
+        file.read_exact(&mut block)?;
+        block.extend_from_slice(&buf);
+        buf = block;
+    }
+}
+
 fn run_lane_command(args: LaneArgs) -> Result<()> {
     use codewhale_lane::{ControlOperation, LaneRegistry, backend_for};
-    use std::io::{BufRead, Seek, Write};
+    use std::io::{BufRead, Write};
     use std::process::Command;
     use std::thread;
     use std::time::Duration;
@@ -1057,14 +1111,10 @@ fn run_lane_command(args: LaneArgs) -> Result<()> {
             if !path.exists() {
                 bail!("log file missing: {}", path.display());
             }
-            let content = std::fs::read(&path)?;
-            let lines: Vec<&[u8]> = content
-                .split(|byte| *byte == b'\n')
-                .filter(|line| !line.is_empty())
-                .collect();
-            let start = lines.len().saturating_sub(tail);
+            let mut file = std::fs::File::open(&path)?;
+            let lines = read_tail_lines(&mut file, tail, LANE_LOG_TAIL_CHUNK_BYTES)?;
             let mut stdout = std::io::stdout().lock();
-            for line in &lines[start..] {
+            for line in &lines {
                 stdout.write_all(String::from_utf8_lossy(line).as_bytes())?;
                 stdout.write_all(b"\n")?;
             }
@@ -1072,8 +1122,8 @@ fn run_lane_command(args: LaneArgs) -> Result<()> {
             if !follow {
                 return Ok(());
             }
-            let mut file = std::fs::File::open(&path)?;
-            file.seek(std::io::SeekFrom::End(0))?;
+            // Same handle, already at the end the tail measured: a line
+            // appended between the tail and the follow is printed, not lost.
             let mut reader = std::io::BufReader::new(file);
             loop {
                 let mut line = Vec::new();
@@ -1918,8 +1968,6 @@ struct AppServerArgs {
     cors_origin: Vec<String>,
 }
 
-const MCP_SERVER_DEFINITIONS_KEY: &str = "mcp.server_definitions";
-
 fn install_rustls_crypto_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
@@ -2438,22 +2486,14 @@ fn run() -> Result<()> {
         }
         Some(Commands::Dispatch(args)) => dispatch::run(args),
         Some(Commands::McpServer) => {
-            // `codewhale serve --mcp` delegates to the TUI and arms there, so
-            // without this the same user action reported differently depending
-            // on which spelling they typed — and `mcp-server`, a surface the
-            // schema documents as emitting, could only ever read zero. A
-            // structural zero a maintainer mistakes for an adoption zero is
-            // the thing the "which surfaces emit" section exists to prevent.
-            let resolved_runtime =
-                resolve_runtime_for_diagnostic_dispatch(&store, &runtime_overrides);
-            let session = start_cli_telemetry(
+            // Keep the CLI spelling, with the same tool and permission authority
+            // as `serve --mcp`. The legacy child-server proxy is retired.
+            let resolved_runtime = resolve_runtime_for_dispatch(&mut store, &runtime_overrides);
+            run_tui_server_in_process(
+                &cli,
                 &resolved_runtime,
-                Some(store.path().to_path_buf()),
-                Surface::McpServer,
-            );
-            let outcome = run_mcp_server_command(&mut store);
-            finish_cli_telemetry(session, &outcome);
-            outcome
+                vec!["serve".to_string(), "--mcp".to_string()],
+            )
         }
         Some(Commands::Config(args)) => {
             let resolved_runtime =
@@ -3106,12 +3146,15 @@ fn provider_keyring_set(secrets: &Secrets, provider: ProviderKind) -> bool {
     provider_keyring_api_key(secrets, provider).is_some()
 }
 
-/// Delete the keyring credential of every provider that has one stored.
+/// Delete the keyring credential of every provider that may have one stored.
 ///
 /// Returns a human-readable entry per slot whose deletion failed, so the
 /// caller can report the failure instead of claiming a clean logout while
 /// credentials linger in the keyring. Slots shared by several providers
-/// (e.g. the historical `siliconflow` slot) are deleted once.
+/// (e.g. the historical `siliconflow` slot) are deleted once. Only a slot the
+/// store reports empty is skipped: an unreadable slot may still hold a key,
+/// so its delete is attempted, and a refused delete is a failure unless the
+/// store then reports the slot empty (the rule `auth clear` applies too).
 fn clear_all_provider_api_keys_from_keyring(secrets: &Secrets) -> Vec<String> {
     let mut failures = Vec::new();
     let mut cleared_slots = std::collections::HashSet::new();
@@ -3120,10 +3163,12 @@ fn clear_all_provider_api_keys_from_keyring(secrets: &Secrets) -> Vec<String> {
         if !cleared_slots.insert(slot) {
             continue;
         }
-        if !provider_keyring_set(secrets, provider) {
+        if matches!(secrets.get(slot), Ok(None)) {
             continue;
         }
-        if let Err(error) = secrets.delete(slot) {
+        if let Err(error) = secrets.delete(slot)
+            && !matches!(secrets.get(slot), Ok(None))
+        {
             failures.push(format!("{slot}: {error}"));
         }
     }
@@ -5358,6 +5403,13 @@ fn run_model_command(
                     provider_source_label(resolved_runtime.provider_source)
                 );
                 println!("model_source: {}", source.as_str());
+                // The runtime refuses a route its resolver rejected; saying
+                // `resolved:` without the rejection would report it as usable.
+                if saved.is_none()
+                    && let Err(error) = &resolved_runtime.route
+                {
+                    println!("route_error: {error}");
+                }
                 return Ok(());
             }
 
@@ -5682,65 +5734,6 @@ fn app_server_token_from_env() -> Option<String> {
     std::env::var("CODEWHALE_APP_SERVER_TOKEN")
         .ok()
         .or_else(|| std::env::var("DEEPSEEK_APP_SERVER_TOKEN").ok())
-}
-
-fn run_mcp_server_command(store: &mut ConfigStore) -> Result<()> {
-    let persisted = load_mcp_server_definitions(store);
-    let updated = run_stdio_server(persisted)?;
-    persist_mcp_server_definitions(store, &updated)
-}
-
-fn load_mcp_server_definitions(store: &ConfigStore) -> Vec<McpServerDefinition> {
-    // `get_raw_string` first: `get_value` re-renders the extras entry as TOML,
-    // which quotes a JSON payload into `'[{"config":…}]'` and makes it
-    // unparseable — so every persisted definition was silently dropped and
-    // `mcp-server` started with an empty server list (#4727). `get_value`
-    // remains as the fallback for keys that are not plain extras strings.
-    let raw = store
-        .config
-        .get_raw_string(MCP_SERVER_DEFINITIONS_KEY)
-        .map(ToOwned::to_owned)
-        .or_else(|| store.config.get_value(MCP_SERVER_DEFINITIONS_KEY));
-    let Some(raw) = raw else {
-        return Vec::new();
-    };
-
-    match parse_mcp_server_definitions(&raw) {
-        Ok(definitions) => definitions,
-        Err(err) => {
-            eprintln!(
-                "warning: failed to parse persisted MCP server definitions ({MCP_SERVER_DEFINITIONS_KEY}): {err}"
-            );
-            Vec::new()
-        }
-    }
-}
-
-fn parse_mcp_server_definitions(raw: &str) -> Result<Vec<McpServerDefinition>> {
-    if let Ok(parsed) = serde_json::from_str::<Vec<McpServerDefinition>>(raw) {
-        return Ok(parsed);
-    }
-
-    let unwrapped: String = serde_json::from_str(raw).map_err(|_| {
-        anyhow!("invalid JSON payload at key {MCP_SERVER_DEFINITIONS_KEY}; contents were omitted")
-    })?;
-    serde_json::from_str::<Vec<McpServerDefinition>>(&unwrapped).map_err(|_| {
-        anyhow!(
-            "invalid MCP server definition list in key {MCP_SERVER_DEFINITIONS_KEY}; contents were omitted"
-        )
-    })
-}
-
-fn persist_mcp_server_definitions(
-    store: &mut ConfigStore,
-    definitions: &[McpServerDefinition],
-) -> Result<()> {
-    let encoded =
-        serde_json::to_string(definitions).context("failed to encode MCP server definitions")?;
-    store
-        .config
-        .set_value(MCP_SERVER_DEFINITIONS_KEY, &encoded)?;
-    store.save()
 }
 
 /// Delegate a long-running server command (`serve --http`/`--mobile`,
@@ -6077,6 +6070,28 @@ mod tests {
         Cli::try_parse_from(argv).unwrap_or_else(|err| panic!("parse failed for {argv:?}: {err}"))
     }
 
+    /// `lane logs --tail` reads backwards; a line split across a chunk
+    /// boundary must come back whole, and the handle must end at EOF.
+    #[test]
+    fn lane_log_tail_reads_whole_lines_across_chunk_boundaries() {
+        use std::io::Seek;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lane.log");
+        let body: String = (0..50).map(|i| format!("line-{i:03}\n\n")).collect();
+        std::fs::write(&path, &body).unwrap();
+        for chunk in [1, 3, 7, 64, 4096] {
+            for tail in [0, 1, 2, 49, 50, 80] {
+                let mut file = std::fs::File::open(&path).unwrap();
+                let got = read_tail_lines(&mut file, tail, chunk).unwrap();
+                let want: Vec<Vec<u8>> = (50usize.saturating_sub(tail)..50)
+                    .map(|i| format!("line-{i:03}").into_bytes())
+                    .collect();
+                assert_eq!(got, want, "chunk {chunk}, tail {tail}");
+                assert_eq!(file.stream_position().unwrap(), body.len() as u64);
+            }
+        }
+    }
+
     fn help_for(argv: &[&str]) -> String {
         let err = Cli::try_parse_from(argv).expect_err("expected --help to short-circuit parsing");
         assert_eq!(err.kind(), ErrorKind::DisplayHelp);
@@ -6131,6 +6146,8 @@ mod tests {
         gets: Mutex<Vec<String>>,
         values: Mutex<std::collections::BTreeMap<String, String>>,
         fail_delete_slot: Option<&'static str>,
+        /// A slot whose reads fail (a locked or access-denied keyring entry).
+        fail_get_slot: Option<&'static str>,
     }
 
     impl RecordingKeyringStore {
@@ -6155,6 +6172,11 @@ mod tests {
                 .lock()
                 .expect("recording gets lock")
                 .push(key.to_string());
+            if self.fail_get_slot == Some(key) {
+                return Err(codewhale_secrets::SecretsError::Keyring(
+                    "test read failure".into(),
+                ));
+            }
             Ok(self
                 .values
                 .lock()
@@ -6225,7 +6247,7 @@ mod tests {
             yolo: None,
             verbosity: None,
             http_headers: std::collections::BTreeMap::new(),
-            route: None,
+            route: Err(codewhale_config::route::RouteError::EmptyModel),
         }
     }
 
@@ -6399,18 +6421,6 @@ mod tests {
         // What the `for cause in err.chain().skip(1)` loop iterates over.
         let causes: Vec<String> = err.chain().skip(1).map(ToString::to_string).collect();
         assert_eq!(causes, vec!["TOML parse error at line 1, column 20"]);
-    }
-
-    #[test]
-    fn malformed_persisted_mcp_json_omits_secret_contents_and_keys() {
-        let secret = "sentinel";
-        let raw =
-            format!(r#"[{{"name":"private","env":{{"PRIVATE_TOKEN":"{secret}"}} trailing-junk}}]"#);
-        let error = parse_mcp_server_definitions(&raw).expect_err("malformed JSON must fail");
-        let diagnostic = format!("{error:#}");
-        assert!(!diagnostic.contains(secret), "{diagnostic}");
-        assert!(!diagnostic.contains("PRIVATE_TOKEN"), "{diagnostic}");
-        assert!(diagnostic.contains("contents were omitted"), "{diagnostic}");
     }
 
     #[test]
@@ -11117,6 +11127,34 @@ verbosity = "concise"
                 .oauth_credential_generation
                 .is_none()
         );
+    }
+
+    /// R02-08: a slot the keyring cannot read may still hold a key. Logout
+    /// must attempt its delete and report the failure, never print success.
+    #[test]
+    fn logout_reports_a_key_it_could_neither_read_nor_delete() {
+        let _lock = env_lock();
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let home = dir
+            .path()
+            .canonicalize()
+            .expect("canonical temp root")
+            .join("codewhale-home");
+        let _home = ScopedEnvVar::set("CODEWHALE_HOME", &home.to_string_lossy());
+        let _api_base = ScopedEnvVar::remove(codewhale_secrets::account::ACCOUNT_API_BASE_ENV);
+        let mut store = ConfigStore::load(Some(home.join("config.toml"))).expect("load config");
+        let locked_slot = provider_slot(ProviderKind::Deepseek);
+        let keyring = RecordingKeyringStore {
+            fail_get_slot: Some(locked_slot),
+            fail_delete_slot: Some(locked_slot),
+            ..RecordingKeyringStore::default()
+        };
+        keyring.set_value(locked_slot, "test-credential");
+        let secrets = Secrets::new(std::sync::Arc::new(keyring));
+        let error = run_logout_command_with_secrets(&mut store, &secrets, None)
+            .expect_err("an unconfirmed deletion must fail logout");
+        assert!(error.to_string().contains("logout incomplete"), "{error}");
+        assert!(error.to_string().contains(locked_slot), "{error}");
     }
 
     #[test]

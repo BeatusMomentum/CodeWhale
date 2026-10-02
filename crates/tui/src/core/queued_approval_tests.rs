@@ -144,6 +144,7 @@ async fn approving_the_first_of_three_queued_calls_cancels_none_of_them() {
             hook_executor: None,
             verbosity: None,
             provenance: UserInputProvenance::ExternalUser,
+            submission_id: None,
         }))
         .await
         .expect("send model turn");

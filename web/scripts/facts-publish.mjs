@@ -463,9 +463,62 @@ async function postgrest(path, { method = "GET", body, prefer } = {}) {
     },
     body: body === undefined ? undefined : JSON.stringify(body),
   });
-  if (!res.ok) { await res.body?.cancel(); throw new Error(`PostgREST request failed (HTTP ${res.status})`); }
+  if (!res.ok) { await res.body?.cancel(); throw Object.assign(new Error(`PostgREST request failed (HTTP ${res.status})`), { status: res.status }); }
   const text = await readBoundedResponse(res);
   return text ? JSON.parse(text) : null;
+}
+
+/**
+ * Insert one signed release and prove what landed. A re-run of the same
+ * envelope (the first run's reply was lost) reports the stored row instead of
+ * failing on the version high-water mark; different bytes at that version
+ * stay an error. `request` is postgrest() or a test double.
+ */
+export async function publishRelease(request, envelope, row, publicKey) {
+  const channels = await request(`facts_channel?scope=eq.global&slug=eq.${encodeURIComponent(envelope.channel)}&select=id`);
+  if (channels?.length !== 1) throw new Error(`channel ${envelope.channel} does not exist`);
+  const channelId = channels[0].id;
+  await request("facts_key", { method: "POST", body: { key_id: envelope.key_id, scope: "global", algorithm: "ed25519", public_key: publicKey, status: "active" }, prefer: "resolution=ignore-duplicates,return=minimal" });
+  let inserted;
+  try {
+    inserted = await request("facts_release", { method: "POST", body: { ...row, channel_id: channelId }, prefer: "return=representation" });
+  } catch (error) {
+    if (error?.status !== 409) throw error;
+    const existing = await request(`facts_release?channel_id=eq.${channelId}&facts_version=eq.${envelope.facts_version}&select=id,payload_sha256,status`);
+    if (existing?.length === 1 && existing[0].payload_sha256 === envelope.sha256) {
+      return { published: false, already_published: true, channel: envelope.channel, facts_version: envelope.facts_version, release_id: existing[0].id, payload_sha256: existing[0].payload_sha256, status: existing[0].status };
+    }
+    throw new Error(`facts_version ${envelope.facts_version} is at or below channel ${envelope.channel}'s high-water mark and is not this envelope; publish a higher facts_version`);
+  }
+  if (inserted?.length !== 1 || inserted[0].payload_sha256 !== envelope.sha256) {
+    throw new Error(`facts_release insert did not return exactly this envelope (rows: ${inserted?.length ?? 0}); inspect channel ${envelope.channel} before retrying`);
+  }
+  return { published: true, channel: envelope.channel, facts_version: envelope.facts_version, release_id: inserted[0].id, payload_sha256: inserted[0].payload_sha256 };
+}
+
+/**
+ * Revoke one published release. Only a `published` row flips, so a re-run
+ * keeps the first revocation's time and reason; a version that matches
+ * nothing is an error, never a silent `revoked: 0`. `head` says whether the
+ * channel now serves nothing (revoking an older version changes no delivery).
+ */
+export async function revokeRelease(request, { channel, version, reason, at }) {
+  const channels = await request(`facts_channel?scope=eq.global&slug=eq.${encodeURIComponent(channel)}&select=id,max_facts_version`);
+  if (channels?.length !== 1) throw new Error(`channel ${channel} does not exist`);
+  const head = Number(channels[0].max_facts_version) === version;
+  const release = `facts_release?channel_id=eq.${channels[0].id}&facts_version=eq.${version}`;
+  const updated = await request(`${release}&status=eq.published`, {
+    method: "PATCH",
+    body: { status: "revoked", revoked_at: at, revoke_reason: reason },
+    prefer: "return=representation",
+  });
+  if (updated?.length === 1) return { revoked: 1, already_revoked: false, head, channel, facts_version: version };
+  if ((updated?.length ?? 0) > 1) throw new Error(`revoke matched ${updated.length} releases for ${channel} v${version}; inspect the channel`);
+  const existing = await request(`${release}&select=status,revoked_at,revoke_reason`);
+  if (existing?.length === 1 && existing[0].status === "revoked") {
+    return { revoked: 0, already_revoked: true, head, channel, facts_version: version, revoked_at: existing[0].revoked_at, revoke_reason: existing[0].revoke_reason };
+  }
+  throw new Error(`channel ${channel} has no published facts_version ${version} to revoke`);
 }
 
 export async function readBoundedResponse(response, maxBytes = MAX_ENVELOPE_BYTES) {
@@ -591,11 +644,7 @@ async function main(argv) {
       console.log(JSON.stringify({ dry_run: true, channel: envelope.channel, facts_key: { key_id: envelope.key_id, public_key: pub }, facts_release: { ...row, payload_b64: `<${envelope.payload_b64.length} chars>` } }, null, 2));
       return 0;
     }
-    const channels = await postgrest(`facts_channel?scope=eq.global&slug=eq.${encodeURIComponent(envelope.channel)}&select=id`);
-    if (!channels?.length) throw new Error(`channel ${envelope.channel} does not exist`);
-    await postgrest("facts_key", { method: "POST", body: { key_id: envelope.key_id, scope: "global", algorithm: "ed25519", public_key: pub, status: "active" }, prefer: "resolution=ignore-duplicates,return=minimal" });
-    const inserted = await postgrest("facts_release", { method: "POST", body: { ...row, channel_id: channels[0].id }, prefer: "return=representation" });
-    console.log(JSON.stringify({ published: true, channel: envelope.channel, facts_version: envelope.facts_version, release_id: inserted?.[0]?.id ?? null, payload_sha256: inserted?.[0]?.payload_sha256 ?? null }, null, 2));
+    console.log(JSON.stringify(await publishRelease(postgrest, envelope, row, pub), null, 2));
     return 0;
   }
   if (cmd === "revoke") {
@@ -607,14 +656,7 @@ async function main(argv) {
       console.log(JSON.stringify({ dry_run: true, channel, facts_version: version, status: "revoked", revoke_reason: reason }, null, 2));
       return 0;
     }
-    const channels = await postgrest(`facts_channel?scope=eq.global&slug=eq.${encodeURIComponent(channel)}&select=id`);
-    if (!channels?.length) throw new Error(`channel ${channel} does not exist`);
-    const updated = await postgrest(`facts_release?channel_id=eq.${channels[0].id}&facts_version=eq.${version}`, {
-      method: "PATCH",
-      body: { status: "revoked", revoked_at: nowIso(), revoke_reason: reason },
-      prefer: "return=representation",
-    });
-    console.log(JSON.stringify({ revoked: updated?.length ?? 0, channel, facts_version: version }, null, 2));
+    console.log(JSON.stringify(await revokeRelease(postgrest, { channel, version, reason, at: nowIso() }), null, 2));
     return 0;
   }
   throw new Error(`unknown command ${cmd}`);

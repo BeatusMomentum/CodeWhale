@@ -1,7 +1,7 @@
 # HarmonyOS 与 OpenHarmony
 
 > 英文原文：[HarmonyOS.md](../HarmonyOS.md)。
-> 最后与英文同步日期（last synced with English revision）：2026-09-26。
+> 最后与英文同步日期（last synced with English revision）：2026-09-29。
 
 本文讲 Codewhale 在 HarmonyOS PC 上运行，以及 OpenHarmony 的交叉编译环境。
 
@@ -9,13 +9,13 @@
 
 | 目标 | Codewhale 层级 | CI 覆盖 | 分发方式 |
 | --- | --- | --- | --- |
-| 用户空间兼容 glibc 的 HarmonyOS PC | Tier 1 Linux ARM64 运行时 | 由 Linux ARM64 发布构建覆盖 | GitHub 发布二进制文件；npm 为次要途径 |
+| 用户空间兼容 glibc 的 HarmonyOS PC | Tier 1 Linux ARM64 运行时 | 由 Linux ARM64 发布构建覆盖 | GitHub 发布的二进制文件；npm 为次要途径 |
 | `aarch64-unknown-linux-ohos`（OpenHarmony） | Tier 2 交叉编译目标 | `codewhale-tui` 会用真实的 OpenHarmony 原生 SDK/sysroot 检查 | 从源码构建；没有预编译发布产物 |
 
 Tier 2 的意思是：每一处相关的源码改动都会过一遍编译检查，但维护者不承诺提供发布二进制文件，
 也不承诺做完整的设备级运行时测试。CI 任务使用已发布的 OpenHarmony 6.1 原生 SDK；
 如果 SDK、Clang 或 sysroot 不可用，它会刻意失败，
-而不是改用宿主头文件，或者拿一个可能谎报成功的桩顶上。
+而不是改用宿主头文件，或者用一个可能误报成功的桩（stub）来替代。
 
 ## 在 HarmonyOS PC 上运行
 
@@ -32,7 +32,7 @@ curl -fsSL https://codewhale.net/install.sh | sh
 HarmonyOS 设备。各版本的具体要求和 Cargo 兜底方案见
 [Linux ARM64 可移植性](./INSTALL.md#linux-arm64-可移植性)。
 已经直接安装过的，用 `codewhale update`。目录已被占用，或者由包管理器管理的安装，
-见[迁移到全新目录](../INSTALL.md#migrating-from-npm-cargo-or-another-installation)。
+见[迁移到全新目录](./INSTALL.md#migrating-from-npm-cargo-or-another-installation)。
 npm 仍是次要的打包途径。`codewhale-tui-linux-arm64` 这个文件名只为兼容旧版更新器而保留，
 并不是第三条命令。
 
@@ -113,7 +113,7 @@ chmod +x ./scripts/ohos/ohos-clang.sh ./scripts/ohos/ohos-clangxx.sh
 ./scripts/release/check-ohos-deps.sh
 ```
 
-这个守卫会校验 Windows 最终链接包装脚本的契约：证明 OHOS 会启用 `rquickjs-sys` 的
+这个守卫会校验 Windows 最终链接包装脚本的约定，证明 OHOS 会启用 `rquickjs-sys` 的
 bindgen feature，解析 `codewhale-tui` 在 `aarch64-unknown-linux-ohos` 下的依赖图，
 并且在不受支持的宿主/UI crate 重新进入该依赖图时失败：`nix` 0.28/0.29、
 `portable-pty`、`starlark`、`arboard` 或 `keyring`。这项无 SDK 检查不能代替真实的

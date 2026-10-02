@@ -43,9 +43,10 @@ const EVENT_CATCHUP_POLL: Duration = Duration::from_millis(200);
 // ignore its eligibility or generation fence.
 const CURRENT_TASK_SCHEMA_VERSION: u32 = 4;
 const STORE_REFRESH_INTERVAL: Duration = Duration::from_millis(200);
-/// An idle worker re-reads an unchanged store at most this often. In-process
-/// submissions wake workers immediately through `notify`; this fallback only
-/// bounds how long a write the fingerprint cannot see may wait (#6573).
+/// Retry an empty claim while queue metadata is missing or too recent to
+/// distinguish writes on a coarse-mtime filesystem. Once settled, idle workers
+/// wait for admission notifications or queue changes instead of reloading every
+/// task record on a timer (#6728).
 const STORE_IDLE_POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// Ceiling for the retry delay after a claim fails (e.g. "Task store is busy").
 /// A failed claim has already waited out `lock_store`'s 5s deadline, so work
@@ -755,6 +756,11 @@ pub enum TaskExecutionEvent {
         id: String,
         output: String,
     },
+    /// Emitted while a journal-tracked tool is in flight but the journal is
+    /// silent, so the worker supervisor's idle watchdog counts the window as
+    /// progress instead of idle. Supervisor-side liveness signal only: never
+    /// persisted and never shown on the task timeline.
+    ToolHeartbeat,
     ToolCompleted {
         id: String,
         name: String,
@@ -915,6 +921,18 @@ async fn drive_engine_turn(
     // Approval requests this turn is waiting on, each with the deadline the
     // runtime bridge will resolve it by (#6118).
     let mut pending_approvals: HashMap<String, Instant> = HashMap::new();
+    // Journal ids of tool items currently in flight. The journal records a
+    // tool call only at start/completion — nothing in between — so the
+    // idle-progress deadline would run unopposed during any silent build,
+    // test suite, or MCP call and kill healthy work at the idle limit. A
+    // tool that is still running IS progress; the wall-time budget remains
+    // the backstop for a hung one (a genuinely stuck tool also hits its own
+    // execution timeout long before a 30-minute wall budget in the common
+    // case). Both lifecycle edges are keyed by the journal item id:
+    // item.started also carries the engine tool-use id under "tool", but
+    // the terminal events only carry "item", so keying the insert by
+    // tool-use id would never drain the set.
+    let mut running_tools: HashSet<String> = HashSet::new();
 
     loop {
         let batch = match runtime_threads
@@ -946,6 +964,26 @@ async fn drive_engine_turn(
                 .is_some_and(|event_turn| event_turn != turn_id)
             {
                 continue;
+            }
+            match event.event.as_str() {
+                "item.started" => {
+                    // Journal tool items carry a `tool` payload key;
+                    // non-tool items do not. A silent context compaction is
+                    // therefore invisible to this set (disclosed gap: a
+                    // background task mid-compaction can still hit the idle
+                    // deadline — compaction has no heartbeat of its own).
+                    if event.payload.get("tool").is_some()
+                        && let Some(item_id) = journal_item_id(&event)
+                    {
+                        running_tools.insert(item_id);
+                    }
+                }
+                "item.completed" | "item.failed" => {
+                    if let Some(item_id) = journal_item_id(&event) {
+                        running_tools.remove(&item_id);
+                    }
+                }
+                _ => {}
             }
             match event.event.as_str() {
                 // An approval parks the turn on an external decision until
@@ -1006,6 +1044,22 @@ async fn drive_engine_turn(
         pending_approvals.retain(|_, until| now < *until);
         if !pending_approvals.is_empty() {
             guard.note_progress(now);
+        }
+
+        // Steady-state progress refresh: the journal is silent for the whole
+        // execution window of an in-flight tool, so the idle check must be
+        // suppressed for as long as any tool is running — not only on event
+        // arrival. The loop below wakes at least every EVENT_CATCHUP_POLL,
+        // so this runs throughout silent builds, test suites, and MCP calls.
+        if !running_tools.is_empty() {
+            guard.note_progress(now);
+            // The worker supervisor (run_task) feeds its own guard from the
+            // task-event channel and cannot see this journal-derived set, so
+            // without a heartbeat its idle deadline would still fire on the
+            // only production path that runs this loop. Publish the in-flight
+            // window on that channel; the heartbeat refreshes the supervisor's
+            // idle clock and is deliberately not persisted or surfaced.
+            emit_task_event(&events, TaskExecutionEvent::ToolHeartbeat).await;
         }
 
         match guard.evaluate(now, cancel.is_cancelled(), false) {
@@ -1101,6 +1155,19 @@ fn runtime_event_is_progress(event: &RuntimeEventRecord) -> bool {
         event.event.as_str(),
         "item.delta" | "item.started" | "item.completed" | "item.failed" | "turn.completed"
     )
+}
+
+/// The journal receipt id of the item a lifecycle event carries. Every
+/// lifecycle edge (`item.started` / `item.completed` / `item.failed`) repeats
+/// it under `payload.item.id`, which is what makes it a stable tracking key
+/// across both edges of one tool call.
+fn journal_item_id(event: &RuntimeEventRecord) -> Option<String> {
+    event
+        .payload
+        .get("item")
+        .and_then(|item| item.get("id"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
 }
 
 async fn ingest_runtime_event(
@@ -1412,9 +1479,10 @@ pub struct TaskManager {
 /// it before promoting the task record, and claims, cancels and startup
 /// recovery write it too. Running tasks flush their records into `tasks/`
 /// every few hundred milliseconds but leave the queue alone, so the tasks
-/// directory is deliberately not part of the fingerprint. Queued records that
-/// `load_state` rebuilds without a queue entry, and unreadable metadata
-/// (which compares as `None`), are covered by the idle fallback poll.
+/// directory is deliberately not part of the fingerprint. Startup still rebuilds
+/// missing queue entries from durable records. Failed claims retry independently,
+/// including a queue removal whose task-status write failed. Missing or recent
+/// metadata keeps a fallback deadline until it can be trusted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct StoreFingerprint(Option<(std::time::SystemTime, u64, u64)>);
 
@@ -1466,15 +1534,15 @@ impl ReadSnapshot {
 /// When an idle worker should next claim from the shared store (#6573).
 ///
 /// A worker claims when it was notified in-process, when the queue
-/// fingerprint changed since its last attempt, or when its deadline passed.
-/// The deadline is the idle fallback poll after an empty claim, and an
-/// exponential backoff after a failed one ("Task store is busy"). Workers
+/// fingerprint changed since its last attempt, or when a retry deadline passed.
+/// Settled empty claims have no deadline. Unreadable/recent metadata gets a
+/// fallback and failed claims get exponential backoff ("Task store is busy"). Workers
 /// keep checking the fingerprint every tick during a backoff, so a queue
 /// write from another process still gets an early retry.
 #[derive(Debug)]
 struct ClaimSchedule {
     seen: Option<StoreFingerprint>,
-    next_claim: Instant,
+    next_claim: Option<Instant>,
     failure_backoff: Duration,
 }
 
@@ -1482,24 +1550,33 @@ impl ClaimSchedule {
     fn new(now: Instant) -> Self {
         Self {
             seen: None,
-            next_claim: now,
+            next_claim: Some(now),
             failure_backoff: STORE_REFRESH_INTERVAL,
         }
     }
 
     fn should_claim(&self, fingerprint: &StoreFingerprint, now: Instant, woken: bool) -> bool {
-        woken || self.seen.as_ref() != Some(fingerprint) || now >= self.next_claim
+        woken
+            || self.seen.as_ref() != Some(fingerprint)
+            || self.next_claim.is_some_and(|deadline| now >= deadline)
     }
 
     fn claimed_task(&mut self, now: Instant) {
         self.seen = None;
-        self.next_claim = now;
+        self.next_claim = Some(now);
         self.failure_backoff = STORE_REFRESH_INTERVAL;
     }
 
     fn found_nothing(&mut self, fingerprint: StoreFingerprint, now: Instant) {
+        // Re-read a recent stamp after its coarse mtime tick has passed before
+        // trusting it indefinitely. Missing metadata never proves no change.
+        let settled = fingerprint.0.as_ref().is_some_and(|(modified, _, _)| {
+            std::time::SystemTime::now()
+                .duration_since(*modified)
+                .is_ok_and(|age| age >= STORE_IDLE_POLL_INTERVAL)
+        });
         self.seen = Some(fingerprint);
-        self.next_claim = now + STORE_IDLE_POLL_INTERVAL;
+        self.next_claim = (!settled).then_some(now + STORE_IDLE_POLL_INTERVAL);
         self.failure_backoff = STORE_REFRESH_INTERVAL;
     }
 
@@ -1507,7 +1584,7 @@ impl ClaimSchedule {
     fn claim_failed(&mut self, fingerprint: StoreFingerprint, now: Instant) -> Duration {
         let delay = self.failure_backoff;
         self.seen = Some(fingerprint);
-        self.next_claim = now + delay;
+        self.next_claim = Some(now + delay);
         self.failure_backoff = (delay * 2).min(STORE_BUSY_BACKOFF_MAX);
         delay
     }
@@ -2400,8 +2477,9 @@ impl TaskManager {
     /// Several processes can share one data dir, and every claim takes the
     /// cross-process store lock and reloads the whole store. An idle worker
     /// therefore only claims when it was notified in-process, when the store
-    /// fingerprint changed, or when the idle fallback poll is due; a failed
-    /// claim backs off exponentially instead of retrying every tick (#6573).
+    /// fingerprint changed, or when unreadable/recent metadata needs a retry.
+    /// A settled empty queue does no periodic full reload; failed claims still
+    /// back off exponentially instead of retrying every tick (#6573, #6728).
     async fn worker_loop(self: Arc<Self>) {
         let mut schedule = ClaimSchedule::new(Instant::now());
         let mut woken = true;
@@ -2786,6 +2864,9 @@ impl TaskManager {
                     },
                 );
             }
+            // Supervisor-side liveness only: recording it would put a
+            // timeline entry behind every poll tick of a silent build.
+            TaskExecutionEvent::ToolHeartbeat => {}
             TaskExecutionEvent::ToolCompleted {
                 id,
                 name,
@@ -3436,6 +3517,7 @@ fn execution_event_is_progress(event: &TaskExecutionEvent) -> bool {
         TaskExecutionEvent::MessageDelta { .. }
             | TaskExecutionEvent::ToolStarted { .. }
             | TaskExecutionEvent::ToolProgress { .. }
+            | TaskExecutionEvent::ToolHeartbeat
             | TaskExecutionEvent::ToolCompleted { .. }
     )
 }
@@ -3446,6 +3528,11 @@ fn execution_event_persist_urgent(event: &TaskExecutionEvent) -> bool {
         TaskExecutionEvent::MessageDelta { .. }
             | TaskExecutionEvent::ToolProgress { .. }
             | TaskExecutionEvent::RuntimeEvent { .. }
+            // Liveness-only signal (see the variant doc): it arrives up to
+            // ~5x/s throughout a silent build, and persisting it would
+            // rewrite the whole task record on every tick while holding the
+            // manager-wide state lock.
+            | TaskExecutionEvent::ToolHeartbeat
     )
 }
 
@@ -3888,7 +3975,7 @@ mod tests {
         let second =
             TaskManager::start_with_executor_in_scope(config(), Arc::new(MockExecutor), "second")
                 .await?;
-        sleep(Duration::from_millis(300)).await;
+        sleep(STORE_IDLE_POLL_INTERVAL + Duration::from_millis(300)).await;
         for manager in [&first, &second] {
             manager.store_loads.store(0, Ordering::Relaxed);
         }
@@ -3897,10 +3984,10 @@ mod tests {
         sleep(window).await;
         let loads =
             first.store_loads.load(Ordering::Relaxed) + second.store_loads.load(Ordering::Relaxed);
-        // Four idle workers polling every 200ms would load ~40 times here;
-        // the idle fallback allows at most one reload per worker per window.
+        // Once the queue stamp settles, unchanged stores never reload just
+        // because time passed. The former 2s fallback reloads in this window.
         assert!(
-            loads <= 8,
+            loads == 0,
             "idle workers reloaded the shared store {loads} times in {window:?}"
         );
 
@@ -4023,7 +4110,7 @@ mod tests {
             "idle",
         )
         .await?;
-        sleep(Duration::from_millis(300)).await;
+        sleep(STORE_IDLE_POLL_INTERVAL + Duration::from_millis(300)).await;
         idle.store_loads.store(0, Ordering::Relaxed);
         let record = root.path().join("tasks").join(format!("{}.json", task.id));
         let flushed_before = fs::metadata(&record)?.modified()?;
@@ -4036,10 +4123,10 @@ mod tests {
             flushed_before,
             "the running task should have flushed its record during the window"
         );
-        // Two workers ticking every 200ms would reload ~20 times; the idle
-        // fallback allows about one reload per worker per window.
+        // Task-event writes never change queue eligibility, so settled idle
+        // workers do not need to re-read them.
         assert!(
-            loads <= 4,
+            loads == 0,
             "idle workers reloaded the shared store {loads} times in {window:?} while a task ran elsewhere"
         );
 
@@ -4075,14 +4162,94 @@ mod tests {
         assert!(schedule.should_claim(&fingerprint(2), now, false));
         assert!(schedule.should_claim(&fingerprint(1), now, true));
 
-        // An empty claim resets the backoff and waits for the idle fallback.
+        // An empty claim on a settled queue resets backoff without scheduling
+        // another scan, however long the worker stays idle.
         schedule.found_nothing(fingerprint(2), now);
         assert!(!schedule.should_claim(&fingerprint(2), now, false));
-        assert!(schedule.should_claim(&fingerprint(2), now + STORE_IDLE_POLL_INTERVAL, false));
+        assert!(!schedule.should_claim(&fingerprint(2), now + Duration::from_secs(86_400), false));
         assert_eq!(
             schedule.claim_failed(fingerprint(2), now),
             STORE_REFRESH_INTERVAL
         );
+    }
+
+    #[test]
+    fn claim_schedule_retries_unknown_or_recent_queue_metadata() {
+        let now = Instant::now();
+        for fingerprint in [
+            StoreFingerprint(None),
+            StoreFingerprint(Some((std::time::SystemTime::now(), 1, 1))),
+        ] {
+            let mut schedule = ClaimSchedule::new(now);
+            schedule.found_nothing(fingerprint.clone(), now);
+            assert!(!schedule.should_claim(&fingerprint, now, false));
+            assert!(schedule.should_claim(&fingerprint, now + STORE_IDLE_POLL_INTERVAL, false));
+        }
+    }
+
+    #[tokio::test]
+    async fn settled_idle_workers_notice_external_queue_writes_without_notify() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let executions = Arc::new(AtomicUsize::new(0));
+        let manager = TaskManager::start_with_executor(
+            TaskManagerConfig {
+                worker_count: 2,
+                ..test_config(root.path().to_path_buf())
+            },
+            Arc::new(AdmissionCountingExecutor(executions.clone())),
+        )
+        .await?;
+        sleep(STORE_IDLE_POLL_INTERVAL + Duration::from_millis(300)).await;
+
+        let mut task = sample_task_record();
+        task.status = TaskStatus::Queued;
+        task.started_at = None;
+        let mut second = task.clone();
+        second.id = "task_0123456789abcdee".into();
+        {
+            // Simulate another process's durable admission, under the real
+            // cross-process transaction lock. No local state or Notify changes.
+            let _transaction = manager.lock_store().await?;
+            manager.persist_task_locked(&task)?;
+            manager.persist_task_locked(&second)?;
+            manager.persist_queue_locked(&VecDeque::from([task.id.clone(), second.id.clone()]))?;
+        }
+        for id in [&task.id, &second.id] {
+            let done = wait_for_terminal_state(&manager, id, Duration::from_secs(2)).await?;
+            assert_eq!(done.status, TaskStatus::Completed);
+        }
+        assert_eq!(executions.load(Ordering::SeqCst), 2);
+        manager.shutdown_and_wait().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn running_task_observes_durable_cancel_without_a_queue_change() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let manager = TaskManager::start_with_executor(
+            test_config(root.path().to_path_buf()),
+            Arc::new(CooperativeIdleCancelExecutor),
+        )
+        .await?;
+        let task = manager
+            .add_task(NewTaskRequest::from_prompt("durable cancel"))
+            .await?;
+        wait_for_running(&manager, &task.id, Duration::from_secs(2)).await?;
+        let queue_before = StoreFingerprint::read(&manager.queue_path);
+        {
+            let _transaction = manager.lock_store().await?;
+            let mut task = manager
+                .read_bound_task(&task.id)?
+                .context("running fixture")?;
+            task.lifecycle_seq += 1;
+            task.cancel_requested_seq = task.lifecycle_seq;
+            manager.persist_task_locked(&task)?;
+        }
+        let done = wait_for_terminal_state(&manager, &task.id, Duration::from_secs(2)).await?;
+        assert_eq!(done.status, TaskStatus::Canceled);
+        assert_eq!(StoreFingerprint::read(&manager.queue_path), queue_before);
+        manager.shutdown_and_wait().await?;
+        Ok(())
     }
 
     #[tokio::test]
@@ -6278,6 +6445,406 @@ mod tests {
         .await;
         assert_eq!(result.status, TaskStatus::Failed);
         assert_eq!(result.terminal_reason, TaskTerminalReason::IdleTimeout);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn silent_running_tool_suppresses_idle_until_it_completes() -> Result<()> {
+        let runtime = Arc::new(test_runtime_manager().await?);
+        let thread = runtime
+            .create_thread(CreateThreadRequest::default())
+            .await?;
+        let (tx, mut rx) = mpsc::channel(64);
+        let runtime_for_drive = Arc::clone(&runtime);
+        let thread_id = thread.id.clone();
+        let drive = tokio::spawn(async move {
+            drive_engine_turn(
+                runtime_for_drive.as_ref(),
+                &thread_id,
+                "turn_silent_tool",
+                tx,
+                CancellationToken::new(),
+                TaskExecutionLimits {
+                    wall_time: Duration::from_secs(5),
+                    idle_progress: Duration::from_millis(80),
+                    cancel_grace: Duration::from_millis(500),
+                    persist_debounce: Duration::from_millis(10),
+                },
+            )
+            .await
+        });
+
+        // Keyed by the journal item id on the started edge; the payload also
+        // carries the engine tool-use id under "tool" (which must NOT become
+        // the tracking key: the terminal events only repeat "item").
+        runtime
+            .emit_event_for_test(
+                &thread.id,
+                Some("turn_silent_tool"),
+                "item.started",
+                json!({
+                    "item": { "id": "item_tool_silent", "status": "in_progress" },
+                    "tool": { "id": "call_build", "name": "exec_command", "input": {} }
+                }),
+            )
+            .await?;
+
+        // A silent build produces no journal traffic for its whole window;
+        // far past the idle deadline the watchdog must still not fire.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let mut seen = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            seen.push(event);
+        }
+        assert!(
+            !seen.iter().any(|event| matches!(
+                event,
+                TaskExecutionEvent::Status { message }
+                    if message.contains("idle deadline")
+            )),
+            "idle watchdog fired while a tool was still running"
+        );
+
+        runtime
+            .emit_event_for_test(
+                &thread.id,
+                Some("turn_silent_tool"),
+                "item.completed",
+                json!({ "item": { "id": "item_tool_silent", "status": "completed" } }),
+            )
+            .await?;
+
+        // Completion drains the set; silence afterwards must let the idle
+        // deadline fire again (a drain bug would surface as WallTimeout).
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match rx.recv().await {
+                    Some(TaskExecutionEvent::Status { message })
+                        if message.contains("idle deadline") =>
+                    {
+                        break;
+                    }
+                    Some(_) => {}
+                    None => panic!("task event stream closed before idle deadline"),
+                }
+            }
+        })
+        .await
+        .context("idle deadline did not fire after the tool completed")?;
+        runtime
+            .emit_event_for_test(
+                &thread.id,
+                Some("turn_silent_tool"),
+                "turn.completed",
+                json!({ "turn": { "status": "interrupted" } }),
+            )
+            .await?;
+        let result = drive.await?;
+        assert_eq!(result.status, TaskStatus::Failed);
+        assert_eq!(result.terminal_reason, TaskTerminalReason::IdleTimeout);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn silent_running_tool_heartbeats_the_worker_watchdog() -> Result<()> {
+        // The supervisor's guard (run_task) only sees task events, so the
+        // steady-state suppression must also publish the in-flight window on
+        // the event channel — otherwise the production path still idles out
+        // even though this loop's own guard is satisfied.
+        let runtime = Arc::new(test_runtime_manager().await?);
+        let thread = runtime
+            .create_thread(CreateThreadRequest::default())
+            .await?;
+        let (tx, mut rx) = mpsc::channel(64);
+        let runtime_for_drive = Arc::clone(&runtime);
+        let thread_id = thread.id.clone();
+        let drive = tokio::spawn(async move {
+            drive_engine_turn(
+                runtime_for_drive.as_ref(),
+                &thread_id,
+                "turn_heartbeat",
+                tx,
+                CancellationToken::new(),
+                TaskExecutionLimits {
+                    wall_time: Duration::from_secs(5),
+                    idle_progress: Duration::from_millis(80),
+                    cancel_grace: Duration::from_millis(500),
+                    persist_debounce: Duration::from_millis(10),
+                },
+            )
+            .await
+        });
+
+        runtime
+            .emit_event_for_test(
+                &thread.id,
+                Some("turn_heartbeat"),
+                "item.started",
+                json!({
+                    "item": { "id": "item_tool_hb", "status": "in_progress" },
+                    "tool": { "id": "call_build", "name": "exec_command", "input": {} }
+                }),
+            )
+            .await?;
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match rx.recv().await {
+                    Some(TaskExecutionEvent::ToolHeartbeat) => break,
+                    Some(_) => {}
+                    None => panic!("task event stream closed before any heartbeat"),
+                }
+            }
+        })
+        .await
+        .context("no ToolHeartbeat reached the worker channel while a tool was in flight")?;
+
+        runtime
+            .emit_event_for_test(
+                &thread.id,
+                Some("turn_heartbeat"),
+                "item.completed",
+                json!({ "item": { "id": "item_tool_hb", "status": "completed" } }),
+            )
+            .await?;
+        runtime
+            .emit_event_for_test(
+                &thread.id,
+                Some("turn_heartbeat"),
+                "turn.completed",
+                json!({ "turn": { "status": "completed" } }),
+            )
+            .await?;
+        let result = drive.await?;
+        assert_eq!(result.status, TaskStatus::Completed);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn hung_running_tool_still_hits_the_wall_budget() -> Result<()> {
+        let runtime = Arc::new(test_runtime_manager().await?);
+        let thread = runtime
+            .create_thread(CreateThreadRequest::default())
+            .await?;
+        let (tx, mut rx) = mpsc::channel(64);
+        let runtime_for_drive = Arc::clone(&runtime);
+        let thread_id = thread.id.clone();
+        let drive = tokio::spawn(async move {
+            drive_engine_turn(
+                runtime_for_drive.as_ref(),
+                &thread_id,
+                "turn_hung_tool",
+                tx,
+                CancellationToken::new(),
+                TaskExecutionLimits {
+                    wall_time: Duration::from_millis(300),
+                    idle_progress: Duration::from_millis(80),
+                    cancel_grace: Duration::from_millis(500),
+                    persist_debounce: Duration::from_millis(10),
+                },
+            )
+            .await
+        });
+
+        runtime
+            .emit_event_for_test(
+                &thread.id,
+                Some("turn_hung_tool"),
+                "item.started",
+                json!({
+                    "item": { "id": "item_tool_hung", "status": "in_progress" },
+                    "tool": { "id": "call_hang", "name": "exec_command", "input": {} }
+                }),
+            )
+            .await?;
+
+        // The running-tool suppression only defers the idle watchdog; the
+        // wall-time budget remains the backstop for a tool that never
+        // completes.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match rx.recv().await {
+                    Some(TaskExecutionEvent::Status { message })
+                        if message.contains("wall-time") =>
+                    {
+                        break;
+                    }
+                    Some(_) => {}
+                    None => panic!("task event stream closed before wall deadline"),
+                }
+            }
+        })
+        .await
+        .context("wall budget did not fire during a hung tool")?;
+        runtime
+            .emit_event_for_test(
+                &thread.id,
+                Some("turn_hung_tool"),
+                "turn.completed",
+                json!({ "turn": { "status": "interrupted" } }),
+            )
+            .await?;
+        let result = drive.await?;
+        assert_eq!(result.status, TaskStatus::Failed);
+        assert_eq!(result.terminal_reason, TaskTerminalReason::WallTimeout);
+        Ok(())
+    }
+
+    /// Mirrors the fixed runtime contract: a ToolStarted edge, then a silent
+    /// window longer than the idle deadline fed only by ToolHeartbeat, then
+    /// completion. Pins the supervisor side of the heartbeat chain — the
+    /// worker idle watchdog must count heartbeats as progress.
+    ///
+    /// Margins: heartbeats every 30 ms across a 1.2 s window against a 500 ms
+    /// idle deadline. The window still outlasts the deadline (so the test
+    /// fails if heartbeats stop counting), while a loaded runner would need a
+    /// half-second stall to starve it; the 150 ms default deadline did starve
+    /// on hosted Windows.
+    struct ToolHeartbeatExecutor;
+
+    const HEARTBEAT_TEST_IDLE_PROGRESS: Duration = Duration::from_millis(500);
+    const HEARTBEAT_TEST_TICKS: u32 = 40;
+
+    #[async_trait]
+    impl TaskExecutor for ToolHeartbeatExecutor {
+        async fn execute(
+            &self,
+            _task: ExecutionTask,
+            events: mpsc::Sender<TaskExecutionEvent>,
+            cancel: CancellationToken,
+        ) -> TaskExecutionResult {
+            let _ = events
+                .send(TaskExecutionEvent::ToolStarted {
+                    id: "tool_hb".to_string(),
+                    name: "exec_command".to_string(),
+                    input: serde_json::json!({}),
+                })
+                .await;
+            for _ in 0..HEARTBEAT_TEST_TICKS {
+                sleep(Duration::from_millis(30)).await;
+                if cancel.is_cancelled() {
+                    return TaskExecutionResult {
+                        status: TaskStatus::Canceled,
+                        result_text: None,
+                        error: None,
+                        terminal_reason: TaskTerminalReason::Canceled,
+                    };
+                }
+                let _ = events.send(TaskExecutionEvent::ToolHeartbeat).await;
+            }
+            let _ = events
+                .send(TaskExecutionEvent::ToolCompleted {
+                    id: "tool_hb".to_string(),
+                    name: "exec_command".to_string(),
+                    success: true,
+                    output: "build ok".to_string(),
+                    metadata: None,
+                })
+                .await;
+            TaskExecutionResult {
+                status: TaskStatus::Completed,
+                result_text: Some("done".to_string()),
+                error: None,
+                terminal_reason: TaskTerminalReason::Completed,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn worker_supervisor_honors_tool_heartbeats_during_silent_tools() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let mut config = short_test_config(root.path().to_path_buf());
+        config.execution_limits.wall_time = Duration::from_secs(5);
+        config.execution_limits.idle_progress = HEARTBEAT_TEST_IDLE_PROGRESS;
+        let manager =
+            TaskManager::start_with_executor(config, Arc::new(ToolHeartbeatExecutor)).await?;
+
+        let task = manager
+            .add_task(NewTaskRequest::from_prompt("silent build with heartbeats"))
+            .await?;
+        let finished = wait_for_terminal_state(&manager, &task.id, Duration::from_secs(10)).await?;
+        assert_eq!(
+            finished.status,
+            TaskStatus::Completed,
+            "heartbeats from a silent in-flight tool must keep the worker idle watchdog fed"
+        );
+        assert!(
+            !finished
+                .timeline
+                .iter()
+                .any(|entry| entry.summary.contains("heartbeat")),
+            "heartbeats are supervisor-side liveness only and must not surface on the timeline"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tool_heartbeat_is_liveness_only_and_never_persists() -> Result<()> {
+        // The heartbeat arrives up to ~5x/s during a silent build; if it
+        // counted as persist-urgent it would rewrite the whole task record
+        // on every tick while holding the manager-wide state lock. The
+        // exclusion list must keep treating it as transient state.
+        assert!(!execution_event_persist_urgent(
+            &TaskExecutionEvent::ToolHeartbeat
+        ));
+        assert!(execution_event_persist_urgent(
+            &TaskExecutionEvent::ToolStarted {
+                id: "item-1".into(),
+                name: "bash".into(),
+                input: serde_json::json!({}),
+            }
+        ));
+
+        // Wiring-level pin: applying a heartbeat to a running task leaves the
+        // record unpersisted, while a real lifecycle edge still flushes. The
+        // executor hangs so the task stays Running (default limits keep the
+        // supervisor idle watchdog far away) while the events are applied.
+        let root = tempfile::tempdir()?;
+        let manager = TaskManager::start_with_executor(
+            test_config(root.path().to_path_buf()),
+            Arc::new(DeafHangExecutor),
+        )
+        .await?;
+        let task = manager
+            .add_task(NewTaskRequest::from_prompt("heartbeat persistence pin"))
+            .await?;
+        let running = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match manager.get_task(&task.id).await {
+                    Ok(record) if record.status == TaskStatus::Running => break Some(record),
+                    Ok(_) => {}
+                    Err(_) => break None,
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .context("task never reached Running for the persistence pin")?
+        .context("task lookup failed before the persistence pin")?;
+        assert_eq!(running.status, TaskStatus::Running);
+
+        let outcome = manager
+            .apply_execution_event(&task.id, TaskExecutionEvent::ToolHeartbeat)
+            .await?;
+        assert!(
+            !outcome.persisted,
+            "a liveness-only heartbeat must not trigger a task-record write"
+        );
+
+        let outcome = manager
+            .apply_execution_event(
+                &task.id,
+                TaskExecutionEvent::ToolStarted {
+                    id: "item-1".into(),
+                    name: "bash".into(),
+                    input: serde_json::json!({}),
+                },
+            )
+            .await?;
+        assert!(
+            outcome.persisted,
+            "a real tool lifecycle edge must still flush the record"
+        );
         Ok(())
     }
 

@@ -436,6 +436,12 @@ pub(crate) fn disable_hotbar(app: &mut App, config: &mut Config) {
 }
 
 pub(crate) fn refresh_config_view_if_open(app: &mut App, focus_key: &str) {
+    refresh_config_view_after_commit(app, focus_key, false);
+}
+
+/// Rebuild an open settings view from disk truth after a commit. When the host
+/// rejected the value, the editor reopens with what the user typed.
+pub(crate) fn refresh_config_view_after_commit(app: &mut App, focus_key: &str, rejected: bool) {
     if app.view_stack.top_kind() != Some(ModalKind::Config) {
         return;
     }
@@ -443,7 +449,13 @@ pub(crate) fn refresh_config_view_if_open(app: &mut App, focus_key: &str) {
         return;
     };
     let rebuilt = match boxed.as_any_mut().downcast_ref::<ConfigView>() {
-        Some(previous) => ConfigView::rebuild_preserving(app, previous, focus_key),
+        Some(previous) => {
+            let mut view = ConfigView::rebuild_preserving(app, previous, focus_key);
+            if rejected {
+                view.restore_rejected_commit(previous);
+            }
+            view
+        }
         // Not a `ConfigView`: rebuild from scratch rather than restoring an
         // unknown modal, matching how the stack got here.
         None => {

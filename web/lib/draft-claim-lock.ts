@@ -12,9 +12,14 @@
  * the Next.js build; `worker.ts` holds the thin class around it.
  */
 
-export type DraftLockAction = "post" | "discard";
+export type DraftLockAction = "post" | "discard" | "generate";
+
+export interface PostAttempt { at: string; identity: string }
 
 export type DraftLockRequest =
+  | { op: "post-status" }
+  | { op: "remember-post"; token: string; attempt: PostAttempt }
+  | { op: "forget-post"; token: string }
   | { op: "claim"; token: string; action: DraftLockAction; leaseMs: number }
   /**
    * `holdMs` > 0 keeps refusing other claims for that long after an action
@@ -24,7 +29,7 @@ export type DraftLockRequest =
   | { op: "release"; token: string; holdMs: number };
 
 export type DraftLockResponse =
-  | { ok: true }
+  | { ok: true; attempt?: PostAttempt }
   | { ok: false; holder: DraftLockAction };
 
 /** The subset of `DurableObjectStorage` the lock uses. */
@@ -48,9 +53,24 @@ export async function applyDraftLock(
   now: number,
   req: DraftLockRequest
 ): Promise<DraftLockResponse> {
+  if (req.op === "post-status") {
+    return { ok: true, attempt: await storage.get<PostAttempt>("post-attempt") };
+  }
   const lease = await storage.get<Lease>(LEASE_KEY);
   const live = lease && lease.expiresAt > now ? lease : undefined;
 
+  if (req.op === "remember-post" || req.op === "forget-post") {
+    if (!live || live.token !== req.token) throw new Error("post claim expired");
+    if (req.op === "remember-post") {
+      if (!/^[0-9a-f]{64}$/.test(req.attempt.identity) || !Number.isFinite(Date.parse(req.attempt.at))) throw new Error("invalid post receipt");
+      const previous = await storage.get<PostAttempt>("post-attempt");
+      if (previous && previous.identity !== req.attempt.identity) throw new Error("unresolved post has different text or target");
+      await storage.put("post-attempt", previous ?? req.attempt);
+    } else {
+      await storage.delete("post-attempt");
+    }
+    return { ok: true };
+  }
   if (req.op === "claim") {
     if (live && live.token !== req.token) return { ok: false, holder: live.action };
     await storage.put<Lease>(LEASE_KEY, {

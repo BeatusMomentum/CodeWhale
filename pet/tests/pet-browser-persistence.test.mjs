@@ -12,7 +12,7 @@ import * as audio from '../dist/core/pet-audio.js';
 /** Run the compiled browser controller and real world with minimal DOM sinks.
  * Storage and file-read completion are controlled: this tests async caller
  * contracts, not IndexedDB transactions, file-picker grants or rendering. */
-async function browser({ deferFirstSave = true, handle } = {}) {
+async function browser({ deferFirstSave = true, handle, later = n => Promise.resolve(n) } = {}) {
   const nodes = new Map(), saves = [], intervals = [], timers = [], listeners = new Map();
   let complete, fail, confirmations = 0;
   const context = new Proxy({}, { get: (object, key) => object[key] ?? (() => {}) });
@@ -29,7 +29,7 @@ async function browser({ deferFirstSave = true, handle } = {}) {
     saveHabitat(habitat, revision, archive) {
       saves.push(structuredClone({ habitat, revision, archive }));
       if (deferFirstSave && saves.length === 1) return new Promise((resolve, reject) => { complete = resolve; fail = reject; });
-      return Promise.resolve(saves.length);
+      return later(saves.length);
     }
   }
   // Windows checkouts can use CRLF; exercise that asset in the actual controller.
@@ -47,7 +47,7 @@ async function browser({ deferFirstSave = true, handle } = {}) {
     setTimeout, clearTimeout, structuredClone, TextEncoder, devicePixelRatio: 1 };
   const inspect = await vm.runInNewContext(`(async () => { ${controller}\n return () => world.recording(true); })()`, environment);
   assert.equal(intervals.length, 1, 'Controller starts its autosave after loading');
-  return { node, saves, autosave: intervals[0], complete: () => complete(1), fail: () => fail(new Error('Disk unavailable')),
+  return { node, saves, autosave: intervals[0], complete: () => complete(1), fail: (error = new Error('Disk unavailable')) => fail(error),
     confirmations: () => confirmations, recording: () => structuredClone(inspect()),
     poll: () => { assert.ok(timers.length); return timers.shift()(); },
     visibility: hidden => { environment.document.hidden = hidden; listeners.get('visibilitychange')(); } };
@@ -75,13 +75,29 @@ test('browser source change waits for autosave and archives inputs accepted duri
 });
 
 test('browser failed autosave asks before leaving and cancel preserves the current source', async () => {
-  const page = await browser();
+  const page = await browser({ later: () => Promise.reject(new Error('Disk unavailable')) });
   page.autosave(); page.node('mode').value = 'demo';
   const changing = page.node('mode').onchange();
   page.fail(); await changing;
   assert.equal(page.confirmations(), 1);
   assert.equal(page.node('mode').value, 'wild');
-  assert.equal(page.saves.length, 1, 'No archive or replacement after the failed write');
+  assert.equal(page.saves.length, 2, 'The archive is retried once; its failure replaces nothing');
+});
+
+test('browser retries a failed habitat save but never overwrites another tab after a revision conflict', async () => {
+  const settle = () => new Promise(resolve => setImmediate(resolve));
+  const page = await browser();
+  page.autosave(); page.fail(); await settle();
+  assert.doesNotMatch(page.node('persistence').textContent, /Habitat saved/);
+  page.autosave(); await settle();
+  assert.equal(page.saves.length, 2, 'A storage failure does not disable later saves');
+  assert.equal(page.saves[1].revision, undefined, 'The retry keeps the last committed revision');
+  assert.match(page.node('persistence').textContent, /Habitat saved/);
+  const conflicted = await browser();
+  conflicted.autosave();
+  conflicted.fail(Object.assign(new Error('Another pet tab saved this habitat.'), { name: 'PetHabitatConflict' })); await settle();
+  conflicted.autosave(); await settle();
+  assert.equal(conflicted.saves.length, 1, 'A newer revision from another tab stops autosave');
 });
 
 test('browser live follow discards a read crossing suspension and primes the resumed file', async () => {

@@ -17,7 +17,6 @@ use codewhale_agent::ModelRegistry;
 use codewhale_config::ConfigStore;
 use codewhale_core::Runtime;
 use codewhale_hooks::{HookDispatcher, JsonlHookSink, StdoutHookSink, UnixSocketHookSink};
-use codewhale_mcp::McpManager;
 use codewhale_protocol::{
     AppRequest, AppResponse, EventFrame, PromptRequest, PromptResponse, ResponseChannel,
     ThreadGoalClearParams, ThreadGoalGetParams, ThreadGoalSetParams, ThreadRequest, ThreadResponse,
@@ -328,7 +327,9 @@ struct ThreadInterruptParams {
 
 pub async fn run(options: AppServerOptions) -> Result<()> {
     let auth_token = resolve_auth_token(&options)?;
-    let state = build_state(options.config_path.clone(), auth_token)?;
+    let state =
+        build_state_off_runtime(options.config_path.clone(), auth_token, AppTransport::Http)
+            .await?;
     let app = app_router(state, &options.cors_origins);
 
     let listener = tokio::net::TcpListener::bind(options.listen).await?;
@@ -373,7 +374,7 @@ async fn shutdown_signal() {
 /// `RuntimeBridge::stream_turn_events` forwards only `item.delta` and the
 /// turn's completion, and there is no decision route, so approval-gated work
 /// belongs on the Runtime API (`/v1/threads/*`, `POST /v1/approvals/{id}`).
-const ADVERTISED_ROUTES: &[&str] = &["/thread", "/app", "/prompt", "/jobs", "/mcp/startup"];
+const ADVERTISED_ROUTES: &[&str] = &["/thread", "/app", "/prompt", "/jobs"];
 
 fn app_router(state: AppState, cors_origins: &[String]) -> Router {
     let protected_routes = Router::new()
@@ -391,7 +392,6 @@ fn app_router(state: AppState, cors_origins: &[String]) -> Router {
             )),
         )
         .route("/jobs", get(jobs_handler))
-        .route("/mcp/startup", post(mcp_startup_handler))
         .route(
             "/v1/chat/completions",
             post(chat_completions::chat_completions_handler),
@@ -410,7 +410,7 @@ fn app_router(state: AppState, cors_origins: &[String]) -> Router {
 }
 
 pub async fn run_stdio(config_path: Option<PathBuf>) -> Result<()> {
-    let state = build_state_with_transport(config_path, None, AppTransport::Stdio)?;
+    let state = build_state_off_runtime(config_path, None, AppTransport::Stdio).await?;
     let reader = BufReader::new(tokio::io::stdin()).lines();
     let writer = tokio::io::BufWriter::new(tokio::io::stdout());
     run_stdio_loop(
@@ -740,15 +740,6 @@ async fn jobs_handler(State(state): State<AppState>) -> Json<AppResponse> {
     Json(runtime.app_status())
 }
 
-async fn mcp_startup_handler(State(state): State<AppState>) -> Json<Value> {
-    let runtime = state.runtime.read().await;
-    let summary = runtime.mcp_startup().await;
-    Json(json!({
-        "ok": true,
-        "summary": summary
-    }))
-}
-
 async fn app_handler(
     State(state): State<AppState>,
     Json(req): Json<AppRequest>,
@@ -775,8 +766,26 @@ fn app_response_status(response: &AppResponse) -> StatusCode {
     }
 }
 
+#[cfg(test)]
 fn build_state(config_path: Option<PathBuf>, auth_token: Option<String>) -> Result<AppState> {
     build_state_with_transport(config_path, auth_token, AppTransport::Http)
+}
+
+/// [`build_state_with_transport`] on the blocking pool. Server startup is
+/// async, but building state is not: it reads and parses the config file,
+/// creates directories, and opens SQLite (a schema migration that may wait
+/// out the 5s busy timeout behind another process). Run inline, that parked
+/// a Tokio worker.
+async fn build_state_off_runtime(
+    config_path: Option<PathBuf>,
+    auth_token: Option<String>,
+    transport: AppTransport,
+) -> Result<AppState> {
+    tokio::task::spawn_blocking(move || {
+        build_state_with_transport(config_path, auth_token, transport)
+    })
+    .await
+    .context("app-server state setup task failed")?
 }
 
 fn build_state_with_transport(
@@ -817,12 +826,7 @@ fn build_state_with_transport(
         hooks.add_sink(Arc::new(UnixSocketHookSink::new(socket_path.clone())));
     }
 
-    let runtime = Runtime::new(
-        config.clone(),
-        state_store,
-        Arc::new(McpManager::default()),
-        hooks,
-    );
+    let runtime = Runtime::new(config.clone(), state_store, hooks);
 
     Ok(AppState {
         config_path,
@@ -1605,6 +1609,7 @@ where
 /// the turn registry across the request.
 async fn interrupt_turn_request(turn: &InFlightTurn) -> std::result::Result<bool, JsonRpcError> {
     let mut request = codewhale_release::platform_http_client_builder()
+        .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(10))
         .build()
         .map_err(|err| JsonRpcError::internal(err.to_string()))?
@@ -1677,25 +1682,35 @@ async fn invalidate_runtime_bridge(state: &AppState) {
 impl RuntimeBridge {
     async fn start(config_path: Option<&Path>) -> Result<Self> {
         install_rustls_crypto_provider();
-        let port = reserve_runtime_port()?;
         let auth_token = format!("cwrt_{}", Uuid::new_v4().simple());
-        let child = Self::runtime_command(config_path, port, &auth_token)?
+        // The bearer token only ever goes to the endpoint the child itself
+        // reports, and never follows a redirect away from it.
+        let client = codewhale_release::platform_http_client_builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .context("failed to build runtime API client")?;
+        let mut child = Self::runtime_command(config_path, &auth_token)?
             .spawn()
             .context("failed to start runtime API bridge")?;
+        let stdout = child.stdout.take();
+        // Owned by the bridge from here on, so every failure below reaps it.
         let mut bridge = Self {
-            base_url: format!("http://127.0.0.1:{port}"),
-            client: codewhale_release::platform_http_client_builder()
-                .build()
-                .context("failed to build runtime API client")?,
+            base_url: String::new(),
+            client,
             auth_token: Some(auth_token),
             child: Some(child),
             last_seq_by_thread: HashMap::new(),
         };
+        let stdout = stdout.context("runtime API bridge has no stdout to report its endpoint")?;
+        let endpoint = runtime_child_endpoint(stdout, Duration::from_secs(15)).await?;
+        bridge.base_url = format!("http://{endpoint}");
         bridge.wait_until_ready().await?;
         Ok(bridge)
     }
 
-    fn runtime_command(config_path: Option<&Path>, port: u16, auth_token: &str) -> Result<Command> {
+    /// The child binds an ephemeral loopback port itself (`--port 0`) and
+    /// reports it on stdout; the parent never reserves a port for it to race.
+    fn runtime_command(config_path: Option<&Path>, auth_token: &str) -> Result<Command> {
         let current_exe = std::env::current_exe().ok();
         let mut command = if let Some(path) = current_exe {
             Command::new(path)
@@ -1712,11 +1727,11 @@ impl RuntimeBridge {
             .arg("--host")
             .arg("127.0.0.1")
             .arg("--port")
-            .arg(port.to_string())
+            .arg("0")
             .env("CODEWHALE_RUNTIME_TOKEN", auth_token)
             .env("DEEPSEEK_RUNTIME_TOKEN", auth_token)
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
+            .stdout(Stdio::piped())
             .stderr(Stdio::null());
         if let Some(config_path) = config_path {
             command.arg("--config").arg(config_path);
@@ -2018,18 +2033,42 @@ impl RuntimeBridge {
             registry.lock().await.remove(key);
         }
 
-        let _ = emit_stdio_event(
-            writer,
-            json!({
-                "type": "response_end",
-                "response_id": response_id,
-            }),
-        )
-        .await;
-        if let Some(transcript) = transcript {
-            transcript.events.push(EventFrame::ResponseEnd {
-                response_id: response_id.clone(),
-            });
+        if stream_result.is_ok() {
+            let _ = emit_stdio_event(
+                writer,
+                json!({
+                    "type": "response_end",
+                    "response_id": response_id,
+                }),
+            )
+            .await;
+            if let Some(transcript) = transcript {
+                transcript.events.push(EventFrame::ResponseEnd {
+                    response_id: response_id.clone(),
+                });
+            }
+        } else {
+            // The stream broke before `turn.completed` (transport error,
+            // oversized or invalid frame, a writer that went away). Ending
+            // the response here reported success ahead of the error, and the
+            // runtime turn kept running with nothing left able to interrupt
+            // it (the registry entry is gone), so the thread refused its next
+            // message until the orphan finished. Stop it, best effort, and
+            // let the error below be the only outcome the client sees.
+            let orphan = InFlightTurn {
+                base_url: self.base_url.clone(),
+                auth_token: self.auth_token.clone(),
+                runtime_thread_id: thread_id.to_string(),
+                turn_id: turn_id.clone(),
+            };
+            if let Err(error) = interrupt_turn_request(&orphan).await {
+                tracing::warn!(
+                    thread_id,
+                    turn_id = %turn_id,
+                    "failed to interrupt a turn whose event stream broke: {}",
+                    error.message
+                );
+            }
         }
 
         let (last_seq, status, error) = stream_result?;
@@ -2197,9 +2236,68 @@ impl Drop for RuntimeBridge {
     }
 }
 
-fn reserve_runtime_port() -> Result<u16> {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
-    Ok(listener.local_addr()?.port())
+/// The line the Runtime prints once it holds its listener (the Runtime's
+/// `RUNTIME_LISTENING_PREFIX`; this crate does not depend on that one).
+const RUNTIME_LISTENING_PREFIX: &str = "Runtime API listening on http://";
+/// The endpoint line is short and comes first; anything larger is not it.
+const RUNTIME_READY_MAX_BYTES: usize = 1024;
+
+/// The endpoint a Runtime child reports for itself: exactly a nonzero port on
+/// `127.0.0.1`, the host the parent asked it to bind.
+fn parse_runtime_endpoint(line: &str) -> Result<std::net::SocketAddr> {
+    let address = line
+        .trim_end()
+        .strip_prefix(RUNTIME_LISTENING_PREFIX)
+        .context("runtime API bridge did not report its endpoint")?;
+    let endpoint: std::net::SocketAddr = address
+        .parse()
+        .context("runtime API bridge reported an invalid endpoint")?;
+    if endpoint.ip() != std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST) || endpoint.port() == 0
+    {
+        bail!("runtime API bridge reported an endpoint that is not a loopback port");
+    }
+    Ok(endpoint)
+}
+
+/// Read the first stdout line, bounded.
+fn read_runtime_ready_line(stdout: &mut impl std::io::Read) -> Result<String> {
+    let mut line = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        if stdout.read(&mut byte)? == 0 {
+            bail!("runtime API bridge closed stdout before reporting its endpoint");
+        }
+        if byte[0] == b'\n' {
+            break;
+        }
+        if line.len() >= RUNTIME_READY_MAX_BYTES {
+            bail!("runtime API bridge sent an oversized readiness line");
+        }
+        line.push(byte[0]);
+    }
+    String::from_utf8(line).context("runtime API bridge readiness line is not UTF-8")
+}
+
+/// Wait for the child to report the endpoint it bound. The reader thread then
+/// keeps draining stdout for the child's lifetime, so the child's later
+/// prints neither block on a full pipe nor fail on a closed one. On error the
+/// caller drops the bridge, which kills and reaps the child.
+async fn runtime_child_endpoint(
+    mut stdout: std::process::ChildStdout,
+    wait: Duration,
+) -> Result<std::net::SocketAddr> {
+    let (ready, endpoint) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        let _ = ready.send(
+            read_runtime_ready_line(&mut stdout).and_then(|line| parse_runtime_endpoint(&line)),
+        );
+        let _ = std::io::copy(&mut stdout, &mut std::io::sink());
+    });
+    match tokio::time::timeout(wait, endpoint).await {
+        Ok(Ok(endpoint)) => endpoint,
+        Ok(Err(_)) => bail!("runtime API bridge readiness reader ended unexpectedly"),
+        Err(_) => bail!("timed out waiting for the runtime API bridge to report its endpoint"),
+    }
 }
 
 fn install_rustls_crypto_provider() {
@@ -2670,7 +2768,7 @@ async fn process_app_request(
             data: json!({
                 "routes": ADVERTISED_ROUTES,
                 "config": ["get", "set", "unset", "list", "reload"],
-                "events": ["response_start", "response_delta", "response_end", "tool_call_start", "tool_call_result", "mcp_startup_update", "mcp_startup_complete"],
+                "events": ["response_start", "response_delta", "response_end", "tool_call_start", "tool_call_result"],
                 "transport": "stdio+http",
                 "config_path": state.config_path.as_ref().map(|p| p.display().to_string()),
             }),
@@ -3113,6 +3211,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mcp_startup_route_cannot_start_a_parallel_pool() {
+        let (app, tmp) = app_with_config(Some("test-token"));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/mcp/startup")
+                    .header(header::AUTHORIZATION, "Bearer test-token")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let state = build_state(Some(tmp.path().join("config.toml")), None).expect("state");
+        let caps = process_app_request(&state, AppRequest::Capabilities, AppTransport::Http).await;
+        assert!(
+            !caps.data["routes"]
+                .as_array()
+                .expect("routes")
+                .iter()
+                .any(|route| route == "/mcp/startup")
+        );
+        assert!(
+            !caps.data["events"]
+                .as_array()
+                .expect("events")
+                .iter()
+                .any(|event| event == "mcp_startup_update" || event == "mcp_startup_complete")
+        );
+    }
+
+    #[tokio::test]
     async fn cors_does_not_allow_arbitrary_origins() {
         let (app, _tmp) = app_with_config(Some("test-token"));
         let response = app
@@ -3362,15 +3494,18 @@ mod tests {
             State(f): State<RecordingRuntime>,
             AxumPath(thread_id): AxumPath<String>,
         ) -> StatusCode {
-            if f.lookup_failures
-                .fetch_update(
-                    std::sync::atomic::Ordering::SeqCst,
-                    std::sync::atomic::Ordering::SeqCst,
-                    |remaining| remaining.checked_sub(1),
-                )
-                .is_ok()
-            {
-                return StatusCode::SERVICE_UNAVAILABLE;
+            use std::sync::atomic::Ordering::SeqCst;
+            let mut remaining = f.lookup_failures.load(SeqCst);
+            while remaining > 0 {
+                match f.lookup_failures.compare_exchange_weak(
+                    remaining,
+                    remaining - 1,
+                    SeqCst,
+                    SeqCst,
+                ) {
+                    Ok(_) => return StatusCode::SERVICE_UNAVAILABLE,
+                    Err(current) => remaining = current,
+                }
             }
             if thread_id == "thr_minted" {
                 StatusCode::OK
@@ -4008,7 +4143,7 @@ mod tests {
         let state = build_state(Some(config_path.clone()), None).expect("state");
         *state.runtime_bridge.lock().await = Some(sentinel_bridge());
 
-        // A long reader (e.g. `/mcp/startup`) holds the runtime, so the set
+        // A concurrent reader holds the runtime, so the set
         // saves to disk and then waits to propagate.
         let runtime_reader = state.runtime.read().await;
         let request = process_app_request(
@@ -4019,8 +4154,10 @@ mod tests {
             },
             AppTransport::Http,
         );
+        // Long enough for the save to reach disk on a slow runner: 200 ms was
+        // not, once, on hosted Windows.
         assert!(
-            tokio::time::timeout(Duration::from_millis(200), request)
+            tokio::time::timeout(Duration::from_secs(2), request)
                 .await
                 .is_err(),
             "the set waits for the runtime",
@@ -4966,6 +5103,92 @@ mod tests {
         assert_eq!(lines[1]["delta"], "hello");
     }
 
+    /// Audit R03-05: a stream that breaks before `turn.completed` must not
+    /// report `response_end` ahead of the error, and must not leave the
+    /// runtime turn running with nothing able to interrupt it.
+    #[tokio::test]
+    async fn stdio_runtime_bridge_interrupts_a_turn_whose_stream_breaks() {
+        static INTERRUPTED: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+
+        async fn create_turn(AxumPath(thread_id): AxumPath<String>) -> Json<Value> {
+            Json(json!({
+                "thread": { "id": thread_id },
+                "turn": { "id": "turn_broken" },
+            }))
+        }
+
+        async fn thread_events() -> ([(header::HeaderName, &'static str); 1], String) {
+            // One delta, then the stream ends without `turn.completed`.
+            let body = sse_frame(
+                "item.delta",
+                json!({
+                    "seq": 1,
+                    "turn_id": "turn_broken",
+                    "payload": { "kind": "agent_message", "delta": "partial" }
+                }),
+            );
+            ([(header::CONTENT_TYPE, "text/event-stream")], body)
+        }
+
+        async fn interrupt(
+            AxumPath((thread_id, turn_id)): AxumPath<(String, String)>,
+        ) -> Json<Value> {
+            assert_eq!(thread_id, "thr_broken");
+            assert_eq!(turn_id, "turn_broken");
+            INTERRUPTED.store(true, std::sync::atomic::Ordering::SeqCst);
+            Json(json!({ "interrupted": true }))
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let addr = listener.local_addr().expect("listener addr");
+        let app = Router::new()
+            .route("/v1/threads/{thread_id}/turns", post(create_turn))
+            .route("/v1/threads/{thread_id}/events", get(thread_events))
+            .route(
+                "/v1/threads/{thread_id}/turns/{turn_id}/interrupt",
+                post(interrupt),
+            );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve test runtime");
+        });
+
+        let mut bridge = RuntimeBridge::from_base_url_for_test(format!("http://{addr}"));
+        let (mut reader, mut writer) = tokio::io::duplex(4096);
+        let result = bridge
+            .message_thread("thr_broken", "hello", &[], None, &mut writer, None, None)
+            .await;
+        drop(writer);
+        let mut stdout = Vec::new();
+        reader
+            .read_to_end(&mut stdout)
+            .await
+            .expect("read stdio output");
+        server.abort();
+        let _ = server.await;
+
+        assert!(result.is_err(), "a broken stream is an error");
+        let event_types: Vec<String> = String::from_utf8(stdout)
+            .expect("utf8 output")
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<Value>(line).expect("json line")["type"]
+                    .as_str()
+                    .expect("event type")
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(event_types, vec!["response_start", "response_delta"]);
+        assert!(
+            INTERRUPTED.load(std::sync::atomic::Ordering::SeqCst),
+            "the orphaned runtime turn was not interrupted"
+        );
+    }
+
     #[tokio::test]
     async fn stdio_runtime_bridge_applies_thread_start_hints() {
         async fn create_thread(Json(body): Json<Value>) -> Json<Value> {
@@ -5478,15 +5701,48 @@ mod tests {
     }
 
     #[test]
+    fn runtime_child_endpoint_must_be_a_reported_loopback_port() {
+        let ok = parse_runtime_endpoint("Runtime API listening on http://127.0.0.1:49152\r\n")
+            .expect("loopback endpoint");
+        assert_eq!(ok.port(), 49152);
+        for bad in [
+            "Runtime API listening on http://127.0.0.1:0",
+            "Runtime API listening on http://10.0.0.5:7878",
+            "Runtime API listening on http://[::1]:7878",
+            "Runtime API listening on http://example.com:80",
+            "Runtime API listening on http://127.0.0.1:80/redirect",
+            "listening on http://127.0.0.1:7878",
+            "",
+        ] {
+            assert!(parse_runtime_endpoint(bad).is_err(), "{bad:?}");
+        }
+
+        let mut first_line_only: &[u8] =
+            b"Runtime API listening on http://127.0.0.1:5000\nRuntime API listening on http://127.0.0.1:6000\n";
+        assert_eq!(
+            read_runtime_ready_line(&mut first_line_only).unwrap(),
+            "Runtime API listening on http://127.0.0.1:5000"
+        );
+        let mut closed: &[u8] = b"Runtime API listening on http://127.0.0.1:5000";
+        assert!(read_runtime_ready_line(&mut closed).is_err(), "no newline");
+        let oversized = vec![b'a'; RUNTIME_READY_MAX_BYTES + 1];
+        assert!(read_runtime_ready_line(&mut oversized.as_slice()).is_err());
+    }
+
+    #[test]
     fn runtime_bridge_command_keeps_auth_token_out_of_argv() {
         // FR001-C001: runtime auth token must not appear on the child argv
         // (visible via local `ps`); pass it via env instead.
         let token = "cwrt_unit_test_secret_token_not_for_argv";
-        let cmd = RuntimeBridge::runtime_command(None, 18787, token).expect("command");
+        let cmd = RuntimeBridge::runtime_command(None, token).expect("command");
         let argv: Vec<String> = cmd
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
+        assert!(
+            argv.windows(2).any(|pair| pair == ["--port", "0"]),
+            "the child picks and reports its own port: {argv:?}"
+        );
         assert!(
             !argv
                 .iter()

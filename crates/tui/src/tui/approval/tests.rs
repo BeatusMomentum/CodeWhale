@@ -2561,7 +2561,7 @@ fn test_elevation_render_zh_hant_has_translated_copy() {
         "missing zh-Hant tool label:\n{joined}"
     );
     assert!(
-        joined.contains("命令："),
+        joined.contains("指令："),
         "missing zh-Hant cmd label:\n{joined}"
     );
     assert!(

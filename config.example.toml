@@ -1151,6 +1151,7 @@ base_url = "https://api.deepseek.com/beta"
 # registry_url = "https://raw.githubusercontent.com/Hmbown/deepseek-skills/main/index.json"
 # max_install_size_bytes = 5_242_880
 # scan_codewhale_only = false # true: ignore Claude/OpenCode/Cursor/agentskills.io skill dirs
+# flat_workspace_root = false # true: opt in to trusted <workspace>/skills content
 
 # Model-stream budgets and HTTP transport. `config dump` shows effective values.
 # Legacy [tui] stream_* keys remain fallbacks when a canonical field is absent.
@@ -1244,6 +1245,7 @@ web_search = true # enables canonical web.run plus the compatibility web_search 
 apply_patch = true
 mcp = true
 exec_policy = true
+code_mode = true # execute_tools composes MCP/plugin/native calls; false defers it behind tool_search
 # vision_model = false  # enable vision model for image_analyze tool
 # verify_tool = false   # disable the agent-callable `verify` self-critique tool
                         # (#4196). On by default; the agent decides when to spend
@@ -1265,9 +1267,18 @@ exec_policy = true
                         # so every plugin must be re-reviewed afterwards.
 
 # [extension_host]
-# node = "/usr/local/bin/node"  # Node.js ^22.19 || >=24. Tried first; otherwise
-#                               # every `node` on PATH is tried in order and the
-#                               # first that runs and meets the floor is used.
+# runtime = "node"              # "node" (default), "bun" or "auto". Bun is an
+#                               # opt-in, qualified on macOS only. "auto" uses
+#                               # Bun >= 1.4.0 when one is found and starts,
+#                               # else Node. "bun"/"node" never fall back.
+#                               # Unset with only `bun` set: "bun".
+# bun = "~/.bun/bin/bun"        # Bun >= 1.4.0. When set, the only Bun tried; a
+#                               # broken one fails instead of searching PATH and
+#                               # $BUN_INSTALL/bin or ~/.bun/bin.
+# node = "/usr/local/bin/node"  # Node.js ^22.19 || >=24. When set, the only Node
+#                               # tried. Unset, every `node` on PATH is tried in
+#                               # order, skipping any inside node_modules or the
+#                               # working directory.
 
 # ─────────────────────────────────────────────────────────────────────────────────
 # Vision Model Configuration (optional)
@@ -1629,12 +1640,15 @@ base_url = "https://integrate.api.nvidia.com/v1"
 # ─────────────────────────────────────────────────────────────────────────────────
 # Tool Overrides & Plugins ([tools])
 # ─────────────────────────────────────────────────────────────────────────────────
-# The `[tools]` table lets you replace any built-in tool with a custom
-# implementation (script or command) or disable it entirely — without
-# forking or recompiling the binary.
+# The `[tools]` table lets you disable any built-in tool, or add your own
+# tool backed by a script or command — without forking or recompiling the
+# binary. A script or command cannot replace a built-in: an override keyed by
+# a built-in name is refused (logged) and the built-in stays active.
 #
 # Plugin scripts dropped in the plugin directory are auto-discovered and
-# registered as model-visible tools alongside the built-in ones.
+# registered as model-visible tools alongside the built-in ones. A script may
+# declare `# approval: suggest` (the default) or `# approval: required`;
+# `# approval: auto` is no longer supported and falls back to the default.
 #
 # Scripts receive the tool's JSON input on **stdin** and must return a
 # JSON `ToolResult` (`{"content": "...", "success": true}`) on **stdout**.
@@ -1645,35 +1659,40 @@ base_url = "https://integrate.api.nvidia.com/v1"
 #
 # [tools.overrides]
 # # Disable a tool entirely — removes it from the model-visible catalog.
-# "code_execution" = { type = "disabled" }
+# "Web" = { type = "disabled" }
 #
-# # Replace a tool with a script. Relative paths resolve against plugin_dir.
-# "exec_shell" = { type = "script", path = "audit-exec-shell.sh" }
+# # Add a tool backed by a script. Relative paths resolve against plugin_dir.
+# "audited_shell" = { type = "script", path = "audit-shell.sh" }
 #
-# # Replace a tool with a command (binary on PATH or absolute path).
-# "read_file" = { type = "command", command = "bat", args = ["--paging=never"] }
+# # Add a tool backed by a command (binary on PATH or absolute path).
+# "bat_reader" = { type = "command", command = "bat", args = ["--paging=never"] }
 #
 # # Scripts can also accept static arguments before the JSON input:
-# "fetch_url" = { type = "script", path = "cached-fetch.sh", args = ["--ttl", "300"] }
+# "cached_fetch" = { type = "script", path = "cached-fetch.sh", args = ["--ttl", "300"] }
 
-# ──────────── Enterprise example: audit-logging exec_shell wrapper ──────────────
-# Drop `audit-exec-shell.sh` in `~/.codewhale/tools/` and enable with:
+# ──────────── Enterprise example: audit-logging shell wrapper ──────────────
+# Drop `audit-shell.sh` (below) in `~/.codewhale/tools/`, where it registers
+# itself as `audited_shell`, and turn the built-in shell off (`Bash` and its
+# lowercase `bash` form). Other shell-capable tools, such as the terminal
+# tools, stay available; disable them too if every command must pass the
+# wrapper.
 #
 # [tools.overrides]
-# "exec_shell" = { type = "script", path = "audit-exec-shell.sh" }
+# "Bash" = { type = "disabled" }
+# "bash" = { type = "disabled" }
 #
-# The wrapper logs every request to `~/.codewhale/audit/exec_shell.log`, then
+# The wrapper logs every request to `~/.codewhale/audit/shell.log`, then
 # delegates to your own approved shell executor. Do not pipe the raw JSON
 # request into `sh -s`; parse the command field and enforce your policy first.
 #
 # ```sh
 # #!/usr/bin/env sh
-# # name: exec_shell
-# # description: Audit-logging wrapper for exec_shell
+# # name: audited_shell
+# # description: Audit-logging shell wrapper
 # # approval: required
 # LOGDIR="${HOME}/.codewhale/audit"
 # mkdir -p "$LOGDIR"
-# LOGFILE="$LOGDIR/exec_shell.log"
+# LOGFILE="$LOGDIR/shell.log"
 # input=$(cat)
 # echo "[$(date -Iseconds)] $input" >> "$LOGFILE"
 # printf '%s\n' '{"content":"audit wrapper dry run: configure an executor","success":false}'

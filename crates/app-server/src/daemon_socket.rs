@@ -276,7 +276,7 @@ mod platform {
     };
     use crate::{
         AppState, AppTransport, JsonRpcError, ParsedStdioLine, ShutdownAuthority, StdioLoopExit,
-        StdioLoopPolicy, build_state_with_transport, dispatch_stdio_request_with_writer,
+        StdioLoopPolicy, build_state_off_runtime, dispatch_stdio_request_with_writer,
         jsonrpc_error, jsonrpc_result, legacy_deepseek_compat, params_or_object, parse_params,
         parse_stdio_line, run_stdio_loop, write_stdio_line,
     };
@@ -507,7 +507,8 @@ mod platform {
                 source,
             })?;
 
-        let state = build_state_with_transport(options.config_path, None, AppTransport::Socket)
+        let state = build_state_off_runtime(options.config_path, None, AppTransport::Socket)
+            .await
             .map_err(DaemonSocketError::State)?;
         let (shutdown, _) = watch::channel(false);
         Ok(DaemonSocket {

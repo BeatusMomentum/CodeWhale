@@ -53,7 +53,7 @@ pub struct PromptSessionContext<'a> {
     pub recovery_hint: Option<&'a str>,
     /// Restrict skill discovery to Codewhale-owned roots plus explicit
     /// `skills_dir` configuration.
-    pub skills_scan_codewhale_only: bool,
+    pub skills_discovery_mode: crate::skills::SkillDiscoveryMode,
     /// Immutable plugin snapshot owned by this App/Engine workspace context.
     /// Never sourced from process-global mutable state.
     pub plugin_registry: Option<&'a crate::plugins::PluginRegistry>,
@@ -75,7 +75,7 @@ impl Default for PromptSessionContext<'_> {
             context_window_override: None,
             verbosity: None,
             recovery_hint: None,
-            skills_scan_codewhale_only: false,
+            skills_discovery_mode: crate::skills::SkillDiscoveryMode::Compatible,
             plugin_registry: None,
             mode: AppMode::Agent,
         }
@@ -96,6 +96,62 @@ const LEGACY_HANDOFF_RELATIVE_PATH: &str = ".deepseek/handoff.md";
 /// its own. Files larger than this are truncated with an explicit `[…truncated: N bytes omitted]`
 /// marker rather than skipped entirely so the model still sees the head.
 const INSTRUCTIONS_FILE_MAX_BYTES: usize = 100 * 1024;
+
+/// Read at most `cap` bytes of a prompt file plus slack for the leading
+/// whitespace the renderers trim, so an oversized file is never read whole
+/// into memory just to be truncated. Returns the text and the file's full
+/// length (for the truncation note). A file that is not UTF-8 within the read
+/// window is an error, as a whole-file `read_to_string` would report; only a
+/// character cut by the window's end is dropped.
+fn read_prompt_file_bounded(path: &Path, cap: usize) -> std::io::Result<(String, usize)> {
+    use std::io::Read as _;
+
+    const LEADING_WHITESPACE_SLACK: usize = 4 * 1024;
+    let file = std::fs::File::open(path)?;
+    let full_len = usize::try_from(file.metadata()?.len()).unwrap_or(usize::MAX);
+    let mut bytes = Vec::new();
+    file.take((cap + LEADING_WHITESPACE_SLACK) as u64)
+        .read_to_end(&mut bytes)?;
+    let truncated = bytes.len() < full_len;
+    let text = match String::from_utf8(bytes) {
+        Ok(text) => text,
+        Err(error) => {
+            let valid = error.utf8_error().valid_up_to();
+            let mut bytes = error.into_bytes();
+            // Only a multi-byte character split by the read window is
+            // forgiven; invalid bytes anywhere else still fail the read.
+            if !truncated || bytes.len() - valid > 3 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "stream did not contain valid UTF-8",
+                ));
+            }
+            bytes.truncate(valid);
+            String::from_utf8(bytes)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?
+        }
+    };
+    Ok((text, full_len))
+}
+
+/// Cap `trimmed` at `cap` bytes on a character boundary, noting what was
+/// omitted out of `total` (the file length when the read itself was bounded).
+fn cap_prompt_text(trimmed: &str, total: usize, cap: usize, hint: &str) -> String {
+    if trimmed.len() <= cap && total <= trimmed.len() {
+        return trimmed.to_string();
+    }
+    let head_end = (0..=cap.min(trimmed.len()))
+        .rev()
+        .find(|&i| trimmed.is_char_boundary(i))
+        .unwrap_or(0);
+    let total = total.max(trimmed.len());
+    format!(
+        "{}\n[…truncated: {} of {} bytes omitted — {hint}]",
+        &trimmed[..head_end],
+        total - head_end,
+        total
+    )
+}
 
 /// System prompt block appended when `translation_enabled` is true.
 /// Instructs the model to respond in the resolved session locale for all
@@ -189,11 +245,7 @@ fn translation_target_language_for_tag(locale_tag: &str) -> &'static str {
 /// churned the otherwise-static prefix on every release. The live workspace
 /// path is delivered per-turn via `<turn_meta>` (see `turn_metadata_block`).
 pub(crate) fn render_environment_block(_workspace: &Path, locale_tag: &str) -> String {
-    let platform = std::env::consts::OS;
-    let shell = crate::shell_dispatcher::global_dispatcher()
-        .kind()
-        .binary()
-        .to_string();
+    let (platform, shell) = environment_host_facts();
 
     format!(
         "## Environment\n\
@@ -202,6 +254,58 @@ pub(crate) fn render_environment_block(_workspace: &Path, locale_tag: &str) -> S
          - platform: {platform}\n\
          - shell: {shell}"
     )
+}
+
+/// The host facts the `## Environment` block names: this process's OS and
+/// the shell commands run under. Conformance goldens recorded on one host
+/// replay that host's facts on the recording thread
+/// ([`pin_recorded_environment`]); production always reports this host.
+fn environment_host_facts() -> (String, String) {
+    #[cfg(test)]
+    if let Some(recorded) = RECORDED_ENVIRONMENT.with(|cell| cell.borrow().clone()) {
+        return recorded;
+    }
+    (
+        std::env::consts::OS.to_string(),
+        crate::shell_dispatcher::global_dispatcher()
+            .kind()
+            .binary()
+            .to_string(),
+    )
+}
+
+#[cfg(test)]
+thread_local! {
+    static RECORDED_ENVIRONMENT: std::cell::RefCell<Option<(String, String)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Replay a recorded host's OS and shell in this thread's environment block
+/// until the guard drops. The only caller, the scripted conformance families,
+/// is Unix-only and runs its engine on this thread's runtime.
+#[cfg(all(test, unix))]
+pub(crate) fn pin_recorded_environment(os: &str, shell: &str) -> RecordedEnvironmentGuard {
+    RECORDED_ENVIRONMENT
+        .with(|cell| *cell.borrow_mut() = Some((os.to_string(), shell.to_string())));
+    RecordedEnvironmentGuard
+}
+
+/// The replayed shell on this thread, when a recorded environment is pinned.
+/// Tool descriptions that name the shell use it too, so a replay never
+/// depends on which shell first initialized their process-wide caches.
+#[cfg(all(test, unix))]
+pub(crate) fn recorded_shell() -> Option<String> {
+    RECORDED_ENVIRONMENT.with(|cell| cell.borrow().as_ref().map(|(_, shell)| shell.clone()))
+}
+
+#[cfg(all(test, unix))]
+pub(crate) struct RecordedEnvironmentGuard;
+
+#[cfg(all(test, unix))]
+impl Drop for RecordedEnvironmentGuard {
+    fn drop(&mut self) {
+        RECORDED_ENVIRONMENT.with(|cell| *cell.borrow_mut() = None);
+    }
 }
 
 /// Source for an `EngineConfig.instructions` entry. Either a disk file (loaded
@@ -255,39 +359,44 @@ impl From<&PathBuf> for InstructionSource {
 fn render_instructions_block(sources: &[InstructionSource]) -> Option<String> {
     let mut sections: Vec<String> = Vec::new();
     for source in sources {
+        let mut total_len: Option<usize> = None;
         let (raw_source_name, raw_content): (String, String) = match source {
-            InstructionSource::File(path) => match std::fs::read_to_string(path) {
-                Ok(raw) => (path.display().to_string(), raw),
-                Err(err) => {
-                    tracing::warn!(
-                        target: "instructions",
-                        ?err,
-                        ?path,
-                        "skipping unreadable instructions file"
-                    );
-                    continue;
+            InstructionSource::File(path) => {
+                match read_prompt_file_bounded(path, INSTRUCTIONS_FILE_MAX_BYTES) {
+                    Ok((raw, full_len)) => {
+                        // `full_len` covers bytes the bounded read left unread.
+                        total_len = Some(full_len);
+                        (path.display().to_string(), raw)
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            target: "instructions",
+                            ?err,
+                            ?path,
+                            "skipping unreadable instructions file"
+                        );
+                        continue;
+                    }
                 }
-            },
+            }
             InstructionSource::Inline { name, content } => (name.clone(), content.clone()),
         };
         let trimmed = raw_content.trim();
         if trimmed.is_empty() {
             continue;
         }
-        let body = if trimmed.len() > INSTRUCTIONS_FILE_MAX_BYTES {
-            let head_end = (0..=INSTRUCTIONS_FILE_MAX_BYTES)
-                .rev()
-                .find(|&i| trimmed.is_char_boundary(i))
-                .unwrap_or(0);
-            format!(
-                "{}\n[…truncated: {} of {} bytes omitted — consider splitting this instructions file]",
-                &trimmed[..head_end],
-                trimmed.len() - head_end,
-                trimmed.len()
-            )
-        } else {
-            trimmed.to_string()
+        // A bounded read that stopped short makes the file's own length the
+        // total; otherwise the trimmed text is everything there was.
+        let total = match total_len {
+            Some(full_len) if raw_content.len() < full_len => full_len,
+            _ => trimmed.len(),
         };
+        let body = cap_prompt_text(
+            trimmed,
+            total,
+            INSTRUCTIONS_FILE_MAX_BYTES,
+            "consider splitting this instructions file",
+        );
         sections.push(format!(
             "<instructions source=\"{raw_source_name}\">\n{body}\n</instructions>"
         ));
@@ -309,13 +418,26 @@ fn load_handoff_block(workspace: &Path) -> Option<String> {
     } else {
         workspace.join(LEGACY_HANDOFF_RELATIVE_PATH)
     };
-    let raw = std::fs::read_to_string(&path).ok()?;
+    // The relay is workspace-writable, so it gets the same per-file cap as
+    // an instructions file rather than an unbounded read into the prompt.
+    let (raw, full_len) = read_prompt_file_bounded(&path, INSTRUCTIONS_FILE_MAX_BYTES).ok()?;
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return None;
     }
+    let total = if raw.len() < full_len {
+        full_len
+    } else {
+        trimmed.len()
+    };
+    let relay = cap_prompt_text(
+        trimmed,
+        total,
+        INSTRUCTIONS_FILE_MAX_BYTES,
+        "shorten the relay artifact",
+    );
     Some(format!(
-        "## Previous Session Relay\n\nThe previous session in this workspace left a relay artifact at `{HANDOFF_RELATIVE_PATH}`. Consider it the first artifact to read on this turn — open blockers, in-flight changes, and recent decisions live there. Update or rewrite it before exiting if state changes materially.\n\n{trimmed}"
+        "## Previous Session Relay\n\nThe previous session in this workspace left a relay artifact at `{HANDOFF_RELATIVE_PATH}`. Consider it the first artifact to read on this turn — open blockers, in-flight changes, and recent decisions live there. Update or rewrite it before exiting if state changes materially.\n\n{relay}"
     ))
 }
 
@@ -1027,7 +1149,7 @@ pub fn system_prompt_for_mode_with_context_and_skills(
             context_window_override: None,
             verbosity: None,
             recovery_hint: None,
-            skills_scan_codewhale_only: false,
+            skills_discovery_mode: crate::skills::SkillDiscoveryMode::Compatible,
             plugin_registry: None,
             mode: AppMode::Agent,
         },
@@ -1158,9 +1280,7 @@ pub(crate) fn system_prompt_for_mode_with_context_skills_session_and_approval_fo
     // `skills_dir` is configured, union it with the workspace view instead of
     // treating it as a fallback; the workspace view often returns Some and
     // would otherwise shadow the configured directory entirely.
-    let skill_discovery_mode = crate::skills::SkillDiscoveryMode::from_codewhale_only(
-        session_context.skills_scan_codewhale_only,
-    );
+    let skill_discovery_mode = session_context.skills_discovery_mode;
     // The index budget scales with the route's context window (5%, floored),
     // so a 1M route sees the whole catalogue while a small local window still
     // keeps every skill name. Session-pinned: the window is fixed per route.
@@ -1684,7 +1804,7 @@ mod tests {
                     model_id: "codewhale",
                     context_window_override: None,
                     verbosity: None,
-                    skills_scan_codewhale_only: false,
+                    skills_discovery_mode: crate::skills::SkillDiscoveryMode::Compatible,
                     plugin_registry: None,
                     recovery_hint: None,
                     mode: AppMode::Agent,
@@ -2168,7 +2288,7 @@ mod tests {
                     model_id: "codewhale",
                     context_window_override: None,
                     verbosity: None,
-                    skills_scan_codewhale_only: false,
+                    skills_discovery_mode: crate::skills::SkillDiscoveryMode::Compatible,
                     plugin_registry: None,
                     recovery_hint: None,
                     mode: AppMode::Agent,
@@ -2294,7 +2414,7 @@ mod tests {
                     model_id: "codewhale",
                     context_window_override: None,
                     verbosity: None,
-                    skills_scan_codewhale_only: false,
+                    skills_discovery_mode: crate::skills::SkillDiscoveryMode::Compatible,
                     plugin_registry: None,
                     recovery_hint: None,
                     mode: AppMode::Agent,
@@ -2342,7 +2462,7 @@ mod tests {
                     model_id: "codewhale",
                     context_window_override: None,
                     verbosity: None,
-                    skills_scan_codewhale_only: false,
+                    skills_discovery_mode: crate::skills::SkillDiscoveryMode::Compatible,
                     plugin_registry: None,
                     recovery_hint: None,
                     mode: AppMode::Agent,
@@ -2436,7 +2556,7 @@ mod tests {
                     model_id: "codewhale",
                     context_window_override: None,
                     verbosity: None,
-                    skills_scan_codewhale_only: false,
+                    skills_discovery_mode: crate::skills::SkillDiscoveryMode::Compatible,
                     plugin_registry: None,
                     recovery_hint: None,
                     mode: AppMode::Agent,
@@ -2618,7 +2738,7 @@ mod tests {
                     model_id: "codewhale",
                     context_window_override: None,
                     verbosity: None,
-                    skills_scan_codewhale_only: false,
+                    skills_discovery_mode: crate::skills::SkillDiscoveryMode::Compatible,
                     plugin_registry: None,
                     recovery_hint: None,
                     mode: AppMode::Agent,
@@ -2649,7 +2769,7 @@ mod tests {
                     model_id: "codewhale",
                     context_window_override: None,
                     verbosity: None,
-                    skills_scan_codewhale_only: false,
+                    skills_discovery_mode: crate::skills::SkillDiscoveryMode::Compatible,
                     plugin_registry: None,
                     recovery_hint: None,
                     mode: AppMode::Agent,
@@ -2694,7 +2814,7 @@ mod tests {
                     model_id: "codewhale",
                     context_window_override: None,
                     verbosity: None,
-                    skills_scan_codewhale_only: false,
+                    skills_discovery_mode: crate::skills::SkillDiscoveryMode::Compatible,
                     plugin_registry: None,
                     recovery_hint: None,
                     mode: AppMode::Agent,
@@ -2825,7 +2945,7 @@ mod tests {
                     model_id: "codewhale",
                     context_window_override: None,
                     verbosity: None,
-                    skills_scan_codewhale_only: false,
+                    skills_discovery_mode: crate::skills::SkillDiscoveryMode::Compatible,
                     plugin_registry: None,
                     recovery_hint: None,
                     mode: AppMode::Agent,
@@ -2857,7 +2977,7 @@ mod tests {
                     model_id: "codewhale",
                     context_window_override: None,
                     verbosity: None,
-                    skills_scan_codewhale_only: false,
+                    skills_discovery_mode: crate::skills::SkillDiscoveryMode::Compatible,
                     plugin_registry: None,
                     recovery_hint: None,
                     mode: AppMode::Agent,
@@ -3080,7 +3200,7 @@ mod tests {
                     model_id: "codewhale",
                     context_window_override: None,
                     verbosity: None,
-                    skills_scan_codewhale_only: false,
+                    skills_discovery_mode: crate::skills::SkillDiscoveryMode::Compatible,
                     plugin_registry: None,
                     recovery_hint: None,
                     mode: AppMode::Agent,
@@ -3115,7 +3235,7 @@ mod tests {
                     model_id: "codewhale",
                     context_window_override: None,
                     verbosity: None,
-                    skills_scan_codewhale_only: false,
+                    skills_discovery_mode: crate::skills::SkillDiscoveryMode::Compatible,
                     plugin_registry: None,
                     recovery_hint: None,
                     mode: AppMode::Agent,
@@ -3149,7 +3269,7 @@ mod tests {
                     context_window_override: None,
                     verbosity: None,
                     recovery_hint,
-                    skills_scan_codewhale_only: false,
+                    skills_discovery_mode: crate::skills::SkillDiscoveryMode::Compatible,
                     plugin_registry: None,
                     mode: AppMode::Agent,
                 },
@@ -3259,7 +3379,7 @@ mod tests {
                     model_id: "glm-5.2",
                     context_window_override: Some(1_000_000),
                     verbosity: None,
-                    skills_scan_codewhale_only: false,
+                    skills_discovery_mode: crate::skills::SkillDiscoveryMode::Compatible,
                     plugin_registry: None,
                     recovery_hint: None,
                     mode: AppMode::Agent,
@@ -3499,6 +3619,23 @@ mod tests {
         assert!(
             !a.contains(summary),
             "summary must not be embedded in system prompt"
+        );
+    }
+
+    #[test]
+    fn oversized_relay_artifact_is_capped_like_an_instructions_file() {
+        let tmp = tempdir().expect("tempdir");
+        let dir = tmp.path().join(".codewhale");
+        std::fs::create_dir_all(&dir).unwrap();
+        // 300 KiB relay: well past the per-file prompt cap.
+        std::fs::write(dir.join("handoff.md"), "R".repeat(300 * 1024)).unwrap();
+
+        let block = super::load_handoff_block(tmp.path()).expect("relay block");
+        assert!(block.contains("[…truncated:"), "truncation marker missing");
+        assert!(
+            block.len() < 110 * 1024,
+            "relay must be capped near 100 KiB, got {} bytes",
+            block.len()
         );
     }
 
@@ -3783,7 +3920,7 @@ mod tests {
                     model_id: "codewhale",
                     context_window_override: None,
                     verbosity: Some(" Concise "),
-                    skills_scan_codewhale_only: false,
+                    skills_discovery_mode: crate::skills::SkillDiscoveryMode::Compatible,
                     plugin_registry: None,
                     recovery_hint: None,
                     mode: AppMode::Agent,
@@ -3828,7 +3965,7 @@ mod tests {
                 model_id: "deepseek-v4-pro",
                 context_window_override: None,
                 verbosity: Some("concise"),
-                skills_scan_codewhale_only: false,
+                skills_discovery_mode: crate::skills::SkillDiscoveryMode::Compatible,
                 plugin_registry: None,
                 recovery_hint: None,
                 mode: AppMode::Agent,
@@ -3882,7 +4019,7 @@ mod tests {
             model_id: "codewhale",
             context_window_override: None,
             verbosity: None,
-            skills_scan_codewhale_only: false,
+            skills_discovery_mode: crate::skills::SkillDiscoveryMode::Compatible,
             plugin_registry: None,
             recovery_hint: None,
             mode: AppMode::Agent,

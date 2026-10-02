@@ -355,7 +355,14 @@ fn classify(
 ) -> BillingPresentation {
     match provider {
         ApiProvider::Ollama | ApiProvider::Sglang | ApiProvider::Vllm => BillingPresentation::Local,
-        ApiProvider::OpenaiCodex => BillingPresentation::Subscription("Codex OAuth quota"),
+        // The Codex OAuth quota is a fact of the ChatGPT backend, not of the
+        // provider name: a custom `[providers.openai_codex] base_url` (a
+        // gateway, a proxy) sells its own terms, so it is Unknown rather than
+        // a subscription that would hide metered spend.
+        ApiProvider::OpenaiCodex if crate::pricing::is_chatgpt_codex_backend(base_url) => {
+            BillingPresentation::Subscription("Codex OAuth quota")
+        }
+        ApiProvider::OpenaiCodex => BillingPresentation::Unknown,
         ApiProvider::OpencodeGo => BillingPresentation::Subscription("OpenCode Go quota"),
         // StepFun already reduces an endpoint to a non-secret billing surface
         // and fails closed on anything it does not recognize.
@@ -2400,6 +2407,43 @@ mod tests {
                 },
             ),
             BillingPresentation::Subscription("Codex OAuth quota")
+        );
+        // The OAuth token pointed anywhere else proves no Codex quota.
+        for elsewhere in [
+            "https://codex-gateway.example.com/backend-api",
+            "https://chatgpt.com.example.net/backend-api",
+            "http://chatgpt.com/backend-api",
+            "https://chatgpt.com/v1",
+            "",
+        ] {
+            assert_eq!(
+                for_dispatched_route(
+                    &config,
+                    DispatchedRoute {
+                        provider: ApiProvider::OpenaiCodex,
+                        base_url: elsewhere,
+                    },
+                ),
+                BillingPresentation::Unknown,
+                "{elsewhere:?}"
+            );
+            // The persisted billing surface agrees: a custom endpoint is not
+            // an OAuth subscription that would drop out of money coverage.
+            if !elsewhere.is_empty() {
+                assert_eq!(
+                    billing_surface_for_dispatch(None, ApiProvider::OpenaiCodex, Some(elsewhere)),
+                    Some(crate::pricing::UNCLASSIFIED_BILLING_SURFACE),
+                    "{elsewhere:?}"
+                );
+            }
+        }
+        assert_eq!(
+            billing_surface_for_dispatch(
+                None,
+                ApiProvider::OpenaiCodex,
+                Some("https://chatgpt.com/backend-api/codex")
+            ),
+            Some(crate::pricing::OAUTH_SUBSCRIPTION_BILLING_SURFACE)
         );
     }
 

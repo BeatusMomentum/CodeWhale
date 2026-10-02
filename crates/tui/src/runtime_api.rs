@@ -1049,6 +1049,9 @@ fn open_runtime_threads_for_server(
     Ok((manager, workshop_activation))
 }
 
+/// Prefix of the first line the Runtime prints once it holds its listener.
+pub const RUNTIME_LISTENING_PREFIX: &str = "Runtime API listening on http://";
+
 /// Start the runtime API server.
 pub async fn run_http_server(
     config: Config,
@@ -1057,6 +1060,17 @@ pub async fn run_http_server(
     options: RuntimeApiOptions,
 ) -> Result<()> {
     validate_runtime_listener_security(&options)?;
+
+    // Own the endpoint before building anything that names it: with an
+    // ephemeral port (`--port 0`) the kernel picks the port, and the address
+    // this process reports is the one it actually holds.
+    let addr = runtime_bind_address(&options.host, options.port)?;
+    let listener = TcpListener::bind(addr)
+        .await
+        .with_context(|| format!("Failed to bind {addr}"))?;
+    let bound_addr = listener
+        .local_addr()
+        .context("Failed to read Runtime API listener address")?;
 
     // Keep the server usable before a local catalog arrives. Omitted API
     // requests are checked at admission; background tasks keep the auto sentinel.
@@ -1149,7 +1163,7 @@ pub async fn run_http_server(
         skill_state: Arc::new(Mutex::new(skill_state)),
         auth_required: auth_enabled,
         bind_host: options.host.clone(),
-        bind_port: options.port,
+        bind_port: bound_addr.port(),
         mobile_enabled: options.mobile,
         mobile,
         web,
@@ -1165,15 +1179,10 @@ pub async fn run_http_server(
     };
     let app = build_router(state);
 
-    let addr = runtime_bind_address(&options.host, options.port)?;
-    let listener = TcpListener::bind(addr)
-        .await
-        .with_context(|| format!("Failed to bind {addr}"))?;
-
-    let bound_addr = listener
-        .local_addr()
-        .context("Failed to read Runtime API listener address")?;
-    println!("Runtime API listening on http://{bound_addr}");
+    // First stdout line, flushed: a supervising parent reads the endpoint
+    // from here instead of guessing a port (stdout is block-buffered on a pipe).
+    println!("{RUNTIME_LISTENING_PREFIX}{bound_addr}");
+    let _ = std::io::Write::flush(&mut std::io::stdout());
     for line in runtime_auth_status_lines(&resolved_auth) {
         println!("{line}");
     }
@@ -1216,7 +1225,7 @@ pub async fn run_http_server(
         println!(
             "  /v1/runtime/info reports bind_host={host:?}, port={port}, auth_required={auth}.",
             host = options.host,
-            port = options.port,
+            port = bound_addr.port(),
             auth = auth_enabled,
         );
     }
@@ -1235,7 +1244,10 @@ pub async fn run_http_server(
 /// overlay transport, so a non-loopback listener would expose the Runtime API
 /// to peers that can observe or replay browser traffic.
 fn validate_runtime_listener_security(options: &RuntimeApiOptions) -> Result<()> {
-    if options.port == 0 {
+    // Port 0 asks the kernel for an ephemeral port. Only a plain loopback
+    // Runtime may use it: web and mobile clients are given a fixed endpoint.
+    if options.port == 0 && (options.web || options.mobile || !is_loopback_bind_host(&options.host))
+    {
         bail!("Port must be > 0");
     }
     if options.web && options.host != "127.0.0.1" {
@@ -3776,9 +3788,7 @@ async fn list_skills(
     let (skills_dir, mode) = {
         let config = state.config.read();
         let skills_dir = resolve_skills_dir(&config, &state.workspace);
-        let mode = crate::skills::SkillDiscoveryMode::from_codewhale_only(
-            config.skills_config().scan_codewhale_only(),
-        );
+        let mode = crate::skills::SkillDiscoveryMode::from_config(&config.skills_config());
         (skills_dir, mode)
     };
     let plugin_registry = state
@@ -3849,9 +3859,7 @@ async fn set_skill_enabled(
     let (skills_dir, mode) = {
         let config = state.config.read();
         let skills_dir = resolve_skills_dir(&config, &state.workspace);
-        let mode = crate::skills::SkillDiscoveryMode::from_codewhale_only(
-            config.skills_config().scan_codewhale_only(),
-        );
+        let mode = crate::skills::SkillDiscoveryMode::from_config(&config.skills_config());
         (skills_dir, mode)
     };
     let plugin_registry = state
@@ -7171,6 +7179,7 @@ async fn complete_thread_goal(
         .transition_goal_status(
             &id,
             &goal.goal_id,
+            goal.status.clone(),
             codewhale_protocol::ThreadGoalStatus::Complete,
         )
         .await
@@ -7223,6 +7232,7 @@ async fn block_thread_goal(
         .transition_goal_status(
             &id,
             &goal.goal_id,
+            goal.status.clone(),
             codewhale_protocol::ThreadGoalStatus::Blocked,
         )
         .await
@@ -8195,8 +8205,11 @@ fn resolve_skills_dir(config: &Config, workspace: &std::path::Path) -> PathBuf {
         Err(_) => return config.skills_dir(),
     };
     for candidate in [
-        canonical_workspace.join(".agents").join("skills"),
-        canonical_workspace.join("skills"),
+        canonical_workspace.join(".codewhale/skills"),
+        canonical_workspace.join(".agents/skills"),
+        canonical_workspace.join(".claude/skills"),
+        canonical_workspace.join(".opencode/skills"),
+        canonical_workspace.join(".cursor/skills"),
     ] {
         // Re-canonicalize the candidate so a `.agents/skills` symlink to e.g.
         // `/etc` cannot promote arbitrary filesystem locations into the
@@ -8209,6 +8222,15 @@ fn resolve_skills_dir(config: &Config, workspace: &std::path::Path) -> PathBuf {
         {
             return canon;
         }
+    }
+    let flat = canonical_workspace.join("skills");
+    if config.skills_config().flat_workspace_root()
+        && let Ok(canonical) = fs::canonicalize(&flat)
+        && canonical.starts_with(&canonical_workspace)
+        && canonical.is_dir()
+        && crate::skills::skills_dir_allowed_by_workspace_trust(workspace, &canonical)
+    {
+        return canonical;
     }
     config.skills_dir()
 }
@@ -9396,6 +9418,9 @@ struct SwitchProviderResponse {
 ///   are committed together through the canonical Config writer.
 /// - Config is reloaded from disk and synced to active engines via
 ///   `runtime_threads.reload_config`, exactly like `POST /v1/config/reload`.
+/// - A reload that fails or is rejected rolls the persisted selection back
+///   (only while the file still holds what this write left), so disk and the
+///   running config never disagree about the provider. The error says which.
 async fn switch_provider(
     State(state): State<RuntimeApiState>,
     Path(id): Path<String>,

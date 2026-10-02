@@ -47,7 +47,7 @@ fn missing_api_stamps_never_drop_messages_or_shift_preserved_times() {
     assert_eq!(app.api_message_stamps.len(), 3);
     assert_eq!(app.api_message_stamps[0], first);
     assert_eq!(app.api_message_stamps[2], third);
-    app.pop_api_message();
+    app.truncate_api_messages(2);
     assert_eq!(app.api_messages.len(), 2);
     assert_eq!(app.api_message_stamps.len(), 2);
     app.truncate_api_messages(1);
@@ -2951,6 +2951,10 @@ fn resolve_skills_dir_ignores_untrusted_workspace_skills() {
         std::fs::create_dir_all(&local_skills).expect("skills dir");
         let config = Config {
             skills_dir: Some(global_skills_dir.to_string_lossy().into_owned()),
+            skills: Some(crate::config::SkillsConfig {
+                flat_workspace_root: Some(true),
+                ..Default::default()
+            }),
             ..Default::default()
         };
 
@@ -6062,6 +6066,37 @@ fn cursor_moves_by_grapheme_over_emoji_and_cjk() {
     assert_eq!(app.cursor_position, 0); // clamped at start
 }
 
+/// U01-m4: vim Normal-mode clamps, `a`, and `j`/`k` column moves land on
+/// grapheme-cluster starts, never inside a combining or skin-tone sequence.
+#[test]
+fn vim_cursor_moves_never_split_a_grapheme_cluster() {
+    let mut app = App::new(test_options(false), &Config::default());
+    app.vim_enabled = true;
+    // "e" + COMBINING ACUTE: two scalars, one cluster.
+    app.input = "e\u{301}".to_string();
+    app.cursor_position = char_count(&app.input);
+    app.vim_enter_normal();
+    assert_eq!(
+        app.cursor_position, 0,
+        "Normal mode sits on the cluster start"
+    );
+    app.vim_enter_append();
+    assert_eq!(
+        app.cursor_position, 2,
+        "`a` appends after the whole cluster"
+    );
+
+    // Scalar column 1 falls inside the other line's skin-tone emoji.
+    app.input = "ab\n\u{1f44d}\u{1f3fd}c".to_string();
+    app.cursor_position = 1; // on `b`
+    app.vim_move_down();
+    assert_eq!(app.cursor_position, 3, "`j` lands on the emoji's start");
+    app.input = "\u{1f44d}\u{1f3fd}c\nab".to_string();
+    app.cursor_position = 5; // on `b`
+    app.vim_move_up();
+    assert_eq!(app.cursor_position, 0, "`k` lands on the emoji's start");
+}
+
 #[test]
 fn backspace_removes_whole_emoji_cluster() {
     let mut app = App::new(test_options(false), &Config::default());
@@ -7854,4 +7889,64 @@ fn ctrl_t_moves_past_a_persisted_alias_the_ladder_dropped() {
     app.cycle_effort();
 
     assert_eq!(app.reasoning_effort, ReasoningEffort::Max);
+}
+
+#[test]
+fn skills_cache_hides_model_only_and_preserves_argument_hint() {
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace = tmp.path().join("workspace");
+    crate::test_support::trust_workspace(&workspace);
+    let root = workspace.join(".codewhale/skills");
+    for (name, policy) in [
+        ("model", "user-invocable: false"),
+        (
+            "user",
+            "disable-model-invocation: true\nargument-hint: '[path]'",
+        ),
+        (
+            "disabled",
+            "disable-model-invocation: true\nuser-invocable: false",
+        ),
+    ] {
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: routing\n{policy}\n---\nbody"),
+        )
+        .unwrap();
+    }
+    let mut options = test_options(false);
+    options.workspace = workspace;
+    options.skills_dir = root;
+    let app = App::new(options, &Config::default());
+    assert!(
+        app.cached_skills
+            .iter()
+            .all(|(name, _)| name != "model" && name != "disabled")
+    );
+    assert!(
+        app.cached_skills
+            .iter()
+            .any(|(name, description)| name == "user" && description.contains("[path]"))
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn oversized_paste_is_not_written_through_a_linked_pastes_directory() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let outside = tempfile::TempDir::new().expect("outside");
+    std::os::unix::fs::symlink(outside.path(), tmp.path().join(".codewhale")).expect("link");
+    let mut opts = test_options(false);
+    opts.workspace = tmp.path().to_path_buf();
+    let mut app = App::new(opts, &Config::default());
+    app.insert_paste_text(&"y".repeat(MAX_SUBMITTED_INPUT_CHARS + 256));
+
+    let _ = app.submit_input();
+
+    assert!(
+        std::fs::read_dir(outside.path()).unwrap().next().is_none(),
+        "the pasted text must not land outside the workspace"
+    );
 }

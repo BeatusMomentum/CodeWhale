@@ -74,7 +74,7 @@ impl ReviewerOutcome {
                 "Auto-Review guardian denied tool '{tool_name}': {reason}. Do not work around this denial; find a materially safer path or stop."
             ))),
             Self::Unavailable { reason } => Err(ToolError::permission_denied(format!(
-                "Auto-Review guardian unavailable ({reason}); the call was denied (fail closed). Switch to Ask to review this call yourself."
+                "Auto-Review guardian unavailable ({reason}); the call was denied (fail closed). To run it, the person can switch Permissions to Full Access, or to Ask where a prompt can be answered."
             ))),
             Self::Cancelled => Err(ToolError::cancelled(
                 "Auto-Review guardian request cancelled",

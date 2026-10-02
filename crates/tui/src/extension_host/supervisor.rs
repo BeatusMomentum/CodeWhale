@@ -4,18 +4,77 @@
 //! The existing Rust manager owns heartbeat, crash budget, generation changes,
 //! and receipt-checked replay; this channel never replays a tool call.
 //!
-//! **OS sandbox.** Where Codewhale's default command sandbox is available
-//! (Seatbelt on macOS; bubblewrap stays opt-in for shell commands and is not
-//! used here) the host runs under a workspace-write profile rooted at
+//! **OS sandbox** ([`HostSandbox`]: the one value `/plugin`, doctor and the
+//! start diagnostic report). The host runs under Codewhale's command sandbox
+//! with a workspace-write policy rooted at
 //! `$CODEWHALE_HOME/extension-host/data`: no direct network, writes only
 //! there and in the temp dirs, and **no reads** of the Codewhale homes
 //! (everything but the bundle, its data dir and plugin code), the Codex and
 //! DSH credential homes, and the credential-store default deny-list
 //! (`sandbox::read_guard`). Other user-readable files stay readable —
-//! including `.env` files, whose filename rule has no Seatbelt subpath form —
-//! and Mach services are not restricted, so this is defense-in-depth, not a
-//! containment boundary. Elsewhere (Linux, Windows) the host runs unsandboxed
-//! with the user's permissions, and `/plugin` says so.
+//! including `.env` files, whose filename rule has no Seatbelt subpath or
+//! bubblewrap mount form — so this is defense-in-depth, not a containment
+//! boundary.
+//! * macOS: Seatbelt. Mach services are not restricted.
+//! * Linux: bubblewrap (`/usr/bin/bwrap`, the shell's builder), used without
+//!   the shell's `prefer_bwrap` opt-in. Every launch first runs the finished
+//!   wrapper around `<runtime> --version` ([`probe_bwrap`]). When bwrap is
+//!   missing or cannot start — e.g. unprivileged user namespaces blocked by
+//!   Ubuntu 24.04's `kernel.apparmor_restrict_unprivileged_userns` — the host
+//!   starts unsandboxed and every surface says so with bwrap's own error;
+//!   never a silent downgrade. bwrap can mask only what exists, so each
+//!   Codewhale home is masked whole and its readable entries are bound again
+//!   (`sandbox::bwrap_exception_args`): an entry created after launch is
+//!   denied, as on macOS.
+//! * Windows: unsandboxed (the Job Object contains the process tree; that is
+//!   not isolation), and `/plugin` says so.
+//!
+//! Known limits under bubblewrap: a default-deny-list credential store
+//! created after launch stays readable (Seatbelt denies it by name); a
+//! Codewhale home, or a readable entry such as `plugins/`, that does not exist
+//! at launch is not masked, or not visible, until the host restarts; bwrap
+//! anywhere but `/usr/bin/bwrap` is not used; the probe costs one extra
+//! runtime start per launch. The reported pid is bwrap's. The host runs in
+//! bwrap's PID namespace, where its parent is bwrap's init and never
+//! changes, so the host's own parent watchdog (`extension-host/src/main.ts`)
+//! cannot fire; `--die-with-parent` is what ends it with the core. That is
+//! a parent-death signal tied to the thread that spawned bwrap, a Tokio
+//! worker that lives as long as the runtime. Plugin child processes end with
+//! the namespace when bwrap's init loses the host.
+//!
+//! **Runtime.** Node (the default) or Bun (opt-in: `runtime = "bun"`, or
+//! `"auto"`, which prefers a supported Bun), chosen once per manager
+//! (`[extension_host] runtime`). Each gets its own flags ([`runtime_args`])
+//! and environment ([`runtime_env`]); Bun silently ignores Node's heap and
+//! `__proto__` flags. The host itself takes in-process native code away from
+//! plugins (`extension-host/src/runtime.ts`: `bun:ffi`, `Bun.FFI`, SQLite
+//! extension loading, Worker threads, ShadowRealm, `process.dlopen`) and
+//! refuses to start if a lock does not hold. That lockdown covers the entry
+//! points found so far (Bun 1.4, Node 22 and 26), not every one a runtime
+//! may add.
+//!
+//! **Memory cap** ([`MemoryEnforcement`]). What was measured where: the
+//! macOS mechanism on macOS 26.1 arm64 (2026-09-30, Bun 1.4.0 and Node);
+//! the Linux thresholds in [`HOST_MEMORY_CAP`] in a Linux container
+//! (2026-09-29). Hosted CI runs the Rust memory-cap test on Linux, macOS and
+//! Windows with Node only; the Rust host tests have not run a Bun host on
+//! Linux or Windows (CI's JS host suites run under Bun 1.4.0 on Linux).
+//! * Linux: `RLIMIT_DATA`, set in the child before exec (clamped to an
+//!   inherited hard limit that is already lower); an allocation past the cap
+//!   fails. Plugin child processes inherit it.
+//! * Windows: the Job Object's per-process limit; an allocation past the cap
+//!   fails. It applies to each process in the job, plugin children included.
+//! * macOS: `setrlimit(RLIMIT_AS/RLIMIT_DATA)` below the current mapping size
+//!   fails with `EINVAL`, and `memorystatus_control` needs privilege. A fatal
+//!   jetsam limit set as a `posix_spawn` attribute works unprivileged, but a
+//!   later `exec` clears it, so it cannot be set on `sandbox-exec`. The Bun
+//!   host therefore re-executes itself in place with the limit before any
+//!   plugin loads, and reports it in `host/hello`; past the cap the kernel
+//!   SIGKILLs it. Plugin child processes are not covered. A Bun host that
+//!   cannot apply the requested limit is refused before initialization. Node
+//!   has no FFI to do the same, so a Node host is checked at each heartbeat
+//!   instead: enforced only as often as
+//!   the heartbeat runs. Node also keeps `--max-old-space-size=256`.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -27,6 +86,8 @@ use std::time::Duration;
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
+
+use crate::dependencies::{HostRuntime, HostRuntimeKind};
 
 use super::protocol::{
     self, CoreRequest, HostLimits, HostMessage, HostNotification, HostRequest, InitializeParams,
@@ -44,10 +105,13 @@ use super::protocol::{
 /// a too-tight budget disables every extension for that session. The
 /// handshake runs in the background, off the first-prompt path, so a wider
 /// budget costs nothing when the host is healthy; 30 s matches the MCP stdio
-/// handshake (`codewhale_mcp::stdio_client::HANDSHAKE_TIMEOUT`).
+/// handshake; it is independent of the active TUI MCP client.
 pub const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(30);
 pub const ACTIVATE_DEADLINE: Duration = Duration::from_secs(5);
 pub const DISPOSE_DEADLINE: Duration = Duration::from_secs(2);
+/// A `host/ping` answer later than this means a hung host: the heartbeat's
+/// default `hang_timeout`, and the bound for any other ping.
+pub const PING_DEADLINE: Duration = Duration::from_secs(10);
 /// Grace between `$/cancel` and resolving a call as cancelled on this side.
 pub const CANCEL_GRACE: Duration = Duration::from_millis(500);
 const STDERR_TAIL_BYTES: usize = 8 * 1024;
@@ -61,8 +125,11 @@ pub enum HostCallError {
     Exited(String),
     #[error("cancelled: {0}")]
     Cancelled(String),
-    #[error("timed out after {0:?}")]
-    Timeout(Duration),
+    #[error("`{method}` timed out after {after:?}; the host was told to cancel it")]
+    Timeout {
+        method: &'static str,
+        after: Duration,
+    },
     #[error("extension host channel is full")]
     Busy,
 }
@@ -74,10 +141,190 @@ pub(crate) struct HostLaunch {
     pub program: PathBuf,
     pub args: Vec<String>,
     pub cwd: PathBuf,
-    /// `seatbelt` / `bwrap`, or `None` when the host runs unsandboxed.
-    pub sandbox: Option<String>,
+    pub sandbox: HostSandbox,
     /// Environment the sandbox wrapper adds (`CODEWHALE_SANDBOX`, …).
     pub sandbox_env: Vec<(String, String)>,
+    /// The runtime inside the wrapper; `host/hello` must report the same one.
+    pub runtime: HostRuntime,
+    /// Environment the runtime needs ([`runtime_env`]).
+    pub runtime_env: Vec<(String, String)>,
+    /// Bytes; see the module docs for how each platform enforces it.
+    pub memory_cap: u64,
+    /// How the cap is meant to be enforced; a macOS Bun host confirms its
+    /// jetsam limit in `host/hello` or initialization is refused.
+    pub memory: MemoryEnforcement,
+}
+
+/// Whether the host runs under an OS sandbox, and why not when it does not
+/// (module docs). Settled by [`plan_launch`]; never inferred afterwards.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HostSandbox {
+    /// Under this wrapper, named as `sandbox::SandboxType` names it
+    /// (`macos-seatbelt`, `linux-bwrap`).
+    Wrapped(String),
+    /// With the user's permissions, for this reason.
+    Unsandboxed(String),
+}
+
+impl HostSandbox {
+    /// The wrapper's name, or `none: <reason>`, for one-line diagnostics.
+    #[must_use]
+    pub fn label(&self) -> String {
+        match self {
+            Self::Wrapped(name) => name.clone(),
+            Self::Unsandboxed(reason) => format!("none: {reason}"),
+        }
+    }
+}
+
+/// What `/plugin` and doctor say about the sandbox.
+impl std::fmt::Display for HostSandbox {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Wrapped(name) => write!(
+                f,
+                "{name} sandbox (no direct network; the Codewhale home except plugin code, the Codex and DSH credential homes and the default credential stores are unreadable; other files you can read, such as project .env files, are not protected)"
+            ),
+            Self::Unsandboxed(reason) => write!(
+                f,
+                "UNSANDBOXED ({reason}): host code runs with your user permissions"
+            ),
+        }
+    }
+}
+
+/// Environment variable carrying the jetsam limit a macOS Bun host applies to
+/// itself, in MiB (`extension-host/src/runtime.ts`, `applyMemoryLimit`).
+pub(crate) const MEMORY_LIMIT_REQUEST_ENV: &str = "CODEWHALE_HOST_MEMORY_LIMIT_MIB";
+
+/// How the host's memory cap is enforced (module docs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryEnforcement {
+    /// Linux: kernel `RLIMIT_DATA`.
+    Rlimit,
+    /// Windows: the Job Object's per-process memory limit.
+    JobObject,
+    /// macOS + Bun: a fatal jetsam limit the host applied to itself.
+    Jetsam,
+    /// macOS otherwise: resident size checked at each heartbeat.
+    Heartbeat,
+    /// No cap on this platform.
+    Unenforced,
+}
+
+impl MemoryEnforcement {
+    /// What this platform does for `kind`, before the host has confirmed it.
+    #[must_use]
+    pub fn planned(kind: HostRuntimeKind) -> Self {
+        if cfg!(target_os = "linux") {
+            Self::Rlimit
+        } else if cfg!(windows) {
+            Self::JobObject
+        } else if cfg!(target_os = "macos") {
+            match kind {
+                HostRuntimeKind::Bun => Self::Jetsam,
+                HostRuntimeKind::Node => Self::Heartbeat,
+            }
+        } else {
+            Self::Unenforced
+        }
+    }
+
+    /// One line for `/plugin` and doctor.
+    #[must_use]
+    pub fn describe(self, cap: u64) -> String {
+        let mib = cap / (1024 * 1024);
+        match self {
+            Self::Rlimit => format!(
+                "memory cap {mib} MiB (kernel RLIMIT_DATA; plugin child processes inherit it)"
+            ),
+            Self::JobObject => format!(
+                "memory cap {mib} MiB (Job Object per-process limit; plugin child processes included)"
+            ),
+            Self::Jetsam => format!(
+                "memory cap {mib} MiB (kernel jetsam limit; the host is killed past it; plugin child processes are not covered)"
+            ),
+            Self::Heartbeat => format!(
+                "memory cap {mib} MiB (resident size checked at each heartbeat; on macOS only the Bun host gets a kernel limit)"
+            ),
+            Self::Unenforced => "no memory cap on this platform".to_string(),
+        }
+    }
+}
+
+/// The default memory cap. Measured once in a Linux container (2026-09-29),
+/// not in CI: under `RLIMIT_DATA` Node 24 aborts when it creates the host's
+/// watchdog Worker at 512 MiB, and Bun 1.4 aborts at startup at 256 MiB.
+/// Both started and ran at 1 GiB and failed an allocation past it. An idle
+/// host used 34–67 MB resident.
+pub const HOST_MEMORY_CAP: u64 = 1 << 30;
+
+/// Runtime flags, before the bundle path. Keep in sync with
+/// `extension-host/test/harness.mjs` (`HOST_ARGS`).
+///
+/// - Node: a 256 MB old-space cap, `__proto__` throws, no native addons,
+///   and the [`crate::dependencies::NODE_NATIVE_CODE_FLAGS`] this Node
+///   accepts (`node:sqlite`, and `node:ffi` where it exists).
+/// - Bun ignores all of those except `--no-addons`. Instead it gets
+///   `--no-install`, because Bun otherwise fetches a missing package from npm
+///   while plugin code is running. It also gets `--no-env-file` and
+///   `--config=<null device>`, because Bun otherwise loads `.env` and
+///   `bunfig.toml` (which can preload code) from the working directory, and
+///   that directory is the host's writable data dir. `bun:ffi` and the rest
+///   are locked in the host itself (`src/runtime.ts`).
+#[must_use]
+pub(crate) fn runtime_args(runtime: &HostRuntime) -> Vec<String> {
+    base_runtime_args(runtime.kind)
+        .iter()
+        .chain(&runtime.native_code_flags)
+        .map(|arg| (*arg).to_string())
+        .collect()
+}
+
+/// Environment for the runtime. Keep in sync with `HOST_ENV` in
+/// `extension-host/test/harness.mjs`.
+///
+/// - Both: `NODE_OPTIONS` is blanked. The child-environment allowlist passes
+///   the user's value through (shell tools need it), and a `--require` or
+///   `--import` preload there would run before the host's native-code
+///   lockdown. Node honours it; Bun 1.4.0 ignored a `--require` in it when
+///   checked (2026-09-30), and it is blanked for Bun too in case a later
+///   Bun does not. `BUN_OPTIONS`, which Bun does honour, is not in that
+///   allowlist.
+/// - Bun: no ShadowRealm, engine-wide (a realm imports a fresh `bun:ffi`;
+///   `node:vm` contexts would otherwise hand the constructor out). The host
+///   refuses to start without it.
+#[must_use]
+pub(crate) fn runtime_env(kind: HostRuntimeKind) -> Vec<(String, String)> {
+    let mut env = vec![("NODE_OPTIONS".to_string(), String::new())];
+    if kind == HostRuntimeKind::Bun {
+        env.push(("BUN_JSC_useShadowRealm".to_string(), "0".to_string()));
+    }
+    env
+}
+
+fn base_runtime_args(kind: HostRuntimeKind) -> &'static [&'static str] {
+    match kind {
+        HostRuntimeKind::Node => &[
+            "--max-old-space-size=256",
+            "--disable-proto=throw",
+            "--no-addons",
+        ],
+        #[cfg(windows)]
+        HostRuntimeKind::Bun => &[
+            "--no-install",
+            "--no-env-file",
+            "--config=NUL",
+            "--no-addons",
+        ],
+        #[cfg(not(windows))]
+        HostRuntimeKind::Bun => &[
+            "--no-install",
+            "--no-env-file",
+            "--config=/dev/null",
+            "--no-addons",
+        ],
+    }
 }
 
 /// Top-level entries of a Codewhale home the host may read: its own bundle
@@ -114,12 +361,22 @@ const HOST_DENIED_HOME_ENTRIES: &[&str] = &[
 ];
 
 /// Paths the host process must never read, even though the sandbox otherwise
-/// grants full-disk read: the curated credential-store defaults; every entry
-/// of Codewhale's homes (the runtime home, the ambient `~/.codewhale`, and the
-/// legacy `~/.deepseek`) except [`HOST_READABLE_HOME_ENTRIES`]; and the Codex
-/// and DSH homes whose credential files Codewhale itself reads. Blocking.
-pub(crate) fn host_denied_read_paths(home: &Path) -> Vec<PathBuf> {
+/// grants full-disk read, and the exceptions inside them: the curated
+/// credential-store defaults; Codewhale's homes (the runtime home, the ambient
+/// `~/.codewhale`, and the legacy `~/.deepseek`) except
+/// [`HOST_READABLE_HOME_ENTRIES`]; and the Codex and DSH homes whose
+/// credential files Codewhale itself reads. Blocking.
+///
+/// With `whole_homes` (bubblewrap, which can mask only what exists) each home
+/// is denied whole and its readable entries come back as exceptions to bind
+/// again. Without it (Seatbelt, which matches paths that do not exist yet)
+/// every other entry is denied by name and there are no exceptions.
+pub(crate) fn host_denied_read_paths(
+    home: &Path,
+    whole_homes: bool,
+) -> (Vec<PathBuf>, Vec<PathBuf>) {
     let mut paths = crate::sandbox::read_guard::ReadDenylist::build(true, &[], &[]).subtree_paths();
+    let mut exceptions: Vec<PathBuf> = Vec::new();
     let mut push = |path: PathBuf| {
         if !paths.contains(&path) {
             paths.push(path);
@@ -133,6 +390,16 @@ pub(crate) fn host_denied_read_paths(home: &Path) -> Vec<PathBuf> {
         roots.push(user.join(".deepseek"));
     }
     for root in roots {
+        if whole_homes {
+            for entry in HOST_READABLE_HOME_ENTRIES {
+                let readable = root.join(entry);
+                if !exceptions.contains(&readable) {
+                    exceptions.push(readable);
+                }
+            }
+            push(root);
+            continue;
+        }
         let mut names: Vec<std::ffi::OsString> = HOST_DENIED_HOME_ENTRIES
             .iter()
             .chain(std::iter::once(&codewhale_config::CONFIG_FILE_NAME))
@@ -173,61 +440,320 @@ pub(crate) fn host_denied_read_paths(home: &Path) -> Vec<PathBuf> {
     if let Some(dsh_home) = codewhale_config::default_dsh_credentials_path().parent() {
         push(dsh_home.to_path_buf());
     }
-    paths
+    (paths, exceptions)
 }
 
 /// Plan the host launch. Blocking (creates the data dir, canonicalizes the
-/// deny-list); call from `spawn_blocking`.
-pub(crate) fn plan_launch(node: &Path, bundle: &Path, home: &Path) -> Result<HostLaunch, String> {
-    use crate::sandbox::{CommandSpec, SandboxManager, SandboxPolicy, SandboxType};
+/// deny-list, and on Linux runs the bwrap probe); call from `spawn_blocking`.
+pub(crate) fn plan_launch(
+    runtime: &HostRuntime,
+    bundle: &Path,
+    home: &Path,
+    memory_cap: u64,
+) -> Result<HostLaunch, String> {
+    let data = host_data_dir(home)?;
+    let mut args = runtime_args(runtime);
+    args.push(bundle.to_string_lossy().into_owned());
+    let wrapped = wrap_host(&runtime.path, &args, &data, home);
+    host_launch(runtime, args, data, memory_cap, wrapped)
+}
+
+/// The sandbox a host started now would get, planned (and on Linux probed)
+/// exactly as [`plan_launch`] does, for doctor. Blocking; creates the data
+/// dir, as a launch would.
+pub(crate) fn planned_sandbox(runtime: &HostRuntime, home: &Path) -> Result<HostSandbox, String> {
+    let data = host_data_dir(home)?;
+    Ok(
+        match wrap_host(&runtime.path, &runtime_args(runtime), &data, home) {
+            Ok(wrapped) => HostSandbox::Wrapped(wrapped.name),
+            Err(reason) => HostSandbox::Unsandboxed(reason),
+        },
+    )
+}
+
+fn host_data_dir(home: &Path) -> Result<PathBuf, String> {
     let data = home.join("extension-host").join("data");
     std::fs::create_dir_all(&data)
         .map_err(|error| format!("cannot create {}: {error}", data.display()))?;
-    let args: Vec<String> = [
-        "--max-old-space-size=256",
-        "--disable-proto=throw",
-        "--no-addons",
-    ]
-    .into_iter()
-    .map(str::to_string)
-    .chain(std::iter::once(bundle.to_string_lossy().into_owned()))
-    .collect();
-    let unsandboxed = HostLaunch {
-        program: node.to_path_buf(),
-        args: args.clone(),
-        cwd: data.clone(),
-        sandbox: None,
-        sandbox_env: Vec::new(),
-    };
+    Ok(data)
+}
+
+/// A host command wrapped in an OS sandbox ([`wrap_host`]).
+#[derive(Debug)]
+struct Wrapped {
+    /// `sandbox::SandboxType`'s name for the wrapper.
+    name: String,
+    /// The wrapper's argv, ending with the runtime's.
+    command: Vec<String>,
+    /// Environment the wrapper adds (`CODEWHALE_SANDBOX`, …).
+    env: Vec<(String, String)>,
+}
+
+/// Why the host runs on Windows without an OS sandbox.
+const WINDOWS_UNSANDBOXED: &str = "Windows has no host sandbox yet; its Job Object contains the process tree, which is not isolation";
+
+/// Wrap `program args` in the host's OS sandbox (module docs), or say why it
+/// has none here. Blocking.
+fn wrap_host(program: &Path, args: &[String], data: &Path, home: &Path) -> Result<Wrapped, String> {
+    use crate::sandbox::{CommandSpec, SandboxManager, SandboxPolicy, SandboxType};
     if cfg!(windows) {
-        // The Windows helper is process containment only; ProcessTree already
-        // provides that, and it must not be reported as isolation.
-        return Ok(unsandboxed);
+        return Err(WINDOWS_UNSANDBOXED.to_string());
     }
-    let spec = CommandSpec::program(&node.to_string_lossy(), args, data, Duration::ZERO)
+    let spec = |args: Vec<String>| {
+        CommandSpec::program(
+            &program.to_string_lossy(),
+            args,
+            data.to_path_buf(),
+            Duration::ZERO,
+        )
         .with_policy(SandboxPolicy::WorkspaceWrite {
             writable_roots: Vec::new(),
             network_access: false,
             exclude_tmpdir: false,
             exclude_slash_tmp: false,
-        });
-    let mut manager = SandboxManager::new();
-    manager.set_denied_read_subpaths(host_denied_read_paths(home));
-    let env = manager.prepare(&spec);
+        })
+    };
+    let bwrap = cfg!(all(target_os = "linux", not(target_env = "ohos")));
+    let mut manager = SandboxManager::with_bwrap_preference(bwrap);
+    let (denied, exceptions) = host_denied_read_paths(home, bwrap);
+    manager.set_denied_read_subpaths(denied);
+    manager.set_denied_read_exceptions(exceptions);
+    let env = manager.prepare(&spec(args.to_vec()));
     if matches!(env.sandbox_type, SandboxType::None) {
-        return Ok(unsandboxed);
+        return Err(no_wrapper_reason());
     }
-    let mut command = env.command.into_iter();
-    let program = command
-        .next()
-        .ok_or("sandbox wrapper produced an empty command")?;
-    Ok(HostLaunch {
-        program: PathBuf::from(program),
-        args: command.collect(),
-        cwd: env.cwd,
-        sandbox: Some(env.sandbox_type.to_string()),
-        sandbox_env: env.env.into_iter().collect(),
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+    if matches!(env.sandbox_type, SandboxType::LinuxBubblewrap) {
+        probe_bwrap(
+            &manager
+                .prepare(&spec(vec!["--version".to_string()]))
+                .command,
+            data,
+        )?;
+    }
+    Ok(Wrapped {
+        name: env.sandbox_type.to_string(),
+        command: env.command,
+        env: env.env.into_iter().collect(),
     })
+}
+
+/// The launch for a [`wrap_host`] outcome: the wrapper's argv, or the
+/// runtime itself, unsandboxed, carrying the reason `/plugin` shows. Pure.
+fn host_launch(
+    runtime: &HostRuntime,
+    args: Vec<String>,
+    data: PathBuf,
+    memory_cap: u64,
+    wrapped: Result<Wrapped, String>,
+) -> Result<HostLaunch, String> {
+    let (program, args, sandbox, sandbox_env) = match wrapped {
+        Ok(wrapped) => {
+            let mut command = wrapped.command.into_iter();
+            let program = command
+                .next()
+                .ok_or("sandbox wrapper produced an empty command")?;
+            (
+                PathBuf::from(program),
+                command.collect(),
+                HostSandbox::Wrapped(wrapped.name),
+                wrapped.env,
+            )
+        }
+        Err(reason) => (
+            runtime.path.clone(),
+            args,
+            HostSandbox::Unsandboxed(reason),
+            Vec::new(),
+        ),
+    };
+    Ok(HostLaunch {
+        program,
+        args,
+        cwd: data,
+        sandbox,
+        sandbox_env,
+        runtime: runtime.clone(),
+        runtime_env: runtime_env(runtime.kind),
+        memory_cap,
+        memory: MemoryEnforcement::planned(runtime.kind),
+    })
+}
+
+/// Why [`wrap_host`] found no wrapper on this platform.
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+fn no_wrapper_reason() -> String {
+    format!(
+        "bwrap unavailable: {} is not an executable file (install bubblewrap)",
+        crate::sandbox::bwrap::BWRAP_PATH
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn no_wrapper_reason() -> String {
+    "Seatbelt (sandbox-exec) is unavailable".to_string()
+}
+
+#[cfg(not(any(
+    target_os = "macos",
+    all(target_os = "linux", not(target_env = "ohos"))
+)))]
+fn no_wrapper_reason() -> String {
+    "no OS sandbox for the host on this platform".to_string()
+}
+
+/// How long the bwrap probe may take. A working bwrap runs
+/// `<runtime> --version` in well under a second, even on a loaded CI runner.
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+const BWRAP_PROBE_DEADLINE: Duration = Duration::from_secs(10);
+
+/// Run the finished bwrap wrapper around `<runtime> --version` (`command`),
+/// with no environment, to learn whether bwrap works on this host: it may be
+/// installed yet unable to create its namespaces. Blocking.
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+fn probe_bwrap(command: &[String], cwd: &Path) -> Result<(), String> {
+    use std::io::Read as _;
+    use wait_timeout::ChildExt as _;
+    let (program, args) = command
+        .split_first()
+        .ok_or("the sandbox wrapper produced an empty command")?;
+    let mut child = std::process::Command::new(program)
+        .args(args)
+        .current_dir(cwd)
+        .env_clear()
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("bwrap unavailable: {program} does not start ({error})"))?;
+    let status = match child.wait_timeout(BWRAP_PROBE_DEADLINE) {
+        Ok(Some(status)) => status,
+        outcome => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(match outcome {
+                Err(error) => format!("bwrap unavailable: waiting for the probe failed ({error})"),
+                _ => format!(
+                    "bwrap unavailable: the probe did not finish within {BWRAP_PROBE_DEADLINE:?}"
+                ),
+            });
+        }
+    };
+    let mut stderr = String::new();
+    if let Some(mut pipe) = child.stderr.take() {
+        let _ = pipe.read_to_string(&mut stderr);
+    }
+    bwrap_probe_verdict(status.success(), &status.to_string(), &stderr)
+}
+
+/// What a wrapped `<runtime> --version` run says about bwrap here: `Ok` when
+/// it ran, otherwise the reason `/plugin` and doctor show — bwrap's first
+/// line of stderr (or the exit status), and a hint when that line is about
+/// the user namespace bwrap could not create. Pure.
+#[cfg(any(test, all(target_os = "linux", not(target_env = "ohos"))))]
+fn bwrap_probe_verdict(succeeded: bool, status: &str, stderr: &str) -> Result<(), String> {
+    if succeeded {
+        return Ok(());
+    }
+    let first = stderr.lines().map(str::trim).find(|line| !line.is_empty());
+    let mut detail: String = first.map_or_else(
+        || status.to_string(),
+        |line| line.chars().take(240).collect(),
+    );
+    if first.is_some_and(|line| line.contains("namespace") || line.contains("uid map")) {
+        detail.push_str(
+            "; unprivileged user namespaces look blocked here (on Ubuntu 24.04 and later: the kernel.apparmor_restrict_unprivileged_userns sysctl)",
+        );
+    }
+    Err(format!("bwrap unavailable ({detail})"))
+}
+
+/// The kernel-enforced memory cap on Linux: `RLIMIT_DATA`, applied in the
+/// child between fork and exec, so only the host (and what it starts) is
+/// limited. Soft and hard limit are both set, so plugin code cannot raise
+/// it. An unprivileged process cannot raise its hard limit, so when the
+/// inherited hard limit is already below `cap` the host gets that lower
+/// limit instead of failing to spawn with `EPERM`.
+///
+/// Known limit: in that case `/plugin` and doctor still name the configured
+/// cap, not the lower inherited one.
+#[cfg(target_os = "linux")]
+fn limit_child_memory(command: &mut tokio::process::Command, cap: u64) {
+    // SAFETY: the closure runs in the forked child before exec and calls only
+    // `getrlimit` and `setrlimit`, which are async-signal-safe; it allocates
+    // nothing.
+    unsafe {
+        command.pre_exec(move || {
+            let mut inherited = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            if libc::getrlimit(libc::RLIMIT_DATA, &raw mut inherited) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let cap = (cap as libc::rlim_t).min(inherited.rlim_max);
+            let limit = libc::rlimit {
+                rlim_cur: cap,
+                rlim_max: cap,
+            };
+            if libc::setrlimit(libc::RLIMIT_DATA, &raw const limit) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn limit_child_memory(_command: &mut tokio::process::Command, _cap: u64) {}
+
+/// Resident size of `pid` in bytes, for the macOS memory-cap check.
+#[cfg(target_os = "macos")]
+pub(crate) fn resident_bytes(pid: u32) -> Option<u64> {
+    let mut info = std::mem::MaybeUninit::<libc::proc_taskinfo>::zeroed();
+    let size = std::mem::size_of::<libc::proc_taskinfo>() as libc::c_int;
+    // SAFETY: `info` is a correctly sized, writable `proc_taskinfo` buffer.
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid as libc::c_int,
+            libc::PROC_PIDTASKINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size,
+        )
+    };
+    // SAFETY: a full-size write initialized the struct.
+    (written == size).then(|| unsafe { info.assume_init() }.pti_resident_size)
+}
+
+/// Platforms without a supervisor-side check (Linux uses `RLIMIT_DATA`,
+/// Windows the Job Object).
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn resident_bytes(_pid: u32) -> Option<u64> {
+    None
+}
+
+/// Report the observed exit and configured cap. SIGKILL alone cannot identify
+/// jetsam: an operator or another process can send the same signal.
+fn exit_reason(
+    status: std::process::ExitStatus,
+    memory: Option<MemoryEnforcement>,
+    cap: u64,
+) -> String {
+    let reason = format!("exited with {status}");
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt as _;
+        if status.signal() == Some(libc::SIGKILL) && memory == Some(MemoryEnforcement::Jetsam) {
+            return format!(
+                "{reason}; configured kernel memory limit: {} MiB; SIGKILL cause unavailable",
+                cap / (1024 * 1024)
+            );
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (memory, cap);
+    reason
 }
 
 /// Callbacks from the channel into the manager.
@@ -258,9 +784,14 @@ struct Handshake {
 
 pub(crate) struct HostProcess {
     pub pid: Option<u32>,
-    pub node_version: std::sync::OnceLock<String>,
-    /// `seatbelt` / `bwrap`, or `None` when unsandboxed.
-    pub sandbox: Option<String>,
+    /// The runtime the Rust side launched; `host/hello` must agree.
+    pub runtime: HostRuntime,
+    /// Runtime version as reported by the host in `host/hello`.
+    pub runtime_version: std::sync::OnceLock<String>,
+    pub memory_cap: u64,
+    /// How the cap is enforced for this process, settled at the handshake.
+    memory: Arc<std::sync::OnceLock<MemoryEnforcement>>,
+    pub sandbox: HostSandbox,
     tree: Arc<crate::process_tree::ProcessTree>,
     outbound: mpsc::Sender<Vec<u8>>,
     pending: Arc<Mutex<HashMap<u64, PendingCall>>>,
@@ -268,6 +799,9 @@ pub(crate) struct HostProcess {
     /// this flag to avoid activation while the exit callback is still pending.
     admission_closed: AtomicBool,
     next_id: AtomicU64,
+    /// Heartbeat pings among those ids; tests count only the core's own work.
+    #[cfg(test)]
+    heartbeats_sent: AtomicU64,
     stderr_tail: Arc<Mutex<VecDeque<u8>>>,
     exited: tokio::sync::watch::Receiver<bool>,
     kill: mpsc::Sender<String>,
@@ -314,10 +848,18 @@ impl HostProcess {
         // that group when the core goes away (stdin EOF, or a parent change
         // seen by its watchdog thread).
         let own_group = if cfg!(unix) { "1" } else { "0" };
+        let memory_request = (launch.memory == MemoryEnforcement::Jetsam)
+            .then(|| (launch.memory_cap / (1024 * 1024)).max(1).to_string());
         let overrides = launch
             .sandbox_env
             .iter()
+            .chain(&launch.runtime_env)
             .map(|(key, value)| (key.as_str(), value.as_str()))
+            .chain(
+                memory_request
+                    .as_deref()
+                    .map(|mib| (MEMORY_LIMIT_REQUEST_ENV, mib)),
+            )
             .chain([
                 ("CODEWHALE_HOST_PARENT_PID", parent_pid.as_str()),
                 ("CODEWHALE_HOST_PROCESS_GROUP", own_group),
@@ -329,10 +871,22 @@ impl HostProcess {
         }
         #[cfg(unix)]
         command.process_group(0);
+        limit_child_memory(&mut command, launch.memory_cap);
 
-        let mut child = command
-            .spawn()
-            .map_err(|error| format!("failed to start {}: {error}", launch.program.display()))?;
+        // On Linux a failure to apply the memory cap in the child surfaces
+        // here as a spawn error carrying only its errno, indistinguishable
+        // from a failed exec, so the message names both.
+        let mut child = command.spawn().map_err(|error| {
+            if cfg!(target_os = "linux") {
+                format!(
+                    "failed to start {}, or to apply its {} MiB memory cap (RLIMIT_DATA) before exec: {error}",
+                    launch.program.display(),
+                    launch.memory_cap / (1024 * 1024)
+                )
+            } else {
+                format!("failed to start {}: {error}", launch.program.display())
+            }
+        })?;
         let pid = child.id();
         let tree = match crate::process_tree::ProcessTree::attach_tokio(&child) {
             Ok(tree) => Arc::new(tree),
@@ -341,6 +895,15 @@ impl HostProcess {
                 return Err(format!("failed to contain the extension host: {error}"));
             }
         };
+        #[cfg(windows)]
+        if let Err(error) = tree.limit_process_memory(launch.memory_cap) {
+            let _ = tree.kill();
+            let _ = child.start_kill();
+            return Err(format!(
+                "failed to cap the extension host's memory: {error}"
+            ));
+        }
+        let memory: Arc<std::sync::OnceLock<MemoryEnforcement>> = Arc::default();
         let stdin = child.stdin.take().ok_or("host stdin unavailable")?;
         let stdout = child.stdout.take().ok_or("host stdout unavailable")?;
         let stderr = child.stderr.take().ok_or("host stderr unavailable")?;
@@ -428,11 +991,13 @@ impl HostProcess {
             let tail = Arc::clone(&stderr_tail);
             let events = Arc::clone(&events);
             let tree = Arc::clone(&tree);
+            let memory = Arc::clone(&memory);
+            let memory_cap = launch.memory_cap;
             tokio::spawn(async move {
                 let reason = tokio::select! {
                     biased;
                     status = child.wait() => match status {
-                        Ok(status) => format!("exited with {status}"),
+                        Ok(status) => exit_reason(status, memory.get().copied(), memory_cap),
                         Err(error) => format!("wait failed: {error}"),
                     },
                     Some(reason) = kill_rx.recv() => {
@@ -461,13 +1026,18 @@ impl HostProcess {
 
         let host = Arc::new(Self {
             pid,
-            node_version: std::sync::OnceLock::new(),
+            runtime: launch.runtime.clone(),
+            runtime_version: std::sync::OnceLock::new(),
+            memory_cap: launch.memory_cap,
+            memory,
             sandbox: launch.sandbox.clone(),
             tree,
             outbound,
             pending,
             admission_closed: AtomicBool::new(false),
             next_id: AtomicU64::new(1),
+            #[cfg(test)]
+            heartbeats_sent: AtomicU64::new(0),
             stderr_tail,
             exited: exited_rx,
             kill: kill_tx.clone(),
@@ -487,12 +1057,58 @@ impl HostProcess {
                     protocol::PROTOCOL_VERSION
                 ));
             }
+            // Never a silent runtime switch: the host must be running on
+            // the runtime this process chose and launched.
+            if hello.runtime.name != launch.runtime.kind.name() {
+                return Err(format!(
+                    "host reports runtime {} but {} was launched",
+                    hello.runtime.name,
+                    launch.runtime.kind.name()
+                ));
+            }
+            // Restarts reuse the pinned runtime without probing it again, so
+            // the binary at that path can have been replaced since (an
+            // upgrade mid-session). Its flags and lockdown were chosen for
+            // the probed version; refuse rather than run an unprobed one.
+            if !launch.runtime.reports_version(&hello.runtime.version) {
+                return Err(format!(
+                    "host reports {} {} but {} {} was probed at {}: the runtime binary changed mid-session; restart Codewhale to use the new version",
+                    hello.runtime.name,
+                    hello.runtime.version,
+                    launch.runtime.kind.name(),
+                    launch.runtime.version_string(),
+                    launch.runtime.path.display()
+                ));
+            }
             if hello.bundle_sha256 != expected_sha256 {
                 return Err(format!(
                     "host bundle digest {} does not match the materialized bundle {}",
                     hello.bundle_sha256, expected_sha256
                 ));
             }
+            let requested = memory_request
+                .as_deref()
+                .and_then(|mib| mib.parse::<u64>().ok());
+            let memory = match (hello.memory_limit_mib, requested) {
+                (Some(applied), Some(requested)) if applied == requested => {
+                    MemoryEnforcement::Jetsam
+                }
+                (Some(applied), _) => {
+                    return Err(format!(
+                        "host reports a {applied} MiB memory limit the core did not ask for"
+                    ));
+                }
+                // The mandatory kernel cap cannot degrade to a delayed RSS
+                // observation. Refuse before plugin initialization and keep
+                // the host's stderr explanation in the existing diagnosis.
+                (None, Some(requested)) => {
+                    return Err(format!(
+                        "host did not apply the requested {requested} MiB kernel memory limit; initialization refused"
+                    ));
+                }
+                (None, None) => launch.memory,
+            };
+            let _ = host.memory.set(memory);
             let initialize = CoreRequest::Initialize(InitializeParams {
                 protocol: protocol::PROTOCOL_VERSION,
                 limits: HostLimits {
@@ -502,18 +1118,18 @@ impl HostProcess {
                     activate_deadline_ms: ACTIVATE_DEADLINE.as_millis() as u64,
                 },
             });
-            host.request(initialize, None)
+            host.call(initialize, None)
                 .await
                 .map_err(|error| format!("host/initialize failed: {error}"))?;
             ready_rx
                 .await
                 .map_err(|_| "host exited before host/ready".to_string())?;
-            Ok(hello.node_version)
+            Ok(hello.runtime.version)
         })
         .await;
         match handshake_result {
-            Ok(Ok(node_version)) => {
-                let _ = host.node_version.set(node_version);
+            Ok(Ok(runtime_version)) => {
+                let _ = host.runtime_version.set(runtime_version);
                 Ok(host)
             }
             Ok(Err(reason)) => {
@@ -534,10 +1150,22 @@ impl HostProcess {
         }
     }
 
-    /// How many requests the core has sent this host (handshake included).
+    /// How the memory cap is enforced for this process (planned until the
+    /// handshake settles it).
+    #[must_use]
+    pub fn memory(&self) -> MemoryEnforcement {
+        self.memory
+            .get()
+            .copied()
+            .unwrap_or_else(|| MemoryEnforcement::planned(self.runtime.kind))
+    }
+
+    /// How many requests the core has sent this host (handshake included),
+    /// excluding the monitor's heartbeat pings, which run on their own timer
+    /// and would otherwise make a "no request yet" assertion timing-dependent.
     #[cfg(test)]
     pub(crate) fn requests_started(&self) -> u64 {
-        self.next_id.load(Ordering::Relaxed) - 1
+        self.next_id.load(Ordering::Relaxed) - 1 - self.heartbeats_sent.load(Ordering::Relaxed)
     }
 
     #[must_use]
@@ -597,6 +1225,10 @@ impl HostProcess {
             return Err(HostCallError::Exited("already exited".to_string()));
         }
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        #[cfg(test)]
+        if matches!(request, CoreRequest::Ping) {
+            self.heartbeats_sent.fetch_add(1, Ordering::Relaxed);
+        }
         let (tx, rx) = oneshot::channel();
         {
             let mut pending = self.pending.lock().expect("pending lock");
@@ -630,34 +1262,37 @@ impl HostProcess {
         Ok((id, rx))
     }
 
-    pub(crate) async fn request(
+    /// Send `request` and wait at most its method's deadline
+    /// ([`CoreRequest::deadline`]) for the answer. On expiry the host is sent
+    /// `$/cancel`, the call is forgotten (a late answer is dropped) and the
+    /// caller gets [`HostCallError::Timeout`]. Dropping the returned future
+    /// (a turn interrupt) cancels the same way. Every awaited core→host
+    /// request goes through here; only the heartbeat drives
+    /// [`Self::start_request`] itself, under its own timeouts.
+    pub(crate) async fn call(
         &self,
         request: CoreRequest,
         owner: Option<String>,
     ) -> Result<Value, HostCallError> {
-        let (_, rx) = self.start_request(request, owner)?;
-        rx.await
-            .unwrap_or_else(|_| Err(HostCallError::Exited("channel closed".to_string())))
-    }
-
-    /// Request with a deadline; on expiry the call is cancelled host-side.
-    pub(crate) async fn request_with_deadline(
-        &self,
-        request: CoreRequest,
-        owner: Option<String>,
-        deadline: Duration,
-    ) -> Result<Value, HostCallError> {
+        let method = request.method();
+        let deadline = request.deadline();
         let (id, rx) = self.start_request(request, owner)?;
-        match tokio::time::timeout(deadline, rx).await {
-            Ok(result) => {
-                result.unwrap_or_else(|_| Err(HostCallError::Exited("channel closed".to_string())))
-            }
-            Err(_) => {
-                self.cancel(id);
-                self.pending.lock().expect("pending lock").remove(&id);
-                Err(HostCallError::Timeout(deadline))
-            }
-        }
+        let mut guard = CancelOnDrop {
+            host: self,
+            id,
+            armed: true,
+        };
+        let Ok(answer) = tokio::time::timeout(deadline, rx).await else {
+            // `guard` is still armed: dropping it sends `$/cancel`.
+            return Err(HostCallError::Timeout {
+                method,
+                after: deadline,
+            });
+        };
+        // Answered, drained at exit, or resolved by revocation: nothing left
+        // to cancel.
+        guard.armed = false;
+        answer.unwrap_or_else(|_| Err(HostCallError::Exited("channel closed".to_string())))
     }
 
     /// Fire `$/cancel`. Best effort: a full or closed channel is fine, the
@@ -704,11 +1339,7 @@ impl HostProcess {
     /// process group at 3 s total.
     #[cfg(test)]
     pub(crate) async fn shutdown(&self) {
-        let _ = tokio::time::timeout(
-            Duration::from_secs(2),
-            self.request(CoreRequest::Shutdown, None),
-        )
-        .await;
+        let _ = self.call(CoreRequest::Shutdown, None).await;
         let mut exited = self.exited.clone();
         let waited = tokio::time::timeout(Duration::from_secs(1), async {
             while !*exited.borrow() {
@@ -720,6 +1351,23 @@ impl HostProcess {
         .await;
         if waited.is_err() {
             let _ = self.tree.kill();
+        }
+    }
+}
+
+/// Cancels a [`HostProcess::call`] that stops waiting before its answer:
+/// deadline expiry, or the caller's future being dropped.
+struct CancelOnDrop<'a> {
+    host: &'a HostProcess,
+    id: u64,
+    armed: bool,
+}
+
+impl Drop for CancelOnDrop<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.host.cancel(self.id);
+            self.host.forget(self.id);
         }
     }
 }
@@ -814,4 +1462,138 @@ fn handle_host_message(
 #[must_use]
 pub fn bundle_dir(root: &Path, sha256: &str) -> PathBuf {
     root.join("extension-host").join(sha256)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn node() -> HostRuntime {
+        HostRuntime {
+            kind: HostRuntimeKind::Node,
+            path: PathBuf::from("/opt/node/bin/node"),
+            version: (22, 19, 0),
+            native_code_flags: Vec::new(),
+        }
+    }
+
+    /// The Linux launch decision, exercised on every platform: a bwrap that
+    /// is installed but cannot start (the probe's stderr as Ubuntu 24.04
+    /// prints it) launches the runtime itself, labelled unsandboxed with
+    /// bwrap's own error wherever the sandbox is reported — never
+    /// `linux-bwrap` — while a probe that ran keeps the wrapper's argv.
+    #[test]
+    fn a_bwrap_that_cannot_start_leaves_the_host_unsandboxed_and_says_why() {
+        let runtime = node();
+        let data = PathBuf::from("/home/u/.codewhale/extension-host/data");
+        let mut args = runtime_args(&runtime);
+        args.push("/home/u/.codewhale/extension-host/abc/host.mjs".to_string());
+
+        let refused = bwrap_probe_verdict(
+            false,
+            "exit status: 1",
+            "\nbwrap: setting up uid map: Permission denied\n",
+        )
+        .unwrap_err();
+        assert!(
+            refused.starts_with("bwrap unavailable (bwrap: setting up uid map: Permission denied;"),
+            "{refused}"
+        );
+        assert!(
+            refused.contains("kernel.apparmor_restrict_unprivileged_userns"),
+            "{refused}"
+        );
+        let launch = host_launch(
+            &runtime,
+            args.clone(),
+            data.clone(),
+            HOST_MEMORY_CAP,
+            Err(refused.clone()),
+        )
+        .unwrap();
+        assert_eq!(launch.program, runtime.path);
+        assert_eq!(launch.args, args);
+        assert!(launch.sandbox_env.is_empty());
+        assert_eq!(launch.sandbox, HostSandbox::Unsandboxed(refused.clone()));
+        assert_eq!(launch.sandbox.label(), format!("none: {refused}"));
+        assert!(
+            launch
+                .sandbox
+                .to_string()
+                .starts_with(&format!("UNSANDBOXED ({refused}): ")),
+            "{}",
+            launch.sandbox
+        );
+
+        // No stderr: the exit status is the reason, with no namespace hint.
+        assert_eq!(
+            bwrap_probe_verdict(false, "signal: 9 (SIGKILL)", ""),
+            Err("bwrap unavailable (signal: 9 (SIGKILL))".to_string())
+        );
+
+        // A probe that ran keeps the wrapper.
+        assert_eq!(bwrap_probe_verdict(true, "exit status: 0", ""), Ok(()));
+        let command: Vec<String> = ["/usr/bin/bwrap", "--unshare-all", "--die-with-parent", "--"]
+            .iter()
+            .map(ToString::to_string)
+            .chain(std::iter::once(runtime.path.to_string_lossy().into_owned()))
+            .chain(args.iter().cloned())
+            .collect();
+        let launch = host_launch(
+            &runtime,
+            args.clone(),
+            data.clone(),
+            HOST_MEMORY_CAP,
+            Ok(Wrapped {
+                name: "linux-bwrap".to_string(),
+                command: command.clone(),
+                env: vec![("CODEWHALE_SANDBOX".to_string(), "bwrap".to_string())],
+            }),
+        )
+        .unwrap();
+        assert_eq!(launch.program, PathBuf::from("/usr/bin/bwrap"));
+        assert_eq!(launch.args, command[1..].to_vec());
+        assert_eq!(launch.cwd, data);
+        assert_eq!(
+            launch.sandbox,
+            HostSandbox::Wrapped("linux-bwrap".to_string())
+        );
+        assert!(
+            launch
+                .sandbox
+                .to_string()
+                .starts_with("linux-bwrap sandbox (no direct network;"),
+            "{}",
+            launch.sandbox
+        );
+    }
+
+    /// bubblewrap can mask only what exists, so under it each Codewhale home
+    /// is denied whole (an entry created later is then denied too) and its
+    /// readable entries come back as exceptions; Seatbelt's form is unchanged.
+    #[test]
+    fn under_bubblewrap_a_codewhale_home_is_denied_whole_but_its_readable_entries() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        std::fs::create_dir_all(home.join("extension-host")).unwrap();
+        std::fs::write(home.join("config.toml.bak-1"), "").unwrap();
+
+        let (seatbelt, none) = host_denied_read_paths(&home, false);
+        assert!(none.is_empty());
+        assert!(seatbelt.contains(&home.join("config.toml.bak-1")));
+        assert!(
+            seatbelt.contains(&home.join("secrets")),
+            "named before it exists"
+        );
+        assert!(!seatbelt.contains(&home));
+        assert!(!seatbelt.contains(&home.join("extension-host")));
+
+        let (bwrap, exceptions) = host_denied_read_paths(&home, true);
+        assert!(bwrap.contains(&home));
+        assert!(!bwrap.contains(&home.join("config.toml.bak-1")));
+        for entry in HOST_READABLE_HOME_ENTRIES {
+            assert!(exceptions.contains(&home.join(entry)), "{entry}");
+            assert!(!bwrap.contains(&home.join(entry)), "{entry}");
+        }
+    }
 }

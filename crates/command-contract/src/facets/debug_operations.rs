@@ -31,9 +31,18 @@ pub trait CommandDebugChangeContext {
 pub trait CommandDebugHistoryContext {
     fn last_user_input(&self) -> Option<String>;
     fn load_composer(&mut self, input: String);
-    /// Truncate the last exchange and update the authoritative history/index
-    /// bookkeeping. Returns the number of display cells removed.
-    fn undo_conversation(&mut self) -> usize;
+    /// Prepare a last-exchange rollback without mutating the live transcript.
+    /// The host applies it only after the Engine acknowledges the truncated
+    /// conversation; retry additionally waits for durable persistence (#6788).
+    fn undo_conversation(&mut self) -> DebugConversationUndo;
+}
+
+/// Prepared conversation-only undo: display cells to remove after Engine
+/// acknowledgement, and the conversation to install as its history.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DebugConversationUndo {
+    pub removed: usize,
+    pub sync: SessionSyncPayload,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

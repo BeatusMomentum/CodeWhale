@@ -1972,11 +1972,16 @@ impl SubAgentInput {
     /// Mark this input as consumed by the child loop.
     fn mark_taken(&self) {
         if let Some(pending) = self.pending.as_ref() {
-            let _ = pending.fetch_update(
-                std::sync::atomic::Ordering::AcqRel,
-                std::sync::atomic::Ordering::Acquire,
-                |value| Some(value.saturating_sub(1)),
-            );
+            // Saturating decrement as a compare-exchange loop: `fetch_update`
+            // is deprecated from Rust 1.99 and `try_update` is newer than the MSRV.
+            use std::sync::atomic::Ordering::{AcqRel, Acquire};
+            let mut value = pending.load(Acquire);
+            while value > 0 {
+                match pending.compare_exchange_weak(value, value - 1, AcqRel, Acquire) {
+                    Ok(_) => break,
+                    Err(current) => value = current,
+                }
+            }
         }
     }
 }
@@ -2370,9 +2375,11 @@ impl SubAgentTerminalDeliveryContext {
         if self.spawn_depth > 0
             && let Some(tx) = self.parent_completion_tx.as_ref()
         {
-            // A full inbox drops this wake; the terminal-results synthesis
-            // still delivers the completion at the next explicit turn (#6147).
-            let _ = tx.try_send(completion.clone());
+            // A full inbox waits for capacity instead of dropping the wake
+            // (#6560 D02-06): a nested parent has no terminal-results
+            // synthesis to recover it, so a child finishing while the inbox
+            // is full would otherwise never reach the parent's model.
+            send_terminal_event(tx, completion.clone());
         }
 
         if let Some(mailbox) = self.mailbox.as_ref() {
@@ -2398,16 +2405,17 @@ impl SubAgentTerminalDeliveryContext {
     }
 }
 
-/// Deliver a terminal sub-agent event the host must not lose (#6184 H2).
+/// Deliver a terminal sub-agent event (or child completion) the receiver
+/// must not lose (#6184 H2, #6560 D02-06).
 ///
 /// `try_send` dropped `AgentComplete` whenever the event channel was full,
 /// leaving a ghost Running row that silenced every stall watchdog. The
 /// terminal claim forbids awaiting here, so a full channel hands the event to
-/// a task that waits for capacity; only a closed channel (no host left)
+/// a task that waits for capacity; only a closed channel (no receiver left)
 /// drops it. Progress events stay lossy by design. `AgentSpawned` also stays
 /// lossy: delivered late it could land after the completion and resurrect a
 /// Running row, while a lost one is recovered by the completion itself.
-pub(crate) fn send_terminal_event(event_tx: &mpsc::Sender<Event>, event: Event) {
+pub(crate) fn send_terminal_event<T: Send + 'static>(event_tx: &mpsc::Sender<T>, event: T) {
     let event = match event_tx.try_send(event) {
         Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => return,
         Err(mpsc::error::TrySendError::Full(event)) => event,
@@ -2851,12 +2859,6 @@ pub struct SubAgentRuntime {
     pub todos: SharedTodoList,
     /// Session mode of the orchestrating parent at spawn time (Wave 7 M4/M5).
     pub parent_mode: AppMode,
-    /// The session's permission posture at spawn time. Children inherit it
-    /// faithfully: under Auto-Review the same deterministic floor and model
-    /// guardian that gate the parent gate the child's held calls; under Ask a
-    /// held call is routed to the parent's approval UI when one exists;
-    /// Full Access still fails closed on the non-bypassable safety floor.
-    pub approval_mode: ApprovalMode,
     /// The session's deterministic Auto-Review policy (configured allow/block
     /// rules plus the built-in safety floor), shared with every descendant.
     pub auto_review_policy: std::sync::Arc<crate::tui::auto_review::AutoReviewPolicy>,
@@ -2937,7 +2939,6 @@ impl SubAgentRuntime {
             speech_output_dir: None,
             todos: crate::tools::todo::new_shared_todo_list(),
             parent_mode: AppMode::Agent,
-            approval_mode: ApprovalMode::Suggest,
             auto_review_policy: std::sync::Arc::new(
                 crate::tui::auto_review::AutoReviewPolicy::default(),
             ),
@@ -2970,17 +2971,15 @@ impl SubAgentRuntime {
         self
     }
 
-    /// Install the session's permission posture and Auto-Review policy so
-    /// children are gated exactly like the parent, and say whether the host
-    /// can answer a prompt raised on a child's behalf.
+    /// Install the session's Auto-Review policy so children are gated exactly
+    /// like the parent, and say whether the host can answer a prompt raised on
+    /// a child's behalf. The posture itself travels on `context`, live.
     #[must_use]
     pub fn with_permission_posture(
         mut self,
-        approval_mode: ApprovalMode,
         auto_review_policy: std::sync::Arc<crate::tui::auto_review::AutoReviewPolicy>,
         parent_can_prompt: bool,
     ) -> Self {
-        self.approval_mode = approval_mode;
         self.auto_review_policy = auto_review_policy;
         self.parent_can_prompt = parent_can_prompt;
         self
@@ -3218,8 +3217,6 @@ impl SubAgentRuntime {
     #[must_use]
     pub fn child_runtime(&self) -> Self {
         let mut child_context = self.context.clone();
-        child_context.auto_approve = self.context.auto_approve;
-        child_context.approval_mode = self.context.approval_mode;
         let cancel_token = self.cancel_token.child_token();
         child_context.cancel_token = Some(cancel_token.clone());
         Self {
@@ -3275,7 +3272,6 @@ impl SubAgentRuntime {
             // LLM attempt reports 429s/successes to the adaptive scheduler.
             governor: self.governor.clone(),
             parent_mode: self.parent_mode,
-            approval_mode: self.approval_mode,
             auto_review_policy: Arc::clone(&self.auto_review_policy),
             parent_can_prompt: self.parent_can_prompt,
             approval_receipt_store: self.approval_receipt_store.clone(),
@@ -11289,14 +11285,6 @@ async fn spawn_subagent_from_input(
         )));
     }
 
-    if let Some(remaining) = crate::retry_status::rate_limit_remaining() {
-        let seconds = remaining.as_secs() + u64::from(remaining.subsec_nanos() > 0);
-        return Err(ToolError::execution_failed(format!(
-            "Provider is rate-limiting; sub-agent spawning is paused for {seconds}s. \
-             Wait for the current backoff window before starting new agent work."
-        )));
-    }
-
     let mut child_runtime = if spawn_request.detached {
         runtime.background_runtime()
     } else {
@@ -11312,11 +11300,18 @@ async fn spawn_subagent_from_input(
         child_runtime.max_output_tokens =
             narrow_optional_limit(child_runtime.max_output_tokens, Some(n));
     }
-    let resident_context = spawn_request
-        .resident_file
-        .as_deref()
-        .map(|file_path| read_bounded_resident_context(&runtime.context, file_path))
-        .transpose()?;
+    // File reads, git and transcript loads below run on the blocking pool,
+    // not the async worker (#6561 D02-09).
+    let resident_context = match spawn_request.resident_file.clone() {
+        Some(file_path) => {
+            let context = runtime.context.clone();
+            Some(
+                spawn_prep_blocking(move || read_bounded_resident_context(&context, &file_path))
+                    .await?,
+            )
+        }
+        None => None,
+    };
     let effective_prompt = assemble_spawn_prompt(&spawn_request, resident_context.as_ref());
     let (model_route, route_source, fallback_note) = bind_spawn_model_route(
         &mut child_runtime,
@@ -11328,6 +11323,19 @@ async fn spawn_subagent_from_input(
         exact_fleet_binding.is_none(),
     )
     .await?;
+    // The pause is per provider route, so it is checked against the route
+    // the child was just bound to, not the parent's: a 429 on the parent's
+    // provider must not refuse a child headed to another provider or a local
+    // runtime (and a child bound to a paused route is refused either way).
+    if let Some(remaining) =
+        crate::retry_status::rate_limit_remaining(&child_runtime.client.rate_limit_scope())
+    {
+        let seconds = remaining.as_secs() + u64::from(remaining.subsec_nanos() > 0);
+        return Err(ToolError::execution_failed(format!(
+            "Provider is rate-limiting; sub-agent spawning is paused for {seconds}s. \
+             Wait for the current backoff window before starting new agent work."
+        )));
+    }
     if let Some(binding) = exact_fleet_binding {
         let provider = child_runtime.api_config.as_ref().map_or_else(
             || child_runtime.client.api_provider().as_str().to_string(),
@@ -11360,22 +11368,35 @@ async fn spawn_subagent_from_input(
             .check_admission_capacity()
             .map_err(|err| ToolError::execution_failed(err.to_string()))?;
     }
-    let child_workspace = prepare_child_workspace(
-        &runtime.context.workspace,
-        spawn_request.cwd.as_deref(),
-        spawn_request.worktree.as_ref(),
-        spawn_request.session_name.as_deref(),
-        &spawn_request.agent_type,
-    )?;
     // Every later refusal (resume_from, resident lease, admission, a name
     // already in use) would otherwise leave the new checkout and its branch
     // behind, one more per failed attempt. Disarmed once the child is live.
-    let mut pending_worktree = PendingChildWorktree(
-        child_workspace
-            .as_ref()
-            .filter(|_| spawn_request.worktree.is_some())
-            .cloned(),
-    );
+    // The guard is armed inside the blocking task, so a spawn future dropped
+    // while git creates the worktree still removes it when the task ends.
+    let (child_workspace, mut pending_worktree) = {
+        let parent_workspace = runtime.context.workspace.clone();
+        let cwd = spawn_request.cwd.clone();
+        let worktree = spawn_request.worktree.clone();
+        let session_name = spawn_request.session_name.clone();
+        let agent_type = spawn_request.agent_type.clone();
+        spawn_prep_blocking(move || {
+            let child_workspace = prepare_child_workspace(
+                &parent_workspace,
+                cwd.as_deref(),
+                worktree.as_ref(),
+                session_name.as_deref(),
+                &agent_type,
+            )?;
+            let pending = PendingChildWorktree(
+                child_workspace
+                    .as_ref()
+                    .filter(|_| worktree.is_some())
+                    .cloned(),
+            );
+            Ok((child_workspace, pending))
+        })
+        .await?
+    };
 
     child_runtime.max_spawn_depth = child_max_spawn_depth_for_spawn(
         child_runtime.max_spawn_depth,
@@ -11443,91 +11464,96 @@ async fn spawn_subagent_from_input(
     // resolve_resume_from: look up the source agent, validate it is settled
     // and lives in the same workspace, then load its transcript so the new
     // child inherits the full lineage (issue #425).
-    let (fork_context, resume_from_agent_id) =
-        if let Some(ref source_ref) = spawn_request.resume_from {
-            // Validate: fork_context=false is incompatible with resume_from.
-            if spawn_request.fork_context == Some(false) {
-                return Err(ToolError::invalid_input(
-                    "resume_from requires fork_context to be true or unset; \
+    let (fork_context, resume_from_agent_id) = if let Some(ref source_ref) =
+        spawn_request.resume_from
+    {
+        // Validate: fork_context=false is incompatible with resume_from.
+        if spawn_request.fork_context == Some(false) {
+            return Err(ToolError::invalid_input(
+                "resume_from requires fork_context to be true or unset; \
                  explicit fork_context=false conflicts with transcript continuation."
-                        .to_string(),
-                ));
-            }
-            let (source_agent_id, source_workspace, source_state_root, checkpoint_messages) = {
-                let manager_read = manager.read().await;
-                let source_id = manager_read
-                    .resolve_agent_ref_for_session(&runtime.context.state_namespace, source_ref)
-                    .map_err(|_| {
-                        ToolError::invalid_input(format!(
-                            "resume_from: agent or session '{source_ref}' not found. \
+                    .to_string(),
+            ));
+        }
+        let (source_agent_id, source_workspace, source_state_root, checkpoint_messages) = {
+            let manager_read = manager.read().await;
+            let source_id = manager_read
+                .resolve_agent_ref_for_session(&runtime.context.state_namespace, source_ref)
+                .map_err(|_| {
+                    ToolError::invalid_input(format!(
+                        "resume_from: agent or session '{source_ref}' not found. \
                      Use agent action=status to list available agents."
-                        ))
-                    })?;
-                manager_read
-                    .ensure_caller_controls_descendant_for_session(
-                        &runtime.context.state_namespace,
-                        &source_id,
-                        runtime.parent_agent_id.as_deref(),
-                        "agent/resume_from",
-                    )
-                    .map_err(|err| ToolError::invalid_input(err.to_string()))?;
-                let source = manager_read.agents.get(&source_id).ok_or_else(|| {
-                    ToolError::invalid_input(format!("resume_from: agent '{source_id}' not found"))
+                    ))
                 })?;
-                if source.status == SubAgentStatus::Running {
-                    return Err(ToolError::invalid_input(format!(
-                        "resume_from: agent '{source_id}' (session '{}') is still running. \
+            manager_read
+                .ensure_caller_controls_descendant_for_session(
+                    &runtime.context.state_namespace,
+                    &source_id,
+                    runtime.parent_agent_id.as_deref(),
+                    "agent/resume_from",
+                )
+                .map_err(|err| ToolError::invalid_input(err.to_string()))?;
+            let source = manager_read.agents.get(&source_id).ok_or_else(|| {
+                ToolError::invalid_input(format!("resume_from: agent '{source_id}' not found"))
+            })?;
+            if source.status == SubAgentStatus::Running {
+                return Err(ToolError::invalid_input(format!(
+                    "resume_from: agent '{source_id}' (session '{}') is still running. \
                      Only settled agents (completed, interrupted, failed, cancelled) \
                      may be used as a resume source. Use action=wait to block until \
                      it settles, or action=interrupt to stop it.",
-                        source.session_name
-                    )));
-                }
-                // Capture checkpoint messages now while holding the read lock; used
-                // as a fallback when the transcript artifact is unavailable.
-                let checkpoint_messages = source
-                    .checkpoint
-                    .as_ref()
-                    .filter(|cp| cp.continuable && !cp.messages.is_empty())
-                    .map(|cp| cp.messages.clone())
-                    .unwrap_or_default();
-                (
-                    source_id,
-                    source.workspace.clone(),
-                    manager_read.state_root.clone(),
-                    checkpoint_messages,
-                )
-            };
-            // Cross-workspace resume remains unsupported because execution
-            // authority and inherited context belong to the source workspace,
-            // even when the transcript artifact itself has a separate state root.
-            let parent_workspace = normalize_subagent_workspace(&runtime.context.workspace);
-            let source_workspace_normalized = normalize_subagent_workspace(&source_workspace);
-            if parent_workspace != source_workspace_normalized {
-                return Err(ToolError::invalid_input(format!(
-                    "resume_from: source agent '{source_agent_id}' lives in a different \
-                 workspace ({}) than this agent ({}). Cross-workspace continuation \
-                 is not supported.",
-                    source_workspace.display(),
-                    runtime.context.workspace.display()
+                    source.session_name
                 )));
             }
-            // Load the full transcript from the on-disk artifact. Fall back to the
-            // checkpoint messages for legacy records that predate transcript
-            // artifacts or for agents whose artifacts were cleaned up.
-            let messages = load_subagent_transcript_artifact(&source_state_root, &source_agent_id)
-                .unwrap_or(checkpoint_messages);
-            let resume_ctx = SubAgentForkContext {
-                messages,
-                structured_state_block: None,
-                work_source: None,
-            };
-            child_runtime.fork_context = Some(resume_ctx);
-            spawn_metadata.resume_from_agent_id = Some(source_agent_id.clone());
-            (true, Some(source_agent_id))
-        } else {
-            (fork_context, None)
+            // Capture checkpoint messages now while holding the read lock; used
+            // as a fallback when the transcript artifact is unavailable.
+            let checkpoint_messages = source
+                .checkpoint
+                .as_ref()
+                .filter(|cp| cp.continuable && !cp.messages.is_empty())
+                .map(|cp| cp.messages.clone())
+                .unwrap_or_default();
+            (
+                source_id,
+                source.workspace.clone(),
+                manager_read.state_root.clone(),
+                checkpoint_messages,
+            )
         };
+        // Cross-workspace resume remains unsupported because execution
+        // authority and inherited context belong to the source workspace,
+        // even when the transcript artifact itself has a separate state root.
+        let parent_workspace = normalize_subagent_workspace(&runtime.context.workspace);
+        let source_workspace_normalized = normalize_subagent_workspace(&source_workspace);
+        if parent_workspace != source_workspace_normalized {
+            return Err(ToolError::invalid_input(format!(
+                "resume_from: source agent '{source_agent_id}' lives in a different \
+                 workspace ({}) than this agent ({}). Cross-workspace continuation \
+                 is not supported.",
+                source_workspace.display(),
+                runtime.context.workspace.display()
+            )));
+        }
+        // Load the full transcript from the on-disk artifact. Fall back to the
+        // checkpoint messages for legacy records that predate transcript
+        // artifacts or for agents whose artifacts were cleaned up.
+        let transcript_agent_id = source_agent_id.clone();
+        let messages = spawn_prep_blocking(move || {
+            Ok(load_subagent_transcript_artifact(&source_state_root, &transcript_agent_id).ok())
+        })
+        .await?
+        .unwrap_or(checkpoint_messages);
+        let resume_ctx = SubAgentForkContext {
+            messages,
+            structured_state_block: None,
+            work_source: None,
+        };
+        child_runtime.fork_context = Some(resume_ctx);
+        spawn_metadata.resume_from_agent_id = Some(source_agent_id.clone());
+        (true, Some(source_agent_id))
+    } else {
+        (fork_context, None)
+    };
 
     let resident_lease = resident_context
         .as_ref()
@@ -11608,6 +11634,15 @@ async fn spawn_subagent_from_input(
     pending_worktree.0 = None;
 
     Ok((result, spawn_metadata))
+}
+
+/// Run synchronous spawn preparation (file reads, git) on the blocking pool.
+async fn spawn_prep_blocking<T: Send + 'static>(
+    work: impl FnOnce() -> Result<T, ToolError> + Send + 'static,
+) -> Result<T, ToolError> {
+    tokio::task::spawn_blocking(work).await.map_err(|error| {
+        ToolError::execution_failed(format!("sub-agent spawn preparation failed: {error}"))
+    })?
 }
 
 /// An isolated worktree created for a spawn that has not started yet. If the
@@ -12063,8 +12098,7 @@ fn build_subagent_system_prompt_with_skills(
 /// Every fresh and nested child derives this from its inherited ToolContext;
 /// forked children receive it at system precedence as well.
 fn subagent_skill_catalog(context: &ToolContext) -> String {
-    let mode =
-        crate::skills::SkillDiscoveryMode::from_codewhale_only(context.skills_scan_codewhale_only);
+    let mode = context.skills_discovery_mode;
     let registry = context
         .skills_dir
         .as_deref()
@@ -12092,7 +12126,11 @@ fn subagent_skill_catalog(context: &ToolContext) -> String {
     let mut output = String::from(
         "## Skills\n\nUse `load_skill` with an exact name before applying a Skill. Catalog entries are workspace-scoped snapshots; plugin entries are revalidated at use.\n",
     );
-    for skill in registry.list() {
+    for skill in registry
+        .list()
+        .iter()
+        .filter(|skill| skill.invocation.model_invocable())
+    {
         let source = match &skill.source {
             crate::skills::SkillSource::Native => "native workspace catalog".to_string(),
             crate::skills::SkillSource::Plugin {
@@ -13916,7 +13954,9 @@ fn record_agent_progress(
 }
 
 /// Bound on the nested-agent completion inbox (#6147): one completion per
-/// terminated nested child, drained by the parent agent's turn loop.
+/// terminated nested child, drained by the parent agent's turn loop. A full
+/// inbox delays a completion rather than dropping it; see
+/// [`send_terminal_event`].
 const CHILD_COMPLETION_CHANNEL_CAPACITY: usize = 64;
 
 fn runtime_for_nested_agent_tools(
@@ -18662,9 +18702,6 @@ struct SubAgentToolRegistry {
     // prefixes; the grant decides what the surface *is*, these names are
     // removed from whatever it granted.
     disallowed_tools: Vec<String>,
-    // Approval posture is separate from authority. Auto approval can remove a
-    // prompt, but cannot restore a tool removed by role, scope, or envelope.
-    auto_approve: bool,
     accept_edits: bool,
     agent_type: FleetRole,
     // Every mutation is attributed to the child and checked against its live
@@ -18690,6 +18727,8 @@ enum ChildGateVerdict {
     Proceed,
     /// Refuse the call with this reason (returned to the child model).
     Deny(String),
+    /// The person changed the posture while the gate waited; gate again.
+    PostureChanged,
 }
 
 impl SubAgentToolRegistry {
@@ -18798,7 +18837,6 @@ impl SubAgentToolRegistry {
         Self {
             grant,
             disallowed_tools: effective_profile.denied_tools.clone(),
-            auto_approve: runtime.context.auto_approve,
             accept_edits: runtime.accept_edits,
             agent_type,
             owner_agent_id,
@@ -18854,6 +18892,17 @@ impl SubAgentToolRegistry {
                 })
             }
         }
+    }
+
+    /// Re-read the session's live posture onto this child's call context,
+    /// never wider than the child's own shell grant.
+    fn refresh_posture(
+        &self,
+        context: &mut ToolContext,
+    ) -> Option<crate::core::engine::LiveRuntimeAuthority> {
+        let posture = context.refresh_live_posture();
+        context.set_shell_policy(context.shell_policy.min_with(self.grant.shell_policy()));
+        posture
     }
 
     /// Emit a transcript-visible receipt for a decision made on this child's
@@ -18919,16 +18968,29 @@ impl SubAgentToolRegistry {
         tool_id: &str,
         name: &str,
         input: &Value,
+        posture: &ToolContext,
     ) -> ChildGateVerdict {
-        use crate::core::engine::{AutoReviewPlanDecision, auto_review_plan_decision_for_context};
-        use crate::core::events::{ToolGate, ToolGateVerdict};
-        use crate::tui::auto_review::{AutoReviewContext, RunOrigin};
-
-        let approval_mode = if self.auto_approve {
-            ApprovalMode::Bypass
-        } else {
-            self.gate_runtime.approval_mode
+        use crate::core::engine::{
+            AutoReviewPlanDecision, auto_review_plan_decision_for_context,
+            auto_review_run_origin_for_plan,
         };
+        use crate::core::events::{ToolGate, ToolGateVerdict};
+        use crate::tui::auto_review::AutoReviewContext;
+
+        if crate::tools::approval_cache::computer_use_user_gate(name, input).is_some()
+            || crate::tools::approval_cache::computer_use_batch_hidden_gate(name, input).is_some()
+        {
+            return ChildGateVerdict::Deny(format!(
+                "Computer Use call {name} needs the user's own approval and cannot run in a sub-agent. Ask the parent to run it."
+            ));
+        }
+
+        // Approval posture is separate from authority: it can remove a
+        // prompt, never restore a tool removed by role, scope, or envelope.
+        let approval_mode = crate::core::authority::agent_approval_mode_for_turn(
+            posture.auto_approve,
+            posture.approval_mode,
+        );
         let workspace = self.gate_runtime.context.workspace.clone();
         // Operator deny rules constrain every descendant, including Full
         // Access and role-delegated reads/writes. The Config clone retains the
@@ -18954,17 +19016,40 @@ impl SubAgentToolRegistry {
         {
             return ChildGateVerdict::Deny(reason);
         }
-        let workspace_trusted = crate::config::is_workspace_trusted(&workspace);
-        // Children are background workers: destructive detached work holds
-        // in every posture, exactly as it does for a detached parent start.
-        let review_context = AutoReviewContext::from_tool_call(
+        // Destructive work nobody is watching holds in every posture: a call
+        // that starts detached, or any call of an agent that runs detached
+        // (no foreground turn owns it). A foreground agent's call is judged
+        // exactly like the parent's own.
+        let detached = self.gate_runtime.foreground_children.is_none()
+            || self
+                .registry
+                .get(name)
+                .is_some_and(|spec| spec.starts_detached_for(input));
+        let review_context = match AutoReviewContext::from_tool_call_async(
             name,
             input,
-            RunOrigin::Background,
+            auto_review_run_origin_for_plan(detached),
             approval_mode,
-            workspace_trusted,
             Some(&workspace),
-        );
+        )
+        .await
+        {
+            Ok(context) => context,
+            Err(error) => {
+                let reason = error.to_string();
+                self.emit_child_gate_receipt(
+                    agent_id,
+                    tool_id,
+                    name,
+                    ToolGate::AutoReviewDeterministic,
+                    ToolGateVerdict::Denied,
+                    None,
+                    &reason,
+                )
+                .await;
+                return ChildGateVerdict::Deny(reason);
+            }
+        };
         let (decision, _audit) = auto_review_plan_decision_for_context(
             &self.gate_runtime.auto_review_policy,
             &review_context,
@@ -19018,6 +19103,7 @@ impl SubAgentToolRegistry {
                         input,
                         &review_context,
                         &held_reason,
+                        posture,
                     )
                     .await
                 }
@@ -19071,6 +19157,7 @@ impl SubAgentToolRegistry {
     /// Auto-Review: ask the one-shot model guardian about a held call, using
     /// the child's own session client, and turn its answer into a verdict
     /// plus a transcript receipt. Any failure denies (fail closed).
+    #[allow(clippy::too_many_arguments)]
     async fn consult_child_guardian(
         &self,
         agent_id: &str,
@@ -19079,6 +19166,7 @@ impl SubAgentToolRegistry {
         input: &Value,
         review_context: &crate::tui::auto_review::AutoReviewContext<'_>,
         held_reason: &str,
+        posture: &ToolContext,
     ) -> ChildGateVerdict {
         use crate::core::engine::reviewer::{ReviewerOutcome, consult_reviewer};
         use crate::core::events::{ToolGate, ToolGateVerdict};
@@ -19092,27 +19180,51 @@ impl SubAgentToolRegistry {
             .gate_runtime
             .client
             .effective_route_envelope(self.gate_runtime.client.model(), chrono::Utc::now());
-        let review = consult_reviewer(
-            &self.gate_runtime.client,
-            &context_text,
-            &self.gate_runtime.cancel_token,
-        )
-        .await;
+        record_agent_progress(
+            &self.gate_runtime,
+            agent_id,
+            AgentProgressEventMeta::new(AgentWorkerStatus::Running).with_tool(name.to_string()),
+            format!("Auto-Review checking '{name}'"),
+        );
         // A provider-success reply carries usage even when it is incomplete or
         // semantically invalid. Record before interpreting the verdict so the
         // fail-closed path cannot erase spend. Pre-dispatch cancellation and
         // transport failure expose no usage and therefore mint no receipt.
-        if let Some(usage) = review.usage.as_ref() {
-            let source_id = child_guardian_usage_source_id(agent_id, tool_id);
-            record_provider_response_usage(
-                &self.gate_runtime,
-                agent_id,
-                &source_id,
-                review_route,
-                usage,
-            )
-            .await;
-        }
+        let mut review = tokio::spawn({
+            let runtime = self.gate_runtime.clone();
+            let agent_id = agent_id.to_string();
+            let source_id = child_guardian_usage_source_id(&agent_id, tool_id);
+            async move {
+                let review =
+                    consult_reviewer(&runtime.client, &context_text, &runtime.cancel_token).await;
+                if let Some(usage) = review.usage.as_ref() {
+                    record_provider_response_usage(
+                        &runtime,
+                        &agent_id,
+                        &source_id,
+                        review_route,
+                        usage,
+                    )
+                    .await;
+                }
+                review
+            }
+        });
+        // A posture change mid-review stops waiting on it (the review still
+        // finishes and its spend is recorded): the call is gated again under
+        // what the person just chose, and Full Access runs it at once.
+        let review = tokio::select! {
+            joined = &mut review => match joined {
+                Ok(review) => review,
+                Err(_) => {
+                    return ChildGateVerdict::Deny(
+                        "Auto-Review guardian review failed; the call was denied (fail closed)"
+                            .to_string(),
+                    );
+                }
+            },
+            () = posture.live_posture_moved() => return ChildGateVerdict::PostureChanged,
+        };
         let risk = review.outcome.audit_risk();
         let (verdict, reason) = match &review.outcome {
             ReviewerOutcome::Allow { reason, .. } => (ToolGateVerdict::Allowed, reason.clone()),
@@ -19936,10 +20048,28 @@ impl SubAgentToolRegistry {
         // Role posture and the execution envelope below stay authoritative:
         // this gate can only decide whether a call the role permits also
         // clears the session's approval boundary.
-        if let ChildGateVerdict::Deny(reason) =
-            self.gate_held_call(agent_id, tool_id, name, &input).await
-        {
-            return Err(admission_denied(reason));
+        let mut context = self
+            .registry
+            .context()
+            .clone()
+            .with_owner_agent(self.owner_agent_id.clone(), self.owner_agent_name.clone())
+            .with_origin_tool_call_id(tool_id.to_string());
+        let mut posture = self.refresh_posture(&mut context);
+        loop {
+            let verdict = self
+                .gate_held_call(agent_id, tool_id, name, &input, &context)
+                .await;
+            if let ChildGateVerdict::Deny(reason) = verdict {
+                return Err(admission_denied(reason));
+            }
+            // A guardian or a person can take a while. Run under the posture
+            // as it is now: gate again if the person narrowed it meanwhile.
+            let now = self.refresh_posture(&mut context);
+            let narrowed = matches!((&now, &posture), (Some(now), Some(then)) if now.narrows(then));
+            posture = now;
+            if verdict == ChildGateVerdict::Proceed && !narrowed {
+                break;
+            }
         }
         reject_subagent_terminal_takeover(name, &input).map_err(as_denied)?;
         if self.write_is_denied() {
@@ -20030,12 +20160,6 @@ impl SubAgentToolRegistry {
                 }
             }
         }
-        let context = self
-            .registry
-            .context()
-            .clone()
-            .with_owner_agent(self.owner_agent_id.clone(), self.owner_agent_name.clone())
-            .with_origin_tool_call_id(tool_id.to_string());
         let observed_paths = if scope_aware_write {
             mutation_paths(name, &input)?
         } else {

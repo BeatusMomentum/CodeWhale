@@ -107,7 +107,14 @@ async function saveCurrent(archiveCurrent: boolean): Promise<boolean> {
     get('persistence').textContent = 'Habitat saved on this device. Earlier recordings remain available.';
     return true;
   }
-  catch (error) { persistenceFailed = true; get('persistence').textContent = error instanceof Error ? error.message : 'Unable to save the habitat. Save a replay file to keep it.'; return false; }
+  catch (error) {
+    // Only another tab's newer revision makes overwriting unsafe. Quota or a
+    // closed database aborts the transaction with the prior revision intact,
+    // so the next autosave or source change retries under the same check.
+    if ((error as { name?: unknown } | null)?.name === 'PetHabitatConflict') persistenceFailed = true;
+    get('persistence').textContent = error instanceof Error ? error.message : 'Unable to save the habitat. Save a replay file to keep it.';
+    return false;
+  }
 }
 async function mayLeave(): Promise<boolean> {
   return await persist(true) || window.confirm('This visit could not be saved. Cancel to keep it and export a replay, or leave without saving its latest progress.');

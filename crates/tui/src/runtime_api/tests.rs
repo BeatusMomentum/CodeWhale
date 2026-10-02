@@ -782,6 +782,28 @@ fn runtime_token_scenario() {
     }
 }
 
+/// Port 0 lets a supervised loopback Runtime own an ephemeral endpoint and
+/// report it. Anything a client is handed a fixed address for keeps a real port.
+#[test]
+fn ephemeral_port_is_only_for_a_plain_loopback_runtime() {
+    let ephemeral = |host: &str, web: bool, mobile: bool| RuntimeApiOptions {
+        host: host.to_string(),
+        port: 0,
+        web,
+        mobile,
+        ..RuntimeApiOptions::default()
+    };
+    assert!(validate_runtime_listener_security(&ephemeral("127.0.0.1", false, false)).is_ok());
+    for refused in [
+        ephemeral("0.0.0.0", false, false),
+        ephemeral("127.0.0.1", true, false),
+        ephemeral("127.0.0.1", false, true),
+    ] {
+        let err = validate_runtime_listener_security(&refused).unwrap_err();
+        assert!(err.to_string().contains("Port must be > 0"), "{err}");
+    }
+}
+
 #[test]
 fn mobile_listener_fails_closed_outside_loopback_without_verified_transport() {
     let non_loopback = RuntimeApiOptions {
@@ -3213,6 +3235,7 @@ async fn compatibility_stream_closes_losslessly_across_replay_live_handoff() -> 
                 turn_id: "mock_compat_handoff".to_string(),
                 created_at: chrono::Utc::now(),
                 route: None,
+                submission_id: None,
             })
             .await;
         let _ = tx_event
@@ -3419,6 +3442,7 @@ async fn compatibility_stream_exposes_and_resolves_user_input_without_answer_ech
                 turn_id: "mock_compat_input".to_string(),
                 created_at: chrono::Utc::now(),
                 route: None,
+                submission_id: None,
             })
             .await?;
         let request = crate::tools::user_input::UserInputRequest {
@@ -3842,6 +3866,7 @@ async fn thread_endpoints_expose_lifecycle_contract() -> Result<()> {
                             turn_id: "mock_lifecycle".to_string(),
                             created_at: chrono::Utc::now(),
                             route: None,
+                            submission_id: None,
                         })
                         .await;
                     let _ = tx_event
@@ -4233,6 +4258,7 @@ async fn turn_operation_lookup_is_authenticated_read_only_and_survives_restart()
             turn_id: "lookup-fixture-engine-turn".into(),
             created_at: chrono::Utc::now(),
             route: None,
+            submission_id: None,
         },
         EngineEvent::MessageStarted { index: 0 },
         EngineEvent::MessageDelta {
@@ -4367,6 +4393,7 @@ async fn events_endpoint_respects_since_seq_cursor() -> Result<()> {
                 turn_id: "mock_cursor".to_string(),
                 created_at: chrono::Utc::now(),
                 route: None,
+                submission_id: None,
             })
             .await;
         let _ = tx_event
@@ -5298,6 +5325,7 @@ async fn steer_and_interrupt_endpoints_work_on_active_turn() -> Result<()> {
                 turn_id: "engine_turn_api".to_string(),
                 created_at: chrono::Utc::now(),
                 route: None,
+                submission_id: None,
             })
             .await;
         let _ = tx_event
@@ -5764,6 +5792,7 @@ async fn stream_endpoint_remains_backward_compatible() -> Result<()> {
                 turn_id: "mock_stream".to_string(),
                 created_at: chrono::Utc::now(),
                 route: None,
+                submission_id: None,
             })
             .await;
         let _ = tx_event
@@ -8096,7 +8125,12 @@ async fn file_revert_route_probes_as_available_and_404s_unknown_threads() -> Res
 /// any case.
 #[tokio::test]
 async fn file_revert_route_validates_body_then_trust_then_ownership() -> Result<()> {
+    // The route opens the snapshot store under the resolved home. Seal the
+    // process environment and own that home, so a concurrent test's temporary
+    // HOME (deleted when it ends) can never host or remove this store mid-request.
+    let _env = lock_test_env();
     let root = std::env::temp_dir().join(format!("deepseek-file-revert-gates-{}", Uuid::new_v4()));
+    let _home = EnvVarGuard::set("CODEWHALE_HOME", root.join("home"));
     let sessions_dir = root.join("sessions");
     let Some((addr, runtime_threads, handle)) =
         spawn_test_server_with_root(root.clone(), sessions_dir).await?
@@ -8160,7 +8194,12 @@ async fn file_revert_route_validates_body_then_trust_then_ownership() -> Result<
 /// workspace, and admit again once it settles. Nothing is changed on refusal.
 #[tokio::test]
 async fn restore_routes_refuse_an_active_turn_in_the_workspace() -> Result<()> {
+    // The route opens the snapshot store under the resolved home. Seal the
+    // process environment and own that home, so a concurrent test's temporary
+    // HOME (deleted when it ends) can never host or remove this store mid-request.
+    let _env = lock_test_env();
     let root = std::env::temp_dir().join(format!("deepseek-restore-active-{}", Uuid::new_v4()));
+    let _home = EnvVarGuard::set("CODEWHALE_HOME", root.join("home"));
     let sessions_dir = root.join("sessions");
     let Some((addr, runtime_threads, handle)) =
         spawn_test_server_with_root(root.clone(), sessions_dir).await?
@@ -8227,8 +8266,9 @@ async fn restore_routes_refuse_an_active_turn_in_the_workspace() -> Result<()> {
         .json(&revert_body)
         .send()
         .await?;
-    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let status = resp.status();
     let text = resp.text().await?;
+    assert_eq!(status, StatusCode::CONFLICT, "got: {text}");
     assert!(text.contains("refresh the change record"), "got: {text}");
     assert_eq!(fs::read_to_string(&file)?, "live");
 
@@ -8324,6 +8364,7 @@ async fn session_create_from_thread_rejects_active_turn() -> Result<()> {
                 turn_id: "mock_active_session_save".to_string(),
                 created_at: chrono::Utc::now(),
                 route: None,
+                submission_id: None,
             })
             .await;
         let _ = tx_event
@@ -8724,9 +8765,12 @@ async fn session_detail_route_serves_a_bounded_redacted_peek_on_request() -> Res
     Ok(())
 }
 
+/// An unknown id is a 404 that leaves nothing behind: no live lease or lock
+/// file is created for an id with nothing to delete. A malformed id is a
+/// 400, not a liveness conflict.
 #[tokio::test]
 async fn session_delete_returns_404_for_missing_id() -> Result<()> {
-    let Some((addr, _runtime_threads, handle)) = spawn_test_server().await? else {
+    let Some((addr, sessions_dir, handle)) = spawn_server_with_saved_sessions(&[]).await? else {
         return Ok(());
     };
     let client = crate::tls::reqwest_client();
@@ -8735,6 +8779,17 @@ async fn session_delete_returns_404_for_missing_id() -> Result<()> {
         .send()
         .await?;
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    for sidecar in ["nonexistent-id.live", "nonexistent-id.lock"] {
+        assert!(
+            !sessions_dir.join(".late-usage").join(sidecar).exists(),
+            "an unknown id must not litter {sidecar}"
+        );
+    }
+    let malformed = client
+        .delete(format!("http://{addr}/v1/sessions/not.a.session"))
+        .send()
+        .await?;
+    assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
     handle.abort();
     Ok(())
 }
@@ -11215,8 +11270,10 @@ async fn unicode_skill_activation_matches_api_load_and_owned_lifecycle() -> Resu
     .await?
     .context("isolated skill API fixture requires loopback")?;
     let client = crate::tls::reqwest_client();
-    let context =
-        ToolContext::new(&workspace).with_skills_config(workspace.join(".codewhale/skills"), false);
+    let context = ToolContext::new(&workspace).with_skills_config(
+        workspace.join(".codewhale/skills"),
+        crate::skills::SkillDiscoveryMode::Compatible,
+    );
     let tool = crate::tools::skill::LoadSkillTool;
 
     let before: serde_json::Value = client
@@ -11456,7 +11513,13 @@ fn resolve_skills_scenario() {
         crate::test_support::trust_workspace(workspace);
         fs::create_dir_all(&local_skills).expect("create skills dir");
 
-        let config = Config::default();
+        let config = Config {
+            skills: Some(crate::config::SkillsConfig {
+                flat_workspace_root: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
         let resolved = resolve_skills_dir(&config, workspace);
 
         let expected = fs::canonicalize(&local_skills).expect("canonical local skills");
@@ -11563,6 +11626,7 @@ fn skill_entry_is_bundled_requires_configured_bundle_path() {
         localized_descriptions: std::collections::HashMap::new(),
         invocation: crate::skills::SkillInvocation::ModelAndUser,
         aliases: Vec::new(),
+        argument_hint: None,
         body: String::new(),
         path: bundled_skill_path,
         source: crate::skills::SkillSource::Native,
@@ -11574,6 +11638,7 @@ fn skill_entry_is_bundled_requires_configured_bundle_path() {
         localized_descriptions: std::collections::HashMap::new(),
         invocation: crate::skills::SkillInvocation::ModelAndUser,
         aliases: Vec::new(),
+        argument_hint: None,
         body: String::new(),
         path: override_skill_path,
         source: crate::skills::SkillSource::Native,
@@ -11640,7 +11705,16 @@ fn resolve_skills_dir_ignores_untrusted_workspace_skills() {
     };
     for (relative, config) in [
         (".agents/skills", Config::default()),
-        ("skills", Config::default()),
+        (
+            "skills",
+            Config {
+                skills: Some(crate::config::SkillsConfig {
+                    flat_workspace_root: Some(true),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        ),
         (".codewhale/skills", codewhale_only),
     ] {
         let workspace = tmp
@@ -14052,6 +14126,51 @@ model = "glm-2"
             .ge(&2),
         "switch must not add a second `model = \"deepseek-v4-pro\"` line for volcengine. \
          Actual config:\n{persisted}"
+    );
+
+    handle.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn switch_provider_rolls_back_a_selection_the_runtime_cannot_apply() -> Result<()> {
+    // The reload after the write fails (the runtime's profile is not in the
+    // file), so the switch is not applied in memory: the file must not keep
+    // it either, or the next start silently adopts a provider the caller was
+    // told failed.
+    let root = std::env::temp_dir().join(format!("codewhale-switch-rollback-{}", Uuid::new_v4()));
+    fs::create_dir_all(&root)?;
+    let config_file = root.join("custom-config.toml");
+    fs::write(
+        &config_file,
+        r#"provider = "deepseek"
+default_text_model = "deepseek-v4-pro"
+
+[providers.volcengine]
+api_key = "ark-test"
+base_url = "https://ark.cn-beijing.volces.com/api/plan/v3"
+model = "glm-2"
+"#,
+    )?;
+    let before = fs::read_to_string(&config_file)?;
+
+    let Some((addr, _runtime_threads, handle)) = spawn_test_server_with_config_path_and_profile(
+        config_file.clone(),
+        "absent-profile".to_string(),
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    let client = crate::tls::reqwest_client();
+
+    let (status, body) =
+        post_switch_provider(&client, &addr, "volcengine", &serde_json::json!({})).await;
+    assert!(!status.is_success(), "the switch cannot apply: {body}");
+    assert_eq!(
+        fs::read_to_string(&config_file)?,
+        before,
+        "a switch the runtime refused must not stay persisted"
     );
 
     handle.abort();
@@ -18727,6 +18846,7 @@ async fn runtime_image_http_rejects_before_dispatch_and_accepts_large_canonical_
             turn_id: "image-http-fixture".into(),
             created_at: Utc::now(),
             route: None,
+            submission_id: None,
         })
         .await?;
     harness

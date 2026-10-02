@@ -34,8 +34,10 @@ mod wire;
 use self::http::{HttpTransport, McpHttpAuth};
 use self::sse::SseTransport;
 use self::stdio::StdioTransport;
+pub(crate) use self::stdio::read_line_capped;
 #[cfg(all(test, unix))]
 use self::stdio::{STDIO_SHUTDOWN_GRACE, StderrTail};
+pub(crate) use self::wire::MAX_MCP_RESPONSE_BYTES;
 use self::wire::{
     is_mcp_connection_lost_error, is_mcp_session_rejected_error, is_mcp_stale_session_body,
 };
@@ -48,7 +50,7 @@ use crate::utils::write_atomic;
 const ERROR_BODY_PREVIEW_BYTES: usize = 200;
 
 /// Newest dated MCP protocol revision Codewhale advertises at `initialize` and
-/// answers as an MCP server. Matches the shared MCP crate (`crates/mcp`).
+/// answers as the native MCP server.
 pub(crate) const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
 /// Dated MCP revisions accepted during negotiation, newest first. A peer
 /// answering or requesting any of these continues the handshake.
@@ -532,8 +534,15 @@ pub struct McpTimeouts {
 fn default_connect_timeout() -> u64 {
     30
 }
+// 30 minutes: an MCP tool call legitimately runs minutes — builds, test
+// suites, scrapes, remote jobs. The old 60s default returned "timed out" to
+// the model for healthy-but-slow tools, which then retried and compounded
+// the cost. Per-server and global `execute_timeout` overrides still win.
+// Scope note: `prompts/get` also routes through `effective_execute_timeout`,
+// so it inherits this default; its server-side template work is normally
+// fast, but the override knob is the intended way to keep it tight.
 fn default_execute_timeout() -> u64 {
-    60
+    1800
 }
 fn default_read_timeout() -> u64 {
     120
@@ -1673,6 +1682,10 @@ pub struct McpConnection {
     state: ConnectionState,
     config: McpServerConfig,
     server_capabilities: Option<McpServerCapabilities>,
+    /// Sanitized `instructions` from this connection's `initialize` result.
+    /// A reconnect builds a new connection, so guidance never outlives the
+    /// handshake that supplied it.
+    instructions: Option<String>,
     discovery_timeout: Duration,
     read_timeout_secs: u64,
     cancel_token: tokio_util::sync::CancellationToken,
@@ -1681,6 +1694,9 @@ pub struct McpConnection {
     /// Pool catalog generation that created/last authorized this connection.
     /// Directly constructed test connections use zero until inserted.
     catalog_generation: u64,
+    /// Key this host shares with the built-in Computer Use plugin over the
+    /// connection itself, to attest a person's card decision on a call.
+    decision_key: Option<[u8; 32]>,
 }
 
 struct PendingAuthorityWatch {
@@ -1756,6 +1772,20 @@ impl Drop for PendingAuthorityWatch {
     }
 }
 
+/// Total request ceiling handed to the HTTP client: it must cover the longest
+/// request the connection carries (`tools/call` at the execute budget), so a
+/// raised `execute_timeout` governs HTTP servers too. This is a ceiling for
+/// the transport, not the read knob.
+///
+/// Streamable HTTP reads the reply inside the POST; `call_method` bounds the
+/// send and the receive with the request's own budget, so this ceiling is
+/// only the transport's outer safety net for requests without one.
+fn http_request_ceiling_secs(config: &McpServerConfig, global: &McpTimeouts) -> u64 {
+    config
+        .effective_read_timeout(global)
+        .max(config.effective_execute_timeout(global))
+}
+
 impl McpConnection {
     /// Connect to an MCP server and initialize it.
     ///
@@ -1817,7 +1847,12 @@ impl McpConnection {
                 config.allow_private_network,
                 network_policy,
                 Duration::from_secs(connect_timeout_secs),
-                Duration::from_secs(read_timeout_secs),
+                // Transport total-request ceiling, not the read knob: it must
+                // cover the longest request this connection carries
+                // (`tools/call` at the execute budget), so a raised
+                // `execute_timeout` governs HTTP servers too. The read knob
+                // itself stays intact for the connection-level waits below.
+                Duration::from_secs(http_request_ceiling_secs(&config, global_timeouts)),
             )?;
             let oauth_runtime = if config.reviewed_plugin.is_some() {
                 None
@@ -1943,13 +1978,40 @@ impl McpConnection {
             state: ConnectionState::Connecting,
             config,
             server_capabilities: None,
+            instructions: None,
             discovery_timeout: Duration::from_secs(connect_timeout_secs),
             read_timeout_secs,
             cancel_token,
             authority_revocation_reason,
             authority_watch,
             catalog_generation: 0,
+            decision_key: None,
         };
+
+        // The built-in Computer Use plugin accepts consent and script calls
+        // only with a decision attested by its host. Its keys travel as the
+        // first message on the plugin's own stdin, never in its environment.
+        if conn.config.url.is_none()
+            && conn.config.command.is_some()
+            && conn
+                .config
+                .reviewed_plugin
+                .as_ref()
+                .is_some_and(|source| source.plugin_name() == COMPUTER_USE_PLUGIN_NAME)
+        {
+            let decision_key = random_key()?;
+            let ledger_key = computer_use_ledger_key().await;
+            conn.send(serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": COMPUTER_USE_HOST_KEYS_METHOD,
+                "params": {
+                    "decision_key": hex_encode(&decision_key),
+                    "ledger_key": ledger_key,
+                }
+            }))
+            .await?;
+            conn.decision_key = Some(decision_key);
+        }
 
         // Initialize with timeout
         tokio::time::timeout(Duration::from_secs(connect_timeout_secs), conn.initialize())
@@ -2050,6 +2112,10 @@ impl McpConnection {
         );
         self.transport.set_protocol_version(negotiated);
         self.server_capabilities = McpServerCapabilities::from_initialize_response(&response);
+        self.instructions = codewhale_mcp::sanitize_server_instructions(
+            &self.name,
+            result.and_then(|result| result.get("instructions")),
+        );
 
         // Send initialized notification (no id, no response expected)
         self.send(serde_json::json!({
@@ -2338,21 +2404,38 @@ impl McpConnection {
     }
 
     /// Call a tool on this MCP server
+    #[cfg(test)]
     pub async fn call_tool(
         &mut self,
         tool_name: &str,
         arguments: serde_json::Value,
         timeout_secs: u64,
     ) -> Result<serde_json::Value> {
-        self.call_method(
-            "tools/call",
-            serde_json::json!({
-                "name": tool_name,
-                "arguments": arguments
-            }),
-            timeout_secs,
-        )
-        .await
+        self.call_tool_decided(tool_name, arguments, timeout_secs, None)
+            .await
+    }
+
+    /// Call a tool, attaching an attested person's decision when there is
+    /// one and this server shares a decision key with the host.
+    async fn call_tool_decided(
+        &mut self,
+        tool_name: &str,
+        arguments: serde_json::Value,
+        timeout_secs: u64,
+        decision: Option<&crate::core::engine::HumanDecision>,
+    ) -> Result<serde_json::Value> {
+        let mut params = serde_json::json!({
+            "name": tool_name,
+            "arguments": arguments
+        });
+        if decision.is_some()
+            && let Some(key) = self.decision_key.as_ref()
+        {
+            params["_meta"] = serde_json::json!({
+                COMPUTER_USE_DECISION_META: attest_decision(key, tool_name, &params["arguments"])?,
+            });
+        }
+        self.call_method("tools/call", params, timeout_secs).await
     }
 
     /// Read a resource from this MCP server
@@ -2408,31 +2491,67 @@ impl McpConnection {
         }
 
         let call_id = self.next_id();
-        if let Err(error) = self
-            .send(serde_json::json!({
+        // One deadline bounds the whole request. Streamable HTTP reads the
+        // reply inside the POST, so a budget on the receive alone would leave
+        // that transport to its client-wide ceiling (the larger of the read
+        // and execute knobs) instead of this request's own budget.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
+        let expired_error = anyhow::anyhow!(
+            "MCP method '{}' on server '{}' timed out after {}s",
+            method,
+            self.name,
+            timeout_secs
+        );
+        match tokio::time::timeout_at(
+            deadline,
+            self.send(serde_json::json!({
                 "jsonrpc": "2.0",
                 "id": &call_id,
                 "method": method,
                 "params": params
-            }))
-            .await
+            })),
+        )
+        .await
         {
-            return self.finish_guarded_error(error).await;
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => return self.finish_guarded_error(error).await,
+            Err(_) => {
+                // A send abandoned mid-write can leave a partial frame on a
+                // stream transport, so the frame boundary is unknown: rebuild
+                // the connection rather than reuse it.
+                self.state = ConnectionState::Disconnected;
+                return self.finish_guarded_error(expired_error).await;
+            }
         }
 
-        let response =
-            match tokio::time::timeout(Duration::from_secs(timeout_secs), self.recv(call_id))
-                .await
-                .with_context(|| {
-                    format!(
-                        "MCP method '{}' on server '{}' timed out after {}s",
-                        method, self.name, timeout_secs
-                    )
-                }) {
-                Ok(Ok(response)) => response,
-                Ok(Err(error)) => return self.finish_guarded_error(error).await,
-                Err(error) => return self.finish_guarded_error(error).await,
-            };
+        // The request's own budget is its only receive deadline. A per-frame
+        // read-knob wait here either undercut it — a server is silent for the
+        // whole execution of a tool call, so the knob fired first, marked the
+        // connection Disconnected, and capped a raised `execute_timeout` — or
+        // tied with it, leaving the connection's fate to timer order. On
+        // expiry the request is abandoned and the connection kept: a late
+        // reply carries the abandoned id and the next receive skips it.
+        //
+        // Known limitation: the server is never told a request was abandoned
+        // (no `notifications/cancelled`), whether by this budget or by the
+        // caller dropping the call (turn cancellation). A server that handles
+        // requests one at a time answers the next call only after finishing
+        // the abandoned one, so that call can wait up to its own budget —
+        // 1800s for `tools/call` by default. Cancelling `cancel_token` instead
+        // marks the connection dead, so the pool rebuilds it (a new child for
+        // stdio) before the next call.
+        let response = match tokio::time::timeout_at(deadline, self.recv_reply(call_id, None))
+            .await
+            .with_context(|| {
+                format!(
+                    "MCP method '{}' on server '{}' timed out after {}s",
+                    method, self.name, timeout_secs
+                )
+            }) {
+            Ok(Ok(response)) => response,
+            Ok(Err(error)) => return self.finish_guarded_error(error).await,
+            Err(error) => return self.finish_guarded_error(error).await,
+        };
 
         if let Some(error) = response.get("error") {
             if self.config.reviewed_plugin.is_some() {
@@ -2515,6 +2634,12 @@ impl McpConnection {
         self.state == ConnectionState::Ready && !self.transport.probe_dead()
     }
 
+    /// Usage guidance the server supplied at `initialize`, sanitized and
+    /// capped (see [`codewhale_mcp::sanitize_server_instructions`]).
+    pub fn instructions(&self) -> Option<&str> {
+        self.instructions.as_deref()
+    }
+
     /// Get server config
     pub fn config(&self) -> &McpServerConfig {
         &self.config
@@ -2551,34 +2676,53 @@ impl McpConnection {
         result
     }
 
+    /// Handshake and discovery receive: each frame wait is bounded by the read
+    /// knob, and a server that stays silent past it is treated as dead.
     async fn recv(&mut self, expected_id: String) -> Result<serde_json::Value> {
-        loop {
-            let bytes = match tokio::time::timeout(
-                Duration::from_secs(self.read_timeout_secs),
-                async {
-                    tokio::select! {
-                        biased;
-                        _ = self.cancel_token.cancelled() => {
-                            anyhow::bail!("MCP connection '{}' was cancelled", self.name)
-                        }
-                        result = self.transport.recv() => result,
-                    }
-                },
-            )
+        self.recv_reply(expected_id, Some(self.read_timeout_secs))
             .await
-            {
-                Ok(result) => result.inspect_err(|_e| {
-                    self.state = ConnectionState::Disconnected;
-                })?,
-                Err(_) => {
-                    self.state = ConnectionState::Disconnected;
-                    anyhow::bail!(
-                        "Timed out waiting for MCP JSON-RPC response from server '{}' after {}s",
-                        self.name,
-                        self.read_timeout_secs
-                    );
+    }
+
+    /// The next transport frame, unless the connection is cancelled first.
+    async fn next_frame(&mut self) -> Result<Vec<u8>> {
+        tokio::select! {
+            biased;
+            _ = self.cancel_token.cancelled() => {
+                anyhow::bail!("MCP connection '{}' was cancelled", self.name)
+            }
+            result = self.transport.recv() => result,
+        }
+    }
+
+    /// Receive the reply to `expected_id`, skipping notifications and replies
+    /// to other (abandoned) requests. `frame_timeout_secs` bounds each frame
+    /// wait and treats its expiry as a dead connection; `None` leaves the
+    /// whole wait to the caller's own request budget.
+    async fn recv_reply(
+        &mut self,
+        expected_id: String,
+        frame_timeout_secs: Option<u64>,
+    ) -> Result<serde_json::Value> {
+        loop {
+            let frame = match frame_timeout_secs {
+                Some(secs) => {
+                    match tokio::time::timeout(Duration::from_secs(secs), self.next_frame()).await {
+                        Ok(frame) => frame,
+                        Err(_) => {
+                            self.state = ConnectionState::Disconnected;
+                            anyhow::bail!(
+                                "Timed out waiting for MCP JSON-RPC response from server '{}' after {}s",
+                                self.name,
+                                secs
+                            );
+                        }
+                    }
                 }
+                None => self.next_frame().await,
             };
+            let bytes = frame.inspect_err(|_e| {
+                self.state = ConnectionState::Disconnected;
+            })?;
             let value: serde_json::Value = match serde_json::from_slice(&bytes) {
                 Ok(value) => value,
                 Err(err) => {
@@ -4393,6 +4537,93 @@ impl McpPool {
         }))
     }
 
+    /// Guidance from connected servers that may be put in front of the model,
+    /// as `(server, instructions)` sorted by server name.
+    ///
+    /// A server qualifies only when it is ready, allowed and still authorized
+    /// (the same gates as [`Self::resolved_tool_servers`]), supplied non-empty
+    /// instructions, and owns at least one enabled tool for which
+    /// `model_visible` holds — the caller passes the turn's final catalog, so
+    /// a server whose tools are all denied by the permission posture
+    /// contributes nothing.
+    #[must_use]
+    pub fn model_server_instructions(
+        &self,
+        model_visible: impl Fn(&str) -> bool,
+    ) -> Vec<(String, String)> {
+        let servers: BTreeSet<String> = self
+            .resolved_tool_servers()
+            .into_iter()
+            .filter(|(tool, _)| model_visible(tool))
+            .map(|(_, server)| server)
+            .collect();
+        servers
+            .into_iter()
+            .filter_map(|server| {
+                let conn = self.connections.get(&server)?;
+                if conn.state() != ConnectionState::Ready {
+                    return None;
+                }
+                let text = conn.instructions()?.to_string();
+                Some((server, text))
+            })
+            .collect()
+    }
+
+    /// Insert a ready, idle connection with the given tools and guidance, for
+    /// tests outside this module that need a pool without spawning a server.
+    #[cfg(test)]
+    pub(crate) fn insert_test_connection(
+        &mut self,
+        server: &str,
+        tools: &[&str],
+        instructions: Option<&str>,
+    ) {
+        struct IdleTransport;
+        #[async_trait::async_trait]
+        impl McpTransport for IdleTransport {
+            async fn send(&mut self, _msg: Vec<u8>) -> Result<()> {
+                Ok(())
+            }
+            async fn recv(&mut self) -> Result<Vec<u8>> {
+                anyhow::bail!("idle test transport has no responses")
+            }
+        }
+        let config: McpServerConfig = serde_json::from_value(serde_json::json!({
+            "command": "codewhale-test-idle-mcp"
+        }))
+        .expect("minimal server config");
+        let conn = McpConnection {
+            name: server.to_string(),
+            transport: Box::new(IdleTransport),
+            tools: tools
+                .iter()
+                .map(|name| McpTool {
+                    name: (*name).to_string(),
+                    description: None,
+                    input_schema: serde_json::json!({"type": "object"}),
+                    annotations: None,
+                })
+                .collect(),
+            resources: Vec::new(),
+            resource_templates: Vec::new(),
+            prompts: Vec::new(),
+            request_id: AtomicU64::new(1),
+            state: ConnectionState::Ready,
+            config,
+            server_capabilities: None,
+            instructions: instructions.map(str::to_string),
+            discovery_timeout: Duration::from_secs(1),
+            read_timeout_secs: 1,
+            cancel_token: tokio_util::sync::CancellationToken::new(),
+            authority_revocation_reason: Arc::new(std::sync::Mutex::new(None)),
+            authority_watch: None,
+            catalog_generation: 0,
+            decision_key: None,
+        };
+        self.connections.insert(server.to_string(), conn);
+    }
+
     /// Get all discovered tools with server-prefixed names
     pub fn all_tools(&self) -> Vec<(String, &McpTool)> {
         let mut by_name: std::collections::BTreeMap<String, Option<&McpTool>> =
@@ -5003,6 +5234,7 @@ impl McpPool {
         name: &str,
         input: serde_json::Value,
         rules: &[String],
+        decision: Option<&crate::core::engine::HumanDecision>,
     ) -> Result<serde_json::Value> {
         Self::authorize_call(&self.disallowed_tools, name, &input)?;
         Self::authorize_call(rules, name, &input)?;
@@ -5057,7 +5289,7 @@ impl McpPool {
             return Ok(serde_json::json!({ field: items }));
         }
         let synthetic_auth = self.authenticate_tool_target(name).is_some();
-        let mut result = self.call_tool(name, input).await?;
+        let mut result = self.call_tool_with_decision(name, input, decision).await?;
         if synthetic_auth {
             Self::filter_authenticate_result(&mut result, rules);
         }
@@ -5078,12 +5310,27 @@ impl McpPool {
     }
 
     /// Call a tool by its prefixed name (mcp_{server}_{tool})
+    #[cfg(test)]
     pub async fn call_tool(
         &mut self,
         prefixed_name: &str,
         arguments: serde_json::Value,
     ) -> Result<serde_json::Value> {
+        self.call_tool_with_decision(prefixed_name, arguments, None)
+            .await
+    }
+
+    /// Call a tool, carrying a person's card decision for this exact call.
+    pub(crate) async fn call_tool_with_decision(
+        &mut self,
+        prefixed_name: &str,
+        arguments: serde_json::Value,
+        decision: Option<&crate::core::engine::HumanDecision>,
+    ) -> Result<serde_json::Value> {
         Self::authorize_call(&self.disallowed_tools, prefixed_name, &arguments)?;
+        if decision.is_some_and(|decision| !decision.authorizes(prefixed_name, &arguments)) {
+            anyhow::bail!("Human approval does not authorize this exact MCP call");
+        }
         if prefixed_name == "list_mcp_resources" {
             let server = arguments
                 .get("server")
@@ -5181,7 +5428,10 @@ impl McpPool {
             anyhow::bail!("MCP tool '{tool_name}' is disabled for server '{server_name}'");
         }
         let timeout = conn.config().effective_execute_timeout(&global_timeouts);
-        let result = match conn.call_tool(&tool_name, arguments.clone(), timeout).await {
+        let result = match conn
+            .call_tool_decided(&tool_name, arguments.clone(), timeout, decision)
+            .await
+        {
             Ok(result) => Ok(result),
             // A rejected credential is not a stale session: reconnecting
             // replays the same rejection, so it takes the auth-required
@@ -5219,7 +5469,8 @@ impl McpPool {
                             ))
                         } else {
                             let timeout = conn.config().effective_execute_timeout(&global_timeouts);
-                            conn.call_tool(&tool_name, arguments, timeout).await
+                            conn.call_tool_decided(&tool_name, arguments, timeout, decision)
+                                .await
                         }
                     }
                     // A reconnect that fails must not swallow the call error
@@ -5874,6 +6125,100 @@ pub fn resolve_server_scope(global_path: &Path, workspace: &Path, name: &str) ->
 
 /// Plugin name of the built-in Computer Use bundle.
 const COMPUTER_USE_PLUGIN_NAME: &str = "computer-use";
+
+/// First message the host sends the built-in Computer Use plugin: its
+/// per-connection decision key and the persisted-ledger key.
+const COMPUTER_USE_HOST_KEYS_METHOD: &str = "codewhale/host_keys";
+
+/// `_meta` key carrying an attested person's decision on a `tools/call`.
+const COMPUTER_USE_DECISION_META: &str = "codewhale/user_decision";
+
+/// Secret-store slot of the key that signs remembered Computer Use grants.
+const COMPUTER_USE_LEDGER_KEY_SLOT: &str = "codewhale_cu_ledger_key";
+
+fn random_key() -> Result<[u8; 32]> {
+    use ring::rand::SecureRandom as _;
+    let mut key = [0_u8; 32];
+    ring::rand::SystemRandom::new()
+        .fill(&mut key)
+        .map_err(|_| {
+            anyhow::anyhow!("System randomness is unavailable for Computer Use approval")
+        })?;
+    Ok(key)
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    bytes
+        .iter()
+        .fold(String::with_capacity(bytes.len() * 2), |mut out, byte| {
+            let _ = write!(out, "{byte:02x}");
+            out
+        })
+}
+
+/// `{nonce, args_json, mac}` for one call: `mac` is HMAC-SHA256 over
+/// `tool \0 args_json \0 nonce`, and the plugin checks that `args_json`
+/// parses to the arguments it received.
+fn attest_decision(
+    key: &[u8; 32],
+    tool_name: &str,
+    arguments: &serde_json::Value,
+) -> Result<serde_json::Value> {
+    let nonce = hex_encode(&random_key()?[..16]);
+    let args_json = serde_json::to_string(arguments)?;
+    let message = [
+        tool_name.as_bytes(),
+        b"\0",
+        args_json.as_bytes(),
+        b"\0",
+        nonce.as_bytes(),
+    ]
+    .concat();
+    let tag = ring::hmac::sign(
+        &ring::hmac::Key::new(ring::hmac::HMAC_SHA256, key),
+        &message,
+    );
+    Ok(serde_json::json!({
+        "nonce": nonce,
+        "args_json": args_json,
+        "mac": hex_encode(tag.as_ref()),
+    }))
+}
+
+/// The key that signs remembered Computer Use grants, created once in the
+/// secret store. `None` when the store is unavailable: remembered grants
+/// then do not survive the session.
+async fn computer_use_ledger_key() -> Option<String> {
+    if cfg!(test) {
+        return None;
+    }
+    tokio::task::spawn_blocking(|| {
+        let secrets = codewhale_secrets::Secrets::auto_detect();
+        // Concurrent connection starts must use the same persisted key;
+        // reading and replacing it share the secret store's entry authority.
+        secrets
+            .with_entry_transaction(COMPUTER_USE_LEDGER_KEY_SLOT, |stored| {
+                if let Some(key) = stored.as_ref()
+                    && key.len() == 64
+                    && key.bytes().all(|b| b.is_ascii_hexdigit())
+                {
+                    return Ok(Some(key.clone()));
+                }
+                let Ok(bytes) = random_key() else {
+                    return Ok(None);
+                };
+                let key = hex_encode(&bytes);
+                *stored = Some(key.clone());
+                Ok(Some(key))
+            })
+            .ok()
+            .flatten()
+    })
+    .await
+    .ok()
+    .flatten()
+}
 
 /// User-configured servers that launch the same Computer Use plugin as the
 /// enabled built-in `computer-use` bundle, with the argument that gave each
@@ -6907,3 +7252,5 @@ mod qualified_plugin_server_name_tests {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+pub(crate) use tests::computer_use_test_fixture;

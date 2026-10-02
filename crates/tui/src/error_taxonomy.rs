@@ -406,6 +406,10 @@ pub fn classify_error_message(message: &str) -> ErrorCategory {
         || lower.contains("chunk decode error")
         || lower.contains("body decode")
         || lower.contains("temporarily unavailable")
+        // Gateways report a failed or empty upstream inside a 200 with this
+        // wording (OpenRouter); it is the upstream being unreachable.
+        || lower.contains("provider returned error")
+        || lower.contains("provider returned an empty response")
         || lower.contains(" 502 ")
         || lower.contains(" 503 ")
         || lower.contains(" 504 ")

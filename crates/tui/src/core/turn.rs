@@ -740,7 +740,7 @@ fn snapshot_with_label_since(
                 _ => None,
             };
             // Prune oldest snapshots to cap disk usage (#1112).
-            if let Err(e) = repo.prune_keep_last_n(max_snapshots_for(workspace)) {
+            if let Err(e) = repo.prune_keep_last_n_batched(max_snapshots_for(workspace)) {
                 tracing::warn!(target: "snapshot", "snapshot prune failed: {e}");
             }
             id.map(|taken| (taken, changed))

@@ -25,7 +25,8 @@ ROOT = Path(__file__).resolve().parent.parent
 # Bots and the maintainer account: real authors of most commits, never
 # "contributors" in the credit sense this file guards.
 SKIP = {
-    "codewhale bot", "claude", "dependabot[bot]", "codewhale-maint",
+    "codewhale bot", "codewhalebot", "claude", "codex", "dependabot[bot]",
+    "codewhale-maint",
     "hunter bown", "hunter b", "hmbown", "deepseek-v41-flash", "devin",
 }
 
@@ -63,7 +64,7 @@ def expected(since: str) -> dict[str, str]:
         # its context window change release to release.
         if any(low.startswith(skip) for skip in SKIP):
             return
-        if "[bot]" in email.lower() or email.lower().endswith("noreply@anthropic.com"):
+        if "[bot]" in email.lower() or email.lower().endswith(("noreply@anthropic.com", "noreply@openai.com")):
             return
         handle = amap.get(email.lower()) or amap.get(name.strip().lower())
         if not handle:

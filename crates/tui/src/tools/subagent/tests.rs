@@ -6827,6 +6827,56 @@ async fn full_event_channel_still_delivers_agent_complete() {
     ));
 }
 
+/// #6560 D02-06: a nested parent's completion inbox is bounded and has no
+/// terminal-results synthesis behind it, so a completion that meets a full
+/// inbox must wait for capacity rather than be dropped.
+#[tokio::test]
+async fn full_nested_completion_inbox_still_delivers_child_completion() {
+    let tmp = tempdir().expect("tempdir");
+    let mut manager = SubAgentManager::new(tmp.path().to_path_buf(), 2);
+    let agent_id = "agent_full_inbox".to_string();
+    let (input_tx, _input_rx) = mpsc::unbounded_channel();
+    let mut agent = SubAgent::new(
+        agent_id.clone(),
+        FleetRole::Worker,
+        "finish while the parent inbox is full".to_string(),
+        make_assignment(),
+        "deepseek-v4-flash".to_string(),
+        None,
+        None,
+        input_tx,
+        tmp.path().to_path_buf(),
+        manager.current_session_boot_id.clone(),
+    );
+    agent.task_handle = Some(tokio::spawn(async {
+        tokio::time::sleep(Duration::from_secs(60)).await;
+    }));
+
+    let (completion_tx, mut completion_rx) = mpsc::channel::<SubAgentCompletion>(1);
+    completion_tx
+        .try_send(SubAgentCompletion {
+            owner_session_id: String::new(),
+            agent_id: "earlier_sibling".to_string(),
+            payload: "already queued".to_string(),
+        })
+        .expect("fill the only slot");
+    let runtime = runtime_with_depth(2, Some(completion_tx));
+    agent.terminal_delivery = Some(SubAgentTerminalDeliveryContext::from_runtime(&runtime));
+    manager.agents.insert(agent_id.clone(), agent);
+    manager.register_worker(make_worker_spec(&agent_id, tmp.path().to_path_buf()));
+
+    let result = manager.cancel_agent(&agent_id).expect("stop");
+    assert_eq!(result.status, SubAgentStatus::Cancelled);
+
+    let filler = completion_rx.recv().await.expect("filler completion");
+    assert_eq!(filler.agent_id, "earlier_sibling");
+    let delivered = tokio::time::timeout(Duration::from_secs(5), completion_rx.recv())
+        .await
+        .expect("child completion is not dropped")
+        .expect("inbox open");
+    assert_eq!(delivered.agent_id, agent_id);
+}
+
 #[tokio::test]
 async fn model_wait_cancel_fans_in_once_and_preserves_checkpoint() {
     use tokio_util::sync::CancellationToken;
@@ -12605,11 +12655,14 @@ async fn rate_limit_pause_blocks_subagent_spawn() {
     let _clear = ClearRateLimitOnDrop;
     crate::retry_status::clear();
     crate::retry_status::clear_rate_limit();
-    crate::retry_status::note_rate_limit(Duration::from_secs(30));
 
     let tmp = tempdir().expect("tempdir");
     let mut runtime = stub_runtime();
     runtime.context = ToolContext::new(tmp.path().to_path_buf());
+    crate::retry_status::note_rate_limit(
+        &runtime.client.rate_limit_scope(),
+        Duration::from_secs(30),
+    );
     let manager = new_shared_subagent_manager(tmp.path().to_path_buf(), 2);
 
     let err = spawn_subagent_from_input(
@@ -15056,7 +15109,6 @@ pub(crate) fn stub_runtime() -> SubAgentRuntime {
         parent_completion_tx: None,
         fork_context: None,
         parent_mode: AppMode::Agent,
-        approval_mode: ApprovalMode::Suggest,
         auto_review_policy: std::sync::Arc::new(
             crate::tui::auto_review::AutoReviewPolicy::default(),
         ),
@@ -18455,6 +18507,32 @@ async fn spawn_budget_capped_worker(
     Arc<AtomicUsize>,
     tokio::task::JoinHandle<()>,
 ) {
+    spawn_budget_capped_worker_with_pause(
+        workspace,
+        prompt_tokens,
+        completion_tokens,
+        max_steps,
+        wall_time,
+        None,
+    )
+    .await
+}
+
+/// As [`spawn_budget_capped_worker`], optionally opening a rate-limit pause
+/// on the worker's own route before it starts.
+async fn spawn_budget_capped_worker_with_pause(
+    workspace: &Path,
+    prompt_tokens: u64,
+    completion_tokens: u64,
+    max_steps: u32,
+    wall_time: Duration,
+    pause: Option<Duration>,
+) -> (
+    Arc<RwLock<SubAgentManager>>,
+    String,
+    Arc<AtomicUsize>,
+    tokio::task::JoinHandle<()>,
+) {
     let manager = Arc::new(RwLock::new(SubAgentManager::new(
         workspace.to_path_buf(),
         2,
@@ -18503,6 +18581,9 @@ async fn spawn_budget_capped_worker(
         launch_gate: None,
         _foreground_child_registration: None,
     };
+    if let Some(pause) = pause {
+        crate::retry_status::note_rate_limit(&runtime.client.rate_limit_scope(), pause);
+    }
     let task_handle = tokio::spawn(run_subagent_task(task));
     (manager, agent_id, calls, task_handle)
 }
@@ -18782,11 +18863,17 @@ async fn worker_is_not_stranded_by_transient_global_rate_limit_window() {
     // in-flight requests promptly.
     let _guard = crate::retry_status::test_guard();
     let _clear = ClearRateLimitOnDrop;
-    crate::retry_status::note_rate_limit(Duration::from_secs(30));
 
     let tmp = tempdir().expect("tempdir");
-    let (manager, agent_id, _calls, task_handle) =
-        spawn_budget_capped_worker(tmp.path(), 60, 40, 4, DEFAULT_CHILD_WALL_TIME).await;
+    let (manager, agent_id, _calls, task_handle) = spawn_budget_capped_worker_with_pause(
+        tmp.path(),
+        60,
+        40,
+        4,
+        DEFAULT_CHILD_WALL_TIME,
+        Some(Duration::from_secs(30)),
+    )
+    .await;
 
     // Simulate the concurrent test finishing: the window closes shortly
     // after the worker's first request has already observed it.
@@ -20528,7 +20615,7 @@ async fn read_only_web_evidence_keeps_the_parent_approval_gate() {
         let mut runtime =
             stub_runtime().with_agent_tool_surface_options(enabled_agent_surface_options());
         runtime.context = ToolContext::new(tmp.path());
-        runtime.approval_mode = ApprovalMode::Never;
+        runtime.context.approval_mode = ApprovalMode::Never;
         runtime.worker_profile = WorkerRuntimeProfile::for_role(role.clone());
         runtime.worker_profile.permissions.network = true;
         let registry = SubAgentToolRegistry::new(
@@ -20557,7 +20644,13 @@ async fn read_only_web_evidence_keeps_the_parent_approval_gate() {
             assert!(
                 matches!(
                     registry
-                        .gate_held_call("agent_scout", "test-web", name, &input)
+                        .gate_held_call(
+                            "agent_scout",
+                            "test-web",
+                            name,
+                            &input,
+                            registry.registry.context(),
+                        )
                         .await,
                     ChildGateVerdict::Deny(_)
                 ),
@@ -21637,7 +21730,14 @@ const READ_ONLY_CHILD_ENVELOPE_BYTE_CEILING: usize = 89_000;
 // (105ad9d3e).
 // The agent schema's `fork_context` property (2026-09-25) fit under this
 // ceiling by trimming the `resume_from` and `wall_time_secs` descriptions.
-const PARENT_SURFACE_BYTE_CEILING: usize = 88_715;
+// Re-measured 2026-10-01 at 88,824B on macOS, +162B over 88,662B, both from
+// audit fixes: +106B because composition branches keep their `required`
+// lists (D04-11, 46835a2fc; `apply_patch`'s `oneOf` had degraded to three
+// unsatisfiable `{}` branches), and +56B for the finance timeout description
+// now saying the budget is shared with the chart fallback (D03-m3,
+// 7c36620d4). Linux measured 13B above macOS last time, so the ceiling is
+// 88,837B until a hosted Linux run re-measures it.
+const PARENT_SURFACE_BYTE_CEILING: usize = 88_837;
 
 #[tokio::test]
 async fn read_only_child_envelope_stays_within_measured_ceiling() {
@@ -23382,6 +23482,26 @@ mod child_permission_gate {
         tokio::sync::mpsc::Receiver<Event>,
         SharedSubAgentManager,
     ) {
+        worker_registry_with_live_posture(
+            approval_mode,
+            auto_approve,
+            parent_can_prompt,
+            client,
+            None,
+        )
+    }
+
+    fn worker_registry_with_live_posture(
+        approval_mode: ApprovalMode,
+        auto_approve: bool,
+        parent_can_prompt: bool,
+        client: Option<CodewhaleClient>,
+        live_posture: Option<crate::core::engine::LivePosture>,
+    ) -> (
+        SubAgentToolRegistry,
+        tokio::sync::mpsc::Receiver<Event>,
+        SharedSubAgentManager,
+    ) {
         let tmp = tempdir().expect("tempdir");
         let (tx, rx) = tokio::sync::mpsc::channel(32);
         let mut runtime = stub_runtime();
@@ -23392,13 +23512,14 @@ mod child_permission_gate {
         let session_id = format!("child_gate_{}", uuid::Uuid::new_v4().simple());
         runtime.context = ToolContext::new(workspace.clone()).with_state_namespace(session_id);
         runtime.context.auto_approve = auto_approve;
+        runtime.context.approval_mode = approval_mode;
+        runtime.context.live_posture = live_posture;
         runtime.allow_shell = true;
         runtime.event_tx = Some(tx);
         runtime = runtime.with_approval_receipt_store(Ok(
             crate::approval_log::ApprovalReceiptStore::new(tmp.path().join("sessions")),
         ));
         runtime = runtime.with_permission_posture(
-            approval_mode,
             std::sync::Arc::new(crate::tui::auto_review::AutoReviewPolicy::default()),
             parent_can_prompt,
         );
@@ -24622,6 +24743,167 @@ mod child_permission_gate {
         assert!(receipts[0].2.is_none());
     }
 
+    /// Linux report against 0.10.0: "even when I give maximum permissions to
+    /// one of the agents, it doesn't take them (the guardian denies)". A
+    /// running agent kept the posture it was spawned under, so switching the
+    /// session to Full Access left an Auto-Review agent asking — and, with no
+    /// reachable guardian, being denied by — the guardian. The agent's next
+    /// call now runs under the posture the person just chose, both ways.
+    #[tokio::test]
+    async fn a_posture_switch_reaches_an_already_running_agent() {
+        let live =
+            crate::core::engine::LivePosture::for_tests(&std::env::temp_dir(), ApprovalMode::Auto);
+        let (registry, mut rx, _) = worker_registry_with_live_posture(
+            ApprovalMode::Auto,
+            false,
+            true,
+            Some(unreachable_client()),
+            Some(live.clone()),
+        );
+        let call = json!({"command": GUARDIAN_PIPELINE});
+        let err = registry
+            .execute("agent_gate", "bash", call.clone())
+            .await
+            .expect_err("Auto-Review with no reachable guardian fails closed");
+        assert!(err.to_string().contains("fail closed"), "{err}");
+        assert_eq!(drain_gate_receipts(&mut rx).len(), 1);
+
+        live.switch_for_tests(ApprovalMode::Bypass);
+        let output = registry
+            .execute("agent_gate", "bash", call.clone())
+            .await
+            .expect("the same running agent runs the call once Full Access is granted");
+        assert!(output.contains("built"), "{output}");
+        assert!(
+            drain_gate_receipts(&mut rx).is_empty(),
+            "Full Access consults no guardian"
+        );
+
+        live.switch_for_tests(ApprovalMode::Auto);
+        registry
+            .execute("agent_gate", "bash", call)
+            .await
+            .expect_err("narrowing back to Auto-Review reaches the agent too");
+    }
+
+    /// Linux report against 0.10.0: an agent given Full Access still had its
+    /// calls denied by the "safety gate". Every child call was judged as
+    /// detached background work, so an ordinary absolute-path cleanup — which
+    /// the same session runs without a word in its own turn — failed closed in
+    /// the agent. Full Access judges the agent's call exactly like the
+    /// parent's: only a genuinely detached start keeps the floor.
+    #[tokio::test]
+    async fn full_access_child_runs_what_the_parent_turn_runs() {
+        let (mut registry, mut rx, _) = worker_registry(ApprovalMode::Bypass, true, true, None);
+        // A foreground agent: the parent turn owns and waits on it.
+        registry.gate_runtime.foreground_children = Some(Arc::new(ForegroundChildRegistry::new()));
+        let workspace = registry.gate_runtime.context.workspace.clone();
+        let build = workspace.join("build");
+        std::fs::create_dir_all(build.join("out")).unwrap();
+        #[cfg(windows)]
+        let command = format!(
+            "Remove-Item -LiteralPath '{}' -Recurse -Force",
+            build.to_string_lossy().replace('\'', "''")
+        );
+        #[cfg(not(windows))]
+        let command = format!(
+            "rm -rf {}",
+            shlex::try_quote(&build.to_string_lossy()).unwrap()
+        );
+        // Parent classification is covered in tui::auto_review; this runtime
+        // test proves the child actually executes and preserves the gate receipt.
+        registry
+            .execute("agent_gate", "bash", json!({"command": command}))
+            .await
+            .expect("a Full Access agent runs what its Full Access session runs");
+        assert!(!build.exists(), "the cleanup actually ran");
+        assert!(drain_gate_receipts(&mut rx).is_empty());
+    }
+
+    /// Review finding on d1655c424: judging agent calls as foreground let a
+    /// detached agent run catastrophic work. Nobody watches a detached agent,
+    /// so the floor holds for it in every posture, Full Access included.
+    #[tokio::test]
+    async fn a_detached_agents_catastrophic_shell_is_held_in_every_posture() {
+        for mode in [
+            ApprovalMode::Bypass,
+            ApprovalMode::Auto,
+            ApprovalMode::Suggest,
+            ApprovalMode::Never,
+        ] {
+            let (registry, mut rx, _) = worker_registry(
+                mode,
+                mode == ApprovalMode::Bypass,
+                false,
+                Some(unreachable_client()),
+            );
+            assert!(registry.gate_runtime.foreground_children.is_none());
+            for command in [
+                "dd if=/dev/zero of=/dev/null count=0",
+                "rm -rf /home/me",
+                "bash -c 'rm -rf /etc'",
+            ] {
+                let err = registry
+                    .execute("agent_gate", "bash", json!({ "command": command }))
+                    .await
+                    .expect_err("a detached agent's catastrophic write is held");
+                // Ask turns the hold into a prompt no person can answer here;
+                // every other posture blocks it outright. Either way it never runs.
+                assert!(
+                    err.to_string().contains("destructive background")
+                        || (mode == ApprovalMode::Suggest
+                            && err.to_string().contains("cannot raise a prompt")),
+                    "{mode:?} {command}: {err}"
+                );
+            }
+            let receipts = drain_gate_receipts(&mut rx);
+            assert!(
+                receipts
+                    .iter()
+                    .all(|receipt| receipt.0 == ToolGate::AutoReviewDeterministic),
+                "{mode:?}: the floor never reaches a guardian: {receipts:?}"
+            );
+        }
+    }
+
+    /// Review finding on d1655c424: the posture was read once, before the
+    /// gate. A person who tightened Permissions while an agent's prompt was
+    /// open still had that call run under the old posture once approved.
+    #[tokio::test]
+    async fn a_posture_narrowed_during_a_prompt_regates_the_call() {
+        let live = crate::core::engine::LivePosture::for_tests(
+            &std::env::temp_dir(),
+            ApprovalMode::Suggest,
+        );
+        let (registry, mut rx, manager) = worker_registry_with_live_posture(
+            ApprovalMode::Suggest,
+            false,
+            true,
+            None,
+            Some(live.clone()),
+        );
+        let call = registry.execute("agent_gate", "bash", json!({"command": "echo held | cat"}));
+        let answer = async {
+            let id = loop {
+                match rx.recv().await.expect("event stream") {
+                    Event::ApprovalRequired { id, .. } => break id,
+                    _ => continue,
+                }
+            };
+            // The person tightens Permissions, then answers the open card.
+            live.switch_for_tests(ApprovalMode::Never);
+            assert!(
+                manager
+                    .write()
+                    .await
+                    .resolve_child_approval(&id, ChildApprovalOutcome::Approved)
+            );
+        };
+        let (result, ()) = tokio::join!(call, answer);
+        let err = result.expect_err("the call is gated again under the narrower posture");
+        assert!(err.to_string().contains("requires approval"), "{err}");
+    }
+
     #[tokio::test]
     async fn full_access_runs_ordinary_shell_but_still_hard_blocks_the_safety_floor() {
         let (registry, mut rx, _) = worker_registry(ApprovalMode::Bypass, true, true, None);
@@ -24631,8 +24913,9 @@ mod child_permission_gate {
             .expect("Full Access runs ordinary shell without a prompt");
         assert!(output.contains("full-access"), "{output}");
         assert!(drain_gate_receipts(&mut rx).is_empty());
-        // Destructive detached work holds in every posture (children are
-        // background workers), so Full Access still fails closed here.
+        // This harness agent is detached (no foreground turn owns it), and
+        // destructive detached work holds in every posture, exactly as it
+        // does for a detached parent start: Full Access fails closed here.
         let err = registry
             .execute("agent_gate", "bash", json!({"command": "rm -rf /usr"}))
             .await
@@ -24993,6 +25276,180 @@ async fn agent_claim_is_withheld_from_a_role_with_no_write_authority() {
         .expect_err("a read-only role cannot widen a write scope")
         .to_string();
     assert!(refusal.contains("no write authority to widen"), "{refusal}");
+}
+
+// Regression (stopship scout repair): the workflow's read-only scout
+// activates `grep_files` with one `tool_search` call before searching. That
+// two-step path only works while the scout surface keeps a first-turn-active
+// `tool_search` and a deferred, searchable `grep_files`; the hidden `File`
+// alias the brief cited before is filtered from every model-visible catalog
+// (`to_api_tools`), which is what silently broke the release-acceptance
+// explore gate. The registry is built with the scope the fixture scout really
+// runs under (`leaf_allowed_tools` lowers a read-only leaf to `["File"]`), so
+// the guard also pins the alias-family intersection that keeps `grep_files`
+// discoverable under that legacy rule. If a surface reshape fails this test,
+// re-work the fixture brief in the same change instead of leaving it
+// instructing calls the child cannot make.
+#[tokio::test]
+async fn scout_surface_keeps_tool_search_grep_files_activation_path() {
+    let tmp = tempdir().expect("tempdir");
+    let mut runtime =
+        stub_runtime().with_agent_tool_surface_options(enabled_agent_surface_options());
+    runtime.context = ToolContext::new(tmp.path().to_path_buf());
+    let todo_list = crate::tools::todo::new_shared_todo_list();
+    let plan_state = crate::tools::plan::new_shared_plan_state();
+    let registry = SubAgentToolRegistry::new(
+        runtime,
+        FleetRole::Scout,
+        Some(vec!["File".to_string()]),
+        todo_list,
+        plan_state,
+    );
+
+    let catalog = registry.deferred_catalog_for_model(&FleetRole::Scout);
+    let search = catalog
+        .iter()
+        .find(|tool| tool.name == "tool_search")
+        .expect("scout must keep an active tool_search");
+    let grep = catalog
+        .iter()
+        .find(|tool| tool.name == "grep_files")
+        .expect("scout must keep a deferred, searchable grep_files");
+    assert_eq!(
+        search.defer_loading,
+        Some(false),
+        "tool_search must be first-turn active on the scout"
+    );
+    assert_eq!(
+        grep.defer_loading,
+        Some(true),
+        "grep_files must be deferred so the taught tool_search activation is required"
+    );
+    assert!(
+        !catalog.iter().any(|tool| tool.name == "File"),
+        "the hidden File alias must stay out of scout catalogs"
+    );
+}
+
+// Regression (stopship scout repair, phantom-tool class): fleet workflow
+// briefs are model-facing text too. The scout brief must name tools the child
+// catalog can actually see (`tool_search`, `grep_files`) and never cite the
+// hidden `File` alias or its retired `search_content` action — that wording
+// failed the release-acceptance explore gate exactly the way the
+// bundled-skills `File` citations stalled real reasoning loops.
+#[test]
+fn workflow_briefs_name_catalog_visible_tools() {
+    const STOPSHIP: &str = include_str!("../../../../../workflows/stopship.workflow.js");
+    // Guard the fixture definition, not the maintainer header comment.
+    let body = STOPSHIP
+        .split_once("export default")
+        .expect("workflow module must export its definition")
+        .1;
+    assert!(
+        body.contains("`tool_search`") && body.contains("`grep_files`"),
+        "the scout brief must teach the two-step activation path:\n{body}"
+    );
+    // Every catalog-invisible execution name (hidden replay aliases and the
+    // retired `search_content` action) is denied as a whole word, so an
+    // unbackticked or renamed citation cannot slip past the guard. `list_dir`
+    // and the lowercase primitives stay legal: they are model-visible.
+    const HIDDEN_EXEC_NAMES: [&str; 8] = [
+        "File",
+        "Bash",
+        "TodoWrite",
+        "work_update",
+        "read_file",
+        "write_file",
+        "edit_file",
+        "search_content",
+    ];
+    let cited: Vec<&str> = body
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .filter(|word| HIDDEN_EXEC_NAMES.iter().any(|hidden| hidden == word))
+        .collect();
+    assert!(
+        cited.is_empty(),
+        "workflow briefs must not command calls a catalog can never return: {cited:?}"
+    );
+}
+
+// Behavioral counterpart to the two composition guards above: on the scout's
+// live surface, one `tool_search` call must make the deferred `grep_files`
+// dispatchable through the same gate the child step loop uses, while the
+// hidden `File` alias the old brief commanded must keep failing the catalog
+// gate. Composition can drift from behavior; this cannot.
+#[tokio::test]
+async fn scout_activation_makes_grep_files_dispatchable() {
+    let tmp = tempdir().expect("tempdir");
+    let mut runtime =
+        stub_runtime().with_agent_tool_surface_options(enabled_agent_surface_options());
+    runtime.context = ToolContext::new(tmp.path().to_path_buf());
+    let todo_list = crate::tools::todo::new_shared_todo_list();
+    let plan_state = crate::tools::plan::new_shared_plan_state();
+    let registry = SubAgentToolRegistry::new(
+        runtime,
+        FleetRole::Scout,
+        Some(vec!["File".to_string()]),
+        todo_list,
+        plan_state,
+    );
+    // Mirror the spawn loop: filtered catalog, then a cold surface.
+    let mut surface =
+        SubAgentToolSurface::new(registry.deferred_catalog_for_model(&FleetRole::Scout), &[]);
+
+    let active_names: std::collections::HashSet<String> = surface.active_names.clone();
+    let file_error = registry
+        .execute_from_surface(
+            "agent_unknown",
+            "",
+            &mut surface,
+            &active_names,
+            "File",
+            serde_json::json!({"action": "search_content", "path": "."}),
+        )
+        .await
+        .expect_err("the hidden File alias must fail the scout catalog gate");
+    assert!(
+        file_error
+            .to_string()
+            .contains("not in this child's policy-filtered catalog"),
+        "{file_error}"
+    );
+
+    let active_names: std::collections::HashSet<String> = surface.active_names.clone();
+    registry
+        .execute_from_surface(
+            "agent_unknown",
+            "",
+            &mut surface,
+            &active_names,
+            "tool_search",
+            serde_json::json!({"query": "grep_files"}),
+        )
+        .await
+        .expect("tool_search activation must succeed on the scout surface");
+    assert!(
+        surface.active_names.contains("grep_files"),
+        "activation must admit grep_files into the same surface the dispatch gate reads"
+    );
+
+    let active_names: std::collections::HashSet<String> = surface.active_names.clone();
+    registry
+        .execute_from_surface(
+            "agent_unknown",
+            "",
+            &mut surface,
+            &active_names,
+            "grep_files",
+            serde_json::json!({
+                "path": ".",
+                "pattern": "stopship",
+                "max_results": 5,
+                "context_lines": 1
+            }),
+        )
+        .await
+        .expect("grep_files must dispatch through the real tool after the taught activation");
 }
 
 #[test]
@@ -25830,4 +26287,61 @@ async fn late_launch_permit_still_gets_the_full_work_budget() {
         saved_deadline_ms >= spawned_at_ms + hold_ms + wall_ms,
         "saved deadline {saved_deadline_ms} must start from launch, not spawn ({spawned_at_ms})"
     );
+}
+
+#[tokio::test]
+async fn computer_use_consent_is_denied_in_child_gate_every_mode() {
+    let tmp = tempdir().expect("tempdir");
+    for (auto_approve, approval_mode) in [
+        (true, codewhale_execpolicy::ApprovalMode::Bypass),
+        (false, codewhale_execpolicy::ApprovalMode::Auto),
+        (false, codewhale_execpolicy::ApprovalMode::Suggest),
+        (false, codewhale_execpolicy::ApprovalMode::Never),
+    ] {
+        let mut runtime = stub_runtime();
+        runtime.context = ToolContext::new(tmp.path());
+        runtime.context.auto_approve = auto_approve;
+        runtime.context.execution.approval_mode = approval_mode;
+        runtime.worker_profile = WorkerRuntimeProfile::for_role(FleetRole::Worker);
+        let registry = SubAgentToolRegistry::new(
+            runtime,
+            FleetRole::Worker,
+            None,
+            crate::tools::todo::new_shared_todo_list(),
+            crate::tools::plan::new_shared_plan_state(),
+        );
+        for (name, input) in [
+            (
+                "mcp_codewhale-cu_consent",
+                json!({"action": "allow", "app": "Safari", "remember": true}),
+            ),
+            ("mcp_codewhale-cu_consent_allow", json!({"app": "Terminal"})),
+            (
+                "mcp_codewhale-cu_app_script",
+                json!({"script": "tell application \"Finder\" to activate"}),
+            ),
+            (
+                "mcp_codewhale-cu_computer_register",
+                json!({"computer": "box", "transport": "ssh", "host": "box.example"}),
+            ),
+            (
+                "mcp_codewhale-cu_run_actions",
+                json!({"steps": [{"tool": "codewhale-cu_consent_allow", "arguments": {"app": "Safari"}}]}),
+            ),
+        ] {
+            let verdict = registry
+                .gate_held_call(
+                    "agent_child",
+                    "call_1",
+                    name,
+                    &input,
+                    registry.registry.context(),
+                )
+                .await;
+            assert!(
+                matches!(verdict, ChildGateVerdict::Deny(ref reason) if reason.contains("own approval")),
+                "{approval_mode:?} {name}: {verdict:?}"
+            );
+        }
+    }
 }

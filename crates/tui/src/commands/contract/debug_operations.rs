@@ -73,8 +73,8 @@ impl CommandDebugHistoryContext for DebugOperationsAdapter<'_> {
         app.cursor_position = app.input.chars().count();
         app.edit_in_progress = true;
     }
-    fn undo_conversation(&mut self) -> usize {
-        undo_conversation(&mut self.host.app.borrow_mut())
+    fn undo_conversation(&mut self) -> DebugConversationUndo {
+        undo_conversation_for_engine(&mut self.host.app.borrow_mut())
     }
 }
 
@@ -111,43 +111,35 @@ impl CommandDebugDiffContext for DebugOperationsAdapter<'_> {
     }
 }
 
-/// Remove last message pair (user + assistant).
-///
-/// This is the old `/undo` behaviour — it removes the most recent
-/// user+assistant conversation pair from history and API messages.
-/// The new `/undo` first tries to revert workspace files via
-/// [`undo_files`]; if no snapshots are available it falls back to
-/// this function.
-pub(in crate::commands) fn undo_conversation(app: &mut App) -> usize {
-    // Remove from display history (up to the last user message)
-    let mut removed_count = 0;
-    while !app.history.is_empty() {
-        let last_is_user = matches!(app.history.last(), Some(HistoryCell::User { .. }));
-        app.pop_history();
-        removed_count += 1;
-        if last_is_user {
-            break;
-        }
+/// Prepare the rollback; the UI action owns Engine acknowledgement and save.
+/// The last real user boundary includes following tool results/runtime notes.
+pub(in crate::commands) fn undo_conversation_for_engine(app: &mut App) -> DebugConversationUndo {
+    let removed = app
+        .history
+        .iter()
+        .rposition(|cell| matches!(cell, HistoryCell::User { .. }))
+        .map_or(0, |index| app.history.len() - index);
+    let mut sync = session_sync_payload(app);
+    if let Some(index) = sync.messages.iter().rposition(|message| {
+        !matches!(
+            crate::runtime_handoff::classify_user_turn_prompt(message),
+            crate::runtime_handoff::UserTurnPromptKind::NotPrompt
+        )
+    }) {
+        sync.messages.truncate(index);
     }
+    DebugConversationUndo { removed, sync }
+}
 
-    // Remove from API messages
-    while let Some(last) = app.api_messages.last() {
-        if last.role == "user" {
-            app.pop_api_message();
-            break;
-        }
-        app.pop_api_message();
+fn session_sync_payload(app: &App) -> SessionSyncPayload {
+    SessionSyncPayload {
+        session_id: app.current_session_id.clone(),
+        messages: app.api_messages.as_ref().clone(),
+        system_prompt: app.system_prompt.clone(),
+        model: app.model.clone(),
+        workspace: app.workspace.clone(),
+        mode: super::to_command_mode(app.mode),
     }
-
-    if removed_count > 0 {
-        // Keep tool/index mappings consistent after truncation.
-        app.tool_cells.clear();
-        app.tool_details_by_cell.clear();
-        app.exploring_entries.clear();
-        app.ignored_tool_calls.clear();
-        app.mark_history_updated();
-    }
-    removed_count
 }
 
 pub(crate) fn prune_undone_tool_context(app: &mut App, tool_id: &str) {
@@ -505,7 +497,26 @@ const POST_TURN_SNAPSHOT_WAIT: std::time::Duration = std::time::Duration::from_s
 ///
 /// Posts a `HistoryCell::System` entry so the user can see what was
 /// reverted in the transcript.
+/// Why workspace files may not be rolled back right now, if they may not.
+///
+/// A running turn is reading and writing this workspace: restoring files
+/// under it discards the turn's in-flight work and leaves the model's view of
+/// the files wrong. `/undo` and `/restore` refuse while one is active, like
+/// the Runtime's restore routes.
+pub(in crate::commands) fn active_turn_restore_refusal(app: &App) -> Option<String> {
+    let turn_active = app.is_loading
+        || app.is_compacting
+        || matches!(app.runtime_turn_status.as_deref(), Some("in_progress"));
+    turn_active.then(|| {
+        "A turn is still running in this workspace, so files were not restored and nothing was changed. Wait for it to finish, or press Esc to stop it, then run the command again."
+            .to_string()
+    })
+}
+
 pub(in crate::commands) fn undo_files(app: &mut App) -> DebugUndoOutcome {
+    if let Some(refusal) = active_turn_restore_refusal(app) {
+        return DebugUndoOutcome::RestoreBlocked(refusal);
+    }
     let workspace = app.workspace.clone();
 
     let repo = match crate::snapshot::SnapshotRepo::open_or_init(&workspace) {
@@ -634,13 +645,6 @@ pub(in crate::commands) fn undo_files(app: &mut App) -> DebugUndoOutcome {
             })
             .collect(),
         skipped: step.skipped,
-        sync: SessionSyncPayload {
-            session_id: app.current_session_id.clone(),
-            messages: app.api_messages.as_ref().clone(),
-            system_prompt: app.system_prompt.clone(),
-            model: app.model.clone(),
-            workspace: app.workspace.clone(),
-            mode: super::to_command_mode(app.mode),
-        },
+        sync: session_sync_payload(app),
     })
 }

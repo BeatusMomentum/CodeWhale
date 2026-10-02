@@ -24,8 +24,8 @@ use windows::Win32::Foundation::{CloseHandle, HANDLE};
 #[cfg(windows)]
 use windows::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
-    SetInformationJobObject, TerminateJobObject,
+    JOB_OBJECT_LIMIT_PROCESS_MEMORY, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+    JobObjectExtendedLimitInformation, SetInformationJobObject, TerminateJobObject,
 };
 #[cfg(windows)]
 use windows::core::PCWSTR;
@@ -131,6 +131,14 @@ impl ProcessTree {
 }
 
 impl ProcessTree {
+    /// Windows: cap the committed memory of every process in the job at
+    /// `bytes` each (`JOB_OBJECT_LIMIT_PROCESS_MEMORY`); an allocation past
+    /// it fails. Kill-on-close stays set. The extension host's memory cap.
+    #[cfg(windows)]
+    pub(crate) fn limit_process_memory(&self, bytes: u64) -> std::io::Result<()> {
+        self.job.limit_process_memory(bytes)
+    }
+
     /// Give up containment without killing anything: the tree outlives the
     /// guard. For a command that exited on its own and may have deliberately
     /// left something running.
@@ -402,6 +410,23 @@ impl WindowsJob {
             AssignProcessToJobObject(job.handle, HANDLE(child)).map_err(windows_io_error)?;
         }
         Ok(job)
+    }
+
+    fn limit_process_memory(&self, bytes: u64) -> std::io::Result<()> {
+        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        limits.BasicLimitInformation.LimitFlags =
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_PROCESS_MEMORY;
+        limits.ProcessMemoryLimit = usize::try_from(bytes).unwrap_or(usize::MAX);
+        // SAFETY: `limits` is live with matching size; the handle is live.
+        unsafe {
+            SetInformationJobObject(
+                self.handle,
+                JobObjectExtendedLimitInformation,
+                &limits as *const _ as *const core::ffi::c_void,
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            )
+            .map_err(windows_io_error)
+        }
     }
 
     fn clear_kill_on_close(&self) -> std::io::Result<()> {

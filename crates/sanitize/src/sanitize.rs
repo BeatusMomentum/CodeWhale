@@ -173,27 +173,7 @@ pub fn redact_url_for_display(url: &str) -> String {
 }
 
 fn is_sensitive_url_query_key(key: &str) -> bool {
-    let normalized = key.trim().replace(['-', '.'], "_").to_ascii_lowercase();
-    matches!(
-        normalized.as_str(),
-        "api_key"
-            | "apikey"
-            | "access_token"
-            | "auth_token"
-            | "authorization"
-            | "bearer"
-            | "client_secret"
-            | "credential"
-            | "id_token"
-            | "password"
-            | "refresh_token"
-            | "secret"
-            | "token"
-    ) || normalized.ends_with("_api_key")
-        || normalized.ends_with("_authorization")
-        || normalized.ends_with("_password")
-        || normalized.ends_with("_secret")
-        || normalized.ends_with("_token")
+    is_sensitive_key_name(key)
 }
 
 /// True when `role` names an internal, non-user-visible message role.
@@ -204,32 +184,84 @@ pub fn is_internal_role(role: &str) -> bool {
     )
 }
 
-/// True when a JSON/assignment key names a credential-bearing value.
-///
-/// Classification normalizes separators and quotes so obfuscated variants are
-/// still caught; the vocabulary is shared with `/structcopy`.
+/// Credential names shared by config, URL and JSON output checks.
+const SENSITIVE_KEY_NAMES: &[&str] = &[
+    "access_key",
+    "access_token",
+    "api_key",
+    "api_keys",
+    "apikey",
+    "auth_token",
+    "authorization",
+    "bearer",
+    "client_secret",
+    "cookie",
+    "credential",
+    "credentials",
+    "id_token",
+    "passwd",
+    "password",
+    "passwords",
+    "private_key",
+    "proxy_authorization",
+    "refresh_token",
+    "secret",
+    "secrets",
+    "session_key",
+    "set_cookie",
+    "sas",
+    "token",
+    "tokens",
+];
+
+/// Use the existing text redactor's identifier normalization, including
+/// camelCase and acronym boundaries, instead of maintaining another parser.
+#[must_use]
+pub fn normalize_key(key: &str) -> String {
+    crate::redact::normalize_sensitive_key(key)
+}
+
+fn key_spellings(key: &str) -> [String; 2] {
+    [normalize_key(key), normalize_key(&key.to_ascii_lowercase())]
+}
+
+/// Precise credential check for settings, headers and flags. Usage settings
+/// such as max_tokens and token_budget remain visible.
+#[must_use]
+pub fn is_sensitive_key_name(key: &str) -> bool {
+    key_spellings(key).iter().any(|normalized| {
+        SENSITIVE_KEY_NAMES.contains(&normalized.as_str())
+            || ["_authorization", "_cookie", "_passwd", "_password", "_secret", "_token"]
+                .iter().any(|suffix| normalized.ends_with(suffix))
+            // Retain config's subscription-key and custom key protection.
+            || (normalized.ends_with("_key")
+                && !matches!(normalized.as_str(), "public_key" | "endpoint_key"))
+    })
+}
+
+/// Broad export check; model-bound text keeps its existing credential-shaped
+/// policy in redact.rs. One shared normalization handles every spelling.
+#[must_use]
 pub fn is_sensitive_key(key: &str) -> bool {
-    let normalized = key
-        .trim()
-        .trim_matches(['\'', '"'])
-        .replace(['-', '.', ' '], "_")
-        .to_ascii_lowercase();
-    [
-        "api_key",
-        "apikey",
-        "secret",
-        "token",
-        "password",
-        "passwd",
-        "authorization",
-        "access_key",
-        "client_secret",
-        "private_key",
-        "cookie",
-        "session_key",
-    ]
-    .iter()
-    .any(|hint| normalized.contains(hint))
+    is_sensitive_key_name(key)
+        || key_spellings(key).iter().any(|normalized| {
+            [
+                "api_key",
+                "apikey",
+                "secret",
+                "token",
+                "password",
+                "passwd",
+                "authorization",
+                "access_key",
+                "client_secret",
+                "private_key",
+                "cookie",
+                "session_key",
+            ]
+            .iter()
+            .any(|hint| normalized.contains(hint))
+        })
 }
 
 /// Sanitize arbitrary text for safe export output.
@@ -252,6 +284,29 @@ pub fn sanitize_text(input: &str) -> String {
         redact_url_match(captures.get(0).map_or("", |value| value.as_str()))
     });
     redact_secrets(&urls)
+}
+
+/// Whether an arbitrary value carries material the shared redactor masks.
+/// Formatting-only changes (URL canonicalization, newlines, ANSI) do not make
+/// a harmless config value a credential.
+#[must_use]
+pub fn contains_secret(input: &str) -> bool {
+    let mut visible = String::with_capacity(input.len());
+    strip_ansi_into(input, &mut visible);
+    private_key_regex().is_match(&visible)
+        || bearer_regex().is_match(&visible)
+        || jwt_regex().is_match(&visible)
+        || redact_secrets(&visible) != visible
+        || url_regex().find_iter(&visible).any(|matched| {
+            let raw = matched.as_str().trim_end_matches(['.', ',', ';', '!']);
+            url::Url::parse(raw).is_ok_and(|url| {
+                !url.username().is_empty()
+                    || url.password().is_some()
+                    || url
+                        .query_pairs()
+                        .any(|(key, _)| is_sensitive_url_query_key(&key))
+            })
+        })
 }
 
 /// Recursively redact a JSON value.
@@ -330,6 +385,68 @@ fn url_regex() -> &'static Regex {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_vocabulary_redacts_camel_case_and_keeps_safe_key_names() {
+        for key in [
+            "accessToken",
+            "clientSecret",
+            "privateKey",
+            "refreshToken",
+            "APIKey",
+            "X-API-Key",
+            "sessionKey",
+            "oauth2Token",
+            "aUtHoRiZaTiOn",
+            "Ocp-Apim-Subscription-Key",
+            "Set-Cookie",
+            "sas",
+        ] {
+            assert!(is_sensitive_key_name(key), "{key}");
+            let mut value = serde_json::json!({key: "s10-synthetic-value"});
+            redact_json(&mut value, None);
+            assert!(!value.to_string().contains("s10-synthetic-value"), "{key}");
+        }
+        for key in [
+            "max_tokens",
+            "token_budget",
+            "maxTokens",
+            "api_key_source",
+            "authMode",
+            "publicKey",
+            "endpoint_key",
+            "monkey",
+        ] {
+            assert!(!is_sensitive_key_name(key), "{key}");
+        }
+        assert_eq!(normalize_key("APIKey"), "api_key");
+    }
+
+    #[test]
+    fn shared_secret_detection_preserves_formatting_only_config_values() {
+        for safe in [
+            "https://api.example.com",
+            "https://api.example.com/v1?team=core",
+            "https://api.example.com/?tokenBudget=5",
+            "normal text",
+            "max tokens = 8192",
+            "tokenCount = 4",
+        ] {
+            assert!(!contains_secret(safe), "safe value classified as secret");
+        }
+        for secret in [
+            "clientSecret=opaque-value",
+            "https://alice:opaque-value@example.com",
+            "https://example.com/?privateKey=opaque-value",
+            "https://example.com/?sas=opaque-value",
+        ] {
+            assert!(contains_secret(secret), "credential not classified");
+        }
+        assert_ne!(
+            sanitize_text("https://api.example.com"),
+            "https://api.example.com"
+        );
+    }
 
     #[test]
     fn strip_ansi_removes_control_sequences_but_keeps_text() {

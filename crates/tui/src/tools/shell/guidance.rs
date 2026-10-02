@@ -73,21 +73,36 @@ pub(super) fn command_guidance(kind: &ShellKind) -> String {
 }
 
 pub(super) fn runtime_command_guidance() -> &'static str {
+    // A conformance replay of a recorded host names that host's shell, not
+    // whichever shell first initialized this process-wide cache (#6698).
+    #[cfg(all(test, unix))]
+    if let Some(binary) = crate::prompts::recorded_shell() {
+        let kind = ShellKind::Custom {
+            binary,
+            flag: "-c".to_string(),
+        };
+        return Box::leak(command_guidance(&kind).into_boxed_str());
+    }
     static GUIDANCE: OnceLock<String> = OnceLock::new();
     GUIDANCE.get_or_init(|| command_guidance(global_dispatcher().kind()))
 }
 
-pub(super) fn description() -> &'static str {
-    static DESCRIPTION: OnceLock<String> = OnceLock::new();
-    DESCRIPTION.get_or_init(|| {
-        format!(
-            "{} Execute in the workspace. Action \"run\" (default) executes a command; \
+fn render_description(guidance: &str) -> String {
+    format!(
+        "{guidance} Execute in the workspace. Action \"run\" (default) executes a command; \
          \"wait\" blocks for a background task until completion or timeout; \"interact\" sends stdin to a background task; \
          \"cancel\" kills a background task. Pass wait=false for a nonblocking task snapshot. Foreground mode is for bounded commands; \
-         use background=true for work expected to take >5 seconds.",
-            runtime_command_guidance()
-        )
-    })
+         use background=true for work expected to take >5 seconds."
+    )
+}
+
+pub(super) fn description() -> &'static str {
+    #[cfg(all(test, unix))]
+    if crate::prompts::recorded_shell().is_some() {
+        return Box::leak(render_description(runtime_command_guidance()).into_boxed_str());
+    }
+    static DESCRIPTION: OnceLock<String> = OnceLock::new();
+    DESCRIPTION.get_or_init(|| render_description(runtime_command_guidance()))
 }
 
 // Interpreter syntax lives on the command parameter. Repeating it in the

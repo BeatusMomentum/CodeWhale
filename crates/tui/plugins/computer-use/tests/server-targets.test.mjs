@@ -1,6 +1,7 @@
 // Target-pipeline tests: real MCP server over stdio with an injected fake
 // backend (CODEWHALE_CU_TEST_BACKEND) so raster math and element
 // revalidation can be asserted against the exact args the backend receives.
+import { hostKeysLine, attest, attestParams } from "./fixtures/host-decision.mjs";
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
@@ -27,14 +28,14 @@ function rpc(method, params, timeoutMs = 30_000) {
   return new Promise((resolve, reject) => {
     const t = setTimeout(() => { pending.delete(id); reject(new Error(`timeout: ${method}`)); }, timeoutMs);
     pending.set(id, (msg) => { clearTimeout(t); resolve(msg); });
-    server.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n");
+    server.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method, params: attestParams(method, params) }) + "\n");
   });
 }
 
 function rpcId(method, params) {
   const id = nextId++;
   const p = new Promise((resolve) => pending.set(id, resolve));
-  server.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n");
+  server.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method, params: attestParams(method, params) }) + "\n");
   return { id, p };
 }
 
@@ -71,6 +72,7 @@ before(async () => {
     },
     stdio: ["pipe", "pipe", "pipe"],
   });
+  server.stdin.write(hostKeysLine());
   server.stderr.on("data", (d) => process.stderr.write(`[server] ${d}`));
   server.stdout.setEncoding("utf8");
   server.stdout.on("data", (d) => {

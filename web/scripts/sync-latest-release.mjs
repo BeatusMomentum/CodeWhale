@@ -31,9 +31,14 @@
 // one release behind a release published under 24h ago: that is the window in
 // which release.yml's sync-release-record PR is waiting to merge, and neither a
 // PR author nor an unrelated push to main can fix it. Past 24h, or more than one
-// release behind, it fails again.
+// release behind, it fails again. An unreachable or failing GitHub API fails
+// --check too: "could not look" is not "current".
+//
+// A write validates all three files first and then replaces each one through a
+// unique temporary file and a rename, so a bad mirror never leaves the first
+// file moved on its own and a crash never leaves a half-written JSON file.
 
-import { readFileSync, writeFileSync } from "node:fs";
+import { readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
 
@@ -51,12 +56,18 @@ const headers = {
 };
 if (process.env.GITHUB_TOKEN) headers.authorization = `Bearer ${process.env.GITHUB_TOKEN}`;
 
-const response = await fetch(`https://api.github.com/repos/${REPO}/releases/latest`, { headers });
-if (!response.ok) {
-  console.error(`[sync-latest-release] GitHub returned ${response.status}; leaving the file alone.`);
-  process.exit(checkOnly ? 0 : 1);
+let release;
+try {
+  const response = await fetch(`https://api.github.com/repos/${REPO}/releases/latest`, {
+    headers,
+    signal: AbortSignal.timeout(30_000),
+  });
+  if (!response.ok) throw new Error(`GitHub returned ${response.status}`);
+  release = await response.json();
+} catch (error) {
+  console.error(`[sync-latest-release] could not read the latest release (${error.message}); leaving the files alone.`);
+  process.exit(1);
 }
-const release = await response.json();
 
 const tag = String(release.tag_name || "");
 const version = tag.startsWith("v") ? tag.slice(1) : "";
@@ -95,7 +106,10 @@ async function isFreshlyOneBehind(recordedTag) {
   const age = Date.now() - Date.parse(next.publishedAt);
   if (!recordedTag || !(age >= 0 && age < GRACE_MS)) return false;
   try {
-    const res = await fetch(`https://api.github.com/repos/${REPO}/releases?per_page=20`, { headers });
+    const res = await fetch(`https://api.github.com/repos/${REPO}/releases?per_page=20`, {
+      headers,
+      signal: AbortSignal.timeout(30_000),
+    });
     if (!res.ok) return false;
     const tags = (await res.json())
       .filter((r) => !r.draft && !r.prerelease && Number.isFinite(Date.parse(r.published_at)))
@@ -138,26 +152,38 @@ if (checkOnly) {
   process.exit(1);
 }
 
-writeFileSync(target, `${JSON.stringify(next, null, 2)}\n`);
-
+// Every input must be usable before anything moves: the three files change
+// together or not at all.
 if (!matrix) {
-  console.error(`[sync-latest-release] could not read ${mirror}; the mirror is now stale.`);
+  console.error(`[sync-latest-release] could not read ${mirror}; nothing was written.`);
+  process.exit(1);
+}
+// stable.json is the unsigned cloud-facts authoring source; only the two
+// release pointers move here. yanked/min_supported/notice stay human calls.
+if (!cloud?.release || typeof cloud.release !== "object") {
+  console.error(`[sync-latest-release] could not read release in ${cloudFacts}; nothing was written.`);
   process.exit(1);
 }
 
 // Preserve every key the matrix carries beyond the four synced fields (notably
 // `sources`), so this stays a fact refresh and not a schema rewrite.
 matrix.latestPublishedRelease = { ...currentMirror, ...next };
-writeFileSync(mirror, `${JSON.stringify(matrix, null, 2)}\n`);
-
-// stable.json is the unsigned cloud-facts authoring source; only the two
-// release pointers move here. yanked/min_supported/notice stay human calls.
-if (!cloud?.release) {
-  console.error(`[sync-latest-release] could not read release in ${cloudFacts}; it is now stale.`);
-  process.exit(1);
-}
 cloud.release.latest = next.version;
 cloud.release.release_url = next.url;
-writeFileSync(cloudFacts, `${JSON.stringify(cloud, null, 2)}\n`);
+
+const staged = [
+  [target, next],
+  [mirror, matrix],
+  [cloudFacts, cloud],
+].map(([path, value]) => {
+  const temporary = `${path}.${process.pid}.${Date.now()}.tmp`;
+  writeFileSync(temporary, `${JSON.stringify(value, null, 2)}\n`, { flag: "wx" });
+  return [temporary, path];
+});
+try {
+  for (const [temporary, path] of staged) renameSync(temporary, path);
+} finally {
+  for (const [temporary] of staged) rmSync(temporary, { force: true });
+}
 
 console.log(`[sync-latest-release] wrote ${next.tag} (${next.publishedAt}) to all three facts`);

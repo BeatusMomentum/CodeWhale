@@ -12,25 +12,32 @@ use super::*;
 /// when the turn is busy. A dropped refresh is safe: the next turn rebuilds
 /// its compaction config from `App`, and the status message tells the user
 /// whether the update was queued or deferred.
+///
+/// The model and its compaction budget are one route update: both mailbox
+/// slots are reserved before either op is sent, so a full mailbox defers the
+/// whole update instead of applying the model without its budget (U03-05).
 pub(crate) fn try_apply_model_and_compaction_update(
     engine_handle: &EngineHandle,
     compaction: crate::compaction::CompactionConfig,
     mode: AppMode,
     route_limits: Option<codewhale_config::route::RouteLimits>,
 ) -> bool {
-    if engine_handle
-        .try_send(Op::SetModel {
+    let Ok(model_permit) = engine_handle.tx_op.clone().try_reserve_owned() else {
+        return false;
+    };
+    let Ok(compaction_permit) = engine_handle.tx_op.clone().try_reserve_owned() else {
+        return false;
+    };
+    engine_handle.send_reserved_op(
+        model_permit,
+        Op::SetModel {
             model: compaction.model.clone(),
             mode,
             route_limits,
-        })
-        .is_err()
-    {
-        return false;
-    }
-    engine_handle
-        .try_send(Op::SetCompaction { config: compaction })
-        .is_ok()
+        },
+    );
+    engine_handle.send_reserved_op(compaction_permit, Op::SetCompaction { config: compaction });
+    true
 }
 
 pub(crate) fn set_explicit_compaction_status(
@@ -571,5 +578,39 @@ mod config_update_tests {
             mock.rx_op.recv().await,
             Some(Op::SetCompaction { config }) if config == compaction
         ));
+    }
+
+    /// U03-05: with room for only one op, neither half of the route update
+    /// is queued; a model without its compaction budget is a half-applied
+    /// route with nothing to roll it back.
+    #[tokio::test]
+    async fn live_compaction_update_is_all_or_nothing_when_one_slot_is_free() {
+        let mut mock = mock_engine_handle();
+        let mut fillers = 0;
+        while mock.handle.tx_op.capacity() > 1 {
+            mock.handle
+                .try_send(Op::ListSubAgents)
+                .expect("filler op fits");
+            fillers += 1;
+        }
+        let compaction = crate::compaction::CompactionConfig {
+            model: "deepseek-v4-flash".to_string(),
+            ..crate::compaction::CompactionConfig::default()
+        };
+
+        assert!(!try_apply_model_and_compaction_update(
+            &mock.handle,
+            compaction,
+            AppMode::Agent,
+            None,
+        ));
+
+        for _ in 0..fillers {
+            assert!(matches!(mock.rx_op.try_recv(), Ok(Op::ListSubAgents)));
+        }
+        assert!(
+            mock.rx_op.try_recv().is_err(),
+            "no half of the route update may be queued"
+        );
     }
 }

@@ -1814,9 +1814,21 @@ pub fn analyze_command(command: &str) -> SafetyAnalysis {
 
     // Check for dangerous patterns first. The token-aware pass above handles
     // spacing and quoting variants; these literal patterns remain as a compact
-    // fallback for legacy shapes.
+    // fallback for legacy shapes. Only a single literal rm invocation may
+    // treat `rm -rf /some/path` as a path instead of this legacy root match.
+    // Opaque code such as Python's system("rm -rf /etc") was held by this
+    // fallback before workspace cleanup was exempted; keep that protection.
     for (pattern, reason) in DANGEROUS_PATTERNS {
-        if command_lower.contains(&pattern.to_lowercase()) {
+        let pattern = pattern.to_lowercase();
+        if command_lower.match_indices(&pattern).any(|(at, _)| {
+            command_lower[at + pattern.len()..]
+                .chars()
+                .next()
+                .is_none_or(|next| {
+                    !(next.is_alphanumeric() || matches!(next, '_' | '-' | '.' | '/'))
+                })
+                || (pattern == "rm -rf /" && !is_literal_rm_invocation(command))
+        }) {
             return SafetyAnalysis::dangerous(
                 command,
                 vec![(*reason).to_string()],
@@ -2035,6 +2047,55 @@ fn shell_words(segment: &str) -> Vec<String> {
             .map(|token| token.trim_matches(['"', '\'']).to_string())
             .collect()
     })
+}
+
+/// Whether this is one direct, literal rm invocation. Only that shape may
+/// clear an existing workspace path: commands run earlier can replace an
+/// ancestor, and wrappers such as sudo --chroot can reinterpret absolute paths.
+/// Reuse the shell expander to reject composition, dynamic words and redirects.
+pub fn is_literal_rm_invocation(command: &str) -> bool {
+    let expansion = crate::shell_expand::expand_command(command);
+    if expansion.control || expansion.dynamic || expansion.arguments_dynamic || expansion.redirects
+    {
+        return false;
+    }
+    shlex::split(command)
+        .and_then(|tokens| tokens.first().map(|token| command_word(token) == "rm"))
+        .unwrap_or(false)
+}
+
+/// Every argv that could run as a command somewhere in `command`: each stage
+/// (`;`, `&&`, `||`, `|`), started at *every* word of it — so no wrapper's
+/// options (`sudo -u me`, `timeout -s KILL 60`, `xargs -0`) can hide the
+/// command behind them — and the same again inside any word that is itself a
+/// command line (`sh -c '…'`). The first word of each argv is folded to its
+/// command name (`/bin/rm`, `\rm` → `rm`).
+///
+/// Deliberately over-inclusive (`echo rm -rf /etc` yields an `rm` argv too):
+/// callers use it to *hold* catastrophic commands, never to allow anything.
+/// `None` when words nest deeper than `MAX_WRAPPER_DEPTH`: fail closed.
+pub fn command_invocations(command: &str) -> Option<Vec<Vec<String>>> {
+    fn collect(command: &str, depth: usize, out: &mut Vec<Vec<String>>) -> bool {
+        if depth > MAX_WRAPPER_DEPTH {
+            return false;
+        }
+        for segment in split_command_segments(command) {
+            let words = shell_words(&segment);
+            for (index, word) in words.iter().enumerate() {
+                let mut argv = words[index..].to_vec();
+                argv[0] = command_word(word);
+                out.push(argv);
+                if word.contains(|ch: char| ch.is_whitespace() || matches!(ch, ';' | '&' | '|'))
+                    && !collect(word, depth + 1, out)
+                {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+    let mut out = Vec::new();
+    collect(command, 0, &mut out).then_some(out)
 }
 
 /// How many wrappers (`sudo env nice sh -c ...`) the classifier will peel
@@ -2790,6 +2851,90 @@ mod destructive_composition_tests {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn literal_dangerous_patterns_must_not_run_on_into_a_longer_path() {
+        for command in [
+            "rm -rf /",
+            "rm -rf /*",
+            "rm -rf / ",
+            "rm -rf /;ls",
+            "rm -rf ~",
+        ] {
+            assert_eq!(
+                analyze_command(command).level,
+                SafetyLevel::Dangerous,
+                "{command}"
+            );
+        }
+        assert_ne!(
+            analyze_command("rm -rf /home/me/project/build").level,
+            SafetyLevel::Dangerous
+        );
+    }
+
+    #[test]
+    fn opaque_absolute_deletes_keep_the_legacy_literal_hold() {
+        for command in [
+            r#"python3 -c '__import__("os").system("rm -rf /etc")'"#,
+            r#"perl -e 'system("rm -rf /etc")'"#,
+        ] {
+            assert_eq!(
+                analyze_command(command).level,
+                SafetyLevel::Dangerous,
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn literal_rm_clearance_excludes_prior_effects_and_dynamic_targets() {
+        for command in [
+            "rm -rf target build node_modules",
+            "/bin/rm -r -f /workspace/build",
+        ] {
+            assert!(is_literal_rm_invocation(command), "{command}");
+        }
+        for command in [
+            "mv build saved && rm -rf /workspace/build",
+            "sudo --chroot=/other-root rm -rf /workspace/build",
+            "bash -c 'rm -rf /workspace/build'",
+            "bash -c 'mv build saved; rm -rf /workspace/build'",
+            "rm -rf /workspace/$(make_path)",
+            "rm -rf /workspace/$TARGET",
+            "rm -rf /workspace/build > output",
+            r#"python3 -c '__import__("os").system("rm -rf /workspace/build")'"#,
+        ] {
+            assert!(!is_literal_rm_invocation(command), "{command}");
+        }
+    }
+
+    #[test]
+    fn command_invocations_reach_past_wrapper_options_and_into_shell_payloads() {
+        let has_rm = |command: &str| {
+            command_invocations(command)
+                .expect("readable")
+                .iter()
+                .any(|argv| argv[0] == "rm" && argv.iter().any(|arg| arg == "/etc"))
+        };
+        for command in [
+            "sudo -u me rm -rf /etc",
+            "timeout -s KILL 60 rm -rf /etc",
+            "echo x | xargs rm -rf /etc",
+            "bash -lc 'cd /; rm -rf /etc'",
+            "\\rm -rf /etc",
+            "/usr/bin/rm -rf /etc",
+        ] {
+            assert!(has_rm(command), "{command}");
+        }
+        let nested = (0..=MAX_WRAPPER_DEPTH + 1).fold("rm -rf /etc".to_string(), |inner, _| {
+            format!("sh -c {}", shlex::try_quote(&inner).unwrap())
+        });
+        assert!(
+            command_invocations(&nested).is_none(),
+            "too deep fails closed"
+        );
+    }
     use super::*;
 
     #[test]

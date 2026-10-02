@@ -365,14 +365,15 @@ impl FanoutCard {
     }
 
     /// Update or insert a worker by id. Returns whether the visible state
-    /// changed and the card should be redrawn.
+    /// changed and the card should be redrawn. A settled worker is final: a
+    /// delayed envelope for it never reopens or re-settles the slot.
     pub fn upsert_worker(&mut self, agent_id: &str, status: AgentLifecycle) -> bool {
         if let Some(slot) = self
             .workers
             .iter_mut()
             .find(|s| s.agent_id == agent_id || s.worker_id == agent_id)
         {
-            if slot.agent_id == agent_id && slot.status == status {
+            if slot.status.is_terminal() || (slot.agent_id == agent_id && slot.status == status) {
                 return false;
             }
             slot.agent_id = agent_id.to_string();
@@ -390,7 +391,7 @@ impl FanoutCard {
     /// circle for the same unit of work.
     pub fn claim_pending_worker(&mut self, agent_id: &str, status: AgentLifecycle) -> bool {
         if let Some(slot) = self.workers.iter_mut().find(|s| s.agent_id == agent_id) {
-            if slot.status == status {
+            if slot.status.is_terminal() || slot.status == status {
                 return false;
             }
             slot.status = status;
@@ -443,33 +444,57 @@ impl FanoutCard {
         s
     }
 
+    /// Header plus dot grid, one glyph per worker. The grid never runs past
+    /// `width`: when it does not fit beside the header it wraps onto its own
+    /// rows, so no worker's state is clipped off the transcript edge.
     #[must_use]
-    pub fn render_lines(&self, _width: u16, theme: &palette::UiTheme) -> Vec<Line<'static>> {
+    pub fn render_lines(&self, width: u16, theme: &palette::UiTheme) -> Vec<Line<'static>> {
         let header_status = self.aggregate_status();
         let count = self.workers.len();
         let count_label = if count == 1 { "agent" } else { "agents" };
-        vec![Line::from(vec![
-            Span::styled(
-                family_glyph(ToolFamily::Fanout),
+        let glyph = family_glyph(ToolFamily::Fanout);
+        let count_text = format!("{count} {count_label}");
+        let grid_style = Style::default()
+            .fg(codewhale_palette::grammar::ChromeInk::Metadata.color(theme))
+            .add_modifier(Modifier::BOLD);
+        // Every span fits the painted width, down to zero columns (U05-m6):
+        // the glyph only when it fits, the count only with room after it.
+        let width = usize::from(width);
+        let glyph_width = UnicodeWidthStr::width(glyph);
+        let mut header = Vec::new();
+        if width >= glyph_width {
+            header.push(Span::styled(
+                glyph,
                 Style::default()
                     .fg(header_status.color(theme))
                     .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" "),
-            Span::styled(
-                format!("{count} {count_label}"),
+            ));
+        }
+        if width > glyph_width + 1 {
+            header.push(Span::raw(" "));
+            header.push(Span::styled(
+                truncate_action(&count_text, width - glyph_width - 1),
                 Style::default()
                     .fg(codewhale_palette::grammar::ChromeInk::Identity.color(theme))
                     .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" "),
-            Span::styled(
-                self.dot_grid(),
-                Style::default()
-                    .fg(codewhale_palette::grammar::ChromeInk::Metadata.color(theme))
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ])]
+            ));
+        }
+        if width == 0 {
+            return vec![Line::from(header)];
+        }
+        let grid: Vec<char> = self.dot_grid().chars().collect();
+        let header_width = glyph_width + 1 + count_text.width() + 1;
+        if header_width + grid.len() <= width {
+            header.push(Span::raw(" "));
+            header.push(Span::styled(grid.iter().collect::<String>(), grid_style));
+            return vec![Line::from(header)];
+        }
+        let mut lines = vec![Line::from(header)];
+        lines.extend(
+            grid.chunks(width)
+                .map(|row| Line::from(Span::styled(row.iter().collect::<String>(), grid_style))),
+        );
+        lines
     }
 
     fn aggregate_status(&self) -> AgentLifecycle {
@@ -477,22 +502,25 @@ impl FanoutCard {
     }
 
     /// Public aggregate lifecycle for the activity shelf and other projectors.
+    ///
+    /// A settled fanout reports its worst outcome: one failed worker among
+    /// finished ones is a failed fanout, not a completed one; an
+    /// interrupted or cancelled worker likewise outranks the completions.
     #[must_use]
     pub fn aggregate_status_public(&self) -> AgentLifecycle {
-        let (done, running, failed, pending) = self.counts();
+        let (done, running, _, pending) = self.counts();
+        let any = |status: AgentLifecycle| self.workers.iter().any(|slot| slot.status == status);
         if running > 0 {
             AgentLifecycle::Running
         } else if pending > 0 {
             // Pending workers wait — amber attention, not "running" teal.
             AgentLifecycle::Pending
-        } else if self
-            .workers
-            .iter()
-            .any(|slot| matches!(slot.status, AgentLifecycle::Interrupted))
-        {
-            AgentLifecycle::Interrupted
-        } else if failed > 0 && done == 0 {
+        } else if any(AgentLifecycle::Failed) {
             AgentLifecycle::Failed
+        } else if any(AgentLifecycle::Interrupted) {
+            AgentLifecycle::Interrupted
+        } else if any(AgentLifecycle::Cancelled) {
+            AgentLifecycle::Cancelled
         } else if done > 0 {
             AgentLifecycle::Completed
         } else {
@@ -559,6 +587,25 @@ pub fn apply_to_delegate(card: &mut DelegateCard, msg: &MailboxMessage) -> bool 
         return false;
     }
     let was_terminal = card.status.is_terminal();
+    // A settled agent is final. Mailbox producers are concurrent (a tool
+    // task can outlive its agent), so a Started/Progress/tool envelope may
+    // land after the terminal one; it must not reopen the card, stretch its
+    // elapsed time, or rewrite its outcome. Only the child's own Work
+    // snapshot still applies (it keeps the terminal status), and a late
+    // `Started` may still name the role of a card that a completion-first
+    // delivery opened with the `unknown` placeholder — identity, not state.
+    if was_terminal {
+        if let MailboxMessage::Started { agent_type, .. } = msg
+            && card.agent_type == "unknown"
+            && agent_type != "unknown"
+        {
+            card.agent_type = agent_type.clone();
+            return true;
+        }
+        if !matches!(msg, MailboxMessage::WorkState { .. }) {
+            return false;
+        }
+    }
     if card.started_at.is_none()
         && matches!(
             msg,
@@ -1391,5 +1438,149 @@ mod tests {
         let joined = render_to_strings(&expanded).join("\n");
         assert!(joined.contains("result:"), "{joined}");
         assert!(joined.contains("mapped 4 call sites"), "{joined}");
+    }
+
+    /// U05-04: mailbox producers are concurrent, so a Started/Progress/tool
+    /// envelope can land after an agent's terminal one. It must not reopen
+    /// the card or its fanout slot, and must not move a settled count.
+    #[test]
+    fn late_envelopes_never_reopen_a_settled_agent() {
+        let role = || crate::tools::subagent::FleetRole::Worker;
+        let mut card = DelegateCard::new("agent_late", "general");
+        apply_to_delegate(&mut card, &MailboxMessage::started("agent_late", role()));
+        assert!(apply_to_delegate(
+            &mut card,
+            &MailboxMessage::Completed {
+                agent_id: "agent_late".into(),
+                summary: "done".into(),
+            },
+        ));
+        let finished_at = card.finished_at;
+        for late in [
+            MailboxMessage::started("agent_late", role()),
+            MailboxMessage::progress("agent_late", "step 4: reading files"),
+            MailboxMessage::ToolCallStarted {
+                agent_id: "agent_late".into(),
+                tool_name: "read_file".into(),
+                step: 4,
+            },
+            MailboxMessage::Failed {
+                agent_id: "agent_late".into(),
+                error: "late".into(),
+            },
+        ] {
+            assert!(!apply_to_delegate(&mut card, &late), "{late:?}");
+        }
+        assert_eq!(card.status, AgentLifecycle::Completed);
+        assert_eq!(card.summary.as_deref(), Some("done"));
+        assert_eq!(card.finished_at, finished_at);
+
+        // A completion-first recovery card may still learn its role from a
+        // late `Started`, but it stays settled.
+        let mut recovered = DelegateCard::new("agent_r", "unknown");
+        apply_to_delegate(
+            &mut recovered,
+            &MailboxMessage::Completed {
+                agent_id: "agent_r".into(),
+                summary: "done".into(),
+            },
+        );
+        assert!(apply_to_delegate(
+            &mut recovered,
+            &MailboxMessage::started("agent_r", role())
+        ));
+        assert_ne!(recovered.agent_type, "unknown");
+        assert_eq!(recovered.status, AgentLifecycle::Completed);
+
+        let mut fanout = FanoutCard::new("rlm");
+        for id in ["w_1", "w_2"] {
+            apply_to_fanout(
+                &mut fanout,
+                &MailboxMessage::ChildSpawned {
+                    parent_id: "root".into(),
+                    child_id: id.into(),
+                },
+            );
+            apply_to_fanout(&mut fanout, &MailboxMessage::started(id, role()));
+            apply_to_fanout(
+                &mut fanout,
+                &MailboxMessage::Completed {
+                    agent_id: id.into(),
+                    summary: "ok".into(),
+                },
+            );
+        }
+        assert!(!apply_to_fanout(
+            &mut fanout,
+            &MailboxMessage::progress("w_1", "step 9: late")
+        ));
+        assert!(!apply_to_fanout(
+            &mut fanout,
+            &MailboxMessage::started("w_2", role())
+        ));
+        assert_eq!(fanout.worker_count(), 2);
+        assert_eq!(fanout.counts(), (2, 0, 0, 0));
+        assert_eq!(fanout.aggregate_status_public(), AgentLifecycle::Completed);
+    }
+
+    /// U05-m2: a settled fanout headlines its worst outcome — one failure
+    /// among completions is a failed fanout, not a completed one.
+    #[test]
+    fn mixed_fanout_outcomes_never_aggregate_to_completed() {
+        let mut card = FanoutCard::new("rlm").with_workers(["w_1", "w_2", "w_3"]);
+        card.upsert_worker("w_1", AgentLifecycle::Completed);
+        card.upsert_worker("w_2", AgentLifecycle::Completed);
+        card.upsert_worker("w_3", AgentLifecycle::Failed);
+        assert_eq!(card.aggregate_status_public(), AgentLifecycle::Failed);
+
+        let mut card = FanoutCard::new("rlm").with_workers(["w_1", "w_2"]);
+        card.upsert_worker("w_1", AgentLifecycle::Completed);
+        card.upsert_worker("w_2", AgentLifecycle::Cancelled);
+        assert_eq!(card.aggregate_status_public(), AgentLifecycle::Cancelled);
+
+        let mut card = FanoutCard::new("rlm").with_workers(["w_1"]);
+        card.upsert_worker("w_1", AgentLifecycle::Completed);
+        assert_eq!(card.aggregate_status_public(), AgentLifecycle::Completed);
+    }
+
+    /// U05-m6: a wide fanout wraps its dot grid instead of running past the
+    /// transcript width, and every worker keeps its glyph.
+    #[test]
+    fn fanout_header_fits_zero_and_one_column_renders() {
+        let ids: Vec<String> = (0..5).map(|i| format!("w_{i}")).collect();
+        let card = FanoutCard::new("rlm").with_workers(ids.iter().cloned());
+        // Every width from nothing up past the header, including the ones
+        // where the count is truncated and the grid wraps.
+        for width in 0_u16..=16 {
+            let lines = render_to_strings(&card.render_lines(width, &codewhale_palette::UI_THEME));
+            assert!(!lines.is_empty(), "{width}");
+            for line in &lines {
+                assert!(
+                    UnicodeWidthStr::width(line.as_str()) <= usize::from(width),
+                    "{width}: {line:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fanout_grid_wraps_within_the_render_width() {
+        let ids: Vec<String> = (0..40).map(|i| format!("w_{i}")).collect();
+        let card = FanoutCard::new("rlm").with_workers(ids.iter().cloned());
+        for width in [12_u16, 20, 80] {
+            let lines = render_to_strings(&card.render_lines(width, &codewhale_palette::UI_THEME));
+            for line in &lines {
+                assert!(
+                    UnicodeWidthStr::width(line.as_str()) <= usize::from(width),
+                    "{width}: {line:?}"
+                );
+            }
+            let glyphs = lines
+                .join("")
+                .chars()
+                .filter(|ch| *ch == '\u{25CB}')
+                .count();
+            assert_eq!(glyphs, 40, "{width}: {lines:?}");
+        }
     }
 }

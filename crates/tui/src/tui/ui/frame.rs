@@ -949,7 +949,7 @@ pub(crate) fn build_engine_config(app: &App, config: &Config) -> EngineConfig {
         mcp_oauth_callback_port: config.mcp_oauth_callback_port,
         mcp_oauth_callback_url: config.mcp_oauth_callback_url.clone(),
         skills_dir: app.skills_dir.clone(),
-        skills_scan_codewhale_only: app.skills_scan_codewhale_only,
+        skills_discovery_mode: app.skills_discovery_mode,
         plugin_registry: Some(std::sync::Arc::clone(&app.plugin_registry)),
         instructions: configured_instruction_sources(config),
         project_context_pack_enabled: config.project_context_pack_enabled(),
@@ -1109,7 +1109,7 @@ pub(crate) fn build_app_system_prompt_with_goal(
             )),
             verbosity: app.verbosity.as_deref(),
             recovery_hint: recovery_hint.as_deref(),
-            skills_scan_codewhale_only: app.skills_scan_codewhale_only,
+            skills_discovery_mode: app.skills_discovery_mode,
             plugin_registry: Some(app.plugin_registry.as_ref()),
             mode: app.mode,
         },
@@ -2025,21 +2025,28 @@ pub(crate) fn draw_app_frame_inner(
     // whole viewport on every wrapped frame instead of deferring as the
     // standard requires). Settings::synchronized_output_enabled resolves
     // the user's setting against the Ptyxis env auto-detect.
-    let wrap_in_sync_update = app.synchronized_output_enabled;
-    if wrap_in_sync_update {
-        let _ = terminal.backend_mut().write_all(BEGIN_SYNC_UPDATE);
-    }
-
-    // Run fallible draw operations in a closure so END_SYNC_UPDATE is
-    // always sent even if an intermediate step fails. Without this, a
-    // failing `?` would return early and leave the terminal stuck in
-    // synchronized-update mode (screen frozen).
-    let result = (|| -> Result<()> {
+    let resized = app.viewport.pending_terminal_size.take();
+    let result = synchronized_frame(terminal, app.synchronized_output_enabled, |terminal| {
+        if let Some(size) = resized {
+            // Keep ratatui's resize clear in the same DEC 2026 transaction as
+            // the repaint. Inline mode rebuilds its fixed-height viewport.
+            let refit = if app.screen_mode == ScreenMode::Inline {
+                refit_inline_viewport(terminal, size)
+            } else {
+                terminal.resize(Rect::new(0, 0, size.width, size.height))
+            };
+            if let Err(err) = refit {
+                tracing::warn!(?err, "terminal resize failed; falling back to clear+draw");
+            }
+            // ConHost and Terminal.app can briefly report the previous size.
+            terminal.backend_mut().force_size(size);
+            terminal.backend_mut().set_terminal_size(size);
+        }
         // The terminal cursor itself is also input-method geometry. Hide it
         // before clear/diff operations move it, then restore the one composer
         // position after ratatui finishes drawing (#5023).
         prepare_frame_cursor(terminal)?;
-        if full_repaint {
+        if full_repaint || resized.is_some() {
             terminal.backend_mut().write_all(TERMINAL_ORIGIN_RESET)?;
             terminal.clear()?;
         }
@@ -2048,13 +2055,30 @@ pub(crate) fn draw_app_frame_inner(
         app.pet_watch.present(terminal.backend_mut())?;
         finish_frame_cursor(terminal, cursor_pos)?;
         Ok(())
-    })();
+    });
+    if resized.is_some() {
+        terminal.backend_mut().clear_forced_size();
+    }
+    result
+}
 
-    // Always end the synchronized update, regardless of success or failure.
-    if wrap_in_sync_update {
+/// End and flush the synchronized frame even when resizing or drawing fails.
+pub(super) fn synchronized_frame<B, T>(
+    terminal: &mut Terminal<B>,
+    enabled: bool,
+    draw: impl FnOnce(&mut Terminal<B>) -> Result<T>,
+) -> Result<T>
+where
+    B: ratatui::backend::Backend + Write,
+{
+    if enabled {
+        let _ = terminal.backend_mut().write_all(BEGIN_SYNC_UPDATE);
+    }
+    let result = draw(terminal);
+    if enabled {
         let _ = terminal.backend_mut().write_all(END_SYNC_UPDATE);
     }
-    let _ = terminal.backend_mut().flush();
+    let _ = std::io::Write::flush(terminal.backend_mut());
     result
 }
 

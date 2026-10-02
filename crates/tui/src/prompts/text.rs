@@ -221,7 +221,8 @@ Before deciding the goal is achieved, verify it against the actual current
 state — files, command output, tests, runtime behavior, issue or PR state, or
 other authoritative evidence — then call `update_goal` with
 `status: "complete"` and concise evidence. If something genuinely prevents
-progress, call `update_goal` with `status: "blocked"` and explain it.
+progress, call `update_goal` with `status: "blocked"` and explain it. If
+`update_goal` is not in your tool list, load it with `tool_search` first.
 "#;
 /// Memory hygiene guidance — appended to the system prompt only when the
 /// session has a non-empty user-memory block. Steers the model toward

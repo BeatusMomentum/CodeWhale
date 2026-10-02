@@ -4398,7 +4398,8 @@ mod tests {
         let _g = test_scope();
         report(
             scope_token(),
-            &BackgroundRoute::new(ApiProvider::OpenaiCodex, "gpt-5.5"),
+            &BackgroundRoute::new(ApiProvider::OpenaiCodex, "gpt-5.5")
+                .with_base_url(Some("https://chatgpt.com/backend-api/codex")),
             &small_usage(),
         );
         let drained = drain();

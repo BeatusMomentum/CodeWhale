@@ -89,7 +89,7 @@ pub(super) fn retry(contexts: CommandContexts<'_>, _: Option<&str>) -> CommandRe
     };
     match history.last_user_input() {
         Some(input) => {
-            history.undo_conversation();
+            let undone = history.undo_conversation();
             let display_input = if input.len() > 50 {
                 let truncate_at = input
                     .char_indices()
@@ -102,7 +102,10 @@ pub(super) fn retry(contexts: CommandContexts<'_>, _: Option<&str>) -> CommandRe
             };
             CommandResult::with_message_and_action(
                 format!("Retrying: {display_input}"),
-                DebugAction::SendMessage(input),
+                DebugAction::ConversationUndo {
+                    sync: undone.sync,
+                    retry_input: Some(input),
+                },
             )
         }
         None => CommandResult::error("No previous request to retry"),
@@ -149,9 +152,17 @@ pub(super) fn diff(contexts: CommandContexts<'_>, _: Option<&str>) -> CommandRes
     }
 }
 
-pub(in crate::commands) fn conversation_result(removed: usize) -> CommandResult {
-    if removed > 0 {
-        CommandResult::message(format!("Removed {removed} message(s)"))
+/// A conversation undo that removed anything hands the truncated conversation
+/// to the engine, which owns the model context (#6788).
+pub(in crate::commands) fn conversation_result(undone: DebugConversationUndo) -> CommandResult {
+    if undone.removed > 0 {
+        CommandResult::with_message_and_action(
+            format!("Removed {} message(s)", undone.removed),
+            DebugAction::ConversationUndo {
+                sync: undone.sync,
+                retry_input: None,
+            },
+        )
     } else {
         CommandResult::message("Nothing to undo")
     }

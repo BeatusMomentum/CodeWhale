@@ -1003,10 +1003,15 @@ async fn task_host_inner(
     loop {
         attempt += 1;
         spawned.set(spawned.get() + 1);
-        let spawned_task = driver
-            .spawn_task(current.clone())
-            .await
-            .map_err(|err| TaskError::new(TaskErrorKind::from(&err), err.to_string()))?;
+        // Admission can wait (a saturated concurrency gate, a routing call),
+        // so it races the run's cancel exactly as the completion does below
+        // and as `tools.call()` does: a cancel that only closed the driver's
+        // gate used to be the one thing that could wake it.
+        let spawned_task = tokio::select! {
+            _ = cancel.cancelled() => return Err(cancelled_task()),
+            spawned = driver.spawn_task(current.clone()) => spawned
+                .map_err(|err| TaskError::new(TaskErrorKind::from(&err), err.to_string()))?,
+        };
         let task_id = spawned_task.task_id;
         let completion_rx = spawned_task.completion;
         let completion = tokio::select! {

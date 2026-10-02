@@ -210,14 +210,24 @@ pub(crate) fn resolve_skills_dir(
     }
 
     for local_skills_dir in [
-        workspace.join(".agents").join("skills"),
-        workspace.join("skills"),
+        workspace.join(".codewhale/skills"),
+        workspace.join(".agents/skills"),
+        workspace.join(".claude/skills"),
+        workspace.join(".opencode/skills"),
+        workspace.join(".cursor/skills"),
     ] {
         if local_skills_dir.exists() && admitted(&local_skills_dir) {
             return local_skills_dir;
         }
     }
 
+    let flat = workspace.join("skills");
+    if config.skills_config().flat_workspace_root() && flat.exists() && admitted(&flat) {
+        return flat;
+    }
+    if global_skills_dir.exists() {
+        return global_skills_dir.to_path_buf();
+    }
     if config.skills_dir.is_none()
         && let Some(global_agents) = crate::skills::agents_global_skills_dir()
         && global_agents.exists()
@@ -970,6 +980,8 @@ impl Default for ComposerState {
 pub struct ViewportState {
     pub transcript_scroll: TranscriptScroll,
     pub pending_scroll_delta: i32,
+    /// Applied inside the next synchronized frame, including resize clears.
+    pub(crate) pending_terminal_size: Option<ratatui::layout::Size>,
     pub mouse_scroll: MouseScrollState,
     pub transcript_cache: TranscriptViewCache,
     pub transcript_selection: TranscriptSelection,
@@ -1027,6 +1039,7 @@ impl Default for ViewportState {
         Self {
             transcript_scroll: TranscriptScroll::to_bottom(),
             pending_scroll_delta: 0,
+            pending_terminal_size: None,
             mouse_scroll: MouseScrollState::new(),
             transcript_cache: TranscriptViewCache::new(),
             transcript_selection: TranscriptSelection::default(),
@@ -1753,7 +1766,7 @@ pub struct App {
     pub legacy_plugin_tools_dir: Option<PathBuf>,
     pub mcp_config_path: PathBuf,
     pub skills_dir: PathBuf,
-    pub skills_scan_codewhale_only: bool,
+    pub skills_discovery_mode: crate::skills::SkillDiscoveryMode,
     /// Whether the optional project context pack was enabled when this
     /// session loaded its configuration. Context diagnostics consult this
     /// source of truth even before the first system prompt is assembled.
@@ -2365,6 +2378,10 @@ pub struct App {
     /// DeepSeek account balance, refreshed once per turn completion.
     /// Shared cell updated by background fetch tasks; read lock in the UI thread.
     pub balance_cell: std::sync::Arc<std::sync::Mutex<Option<crate::pricing::BalanceInfo>>>,
+    /// The route `balance_cell` belongs to (provider, endpoint, key
+    /// fingerprint). A route change swaps in a fresh cell; see
+    /// `provider_routes::balance_cell_for_route`.
+    pub balance_route: Option<String>,
     /// Shared cell for async fleet-profile model-draft delivery. A background
     /// task fills it (model label + drafted profile or a failure reason) so
     /// the drafting network call never parks the event loop (#3757 review).
@@ -2612,7 +2629,13 @@ pub(crate) struct ToolRunCache {
     pub(crate) threshold: usize,
     pub(crate) mode: ToolCollapseMode,
     pub(crate) calm_mode: bool,
-    pub(crate) runs: Vec<crate::tui::history::ToolRun>,
+    #[cfg(test)]
+    pub(crate) projection_builds: usize,
+    pub(crate) history_len: usize,
+    pub(crate) expanded_runs: HashSet<usize>,
+    pub(crate) summaries: HashMap<usize, (HistoryCell, u64)>,
+    pub(crate) hidden_indices: HashSet<usize>,
+    pub(crate) superseded_todos: HashSet<usize>,
 }
 
 impl Default for ToolRunCache {
@@ -2624,7 +2647,13 @@ impl Default for ToolRunCache {
             threshold: usize::MAX,
             mode: ToolCollapseMode::Expanded,
             calm_mode: false,
-            runs: Vec::new(),
+            #[cfg(test)]
+            projection_builds: 0,
+            history_len: usize::MAX,
+            expanded_runs: HashSet::new(),
+            summaries: HashMap::new(),
+            hidden_indices: HashSet::new(),
+            superseded_todos: HashSet::new(),
         }
     }
 }
@@ -3025,19 +3054,20 @@ impl App {
     fn discover_cached_skills(
         workspace: &std::path::Path,
         skills_dir: &std::path::Path,
-        scan_codewhale_only: bool,
+        discovery_mode: crate::skills::SkillDiscoveryMode,
         plugins: &crate::plugins::PluginRegistry,
     ) -> Vec<(String, String)> {
         crate::skills::discover_for_workspace_and_dir_with_mode_and_plugins(
             workspace,
             skills_dir,
-            crate::skills::SkillDiscoveryMode::from_codewhale_only(scan_codewhale_only),
+            discovery_mode,
             Some(plugins),
         )
         .into_enabled()
         .list()
         .iter()
-        .map(|s| (s.name.clone(), s.description.clone()))
+        .filter(|s| s.invocation.user_invocable())
+        .map(|s| (s.name.clone(), s.user_menu_description()))
         .collect()
     }
 
@@ -3047,7 +3077,7 @@ impl App {
         let cached_skills = Self::discover_cached_skills(
             &self.workspace,
             &skills_dir,
-            self.skills_scan_codewhale_only,
+            self.skills_discovery_mode,
             self.plugin_registry.as_ref(),
         );
         self.hotbar_actions.replace_skills(&cached_skills);
@@ -3846,7 +3876,13 @@ impl App {
     /// contaminate the replacement session after clear/load/new.
     #[must_use]
     pub fn session_transition_blocked(&self) -> bool {
+        // A dispatch still resolving its route, and a locally cancelled turn
+        // whose terminal event has not landed, both belong to this session:
+        // switching now would hand the next session a stale suppression that
+        // cancels its first turn, or a dispatch bound to the old one (U02-10).
         self.is_loading
+            || self.dispatch_in_flight
+            || self.suppress_stream_events_until_turn_complete
             || self.runtime_turn_status.as_deref() == Some("in_progress")
             || self.is_compacting
             || self.manual_compaction_queued
@@ -5029,13 +5065,6 @@ impl App {
         self.api_message_stamps.push(stamp);
     }
 
-    pub fn pop_api_message(&mut self) -> Option<Message> {
-        self.api_message_stamps
-            .resize_with(self.api_messages.len(), Utc::now);
-        self.api_message_stamps.pop();
-        self.api_messages_mut().pop()
-    }
-
     /// `created_at` of each `api_messages` entry, paired positionally.
     /// Preserve messages even if older state lacks a stamp; missing times
     /// fall back to observation time, as they do when restoring a session.
@@ -5974,16 +6003,16 @@ impl App {
             spacing: self.transcript_spacing,
             palette_mode: self.ui_theme.mode,
             prose_measure: self.prose_measure,
-            reasoning_preview_extra_lines: 0,
-            reasoning_preview_viewport_lines: None,
         }
     }
 
     /// Handle terminal resize event.
-    pub fn handle_resize(&mut self, _width: u16, _height: u16) {
+    pub fn handle_resize(&mut self, width: u16, height: u16) {
         let preserved_scroll = (!self.viewport.transcript_scroll.is_at_tail())
             .then_some(self.viewport.last_transcript_top);
-        self.viewport.transcript_cache = TranscriptViewCache::new();
+        // Wrapped rows already key themselves by width and render options.
+        // Height changes only affect the final reasoning preview (#6652).
+        self.viewport.pending_terminal_size = Some(ratatui::layout::Size::new(width, height));
 
         if let Some(top) = preserved_scroll {
             self.viewport.transcript_scroll = TranscriptScroll::at_line(top);
@@ -5997,12 +6026,12 @@ impl App {
         self.viewport.last_transcript_top = 0;
         // Seed visible height from the resize event so paging keys use a
         // useful page size immediately, before the next render updates it.
-        self.viewport.last_transcript_visible = (_height as usize).saturating_sub(2).max(1);
+        self.viewport.last_transcript_visible = (height as usize).saturating_sub(2).max(1);
         self.viewport.last_transcript_total = 0;
         self.viewport.last_transcript_padding_top = 0;
         self.viewport.jump_to_latest_button_area = None;
 
-        self.mark_history_updated();
+        self.needs_redraw = true;
     }
 
     pub fn scroll_up(&mut self, amount: usize) {

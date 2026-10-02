@@ -750,6 +750,33 @@ fn a_created_secret_is_printed_once_with_an_unmissable_notice() {
     assert!(text.contains("cannot show it again"), "{text}");
 }
 
+/// Audit R02-m2: a 2xx with an empty or malformed secret is not reported as
+/// a created key.
+#[test]
+fn a_created_response_without_a_well_formed_secret_is_not_reported_as_created() {
+    for secret in [json!(null), json!(""), json!("cwc_key_truncated")] {
+        let mut body = json!({
+            "apiKey": {
+                "id": "3f2a9c1e4b7d8a0f5c6e2b91",
+                "name": "github-actions",
+                "displayPrefix": "cwc_key_3f2a9c1e4b7d8a0f5c6e2b91",
+                "scopes": ["account:read"],
+                "createdAt": "2026-01-01T00:00:00Z"
+            }
+        });
+        if !secret.is_null() {
+            body["secret"] = secret.clone();
+        }
+        let created: ApiKeyCreateResponse = serde_json::from_value(body).unwrap();
+        let mut out = Vec::new();
+        let err = write_created_key(&mut out, &created).expect_err("malformed secret");
+        assert!(out.is_empty(), "printed before validating: {secret}");
+        let message = err.to_string();
+        assert!(message.contains("3f2a9c1e4b7d8a0f5c6e2b91"), "{message}");
+        assert!(message.contains("revoke"), "{message}");
+    }
+}
+
 #[test]
 fn a_listing_can_never_carry_a_secret_because_the_type_has_no_field_for_one() {
     // The server never returns one; the type makes a regression that started

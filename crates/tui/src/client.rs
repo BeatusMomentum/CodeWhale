@@ -3880,17 +3880,21 @@ impl CodewhaleClient {
             return self.send_with_isolated_retry(build, disclosure).await;
         }
         let retry_cfg: LlmRetryConfig = self.retry.clone().into();
+        let pause_scope = self.rate_limit_scope();
+        let callback_scope = pause_scope.clone();
         let request_result = with_retry(
             &retry_cfg,
             || {
                 let request = build();
+                let pause_scope = pause_scope.as_str();
                 async move {
                     // Sleep in bounded slices rather than the full remaining
-                    // window: the pause is process-global, so a concurrent
-                    // `clear_rate_limit()` (or a shortened deadline) must
-                    // release requests that are already waiting instead of
-                    // stranding them for the whole original window.
-                    while let Some(delay) = crate::retry_status::rate_limit_remaining() {
+                    // window: the pause is shared by every request to this
+                    // route, so a concurrent `clear_rate_limit()` (or a
+                    // shortened deadline) must release requests that are
+                    // already waiting instead of stranding them for the whole
+                    // original window.
+                    while let Some(delay) = crate::retry_status::rate_limit_remaining(pause_scope) {
                         tokio::time::sleep(delay.min(RATE_LIMIT_PAUSE_RECHECK_INTERVAL)).await;
                     }
                     self.wait_for_rate_limit().await;
@@ -3912,7 +3916,7 @@ impl CodewhaleClient {
                     Err(self.http_error_with_route_context(status.as_u16(), &body, retry_after))
                 }
             },
-            Some(Box::new(|err, attempt, delay| {
+            Some(Box::new(move |err, attempt, delay| {
                 let (reason_label, human_reason) = retry_reason_label_and_human(err);
                 logging::warn(format!(
                     "HTTP retry reason={} attempt={} delay={:.2}s",
@@ -3921,7 +3925,7 @@ impl CodewhaleClient {
                     delay.as_secs_f64(),
                 ));
                 if matches!(err, LlmError::RateLimited { .. }) {
-                    crate::retry_status::note_rate_limit(delay);
+                    crate::retry_status::note_rate_limit(&callback_scope, delay);
                 }
                 crate::retry_status::start(attempt + 1, delay, human_reason);
             })),
@@ -3937,6 +3941,7 @@ impl CodewhaleClient {
             Err(err) => {
                 if let LlmError::RateLimited { retry_after, .. } = &err.last_error {
                     crate::retry_status::note_rate_limit(
+                        &pause_scope,
                         retry_after
                             .unwrap_or_else(|| retry_cfg.delay_for_attempt(retry_cfg.max_retries)),
                     );
@@ -3955,6 +3960,21 @@ impl CodewhaleClient {
                 Err(anyhow::Error::new(err.last_error))
             }
         }
+    }
+
+    /// Key for this route's shared `Retry-After` pause: the configured route
+    /// identity plus the host it reaches. A 429 from one provider pauses only
+    /// requests that would hit the same limit, never another provider, a
+    /// local runtime, or a sub-agent on a different route.
+    pub(crate) fn rate_limit_scope(&self) -> String {
+        let route = if self.provider_identity.is_empty() {
+            self.api_provider.as_str()
+        } else {
+            self.provider_identity.as_str()
+        };
+        let host = crate::llm_client::base_url_authority(&self.base_url)
+            .unwrap_or_else(|| redact_url_for_display(&self.base_url));
+        format!("{route}@{host}")
     }
 
     /// The same bounded transport retry policy without process-global retry
@@ -6722,7 +6742,6 @@ mod tests {
         crate::retry_status::clear();
         crate::retry_status::clear_rate_limit();
         crate::retry_status::start(7, Duration::from_secs(60), "foreground sentinel");
-        crate::retry_status::note_rate_limit(Duration::from_secs(60));
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -6741,6 +6760,7 @@ mod tests {
             .await;
 
         let client = deepseek_request_boundary_client("https://api.deepseek.com/v1", server.uri());
+        crate::retry_status::note_rate_limit(&client.rate_limit_scope(), Duration::from_secs(60));
         let request = MessageRequest {
             model: "deepseek-v4-pro".to_string(),
             messages: vec![Message {
@@ -6807,7 +6827,7 @@ mod tests {
             state => panic!("isolated success mutated retry state: {state:?}"),
         }
         assert!(
-            crate::retry_status::rate_limit_remaining().is_some(),
+            crate::retry_status::rate_limit_remaining(&client.rate_limit_scope()).is_some(),
             "isolated success must not clear the foreground provider pause"
         );
         crate::retry_status::clear();
@@ -6823,7 +6843,6 @@ mod tests {
         crate::retry_status::clear();
         crate::retry_status::clear_rate_limit();
         crate::retry_status::start(9, Duration::from_secs(60), "foreground sentinel 429");
-        crate::retry_status::note_rate_limit(Duration::from_secs(60));
 
         let server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -6839,6 +6858,7 @@ mod tests {
             deepseek_request_boundary_client("https://api.deepseek.com/v1", server.uri());
         client.retry.enabled = false;
         client.retry.max_retries = 0;
+        crate::retry_status::note_rate_limit(&client.rate_limit_scope(), Duration::from_secs(60));
         let request = MessageRequest {
             model: "deepseek-v4-pro".to_string(),
             messages: vec![Message {
@@ -6877,8 +6897,8 @@ mod tests {
             }
             state => panic!("isolated 429 mutated retry state: {state:?}"),
         }
-        let remaining =
-            crate::retry_status::rate_limit_remaining().expect("foreground provider pause remains");
+        let remaining = crate::retry_status::rate_limit_remaining(&client.rate_limit_scope())
+            .expect("foreground provider pause remains");
         assert!(
             remaining < Duration::from_secs(70),
             "classifier Retry-After must not extend the global pause: {remaining:?}"

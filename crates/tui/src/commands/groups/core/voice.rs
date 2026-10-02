@@ -27,8 +27,7 @@ use crate::commands::traits::{CommandInfo, RegisterCommand};
 use crate::config::Config;
 use crate::tui::app::{App, AppAction};
 use crate::voice::{
-    is_available, process_voice_control, record_audio, resolve_asr_choice, split_send_suffix,
-    transcribe, transcribe_groq, transcribe_local_whisper,
+    is_available, record_audio, resolve_asr_choice, split_send_suffix, transcribe_selected,
 };
 use codewhale_localization::{MessageId, tr};
 
@@ -127,14 +126,19 @@ pub async fn capture_and_transcribe(
     if !is_available() {
         return Err(tr(locale, MessageId::VoiceErrNoRecorder).to_string());
     }
-    let api_key = config
-        .active_route_api_key()
-        .map_err(|_| tr(locale, MessageId::VoiceErrNoAuth).to_string())?;
-    let base_url = config.active_route_base_url();
-    let openrouter_vendor = config
-        .openrouter_vendor()
-        .map_err(|error| error.to_string())?;
-
+    // C01-10: the credential check follows the ASR backend that will run,
+    // not the chat provider. Local Whisper and Groq need no provider key, so
+    // resolve it lazily — the same contract as `crate::voice::dictate_once`
+    // — and only refuse before recording when provider ASR is the backend.
+    let provider_key = || {
+        config
+            .active_route_api_key()
+            .map_err(|_| tr(locale, MessageId::VoiceErrNoAuth).to_string())
+    };
+    let (asr_kind, _asr_model) = resolve_asr_choice(config);
+    if asr_kind == "provider" {
+        provider_key()?;
+    }
     // Show the localized recording status plus the live interim in the composer.
     let original_input = app.composer.input.clone();
     let original_cursor = app.composer.cursor_position;
@@ -143,7 +147,6 @@ pub async fn capture_and_transcribe(
     // Streaming interim: poll every 700ms and show partial transcript like Grok Build's
     // VoiceEvent::Interim → VoiceState::Recording{interim}. We re-transcribe the
     // growing buffer (local-whisper is cheap; Groq is ~300ms; provider falls back).
-    let (asr_kind, _asr_model) = resolve_asr_choice(config);
     let interim_enabled = true; // always show partials — feels alive like Spark
 
     // Spawn recorder on blocking thread with a shared buffer for interim polling.
@@ -188,27 +191,9 @@ pub async fn capture_and_transcribe(
             continue;
         }
         // Try cheapest free ASR for interim; don't fail the whole capture on interim error.
-        let interim = match asr_kind.as_str() {
-            "local-whisper" => transcribe_local_whisper(&snapshot)
-                .await
-                .unwrap_or_default(),
-            "groq" => transcribe_groq(&snapshot).await.unwrap_or_default(),
-            _ => {
-                // For provider ASR, reuse the same endpoint but don't block on interim if no key.
-                if let Ok(key) = config
-                    .active_route_api_key()
-                    .map(|k: String| k)
-                    .map_err(|_| String::new())
-                {
-                    let url = config.active_route_base_url();
-                    transcribe(&key, &url, &snapshot, openrouter_vendor.as_deref())
-                        .await
-                        .unwrap_or_default()
-                } else {
-                    String::new()
-                }
-            }
-        };
+        let interim = transcribe_selected(config, &asr_kind, &snapshot, None)
+            .await
+            .unwrap_or_default();
         let trimmed = interim.trim();
         if !trimmed.is_empty() && trimmed != last_interim {
             last_interim = trimmed.to_string();
@@ -238,31 +223,14 @@ pub async fn capture_and_transcribe(
     app.composer.cursor_position = original_cursor;
     app.status_message = Some(tr(locale, MessageId::VoiceProcessing).to_string());
 
-    let text = match asr_kind.as_str() {
-        "local-whisper" => match transcribe_local_whisper(&samples).await {
-            Ok(v) => Ok(v),
-            Err(_) => transcribe(&api_key, &base_url, &samples, openrouter_vendor.as_deref()).await,
-        },
-        "groq" => match transcribe_groq(&samples).await {
-            Ok(v) => Ok(v),
-            Err(_) => transcribe(&api_key, &base_url, &samples, openrouter_vendor.as_deref()).await,
-        },
-        _ => {
-            if app.voice_control_enabled {
-                process_voice_control(
-                    &api_key,
-                    &base_url,
-                    &samples,
-                    &original_input,
-                    openrouter_vendor.as_deref(),
-                )
-                .await
-            } else {
-                transcribe(&api_key, &base_url, &samples, openrouter_vendor.as_deref()).await
-            }
-        }
-    }
-    .map_err(|e| format!("{}: {e}", tr(locale, MessageId::VoiceErrNetwork)))?;
+    let text = transcribe_selected(
+        config,
+        &asr_kind,
+        &samples,
+        app.voice_control_enabled.then_some(original_input.as_str()),
+    )
+    .await
+    .map_err(|error| format!("{}: {error}", tr(locale, MessageId::VoiceErrNetwork)))?;
 
     let clean = text.trim();
     if app.voice_send_enabled {

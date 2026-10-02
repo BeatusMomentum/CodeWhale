@@ -191,6 +191,10 @@ pub struct SetupWizardView {
     /// Display label of the model that authored `model_draft` (safe metadata,
     /// e.g. "GLM-5.2"), for provenance copy only.
     model_draft_label: Option<String>,
+    /// The answers (and free-form note) the in-flight model draft was asked
+    /// to write. A draft lands only while they are still the wizard's
+    /// answers; one requested for answers since changed is stale (U08-06).
+    model_draft_request: Option<(GuidedConstitutionDraft, Option<String>)>,
     runtime_preset: SetupRuntimePreset,
     runtime_preset_preview_seen: bool,
     body_scroll: usize,
@@ -2316,6 +2320,7 @@ impl SetupWizardView {
             existing_preview_seen: false,
             model_draft: None,
             model_draft_label: None,
+            model_draft_request: None,
             runtime_preset: SetupRuntimePreset::default(),
             runtime_preset_preview_seen: false,
             body_scroll: 0,
@@ -2343,6 +2348,7 @@ impl SetupWizardView {
             existing_preview_seen: false,
             model_draft: None,
             model_draft_label: None,
+            model_draft_request: None,
             runtime_preset: SetupRuntimePreset::default(),
             runtime_preset_preview_seen: false,
             body_scroll: 0,
@@ -2844,10 +2850,11 @@ impl SetupWizardView {
     /// `A` on the constitution step: ask the first configured model to draft.
     /// Requires a ready provider route; otherwise the key is inert and the
     /// deterministic guided flow stands untouched.
-    fn request_model_draft(&self) -> ViewAction {
+    fn request_model_draft(&mut self) -> ViewAction {
         if !self.facts.provider_ready {
             return ViewAction::None;
         }
+        self.model_draft_request = Some(self.current_model_draft_request());
         ViewAction::Emit(ViewEvent::SetupConstitutionModelDraftRequested {
             draft: self.guided_draft,
             freeform_note: self.freeform_note_for_draft().map(str::to_string),
@@ -2860,6 +2867,13 @@ impl SetupWizardView {
             self.editing_freeform_note = !self.editing_freeform_note;
         }
         ViewAction::None
+    }
+
+    fn current_model_draft_request(&self) -> (GuidedConstitutionDraft, Option<String>) {
+        (
+            self.guided_draft,
+            self.freeform_note_for_draft().map(str::to_string),
+        )
     }
 
     fn freeform_note_for_draft(&self) -> Option<&str> {
@@ -2906,12 +2920,20 @@ impl SetupWizardView {
     /// ratification preview the host must open in the same breath — that is
     /// what satisfies the preview gate. Ratifying still takes the explicit
     /// `G` keypress afterwards.
+    ///
+    /// Returns `None`, installing nothing, when the answers or note changed
+    /// after the draft was requested: that draft is law for answers the
+    /// person no longer holds (U08-06).
     #[must_use]
     pub(crate) fn install_model_draft(
         &mut self,
         constitution: Box<UserConstitution>,
         model_label: String,
-    ) -> (String, String) {
+    ) -> Option<(String, String)> {
+        if self.model_draft_request.as_ref() != Some(&self.current_model_draft_request()) {
+            return None;
+        }
+        self.model_draft_request = None;
         let content = constitution_ratification_text(
             self.locale,
             &constitution,
@@ -2920,7 +2942,7 @@ impl SetupWizardView {
         self.model_draft = Some(constitution);
         self.model_draft_label = Some(model_label);
         self.guided_preview_seen = true;
-        (ratification_preview_title(self.locale).to_string(), content)
+        Some((ratification_preview_title(self.locale).to_string(), content))
     }
 
     fn commit_constitution(&self, kind: SetupCommitKind) -> ViewAction {

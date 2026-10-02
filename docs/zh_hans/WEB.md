@@ -1,7 +1,7 @@
 # 本地浏览器客户端
 
 > 英文原文：[WEB.md](../WEB.md)。
-> 最后与英文同步日期（last synced with English revision）：2026-09-22。
+> 最后与英文同步日期（last synced with English revision）：2026-09-29。
 
 `codewhale web` 通过统一的 Runtime API 打开 Codewhale 内嵌的浏览器客户端。
 这是一个本地界面：服务器始终绑定到 `127.0.0.1`，不能改为局域网地址，
@@ -21,7 +21,7 @@ codewhale web
 codewhale web --port 8788
 ```
 
-Codewhale 会启动 Runtime API，提供随已安装二进制文件内嵌、无需额外依赖的客户端，
+Codewhale 会启动 Runtime API，提供已内嵌在所安装二进制文件中、无需额外依赖的客户端，
 打印一个只能使用一次的启动 URL，并请求操作系统在默认浏览器中打开它。
 如果浏览器没有自动打开，请在十分钟内使用打印出的 URL。
 按 `Ctrl+C` 停止进程，浏览器会话也会随之结束。

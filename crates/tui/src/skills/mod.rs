@@ -6,6 +6,7 @@ pub mod audit;
 mod catalog_matrix;
 mod frontmatter;
 pub(crate) use frontmatter::parse_frontmatter;
+use frontmatter::{SkillValidationMode, parse_frontmatter_bool, validate_skill_frontmatter};
 pub mod install;
 pub mod mutation;
 mod package_digest;
@@ -232,6 +233,8 @@ pub enum SkillDiscoveryMode {
     /// Preserve the existing broad compatibility scan across CodeWhale,
     /// agentskills.io, Claude, OpenCode, Cursor, and legacy DeepSeek roots.
     Compatible,
+    /// Compatible discovery including an explicitly opted-in flat workspace root.
+    CompatibleWithFlatWorkspace,
     /// Scan only CodeWhale-owned roots. Callers that also pass an explicit
     /// `skills_dir` still get that directory because it is user configuration.
     CodeWhaleOnly,
@@ -239,12 +242,18 @@ pub enum SkillDiscoveryMode {
 
 impl SkillDiscoveryMode {
     #[must_use]
-    pub fn from_codewhale_only(value: bool) -> Self {
-        if value {
+    pub fn from_config(config: &crate::config::SkillsConfig) -> Self {
+        if config.scan_codewhale_only() {
             Self::CodeWhaleOnly
+        } else if config.flat_workspace_root() {
+            Self::CompatibleWithFlatWorkspace
         } else {
             Self::Compatible
         }
+    }
+
+    pub fn flat_workspace_root(self) -> bool {
+        self == Self::CompatibleWithFlatWorkspace
     }
 }
 
@@ -270,6 +279,8 @@ pub struct Skill {
     /// prompt entries, so they do not inflate the catalogue or create a
     /// second instruction surface.
     pub aliases: Vec<String>,
+    /// Optional user-facing argument guidance; never execution authority.
+    pub argument_hint: Option<String>,
     pub body: String,
     /// On-disk path to the `SKILL.md` this was loaded from. The directory
     /// name can differ from the frontmatter `name` for community installs
@@ -283,9 +294,19 @@ pub struct Skill {
 pub enum SkillInvocation {
     ModelAndUser,
     ExplicitOnly,
+    ModelOnly,
+    Disabled,
 }
 
 impl SkillInvocation {
+    pub fn model_invocable(self) -> bool {
+        matches!(self, Self::ModelAndUser | Self::ModelOnly)
+    }
+
+    pub fn user_invocable(self) -> bool {
+        matches!(self, Self::ModelAndUser | Self::ExplicitOnly)
+    }
+
     fn from_frontmatter(value: Option<&str>) -> Self {
         match value.map(str::trim).map(|value| value.to_ascii_lowercase()) {
             Some(value) if value == "explicit-only" || value == "explicit_only" => {
@@ -307,6 +328,28 @@ pub enum SkillSource {
 }
 
 impl Skill {
+    /// Safe, single-line argument guidance for user selection surfaces.
+    pub fn user_menu_description(&self) -> String {
+        let Some(hint) = self.argument_hint.as_deref() else {
+            return self.description.clone();
+        };
+        let hint = hint
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .chars()
+            .filter(|ch| !ch.is_control())
+            .take(200)
+            .collect::<String>();
+        if hint.is_empty() {
+            self.description.clone()
+        } else if self.description.is_empty() {
+            hint
+        } else {
+            format!("{} ({hint})", self.description)
+        }
+    }
+
     /// Pick the best description for a session `locale_tag`, falling back to the
     /// default `description` when no localized variant matches.
     ///
@@ -518,13 +561,16 @@ impl SkillRegistry {
             #[cfg(test)]
             record_skill_md_read_attempt();
             match fs::read_to_string(&skill_path) {
-                Ok(content) => match Self::parse_skill(&skill_path, &content) {
-                    Ok(mut skill) => {
+                Ok(content) => match Self::parse_verified_content(&skill_path, &content) {
+                    Ok((mut skill, warnings)) => {
+                        for warning in warnings {
+                            registry.push_warning(format!("{}: {warning}", skill_path.display()));
+                        }
                         if !Self::mark_discovered_dir(&path, visited) {
                             continue;
                         }
                         skill.path = skill_path.clone();
-                        registry.normalize_skill_name(&mut skill, &skill_path);
+
                         // Two sibling directories under the same root can
                         // normalize to the same command name (e.g. `My Skill/`
                         // and `my_skill/` both slugify to `my-skill`). Keep the
@@ -618,21 +664,59 @@ impl SkillRegistry {
         }
     }
 
-    pub(crate) fn parse_skill(_path: &Path, content: &str) -> std::result::Result<Skill, String> {
+    #[cfg(test)]
+    pub(crate) fn parse_skill(path: &Path, content: &str) -> std::result::Result<Skill, String> {
+        Self::parse_skill_and_warnings(path, content).map(|(skill, _)| skill)
+    }
+
+    fn parse_skill_and_warnings(
+        path: &Path,
+        content: &str,
+    ) -> std::result::Result<(Skill, Vec<String>), String> {
         // Try to parse frontmatter block first. If absent, fall back to
         // extracting the first `# Heading` as the skill name so that plain
         // Markdown files (no `---` fence) are accepted instead of rejected.
-        if let Some((metadata, body)) = parse_frontmatter(content)? {
+        let parsed = parse_frontmatter(content)?;
+        let warnings = validate_skill_frontmatter(
+            parsed.as_ref().map(|(metadata, _)| metadata),
+            Some(path),
+            SkillValidationMode::Lenient,
+        )?;
+        if let Some((metadata, body)) = parsed {
             let name = metadata
                 .get("name")
                 .filter(|name| !name.is_empty())
                 .cloned()
                 .ok_or_else(|| "missing required frontmatter field: name".to_string())?;
 
-            let description = metadata.get("description").cloned().unwrap_or_default();
+            let mut description = metadata.get("description").cloned().unwrap_or_default();
+            if let Some(trigger) = metadata
+                .get("when_to_use")
+                .filter(|value| !value.trim().is_empty())
+            {
+                if !description.is_empty() {
+                    description.push(' ');
+                }
+                description.push_str("Use when: ");
+                description.push_str(trigger.trim());
+            }
 
-            let invocation =
-                SkillInvocation::from_frontmatter(metadata.get("invocation").map(String::as_str));
+            let explicit =
+                SkillInvocation::from_frontmatter(metadata.get("invocation").map(String::as_str))
+                    == SkillInvocation::ExplicitOnly;
+            let model_allowed = !explicit
+                && metadata
+                    .get("disable-model-invocation")
+                    .is_none_or(|value| parse_frontmatter_bool(value) == Some(false));
+            let user_allowed = metadata
+                .get("user-invocable")
+                .is_none_or(|value| parse_frontmatter_bool(value) == Some(true));
+            let invocation = match (model_allowed, user_allowed) {
+                (true, true) => SkillInvocation::ModelAndUser,
+                (false, true) => SkillInvocation::ExplicitOnly,
+                (true, false) => SkillInvocation::ModelOnly,
+                (false, false) => SkillInvocation::Disabled,
+            };
             let aliases = metadata
                 .get("aliases-for")
                 .into_iter()
@@ -654,19 +738,26 @@ impl SkillRegistry {
                 })
                 .collect();
 
-            return Ok(Skill {
-                name,
-                legacy_activation_name: None,
-                description,
-                localized_descriptions,
-                invocation,
-                aliases,
-                body: body.trim().to_string(),
-                // Filled in by `discover` after parse succeeds; default to an
-                // empty path so direct constructors (e.g. tests) compile.
-                path: PathBuf::new(),
-                source: SkillSource::Native,
-            });
+            return Ok((
+                Skill {
+                    name,
+                    legacy_activation_name: None,
+                    description,
+                    localized_descriptions,
+                    invocation,
+                    aliases,
+                    argument_hint: metadata
+                        .get("argument-hint")
+                        .filter(|value| !value.trim().is_empty())
+                        .cloned(),
+                    body: body.trim().to_string(),
+                    // Filled in by `discover` after parse succeeds; default to an
+                    // empty path so direct constructors (e.g. tests) compile.
+                    path: PathBuf::new(),
+                    source: SkillSource::Native,
+                },
+                warnings,
+            ));
         }
 
         // Graceful degradation: no frontmatter fence found.
@@ -681,17 +772,21 @@ impl SkillRegistry {
                 "no frontmatter and no `# Heading` found to use as skill name".to_string()
             })?;
 
-        Ok(Skill {
-            name,
-            legacy_activation_name: None,
-            description: String::new(),
-            localized_descriptions: HashMap::new(),
-            invocation: SkillInvocation::ModelAndUser,
-            aliases: Vec::new(),
-            body: content.trim().to_string(),
-            path: PathBuf::new(),
-            source: SkillSource::Native,
-        })
+        Ok((
+            Skill {
+                name,
+                legacy_activation_name: None,
+                description: String::new(),
+                localized_descriptions: HashMap::new(),
+                invocation: SkillInvocation::ModelAndUser,
+                aliases: Vec::new(),
+                argument_hint: None,
+                body: content.trim().to_string(),
+                path: PathBuf::new(),
+                source: SkillSource::Native,
+            },
+            warnings,
+        ))
     }
 
     /// Parse one already-read Skill body while preserving the same name
@@ -703,7 +798,8 @@ impl SkillRegistry {
         content: &str,
     ) -> std::result::Result<(Skill, Vec<String>), String> {
         let mut registry = Self::default();
-        let mut skill = Self::parse_skill(path, content)?;
+        let (mut skill, warnings) = Self::parse_skill_and_warnings(path, content)?;
+        registry.warnings = warnings;
         skill.path = path.to_path_buf();
         registry.normalize_skill_name(&mut skill, path);
         Ok((skill, registry.warnings))
@@ -889,18 +985,12 @@ fn legacy_skill_name_segment(name: &str) -> String {
 /// Precedence is defined once in [`roots::SkillRootCatalog`] (first
 /// match wins on name conflicts):
 ///
-/// 1. `<workspace>/.agents/skills` — agentskills.io shared convention.
-/// 2. `<workspace>/skills` — flat, project-local.
-/// 3. `<workspace>/.opencode/skills` — OpenCode interop.
-/// 4. `<workspace>/.claude/skills` — Claude Code interop.
-/// 5. `<workspace>/.cursor/skills` — Cursor interop.
-/// 6. `<workspace>/.codewhale/skills` — CodeWhale workspace skills.
-/// 7. [`agents_global_skills_dir`] — agentskills.io global.
-/// 8. `~/.claude/skills` — Claude-ecosystem global (#902).
-/// 9. `~/.codewhale/skills` — CodeWhale global, primary install target.
-/// 10. `~/.deepseek/skills` — legacy DeepSeek global fallback.
-///
-/// Workspace roots (1-6) load only once the workspace is trusted.
+/// Owned `.codewhale/skills` wins in each scope. Project order is
+/// `.codewhale`, `.agents`, `.claude`, `.opencode`, `.cursor`, followed by
+/// an opted-in flat `skills` root. Global order is `.codewhale`, `.agents`,
+/// `.claude`, then legacy `.deepseek`. Project roots outrank global roots.
+/// Workspace roots load only once the workspace is trusted. A flat root
+/// requires `[skills] flat_workspace_root = true` or an explicit `skills_dir`.
 /// Compatible audit may also observe `.codex/skills`, but that root is
 /// never activated for runtime discovery in this catalog.
 ///
@@ -958,7 +1048,7 @@ pub fn discover_in_workspace_with_mode_and_plugins(
         skills_directories_for_mode(workspace, mode),
         plugins,
     );
-    with_untrusted_project_skills_warning(registry, workspace, None)
+    with_untrusted_project_skills_warning(registry, workspace, None, mode)
 }
 
 /// Name the project skill directories an untrusted workspace kept out, so
@@ -967,8 +1057,10 @@ fn with_untrusted_project_skills_warning(
     mut registry: SkillRegistry,
     workspace: &Path,
     configured_skills_dir: Option<&Path>,
+    mode: SkillDiscoveryMode,
 ) -> SkillRegistry {
-    if let Some(warning) = untrusted_project_skills_warning(workspace, configured_skills_dir) {
+    if let Some(warning) = untrusted_project_skills_warning(workspace, configured_skills_dir, mode)
+    {
         registry.warnings.push(warning);
     }
     registry
@@ -977,10 +1069,15 @@ fn with_untrusted_project_skills_warning(
 pub(crate) fn untrusted_project_skills_warning(
     workspace: &Path,
     configured_skills_dir: Option<&Path>,
+    mode: SkillDiscoveryMode,
 ) -> Option<String> {
     let home = crate::config::effective_home_dir();
-    let skipped =
-        roots::untrusted_project_skill_dirs(workspace, home.as_deref(), configured_skills_dir);
+    let skipped = roots::untrusted_project_skill_dirs(
+        workspace,
+        home.as_deref(),
+        configured_skills_dir,
+        mode,
+    );
     if skipped.is_empty() {
         return None;
     }
@@ -1008,7 +1105,7 @@ pub fn discover_for_workspace_and_dir_with_mode_and_plugins(
 ) -> SkillRegistry {
     let dirs = skill_directories_for_workspace_and_dir(workspace, skills_dir, mode);
     let registry = discover_from_directories_with_plugins(dirs, plugins);
-    with_untrusted_project_skills_warning(registry, workspace, Some(skills_dir))
+    with_untrusted_project_skills_warning(registry, workspace, Some(skills_dir), mode)
 }
 
 #[must_use]
@@ -1229,6 +1326,7 @@ fn merge_plugin_skills_from_plugins(
                 localized_descriptions: snapshot.localized_descriptions,
                 invocation: snapshot.invocation,
                 aliases: snapshot.aliases,
+                argument_hint: snapshot.argument_hint,
                 body: snapshot.body,
                 path: snapshot.path,
                 source: SkillSource::Plugin {
@@ -1643,7 +1741,7 @@ Skills are optional instruction packs. This index exposes routing metadata; bodi
         // alias, but must not be presented as model-selectable catalogue
         // entries. This keeps opt-in power skills from becoming ambient
         // instructions or consuming prompt budget.
-        .filter(|skill| skill.invocation != SkillInvocation::ExplicitOnly)
+        .filter(|skill| skill.invocation.model_invocable())
         .map(|skill| {
             // Native skills expose the real on-disk path captured at discovery.
             // Plugin skills expose only their reviewed snapshot identity so the

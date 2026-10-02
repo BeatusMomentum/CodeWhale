@@ -65,7 +65,9 @@ pub(in crate::commands) fn load_portable(
         return CommandResult::error("Usage: /load <path>".to_string());
     };
     match lifecycle.load_session(path) {
-        Ok(load_path) => CommandResult::action(crate::tui::app::AppAction::LoadSession(load_path)),
+        Ok(load_path) => CommandResult::action(
+            codewhale_command_contract::outcome::SessionAction::LoadSession(load_path),
+        ),
         Err(error) => CommandResult::error(error),
     }
 }

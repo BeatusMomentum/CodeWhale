@@ -32,7 +32,7 @@ use codewhale_models::{
 
 use super::prepared::WireDialect;
 use super::role_placement::{RolePlacement, role_placement};
-use super::wire::{extract_sse_data_value, flush_sse_line, take_sse_line};
+use super::wire::{extract_sse_data_value, flush_sse_line, push_sse_event_data, take_sse_line};
 use super::{
     CodewhaleClient, ERROR_BODY_MAX_BYTES, SSE_BACKPRESSURE_HIGH_WATERMARK,
     SSE_BACKPRESSURE_SLEEP_MS, SSE_MAX_LINES_PER_CHUNK, acquire_stream_buffer,
@@ -1606,15 +1606,13 @@ impl CodewhaleClient {
                         continue;
                     }
 
-                    if let Some(data) = extract_sse_data_value(&line) {
-                        // The SSE spec joins multiple `data:` fields within one
-                        // event with '\n'; concatenating with no separator would
-                        // yield `{…}{…}` and fail JSON parsing, silently dropping
-                        // the frame.
-                        if !line_buf.is_empty() {
-                            line_buf.push('\n');
-                        }
-                        line_buf.push_str(data);
+                    if let Some(data) = extract_sse_data_value(&line)
+                        && let Err(err) = push_sse_event_data(&mut line_buf, data)
+                    {
+                        decode_failed = true;
+                        stream_failed = true;
+                        yield Err(anyhow::anyhow!("{err}"));
+                        break 'stream;
                     }
                     // Ignore other SSE fields (event:, id:, retry:)
 
@@ -1642,11 +1640,12 @@ impl CodewhaleClient {
             if !saw_done && !decode_failed {
                 match flush_sse_line(&mut byte_buf) {
                     Ok(Some(line)) => {
-                        if let Some(data) = extract_sse_data_value(&line) {
-                            if !line_buf.is_empty() {
-                                line_buf.push('\n');
-                            }
-                            line_buf.push_str(data);
+                        if let Some(data) = extract_sse_data_value(&line)
+                            && let Err(err) = push_sse_event_data(&mut line_buf, data)
+                        {
+                            decode_failed = true;
+                            stream_failed = true;
+                            yield Err(anyhow::anyhow!("{err}"));
                         }
                     }
                     Ok(None) => {}

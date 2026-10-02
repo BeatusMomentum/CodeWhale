@@ -4,7 +4,7 @@
 //! Parsing, document rendering, redaction, operation sequencing, and result
 //! composition are portable: this module depends only on the external command
 //! contract, `chrono`, the shared pure sanitizer in
-//! [`codewhale_secrets::sanitize`], and the temporary FEAT-037 `CommandResult`.
+//! [`codewhale_sanitize::sanitize`], and the shared session `CommandResult`.
 //! Concrete `App`, clipboard, filesystem, snapshot, history, and turn-handoff
 //! access stays behind `CommandSessionExportContext` (D1). Helpers, tests, and
 //! this handler therefore carry no TUI, client, configuration, or filesystem
@@ -22,7 +22,7 @@ use codewhale_command_contract::handler::{CommandCapabilities, CommandContexts, 
 use codewhale_command_contract::metadata::{
     CommandInfo as ContractInfo, RegisterCommand as ContractRegisterCommand,
 };
-use codewhale_secrets::sanitize::{
+use codewhale_sanitize::sanitize::{
     inline_text, is_internal_role, redact_json, redact_url_for_display, sanitize_text,
 };
 use serde_json::Value;

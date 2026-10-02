@@ -2348,32 +2348,39 @@ pub fn set_config_value(app: &mut App, key: &str, value: &str, persist: bool) ->
             }
             let next_path = PathBuf::from(expand_tilde(value));
             let path_changed = next_path != app.mcp_config_path;
-            app.mcp_config_path = next_path;
-            if path_changed {
-                app.mcp_reload_required = true;
-            }
             let reload_note = if path_changed {
                 "; run /mcp reload to rebuild the live tool pool"
             } else {
                 ""
             };
-            let message = if persist {
+            // Persist before touching live state (C01-08): a failed save
+            // must leave the session exactly as it was, not report failure
+            // over a path and reload flag that already moved.
+            let saved_to = if persist {
                 match persist_root_string_key(app.config_path.as_deref(), "mcp_config_path", value)
                 {
-                    Ok(path) => format!(
-                        "mcp_config_path = {} (saved to {}){}",
-                        app.mcp_config_path.display(),
-                        path.display(),
-                        reload_note
-                    ),
+                    Ok(path) => Some(path),
                     Err(err) => return CommandResult::error(format!("Failed to save: {err}")),
                 }
             } else {
-                format!(
+                None
+            };
+            app.mcp_config_path = next_path;
+            if path_changed {
+                app.mcp_reload_required = true;
+            }
+            let message = match saved_to {
+                Some(path) => format!(
+                    "mcp_config_path = {} (saved to {}){}",
+                    app.mcp_config_path.display(),
+                    path.display(),
+                    reload_note
+                ),
+                None => format!(
                     "mcp_config_path = {} (session only){}",
                     app.mcp_config_path.display(),
                     reload_note
-                )
+                ),
             };
             return CommandResult::message(message);
         }
@@ -2525,7 +2532,6 @@ pub fn set_config_value(app: &mut App, key: &str, value: &str, persist: bool) ->
             } else {
                 raw
             };
-            app.stream_chunk_timeout_secs = resolved;
             let value_label = stream_chunk_timeout_value_label(raw, resolved);
             if persist {
                 match persist_table_value_key(
@@ -2535,6 +2541,9 @@ pub fn set_config_value(app: &mut App, key: &str, value: &str, persist: bool) ->
                     (raw as i64).into(), // validated above: at most 3600
                 ) {
                     Ok(path) => {
+                        // Live state moves only with the engine action and
+                        // only after the save landed (C01-08).
+                        app.stream_chunk_timeout_secs = resolved;
                         return CommandResult::with_message_and_action(
                             format!(
                                 "stream_chunk_timeout_secs = {value_label} (saved to {}; affects subsequent turns in this session)",
@@ -2546,6 +2555,7 @@ pub fn set_config_value(app: &mut App, key: &str, value: &str, persist: bool) ->
                     Err(err) => return CommandResult::error(format!("Failed to save: {err}")),
                 }
             }
+            app.stream_chunk_timeout_secs = resolved;
             return CommandResult::with_message_and_action(
                 format!(
                     "stream_chunk_timeout_secs = {value_label} (session only; affects subsequent turns in this session)"
@@ -2731,14 +2741,8 @@ pub fn set_config_value(app: &mut App, key: &str, value: &str, persist: bool) ->
                 Ok(value) => value,
                 Err(err) => return CommandResult::error(err),
             };
-            match field {
-                "keep_header" => app.mini_window.keep_header = value,
-                "keep_input" => app.mini_window.keep_input = value,
-                "keep_todo" => app.mini_window.keep_todo = value,
-                "keep_sidebar" => app.mini_window.keep_sidebar = value,
-                "keep_footer" => app.mini_window.keep_footer = value,
-                _ => unreachable!("mini_window field matched above"),
-            }
+            // Persist first: a failed save leaves the live layout as it was
+            // (C01-08).
             if persist
                 && let Err(err) = crate::config_persistence::persist_mini_window_bool_key(
                     app.config_path.as_deref(),
@@ -2747,6 +2751,14 @@ pub fn set_config_value(app: &mut App, key: &str, value: &str, persist: bool) ->
                 )
             {
                 return CommandResult::error(format!("Failed to persist: {err}"));
+            }
+            match field {
+                "keep_header" => app.mini_window.keep_header = value,
+                "keep_input" => app.mini_window.keep_input = value,
+                "keep_todo" => app.mini_window.keep_todo = value,
+                "keep_sidebar" => app.mini_window.keep_sidebar = value,
+                "keep_footer" => app.mini_window.keep_footer = value,
+                _ => unreachable!("mini_window field matched above"),
             }
             app.needs_redraw = true;
         }
@@ -2798,15 +2810,17 @@ pub fn set_config_value(app: &mut App, key: &str, value: &str, persist: bool) ->
             app.needs_redraw = true;
         }
         "workspace_follow_symlinks" | "follow_symlinks" => {
+            // Persist first: a failed save leaves the live value as it was
+            // (C01-08).
+            if persist && let Err(e) = persist_single_setting(&key, value) {
+                return CommandResult::error(format!("Failed to save: {e}"));
+            }
             app.workspace_follow_symlinks = settings.workspace_follow_symlinks;
             app.composer.mention_completion_cache = None;
             app.composer.mention_discovery.invalidate();
             app.needs_redraw = true;
             // Engine tools use EngineConfig which is fixed at startup
             return CommandResult::message(if persist {
-                if let Err(e) = persist_single_setting(&key, value) {
-                    return CommandResult::error(format!("Failed to save: {e}"));
-                }
                 format!(
                     "workspace_follow_symlinks = {} (saved; restart required for engine tools)",
                     settings.workspace_follow_symlinks
@@ -2904,7 +2918,18 @@ pub fn set_config_value(app: &mut App, key: &str, value: &str, persist: bool) ->
 
     let message = if persist {
         if let Err(e) = persist_single_setting(&key, value) {
-            return CommandResult::error(format!("Failed to save: {e}"));
+            // C01-08: the projection above already changed live state (and
+            // some arms validate only while projecting, so saving first could
+            // persist a value that never applied). Report exactly that partial
+            // effect, and keep the action so the engine matches the UI instead
+            // of silently diverging from it.
+            return CommandResult {
+                message: Some(format!(
+                    "Error: {key} = {display_value} applies to this session only; saving failed: {e}"
+                )),
+                action,
+                is_error: true,
+            };
         }
         format!("{key} = {display_value} (saved)")
     } else {
@@ -5382,6 +5407,35 @@ context_window = 262144
             query.message.as_deref(),
             Some("stream_chunk_timeout_secs = 90")
         );
+    }
+
+    #[test]
+    fn failed_save_leaves_live_config_state_untouched() {
+        // C01-08: a `--save` that cannot write must not report failure over
+        // live state that already moved.
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = EnvGuard::new(temp.path());
+        let blocker = temp.path().join("not-a-directory");
+        fs::write(&blocker, "a file where the config directory should be").unwrap();
+        let mut app = create_test_app();
+        app.config_path = Some(blocker.join("config.toml"));
+        let mcp_before = app.mcp_config_path.clone();
+        app.mcp_reload_required = false;
+        let timeout_before = app.stream_chunk_timeout_secs;
+
+        let result = set_config_value(&mut app, "mcp_config_path", "/elsewhere/mcp.json", true);
+        assert!(result.is_error, "{:?}", result.message);
+        assert_eq!(app.mcp_config_path, mcp_before);
+        assert!(!app.mcp_reload_required);
+
+        let next_timeout = if timeout_before == 120 { "121" } else { "120" };
+        let result = set_config_value(&mut app, "stream_chunk_timeout_secs", next_timeout, true);
+        assert!(result.is_error, "{:?}", result.message);
+        assert!(
+            result.action.is_none(),
+            "no engine update for an unsaved value"
+        );
+        assert_eq!(app.stream_chunk_timeout_secs, timeout_before);
     }
 
     #[test]

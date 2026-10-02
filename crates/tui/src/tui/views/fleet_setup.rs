@@ -719,6 +719,14 @@ struct RouteAssignment {
     reasoning: Option<String>,
 }
 
+/// The wizard answers a model draft was requested against (U09-03).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ModelDraftRequest {
+    role: String,
+    route: Option<(String, String)>,
+    reasoning_effort: Option<String>,
+}
+
 fn assignment_source(path: &Path) -> Result<Option<String>, String> {
     match std::fs::read_to_string(path) {
         Ok(text) => Ok(Some(text)),
@@ -765,6 +773,11 @@ pub struct FleetSetupView {
     /// pressing Esc. Keeping the preview and the save control in the same
     /// view means the footer's `g`/Enter hints are never a lie.
     model_draft_preview: Option<String>,
+    /// The answers the in-flight model draft (`m` on Review) was requested
+    /// against. Cleared with the draft whenever an answer changes, so a
+    /// draft that lands late is refused instead of being installed onto
+    /// answers it was never written for.
+    model_draft_request: Option<ModelDraftRequest>,
     /// Model-step rows: `inherit` followed by one row per concrete model from
     /// every configured provider (#4093).
     model_choices: Vec<Choice>,
@@ -812,6 +825,7 @@ impl FleetSetupView {
         let old_review_scroll = self.review_scroll;
         let old_model_draft = self.model_draft.clone();
         let old_model_draft_preview = self.model_draft_preview.clone();
+        let old_model_draft_request = self.model_draft_request.clone();
 
         *self = Self::from_snapshot(snapshot);
 
@@ -828,6 +842,7 @@ impl FleetSetupView {
         self.review_scroll = old_review_scroll;
         self.model_draft = old_model_draft;
         self.model_draft_preview = old_model_draft_preview;
+        self.model_draft_request = old_model_draft_request;
         if self.step == Step::Composition && !self.has_composition_for_selected_role() {
             self.step = Step::Model;
         }
@@ -1209,6 +1224,7 @@ impl FleetSetupView {
             review_scroll: 0,
             model_draft: None,
             model_draft_preview: None,
+            model_draft_request: None,
             model_choices,
             model_routes,
             model_row_states,
@@ -1224,21 +1240,34 @@ impl FleetSetupView {
     /// (returned here for the caller's status message) renders inline on the
     /// Review step — not in a separate pager — so the footer's `g`/Enter
     /// ratify hints stay true the instant the draft lands (#4093).
+    ///
+    /// `None` refuses a draft that no longer matches the wizard: an answer
+    /// changed (or the draft was discarded) while it was in flight. The
+    /// request generation only orders requests; it cannot see an edit made
+    /// after the last `m`, so the wizard checks its own answers (U09-03).
     pub fn install_model_draft(
         &mut self,
         mut draft: Box<crate::fleet::profile::FleetProfileDraft>,
         model_label: String,
         picked_route: Option<(String, String)>,
         reasoning_effort: Option<String>,
-    ) -> (String, String) {
+    ) -> Option<(String, String)> {
+        let current = self.current_draft_request();
+        if self.model_draft_request.as_ref() != Some(&current)
+            || current.route != picked_route
+            || current.reasoning_effort != reasoning_effort
+        {
+            return None;
+        }
+        self.model_draft_request = None;
         // Re-inject the route the operator picked at `m`-press time (#4093). A
         // model draft comes from `from_untrusted_json`, which hard-sets
         // `provider: None` and echoes whatever `model` the model happened to
         // emit — so ratifying it verbatim would drop a concrete cross-provider
         // pick and persist the ambiguous, provider-scoped profile #4093 exists
         // to prevent. Pinning BOTH fields from the CARRIED route keeps the route
-        // the user actually chose (the model only authored the prose), and is
-        // immune to the selection changing while the async draft is in flight.
+        // the user actually chose (the model only authored the prose); the
+        // check above already refused a draft whose answers changed in flight.
         // `inherit` (a `None` route) leaves `model`/`provider` untouched,
         // matching the deterministic Enter path.
         if let Some((provider, model)) = picked_route {
@@ -1261,7 +1290,7 @@ impl FleetSetupView {
         self.model_draft = Some(draft);
         self.model_draft_preview = Some(content.clone());
         self.review_scroll = 0;
-        (title, content)
+        Some((title, content))
     }
 
     /// The planner role chosen (drives the profile file name and `role_hint`).
@@ -1569,10 +1598,20 @@ impl FleetSetupView {
         }
     }
 
-    /// A draft is only valid for the answers it was requested against.
+    /// A draft is only valid for the answers it was requested against —
+    /// including one still in flight.
     fn discard_model_draft(&mut self) {
         self.model_draft = None;
         self.model_draft_preview = None;
+        self.model_draft_request = None;
+    }
+
+    fn current_draft_request(&self) -> ModelDraftRequest {
+        ModelDraftRequest {
+            role: self.selected_role(),
+            route: self.selected_route(),
+            reasoning_effort: self.selected_reasoning_effort(),
+        }
     }
 
     fn move_down(&mut self) {
@@ -2107,6 +2146,7 @@ impl ModalView for FleetSetupView {
             }
             KeyCode::Char('m') if self.step == Step::Review && self.snapshot.provider_ready => {
                 let route = self.selected_route();
+                self.model_draft_request = Some(self.current_draft_request());
                 ViewAction::Emit(ViewEvent::FleetProfileModelDraftRequested {
                     role: self.selected_role(),
                     model: route
@@ -2115,8 +2155,8 @@ impl ModalView for FleetSetupView {
                         .unwrap_or_else(|| "inherit".to_string()),
                     // Carry the picked provider so the redrafted profile keeps
                     // the cross-provider route (#4093). `install_model_draft`
-                    // re-injects it authoritatively from the wizard's current
-                    // selection, but the event stays self-describing.
+                    // re-injects it and refuses a draft whose answers changed
+                    // while it was in flight; the event stays self-describing.
                     provider: route.map(|(provider, _)| provider),
                     reasoning_effort: self.selected_reasoning_effort(),
                     locale: self.snapshot.locale,
@@ -3858,7 +3898,7 @@ approval_required = true
 
         // The host reconstructs the picked route from the event exactly as
         // `handle_fleet_profile_model_draft` does, and carries it to
-        // `install_model_draft` (immune to the selection changing mid-draft).
+        // `install_model_draft`, which refuses it if the answers changed.
         let picked_route = provider.map(|provider| (provider, model.clone()));
 
         // The model returns a draft that (as always) has provider: None — the
@@ -3869,12 +3909,14 @@ approval_required = true
         // Installing it re-injects the picked route, so the ratified draft keeps
         // BOTH the provider and the model the user actually chose, plus the
         // captured thinking tier.
-        let (_title, content) = view.install_model_draft(
-            drafted,
-            "GLM-5.2".to_string(),
-            picked_route,
-            reasoning_effort,
-        );
+        let (_title, content) = view
+            .install_model_draft(
+                drafted,
+                "GLM-5.2".to_string(),
+                picked_route,
+                reasoning_effort,
+            )
+            .expect("answers unchanged since `m`");
         let ratified = view.model_draft.as_deref().expect("draft installed");
         assert_eq!(ratified.provider.as_deref(), Some("zai"));
         assert_eq!(ratified.model.as_deref(), Some("glm-5.2"));
@@ -4019,8 +4061,10 @@ approval_required = true
 
         let mut view = FleetSetupView::from_snapshot(snapshot());
         to_review(&mut view);
-        let (title, content) =
-            view.install_model_draft(sample_draft(), "GLM-5.2".to_string(), None, None);
+        view.handle_key(key(KeyCode::Char('m')));
+        let (title, content) = view
+            .install_model_draft(sample_draft(), "GLM-5.2".to_string(), None, None)
+            .expect("answers unchanged since `m`");
         assert!(title.contains("GLM-5.2"));
         assert!(content.contains("id = \"reviewer\""), "{content}");
         assert!(content.contains("Nothing is saved until"), "{content}");
@@ -4039,7 +4083,11 @@ approval_required = true
     fn changing_answers_discards_a_stale_draft() {
         let mut view = FleetSetupView::from_snapshot(snapshot());
         to_review(&mut view);
-        let _ = view.install_model_draft(sample_draft(), "GLM-5.2".to_string(), None, None);
+        view.handle_key(key(KeyCode::Char('m')));
+        assert!(
+            view.install_model_draft(sample_draft(), "GLM-5.2".to_string(), None, None)
+                .is_some()
+        );
         assert!(view.model_draft.is_some());
 
         // Back to the role step and change the selection: the draft no
@@ -4059,6 +4107,49 @@ approval_required = true
             panic!("expected fresh deterministic starter");
         };
         assert_eq!(draft.id, "explore");
+    }
+
+    /// U09-03: the request generation orders `m` presses but cannot see an
+    /// answer changed after the last one. A draft that lands after the user
+    /// changed the thinking tier (or role, or route) mid-flight is refused,
+    /// never installed onto answers it was not written for.
+    #[test]
+    fn late_model_draft_is_refused_after_answers_change_in_flight() {
+        let mut view = FleetSetupView::from_snapshot(snapshot());
+        to_review(&mut view);
+        let ViewAction::Emit(ViewEvent::FleetProfileModelDraftRequested {
+            reasoning_effort, ..
+        }) = view.handle_key(key(KeyCode::Char('m')))
+        else {
+            panic!("expected model draft request");
+        };
+        // While the draft is in flight the user cycles the thinking tier.
+        view.handle_key(key(KeyCode::Char('t')));
+        assert!(
+            view.install_model_draft(
+                sample_draft(),
+                "GLM-5.2".to_string(),
+                None,
+                reasoning_effort.clone()
+            )
+            .is_none()
+        );
+        assert!(view.model_draft.is_none());
+        let action = view.handle_key(key(KeyCode::Char('g')));
+        let ViewAction::EmitAndClose(ViewEvent::FleetProfileDraftCommitRequested { draft, .. }) =
+            action
+        else {
+            panic!("expected the deterministic starter for the current answers");
+        };
+        assert_eq!(draft.id, "manager");
+
+        // A draft nobody requested (no `m`) is refused too.
+        let mut view = FleetSetupView::from_snapshot(snapshot());
+        to_review(&mut view);
+        assert!(
+            view.install_model_draft(sample_draft(), "GLM-5.2".to_string(), None, None)
+                .is_none()
+        );
     }
 
     #[test]
@@ -4603,15 +4694,20 @@ approval_required = true
             model: "model-a".to_string(),
             ..snapshot()
         });
-        let route = view
+        let route_idx = view
             .model_routes
             .iter()
-            .find(|(provider, model)| provider == "custom-b" && model == "model-b")
-            .cloned()
+            .position(|(provider, model)| provider == "custom-b" && model == "model-b")
             .expect("custom B route selectable while A is active");
+        let route = view.model_routes[route_idx].clone();
+        // Request the draft against the custom B answer, as `m` on Review does.
+        view.model_idx = route_idx;
+        view.step = Step::Review;
+        view.handle_key(key(KeyCode::Char('m')));
         let draft = sample_draft();
-        let (_, rendered) =
-            view.install_model_draft(draft, "model-b".to_string(), Some(route), None);
+        let (_, rendered) = view
+            .install_model_draft(draft, "model-b".to_string(), Some(route), None)
+            .expect("answers unchanged since `m`");
         assert!(rendered.contains("provider = \"custom-b\""), "{rendered}");
     }
 

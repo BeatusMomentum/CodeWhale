@@ -260,12 +260,13 @@ impl ApprovalReceiptStore {
             io::Error::new(io::ErrorKind::InvalidInput, "approval lock has no parent")
         })?;
         fs::create_dir_all(parent)?;
-        OpenOptions::new()
-            .create(true)
+        let file = crate::utils::private_log_options()
             .truncate(false)
             .read(true)
             .write(true)
-            .open(path)
+            .open(path)?;
+        crate::utils::restrict_to_owner(&file)?;
+        Ok(file)
     }
 
     fn open_existing_lock_file(&self, session_id: &str) -> io::Result<Option<File>> {
@@ -403,7 +404,11 @@ impl ApprovalReceiptStore {
             line.insert(0, b'\n');
         }
         line.push(b'\n');
-        let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
+        // Approval receipts are owner-only and never written through a link.
+        let mut file = crate::utils::private_log_options()
+            .append(true)
+            .open(&path)?;
+        crate::utils::restrict_to_owner(&file)?;
         if let Some(tail) = &loaded.torn_tail {
             // Validate the candidate and preserve evidence before touching the
             // live log. Any preservation error leaves the original intact.

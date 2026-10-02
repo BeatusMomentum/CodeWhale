@@ -9,8 +9,8 @@ var __export = (target, all) => {
 // src/main.ts
 import { createHash as createHash2 } from "node:crypto";
 import { readFileSync } from "node:fs";
+import { createRequire as createRequire2 } from "node:module";
 import { fileURLToPath } from "node:url";
-import { Worker } from "node:worker_threads";
 
 // node_modules/@deepseek-ai/cordis/lib/index.js
 var lib_exports2 = {};
@@ -3881,7 +3881,214 @@ var ToolOutputError = class extends HarnessError {
 };
 
 // src/dsh/resolve-hooks.ts
-import { registerHooks } from "node:module";
+import * as nodeModule2 from "node:module";
+
+// src/runtime.ts
+import * as nodeModule from "node:module";
+import * as vm from "node:vm";
+var require2 = nodeModule.createRequire(import.meta.url);
+var RUNTIME = typeof process.versions.bun === "string" ? { name: "bun", version: process.versions.bun } : { name: "node", version: process.versions.node };
+function refuse(what) {
+  throw new Error(`${what} is not available to extensions`);
+}
+var LIMIT_REQUEST = "CODEWHALE_HOST_MEMORY_LIMIT_MIB";
+var LIMIT_APPLIED = "CODEWHALE_HOST_MEMORY_LIMIT_APPLIED";
+var POSIX_SPAWN_SETEXEC = 64;
+var POSIX_SPAWN_JETSAM_MEMLIMIT_ACTIVE_FATAL = 4;
+var POSIX_SPAWN_JETSAM_MEMLIMIT_INACTIVE_FATAL = 8;
+var JETSAM_PRIORITY_DEFAULT = -1;
+function applyMemoryLimit() {
+  const requested = Number(process.env[LIMIT_REQUEST] ?? "");
+  const applied = process.env[LIMIT_APPLIED];
+  delete process.env[LIMIT_REQUEST];
+  delete process.env[LIMIT_APPLIED];
+  if (!Number.isSafeInteger(requested) || requested <= 0) return void 0;
+  if (applied === String(requested)) return requested;
+  let failure;
+  if (applied !== void 0) {
+    failure = `re-exec reported ${applied} MiB, not ${requested}`;
+  } else if (RUNTIME.name !== "bun" || process.platform !== "darwin") {
+    failure = `only Bun on macOS applies its own limit (this is ${RUNTIME.name} on ${process.platform})`;
+  } else {
+    failure = execUnderJetsamLimit(requested);
+  }
+  process.stderr.write(`codewhale-extension-host: kernel memory limit not applied: ${failure}
+`);
+  return void 0;
+}
+function execUnderJetsamLimit(mib) {
+  const { dlopen, FFIType, ptr } = require2("bun:ffi");
+  let lib;
+  try {
+    lib = dlopen("/usr/lib/libSystem.B.dylib", {
+      posix_spawnattr_init: { args: [FFIType.ptr], returns: FFIType.i32 },
+      posix_spawnattr_destroy: { args: [FFIType.ptr], returns: FFIType.i32 },
+      posix_spawnattr_setflags: { args: [FFIType.ptr, FFIType.i16], returns: FFIType.i32 },
+      posix_spawnattr_setjetsam_ext: {
+        args: [FFIType.ptr, FFIType.i16, FFIType.i32, FFIType.i32, FFIType.i32],
+        returns: FFIType.i32
+      },
+      posix_spawn: {
+        args: [FFIType.ptr, FFIType.ptr, FFIType.ptr, FFIType.ptr, FFIType.ptr, FFIType.ptr],
+        returns: FFIType.i32
+      }
+    });
+  } catch (error) {
+    return `libSystem: ${error.message}`;
+  }
+  const call = lib.symbols;
+  const keep = [];
+  const cString = (text) => {
+    const bytes = Buffer.from(`${text}\0`);
+    keep.push(bytes);
+    return ptr(bytes);
+  };
+  const cArray = (items) => {
+    const array = new BigUint64Array(items.length + 1);
+    items.forEach((item, index) => {
+      array[index] = BigInt(cString(item));
+    });
+    keep.push(array);
+    return ptr(array);
+  };
+  const attr = new BigUint64Array(1);
+  let code = call.posix_spawnattr_init(ptr(attr));
+  if (code !== 0) {
+    lib.close();
+    return `posix_spawnattr_init failed (${code})`;
+  }
+  try {
+    code = call.posix_spawnattr_setflags(ptr(attr), POSIX_SPAWN_SETEXEC);
+    if (code !== 0) return `posix_spawnattr_setflags failed (${code})`;
+    code = call.posix_spawnattr_setjetsam_ext(
+      ptr(attr),
+      POSIX_SPAWN_JETSAM_MEMLIMIT_ACTIVE_FATAL | POSIX_SPAWN_JETSAM_MEMLIMIT_INACTIVE_FATAL,
+      JETSAM_PRIORITY_DEFAULT,
+      mib,
+      mib
+    );
+    if (code !== 0) return `posix_spawnattr_setjetsam_ext failed (${code})`;
+    const argv = [process.execPath, ...process.execArgv, ...process.argv.slice(1)];
+    const env = { ...process.env, [LIMIT_REQUEST]: String(mib), [LIMIT_APPLIED]: String(mib) };
+    const envp = Object.entries(env).filter((entry) => typeof entry[1] === "string").map(([key, value]) => `${key}=${value}`);
+    code = call.posix_spawn(null, cString(process.execPath), null, ptr(attr), cArray(argv), cArray(envp));
+    return `posix_spawn failed (${code})`;
+  } finally {
+    call.posix_spawnattr_destroy(ptr(attr));
+    lib.close();
+  }
+}
+function lockMethod(target, name, what) {
+  Object.defineProperty(target, name, {
+    value: () => refuse(what),
+    writable: false,
+    configurable: false
+  });
+}
+function lockExports(target, what) {
+  for (const name of Object.keys(target)) {
+    Object.defineProperty(target, name, {
+      get: () => refuse(what),
+      enumerable: true,
+      configurable: false
+    });
+  }
+  Object.freeze(target);
+}
+function lockPrototype(target, what) {
+  const prototype = target.prototype;
+  for (const key of Reflect.ownKeys(prototype)) {
+    if (key === "constructor") continue;
+    const accessor = Object.getOwnPropertyDescriptor(prototype, key);
+    Object.defineProperty(
+      prototype,
+      key,
+      accessor?.get || accessor?.set ? { get: () => refuse(what), set: () => refuse(what), configurable: false } : { value: () => refuse(what), writable: false, configurable: false }
+    );
+  }
+  Object.freeze(prototype);
+}
+function importBuiltin(specifier) {
+  return import(specifier);
+}
+function builtin(specifier) {
+  try {
+    return require2(specifier);
+  } catch {
+    return void 0;
+  }
+}
+async function verifyBunLockdown(locked) {
+  const probes = [
+    ["`bun:ffi`", () => importBuiltin("bun:ffi").then((ffi) => ffi.dlopen)],
+    ["`Bun.FFI`", async () => globalThis.Bun.FFI.dlopen],
+    ["`bun:sqlite`", () => importBuiltin("bun:sqlite").then((sqlite) => sqlite.Database)],
+    ["`node:sqlite`", () => importBuiltin("node:sqlite").then(({ DatabaseSync }) => new DatabaseSync(":memory:", { open: false }).open())]
+  ];
+  for (const [what, probe] of probes) {
+    if (!locked.has(what)) continue;
+    const outcome = await probe().then(
+      () => "reachable",
+      (error) => String(error?.message ?? error)
+    );
+    if (outcome !== `${what} is not available to extensions`) {
+      throw new Error(`native-code lockdown does not hold on Bun ${RUNTIME.version}: ${what} (${outcome})`);
+    }
+  }
+}
+async function denyNativeCode() {
+  lockMethod(process, "dlopen", "process.dlopen");
+  if (typeof process.execve === "function") lockMethod(process, "execve", "process.execve");
+  const denied = function Worker2() {
+    refuse("`Worker`");
+  };
+  const threads = require2("node:worker_threads");
+  Object.defineProperty(threads, "Worker", { value: denied, writable: false, configurable: false, enumerable: true });
+  nodeModule.syncBuiltinESMExports?.();
+  if (typeof globalThis.Worker === "function") {
+    Object.defineProperty(globalThis, "Worker", { value: denied, writable: false, configurable: false });
+  }
+  if (RUNTIME.name === "bun") {
+    const locked = /* @__PURE__ */ new Set();
+    const ffi = builtin("bun:ffi");
+    if (ffi) {
+      lockExports(ffi, "`bun:ffi`");
+      locked.add("`bun:ffi`");
+    }
+    const bun = globalThis.Bun;
+    if (bun.FFI) {
+      lockExports(bun.FFI, "`Bun.FFI`");
+      Object.defineProperty(bun, "FFI", { writable: false });
+      locked.add("`Bun.FFI`");
+    }
+    const bunSqlite = builtin("bun:sqlite");
+    if (bunSqlite) {
+      lockExports(bunSqlite, "`bun:sqlite`");
+      locked.add("`bun:sqlite`");
+    }
+    const sqlite = builtin("node:sqlite");
+    if (sqlite) {
+      for (const name of ["DatabaseSync", "StatementSync", "Session"]) {
+        if (typeof sqlite[name] === "function") lockPrototype(sqlite[name], "`node:sqlite`");
+      }
+      lockExports(sqlite, "`node:sqlite`");
+      locked.add("`node:sqlite`");
+    }
+    if (typeof globalThis.ShadowRealm !== "undefined" || vm.runInNewContext("typeof ShadowRealm") !== "undefined") {
+      throw new Error("ShadowRealm is enabled; the host must run with BUN_JSC_useShadowRealm=0");
+    }
+    await verifyBunLockdown(locked);
+    return;
+  }
+  for (const [name, flag] of [
+    ["node:ffi", "--no-experimental-ffi"],
+    ["node:sqlite", "--no-experimental-sqlite"]
+  ]) {
+    if (nodeModule.isBuiltin(name)) throw new Error(`\`${name}\` is enabled; the host must run with ${flag}`);
+  }
+}
+
+// src/dsh/resolve-hooks.ts
 var SCHEME = "codewhale-host:";
 var REGISTRY_KEY = /* @__PURE__ */ Symbol.for("codewhale.extension-host.modules");
 var SINGLETONS = {
@@ -3926,12 +4133,47 @@ function virtualSource(key, namespace) {
   if ("default" in namespace) lines.push("export default ns.default;");
   return lines.join("\n");
 }
+var PEER_PATH = /[\\/]node_modules[\\/]((?:@deepseek-ai[\\/](?:dsh-[^\\/]+|cordis(?:-[^\\/]+)?|schemastery|cosmokit))|cosmokit)[\\/]/;
+function explainImportError(error) {
+  const match = error instanceof Error ? /Cannot find package '([^']+)'/.exec(error.message) : null;
+  if (!match) return error;
+  try {
+    classifySpecifier(match[1]);
+  } catch (unsupported) {
+    return unsupported;
+  }
+  return error;
+}
+function installBunResolver(modules) {
+  const bun = globalThis.Bun;
+  bun.plugin({
+    name: "codewhale-host-modules",
+    setup(build) {
+      for (const [specifier, key] of Object.entries(SINGLETONS)) {
+        if (key in modules) build.module(specifier, () => ({ exports: modules[key], loader: "object" }));
+      }
+      build.onResolve({ filter: /^[^./]/ }, (args) => {
+        const key = classifySpecifier(args.path);
+        if (key !== null && !(key in modules)) throw new UnsupportedPeerError(args.path);
+        return void 0;
+      });
+      build.onLoad({ filter: PEER_PATH }, (args) => {
+        const match = PEER_PATH.exec(args.path);
+        throw new UnsupportedPeerError((match?.[1] ?? args.path).replaceAll("\\", "/"));
+      });
+    }
+  });
+}
 var installed = false;
 function installResolveHooks(modules) {
   if (installed) return;
   installed = true;
   globalThis[REGISTRY_KEY] = modules;
-  registerHooks({
+  if (RUNTIME.name === "bun") {
+    installBunResolver(modules);
+    return;
+  }
+  nodeModule2.registerHooks({
     resolve(specifier, context, nextResolve) {
       const key = classifySpecifier(specifier);
       if (key !== null) {
@@ -3950,32 +4192,133 @@ function installResolveHooks(modules) {
   });
 }
 
-// src/protocol.ts
+// src/protocol.generated.ts
 var PROTOCOL_VERSION = 1;
-var MAGIC = Buffer.from("CWX1", "ascii");
-var MAX_FRAME = 32 * 1024 * 1024;
+var MAGIC_ASCII = "CWX1";
 var HEADER_LEN = 8;
+var MAX_FRAME = 33554432;
+var MAX_INFLIGHT = 256;
 var ErrorCode = {
   ParseError: -32700,
   InvalidRequest: -32600,
   MethodNotFound: -32601,
   InvalidParams: -32602,
   Internal: -32603,
-  /** The tool body threw. */
   ExecutionFailed: -32e3,
-  /** The handle is unknown, revoked, or its owner is not active. */
   NotAvailable: -32001,
-  /** Cancelled by `$/cancel` (LSP's RequestCancelled). */
   Cancelled: -32800
 };
-var CORE_TO_HOST = {
-  requests: ["host/initialize", "host/shutdown", "host/ping", "ext/activate", "ext/deactivate", "tool/call"],
-  notifications: ["$/cancel"]
+var METHODS = [
+  { name: "host/initialize", direction: "core_to_host", request: true, params: "InitializeParams" },
+  { name: "host/ping", direction: "core_to_host", request: true, params: "EmptyParams" },
+  { name: "host/shutdown", direction: "core_to_host", request: true, params: "EmptyParams" },
+  { name: "ext/activate", direction: "core_to_host", request: true, params: "ActivateParams" },
+  { name: "ext/deactivate", direction: "core_to_host", request: true, params: "DeactivateParams" },
+  { name: "tool/call", direction: "core_to_host", request: true, params: "ToolCallParams" },
+  { name: "$/cancel", direction: "core_to_host", request: false, params: "CancelParams" },
+  { name: "host/hello", direction: "host_to_core", request: false, params: "HelloParams" },
+  { name: "host/ready", direction: "host_to_core", request: false, params: "EmptyParams" },
+  { name: "registry/register", direction: "host_to_core", request: true, params: "RegisterParams" },
+  { name: "registry/unregister", direction: "host_to_core", request: true, params: "UnregisterParams" },
+  { name: "ext/faulted", direction: "host_to_core", request: false, params: "FaultedParams" },
+  { name: "log", direction: "host_to_core", request: false, params: "LogParams" },
+  { name: "$/cancel", direction: "host_to_core", request: false, params: "CancelParams" }
+];
+var SHAPES = {
+  ActivateParams: {
+    strict: false,
+    required: { owner: { ref: "OwnerRef" }, plugin_name: "string", entry: { ref: "EntryRef" } },
+    optional: { config: "json" }
+  },
+  CancelParams: {
+    strict: true,
+    required: { id: "uint" },
+    optional: {}
+  },
+  DeactivateParams: {
+    strict: false,
+    required: { owner: { ref: "OwnerRef" } },
+    optional: {}
+  },
+  EmptyParams: {
+    strict: true,
+    required: {},
+    optional: {}
+  },
+  EntryRef: {
+    strict: false,
+    required: { path: "string", sha256: "string" },
+    optional: {}
+  },
+  FaultedParams: {
+    strict: true,
+    required: { owner: { ref: "OwnerRef" }, error: "string" },
+    optional: {}
+  },
+  HelloParams: {
+    strict: true,
+    required: { protocol: { ref: "ProtocolRange" }, host_version: "string", bundle_sha256: "string", runtime: { ref: "HelloRuntime" } },
+    optional: { memory_limit_mib: "uint" }
+  },
+  HelloRuntime: {
+    strict: true,
+    required: { name: "string", version: "string" },
+    optional: {}
+  },
+  HostLimits: {
+    strict: false,
+    required: { max_frame: "uint", max_inflight: "uint", dispose_deadline_ms: "uint", activate_deadline_ms: "uint" },
+    optional: {}
+  },
+  InitializeParams: {
+    strict: false,
+    required: { protocol: "uint", limits: { ref: "HostLimits" } },
+    optional: {}
+  },
+  LogParams: {
+    strict: true,
+    required: { level: "string", msg: "string" },
+    optional: { plugin_id: "string" }
+  },
+  OwnerRef: {
+    strict: true,
+    required: { plugin_id: "string", generation: "uint", owner_token: "string" },
+    optional: {}
+  },
+  ProtocolRange: {
+    strict: true,
+    required: { min: "uint", max: "uint" },
+    optional: {}
+  },
+  RegisterParams: {
+    strict: true,
+    required: { owner: { ref: "OwnerRef" }, kind: { enum: ["tool"] }, spec: { ref: "ToolSpecWire" } },
+    optional: {}
+  },
+  RpcErrorWire: {
+    strict: true,
+    required: { code: "integer", message: "string" },
+    optional: { data: "json" }
+  },
+  ToolCallParams: {
+    strict: false,
+    required: { handle: "uint", call_id: "string", input: "json", deadline_ms: "uint" },
+    optional: {}
+  },
+  ToolSpecWire: {
+    strict: true,
+    required: { name: "string", description: "string", input_schema: "object" },
+    optional: {}
+  },
+  UnregisterParams: {
+    strict: true,
+    required: { owner: { ref: "OwnerRef" }, handle: "uint" },
+    optional: {}
+  }
 };
-var HOST_TO_CORE = {
-  requests: ["registry/register", "registry/unregister"],
-  notifications: ["host/hello", "host/ready", "ext/faulted", "log", "$/cancel"]
-};
+
+// src/protocol.ts
+var MAGIC = Buffer.from(MAGIC_ASCII, "ascii");
 var FrameError = class extends Error {
   constructor(message) {
     super(message);
@@ -4026,35 +4369,47 @@ var FrameDecoder = class {
 function isObject2(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
-function checkShape(where, value, required, optional = {}, strict = false) {
+function checkShape(where, value, shape) {
   if (!isObject2(value)) throw new ProtocolError(`${where}: expected an object`);
-  for (const [key, kind] of Object.entries(required)) {
+  for (const [key, kind] of Object.entries(shape.required)) {
     if (!(key in value)) throw new ProtocolError(`${where}: missing field \`${key}\``);
     checkKind(`${where}.${key}`, value[key], kind);
   }
-  for (const [key, kind] of Object.entries(optional)) {
-    if (key in value && value[key] !== void 0) checkKind(`${where}.${key}`, value[key], kind);
+  for (const [key, kind] of Object.entries(shape.optional)) {
+    if (value[key] !== void 0 && value[key] !== null) checkKind(`${where}.${key}`, value[key], kind);
   }
-  if (strict) {
+  if (shape.strict) {
     for (const key of Object.keys(value)) {
-      if (!(key in required) && !(key in optional)) {
+      if (!(key in shape.required) && !(key in shape.optional)) {
         throw new ProtocolError(`${where}: unknown field \`${key}\``);
       }
     }
   }
 }
 function checkKind(where, value, kind) {
+  if (typeof kind === "object") {
+    if ("ref" in kind) return checkShape(where, value, SHAPES[kind.ref]);
+    if ("enum" in kind) {
+      if (typeof value !== "string" || !kind.enum.includes(value)) {
+        throw new ProtocolError(`${where}: expected one of ${kind.enum.map((v) => `\`${v}\``).join(", ")}`);
+      }
+      return;
+    }
+    if (!Array.isArray(value)) throw new ProtocolError(`${where}: expected an array`);
+    value.forEach((item, index) => checkKind(`${where}[${index}]`, item, kind.items));
+    return;
+  }
   switch (kind) {
     case "string":
       if (typeof value !== "string") throw new ProtocolError(`${where}: expected a string`);
       return;
-    case "number":
-      if (typeof value !== "number" || !Number.isFinite(value)) throw new ProtocolError(`${where}: expected a number`);
-      return;
-    case "u64":
+    case "uint":
       if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
         throw new ProtocolError(`${where}: expected an unsigned integer`);
       }
+      return;
+    case "integer":
+      if (typeof value !== "number" || !Number.isSafeInteger(value)) throw new ProtocolError(`${where}: expected an integer`);
       return;
     case "boolean":
       if (typeof value !== "boolean") throw new ProtocolError(`${where}: expected a boolean`);
@@ -4062,100 +4417,38 @@ function checkKind(where, value, kind) {
     case "object":
       if (!isObject2(value)) throw new ProtocolError(`${where}: expected an object`);
       return;
-    case "array":
-      if (!Array.isArray(value)) throw new ProtocolError(`${where}: expected an array`);
-      return;
-    case "owner":
-      checkShape(where, value, { plugin_id: "string", generation: "u64", owner_token: "string" }, {}, true);
-      return;
     case "json":
       return;
   }
 }
-var PARAMS = {
-  // host → core
-  "host/hello": {
-    dir: "host",
-    required: { protocol: "object", host_version: "string", bundle_sha256: "string", node_version: "string" },
-    check: (p, strict) => checkShape("host/hello.protocol", p.protocol, { min: "u64", max: "u64" }, {}, strict)
-  },
-  "host/ready": { dir: "host", required: {} },
-  "registry/register": {
-    dir: "host",
-    required: { owner: "owner", kind: "string", spec: "object" },
-    check: (p, strict) => {
-      if (p.kind !== "tool") throw new ProtocolError(`registry/register: unsupported kind \`${p.kind}\``);
-      checkShape("registry/register.spec", p.spec, { name: "string", description: "string", input_schema: "object" }, {}, strict);
-    }
-  },
-  "registry/unregister": { dir: "host", required: { owner: "owner", handle: "u64" } },
-  "ext/faulted": { dir: "host", required: { owner: "owner", error: "string" } },
-  log: { dir: "host", required: { level: "string", msg: "string" }, optional: { plugin_id: "string" } },
-  // core → host
-  "host/initialize": {
-    dir: "core",
-    required: { protocol: "u64", limits: "object" },
-    check: (p, strict) => checkShape(
-      "host/initialize.limits",
-      p.limits,
-      { max_frame: "u64", max_inflight: "u64", dispose_deadline_ms: "u64", activate_deadline_ms: "u64" },
-      {},
-      strict
-    )
-  },
-  "host/shutdown": { dir: "core", required: {} },
-  "host/ping": { dir: "core", required: {} },
-  "ext/activate": {
-    dir: "core",
-    required: { owner: "owner", plugin_name: "string", entry: "object" },
-    optional: { config: "json" },
-    check: (p, strict) => checkShape("ext/activate.entry", p.entry, { path: "string", sha256: "string" }, {}, strict)
-  },
-  "ext/deactivate": { dir: "core", required: { owner: "owner" } },
-  "tool/call": {
-    dir: "core",
-    required: { handle: "u64", call_id: "string", input: "json", deadline_ms: "u64" }
-  }
-};
-var CANCEL_SHAPE = { id: "u64" };
 function validateMessage(value, direction) {
   const strict = direction === "host_to_core";
   if (!isObject2(value)) throw new ProtocolError("message: expected an object");
   if (value.jsonrpc !== "2.0") throw new ProtocolError('message: jsonrpc must be "2.0"');
   const hasId = "id" in value;
-  if (hasId) checkKind("message.id", value.id, "u64");
+  if (hasId) checkKind("message.id", value.id, "uint");
   if ("method" in value) {
-    checkShape("message", value, { jsonrpc: "string", method: "string" }, { id: "u64", params: "json" }, strict);
+    checkShape("message", value, { strict, required: { jsonrpc: "string", method: "string" }, optional: { id: "uint", params: "json" } });
     const method = value.method;
-    const params = value.params ?? {};
-    if (method === "$/cancel") {
-      if (hasId) throw new ProtocolError("$/cancel must be a notification");
-      checkShape("$/cancel", params, CANCEL_SHAPE, {}, strict);
-      return value;
+    const spec = METHODS.find((entry) => entry.name === method && entry.direction === direction);
+    if (!spec) throw new ProtocolError(`unknown ${direction} method \`${method}\``);
+    if (spec.request !== hasId) {
+      throw new ProtocolError(`\`${method}\` must be ${spec.request ? "a request (with id)" : "a notification (no id)"}`);
     }
-    const spec = PARAMS[method];
-    const expectedDir = direction === "host_to_core" ? "host" : "core";
-    if (!spec || spec.dir !== expectedDir) {
-      throw new ProtocolError(`unknown ${direction} method \`${method}\``);
+    const params = "params" in value ? value.params : {};
+    checkShape(method, params, SHAPES[spec.params]);
+    if (method === "host/hello" && params.runtime.name !== "bun" && params.runtime.name !== "node") {
+      throw new ProtocolError(`host/hello.runtime.name: unknown runtime \`${params.runtime.name}\``);
     }
-    const isRequest = (direction === "host_to_core" ? HOST_TO_CORE.requests : CORE_TO_HOST.requests).includes(
-      method
-    );
-    if (isRequest !== hasId) {
-      throw new ProtocolError(`\`${method}\` must be ${isRequest ? "a request (with id)" : "a notification (no id)"}`);
-    }
-    checkShape(method, params, spec.required, spec.optional ?? {}, strict);
-    spec.check?.(params, strict);
     return value;
   }
   if (!hasId) throw new ProtocolError("response: missing id");
   if ("error" in value) {
-    checkShape("message", value, { jsonrpc: "string", id: "u64", error: "object" }, {}, strict);
-    checkShape("error", value.error, { code: "number", message: "string" }, { data: "json" }, strict);
+    checkShape("message", value, { strict, required: { jsonrpc: "string", id: "uint", error: { ref: "RpcErrorWire" } }, optional: {} });
     return value;
   }
   if (!("result" in value)) throw new ProtocolError("response: needs result or error");
-  checkShape("message", value, { jsonrpc: "string", id: "u64", result: "json" }, {}, strict);
+  checkShape("message", value, { strict, required: { jsonrpc: "string", id: "uint", result: "json" }, optional: {} });
   return value;
 }
 
@@ -4173,7 +4466,6 @@ var RpcError = class extends Error {
     return this.data === void 0 ? { code: this.code, message: this.message } : { code: this.code, message: this.message, data: this.data };
   }
 };
-var MAX_INFLIGHT = 256;
 var RpcPeer = class {
   constructor(send) {
     this.send = send;
@@ -4444,7 +4736,9 @@ var HostRoot = class {
       if (digest !== params.entry.sha256) {
         throw new Error(`entry ${params.entry.path} changed after review (sha256 ${digest.slice(0, 12)}…)`);
       }
-      const module = await ownerStorage.run(owner, () => import(pathToFileURL(params.entry.path).href));
+      const module = await ownerStorage.run(owner, () => import(pathToFileURL(params.entry.path).href)).catch((error) => {
+        throw explainImportError(error);
+      });
       const plugin = pickPlugin(module);
       const missing = Object.keys(Inject.resolve(plugin.inject)).filter((name) => !PROVIDED_SERVICES.has(name));
       if (missing.length > 0) {
@@ -4586,6 +4880,7 @@ function pendingFibers(fiber) {
 
 // src/main.ts
 var HOST_VERSION = "0.1.0";
+var MEMORY_LIMIT_MIB = applyMemoryLimit();
 var channelWrite = process.stdout.write.bind(process.stdout);
 var stderrWrite = process.stderr.write.bind(process.stderr);
 process.stdout.write = ((chunk, encoding, callback) => stderrWrite(chunk, encoding, callback));
@@ -4624,6 +4919,7 @@ function killHostTree() {
   }
   return realExit(0);
 }
+var { Worker } = createRequire2(import.meta.url)("node:worker_threads");
 var watchdog = new Worker(
   `const { workerData } = require('node:worker_threads')
   const parent = process.ppid
@@ -4634,6 +4930,7 @@ var watchdog = new Worker(
   { eval: true, workerData: { pid: process.pid, group: OWN_GROUP }, resourceLimits: { maxOldGenerationSizeMb: 8 } }
 );
 watchdog.unref();
+await denyNativeCode();
 function shutdownNow(code) {
   channelWrite("", () => realExit(code));
   setTimeout(() => realExit(code), 200).unref();
@@ -4720,7 +5017,8 @@ rpc.notify("host/hello", {
   protocol: { min: PROTOCOL_VERSION, max: PROTOCOL_VERSION },
   host_version: HOST_VERSION,
   bundle_sha256: bundleDigest(),
-  node_version: process.versions.node
+  runtime: RUNTIME,
+  ...MEMORY_LIMIT_MIB === void 0 ? {} : { memory_limit_mib: MEMORY_LIMIT_MIB }
 });
 export {
   HOST_VERSION

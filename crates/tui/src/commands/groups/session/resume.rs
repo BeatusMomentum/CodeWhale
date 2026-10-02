@@ -64,7 +64,7 @@ pub(in crate::commands) fn resume_portable(
                     "Imported foreign session as {} ({} entries, leaf {})",
                     receipt.truncated_id, receipt.entry_count, receipt.leaf_display
                 ),
-                super::sync_session_action(receipt.sync),
+                codewhale_command_contract::outcome::SessionAction::SyncSession(receipt.sync),
             ),
             Err(error) => CommandResult::error(error),
         },
@@ -73,14 +73,16 @@ pub(in crate::commands) fn resume_portable(
                 "Imported foreign session as {} ({} entries, leaf {})",
                 receipt.truncated_id, receipt.entry_count, receipt.leaf_display
             ),
-            super::sync_session_action(receipt.sync),
+            codewhale_command_contract::outcome::SessionAction::SyncSession(receipt.sync),
         ),
         Ok(ResumeSource::Session {
             load_path,
             truncated_id,
             title,
         }) => match load_path {
-            Some(path) => CommandResult::action(crate::tui::app::AppAction::LoadSession(path)),
+            Some(path) => CommandResult::action(
+                codewhale_command_contract::outcome::SessionAction::LoadSession(path),
+            ),
             None => CommandResult::message(format!("Resuming session {truncated_id} ({title})")),
         },
         Ok(ResumeSource::NotFound { raw, error }) => CommandResult::error(format!(
@@ -152,7 +154,7 @@ mod tests {
         assert!(
             matches!(
                 result.action,
-                Some(crate::tui::app::AppAction::SyncSession { ref session_id, .. })
+                Some(codewhale_command_contract::outcome::SessionAction::SyncSession(codewhale_command_contract::facets::SessionSyncPayload { ref session_id, .. }))
                 if session_id.as_deref() == Some("imp-9")
             ),
             "{result:?}"
@@ -185,7 +187,7 @@ mod tests {
         assert!(
             matches!(
                 result.action,
-                Some(crate::tui::app::AppAction::SyncSession { ref session_id, .. })
+                Some(codewhale_command_contract::outcome::SessionAction::SyncSession(codewhale_command_contract::facets::SessionSyncPayload { ref session_id, .. }))
                 if session_id.as_deref() == Some("c-1")
             ),
             "{result:?}"
@@ -204,7 +206,7 @@ mod tests {
         assert!(!result.is_error);
         assert!(matches!(
             result.action,
-            Some(crate::tui::app::AppAction::LoadSession(path)) if path == *"/tmp/sessions/abc123.json"
+            Some(codewhale_command_contract::outcome::SessionAction::LoadSession(path)) if path == *"/tmp/sessions/abc123.json"
         ));
 
         let mut fake = control_fake();

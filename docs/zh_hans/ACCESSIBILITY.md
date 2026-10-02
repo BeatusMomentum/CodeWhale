@@ -1,11 +1,11 @@
 # 无障碍
 
 > 英文原文：[ACCESSIBILITY.md](../ACCESSIBILITY.md)。
-> 最后与英文同步日期（last synced with English revision）：2026-09-26。
+> 最后与英文同步日期（last synced with English revision）：2026-09-29。
 
-Codewhale 跑在终端里，所以平台自带的无障碍栈（屏幕阅读器、放大镜、终端级主题）
-承担了大部分工作。TUI 提供少量开关，让屏幕阅读器用户和低动效用户把视觉动效
-和信息密度降下来。
+Codewhale 运行在终端里，所以平台自带的无障碍栈（屏幕阅读器、放大镜、终端级主题）
+承担了大部分工作。TUI 提供少量开关，让屏幕阅读器用户和低动效用户降低视觉动效
+和信息密度。
 
 ## 快速参考
 
@@ -27,14 +27,14 @@ Codewhale 跑在终端里，所以平台自带的无障碍栈（屏幕阅读器�
 
 调色板在两处强制 WCAG 对比度下限，代码真正保证的也就这些，不多不少：
 
-* **绘制时**，每个文本单元都会针对自己实际渲染所在的那个表面，把对比度提升到
+* **绘制时**，每个文本单元都会针对它实际渲染所在的表面，把对比度提升到
   4.5:1（终端后端里的 `enforce_cell_contrast`）。框架装饰（边框、块字形）不做钳制；
   自带整套自定义调色板的社区预设（Catppuccin、Tokyo Night、Dracula、Gruvbox、
   Claude、Matrix、Solarized Light、Terminal）不参与绘制时的对比度钳制，
   因为它们的作者已经调过这些配色对。
 * **按主题**，一个审计（`theme_contrast_violations`）要求每个可选预设都守住
   同样的下限：正文、soft 和 muted 文本在每个主表面上都达到 4.5:1（包括选中
-  和错误表面）；提示文本和暗文本 3:1；状态、警告、成功和信息角色为 3:1，
+  和错误表面）；提示文本和弱化文本为 3:1；状态、警告、成功和信息角色为 3:1，
   因为它们本就冗余——每个状态还带一个字形和一个文字标签，颜色从不是唯一的
   通道。diff 的前景/背景对要求 3:1。
 * **Terminal**（透明）主题按设计豁免：它绘制 `Color::Reset` 表面和 ANSI 强调色，
@@ -93,14 +93,14 @@ Tilix 和 Terminator 的会话会自动以低动效模式启动，因为这类�
 * `low_motion` 把空闲重绘循环放慢到每帧约 120ms，并冻结状态标记，但不会合成
   模型文本，也不会给它限流。配合 `calm_mode`，重绘频率足够低，VoiceOver / Orca 的
   播报会跟随模型输出线性推进，而不是每个 tick 都把整屏重念一遍。
-* 转录（transcript）是纯文本——没有图片，也没有 canvas 渲染——所以任何集成了平台
+* 对话记录（transcript）是纯文本——没有图片，也没有 canvas 渲染——所以任何集成了平台
   无障碍服务的终端（例如 macOS Terminal.app、iTerm2、Ghostty、Windows Terminal）
   都会把渲染后的内容原样透传。
 * 如果 `low_motion = true` 时仍有界面元素产生动效，请针对
   [`PRIOR: Screen-reader / accessibility flag`](https://github.com/Hmbown/CodeWhale/issues/450)
   提一个 issue，并附上截图或终端录制。
 
-## 相关议题 / 历史
+## 相关 issue / 历史
 
 * [#450](https://github.com/Hmbown/CodeWhale/issues/450) ——
   记录已有的开关，加入 `NO_ANIMATIONS` 启动覆盖，并撰写本页。

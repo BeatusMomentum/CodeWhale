@@ -955,7 +955,7 @@ mod tests {
                 &json!({"search_query": [{"q": "espresso"}, {"q": "grinder"}]}),
                 None,
             ),
-            "在网上搜索“espresso”（另 1 项）"
+            "在网上搜索“espresso” （另 1 项）"
         );
         assert_eq!(
             approval_summary_in(Locale::Fr, "mcp_github_create_issue", &json!({}), None),

@@ -1374,20 +1374,24 @@ fn render_directory_mention_context(raw: &str, path: &Path, display_path: &str) 
         }
     };
 
-    let mut names = entries
-        .filter_map(|entry| entry.ok())
-        .map(|entry| {
-            let marker = entry
-                .file_type()
-                .ok()
-                .filter(|ty| ty.is_dir())
-                .map_or("", |_| "/");
-            format!("{}{}", entry.file_name().to_string_lossy(), marker)
-        })
-        .collect::<Vec<_>>();
-    names.sort();
-    let total = names.len();
-    names.truncate(MAX_DIRECTORY_MENTION_ENTRIES);
+    // Keep only the first MAX entries in sort order while counting the rest:
+    // a max-heap of that size bounds memory to the output instead of
+    // materializing and sorting the whole directory (U07-03).
+    let mut total = 0usize;
+    let mut kept = std::collections::BinaryHeap::with_capacity(MAX_DIRECTORY_MENTION_ENTRIES + 1);
+    for entry in entries.filter_map(|entry| entry.ok()) {
+        total += 1;
+        let marker = entry
+            .file_type()
+            .ok()
+            .filter(|ty| ty.is_dir())
+            .map_or("", |_| "/");
+        kept.push(format!("{}{}", entry.file_name().to_string_lossy(), marker));
+        if kept.len() > MAX_DIRECTORY_MENTION_ENTRIES {
+            kept.pop();
+        }
+    }
+    let names = kept.into_sorted_vec();
     let mut body = names.join("\n");
     if total > MAX_DIRECTORY_MENTION_ENTRIES {
         let omitted = total - MAX_DIRECTORY_MENTION_ENTRIES;
@@ -1398,13 +1402,15 @@ fn render_directory_mention_context(raw: &str, path: &Path, display_path: &str) 
 
 /// Bounded read of a mention's file content, optionally sliced to a line
 /// range. Returns `(text, truncated, beyond_eof)`: `truncated` mirrors the
-/// full-file byte bound; `beyond_eof` is set only when the requested range
-/// starts past the end of the file.
+/// full-file byte bound, except for a range that starts past that bound,
+/// where it says whether the streamed range itself was cut; `beyond_eof` is
+/// set only when the requested range starts past the end of the file.
 fn read_file_content(
     path: &Path,
     range: Option<FileRange>,
 ) -> std::io::Result<(String, bool, bool)> {
-    let (text, truncated) = read_text_prefix(path)?;
+    let mut file = std::fs::File::open(path)?;
+    let (text, truncated) = read_text_prefix(&mut file)?;
     let Some(FileRange { start, end }) = range else {
         return Ok((text, truncated, false));
     };
@@ -1414,14 +1420,78 @@ fn read_file_content(
     }
     let start_idx = usize::try_from(start.saturating_sub(1)).unwrap_or(usize::MAX);
     if start_idx >= lines.len() {
+        if truncated {
+            // The prefix ended, not the file: read the range from the file
+            // itself instead of calling it past EOF (U07-04).
+            std::io::Seek::rewind(&mut file)?;
+            return read_line_range_past_prefix(file, u64::from(start), u64::from(end));
+        }
         return Ok((String::new(), truncated, true));
     }
     let end_idx = usize::try_from(end).unwrap_or(usize::MAX).min(lines.len());
     Ok((lines[start_idx..end_idx].join("\n"), truncated, false))
 }
 
-fn read_text_prefix(path: &Path) -> std::io::Result<(String, bool)> {
-    let mut file = std::fs::File::open(path)?;
+/// Stream a 1-based inclusive line range that starts beyond the bounded
+/// prefix. Skipped lines are scanned, never stored; the range text itself is
+/// held to the same byte budget as a whole-file mention.
+fn read_line_range_past_prefix(
+    file: impl Read,
+    start: u64,
+    end: u64,
+) -> std::io::Result<(String, bool, bool)> {
+    use std::io::BufRead;
+    let mut reader = std::io::BufReader::new(file);
+    let mut line = 1u64;
+    while line < start {
+        let buf = reader.fill_buf()?;
+        if buf.is_empty() {
+            return Ok((String::new(), false, true));
+        }
+        let consumed = match buf.iter().position(|byte| *byte == b'\n') {
+            Some(newline) => {
+                line += 1;
+                newline + 1
+            }
+            None => buf.len(),
+        };
+        reader.consume(consumed);
+    }
+    if reader.fill_buf()?.is_empty() {
+        return Ok((String::new(), false, true));
+    }
+    let budget = usize::try_from(MAX_MENTION_FILE_BYTES).unwrap_or(usize::MAX);
+    let mut buffer = Vec::new();
+    let mut truncated = false;
+    while line <= end {
+        let buf = reader.fill_buf()?;
+        if buf.is_empty() {
+            break;
+        }
+        let (take, newline) = match buf.iter().position(|byte| *byte == b'\n') {
+            Some(newline) => (newline + 1, true),
+            None => (buf.len(), false),
+        };
+        let room = budget - buffer.len();
+        if take > room {
+            buffer.extend_from_slice(&buf[..room]);
+            truncated = true;
+            break;
+        }
+        buffer.extend_from_slice(&buf[..take]);
+        reader.consume(take);
+        if newline {
+            line += 1;
+        }
+    }
+    let mut text = decode_bounded_text(buffer, truncated)?;
+    if text.ends_with('\n') {
+        text.pop();
+    }
+    Ok((text, truncated, false))
+}
+
+fn read_text_prefix(file: &mut impl Read) -> std::io::Result<(String, bool)> {
     let mut buffer = Vec::new();
     file.by_ref()
         .take(MAX_MENTION_FILE_BYTES + 1)
@@ -1429,6 +1499,13 @@ fn read_text_prefix(path: &Path) -> std::io::Result<(String, bool)> {
     let truncated = buffer.len() as u64 > MAX_MENTION_FILE_BYTES;
     if truncated {
         buffer.truncate(MAX_MENTION_FILE_BYTES as usize);
+    }
+    Ok((decode_bounded_text(buffer, truncated)?, truncated))
+}
+
+/// Decode a budget-bounded read as UTF-8 text, rejecting binary content.
+fn decode_bounded_text(mut buffer: Vec<u8>, truncated: bool) -> std::io::Result<String> {
+    if truncated {
         // Round down to the nearest valid UTF-8 character boundary so a
         // multi-byte sequence (CJK, emoji, etc.) is never split at the cut point.
         // Only adjust when error_len() is None — that means truncation landed
@@ -1450,7 +1527,7 @@ fn read_text_prefix(path: &Path) -> std::io::Result<(String, bool)> {
     let text = std::str::from_utf8(&buffer)
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "file is not UTF-8"))?
         .to_string();
-    Ok((text, truncated))
+    Ok(text)
 }
 
 fn is_media_path(path: &Path) -> bool {
@@ -1962,6 +2039,39 @@ mod tests {
         ] {
             assert_eq!(split_mention_range(whole), None, "{whole} must stay whole");
         }
+    }
+
+    /// U07-04: a range that starts past the bounded prefix is read from the
+    /// file, not reported as past EOF; a range past the real end still is.
+    #[test]
+    fn ranged_file_mention_reads_past_the_bounded_prefix() {
+        let tmp = TempDir::new().expect("tempdir");
+        let path = tmp.path().join("long.txt");
+        let body: String = (1..=20_000).map(|n| format!("line {n}\n")).collect();
+        assert!(body.len() as u64 > MAX_MENTION_FILE_BYTES);
+        std::fs::write(&path, body).expect("write");
+
+        let (text, truncated, beyond_eof) = read_file_content(
+            &path,
+            Some(FileRange {
+                start: 19_998,
+                end: 20_000,
+            }),
+        )
+        .expect("range read");
+        assert!(!beyond_eof, "the file has these lines");
+        assert!(!truncated, "three short lines fit the budget");
+        assert_eq!(text, "line 19998\nline 19999\nline 20000");
+
+        let (_, _, beyond_eof) = read_file_content(
+            &path,
+            Some(FileRange {
+                start: 20_001,
+                end: 20_002,
+            }),
+        )
+        .expect("range read");
+        assert!(beyond_eof, "the file really ends at line 20000");
     }
 
     #[test]

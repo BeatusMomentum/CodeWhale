@@ -54,7 +54,7 @@ For the read-only record of what a thread or turn did, see
 | `codewhale app-server --mobile` | HTTP/SSE on loopback + `/mobile` | Runtime API + local mobile control page |
 | `codewhale app-server --stdio` | JSON-RPC 2.0 over stdio | Local SDK / control probe (no listener) |
 | `codewhale app-server --socket [--socket-path P]` | JSON-RPC 2.0 over a `0600` unix domain socket | Desktop daemon: multi-client, peer-uid checked, `daemon/attach` claim handshake (macOS/Linux; Windows named pipe reserved, not implemented) |
-| `codewhale app-server` | HTTP on `127.0.0.1:8787` | Legacy in-process app-server (`/healthz`, `/thread`, `/app`, `/prompt`, `/jobs`, `/mcp/startup`); `/prompt` and `/thread` messages execute real turns via the runtime bridge. There is no direct `/tool` route: tools run only inside Engine turns, under the Engine's tool catalog and approval posture. This legacy server does not surface approvals: its bridge forwards only text deltas and the turn's completion, and it has no decision route, so an approval-gated call waits unanswered. Drive approval-gated work through the Runtime API (`/v1/threads/*` events and `POST /v1/approvals/{approval_id}`) |
+| `codewhale app-server` | HTTP on `127.0.0.1:8787` | Legacy in-process app-server (`/healthz`, `/thread`, `/app`, `/prompt`, `/jobs`); `/prompt` and `/thread` messages execute real turns via the runtime bridge. There is no direct `/tool` route: tools run only inside Engine turns, under the Engine's tool catalog and approval posture. This legacy server does not surface approvals: its bridge forwards only text deltas and the turn's completion, and it has no decision route, so an approval-gated call waits unanswered. Drive approval-gated work through the Runtime API (`/v1/threads/*` events and `POST /v1/approvals/{approval_id}`) |
 | `codewhale serve --http` / `--mobile` | same server as `app-server --http`/`--mobile` | Compatibility aliases |
 
 `app-server --http` and `--mobile` launch the same mature runtime API server
@@ -1925,6 +1925,10 @@ implementation the TUI's `/voice` commands run, headless. Recording is one
 blocking capture per host (requests serialize; the loser gets
 `ok:false`/`no_speech`, not a fought-over device). Provider ASR resolves its
 key lazily so local-whisper and Groq paths work without provider auth.
+Interim and final transcription use the selected ASR backend. If local whisper
+or Groq fails, the error stays on that backend: the runtime never retries the
+recording or composer text with the active model provider. Select provider ASR
+explicitly to use that route.
 Failure is data: `no_recorder`, `no_speech`, `no_provider_auth`,
 `transcription_failed`. `CODEWHALE_DISABLE_VOICE=1` is an operator
 kill-switch — a headless `serve --http` host reports `available: false` and

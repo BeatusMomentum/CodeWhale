@@ -4,6 +4,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
 use crate::tui::markdown_render;
+use codewhale_localization::{Locale, MessageId, tr};
 use codewhale_palette as palette;
 
 /// Reasoning header opener. Replaces the spinner glyph on thinking cells —
@@ -17,11 +18,9 @@ pub(super) const REASONING_RAIL: &str = "\u{254E} "; // ╎ + space
 pub(super) const REASONING_CURSOR: &str = "\u{258E}"; // ▎
 
 const THINKING_SUMMARY_LINE_LIMIT: usize = 4;
-/// Completed collapsed thought: a short lede, not a ten-line dump.
-/// Grok's finished thought is header-only; we keep two lines so a one-step
-/// thought is still readable without forcing an expand.
+/// Non-calm completed preview; calm mode uses a header-only projection.
 const THINKING_COMPLETED_PREVIEW_LINE_LIMIT: usize = 2;
-const THINKING_STREAMING_PREVIEW_LINE_LIMIT: usize = 12;
+const THINKING_STREAMING_PREVIEW_LINE_LIMIT: usize = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ThinkingVisualState {
@@ -115,7 +114,7 @@ pub(crate) fn render_thinking_with_analysis(
         collapsed,
         low_motion,
         highlight,
-        0,
+        Locale::En,
         THINKING_COMPLETED_PREVIEW_LINE_LIMIT,
     )
 }
@@ -129,7 +128,7 @@ pub(crate) fn render_thinking_with_preview_limit(
     collapsed: bool,
     low_motion: bool,
     highlight: bool,
-    preview_extra_lines: usize,
+    locale: Locale,
     completed_preview_lines: usize,
 ) -> (Vec<Line<'static>>, bool) {
     let state = thinking_visual_state(streaming, duration_secs);
@@ -145,28 +144,23 @@ pub(crate) fn render_thinking_with_preview_limit(
     };
     let mut lines = Vec::new();
 
-    // Header: `…` opener (replaces the spinner; reasoning isn't a tool, it's
-    // a slow exhale) followed by the reasoning label and live status.
-    let mut header_spans = vec![
+    let label = if streaming {
+        format!("{}…", tr(locale, MessageId::WhaleStateThinking))
+    } else if let Some(duration) = duration_secs {
+        tr(locale, MessageId::TranscriptThoughtFor).replace(
+            "{duration}",
+            &crate::elapsed::format_elapsed_ms((duration * 1000.0) as u64),
+        )
+    } else {
+        tr(locale, MessageId::TranscriptThought).into_owned()
+    };
+    lines.push(Line::from(vec![
         Span::styled(
             format!("{REASONING_OPENER} "),
             Style::default().fg(thinking_state_accent(state)),
         ),
-        Span::styled("reasoning", thinking_title_style()),
-    ];
-    header_spans.push(Span::styled(" ", Style::default()));
-    header_spans.push(Span::styled(
-        thinking_status_label(state),
-        thinking_status_style(state),
-    ));
-    if let Some(dur) = duration_secs {
-        header_spans.push(Span::styled(" · ", Style::default().fg(palette::TEXT_DIM)));
-        header_spans.push(Span::styled(
-            crate::elapsed::format_elapsed_ms((dur * 1000.0) as u64),
-            thinking_meta_style(),
-        ));
-    }
-    lines.push(Line::from(header_spans));
+        Span::styled(label, Style::default().fg(thinking_state_accent(state))),
+    ]));
 
     let content_width = width.saturating_sub(3).max(1);
     // #6196: compute only the projection being shown. The previous order ran
@@ -178,7 +172,6 @@ pub(crate) fn render_thinking_with_preview_limit(
             width,
             streaming,
             body_style,
-            preview_extra_lines,
             completed_preview_lines,
         )
     } else if content.trim().is_empty() {
@@ -191,11 +184,11 @@ pub(crate) fn render_thinking_with_preview_limit(
         // the streaming preview; settled content shows more than the
         // completed preview, or differs from its explicit summary.
         let expandable = if streaming {
-            body.len() > THINKING_STREAMING_PREVIEW_LINE_LIMIT.saturating_add(preview_extra_lines)
+            body.len() > THINKING_STREAMING_PREVIEW_LINE_LIMIT
         } else {
             extract_explicit_reasoning_summary(content).is_some_and(|summary| {
                 summary.trim() != content.trim() || body.len() > THINKING_SUMMARY_LINE_LIMIT
-            }) || body.len() > completed_preview_lines.saturating_add(preview_extra_lines)
+            }) || body.len() > completed_preview_lines
         };
         (body, expandable)
     };
@@ -224,13 +217,11 @@ pub(crate) fn render_thinking_with_preview_limit(
     }
 
     if collapsed && expandable {
-        lines.push(Line::from(vec![
-            Span::styled(REASONING_RAIL.to_string(), rail_style),
-            Span::styled(
-                REASONING_OPENER,
-                Style::default().fg(palette::TEXT_MUTED).italic(),
-            ),
-        ]));
+        // The header owns the reveal affordance: it never displaces a live
+        // tail row, and settled calm reasoning remains a single line.
+        lines[0]
+            .spans
+            .push(Span::styled(" ›", Style::default().fg(palette::TEXT_MUTED)));
     }
 
     (lines, expandable)
@@ -241,9 +232,11 @@ fn collapsed_thinking_body(
     width: u16,
     streaming: bool,
     style: Style,
-    preview_extra_lines: usize,
     completed_preview_lines: usize,
 ) -> (Vec<Line<'static>>, bool) {
+    if !streaming && completed_preview_lines == 0 {
+        return (Vec::new(), !content.trim().is_empty());
+    }
     let (body_text, without_explicit_summary): (std::borrow::Cow<'_, str>, bool) = if streaming {
         // #861 RC4 / #1324: an in-flight block has no meaningful completed
         // summary. Render raw content; the limit below keeps its newest lines.
@@ -255,9 +248,9 @@ fn collapsed_thinking_body(
         }
     };
     let limit = if streaming {
-        THINKING_STREAMING_PREVIEW_LINE_LIMIT.saturating_add(preview_extra_lines)
+        THINKING_STREAMING_PREVIEW_LINE_LIMIT
     } else if without_explicit_summary {
-        completed_preview_lines.saturating_add(preview_extra_lines)
+        completed_preview_lines
     } else {
         THINKING_SUMMARY_LINE_LIMIT
     };
@@ -394,26 +387,10 @@ fn thinking_visual_state(streaming: bool, duration_secs: Option<f32>) -> Thinkin
     }
 }
 
-fn thinking_status_label(state: ThinkingVisualState) -> &'static str {
-    match state {
-        ThinkingVisualState::Live => "live",
-        ThinkingVisualState::Done => "done",
-        ThinkingVisualState::Idle => "idle",
-    }
-}
-
 fn thinking_title_style() -> Style {
     Style::default()
         .fg(palette::TEXT_SOFT)
         .add_modifier(Modifier::BOLD)
-}
-
-fn thinking_status_style(state: ThinkingVisualState) -> Style {
-    Style::default().fg(match state {
-        ThinkingVisualState::Live => palette::ACCENT_REASONING_LIVE,
-        ThinkingVisualState::Done => palette::TEXT_DIM,
-        ThinkingVisualState::Idle => palette::TEXT_DIM,
-    })
 }
 
 fn thinking_meta_style() -> Style {
@@ -500,17 +477,17 @@ mod tests {
             true,
             false,
             false,
-            0,
+            Locale::En,
             THINKING_COMPLETED_PREVIEW_LINE_LIMIT,
         );
         assert!(expandable, "a long streaming body must offer expand");
-        // header + 12 preview lines + the expand affordance row
-        assert_eq!(lines.len(), 1 + THINKING_STREAMING_PREVIEW_LINE_LIMIT + 1);
+        // header (including the affordance) + three preview rows
+        assert_eq!(lines.len(), 1 + THINKING_STREAMING_PREVIEW_LINE_LIMIT);
         let text = joined_text(&lines);
         assert!(text.iter().any(|t| t.contains("tail marker 19")));
-        assert!(text.iter().any(|t| t.contains("tail marker 8")));
+        assert!(text.iter().any(|t| t.contains("tail marker 17")));
         assert!(
-            !text.iter().any(|t| t.contains("tail marker 7")),
+            !text.iter().any(|t| t.contains("tail marker 16")),
             "the window must drop the head: {text:?}"
         );
         assert!(!text.iter().any(|t| t.contains("head marker 39")));
@@ -530,7 +507,7 @@ mod tests {
             true,
             false,
             false,
-            0,
+            Locale::En,
             THINKING_COMPLETED_PREVIEW_LINE_LIMIT,
         );
         // Code rows carry the two-space code prefix after the rail; if the
@@ -561,7 +538,7 @@ mod tests {
             false,
             false,
             false,
-            0,
+            Locale::En,
             THINKING_COMPLETED_PREVIEW_LINE_LIMIT,
         );
         assert_eq!(
