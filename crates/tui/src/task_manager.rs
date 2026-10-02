@@ -304,7 +304,9 @@ pub struct TaskRecord {
     pub mode: String,
     pub allow_shell: bool,
     pub trust_mode: bool,
-    #[serde(default = "default_auto_approve")]
+    /// A record without the field (written before it existed) is not
+    /// auto-approved: a missing grant never widens authority.
+    #[serde(default)]
     pub auto_approve: bool,
     /// Permission posture the task's own thread starts on (`ask`,
     /// `auto_review`, `full_access`). Absent on records written before the
@@ -3785,10 +3787,6 @@ fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
         .with_context(|| format!("Failed to write {}", path.display()))
 }
 
-fn default_auto_approve() -> bool {
-    true
-}
-
 /// Default task manager data location (`~/.codewhale/tasks`, or legacy
 /// `~/.deepseek/tasks` when only the legacy directory exists).
 #[must_use]
@@ -5758,6 +5756,30 @@ mod tests {
             tool_calls: Vec::new(),
             timeline: Vec::new(),
         }
+    }
+
+    /// Records persisted before `auto_approve` existed must load as not
+    /// auto-approved, and the thread request they build must say so.
+    #[test]
+    fn task_record_missing_auto_approve_loads_fail_closed() {
+        let mut record = sample_task_record();
+        record.auto_approve = true;
+        let mut value = serde_json::to_value(&record).expect("serialize");
+        assert_eq!(value["auto_approve"], serde_json::json!(true));
+        value
+            .as_object_mut()
+            .expect("object")
+            .remove("auto_approve");
+        let loaded: TaskRecord = serde_json::from_value(value).expect("legacy record loads");
+        assert!(!loaded.auto_approve);
+        assert_eq!(
+            ExecutionTask::from(&loaded).thread_request().auto_approve,
+            Some(false)
+        );
+        assert_eq!(
+            ExecutionTask::from(&loaded).turn_request().auto_approve,
+            Some(false)
+        );
     }
 
     #[test]
