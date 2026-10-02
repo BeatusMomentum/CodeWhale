@@ -2849,13 +2849,13 @@ impl CommandSkillGroupContext for SkillGroupAdapter<'_> {
                 });
             }
             let plugin_provenance = skill.source.provenance();
-            if let Some(provenance) = &plugin_provenance {
-                if let Err(reason) = provenance.verify(&self.host.app.borrow().workspace) {
-                    return Err(SkillActivationError::PluginRejected {
-                        name: skill.name.clone(),
-                        reason,
-                    });
-                }
+            if let Some(provenance) = &plugin_provenance
+                && let Err(reason) = provenance.verify(&self.host.app.borrow().workspace)
+            {
+                return Err(SkillActivationError::PluginRejected {
+                    name: skill.name.clone(),
+                    reason,
+                });
             }
             let skill = skill.clone();
             let instruction = format!(

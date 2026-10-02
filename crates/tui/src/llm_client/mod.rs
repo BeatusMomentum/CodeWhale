@@ -839,9 +839,7 @@ fn is_explicit_quota_code(code: &str) -> bool {
 
 fn explicit_quota_code_marker(body: &str) -> Option<String> {
     let lower = body.to_ascii_lowercase();
-    let Some((_, suffix)) = lower.split_once("provider error code:") else {
-        return None;
-    };
+    let (_, suffix) = lower.split_once("provider error code:")?;
     let code = suffix
         .trim_start()
         .split(|ch: char| !(ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-')))

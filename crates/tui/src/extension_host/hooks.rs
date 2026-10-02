@@ -113,6 +113,44 @@ impl HostAttachment {
     }
 }
 
+impl ManagerShared {
+    async fn live_host_for_hook(
+        &self,
+        hook: &super::registry::HookRegistration,
+    ) -> Result<std::sync::Arc<super::supervisor::HostProcess>, String> {
+        self.live_host(hook.tier, |registry| {
+            registry
+                .is_live_hook(hook.handle, &hook.owner)
+                .then(|| hook.owner.clone())
+                .ok_or_else(|| "extension hook is no longer registered".to_string())
+        })
+        .await
+    }
+}
+
+fn verdict_stdout(verdict: HookVerdictWire) -> Result<String, String> {
+    let revises = matches!(verdict, HookVerdictWire::Revise { .. });
+    let value = match verdict {
+        HookVerdictWire::Abstain => json!({}),
+        HookVerdictWire::Deny { reason } => json!({"decision":"deny", "reason":reason}),
+        HookVerdictWire::Ask { reason } => json!({"decision":"ask", "reason":reason}),
+        HookVerdictWire::Annotate { text } => json!({"additionalContext":text}),
+        HookVerdictWire::Revise { input } => json!({"updatedInput":Value::Object(input)}),
+    };
+    let stdout = serde_json::to_string(&value)
+        .map_err(|_| "extension hook verdict is not JSON".to_string())?;
+    // Reuse the existing validation and size limit. A rejected revision is
+    // a strict no-verdict, never a silently ignored plugin proposal.
+    if revises
+        && crate::hooks::parse_tool_call_before_stdout(&stdout)
+            .updated_input
+            .is_none()
+    {
+        return Err("extension hook input revision exceeded the limit".to_string());
+    }
+    Ok(stdout)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -229,42 +267,4 @@ mod tests {
         assert_eq!(after, Default::default());
         manager.shutdown().await;
     }
-}
-
-impl ManagerShared {
-    async fn live_host_for_hook(
-        &self,
-        hook: &super::registry::HookRegistration,
-    ) -> Result<std::sync::Arc<super::supervisor::HostProcess>, String> {
-        self.live_host(hook.tier, |registry| {
-            registry
-                .is_live_hook(hook.handle, &hook.owner)
-                .then(|| hook.owner.clone())
-                .ok_or_else(|| "extension hook is no longer registered".to_string())
-        })
-        .await
-    }
-}
-
-fn verdict_stdout(verdict: HookVerdictWire) -> Result<String, String> {
-    let revises = matches!(verdict, HookVerdictWire::Revise { .. });
-    let value = match verdict {
-        HookVerdictWire::Abstain => json!({}),
-        HookVerdictWire::Deny { reason } => json!({"decision":"deny", "reason":reason}),
-        HookVerdictWire::Ask { reason } => json!({"decision":"ask", "reason":reason}),
-        HookVerdictWire::Annotate { text } => json!({"additionalContext":text}),
-        HookVerdictWire::Revise { input } => json!({"updatedInput":Value::Object(input)}),
-    };
-    let stdout = serde_json::to_string(&value)
-        .map_err(|_| "extension hook verdict is not JSON".to_string())?;
-    // Reuse the existing validation and size limit. A rejected revision is
-    // a strict no-verdict, never a silently ignored plugin proposal.
-    if revises
-        && crate::hooks::parse_tool_call_before_stdout(&stdout)
-            .updated_input
-            .is_none()
-    {
-        return Err("extension hook input revision exceeded the limit".to_string());
-    }
-    Ok(stdout)
 }

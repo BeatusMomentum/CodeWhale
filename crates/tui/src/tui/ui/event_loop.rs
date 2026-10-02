@@ -19,6 +19,11 @@ use codewhale_models::Role;
 
 use crate::tui::control_socket::SessionControl;
 
+type SkillCacheRefresh = (
+    crate::tui::app::SkillCacheScope,
+    tokio::task::JoinHandle<Vec<(String, String)>>,
+);
+
 pub(super) fn event_owner_is_active(
     current_session_id: Option<&str>,
     owner_session_id: &str,
@@ -1717,10 +1722,7 @@ pub(crate) async fn run_event_loop(
     // and all return to full cadence the moment it moves.
     let mut last_ui_activity = Instant::now();
     let mut skill_registry_epoch = None;
-    let mut skill_cache_refresh: Option<(
-        crate::tui::app::SkillCacheScope,
-        tokio::task::JoinHandle<Vec<(String, String)>>,
-    )> = None;
+    let mut skill_cache_refresh: Option<SkillCacheRefresh> = None;
     // Whether the previous iteration found the UI quiescent and quiet (see
     // `ui_state_is_quiescent`). The 2.5 s task block runs before this
     // iteration's facts exist, so it reads the previous one.

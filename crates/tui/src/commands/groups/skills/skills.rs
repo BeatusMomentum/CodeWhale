@@ -88,13 +88,13 @@ fn activate_skill(app: &mut crate::tui::app::App, name: &str) -> CommandResult {
             ));
         }
         let plugin_provenance = skill.source.provenance();
-        if let Some(provenance) = &plugin_provenance {
-            if let Err(reason) = provenance.verify(&app.workspace) {
-                return CommandResult::error(format!(
-                    "Plugin skill '{}' is no longer active: {reason}",
-                    skill.name
-                ));
-            }
+        if let Some(provenance) = &plugin_provenance
+            && let Err(reason) = provenance.verify(&app.workspace)
+        {
+            return CommandResult::error(format!(
+                "Plugin skill '{}' is no longer active: {reason}",
+                skill.name
+            ));
         }
         let instruction = format!(
             "You are now using a skill. Follow these instructions:\n\n# Skill: {}\n\n{}\n\n---\n\nNow respond to the user's request following the above skill instructions.",
