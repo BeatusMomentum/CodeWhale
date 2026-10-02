@@ -7146,7 +7146,7 @@ impl Config {
     /// this reads it without opening the credential a second time.
     pub(crate) fn active_route_api_key_with_xai_sign_in(
         &self,
-    ) -> Result<((String, String), Option<Option<String>>)> {
+    ) -> Result<(ResolvedApiKey, Option<XaiSignInLabel>)> {
         if let Some(credentials) = self.xai_oauth_route_credentials() {
             let credentials = credentials?;
             return Ok((
@@ -12861,6 +12861,13 @@ fn user_global_config_api_key(provider: ApiProvider) -> Option<String> {
 pub fn has_api_key_for(config: &Config, provider: ApiProvider) -> bool {
     credential_resolve::resolve_credential_source(config, provider).is_present()
 }
+
+/// `(key, source label)` as the active-route resolver returns it.
+pub(crate) type ResolvedApiKey = (String, String);
+
+/// Account label of the xAI sign-in that minted a key; `None` when its ID
+/// token names no email.
+pub(crate) type XaiSignInLabel = Option<String>;
 
 /// Key-source label the resolver gives a key minted by xAI OAuth (owned
 /// sign-in or consented Grok CLI import), named in authentication errors.
