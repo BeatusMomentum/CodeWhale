@@ -1100,6 +1100,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "codewhale-ratatui"
+version = "0.1.0"
+dependencies = [
+ "crossterm",
+ "libc",
+ "ratatui",
+ "ratatui-core",
+ "serde",
+ "serde_json",
+ "unicode-segmentation",
+ "unicode-width",
+]
+
+[[package]]
 name = "codewhale-release"
 version = "0.10.1"
 dependencies = [
@@ -1247,6 +1261,7 @@ dependencies = [
  "codewhale-palette",
  "codewhale-paths",
  "codewhale-protocol",
+ "codewhale-ratatui",
  "codewhale-release",
  "codewhale-runtime",
  "codewhale-sanitize",
