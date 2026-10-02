@@ -10,10 +10,14 @@ Publishing codewhale-tui to crates.io requires this kit version on crates.io;
 that publication remains a separate release gate requiring founder approval.
 
 Adoption is deliberately incremental: each migrated renderer deletes its
-predecessor. Workflow progress, working/verification indicators and the
-metrics row use the kit. MetricsLine owns its complete shed, projection,
-render and pointer geometry; the Engine supplies measured facts, localized
-labels and hints, live/custom theme ink and action dispatch. Mounted composer,
-dock, posture, transcript, pending input,
+predecessor. Workflow progress, working/verification indicators, the metrics
+row and posture row use the kit. MetricsLine and PostureBar own their complete
+shed, projection, render and pointer geometry; the Engine supplies measured
+facts, localized labels and hints, clock lifecycle, live/custom theme ink and
+action dispatch. The current kit drops the pinned right PostureFact's optional
+ink during layout. The host carries every fact's exact ink in a distinct role
+and uses the shared live-theme adapter, so permission and right-notice colors
+remain independent without modifying pinned source. Mounted composer,
+dock, transcript, pending input,
 ocean and character remain in the Engine until their keyboard, mouse,
 localization and layout contracts can move together.
