@@ -710,7 +710,7 @@ pub fn history_cells_from_message(msg: &Message) -> Vec<HistoryCell> {
     if let Some(instructions) = crate::runtime_handoff::extension_prompt_contributions_display(msg)
     {
         return vec![HistoryCell::System {
-            content: format!("Extension instructions shown to the model:\n{instructions}"),
+            content: instructions.to_string(),
         }];
     }
     // Raw runtime handoffs have live tool/status receipts, not user cells.
