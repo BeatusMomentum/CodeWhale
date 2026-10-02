@@ -865,7 +865,7 @@ mod tests {
             manager.owner_state(id),
             Some(super::super::registry::OwnerState::Active),
             "owner: {:?}; diagnostics: {:?}",
-            manager.owner_report(id),
+            manager.owner_state(id),
             manager.diagnostics()
         );
         assert!(
@@ -882,7 +882,7 @@ mod tests {
             .unwrap_or_else(|| {
                 panic!(
                     "Native root missing after explicit retry; owner: {:?}; diagnostics: {:?}",
-                    manager.owner_report(id),
+                    manager.owner_state(id),
                     manager.diagnostics()
                 )
             })
