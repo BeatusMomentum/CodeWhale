@@ -51,8 +51,9 @@ test('storage refuses invalid JSON, oversized values and keys without damaging s
   const sparse = new Array(2)
   const cyclic = {}; cyclic.self = cyclic
   const symbol = { [Symbol('hidden')]: 1 }
+  const extra = [1]; extra.custom = 2
   const getter = Object.defineProperty({}, 'x', { enumerable: true, get() { throw new Error('must not run') } })
-  for (const value of [undefined, NaN, Infinity, 1n, new Date(), () => 1, sparse, cyclic, symbol, getter]) {
+  for (const value of [undefined, NaN, Infinity, 1n, new Date(), () => 1, sparse, cyclic, symbol, getter, extra]) {
     await assert.rejects(store.set('bad', value), code('invalid'))
   }
   for (const key of ['', 'nul\0key', '鲸'.repeat(STORAGE_LIMITS.keyBytes)]) await assert.rejects(store.set(key, 1), code('invalid'))
@@ -83,6 +84,13 @@ test('key-count quota is enforced when reading persisted state', async (t) => {
   await assert.rejects(store.get('k0'), code('corrupt'))
   await assert.rejects(store.set('x', 1), code('corrupt'))
   assert.equal(await readFile(join(a, 'storage.json'), 'utf8'), bytes)
+  delete entries.k1024
+  await writeFile(join(a, 'storage.json'), JSON.stringify({ version: 1, entries }))
+  await assert.rejects(store.set('extra', 1), code('limit'))
+  await store.set('k0', 1)
+  await store.delete('k1')
+  await store.set('extra', 2)
+  assert.equal(await store.get('extra'), 2)
 })
 
 test('queued operations refuse a revoked owner and state survives revocation', async (t) => {
@@ -134,4 +142,22 @@ test('concurrent calls on one owner serialize without losing independent keys', 
   const { store } = await fixture(t)
   await Promise.all(Array.from({ length: 24 }, (_, i) => store.set(`k${i}`, i)))
   assert.deepEqual(await Promise.all(Array.from({ length: 24 }, (_, i) => store.get(`k${i}`))), Array.from({ length: 24 }, (_, i) => i))
+})
+
+test('set snapshots input at invocation before callers can mutate it', async (t) => {
+  const { store } = await fixture(t)
+  const value = { counter: 1 }
+  const pending = store.set('value', value)
+  value.counter = 99
+  await pending
+  assert.deepEqual(await store.get('value'), { counter: 1 })
+})
+
+test('storage requires an assigned absolute directory and refuses directory links', { skip: process.platform === 'win32' }, async (t) => {
+  const { a, b } = await fixture(t)
+  assert.throws(() => createStorage({ dataDir: 'relative', isActive: () => true }), code('invalid'))
+  const linked = join(a, 'linked')
+  await symlink(b, linked)
+  const store = createStorage({ dataDir: linked, isActive: () => true })
+  await assert.rejects(store.set('key', 1), code('invalid'))
 })

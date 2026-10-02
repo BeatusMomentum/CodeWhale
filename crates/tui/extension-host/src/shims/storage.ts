@@ -1,7 +1,7 @@
 /** Owner-local plugin state, never session history or a credential service. */
 import { constants } from 'node:fs'
 import { lstat, open, rename, unlink } from 'node:fs/promises'
-import { join } from 'node:path'
+import { isAbsolute, join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { isJson } from '../json.ts'
 import type { Json } from '../protocol.ts'
@@ -80,6 +80,7 @@ function fsCode(error: unknown): string | undefined {
  * disposal runs. Later or queued calls are refused. Unload never deletes state.
  */
 export function createStorage({ dataDir, isActive }: StorageOptions): PluginStorage {
+  if (typeof dataDir !== 'string' || !isAbsolute(dataDir)) throw new StorageError('invalid', 'plugin storage needs its assigned absolute dataDir')
   const path = join(dataDir, 'storage.json')
   const lockPath = join(dataDir, 'storage.lock')
   let tail: Promise<unknown> = Promise.resolve()
@@ -181,8 +182,7 @@ export function createStorage({ dataDir, isActive }: StorageOptions): PluginStor
   function queue<T>(operation: () => Promise<T>): Promise<T> {
     const next = tail.then(async () => {
       active()
-      await directory()
-      try { return await operation() } catch (error) {
+      try { await directory(); return await operation() } catch (error) {
         if (error instanceof StorageError) throw error
         throw new StorageError('io', `plugin storage operation failed (${fsCode(error) ?? 'unknown filesystem error'})`)
       }
@@ -196,7 +196,9 @@ export function createStorage({ dataDir, isActive }: StorageOptions): PluginStor
       return queue(async () => { checkKey(key); const entries = await load(); active(); return Object.hasOwn(entries, key) ? entries[key] : undefined })
     },
     set(key: string, value: Json) {
-      return queue(async () => { checkKey(key); const copy = snapshot(value); await mutate((entries) => ({ entries: { ...entries, [key]: copy }, result: undefined })) })
+      let copy: Json
+      try { active(); checkKey(key); copy = snapshot(value) } catch (error) { return Promise.reject(error) }
+      return queue(async () => { await mutate((entries) => ({ entries: { ...entries, [key]: copy }, result: undefined })) })
     },
     delete(key: string) {
       return queue(async () => {
