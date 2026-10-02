@@ -1,5 +1,5 @@
-//! The ONE access-route flow: Codex CLI import (read-only, consented) plus
-//! the unified OAuth login core every subscription provider runs through.
+//! Codewhale-owned OAuth login and protected credential lifecycle.
+//! ChatGPT uses its official dynamic registration and direct inference grant.
 //! Providers are data rows in the parameter table below, not modules.
 //!
 //! External Codex CLI credentials are read only after an exact, provider-scoped
@@ -20,6 +20,7 @@ use anyhow::{Context, Result, bail};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use codewhale_config::ExternalCredentialReadGrant;
+use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header, jwk::JwkSet};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -392,24 +393,25 @@ pub const CHATGPT_OAUTH_PARAMS: OAuthProviderParams = OAuthProviderParams {
         no_account_prompt_var: Some("CODEWHALE_CHATGPT_OAUTH_NO_PROMPT"),
     },
     device_code_path: None,
-    authorize_path: Some("oauth/authorize"),
-    token_path: "oauth/token",
+    authorize_path: Some("api/accounts/authorize"),
+    token_path: "api/accounts/oauth/token",
     discover_endpoints: false,
     device_poll_floor_secs: 30,
-    authorize_extras: &[("id_token_add_organizations", "true")],
+    authorize_extras: &[("resource", CHATGPT_OAUTH_RESOURCE)],
     // `prompt=login` (OIDC Core 1.0 §3.1.2.1) asks the issuer to re-prompt
     // instead of silently reusing whichever ChatGPT account the browser is
-    // already signed into, so an explicit `codewhale auth chatgpt` can pick a
-    // different account. Every browser login here is user-initiated; refresh
+    // already signed into. Returning registrations still require the same
+    // verified account; a new account explicitly starts dynamic registration.
+    // Every browser login here is user-initiated; refresh
     // never visits the authorize endpoint. CODEWHALE_CHATGPT_OAUTH_NO_PROMPT
     // drops it should the issuer ever refuse it.
     account_choice_extras: &[("prompt", "login")],
     revoke_path: Some("api/accounts/oauth/revoke"),
     callback_path: "/auth/callback",
-    loopback_ports: &[1455, 1457],
+    loopback_ports: &[1455, 1457, 0],
     relogin_hint: "codewhale auth chatgpt",
     session_login_hint: "/auth chatgpt",
-    callback_conflict_hint: "Stop the process holding that port, or import Codex CLI credentials with `codewhale auth external-consent`.",
+    callback_conflict_hint: "Close the process holding the callback port and retry `codewhale auth chatgpt`.",
 };
 
 /// The parameter table. A provider login looks its row up here; adding a
@@ -423,6 +425,7 @@ pub fn oauth_provider_params(provider: OAuthProvider) -> &'static OAuthProviderP
 }
 
 /// Resolved login inputs: schema defaults, environment-tested in order.
+#[derive(Clone)]
 pub struct ResolvedOAuthInputs {
     pub issuer: String,
     pub client_id: String,
@@ -458,9 +461,18 @@ pub struct OAuthTokenMaterial {
     pub access_token: Option<String>,
     pub refresh_token: Option<String>,
     pub expires_in: Option<u64>,
+    #[serde(default)]
+    pub earliest_refresh_at: Option<Value>,
     /// OpenID Connect id token; carries the account claim when issued.
     #[serde(default)]
     pub id_token: Option<String>,
+    #[serde(default)]
+    pub scope: Option<String>,
+    #[serde(default)]
+    pub token_type: Option<String>,
+    /// Set only after cryptographic validation, never deserialized from a server.
+    #[serde(skip)]
+    pub(crate) verified_chatgpt: Option<ChatgptRegistration>,
     #[serde(default)]
     pub interval: Option<u64>,
     #[serde(default)]
@@ -936,6 +948,10 @@ pub(crate) fn device_code_login_with(
 /// the grant is device-code or browser PKCE. A provider with neither fails
 /// here with the reason.
 pub async fn login(provider: OAuthProvider) -> Result<PendingOAuthLogin> {
+    if provider == OAuthProvider::Chatgpt {
+        let config = Config::load(None, None)?;
+        return login_with_config(provider, &config).await;
+    }
     let params = oauth_provider_params(provider);
     if params.device_code_path.is_some() {
         device_code_login(provider).await
@@ -944,6 +960,26 @@ pub async fn login(provider: OAuthProvider) -> Result<PendingOAuthLogin> {
     } else {
         bail!("{} offers no sign-in flow", params.display_name);
     }
+}
+
+/// Reauthorize the registration selected by the caller's actual config.
+pub async fn login_with_config(
+    provider: OAuthProvider,
+    config: &Config,
+) -> Result<PendingOAuthLogin> {
+    if provider != OAuthProvider::Chatgpt {
+        let params = oauth_provider_params(provider);
+        return if params.device_code_path.is_some() {
+            device_code_login(provider).await
+        } else {
+            pkce_login(provider).await
+        };
+    }
+    let selected = official_chatgpt_registration(config).ok();
+    let inputs = oauth_provider_params(provider).resolve_inputs();
+    tokio::task::spawn_blocking(move || pkce_login_with_selected(provider, &inputs, selected))
+        .await
+        .context("ChatGPT PKCE login worker failed")?
 }
 
 // ── form-post transport seam ──────────────────────────────────────────
@@ -955,11 +991,49 @@ pub async fn login(provider: OAuthProvider) -> Result<PendingOAuthLogin> {
 
 pub(crate) trait OAuthFormClient {
     fn post_form(&self, url: &str, form: &[(&str, &str)]) -> Result<(u16, String)>;
+    fn chatgpt_jwks(&self, issuer: &str) -> Result<JwkSet> {
+        fetch_chatgpt_jwks(issuer)
+    }
+    fn revocation_endpoint(&self, params: &OAuthProviderParams, issuer: &str) -> Result<String> {
+        remote_revoke_url(params, issuer).context("OAuth has no remote revoke endpoint")
+    }
 }
 
 pub(crate) struct ReqwestOAuthFormClient;
 
 impl OAuthFormClient for ReqwestOAuthFormClient {
+    fn revocation_endpoint(&self, params: &OAuthProviderParams, issuer: &str) -> Result<String> {
+        if params.display_name != "ChatGPT" {
+            return remote_revoke_url(params, issuer)
+                .context("OAuth has no remote revoke endpoint");
+        }
+        anyhow::ensure!(
+            issuer == CHATGPT_OAUTH_ISSUER,
+            "ChatGPT revocation issuer is invalid"
+        );
+        let response = oauth_http_client("revocation discovery")?
+            .get(format!("{issuer}/.well-known/openid-configuration"))
+            .send()
+            .context("ChatGPT revocation discovery failed")?;
+        let (status, document): (_, Value) =
+            parse_oauth_json(response, "ChatGPT revocation discovery")?;
+        anyhow::ensure!(
+            status.is_success() && document.get("issuer").and_then(Value::as_str) == Some(issuer),
+            "ChatGPT revocation discovery issuer is invalid"
+        );
+        let endpoint = document
+            .get("revocation_endpoint")
+            .and_then(Value::as_str)
+            .context("ChatGPT did not publish a revocation endpoint")?;
+        let url = oauth_endpoint_url(endpoint)?;
+        anyhow::ensure!(
+            url.origin() == oauth_endpoint_url(issuer)?.origin()
+                && url.query().is_none()
+                && url.fragment().is_none(),
+            "ChatGPT revocation endpoint is invalid"
+        );
+        Ok(url.to_string())
+    }
     fn post_form(&self, url: &str, form: &[(&str, &str)]) -> Result<(u16, String)> {
         let url = oauth_endpoint_url(url)?;
         #[cfg(test)]
@@ -1052,14 +1126,15 @@ pub(crate) fn refresh_access_token_via(
 ) -> Result<OAuthTokenMaterial> {
     #[cfg(test)]
     crate::external_credentials::record_oauth_refresh();
-    let (status, body) = client.post_form(
-        token_url,
-        &[
-            ("grant_type", "refresh_token"),
-            ("client_id", client_id),
-            ("refresh_token", refresh_token),
-        ],
-    )?;
+    let mut fields = vec![
+        ("grant_type", "refresh_token"),
+        ("client_id", client_id),
+        ("refresh_token", refresh_token),
+    ];
+    if params.display_name == "ChatGPT" {
+        fields.push(("resource", CHATGPT_OAUTH_RESOURCE));
+    }
+    let (status, body) = client.post_form(token_url, &fields)?;
     parse_oauth_form_response(status, &body, "refresh", params)
 }
 
@@ -1072,18 +1147,17 @@ pub(crate) fn revoke_remote_token_via(
     client_id: &str,
     token: &str,
 ) -> Result<()> {
-    let Some(revoke_url) = remote_revoke_url(params, issuer) else {
-        bail!("{} has no remote revoke endpoint", params.display_name);
-    };
-    let (status, body) =
-        client.post_form(&revoke_url, &[("token", token), ("client_id", client_id)])?;
-    if !(200..300).contains(&status) {
-        bail!(
-            "{} OAuth revoke failed with HTTP {status}: {}",
-            params.display_name,
-            compact_form_error(&body)
-        );
+    let revoke_url = client.revocation_endpoint(params, issuer)?;
+    let mut fields = vec![("token", token), ("client_id", client_id)];
+    if params.display_name == "ChatGPT" {
+        fields.push(("token_type_hint", "refresh_token"));
     }
+    let (status, _) = client.post_form(&revoke_url, &fields)?;
+    anyhow::ensure!(
+        (200..300).contains(&status),
+        "{} OAuth revoke failed with HTTP {status}",
+        params.display_name
+    );
     Ok(())
 }
 
@@ -1111,6 +1185,7 @@ impl std::fmt::Debug for PkceChallenge {
 #[derive(Clone)]
 pub struct BrowserAuthRequest {
     pub state: String,
+    pub nonce: String,
     pub pkce: PkceChallenge,
     pub redirect_uri: String,
     pub authorize_url: String,
@@ -1122,23 +1197,44 @@ impl std::fmt::Debug for BrowserAuthRequest {
             .field("state", &self.state)
             .field("pkce", &self.pkce)
             .field("redirect_uri", &self.redirect_uri)
-            .field("authorize_url", &self.authorize_url)
+            .field("authorize_url", &"<redacted>")
             .finish()
     }
 }
 
 /// Parsed callback query: a code+state pair, or the issuer's refusal.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum CallbackOutcome {
     Success {
         code: String,
         state: String,
+        client_id: Option<String>,
     },
     Error {
         error: String,
         description: Option<String>,
         state: Option<String>,
     },
+}
+
+impl std::fmt::Debug for CallbackOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Success {
+                state, client_id, ..
+            } => f
+                .debug_struct("Success")
+                .field("code", &"<redacted>")
+                .field("state", state)
+                .field("client_id", client_id)
+                .finish(),
+            Self::Error { state, .. } => f
+                .debug_struct("Error")
+                .field("error", &"<redacted>")
+                .field("state", state)
+                .finish(),
+        }
+    }
 }
 
 /// RFC 7636 S256 PKCE pair.
@@ -1234,15 +1330,31 @@ pub fn parse_callback_query(params: &OAuthProviderParams, query: &str) -> Result
     let mut state = None;
     let mut error = None;
     let mut description = None;
+    let mut client_id = None;
+    let mut seen = std::collections::HashSet::new();
     for (key, value) in parsed.query_pairs() {
+        if matches!(
+            key.as_ref(),
+            "code" | "state" | "error" | "error_description" | "client_id"
+        ) {
+            anyhow::ensure!(
+                seen.insert(key.to_string()),
+                "OAuth callback contains a duplicate parameter"
+            );
+        }
         match key.as_ref() {
             "code" => code = Some(value.into_owned()),
             "state" => state = Some(value.into_owned()),
             "error" => error = Some(value.into_owned()),
             "error_description" => description = Some(value.into_owned()),
+            "client_id" => client_id = Some(value.into_owned()),
             _ => {}
         }
     }
+    anyhow::ensure!(
+        code.is_none() || error.is_none(),
+        "OAuth callback contains both success and error"
+    );
     if let Some(error) = error {
         return Ok(CallbackOutcome::Error {
             error,
@@ -1256,33 +1368,45 @@ pub fn parse_callback_query(params: &OAuthProviderParams, query: &str) -> Result
     let state = state
         .filter(|s| !s.trim().is_empty())
         .context("OAuth callback missing state")?;
-    Ok(CallbackOutcome::Success { code, state })
+    Ok(CallbackOutcome::Success {
+        code,
+        state,
+        client_id,
+    })
 }
 
 pub fn accept_callback(expected_state: &str, outcome: CallbackOutcome) -> Result<String> {
+    accept_callback_with_client(expected_state, outcome).map(|(code, _)| code)
+}
+
+fn accept_callback_with_client(
+    expected_state: &str,
+    outcome: CallbackOutcome,
+) -> Result<(String, Option<String>)> {
     match outcome {
-        CallbackOutcome::Success { code, state } => {
+        CallbackOutcome::Success {
+            code,
+            state,
+            client_id,
+        } => {
             anyhow::ensure!(
                 state == expected_state,
                 "OAuth callback state did not match the pending login"
             );
-            Ok(code)
+            Ok((code, client_id))
         }
         CallbackOutcome::Error {
             error,
             description,
             state,
         } => {
-            if let Some(state) = state {
-                anyhow::ensure!(
-                    state == expected_state,
-                    "OAuth error callback state did not match the pending login"
-                );
-            }
-            let detail = description
-                .filter(|text| !text.trim().is_empty())
-                .unwrap_or(error);
-            bail!("sign-in was not completed: {detail}")
+            anyhow::ensure!(
+                state.as_deref() == Some(expected_state),
+                "OAuth error callback state did not match the pending login"
+            );
+            let _ = description;
+            let error = compact_form_error(&error);
+            bail!("sign-in was not completed ({error})")
         }
     }
 }
@@ -1310,17 +1434,8 @@ fn query_from_target<'a>(params: &OAuthProviderParams, target: &'a str) -> Resul
     Ok(target.split_once('?').map(|(_, q)| q).unwrap_or(""))
 }
 
-/// Bind the loopback callback on both IP stacks for the first free port.
-///
-/// The redirect URI has to say `localhost` — that is what is registered with
-/// the authorization server, and redirect matching is exact — but `localhost`
-/// resolves to `::1` before `127.0.0.1` on IPv6-first hosts. Binding only
-/// IPv4 left the browser connecting to a closed port, which browsers paper
-/// over with Happy Eyeballs fallback: a working sign-in becomes a slow one,
-/// and a broken one wherever that fallback is disabled. Binding both is the
-/// fix that keeps the registered redirect URI intact.
-///
-/// A host with only one stack available binds only that one and still works.
+/// Bind ChatGPT's exact 127.0.0.1 callback, with an ephemeral-port fallback.
+/// Other providers using localhost bind both IP stacks when available.
 pub fn bind_loopback_callback(params: &OAuthProviderParams) -> Result<Vec<TcpListener>> {
     let name = params.display_name;
     let mut last_error = None;
@@ -1330,6 +1445,9 @@ pub fn bind_loopback_callback(params: &OAuthProviderParams) -> Result<Vec<TcpLis
             SocketAddr::from((Ipv4Addr::LOCALHOST, *port)),
             SocketAddr::from((Ipv6Addr::LOCALHOST, *port)),
         ] {
+            if params.display_name == "ChatGPT" && addr.is_ipv6() {
+                continue;
+            }
             match TcpListener::bind(addr) {
                 Ok(listener) => {
                     listener.set_nonblocking(true).with_context(|| {
@@ -1382,10 +1500,16 @@ pub(crate) fn start_auth_request_on(
             )
         })?
         .port();
-    let redirect_uri = format!("http://localhost:{port}{}", params.callback_path);
+    let host = if params.display_name == "ChatGPT" {
+        "127.0.0.1"
+    } else {
+        "localhost"
+    };
+    let redirect_uri = format!("http://{host}:{port}{}", params.callback_path);
     let pkce = generate_pkce();
     let state = generate_state();
-    let authorize_url = build_authorize_url(
+    let nonce = generate_state();
+    let mut authorize_url = reqwest::Url::parse(&build_authorize_url(
         params,
         &inputs.issuer,
         &inputs.client_id,
@@ -1393,12 +1517,21 @@ pub(crate) fn start_auth_request_on(
         &redirect_uri,
         &state,
         &pkce,
-    )?;
+    )?)?;
+    if params.display_name == "ChatGPT" {
+        authorize_url.query_pairs_mut().append_pair("nonce", &nonce);
+        if inputs.client_id == CHATGPT_OAUTH_CLIENT_ID {
+            authorize_url
+                .query_pairs_mut()
+                .append_pair("agent_name_hint", "Codewhale");
+        }
+    }
     Ok(BrowserAuthRequest {
         state,
+        nonce,
         pkce,
         redirect_uri,
-        authorize_url,
+        authorize_url: authorize_url.to_string(),
     })
 }
 
@@ -1410,7 +1543,7 @@ fn wait_for_callback(
     listeners: &[TcpListener],
     params: &OAuthProviderParams,
     expected_state: &str,
-) -> Result<String> {
+) -> Result<(String, Option<String>)> {
     let deadline = Instant::now() + CALLBACK_TIMEOUT;
     loop {
         if Instant::now() >= deadline {
@@ -1445,7 +1578,7 @@ fn handle_callback_stream(
     mut stream: TcpStream,
     params: &OAuthProviderParams,
     expected_state: &str,
-) -> Result<String> {
+) -> Result<(String, Option<String>)> {
     // BSD sockets (macOS) hand the accepted stream the listener's O_NONBLOCK;
     // the bounded read below needs a blocking socket with a timeout.
     stream.set_nonblocking(false).with_context(|| {
@@ -1481,7 +1614,7 @@ fn handle_callback_stream(
         let target = parse_http_request_target(request_line)?;
         let query = query_from_target(params, &target)?;
         let outcome = parse_callback_query(params, query)?;
-        accept_callback(expected_state, outcome)
+        accept_callback_with_client(expected_state, outcome)
     })();
     let (status, body) = match &result {
         Ok(_) => ("200 OK", CALLBACK_HTML_OK),
@@ -1504,16 +1637,17 @@ pub(crate) fn exchange_authorization_code(
     code: &str,
     verifier: &str,
 ) -> Result<OAuthTokenMaterial> {
-    let (status, body) = client.post_form(
-        token_endpoint,
-        &[
-            ("grant_type", "authorization_code"),
-            ("client_id", client_id),
-            ("redirect_uri", redirect_uri),
-            ("code", code),
-            ("code_verifier", verifier),
-        ],
-    )?;
+    let mut fields = vec![
+        ("grant_type", "authorization_code"),
+        ("client_id", client_id),
+        ("redirect_uri", redirect_uri),
+        ("code", code),
+        ("code_verifier", verifier),
+    ];
+    if params.display_name == "ChatGPT" {
+        fields.push(("resource", CHATGPT_OAUTH_RESOURCE));
+    }
+    let (status, body) = client.post_form(token_endpoint, &fields)?;
     parse_oauth_form_response(status, &body, "authorization code exchange", params)
 }
 
@@ -1542,10 +1676,50 @@ pub(crate) fn pkce_login_with(
     provider: OAuthProvider,
     inputs: &ResolvedOAuthInputs,
 ) -> Result<PendingOAuthLogin> {
+    pkce_login_with_selected(provider, inputs, None)
+}
+
+fn pkce_login_with_selected(
+    provider: OAuthProvider,
+    inputs: &ResolvedOAuthInputs,
+    selected: Option<ChatgptRegistration>,
+) -> Result<PendingOAuthLogin> {
     let params = oauth_provider_params(provider);
     let display_name = params.display_name;
+    let mut host = if provider == OAuthProvider::Chatgpt {
+        Some(prepare_chatgpt_host()?)
+    } else {
+        None
+    };
+    if let Some(host) = &mut host {
+        if !std::env::var("CODEWHALE_CHATGPT_NEW_ACCOUNT").is_ok_and(|value| value == "1")
+            && let Some(mut selected) = selected
+        {
+            selected.host_id = host.host_id.clone();
+            host.registration = Some(selected);
+        }
+        if let Some(registration) = &host.registration {
+            anyhow::ensure!(
+                registration.issuer == inputs.issuer,
+                "Saved ChatGPT registration belongs to a different issuer; credentials were not replaced"
+            );
+        }
+    }
+    let mut inputs = inputs.clone();
+    if let Some(host) = &host {
+        inputs.client_id = host.registration.as_ref().map_or_else(
+            || CHATGPT_OAUTH_CLIENT_ID.to_string(),
+            |registration| registration.client_id.clone(),
+        );
+    }
     let listeners = bind_loopback_callback(params)?;
-    let request = start_auth_request_on(&listeners, params, inputs)?;
+    let mut request = start_auth_request_on(&listeners, params, &inputs)?;
+    if let Some(host) = &host {
+        let mut url = reqwest::Url::parse(&request.authorize_url)?;
+        url.query_pairs_mut()
+            .append_pair("ext_agent_host_id", &host.host_id);
+        request.authorize_url = url.to_string();
+    }
     eprintln!("{display_name} sign-in (PKCE)");
     eprintln!("  Open:  {}", request.authorize_url);
     eprintln!("{}", account_choice_hint(display_name));
@@ -1555,20 +1729,59 @@ pub(crate) fn pkce_login_with(
     {
         eprintln!("Could not open the browser automatically: {err}");
     }
-    let code = wait_for_callback(&listeners, params, &request.state)?;
-    let token = exchange_authorization_code(
+    let (code, callback_id) = wait_for_callback(&listeners, params, &request.state)?;
+    let client_id = if provider == OAuthProvider::Chatgpt {
+        issued_callback_client_id(&inputs.client_id, callback_id.as_deref())?
+    } else {
+        inputs.client_id.clone()
+    };
+    let mut token = exchange_authorization_code(
         &ReqwestOAuthFormClient,
         params,
         &form_token_url(params, &inputs.issuer),
-        &inputs.client_id,
+        &client_id,
         &request.redirect_uri,
         &code,
         &request.pkce.verifier,
     )?;
+    if let Some(host) = &host {
+        require_chatgpt_scopes(token.scope.as_deref())?;
+        anyhow::ensure!(
+            token
+                .token_type
+                .as_deref()
+                .is_some_and(|value| value.eq_ignore_ascii_case("bearer")),
+            "ChatGPT token response did not return Bearer credentials"
+        );
+        let keys = fetch_chatgpt_jwks(&inputs.issuer)?;
+        let registration = verify_chatgpt_id_token(
+            token
+                .id_token
+                .as_deref()
+                .context("ChatGPT sign-in omitted its ID token")?,
+            &keys,
+            &inputs.issuer,
+            &client_id,
+            Some(&request.nonce),
+            host.registration
+                .as_ref()
+                .map(|registration| registration.subject.as_str()),
+            &host.host_id,
+        )?;
+        verify_chatgpt_access_token(
+            token
+                .access_token
+                .as_deref()
+                .context("ChatGPT sign-in omitted its access token")?,
+            &keys,
+            &registration,
+        )?;
+        token.verified_chatgpt = Some(registration);
+    }
     Ok(PendingOAuthLogin {
         provider,
         issuer: inputs.issuer.clone(),
-        client_id: inputs.client_id.clone(),
+        client_id,
         token,
     })
 }
@@ -1590,10 +1803,295 @@ pub(crate) const DEVICE_POLL_MAX_SECS: u64 = 900;
 
 /// ChatGPT issuer and public client.
 pub const CHATGPT_OAUTH_ISSUER: &str = "https://auth.openai.com";
-pub const CHATGPT_OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
+pub const CHATGPT_OAUTH_CLIENT_ID: &str = "dynamic_agent_client";
 /// Honest originator; never impersonate `codex_cli_rs`.
 pub const CHATGPT_OAUTH_ORIGINATOR: &str = "codewhale";
-pub const CHATGPT_OAUTH_SCOPE: &str = "openid profile email offline_access";
+pub const CHATGPT_OAUTH_RESOURCE: &str = "https://api.openai.com/v1";
+pub const CHATGPT_OAUTH_SCOPE: &str =
+    "openid profile email offline_access resource.invoke chatgpt.tokens.use.direct";
+
+/// Verified registration identity. The client ID also binds the selected workspace.
+/// One active registration is supported; use CODEWHALE_CHATGPT_NEW_ACCOUNT=1
+/// to explicitly replace it after a new, fully validated browser sign-in.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct ChatgptRegistration {
+    pub issuer: String,
+    pub client_id: String,
+    pub subject: String,
+    pub email: Option<String>,
+    pub host_id: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ChatgptHost {
+    host_id: String,
+    #[serde(default)]
+    registration: Option<ChatgptRegistration>,
+}
+
+fn valid_issued_chatgpt_client_id(value: &str) -> bool {
+    value.starts_with("oaiapp_")
+        && value.len() > 7
+        && value.len() <= 256
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
+fn validate_chatgpt_host(host: &ChatgptHost) -> Result<()> {
+    let id = host
+        .host_id
+        .strip_prefix("urn:uuid:")
+        .and_then(|value| uuid::Uuid::parse_str(value).ok())
+        .context("ChatGPT host identifier is invalid")?;
+    anyhow::ensure!(
+        id.get_version_num() == 4,
+        "ChatGPT host identifier must be a UUIDv4"
+    );
+    if let Some(registration) = &host.registration {
+        anyhow::ensure!(
+            registration.host_id == host.host_id
+                && valid_issued_chatgpt_client_id(&registration.client_id)
+                && !registration.subject.trim().is_empty(),
+            "Saved ChatGPT registration is invalid"
+        );
+    }
+    Ok(())
+}
+
+fn prepare_chatgpt_host() -> Result<ChatgptHost> {
+    codewhale_config::with_xai_oauth_lifecycle_lock(|store| {
+        let name = codewhale_config::CHATGPT_HOST_FILE_NAME;
+        let mut host: ChatgptHost = match store.read_to_string(name)? {
+            Some(raw) => {
+                serde_json::from_str(&raw).context("Saved ChatGPT host metadata is invalid")?
+            }
+            None => ChatgptHost {
+                host_id: format!("urn:uuid:{}", uuid::Uuid::new_v4()),
+                registration: None,
+            },
+        };
+        validate_chatgpt_host(&host)?;
+        // Persist before opening a browser, including after a cancelled first login.
+        store.write(name, &serde_json::to_vec(&host)?, true)?;
+        if std::env::var("CODEWHALE_CHATGPT_NEW_ACCOUNT").is_ok_and(|value| value == "1") {
+            host.registration = None;
+        }
+        Ok(host)
+    })
+}
+
+fn require_chatgpt_scopes(scope: Option<&str>) -> Result<()> {
+    let scope = scope.context("ChatGPT token response omitted granted scopes; sign in again")?;
+    for required in ["chatgpt.tokens.use.direct", "resource.invoke"] {
+        anyhow::ensure!(
+            scope
+                .split_ascii_whitespace()
+                .any(|value| value == required),
+            "ChatGPT plan permission was not granted; authorize plan usage in ChatGPT and sign in again"
+        );
+    }
+    Ok(())
+}
+
+#[derive(Clone, Deserialize)]
+struct ChatgptIdClaims {
+    sub: String,
+    #[serde(default)]
+    nonce: Option<String>,
+    #[serde(default)]
+    email: Option<String>,
+}
+
+fn fetch_chatgpt_jwks(issuer: &str) -> Result<JwkSet> {
+    let url = oauth_endpoint_url(&format!(
+        "{}/.well-known/jwks.json",
+        issuer.trim_end_matches('/')
+    ))?;
+    let response = oauth_http_client("identity verification")?
+        .get(url)
+        .send()
+        .context("ChatGPT identity verification keys could not be retrieved")?;
+    let (status, keys) = parse_oauth_json(response, "ChatGPT verification keys")?;
+    anyhow::ensure!(
+        status.is_success(),
+        "ChatGPT identity verification keys are unavailable"
+    );
+    Ok(keys)
+}
+
+fn verify_chatgpt_jwt<T: serde::de::DeserializeOwned + Clone>(
+    token: &str,
+    keys: &JwkSet,
+    issuer: &str,
+    audience: &str,
+) -> Result<T> {
+    let header = decode_header(token).context("ChatGPT identity token header is invalid")?;
+    anyhow::ensure!(
+        matches!(
+            header.alg,
+            Algorithm::RS256
+                | Algorithm::RS384
+                | Algorithm::RS512
+                | Algorithm::ES256
+                | Algorithm::ES384
+                | Algorithm::EdDSA
+        ),
+        "ChatGPT identity token uses an unsupported signature algorithm"
+    );
+    let kid = header
+        .kid
+        .as_deref()
+        .context("ChatGPT identity token omitted its verification key")?;
+    let jwk = keys
+        .find(kid)
+        .context("ChatGPT identity token verification key is unknown")?;
+    let key = DecodingKey::from_jwk(jwk).context("ChatGPT identity verification key is invalid")?;
+    let mut validation = Validation::new(header.alg);
+    validation.set_issuer(&[issuer]);
+    validation.set_audience(&[audience]);
+    validation.set_required_spec_claims(&["exp", "iss", "aud", "sub"]);
+    validation.validate_nbf = true;
+    validation.leeway = 0;
+    let claims = decode::<Value>(token, &key, &validation)
+        .map_err(|_| {
+            anyhow::anyhow!("ChatGPT token signature or identity claims failed verification")
+        })?
+        .claims;
+    let exact_audience = claims.get("aud").is_some_and(|aud| {
+        aud.as_str() == Some(audience)
+            || aud
+                .as_array()
+                .is_some_and(|values| values.len() == 1 && values[0].as_str() == Some(audience))
+    });
+    anyhow::ensure!(
+        exact_audience,
+        "ChatGPT token audience does not match this registration"
+    );
+    serde_json::from_value(claims).context("ChatGPT token identity claims are invalid")
+}
+
+fn verify_chatgpt_id_token(
+    token: &str,
+    keys: &JwkSet,
+    issuer: &str,
+    client_id: &str,
+    nonce: Option<&str>,
+    expected_subject: Option<&str>,
+    host_id: &str,
+) -> Result<ChatgptRegistration> {
+    let claims: ChatgptIdClaims = verify_chatgpt_jwt(token, keys, issuer, client_id)?;
+    anyhow::ensure!(
+        !claims.sub.trim().is_empty(),
+        "ChatGPT identity token has no subject"
+    );
+    if let Some(nonce) = nonce {
+        anyhow::ensure!(
+            claims.nonce.as_deref() == Some(nonce),
+            "ChatGPT identity token nonce did not match the pending login"
+        );
+    }
+    if let Some(subject) = expected_subject {
+        anyhow::ensure!(
+            claims.sub == subject,
+            "ChatGPT sign-in returned a different account; the selected registration was not replaced"
+        );
+    }
+    Ok(ChatgptRegistration {
+        issuer: issuer.to_string(),
+        client_id: client_id.to_string(),
+        subject: claims.sub,
+        email: claims.email,
+        host_id: host_id.to_string(),
+    })
+}
+
+#[derive(Clone, Deserialize)]
+struct ChatgptAccessClaims {
+    sub: String,
+    client_id: String,
+    scope: String,
+}
+
+fn verify_chatgpt_access_token(
+    token: &str,
+    keys: &JwkSet,
+    registration: &ChatgptRegistration,
+) -> Result<()> {
+    let claims: ChatgptAccessClaims =
+        verify_chatgpt_jwt(token, keys, &registration.issuer, CHATGPT_OAUTH_RESOURCE)?;
+    anyhow::ensure!(
+        claims.sub == registration.subject && claims.client_id == registration.client_id,
+        "ChatGPT access token does not match the selected account registration"
+    );
+    require_chatgpt_scopes(Some(&claims.scope))
+}
+
+fn issued_callback_client_id(pending_id: &str, callback_id: Option<&str>) -> Result<String> {
+    if pending_id == CHATGPT_OAUTH_CLIENT_ID {
+        let issued =
+            callback_id.context("ChatGPT registration did not return an issued client ID")?;
+        anyhow::ensure!(
+            valid_issued_chatgpt_client_id(issued),
+            "ChatGPT registration returned an invalid client ID"
+        );
+        Ok(issued.to_string())
+    } else {
+        anyhow::ensure!(
+            valid_issued_chatgpt_client_id(pending_id),
+            "Saved ChatGPT client ID is invalid; register again"
+        );
+        anyhow::ensure!(
+            callback_id.is_none_or(|value| value == pending_id),
+            "ChatGPT callback changed the selected registration; credentials were not replaced"
+        );
+        Ok(pending_id.to_string())
+    }
+}
+
+fn registration_from_entry(entry: &OwnedAuthEntry) -> Result<ChatgptRegistration> {
+    let registration: ChatgptRegistration =
+        serde_json::from_value(entry.extra.get("siwc_registration").cloned().context(
+            "Existing ChatGPT credentials need reauthorization; run `codewhale auth chatgpt`",
+        )?)
+        .context("Saved official ChatGPT registration is invalid; sign in again")?;
+    anyhow::ensure!(
+        registration.issuer == CHATGPT_OAUTH_ISSUER
+            && entry.oidc_issuer.as_deref() == Some(registration.issuer.as_str())
+            && entry.oidc_client_id.as_deref() == Some(registration.client_id.as_str())
+            && valid_issued_chatgpt_client_id(&registration.client_id)
+            && !registration.subject.trim().is_empty(),
+        "Saved ChatGPT grant does not match its verified registration; sign in again"
+    );
+    require_chatgpt_scopes(entry.extra.get("siwc_scope").and_then(Value::as_str))?;
+    let access = entry
+        .access_token
+        .as_deref()
+        .context("Saved ChatGPT access token is missing")?;
+    let fingerprint = URL_SAFE_NO_PAD.encode(Sha256::digest(access.as_bytes()));
+    anyhow::ensure!(
+        entry.extra.get("siwc_token_sha256").and_then(Value::as_str) == Some(fingerprint.as_str()),
+        "Saved ChatGPT token does not match its validated grant; sign in again"
+    );
+    Ok(registration)
+}
+
+/// Metadata only: no network, refresh, token return, or external credential import.
+pub(crate) fn official_chatgpt_registration(config: &Config) -> Result<ChatgptRegistration> {
+    anyhow::ensure!(
+        config
+            .provider_config_for(OAuthProvider::Chatgpt.api())
+            .and_then(|entry| entry.auth_mode.as_deref())
+            == Some("oauth"),
+        "The selected ChatGPT route does not use an official OAuth grant"
+    );
+    let path = configured_owned_auth_file_path(OAuthProvider::Chatgpt, config)?
+        .context("Sign in with ChatGPT using `codewhale auth chatgpt`")?;
+    let mut file = load_owned_auth_file(&path)?.context("Saved ChatGPT credentials are missing")?;
+    let (_, entry) = select_entry(OAuthProvider::Chatgpt, &mut file)
+        .context("Saved ChatGPT credentials are missing")?;
+    registration_from_entry(&entry)
+}
 
 impl OAuthProvider {
     /// The engine provider this OAuth row belongs to.
@@ -1773,21 +2271,10 @@ impl OAuthActivation {
         }
     }
 
-    /// A process token outranks every ChatGPT sign-in, so a new login does
-    /// not change the account requests use while one is set. Names the
-    /// variable, never its value.
+    /// Official ChatGPT sign-in never uses an ambient process token.
     #[must_use]
-    pub fn env_override_warning(&self, locale: codewhale_localization::Locale) -> Option<String> {
-        if self.provider != OAuthProvider::Chatgpt || credentials_from_env().is_none() {
-            return None;
-        }
-        Some(
-            codewhale_localization::tr(
-                locale,
-                codewhale_localization::MessageId::AuthEnvTokenOutranksSignIn,
-            )
-            .into_owned(),
-        )
+    pub fn env_override_warning(&self, _locale: codewhale_localization::Locale) -> Option<String> {
+        None
     }
 }
 
@@ -1888,6 +2375,18 @@ fn load_external_auth_file(
 }
 
 fn select_entry(provider: OAuthProvider, file: &mut AuthFile) -> Option<(String, OwnedAuthEntry)> {
+    if provider == OAuthProvider::Chatgpt {
+        let mut official = file
+            .iter()
+            .filter(|(_, entry)| registration_from_entry(entry).is_ok());
+        if let Some((scope, entry)) = official.next() {
+            // Ambiguous profile selection fails closed. Login writes one account.
+            return official
+                .next()
+                .is_none()
+                .then(|| (scope.clone(), entry.clone()));
+        }
+    }
     // Prefer this provider's registered client-id scope when present.
     let preferred_suffix = format!("::{}", oauth_provider_params(provider).default_client_id);
     if let Some((k, v)) = file
@@ -1912,6 +2411,21 @@ fn entry_has_usable_secret(entry: &OwnedAuthEntry) -> bool {
             .is_some_and(|t| !t.trim().is_empty())
 }
 
+fn chatgpt_refresh_not_before(value: &Value) -> Result<i64> {
+    value
+        .as_i64()
+        .or_else(|| {
+            value.as_str().and_then(|value| {
+                value
+                    .parse::<i64>()
+                    .ok()
+                    .or_else(|| parse_rfc3339_secs(value))
+            })
+        })
+        .filter(|value| *value >= 0)
+        .context("ChatGPT earliest refresh time is invalid; sign in again")
+}
+
 const REFRESH_SKEW_SECS: i64 = 60;
 
 fn entry_access_token_is_fresh(entry: &OwnedAuthEntry) -> bool {
@@ -1926,11 +2440,19 @@ fn entry_access_token_is_fresh(entry: &OwnedAuthEntry) -> bool {
     let token_expiry = jwt_expiry_seconds(token).and_then(|exp| i64::try_from(exp).ok());
     // A later stored expiry must not hide an already-expired access token.
     // Opaque tokens still use stored expiry; no known expiry remains stale.
+    let now = now_unix_secs().unwrap_or(0);
+    let refresh_blocked = entry
+        .extra
+        .get("siwc_earliest_refresh_at")
+        .and_then(|value| chatgpt_refresh_not_before(value).ok())
+        .is_some_and(|earliest| earliest > now);
     stored_expiry
         .into_iter()
         .chain(token_expiry)
         .min()
-        .is_some_and(|exp| exp.saturating_sub(now_unix_secs().unwrap_or(0)) > REFRESH_SKEW_SECS)
+        .is_some_and(|exp| {
+            exp.saturating_sub(now) > REFRESH_SKEW_SECS || (refresh_blocked && exp > now)
+        })
 }
 
 fn credentials_from_entry(
@@ -1983,6 +2505,43 @@ fn apply_token_response(
     client_id: &str,
     token: &OAuthTokenMaterial,
 ) -> Result<()> {
+    if provider == OAuthProvider::Chatgpt {
+        let registration = token
+            .verified_chatgpt
+            .as_ref()
+            .context("ChatGPT credentials were not cryptographically verified; sign in again")?;
+        anyhow::ensure!(
+            registration.issuer == issuer && registration.client_id == client_id,
+            "Verified ChatGPT registration does not match the token exchange"
+        );
+        require_chatgpt_scopes(token.scope.as_deref())?;
+        entry.extra.insert(
+            "siwc_registration".to_string(),
+            serde_json::to_value(registration)?,
+        );
+        entry.extra.insert(
+            "siwc_scope".to_string(),
+            Value::String(token.scope.clone().unwrap_or_default()),
+        );
+        let access = token
+            .access_token
+            .as_deref()
+            .context("token response missing access_token")?;
+        entry.extra.insert(
+            "siwc_token_sha256".to_string(),
+            Value::String(URL_SAFE_NO_PAD.encode(Sha256::digest(access.as_bytes()))),
+        );
+        if let Some(value) = &token.earliest_refresh_at {
+            let earliest = chatgpt_refresh_not_before(value)?;
+            entry.extra.insert(
+                "siwc_earliest_refresh_at".to_string(),
+                Value::from(earliest),
+            );
+        } else {
+            entry.extra.remove("siwc_earliest_refresh_at");
+        }
+        entry.account_id = Some(registration.subject.clone());
+    }
     let access = token
         .access_token
         .as_deref()
@@ -2003,7 +2562,9 @@ fn apply_token_response(
         .originator
         .map(ToOwned::to_owned);
     if let Some(id_token) = token.id_token.clone() {
-        if let Some(account_id) = account_id_from_id_token(&id_token) {
+        if provider != OAuthProvider::Chatgpt
+            && let Some(account_id) = account_id_from_id_token(&id_token)
+        {
             entry.account_id = Some(account_id);
         }
         entry.id_token = Some(id_token);
@@ -2142,7 +2703,10 @@ fn owned_account_label_at(provider: OAuthProvider, path: &Path) -> Result<Option
         .map_err(|_| anyhow::anyhow!("sign-in file is unreadable"))?
         .ok_or_else(|| anyhow::anyhow!("sign-in file is missing"))?;
     let (_, entry) = select_entry(provider, &mut file)
-        .filter(|(_, entry)| owned_entry_is_usable(entry))
+        .filter(|(_, entry)| {
+            (provider != OAuthProvider::Chatgpt || registration_from_entry(entry).is_ok())
+                && owned_entry_is_usable(entry)
+        })
         .ok_or_else(|| anyhow::anyhow!("sign-in file holds no usable sign-in"))?;
     Ok(entry.account_label())
 }
@@ -2156,10 +2720,14 @@ fn owned_account_label_at(provider: OAuthProvider, path: &Path) -> Result<Option
 pub fn usage_limit_guidance(provider: OAuthProvider, account_label: Option<&str>) -> String {
     let params = oauth_provider_params(provider);
     let name = params.display_name;
-    let switch = format!(
-        "To continue with a different {name} account, run `{}` in Codewhale, or `{}` in a shell and then restart open Codewhale sessions.",
-        params.session_login_hint, params.relogin_hint
-    );
+    let switch = if provider == OAuthProvider::Chatgpt {
+        "To continue with a different ChatGPT account, run `CODEWHALE_CHATGPT_NEW_ACCOUNT=1 codewhale auth chatgpt` in a shell and then restart open Codewhale sessions. `/auth chatgpt` reauthorizes the selected account.".to_string()
+    } else {
+        format!(
+            "To continue with a different {name} account, run `{}` in Codewhale, or `{}` in a shell and then restart open Codewhale sessions.",
+            params.session_login_hint, params.relogin_hint
+        )
+    };
     match account_label {
         Some(label) => format!("This request used the {name} account {label}. {switch}"),
         None => switch,
@@ -2169,6 +2737,9 @@ pub fn usage_limit_guidance(provider: OAuthProvider, account_label: Option<&str>
 /// Printed beside a login URL: the issuer signs in whichever account the
 /// browser already holds unless the user picks another.
 fn account_choice_hint(display_name: &str) -> String {
+    if display_name == "ChatGPT" {
+        return "Returning sign-in must use the selected ChatGPT account. To replace it, start a new login with `CODEWHALE_CHATGPT_NEW_ACCOUNT=1 codewhale auth chatgpt`. If the browser shows a different account, sign out there first or open the login URL in a private window.".to_string();
+    }
     format!(
         "Approve with the {display_name} account Codewhale should use. If the page is already \
          signed in to a different account, sign out there first or open the URL above in a \
@@ -2291,6 +2862,14 @@ pub fn usable_sign_in(provider: OAuthProvider, config: &Config) -> Option<Usable
     // explicitly selects OAuth. A failed post-login config finalization can
     // therefore never make a newly written token silently ready on the next
     // launch.
+    if provider == OAuthProvider::Chatgpt
+        && config
+            .provider_config_for(provider.api())
+            .and_then(|entry| entry.auth_mode.as_deref())
+            != Some("oauth")
+    {
+        return None;
+    }
     if provider == OAuthProvider::Xai
         && !config
             .provider_config_for(provider.api())
@@ -2302,6 +2881,7 @@ pub fn usable_sign_in(provider: OAuthProvider, config: &Config) -> Option<Usable
     if let Ok(Some(path)) = configured_owned_auth_file_path(provider, config)
         && let Ok(Some(mut file)) = load_owned_auth_file(&path)
         && let Some((_, entry)) = select_entry(provider, &mut file)
+        && (provider != OAuthProvider::Chatgpt || registration_from_entry(&entry).is_ok())
         && owned_entry_is_usable(&entry)
     {
         return Some(usable(&entry));
@@ -2434,7 +3014,43 @@ pub fn get_owned_credentials(
     provider: OAuthProvider,
     config: &Config,
 ) -> Result<OwnedOAuthCredentials> {
+    if provider == OAuthProvider::Chatgpt {
+        anyhow::ensure!(
+            config
+                .provider_config_for(provider.api())
+                .and_then(|entry| entry.auth_mode.as_deref())
+                == Some("oauth"),
+            "ChatGPT credentials are inactive; run `codewhale auth chatgpt`"
+        );
+    }
     get_owned_credentials_with(provider, config, &ReqwestOAuthFormClient)
+}
+
+/// Read-only diagnostics: never refreshes or changes protected storage.
+pub(crate) fn get_owned_credentials_read_only(
+    provider: OAuthProvider,
+    config: &Config,
+) -> Result<OwnedOAuthCredentials> {
+    anyhow::ensure!(
+        provider == OAuthProvider::Chatgpt,
+        "Read-only official credentials require ChatGPT"
+    );
+    official_chatgpt_registration(config)?;
+    let path = configured_owned_auth_file_path(provider, config)?
+        .context("ChatGPT credentials are not configured")?;
+    let mut file = load_owned_auth_file(&path)?.context("ChatGPT credentials are missing")?;
+    let (scope, entry) =
+        select_entry(provider, &mut file).context("ChatGPT credentials are unavailable")?;
+    registration_from_entry(&entry)?;
+    anyhow::ensure!(
+        entry_access_token_is_fresh(&entry),
+        "ChatGPT access token needs runtime refresh; read-only diagnostics do not refresh"
+    );
+    let access = entry
+        .access_token
+        .clone()
+        .context("ChatGPT access token is missing")?;
+    Ok(credentials_from_entry(provider, &scope, &entry, access))
 }
 
 fn get_owned_credentials_with(
@@ -2453,9 +3069,15 @@ fn get_owned_credentials_with(
         .and_then(|name| name.to_str())
         .context("Codewhale-owned OAuth path must have a UTF-8 basename")?;
     codewhale_config::with_xai_oauth_lifecycle_lock(|store| {
-        get_owned_credentials_locked(provider, store, name, |issuer, client_id, refresh| {
-            refresh_for_provider(provider, client, issuer, client_id, refresh)
-        })
+        get_owned_credentials_locked(
+            provider,
+            store,
+            name,
+            client,
+            |issuer, client_id, refresh| {
+                refresh_for_provider(provider, client, issuer, client_id, refresh)
+            },
+        )
     })
 }
 
@@ -2474,15 +3096,21 @@ fn get_owned_credentials_at(provider: OAuthProvider, path: &Path) -> Result<Owne
         "Codewhale-owned OAuth path has an invalid basename"
     );
     codewhale_config::with_xai_oauth_lifecycle_lock(|store| {
-        get_owned_credentials_locked(provider, store, name, |issuer, client_id, refresh| {
-            refresh_for_provider(
-                provider,
-                &ReqwestOAuthFormClient,
-                issuer,
-                client_id,
-                refresh,
-            )
-        })
+        get_owned_credentials_locked(
+            provider,
+            store,
+            name,
+            &ReqwestOAuthFormClient,
+            |issuer, client_id, refresh| {
+                refresh_for_provider(
+                    provider,
+                    &ReqwestOAuthFormClient,
+                    issuer,
+                    client_id,
+                    refresh,
+                )
+            },
+        )
     })
 }
 
@@ -2490,6 +3118,7 @@ fn get_owned_credentials_locked<F>(
     provider: OAuthProvider,
     store: &codewhale_config::XaiOAuthCredentialStore,
     name: &str,
+    client: &dyn OAuthFormClient,
     refresh_access: F,
 ) -> Result<OwnedOAuthCredentials>
 where
@@ -2509,6 +3138,11 @@ where
             codewhale_config::quote_os_path(&path)
         )
     })?;
+    let registration = if provider == OAuthProvider::Chatgpt {
+        Some(registration_from_entry(&entry)?)
+    } else {
+        None
+    };
 
     if entry_access_token_is_fresh(&entry) {
         let token = entry
@@ -2537,7 +3171,54 @@ where
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| client_id_from_scope(provider, &scope));
 
-    let refreshed = refresh_access(&issuer, &client_id, refresh)?;
+    if let Some(value) = entry.extra.get("siwc_earliest_refresh_at") {
+        anyhow::ensure!(
+            chatgpt_refresh_not_before(value)?
+                <= now_unix_secs().context("System clock is unavailable for ChatGPT refresh")?,
+            "ChatGPT refresh window has not opened; retry later"
+        );
+    }
+    let mut refreshed = refresh_access(&issuer, &client_id, refresh)?;
+    if let Some(registration) = registration {
+        require_chatgpt_scopes(refreshed.scope.as_deref())?;
+        anyhow::ensure!(
+            refreshed
+                .token_type
+                .as_deref()
+                .is_some_and(|value| value.eq_ignore_ascii_case("bearer")),
+            "ChatGPT refresh did not return Bearer credentials"
+        );
+        anyhow::ensure!(
+            refreshed
+                .refresh_token
+                .as_deref()
+                .is_some_and(|token| !token.trim().is_empty()),
+            "ChatGPT refresh omitted its rotating refresh token; sign in again"
+        );
+        let keys = client.chatgpt_jwks(&issuer)?;
+        verify_chatgpt_access_token(
+            refreshed
+                .access_token
+                .as_deref()
+                .context("ChatGPT refresh omitted its access token")?,
+            &keys,
+            &registration,
+        )?;
+        if let Some(id_token) = &refreshed.id_token {
+            let refreshed_registration = verify_chatgpt_id_token(
+                id_token,
+                &keys,
+                &issuer,
+                &client_id,
+                None,
+                Some(&registration.subject),
+                &registration.host_id,
+            )?;
+            refreshed.verified_chatgpt = Some(refreshed_registration);
+        } else {
+            refreshed.verified_chatgpt = Some(registration);
+        }
+    }
     apply_token_response(provider, &mut entry, &issuer, &client_id, &refreshed)?;
     file.insert(scope.clone(), entry.clone());
     write_auth_file_to_store(store, name, &file, true)?;
@@ -2706,6 +3387,18 @@ fn activate_login_locked(
             ));
         }
     };
+    if let Some(registration) = pending.token.verified_chatgpt.as_ref() {
+        let host = ChatgptHost {
+            host_id: registration.host_id.clone(),
+            registration: Some(registration.clone()),
+        };
+        if let Err(error) = serde_json::to_vec(&host)
+            .map_err(anyhow::Error::from)
+            .and_then(|bytes| store.write(codewhale_config::CHATGPT_HOST_FILE_NAME, &bytes, true))
+        {
+            tracing::warn!(target: "codewhale::oauth", error = %error, "ChatGPT grant activated; retaining its signed-out registration failed");
+        }
+    }
 
     if let Some(config) = live_config {
         match provider {
@@ -2815,6 +3508,7 @@ fn revoke_owned_login_locked_with(
         }
         _ => vec![provider.legacy_file_name().to_string()],
     };
+    let mut remote_unconfirmed = false;
     for name in names {
         if let Ok(Some(raw)) = store.read_to_string(&name)
             && let Ok(file) = parse_auth_file(&raw, &store.path_for(&name)?)
@@ -2841,6 +3535,7 @@ fn revoke_owned_login_locked_with(
                         client_id,
                         token,
                     ) {
+                        remote_unconfirmed |= provider == OAuthProvider::Chatgpt;
                         tracing::warn!(
                             target: "codewhale::oauth",
                             error = %error,
@@ -2850,8 +3545,14 @@ fn revoke_owned_login_locked_with(
                 }
             }
         }
-        let _ = store.remove(&name);
+        store
+            .remove(&name)
+            .context("OAuth sign-out could not clear local credential storage")?;
     }
+    anyhow::ensure!(
+        !remote_unconfirmed,
+        "Signed out locally, but remote revocation was not confirmed. Disconnect Codewhale in ChatGPT Settings to end the renewable session."
+    );
     Ok(())
 }
 
@@ -2978,21 +3679,16 @@ pub fn missing_auth_message(provider: OAuthProvider) -> String {
              codewhale auth set --provider xai",
             codewhale_config::quote_os_path(&grok_auth_file_path())
         ),
-        OAuthProvider::Chatgpt => format!(
-            "OpenAI Codex OAuth credentials are unavailable.\n\
-             \n\
-             Sign in with ChatGPT (subscription billing, Codewhale-owned tokens):\n\
-             `codewhale auth chatgpt` or /provider setup openai-codex.\n\
-             The openai API-key route is a different billing owner.\n\
-             \n\
-             Alternatives:\n\
-             - Process token: OPENAI_CODEX_ACCESS_TOKEN / CODEX_ACCESS_TOKEN\n\
-             - Explicit Codex CLI import (not a prerequisite): after `codex login`, run \
-             `codewhale auth external-consent --provider openai-codex --mode read-only --path {}`\n\
-             Read-only access never refreshes or rewrites the Codex CLI file.\n\
-             Revoke Codewhale-owned tokens with `codewhale auth chatgpt-revoke`.",
-            codewhale_config::quote_os_path(&auth_file_path())
-        ),
+        OAuthProvider::Chatgpt => "Official ChatGPT credentials are unavailable.
+\
+             Run `codewhale auth chatgpt` or /provider setup openai-codex.
+\
+             Authorize ChatGPT plan usage to use your plan allowance.
+\
+             Revoke Codewhale-owned tokens with `codewhale auth chatgpt-revoke`.
+\
+             The openai API-key route uses separate API billing."
+            .to_string(),
     }
 }
 
@@ -3013,13 +3709,33 @@ pub(crate) fn pending_login_with_id_token_for_test(
     refresh_token: &str,
     id_token: Option<&str>,
 ) -> PendingOAuthLogin {
+    let registration = (provider == OAuthProvider::Chatgpt).then(|| ChatgptRegistration {
+        issuer: CHATGPT_OAUTH_ISSUER.to_string(),
+        client_id: "oaiapp_codewhale_test".to_string(),
+        subject: id_token
+            .and_then(account_id_from_id_token)
+            .unwrap_or_else(|| "test-sub".to_string()),
+        email: None,
+        host_id: format!("urn:uuid:{}", uuid::Uuid::new_v4()),
+    });
     PendingOAuthLogin {
         provider,
         issuer: oauth_provider_params(provider).default_issuer.to_string(),
-        client_id: oauth_provider_params(provider)
-            .default_client_id
-            .to_string(),
+        client_id: registration.as_ref().map_or_else(
+            || {
+                oauth_provider_params(provider)
+                    .default_client_id
+                    .to_string()
+            },
+            |registration| registration.client_id.clone(),
+        ),
         token: OAuthTokenMaterial {
+            earliest_refresh_at: None,
+            scope: registration
+                .as_ref()
+                .map(|_| CHATGPT_OAUTH_SCOPE.to_string()),
+            token_type: Some("Bearer".to_string()),
+            verified_chatgpt: registration,
             access_token: Some(access_token.to_string()),
             refresh_token: Some(refresh_token.to_string()),
             expires_in: Some(3600),
@@ -3029,6 +3745,60 @@ pub(crate) fn pending_login_with_id_token_for_test(
             error_description: None,
         },
     }
+}
+
+/// Local stored-proof fixture only; signature verification has separate tests.
+/// The caller must isolate CODEWHALE_HOME before using this helper.
+#[cfg(test)]
+pub(crate) fn install_test_chatgpt_registration(config: &mut Config) -> Result<String> {
+    install_test_chatgpt_registration_for(config, "test-sub", "oaiapp_codewhale_test")
+}
+
+#[cfg(test)]
+pub(crate) fn install_test_chatgpt_registration_for(
+    config: &mut Config,
+    subject: &str,
+    client_id: &str,
+) -> Result<String> {
+    let mut pending = pending_login_for_test(
+        OAuthProvider::Chatgpt,
+        "siwc-test-access",
+        "siwc-test-refresh",
+    );
+    pending.client_id = client_id.to_string();
+    let registration = pending
+        .token
+        .verified_chatgpt
+        .as_mut()
+        .expect("fixture registration");
+    registration.subject = subject.to_string();
+    registration.client_id = client_id.to_string();
+    let generation = OAuthProvider::Chatgpt.new_generation();
+    let mut entry = OwnedAuthEntry {
+        access_token: None,
+        refresh_token: None,
+        expires_at: None,
+        id_token: None,
+        account_id: None,
+        oidc_issuer: None,
+        oidc_client_id: None,
+        originator: None,
+        auth_mode: None,
+        extra: BTreeMap::new(),
+    };
+    apply_token_response(
+        OAuthProvider::Chatgpt,
+        &mut entry,
+        &pending.issuer,
+        &pending.client_id,
+        &pending.token,
+    )?;
+    let file = BTreeMap::from([(format!("{}::{}", pending.issuer, pending.client_id), entry)]);
+    codewhale_config::with_xai_oauth_lifecycle_lock(|store| {
+        write_auth_file_to_store(store, &generation, &file, false)
+    })?;
+    config.mark_codewhale_owned_chatgpt_oauth(generation);
+    Ok("siwc-test-access".to_string())
 }
 
 #[cfg(test)]
@@ -3287,20 +4057,15 @@ mod tests {
     }
 
     #[test]
-    fn missing_auth_message_explains_disabled_default_and_explicit_consent() {
-        let _lock = crate::test_support::lock_test_env();
+    fn missing_auth_message_guides_official_sign_in() {
         let message = missing_auth_message(OAuthProvider::Chatgpt);
-
-        assert!(message.contains("OpenAI Codex OAuth credentials are unavailable"));
-        assert!(message.contains("OPENAI_CODEX_ACCESS_TOKEN"));
-        assert!(message.contains("CODEX_ACCESS_TOKEN"));
-        assert!(message.contains(&codewhale_config::quote_os_path(&auth_file_path())));
+        assert!(message.contains("Official ChatGPT credentials"));
         assert!(message.contains("codewhale auth chatgpt"));
-        assert!(message.contains("subscription billing"));
+        assert!(message.contains("ChatGPT plan usage"));
         assert!(message.contains("openai API-key"));
-        assert!(message.contains("codex login"));
-        assert!(message.contains("external-consent"));
         assert!(message.contains("chatgpt-revoke"));
+        assert!(!message.contains("external-consent"));
+        assert!(!message.contains("CODEX_ACCESS_TOKEN"));
     }
 
     #[test]
@@ -4062,13 +4827,13 @@ mod tests {
             &pkce,
         )
         .expect("static issuer parses");
-        assert!(url.starts_with("https://auth.openai.com/oauth/authorize?"));
+        assert!(url.starts_with("https://auth.openai.com/api/accounts/authorize?"));
         assert!(url.contains("code_challenge=challenge"));
         assert!(url.contains("code_challenge_method=S256"));
         assert!(url.contains("originator=codewhale"));
         assert!(!url.contains("codex_cli_rs"));
         assert!(url.contains("redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback"));
-        assert!(url.contains("id_token_add_organizations=true"));
+        assert!(url.contains("resource=https%3A%2F%2Fapi.openai.com%2Fv1"));
         // Account choice: the issuer must re-prompt rather than reuse the
         // browser's current ChatGPT session.
         let query: BTreeMap<String, String> = reqwest::Url::parse(&url)
@@ -4093,7 +4858,10 @@ mod tests {
         )
         .expect("static issuer parses");
         assert!(!url.contains("prompt="), "{url}");
-        assert!(url.contains("id_token_add_organizations=true"), "{url}");
+        assert!(
+            url.contains("resource=https%3A%2F%2Fapi.openai.com%2Fv1"),
+            "{url}"
+        );
     }
 
     fn id_token(claims: &serde_json::Value) -> String {
@@ -4174,11 +4942,14 @@ mod tests {
     fn usage_limit_guidance_names_account_and_switch_command() {
         let chatgpt = usage_limit_guidance(OAuthProvider::Chatgpt, Some("a@example.com (plus)"));
         assert!(chatgpt.contains("a@example.com (plus)"), "{chatgpt}");
-        assert!(chatgpt.contains("`codewhale auth chatgpt`"), "{chatgpt}");
-        // A running session does not see a shell login: the in-session
-        // command comes first, and the shell route says to restart.
         assert!(
-            chatgpt.contains("`/auth chatgpt` in Codewhale"),
+            chatgpt.contains("`CODEWHALE_CHATGPT_NEW_ACCOUNT=1 codewhale auth chatgpt`"),
+            "{chatgpt}"
+        );
+        // A running session does not see a shell login. Returning login
+        // stays on its verified account; explicit replacement needs a restart.
+        assert!(
+            chatgpt.contains("`/auth chatgpt` reauthorizes the selected account"),
             "{chatgpt}"
         );
         assert!(
@@ -4221,16 +4992,15 @@ mod tests {
             "Signed in to ChatGPT as a@example.com (plus)."
         );
 
-        // Account B's grant carries no refresh token and no account claim:
-        // nothing from account A may survive into B's credential.
+        // Account B has its own offline grant and no account claim in the
+        // display token: nothing from account A may survive into B's credential.
         let token_b = id_token(&serde_json::json!({"email": "b@example.com"}));
-        let mut pending_b = pending_login_with_id_token_for_test(
+        let pending_b = pending_login_with_id_token_for_test(
             OAuthProvider::Chatgpt,
             "access-b",
-            "unused",
+            "refresh-b",
             Some(&token_b),
         );
-        pending_b.token.refresh_token = None;
         let second = activate_login(pending_b, Some(&config_path), None).expect("second login");
         assert_eq!(second.account_label.as_deref(), Some("b@example.com"));
         assert_eq!(
@@ -4291,19 +5061,19 @@ mod tests {
         std::fs::write(&config_path, "").expect("empty config");
         let token_a = id_token(&serde_json::json!({"email": "a@example.com"}));
         let mut pending_a = pending_login_with_id_token_for_test(
-            OAuthProvider::Chatgpt,
+            OAuthProvider::Xai,
             "access-a",
             "refresh-a",
             Some(&token_a),
         );
         // '/' sorts before ':', so this scope comes first in the file.
-        pending_a.issuer = format!("{CHATGPT_OAUTH_ISSUER}/");
+        pending_a.issuer = format!("{XAI_OIDC_ISSUER}/");
         activate_login(pending_a, Some(&config_path), None).expect("login A");
 
         let token_b = id_token(&serde_json::json!({"email": "b@example.com"}));
         let second = activate_login(
             pending_login_with_id_token_for_test(
-                OAuthProvider::Chatgpt,
+                OAuthProvider::Xai,
                 "access-b",
                 "refresh-b",
                 Some(&token_b),
@@ -4322,9 +5092,9 @@ mod tests {
             .and_then(|name| name.to_str())
             .expect("generation name");
         let mut config = Config::default();
-        config.mark_codewhale_owned_chatgpt_oauth(generation.to_string());
+        config.mark_codewhale_owned_xai_oauth(generation.to_string());
         assert_eq!(
-            usable_sign_in(OAuthProvider::Chatgpt, &config)
+            usable_sign_in(OAuthProvider::Xai, &config)
                 .and_then(|sign_in| sign_in.account_label)
                 .as_deref(),
             Some("b@example.com")
@@ -4476,7 +5246,8 @@ mod tests {
         )
         .unwrap();
         let err = accept_callback("s1", outcome).unwrap_err().to_string();
-        assert!(err.contains("nope"), "{err}");
+        assert!(err.contains("access_denied"), "{err}");
+        assert!(!err.contains("nope"), "{err}");
         assert!(!err.contains("access_token"));
     }
 
@@ -4513,7 +5284,10 @@ mod tests {
         assert_eq!(token.access_token.as_deref(), Some("at-1"));
         let posts = client.posts.lock().unwrap();
         assert_eq!(posts.len(), 1);
-        assert_eq!(posts[0].0, "https://auth.openai.com/oauth/token");
+        assert_eq!(
+            posts[0].0,
+            "https://auth.openai.com/api/accounts/oauth/token"
+        );
         let form: std::collections::BTreeMap<_, _> = posts[0].1.iter().cloned().collect();
         assert_eq!(form["grant_type"], "authorization_code");
         assert_eq!(form["code_verifier"], "verifier");
@@ -4568,7 +5342,7 @@ mod tests {
         )
         .unwrap();
         let code = server.join().expect("server").expect("callback ok");
-        assert_eq!(code, "tok");
+        assert_eq!(code.0, "tok");
 
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind error port");
         listener.set_nonblocking(false).unwrap();
@@ -4626,7 +5400,7 @@ mod tests {
                 .join()
                 .expect("server")
                 .unwrap_or_else(|error| panic!("callback on {target_addr} rejected: {error}"));
-            assert_eq!(code, "tok", "callback on {target_addr}");
+            assert_eq!(code.0, "tok", "callback on {target_addr}");
         }
     }
 
@@ -5013,9 +5787,13 @@ mod tests {
             store.write(generation, stored.as_bytes(), false)?;
             // A fresh stored token must be used as-is: refreshing here would
             // mean an existing login stopped working offline.
-            get_owned_credentials_locked(OAuthProvider::Xai, store, generation, |_, _, _| {
-                panic!("a fresh stored token must not be refreshed")
-            })
+            get_owned_credentials_locked(
+                OAuthProvider::Xai,
+                store,
+                generation,
+                &ReqwestOAuthFormClient,
+                |_, _, _| panic!("a fresh stored token must not be refreshed"),
+            )
         })
         .expect("read back a credential stored in the current format");
 
@@ -5151,12 +5929,17 @@ mod tests {
                     OAuthProvider::Xai,
                     store,
                     &first_generation,
+                    &ReqwestOAuthFormClient,
                     |_, _, refresh| {
                         assert_eq!(refresh, "initial-refresh");
                         first_refreshes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         entered_tx.send(()).unwrap();
                         release_rx.recv().unwrap();
                         Ok(OAuthTokenMaterial {
+                            earliest_refresh_at: None,
+                            scope: None,
+                            token_type: None,
+                            verified_chatgpt: None,
                             id_token: None,
                             access_token: Some("rotated-access".to_string()),
                             refresh_token: Some("rotated-refresh".to_string()),
@@ -5181,6 +5964,7 @@ mod tests {
                     OAuthProvider::Xai,
                     store,
                     &second_generation,
+                    &ReqwestOAuthFormClient,
                     |_, _, _| {
                         second_refreshes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         bail!("second refresh must observe the first thread's committed token")
@@ -5235,10 +6019,15 @@ mod tests {
                     OAuthProvider::Xai,
                     store,
                     &refresh_generation,
+                    &ReqwestOAuthFormClient,
                     |_, _, _| {
                         entered_tx.send(()).unwrap();
                         release_rx.recv().unwrap();
                         Ok(OAuthTokenMaterial {
+                            earliest_refresh_at: None,
+                            scope: None,
+                            token_type: None,
+                            verified_chatgpt: None,
                             id_token: None,
                             access_token: Some("last-refresh-access".to_string()),
                             refresh_token: Some("last-refresh-rotation".to_string()),
@@ -5990,6 +6779,10 @@ consent_version = 1
             extra: BTreeMap::new(),
         };
         let token = OAuthTokenMaterial {
+            earliest_refresh_at: None,
+            scope: None,
+            token_type: None,
+            verified_chatgpt: None,
             id_token: None,
             access_token: Some("fresh-access".to_string()),
             refresh_token: Some("fresh-refresh".to_string()),
@@ -6039,6 +6832,10 @@ consent_version = 1
             extra: BTreeMap::new(),
         };
         let token = OAuthTokenMaterial {
+            earliest_refresh_at: None,
+            scope: None,
+            token_type: None,
+            verified_chatgpt: None,
             id_token: None,
             access_token: None,
             refresh_token: None,
@@ -6100,7 +6897,7 @@ consent_version = 1
     }
 
     #[test]
-    fn store_persist_refresh_and_revoke_use_mock_issuer() {
+    fn siwc_legacy_credentials_require_reauthorization_and_revoke_retains_host() {
         let _lock = crate::test_support::lock_test_env();
         let home = tempfile::tempdir().expect("temp home");
         let root = home.path().canonicalize().expect("canonical home");
@@ -6164,16 +6961,15 @@ consent_version = 1
             })
             .to_string(),
         )]);
-        let refreshed =
-            get_owned_credentials_with(OAuthProvider::Chatgpt, &config, &mock).expect("refresh");
-        assert_eq!(refreshed.access_token, "access-2");
-        let stored = codewhale_config::with_xai_oauth_lifecycle_lock(|store| {
-            store.read_to_string(&generation)
-        })
-        .unwrap()
-        .unwrap();
-        assert!(stored.contains("refresh-2"), "{stored}");
-        assert!(!stored.contains("refresh-old"), "{stored}");
+        let error = match get_owned_credentials_with(OAuthProvider::Chatgpt, &config, &mock) {
+            Ok(_) => panic!("legacy credentials must not be sent to the official API"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("reauthorization"), "{error}");
+        assert!(
+            mock.posts.lock().unwrap().is_empty(),
+            "legacy tokens must not be refreshed"
+        );
 
         let revoke_mock = MockTokenClient::new(vec![(200, String::new())]);
         codewhale_config::with_xai_oauth_lifecycle_lock(|store| {
@@ -6188,6 +6984,12 @@ consent_version = 1
         .expect("revoke");
         let after = std::fs::read_to_string(&config_path).expect("config after revoke");
         assert!(!after.contains("chatgpt-auth-"), "{after}");
+        assert!(
+            root.join("credentials")
+                .join(codewhale_config::CHATGPT_HOST_FILE_NAME)
+                .exists(),
+            "signout retains the host and registration"
+        );
         let posts = revoke_mock.posts.lock().unwrap();
         assert!(
             posts.iter().any(|(url, _)| url.contains("/oauth/revoke")),
@@ -6234,5 +7036,281 @@ consent_version = 1
         let rendered = format!("{activation:?}");
         assert!(rendered.contains("<redacted>"));
         assert!(!rendered.contains("secret-access"));
+    }
+    struct SiwcSigningFixture {
+        pair: ring::signature::Ed25519KeyPair,
+        keys: JwkSet,
+    }
+
+    impl SiwcSigningFixture {
+        fn new() -> Self {
+            use ring::signature::KeyPair as _;
+            let pkcs8 =
+                ring::signature::Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new())
+                    .unwrap();
+            let pair = ring::signature::Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
+            let keys = serde_json::from_value(serde_json::json!({"keys": [{
+                "kty": "OKP", "crv": "Ed25519", "kid": "siwc-fixture", "alg": "EdDSA", "use": "sig",
+                "x": URL_SAFE_NO_PAD.encode(pair.public_key().as_ref())
+            }]}))
+            .unwrap();
+            Self { pair, keys }
+        }
+        fn token(&self, claims: Value) -> String {
+            let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"EdDSA","kid":"siwc-fixture"}"#);
+            let payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap());
+            let message = format!("{header}.{payload}");
+            format!(
+                "{message}.{}",
+                URL_SAFE_NO_PAD.encode(self.pair.sign(message.as_bytes()).as_ref())
+            )
+        }
+        fn id_claims(&self) -> Value {
+            serde_json::json!({"iss": CHATGPT_OAUTH_ISSUER, "aud": "oaiapp_codewhale_test", "sub": "test-sub", "nonce": "pending-nonce", "exp": now_unix_secs().unwrap() + 3600})
+        }
+        fn access(&self, subject: &str) -> String {
+            self.token(serde_json::json!({"iss": CHATGPT_OAUTH_ISSUER, "aud": CHATGPT_OAUTH_RESOURCE, "sub": subject, "client_id": "oaiapp_codewhale_test", "scope": CHATGPT_OAUTH_SCOPE, "exp": now_unix_secs().unwrap() + 3600}))
+        }
+    }
+
+    #[test]
+    fn siwc_signed_identity_requires_signature_issuer_audience_expiry_nonce_and_account() {
+        let signer = SiwcSigningFixture::new();
+        let verify = |token: &str| {
+            verify_chatgpt_id_token(
+                token,
+                &signer.keys,
+                CHATGPT_OAUTH_ISSUER,
+                "oaiapp_codewhale_test",
+                Some("pending-nonce"),
+                Some("test-sub"),
+                "urn:uuid:00000000-0000-4000-8000-000000000001",
+            )
+        };
+        let claims = signer.id_claims();
+        let signed = signer.token(claims.clone());
+        assert_eq!(verify(&signed).unwrap().subject, "test-sub");
+        for (field, wrong) in [
+            ("iss", Value::from("https://other.invalid")),
+            ("aud", Value::from("oaiapp_other")),
+            (
+                "aud",
+                serde_json::json!(["oaiapp_codewhale_test", "another-audience"]),
+            ),
+            ("exp", Value::from(1)),
+            ("nonce", Value::from("another-nonce")),
+            ("sub", Value::from("another-subject")),
+            ("sub", Value::from("")),
+        ] {
+            let mut changed = claims.clone();
+            changed[field] = wrong;
+            assert!(
+                verify(&signer.token(changed)).is_err(),
+                "accepted invalid {field}"
+            );
+        }
+        for required in ["iss", "aud", "exp", "sub", "nonce"] {
+            let mut changed = claims.clone();
+            changed.as_object_mut().unwrap().remove(required);
+            assert!(
+                verify(&signer.token(changed)).is_err(),
+                "accepted missing {required}"
+            );
+        }
+        let other_signer = SiwcSigningFixture::new();
+        assert!(verify(&other_signer.token(claims.clone())).is_err());
+        let parts: Vec<_> = signed.split('.').collect();
+        let bad_payload = URL_SAFE_NO_PAD.encode(br#"{"sub":"attacker"}"#);
+        assert!(verify(&format!("{}.{}.{}", parts[0], bad_payload, parts[2])).is_err());
+        let symmetric_header = URL_SAFE_NO_PAD.encode(br#"{"alg":"HS256","kid":"siwc-fixture"}"#);
+        assert!(verify(&format!("{}.{}.{}", symmetric_header, parts[1], parts[2])).is_err());
+    }
+
+    #[test]
+    fn siwc_callback_and_grant_guards_reject_registration_substitution() {
+        assert!(issued_callback_client_id(CHATGPT_OAUTH_CLIENT_ID, None).is_err());
+        assert!(
+            issued_callback_client_id(CHATGPT_OAUTH_CLIENT_ID, Some(CHATGPT_OAUTH_CLIENT_ID))
+                .is_err()
+        );
+        assert_eq!(
+            issued_callback_client_id(CHATGPT_OAUTH_CLIENT_ID, Some("oaiapp_first")).unwrap(),
+            "oaiapp_first"
+        );
+        assert_eq!(
+            issued_callback_client_id("oaiapp_first", None).unwrap(),
+            "oaiapp_first"
+        );
+        assert!(issued_callback_client_id("oaiapp_first", Some("oaiapp_other")).is_err());
+        assert!(require_chatgpt_scopes(Some("openid resource.invoke")).is_err());
+        assert!(require_chatgpt_scopes(Some("chatgpt.tokens.use.direct")).is_err());
+        assert!(require_chatgpt_scopes(Some(CHATGPT_OAUTH_SCOPE)).is_ok());
+        assert!(parse_callback_query(&CHATGPT_OAUTH_PARAMS, "code=x&state=a&state=b").is_err());
+        assert!(
+            parse_callback_query(&CHATGPT_OAUTH_PARAMS, "code=x&state=a&error=denied").is_err()
+        );
+        let error = parse_callback_query(&CHATGPT_OAUTH_PARAMS, "error=access_denied").unwrap();
+        assert!(accept_callback("pending", error).is_err());
+        let success = parse_callback_query(
+            &CHATGPT_OAUTH_PARAMS,
+            "code=secret-code&state=a&client_id=oaiapp_first",
+        )
+        .unwrap();
+        assert!(!format!("{success:?}").contains("secret-code"));
+    }
+
+    #[test]
+    fn siwc_signed_access_requires_resource_account_registration_and_plan_scope() {
+        let signer = SiwcSigningFixture::new();
+        let registration = verify_chatgpt_id_token(
+            &signer.token(signer.id_claims()),
+            &signer.keys,
+            CHATGPT_OAUTH_ISSUER,
+            "oaiapp_codewhale_test",
+            Some("pending-nonce"),
+            None,
+            "host",
+        )
+        .unwrap();
+        assert!(
+            verify_chatgpt_access_token(&signer.access("test-sub"), &signer.keys, &registration)
+                .is_ok()
+        );
+        assert!(
+            verify_chatgpt_access_token(
+                &signer.access("another-subject"),
+                &signer.keys,
+                &registration
+            )
+            .is_err()
+        );
+        for (field, wrong) in [
+            ("aud", CHATGPT_OAUTH_ISSUER),
+            ("client_id", "oaiapp_other"),
+            ("scope", "openid resource.invoke"),
+        ] {
+            let mut claims = serde_json::json!({"iss": CHATGPT_OAUTH_ISSUER, "aud": CHATGPT_OAUTH_RESOURCE, "sub": "test-sub", "client_id": "oaiapp_codewhale_test", "scope": CHATGPT_OAUTH_SCOPE, "exp": now_unix_secs().unwrap() + 3600});
+            claims[field] = Value::from(wrong);
+            let token = signer.token(claims);
+            assert!(
+                verify_chatgpt_access_token(&token, &signer.keys, &registration).is_err(),
+                "accepted invalid {field}"
+            );
+        }
+    }
+
+    struct SiwcRefreshClient {
+        keys: JwkSet,
+        access: String,
+        posts: Mutex<Vec<MockPost>>,
+    }
+    impl OAuthFormClient for SiwcRefreshClient {
+        fn post_form(&self, url: &str, form: &[(&str, &str)]) -> Result<(u16, String)> {
+            self.posts.lock().unwrap().push((
+                url.to_string(),
+                form.iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+            ));
+            Ok((200, serde_json::json!({"access_token": self.access, "refresh_token": "rotated-refresh", "expires_in": 3600, "scope": CHATGPT_OAUTH_SCOPE, "token_type": "Bearer"}).to_string()))
+        }
+        fn chatgpt_jwks(&self, _: &str) -> Result<JwkSet> {
+            Ok(self.keys.clone())
+        }
+    }
+
+    #[test]
+    fn siwc_refresh_rotates_atomically_and_rejects_a_different_account() {
+        let _lock = crate::test_support::lock_test_env();
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().canonicalize().unwrap();
+        let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", &root);
+        let signer = SiwcSigningFixture::new();
+        let mut config = Config::default();
+        install_test_chatgpt_registration(&mut config).unwrap();
+        let path = configured_owned_auth_file_path(OAuthProvider::Chatgpt, &config)
+            .unwrap()
+            .unwrap();
+        let name = path.file_name().unwrap().to_str().unwrap();
+        codewhale_config::with_xai_oauth_lifecycle_lock(|store| {
+            let mut file = load_owned_auth_file_from_store(store, name)?.unwrap();
+            for entry in file.values_mut() {
+                entry.expires_at = Some("2000-01-01T00:00:00Z".to_string());
+            }
+            write_auth_file_to_store(store, name, &file, true)
+        })
+        .unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let wrong = SiwcRefreshClient {
+            keys: signer.keys.clone(),
+            access: signer.access("another-account"),
+            posts: Mutex::new(Vec::new()),
+        };
+        assert!(get_owned_credentials_with(OAuthProvider::Chatgpt, &config, &wrong).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        let right = SiwcRefreshClient {
+            keys: signer.keys.clone(),
+            access: signer.access("test-sub"),
+            posts: Mutex::new(Vec::new()),
+        };
+        let refreshed =
+            get_owned_credentials_with(OAuthProvider::Chatgpt, &config, &right).unwrap();
+        assert_eq!(refreshed.refresh_token.as_deref(), Some("rotated-refresh"));
+        assert_eq!(
+            official_chatgpt_registration(&config).unwrap().subject,
+            "test-sub"
+        );
+        assert!(get_owned_credentials_read_only(OAuthProvider::Chatgpt, &config).is_ok());
+        let posts = right.posts.lock().unwrap();
+        assert_eq!(
+            posts[0].0,
+            "https://auth.openai.com/api/accounts/oauth/token"
+        );
+        assert!(
+            posts[0]
+                .1
+                .contains(&("client_id".to_string(), "oaiapp_codewhale_test".to_string()))
+        );
+        assert!(
+            posts[0]
+                .1
+                .contains(&("resource".to_string(), CHATGPT_OAUTH_RESOURCE.to_string()))
+        );
+        assert!(
+            posts[0]
+                .1
+                .contains(&("refresh_token".to_string(), "siwc-test-refresh".to_string()))
+        );
+    }
+
+    #[test]
+    fn siwc_replacing_account_drops_previous_registration_and_token() {
+        let _lock = crate::test_support::lock_test_env();
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().canonicalize().unwrap();
+        let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", &root);
+        let config_path = root.join("config.toml");
+        std::fs::write(&config_path, "").unwrap();
+        let mut config = Config::default();
+        let first = pending_login_for_test(OAuthProvider::Chatgpt, "first-access", "first-refresh");
+        activate_login(first, Some(&config_path), Some(&mut config)).unwrap();
+        let mut next =
+            pending_login_for_test(OAuthProvider::Chatgpt, "next-access", "next-refresh");
+        next.client_id = "oaiapp_next".to_string();
+        let registration = next.token.verified_chatgpt.as_mut().unwrap();
+        registration.client_id = "oaiapp_next".to_string();
+        registration.subject = "next-sub".to_string();
+        let activated = activate_login(next, Some(&config_path), Some(&mut config)).unwrap();
+        let registration = official_chatgpt_registration(&config).unwrap();
+        assert_eq!(registration.subject, "next-sub");
+        assert_eq!(registration.client_id, "oaiapp_next");
+        let raw = std::fs::read_to_string(activated.auth_path).unwrap();
+        assert!(!raw.contains("first-access"));
+        assert!(!raw.contains("first-refresh"));
+        let mut file: AuthFile = serde_json::from_str(&raw).unwrap();
+        assert_eq!(file.len(), 1);
+        let (_, mut entry) = select_entry(OAuthProvider::Chatgpt, &mut file).unwrap();
+        entry.access_token = Some("unverified-replacement".to_string());
+        assert!(registration_from_entry(&entry).is_err());
     }
 }
