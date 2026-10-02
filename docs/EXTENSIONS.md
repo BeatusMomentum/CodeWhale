@@ -122,17 +122,36 @@ require another review. See [bundle rules](PLUGIN_BUNDLES.md).
 Export a Cordis plugin function or an object with `apply`. The host supplies
 one shared Cordis and the supported DSH compatibility services. The example's
 `inject = ['tools', 'commands']` asks for the tool and command registries. The
-supplied service names are `tools`, `commands`, `logger`, `events`, `reflect`
-and `registry`. A tool can ask the core to run a core tool through
+supplied service names are `tools`, `commands`, `prompt`, `storage`, `logger`,
+`events`, `reflect` and `registry`. A tool can ask the core to run a core tool through
 `exec.core` (see [Asking the core to run a tool](#asking-the-core-to-run-a-tool));
-a storage service (a plugin has its own `dataDir` to write to), hooks, skills
-and prompt providers are not host services yet. Programmable pre-execute
+skills and MCP are not host services yet. Programmable pre-execute
 listeners use `ctx.on` as described below. A required
 service that is unavailable fails activation with a diagnostic.
 
 Package runtime dependencies and local imports within the reviewed bundle.
 Do not install packages or fetch code during activation. Register cleanup
 through `ctx.effect`; asynchronous disposers are awaited with a deadline.
+
+`ctx.prompt.registerSection({ id, text })` contributes an attributed plain-text
+section and returns its disposer. Rust delivers the complete current snapshot
+as a user-role runtime message; changes replace earlier snapshots and an empty
+snapshot explicitly withdraws earlier sections. Rust admits
+sections only for the caller's live reviewed owners, sorts them by owner/id,
+and withdraws them on unregister, disable, revoke or host exit. Each section
+is limited to 4 KiB UTF-8 text, each owner to 32 KiB and 128 sections, and the
+host to 128 KiB and 1,024 sections. The final attributed prompt has the same
+128 KiB limit. IDs use lower-case letters, digits, `_` and `-`, start with a
+letter, and contain at most 64 characters. Duplicate owner-local IDs require
+disposing the earlier section first. The author cannot replace the core
+system prompt or select another session's sections.
+
+`ctx.storage.get(key)`, `set(key, json)` and `delete(key)` persist owner-local
+JSON under the `dataDir` Rust assigned. The API refuses access once owner
+disposal begins, symlinked storage, corrupt data and writes that exceed its
+bounded key/value/owner limits. It does not expose session history or secrets.
+Tool and command invocations also expose frozen `sessionId`, `agentId` and
+`originTurnId` strings when Rust supplies them for that particular call.
 
 ## Tool rules
 

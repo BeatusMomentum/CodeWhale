@@ -201,6 +201,17 @@ pub struct HookRegistration {
     pub event: String,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct PromptSectionRegistration {
+    pub handle: u64,
+    pub owner: OwnerRef,
+    pub tier: HostTier,
+    pub plugin_name: String,
+    pub content_hash: String,
+    pub id: String,
+    pub text: String,
+}
+
 #[derive(Debug, Default)]
 pub struct OwnerRegistry {
     next_handle: u64,
@@ -214,6 +225,7 @@ pub struct OwnerRegistry {
     /// tool is called by the model, a command by the user.
     commands_by_name: HashMap<String, u64>,
     hooks: BTreeMap<u64, HookRegistration>,
+    prompt_sections: BTreeMap<u64, PromptSectionRegistration>,
     /// Lower-cased names of every native tool any engine's turn build has
     /// reported, plus the static set. Only ever grows: engines in one
     /// process build different native surfaces, and a name that is native
@@ -421,7 +433,75 @@ impl OwnerRegistry {
             RegisterKind::Tool => self.register_tool(params),
             RegisterKind::Command => self.register_command(params),
             RegisterKind::Hook => self.register_hook(params),
+            RegisterKind::PromptSection => self.register_prompt_section(params),
         }
+    }
+
+    pub(crate) fn register_prompt_section(
+        &mut self,
+        params: &RegisterParams,
+    ) -> Result<u64, String> {
+        use super::prompt::{
+            MAX_PROMPT_HOST_BYTES, MAX_PROMPT_OWNER_BYTES, MAX_PROMPT_SECTION_BYTES,
+            MAX_PROMPT_SECTIONS_PER_HOST, MAX_PROMPT_SECTIONS_PER_OWNER,
+        };
+        params.check_spec()?;
+        let id = &params.spec.name;
+        let text = &params.spec.description;
+        if !valid_command_name(id)
+            || id.len() > 64
+            || text.trim().is_empty()
+            || text.len() > MAX_PROMPT_SECTION_BYTES
+            || text
+                .chars()
+                .any(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t'))
+        {
+            return Err("prompt section needs a valid short id and bounded non-empty text without control characters".to_string());
+        }
+        let entry = self
+            .current(&params.owner)
+            .ok_or_else(|| "stale or unknown owner".to_string())?;
+        let owned: Vec<_> = self
+            .prompt_sections
+            .values()
+            .filter(|section| section.owner == params.owner)
+            .collect();
+        if owned.iter().any(|section| &section.id == id) {
+            return Err(
+                "prompt section id is already registered; dispose it before registering it again"
+                    .to_string(),
+            );
+        }
+        if owned.len() >= MAX_PROMPT_SECTIONS_PER_OWNER
+            || self.prompt_sections.len() >= MAX_PROMPT_SECTIONS_PER_HOST
+            || owned
+                .iter()
+                .map(|section| section.text.len())
+                .sum::<usize>()
+                + text.len()
+                > MAX_PROMPT_OWNER_BYTES
+            || self
+                .prompt_sections
+                .values()
+                .map(|section| section.text.len())
+                .sum::<usize>()
+                + text.len()
+                > MAX_PROMPT_HOST_BYTES
+        {
+            return Err("prompt section owner or host byte/registration limit reached".to_string());
+        }
+        let section = PromptSectionRegistration {
+            handle: self.next_handle + 1,
+            owner: params.owner.clone(),
+            tier: entry.tier,
+            plugin_name: entry.plugin_name.clone(),
+            content_hash: entry.content_hash.clone(),
+            id: id.clone(),
+            text: text.clone(),
+        };
+        self.next_handle += 1;
+        self.prompt_sections.insert(section.handle, section);
+        Ok(self.next_handle)
     }
 
     fn register_hook(&mut self, params: &RegisterParams) -> Result<u64, String> {
@@ -689,6 +769,14 @@ impl OwnerRegistry {
     /// Undo exactly one registration. Idempotent; a stale or foreign handle is a no-op.
     pub fn unregister(&mut self, owner: &OwnerRef, handle: u64) {
         if self
+            .prompt_sections
+            .get(&handle)
+            .is_some_and(|section| section.owner == *owner)
+        {
+            self.prompt_sections.remove(&handle);
+            return;
+        }
+        if self
             .hooks
             .get(&handle)
             .is_some_and(|hook| hook.owner == *owner)
@@ -743,6 +831,8 @@ impl OwnerRegistry {
     }
 
     fn remove_registrations_of(&mut self, plugin_id: &str) -> Vec<u64> {
+        self.prompt_sections
+            .retain(|_, section| section.owner.plugin_id != plugin_id);
         self.hooks
             .retain(|_, hook| hook.owner.plugin_id != plugin_id);
         self.remove_commands_of(plugin_id);
@@ -788,6 +878,8 @@ impl OwnerRegistry {
     /// Drop every registration owned by `tier`'s host: the host that held
     /// them is gone, and the other tier's host is not.
     fn clear_tier_registrations(&mut self, tier: HostTier) {
+        self.prompt_sections
+            .retain(|_, section| section.tier != tier);
         self.hooks.retain(|_, hook| hook.tier != tier);
         self.tools.retain(|_, tool| tool.tier != tier);
         let tools = &self.tools;
@@ -857,6 +949,27 @@ impl OwnerRegistry {
             .filter(|hook| self.is_live_hook(hook.handle, &hook.owner))
             .cloned()
             .collect()
+    }
+
+    pub fn live_prompt_sections(&self) -> Vec<PromptSectionRegistration> {
+        let mut sections: Vec<_> = self
+            .prompt_sections
+            .values()
+            .filter(|section| self.is_live_prompt_section(section.handle, &section.owner))
+            .cloned()
+            .collect();
+        sections.sort_by(|a, b| (&a.owner.plugin_id, &a.id).cmp(&(&b.owner.plugin_id, &b.id)));
+        sections
+    }
+
+    pub fn is_live_prompt_section(&self, handle: u64, owner: &OwnerRef) -> bool {
+        self.prompt_sections
+            .get(&handle)
+            .is_some_and(|section| section.owner == *owner)
+            && self
+                .owners
+                .get(&owner.plugin_id)
+                .is_some_and(|entry| entry.owner == *owner && entry.state == OwnerState::Active)
     }
 
     pub fn is_live_hook(&self, handle: u64, owner: &OwnerRef) -> bool {

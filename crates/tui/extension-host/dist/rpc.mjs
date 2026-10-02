@@ -48,7 +48,7 @@ var SHAPES = {
   CommandRunParams: {
     strict: false,
     required: { handle: "uint", command_id: "string", raw_input: "string", deadline_ms: "uint" },
-    optional: { workspace: "string" }
+    optional: { workspace: "string", session_id: "string", agent_id: "string", origin_turn_id: "string" }
   },
   CoreCallParams: {
     strict: true,
@@ -127,7 +127,7 @@ var SHAPES = {
   },
   RegisterParams: {
     strict: true,
-    required: { owner: { ref: "OwnerRef" }, kind: { enum: ["tool", "command", "hook"] }, spec: { ref: "RegisterSpecWire" } },
+    required: { owner: { ref: "OwnerRef" }, kind: { enum: ["tool", "command", "hook", "prompt_section"] }, spec: { ref: "RegisterSpecWire" } },
     optional: {}
   },
   RegisterSpecWire: {
@@ -143,7 +143,7 @@ var SHAPES = {
   ToolCallParams: {
     strict: false,
     required: { handle: "uint", call_id: "string", input: "json", deadline_ms: "uint" },
-    optional: { workspace: "string", ticket: "string" }
+    optional: { workspace: "string", ticket: "string", session_id: "string", agent_id: "string", origin_turn_id: "string" }
   },
   UnregisterParams: {
     strict: true,
@@ -237,7 +237,7 @@ function validateMessage(value, direction, tier, methods = METHODS) {
     }
     if (method === "registry/register") {
       const { kind, spec: spec2 } = params;
-      const reason = kind === "tool" && spec2.input_schema == null ? "a tool registration needs `spec.input_schema`" : kind === "tool" && spec2.argument_hint != null ? "a tool registration has no `spec.argument_hint`" : kind === "command" && spec2.input_schema != null ? "a command registration has no `spec.input_schema`" : kind === "hook" && (spec2.input_schema != null || spec2.argument_hint != null) ? "a hook registration has no input schema or argument hint" : void 0;
+      const reason = kind === "tool" && spec2.input_schema == null ? "a tool registration needs `spec.input_schema`" : kind === "tool" && spec2.argument_hint != null ? "a tool registration has no `spec.argument_hint`" : kind === "command" && spec2.input_schema != null ? "a command registration has no `spec.input_schema`" : (kind === "hook" || kind === "prompt_section") && (spec2.input_schema != null || spec2.argument_hint != null) ? "a hook or prompt registration has no input schema or argument hint" : void 0;
       if (reason !== void 0) throw new ProtocolError(`${method}: ${reason}`);
     }
     return value;

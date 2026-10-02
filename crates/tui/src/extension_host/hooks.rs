@@ -37,6 +37,17 @@ impl HostAttachment {
             let started = Instant::now();
             let answer = async {
                 let host = shared.live_host_for_hook(&hook).await?;
+                let still_desired = shared
+                    .attachments
+                    .lock()
+                    .expect("attachments lock")
+                    .get(&self.id)
+                    .is_some_and(|state| {
+                        state.desired.get(&hook.owner.plugin_id) == Some(&hook.content_hash)
+                    });
+                if !still_desired {
+                    return Err("extension hook was withdrawn".to_string());
+                }
                 let remaining_ms = HOOK_DEADLINE
                     .saturating_sub(batch_started.elapsed())
                     .as_millis() as u64;
@@ -117,7 +128,18 @@ mod tests {
         };
         let _policy = crate::plugins::activation::TestPolicyGuard::extension_host(true);
         let fixture = FixturePlugins::new(&["hook-policy"]).await;
-        let manager = fixture.manager(node);
+        let manager = Arc::new(super::super::ExtensionHostManager::new(
+            super::super::ExtensionHostOptions {
+                runtime: crate::config::ExtensionHostRuntime::Node,
+                node_override: Some(node),
+                root: Some(fixture.root.clone()),
+                supervision: super::super::SupervisionOptions {
+                    heartbeat_interval: Duration::from_secs(60),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        ));
         let source = Arc::new(manager.attach(fixture.registry()));
         source.sync().await.unwrap();
         let timeout = run_tool_call_before_hooks(

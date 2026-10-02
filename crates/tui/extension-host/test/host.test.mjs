@@ -977,6 +977,59 @@ test('several core calls can be in flight at once, each answered to its own requ
   assert.equal(new Set(host.coreCalls.map((c) => c.id)).size, 4)
 })
 
+test('storage survives owner reload, refuses disposed owner access, and call identity is per invocation', async (t) => {
+  const host = await startHost()
+  t.after(() => host.stop())
+  const plugin = tempPlugin(`
+export const inject = ['tools', 'commands', 'storage']
+let savedStorage
+export async function apply(ctx, config) {
+  if (config.capture) savedStorage = ctx.storage
+  const identity = (exec) => ({
+    frozen: Object.isFrozen(exec),
+    sessionId: exec.sessionId ?? null,
+    agentId: exec.agentId ?? null,
+    originTurnId: exec.originTurnId ?? null,
+  })
+  ctx.tools.register({ name: config.tool, description: 'Read owner-local state.', parameters: { type: 'object' },
+    async execute(input, exec) {
+      if (input.saved) { try { await savedStorage.get('state'); return { accessed: true } } catch (error) { return { error: error.code } } }
+      if ('set' in input) await ctx.storage.set('state', input.set)
+      return { value: (await ctx.storage.get('state')) ?? null, ...identity(exec) }
+    },
+  })
+  ctx.commands.register({ name: config.command, description: 'Inspect invocation identity.',
+    handler: (exec) => JSON.stringify(identity(exec)),
+  })
+}
+`)
+  t.after(plugin.cleanup)
+  const firstDir = join(plugin.dir, 'first-state')
+  const otherDir = join(plugin.dir, 'other-state')
+  mkdirSync(firstDir)
+  mkdirSync(otherDir)
+  const firstConfig = { tool: 'first_state', command: 'first-state', capture: true }
+  const first = await activate(host, 'first-state-owner', plugin.entry, { config: firstConfig, data_dir: firstDir })
+  assert.equal(first.result.status, 'ok')
+  const handle = (name) => host.registry.findLast((entry) => entry.op === 'register' && entry.spec.name === name).handle
+  const tool = (name, input = {}, extra = {}) => host.call('tool/call', { handle: handle(name), call_id: 'state-call', input, deadline_ms: 5000, ...extra })
+  const identity = { session_id: 'session-one', agent_id: 'agent-one', origin_turn_id: 'turn-one' }
+  assert.deepEqual((await tool('first_state', { set: { count: 1 } }, identity)).structured,
+    { value: { count: 1 }, frozen: true, sessionId: 'session-one', agentId: 'agent-one', originTurnId: 'turn-one' })
+  assert.deepEqual((await tool('first_state')).structured,
+    { value: { count: 1 }, frozen: true, sessionId: null, agentId: null, originTurnId: null })
+  const command = await host.call('command/run', { handle: handle('first-state'), command_id: 'state-command', raw_input: '', deadline_ms: 5000, ...identity })
+  assert.deepEqual(JSON.parse(command.text), { frozen: true, sessionId: 'session-one', agentId: 'agent-one', originTurnId: 'turn-one' })
+  await host.call('ext/deactivate', { owner: first.ref })
+  const other = await activate(host, 'other-state-owner', plugin.entry, { config: { tool: 'other_state', command: 'other-state' }, data_dir: otherDir })
+  assert.equal(other.result.status, 'ok')
+  assert.deepEqual((await tool('other_state', { saved: true })).structured, { error: 'not_available' })
+  assert.equal((await tool('other_state')).structured.value, null, 'another owner directory has separate state')
+  const reloaded = await activate(host, 'reloaded-state-owner', plugin.entry, { config: { ...firstConfig, capture: false }, data_dir: firstDir })
+  assert.equal(reloaded.result.status, 'ok')
+  assert.deepEqual((await tool('first_state')).structured.value, { count: 1 }, 'the assigned owner directory preserves state on reload')
+})
+
 test('programmable pre-execute listeners propose deny, ask, rewrite and context without core authority', async (t) => {
   const host = await startHost()
   t.after(() => host.stop())

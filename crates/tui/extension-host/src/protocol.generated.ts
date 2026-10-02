@@ -80,7 +80,7 @@ export const SHAPES: { readonly [name: string]: Shape } = {
   CommandRunParams: {
     strict: false,
     required: { handle: 'uint', command_id: 'string', raw_input: 'string', deadline_ms: 'uint' },
-    optional: { workspace: 'string' },
+    optional: { workspace: 'string', session_id: 'string', agent_id: 'string', origin_turn_id: 'string' },
   },
   CoreCallParams: {
     strict: true,
@@ -159,7 +159,7 @@ export const SHAPES: { readonly [name: string]: Shape } = {
   },
   RegisterParams: {
     strict: true,
-    required: { owner: { ref: 'OwnerRef' }, kind: { enum: ['tool', 'command', 'hook'] }, spec: { ref: 'RegisterSpecWire' } },
+    required: { owner: { ref: 'OwnerRef' }, kind: { enum: ['tool', 'command', 'hook', 'prompt_section'] }, spec: { ref: 'RegisterSpecWire' } },
     optional: {},
   },
   RegisterSpecWire: {
@@ -175,7 +175,7 @@ export const SHAPES: { readonly [name: string]: Shape } = {
   ToolCallParams: {
     strict: false,
     required: { handle: 'uint', call_id: 'string', input: 'json', deadline_ms: 'uint' },
-    optional: { workspace: 'string', ticket: 'string' },
+    optional: { workspace: 'string', ticket: 'string', session_id: 'string', agent_id: 'string', origin_turn_id: 'string' },
   },
   UnregisterParams: {
     strict: true,
@@ -208,6 +208,9 @@ export interface CommandRunParams {
   raw_input: string
   deadline_ms: number
   workspace?: string
+  session_id?: string
+  agent_id?: string
+  origin_turn_id?: string
 }
 
 export type ContentBlockWire = { type: 'text'; text: string }
@@ -309,7 +312,7 @@ export interface ProtocolRange {
   max: number
 }
 
-export type RegisterKind = 'tool' | 'command' | 'hook'
+export type RegisterKind = 'tool' | 'command' | 'hook' | 'prompt_section'
 
 export interface RegisterParams {
   owner: OwnerRef
@@ -339,6 +342,9 @@ export interface ToolCallParams {
   deadline_ms: number
   workspace?: string
   ticket?: string
+  session_id?: string
+  agent_id?: string
+  origin_turn_id?: string
 }
 
 export interface ToolResultWire {

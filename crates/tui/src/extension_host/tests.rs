@@ -1161,7 +1161,7 @@ async fn plugin_context_reaches_the_plugin_and_changed_settings_reactivate_it() 
         .expect("the plugin's command is live")
         .reference();
     let super::command::CommandOutcome::Show { text } =
-        super::command::run(&manager.shared, &command, "")
+        super::command::run(&manager.shared, &command, "", None)
             .await
             .unwrap()
     else {
@@ -2379,6 +2379,9 @@ async fn ordinary_exit_rejects_requests_from_a_drained_calls_waker() {
                 deadline_ms: 60_000,
                 workspace: None,
                 ticket: None,
+                session_id: None,
+                agent_id: None,
+                origin_turn_id: None,
             }),
             Some(registration.owner.plugin_id),
         )
@@ -2436,6 +2439,9 @@ async fn idle_retirement_seals_admission_and_does_not_wait_for_heartbeat() {
                 deadline_ms: 5000,
                 workspace: None,
                 ticket: None,
+                session_id: None,
+                agent_id: None,
+                origin_turn_id: None,
             }),
             Some(registration.owner.plugin_id),
         )
@@ -2529,6 +2535,9 @@ async fn two_dirty_teardowns_wait_for_a_live_call_then_replay_without_spending_c
                 deadline_ms: 10000,
                 workspace: None,
                 ticket: None,
+                session_id: None,
+                agent_id: None,
+                origin_turn_id: None,
             }),
             Some(registration.owner.plugin_id.clone()),
         )
@@ -3946,6 +3955,9 @@ fn command_run_and_its_answers_have_the_documented_shapes() {
         raw_input: "args".to_string(),
         deadline_ms: 30_000,
         workspace: None,
+        session_id: None,
+        agent_id: None,
+        origin_turn_id: None,
     });
     assert_eq!(request.method(), "command/run");
     assert_eq!(request.deadline(), Duration::from_secs(30));
@@ -4042,7 +4054,7 @@ export function apply(ctx) {{
                 .into_iter()
                 .find(|entry| entry.registration.name == name)
                 .unwrap_or_else(|| panic!("{name} is not live"));
-            command::run(&manager.shared, &entry.reference(), "").await
+            command::run(&manager.shared, &entry.reference(), "", None).await
         }
     };
     match run("big-text").await.unwrap() {
@@ -4182,7 +4194,7 @@ async fn a_command_from_a_dead_host_reports_host_down() {
     ] {
         *manager.shared.plugin.host.lock().unwrap() = slot;
         let started = Instant::now();
-        let error = super::command::run(&manager.shared, &reference, "")
+        let error = super::command::run(&manager.shared, &reference, "", None)
             .await
             .unwrap_err();
         assert!(
@@ -4193,7 +4205,7 @@ async fn a_command_from_a_dead_host_reports_host_down() {
     }
     drop(policy);
     let _off = TestPolicyGuard::extension_host(false);
-    let error = super::command::run(&manager.shared, &reference, "")
+    let error = super::command::run(&manager.shared, &reference, "", None)
         .await
         .unwrap_err();
     assert_eq!(
@@ -4238,7 +4250,7 @@ async fn a_slow_command_is_cancelled_and_a_killed_host_fails_it_as_down() {
     let started = Instant::now();
     let error = tokio::time::timeout(
         Duration::from_secs(5),
-        super::command::run(&manager.shared, &slow, "30000"),
+        super::command::run(&manager.shared, &slow, "30000", None),
     )
     .await
     .expect("the deadline bounds the command")
@@ -4248,7 +4260,7 @@ async fn a_slow_command_is_cancelled_and_a_killed_host_fails_it_as_down() {
     // The same host takes the next command.
     let echo = reference("ext-echo");
     assert_eq!(
-        super::command::run(&manager.shared, &echo, "again").await,
+        super::command::run(&manager.shared, &echo, "again", None).await,
         Ok(super::command::CommandOutcome::Show {
             text: "echo: again".to_string()
         })
@@ -4260,7 +4272,9 @@ async fn a_slow_command_is_cancelled_and_a_killed_host_fails_it_as_down() {
     // The kill lands well inside the 300 ms deadline.
     let running = {
         let slow = slow.clone();
-        tokio::spawn(async move { super::command::run(&manager2.shared, &slow, "30000").await })
+        tokio::spawn(
+            async move { super::command::run(&manager2.shared, &slow, "30000", None).await },
+        )
     };
     tokio::time::sleep(Duration::from_millis(100)).await;
     #[cfg(unix)]
@@ -4289,14 +4303,14 @@ async fn a_slow_command_is_cancelled_and_a_killed_host_fails_it_as_down() {
         manager.spawn_attempts() == 2 && manager.live_command_names().contains(&"ext-echo".into())
     })
     .await;
-    let error = super::command::run(&manager.shared, &echo, "old")
+    let error = super::command::run(&manager.shared, &echo, "old", None)
         .await
         .unwrap_err();
     assert!(error.contains("no longer registered"), "{error}");
     let fresh = reference("ext-echo");
     assert_ne!(fresh.generation, echo.generation);
     assert_eq!(
-        super::command::run(&manager.shared, &fresh, "new").await,
+        super::command::run(&manager.shared, &fresh, "new", None).await,
         Ok(super::command::CommandOutcome::Show {
             text: "echo: new".to_string()
         })

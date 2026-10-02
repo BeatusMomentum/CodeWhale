@@ -47,8 +47,8 @@
 //!
 //! Known limitations (by design — see the design doc §8 and its "As built"
 //! sections):
-//! * Tools, slash commands and programmable pre-execute admission hooks.
-//!   Skills, prompt sections and MCP are not host services yet.
+//! * Tools, slash commands, programmable pre-execute admission hooks, additive
+//!   prompt sections and owner-local storage. Skills and MCP are not host services yet.
 //!   The one thing the host may ask the core to do is a `core/call` from a tool
 //!   under the turn's gate; commands, timers and activation code ask for
 //!   nothing.
@@ -122,6 +122,7 @@ pub(crate) mod command;
 pub(crate) mod core_call;
 mod hooks;
 pub(crate) mod plugin_config;
+pub(crate) mod prompt;
 pub(crate) mod protocol;
 pub(crate) mod registry;
 pub(crate) mod supervisor;
@@ -908,6 +909,7 @@ impl HostEvents for Events {
                     RegisterKind::Tool => "tool",
                     RegisterKind::Command => "command",
                     RegisterKind::Hook => "hook",
+                    RegisterKind::PromptSection => "prompt section",
                 };
                 let message = format!(
                     "extension `{}` {kind} `{}` refused: {reason}",
@@ -2514,8 +2516,9 @@ pub(crate) fn live_commands_for(workspace: &Path) -> Vec<command::ExtensionComma
 pub async fn run_command(
     command: &command::ExtensionCommandRef,
     raw_input: &str,
+    session_id: Option<&str>,
 ) -> Result<command::CommandOutcome, String> {
-    command::run(&manager().shared, command, raw_input).await
+    command::run(&manager().shared, command, raw_input, session_id).await
 }
 
 /// The `/plugin` section. With the experimental host off it is one line

@@ -25,6 +25,8 @@ use tempfile::tempdir;
 
 #[path = "tests/extension_hooks.rs"]
 mod extension_hooks;
+#[path = "tests/extension_prompts.rs"]
+mod extension_prompts;
 
 const WORKING_SET_SUMMARY_MARKER: &str = "## Repo Working Set";
 

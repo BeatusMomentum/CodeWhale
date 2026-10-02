@@ -115,6 +115,14 @@ async fn typescript_mod_rewrites_denies_and_regates_native_tools_on_the_real_eng
     assert!(outcomes.remove("action").unwrap().is_err());
     assert_eq!(approvals, 1, "only the revised write needs an approval");
     assert!(!fixture.workspace().join("rewritten.txt").exists());
+    let first_request = mock.captured_requests().into_iter().next().unwrap();
+    let first_prompt = first_request
+        .messages
+        .iter()
+        .find_map(crate::runtime_handoff::extension_prompt_contributions_display)
+        .expect("the authored prompt contribution is delivered as a complete runtime snapshot");
+    assert!(first_prompt.contains("Use the repository style guide when preparing release notes."));
+    assert!(first_prompt.contains("repo-style"));
     drop(rx);
     let disabled = fixture.disable("hook-policy");
     crate::extension_host::plugins_changed(disabled);
@@ -152,6 +160,18 @@ async fn typescript_mod_rewrites_denies_and_regates_native_tools_on_the_real_eng
         }
     }
     assert!(original, "disabled listener must not rewrite the next turn");
+    let after_disable = mock.last_request().unwrap();
+    let latest_context = after_disable
+        .messages
+        .iter()
+        .rev()
+        .find_map(crate::runtime_handoff::extension_prompt_contributions_display)
+        .expect("disabling the authored section records a withdrawn runtime snapshot");
+    assert!(latest_context.contains("All earlier extension prompt contributions are withdrawn"));
+    assert!(
+        !latest_context.contains("Use the repository style guide when preparing release notes.")
+    );
+    assert!(!latest_context.contains("repo-style"));
     drop(rx);
     handle.send(Op::Shutdown).await.unwrap();
     task.await.unwrap();

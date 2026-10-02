@@ -1,6 +1,8 @@
 export const name = 'hook-policy'
+export const inject = ['prompt']
 
 export function apply(ctx) {
+  ctx.prompt.registerSection({ id: 'repo-style', text: 'Use the repository style guide when preparing release notes.' })
   ctx.on('tools/pre-execute', async (exec, next) => {
     if (!Object.isFrozen(exec) || !Object.isFrozen(exec.arguments) || exec.core !== undefined) {
       throw new Error('hook execution view is not frozen or has core authority')

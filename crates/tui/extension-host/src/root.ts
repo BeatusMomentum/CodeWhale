@@ -20,6 +20,7 @@ import {
   type DeactivateResult,
   type HookEvaluateParams,
   type HookVerdictWire,
+  type Json,
   type OwnerRef,
   type ToolResultWire,
 } from './protocol.ts'
@@ -29,6 +30,8 @@ import { isJson } from './json.ts'
 import { makeCoreApi } from './shims/core.ts'
 import { OwnedRegistrations } from './shims/owned.ts'
 import { hookExecution, hookVerdict, type LocalHook } from './shims/hooks.ts'
+import { PromptSections, definePromptService, type LocalPromptSection } from './shims/prompt.ts'
+import { createStorage, type PluginStorage } from './shims/storage.ts'
 import { ownerTier, type HostTier } from './tier.ts'
 import {
   commandSpec,
@@ -60,12 +63,14 @@ export const REFUSED_SERVICES = new Set([
   'systemPrompt',
   'tools',
   'commands',
+  'prompt',
+  'storage',
   'skills',
   'logger',
 ])
 
 /** Services the root provides; `inject` of anything else fails activation. */
-const PROVIDED_SERVICES = new Set(['tools', 'commands', 'logger', 'events', 'reflect', 'registry'])
+const PROVIDED_SERVICES = new Set(['tools', 'commands', 'prompt', 'storage', 'logger', 'events', 'reflect', 'registry'])
 
 const ACTIVATE_DEADLINE_MS = 5_000
 const DISPOSE_DEADLINE_MS = 2_000
@@ -80,6 +85,8 @@ export interface OwnerRecord {
   tools: Map<number, LocalTool>
   commands: Map<number, LocalCommand<OwnerRecord>>
   hooks: Map<number, LocalHook<OwnerRecord>>
+  promptSections: Map<number, LocalPromptSection<OwnerRecord>>
+  storage?: PluginStorage
   warnedAllow?: boolean
   /** Entry modules activated under this owner so far (a plugin may declare several). */
   entries: Set<string>
@@ -119,6 +126,7 @@ export class HostRoot {
   private readonly toolRegistrations: OwnedRegistrations<OwnerRecord, LocalTool>
   private readonly commandRegistrations: OwnedRegistrations<OwnerRecord, LocalCommand<OwnerRecord>>
   private readonly hookRegistrations: OwnedRegistrations<OwnerRecord, LocalHook<OwnerRecord>>
+  private readonly promptSections: PromptSections<OwnerRecord>
 
   constructor(
     private readonly rpc: RpcPeer,
@@ -141,6 +149,8 @@ export class HostRoot {
       (message, owner) => this.log('warn', message, owner),
     )
     this.hookRegistrations = new OwnedRegistrations(rpc, 'hook', (owner) => owner.hooks,
+      (message, owner) => this.log('warn', message, owner))
+    this.promptSections = new PromptSections(rpc, (owner) => owner.promptSections,
       (message, owner) => this.log('warn', message, owner))
 
     // Cordis already owns listener effects and teardown. Intercept this one
@@ -210,10 +220,34 @@ export class HostRoot {
       ownerOf: (ctx) => ctx[OWNER],
       addCommand: (owner, command) => host.addCommand(owner, command),
     })
+    const PromptShim = definePromptService<OwnerRecord>({
+      ownerOf: (ctx) => ctx[OWNER],
+      promptSections: this.promptSections,
+    })
+    class StorageShim extends Service {
+      constructor(ctx: any) { super(ctx, 'storage') }
+      private api(): PluginStorage {
+        const owner: OwnerRecord | undefined = (this.ctx as any)[OWNER]
+        if (!owner || !owner.dataDir) throw new Error('storage requires an active extension owner and data directory')
+        owner.storage ??= createStorage({
+          dataDir: owner.dataDir,
+          isActive: () => (owner.state === 'activating' || owner.state === 'active') && !owner.disposing,
+        })
+        return owner.storage
+      }
+      get(key: string) { return this.api().get(key) }
+      set(key: string, value: Json) { return this.api().set(key, value) }
+      delete(key: string) { return this.api().delete(key) }
+    }
+    Object.freeze(StorageShim.prototype)
     shimClasses.set('tools', ToolsShim)
     shimClasses.set('commands', CommandsShim)
+    shimClasses.set('prompt', PromptShim)
+    shimClasses.set('storage', StorageShim)
     root.plugin(ToolsShim)
     root.plugin(CommandsShim)
+    root.plugin(PromptShim)
+    root.plugin(StorageShim)
   }
 
   log(level: string, msg: string, owner?: OwnerRecord) {
@@ -277,6 +311,7 @@ export class HostRoot {
       tools: new Map(),
       commands: new Map(),
       hooks: new Map(),
+      promptSections: new Map(),
       entries: new Set(),
       ...(params.data_dir === undefined ? {} : { dataDir: params.data_dir }),
       state: 'activating',
@@ -326,6 +361,7 @@ export class HostRoot {
 
   /** Dispose one owner's fibers (reverse order, async disposers awaited). Memoised. */
   disposeOwner(owner: OwnerRecord): Promise<void> {
+    owner.state = 'disposed'
     owner.disposing ??= (async () => {
       for (const fiber of [...owner.fibers].reverse()) {
         await fiber.dispose()
@@ -348,6 +384,7 @@ export class HostRoot {
       ...[...owner.tools.values()].map((tool) => `tool:${tool.name}`),
       ...[...owner.commands.values()].map((command) => `command:${command.name}`),
       ...[...owner.hooks.values()].map((hook) => `hook:${hook.name}`),
+      ...[...owner.promptSections.values()].map((section) => `prompt_section:${section.name}`),
     ]
     for (const fiber of owner.fibers) {
       for (const effect of fiber.getEffects?.() ?? []) leaked.push(`effect:${effect.label}`)
@@ -355,6 +392,7 @@ export class HostRoot {
     this.toolRegistrations.forget(owner)
     this.commandRegistrations.forget(owner)
     this.hookRegistrations.forget(owner)
+    this.promptSections.forget(owner)
     this.owners.delete(ref.owner_token)
     return { disposed, leaked }
   }
@@ -375,6 +413,7 @@ export class HostRoot {
     workspace?: string,
     /** The core's invocation ticket: present only when this call runs under the turn loop's permission gate. */
     ticket?: string,
+    identity?: InvocationIdentityWire,
   ): Promise<ToolResultWire> {
     const local = this.toolRegistrations.byHandle.get(handle)
     if (!local || local.disposed || local.owner.state !== 'active') {
@@ -385,7 +424,7 @@ export class HostRoot {
     // this plugin's own directory. Both are read-only strings.
     // `core` exists only when the core gave this call a ticket (`exec.core` in shims/core.ts).
     const core = ticket === undefined ? {} : { core: makeCoreApi(this.rpc, local.owner.ref, ticket, signal) }
-    const exec = Object.freeze({ signal, callId, args: input, ...callContext(local.owner, workspace), ...core })
+    const exec = Object.freeze({ signal, callId, args: input, ...callContext(local.owner, workspace, identity), ...core })
     const run = ownerStorage.run(local.owner, async () => {
       const value = await definition.execute(input, exec)
       return renderResult(definition, input, value)
@@ -394,14 +433,14 @@ export class HostRoot {
   }
 
   /** `command/run`: only for a handle the core admitted, and only on a user's own invocation. */
-  async callCommand(handle: number, rawInput: string, commandId: string, signal: AbortSignal, workspace?: string): Promise<CommandResultWire> {
+  async callCommand(handle: number, rawInput: string, commandId: string, signal: AbortSignal, workspace?: string, identity?: InvocationIdentityWire): Promise<CommandResultWire> {
     const local = this.commandRegistrations.byHandle.get(handle)
     if (!local || local.disposed || local.owner.state !== 'active') {
       throw new RpcError(ErrorCode.NotAvailable, `command handle ${handle} is not live`)
     }
     const { definition } = local
     const run = ownerStorage.run(local.owner, async () => {
-      const value = await definition.handler(makeInvocation(rawInput, commandId, signal, callContext(local.owner, workspace)))
+      const value = await definition.handler(makeInvocation(rawInput, commandId, signal, callContext(local.owner, workspace, identity)))
       return normalizeResult(definition.name, value)
     })
     return Promise.race([run, abortedBy(signal)])
@@ -426,10 +465,19 @@ export class HostRoot {
 }
 
 /** The read-only context a call carries beyond its input; a field the core did not send is absent. */
-function callContext(owner: OwnerRecord, workspace: string | undefined): { workspace?: string; dataDir?: string } {
+interface InvocationIdentityWire {
+  session_id?: string
+  agent_id?: string
+  origin_turn_id?: string
+}
+
+function callContext(owner: OwnerRecord, workspace: string | undefined, identity?: InvocationIdentityWire) {
   return {
     ...(workspace === undefined ? {} : { workspace }),
     ...(owner.dataDir === undefined ? {} : { dataDir: owner.dataDir }),
+    ...(identity?.session_id === undefined ? {} : { sessionId: identity.session_id }),
+    ...(identity?.agent_id === undefined ? {} : { agentId: identity.agent_id }),
+    ...(identity?.origin_turn_id === undefined ? {} : { originTurnId: identity.origin_turn_id }),
   }
 }
 

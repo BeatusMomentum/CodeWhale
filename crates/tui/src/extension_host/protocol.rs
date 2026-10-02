@@ -381,6 +381,7 @@ pub enum RegisterKind {
     Tool,
     Command,
     Hook,
+    PromptSection,
 }
 
 /// What a registration proposes. The fields a kind uses are fixed by
@@ -428,8 +429,13 @@ impl RegisterParams {
             RegisterKind::Command if spec.input_schema.is_some() => {
                 Err("a command registration has no `spec.input_schema`".to_string())
             }
-            RegisterKind::Hook if spec.input_schema.is_some() || spec.argument_hint.is_some() => {
-                Err("a hook registration has no input schema or argument hint".to_string())
+            RegisterKind::Hook | RegisterKind::PromptSection
+                if spec.input_schema.is_some() || spec.argument_hint.is_some() =>
+            {
+                Err(
+                    "a hook or prompt registration has no input schema or argument hint"
+                        .to_string(),
+                )
             }
             _ => Ok(()),
         }
@@ -751,6 +757,13 @@ pub struct ToolCallParams {
     /// whose tool then has no way to ask the core for anything.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ticket: Option<String>,
+    /// Per-invocation identity; never cached at activation or by the host root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_turn_id: Option<String>,
 }
 
 /// One user invocation of a registered command. `raw_input` is what follows
@@ -765,6 +778,12 @@ pub struct CommandRunParams {
     /// The workspace the user ran the command in, and no other.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_turn_id: Option<String>,
 }
 
 /// A Rust-composed view of a pending call. No session handle or invocation

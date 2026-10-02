@@ -10,7 +10,7 @@ var __export = (target, all) => {
 var define_BUILTIN_MODULE_DIGESTS_default = {};
 
 // src/main.ts
-import { createHash as createHash2 } from "node:crypto";
+import { createHash as createHash3 } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { createRequire as createRequire2 } from "node:module";
 import { fileURLToPath } from "node:url";
@@ -4250,7 +4250,7 @@ var SHAPES = {
   CommandRunParams: {
     strict: false,
     required: { handle: "uint", command_id: "string", raw_input: "string", deadline_ms: "uint" },
-    optional: { workspace: "string" }
+    optional: { workspace: "string", session_id: "string", agent_id: "string", origin_turn_id: "string" }
   },
   CoreCallParams: {
     strict: true,
@@ -4329,7 +4329,7 @@ var SHAPES = {
   },
   RegisterParams: {
     strict: true,
-    required: { owner: { ref: "OwnerRef" }, kind: { enum: ["tool", "command", "hook"] }, spec: { ref: "RegisterSpecWire" } },
+    required: { owner: { ref: "OwnerRef" }, kind: { enum: ["tool", "command", "hook", "prompt_section"] }, spec: { ref: "RegisterSpecWire" } },
     optional: {}
   },
   RegisterSpecWire: {
@@ -4345,7 +4345,7 @@ var SHAPES = {
   ToolCallParams: {
     strict: false,
     required: { handle: "uint", call_id: "string", input: "json", deadline_ms: "uint" },
-    optional: { workspace: "string", ticket: "string" }
+    optional: { workspace: "string", ticket: "string", session_id: "string", agent_id: "string", origin_turn_id: "string" }
   },
   UnregisterParams: {
     strict: true,
@@ -4480,7 +4480,7 @@ function validateMessage(value, direction, tier, methods = METHODS) {
     }
     if (method === "registry/register") {
       const { kind, spec: spec2 } = params;
-      const reason = kind === "tool" && spec2.input_schema == null ? "a tool registration needs `spec.input_schema`" : kind === "tool" && spec2.argument_hint != null ? "a tool registration has no `spec.argument_hint`" : kind === "command" && spec2.input_schema != null ? "a command registration has no `spec.input_schema`" : kind === "hook" && (spec2.input_schema != null || spec2.argument_hint != null) ? "a hook registration has no input schema or argument hint" : void 0;
+      const reason = kind === "tool" && spec2.input_schema == null ? "a tool registration needs `spec.input_schema`" : kind === "tool" && spec2.argument_hint != null ? "a tool registration has no `spec.argument_hint`" : kind === "command" && spec2.input_schema != null ? "a command registration has no `spec.input_schema`" : (kind === "hook" || kind === "prompt_section") && (spec2.input_schema != null || spec2.argument_hint != null) ? "a hook or prompt registration has no input schema or argument hint" : void 0;
       if (reason !== void 0) throw new ProtocolError(`${method}: ${reason}`);
     }
     return value;
@@ -4630,7 +4630,7 @@ function toRpcError(error, signal) {
 }
 
 // src/root.ts
-import { createHash } from "node:crypto";
+import { createHash as createHash2 } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { pathToFileURL } from "node:url";
@@ -4820,6 +4820,309 @@ function hookVerdict(value, onAllow) {
   }
 }
 
+// src/shims/prompt.ts
+var MAX_PROMPT_SECTION_BYTES = 4 * 1024;
+var MAX_PROMPT_OWNER_BYTES = 32 * 1024;
+var MAX_PROMPT_HOST_BYTES = 128 * 1024;
+var MAX_PROMPT_SECTIONS_PER_OWNER = 128;
+var MAX_PROMPT_SECTIONS_PER_HOST = 1024;
+var SECTION_ID = /^[a-z][a-z0-9_-]{0,63}$/u;
+function normalizePromptSection(value) {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new TypeError("prompt section must be an object with id and text");
+  }
+  if (Object.keys(value).some((key) => key !== "id" && key !== "text")) {
+    throw new TypeError("prompt section supports only id and text");
+  }
+  const { id, text } = value;
+  if (typeof id !== "string" || !SECTION_ID.test(id)) {
+    throw new TypeError("prompt section id must be lower case, start with a letter, and use a-z, 0-9, _ or - (at most 64 characters)");
+  }
+  if (typeof text !== "string" || text.trim().length === 0) {
+    throw new TypeError(`prompt section "${id}" needs non-empty text`);
+  }
+  if (/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/u.test(text)) {
+    throw new TypeError(`prompt section "${id}" text contains control characters`);
+  }
+  if (Buffer.byteLength(text, "utf8") > MAX_PROMPT_SECTION_BYTES) {
+    throw new RangeError(`prompt section "${id}" exceeds ${MAX_PROMPT_SECTION_BYTES} UTF-8 bytes`);
+  }
+  return Object.freeze({ id, text });
+}
+var PromptSections = class {
+  registrations;
+  owners = /* @__PURE__ */ new Map();
+  bytes = 0;
+  count = 0;
+  constructor(rpc2, ownedBy, warn) {
+    this.registrations = new OwnedRegistrations(rpc2, "prompt_section", ownedBy, warn);
+  }
+  register(owner, definition) {
+    if (owner.state !== "activating" && owner.state !== "active") throw new Error("prompt owner is not live");
+    const section = normalizePromptSection(definition);
+    const sections = this.owners.get(owner) ?? /* @__PURE__ */ new Map();
+    if (sections.has(section.id)) throw new Error(`prompt section "${section.id}" is already registered; dispose it before registering it again`);
+    const bytes = Buffer.byteLength(section.text, "utf8");
+    const ownerBytes = [...sections.values()].reduce((sum, item) => sum + item.bytes, 0);
+    if (ownerBytes + bytes > MAX_PROMPT_OWNER_BYTES || this.bytes + bytes > MAX_PROMPT_HOST_BYTES) {
+      throw new RangeError("prompt section owner or host UTF-8 byte limit reached");
+    }
+    if (sections.size >= MAX_PROMPT_SECTIONS_PER_OWNER || this.count >= MAX_PROMPT_SECTIONS_PER_HOST) {
+      throw new RangeError("prompt section owner or host registration limit reached");
+    }
+    const entry = { owner, name: section.id, definition: section, disposed: false };
+    const undo = this.registrations.add(entry, { name: section.id, description: section.text });
+    const record = { entry, bytes, dispose: () => {
+      if (sections.get(section.id) !== record) return;
+      sections.delete(section.id);
+      this.bytes -= bytes;
+      this.count -= 1;
+      if (sections.size === 0) this.owners.delete(owner);
+      undo();
+    } };
+    sections.set(section.id, record);
+    this.owners.set(owner, sections);
+    this.bytes += bytes;
+    this.count += 1;
+    return record.dispose;
+  }
+  /** Release reservations even after a plugin fails or times out during teardown. */
+  forget(owner) {
+    for (const record of [...this.owners.get(owner)?.values() ?? []]) record.dispose();
+    this.registrations.forget(owner);
+  }
+};
+function definePromptService(host2) {
+  class PromptShim extends Service {
+    constructor(ctx) {
+      super(ctx, "prompt");
+    }
+    registerSection(definition) {
+      const ctx = this.ctx;
+      const owner = host2.ownerOf(ctx);
+      if (!owner) throw new Error("prompt.registerSection called outside an extension owner");
+      const section = normalizePromptSection(definition);
+      return ctx.effect(() => host2.promptSections.register(owner, section), `prompt.registerSection(${JSON.stringify(section.id)})`);
+    }
+  }
+  Object.freeze(PromptShim.prototype);
+  return PromptShim;
+}
+
+// src/shims/storage.ts
+import { constants } from "node:fs";
+import { lstat, mkdir, open, readdir, realpath, rename, unlink } from "node:fs/promises";
+import { isAbsolute, join } from "node:path";
+import { createHash, randomUUID } from "node:crypto";
+var STORAGE_LIMITS = Object.freeze({ keyBytes: 128, valueBytes: 128 * 1024, totalBytes: 4 * 1024 * 1024, keys: 1024 });
+var RECORD_NAME = /^[a-f0-9]{64}\.json$/u;
+var MAX_RECORD_BYTES = STORAGE_LIMITS.valueBytes + STORAGE_LIMITS.keyBytes * 6 + 128;
+var queues = /* @__PURE__ */ new Map();
+var StorageError = class extends Error {
+  code;
+  constructor(code, message) {
+    super(message);
+    this.code = code;
+    this.name = "StorageError";
+  }
+};
+function checkKey(key) {
+  if (typeof key !== "string" || !key.length || key.includes("\0") || Buffer.byteLength(key) > STORAGE_LIMITS.keyBytes) {
+    throw new StorageError("invalid", `storage key must contain 1 to ${STORAGE_LIMITS.keyBytes} UTF-8 bytes and no NUL`);
+  }
+}
+function plainJson(value, depth = 0) {
+  if (depth > 64) return false;
+  if (value === null || typeof value !== "object") return true;
+  if (!Array.isArray(value) && Object.getPrototypeOf(value) !== Object.prototype && Object.getPrototypeOf(value) !== null) return false;
+  const keys = Reflect.ownKeys(value);
+  if (Array.isArray(value) && keys.length !== value.length + 1) return false;
+  for (const key of keys) {
+    if (Array.isArray(value) && key === "length") continue;
+    if (typeof key !== "string") return false;
+    if (Array.isArray(value) && (!/^(0|[1-9]\d*)$/u.test(key) || Number(key) >= value.length)) return false;
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (!descriptor.enumerable || !("value" in descriptor) || !plainJson(descriptor.value, depth + 1)) return false;
+  }
+  return true;
+}
+function snapshot2(value) {
+  if (!plainJson(value) || !isJson(value)) throw new StorageError("invalid", "storage value must be plain JSON");
+  const encoded = JSON.stringify(value);
+  if (Buffer.byteLength(encoded) > STORAGE_LIMITS.valueBytes) throw new StorageError("limit", "storage value exceeds its byte limit");
+  return JSON.parse(encoded);
+}
+function recordName(key) {
+  return `${createHash("sha256").update(key).digest("hex")}.json`;
+}
+function fsCode(error) {
+  return error?.code;
+}
+async function readRecord(directory, name) {
+  const path = join(directory, name);
+  let file;
+  try {
+    const before = await lstat(path);
+    if (!before.isFile() || before.isSymbolicLink() || before.nlink > 1) throw new StorageError("corrupt", "plugin storage record is not a single-link regular file");
+    file = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+    const stat = await file.stat();
+    const current = await lstat(path).catch((error) => {
+      if (fsCode(error) !== "ENOENT") throw error;
+      return void 0;
+    });
+    if (!stat.isFile() || stat.nlink > 1 || current?.isSymbolicLink()) throw new StorageError("corrupt", "plugin storage record changed while opening");
+    if (stat.size > MAX_RECORD_BYTES) throw new StorageError("corrupt", "plugin storage record exceeds its byte limit");
+    const bytes = Buffer.alloc(stat.size + 1);
+    let length = 0;
+    while (length < bytes.length) {
+      const read = await file.read(bytes, length, bytes.length - length, length);
+      if (!read.bytesRead) break;
+      length += read.bytesRead;
+    }
+    if (length > stat.size) throw new StorageError("corrupt", "plugin storage record changed while reading");
+    const stored = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes.subarray(0, length)));
+    if (!stored || stored.version !== 1 || Object.keys(stored).length !== 3 || !Object.hasOwn(stored, "value")) throw new StorageError("corrupt", "plugin storage record format is invalid");
+    checkKey(stored.key);
+    if (recordName(stored.key) !== name) throw new StorageError("corrupt", "plugin storage record does not match its key");
+    return { key: stored.key, value: snapshot2(stored.value), bytes: length };
+  } catch (error) {
+    if (fsCode(error) === "ENOENT") return void 0;
+    if (error instanceof StorageError) throw new StorageError("corrupt", error.message);
+    if (error instanceof SyntaxError || error instanceof TypeError) throw new StorageError("corrupt", "plugin storage record is invalid; existing state was preserved");
+    throw error;
+  } finally {
+    await file?.close();
+  }
+}
+function createStorage({ dataDir, isActive, onWarning }) {
+  if (typeof dataDir !== "string" || !isAbsolute(dataDir)) throw new StorageError("invalid", "plugin storage needs its assigned absolute dataDir");
+  function active() {
+    if (!isActive()) throw new StorageError("not_available", "plugin storage owner is no longer active");
+  }
+  async function directory() {
+    const stat = await lstat(dataDir);
+    if (!stat.isDirectory() || stat.isSymbolicLink()) throw new StorageError("invalid", "plugin storage dataDir must be a real directory");
+    return join(await realpath(dataDir), "storage-v1");
+  }
+  async function prepare(directory2) {
+    await mkdir(directory2, { mode: 448 }).catch((error) => {
+      if (fsCode(error) !== "EEXIST") throw error;
+    });
+    const stat = await lstat(directory2);
+    if (!stat.isDirectory() || stat.isSymbolicLink()) throw new StorageError("corrupt", "plugin storage record directory must be a real directory");
+    active();
+  }
+  async function syncDirectory(directory2) {
+    let dir;
+    try {
+      dir = await open(directory2, constants.O_RDONLY);
+      await dir.sync();
+    } catch (error) {
+      try {
+        onWarning?.(`plugin storage record committed; directory fsync unavailable (${fsCode(error) ?? "unknown filesystem error"})`);
+      } catch {
+      }
+    } finally {
+      await dir?.close().catch(() => void 0);
+    }
+  }
+  async function checkQuota(directory2, name, candidateBytes) {
+    const names = (await readdir(directory2)).filter((entry) => RECORD_NAME.test(entry));
+    let count = 0, bytes = 0;
+    for (const entry of names) {
+      if (entry === name) continue;
+      const record = await readRecord(directory2, entry);
+      if (!record) continue;
+      count++;
+      bytes += record.bytes;
+      if (count + 1 > STORAGE_LIMITS.keys || bytes + candidateBytes > STORAGE_LIMITS.totalBytes) throw new StorageError("limit", "plugin storage exceeds its observed owner quota");
+    }
+    if (count + 1 > STORAGE_LIMITS.keys || bytes + candidateBytes > STORAGE_LIMITS.totalBytes) throw new StorageError("limit", "plugin storage exceeds its observed owner quota");
+  }
+  async function write2(directory2, key, value) {
+    const name = recordName(key);
+    const encoded = JSON.stringify({ version: 1, key, value }) + "\n";
+    await readRecord(directory2, name);
+    await checkQuota(directory2, name, Buffer.byteLength(encoded));
+    const temporary = join(directory2, `.pending-${randomUUID()}.tmp`);
+    let file;
+    let published = false;
+    try {
+      file = await open(temporary, "wx", 384);
+      await file.writeFile(encoded);
+      await file.sync();
+      await file.close();
+      file = void 0;
+      active();
+      await rename(temporary, join(directory2, name));
+      published = true;
+      await syncDirectory(directory2);
+    } finally {
+      await file?.close();
+      if (!published) await unlink(temporary).catch((error) => {
+        if (fsCode(error) !== "ENOENT") throw error;
+      });
+    }
+  }
+  async function queue(operation) {
+    active();
+    try {
+      const dir = await directory();
+      const next = (queues.get(dir) ?? Promise.resolve()).then(async () => {
+        active();
+        await prepare(dir);
+        return operation(dir);
+      });
+      const tail = next.then(() => void 0, () => void 0);
+      queues.set(dir, tail);
+      void tail.then(() => {
+        if (queues.get(dir) === tail) queues.delete(dir);
+      });
+      return await next;
+    } catch (error) {
+      if (error instanceof StorageError) throw error;
+      throw new StorageError("io", `plugin storage operation failed (${fsCode(error) ?? "unknown filesystem error"})`);
+    }
+  }
+  return Object.freeze({
+    get(key) {
+      return queue(async (dir) => {
+        checkKey(key);
+        const record = await readRecord(dir, recordName(key));
+        active();
+        return record?.value;
+      });
+    },
+    set(key, value) {
+      let copy;
+      try {
+        active();
+        checkKey(key);
+        copy = snapshot2(value);
+      } catch (error) {
+        return Promise.reject(error);
+      }
+      return queue((dir) => write2(dir, key, copy));
+    },
+    delete(key) {
+      return queue(async (dir) => {
+        checkKey(key);
+        const path = join(dir, recordName(key));
+        const stat = await lstat(path).catch((error) => {
+          if (fsCode(error) !== "ENOENT") throw error;
+          return void 0;
+        });
+        if (!stat) return false;
+        if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1) throw new StorageError("corrupt", "plugin storage record is not a single-link regular file");
+        active();
+        await unlink(path);
+        await syncDirectory(dir);
+        return true;
+      });
+    }
+  });
+}
+
 // src/tier.ts
 var HOST_OWNER_PREFIX = "host:";
 var TIERS = ["plugin", "builtin"];
@@ -4953,10 +5256,12 @@ var REFUSED_SERVICES = /* @__PURE__ */ new Set([
   "systemPrompt",
   "tools",
   "commands",
+  "prompt",
+  "storage",
   "skills",
   "logger"
 ]);
-var PROVIDED_SERVICES = /* @__PURE__ */ new Set(["tools", "commands", "logger", "events", "reflect", "registry"]);
+var PROVIDED_SERVICES = /* @__PURE__ */ new Set(["tools", "commands", "prompt", "storage", "logger", "events", "reflect", "registry"]);
 var ACTIVATE_DEADLINE_MS = 5e3;
 var DISPOSE_DEADLINE_MS = 2e3;
 var ownerStorage = new AsyncLocalStorage();
@@ -4995,6 +5300,11 @@ var HostRoot = class {
       rpc2,
       "hook",
       (owner) => owner.hooks,
+      (message, owner) => this.log("warn", message, owner)
+    );
+    this.promptSections = new PromptSections(
+      rpc2,
+      (owner) => owner.promptSections,
       (message, owner) => this.log("warn", message, owner)
     );
     root.on("internal/listener", function(name, callback, options) {
@@ -5049,10 +5359,42 @@ var HostRoot = class {
       ownerOf: (ctx) => ctx[OWNER],
       addCommand: (owner, command) => host2.addCommand(owner, command)
     });
+    const PromptShim = definePromptService({
+      ownerOf: (ctx) => ctx[OWNER],
+      promptSections: this.promptSections
+    });
+    class StorageShim extends Service {
+      constructor(ctx) {
+        super(ctx, "storage");
+      }
+      api() {
+        const owner = this.ctx[OWNER];
+        if (!owner || !owner.dataDir) throw new Error("storage requires an active extension owner and data directory");
+        owner.storage ??= createStorage({
+          dataDir: owner.dataDir,
+          isActive: () => (owner.state === "activating" || owner.state === "active") && !owner.disposing
+        });
+        return owner.storage;
+      }
+      get(key) {
+        return this.api().get(key);
+      }
+      set(key, value) {
+        return this.api().set(key, value);
+      }
+      delete(key) {
+        return this.api().delete(key);
+      }
+    }
+    Object.freeze(StorageShim.prototype);
     shimClasses.set("tools", ToolsShim);
     shimClasses.set("commands", CommandsShim);
+    shimClasses.set("prompt", PromptShim);
+    shimClasses.set("storage", StorageShim);
     root.plugin(ToolsShim);
     root.plugin(CommandsShim);
+    root.plugin(PromptShim);
+    root.plugin(StorageShim);
   }
   rpc;
   tier;
@@ -5061,6 +5403,7 @@ var HostRoot = class {
   toolRegistrations;
   commandRegistrations;
   hookRegistrations;
+  promptSections;
   log(level, msg, owner) {
     const params = { level, msg: msg.slice(0, 8192) };
     if (owner) params.plugin_id = owner.ref.plugin_id;
@@ -5117,6 +5460,7 @@ var HostRoot = class {
       tools: /* @__PURE__ */ new Map(),
       commands: /* @__PURE__ */ new Map(),
       hooks: /* @__PURE__ */ new Map(),
+      promptSections: /* @__PURE__ */ new Map(),
       entries: /* @__PURE__ */ new Set(),
       ...params.data_dir === void 0 ? {} : { dataDir: params.data_dir },
       state: "activating"
@@ -5125,7 +5469,7 @@ var HostRoot = class {
     owner.entries.add(params.entry.path);
     try {
       const bytes = await readFile(params.entry.path);
-      const digest = createHash("sha256").update(bytes).digest("hex");
+      const digest = createHash2("sha256").update(bytes).digest("hex");
       if (digest !== params.entry.sha256) {
         throw new Error(`entry ${params.entry.path} changed after review (sha256 ${digest.slice(0, 12)}…)`);
       }
@@ -5164,6 +5508,7 @@ var HostRoot = class {
   }
   /** Dispose one owner's fibers (reverse order, async disposers awaited). Memoised. */
   disposeOwner(owner) {
+    owner.state = "disposed";
     owner.disposing ??= (async () => {
       for (const fiber of [...owner.fibers].reverse()) {
         await fiber.dispose();
@@ -5184,7 +5529,8 @@ var HostRoot = class {
     const leaked = [
       ...[...owner.tools.values()].map((tool) => `tool:${tool.name}`),
       ...[...owner.commands.values()].map((command) => `command:${command.name}`),
-      ...[...owner.hooks.values()].map((hook) => `hook:${hook.name}`)
+      ...[...owner.hooks.values()].map((hook) => `hook:${hook.name}`),
+      ...[...owner.promptSections.values()].map((section) => `prompt_section:${section.name}`)
     ];
     for (const fiber of owner.fibers) {
       for (const effect of fiber.getEffects?.() ?? []) leaked.push(`effect:${effect.label}`);
@@ -5192,6 +5538,7 @@ var HostRoot = class {
     this.toolRegistrations.forget(owner);
     this.commandRegistrations.forget(owner);
     this.hookRegistrations.forget(owner);
+    this.promptSections.forget(owner);
     this.owners.delete(ref.owner_token);
     return { disposed, leaked };
   }
@@ -5202,14 +5549,14 @@ var HostRoot = class {
       "shutdown"
     ).catch(() => void 0);
   }
-  async callTool(handle, input, callId, signal, workspace, ticket) {
+  async callTool(handle, input, callId, signal, workspace, ticket, identity) {
     const local = this.toolRegistrations.byHandle.get(handle);
     if (!local || local.disposed || local.owner.state !== "active") {
       throw new RpcError(ErrorCode.NotAvailable, `tool handle ${handle} is not live`);
     }
     const definition = local.definition;
     const core = ticket === void 0 ? {} : { core: makeCoreApi(this.rpc, local.owner.ref, ticket, signal) };
-    const exec = Object.freeze({ signal, callId, args: input, ...callContext(local.owner, workspace), ...core });
+    const exec = Object.freeze({ signal, callId, args: input, ...callContext(local.owner, workspace, identity), ...core });
     const run = ownerStorage.run(local.owner, async () => {
       const value = await definition.execute(input, exec);
       return renderResult(definition, input, value);
@@ -5217,14 +5564,14 @@ var HostRoot = class {
     return Promise.race([run, abortedBy(signal)]);
   }
   /** `command/run`: only for a handle the core admitted, and only on a user's own invocation. */
-  async callCommand(handle, rawInput, commandId, signal, workspace) {
+  async callCommand(handle, rawInput, commandId, signal, workspace, identity) {
     const local = this.commandRegistrations.byHandle.get(handle);
     if (!local || local.disposed || local.owner.state !== "active") {
       throw new RpcError(ErrorCode.NotAvailable, `command handle ${handle} is not live`);
     }
     const { definition } = local;
     const run = ownerStorage.run(local.owner, async () => {
-      const value = await definition.handler(makeInvocation(rawInput, commandId, signal, callContext(local.owner, workspace)));
+      const value = await definition.handler(makeInvocation(rawInput, commandId, signal, callContext(local.owner, workspace, identity)));
       return normalizeResult(definition.name, value);
     });
     return Promise.race([run, abortedBy(signal)]);
@@ -5246,10 +5593,13 @@ var HostRoot = class {
     return Promise.race([run, abortedBy(signal)]);
   }
 };
-function callContext(owner, workspace) {
+function callContext(owner, workspace, identity) {
   return {
     ...workspace === void 0 ? {} : { workspace },
-    ...owner.dataDir === void 0 ? {} : { dataDir: owner.dataDir }
+    ...owner.dataDir === void 0 ? {} : { dataDir: owner.dataDir },
+    ...identity?.session_id === void 0 ? {} : { sessionId: identity.session_id },
+    ...identity?.agent_id === void 0 ? {} : { agentId: identity.agent_id },
+    ...identity?.origin_turn_id === void 0 ? {} : { originTurnId: identity.origin_turn_id }
   };
 }
 function abortedBy(signal) {
@@ -5357,7 +5707,7 @@ installResolveHooks({
 });
 function bundleDigest() {
   try {
-    return createHash2("sha256").update(readFileSync(fileURLToPath(import.meta.url))).digest("hex");
+    return createHash3("sha256").update(readFileSync(fileURLToPath(import.meta.url))).digest("hex");
   } catch {
     return "unknown";
   }
@@ -5421,11 +5771,11 @@ rpc.onRequest("ext/deactivate", async (params) => {
 });
 rpc.onRequest("tool/call", async (params, cx) => {
   requireInitialized();
-  return host.callTool(params.handle, params.input, params.call_id, cx.signal, params.workspace, params.ticket);
+  return host.callTool(params.handle, params.input, params.call_id, cx.signal, params.workspace, params.ticket, params);
 });
 rpc.onRequest("command/run", async (params, cx) => {
   requireInitialized();
-  return host.callCommand(params.handle, params.raw_input, params.command_id, cx.signal, params.workspace);
+  return host.callCommand(params.handle, params.raw_input, params.command_id, cx.signal, params.workspace, params);
 });
 rpc.onRequest("hook/evaluate", async (params, cx) => {
   requireInitialized();

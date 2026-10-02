@@ -68,6 +68,9 @@ export interface CommandInvocation {
   readonly workspace?: string
   /** This plugin's own writable directory. */
   readonly dataDir?: string
+  readonly sessionId?: string
+  readonly agentId?: string
+  readonly originTurnId?: string
 }
 
 /** Reject an invalid definition before it reaches the core, with a message that names the problem. */
@@ -116,7 +119,7 @@ export function makeInvocation(
   args: string,
   commandId: string,
   signal: AbortSignal,
-  context: { workspace?: string; dataDir?: string } = {},
+  context: { workspace?: string; dataDir?: string; sessionId?: string; agentId?: string; originTurnId?: string } = {},
 ): CommandInvocation {
   return Object.freeze({
     commandId,

@@ -8,6 +8,33 @@
 > from the text that follows. Where they disagree, the newest "As built"
 > section and the code are current; the rest is the plan for later phases.
 
+## As built: authored prompt sections, owner-local storage and invocation identity (2026-10-02)
+
+`prompt` and `storage` are host-provided shim services whose replacement is
+refused. `ctx.prompt.registerSection({id, text})` uses the existing owned
+registration lifecycle and Rust's reviewed owner registry. Live snapshots are
+scoped to one Engine attachment, validated against its desired plugin hashes
+and current Native authority before and after collection, and sorted by
+owner/id. Rust bounds raw text, section counts and the final attributed block;
+the existing user-role runtime-message path delivers the complete bounded
+snapshot at turn boundaries, including explicit withdrawal, without changing
+the pinned system header or truncating it into workspace context deltas.
+An author cannot replace the system prompt or choose another session. See
+`docs/EXTENSIONS.md` for the exact byte/count limits and grammar.
+
+`ctx.storage.get`, `set` and `delete` expose bounded plain JSON in the directory
+Rust assigned to that owner. Atomic per-key replacement, corrupt-data refusal, symlink
+refusal, serialized owner writes and live-owner checks preserve local state.
+Storage has no session-history or credential access and introduces no protocol
+method. It remains plugin-local state in the existing directory, rather than
+another Codewhale session store.
+
+`tool/call` and `command/run` add optional `session_id`, `agent_id` and
+`origin_turn_id` wire strings. The host exposes only supplied fields as frozen
+per-call `sessionId`, `agentId` and `originTurnId`; no identity is cached during
+activation. A user slash command supplies its known session only. These are
+labels, not handles or new authority. Older callers can omit every field.
+
 ## As built: programmable pre-execute mods (2026-10-02)
 
 `ctx.on('tools/pre-execute', (exec, next) => ...)` now registers an owned `hook` handle through Cordis's `internal/listener` extension point. `hook/evaluate` is core-to-host only, carries a Rust-composed frozen call projection with DSH's `name`, `arguments`, `callId`, and cancellation `signal` spelling, and accepts monotonic `abstain`, `deny`, `ask`, `annotate`, and `revise` proposals. DSH `allow` maps to abstention; unsupported answers fail closed. No runtime, session, agent, invocation ticket, or approval handle is given to a listener.
@@ -21,6 +48,9 @@ This is the bounded pre-execute part of phase 4. It does not implement DSH's aro
 Slice B of the tier plan, and the first thing the host can ask the core to do.
 Still protocol v1 (a new method and an optional field); corpus `22`, `58`-`66`.
 User-facing rules: `docs/EXTENSIONS.md`, "Asking the core to run a tool".
+Nested shell and network calls force a fresh user prompt under the accepted
+Slice B contract, including semantic action aliases. The separate routing hook
+remains outstanding; programmable pre-execute proposals do not implement it.
 
 - **Protocol.** `core/call` (host to core, request, both tiers)
   `{owner, ticket, name, input}`, answered with the existing `ToolResultWire`;
@@ -1417,7 +1447,7 @@ This follows "migrate the last consumer or do not start". Every phase's exit cri
 - The +2,800: supervisor and client (~600), protocol (~500), OwnerRegistry (~500), tool adapter and MCP dispatch (~300), broker glue (~300), FetchProxy (~400), catalog admission and cache (~200).
 - That leaves **about −7,050 net**, plus about 5–8k lines of TypeScript. These remain reading-based estimates, not measured diffs.
 
-**Stop rule.** If phase 3 has not landed within six weeks of phase 1, delete the host rather than leave a second extension runtime in the tree behind a flag. The flag is for trying it out, not for keeping two systems.
+**Stop rule.** The accepted anchor is the Phase 1 exit gate, not the September 26 host merge. If Phase 3 has not landed within six weeks of that gate, delete the host rather than retain another extension runtime behind a flag. Phase 1 exit is not yet achieved, so that clock has not started. The October 1 plan proposes a later anchor; no founder adoption of that change is recorded. `CURRENT_DECISIONS.md` §26 is the accepted decision.
 
 ---
 
