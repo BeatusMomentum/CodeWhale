@@ -387,11 +387,13 @@ impl OceanRamp {
         )
     }
 
+    #[cfg(test)]
     #[must_use]
     pub fn color_at_context(self, row: u16, height: u16, context_percent: u8) -> Color {
         self.native().color_at_context(row, height, context_percent)
     }
 
+    #[cfg(test)]
     #[must_use]
     pub fn color_at_phase_context(
         self,
@@ -410,6 +412,7 @@ impl OceanRamp {
         )
     }
 
+    #[cfg(test)]
     #[must_use]
     pub fn color_at_completion_context(
         self,
