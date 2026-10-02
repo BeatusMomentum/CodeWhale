@@ -1342,6 +1342,18 @@ impl ExtensionHostManager {
             .collect()
     }
 
+    /// The command registrations currently admitted, for tests on the commands
+    /// side that drive the real command table.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn live_command_registrations(&self) -> Vec<CommandRegistration> {
+        self.shared
+            .registry
+            .lock()
+            .expect("registry lock")
+            .live_commands()
+    }
+
     #[cfg(test)]
     #[must_use]
     pub fn owner_state(&self, plugin_id: &str) -> Option<OwnerState> {

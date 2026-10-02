@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
+use super::command::{BuiltinCommandCatalog, BuiltinCommandsGuard};
 use super::protocol::{
     self, OwnerRef, RegisterKind, RegisterParams, RegisterSpecWire, parse_core_message,
     parse_host_message,
@@ -27,6 +28,26 @@ use crate::tools::spec::{ApprovalRequirement, ToolContext, ToolError, ToolSpec};
 /// The integration tests below run the host on Node unless they say
 /// otherwise; the Bun ones pin Bun (`bun_for_tests`).
 const NODE: crate::config::ExtensionHostRuntime = crate::config::ExtensionHostRuntime::Node;
+
+/// What the registry is told is a built-in command in the tests that are not
+/// about the command table. Those that are (`commands::extension_host_tests`)
+/// install the real one: this module may not depend on `crate::commands`.
+#[derive(Debug)]
+struct StubBuiltinCommands;
+
+impl BuiltinCommandCatalog for StubBuiltinCommands {
+    fn answers_to(&self, name: &str) -> bool {
+        matches!(
+            name,
+            "help" | "trust" | "model" | "jihua" | "zidong" | "stub-alias"
+        )
+    }
+}
+
+/// The stub catalog, for this thread until the guard drops.
+fn stub_builtin_commands() -> BuiltinCommandsGuard {
+    BuiltinCommandsGuard::install(Arc::new(StubBuiltinCommands))
+}
 
 fn fixtures_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/extension_host")
@@ -106,7 +127,7 @@ async fn frames_decode_in_order_and_violations_are_typed() {
 // Owner registry
 // ---------------------------------------------------------------------------
 
-fn fake_authority(plugin_id: &str) -> crate::plugins::types::PluginAuthority {
+pub(crate) fn fake_authority(plugin_id: &str) -> crate::plugins::types::PluginAuthority {
     crate::plugins::types::PluginAuthority {
         plugin_id: crate::plugins::types::PluginId(plugin_id.to_string()),
         plugin_name: plugin_id.to_string(),
@@ -623,6 +644,9 @@ pub(crate) struct FixturePlugins {
     _temp: tempfile::TempDir,
     pub config: DiscoveryConfig,
     pub root: PathBuf,
+    /// The stub built-in command catalog, so a fixture plugin's commands can
+    /// register; a test about the real table installs its own after this.
+    _commands: BuiltinCommandsGuard,
 }
 
 impl FixturePlugins {
@@ -671,6 +695,7 @@ impl FixturePlugins {
             _temp: temp,
             config,
             root,
+            _commands: stub_builtin_commands(),
         };
         let registry = fixture.registry();
         for name in names {
@@ -2046,13 +2071,13 @@ fn attachment_changes_discard_the_complete_scan_before_owner_side_effects() {
     );
 }
 
-fn installed(engine: &HostAttachment, workspace: &Path) -> Vec<String> {
+pub(crate) fn installed(engine: &HostAttachment, workspace: &Path) -> Vec<String> {
     let mut registry =
         crate::tools::registry::ToolRegistryBuilder::new().build(ToolContext::new(workspace));
     engine.install_tools(&mut registry)
 }
 
-fn plugin_id(fixture: &FixturePlugins, name: &str) -> String {
+pub(crate) fn plugin_id(fixture: &FixturePlugins, name: &str) -> String {
     fixture
         .registry()
         .get(name)
@@ -3659,6 +3684,7 @@ fn register_command(
 
 #[test]
 fn command_registry_refuses_shadowing_and_undoes_exactly_one_entry() {
+    let _catalog = stub_builtin_commands();
     let mut registry = OwnerRegistry::new();
     let a = registry
         .begin_owner(
@@ -3679,12 +3705,9 @@ fn command_registry_refuses_shadowing_and_undoes_exactly_one_entry() {
         )
         .unwrap();
 
-    // Built-in names, their aliases, and the fixed mode aliases.
-    let builtin_alias = crate::commands::command_infos()
-        .iter()
-        .find_map(|info| info.aliases.first().copied())
-        .expect("some built-in has an alias");
-    for name in ["help", "trust", "model", "jihua", "zidong", builtin_alias] {
+    // Built-in names, their aliases, and the fixed mode aliases, as the
+    // catalog says (the real table: `commands::extension_host_tests`).
+    for name in ["help", "trust", "model", "jihua", "zidong", "stub-alias"] {
         let refused = register_command(&mut registry, &a, name, None)
             .expect_err(&format!("/{name} must be refused"));
         assert!(refused.contains("built-in command"), "{name}: {refused}");
@@ -3975,266 +3998,54 @@ fn manager_workspace(manager: &ExtensionHostManager) -> PathBuf {
         .to_path_buf()
 }
 
-/// Commands registered by real plugins in a real host: what the user
-/// registry loads, what dispatch returns, and what running each one gives.
-#[tokio::test]
-async fn extension_commands_run_end_to_end_through_the_user_command_registry() {
-    use super::command::CommandOutcome;
-    use crate::tui::app::{App, AppAction, TuiOptions};
-
-    let Some(node) = node_for_tests("extension_commands_run_end_to_end") else {
-        return;
-    };
-    let _policy = TestPolicyGuard::extension_host(true);
-    let fixture = FixturePlugins::new(&["ext-commands"]).await;
-    let manager = fixture.manager(node);
-    let _manager = super::TestManagerGuard::install(Arc::clone(&manager));
-    let engine = manager.attach(fixture.registry());
-    // Nothing is visible before the host has registered anything.
-    assert!(manager.live_command_names().is_empty());
-    engine.sync().await.unwrap();
-    let mut live = manager.live_command_names();
-    live.sort();
-    assert_eq!(
-        live,
-        [
-            "ext-ansi",
-            "ext-ask",
-            "ext-dsh",
-            "ext-echo",
-            "ext-fail",
-            "ext-slow",
-            "ext-throw"
-        ]
-    );
-    // Commands are not tools.
-    assert!(manager.live_tool_names().is_empty());
-    assert!(installed(&engine, fixture.workspace()).is_empty());
-
-    // The user registry loads them for this workspace (and no other).
-    let hint = |name: &str| {
-        crate::commands::user_registry::with_registry_for_workspace(
-            Some(fixture.workspace()),
-            |registry| {
-                registry
-                    .get(name)
-                    .map(|command| (command.argument_hint.clone(), command.takes_arguments()))
-            },
-        )
-    };
-    assert_eq!(hint("ext-echo"), Some((Some("<text>".to_string()), true)));
-    assert_eq!(hint("ext-ask"), Some((Some("<topic>".to_string()), true)));
-    assert_eq!(hint("ext-fail"), Some((None, false)));
-    let other = fixture.workspace().join("elsewhere");
-    assert!(
-        crate::commands::user_registry::with_registry_for_workspace(Some(&other), |registry| {
-            registry.get("ext-echo").is_none()
-        }),
-        "another workspace never sees this workspace's extension commands"
-    );
-    // Discovery lists them.
-    let described = crate::commands::user_registry::with_registry_for_workspace(
-        Some(fixture.workspace()),
-        |registry| {
-            registry
-                .iter()
-                .filter(|command| command.extension.is_some())
-                .count()
-        },
-    );
-    assert_eq!(described, 7);
-
-    // Dispatch is the ordinary slash-command path, and returns the action
-    // the UI loop runs; the arguments arrive trimmed.
-    let mut app = App::new(
-        TuiOptions {
-            workspace: fixture.workspace().to_path_buf(),
-            ..crate::test_support::test_tui_options(fixture.workspace())
-        },
-        &crate::config::Config::default(),
-    );
-    let help = crate::commands::execute("/help ext-echo", &mut app);
-    assert!(
-        help.message
-            .as_deref()
-            .is_some_and(|text| text.contains("Echo the arguments.")),
-        "{help:?}"
-    );
-    let dispatched = |app: &mut App, input: &str| match crate::commands::execute(input, app).action
-    {
-        Some(AppAction::RunExtensionCommand {
-            command,
-            name,
-            input,
-        }) => (command, name, input),
-        other => panic!("{input}: expected an extension command action, got {other:?}"),
-    };
-    let (echo, name, args) = dispatched(&mut app, "/ext-echo   hello   there ");
-    assert_eq!(
-        (name.as_str(), args.as_str()),
-        ("ext-echo", "hello   there")
-    );
-    assert_eq!(echo.origin, "extension:ext-commands");
-    assert_eq!(
-        super::run_command(&echo, &args).await,
-        Ok(CommandOutcome::Show {
-            text: "echo: hello   there".to_string()
-        })
-    );
-    let (ask, _, args) = dispatched(&mut app, "/EXT-ASK tokens");
-    assert_eq!(
-        super::run_command(&ask, &args).await,
-        Ok(CommandOutcome::Submit {
-            prompt: "Summarize: tokens".to_string(),
-            note: Some("Asking the model.".to_string())
-        })
-    );
-    let (fail, _, args) = dispatched(&mut app, "/ext-fail");
-    assert_eq!(
-        super::run_command(&fail, &args).await,
-        Err("unknown topic".to_string())
-    );
-    let (thrown, _, args) = dispatched(&mut app, "/ext-throw");
-    let error = super::run_command(&thrown, &args).await.unwrap_err();
-    assert!(
-        error.starts_with("failed:") && error.contains("boom"),
-        "{error}"
-    );
-    // Escape sequences never reach the transcript.
-    let (ansi, _, args) = dispatched(&mut app, "/ext-ansi");
-    assert_eq!(
-        super::run_command(&ansi, &args).await,
-        Ok(CommandOutcome::Show {
-            text: "plain red end".to_string()
-        })
-    );
-    // The DSH-shaped `rawInput` keeps its leading separator.
-    let (dsh, _, args) = dispatched(&mut app, "/ext-dsh a b");
-    assert_eq!(
-        super::run_command(&dsh, &args).await,
-        Ok(CommandOutcome::Show {
-            text: "\" a b\"".to_string()
-        })
-    );
-
-    // Disabling the plugin removes every command at once: the registry stops
-    // listing them, and the reference a user (or palette) still holds fails
-    // closed instead of reaching the host.
-    engine.set_plugins(fixture.disable("ext-commands"));
-    engine.sync().await.unwrap();
-    assert!(manager.live_command_names().is_empty());
-    assert_eq!(hint("ext-echo"), None);
-    let error = super::run_command(&echo, "x").await.unwrap_err();
-    assert!(error.contains("no longer registered"), "{error}");
-    manager.shutdown().await;
-}
-
-/// A command may never take a built-in's name or another plugin's: the
-/// registration is refused with a reason and that plugin fails to activate,
-/// without disturbing the plugin that already holds the name.
-#[tokio::test]
-async fn extension_commands_never_shadow_built_ins_or_other_plugins() {
-    let Some(node) = node_for_tests("extension_commands_never_shadow") else {
-        return;
-    };
-    let _policy = TestPolicyGuard::extension_host(true);
-    let fixture = FixturePlugins::new(&[
-        "ext-commands",
-        "commands-clash-builtin",
-        "commands-clash-plugin",
-    ])
-    .await;
-    let manager = fixture.manager(node);
-    let engine = manager.attach(fixture.registry());
-    engine.sync().await.unwrap();
-    let state = |name: &str| manager.owner_state(&plugin_id(&fixture, name)).unwrap();
-    match state("commands-clash-builtin") {
-        OwnerState::Failed(reason) => {
-            assert!(
-                reason.contains("collides with a built-in command"),
-                "{reason}"
+/// With no built-in command catalog installed, a command cannot be checked
+/// against the built-in names, so its registration is refused (never accepted
+/// unchecked); tools are not affected. With one, the catalog decides.
+#[test]
+fn a_command_registration_is_refused_when_no_built_in_catalog_is_installed() {
+    let owner = |registry: &mut OwnerRegistry| {
+        registry
+            .begin_owner(
+                HostTier::Plugin,
+                "a",
+                "a",
+                Some(fake_authority("a")),
+                "hash-a",
             )
-        }
-        other => panic!("{other:?}"),
-    }
-    // Activation order between the other two is not fixed: exactly one holds
-    // `/ext-echo`, and the other failed on it.
-    let (winner, loser) = match (state("ext-commands"), state("commands-clash-plugin")) {
-        (OwnerState::Active, OwnerState::Failed(reason)) => ("ext-commands", reason),
-        (OwnerState::Failed(reason), OwnerState::Active) => ("commands-clash-plugin", reason),
-        other => panic!("{other:?}"),
+            .unwrap()
     };
-    assert!(loser.contains("already registered by extension"), "{loser}");
-    let live = manager.live_command_names();
-    assert_eq!(live.iter().filter(|name| *name == "ext-echo").count(), 1);
-    assert!(!live.contains(&"help".to_string()));
-    let holder = manager
-        .shared
-        .registry
-        .lock()
-        .unwrap()
-        .live_commands()
-        .into_iter()
-        .find(|command| command.name == "ext-echo")
-        .unwrap();
-    assert_eq!(holder.plugin_name, winner);
-    let diagnostics = manager.diagnostics().join("\n");
+    let _absent = BuiltinCommandsGuard::absent();
+    let mut registry = OwnerRegistry::new();
+    let a = owner(&mut registry);
+    let refused = register_command(&mut registry, &a, "fine-name", None).unwrap_err();
     assert!(
-        diagnostics.contains("command `help` refused"),
-        "{diagnostics}"
+        refused.contains("no built-in command catalog is installed"),
+        "{refused}"
     );
-    manager.shutdown().await;
+    assert!(registry.live_commands().is_empty());
+    // A name the grammar refuses is refused for its own reason first.
+    assert!(
+        register_command(&mut registry, &a, "Not Valid", None)
+            .unwrap_err()
+            .contains("invalid")
+    );
+    // Tools do not consult the command table.
+    register(&mut registry, &a, "a_tool").unwrap();
 
-    // The user registry is the last line: a command already defined by a
-    // markdown source, or by a built-in, wins the spelling and the extension
-    // one is left out with a load error naming why.
-    let mut registry = crate::commands::user_registry::UserCommandRegistry::from_loaded(vec![(
-        "ext-echo".to_string(),
-        "markdown wins".to_string(),
-    )]);
-    let entry = |name: &str| super::command::ExtensionCommandEntry {
-        registration: super::registry::CommandRegistration {
-            handle: 1,
-            owner: protocol::OwnerRef {
-                plugin_id: "p".into(),
-                generation: 1,
-                owner_token: "t".into(),
-            },
-            tier: HostTier::Plugin,
-            plugin_name: "p".into(),
-            content_hash: "h".into(),
-            name: name.to_string(),
-            description: "d".into(),
-            argument_hint: None,
-        },
-        authority: fake_authority("p"),
-        workspace: PathBuf::from("/w"),
-    };
-    registry.load_extension_commands(vec![entry("ext-echo"), entry("help")]);
-    let errors: Vec<String> = registry
-        .load_errors()
-        .iter()
-        .map(|error| error.message.clone())
-        .collect();
+    let _stub = stub_builtin_commands();
+    register_command(&mut registry, &a, "fine-name", None).unwrap();
+    let clash = register_command(&mut registry, &a, "help", None).unwrap_err();
     assert!(
-        errors
-            .iter()
-            .any(|e| e.contains("'/ext-echo' collides with another command")),
-        "{errors:?}"
+        clash.contains("collides with a built-in command"),
+        "{clash}"
     );
-    assert!(
-        errors
-            .iter()
-            .any(|e| e.contains("'/help' collides with a built-in command")),
-        "{errors:?}"
-    );
-    assert!(registry.get("ext-echo").unwrap().extension.is_none());
 }
 
 /// A command from a host that is down says so immediately instead of
 /// hanging, and a revoked registration cannot be run.
 #[tokio::test]
 async fn a_command_from_a_dead_host_reports_host_down() {
+    let _catalog = stub_builtin_commands();
     let policy = TestPolicyGuard::extension_host(true);
     let manager = Arc::new(ExtensionHostManager::new(ExtensionHostOptions::default()));
     let reference = {

@@ -234,12 +234,6 @@ fn valid_command_name(name: &str) -> bool {
         && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
 }
 
-/// Whether a built-in command answers to `name`: a canonical name, an alias,
-/// or one of the fixed mode aliases dispatched ahead of the registry.
-fn builtin_command(name: &str) -> bool {
-    matches!(name, "jihua" | "zidong") || crate::commands::registry().get(name).is_some()
-}
-
 /// Why the core would treat a tool called `name` as something other than an
 /// opaque extension tool, if it would.
 ///
@@ -438,7 +432,14 @@ impl OwnerRegistry {
                 crate::safe_label::SafeLabel::identifier(name)
             ));
         }
-        if builtin_command(name) {
+        // Fail closed: with no catalog installed there is nothing to check the
+        // name against, so the registration is refused, not accepted unchecked.
+        let Some(catalog) = super::command::builtin_commands() else {
+            return Err(format!(
+                "command `/{name}` cannot be checked against the built-in commands: no built-in command catalog is installed, so extension commands are refused"
+            ));
+        };
+        if catalog.answers_to(name) {
             return Err(format!(
                 "command `/{name}` collides with a built-in command; extensions never shadow core commands; use a plugin-specific name, for example `/myplugin-{name}`"
             ));

@@ -23,6 +23,12 @@ pub mod user_registry;
 #[path = "epic_dispatch_acceptance.rs"]
 mod epic_dispatch_acceptance;
 
+// Extension slash commands through the real command table and `App` dispatch;
+// they cannot live in `extension_host`, a runtime module that may not depend
+// on this one.
+#[cfg(test)]
+mod extension_host_tests;
+
 #[cfg(test)]
 #[path = "epic_discovery_acceptance.rs"]
 mod epic_discovery_acceptance;
@@ -193,6 +199,20 @@ fn feat015_ctx_command() -> &'static traits::ContextualCommand {
 
 pub fn registry() -> &'static traits::CommandRegistry {
     REGISTRY.get_or_init(build_registry)
+}
+
+/// The built-in command table as the extension host asks about it: the one
+/// read-only question "does a built-in command answer to this name?". The
+/// composition root installs it at startup (`lib.rs`), so the runtime-side host
+/// never depends on this module.
+pub(crate) struct BuiltinCommandNames;
+
+impl crate::extension_host::command::BuiltinCommandCatalog for BuiltinCommandNames {
+    fn answers_to(&self, name: &str) -> bool {
+        // `jihua` and `zidong` are mode aliases the dispatcher answers ahead
+        // of the registry.
+        matches!(name, "jihua" | "zidong") || registry().get(name).is_some()
+    }
 }
 
 pub fn command_infos() -> Vec<&'static CommandInfo> {

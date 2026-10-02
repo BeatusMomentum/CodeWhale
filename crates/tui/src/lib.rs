@@ -8932,6 +8932,12 @@ fn install_extension_host_boot_config(config: &Config) {
         .enabled(crate::features::Feature::ExtensionHost);
     crate::plugins::activation::install_extension_host_policy(enabled);
     if enabled {
+        // The host asks the command table whether a built-in command answers
+        // to a name before it admits an extension command; without this it
+        // refuses every extension command.
+        crate::extension_host::command::install_builtin_commands(std::sync::Arc::new(
+            crate::commands::BuiltinCommandNames,
+        ));
         crate::extension_host::configure(crate::extension_host::ExtensionHostOptions::from_config(
             config.extension_host.as_ref(),
         ));

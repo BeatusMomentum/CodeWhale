@@ -3,8 +3,8 @@
 //! A command mirrors a tool. The host proposes it with `registry/register`
 //! (`kind = "command"`); [`super::registry::OwnerRegistry`] admits or refuses
 //! it under the same owner/generation/handle rules; the admitted commands of
-//! the owners an engine's workspace desires are loaded into the existing
-//! [`crate::commands::user_registry::UserCommandRegistry`] (at the lowest
+//! the owners an engine's workspace desires are loaded into the existing user
+//! command registry (`commands::user_registry`, at the lowest
 //! precedence, so a built-in or a markdown command always wins the spelling);
 //! and a user invocation becomes `command/run` to the host. Revocation,
 //! deactivation, crash and generation change remove the registrations the
@@ -20,6 +20,14 @@
 //! Invoking a command is the user's own action, so it needs no approval of
 //! its own; it still re-checks that the owner is live, that its reviewed
 //! receipt is current, and that the host is running before anything is sent.
+//!
+//! **The built-in command table is a port.** This module is runtime-side and
+//! may not reach into `commands`, so registration asks
+//! [`BuiltinCommandCatalog`] whether a built-in command answers to a name. The
+//! commands side implements it (`commands::BuiltinCommandNames`) and the
+//! composition root installs it once at startup ([`install_builtin_commands`]).
+//! With none installed a command registration is refused, never accepted
+//! unchecked.
 //!
 //! Known limitations:
 //! * The UI event loop awaits the command (like `/balance`), bounded by
@@ -38,6 +46,7 @@
 //!   prompt over [`MAX_PROMPT_BYTES`] is refused, never truncated.
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use serde_json::Value;
 
@@ -53,6 +62,65 @@ pub const COMMAND_RUN_DEADLINE: std::time::Duration = std::time::Duration::from_
 pub const MAX_TEXT_BYTES: usize = 64 * 1024;
 /// Longest prompt a command may submit. Over this it is refused outright.
 pub const MAX_PROMPT_BYTES: usize = 128 * 1024;
+
+/// What registration needs to know about the built-in slash commands, and
+/// nothing more: read-only, implemented by the commands side.
+pub trait BuiltinCommandCatalog: Send + Sync {
+    /// Whether a built-in command answers to `name` (lower case): a canonical
+    /// name, an alias, or one of the mode aliases the dispatcher answers ahead
+    /// of the registry.
+    fn answers_to(&self, name: &str) -> bool;
+}
+
+static BUILTIN_COMMANDS: OnceLock<Arc<dyn BuiltinCommandCatalog>> = OnceLock::new();
+
+/// Install the process's catalog, once at startup. The first install wins and
+/// returns `true`; a later one is ignored.
+pub fn install_builtin_commands(catalog: Arc<dyn BuiltinCommandCatalog>) -> bool {
+    BUILTIN_COMMANDS.set(catalog).is_ok()
+}
+
+/// The installed catalog. `None` means none was installed (or, in a test, the
+/// thread asked for none): command registration is refused.
+pub(crate) fn builtin_commands() -> Option<Arc<dyn BuiltinCommandCatalog>> {
+    #[cfg(test)]
+    if let Some(chosen) = TEST_CATALOG.with(|cell| cell.borrow().clone()) {
+        return chosen;
+    }
+    BUILTIN_COMMANDS.get().cloned()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// `Some(None)` is a thread that asked for no catalog at all.
+    static TEST_CATALOG: std::cell::RefCell<Option<Option<Arc<dyn BuiltinCommandCatalog>>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Test-only: route [`builtin_commands`] on this thread to a catalog (or to
+/// none) until dropped, restoring what was there before, so tests never touch
+/// the process-wide install.
+#[cfg(test)]
+pub(crate) struct BuiltinCommandsGuard(Option<Option<Arc<dyn BuiltinCommandCatalog>>>);
+
+#[cfg(test)]
+impl BuiltinCommandsGuard {
+    pub(crate) fn install(catalog: Arc<dyn BuiltinCommandCatalog>) -> Self {
+        Self(TEST_CATALOG.with(|cell| cell.replace(Some(Some(catalog)))))
+    }
+
+    /// This thread has no catalog, whatever the process installed.
+    pub(crate) fn absent() -> Self {
+        Self(TEST_CATALOG.with(|cell| cell.replace(Some(None))))
+    }
+}
+
+#[cfg(test)]
+impl Drop for BuiltinCommandsGuard {
+    fn drop(&mut self) {
+        TEST_CATALOG.with(|cell| *cell.borrow_mut() = self.0.take());
+    }
+}
 
 static EPOCH: AtomicU64 = AtomicU64::new(0);
 
