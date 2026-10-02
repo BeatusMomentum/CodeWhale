@@ -1,11 +1,12 @@
-//! Additive, reviewed extension prompt contributions to the existing Engine prompt.
+//! Additive, reviewed extension instructions in the existing Engine session history.
 //!
 //! There is no prompt store or turn loop here. Each turn captures sections from
 //! its own attachment, validates the Native receipt, and rechecks owner and
-//! attachment after that asynchronous check. The Engine records the captured
-//! block through its existing context-update path and keeps the turn's prefix
-//! stable. Activation is asynchronous: a first turn before owners are ready
-//! sees no sections; a later turn captures them after reconciliation.
+//! attachment after that asynchronous check. The Engine records the complete
+//! captured block as a runtime history snapshot replacing earlier snapshots,
+//! so no instructions are lost to a truncated workspace delta and the system
+//! prefix stays stable. Activation is asynchronous: a first turn before owners
+//! are ready sees no sections; a later turn captures them after reconciliation.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
@@ -115,7 +116,7 @@ impl HostAttachment {
     }
 }
 
-/// One attributed block for the Engine's ordinary SystemBlock assembly.
+/// One attributed block for the Engine's complete runtime history snapshot.
 /// Refuse oversized input; never cut instructions partway through a section.
 pub fn render_prompt_sections(sections: &[PromptSection]) -> Result<Option<String>, String> {
     if sections.is_empty() {

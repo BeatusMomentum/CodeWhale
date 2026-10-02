@@ -73,10 +73,12 @@ test('invalid, duplicate and oversized UTF-8 sections fail activation and roll b
     const { result } = await activate(host, `bad-prompt-${index}`, plugin(t, body))
     assert.equal(result.status, 'failed')
     assert.match(result.diagnostic, reason)
-    const records = host.registry.slice(before)
-    const admitted = records.filter((item) => item.op === 'register' && item.kind === 'prompt_section')
+    const admitted = host.registry.slice(before).filter((item) => item.op === 'register' && item.kind === 'prompt_section')
     for (const registration of admitted) {
-      assert.ok(records.some((item) => item.op === 'unregister' && item.handle === registration.handle), `registration ${registration.handle} rolled back`)
+      if (!host.registry.some((item) => item.op === 'unregister' && item.handle === registration.handle)) {
+        await host.waitFor((message) => message.method === 'registry/unregister' && message.params.handle === registration.handle, 2000)
+      }
+      assert.ok(host.registry.some((item) => item.op === 'unregister' && item.handle === registration.handle), `registration ${registration.handle} rolled back`)
     }
   }
 })
