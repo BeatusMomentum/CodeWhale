@@ -14,6 +14,73 @@ use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 const KEY: &str = "catalog-key-canary-7f092";
 const CURSOR: &str = "cursor/second +?&=雪-canary";
 
+#[tokio::test]
+async fn chatgpt_models_http_uses_visible_roster_and_rejects_secret_labels() {
+    let server = MockServer::start().await;
+    let client = CodewhaleClient::new(&Config {
+        provider: Some("openai-codex".into()),
+        providers: Some(ProvidersConfig {
+            openai_codex: ProviderConfig {
+                api_key: Some(KEY.into()),
+                base_url: Some(format!("{}/v1", server.uri())),
+                ..ProviderConfig::default()
+            },
+            ..ProvidersConfig::default()
+        }),
+        ..Config::default()
+    })
+    .expect("explicit local ChatGPT protocol fixture");
+    mount_models_json(
+        &server,
+        200,
+        json!({"models":[
+            {"slug":"gpt-z","display_name":"GPT Z","visibility":"list"},
+            {"slug":"gpt-hidden","display_name":"Hidden","visibility":"hidden"},
+            {"slug":"gpt-a","display_name":"GPT A","visibility":"list"}
+        ]}),
+    )
+    .await;
+    let models = client.list_models().await.expect("account roster");
+    assert_eq!(
+        models.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+        ["gpt-z", "gpt-a"]
+    );
+    assert_eq!(models[0].display_name.as_deref(), Some("GPT Z"));
+    let delta = client
+        .fetch_catalog_delta()
+        .await
+        .expect("same parsed roster");
+    assert_eq!(
+        delta
+            .offerings
+            .iter()
+            .map(|row| row.wire_model_id.as_str())
+            .collect::<Vec<_>>(),
+        ["gpt-z", "gpt-a"]
+    );
+    for request in server.received_requests().await.expect("requests") {
+        assert_eq!(request.url.path(), "/v1/models");
+        assert_eq!(
+            request.headers.get("authorization").unwrap(),
+            &format!("Bearer {KEY}")
+        );
+    }
+    server.reset().await;
+    mount_models_json(
+        &server,
+        200,
+        json!({"models":[
+            {"slug":"gpt-a","display_name":KEY,"visibility":"list"}
+        ]}),
+    )
+    .await;
+    let error = client
+        .list_models()
+        .await
+        .expect_err("credential echo is never cached");
+    assert!(!error.to_string().contains(KEY));
+}
+
 fn anthropic_client(base_url: &str) -> CodewhaleClient {
     let mut client = CodewhaleClient::new(&Config {
         provider: Some("anthropic".into()),

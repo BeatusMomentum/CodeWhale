@@ -7304,7 +7304,8 @@ pub(crate) async fn run_chatgpt_pkce_login_from_tui(
         app.use_mouse_capture,
         app.use_bracketed_paste,
     )?;
-    let login_result = crate::oauth::login(crate::oauth::OAuthProvider::Chatgpt).await;
+    let login_result =
+        crate::oauth::login_with_config(crate::oauth::OAuthProvider::Chatgpt, config).await;
     resume_terminal(
         terminal,
         app.use_alt_screen(),

@@ -8,7 +8,7 @@ use codewhale_config::route::{
 use serde::Serialize;
 
 use crate::client::CodewhaleClient;
-use crate::codex_model_cache::{CodexModelCacheFreshness, model_roster};
+use crate::codex_model_cache::{CodexModelCacheFreshness, model_roster, model_roster_for};
 use crate::config::{
     ApiProvider, Config, KIMI_CODE_K3_CONTEXT_WINDOW_TOKENS, ProviderIdentity,
     is_exact_direct_moonshot_k3_route, is_exact_kimi_code_bare_k3_route,
@@ -349,27 +349,29 @@ fn classify_provider_route_preflight_next_step(
 ) -> Option<String> {
     let headless = surface == RouteErrorSurface::Headless;
     let lower = reason.to_ascii_lowercase();
-    if lower
-        .contains("codex oauth credentials are only available on the official openai codex route")
-    {
+    if lower.contains("chatgpt credentials are only available on the official public api route") {
         return Some(if headless {
             format!(
-                "Remove the custom base_url from [providers.{identity_key}]; Codex OAuth only works on the official route."
+                "Remove the custom base_url from [providers.{identity_key}]; ChatGPT plan access only works on the official public API route."
             )
         } else {
             format!(
-                "Run /provider setup {identity_key} and remove its custom base URL; Codex OAuth only works on the official route."
+                "Run /provider setup {identity_key} and remove its custom base URL; ChatGPT plan access only works on the official public API route."
             )
         });
     }
-    if lower.contains("openai codex oauth credentials are unavailable")
+    if lower.contains("sign in with chatgpt")
+        || lower.contains("chatgpt credentials")
+        || lower.contains("chatgpt grant")
+        || lower.contains("chatgpt registration")
+        || lower.contains("openai codex oauth credentials are unavailable")
         || lower.contains("codex access token")
     {
         return Some(if headless {
-            "Run `codewhale auth chatgpt` to Sign in with ChatGPT; Codex CLI import remains an explicit alternative.".to_string()
+            "Run `codewhale auth chatgpt` to Sign in with ChatGPT.".to_string()
         } else {
             format!(
-                "Run `codewhale auth chatgpt` or /provider setup {identity_key} to Sign in with ChatGPT; Codex CLI import remains an explicit alternative."
+                "Run `codewhale auth chatgpt` or /provider setup {identity_key} to Sign in with ChatGPT."
             )
         });
     }
@@ -925,7 +927,11 @@ pub(crate) fn resolve_runtime_route_for_identity(
     let roster_preferred = (provider == ApiProvider::OpenaiCodex
         && model_selector.is_none()
         && saved_provider_model.is_none())
-    .then(|| model_roster().preferred_model_id().map(str::to_string))
+    .then(|| {
+        model_roster_for(&route_config)
+            .preferred_model_id()
+            .map(str::to_string)
+    })
     .flatten();
     let model_selector = model_selector.or(roster_preferred.as_deref());
     let base_url = route_config.active_route_base_url();
@@ -1354,11 +1360,11 @@ mod tests {
             RouteErrorSurface::Interactive,
         );
         assert!(missing_formatted.contains(
-            "Next step: Run `codewhale auth chatgpt` or /provider setup openai-codex to Sign in with ChatGPT; Codex CLI import remains an explicit alternative."
+            "Next step: Run `codewhale auth chatgpt` or /provider setup openai-codex to Sign in with ChatGPT."
         ));
 
         let custom = anyhow::anyhow!(
-            "Codex OAuth credentials are only available on the official OpenAI Codex route"
+            "ChatGPT credentials are only available on the official public API route"
         );
         let custom_formatted = format_provider_route_preflight_error(
             "openai-codex",
@@ -1367,7 +1373,7 @@ mod tests {
             RouteErrorSurface::Interactive,
         );
         assert!(custom_formatted.contains(
-            "Next step: Run /provider setup openai-codex and remove its custom base URL; Codex OAuth only works on the official route."
+            "Next step: Run /provider setup openai-codex and remove its custom base URL; ChatGPT plan access only works on the official public API route."
         ));
     }
 
@@ -1395,7 +1401,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_route_uses_fresh_account_context_and_drops_api_only_limits() {
+    fn chatgpt_route_ignores_external_context_and_drops_api_only_limits() {
         let _lock = crate::test_support::lock_test_env();
         let codex_home = tempfile::tempdir().expect("Codex home");
         let _home = crate::test_support::EnvVarGuard::set("CODEX_HOME", codex_home.path());
@@ -1424,7 +1430,7 @@ mod tests {
         )
         .expect("Codex route");
 
-        assert_eq!(candidate.limits().context_tokens, Some(128_000));
+        assert_eq!(candidate.limits().context_tokens, None);
         assert_eq!(candidate.limits().input_tokens, None);
         assert_eq!(candidate.limits().output_tokens, None);
         assert_eq!(
@@ -1442,22 +1448,18 @@ mod tests {
         // #5034: switching to openai-codex with no saved model must land on
         // the roster's current flagship, not the static seed constant.
         let _lock = crate::test_support::lock_test_env();
-        let codex_home = tempfile::tempdir().expect("Codex home");
-        let _home = crate::test_support::EnvVarGuard::set("CODEX_HOME", codex_home.path());
-        std::fs::write(
-            codex_home.path().join("models_cache.json"),
-            serde_json::to_vec(&serde_json::json!({
-                "fetched_at": chrono::Utc::now(),
-                "models": [
-                    {"slug": "gpt-test-flagship", "priority": 1, "context_window": 256000},
-                    {"slug": crate::config::DEFAULT_OPENAI_CODEX_MODEL, "priority": 7}
-                ]
-            }))
-            .expect("serialize cache"),
+        let home = tempfile::tempdir().expect("Codewhale home");
+        let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", home.path());
+        let mut config = crate::config::Config::default();
+        crate::oauth::install_test_chatgpt_registration(&mut config).expect("owned grant");
+        crate::codex_model_cache::install_test_chatgpt_roster(
+            &config,
+            &[
+                "gpt-test-flagship",
+                crate::config::DEFAULT_OPENAI_CODEX_MODEL,
+            ],
         )
-        .expect("write cache");
-
-        let config = crate::config::Config::default();
+        .expect("account roster");
         let route = resolve_runtime_route(&config, ApiProvider::OpenaiCodex, None)
             .expect("codex route resolves");
         assert_eq!(route.model, "gpt-test-flagship");

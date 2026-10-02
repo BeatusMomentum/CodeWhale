@@ -52,7 +52,7 @@ pub use user_constitution::{
     UserConstitution, UserConstitutionLoad,
 };
 pub use xai_credentials::{
-    CHATGPT_OAUTH_GENERATION_PREFIX, CHATGPT_OAUTH_GENERATION_SUFFIX,
+    CHATGPT_HOST_FILE_NAME, CHATGPT_OAUTH_GENERATION_PREFIX, CHATGPT_OAUTH_GENERATION_SUFFIX,
     LEGACY_CHATGPT_OAUTH_FILE_NAME, LEGACY_XAI_OAUTH_FILE_NAME, XAI_OAUTH_GENERATION_PREFIX,
     XAI_OAUTH_GENERATION_SUFFIX, XaiOAuthCredentialStore, XaiOAuthRevocation,
     chatgpt_oauth_generation_path, clear_all_chatgpt_oauth_credentials,

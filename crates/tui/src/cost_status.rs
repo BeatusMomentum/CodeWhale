@@ -194,7 +194,14 @@ impl EffectiveRouteEnvelope {
         let model = model.into();
         let billing = config.map_or_else(
             || crate::route_billing::for_endpoint_without_config(provider, base_url),
-            |config| crate::route_billing::for_route(config, provider),
+            |config| {
+                base_url.map_or_else(
+                    || crate::route_billing::for_route(config, provider),
+                    |endpoint| {
+                        crate::route_billing::for_route_with_endpoint(config, provider, endpoint)
+                    },
+                )
+            },
         );
         let endpoint_fingerprint = base_url.and_then(endpoint_fingerprint);
         let provider_live_pricing = base_url.and_then(|base_url| {

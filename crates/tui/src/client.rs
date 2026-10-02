@@ -225,6 +225,8 @@ pub struct AvailableModel {
     pub id: String,
     pub owned_by: Option<String>,
     pub created: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
 }
 
 /// Request payload for Xiaomi MiMo speech synthesis models.
@@ -371,23 +373,12 @@ const ALLOW_INSECURE_HTTP_ENV: &str = "CODEWHALE_ALLOW_INSECURE_HTTP";
 /// Legacy alias for [`ALLOW_INSECURE_HTTP_ENV`].
 const LEGACY_ALLOW_INSECURE_HTTP_ENV: &str = "DEEPSEEK_ALLOW_INSECURE_HTTP";
 
-fn client_user_agent(api_provider: ApiProvider) -> &'static str {
-    // The ChatGPT Codex backend is the sole route with a documented
-    // compatibility exception. Kimi Code, including K3, must keep the normal
-    // Codewhale identity rather than impersonating a Kimi CLI.
-    if api_provider == ApiProvider::OpenaiCodex {
-        concat!(
-            "codex_cli_rs/0.137.0 (CodeWhale ",
-            env!("CARGO_PKG_VERSION"),
-            ")"
-        )
-    } else {
-        concat!(
-            "Mozilla/5.0 (compatible; codewhale/",
-            env!("CARGO_PKG_VERSION"),
-            "; +https://github.com/Hmbown/CodeWhale)"
-        )
-    }
+fn client_user_agent(_api_provider: ApiProvider) -> &'static str {
+    concat!(
+        "Mozilla/5.0 (compatible; codewhale/",
+        env!("CARGO_PKG_VERSION"),
+        "; +https://github.com/Hmbown/CodeWhale)"
+    )
 }
 
 /// Upper bound on a single sleep inside the provider-wide rate-limit pause
@@ -988,7 +979,7 @@ impl From<CatalogRefreshError> for ModelsFetchError {
 // fields that the existing typed provider parsers reject.
 #[derive(Deserialize)]
 struct ModelsPage<'a> {
-    #[serde(borrow)]
+    #[serde(borrow, alias = "models")]
     data: &'a serde_json::value::RawValue,
     #[serde(default)]
     has_more: bool,
@@ -1591,50 +1582,44 @@ impl CodewhaleClient {
             Some(&base_url),
         )
         .map(str::to_string);
-        let billing_mode = crate::route_billing::for_route(config, api_provider).into();
+        let billing_mode =
+            crate::route_billing::for_route_with_endpoint(config, api_provider, &base_url).into();
+        if api_provider == ApiProvider::OpenaiCodex {
+            anyhow::ensure!(
+                !reqwest::Url::parse(&base_url)
+                    .ok()
+                    .is_some_and(|url| url.host_str() == Some("chatgpt.com")),
+                "The legacy ChatGPT backend route is retired. Use https://api.openai.com/v1 and run codewhale auth chatgpt."
+            );
+        }
         if api_provider == ApiProvider::OpencodeGo {
             validate_route(api_provider, &default_model).map_err(anyhow::Error::msg)?;
         }
+        anyhow::ensure!(
+            api_provider != ApiProvider::OpenaiCodex
+                || crate::pricing::is_official_chatgpt_api(&base_url)
+                || config.provider_uses_custom_endpoint(ApiProvider::OpenaiCodex),
+            "Refusing to send an official ChatGPT grant to a different endpoint"
+        );
         // Plan-limit guidance names the account whose credential this client
-        // actually sends, taken from that credential, never from config.
+        // actually sends, taken from that credential in the same read.
         let ((api_key, api_key_source), codex_account_id, subscription_limit_guidance) =
-            if api_provider == ApiProvider::OpenaiCodex {
-                // The official endpoint requires Codex OAuth credentials. A custom
-                // endpoint prefers its own configured key, but an explicit
-                // `OPENAI_CODEX_ACCESS_TOKEN` still wins (`codex_credentials`
-                // checks env before enforcing the official-endpoint consent
-                // grant), so existing token-plus-custom-base-url setups keep
-                // working. Only when no env token exists does the custom endpoint
-                // fall back to the generic provider-scoped key resolver.
-                match config.codex_credentials() {
-                    Ok(credentials) => {
-                        // A process token outranks every sign-in, so
-                        // re-running the login would not switch accounts.
-                        let guidance = crate::oauth::credentials_from_env().is_none().then(|| {
-                            crate::oauth::usage_limit_guidance(
-                                crate::oauth::OAuthProvider::Chatgpt,
-                                credentials.account_label.as_deref(),
-                            )
-                        });
-                        (
-                            (credentials.access_token, "Codex OAuth login".to_string()),
-                            credentials.account_id,
-                            guidance,
-                        )
-                    }
-                    Err(error) => {
-                        if config.provider_uses_custom_endpoint(ApiProvider::OpenaiCodex) {
-                            (config.active_route_api_key_with_source()?, None, None)
-                        } else {
-                            return Err(error);
-                        }
-                    }
-                }
+            if api_provider == ApiProvider::OpenaiCodex
+                && crate::pricing::is_official_chatgpt_api(&base_url)
+            {
+                let credentials = config.codex_credentials()?;
+                let guidance = crate::oauth::usage_limit_guidance(
+                    crate::oauth::OAuthProvider::Chatgpt,
+                    credentials.account_label.as_deref(),
+                );
+                (
+                    (credentials.access_token, "ChatGPT sign-in".to_string()),
+                    credentials.account_id,
+                    Some(guidance),
+                )
             } else {
                 // Only the resolver's xAI OAuth step carries a sign-in; an
-                // `auth_mode = "oauth"` route that fell through to an API key
-                // gets no sign-in guidance. The label comes from the
-                // credential this client sends, in the same read.
+                // OAuth mode that fell through to an API key names no account.
                 let (resolved, xai_sign_in) = config.active_route_api_key_with_xai_sign_in()?;
                 let guidance = xai_sign_in.map(|label| {
                     crate::oauth::usage_limit_guidance(
@@ -2765,11 +2750,7 @@ impl CodewhaleClient {
                     body["model"] = json!(model);
                 }
                 let is_codex = self.api_provider == ApiProvider::OpenaiCodex;
-                let url = if is_codex {
-                    format!("{}{}", self.base_url, responses::CODEX_RESPONSES_PATH)
-                } else {
-                    responses_api_url(&self.base_url, self.api_provider)
-                };
+                let url = responses_api_url(&self.base_url, self.api_provider);
                 let shape = if is_codex {
                     RouteShape::CodexResponses
                 } else if self.api_provider == ApiProvider::OpencodeZen {
@@ -3179,13 +3160,29 @@ impl CodewhaleClient {
             .models_document(ModelsRequestMode::Interactive)
             .await
             .map_err(ModelsFetchError::into_interactive)?;
-        let models = parse_models_response(&body)
+        let models = parse_models_response_for_provider(&body, self.api_provider)
             .map(|models| apply_provider_model_cutline(self.api_provider, models))
             .map_err(|_| {
                 ModelsFetchError::Catalog(CatalogRefreshError::InvalidResponse).into_interactive()
             })?;
         if tokio::time::Instant::now() >= deadline {
             return Err(ModelsFetchError::Catalog(CatalogRefreshError::Network).into_interactive());
+        }
+        if self.api_provider == ApiProvider::OpenaiCodex
+            && models.iter().any(|model| {
+                self.model_bound_secret_values.iter().any(|secret| {
+                    !secret.is_empty()
+                        && (model.id.contains(secret.as_str())
+                            || model
+                                .display_name
+                                .as_deref()
+                                .is_some_and(|name| name.contains(secret.as_str())))
+                })
+            })
+        {
+            return Err(
+                ModelsFetchError::Catalog(CatalogRefreshError::InvalidResponse).into_interactive(),
+            );
         }
         Ok(models)
     }
@@ -3372,7 +3369,8 @@ impl CodewhaleClient {
         } else {
             let models = apply_provider_model_cutline(
                 self.api_provider,
-                parse_models_response(&body).map_err(|_| CatalogRefreshError::InvalidResponse)?,
+                parse_models_response_for_provider(&body, self.api_provider)
+                    .map_err(|_| CatalogRefreshError::InvalidResponse)?,
             );
             if models.is_empty() {
                 return Err(CatalogRefreshError::EmptyList);
@@ -4339,6 +4337,53 @@ struct BasetenArchitecture {
     output_modalities: Option<Vec<String>>,
 }
 
+fn parse_models_response_for_provider(
+    payload: &str,
+    provider: ApiProvider,
+) -> Result<Vec<AvailableModel>> {
+    if provider != ApiProvider::OpenaiCodex {
+        return parse_models_response(payload);
+    }
+    #[derive(Deserialize)]
+    struct Roster {
+        models: Vec<Row>,
+    }
+    #[derive(Deserialize)]
+    struct Row {
+        slug: String,
+        display_name: String,
+        visibility: String,
+    }
+    let roster: Roster = serde_json::from_str(payload).context("Invalid ChatGPT model roster")?;
+    anyhow::ensure!(
+        roster.models.len() <= PROVIDER_CATALOG_MAX_ROWS,
+        "ChatGPT model roster exceeds row limit"
+    );
+    let mut seen = std::collections::HashSet::new();
+    let mut models = Vec::new();
+    for row in roster.models {
+        if row.visibility != "list" {
+            continue;
+        }
+        anyhow::ensure!(
+            crate::provider_lake::valid_catalog_model_id(&row.slug)
+                && !row.display_name.trim().is_empty()
+                && row.display_name.len() <= 256
+                && !row.display_name.chars().any(char::is_control),
+            "Invalid ChatGPT model row"
+        );
+        if seen.insert(row.slug.clone()) {
+            models.push(AvailableModel {
+                id: row.slug,
+                display_name: Some(row.display_name),
+                owned_by: None,
+                created: None,
+            });
+        }
+    }
+    Ok(models)
+}
+
 pub(crate) fn parse_models_response(payload: &str) -> Result<Vec<AvailableModel>> {
     let parsed: ModelsListResponse =
         serde_json::from_str(payload).context("Failed to parse model list JSON")?;
@@ -4350,6 +4395,7 @@ pub(crate) fn parse_models_response(payload: &str) -> Result<Vec<AvailableModel>
             id: item.id,
             owned_by: item.owned_by,
             created: item.created,
+            display_name: None,
         })
         .collect::<Vec<_>>();
     models.sort_by(|a, b| a.id.cmp(&b.id));
@@ -8086,7 +8132,10 @@ mod tests {
             guided.contains("ChatGPT account a@example.com (plus)"),
             "{guided}"
         );
-        assert!(guided.contains("`codewhale auth chatgpt`"), "{guided}");
+        assert!(
+            guided.contains("CODEWHALE_CHATGPT_NEW_ACCOUNT=1 codewhale auth chatgpt"),
+            "{guided}"
+        );
         assert!(!guided.contains("or-quota-key-1234567890"), "{guided}");
         // Ordinary rate limits stay retryable and unannotated.
         let rate = client.http_error_with_route_context(429, "Too Many Requests", None);
@@ -8137,12 +8186,10 @@ mod tests {
         )
     }
 
-    /// #6715 review: plan-limit guidance names the account whose credential
-    /// this client sends. An unusable Codewhale-owned ChatGPT sign-in falls
-    /// through to the consented Codex CLI file, so the guidance names that
-    /// file's account and never the owned one.
+    /// The official ChatGPT route names the selected owned grant even when a
+    /// legacy external login is present and consented for import.
     #[test]
-    fn codex_quota_guidance_names_the_consented_import_that_sent_the_request() {
+    fn chatgpt_quota_guidance_names_owned_grant_and_ignores_legacy_import() {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let _env = crate::test_support::lock_test_env();
         let home = tempfile::tempdir().expect("temp home");
@@ -8150,49 +8197,26 @@ mod tests {
         let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", &root);
         let _access = crate::test_support::EnvVarGuard::remove("OPENAI_CODEX_ACCESS_TOKEN");
         let _legacy_access = crate::test_support::EnvVarGuard::remove("CODEX_ACCESS_TOKEN");
-        // Expired access token and no refresh token: the owned sign-in is
-        // unusable, so the runtime falls through to the consented import.
-        let generation = "chatgpt-auth-0123456789abcdef0123456789abcdef.json";
-        let owned = json!({
-            format!(
-                "{}::{}",
-                crate::oauth::CHATGPT_OAUTH_ISSUER,
-                crate::oauth::CHATGPT_OAUTH_CLIENT_ID
-            ): {
-                "access_token": "owned-stale-access",
-                "expires_at": "2000-01-01T00:00:00Z",
-                "id_token": test_id_token("owned@example.com"),
-            }
-        });
-        codewhale_config::with_xai_oauth_lifecycle_lock(|store| {
-            store.write(generation, owned.to_string().as_bytes(), false)
-        })
-        .expect("seed owned generation");
-        let path = root.join("auth.json");
-        let token = crate::test_support::future_test_jwt("codex-cli");
+        let path = root.join("legacy-auth.json");
         std::fs::write(
             &path,
-            serde_json::to_vec(&json!({
-                "tokens": {
-                    "access_token": token.clone(),
-                    "id_token": test_id_token("codex-cli@example.com"),
-                }
-            }))
-            .expect("serialize fixture"),
+            serde_json::to_vec(&json!({"tokens": {
+                "access_token": crate::test_support::future_test_jwt("legacy-import"),
+                "id_token": test_id_token("legacy@example.com"),
+            }}))
+            .unwrap(),
         )
-        .expect("write fixture");
+        .unwrap();
         let _auth_path = crate::test_support::EnvVarGuard::set("OPENAI_CODEX_AUTH_FILE", &path);
-        let config = Config {
+        let mut config = Config {
             provider: Some(ApiProvider::OpenaiCodex.as_str().to_string()),
             providers: Some(ProvidersConfig {
                 openai_codex: ProviderConfig {
-                    auth_mode: Some("oauth".to_string()),
-                    oauth_credential_generation: Some(generation.to_string()),
                     external_credentials: Some(
                         codewhale_config::ExternalCredentialConsentToml::read_only(
                             codewhale_config::ProviderKind::OpenaiCodex,
                             codewhale_config::ExternalCredentialSource::CodexCli,
-                            path.clone(),
+                            path,
                         ),
                     ),
                     ..ProviderConfig::default()
@@ -8201,17 +8225,42 @@ mod tests {
             }),
             ..Config::default()
         };
-        let client = CodewhaleClient::new(&config).expect("Codex client");
-        assert_eq!(client.api_key, token);
-        let guidance = client
-            .subscription_limit_guidance
-            .as_deref()
-            .expect("sign-in guidance");
         assert!(
-            guidance.contains("ChatGPT account codex-cli@example.com"),
+            CodewhaleClient::new(&config).is_err(),
+            "an import cannot authorize the official route"
+        );
+        let config_path = root.join("config.toml");
+        std::fs::write(&config_path, "").unwrap();
+        // Stored verified-grant fixture; OAuth signature validation has its
+        // own signed-token boundary tests.
+        crate::oauth::activate_login(
+            crate::oauth::pending_login_with_id_token_for_test(
+                crate::oauth::OAuthProvider::Chatgpt,
+                "own-verified-access",
+                "own-verified-refresh",
+                Some(&test_id_token("owned@example.com")),
+            ),
+            Some(&config_path),
+            Some(&mut config),
+        )
+        .unwrap();
+        let client = CodewhaleClient::new(&config).expect("official owned ChatGPT client");
+        assert_eq!(client.api_key, "own-verified-access");
+        let guidance = client.subscription_limit_guidance.as_deref().unwrap();
+        assert!(
+            guidance.contains("ChatGPT account owned@example.com"),
             "{guidance}"
         );
-        assert!(!guidance.contains("owned@example.com"), "{guidance}");
+        assert!(!guidance.contains("legacy@example.com"), "{guidance}");
+        let error = client.http_error_with_route_context(
+            429,
+            r#"{"error":{"code":"subscription_sharing_usage_limit_exceeded"}}"#,
+            None,
+        );
+        assert!(matches!(error, LlmError::QuotaExhausted(_)));
+        assert!(!error.is_retryable());
+        assert!(error.to_string().contains("owned@example.com"));
+        assert!(!error.to_string().contains("own-verified-access"));
     }
 
     /// An xAI OAuth route names the signed-in account from the credential
@@ -8332,11 +8381,9 @@ mod tests {
         assert!(!guidance.contains(&token), "{guidance}");
     }
 
-    /// A process token outranks every ChatGPT sign-in, so re-running the
-    /// login would not change the account that sent the request: no
-    /// guidance, even when a Codewhale-owned sign-in exists.
+    /// Ambient legacy process tokens cannot authorize the official route.
     #[test]
-    fn codex_process_token_gets_no_sign_in_guidance() {
+    fn chatgpt_process_token_cannot_replace_owned_grant_or_account_guidance() {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let _env = crate::test_support::lock_test_env();
         let home = tempfile::tempdir().expect("temp home");
@@ -8345,20 +8392,16 @@ mod tests {
         let token = crate::test_support::future_test_jwt("process-token");
         let _access = crate::test_support::EnvVarGuard::set("OPENAI_CODEX_ACCESS_TOKEN", &token);
         let _legacy_access = crate::test_support::EnvVarGuard::remove("CODEX_ACCESS_TOKEN");
-        let config = Config {
+        let mut config = Config {
             provider: Some(ApiProvider::OpenaiCodex.as_str().to_string()),
-            providers: Some(ProvidersConfig {
-                openai_codex: ProviderConfig {
-                    auth_mode: Some("oauth".to_string()),
-                    ..ProviderConfig::default()
-                },
-                ..ProvidersConfig::default()
-            }),
             ..Config::default()
         };
-        let client = CodewhaleClient::new(&config).expect("Codex client");
-        assert_eq!(client.api_key, token);
-        assert_eq!(client.subscription_limit_guidance, None);
+        assert!(CodewhaleClient::new(&config).is_err());
+        let own = crate::oauth::install_test_chatgpt_registration(&mut config).unwrap();
+        let client = CodewhaleClient::new(&config).expect("official ChatGPT client");
+        assert_eq!(client.api_key, own);
+        assert_ne!(client.api_key, token);
+        assert!(client.subscription_limit_guidance.is_some());
     }
 
     fn concentrate_client(server: &MockServer, model: &str) -> CodewhaleClient {
@@ -9139,64 +9182,60 @@ mod tests {
     ];
 
     #[test]
-    fn codex_client_uses_one_coherent_external_credential_snapshot() {
+    fn chatgpt_client_rejects_external_tokens_and_uses_its_owned_grant() {
         let _env = crate::test_support::lock_test_env();
         let temp = tempfile::tempdir().expect("credential fixture");
-        let path = temp
-            .path()
-            .canonicalize()
-            .expect("canonical temp root")
-            .join("auth.json");
-        let token_a = crate::test_support::future_test_jwt("a");
-        std::fs::write(
-            &path,
-            serde_json::to_vec(&serde_json::json!({
-                "tokens": {"access_token": token_a.clone(), "account_id": "account-a"}
-            }))
-            .expect("serialize fixture"),
-        )
-        .expect("write fixture");
-        let _auth_path = crate::test_support::EnvVarGuard::set("OPENAI_CODEX_AUTH_FILE", &path);
-        let _access = crate::test_support::EnvVarGuard::remove("OPENAI_CODEX_ACCESS_TOKEN");
-        let _legacy_access = crate::test_support::EnvVarGuard::remove("CODEX_ACCESS_TOKEN");
-        let config = Config {
-            provider: Some(ApiProvider::OpenaiCodex.as_str().to_string()),
-            providers: Some(ProvidersConfig {
-                openai_codex: ProviderConfig {
-                    auth_mode: Some("oauth".to_string()),
-                    external_credentials: Some(
-                        codewhale_config::ExternalCredentialConsentToml::read_only(
-                            codewhale_config::ProviderKind::OpenaiCodex,
-                            codewhale_config::ExternalCredentialSource::CodexCli,
-                            path.clone(),
-                        ),
-                    ),
-                    ..ProviderConfig::default()
-                },
-                ..ProvidersConfig::default()
-            }),
+        let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", temp.path());
+        let _ambient =
+            crate::test_support::EnvVarGuard::set("OPENAI_CODEX_ACCESS_TOKEN", "external-token");
+        let mut config = Config {
+            provider: Some("openai-codex".to_string()),
             ..Config::default()
         };
-
         crate::external_credentials::reset_side_effect_trap();
-        let client = CodewhaleClient::new(&config).expect("Codex client");
-        assert_eq!(client.api_key, token_a);
-        assert_eq!(client.codex_account_id.as_deref(), Some("account-a"));
+        assert!(CodewhaleClient::new(&config).is_err());
+        let token = crate::oauth::install_test_chatgpt_registration(&mut config)
+            .expect("owned registration");
+        let client = CodewhaleClient::new(&config).expect("official ChatGPT client");
+        assert_eq!(client.api_key, token);
+        assert_eq!(client.base_url, "https://api.openai.com/v1");
         assert_eq!(
-            crate::external_credentials::side_effect_trap_counts(),
-            (1, 1),
-            "bearer and account id must come from one secure open/read"
+            crate::external_credentials::complete_side_effect_trap_counts(),
+            (0, 0, 0, 0, 0)
         );
+    }
 
-        // An owner rotation after construction cannot splice account B into
-        // the already-resolved bearer snapshot.
-        std::fs::write(
-            &path,
-            serde_json::to_string(&serde_json::json!({"tokens": {"access_token": crate::test_support::future_test_jwt("b"), "account_id": "account-b"}})).expect("serialize rotated fixture"),
+    #[test]
+    fn chatgpt_roster_preserves_visible_account_order_and_labels() {
+        let roster = parse_models_response_for_provider(
+            r#"{"models":[
+            {"slug":"gpt-z","display_name":"GPT Z","visibility":"list"},
+            {"slug":"gpt-hidden","display_name":"Hidden","visibility":"hidden"},
+            {"slug":"gpt-a","display_name":"GPT A","visibility":"list"},
+            {"slug":"gpt-z","display_name":"Duplicate","visibility":"list"}
+        ]}"#,
+            ApiProvider::OpenaiCodex,
         )
-        .expect("rotate fixture");
-        assert_eq!(client.api_key, token_a);
-        assert_eq!(client.codex_account_id.as_deref(), Some("account-a"));
+        .expect("roster");
+        assert_eq!(
+            roster.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+            ["gpt-z", "gpt-a"]
+        );
+        assert_eq!(roster[0].display_name.as_deref(), Some("GPT Z"));
+        assert!(
+            parse_models_response_for_provider(
+                r#"{"data":[{"id":"gpt-z"}]}"#,
+                ApiProvider::OpenaiCodex
+            )
+            .is_err()
+        );
+        assert!(
+            parse_models_response_for_provider(
+                r#"{"models":[{"slug":"gpt-bad\n","display_name":"Bad","visibility":"list"}]}"#,
+                ApiProvider::OpenaiCodex
+            )
+            .is_err()
+        );
     }
 
     fn client_with_config_secret_sentinels() -> CodewhaleClient {
@@ -12946,12 +12985,14 @@ mod tests {
                 AvailableModel {
                     id: "deepseek-v4-flash".to_string(),
                     owned_by: None,
-                    created: None
+                    created: None,
+                    display_name: None
                 },
                 AvailableModel {
                     id: "deepseek-v4-pro".to_string(),
                     owned_by: Some("deepseek".to_string()),
-                    created: Some(1)
+                    created: Some(1),
+                    display_name: None
                 }
             ]
         );

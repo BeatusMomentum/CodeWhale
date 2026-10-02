@@ -9156,7 +9156,9 @@ async fn run_xai_device_auth(config_path: Option<&Path>) -> Result<()> {
 }
 
 async fn run_chatgpt_pkce_auth(config_path: Option<&Path>) -> Result<()> {
-    let pending = crate::oauth::login(crate::oauth::OAuthProvider::Chatgpt).await?;
+    let config = Config::load(config_path.map(Path::to_path_buf), None)?;
+    let pending =
+        crate::oauth::login_with_config(crate::oauth::OAuthProvider::Chatgpt, &config).await?;
     let activation = crate::oauth::activate_login(pending, config_path, None)?;
     println!("{}", activation.summary(codewhale_localization::Locale::En));
     if let Some(warning) = activation.env_override_warning(codewhale_localization::Locale::En) {
@@ -9168,8 +9170,19 @@ async fn run_chatgpt_pkce_auth(config_path: Option<&Path>) -> Result<()> {
         codewhale_config::quote_os_path(&activation.config_path)
     );
     println!(
-        "To switch accounts later, run `codewhale auth chatgpt` again (or `/auth chatgpt` in Codewhale) and choose the other account. Restart open Codewhale sessions after a shell login."
+        "To switch ChatGPT accounts or workspaces, run `CODEWHALE_CHATGPT_NEW_ACCOUNT=1 codewhale auth chatgpt` in a shell and restart open Codewhale sessions. `/auth chatgpt` reauthorizes the selected account."
     );
+    let mut selected = Config::load(config_path.map(Path::to_path_buf), None)?;
+    selected.provider = Some(ApiProvider::OpenaiCodex.as_str().to_string());
+    match crate::codex_model_cache::update_from_chatgpt(&selected).await {
+        Ok(roster) => println!(
+            "{} ChatGPT models available. Use `codewhale models --provider openai-codex` to list them.",
+            roster.models.len()
+        ),
+        Err(_) => println!(
+            "Sign-in is saved. Model discovery is unavailable; retry `codewhale models --update --provider openai-codex`."
+        ),
+    }
     Ok(())
 }
 

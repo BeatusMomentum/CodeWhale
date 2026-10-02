@@ -22,6 +22,8 @@ pub const LEGACY_XAI_OAUTH_FILE_NAME: &str = "xai-auth.json";
 pub const CHATGPT_OAUTH_GENERATION_PREFIX: &str = "chatgpt-auth-";
 pub const CHATGPT_OAUTH_GENERATION_SUFFIX: &str = ".json";
 pub const LEGACY_CHATGPT_OAUTH_FILE_NAME: &str = "chatgpt-oauth.json";
+/// Stable local host and registration metadata, retained across token logout.
+pub const CHATGPT_HOST_FILE_NAME: &str = "chatgpt-host.json";
 const XAI_OAUTH_LIFECYCLE_LOCK_FILE_NAME: &str = ".xai-oauth.lock";
 const XAI_OAUTH_FILE_LIMIT: u64 = 1024 * 1024;
 
@@ -554,6 +556,7 @@ fn validate_owned_auth_name(name: &str) -> Result<()> {
     anyhow::ensure!(
         name == LEGACY_XAI_OAUTH_FILE_NAME
             || name == LEGACY_CHATGPT_OAUTH_FILE_NAME
+            || name == CHATGPT_HOST_FILE_NAME
             || is_valid_xai_oauth_generation(name)
             || is_valid_chatgpt_oauth_generation(name),
         "invalid Codewhale-owned OAuth basename"
@@ -1794,11 +1797,15 @@ mod tests {
         store.write(chatgpt, b"chatgpt", false).expect("chatgpt");
         store.write(xai, b"xai", false).expect("xai");
         store
+            .write(CHATGPT_HOST_FILE_NAME, b"host", false)
+            .expect("host");
+        store
             .write(LEGACY_CHATGPT_OAUTH_FILE_NAME, b"legacy", false)
             .expect("legacy chatgpt");
 
         assert_eq!(store.clear_chatgpt().expect("clear chatgpt"), 2);
         assert!(directory.join(xai).exists());
+        assert!(directory.join(CHATGPT_HOST_FILE_NAME).exists());
         assert!(!directory.join(chatgpt).exists());
         assert!(!directory.join(LEGACY_CHATGPT_OAUTH_FILE_NAME).exists());
     }

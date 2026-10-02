@@ -3833,6 +3833,24 @@ async fn apply_codewhale_owned_login(
         }
     }
 
+    if provider == ApiProvider::OpenaiCodex {
+        let mut selected = config.clone();
+        selected.provider = Some(provider.as_str().to_string());
+        if crate::codex_model_cache::update_from_chatgpt(&selected)
+            .await
+            .is_err()
+        {
+            app.push_status_toast(
+                format!(
+                    "{}  codewhale models --update --provider openai-codex",
+                    app.tr(MessageId::ProviderNoCatalogModels)
+                ),
+                StatusToastLevel::Warning,
+                Some(App::STICKY_ERROR_TTL_MS),
+            );
+            return false;
+        }
+    }
     switch_provider(app, engine_handle, config, provider, None).await
 }
 

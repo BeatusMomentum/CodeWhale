@@ -11075,7 +11075,7 @@ fn codex_external_credentials_are_disabled_by_default_and_managed_fails_before_i
     let error = disabled
         .active_route_api_key()
         .expect_err("external credentials default to disabled");
-    assert!(error.to_string().contains("are disabled"));
+    assert!(error.to_string().contains("Sign in with ChatGPT"));
     assert_eq!(disabled.codex_account_id(), None);
     assert_eq!(
         crate::external_credentials::side_effect_trap_counts(),
@@ -11105,11 +11105,7 @@ fn codex_external_credentials_are_disabled_by_default_and_managed_fails_before_i
     let error = managed
         .active_route_api_key()
         .expect_err("managed access needs a preservation adapter");
-    assert!(
-        error
-            .to_string()
-            .contains("schema-safe preservation adapter")
-    );
+    assert!(error.to_string().contains("Sign in with ChatGPT"));
     assert_eq!(
         crate::external_credentials::side_effect_trap_counts(),
         (0, 0)
@@ -11192,10 +11188,10 @@ fn codex_read_only_consent_reads_exact_file_without_mutation() -> Result<()> {
     );
 
     crate::external_credentials::reset_side_effect_trap();
-    assert_eq!(config.active_route_api_key()?, token);
+    assert!(config.active_route_api_key().is_err());
     assert_eq!(
         crate::external_credentials::side_effect_trap_counts(),
-        (1, 1)
+        (0, 0)
     );
     assert_eq!(fs::read_to_string(&auth_path)?, raw);
     assert_eq!(fs::read_to_string(&ambient_decoy)?, ambient_decoy_raw);
@@ -11203,12 +11199,12 @@ fn codex_read_only_consent_reads_exact_file_without_mutation() -> Result<()> {
     drop(_access);
     let _process_access = EnvVarGuard::set("OPENAI_CODEX_ACCESS_TOKEN", "process-token");
     crate::external_credentials::reset_side_effect_trap();
-    assert_eq!(config.active_route_api_key()?, "process-token");
+    assert!(config.active_route_api_key().is_err());
     assert_eq!(config.codex_account_id(), None);
     assert_eq!(
         crate::external_credentials::side_effect_trap_counts(),
         (0, 0),
-        "process-scoped Codex auth must not be mixed with external-file metadata"
+        "external tokens must never substitute for Codewhale-issued plan access"
     );
     Ok(())
 }
@@ -15278,21 +15274,21 @@ fn legacy_config(body: &str) -> Config {
 }
 
 #[test]
-fn official_codex_host_on_the_legacy_root_belongs_to_codex_in_both_crates() -> Result<()> {
+fn official_chatgpt_api_on_legacy_root_belongs_to_chatgpt_in_both_crates() -> Result<()> {
     // The config crate always let Codex read an official Codex endpoint from
     // the top level; the TUI refused it. One rule now: it is Codex's (#6394).
-    let body = "provider = \"openai-codex\"\nbase_url = \"https://chatgpt.com/backend-api\"\n";
+    let body = "provider = \"openai-codex\"\nbase_url = \"https://api.openai.com/v1\"\n";
     let config = legacy_config(body);
     assert_eq!(
         config
             .provider_config_for(ApiProvider::OpenaiCodex)
             .and_then(|entry| entry.base_url.as_deref()),
-        Some("https://chatgpt.com/backend-api")
+        Some("https://api.openai.com/v1")
     );
     let store = codewhale_config::parse_config_toml(body)?;
     assert_eq!(
         store.providers.openai_codex.base_url.as_deref(),
-        Some("https://chatgpt.com/backend-api")
+        Some("https://api.openai.com/v1")
     );
     assert!(store.providers.deepseek.base_url.is_none());
     Ok(())

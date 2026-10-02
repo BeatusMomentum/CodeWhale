@@ -92,6 +92,24 @@ pub(crate) fn resolve_credential_source_with(
         return CredentialResolution::found(CredentialSource::AuthModeNone);
     }
 
+    // The public ChatGPT API accepts only Codewhale's own issued registration.
+    // Environment tokens and consented Codex files belong to different clients.
+    if provider == ApiProvider::OpenaiCodex && !config.provider_uses_custom_endpoint(provider) {
+        if let Some(sign_in) =
+            crate::oauth::usable_sign_in(crate::oauth::OAuthProvider::Chatgpt, config)
+        {
+            return CredentialResolution::found(CredentialSource::OAuth {
+                flow: "ChatGPT".to_string(),
+                account: sign_in.account_label,
+            });
+        }
+        probed.push(CredentialProbe::with_fix(
+            "Codewhale-owned ChatGPT sign-in",
+            "codewhale auth chatgpt",
+        ));
+        return CredentialResolution::missing(probed);
+    }
+
     if provider == config.api_provider()
         && !provider_uses_oauth_credentials(config, provider)
         && explicit_cli_api_key_override().is_some()
@@ -135,36 +153,6 @@ pub(crate) fn resolve_credential_source_with(
             "codewhale auth set --provider moonshot",
         ));
         return CredentialResolution::missing(probed);
-    }
-    if provider == ApiProvider::OpenaiCodex && !config.provider_uses_custom_endpoint(provider) {
-        if let Some(sign_in) =
-            crate::oauth::usable_sign_in(crate::oauth::OAuthProvider::Chatgpt, config)
-        {
-            return CredentialResolution::found(CredentialSource::OAuth {
-                flow: "ChatGPT".to_string(),
-                account: sign_in.account_label,
-            });
-        }
-        probed.push(CredentialProbe::with_fix(
-            "Codewhale-owned ChatGPT sign-in",
-            "codewhale auth chatgpt",
-        ));
-        // Token env overrides are checked above. An external Codex login is
-        // considered only after exact read-only consent has been validated.
-        match resolve_external_grant(
-            config,
-            provider,
-            codewhale_config::ExternalCredentialSource::CodexCli,
-            "Codex CLI",
-            "codewhale auth external-consent --provider openai-codex --mode read-only",
-            crate::oauth::stored_credentials_present,
-        ) {
-            Ok(source) => return CredentialResolution::found(source),
-            Err(probe) => {
-                probed.push(probe);
-                return CredentialResolution::missing(probed);
-            }
-        }
     }
     if provider == ApiProvider::Xai
         && !config.provider_uses_custom_endpoint(provider)
@@ -521,8 +509,8 @@ mod tests {
         assert!(!has_api_key_for(&config, ApiProvider::OpenaiCodex));
         let checked = resolution.checked_places();
         assert!(
-            checked.contains("no read-only consent recorded"),
-            "the probe explains the missing consent without an existence claim: {checked}"
+            checked.contains("Codewhale-owned ChatGPT sign-in"),
+            "the probe names the owned connection without accessing external state: {checked}"
         );
         assert!(
             !checked.contains("(absent)") && !checked.contains("present, not consented"),
@@ -541,7 +529,7 @@ mod tests {
     /// and resolves as *missing* rather than masquerading as a stored
     /// credential. No write, refresh, or network side effect is permitted.
     #[test]
-    fn consented_external_resolution_validates_the_exact_consented_file() {
+    fn chatgpt_resolution_does_not_import_even_consented_external_files() {
         let _lock = lock_test_env();
         let temp = tempfile::tempdir().expect("external fixture");
         let codex_path = temp
@@ -582,20 +570,20 @@ mod tests {
         assert!(
             resolution
                 .checked_places()
-                .contains("consented, but no usable credential in that file"),
-            "the probe names the consented-read outcome: {}",
+                .contains("Codewhale-owned ChatGPT sign-in"),
+            "the probe requires Codewhale sign-in despite external consent: {}",
             resolution.checked_places()
         );
         assert_eq!(
             crate::external_credentials::complete_side_effect_trap_counts(),
-            (1, 0, 0, 0, 0),
-            "one secure open attempt of the exact consented path; NotFound stops before the read"
+            (0, 0, 0, 0, 0),
+            "external consent cannot authorize the public ChatGPT API"
         );
         assert!(!has_api_key_for(&config, ApiProvider::OpenaiCodex));
         assert_eq!(
             crate::external_credentials::complete_side_effect_trap_counts(),
-            (2, 0, 0, 0, 0),
-            "has_api_key_for re-resolves through the same consented read; still no write/refresh/network"
+            (0, 0, 0, 0, 0),
+            "has_api_key_for never reads another client credential"
         );
     }
 }
