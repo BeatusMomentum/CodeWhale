@@ -85,43 +85,58 @@ pub(super) async fn admit_root(
 ) -> RegisterResult {
     let result = async {
         params.check_spec()?;
-        if !params.spec.description.is_empty() { return Err("skill root has no description".to_string()); }
+        if !params.spec.description.is_empty() {
+            return Err("skill root has no description".to_string());
+        }
         let relative = root_path(&params.spec.name)?;
-        if tier != HostTier::Plugin { return Err("skill roots require a reviewed plugin bundle".to_string()); }
-        if cx.cancel.is_cancelled() { return Err("skill root admission cancelled".to_string()); }
-        let permit = tokio::select! {
-            _ = cx.cancel.cancelled() => return Err("skill root admission cancelled".to_string()),
-            permit = Arc::clone(&shared.skill_admission).acquire_owned() => permit.map_err(|_| "skill admission is unavailable".to_string())?,
-        };
-        shared.live_host(tier, |registry| {
-            registry.authority_for(&params.owner).ok_or_else(|| "stale or unknown skill owner".to_string())?;
-            Ok(params.owner.clone())
-        }).await?;
-        let authority = shared.registry.lock().expect("registry lock").authority_for(&params.owner)
-            .ok_or_else(|| "skill owner was withdrawn".to_string())?;
-        let policy = super::activation::extension_host_policy_enabled();
-        #[cfg(test)]
-        let env_scope = crate::test_support::env_scope_ticket();
-        let work = tokio::task::spawn_blocking(move || {
-            #[cfg(test)]
-            let _env_scope = crate::test_support::join_env_scope(env_scope);
-            // The permit stays with the blocking job after an RPC timeout;
-            // dropping its JoinHandle cannot unleash more concurrent parsers.
-            let _permit = permit;
-            let _policy = crate::plugins::activation::PolicyScope::propagate(policy);
-            crate::plugins::discovery::load_staged_skill_root_snapshots(&authority, &relative)
-        });
-        let snapshots = tokio::select! {
-            _ = cx.cancel.cancelled() => return Err("skill root admission cancelled".to_string()),
-            result = work => result.map_err(|e| format!("skill snapshot check failed: {e}"))??,
-        };
+        if tier != HostTier::Plugin {
+            return Err("skill roots require a reviewed plugin bundle".to_string());
+        }
+        let authority = shared
+            .live_owner_authority(tier, |registry| {
+                registry
+                    .authority_for(&params.owner)
+                    .ok_or_else(|| "stale or unknown skill owner".to_string())?;
+                Ok(params.owner.clone())
+            })?
+            .ok_or_else(|| "skill owner has no reviewed authority".to_string())?;
+        let snapshots =
+            bounded_root_check(Arc::clone(&shared.skill_admission), &cx.cancel, move || {
+                // One permit covers every disk check, including the Native receipt
+                // phase; cancellation never leaves that phase outside the bound.
+                crate::plugins::registry::verify_plugin_component_authority(
+                    &authority,
+                    PluginActivationCapability::Native,
+                )?;
+                let snapshots = crate::plugins::discovery::load_staged_skill_root_snapshots(
+                    &authority, &relative,
+                )?;
+                crate::plugins::registry::verify_plugin_component_authority(
+                    &authority,
+                    PluginActivationCapability::Native,
+                )?;
+                Ok(snapshots)
+            })
+            .await?;
+        shared
+            .ready_host(tier)
+            .map_err(|status| status.to_string())?;
         let runtime = shared.tier_runtime(tier);
         let _slot = runtime.host.lock().expect("host lock");
-        if runtime.host_generation.load(Ordering::SeqCst) != host_generation || cx.cancel.is_cancelled() {
-            return Err("skill root host generation changed or admission was cancelled".to_string());
+        if runtime.host_generation.load(Ordering::SeqCst) != host_generation
+            || cx.cancel.is_cancelled()
+        {
+            return Err(
+                "skill root host generation changed or admission was cancelled".to_string(),
+            );
         }
-        shared.registry.lock().expect("registry lock").register_skill_root(&params, snapshots, host_generation)
-    }.await;
+        shared
+            .registry
+            .lock()
+            .expect("registry lock")
+            .register_skill_root(&params, snapshots, host_generation)
+    }
+    .await;
     match result {
         Ok(handle) => RegisterResult::Admitted { handle },
         Err(refused) => {
@@ -131,6 +146,40 @@ pub(super) async fn admit_root(
             );
             RegisterResult::Refused { refused }
         }
+    }
+}
+
+/// Every Native root disk phase uses this job. Its permit belongs to the
+/// blocking closure, so RPC cancellation or abandonment cannot release it
+/// until receipt validation and parsing actually stop.
+async fn bounded_root_check<T: Send + 'static>(
+    admission: Arc<tokio::sync::Semaphore>,
+    cancel: &tokio_util::sync::CancellationToken,
+    check: impl FnOnce() -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    if cancel.is_cancelled() {
+        return Err("skill root admission cancelled".to_string());
+    }
+    let permit = tokio::select! {
+        _ = cancel.cancelled() => return Err("skill root admission cancelled".to_string()),
+        permit = admission.acquire_owned() => permit.map_err(|_| "skill admission is unavailable".to_string())?,
+    };
+    if cancel.is_cancelled() {
+        return Err("skill root admission cancelled".to_string());
+    }
+    let policy = super::activation::extension_host_policy_enabled();
+    #[cfg(test)]
+    let env_scope = crate::test_support::env_scope_ticket();
+    let work = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        #[cfg(test)]
+        let _env_scope = crate::test_support::join_env_scope(env_scope);
+        let _policy = crate::plugins::activation::PolicyScope::propagate(policy);
+        check()
+    });
+    tokio::select! {
+        _ = cancel.cancelled() => Err("skill root admission cancelled".to_string()),
+        result = work => result.map_err(|error| format!("skill snapshot check failed: {error}"))?,
     }
 }
 
@@ -274,6 +323,78 @@ mod tests {
             body,
             path: PathBuf::from(format!("/staged/skills/{name}/SKILL.md")),
             source_hash: "0".repeat(64),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_native_root_disk_job_keeps_admission_permit_until_completion() {
+        // Exercise the production helper for both cooperative cancellation and
+        // a channel abandoning its handler. A blocked first disk phase cannot
+        // release its permit or start another queued check in either case.
+        for abandon_handler in [false, true] {
+            let admission = Arc::new(tokio::sync::Semaphore::new(1));
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let (entered, started) = tokio::sync::oneshot::channel();
+            let (release, wait) = std::sync::mpsc::channel();
+            let running_admission = Arc::clone(&admission);
+            let running_cancel = cancel.clone();
+            let running = tokio::spawn(async move {
+                bounded_root_check(running_admission, &running_cancel, move || {
+                    let _ = entered.send(());
+                    wait.recv().map_err(|error| error.to_string())?;
+                    Ok(7)
+                })
+                .await
+            });
+            started.await.unwrap();
+            if abandon_handler {
+                running.abort();
+                assert!(running.await.unwrap_err().is_cancelled());
+            } else {
+                cancel.cancel();
+                assert!(running.await.unwrap().unwrap_err().contains("cancelled"));
+            }
+            assert_eq!(
+                admission.available_permits(),
+                0,
+                "cancelled handler must not release the live disk job's permit"
+            );
+            let queued_cancel = tokio_util::sync::CancellationToken::new();
+            let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let queued_ran = Arc::clone(&ran);
+            let queued_admission = Arc::clone(&admission);
+            let queued_token = queued_cancel.clone();
+            let queued = tokio::spawn(async move {
+                bounded_root_check(queued_admission, &queued_token, move || {
+                    queued_ran.store(true, Ordering::SeqCst);
+                    Ok(9)
+                })
+                .await
+            });
+            tokio::task::yield_now().await;
+            queued_cancel.cancel();
+            assert!(queued.await.unwrap().is_err());
+            assert!(
+                !ran.load(Ordering::SeqCst),
+                "a cancelled queued check never enters the blocking pool"
+            );
+            release.send(()).unwrap();
+            let resumed = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                bounded_root_check(
+                    Arc::clone(&admission),
+                    &tokio_util::sync::CancellationToken::new(),
+                    || Ok(11),
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                resumed, 11,
+                "completed disk work releases admission for the next live owner"
+            );
+            assert_eq!(admission.available_permits(), 1);
         }
     }
 
@@ -481,7 +602,7 @@ mod tests {
 
     fn parser_bundle(skills: usize, bytes: usize) -> (tempfile::TempDir, PluginAuthority) {
         let temp = tempfile::tempdir().unwrap();
-        std::fs::write(temp.path().join("plugin.json"), r#"{"name":"bounded-skills","version":"0.1.0","description":"bounded fixture","extensions":{"net.codewhale":{"native":{"path":"index.mjs"}}}}"#).unwrap();
+        std::fs::write(temp.path().join("plugin.json"), r#"{"$schema":"https://agent-plugins.org/schemas/plugin.json","name":"bounded-skills","version":"0.1.0","description":"bounded fixture","extensions":{"net.codewhale":{"native":{"path":"index.mjs"}}}}"#).unwrap();
         std::fs::write(
             temp.path().join("index.mjs"),
             "export function apply() {}\n",
@@ -628,11 +749,11 @@ mod tests {
         let _policy = TestPolicyGuard::extension_host(true);
         let fixture = FixturePlugins::new(&["skills-root"]).await;
         let plugins = fixture.registry();
+        let plugin = plugins.get("skills-root").unwrap();
+        assert_eq!(plugin.inventory.skills, 0);
         assert!(
-            !plugins
-                .get("skills-root")
-                .unwrap()
-                .component_active(PluginActivationCapability::Skills)
+            plugin.skill_snapshots.is_empty(),
+            "fixture has no declarative Skill adapter snapshots"
         );
         let manager = fixture.manager(node);
         let _manager = super::super::TestManagerGuard::install(Arc::clone(&manager));
@@ -722,7 +843,31 @@ mod tests {
             .unwrap();
         manager.shutdown().await;
         assert!(provenance.verify(fixture.workspace()).is_err());
+        let id = plugins.get("skills-root").unwrap().id.as_str();
+        assert!(matches!(
+            manager.owner_state(id),
+            Some(super::super::registry::OwnerState::Failed(_))
+        ));
         engine.sync().await.unwrap();
+        assert!(
+            manager
+                .shared
+                .registry
+                .lock()
+                .unwrap()
+                .live_skill_roots()
+                .is_empty(),
+            "unchanged failed activations require an explicit retry"
+        );
+        manager.retry();
+        engine.sync().await.unwrap();
+        assert_eq!(
+            manager.owner_state(id),
+            Some(super::super::registry::OwnerState::Active),
+            "owner: {:?}; diagnostics: {:?}",
+            manager.owner_report(id),
+            manager.diagnostics()
+        );
         assert!(
             provenance.verify(fixture.workspace()).is_err(),
             "restart must not revive old handles"
@@ -734,7 +879,13 @@ mod tests {
         );
         let current = current
             .get("skills-root:quick-check")
-            .unwrap()
+            .unwrap_or_else(|| {
+                panic!(
+                    "Native root missing after explicit retry; owner: {:?}; diagnostics: {:?}",
+                    manager.owner_report(id),
+                    manager.diagnostics()
+                )
+            })
             .source
             .provenance()
             .unwrap();

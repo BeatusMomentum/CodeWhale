@@ -726,28 +726,24 @@ impl ManagerShared {
         }
     }
 
-    /// Re-check everything a call depends on, immediately before it is sent:
-    /// a running host of the owner's tier (first, so a call to a host that is
-    /// down says why), exact owner generation on that tier, for a plugin the
-    /// reviewed receipt and staged bytes and the Native adapter in this
-    /// build's policy (a built-in module has no receipt: its source was
-    /// checked against the Rust table's digest when it activated), and the
-    /// host again.
+    /// The shared fast liveness guard: current policy, running host, exact
+    /// owner generation/tier and its reviewed authority. `live_host` follows
+    /// with Native receipt validation and another host check; root admission
+    /// uses the same authority inside its one bounded blocking disk job.
     ///
     /// `owner_if_live` runs under the registry lock and names the owner
     /// generation the call belongs to, or why it is no longer registered.
-    async fn live_host(
+    fn live_owner_authority(
         &self,
         tier: HostTier,
         owner_if_live: impl FnOnce(&OwnerRegistry) -> Result<OwnerRef, String>,
-    ) -> Result<Arc<HostProcess>, String> {
-        let policy = activation::extension_host_policy_enabled();
-        if !policy {
+    ) -> Result<Option<PluginAuthority>, String> {
+        if !activation::extension_host_policy_enabled() {
             return Err(host_down(tier, &HostStatus::Disabled));
         }
         self.ready_host(tier)
             .map_err(|status| host_down(tier, &status))?;
-        let authority = {
+        {
             let registry = self.registry.lock().expect("registry lock");
             let owner = owner_if_live(&registry)?;
             let owner_tier = registry
@@ -762,11 +758,20 @@ impl ManagerShared {
                 ));
             }
             match (tier, registry.authority_for(&owner)) {
-                (HostTier::Plugin, Some(authority)) => Some(authority),
-                (HostTier::Builtin, None) => None,
-                _ => return Err("extension owner has no authority".to_string()),
+                (HostTier::Plugin, Some(authority)) => Ok(Some(authority)),
+                (HostTier::Builtin, None) => Ok(None),
+                _ => Err("extension owner has no authority".to_string()),
             }
-        };
+        }
+    }
+
+    async fn live_host(
+        &self,
+        tier: HostTier,
+        owner_if_live: impl FnOnce(&OwnerRegistry) -> Result<OwnerRef, String>,
+    ) -> Result<Arc<HostProcess>, String> {
+        let policy = activation::extension_host_policy_enabled();
+        let authority = self.live_owner_authority(tier, owner_if_live)?;
         if let Some(authority) = authority {
             #[cfg(test)]
             let env_scope = crate::test_support::env_scope_ticket();
