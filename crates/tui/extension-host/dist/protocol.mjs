@@ -130,7 +130,7 @@ var SHAPES = {
   },
   RegisterParams: {
     strict: true,
-    required: { owner: { ref: "OwnerRef" }, kind: { enum: ["tool", "command", "hook", "prompt_section"] }, spec: { ref: "RegisterSpecWire" } },
+    required: { owner: { ref: "OwnerRef" }, kind: { enum: ["tool", "command", "hook", "prompt_section", "skill_root"] }, spec: { ref: "RegisterSpecWire" } },
     optional: {}
   },
   RegisterSpecWire: {
@@ -281,7 +281,7 @@ function validateMessage(value, direction, tier, methods = METHODS) {
     }
     if (method === "registry/register") {
       const { kind, spec: spec2 } = params;
-      const reason = kind === "tool" && spec2.input_schema == null ? "a tool registration needs `spec.input_schema`" : kind === "tool" && spec2.argument_hint != null ? "a tool registration has no `spec.argument_hint`" : kind === "command" && spec2.input_schema != null ? "a command registration has no `spec.input_schema`" : (kind === "hook" || kind === "prompt_section") && (spec2.input_schema != null || spec2.argument_hint != null) ? "a hook or prompt registration has no input schema or argument hint" : void 0;
+      const reason = kind === "tool" && spec2.input_schema == null ? "a tool registration needs `spec.input_schema`" : kind === "tool" && spec2.argument_hint != null ? "a tool registration has no `spec.argument_hint`" : kind === "command" && spec2.input_schema != null ? "a command registration has no `spec.input_schema`" : (kind === "hook" || kind === "prompt_section" || kind === "skill_root") && (spec2.input_schema != null || spec2.argument_hint != null) ? "a hook, prompt or skill root registration has no input schema or argument hint" : void 0;
       if (reason !== void 0) throw new ProtocolError(`${method}: ${reason}`);
     }
     return value;

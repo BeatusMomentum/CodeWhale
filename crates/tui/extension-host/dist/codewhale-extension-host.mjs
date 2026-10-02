@@ -4329,7 +4329,7 @@ var SHAPES = {
   },
   RegisterParams: {
     strict: true,
-    required: { owner: { ref: "OwnerRef" }, kind: { enum: ["tool", "command", "hook", "prompt_section"] }, spec: { ref: "RegisterSpecWire" } },
+    required: { owner: { ref: "OwnerRef" }, kind: { enum: ["tool", "command", "hook", "prompt_section", "skill_root"] }, spec: { ref: "RegisterSpecWire" } },
     optional: {}
   },
   RegisterSpecWire: {
@@ -4480,7 +4480,7 @@ function validateMessage(value, direction, tier, methods = METHODS) {
     }
     if (method === "registry/register") {
       const { kind, spec: spec2 } = params;
-      const reason = kind === "tool" && spec2.input_schema == null ? "a tool registration needs `spec.input_schema`" : kind === "tool" && spec2.argument_hint != null ? "a tool registration has no `spec.argument_hint`" : kind === "command" && spec2.input_schema != null ? "a command registration has no `spec.input_schema`" : (kind === "hook" || kind === "prompt_section") && (spec2.input_schema != null || spec2.argument_hint != null) ? "a hook or prompt registration has no input schema or argument hint" : void 0;
+      const reason = kind === "tool" && spec2.input_schema == null ? "a tool registration needs `spec.input_schema`" : kind === "tool" && spec2.argument_hint != null ? "a tool registration has no `spec.argument_hint`" : kind === "command" && spec2.input_schema != null ? "a command registration has no `spec.input_schema`" : (kind === "hook" || kind === "prompt_section" || kind === "skill_root") && (spec2.input_schema != null || spec2.argument_hint != null) ? "a hook, prompt or skill root registration has no input schema or argument hint" : void 0;
       if (reason !== void 0) throw new ProtocolError(`${method}: ${reason}`);
     }
     return value;
@@ -4712,18 +4712,19 @@ function describeError(error) {
   return error instanceof Error ? `${error.name}: ${error.message}` : String(error);
 }
 var OwnedRegistrations = class {
+  /** Admitted entries by core handle. */
+  byHandle = /* @__PURE__ */ new Map();
+  rpc;
+  kind;
+  /** The owner's own index of this kind, for the leak report at deactivation. */
+  ownedBy;
+  warn;
   constructor(rpc2, kind, ownedBy, warn) {
     this.rpc = rpc2;
     this.kind = kind;
     this.ownedBy = ownedBy;
     this.warn = warn;
   }
-  rpc;
-  kind;
-  ownedBy;
-  warn;
-  /** Admitted entries by core handle. */
-  byHandle = /* @__PURE__ */ new Map();
   /** Called inside the owner's effect; returns the effect's cleanup. */
   add(entry, spec) {
     const owner = entry.owner;
@@ -5123,6 +5124,65 @@ function createStorage({ dataDir, isActive, onWarning }) {
   });
 }
 
+// src/shims/skills.ts
+var MAX_SKILL_ROOTS_PER_OWNER = 8;
+var MAX_SKILL_ROOTS_PER_HOST = 64;
+function normalizeSkillRoot(value) {
+  if (typeof value !== "object" || value === null || Array.isArray(value) || Object.keys(value).some((key) => key !== "path")) throw new TypeError("skill root supports only path");
+  const { path } = value;
+  if (typeof path !== "string" || !path || Buffer.byteLength(path, "utf8") > 512 || /[\\:\u0000-\u001f\u007f-\u009f]/u.test(path) || path.split("/").some((part) => !part || part === "." || part === "..")) {
+    throw new TypeError("skill root path must be a bounded bundle-relative path with normal slash-separated components");
+  }
+  return Object.freeze({ path });
+}
+var SkillRoots = class {
+  registrations;
+  owners = /* @__PURE__ */ new Map();
+  count = 0;
+  constructor(rpc2, ownedBy, warn) {
+    this.registrations = new OwnedRegistrations(rpc2, "skill_root", ownedBy, warn);
+  }
+  register(owner, definition) {
+    if (owner.state !== "activating" && owner.state !== "active") throw new Error("skill owner is not live");
+    const { path } = normalizeSkillRoot(definition);
+    const roots = this.owners.get(owner) ?? /* @__PURE__ */ new Map();
+    if (roots.has(path)) throw new Error("skill root is already registered; dispose it before registering it again");
+    if (roots.size >= MAX_SKILL_ROOTS_PER_OWNER || this.count >= MAX_SKILL_ROOTS_PER_HOST) throw new RangeError("skill root owner or host registration limit reached");
+    const undo = this.registrations.add({ owner, name: path, disposed: false }, { name: path, description: "" });
+    const dispose = () => {
+      if (roots.get(path) !== dispose) return;
+      roots.delete(path);
+      this.count--;
+      if (!roots.size) this.owners.delete(owner);
+      undo();
+    };
+    roots.set(path, dispose);
+    this.owners.set(owner, roots);
+    this.count++;
+    return dispose;
+  }
+  forget(owner) {
+    for (const dispose of [...this.owners.get(owner)?.values() ?? []]) dispose();
+    this.registrations.forget(owner);
+  }
+};
+function defineSkillsService(host2) {
+  class SkillsShim extends Service {
+    constructor(ctx) {
+      super(ctx, "skills");
+    }
+    registerRoot(definition) {
+      const ctx = this.ctx;
+      const owner = host2.ownerOf(ctx);
+      if (!owner) throw new Error("skills.registerRoot called outside an extension owner");
+      const root = normalizeSkillRoot(definition);
+      return ctx.effect(() => host2.skillRoots.register(owner, root), `skills.registerRoot(${JSON.stringify(root.path)})`);
+    }
+  }
+  Object.freeze(SkillsShim.prototype);
+  return SkillsShim;
+}
+
 // src/tier.ts
 var HOST_OWNER_PREFIX = "host:";
 var TIERS = ["plugin", "builtin"];
@@ -5261,7 +5321,7 @@ var REFUSED_SERVICES = /* @__PURE__ */ new Set([
   "skills",
   "logger"
 ]);
-var PROVIDED_SERVICES = /* @__PURE__ */ new Set(["tools", "commands", "prompt", "storage", "logger", "events", "reflect", "registry"]);
+var PROVIDED_SERVICES = /* @__PURE__ */ new Set(["tools", "commands", "prompt", "storage", "skills", "logger", "events", "reflect", "registry"]);
 var ACTIVATE_DEADLINE_MS = 5e3;
 var DISPOSE_DEADLINE_MS = 2e3;
 var ownerStorage = new AsyncLocalStorage();
@@ -5305,6 +5365,11 @@ var HostRoot = class {
     this.promptSections = new PromptSections(
       rpc2,
       (owner) => owner.promptSections,
+      (message, owner) => this.log("warn", message, owner)
+    );
+    this.skillRoots = new SkillRoots(
+      rpc2,
+      (owner) => owner.skillRoots,
       (message, owner) => this.log("warn", message, owner)
     );
     root.on("internal/listener", function(name, callback, options) {
@@ -5363,6 +5428,7 @@ var HostRoot = class {
       ownerOf: (ctx) => ctx[OWNER],
       promptSections: this.promptSections
     });
+    const SkillsShim = defineSkillsService({ ownerOf: (ctx) => ctx[OWNER], skillRoots: this.skillRoots });
     class StorageShim extends Service {
       constructor(ctx) {
         super(ctx, "storage");
@@ -5391,10 +5457,12 @@ var HostRoot = class {
     shimClasses.set("commands", CommandsShim);
     shimClasses.set("prompt", PromptShim);
     shimClasses.set("storage", StorageShim);
+    shimClasses.set("skills", SkillsShim);
     root.plugin(ToolsShim);
     root.plugin(CommandsShim);
     root.plugin(PromptShim);
     root.plugin(StorageShim);
+    root.plugin(SkillsShim);
   }
   rpc;
   tier;
@@ -5404,6 +5472,7 @@ var HostRoot = class {
   commandRegistrations;
   hookRegistrations;
   promptSections;
+  skillRoots;
   log(level, msg, owner) {
     const params = { level, msg: msg.slice(0, 8192) };
     if (owner) params.plugin_id = owner.ref.plugin_id;
@@ -5461,6 +5530,7 @@ var HostRoot = class {
       commands: /* @__PURE__ */ new Map(),
       hooks: /* @__PURE__ */ new Map(),
       promptSections: /* @__PURE__ */ new Map(),
+      skillRoots: /* @__PURE__ */ new Map(),
       entries: /* @__PURE__ */ new Set(),
       ...params.data_dir === void 0 ? {} : { dataDir: params.data_dir },
       state: "activating"
@@ -5502,6 +5572,7 @@ var HostRoot = class {
     } catch (error) {
       owner.state = "failed";
       await this.disposeOwner(owner).catch(() => void 0);
+      this.skillRoots.forget(owner);
       this.owners.delete(key);
       return { status: "failed", diagnostic: describeError2(error) };
     }
@@ -5530,7 +5601,8 @@ var HostRoot = class {
       ...[...owner.tools.values()].map((tool) => `tool:${tool.name}`),
       ...[...owner.commands.values()].map((command) => `command:${command.name}`),
       ...[...owner.hooks.values()].map((hook) => `hook:${hook.name}`),
-      ...[...owner.promptSections.values()].map((section) => `prompt_section:${section.name}`)
+      ...[...owner.promptSections.values()].map((section) => `prompt_section:${section.name}`),
+      ...[...owner.skillRoots.values()].map((root) => `skill_root:${root.name}`)
     ];
     for (const fiber of owner.fibers) {
       for (const effect of fiber.getEffects?.() ?? []) leaked.push(`effect:${effect.label}`);
@@ -5539,6 +5611,7 @@ var HostRoot = class {
     this.commandRegistrations.forget(owner);
     this.hookRegistrations.forget(owner);
     this.promptSections.forget(owner);
+    this.skillRoots.forget(owner);
     this.owners.delete(ref.owner_token);
     return { disposed, leaked };
   }
