@@ -19,6 +19,12 @@ export interface LocalPromptSection<O extends OwnerBase = OwnerBase> extends Own
   definition: PromptSectionDefinition
 }
 
+interface PromptReservation<O extends OwnerBase> {
+  entry: LocalPromptSection<O>
+  bytes: number
+  dispose: () => void
+}
+
 /** Copy plain text now; mutating the author's object cannot change an admitted section. */
 export function normalizePromptSection(value: unknown): PromptSectionDefinition {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) {
@@ -46,7 +52,7 @@ export function normalizePromptSection(value: unknown): PromptSectionDefinition 
 /** Reserve pending registrations too, so a burst cannot bypass byte/count limits. */
 export class PromptSections<O extends OwnerBase> {
   private readonly registrations: OwnedRegistrations<O, LocalPromptSection<O>>
-  private readonly owners = new Map<O, Map<string, { entry: LocalPromptSection<O>; bytes: number; dispose: () => void }>>()
+  private readonly owners = new Map<O, Map<string, PromptReservation<O>>>()
   private bytes = 0
   private count = 0
 
@@ -57,7 +63,7 @@ export class PromptSections<O extends OwnerBase> {
   register(owner: O, definition: PromptSectionDefinition): () => void {
     if (owner.state !== 'activating' && owner.state !== 'active') throw new Error('prompt owner is not live')
     const section = normalizePromptSection(definition)
-    const sections = this.owners.get(owner) ?? new Map()
+    const sections = this.owners.get(owner) ?? new Map<string, PromptReservation<O>>()
     if (sections.has(section.id)) throw new Error(`prompt section "${section.id}" is already registered; dispose it before registering it again`)
     const bytes = Buffer.byteLength(section.text, 'utf8')
     const ownerBytes = [...sections.values()].reduce((sum, item) => sum + item.bytes, 0)
@@ -69,7 +75,7 @@ export class PromptSections<O extends OwnerBase> {
     }
     const entry: LocalPromptSection<O> = { owner, name: section.id, definition: section, disposed: false }
     const undo = this.registrations.add(entry, { name: section.id, description: section.text })
-    const record = { entry, bytes, dispose: () => {
+    const record: PromptReservation<O> = { entry, bytes, dispose: () => {
       if (sections.get(section.id) !== record) return
       sections.delete(section.id)
       this.bytes -= bytes
