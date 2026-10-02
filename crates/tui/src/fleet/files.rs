@@ -172,6 +172,12 @@ impl WorkspaceFile {
         self.open_with_flags(libc::O_RDONLY)
     }
 
+    /// Reads a file another process may hold open for writing. Unix opens do
+    /// not exclude writers, so this is [`Self::open_file`].
+    pub(crate) fn open_file_shared(&self) -> io::Result<File> {
+        self.open_file()
+    }
+
     pub(crate) fn open_write(&self, append: bool) -> io::Result<File> {
         self.open_with_flags(
             libc::O_WRONLY | libc::O_CREAT | if append { libc::O_APPEND } else { 0 },
@@ -479,18 +485,33 @@ impl WorkspaceFile {
     }
 
     pub(crate) fn open_update(&self, create: bool, append: bool) -> io::Result<File> {
-        self.open_with_access(create, append, true)
+        self.open_with_access(create, append, true, true)
     }
 
     pub(crate) fn open_write(&self, append: bool) -> io::Result<File> {
-        self.open_with_access(true, append, false)
+        self.open_with_access(true, append, false, true)
     }
 
-    fn open_with_access(&self, create: bool, append: bool, read: bool) -> io::Result<File> {
+    /// Reads a file another process may hold open for writing (a running
+    /// worker's log). [`Self::open_file`] denies concurrent writers, so it
+    /// fails with a sharing violation while the writer is alive; this opens
+    /// read-only with full sharing and applies the same regular, unlinked
+    /// checks to the handle.
+    pub(crate) fn open_file_shared(&self) -> io::Result<File> {
+        self.open_with_access(false, false, true, false)
+    }
+
+    fn open_with_access(
+        &self,
+        create: bool,
+        append: bool,
+        read: bool,
+        write: bool,
+    ) -> io::Result<File> {
         use std::os::windows::fs::OpenOptionsExt;
         let file = std::fs::OpenOptions::new()
             .read(read)
-            .write(true)
+            .write(write)
             .append(append)
             .create(create)
             .truncate(false)
@@ -886,6 +907,9 @@ impl WorkspaceFile {
         unreachable!()
     }
     pub(crate) fn open_file(&self) -> io::Result<File> {
+        unreachable!()
+    }
+    pub(crate) fn open_file_shared(&self) -> io::Result<File> {
         unreachable!()
     }
     pub(crate) fn publish(&self, _: &[u8]) -> io::Result<()> {

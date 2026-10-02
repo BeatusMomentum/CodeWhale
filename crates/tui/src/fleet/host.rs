@@ -827,7 +827,8 @@ fn open_worker_log(workspace: &Path, path: &Path) -> FleetHostResult<File> {
 }
 
 fn read_bounded_log(workspace: &Path, path: &Path, max_bytes: usize) -> FleetHostResult<String> {
-    let mut file = crate::fs_confined::open_read(workspace, path).map_err(|err| {
+    // The worker may still hold its log open for writing.
+    let mut file = crate::fs_confined::open_read_shared(workspace, path).map_err(|err| {
         FleetHostError::retryable(format!("opening worker log {}: {err}", path.display()))
     })?;
     let len = file
