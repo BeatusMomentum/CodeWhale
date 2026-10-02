@@ -2054,7 +2054,7 @@ pub(crate) fn official_chatgpt_registration(config: &Config) -> Result<ChatgptRe
             .provider_config_for(OAuthProvider::Chatgpt.api())
             .and_then(|entry| entry.auth_mode.as_deref())
             == Some("oauth"),
-        "The selected ChatGPT route does not use an official OAuth grant"
+        "Sign in with ChatGPT using `codewhale auth chatgpt`; the selected route has no official OAuth grant"
     );
     let path = configured_owned_auth_file_path(OAuthProvider::Chatgpt, config)?
         .context("Sign in with ChatGPT using `codewhale auth chatgpt`")?;

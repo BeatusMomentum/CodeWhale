@@ -9225,8 +9225,13 @@ mod tests {
         };
         crate::external_credentials::reset_side_effect_trap();
         assert!(CodewhaleClient::new(&config).is_err());
+        assert_eq!(
+            crate::external_credentials::complete_side_effect_trap_counts(),
+            (0, 0, 0, 0, 0)
+        );
         let token = crate::oauth::install_test_chatgpt_registration(&mut config)
             .expect("owned registration");
+        crate::external_credentials::reset_side_effect_trap();
         let client = CodewhaleClient::new(&config).expect("official ChatGPT client");
         assert_eq!(client.api_key, token);
         assert_eq!(client.base_url, "https://api.openai.com/v1");

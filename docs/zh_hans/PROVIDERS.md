@@ -74,7 +74,9 @@ codewhale --provider openai-codex
 
 这是面向本地开源应用的预览集成，不读取 ChatGPT 对话历史。请求使用 `store: false` 和 `stream: true`，会话历史由 Codewhale 保存。此路由不支持 OpenAI 托管的图像生成、文件搜索、Code Interpreter、原生电脑操作、MCP/连接器或 Responses `tool_search`；Codewhale 自己的工具使用受支持的函数调用。参见[预览限制](https://developers.openai.com/siwc/token-sharing-open-source/preview-limitations)。付费或远程托管应用需要走[商业合作申请流程](https://openai.com/form/sign-in-with-chatgpt-interest/)；完成本地集成不代表已获得商业批准。
 
-规范的提供商 ID 是 `ProviderKind::ALL`（`crates/config/src/provider_kind.rs`）的 46 个条目，按该顺序排列：
+ChatGPT 预览版一次只请求一个函数调用。
+
+规范的提供商 ID 是 `ProviderKind::ALL`（`crates/config/src/provider_kind.rs`）的全部条目，按该顺序排列：
 
 `deepseek`, `nvidia-nim`, `openai`, `atlascloud`, `wanjie-ark`, `volcengine`,
 `openrouter`, `orcarouter`, `xiaomi-mimo`, `novita`, `fireworks`, `siliconflow`, `arcee`,

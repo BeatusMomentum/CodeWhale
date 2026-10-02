@@ -161,6 +161,7 @@ to ChatGPT conversation history. Requests stream with `store: false` and
 OpenAI-hosted image generation, file search, Code Interpreter, native computer
 use, hosted MCP/connectors, and Responses `tool_search` are unavailable on this
 route; Codewhale's own tools use supported function/custom tool calls.
+The ChatGPT preview requests one function call at a time.
 See [preview limitations](https://developers.openai.com/siwc/token-sharing-open-source/preview-limitations).
 Paid or remotely hosted applications require the
 [commercial partner interest process](https://openai.com/form/sign-in-with-chatgpt-interest/);

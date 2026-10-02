@@ -1070,11 +1070,11 @@ window is a hard override and renders as `configured` (or
 `configured (per-model)`) with no marker.
 
 Output ceilings follow the same rule (#5440): an Anthropic-family model the
-catalog does not describe keeps the 64K Messages floor as its clamp, and the
-ChatGPT/Codex OAuth route keeps its long-standing 4K policy, but receipts and
-pickers label those numbers `unverified` (or an "assumed floor") instead of
-`documented`. Clamping to a defensible floor is a product choice; presenting
-it as a documented fact is not.
+catalog does not describe keeps the 64K Messages floor as its clamp, labeled
+`unverified` (or an "assumed floor") instead of `documented`. The official
+ChatGPT plan preview does not accept `max_output_tokens`; Codewhale sends no
+output-token cap on that route. A local request budget is not an upstream
+limit or a guarantee about the completed response length.
 
 There is no environment variable for the context window; the provider-table
 `context_window` and per-model `model_context_windows` keys are the user

@@ -9173,7 +9173,7 @@ async fn run_chatgpt_pkce_auth(config_path: Option<&Path>) -> Result<()> {
         "To switch ChatGPT accounts or workspaces, run `CODEWHALE_CHATGPT_NEW_ACCOUNT=1 codewhale auth chatgpt` in a shell and restart open Codewhale sessions. `/auth chatgpt` reauthorizes the selected account."
     );
     let mut selected = Config::load(config_path.map(Path::to_path_buf), None)?;
-    selected.provider = Some(ApiProvider::OpenaiCodex.as_str().to_string());
+    selected.provider = Some(config::ApiProvider::OpenaiCodex.as_str().to_string());
     match crate::codex_model_cache::update_from_chatgpt(&selected).await {
         Ok(roster) => println!(
             "{} ChatGPT models available. Use `codewhale models --provider openai-codex` to list them.",
@@ -9188,7 +9188,7 @@ async fn run_chatgpt_pkce_auth(config_path: Option<&Path>) -> Result<()> {
 
 fn run_chatgpt_pkce_revoke(config_path: Option<&Path>) -> Result<()> {
     crate::oauth::revoke_owned_login(crate::oauth::OAuthProvider::Chatgpt, config_path, None)?;
-    println!("Revoked Codewhale-owned ChatGPT tokens. Codex CLI consent is unchanged.");
+    println!("Removed Codewhale's saved ChatGPT sign-in.");
     Ok(())
 }
 
