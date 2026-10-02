@@ -134,6 +134,7 @@ impl ChildBillingProvenance {
 #[cfg(test)]
 fn static_subscription_label(label: &str) -> Option<&'static str> {
     Some(match label {
+        "ChatGPT plan allowance" => "ChatGPT plan allowance",
         "Codex OAuth quota" => "Codex OAuth quota",
         "OpenCode Go quota" => "OpenCode Go quota",
         "Z.ai Coding Plan quota" => "Z.ai Coding Plan quota",
@@ -233,11 +234,23 @@ pub enum RouteProduct {
 #[must_use]
 pub fn for_route(config: &Config, provider: ApiProvider) -> BillingPresentation {
     let base_url = config.base_url_for_route(provider);
+    for_route_with_endpoint(config, provider, &base_url)
+}
+
+/// Capture billing from the concrete endpoint the client will dispatch on.
+/// Candidate-selected endpoints can differ from the ambient config default;
+/// credentials cannot turn a gateway endpoint into an official plan receipt.
+#[must_use]
+pub fn for_route_with_endpoint(
+    config: &Config,
+    provider: ApiProvider,
+    base_url: &str,
+) -> BillingPresentation {
     let identity = config.provider_identity_for(provider);
     classify(
         provider,
         Some(identity.as_str()),
-        &base_url,
+        base_url,
         capture_product(config, provider),
     )
 }
@@ -253,6 +266,13 @@ pub fn for_route(config: &Config, provider: ApiProvider) -> BillingPresentation 
 pub fn capture_product(config: &Config, provider: ApiProvider) -> RouteProduct {
     let provider_config = config.provider_config_for(provider);
     match provider {
+        ApiProvider::OpenaiCodex => {
+            if crate::oauth::official_chatgpt_registration(config).is_ok() {
+                RouteProduct::Subscription("ChatGPT plan allowance")
+            } else {
+                RouteProduct::Unproven
+            }
+        }
         ApiProvider::Minimax | ApiProvider::MinimaxAnthropic => {
             match minimax_credential_product(config, provider, provider_config) {
                 CredentialProduct::Plan => RouteProduct::Subscription("MiniMax Token Plan quota"),
@@ -355,10 +375,18 @@ fn classify(
 ) -> BillingPresentation {
     match provider {
         ApiProvider::Ollama | ApiProvider::Sglang | ApiProvider::Vllm => BillingPresentation::Local,
-        // The Codex OAuth quota is a fact of the ChatGPT backend, not of the
-        // provider name: a custom `[providers.openai_codex] base_url` (a
-        // gateway, a proxy) sells its own terms, so it is Unknown rather than
-        // a subscription that would hide metered spend.
+        // The official public API accepts both API keys and ChatGPT grants.
+        // Only the plan provider plus verified dispatch-time grant can claim
+        // allowance; neither a shared host nor a provider name is proof.
+        ApiProvider::OpenaiCodex if crate::pricing::is_official_chatgpt_api(base_url) => {
+            match product {
+                RouteProduct::Subscription("ChatGPT plan allowance") => {
+                    BillingPresentation::Subscription("ChatGPT plan allowance")
+                }
+                _ => BillingPresentation::Unknown,
+            }
+        }
+        // Keep legacy backend receipts interpretable for persisted history.
         ApiProvider::OpenaiCodex if crate::pricing::is_chatgpt_codex_backend(base_url) => {
             BillingPresentation::Subscription("Codex OAuth quota")
         }
@@ -553,7 +581,11 @@ pub fn billing_surface_for_dispatch(
     base_url: Option<&str>,
 ) -> Option<&'static str> {
     if let Some(config) = config {
-        match for_route(config, provider) {
+        let billing = base_url.map_or_else(
+            || for_route(config, provider),
+            |endpoint| for_route_with_endpoint(config, provider, endpoint),
+        );
+        match billing {
             BillingPresentation::Subscription(_) => {
                 return Some(match provider {
                     ApiProvider::Minimax | ApiProvider::MinimaxAnthropic => {
@@ -1591,13 +1623,19 @@ mod tests {
     }
 
     #[test]
-    fn codex_oauth_never_claims_api_dollars() {
+    fn chatgpt_plan_never_claims_api_dollars() {
+        let billing = for_dispatched_receipt(DispatchedReceipt {
+            provider: ApiProvider::OpenaiCodex,
+            identity: Some("openai_codex"),
+            base_url: "https://api.openai.com/v1",
+            product: RouteProduct::Subscription("ChatGPT plan allowance"),
+        });
         assert_eq!(
-            for_route(&Config::default(), ApiProvider::OpenaiCodex),
-            BillingPresentation::Subscription("Codex OAuth quota")
+            billing,
+            BillingPresentation::Subscription("ChatGPT plan allowance")
         );
         let chip = usage_chip(
-            BillingPresentation::Subscription("Codex OAuth quota"),
+            billing,
             ApiProvider::OpenaiCodex,
             "gpt-5.5",
             12.34,
@@ -1606,12 +1644,94 @@ mod tests {
         );
         assert_eq!(
             format_usage_chip(&chip, codewhale_localization::Locale::En).as_deref(),
-            Some("usage: Codex OAuth quota")
+            Some("usage: ChatGPT plan allowance")
         );
         assert!(
             !format_usage_chip(&chip, codewhale_localization::Locale::En)
                 .unwrap_or_default()
                 .contains('$')
+        );
+    }
+
+    #[test]
+    fn chatgpt_plan_requires_captured_official_grant_and_endpoint() {
+        let receipt = DispatchedReceipt {
+            provider: ApiProvider::OpenaiCodex,
+            identity: Some("openai_codex"),
+            base_url: "https://api.openai.com/v1",
+            product: RouteProduct::Subscription("ChatGPT plan allowance"),
+        };
+        for product in [
+            RouteProduct::Unproven,
+            RouteProduct::Metered,
+            RouteProduct::Subscription("Codex OAuth quota"),
+        ] {
+            assert_eq!(
+                for_dispatched_receipt(DispatchedReceipt { product, ..receipt }),
+                BillingPresentation::Unknown,
+                "{product:?} is not an official ChatGPT grant"
+            );
+        }
+        for endpoint in [
+            "https://gateway.example/v1",
+            "https://api.openai.com.example.net/v1",
+            "https://api.openai.com/v1/preview",
+            "https://api.openai.com/v1?billing=plan",
+            "https://api.openai.com/v1#plan",
+            "https://user:secret@api.openai.com/v1",
+            "http://api.openai.com/v1",
+            "",
+        ] {
+            assert_eq!(
+                for_dispatched_receipt(DispatchedReceipt {
+                    base_url: endpoint,
+                    ..receipt
+                }),
+                BillingPresentation::Unknown,
+                "{endpoint} is not the official plan endpoint"
+            );
+        }
+        assert_eq!(
+            for_dispatched_receipt(DispatchedReceipt {
+                provider: ApiProvider::Openai,
+                identity: Some("openai"),
+                ..receipt
+            }),
+            BillingPresentation::Metered,
+            "API-key provider must not inherit ChatGPT plan allowance"
+        );
+        assert_eq!(
+            for_dispatched_receipt(receipt),
+            BillingPresentation::Subscription("ChatGPT plan allowance"),
+            "receipt interpretation needs no ambient config or credentials"
+        );
+    }
+
+    #[test]
+    fn chatgpt_plan_without_owned_grant_stays_unknown() {
+        let config = Config::default();
+        assert_eq!(
+            for_route_with_endpoint(
+                &config,
+                ApiProvider::OpenaiCodex,
+                "https://api.openai.com/v1"
+            ),
+            BillingPresentation::Unknown
+        );
+        assert_eq!(
+            for_endpoint_without_config(
+                ApiProvider::OpenaiCodex,
+                Some("https://api.openai.com/v1")
+            ),
+            BillingPresentation::Unknown
+        );
+        assert_eq!(
+            billing_surface_for_dispatch(
+                Some(&config),
+                ApiProvider::OpenaiCodex,
+                Some("https://api.openai.com/v1")
+            ),
+            Some(crate::pricing::UNCLASSIFIED_BILLING_SURFACE)
         );
     }
 
@@ -2910,6 +3030,7 @@ mod tests {
     fn child_billing_provenance_round_trips_through_serde() {
         for billing in [
             BillingPresentation::Metered,
+            BillingPresentation::Subscription("ChatGPT plan allowance"),
             BillingPresentation::Subscription("Kimi Code quota"),
             BillingPresentation::Subscription("MiniMax Token Plan quota"),
             BillingPresentation::Local,
@@ -3136,10 +3257,7 @@ mod tests {
         (ApiProvider::Modelscope, BillingPresentation::Metered),
         (ApiProvider::Together, BillingPresentation::Metered),
         (ApiProvider::Qianfan, BillingPresentation::Metered),
-        (
-            ApiProvider::OpenaiCodex,
-            BillingPresentation::Subscription("Codex OAuth quota"),
-        ),
+        (ApiProvider::OpenaiCodex, BillingPresentation::Unknown),
         (ApiProvider::Anthropic, BillingPresentation::Metered),
         (ApiProvider::Openmodel, BillingPresentation::Metered),
         (
