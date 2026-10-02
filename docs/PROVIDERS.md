@@ -106,7 +106,9 @@ and never changes the saved provider or model. A command-line API key is
 confined to the active provider; other routes are reported as skipped for
 that invocation.
 
-Plain `models` lists the active provider's saved catalog without provider requests. Successful refreshes are saved under Codewhale's
+Plain `models` lists the active provider's saved catalog without provider requests.
+For ChatGPT, it validates the selected registration locally before reading
+that account's saved roster. Successful refreshes are saved under Codewhale's
 catalog directory and used by the model/provider pickers. Cache files are
 scoped to provider identity and endpoint; a failed refresh preserves prior
 rows. Text output reports source, last successful fetch time (Unix seconds),
@@ -660,43 +662,51 @@ OAuth remains blocked on a vendor-registered Codewhale identity.
 
 Codewhale keeps one sign-in of its own per subscription provider. It is
 separate from the browser, the ChatGPT or Grok apps, and the Codex or Grok
-CLIs, so those can be signed in to a different account.
+CLIs, so those can be signed in to a different account. A successful login
+replaces the previous owned grant; there is no picker for multiple saved
+ChatGPT accounts.
 
 - **See which account is signed in.** `codewhale auth status --provider
-  openai-codex` (or `--provider xai`) and `codewhale auth list` show the
-  account email and, for ChatGPT, the plan; a team, business, enterprise or
-  other workspace plan also shows the first characters of the workspace's
-  account id, so two workspaces on one email are told apart. The label comes
-  from the ID token the issuer returned at sign-in, decoded locally; no token
-  is printed. A sign-in that can no longer produce a token (expired, no
-  refresh token, file missing) shows no account and says why. The provider
-  picker shows the label of the sign-in the route would use (for xAI that
-  includes a consented Grok CLI import) next to the credential, and a
-  successful login ends with `Signed in to ChatGPT as <email> (<plan>).` (in
-  the TUI, in its interface language).
-- **Switch accounts.** Inside Codewhale, run `/auth chatgpt` (or
-  `/auth xai-device`); this switches the running session. From a shell, run
-  `codewhale auth chatgpt` (or `codewhale auth xai-device`) and restart any
-  open Codewhale session, which keeps the credential it started with. The
-  ChatGPT sign-in page is opened with `prompt=login`, asking the issuer to
-  show the sign-in step instead of reusing the browser's current account; set
-  `CODEWHALE_CHATGPT_OAUTH_NO_PROMPT=1` to leave that parameter out if the
-  issuer ever refuses it. The xAI device page approves with whichever account
-  the browser holds. For either, if the browser is signed in to the wrong
-  account, sign out there or open the printed URL in a private window. The
-  new account replaces the Codewhale-owned sign-in outright, and the login
-  names the account it replaced, or says it is the same account as before.
-- **Usage limits.** When the ChatGPT subscription reports its usage limit
-  (`usage_limit_reached`), says the plan does not include Codex
-  (`usage_not_included`), or a provider reports plan quota exhausted on a
-  subscription sign-in, the error names the account whose credential made the
-  request and how to switch. Codewhale does not retry that error, because
-  the limit resets on the plan's schedule. An xAI route set to OAuth that fell
-  back to an API key gets no sign-in guidance, since no sign-in was used.
-- **Precedence.** `OPENAI_CODEX_ACCESS_TOKEN` / `CODEX_ACCESS_TOKEN` outrank
-  the Codewhale-owned ChatGPT sign-in, and the owned sign-in outranks a
-  consented Codex CLI import. Unset the token variable if a re-login seems to
-  have no effect; `auth status` and the login itself say so when one is set.
+  openai-codex` (or `--provider xai`) and `codewhale auth list` show an account
+  label when the ID token contains an email. ChatGPT plan and workspace
+  details appear only when those claims are present; a workspace label uses
+  the first characters of its account ID. The label is display metadata, not
+  proof of plan entitlement. A valid sign-in may have no email label. Status
+  reads local credential state without contacting the issuer: an expired
+  access token with a stored refresh token remains structurally usable, while
+  missing or invalid storage, or an expired token without a refresh token,
+  is reported unusable. The provider picker shows the label of the sign-in
+  the route would use (for xAI this includes a consented Grok CLI import).
+  Successful login reports the account when known and whether it replaced
+  an earlier sign-in, in the TUI's selected language. No token is printed.
+- **Reauthorize ChatGPT.** Run `/auth chatgpt` inside Codewhale to update the
+  running session, or `codewhale auth chatgpt` from a shell and restart open
+  Codewhale sessions. Ordinary login reuses the selected account/workspace's
+  issued client ID and checks that the returned account is the same. The
+  browser opens with `prompt=login`; `CODEWHALE_CHATGPT_OAUTH_NO_PROMPT=1`
+  omits that parameter if the issuer refuses it.
+- **Replace the ChatGPT account or workspace.** From a shell, run
+  `CODEWHALE_CHATGPT_NEW_ACCOUNT=1 codewhale auth chatgpt`, then refresh its
+  model catalog and restart open Codewhale sessions. If the browser holds the
+  wrong account, sign out there or open the printed URL in a private window.
+  Only a fully validated new grant replaces the active owned sign-in.
+- **Switch xAI accounts.** Run `/auth xai-device` inside Codewhale, or
+  `codewhale auth xai-device` from a shell and restart open sessions. The
+  device page approves with whichever account the browser holds; sign out
+  there or use a private window to approve another account. The login names
+  the account it replaced, or says it is the same account as before.
+- **Usage limits.** ChatGPT plan requests can fail with
+  `subscription_sharing_usage_limit_exceeded` or
+  `subscription_sharing_usage_unavailable`. These errors, and subscription
+  quota errors from other providers, name the account that made the request
+  when its label is known and offer recovery guidance. Codewhale does not
+  retry these terminal errors or silently choose another billing route. An
+  xAI route set to OAuth that fell back to an API key gets no sign-in
+  guidance, since no sign-in was used.
+- **ChatGPT credential authority.** The official ChatGPT plan route uses
+  only its selected, verified Codewhale-owned grant.
+  `OPENAI_CODEX_ACCESS_TOKEN`, `CODEX_ACCESS_TOKEN`, and consented Codex CLI
+  tokens cannot override or authorize this route.
 
 ### External CLI credential consent
 

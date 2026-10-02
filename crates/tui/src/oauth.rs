@@ -140,6 +140,7 @@ fn load_credentials(grant: &ExternalCredentialReadGrant) -> Result<Option<CodexC
 /// this to find out whether the consented file *still* holds a usable token,
 /// because a record that outlives its token would otherwise read as stored.
 #[must_use]
+#[cfg(test)]
 pub fn stored_credentials_present(grant: &ExternalCredentialReadGrant) -> bool {
     load_credentials(grant)
         .ok()
@@ -1332,6 +1333,7 @@ pub fn parse_callback_query(params: &OAuthProviderParams, query: &str) -> Result
     })
 }
 
+#[cfg(test)]
 pub fn accept_callback(expected_state: &str, outcome: CallbackOutcome) -> Result<String> {
     accept_callback_with_client(expected_state, outcome).map(|(code, _)| code)
 }

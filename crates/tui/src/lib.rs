@@ -2282,6 +2282,13 @@ pub fn owned_oauth_account_label(
     oauth::owned_account_label_for_generation(provider, generation)
 }
 
+/// Whether a resolved route is the canonical public ChatGPT API endpoint.
+/// CLI diagnostics use the same destination check as inference dispatch.
+#[must_use]
+pub fn is_official_chatgpt_api_base(base_url: &str) -> bool {
+    pricing::is_official_chatgpt_api(base_url)
+}
+
 /// Compatibility command to explicitly enable usage under the current policy.
 /// This optional choice never arms the current process.
 pub fn accept_telemetry_notice(config_path: Option<PathBuf>, version: u32) -> Result<String> {
