@@ -9212,7 +9212,11 @@ mod tests {
     fn chatgpt_client_rejects_external_tokens_and_uses_its_owned_grant() {
         let _env = crate::test_support::lock_test_env();
         let temp = tempfile::tempdir().expect("credential fixture");
-        let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", temp.path());
+        let root = temp
+            .path()
+            .canonicalize()
+            .expect("canonical credential home");
+        let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", &root);
         let _ambient =
             crate::test_support::EnvVarGuard::set("OPENAI_CODEX_ACCESS_TOKEN", "external-token");
         let mut config = Config {
@@ -9236,7 +9240,11 @@ mod tests {
     fn chatgpt_reasoning_scope_separates_account_workspace_and_custom_routes() {
         let _env = crate::test_support::lock_test_env();
         let temp = tempfile::tempdir().unwrap();
-        let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", temp.path());
+        let root = temp
+            .path()
+            .canonicalize()
+            .expect("canonical credential home");
+        let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", &root);
         let mut config = Config {
             provider: Some("openai-codex".into()),
             ..Default::default()

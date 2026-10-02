@@ -88,7 +88,7 @@ fn test_codex_config(server: &MockServer) -> Config {
         }),
         providers: Some(ProvidersConfig {
             openai_codex: ProviderConfig {
-                base_url: Some(server.uri()),
+                base_url: Some(format!("{}/v1", server.uri())),
                 api_key: Some("test-token".to_string()),
                 ..ProviderConfig::default()
             },
@@ -103,7 +103,7 @@ async fn responses_stream_retries_rate_limited_request() {
     let server = MockServer::start().await;
     let attempts = Arc::new(AtomicUsize::new(0));
     Mock::given(method("POST"))
-        .and(path("/responses"))
+        .and(path("/v1/responses"))
         .respond_with(RetryThenSuccess {
             attempts: Arc::clone(&attempts),
             retry_status: 429,
@@ -118,6 +118,10 @@ async fn responses_stream_retries_rate_limited_request() {
     let prepared = client
         .prepare_outbound_request(request, true)
         .expect("responses request prepares");
+    assert_eq!(
+        prepared.endpoint.url,
+        format!("{}/v1/responses", server.uri())
+    );
     // The official ChatGPT plan preview does not support output-cap fields;
     // omit them while retaining the allowance in the resolved envelope.
     assert!(prepared.body.get("max_output_tokens").is_none());
@@ -151,7 +155,7 @@ async fn responses_stream_retries_transient_server_error() {
     let server = MockServer::start().await;
     let attempts = Arc::new(AtomicUsize::new(0));
     Mock::given(method("POST"))
-        .and(path("/responses"))
+        .and(path("/v1/responses"))
         .respond_with(RetryThenSuccess {
             attempts: Arc::clone(&attempts),
             retry_status: 503,
@@ -186,7 +190,7 @@ async fn responses_stream_retries_upstream_499_before_streaming() {
     let server = MockServer::start().await;
     let attempts = Arc::new(AtomicUsize::new(0));
     Mock::given(method("POST"))
-        .and(path("/responses"))
+        .and(path("/v1/responses"))
         .respond_with(RetryThenSuccess {
             attempts: Arc::clone(&attempts),
             retry_status: 499,
@@ -219,7 +223,7 @@ async fn responses_stream_retries_upstream_499_before_streaming() {
 async fn collect_responses_stream(sse_body: &str) -> Vec<Result<StreamEvent>> {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
-        .and(path("/responses"))
+        .and(path("/v1/responses"))
         .respond_with(
             ResponseTemplate::new(200)
                 .insert_header("Content-Type", "text/event-stream")
@@ -405,7 +409,7 @@ async fn chatgpt_http_usage_limit_is_not_retried() {
     let server = MockServer::start().await;
     let attempts = Arc::new(AtomicUsize::new(0));
     Mock::given(method("POST"))
-        .and(path("/responses"))
+        .and(path("/v1/responses"))
         .respond_with(AlwaysError {
             attempts: Arc::clone(&attempts),
             status: 429,
@@ -458,7 +462,7 @@ async fn responses_stream_finishes_on_semantic_terminal_event_without_done_marke
         "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":3,\"output_tokens\":2}}}\n\n",
     );
     Mock::given(method("POST"))
-        .and(path("/responses"))
+        .and(path("/v1/responses"))
         .respond_with(
             ResponseTemplate::new(200)
                 .insert_header("Content-Type", "text/event-stream")
@@ -506,7 +510,7 @@ async fn responses_stream_surfaces_notice_for_web_search_call_items() {
         "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":3,\"output_tokens\":2}}}\n\n",
     );
     Mock::given(method("POST"))
-        .and(path("/responses"))
+        .and(path("/v1/responses"))
         .respond_with(
             ResponseTemplate::new(200)
                 .insert_header("Content-Type", "text/event-stream")
@@ -548,7 +552,7 @@ async fn responses_stream_fails_fast_on_non_retryable_provider_error() {
     let server = MockServer::start().await;
     let attempts = Arc::new(AtomicUsize::new(0));
     Mock::given(method("POST"))
-        .and(path("/responses"))
+        .and(path("/v1/responses"))
         .respond_with(AlwaysError {
             attempts: Arc::clone(&attempts),
             status: 403,
@@ -642,7 +646,7 @@ async fn responses_stream_open_preserves_wire_headers_through_shared_seam() {
     // Public API requests retain bearer/SSE headers and Codewhale identity
     // through the shared stream-entry transport; no backend headers survive.
     Mock::given(method("POST"))
-        .and(path("/responses"))
+        .and(path("/v1/responses"))
         .and(header("Accept", "text/event-stream"))
         .and(header("Authorization", "Bearer test-token"))
         .respond_with(
@@ -706,7 +710,7 @@ async fn responses_stream_inserts_boundary_between_reasoning_summary_parts() {
         "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n",
     );
     Mock::given(method("POST"))
-        .and(path("/responses"))
+        .and(path("/v1/responses"))
         .respond_with(
             ResponseTemplate::new(200)
                 .insert_header("Content-Type", "text/event-stream")
@@ -766,7 +770,7 @@ async fn codex_selected_effort_reaches_preview_wire_and_restored_receipt_unchang
 
     let server = MockServer::start().await;
     Mock::given(method("POST"))
-        .and(path("/responses"))
+        .and(path("/v1/responses"))
         .respond_with(
             ResponseTemplate::new(200)
                 .insert_header("Content-Type", "text/event-stream")
@@ -1080,7 +1084,7 @@ async fn chatgpt_stream_captures_only_scoped_encrypted_reasoning() {
         "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n",
     );
     Mock::given(method("POST"))
-        .and(path("/responses"))
+        .and(path("/v1/responses"))
         .respond_with(
             ResponseTemplate::new(200)
                 .insert_header("Content-Type", "text/event-stream")
@@ -1151,7 +1155,7 @@ fn deepseek_responses_reasoning_effort_uses_documented_labels() {
 async fn generic_responses_captures_and_replays_opaque_reasoning() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
-        .and(path("/responses"))
+        .and(path("/v1/responses"))
         .respond_with(ResponseTemplate::new(200)
             .insert_header("Content-Type", "text/event-stream")
             .set_body_string(concat!(
@@ -1165,7 +1169,7 @@ async fn generic_responses_captures_and_replays_opaque_reasoning() {
         providers: Some(ProvidersConfig {
             openai: ProviderConfig {
                 api_key: Some("test-token".into()),
-                base_url: Some(server.uri()),
+                base_url: Some(format!("{}/v1", server.uri())),
                 ..Default::default()
             },
             ..Default::default()
@@ -1173,7 +1177,7 @@ async fn generic_responses_captures_and_replays_opaque_reasoning() {
         ..Default::default()
     };
     let client = CodewhaleClient::from_parts(
-        server.uri(),
+        format!("{}/v1", server.uri()),
         "gpt-5.5".into(),
         codewhale_config::provider::WireFormat::Responses,
         None,
@@ -1184,6 +1188,10 @@ async fn generic_responses_captures_and_replays_opaque_reasoning() {
     let prepared = client
         .prepare_outbound_request(minimal_responses_request(), true)
         .unwrap();
+    assert_eq!(
+        prepared.endpoint.url,
+        format!("{}/v1/responses", server.uri())
+    );
     let mut stream = client.handle_responses_stream(&prepared).await.unwrap();
     let mut captured = None;
     while let Some(event) = stream.next().await {
