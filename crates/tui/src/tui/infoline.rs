@@ -139,7 +139,7 @@ impl<'a> InfoLine<'a> {
 // Named native palettes can collapse Hint/Dim or permission inks; use the
 // uncollapsed role table so custom UiTheme slots remain independent. The
 // existing backend applies terminal color capabilities after this adapter.
-fn source_theme(ascii: bool) -> Theme {
+pub(super) fn source_theme(ascii: bool) -> Theme {
     Theme::new(Caps {
         depth: ColorDepth::TrueColor,
         ascii,
@@ -147,7 +147,7 @@ fn source_theme(ascii: bool) -> Theme {
     })
 }
 
-fn ink_role(ink: ChromeInk) -> Role {
+pub(super) fn ink_role(ink: ChromeInk) -> Role {
     match ink {
         ChromeInk::Outcome | ChromeInk::Active => Role::Live,
         // These three roles are private style identities in this adapter;
@@ -214,34 +214,45 @@ pub fn context_meter_hitbox(info: &InfoLine<'_>, area: Rect) -> Option<Rect> {
 
 impl Widget for InfoLine<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        let area = area.intersection(buf.area);
-        if area.is_empty() {
-            return;
+        paint_native_row(&self.kit(), area, buf, self.theme, self.ascii_safe);
+    }
+}
+
+/// Adapt the kit's two native chrome rows to the live host ink slots.
+pub(super) fn paint_native_row(
+    component: &impl Paint,
+    area: Rect,
+    buf: &mut Buffer,
+    theme: &UiTheme,
+    ascii: bool,
+) {
+    let area = area.intersection(buf.area);
+    if area.is_empty() {
+        return;
+    }
+    let area = Rect { height: 1, ..area };
+    let source = source_theme(ascii);
+    let inks = STYLE_INKS.map(|ink| (source.color(ink_role(ink)), ink.color(theme)));
+    // Render one borrowed row with a foreground sentinel. Only cells the
+    // kit writes are copied back, preserving untouched content and all
+    // host-owned backgrounds/modifiers. Wide-character continuation cells
+    // reset exactly as they do in a direct Ratatui render.
+    let untouched = Color::Indexed(0);
+    let mut row = Buffer::empty(area);
+    for x in area.left()..area.right() {
+        row[(x, area.y)].clone_from(&buf[(x, area.y)]);
+        row[(x, area.y)].fg = untouched;
+    }
+    component.paint(area, &mut row, &source);
+    for x in area.left()..area.right() {
+        let cell = &mut row[(x, area.y)];
+        if cell.fg == untouched {
+            continue;
         }
-        let area = Rect { height: 1, ..area };
-        let source = source_theme(self.ascii_safe);
-        let inks = STYLE_INKS.map(|ink| (source.color(ink_role(ink)), ink.color(self.theme)));
-        // Render one borrowed row with a foreground sentinel. Only cells the
-        // kit writes are copied back, preserving untouched content and all
-        // host-owned backgrounds/modifiers. Wide-character continuation cells
-        // reset exactly as they do in a direct Ratatui render.
-        let untouched = Color::Indexed(0);
-        let mut row = Buffer::empty(area);
-        for x in area.left()..area.right() {
-            row[(x, area.y)].clone_from(&buf[(x, area.y)]);
-            row[(x, area.y)].fg = untouched;
+        if let Some((_, color)) = inks.iter().find(|(identity, _)| *identity == Some(cell.fg)) {
+            cell.fg = *color;
         }
-        self.kit().paint(area, &mut row, &source);
-        for x in area.left()..area.right() {
-            let cell = &mut row[(x, area.y)];
-            if cell.fg == untouched {
-                continue;
-            }
-            if let Some((_, color)) = inks.iter().find(|(identity, _)| *identity == Some(cell.fg)) {
-                cell.fg = *color;
-            }
-            buf[(x, area.y)].clone_from(cell);
-        }
+        buf[(x, area.y)].clone_from(cell);
     }
 }
 
