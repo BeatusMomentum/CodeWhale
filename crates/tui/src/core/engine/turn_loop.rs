@@ -4018,6 +4018,9 @@ impl Engine {
                     &tool_name,
                     &tool_input,
                     approval_required,
+                    tool_registry
+                        .and_then(|registry| registry.get(&tool_name))
+                        .as_deref(),
                 ) {
                     crate::extension_host::core_call::OriginApproval::Unchanged => {}
                     crate::extension_host::core_call::OriginApproval::Prompt => {

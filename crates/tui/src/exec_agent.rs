@@ -1038,8 +1038,14 @@ pub(crate) async fn run_exec_agent(
             }
             // Headless runs have no person at the prompt: the run's flags
             // (the posture) answer every request.
-            Event::ApprovalRequired { id, .. } => {
-                if auto_approve {
+            Event::ApprovalRequired {
+                id,
+                approval_force_prompt,
+                ..
+            } => {
+                // An exact user decision (including extension-sourced shell
+                // and network calls) cannot be supplied by a headless posture.
+                if auto_approve && !approval_force_prompt {
                     let _ = engine_handle
                         .approve_tool_call_by(id, crate::approval_log::ApprovalDecider::Posture)
                         .await;

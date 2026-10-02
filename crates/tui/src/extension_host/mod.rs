@@ -128,9 +128,9 @@ pub(crate) mod tier;
 pub(crate) mod tool;
 
 #[cfg(test)]
-pub(crate) mod tests;
-#[cfg(test)]
 mod core_call_tests;
+#[cfg(test)]
+pub(crate) mod tests;
 
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::fmt;
@@ -1398,16 +1398,6 @@ impl ExtensionHostManager {
 
     /// The command registrations currently admitted, for tests on the commands
     /// side that drive the real command table.
-    #[cfg(test)]
-    #[must_use]
-    pub(crate) fn live_command_registrations(&self) -> Vec<CommandRegistration> {
-        self.shared
-            .registry
-            .lock()
-            .expect("registry lock")
-            .live_commands()
-    }
-
     #[cfg(test)]
     #[must_use]
     pub(crate) fn live_command_registrations(&self) -> Vec<CommandRegistration> {

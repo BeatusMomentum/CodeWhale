@@ -77,7 +77,8 @@ User-facing rules: `docs/EXTENSIONS.md`, "Asking the core to run a tool".
   `grep_files`; a test pins each as a registered, read-only, auto-approved tool;
   the action-based `Git` tool is left out until its read-only actions can be
   told apart by name) *and* planning found nothing
-  that asks. Shell and network (the authority categories plus `web.run`,
+  that asks. Shell and network (the registered tool's capabilities and concrete
+  execution-envelope classification, plus the authority categories and `web.run`,
   `git_fetch`, `finance`, `run_tests`, `verify`, `run_verifiers`, `harness`)
   set `approval_force_prompt`. The card text is composed in Rust ("Requested by
   `extension:<plugin>` from inside its tool `<tool>` (core/call): ...") and the
@@ -142,8 +143,12 @@ User-facing rules: `docs/EXTENSIONS.md`, "Asking the core to run a tool".
   fake core (payload, absence without a ticket, every error code, local refusals,
   cancel, concurrency).
 
-Not done: the UI card is not retracted when a call is withdrawn (there is no
-event for it; an answer afterwards finds no waiter); no per-plugin process (a
+Withdrawn calls emit the typed `ApprovalWithdrawn` identity after committing the
+cancelled outcome. Terminal and runtime clients retire the matching card and
+continue draining events; a queued allow cannot win over a ready cancellation.
+Headless Full Access also refuses these forced holds.
+
+Not done: no per-plugin process (a
 ticket narrows a frame, it does not isolate plugins sharing the host, section
 4.4); images and rich content from a core tool are dropped; the refusal table
 names tools (a new mode/permission tool must be added); no `core/call` from a

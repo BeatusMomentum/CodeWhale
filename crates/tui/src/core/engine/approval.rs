@@ -270,17 +270,8 @@ impl Engine {
         let mut announced = false;
         loop {
             tokio::select! {
-                _ = heartbeat.tick() => {
-                    let waited = started.elapsed();
-                    let message = wait_announcement("tool approval", tool_id, waited);
-                    // Log every heartbeat; tell the user once, so a long park
-                    // leaves a trail without filling the transcript.
-                    tracing::warn!(tool_id, waited_secs = waited.as_secs(), "{message}");
-                    if !announced {
-                        announced = true;
-                        let _ = self.send_event(Event::Status { message }).await;
-                    }
-                }
+                // A withdrawn request cannot consume an already queued allow.
+                biased;
                 _ = self.cancel_token.cancelled() => {
                     let suffix = self.cancel_reason_suffix();
                     self.commit_approval_outcome(tool_id, ApprovalOutcome::Cancelled, Some(ApprovalDecider::Host)).await?;
@@ -350,6 +341,17 @@ impl Engine {
                         // agent's answer never arrives here; the handle hands
                         // it to the agent directly.)
                         _ => continue,
+                    }
+                }
+                _ = heartbeat.tick() => {
+                    let waited = started.elapsed();
+                    let message = wait_announcement("tool approval", tool_id, waited);
+                    // Log every heartbeat; tell the user once, so a long park
+                    // leaves a trail without filling the transcript.
+                    tracing::warn!(tool_id, waited_secs = waited.as_secs(), "{message}");
+                    if !announced {
+                        announced = true;
+                        let _ = self.send_event(Event::Status { message }).await;
                     }
                 }
             }
@@ -2408,7 +2410,8 @@ mod tests {
         );
         let events = turn.events.clone();
         let mut seen = Vec::new();
-        let _ = next_approval_event(&events, &mut seen).await;
+        let event = next_approval_event(&events, &mut seen).await;
+        let withdrawn_id = approval_fields(&event).0.to_string();
         assert!(
             tokio::time::timeout(Duration::from_millis(100), &mut turn.task)
                 .await
@@ -2440,7 +2443,7 @@ mod tests {
         );
         assert!(
             seen.iter().any(|event| {
-                matches!(event, Event::ApprovalWithdrawn { id } if id == "ext-1.1")
+                matches!(event, Event::ApprovalWithdrawn { id } if id == &withdrawn_id)
             }),
             "every decision surface receives the withdrawn approval identity"
         );
@@ -2491,6 +2494,50 @@ mod tests {
 
     /// `await_tool_approval` stops when its withdraw token fires, with a
     /// cancelled outcome in the log, and ignores it otherwise.
+    #[tokio::test]
+    async fn withdrawal_wins_over_an_already_queued_allow() {
+        let tmp = tempfile::tempdir().expect("fixture directory");
+        let (mut engine, handle) = Engine::new(
+            EngineConfig {
+                workspace: tmp.path().to_path_buf(),
+                terminal_chrome_enabled: false,
+                ..EngineConfig::default()
+            },
+            &Config::default(),
+        );
+        let store = crate::approval_log::ApprovalReceiptStore::new(tmp.path().join("sessions"));
+        engine.approval_receipt_store = Ok(store.clone());
+        let session_id = engine.session.id.clone();
+        let withdraw = tokio_util::sync::CancellationToken::new();
+        withdraw.cancel();
+        handle
+            .approve_tool_call("withdrawn-ready")
+            .await
+            .expect("queue allow");
+        let outcome = engine
+            .request_tool_approval_until(
+                "withdrawn-ready",
+                "exec_shell",
+                approval_event("withdrawn-ready"),
+                Some(&withdraw),
+            )
+            .await;
+        assert!(
+            matches!(outcome, Err(ToolError::Cancelled { .. })),
+            "{outcome:?}"
+        );
+        let replay = store.replay(&session_id).expect("replay");
+        assert!(replay.unmatched_asks.is_empty());
+        assert_eq!(
+            replay
+                .completed
+                .iter()
+                .map(|receipt| receipt.outcome.clone())
+                .collect::<Vec<_>>(),
+            vec![ApprovalOutcome::Cancelled]
+        );
+    }
+
     #[tokio::test]
     async fn a_withdraw_token_ends_an_approval_wait_with_a_cancelled_outcome() {
         let tmp = tempfile::tempdir().expect("fixture directory");

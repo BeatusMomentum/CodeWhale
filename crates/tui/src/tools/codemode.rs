@@ -235,7 +235,7 @@ impl NestedCallRequest {
 /// by Rust from the extension tool's registration, never from anything the host
 /// says.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ExtensionCaller {
+pub struct ExtensionCaller {
     /// `extension:<plugin>`: named on the approval card and in audit records.
     pub(crate) origin: String,
     /// The extension tool the calls are made inside.

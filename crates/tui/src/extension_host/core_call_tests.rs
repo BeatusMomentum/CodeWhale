@@ -5,7 +5,7 @@
 //! loop's gate: it serves `NestedCallRequest`s exactly as the engine does and
 //! can hold a request the way an approval card does. What the engine itself
 //! decides (planning, the card, forced prompts, withdrawal) is tested in
-//! `core::engine::tests::extension_core_call`.
+//! `core::engine::approval::tests`.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -902,12 +902,12 @@ fn the_auto_table_is_registered_read_only_tools_and_shell_and_network_force_a_pr
     for name in EXT_AUTO_ELIGIBLE {
         // Planning found nothing that asks: unchanged. If it did ask, still asks.
         assert_eq!(
-            origin_approval(name, &input, false),
+            origin_approval(name, &input, false, None),
             OriginApproval::Unchanged,
             "{name}"
         );
         assert_eq!(
-            origin_approval(name, &input, true),
+            origin_approval(name, &input, true, None),
             OriginApproval::Prompt,
             "{name}"
         );
@@ -922,7 +922,7 @@ fn the_auto_table_is_registered_read_only_tools_and_shell_and_network_force_a_pr
         "tui_help",
     ] {
         assert_eq!(
-            origin_approval(name, &input, false),
+            origin_approval(name, &input, false, None),
             OriginApproval::Prompt,
             "{name}"
         );
@@ -944,16 +944,68 @@ fn the_auto_table_is_registered_read_only_tools_and_shell_and_network_force_a_pr
         "finance",
     ] {
         assert_eq!(
-            origin_approval(name, &input, false),
+            origin_approval(name, &input, false, None),
             OriginApproval::ForcePrompt,
             "{name}"
         );
         assert_eq!(
-            origin_approval(name, &input, true),
+            origin_approval(name, &input, true, None),
             OriginApproval::ForcePrompt,
             "{name}"
         );
     }
+}
+
+#[test]
+fn action_families_and_registered_process_or_network_tools_always_force_a_prompt() {
+    let registry = crate::tools::registry::ToolRegistryBuilder::new()
+        .with_file_tools()
+        .with_git_tools()
+        .with_validation_tools()
+        .with_runtime_task_tools()
+        .with_web_tools()
+        .build(ToolContext::new(Path::new("/w")));
+    for (name, action) in [
+        ("Git", "fetch"),
+        ("Run", "tests"),
+        ("Web", "search"),
+        ("Web", "fetch"),
+        ("tasks", "gate_run"),
+        ("github", "issue_context"),
+    ] {
+        let input = json!({"action": action});
+        let spec = registry.get(name).expect("registered family");
+        for spelling in [
+            name.to_string(),
+            name.to_ascii_lowercase(),
+            name.to_ascii_uppercase(),
+        ] {
+            assert_eq!(
+                origin_approval(&spelling, &input, false, Some(spec.as_ref())),
+                OriginApproval::ForcePrompt,
+                "{spelling}/{action} must prompt even under Full Access or a grant"
+            );
+        }
+    }
+    // Resolve family semantics even for core meta-tools without a registry spec.
+    for (name, action) in [("gIt", "fetch"), ("rUn", "tests"), ("wEb", "search")] {
+        assert_eq!(
+            origin_approval(name, &json!({"action": action}), false, None),
+            OriginApproval::ForcePrompt,
+            "{name}/{action}"
+        );
+    }
+    // The same family preserves safe workspace reads.
+    let file = registry.get("File").expect("registered File family");
+    assert_eq!(
+        origin_approval(
+            "File",
+            &json!({"action": "read", "path": "note.txt"}),
+            false,
+            Some(file.as_ref())
+        ),
+        OriginApproval::Unchanged
+    );
 }
 
 /// How each existing approval posture resolves what an extension's call needs
@@ -979,7 +1031,7 @@ fn extension_calls_resolve_against_every_posture_as_documented() {
     let never = authority(false, ApprovalMode::Never);
 
     let resolve = |authority: &TurnAuthority, name: &str, granted: bool| {
-        let approval = origin_approval(name, &input, false);
+        let approval = origin_approval(name, &input, false, None);
         match approval {
             OriginApproval::Unchanged => None,
             OriginApproval::Prompt => Some(resolve_approval_request_disposition(

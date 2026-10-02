@@ -59,9 +59,8 @@
 //! * The refusal list names tools; a tool added later that changes the mode,
 //!   the posture or the permissions has to be added to [`REFUSED_NAMES`]
 //!   (a test fails when a name in it stops being a tool the core registers).
-//! * The turn loop's card is not retracted from the UI when a call is
-//!   withdrawn (there is no event for that); an answer that arrives afterwards
-//!   finds no waiter and changes nothing.
+//! * A withdrawn call retires its card through the typed `ApprovalWithdrawn`
+//!   event on terminal and runtime clients. A later answer has no live waiter.
 //! * Results come back as text (and structured JSON when the tool's content
 //!   was JSON); images and other rich blocks are dropped, as in code mode.
 //! * One extension tool call at a time holds the turn's tool lock, so a
@@ -86,7 +85,7 @@ use crate::core::authority::{ToolCategory, get_tool_category_for_call};
 use crate::tools::codemode::{
     CodemodeInvoker, ExtensionCaller, NestedCallGate, NestedDecision, NestedFailure, PauseClock,
 };
-use crate::tools::spec::{ToolContext, ToolSpec};
+use crate::tools::spec::{ToolCapability, ToolContext, ToolSpec};
 
 /// The protocol method an invocation ticket is good for.
 pub(crate) const METHOD: &str = "core/call";
@@ -140,8 +139,13 @@ const FORCED_PROMPT_NAMES: &[&str] = &[
 ];
 
 fn canonical(name: &str, input: &Value) -> String {
-    crate::tools::canonical_action::canonical_action_alias(&name.to_ascii_lowercase(), input)
-        .to_ascii_lowercase()
+    // Preserve the family's registered spelling until its action is resolved.
+    // Lowercasing `Git` first would hide `Git{action:"fetch"}` from policy.
+    let family = crate::tools::canonical_action::CANONICAL_ACTION_ALIASES
+        .iter()
+        .find(|(family, _, _)| family.eq_ignore_ascii_case(name))
+        .map_or(name, |(family, _, _)| *family);
+    crate::tools::canonical_action::canonical_action_alias(family, input).to_ascii_lowercase()
 }
 
 fn is_extension_tool(specs: &[Arc<dyn ToolSpec>], name: &str) -> bool {
@@ -205,7 +209,10 @@ pub(crate) fn origin_approval(
     name: &str,
     input: &Value,
     planned_requires_approval: bool,
+    spec: Option<&dyn ToolSpec>,
 ) -> OriginApproval {
+    use crate::tools::execution_envelope::{CallClass, classify_call};
+
     let lower = name.to_ascii_lowercase();
     let resolved = canonical(name, input);
     let forced = |candidate: &str| {
@@ -214,7 +221,20 @@ pub(crate) fn origin_approval(
             ToolCategory::Shell | ToolCategory::Network
         ) || FORCED_PROMPT_NAMES.contains(&candidate)
     };
-    if forced(&lower) || forced(&resolved) {
+    // Names cover core meta-tools; the registered capability and concrete
+    // execution classification also cover tools added without a name-list row.
+    let reaches_or_executes = spec.is_some_and(|spec| {
+        spec.capabilities().contains(&ToolCapability::Network)
+            || matches!(
+                classify_call(spec.name(), input, spec),
+                CallClass::VerificationFilter
+                    | CallClass::UnboundedVerification
+                    | CallClass::BoundedFetch
+                    | CallClass::Executes
+                    | CallClass::Reaches
+            )
+    });
+    if forced(&lower) || forced(&resolved) || reaches_or_executes {
         OriginApproval::ForcePrompt
     } else if EXT_AUTO_ELIGIBLE.contains(&resolved.as_str()) && !planned_requires_approval {
         OriginApproval::Unchanged
