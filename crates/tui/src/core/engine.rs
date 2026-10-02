@@ -5994,6 +5994,32 @@ impl Engine {
         self.config.translation_enabled = translation_enabled;
         self.config.verbosity = verbosity;
 
+        // Capture only this engine's reviewed, live plugin contributions. A
+        // failed/withdrawn capture records retirement. Full bounded snapshots
+        // use ordinary session history, not the smaller workspace line delta.
+        let extension_prompt_block = if self.config.features.enabled(Feature::ExtensionHost) {
+            if let Some(attachment) = &self.extension_host {
+                match attachment.prompt_sections().await.and_then(|sections| {
+                    crate::extension_host::prompt::render_prompt_sections(&sections)
+                }) {
+                    Ok(block) => block,
+                    Err(reason) => {
+                        tracing::warn!(%reason, "extension prompt contributions unavailable");
+                        let _ = self.send_event(Event::status(
+                            "Extension prompt contributions are unavailable; inspect /plugin show.".to_string(),
+                        )).await;
+                        None
+                    }
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        self.record_extension_prompt_contributions(extension_prompt_block.as_deref())
+            .await;
+
         // Compose from the immutable values accepted for this turn. Preview
         // receives the same context before anything is installed, so prompt
         // bytes cannot depend on stale session state or mutation order. The
@@ -7831,6 +7857,24 @@ impl Engine {
             )
         };
         let _ = self.send_event(Event::status(status)).await;
+    }
+
+    /// Record the entire bounded mod snapshot in the existing session history.
+    /// The latest snapshot supersedes earlier ones; an empty capture withdraws
+    /// them. Comparing the log also re-delivers instructions after compaction
+    /// or resume without maintaining another prompt store or changing the prefix.
+    async fn record_extension_prompt_contributions(&mut self, block: Option<&str>) {
+        let previous = self.session.messages.iter().rev().find(|message| {
+            crate::runtime_handoff::extension_prompt_contributions_display(message).is_some()
+        });
+        if block.is_none() && previous.is_none() {
+            return;
+        }
+        let message = crate::runtime_handoff::extension_prompt_contributions_runtime_message(block);
+        if previous == Some(&message) {
+            return;
+        }
+        self.add_session_message(message).await;
     }
 
     /// Recompose the stable system prompt from current context. When the bytes

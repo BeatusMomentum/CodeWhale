@@ -39,9 +39,10 @@
 //!   registration-time refusal, because only the user registry knows the
 //!   workspace: the markdown command wins and the extension command is left
 //!   out with a load error.
-//! * The handler gets no agent or session handle, and no attachments. It is
+//! * The handler gets no mutable agent or session handle, and no attachments. It is
 //!   told the workspace the command was loaded for (`ExtensionCommandRef`) and
-//!   its plugin's data directory, both read-only strings.
+//!   its plugin's data directory, plus the invoking session id when known,
+//!   all read-only strings. User commands have no Engine turn or agent identity.
 //! * A command's result text is bounded and stripped of terminal escapes; a
 //!   prompt over [`MAX_PROMPT_BYTES`] is refused, never truncated.
 
@@ -234,6 +235,7 @@ pub(crate) async fn run(
     shared: &ManagerShared,
     command: &ExtensionCommandRef,
     raw_input: &str,
+    session_id: Option<&str>,
 ) -> Result<CommandOutcome, String> {
     let (host, registration) = shared.live_host_for_command(command).await?;
     let deadline = shared.options.supervision.command_run_deadline;
@@ -243,6 +245,9 @@ pub(crate) async fn run(
         raw_input: raw_input.to_string(),
         deadline_ms: u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX),
         workspace: command.workspace.to_str().map(str::to_owned),
+        session_id: session_id.filter(|id| !id.is_empty()).map(str::to_owned),
+        agent_id: None,
+        origin_turn_id: None,
     });
     let value: Value = host
         .call(request, Some(registration.owner.plugin_id.clone()))

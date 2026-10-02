@@ -201,6 +201,9 @@ pub(crate) fn wire_to_result(wire: ToolResultWire, origin: &str) -> ToolResult {
         .join("\n");
     let mut metadata = serde_json::Map::new();
     metadata.insert("origin".to_string(), Value::String(origin.to_string()));
+    if let Some(structured) = wire.structured {
+        metadata.insert("structured".to_string(), structured);
+    }
     ToolResult {
         content,
         success: !wire.is_error,
@@ -329,6 +332,14 @@ impl ToolSpec for HostToolSpec {
             // learns where else this process has workspaces.
             workspace: context.workspace.to_str().map(str::to_owned),
             ticket: invocation.as_ref().map(|i| i.ticket().to_string()),
+            session_id: context
+                .execution
+                .session_objects
+                .as_ref()
+                .map(|session| session.session_id.clone())
+                .filter(|id| !id.is_empty()),
+            agent_id: context.execution.owner_agent_id.clone(),
+            origin_turn_id: context.execution.origin_turn_id.clone(),
         });
         // The deadline stops while one of this call's `core/call`s waits on
         // the gate (an approval card), so a person's time is not the tool's.
@@ -355,5 +366,31 @@ impl ToolSpec for HostToolSpec {
             metadata.insert("core_calls".to_string(), receipts);
         }
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn structured_result_and_soft_failure_survive_the_host_boundary() {
+        let value = json!({"count": 2, "items": ["a", "b"]});
+        let result = wire_to_result(
+            ToolResultWire {
+                content: vec![ContentBlockWire::Text {
+                    text: "two items".to_string(),
+                }],
+                is_error: true,
+                structured: Some(value.clone()),
+            },
+            "extension:fixture",
+        );
+        assert_eq!(result.content, "two items");
+        assert!(!result.success);
+        let metadata = result.metadata.expect("result metadata");
+        assert_eq!(metadata["origin"], "extension:fixture");
+        assert_eq!(metadata["structured"], value);
     }
 }

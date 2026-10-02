@@ -1833,7 +1833,13 @@ async fn apply_command_result_inner(
                 app.status_message = Some(format!("Running /{name} ({origin})..."));
                 // Awaited here like `/balance`; the call is bounded by its
                 // deadline and cancelled in the host when it expires.
-                match crate::extension_host::run_command(&command, &input).await {
+                match crate::extension_host::run_command(
+                    &command,
+                    &input,
+                    app.current_session_id.as_deref(),
+                )
+                .await
+                {
                     Ok(CommandOutcome::Show { text }) => {
                         if text.trim().is_empty() {
                             app.status_message = Some(format!("/{name} completed"));

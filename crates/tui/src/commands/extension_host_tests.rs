@@ -194,14 +194,14 @@ async fn extension_commands_run_end_to_end_through_the_user_command_registry() {
     );
     assert_eq!(echo.origin, "extension:ext-commands");
     assert_eq!(
-        crate::extension_host::run_command(&echo, &args).await,
+        crate::extension_host::run_command(&echo, &args, None).await,
         Ok(CommandOutcome::Show {
             text: "echo: hello   there".to_string()
         })
     );
     let (ask, _, args) = dispatched(&mut app, "/EXT-ASK tokens");
     assert_eq!(
-        crate::extension_host::run_command(&ask, &args).await,
+        crate::extension_host::run_command(&ask, &args, None).await,
         Ok(CommandOutcome::Submit {
             prompt: "Summarize: tokens".to_string(),
             note: Some("Asking the model.".to_string())
@@ -209,11 +209,11 @@ async fn extension_commands_run_end_to_end_through_the_user_command_registry() {
     );
     let (fail, _, args) = dispatched(&mut app, "/ext-fail");
     assert_eq!(
-        crate::extension_host::run_command(&fail, &args).await,
+        crate::extension_host::run_command(&fail, &args, None).await,
         Err("unknown topic".to_string())
     );
     let (thrown, _, args) = dispatched(&mut app, "/ext-throw");
-    let error = crate::extension_host::run_command(&thrown, &args)
+    let error = crate::extension_host::run_command(&thrown, &args, None)
         .await
         .unwrap_err();
     assert!(
@@ -223,7 +223,7 @@ async fn extension_commands_run_end_to_end_through_the_user_command_registry() {
     // Escape sequences never reach the transcript.
     let (ansi, _, args) = dispatched(&mut app, "/ext-ansi");
     assert_eq!(
-        crate::extension_host::run_command(&ansi, &args).await,
+        crate::extension_host::run_command(&ansi, &args, None).await,
         Ok(CommandOutcome::Show {
             text: "plain red end".to_string()
         })
@@ -231,7 +231,7 @@ async fn extension_commands_run_end_to_end_through_the_user_command_registry() {
     // The DSH-shaped `rawInput` keeps its leading separator.
     let (dsh, _, args) = dispatched(&mut app, "/ext-dsh a b");
     assert_eq!(
-        crate::extension_host::run_command(&dsh, &args).await,
+        crate::extension_host::run_command(&dsh, &args, None).await,
         Ok(CommandOutcome::Show {
             text: "\" a b\"".to_string()
         })
@@ -244,7 +244,7 @@ async fn extension_commands_run_end_to_end_through_the_user_command_registry() {
     engine.sync().await.unwrap();
     assert!(manager.live_command_names().is_empty());
     assert_eq!(hint("ext-echo"), None);
-    let error = crate::extension_host::run_command(&echo, "x")
+    let error = crate::extension_host::run_command(&echo, "x", None)
         .await
         .unwrap_err();
     assert!(error.contains("no longer registered"), "{error}");
