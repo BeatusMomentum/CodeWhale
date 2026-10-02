@@ -628,6 +628,10 @@ pub enum Event {
         approval_force_prompt: bool,
     },
 
+    /// The engine no longer waits for this approval. Every decision surface
+    /// must retire the request by identity without sending a user decision.
+    ApprovalWithdrawn { id: String },
+
     /// Request user input for a tool call
     UserInputRequired {
         id: String,

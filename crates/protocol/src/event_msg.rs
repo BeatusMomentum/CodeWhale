@@ -694,6 +694,11 @@ pub enum EventMsg {
         intent_summary: Option<String>,
         approval_force_prompt: bool,
     },
+    ApprovalWithdrawn {
+        thread_id: ThreadId,
+        session_id: SessionId,
+        id: String,
+    },
     UserInputRequired {
         thread_id: ThreadId,
         session_id: SessionId,
@@ -881,6 +886,7 @@ impl EventMsg {
             Self::PauseEvents { .. } => "pause_events",
             Self::ResumeEvents { .. } => "resume_events",
             Self::ApprovalRequired { .. } => "approval_required",
+            Self::ApprovalWithdrawn { .. } => "approval_withdrawn",
             Self::UserInputRequired { .. } => "user_input_required",
             Self::SessionUpdated { .. } => "session_updated",
             Self::ElevationRequired { .. } => "elevation_required",
@@ -937,6 +943,7 @@ impl EventMsg {
             | Self::PauseEvents { thread_id, .. }
             | Self::ResumeEvents { thread_id, .. }
             | Self::ApprovalRequired { thread_id, .. }
+            | Self::ApprovalWithdrawn { thread_id, .. }
             | Self::UserInputRequired { thread_id, .. }
             | Self::SessionUpdated { thread_id, .. }
             | Self::ElevationRequired { thread_id, .. }
@@ -993,6 +1000,7 @@ impl EventMsg {
             | Self::PauseEvents { session_id, .. }
             | Self::ResumeEvents { session_id, .. }
             | Self::ApprovalRequired { session_id, .. }
+            | Self::ApprovalWithdrawn { session_id, .. }
             | Self::UserInputRequired { session_id, .. }
             | Self::SessionUpdated { session_id, .. }
             | Self::ElevationRequired { session_id, .. }
@@ -1394,6 +1402,11 @@ mod tests {
                 approval_grouping_key: "g".into(),
                 intent_summary: None,
                 approval_force_prompt: true,
+            },
+            EventMsg::ApprovalWithdrawn {
+                thread_id: t.clone(),
+                session_id: s.clone(),
+                id: "c1".into(),
             },
             EventMsg::UserInputRequired {
                 thread_id: t.clone(),

@@ -15003,6 +15003,117 @@ async fn terminal_turn_cancels_pending_dynamic_tool_exactly_once() -> Result<()>
 /// decision. It must never be sequenced after `approval.decided`, where it
 /// reads as a live claim that the (already answered) call is still waiting.
 #[tokio::test]
+async fn engine_withdrawal_retires_approval_and_unblocks_queued_events() -> Result<()> {
+    let manager = test_manager(test_runtime_dir())?;
+    let thread = manager
+        .create_thread(CreateThreadRequest::default())
+        .await?;
+    let mut harness = install_mock_engine(&manager, &thread.id).await;
+    let turn = manager
+        .start_turn(
+            &thread.id,
+            StartTurnRequest {
+                prompt: "run extension".to_string(),
+                ..Default::default()
+            },
+        )
+        .await?;
+    assert!(matches!(
+        harness.rx_op.recv().await,
+        Some(Op::SendMessage(TurnSpec { .. }))
+    ));
+    harness
+        .tx_event
+        .send(EngineEvent::TurnStarted {
+            turn_id: "engine_withdrawal".to_string(),
+            created_at: Utc::now(),
+            route: None,
+            submission_id: None,
+        })
+        .await?;
+    let request = |id: &str| EngineEvent::ApprovalRequired {
+        id: id.to_string(),
+        tool_name: "exec_shell".to_string(),
+        description: "extension call".to_string(),
+        input: json!({"command": "echo example"}),
+        approval_key: format!("extension-key:{id}"),
+        approval_grouping_key: "extension-group".to_string(),
+        intent_summary: None,
+        approval_force_prompt: true,
+    };
+    harness.tx_event.send(request("ext-1.1")).await?;
+    let withdrawn_id = await_approval_identity(&manager, &thread.id, "ext-1.1").await?;
+
+    // An unrelated event ahead of withdrawal must not park the event pump.
+    harness
+        .tx_event
+        .send(EngineEvent::MessageStarted { index: 0 })
+        .await?;
+    harness
+        .tx_event
+        .send(EngineEvent::MessageDelta {
+            index: 0,
+            content: "continued".into(),
+        })
+        .await?;
+    harness
+        .tx_event
+        .send(EngineEvent::ApprovalWithdrawn {
+            id: "ext-1.1".into(),
+        })
+        .await?;
+    harness.tx_event.send(request("ext-1.2")).await?;
+    let next_id = await_approval_identity(&manager, &thread.id, "ext-1.2").await?;
+    assert_ne!(withdrawn_id, next_id);
+    assert!(
+        !manager.deliver_external_approval(
+            &withdrawn_id,
+            ExternalApprovalDecision::Allow { remember: true },
+        ),
+        "withdrawal removes the capability before any late allow can create a grant"
+    );
+    let detail = manager.get_thread_detail(&thread.id).await?;
+    assert_eq!(detail.pending_approvals.len(), 1);
+    assert_eq!(detail.pending_approvals[0].id, next_id);
+    assert!(detail.approval_grants.is_empty());
+    assert!(
+        manager.deliver_external_approval(
+            &next_id,
+            ExternalApprovalDecision::Deny { remember: false }
+        )
+    );
+    assert_eq!(
+        harness.recv_approval_event().await,
+        Some(MockApprovalEvent::Denied {
+            id: "ext-1.2".into()
+        }),
+        "withdrawal itself never dispatches a fabricated user decision"
+    );
+    harness
+        .tx_event
+        .send(EngineEvent::TurnComplete {
+            usage: Usage::default(),
+            parent_route_usage: Usage::default(),
+            routed_usage_dropped_records: 0,
+            status: TurnOutcomeStatus::Completed,
+            error: None,
+            tool_catalog: None,
+            base_url: None,
+        })
+        .await?;
+    wait_for_terminal_turn(&manager, &turn.id).await?;
+    assert!(manager.events_since(&thread.id, None)?.iter().any(|event| {
+        event.event == "approval.decided"
+            && event.payload["approval_id"] == withdrawn_id
+            && event.payload["tool_call_id"] == "ext-1.1"
+            && event.payload["cancelled"] == true
+            && event.payload["remember"] == false
+    }));
+    assert_eq!(manager.pending_approvals_count(), 0);
+    Ok(())
+}
+
+#[tokio::test]
 async fn approval_wait_heartbeat_is_never_sequenced_after_the_decision() -> Result<()> {
     let manager = test_manager(test_runtime_dir())?;
     let thread = manager

@@ -14962,7 +14962,7 @@ impl RuntimeThreadManager {
         let mut saw_engine_activity = false;
         let mut saw_turn_started = false;
         let mut engine_turn_id: Option<String> = None;
-        let mut pending_event: Option<EngineEvent> = None;
+        let mut pending_events: VecDeque<EngineEvent> = VecDeque::new();
         let mut event_channel_closed = false;
         // Raw tool call IDs whose external approval this turn already settled.
         // An approval-wait heartbeat naming one of them is stale by the time
@@ -15029,7 +15029,7 @@ impl RuntimeThreadManager {
         let mut tool_restore_points: HashMap<String, String> = HashMap::new();
 
         loop {
-            let event = if let Some(event) = pending_event.take() {
+            let event = if let Some(event) = pending_events.pop_front() {
                 Some(event)
             } else if event_channel_closed {
                 None
@@ -15182,11 +15182,15 @@ impl RuntimeThreadManager {
                     current_message_item = Some(item);
                 }
                 EngineEvent::MessageDelta { content, .. } => {
-                    let batch =
-                        coalesce_stream_delta(&engine, StreamDeltaKind::Message, content).await;
-                    pending_event = batch.pending_event;
-                    event_channel_closed |= batch.channel_closed;
-                    let content = batch.content;
+                    let content = if pending_events.is_empty() {
+                        let batch =
+                            coalesce_stream_delta(&engine, StreamDeltaKind::Message, content).await;
+                        pending_events.extend(batch.pending_event);
+                        event_channel_closed |= batch.channel_closed;
+                        batch.content
+                    } else {
+                        content
+                    };
                     if let Some(item) = current_message_item.as_mut() {
                         let text = item.detail.get_or_insert_default();
                         text.push_str(&content);
@@ -15256,11 +15260,16 @@ impl RuntimeThreadManager {
                     current_reasoning_item = Some(item);
                 }
                 EngineEvent::ThinkingDelta { content, .. } => {
-                    let batch =
-                        coalesce_stream_delta(&engine, StreamDeltaKind::Reasoning, content).await;
-                    pending_event = batch.pending_event;
-                    event_channel_closed |= batch.channel_closed;
-                    let content = batch.content;
+                    let content = if pending_events.is_empty() {
+                        let batch =
+                            coalesce_stream_delta(&engine, StreamDeltaKind::Reasoning, content)
+                                .await;
+                        pending_events.extend(batch.pending_event);
+                        event_channel_closed |= batch.channel_closed;
+                        batch.content
+                    } else {
+                        content
+                    };
                     if let Some(item) = current_reasoning_item.as_mut() {
                         let text = item.detail.get_or_insert_default();
                         text.push_str(&content);
@@ -16150,15 +16159,24 @@ impl RuntimeThreadManager {
                     // parking the pump here used to sequence it after
                     // `approval.decided`, where it read as a live claim that
                     // the answered call was still waiting (DESKTOP-QA-20260923).
-                    // Anything else is held for the main loop, in order.
+                    // Other events stay ordered for the main loop, but must
+                    // not hide an approval withdrawal queued behind them.
                     let decision = loop {
                         tokio::select! {
                             biased;
-                            decision = &mut wait_for_decision => break decision,
                             event = async { engine.rx_event.write().await.recv().await },
-                                if pending_event.is_none() && !event_channel_closed =>
+                                if !event_channel_closed =>
                             {
                                 match event {
+                                    Some(EngineEvent::ApprovalWithdrawn { id: withdrawn }) if withdrawn == id => {
+                                        self.cancel_pending_approval(&approval_id);
+                                        break None;
+                                    }
+                                    Some(terminal @ EngineEvent::TurnComplete { .. }) => {
+                                        pending_events.push_back(terminal);
+                                        self.cancel_pending_approval(&approval_id);
+                                        break None;
+                                    }
                                     Some(EngineEvent::Status { message }) => {
                                         if let Err(err) = self
                                             .publish_status_item(
@@ -16176,13 +16194,37 @@ impl RuntimeThreadManager {
                                             );
                                         }
                                     }
-                                    Some(other) => pending_event = Some(other),
-                                    None => event_channel_closed = true,
+                                    Some(other) => pending_events.push_back(other),
+                                    None => {
+                                        event_channel_closed = true;
+                                        self.cancel_pending_approval(&approval_id);
+                                        break None;
+                                    }
                                 }
                             }
+                            decision = &mut wait_for_decision => break Some(decision),
                         }
                     };
                     settled_approval_calls.insert(id.clone());
+                    let Some(decision) = decision else {
+                        self.emit_event(
+                            &thread_id,
+                            Some(&turn_id),
+                            None,
+                            "approval.decided",
+                            json!({
+                                "approval_id": approval_id,
+                                "tool_call_id": id,
+                                "decision": "deny",
+                                "remember": false,
+                                "cancelled": true,
+                            }),
+                        )
+                        .await?;
+                        // The engine has already recorded Cancelled. A stale
+                        // card cannot grant work or overwrite that receipt.
+                        continue;
+                    };
                     // A decision may already have consumed the sender when
                     // Stop wins. Never remember or dispatch that late allow.
                     let cancelled = {
@@ -16313,6 +16355,7 @@ impl RuntimeThreadManager {
                         }
                     }
                 }
+                EngineEvent::ApprovalWithdrawn { .. } => {}
                 EngineEvent::ElevationRequired {
                     tool_id,
                     tool_name,

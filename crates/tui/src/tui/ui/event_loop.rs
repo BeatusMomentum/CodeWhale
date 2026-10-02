@@ -4125,6 +4125,8 @@ pub(crate) async fn run_event_loop(
                         )
                         .await;
                     }
+                    // Retired by pending_requests before session/idle filters.
+                    EngineEvent::ApprovalWithdrawn { .. } => {}
                     EngineEvent::UserInputRequired { id, request } => {
                         app.pending_user_input_prompt = Some((id.clone(), request.clone()));
                         app.view_stack.push(UserInputView::new(id.clone(), request));

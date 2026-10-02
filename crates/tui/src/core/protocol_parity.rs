@@ -903,6 +903,11 @@ pub fn event_to_protocol(event: &Event, ids: &ProtocolIds) -> wire::EventMsg {
             intent_summary: intent_summary.clone(),
             approval_force_prompt: *approval_force_prompt,
         },
+        Event::ApprovalWithdrawn { id } => wire::EventMsg::ApprovalWithdrawn {
+            thread_id,
+            session_id,
+            id: id.clone(),
+        },
         Event::UserInputRequired { id, request } => wire::EventMsg::UserInputRequired {
             thread_id,
             session_id,

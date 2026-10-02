@@ -284,6 +284,7 @@ impl Engine {
                 _ = self.cancel_token.cancelled() => {
                     let suffix = self.cancel_reason_suffix();
                     self.commit_approval_outcome(tool_id, ApprovalOutcome::Cancelled, Some(ApprovalDecider::Host)).await?;
+                    let _ = self.send_event(Event::ApprovalWithdrawn { id: tool_id.to_string() }).await;
                     return Err(ToolError::cancelled(
                         format!("Request cancelled while awaiting approval{suffix}"),
                     ));
@@ -295,6 +296,7 @@ impl Engine {
                     }
                 } => {
                     self.commit_approval_outcome(tool_id, ApprovalOutcome::Cancelled, Some(ApprovalDecider::Host)).await?;
+                    let _ = self.send_event(Event::ApprovalWithdrawn { id: tool_id.to_string() }).await;
                     let _ = self.send_event(Event::Status {
                         message: format!(
                             "Approval for `{tool_id}` withdrawn: the call that asked for it no longer waits for the answer"
@@ -2435,6 +2437,12 @@ mod tests {
                 |event| matches!(event, Event::Status { message } if message.contains("withdrawn"))
             ),
             "the withdrawal is announced"
+        );
+        assert!(
+            seen.iter().any(|event| {
+                matches!(event, Event::ApprovalWithdrawn { id } if id == "ext-1.1")
+            }),
+            "every decision surface receives the withdrawn approval identity"
         );
         // An answer that arrives afterwards finds no waiter and changes nothing.
         let _ = turn.handle.approve_tool_call("late-answer").await;

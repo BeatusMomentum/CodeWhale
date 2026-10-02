@@ -26679,6 +26679,44 @@ async fn recoverable_stream_error_keeps_active_turn_for_pending_approval() {
 }
 
 #[tokio::test]
+async fn withdrawn_extension_approval_retires_only_its_card_even_when_idle() {
+    let mut app = ask_posture_app();
+    app.is_loading = true;
+    let mut mock = mock_engine_handle();
+    let request = |id: &str| EngineEvent::ApprovalRequired {
+        id: id.into(),
+        tool_name: "exec_shell".into(),
+        description: "extension request".into(),
+        input: serde_json::json!({"command": "echo example"}),
+        approval_key: format!("ext:{id}"),
+        approval_grouping_key: format!("ext-group:{id}"),
+        intent_summary: None,
+        approval_force_prompt: true,
+    };
+    drain_approval_event(&mut app, &mock.handle, request("ext-1.1")).await;
+    drain_approval_event(&mut app, &mock.handle, request("ext-1.2")).await;
+    assert!(app.view_stack.contains_approval_id("ext-1.1"));
+    assert!(app.view_stack.contains_approval_id("ext-1.2"));
+    app.view_stack.push(HelpView::new());
+    app.is_loading = false;
+    assert!(crate::tui::pending_requests::observe_engine_event(
+        &mut app,
+        &EngineEvent::ApprovalWithdrawn {
+            id: "ext-1.1".into()
+        },
+    ));
+    assert!(!app.view_stack.contains_approval_id("ext-1.1"));
+    assert!(app.view_stack.contains_approval_id("ext-1.2"));
+    assert!(app.needs_redraw);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), mock.recv_approval_event())
+            .await
+            .is_err(),
+        "retiring a card does not fabricate a decision"
+    );
+}
+
+#[tokio::test]
 async fn recoverable_stream_error_after_local_cancel_resolves_stale_approval() {
     let mut app = create_test_app();
     app.is_loading = true;
