@@ -47,7 +47,8 @@
 //!
 //! Known limitations (by design — see the design doc §8 and its "As built"
 //! sections):
-//! * Tools and slash commands only: no hooks, skills, prompt sections or MCP.
+//! * Tools, slash commands and programmable pre-execute admission hooks.
+//!   Skills, prompt sections and MCP are not host services yet.
 //!   The one thing the host may ask the core to do is a `core/call` from a tool
 //!   under the turn's gate; commands, timers and activation code ask for
 //!   nothing.
@@ -119,6 +120,7 @@
 
 pub(crate) mod command;
 pub(crate) mod core_call;
+mod hooks;
 pub(crate) mod plugin_config;
 pub(crate) mod protocol;
 pub(crate) mod registry;
@@ -905,6 +907,7 @@ impl HostEvents for Events {
                 let kind = match params.kind {
                     RegisterKind::Tool => "tool",
                     RegisterKind::Command => "command",
+                    RegisterKind::Hook => "hook",
                 };
                 let message = format!(
                     "extension `{}` {kind} `{}` refused: {reason}",

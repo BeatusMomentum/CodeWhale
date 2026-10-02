@@ -200,6 +200,8 @@ export function validateMessage(
             ? 'a tool registration has no `spec.argument_hint`'
             : kind === 'command' && spec.input_schema != null
               ? 'a command registration has no `spec.input_schema`'
+              : kind === 'hook' && (spec.input_schema != null || spec.argument_hint != null)
+                ? 'a hook registration has no input schema or argument hint'
               : undefined
       if (reason !== undefined) throw new ProtocolError(`${method}: ${reason}`)
     }

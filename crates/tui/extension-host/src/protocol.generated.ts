@@ -34,6 +34,7 @@ export const METHODS = [
   { name: 'ext/deactivate', direction: 'core_to_host', request: true, params: 'DeactivateParams', tiers: ['plugin', 'builtin'] },
   { name: 'tool/call', direction: 'core_to_host', request: true, params: 'ToolCallParams', tiers: ['plugin', 'builtin'] },
   { name: 'command/run', direction: 'core_to_host', request: true, params: 'CommandRunParams', tiers: ['plugin', 'builtin'] },
+  { name: 'hook/evaluate', direction: 'core_to_host', request: true, params: 'HookEvaluateParams', tiers: ['plugin', 'builtin'] },
   { name: '$/cancel', direction: 'core_to_host', request: false, params: 'CancelParams', tiers: ['plugin', 'builtin'] },
   { name: 'host/hello', direction: 'host_to_core', request: false, params: 'HelloParams', tiers: ['plugin', 'builtin'] },
   { name: 'host/ready', direction: 'host_to_core', request: false, params: 'EmptyParams', tiers: ['plugin', 'builtin'] },
@@ -116,6 +117,16 @@ export const SHAPES: { readonly [name: string]: Shape } = {
     required: { name: 'string', version: 'string' },
     optional: {},
   },
+  HookCallPayload: {
+    strict: true,
+    required: { name: 'string', call_id: 'string', input: 'json', mode: 'string', workspace: 'string', model: 'string' },
+    optional: {},
+  },
+  HookEvaluateParams: {
+    strict: true,
+    required: { handle: 'uint', event: 'string', payload: { ref: 'HookCallPayload' }, deadline_ms: 'uint' },
+    optional: {},
+  },
   HostLimits: {
     strict: false,
     required: { max_frame: 'uint', max_inflight: 'uint', dispose_deadline_ms: 'uint', activate_deadline_ms: 'uint' },
@@ -148,7 +159,7 @@ export const SHAPES: { readonly [name: string]: Shape } = {
   },
   RegisterParams: {
     strict: true,
-    required: { owner: { ref: 'OwnerRef' }, kind: { enum: ['tool', 'command'] }, spec: { ref: 'RegisterSpecWire' } },
+    required: { owner: { ref: 'OwnerRef' }, kind: { enum: ['tool', 'command', 'hook'] }, spec: { ref: 'RegisterSpecWire' } },
     optional: {},
   },
   RegisterSpecWire: {
@@ -244,6 +255,24 @@ export interface HelloRuntime {
   version: string
 }
 
+export interface HookCallPayload {
+  name: string
+  call_id: string
+  input: Json
+  mode: string
+  workspace: string
+  model: string
+}
+
+export interface HookEvaluateParams {
+  handle: number
+  event: string
+  payload: HookCallPayload
+  deadline_ms: number
+}
+
+export type HookVerdictWire = { kind: 'abstain' } | { kind: 'deny'; reason: string } | { kind: 'ask'; reason: string } | { kind: 'annotate'; text: string } | { kind: 'revise'; input: { [key: string]: Json } }
+
 export interface HostLimits {
   max_frame: number
   max_inflight: number
@@ -280,7 +309,7 @@ export interface ProtocolRange {
   max: number
 }
 
-export type RegisterKind = 'tool' | 'command'
+export type RegisterKind = 'tool' | 'command' | 'hook'
 
 export interface RegisterParams {
   owner: OwnerRef

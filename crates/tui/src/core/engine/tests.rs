@@ -23,6 +23,9 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tempfile::tempdir;
 
+#[path = "tests/extension_hooks.rs"]
+mod extension_hooks;
+
 const WORKING_SET_SUMMARY_MARKER: &str = "## Repo Working Set";
 
 #[tokio::test]

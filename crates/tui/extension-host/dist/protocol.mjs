@@ -26,6 +26,7 @@ var METHODS = [
   { name: "ext/deactivate", direction: "core_to_host", request: true, params: "DeactivateParams", tiers: ["plugin", "builtin"] },
   { name: "tool/call", direction: "core_to_host", request: true, params: "ToolCallParams", tiers: ["plugin", "builtin"] },
   { name: "command/run", direction: "core_to_host", request: true, params: "CommandRunParams", tiers: ["plugin", "builtin"] },
+  { name: "hook/evaluate", direction: "core_to_host", request: true, params: "HookEvaluateParams", tiers: ["plugin", "builtin"] },
   { name: "$/cancel", direction: "core_to_host", request: false, params: "CancelParams", tiers: ["plugin", "builtin"] },
   { name: "host/hello", direction: "host_to_core", request: false, params: "HelloParams", tiers: ["plugin", "builtin"] },
   { name: "host/ready", direction: "host_to_core", request: false, params: "EmptyParams", tiers: ["plugin", "builtin"] },
@@ -87,6 +88,16 @@ var SHAPES = {
     required: { name: "string", version: "string" },
     optional: {}
   },
+  HookCallPayload: {
+    strict: true,
+    required: { name: "string", call_id: "string", input: "json", mode: "string", workspace: "string", model: "string" },
+    optional: {}
+  },
+  HookEvaluateParams: {
+    strict: true,
+    required: { handle: "uint", event: "string", payload: { ref: "HookCallPayload" }, deadline_ms: "uint" },
+    optional: {}
+  },
   HostLimits: {
     strict: false,
     required: { max_frame: "uint", max_inflight: "uint", dispose_deadline_ms: "uint", activate_deadline_ms: "uint" },
@@ -119,7 +130,7 @@ var SHAPES = {
   },
   RegisterParams: {
     strict: true,
-    required: { owner: { ref: "OwnerRef" }, kind: { enum: ["tool", "command"] }, spec: { ref: "RegisterSpecWire" } },
+    required: { owner: { ref: "OwnerRef" }, kind: { enum: ["tool", "command", "hook"] }, spec: { ref: "RegisterSpecWire" } },
     optional: {}
   },
   RegisterSpecWire: {
@@ -270,7 +281,7 @@ function validateMessage(value, direction, tier, methods = METHODS) {
     }
     if (method === "registry/register") {
       const { kind, spec: spec2 } = params;
-      const reason = kind === "tool" && spec2.input_schema == null ? "a tool registration needs `spec.input_schema`" : kind === "tool" && spec2.argument_hint != null ? "a tool registration has no `spec.argument_hint`" : kind === "command" && spec2.input_schema != null ? "a command registration has no `spec.input_schema`" : void 0;
+      const reason = kind === "tool" && spec2.input_schema == null ? "a tool registration needs `spec.input_schema`" : kind === "tool" && spec2.argument_hint != null ? "a tool registration has no `spec.argument_hint`" : kind === "command" && spec2.input_schema != null ? "a command registration has no `spec.input_schema`" : kind === "hook" && (spec2.input_schema != null || spec2.argument_hint != null) ? "a hook registration has no input schema or argument hint" : void 0;
       if (reason !== void 0) throw new ProtocolError(`${method}: ${reason}`);
     }
     return value;

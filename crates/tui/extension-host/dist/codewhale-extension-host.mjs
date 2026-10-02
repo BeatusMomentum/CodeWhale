@@ -4225,6 +4225,7 @@ var METHODS = [
   { name: "ext/deactivate", direction: "core_to_host", request: true, params: "DeactivateParams", tiers: ["plugin", "builtin"] },
   { name: "tool/call", direction: "core_to_host", request: true, params: "ToolCallParams", tiers: ["plugin", "builtin"] },
   { name: "command/run", direction: "core_to_host", request: true, params: "CommandRunParams", tiers: ["plugin", "builtin"] },
+  { name: "hook/evaluate", direction: "core_to_host", request: true, params: "HookEvaluateParams", tiers: ["plugin", "builtin"] },
   { name: "$/cancel", direction: "core_to_host", request: false, params: "CancelParams", tiers: ["plugin", "builtin"] },
   { name: "host/hello", direction: "host_to_core", request: false, params: "HelloParams", tiers: ["plugin", "builtin"] },
   { name: "host/ready", direction: "host_to_core", request: false, params: "EmptyParams", tiers: ["plugin", "builtin"] },
@@ -4286,6 +4287,16 @@ var SHAPES = {
     required: { name: "string", version: "string" },
     optional: {}
   },
+  HookCallPayload: {
+    strict: true,
+    required: { name: "string", call_id: "string", input: "json", mode: "string", workspace: "string", model: "string" },
+    optional: {}
+  },
+  HookEvaluateParams: {
+    strict: true,
+    required: { handle: "uint", event: "string", payload: { ref: "HookCallPayload" }, deadline_ms: "uint" },
+    optional: {}
+  },
   HostLimits: {
     strict: false,
     required: { max_frame: "uint", max_inflight: "uint", dispose_deadline_ms: "uint", activate_deadline_ms: "uint" },
@@ -4318,7 +4329,7 @@ var SHAPES = {
   },
   RegisterParams: {
     strict: true,
-    required: { owner: { ref: "OwnerRef" }, kind: { enum: ["tool", "command"] }, spec: { ref: "RegisterSpecWire" } },
+    required: { owner: { ref: "OwnerRef" }, kind: { enum: ["tool", "command", "hook"] }, spec: { ref: "RegisterSpecWire" } },
     optional: {}
   },
   RegisterSpecWire: {
@@ -4469,7 +4480,7 @@ function validateMessage(value, direction, tier, methods = METHODS) {
     }
     if (method === "registry/register") {
       const { kind, spec: spec2 } = params;
-      const reason = kind === "tool" && spec2.input_schema == null ? "a tool registration needs `spec.input_schema`" : kind === "tool" && spec2.argument_hint != null ? "a tool registration has no `spec.argument_hint`" : kind === "command" && spec2.input_schema != null ? "a command registration has no `spec.input_schema`" : void 0;
+      const reason = kind === "tool" && spec2.input_schema == null ? "a tool registration needs `spec.input_schema`" : kind === "tool" && spec2.argument_hint != null ? "a tool registration has no `spec.argument_hint`" : kind === "command" && spec2.input_schema != null ? "a command registration has no `spec.input_schema`" : kind === "hook" && (spec2.input_schema != null || spec2.argument_hint != null) ? "a hook registration has no input schema or argument hint" : void 0;
       if (reason !== void 0) throw new ProtocolError(`${method}: ${reason}`);
     }
     return value;
@@ -4759,6 +4770,56 @@ var OwnedRegistrations = class {
   }
 };
 
+// src/shims/hooks.ts
+function freezeJson(value) {
+  if (value && typeof value === "object") {
+    for (const child of Object.values(value)) freezeJson(child);
+    Object.freeze(value);
+  }
+  return value;
+}
+function hookExecution(payload, signal) {
+  return Object.freeze({
+    name: payload.name,
+    callId: payload.call_id,
+    arguments: freezeJson(payload.input),
+    signal,
+    workspace: payload.workspace,
+    mode: payload.mode,
+    model: payload.model
+  });
+}
+function hookVerdict(value, onAllow) {
+  if (value === void 0 || value === null) return { kind: "abstain" };
+  if (!isJson(value) || typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new TypeError("pre-execute listener must return a JSON verdict");
+  }
+  const result = value;
+  switch (result.kind) {
+    case "allow":
+      onAllow();
+      return { kind: "abstain" };
+    case "abstain":
+      return { kind: "abstain" };
+    case "deny":
+      if (typeof result.reason !== "string") throw new TypeError("deny needs a reason");
+      return { kind: "deny", reason: result.reason };
+    case "ask":
+      if (result.reason !== void 0 && typeof result.reason !== "string") throw new TypeError("ask reason must be text");
+      return { kind: "ask", reason: result.reason ?? "Requested by a pre-execute listener" };
+    case "annotate":
+      if (typeof result.text !== "string") throw new TypeError("annotate needs text");
+      return { kind: "annotate", text: result.text };
+    case "revise":
+      if (!result.input || typeof result.input !== "object" || Array.isArray(result.input)) {
+        throw new TypeError("revise needs a JSON object input");
+      }
+      return { kind: "revise", input: result.input };
+    default:
+      throw new TypeError(`unsupported pre-execute verdict ${JSON.stringify(result.kind)}`);
+  }
+}
+
 // src/tier.ts
 var HOST_OWNER_PREFIX = "host:";
 var TIERS = ["plugin", "builtin"];
@@ -4930,6 +4991,22 @@ var HostRoot = class {
       (owner) => owner.commands,
       (message, owner) => this.log("warn", message, owner)
     );
+    this.hookRegistrations = new OwnedRegistrations(
+      rpc2,
+      "hook",
+      (owner) => owner.hooks,
+      (message, owner) => this.log("warn", message, owner)
+    );
+    root.on("internal/listener", function(name, callback, options) {
+      if (name !== "tools/pre-execute") return;
+      const owner = this[OWNER];
+      if (!owner) throw new Error("pre-execute listener registered outside an extension owner");
+      if (options?.prepend || options?.global) throw new Error("pre-execute listeners use core registration order; prepend/global are unsupported");
+      return this.effect(() => host2.hookRegistrations.add(
+        { owner, name, callback, disposed: false },
+        { name, description: "Programmable tool admission listener" }
+      ), 'ctx.on("tools/pre-execute")');
+    });
     const shimClasses = /* @__PURE__ */ new Map();
     const shimsProvided = /* @__PURE__ */ new Set();
     const reflect = root.reflect;
@@ -4983,6 +5060,7 @@ var HostRoot = class {
   owners = /* @__PURE__ */ new Map();
   toolRegistrations;
   commandRegistrations;
+  hookRegistrations;
   log(level, msg, owner) {
     const params = { level, msg: msg.slice(0, 8192) };
     if (owner) params.plugin_id = owner.ref.plugin_id;
@@ -5038,6 +5116,7 @@ var HostRoot = class {
       refusals: [],
       tools: /* @__PURE__ */ new Map(),
       commands: /* @__PURE__ */ new Map(),
+      hooks: /* @__PURE__ */ new Map(),
       entries: /* @__PURE__ */ new Set(),
       ...params.data_dir === void 0 ? {} : { dataDir: params.data_dir },
       state: "activating"
@@ -5104,13 +5183,15 @@ var HostRoot = class {
     }
     const leaked = [
       ...[...owner.tools.values()].map((tool) => `tool:${tool.name}`),
-      ...[...owner.commands.values()].map((command) => `command:${command.name}`)
+      ...[...owner.commands.values()].map((command) => `command:${command.name}`),
+      ...[...owner.hooks.values()].map((hook) => `hook:${hook.name}`)
     ];
     for (const fiber of owner.fibers) {
       for (const effect of fiber.getEffects?.() ?? []) leaked.push(`effect:${effect.label}`);
     }
     this.toolRegistrations.forget(owner);
     this.commandRegistrations.forget(owner);
+    this.hookRegistrations.forget(owner);
     this.owners.delete(ref.owner_token);
     return { disposed, leaked };
   }
@@ -5146,6 +5227,22 @@ var HostRoot = class {
       const value = await definition.handler(makeInvocation(rawInput, commandId, signal, callContext(local.owner, workspace)));
       return normalizeResult(definition.name, value);
     });
+    return Promise.race([run, abortedBy(signal)]);
+  }
+  async evaluateHook(params, signal) {
+    const local = this.hookRegistrations.byHandle.get(params.handle);
+    if (!local || local.disposed || local.owner.state !== "active" || params.event !== local.name) {
+      throw new RpcError(ErrorCode.NotAvailable, "hook handle is not live for this event");
+    }
+    const exec = hookExecution(params.payload, signal);
+    const run = ownerStorage.run(local.owner, async () => hookVerdict(
+      await local.callback(exec, async () => ({ kind: "abstain" })),
+      () => {
+        if (local.owner.warnedAllow) return;
+        local.owner.warnedAllow = true;
+        this.log("warn", "pre-execute allow is an abstention; Rust still evaluates all admission gates", local.owner);
+      }
+    ));
     return Promise.race([run, abortedBy(signal)]);
   }
 };
@@ -5329,6 +5426,10 @@ rpc.onRequest("tool/call", async (params, cx) => {
 rpc.onRequest("command/run", async (params, cx) => {
   requireInitialized();
   return host.callCommand(params.handle, params.raw_input, params.command_id, cx.signal, params.workspace);
+});
+rpc.onRequest("hook/evaluate", async (params, cx) => {
+  requireInitialized();
+  return host.evaluateHook(params, cx.signal);
 });
 rpc.onRequest("host/shutdown", async () => {
   await host.deactivateAll(2e3);

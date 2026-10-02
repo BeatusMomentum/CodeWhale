@@ -8,6 +8,14 @@
 > from the text that follows. Where they disagree, the newest "As built"
 > section and the code are current; the rest is the plan for later phases.
 
+## As built: programmable pre-execute mods (2026-10-02)
+
+`ctx.on('tools/pre-execute', (exec, next) => ...)` now registers an owned `hook` handle through Cordis's `internal/listener` extension point. `hook/evaluate` is core-to-host only, carries a Rust-composed frozen call projection with DSH's `name`, `arguments`, `callId`, and cancellation `signal` spelling, and accepts monotonic `abstain`, `deny`, `ask`, `annotate`, and `revise` proposals. DSH `allow` maps to abstention; unsupported answers fail closed. No runtime, session, agent, invocation ticket, or approval handle is given to a listener.
+
+`HostAttachment::tool_before_hooks` scopes dispatch to this engine's desired reviewed owners, validates Native authority and owner generation before and after dispatch, and uses the existing owner cancellation and host supervision. Native hook results followed by TypeScript proposals enter `fold_tool_call_before_results`; the existing `reprepare_tool_call_after_hook` and all later policy/approval gates consume the revised arguments. Strict no-verdict semantics cover malformed replies, errors, the bounded five-second listener batch, and revocation. Multiple listeners share the existing deny/ask/last-input/context fold. The real-host acceptance drives native reads and a read-to-write revision through a real Engine, alongside owner withdrawal and workspace isolation.
+
+This is the bounded pre-execute part of phase 4. It does not implement DSH's around-execution waterfalls or replace its agent/token runtime; `next()` is an abstention rather than tool execution. `prepend`/`global`, post-result transformations, and lifecycle events remain absent. Standalone ACP has no TypeScript attachment; its native hook contract is preserved.
+
 ## As built: `core/call`, capability tickets and the gate for extension tools (2026-10-02)
 
 Slice B of the tier plan, and the first thing the host can ask the core to do.

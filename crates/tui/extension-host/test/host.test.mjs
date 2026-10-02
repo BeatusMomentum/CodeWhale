@@ -976,3 +976,34 @@ test('several core calls can be in flight at once, each answered to its own requ
   assert.equal(host.coreCalls.length, 4)
   assert.equal(new Set(host.coreCalls.map((c) => c.id)).size, 4)
 })
+
+test('programmable pre-execute listeners propose deny, ask, rewrite and context without core authority', async (t) => {
+  const host = await startHost()
+  t.after(() => host.stop())
+  const { ref, result } = await activate(host, 'hook-policy')
+  assert.equal(result.status, 'ok')
+  const hook = host.registry.find((entry) => entry.op === 'register' && entry.kind === 'hook')
+  assert.equal(hook.spec.name, 'tools/pre-execute')
+  const evaluate = (path) => host.call('hook/evaluate', {
+    handle: hook.handle, event: 'tools/pre-execute', deadline_ms: 5000,
+    payload: { name: 'read', call_id: 'hook-1', input: { path }, mode: 'Agent', workspace: '/workspace', model: 'fixture' },
+  })
+  assert.deepEqual(await evaluate('before.txt'), { kind: 'revise', input: { path: 'after.txt' } })
+  assert.deepEqual(await evaluate('blocked.txt'), { kind: 'deny', reason: 'blocked by fixture' })
+  assert.deepEqual(await evaluate('ask.txt'), { kind: 'ask', reason: 'fixture asks' })
+  assert.deepEqual(await evaluate('context.txt'), { kind: 'annotate', text: 'fixture context' })
+  assert.deepEqual(await evaluate('allow.txt'), { kind: 'abstain' })
+  assert.deepEqual(await evaluate('allow.txt'), { kind: 'abstain' })
+  assert.equal(host.logs.filter((log) => log.msg.includes('allow is an abstention')).length, 1)
+  assert.deepEqual(await evaluate('other.txt'), { kind: 'abstain' })
+  await assert.rejects(evaluate('malformed.txt'), /revise needs a JSON object/)
+  await assert.rejects(evaluate('throw.txt'), /fixture hook failure/)
+  const pending = host.request('hook/evaluate', {
+    handle: hook.handle, event: 'tools/pre-execute', deadline_ms: 5000,
+    payload: { name: 'read', call_id: 'hook-held', input: { path: 'held.txt' }, mode: 'Agent', workspace: '/workspace', model: 'fixture' },
+  })
+  host.cancel(pending.id)
+  await assert.rejects(pending.promise, (error) => error.code === ErrorCode.Cancelled)
+  assert.deepEqual(await host.call('ext/deactivate', { owner: ref }), { disposed: true, leaked: [] })
+  await assert.rejects(evaluate('before.txt'), (error) => error.code === ErrorCode.NotAvailable)
+})

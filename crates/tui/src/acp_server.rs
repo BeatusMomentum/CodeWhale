@@ -820,6 +820,7 @@ async fn prepare_acp_tool_with_hooks(
 
     let hook_outcome = run_tool_call_before_hooks(
         registry.context().runtime.hook_executor.as_ref(),
+        None, // This surface has no TypeScript host attachment.
         &call.name,
         &call.execution_id,
         &call.input,

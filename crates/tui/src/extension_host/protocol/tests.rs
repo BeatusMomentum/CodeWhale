@@ -29,6 +29,7 @@ fn params_schema(method: &str, generator: &mut SchemaGenerator) -> Schema {
         "ext/deactivate" => generator.subschema_for::<DeactivateParams>(),
         "tool/call" => generator.subschema_for::<ToolCallParams>(),
         "command/run" => generator.subschema_for::<CommandRunParams>(),
+        "hook/evaluate" => generator.subschema_for::<HookEvaluateParams>(),
         "$/cancel" => generator.subschema_for::<CancelParams>(),
         "host/hello" => generator.subschema_for::<HelloParams>(),
         "registry/register" => generator.subschema_for::<RegisterParams>(),
@@ -322,6 +323,7 @@ fn render() -> String {
     let _ = generator.subschema_for::<DeactivateResult>();
     let _ = generator.subschema_for::<ToolResultWire>();
     let _ = generator.subschema_for::<CommandResultWire>();
+    let _ = generator.subschema_for::<HookVerdictWire>();
     let defs: BTreeMap<String, Def> = generator
         .definitions()
         .iter()
@@ -500,6 +502,11 @@ const REVIEWED: &[(&str, &str, &str)] = &[
         "core_to_host",
         "$/cancel",
         "the core withdraws its own request",
+    ),
+    (
+        "core_to_host",
+        "hook/evaluate",
+        "the core evaluates a reviewed owner's listener; monotonic proposals are folded and any input revision is re-gated in Rust, with no approval or tool handle exposed",
     ),
     (
         "host_to_core",

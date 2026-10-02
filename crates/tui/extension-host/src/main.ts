@@ -168,6 +168,11 @@ rpc.onRequest('command/run', async (params: any, cx) => {
   return host.callCommand(params.handle, params.raw_input, params.command_id, cx.signal, params.workspace)
 })
 
+rpc.onRequest('hook/evaluate', async (params: any, cx) => {
+  requireInitialized()
+  return host.evaluateHook(params, cx.signal)
+})
+
 rpc.onRequest('host/shutdown', async () => {
   await host.deactivateAll(2_000)
   setImmediate(() => shutdownNow(0))

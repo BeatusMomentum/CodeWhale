@@ -3581,6 +3581,11 @@ impl Engine {
             if blocked_error.is_none() {
                 match run_tool_call_before_hooks(
                     self.config.hook_executor.as_ref(),
+                    self.extension_host.as_ref().filter(|_| {
+                        self.config
+                            .features
+                            .enabled(crate::features::Feature::ExtensionHost)
+                    }),
                     &tool_name,
                     &tool_id,
                     &tool_input,
@@ -7411,6 +7416,7 @@ pub(crate) struct ToolCallBeforeHookOutcome {
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_tool_call_before_hooks(
     hook_executor: Option<&std::sync::Arc<crate::hooks::HookExecutor>>,
+    extension_host: Option<&crate::extension_host::HostAttachment>,
     tool_name: &str,
     tool_call_id: &str,
     tool_input: &serde_json::Value,
@@ -7418,57 +7424,57 @@ pub(crate) async fn run_tool_call_before_hooks(
     workspace: &std::path::Path,
     model: &str,
 ) -> Result<ToolCallBeforeHookOutcome, ToolError> {
-    let Some(hook_executor) = hook_executor else {
-        return Ok(ToolCallBeforeHookOutcome::default());
-    };
-    if !hook_executor.has_hooks_for_event(crate::hooks::HookEvent::ToolCallBefore) {
-        return Ok(ToolCallBeforeHookOutcome::default());
+    let mut hook_results = Vec::new();
+    let mut lost = ToolCallHookFold::default();
+    if let Some(hook_executor) = hook_executor
+        && hook_executor.has_hooks_for_event(crate::hooks::HookEvent::ToolCallBefore)
+    {
+        if hook_executor.has_background_hooks_for_event(crate::hooks::HookEvent::ToolCallBefore) {
+            tracing::warn!("background ToolCallBefore hooks cannot decide admission");
+        }
+        let hook_context = crate::hooks::HookContext::new()
+            .with_tool_name(tool_name)
+            .with_tool_call_id(tool_call_id)
+            .with_tool_args(tool_input)
+            .with_mode(&format!("{mode:?}"))
+            .with_workspace(workspace.to_path_buf())
+            .with_model(model)
+            .with_session_id(hook_executor.session_id());
+        let executor = hook_executor.clone();
+        let strict_gates = hook_executor
+            .matched_strict_gate_labels(crate::hooks::HookEvent::ToolCallBefore, &hook_context);
+        match tokio::task::spawn_blocking(move || {
+            executor.execute(crate::hooks::HookEvent::ToolCallBefore, &hook_context)
+        })
+        .await
+        {
+            Ok(results) => hook_results.extend(results),
+            Err(join_err) => {
+                tracing::error!(target: "hooks", tool = %tool_name, "hook executor task unavailable: {join_err}");
+                lost = lost_executor_fold(&strict_gates);
+            }
+        }
     }
-
-    // Background hooks are observers: they return immediately and cannot
-    // provide an admission verdict.
-    if hook_executor.has_background_hooks_for_event(crate::hooks::HookEvent::ToolCallBefore) {
-        tracing::warn!(
-            "ToolCallBefore hook(s) configured with background=true — \
-             background hooks cannot deny tool calls because they exit \
-             immediately with no result"
+    if let Some(extension_host) = extension_host {
+        let native_fold = fold_tool_call_before_results(&hook_results);
+        hook_results.extend(
+            extension_host
+                .tool_before_hooks(crate::extension_host::protocol::HookCallPayload {
+                    name: tool_name.to_string(),
+                    call_id: tool_call_id.to_string(),
+                    input: native_fold
+                        .updated_input
+                        .unwrap_or_else(|| tool_input.clone()),
+                    mode: format!("{mode:?}"),
+                    workspace: workspace.to_string_lossy().into_owned(),
+                    model: model.to_string(),
+                })
+                .await,
         );
     }
-
-    // The executor owns the stable hook-session identity across every event.
-    let hook_context = crate::hooks::HookContext::new()
-        .with_tool_name(tool_name)
-        .with_tool_call_id(tool_call_id)
-        .with_tool_args(tool_input)
-        .with_mode(&format!("{mode:?}"))
-        .with_workspace(workspace.to_path_buf())
-        .with_model(model)
-        .with_session_id(hook_executor.session_id());
-    let executor = hook_executor.clone();
-    // Capture strict gates before dispatch so a lost blocking task cannot turn
-    // an operator-declared fail-closed hook into an implicit allow.
-    let strict_gates = hook_executor
-        .matched_strict_gate_labels(crate::hooks::HookEvent::ToolCallBefore, &hook_context);
-    let hook_results = match tokio::task::spawn_blocking(move || {
-        executor.execute(crate::hooks::HookEvent::ToolCallBefore, &hook_context)
-    })
-    .await
-    {
-        Ok(results) => Some(results),
-        Err(join_err) => {
-            tracing::error!(
-                target: "hooks",
-                tool = %tool_name,
-                strict_gates = strict_gates.len(),
-                "hook executor task panicked or was cancelled: {join_err}"
-            );
-            None
-        }
-    };
-    let fold = match &hook_results {
-        Some(results) => fold_tool_call_before_results(results),
-        None => lost_executor_fold(&strict_gates),
-    };
+    let mut fold = fold_tool_call_before_results(&hook_results);
+    fold.unavailable.extend(lost.unavailable);
+    fold.blocking_unavailable.extend(lost.blocking_unavailable);
     if !fold.unavailable.is_empty() {
         tracing::warn!(
             target: "hooks",

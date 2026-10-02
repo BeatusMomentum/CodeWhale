@@ -42,7 +42,7 @@ export class OwnedRegistrations<O extends OwnerBase, T extends OwnedEntry<O>> {
 
   constructor(
     private readonly rpc: RpcPeer,
-    private readonly kind: 'tool' | 'command',
+    private readonly kind: 'tool' | 'command' | 'hook',
     /** The owner's own index of this kind, for the leak report at deactivation. */
     private readonly ownedBy: (owner: O) => Map<number, T>,
     private readonly warn: (message: string, owner: O) => void,

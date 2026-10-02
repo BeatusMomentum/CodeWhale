@@ -190,6 +190,17 @@ pub struct CommandRegistration {
     pub argument_hint: Option<String>,
 }
 
+/// A programmable admission listener, owned and revoked like a tool.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HookRegistration {
+    pub handle: u64,
+    pub owner: OwnerRef,
+    pub tier: HostTier,
+    pub plugin_name: String,
+    pub content_hash: String,
+    pub event: String,
+}
+
 #[derive(Debug, Default)]
 pub struct OwnerRegistry {
     next_handle: u64,
@@ -202,6 +213,7 @@ pub struct OwnerRegistry {
     /// Command name → handle. Commands and tools are separate namespaces: a
     /// tool is called by the model, a command by the user.
     commands_by_name: HashMap<String, u64>,
+    hooks: BTreeMap<u64, HookRegistration>,
     /// Lower-cased names of every native tool any engine's turn build has
     /// reported, plus the static set. Only ever grows: engines in one
     /// process build different native surfaces, and a name that is native
@@ -408,7 +420,39 @@ impl OwnerRegistry {
         match params.kind {
             RegisterKind::Tool => self.register_tool(params),
             RegisterKind::Command => self.register_command(params),
+            RegisterKind::Hook => self.register_hook(params),
         }
+    }
+
+    fn register_hook(&mut self, params: &RegisterParams) -> Result<u64, String> {
+        params.check_spec()?;
+        if params.spec.name != "tools/pre-execute" {
+            return Err("only `tools/pre-execute` admission listeners are supported".to_string());
+        }
+        let entry = self
+            .current(&params.owner)
+            .ok_or_else(|| "stale or unknown owner".to_string())?;
+        if self.hooks.len() >= 1024
+            || self
+                .hooks
+                .values()
+                .filter(|hook| hook.owner == params.owner)
+                .count()
+                >= 128
+        {
+            return Err("extension hook registration limit reached".to_string());
+        }
+        let registration = HookRegistration {
+            handle: self.next_handle + 1,
+            owner: params.owner.clone(),
+            tier: entry.tier,
+            plugin_name: entry.plugin_name.clone(),
+            content_hash: entry.content_hash.clone(),
+            event: params.spec.name.clone(),
+        };
+        self.next_handle += 1;
+        self.hooks.insert(registration.handle, registration);
+        Ok(self.next_handle)
     }
 
     /// Admit or refuse one command registration. An extension command never
@@ -645,6 +689,14 @@ impl OwnerRegistry {
     /// Undo exactly one registration. Idempotent; a stale or foreign handle is a no-op.
     pub fn unregister(&mut self, owner: &OwnerRef, handle: u64) {
         if self
+            .hooks
+            .get(&handle)
+            .is_some_and(|hook| hook.owner == *owner)
+        {
+            self.hooks.remove(&handle);
+            return;
+        }
+        if self
             .commands
             .get(&handle)
             .is_some_and(|command| command.owner == *owner)
@@ -691,6 +743,8 @@ impl OwnerRegistry {
     }
 
     fn remove_registrations_of(&mut self, plugin_id: &str) -> Vec<u64> {
+        self.hooks
+            .retain(|_, hook| hook.owner.plugin_id != plugin_id);
         self.remove_commands_of(plugin_id);
         let handles: Vec<u64> = self
             .tools
@@ -734,6 +788,7 @@ impl OwnerRegistry {
     /// Drop every registration owned by `tier`'s host: the host that held
     /// them is gone, and the other tier's host is not.
     fn clear_tier_registrations(&mut self, tier: HostTier) {
+        self.hooks.retain(|_, hook| hook.tier != tier);
         self.tools.retain(|_, tool| tool.tier != tier);
         let tools = &self.tools;
         self.by_name.retain(|_, handle| tools.contains_key(handle));
@@ -792,6 +847,26 @@ impl OwnerRegistry {
             })
             .cloned()
             .collect()
+    }
+
+    /// Hooks of active owners, in registration order. Multiple listeners for
+    /// the same event coexist; withdrawing one never removes another.
+    pub fn live_hooks(&self) -> Vec<HookRegistration> {
+        self.hooks
+            .values()
+            .filter(|hook| self.is_live_hook(hook.handle, &hook.owner))
+            .cloned()
+            .collect()
+    }
+
+    pub fn is_live_hook(&self, handle: u64, owner: &OwnerRef) -> bool {
+        self.hooks
+            .get(&handle)
+            .is_some_and(|hook| hook.owner == *owner)
+            && self
+                .owners
+                .get(&owner.plugin_id)
+                .is_some_and(|entry| entry.owner == *owner && entry.state == OwnerState::Active)
     }
 
     /// Commands of active owners, in handle order.

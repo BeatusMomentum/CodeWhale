@@ -18,6 +18,8 @@ import {
   type CommandResultWire,
   type ContentBlockWire,
   type DeactivateResult,
+  type HookEvaluateParams,
+  type HookVerdictWire,
   type OwnerRef,
   type ToolResultWire,
 } from './protocol.ts'
@@ -26,6 +28,7 @@ import { explainImportError } from './dsh/resolve-hooks.ts'
 import { isJson } from './json.ts'
 import { makeCoreApi } from './shims/core.ts'
 import { OwnedRegistrations } from './shims/owned.ts'
+import { hookExecution, hookVerdict, type LocalHook } from './shims/hooks.ts'
 import { ownerTier, type HostTier } from './tier.ts'
 import {
   commandSpec,
@@ -76,6 +79,8 @@ export interface OwnerRecord {
   refusals: string[]
   tools: Map<number, LocalTool>
   commands: Map<number, LocalCommand<OwnerRecord>>
+  hooks: Map<number, LocalHook<OwnerRecord>>
+  warnedAllow?: boolean
   /** Entry modules activated under this owner so far (a plugin may declare several). */
   entries: Set<string>
   /** The plugin's own writable directory, as the core named it at activation. */
@@ -113,6 +118,7 @@ export class HostRoot {
   readonly owners = new Map<string, OwnerRecord>()
   private readonly toolRegistrations: OwnedRegistrations<OwnerRecord, LocalTool>
   private readonly commandRegistrations: OwnedRegistrations<OwnerRecord, LocalCommand<OwnerRecord>>
+  private readonly hookRegistrations: OwnedRegistrations<OwnerRecord, LocalHook<OwnerRecord>>
 
   constructor(
     private readonly rpc: RpcPeer,
@@ -134,6 +140,21 @@ export class HostRoot {
       (owner) => owner.commands,
       (message, owner) => this.log('warn', message, owner),
     )
+    this.hookRegistrations = new OwnedRegistrations(rpc, 'hook', (owner) => owner.hooks,
+      (message, owner) => this.log('warn', message, owner))
+
+    // Cordis already owns listener effects and teardown. Intercept this one
+    // event using its supported extension point instead of replacing ctx.on.
+    root.on('internal/listener', function (this: any, name: string, callback: any, options: any) {
+      if (name !== 'tools/pre-execute') return
+      const owner: OwnerRecord | undefined = this[OWNER]
+      if (!owner) throw new Error('pre-execute listener registered outside an extension owner')
+      if (options?.prepend || options?.global) throw new Error('pre-execute listeners use core registration order; prepend/global are unsupported')
+      return this.effect(() => host.hookRegistrations.add(
+        { owner, name, callback, disposed: false },
+        { name, description: 'Programmable tool admission listener' },
+      ), 'ctx.on("tools/pre-execute")')
+    })
 
     // Refuse core service names before any plugin can run. The refusal does
     // not depend on who calls: `ctx.root.provide(...)` runs with the root as
@@ -255,6 +276,7 @@ export class HostRoot {
       refusals: [],
       tools: new Map(),
       commands: new Map(),
+      hooks: new Map(),
       entries: new Set(),
       ...(params.data_dir === undefined ? {} : { dataDir: params.data_dir }),
       state: 'activating',
@@ -325,12 +347,14 @@ export class HostRoot {
     const leaked = [
       ...[...owner.tools.values()].map((tool) => `tool:${tool.name}`),
       ...[...owner.commands.values()].map((command) => `command:${command.name}`),
+      ...[...owner.hooks.values()].map((hook) => `hook:${hook.name}`),
     ]
     for (const fiber of owner.fibers) {
       for (const effect of fiber.getEffects?.() ?? []) leaked.push(`effect:${effect.label}`)
     }
     this.toolRegistrations.forget(owner)
     this.commandRegistrations.forget(owner)
+    this.hookRegistrations.forget(owner)
     this.owners.delete(ref.owner_token)
     return { disposed, leaked }
   }
@@ -380,6 +404,23 @@ export class HostRoot {
       const value = await definition.handler(makeInvocation(rawInput, commandId, signal, callContext(local.owner, workspace)))
       return normalizeResult(definition.name, value)
     })
+    return Promise.race([run, abortedBy(signal)])
+  }
+
+  async evaluateHook(params: HookEvaluateParams, signal: AbortSignal): Promise<HookVerdictWire> {
+    const local = this.hookRegistrations.byHandle.get(params.handle)
+    if (!local || local.disposed || local.owner.state !== 'active' || params.event !== local.name) {
+      throw new RpcError(ErrorCode.NotAvailable, 'hook handle is not live for this event')
+    }
+    const exec = hookExecution(params.payload, signal)
+    const run = ownerStorage.run(local.owner, async () => hookVerdict(
+      await local.callback(exec, async () => ({ kind: 'abstain' })),
+      () => {
+        if (local.owner.warnedAllow) return
+        local.owner.warnedAllow = true
+        this.log('warn', 'pre-execute allow is an abstention; Rust still evaluates all admission gates', local.owner)
+      },
+    ))
     return Promise.race([run, abortedBy(signal)])
   }
 }

@@ -146,6 +146,7 @@ pub const METHODS: &[MethodSpec] = &[
     row(Direction::CoreToHost, "ext/deactivate", true),
     row(Direction::CoreToHost, "tool/call", true),
     row(Direction::CoreToHost, "command/run", true),
+    row(Direction::CoreToHost, "hook/evaluate", true),
     row(Direction::CoreToHost, "$/cancel", false),
     row(Direction::HostToCore, "host/hello", false),
     row(Direction::HostToCore, "host/ready", false),
@@ -379,6 +380,7 @@ pub struct EmptyParams {}
 pub enum RegisterKind {
     Tool,
     Command,
+    Hook,
 }
 
 /// What a registration proposes. The fields a kind uses are fixed by
@@ -425,6 +427,9 @@ impl RegisterParams {
             }
             RegisterKind::Command if spec.input_schema.is_some() => {
                 Err("a command registration has no `spec.input_schema`".to_string())
+            }
+            RegisterKind::Hook if spec.input_schema.is_some() || spec.argument_hint.is_some() => {
+                Err("a hook registration has no input schema or argument hint".to_string())
             }
             _ => Ok(()),
         }
@@ -762,6 +767,43 @@ pub struct CommandRunParams {
     pub workspace: Option<String>,
 }
 
+/// A Rust-composed view of a pending call. No session handle or invocation
+/// ticket crosses this boundary.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct HookCallPayload {
+    pub name: String,
+    pub call_id: String,
+    pub input: Value,
+    pub mode: String,
+    pub workspace: String,
+    pub model: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct HookEvaluateParams {
+    pub handle: u64,
+    pub event: String,
+    pub payload: HookCallPayload,
+    pub deadline_ms: u64,
+}
+
+/// Monotonic proposals. Rust folds them with native hooks and re-prepares
+/// revised input through every policy and approval gate.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum HookVerdictWire {
+    Abstain,
+    Deny { reason: String },
+    Ask { reason: String },
+    Annotate { text: String },
+    Revise { input: Map<String, Value> },
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum CoreRequest {
     Ping,
@@ -774,6 +816,7 @@ pub enum CoreRequest {
     Deactivate(DeactivateParams),
     ToolCall(ToolCallParams),
     CommandRun(CommandRunParams),
+    HookEvaluate(HookEvaluateParams),
 }
 
 impl CoreRequest {
@@ -788,6 +831,7 @@ impl CoreRequest {
             Self::Deactivate(_) => "ext/deactivate",
             Self::ToolCall(_) => "tool/call",
             Self::CommandRun(_) => "command/run",
+            Self::HookEvaluate(_) => "hook/evaluate",
         }
     }
 
@@ -802,6 +846,7 @@ impl CoreRequest {
             Self::Deactivate(p) => to_value(p),
             Self::ToolCall(p) => to_value(p),
             Self::CommandRun(p) => to_value(p),
+            Self::HookEvaluate(p) => to_value(p),
         }
     }
 
@@ -833,6 +878,7 @@ impl CoreRequest {
             Self::Deactivate(_) => DISPOSE_DEADLINE + Duration::from_millis(500),
             Self::ToolCall(params) => Duration::from_millis(params.deadline_ms),
             Self::CommandRun(params) => Duration::from_millis(params.deadline_ms),
+            Self::HookEvaluate(params) => Duration::from_millis(params.deadline_ms),
         }
     }
 
@@ -961,6 +1007,7 @@ pub fn parse_core_message(value: Value, tier: HostTier) -> Result<CoreMessage, P
         "ext/deactivate" => CoreRequest::Deactivate(params(&method, p)?),
         "tool/call" => CoreRequest::ToolCall(params(&method, p)?),
         "command/run" => CoreRequest::CommandRun(params(&method, p)?),
+        "hook/evaluate" => CoreRequest::HookEvaluate(params(&method, p)?),
         _ => return Err(undecoded(&method)),
     };
     Ok(CoreMessage::Request { id, request })

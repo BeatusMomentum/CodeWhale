@@ -126,7 +126,8 @@ supplied service names are `tools`, `commands`, `logger`, `events`, `reflect`
 and `registry`. A tool can ask the core to run a core tool through
 `exec.core` (see [Asking the core to run a tool](#asking-the-core-to-run-a-tool));
 a storage service (a plugin has its own `dataDir` to write to), hooks, skills
-and prompt providers are not host services yet. A required
+and prompt providers are not host services yet. Programmable pre-execute
+listeners use `ctx.on` as described below. A required
 service that is unavailable fails activation with a diagnostic.
 
 Package runtime dependencies and local imports within the reviewed bundle.
@@ -285,6 +286,16 @@ such setting.
   and activated again as a new generation, with the new values; one whose table
   did not change is left alone. A file that cannot be read keeps the previous
   settings.
+
+## Programmable tool admission
+
+A reviewed native mod may register `ctx.on('tools/pre-execute', async (exec, next) => ...)`. The frozen call view carries `name`, `callId`, `arguments`, `signal`, `workspace`, `mode`, and `model`. It has no session, agent, tool, or approval handle. `next()` returns an abstention; Rust evaluates the remaining listeners and gates.
+
+Return `{kind:'deny', reason}`, `{kind:'ask', reason?}`, `{kind:'revise', input}` (a JSON object), `{kind:'annotate', text}`, or `{kind:'abstain'}`. `undefined` also abstains. DSH-shaped `allow` is an abstention and logs a warning once per owner. A malformed answer, thrown error, timeout, or withdrawn owner fails the call closed. The listener batch has a five-second deadline and observes cancellation through `exec.signal`.
+
+Native hooks run first, then mod listeners in core registration order. Denial always wins; the last accepted input revision wins. Rust re-prepares revised arguments and reruns the existing authority, policy, and approval checks. Input revisions use the existing 32 KiB hook limit; context and reasons use the existing sanitizers. Unloading a fiber removes its listener, and disabling or revoking an owner retires its admitted handles before host teardown. Other workspaces do not receive the call.
+
+This bridge runs on Engine sessions, including model tools, gated code-mode calls, and `exec.core` calls. The standalone ACP execution path has no TypeScript host attachment. Prepend/global listener ordering, DSH runtime/agent handles, around-execution wrappers, and post-result rewriting are not provided. Native `tool_call_after` remains an observer contract.
 
 ## Asking the core to run a tool
 
