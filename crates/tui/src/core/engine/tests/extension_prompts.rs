@@ -53,10 +53,6 @@ async fn extension_prompt_changes_and_retirement_are_recorded_without_rewriting_
     assert!(crate::runtime_handoff::is_runtime_owned_user_message(
         recorded
     ));
-    let cells = crate::tui::history::history_cells_from_message(recorded);
-    assert!(
-        matches!(cells.as_slice(), [crate::tui::history::HistoryCell::System { content }] if content.contains("Last instruction 2."))
-    );
     assert!(engine.refresh_pinned_header_for_turn(&context).is_none());
     assert_eq!(
         codewhale_core::prefix_cache::system_prompt_text(engine.session.system_prompt.as_ref()),

@@ -413,7 +413,7 @@ async fn without_the_turn_loops_gate_for_this_tool_there_is_no_ticket_and_no_cor
         .find(|entry| entry.registration.name == "cc-probe")
         .expect("the command is live")
         .reference();
-    match super::command::run(&manager.shared, &reference, "").await {
+    match super::command::run(&manager.shared, &reference, "", None).await {
         Ok(super::command::CommandOutcome::Show { text }) => {
             let probe: Value = serde_json::from_str(&text).unwrap();
             assert_eq!(probe["hasCore"], false, "{text}");

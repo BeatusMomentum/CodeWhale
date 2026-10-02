@@ -9,6 +9,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use codewhale_ratatui::{MotionMode, VerificationSpinner, spin};
 
+#[cfg(test)]
 pub(crate) const BRAILLE_SPINNER_FRAMES: [&str; 8] = spin::FRAMES;
 #[cfg(test)]
 const VERIFY_TICK_FRAMES: [&str; 8] = VerificationSpinner::FRAMES;
