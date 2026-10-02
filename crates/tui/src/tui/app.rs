@@ -2627,6 +2627,11 @@ pub struct App {
 }
 
 pub(crate) struct ToolRunCache {
+    /// Bumped each time the projection below is rebuilt, so anything derived
+    /// from it (the collapsed-row mapping) can tell it is stale without
+    /// re-deriving the key.
+    pub(crate) generation: u64,
+    pub(crate) filtered: FilteredProjection,
     pub(crate) history_version: u64,
     pub(crate) active_cell_revision: u64,
     pub(crate) active_len: usize,
@@ -2642,9 +2647,59 @@ pub(crate) struct ToolRunCache {
     pub(crate) superseded_todos: HashSet<usize>,
 }
 
+/// The collapsed transcript path's rendered-row -> original-index mapping.
+///
+/// Which rows survive filtering depends only on the tool-run projection and
+/// the user's hidden cells, never on cell revisions, so it is computed once
+/// per change of either instead of once per frame with a hash lookup per
+/// history cell (#6652). Revisions are still read fresh every frame.
+#[derive(Default)]
+pub(crate) struct FilteredProjection {
+    /// `ToolRunCache::generation` this mapping was built for.
+    built_for: Option<u64>,
+    collapsed_cells: HashSet<usize>,
+    /// Rendered position -> original virtual index.
+    pub(crate) original: Vec<usize>,
+    /// Rendered positions that show a collapsed-run summary instead of the
+    /// cell at their original index.
+    pub(crate) summary_slots: Vec<usize>,
+}
+
+impl ToolRunCache {
+    /// Refresh [`FilteredProjection`] unless it already matches the current
+    /// projection and `collapsed_cells`. `rows` is committed plus active.
+    pub(crate) fn refresh_filtered(&mut self, rows: usize, collapsed_cells: &HashSet<usize>) {
+        if self.filtered.built_for == Some(self.generation)
+            && self.filtered.collapsed_cells == *collapsed_cells
+        {
+            return;
+        }
+        self.filtered.original.clear();
+        self.filtered.summary_slots.clear();
+        for index in 0..rows {
+            if self.superseded_todos.contains(&index)
+                || collapsed_cells.contains(&index)
+                || self.hidden_indices.contains(&index)
+            {
+                continue;
+            }
+            if self.summaries.contains_key(&index) {
+                self.filtered
+                    .summary_slots
+                    .push(self.filtered.original.len());
+            }
+            self.filtered.original.push(index);
+        }
+        self.filtered.collapsed_cells.clone_from(collapsed_cells);
+        self.filtered.built_for = Some(self.generation);
+    }
+}
+
 impl Default for ToolRunCache {
     fn default() -> Self {
         Self {
+            generation: 0,
+            filtered: FilteredProjection::default(),
             history_version: u64::MAX,
             active_cell_revision: u64::MAX,
             active_len: usize::MAX,

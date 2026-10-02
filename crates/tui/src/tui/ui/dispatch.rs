@@ -617,7 +617,6 @@ pub(crate) fn prepare_user_dispatch(
         tool_evidence: app.tool_evidence.clone(),
         history_len: app.history.len(),
         history_revisions_len: app.history_revisions.len(),
-        history_version: app.history_version,
         api_messages_len: app.api_messages.len(),
         last_send_at: app.last_send_at,
     };
@@ -1137,7 +1136,10 @@ pub(crate) fn build_dispatch_error_closure(
             app.prune_transcript_index_state(prepare.snapshot.history_len);
             app.history_revisions
                 .truncate(prepare.snapshot.history_revisions_len);
-            app.history_version = prepare.snapshot.history_version;
+            // Never rewind the version: a cache keyed by (version, len) that
+            // saw the rolled-back echo would match a different cell that
+            // later lands at the same version and length.
+            app.history_version = app.history_version.wrapping_add(1);
             app.truncate_api_messages(prepare.snapshot.api_messages_len);
             app.last_send_at = prepare.snapshot.last_send_at;
             app.needs_redraw = true;

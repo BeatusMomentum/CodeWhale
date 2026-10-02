@@ -371,6 +371,7 @@ impl ChatWidget {
             {
                 cache.projection_builds += 1;
             }
+            cache.generation = cache.generation.wrapping_add(1);
             cache.summaries.clear();
             cache.hidden_indices.clear();
             for run in &runs {
@@ -407,16 +408,17 @@ impl ChatWidget {
             cache.calm_mode = app.calm_mode;
             cache.expanded_runs.clone_from(&app.expanded_tool_runs);
         }
-        let superseded_todos = &app.tool_run_cache.superseded_todos;
-        let collapsed_tool_indices = &app.tool_run_cache.hidden_indices;
-        let summary_cells = &app.tool_run_cache.summaries;
-
         // v0.9.1: do not collapse concurrent sub-agent cards into an Enter-
         // expand shelf. Count lives in header chrome; full cards stay visible;
         // sidebar / SubAgents modal are the drill-in surface.
         let has_collapsed = !app.collapsed_cells.is_empty()
-            || !summary_cells.is_empty()
-            || !superseded_todos.is_empty();
+            || !app.tool_run_cache.summaries.is_empty()
+            || !app.tool_run_cache.superseded_todos.is_empty();
+        if has_collapsed {
+            app.tool_run_cache
+                .refresh_filtered(history_len + active_entries.len(), &app.collapsed_cells);
+        }
+        let summary_cells = &app.tool_run_cache.summaries;
 
         // Fast path: no collapsed cells — use original slices directly.
         if !has_collapsed {
@@ -459,61 +461,32 @@ impl ChatWidget {
             // filtered→original index mapping. Collapsed run starts render a
             // synthetic summary cell borrowed from the generation cache.
             // No history cells or summary bodies are cloned on scroll frames.
-            let mut filtered_cells: Vec<&HistoryCell> =
-                Vec::with_capacity(history_len + active_entries.len());
-            let mut filtered_revs: Vec<u64> =
-                Vec::with_capacity(history_len + active_entries.len());
-            let mut filtered_to_original: Vec<usize> =
-                Vec::with_capacity(history_len + active_entries.len());
-
-            for (idx, cell) in app.history.iter().enumerate() {
-                if superseded_todos.contains(&idx) {
-                    continue;
-                }
-                if app.collapsed_cells.contains(&idx) {
-                    continue;
-                }
-                if collapsed_tool_indices.contains(&idx) {
-                    continue;
-                }
-                if let Some((summary, revision)) = summary_cells.get(&idx) {
-                    filtered_cells.push(summary);
-                    filtered_revs.push(*revision);
-                    filtered_to_original.push(idx);
-                    continue;
-                }
-                filtered_cells.push(cell);
-                filtered_revs.push(history_entry_revision(app.history_revisions[idx]));
-                filtered_to_original.push(idx);
-            }
-
-            if !active_entries.is_empty() {
-                let active_rev = app.active_cell_revision;
-                for (i, cell) in active_entries.iter().enumerate() {
-                    let original_idx = history_len + i;
-                    if superseded_todos.contains(&original_idx) {
-                        continue;
-                    }
-                    if app.collapsed_cells.contains(&original_idx) {
-                        continue;
-                    }
-                    if collapsed_tool_indices.contains(&original_idx) {
-                        continue;
-                    }
-                    if let Some((summary, revision)) = summary_cells.get(&original_idx) {
-                        filtered_cells.push(summary);
-                        filtered_revs.push(*revision);
-                        filtered_to_original.push(original_idx);
-                        continue;
-                    }
-                    filtered_cells.push(cell);
-                    let salt = (i as u64).wrapping_add(1);
-                    filtered_revs.push(active_entry_revision(active_rev, salt));
-                    filtered_to_original.push(original_idx);
+            // Which rows survive is cached per projection generation; only
+            // the revisions are gathered fresh (#6652).
+            let filtered = &app.tool_run_cache.filtered;
+            let active_rev = app.active_cell_revision;
+            let mut filtered_cells: Vec<&HistoryCell> = Vec::with_capacity(filtered.original.len());
+            let mut filtered_revs: Vec<u64> = Vec::with_capacity(filtered.original.len());
+            for &original in &filtered.original {
+                if original < history_len {
+                    filtered_cells.push(&app.history[original]);
+                    filtered_revs.push(history_entry_revision(app.history_revisions[original]));
+                } else {
+                    let active_index = original - history_len;
+                    filtered_cells.push(&active_entries[active_index]);
+                    filtered_revs.push(active_entry_revision(
+                        active_rev,
+                        (active_index as u64).wrapping_add(1),
+                    ));
                 }
             }
-
-            app.collapsed_cell_map = filtered_to_original;
+            for &slot in &filtered.summary_slots {
+                if let Some((summary, revision)) = summary_cells.get(&filtered.original[slot]) {
+                    filtered_cells[slot] = summary;
+                    filtered_revs[slot] = *revision;
+                }
+            }
+            app.collapsed_cell_map.clone_from(&filtered.original);
 
             app.viewport.transcript_cache.ensure_filtered(
                 &filtered_cells,
@@ -9756,5 +9729,328 @@ diff --git a/src/b.rs b/src/b.rs\n\
         assert!(fish_flee_offset(400) >= 8);
         assert_eq!(fish_flee_offset(800), 0);
         assert_eq!(fish_flee_offset(8_000), 0);
+    }
+
+    /// Cold-versus-warm proof for the whole chat frame (#6652): the cached
+    /// tool-run projection, the cached collapsed-row mapping, and the
+    /// transcript cache's in-place update must show exactly what a frame built
+    /// from empty caches shows, after every kind of transcript mutation.
+    #[test]
+    fn warm_chat_frame_matches_a_cold_frame_after_every_mutation() {
+        fn next(state: &mut u64) -> u64 {
+            *state ^= *state >> 12;
+            *state ^= *state << 25;
+            *state ^= *state >> 27;
+            state.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+        fn below(state: &mut u64, bound: usize) -> usize {
+            (next(state) % bound as u64) as usize
+        }
+        fn random_cell(state: &mut u64, serial: u64) -> HistoryCell {
+            match below(state, 8) {
+                0 => HistoryCell::User {
+                    content: format!("prompt {serial} with enough words to wrap in a narrow pane"),
+                },
+                1 => HistoryCell::Assistant {
+                    content: format!("answer {serial}\n\n- one\n- two"),
+                    streaming: false,
+                },
+                2 => HistoryCell::Thinking {
+                    content: format!("reasoning {serial}\nmore reasoning\nand more"),
+                    streaming: false,
+                    duration_secs: Some(1.0),
+                },
+                3 => todo_write_cell(Some(&format!("task {serial}"))),
+                _ => success_tool_cell(
+                    ["read_file", "list_dir", "web_search", "grep"][below(state, 4)],
+                ),
+            }
+        }
+        // Everything a frame leaves behind that a reader can observe: visible
+        // rows, transcript rows, row -> cell map, row total.
+        type Observed = (Vec<Line<'static>>, Vec<Line<'static>>, Vec<usize>, usize);
+        fn frame(app: &mut App, area: Rect) -> Observed {
+            let mut buf = Buffer::empty(area);
+            // An empty transcript paints the empty state and never consults
+            // the cache, so whatever it still holds is not on screen.
+            let empty_state = should_render_empty_state(app);
+            let widget = ChatWidget::new(app, area);
+            widget.render(area, &mut buf);
+            (
+                widget.lines.clone(),
+                if empty_state {
+                    Vec::new()
+                } else {
+                    app.viewport.transcript_cache.lines().to_vec()
+                },
+                app.collapsed_cell_map.clone(),
+                app.viewport.last_transcript_total,
+            )
+        }
+
+        // The same app, drawn with every cache empty.
+        fn cold_frame(app: &mut App, area: Rect) -> Observed {
+            let transcript = std::mem::replace(
+                &mut app.viewport.transcript_cache,
+                crate::tui::transcript::TranscriptViewCache::new(),
+            );
+            let projection = std::mem::take(&mut app.tool_run_cache);
+            let cold = frame(app, area);
+            app.viewport.transcript_cache = transcript;
+            app.tool_run_cache = projection;
+            cold
+        }
+
+        for seed in 1..=6u64 {
+            let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+            let mut app = create_test_app();
+            app.low_motion = true;
+            app.tool_collapse_mode = ToolCollapseMode::Compact;
+            app.tool_collapse_threshold = 3;
+            let mut width = 90u16;
+            let mut log: Vec<&'static str> = Vec::new();
+            let mut serial = 0u64;
+            for step in 0..120 {
+                serial += 1;
+                let total = app.history.len();
+                let op = match below(&mut state, 18) {
+                    0..=5 => {
+                        let cell = random_cell(&mut state, serial);
+                        app.add_message(cell);
+                        "add"
+                    }
+                    6 if total > 0 => {
+                        let index = below(&mut state, total);
+                        app.history[index] = random_cell(&mut state, serial);
+                        app.bump_history_cell(index);
+                        "replace"
+                    }
+                    7 => {
+                        let streaming = matches!(
+                            app.history.last(),
+                            Some(HistoryCell::Assistant {
+                                streaming: true,
+                                ..
+                            })
+                        );
+                        if streaming {
+                            let index = app.history.len() - 1;
+                            if let Some(HistoryCell::Assistant { content, .. }) =
+                                app.history.get_mut(index)
+                            {
+                                content.push_str(" streamed words\n");
+                            }
+                            app.bump_history_cell(index);
+                        } else {
+                            app.add_message(HistoryCell::Assistant {
+                                content: "opening ".to_string(),
+                                streaming: true,
+                            });
+                        }
+                        "stream"
+                    }
+                    8 if total > 0 => {
+                        let index = total - 1;
+                        if let Some(HistoryCell::Assistant { streaming, .. }) =
+                            app.history.get_mut(index)
+                        {
+                            *streaming = false;
+                        }
+                        app.bump_history_cell(index);
+                        "finish stream"
+                    }
+                    9 => {
+                        let cell = random_cell(&mut state, serial);
+                        app.active_cell
+                            .get_or_insert_with(ActiveCell::new)
+                            .push_untracked(cell);
+                        app.bump_active_cell_revision();
+                        "active push"
+                    }
+                    10 => {
+                        app.flush_active_cell();
+                        "flush active"
+                    }
+                    11 if total > 0 => {
+                        let index = below(&mut state, total + 2);
+                        if !app.collapsed_cells.remove(&index) {
+                            app.collapsed_cells.insert(index);
+                        }
+                        "hide cell"
+                    }
+                    12 if total > 0 => {
+                        let index = below(&mut state, total);
+                        if !app.expanded_tool_runs.remove(&index) {
+                            app.expanded_tool_runs.insert(index);
+                        }
+                        "expand run"
+                    }
+                    13 if total > 0 => {
+                        let index = below(&mut state, total);
+                        app.thinking_folds.insert(
+                            index,
+                            if below(&mut state, 2) == 0 {
+                                crate::tui::history::ThinkingFold::Expanded
+                            } else {
+                                crate::tui::history::ThinkingFold::Collapsed
+                            },
+                        );
+                        "fold"
+                    }
+                    14 => {
+                        app.tool_collapse_threshold = [0, 2, 3, 5][below(&mut state, 4)];
+                        "threshold"
+                    }
+                    15 => {
+                        width = [50, 90, 130][below(&mut state, 3)];
+                        "width"
+                    }
+                    16 if total > 0 && below(&mut state, 3) == 0 => {
+                        app.truncate_history_to(below(&mut state, total));
+                        "truncate"
+                    }
+                    17 if below(&mut state, 8) == 0 => {
+                        app.clear_history();
+                        "clear"
+                    }
+                    _ => "no-op",
+                };
+                log.push(op);
+                let context = || format!("seed {seed} step {step}: {}", log.join(", "));
+                let area = Rect::new(0, 0, width, 18);
+
+                let warm = frame(&mut app, area);
+                // Nothing changed: the next frame is the same frame.
+                assert_eq!(frame(&mut app, area), warm, "settled; {}", context());
+
+                let cold = cold_frame(&mut app, area);
+                if warm.0 != cold.0 {
+                    let row = warm
+                        .0
+                        .iter()
+                        .zip(&cold.0)
+                        .position(|(warm, cold)| warm != cold)
+                        .unwrap_or(warm.0.len().min(cold.0.len()));
+                    let plain = |lines: &[Line<'static>]| {
+                        lines
+                            .iter()
+                            .map(|line| line.to_string())
+                            .collect::<Vec<_>>()
+                            .join(" / ")
+                    };
+                    let kinds = app
+                        .history
+                        .iter()
+                        .map(|cell| format!("{cell:?}").chars().take(48).collect::<String>())
+                        .collect::<Vec<_>>();
+                    panic!(
+                        "visible rows differ at row {row} of {}/{}; cold frame repeatable: {}; {}\n warm: {:?}\n cold: {:?}\n map: {:?}\n cold map: {:?}\n warm rows: {}\n cold rows: {}\n history: {kinds:#?}\n collapsed {:?} expanded {:?} threshold {} active {}",
+                        warm.0.len(),
+                        cold.0.len(),
+                        cold_frame(&mut app, area) == cold,
+                        context(),
+                        warm.0.get(row),
+                        cold.0.get(row),
+                        warm.2,
+                        cold.2,
+                        plain(&warm.0),
+                        plain(&cold.0),
+                        app.collapsed_cells,
+                        app.expanded_tool_runs,
+                        app.tool_collapse_threshold,
+                        app.active_cell.as_ref().map_or(0, |a| a.entries().len()),
+                    );
+                }
+                assert_eq!(warm.1, cold.1, "transcript rows; {}", context());
+                assert_eq!(warm.2, cold.2, "row -> cell map; {}", context());
+                assert_eq!(warm.3, cold.3, "row total; {}", context());
+            }
+        }
+    }
+
+    /// Per-frame cost of preparing the collapsed transcript inputs, before
+    /// (a filter pass with three hash lookups per cell) and after (a key check
+    /// plus a gather over the cached mapping). Same binary, same history;
+    /// `--ignored --nocapture`.
+    #[test]
+    #[ignore = "timing benchmark, not a correctness gate"]
+    #[allow(clippy::print_stderr)]
+    fn bench_collapsed_row_mapping_per_frame() {
+        for turns in [1_000usize, 5_000] {
+            let mut app = create_test_app();
+            app.tool_collapse_mode = ToolCollapseMode::Compact;
+            app.tool_collapse_threshold = 3;
+            for turn in 0..turns {
+                app.add_message(HistoryCell::User {
+                    content: format!("question {turn}"),
+                });
+                for name in ["read_file", "list_dir", "web_search"] {
+                    app.add_message(success_tool_cell(name));
+                }
+                app.add_message(HistoryCell::Assistant {
+                    content: format!("answer {turn}"),
+                    streaming: false,
+                });
+            }
+            let area = Rect::new(0, 0, 120, 30);
+            let mut buf = Buffer::empty(area);
+            ChatWidget::new(&mut app, area).render(area, &mut buf);
+            let history_len = app.history.len();
+            let frames = 200u32;
+
+            let started = Instant::now();
+            let mut sink = 0usize;
+            for _ in 0..frames {
+                let cache = &app.tool_run_cache;
+                let mut cells: Vec<&HistoryCell> = Vec::with_capacity(history_len);
+                let mut revs: Vec<u64> = Vec::with_capacity(history_len);
+                let mut map: Vec<usize> = Vec::with_capacity(history_len);
+                for (idx, cell) in app.history.iter().enumerate() {
+                    if cache.superseded_todos.contains(&idx)
+                        || app.collapsed_cells.contains(&idx)
+                        || cache.hidden_indices.contains(&idx)
+                    {
+                        continue;
+                    }
+                    if let Some((summary, revision)) = cache.summaries.get(&idx) {
+                        cells.push(summary);
+                        revs.push(*revision);
+                    } else {
+                        cells.push(cell);
+                        revs.push(history_entry_revision(app.history_revisions[idx]));
+                    }
+                    map.push(idx);
+                }
+                sink += std::hint::black_box(cells.len() + revs.len() + map.len());
+            }
+            let before = started.elapsed() / frames;
+
+            let started = Instant::now();
+            for _ in 0..frames {
+                app.tool_run_cache
+                    .refresh_filtered(history_len, &app.collapsed_cells);
+                let filtered = &app.tool_run_cache.filtered;
+                let mut cells: Vec<&HistoryCell> = Vec::with_capacity(filtered.original.len());
+                let mut revs: Vec<u64> = Vec::with_capacity(filtered.original.len());
+                for &original in &filtered.original {
+                    cells.push(&app.history[original]);
+                    revs.push(history_entry_revision(app.history_revisions[original]));
+                }
+                for &slot in &filtered.summary_slots {
+                    if let Some((summary, revision)) =
+                        app.tool_run_cache.summaries.get(&filtered.original[slot])
+                    {
+                        cells[slot] = summary;
+                        revs[slot] = *revision;
+                    }
+                }
+                app.collapsed_cell_map.clone_from(&filtered.original);
+                sink += std::hint::black_box(cells.len() + revs.len());
+            }
+            let after = started.elapsed() / frames;
+            eprintln!(
+                "#6652 collapsed inputs: {history_len} cells, before {before:?}/frame, after {after:?}/frame ({sink})"
+            );
+        }
     }
 }

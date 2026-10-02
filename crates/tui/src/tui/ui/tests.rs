@@ -7474,6 +7474,7 @@ fn pop_and_truncate_prune_index_state_before_replacement() {
 fn dispatch_rollback_prunes_tail_state_and_keeps_revisions_monotonic() {
     let mut app = create_test_app();
     let config = Config::default();
+    let version_before_echo = app.history_version;
     let prepare = prepare_user_dispatch(
         &mut app,
         &config,
@@ -7491,6 +7492,10 @@ fn dispatch_rollback_prunes_tail_state_and_keeps_revisions_monotonic() {
     let error = apply(&mut app, &engine.handle, &config).expect_err("dispatch fails");
     assert_eq!(error.to_string(), "failed");
     assert_eq!(app.next_history_revision, next_revision);
+    // The history version feeds cache keys; rolling the echo back to the
+    // version it had before would let a later cell reuse a key a frame has
+    // already seen.
+    assert_ne!(app.history_version, version_before_echo);
     assert!(app.collapsed_cells.is_empty() && app.thinking_folds.is_empty());
     assert!(app.expanded_tool_runs.is_empty() && app.collapsed_cell_map.is_empty());
     app.push_history_cell(HistoryCell::Assistant {
@@ -32797,58 +32802,100 @@ fn long_session_history(turns: usize) -> Vec<HistoryCell> {
     cells
 }
 
+/// A session whose every turn ends in a run of three tool calls, so the
+/// collapsed-run projection (and the filtered transcript path) is live.
+fn collapsing_session_history(turns: usize) -> Vec<HistoryCell> {
+    let tool = |name: &str| {
+        HistoryCell::Tool(ToolCell::Generic(GenericToolCell {
+            name: name.to_string(),
+            status: ToolStatus::Success,
+            input_summary: Some(format!("path: {name}.txt")),
+            output: Some(format!("full output from {name}")),
+            prompts: None,
+            spillover_path: None,
+            output_summary: None,
+            is_diff: false,
+        }))
+    };
+    let mut cells = Vec::with_capacity(turns * 5);
+    for turn in 0..turns {
+        cells.push(HistoryCell::User {
+            content: format!("question {turn}: please look at the render path"),
+        });
+        for name in ["read_file", "list_dir", "web_search"] {
+            cells.push(tool(name));
+        }
+        cells.push(HistoryCell::Assistant {
+            content: format!("Answer {turn}.\n\n- point one\n- point two"),
+            streaming: false,
+        });
+    }
+    cells
+}
+
 /// Full-frame scroll benchmark for #6652; run with `--ignored --nocapture`.
+/// `plain` histories take the unfiltered path; `collapsed` ones take the
+/// filtered path with collapsed tool-run summaries.
 #[test]
 #[ignore = "timing benchmark, not a correctness gate"]
 #[allow(clippy::print_stderr)]
 fn bench_full_frame_scroll_cost_by_history_length() {
-    for turns in [100usize, 1_000] {
-        let mut app = create_test_app();
-        app.history = long_session_history(turns);
-        app.resync_history_revisions();
-        let config = Config::default();
-        let mut terminal = Terminal::new(TestBackend::new(140, 40)).unwrap();
-        terminal
-            .draw(|frame| {
-                let _ = super::frame::render(frame, &mut app, &config);
-            })
-            .unwrap();
-        let frames = 200u32;
-        let started = Instant::now();
-        for _ in 0..frames {
-            app.viewport.pending_scroll_delta = -3;
-            app.needs_redraw = true;
+    for collapsed in [false, true] {
+        let shape = if collapsed { "collapsed" } else { "plain" };
+        for turns in [100usize, 1_000, 5_000] {
+            let mut app = create_test_app();
+            if collapsed {
+                app.tool_collapse_mode = crate::tui::app::ToolCollapseMode::Compact;
+                app.tool_collapse_threshold = 3;
+                app.history = collapsing_session_history(turns);
+            } else {
+                app.history = long_session_history(turns);
+            }
+            app.resync_history_revisions();
+            let config = Config::default();
+            let mut terminal = Terminal::new(TestBackend::new(140, 40)).unwrap();
             terminal
                 .draw(|frame| {
                     let _ = super::frame::render(frame, &mut app, &config);
                 })
                 .unwrap();
+            let frames = 200u32;
+            let started = Instant::now();
+            for _ in 0..frames {
+                app.viewport.pending_scroll_delta = -3;
+                app.needs_redraw = true;
+                terminal
+                    .draw(|frame| {
+                        let _ = super::frame::render(frame, &mut app, &config);
+                    })
+                    .unwrap();
+            }
+            let elapsed = started.elapsed();
+            eprintln!(
+                "#6652 full-frame {shape}: {} cells, {} lines, {:?}/scroll frame",
+                app.history.len(),
+                app.viewport.transcript_cache.total_lines(),
+                elapsed / frames
+            );
+            // Chrome that grows or shrinks (composer lines, toasts, turn rows)
+            // changes the transcript height without changing its width.
+            let started = Instant::now();
+            for frame in 0..frames {
+                let height = if frame % 2 == 0 { 41 } else { 40 };
+                terminal.backend_mut().resize(140, height);
+                app.needs_redraw = true;
+                terminal
+                    .draw(|frame| {
+                        let _ = super::frame::render(frame, &mut app, &config);
+                    })
+                    .unwrap();
+            }
+            eprintln!(
+                "#6652 full-frame {shape}: {} cells, {:?}/height-change frame",
+                app.history.len(),
+                started.elapsed() / frames
+            );
         }
-        let elapsed = started.elapsed();
-        eprintln!(
-            "#6652 full-frame: {} cells, {} lines, {:?}/scroll frame",
-            app.history.len(),
-            app.viewport.transcript_cache.total_lines(),
-            elapsed / frames
-        );
-        // Chrome that grows or shrinks (composer lines, toasts, turn rows)
-        // changes the transcript height without changing its width.
-        let started = Instant::now();
-        for frame in 0..frames {
-            let height = if frame % 2 == 0 { 41 } else { 40 };
-            terminal.backend_mut().resize(140, height);
-            app.needs_redraw = true;
-            terminal
-                .draw(|frame| {
-                    let _ = super::frame::render(frame, &mut app, &config);
-                })
-                .unwrap();
-        }
-        eprintln!(
-            "#6652 full-frame: {} cells, {:?}/height-change frame",
-            app.history.len(),
-            started.elapsed() / frames
-        );
     }
 }
 

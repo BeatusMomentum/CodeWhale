@@ -237,7 +237,6 @@ pub(crate) struct UserDispatchSnapshot {
     pub(crate) tool_evidence: Vec<ToolEvidence>,
     pub(crate) history_len: usize,
     pub(crate) history_revisions_len: usize,
-    pub(crate) history_version: u64,
     pub(crate) api_messages_len: usize,
     pub(crate) last_send_at: Option<Instant>,
 }
