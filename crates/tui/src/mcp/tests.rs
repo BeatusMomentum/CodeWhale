@@ -2733,6 +2733,49 @@ fn init_mcp_config_rejects_traversal_before_parent_creation() {
     );
 }
 
+/// A workspace's `.codewhale/mcp.json` is never written through a link: not
+/// when `.codewhale` itself is a link, and not when the file is. Reads stay
+/// unchanged and the outside directory is never touched.
+#[cfg(unix)]
+#[test]
+fn project_mcp_config_writes_refuse_links_out_of_the_workspace() {
+    use std::os::unix::fs::symlink;
+    let workspace = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    symlink(outside.path(), workspace.path().join(".codewhale")).unwrap();
+    let path = workspace_mcp_config_path(workspace.path());
+
+    let err = init_config(&path, false).expect_err("a linked .codewhale is refused");
+    assert!(
+        format!("{err:#}").contains("Refusing symlinked"),
+        "got: {err:#}"
+    );
+    let err = mutate_config(&path, None, |_| Ok(())).expect_err("mutation is refused too");
+    assert!(
+        format!("{err:#}").contains("Refusing symlinked"),
+        "got: {err:#}"
+    );
+    assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
+
+    // A linked file inside a real `.codewhale` is refused as well.
+    let other = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(other.path().join(".codewhale")).unwrap();
+    let target = outside.path().join("target.json");
+    symlink(&target, other.path().join(".codewhale").join("mcp.json")).unwrap();
+    assert!(init_config(&workspace_mcp_config_path(other.path()), false).is_err());
+    assert!(
+        !target.exists(),
+        "a link at the file name must not be created through"
+    );
+
+    // An ordinary workspace still works.
+    let plain = tempfile::tempdir().unwrap();
+    assert_eq!(
+        init_config(&workspace_mcp_config_path(plain.path()), false).unwrap(),
+        McpWriteStatus::Created
+    );
+}
+
 #[test]
 fn test_mcp_config_manager_actions_round_trip() {
     let dir = tempfile::tempdir().unwrap();
