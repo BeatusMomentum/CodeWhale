@@ -10,8 +10,8 @@ use super::observer_hooks::{
     execute_turn_end_observer_hook, surface_observer_hook_submission_failure,
 };
 use super::task_projection::{
-    refresh_active_task_panel, refresh_automation_panel, refresh_automation_panel_blocking,
-    refresh_shell_exec_live_output,
+    AUTOMATION_SCAN_BUSY_INTERVAL, automation_scan_is_due, refresh_active_task_panel,
+    refresh_automation_panel, refresh_automation_panel_blocking, refresh_shell_exec_live_output,
 };
 use super::*;
 use crate::tui::shell_key_routing::ShellBindingId;
@@ -1654,10 +1654,25 @@ pub(super) fn edit_replacement_result(
 /// takes no optional locks, so running it mid-turn cannot block the user's
 /// own git.
 pub(crate) fn git_probe_allowed(app: &App, workspace_context_refresh_allowed: bool) -> bool {
-    workspace_context_refresh_allowed
-        || (app.work_surface.panel == crate::tui::work_surface::RailPanel::Git
-            && app.work_surface.effective_placement()
-                != crate::tui::work_surface::WorkSurfacePlacement::Off)
+    workspace_context_refresh_allowed || git_panel_visible(app)
+}
+
+/// The quiet time the git probe schedule sees: none at all while the Git
+/// panel is showing, so that live view keeps the fast cadence (#6728).
+pub(crate) fn git_probe_quiet_for(app: &App, quiet_for: Duration) -> Duration {
+    if git_panel_visible(app) {
+        Duration::ZERO
+    } else {
+        quiet_for
+    }
+}
+
+/// The Git rail panel is showing: it is the live repository state, so the
+/// probe keeps its fast cadence however quiet the session is (#6728).
+pub(crate) fn git_panel_visible(app: &App) -> bool {
+    app.work_surface.panel == crate::tui::work_surface::RailPanel::Git
+        && app.work_surface.effective_placement()
+            != crate::tui::work_surface::WorkSurfacePlacement::Off
 }
 
 pub(crate) async fn run_event_loop(
@@ -1695,6 +1710,18 @@ pub(crate) async fn run_event_loop(
         .unwrap_or_else(Instant::now);
     let mut last_status_frame = Instant::now()
         .checked_sub(Duration::from_millis(UI_STATUS_ANIMATION_MS))
+        .unwrap_or_else(Instant::now);
+    // #6728: the last moment anything happened that wanted a prompt reaction:
+    // a terminal event, an engine event, or any non-quiescent UI state. The
+    // idle poll, the automation scan and the git probe all back off from it,
+    // and all return to full cadence the moment it moves.
+    let mut last_ui_activity = Instant::now();
+    // Whether the previous iteration found the UI quiescent and quiet (see
+    // `ui_state_is_quiescent`). The 2.5 s task block runs before this
+    // iteration's facts exist, so it reads the previous one.
+    let mut ui_quiet = false;
+    let mut last_automation_scan = Instant::now()
+        .checked_sub(AUTOMATION_SCAN_BUSY_INTERVAL)
         .unwrap_or_else(Instant::now);
     // 120 FPS draw cap. Without this we redraw on every SSE chunk during a
     // long stream — wasted work the user can't perceive. See
@@ -2090,8 +2117,19 @@ pub(crate) async fn run_event_loop(
             // held for finite work or a busy parent turn goes out once that
             // work settles (#6565).
             flush_background_finished(app, config, false);
-            if refresh_automation_panel(app).await {
+            // A finished scan is folded on every tick; the next one starts
+            // only when due. A quiet UI with nothing scheduled or live
+            // rescans on the long cadence (#6728).
+            let automation_scan_due = automation_scan_is_due(
+                app,
+                ui_quiet,
+                Instant::now().saturating_duration_since(last_automation_scan),
+            );
+            if refresh_automation_panel(app, automation_scan_due).await {
                 app.needs_redraw = true;
+            }
+            if automation_scan_due {
+                last_automation_scan = Instant::now();
             }
             if refresh_shell_exec_live_output(app) {
                 app.needs_redraw = true;
@@ -2180,6 +2218,9 @@ pub(crate) async fn run_event_loop(
 
         // First, poll for engine events (non-blocking)
         let mut received_engine_event = false;
+        // Any engine event at all, including ones that asked for no redraw:
+        // it is activity for the idle backoff (#6728).
+        let mut engine_event_seen = false;
         let mut transcript_batch_updated = false;
         // #freeze: coalesce per-event `Op::ListSubAgents` sends into a single
         // trailing-edge refresh per drain. At high fanout, many spawn/complete/
@@ -2217,6 +2258,7 @@ pub(crate) async fn run_event_loop(
                 // producer flooding them never tripped the drain budget and
                 // the loop never returned to render or read the cancel key.
                 events_drained = events_drained.saturating_add(1);
+                engine_event_seen = true;
                 // #3033: remember whether an EARLIER event in this drain batch
                 // already requested a redraw. The AgentProgress throttle below
                 // may opt the current event out of repainting, but it must not
@@ -4551,6 +4593,31 @@ pub(crate) async fn run_event_loop(
         let underwater_motion =
             underwater_ambient_motion || underwater_completion_motion || launch_motion;
         let animation_active = status_motion || underwater_motion;
+        // #6728: what the loop knows about its own quiet. Anything that
+        // wants a prompt reaction moves `last_ui_activity`; the idle poll,
+        // the automation scan and the git probe all back off from it.
+        let idle_facts = IdleFacts {
+            has_running_agents,
+            animation_active,
+            durable_tasks_active,
+            input_pending: !pending_terminal_events.is_empty(),
+            pending_engine_op: pending_subagent_list_refresh,
+        };
+        {
+            let tick_now = Instant::now();
+            if engine_event_seen || !ui_state_is_quiescent(app, &idle_facts, tick_now) {
+                last_ui_activity = tick_now;
+            }
+            let quiet_for = tick_now.saturating_duration_since(last_ui_activity);
+            ui_quiet = quiet_for >= UI_QUIESCENT_AFTER
+                && ui_state_is_quiescent(app, &idle_facts, tick_now);
+            // The git cache TTL follows the same quiet clock, set every
+            // iteration so a stale back-off can never outlive the activity
+            // that ended it (a turn does not reach the probe block below).
+            crate::tui::git_status::set_probe_backoff(crate::tui::git_status::probe_is_backed_off(
+                git_probe_quiet_for(app, quiet_for),
+            ));
+        }
         let animation_interval = Duration::from_millis(animation_interval_ms(
             app,
             status_motion,
@@ -4681,17 +4748,23 @@ pub(crate) async fn run_event_loop(
         let allow_workspace_context_refresh =
             !app.is_loading && !has_running_agents && !app.is_compacting && !app.is_purging;
         workspace_context::refresh_if_needed(app, now, allow_workspace_context_refresh);
-        // Native git chrome: at most one background probe per cache TTL, never
+        // Native git chrome: at most one background probe per interval, never
         // on the render path. While a turn is live it waits, unless the Git
         // view is showing: that view is the live repository state (#6565).
+        // Every probe is about a dozen `git` processes, so an untouched
+        // session backs off to a slow cadence and the next input or engine
+        // event (a tool finishing, say) brings the fast one back (#6728).
         if git_probe_allowed(app, allow_workspace_context_refresh) {
             static GIT_PROBE_LOCK: std::sync::OnceLock<std::sync::Mutex<Option<Instant>>> =
                 std::sync::OnceLock::new();
             let slot = GIT_PROBE_LOCK.get_or_init(|| std::sync::Mutex::new(None));
+            let quiet_for =
+                git_probe_quiet_for(app, now.saturating_duration_since(last_ui_activity));
             let should_probe = slot
                 .lock()
                 .map(|mut last| {
-                    let due = last.is_none_or(|t| t.elapsed() >= Duration::from_secs(2));
+                    let due =
+                        crate::tui::git_status::probe_due(last.map(|t| t.elapsed()), quiet_for);
                     if due {
                         *last = Some(Instant::now());
                     }
@@ -4757,7 +4830,15 @@ pub(crate) async fn run_event_loop(
             if app.is_loading || has_running_agents || app.is_compacting || app.is_purging {
                 Duration::from_millis(active_poll_ms(app))
             } else {
-                Duration::from_millis(idle_poll_ms(app))
+                // Relaxes only once the UI has been quiescent and quiet for
+                // `UI_QUIESCENT_AFTER` (#6728); every deadline below still
+                // shortens it, and input returns the loop at once.
+                idle_poll_duration(
+                    app,
+                    &idle_facts,
+                    now,
+                    now.saturating_duration_since(last_ui_activity),
+                )
             };
         if let Some(until_flush) = app.paste_burst_next_flush_delay_if_enabled(now) {
             poll_timeout = poll_timeout.min(until_flush);
@@ -4793,6 +4874,9 @@ pub(crate) async fn run_event_loop(
 
         let maybe_terminal_event =
             next_terminal_event(&terminal_input, &mut pending_terminal_events, poll_timeout)?;
+        if maybe_terminal_event.is_some() {
+            last_ui_activity = Instant::now();
+        }
         if maybe_terminal_event.is_none() {
             let now = Instant::now();
             let input_stalled_for = terminal_input.stalled_for(now);
