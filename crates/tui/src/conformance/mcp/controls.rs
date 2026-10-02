@@ -290,14 +290,22 @@ fn the_secret_scan_trips_on_every_spelling_of_the_token() {
         "{\"requests\": [{\"authorization\": \"<bearer>\"}]}",
     )
     .expect("a shape is not a secret");
-    for leaked in [
-        format!("Authorization: Bearer {secret}"),
-        format!("{{\"detail\": \"rejected {secret}\"}}"),
-        format!("http://host/mcp?token={secret}"),
+    // Name the spelling that was missed, never print it: the failure message
+    // must not carry the token (or a string built from it) into a log.
+    for (spelling, leaked) in [
+        (
+            "an Authorization header",
+            format!("Authorization: Bearer {secret}"),
+        ),
+        (
+            "a JSON error detail",
+            format!("{{\"detail\": \"rejected {secret}\"}}"),
+        ),
+        ("a URL query", format!("http://host/mcp?token={secret}")),
     ] {
         assert!(
             assert_no_secret(secret, &leaked).is_err(),
-            "scan missed: {leaked}"
+            "the scan missed the token in {spelling}"
         );
     }
 }
