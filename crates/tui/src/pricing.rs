@@ -399,20 +399,23 @@ fn host_of(url: &str) -> Option<String> {
         .map(str::to_ascii_lowercase)
 }
 
-/// The ChatGPT backend the Codex OAuth route ships with
-/// (`https://chatgpt.com/backend-api`, or a path under it). Only this endpoint
-/// carries the Codex OAuth quota; the billing surface and the route
-/// presentation both decide from it.
+/// Historical Codex backend receipts retain their original quota basis.
+/// New Sign in with ChatGPT requests use the public API and additionally need
+/// captured grant provenance; this endpoint check never proves that grant.
 pub(crate) fn is_chatgpt_codex_backend(base_url: &str) -> bool {
-    let Ok(url) = reqwest::Url::parse(base_url.trim()) else {
+    let Some(shape) = endpoint_shape(base_url) else {
         return false;
     };
-    let path = url.path().trim_end_matches('/');
-    url.scheme() == "https"
-        && url.host_str() == Some("chatgpt.com")
-        && url.port().is_none()
-        && url.username().is_empty()
-        && (path == "/backend-api" || path.starts_with("/backend-api/"))
+    shape.host == "chatgpt.com"
+        && (shape.path == "/backend-api" || shape.path.starts_with("/backend-api/"))
+}
+
+/// The public API base documented for official ChatGPT plan inference.
+/// The same endpoint accepts metered API keys: this shape alone is not a
+/// subscription claim. [`crate::route_billing`] also requires a verified grant.
+pub(crate) fn is_official_chatgpt_api(base_url: &str) -> bool {
+    endpoint_shape(base_url)
+        .is_some_and(|shape| shape.host == "api.openai.com" && shape.path == "/v1")
 }
 
 /// Reduce a concrete request endpoint to non-secret billing provenance.
@@ -438,18 +441,15 @@ pub(crate) fn billing_surface_for_route(
         // authoritative billing surface is available.
         ApiProvider::OllamaCloud => return Some(UNCLASSIFIED_BILLING_SURFACE),
         ApiProvider::OpencodeGo => return Some(OAUTH_SUBSCRIPTION_BILLING_SURFACE),
-        // The Codex OAuth quota is a fact of the ChatGPT backend, not of the
-        // provider name: a custom endpoint (a gateway, a proxy) sells its own
-        // terms, so it is unclassified rather than a subscription that would
-        // drop its spend out of money coverage. No endpoint at all keeps the
-        // provider default, which is the ChatGPT backend.
+        // Preserve historical backend provenance, but public API plan access
+        // is credential-shaped. Without the captured official grant it stays
+        // unknown, including when no endpoint was supplied.
         ApiProvider::OpenaiCodex => {
-            return Some(
-                match base_url.map(str::trim).filter(|url| !url.is_empty()) {
-                    Some(url) if !is_chatgpt_codex_backend(url) => UNCLASSIFIED_BILLING_SURFACE,
-                    _ => OAUTH_SUBSCRIPTION_BILLING_SURFACE,
-                },
-            );
+            return Some(if base_url.is_some_and(is_chatgpt_codex_backend) {
+                OAUTH_SUBSCRIPTION_BILLING_SURFACE
+            } else {
+                UNCLASSIFIED_BILLING_SURFACE
+            });
         }
         // A named custom endpoint is never assumed to be metered; the billing
         // presentation layer decides that from explicit config.
@@ -1655,7 +1655,7 @@ fn audit_turn_cost_for_provider_on_endpoint_for_identity_at(
         return TurnCostAudit::unpriced(UnpricedReason::InconsistentUsage);
     }
     if provider == ApiProvider::OpenaiCodex {
-        return TurnCostAudit::unpriced(UnpricedReason::NotMoneyMetered);
+        return TurnCostAudit::unpriced(UnpricedReason::AmbiguousBillingSurface);
     }
     if provider == ApiProvider::Custom {
         // A transport family plus current mutable catalog state is not a
@@ -2920,6 +2920,45 @@ mod tests {
     /// anything unrecognized must fail closed as unknown rather than defaulting
     /// into per-token dollars (#4318).
     #[test]
+    fn official_chatgpt_api_requires_the_exact_secure_base() {
+        for endpoint in ["https://api.openai.com/v1", "https://api.openai.com/v1/"] {
+            assert!(is_official_chatgpt_api(endpoint), "{endpoint}");
+        }
+        for endpoint in [
+            "http://api.openai.com/v1",
+            "https://api.openai.com:444/v1",
+            "https://api.openai.com.example.net/v1",
+            "https://api.openai.com/v1/responses",
+            "https://api.openai.com/v1?route=plan",
+            "https://api.openai.com/v1#plan",
+            "https://user:secret@api.openai.com/v1",
+            "https://chatgpt.com/backend-api",
+            "",
+        ] {
+            assert!(!is_official_chatgpt_api(endpoint), "{endpoint}");
+        }
+    }
+
+    #[test]
+    fn public_chatgpt_endpoint_does_not_prove_a_plan_without_grant_provenance() {
+        assert_eq!(
+            billing_surface_for_route(ApiProvider::OpenaiCodex, Some("https://api.openai.com/v1")),
+            Some(UNCLASSIFIED_BILLING_SURFACE)
+        );
+        assert_eq!(
+            billing_surface_for_route(ApiProvider::Openai, Some("https://api.openai.com/v1")),
+            Some(FIRST_PARTY_PAYG_BILLING_SURFACE)
+        );
+        assert_eq!(
+            billing_surface_for_route(
+                ApiProvider::OpenaiCodex,
+                Some("https://chatgpt.com/backend-api/codex")
+            ),
+            Some(OAUTH_SUBSCRIPTION_BILLING_SURFACE)
+        );
+    }
+
+    #[test]
     fn endpoint_classification_covers_every_exact_billing_surface() {
         for (provider, base_url, expected_surface, expected_metering) in [
             (
@@ -3002,8 +3041,8 @@ mod tests {
         for (provider, expected_surface, expected_metering) in [
             (
                 ApiProvider::OpenaiCodex,
-                OAUTH_SUBSCRIPTION_BILLING_SURFACE,
-                EndpointMetering::ExactSubscription,
+                UNCLASSIFIED_BILLING_SURFACE,
+                EndpointMetering::Unknown,
             ),
             (
                 ApiProvider::OpencodeGo,
@@ -3328,7 +3367,7 @@ mod tests {
                 Utc::now(),
             )
             .unpriced_reason,
-            Some(UnpricedReason::NotMoneyMetered)
+            Some(UnpricedReason::AmbiguousBillingSurface)
         );
         assert_eq!(
             audit_turn_cost_for_route_at(
