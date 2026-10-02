@@ -1,6 +1,6 @@
 {
   "direction": "host_to_core",
-  "valid": true,
+  "valid": false,
   "frame": {
     "jsonrpc": "2.0",
     "method": "host/hello",
@@ -16,7 +16,9 @@
         "version": "1.4.0"
       },
       "tier": "plugin",
-      "builtin_modules": []
+      "builtin_modules": {
+        "mcp": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+      }
     }
   }
 }

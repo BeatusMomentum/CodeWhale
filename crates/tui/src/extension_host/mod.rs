@@ -14,6 +14,13 @@
 //! rebuild, deferred. Disabling, revoking or updating the plugin revokes its
 //! registrations synchronously before the host is asked to tear down.
 //!
+//! `core/call` ([`core_call`], tickets in [`ticket`]): an extension tool that
+//! the model called directly may ask the core to run a core tool for it,
+//! through the same gate as the model's own calls. The host decides nothing:
+//! planning, approval and the card's text are Rust's, MCP and anything that
+//! changes the session's authority are refused, and shell and network calls
+//! force a prompt.
+//!
 //! Engines: the manager and its one host are process-wide, but each engine
 //! holds its own [`HostAttachment`] carrying the plugin snapshot of its
 //! workspace. Reconcile activates the union of what every attached snapshot
@@ -40,8 +47,10 @@
 //!
 //! Known limitations (by design — see the design doc §8 and its "As built"
 //! sections):
-//! * Tools and slash commands only: no hooks, skills, prompt sections, MCP,
-//!   or `core/call` (the host cannot ask the core to do anything).
+//! * Tools and slash commands only: no hooks, skills, prompt sections or MCP.
+//!   The one thing the host may ask the core to do is a `core/call` from a tool
+//!   under the turn's gate; commands, timers and activation code ask for
+//!   nothing.
 //! * Heartbeat and bounded automatic restart preserve the shared crash budget
 //!   across engine creation and replay. Dead-host calls fail with a typed
 //!   error and are never replayed. Three crashes in five minutes require an
@@ -109,15 +118,19 @@
 //!   check, not re-hashed by the host.
 
 pub(crate) mod command;
+pub(crate) mod core_call;
 pub(crate) mod plugin_config;
 pub(crate) mod protocol;
 pub(crate) mod registry;
 pub(crate) mod supervisor;
+pub(crate) mod ticket;
 pub(crate) mod tier;
 pub(crate) mod tool;
 
 #[cfg(test)]
 pub(crate) mod tests;
+#[cfg(test)]
+mod core_call_tests;
 
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::fmt;
@@ -126,6 +139,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
+use async_trait::async_trait;
 use sha2::{Digest, Sha256};
 
 use self::protocol::{
@@ -133,7 +147,7 @@ use self::protocol::{
     OwnerRef, RegisterKind, RegisterResult,
 };
 use self::registry::{CommandRegistration, OwnerRegistry, OwnerState, ToolRegistration};
-use self::supervisor::{HostEvents, HostProcess};
+use self::supervisor::{HostEvents, HostProcess, HostRequestContext};
 use self::tier::{BuiltinModule, HostTier};
 use crate::plugins::PluginRegistry;
 use crate::plugins::activation::{self, PluginActivationCapability};
@@ -525,6 +539,9 @@ pub(crate) struct ManagerShared {
     next_attachment: AtomicU64,
     /// One registry for both tiers: an owner's entry records which.
     registry: Mutex<OwnerRegistry>,
+    /// Capability tickets and the invocations they belong to (`core/call`).
+    /// A leaf lock domain: its mutexes are never held with another lock.
+    core_calls: Arc<core_call::CoreCalls>,
     /// Tier 1: reviewed third-party plugins.
     plugin: TierRuntime,
     /// Tier 0: Codewhale's own host code. Starts only for a built-in module.
@@ -815,7 +832,40 @@ struct Events {
     generation: u64,
 }
 
+#[async_trait]
 impl HostEvents for Events {
+    async fn host_request(
+        &self,
+        request: protocol::HostRequest,
+        cx: HostRequestContext,
+    ) -> Result<serde_json::Value, protocol::RpcErrorWire> {
+        let refuse = |message: &str| protocol::RpcErrorWire {
+            code: protocol::error_code::REFUSED,
+            message: message.to_string(),
+            data: None,
+        };
+        match request {
+            protocol::HostRequest::CoreCall(params) => {
+                let Some(shared) = self.shared.upgrade() else {
+                    return Err(refuse("extension host manager is gone"));
+                };
+                if shared
+                    .tier_runtime(self.tier)
+                    .host_generation
+                    .load(Ordering::SeqCst)
+                    != self.generation
+                {
+                    return Err(refuse("stale host generation"));
+                }
+                shared
+                    .core_calls
+                    .serve(&shared, self.tier, self.generation, params, cx)
+                    .await
+            }
+            other => supervisor::registry_host_request(self, other, &cx),
+        }
+    }
+
     fn register(&self, params: &protocol::RegisterParams) -> RegisterResult {
         let Some(shared) = self.shared.upgrade() else {
             return RegisterResult::Refused {
@@ -903,6 +953,7 @@ impl HostEvents for Events {
             host.revoke_calls_of(&params.owner.plugin_id);
         }
         drop(slot);
+        shared.core_calls.revoke_owner(&params.owner.plugin_id);
         shared.plugin_diagnostic(
             &params.owner.plugin_id,
             format!(
@@ -916,6 +967,8 @@ impl HostEvents for Events {
         let Some(shared) = self.shared.upgrade() else {
             return;
         };
+        // Whatever this process was asked for, nothing it held is good again.
+        shared.core_calls.revoke_host(self.tier, host_generation);
         let runtime = shared.tier_runtime(self.tier);
         let retry = {
             let mut slot = runtime.host.lock().expect("host lock");
@@ -1206,6 +1259,7 @@ impl ExtensionHostManager {
                 attachments: Mutex::new(BTreeMap::new()),
                 next_attachment: AtomicU64::new(0),
                 registry: Mutex::new(OwnerRegistry::new()),
+                core_calls: Arc::default(),
                 plugin: TierRuntime::new(),
                 builtin: TierRuntime::new(),
                 sync_lock: tokio::sync::Mutex::new(()),
@@ -1344,6 +1398,16 @@ impl ExtensionHostManager {
 
     /// The command registrations currently admitted, for tests on the commands
     /// side that drive the real command table.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn live_command_registrations(&self) -> Vec<CommandRegistration> {
+        self.shared
+            .registry
+            .lock()
+            .expect("registry lock")
+            .live_commands()
+    }
+
     #[cfg(test)]
     #[must_use]
     pub(crate) fn live_command_registrations(&self) -> Vec<CommandRegistration> {
@@ -1770,6 +1834,7 @@ impl ExtensionHostManager {
         }
         let host = shared.ready_host(HostTier::Plugin).ok();
         for owner in revoked {
+            shared.core_calls.revoke_owner(&owner.plugin_id);
             shared.plugin_diagnostic(
                 &owner.plugin_id,
                 format!("extension `{}` revoked", owner.plugin_id),

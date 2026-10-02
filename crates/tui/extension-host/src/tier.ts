@@ -13,7 +13,8 @@
  * Not a security boundary on its own (the OS sandbox and the separate
  * processes are); the Rust core is the authority on what runs where.
  */
-export type HostTier = 'plugin' | 'builtin'
+export type { HostTier } from './protocol.generated.ts'
+import type { HostTier } from './protocol.generated.ts'
 
 /** Every tier-0 owner id starts with this. Mirrors `tier::HOST_OWNER_PREFIX` in Rust. */
 export const HOST_OWNER_PREFIX = 'host:'
@@ -38,6 +39,20 @@ export function parseTier(argv: readonly string[]): HostTier {
     found = value as HostTier
   }
   return found ?? 'plugin'
+}
+
+/**
+ * The SHA-256 of each built-in module source this build embeds, in id order:
+ * what `host/hello` reports and the core checks against its own pinned table.
+ * The build (`build.mjs`) builds the modules first and substitutes their
+ * digests for `__BUILTIN_MODULE_DIGESTS__`; run from source it is empty.
+ */
+declare const __BUILTIN_MODULE_DIGESTS__: Readonly<Record<string, string>>
+export function builtinModuleDigests(): { id: string; sha256: string }[] {
+  const digests = typeof __BUILTIN_MODULE_DIGESTS__ === 'undefined' ? {} : __BUILTIN_MODULE_DIGESTS__
+  return Object.entries(digests)
+    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+    .map(([id, sha256]) => ({ id, sha256 }))
 }
 
 /** The tier an owner id belongs to. Total: the id decides. */

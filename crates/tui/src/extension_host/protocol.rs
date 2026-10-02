@@ -20,6 +20,16 @@
 //! generated as TypeScript types only; the host does not validate the
 //! results the core sends it, and the core validates what it reads.
 //!
+//! **Tiers.** Each [`MethodSpec`] carries the trust tiers (`HostTier`) that may
+//! send or be sent it, and both parsers and the sender enforce that: a
+//! plugin-tier host is never sent, and a plugin-tier host's frame is never
+//! admitted for, a method reserved for the built-in tier. Every method allows
+//! both tiers today ([`ALL_TIERS`]); a reserved method is a row written as
+//! `MethodSpec { tiers: &[HostTier::Builtin], ..row(direction, name, request) }`.
+//! `host/hello` carries the tier the host serves and the digests of the built-in
+//! modules its bundle embeds, which the core checks against what it launched
+//! (`supervisor::check_hello_identity`).
+//!
 //! There is deliberately no method that expresses approval, and nothing a
 //! host can send makes the core *do* anything: registrations are admitted or
 //! refused, and tool calls only flow core→host after the gate. `command/run`
@@ -35,6 +45,8 @@ use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value, json};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
+use super::tier::HostTier;
+
 pub const PROTOCOL_VERSION: u32 = 1;
 pub const MAGIC: [u8; 4] = *b"CWX1";
 pub const HEADER_LEN: usize = 8;
@@ -45,11 +57,20 @@ pub const MAX_INFLIGHT: usize = 256;
 
 /// JSON-RPC error codes used on this channel.
 pub mod error_code {
+    /// A method the receiver has no handler for (the core never sends one the
+    /// host's tier may not receive; see `MethodSpec::tiers`).
+    pub const METHOD_NOT_FOUND: i64 = -32601;
     pub const INVALID_PARAMS: i64 = -32602;
     /// Unknown, revoked, or not-yet-active handle.
     pub const NOT_AVAILABLE: i64 = -32001;
     /// Cancelled by `$/cancel`.
     pub const CANCELLED: i64 = -32800;
+    /// `core/call`: the core's policy refuses the call (a tool the extension
+    /// may not reach, a limit, an invalid ticket), or the host's request is
+    /// refused for a reason that is not a person's answer.
+    pub const REFUSED: i64 = -32002;
+    /// `core/call`: the user declined the approval card for it.
+    pub const DENIED: i64 = -32003;
 
     /// Every code on the channel, by the name the TypeScript side uses. The
     /// core interprets only the three above; the host also answers with the
@@ -59,11 +80,13 @@ pub mod error_code {
     pub const ALL: &[(&str, i64)] = &[
         ("ParseError", -32700),
         ("InvalidRequest", -32600),
-        ("MethodNotFound", -32601),
+        ("MethodNotFound", METHOD_NOT_FOUND),
         ("InvalidParams", INVALID_PARAMS),
         ("Internal", -32603),
         ("ExecutionFailed", -32000),
         ("NotAvailable", NOT_AVAILABLE),
+        ("Refused", REFUSED),
+        ("Denied", DENIED),
         ("Cancelled", CANCELLED),
     ];
 }
@@ -93,13 +116,23 @@ pub struct MethodSpec {
     pub direction: Direction,
     /// A request carries an id and gets a response; a notification does not.
     pub request: bool,
+    /// The trust tiers whose host may send (host to core) or be sent (core to
+    /// host) this method. Enforced in both directions: [`admit_in`] on what is
+    /// received, [`allowed_on`] before the core sends.
+    pub tiers: &'static [HostTier],
 }
 
+/// Both trust tiers: what a method allows unless it is reserved.
+pub const ALL_TIERS: &[HostTier] = &HostTier::ALL;
+
+/// A method open to both tiers. Reserve one for a tier with struct update:
+/// `MethodSpec { tiers: &[HostTier::Builtin], ..row(..) }`.
 const fn row(direction: Direction, name: &'static str, request: bool) -> MethodSpec {
     MethodSpec {
         name,
         direction,
         request,
+        tiers: ALL_TIERS,
     }
 }
 
@@ -118,6 +151,7 @@ pub const METHODS: &[MethodSpec] = &[
     row(Direction::HostToCore, "host/ready", false),
     row(Direction::HostToCore, "registry/register", true),
     row(Direction::HostToCore, "registry/unregister", true),
+    row(Direction::HostToCore, "core/call", true),
     row(Direction::HostToCore, "ext/faulted", false),
     row(Direction::HostToCore, "log", false),
     row(Direction::HostToCore, "$/cancel", false),
@@ -130,16 +164,48 @@ fn admit(
     direction: Direction,
     method: &str,
     id: Option<u64>,
+    tier: HostTier,
 ) -> Result<Option<u64>, ProtocolError> {
-    let spec = METHODS
+    admit_in(METHODS, direction, method, id, tier)
+}
+
+/// [`admit`] over `table`, so the tier rule is testable with a reserved row
+/// that production does not have.
+fn admit_in(
+    table: &[MethodSpec],
+    direction: Direction,
+    method: &str,
+    id: Option<u64>,
+    tier: HostTier,
+) -> Result<Option<u64>, ProtocolError> {
+    let spec = table
         .iter()
         .find(|spec| spec.direction == direction && spec.name == method)
         .ok_or_else(|| perr(format!("unknown {} method `{method}`", direction.as_str())))?;
+    if !spec.tiers.contains(&tier) {
+        return Err(perr(format!(
+            "`{method}` is not allowed on the {} tier",
+            tier.name()
+        )));
+    }
     match (spec.request, id) {
         (true, Some(_)) | (false, None) => Ok(id),
         (true, None) => Err(perr(format!("`{method}` must be a request (with id)"))),
         (false, Some(_)) => Err(perr(format!("`{method}` must be a notification (no id)"))),
     }
+}
+
+/// Whether a host of `tier` may be sent (core to host) or send (host to core)
+/// `method`. A method not in [`METHODS`] is not allowed.
+#[must_use]
+pub fn allowed_on(direction: Direction, method: &str, tier: HostTier) -> bool {
+    allowed_in(METHODS, direction, method, tier)
+}
+
+fn allowed_in(table: &[MethodSpec], direction: Direction, method: &str, tier: HostTier) -> bool {
+    table.iter().any(|spec| {
+        spec.direction == direction && spec.name == method && spec.tiers.contains(&tier)
+    })
 }
 
 fn undecoded(method: &str) -> ProtocolError {
@@ -267,6 +333,13 @@ pub struct HelloParams {
     /// The runtime actually running the host. Under Bun this comes from
     /// `process.versions.bun`, not the Node version Bun emulates.
     pub runtime: HelloRuntime,
+    /// The trust tier this host process serves (`--tier=`). The core refuses a
+    /// host that reports any tier but the one it launched.
+    pub tier: HostTier,
+    /// The SHA-256 of every built-in module source this host build embeds
+    /// (`dist/builtin-modules.json`), one row per module, in id order. The
+    /// core refuses a host whose list is not the one its own table pins.
+    pub builtin_modules: Vec<ModuleDigestWire>,
     /// A kernel memory limit the host applied to itself before loading any
     /// plugin, in MiB: macOS + Bun, when the core asked for one
     /// (`supervisor::MemoryEnforcement::Jetsam`). Absent otherwise.
@@ -281,6 +354,15 @@ pub struct HelloRuntime {
     /// `bun` or `node`.
     pub name: String,
     pub version: String,
+}
+
+/// One built-in module's pinned source digest, as the host build records it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct ModuleDigestWire {
+    pub id: String,
+    pub sha256: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -357,6 +439,22 @@ pub struct UnregisterParams {
     pub handle: u64,
 }
 
+/// A tool asking the core to run one of the core's tools for it
+/// (`core/call`, answered with a [`ToolResultWire`]). The `ticket` is the
+/// invocation ticket the core put in this call's `tool/call`; the core checks
+/// it against its own row (owner, tier, host generation, method, limits) and
+/// the host never decides anything: policy, approval and the approval card's
+/// text are the core's.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct CoreCallParams {
+    pub owner: OwnerRef,
+    pub ticket: String,
+    pub name: String,
+    pub input: Value,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
@@ -386,6 +484,19 @@ pub struct CancelParams {
 pub enum HostRequest {
     Register(RegisterParams),
     Unregister(UnregisterParams),
+    CoreCall(CoreCallParams),
+}
+
+impl HostRequest {
+    /// The plugin whose revocation cancels this request in flight.
+    #[must_use]
+    pub fn plugin_id(&self) -> &str {
+        match self {
+            Self::Register(params) => &params.owner.plugin_id,
+            Self::Unregister(params) => &params.owner.plugin_id,
+            Self::CoreCall(params) => &params.owner.plugin_id,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -461,8 +572,9 @@ fn decode_response(
     }
 }
 
-/// Parse and strictly validate one host→core message.
-pub fn parse_host_message(value: Value) -> Result<HostMessage, ProtocolError> {
+/// Parse and strictly validate one host→core message from a host of `tier`: a
+/// method reserved for another tier is refused like an unknown one.
+pub fn parse_host_message(value: Value, tier: HostTier) -> Result<HostMessage, ProtocolError> {
     let envelope = decode_envelope(value)?;
     let Some(method) = envelope.method.clone() else {
         let (id, outcome) = decode_response(envelope)?;
@@ -473,7 +585,7 @@ pub fn parse_host_message(value: Value) -> Result<HostMessage, ProtocolError> {
             "`{method}`: a request carries no result or error"
         )));
     }
-    let id = admit(Direction::HostToCore, &method, envelope.id)?;
+    let id = admit(Direction::HostToCore, &method, envelope.id, tier)?;
     let p = envelope.params;
     let message = match (method.as_str(), id) {
         ("registry/register", Some(id)) => {
@@ -489,6 +601,10 @@ pub fn parse_host_message(value: Value) -> Result<HostMessage, ProtocolError> {
         ("registry/unregister", Some(id)) => HostMessage::Request {
             id,
             request: HostRequest::Unregister(params(&method, p)?),
+        },
+        ("core/call", Some(id)) => HostMessage::Request {
+            id,
+            request: HostRequest::CoreCall(params(&method, p)?),
         },
         ("host/hello", None) => {
             let hello: HelloParams = params(&method, p)?;
@@ -524,7 +640,7 @@ fn notification_value(method: &str, params: Value) -> Value {
     json!({"jsonrpc": "2.0", "method": method, "params": params})
 }
 
-fn response_value(id: u64, outcome: &Result<Value, RpcErrorWire>) -> Value {
+pub fn response_value(id: u64, outcome: &Result<Value, RpcErrorWire>) -> Value {
     match outcome {
         Ok(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}),
         Err(error) => json!({"jsonrpc": "2.0", "id": id, "error": error}),
@@ -546,6 +662,7 @@ impl HostMessage {
                 HostRequest::Unregister(p) => {
                     request_value(*id, "registry/unregister", to_value(p))
                 }
+                HostRequest::CoreCall(p) => request_value(*id, "core/call", to_value(p)),
             },
             Self::Notification(notification) => match notification {
                 HostNotification::Hello(p) => notification_value("host/hello", to_value(p)),
@@ -623,6 +740,12 @@ pub struct ToolCallParams {
     /// when its path is not valid UTF-8.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<String>,
+    /// The invocation ticket: present only when this call runs under the turn
+    /// loop's permission gate, and what `core/call` must present. Absent for a
+    /// call with no gate (a sub-agent, one nested in `execute_tools`, a test),
+    /// whose tool then has no way to ask the core for anything.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ticket: Option<String>,
 }
 
 /// One user invocation of a registered command. `raw_input` is what follows
@@ -808,16 +931,17 @@ pub enum CoreMessage {
     },
 }
 
-/// Parse a core→host message (the shape this side writes).
+/// Parse a core→host message (the shape this side writes) bound for a host of
+/// `tier`.
 #[cfg(test)]
-pub fn parse_core_message(value: Value) -> Result<CoreMessage, ProtocolError> {
+pub fn parse_core_message(value: Value, tier: HostTier) -> Result<CoreMessage, ProtocolError> {
     let envelope = decode_envelope(value)?;
     let Some(method) = envelope.method.clone() else {
         let (id, outcome) = decode_response(envelope)?;
         return Ok(CoreMessage::Response { id, outcome });
     };
     let p = envelope.params;
-    let Some(id) = admit(Direction::CoreToHost, &method, envelope.id)? else {
+    let Some(id) = admit(Direction::CoreToHost, &method, envelope.id, tier)? else {
         return match method.as_str() {
             "$/cancel" => Ok(CoreMessage::Cancel(params(&method, p)?)),
             _ => Err(undecoded(&method)),
@@ -857,11 +981,6 @@ impl CoreMessage {
 #[must_use]
 pub fn cancel_value(id: u64) -> Value {
     notification_value("$/cancel", json!({ "id": id }))
-}
-
-#[must_use]
-pub fn response_ok(id: u64, result: Value) -> Value {
-    response_value(id, &Ok(result))
 }
 
 #[cfg(test)]

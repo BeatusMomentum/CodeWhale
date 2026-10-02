@@ -44,6 +44,9 @@ test('handshake reports protocol 1 and the digest of the running bundle', async 
   // The real runtime, not Bun's emulated `process.versions.node`.
   assert.deepEqual(host.hello.runtime, IS_BUN ? { name: 'bun', version: process.versions.bun } : { name: 'node', version: process.versions.node })
   assert.equal(host.hello.node_version, undefined)
+  // The tier the host serves and the built-in module digests it embeds.
+  assert.equal(host.hello.tier, 'plugin')
+  assert.deepEqual(host.hello.builtin_modules, builtinDigests())
   // No limit was asked for, so none is reported.
   assert.equal(host.hello.memory_limit_mib, undefined)
   const rss = residentMiB(host.child.pid)
@@ -841,6 +844,23 @@ test('a plugin-tier host refuses a host: owner and a builtin-tier host refuses a
   assert.deepEqual(await builtin.call('ext/deactivate', { owner: ref }), { disposed: true, leaked: [] })
 })
 
+/** What `dist/builtin-modules.json` says, as `host/hello.builtin_modules` rows. */
+function builtinDigests() {
+  const manifest = JSON.parse(readFileSync(join(dirname(BUNDLE), 'builtin-modules.json'), 'utf8'))
+  return Object.entries(manifest.modules)
+    .sort(([a], [b]) => (a < b ? -1 : 1))
+    .map(([id, sha256]) => ({ id, sha256 }))
+}
+
+test('host/hello says which tier the host serves, and the built-in module digests its build embeds', async (t) => {
+  for (const [tier, reported] of [['plugin', 'plugin'], [null, 'plugin'], ['builtin', 'builtin']]) {
+    const host = await startHost({ tier })
+    t.after(() => host.stop())
+    assert.equal(host.hello.tier, reported, `--tier=${tier}`)
+    assert.deepEqual(host.hello.builtin_modules, builtinDigests(), `--tier=${tier}`)
+  }
+})
+
 test('the build records the digest of every built-in module, and only those', () => {
   const dist = join(dirname(BUNDLE))
   const manifest = JSON.parse(readFileSync(join(dist, 'builtin-modules.json'), 'utf8'))
@@ -849,4 +869,110 @@ test('the build records the digest of every built-in module, and only those', ()
   for (const [id, digest] of Object.entries(manifest.modules)) {
     assert.equal(sha256File(join(dist, 'builtin', `${id}.mjs`)), digest, id)
   }
+})
+
+// ---- core/call: a tool asking the core to run a core tool for it (`exec.core`).
+
+const coreResult = (text, extra = {}) => ({ content: [{ type: 'text', text }], is_error: false, ...extra })
+
+async function coreCallTool(host, name, input, { ticket = 'ticket-1' } = {}) {
+  const { result } = await activate(host, 'core-call')
+  assert.equal(result.status, 'ok')
+  const registered = host.registry.find((entry) => entry.op === 'register' && entry.spec.name === name)
+  return {
+    registered,
+    call: (callInput, extra = {}) =>
+      host.request('tool/call', { handle: registered.handle, call_id: 'cc-1', input: callInput, deadline_ms: 5000, ...(ticket === null ? {} : { ticket }), ...extra }),
+  }
+}
+
+test('a tool called with a ticket reaches the core through exec.core, and core/call carries its owner, ticket, name and input', async (t) => {
+  const host = await startHost({ coreCall: (params) => coreResult(`ran ${params.name}`, { structured: { echoed: params.input } }) })
+  t.after(() => host.stop())
+  const { call } = await coreCallTool(host, 'cc_call')
+  const { promise } = call({ name: 'read', input: { path: 'a.txt' } })
+  const out = await promise
+  assert.deepEqual(out.structured, { ok: { content: 'ran read', isError: false, structured: { echoed: { path: 'a.txt' } } } })
+  assert.equal(host.coreCalls.length, 1)
+  const sent = host.coreCalls[0]
+  assert.equal(sent.ticket, 'ticket-1')
+  assert.equal(sent.name, 'read')
+  assert.deepEqual(sent.input, { path: 'a.txt' })
+  assert.equal(sent.owner.plugin_id, 'core-call')
+  assert.deepEqual(Object.keys(sent).sort(), ['id', 'input', 'name', 'owner', 'ticket'])
+})
+
+test('without a ticket exec.core does not exist, and a command invocation never has one', async (t) => {
+  const host = await startHost({ coreCall: () => coreResult('x') })
+  t.after(() => host.stop())
+  const { call } = await coreCallTool(host, 'cc_probe', {}, { ticket: null })
+  const bare = (await call({}).promise).structured
+  assert.equal(bare.hasCore, false)
+  assert.deepEqual(bare.keys, ['args', 'callId', 'signal'])
+  const withTicket = (await call({}, { ticket: 'tk' }).promise).structured
+  assert.equal(withTicket.hasCore, true)
+  assert.deepEqual(withTicket.coreKeys, ['call'])
+  const noCore = host.registry.find((entry) => entry.spec.name === 'cc_call')
+  assert.deepEqual((await host.request('tool/call', { handle: noCore.handle, call_id: 'c2', input: { name: 'read' }, deadline_ms: 5000 }).promise).structured, { noCore: true })
+  const command = host.registry.find((entry) => entry.op === 'register' && entry.kind === 'command')
+  const said = await host.call('command/run', { handle: command.handle, command_id: 'c-1', raw_input: '', deadline_ms: 5000 })
+  assert.equal(JSON.parse(said.text).hasCore, false)
+  assert.equal(host.coreCalls.length, 0, 'nothing reached the core')
+})
+
+test('typed refusals reach the tool as CoreCallError codes', async (t) => {
+  const errors = {
+    refused: { code: ErrorCode.Refused, message: 'policy says no' },
+    denied: { code: ErrorCode.Denied, message: 'the user said no' },
+    cancelled: { code: ErrorCode.Cancelled, message: 'cancelled' },
+    unavailable: { code: ErrorCode.NotAvailable, message: 'turn ended' },
+    failed: { code: ErrorCode.Internal, message: 'boom' },
+  }
+  const host = await startHost({ coreCall: (params) => ({ error: errors[params.name] }) })
+  t.after(() => host.stop())
+  const { call } = await coreCallTool(host, 'cc_call')
+  for (const [name, error] of Object.entries(errors)) {
+    const out = (await call({ name }).promise).structured
+    assert.deepEqual(out.failed, { name: 'CoreCallError', code: name, message: error.message }, name)
+  }
+})
+
+test('the host refuses what it must not send: a bad name, input that is not JSON', async (t) => {
+  const host = await startHost({ coreCall: () => coreResult('x') })
+  t.after(() => host.stop())
+  const { call } = await coreCallTool(host, 'cc_local')
+  const out = (await call({}).promise).structured
+  for (const key of ['emptyName', 'longName', 'notJson', 'cyclic']) {
+    assert.equal(out[key].failed.code, 'failed', key)
+  }
+  assert.equal(host.coreCalls.length, 0)
+})
+
+test('cancelling the tool call cancels its pending core/call with $/cancel, and the answer that follows is dropped', async (t) => {
+  let release
+  const held = new Promise((resolve) => (release = resolve))
+  const host = await startHost({ coreCall: () => held })
+  t.after(() => host.stop())
+  const { call } = await coreCallTool(host, 'cc_call')
+  const { id, promise } = call({ name: 'read' })
+  await host.waitFor((m) => m.method === 'core/call')
+  host.cancel(id)
+  await host.waitFor((m) => m.method === '$/cancel')
+  assert.deepEqual(host.cancels, [host.coreCalls[0].id])
+  await assert.rejects(promise, (error) => error.code === ErrorCode.Cancelled)
+  release(coreResult('late'))
+  // The host stays usable.
+  assert.deepEqual(await host.call('host/ping', {}), {})
+})
+
+test('several core calls can be in flight at once, each answered to its own request', async (t) => {
+  const host = await startHost({ coreCall: async (params) => { await new Promise((r) => setTimeout(r, params.input.ms)); return coreResult(String(params.input.ms)) } })
+  t.after(() => host.stop())
+  const { call } = await coreCallTool(host, 'cc_many')
+  // The input is the same for every call, so answers differ only by arrival; all four are answered.
+  const out = (await call({ name: 'read', input: { ms: 20 }, count: 4, parallel: true }).promise).structured
+  assert.equal(out.outcomes.length, 4)
+  assert.ok(out.outcomes.every((o) => o.ok.content === '20'))
+  assert.equal(host.coreCalls.length, 4)
+  assert.equal(new Set(host.coreCalls.map((c) => c.id)).size, 4)
 })

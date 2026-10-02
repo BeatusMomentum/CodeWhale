@@ -18,7 +18,7 @@ import { ErrorCode, FrameDecoder, encodeFrame, PROTOCOL_VERSION, type Message } 
 import { RpcError, RpcPeer } from './rpc.ts'
 import { HostRoot, ownerStorage } from './root.ts'
 import { RUNTIME, applyMemoryLimit, denyNativeCode } from './runtime.ts'
-import { parseTier } from './tier.ts'
+import { builtinModuleDigests, parseTier } from './tier.ts'
 
 export const HOST_VERSION = '0.1.0'
 
@@ -124,7 +124,7 @@ function shutdownNow(code: number) {
 
 const rpc = new RpcPeer((message: Message) => {
   channelWrite(encodeFrame(message))
-})
+}, TIER)
 const host = new HostRoot(rpc, TIER)
 let initialized = false
 
@@ -160,7 +160,7 @@ rpc.onRequest('ext/deactivate', async (params: any) => {
 
 rpc.onRequest('tool/call', async (params: any, cx) => {
   requireInitialized()
-  return host.callTool(params.handle, params.input, params.call_id, cx.signal, params.workspace)
+  return host.callTool(params.handle, params.input, params.call_id, cx.signal, params.workspace, params.ticket)
 })
 
 rpc.onRequest('command/run', async (params: any, cx) => {
@@ -219,5 +219,7 @@ rpc.notify('host/hello', {
   host_version: HOST_VERSION,
   bundle_sha256: bundleDigest(),
   runtime: RUNTIME,
+  tier: TIER,
+  builtin_modules: builtinModuleDigests(),
   ...(MEMORY_LIMIT_MIB === undefined ? {} : { memory_limit_mib: MEMORY_LIMIT_MIB }),
 })

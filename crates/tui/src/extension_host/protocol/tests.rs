@@ -33,6 +33,7 @@ fn params_schema(method: &str, generator: &mut SchemaGenerator) -> Schema {
         "host/hello" => generator.subschema_for::<HelloParams>(),
         "registry/register" => generator.subschema_for::<RegisterParams>(),
         "registry/unregister" => generator.subschema_for::<UnregisterParams>(),
+        "core/call" => generator.subschema_for::<CoreCallParams>(),
         "ext/faulted" => generator.subschema_for::<FaultedParams>(),
         "log" => generator.subschema_for::<LogParams>(),
         other => panic!("method `{other}` has no params type in the TypeScript generator"),
@@ -361,15 +362,17 @@ fn render() -> String {
         let _ = writeln!(out, "  {name}: {code},");
     }
     out.push_str("} as const\n\nexport type Direction = 'core_to_host' | 'host_to_core'\n");
-    out.push_str("\n/** Every method either side may send; nothing else is admitted. */\nexport const METHODS = [\n");
+    out.push_str("\n/** Every method either side may send, and the trust tiers it is allowed on; nothing else is admitted. */\nexport const METHODS = [\n");
     for (spec, params) in &methods {
+        let tiers: Vec<String> = spec.tiers.iter().map(|tier| quote(tier.name())).collect();
         let _ = writeln!(
             out,
-            "  {{ name: {}, direction: {}, request: {}, params: {} }},",
+            "  {{ name: {}, direction: {}, request: {}, params: {}, tiers: [{}] }},",
             quote(spec.name),
             quote(spec.direction.as_str()),
             spec.request,
-            quote(params)
+            quote(params),
+            tiers.join(", ")
         );
     }
     out.push_str("] as const\n");
@@ -520,6 +523,11 @@ const REVIEWED: &[(&str, &str, &str)] = &[
     ),
     (
         "host_to_core",
+        "core/call",
+        "a request the core serves only for a ticket it minted for a call that already passed its gate, then plans and approves through the same gate as a model's call; the host names a tool and an input, never an approval, a card text, an argv, a URL or a ticket's contents",
+    ),
+    (
+        "host_to_core",
         "ext/faulted",
         "a report; the core revokes the owner",
     ),
@@ -531,7 +539,7 @@ const REVIEWED: &[(&str, &str, &str)] = &[
     (
         "host_to_core",
         "$/cancel",
-        "ignored: phase 1 has no host-originated requests to cancel",
+        "the host withdraws its own in-flight request; the core cancels that request's task and drops whatever it produces",
     ),
 ];
 
@@ -582,4 +590,100 @@ fn host_protocol_never_gains_core_authority() {
         seen >= METHODS.len(),
         "the source scan matched only {seen} literals"
     );
+}
+
+/// The tier rule, against a table with methods reserved for the built-in tier
+/// (the production table has none yet): refused to a plugin-tier host in both
+/// directions, by the parser and by the sender's check, and open methods stay
+/// open to both.
+#[test]
+fn a_method_reserved_for_the_builtin_tier_is_refused_in_both_directions() {
+    const RESERVED: &[MethodSpec] = &[
+        MethodSpec {
+            tiers: &[HostTier::Builtin],
+            ..row(Direction::HostToCore, "test/reserved", true)
+        },
+        MethodSpec {
+            tiers: &[HostTier::Builtin],
+            ..row(Direction::CoreToHost, "test/reserved-in", false)
+        },
+        row(Direction::HostToCore, "test/shared", true),
+    ];
+    use Direction::{CoreToHost, HostToCore};
+    use HostTier::{Builtin, Plugin};
+
+    assert_eq!(
+        admit_in(RESERVED, HostToCore, "test/reserved", Some(1), Builtin),
+        Ok(Some(1))
+    );
+    assert_eq!(
+        admit_in(RESERVED, CoreToHost, "test/reserved-in", None, Builtin),
+        Ok(None)
+    );
+    for (direction, method, id) in [
+        (HostToCore, "test/reserved", Some(1)),
+        (CoreToHost, "test/reserved-in", None),
+    ] {
+        let refused = admit_in(RESERVED, direction, method, id, Plugin).unwrap_err();
+        assert!(
+            refused.0.contains("not allowed on the plugin tier"),
+            "{refused}"
+        );
+        assert!(allowed_in(RESERVED, direction, method, Builtin));
+        assert!(!allowed_in(RESERVED, direction, method, Plugin));
+    }
+    // Open to both tiers, and a name or direction the table lacks is unknown
+    // (not "reserved"), whatever the tier.
+    for tier in HostTier::ALL {
+        assert_eq!(
+            admit_in(RESERVED, HostToCore, "test/shared", Some(2), tier),
+            Ok(Some(2))
+        );
+        assert!(allowed_in(RESERVED, HostToCore, "test/shared", tier));
+        for (direction, method) in [(HostToCore, "test/none"), (CoreToHost, "test/reserved")] {
+            assert!(
+                admit_in(RESERVED, direction, method, Some(3), tier)
+                    .unwrap_err()
+                    .0
+                    .contains("unknown"),
+                "{method}"
+            );
+            assert!(!allowed_in(RESERVED, direction, method, tier));
+        }
+    }
+}
+
+/// The production table: `allowed_on` says what each row says, and the
+/// families the design reserves for the built-in tier (the process broker, the
+/// fetch proxy and the MCP client; none exist yet) can never be added to the
+/// plugin tier by accident.
+#[test]
+fn production_methods_follow_their_tier_rows_and_reserved_families_stay_builtin_only() {
+    for spec in METHODS {
+        for tier in HostTier::ALL {
+            assert_eq!(
+                allowed_on(spec.direction, spec.name, tier),
+                spec.tiers.contains(&tier),
+                "{}",
+                spec.name
+            );
+        }
+        assert!(!spec.tiers.is_empty(), "{} allows no tier", spec.name);
+        if ["proc/", "net/", "mcp/"]
+            .iter()
+            .any(|family| spec.name.starts_with(family))
+        {
+            assert_eq!(
+                spec.tiers,
+                &[HostTier::Builtin],
+                "{} is reserved for the built-in tier",
+                spec.name
+            );
+        }
+    }
+    assert!(!allowed_on(
+        Direction::HostToCore,
+        "no/such-method",
+        HostTier::Builtin
+    ));
 }

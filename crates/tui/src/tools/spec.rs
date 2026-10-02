@@ -1613,6 +1613,16 @@ pub trait ToolSpec: Send + Sync {
         None
     }
 
+    /// Who this tool is, if it is an extension tool: composed by Rust from its
+    /// registration. `Some` makes the turn loop serve a permission gate for
+    /// the tool's call, through which its `core/call`s are planned and
+    /// approved like a model's, and makes the tool unreachable from any other
+    /// extension's `core/call` (no recursion). `None` (every built-in, script
+    /// and MCP tool) changes nothing.
+    fn extension_caller(&self) -> Option<crate::tools::codemode::ExtensionCaller> {
+        None
+    }
+
     /// Returns whether this tool should be excluded from the model-visible
     /// tool catalog (deferred loading). Tools marked `true` are registered
     /// but not sent to the model until explicitly activated via tool search.

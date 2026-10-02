@@ -4,6 +4,19 @@
 //! The existing Rust manager owns heartbeat, crash budget, generation changes,
 //! and receipt-checked replay; this channel never replays a tool call.
 //!
+//! **Host-originated requests** run as tasks, not inline in the reader. Each
+//! request the host sends is admitted into [`InboundRequests`] (at most
+//! [`protocol::MAX_INFLIGHT`] at a time, no id twice, both violations end the
+//! host) and handed to [`HostEvents::host_request`] as its own task. It is
+//! cancelled by the host's `$/cancel` (whatever the handler later produces is
+//! dropped), by its owner's revocation (the host is answered `Cancelled`) and
+//! by the host's exit (nobody is answered); a handler that ignores its token is
+//! abandoned [`CANCEL_GRACE`] after the cancel. A method reserved for the other
+//! tier is neither accepted from the host nor sent to it
+//! (`protocol::MethodSpec::tiers`), and `host/hello` must report the tier the
+//! core launched and the built-in module digests it pins
+//! ([`check_hello_identity`]).
+//!
 //! **Tiers** ([`HostTier`]). The host is two processes, one per trust tier,
 //! started from the same bundle with `--tier=plugin|builtin` as the last
 //! argument. Each has its own data directory ([`tier_data_dir`]) and its own
@@ -90,17 +103,20 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use async_trait::async_trait;
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
+use tokio_util::sync::CancellationToken;
 
 use crate::dependencies::{HostRuntime, HostRuntimeKind};
+use crate::tools::codemode::PauseClock;
 
 use super::protocol::{
-    self, CoreRequest, HostLimits, HostMessage, HostNotification, HostRequest, InitializeParams,
-    RegisterResult, error_code,
+    self, CoreRequest, Direction, HelloParams, HostLimits, HostMessage, HostNotification,
+    HostRequest, InitializeParams, RegisterResult, RpcErrorWire, error_code,
 };
-use super::tier::HostTier;
+use super::tier::{self, BuiltinModule, HostTier};
 
 /// Budget for spawn → `host/hello` → `host/initialize` → `host/ready`.
 ///
@@ -163,6 +179,10 @@ pub(crate) struct HostLaunch {
     /// How the cap is meant to be enforced; a macOS Bun host confirms its
     /// jetsam limit in `host/hello` or initialization is refused.
     pub memory: MemoryEnforcement,
+    /// The built-in module digests `host/hello` must report: the table this
+    /// build pins ([`tier::BUILTIN_MODULES`]), which the host bundle embedded
+    /// from the same build must agree with ([`check_hello_identity`]).
+    pub builtin_modules: &'static [BuiltinModule],
 }
 
 /// Whether the host runs under an OS sandbox, and why not when it does not
@@ -688,6 +708,7 @@ fn host_launch(
         runtime_env: runtime_env(runtime.kind),
         memory_cap,
         memory: MemoryEnforcement::planned(runtime.kind),
+        builtin_modules: tier::BUILTIN_MODULES,
     })
 }
 
@@ -867,13 +888,224 @@ fn exit_reason(
     reason
 }
 
+/// What one host-originated request is told about its own life: its id on the
+/// channel and the token that fires when the request is cancelled (the host's
+/// `$/cancel`, the owner's revocation, or the host's exit). A handler that
+/// waits for anything must wait on `cancel` too; one that ignores it is
+/// abandoned [`CANCEL_GRACE`] after it fires and its answer is dropped.
+pub(crate) struct HostRequestContext {
+    pub id: u64,
+    pub cancel: CancellationToken,
+    /// The channel's kill switch, for a handler that finds the host in
+    /// violation of the protocol (it ends the host, like a bad frame).
+    kill: mpsc::Sender<String>,
+}
+
+#[cfg(test)]
+impl HostRequestContext {
+    /// A context not attached to any channel, with the receiver its violations
+    /// arrive on and the token that cancels it.
+    pub(crate) fn for_test(id: u64) -> (Self, mpsc::Receiver<String>, CancellationToken) {
+        let (kill, violations) = mpsc::channel(8);
+        let cancel = CancellationToken::new();
+        (
+            Self {
+                id,
+                cancel: cancel.clone(),
+                kill,
+            },
+            violations,
+            cancel,
+        )
+    }
+}
+
+impl HostRequestContext {
+    /// Report a protocol violation by the host: the host process is ended.
+    pub(crate) fn violation(&self, reason: String) {
+        let _ = self.kill.try_send(format!("protocol violation: {reason}"));
+    }
+}
+
 /// Callbacks from the channel into the manager.
+#[async_trait]
 pub(crate) trait HostEvents: Send + Sync + 'static {
     fn register(&self, params: &protocol::RegisterParams) -> RegisterResult;
     fn unregister(&self, params: &protocol::UnregisterParams);
     fn faulted(&self, params: &protocol::FaultedParams);
     fn log(&self, params: &protocol::LogParams);
     fn exited(&self, host_generation: u64, reason: String, stderr_tail: String);
+
+    /// Answer one host-originated request. Every such request runs as its own
+    /// task (`start_host_request`), so a handler may take as long as it needs
+    /// without holding up the reader. The registry requests are quick and
+    /// synchronous; a request that has to wait (a tool call the host asked the
+    /// core to make, later) overrides this and observes `cx.cancel`.
+    async fn host_request(
+        &self,
+        request: HostRequest,
+        cx: HostRequestContext,
+    ) -> Result<Value, RpcErrorWire> {
+        registry_host_request(self, request, &cx)
+    }
+}
+
+/// The answer to a registry request (`registry/register`,
+/// `registry/unregister`), which is quick and synchronous, and the refusal of a
+/// `core/call` an events implementation does not serve. The default
+/// [`HostEvents::host_request`], and what an overriding one falls back to.
+pub(crate) fn registry_host_request<E: HostEvents + ?Sized>(
+    events: &E,
+    request: HostRequest,
+    cx: &HostRequestContext,
+) -> Result<Value, RpcErrorWire> {
+    tracing::trace!(target: "extension_host", id = cx.id, "host request");
+    // A request cancelled before its handler began does nothing.
+    if cx.cancel.is_cancelled() {
+        return Err(RpcErrorWire {
+            code: error_code::CANCELLED,
+            message: "cancelled".to_string(),
+            data: None,
+        });
+    }
+    match request {
+        HostRequest::Register(params) => Ok(serde_json::to_value(events.register(&params))
+            .unwrap_or_else(|_| json!({"refused": "internal"}))),
+        HostRequest::Unregister(params) => {
+            events.unregister(&params);
+            Ok(json!({}))
+        }
+        HostRequest::CoreCall(_) => Err(RpcErrorWire {
+            code: error_code::REFUSED,
+            message: "core/call is not served here".to_string(),
+            data: None,
+        }),
+    }
+}
+
+/// Why an in-flight host request was cancelled; decides what the host is told.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CancelReason {
+    /// The host sent `$/cancel`: it has already stopped waiting, so whatever
+    /// the handler produces afterwards is dropped.
+    Host,
+    /// The request's owner was revoked: the host is answered `Cancelled`.
+    Revoked,
+    /// The host exited: there is nobody to answer.
+    Exit,
+}
+
+struct InboundRequest {
+    /// The plugin whose revocation cancels it.
+    owner: String,
+    cancel: CancellationToken,
+    cancelled: Option<CancelReason>,
+}
+
+/// The host-originated requests in flight, by the id the host gave them. At
+/// most [`protocol::MAX_INFLIGHT`] at a time (the same bound the host holds
+/// itself to), no id twice, and nothing admitted once the host has exited.
+#[derive(Default)]
+pub(crate) struct InboundRequests {
+    table: Mutex<InboundTable>,
+}
+
+#[derive(Default)]
+struct InboundTable {
+    requests: HashMap<u64, InboundRequest>,
+    closed: bool,
+}
+
+impl InboundRequests {
+    /// Start tracking request `id` of `owner`. `Err` is a protocol violation:
+    /// the host reused an id still in flight, or has more requests in flight
+    /// than its own limit allows.
+    fn admit(&self, id: u64, owner: &str) -> Result<CancellationToken, String> {
+        let mut table = self.table.lock().expect("inbound lock");
+        if table.closed {
+            return Err("host request after the host exited".to_string());
+        }
+        if table.requests.contains_key(&id) {
+            return Err(format!("host request id {id} is already in flight"));
+        }
+        if table.requests.len() >= protocol::MAX_INFLIGHT {
+            return Err(format!(
+                "more than {} host requests in flight",
+                protocol::MAX_INFLIGHT
+            ));
+        }
+        let cancel = CancellationToken::new();
+        table.requests.insert(
+            id,
+            InboundRequest {
+                owner: owner.to_string(),
+                cancel: cancel.clone(),
+                cancelled: None,
+            },
+        );
+        Ok(cancel)
+    }
+
+    /// The host's `$/cancel {id}`. An id that is not in flight (already
+    /// answered, or never sent) is ignored: the cancel raced the answer.
+    fn cancel_by_host(&self, id: u64) {
+        if let Some(request) = self
+            .table
+            .lock()
+            .expect("inbound lock")
+            .requests
+            .get_mut(&id)
+        {
+            request.fire(CancelReason::Host);
+        }
+    }
+
+    /// Cancel every in-flight request of `plugin_id`: its owner was revoked.
+    fn cancel_owner(&self, plugin_id: &str) {
+        for request in self
+            .table
+            .lock()
+            .expect("inbound lock")
+            .requests
+            .values_mut()
+            .filter(|request| request.owner == plugin_id)
+        {
+            request.fire(CancelReason::Revoked);
+        }
+    }
+
+    /// The host exited: cancel everything and admit nothing more.
+    fn cancel_all(&self) {
+        let mut table = self.table.lock().expect("inbound lock");
+        table.closed = true;
+        for request in table.requests.values_mut() {
+            request.fire(CancelReason::Exit);
+        }
+    }
+
+    /// The handler is done (or abandoned): forget the request and say why it
+    /// was cancelled, if it was.
+    fn finish(&self, id: u64) -> Option<CancelReason> {
+        self.table
+            .lock()
+            .expect("inbound lock")
+            .requests
+            .remove(&id)
+            .and_then(|request| request.cancelled)
+    }
+
+    #[cfg(test)]
+    fn in_flight(&self) -> usize {
+        self.table.lock().expect("inbound lock").requests.len()
+    }
+}
+
+impl InboundRequest {
+    /// Cancel for `reason`; the first reason stands.
+    fn fire(&mut self, reason: CancelReason) {
+        self.cancelled.get_or_insert(reason);
+        self.cancel.cancel();
+    }
 }
 
 /// Receives one request's outcome.
@@ -896,6 +1128,9 @@ struct Handshake {
 pub(crate) struct HostProcess {
     /// The tier this process was launched for.
     pub tier: HostTier,
+    /// The generation of its tier's host this process is (what the manager
+    /// bumps per launch); a capability ticket is bound to it.
+    pub generation: u64,
     pub pid: Option<u32>,
     /// The runtime the Rust side launched; `host/hello` must agree.
     pub runtime: HostRuntime,
@@ -908,6 +1143,8 @@ pub(crate) struct HostProcess {
     tree: Arc<crate::process_tree::ProcessTree>,
     outbound: mpsc::Sender<Vec<u8>>,
     pending: Arc<Mutex<HashMap<u64, PendingCall>>>,
+    /// Requests the host sent, running as tasks ([`start_host_request`]).
+    inbound: Arc<InboundRequests>,
     /// Admission checks and sealing hold `pending`; the manager also reads
     /// this flag to avoid activation while the exit callback is still pending.
     admission_closed: AtomicBool,
@@ -1023,6 +1260,7 @@ impl HostProcess {
 
         let (outbound, mut outbound_rx) = mpsc::channel::<Vec<u8>>(OUTBOUND_QUEUE);
         let pending: Arc<Mutex<HashMap<u64, PendingCall>>> = Arc::default();
+        let inbound: Arc<InboundRequests> = Arc::default();
         let stderr_tail: Arc<Mutex<VecDeque<u8>>> = Arc::default();
         let (exited_tx, exited_rx) = tokio::sync::watch::channel(false);
         let (hello_tx, hello_rx) = oneshot::channel();
@@ -1070,10 +1308,15 @@ impl HostProcess {
         // host is not ours).
         let (kill_tx, mut kill_rx) = mpsc::channel::<String>(1);
         {
-            let pending = Arc::clone(&pending);
-            let outbound = outbound.clone();
-            let events = Arc::clone(&events);
-            let handshake = Arc::clone(&handshake);
+            let reader = Reader {
+                kill: kill_tx.clone(),
+                pending: Arc::clone(&pending),
+                inbound: Arc::clone(&inbound),
+                outbound: outbound.clone(),
+                events: Arc::clone(&events),
+                handshake: Arc::clone(&handshake),
+            };
+            let tier = launch.tier;
             let kill_tx = kill_tx.clone();
             tokio::spawn(async move {
                 let mut stdout = stdout;
@@ -1086,14 +1329,17 @@ impl HostProcess {
                             break;
                         }
                     };
-                    let message = match protocol::parse_host_message(value) {
+                    let message = match protocol::parse_host_message(value, tier) {
                         Ok(message) => message,
                         Err(error) => {
                             let _ = kill_tx.try_send(format!("protocol violation: {error}"));
                             break;
                         }
                     };
-                    handle_host_message(message, &pending, &outbound, events.as_ref(), &handshake);
+                    if let Err(violation) = reader.handle(message) {
+                        let _ = kill_tx.try_send(format!("protocol violation: {violation}"));
+                        break;
+                    }
                 }
             });
         }
@@ -1101,6 +1347,7 @@ impl HostProcess {
         // Exit watcher: owns the child. On exit, fail everything and report.
         {
             let pending = Arc::clone(&pending);
+            let inbound = Arc::clone(&inbound);
             let tail = Arc::clone(&stderr_tail);
             let events = Arc::clone(&events);
             let tree = Arc::clone(&tree);
@@ -1131,6 +1378,8 @@ impl HostProcess {
                 for call in drained {
                     let _ = call.tx.send(Err(HostCallError::Exited(reason.clone())));
                 }
+                // Requests the host sent have nobody left to answer.
+                inbound.cancel_all();
                 // Give the stderr task a moment to capture the last lines.
                 tokio::time::sleep(Duration::from_millis(50)).await;
                 events.exited(generation, reason, tail_string(&tail));
@@ -1139,6 +1388,7 @@ impl HostProcess {
 
         let host = Arc::new(Self {
             tier: launch.tier,
+            generation,
             pid,
             runtime: launch.runtime.clone(),
             runtime_version: std::sync::OnceLock::new(),
@@ -1148,6 +1398,7 @@ impl HostProcess {
             tree,
             outbound,
             pending,
+            inbound,
             admission_closed: AtomicBool::new(false),
             next_id: AtomicU64::new(1),
             #[cfg(test)]
@@ -1180,6 +1431,7 @@ impl HostProcess {
                     launch.runtime.kind.name()
                 ));
             }
+            check_hello_identity(&hello, launch.tier, launch.builtin_modules)?;
             // Restarts reuse the pinned runtime without probing it again, so
             // the binary at that path can have been replaced since (an
             // upgrade mid-session). Its flags and lockdown were chosen for
@@ -1335,6 +1587,17 @@ impl HostProcess {
         request: CoreRequest,
         owner: Option<String>,
     ) -> Result<(u64, CallReceiver), HostCallError> {
+        // A method reserved for another tier is never sent to this host.
+        if !protocol::allowed_on(Direction::CoreToHost, request.method(), self.tier) {
+            return Err(HostCallError::Rpc {
+                code: error_code::METHOD_NOT_FOUND,
+                message: format!(
+                    "`{}` is not allowed on the {} tier",
+                    request.method(),
+                    self.tier.name()
+                ),
+            });
+        }
         if self.has_exited() {
             return Err(HostCallError::Exited("already exited".to_string()));
         }
@@ -1388,20 +1651,44 @@ impl HostProcess {
         request: CoreRequest,
         owner: Option<String>,
     ) -> Result<Value, HostCallError> {
+        self.call_with_clock(request, owner, None).await
+    }
+
+    /// [`Self::call`] with the deadline measured on `clock`, which stops while
+    /// the caller waits on something that is not the host's time (a
+    /// `core/call` waiting on an approval card). `None` is a clock nothing
+    /// pauses: the plain deadline.
+    pub(crate) async fn call_with_clock(
+        &self,
+        request: CoreRequest,
+        owner: Option<String>,
+        clock: Option<Arc<Mutex<PauseClock>>>,
+    ) -> Result<Value, HostCallError> {
         let method = request.method();
         let deadline = request.deadline();
-        let (id, rx) = self.start_request(request, owner)?;
+        let clock = clock.unwrap_or_else(|| Arc::new(Mutex::new(PauseClock::new())));
+        let (id, mut rx) = self.start_request(request, owner)?;
         let mut guard = CancelOnDrop {
             host: self,
             id,
             armed: true,
         };
-        let Ok(answer) = tokio::time::timeout(deadline, rx).await else {
-            // `guard` is still armed: dropping it sends `$/cancel`.
-            return Err(HostCallError::Timeout {
-                method,
-                after: deadline,
-            });
+        let answer = loop {
+            let remaining = clock
+                .lock()
+                .expect("deadline clock lock")
+                .remaining(deadline);
+            let Some(remaining) = remaining else {
+                // `guard` is still armed: dropping it sends `$/cancel`.
+                return Err(HostCallError::Timeout {
+                    method,
+                    after: deadline,
+                });
+            };
+            tokio::select! {
+                answer = &mut rx => break answer,
+                () = tokio::time::sleep(remaining) => {}
+            }
         };
         // Answered, drained at exit, or resolved by revocation: nothing left
         // to cancel.
@@ -1424,6 +1711,9 @@ impl HostProcess {
     /// resolves as cancelled when the host answers or after `CANCEL_GRACE`,
     /// whichever is first — revocation never waits on the host.
     pub(crate) fn revoke_calls_of(self: &Arc<Self>, plugin_id: &str) {
+        // Requests the host sent for this owner are cancelled too (and
+        // answered `Cancelled`), whatever they are waiting for.
+        self.inbound.cancel_owner(plugin_id);
         let ids: Vec<u64> = {
             let mut pending = self.pending.lock().expect("pending lock");
             pending
@@ -1496,80 +1786,163 @@ impl Drop for HostProcess {
     }
 }
 
-fn handle_host_message(
-    message: HostMessage,
-    pending: &Mutex<HashMap<u64, PendingCall>>,
-    outbound: &mpsc::Sender<Vec<u8>>,
-    events: &dyn HostEvents,
-    handshake: &Mutex<Handshake>,
-) {
-    let send = |value: Value| {
-        if let Ok(frame) = protocol::encode_frame(&value) {
-            let _ = outbound.try_send(frame);
-        }
-    };
-    match message {
-        HostMessage::Response { id, outcome } => {
-            let Some(call) = pending.lock().expect("pending lock").remove(&id) else {
-                tracing::debug!(target: "extension_host", id, "dropping late host response");
-                return;
-            };
-            let result = if call.revoked {
-                Err(HostCallError::Cancelled(
-                    "extension was revoked".to_string(),
-                ))
-            } else {
-                match outcome {
-                    Ok(value) => Ok(value),
-                    Err(error) if error.code == error_code::CANCELLED => {
-                        Err(HostCallError::Cancelled(error.message))
+/// What the channel's reader task holds: everything one decoded host→core
+/// message may touch.
+struct Reader {
+    kill: mpsc::Sender<String>,
+    pending: Arc<Mutex<HashMap<u64, PendingCall>>>,
+    inbound: Arc<InboundRequests>,
+    outbound: mpsc::Sender<Vec<u8>>,
+    events: Arc<dyn HostEvents>,
+    handshake: Arc<Mutex<Handshake>>,
+}
+
+impl Reader {
+    /// Route one validated host→core message. `Err` is a protocol violation
+    /// the caller ends the host for.
+    fn handle(&self, message: HostMessage) -> Result<(), String> {
+        match message {
+            HostMessage::Response { id, outcome } => {
+                let Some(call) = self.pending.lock().expect("pending lock").remove(&id) else {
+                    tracing::debug!(target: "extension_host", id, "dropping late host response");
+                    return Ok(());
+                };
+                let result = if call.revoked {
+                    Err(HostCallError::Cancelled(
+                        "extension was revoked".to_string(),
+                    ))
+                } else {
+                    match outcome {
+                        Ok(value) => Ok(value),
+                        Err(error) if error.code == error_code::CANCELLED => {
+                            Err(HostCallError::Cancelled(error.message))
+                        }
+                        Err(error) => Err(HostCallError::Rpc {
+                            code: error.code,
+                            message: error.message,
+                        }),
                     }
-                    Err(error) => Err(HostCallError::Rpc {
-                        code: error.code,
-                        message: error.message,
-                    }),
+                };
+                let _ = call.tx.send(result);
+            }
+            HostMessage::Request { id, request } => self.start_host_request(id, request)?,
+            HostMessage::Notification(notification) => match notification {
+                HostNotification::Hello(hello) => {
+                    if let Some(tx) = self.handshake.lock().expect("handshake lock").hello.take() {
+                        let _ = tx.send(hello);
+                    }
                 }
-            };
-            let _ = call.tx.send(result);
+                HostNotification::Ready => {
+                    if let Some(tx) = self.handshake.lock().expect("handshake lock").ready.take() {
+                        let _ = tx.send(());
+                    }
+                }
+                HostNotification::Faulted(params) => self.events.faulted(&params),
+                HostNotification::Log(log) => {
+                    self.events.log(&log);
+                    let plugin = log.plugin_id.as_deref().unwrap_or("host");
+                    match log.level.as_str() {
+                        "error" => tracing::warn!(target: "extension_host", plugin, "{}", log.msg),
+                        "warn" => tracing::info!(target: "extension_host", plugin, "{}", log.msg),
+                        _ => tracing::debug!(target: "extension_host", plugin, "{}", log.msg),
+                    }
+                }
+                // The host withdrawing a request of its own. One that has
+                // already been answered is not in flight: the cancel lost the
+                // race, and nothing is owed.
+                HostNotification::Cancel(params) => self.inbound.cancel_by_host(params.id),
+            },
         }
-        HostMessage::Request { id, request } => match request {
-            HostRequest::Register(params) => {
-                let result = events.register(&params);
-                send(protocol::response_ok(
-                    id,
-                    serde_json::to_value(result).unwrap_or_else(|_| json!({"refused": "internal"})),
-                ));
-            }
-            HostRequest::Unregister(params) => {
-                events.unregister(&params);
-                send(protocol::response_ok(id, json!({})));
-            }
-        },
-        HostMessage::Notification(notification) => match notification {
-            HostNotification::Hello(hello) => {
-                if let Some(tx) = handshake.lock().expect("handshake lock").hello.take() {
-                    let _ = tx.send(hello);
-                }
-            }
-            HostNotification::Ready => {
-                if let Some(tx) = handshake.lock().expect("handshake lock").ready.take() {
-                    let _ = tx.send(());
-                }
-            }
-            HostNotification::Faulted(params) => events.faulted(&params),
-            HostNotification::Log(log) => {
-                events.log(&log);
-                let plugin = log.plugin_id.as_deref().unwrap_or("host");
-                match log.level.as_str() {
-                    "error" => tracing::warn!(target: "extension_host", plugin, "{}", log.msg),
-                    "warn" => tracing::info!(target: "extension_host", plugin, "{}", log.msg),
-                    _ => tracing::debug!(target: "extension_host", plugin, "{}", log.msg),
-                }
-            }
-            // Phase 1 has no host-originated requests to cancel.
-            HostNotification::Cancel(_) => {}
-        },
+        Ok(())
     }
+
+    /// Run one host-originated request as its own task: tracked by id so the
+    /// host's `$/cancel`, the owner's revocation and the host's exit can
+    /// cancel it, and answered when the handler finishes unless it was
+    /// cancelled for a reason that makes the answer moot ([`CancelReason`]).
+    /// A handler that does not stop within [`CANCEL_GRACE`] of its cancel is
+    /// abandoned.
+    fn start_host_request(&self, id: u64, request: HostRequest) -> Result<(), String> {
+        let cancel = self.inbound.admit(id, request.plugin_id())?;
+        let events = Arc::clone(&self.events);
+        let inbound = Arc::clone(&self.inbound);
+        let outbound = self.outbound.clone();
+        let kill = self.kill.clone();
+        tokio::spawn(async move {
+            let cx = HostRequestContext {
+                id,
+                cancel: cancel.clone(),
+                kill,
+            };
+            let mut handler = std::pin::pin!(events.host_request(request, cx));
+            let outcome = tokio::select! {
+                outcome = &mut handler => Some(outcome),
+                () = async {
+                    cancel.cancelled().await;
+                    tokio::time::sleep(CANCEL_GRACE).await;
+                } => None,
+            };
+            let outcome = match (inbound.finish(id), outcome) {
+                // The host stopped waiting, or is gone: a late answer is dropped.
+                (Some(CancelReason::Host | CancelReason::Exit), _) => return,
+                (Some(CancelReason::Revoked), _) | (None, None) => Err(RpcErrorWire {
+                    code: error_code::CANCELLED,
+                    message: "extension was revoked".to_string(),
+                    data: None,
+                }),
+                (None, Some(outcome)) => outcome,
+            };
+            if let Ok(frame) = protocol::encode_frame(&protocol::response_value(id, &outcome)) {
+                let _ = outbound.send(frame).await;
+            }
+        });
+        Ok(())
+    }
+}
+
+/// What `host/hello` must say about the host's tier and built-in modules,
+/// checked the way its runtime name and version are: against what the core
+/// launched. The tier must be the one in the launch plan (`--tier=`), and the
+/// module digests the bundle embeds must be exactly the ones `modules` pins, so
+/// a host build and a Rust table that disagree about a built-in module are
+/// refused before any module can run. Pure.
+pub(crate) fn check_hello_identity(
+    hello: &HelloParams,
+    tier: HostTier,
+    modules: &[BuiltinModule],
+) -> Result<(), String> {
+    if hello.tier != tier {
+        return Err(format!(
+            "host reports the {} tier but the {} tier was launched",
+            hello.tier.name(),
+            tier.name()
+        ));
+    }
+    let describe = |rows: &[(String, String)]| {
+        rows.iter()
+            .map(|(id, digest)| format!("{id}={}", digest.chars().take(12).collect::<String>()))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let mut reported: Vec<(String, String)> = hello
+        .builtin_modules
+        .iter()
+        .map(|module| (module.id.clone(), module.sha256.clone()))
+        .collect();
+    let mut pinned: Vec<(String, String)> = modules
+        .iter()
+        .map(|module| (module.id.to_string(), module.source_sha256.to_string()))
+        .collect();
+    reported.sort();
+    pinned.sort();
+    if reported != pinned {
+        return Err(format!(
+            "host bundle embeds the built-in module digests [{}] but the core pins [{}]",
+            describe(&reported),
+            describe(&pinned)
+        ));
+    }
+    Ok(())
 }
 
 /// Where the embedded bundle is written: `<root>/extension-host/<sha256>/`.
@@ -1764,5 +2137,436 @@ mod tests {
             assert!(exceptions.contains(&home.join(entry)), "{entry}");
             assert!(!bwrap.contains(&home.join(entry)), "{entry}");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // The host's tier and built-in module digests in `host/hello`
+    // -----------------------------------------------------------------------
+
+    const DEMO_DIGEST: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const OTHER_DIGEST: &str = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
+    const PINNED: &[BuiltinModule] = &[
+        BuiltinModule {
+            id: "demo",
+            source_sha256: DEMO_DIGEST,
+            tools: &[],
+        },
+        BuiltinModule {
+            id: "other",
+            source_sha256: OTHER_DIGEST,
+            tools: &[],
+        },
+    ];
+
+    fn hello(tier: HostTier, modules: &[(&str, &str)]) -> HelloParams {
+        HelloParams {
+            protocol: protocol::ProtocolRange { min: 1, max: 1 },
+            host_version: "0.1.0".to_string(),
+            bundle_sha256: "0".repeat(64),
+            runtime: protocol::HelloRuntime {
+                name: "node".to_string(),
+                version: "22.20.0".to_string(),
+            },
+            tier,
+            builtin_modules: modules
+                .iter()
+                .map(|(id, sha256)| protocol::ModuleDigestWire {
+                    id: (*id).to_string(),
+                    sha256: (*sha256).to_string(),
+                })
+                .collect(),
+            memory_limit_mib: None,
+        }
+    }
+
+    #[test]
+    fn hello_must_report_the_launched_tier_and_exactly_the_pinned_module_digests() {
+        // Production: no module, so none may be reported, on either tier.
+        for tier in HostTier::ALL {
+            assert_eq!(check_hello_identity(&hello(tier, &[]), tier, &[]), Ok(()));
+        }
+        // Order is not part of the claim.
+        let reported = [("other", OTHER_DIGEST), ("demo", DEMO_DIGEST)];
+        assert_eq!(
+            check_hello_identity(
+                &hello(HostTier::Builtin, &reported),
+                HostTier::Builtin,
+                PINNED
+            ),
+            Ok(())
+        );
+
+        let refused = |hello: HelloParams, tier: HostTier| {
+            check_hello_identity(&hello, tier, PINNED).unwrap_err()
+        };
+        assert_eq!(
+            refused(hello(HostTier::Plugin, &reported), HostTier::Builtin),
+            "host reports the plugin tier but the builtin tier was launched"
+        );
+        assert_eq!(
+            refused(hello(HostTier::Builtin, &reported), HostTier::Plugin),
+            "host reports the builtin tier but the plugin tier was launched"
+        );
+        let pinned = "[demo=0123456789ab, other=fedcba987654]";
+        for (what, rows, shown) in [
+            ("none reported", vec![], "[]"),
+            (
+                "one missing",
+                vec![("demo", DEMO_DIGEST)],
+                "[demo=0123456789ab]",
+            ),
+            (
+                "an unpinned module",
+                vec![
+                    ("demo", DEMO_DIGEST),
+                    ("other", OTHER_DIGEST),
+                    ("extra", DEMO_DIGEST),
+                ],
+                "[demo=0123456789ab, extra=0123456789ab, other=fedcba987654]",
+            ),
+            (
+                "a changed digest",
+                vec![("demo", OTHER_DIGEST), ("other", OTHER_DIGEST)],
+                "[demo=fedcba987654, other=fedcba987654]",
+            ),
+            (
+                "a row twice",
+                vec![
+                    ("demo", DEMO_DIGEST),
+                    ("demo", DEMO_DIGEST),
+                    ("other", OTHER_DIGEST),
+                ],
+                "[demo=0123456789ab, demo=0123456789ab, other=fedcba987654]",
+            ),
+        ] {
+            assert_eq!(
+                refused(hello(HostTier::Builtin, &rows), HostTier::Builtin),
+                format!(
+                    "host bundle embeds the built-in module digests {shown} but the core pins {pinned}"
+                ),
+                "{what}"
+            );
+        }
+        // A host that reports modules when the core pins none is refused too.
+        assert!(
+            check_hello_identity(
+                &hello(HostTier::Plugin, &[("demo", DEMO_DIGEST)]),
+                HostTier::Plugin,
+                &[]
+            )
+            .is_err()
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Host-originated requests run as their own tracked tasks
+    // -----------------------------------------------------------------------
+
+    use std::sync::atomic::AtomicUsize;
+    use tokio::sync::Notify;
+
+    /// How a stub handler waits.
+    #[derive(Clone, Copy)]
+    enum Behaviour {
+        /// Until `release`, or until its request is cancelled (then it stops).
+        WaitsUnlessCancelled,
+        /// Until `release`, whatever happens to its request.
+        IgnoresCancel,
+        /// Forever.
+        Hangs,
+    }
+
+    struct Stub {
+        behaviour: Behaviour,
+        release: Arc<Notify>,
+        started: AtomicUsize,
+        saw_cancel: AtomicBool,
+    }
+
+    impl Stub {
+        fn new(behaviour: Behaviour) -> Arc<Self> {
+            Arc::new(Self {
+                behaviour,
+                release: Arc::new(Notify::new()),
+                started: AtomicUsize::new(0),
+                saw_cancel: AtomicBool::new(false),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl HostEvents for Stub {
+        fn register(&self, _: &protocol::RegisterParams) -> RegisterResult {
+            unreachable!("the stub answers every request itself")
+        }
+        fn unregister(&self, _: &protocol::UnregisterParams) {}
+        fn faulted(&self, _: &protocol::FaultedParams) {}
+        fn log(&self, _: &protocol::LogParams) {}
+        fn exited(&self, _: u64, _: String, _: String) {}
+
+        async fn host_request(
+            &self,
+            _request: HostRequest,
+            cx: HostRequestContext,
+        ) -> Result<Value, RpcErrorWire> {
+            self.started.fetch_add(1, Ordering::SeqCst);
+            match self.behaviour {
+                Behaviour::WaitsUnlessCancelled => {
+                    tokio::select! {
+                        () = cx.cancel.cancelled() => {
+                            self.saw_cancel.store(true, Ordering::SeqCst);
+                            Err(RpcErrorWire {
+                                code: error_code::CANCELLED,
+                                message: "stub saw the cancel".to_string(),
+                                data: None,
+                            })
+                        }
+                        () = self.release.notified() => Ok(json!({"answered": cx.id})),
+                    }
+                }
+                Behaviour::IgnoresCancel => {
+                    self.release.notified().await;
+                    Ok(json!({"answered": cx.id}))
+                }
+                Behaviour::Hangs => std::future::pending().await,
+            }
+        }
+    }
+
+    /// An events implementation that keeps the trait's own answers for the
+    /// registry requests.
+    struct Plain;
+
+    #[async_trait]
+    impl HostEvents for Plain {
+        fn register(&self, _: &protocol::RegisterParams) -> RegisterResult {
+            RegisterResult::Admitted { handle: 9 }
+        }
+        fn unregister(&self, _: &protocol::UnregisterParams) {}
+        fn faulted(&self, _: &protocol::FaultedParams) {}
+        fn log(&self, _: &protocol::LogParams) {}
+        fn exited(&self, _: u64, _: String, _: String) {}
+    }
+
+    struct Rig {
+        reader: Reader,
+        frames: mpsc::Receiver<Vec<u8>>,
+    }
+
+    fn new_rig(events: Arc<dyn HostEvents>) -> Rig {
+        let (outbound, frames) = mpsc::channel(OUTBOUND_QUEUE);
+        Rig {
+            reader: Reader {
+                kill: mpsc::channel(1).0,
+                pending: Arc::default(),
+                inbound: Arc::default(),
+                outbound,
+                events,
+                handshake: Arc::default(),
+            },
+            frames,
+        }
+    }
+
+    fn owner(plugin: &str) -> protocol::OwnerRef {
+        protocol::OwnerRef {
+            plugin_id: plugin.to_string(),
+            generation: 1,
+            owner_token: "t".repeat(32),
+        }
+    }
+
+    fn register_request(plugin: &str) -> HostRequest {
+        HostRequest::Register(protocol::RegisterParams {
+            owner: owner(plugin),
+            kind: protocol::RegisterKind::Tool,
+            spec: protocol::RegisterSpecWire {
+                name: "t".to_string(),
+                description: "d".to_string(),
+                input_schema: Some(serde_json::Map::new()),
+                argument_hint: None,
+            },
+        })
+    }
+
+    fn request(rig: &Rig, id: u64, plugin: &str) -> Result<(), String> {
+        rig.reader.handle(HostMessage::Request {
+            id,
+            request: register_request(plugin),
+        })
+    }
+
+    fn cancel(rig: &Rig, id: u64) {
+        rig.reader
+            .handle(HostMessage::Notification(HostNotification::Cancel(
+                protocol::CancelParams { id },
+            )))
+            .unwrap();
+    }
+
+    /// The next frame the core wrote to the host, decoded.
+    async fn next_frame(rig: &mut Rig) -> Value {
+        let frame = tokio::time::timeout(Duration::from_secs(5), rig.frames.recv())
+            .await
+            .expect("a frame within 5 s")
+            .expect("the channel is open");
+        serde_json::from_slice(&frame[protocol::HEADER_LEN..]).expect("a JSON frame")
+    }
+
+    /// Nothing is written to the host for `ms`.
+    async fn no_frame(rig: &mut Rig, ms: u64) {
+        let frame = tokio::time::timeout(Duration::from_millis(ms), rig.frames.recv()).await;
+        assert!(frame.is_err(), "unexpected frame: {frame:?}");
+    }
+
+    async fn until(what: &str, mut done: impl FnMut() -> bool) {
+        for _ in 0..200 {
+            if done() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("timed out waiting for {what}");
+    }
+
+    #[tokio::test]
+    async fn registry_requests_are_answered_through_the_generic_handler_as_before() {
+        let mut rig = new_rig(Arc::new(Plain));
+        request(&rig, 5, "p").unwrap();
+        assert_eq!(
+            next_frame(&mut rig).await,
+            json!({"jsonrpc": "2.0", "id": 5, "result": {"handle": 9}})
+        );
+        rig.reader
+            .handle(HostMessage::Request {
+                id: 6,
+                request: HostRequest::Unregister(protocol::UnregisterParams {
+                    owner: owner("p"),
+                    handle: 9,
+                }),
+            })
+            .unwrap();
+        assert_eq!(
+            next_frame(&mut rig).await,
+            json!({"jsonrpc": "2.0", "id": 6, "result": {}})
+        );
+        until("the table to empty", || rig.reader.inbound.in_flight() == 0).await;
+    }
+
+    #[tokio::test]
+    async fn a_host_cancel_cancels_the_task_and_the_answer_is_dropped() {
+        // A handler that stops when cancelled answers nothing.
+        let stub = Stub::new(Behaviour::WaitsUnlessCancelled);
+        let mut rig = new_rig(stub.clone());
+        request(&rig, 1, "p").unwrap();
+        until("the handler to start", || {
+            stub.started.load(Ordering::SeqCst) == 1
+        })
+        .await;
+        assert_eq!(rig.reader.inbound.in_flight(), 1);
+        cancel(&rig, 1);
+        until("the handler to see the cancel", || {
+            stub.saw_cancel.load(Ordering::SeqCst)
+        })
+        .await;
+        no_frame(&mut rig, 150).await;
+        until("the table to empty", || rig.reader.inbound.in_flight() == 0).await;
+        // A cancel for an id that is not in flight (answered, or never sent) is ignored.
+        cancel(&rig, 1);
+        cancel(&rig, 4242);
+
+        // A handler that ignores the cancel and finishes later: its late answer is dropped.
+        let stub = Stub::new(Behaviour::IgnoresCancel);
+        let mut rig = new_rig(stub.clone());
+        request(&rig, 2, "p").unwrap();
+        until("the handler to start", || {
+            stub.started.load(Ordering::SeqCst) == 1
+        })
+        .await;
+        cancel(&rig, 2);
+        stub.release.notify_one();
+        no_frame(&mut rig, 150).await;
+        until("the table to empty", || rig.reader.inbound.in_flight() == 0).await;
+
+        // One that never finishes is abandoned CANCEL_GRACE after the cancel,
+        // and frees its slot.
+        let mut rig = new_rig(Stub::new(Behaviour::Hangs));
+        request(&rig, 3, "p").unwrap();
+        cancel(&rig, 3);
+        assert_eq!(
+            rig.reader.inbound.in_flight(),
+            1,
+            "held until the grace ends"
+        );
+        until("the abandoned request to leave the table", || {
+            rig.reader.inbound.in_flight() == 0
+        })
+        .await;
+        no_frame(&mut rig, 100).await;
+    }
+
+    #[tokio::test]
+    async fn revoking_an_owner_answers_its_requests_cancelled_and_leaves_others_alone() {
+        let stub = Stub::new(Behaviour::WaitsUnlessCancelled);
+        let mut rig = new_rig(stub.clone());
+        request(&rig, 1, "a").unwrap();
+        request(&rig, 2, "b").unwrap();
+        until("both handlers to start", || {
+            stub.started.load(Ordering::SeqCst) == 2
+        })
+        .await;
+        rig.reader.inbound.cancel_owner("a");
+        // The revoked owner's host is told (its own `$/cancel` never came).
+        let frame = next_frame(&mut rig).await;
+        assert_eq!(frame["id"], 1);
+        assert_eq!(frame["error"]["code"], error_code::CANCELLED);
+        assert_eq!(frame["error"]["message"], "extension was revoked");
+        // The other owner's request is untouched and answers when released.
+        assert_eq!(rig.reader.inbound.in_flight(), 1);
+        stub.release.notify_one();
+        assert_eq!(
+            next_frame(&mut rig).await,
+            json!({"jsonrpc": "2.0", "id": 2, "result": {"answered": 2}})
+        );
+    }
+
+    #[tokio::test]
+    async fn a_host_exit_cancels_every_request_answers_none_and_admits_no_more() {
+        let stub = Stub::new(Behaviour::WaitsUnlessCancelled);
+        let mut rig = new_rig(stub.clone());
+        request(&rig, 1, "a").unwrap();
+        request(&rig, 2, "b").unwrap();
+        until("both handlers to start", || {
+            stub.started.load(Ordering::SeqCst) == 2
+        })
+        .await;
+        rig.reader.inbound.cancel_all();
+        no_frame(&mut rig, 150).await;
+        until("the table to empty", || rig.reader.inbound.in_flight() == 0).await;
+        assert!(
+            request(&rig, 3, "a")
+                .unwrap_err()
+                .contains("after the host exited")
+        );
+    }
+
+    #[tokio::test]
+    async fn host_requests_are_capped_and_an_id_cannot_be_reused_in_flight() {
+        let rig = new_rig(Stub::new(Behaviour::Hangs));
+        for id in 1..=protocol::MAX_INFLIGHT as u64 {
+            request(&rig, id, "p").unwrap_or_else(|reason| panic!("request {id}: {reason}"));
+        }
+        assert_eq!(rig.reader.inbound.in_flight(), protocol::MAX_INFLIGHT);
+        let over = request(&rig, 9999, "p").unwrap_err();
+        assert!(
+            over.contains("more than 256 host requests in flight"),
+            "{over}"
+        );
+        let reused = request(&rig, 1, "p").unwrap_err();
+        assert!(reused.contains("already in flight"), "{reused}");
+        // Both are protocol violations (the reader ends the host); neither
+        // disturbed what was admitted.
+        assert_eq!(rig.reader.inbound.in_flight(), protocol::MAX_INFLIGHT);
+        rig.reader.inbound.cancel_all();
     }
 }

@@ -123,9 +123,10 @@ Export a Cordis plugin function or an object with `apply`. The host supplies
 one shared Cordis and the supported DSH compatibility services. The example's
 `inject = ['tools', 'commands']` asks for the tool and command registries. The
 supplied service names are `tools`, `commands`, `logger`, `events`, `reflect`
-and `registry`; `core/call`, a storage service (a plugin has its own
-`dataDir` to write to), hooks, skills and prompt providers are not host
-services yet. A required
+and `registry`. A tool can ask the core to run a core tool through
+`exec.core` (see [Asking the core to run a tool](#asking-the-core-to-run-a-tool));
+a storage service (a plugin has its own `dataDir` to write to), hooks, skills
+and prompt providers are not host services yet. A required
 service that is unavailable fails activation with a diagnostic.
 
 Package runtime dependencies and local imports within the reviewed bundle.
@@ -224,7 +225,9 @@ A tool's `execute(input, exec)` gets, in `exec`:
   argument);
 - `workspace`, the root path of the workspace of the session that made the
   call, and no other (it is absent only if that path is not valid UTF-8);
-- `dataDir`, the plugin's own directory.
+- `dataDir`, the plugin's own directory;
+- `core`, only while the call runs under the turn's permission gate:
+  [`exec.core.call`](#asking-the-core-to-run-a-tool).
 
 A command's handler gets `workspace` (where the user ran it) and `dataDir` in
 its invocation beside `args`, `signal` and `commandId`. All of these are
@@ -282,6 +285,75 @@ such setting.
   and activated again as a new generation, with the new values; one whose table
   did not change is left alone. A file that cannot be read keeps the previous
   settings.
+
+## Asking the core to run a tool
+
+A tool can ask the core to run one of the core's tools for it:
+
+```ts
+async execute({ path }, exec) {
+  if (!exec.core) return { error: 'not run under the turn gate' }
+  try {
+    const { content, isError, structured } = await exec.core.call('read', { path })
+    return { content, isError }
+  } catch (error) {
+    // error.name === 'CoreCallError'; error.code is 'refused' | 'denied' |
+    // 'cancelled' | 'unavailable' | 'failed'
+    return { error: error.code, message: error.message }
+  }
+}
+```
+
+The call is planned and approved exactly like a call the model makes: the
+allow and deny lists, hooks, Auto-Review, repo law, the worker authority
+envelope and the approval card all apply. **You never decide any of that.**
+There is no way to approve, to supply a card's text, an argv, a URL or a
+ticket. Rust composes the card ("Requested by `extension:<plugin>` from inside
+its tool `<tool>`") and decides whether one is shown.
+
+**When `exec.core` exists.** Only when the model called your tool directly and
+the turn loop is serving its permission gate for that call. It is absent for a
+command, a timer, activation code, a sub-agent's call, and a tool run from
+inside `execute_tools` (code mode gives nested tools no gate); the core refuses
+a `core/call` from any of them. It also ends with the call: when your `execute`
+returns, fails, times out or is cancelled, or your plugin is disabled, or the
+host exits, pending core calls are cancelled and a waiting approval card is
+withdrawn (recorded as cancelled; an answer given afterwards changes nothing).
+Cancelling your `exec.signal` cancels them too, and `call(name, input, {signal})`
+can cancel one.
+
+**Refused outright** (`error.code === 'refused'`, nothing runs, no card): every
+tool code mode refuses (`execute_tools`, the interpreters, `agent`, `workflow`,
+`rlm`, `request_user_input`, interactive shells, sandbox escalation, Computer
+Use consent and scripts, MCP sign-in); any extension tool, yours included (no
+recursion); tool search and tool-result retrieval; the memory writer
+(`remember`) and tools that change what the session may do or schedule work
+(`request_plugin_install`, goals, automations, `send_later`, starting MCP
+servers); and **every MCP tool, Computer Use included** (not in v1). Names match
+case-insensitively and after the core resolves aliases and after any hook
+rewrites the call.
+
+**What prompts.** Every call needs approval except a read-only, workspace-local
+tool from a short list (`read`, `read_file`, `list_dir`, `file_search`,
+`grep_files`) when nothing else asks for one. Your plugin's own approvals are separate: the user approved your
+tool, not what it asks the core to do. Approval keys are scoped to your plugin
+build: a grant the user gave the model for a tool never covers your call of it,
+and a grant for your call never covers the model's. **Shell and network calls
+force a prompt**: a session grant is not consulted, and a posture that cannot
+open a prompt refuses them instead of satisfying them. That is, in Ask the user
+is asked every time; in Full Access (which opens no prompts) the call is
+refused and nothing runs, and so in Auto-Review and Never. In Full Access every
+other call an extension makes is auto-approved, as it is for the model.
+`error.code === 'denied'` is the user's "no": do not retry it.
+
+**Limits**, per invocation: 50 core calls in all, 4 at once, and one approval
+card at a time; per host, 256 requests in flight. A host that presents invalid
+tickets in a burst is ended as a protocol violation. Your `tool/call` deadline
+(120 s) stops while a core call waits on an approval card. The result is the
+tool's text (`content`) and, when it was JSON, the parsed value
+(`structured`); a long one is cut with a note, and images are dropped. What your
+tool asked the core to run is recorded (bounded) in your tool result's
+`core_calls` metadata, with each call's decision and outcome.
 
 ## Lifecycle, diagnostics and restarts
 

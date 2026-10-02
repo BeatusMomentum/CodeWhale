@@ -25,10 +25,12 @@
 //! * [`BUILTIN_MODULES`] is empty, so nothing asks for the builtin tier and it
 //!   never spawns. "Needed" means "has a row" until the first consumer brings
 //!   a reason to defer the spawn.
-//! * No protocol change: `host/hello` does not report a tier, and no method
-//!   has a tier allow-list, so the core cannot tell a host which tier it runs
-//!   beyond its `--tier=` argument, and the host's own refusal of an owner of
-//!   the other tier is the only check on its side.
+//! * No method is reserved for the builtin tier yet (`protocol::MethodSpec::tiers`
+//!   is both tiers for every row), so the tier allow-list that keeps a
+//!   plugin-tier host from sending or being sent `proc/*`, `net/*` and `mcp/*`
+//!   has nothing to refuse today. `host/hello` does report the tier and the
+//!   built-in module digests, and the core refuses a mismatch with what it
+//!   launched (`supervisor::check_hello_identity`).
 //! * No capability tickets: a tier-0 module can ask for nothing the protocol
 //!   did not already let a plugin ask for. They land with their first redeemer.
 //! * The pinned digest is drift protection (a changed module no longer
@@ -43,8 +45,12 @@ use crate::tools::spec::ApprovalRequirement;
 /// Every tier-0 owner id starts with this: `host:<module>`.
 pub(crate) const HOST_OWNER_PREFIX: &str = "host:";
 
-/// Which of the two host processes something belongs to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// Which of the two host processes something belongs to. Also the wire value
+/// of `host/hello.tier` and of a method's tier allow-list
+/// (`protocol::MethodSpec::tiers`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+#[serde(rename_all = "lowercase")]
 pub(crate) enum HostTier {
     /// Codewhale's own host code (tier 0).
     Builtin,

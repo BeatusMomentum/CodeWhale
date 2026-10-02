@@ -6,6 +6,9 @@ var __export = (target, all) => {
     __defProp(target, name, { get: all[name], enumerable: true });
 };
 
+// <define:__BUILTIN_MODULE_DIGESTS__>
+var define_BUILTIN_MODULE_DIGESTS_default = {};
+
 // src/main.ts
 import { createHash as createHash2 } from "node:crypto";
 import { readFileSync } from "node:fs";
@@ -4210,24 +4213,27 @@ var ErrorCode = {
   Internal: -32603,
   ExecutionFailed: -32e3,
   NotAvailable: -32001,
+  Refused: -32002,
+  Denied: -32003,
   Cancelled: -32800
 };
 var METHODS = [
-  { name: "host/initialize", direction: "core_to_host", request: true, params: "InitializeParams" },
-  { name: "host/ping", direction: "core_to_host", request: true, params: "EmptyParams" },
-  { name: "host/shutdown", direction: "core_to_host", request: true, params: "EmptyParams" },
-  { name: "ext/activate", direction: "core_to_host", request: true, params: "ActivateParams" },
-  { name: "ext/deactivate", direction: "core_to_host", request: true, params: "DeactivateParams" },
-  { name: "tool/call", direction: "core_to_host", request: true, params: "ToolCallParams" },
-  { name: "command/run", direction: "core_to_host", request: true, params: "CommandRunParams" },
-  { name: "$/cancel", direction: "core_to_host", request: false, params: "CancelParams" },
-  { name: "host/hello", direction: "host_to_core", request: false, params: "HelloParams" },
-  { name: "host/ready", direction: "host_to_core", request: false, params: "EmptyParams" },
-  { name: "registry/register", direction: "host_to_core", request: true, params: "RegisterParams" },
-  { name: "registry/unregister", direction: "host_to_core", request: true, params: "UnregisterParams" },
-  { name: "ext/faulted", direction: "host_to_core", request: false, params: "FaultedParams" },
-  { name: "log", direction: "host_to_core", request: false, params: "LogParams" },
-  { name: "$/cancel", direction: "host_to_core", request: false, params: "CancelParams" }
+  { name: "host/initialize", direction: "core_to_host", request: true, params: "InitializeParams", tiers: ["plugin", "builtin"] },
+  { name: "host/ping", direction: "core_to_host", request: true, params: "EmptyParams", tiers: ["plugin", "builtin"] },
+  { name: "host/shutdown", direction: "core_to_host", request: true, params: "EmptyParams", tiers: ["plugin", "builtin"] },
+  { name: "ext/activate", direction: "core_to_host", request: true, params: "ActivateParams", tiers: ["plugin", "builtin"] },
+  { name: "ext/deactivate", direction: "core_to_host", request: true, params: "DeactivateParams", tiers: ["plugin", "builtin"] },
+  { name: "tool/call", direction: "core_to_host", request: true, params: "ToolCallParams", tiers: ["plugin", "builtin"] },
+  { name: "command/run", direction: "core_to_host", request: true, params: "CommandRunParams", tiers: ["plugin", "builtin"] },
+  { name: "$/cancel", direction: "core_to_host", request: false, params: "CancelParams", tiers: ["plugin", "builtin"] },
+  { name: "host/hello", direction: "host_to_core", request: false, params: "HelloParams", tiers: ["plugin", "builtin"] },
+  { name: "host/ready", direction: "host_to_core", request: false, params: "EmptyParams", tiers: ["plugin", "builtin"] },
+  { name: "registry/register", direction: "host_to_core", request: true, params: "RegisterParams", tiers: ["plugin", "builtin"] },
+  { name: "registry/unregister", direction: "host_to_core", request: true, params: "UnregisterParams", tiers: ["plugin", "builtin"] },
+  { name: "core/call", direction: "host_to_core", request: true, params: "CoreCallParams", tiers: ["plugin", "builtin"] },
+  { name: "ext/faulted", direction: "host_to_core", request: false, params: "FaultedParams", tiers: ["plugin", "builtin"] },
+  { name: "log", direction: "host_to_core", request: false, params: "LogParams", tiers: ["plugin", "builtin"] },
+  { name: "$/cancel", direction: "host_to_core", request: false, params: "CancelParams", tiers: ["plugin", "builtin"] }
 ];
 var SHAPES = {
   ActivateParams: {
@@ -4244,6 +4250,11 @@ var SHAPES = {
     strict: false,
     required: { handle: "uint", command_id: "string", raw_input: "string", deadline_ms: "uint" },
     optional: { workspace: "string" }
+  },
+  CoreCallParams: {
+    strict: true,
+    required: { owner: { ref: "OwnerRef" }, ticket: "string", name: "string", input: "json" },
+    optional: {}
   },
   DeactivateParams: {
     strict: false,
@@ -4267,7 +4278,7 @@ var SHAPES = {
   },
   HelloParams: {
     strict: true,
-    required: { protocol: { ref: "ProtocolRange" }, host_version: "string", bundle_sha256: "string", runtime: { ref: "HelloRuntime" } },
+    required: { protocol: { ref: "ProtocolRange" }, host_version: "string", bundle_sha256: "string", runtime: { ref: "HelloRuntime" }, tier: { enum: ["builtin", "plugin"] }, builtin_modules: { items: { ref: "ModuleDigestWire" } } },
     optional: { memory_limit_mib: "uint" }
   },
   HelloRuntime: {
@@ -4289,6 +4300,11 @@ var SHAPES = {
     strict: true,
     required: { level: "string", msg: "string" },
     optional: { plugin_id: "string" }
+  },
+  ModuleDigestWire: {
+    strict: true,
+    required: { id: "string", sha256: "string" },
+    optional: {}
   },
   OwnerRef: {
     strict: true,
@@ -4318,7 +4334,7 @@ var SHAPES = {
   ToolCallParams: {
     strict: false,
     required: { handle: "uint", call_id: "string", input: "json", deadline_ms: "uint" },
-    optional: { workspace: "string" }
+    optional: { workspace: "string", ticket: "string" }
   },
   UnregisterParams: {
     strict: true,
@@ -4431,7 +4447,7 @@ function checkKind(where, value, kind) {
       return;
   }
 }
-function validateMessage(value, direction) {
+function validateMessage(value, direction, tier, methods = METHODS) {
   const strict = direction === "host_to_core";
   if (!isObject2(value)) throw new ProtocolError("message: expected an object");
   if (value.jsonrpc !== "2.0") throw new ProtocolError('message: jsonrpc must be "2.0"');
@@ -4440,8 +4456,9 @@ function validateMessage(value, direction) {
   if ("method" in value) {
     checkShape("message", value, { strict, required: { jsonrpc: "string", method: "string" }, optional: { id: "uint", params: "json" } });
     const method = value.method;
-    const spec = METHODS.find((entry) => entry.name === method && entry.direction === direction);
+    const spec = methods.find((entry) => entry.name === method && entry.direction === direction);
     if (!spec) throw new ProtocolError(`unknown ${direction} method \`${method}\``);
+    if (!spec.tiers.includes(tier)) throw new ProtocolError(`\`${method}\` is not allowed on the ${tier} tier`);
     if (spec.request !== hasId) {
       throw new ProtocolError(`\`${method}\` must be ${spec.request ? "a request (with id)" : "a notification (no id)"}`);
     }
@@ -4482,10 +4499,12 @@ var RpcError = class extends Error {
   }
 };
 var RpcPeer = class {
-  constructor(send) {
+  constructor(send, tier) {
     this.send = send;
+    this.tier = tier;
   }
   send;
+  tier;
   nextId = 1;
   pending = /* @__PURE__ */ new Map();
   inbound = /* @__PURE__ */ new Map();
@@ -4498,29 +4517,50 @@ var RpcPeer = class {
   onNotification(method, handler) {
     this.notificationHandlers.set(method, handler);
   }
-  /** Send a host→core request. Outbound messages are validated strictly first. */
-  request(method, params) {
+  /**
+   * Send a host→core request. Outbound messages are validated strictly first.
+   * When `signal` aborts before the answer, the core is sent `$/cancel` for it
+   * and the promise rejects as cancelled at once; an answer that still arrives
+   * is dropped (the core drops its own after a cancel as well).
+   */
+  request(method, params, signal) {
     if (this.closed) return Promise.reject(new RpcError(ErrorCode.NotAvailable, "channel closed"));
+    if (signal?.aborted) return Promise.reject(new RpcError(ErrorCode.Cancelled, "cancelled"));
     if (this.pending.size >= MAX_INFLIGHT) {
       return Promise.reject(new RpcError(ErrorCode.Internal, `more than ${MAX_INFLIGHT} requests in flight`));
     }
     const id = this.nextId++;
     const message = { jsonrpc: "2.0", id, method, params };
-    validateMessage(message, "host_to_core");
+    validateMessage(message, "host_to_core", this.tier);
     return new Promise((resolve2, reject) => {
-      this.pending.set(id, { resolve: resolve2, reject });
+      const onAbort = () => {
+        if (!this.pending.delete(id)) return;
+        this.notify("$/cancel", { id });
+        reject(new RpcError(ErrorCode.Cancelled, "cancelled"));
+      };
+      this.pending.set(id, {
+        resolve: (value) => {
+          signal?.removeEventListener("abort", onAbort);
+          resolve2(value);
+        },
+        reject: (error) => {
+          signal?.removeEventListener("abort", onAbort);
+          reject(error);
+        }
+      });
+      signal?.addEventListener("abort", onAbort, { once: true });
       this.send(message);
     });
   }
   notify(method, params) {
     if (this.closed) return;
     const message = { jsonrpc: "2.0", method, params };
-    validateMessage(message, "host_to_core");
+    validateMessage(message, "host_to_core", this.tier);
     this.send(message);
   }
   /** Dispatch one decoded core→host message. Throws `ProtocolError` for malformed input. */
   handle(raw) {
-    const message = validateMessage(raw, "core_to_host");
+    const message = validateMessage(raw, "core_to_host", this.tier);
     if ("method" in message) {
       if (message.method === "$/cancel") {
         this.inbound.get(message.params.id)?.abort();
@@ -4583,6 +4623,78 @@ import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { pathToFileURL } from "node:url";
+
+// src/json.ts
+function isJson(value, depth = 0) {
+  if (depth > 64) return false;
+  if (value === null) return true;
+  switch (typeof value) {
+    case "boolean":
+    case "string":
+      return true;
+    case "number":
+      return Number.isFinite(value);
+    case "object":
+      if (Array.isArray(value)) return value.every((v) => isJson(v, depth + 1));
+      if (Object.getPrototypeOf(value) !== Object.prototype && Object.getPrototypeOf(value) !== null) return false;
+      return Object.values(value).every((v) => isJson(v, depth + 1));
+    default:
+      return false;
+  }
+}
+
+// src/shims/core.ts
+var CoreCallError = class extends Error {
+  constructor(code, message) {
+    super(message);
+    this.code = code;
+    this.name = "CoreCallError";
+  }
+  code;
+};
+var MAX_NAME_LENGTH = 128;
+function failureFor(error) {
+  if (error instanceof CoreCallError) return error;
+  if (error instanceof RpcError) {
+    switch (error.code) {
+      case ErrorCode.Refused:
+        return new CoreCallError("refused", error.message);
+      case ErrorCode.Denied:
+        return new CoreCallError("denied", error.message);
+      case ErrorCode.Cancelled:
+        return new CoreCallError("cancelled", error.message);
+      case ErrorCode.NotAvailable:
+        return new CoreCallError("unavailable", error.message);
+      default:
+        return new CoreCallError("failed", error.message);
+    }
+  }
+  return new CoreCallError("failed", error instanceof Error ? error.message : String(error));
+}
+function toResult(wire) {
+  const result = {
+    content: wire.content.map((block) => block.text).join("\n"),
+    isError: wire.is_error
+  };
+  if (wire.structured !== void 0) result.structured = wire.structured;
+  return result;
+}
+function makeCoreApi(rpc2, owner, ticket, callSignal) {
+  return Object.freeze({
+    async call(name, input = {}, options = {}) {
+      if (typeof name !== "string" || name.length === 0 || name.length > MAX_NAME_LENGTH) {
+        throw new CoreCallError("failed", `core.call needs a tool name of 1 to ${MAX_NAME_LENGTH} characters`);
+      }
+      if (!isJson(input)) throw new CoreCallError("failed", "core.call input must be plain JSON");
+      const signal = options.signal === void 0 ? callSignal : AbortSignal.any([callSignal, options.signal]);
+      try {
+        return toResult(await rpc2.request("core/call", { owner, ticket, name, input }, signal));
+      } catch (error) {
+        throw failureFor(error);
+      }
+    }
+  });
+}
 
 // src/shims/owned.ts
 function describeError(error) {
@@ -4662,6 +4774,10 @@ function parseTier(argv) {
     found = value;
   }
   return found ?? "plugin";
+}
+function builtinModuleDigests() {
+  const digests = typeof define_BUILTIN_MODULE_DIGESTS_default === "undefined" ? {} : define_BUILTIN_MODULE_DIGESTS_default;
+  return Object.entries(digests).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0).map(([id, sha256]) => ({ id, sha256 }));
 }
 function ownerTier(ownerId) {
   return ownerId.startsWith(HOST_OWNER_PREFIX) ? "builtin" : "plugin";
@@ -4794,23 +4910,6 @@ function withDeadline(promise, ms, label) {
     timer.unref();
   });
   return Promise.race([promise, deadline]).finally(() => clearTimeout(timer));
-}
-function isJson(value, depth = 0) {
-  if (depth > 64) return false;
-  if (value === null) return true;
-  switch (typeof value) {
-    case "boolean":
-    case "string":
-      return true;
-    case "number":
-      return Number.isFinite(value);
-    case "object":
-      if (Array.isArray(value)) return value.every((v) => isJson(v, depth + 1));
-      if (Object.getPrototypeOf(value) !== Object.prototype && Object.getPrototypeOf(value) !== null) return false;
-      return Object.values(value).every((v) => isJson(v, depth + 1));
-    default:
-      return false;
-  }
 }
 var HostRoot = class {
   constructor(rpc2, tier) {
@@ -5022,13 +5121,14 @@ var HostRoot = class {
       "shutdown"
     ).catch(() => void 0);
   }
-  async callTool(handle, input, callId, signal, workspace) {
+  async callTool(handle, input, callId, signal, workspace, ticket) {
     const local = this.toolRegistrations.byHandle.get(handle);
     if (!local || local.disposed || local.owner.state !== "active") {
       throw new RpcError(ErrorCode.NotAvailable, `tool handle ${handle} is not live`);
     }
     const definition = local.definition;
-    const exec = Object.freeze({ signal, callId, args: input, ...callContext(local.owner, workspace) });
+    const core = ticket === void 0 ? {} : { core: makeCoreApi(this.rpc, local.owner.ref, ticket, signal) };
+    const exec = Object.freeze({ signal, callId, args: input, ...callContext(local.owner, workspace), ...core });
     const run = ownerStorage.run(local.owner, async () => {
       const value = await definition.execute(input, exec);
       return renderResult(definition, input, value);
@@ -5193,7 +5293,7 @@ function shutdownNow(code) {
 }
 var rpc = new RpcPeer((message) => {
   channelWrite(encodeFrame(message));
-});
+}, TIER);
 var host = new HostRoot(rpc, TIER);
 var initialized = false;
 rpc.onRequest("host/initialize", (params) => {
@@ -5224,7 +5324,7 @@ rpc.onRequest("ext/deactivate", async (params) => {
 });
 rpc.onRequest("tool/call", async (params, cx) => {
   requireInitialized();
-  return host.callTool(params.handle, params.input, params.call_id, cx.signal, params.workspace);
+  return host.callTool(params.handle, params.input, params.call_id, cx.signal, params.workspace, params.ticket);
 });
 rpc.onRequest("command/run", async (params, cx) => {
   requireInitialized();
@@ -5278,6 +5378,8 @@ rpc.notify("host/hello", {
   host_version: HOST_VERSION,
   bundle_sha256: bundleDigest(),
   runtime: RUNTIME,
+  tier: TIER,
+  builtin_modules: builtinModuleDigests(),
   ...MEMORY_LIMIT_MIB === void 0 ? {} : { memory_limit_mib: MEMORY_LIMIT_MIB }
 });
 export {

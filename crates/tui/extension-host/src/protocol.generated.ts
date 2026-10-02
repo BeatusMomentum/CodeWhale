@@ -18,28 +18,31 @@ export const ErrorCode = {
   Internal: -32603,
   ExecutionFailed: -32000,
   NotAvailable: -32001,
+  Refused: -32002,
+  Denied: -32003,
   Cancelled: -32800,
 } as const
 
 export type Direction = 'core_to_host' | 'host_to_core'
 
-/** Every method either side may send; nothing else is admitted. */
+/** Every method either side may send, and the trust tiers it is allowed on; nothing else is admitted. */
 export const METHODS = [
-  { name: 'host/initialize', direction: 'core_to_host', request: true, params: 'InitializeParams' },
-  { name: 'host/ping', direction: 'core_to_host', request: true, params: 'EmptyParams' },
-  { name: 'host/shutdown', direction: 'core_to_host', request: true, params: 'EmptyParams' },
-  { name: 'ext/activate', direction: 'core_to_host', request: true, params: 'ActivateParams' },
-  { name: 'ext/deactivate', direction: 'core_to_host', request: true, params: 'DeactivateParams' },
-  { name: 'tool/call', direction: 'core_to_host', request: true, params: 'ToolCallParams' },
-  { name: 'command/run', direction: 'core_to_host', request: true, params: 'CommandRunParams' },
-  { name: '$/cancel', direction: 'core_to_host', request: false, params: 'CancelParams' },
-  { name: 'host/hello', direction: 'host_to_core', request: false, params: 'HelloParams' },
-  { name: 'host/ready', direction: 'host_to_core', request: false, params: 'EmptyParams' },
-  { name: 'registry/register', direction: 'host_to_core', request: true, params: 'RegisterParams' },
-  { name: 'registry/unregister', direction: 'host_to_core', request: true, params: 'UnregisterParams' },
-  { name: 'ext/faulted', direction: 'host_to_core', request: false, params: 'FaultedParams' },
-  { name: 'log', direction: 'host_to_core', request: false, params: 'LogParams' },
-  { name: '$/cancel', direction: 'host_to_core', request: false, params: 'CancelParams' },
+  { name: 'host/initialize', direction: 'core_to_host', request: true, params: 'InitializeParams', tiers: ['plugin', 'builtin'] },
+  { name: 'host/ping', direction: 'core_to_host', request: true, params: 'EmptyParams', tiers: ['plugin', 'builtin'] },
+  { name: 'host/shutdown', direction: 'core_to_host', request: true, params: 'EmptyParams', tiers: ['plugin', 'builtin'] },
+  { name: 'ext/activate', direction: 'core_to_host', request: true, params: 'ActivateParams', tiers: ['plugin', 'builtin'] },
+  { name: 'ext/deactivate', direction: 'core_to_host', request: true, params: 'DeactivateParams', tiers: ['plugin', 'builtin'] },
+  { name: 'tool/call', direction: 'core_to_host', request: true, params: 'ToolCallParams', tiers: ['plugin', 'builtin'] },
+  { name: 'command/run', direction: 'core_to_host', request: true, params: 'CommandRunParams', tiers: ['plugin', 'builtin'] },
+  { name: '$/cancel', direction: 'core_to_host', request: false, params: 'CancelParams', tiers: ['plugin', 'builtin'] },
+  { name: 'host/hello', direction: 'host_to_core', request: false, params: 'HelloParams', tiers: ['plugin', 'builtin'] },
+  { name: 'host/ready', direction: 'host_to_core', request: false, params: 'EmptyParams', tiers: ['plugin', 'builtin'] },
+  { name: 'registry/register', direction: 'host_to_core', request: true, params: 'RegisterParams', tiers: ['plugin', 'builtin'] },
+  { name: 'registry/unregister', direction: 'host_to_core', request: true, params: 'UnregisterParams', tiers: ['plugin', 'builtin'] },
+  { name: 'core/call', direction: 'host_to_core', request: true, params: 'CoreCallParams', tiers: ['plugin', 'builtin'] },
+  { name: 'ext/faulted', direction: 'host_to_core', request: false, params: 'FaultedParams', tiers: ['plugin', 'builtin'] },
+  { name: 'log', direction: 'host_to_core', request: false, params: 'LogParams', tiers: ['plugin', 'builtin'] },
+  { name: '$/cancel', direction: 'host_to_core', request: false, params: 'CancelParams', tiers: ['plugin', 'builtin'] },
 ] as const
 
 /** A field's wire kind: the Rust field's serde type, normalized for validation. */
@@ -78,6 +81,11 @@ export const SHAPES: { readonly [name: string]: Shape } = {
     required: { handle: 'uint', command_id: 'string', raw_input: 'string', deadline_ms: 'uint' },
     optional: { workspace: 'string' },
   },
+  CoreCallParams: {
+    strict: true,
+    required: { owner: { ref: 'OwnerRef' }, ticket: 'string', name: 'string', input: 'json' },
+    optional: {},
+  },
   DeactivateParams: {
     strict: false,
     required: { owner: { ref: 'OwnerRef' } },
@@ -100,7 +108,7 @@ export const SHAPES: { readonly [name: string]: Shape } = {
   },
   HelloParams: {
     strict: true,
-    required: { protocol: { ref: 'ProtocolRange' }, host_version: 'string', bundle_sha256: 'string', runtime: { ref: 'HelloRuntime' } },
+    required: { protocol: { ref: 'ProtocolRange' }, host_version: 'string', bundle_sha256: 'string', runtime: { ref: 'HelloRuntime' }, tier: { enum: ['builtin', 'plugin'] }, builtin_modules: { items: { ref: 'ModuleDigestWire' } } },
     optional: { memory_limit_mib: 'uint' },
   },
   HelloRuntime: {
@@ -122,6 +130,11 @@ export const SHAPES: { readonly [name: string]: Shape } = {
     strict: true,
     required: { level: 'string', msg: 'string' },
     optional: { plugin_id: 'string' },
+  },
+  ModuleDigestWire: {
+    strict: true,
+    required: { id: 'string', sha256: 'string' },
+    optional: {},
   },
   OwnerRef: {
     strict: true,
@@ -151,7 +164,7 @@ export const SHAPES: { readonly [name: string]: Shape } = {
   ToolCallParams: {
     strict: false,
     required: { handle: 'uint', call_id: 'string', input: 'json', deadline_ms: 'uint' },
-    optional: { workspace: 'string' },
+    optional: { workspace: 'string', ticket: 'string' },
   },
   UnregisterParams: {
     strict: true,
@@ -188,6 +201,13 @@ export interface CommandRunParams {
 
 export type ContentBlockWire = { type: 'text'; text: string }
 
+export interface CoreCallParams {
+  owner: OwnerRef
+  ticket: string
+  name: string
+  input: Json
+}
+
 export interface DeactivateParams {
   owner: OwnerRef
 }
@@ -214,6 +234,8 @@ export interface HelloParams {
   host_version: string
   bundle_sha256: string
   runtime: HelloRuntime
+  tier: HostTier
+  builtin_modules: ModuleDigestWire[]
   memory_limit_mib?: number
 }
 
@@ -229,6 +251,8 @@ export interface HostLimits {
   activate_deadline_ms: number
 }
 
+export type HostTier = 'builtin' | 'plugin'
+
 export interface InitializeParams {
   protocol: number
   limits: HostLimits
@@ -238,6 +262,11 @@ export interface LogParams {
   level: string
   msg: string
   plugin_id?: string
+}
+
+export interface ModuleDigestWire {
+  id: string
+  sha256: string
 }
 
 export interface OwnerRef {
@@ -280,6 +309,7 @@ export interface ToolCallParams {
   input: Json
   deadline_ms: number
   workspace?: string
+  ticket?: string
 }
 
 export interface ToolResultWire {

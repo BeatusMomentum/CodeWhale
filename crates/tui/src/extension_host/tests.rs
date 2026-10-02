@@ -72,20 +72,30 @@ fn protocol_corpus_parses_and_round_trips_in_both_directions() {
         let frame = case["frame"].clone();
         let direction = case["direction"].as_str().unwrap();
         let expect_valid = case["valid"].as_bool().unwrap();
-        let reencoded = match direction {
-            "host_to_core" => parse_host_message(frame.clone()).map(|m| m.to_value()),
-            "core_to_host" => parse_core_message(frame.clone()).map(|m| m.to_value()),
-            other => panic!("unknown direction {other}"),
-        };
         let name = path.file_name().unwrap().to_string_lossy();
+        // Every method allows both tiers today, so a case reads the same under
+        // either (the tier rule itself is `protocol::tests`).
+        for tier in HostTier::ALL {
+            let reencoded = match direction {
+                "host_to_core" => parse_host_message(frame.clone(), tier).map(|m| m.to_value()),
+                "core_to_host" => parse_core_message(frame.clone(), tier).map(|m| m.to_value()),
+                other => panic!("unknown direction {other}"),
+            };
+            if expect_valid {
+                let reencoded = reencoded.unwrap_or_else(|e| panic!("{name} ({tier:?}): {e}"));
+                assert_eq!(
+                    reencoded, frame,
+                    "{name} ({tier:?}) must round-trip exactly"
+                );
+            } else {
+                assert!(reencoded.is_err(), "{name} ({tier:?}) must be rejected");
+            }
+        }
         if expect_valid {
-            let reencoded = reencoded.unwrap_or_else(|e| panic!("{name}: {e}"));
-            assert_eq!(reencoded, frame, "{name} must round-trip exactly");
             let bytes = protocol::encode_frame(&frame).unwrap();
             assert_eq!(&bytes[..4], b"CWX1");
             valid += 1;
         } else {
-            assert!(reencoded.is_err(), "{name} must be rejected");
             invalid += 1;
         }
     }
@@ -2368,6 +2378,7 @@ async fn ordinary_exit_rejects_requests_from_a_drained_calls_waker() {
                 input: json!({"ms": 30_000}),
                 deadline_ms: 60_000,
                 workspace: None,
+                ticket: None,
             }),
             Some(registration.owner.plugin_id),
         )
@@ -2424,6 +2435,7 @@ async fn idle_retirement_seals_admission_and_does_not_wait_for_heartbeat() {
                 input: json!({"ms": 100}),
                 deadline_ms: 5000,
                 workspace: None,
+                ticket: None,
             }),
             Some(registration.owner.plugin_id),
         )
@@ -2516,6 +2528,7 @@ async fn two_dirty_teardowns_wait_for_a_live_call_then_replay_without_spending_c
                 input: json!({"ms": 4000}),
                 deadline_ms: 10000,
                 workspace: None,
+                ticket: None,
             }),
             Some(registration.owner.plugin_id.clone()),
         )
@@ -3369,6 +3382,87 @@ async fn handshake_refuses_a_runtime_or_version_mismatch_and_an_unapplied_kernel
             Err(error) => error,
         };
         assert!(error.contains(expected), "{error}");
+    }
+}
+
+/// A host that reports another tier than the one launched, or built-in module
+/// digests other than the ones the core pins, is refused at the handshake like
+/// a runtime mismatch: before initialization, with the reason.
+#[tokio::test]
+async fn handshake_refuses_a_tier_or_built_in_module_digest_mismatch() {
+    let Some(node) = node_for_tests("handshake_refuses_a_tier_or_built_in_module_digest_mismatch")
+    else {
+        return;
+    };
+    // A table that pins a module the host bundle does not embed.
+    const PINNED: &[super::tier::BuiltinModule] = &[super::tier::BuiltinModule {
+        id: "demo",
+        source_sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        tools: &[],
+    }];
+    struct NoEvents;
+    impl super::supervisor::HostEvents for NoEvents {
+        fn register(&self, _: &protocol::RegisterParams) -> protocol::RegisterResult {
+            unreachable!()
+        }
+        fn unregister(&self, _: &protocol::UnregisterParams) {}
+        fn faulted(&self, _: &protocol::FaultedParams) {}
+        fn log(&self, _: &protocol::LogParams) {}
+        fn exited(&self, _: u64, _: String, _: String) {}
+    }
+    let home = tempfile::tempdir().unwrap();
+    let bundle = super::materialize_bundle(home.path()).unwrap();
+    let runtime =
+        crate::dependencies::resolve_extension_host_runtime(NODE, Some(node.as_path()), None)
+            .selected
+            .expect("the test Node resolves");
+    let launch_for = |tier: HostTier| {
+        super::supervisor::plan_launch(tier, &runtime, &bundle, home.path(), 1 << 30).unwrap()
+    };
+
+    // Each tier's host reports its own tier and the build's (empty) digests.
+    for tier in HostTier::ALL {
+        let host = super::supervisor::HostProcess::spawn(
+            1,
+            &launch_for(tier),
+            super::bundle_sha256(),
+            Arc::new(NoEvents),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("{tier:?} host: {error}"));
+        assert_eq!(host.tier, tier);
+        host.shutdown().await;
+    }
+
+    for (case, expected) in [
+        (
+            "tier",
+            "host reports the plugin tier but the builtin tier was launched",
+        ),
+        (
+            "modules",
+            "host bundle embeds the built-in module digests [] but the core pins [demo=0123456789ab]",
+        ),
+    ] {
+        let mut launch = launch_for(HostTier::Plugin);
+        match case {
+            // The core believes it launched the builtin tier; the host, started
+            // with `--tier=plugin`, truthfully says plugin.
+            "tier" => launch.tier = HostTier::Builtin,
+            _ => launch.builtin_modules = PINNED,
+        }
+        let error = match super::supervisor::HostProcess::spawn(
+            1,
+            &launch,
+            super::bundle_sha256(),
+            Arc::new(NoEvents),
+        )
+        .await
+        {
+            Ok(_) => panic!("{case}: {expected}"),
+            Err(error) => error,
+        };
+        assert!(error.contains(expected), "{case}: {error}");
     }
 }
 

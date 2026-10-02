@@ -1,6 +1,6 @@
 {
   "direction": "host_to_core",
-  "valid": true,
+  "valid": false,
   "frame": {
     "jsonrpc": "2.0",
     "method": "host/hello",
@@ -15,7 +15,7 @@
         "name": "bun",
         "version": "1.4.0"
       },
-      "tier": "plugin",
+      "tier": "root",
       "builtin_modules": []
     }
   }

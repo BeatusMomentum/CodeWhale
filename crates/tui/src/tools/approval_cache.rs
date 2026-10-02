@@ -171,6 +171,25 @@ pub fn approval_keys_for_call(
     }
 }
 
+/// [`approval_keys_for_call`] for a call an extension made through `core/call`
+/// (`scope` is the extension plugin build's [`approval_scope`]): both keys are
+/// prefixed `extcall:<scope>:`, so a session grant or a denial recorded for the
+/// model's call of a tool never matches the extension's call of it, and the
+/// reverse, and neither crosses to another plugin build.
+///
+/// [`approval_scope`]: crate::tools::spec::ToolSpec::approval_scope
+#[must_use]
+pub fn extension_origin_approval_keys(
+    scope: &str,
+    registry: Option<&crate::tools::ToolRegistry>,
+    tool_name: &str,
+    input: &serde_json::Value,
+) -> (ApprovalKey, ApprovalKey) {
+    let (exact, grouping) = approval_keys_for_call(registry, tool_name, input);
+    let scoped = |key: ApprovalKey| ApprovalKey(format!("extcall:{scope}:{}", key.0));
+    (scoped(exact), scoped(grouping))
+}
+
 /// The sorted `web.run` action kinds present in `input`, e.g. `open+search_query`.
 fn web_run_action_class(input: &Value) -> String {
     const ACTIONS: [&str; 6] = [

@@ -8,6 +8,210 @@
 > from the text that follows. Where they disagree, the newest "As built"
 > section and the code are current; the rest is the plan for later phases.
 
+## As built: `core/call`, capability tickets and the gate for extension tools (2026-10-02)
+
+Slice B of the tier plan, and the first thing the host can ask the core to do.
+Still protocol v1 (a new method and an optional field); corpus `22`, `58`-`66`.
+User-facing rules: `docs/EXTENSIONS.md`, "Asking the core to run a tool".
+
+- **Protocol.** `core/call` (host to core, request, both tiers)
+  `{owner, ticket, name, input}`, answered with the existing `ToolResultWire`;
+  `core_call::` below. New error codes `Refused` (-32002: policy, a limit, an
+  invalid ticket) and `Denied` (-32003: the user declined the card).
+  `tool/call` gains an optional `ticket`. `host_protocol_never_gains_core_authority`
+  has its reviewed row for `core/call` and was not weakened (the method name
+  mentions none of the core-only words); corpus `22` flipped from invalid to
+  valid and was renamed.
+- **Tickets** (`extension_host/ticket.rs`). A Rust-minted opaque id (244 random
+  bits) indexing a Rust-side row `{kind, tier, host_generation, owner, method,
+  target, expires, uses_left}`. `TicketKind` has one variant, `Invocation`
+  (multi-use, budgeted); a process launch, fetch or MCP grant join with their
+  redeemers. `redeem` checks every field under one mutex (kind, tier, host
+  generation, the whole `OwnerRef`, method, a stated target as parsed JSON,
+  expiry, uses) and refuses an unknown, expired, replayed (exhausted), wrong-owner,
+  wrong-tier, wrong-generation or wrong-method ticket. Which field mismatched is
+  not told to the host. Eight invalid presentations within a minute from one
+  host process are a protocol violation (`HostRequestContext::violation` ends
+  the host through the reader's kill path); a valid ticket merely out of uses
+  does not count. Tickets are never persisted or logged (`Ticket`'s `Debug` is
+  redacted; nothing quotes one) and are revoked when the invocation ends (the
+  guard's `Drop`, so also when the tool call's future is dropped), when the
+  owner is revoked (reconcile, `ext/faulted`) and when the host exits.
+  Backstop expiry is 24 h: an invocation's life is bounded by its own deadline,
+  which pauses while a person decides, so a short ttl would be wrong.
+- **Where one exists.** `HostToolSpec::execute` mints an `Invocation` ticket only
+  when the tool's context carries a `NestedCallGate` that the turn loop built
+  *for this tool* (`NestedCallGate::for_extension(caller, specs)`; the tool
+  checks the caller matches its own). The turn loop attaches one when a
+  registry spec says `extension_caller()` (a `ToolSpec` method, default
+  `None`), in `execute_tools_with_nested_gate`, the same function that serves an
+  `execute_tools` program's gate. A sub-agent, a test, and a tool nested in
+  `execute_tools` (whose invoker takes the gate from the nested context) have
+  none, nor does any command, timer or activation: the tool gets no `exec.core`
+  and a forged request finds no ticket.
+- **One gate, one executor.** The turn loop serves the request with
+  `gate_nested_call`, now parameterised by who is asking
+  (`ToolCallSource::Extension`), so planning is `plan_tool_calls` unchanged
+  (budget, allow/deny lists, preparation, hooks, ask-rules, Auto-Review, repo
+  law, the authority envelope, the fleet guard). The caller side is the same
+  `CodemodeInvoker` code mode uses (`for_extension`; `invoke` is now `call` plus
+  a mapping): the concurrency cap, the exclusive/shared order lock, the
+  `PauseClock`, the receipts, the result bounding and spill. What this removed
+  rather than copied: nothing about the executor was duplicated; the only new
+  code in `codemode.rs` is the withdraw plumbing and the `NestedFailure` type
+  that lets a caller see the decision (code mode maps it back to
+  `DriverError`).
+- **Refused outright** (`core_call::refusal`), before planning on the host's
+  name and again by the turn loop on the name planning resolved and the final
+  input (after a hook rewrite): everything `refusal_before_gate` refuses; any
+  extension tool (`ToolSpec::extension_caller`, found by case-insensitive name
+  and by canonical alias), the caller's own tool included; `mcp_*` and the MCP
+  resource tools, Computer Use included (founder's default: not in v1); tool
+  search and `retrieve_tool_result`; `remember`; and a name table for what
+  changes or schedules beyond the session (`request_plugin_install`, goals,
+  `automation*`, `send_later`, starting MCP servers). Names compare ASCII
+  case-insensitively and by canonical alias.
+- **Approval** (`core_call::origin_approval`, applied at the end of
+  `plan_tool_calls` for `Extension` and only ever raising). `Required` unless the
+  tool is in `EXT_AUTO_ELIGIBLE` (`read`, `read_file`, `list_dir`, `file_search`,
+  `grep_files`; a test pins each as a registered, read-only, auto-approved tool;
+  the action-based `Git` tool is left out until its read-only actions can be
+  told apart by name) *and* planning found nothing
+  that asks. Shell and network (the authority categories plus `web.run`,
+  `git_fetch`, `finance`, `run_tests`, `verify`, `run_verifiers`, `harness`)
+  set `approval_force_prompt`. The card text is composed in Rust ("Requested by
+  `extension:<plugin>` from inside its tool `<tool>` (core/call): ...") and the
+  audit events say `caller: extension` with the extension and tool. Keys are
+  origin-scoped (`extension_origin_approval_keys`: `extcall:<ext:plugin@hash>:`
+  plus the usual key), so a grant for the model's call never covers an
+  extension's and the reverse.
+  *How "forced" meets the existing postures* (a documented choice, tested in
+  `extension_calls_resolve_against_every_posture_as_documented`): the engine
+  always raises the card with `approval_force_prompt`; what answers it is
+  `resolve_approval_request_disposition`. Ask: a modal every time, no session
+  grant consulted. Full Access: a forced hold opens no modal and fails closed, so
+  the call is refused and nothing runs (`AutoDenyFullAccessPolicyHold`, the same
+  rule typed ask-rules and the safety floor already follow); the founder's "force
+  a prompt even under Full Access" is realised as "never satisfied by Full
+  Access". Auto-Review and Never: refused as for any hold. Every other call an
+  extension makes (Required, not forced) is, in Full Access, auto-approved as the
+  model's would be, and in Ask promptable and groupable under the extension's
+  own keys.
+- **Two fixes the plan named.** (1) `await_tool_approval` takes an optional
+  withdraw token (`request_tool_approval_until`; the old name is a wrapper):
+  when it fires the wait ends with a `Cancelled` outcome in the approval log, a
+  status line and a cancelled error, and the call is never decided for the
+  person. The token fires on the host's `$/cancel` of the request, the owner's
+  revocation, the host's exit and the invocation's end (which includes the
+  tool call's deadline and the turn being cancelled); a request withdrawn
+  before the server starts it is dropped unplanned (`NestedCallRequest::is_stale`).
+  (2) `HostProcess::call_with_clock` measures the `tool/call` deadline on the
+  invocation's `PauseClock`, paused while any `core/call` waits on the gate
+  (`call` is the same with a clock nothing pauses), so a person taking a minute
+  on a card does not time the tool out; the deadline is otherwise as before.
+- **Caps.** Per invocation 50 core calls in all (the ticket's uses), 4 at once
+  (code mode's `MAX_CONCURRENT_CALLS`; a fifth waits for a slot), and one
+  approval card at a time (the turn loop serves one gate request at a time; a
+  second call needing approval waits behind the first); per host 256 requests in
+  flight (A2's table). The call's result metadata gets `core_calls`: at most 50
+  receipts (decision, status, bytes, a note cut at 256 bytes).
+- **Host.** `exec.core.call(name, input?, {signal?})` (`src/shims/core.ts`),
+  present on a tool's `exec` only when the call carried a ticket (so the frozen
+  `exec`'s keys are unchanged otherwise); it answers `{content, isError,
+  structured?}` or rejects with `CoreCallError` whose `code` is `refused`,
+  `denied`, `cancelled`, `unavailable` or `failed`. The host refuses locally
+  what it must not send (a bad name, input that is not plain JSON). The tool's
+  `exec.signal` and an optional per-call signal send `$/cancel` for the pending
+  `core/call`. The ticket is never exposed to plugin code. No DSH equivalent was
+  found in the vendored DSH surface (DSH reaches tools through its own
+  `ToolRuntime` service, which the host deliberately does not provide), so there
+  is only the Codewhale-native API.
+- **Tests.** Rust: the ticket table (every field, expiry, exhaustion, burst
+  window, revocation, redaction); spoofing against `serve` (wrong owner, other
+  token, other tier, generation bump, unknown, after revoke/exit/end); the real
+  host through a stand-in gate (read plus receipts, every refusal in many
+  spellings before the gate is asked, no ticket without this tool's extension
+  gate, a command has no `core`, a held approval outliving a 1 s deadline,
+  withdrawal on drop, owner revoke and host kill, 50 total and 4 concurrent);
+  the real turn loop with a fake extension tool (forced prompt in Ask and Full
+  Access with Rust-composed card and extension-scoped keys, read unprompted and
+  write carded, refused calls raise no card, a withdrawn card recorded
+  cancelled, one card at a time) and `await_tool_approval`'s withdraw token on
+  its own; the refusal list and the approval table; the posture matrix; the key
+  scoping in both directions; the corpus and the lint. JS: `exec.core` against a
+  fake core (payload, absence without a ticket, every error code, local refusals,
+  cancel, concurrency).
+
+Not done: the UI card is not retracted when a call is withdrawn (there is no
+event for it; an answer afterwards finds no waiter); no per-plugin process (a
+ticket narrows a frame, it does not isolate plugins sharing the host, section
+4.4); images and rich content from a core tool are dropped; the refusal table
+names tools (a new mode/permission tool must be added); no `core/call` from a
+command, a timer or activation (by design: they return a proposal); `mcp_*`
+stays out until the MCP move.
+
+## As built: the tier in the handshake, method tiers and host requests (2026-10-02)
+
+Slice A2 of the tier plan. It adds the three things A1 listed as not done that
+need no new method. Still protocol v1; the TypeScript shapes are regenerated and
+corpus fixtures `51`-`57` cover the new hello fields.
+
+- **`host/hello` says what the host is.** It now carries `tier`
+  (`plugin`|`builtin`, the `--tier=` the host was started with) and
+  `builtin_modules`, one `{id, sha256}` row per built-in module source the host
+  *build* embeds, in id order. `build.mjs` builds the built-in modules first and
+  substitutes their digests into the host bundle, so the bundle states them
+  itself and stays deterministic. The core checks both the way it checks the
+  runtime name and version, in `supervisor::check_hello_identity`, and refuses
+  a mismatch before `host/initialize`: a tier other than the one in the launch
+  plan, or a module list that is not exactly the one the Rust table
+  (`tier::BUILTIN_MODULES`, carried on the launch as `builtin_modules`) pins.
+  Both fields are required (a host that omits one is a protocol violation, not
+  a legacy host: the bundle is embedded and always the same build). Today the
+  table and the list are empty. This is drift protection between the two halves
+  of one build, not authentication: a substituted host reports whatever it
+  likes, as `bundle_sha256` already allowed (§4.4, threat 1).
+- **A tier allow-list per method.** `protocol::MethodSpec` has `tiers`, the
+  trust tiers whose host may send (host to core) or be sent (core to host) the
+  method; `row()` gives both and a reserved method is written
+  `MethodSpec { tiers: &[HostTier::Builtin], ..row(..) }`. It is enforced in both
+  directions on both sides: `admit_in` refuses a frame from a host of the wrong
+  tier like an unknown method (a protocol violation), `HostProcess::start_request`
+  refuses to send a method the host's tier may not receive (`MethodNotFound`,
+  nothing is written), and the host's `validateMessage(.., tier)` refuses both
+  what it would send and what it is sent. The generated `METHODS` table carries
+  `tiers`. No method is reserved yet (the first are the process broker, the
+  fetch proxy and the MCP client: `proc/*`, `net/*`, `mcp/*`; a test pins that
+  any method with those prefixes can never allow the plugin tier); the mechanism
+  is tested with test-only reserved rows in Rust and in the host's tests.
+- **Host requests are tasks.** The reader no longer answers `registry/*`
+  inline. Each host request is admitted into an id table
+  (`supervisor::InboundRequests`, at most 256 in flight and no id reused in
+  flight, the same bound the host holds itself to; either is a protocol
+  violation that ends the host), runs as its own task through
+  `HostEvents::host_request` (an async trait method whose default answers the
+  registry requests exactly as before) and is answered when it finishes. It is
+  cancelled by the host's `$/cancel {id}` (the answer, if the handler still
+  produces one, is dropped; a cancel for an id not in flight is ignored), by
+  its owner's revocation (`revoke_calls_of`: the host is answered `Cancelled`)
+  and by the host's exit (nobody is answered). A handler gets a
+  `CancellationToken` it should wait on; one that ignores it is abandoned
+  500 ms (`CANCEL_GRACE`) after the cancel, so a cancelled request never holds
+  its slot. The host half: `RpcPeer.request(method, params, signal)` sends
+  `$/cancel` for its id and rejects as cancelled when the signal aborts.
+- **Tests.** Rust: the hello identity rules (tier, missing, extra, changed and
+  repeated modules), a real host refused for a launched/reported tier mismatch
+  and for a pinned module its bundle lacks, the id table (cancel, late answer,
+  abandoned handler, revoke, exit, cap, id reuse, default registry answers), the
+  tier rule over a reserved test table, the corpus under both tiers, and the
+  generated-TypeScript drift test. JS: the corpus under both tiers, a reserved
+  test row refused to a plugin host in both directions, the hello fields, and
+  `RpcPeer` cancellation.
+
+Not done: any reserved method (nothing needs the builtin-only tier before the
+MCP move). The first host request that can be cancelled, `core/call`, is the
+next section.
+
 ## As built: trust tiers (2026-10-02)
 
 Slice A1 of the tier plan (CURRENT_DECISIONS §26 D3, §1.5 above): the host is
@@ -91,10 +295,8 @@ exists:
 
 Not done, and not claimed: any real tier-0 module (the MCP move, §5, is the
 first consumer); `host/hello` reporting a tier or module digests and a
-per-method tier allow-list (slice A2: until then the core cannot tell what
-tier a host believes it serves beyond its argv, and a tier-1 host is not
-refused `proc/*`, `net/*` or `mcp/*` because none of those exist); capability
-tickets (they land with their first redeemer, `core/call`); embedding or
+per-method tier allow-list (done in slice A2, above); capability
+tickets (landed with their first redeemer, `core/call`, in the section above); embedding or
 materializing a module's source; a bundled tier-0 executable (D1); a demand
 predicate that defers the builtin spawn until something needs it; the builtin
 tier's sandbox denying the plugin tier's data directory (it can read it today);
@@ -830,7 +1032,7 @@ Rust then respawns the host and replays activations from its own record of which
 
   ```
   host → core  host/hello      {protocol: {min: 1, max: 1}, host_version, bundle_sha256, runtime: {name, version},
-                                required_caps: [...], optional_caps: [...]}
+                                tier, builtin_modules: [{id, sha256}], (memory_limit_mib)}
   core → host  host/initialize {protocol: 1, session_runtime_id, workspace_roots, caps_granted: [...],
                                 limits: {max_frame, max_inflight, hook_deadline_ms, dispose_deadline_ms}}
   host → core  host/ready      {}

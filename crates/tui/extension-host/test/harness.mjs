@@ -45,8 +45,12 @@ export const LIMITS = { max_frame: 32 * 1024 * 1024, max_inflight: 256, dispose_
  * handle number or `{ refused }`. Registry traffic is recorded in `registry`.
  * `tier` is the trust tier it serves (`--tier=`, after the bundle, as the Rust
  * core passes it); `null` passes none, as a host started by hand would.
+ * `coreCall(params, id)` answers a `core/call` request: return a tool result, or
+ * `{ error: { code, message } }`; it may be async, and a request the host
+ * cancelled is not answered. Requests are recorded in `coreCalls`, the host's
+ * `$/cancel` ids in `cancels`.
  */
-export async function startHost({ admit, env, ownGroup = false, tier = 'plugin' } = {}) {
+export async function startHost({ admit, env, ownGroup = false, tier = 'plugin', coreCall } = {}) {
   const started = performance.now()
   // `ownGroup` spawns the host as a process-group leader and tells it so, as
   // the Rust core does on Unix.
@@ -63,13 +67,15 @@ export async function startHost({ admit, env, ownGroup = false, tier = 'plugin' 
     stderr: '',
     logs: [],
     faulted: [],
+    coreCalls: [],
+    cancels: [],
     registry: [],
     hello: null,
     nextId: 1,
     nextHandle: 1,
     exit: new Promise((resolve) => child.on('exit', (code, signal) => resolve({ code, signal }))),
     send(message) {
-      validateMessage(message, 'core_to_host')
+      validateMessage(message, 'core_to_host', tier ?? 'plugin')
       child.stdin.write(encodeFrame(message))
     },
     request(method, params) {
@@ -100,7 +106,7 @@ export async function startHost({ admit, env, ownGroup = false, tier = 'plugin' 
   child.stderr.on('data', (chunk) => { host.stderr += chunk.toString() })
   child.stdout.on('data', (chunk) => {
     for (const raw of decoder.push(chunk)) {
-      const message = validateMessage(raw, 'host_to_core')
+      const message = validateMessage(raw, 'host_to_core', tier ?? 'plugin')
       for (let i = waiters.length - 1; i >= 0; i--) {
         if (waiters[i].predicate(message)) waiters.splice(i, 1)[0].resolve(message)
       }
@@ -121,6 +127,20 @@ export async function startHost({ admit, env, ownGroup = false, tier = 'plugin' 
             const result = verdict && typeof verdict === 'object' ? verdict : { handle: verdict ?? host.nextHandle++ }
             if ('handle' in result) host.registry.at(-1).handle = result.handle
             host.send({ jsonrpc: '2.0', id: message.id, result })
+            break
+          }
+          case '$/cancel':
+            host.cancels.push(message.params.id)
+            break
+          case 'core/call': {
+            host.coreCalls.push({ id: message.id, ...message.params })
+            const answer = coreCall ? coreCall(message.params, message.id) : { error: { code: -32002, message: 'no core/call handler' } }
+            const id = message.id
+            Promise.resolve(answer).then((value) => {
+              if (host.cancels.includes(id) || child.exitCode !== null) return
+              if (value && typeof value === 'object' && 'error' in value) host.send({ jsonrpc: '2.0', id, error: value.error })
+              else host.send({ jsonrpc: '2.0', id, result: value })
+            })
             break
           }
           case 'registry/unregister':

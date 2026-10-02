@@ -15,8 +15,17 @@
         "name": "bun",
         "version": "1.4.0"
       },
-      "tier": "plugin",
-      "builtin_modules": []
+      "tier": "builtin",
+      "builtin_modules": [
+        {
+          "id": "mcp",
+          "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+        },
+        {
+          "id": "search",
+          "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+        }
+      ]
     }
   }
 }

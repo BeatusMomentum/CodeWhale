@@ -18,12 +18,13 @@ import {
   type CommandResultWire,
   type ContentBlockWire,
   type DeactivateResult,
-  type Json,
   type OwnerRef,
   type ToolResultWire,
 } from './protocol.ts'
 import { RpcError, type RpcPeer } from './rpc.ts'
 import { explainImportError } from './dsh/resolve-hooks.ts'
+import { isJson } from './json.ts'
+import { makeCoreApi } from './shims/core.ts'
 import { OwnedRegistrations } from './shims/owned.ts'
 import { ownerTier, type HostTier } from './tier.ts'
 import {
@@ -105,24 +106,6 @@ function withDeadline<T>(promise: Promise<T>, ms: number, label: string): Promis
     timer.unref()
   })
   return Promise.race([promise, deadline]).finally(() => clearTimeout(timer))
-}
-
-function isJson(value: unknown, depth = 0): value is Json {
-  if (depth > 64) return false
-  if (value === null) return true
-  switch (typeof value) {
-    case 'boolean':
-    case 'string':
-      return true
-    case 'number':
-      return Number.isFinite(value)
-    case 'object':
-      if (Array.isArray(value)) return value.every((v) => isJson(v, depth + 1))
-      if (Object.getPrototypeOf(value) !== Object.prototype && Object.getPrototypeOf(value) !== null) return false
-      return Object.values(value as object).every((v) => isJson(v, depth + 1))
-    default:
-      return false
-  }
 }
 
 export class HostRoot {
@@ -360,7 +343,15 @@ export class HostRoot {
     ).catch(() => undefined)
   }
 
-  async callTool(handle: number, input: unknown, callId: string, signal: AbortSignal, workspace?: string): Promise<ToolResultWire> {
+  async callTool(
+    handle: number,
+    input: unknown,
+    callId: string,
+    signal: AbortSignal,
+    workspace?: string,
+    /** The core's invocation ticket: present only when this call runs under the turn loop's permission gate. */
+    ticket?: string,
+  ): Promise<ToolResultWire> {
     const local = this.toolRegistrations.byHandle.get(handle)
     if (!local || local.disposed || local.owner.state !== 'active') {
       throw new RpcError(ErrorCode.NotAvailable, `tool handle ${handle} is not live`)
@@ -368,7 +359,9 @@ export class HostRoot {
     const definition = local.definition
     // `workspace` is the calling session's workspace, per call; `dataDir` is
     // this plugin's own directory. Both are read-only strings.
-    const exec = Object.freeze({ signal, callId, args: input, ...callContext(local.owner, workspace) })
+    // `core` exists only when the core gave this call a ticket (`exec.core` in shims/core.ts).
+    const core = ticket === undefined ? {} : { core: makeCoreApi(this.rpc, local.owner.ref, ticket, signal) }
+    const exec = Object.freeze({ signal, callId, args: input, ...callContext(local.owner, workspace), ...core })
     const run = ownerStorage.run(local.owner, async () => {
       const value = await definition.execute(input, exec)
       return renderResult(definition, input, value)

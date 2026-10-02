@@ -25,6 +25,13 @@
 //! * **Liveness is re-checked at call time**: the plugin's reviewed receipt,
 //!   the Native adapter in this build's policy, and the exact owner
 //!   generation. A revocation mid-turn fails the call closed.
+//!
+//! A fifth thing is not a rule but a capability: when the turn loop serves a
+//! permission gate for exactly this call (the model called the tool directly),
+//! the call carries an invocation ticket and the tool may ask the core to run
+//! core tools through `core/call` (`super::core_call`). The call's deadline
+//! then stops while one of those waits on an approval card, and what the tool
+//! asked the core to run is attached to its result metadata (`core_calls`).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -33,10 +40,12 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use super::ManagerShared;
+use super::core_call::InvocationGuard;
 use super::protocol::{ContentBlockWire, CoreRequest, ToolCallParams, ToolResultWire};
 use super::registry::ToolRegistration;
 use super::supervisor::HostCallError;
 use super::tier::{self, HostTier};
+use crate::tools::codemode::ExtensionCaller;
 use crate::tools::spec::{
     ApprovalRequirement, PreparedToolCall, ToolCapability, ToolContext, ToolError, ToolResult,
     ToolSpec,
@@ -96,6 +105,19 @@ impl HostToolSpec {
                     self.registration.name
                 ))
             })
+    }
+
+    /// Who this tool is to the turn loop's gate: composed here, from the
+    /// registration, never from anything the host says.
+    fn caller(&self) -> ExtensionCaller {
+        ExtensionCaller {
+            origin: self.origin(),
+            tool: self.registration.name.clone(),
+            scope: format!(
+                "ext:{}@{}",
+                self.registration.owner.plugin_id, self.registration.content_hash
+            ),
+        }
     }
 
     /// The approval-card text. Rust composes it; the extension supplies none.
@@ -234,10 +256,13 @@ impl ToolSpec for HostToolSpec {
 
     /// Grants are bound to the plugin's reviewed receipt (design §4.3).
     fn approval_scope(&self) -> Option<String> {
-        Some(format!(
-            "ext:{}@{}",
-            self.registration.owner.plugin_id, self.registration.content_hash
-        ))
+        Some(self.caller().scope)
+    }
+
+    /// The turn loop serves a permission gate for this tool's call, through
+    /// which its `core/call`s are planned and approved.
+    fn extension_caller(&self) -> Option<ExtensionCaller> {
+        Some(self.caller())
     }
 
     fn prepare(&self, input: Value, _context: &ToolContext) -> Result<PreparedToolCall, ToolError> {
@@ -276,6 +301,25 @@ impl ToolSpec for HostToolSpec {
         // The deadline travels with the call: the host is told the bound
         // `HostProcess::call` enforces (and cancels at).
         let deadline = self.manager.options.supervision.tool_call_deadline;
+        // An invocation ticket (so the tool may ask the core to run tools for
+        // it) exists only when the turn loop is serving a permission gate for
+        // exactly this tool's call. Otherwise (a sub-agent, a call nested in
+        // `execute_tools`, a test) the tool has no way to ask for anything.
+        let invocation: Option<InvocationGuard> = context
+            .execution
+            .nested_call_gate
+            .as_ref()
+            .and_then(|gate| {
+                self.manager.core_calls.begin(
+                    registration.tier,
+                    host.generation,
+                    &registration.owner,
+                    &call_id,
+                    &self.caller(),
+                    context,
+                    gate,
+                )
+            });
         let request = CoreRequest::ToolCall(ToolCallParams {
             handle: registration.handle,
             call_id,
@@ -284,9 +328,16 @@ impl ToolSpec for HostToolSpec {
             // The calling session's workspace and no other: the plugin never
             // learns where else this process has workspaces.
             workspace: context.workspace.to_str().map(str::to_owned),
+            ticket: invocation.as_ref().map(|i| i.ticket().to_string()),
         });
+        // The deadline stops while one of this call's `core/call`s waits on
+        // the gate (an approval card), so a person's time is not the tool's.
         let value = host
-            .call(request, Some(registration.owner.plugin_id.clone()))
+            .call_with_clock(
+                request,
+                Some(registration.owner.plugin_id.clone()),
+                invocation.as_ref().map(InvocationGuard::clock),
+            )
             .await
             .map_err(|error| map_call_error(&registration.name, error))?;
         let wire: ToolResultWire = serde_json::from_value(value).map_err(|error| {
@@ -295,6 +346,14 @@ impl ToolSpec for HostToolSpec {
                 registration.name
             ))
         })?;
-        Ok(wire_to_result(wire, &self.origin()))
+        let mut result = wire_to_result(wire, &self.origin());
+        // What the tool asked the core to run, so the persisted record shows it.
+        if let (Some(receipts), Some(Value::Object(metadata))) = (
+            invocation.as_ref().and_then(InvocationGuard::receipts),
+            result.metadata.as_mut(),
+        ) {
+            metadata.insert("core_calls".to_string(), receipts);
+        }
+        Ok(result)
     }
 }

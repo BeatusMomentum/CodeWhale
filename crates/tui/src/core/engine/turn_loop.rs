@@ -32,15 +32,20 @@ struct PlannedToolCalls {
     batch_sandbox_policy: crate::sandbox::SandboxPolicy,
 }
 
-/// Who proposed a tool call being planned. Both sources go through the same
-/// gate; only code-mode calls skip deferred-schema hydration, so a program
-/// never activates a tool (and never re-pins the request prefix).
+/// Who proposed a tool call being planned. Every source goes through the same
+/// gate; only code-mode and extension calls skip deferred-schema hydration, so
+/// neither a program nor an extension ever activates a tool (and never re-pins
+/// the request prefix).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ToolCallSource {
     /// Emitted by the model in its response.
     Model,
     /// Issued by an `execute_tools` program through its nested-call gate.
     CodeMode,
+    /// Issued by an extension tool through its `core/call` gate. Planned
+    /// exactly like the others, then its approval is raised to an extension's
+    /// (`extension_host::core_call::origin_approval`).
+    Extension,
 }
 
 /// The planning inputs an `execute_tools` program's nested calls need, so
@@ -4004,6 +4009,27 @@ impl Engine {
                 );
             }
 
+            // An extension's call needs more than the model's would: approval
+            // unless the tool is a read-only workspace one, and a prompt no
+            // grant or posture may satisfy for shell and network. Only ever
+            // raised, after every gate above has had its say.
+            if source == ToolCallSource::Extension && blocked_error.is_none() {
+                match crate::extension_host::core_call::origin_approval(
+                    &tool_name,
+                    &tool_input,
+                    approval_required,
+                ) {
+                    crate::extension_host::core_call::OriginApproval::Unchanged => {}
+                    crate::extension_host::core_call::OriginApproval::Prompt => {
+                        approval_required = true;
+                    }
+                    crate::extension_host::core_call::OriginApproval::ForcePrompt => {
+                        approval_required = true;
+                        approval_force_prompt = true;
+                    }
+                }
+            }
+
             // #5170: a call stopped by any admission gate above never
             // executes, so hand its debited budget slot back. Only the
             // budget gate's own rejection leaves nothing to refund —
@@ -4829,6 +4855,11 @@ impl Engine {
                     }
 
                     let started_at = Instant::now();
+                    // An extension tool's call is served a permission gate too:
+                    // its `core/call`s are planned and approved like a model's.
+                    let extension_caller = tool_registry
+                        .and_then(|registry| registry.get(&tool_name))
+                        .and_then(|spec| spec.extension_caller());
                     let call_context = tool_context_for_call(
                         context_override.or_else(|| batch_tool_context.clone()),
                         &tool_id,
@@ -4844,7 +4875,8 @@ impl Engine {
                     {
                         (result_override.map(RichToolResult::plain), false)
                     } else if (tool_name == EXECUTE_TOOLS_TOOL_NAME
-                        || tool_name == crate::tools::rlm::RLM_TOOL_NAME)
+                        || tool_name == crate::tools::rlm::RLM_TOOL_NAME
+                        || extension_caller.is_some())
                         && let Some(context) = call_context.clone()
                     {
                         self.execute_tools_with_nested_gate(
@@ -4859,6 +4891,7 @@ impl Engine {
                             mcp_pool.clone(),
                             context,
                             *mode,
+                            extension_caller.clone(),
                         )
                         .await
                     } else {
@@ -5008,12 +5041,19 @@ impl Engine {
         mcp_pool: Option<Arc<AsyncMutex<McpPool>>>,
         mut context: crate::tools::ToolContext,
         mode: AppMode,
+        extension: Option<crate::tools::codemode::ExtensionCaller>,
     ) -> (Result<RichToolResult, ToolError>, bool) {
         let (gate, mut requests) = crate::tools::codemode::NestedCallGate::new(
             mcp_pool.clone(),
             self.tx_event.clone(),
             self.nested_program_deadline(),
         );
+        // An extension tool's gate also says who it serves and the tools its
+        // calls run against; a program's and an `rlm` call's say neither.
+        let gate = match (&extension, tool_registry) {
+            (Some(caller), Some(registry)) => gate.for_extension(caller.clone(), registry.all()),
+            _ => gate,
+        };
         context.execution.nested_call_gate = Some(gate);
         let cancel = self.cancel_token.clone();
         let run = Self::execute_tool_with_lock(
@@ -5040,6 +5080,11 @@ impl Engine {
                 }
                 result = &mut run => return (result, false),
                 Some(request) = requests.recv() => {
+                    // Nobody is waiting for this one any more (a withdrawn
+                    // extension call): no plan, no card.
+                    if request.is_stale() {
+                        continue;
+                    }
                     seq += 1;
                     let verdict = if tool_name == crate::tools::rlm::RLM_TOOL_NAME {
                         self.gate_rlm_round(
@@ -5065,6 +5110,8 @@ impl Engine {
                             active_tool_names,
                             tool_registry,
                             mode,
+                            extension.as_ref(),
+                            request.withdraw.as_ref(),
                         )
                         .await
                     };
@@ -5161,7 +5208,11 @@ impl Engine {
         }
     }
 
-    /// Decide one nested `execute_tools` call through the direct-call gate.
+    /// Decide one nested call through the direct-call gate: a call an
+    /// `execute_tools` program made (`extension` is `None`), or one an
+    /// extension tool asked for through `core/call` (`extension` names it).
+    /// `withdraw` fires when the asker no longer wants the answer; an approval
+    /// wait ends with it, recorded cancelled.
     #[allow(clippy::too_many_arguments)]
     async fn gate_nested_call(
         &mut self,
@@ -5174,8 +5225,37 @@ impl Engine {
         active_tool_names: &mut std::collections::HashSet<String>,
         tool_registry: Option<&crate::tools::ToolRegistry>,
         mode: AppMode,
+        extension: Option<&crate::tools::codemode::ExtensionCaller>,
+        withdraw: Option<&tokio_util::sync::CancellationToken>,
     ) -> crate::tools::codemode::NestedCallVerdict {
         use crate::tools::codemode::{NestedCallVerdict, NestedDecision};
+        let source = if extension.is_some() {
+            ToolCallSource::Extension
+        } else {
+            ToolCallSource::CodeMode
+        };
+        // Who the card and the audit record name. Composed here from the
+        // extension tool's registration; nothing the host sent is in it.
+        let caller_label = extension.map_or("code_mode", |_| "extension");
+        // The refusals that need no planning, on the name the caller sent.
+        // (An extension's own list also ran in its invoker; this is the turn
+        // loop's own check, and is run again below on what planning resolved.)
+        let refuse_early = |tool_registry: Option<&crate::tools::ToolRegistry>,
+                            name: &str,
+                            input: &serde_json::Value| {
+            extension.and_then(|_| {
+                let specs = tool_registry
+                    .map(|registry| registry.all())
+                    .unwrap_or_default();
+                crate::extension_host::core_call::refusal(&specs, name, input)
+            })
+        };
+        if let Some(note) = refuse_early(tool_registry, &name, &input) {
+            return NestedCallVerdict::Refused {
+                error: ToolError::permission_denied(note),
+                decision: NestedDecision::Refused,
+            };
+        }
 
         // The program's tool context (sandbox policy, trust) was built under
         // the posture the program started with. Once that posture changes,
@@ -5220,7 +5300,7 @@ impl Engine {
                 nested_gate_env.tool_call_budget,
                 mode,
                 nested_gate_env.fleet_denial_guard,
-                ToolCallSource::CodeMode,
+                source,
             )
             .await;
         let Some(plan) = plans.into_iter().next() else {
@@ -5240,6 +5320,7 @@ impl Engine {
         // raw request passed are checked again on what would actually run.
         if let Some(note) =
             crate::tools::codemode::refusal_before_gate(&plan.name, &plan.input, true)
+                .or_else(|| refuse_early(tool_registry, &plan.name, &plan.input))
         {
             // Admitted by planning but never executed: hand the slot back.
             nested_gate_env.tool_call_budget.refund();
@@ -5261,27 +5342,45 @@ impl Engine {
                 "event": "tool.approval_required",
                 "tool_id": nested_id.clone(),
                 "tool_name": plan.name.clone(),
-                "caller": "code_mode",
+                "caller": caller_label,
+                "extension": extension.map(|caller| caller.origin.clone()),
+                "extension_tool": extension.map(|caller| caller.tool.clone()),
                 "parent_tool_id": parent_id,
             }));
-            let (approval_key, approval_grouping_key) =
-                crate::tools::approval_cache::approval_keys_for_call(
+            // An extension's call is keyed under its own plugin build, so no
+            // grant given for the model's call covers it, nor the reverse.
+            let (approval_key, approval_grouping_key) = match extension {
+                Some(caller) => crate::tools::approval_cache::extension_origin_approval_keys(
+                    &caller.scope,
                     tool_registry,
                     &plan.name,
                     &plan.input,
-                );
+                ),
+                None => crate::tools::approval_cache::approval_keys_for_call(
+                    tool_registry,
+                    &plan.name,
+                    &plan.input,
+                ),
+            };
+            let description = match extension {
+                Some(caller) => format!(
+                    "Requested by {} from inside its tool `{}` (core/call): {}",
+                    caller.origin, caller.tool, plan.approval_description
+                ),
+                None => format!("execute_tools program call: {}", plan.approval_description),
+            };
             let approval_event = Event::ApprovalRequired {
                 id: nested_id.clone(),
                 tool_name: plan.name.clone(),
                 input: plan.input.clone(),
-                description: format!("execute_tools program call: {}", plan.approval_description),
+                description,
                 approval_key: approval_key.0,
                 approval_grouping_key: approval_grouping_key.0,
                 intent_summary: None,
                 approval_force_prompt: plan.approval_force_prompt,
             };
             let answer = self
-                .request_tool_approval(&nested_id, &plan.name, approval_event)
+                .request_tool_approval_until(&nested_id, &plan.name, approval_event, withdraw)
                 .await;
             let (decision, refusal) = match answer {
                 Ok(ApprovalResult::Approved(_)) => (NestedDecision::Approved, None),
@@ -5312,7 +5411,9 @@ impl Engine {
                 "tool_id": nested_id.clone(),
                 "tool_name": plan.name.clone(),
                 "decision": decision,
-                "caller": "code_mode",
+                "caller": caller_label,
+                "extension": extension.map(|caller| caller.origin.clone()),
+                "extension_tool": extension.map(|caller| caller.tool.clone()),
                 "parent_tool_id": parent_id,
             }));
             if let Some(error) = refusal {
