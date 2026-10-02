@@ -51,6 +51,17 @@ where
     }
     #[cfg(windows)]
     fill_windows_common_program_files(&mut env);
+    // OS sandboxes set CODEWHALE_SANDBOX (seatbelt / bwrap / windows). sccache
+    // and other RUSTC_WRAPPER compilers need sockets or files those sandboxes
+    // deny, so nested `cargo` fails with "Operation not permitted" before any
+    // crate compiles (seen on macOS CI seatbelt). Drop the wrapper so rustc
+    // still runs under the sandbox; unsandboxed children keep it.
+    if env
+        .iter()
+        .any(|(key, _)| normalize_key(key) == "CODEWHALE_SANDBOX")
+    {
+        env.retain(|(key, _)| normalize_key(key) != "RUSTC_WRAPPER");
+    }
     env
 }
 
@@ -371,7 +382,9 @@ fn is_allowed_parent_env_key(key: &OsStr) -> bool {
             // dropping them caused full rebuilds, lost memory limits and TLS
             // failures. `CARGO_*` is handled below without its secret-shaped
             // and registry keys. Connection strings such as `DATABASE_URL`
-            // stay out: they usually embed a password.
+            // stay out: they usually embed a password. `RUSTC_WRAPPER` is
+            // kept for unsandboxed children only; see the CODEWHALE_SANDBOX
+            // scrub in `sanitized_child_env`.
             | "RUSTFLAGS"
             | "RUSTDOCFLAGS"
             | "RUSTC_WRAPPER"
@@ -1330,6 +1343,37 @@ mod tests {
         assert!(
             env.iter()
                 .all(|(key, _)| key != "DEEPSEEK_CHILD_ENV_TEST_SECRET")
+        );
+    }
+
+    #[test]
+    fn sanitized_child_env_drops_rustc_wrapper_under_os_sandbox() {
+        let _guard = crate::test_support::lock_test_env();
+        let _wrapper = EnvVarGuard::set("RUSTC_WRAPPER", "sccache");
+
+        let unsandboxed = sanitized_child_env(std::iter::empty::<(OsString, OsString)>());
+        assert!(
+            unsandboxed
+                .iter()
+                .any(|(key, value)| normalize_key(key) == "RUSTC_WRAPPER" && value == "sccache"),
+            "unsandboxed children keep RUSTC_WRAPPER"
+        );
+
+        let sandboxed = sanitized_child_env([(
+            OsString::from("CODEWHALE_SANDBOX"),
+            OsString::from("seatbelt"),
+        )]);
+        assert!(
+            sandboxed
+                .iter()
+                .any(|(key, value)| normalize_key(key) == "CODEWHALE_SANDBOX" && value == "seatbelt"),
+            "sandbox marker must survive"
+        );
+        assert!(
+            sandboxed
+                .iter()
+                .all(|(key, _)| normalize_key(key) != "RUSTC_WRAPPER"),
+            "OS sandbox children must not keep RUSTC_WRAPPER"
         );
     }
 
