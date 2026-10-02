@@ -8250,8 +8250,11 @@ fn discover_skills_for_runtime_api(
     plugins: Option<&crate::plugins::PluginRegistry>,
 ) -> (crate::skills::SkillRegistry, Vec<PathBuf>) {
     let directories = skills_search_directories(workspace, skills_dir, mode);
-    let registry =
-        crate::skills::discover_from_directories_with_plugins(directories.clone(), plugins);
+    let registry = crate::skills::discover_from_directories_in_workspace(
+        directories.clone(),
+        Some(workspace),
+        plugins,
+    );
     (registry, directories)
 }
 

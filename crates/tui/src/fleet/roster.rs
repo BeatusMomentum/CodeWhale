@@ -41,7 +41,7 @@ use codewhale_config::{
 
 use super::profile::{
     AgentProfile, AgentProfileLoadIssue, CLAUDE_AGENT_DIR, claude_user_agent_dir,
-    load_agent_profiles_from_dir_tolerant, load_claude_agent_profiles_from_dir,
+    load_agent_profiles_from_dir_tolerant, load_claude_agent_profiles_from_dir_in,
     load_plugin_agent_profiles_from_component, load_workspace_agent_profiles_tolerant,
     personal_agent_profile_dir,
 };
@@ -374,12 +374,14 @@ impl FleetRoster {
         // Claude Code agent files come last and only fill ids nobody else
         // defined. The project copy (trusted project config only) is read
         // before `~/.claude/agents`, matching Claude Code's own precedence.
+        // Only the project copy is workspace content, so only it is confined
+        // to the workspace; `~/.claude/agents` is the user's own directory.
         let claude_dirs = include_workspace_profiles
-            .then(|| workspace.join(CLAUDE_AGENT_DIR))
+            .then(|| (workspace.join(CLAUDE_AGENT_DIR), Some(workspace)))
             .into_iter()
-            .chain(claude_user_dir.map(Path::to_path_buf));
-        for dir in claude_dirs {
-            match load_claude_agent_profiles_from_dir(&dir) {
+            .chain(claude_user_dir.map(|dir| (dir.to_path_buf(), None)));
+        for (dir, confine_to) in claude_dirs {
+            match load_claude_agent_profiles_from_dir_in(confine_to, &dir) {
                 Ok((profiles, issues)) => {
                     for issue in &issues {
                         tracing::warn!(
