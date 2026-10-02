@@ -10,8 +10,6 @@ use reqwest::header::{ACCEPT, CONTENT_TYPE};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, OnceLock};
-#[cfg(unix)]
-use tokio::io::AsyncBufReadExt;
 
 fn test_http_client() -> reqwest::Client {
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -1886,12 +1884,13 @@ async fn plugin_stdio_authority_cancellation_terminates_an_idle_child() {
         cancellation.clone(),
     )
     .unwrap();
-    assert!(transport.child.lock().await.try_wait().unwrap().is_none());
+    let child = transport.session.child_for_tests();
+    assert!(child.lock().await.try_wait().unwrap().is_none());
 
     cancellation.cancel();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
     loop {
-        if transport.child.lock().await.try_wait().unwrap().is_some() {
+        if child.lock().await.try_wait().unwrap().is_some() {
             break;
         }
         assert!(
@@ -2005,7 +2004,7 @@ async fn dead_stdio_child_stops_reading_ready_without_a_call_in_flight() {
         tokio_util::sync::CancellationToken::new(),
     )
     .unwrap();
-    let child = Arc::clone(&transport.child);
+    let child = transport.session.child_for_tests();
     let connection = test_connection(Box::new(transport));
 
     // Alive child: the Ready state flag is the whole answer.
@@ -5326,26 +5325,22 @@ fn invalid_json_preview_collapses_lines_and_redacts_secrets() {
 #[cfg(unix)]
 #[tokio::test]
 async fn stdio_transport_shutdown_terminates_child() {
-    use tokio::process::Command as TokioCommand;
-    let mut cmd = TokioCommand::new("cat");
-    cmd.stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .kill_on_drop(true);
-    let mut child = cmd.spawn().expect("spawn cat");
-    let pid = child.id().expect("child pid");
-    let stdin = child.stdin.take().expect("child stdin");
-    let stdout = child.stdout.take().expect("child stdout");
-    let mut transport = StdioTransport {
-        child: Arc::new(tokio::sync::Mutex::new(child)),
-        stdin,
-        reader: tokio::io::BufReader::new(stdout),
-        pending_line: Vec::new(),
-        stderr_tail: StderrTail::new(),
-        authority_cancel_watch: None,
-        _reviewed_launch: None,
-        process_tree: None,
-    };
+    let mut config = test_server_config();
+    config.command = Some("cat".to_string());
+    let mut transport = StdioTransport::spawn(
+        "shutdown-test",
+        "cat",
+        &config,
+        tokio_util::sync::CancellationToken::new(),
+    )
+    .expect("spawn cat through the production broker");
+    let pid = transport
+        .session
+        .child_for_tests()
+        .lock()
+        .await
+        .id()
+        .expect("child pid");
 
     // shutdown() should send SIGTERM and complete within the grace window.
     let start = std::time::Instant::now();
@@ -5421,7 +5416,13 @@ async fn stdio_transport_drop_kills_child_that_ignores_cleanup() {
     )
     .expect("spawn unresponsive fixture");
     assert_eq!(transport.recv().await.unwrap(), b"ready");
-    let pid = transport.child.lock().await.id().expect("live child");
+    let pid = transport
+        .session
+        .child_for_tests()
+        .lock()
+        .await
+        .id()
+        .expect("live child");
     drop(transport);
     tokio::time::timeout(STDIO_SHUTDOWN_GRACE + Duration::from_secs(1), async {
         // Signal zero only observes the process; the owned Child sends kills.
@@ -5440,42 +5441,19 @@ async fn stdio_transport_drop_kills_child_that_ignores_cleanup() {
 #[cfg(unix)]
 #[tokio::test]
 async fn stdio_transport_recv_error_includes_stderr_tail() {
-    use tokio::process::Command as TokioCommand;
-
-    let mut cmd = TokioCommand::new("sh");
-    cmd.arg("-c")
-        .arg("echo 'mcp-server: failed to load plugin' 1>&2; exit 1")
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true);
-
-    let mut child = cmd.spawn().expect("spawn sh");
-    let stdin = child.stdin.take().expect("stdin");
-    let stdout = child.stdout.take().expect("stdout");
-    let stderr = child.stderr.take().expect("stderr");
-
-    let stderr_tail = StderrTail::new();
-    {
-        let tail = Arc::clone(&stderr_tail);
-        tokio::spawn(async move {
-            let mut lines = tokio::io::BufReader::new(stderr).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                tail.push(line).await;
-            }
-        });
-    }
-
-    let mut transport = StdioTransport {
-        child: Arc::new(tokio::sync::Mutex::new(child)),
-        stdin,
-        reader: tokio::io::BufReader::new(stdout),
-        pending_line: Vec::new(),
-        stderr_tail,
-        authority_cancel_watch: None,
-        _reviewed_launch: None,
-        process_tree: None,
-    };
+    let mut config = test_server_config();
+    config.command = Some("sh".to_string());
+    config.args = vec![
+        "-c".to_string(),
+        "echo 'mcp-server: failed to load plugin' 1>&2; exit 1".to_string(),
+    ];
+    let mut transport = StdioTransport::spawn(
+        "stderr-test",
+        "sh",
+        &config,
+        tokio_util::sync::CancellationToken::new(),
+    )
+    .expect("spawn sh through the production broker");
 
     // Give the subprocess time to write its stderr line and exit.
     tokio::time::sleep(Duration::from_millis(300)).await;

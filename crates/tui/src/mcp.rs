@@ -26,17 +26,18 @@ mod headers;
 mod http;
 mod http_client;
 pub mod oauth;
+mod process_broker;
 mod sse;
 mod stdio;
 mod streamable_http;
 mod wire;
 
 use self::http::{HttpTransport, McpHttpAuth};
+#[cfg(all(test, unix))]
+use self::process_broker::STDIO_SHUTDOWN_GRACE;
 use self::sse::SseTransport;
 use self::stdio::StdioTransport;
 pub(crate) use self::stdio::read_line_capped;
-#[cfg(all(test, unix))]
-use self::stdio::{STDIO_SHUTDOWN_GRACE, StderrTail};
 pub(crate) use self::wire::MAX_MCP_RESPONSE_BYTES;
 use self::wire::{
     is_mcp_connection_lost_error, is_mcp_session_rejected_error, is_mcp_stale_session_body,
