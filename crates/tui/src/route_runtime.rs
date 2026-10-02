@@ -1449,7 +1449,10 @@ mod tests {
         // the roster's current flagship, not the static seed constant.
         let _lock = crate::test_support::lock_test_env();
         let home = tempfile::tempdir().expect("Codewhale home");
-        let home_path = home.path().canonicalize().expect("canonical Codewhale home");
+        let home_path = home
+            .path()
+            .canonicalize()
+            .expect("canonical Codewhale home");
         let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", &home_path);
         let mut config = crate::config::Config::default();
         crate::oauth::install_test_chatgpt_registration(&mut config).expect("owned grant");
