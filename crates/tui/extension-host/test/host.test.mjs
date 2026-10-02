@@ -157,11 +157,11 @@ test('cancel aborts a running tool, and deactivate waits for the async disposer'
 
 test('injecting a service the host does not provide fails with its name', async (t) => {
   const host = await startHost()
-  const plugin = tempPlugin("export const name = 'needs-skills'\nexport const inject = ['skills']\nexport function apply() {}\n")
+  const plugin = tempPlugin("export const name = 'needs-secrets'\nexport const inject = ['secrets']\nexport function apply() {}\n")
   t.after(async () => { await host.stop(); plugin.cleanup() })
-  const { result } = await activate(host, 'needs-skills', plugin.entry)
+  const { result } = await activate(host, 'needs-secrets', plugin.entry)
   assert.equal(result.status, 'failed')
-  assert.match(result.diagnostic, /requires `skills`/)
+  assert.match(result.diagnostic, /requires `secrets`/)
 })
 
 test('an unsupported DSH peer fails the import loudly', async (t) => {
