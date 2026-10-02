@@ -150,6 +150,7 @@ mod tests {
     use super::*;
     use crate::tui::widgets::workflow_panel::{WorkflowPanelEvent, WorkflowRowStatus};
     use ratatui::{Terminal, backend::TestBackend};
+    use unicode_width::UnicodeWidthStr;
 
     const NOW: u64 = 1_000_000;
 
@@ -362,11 +363,12 @@ mod tests {
         assert!(!row.contains('█'), "no agent succeeded: {row}");
         assert!(row.contains("0/2 done · 2 failed"), "{row}");
         assert!(row.contains("355ms") && !row.contains(" 0s"), "{row}");
-        // The failed cells carry error ink, not the success ink of done cells.
+        // The failed state mark carries error ink; the custom-theme regression
+        // separately covers failure bar cells.
         let theme = codewhale_palette::UI_THEME;
         let failed_cell = (0..140)
-            .find(|&x| band[(x, 0)].symbol() == FAILED_CELL)
-            .expect("failed cells");
+            .find(|&x| band[(x, 0)].symbol() == codewhale_ratatui::glyphs::FAILED)
+            .expect("failed state mark");
         assert_eq!(band[(failed_cell, 0)].fg, theme.error_fg);
         // The agents' own reason, not the run's aggregate, and not cut mid-word.
         assert!(row.contains("Authorization failed"), "{row}");
