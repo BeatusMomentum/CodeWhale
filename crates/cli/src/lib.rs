@@ -5187,11 +5187,11 @@ fn run_config_doctor(store: &ConfigStore) -> Result<()> {
         }
     }
     for (name, endpoint) in endpoints {
-        if let Some(url) = endpoint.as_deref()
-            && !url.starts_with("http://")
-            && !url.starts_with("https://")
-        {
-            errors.push(format!("`{name}` is not an http(s) URL: {url}"));
+        if let Some(url) = endpoint.as_deref() {
+            let url_for_check = url.to_ascii_lowercase();
+            if !url_for_check.starts_with("http://") && !url_for_check.starts_with("https://") {
+                errors.push(format!("`{name}` is not an http(s) URL: {url}"));
+            }
         }
     }
 
