@@ -326,15 +326,15 @@ pub(crate) fn guarded_environment_provides_state_paths() -> bool {
     .any(|var| guarded_path_is_present(var))
 }
 
-/// Whether some live seal currently pins the user's *home* — the root that
+/// Whether the calling test's live seal pins the user's *home* — the root that
 /// user state (sessions, snapshots, plugin bundles, logs) resolves under — as
 /// opposed to merely redirecting a config file.
 ///
-/// Deliberately process-wide rather than per-thread. The seal belongs to one
-/// test, but the work done for it runs on threads the test did not spawn
-/// (`spawn_blocking`, runtime workers, writer threads), and those must follow
-/// the sealed home. What they must never do is follow an *ambient* one: when no
-/// seal is live the environment names a real profile.
+/// The owner and workers enrolled through [`join_env_scope`] follow the seal.
+/// Unrelated parallel tests and workers without that scope use the isolated
+/// root: following another test's environment would race its restoration to
+/// the developer's real profile. Pass [`env_scope_ticket`] to workers that need
+/// their owner's home.
 ///
 /// Stricter than [`guarded_environment_provides_state_paths`], which also
 /// accepts a guarded config-path override: such a test still resolves
@@ -342,6 +342,9 @@ pub(crate) fn guarded_environment_provides_state_paths() -> bool {
 /// is set, so a guarded `HOME` seals nothing while an unguarded
 /// `CODEWHALE_HOME` is in the ambient environment.
 pub(crate) fn home_is_sealed() -> bool {
+    if !current_thread_holds_test_env_lock() {
+        return false;
+    }
     let present = |var: &str| {
         std::env::var_os(var)
             .is_some_and(|value| value.to_str().is_none_or(|text| !text.trim().is_empty()))
@@ -692,8 +695,7 @@ mod tests {
     /// a `#[cfg(test)]` fence — and fence the next one before a test finds it.
     #[test]
     fn unsealed_state_resolvers_stay_inside_the_isolated_root() {
-        // Hold the barrier so no parallel test can have a seal live: with one,
-        // the resolvers would rightly follow *its* environment.
+        // Hold the barrier to keep the fixture's environment stable.
         let _lock = lock_test_env();
         assert!(!home_is_sealed());
         let root = isolated_test_state_root();
@@ -725,6 +727,33 @@ mod tests {
         );
     }
 
+    #[test]
+    fn home_seal_is_available_only_to_its_owner_and_enrolled_workers() {
+        let seal = SealedHome::new();
+        let sessions = seal.codewhale_home().join("sessions");
+        let ticket = env_scope_ticket().expect("seal owns an environment scope");
+
+        std::thread::spawn(move || {
+            assert!(!home_is_sealed(), "a foreign worker cannot follow the seal");
+            assert!(
+                crate::session_manager::default_sessions_dir()
+                    .expect("isolated sessions dir")
+                    .starts_with(isolated_test_state_root())
+            );
+
+            let membership = join_env_scope(Some(ticket)).expect("enroll worker");
+            assert!(home_is_sealed());
+            assert_eq!(
+                crate::session_manager::default_sessions_dir().expect("sealed sessions dir"),
+                sessions
+            );
+            drop(membership);
+            assert!(!home_is_sealed(), "leaving the scope withdraws the seal");
+        })
+        .join()
+        .expect("home seal worker");
+    }
+
     /// Tripwire for the leak this module exists to prevent: run a sample of
     /// the tests that once wrote `~/.codewhale` in a child process whose
     /// *ambient* `HOME` and `CODEWHALE_HOME` are a seeded, read-only sentinel,
@@ -754,6 +783,7 @@ mod tests {
             "commands::session_lifecycle_regression_tests::fork_saves_parent_and_switches_to_child_session",
             "commands::session_lifecycle_regression_tests::test_save_creates_file_and_sets_session_id",
             "commands::tests::every_registered_command_dispatches_to_a_handler",
+            "commands::tests::every_command_alias_dispatches_to_a_handler",
             "commands::tests::feat020_plugin_dispatches_through_public_seam",
         ];
 
@@ -785,10 +815,13 @@ mod tests {
                     .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
                     .map_or(0, |elapsed| elapsed.as_nanos());
                 out.push(format!(
-                    "{} dir={} len={} mtime={mtime}",
+                    "{} dir={} len={} mtime={mtime} contents={:?}",
                     path.strip_prefix(root).unwrap_or(path).display(),
                     metadata.is_dir(),
-                    metadata.len()
+                    metadata.len(),
+                    metadata
+                        .is_file()
+                        .then(|| std::fs::read(path).expect("read sentinel file"))
                 ));
             });
             out
