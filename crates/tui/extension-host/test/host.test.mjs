@@ -1,14 +1,14 @@
 // End-to-end tests of the committed host bundle against a fake core.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdirSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync, rmSync } from 'node:fs'
 import { createServer } from 'node:http'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { execFileSync, spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
-import { BUNDLE, FIXTURES, HOST_ARGS, IS_BUN, activate, owner, sha256File, startHost } from './harness.mjs'
-import { encodeFrame } from '../dist/protocol.mjs'
+import { BUNDLE, FIXTURES, HOST_ARGS, HOST_ENV, IS_BUN, activate, owner, sha256File, startHost } from './harness.mjs'
+import { ErrorCode, encodeFrame } from '../dist/protocol.mjs'
 
 // Budgets for a cold host start (the first host this file starts), gated in
 // the first test. Measured 2026-09-30 on macOS arm64, 5 starts each: Node 26
@@ -788,4 +788,65 @@ test('a plugin is given its config, validated by its own Config schema, and each
   // And an activation with no config or data dir (an older core) still works.
   const bare2 = await activate(host, 'plugin-context', entry)
   assert.equal(bare2.result.status, 'ok')
+})
+
+// ---- Trust tiers: one host process per tier, told which with `--tier=`.
+
+test('the host refuses to start on an unknown tier, a tier with no value or a tier named twice', async () => {
+  for (const args of [['--tier=root'], ['--tier='], ['--tier'], ['--tier=Plugin'], ['--tier=plugin', '--tier=builtin'], ['--tier=builtin', '--tier=builtin']]) {
+    const child = spawn(process.execPath, [...HOST_ARGS, BUNDLE, ...args], {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      env: { ...process.env, ...HOST_ENV },
+    })
+    let stderr = ''
+    let stdoutBytes = 0
+    child.stderr.on('data', (chunk) => { stderr += chunk })
+    child.stdout.on('data', (chunk) => { stdoutBytes += chunk.length })
+    const { code } = await new Promise((resolve) => child.on('exit', (code, signal) => resolve({ code, signal })))
+    assert.equal(code, 64, `${args.join(' ')}: ${stderr}`)
+    assert.match(stderr, /tier/, args.join(' '))
+    assert.equal(stdoutBytes, 0, `${args.join(' ')}: a host that refuses its tier never says hello`)
+  }
+})
+
+test('a plugin-tier host refuses a host: owner and a builtin-tier host refuses a plugin owner, before loading anything', async (t) => {
+  const entry = join(FIXTURES, 'ext-commands', 'index.mjs')
+  const request = (ref) => ({ owner: ref, plugin_name: 'ext-commands', entry: { path: entry, sha256: sha256File(entry) }, config: {} })
+  const refused = (tier) => (error) => {
+    assert.equal(error.code, ErrorCode.InvalidParams)
+    assert.match(error.message, new RegExp(`this host serves the ${tier} tier`))
+    return true
+  }
+  // No `--tier=` is the plugin tier, the least-privileged one.
+  for (const tier of ['plugin', null]) {
+    const host = await startHost({ tier })
+    t.after(() => host.stop())
+    await assert.rejects(host.call('ext/activate', request(owner('host:ext-commands'))), refused('plugin'))
+    assert.equal(host.registry.length, 0, 'nothing of the refused owner was loaded')
+    // The same fixture activates under a plugin id.
+    const { result } = await activate(host, 'ext-commands')
+    assert.equal(result.status, 'ok')
+  }
+
+  const builtin = await startHost({ tier: 'builtin' })
+  t.after(() => builtin.stop())
+  await assert.rejects(builtin.call('ext/activate', request(owner('user/0123456789ab/ext-commands'))), refused('builtin'))
+  await assert.rejects(builtin.call('ext/activate', request(owner('ext-commands'))), refused('builtin'))
+  assert.equal(builtin.registry.length, 0, 'nothing of the refused owners was loaded')
+  // A `host:` owner is what a builtin-tier host takes.
+  const ref = owner('host:ext-commands')
+  const result = await builtin.call('ext/activate', request(ref))
+  assert.equal(result.status, 'ok')
+  assert.ok(result.commands.includes('ext-echo'))
+  assert.deepEqual(await builtin.call('ext/deactivate', { owner: ref }), { disposed: true, leaked: [] })
+})
+
+test('the build records the digest of every built-in module, and only those', () => {
+  const dist = join(dirname(BUNDLE))
+  const manifest = JSON.parse(readFileSync(join(dist, 'builtin-modules.json'), 'utf8'))
+  const built = existsSync(join(dist, 'builtin')) ? readdirSync(join(dist, 'builtin')).sort() : []
+  assert.deepEqual(Object.keys(manifest.modules).map((id) => `${id}.mjs`).sort(), built)
+  for (const [id, digest] of Object.entries(manifest.modules)) {
+    assert.equal(sha256File(join(dist, 'builtin', `${id}.mjs`)), digest, id)
+  }
 })

@@ -17,6 +17,7 @@ use super::protocol::{
     parse_host_message,
 };
 use super::registry::{OwnerRegistry, OwnerState};
+use super::tier::HostTier;
 use super::{ExtensionHostManager, ExtensionHostOptions, HostAttachment, HostStatus};
 use crate::plugins::PluginRegistry;
 use crate::plugins::activation::TestPolicyGuard;
@@ -138,8 +139,24 @@ fn register(registry: &mut OwnerRegistry, owner: &OwnerRef, name: &str) -> Resul
 fn registry_refuses_shadowing_and_foreign_names_and_undoes_exactly_one_entry() {
     let mut registry = OwnerRegistry::new();
     registry.add_native_names(["grep_files"]);
-    let a = registry.begin_owner("a", "a", fake_authority("a"), "hash-a");
-    let b = registry.begin_owner("b", "b", fake_authority("b"), "hash-b");
+    let a = registry
+        .begin_owner(
+            HostTier::Plugin,
+            "a",
+            "a",
+            Some(fake_authority("a")),
+            "hash-a",
+        )
+        .unwrap();
+    let b = registry
+        .begin_owner(
+            HostTier::Plugin,
+            "b",
+            "b",
+            Some(fake_authority("b")),
+            "hash-b",
+        )
+        .unwrap();
 
     // Built-ins (static, snapshot, and case-folded) and reserved prefixes.
     for name in [
@@ -189,7 +206,15 @@ fn registry_refuses_shadowing_and_foreign_names_and_undoes_exactly_one_entry() {
 #[test]
 fn registry_refuses_names_the_approval_tables_special_case() {
     let mut registry = OwnerRegistry::new();
-    let a = registry.begin_owner("a", "a", fake_authority("a"), "hash-a");
+    let a = registry
+        .begin_owner(
+            HostTier::Plugin,
+            "a",
+            "a",
+            Some(fake_authority("a")),
+            "hash-a",
+        )
+        .unwrap();
     // Special-cased by name somewhere in the approval path; some are also
     // natives in some modes.
     for name in [
@@ -240,7 +265,15 @@ fn registry_refuses_names_the_approval_tables_special_case() {
 #[test]
 fn registry_enforces_schema_and_count_caps() {
     let mut registry = OwnerRegistry::new();
-    let a = registry.begin_owner("a", "a", fake_authority("a"), "hash-a");
+    let a = registry
+        .begin_owner(
+            HostTier::Plugin,
+            "a",
+            "a",
+            Some(fake_authority("a")),
+            "hash-a",
+        )
+        .unwrap();
     let mut params = RegisterParams {
         owner: a.clone(),
         kind: RegisterKind::Tool,
@@ -289,7 +322,15 @@ fn registry_enforces_schema_and_count_caps() {
 /// to `HostToolSpec`, with `schema` as its input schema.
 fn admitted_tool(schema: Value) -> Result<super::registry::ToolRegistration, String> {
     let mut registry = OwnerRegistry::new();
-    let owner = registry.begin_owner("probe", "probe", fake_authority("probe"), "hash-probe");
+    let owner = registry
+        .begin_owner(
+            HostTier::Plugin,
+            "probe",
+            "probe",
+            Some(fake_authority("probe")),
+            "hash-probe",
+        )
+        .unwrap();
     registry.register_tool(&RegisterParams {
         owner: owner.clone(),
         kind: RegisterKind::Tool,
@@ -1331,7 +1372,17 @@ async fn killed_host_fails_calls_once_and_replays_with_fresh_owners() {
     .await;
     assert!(matches!(manager.status(), HostStatus::Ready { .. }));
     assert_ne!(manager.host_pid(), Some(pid));
-    assert_eq!(manager.shared.supervision.lock().unwrap().crashes.len(), 1);
+    assert_eq!(
+        manager
+            .shared
+            .plugin
+            .supervision
+            .lock()
+            .unwrap()
+            .crashes
+            .len(),
+        1
+    );
     manager.shutdown().await;
 }
 
@@ -1623,7 +1674,15 @@ fn extension_approval_keys_are_bound_to_the_plugin_receipt() {
         owners.live_tools().pop().unwrap()
     };
 
-    let first = owners.begin_owner("a", "a", fake_authority("a"), "hash-a1");
+    let first = owners
+        .begin_owner(
+            HostTier::Plugin,
+            "a",
+            "a",
+            Some(fake_authority("a")),
+            "hash-a1",
+        )
+        .unwrap();
     let first = keys_for(&manager, live(&mut owners, &first), &input);
     assert!(
         first.0.starts_with("ext:a@hash-a1:shared_tool:"),
@@ -1634,13 +1693,29 @@ fn extension_approval_keys_are_bound_to_the_plugin_receipt() {
     assert_ne!(first.1, generic.0, "never the name-derived family key");
 
     // Same plugin, same input, updated bytes: a different grant.
-    let updated = owners.begin_owner("a", "a", fake_authority("a"), "hash-a2");
+    let updated = owners
+        .begin_owner(
+            HostTier::Plugin,
+            "a",
+            "a",
+            Some(fake_authority("a")),
+            "hash-a2",
+        )
+        .unwrap();
     let updated = keys_for(&manager, live(&mut owners, &updated), &input);
     assert_ne!(first.1, updated.1);
 
     // Another plugin takes the name once the first is gone.
     owners.revoke_owner("a");
-    let other = owners.begin_owner("b", "b", fake_authority("b"), "hash-a1");
+    let other = owners
+        .begin_owner(
+            HostTier::Plugin,
+            "b",
+            "b",
+            Some(fake_authority("b")),
+            "hash-a1",
+        )
+        .unwrap();
     let other = keys_for(&manager, live(&mut owners, &other), &input);
     assert_ne!(first.1, other.1);
     assert_ne!(updated.1, other.1);
@@ -1753,22 +1828,27 @@ fn owner_reports_keep_bounded_attributed_logs_and_ignore_stale_hosts() {
     let manager = ExtensionHostManager::new(ExtensionHostOptions::default());
     manager
         .shared
+        .plugin
         .host_generation
         .store(2, std::sync::atomic::Ordering::SeqCst);
     {
         let mut registry = manager.shared.registry.lock().unwrap();
         for id in ["alpha", "beta"] {
-            let owner = registry.begin_owner(id, id, fake_authority(id), "hash");
+            let owner = registry
+                .begin_owner(HostTier::Plugin, id, id, Some(fake_authority(id)), "hash")
+                .unwrap();
             registry.mark_active(&owner);
             register(&mut registry, &owner, &format!("{id}_probe")).unwrap();
         }
     }
     let current = super::Events {
         shared: Arc::downgrade(&manager.shared),
+        tier: HostTier::Plugin,
         generation: 2,
     };
     let stale = super::Events {
         shared: Arc::downgrade(&manager.shared),
+        tier: HostTier::Plugin,
         generation: 1,
     };
     for index in 0..25 {
@@ -2253,7 +2333,7 @@ async fn ordinary_exit_rejects_requests_from_a_drained_calls_waker() {
     }));
     let engine = manager.attach(fixture.registry());
     engine.sync().await.unwrap();
-    let host = manager.shared.ready_host().unwrap();
+    let host = manager.shared.ready_host(HostTier::Plugin).unwrap();
     let registration = manager.shared.registry.lock().unwrap().live_tools()[0].clone();
     let (_, mut call) = host
         .start_request(
@@ -2309,7 +2389,7 @@ async fn idle_retirement_seals_admission_and_does_not_wait_for_heartbeat() {
     let manager = supervised_manager(&fixture, node);
     let engine = manager.attach(fixture.registry());
     engine.sync().await.unwrap();
-    let host = manager.shared.ready_host().unwrap();
+    let host = manager.shared.ready_host(HostTier::Plugin).unwrap();
     let registration = manager.shared.registry.lock().unwrap().live_tools()[0].clone();
     let (_, call) = host
         .start_request(
@@ -2332,14 +2412,20 @@ async fn idle_retirement_seals_admission_and_does_not_wait_for_heartbeat() {
         .unwrap();
     assert!(host.terminate_if_idle(super::DIRTY_RESTART_REASON));
     assert!(matches!(
-        manager.shared.ready_host(),
+        manager.shared.ready_host(HostTier::Plugin),
         Err(HostStatus::Restarting { .. })
     ));
     assert!(matches!(manager.status(), HostStatus::Restarting { .. }));
     // Poll without yielding to the exit watcher. A reconcile in this exact
     // gap must not start activation on the sealed process and falsely fail
     // a valid receipt before replay.
-    assert!(manager.ensure_host(true).now_or_never().unwrap().is_err());
+    assert!(
+        manager
+            .ensure_host(HostTier::Plugin, true)
+            .now_or_never()
+            .unwrap()
+            .is_err()
+    );
     assert_eq!(
         manager.owner_state(&plugin_id(&fixture, "slow-tool")),
         Some(OwnerState::Active)
@@ -2365,6 +2451,7 @@ async fn two_dirty_teardowns_wait_for_a_live_call_then_replay_without_spending_c
     // An existing unexpected crash must survive planned maintenance.
     manager
         .shared
+        .plugin
         .supervision
         .lock()
         .unwrap()
@@ -2374,6 +2461,7 @@ async fn two_dirty_teardowns_wait_for_a_live_call_then_replay_without_spending_c
     assert_eq!(
         manager
             .shared
+            .plugin
             .supervision
             .lock()
             .unwrap()
@@ -2393,7 +2481,7 @@ async fn two_dirty_teardowns_wait_for_a_live_call_then_replay_without_spending_c
     engine.set_plugins(Arc::new(enabled));
     engine.sync().await.unwrap();
     let old = host_tool(&engine, fixture.workspace(), "slow_wait");
-    let host = manager.shared.ready_host().unwrap();
+    let host = manager.shared.ready_host(HostTier::Plugin).unwrap();
     let registration = manager.shared.registry.lock().unwrap().live_tools()[0].clone();
     let (_, call) = host
         .start_request(
@@ -2412,6 +2500,7 @@ async fn two_dirty_teardowns_wait_for_a_live_call_then_replay_without_spending_c
     assert!(
         manager
             .shared
+            .plugin
             .supervision
             .lock()
             .unwrap()
@@ -2429,10 +2518,21 @@ async fn two_dirty_teardowns_wait_for_a_live_call_then_replay_without_spending_c
         manager.spawn_attempts() == 2 && manager.live_tool_names().contains(&"slow_wait".into())
     })
     .await;
-    assert_eq!(manager.shared.supervision.lock().unwrap().crashes.len(), 1);
+    assert_eq!(
+        manager
+            .shared
+            .plugin
+            .supervision
+            .lock()
+            .unwrap()
+            .crashes
+            .len(),
+        1
+    );
     assert!(
         !manager
             .shared
+            .plugin
             .supervision
             .lock()
             .unwrap()
@@ -2451,6 +2551,7 @@ async fn two_dirty_teardowns_wait_for_a_live_call_then_replay_without_spending_c
     assert!(
         manager
             .shared
+            .plugin
             .supervision
             .lock()
             .unwrap()
@@ -2493,6 +2594,7 @@ async fn failed_activation_cleanup_also_records_a_dirty_teardown() {
     assert_eq!(
         manager
             .shared
+            .plugin
             .supervision
             .lock()
             .unwrap()
@@ -2503,6 +2605,7 @@ async fn failed_activation_cleanup_also_records_a_dirty_teardown() {
     assert!(
         manager
             .shared
+            .plugin
             .supervision
             .lock()
             .unwrap()
@@ -2521,23 +2624,37 @@ async fn failed_activation_cleanup_also_records_a_dirty_teardown() {
 #[test]
 fn host_exit_preserves_failed_receipts_and_blames_only_the_activating_owner() {
     let mut registry = OwnerRegistry::new();
-    let active = registry.begin_owner(
-        "healthy",
-        "healthy",
-        fake_authority("healthy"),
-        "hash-healthy",
-    );
+    let active = registry
+        .begin_owner(
+            HostTier::Plugin,
+            "healthy",
+            "healthy",
+            Some(fake_authority("healthy")),
+            "hash-healthy",
+        )
+        .unwrap();
     registry.mark_active(&active);
     register(&mut registry, &active, "healthy_probe").unwrap();
-    let failed = registry.begin_owner("failed", "failed", fake_authority("failed"), "hash-failed");
+    let failed = registry
+        .begin_owner(
+            HostTier::Plugin,
+            "failed",
+            "failed",
+            Some(fake_authority("failed")),
+            "hash-failed",
+        )
+        .unwrap();
     registry.mark_failed(&failed, OwnerState::Faulted("existing fault".into()));
-    registry.begin_owner(
-        "activating",
-        "activating",
-        fake_authority("activating"),
-        "hash-activating",
-    );
-    registry.host_exited("fixture crash");
+    registry
+        .begin_owner(
+            HostTier::Plugin,
+            "activating",
+            "activating",
+            Some(fake_authority("activating")),
+            "hash-activating",
+        )
+        .unwrap();
+    registry.host_exited(HostTier::Plugin, "fixture crash");
     assert!(registry.owner("healthy").is_none());
     assert!(registry.live_tools().is_empty());
     assert!(matches!(
@@ -2548,12 +2665,15 @@ fn host_exit_preserves_failed_receipts_and_blames_only_the_activating_owner() {
         registry.owner("activating").unwrap().state,
         OwnerState::Failed(_)
     ));
-    let replay = registry.begin_owner(
-        "healthy",
-        "healthy",
-        fake_authority("healthy"),
-        "hash-healthy",
-    );
+    let replay = registry
+        .begin_owner(
+            HostTier::Plugin,
+            "healthy",
+            "healthy",
+            Some(fake_authority("healthy")),
+            "hash-healthy",
+        )
+        .unwrap();
     assert_ne!(replay.generation, active.generation);
     assert_ne!(replay.owner_token, active.owner_token);
 }
@@ -2562,22 +2682,33 @@ fn host_exit_preserves_failed_receipts_and_blames_only_the_activating_owner() {
 fn opening_an_engine_never_resets_a_crash_budget() {
     let manager = Arc::new(ExtensionHostManager::new(ExtensionHostOptions::default()));
     {
-        *manager.shared.host.lock().unwrap() = super::HostSlot::Failed {
+        *manager.shared.plugin.host.lock().unwrap() = super::HostSlot::Failed {
             reason: "budget".into(),
             stderr_tail: String::new(),
         };
-        let mut state = manager.shared.supervision.lock().unwrap();
+        let mut state = manager.shared.plugin.supervision.lock().unwrap();
         for _ in 0..3 {
             state.record_crash(Instant::now(), &manager.shared.options.supervision);
         }
     }
     let _engine = manager.attach(Arc::new(PluginRegistry::empty(Path::new("/fixture"))));
-    assert_eq!(manager.shared.supervision.lock().unwrap().crashes.len(), 3);
+    assert_eq!(
+        manager
+            .shared
+            .plugin
+            .supervision
+            .lock()
+            .unwrap()
+            .crashes
+            .len(),
+        3
+    );
     assert!(matches!(manager.status(), HostStatus::Failed { .. }));
     manager.retry();
     assert!(
         manager
             .shared
+            .plugin
             .supervision
             .lock()
             .unwrap()
@@ -2595,7 +2726,15 @@ async fn a_host_that_is_down_names_why_in_plugin_status_and_tool_errors() {
     let manager = Arc::new(ExtensionHostManager::new(ExtensionHostOptions::default()));
     let registration = {
         let mut registry = manager.shared.registry.lock().unwrap();
-        let owner = registry.begin_owner("probe", "probe", fake_authority("probe"), "hash");
+        let owner = registry
+            .begin_owner(
+                HostTier::Plugin,
+                "probe",
+                "probe",
+                Some(fake_authority("probe")),
+                "hash",
+            )
+            .unwrap();
         registry.mark_active(&owner);
         register(&mut registry, &owner, "probe_tool").unwrap();
         registry.live_tools()[0].clone()
@@ -2619,7 +2758,7 @@ async fn a_host_that_is_down_names_why_in_plugin_status_and_tool_errors() {
         ),
         (super::HostSlot::Idle, "not started".to_string()),
     ] {
-        *manager.shared.host.lock().unwrap() = slot;
+        *manager.shared.plugin.host.lock().unwrap() = slot;
         let report = super::render_status(&manager);
         assert!(
             report.starts_with(&format!("Extension host (experimental): {why}")),
@@ -2706,6 +2845,7 @@ async fn three_crashes_stop_replay_until_explicit_retry() {
     assert!(
         manager
             .shared
+            .plugin
             .supervision
             .lock()
             .unwrap()
@@ -2736,7 +2876,17 @@ async fn an_activation_crash_does_not_prevent_other_receipts_replaying() {
         manager.owner_state(&plugin_id(&fixture, "crash-activation")),
         Some(OwnerState::Failed(_))
     ));
-    assert_eq!(manager.shared.supervision.lock().unwrap().crashes.len(), 1);
+    assert_eq!(
+        manager
+            .shared
+            .plugin
+            .supervision
+            .lock()
+            .unwrap()
+            .crashes
+            .len(),
+        1
+    );
     manager.shutdown().await;
 }
 
@@ -2778,7 +2928,17 @@ async fn heartbeat_recovers_a_delayed_pong_then_kills_a_hung_host() {
         manager.spawn_attempts() == 2 && manager.live_tool_names().contains(&"hang_probe".into())
     })
     .await;
-    assert_eq!(manager.shared.supervision.lock().unwrap().crashes.len(), 1);
+    assert_eq!(
+        manager
+            .shared
+            .plugin
+            .supervision
+            .lock()
+            .unwrap()
+            .crashes
+            .len(),
+        1
+    );
     manager.shutdown().await;
 }
 
@@ -2788,22 +2948,27 @@ fn old_host_callbacks_cannot_fault_or_remove_a_new_owner() {
     let manager = ExtensionHostManager::new(ExtensionHostOptions::default());
     manager
         .shared
+        .plugin
         .host_generation
         .store(2, std::sync::atomic::Ordering::SeqCst);
     let owner = {
         let mut registry = manager.shared.registry.lock().unwrap();
-        let owner = registry.begin_owner(
-            "fixture",
-            "fixture",
-            fake_authority("fixture"),
-            "hash-fixture",
-        );
+        let owner = registry
+            .begin_owner(
+                HostTier::Plugin,
+                "fixture",
+                "fixture",
+                Some(fake_authority("fixture")),
+                "hash-fixture",
+            )
+            .unwrap();
         registry.mark_active(&owner);
         register(&mut registry, &owner, "fixture_probe").unwrap();
         owner
     };
     let old = super::Events {
         shared: Arc::downgrade(&manager.shared),
+        tier: HostTier::Plugin,
         generation: 1,
     };
     old.faulted(&protocol::FaultedParams {
@@ -2816,6 +2981,7 @@ fn old_host_callbacks_cannot_fault_or_remove_a_new_owner() {
     assert!(
         manager
             .shared
+            .plugin
             .supervision
             .lock()
             .unwrap()
@@ -2827,19 +2993,19 @@ fn old_host_callbacks_cannot_fault_or_remove_a_new_owner() {
 #[test]
 fn a_new_attachment_retries_only_cooled_down_launch_failures() {
     let manager = Arc::new(ExtensionHostManager::new(ExtensionHostOptions::default()));
-    *manager.shared.host.lock().unwrap() = super::HostSlot::Failed {
+    *manager.shared.plugin.host.lock().unwrap() = super::HostSlot::Failed {
         reason: "missing Node".into(),
         stderr_tail: String::new(),
     };
     {
-        let mut state = manager.shared.supervision.lock().unwrap();
+        let mut state = manager.shared.plugin.supervision.lock().unwrap();
         state.launch_failed = true;
         state.last_start = Some(Instant::now());
     }
     let plugins = Arc::new(PluginRegistry::empty(Path::new("/fixture")));
     let _first = manager.attach(Arc::clone(&plugins));
     assert!(matches!(manager.status(), HostStatus::Failed { .. }));
-    manager.shared.supervision.lock().unwrap().last_start =
+    manager.shared.plugin.supervision.lock().unwrap().last_start =
         Some(Instant::now() - Duration::from_secs(61));
     let _later = manager.attach(plugins);
     assert_eq!(manager.status(), HostStatus::Idle);
@@ -3046,8 +3212,14 @@ fn launch_plan_gives_each_runtime_its_own_flags() {
                 HostRuntimeKind::Node => crate::dependencies::NODE_NATIVE_CODE_FLAGS.to_vec(),
             },
         };
-        let launch =
-            super::supervisor::plan_launch(&runtime, &bundle, home.path(), 1 << 30).unwrap();
+        let launch = super::supervisor::plan_launch(
+            HostTier::Plugin,
+            &runtime,
+            &bundle,
+            home.path(),
+            1 << 30,
+        )
+        .unwrap();
         // Wrapped or not, the runtime's flags come right before the bundle.
         let at = launch
             .args
@@ -3133,8 +3305,14 @@ async fn handshake_refuses_a_runtime_or_version_mismatch_and_an_unapplied_kernel
         fn exited(&self, _: u64, _: String, _: String) {}
     }
     for case in ["runtime", "version", "cap"] {
-        let mut launch =
-            super::supervisor::plan_launch(&runtime, &bundle, home.path(), 1 << 30).unwrap();
+        let mut launch = super::supervisor::plan_launch(
+            HostTier::Plugin,
+            &runtime,
+            &bundle,
+            home.path(),
+            1 << 30,
+        )
+        .unwrap();
         let expected = match case {
             // The core believes it launched Bun; the host truthfully says Node.
             "runtime" => {
@@ -3482,8 +3660,24 @@ fn register_command(
 #[test]
 fn command_registry_refuses_shadowing_and_undoes_exactly_one_entry() {
     let mut registry = OwnerRegistry::new();
-    let a = registry.begin_owner("a", "a", fake_authority("a"), "hash-a");
-    let b = registry.begin_owner("b", "b", fake_authority("b"), "hash-b");
+    let a = registry
+        .begin_owner(
+            HostTier::Plugin,
+            "a",
+            "a",
+            Some(fake_authority("a")),
+            "hash-a",
+        )
+        .unwrap();
+    let b = registry
+        .begin_owner(
+            HostTier::Plugin,
+            "b",
+            "b",
+            Some(fake_authority("b")),
+            "hash-b",
+        )
+        .unwrap();
 
     // Built-in names, their aliases, and the fixed mode aliases.
     let builtin_alias = crate::commands::command_infos()
@@ -3619,7 +3813,7 @@ fn command_registry_refuses_shadowing_and_undoes_exactly_one_entry() {
     registry.mark_active(&b);
     let handle = register_command(&mut registry, &b, "survivor", None).unwrap();
     assert!(registry.live_command(handle, "b", b.generation).is_some());
-    registry.host_exited("exited");
+    registry.host_exited(HostTier::Plugin, "exited");
     assert!(registry.live_commands().is_empty());
     assert!(registry.live_command(handle, "b", b.generation).is_none());
 }
@@ -4006,6 +4200,7 @@ async fn extension_commands_never_shadow_built_ins_or_other_plugins() {
                 generation: 1,
                 owner_token: "t".into(),
             },
+            tier: HostTier::Plugin,
             plugin_name: "p".into(),
             content_hash: "h".into(),
             name: name.to_string(),
@@ -4044,7 +4239,15 @@ async fn a_command_from_a_dead_host_reports_host_down() {
     let manager = Arc::new(ExtensionHostManager::new(ExtensionHostOptions::default()));
     let reference = {
         let mut registry = manager.shared.registry.lock().unwrap();
-        let owner = registry.begin_owner("probe", "probe", fake_authority("probe"), "hash");
+        let owner = registry
+            .begin_owner(
+                HostTier::Plugin,
+                "probe",
+                "probe",
+                Some(fake_authority("probe")),
+                "hash",
+            )
+            .unwrap();
         registry.mark_active(&owner);
         let handle = register_command(&mut registry, &owner, "probe-cmd", None).unwrap();
         super::command::ExtensionCommandRef {
@@ -4072,7 +4275,7 @@ async fn a_command_from_a_dead_host_reports_host_down() {
         ),
         (super::HostSlot::Idle, "not started".to_string()),
     ] {
-        *manager.shared.host.lock().unwrap() = slot;
+        *manager.shared.plugin.host.lock().unwrap() = slot;
         let started = Instant::now();
         let error = super::command::run(&manager.shared, &reference, "")
             .await
@@ -4193,5 +4396,629 @@ async fn a_slow_command_is_cancelled_and_a_killed_host_fails_it_as_down() {
             text: "echo: new".to_string()
         })
     );
+    manager.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// Trust tiers: a plugin host and a built-in (tier 0) host, never one process
+// ---------------------------------------------------------------------------
+
+use super::tier::{BuiltinModule, Tier0Tool};
+use sha2::{Digest, Sha256};
+
+fn tier_register_params(owner: &OwnerRef, name: &str) -> RegisterParams {
+    RegisterParams {
+        owner: owner.clone(),
+        kind: RegisterKind::Tool,
+        spec: RegisterSpecWire {
+            name: name.to_string(),
+            description: "d".to_string(),
+            input_schema: json!({"type": "object", "properties": {}})
+                .as_object()
+                .cloned(),
+            argument_hint: None,
+        },
+    }
+}
+
+#[test]
+fn owners_are_bound_to_their_tier() {
+    let mut registry = OwnerRegistry::new();
+    let plugin_id = "user/0123456789ab/demo";
+
+    // A `host:` id on the plugin tier, and any other id on the builtin tier.
+    let refused = registry
+        .begin_owner(
+            HostTier::Plugin,
+            "host:mcp",
+            "mcp",
+            Some(fake_authority("host:mcp")),
+            "h",
+        )
+        .unwrap_err();
+    assert!(
+        refused.contains("a plugin id can never use it"),
+        "{refused}"
+    );
+    let refused = registry
+        .begin_owner(HostTier::Builtin, plugin_id, "demo", None, "h")
+        .unwrap_err();
+    assert!(
+        refused.contains("not a built-in host module id"),
+        "{refused}"
+    );
+    let refused = registry
+        .begin_owner(HostTier::Builtin, "demo", "demo", None, "h")
+        .unwrap_err();
+    assert!(
+        refused.contains("not a built-in host module id"),
+        "{refused}"
+    );
+    // The authority must fit the tier too.
+    assert!(
+        registry
+            .begin_owner(HostTier::Plugin, plugin_id, "demo", None, "h")
+            .unwrap_err()
+            .contains("needs its reviewed plugin authority")
+    );
+    assert!(
+        registry
+            .begin_owner(
+                HostTier::Builtin,
+                "host:mcp",
+                "mcp",
+                Some(fake_authority("host:mcp")),
+                "h"
+            )
+            .unwrap_err()
+            .contains("has no plugin authority")
+    );
+    assert!(
+        registry.owners().next().is_none(),
+        "a refused owner leaves nothing behind"
+    );
+
+    let plugin = registry
+        .begin_owner(
+            HostTier::Plugin,
+            plugin_id,
+            "demo",
+            Some(fake_authority(plugin_id)),
+            "hash-demo",
+        )
+        .unwrap();
+    let other_plugin = registry
+        .begin_owner(
+            HostTier::Plugin,
+            "user/0123456789ab/other",
+            "other",
+            Some(fake_authority("user/0123456789ab/other")),
+            "hash-other",
+        )
+        .unwrap();
+    let builtin = registry
+        .begin_owner(HostTier::Builtin, "host:mcp", "mcp", None, "digest-mcp")
+        .unwrap();
+    for owner in [&plugin, &other_plugin, &builtin] {
+        registry.mark_active(owner);
+    }
+    assert_eq!(registry.owner("host:mcp").unwrap().tier, HostTier::Builtin);
+    assert_eq!(registry.owner(plugin_id).unwrap().tier, HostTier::Plugin);
+    assert_eq!(registry.tier_of(&builtin), Some(HostTier::Builtin));
+    assert!(registry.authority_for(&builtin).is_none());
+    assert!(registry.authority_for(&plugin).is_some());
+    // Plugins share a process with each other; a built-in module does not
+    // share one with any plugin.
+    assert_eq!(registry.other_active_owners(plugin_id), 1);
+    assert_eq!(registry.other_active_owners("host:mcp"), 0);
+
+    let plugin_tool = register(&mut registry, &plugin, "zz_plugin_probe").unwrap();
+    let builtin_tool = register(&mut registry, &builtin, "zz_builtin_probe").unwrap();
+    let tiers: Vec<_> = registry
+        .live_tools()
+        .into_iter()
+        .map(|tool| (tool.name, tool.tier))
+        .collect();
+    assert_eq!(
+        tiers,
+        [
+            ("zz_plugin_probe".to_string(), HostTier::Plugin),
+            ("zz_builtin_probe".to_string(), HostTier::Builtin)
+        ]
+    );
+    assert!(registry.is_live(plugin_tool, &plugin));
+    assert!(registry.is_live(builtin_tool, &builtin));
+
+    // Each tier's host is its own process: a crash of one takes only its own
+    // owners and registrations with it.
+    registry.host_exited(HostTier::Plugin, "plugin host crashed");
+    assert!(registry.owner(plugin_id).is_none());
+    assert_eq!(
+        registry.owner("host:mcp").unwrap().state,
+        OwnerState::Active
+    );
+    assert!(registry.is_live(builtin_tool, &builtin));
+    assert!(!registry.is_live(plugin_tool, &plugin));
+    // ... and a shutdown of the builtin tier leaves the plugin tier's alone.
+    let replay = registry
+        .begin_owner(
+            HostTier::Plugin,
+            plugin_id,
+            "demo",
+            Some(fake_authority(plugin_id)),
+            "hash-demo",
+        )
+        .unwrap();
+    registry.mark_active(&replay);
+    let again = register(&mut registry, &replay, "zz_plugin_probe").unwrap();
+    registry.revoke_all(HostTier::Builtin, "builtin host shut down");
+    assert!(registry.is_live(again, &replay));
+    assert!(matches!(
+        registry.owner("host:mcp").unwrap().state,
+        OwnerState::Failed(_)
+    ));
+    assert_eq!(registry.live_tools().len(), 1);
+}
+
+/// A host answers for its own tier's owners only, even if it somehow named
+/// the other tier's: the registration, and the log line, are dropped.
+#[test]
+fn a_host_registers_and_logs_only_for_owners_of_its_own_tier() {
+    use super::supervisor::HostEvents;
+    let manager = ExtensionHostManager::new(ExtensionHostOptions::default());
+    let (plugin, builtin) = {
+        let mut registry = manager.shared.registry.lock().unwrap();
+        let plugin = registry
+            .begin_owner(
+                HostTier::Plugin,
+                "user/0123456789ab/demo",
+                "demo",
+                Some(fake_authority("user/0123456789ab/demo")),
+                "hash",
+            )
+            .unwrap();
+        let builtin = registry
+            .begin_owner(HostTier::Builtin, "host:mcp", "mcp", None, "digest")
+            .unwrap();
+        registry.mark_active(&plugin);
+        registry.mark_active(&builtin);
+        (plugin, builtin)
+    };
+    let events = |tier| super::Events {
+        shared: Arc::downgrade(&manager.shared),
+        tier,
+        generation: 0,
+    };
+    let refused = events(HostTier::Plugin).register(&tier_register_params(&builtin, "zz_probe"));
+    assert!(
+        matches!(&refused, protocol::RegisterResult::Refused { refused }
+            if refused.contains("belongs to the builtin tier")),
+        "{refused:?}"
+    );
+    let refused = events(HostTier::Builtin).register(&tier_register_params(&plugin, "zz_probe"));
+    assert!(
+        matches!(&refused, protocol::RegisterResult::Refused { refused }
+            if refused.contains("belongs to the plugin tier")),
+        "{refused:?}"
+    );
+    assert!(manager.live_tool_names().is_empty());
+    assert!(matches!(
+        events(HostTier::Builtin).register(&tier_register_params(&builtin, "zz_probe")),
+        protocol::RegisterResult::Admitted { .. }
+    ));
+    assert!(matches!(
+        events(HostTier::Plugin).register(&tier_register_params(&plugin, "zz_other")),
+        protocol::RegisterResult::Admitted { .. }
+    ));
+
+    let warn = |plugin_id: &str| protocol::LogParams {
+        level: "warn".into(),
+        msg: "m".into(),
+        plugin_id: Some(plugin_id.into()),
+    };
+    events(HostTier::Plugin).log(&warn("host:mcp"));
+    events(HostTier::Builtin).log(&warn("user/0123456789ab/demo"));
+    assert!(
+        manager
+            .owner_report("host:mcp")
+            .unwrap()
+            .diagnostics
+            .is_empty()
+    );
+    assert!(
+        manager
+            .owner_report("user/0123456789ab/demo")
+            .unwrap()
+            .diagnostics
+            .is_empty()
+    );
+    events(HostTier::Builtin).log(&warn("host:mcp"));
+    assert_eq!(
+        manager.owner_report("host:mcp").unwrap().diagnostics,
+        ["warn: m"]
+    );
+}
+
+/// A manifest name cannot carry a `host:` prefix (names are lower-case ASCII
+/// letters, digits and internal `-`/`.`), so discovery never builds a `host:`
+/// id, and the plugin that tries fails validation instead of reaching the
+/// host.
+#[test]
+fn a_plugin_named_like_a_tier_zero_owner_fails_validation_and_never_reaches_the_host() {
+    let _policy = TestPolicyGuard::extension_host(true);
+    let temp = tempfile::tempdir().unwrap();
+    let user = temp.path().join("user");
+    native_bundle(&user, "evil", "index.mjs", &["index.mjs"]);
+    native_bundle(&user, "fine", "index.mjs", &["index.mjs"]);
+    // The directory is harmless; the manifest's name is the claim.
+    let manifest = user.join("evil/plugin.json");
+    let rewritten = std::fs::read_to_string(&manifest)
+        .unwrap()
+        .replace("\"name\": \"evil\"", "\"name\": \"host:evil\"");
+    assert!(rewritten.contains("host:evil"));
+    std::fs::write(&manifest, rewritten).unwrap();
+    let config = DiscoveryConfig {
+        workspace: temp.path().join("project"),
+        user_plugins_dir: user,
+        workspace_plugins_dir: temp.path().join("project/.codewhale/plugins"),
+        builtin_plugin_dirs: Vec::new(),
+        state_path: temp.path().join("state/plugin-state.json"),
+    };
+    let registry = discover_with_config(&config);
+    assert!(
+        registry.get("host:evil").is_none(),
+        "a plugin named `host:evil` must not be discovered as a plugin"
+    );
+    assert!(
+        registry
+            .diagnostics()
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("host:evil")
+                && diagnostic.message.contains("name")),
+        "{:?}",
+        registry.diagnostics()
+    );
+    assert!(registry.get("fine").is_some());
+    // Whatever discovery yields, no desired owner is a tier-0 id.
+    let (desired, _) = super::desired_owners(&registry);
+    assert!(
+        desired
+            .keys()
+            .all(|id| HostTier::Plugin.check_owner_id(id).is_ok())
+    );
+}
+
+#[test]
+fn launch_plans_carry_their_tier_and_use_a_data_directory_each() {
+    use crate::dependencies::{HostRuntime, HostRuntimeKind};
+    let home = tempfile::tempdir().unwrap();
+    let bundle = home.path().join("codewhale-extension-host.mjs");
+    let runtime = HostRuntime {
+        kind: HostRuntimeKind::Node,
+        path: PathBuf::from("/opt/runtime/bin/node"),
+        version: (22, 19, 0),
+        native_code_flags: Vec::new(),
+    };
+    let mut dirs = Vec::new();
+    for tier in HostTier::ALL {
+        let launch =
+            super::supervisor::plan_launch(tier, &runtime, &bundle, home.path(), 1 << 30).unwrap();
+        assert_eq!(launch.tier, tier);
+        // The runtime's own argv ends `<bundle> --tier=<tier>`, wrapped by the
+        // OS sandbox or not.
+        let at = launch
+            .args
+            .iter()
+            .position(|arg| Path::new(arg) == bundle)
+            .expect("bundle in argv");
+        assert_eq!(launch.args[at + 1], format!("--tier={}", tier.name()));
+        assert_eq!(launch.args.len(), at + 2, "the tier is the last argument");
+        assert_eq!(
+            launch.cwd,
+            super::supervisor::tier_data_dir(home.path(), tier)
+        );
+        assert!(launch.cwd.is_dir(), "{}", launch.cwd.display());
+        dirs.push(launch.cwd);
+    }
+    assert_ne!(dirs[0], dirs[1], "each tier has its own data directory");
+    assert_eq!(HostTier::Plugin.argv_flag(), "--tier=plugin");
+    assert_eq!(HostTier::Builtin.argv_flag(), "--tier=builtin");
+}
+
+/// A built-in module table that pins `source`, for a test. Production has
+/// none: `BUILTIN_MODULES` is empty.
+fn test_builtin_table(source: &Path) -> &'static [BuiltinModule] {
+    let digest = super::hex(Sha256::digest(std::fs::read(source).unwrap()));
+    let tools: &'static [Tier0Tool] = Box::leak(Box::new([Tier0Tool {
+        name: "zz_tier0_listed",
+        approval: ApprovalRequirement::Auto,
+    }]));
+    Box::leak(Box::new([BuiltinModule {
+        id: "tier0-module",
+        source_sha256: Box::leak(digest.into_boxed_str()),
+        tools,
+    }]))
+}
+
+/// Put `bytes` where the core looks for built-in module `id`'s source under
+/// the home `root`.
+fn place_builtin_source(root: &Path, id: &str, bytes: &[u8]) {
+    let path = super::supervisor::bundle_dir(root, super::bundle_sha256())
+        .join("builtin")
+        .join(format!("{id}.mjs"));
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, bytes).unwrap();
+}
+
+/// Production's table is empty, so with the default options a plugin starts
+/// the plugin host and the builtin tier is never spawned.
+#[tokio::test]
+async fn the_builtin_tier_never_spawns_in_production() {
+    assert!(
+        ExtensionHostManager::new(ExtensionHostOptions::default())
+            .shared
+            .builtin_modules
+            .is_empty()
+    );
+    let Some(node) = node_for_tests("the_builtin_tier_never_spawns_in_production") else {
+        return;
+    };
+    let _policy = TestPolicyGuard::extension_host(true);
+    let fixture = FixturePlugins::new(&["dsh-workspace-deps"]).await;
+    let manager = fixture.manager(node);
+    let engine = manager.attach(fixture.registry());
+    engine.sync().await.unwrap();
+    assert!(matches!(manager.status(), HostStatus::Ready { .. }));
+    assert_eq!(manager.tier_spawn_attempts(HostTier::Plugin), 1);
+    assert_eq!(manager.tier_spawn_attempts(HostTier::Builtin), 0);
+    assert_eq!(manager.tier_status(HostTier::Builtin), HostStatus::Idle);
+    assert!(
+        !super::supervisor::tier_data_dir(&fixture.root, HostTier::Builtin).exists(),
+        "no builtin data directory exists until a builtin host needs one"
+    );
+    let report = super::render_status(&manager);
+    assert!(!report.contains("built-in host"), "{report}");
+    manager.shutdown().await;
+}
+
+/// A module whose source is not the digest the table pins, or is missing, is
+/// refused with the reason, and no host is started for it.
+#[tokio::test]
+async fn a_built_in_module_that_is_not_the_pinned_source_is_refused_and_starts_nothing() {
+    let _policy = TestPolicyGuard::extension_host(true);
+    let source = fixtures_dir().join("tier0-module/module.mjs");
+    let modules = test_builtin_table(&source);
+    for (case, bytes, expected) in [
+        (
+            "tampered",
+            Some(&b"export const name = 'tier0-module'\nexport function apply() {}\n"[..]),
+            "the core pins",
+        ),
+        ("missing", None, "cannot read the source"),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("home");
+        if let Some(bytes) = bytes {
+            place_builtin_source(&root, "tier0-module", bytes);
+        }
+        let manager = Arc::new(ExtensionHostManager::with_builtin_modules(
+            ExtensionHostOptions {
+                root: Some(root),
+                ..Default::default()
+            },
+            modules,
+        ));
+        let engine = manager.attach(Arc::new(PluginRegistry::empty(temp.path())));
+        engine.sync().await.unwrap();
+        assert_eq!(manager.spawn_attempts(), 0, "{case}");
+        assert_eq!(manager.tier_status(HostTier::Builtin), HostStatus::Idle);
+        let Some(OwnerState::Failed(reason)) = manager.owner_state("host:tier0-module") else {
+            panic!("{case}: {:?}", manager.owner_state("host:tier0-module"));
+        };
+        assert!(reason.contains(expected), "{case}: {reason}");
+        assert!(manager.live_tool_names().is_empty());
+        // Not retried every turn.
+        engine.sync().await.unwrap();
+        assert_eq!(
+            manager.diagnostics().len(),
+            1,
+            "{:?}",
+            manager.diagnostics()
+        );
+    }
+}
+
+/// The two tiers are two processes under one manager: a built-in module
+/// activates under `host:<module>` in its own host, its tool's approval is
+/// whatever the table says (and `Required` where it says nothing), plugin
+/// tools stay `Required`, and crashing the plugin host disturbs nothing of
+/// the builtin one.
+#[tokio::test]
+async fn a_tier_zero_host_runs_apart_from_the_plugin_host_and_its_tool_approval_follows_the_table()
+{
+    let Some(node) = node_for_tests("a_tier_zero_host_runs_apart") else {
+        return;
+    };
+    let _policy = TestPolicyGuard::extension_host(true);
+    let fixture = FixturePlugins::new(&["dsh-workspace-deps"]).await;
+    let source = fixtures_dir().join("tier0-module/module.mjs");
+    place_builtin_source(
+        &fixture.root,
+        "tier0-module",
+        &std::fs::read(&source).unwrap(),
+    );
+    let manager = Arc::new(ExtensionHostManager::with_builtin_modules(
+        ExtensionHostOptions {
+            runtime: NODE,
+            node_override: Some(node),
+            root: Some(fixture.root.clone()),
+            ..Default::default()
+        },
+        test_builtin_table(&source),
+    ));
+    assert_eq!(manager.tier_status(HostTier::Builtin), HostStatus::Idle);
+    let engine = manager.attach(fixture.registry());
+    engine.sync().await.unwrap();
+
+    // Two hosts, two processes, each launched once.
+    let plugin_pid = manager.host_pid().expect("plugin host running");
+    let builtin_pid = manager
+        .shared
+        .ready_host(HostTier::Builtin)
+        .expect("builtin host running")
+        .pid
+        .expect("builtin pid");
+    assert_ne!(plugin_pid, builtin_pid);
+    assert_eq!(manager.tier_spawn_attempts(HostTier::Plugin), 1);
+    assert_eq!(manager.tier_spawn_attempts(HostTier::Builtin), 1);
+    let plugin_host_id = plugin_id(&fixture, "dsh-workspace-deps");
+    assert_eq!(
+        manager.owner_state("host:tier0-module"),
+        Some(OwnerState::Active)
+    );
+    assert_eq!(
+        manager.owner_state(&plugin_host_id),
+        Some(OwnerState::Active)
+    );
+    {
+        let registry = manager.shared.registry.lock().unwrap();
+        assert_eq!(
+            registry.owner("host:tier0-module").unwrap().tier,
+            HostTier::Builtin
+        );
+        assert_eq!(
+            registry.owner(&plugin_host_id).unwrap().tier,
+            HostTier::Plugin
+        );
+        assert_eq!(
+            registry.owner("host:tier0-module").unwrap().content_hash,
+            test_builtin_table(&source)[0].source_sha256
+        );
+    }
+    // The module's data directory is under the builtin tier's, apart from
+    // every plugin's.
+    assert!(
+        super::supervisor::owner_data_dir(
+            &fixture.root,
+            HostTier::Builtin,
+            "host:tier0-module",
+            "tier0-module"
+        )
+        .is_dir()
+    );
+
+    // An engine installs plugin tools only; tier-0 tools are not offered to
+    // the model by a plugin snapshot.
+    let installed = installed(&engine, fixture.workspace());
+    assert_eq!(installed, ["load_workspace_dependencies"]);
+
+    // Approval follows the table for tier 0, and stays Required for plugins.
+    let registrations = manager.shared.registry.lock().unwrap().live_tools();
+    let spec_for = |name: &str| {
+        let registration = registrations
+            .iter()
+            .find(|tool| tool.name == name)
+            .unwrap_or_else(|| panic!("{name} not registered"))
+            .clone();
+        super::tool::HostToolSpec::new(registration, Arc::clone(&manager.shared))
+    };
+    let listed = spec_for("zz_tier0_listed");
+    let unlisted = spec_for("zz_tier0_unlisted");
+    let plugin_tool = spec_for("load_workspace_dependencies");
+    assert_eq!(listed.registration_origin(), "host:tier0-module");
+    assert_eq!(listed.approval_requirement(), ApprovalRequirement::Auto);
+    assert_eq!(
+        listed.approval_requirement_for(&json!({})),
+        ApprovalRequirement::Auto
+    );
+    assert_eq!(
+        unlisted.approval_requirement(),
+        ApprovalRequirement::Required
+    );
+    assert_eq!(
+        plugin_tool.approval_requirement(),
+        ApprovalRequirement::Required
+    );
+    let context = ToolContext::new(fixture.workspace());
+    assert_eq!(
+        listed.prepare(json!({}), &context).unwrap().approval,
+        ApprovalRequirement::Auto
+    );
+    assert_eq!(
+        unlisted.prepare(json!({}), &context).unwrap().approval,
+        ApprovalRequirement::Required
+    );
+    // Even an Auto tool is host code: never read-only, never plan-mode safe.
+    assert!(!listed.is_read_only_for(&json!({})));
+
+    // The call goes to the builtin host and comes back.
+    let result = listed.execute(json!({}), &context).await.unwrap();
+    assert!(result.success);
+    assert_eq!(
+        serde_json::from_str::<Value>(&result.content).unwrap(),
+        json!({"tier": "zero", "listed": true})
+    );
+
+    // Kill the plugin host: its owners go and come back, the builtin host and
+    // its module are untouched, and its crash budget is not spent.
+    #[cfg(unix)]
+    let status = std::process::Command::new("kill")
+        .args(["-9", &plugin_pid.to_string()])
+        .status()
+        .unwrap();
+    #[cfg(windows)]
+    let status = std::process::Command::new("taskkill")
+        .args(["/F", "/PID", &plugin_pid.to_string()])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    wait_host(&manager, || {
+        manager.tier_spawn_attempts(HostTier::Plugin) == 2
+            && manager
+                .live_tool_names()
+                .contains(&"load_workspace_dependencies".to_string())
+    })
+    .await;
+    assert_eq!(
+        manager.shared.ready_host(HostTier::Builtin).unwrap().pid,
+        Some(builtin_pid)
+    );
+    assert_eq!(manager.tier_spawn_attempts(HostTier::Builtin), 1);
+    assert_eq!(
+        manager.owner_state("host:tier0-module"),
+        Some(OwnerState::Active)
+    );
+    assert!(
+        manager
+            .shared
+            .builtin
+            .supervision
+            .lock()
+            .unwrap()
+            .crashes
+            .is_empty()
+    );
+    assert_eq!(
+        manager
+            .shared
+            .plugin
+            .supervision
+            .lock()
+            .unwrap()
+            .crashes
+            .len(),
+        1
+    );
+    assert!(listed.execute(json!({}), &context).await.unwrap().success);
+
+    // The status page shows the builtin host and keeps its tools off the
+    // plugin list.
+    let report = super::render_status(&manager);
+    assert!(
+        report.contains("built-in host (tier 0): running"),
+        "{report}"
+    );
+    assert!(!report.contains("tool zz_tier0_listed"), "{report}");
+    assert!(!report.contains("command /"), "{report}");
     manager.shutdown().await;
 }

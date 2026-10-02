@@ -18,11 +18,25 @@ import { ErrorCode, FrameDecoder, encodeFrame, PROTOCOL_VERSION, type Message } 
 import { RpcError, RpcPeer } from './rpc.ts'
 import { HostRoot, ownerStorage } from './root.ts'
 import { RUNTIME, applyMemoryLimit, denyNativeCode } from './runtime.ts'
+import { parseTier } from './tier.ts'
 
 export const HOST_VERSION = '0.1.0'
 
-// 0. The kernel memory limit the core asked for (macOS + Bun). This may
-//    re-execute the process in place, so it runs before anything else.
+// 0a. Which trust tier this process serves (`--tier=plugin|builtin`). Anything
+//     else is refused before the host does any work. `process.exit` is still
+//     the real one here; step 2 replaces it.
+const TIER = (() => {
+  try {
+    return parseTier(process.argv.slice(2))
+  } catch (error) {
+    process.stderr.write(`codewhale-extension-host: ${(error as Error).message}\n`)
+    return process.exit(64)
+  }
+})()
+
+// 0b. The kernel memory limit the core asked for (macOS + Bun). This may
+//     re-execute the process in place (argv, and so the tier, are kept), so it
+//     runs before anything else that has an effect.
 const MEMORY_LIMIT_MIB = applyMemoryLimit()
 
 // 1. Own the protocol channel; rebind every other stdout writer to stderr.
@@ -111,7 +125,7 @@ function shutdownNow(code: number) {
 const rpc = new RpcPeer((message: Message) => {
   channelWrite(encodeFrame(message))
 })
-const host = new HostRoot(rpc)
+const host = new HostRoot(rpc, TIER)
 let initialized = false
 
 rpc.onRequest('host/initialize', (params: any) => {

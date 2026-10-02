@@ -43,12 +43,14 @@ export const LIMITS = { max_frame: 32 * 1024 * 1024, max_inflight: 256, dispose_
 /**
  * Start a host. `admit(spec, owner)` decides `registry/register`: return a
  * handle number or `{ refused }`. Registry traffic is recorded in `registry`.
+ * `tier` is the trust tier it serves (`--tier=`, after the bundle, as the Rust
+ * core passes it); `null` passes none, as a host started by hand would.
  */
-export async function startHost({ admit, env, ownGroup = false } = {}) {
+export async function startHost({ admit, env, ownGroup = false, tier = 'plugin' } = {}) {
   const started = performance.now()
   // `ownGroup` spawns the host as a process-group leader and tells it so, as
   // the Rust core does on Unix.
-  const child = spawn(process.execPath, [...HOST_ARGS, BUNDLE], {
+  const child = spawn(process.execPath, [...HOST_ARGS, BUNDLE, ...(tier === null ? [] : [`--tier=${tier}`])], {
     stdio: ['pipe', 'pipe', 'pipe'],
     env: { ...process.env, ...HOST_ENV, ...env, ...(ownGroup ? { CODEWHALE_HOST_PROCESS_GROUP: '1' } : {}) },
     detached: ownGroup,

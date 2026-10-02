@@ -5,6 +5,11 @@
 //! removes its tools from every later turn's registry at once, and
 //! `HostToolSpec` re-checks liveness before each call. Handles are never
 //! reused, so undoing one registration can never touch a newer one.
+//!
+//! One registry serves both trust tiers ([`super::tier`]): an owner records
+//! which host process it lives in, `begin_owner` refuses an id the tier cannot
+//! hold (`host:<module>` is tier 0's alone), and a host exit removes only its
+//! own tier's owners and registrations.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
@@ -12,6 +17,7 @@ use std::sync::Arc;
 use serde_json::Value;
 
 use super::protocol::{OwnerRef, RegisterKind, RegisterParams};
+use super::tier::HostTier;
 use crate::plugins::types::PluginAuthority;
 
 /// Largest accepted tool input schema, serialized.
@@ -58,8 +64,14 @@ pub enum OwnerState {
 #[derive(Debug, Clone)]
 pub struct OwnerEntry {
     pub owner: OwnerRef,
+    /// The host process this owner lives in. Fixed at [`OwnerRegistry::begin_owner`],
+    /// which refuses an id the tier cannot hold.
+    pub tier: HostTier,
     pub plugin_name: String,
-    pub authority: PluginAuthority,
+    /// The reviewed plugin authority (plugin tier). A built-in module has none:
+    /// what it is bound to is the source digest the Rust table pins, which is
+    /// its `content_hash`.
+    pub authority: Option<PluginAuthority>,
     pub content_hash: String,
     /// Digest of the plugin config this activation was given (empty until
     /// [`OwnerRegistry::set_config_hash`]). A change of config is a different
@@ -148,6 +160,8 @@ impl std::fmt::Debug for InputValidator {
 pub struct ToolRegistration {
     pub handle: u64,
     pub owner: OwnerRef,
+    /// The tier of `owner`'s host.
+    pub tier: HostTier,
     pub plugin_name: String,
     /// The reviewed bundle content hash of the owner that registered it: the
     /// receipt its approval grants are bound to.
@@ -165,6 +179,8 @@ pub struct ToolRegistration {
 pub struct CommandRegistration {
     pub handle: u64,
     pub owner: OwnerRef,
+    /// The tier of `owner`'s host.
+    pub tier: HostTier,
     pub plugin_name: String,
     /// The reviewed bundle content hash of the registering owner.
     pub content_hash: String,
@@ -292,14 +308,33 @@ impl OwnerRegistry {
             .extend(names.into_iter().map(str::to_ascii_lowercase));
     }
 
-    /// Start a new activation for `plugin_id`, superseding any previous one.
+    /// Start a new activation for `plugin_id` on `tier`, superseding any
+    /// previous one. Refuses an id the tier cannot hold (a `host:` id on the
+    /// plugin tier, any other on the builtin tier) and an authority that does
+    /// not fit it: a plugin owner is bound to its reviewed plugin authority, a
+    /// built-in module to none (its pinned digest is `content_hash`).
     pub fn begin_owner(
         &mut self,
+        tier: HostTier,
         plugin_id: &str,
         plugin_name: &str,
-        authority: PluginAuthority,
+        authority: Option<PluginAuthority>,
         content_hash: &str,
-    ) -> OwnerRef {
+    ) -> Result<OwnerRef, String> {
+        tier.check_owner_id(plugin_id)?;
+        match (tier, authority.is_some()) {
+            (HostTier::Plugin, false) => {
+                return Err(format!(
+                    "plugin owner `{plugin_id}` needs its reviewed plugin authority"
+                ));
+            }
+            (HostTier::Builtin, true) => {
+                return Err(format!(
+                    "built-in module `{plugin_id}` has no plugin authority; the digest the Rust table pins is its authority"
+                ));
+            }
+            _ => {}
+        }
         self.revoke_owner(plugin_id);
         self.next_generation += 1;
         let owner = OwnerRef {
@@ -311,6 +346,7 @@ impl OwnerRegistry {
             plugin_id.to_string(),
             OwnerEntry {
                 owner: owner.clone(),
+                tier,
                 plugin_name: plugin_name.to_string(),
                 authority,
                 content_hash: content_hash.to_string(),
@@ -318,7 +354,7 @@ impl OwnerRegistry {
                 state: OwnerState::Activating,
             },
         );
-        owner
+        Ok(owner)
     }
 
     /// Record which config `owner`'s activation was given.
@@ -392,6 +428,7 @@ impl OwnerRegistry {
             .ok_or_else(|| "stale or unknown owner".to_string())?;
         let plugin_name = entry.plugin_name.clone();
         let content_hash = entry.content_hash.clone();
+        let tier = entry.tier;
         let spec = &params.spec;
         let name = spec.name.as_str();
         const COMMAND_HINT: &str = "a command name is lower case, starts with a letter, and uses only a-z, 0-9, `_` and `-` (at most 64 characters)";
@@ -476,6 +513,7 @@ impl OwnerRegistry {
             CommandRegistration {
                 handle,
                 owner: params.owner.clone(),
+                tier,
                 plugin_name,
                 content_hash,
                 name: name.to_string(),
@@ -495,6 +533,7 @@ impl OwnerRegistry {
             .ok_or_else(|| "stale or unknown owner".to_string())?;
         let plugin_name = entry.plugin_name.clone();
         let content_hash = entry.content_hash.clone();
+        let tier = entry.tier;
         let spec = &params.spec;
         let name = spec.name.as_str();
         if !valid_tool_name(name) {
@@ -589,6 +628,7 @@ impl OwnerRegistry {
             ToolRegistration {
                 handle,
                 owner: params.owner.clone(),
+                tier,
                 plugin_name,
                 content_hash,
                 name: name.to_string(),
@@ -690,19 +730,30 @@ impl OwnerRegistry {
             .retain(|_, entry| matches!(entry.state, OwnerState::Activating | OwnerState::Active));
     }
 
-    /// A crash drops live registrations, preserves failed/faulted receipts,
-    /// and blames the sole activating owner. Other owners are replayable only
-    /// after reconciliation verifies their current persisted authority again.
-    pub fn host_exited(&mut self, reason: &str) {
-        self.tools.clear();
-        self.by_name.clear();
-        self.commands.clear();
-        self.commands_by_name.clear();
+    /// Drop every registration owned by `tier`'s host: the host that held
+    /// them is gone, and the other tier's host is not.
+    fn clear_tier_registrations(&mut self, tier: HostTier) {
+        self.tools.retain(|_, tool| tool.tier != tier);
+        let tools = &self.tools;
+        self.by_name.retain(|_, handle| tools.contains_key(handle));
+        self.commands.retain(|_, command| command.tier != tier);
+        let commands = &self.commands;
+        self.commands_by_name
+            .retain(|_, handle| commands.contains_key(handle));
         super::command::bump_epoch();
+    }
+
+    /// `tier`'s host exited: its crash drops its live registrations, preserves
+    /// its failed/faulted receipts, and blames its sole activating owner.
+    /// Other owners of that tier are replayable only after reconciliation
+    /// verifies their current persisted authority again. The other tier's
+    /// owners are not touched: they live in another process.
+    pub fn host_exited(&mut self, tier: HostTier, reason: &str) {
+        self.clear_tier_registrations(tier);
         let activating: Vec<_> = self
             .owners
             .values()
-            .filter(|entry| entry.state == OwnerState::Activating)
+            .filter(|entry| entry.tier == tier && entry.state == OwnerState::Activating)
             .map(|entry| entry.owner.plugin_id.clone())
             .collect();
         if let [plugin] = activating.as_slice() {
@@ -710,20 +761,19 @@ impl OwnerRegistry {
                 OwnerState::Failed(format!("host crashed during activation: {reason}"));
         }
         self.owners.retain(|_, entry| {
-            matches!(entry.state, OwnerState::Failed(_) | OwnerState::Faulted(_))
+            entry.tier != tier
+                || matches!(entry.state, OwnerState::Failed(_) | OwnerState::Faulted(_))
         });
     }
 
-    /// Planned test shutdown drops all tools and fails the remaining live owners.
+    /// Planned test shutdown drops `tier`'s tools and fails its remaining live owners.
     #[cfg(test)]
-    pub fn revoke_all(&mut self, reason: &str) {
-        self.tools.clear();
-        self.by_name.clear();
-        self.commands.clear();
-        self.commands_by_name.clear();
-        super::command::bump_epoch();
+    pub fn revoke_all(&mut self, tier: HostTier, reason: &str) {
+        self.clear_tier_registrations(tier);
         for entry in self.owners.values_mut() {
-            if matches!(entry.state, OwnerState::Activating | OwnerState::Active) {
+            if entry.tier == tier
+                && matches!(entry.state, OwnerState::Activating | OwnerState::Active)
+            {
                 entry.state = OwnerState::Failed(reason.to_string());
             }
         }
@@ -789,17 +839,32 @@ impl OwnerRegistry {
                 .is_some_and(|entry| entry.owner == *owner && entry.state == OwnerState::Active)
     }
 
-    /// Active owners other than `plugin_id` sharing the one host process.
+    /// Active owners other than `plugin_id` sharing its host process (the
+    /// other owners of its tier).
     #[must_use]
     pub fn other_active_owners(&self, plugin_id: &str) -> usize {
+        let tier = HostTier::of_owner_id(plugin_id);
         self.owners
             .values()
-            .filter(|entry| entry.owner.plugin_id != plugin_id && entry.state == OwnerState::Active)
+            .filter(|entry| {
+                entry.tier == tier
+                    && entry.owner.plugin_id != plugin_id
+                    && entry.state == OwnerState::Active
+            })
             .count()
     }
 
+    /// The plugin authority of the exact current owner: `None` for a stale
+    /// owner and for a built-in module, which has none.
     #[must_use]
     pub fn authority_for(&self, owner: &OwnerRef) -> Option<PluginAuthority> {
-        self.current(owner).map(|entry| entry.authority.clone())
+        self.current(owner)
+            .and_then(|entry| entry.authority.clone())
+    }
+
+    /// The tier of the exact current owner.
+    #[must_use]
+    pub fn tier_of(&self, owner: &OwnerRef) -> Option<HostTier> {
+        self.current(owner).map(|entry| entry.tier)
     }
 }
