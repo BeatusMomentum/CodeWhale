@@ -14,7 +14,7 @@
 use std::time::Instant;
 
 use crate::commands::debug_diagnostics_test_support::{
-    DiagnosticsHarness, assert_fixture, normalize_cache_ages,
+    DiagnosticsHarness, SealedHome, assert_fixture, normalize_cache_ages,
 };
 use crate::commands::{CommandResult, execute};
 use crate::config::ApiProvider;
@@ -237,6 +237,8 @@ fn system_alias_and_truncation_boundary_are_preserved() {
 /// shared renderer; an unknown subcommand is an exact error with no action.
 #[test]
 fn context_routing_and_report_branches_match_baseline() {
+    // The report counts the user's global instructions and installed skills.
+    let _home = SealedHome::new();
     let mut harness = DiagnosticsHarness::new();
     assert_fixture(
         "context_bare.txt",
@@ -265,6 +267,10 @@ fn context_routing_and_report_branches_match_baseline() {
 /// must return the inspector action with no message.
 #[test]
 fn context_alias_and_bare_action_are_preserved() {
+    // The alias and canonical reports are compared byte for byte, and both
+    // enumerate the user's installed skills: on a developer machine their
+    // discovery can differ between two calls in one test.
+    let _home = SealedHome::new();
     let mut harness = DiagnosticsHarness::new();
     let bare = execute("/context", &mut harness.app);
     assert!(bare.message.is_none());

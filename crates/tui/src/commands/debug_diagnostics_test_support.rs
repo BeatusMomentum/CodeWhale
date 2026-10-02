@@ -19,7 +19,48 @@ use regex::Regex;
 use tempfile::TempDir;
 
 use crate::config::ApiProvider;
+use crate::test_support::{EnvVarGuard, TestEnvLock, lock_test_env};
 use crate::tui::app::{App, TuiOptions};
+
+/// Seal `HOME`, `USERPROFILE` and `CODEWHALE_HOME` onto empty temporary
+/// directories for the life of one test.
+///
+/// The diagnostics surface reads the *user's* state: global instructions
+/// (`~/.codewhale/instructions.md`), installed skills, persisted settings. A
+/// fixture that only owns its workspace and skills directory still lands
+/// those reads on the developer's real home, so token totals and context
+/// reports change with whoever runs the suite. Take this first in any test
+/// whose output depends on them, before building a [`DiagnosticsHarness`]:
+/// it holds the process-wide environment lock, which the harness's settings
+/// loader re-enters. Keep one per test; the lock is not reentrant across
+/// two seals.
+pub(crate) struct SealedHome {
+    // Drop order matters: restore the environment, then delete the
+    // directories, then release the lock.
+    _codewhale_home: EnvVarGuard,
+    _userprofile: EnvVarGuard,
+    _home: EnvVarGuard,
+    _dir: TempDir,
+    _lock: TestEnvLock,
+}
+
+impl SealedHome {
+    pub(crate) fn new() -> Self {
+        let lock = lock_test_env();
+        let dir = TempDir::new().expect("sealed home tempdir");
+        let home = dir.path().join("home");
+        let codewhale_home = dir.path().join("codewhale-home");
+        std::fs::create_dir_all(&home).expect("sealed home dir");
+        std::fs::create_dir_all(&codewhale_home).expect("sealed codewhale home dir");
+        Self {
+            _home: EnvVarGuard::set("HOME", &home),
+            _userprofile: EnvVarGuard::set("USERPROFILE", &home),
+            _codewhale_home: EnvVarGuard::set("CODEWHALE_HOME", &codewhale_home),
+            _dir: dir,
+            _lock: lock,
+        }
+    }
+}
 
 /// Host-isolated fixture for the diagnostics command surface.
 ///
