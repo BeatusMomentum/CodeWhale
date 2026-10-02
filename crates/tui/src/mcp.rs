@@ -1528,12 +1528,17 @@ fn response_result<'a>(
     Ok(response.get("result"))
 }
 
-async fn run_optional_discovery<F>(server: &str, method: &str, timeout: Duration, discovery: F)
+async fn run_optional_discovery<F, T>(
+    server: &str,
+    method: &str,
+    timeout: Duration,
+    discovery: F,
+) -> Option<T>
 where
-    F: Future<Output = Result<()>>,
+    F: Future<Output = Result<T>>,
 {
     match tokio::time::timeout(timeout, discovery).await {
-        Ok(Ok(())) => {}
+        Ok(Ok(value)) => return Some(value),
         Ok(Err(error)) => {
             tracing::warn!(
                 target: "mcp",
@@ -1554,6 +1559,7 @@ where
             );
         }
     }
+    None
 }
 
 // === McpConnection - Async Connection Management ===
@@ -1599,62 +1605,73 @@ const MAX_MCP_CATALOG_PAGES: usize = 64;
 const MAX_MCP_CATALOG_ITEMS: usize = 4_096;
 const MAX_MCP_CATALOG_BYTES: usize = 32 * 1024 * 1024;
 
+/// One retained catalog generation, shared by every advertised family.
 struct McpCatalogBudget {
-    method: &'static str,
     pages: usize,
     items: usize,
     bytes: usize,
-    seen_cursors: HashSet<String>,
+    // Cursor namespaces are independent across list methods.
+    seen_cursors: HashSet<(&'static str, String)>,
+    // Optional-method recovery cannot turn a budget refusal into success.
+    refused: Option<String>,
 }
 
 impl McpCatalogBudget {
-    fn new(method: &'static str) -> Self {
+    fn new() -> Self {
         Self {
-            method,
             pages: 0,
             items: 0,
             bytes: 0,
             seen_cursors: HashSet::new(),
+            refused: None,
         }
+    }
+
+    fn ensure_available(&self) -> Result<()> {
+        if let Some(reason) = self.refused.as_ref() {
+            anyhow::bail!("{reason}");
+        }
+        Ok(())
     }
 
     fn observe_page(
         &mut self,
+        method: &'static str,
         result: &serde_json::Value,
         item_count: usize,
     ) -> Result<Option<String>> {
+        self.ensure_available()?;
         self.pages = self.pages.saturating_add(1);
         self.items = self.items.saturating_add(item_count);
         self.bytes = self.bytes.saturating_add(serde_json::to_vec(result)?.len());
-        if self.pages > MAX_MCP_CATALOG_PAGES {
-            anyhow::bail!(
-                "{} exceeded the {}-page catalogue limit",
-                self.method,
-                MAX_MCP_CATALOG_PAGES
-            );
-        }
-        if self.items > MAX_MCP_CATALOG_ITEMS {
-            anyhow::bail!(
-                "{} exceeded the {}-item catalogue limit",
-                self.method,
-                MAX_MCP_CATALOG_ITEMS
-            );
-        }
-        if self.bytes > MAX_MCP_CATALOG_BYTES {
-            anyhow::bail!(
-                "{} exceeded the {}-byte aggregate catalogue limit",
-                self.method,
-                MAX_MCP_CATALOG_BYTES
-            );
+        let refusal = if self.pages > MAX_MCP_CATALOG_PAGES {
+            Some(format!(
+                "{method} exceeded the {MAX_MCP_CATALOG_PAGES}-page catalogue limit"
+            ))
+        } else if self.items > MAX_MCP_CATALOG_ITEMS {
+            Some(format!(
+                "{method} exceeded the {MAX_MCP_CATALOG_ITEMS}-item catalogue limit"
+            ))
+        } else if self.bytes > MAX_MCP_CATALOG_BYTES {
+            Some(format!(
+                "{method} exceeded the {MAX_MCP_CATALOG_BYTES}-byte aggregate catalogue limit"
+            ))
+        } else {
+            None
+        };
+        if let Some(reason) = refusal {
+            self.refused = Some(reason);
+            self.ensure_available()?;
         }
         let cursor = result
             .get("nextCursor")
             .and_then(|value| value.as_str())
             .map(str::to_owned);
         if let Some(cursor) = cursor.as_ref()
-            && !self.seen_cursors.insert(cursor.clone())
+            && !self.seen_cursors.insert((method, cursor.clone()))
         {
-            anyhow::bail!("{} repeated pagination cursor; aborting", self.method);
+            self.refused = Some(format!("{method} repeated pagination cursor; aborting"));
+            self.ensure_available()?;
         }
         Ok(cursor)
     }
@@ -2148,25 +2165,32 @@ impl McpConnection {
         Ok(())
     }
 
-    /// Discover tools, resources, and prompts
+    /// Discover and admit one complete tools/resources/prompts generation.
     async fn discover_all(&mut self) -> Result<()> {
         let capabilities = self.server_capabilities;
         let server = self.name.clone();
         let discovery_timeout = self.discovery_timeout;
+        let mut budget = McpCatalogBudget::new();
+        let mut tools = None;
+        let mut resources = None;
+        let mut resource_templates = None;
+        let mut prompts = None;
 
         // Missing initialize metadata is treated as a legacy/unknown server:
         // retain tool discovery and bounded best-effort probes for compatibility.
         // When capabilities are advertised, do not call methods the server says
         // it does not implement (notably JetBrains tools-only MCP servers).
         if capabilities.is_none_or(|capabilities| capabilities.tools) {
-            tokio::time::timeout(discovery_timeout, self.discover_tools())
-                .await
-                .with_context(|| {
-                    format!(
-                        "MCP server '{}' tool discovery timed out after {:?}",
-                        server, discovery_timeout
-                    )
-                })??;
+            tools = Some(
+                tokio::time::timeout(discovery_timeout, self.discover_tools(&mut budget))
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "MCP server '{}' tool discovery timed out after {:?}",
+                            server, discovery_timeout
+                        )
+                    })??,
+            );
         }
 
         // Keep all three optional calls within one discovery-timeout budget in
@@ -2174,39 +2198,47 @@ impl McpConnection {
         let optional_timeout =
             (discovery_timeout / 3).min(Duration::from_secs(self.read_timeout_secs));
         if capabilities.is_none_or(|capabilities| capabilities.resources) {
-            run_optional_discovery(
+            resources = run_optional_discovery(
                 &server,
                 "resources/list",
                 optional_timeout,
-                self.discover_resources(),
+                self.discover_resources(&mut budget),
             )
             .await;
-            run_optional_discovery(
+            resource_templates = run_optional_discovery(
                 &server,
                 "resources/templates/list",
                 optional_timeout,
-                self.discover_resource_templates(),
+                self.discover_resource_templates(&mut budget),
             )
             .await;
         }
         if capabilities.is_none_or(|capabilities| capabilities.prompts) {
-            run_optional_discovery(
+            prompts = run_optional_discovery(
                 &server,
                 "prompts/list",
                 optional_timeout,
-                self.discover_prompts(),
+                self.discover_prompts(&mut budget),
             )
             .await;
         }
+        // Ordinary optional-method errors remain best effort. Admit only the
+        // freshly staged families; do not mix them with an old generation.
+        // A budget/cursor refusal preserves the entire previous catalog.
+        budget.ensure_available()?;
+        self.tools = tools.unwrap_or_default();
+        self.resources = resources.unwrap_or_default();
+        self.resource_templates = resource_templates.unwrap_or_default();
+        self.prompts = prompts.unwrap_or_default();
         Ok(())
     }
 
     /// Discover available tools from the MCP server
-    async fn discover_tools(&mut self) -> Result<()> {
+    async fn discover_tools(&mut self, budget: &mut McpCatalogBudget) -> Result<Vec<McpTool>> {
         let mut cursor: Option<String> = None;
-        let mut budget = McpCatalogBudget::new("tools/list");
         let mut discovered = Vec::new();
         loop {
+            budget.ensure_available()?;
             let list_id = self.next_id();
             let params = match &cursor {
                 Some(c) => serde_json::json!({ "cursor": c }),
@@ -2234,6 +2266,7 @@ impl McpConnection {
                 .get("tools")
                 .and_then(|tools| tools.as_array())
                 .map_or(0, Vec::len);
+            cursor = budget.observe_page("tools/list", result, items)?;
             if let Some(arr) = result.get("tools").and_then(|t| t.as_array()) {
                 for item in arr {
                     match serde_json::from_value::<McpTool>(item.clone()) {
@@ -2249,7 +2282,6 @@ impl McpConnection {
                 }
             }
 
-            cursor = budget.observe_page(result, items)?;
             if cursor.is_none() {
                 break;
             }
@@ -2258,16 +2290,18 @@ impl McpConnection {
         // server-side pagination ordering — keeps the prompt prefix stable
         // for cache-hit purposes (#1319).
         discovered.sort_by(|a, b| a.name.cmp(&b.name));
-        self.tools = discovered;
-        Ok(())
+        Ok(discovered)
     }
 
     /// Discover available resources from the MCP server
-    async fn discover_resources(&mut self) -> Result<()> {
+    async fn discover_resources(
+        &mut self,
+        budget: &mut McpCatalogBudget,
+    ) -> Result<Vec<McpResource>> {
         let mut cursor: Option<String> = None;
-        let mut budget = McpCatalogBudget::new("resources/list");
         let mut discovered = Vec::new();
         loop {
+            budget.ensure_available()?;
             let list_id = self.next_id();
             let params = match &cursor {
                 Some(c) => serde_json::json!({ "cursor": c }),
@@ -2295,6 +2329,7 @@ impl McpConnection {
                 .get("resources")
                 .and_then(|resources| resources.as_array())
                 .map_or(0, Vec::len);
+            cursor = budget.observe_page("resources/list", result, items)?;
             if let Some(arr) = result.get("resources").and_then(|r| r.as_array()) {
                 for item in arr {
                     match serde_json::from_value::<McpResource>(item.clone()) {
@@ -2306,21 +2341,22 @@ impl McpConnection {
                 }
             }
 
-            cursor = budget.observe_page(result, items)?;
             if cursor.is_none() {
                 break;
             }
         }
-        self.resources = discovered;
-        Ok(())
+        Ok(discovered)
     }
 
     /// Discover available resource templates from the MCP server
-    async fn discover_resource_templates(&mut self) -> Result<()> {
+    async fn discover_resource_templates(
+        &mut self,
+        budget: &mut McpCatalogBudget,
+    ) -> Result<Vec<McpResourceTemplate>> {
         let mut cursor: Option<String> = None;
-        let mut budget = McpCatalogBudget::new("resources/templates/list");
         let mut discovered = Vec::new();
         loop {
+            budget.ensure_available()?;
             let list_id = self.next_id();
             let params = match &cursor {
                 Some(c) => serde_json::json!({ "cursor": c }),
@@ -2351,6 +2387,7 @@ impl McpConnection {
             let items = templates
                 .and_then(|templates| templates.as_array())
                 .map_or(0, Vec::len);
+            cursor = budget.observe_page("resources/templates/list", result, items)?;
             if let Some(arr) = templates.and_then(|t| t.as_array()) {
                 for item in arr {
                     match serde_json::from_value::<McpResourceTemplate>(item.clone()) {
@@ -2362,21 +2399,19 @@ impl McpConnection {
                 }
             }
 
-            cursor = budget.observe_page(result, items)?;
             if cursor.is_none() {
                 break;
             }
         }
-        self.resource_templates = discovered;
-        Ok(())
+        Ok(discovered)
     }
 
     /// Discover available prompts from the MCP server
-    async fn discover_prompts(&mut self) -> Result<()> {
+    async fn discover_prompts(&mut self, budget: &mut McpCatalogBudget) -> Result<Vec<McpPrompt>> {
         let mut cursor: Option<String> = None;
-        let mut budget = McpCatalogBudget::new("prompts/list");
         let mut discovered = Vec::new();
         loop {
+            budget.ensure_available()?;
             let list_id = self.next_id();
             let params = match &cursor {
                 Some(c) => serde_json::json!({ "cursor": c }),
@@ -2404,6 +2439,7 @@ impl McpConnection {
                 .get("prompts")
                 .and_then(|prompts| prompts.as_array())
                 .map_or(0, Vec::len);
+            cursor = budget.observe_page("prompts/list", result, items)?;
             if let Some(arr) = result.get("prompts").and_then(|p| p.as_array()) {
                 for item in arr {
                     match serde_json::from_value::<McpPrompt>(item.clone()) {
@@ -2415,13 +2451,11 @@ impl McpConnection {
                 }
             }
 
-            cursor = budget.observe_page(result, items)?;
             if cursor.is_none() {
                 break;
             }
         }
-        self.prompts = discovered;
-        Ok(())
+        Ok(discovered)
     }
 
     /// Call a tool on this MCP server

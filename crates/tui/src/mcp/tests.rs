@@ -3980,7 +3980,10 @@ async fn discover_tools_sorts_by_name_for_cache_stability() {
         ]),
     };
     let mut conn = test_connection(Box::new(transport));
-    conn.discover_tools().await.expect("discover");
+    conn.tools = conn
+        .discover_tools(&mut McpCatalogBudget::new())
+        .await
+        .expect("discover");
 
     let names: Vec<&str> = conn.tools.iter().map(|t| t.name.as_str()).collect();
     assert_eq!(
@@ -4016,7 +4019,7 @@ async fn discover_tools_rejects_a_repeated_pagination_cursor_without_publishing_
     let mut conn = test_connection(Box::new(transport));
 
     let error = conn
-        .discover_tools()
+        .discover_tools(&mut McpCatalogBudget::new())
         .await
         .expect_err("repeated cursor must abort discovery");
     assert!(error.to_string().contains("repeated pagination cursor"));
@@ -10429,4 +10432,161 @@ async fn computer_use_real_plugin_host_handshake_rejects_tamper_replay_and_late_
     );
     assert_eq!(replay["error"]["code"], "consent_needs_user", "{replay}");
     pool.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn discover_all_rejects_combined_item_budget_without_publishing_any_family() {
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let tools = (0..MAX_MCP_CATALOG_ITEMS)
+        .map(|i| serde_json::json!({"name": format!("tool_{i}"), "inputSchema": {}}))
+        .collect::<Vec<_>>();
+    let transport = ScriptedValueTransport {
+        sent: Arc::clone(&sent),
+        responses: VecDeque::from([
+            json_frame(serde_json::json!({"jsonrpc":"2.0", "id":1, "result":{"tools":tools}})),
+            json_frame(
+                serde_json::json!({"jsonrpc":"2.0", "id":2, "result":{"resources":[{"uri":"file:///over-limit", "name":"over-limit"}]}}),
+            ),
+        ]),
+    };
+    let mut conn = test_connection(Box::new(transport));
+    conn.server_capabilities = Some(McpServerCapabilities {
+        tools: true,
+        resources: true,
+        prompts: true,
+    });
+    conn.tools = vec![
+        serde_json::from_value(serde_json::json!({"name":"previous", "inputSchema":{}})).unwrap(),
+    ];
+    conn.resources = vec![
+        serde_json::from_value(serde_json::json!({"uri":"file:///previous", "name":"previous"}))
+            .unwrap(),
+    ];
+    conn.resource_templates = vec![
+        serde_json::from_value(
+            serde_json::json!({"uriTemplate":"file:///{key}", "name":"previous"}),
+        )
+        .unwrap(),
+    ];
+    conn.prompts = vec![serde_json::from_value(serde_json::json!({"name":"previous"})).unwrap()];
+
+    let error = conn
+        .discover_all()
+        .await
+        .expect_err("combined count must refuse");
+    assert!(
+        error
+            .to_string()
+            .contains("resources/list exceeded the 4096-item")
+    );
+    assert_eq!(conn.tools.len(), 1);
+    assert_eq!(conn.tools[0].name, "previous");
+    assert_eq!(conn.resources[0].uri, "file:///previous");
+    assert_eq!(conn.resource_templates[0].name, "previous");
+    assert_eq!(conn.prompts[0].name, "previous");
+    assert_eq!(
+        sent.lock().unwrap().len(),
+        2,
+        "poisoned budget must prevent subsequent RPCs"
+    );
+}
+
+#[tokio::test]
+async fn discover_all_rejects_combined_page_budget_without_publishing() {
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let mut responses = VecDeque::new();
+    for page in 1..=MAX_MCP_CATALOG_PAGES {
+        let mut result = serde_json::json!({"tools":[]});
+        if page < MAX_MCP_CATALOG_PAGES {
+            result["nextCursor"] = serde_json::json!(format!("page_{page}"));
+        }
+        responses.push_back(json_frame(
+            serde_json::json!({"jsonrpc":"2.0", "id":page, "result":result}),
+        ));
+    }
+    responses.push_back(json_frame(serde_json::json!({"jsonrpc":"2.0", "id":MAX_MCP_CATALOG_PAGES+1, "result":{"resources":[]}})));
+    let mut conn = test_connection(Box::new(ScriptedValueTransport {
+        sent: Arc::clone(&sent),
+        responses,
+    }));
+    conn.server_capabilities = Some(McpServerCapabilities {
+        tools: true,
+        resources: true,
+        prompts: false,
+    });
+    conn.tools = vec![
+        serde_json::from_value(serde_json::json!({"name":"previous", "inputSchema":{}})).unwrap(),
+    ];
+    let error = conn
+        .discover_all()
+        .await
+        .expect_err("page budget must span families");
+    assert!(
+        error
+            .to_string()
+            .contains("resources/list exceeded the 64-page")
+    );
+    assert_eq!(conn.tools[0].name, "previous");
+    assert_eq!(sent.lock().unwrap().len(), MAX_MCP_CATALOG_PAGES + 1);
+}
+
+#[test]
+fn catalog_cursor_refusal_is_scoped_by_family_and_latched() {
+    let mut budget = McpCatalogBudget::new();
+    let page = serde_json::json!({"nextCursor":"shared-value"});
+    budget.observe_page("tools/list", &page, 0).unwrap();
+    budget.observe_page("resources/list", &page, 0).unwrap();
+    let error = budget.observe_page("tools/list", &page, 0).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("tools/list repeated pagination cursor")
+    );
+    let error = budget
+        .observe_page("prompts/list", &serde_json::json!({}), 0)
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("tools/list repeated pagination cursor")
+    );
+}
+
+#[test]
+fn catalog_byte_budget_cannot_reset_between_families() {
+    let mut budget = McpCatalogBudget::new();
+    // Put the real shared counter at the boundary without a 32MiB allocation.
+    let page = serde_json::json!({});
+    budget.bytes = MAX_MCP_CATALOG_BYTES - serde_json::to_vec(&page).unwrap().len();
+    budget.observe_page("tools/list", &page, 0).unwrap();
+    let error = budget.observe_page("resources/list", &page, 0).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("resources/list exceeded the 33554432-byte aggregate")
+    );
+    assert!(budget.ensure_available().is_err());
+}
+
+#[tokio::test]
+async fn discover_all_success_replaces_unavailable_old_families() {
+    let mut conn = test_connection(Box::new(ScriptedValueTransport {
+        sent: Arc::new(Mutex::new(Vec::new())),
+        responses: VecDeque::from([json_frame(
+            serde_json::json!({"jsonrpc":"2.0", "id":1, "result":{"tools":[]}}),
+        )]),
+    }));
+    conn.server_capabilities = Some(McpServerCapabilities {
+        tools: true,
+        resources: false,
+        prompts: false,
+    });
+    conn.resources = vec![
+        serde_json::from_value(serde_json::json!({"uri":"file:///old", "name":"old"})).unwrap(),
+    ];
+    conn.prompts = vec![serde_json::from_value(serde_json::json!({"name":"old"})).unwrap()];
+    conn.discover_all().await.unwrap();
+    assert!(conn.tools.is_empty());
+    assert!(conn.resources.is_empty());
+    assert!(conn.prompts.is_empty());
 }
