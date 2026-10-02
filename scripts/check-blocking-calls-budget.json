@@ -13,7 +13,7 @@
   },
   "crates/cli/src/config_bundles.rs": {
     "path_canonicalize": 2,
-    "std_fs": 7
+    "std_fs": 6
   },
   "crates/cli/src/lib.rs": {
     "path_canonicalize": 3,
@@ -35,7 +35,7 @@
   },
   "crates/config/src/lib.rs": {
     "path_canonicalize": 3,
-    "std_fs": 10
+    "std_fs": 9
   },
   "crates/config/src/redaction.rs": {
     "path_canonicalize": 2,
@@ -190,7 +190,7 @@
   },
   "crates/tui/src/fleet/files.rs": {
     "path_canonicalize": 2,
-    "std_fs": 5,
+    "std_fs": 6,
     "thread_sleep": 1
   },
   "crates/tui/src/fleet/host.rs": {
@@ -202,10 +202,10 @@
     "std_fs": 3
   },
   "crates/tui/src/fleet/manager.rs": {
-    "std_fs": 7
+    "std_fs": 3
   },
   "crates/tui/src/fleet/profile.rs": {
-    "std_fs": 5
+    "std_fs": 3
   },
   "crates/tui/src/fleet/task_spec.rs": {
     "std_fs": 3
@@ -473,17 +473,11 @@
     "path_canonicalize": 4,
     "std_fs": 1
   },
-  "crates/tui/src/tools/workflow/report.rs": {
-    "std_fs": 4
-  },
   "crates/tui/src/tui/app/init.rs": {
     "std_fs": 1
   },
   "crates/tui/src/tui/auto_review.rs": {
     "path_canonicalize": 3
-  },
-  "crates/tui/src/tui/clipboard.rs": {
-    "std_fs": 2
   },
   "crates/tui/src/tui/file_frecency.rs": {
     "std_fs": 3
@@ -527,9 +521,6 @@
   },
   "crates/tui/src/tui/ui/activity_detail.rs": {
     "path_canonicalize": 2,
-    "std_fs": 2
-  },
-  "crates/tui/src/tui/ui/apply.rs": {
     "std_fs": 2
   },
   "crates/tui/src/tui/ui/fatal_signal_guard.rs": {
