@@ -79,10 +79,9 @@ async fn extension_prompt_changes_and_retirement_are_recorded_without_rewriting_
     );
 
     // Restore/compaction cannot make a process-local baseline swallow the text.
+    engine.extension_prompt_block = Some(block.clone());
     engine.session.messages.clear();
-    engine
-        .record_extension_prompt_contributions(Some(&block))
-        .await;
+    engine.record_current_extension_prompt_contributions().await;
     assert_eq!(engine.session.messages.len(), 1);
     assert!(
         crate::runtime_handoff::extension_prompt_contributions_display(&engine.session.messages[0])

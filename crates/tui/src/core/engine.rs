@@ -937,6 +937,9 @@ pub struct Engine {
     /// and for engines without a plugin snapshot of their own (isolated
     /// chats), which must never revoke another engine's plugins.
     extension_host: Option<crate::extension_host::HostAttachment>,
+    /// Immutable contribution snapshot for the running turn. Re-delivery after
+    /// compaction uses these same bytes, never a mid-turn host re-sampling.
+    extension_prompt_block: Option<String>,
     api_provider: ApiProvider,
     /// Exact configured route key. Named custom providers share the `Custom`
     /// enum, so the enum alone cannot prove that the active client is current.
@@ -2094,6 +2097,7 @@ impl Engine {
             mcp_event_generation: 0,
             plugin_registry,
             extension_host,
+            extension_prompt_block: None,
             api_provider,
             api_provider_identity,
             api_provider_id,
@@ -5997,7 +6001,7 @@ impl Engine {
         // Capture only this engine's reviewed, live plugin contributions. A
         // failed/withdrawn capture records retirement. Full bounded snapshots
         // use ordinary session history, not the smaller workspace line delta.
-        let extension_prompt_block = if self.config.features.enabled(Feature::ExtensionHost) {
+        self.extension_prompt_block = if self.config.features.enabled(Feature::ExtensionHost) {
             if let Some(attachment) = &self.extension_host {
                 match attachment.prompt_sections().await.and_then(|sections| {
                     crate::extension_host::prompt::render_prompt_sections(&sections)
@@ -6017,8 +6021,7 @@ impl Engine {
         } else {
             None
         };
-        self.record_extension_prompt_contributions(extension_prompt_block.as_deref())
-            .await;
+        self.record_current_extension_prompt_contributions().await;
 
         // Compose from the immutable values accepted for this turn. Preview
         // receives the same context before anything is installed, so prompt
@@ -7863,6 +7866,12 @@ impl Engine {
     /// The latest snapshot supersedes earlier ones; an empty capture withdraws
     /// them. Comparing the log also re-delivers instructions after compaction
     /// or resume without maintaining another prompt store or changing the prefix.
+    async fn record_current_extension_prompt_contributions(&mut self) {
+        let block = self.extension_prompt_block.clone();
+        self.record_extension_prompt_contributions(block.as_deref())
+            .await;
+    }
+
     async fn record_extension_prompt_contributions(&mut self, block: Option<&str>) {
         let previous = self.session.messages.iter().rev().find(|message| {
             crate::runtime_handoff::extension_prompt_contributions_display(message).is_some()
