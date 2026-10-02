@@ -133,6 +133,8 @@ in Codewhale's protected credential storage. Permission to use your ChatGPT
 plan is separate from identity sign-in. A declined or missing plan grant stops
 inference; choose another provider explicitly if you want another billing path.
 `codewhale auth chatgpt-revoke` signs out of the Codewhale-owned session.
+This experimental implementation retains one active registration. A picker
+for multiple saved ChatGPT accounts is not implemented yet.
 
 Model discovery uses your granted bearer token at
 `GET https://api.openai.com/v1/models`; inference uses the public
@@ -150,7 +152,7 @@ Eligible requests consume your ChatGPT plan or credits. ChatGPT Plus's
 five-hour allowance is shared across apps; each app receives no separate
 allowance. The documented five-hour limit does not apply to Pro. App-specific
 limits can also apply. Review limits and access in
-[ChatGPT usage settings](https://chatgpt.com/#settings/Usage). Codewhale does
+[ChatGPT usage settings](https://chatgpt.com/settings/usage). Codewhale does
 not silently switch to an API key or another provider when a limit is reached.
 
 This is an OpenAI preview for open-source/local apps. It does not grant access
