@@ -32,11 +32,6 @@ use crate::config::Config;
 #[serde(rename_all = "snake_case")]
 struct AuthTokens {
     access_token: Option<String>,
-    account_id: Option<String>,
-    /// Read only to derive the display label of the account this file signs
-    /// in as; never forwarded.
-    #[serde(default)]
-    id_token: Option<String>,
 }
 
 /// Top-level structure of Codex CLI's `auth.json`.
@@ -50,10 +45,6 @@ struct CodexAuthFile {
 #[derive(Debug, Clone)]
 pub struct CodexCredentials {
     pub access_token: String,
-    pub account_id: Option<String>,
-    /// Display label (email, plan) of the account these exact credentials
-    /// sign in as, from the same file read. `None` for an env token.
-    pub account_label: Option<String>,
 }
 
 /// JWT claims subset for expiry extraction.
@@ -138,32 +129,7 @@ fn load_credentials(grant: &ExternalCredentialReadGrant) -> Result<Option<CodexC
         Some(t) if !t.trim().is_empty() => t,
         _ => return Ok(None),
     };
-    Ok(Some(CodexCredentials {
-        access_token,
-        account_id: tokens.account_id,
-        account_label: tokens
-            .id_token
-            .as_deref()
-            .and_then(account_label_from_id_token),
-    }))
-}
-
-/// Prompt-free, non-refreshing readiness check for picker/onboarding surfaces.
-/// It reads process-level token variables only; no file or network access occurs.
-#[must_use]
-pub fn credentials_from_env() -> Option<CodexCredentials> {
-    ["OPENAI_CODEX_ACCESS_TOKEN", "CODEX_ACCESS_TOKEN"]
-        .iter()
-        .find_map(|name| {
-            std::env::var(name)
-                .ok()
-                .filter(|token| !token.trim().is_empty())
-        })
-        .map(|access_token| CodexCredentials {
-            access_token,
-            account_id: codex_account_id_env(),
-            account_label: None,
-        })
+    Ok(Some(CodexCredentials { access_token }))
 }
 
 /// Validate only the stored OAuth file, excluding token environment
@@ -193,22 +159,9 @@ pub fn get_credentials(grant: &ExternalCredentialReadGrant) -> Result<CodexCrede
     }
 
     bail!(
-        "Codex access token in {} is expired. Read-only consent never refreshes or rewrites another CLI's credentials. Sign in with ChatGPT via `codewhale auth chatgpt`, run `codex login` again, or provide OPENAI_CODEX_ACCESS_TOKEN for this process.",
+        "Codex access token in {} is expired. Read-only consent never refreshes or rewrites another CLI's credentials. Use `codewhale auth chatgpt` for the official ChatGPT plan route. To inspect this legacy credential file again, renew its login with `codex login`.",
         codewhale_config::quote_os_path(grant.path())
     )
-}
-
-/// Read a ChatGPT account id from env overrides only.
-fn codex_account_id_env() -> Option<String> {
-    for var in ["OPENAI_CODEX_ACCOUNT_ID", "CODEX_ACCOUNT_ID"] {
-        if let Ok(value) = std::env::var(var) {
-            let trimmed = value.trim();
-            if !trimmed.is_empty() {
-                return Some(trimmed.to_string());
-            }
-        }
-    }
-    None
 }
 
 // ── ONE access-route flow ─────────────────────────────────────────────
