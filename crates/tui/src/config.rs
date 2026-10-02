@@ -12886,20 +12886,14 @@ pub(crate) const XAI_OAUTH_KEY_SOURCE: &str = "xAI OAuth login";
 impl Config {
     /// Resolve Codewhale's verified ChatGPT grant. Credential refresh remains
     /// serialized by the owned-store lifecycle transaction.
-    pub(crate) fn codex_credentials(&self) -> Result<crate::oauth::CodexCredentials> {
+    pub(crate) fn codex_credentials(&self) -> Result<crate::oauth::OwnedOAuthCredentials> {
         anyhow::ensure!(
             self.api_provider() == ApiProvider::OpenaiCodex
                 && !self.provider_uses_custom_endpoint(ApiProvider::OpenaiCodex),
             "ChatGPT credentials are only available on the official public API route"
         );
         crate::oauth::official_chatgpt_registration(self)?;
-        let owned =
-            crate::oauth::get_owned_credentials(crate::oauth::OAuthProvider::Chatgpt, self)?;
-        Ok(crate::oauth::CodexCredentials {
-            access_token: owned.access_token,
-            account_id: owned.account_id,
-            account_label: owned.account_label,
-        })
+        crate::oauth::get_owned_credentials(crate::oauth::OAuthProvider::Chatgpt, self)
     }
 
     /// Account identifier from the selected Codewhale-owned ChatGPT grant.

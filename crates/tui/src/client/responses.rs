@@ -33,7 +33,7 @@ const CHATGPT_TOOL_NAMESPACE: &str = "codewhale";
 /// Build the Responses API request body from a `MessageRequest`.
 #[cfg(test)]
 pub(super) fn build_responses_body(request: &MessageRequest) -> Value {
-    build_responses_body_for_provider(request, ApiProvider::OpenaiCodex)
+    build_responses_body_for_provider(request, ApiProvider::OpenaiCodex, None)
 }
 
 /// Build a provider-aware Responses API request body.
@@ -45,6 +45,7 @@ pub(super) fn build_responses_body(request: &MessageRequest) -> Value {
 pub(super) fn build_responses_body_for_provider(
     request: &MessageRequest,
     provider: ApiProvider,
+    reasoning_api: Option<&str>,
 ) -> Value {
     let is_deepseek = matches!(provider, ApiProvider::Deepseek | ApiProvider::DeepseekCN);
     // Concentrate documents `model`, `input`, `stream`, `max_output_tokens`,
@@ -80,14 +81,13 @@ pub(super) fn build_responses_body_for_provider(
         }
     }
 
-    // Supply a minimal system prompt when the caller did not provide one.
-    // The ChatGPT plan preview receives it as a developer input message.
+    // Supply minimal instructions when the caller did not provide a system prompt.
     let instructions = system_to_instructions(request.system.clone())
         .filter(|text| !text.trim().is_empty())
         .unwrap_or_else(|| "You are a helpful assistant.".to_string());
 
     // Convert messages to Responses input items.
-    let mut input = convert_messages_to_responses_input(request, provider);
+    let mut input = convert_messages_to_responses_input(request, provider, reasoning_api);
     if is_concentrate {
         input.insert(
             0,
@@ -149,7 +149,7 @@ pub(super) fn build_responses_body_for_provider(
 }
 
 impl CodewhaleClient {
-    /// Handle a streaming Responses API request for the OpenAI Codex provider.
+    /// Handle a streaming Responses request for the resolved provider route.
     pub(super) async fn handle_responses_stream(
         &self,
         prepared: &super::PreparedOutboundRequest,
@@ -165,8 +165,13 @@ impl CodewhaleClient {
         // remapping — rather than borrowing the request that no longer exists
         // at this layer.
         let wire_model = prepared.wire_model.clone();
-        let reasoning_origin = (self.api_provider == ApiProvider::OpenaiCodex)
-            .then(|| (self.api_provider.as_str().to_string(), wire_model.clone()));
+        let reasoning_origin = self.chatgpt_reasoning_api.as_ref().map(|api| {
+            (
+                self.api_provider.as_str().to_string(),
+                api.clone(),
+                wire_model.clone(),
+            )
+        });
 
         // The bearer Authorization header is already installed as a default
         // header on both HTTP clients, so it must not be duplicated here.
@@ -516,7 +521,7 @@ impl CodewhaleClient {
                             }
                             "response.output_item.done" => {
                                 if let Some(idx) = current_block_index {
-                                    if let (Some((provider, model)), Some(item)) =
+                                    if let (Some((provider, api, model)), Some(item)) =
                                         (reasoning_origin.as_ref(), event.get("item"))
                                         && item.get("type").and_then(Value::as_str)
                                             == Some("reasoning")
@@ -530,7 +535,7 @@ impl CodewhaleClient {
                                             delta: Delta::ReasoningStateDelta {
                                                 state: OpaqueReasoningState {
                                                     provider: provider.clone(),
-                                                    api: "openai-responses".to_string(),
+                                                    api: api.clone(),
                                                     model: model.clone(),
                                                     id: item
                                                         .get("id")
@@ -796,6 +801,7 @@ pub(super) fn responses_tool_output(content: &str, content_blocks: Option<&[Valu
 pub(super) fn convert_messages_to_responses_input(
     request: &MessageRequest,
     provider: ApiProvider,
+    reasoning_api: Option<&str>,
 ) -> Vec<Value> {
     let is_deepseek = matches!(provider, ApiProvider::Deepseek | ApiProvider::DeepseekCN);
     let mut items = Vec::new();
@@ -895,7 +901,11 @@ pub(super) fn convert_messages_to_responses_input(
                         } => {
                             if let Some(state) = state {
                                 if state.provider == provider.as_str()
-                                    && state.api == "openai-responses"
+                                    && if provider == ApiProvider::OpenaiCodex {
+                                        reasoning_api.is_some_and(|api| state.api == api)
+                                    } else {
+                                        state.api == "openai-responses"
+                                    }
                                     && state.model == request.model
                                 {
                                     let mut item = json!({

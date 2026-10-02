@@ -216,7 +216,7 @@ async fn responses_stream_retries_upstream_499_before_streaming() {
     assert_eq!(attempts.load(Ordering::SeqCst), 2);
 }
 
-async fn collect_responses_stream(sse_body: &'static str) -> Vec<Result<StreamEvent>> {
+async fn collect_responses_stream(sse_body: &str) -> Vec<Result<StreamEvent>> {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/responses"))
@@ -831,11 +831,12 @@ fn codex_tiers_do_not_change_other_responses_provider_dialects() {
     for effort in ["max", "ultra"] {
         request.reasoning_effort = Some(effort.to_string());
         assert_eq!(
-            build_responses_body_for_provider(&request, ApiProvider::Concentrate)["reasoning"]["effort"],
+            build_responses_body_for_provider(&request, ApiProvider::Concentrate, None)["reasoning"]
+                ["effort"],
             "xhigh"
         );
         assert_eq!(
-            build_responses_body_for_provider(&request, ApiProvider::Deepseek)["reasoning"]["effort"],
+            build_responses_body_for_provider(&request, ApiProvider::Deepseek, None)["reasoning"]["effort"],
             "max"
         );
     }
@@ -871,7 +872,7 @@ fn concentrate_responses_body_sends_only_documented_fields() {
         cache_control: None,
     }]);
 
-    let body = build_responses_body_for_provider(&request, ApiProvider::Concentrate);
+    let body = build_responses_body_for_provider(&request, ApiProvider::Concentrate, None);
     let documented = [
         "model",
         "input",
@@ -920,7 +921,7 @@ fn concentrate_responses_body_sends_only_documented_fields() {
 
     // The same request on the generic Responses path still carries the
     // OpenAI-only fields, so the Concentrate branch is a deliberate subset.
-    let generic = build_responses_body_for_provider(&request, ApiProvider::Openai);
+    let generic = build_responses_body_for_provider(&request, ApiProvider::Openai, None);
     assert!(
         generic.get("store").is_some()
             && generic.get("include").is_some()
@@ -947,7 +948,7 @@ fn deepseek_flash_responses_body_uses_stateless_0731_contract() {
         },
     );
 
-    let body = build_responses_body_for_provider(&request, ApiProvider::Deepseek);
+    let body = build_responses_body_for_provider(&request, ApiProvider::Deepseek, None);
 
     assert_eq!(body["model"], "deepseek-v4-flash");
     assert_eq!(body["max_output_tokens"], 128);
@@ -978,7 +979,7 @@ fn chatgpt_plan_body_omits_unsupported_output_caps() {
     let mut request = minimal_responses_request();
     request.max_tokens = 4_096;
 
-    let codex = build_responses_body_for_provider(&request, ApiProvider::OpenaiCodex);
+    let codex = build_responses_body_for_provider(&request, ApiProvider::OpenaiCodex, None);
     assert!(
         codex.get("max_output_tokens").is_none(),
         "ChatGPT plan body names an unsupported output cap: {codex}"
@@ -988,16 +989,17 @@ fn chatgpt_plan_body_omits_unsupported_output_caps() {
         "no alternate output-cap spelling may sneak onto the Codex wire: {codex}"
     );
 
-    let deepseek = build_responses_body_for_provider(&request, ApiProvider::Deepseek);
+    let deepseek = build_responses_body_for_provider(&request, ApiProvider::Deepseek, None);
     assert_eq!(deepseek["max_output_tokens"], json!(4_096));
 }
 
 #[test]
-fn codex_replays_only_exact_model_opaque_reasoning_state() {
+fn chatgpt_replays_only_exact_grant_and_model_opaque_reasoning_state() {
     const SENTINEL: &str = "readable private reasoning must not be replayed";
+    const SCOPE: &str = "openai-responses-siwc-v1:test-grant";
     let state = OpaqueReasoningState {
         provider: ApiProvider::OpenaiCodex.as_str().to_string(),
-        api: "openai-responses".to_string(),
+        api: SCOPE.to_string(),
         model: "gpt-5.5".to_string(),
         id: Some("rs_opaque".to_string()),
         encrypted_content: "enc_opaque_payload".to_string(),
@@ -1015,7 +1017,7 @@ fn codex_replays_only_exact_model_opaque_reasoning_state() {
         },
     );
 
-    let exact = build_responses_body_for_provider(&request, ApiProvider::OpenaiCodex);
+    let exact = build_responses_body_for_provider(&request, ApiProvider::OpenaiCodex, Some(SCOPE));
     let exact_wire = exact.to_string();
     assert!(!exact_wire.contains(SENTINEL), "{exact}");
     assert_eq!(exact.pointer("/input/0/type"), Some(&json!("reasoning")));
@@ -1026,8 +1028,26 @@ fn codex_replays_only_exact_model_opaque_reasoning_state() {
         Some(&json!("enc_opaque_payload"))
     );
 
+    for other_scope in [None, Some("openai-responses-siwc-v1:another-grant")] {
+        let body =
+            build_responses_body_for_provider(&request, ApiProvider::OpenaiCodex, other_scope);
+        assert!(!body.to_string().contains("enc_opaque_payload"), "{body}");
+        assert!(!body.to_string().contains(SENTINEL), "{body}");
+    }
+    let mut legacy = request.clone();
+    if let ContentBlock::Thinking {
+        state: Some(state), ..
+    } = &mut legacy.messages[0].content[0]
+    {
+        state.api = "openai-responses".to_string();
+    }
+    let legacy_body =
+        build_responses_body_for_provider(&legacy, ApiProvider::OpenaiCodex, Some(SCOPE));
+    assert!(!legacy_body.to_string().contains("enc_opaque_payload"));
+
     request.model = "gpt-5.6".to_string();
-    let switched_model = build_responses_body_for_provider(&request, ApiProvider::OpenaiCodex);
+    let switched_model =
+        build_responses_body_for_provider(&request, ApiProvider::OpenaiCodex, Some(SCOPE));
     assert!(!switched_model.to_string().contains(SENTINEL));
     assert!(
         switched_model
@@ -1037,7 +1057,8 @@ fn codex_replays_only_exact_model_opaque_reasoning_state() {
         "{switched_model}"
     );
 
-    let switched_provider = build_responses_body_for_provider(&request, ApiProvider::Deepseek);
+    let switched_provider =
+        build_responses_body_for_provider(&request, ApiProvider::Deepseek, None);
     let switched_wire = switched_provider.to_string();
     assert!(!switched_wire.contains(SENTINEL), "{switched_provider}");
     assert!(
@@ -1047,7 +1068,7 @@ fn codex_replays_only_exact_model_opaque_reasoning_state() {
 }
 
 #[tokio::test]
-async fn codex_stream_captures_encrypted_reasoning_as_opaque_state() {
+async fn chatgpt_stream_captures_only_scoped_encrypted_reasoning() {
     let server = MockServer::start().await;
     let sse_body = concat!(
         "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"reasoning\",\"id\":\"rs_1\"}}\n\n",
@@ -1065,32 +1086,44 @@ async fn codex_stream_captures_encrypted_reasoning_as_opaque_state() {
         .mount(&server)
         .await;
 
-    let client = CodewhaleClient::new(&test_codex_config(&server)).unwrap();
-    let mut stream = client
-        .handle_responses_stream(
-            &client
-                .prepare_outbound_request(minimal_responses_request(), true)
-                .expect("responses request prepares"),
-        )
-        .await
-        .unwrap();
-    let mut captured = None;
-    while let Some(event) = stream.next().await {
-        if let StreamEvent::ContentBlockDelta {
-            delta: Delta::ReasoningStateDelta { state },
-            ..
-        } = event.unwrap()
-        {
-            captured = Some(state);
+    for scope in [Some("openai-responses-siwc-v1:verified-test-grant"), None] {
+        let mut client = CodewhaleClient::new(&test_codex_config(&server)).unwrap();
+        // The local HTTP fixture stands in for the official transport; production
+        // obtains this frozen marker only from its selected verified grant.
+        client.chatgpt_reasoning_api = scope.map(str::to_string);
+        let mut stream = client
+            .handle_responses_stream(
+                &client
+                    .prepare_outbound_request(minimal_responses_request(), true)
+                    .expect("responses request prepares"),
+            )
+            .await
+            .unwrap();
+        let mut captured = None;
+        while let Some(event) = stream.next().await {
+            if let StreamEvent::ContentBlockDelta {
+                delta: Delta::ReasoningStateDelta { state },
+                ..
+            } = event.unwrap()
+            {
+                captured = Some(state);
+            }
         }
-    }
 
-    let state = captured.expect("encrypted reasoning state delta");
-    assert_eq!(state.provider, ApiProvider::OpenaiCodex.as_str());
-    assert_eq!(state.api, "openai-responses");
-    assert_eq!(state.model, "gpt-5.5");
-    assert_eq!(state.id.as_deref(), Some("rs_1"));
-    assert_eq!(state.encrypted_content, "enc_state");
+        let Some(scope) = scope else {
+            assert!(
+                captured.is_none(),
+                "a custom API-key route cannot mint grant state"
+            );
+            continue;
+        };
+        let state = captured.expect("encrypted reasoning state delta");
+        assert_eq!(state.provider, ApiProvider::OpenaiCodex.as_str());
+        assert_eq!(state.api, scope);
+        assert_eq!(state.model, "gpt-5.5");
+        assert_eq!(state.id.as_deref(), Some("rs_1"));
+        assert_eq!(state.encrypted_content, "enc_state");
+    }
 }
 
 #[test]
@@ -1387,7 +1420,7 @@ fn responses_input_includes_user_role_tool_results() {
         top_p: None,
     };
 
-    let input = convert_messages_to_responses_input(&request, ApiProvider::OpenaiCodex);
+    let input = convert_messages_to_responses_input(&request, ApiProvider::OpenaiCodex, None);
 
     assert_eq!(input[0]["type"], "function_call");
     assert_eq!(input[0]["call_id"], "call_abc");
@@ -1425,12 +1458,12 @@ fn responses_input_encodes_tool_call_names() {
         top_p: None,
     };
 
-    let input = convert_messages_to_responses_input(&request, ApiProvider::OpenaiCodex);
+    let input = convert_messages_to_responses_input(&request, ApiProvider::OpenaiCodex, None);
 
     assert_eq!(input[0]["type"], "function_call");
     assert_eq!(input[0]["name"], to_api_tool_name("web.run"));
     assert_eq!(input[0]["namespace"], "codewhale");
-    let generic = convert_messages_to_responses_input(&request, ApiProvider::Openai);
+    let generic = convert_messages_to_responses_input(&request, ApiProvider::Openai, None);
     assert!(generic[0].get("namespace").is_none());
 }
 
@@ -1555,7 +1588,7 @@ fn user_image_becomes_an_input_image_item() {
         },
     });
 
-    let items = convert_messages_to_responses_input(&request, ApiProvider::OpenaiCodex);
+    let items = convert_messages_to_responses_input(&request, ApiProvider::OpenaiCodex, None);
 
     let user = items
         .iter()
@@ -1609,7 +1642,7 @@ fn tool_result_image_becomes_native_function_output_content() {
         },
     ];
 
-    let items = convert_messages_to_responses_input(&request, ApiProvider::OpenaiCodex);
+    let items = convert_messages_to_responses_input(&request, ApiProvider::OpenaiCodex, None);
     let output = items
         .iter()
         .find(|item| item["type"] == "function_call_output")
@@ -1654,7 +1687,7 @@ fn responses_input_preserves_system_history_with_the_provider_role() {
         (ApiProvider::OpenaiCodex, "developer"),
         (ApiProvider::Openai, "system"),
     ] {
-        let items = convert_messages_to_responses_input(&request, provider);
+        let items = convert_messages_to_responses_input(&request, provider, None);
         let system = items
             .iter()
             .find(|item| item["role"] == role)

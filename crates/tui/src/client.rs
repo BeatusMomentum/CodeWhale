@@ -326,9 +326,11 @@ pub struct CodewhaleClient {
     /// they must not reconstruct output caps with `None` and discard a custom
     /// route's context window.
     route_limits: Option<RouteLimits>,
-    /// ChatGPT account id captured through the same consent-gated credential
-    /// resolution as the Codex bearer token.
+    /// Verified ChatGPT subject captured with Codewhale's own selected grant.
     pub(super) codex_account_id: Option<String>,
+    /// Opaque reasoning is bound to this verified grant identity, stable across
+    /// token refresh and absent on custom API-key routes.
+    pub(super) chatgpt_reasoning_api: Option<String>,
     wire_format: WireFormat,
     retry: RetryPolicy,
     /// Auxiliary inspection calls use the normal bounded retry schedule but
@@ -625,6 +627,7 @@ impl Clone for CodewhaleClient {
             configured_models: Arc::clone(&self.configured_models),
             route_limits: self.route_limits,
             codex_account_id: self.codex_account_id.clone(),
+            chatgpt_reasoning_api: self.chatgpt_reasoning_api.clone(),
             wire_format: self.wire_format,
             retry: self.retry.clone(),
             isolated_request_state: self.isolated_request_state,
@@ -1601,34 +1604,51 @@ impl CodewhaleClient {
                 || config.provider_uses_custom_endpoint(ApiProvider::OpenaiCodex),
             "Refusing to send an official ChatGPT grant to a different endpoint"
         );
-        // Plan-limit guidance names the account whose credential this client
-        // actually sends, taken from that credential in the same read.
-        let ((api_key, api_key_source), codex_account_id, subscription_limit_guidance) =
-            if api_provider == ApiProvider::OpenaiCodex
-                && crate::pricing::is_official_chatgpt_api(&base_url)
-            {
-                let credentials = config.codex_credentials()?;
-                let guidance = crate::oauth::usage_limit_guidance(
-                    crate::oauth::OAuthProvider::Chatgpt,
-                    credentials.account_label.as_deref(),
-                );
-                (
-                    (credentials.access_token, "ChatGPT sign-in".to_string()),
-                    credentials.account_id,
-                    Some(guidance),
+        // Guidance and opaque-reasoning scope come from the exact owned
+        // credential snapshot this client sends, never a second store read.
+        let (
+            (api_key, api_key_source),
+            codex_account_id,
+            subscription_limit_guidance,
+            chatgpt_reasoning_api,
+        ) = if api_provider == ApiProvider::OpenaiCodex
+            && crate::pricing::is_official_chatgpt_api(&base_url)
+        {
+            let credentials = config.codex_credentials()?;
+            let guidance = crate::oauth::usage_limit_guidance(
+                crate::oauth::OAuthProvider::Chatgpt,
+                credentials.account_label.as_deref(),
+            );
+            let identity = serde_json::to_vec(&(
+                credentials.issuer.as_str(),
+                credentials.client_id.as_str(),
+                credentials
+                    .account_id
+                    .as_deref()
+                    .context("Verified ChatGPT subject is missing")?,
+            ))?;
+            let reasoning_api = format!(
+                "openai-responses-siwc-v1:{}",
+                crate::hashing::sha256_hex(&identity),
+            );
+            (
+                (credentials.access_token, "ChatGPT sign-in".to_string()),
+                credentials.account_id,
+                Some(guidance),
+                Some(reasoning_api),
+            )
+        } else {
+            // Only the resolver's xAI OAuth step carries a sign-in; an
+            // OAuth mode that fell through to an API key names no account.
+            let (resolved, xai_sign_in) = config.active_route_api_key_with_xai_sign_in()?;
+            let guidance = xai_sign_in.map(|label| {
+                crate::oauth::usage_limit_guidance(
+                    crate::oauth::OAuthProvider::Xai,
+                    label.as_deref(),
                 )
-            } else {
-                // Only the resolver's xAI OAuth step carries a sign-in; an
-                // OAuth mode that fell through to an API key names no account.
-                let (resolved, xai_sign_in) = config.active_route_api_key_with_xai_sign_in()?;
-                let guidance = xai_sign_in.map(|label| {
-                    crate::oauth::usage_limit_guidance(
-                        crate::oauth::OAuthProvider::Xai,
-                        label.as_deref(),
-                    )
-                });
-                (resolved, None, guidance)
-            };
+            });
+            (resolved, None, guidance, None)
+        };
         let model_bound_secret_values =
             Arc::new(configured_model_bound_secret_values(config, &api_key));
         // The opt-out is effective only after an explicit startup confirmation;
@@ -1757,6 +1777,7 @@ impl CodewhaleClient {
             configured_models: Arc::new(config.custom_models.clone().unwrap_or_default()),
             route_limits,
             codex_account_id,
+            chatgpt_reasoning_api,
             wire_format,
             retry,
             isolated_request_state: false,
@@ -2747,8 +2768,11 @@ impl CodewhaleClient {
                 ))
             }
             WireFormat::Responses => {
-                let mut body =
-                    responses::build_responses_body_for_provider(&request, self.api_provider);
+                let mut body = responses::build_responses_body_for_provider(
+                    &request,
+                    self.api_provider,
+                    self.chatgpt_reasoning_api.as_deref(),
+                );
                 if let Some(model) = &declared_wire_model {
                     body["model"] = json!(model);
                 }
@@ -6538,9 +6562,9 @@ mod tests {
 
         // Responses (the Codex route where the 0% hit was recorded).
         let parent_body =
-            responses::build_responses_body_for_provider(&parent, ApiProvider::OpenaiCodex);
+            responses::build_responses_body_for_provider(&parent, ApiProvider::OpenaiCodex, None);
         let summary_body =
-            responses::build_responses_body_for_provider(&summary, ApiProvider::OpenaiCodex);
+            responses::build_responses_body_for_provider(&summary, ApiProvider::OpenaiCodex, None);
         assert_extends("responses", &parent_body["input"], &summary_body["input"]);
         for key in ["model", "instructions", "tools", "reasoning", "include"] {
             assert_eq!(
@@ -9205,6 +9229,51 @@ mod tests {
         assert_eq!(
             crate::external_credentials::complete_side_effect_trap_counts(),
             (0, 0, 0, 0, 0)
+        );
+    }
+
+    #[test]
+    fn chatgpt_reasoning_scope_separates_account_workspace_and_custom_routes() {
+        let _env = crate::test_support::lock_test_env();
+        let temp = tempfile::tempdir().unwrap();
+        let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", temp.path());
+        let mut config = Config {
+            provider: Some("openai-codex".into()),
+            ..Default::default()
+        };
+        let mut scopes = Vec::new();
+        for (subject, client_id) in [
+            ("account-a", "oaiapp_workspace_a"),
+            ("account-b", "oaiapp_workspace_a"),
+            ("account-a", "oaiapp_workspace_b"),
+        ] {
+            crate::oauth::install_test_chatgpt_registration_for(&mut config, subject, client_id)
+                .unwrap();
+            let client = CodewhaleClient::new(&config).unwrap();
+            assert_eq!(
+                client.chatgpt_reasoning_api,
+                client.clone().chatgpt_reasoning_api
+            );
+            scopes.push(client.chatgpt_reasoning_api.unwrap());
+        }
+        assert_ne!(scopes[0], scopes[1]);
+        assert_ne!(scopes[0], scopes[2]);
+        assert!(
+            scopes
+                .iter()
+                .all(|scope| scope.starts_with("openai-responses-siwc-v1:")
+                    && !scope.contains("account-"))
+        );
+        let provider = config.provider_config_for_mut(ApiProvider::OpenaiCodex);
+        provider.base_url = Some("http://127.0.0.1:9/v1".into());
+        provider.api_key = Some("configured-fixture-key".into());
+        provider.auth_mode = None;
+        provider.oauth_credential_generation = None;
+        assert!(
+            CodewhaleClient::new(&config)
+                .unwrap()
+                .chatgpt_reasoning_api
+                .is_none()
         );
     }
 

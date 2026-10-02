@@ -1620,12 +1620,61 @@ mod dialect_seam_tests {
             "namespace wrappers are not executable tools"
         );
 
-        let reference = super::super::responses::build_responses_body(&preprocessed(
-            &client,
-            request("gpt-5-codex"),
-        ));
+        let reference = super::super::responses::build_responses_body_for_provider(
+            &preprocessed(&client, request("gpt-5-codex")),
+            ApiProvider::OpenaiCodex,
+            client.chatgpt_reasoning_api.as_deref(),
+        );
         assert_eq!(prepared.body_sha256(), sha256(&canonical_json(&reference)));
         assert_eq!(prepared.body.get("tool_choice"), Some(&json!("auto")));
+    }
+
+    #[test]
+    fn responses_prepared_request_preserves_full_history_for_its_grant() {
+        let client = codex_client();
+        let scope = client.chatgpt_reasoning_api.as_ref().unwrap();
+        let mut request = request("gpt-5-codex");
+        for id in ["first", "second"] {
+            request.messages.push(codewhale_models::Message {
+                role: codewhale_models::Role::Assistant,
+                content: vec![codewhale_models::ContentBlock::Thinking {
+                    thinking: "readable-reasoning-must-stay-local".into(),
+                    signature: None,
+                    state: Some(codewhale_models::OpaqueReasoningState {
+                        provider: "openai-codex".into(),
+                        api: scope.clone(),
+                        model: "gpt-5-codex".into(),
+                        id: Some(id.into()),
+                        encrypted_content: format!("opaque-{id}"),
+                    }),
+                }],
+            });
+        }
+        let prepared = client
+            .prepare_outbound_request(request.clone(), true)
+            .unwrap();
+        let reasoning: Vec<_> = prepared.body["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|item| item["type"] == "reasoning")
+            .collect();
+        assert_eq!(reasoning.len(), 2);
+        assert_eq!(reasoning[0]["encrypted_content"], "opaque-first");
+        assert_eq!(reasoning[1]["encrypted_content"], "opaque-second");
+        assert!(
+            !prepared
+                .body
+                .to_string()
+                .contains("readable-reasoning-must-stay-local")
+        );
+        let mut different_grant = client.clone();
+        different_grant.chatgpt_reasoning_api = Some("openai-responses-siwc-v1:other".into());
+        let rejected = different_grant
+            .prepare_outbound_request(request, true)
+            .unwrap();
+        assert!(!rejected.body.to_string().contains("opaque-first"));
+        assert!(!rejected.body.to_string().contains("opaque-second"));
     }
 
     #[test]

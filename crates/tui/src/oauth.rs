@@ -2076,6 +2076,7 @@ fn registration_from_entry(entry: &OwnedAuthEntry) -> Result<ChatgptRegistration
         registration.issuer == CHATGPT_OAUTH_ISSUER
             && entry.oidc_issuer.as_deref() == Some(registration.issuer.as_str())
             && entry.oidc_client_id.as_deref() == Some(registration.client_id.as_str())
+            && entry.account_id.as_deref() == Some(registration.subject.as_str())
             && valid_issued_chatgpt_client_id(&registration.client_id)
             && !registration.subject.trim().is_empty(),
         "Saved ChatGPT grant does not match its verified registration; sign in again"
@@ -7243,8 +7244,15 @@ consent_version = 1
         let root = home.path().canonicalize().unwrap();
         let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", &root);
         let signer = SiwcSigningFixture::new();
-        let mut config = Config::default();
+        let mut config = Config {
+            provider: Some("openai-codex".into()),
+            ..Default::default()
+        };
         install_test_chatgpt_registration(&mut config).unwrap();
+        let original = get_owned_credentials_read_only(OAuthProvider::Chatgpt, &config).unwrap();
+        let original_scope = crate::client::CodewhaleClient::new(&config)
+            .unwrap()
+            .chatgpt_reasoning_api;
         let path = configured_owned_auth_file_path(OAuthProvider::Chatgpt, &config)
             .unwrap()
             .unwrap();
@@ -7272,6 +7280,13 @@ consent_version = 1
         };
         let refreshed =
             get_owned_credentials_with(OAuthProvider::Chatgpt, &config, &right).unwrap();
+        assert_ne!(original.access_token, refreshed.access_token);
+        assert_eq!(
+            original_scope,
+            crate::client::CodewhaleClient::new(&config)
+                .unwrap()
+                .chatgpt_reasoning_api
+        );
         assert_eq!(refreshed.refresh_token.as_deref(), Some("rotated-refresh"));
         assert_eq!(
             official_chatgpt_registration(&config).unwrap().subject,
@@ -7327,6 +7342,9 @@ consent_version = 1
         let mut file: AuthFile = serde_json::from_str(&raw).unwrap();
         assert_eq!(file.len(), 1);
         let (_, mut entry) = select_entry(OAuthProvider::Chatgpt, &mut file).unwrap();
+        entry.account_id = Some("unverified-account".to_string());
+        assert!(registration_from_entry(&entry).is_err());
+        entry.account_id = Some("next-sub".to_string());
         entry.access_token = Some("unverified-replacement".to_string());
         assert!(registration_from_entry(&entry).is_err());
     }
