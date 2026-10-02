@@ -11984,7 +11984,9 @@ fn computer_use_decisions_always_force_the_card() {
         ApprovalMode::Suggest,
     );
     assert_eq!(
-        crate::core::authority::resolve_approval_request_disposition(&ask, true, false, true),
+        crate::core::authority::resolve_approval_request_disposition(
+            &ask, true, false, true, false
+        ),
         crate::core::authority::ApprovalRequestDisposition::Prompt,
         "a session grant must not pre-answer a forced prompt"
     );

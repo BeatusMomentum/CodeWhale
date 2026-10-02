@@ -1009,9 +1009,9 @@ fn action_families_and_registered_process_or_network_tools_always_force_a_prompt
 }
 
 /// How each existing approval posture resolves what an extension's call needs
-/// (the table in `docs/EXTENSIONS.md`): a prompt is shown only in Ask; a
-/// posture that opens no prompt refuses what is forced, and Full Access
-/// auto-approves the rest as it does for the model.
+/// (the table in `docs/EXTENSIONS.md`): forced extension calls ask in both
+/// Ask and Full Access; Auto-Review and Never refuse them. Full Access
+/// auto-approves ordinary extension calls as it does for the model.
 #[test]
 fn extension_calls_resolve_against_every_posture_as_documented() {
     use crate::core::authority::{
@@ -1035,10 +1035,10 @@ fn extension_calls_resolve_against_every_posture_as_documented() {
         match approval {
             OriginApproval::Unchanged => None,
             OriginApproval::Prompt => Some(resolve_approval_request_disposition(
-                authority, granted, false, false,
+                authority, granted, false, false, true,
             )),
             OriginApproval::ForcePrompt => Some(resolve_approval_request_disposition(
-                authority, granted, false, true,
+                authority, granted, false, true, true,
             )),
         }
     };
@@ -1063,8 +1063,8 @@ fn extension_calls_resolve_against_every_posture_as_documented() {
         resolve(&never, "write_file", true),
         Some(D::AutoDenyNeverPosture)
     );
-    // Shell and network: a prompt every time in Ask, whatever grant exists;
-    // refused where no prompt can open.
+    // Shell and network ask in Ask and Full Access, whatever grant exists.
+    // Explicit no-prompt postures still refuse.
     for name in ["bash", "web_search"] {
         assert_eq!(resolve(&ask, name, false), Some(D::Prompt), "{name}");
         assert_eq!(
@@ -1072,16 +1072,8 @@ fn extension_calls_resolve_against_every_posture_as_documented() {
             Some(D::Prompt),
             "{name}: a grant never satisfies it"
         );
-        assert_eq!(
-            resolve(&full, name, false),
-            Some(D::AutoDenyFullAccessPolicyHold),
-            "{name}"
-        );
-        assert_eq!(
-            resolve(&full, name, true),
-            Some(D::AutoDenyFullAccessPolicyHold),
-            "{name}"
-        );
+        assert_eq!(resolve(&full, name, false), Some(D::Prompt), "{name}");
+        assert_eq!(resolve(&full, name, true), Some(D::Prompt), "{name}");
         assert_eq!(
             resolve(&auto_review, name, false),
             Some(D::AutoDenyAutoReview),

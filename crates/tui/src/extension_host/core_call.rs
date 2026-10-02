@@ -39,9 +39,9 @@
 //! keys are scoped to the extension plugin build
 //! (`approval_cache::extension_origin_approval_keys`), so a grant the user gave
 //! the model never covers an extension's call and the reverse. Shell and
-//! network calls force a prompt: a session grant is not consulted, and a
-//! posture that cannot open a prompt (Full Access, Auto-Review, Never) refuses
-//! them instead of satisfying them (`resolve_approval_request_disposition`).
+//! network calls force a prompt: a session grant is not consulted, and
+//! Full Access still opens their card. Auto-Review and Never refuse them
+//! (`resolve_approval_request_disposition`); explicit denials always win.
 //!
 //! **Caps.** Per invocation: 50 `core/call`s in all (the ticket's uses), 4 at
 //! once (code mode's own cap), and one approval card at a time (the turn

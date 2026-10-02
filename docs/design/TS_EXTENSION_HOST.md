@@ -127,12 +127,12 @@ remains outstanding; programmable pre-execute proposals do not implement it.
   *How "forced" meets the existing postures* (a documented choice, tested in
   `extension_calls_resolve_against_every_posture_as_documented`): the engine
   always raises the card with `approval_force_prompt`; what answers it is
-  `resolve_approval_request_disposition`. Ask: a modal every time, no session
-  grant consulted. Full Access: a forced hold opens no modal and fails closed, so
-  the call is refused and nothing runs (`AutoDenyFullAccessPolicyHold`, the same
-  rule typed ask-rules and the safety floor already follow); the founder's "force
-  a prompt even under Full Access" is realised as "never satisfied by Full
-  Access". Auto-Review and Never: refused as for any hold. Every other call an
+  `resolve_approval_request_disposition`. Ask and Full Access: a modal every
+  time, no session grant consulted. The Engine-minted `extcall:ext:` approval
+  namespace identifies extension-origin calls; host labels cannot select this
+  policy. Explicit session denials still win. Other forced policy holds retain
+  their Full Access refusal. Auto-Review and Never refuse these extension calls
+  as for any hold. Every other call an
   extension makes (Required, not forced) is, in Full Access, auto-approved as the
   model's would be, and in Ask promptable and groupable under the extension's
   own keys.

@@ -408,10 +408,9 @@ tool from a short list (`read`, `read_file`, `list_dir`, `file_search`,
 tool, not what it asks the core to do. Approval keys are scoped to your plugin
 build: a grant the user gave the model for a tool never covers your call of it,
 and a grant for your call never covers the model's. **Shell and network calls
-force a prompt**: a session grant is not consulted, and a posture that cannot
-open a prompt refuses them instead of satisfying them. That is, in Ask the user
-is asked every time; in Full Access (which opens no prompts) the call is
-refused and nothing runs, and so in Auto-Review and Never. In Full Access every
+force a prompt**: a session grant is not consulted. Ask and Full Access
+both ask the user every time; explicit session denials still refuse the call.
+Auto-Review and Never refuse it without opening a card. In Full Access every
 other call an extension makes is auto-approved, as it is for the model.
 `error.code === 'denied'` is the user's "no": do not retry it.
 

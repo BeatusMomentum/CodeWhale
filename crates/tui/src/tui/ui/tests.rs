@@ -33116,3 +33116,84 @@ async fn persisted_queued_native_skill_is_denied_after_host_withdrawal() {
     manager.shutdown().await;
     assert!(queued_message_content_for_app(&app, &restored, None, &mut git).is_err());
 }
+
+/// Extension shell/network cards remain human decisions under Full Access.
+/// Exercise the real stale-request and UI handler path, not only its resolver.
+#[tokio::test]
+async fn full_access_extension_calls_open_human_cards_despite_remembered_grants() {
+    for name in ["bash", "web_search"] {
+        let mut app = ask_posture_app();
+        app.approval_mode = ApprovalMode::Bypass;
+        app.is_loading = true;
+        let input = serde_json::json!({"command": "echo fixture"});
+        let (key, group) = crate::tools::approval_cache::extension_origin_approval_keys(
+            "ext:fixture@reviewed-hash",
+            None,
+            name,
+            &input,
+        );
+        app.approval_session_approved.insert(group.0.clone());
+        let mut mock = mock_engine_handle();
+        drain_approval_event(
+            &mut app,
+            &mock.handle,
+            EngineEvent::ApprovalRequired {
+                id: "extension-core-call".into(),
+                tool_name: name.into(),
+                description: "Requested by extension:fixture".into(),
+                input,
+                approval_key: key.0,
+                approval_grouping_key: group.0,
+                intent_summary: None,
+                approval_force_prompt: true,
+            },
+        )
+        .await;
+        assert_eq!(
+            app.view_stack.top_kind(),
+            Some(ModalKind::Approval),
+            "{name}"
+        );
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(10),
+                mock.recv_approval_decision(),
+            )
+            .await
+            .is_err(),
+            "the posture must not answer for the user: {name}"
+        );
+    }
+}
+
+#[test]
+fn extension_prompt_origin_keeps_denials_and_other_policy_holds() {
+    use crate::core::authority::ApprovalRequestDisposition as D;
+    let mut app = ask_posture_app();
+    app.approval_mode = ApprovalMode::Bypass;
+    let key = "extcall:ext:fixture@hash:shell:key";
+    app.approval_session_denied.insert(key.into());
+    assert_eq!(
+        resolve_ui_approval_disposition(&app, "bash", "group", key, true),
+        D::AutoDenySessionDenied
+    );
+    app.approval_session_denied.clear();
+    assert_eq!(
+        resolve_ui_approval_disposition(&app, "bash", "group", "model-key", true),
+        D::AutoDenyFullAccessPolicyHold
+    );
+    assert_eq!(
+        resolve_ui_approval_disposition(&app, "bash", "group", key, false),
+        D::AutoApprove
+    );
+    app.approval_mode = ApprovalMode::Auto;
+    assert_eq!(
+        resolve_ui_approval_disposition(&app, "bash", "group", key, true),
+        D::AutoDenyAutoReview
+    );
+    app.approval_mode = ApprovalMode::Never;
+    assert_eq!(
+        resolve_ui_approval_disposition(&app, "bash", "group", key, true),
+        D::AutoDenyNeverPosture
+    );
+}

@@ -2265,9 +2265,8 @@ mod tests {
     }
 
     /// A shell call an extension makes forces a prompt in every posture that
-    /// can open one, Full Access included (it reaches the card; what then
-    /// answers it is the posture's disposition,
-    /// `resolve_approval_request_disposition`). The card is Rust's text naming
+    /// can open one, Full Access included. The UI's shared disposition keeps
+    /// that extension-origin card open for the human. The card is Rust's text naming
     /// the extension and its tool, and its keys are the extension's own.
     #[tokio::test]
     async fn an_extensions_shell_call_forces_a_prompt_in_every_posture_and_names_the_extension() {
