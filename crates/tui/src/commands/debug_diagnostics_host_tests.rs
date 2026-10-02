@@ -1134,6 +1134,9 @@ fn test_context_shows_usage_stats() {
 
 #[test]
 fn test_context_report_subcommands_return_source_map() {
+    // The source map reads the user's global instructions and skills: seal the
+    // home so the report does not change with whoever runs the suite.
+    let _home = crate::test_support::SealedHome::new();
     let mut app = create_test_app();
     app.api_messages_mut().push(Message {
         role: Role::User,

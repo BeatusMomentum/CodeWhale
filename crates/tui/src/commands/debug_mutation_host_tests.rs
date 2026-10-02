@@ -284,40 +284,12 @@ fn test_retry_truncates_long_input() {
 #[test]
 fn test_patch_undo_requests_session_resync_after_restore() {
     use crate::snapshot::SnapshotRepo;
-    use crate::test_support::lock_test_env;
     use tempfile::tempdir;
-
-    struct HomeGuard {
-        prev: Option<std::ffi::OsString>,
-        _lock: crate::test_support::TestEnvLock,
-    }
-
-    impl Drop for HomeGuard {
-        fn drop(&mut self) {
-            // SAFETY: process-wide lock still held.
-            unsafe {
-                match self.prev.take() {
-                    Some(v) => std::env::set_var("HOME", v),
-                    None => std::env::remove_var("HOME"),
-                }
-            }
-        }
-    }
-
-    fn scoped_home(home: &std::path::Path) -> HomeGuard {
-        let lock = lock_test_env();
-        let prev = std::env::var_os("HOME");
-        // SAFETY: serialized by the global env lock.
-        unsafe {
-            std::env::set_var("HOME", home);
-        }
-        HomeGuard { prev, _lock: lock }
-    }
 
     let tmp = tempdir().unwrap();
     let workspace = tmp.path().join("ws");
     std::fs::create_dir_all(&workspace).unwrap();
-    let _guard = scoped_home(tmp.path());
+    let _guard = crate::test_support::SealedHome::at(tmp.path());
 
     let repo = SnapshotRepo::open_or_init(&workspace).unwrap();
     std::fs::write(workspace.join("a.txt"), b"original").unwrap();
@@ -376,40 +348,12 @@ fn test_patch_undo_requests_session_resync_after_restore() {
 #[test]
 fn test_undo_legacy_chain_falls_back_to_conversation_only() {
     use crate::snapshot::SnapshotRepo;
-    use crate::test_support::lock_test_env;
     use tempfile::tempdir;
-
-    struct HomeGuard {
-        prev: Option<std::ffi::OsString>,
-        _lock: crate::test_support::TestEnvLock,
-    }
-
-    impl Drop for HomeGuard {
-        fn drop(&mut self) {
-            // SAFETY: process-wide lock still held.
-            unsafe {
-                match self.prev.take() {
-                    Some(v) => std::env::set_var("HOME", v),
-                    None => std::env::remove_var("HOME"),
-                }
-            }
-        }
-    }
-
-    fn scoped_home(home: &std::path::Path) -> HomeGuard {
-        let lock = lock_test_env();
-        let prev = std::env::var_os("HOME");
-        // SAFETY: serialized by the global env lock.
-        unsafe {
-            std::env::set_var("HOME", home);
-        }
-        HomeGuard { prev, _lock: lock }
-    }
 
     let tmp = tempdir().unwrap();
     let workspace = tmp.path().join("ws");
     std::fs::create_dir_all(&workspace).unwrap();
-    let _guard = scoped_home(tmp.path());
+    let _guard = crate::test_support::SealedHome::at(tmp.path());
 
     let repo = SnapshotRepo::open_or_init(&workspace).unwrap();
     let file = workspace.join("a.txt");
@@ -446,40 +390,12 @@ fn test_undo_legacy_chain_falls_back_to_conversation_only() {
 #[test]
 fn test_patch_undo_prunes_tool_turn_context() {
     use crate::snapshot::SnapshotRepo;
-    use crate::test_support::lock_test_env;
     use tempfile::tempdir;
-
-    struct HomeGuard {
-        prev: Option<std::ffi::OsString>,
-        _lock: crate::test_support::TestEnvLock,
-    }
-
-    impl Drop for HomeGuard {
-        fn drop(&mut self) {
-            // SAFETY: process-wide lock still held.
-            unsafe {
-                match self.prev.take() {
-                    Some(v) => std::env::set_var("HOME", v),
-                    None => std::env::remove_var("HOME"),
-                }
-            }
-        }
-    }
-
-    fn scoped_home(home: &std::path::Path) -> HomeGuard {
-        let lock = lock_test_env();
-        let prev = std::env::var_os("HOME");
-        // SAFETY: serialized by the global env lock.
-        unsafe {
-            std::env::set_var("HOME", home);
-        }
-        HomeGuard { prev, _lock: lock }
-    }
 
     let tmp = tempdir().unwrap();
     let workspace = tmp.path().join("ws");
     std::fs::create_dir_all(&workspace).unwrap();
-    let _guard = scoped_home(tmp.path());
+    let _guard = crate::test_support::SealedHome::at(tmp.path());
 
     let repo = SnapshotRepo::open_or_init(&workspace).unwrap();
     let file = workspace.join("a.txt");
@@ -582,40 +498,12 @@ fn test_patch_undo_prunes_tool_turn_context() {
 #[test]
 fn test_patch_undo_prunes_pre_turn_context() {
     use crate::snapshot::SnapshotRepo;
-    use crate::test_support::lock_test_env;
     use tempfile::tempdir;
-
-    struct HomeGuard {
-        prev: Option<std::ffi::OsString>,
-        _lock: crate::test_support::TestEnvLock,
-    }
-
-    impl Drop for HomeGuard {
-        fn drop(&mut self) {
-            // SAFETY: process-wide lock still held.
-            unsafe {
-                match self.prev.take() {
-                    Some(v) => std::env::set_var("HOME", v),
-                    None => std::env::remove_var("HOME"),
-                }
-            }
-        }
-    }
-
-    fn scoped_home(home: &std::path::Path) -> HomeGuard {
-        let lock = lock_test_env();
-        let prev = std::env::var_os("HOME");
-        // SAFETY: serialized by the global env lock.
-        unsafe {
-            std::env::set_var("HOME", home);
-        }
-        HomeGuard { prev, _lock: lock }
-    }
 
     let tmp = tempdir().unwrap();
     let workspace = tmp.path().join("ws");
     std::fs::create_dir_all(&workspace).unwrap();
-    let _guard = scoped_home(tmp.path());
+    let _guard = crate::test_support::SealedHome::at(tmp.path());
 
     let repo = SnapshotRepo::open_or_init(&workspace).unwrap();
     let file = workspace.join("a.txt");
@@ -829,38 +717,12 @@ fn undo_uses_execution_identity_and_preserves_coalesced_result_stamp() {
 #[test]
 fn test_patch_undo_refuses_outside_trusted_mode() {
     use crate::snapshot::SnapshotRepo;
-    use crate::test_support::lock_test_env;
     use tempfile::tempdir;
-
-    struct HomeGuard {
-        prev: Option<std::ffi::OsString>,
-        _lock: crate::test_support::TestEnvLock,
-    }
-    impl Drop for HomeGuard {
-        fn drop(&mut self) {
-            // SAFETY: process-wide lock still held.
-            unsafe {
-                match self.prev.take() {
-                    Some(v) => std::env::set_var("HOME", v),
-                    None => std::env::remove_var("HOME"),
-                }
-            }
-        }
-    }
-    fn scoped_home(home: &std::path::Path) -> HomeGuard {
-        let lock = lock_test_env();
-        let prev = std::env::var_os("HOME");
-        // SAFETY: serialised by the global env lock.
-        unsafe {
-            std::env::set_var("HOME", home);
-        }
-        HomeGuard { prev, _lock: lock }
-    }
 
     let tmp = tempdir().unwrap();
     let workspace = tmp.path().join("ws");
     std::fs::create_dir_all(&workspace).unwrap();
-    let _guard = scoped_home(tmp.path());
+    let _guard = crate::test_support::SealedHome::at(tmp.path());
 
     let repo = SnapshotRepo::open_or_init(&workspace).unwrap();
     std::fs::write(workspace.join("a.txt"), b"original").unwrap();
@@ -893,38 +755,12 @@ fn test_patch_undo_refuses_outside_trusted_mode() {
 #[test]
 fn test_patch_undo_never_crosses_session_boundary() {
     use crate::snapshot::SnapshotRepo;
-    use crate::test_support::lock_test_env;
     use tempfile::tempdir;
-
-    struct HomeGuard {
-        prev: Option<std::ffi::OsString>,
-        _lock: crate::test_support::TestEnvLock,
-    }
-    impl Drop for HomeGuard {
-        fn drop(&mut self) {
-            // SAFETY: process-wide lock still held.
-            unsafe {
-                match self.prev.take() {
-                    Some(v) => std::env::set_var("HOME", v),
-                    None => std::env::remove_var("HOME"),
-                }
-            }
-        }
-    }
-    fn scoped_home(home: &std::path::Path) -> HomeGuard {
-        let lock = lock_test_env();
-        let prev = std::env::var_os("HOME");
-        // SAFETY: serialised by the global env lock.
-        unsafe {
-            std::env::set_var("HOME", home);
-        }
-        HomeGuard { prev, _lock: lock }
-    }
 
     let tmp = tempdir().unwrap();
     let workspace = tmp.path().join("ws");
     std::fs::create_dir_all(&workspace).unwrap();
-    let _guard = scoped_home(tmp.path());
+    let _guard = crate::test_support::SealedHome::at(tmp.path());
 
     let repo = SnapshotRepo::open_or_init(&workspace).unwrap();
     let file = workspace.join("a.txt");
@@ -969,13 +805,11 @@ fn test_patch_undo_never_crosses_session_boundary() {
 /// conversation-only fallback must say so, and say why.
 #[test]
 fn test_undo_reports_that_files_were_not_reverted_when_the_repo_is_unavailable() {
-    use crate::test_support::{EnvVarGuard, lock_test_env};
+    use crate::test_support::SealedHome;
     use tempfile::tempdir;
 
-    let _lock = lock_test_env();
     let tmp = tempdir().unwrap();
-    let _home = EnvVarGuard::set("HOME", tmp.path());
-    let _profile = EnvVarGuard::set("USERPROFILE", tmp.path());
+    let _home = SealedHome::at(tmp.path());
 
     // The home directory itself is refused by the snapshot safety gate, so
     // `patch_undo` cannot open a repo at all.
@@ -1011,36 +845,27 @@ fn test_undo_reports_that_files_were_not_reverted_when_the_repo_is_unavailable()
 }
 
 /// Isolated HOME + workspace for the `/undo` restore tests (#6644).
-// Fields drop in order: the env guards restore before the lock releases.
+// Fields drop in order: the seal restores the environment and releases the
+// lock before the directory it pointed at is deleted.
 struct UndoFixture {
     workspace: PathBuf,
     repo: crate::snapshot::SnapshotRepo,
+    _home: crate::test_support::SealedHome,
     _tmp: tempfile::TempDir,
-    _codewhale_home: crate::test_support::EnvVarGuard,
-    _profile: crate::test_support::EnvVarGuard,
-    _home: crate::test_support::EnvVarGuard,
-    _lock: crate::test_support::TestEnvLock,
 }
 
 impl UndoFixture {
     fn new() -> Self {
-        use crate::test_support::{EnvVarGuard, lock_test_env};
-        let lock = lock_test_env();
         let tmp = tempfile::tempdir().unwrap();
-        let home = EnvVarGuard::set("HOME", tmp.path());
-        let profile = EnvVarGuard::set("USERPROFILE", tmp.path());
-        let codewhale_home = EnvVarGuard::remove("CODEWHALE_HOME");
+        let home = crate::test_support::SealedHome::at(tmp.path());
         let workspace = tmp.path().join("ws");
         std::fs::create_dir_all(&workspace).unwrap();
         let repo = crate::snapshot::SnapshotRepo::open_or_init(&workspace).unwrap();
         Self {
             workspace,
             repo,
-            _tmp: tmp,
-            _codewhale_home: codewhale_home,
-            _profile: profile,
             _home: home,
-            _lock: lock,
+            _tmp: tmp,
         }
     }
 

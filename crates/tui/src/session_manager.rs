@@ -3757,6 +3757,9 @@ pub(crate) fn paths_equivalent(lhs: &Path, rhs: &Path) -> bool {
 /// If an older build already created an empty primary sessions directory, copy
 /// missing legacy entries into it without overwriting newer CodeWhale data.
 pub fn default_sessions_dir() -> std::io::Result<PathBuf> {
+    if let Some(dir) = unsealed_sessions_dir() {
+        return Ok(dir);
+    }
     let dir = codewhale_config::ensure_state_dir("sessions")
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::NotFound, e.to_string()))?;
     match merge_missing_legacy_session_entries(&dir) {
@@ -3777,6 +3780,21 @@ pub fn default_sessions_dir() -> std::io::Result<PathBuf> {
         }
     }
     Ok(dir)
+}
+
+/// `App::new` lists recent sessions, so merely building a fixture reaches the
+/// sessions directory — including the legacy relocation `ensure_state_dir`
+/// performs, which would move a developer's real `~/.deepseek/sessions`.
+/// An unsealed test gets a private directory (and no migration); a sealed one
+/// follows its own environment.
+#[cfg(test)]
+fn unsealed_sessions_dir() -> Option<PathBuf> {
+    crate::test_support::unsealed_state_dir("sessions")
+}
+
+#[cfg(not(test))]
+fn unsealed_sessions_dir() -> Option<PathBuf> {
+    None
 }
 
 fn merge_missing_legacy_session_entries(primary: &Path) -> io::Result<usize> {

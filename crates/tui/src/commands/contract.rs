@@ -3176,10 +3176,17 @@ impl CommandSkillGroupContext for SkillGroupAdapter<'_> {
         if tokio::runtime::Handle::try_current().is_err() {
             return restore();
         }
+        // A sealed test's home must follow the work onto the blocking pool.
+        #[cfg(test)]
+        let ticket = crate::test_support::env_scope_ticket();
         run_async(async move {
-            tokio::task::spawn_blocking(restore)
-                .await
-                .map_err(|error| format!("Restore task failed: {error}"))?
+            tokio::task::spawn_blocking(move || {
+                #[cfg(test)]
+                let _membership = crate::test_support::join_env_scope(ticket);
+                restore()
+            })
+            .await
+            .map_err(|error| format!("Restore task failed: {error}"))?
         })
     }
 
@@ -5885,37 +5892,10 @@ mod tests {
 
     // ─── FEAT-022 skill-group adapter tests ───────────────────────────────────
 
-    /// Pins HOME to a tempdir for the duration of the test under the
+    /// Seals the user's home for the duration of the test under the
     /// crate-wide env mutex (keeps global skill/snapshot discovery hermetic).
-    struct ScopedHome {
-        prev: Option<std::ffi::OsString>,
-        _home: TempDir,
-        _guard: crate::test_support::TestEnvLock,
-    }
-    impl Drop for ScopedHome {
-        fn drop(&mut self) {
-            // SAFETY: process-wide lock still held.
-            unsafe {
-                match self.prev.take() {
-                    Some(v) => std::env::set_var("HOME", v),
-                    None => std::env::remove_var("HOME"),
-                }
-            }
-        }
-    }
-    fn scoped_home(_workspace: &TempDir) -> ScopedHome {
-        let guard = crate::test_support::lock_test_env();
-        let prev = std::env::var_os("HOME");
-        let home = TempDir::new().expect("home tempdir");
-        // SAFETY: serialised by the global env lock.
-        unsafe {
-            std::env::set_var("HOME", home.path());
-        }
-        ScopedHome {
-            prev,
-            _home: home,
-            _guard: guard,
-        }
+    fn scoped_home(_workspace: &TempDir) -> crate::test_support::SealedHome {
+        crate::test_support::SealedHome::new()
     }
 
     /// The fixture's skills dir lives inside its workspace, so the workspace

@@ -11660,9 +11660,7 @@ fn skill_entry_is_bundled_requires_configured_bundle_path() {
 #[test]
 fn resolve_skills_dir_rejects_symlink_escaping_workspace() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let _env_lock = crate::test_support::lock_test_env();
-    let _home = crate::test_support::EnvVarGuard::set("HOME", tmp.path());
-    let _userprofile = crate::test_support::EnvVarGuard::set("USERPROFILE", tmp.path());
+    let _home = crate::test_support::SealedHome::at(tmp.path());
     let workspace_root = tmp.path().join("workspace");
     let escape_target = tmp.path().join("escape_target");
     fs::create_dir_all(&workspace_root).expect("create workspace");
@@ -11693,9 +11691,7 @@ fn resolve_skills_dir_rejects_symlink_escaping_workspace() {
 #[test]
 fn resolve_skills_dir_ignores_untrusted_workspace_skills() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let _env_lock = crate::test_support::lock_test_env();
-    let _home = crate::test_support::EnvVarGuard::set("HOME", tmp.path());
-    let _userprofile = crate::test_support::EnvVarGuard::set("USERPROFILE", tmp.path());
+    let _home = crate::test_support::SealedHome::at(tmp.path());
     let codewhale_only = Config {
         skills: Some(crate::config::SkillsConfig {
             scan_codewhale_only: Some(true),
@@ -11742,9 +11738,7 @@ fn resolve_skills_dir_ignores_untrusted_workspace_skills() {
 #[test]
 fn resolve_skills_dir_rejects_codewhale_only_symlink_escaping_workspace() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let _env_lock = crate::test_support::lock_test_env();
-    let _home = crate::test_support::EnvVarGuard::set("HOME", tmp.path());
-    let _userprofile = crate::test_support::EnvVarGuard::set("USERPROFILE", tmp.path());
+    let _home = crate::test_support::SealedHome::at(tmp.path());
     let workspace_root = tmp.path().join("workspace");
     let escape_target = tmp.path().join("escape_target");
     fs::create_dir_all(&workspace_root).expect("create workspace");

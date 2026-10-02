@@ -503,7 +503,6 @@ mod tests {
     use crate::tui::app::{App, AppAction, TuiOptions};
     use crate::tui::work_surface::{RailPanel, WorkSurfacePlacement};
     use codewhale_localization::{Locale, MessageId};
-    use std::ffi::OsString;
     use std::path::{Path, PathBuf};
     use tempfile::tempdir;
 
@@ -1554,35 +1553,24 @@ mod tests {
         assert!(deepseek_result.action.is_none());
     }
 
+    /// Seals the user's home *and* points the config at the fixture's own
+    /// file. Dispatching every command reaches credentials, sessions, snapshots,
+    /// plugin bundles, audit logs and the `/import-claude` report — all of which
+    /// resolve under the home, so pinning the config path alone (as this once
+    /// did) left them on the developer's real profile.
     struct ConfigPathGuard {
-        previous: Option<OsString>,
-        _lock: crate::test_support::TestEnvLock,
+        // Fields drop in order: restore the config path, then the seal.
+        _config_path: crate::test_support::EnvVarGuard,
+        _home: crate::test_support::SealedHome,
     }
 
     impl ConfigPathGuard {
         fn new(config_path: &Path) -> Self {
-            let lock = crate::test_support::lock_test_env();
-            let previous = std::env::var_os("DEEPSEEK_CONFIG_PATH");
-            // Safety: test-only environment mutation guarded by a global mutex.
-            unsafe {
-                std::env::set_var("DEEPSEEK_CONFIG_PATH", config_path);
-            }
+            let home = crate::test_support::SealedHome::new();
+            let config = crate::test_support::EnvVarGuard::set("DEEPSEEK_CONFIG_PATH", config_path);
             Self {
-                previous,
-                _lock: lock,
-            }
-        }
-    }
-
-    impl Drop for ConfigPathGuard {
-        fn drop(&mut self) {
-            // Safety: test-only environment mutation guarded by a global mutex.
-            unsafe {
-                if let Some(previous) = self.previous.take() {
-                    std::env::set_var("DEEPSEEK_CONFIG_PATH", previous);
-                } else {
-                    std::env::remove_var("DEEPSEEK_CONFIG_PATH");
-                }
+                _config_path: config,
+                _home: home,
             }
         }
     }
@@ -2414,36 +2402,9 @@ mod tests {
     // is asserted by the migration fixtures and live gate.
     // ---------------------------------------------------------------------
 
-    /// Pins HOME to a tempdir so global skill discovery stays hermetic.
-    struct Feat022ScopedHome {
-        prev: Option<std::ffi::OsString>,
-        _home: tempfile::TempDir,
-        _guard: crate::test_support::TestEnvLock,
-    }
-    impl Drop for Feat022ScopedHome {
-        fn drop(&mut self) {
-            // SAFETY: process-wide lock still held.
-            unsafe {
-                match self.prev.take() {
-                    Some(v) => std::env::set_var("HOME", v),
-                    None => std::env::remove_var("HOME"),
-                }
-            }
-        }
-    }
-    fn feat022_scoped_home(_tmp: &tempfile::TempDir) -> Feat022ScopedHome {
-        let guard = crate::test_support::lock_test_env();
-        let prev = std::env::var_os("HOME");
-        let home = tempfile::TempDir::new().expect("home tempdir");
-        // SAFETY: serialised by the global env lock.
-        unsafe {
-            std::env::set_var("HOME", home.path());
-        }
-        Feat022ScopedHome {
-            prev,
-            _home: home,
-            _guard: guard,
-        }
+    /// Seals the user's home so global skill discovery stays hermetic.
+    fn feat022_scoped_home(_tmp: &tempfile::TempDir) -> crate::test_support::SealedHome {
+        crate::test_support::SealedHome::new()
     }
 
     fn feat022_test_app(tmp: &tempfile::TempDir) -> App {
@@ -2753,6 +2714,7 @@ mod tests {
 
     #[test]
     fn feat020_plugin_dispatches_through_public_seam() {
+        let _home = crate::test_support::SealedHome::new();
         let tmpdir = tempfile::TempDir::new().unwrap();
         let mut app = plugin_test_app(&tmpdir);
 
@@ -2776,6 +2738,7 @@ mod tests {
 
     #[test]
     fn feat020_public_dispatch_never_panics_on_plugin_commands() {
+        let _home = crate::test_support::SealedHome::new();
         let tmpdir = tempfile::TempDir::new().unwrap();
         let mut app = plugin_test_app(&tmpdir);
         for command in [
@@ -2900,6 +2863,7 @@ mod tests {
 
     #[test]
     fn feat023_lifecycle_commands_dispatch_through_public_seam() {
+        let _home = crate::test_support::SealedHome::new();
         let mut app = create_test_app();
         app.workspace = PathBuf::from(".");
 
@@ -2953,6 +2917,7 @@ mod tests {
 
     #[test]
     fn feat024_control_commands_dispatch_through_public_seam() {
+        let _home = crate::test_support::SealedHome::new();
         let mut app = create_test_app();
         app.workspace = PathBuf::from(".");
 

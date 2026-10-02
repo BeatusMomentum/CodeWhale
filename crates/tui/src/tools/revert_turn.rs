@@ -144,34 +144,13 @@ fn short_sha(sha: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::lock_test_env;
     use tempfile::tempdir;
 
-    /// Pins HOME to a tempdir for the duration of the test under the
-    /// process-wide env mutex (`crate::test_support::lock_test_env`).
-    struct HomeGuard {
-        prev: Option<std::ffi::OsString>,
-        _lock: crate::test_support::TestEnvLock,
-    }
-    impl Drop for HomeGuard {
-        fn drop(&mut self) {
-            // SAFETY: process-wide lock still held.
-            unsafe {
-                match self.prev.take() {
-                    Some(v) => std::env::set_var("HOME", v),
-                    None => std::env::remove_var("HOME"),
-                }
-            }
-        }
-    }
-    fn scoped_home(home: &std::path::Path) -> HomeGuard {
-        let lock = lock_test_env();
-        let prev = std::env::var_os("HOME");
-        // SAFETY: serialised by the global env lock.
-        unsafe {
-            std::env::set_var("HOME", home);
-        }
-        HomeGuard { prev, _lock: lock }
+    /// Seals the user's home onto `home` for the duration of the test. Pinning
+    /// `HOME` alone left an ambient `CODEWHALE_HOME` in charge of the snapshot
+    /// store.
+    fn scoped_home(home: &std::path::Path) -> crate::test_support::SealedHome {
+        crate::test_support::SealedHome::at(home)
     }
 
     #[tokio::test]
