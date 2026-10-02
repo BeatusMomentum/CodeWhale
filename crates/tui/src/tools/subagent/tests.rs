@@ -11516,6 +11516,34 @@ fn persist_state_rejects_symlinked_state_directory() {
     );
 }
 
+/// A linked `.codewhale` must be refused before anything is created: the
+/// coordination lock used to `create_dir_all` through the link first.
+#[cfg(unix)]
+#[test]
+fn coordination_lock_refuses_linked_codewhale_without_writing_through_it() {
+    let tmp = tempdir().expect("tempdir");
+    let workspace = tmp.path().join("workspace");
+    let outside = tmp.path().join("outside");
+    std::fs::create_dir_all(&workspace).expect("mkdir workspace");
+    std::fs::create_dir_all(&outside).expect("mkdir outside");
+    std::os::unix::fs::symlink(&outside, workspace.join(".codewhale")).expect("link .codewhale");
+
+    let Err(err) = CoordinationProcessLock::acquire(&workspace) else {
+        panic!("a linked .codewhale must be refused");
+    };
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("must not traverse symlinks")
+            || message.contains("must stay within state root"),
+        "{message}"
+    );
+    assert_eq!(
+        std::fs::read_dir(&outside).expect("read outside").count(),
+        0,
+        "nothing may be created through the link"
+    );
+}
+
 #[test]
 fn test_interrupted_status_name_and_summary() {
     let snapshot = make_snapshot(SubAgentStatus::Interrupted(

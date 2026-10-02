@@ -467,8 +467,7 @@
     "std_fs": 1
   },
   "crates/tui/src/tools/workflow/journal.rs": {
-    "path_canonicalize": 2,
-    "std_fs": 4
+    "path_canonicalize": 2
   },
   "crates/tui/src/tools/workflow/mod.rs": {
     "path_canonicalize": 4,

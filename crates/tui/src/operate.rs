@@ -1057,12 +1057,7 @@ impl OperationStore {
     }
 
     fn open_lock_file(&self) -> Result<fs::File> {
-        fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&self.lock_path)
+        crate::session_manager::open_private_lock_file(&self.lock_path)
             .with_context(|| format!("Failed to open {}", self.lock_path.display()))
     }
 
@@ -1662,6 +1657,19 @@ api_key_env = "CW_OPERATE_MISSING_TEST_KEY"
                 .filter(|member| member.id == "lead")
                 .all(|member| member.model == "auto")
         );
+        Ok(())
+    }
+
+    /// The cross-process lock sidecar is owner-only like the operation file.
+    #[cfg(unix)]
+    #[test]
+    fn operation_lock_file_is_owner_only() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = TempDir::new()?;
+        let store = OperationStore::open(root.path())?;
+        start_operation(&store, root.path(), None, None, true, "auto")?;
+        let lock = root.path().join("current.json.lock");
+        assert_eq!(fs::metadata(&lock)?.permissions().mode() & 0o777, 0o600);
         Ok(())
     }
 

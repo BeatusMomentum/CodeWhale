@@ -134,7 +134,9 @@ fn normalize_managed_dir(path: PathBuf) -> std::io::Result<PathBuf> {
     std::env::current_dir().map(|cwd| cwd.join(path))
 }
 
-fn open_private_lock_file(path: &Path) -> io::Result<fs::File> {
+/// Open (creating if needed) an advisory-lock sidecar that is owner-only
+/// (0600), one regular link, and never followed through a symlink.
+pub(crate) fn open_private_lock_file(path: &Path) -> io::Result<fs::File> {
     let mut options = OpenOptions::new();
     options.create(true).read(true).write(true);
     #[cfg(unix)]

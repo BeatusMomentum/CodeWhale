@@ -3570,6 +3570,9 @@ impl CoordinationProcessLock {
     fn acquire(state_root: &Path) -> Result<Self> {
         let requested_root = normalize_subagent_workspace(state_root);
         let lock_dir = requested_root.join(".codewhale").join("state");
+        // Refuse a linked `.codewhale` or `state` before creating anything:
+        // `create_dir_all` follows links and would populate the target.
+        reject_root_relative_symlinks(&requested_root, &lock_dir.join(SUBAGENT_STATE_LOCK_FILE))?;
         fs::create_dir_all(&lock_dir)?;
         // Creating a missing root can change its canonical spelling on
         // Windows (for example by adding a `\\?\` prefix). Re-resolve both

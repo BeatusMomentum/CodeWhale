@@ -165,14 +165,34 @@ fn powershell_prefers_script_file(shell_command: &str) -> bool {
 /// command behaves the same whether it travels as `-Command` or `-File`.
 /// Group Policy scopes still take precedence; see the module's known
 /// limitations.
+///
+/// `CODEWHALE_POWERSHELL_EXECUTION_POLICY=inherit` omits the flag so the
+/// machine/user policy applies instead (#6745). Unset, `bypass`, or any other
+/// value keeps the default.
 fn powershell_base_args() -> Vec<String> {
-    vec![
+    powershell_base_args_for_policy(
+        std::env::var(POWERSHELL_EXECUTION_POLICY_ENV)
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// Environment variable that opts out of the process-scope policy bypass.
+const POWERSHELL_EXECUTION_POLICY_ENV: &str = "CODEWHALE_POWERSHELL_EXECUTION_POLICY";
+
+/// [`powershell_base_args`] with the opt-out value passed in, so the decision
+/// is testable without touching the process environment.
+fn powershell_base_args_for_policy(setting: Option<&str>) -> Vec<String> {
+    let mut args = vec![
         "-NoLogo".to_string(),
         "-NoProfile".to_string(),
         "-NonInteractive".to_string(),
-        "-ExecutionPolicy".to_string(),
-        "Bypass".to_string(),
-    ]
+    ];
+    if !setting.is_some_and(|value| value.trim().eq_ignore_ascii_case("inherit")) {
+        args.push("-ExecutionPolicy".to_string());
+        args.push("Bypass".to_string());
+    }
+    args
 }
 
 /// Wrap a model/user PowerShell command so native program failures surface
@@ -717,6 +737,34 @@ mod tests {
             if args[payload_flag] == "-File" {
                 let _ = std::fs::remove_file(&args[payload_flag + 1]);
             }
+        }
+    }
+
+    /// #6745: `inherit` is the only value that drops the process-scope bypass;
+    /// unset, `bypass`, and anything unrecognised keep it. Tested on the pure
+    /// decision so no test mutates the process environment.
+    #[test]
+    fn powershell_execution_policy_opt_out_only_honours_inherit() {
+        let bypass = |args: &[String]| {
+            args.iter()
+                .position(|a| a == "-ExecutionPolicy")
+                .map(|index| args[index + 1].clone())
+        };
+        for setting in [
+            None,
+            Some("bypass"),
+            Some("Bypass"),
+            Some(""),
+            Some("restricted"),
+        ] {
+            let args = powershell_base_args_for_policy(setting);
+            assert_eq!(bypass(&args).as_deref(), Some("Bypass"), "{setting:?}");
+            assert!(args.contains(&"-NonInteractive".to_string()), "{setting:?}");
+        }
+        for setting in ["inherit", "INHERIT", " inherit "] {
+            let args = powershell_base_args_for_policy(Some(setting));
+            assert_eq!(bypass(&args), None, "{setting:?}: {args:?}");
+            assert_eq!(args, ["-NoLogo", "-NoProfile", "-NonInteractive"]);
         }
     }
 

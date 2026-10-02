@@ -1502,6 +1502,10 @@ pub(crate) async fn run_backend_search(
     }
 }
 
+/// Share of the search budget a DuckDuckGo request may use when Bing is allowed
+/// to answer after it (#6746).
+const DUCKDUCKGO_BUDGET_SHARE: f64 = 0.6;
+
 #[derive(Clone, Copy)]
 struct ScrapeEndpoints<'a> {
     bing: &'a str,
@@ -1548,9 +1552,11 @@ async fn run_scrape_search_with_endpoints(
     context: &ToolContext,
     endpoints: ScrapeEndpoints<'_>,
 ) -> Result<BackendSearch, ToolError> {
+    let started = Instant::now();
+    let budget = Duration::from_millis(timeout_ms);
     let decider = context.network_policy.as_ref();
     let client = crate::tls::reqwest_client_builder()
-        .timeout(Duration::from_millis(timeout_ms))
+        .timeout(budget)
         .user_agent(USER_AGENT)
         .build()
         .map_err(|error| {
@@ -1561,7 +1567,8 @@ async fn run_scrape_search_with_endpoints(
 
     if provider == SearchProvider::Bing {
         check_policy(decider, BING_HOST)?;
-        let results = run_bing_search(&client, &query.query, max_results, endpoints.bing).await?;
+        let results =
+            run_bing_search(&client, &query.query, max_results, endpoints.bing, budget).await?;
         return Ok(BackendSearch {
             backend: BackendId::Bing,
             source: "bing".to_string(),
@@ -1578,7 +1585,20 @@ async fn run_scrape_search_with_endpoints(
         .allow_bing_fallback
         .unwrap_or_else(|| duckduckgo_allows_bing_fallback(context.search_base_url.as_deref()));
     check_policy(decider, &duckduckgo_host)?;
-    let fetched = fetch_duckduckgo_html(&client, &url).await;
+    // #6746: a hanging DuckDuckGo must leave the Bing fallback time to answer.
+    // When Bing may follow, DuckDuckGo gets a share of the budget and Bing
+    // the remainder; without the fallback DuckDuckGo keeps the whole budget.
+    let duckduckgo_budget = if allow_bing_fallback {
+        budget.mul_f64(DUCKDUCKGO_BUDGET_SHARE)
+    } else {
+        budget
+    };
+    let fetched = fetch_duckduckgo_html(&client, &url, duckduckgo_budget).await;
+    let bing_budget = || {
+        budget
+            .saturating_sub(started.elapsed())
+            .max(Duration::from_millis(1))
+    };
     let body = match fetched {
         Ok(body) => body,
         // #6746: an unreachable DuckDuckGo (connection error, timeout, or a
@@ -1587,7 +1607,15 @@ async fn run_scrape_search_with_endpoints(
         // error; otherwise the original failure is reported.
         Err(error) if allow_bing_fallback => {
             check_policy(decider, BING_HOST)?;
-            return match run_bing_search(&client, &query.query, max_results, endpoints.bing).await {
+            return match run_bing_search(
+                &client,
+                &query.query,
+                max_results,
+                endpoints.bing,
+                bing_budget(),
+            )
+            .await
+            {
                 Ok(results) if !results.is_empty() => {
                     degraded.push(DegradedReason::BackendUnavailable {
                         backend: BackendId::DuckDuckGo,
@@ -1658,7 +1686,15 @@ async fn run_scrape_search_with_endpoints(
     }
 
     check_policy(decider, BING_HOST)?;
-    match run_bing_search(&client, &query.query, max_results, endpoints.bing).await {
+    match run_bing_search(
+        &client,
+        &query.query,
+        max_results,
+        endpoints.bing,
+        bing_budget(),
+    )
+    .await
+    {
         Ok(results) if !results.is_empty() => {
             degraded.push(DegradedReason::ScrapeFallback {
                 from: BackendId::DuckDuckGo,
@@ -1696,9 +1732,14 @@ async fn run_scrape_search_with_endpoints(
 
 /// Fetch the DuckDuckGo HTML results page. A transport failure or a non-2xx
 /// status is an error so the caller can decide whether Bing may answer.
-async fn fetch_duckduckgo_html(client: &reqwest::Client, url: &str) -> Result<String, String> {
+async fn fetch_duckduckgo_html(
+    client: &reqwest::Client,
+    url: &str,
+    timeout: Duration,
+) -> Result<String, String> {
     let resp = client
         .get(url)
+        .timeout(timeout)
         .header(
             "Accept",
             "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -2372,12 +2413,14 @@ async fn run_bing_search(
     query: &str,
     max_results: usize,
     endpoint: &str,
+    timeout: Duration,
 ) -> Result<Vec<WebSearchEntry>, ToolError> {
     let mut url = reqwest::Url::parse(endpoint)
         .map_err(|error| ToolError::invalid_input(format!("Invalid Bing endpoint: {error}")))?;
     url.query_pairs_mut().append_pair("q", query);
     let resp = client
         .get(url)
+        .timeout(timeout)
         .header(
             "Accept",
             "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -4676,6 +4719,139 @@ mod tests {
             panic!("no fallback means the HTTP failure surfaces");
         };
         assert!(error.to_string().contains("HTTP 503"), "{error}");
+    }
+
+    /// #6746: a DuckDuckGo that accepts the connection and then hangs must not
+    /// eat the whole budget; Bing answers inside the same total.
+    #[tokio::test]
+    async fn hanging_duckduckgo_leaves_bing_time_inside_the_total_budget() {
+        use crate::config::SearchProvider;
+        use crate::tools::spec::ToolContext;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/html/"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(30)))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/bing"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"
+                <ol><li class="b_algo">
+                  <h2><a href="https://example.com/after-hang">After the hang</a></h2>
+                  <div class="b_caption"><p>Bing answered after DuckDuckGo hung.</p></div>
+                </li></ol>
+                "#,
+            ))
+            .mount(&server)
+            .await;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut context = ToolContext::new(tmp.path().to_path_buf());
+        context.search_provider = SearchProvider::DuckDuckGo;
+        context.search_base_url = Some(format!("{}/html/", server.uri()));
+        let query = SearchQuery::new("hang".to_string(), 5, None, Vec::new(), None);
+        let budget = Duration::from_millis(3_000);
+        let started = Instant::now();
+        let outcome = tokio::time::timeout(
+            budget,
+            run_scrape_search_with_endpoints(
+                SearchProvider::DuckDuckGo,
+                &query,
+                3_000,
+                &context,
+                ScrapeEndpoints {
+                    bing: &format!("{}/bing", server.uri()),
+                    allow_bing_fallback: Some(true),
+                },
+            ),
+        )
+        .await
+        .expect("the whole search must finish inside its budget");
+        let raw = outcome.expect("Bing fallback should answer after DuckDuckGo hangs");
+
+        assert_eq!(raw.backend, BackendId::Bing);
+        assert_eq!(raw.results.len(), 1);
+        assert!(started.elapsed() < budget, "{:?}", started.elapsed());
+        assert!(
+            raw.degraded.contains(&DegradedReason::BackendUnavailable {
+                backend: BackendId::DuckDuckGo
+            }),
+            "{:?}",
+            raw.degraded
+        );
+    }
+
+    /// #6746: a custom `search_base_url` keeps no public fallback and keeps the
+    /// whole budget: a slow private endpoint is waited for, and Bing is never
+    /// contacted, whether the endpoint answers late or hangs.
+    #[tokio::test]
+    async fn custom_base_url_keeps_full_budget_and_never_reaches_bing() {
+        use crate::config::SearchProvider;
+        use crate::tools::spec::ToolContext;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let query = SearchQuery::new("private".to_string(), 5, None, Vec::new(), None);
+        for (delay, expect_results) in [
+            (Duration::from_millis(1_500), true),
+            (Duration::from_secs(30), false),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/html/"))
+                .respond_with(ResponseTemplate::new(200).set_delay(delay).set_body_string(
+                    r#"
+                            <html><body>
+                              <a class="result__a" href="https://example.com/private">Private</a>
+                              <div class="result__snippet">Private result</div>
+                            </body></html>
+                            "#,
+                ))
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/bing"))
+                .respond_with(ResponseTemplate::new(200))
+                .mount(&server)
+                .await;
+
+            let mut context = ToolContext::new(tmp.path().to_path_buf());
+            context.search_provider = SearchProvider::DuckDuckGo;
+            context.search_base_url = Some(format!("{}/html/", server.uri()));
+            // 60% of 2s would be 1.2s: a 1.5s answer only arrives if the
+            // private endpoint kept the whole budget.
+            let outcome = run_scrape_search_with_endpoints(
+                SearchProvider::DuckDuckGo,
+                &query,
+                2_000,
+                &context,
+                ScrapeEndpoints {
+                    bing: &format!("{}/bing", server.uri()),
+                    allow_bing_fallback: None,
+                },
+            )
+            .await;
+            if expect_results {
+                let raw = outcome.expect("a slow private endpoint keeps its full budget");
+                assert_eq!(raw.backend, BackendId::DuckDuckGo);
+                assert_eq!(raw.results.len(), 1);
+            } else {
+                assert!(outcome.is_err(), "a hanging private endpoint is an error");
+            }
+            let bing_requests = server
+                .received_requests()
+                .await
+                .expect("recorded requests")
+                .iter()
+                .filter(|request| request.url.path() == "/bing")
+                .count();
+            assert_eq!(bing_requests, 0, "custom base URL must not reach Bing");
+        }
     }
 
     #[tokio::test]

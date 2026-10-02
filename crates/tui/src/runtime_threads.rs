@@ -6381,7 +6381,13 @@ fn run_owner_lock_test_hook(point: OwnerLockTestPoint) {
 #[derive(Debug)]
 pub(crate) struct RuntimeProcessOwnerLock {
     _file: File,
+    /// Set once [`Self::record_holder`] wrote a holder record, so `Drop` clears
+    /// it before the lock is released instead of leaving a stale pid behind.
+    holder_recorded: bool,
 }
+
+/// Upper bound on the bytes read back from a lock file's holder record.
+const OWNER_LOCK_HOLDER_MAX_BYTES: u64 = 128;
 
 impl RuntimeProcessOwnerLock {
     /// Reuse the Runtime's protected OS lease for task-store ownership. A
@@ -6409,7 +6415,10 @@ impl RuntimeProcessOwnerLock {
                 }
             }
             if owner_lock_is_at_path(&file, path)? {
-                return Ok(Some(Self { _file: file }));
+                return Ok(Some(Self {
+                    _file: file,
+                    holder_recorded: false,
+                }));
             }
             // Moved out of this store between open and lock: reopen.
         }
@@ -6453,12 +6462,62 @@ impl RuntimeProcessOwnerLock {
                 }
             }
             if owner_lock_is_at_path(&file, &path)? {
-                return Ok(Self { _file: file });
+                return Ok(Self {
+                    _file: file,
+                    holder_recorded: false,
+                });
             }
             // A maintenance move renamed the file out of this store between
             // our open and our lock; the lock we hold is on the moved store.
         }
         Err(Self::held_error())
+    }
+
+    /// Write this process's pid and the acquisition time into the lock file so
+    /// a contender that finds the lock busy can say who holds it (#6573).
+    /// Best effort: diagnostics must never fail the lock holder.
+    pub(crate) fn record_holder(&mut self) {
+        let since_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_millis());
+        let record = format!("pid={} since_ms={since_ms}\n", std::process::id());
+        let mut file = &self._file;
+        let written = file
+            .set_len(0)
+            .and_then(|()| file.seek(SeekFrom::Start(0)).map(|_| ()))
+            .and_then(|()| file.write_all(record.as_bytes()));
+        match written {
+            Ok(()) => self.holder_recorded = true,
+            Err(error) => tracing::debug!(%error, "Could not record lock holder"),
+        }
+    }
+
+    /// Read the holder recorded by [`Self::record_holder`]: its pid and how
+    /// long it has held the lock. Never blocks (advisory locks do not stop
+    /// reads) and never fails: anything unreadable or malformed is `None`.
+    pub(crate) fn read_holder(path: &Path) -> Option<(u32, Duration)> {
+        let file = open_runtime_store_file(path, "Owner lock holder record", |options| {
+            options.read(true);
+        })
+        .ok()?;
+        let mut text = String::new();
+        file.take(OWNER_LOCK_HOLDER_MAX_BYTES)
+            .read_to_string(&mut text)
+            .ok()?;
+        let mut pid = None;
+        let mut since_ms = None;
+        for field in text.split_whitespace() {
+            match field.split_once('=') {
+                Some(("pid", value)) => pid = value.parse::<u32>().ok(),
+                Some(("since_ms", value)) => since_ms = value.parse::<u64>().ok(),
+                _ => {}
+            }
+        }
+        let since = std::time::UNIX_EPOCH + Duration::from_millis(since_ms?);
+        let held_for = std::time::SystemTime::now()
+            .duration_since(since)
+            .unwrap_or_default();
+        Some((pid?, held_for))
     }
 
     /// A held lock is typed `WouldBlock` so callers (the credential scrub,
@@ -6507,6 +6566,10 @@ impl RuntimeProcessOwnerLock {
 
 impl Drop for RuntimeProcessOwnerLock {
     fn drop(&mut self) {
+        if self.holder_recorded {
+            // Best effort: a stale pid must not outlive the lock it described.
+            let _ = self._file.set_len(0);
+        }
         // close() also releases, but unlocking first lets a same-process
         // reopen proceed without racing the previous fd's teardown (#5735).
         #[cfg(unix)]
