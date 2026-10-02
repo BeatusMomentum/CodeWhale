@@ -1,6 +1,6 @@
 //! Additive, reviewed extension prompt contributions to the existing Engine prompt.
 //!
-//! There is no prompt store or renderer here. Each turn captures sections from
+//! There is no prompt store or turn loop here. Each turn captures sections from
 //! its own attachment, validates the Native receipt, and rechecks owner and
 //! attachment after that asynchronous check. The Engine records the captured
 //! block through its existing context-update path and keeps the turn's prefix
@@ -38,16 +38,14 @@ fn selected(
     registry: &OwnerRegistry,
     desired: &BTreeMap<String, String>,
 ) -> Vec<PromptSectionRegistration> {
-    let mut sections: Vec<_> = registry
+    registry
         .live_prompt_sections()
         .into_iter()
         .filter(|section| {
             section.tier == HostTier::Plugin
                 && desired.get(&section.owner.plugin_id) == Some(&section.content_hash)
         })
-        .collect();
-    sections.sort_by(|a, b| (&a.owner.plugin_id, &a.id).cmp(&(&b.owner.plugin_id, &b.id)));
-    sections
+        .collect()
 }
 
 impl HostAttachment {
