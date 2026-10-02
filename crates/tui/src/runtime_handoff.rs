@@ -187,7 +187,7 @@ const MCP_SERVER_INSTRUCTIONS_WITHDRAWN: &str = concat!(
 
 /// Neutralize markup that could close or forge this envelope from inside
 /// untrusted server text.
-fn escape_mcp_guidance(text: &str) -> String {
+pub(crate) fn escape_mcp_guidance(text: &str) -> String {
     text.replace("</mcp_server_instructions", "&lt;/mcp_server_instructions")
         .replace("<mcp_server_instructions", "&lt;mcp_server_instructions")
         .replace("</codewhale:", "&lt;/codewhale:")
