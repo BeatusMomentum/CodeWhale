@@ -12,6 +12,37 @@ pub(crate) fn path_is_confined(path: &Path) -> bool {
         })
 }
 
+/// Refuse `path` when any existing component below `root` is a link. The
+/// walk stops at the first component that does not exist yet, so a path that
+/// is about to be created through a real directory chain passes. This is a
+/// lexical check made before the use; prefer [`WorkspaceFile`] where the
+/// caller can open through it, and use this for paths a library call (a
+/// directory listing, a removal) takes by name.
+pub(crate) fn reject_linked_path(root: &Path, path: &Path) -> io::Result<()> {
+    let relative = path.strip_prefix(root).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} must stay within {}", path.display(), root.display()),
+        )
+    })?;
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        current.push(component);
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) if crate::plugins::metadata_is_link_or_reparse(&metadata) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("Refusing symlinked path {}", current.display()),
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
 fn invalid_path() -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidInput,
@@ -150,18 +181,34 @@ impl WorkspaceFile {
     fn open_with_flags(&self, flags: libc::c_int) -> io::Result<File> {
         use std::os::fd::{AsRawFd, FromRawFd};
         use std::os::unix::fs::MetadataExt;
-        // SAFETY: a pinned parent and validated basename; never follows links.
-        let fd = unsafe {
-            libc::openat(
-                self.directory.as_raw_fd(),
-                self.filename.as_ptr(),
-                flags | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
-                self.create_mode(),
-            )
+        // macOS can fail an `openat(O_CREAT)` with ENOENT while another thread
+        // is creating the same name through the same pinned directory, even
+        // though the parent exists. The loser of that race only has to ask
+        // again: the file is there by then. The retry is bounded and applies
+        // only when creating, so a vanished parent still fails.
+        let mut attempts = 0;
+        let fd = loop {
+            // SAFETY: a pinned parent and validated basename; never follows links.
+            let fd = unsafe {
+                libc::openat(
+                    self.directory.as_raw_fd(),
+                    self.filename.as_ptr(),
+                    flags | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+                    self.create_mode(),
+                )
+            };
+            if fd >= 0 {
+                break fd;
+            }
+            let error = io::Error::last_os_error();
+            attempts += 1;
+            if flags & libc::O_CREAT != 0 && error.kind() == io::ErrorKind::NotFound && attempts < 4
+            {
+                std::thread::yield_now();
+                continue;
+            }
+            return Err(error);
         };
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
         // SAFETY: fd is freshly owned.
         let file = unsafe { File::from_raw_fd(fd) };
         let metadata = file.metadata()?;
@@ -577,6 +624,33 @@ impl WorkspaceFile {
 mod unix_publication_tests {
     use super::*;
     use std::io::Read;
+
+    /// Several threads creating one new name through their own pinned handles
+    /// must all succeed. macOS can fail the losers of that race with ENOENT
+    /// unless the open asks again.
+    #[test]
+    fn racing_creates_of_one_name_all_succeed() {
+        let workspace = tempfile::tempdir().unwrap();
+        for round in 0..40 {
+            let relative = std::path::PathBuf::from(format!("locks-{round}/manager.lock"));
+            std::thread::scope(|scope| {
+                let workers: Vec<_> = (0..4)
+                    .map(|_| {
+                        scope.spawn(|| {
+                            WorkspaceFile::open(workspace.path(), &relative, true)
+                                .and_then(|file| file.open_update(true, false))
+                        })
+                    })
+                    .collect();
+                for worker in workers {
+                    worker
+                        .join()
+                        .unwrap()
+                        .expect("every racing create succeeds");
+                }
+            });
+        }
+    }
 
     #[test]
     fn a_racing_reader_never_sees_a_publication_half_done() {

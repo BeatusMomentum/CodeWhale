@@ -7,7 +7,6 @@
 #![allow(dead_code)]
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::OpenOptions;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -358,7 +357,11 @@ impl FleetManager {
 
     fn manager_lock_path(&self, run_id: &FleetRunId) -> PathBuf {
         self.workspace
-            .join(".codewhale")
+            .join(Self::manager_lock_relative_path(run_id))
+    }
+
+    fn manager_lock_relative_path(run_id: &FleetRunId) -> PathBuf {
+        PathBuf::from(".codewhale")
             .join("fleet")
             .join(format!("manager-{}.lock", safe_path_segment(&run_id.0)))
     }
@@ -805,18 +808,13 @@ impl FleetManager {
         // blocking pool (blocking-call convention, #6149).
         let lock_file = {
             let path = manager_lock_path.clone();
+            let workspace = self.workspace.clone();
+            let relative = Self::manager_lock_relative_path(run_id);
             tokio::task::spawn_blocking(move || -> Result<std::fs::File> {
-                if let Some(parent) = path.parent() {
-                    std::fs::create_dir_all(parent).with_context(|| {
-                        format!("creating Fleet manager lock dir {}", parent.display())
-                    })?;
-                }
-                OpenOptions::new()
-                    .create(true)
-                    .truncate(false)
-                    .read(true)
-                    .write(true)
-                    .open(&path)
+                // Created and opened through the pinned no-follow handle, so a
+                // linked `.codewhale` or lock name is refused, not followed.
+                super::files::WorkspaceFile::open(&workspace, &relative, true)
+                    .and_then(|file| file.open_update(true, false))
                     .with_context(|| format!("opening Fleet manager lock {}", path.display()))
             })
             .await
@@ -2084,18 +2082,15 @@ impl FleetManager {
             .join(safe_path_segment(&run_id.0))
             .join(safe_path_segment(&task_spec.id))
             .join(format!("{}.log", safe_path_segment(worker_id)));
-        let abs_path = self.workspace.join(&rel_path);
-        if let Some(parent) = abs_path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("creating Fleet artifact dir {}", parent.display()))?;
-        }
         let contents = format!(
             "run_id={}\ntask_id={}\ntask_name={}\nworker_id={}\nstatus=started\n",
             run_id.0, task_spec.id, task_spec.name, worker_id
         );
-        std::fs::write(&abs_path, contents)
-            .with_context(|| format!("writing Fleet worker log {}", abs_path.display()))?;
-        let size_bytes = std::fs::metadata(&abs_path).ok().map(|m| m.len());
+        // The same pinned, no-follow writer as every other Fleet artifact: a
+        // link in `.codewhale` cannot send the log outside the workspace.
+        super::artifacts::write(&self.workspace, &rel_path, contents.as_bytes())
+            .with_context(|| format!("writing Fleet worker log {}", rel_path.display()))?;
+        let size_bytes = Some(contents.len() as u64);
         Ok(FleetArtifactRef {
             kind: FleetArtifactKind::Log,
             path: rel_path,

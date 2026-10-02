@@ -6387,6 +6387,39 @@ mod tests {
         assert!(body.contains("\"confirmed\": 2"), "{body}");
     }
 
+    /// A workspace that ships `.codewhale/reports` as a link cannot make the
+    /// run report or the raw schema reply land outside the workspace.
+    #[cfg(unix)]
+    #[test]
+    fn report_artifacts_are_never_written_through_a_linked_reports_directory() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let outside = tempfile::tempdir().expect("outside");
+        std::fs::create_dir_all(tmp.path().join(".codewhale")).expect("mkdir");
+        std::os::unix::fs::symlink(
+            outside.path(),
+            tmp.path().join(".codewhale").join("reports"),
+        )
+        .expect("link");
+        let mut record = WorkflowRunRecord::new(
+            "workflow_report_linked".to_string(),
+            Some("session-test".to_string()),
+            None,
+            None,
+            None,
+        );
+        record.status = WorkflowRunStatus::Completed;
+
+        write_run_report_artifact(tmp.path(), &record);
+        let schema = write_schema_raw_artifact(tmp.path(), "run-linked", "agent_0001", 1, "raw");
+
+        assert!(schema.is_none(), "the schema artifact must be refused");
+        assert_eq!(
+            std::fs::read_dir(outside.path()).expect("outside").count(),
+            0,
+            "nothing may land behind the link"
+        );
+    }
+
     #[test]
     fn running_runs_write_no_report_artifact() {
         let tmp = tempfile::tempdir().expect("tempdir");

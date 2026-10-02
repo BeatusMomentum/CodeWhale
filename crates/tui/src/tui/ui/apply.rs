@@ -2856,11 +2856,23 @@ fn apply_validated_profile_config(
 /// time, and reloads the hook set on return so the screen reflects the edit
 /// immediately.
 fn edit_project_hooks_from_tui(terminal: &mut AppTerminal, app: &mut App, config: &Config) {
-    let dir = app.workspace.join(".codewhale");
-    let path = dir.join("hooks.toml");
+    let path = app.workspace.join(".codewhale").join("hooks.toml");
+    // A link in `.codewhale` or at hooks.toml is never created through, and the
+    // editor is not pointed at one: the file must really live in the workspace.
+    if let Err(error) = crate::fleet::files::reject_linked_path(&app.workspace, &path) {
+        app.push_status_toast(
+            format!("Could not use {}: {error}", path.display()),
+            StatusToastLevel::Warning,
+            Some(8_000),
+        );
+        return;
+    }
     if !path.exists()
-        && let Err(error) = std::fs::create_dir_all(&dir)
-            .and_then(|()| std::fs::write(&path, crate::hooks::PROJECT_HOOKS_TEMPLATE))
+        && let Err(error) = crate::fs_confined::write(
+            &app.workspace,
+            &path,
+            crate::hooks::PROJECT_HOOKS_TEMPLATE.as_bytes(),
+        )
     {
         app.push_status_toast(
             format!("Could not create {}: {error}", path.display()),

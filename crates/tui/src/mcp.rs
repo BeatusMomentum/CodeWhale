@@ -82,6 +82,26 @@ fn validate_mcp_config_path(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Refuse to write a workspace's `.codewhale/mcp.json` through a link: when
+/// the file lives under a `<workspace>/.codewhale`, no component from the
+/// workspace down may be a link. The user's own home config (`~/.codewhale`) is
+/// exempt, because users relocate it on purpose. Writers only: reading a linked
+/// file is still allowed, as before.
+fn reject_linked_workspace_state_path(path: &Path) -> Result<()> {
+    let Some(root) = path
+        .ancestors()
+        .find(|ancestor| ancestor.file_name() == Some(std::ffi::OsStr::new(".codewhale")))
+        .and_then(Path::parent)
+    else {
+        return Ok(());
+    };
+    if crate::config::effective_home_dir().is_some_and(|home| home == root) {
+        return Ok(());
+    }
+    crate::fleet::files::reject_linked_path(root, path)
+        .with_context(|| format!("MCP config {} is not safe to write", path.display()))
+}
+
 /// Expand `${NAME}` placeholders in an MCP config value from the process
 /// environment. This lets secrets (API keys, bearer tokens, …) be supplied
 /// through environment variables instead of being written in cleartext into
@@ -6745,6 +6765,7 @@ pub fn mutate_config<T>(
     mutate: impl FnOnce(&mut McpConfig) -> Result<T>,
 ) -> Result<(T, String)> {
     validate_mcp_config_path(path)?;
+    reject_linked_workspace_state_path(path)?;
     codewhale_config::with_config_write_lock(path, |path| {
         let original = read_mcp_config_file(path)?;
         let revision = config_revision(original.as_deref());
@@ -6828,6 +6849,7 @@ fn mcp_template_json() -> Result<String> {
 
 pub fn init_config(path: &Path, force: bool) -> Result<McpWriteStatus> {
     validate_mcp_config_path(path)?;
+    reject_linked_workspace_state_path(path)?;
     codewhale_config::with_config_write_lock(path, |path| {
         let original = read_mcp_config_file(path)?;
         if let Some(raw) = original.as_deref() {

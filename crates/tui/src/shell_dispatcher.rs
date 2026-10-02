@@ -223,24 +223,31 @@ const TEMP_PS1_TAIL: &str = concat!(
 );
 
 fn write_temp_ps1(shell_command: &str) -> std::io::Result<String> {
-    use std::io::Write;
     let dir = std::env::temp_dir();
     sweep_stale_temp_ps1(&dir);
+    // Unguessable name: another user of the shared temporary directory cannot
+    // predict it, and `write_temp_ps1_at` still refuses anything already there.
     let name = format!(
         "codewhale-shell-{}-{}.ps1",
         std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
+        uuid::Uuid::new_v4().simple()
     );
-    let path = dir.join(name);
+    write_temp_ps1_at(&dir.join(name), shell_command)
+}
+
+/// Create `path` exclusively, owner-only on Unix, and write the script into it.
+fn write_temp_ps1_at(path: &std::path::Path, shell_command: &str) -> std::io::Result<String> {
+    use std::io::Write;
     // Create-new: never write the script through a file or link that someone
     // else placed at this name in the shared temporary directory.
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&path)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
     // UTF-8 with BOM helps Windows PowerShell 5.1 decode non-ASCII scripts.
     file.write_all(&[0xEF, 0xBB, 0xBF])?;
     file.write_all(shell_command.as_bytes())?;
@@ -783,6 +790,55 @@ mod tests {
             payload.contains("\nif ($null -ne $LASTEXITCODE"),
             "exit-code capture must start on a fresh line: {payload}"
         );
+    }
+
+    /// The temporary script is created exclusively: a file or link already at
+    /// the name is refused and left exactly as it was, and a fresh script is
+    /// owner-only.
+    #[test]
+    fn temp_ps1_script_is_created_exclusively_and_privately() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let taken = dir.path().join("codewhale-shell-taken.ps1");
+        std::fs::write(&taken, "original").expect("pre-existing file");
+        let error = write_temp_ps1_at(&taken, "Write-Output 'x'")
+            .expect_err("an existing file must be refused");
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read_to_string(&taken).unwrap(), "original");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{PermissionsExt, symlink};
+            let victim = dir.path().join("victim.txt");
+            let linked = dir.path().join("codewhale-shell-linked.ps1");
+            symlink(&victim, &linked).expect("plant dangling link");
+            assert!(write_temp_ps1_at(&linked, "Write-Output 'x'").is_err());
+            assert!(
+                !victim.exists(),
+                "a planted link must not be written through"
+            );
+
+            let fresh = dir.path().join("codewhale-shell-fresh.ps1");
+            write_temp_ps1_at(&fresh, "Write-Output 'x'").expect("fresh script");
+            let mode = std::fs::metadata(&fresh).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+
+        let fresh = dir.path().join("codewhale-shell-content.ps1");
+        let written = write_temp_ps1_at(&fresh, "Write-Output 'x'").expect("script");
+        assert_eq!(written, fresh.to_string_lossy());
+        let bytes = std::fs::read(&fresh).unwrap();
+        assert_eq!(&bytes[..3], &[0xEF, 0xBB, 0xBF]);
+        let text = String::from_utf8(bytes[3..].to_vec()).unwrap();
+        assert!(text.starts_with("Write-Output 'x'\n"), "{text}");
+        assert!(text.ends_with(TEMP_PS1_TAIL), "{text}");
+
+        // Two scripts from the public entry point never collide.
+        let first = write_temp_ps1("1").expect("first");
+        let second = write_temp_ps1("2").expect("second");
+        assert_ne!(first, second);
+        let _ = std::fs::remove_file(first);
+        let _ = std::fs::remove_file(second);
     }
 
     #[test]

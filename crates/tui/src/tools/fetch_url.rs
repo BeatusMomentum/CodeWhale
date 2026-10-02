@@ -552,6 +552,52 @@ mod tests {
         ToolContext::new(PathBuf::from("."))
     }
 
+    /// `fetch_url` can disclose local data through a URL or query, so it always
+    /// asks: the tool declares `Required`, and the default-ask policy resolves
+    /// that to a prompt rather than running it.
+    #[test]
+    fn fetch_url_always_requires_approval() {
+        use crate::tools::spec::{ApprovalRequirement, ToolSpec};
+        assert_eq!(
+            FetchUrlTool.approval_requirement(),
+            ApprovalRequirement::Required
+        );
+        assert!(
+            FetchUrlTool
+                .capabilities()
+                .contains(&ToolCapability::Network)
+        );
+
+        // Under the default Ask posture that requirement resolves to a prompt,
+        // and only full access (or an explicit bypass) lets it through.
+        use crate::core::authority::{ToolPermission, TurnAuthority, resolve_tool_permission};
+        use codewhale_config::AppMode;
+        use codewhale_execpolicy::ApprovalMode;
+        let requirement = FetchUrlTool.approval_requirement();
+        let ask = TurnAuthority::from_effective_fields(
+            AppMode::Agent,
+            true,
+            false,
+            false,
+            ApprovalMode::Suggest,
+        );
+        assert_eq!(
+            resolve_tool_permission(&ask, requirement, false),
+            ToolPermission::Prompt
+        );
+        let never = TurnAuthority::from_effective_fields(
+            AppMode::Agent,
+            true,
+            false,
+            false,
+            ApprovalMode::Never,
+        );
+        assert_eq!(
+            resolve_tool_permission(&never, requirement, false),
+            ToolPermission::Deny
+        );
+    }
+
     #[test]
     fn format_parse_accepts_aliases_and_rejects_unknown() {
         assert_eq!(Format::parse(Some("markdown")).unwrap(), Format::Markdown);
