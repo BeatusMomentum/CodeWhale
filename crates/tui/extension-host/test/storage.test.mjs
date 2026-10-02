@@ -1,9 +1,16 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, mkdir, readFile, writeFile, stat, symlink, rm } from 'node:fs/promises'
+import { mkdtemp, mkdir, readFile, writeFile, readdir, stat, symlink, rm } from 'node:fs/promises'
+import { createHash } from 'node:crypto'
+import { spawn } from 'node:child_process'
+import { once } from 'node:events'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createStorage, STORAGE_LIMITS } from '../src/shims/storage.ts'
+
+const moduleUrl = new URL('../src/shims/storage.ts', import.meta.url).href
+const keyPath = (dir, key) => join(dir, 'storage-v1', `${createHash('sha256').update(key).digest('hex')}.json`)
+const code = (expected) => (error) => error.code === expected
 
 async function fixture(t) {
   const root = await mkdtemp(join(tmpdir(), 'codewhale-plugin-storage-'))
@@ -14,7 +21,14 @@ async function fixture(t) {
   return { a, b, store: createStorage({ dataDir: a, isActive: () => live }), revoke: () => { live = false } }
 }
 
-const code = (expected) => (error) => error.code === expected
+function worker(t, directory, script) {
+  const child = spawn(process.execPath, ['-e', script, directory], { stdio: ['ignore', 'ignore', 'pipe', 'ipc'] })
+  let stderr = ''
+  child.stderr.on('data', (chunk) => { stderr = (stderr + chunk).slice(-4000) })
+  const exited = once(child, 'exit')
+  t.after(async () => { if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL'); await exited })
+  return { child, exited, stderr: () => stderr }
+}
 
 test('storage persists JSON across owner generations and deletes exact keys', async (t) => {
   const { a, store } = await fixture(t)
@@ -28,7 +42,8 @@ test('storage persists JSON across owner generations and deletes exact keys', as
   assert.equal(await restarted.delete('profile'), true)
   assert.equal(await restarted.delete('profile'), false)
   assert.equal(await store.get('profile'), undefined)
-  if (process.platform !== 'win32') assert.equal((await stat(join(a, 'storage.json'))).mode & 0o777, 0o600)
+  await store.set('permissions', true)
+  if (process.platform !== 'win32') assert.equal((await stat(keyPath(a, 'permissions'))).mode & 0o777, 0o600)
 })
 
 test('owner directories isolate equal keys and keys never become paths', async (t) => {
@@ -41,27 +56,23 @@ test('owner directories isolate equal keys and keys never become paths', async (
   assert.equal(await other.get('../outside'), 'b')
   assert.deepEqual(await store.get('__proto__'), { owner: 'a' })
   assert.equal(await other.get('__proto__'), undefined)
-  assert.equal(JSON.parse(await readFile(join(a, 'storage.json'), 'utf8')).entries['../outside'], 'a')
+  assert.ok((await readdir(join(a, 'storage-v1'))).every((name) => /^[a-f0-9]{64}\.json$/u.test(name)))
 })
 
 test('storage refuses invalid JSON, oversized values and keys without damaging state', async (t) => {
   const { a, store } = await fixture(t)
   await store.set('kept', 'original')
-  const before = await readFile(join(a, 'storage.json'))
-  const sparse = new Array(2)
-  const cyclic = {}; cyclic.self = cyclic
-  const symbol = { [Symbol('hidden')]: 1 }
-  const extra = [1]; extra.custom = 2
+  const before = await readFile(keyPath(a, 'kept'))
+  const sparse = new Array(2), cyclic = {}; cyclic.self = cyclic
+  const symbol = { [Symbol('hidden')]: 1 }, extra = [1]; extra.custom = 2
   const getter = Object.defineProperty({}, 'x', { enumerable: true, get() { throw new Error('must not run') } })
-  for (const value of [undefined, NaN, Infinity, 1n, new Date(), () => 1, sparse, cyclic, symbol, getter, extra]) {
-    await assert.rejects(store.set('bad', value), code('invalid'))
-  }
+  for (const value of [undefined, NaN, Infinity, 1n, new Date(), () => 1, sparse, cyclic, symbol, getter, extra]) await assert.rejects(store.set('bad', value), code('invalid'))
   for (const key of ['', 'nul\0key', '鲸'.repeat(STORAGE_LIMITS.keyBytes)]) await assert.rejects(store.set(key, 1), code('invalid'))
   await assert.rejects(store.set('big', 'x'.repeat(STORAGE_LIMITS.valueBytes)), code('limit'))
-  assert.deepEqual(await readFile(join(a, 'storage.json')), before)
+  assert.deepEqual(await readFile(keyPath(a, 'kept')), before)
 })
 
-test('owner quota refuses the next write and allows replacement or deletion', async (t) => {
+test('observed owner quota refuses the next write and allows replacement or deletion', async (t) => {
   const { store } = await fixture(t)
   const value = 'x'.repeat(STORAGE_LIMITS.valueBytes - 2)
   let count = 0
@@ -76,20 +87,15 @@ test('owner quota refuses the next write and allows replacement or deletion', as
   await store.delete('key1')
 })
 
-test('key-count quota is enforced when reading persisted state', async (t) => {
+test('observed key-count quota is shared between API instances in one host', async (t) => {
   const { a, store } = await fixture(t)
-  const entries = Object.fromEntries(Array.from({ length: STORAGE_LIMITS.keys + 1 }, (_, i) => [`k${i}`, null]))
-  const bytes = JSON.stringify({ version: 1, entries })
-  await writeFile(join(a, 'storage.json'), bytes, { mode: 0o600 })
-  await assert.rejects(store.get('k0'), code('corrupt'))
-  await assert.rejects(store.set('x', 1), code('corrupt'))
-  assert.equal(await readFile(join(a, 'storage.json'), 'utf8'), bytes)
-  delete entries.k1024
-  await writeFile(join(a, 'storage.json'), JSON.stringify({ version: 1, entries }))
-  await assert.rejects(store.set('extra', 1), code('limit'))
-  await store.set('k0', 1)
+  await store.set('kept', true)
+  await Promise.all(Array.from({ length: STORAGE_LIMITS.keys - 1 }, (_, i) => writeFile(keyPath(a, `k${i}`), JSON.stringify({ version: 1, key: `k${i}`, value: null }), { mode: 0o600 })))
+  const other = createStorage({ dataDir: a, isActive: () => true })
+  await assert.rejects(other.set('extra', 1), code('limit'))
+  await other.set('kept', false)
   await store.delete('k1')
-  await store.set('extra', 2)
+  await other.set('extra', 2)
   assert.equal(await store.get('extra'), 2)
 })
 
@@ -104,50 +110,45 @@ test('queued operations refuse a revoked owner and state survives revocation', a
   const restarted = createStorage({ dataDir: a, isActive: () => true })
   assert.equal(await restarted.get('kept'), 7)
   assert.equal(await restarted.get('late'), undefined)
+  await restarted.set('after-reload', 9)
+  assert.equal(await restarted.get('after-reload'), 9)
 })
 
-test('a writer lease prevents conflicting or interrupted writes from losing state', async (t) => {
+test('corrupt records fail closed, preserve old bytes, and support explicit key deletion', async (t) => {
   const { a, store } = await fixture(t)
-  await store.set('kept', 7)
-  const bytes = await readFile(join(a, 'storage.json'))
-  await writeFile(join(a, 'storage.lock'), 'another or interrupted writer', { flag: 'wx', mode: 0o600 })
-  assert.equal(await store.get('kept'), 7)
-  await assert.rejects(store.set('kept', 8), code('busy'))
-  await assert.rejects(store.delete('kept'), code('busy'))
-  assert.deepEqual(await readFile(join(a, 'storage.json')), bytes)
-})
-
-test('corrupt state fails closed and never gets replaced by an empty store', async (t) => {
-  const { a, store } = await fixture(t)
-  for (const bytes of ['{broken', '{"version":2,"entries":{}}', '{"version":1,"entries":[],"extra":true}']) {
-    await writeFile(join(a, 'storage.json'), bytes)
+  await store.set('key', true)
+  for (const bytes of ['{broken', '{"version":2,"key":"key","value":null}', '{"version":1,"key":"other","value":null}']) {
+    await writeFile(keyPath(a, 'key'), bytes)
     await assert.rejects(store.get('key'), code('corrupt'))
     await assert.rejects(store.set('key', 1), code('corrupt'))
-    assert.equal(await readFile(join(a, 'storage.json'), 'utf8'), bytes)
+    assert.equal(await readFile(keyPath(a, 'key'), 'utf8'), bytes)
   }
+  assert.equal(await store.delete('key'), true)
+  await store.set('key', 'recovered')
+  assert.equal(await store.get('key'), 'recovered')
 })
 
-test('storage refuses a linked state file instead of reading or changing its target', { skip: process.platform === 'win32' }, async (t) => {
+test('storage refuses a linked record instead of reading or changing its target', { skip: process.platform === 'win32' }, async (t) => {
   const { a, b, store } = await fixture(t)
-  const outside = join(b, 'untouched.json')
-  const bytes = '{"version":1,"entries":{"secret":"untouched"}}'
+  await store.get('absent')
+  const outside = join(b, 'untouched.json'), bytes = '{"version":1,"key":"secret","value":"untouched"}'
   await writeFile(outside, bytes)
-  await symlink(outside, join(a, 'storage.json'))
+  await symlink(outside, keyPath(a, 'secret'))
   await assert.rejects(store.get('secret'), code('corrupt'))
   await assert.rejects(store.set('secret', 'changed'), code('corrupt'))
   assert.equal(await readFile(outside, 'utf8'), bytes)
 })
 
-test('concurrent calls on one owner serialize without losing independent keys', async (t) => {
-  const { store } = await fixture(t)
-  await Promise.all(Array.from({ length: 24 }, (_, i) => store.set(`k${i}`, i)))
+test('concurrent calls across API instances share the directory queue', async (t) => {
+  const { a, store } = await fixture(t)
+  const other = createStorage({ dataDir: a, isActive: () => true })
+  await Promise.all(Array.from({ length: 24 }, (_, i) => (i % 2 ? store : other).set(`k${i}`, i)))
   assert.deepEqual(await Promise.all(Array.from({ length: 24 }, (_, i) => store.get(`k${i}`))), Array.from({ length: 24 }, (_, i) => i))
 })
 
 test('set snapshots input at invocation before callers can mutate it', async (t) => {
   const { store } = await fixture(t)
-  const value = { counter: 1 }
-  const pending = store.set('value', value)
+  const value = { counter: 1 }, pending = store.set('value', value)
   value.counter = 99
   await pending
   assert.deepEqual(await store.get('value'), { counter: 1 })
@@ -158,6 +159,62 @@ test('storage requires an assigned absolute directory and refuses directory link
   assert.throws(() => createStorage({ dataDir: 'relative', isActive: () => true }), code('invalid'))
   const linked = join(a, 'linked')
   await symlink(b, linked)
-  const store = createStorage({ dataDir: linked, isActive: () => true })
-  await assert.rejects(store.set('key', 1), code('invalid'))
+  await assert.rejects(createStorage({ dataDir: linked, isActive: () => true }).set('key', 1), code('invalid'))
+})
+
+test('killing a writer before publication preserves old state and reload stays writable', async (t) => {
+  const { a, store } = await fixture(t)
+  await store.set('kept', 'original')
+  const run = worker(t, a, `
+    const fs = require('node:fs');
+    fs.promises.rename = async () => { setInterval(() => {}, 1000); process.send('publishing'); await new Promise(() => {}); };
+    require('node:module').syncBuiltinESMExports();
+    import(${JSON.stringify(moduleUrl)}).then(({ createStorage }) => createStorage({ dataDir: process.argv[1], isActive: () => true }).set('kept', 'interrupted')).catch(e => { console.error(e); process.exit(1); });
+  `)
+  const ready = await Promise.race([once(run.child, 'message', { signal: AbortSignal.timeout(5000) }), run.exited.then(() => { throw new Error(run.stderr()) })])
+  assert.equal(ready[0], 'publishing')
+  run.child.kill('SIGKILL')
+  const [, signal] = await run.exited
+  assert.equal(signal, 'SIGKILL')
+  const names = await readdir(join(a, 'storage-v1'))
+  assert.ok(names.some((name) => name.startsWith('.pending-')))
+  const reloaded = createStorage({ dataDir: a, isActive: () => true })
+  assert.equal(await reloaded.get('kept'), 'original')
+  await reloaded.set('kept', 'after-crash')
+  await reloaded.set('new', true)
+  assert.equal(await reloaded.get('kept'), 'after-crash')
+  assert.equal(await reloaded.get('new'), true)
+})
+
+test('different-key writers in separate processes cannot erase each other', async (t) => {
+  const { a, store } = await fixture(t)
+  const makeScript = (prefix) => `import(${JSON.stringify(moduleUrl)}).then(async ({ createStorage }) => {
+    const store = createStorage({ dataDir: process.argv[1], isActive: () => true });
+    for (let i = 0; i < 12; i++) await store.set(${JSON.stringify(prefix)} + i, i);
+    process.disconnect();
+  }).catch(e => { console.error(e); process.exit(1); });`
+  const first = worker(t, a, makeScript('first')), second = worker(t, a, makeScript('second'))
+  for (const run of [first, second]) assert.equal((await run.exited)[0], 0, run.stderr())
+  for (let i = 0; i < 12; i++) {
+    assert.equal(await store.get(`first${i}`), i)
+    assert.equal(await store.get(`second${i}`), i)
+  }
+})
+
+test('same-key writers publish complete last-writer-wins records during concurrent reads', async (t) => {
+  const { a, store } = await fixture(t)
+  await store.set('shared', { writer: 'seed', payload: 'seed' })
+  const makeScript = (writer) => `import(${JSON.stringify(moduleUrl)}).then(async ({ createStorage }) => {
+    const store = createStorage({ dataDir: process.argv[1], isActive: () => true });
+    for (let i = 0; i < 12; i++) await store.set('shared', { writer: ${JSON.stringify(writer)}, payload: ${JSON.stringify(writer)}.repeat(10000) });
+    process.disconnect();
+  }).catch(e => { console.error(e); process.exit(1); });`
+  const first = worker(t, a, makeScript('first')), second = worker(t, a, makeScript('second'))
+  while (first.child.exitCode === null || second.child.exitCode === null) {
+    const value = await store.get('shared')
+    assert.ok(['seed', 'first', 'second'].includes(value.writer))
+    assert.equal(value.payload, value.writer === 'seed' ? 'seed' : value.writer.repeat(10000))
+  }
+  for (const run of [first, second]) assert.equal((await run.exited)[0], 0, run.stderr())
+  assert.ok(['first', 'second'].includes((await store.get('shared')).writer))
 })
