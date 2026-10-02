@@ -79,6 +79,28 @@ async fn chatgpt_models_http_uses_visible_roster_and_rejects_secret_labels() {
         .await
         .expect_err("credential echo is never cached");
     assert!(!error.to_string().contains(KEY));
+    server.reset().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(ResponseTemplate::new(307).insert_header("Location", "/other"))
+        .mount(&server)
+        .await;
+    let response = client
+        .http_client
+        .post(format!("{}/v1/responses", server.uri()))
+        .send()
+        .await
+        .expect("local response");
+    assert_eq!(response.status().as_u16(), 307);
+    assert_eq!(
+        server
+            .received_requests()
+            .await
+            .expect("request count")
+            .len(),
+        1,
+        "a plan grant must not follow a redirected inference endpoint"
+    );
 }
 
 fn anthropic_client(base_url: &str) -> CodewhaleClient {
