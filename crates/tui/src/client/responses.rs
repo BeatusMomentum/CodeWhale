@@ -114,7 +114,8 @@ pub(super) fn build_responses_body_for_provider(
                 json!(responses_tools)
             };
             body["tool_choice"] = json!("auto");
-            body["parallel_tool_calls"] = json!(true);
+            // The plan preview decoder tracks one active function-call block.
+            body["parallel_tool_calls"] = json!(provider != ApiProvider::OpenaiCodex);
         }
     }
 
@@ -165,10 +166,15 @@ impl CodewhaleClient {
         // remapping — rather than borrowing the request that no longer exists
         // at this layer.
         let wire_model = prepared.wire_model.clone();
-        let reasoning_origin = self.chatgpt_reasoning_api.as_ref().map(|api| {
+        let reasoning_api = if is_chatgpt {
+            self.chatgpt_reasoning_api.as_deref()
+        } else {
+            Some("openai-responses")
+        };
+        let reasoning_origin = reasoning_api.map(|api| {
             (
                 self.api_provider.as_str().to_string(),
-                api.clone(),
+                api.to_string(),
                 wire_model.clone(),
             )
         });

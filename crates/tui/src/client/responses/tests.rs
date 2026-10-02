@@ -601,6 +601,9 @@ fn responses_body_serializes_the_child_catalog_without_duplication() {
     let mut request = minimal_responses_request();
     request.tools = Some(tools);
     let body = build_responses_body(&request);
+    assert_eq!(body["parallel_tool_calls"], false);
+    let generic = build_responses_body_for_provider(&request, ApiProvider::Openai, None);
+    assert_eq!(generic["parallel_tool_calls"], true);
     assert_eq!(body["tools"].as_array().unwrap().len(), 1);
     assert_eq!(body["tools"][0]["type"], "namespace");
     assert_eq!(body["tools"][0]["name"], "codewhale");
@@ -1142,6 +1145,86 @@ fn deepseek_responses_reasoning_effort_uses_documented_labels() {
     // minimal stays a low tier for DeepSeek (undocumented label preserved
     // for Codex compatibility).
     assert_eq!(responses_reasoning_effort("minimal", true), Some("low"));
+}
+
+#[tokio::test]
+async fn generic_responses_captures_and_replays_opaque_reasoning() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/responses"))
+        .respond_with(ResponseTemplate::new(200)
+            .insert_header("Content-Type", "text/event-stream")
+            .set_body_string(concat!(
+                "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"reasoning\",\"id\":\"rs_generic\"}}\n\n",
+                "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"reasoning\",\"id\":\"rs_generic\",\"encrypted_content\":\"enc_generic\"}}\n\n",
+                "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n",
+            )))
+        .mount(&server).await;
+    let config = Config {
+        provider: Some("openai".into()),
+        providers: Some(ProvidersConfig {
+            openai: ProviderConfig {
+                api_key: Some("test-token".into()),
+                base_url: Some(server.uri()),
+                ..Default::default()
+            },
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let client = CodewhaleClient::from_parts(
+        server.uri(),
+        "gpt-5.5".into(),
+        codewhale_config::provider::WireFormat::Responses,
+        None,
+        &config,
+    )
+    .unwrap();
+    assert!(client.chatgpt_reasoning_api.is_none());
+    let prepared = client
+        .prepare_outbound_request(minimal_responses_request(), true)
+        .unwrap();
+    let mut stream = client.handle_responses_stream(&prepared).await.unwrap();
+    let mut captured = None;
+    while let Some(event) = stream.next().await {
+        if let StreamEvent::ContentBlockDelta {
+            delta: Delta::ReasoningStateDelta { state },
+            ..
+        } = event.unwrap()
+        {
+            captured = Some(state);
+        }
+    }
+    let state = captured.expect("generic Responses must retain encrypted state");
+    assert_eq!(state.provider, "openai");
+    assert_eq!(state.api, "openai-responses");
+    assert_eq!(state.model, "gpt-5.5");
+    let mut continuation = minimal_responses_request();
+    continuation.messages.push(Message {
+        role: Role::Assistant,
+        content: vec![ContentBlock::Thinking {
+            thinking: "readable-private-summary".into(),
+            signature: None,
+            state: Some(state),
+        }],
+    });
+    let replay = client
+        .prepare_outbound_request(continuation.clone(), true)
+        .unwrap();
+    assert!(
+        replay.body["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["type"] == "reasoning" && item["encrypted_content"] == "enc_generic")
+    );
+    assert!(!replay.body.to_string().contains("readable-private-summary"));
+    continuation.model = "another-model".into();
+    let wrong_model = build_responses_body_for_provider(&continuation, ApiProvider::Openai, None);
+    assert!(!wrong_model.to_string().contains("enc_generic"));
+    let wrong_provider =
+        build_responses_body_for_provider(&continuation, ApiProvider::Deepseek, None);
+    assert!(!wrong_provider.to_string().contains("enc_generic"));
 }
 
 #[test]
