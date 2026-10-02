@@ -1,5 +1,6 @@
 {
   "ComposerOversizedSubmitHeld": "전송하지 못했습니다. 메시지가 {limit}자를 초과하며 붙여넣기 파일로 저장할 수 없습니다({error}). 전체 텍스트는 입력란에 그대로 있습니다. 내용을 줄이거나 .codewhale/pastes에 쓰기 권한을 부여한 뒤 Enter를 다시 누르세요.",
+  "ComposerOversizedSubmitHeldShort": "전송 안 됨: {limit}자 초과, 붙여넣기 파일 저장 실패.",
   "CmdPluginOwnerReport": "확장 호스트:\n  상태: {state}\n  활성 도구 ({count}): {tools}",
   "CmdPluginOwnerActivating": "활성화 중",
   "CmdPluginOwnerActive": "활성",

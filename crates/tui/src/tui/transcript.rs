@@ -339,7 +339,11 @@ impl TranscriptViewCache {
         }
         self.width = width;
         self.options = options;
-        self.thinking_folds = thinking_folds.clone();
+        // Cloning the map every frame is wasted work for the usual unchanged
+        // case (#6652); `folded_changed` already compared the two.
+        if folded_changed {
+            self.thinking_folds.clone_from(thinking_folds);
+        }
         let previous_rendered_target = self.reasoning_action_rendered_cell;
 
         // Same-index revision reuse is intentional: insert/remove shifts must

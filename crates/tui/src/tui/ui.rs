@@ -1079,6 +1079,9 @@ fn mark_active_turn_cancelled_locally(app: &mut App) {
     app.finalize_streaming_assistant_as_interrupted();
     persist_recovery_snapshot(app);
     app.is_loading = false;
+    // #6800: a dispatch still waiting on engine admission fails back now, not
+    // after its 60 s bound; its closure retires `dispatch_in_flight`.
+    app.cancel_in_flight_dispatch();
     app.dispatch_started_at = None;
     app.turn_started_at = None;
     app.turn_last_activity_at = None;

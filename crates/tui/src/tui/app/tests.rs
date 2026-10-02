@@ -3337,11 +3337,24 @@ fn submit_input_holds_oversized_input_when_paste_file_cannot_be_written() {
         app.input, full_content,
         "the full text stays in the composer"
     );
+    // The toast is short enough to survive the footer's clause-shedding...
     assert!(
         app.status_toasts
             .iter()
-            .any(|toast| toast.text.starts_with("Not sent") && toast.text.contains("shorten it")),
-        "expected an actionable not-sent toast"
+            .any(|toast| toast.text.starts_with("Not sent")
+                && toast.text.contains("paste file not saved")),
+        "expected a short not-sent toast"
+    );
+    // ...and the actionable reason, with the write error, is in the transcript.
+    assert!(
+        app.history.iter().any(|cell| matches!(
+            cell,
+            HistoryCell::System { content }
+                if content.starts_with("Not sent")
+                    && content.contains("shorten it")
+                    && !content.contains("{error}")
+        )),
+        "expected the full reason in the transcript"
     );
 }
 

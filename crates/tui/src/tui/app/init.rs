@@ -811,6 +811,7 @@ impl App {
             is_loading: false,
             dispatch_completion_tx: None,
             dispatch_in_flight: false,
+            dispatch_cancel: None,
             last_enter_instant: None,
             provider_wait_incident_logged: false,
             prompt_suggestion: None,

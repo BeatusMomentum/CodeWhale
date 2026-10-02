@@ -481,6 +481,8 @@ pub(crate) fn recover_stalled_runtime_turn(app: &mut App, message: &str, level: 
     persist_recovery_snapshot(app);
 
     app.is_loading = false;
+    // #6800: fail an unadmitted dispatch back now instead of after its bound.
+    app.cancel_in_flight_dispatch();
     app.turn_started_at = None;
     app.turn_last_activity_at = None;
     app.runtime_turn_status = None;

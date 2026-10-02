@@ -1641,6 +1641,7 @@ pub(super) fn edit_replacement_result(
         action: Some(AppAction::ConversationUndo {
             sync,
             retry_input: Some(input.to_string()),
+            edit_replacement: true,
         }),
         is_error: false,
     })

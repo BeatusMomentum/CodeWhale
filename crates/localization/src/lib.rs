@@ -1000,6 +1000,9 @@ pub enum MessageId {
     /// Paste found nothing: the clipboard read came back empty or failed.
     ClipboardNothingToPaste,
     ComposerOversizedSubmitHeld,
+    /// Short toast form of [`Self::ComposerOversizedSubmitHeld`]; the toast row
+    /// sheds clauses to fit, so the full text goes to the transcript instead.
+    ComposerOversizedSubmitHeldShort,
     KbContextMenu,
     KbPointerScroll,
     KbPointerClick,
@@ -3545,6 +3548,7 @@ pub const ALL_MESSAGE_IDS: &[MessageId] = &[
     MessageId::ClipboardCutKeptText,
     MessageId::ClipboardNothingToPaste,
     MessageId::ComposerOversizedSubmitHeld,
+    MessageId::ComposerOversizedSubmitHeldShort,
     MessageId::KbContextMenu,
     MessageId::KbPointerScroll,
     MessageId::KbPointerClick,

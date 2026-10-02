@@ -54,6 +54,36 @@ fn edit_dispatch_loads_unicode_composer_without_truncating_history() {
     assert!(!result.is_error);
 }
 
+/// A queued follow-up open for editing must not be overwritten or later sent
+/// in place of the `/edit` revision: it goes back to the queue, text intact.
+#[test]
+fn edit_dispatch_returns_an_open_queued_draft_to_the_queue() {
+    use crate::tui::app::QueuedMessage;
+    let mut app = create_test_app();
+    app.push_history_cell(HistoryCell::User {
+        content: "last sent".into(),
+    });
+    app.queued_messages
+        .push_back(QueuedMessage::new("queued follow-up".to_string(), None));
+    assert!(app.pop_last_queued_into_draft());
+    assert_eq!(app.input, "queued follow-up");
+    assert!(app.queued_draft.is_some());
+
+    let result = super::execute("/edit", &mut app);
+    assert!(!result.is_error, "{:?}", result.message);
+    assert!(app.queued_draft.is_none(), "draft edit is closed");
+    assert_eq!(
+        app.queued_messages
+            .iter()
+            .map(|message| message.display.as_str())
+            .collect::<Vec<_>>(),
+        ["queued follow-up"],
+        "the queued follow-up is back in the queue, exactly once"
+    );
+    assert_eq!(app.input, "last sent");
+    assert!(app.edit_in_progress);
+}
+
 #[test]
 fn diff_dispatch_reads_only_the_apps_workspace_without_changing_files() {
     let workspace = tempfile::tempdir().unwrap();
@@ -161,7 +191,7 @@ fn test_undo_conversation_stages_last_exchange_without_mutating_live_history() {
     );
     assert_eq!(app.api_messages.len(), initial_api_len);
     assert!(
-        matches!(result.action, Some(AppAction::ConversationUndo { sync, retry_input: None }) if sync.messages.is_empty())
+        matches!(result.action, Some(AppAction::ConversationUndo { sync, retry_input: None, .. }) if sync.messages.is_empty())
     );
 }
 

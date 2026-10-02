@@ -648,6 +648,10 @@ pub enum AppAction {
     ConversationUndo {
         sync: codewhale_command_contract::facets::SessionSyncPayload,
         retry_input: Option<String>,
+        /// `retry_input` is the text of a pending `/edit`, already taken from
+        /// the composer. If the rollback is refused it must go back there, with
+        /// edit mode re-armed, or the user's revision is lost.
+        edit_replacement: bool,
     },
     /// Send a built-in Workflow planning turn with separate user-visible text
     /// and bounded runtime guidance. Draft instructions carry a typed marker

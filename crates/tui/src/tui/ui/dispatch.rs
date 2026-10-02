@@ -710,14 +710,21 @@ pub(crate) fn start_user_dispatch(
         }
     };
     app.dispatch_in_flight = true;
+    // #6800: a local cancel (Esc, stall recovery) trips this token so the
+    // dispatch fails back to the composer at once instead of holding
+    // `dispatch_in_flight` — and queueing every new send — for the full
+    // `DISPATCH_TASK_BOUND` while it waits on engine admission.
+    let cancel = tokio_util::sync::CancellationToken::new();
+    app.dispatch_cancel = Some(cancel.clone());
     // Supervised: `spawned_dispatch_execute` owns the whole dispatch future,
-    // so its completion callback always arrives — on success, on a panic, or
-    // when the dispatch exceeds its bound (#6184).
+    // so its completion callback always arrives — on success, on a panic, on
+    // a local cancel, or when the dispatch exceeds its bound (#6184).
     tokio::spawn(spawned_dispatch_execute(
         prepare,
         recovery,
         engine_handle.clone(),
         completion_permit,
+        cancel,
     ));
     Ok(())
 }
@@ -733,11 +740,13 @@ pub(crate) async fn spawned_dispatch_execute(
     recovery: DispatchRecovery,
     engine_handle: EngineHandle,
     completion_permit: tokio::sync::mpsc::OwnedPermit<crate::tui::app::DispatchApplyFn>,
+    cancel: tokio_util::sync::CancellationToken,
 ) {
     let apply = supervised_dispatch(
         prepare,
         recovery,
         DISPATCH_TASK_BOUND,
+        cancel,
         |prepare, recovery| spawned_dispatch_inner(prepare, recovery, engine_handle),
     )
     .await;
@@ -748,11 +757,15 @@ pub(crate) async fn spawned_dispatch_execute(
 /// turn a panic or a hang into a dispatch that never reported back: the
 /// completion permit was dropped, `dispatch_in_flight` stayed set and the
 /// message sat in limbo. Every outcome now yields a callback; a panic or an
-/// overrun also leaves a log line and a `crashes/` record.
+/// overrun also leaves a log line and a `crashes/` record. A tripped `cancel`
+/// token abandons the dispatch and fails it back through the same error
+/// closure, so the unsent message returns to the composer exactly as on any
+/// other dispatch failure (#6800).
 pub(crate) async fn supervised_dispatch<F, Fut>(
     prepare: UserDispatchPrepare,
     recovery: DispatchRecovery,
     bound: std::time::Duration,
+    cancel: tokio_util::sync::CancellationToken,
     run: F,
 ) -> crate::tui::app::DispatchApplyFn
 where
@@ -763,7 +776,18 @@ where
     let fallback = prepare.clone();
     let started = std::time::Instant::now();
     let supervised = std::panic::AssertUnwindSafe(run(prepare, recovery)).catch_unwind();
-    match tokio::time::timeout(bound, supervised).await {
+    let outcome = tokio::select! {
+        biased;
+        () = cancel.cancelled() => {
+            return build_dispatch_error_closure(
+                fallback,
+                recovery,
+                "Message dispatch was cancelled before it reached the engine".to_string(),
+            );
+        }
+        outcome = tokio::time::timeout(bound, supervised) => outcome,
+    };
+    match outcome {
         Ok(Ok(apply)) => apply,
         Ok(Err(panic)) => {
             let detail = crate::utils::panic_message(&*panic);

@@ -13778,6 +13778,62 @@ async fn reserved_dispatch_cancel_before_acceptance_keeps_prompt_and_next_dispat
             assert!(engine.rx_op.try_recv().is_err());
         }
     }
+
+    // #6800: a dispatch parked on engine admission (op mailbox full) must not
+    // hold input hostage for its 60 s bound once the turn is cancelled locally.
+    // The accepted dispatch above left a turn running; start this one idle.
+    app.is_loading = false;
+    app.suppress_stream_events_until_turn_complete = false;
+    while engine
+        .handle
+        .tx_op
+        .try_send(crate::core::ops::Op::Shutdown)
+        .is_ok()
+    {}
+    start_user_dispatch(
+        &mut app,
+        &config,
+        &engine.handle,
+        QueuedMessage::new("parked behind a full mailbox".to_string(), None),
+        DispatchRecovery::Immediate,
+    )
+    .expect("start parked dispatch");
+    assert!(app.dispatch_in_flight);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(rx.try_recv().is_err(), "still waiting for engine admission");
+
+    let cancelled_at = Instant::now();
+    mark_active_turn_cancelled_locally(&mut app);
+    let apply = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+        .await
+        .expect("cancelled dispatch must call back within 1 s, not the 60 s bound")
+        .expect("dispatch callback");
+    assert!(cancelled_at.elapsed() < Duration::from_secs(1));
+    assert!(apply(&mut app, &engine.handle, &config).is_err());
+    assert!(!app.dispatch_in_flight);
+    assert!(!app.is_loading);
+    assert_eq!(app.input, "parked behind a full mailbox");
+    assert!(!app.suppress_stream_events_until_turn_complete);
+
+    // The next dispatch proceeds once the mailbox has room again.
+    while engine.rx_op.try_recv().is_ok() {}
+    start_user_dispatch(
+        &mut app,
+        &config,
+        &engine.handle,
+        QueuedMessage::new("parked behind a full mailbox".to_string(), None),
+        DispatchRecovery::Immediate,
+    )
+    .expect("start next dispatch");
+    let apply = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+        .await
+        .expect("next dispatch callback timeout")
+        .expect("next dispatch callback");
+    apply(&mut app, &engine.handle, &config).expect("next dispatch accepted");
+    assert!(matches!(
+        engine.rx_op.try_recv(),
+        Ok(crate::core::ops::Op::SendMessage(TurnSpec { .. }))
+    ));
 }
 
 #[tokio::test]
@@ -15386,6 +15442,7 @@ async fn stall_dispatch_task_overrun_reports_and_restores_message() {
             prepare,
             DispatchRecovery::Immediate,
             bound,
+            tokio_util::sync::CancellationToken::new(),
             |_prepare, _recovery| std::future::pending(),
         ),
     )
@@ -15422,6 +15479,7 @@ async fn stall_dispatch_task_panic_still_reports_back() {
         prepare,
         DispatchRecovery::Immediate,
         Duration::from_secs(60),
+        tokio_util::sync::CancellationToken::new(),
         |_prepare, _recovery| async { panic!("route planner exploded") },
     )
     .await;
@@ -21305,6 +21363,41 @@ fn launch_submit_holds_oversized_draft_before_creating_a_session() {
 
     assert!(super::event_loop::launch_submit_held(&mut app));
     assert_eq!(app.input, draft, "the full text stays in the composer");
+    // The toast row sheds clauses to fit, so it carries only the short form;
+    // the full reason (with the write error) lives in the transcript.
+    assert_eq!(
+        app.status_toasts.back().map(|toast| toast.text.as_str()),
+        Some(
+            format!(
+                "Not sent: over {} characters; paste file not saved.",
+                crate::tui::app::MAX_SUBMITTED_INPUT_CHARS
+            )
+            .as_str()
+        )
+    );
+    let held_notes = |app: &App| {
+        app.history
+            .iter()
+            .filter_map(|cell| match cell {
+                HistoryCell::System { content }
+                    if content.contains("could not be saved as a paste file") =>
+                {
+                    Some(content.clone())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    let notes = held_notes(&app);
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert!(
+        notes[0].contains("press Enter again") && !notes[0].contains("{error}"),
+        "{}",
+        notes[0]
+    );
+    // Retrying the same held submit does not stack identical notes.
+    assert!(super::event_loop::launch_submit_held(&mut app));
+    assert_eq!(held_notes(&app).len(), 1);
 
     app.input = "hello".to_string();
     app.cursor_position = app.input.chars().count();

@@ -1782,8 +1782,20 @@ async fn apply_command_result_inner(
                         .await;
                 }
             }
-            AppAction::ConversationUndo { sync, retry_input } => {
+            AppAction::ConversationUndo {
+                sync,
+                retry_input,
+                edit_replacement,
+            } => {
                 if let Err(error) = apply_conversation_undo(app, engine_handle, sync).await {
+                    // A refused `/edit` rollback has already consumed the
+                    // revision from the composer: hand it back, with edit mode
+                    // re-armed, so the user can retry instead of retyping.
+                    if edit_replacement && let Some(content) = retry_input {
+                        let restored = build_queued_message(app, content);
+                        restore_failed_immediate_submit(app, restored, &error);
+                        app.edit_in_progress = true;
+                    }
                     app.push_status_toast(
                         format!("Conversation rollback failed; retry was not sent: {error:#}"),
                         StatusToastLevel::Error,
@@ -1796,6 +1808,8 @@ async fn apply_command_result_inner(
                 }
                 if let Some(content) = retry_input {
                     let queued = build_queued_message(app, content);
+                    // The rollback required an idle app, so this always resolves to an
+                    // immediate send; the disposition is kept for parity with `SendMessage`.
                     dispatch_composer_message(
                         app,
                         config,

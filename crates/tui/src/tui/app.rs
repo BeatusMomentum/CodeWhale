@@ -1579,6 +1579,10 @@ pub struct App {
     /// submit after an Esc-cancel (which clears `is_loading`) still queues
     /// instead of spawning a second dispatch that could reorder ops.
     pub dispatch_in_flight: bool,
+    /// Cancels the in-flight dispatch task (#6800). Tripped by a local turn
+    /// cancel or stall recovery so the dispatch fails back to the composer
+    /// instead of holding `dispatch_in_flight` for its whole bound.
+    pub dispatch_cancel: Option<tokio_util::sync::CancellationToken>,
     /// Timestamp of the most recent Enter while the engine was busy.
     /// Used by `enter_with_double_tap()` / `double_tap_window_open()` to
     /// detect a second Enter inside [`Self::DOUBLE_TAP_WINDOW`].
@@ -3891,6 +3895,16 @@ impl App {
                 .task_panel
                 .iter()
                 .any(|task| matches!(task.status.as_str(), "queued" | "running"))
+    }
+
+    /// Abandon a dispatch still resolving its route or waiting on engine
+    /// admission (#6800). Its completion closure then arrives promptly, retires
+    /// `dispatch_in_flight` and restores the unsent message through the normal
+    /// dispatch-error path. A no-op when no dispatch is outstanding.
+    pub fn cancel_in_flight_dispatch(&mut self) {
+        if let Some(cancel) = self.dispatch_cancel.take() {
+            cancel.cancel();
+        }
     }
 
     /// Whether the interface is asking the user to make a decision. Ambient
