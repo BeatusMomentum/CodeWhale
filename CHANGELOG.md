@@ -20,8 +20,9 @@ note below before upgrading.
 - Experimental TypeScript extension host. New in this release and off by
   default: turn it on with `[features] extension_host = true`. A plugin that
   declares a `native` TypeScript or JavaScript entry (the Cordis / DeepSeek
-  Harness plugin model) can contribute tools and slash commands today; nothing
-  else (no hooks, skills, MCP or prompt sections). Its code runs in a separate
+  Harness plugin model) can contribute tools, slash commands, pre-execution
+  policy hooks, additive prompt sections and plugin-local JSON state. Skills
+  and MCP are not host services yet. Its code runs in a separate
   Node process, never inside Codewhale (Bun is an opt-in through
   `[extension_host] runtime`), and every call goes through Codewhale's own gate:
   an extension tool is never treated as read-only, so it always meets the
@@ -42,6 +43,15 @@ note below before upgrading.
   command's name or another plugin's, and a markdown command with the same name
   wins. A command has 30 seconds, and commands are TUI only: the Runtime API
   does not list or run them.
+- Native extension authoring now includes policy listeners through
+  `ctx.on('tools/pre-execute', ...)`, prompt sections through
+  `ctx.prompt.registerSection`, and persistent plugin-local state through
+  `ctx.storage`. Listeners may deny, ask, revise input or annotate; Rust
+  rechecks revised calls and owns every approval. Prompt sections cannot
+  replace the system prompt, and state exposes no session history or secret
+  API. These services share the experimental, off-by-default host's reviewed
+  owner lifecycle and are withdrawn when their owner unloads or is revoked;
+  saved state remains available when the plugin reloads.
 - Extension tool input is checked against the JSON Schema the tool registered,
   before an approval card appears and again before the call reaches the host. An
   invalid call comes back to the model as an error naming what to correct, and
@@ -154,6 +164,11 @@ note below before upgrading.
   one test call before it saves, `/status` shows the router's choice, cost and
   latency, and a failing router is shown as failing
   ([#6525](https://github.com/Hmbown/Codewhale/issues/6525)).
+- ChatGPT sign-in uses Codewhale-owned protected credentials and a model roster
+  fetched for the signed-in account. Account, workspace and issuer changes
+  cannot reuse another roster; a missing or stale roster offers no models.
+  Authentication failures and subscription limits do not silently fall back
+  to a paid API route.
 - Code mode composes MCP and plugin tools and is on by default:
   `execute_tools` programs can call MCP tools, and each nested call passes the
   same approval gate as a direct call, pausing the program for approval when
