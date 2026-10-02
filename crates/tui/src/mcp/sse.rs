@@ -2,22 +2,18 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 
-use super::headers::{apply_safe_custom_headers, with_default_mcp_http_headers};
 use super::http_client::McpHttpClient;
 use super::wire::{
     MAX_SSE_FRAME_BYTES, McpSessionRejected, find_sse_event_separator_bytes,
     is_mcp_stale_session_body, sse_field_value,
 };
-use super::{
-    ERROR_BODY_PREVIEW_BYTES, McpHttpAuth, McpTransport, bounded_body_excerpt, mask_url_secrets,
-};
+use super::{ERROR_BODY_PREVIEW_BYTES, McpTransport, bounded_body_excerpt, mask_url_secrets};
 
 const SSE_INBOUND_CHANNEL_CAPACITY: usize = 4;
 
 pub(super) struct SseTransport {
     pub(super) client: McpHttpClient,
     pub(super) base_url: String,
-    pub(super) auth: McpHttpAuth,
     pub(super) endpoint_url: Option<String>,
     pub(super) receiver: tokio::sync::mpsc::Receiver<SseInbound>,
     pub(super) sse_task: tokio::task::JoinHandle<()>,
@@ -32,14 +28,12 @@ impl SseTransport {
     pub(super) async fn connect(
         client: McpHttpClient,
         url: String,
-        auth: McpHttpAuth,
         cancel_token: tokio_util::sync::CancellationToken,
         endpoint_timeout: Duration,
     ) -> Result<Self> {
         let (tx, rx) = tokio::sync::mpsc::channel(SSE_INBOUND_CHANNEL_CAPACITY);
         let client_clone = client.clone();
         let url_clone = url.clone();
-        let auth_clone = auth.clone();
         let wait_cancel_token = cancel_token.clone();
 
         let sse_task = tokio::spawn(async move {
@@ -50,7 +44,6 @@ impl SseTransport {
             let result = std::panic::AssertUnwindSafe(Self::run_sse_loop(
                 client_clone,
                 url_clone,
-                auth_clone,
                 tx,
                 cancel_token,
             ))
@@ -77,7 +70,6 @@ impl SseTransport {
         let mut transport = Self {
             client,
             base_url: url,
-            auth,
             endpoint_url: None,
             receiver: rx,
             sse_task,
@@ -91,21 +83,16 @@ impl SseTransport {
     async fn run_sse_loop(
         client: McpHttpClient,
         url: String,
-        auth: McpHttpAuth,
         tx: tokio::sync::mpsc::Sender<SseInbound>,
         cancel_token: tokio_util::sync::CancellationToken,
     ) -> Result<()> {
-        let headers = tokio::select! {
+        let request = tokio::select! {
             biased;
             _ = cancel_token.cancelled() => {
                 anyhow::bail!("MCP SSE connect cancelled before authentication completed")
             }
-            headers = auth.resolved_headers() => headers?,
+            request = client.prepare_mcp_request(client.get(&url), false) => request?,
         };
-        let request = apply_safe_custom_headers(
-            with_default_mcp_http_headers(client.get(&url), false),
-            &headers,
-        );
         let response = tokio::select! {
             biased;
             _ = cancel_token.cancelled() => {
@@ -121,7 +108,7 @@ impl SseTransport {
         let status = response.status();
         if !status.is_success() {
             let body_excerpt = bounded_body_excerpt(response, ERROR_BODY_PREVIEW_BYTES).await;
-            let body_excerpt = auth.server_error_preview(&body_excerpt);
+            let body_excerpt = client.server_error_preview(&body_excerpt);
             anyhow::bail!(
                 "MCP SSE rejected (transport=http url={} status={}): {}",
                 mask_url_secrets(&url),
@@ -277,12 +264,11 @@ impl McpTransport for SseTransport {
             .as_ref()
             .context("SSE endpoint not yet discovered")?
             .clone();
-        let headers = self.auth.resolved_headers().await?;
-        let request = apply_safe_custom_headers(
-            with_default_mcp_http_headers(self.client.post(&endpoint), true),
-            &headers,
-        )
-        .body(msg);
+        let request = self
+            .client
+            .prepare_mcp_request(self.client.post(&endpoint), true)
+            .await?
+            .body(msg);
         let response = self.client.send(request).await.with_context(|| {
             format!(
                 "MCP SSE POST send failed (transport=sse endpoint={})",
@@ -293,7 +279,7 @@ impl McpTransport for SseTransport {
         if !status.is_success() {
             let body_excerpt = bounded_body_excerpt(response, ERROR_BODY_PREVIEW_BYTES).await;
             let stale_session = is_mcp_stale_session_body(&body_excerpt);
-            let body_excerpt = self.auth.server_error_preview(&body_excerpt);
+            let body_excerpt = self.client.server_error_preview(&body_excerpt);
             if stale_session {
                 return Err(McpSessionRejected(format!(
                     "MCP session expired (transport=sse endpoint={} status={}): {}",
@@ -350,7 +336,7 @@ impl Drop for SseTransport {
 mod endpoint_tests {
     use std::time::Duration;
 
-    use super::{McpHttpAuth, McpHttpClient, SseInbound, SseTransport};
+    use super::{McpHttpClient, SseInbound, SseTransport};
 
     #[test]
     fn resolve_endpoint_accepts_relative_and_same_origin() {
@@ -404,7 +390,6 @@ mod endpoint_tests {
             )
             .unwrap(),
             base_url: "https://example.invalid/sse".to_string(),
-            auth: McpHttpAuth::default(),
             endpoint_url: None,
             receiver: rx,
             sse_task: tokio::spawn(async {}),
@@ -467,7 +452,6 @@ mod endpoint_tests {
         SseTransport::connect(
             client,
             url,
-            McpHttpAuth::default(),
             tokio_util::sync::CancellationToken::new(),
             Duration::from_secs(5),
         )

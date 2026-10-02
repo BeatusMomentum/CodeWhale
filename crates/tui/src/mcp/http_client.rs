@@ -4,6 +4,8 @@
 //! operator. Explicit local endpoints/private-network opt-ins and selected
 //! operator proxy routes carry authority only on their exact configured origin.
 //! Model-added endpoints and server-selected secondary origins stay public.
+//! The same client owns MCP request-time auth/header resolution for HTTP,
+//! Streamable HTTP and SSE. OAuth retains the raw guarded request path.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -13,8 +15,114 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use reqwest::{Method, Request, Response, Url, header};
 
+use super::headers::{apply_safe_custom_headers, with_default_mcp_http_headers};
+use super::{McpServerConfig, ReviewedPluginMcpSource, oauth};
 use crate::network_policy::{Decision, NetworkPolicyDecider};
 use crate::tools::web::guard::{guarded_reqwest_client_builder, is_restricted_ip};
+
+#[derive(Clone, Default)]
+pub(super) struct McpHttpAuth {
+    pub(super) server_name: String,
+    pub(super) headers: HashMap<String, String>,
+    pub(super) env_headers: HashMap<String, String>,
+    pub(super) bearer_token_env_var: Option<String>,
+    pub(super) oauth: Option<oauth::McpOAuthRuntime>,
+    /// Whether the server's *configuration* routes authentication through
+    /// OAuth, independent of whether a credential is cached yet: a URL-based
+    /// server that is neither plugin-contributed nor supplied a manual
+    /// bearer/Authorization credential (#6030).
+    ///
+    /// This is [`oauth::server_supports_oauth_login`] — the same predicate the
+    /// login flow itself is gated on — so the recovery copy it selects
+    /// (`/mcp login <name>`) names a command that will actually run. A live
+    /// [`Self::oauth`] runtime always implies it: the runtime is only built
+    /// for a server that passes this predicate. A first-run OAuth server has
+    /// no runtime yet, which is exactly the case that used to fall through to
+    /// the bearer-token copy.
+    pub(super) oauth_configured: bool,
+    pub(super) suppress_server_error_details: bool,
+    pub(super) reviewed_plugin: Option<ReviewedPluginMcpSource>,
+}
+
+impl McpHttpAuth {
+    pub(super) fn from_config(
+        server_name: &str,
+        config: &McpServerConfig,
+        oauth: Option<oauth::McpOAuthRuntime>,
+    ) -> Self {
+        Self {
+            server_name: server_name.to_string(),
+            headers: config.headers.clone(),
+            env_headers: config.env_headers.clone(),
+            bearer_token_env_var: config.bearer_token_env_var.clone(),
+            oauth,
+            oauth_configured: oauth::server_supports_oauth_login(config),
+            suppress_server_error_details: config.reviewed_plugin.is_some(),
+            reviewed_plugin: config.reviewed_plugin.clone(),
+        }
+    }
+
+    pub(super) fn server_error_preview(&self, preview: &str) -> String {
+        if self.suppress_server_error_details {
+            "<server details suppressed for reviewed plugin>".to_string()
+        } else {
+            preview.to_string()
+        }
+    }
+
+    pub(super) async fn resolved_headers(&self) -> Result<HashMap<String, String>> {
+        if let Some(source) = self.reviewed_plugin.as_ref() {
+            source.validate_before_use(&self.server_name, "authenticate request to")?;
+        }
+        let mut headers = self.headers.clone();
+        for (name, env_var) in &self.env_headers {
+            let value = self.reviewed_plugin.as_ref().map_or_else(
+                || std::env::var(env_var),
+                |source| source.host_environment.var(env_var),
+            );
+            if let Ok(value) = value
+                && !value.trim().is_empty()
+            {
+                headers.insert(name.clone(), value);
+            }
+        }
+        if !mcp_headers_have_authorization(&headers)
+            && let Some(env_var) = self.bearer_token_env_var.as_deref()
+            && let Ok(token) = self.reviewed_plugin.as_ref().map_or_else(
+                || std::env::var(env_var),
+                |source| source.host_environment.var(env_var),
+            )
+        {
+            let token = token.trim();
+            if !token.is_empty() {
+                headers.insert("Authorization".to_string(), format!("Bearer {token}"));
+            }
+        }
+        if !mcp_headers_have_authorization(&headers)
+            && let Some(oauth) = &self.oauth
+        {
+            let authorization = match oauth.authorization_header().await {
+                Ok(authorization) => authorization,
+                Err(_) if self.suppress_server_error_details => {
+                    anyhow::bail!(
+                        "Reviewed plugin MCP authentication failed (provider details suppressed)"
+                    )
+                }
+                Err(error) => return Err(error),
+            };
+            if let Some(value) = authorization {
+                headers.insert("Authorization".to_string(), value);
+            }
+        }
+        Ok(headers)
+    }
+}
+
+pub(super) fn mcp_headers_have_authorization(headers: &HashMap<String, String>) -> bool {
+    headers
+        .keys()
+        .any(|key| key.trim().eq_ignore_ascii_case("authorization"))
+}
 
 #[derive(Clone)]
 pub(super) struct McpHttpClient {
@@ -28,6 +136,9 @@ pub(super) struct McpHttpClient {
     connect_timeout: Duration,
     read_timeout: Duration,
     default_headers: header::HeaderMap,
+    // Bound once after OAuth setup; clones keep the same request-time authority.
+    // Raw OAuth execute/send deliberately do not resolve this MCP auth policy.
+    mcp_auth: McpHttpAuth,
     request_builder: reqwest::Client,
     clients: Arc<Mutex<HashMap<String, reqwest::Client>>>,
 }
@@ -60,9 +171,47 @@ impl McpHttpClient {
             connect_timeout,
             read_timeout,
             default_headers: header::HeaderMap::new(),
+            mcp_auth: McpHttpAuth::default(),
             request_builder: guarded_reqwest_client_builder().build()?,
             clients: Arc::new(Mutex::new(HashMap::new())),
         })
+    }
+
+    /// Bind the server's request-time credentials to its guarded HTTP session.
+    pub(super) fn with_mcp_auth(mut self, auth: McpHttpAuth) -> Self {
+        self.mcp_auth = auth;
+        self
+    }
+
+    /// Prepare the MCP request's fixed framing headers and live credentials.
+    /// This remains separate from send so callers retain their existing auth,
+    /// header and long-lived-body cancellation/deadline boundaries. OAuth uses
+    /// raw execute/send and must never inherit the MCP bearer/header pass.
+    pub(super) async fn prepare_mcp_request(
+        &self,
+        request: reqwest::RequestBuilder,
+        json_body: bool,
+    ) -> Result<reqwest::RequestBuilder> {
+        let headers = self.mcp_auth.resolved_headers().await?;
+        Ok(apply_safe_custom_headers(
+            with_default_mcp_http_headers(request, json_body),
+            &headers,
+        ))
+    }
+
+    /// Only an explicit unauthorized response lets the transport request this
+    /// refresh; the session performs no replay or automatic send of its own.
+    pub(super) async fn refresh_mcp_oauth(&self) -> Option<Result<()>> {
+        let oauth = self.mcp_auth.oauth.as_ref()?;
+        Some(oauth.force_refresh().await)
+    }
+
+    pub(super) fn oauth_configured(&self) -> bool {
+        self.mcp_auth.oauth_configured
+    }
+
+    pub(super) fn server_error_preview(&self, preview: &str) -> String {
+        self.mcp_auth.server_error_preview(preview)
     }
 
     pub(super) fn with_default_headers(mut self, headers: header::HeaderMap) -> Self {
@@ -701,5 +850,178 @@ mod tests {
         // The event stream and its POSTs share one pooled client.
         assert_eq!(client.clients.lock().unwrap().len(), 1);
         drop(stream);
+    }
+
+    #[tokio::test]
+    async fn mcp_session_clones_resolve_current_credentials_and_keep_framing() {
+        let _env = crate::test_support::lock_test_env();
+        crate::tls::ensure_rustls_crypto_provider();
+        let _first_token = crate::test_support::EnvVarGuard::set(
+            "CODEWHALE_TEST_MCP_SESSION_BEARER",
+            "first-fixture",
+        );
+        let _first_header = crate::test_support::EnvVarGuard::set(
+            "CODEWHALE_TEST_MCP_SESSION_HEADER",
+            "first-header",
+        );
+        let url = "https://example.invalid/mcp";
+        let session = client(url, false).with_mcp_auth(McpHttpAuth {
+            headers: HashMap::from([
+                ("Accept".to_string(), "incorrect-accept".to_string()),
+                ("Content-Type".to_string(), "incorrect-type".to_string()),
+                ("X-Live".to_string(), "static-header".to_string()),
+                ("X-Unsafe".to_string(), "fixture\r\ninjected".to_string()),
+            ]),
+            env_headers: HashMap::from([(
+                "X-Live".to_string(),
+                "CODEWHALE_TEST_MCP_SESSION_HEADER".to_string(),
+            )]),
+            bearer_token_env_var: Some("CODEWHALE_TEST_MCP_SESSION_BEARER".to_string()),
+            ..Default::default()
+        });
+        let cloned = session.clone();
+        let first = session
+            .prepare_mcp_request(
+                session
+                    .post(url)
+                    .header("Mcp-Session-Id", "session-fixture"),
+                true,
+            )
+            .await
+            .unwrap()
+            .build()
+            .unwrap();
+        assert_eq!(
+            first.headers().get(header::AUTHORIZATION).unwrap(),
+            "Bearer first-fixture"
+        );
+        assert_eq!(first.headers().get("X-Live").unwrap(), "first-header");
+        assert_eq!(
+            first.headers().get(header::ACCEPT).unwrap(),
+            super::super::headers::MCP_HTTP_ACCEPT
+        );
+        assert_eq!(
+            first.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/json"
+        );
+        assert_eq!(
+            first.headers().get("Mcp-Session-Id").unwrap(),
+            "session-fixture"
+        );
+        assert!(!first.headers().contains_key("X-Unsafe"));
+
+        let _next_token = crate::test_support::EnvVarGuard::set(
+            "CODEWHALE_TEST_MCP_SESSION_BEARER",
+            "second-fixture",
+        );
+        let _next_header = crate::test_support::EnvVarGuard::set(
+            "CODEWHALE_TEST_MCP_SESSION_HEADER",
+            "second-header",
+        );
+        let next = cloned
+            .prepare_mcp_request(cloned.get(url), false)
+            .await
+            .unwrap()
+            .build()
+            .unwrap();
+        assert_eq!(
+            next.headers().get(header::AUTHORIZATION).unwrap(),
+            "Bearer second-fixture"
+        );
+        assert_eq!(next.headers().get("X-Live").unwrap(), "second-header");
+        assert_eq!(
+            next.headers().get(header::ACCEPT).unwrap(),
+            super::super::headers::MCP_HTTP_ACCEPT
+        );
+        assert!(!next.headers().contains_key(header::CONTENT_TYPE));
+        assert!(!next.headers().contains_key("X-Unsafe"));
+    }
+
+    #[tokio::test]
+    async fn raw_oauth_execute_does_not_inherit_bound_mcp_credentials() {
+        let _env = crate::test_support::lock_test_env();
+        let _no_proxy = crate::test_support::EnvVarGuard::set("NO_PROXY", "*");
+        crate::tls::ensure_rustls_crypto_provider();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let url = format!("{origin}/mcp");
+        let server = tokio::spawn(async move {
+            let mut seen = Vec::new();
+            for _ in 0..2 {
+                let (mut socket, _) =
+                    tokio::time::timeout(Duration::from_secs(5), listener.accept())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                let mut bytes = Vec::new();
+                let mut buffer = [0u8; 2048];
+                while !bytes.windows(4).any(|part| part == b"\r\n\r\n") {
+                    let n = socket.read(&mut buffer).await.unwrap();
+                    assert!(n > 0);
+                    bytes.extend_from_slice(&buffer[..n]);
+                }
+                seen.push(String::from_utf8(bytes).unwrap().to_ascii_lowercase());
+                socket
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 2\r\n\r\nok",
+                    )
+                    .await
+                    .unwrap();
+            }
+            seen
+        });
+        let session = client(&url, false).with_mcp_auth(McpHttpAuth {
+            headers: HashMap::from([
+                (
+                    "Authorization".to_string(),
+                    "Bearer mcp-only-fixture".to_string(),
+                ),
+                (
+                    "X-Mcp-Credential".to_string(),
+                    "mcp-custom-fixture".to_string(),
+                ),
+            ]),
+            ..Default::default()
+        });
+        let request = session
+            .prepare_mcp_request(session.post(&url), true)
+            .await
+            .unwrap();
+        assert_eq!(
+            session
+                .send(request.body("{}"))
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap(),
+            "ok"
+        );
+        let token_url = format!("{origin}/token");
+        let oauth_request = session
+            .clone()
+            .post(&token_url)
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body("code=fixture")
+            .build()
+            .unwrap();
+        assert_eq!(
+            session
+                .execute(oauth_request, false)
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap(),
+            "ok"
+        );
+        let seen = server.await.unwrap();
+        assert!(seen[0].contains("authorization: bearer mcp-only-fixture"));
+        assert!(seen[0].contains("x-mcp-credential: mcp-custom-fixture"));
+        assert!(!seen[1].contains("mcp-only-fixture"));
+        assert!(!seen[1].contains("mcp-custom-fixture"));
+        assert!(!seen[1].contains("authorization:"));
+        assert!(!seen[1].contains("accept: application/json, text/event-stream"));
+        assert!(seen[1].contains("content-type: application/x-www-form-urlencoded"));
     }
 }

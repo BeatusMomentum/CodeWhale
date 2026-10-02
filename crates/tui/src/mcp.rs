@@ -32,7 +32,8 @@ mod stdio;
 mod streamable_http;
 mod wire;
 
-use self::http::{HttpTransport, McpHttpAuth};
+use self::http::HttpTransport;
+use self::http_client::McpHttpAuth;
 #[cfg(all(test, unix))]
 use self::process_broker::STDIO_SHUTDOWN_GRACE;
 use self::sse::SseTransport;
@@ -1934,13 +1935,13 @@ impl McpConnection {
                     }
                 }
             };
-            let http_auth = McpHttpAuth::from_config(&name, &config, oauth_runtime);
+            let client =
+                client.with_mcp_auth(McpHttpAuth::from_config(&name, &config, oauth_runtime));
             if is_legacy_sse_transport(&config) {
                 Box::new(
                     SseTransport::connect(
                         client,
                         url.clone(),
-                        http_auth,
                         cancel_token.clone(),
                         Duration::from_secs(connect_timeout_secs),
                     )
@@ -1950,7 +1951,6 @@ impl McpConnection {
                 let mut http = HttpTransport::new(
                     client,
                     url.clone(),
-                    http_auth,
                     cancel_token.clone(),
                     Duration::from_secs(connect_timeout_secs),
                 );

@@ -1,5 +1,6 @@
 use super::headers::{MCP_HTTP_ACCEPT, is_safe_custom_header, with_default_mcp_http_headers};
-use super::http::{HttpTransport, McpHttpAuth};
+use super::http::HttpTransport;
+use super::http_client::McpHttpAuth;
 use super::streamable_http::StreamableHttpTransport;
 use super::wire::{
     find_sse_event_separator, find_sse_event_separator_bytes, is_mcp_stale_session_error,
@@ -781,19 +782,34 @@ fn default_mcp_http_post_accepts_json_and_event_stream() {
     );
 }
 
-#[test]
-fn streamable_http_transport_stores_headers() {
+#[tokio::test]
+async fn streamable_http_transport_prepares_configured_headers() {
     let mut headers = HashMap::new();
     headers.insert("Authorization".to_string(), "Bearer xyz".to_string());
+    let url = "https://example.invalid/mcp";
     let transport = StreamableHttpTransport::new(
-        test_mcp_http_client("https://example.invalid/mcp"),
-        "https://example.invalid/mcp".to_string(),
-        McpHttpAuth {
-            headers: headers.clone(),
+        test_mcp_http_client(url).with_mcp_auth(McpHttpAuth {
+            headers,
             ..Default::default()
-        },
+        }),
+        url.to_string(),
     );
-    assert_eq!(transport.auth.headers, headers);
+    let request = transport
+        .client
+        .prepare_mcp_request(transport.client.post(&transport.url), true)
+        .await
+        .unwrap()
+        .build()
+        .unwrap();
+    assert_eq!(
+        request.headers().get("Authorization").unwrap(),
+        "Bearer xyz"
+    );
+    assert_eq!(request.headers().get(ACCEPT).unwrap(), MCP_HTTP_ACCEPT);
+    assert_eq!(
+        request.headers().get(CONTENT_TYPE).unwrap(),
+        "application/json"
+    );
 }
 
 #[test]
@@ -5537,15 +5553,10 @@ async fn sse_connect_waits_for_endpoint_before_first_send() {
 
     let url = format!("http://{addr}/sse");
     let client = test_mcp_http_client(&url);
-    let mut transport = SseTransport::connect(
-        client,
-        url,
-        McpHttpAuth::default(),
-        cancel_token.clone(),
-        Duration::from_secs(2),
-    )
-    .await
-    .unwrap();
+    let mut transport =
+        SseTransport::connect(client, url, cancel_token.clone(), Duration::from_secs(2))
+            .await
+            .unwrap();
 
     transport
         .send(json_frame(serde_json::json!({
@@ -5628,15 +5639,10 @@ async fn sse_connect_accepts_crlf_endpoint_events() {
 
     let url = format!("http://{addr}/sse");
     let client = test_mcp_http_client(&url);
-    let mut transport = SseTransport::connect(
-        client,
-        url,
-        McpHttpAuth::default(),
-        cancel_token.clone(),
-        Duration::from_secs(2),
-    )
-    .await
-    .unwrap();
+    let mut transport =
+        SseTransport::connect(client, url, cancel_token.clone(), Duration::from_secs(2))
+            .await
+            .unwrap();
 
     transport
         .send(json_frame(serde_json::json!({
@@ -5731,12 +5737,11 @@ async fn sse_transport_applies_custom_headers_to_get_and_post() {
     let mut headers = HashMap::new();
     headers.insert("X-Custom-Auth".to_string(), "my-test-token".to_string());
     let mut transport = SseTransport::connect(
-        client,
-        url,
-        McpHttpAuth {
+        client.with_mcp_auth(McpHttpAuth {
             headers,
             ..Default::default()
-        },
+        }),
+        url,
         cancel_token.clone(),
         Duration::from_secs(2),
     )
@@ -5820,15 +5825,10 @@ async fn sse_post_error_includes_response_body_excerpt() {
 
     let url = format!("http://{addr}/sse");
     let client = test_mcp_http_client(&url);
-    let mut transport = SseTransport::connect(
-        client,
-        url,
-        McpHttpAuth::default(),
-        cancel_token.clone(),
-        Duration::from_secs(2),
-    )
-    .await
-    .unwrap();
+    let mut transport =
+        SseTransport::connect(client, url, cancel_token.clone(), Duration::from_secs(2))
+            .await
+            .unwrap();
 
     let err = transport
         .send(json_frame(serde_json::json!({
@@ -6221,7 +6221,6 @@ async fn legacy_sse_session_expiry_is_marked_stale() {
     let mut transport = SseTransport {
         client: test_mcp_http_client(&format!("http://{addr}/sse")),
         base_url: format!("http://{addr}/sse"),
-        auth: McpHttpAuth::default(),
         endpoint_url: Some(format!("http://{addr}/messages")),
         receiver,
         sse_task,
@@ -6636,7 +6635,6 @@ fn session_id_starts_none() {
     let transport = StreamableHttpTransport::new(
         test_mcp_http_client("https://example.invalid/mcp"),
         "https://example.invalid/mcp".to_string(),
-        McpHttpAuth::default(),
     );
     assert!(transport.session_id.is_none());
 }
@@ -6684,8 +6682,7 @@ async fn session_id_captured_from_post_response_and_replayed() {
     });
 
     let url = format!("http://{addr}/mcp");
-    let mut transport =
-        StreamableHttpTransport::new(test_mcp_http_client(&url), url, McpHttpAuth::default());
+    let mut transport = StreamableHttpTransport::new(test_mcp_http_client(&url), url);
 
     // First send: server returns Mcp-Session-Id.
     transport
@@ -6760,12 +6757,11 @@ async fn custom_headers_applied_to_get_preflight() {
     headers.insert("X-Custom-Auth".to_string(), "my-test-token".to_string());
 
     let mut transport = HttpTransport::new(
-        test_mcp_http_client(&url),
-        url,
-        McpHttpAuth {
+        test_mcp_http_client(&url).with_mcp_auth(McpHttpAuth {
             headers,
             ..Default::default()
-        },
+        }),
+        url,
         tokio_util::sync::CancellationToken::new(),
         Duration::from_secs(10),
     );

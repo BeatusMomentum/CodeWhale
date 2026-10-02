@@ -4,16 +4,13 @@ use anyhow::{Context, Result};
 use reqwest::StatusCode;
 use reqwest::header::CONTENT_TYPE;
 
-use super::headers::{apply_safe_custom_headers, with_default_mcp_http_headers};
 use super::http_client::McpHttpClient;
 use super::wire::{MAX_MCP_RESPONSE_BYTES, parse_sse_message_data};
-use super::{ERROR_BODY_PREVIEW_BYTES, McpHttpAuth, bounded_body_excerpt, mask_url_secrets};
+use super::{ERROR_BODY_PREVIEW_BYTES, bounded_body_excerpt, mask_url_secrets};
 
 pub(super) struct StreamableHttpTransport {
     pub(super) client: McpHttpClient,
     pub(super) url: String,
-    /// Request-time auth and custom header resolver for outbound POSTs.
-    pub(super) auth: McpHttpAuth,
     pending_messages: VecDeque<Vec<u8>>,
     /// Per-spec MCP session identifier returned by the server in the
     /// first response (typically the `initialize` response). Attached
@@ -36,11 +33,10 @@ pub(super) enum StreamableSendError {
 }
 
 impl StreamableHttpTransport {
-    pub(super) fn new(client: McpHttpClient, url: String, auth: McpHttpAuth) -> Self {
+    pub(super) fn new(client: McpHttpClient, url: String) -> Self {
         Self {
             client,
             url,
-            auth,
             pending_messages: VecDeque::new(),
             session_id: None,
             protocol_version: None,
@@ -61,17 +57,11 @@ impl StreamableHttpTransport {
         // of a raw rejection that reads like a broken server.
         let mut retried = false;
         loop {
-            // Apply user-configured custom headers after protocol framing so
-            // reserved Accept / Content-Type overrides can be filtered out.
-            let headers = self
-                .auth
-                .resolved_headers()
+            let mut request = self
+                .client
+                .prepare_mcp_request(self.client.post(&self.url), true)
                 .await
                 .map_err(StreamableSendError::Other)?;
-            let mut request = apply_safe_custom_headers(
-                with_default_mcp_http_headers(self.client.post(&self.url), true),
-                &headers,
-            );
             // Attach any previously captured session ID per the Streamable
             // HTTP spec so the server can correlate this request to the
             // existing session.
@@ -109,8 +99,8 @@ impl StreamableHttpTransport {
             }
 
             if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
-                if !retried && let Some(oauth) = self.auth.oauth.as_ref() {
-                    match oauth.force_refresh().await {
+                if !retried && let Some(refresh) = self.client.refresh_mcp_oauth().await {
+                    match refresh {
                         Ok(()) => {
                             retried = true;
                             continue;
@@ -124,7 +114,7 @@ impl StreamableHttpTransport {
                         }
                     }
                 }
-                let hint = unauthorized_session_hint(self.auth.oauth_configured);
+                let hint = unauthorized_session_hint(self.client.oauth_configured());
                 return Err(StreamableSendError::Other(anyhow::anyhow!(
                     "MCP server {} rejected the request with {status}; the session is no longer accepted. {hint}",
                     mask_url_secrets(&self.url),
@@ -135,7 +125,7 @@ impl StreamableHttpTransport {
                 let body_excerpt = bounded_body_excerpt(response, ERROR_BODY_PREVIEW_BYTES).await;
                 let stale_session = self.session_id.is_some()
                     && is_streamable_http_stale_session_status(status, &body_excerpt);
-                let body_excerpt = self.auth.server_error_preview(&body_excerpt);
+                let body_excerpt = self.client.server_error_preview(&body_excerpt);
                 if stale_session {
                     return Err(StreamableSendError::StaleSession(format!(
                         "status={status} body={body_excerpt}"
@@ -232,7 +222,7 @@ fn oauth_refresh_failed_hint() -> &'static str {
 }
 
 /// TUI recovery for a rejected OAuth session. `oauth_configured` is the
-/// server's configured auth path ([`McpHttpAuth::oauth_configured`]), not the
+/// server's configured auth path ([`McpHttpClient::oauth_configured`]), not the
 /// presence of a cached token, so a first-run OAuth server — a 401 with
 /// nothing stored yet — is still pointed at `/mcp login <name>` rather than at
 /// a bearer token it never had (#6030). Servers where a bearer credential is
@@ -270,8 +260,9 @@ fn is_streamable_http_stale_session_status(status: StatusCode, body_excerpt: &st
 
 #[cfg(test)]
 mod tests {
-    use super::{McpHttpAuth, oauth_refresh_failed_hint, unauthorized_session_hint};
+    use super::{oauth_refresh_failed_hint, unauthorized_session_hint};
     use crate::mcp::McpServerConfig;
+    use crate::mcp::http_client::McpHttpAuth;
 
     fn server_config(json: serde_json::Value) -> McpServerConfig {
         serde_json::from_value(json).expect("MCP server config fixture")
