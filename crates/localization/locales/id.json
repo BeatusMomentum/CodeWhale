@@ -1,4 +1,5 @@
 {
+  "ExtensionPromptUnavailable": "Instruksi ekstensi tidak tersedia; periksa /plugin show.",
   "ComposerOversizedSubmitHeld": "Belum terkirim: pesan ini melebihi {limit} karakter dan tidak dapat disimpan sebagai berkas teks tempelan ({error}). Teks lengkap masih ada di kolom input: persingkat teks atau izinkan penulisan ke .codewhale/pastes, lalu tekan Enter lagi.",
   "ComposerOversizedSubmitHeldShort": "Belum terkirim: melebihi {limit} karakter; berkas tempelan tidak tersimpan.",
   "CmdPluginOwnerReport": "Host ekstensi:\n  Status: {state}\n  Alat aktif ({count}): {tools}",

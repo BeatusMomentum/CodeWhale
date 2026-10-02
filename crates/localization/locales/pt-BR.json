@@ -1,4 +1,5 @@
 {
+  "ExtensionPromptUnavailable": "As instruções das extensões não estão disponíveis; confira /plugin show.",
   "ComposerOversizedSubmitHeld": "Não enviado: esta mensagem excede {limit} caracteres e não pôde ser salva em um arquivo de texto colado ({error}). O texto completo continua no campo de entrada: reduza-o ou permita a gravação em .codewhale/pastes e pressione Enter novamente.",
   "ComposerOversizedSubmitHeldShort": "Não enviado: acima de {limit} caracteres; arquivo colado não salvo.",
   "CmdPluginOwnerReport": "Host de extensões:\n  Estado: {state}\n  Ferramentas ativas ({count}): {tools}",

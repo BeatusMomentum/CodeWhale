@@ -6009,9 +6009,15 @@ impl Engine {
                     Ok(block) => block,
                     Err(reason) => {
                         tracing::warn!(%reason, "extension prompt contributions unavailable");
-                        let _ = self.send_event(Event::status(
-                            "Extension prompt contributions are unavailable; inspect /plugin show.".to_string(),
-                        )).await;
+                        let _ = self
+                            .send_event(Event::status(
+                                codewhale_localization::tr(
+                                    codewhale_localization::resolve_locale(&self.config.locale_tag),
+                                    codewhale_localization::MessageId::ExtensionPromptUnavailable,
+                                )
+                                .to_string(),
+                            ))
+                            .await;
                         None
                     }
                 }
