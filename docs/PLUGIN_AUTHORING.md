@@ -144,6 +144,7 @@ All components use the same bundle review and existing Codewhale runtime:
 | Commands | Markdown command files; [command metadata](architecture/command-dispatch.md#user-commands). |
 | Agent profiles | Fleet TOML profiles; [Fleet authoring](FLEET.md#authoring-agent-profiles-fleet-setup). |
 | Hooks | `HooksConfig` TOML files; [events and process behavior](HOOKS.md). |
+| Native mods (experimental) | Reviewed ESM entries contributing tools, commands, pre-execute listeners, prompt sections and owner-local JSON state; [extension contract](EXTENSIONS.md). |
 
 Declare Commands, Agents, and Hooks paths under
 `extensions["net.codewhale"]` in `plugin.json`, as specified in
@@ -160,6 +161,50 @@ reviewed build can satisfy that gate without a prompt
 For a tested typed example, lifecycle rules and per-plugin diagnostics, read
 [Writing an extension tool](EXTENSIONS.md). `.mts` supports Node's erasable
 types without a separate compiler; syntax needing transformation is not supported.
+
+## Write a scoped native mod
+
+The [mod-extension example](examples/plugins/mod-extension/README.md) is a
+runnable ESM bundle with no package installation or compiler step. It registers
+`mod_counter`, `/mod-count`, one prompt section, and a pre-execute listener
+limited to its own tool. The tool returns a structured JSON counter value;
+`ctx.storage` keeps that value in the owner directory Rust assigned. Its
+idempotent disposers remove registrations and wait for queued work. Disable
+withdraws the prompt section and listener while retaining the stored counter.
+
+Enable the experimental `extension_host` feature explicitly, install the
+example directory, validate and inspect its Native capability, then personally
+review and trust its exact content/capability hashes before enabling it. With
+the feature off, native code remains inventory-only. Source changes require
+another review; `/plugin reload` is explicit, not a hot-reload watcher.
+
+The available author services are `tools`, `commands`, `prompt`, `storage`,
+`logger`, and Cordis lifecycle facilities. `ctx.on('tools/pre-execute', ...)`
+may abstain, deny, ask, revise object input or annotate context. Rust folds those
+proposals and repeats planning and admission checks for revised input. `allow`
+does not approve anything; `next()` abstains. Errors, malformed answers,
+timeouts and withdrawn owners fail closed. This is a pre-execute proposal
+contract, with no around-execution middleware or post-result rewriting.
+
+`ctx.prompt.registerSection({id, text})` proposes bounded, attributed
+instructions delivered through the existing Engine runtime-message path.
+`ctx.storage.get/set/delete` handles bounded owner-local JSON, including state
+across generations. Neither API replaces the system prompt, session store or
+credentials. Tool and command invocations expose optional frozen `sessionId`,
+`agentId` and `originTurnId` labels supplied for that call, not runtime handles.
+The public author SDK is not published; the example uses the documented shims.
+
+Custom Ratatui/GPUI widgets, DSH browser UI slots, skill-root registration,
+native `dsh.bundle.patch` execution and DSH's agent runtime are not provided.
+The static importer described below still converts only its portable subset.
+Compatible Claude bundles still use the existing declarative component adapters;
+this Native API does not load Claude's agent loop or automatically adapt Pi's
+extension API. Port executable mod behavior against the documented host contract.
+An extension tool can use `exec.core.call` only during its direct model
+invocation under the shared turn gate. Commands and activation have no core
+handle. Nested shell and network calls force a user prompt; a mode that cannot
+open one refuses them. See [the exact core-call contract](EXTENSIONS.md#asking-the-core-to-run-a-tool)
+for refused tools, cancellation and call limits.
 
 Plugin trust is **not an OS sandbox**. A local MCP server or hook can launch a
 process; review its code and authority before enabling it. Skills do not grant
@@ -301,8 +346,10 @@ children only when those directories live inside the package. Default user and
 project skill roots, watchers and foreign service dependencies are not imported.
 Arbitrary DSH TypeScript plugin execution is outside this importer's scope.
 DSH TypeScript plugin code runs only through the experimental TypeScript
-extension host (`[features] extension_host`, off by default), which covers
-tools only; see [EXTENSIONS.md](EXTENSIONS.md) and
+extension host (`[features] extension_host`, off by default), which now supports
+tools, slash commands, scoped pre-execute proposals, additive prompt sections
+and owner-local storage through an explicitly authored Native entry. It does
+not execute the imported `dsh.bundle.patch` composition. See [EXTENSIONS.md](EXTENSIONS.md) and
 [design/TS_EXTENSION_HOST.md](design/TS_EXTENSION_HOST.md).
 
 ### Local Node MCP servers
