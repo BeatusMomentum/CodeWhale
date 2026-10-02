@@ -44,10 +44,11 @@ exec-persistent-service = { max-threads = 1 }
 # (a durable heartbeat and a `ps` sample on every scheduler tick) is now
 # bounded to once a second per worker.
 fleet-manager-lifecycle = { max-threads = 1 }
-# Extension fixtures launch real Node hosts with a five-second production
-# handshake deadline. Windows full-suite runs on #6776/#6780 reported ordinary
-# hosts missing that deadline. Bound contention across nextest processes;
-# keep production deadlines and the explicit hang-detection tests unchanged.
+# Extension fixtures launch real Node hosts, and the production handshake
+# deadline is 30 s (`HANDSHAKE_DEADLINE`, raised from 5 s: Windows full-suite
+# runs on #6776/#6780 reported ordinary hosts missing the old one). Bound
+# contention across nextest processes; keep production deadlines and the
+# explicit hang-detection tests unchanged.
 extension-host = { max-threads = 1 }
 
 # First matching test-group override wins. Keep these more-specific

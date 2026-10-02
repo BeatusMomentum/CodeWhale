@@ -7,8 +7,9 @@
  * package declared it, and ignoring any copy under the package's own
  * `node_modules` — resolves to the single instance bundled into this host.
  *
- * `@deepseek-ai/dsh-tools` resolves to the definition-side compat module.
- * Any other `@deepseek-ai/dsh-*` package fails the import loudly: the host
+ * `@deepseek-ai/dsh-tools` resolves to the definition-side compat module, and
+ * `@deepseek-ai/dsh-commands/brand` (the `CommandDefinitionId` constructor DSH
+ * command plugins import) to its two identity functions. Any other `@deepseek-ai/dsh-*` package fails the import loudly: the host
  * does not provide it, and a silent partial load would be worse.
  *
  * Node: `module.registerHooks`. Bun has no `registerHooks` (a named import of
@@ -31,6 +32,11 @@ const SINGLETONS: Record<string, string> = {
   '@deepseek-ai/dsh-util-values': 'dsh-util-values',
 }
 
+/** Subpaths of a refused package that are provided anyway: exact specifier → singleton key. */
+const SUBPATH_SINGLETONS: Record<string, string> = {
+  '@deepseek-ai/dsh-commands/brand': 'dsh-commands-brand',
+}
+
 export class UnsupportedPeerError extends Error {
   constructor(readonly specifier: string) {
     super(`requires \`${specifier}\`, which the Codewhale extension host does not provide`)
@@ -46,6 +52,7 @@ function packageName(specifier: string): string {
 /** Map a bare specifier to a singleton key, `null` for "not ours", or throw for an unsupported DSH peer. */
 export function classifySpecifier(specifier: string): string | null {
   if (specifier.startsWith('.') || specifier.startsWith('/') || specifier.includes(':')) return null
+  if (specifier in SUBPATH_SINGLETONS) return SUBPATH_SINGLETONS[specifier]
   const name = packageName(specifier)
   if (name in SINGLETONS) {
     if (specifier !== name) throw new UnsupportedPeerError(specifier)
@@ -106,7 +113,7 @@ function installBunResolver(modules: Record<string, Record<string, unknown>>) {
   bun.plugin({
     name: 'codewhale-host-modules',
     setup(build: any) {
-      for (const [specifier, key] of Object.entries(SINGLETONS)) {
+      for (const [specifier, key] of Object.entries({ ...SINGLETONS, ...SUBPATH_SINGLETONS })) {
         if (key in modules) build.module(specifier, () => ({ exports: modules[key], loader: 'object' }))
       }
       build.onResolve({ filter: /^[^./]/ }, (args: { path: string }) => {

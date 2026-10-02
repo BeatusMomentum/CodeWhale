@@ -167,6 +167,15 @@ struct Cli {
     /// the subcommand; it is applied before subcommand dispatch.
     #[arg(long = "no-project-config")]
     no_project_config: bool,
+    /// Enable a feature for this run (repeatable); equivalent to
+    /// `[features] <name> = true`. `codewhale features list` shows the names.
+    /// Must appear before the subcommand.
+    #[arg(long = "enable", value_name = "FEATURE", action = clap::ArgAction::Append)]
+    enable: Vec<String>,
+    /// Disable a feature for this run (repeatable); equivalent to
+    /// `[features] <name> = false`. Must appear before the subcommand.
+    #[arg(long = "disable", value_name = "FEATURE", action = clap::ArgAction::Append)]
+    disable: Vec<String>,
     /// Legacy compatibility alias for Act + Full Access.
     #[arg(long, hide = true)]
     yolo: bool,
@@ -5857,6 +5866,14 @@ fn tui_argv(cli: &Cli, passthrough: Vec<String>) -> Vec<String> {
     }
     if cli.no_project_config {
         args.push("--no-project-config".to_string());
+    }
+    for feature in &cli.enable {
+        args.push("--enable".to_string());
+        args.push(feature.clone());
+    }
+    for feature in &cli.disable {
+        args.push("--disable".to_string());
+        args.push(feature.clone());
     }
     args.extend(passthrough);
     args
@@ -11698,6 +11715,34 @@ verbosity = "concise"
                 "{flags:?} must remain launch flags, not a joined prompt"
             );
         }
+    }
+
+    #[test]
+    fn root_feature_toggles_forward_to_the_tui_instead_of_becoming_prompt_text() {
+        // `codewhale --enable extension_host` used to fail: the dispatcher had
+        // no such flag, and the TUI parser rejected the joined prompt text.
+        let cli = parse_ok(&[
+            "codewhale",
+            "--enable",
+            "extension_host",
+            "--disable",
+            "web_search",
+            "--enable",
+            "goals",
+        ]);
+        assert!(cli.prompt.is_empty());
+        assert_eq!(
+            tui_argv(&cli, root_tui_passthrough(&cli).unwrap()),
+            [
+                "codewhale",
+                "--enable",
+                "extension_host",
+                "--enable",
+                "goals",
+                "--disable",
+                "web_search",
+            ]
+        );
     }
 
     #[test]

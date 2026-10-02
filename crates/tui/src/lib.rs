@@ -8935,6 +8935,12 @@ fn install_extension_host_boot_config(config: &Config) {
         crate::extension_host::configure(crate::extension_host::ExtensionHostOptions::from_config(
             config.extension_host.as_ref(),
         ));
+        // Per-plugin settings (`[plugins."<name>".config]`) and the file
+        // `/plugin reload` re-reads them from.
+        crate::extension_host::install_plugin_settings(
+            config.plugins.as_ref(),
+            config.loaded_config_path.clone(),
+        );
     }
 }
 

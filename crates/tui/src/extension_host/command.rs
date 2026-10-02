@@ -1,0 +1,207 @@
+//! Extension slash commands: owned registrations in the user command registry.
+//!
+//! A command mirrors a tool. The host proposes it with `registry/register`
+//! (`kind = "command"`); [`super::registry::OwnerRegistry`] admits or refuses
+//! it under the same owner/generation/handle rules; the admitted commands of
+//! the owners an engine's workspace desires are loaded into the existing
+//! [`crate::commands::user_registry::UserCommandRegistry`] (at the lowest
+//! precedence, so a built-in or a markdown command always wins the spelling);
+//! and a user invocation becomes `command/run` to the host. Revocation,
+//! deactivation, crash and generation change remove the registrations the
+//! same way they remove tools, and each change bumps [`epoch`] so the user
+//! registry reloads.
+//!
+//! What a command can return, chosen from what the user-command machinery
+//! already does: text shown to the user (a `System` transcript cell, like a
+//! built-in's message) and/or a prompt submitted as the user's next message
+//! (`AppAction::SendMessage`, like a markdown command's expanded template).
+//! The host never calls the model or a tool itself: anything the model does
+//! after a `submit` goes through the normal turn, tool approval included.
+//! Invoking a command is the user's own action, so it needs no approval of
+//! its own; it still re-checks that the owner is live, that its reviewed
+//! receipt is current, and that the host is running before anything is sent.
+//!
+//! Known limitations:
+//! * The UI event loop awaits the command (like `/balance`), bounded by
+//!   `SupervisionOptions::command_run_deadline` (30 s) and then cancelled with
+//!   `$/cancel`. A keypress does not cancel it earlier.
+//! * Commands are TUI-only: the Runtime API's `GET /v1/commands` omits them
+//!   and cannot run them.
+//! * A clash with a user, workspace or manifest (markdown) command is not a
+//!   registration-time refusal, because only the user registry knows the
+//!   workspace: the markdown command wins and the extension command is left
+//!   out with a load error.
+//! * The handler gets no agent or session handle, and no attachments. It is
+//!   told the workspace the command was loaded for (`ExtensionCommandRef`) and
+//!   its plugin's data directory, both read-only strings.
+//! * A command's result text is bounded and stripped of terminal escapes; a
+//!   prompt over [`MAX_PROMPT_BYTES`] is refused, never truncated.
+
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use serde_json::Value;
+
+use super::ManagerShared;
+use super::protocol::{CommandResultWire, CommandRunParams, CoreRequest};
+use super::registry::CommandRegistration;
+use super::supervisor::HostCallError;
+use crate::plugins::types::PluginAuthority;
+
+/// How long the user waits for one command before it is cancelled.
+pub const COMMAND_RUN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+/// Longest result text shown; the rest is cut with a marker.
+pub const MAX_TEXT_BYTES: usize = 64 * 1024;
+/// Longest prompt a command may submit. Over this it is refused outright.
+pub const MAX_PROMPT_BYTES: usize = 128 * 1024;
+
+static EPOCH: AtomicU64 = AtomicU64::new(0);
+
+/// Something that may have changed which commands are live: a registration,
+/// a revocation, an activation, a host exit, an attachment's desired set.
+/// Spurious bumps are harmless (one extra registry reload).
+pub(crate) fn bump_epoch() {
+    EPOCH.fetch_add(1, Ordering::SeqCst);
+}
+
+/// The user registry reloads when this moves.
+#[must_use]
+pub(crate) fn epoch() -> u64 {
+    EPOCH.load(Ordering::SeqCst)
+}
+
+/// A reference to one admitted command, carried by the user-registry entry
+/// and the dispatch action. It names the exact registration: a handle is
+/// never reused, so a stale reference can only fail, never run a newer one.
+/// It holds no owner token.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtensionCommandRef {
+    pub handle: u64,
+    pub plugin_id: String,
+    pub generation: u64,
+    /// `extension:<plugin>`, the origin shown beside the command's output.
+    pub origin: String,
+    /// The workspace whose user registry loaded the command: what the handler
+    /// is told as the place the user ran it.
+    pub workspace: std::path::PathBuf,
+}
+
+/// One live command as the user registry loads it.
+#[derive(Debug, Clone)]
+pub struct ExtensionCommandEntry {
+    pub registration: CommandRegistration,
+    /// The owner's reviewed authority, so the user registry hides the command
+    /// the moment the plugin is disabled or loses trust.
+    pub authority: PluginAuthority,
+    /// The workspace this entry was loaded for.
+    pub workspace: std::path::PathBuf,
+}
+
+impl ExtensionCommandEntry {
+    #[must_use]
+    pub fn reference(&self) -> ExtensionCommandRef {
+        ExtensionCommandRef {
+            handle: self.registration.handle,
+            plugin_id: self.registration.owner.plugin_id.clone(),
+            generation: self.registration.owner.generation,
+            origin: format!("extension:{}", self.registration.plugin_name),
+            workspace: self.workspace.clone(),
+        }
+    }
+}
+
+/// What a command asked the core to do with its answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommandOutcome {
+    /// Show `text` (possibly empty) to the user.
+    Show { text: String },
+    /// Submit `prompt` as the user's next message; show `note` beside it.
+    Submit {
+        prompt: String,
+        note: Option<String>,
+    },
+}
+
+fn strip_escapes(text: &str) -> String {
+    let mut clean = String::with_capacity(text.len());
+    codewhale_secrets::sanitize::strip_ansi_into(text, &mut clean);
+    clean
+}
+
+/// Strip terminal escapes and bound the text. A command's output is
+/// plugin-controlled and goes straight into the transcript.
+fn display_text(text: &str) -> String {
+    let mut clean = strip_escapes(text);
+    if clean.len() > MAX_TEXT_BYTES {
+        let mut end = MAX_TEXT_BYTES;
+        while !clean.is_char_boundary(end) {
+            end -= 1;
+        }
+        clean.truncate(end);
+        clean.push_str("\n… (output truncated)");
+    }
+    clean
+}
+
+/// The phrase shown after `/<name> (extension:<plugin>):` on failure.
+fn map_call_error(error: HostCallError) -> String {
+    match error {
+        HostCallError::Cancelled(reason) => format!("cancelled: {reason}"),
+        HostCallError::Timeout { after, .. } => {
+            format!("timed out after {}s and was cancelled", after.as_secs())
+        }
+        HostCallError::Exited(reason) => format!("extension host is down: exited: {reason}"),
+        HostCallError::Busy => "extension host is busy; try again".to_string(),
+        HostCallError::Rpc { code, message } => {
+            if code == super::protocol::error_code::NOT_AVAILABLE {
+                format!("not available: {message}")
+            } else {
+                format!("failed: {message}")
+            }
+        }
+    }
+}
+
+/// Run one command for the user. Errors are the text to show as a failure.
+pub(crate) async fn run(
+    shared: &ManagerShared,
+    command: &ExtensionCommandRef,
+    raw_input: &str,
+) -> Result<CommandOutcome, String> {
+    let (host, registration) = shared.live_host_for_command(command).await?;
+    let deadline = shared.options.supervision.command_run_deadline;
+    let request = CoreRequest::CommandRun(CommandRunParams {
+        handle: registration.handle,
+        command_id: uuid::Uuid::new_v4().simple().to_string(),
+        raw_input: raw_input.to_string(),
+        deadline_ms: u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX),
+        workspace: command.workspace.to_str().map(str::to_owned),
+    });
+    let value: Value = host
+        .call(request, Some(registration.owner.plugin_id.clone()))
+        .await
+        .map_err(map_call_error)?;
+    let wire: CommandResultWire = serde_json::from_value(value)
+        .map_err(|error| format!("returned a malformed result: {error}"))?;
+    match wire {
+        CommandResultWire::Success { text } => Ok(CommandOutcome::Show {
+            text: text.as_deref().map(display_text).unwrap_or_default(),
+        }),
+        CommandResultWire::Error { text } => Err(display_text(&text)),
+        CommandResultWire::Submit { prompt, text } => {
+            let prompt = strip_escapes(&prompt);
+            if prompt.trim().is_empty() {
+                return Err("submitted an empty prompt".to_string());
+            }
+            if prompt.len() > MAX_PROMPT_BYTES {
+                return Err(format!(
+                    "returned a prompt of {} bytes, over the {MAX_PROMPT_BYTES}-byte limit; it was not submitted",
+                    prompt.len()
+                ));
+            }
+            Ok(CommandOutcome::Submit {
+                prompt,
+                note: text.as_deref().map(display_text).filter(|t| !t.is_empty()),
+            })
+        }
+    }
+}

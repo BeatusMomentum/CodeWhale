@@ -150,13 +150,15 @@ export function owner(pluginId) {
   return { plugin_id: pluginId, generation: 1, owner_token: `token-${pluginId}-${token}-${'0'.repeat(24)}` }
 }
 
-export async function activate(host, fixture, entryPath = join(FIXTURES, fixture, 'index.mjs')) {
+/** `extra` adds or replaces `ext/activate` params, such as `config` and `data_dir`. */
+export async function activate(host, fixture, entryPath = join(FIXTURES, fixture, 'index.mjs'), extra = {}) {
   const ref = owner(fixture)
   const result = await host.call('ext/activate', {
     owner: ref,
     plugin_name: fixture,
     entry: { path: entryPath, sha256: sha256File(entryPath) },
     config: {},
+    ...extra,
   })
   return { ref, result }
 }

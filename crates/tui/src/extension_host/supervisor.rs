@@ -471,6 +471,36 @@ pub(crate) fn planned_sandbox(runtime: &HostRuntime, home: &Path) -> Result<Host
     )
 }
 
+/// One plugin's own directory inside the host's data dir, which is the host
+/// sandbox's writable root: stable for one plugin id (so it survives updates
+/// and restarts), distinct per plugin, and a single path component under
+/// `plugins/`. The id contains slashes and the name alone can collide between
+/// scopes, so the name is joined to a digest of the id. Pure.
+pub(crate) fn plugin_data_dir(home: &Path, plugin_id: &str, plugin_name: &str) -> PathBuf {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(plugin_id.as_bytes());
+    let short: String = digest
+        .iter()
+        .take(6)
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let name: String = plugin_name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .take(64)
+        .collect();
+    home.join("extension-host")
+        .join("data")
+        .join("plugins")
+        .join(format!("{name}-{short}"))
+}
+
 fn host_data_dir(home: &Path) -> Result<PathBuf, String> {
     let data = home.join("extension-host").join("data");
     std::fs::create_dir_all(&data)

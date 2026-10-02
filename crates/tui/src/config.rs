@@ -1,6 +1,6 @@
 //! Configuration loading and defaults for codewhale.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -1800,6 +1800,41 @@ impl ExtensionHostRuntime {
     }
 }
 
+/// `[plugins."<name>"]`: per-plugin settings, keyed by the plugin's manifest
+/// name. User config only (like `[extension_host]`): project-scope config is
+/// applied by an explicit allowlist that does not include this table, so a
+/// repository cannot configure the plugins it asks you to trust.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct PluginSettings {
+    /// `[plugins."<name>".config]`: a TOML table delivered as the `config`
+    /// argument of the plugin's `apply(ctx, config)` when the extension host
+    /// activates it, validated against the plugin's own `Config` schema when it
+    /// declares one. A change takes effect at `/plugin reload` (the plugin is
+    /// re-activated). Values are not secrets storage: they are shown to the
+    /// plugin's code, and `/plugin show` lists their keys.
+    #[serde(default)]
+    pub config: Option<toml::Table>,
+}
+
+/// The `[plugins]` table of the user config file at `path`, read on its own so
+/// an edit reaches the extension host at `/plugin reload` without reloading
+/// the whole configuration. A missing file has no settings. Blocking.
+pub(crate) fn read_plugin_settings(
+    path: &Path,
+) -> std::result::Result<BTreeMap<String, PluginSettings>, String> {
+    let contents = match fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+        Err(error) => return Err(format!("cannot read {}: {error}", path.display())),
+    };
+    // The same parse the whole configuration goes through; its error text
+    // omits file contents, which can hold secrets.
+    parse_config_file(&contents)
+        .map(|file| file.base.plugins.unwrap_or_default())
+        .map_err(|_| format!("cannot parse {}", path.display()))
+}
+
 /// Raw retry configuration loaded from config files.
 #[derive(Debug, Clone, Deserialize)]
 pub struct RetryConfig {
@@ -3194,6 +3229,9 @@ pub struct Config {
     /// Experimental TypeScript extension host settings.
     #[serde(default)]
     pub extension_host: Option<ExtensionHostConfig>,
+    /// Per-plugin settings (`[plugins."<name>".config]`). User config only.
+    #[serde(default)]
+    pub plugins: Option<BTreeMap<String, PluginSettings>>,
 
     /// Deterministic user-level auto-review policy for tool calls. The engine
     /// applies these rules after built-in safety floors, so config cannot
@@ -11626,6 +11664,7 @@ fn merge_config(base: Config, override_cfg: Config) -> Config {
         providers: merge_providers(base.providers, override_cfg.providers),
         features: merge_features(base.features, override_cfg.features),
         extension_host: override_cfg.extension_host.or(base.extension_host),
+        plugins: override_cfg.plugins.or(base.plugins),
         notifications: override_cfg.notifications.or(base.notifications),
         approval: override_cfg.approval.or(base.approval),
         network: override_cfg.network.or(base.network),

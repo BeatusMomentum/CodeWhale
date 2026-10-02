@@ -31,6 +31,7 @@ export const METHODS = [
   { name: 'ext/activate', direction: 'core_to_host', request: true, params: 'ActivateParams' },
   { name: 'ext/deactivate', direction: 'core_to_host', request: true, params: 'DeactivateParams' },
   { name: 'tool/call', direction: 'core_to_host', request: true, params: 'ToolCallParams' },
+  { name: 'command/run', direction: 'core_to_host', request: true, params: 'CommandRunParams' },
   { name: '$/cancel', direction: 'core_to_host', request: false, params: 'CancelParams' },
   { name: 'host/hello', direction: 'host_to_core', request: false, params: 'HelloParams' },
   { name: 'host/ready', direction: 'host_to_core', request: false, params: 'EmptyParams' },
@@ -65,12 +66,17 @@ export const SHAPES: { readonly [name: string]: Shape } = {
   ActivateParams: {
     strict: false,
     required: { owner: { ref: 'OwnerRef' }, plugin_name: 'string', entry: { ref: 'EntryRef' } },
-    optional: { config: 'json' },
+    optional: { config: 'json', data_dir: 'string' },
   },
   CancelParams: {
     strict: true,
     required: { id: 'uint' },
     optional: {},
+  },
+  CommandRunParams: {
+    strict: false,
+    required: { handle: 'uint', command_id: 'string', raw_input: 'string', deadline_ms: 'uint' },
+    optional: { workspace: 'string' },
   },
   DeactivateParams: {
     strict: false,
@@ -129,8 +135,13 @@ export const SHAPES: { readonly [name: string]: Shape } = {
   },
   RegisterParams: {
     strict: true,
-    required: { owner: { ref: 'OwnerRef' }, kind: { enum: ['tool'] }, spec: { ref: 'ToolSpecWire' } },
+    required: { owner: { ref: 'OwnerRef' }, kind: { enum: ['tool', 'command'] }, spec: { ref: 'RegisterSpecWire' } },
     optional: {},
+  },
+  RegisterSpecWire: {
+    strict: true,
+    required: { name: 'string', description: 'string' },
+    optional: { input_schema: 'object', argument_hint: 'string' },
   },
   RpcErrorWire: {
     strict: true,
@@ -140,12 +151,7 @@ export const SHAPES: { readonly [name: string]: Shape } = {
   ToolCallParams: {
     strict: false,
     required: { handle: 'uint', call_id: 'string', input: 'json', deadline_ms: 'uint' },
-    optional: {},
-  },
-  ToolSpecWire: {
-    strict: true,
-    required: { name: 'string', description: 'string', input_schema: 'object' },
-    optional: {},
+    optional: { workspace: 'string' },
   },
   UnregisterParams: {
     strict: true,
@@ -161,12 +167,23 @@ export interface ActivateParams {
   plugin_name: string
   entry: EntryRef
   config?: Json
+  data_dir?: string
 }
 
-export type ActivateResult = { status: 'ok'; tools: string[] } | { status: 'failed'; diagnostic: string }
+export type ActivateResult = { status: 'ok'; tools: string[]; commands?: string[] } | { status: 'failed'; diagnostic: string }
 
 export interface CancelParams {
   id: number
+}
+
+export type CommandResultWire = { kind: 'success'; text?: string } | { kind: 'error'; text: string } | { kind: 'submit'; prompt: string; text?: string }
+
+export interface CommandRunParams {
+  handle: number
+  command_id: string
+  raw_input: string
+  deadline_ms: number
+  workspace?: string
 }
 
 export type ContentBlockWire = { type: 'text'; text: string }
@@ -234,15 +251,22 @@ export interface ProtocolRange {
   max: number
 }
 
-export type RegisterKind = 'tool'
+export type RegisterKind = 'tool' | 'command'
 
 export interface RegisterParams {
   owner: OwnerRef
   kind: RegisterKind
-  spec: ToolSpecWire
+  spec: RegisterSpecWire
 }
 
 export type RegisterResult = { handle: number } | { refused: string }
+
+export interface RegisterSpecWire {
+  name: string
+  description: string
+  input_schema?: { [key: string]: Json }
+  argument_hint?: string
+}
 
 export interface RpcErrorWire {
   code: number
@@ -255,18 +279,13 @@ export interface ToolCallParams {
   call_id: string
   input: Json
   deadline_ms: number
+  workspace?: string
 }
 
 export interface ToolResultWire {
   content: ContentBlockWire[]
   is_error: boolean
   structured?: Json
-}
-
-export interface ToolSpecWire {
-  name: string
-  description: string
-  input_schema: { [key: string]: Json }
 }
 
 export interface UnregisterParams {

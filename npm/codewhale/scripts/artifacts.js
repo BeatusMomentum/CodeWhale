@@ -101,7 +101,7 @@ function unsupportedBuildHint() {
     "No prebuilt binary is available for this platform/architecture combo.",
     "You can still run codewhale by building from source with Cargo (single binary):",
     "",
-    "  # Requires Rust 1.88+ (https://rustup.rs)",
+    "  # Requires Rust 1.89+ (https://rustup.rs)",
     "  cargo install codewhale-cli --locked   # provides `codewhale`",
     "",
     "Or build from a checkout:",

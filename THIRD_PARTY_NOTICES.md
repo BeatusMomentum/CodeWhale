@@ -64,3 +64,78 @@ limitations under the License.
 
 The full Apache License 2.0 text ships in this repository at
 `patches/unicode-width-0.2.2/LICENSE-APACHE`.
+
+## Cordis, schemastery and cosmokit (Shigma, via DeepSeek Harness) — MIT
+
+The embedded extension host bundle
+(`crates/tui/extension-host/dist/codewhale-extension-host.mjs`) contains these
+packages, as published by DeepSeek Harness:
+
+- `@deepseek-ai/cordis` 4.0.4
+- `@deepseek-ai/schemastery` 3.18.4
+- `@deepseek-ai/cosmokit` 1.8.5
+
+Upstream: <https://github.com/deepseek-ai/deepseek-harness> (`vendor/cordis`,
+`vendor/schemastery`, `vendor/cosmokit`)
+
+```
+MIT License
+
+Copyright (c) 2021-present Shigma
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+## DeepSeek Harness utility packages (`dsh-util-values`, `dsh-tools`) — MIT
+
+The same bundle contains `@deepseek-ai/dsh-util-values` 0.1.7-alpha.2, and
+`crates/tui/extension-host/src/dsh/dsh-tools-compat.js` contains verbatim
+excerpts of `@deepseek-ai/dsh-tools` 0.1.7-alpha.2 (`lib/index.js`, lines 8-888
+and 2528-2558), under the same licence text.
+
+Upstream: <https://github.com/deepseek-ai/deepseek-harness>
+(`dsh-util-values` is published from `packages/util/values`)
+
+```
+MIT License
+
+Copyright (c) 2026 DeepSeek
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+The host bundle's own copy of these notices is `dist/LICENSES.txt`, generated
+from the bundler's metafile; Codewhale writes it beside the bundle it
+materialises (`~/.codewhale/extension-host/<sha256>/LICENSES.txt`).

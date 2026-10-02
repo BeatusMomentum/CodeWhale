@@ -4099,6 +4099,9 @@ var SINGLETONS = {
   "@deepseek-ai/dsh-tools": "dsh-tools",
   "@deepseek-ai/dsh-util-values": "dsh-util-values"
 };
+var SUBPATH_SINGLETONS = {
+  "@deepseek-ai/dsh-commands/brand": "dsh-commands-brand"
+};
 var UnsupportedPeerError = class extends Error {
   constructor(specifier) {
     super(`requires \`${specifier}\`, which the Codewhale extension host does not provide`);
@@ -4113,6 +4116,7 @@ function packageName(specifier) {
 }
 function classifySpecifier(specifier) {
   if (specifier.startsWith(".") || specifier.startsWith("/") || specifier.includes(":")) return null;
+  if (specifier in SUBPATH_SINGLETONS) return SUBPATH_SINGLETONS[specifier];
   const name = packageName(specifier);
   if (name in SINGLETONS) {
     if (specifier !== name) throw new UnsupportedPeerError(specifier);
@@ -4149,7 +4153,7 @@ function installBunResolver(modules) {
   bun.plugin({
     name: "codewhale-host-modules",
     setup(build) {
-      for (const [specifier, key] of Object.entries(SINGLETONS)) {
+      for (const [specifier, key] of Object.entries({ ...SINGLETONS, ...SUBPATH_SINGLETONS })) {
         if (key in modules) build.module(specifier, () => ({ exports: modules[key], loader: "object" }));
       }
       build.onResolve({ filter: /^[^./]/ }, (args) => {
@@ -4215,6 +4219,7 @@ var METHODS = [
   { name: "ext/activate", direction: "core_to_host", request: true, params: "ActivateParams" },
   { name: "ext/deactivate", direction: "core_to_host", request: true, params: "DeactivateParams" },
   { name: "tool/call", direction: "core_to_host", request: true, params: "ToolCallParams" },
+  { name: "command/run", direction: "core_to_host", request: true, params: "CommandRunParams" },
   { name: "$/cancel", direction: "core_to_host", request: false, params: "CancelParams" },
   { name: "host/hello", direction: "host_to_core", request: false, params: "HelloParams" },
   { name: "host/ready", direction: "host_to_core", request: false, params: "EmptyParams" },
@@ -4228,12 +4233,17 @@ var SHAPES = {
   ActivateParams: {
     strict: false,
     required: { owner: { ref: "OwnerRef" }, plugin_name: "string", entry: { ref: "EntryRef" } },
-    optional: { config: "json" }
+    optional: { config: "json", data_dir: "string" }
   },
   CancelParams: {
     strict: true,
     required: { id: "uint" },
     optional: {}
+  },
+  CommandRunParams: {
+    strict: false,
+    required: { handle: "uint", command_id: "string", raw_input: "string", deadline_ms: "uint" },
+    optional: { workspace: "string" }
   },
   DeactivateParams: {
     strict: false,
@@ -4292,8 +4302,13 @@ var SHAPES = {
   },
   RegisterParams: {
     strict: true,
-    required: { owner: { ref: "OwnerRef" }, kind: { enum: ["tool"] }, spec: { ref: "ToolSpecWire" } },
+    required: { owner: { ref: "OwnerRef" }, kind: { enum: ["tool", "command"] }, spec: { ref: "RegisterSpecWire" } },
     optional: {}
+  },
+  RegisterSpecWire: {
+    strict: true,
+    required: { name: "string", description: "string" },
+    optional: { input_schema: "object", argument_hint: "string" }
   },
   RpcErrorWire: {
     strict: true,
@@ -4303,12 +4318,7 @@ var SHAPES = {
   ToolCallParams: {
     strict: false,
     required: { handle: "uint", call_id: "string", input: "json", deadline_ms: "uint" },
-    optional: {}
-  },
-  ToolSpecWire: {
-    strict: true,
-    required: { name: "string", description: "string", input_schema: "object" },
-    optional: {}
+    optional: { workspace: "string" }
   },
   UnregisterParams: {
     strict: true,
@@ -4440,6 +4450,11 @@ function validateMessage(value, direction) {
     if (method === "host/hello" && params.runtime.name !== "bun" && params.runtime.name !== "node") {
       throw new ProtocolError(`host/hello.runtime.name: unknown runtime \`${params.runtime.name}\``);
     }
+    if (method === "registry/register") {
+      const { kind, spec: spec2 } = params;
+      const reason = kind === "tool" && spec2.input_schema == null ? "a tool registration needs `spec.input_schema`" : kind === "tool" && spec2.argument_hint != null ? "a tool registration has no `spec.argument_hint`" : kind === "command" && spec2.input_schema != null ? "a command registration has no `spec.input_schema`" : void 0;
+      if (reason !== void 0) throw new ProtocolError(`${method}: ${reason}`);
+    }
     return value;
   }
   if (!hasId) throw new ProtocolError("response: missing id");
@@ -4568,6 +4583,166 @@ import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { pathToFileURL } from "node:url";
+
+// src/shims/owned.ts
+function describeError(error) {
+  return error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+}
+var OwnedRegistrations = class {
+  constructor(rpc2, kind, ownedBy, warn) {
+    this.rpc = rpc2;
+    this.kind = kind;
+    this.ownedBy = ownedBy;
+    this.warn = warn;
+  }
+  rpc;
+  kind;
+  ownedBy;
+  warn;
+  /** Admitted entries by core handle. */
+  byHandle = /* @__PURE__ */ new Map();
+  /** Called inside the owner's effect; returns the effect's cleanup. */
+  add(entry, spec) {
+    const owner = entry.owner;
+    const registration = this.rpc.request("registry/register", { owner: owner.ref, kind: this.kind, spec }).then(
+      (result) => {
+        if (typeof result?.handle === "number") {
+          entry.handle = result.handle;
+          if (entry.disposed) {
+            void this.unregister(entry);
+            return;
+          }
+          this.ownedBy(owner).set(result.handle, entry);
+          this.byHandle.set(result.handle, entry);
+        } else {
+          const reason = typeof result?.refused === "string" ? result.refused : "refused without a reason";
+          owner.refusals.push(`${this.kind} \`${entry.name}\` refused: ${reason}`);
+          if (owner.state === "active") this.warn(`${this.kind} \`${entry.name}\` refused: ${reason}`, owner);
+        }
+      },
+      (error) => {
+        owner.refusals.push(`${this.kind} \`${entry.name}\` registration failed: ${describeError(error)}`);
+      }
+    ).finally(() => owner.pendingRegistrations.delete(registration));
+    owner.pendingRegistrations.add(registration);
+    return () => {
+      if (entry.disposed) return;
+      entry.disposed = true;
+      if (entry.handle !== void 0) void this.unregister(entry);
+    };
+  }
+  /** Undo exactly this entry. The core revokes first, so a failure here is expected after revocation. */
+  async unregister(entry) {
+    const handle = entry.handle;
+    this.ownedBy(entry.owner).delete(handle);
+    this.byHandle.delete(handle);
+    try {
+      await this.rpc.request("registry/unregister", { owner: entry.owner.ref, handle });
+    } catch {
+    }
+  }
+  /** Drop the host's index of everything `owner` registered (after its teardown). */
+  forget(owner) {
+    for (const entry of this.ownedBy(owner).values()) this.byHandle.delete(entry.handle);
+  }
+};
+
+// src/shims/commands.ts
+var COMMAND_NAME = /^[a-z][a-z0-9_-]*$/u;
+var NO_ATTACHMENTS = Object.freeze([]);
+function normalizeCommand(definition) {
+  if (!definition || typeof definition !== "object") throw new TypeError("command definition must be an object");
+  const { name } = definition;
+  if (typeof name !== "string" || !COMMAND_NAME.test(name)) {
+    throw new TypeError(`command name ${JSON.stringify(name)} must match ${String(COMMAND_NAME)}`);
+  }
+  if (typeof definition.description !== "string" || definition.description.trim().length === 0) {
+    throw new TypeError(`command "${name}" needs a non-empty description`);
+  }
+  if (typeof definition.handler !== "function") throw new TypeError(`command "${name}" handler must be a function`);
+  let hint = definition.argumentHint;
+  const input = definition.input;
+  if (input !== void 0) {
+    if (typeof input !== "object" || input === null || typeof input.hint !== "string") {
+      throw new TypeError(`command "${name}" input hint must be a string`);
+    }
+    if (input.attachments === true) {
+      throw new TypeError(`command "${name}": attachments are not supported by the Codewhale extension host`);
+    }
+    hint ??= input.hint;
+  }
+  if (hint !== void 0 && (typeof hint !== "string" || hint.trim().length === 0)) {
+    throw new TypeError(`command "${name}" argument hint must be a non-empty string`);
+  }
+  return {
+    name,
+    description: definition.description,
+    ...hint === void 0 ? {} : { argumentHint: hint },
+    handler: definition.handler
+  };
+}
+function commandSpec(command) {
+  return {
+    name: command.name,
+    description: command.description,
+    ...command.argumentHint === void 0 ? {} : { argument_hint: command.argumentHint }
+  };
+}
+function makeInvocation(args, commandId, signal, context = {}) {
+  return Object.freeze({
+    commandId,
+    args,
+    rawInput: args === "" ? "" : ` ${args}`,
+    attachments: NO_ATTACHMENTS,
+    signal,
+    ...context
+  });
+}
+function normalizeResult(command, value) {
+  if (value === void 0 || value === null) return { kind: "success" };
+  if (typeof value === "string") return { kind: "success", text: value };
+  if (typeof value !== "object") throw new TypeError(`command "${command}" handler must return a result object or a string`);
+  const result = value;
+  const text = result.text;
+  if (text !== void 0 && typeof text !== "string") {
+    throw new TypeError(`command "${command}" result text must be a string when supplied`);
+  }
+  switch (result.kind) {
+    case "success":
+      return text === void 0 ? { kind: "success" } : { kind: "success", text };
+    case "error":
+      if (typeof text !== "string" || text.trim().length === 0) {
+        throw new TypeError(`command "${command}" error text must be a non-empty string`);
+      }
+      return { kind: "error", text };
+    case "submit":
+      if (typeof result.prompt !== "string" || result.prompt.trim().length === 0) {
+        throw new TypeError(`command "${command}" submit prompt must be a non-empty string`);
+      }
+      return text === void 0 ? { kind: "submit", prompt: result.prompt } : { kind: "submit", prompt: result.prompt, text };
+    default:
+      throw new TypeError(`command "${command}" returned unknown result kind ${JSON.stringify(result.kind)}`);
+  }
+}
+function defineCommandsService(host2) {
+  class CommandsShim extends Service {
+    constructor(ctx) {
+      super(ctx, "commands");
+    }
+    /** `ctx.commands.register(definition)`: returns an idempotent disposer. */
+    register(definition) {
+      const ctx = this.ctx;
+      const owner = host2.ownerOf(ctx);
+      if (!owner) throw new Error("commands.register called outside an extension owner");
+      const command = normalizeCommand(definition);
+      return ctx.effect(() => host2.addCommand(owner, command), `commands.register(${JSON.stringify(command.name)})`);
+    }
+  }
+  Object.freeze(CommandsShim.prototype);
+  return CommandsShim;
+}
+
+// src/root.ts
 var OWNER = /* @__PURE__ */ Symbol.for("codewhale.extension-host.owner");
 var REFUSED_SERVICES = /* @__PURE__ */ new Set([
   "approval",
@@ -4584,11 +4759,11 @@ var REFUSED_SERVICES = /* @__PURE__ */ new Set([
   "skills",
   "logger"
 ]);
-var PROVIDED_SERVICES = /* @__PURE__ */ new Set(["tools", "logger", "events", "reflect", "registry"]);
+var PROVIDED_SERVICES = /* @__PURE__ */ new Set(["tools", "commands", "logger", "events", "reflect", "registry"]);
 var ACTIVATE_DEADLINE_MS = 5e3;
 var DISPOSE_DEADLINE_MS = 2e3;
 var ownerStorage = new AsyncLocalStorage();
-function describeError(error) {
+function describeError2(error) {
   if (error instanceof Error) return `${error.name}: ${error.message}`;
   return String(error);
 }
@@ -4623,16 +4798,30 @@ var HostRoot = class {
     const root = new Context();
     this.root = root;
     const host2 = this;
+    this.toolRegistrations = new OwnedRegistrations(
+      rpc2,
+      "tool",
+      (owner) => owner.tools,
+      (message, owner) => this.log("warn", message, owner)
+    );
+    this.commandRegistrations = new OwnedRegistrations(
+      rpc2,
+      "command",
+      (owner) => owner.commands,
+      (message, owner) => this.log("warn", message, owner)
+    );
+    const shimClasses = /* @__PURE__ */ new Map();
+    const shimsProvided = /* @__PURE__ */ new Set();
     const reflect = root.reflect;
     const originalProvide = reflect.provide;
-    let toolsShimProvided = false;
     reflect.provide = function(name, value, ...rest) {
       if (REFUSED_SERVICES.has(name)) {
-        const hostShim = name === "tools" && !toolsShimProvided && value instanceof ToolsShim;
+        const shim = shimClasses.get(name);
+        const hostShim = shim !== void 0 && !shimsProvided.has(name) && value instanceof shim;
         if (!hostShim) {
           throw new Error(`extension may not provide core service \`${name}\`: the Codewhale core owns it`);
         }
-        toolsShimProvided = true;
+        shimsProvided.add(name);
       }
       return originalProvide.call(this, name, value, ...rest);
     };
@@ -4641,7 +4830,7 @@ var HostRoot = class {
       export: (message) => {
         const fiber = message.fiber?.deref?.();
         const owner = fiber?.ctx?.[OWNER];
-        const text = (message.args ?? []).map((arg) => arg instanceof Error ? describeError(arg) : typeof arg === "string" ? arg : safeStringify(arg)).join(" ");
+        const text = (message.args ?? []).map((arg) => arg instanceof Error ? describeError2(arg) : typeof arg === "string" ? arg : safeStringify(arg)).join(" ");
         host2.log(message.type === "error" ? "error" : message.type === "warn" ? "warn" : "info", `[${message.name}] ${text}`, owner);
       }
     });
@@ -4659,12 +4848,20 @@ var HostRoot = class {
       }
     }
     Object.freeze(ToolsShim.prototype);
+    const CommandsShim = defineCommandsService({
+      ownerOf: (ctx) => ctx[OWNER],
+      addCommand: (owner, command) => host2.addCommand(owner, command)
+    });
+    shimClasses.set("tools", ToolsShim);
+    shimClasses.set("commands", CommandsShim);
     root.plugin(ToolsShim);
+    root.plugin(CommandsShim);
   }
   rpc;
   root;
   owners = /* @__PURE__ */ new Map();
-  toolsByHandle = /* @__PURE__ */ new Map();
+  toolRegistrations;
+  commandRegistrations;
   log(level, msg, owner) {
     const params = { level, msg: msg.slice(0, 8192) };
     if (owner) params.plugin_id = owner.ref.plugin_id;
@@ -4673,63 +4870,52 @@ var HostRoot = class {
   /** Called inside the owner's effect; returns the effect's cleanup. */
   addTool(owner, definition) {
     const local = { owner, name: definition.name, definition, disposed: false };
-    const registration = this.rpc.request("registry/register", {
-      owner: owner.ref,
-      kind: "tool",
-      spec: {
-        name: definition.name,
-        description: String(definition.description ?? ""),
-        input_schema: definition.parameters ?? { type: "object", properties: {} }
-      }
-    }).then(
-      (result) => {
-        if (typeof result?.handle === "number") {
-          local.handle = result.handle;
-          if (local.disposed) {
-            void this.unregister(local);
-            return;
-          }
-          owner.tools.set(result.handle, local);
-          this.toolsByHandle.set(result.handle, local);
-        } else {
-          const reason = typeof result?.refused === "string" ? result.refused : "refused without a reason";
-          owner.refusals.push(`tool \`${definition.name}\` refused: ${reason}`);
-          if (owner.state === "active") this.log("warn", `tool \`${definition.name}\` refused: ${reason}`, owner);
-        }
-      },
-      (error) => {
-        owner.refusals.push(`tool \`${definition.name}\` registration failed: ${describeError(error)}`);
-      }
-    ).finally(() => owner.pendingRegistrations.delete(registration));
-    owner.pendingRegistrations.add(registration);
-    return () => {
-      if (local.disposed) return;
-      local.disposed = true;
-      if (local.handle !== void 0) void this.unregister(local);
-    };
+    return this.toolRegistrations.add(local, {
+      name: definition.name,
+      description: String(definition.description ?? ""),
+      input_schema: definition.parameters ?? { type: "object", properties: {} }
+    });
   }
-  async unregister(local) {
-    const handle = local.handle;
-    local.owner.tools.delete(handle);
-    this.toolsByHandle.delete(handle);
-    try {
-      await this.rpc.request("registry/unregister", { owner: local.owner.ref, handle });
-    } catch {
-    }
+  addCommand(owner, definition) {
+    const local = { owner, name: definition.name, definition, disposed: false };
+    return this.commandRegistrations.add(local, commandSpec(definition));
   }
+  /**
+   * `ext/activate`: load one `native` entry of a plugin under its owner. A
+   * manifest may declare several entries; the core sends one `ext/activate`
+   * per entry, in order, under the same owner token, and every entry becomes a
+   * fiber of that one owner. A further entry is accepted only after the
+   * previous one finished activating, for the same plugin, and only once per
+   * path. Any failure fails the whole owner: its fibers, the earlier entries'
+   * included, are disposed and the owner forgotten (all-or-nothing).
+   */
   async activate(params) {
     const key = params.owner.owner_token;
-    if (this.owners.has(key)) return { status: "failed", diagnostic: "owner token already active" };
-    const owner = {
+    const existing = this.owners.get(key);
+    if (existing) {
+      if (existing.state !== "active") return { status: "failed", diagnostic: "owner token already active" };
+      if (existing.ref.plugin_id !== params.owner.plugin_id || existing.pluginName !== params.plugin_name) {
+        return { status: "failed", diagnostic: "owner token already active for another plugin" };
+      }
+      if (existing.entries.has(params.entry.path)) {
+        return { status: "failed", diagnostic: `entry ${params.entry.path} is already activated under this owner` };
+      }
+      existing.state = "activating";
+    }
+    const owner = existing ?? {
       ref: params.owner,
       pluginName: params.plugin_name,
       fibers: [],
       pendingRegistrations: /* @__PURE__ */ new Set(),
       refusals: [],
       tools: /* @__PURE__ */ new Map(),
+      commands: /* @__PURE__ */ new Map(),
+      entries: /* @__PURE__ */ new Set(),
+      ...params.data_dir === void 0 ? {} : { dataDir: params.data_dir },
       state: "activating"
     };
-    this.owners.set(key, owner);
+    if (!existing) this.owners.set(key, owner);
+    owner.entries.add(params.entry.path);
     try {
       const bytes = await readFile(params.entry.path);
       const digest = createHash("sha256").update(bytes).digest("hex");
@@ -4757,12 +4943,16 @@ var HostRoot = class {
       }
       if (owner.refusals.length > 0) throw new Error(owner.refusals.join("; "));
       owner.state = "active";
-      return { status: "ok", tools: [...owner.tools.values()].map((tool) => tool.name).sort() };
+      return {
+        status: "ok",
+        tools: [...owner.tools.values()].map((tool) => tool.name).sort(),
+        commands: [...owner.commands.values()].map((command) => command.name).sort()
+      };
     } catch (error) {
       owner.state = "failed";
       await this.disposeOwner(owner).catch(() => void 0);
       this.owners.delete(key);
-      return { status: "failed", diagnostic: describeError(error) };
+      return { status: "failed", diagnostic: describeError2(error) };
     }
   }
   /** Dispose one owner's fibers (reverse order, async disposers awaited). Memoised. */
@@ -4784,11 +4974,15 @@ var HostRoot = class {
     } catch {
       disposed = false;
     }
-    const leaked = [...owner.tools.values()].map((tool) => `tool:${tool.name}`);
+    const leaked = [
+      ...[...owner.tools.values()].map((tool) => `tool:${tool.name}`),
+      ...[...owner.commands.values()].map((command) => `command:${command.name}`)
+    ];
     for (const fiber of owner.fibers) {
       for (const effect of fiber.getEffects?.() ?? []) leaked.push(`effect:${effect.label}`);
     }
-    for (const tool of owner.tools.values()) this.toolsByHandle.delete(tool.handle);
+    this.toolRegistrations.forget(owner);
+    this.commandRegistrations.forget(owner);
     this.owners.delete(ref.owner_token);
     return { disposed, leaked };
   }
@@ -4799,24 +4993,46 @@ var HostRoot = class {
       "shutdown"
     ).catch(() => void 0);
   }
-  async callTool(handle, input, callId, signal) {
-    const local = this.toolsByHandle.get(handle);
+  async callTool(handle, input, callId, signal, workspace) {
+    const local = this.toolRegistrations.byHandle.get(handle);
     if (!local || local.disposed || local.owner.state !== "active") {
       throw new RpcError(ErrorCode.NotAvailable, `tool handle ${handle} is not live`);
     }
     const definition = local.definition;
-    const aborted = new Promise((_, reject) => {
-      const onAbort = () => reject(new RpcError(ErrorCode.Cancelled, "cancelled"));
-      if (signal.aborted) onAbort();
-      else signal.addEventListener("abort", onAbort, { once: true });
-    });
+    const exec = Object.freeze({ signal, callId, args: input, ...callContext(local.owner, workspace) });
     const run = ownerStorage.run(local.owner, async () => {
-      const value = await definition.execute(input, { signal, callId, args: input });
+      const value = await definition.execute(input, exec);
       return renderResult(definition, input, value);
     });
-    return Promise.race([run, aborted]);
+    return Promise.race([run, abortedBy(signal)]);
+  }
+  /** `command/run`: only for a handle the core admitted, and only on a user's own invocation. */
+  async callCommand(handle, rawInput, commandId, signal, workspace) {
+    const local = this.commandRegistrations.byHandle.get(handle);
+    if (!local || local.disposed || local.owner.state !== "active") {
+      throw new RpcError(ErrorCode.NotAvailable, `command handle ${handle} is not live`);
+    }
+    const { definition } = local;
+    const run = ownerStorage.run(local.owner, async () => {
+      const value = await definition.handler(makeInvocation(rawInput, commandId, signal, callContext(local.owner, workspace)));
+      return normalizeResult(definition.name, value);
+    });
+    return Promise.race([run, abortedBy(signal)]);
   }
 };
+function callContext(owner, workspace) {
+  return {
+    ...workspace === void 0 ? {} : { workspace },
+    ...owner.dataDir === void 0 ? {} : { dataDir: owner.dataDir }
+  };
+}
+function abortedBy(signal) {
+  return new Promise((_, reject) => {
+    const onAbort = () => reject(new RpcError(ErrorCode.Cancelled, "cancelled"));
+    if (signal.aborted) onAbort();
+    else signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
 function renderResult(definition, input, value) {
   let blocks = void 0;
   if (typeof definition.output?.render === "function") {
@@ -4900,7 +5116,9 @@ installResolveHooks({
   schemastery: lib_exports3,
   cosmokit: lib_exports,
   "dsh-util-values": lib_exports4,
-  "dsh-tools": dsh_tools_compat_exports
+  "dsh-tools": dsh_tools_compat_exports,
+  // `@deepseek-ai/dsh-commands/brand`: the brands are plain strings at runtime.
+  "dsh-commands-brand": { CommandDefinitionId: (id) => id, CommandId: (id) => id }
 });
 function bundleDigest() {
   try {
@@ -4968,7 +5186,11 @@ rpc.onRequest("ext/deactivate", async (params) => {
 });
 rpc.onRequest("tool/call", async (params, cx) => {
   requireInitialized();
-  return host.callTool(params.handle, params.input, params.call_id, cx.signal);
+  return host.callTool(params.handle, params.input, params.call_id, cx.signal, params.workspace);
+});
+rpc.onRequest("command/run", async (params, cx) => {
+  requireInitialized();
+  return host.callCommand(params.handle, params.raw_input, params.command_id, cx.signal, params.workspace);
 });
 rpc.onRequest("host/shutdown", async () => {
   await host.deactivateAll(2e3);

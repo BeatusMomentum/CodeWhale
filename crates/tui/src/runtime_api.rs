@@ -3625,7 +3625,12 @@ fn command_catalog(
             shadowed_aliases,
         });
     }
-    for command in user_commands.iter() {
+    // Extension commands run in the extension host from the TUI's event loop;
+    // a Runtime API client cannot run them, so they are not advertised here.
+    for command in user_commands
+        .iter()
+        .filter(|command| command.extension.is_none())
+    {
         let takes_arguments = command.takes_arguments();
         commands.push(CommandCatalogEntry {
             name: command.name.clone(),

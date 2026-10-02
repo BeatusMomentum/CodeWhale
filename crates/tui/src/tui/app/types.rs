@@ -641,6 +641,14 @@ pub enum AppAction {
         url: String,
         label: String,
     },
+    /// Run an extension command in the extension host (`/name input`). The UI
+    /// event loop awaits it, then shows its text and/or submits its prompt
+    /// as the user's next message.
+    RunExtensionCommand {
+        command: crate::extension_host::command::ExtensionCommandRef,
+        name: String,
+        input: String,
+    },
     /// Send a message to the AI (normal chat mode).
     SendMessage(String),
     /// Same-session rollback. A retry is admitted only after the Engine

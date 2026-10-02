@@ -21,9 +21,12 @@
 //! results the core sends it, and the core validates what it reads.
 //!
 //! There is deliberately no method that expresses approval, and nothing a
-//! host can send makes the core *do* anything in phase 1: registrations are
-//! admitted or refused, and tool calls only flow core→host after the gate.
-//! The authority lint in `protocol/tests.rs` keeps [`METHODS`] that way.
+//! host can send makes the core *do* anything: registrations are admitted or
+//! refused, and tool calls only flow core→host after the gate. `command/run`
+//! flows core→host only when the user invokes the command themselves; the
+//! host answers with text or a prompt, and the core decides whether and how
+//! to show or submit it. The authority lint in `protocol/tests.rs` keeps
+//! [`METHODS`] that way.
 
 use std::time::Duration;
 
@@ -109,6 +112,7 @@ pub const METHODS: &[MethodSpec] = &[
     row(Direction::CoreToHost, "ext/activate", true),
     row(Direction::CoreToHost, "ext/deactivate", true),
     row(Direction::CoreToHost, "tool/call", true),
+    row(Direction::CoreToHost, "command/run", true),
     row(Direction::CoreToHost, "$/cancel", false),
     row(Direction::HostToCore, "host/hello", false),
     row(Direction::HostToCore, "host/ready", false),
@@ -284,21 +288,35 @@ pub struct HelloRuntime {
 #[serde(deny_unknown_fields)]
 pub struct EmptyParams {}
 
+/// What a registration is: a `tool` the model calls (`tool/call`), or a slash
+/// `command` the user runs (`/name args`, `command/run`). No variant docs:
+/// schemars would then render the enum as a mix the generator does not read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum RegisterKind {
-    /// The only kind in phase 1.
     Tool,
+    Command,
 }
 
+/// What a registration proposes. The fields a kind uses are fixed by
+/// [`RegisterParams::check_spec`] (the generated shapes cannot express a
+/// per-kind union): a tool has an `input_schema` and no `argument_hint`; a
+/// command has no `input_schema` and may have an `argument_hint`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
-pub struct ToolSpecWire {
+pub struct RegisterSpecWire {
     pub name: String,
     pub description: String,
-    pub input_schema: Map<String, Value>,
+    /// Tools only: the JSON object schema of the call's input.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_schema: Option<Map<String, Value>>,
+    /// Commands only: the argument placeholder shown after the name (for
+    /// example `<topic>`). A command with a hint waits in the composer for
+    /// arguments; one without runs directly from the palette.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub argument_hint: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -307,7 +325,28 @@ pub struct ToolSpecWire {
 pub struct RegisterParams {
     pub owner: OwnerRef,
     pub kind: RegisterKind,
-    pub spec: ToolSpecWire,
+    pub spec: RegisterSpecWire,
+}
+
+impl RegisterParams {
+    /// The rule [`RegisterSpecWire`]'s docs state: which spec fields each
+    /// kind uses. Applied by [`parse_host_message`] and mirrored in the
+    /// host's `validateMessage`; the corpus holds both to it.
+    pub fn check_spec(&self) -> Result<(), String> {
+        let spec = &self.spec;
+        match self.kind {
+            RegisterKind::Tool if spec.input_schema.is_none() => {
+                Err("a tool registration needs `spec.input_schema`".to_string())
+            }
+            RegisterKind::Tool if spec.argument_hint.is_some() => {
+                Err("a tool registration has no `spec.argument_hint`".to_string())
+            }
+            RegisterKind::Command if spec.input_schema.is_some() => {
+                Err("a command registration has no `spec.input_schema`".to_string())
+            }
+            _ => Ok(()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -437,10 +476,16 @@ pub fn parse_host_message(value: Value) -> Result<HostMessage, ProtocolError> {
     let id = admit(Direction::HostToCore, &method, envelope.id)?;
     let p = envelope.params;
     let message = match (method.as_str(), id) {
-        ("registry/register", Some(id)) => HostMessage::Request {
-            id,
-            request: HostRequest::Register(params(&method, p)?),
-        },
+        ("registry/register", Some(id)) => {
+            let register: RegisterParams = params(&method, p)?;
+            register
+                .check_spec()
+                .map_err(|reason| perr(format!("{method}: {reason}")))?;
+            HostMessage::Request {
+                id,
+                request: HostRequest::Register(register),
+            }
+        }
         ("registry/unregister", Some(id)) => HostMessage::Request {
             id,
             request: HostRequest::Unregister(params(&method, p)?),
@@ -547,8 +592,14 @@ pub struct ActivateParams {
     pub owner: OwnerRef,
     pub plugin_name: String,
     pub entry: EntryRef,
+    /// The plugin's settings (`[plugins."<name>".config]`), delivered as the
+    /// second argument of `apply`. Always an object; `{}` when none.
     #[serde(default = "empty_object")]
     pub config: Value,
+    /// The plugin's own writable directory (read-only string to the plugin).
+    /// The same for every entry of one owner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_dir: Option<String>,
 }
 
 fn empty_object() -> Value {
@@ -568,6 +619,24 @@ pub struct ToolCallParams {
     pub call_id: String,
     pub input: Value,
     pub deadline_ms: u64,
+    /// The workspace of the session the call comes from, and no other. Absent
+    /// when its path is not valid UTF-8.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
+}
+
+/// One user invocation of a registered command. `raw_input` is what follows
+/// the command name, trimmed (the core's slash-command parser trims it).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+pub struct CommandRunParams {
+    pub handle: u64,
+    pub command_id: String,
+    pub raw_input: String,
+    pub deadline_ms: u64,
+    /// The workspace the user ran the command in, and no other.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -581,6 +650,7 @@ pub enum CoreRequest {
     Activate(ActivateParams),
     Deactivate(DeactivateParams),
     ToolCall(ToolCallParams),
+    CommandRun(CommandRunParams),
 }
 
 impl CoreRequest {
@@ -594,6 +664,7 @@ impl CoreRequest {
             Self::Activate(_) => "ext/activate",
             Self::Deactivate(_) => "ext/deactivate",
             Self::ToolCall(_) => "tool/call",
+            Self::CommandRun(_) => "command/run",
         }
     }
 
@@ -607,6 +678,7 @@ impl CoreRequest {
             Self::Activate(p) => to_value(p),
             Self::Deactivate(p) => to_value(p),
             Self::ToolCall(p) => to_value(p),
+            Self::CommandRun(p) => to_value(p),
         }
     }
 
@@ -623,6 +695,7 @@ impl CoreRequest {
     /// | `ext/activate` | `ACTIVATE_DEADLINE` + 1 s | the host enforces activation's own deadline; 1 s for its answer to arrive |
     /// | `ext/deactivate` | `DISPOSE_DEADLINE` + 500 ms | the same, for disposal |
     /// | `tool/call` | its `deadline_ms` | the host is told the bound the core enforces (`SupervisionOptions::tool_call_deadline`, 120 s) |
+    /// | `command/run` | its `deadline_ms` | the same, for a command the user is waiting on (`SupervisionOptions::command_run_deadline`, 30 s) |
     #[must_use]
     pub fn deadline(&self) -> Duration {
         use super::supervisor::{
@@ -636,6 +709,7 @@ impl CoreRequest {
             Self::Activate(_) => ACTIVATE_DEADLINE + Duration::from_secs(1),
             Self::Deactivate(_) => DISPOSE_DEADLINE + Duration::from_millis(500),
             Self::ToolCall(params) => Duration::from_millis(params.deadline_ms),
+            Self::CommandRun(params) => Duration::from_millis(params.deadline_ms),
         }
     }
 
@@ -659,8 +733,14 @@ pub enum RegisterResult {
 #[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum ActivateResult {
-    Ok { tools: Vec<String> },
-    Failed { diagnostic: String },
+    Ok {
+        tools: Vec<String>,
+        #[serde(default)]
+        commands: Vec<String>,
+    },
+    Failed {
+        diagnostic: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -688,6 +768,29 @@ pub struct ToolResultWire {
         deserialize_with = "present"
     )]
     pub structured: Option<Value>,
+}
+
+/// A command's answer. The core shows `text` to the user (stripped of
+/// terminal escapes and bounded) and, for `submit`, sends `prompt` as the
+/// user's next message through the ordinary turn: the model's work after that
+/// is gated like any other. `error` is shown as a failure.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CommandResultWire {
+    Success {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        text: Option<String>,
+    },
+    Error {
+        text: String,
+    },
+    Submit {
+        prompt: String,
+        /// An optional note shown to the user alongside the submission.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        text: Option<String>,
+    },
 }
 
 /// One core→host message, parsed back (tests and the corpus only).
@@ -733,6 +836,7 @@ pub fn parse_core_message(value: Value) -> Result<CoreMessage, ProtocolError> {
         "ext/activate" => CoreRequest::Activate(params(&method, p)?),
         "ext/deactivate" => CoreRequest::Deactivate(params(&method, p)?),
         "tool/call" => CoreRequest::ToolCall(params(&method, p)?),
+        "command/run" => CoreRequest::CommandRun(params(&method, p)?),
         _ => return Err(undecoded(&method)),
     };
     Ok(CoreMessage::Request { id, request })

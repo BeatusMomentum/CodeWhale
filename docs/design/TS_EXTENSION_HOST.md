@@ -8,6 +8,198 @@
 > from the text that follows. Where they disagree, the newest "As built"
 > section and the code are current; the rest is the plan for later phases.
 
+## As built: plugin context, several entries, input validation, notices (2026-10-01)
+
+A review of the commands slice found four defects and one gap in what an author
+can do. This section is what changed; where it disagrees with the older "As
+built" sections below, this one is current.
+
+- **Licence notices.** The embedded bundle contains MIT code (cordis,
+  schemastery, cosmokit, dsh-util-values, and verbatim `dsh-tools` excerpts),
+  and its banner promised `LICENSES.txt` beside it, which nothing wrote.
+  `build.mjs` now generates `dist/LICENSES.txt` from the bundler's metafile
+  (every package that contributed an input file, each with its own LICENSE
+  file; a bundled package with none fails the build; the `dsh-tools` excerpt is
+  listed from a named table that the build checks against the source file). The
+  list was hand-kept before and named `@standard-schema/spec`, which is not
+  bundled. The existing `git diff --exit-code -- dist` check covers it. Rust
+  embeds it (`NOTICES`) and `materialize_bundle` writes it beside the bundle in
+  the same digest-named directory, by the same staging, `0400`, rename and
+  read-back as the bundle (so a symlink at its name is replaced, never written
+  through). `THIRD_PARTY_NOTICES.md` lists the packages. Tests: the directory
+  holds exactly the two files with the embedded bytes; and every
+  `node_modules/<pkg>` marker in the *embedded bundle* has a section in
+  `LICENSES.txt` and an entry in `THIRD_PARTY_NOTICES.md`, so the check does not
+  trust the generator.
+- **Several `native` entries.** The manifest has always accepted
+  `native.paths` (up to 64), and the core sent one `ext/activate` per entry
+  under one owner token, which the host answered with "owner token already
+  active" for the second. No protocol change was needed: the host now accepts a
+  further `ext/activate` for a live owner token if the previous entry finished
+  activating, the plugin matches, and the path is new; each entry is a fiber of
+  the same owner, so deactivation, revocation and crash handling are unchanged.
+  Any failing entry fails the owner and the host disposes the earlier entries'
+  fibers (rolling back their registrations) before answering; the core already
+  drops the owner's registrations. The core merges the cumulative tool and
+  command names of the answers and skips a path the manifest lists twice. Tests
+  (JS and Rust, with `two-entries` and `two-entries-failing` fixtures): both
+  entries live under one owner, one tool callable from each, a repeated or
+  foreign entry refused, one `ext/deactivate` tearing both down, a throwing
+  second entry leaving nothing of the first.
+- **Input is validated by the core.** `HostToolSpec` checked nothing against
+  the schema a plugin registered, so `additionalProperties: false` in the
+  example was advice (DSH's `defineTool` validates inside the plugin; a raw
+  registration did not). `registry::InputValidator` compiles the schema at
+  registration with the `jsonschema` crate (already linked for Workflow
+  `responseSchema`; it moved from `[dev-dependencies]` to `[dependencies]` of
+  `codewhale-tui`, no new crate and no lockfile change). No `$ref` resolver is
+  enabled, so a reference outside the schema fails to compile and is refused
+  at registration with the reason, as is any invalid schema. `prepare` (before
+  an approval card exists) and `execute` check each call and return
+  `ToolError::InvalidInput` naming the violations (at most five, bounded), so
+  the model can correct itself and the host sees nothing. The deferred-tool
+  first-call check (`deferred_first_call_matches_schema`) is a separate,
+  hand-written shape check of required and known field names; it leaves types
+  to the tool, so it was not the path to reuse. Known limit: the validator
+  runs on the channel's callback thread under the registry lock at
+  registration (a schema is at most 64 KiB); schema `format` assertions follow
+  the draft's own default.
+- **Plugin context.** Core to host, three optional fields (protocol still v1;
+  an older host ignores them, the generated TypeScript was regenerated):
+  `ext/activate.data_dir`, `tool/call.workspace`, `command/run.workspace`
+  (corpus `46`-`50`). The workspace is `ToolContext::workspace` of the calling
+  session, or the workspace whose user registry loaded the command
+  (`ExtensionCommandRef::workspace`); a path that is not UTF-8 is omitted. A
+  plugin's `exec` is now frozen `{signal, callId, args, workspace?, dataDir?}`
+  and a command invocation gains the same two. `dataDir` is
+  `<home>/extension-host/data/plugins/<name>-<12 hex of sha256(plugin id)>`,
+  created by Rust (0700) before activation: inside the host's single writable
+  root, stable across generations, never deleted. It is not isolation between
+  plugins that share the process (§4.4). No home, credential or other
+  workspace path is passed, though `dataDir` and the entry path do reveal the
+  Codewhale home's location.
+- **Plugin configuration.** There was no per-plugin config (`config` was always
+  `{}`). `[plugins."<name>".config]` in the *user's* `config.toml`
+  (`config::PluginSettings`, a new field on `Config`; project scope reads an
+  explicit key list that excludes it) becomes the second argument of `apply`.
+  Cordis already validates it against an exported `Config` schema (a
+  schemastery `Schema`) and applies defaults, so a mismatch fails activation
+  with the field named; no host code was needed for that. Rust bounds it
+  (`plugin_config.rs`: objects of plain TOML values, 16 KiB, 16 levels, no
+  date-times) and refuses an over-limit table by failing that plugin's
+  activation with the reason, before the host is asked. Each owner records the
+  digest of the config it was activated with; reconcile treats a changed
+  digest like a changed plugin (revoke, new generation), so settings re-read
+  at `/plugin reload` re-activate exactly the plugins whose table changed. A
+  refused config is hashed from its reason, so it is neither retried every turn
+  nor stuck once fixed. `/plugin show` lists the configured keys (never the
+  values) or the refusal. The example plugin reads one setting through its own
+  `Config` schema.
+- **Tests.** Rust: settings parse, size/depth/date-time refusal and digest
+  behaviour; the real host with `plugin-context` (settings with the plugin's
+  default filled in, per-call workspace, frozen context, a write into `dataDir`
+  inside the sandbox, a command's workspace, no churn on unchanged settings, a
+  new generation on a change, a schema-refused config, an oversize config, and
+  recovery); `/plugin show` rendering and escaping. JS: the same against the
+  fake core, and the typed example with and without its setting.
+
+Not done: a running session does not watch `config.toml` (only `/plugin reload`
+re-reads it); `[plugins]` is not profile-scoped; the review screen shows the
+config keys through `/plugin show`, not the trust review itself; the `Config`
+schema is not exported into the plugin's registered tool schema; there is still
+no storage service beyond the directory; the Linux and Windows runs of the new
+Rust tests did not happen on this machine.
+
+## As built: extension commands (2026-10-01)
+
+Phase 2's `command/run` landed in `crates/tui/src/extension_host/command.rs`,
+the registry, the protocol and the host's `src/shims/commands.ts`, mirroring
+how a tool flows: `registry/register` → owned entry (plugin id + generation,
+never-reused handle) → adapter → call → teardown.
+
+- **Protocol (still v1).** `registry/register` takes `kind: "command"`.
+  `RegisterSpecWire` (was `ToolSpecWire`) has `name`, `description`,
+  `input_schema?` and `argument_hint?`; the generator cannot express a
+  per-kind union, so `RegisterParams::check_spec` (a tool needs `input_schema`
+  and takes no hint; a command takes no schema) runs in `parse_host_message`
+  and is mirrored in the host's `validateMessage`, and the corpus holds both
+  (`20`, `37`–`40`). New core→host request `command/run`
+  `{handle, command_id, raw_input, deadline_ms}`; `raw_input` is the argument
+  text after the name, trimmed (the core's slash parser trims; the design's
+  `agent: AgentRef` was not built, the host has no agent or session). Its
+  answer, `CommandResultWire`, is `{kind: "success", text?}`,
+  `{kind: "error", text}` or `{kind: "submit", prompt, text?}` (corpus `41`–`45`).
+  `ext/activate`'s `ok` also reports `commands` (defaulted). The protocol lint
+  (`host_protocol_never_gains_core_authority`) passes unchanged by
+  construction: `command/run` names no event, store, approval, secret,
+  credential, token, auth, turn, loop, session or prompt authority, and has a
+  reviewed row saying why. `protocol.generated.ts` is regenerated by the
+  drift test.
+- **What a command can return.** What the user-command machinery already does:
+  text shown as a `System` transcript cell (labelled with `/name` and
+  `extension:<plugin>`; escapes stripped, cut at 64 KiB) and/or a prompt sent
+  as the user's next message through the same `SendMessage` path a markdown
+  command's template takes (visible; refused over 128 KiB, never truncated;
+  empty refused). Nothing the host returns makes the core call a tool or the
+  model itself: after a `submit` the turn and tool approval are the ordinary
+  ones.
+- **Rust.** `OwnerRegistry` holds commands beside tools with the same owner
+  rules; one never-reused handle counter; `remove_registrations_of`,
+  `mark_failed`, `revoke_owner`, `forget_owner`, `host_exited` and
+  `revoke_all` remove an owner's commands with its tools; a stale
+  `unregister` is a no-op. Admission (`register_command`): DSH's grammar
+  (`^[a-z][a-z0-9_-]*$`, ≤ 64), refused if a built-in command or alias (or the
+  fixed `jihua`/`zidong`) answers to the name, or another plugin holds it;
+  descriptions ≤ 1 KiB and hints ≤ 256 bytes, single-line; 64 per owner, 256
+  per host. Commands and tools are separate namespaces. The commands of the
+  owners an engine's workspace snapshot desires, bound to the reviewed hash,
+  are loaded by `UserCommandRegistry::load_extension_commands` into the
+  existing user registry, last, so a user, workspace or manifest markdown
+  command (or a built-in) always wins the spelling, with a load error; a
+  global `command::epoch()` bumped on every registry or attachment change
+  makes the registry reload. Entries carry the owner's reviewed authority, so
+  disabling or untrusting the plugin hides them at once, before reconcile.
+  Dispatch (`try_dispatch`) returns the new `AppAction::RunExtensionCommand`;
+  the UI loop awaits `extension_host::run_command` (like `/balance`).
+  `run` re-checks, immediately before sending, the policy flag, a running
+  host (so a dead host answers `extension host is down: <why>` at once), the
+  exact registration (handle and generation), the reviewed receipt and the
+  `Native` capability, through the same `live_host` the tool path now uses.
+  The call is bounded by `SupervisionOptions::command_run_deadline` (30 s),
+  sent as `deadline_ms`, then `$/cancel`, like every method. Capability: the
+  existing `Native`; no new one and no policy bump (§4.6).
+- **Host.** `ctx.commands.register(definition)` returns an idempotent
+  disposer and is an effect of the calling fiber. It accepts the Codewhale
+  shape (`argumentHint`, handler may return a string, `{kind: 'submit'}`) and
+  DSH's (`input: {hint}`, `{kind: 'success' | 'error'}`, `rawInput` with its
+  leading separator; `@deepseek-ai/dsh-commands/brand`, the one value import
+  such plugins make, resolves to two identity functions in
+  `src/dsh/resolve-hooks.ts`, and the rest of that package still fails
+  loudly). `commands` moved from "not provided" to provided;
+  plugins still cannot provide it (the root provides its own shim once, frozen
+  like `tools`). `src/shims/owned.ts` holds the register/undo bookkeeping
+  both shims now share; the tool path was moved onto it. `dist/` was rebuilt.
+- **Tests.** Host: register, each answer kind, cancel, refusal, dispose of
+  one handle versus deactivation, invalid definitions, no provide/rewrite.
+  Rust: registry rules (shadowing, caps, exact undo, revocation, crash),
+  wire shapes, end-to-end through the real host and `commands::execute`
+  (hints, per-workspace visibility, trimmed arguments, DSH `rawInput`,
+  escapes, disable), clash refusal (built-in, other plugin, markdown wins),
+  host-down, deadline cancel, and a killed host with a stale reference after
+  replay.
+
+Not done: Esc or a keypress cancelling a running command before its deadline
+(the UI loop awaits it); the Runtime API and GPUI cannot list or run
+extension commands (`GET /v1/commands` omits them); a clash with a
+markdown command is resolved at registry load, not refused at registration;
+`/plugin show`'s localized owner line does not list commands (the `/plugin`
+host section does); no `agent`/session handle, attachments, `list`/`find`
+on the DSH surface or `command/run`/`command/done` session events; an
+extension command does not reset the goal, todos or plan as a markdown command
+does; a command's `submit` prompt is not marked as plugin-authored beyond the
+transcript line printed before it; the Bun runtime and Windows/Linux were not
+run for the Rust tests of this slice.
+
 ## As built: script tools lose self-approval and shadowing (2026-09-30)
 
 CURRENT_DECISIONS §26 D4 landed in Rust ahead of phase 4, so R1 below and
@@ -197,8 +389,8 @@ discovery rules as `.mjs`/`.js`; Node strips erasable types. The executable
 [author guide](../EXTENSIONS.md) describe the actual services and trust loop.
 
 `exec.cwd` remains deferred: the current execution context does not expose the
-caller's workspace path. Commands, hooks, MCP, `core/call`, and sandbox parity
-also remain subsequent work. The following phase-1 section is its historical
+caller's workspace path. Hooks, MCP, `core/call`, and sandbox parity
+also remain subsequent work (commands landed: see the 2026-10-01 section). The following phase-1 section is its historical
 receipt, including the earlier lack of heartbeat/restart and `.mts` support.
 
 ## As built: phase 1 (2026-09-25)
