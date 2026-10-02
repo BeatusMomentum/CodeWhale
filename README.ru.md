@@ -3,9 +3,9 @@
 
 Codewhale — агент с открытым исходным кодом, который читает ваш проект, редактирует файлы, выполняет команды и проверяет свою работу с помощью выбранной вами облачной или локальной модели. Начните с одной задачи в терминале. Для большой работы поручайте её части агентам с разными моделями и ролями.
 
-![Codewhale работает в терминале](web/public/codewhale-tui-5765d80.png)
+![Codewhale работает в терминале](web/public/codewhale-tui-e940149.png)
 
-*Предварительный вид терминала из сборки v0.10.0, находившейся в разработке.*
+*Предварительный вид терминала из сборки v0.10.1, находившейся в разработке.*
 
 [English](README.md) · [简体中文](README.zh-CN.md) · [日本語](README.ja-JP.md) · [Tiếng Việt](README.vi.md) · [Bahasa Indonesia](README.id.md) · [한국어](README.ko-KR.md) · [Español](README.es-419.md) · [Português](README.pt-BR.md) · [Українська](README.uk.md) · [Français](README.fr.md) · [Deutsch](README.de.md) · [繁體中文](README.zh-TW.md) · [हिन्दी](README.hi.md) · [Türkçe](README.tr.md) · [Italiano](README.it.md) · [Polski](README.pl.md) · [العربية](README.ar.md) · [Català](README.ca.md)
 
