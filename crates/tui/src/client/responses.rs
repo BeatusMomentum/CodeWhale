@@ -26,9 +26,9 @@ use super::{
     CodewhaleClient, ERROR_BODY_MAX_BYTES, bounded_error_text, from_api_tool_name,
     system_to_instructions, to_api_tool_name,
 };
+use crate::llm_client::LlmError;
 
-/// Base URL path for the Codex Responses endpoint.
-pub(super) const CODEX_RESPONSES_PATH: &str = "/codex/responses";
+const CHATGPT_TOOL_NAMESPACE: &str = "codewhale";
 
 /// Build the Responses API request body from a `MessageRequest`.
 #[cfg(test)]
@@ -66,11 +66,8 @@ pub(super) fn build_responses_body_for_provider(
     // Every Responses route receives the same resolved request envelope as
     // Chat and Messages. Omitting this field let auxiliary Responses calls
     // escape the central route cap and made preview unable to prove the wire
-    // allowance. The Codex OAuth backend is the exception: its Responses
-    // endpoint rejects the field outright ("Unsupported parameter:
-    // max_output_tokens"), so its requests carry no client-side output cap
-    // instead of failing every call — the same lesson the Chat path learned
-    // in `apply_provider_token_limit`.
+    // allowance. The official ChatGPT plan preview contract disallows
+    // max_output_tokens, so that route carries no client-side output cap.
     if request.max_tokens > 0 && provider != ApiProvider::OpenaiCodex {
         body["max_output_tokens"] = json!(request.max_tokens);
     }
@@ -83,9 +80,8 @@ pub(super) fn build_responses_body_for_provider(
         }
     }
 
-    // Instructions (system prompt). The Codex Responses backend rejects
-    // requests without instructions, so fall back to a minimal system
-    // prompt when the caller did not supply one.
+    // Supply a minimal system prompt when the caller did not provide one.
+    // The ChatGPT plan preview receives it as a developer input message.
     let instructions = system_to_instructions(request.system.clone())
         .filter(|text| !text.trim().is_empty())
         .unwrap_or_else(|| "You are a helpful assistant.".to_string());
@@ -110,7 +106,13 @@ pub(super) fn build_responses_body_for_provider(
     if let Some(tools) = request.tools.as_ref() {
         let responses_tools: Vec<Value> = tools.iter().map(tool_to_responses_function).collect();
         if !responses_tools.is_empty() {
-            body["tools"] = json!(responses_tools);
+            body["tools"] = if provider == ApiProvider::OpenaiCodex {
+                json!([{ "type": "namespace", "name": CHATGPT_TOOL_NAMESPACE,
+                    "description": "Codewhale tools running under the user's local permissions.",
+                    "tools": responses_tools }])
+            } else {
+                json!(responses_tools)
+            };
             body["tool_choice"] = json!("auto");
             body["parallel_tool_calls"] = json!(true);
         }
@@ -155,7 +157,7 @@ impl CodewhaleClient {
         // Body, endpoint, and route shape all come from the shared
         // prepared-request seam (`prepare_outbound_request`).
         let body = &prepared.body;
-        let is_codex = prepared.endpoint.shape == super::RouteShape::CodexResponses;
+        let is_chatgpt = self.api_provider == ApiProvider::OpenaiCodex;
         let url = prepared.endpoint.url.clone();
         // The synthetic MessageStart below is emitted from inside the stream
         // closure, which outlives `prepared`. Clone the wire model — the id
@@ -167,23 +169,19 @@ impl CodewhaleClient {
             .then(|| (self.api_provider.as_str().to_string(), wire_model.clone()));
 
         // The bearer Authorization header is already installed as a default
-        // header on both the dual and the HTTP/1.1 twin client (resolved from
-        // the Codex OAuth access token), so it must not be set again here or
-        // it would be duplicated. The ChatGPT backend additionally requires
-        // the account id and the experimental Responses beta opt-in.
+        // header on both HTTP clients, so it must not be duplicated here.
+        // The public API does not use Codex backend identity or beta headers.
         //
         // The open itself goes through the shared stream-entry transport
         // policy: bounded header wait, policy-selected client, and at most
         // one HTTP/1.1 fallback retry on a classified H2 header stall. The
         // pre-existing provider retry loop (rate limit / transient upstream)
         // stays inside each open attempt, before any stream body exists.
-        let account_id = self.codex_account_id.clone();
         let request_body =
             serde_json::to_vec(&body).context("Failed to serialize Responses API request body")?;
         let open_req = self.stream_open_request();
         let response = super::stream_entry::open_sse_response(&open_req, |policy| {
             let url = url.clone();
-            let account_id = account_id.clone();
             let request_body = request_body.clone();
             async move {
                 let client = super::stream_entry::client_for_policy(
@@ -192,19 +190,11 @@ impl CodewhaleClient {
                     policy,
                 );
                 self.send_with_retry(|| {
-                    let mut builder = client
+                    client
                         .post(&url)
                         .header("Content-Type", "application/json")
-                        .header("Accept", "text/event-stream");
-                    if is_codex {
-                        builder = builder
-                            .header("OpenAI-Beta", "responses=experimental")
-                            .header("originator", "codex_cli_rs");
-                        if let Some(account_id) = &account_id {
-                            builder = builder.header("chatgpt-account-id", account_id);
-                        }
-                    }
-                    builder.body(request_body.clone())
+                        .header("Accept", "text/event-stream")
+                        .body(request_body.clone())
                 })
                 .await
                 .context("Responses API request failed")
@@ -216,12 +206,14 @@ impl CodewhaleClient {
         crate::client::record_provider_response(self.api_provider, status.as_u16());
         if !status.is_success() {
             let raw = bounded_error_text(response, ERROR_BODY_MAX_BYTES).await;
-            anyhow::bail!("Responses API error (HTTP {status}): {raw}");
+            let raw = self.redact_model_bound_text(&raw);
+            return Err(LlmError::from_http_response(status.as_u16(), &raw).into());
         }
 
         let stream_idle_timeout = self.stream_idle_timeout;
         let first_byte = super::stream_entry::first_byte_timeout(stream_idle_timeout);
         let provider_label = self.api_provider.display_name();
+        let error_secrets = self.model_bound_secret_values.clone();
         let byte_stream = response.bytes_stream();
 
         let stream = async_stream::stream! {
@@ -310,6 +302,10 @@ impl CodewhaleClient {
                             } else if let Some(value) = extract_sse_data_value(&line)
                                 && let Err(err) = push_sse_event_data(&mut event_data, value)
                             {
+                                if is_chatgpt {
+                                    yield Err(LlmError::ParseError(err.to_string()).into());
+                                    return;
+                                }
                                 yield Err(anyhow::anyhow!("{err}"));
                                 return;
                             }
@@ -321,6 +317,10 @@ impl CodewhaleClient {
                         }
                         Ok(None) => break,
                         Err(err) => {
+                            if is_chatgpt {
+                                yield Err(LlmError::ParseError(err.to_string()).into());
+                                return;
+                            }
                             yield Err(anyhow::anyhow!("{err}"));
                             return;
                         }
@@ -332,13 +332,17 @@ impl CodewhaleClient {
                     {
                         let data = data.as_str();
                         if data == "[DONE]" {
-                            done = true;
+                            if !is_chatgpt { done = true; }
                             break;
                         }
 
                         let event: Value = match serde_json::from_str(data) {
                             Ok(v) => v,
                             Err(e) => {
+                                if is_chatgpt {
+                                    yield Err(LlmError::ParseError("Invalid ChatGPT response event".into()).into());
+                                    return;
+                                }
                                 logging::warn(format!(
                                     "Failed to parse Responses SSE event: {e}"
                                 ));
@@ -370,6 +374,10 @@ impl CodewhaleClient {
                                                 Some(content_block_counter - 1);
                                         }
                                         "function_call" => {
+                                            if is_chatgpt && item.get("namespace").and_then(Value::as_str) != Some(CHATGPT_TOOL_NAMESPACE) {
+                                                yield Err(LlmError::ParseError("ChatGPT returned a function outside the Codewhale tool namespace".into()).into());
+                                                return;
+                                            }
                                             let call_id = item
                                                 .get("call_id")
                                                 .and_then(|v| v.as_str())
@@ -538,6 +546,27 @@ impl CodewhaleClient {
                                 }
                             }
                             "response.completed" | "response.incomplete" => {
+                                if is_chatgpt && !event.get("response").is_some_and(Value::is_object) {
+                                    yield Err(LlmError::ParseError("ChatGPT completion event has no response".into()).into());
+                                    return;
+                                }
+                                if is_chatgpt && event_type == "response.completed" && string_at(&event, "/response/status") != Some("completed") {
+                                    yield Err(LlmError::ParseError("ChatGPT completion event has an unsuccessful status".into()).into());
+                                    return;
+                                }
+                                if is_chatgpt && event_type == "response.incomplete" {
+                                    if let Some(usage_val) = event.pointer("/response/usage") {
+                                        yield Ok(StreamEvent::MessageDelta {
+                                            delta: MessageDelta { stop_reason: None, stop_sequence: None },
+                                            usage: Some(parse_responses_usage(usage_val)),
+                                        });
+                                    }
+                                    let (code, msg) = responses_event_error_details(&event);
+                                    let code = super::redact_model_bound_text(&code, &error_secrets);
+                                    let msg = super::redact_model_bound_text(&msg, &error_secrets);
+                                    yield Err(LlmError::ParseError(format!("ChatGPT response incomplete [{code}]: {msg}")).into());
+                                    return;
+                                }
                                 if let Some(resp) = event.get("response") {
                                     if let Some(usage_val) = resp.get("usage") {
                                         usage_data =
@@ -559,6 +588,24 @@ impl CodewhaleClient {
                             }
                             "error" | "response.failed" => {
                                 let (code, msg) = responses_event_error_details(&event);
+                                if is_chatgpt {
+                                    if let Some(usage_val) = event.pointer("/response/usage") {
+                                        yield Ok(StreamEvent::MessageDelta {
+                                            delta: MessageDelta { stop_reason: None, stop_sequence: None },
+                                            usage: Some(parse_responses_usage(usage_val)),
+                                        });
+                                    }
+                                    if let Some(error) = LlmError::from_subscription_sharing_error_code(&code) {
+                                        yield Err(error.into());
+                                        return;
+                                    }
+                                }
+                                let code = super::redact_model_bound_text(&code, &error_secrets);
+                                let msg = super::redact_model_bound_text(&msg, &error_secrets);
+                                if is_chatgpt {
+                                    yield Err(LlmError::ModelError(format!("Responses API error [{code}]: {msg}")).into());
+                                    return;
+                                }
                                 yield Err(anyhow::anyhow!(
                                     "Responses API error [{code}]: {msg}"
                                 ));
@@ -576,12 +623,17 @@ impl CodewhaleClient {
                 }
             }
 
-            // Only `[DONE]` or `response.completed`/`response.incomplete`
-            // proves the response is whole. A bare HTTP EOF is truncation, and
+            // ChatGPT requires a successful response.completed event; other
+            // Responses routes also accept their documented terminal markers.
+            // A bare HTTP EOF is truncation, and
             // a MessageStop here would hand the turn a partial answer as done.
             if !done {
+                if is_chatgpt {
+                    yield Err(LlmError::ParseError("ChatGPT Responses stream closed before a successful completion event".into()).into());
+                    return;
+                }
                 yield Err(anyhow::anyhow!(
-                    "Responses stream closed before response.completed or [DONE]"
+                    "Responses stream closed before a successful completion event"
                 ));
                 return;
             }
@@ -594,10 +646,8 @@ impl CodewhaleClient {
     /// Non-streaming Responses request: drive the streaming handler and fold
     /// its events into a single `MessageResponse`.
     ///
-    /// The ChatGPT Codex backend only serves streaming responses, so the
-    /// non-streaming entry point (`create_message`, used by `exec`) reuses the
-    /// same wire path as the interactive stream rather than a second request
-    /// shape.
+    /// The official ChatGPT plan preview requires streaming. The blocking
+    /// entry point (`create_message`, used by `exec`) folds that same wire path.
     pub(super) async fn handle_responses_message(
         &self,
         prepared: &super::PreparedOutboundRequest,
@@ -829,12 +879,16 @@ pub(super) fn convert_messages_to_responses_input(
                             id, name, input, ..
                         } => {
                             let (call_id, _item_id) = parse_tool_use_id(id);
-                            items.push(json!({
+                            let mut item = json!({
                                 "type": "function_call",
                                 "call_id": call_id,
                                 "name": to_api_tool_name(name),
                                 "arguments": serde_json::to_string(input).unwrap_or_default(),
-                            }));
+                            });
+                            if provider == ApiProvider::OpenaiCodex {
+                                item["namespace"] = json!(CHATGPT_TOOL_NAMESPACE);
+                            }
+                            items.push(item);
                         }
                         ContentBlock::Thinking {
                             thinking, state, ..
@@ -911,7 +965,7 @@ pub(super) fn convert_messages_to_responses_input(
                         if !content_items.is_empty() {
                             items.push(json!({
                                 "type": "message",
-                                "role": role,
+                                "role": if provider == ApiProvider::OpenaiCodex && role == "system" { "developer" } else { role },
                                 "content": content_items,
                             }));
                         }
@@ -995,24 +1049,29 @@ fn responses_event_error_details(event: &Value) -> (String, String) {
         ],
     )
     .unwrap_or("unknown");
-    let message = first_string_at(
-        event,
-        &[
-            "/message",
-            "/error/message",
-            "/response/error/message",
-            "/response/incomplete_details/reason",
-        ],
-    )
-    .map_or_else(
-        || format!("{event_type} event received"),
-        |message| {
-            if message == code && event_type == "response.incomplete" {
-                format!("response incomplete: {message}")
-            } else {
-                message.to_string()
-            }
+    let message = LlmError::from_subscription_sharing_error_code(code).map_or_else(
+        || {
+            first_string_at(
+                event,
+                &[
+                    "/message",
+                    "/error/message",
+                    "/response/error/message",
+                    "/response/incomplete_details/reason",
+                ],
+            )
+            .map_or_else(
+                || format!("{event_type} event received"),
+                |message| {
+                    if message == code && event_type == "response.incomplete" {
+                        format!("response incomplete: {message}")
+                    } else {
+                        message.to_string()
+                    }
+                },
+            )
         },
+        |error| error.to_string(),
     );
     (code.to_string(), message)
 }

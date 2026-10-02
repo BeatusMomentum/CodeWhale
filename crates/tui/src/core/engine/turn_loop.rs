@@ -71,6 +71,7 @@ struct StreamOutcome {
     pending_message_complete: bool,
     last_text_index: Option<usize>,
     stream_errors: u32,
+    terminal_stream_error: bool,
     /// Unsettled steers queued mid-stream. Each is committed into the turn's
     /// record at a step boundary, or dropped — and dropping one reports
     /// `SteerOutcome::Dropped` to its sender, so an interrupted or failed
@@ -1916,6 +1917,7 @@ impl Engine {
                 pending_message_complete,
                 last_text_index,
                 stream_errors,
+                terminal_stream_error,
                 mut pending_steers,
                 pending_resume,
                 stream_start,
@@ -2075,6 +2077,7 @@ impl Engine {
             // conversation — the retried request is the persisted
             // conversation re-issued, nothing else.
             let stream_died_with_nothing = stream_errors > 0
+                && !terminal_stream_error
                 && tool_uses.is_empty()
                 && current_text_visible.trim().is_empty()
                 && current_thinking.trim().is_empty()
@@ -2084,7 +2087,8 @@ impl Engine {
                 None if stream_died_with_nothing => Some(StreamResume::NoContentStreamDeath),
                 None => None,
             };
-            if let Some(resume) = pending_resume
+            if !terminal_stream_error
+                && let Some(resume) = pending_resume
                 && let Some(attempt) = stream_retry_budget.authorize()
             {
                 let limit = stream_retry_budget.limit();
@@ -5708,6 +5712,7 @@ impl Engine {
         // breaking the existing pin invariants.
         let mut stream = stream;
         let mut stream_error: Option<String> = None;
+        let mut terminal_stream_error = false;
 
         let mut current_text_raw = String::new();
         let mut current_text_visible = String::new();
@@ -5880,6 +5885,18 @@ impl Engine {
                 Err(e) => {
                     stream_errors = stream_errors.saturating_add(1);
                     let message = self.decorate_auth_error_message(e.to_string());
+                    let user_message =
+                        stream_read_error_user_message(&message, any_content_received);
+                    let envelope =
+                        crate::error_taxonomy::envelope_for_llm_error(e, user_message.clone());
+                    // Typed account, authorization, and protocol failures cannot
+                    // be repaired by sleep recovery or replaying the request.
+                    if !envelope.recoverable {
+                        terminal_stream_error = true;
+                        stream_error.get_or_insert(user_message);
+                        let _ = self.send_stream_event(Event::error(envelope)).await;
+                        break;
+                    }
                     // #2990: wall-clock far ahead of the monotonic clock
                     // since the last chunk means the host slept mid-stream.
                     // The partial output predates the sleep and the user
@@ -5955,13 +5972,11 @@ impl Engine {
                                     "Stream retry failed: {retry_err}"
                                 ));
                                 stream_error.get_or_insert(retry_msg.clone());
-                                let _ = self
-                                    .send_stream_event(Event::error(
-                                        crate::error_taxonomy::envelope_for_llm_error(
-                                            retry_err, retry_msg,
-                                        ),
-                                    ))
-                                    .await;
+                                let envelope = crate::error_taxonomy::envelope_for_llm_error(
+                                    retry_err, retry_msg,
+                                );
+                                terminal_stream_error = !envelope.recoverable;
+                                let _ = self.send_stream_event(Event::error(envelope)).await;
                                 break;
                             }
                         }
@@ -6033,19 +6048,10 @@ impl Engine {
                         pending_resume = Some(StreamResume::InteractiveNetworkDrop);
                         break;
                     }
-                    let user_message =
-                        stream_read_error_user_message(&message, any_content_received);
                     stream_error.get_or_insert(user_message.clone());
-                    let envelope = crate::error_taxonomy::envelope_for_llm_error(e, user_message);
-                    // A terminal (non-recoverable) stream failure must stop
-                    // consumption immediately: re-issuing a wrong-model or
-                    // authorization rejection cannot succeed, and continuing
-                    // leaves the door open for stale deltas after the failure
-                    // card. Recoverable classes (rate limit, network) keep
-                    // the bounded retry tail.
-                    let terminal = !envelope.recoverable;
+                    // Recoverable failures retain their bounded retry tail.
                     let _ = self.send_stream_event(Event::error(envelope)).await;
-                    if terminal || stream_errors >= retry_limits.max_errors {
+                    if stream_errors >= retry_limits.max_errors {
                         break;
                     }
                     continue;
@@ -6388,6 +6394,7 @@ impl Engine {
             pending_message_complete,
             last_text_index,
             stream_errors,
+            terminal_stream_error,
             pending_steers,
             pending_resume,
             stream_start,
@@ -7644,6 +7651,52 @@ mod tests {
             tool_choice: None,
             reasoning_effort: None,
         })
+    }
+
+    #[tokio::test]
+    async fn typed_terminal_stream_failure_never_replays_or_consumes_suffix() {
+        use crate::llm_client::{LlmError, mock::canned};
+        for code in [
+            "subscription_sharing_usage_limit_exceeded",
+            "subscription_sharing_usage_unavailable",
+        ] {
+            let tmp = tempdir().unwrap();
+            let (mut engine, model, mut rx) = stream_backpressure_fixture(tmp.path(), 16);
+            let error = LlmError::from_subscription_sharing_error_code(code).unwrap();
+            let stream = futures_util::stream::iter(vec![
+                Err(error.into()),
+                Ok(canned::text_delta(0, "UNREAD-SUFFIX")),
+                Ok(canned::message_stop()),
+            ]);
+            let request = stream_backpressure_request();
+            let mut diagnostics = crate::tool_inspection::TurnStopDiagnostics::default();
+            let outcome = tokio::time::timeout(
+                Duration::from_secs(1),
+                engine.process_stream(
+                    model.as_ref(),
+                    Box::pin(stream),
+                    &request,
+                    Instant::now(),
+                    0,
+                    &mut diagnostics,
+                ),
+            )
+            .await
+            .unwrap();
+            assert!(outcome.terminal_stream_error);
+            assert!(outcome.pending_resume.is_none());
+            assert!(!outcome.pending_message_complete);
+            assert!(outcome.current_text_raw.is_empty());
+            assert_eq!(
+                model.call_count(),
+                0,
+                "terminal errors must not transparently retry"
+            );
+            assert_eq!(diagnostics.transparent_stream_retries, 0);
+            assert!(
+                matches!(rx.try_recv(), Ok(Event::Error { envelope, .. }) if envelope.code == "llm_quota_exhausted" && !envelope.recoverable)
+            );
+        }
     }
 
     /// Hold the actual stream decoder in a full host queue, then cancel

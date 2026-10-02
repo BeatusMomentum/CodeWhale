@@ -316,7 +316,7 @@ fn redact_api_key_from_message(message: &str, api_key: Option<&str>) -> String {
 
 // === LlmError - Classified Error Types ===
 
-/// Evidence captured when an HTTP response explicitly identifies plan quota
+/// Evidence captured when a provider response explicitly identifies plan quota
 /// exhaustion. The private field prevents callers outside this parser module
 /// from manufacturing the durable classification from arbitrary text.
 #[derive(Debug)]

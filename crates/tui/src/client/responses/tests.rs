@@ -347,10 +347,20 @@ async fn chatgpt_plan_usage_errors_explain_where_to_check_allowance() {
             .last()
             .unwrap()
             .as_ref()
-            .expect_err("plan usage error")
-            .to_string();
-        assert!(error.contains("ChatGPT plan usage"), "{error}");
-        assert!(error.contains("ChatGPT Settings > Usage"), "{error}");
+            .expect_err("plan usage error");
+        let typed = error
+            .downcast_ref::<crate::llm_client::LlmError>()
+            .expect("typed allowance error");
+        assert!(matches!(
+            typed,
+            crate::llm_client::LlmError::QuotaExhausted(_)
+        ));
+        assert!(!typed.is_retryable());
+        assert!(error.to_string().contains("ChatGPT plan usage"), "{error}");
+        assert!(
+            error.to_string().contains("ChatGPT Settings > Usage"),
+            "{error}"
+        );
         assert!(
             !events
                 .iter()
@@ -358,6 +368,64 @@ async fn chatgpt_plan_usage_errors_explain_where_to_check_allowance() {
             "{events:?}"
         );
     }
+}
+
+#[tokio::test]
+async fn chatgpt_terminal_failures_preserve_usage_without_settling() {
+    for response in [
+        json!({"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"}}),
+        json!({"status":"failed","error":{"code":"subscription_sharing_usage_unavailable"}}),
+    ] {
+        let event_type = if response["status"] == "incomplete" {
+            "response.incomplete"
+        } else {
+            "response.failed"
+        };
+        let mut response = response;
+        response["usage"] = json!({"input_tokens":13,"output_tokens":5});
+        let events = collect_responses_stream(&format!(
+            "data: {}\n\n",
+            json!({"type":event_type,"response":response})
+        ))
+        .await;
+        assert!(events.iter().any(|event| matches!(event, Ok(StreamEvent::MessageDelta { usage: Some(usage), .. }) if usage.input_tokens == 13 && usage.output_tokens == 5)));
+        let error = events.last().unwrap().as_ref().unwrap_err();
+        let typed = error.downcast_ref::<crate::llm_client::LlmError>().unwrap();
+        assert!(!typed.is_retryable());
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, Ok(StreamEvent::MessageStop)))
+        );
+    }
+}
+
+#[tokio::test]
+async fn chatgpt_http_usage_limit_is_not_retried() {
+    let server = MockServer::start().await;
+    let attempts = Arc::new(AtomicUsize::new(0));
+    Mock::given(method("POST"))
+        .and(path("/responses"))
+        .respond_with(AlwaysError {
+            attempts: Arc::clone(&attempts),
+            status: 429,
+            body: r#"{"error":{"code":"subscription_sharing_usage_limit_exceeded","message":"opaque"}}"#,
+        }).mount(&server).await;
+    let client = CodewhaleClient::new(&test_codex_config(&server)).unwrap();
+    let request = client
+        .prepare_outbound_request(minimal_responses_request(), true)
+        .unwrap();
+    let error = match client.handle_responses_stream(&request).await {
+        Ok(_) => panic!("allowance error must fail"),
+        Err(error) => error,
+    };
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    let typed = error.downcast_ref::<crate::llm_client::LlmError>().unwrap();
+    assert!(matches!(
+        typed,
+        crate::llm_client::LlmError::QuotaExhausted(_)
+    ));
+    assert!(!typed.is_retryable());
 }
 
 #[tokio::test]
