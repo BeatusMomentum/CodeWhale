@@ -9301,7 +9301,8 @@ mod tests {
     fn chatgpt_provider_models_require_own_roster_and_keep_provider_order() {
         let _env = crate::test_support::lock_test_env();
         let home = tempfile::tempdir().unwrap();
-        let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", home.path());
+        let home_path = home.path().canonicalize().unwrap();
+        let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", &home_path);
         let mut config = Config::default();
         let picker = ProviderPickerView::new(ApiProvider::Deepseek, &config);
         let row = picker

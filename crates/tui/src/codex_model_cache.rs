@@ -393,7 +393,8 @@ mod tests {
     fn own_roster_follows_selected_registration_and_disappears_after_sign_out() {
         let _env = crate::test_support::lock_test_env();
         let directory = tempfile::tempdir().unwrap();
-        let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", directory.path());
+        let directory_path = directory.path().canonicalize().unwrap();
+        let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", &directory_path);
         let mut account_a = Config::default();
         crate::oauth::install_test_chatgpt_registration_for(
             &mut account_a,
