@@ -705,9 +705,12 @@ do not stat, read, refresh, contact an identity provider for, or rewrite Codex,
 Grok, Kimi, or future external credential files.
 
 Codewhale currently supports exact-path, provider-scoped **read-only** grants
-for the Codex CLI and Grok CLI:
+for the Codex CLI and Grok CLI. Codex grants remain available for legacy
+credential inspection only; they cannot authorize the official ChatGPT plan
+route. Use `codewhale auth chatgpt` for that route.
 
 ```bash
+# Legacy Codex credential inspection; does not authorize ChatGPT plan requests.
 codex login
 codewhale auth external-consent --provider openai-codex --mode read-only
 
@@ -722,9 +725,11 @@ Pass `--path /absolute/path/to/auth.json` when the external CLI uses a custom
 location. Consent persists the provider, external owner, exact absolute path,
 and consent schema version. Later environment-variable changes do not redirect
 that authority to a different file. Read-only grants never refresh, contact an
-identity/discovery service, or rewrite the external file; normal requests to
-the explicitly selected provider may use its token. An expired token fails
-with login guidance. Doctor reports structural consent/config state without
+identity/discovery service, or rewrite the external file. Supported routes such
+as xAI may use the external token after explicit selection. The official ChatGPT
+plan route ignores imported Codex tokens and requires its own verified grant.
+An expired external token fails with login guidance. Doctor reports structural
+consent/config state without
 opening credential files and is always non-mutating.
 
 `managed` is reserved for a future provider-specific preservation adapter.
