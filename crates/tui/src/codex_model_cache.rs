@@ -229,7 +229,11 @@ fn valid_effort(effort: &str) -> bool {
 pub(crate) async fn update_from_chatgpt(config: &Config) -> Result<CodexModelRoster, &'static str> {
     let config = config.clone();
     let prepared = config.clone();
+    #[cfg(test)]
+    let ticket = crate::test_support::env_scope_ticket();
     let (path, client) = tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        let _membership = crate::test_support::join_env_scope(ticket);
         let path = snapshot_path(&prepared).ok_or("chatgpt_plan_permission_required")?;
         let client = crate::client::CodewhaleClient::for_catalog_refresh(&prepared)
             .map_err(|_| "chatgpt_plan_credentials_unavailable")?;
@@ -266,7 +270,11 @@ pub(crate) async fn update_from_chatgpt(config: &Config) -> Result<CodexModelRos
         fetched_at: Utc::now(),
         models,
     };
+    #[cfg(test)]
+    let ticket = crate::test_support::env_scope_ticket();
     tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        let _membership = crate::test_support::join_env_scope(ticket);
         if snapshot_path(&config).as_ref() != Some(&path) {
             return Err("refresh_credentials_changed");
         }
