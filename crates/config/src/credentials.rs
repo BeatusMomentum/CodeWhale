@@ -168,8 +168,9 @@ fn set_provider_api_key_unlocked(
 pub struct ClearOutcome {
     /// The secret-store slot the clear targeted.
     pub slot: &'static str,
-    /// `None` when the secret store accepted the delete; otherwise the backend
-    /// error, already stringified so it carries no credential material.
+    /// `None` when the secret store accepted the delete or holds no key for the
+    /// slot; otherwise the backend error, already stringified so it carries no
+    /// credential material.
     pub secret_store_error: Option<String>,
 }
 
@@ -216,7 +217,14 @@ pub fn clear_provider_api_key(
         store.config = original_config;
         return Err(error);
     }
-    let secret_store_error = secrets.delete(slot).err().map(|error| error.to_string());
+    // A backend that refuses every delete (a read-only store) but holds no key
+    // for this slot has nothing left to revoke, so that refusal is not a
+    // failure. Both callers get this rule from here.
+    let secret_store_error = secrets
+        .delete(slot)
+        .err()
+        .filter(|_| !matches!(secrets.get(slot), Ok(None)))
+        .map(|error| error.to_string());
     Ok(ClearOutcome {
         slot,
         secret_store_error,
@@ -226,6 +234,50 @@ pub fn clear_provider_api_key(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codewhale_secrets::{KeyringStore, SecretsError};
+    use std::sync::Arc;
+
+    /// A store that refuses every delete and holds `.0` for every slot.
+    struct UndeletableStore(Option<&'static str>);
+
+    impl KeyringStore for UndeletableStore {
+        fn get(&self, _key: &str) -> Result<Option<String>, SecretsError> {
+            Ok(self.0.map(str::to_string))
+        }
+
+        fn set(&self, _key: &str, _value: &str) -> Result<(), SecretsError> {
+            Err(SecretsError::ReadOnly)
+        }
+
+        fn delete(&self, _key: &str) -> Result<(), SecretsError> {
+            Err(SecretsError::Keyring("test delete failure".to_string()))
+        }
+
+        fn backend_name(&self) -> &'static str {
+            "undeletable test store"
+        }
+    }
+
+    #[test]
+    fn a_refused_delete_fails_the_clear_only_while_the_store_still_holds_a_key() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        for (held, fails) in [(Some("sk-keyring-fixture"), true), (None, false)] {
+            let mut store = ConfigStore::load(Some(path.clone())).expect("load config");
+            store.config.providers.deepseek.api_key = Some("sk-config-fixture".to_string());
+            let secrets = Secrets::new(Arc::new(UndeletableStore(held)));
+            let outcome = clear_provider_api_key(&mut store, &secrets, ProviderKind::Deepseek)
+                .expect("the config leg saves");
+            assert!(store.config.providers.deepseek.api_key.is_none());
+            assert_eq!(outcome.is_complete(), !fails, "delete refusal completion");
+            if let Some(error) = outcome.secret_store_error {
+                assert!(
+                    !error.contains("sk-keyring-fixture"),
+                    "credential leaked into error"
+                );
+            }
+        }
+    }
 
     fn store_with(body: &str) -> (tempfile::TempDir, ConfigStore) {
         let dir = tempfile::tempdir().expect("tempdir");

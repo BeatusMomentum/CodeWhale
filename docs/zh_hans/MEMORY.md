@@ -1,7 +1,7 @@
 # 用户记忆
 
 > 英文原文：[MEMORY.md](../MEMORY.md)。
-> 最后与英文同步日期（last synced with English revision）：2026-09-26。
+> 最后与英文同步日期（last synced with English revision）：2026-09-29。
 
 用户记忆给模型提供一小块本地持久存储，用来存放应当跨会话保留的偏好和约定——
 “我更喜欢 pytest 而不是 unittest”、“这个代码库用 4 空格缩进”——这样就不用每次
@@ -148,7 +148,7 @@ remote 的 git 仓库（作用域 id 就是它的哈希）。
 
 记忆只存放**持久**的信号。下面这些不应该放进去：
 
-- **机密信息**——不要放 API key、token、密码。这些文件是磁盘上的明文，
+- **机密信息**——不要放 API 密钥、令牌、密码。这些文件是磁盘上的明文，
   条目还会被注入系统提示词。
 - **临时任务状态**——“我现在正在改解析器”每次会话都会变，不属于跨会话记忆。
 - **对话片段**——引文式的笔记应该写进笔记工具（`note`），不是记忆。
@@ -195,7 +195,7 @@ enabled = true                    # default false; or set DEEPSEEK_MEMORY=on
 
 ## 相关文档
 
-- `docs/SUBAGENTS.md`——子代理（subagent）会继承记忆，也可以使用 `remember` 工具。
+- `docs/SUBAGENTS.md`——子智能体（sub-agent）会继承记忆，也可以使用 `remember` 工具。
 - `docs/CONFIGURATION.md`——完整的配置参考。
 - Issue [#489](https://github.com/Hmbown/CodeWhale/issues/489)
   ——跟踪这项工作的第一阶段 EPIC。

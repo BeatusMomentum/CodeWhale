@@ -102,7 +102,12 @@ async fn runtime_store_binding_exit_preserves_inflight_recovery() -> anyhow::Res
     let root = tempfile::tempdir()?;
     let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", root.path());
     let sessions = SessionManager::default_location()?;
-    for (loading, dispatch) in [(true, false), (false, true)] {
+    // U02-09: a locally cancelled turn still owes its terminal event.
+    for (loading, dispatch, cancelled) in [
+        (true, false, false),
+        (false, true, false),
+        (false, false, true),
+    ] {
         let original = crate::session_manager::create_saved_session_with_mode(
             &[],
             "deepseek-v4-pro",
@@ -119,6 +124,7 @@ async fn runtime_store_binding_exit_preserves_inflight_recovery() -> anyhow::Res
         app.current_session_id = Some(original.metadata.id.clone());
         app.is_loading = loading;
         app.dispatch_in_flight = dispatch;
+        app.suppress_stream_events_until_turn_complete = cancelled;
         let (handle, actor) =
             persistence_actor::spawn_persistence_actor(SessionManager::default_location()?);
         assert!(

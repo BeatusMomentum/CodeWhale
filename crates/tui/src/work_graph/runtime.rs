@@ -894,21 +894,33 @@ fn operation_parent(
     session_id: &str,
     source: &str,
 ) -> Result<WorkNodeId, String> {
-    if let Some(parent) = graph
-        .snapshot()
+    let snapshot = graph.snapshot();
+    // Only a step the current plan or To-do projection still lists may adopt
+    // new work. Replacing a plan keeps the dropped steps as history (their
+    // ids are reused if the plan grows back, so they are not retired), but a
+    // step nobody can see must never become an operation's parent.
+    let projected_step = |node: &&WorkNode, state: NodeState| {
+        node.kind == NodeKind::PlanStep
+            && node.state == state
+            && (snapshot.compat.plan_order.contains(&node.id)
+                || snapshot
+                    .compat
+                    .todos
+                    .iter()
+                    .any(|binding| binding.node == node.id))
+    };
+    if let Some(parent) = snapshot
         .nodes
         .iter()
-        .find(|node| node.kind == NodeKind::PlanStep && node.state == NodeState::Active)
+        .find(|node| projected_step(node, NodeState::Active))
         .or_else(|| {
-            graph
-                .snapshot()
+            snapshot
                 .nodes
                 .iter()
-                .find(|node| node.kind == NodeKind::PlanStep && node.state == NodeState::Ready)
+                .find(|node| projected_step(node, NodeState::Ready))
         })
         .or_else(|| {
-            graph
-                .snapshot()
+            snapshot
                 .nodes
                 .iter()
                 .find(|node| node.kind == NodeKind::Objective)
@@ -1823,6 +1835,67 @@ mod tests {
                 )
                 .expect_err("owner sequence cannot regress")
                 .contains("sequence regressed")
+        );
+    }
+
+    #[tokio::test]
+    async fn replaced_plan_steps_never_parent_new_operations() {
+        let runtime = new_shared_work_runtime(
+            crate::tools::todo::new_shared_todo_list(),
+            crate::tools::plan::new_shared_plan_state(),
+        );
+        let step = |step: &str, status: StepStatus| PlanItemArg {
+            step: step.to_string(),
+            status,
+        };
+        let three = PlanSnapshot {
+            items: vec![
+                step("first", StepStatus::Pending),
+                step("second", StepStatus::Pending),
+                step("third", StepStatus::InProgress),
+            ],
+            ..PlanSnapshot::default()
+        };
+        runtime
+            .apply_plan_update("session", "update_plan", &three)
+            .await
+            .expect("three-step plan");
+        let one = PlanSnapshot {
+            items: vec![step("only", StepStatus::Pending)],
+            ..PlanSnapshot::default()
+        };
+        runtime
+            .apply_plan_update("session", "update_plan", &one)
+            .await
+            .expect("replacement plan");
+
+        let operation = runtime
+            .register_operation(
+                "session",
+                OperationIntent::new(
+                    "shell:after",
+                    "after replacement",
+                    false,
+                    "exec_shell",
+                    "c1",
+                ),
+            )
+            .expect("register operation");
+        let graph = runtime
+            .capture(Some("session"))
+            .expect("capture")
+            .expect("graph")
+            .graph;
+        assert_eq!(graph.compat.plan_order.len(), 1);
+        let parent = graph
+            .edges
+            .iter()
+            .find(|edge| edge.kind == EdgeKind::Contains && edge.to == operation)
+            .map(|edge| edge.from.clone());
+        assert_eq!(
+            parent,
+            Some(graph.compat.plan_order[0].clone()),
+            "an orphaned step from the replaced plan must not adopt new work"
         );
     }
 

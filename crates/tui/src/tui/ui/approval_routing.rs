@@ -91,12 +91,19 @@ pub(super) async fn auto_deny_session_approval(
             "session_id": app.current_session_id,
         }),
     );
-    let _ = engine_handle
+    // The notice claims the call was denied; say so only when the denial
+    // reached the engine (U03-06). A failed send means the engine's approval
+    // mailbox is closed, so nothing is left waiting on this decision.
+    if let Err(error) = engine_handle
         .deny_tool_call_by(
             id.to_string(),
             crate::approval_log::ApprovalDecider::SessionRule,
         )
-        .await;
+        .await
+    {
+        tracing::warn!(tool_name, %error, "session-rule denial did not reach the engine");
+        return;
+    }
     surface_session_denied_notice(app, tool_name);
 }
 

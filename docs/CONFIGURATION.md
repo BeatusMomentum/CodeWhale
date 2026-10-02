@@ -751,9 +751,9 @@ read from `TYPESAFE_API_KEY`, the `typesafe` secret-store entry, or
 
 #### Decision routers (`kind = "decision"`)
 
-A decision router asks a non-generative decision model one typed question per
-turn — a Choice between the active provider's `fast` and `strong` tiers, plus a
-thinking level — and gets calibrated probabilities back. No prose is parsed.
+A decision router asks a non-generative decision model typed Choice questions
+for the active provider's `fast` and `strong` tiers and thinking level, then
+reads calibrated probabilities. No prose is parsed.
 
 ```toml
 [auto.router]
@@ -771,8 +771,55 @@ min_confidence = 0.5          # default 0.5, clamped to 0..1
   0.75, or the turn stays on the fast tier.
 - An unknown `kind`, or a decision `provider` other than `openrouter` /
   `typesafe`, leaves the router unconfigured and shown as failing.
-- `thinking` is ignored for decision routers. OpenRouter spend is recorded like
-  any routed usage; TypeSafe-direct spend appears on the receipt only.
+- `[auto.router] thinking` is ignored for decision routers. Both routes settle tokens through
+  the originating session's routed-usage ledger. TypeSafe is a named Custom route
+  with unknown billing; its price is never borrowed from the active chat provider.
+  Provider-reported cost remains verbatim on the decision receipt.
+- OpenRouter uses `POST /api/alpha/decisions`; TypeSafe uses `POST /v1/systemone`.
+  The shared client validates Choice, Noul and Score against the offered questions
+  and bounds responses to 256 KiB. Malformed answers fail open with usage retained.
+
+#### Shadow Decision Gate (experimental, off by default)
+
+The Superfast Decision Gate asks a decision model three typed questions about
+the latest user message — does it need a tool, can it be answered from the
+conversation, and what is its intent — and logs a conservative recommendation.
+It is shadow-only: it never changes routing, never skips or delays the model
+call, and fails open on any error, timeout or malformed answer. It uses the same
+System One client as the decision router above; there is no separate HTTP
+client. It is configured from the environment and reads it when a turn starts:
+
+```sh
+SUPERFAST_ENABLED=1              # off unless set
+SUPERFAST_PROVIDER=typesafe      # or openrouter; required when enabled
+SUPERFAST_BASE_URL=http://localhost:8000/v1  # optional TypeSafe-route base, e.g. self-hosted
+SUPERFAST_MODEL=jev-latest       # default jev-latest / ~typesafe/jev-latest
+SUPERFAST_TIMEOUT_MS=150         # 1..=10000, default 150
+```
+
+- Enabling the gate never picks an endpoint by itself: without
+  `SUPERFAST_PROVIDER` nothing is sent and a warning is logged.
+- The key comes from the same place the decision router reads it. The TypeSafe
+  route always authenticates, so a self-hosted server that ignores auth still
+  needs a placeholder `TYPESAFE_API_KEY`.
+- Only the latest user message is sent, truncated to 4,000 characters and
+  redacted of configured secrets. The log (target `superfast`) carries the
+  route, failure class and latency, never prompt text.
+- The gate retains the originating turn's accounting owner and cancellation.
+  Its tokens settle through the shared ledger; missing usage or a cancelled/timed
+  out request after dispatch creates an explicit coverage gap. Unknown TypeSafe
+  pricing is recorded as unpriced rather than free.
+- Provider-reported cost survives rejected answers and late responses in bounded
+  receipts on the originating turn or session. These are diagnostic evidence;
+  unknown pricing never becomes an authoritative dollar total. Incomplete token
+  counters record a coverage gap while preserving the reported raw evidence.
+
+The wire contracts are documented in [TypeSafe's OpenAPI schema](https://api.typesafe.ai/openapi.json)
+and [OpenRouter's Decisions examples](https://openrouter.ai/blog/insights/what-is-jev/).
+
+The Decision Gate concept and reference implementation are by Andrea Bruno,
+released under CC BY 4.0:
+[harness-superfast](https://github.com/Andrea-Bruno/harness-superfast).
 
 Two `[auto]` keys shape routing (`AutoConfig` in `crates/tui/src/config.rs`):
 
@@ -1252,7 +1299,7 @@ Remaining variables:
 - `DEEPSEEK_HTTP_HEADERS` (custom model request headers, comma-separated `name=value` pairs)
 - `DEEPSEEK_DEFAULT_TEXT_MODEL` (extra legacy alias of `DEEPSEEK_MODEL`)
 - `DEEPSEEK_STREAM_IDLE_TIMEOUT_SECS` (stream idle timeout in seconds; default `900`, clamped to `1..=3600`)
-- `DEEPSEEK_STREAM_OPEN_TIMEOUT_SECS` (connection setup + response-header wait in seconds; default `45`, clamped to `5..=300`; distinct from the per-chunk idle timeout; `tui.stream_open_timeout_secs` wins when set)
+- `DEEPSEEK_STREAM_OPEN_TIMEOUT_SECS` (connection setup + response-header wait in seconds; default `45`, clamped to `5..=300`; distinct from the per-chunk idle timeout; `stream.open_timeout_secs` (legacy `tui.stream_open_timeout_secs` fallback) wins when positive)
 - `CODEWHALE_CACHE_MAXIMAL` (`1`/`true`/`on`/`yes`) — cache-maximal context mode (#528). When on, the Repo Working Set block materializes the **full current contents** of the top active files into the system prompt each turn (deterministic order, byte-bounded), instead of only listing their paths. The block stays byte-stable while those files are unchanged so DeepSeek's KV prefix cache keeps hitting; editing a file cache-misses from its block onward. Off by default (path list only). Byte caps default to 24 KB per file / 96 KB total.
 - `NVIDIA_API_KEY` or `NVIDIA_NIM_API_KEY` (when provider is `nvidia-nim`)
 - `NVIDIA_NIM_BASE_URL`, `NIM_BASE_URL`, or `NVIDIA_BASE_URL`
@@ -2440,6 +2487,11 @@ reasoning contract, and all four membership ids omit generic sampling fields.
   scans `<workspace>/.codewhale/skills`, `~/.codewhale/skills`, and any explicit
   `skills_dir` override. The Skills Manager can still toggle a local compatible
   audit scan independently of this runtime knob — see [SKILLS.md](SKILLS.md).
+- `[skills].flat_workspace_root` (bool, default `false`): opt in to the flat
+  `<workspace>/skills` compatibility root after workspace trust. Without this
+  opt-in it is an audit candidate only; an explicit `skills_dir` remains an
+  alternative. `scan_codewhale_only = true` excludes the flat compatibility
+  root regardless of this flag, unless it is the explicit `skills_dir`.
 - `[skills].registry_url` / `[skills].max_install_size_bytes` (optional): used by
   `/skills --remote`, `/skills suggest <task>`, `/skills sync`, and `/skill
   install|update`. The default manager open path does not contact the registry.
@@ -2512,10 +2564,14 @@ reasoning contract, and all four membership ids omit generic sampling fields.
   - `[retry].initial_delay` (float seconds, default `1.0`)
   - `[retry].max_delay` (float seconds, default `60.0`)
   - `[retry].exponential_base` (float, default `2.0`)
+  - `[retry].jitter` (bool, default `true`): randomize each backoff delay
+  - `[retry].jitter_factor` (float, default `0.1` = ±10%; clamps to `0.0..=1.0`)
+  - `[retry].respect_retry_after` (bool, default `true`): wait for a server
+    `Retry-After` header instead of the computed backoff
 
   `[retry]` schedules HTTP-request retries inside the client. The stream-level
   budgets that sit above it — how often a turn re-issues a request whose
-  stream failed to open or died — are the `tui.stream_max_*` keys below.
+  stream failed to open or died — are the `[stream]` keys below; legacy `tui.stream_max_*` keys remain fallbacks.
 - `[notifications]`: notification delivery, attention, categories and audio share one
   policy. `quiet = true`, `method = "off"`, `condition = "never"` and disabled
   categories suppress both the banner and Codewhale's selected sound.
@@ -2562,7 +2618,7 @@ reasoning contract, and all four membership ids omit generic sampling fields.
   selections and the Linux PRIMARY auto-copy are unchanged; PRIMARY always
   carries rendered text.
 
-- `tui.stream_chunk_timeout_secs` (int, optional, default `900`): per-SSE-chunk idle timeout for streamed model responses. Slow local or compatible servers can raise this with `/config stream_chunk_timeout_secs <seconds>`; `0` maps to the default and explicit values must be `1..=3600`. The legacy `DEEPSEEK_STREAM_IDLE_TIMEOUT_SECS` env var is still honored when this key is omitted.
+- `tui.stream_chunk_timeout_secs` (int, optional, default `900`): per-SSE-chunk idle timeout for streamed model responses. Slow local or compatible servers can raise this with `/config stream_chunk_timeout_secs <seconds>` (add `--save` to write canonical `stream.chunk_timeout_secs`); `0` maps to the default and explicit values must be `1..=3600`. The legacy `DEEPSEEK_STREAM_IDLE_TIMEOUT_SECS` env var is still honored when this key is omitted.
 - `tui.osc8_links` (bool, optional, default on for macOS/Linux, off for Windows): emit OSC 8 escape sequences around URLs in transcript output so supporting terminals (iTerm2, Terminal.app 13+, Ghostty, Kitty, WezTerm, Alacritty, recent gnome-terminal/konsole) can open them with the terminal's link gesture—usually Cmd-click on macOS and Ctrl-click on Linux/Windows. Terminals without OSC 8 support render the plain label and ignore the escape. The escapes are emitted out-of-band (not inside buffer cells), so column corruption is not a concern; set `false` only for terminals that misrender the OSC 8 terminator itself. Windows legacy consoles default off; opt in with `true`.
 - `tui.max_model_steps` (int, optional, default uncapped): optional model-step ceiling for one ordinary turn. Omission or `0` leaves model steps uncapped; explicit positive values are clamped to `1..=100000`. Headless `exec` and Fleet workers also have no implicit model-step ceiling; `exec --max-turns N` and positive worker budgets still apply. At ~80% of an explicit step budget the model gets one soft-landing notice; at exhaustion the turn ends `Failed` with `Maximum model steps reached before completion (limit: N)` after one bounded final-report response when needed. Cumulative wall-clock and per-stream limits remain independent. Active interactive goal turns use `goal.max_steps` instead (default `1000`); see the Goal loop section below.
 - `tui.turn_wall_clock_secs` (int, optional, default: no limit): cumulative per-turn wall-clock budget in seconds, measured across every model step of one turn (not per request). Time blocked on a human approval is excluded. Omitted or `0` means no limit; positive values clamp to `30..=86400` (24 hours is the ceiling). When exhausted the turn stops before authorizing another billable request with a message naming the limit and the key to raise.
@@ -2571,10 +2627,53 @@ reasoning contract, and all four membership ids omit generic sampling fields.
 - `tui.stream_max_errors` (int, optional, default `5`): recoverable errors tolerated within one stream before it ends. Unlike the two retry counts above, `0` does not switch anything off: like the other finite stream budgets it selects the default. Other values clamp to `1..=50`, so `1` ends the stream on its first recoverable error.
 - `tui.stream_open_timeout_secs` (int, optional, default `45`): wait for a streaming request's response headers (connection setup included). A header stall on HTTP/2 retries once over HTTP/1.1 with the same wait. Omitted or `0` falls back to `CODEWHALE_STREAM_OPEN_TIMEOUT_SECS`, then the default; values clamp to `5..=300`.
 - `tui.connect_timeout_secs` (int, optional, default `30`): TCP/TLS connect timeout for the model HTTP client. Omitted or `0` uses the default; values clamp to `1..=300`.
+- `tui.force_http1` (bool, optional, default `false`): pin the model HTTP client to HTTP/1.1, for provider edges or proxies that mishandle long-lived HTTP/2 streams. `CODEWHALE_FORCE_HTTP1=1` does the same; either one pins.
 - `tui.stream_max_content_mb` (int, optional, default `10`) and `tui.stream_max_duration_secs` (int, optional, default `1800`): per-step caps on one stream's accumulated content and wall-clock duration. `0` selects the default; values clamp to `1..=512` MB and `10..=86400` seconds.
 - `transcript.prose_measure` (positive integer, optional, default absent = full width): wrap cap, in columns, for prose cells — user messages, assistant answers, and reasoning/thinking blocks — in the live transcript (#5436). Absent (or `0`) spends the full content width, consistent with tool/status cells and the #5322 wide-frame decision; the former 105-column prose rail is gone. Set a positive whole number (e.g. `prose_measure = 120` under `[transcript]`) to restore a bounded reading measure on ultrawide terminals. Narrow terminals always keep their content width — the cap clamps from above only. Tool, diff, and status cells never inherit this cap. Invalid values (negative or non-integer) are rejected at startup with a `transcript.prose_measure` config error. Resolved once per render pass, so the main transcript cache and the full-screen overlay always agree on the effective width.
 - `hooks` (optional): lifecycle hooks configuration (see `config.example.toml`).
 - `features.*` (optional): feature flag overrides (see below).
+
+### Stream and transport settings
+
+`[stream]` is the canonical table for model-stream policy and its HTTP clients.
+`codewhale config dump` and `codewhale config get stream` show effective values
+from the runtime resolver, including environment fallbacks and clamps; this does
+not persist defaults. Set or unset individual fields with, for example,
+`codewhale config set stream.open_timeout_secs 120` and
+`codewhale config unset stream.open_timeout_secs`. Per-run
+`--set stream.open_timeout_secs=120` uses the same validation.
+
+| `[stream]` key | Default | Accepted behavior | Legacy `[tui]` fallback |
+| --- | --- | --- | --- |
+| `open_timeout_secs` | 45 | Positive values clamp to 5–300; 0 or omission falls through to the environment/default | `stream_open_timeout_secs` |
+| `chunk_timeout_secs` | 900 | 0 selects default; positive values clamp to 1–3600 | `stream_chunk_timeout_secs` |
+| `max_resumes` | 3 | 0 disables whole-request reissues; maximum 10 | `stream_max_resumes` |
+| `max_transparent_retries` | 2 | 0 disables retries before any content; maximum 10 | `stream_max_transparent_retries` |
+| `max_stream_errors` | 5 | 0 selects default; positive values clamp to 1–50 | `stream_max_errors` |
+| `max_duration_secs` | 1800 | Per-stream wall clock; 0 selects default, positive values clamp to 10–86400 | `stream_max_duration_secs` |
+| `max_content_mb` | 10 | Per-stream content; 0 selects default, positive values clamp to 1–512 MiB | `stream_max_content_mb` |
+| `connect_timeout_secs` | 30 | TCP/TLS setup; 0 selects default, positive values clamp to 1–300 | `connect_timeout_secs` |
+| `force_http1` | false | Boolean; a truthy environment pin always enables HTTP/1.1 | `force_http1` |
+| `tcp_keepalive_secs` | 30 | Idle time before TCP keepalive probes; 0 disables, positive values clamp to 1–3600 | none |
+| `http2_keep_alive_interval_secs` | 15 | PING interval on active HTTP/2 connections; 0 disables, positive values clamp to 1–3600 | none |
+| `http2_keep_alive_timeout_secs` | 20 | PING acknowledgement deadline; 0 selects default, positive values clamp to 1–3600 | none |
+
+For each field, an explicit canonical value wins over the legacy `[tui]` field,
+including zero or false; an absent canonical field preserves the legacy value.
+The existing environment precedence is unchanged: a positive configured header
+wait wins over `CODEWHALE_STREAM_OPEN_TIMEOUT_SECS` (then its `DEEPSEEK_` alias);
+zero falls through to those variables. An omitted chunk timeout uses
+`CODEWHALE_STREAM_IDLE_TIMEOUT_SECS` (then its `DEEPSEEK_` alias), whereas an
+explicit zero uses 900. `CODEWHALE_FORCE_HTTP1` (legacy `DEEPSEEK_FORCE_HTTP1`)
+is ORed with the selected config flag, so a false config flag cannot defeat a
+truthy environment pin. Profile overlays merge canonical fields independently.
+
+HTTP transport values apply to all newly constructed model, catalog and HTTP/1
+fallback clients. They do not rebuild an active client, govern MCP/other network
+services, or send HTTP/2 PINGs on idle pooled connections. HTTP/2 knobs have no
+effect when HTTP/1.1 is pinned. The operating system controls TCP probe details;
+these settings do not disable certificate validation. `[retry]` still owns the
+HTTP-request backoff schedule independently of stream-level budgets.
 
 ### Workspace notes
 
@@ -3008,6 +3107,45 @@ tools loaded on every request, add them to `[tools].always_load`:
 always_load = ["Git", "notify"]
 ```
 
+### Script tools and overrides
+
+Scripts in `~/.codewhale/tools/` (or `[tools].plugin_dir`) that start with a
+`# name:` header become model-visible tools, and `/plugin tools` lists them.
+The script reads the tool's JSON input on stdin and writes a JSON
+`ToolResult` (`{"content": "...", "success": true}`) on stdout.
+
+```sh
+#!/usr/bin/env sh
+# name: word_count
+# description: Count words in the given text
+# schema: {"type":"object","properties":{"text":{"type":"string"}}}
+# approval: required
+```
+
+`# approval:` takes `suggest` (the default) or `required`; either way the
+tool follows the session's approval setting. A script cannot approve itself:
+`approval: auto` is no longer supported, so such a script gets the default,
+and the runtime log (`~/.codewhale/logs/`) and `/plugin tools` name it.
+
+A script cannot replace a built-in tool either. A script whose `# name:` is
+already registered is not loaded. `[tools.overrides]` may disable a built-in,
+or add a script or command tool under a name of its own:
+
+```toml
+[tools.overrides]
+"Web" = { type = "disabled" }                                   # turn a built-in off
+"audited_shell" = { type = "script", path = "audit-shell.sh" }  # a new tool
+"Bash" = { type = "script", path = "audit-shell.sh" }           # refused: Bash is built in
+```
+
+A `script` or `command` override keyed by a built-in is refused, and the
+built-in stays active. A status line names the key once per session, and the
+runtime log records it. To route a
+built-in through your own wrapper, disable the built-in and register the
+wrapper under a new name. An override keyed by a drop-in script's name still
+replaces that script. Relative `path` values resolve against the plugin
+directory.
+
 ### `request_user_input` limits
 
 `request_user_input` asks the user a short batch of multiple-choice questions.
@@ -3028,16 +3166,16 @@ either resize the batch or tell the user which setting to change.
 
 ### User-input wait timeout
 
-Questions from `request_user_input` wait a bounded time and then cancel with
-a timeout (#6003). The default is 300 seconds.
-Raise it when you step away or read carefully, or set `0` to wait forever
-(overnight automation, long human review). Headless `exec` runs have no
+Questions from `request_user_input` wait until answered or canceled by default
+(#6003). An omitted setting or `0` leaves the wait unbounded; a positive value
+cancels the question when that many seconds pass, capped at 86,400 (24 hours).
+Headless `exec` runs have no
 responder, so `request_user_input` is withheld there by default:
 the model reports the tool absent and finishes instead of stalling.
 
 ```toml
 [tools]
-user_input_timeout_seconds = 300   # default 300; 0 disables the timeout; clamped to 86400 (24h)
+user_input_timeout_seconds = 300   # opt into 5 minutes; omitted or 0 waits indefinitely; maximum 86400
 ```
 
 This key governs question waits only. Approvals have their own clock,
@@ -3059,12 +3197,24 @@ apply_patch = true
 mcp = true
 exec_policy = true
 code_mode = true # execute_tools composes MCP/plugin/native calls; false defers it behind tool_search
+verify_tool = true # agent-callable `verify` self-critique; false removes it from the tool catalog
+vision_model = false # true routes image analysis to the [vision_model] model (see above)
+extension_host = false # experimental: run reviewed plugins' native code (see EXTENSIONS.md)
 ```
 
 `code_mode` is on by default: `execute_tools` is advertised from the first
 request and nested calls go through the same permission gate as direct calls
 (see [Tool surface](TOOL_SURFACE.md#code-mode-execute_tools)). Set
 `code_mode = false` to defer it behind `tool_search` again.
+
+`extension_host` is experimental and off by default. Turning it on lets reviewed
+plugins run their `native` TypeScript/JavaScript tool code in a Node sidecar;
+toggling it in either direction changes the plugin activation policy, so every
+plugin is reviewed again after a restart. See
+[Writing an extension tool](EXTENSIONS.md).
+
+Every flag has a row in [`docs/features.toml`](features.toml), the feature
+registry; a test fails when a flag and its row disagree.
 
 You can also override features for a single run:
 
@@ -3099,7 +3249,7 @@ route. `[search] native` decides the order:
 
 - unset (default): native search leads only when no search provider is
   configured; a provider chosen in `[search] provider`,
-  `CODEWHALE_SEARCH_PROVIDER`, a Tavily key, or `/search` in-session wins;
+  `CODEWHALE_SEARCH_PROVIDER`, or a Tavily key wins;
 - `native = true`: native search leads even when a provider is pinned;
 - `native = false`: native search is never used.
 

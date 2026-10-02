@@ -355,8 +355,11 @@ pub struct CodewhaleClient {
     pub(super) reasoning_stream_style: Option<String>,
     pub(super) stream_idle_timeout: Duration,
     /// Bounded wait for SSE response headers, resolved once from
-    /// `[tui].stream_open_timeout_secs` / `CODEWHALE_STREAM_OPEN_TIMEOUT_SECS`.
+    /// `[stream].open_timeout_secs`, legacy `[tui]`, or the environment fallback.
     pub(super) stream_open_timeout: Duration,
+    /// HTTP/1.1 pin resolved once from `Config::force_http1` (#6700); the
+    /// single source every client builder and stream open reads.
+    pub(super) force_http1: bool,
 }
 
 const CONNECTION_FAILURE_THRESHOLD: u32 = 2;
@@ -647,6 +650,7 @@ impl Clone for CodewhaleClient {
             reasoning_stream_style: self.reasoning_stream_style.clone(),
             stream_idle_timeout: self.stream_idle_timeout,
             stream_open_timeout: self.stream_open_timeout,
+            force_http1: self.force_http1,
         }
     }
 }
@@ -1394,9 +1398,9 @@ fn build_speech_synthesis_body(
 // === CodewhaleClient ===
 
 /// Returns true when CODEWHALE_FORCE_HTTP1 (legacy alias: DEEPSEEK_FORCE_HTTP1)
-/// is set to a truthy value (`1`, `true`, `yes`, `on`, case-insensitive). Used
-/// by `build_http_client` to opt out of HTTP/2 entirely when a provider's edge
-/// mishandles long-lived H2 streams (#103). Anything else (unset, `0`,
+/// is set to a truthy value (`1`, `true`, `yes`, `on`, case-insensitive). Read
+/// only by `Config::force_http1`, which ORs it with the selected stream config flag; every
+/// client builder and stream open takes that resolved value (#103, #6700). Anything else (unset, `0`,
 /// `false`, ...) leaves HTTP/2 on.
 pub(crate) fn force_http1_from_env() -> bool {
     std::env::var("CODEWHALE_FORCE_HTTP1")
@@ -1653,7 +1657,12 @@ impl CodewhaleClient {
         let retry = config.retry_policy();
         let stream_idle_timeout = Duration::from_secs(config.stream_chunk_timeout_secs());
         let stream_open_timeout = config.stream_open_timeout();
-        let connect_timeout = config.connect_timeout();
+        let force_http1 = config.force_http1();
+        if force_http1 {
+            logging::info(
+                "HTTP/1.1 pinned (stream configuration or environment) — HTTP/2 disabled",
+            );
+        }
         let http_headers = config.http_headers();
         let auth_disabled =
             auth_mode_disables_api_key(config.auth_mode_for_provider(api_provider).as_deref());
@@ -1708,8 +1717,8 @@ impl CodewhaleClient {
             &base_url,
             wire_format,
             auth_disabled,
-            false,
-            connect_timeout,
+            force_http1,
+            config,
         )?
         .build()?;
         let models_http_client = Self::http_client_builder_with_auth_mode(
@@ -1719,13 +1728,13 @@ impl CodewhaleClient {
             &base_url,
             wire_format,
             auth_disabled,
-            false,
-            connect_timeout,
+            force_http1,
+            config,
         )?
         .redirect(reqwest::redirect::Policy::none())
         .build()?;
         // Always keep an HTTP/1.1 twin for automatic stream-header fallback
-        // when H2 stalls. When CODEWHALE_FORCE_HTTP1 is set, both clients are
+        // when H2 stalls. When `force_http1` is pinned, both clients are
         // HTTP/1.1 and the fallback is a no-op retry path.
         let http1_client = Self::http_client_builder_with_auth_mode(
             &api_key,
@@ -1735,7 +1744,7 @@ impl CodewhaleClient {
             wire_format,
             auth_disabled,
             true,
-            connect_timeout,
+            config,
         )?
         .build()?;
 
@@ -1780,6 +1789,7 @@ impl CodewhaleClient {
             reasoning_stream_style,
             stream_idle_timeout,
             stream_open_timeout,
+            force_http1,
         })
     }
 
@@ -2078,7 +2088,7 @@ impl CodewhaleClient {
             provider_default_wire_format(api_provider),
             false,
             false,
-            Duration::from_secs(crate::config::DEFAULT_CONNECT_TIMEOUT_SECS),
+            &Config::default(),
         )?
         .build()
         .map_err(Into::into)
@@ -2092,7 +2102,7 @@ impl CodewhaleClient {
         wire_format: WireFormat,
         auth_disabled: bool,
         force_http1: bool,
-        connect_timeout: Duration,
+        config: &Config,
     ) -> Result<reqwest::ClientBuilder> {
         let headers = build_default_headers(
             api_key,
@@ -2105,16 +2115,12 @@ impl CodewhaleClient {
         let mut builder = crate::tls::reqwest_client_builder()
             .default_headers(headers)
             .user_agent(client_user_agent(api_provider))
-            .connect_timeout(connect_timeout)
-            .tcp_keepalive(Some(Duration::from_secs(30)))
-            .http2_keep_alive_interval(Some(Duration::from_secs(15)))
-            .http2_keep_alive_timeout(Duration::from_secs(20))
+            .connect_timeout(config.connect_timeout())
+            .tcp_keepalive(config.tcp_keepalive())
+            .http2_keep_alive_interval(config.http2_keep_alive_interval())
+            .http2_keep_alive_timeout(config.http2_keep_alive_timeout())
             .min_tls_version(reqwest::tls::Version::TLS_1_2);
-        let pin_http1 = force_http1 || force_http1_from_env();
-        if pin_http1 {
-            if force_http1_from_env() && !force_http1 {
-                logging::info("CODEWHALE_FORCE_HTTP1=1 — pinning HTTP client to HTTP/1.1");
-            }
+        if force_http1 {
             builder = builder.http1_only();
         }
         if let Ok(cert_path) = std::env::var("SSL_CERT_FILE")
@@ -3793,17 +3799,21 @@ impl CodewhaleClient {
             return self.send_with_isolated_retry(build, disclosure).await;
         }
         let retry_cfg: LlmRetryConfig = self.retry.clone().into();
+        let pause_scope = self.rate_limit_scope();
+        let callback_scope = pause_scope.clone();
         let request_result = with_retry(
             &retry_cfg,
             || {
                 let request = build();
+                let pause_scope = pause_scope.as_str();
                 async move {
                     // Sleep in bounded slices rather than the full remaining
-                    // window: the pause is process-global, so a concurrent
-                    // `clear_rate_limit()` (or a shortened deadline) must
-                    // release requests that are already waiting instead of
-                    // stranding them for the whole original window.
-                    while let Some(delay) = crate::retry_status::rate_limit_remaining() {
+                    // window: the pause is shared by every request to this
+                    // route, so a concurrent `clear_rate_limit()` (or a
+                    // shortened deadline) must release requests that are
+                    // already waiting instead of stranding them for the whole
+                    // original window.
+                    while let Some(delay) = crate::retry_status::rate_limit_remaining(pause_scope) {
                         tokio::time::sleep(delay.min(RATE_LIMIT_PAUSE_RECHECK_INTERVAL)).await;
                     }
                     self.wait_for_rate_limit().await;
@@ -3821,7 +3831,7 @@ impl CodewhaleClient {
                     Err(self.http_error_with_route_context(status.as_u16(), &body, retry_after))
                 }
             },
-            Some(Box::new(|err, attempt, delay| {
+            Some(Box::new(move |err, attempt, delay| {
                 let (reason_label, human_reason) = retry_reason_label_and_human(err);
                 logging::warn(format!(
                     "HTTP retry reason={} attempt={} delay={:.2}s",
@@ -3830,7 +3840,7 @@ impl CodewhaleClient {
                     delay.as_secs_f64(),
                 ));
                 if matches!(err, LlmError::RateLimited { .. }) {
-                    crate::retry_status::note_rate_limit(delay);
+                    crate::retry_status::note_rate_limit(&callback_scope, delay);
                 }
                 crate::retry_status::start(attempt + 1, delay, human_reason);
             })),
@@ -3846,6 +3856,7 @@ impl CodewhaleClient {
             Err(err) => {
                 if let LlmError::RateLimited { retry_after, .. } = &err.last_error {
                     crate::retry_status::note_rate_limit(
+                        &pause_scope,
                         retry_after
                             .unwrap_or_else(|| retry_cfg.delay_for_attempt(retry_cfg.max_retries)),
                     );
@@ -3864,6 +3875,21 @@ impl CodewhaleClient {
                 Err(anyhow::Error::new(err.last_error))
             }
         }
+    }
+
+    /// Key for this route's shared `Retry-After` pause: the configured route
+    /// identity plus the host it reaches. A 429 from one provider pauses only
+    /// requests that would hit the same limit, never another provider, a
+    /// local runtime, or a sub-agent on a different route.
+    pub(crate) fn rate_limit_scope(&self) -> String {
+        let route = if self.provider_identity.is_empty() {
+            self.api_provider.as_str()
+        } else {
+            self.provider_identity.as_str()
+        };
+        let host = crate::llm_client::base_url_authority(&self.base_url)
+            .unwrap_or_else(|| redact_url_for_display(&self.base_url));
+        format!("{route}@{host}")
     }
 
     /// The same bounded transport retry policy without process-global retry
@@ -6624,7 +6650,6 @@ mod tests {
         crate::retry_status::clear();
         crate::retry_status::clear_rate_limit();
         crate::retry_status::start(7, Duration::from_secs(60), "foreground sentinel");
-        crate::retry_status::note_rate_limit(Duration::from_secs(60));
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -6643,6 +6668,7 @@ mod tests {
             .await;
 
         let client = deepseek_request_boundary_client("https://api.deepseek.com/v1", server.uri());
+        crate::retry_status::note_rate_limit(&client.rate_limit_scope(), Duration::from_secs(60));
         let request = MessageRequest {
             model: "deepseek-v4-pro".to_string(),
             messages: vec![Message {
@@ -6709,7 +6735,7 @@ mod tests {
             state => panic!("isolated success mutated retry state: {state:?}"),
         }
         assert!(
-            crate::retry_status::rate_limit_remaining().is_some(),
+            crate::retry_status::rate_limit_remaining(&client.rate_limit_scope()).is_some(),
             "isolated success must not clear the foreground provider pause"
         );
         crate::retry_status::clear();
@@ -6725,7 +6751,6 @@ mod tests {
         crate::retry_status::clear();
         crate::retry_status::clear_rate_limit();
         crate::retry_status::start(9, Duration::from_secs(60), "foreground sentinel 429");
-        crate::retry_status::note_rate_limit(Duration::from_secs(60));
 
         let server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -6741,6 +6766,7 @@ mod tests {
             deepseek_request_boundary_client("https://api.deepseek.com/v1", server.uri());
         client.retry.enabled = false;
         client.retry.max_retries = 0;
+        crate::retry_status::note_rate_limit(&client.rate_limit_scope(), Duration::from_secs(60));
         let request = MessageRequest {
             model: "deepseek-v4-pro".to_string(),
             messages: vec![Message {
@@ -6779,8 +6805,8 @@ mod tests {
             }
             state => panic!("isolated 429 mutated retry state: {state:?}"),
         }
-        let remaining =
-            crate::retry_status::rate_limit_remaining().expect("foreground provider pause remains");
+        let remaining = crate::retry_status::rate_limit_remaining(&client.rate_limit_scope())
+            .expect("foreground provider pause remains");
         assert!(
             remaining < Duration::from_secs(70),
             "classifier Retry-After must not extend the global pause: {remaining:?}"
@@ -14117,7 +14143,7 @@ mod tests {
 
     /// Serialize tests that mutate `DEEPSEEK_FORCE_HTTP1` so they don't race
     /// against each other — env vars are process-global.
-    static FORCE_HTTP1_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    pub(super) static FORCE_HTTP1_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     struct ForceHttp1EnvGuard {
         prior: Option<std::ffi::OsString>,
@@ -14137,6 +14163,69 @@ mod tests {
                 None => unsafe { std::env::remove_var("DEEPSEEK_FORCE_HTTP1") },
             }
         }
+    }
+
+    #[tokio::test]
+    async fn configured_http2_keepalive_reaches_real_client_transport() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let config: Config = toml::from_str(
+            "[stream]\nhttp2_keep_alive_interval_secs=1\nhttp2_keep_alive_timeout_secs=1\n",
+        )
+        .unwrap();
+        let client = CodewhaleClient::http_client_builder_with_auth_mode(
+            "",
+            &HashMap::new(),
+            ApiProvider::Deepseek,
+            &url,
+            WireFormat::ChatCompletions,
+            true,
+            false,
+            &config,
+        )
+        .unwrap()
+        .no_proxy()
+        .http2_prior_knowledge()
+        .build()
+        .unwrap();
+        let request = tokio::spawn(async move { client.get(url).send().await });
+        // Minimal HTTP/2 peer: handshake, leave the request open, and observe
+        // the actual PING. No additional dependency or external provider.
+        let peer = tokio::time::timeout(Duration::from_secs(5), async {
+            let (mut peer, _) = listener.accept().await.unwrap();
+            let mut preface = [0; 24];
+            peer.read_exact(&mut preface).await.unwrap();
+            assert_eq!(&preface, b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+            peer.write_all(&[0, 0, 0, 4, 0, 0, 0, 0, 0]).await.unwrap();
+            loop {
+                let mut header = [0; 9];
+                peer.read_exact(&mut header).await.unwrap();
+                let len = (usize::from(header[0]) << 16)
+                    | (usize::from(header[1]) << 8)
+                    | usize::from(header[2]);
+                assert!(len <= 65536, "bounded test frame");
+                let mut body = vec![0; len];
+                peer.read_exact(&mut body).await.unwrap();
+                if header[3] == 4 && header[4] & 1 == 0 {
+                    peer.write_all(&[0, 0, 0, 4, 1, 0, 0, 0, 0]).await.unwrap();
+                }
+                if header[3] == 6 && header[4] & 1 == 0 {
+                    assert_eq!(len, 8);
+                    return peer; // Deliberately withhold the PING ACK.
+                }
+            }
+        })
+        .await
+        .expect("configured one-second interval must send a PING before the default 15 seconds");
+        let result = tokio::time::timeout(Duration::from_secs(3), request).await
+            .expect("configured one-second acknowledgement timeout must end the request before default 20 seconds")
+            .unwrap();
+        assert!(
+            result.is_err(),
+            "an unacknowledged PING must fail the request"
+        );
+        drop(peer); // Keep the peer open until the client's own timer fires.
     }
 
     #[test]

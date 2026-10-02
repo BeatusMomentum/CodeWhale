@@ -1572,6 +1572,26 @@ enum VisibleEntry<'a> {
     Empty,
 }
 
+/// Stable identity of a visible row across snapshot refreshes. An item is
+/// keyed by its own id alone: a refresh may regroup it (MCP login-first).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum EntryKey {
+    Group(String),
+    Item(String),
+    Problem,
+}
+
+impl EntryKey {
+    fn of(entry: VisibleEntry<'_>) -> Option<Self> {
+        match entry {
+            VisibleEntry::Group(group) => Some(Self::Group(group.id.clone())),
+            VisibleEntry::Item(_, item) => Some(Self::Item(item.id.clone())),
+            VisibleEntry::Problem(_) => Some(Self::Problem),
+            VisibleEntry::Empty => None,
+        }
+    }
+}
+
 #[derive(Default)]
 struct HitAreas {
     tabs: Vec<(Rect, ExtensionsTab)>,
@@ -1893,11 +1913,33 @@ impl ExtensionsView {
 
     /// Swap in a fresh read model while keeping everything the user is doing:
     /// active tab, focus, search query, selection, scroll, and folded groups
-    /// all survive; the selection only moves when the refreshed list no
-    /// longer reaches it.
+    /// all survive. The selection follows its entity, not its row number: a
+    /// refresh that reorders the list (a server logs in, a plugin is
+    /// installed) keeps the same item selected, so a later `e`/`d` can never
+    /// act on whatever row slid into the old index. It only moves when the
+    /// selected entity is gone.
     pub fn refresh_snapshot(&mut self, snapshot: ExtensionsSnapshot) {
+        let active = self.active_tab;
+        let anchors = ExtensionsTab::ALL.map(|tab| {
+            self.active_tab = tab;
+            self.visible_entries()
+                .get(self.selected[tab.index()])
+                .copied()
+                .and_then(EntryKey::of)
+        });
         self.snapshot = snapshot;
-        self.clamp_selection();
+        for (tab, anchor) in ExtensionsTab::ALL.into_iter().zip(anchors) {
+            self.active_tab = tab;
+            if let Some(index) = anchor.and_then(|anchor| {
+                self.visible_entries()
+                    .iter()
+                    .position(|entry| EntryKey::of(*entry).as_ref() == Some(&anchor))
+            }) {
+                self.selected[tab.index()] = index;
+            }
+            self.clamp_selection();
+        }
+        self.active_tab = active;
     }
 
     fn set_tab(&mut self, tab: ExtensionsTab) {
@@ -3323,5 +3365,68 @@ mod tests {
             }
             other => panic!("expected the refreshed item, got {other:?}"),
         }
+    }
+
+    /// U09-05: a refresh that reorders the list keeps the selection on the
+    /// same entity, so a later toggle acts on the row the user chose — never
+    /// on whatever slid into the old index.
+    #[test]
+    fn refresh_keeps_selection_on_the_same_entity_when_rows_reorder() {
+        fn row(id: &str) -> ExtensionItem {
+            ExtensionItem {
+                id: id.into(),
+                label: id.into(),
+                toggle: Some(ExtensionAction::Command {
+                    label: "disable".into(),
+                    command: format!("/plugin disable {id}"),
+                    disposition: RowActionDisposition::InPlace,
+                }),
+                ..item_with_action(ExtensionAction::Status {
+                    label: "enabled".into(),
+                })
+            }
+        }
+        fn snapshot(order: &[&str]) -> ExtensionsSnapshot {
+            let mut snapshot = ExtensionsSnapshot::default();
+            snapshot.tabs[ExtensionsTab::Plugins.index()] = ExtensionsTabModel {
+                groups: vec![ExtensionGroup {
+                    id: "g".into(),
+                    label: "g".into(),
+                    items: order.iter().map(|id| row(id)).collect(),
+                }],
+                problem: None,
+            };
+            snapshot
+        }
+        let mut view = ExtensionsView::from_snapshot_with_locale(
+            snapshot(&["alpha", "beta"]),
+            ExtensionsTab::Plugins,
+            Locale::En,
+        );
+        // Group heading, alpha, beta: select beta.
+        view.selected[ExtensionsTab::Plugins.index()] = 2;
+        assert_eq!(
+            view.selected_item().map(|item| item.id.as_str()),
+            Some("beta")
+        );
+
+        view.refresh_snapshot(snapshot(&["beta", "alpha"]));
+        assert_eq!(
+            view.selected_item().map(|item| item.id.as_str()),
+            Some("beta")
+        );
+        match view.toggle_selected() {
+            ViewAction::Emit(ViewEvent::ExecutePanelCommand { command, .. }) => {
+                assert_eq!(command, "/plugin disable beta");
+            }
+            other => panic!("expected the toggle command, got {other:?}"),
+        }
+
+        // A selected entity that is gone falls back to the clamped row.
+        view.refresh_snapshot(snapshot(&["alpha"]));
+        assert_eq!(
+            view.selected_item().map(|item| item.id.as_str()),
+            Some("alpha")
+        );
     }
 }

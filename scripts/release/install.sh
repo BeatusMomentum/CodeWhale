@@ -136,7 +136,28 @@ fi
 
 stage=""
 stage_dir=""
-trap 'if [[ -n "$stage" ]]; then rm -f "$stage"; fi; if [[ -n "$stage_dir" ]]; then rmdir "$stage_dir"; fi' EXIT
+# Commands this run published, as "source<TAB>destination" lines. If a later
+# publication fails, they are removed again (only while each is still the
+# exact file this run wrote), so a failed install leaves no half-installed
+# pair; files that were already installed are never touched.
+published=""
+rollback_published() {
+    local src dst
+    while IFS=$'\t' read -r src dst; do
+        [[ -n "$dst" ]] || continue
+        if [[ ! -L "$dst" && -f "$dst" ]] && cmp -s "$src" "$dst"; then
+            rm -f "$dst"
+            echo "Removed $dst: this install did not complete." >&2
+        fi
+    done <<< "$published"
+}
+on_exit() {
+    local status=$?
+    if [[ -n "$stage" ]]; then rm -f "$stage"; fi
+    if [[ -n "$stage_dir" ]]; then rmdir "$stage_dir"; fi
+    if [[ "$status" -ne 0 && -n "$published" ]]; then rollback_published; fi
+}
+trap on_exit EXIT
 install_binary() {
     local src="$1" dst="$2"
     check_destination "$src" "$dst"
@@ -157,6 +178,7 @@ install_binary() {
         echo "ERROR: installed path changed during publication: $dst" >&2
         return 1
     }
+    published+="$src"$'\t'"$dst"$'\n'
     rm -f "$stage"
     rmdir "$stage_dir"
     stage=""

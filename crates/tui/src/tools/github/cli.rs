@@ -76,5 +76,11 @@ pub(super) fn ensure_github_repo(context: &ToolContext) -> Result<(), ToolError>
 pub(super) fn git_status_porcelain(context: &ToolContext) -> Result<String, ToolError> {
     let out = crate::dependencies::Git::output(&["status", "--porcelain"], &context.workspace)
         .map_err(|e| ToolError::execution_failed(format!("failed to run git status: {e}")))?;
+    if !out.status.success() {
+        return Err(ToolError::execution_failed(format!(
+            "git status failed ({}); cannot verify that the worktree is clean",
+            out.status
+        )));
+    }
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
 }

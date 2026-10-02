@@ -3165,6 +3165,30 @@ fn relative_codewhale_home_is_a_hard_error() {
     assert!(message.contains("absolute"), "{message}");
 }
 
+/// Audit R04-05: a relative `HOME` must not relocate global state into the
+/// working directory.
+#[test]
+fn relative_user_home_is_a_hard_error() {
+    let _lock = env_lock();
+    let _env = StateEnvRestore {
+        home: env::var_os("HOME"),
+        userprofile: env::var_os("USERPROFILE"),
+        codewhale_home: env::var_os("CODEWHALE_HOME"),
+    };
+    // Safety: test-only environment mutation is serialized by env_lock().
+    unsafe {
+        env::set_var("HOME", "relative-home");
+        env::remove_var("USERPROFILE");
+        env::remove_var("CODEWHALE_HOME");
+    }
+
+    assert_eq!(codewhale_paths::user_home(), None);
+    let error = codewhale_home().expect_err("relative HOME must fail closed");
+    let message = format!("{error:#}");
+    assert!(message.contains("HOME"), "{message}");
+    assert!(message.contains("absolute"), "{message}");
+}
+
 #[test]
 fn migrate_config_reports_copied_legacy_path() {
     let _lock = env_lock();
@@ -10735,4 +10759,152 @@ fn ensure_state_dir_keeps_legacy_authoritative_until_migration_succeeds() {
         );
     }
     let _ = fs::remove_dir_all(&state_env.home);
+}
+
+#[test]
+fn stream_settings_are_typed_nested_and_fail_without_mutation() {
+    let mut config = ConfigToml::default();
+    for (key, value) in [
+        ("stream.open_timeout_secs", "120"),
+        ("stream.force_http1", "on"),
+        ("stream.tcp_keepalive_secs", "0"),
+    ] {
+        config.set_value(key, value).unwrap();
+    }
+    assert_eq!(
+        config.extras["stream"]["open_timeout_secs"].as_integer(),
+        Some(120)
+    );
+    assert_eq!(config.extras["stream"]["force_http1"].as_bool(), Some(true));
+    let before = toml::to_string(&config).unwrap();
+    for (key, value) in [
+        ("stream.max_resumes", "-1"),
+        ("stream.max_resumes", "4294967296"),
+        ("stream.force_http1", "flase"),
+        ("stream.tcp_keepalive_secs", "1.5"),
+        ("stream.open_timout_secs", "45"),
+    ] {
+        assert!(config.set_value(key, value).is_err(), "{key}");
+        assert_eq!(toml::to_string(&config).unwrap(), before);
+    }
+    let mut reloaded: ConfigToml = toml::from_str(&before).unwrap();
+    reloaded.unset_value("stream.force_http1").unwrap();
+    assert!(reloaded.extras["stream"].get("force_http1").is_none());
+    assert_eq!(
+        reloaded.extras["stream"]["open_timeout_secs"].as_integer(),
+        Some(120)
+    );
+    assert_eq!(
+        reloaded.extras["stream"]["tcp_keepalive_secs"].as_integer(),
+        Some(0)
+    );
+}
+
+#[test]
+fn config_backup_shared_vocabulary_preserves_safe_values_and_comments_on_disk() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join(CONFIG_FILE_NAME);
+    let canonical = "model = \"current-model\"\n";
+    fs::write(&path, canonical).expect("canonical config");
+    let raw = r#"# ordinary header stays
+# privateKey = "comment-s10-synthetic"
+model = "fixture-model" # clientSecret=inline-s10-synthetic
+max_tokens = 4096 # ordinary inline stays
+public_key = "public-value"
+endpoint_key = "endpoint-label"
+base_url = "https://api.example.com"
+# ordinary URL https://api.example.com
+[providers.fixture] # cookie=table-inline-s10-synthetic
+privateKey = "private-s10-synthetic"
+clientSecret = "client-s10-synthetic"
+api_key_env = "SYNTHETIC_KEY_ENV"
+auth_mode = "api_key"
+headers = { "Set-Cookie" = "cookie-s10-synthetic", "X-Trace" = "kept-trace" }
+[future_section]
+profiles = [{ accessToken = "access-s10-synthetic", label = "kept-profile" }]
+args = ["--flag", "clientSecret=array-s10-synthetic", "https://api.example.com"]
+webhook_url = "https://hooks.example.com/?sas=url-s10-synthetic"
+# trailing ordinary comment stays
+"#;
+    let backup_path = config_backup_path(&path);
+    fs::write(&backup_path, raw).expect("seed historical backup");
+    scrub_plaintext_api_keys_from_config_backup(&path).expect("scrub persisted backup");
+    let backup = fs::read_to_string(&backup_path).expect("persisted backup");
+    for marker in [
+        "comment-s10-synthetic",
+        "inline-s10-synthetic",
+        "table-inline-s10-synthetic",
+        "private-s10-synthetic",
+        "client-s10-synthetic",
+        "cookie-s10-synthetic",
+        "access-s10-synthetic",
+        "array-s10-synthetic",
+        "url-s10-synthetic",
+    ] {
+        assert!(
+            !backup.contains(marker),
+            "credential survived in persisted backup"
+        );
+    }
+    for kept in [
+        "ordinary header stays",
+        "ordinary inline stays",
+        "trailing ordinary comment stays",
+        "max_tokens = 4096",
+        "public-value",
+        "endpoint-label",
+        "https://api.example.com",
+        "ordinary URL",
+        "SYNTHETIC_KEY_ENV",
+        "auth_mode",
+        "kept-trace",
+        "kept-profile",
+        "--flag",
+    ] {
+        assert!(backup.contains(kept), "ordinary backup data lost: {kept}");
+    }
+    backup
+        .parse::<toml_edit::DocumentMut>()
+        .expect("still valid TOML");
+    assert_eq!(fs::read_to_string(&path).unwrap(), canonical);
+}
+
+#[test]
+fn config_dump_shared_vocabulary_redacts_camel_case() {
+    for key in [
+        "accessToken",
+        "clientSecret",
+        "privateKey",
+        "refreshToken",
+        "Set-Cookie",
+        "sas",
+        "Ocp-Apim-Subscription-Key",
+    ] {
+        assert!(is_sensitive_config_key(key), "{key}");
+        assert!(
+            is_sensitive_config_key(&format!("providers.fixture.{key}")),
+            "{key}"
+        );
+    }
+    for key in [
+        "max_tokens",
+        "token_budget",
+        "api_key_source",
+        "authMode",
+        "publicKey",
+        "endpoint_key",
+    ] {
+        assert!(!is_sensitive_config_key(key), "{key}");
+    }
+    let value: toml::Value = toml::from_str(
+        r#"privateKey = "private-s10-synthetic"
+clientSecret = "client-s10-synthetic"
+model = "fixture-model"
+"#,
+    )
+    .unwrap();
+    let shown = redact_toml_value_for_display("providers.fixture", &value);
+    assert!(!shown.contains("private-s10-synthetic"));
+    assert!(!shown.contains("client-s10-synthetic"));
+    assert!(shown.contains("fixture-model"));
 }

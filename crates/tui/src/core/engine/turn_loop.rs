@@ -5,6 +5,7 @@
 //! event handling, tool planning/execution, LSP post-edit hooks, capacity
 //! checkpoints, and loop termination.
 
+use super::compaction::AutoCompactionStep;
 use super::dispatch::{
     FLEET_FINAL_REPORT_NOTICE, FLEET_NO_PROGRESS_STOP, FLEET_STRATEGY_SWITCH_NOTICE,
     FleetDenialAction, FleetDenialBatch, FleetDenialGuard, normalize_schema_json_containers,
@@ -19,7 +20,6 @@ use crate::runtime_handoff::{
 };
 use crate::tool_inspection::TurnStopReason;
 use crate::tools::canonical_action::canonical_action_alias;
-use crate::tools::spec::ToolTerminalStatus;
 use crate::tools::tool_call_budget::ToolCallBudget;
 use codewhale_core::request::{PrimaryTurnRequest, prepare_primary_turn_request};
 use codewhale_models::Role;
@@ -112,13 +112,39 @@ async fn preserve_tool_output_before_fanout(
     tool_id: &str,
     tool_name: &str,
 ) -> Result<RichToolResult, ToolError> {
-    let mut rich = result?;
     let model = model.to_owned();
     let session_id = session_id.to_owned();
     let tool_id = tool_id.to_owned();
     let tool_name = tool_name.to_owned();
+    let mut rich = match result {
+        Ok(rich) => rich,
+        // C02-12: an error is fanned out to the event stream and the session
+        // exactly like a result, so an oversized one gets the same bounded
+        // head/tail projection and saved artifact. Ordinary short errors
+        // stay byte-identical (the projection only engages past the
+        // spillover threshold).
+        Err(mut error) => {
+            if tool_error_message_mut(&mut error).is_none_or(|message| {
+                message.len() <= crate::tools::truncate::SPILLOVER_THRESHOLD_BYTES
+            }) {
+                return Err(error);
+            }
+            return tokio::task::spawn_blocking(move || {
+                bound_oversized_tool_error(error, &tool_id, &tool_name, &session_id)
+            })
+            .await
+            .map_err(|join_error| {
+                ToolError::execution_failed(format!(
+                    "Tool output preservation failed: {join_error}"
+                ))
+            })
+            .and_then(Err);
+        }
+    };
     tokio::task::spawn_blocking(move || {
-        if let Some(path) = crate::tools::truncate::apply_spillover_with_artifact(
+        // Failed results are bounded too: the fan-out cost of a huge one is
+        // the same whether or not the tool called it a failure (C02-12).
+        if let Some(path) = crate::tools::truncate::apply_spillover_with_artifact_including_errors(
             &mut rich.result,
             &tool_id,
             &tool_name,
@@ -153,6 +179,42 @@ async fn preserve_tool_output_before_fanout(
     .map_err(|error| {
         ToolError::execution_failed(format!("Tool output preservation failed: {error}"))
     })
+}
+
+/// The free-form text of a tool error, when its variant carries one.
+fn tool_error_message_mut(error: &mut ToolError) -> Option<&mut String> {
+    match error {
+        ToolError::InvalidInput { message }
+        | ToolError::ExecutionFailed { message, .. }
+        | ToolError::Cancelled { message }
+        | ToolError::NotAvailable { message }
+        | ToolError::PermissionDenied { message } => Some(message),
+        _ => None,
+    }
+}
+
+/// Give an oversized tool error message the bounded head/tail projection and
+/// saved artifact a failed result gets (C02-12). Blocking: it may write the
+/// artifact, so callers run it under `spawn_blocking`. A failed artifact
+/// write leaves a bounded preview that says the full output could not be saved.
+fn bound_oversized_tool_error(
+    mut error: ToolError,
+    tool_id: &str,
+    tool_name: &str,
+    session_id: &str,
+) -> ToolError {
+    let Some(message) = tool_error_message_mut(&mut error) else {
+        return error;
+    };
+    let mut projected = ToolResult::error(std::mem::take(message));
+    crate::tools::truncate::apply_spillover_with_artifact_including_errors(
+        &mut projected,
+        tool_id,
+        tool_name,
+        session_id,
+    );
+    *message = projected.content;
+    error
 }
 
 fn approval_intent_summary(text: &str) -> Option<String> {
@@ -229,6 +291,19 @@ pub(super) fn registered_tool_forces_prompt(
 ) -> bool {
     requirement != ApprovalRequirement::Auto
         && registered_tool_requires_non_bypassable_approval(tool_name)
+}
+
+/// A Computer Use consent, script or computer registration call carries the
+/// person's decision to the plugin, so only an approval card may answer it:
+/// the prompt is forced, and no session grant, remembered rule or runtime
+/// grant pre-answers it.
+pub(super) fn call_forces_prompt(
+    tool_name: &str,
+    input: &serde_json::Value,
+    requirement: ApprovalRequirement,
+) -> bool {
+    registered_tool_forces_prompt(tool_name, requirement)
+        || crate::tools::approval_cache::computer_use_user_gate(tool_name, input).is_some()
 }
 
 /// Repo-law `ask` rules require a human decision. Only Ask posture can open
@@ -405,6 +480,28 @@ fn incomplete_tool_result(reason: &str) -> ToolResult {
     }
 }
 
+/// Status receipt carried by the one request a reasoning-only / empty-stop
+/// nudge rides (C02-04). The nudge itself never joins the session.
+pub(super) const REQUEST_NUDGE_RECEIPT_PREFIX: &str =
+    "Continuing — this retry carries a request-scoped nudge (not saved to the conversation): ";
+
+/// The not-executed result for a call collected from a response whose stream
+/// failed before it completed (C02-05). Same shape as
+/// [`incomplete_tool_result`]: nothing started, so nothing needs undoing.
+fn stream_failed_tool_result(error: &str) -> ToolResult {
+    ToolResult {
+        content: format!(
+            "Not executed: the provider stream failed before the model response completed ({error})."
+        ),
+        success: false,
+        metadata: Some(json!({
+            "side_effect_status": "not_started",
+            "error_category": "model_stream_failed",
+            "model_output_incomplete": true,
+        })),
+    }
+}
+
 fn registered_tool_requires_non_bypassable_approval(tool_name: &str) -> bool {
     // `rlm_eval` (and the unified `rlm` tool whose eval action inherits the
     // same Required approval) must never bypass explicit approval (#3866).
@@ -414,9 +511,11 @@ fn registered_tool_requires_non_bypassable_approval(tool_name: &str) -> bool {
 /// Replace the runtime-MCP slice of the tool catalog wholesale. An additive
 /// merge could never remove anything: the synthetic `mcp_<server>_
 /// authenticate` entry would survive its own successful login, and tools
-/// killed by a live 401 would stay callable in name. `universe` is every
-/// name the pool can own; entries inside it are the pool's to manage, and
-/// the refreshed list is the new truth.
+/// killed by a live 401 would stay callable in name. The pool owns `universe`
+/// (every name it can list now) and every MCP name already in the catalog —
+/// the second half is what lets a tool whose server vanished or lost its
+/// authorization leave (C02-07); `universe` alone only names survivors. The
+/// refreshed list is the new truth for all of them.
 ///
 /// The refreshed slice is shaped exactly like the turn's initial catalog —
 /// the same deferral pass, the same surface budget, the same always-load
@@ -425,6 +524,10 @@ fn registered_tool_requires_non_bypassable_approval(tool_name: &str) -> bool {
 /// projection carries `defer_loading = false` on every tool, so pushing it
 /// in unshaped put every MCP tool definition into every remaining request
 /// of the turn (#5939).
+///
+/// Returns whether the catalog or its active set changed in any way — a
+/// schema or description edit included, not only a count change (C02-16) —
+/// so the caller can declare the tool-surface change to the prefix check.
 pub(super) fn replace_runtime_mcp_tools(
     tool_catalog: &mut Vec<Tool>,
     active_tool_names: &mut std::collections::HashSet<String>,
@@ -433,11 +536,12 @@ pub(super) fn replace_runtime_mcp_tools(
     mode: AppMode,
     always_load: &std::collections::HashSet<String>,
     surface_budget: crate::model_profile::ToolSurfaceBudget,
-) -> usize {
-    let before = tool_catalog.len();
+) -> bool {
+    let catalog_before = tool_catalog.clone();
+    let active_before = active_tool_names.clone();
     let mut previously_active = std::collections::HashSet::new();
     tool_catalog.retain(|tool| {
-        let owned = universe.contains(&tool.name);
+        let owned = universe.contains(&tool.name) || McpPool::is_mcp_tool(&tool.name);
         if owned && active_tool_names.remove(&tool.name) {
             previously_active.insert(tool.name.clone());
         }
@@ -455,7 +559,22 @@ pub(super) fn replace_runtime_mcp_tools(
         }
         tool_catalog.push(tool);
     }
-    tool_catalog.len().abs_diff(before)
+    *tool_catalog != catalog_before || *active_tool_names != active_before
+}
+
+/// Whether model-written Python may run on this turn at all: `code_execution`
+/// is on the turn's surface and neither Plan mode nor the allow/deny lists
+/// withhold it. Inline fences and nested RLM rounds share this rule.
+fn code_execution_offered(
+    mode: AppMode,
+    tool_catalog: &[codewhale_models::Tool],
+    tool_policy: &ToolSurfacePolicy,
+) -> bool {
+    let name = super::tool_catalog::CODE_EXECUTION_TOOL_NAME;
+    mode != AppMode::Plan
+        && tool_catalog.iter().any(|tool| tool.name == name)
+        && tool_policy.passes_allow_list(name)
+        && !tool_policy.denies_tool(name)
 }
 
 impl Engine {
@@ -470,6 +589,9 @@ impl Engine {
     async fn repl_fence_blocked_reason(
         &mut self,
         blocks: &[crate::repl::ReplBlock],
+        // What the approval card says would run, e.g. "the reply's ```repl
+        // block(s) in the session REPL kernel".
+        what_runs: &str,
         approval_id: &str,
         client: &dyn crate::core::model_client::ModelClient,
         turn: &mut TurnContext,
@@ -542,8 +664,7 @@ impl Engine {
                 approval_grouping_key: approval_grouping_key.0,
                 input: plan.input,
                 description: format!(
-                    "Run the reply's ```repl block(s) in the session REPL kernel (a local \
-                     subprocess, not OS-sandboxed): {}",
+                    "Run {what_runs} (a local subprocess, not OS-sandboxed): {}",
                     plan.approval_description
                 ),
                 intent_summary: None,
@@ -557,14 +678,14 @@ impl Engine {
                 "tool_id": approval_id,
                 "tool_name": tool_name,
                 "decision": match decision {
-                    Ok(ApprovalResult::Approved) => "approved",
+                    Ok(ApprovalResult::Approved(_)) => "approved",
                     Ok(ApprovalResult::TimedOut) => "timeout",
                     _ => "denied",
                 },
                 "caller": "repl_fence",
             }));
             let refusal = match decision {
-                Ok(ApprovalResult::Approved) => None,
+                Ok(ApprovalResult::Approved(_)) => None,
                 Ok(ApprovalResult::Denied) => Some("not approved".to_string()),
                 // An expired card is not the user's denial (#6601).
                 Ok(ApprovalResult::TimedOut) => {
@@ -600,6 +721,18 @@ impl Engine {
         None
     }
 
+    /// R1: the turn-ending error once the per-turn wall-clock budget is spent.
+    /// Checked wherever the loop is about to authorize a provider request.
+    pub(super) fn turn_wall_clock_exhausted_error(&self) -> Option<String> {
+        self.turn_wall_clock.exhausted().then(|| {
+            format!(
+                "Per-turn wall-clock budget exhausted after {}s (limit: {}s). The turn was stopped before another model request; work already done is in the transcript. Send another message to continue, or raise `[tui].turn_wall_clock_secs`.",
+                self.turn_wall_clock.spent().as_secs(),
+                self.turn_wall_clock.budget().as_secs(),
+            )
+        })
+    }
+
     /// A connection completed during inference must be discoverable in this
     /// turn, without widening its command policy or making every MCP tool eager.
     pub(super) async fn refresh_boot_mcp_catalog(
@@ -615,23 +748,17 @@ impl Engine {
         let Some(pool) = self.mcp_pool.as_ref() else {
             return;
         };
-        let (mut universe, mut refreshed) = {
+        let (universe, mut refreshed) = {
             let pool = pool.lock().await;
             let refreshed = pool.to_api_tools();
             (pool.model_tool_names(&refreshed), refreshed)
         };
         // A config/authority change during handshake can remove a server;
-        // its previous names must also leave this turn's catalog.
-        universe.extend(
-            catalog
-                .iter()
-                .filter(|tool| McpPool::is_mcp_tool(&tool.name))
-                .map(|tool| tool.name.clone()),
-        );
+        // `replace_runtime_mcp_tools` owns every MCP name already in the
+        // catalog, so its previous names leave this turn's catalog too.
         refreshed
             .retain(|tool| policy.passes_allow_list(&tool.name) && !policy.denies_tool(&tool.name));
-        let before = catalog.clone();
-        replace_runtime_mcp_tools(
+        if replace_runtime_mcp_tools(
             catalog,
             active,
             &universe,
@@ -640,8 +767,7 @@ impl Engine {
             &self.config.tools_always_load,
             self.turn_tool_surface_budget
                 .unwrap_or(crate::model_profile::ToolSurfaceBudget::Standard),
-        );
-        if *catalog != before {
+        ) {
             self.session.pending_prefix_change_reason = Some("mcp-session-boot".to_string());
         }
     }
@@ -769,8 +895,7 @@ impl Engine {
             format!(" ({failed} failed)")
         };
         let _ = self
-            .tx_event
-            .send(Event::status(format!(
+            .send_event(Event::status(format!(
                 "Resuming turn with {count} {prefix}sub-agent completion(s){failure_suffix}"
             )))
             .await;
@@ -809,8 +934,7 @@ impl Engine {
         let context_text =
             crate::tui::auto_review::build_reviewer_context(context, held_reason, tool_input);
         let _ = self
-            .tx_event
-            .send(Event::status(format!(
+            .send_event(Event::status(format!(
                 "Auto-Review checking '{}'",
                 context.tool_name
             )))
@@ -832,8 +956,7 @@ impl Engine {
             if usage_has_reported_data(usage) {
                 let request_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
                 let _ = self
-                    .tx_event
-                    .send(Event::RoutedTurnUsage {
+                    .send_event(Event::RoutedTurnUsage {
                         usage: usage.clone(),
                         duration_ms: request_ms,
                         first_token_ms: None,
@@ -866,7 +989,7 @@ impl Engine {
             )),
             super::reviewer::ReviewerOutcome::Cancelled => None,
         };
-        let result = review.outcome.into_tool_result(context.tool_name);
+        let result = review.outcome.into_tool_result(context.tool_name.as_ref());
         emit_tool_audit(json!({
             "event": "tool.auto_review",
             "gate": "guardian",
@@ -877,8 +1000,7 @@ impl Engine {
         }));
         if let Some((verdict, reason)) = receipt {
             let _ = self
-                .tx_event
-                .send(Event::ToolGateDecision {
+                .send_event(Event::ToolGateDecision {
                     agent_id: None,
                     tool_id: tool_id.to_string(),
                     tool_name: context.tool_name.to_string(),
@@ -997,8 +1119,11 @@ impl Engine {
         // retry after that carries a nudge — attached to one outbound request
         // and dropped, never added to the session. Writing it to the session
         // would put a message the user never sent into the transcript, the
-        // exports, and every later turn's context.
-        let mut reasoning_only_nudge: Option<Message> = None;
+        // exports, and every later turn's context. It is still model-visible,
+        // so the request that carries it also emits a durable internal
+        // status receipt with its exact text (C02-04, "model-visible means
+        // logged"): the runtime event log can reconstruct the request.
+        let mut reasoning_only_nudge: Option<String> = None;
         // Outer stream-retry budget: when the chunked-transfer connection
         // dies mid-stream and either nothing useful was streamed (#103
         // Phase 3), the host slept mid-turn (#2990), or a host hit a
@@ -1016,7 +1141,7 @@ impl Engine {
 
         loop {
             if self.cancel_token.is_cancelled() {
-                let _ = self.tx_event.send(Event::status("Request cancelled")).await;
+                let _ = self.send_event(Event::status("Request cancelled")).await;
                 return (TurnOutcomeStatus::Interrupted, None);
             }
             self.turn_heartbeat.enter(
@@ -1026,6 +1151,7 @@ impl Engine {
             );
             self.refresh_boot_mcp_catalog(&tool_policy, &mut tool_catalog, &mut active_tool_names)
                 .await;
+            self.record_mcp_server_instructions(&tool_catalog).await;
 
             // R1: the cumulative per-turn wall-clock budget. Checked at the
             // provider-request boundary so a turn that runs out of time stops
@@ -1033,13 +1159,8 @@ impl Engine {
             // result already produced stays in the transcript. Hitting it is
             // never a clean success — the turn ends `Failed` with the limit
             // named, matching how the step ceiling below reports.
-            if self.turn_wall_clock.exhausted() {
-                let error = format!(
-                    "Per-turn wall-clock budget exhausted after {}s (limit: {}s). The turn was stopped before another model request; work already done is in the transcript. Send another message to continue, or raise `[tui].turn_wall_clock_secs`.",
-                    self.turn_wall_clock.spent().as_secs(),
-                    self.turn_wall_clock.budget().as_secs(),
-                );
-                let _ = self.tx_event.send(Event::status(error.clone())).await;
+            if let Some(error) = self.turn_wall_clock_exhausted_error() {
+                let _ = self.send_event(Event::status(error.clone())).await;
                 return (TurnOutcomeStatus::Failed, Some(error));
             }
 
@@ -1066,8 +1187,7 @@ impl Engine {
                 self.add_session_message(self.user_text_message_with_turn_metadata(steer.clone()))
                     .await;
                 let _ = self
-                    .tx_event
-                    .send(Event::status(format!(
+                    .send_event(Event::status(format!(
                         "Steer input accepted: {}",
                         summarize_text(&steer, 120)
                     )))
@@ -1121,8 +1241,7 @@ impl Engine {
                 self.add_session_message(self.user_text_message_with_turn_metadata(notice))
                     .await;
                 let _ = self
-                    .tx_event
-                    .send(Event::status(
+                    .send_event(Event::status(
                         "Soft landing: wrap up with your final report",
                     ))
                     .await;
@@ -1145,8 +1264,7 @@ impl Engine {
                     self.add_session_message(self.user_text_message_with_turn_metadata(notice))
                         .await;
                     let _ = self
-                        .tx_event
-                        .send(Event::status(
+                        .send_event(Event::status(
                             "Model budget exhausted — final report requested",
                         ))
                         .await;
@@ -1158,7 +1276,7 @@ impl Engine {
                         turn.max_steps,
                         turn.budget_source.key_label(),
                     );
-                    let _ = self.tx_event.send(Event::status(error.clone())).await;
+                    let _ = self.send_event(Event::status(error.clone())).await;
                     return (TurnOutcomeStatus::Failed, Some(error));
                 }
             }
@@ -1176,9 +1294,7 @@ impl Engine {
                 && let Some(budget) = snapshot.token_budget
                 && snapshot.tokens_used >= u64::from(budget)
             {
-                let _ = self
-                    .tx_event
-                    .send(Event::status(format!(
+                let _ = self.send_event(Event::status(format!(
                         "Goal over token budget ({} / {budget} tokens) — continuing (unbounded); verify or /goal clear when done.",
                         snapshot.tokens_used
                     )))
@@ -1187,236 +1303,18 @@ impl Engine {
 
             let active_tools =
                 active_tools_for_request(&tool_catalog, &active_tool_names, strict_tool_mode);
-            let auto_compaction_config = self.config.compaction.clone();
-            // Billing usage accumulates every parent step and child-model
-            // call. Only the most recent parent-route request describes the
-            // live message list whose pressure we are checking here.
-            let billed_input_tokens = turn.live_input_tokens_for_compaction(
-                &self.session.messages,
-                self.session.system_prompt.as_ref(),
-                self.session.latest_parent_input_tokens,
-            );
-            let prepared = if !auto_compaction_suppressed
-                && crate::compaction::compaction_pressure_reached_with_billed(
-                    &self.session.messages,
-                    self.session.system_prompt.as_ref(),
-                    &auto_compaction_config,
-                    billed_input_tokens,
-                ) {
-                let mut prepared = self.prepare_compaction_envelope(auto_compaction_config);
-                prepared.tools = active_tools.clone();
-                Some(prepared)
-            } else {
-                None
-            };
-
-            let compaction_go = match prepared.as_ref() {
-                None => false,
-                Some(prepared) => match crate::compaction::compaction_decision_with_billed(
-                    &self.session.messages,
-                    self.session.system_prompt.as_ref(),
-                    prepared,
-                    billed_input_tokens,
-                ) {
-                    crate::compaction::CompactionDecision::Compact => true,
-                    crate::compaction::CompactionDecision::NotNeeded => false,
-                    crate::compaction::CompactionDecision::Refused(reason) => {
-                        // A silent refusal looks like broken auto-compaction:
-                        // the meter is full and nothing happens (#5577). Name
-                        // the guard once per turn, in both the transcript
-                        // status line and the trace.
-                        if !turn.compaction_refusal_notified {
-                            turn.compaction_refusal_notified = true;
-                            let estimated_tokens_before = self.estimated_input_tokens();
-                            self.record_compaction_event("compaction.refused", serde_json::json!({
-                                "trigger": "auto",
-                                "reason": match &reason {
-                                    crate::compaction::CompactionRefusal::TooFewMessages { .. } => "too_few_messages",
-                                    crate::compaction::CompactionRefusal::RetainedFloor { .. } => "retained_floor",
-                                },
-                                "messages_before": self.session.messages.len(),
-                                "estimated_tokens_before": estimated_tokens_before,
-                                "billed_input_tokens": billed_input_tokens,
-                                "threshold_tokens": prepared.config.token_threshold,
-                            })).await;
-                            let message = match reason {
-                                crate::compaction::CompactionRefusal::TooFewMessages { count } => {
-                                    format!(
-                                        "Context is filling up, but there is nothing to make room from yet: only {count} messages"
-                                    )
-                                }
-                                crate::compaction::CompactionRefusal::RetainedFloor {
-                                    floor,
-                                    threshold,
-                                } => format!(
-                                    "Context is filling up, but making room would not help: retained context (~{}K tokens) cannot fall below the {}K trigger — /compact to force a pass, or trim pinned context",
-                                    floor / 1000,
-                                    threshold / 1000
-                                ),
-                            };
-                            tracing::warn!(
-                                target: "compaction",
-                                ?reason,
-                                billed = ?billed_input_tokens,
-                                "auto-compaction refused under pressure"
-                            );
-                            let _ = self.tx_event.send(Event::status(message)).await;
-                        }
-                        false
-                    }
-                },
-            };
-            if let Some(prepared) = prepared
-                && compaction_go
-            {
-                let compaction_id = format!("compact_{}", &uuid::Uuid::new_v4().to_string()[..8]);
-                turn.stop_diagnostics.automatic_compaction_attempts = turn
-                    .stop_diagnostics
-                    .automatic_compaction_attempts
-                    .saturating_add(1);
-                let compaction_cancel = self
-                    .claim_compaction(&compaction_id)
-                    .expect("a fresh automatic compaction id cannot be pre-canceled");
-                self.emit_compaction_started(
-                    compaction_id.clone(),
-                    true,
-                    "Making room…".to_string(),
+            match self
+                .run_auto_compaction(
+                    client.as_ref(),
+                    active_tools.as_deref(),
+                    turn,
+                    &mut auto_compaction_suppressed,
                 )
-                .await;
-                let auto_messages_before = self.session.messages.len();
-                let auto_tokens_before = self.estimated_input_tokens();
-                let turn_cancel = self.cancel_token.clone();
-                let started = Instant::now();
-                let mut compaction_usage = Usage::default();
-                // Parked: the compaction pass owns its own bound.
-                self.turn_heartbeat
-                    .enter(super::turn_heartbeat::TurnPhase::Compacting, None, None);
-                let (compaction_result, turn_was_canceled) = tokio::select! {
-                    biased;
-                    _ = turn_cancel.cancelled() => (None, true),
-                    _ = compaction_cancel.cancelled() => (None, false),
-                    result = compact_messages_safe(
-                        client.as_ref(),
-                        &self.session.messages,
-                        self.session.system_prompt.as_ref(),
-                        &prepared,
-                        &mut compaction_usage,
-                    ) => (Some(result), false),
-                };
-                turn.add_usage(&compaction_usage);
-                self.emit_compaction_usage(&compaction_usage, started.elapsed())
-                    .await;
-                let Some(compaction_result) = compaction_result else {
-                    auto_compaction_suppressed = true;
-                    self.finish_compaction(&compaction_id);
-                    let message = if turn_was_canceled {
-                        "Making room stopped with the turn; the conversation was not changed"
-                    } else {
-                        "Making room stopped; the conversation was not changed"
-                    }
-                    .to_string();
-                    self.emit_compaction_cancelled(compaction_id, true, message)
-                        .await;
-                    if turn_was_canceled {
-                        return (TurnOutcomeStatus::Interrupted, None);
-                    }
-                    continue;
-                };
-
-                match compaction_result {
-                    Ok(mut result) => {
-                        // Only update if we got valid messages (never corrupt state)
-                        if !result.messages.is_empty() || self.session.messages.is_empty() {
-                            self.append_compaction_agent_topology(&mut result.messages)
-                                .await;
-                            let turn_was_canceled = turn_cancel.is_cancelled();
-                            if turn_was_canceled || compaction_cancel.is_cancelled() {
-                                auto_compaction_suppressed = true;
-                                self.finish_compaction(&compaction_id);
-                                let message = if turn_was_canceled {
-                                    "Making room stopped with the turn; the conversation was not changed"
-                                } else {
-                                    "Making room stopped; the conversation was not changed"
-                                }
-                                .to_string();
-                                self.emit_compaction_cancelled(compaction_id, true, message)
-                                    .await;
-                                if turn_was_canceled {
-                                    return (TurnOutcomeStatus::Interrupted, None);
-                                }
-                                continue;
-                            }
-                            let auto_messages_after = result.messages.len();
-                            let retries_used = result.retries_used;
-                            let coverage_clause = result.coverage.receipt_clause();
-                            let path = result.coverage.path;
-                            self.session.replace_messages(result.messages);
-                            turn.clear_parent_input_tokens();
-                            if let Some(pm) = self.session.prefix_stability.as_mut() {
-                                pm.note_history_reset("compaction");
-                            }
-                            self.commit_compaction_checkpoint(result.summary_prompt);
-                            auto_compaction_suppressed =
-                                crate::compaction::compaction_pressure_reached(
-                                    &self.session.messages,
-                                    self.session.system_prompt.as_ref(),
-                                    &self.config.compaction,
-                                );
-                            self.emit_session_updated().await;
-                            let removed = auto_messages_before.saturating_sub(auto_messages_after);
-                            let auto_tokens_after = self.estimated_input_tokens();
-                            let status = if retries_used > 0 {
-                                format!(
-                                    "Made room: {auto_messages_before} → {auto_messages_after} messages ({removed} removed, {retries_used} retries), ~{auto_tokens_before} → ~{auto_tokens_after} tokens ({coverage_clause})"
-                                )
-                            } else {
-                                format!(
-                                    "Made room: {auto_messages_before} → {auto_messages_after} messages ({removed} removed), ~{auto_tokens_before} → ~{auto_tokens_after} tokens ({coverage_clause})"
-                                )
-                            };
-                            self.emit_compaction_completed(
-                                compaction_id.clone(),
-                                true,
-                                status.clone(),
-                                Some(auto_messages_before),
-                                Some(auto_messages_after),
-                                super::compaction::CompactionPass {
-                                    trigger: "auto",
-                                    path,
-                                    tokens_before: auto_tokens_before,
-                                    threshold_tokens: prepared.config.token_threshold,
-                                    usage: compaction_usage.clone(),
-                                },
-                            )
-                            .await;
-                        } else {
-                            auto_compaction_suppressed = true;
-                            let message =
-                                "Making room skipped: the summary came back empty".to_string();
-                            self.emit_compaction_failed(
-                                compaction_id.clone(),
-                                true,
-                                message.clone(),
-                            )
-                            .await;
-                            let _ = self.tx_event.send(Event::status(message)).await;
-                        }
-                    }
-                    Err(err) => {
-                        auto_compaction_suppressed = true;
-                        // Log error but continue with original messages (never corrupt)
-                        let message = crate::compaction::report_compaction_failure(
-                            "Making room failed",
-                            &compaction_id,
-                            true,
-                            &err,
-                        );
-                        self.emit_compaction_failed(compaction_id.clone(), true, message.clone())
-                            .await;
-                        let _ = self.tx_event.send(Event::status(message)).await;
-                    }
-                }
-                self.finish_compaction(&compaction_id);
+                .await
+            {
+                AutoCompactionStep::Proceed => {}
+                AutoCompactionStep::Restart => continue,
+                AutoCompactionStep::EndTurn(status, error) => return (status, error),
             }
 
             // The guard measures what the compaction gate measures: the honest
@@ -1492,8 +1390,7 @@ impl Engine {
                         );
                         turn_error = Some(message.clone());
                         let _ = self
-                            .tx_event
-                            .send(Event::error(ErrorEnvelope::context_overflow(message)))
+                            .send_event(Event::error(ErrorEnvelope::context_overflow(message)))
                             .await;
                         return (TurnOutcomeStatus::Failed, turn_error);
                     }
@@ -1526,7 +1423,7 @@ impl Engine {
                             display_message.clone(),
                         );
                         envelope.message = display_message.clone();
-                        let _ = self.tx_event.send(Event::error(envelope)).await;
+                        let _ = self.send_event(Event::error(envelope)).await;
                         return (TurnOutcomeStatus::Failed, Some(display_message));
                     }
                     let message = if crate::compaction::has_compactable_history(
@@ -1548,8 +1445,7 @@ impl Engine {
                         )
                     };
                     let _ = self
-                        .tx_event
-                        .send(Event::error(ErrorEnvelope::context_overflow(
+                        .send_event(Event::error(ErrorEnvelope::context_overflow(
                             message.clone(),
                         )))
                         .await;
@@ -1669,7 +1565,7 @@ impl Engine {
                         }
                     }
                 };
-                let _ = self.tx_event.send(event).await;
+                let _ = self.send_event(event).await;
             }
 
             // Three-zone prefix contract (#2264): freeze baseline on first
@@ -1707,8 +1603,7 @@ impl Engine {
                     );
                     let frozen = pinned.freeze();
                     let _ = self
-                        .tx_event
-                        .send(Event::PrefixCacheChange {
+                        .send_event(Event::PrefixCacheChange {
                             description: format!("frozen: {}", frozen.short_id()),
                             system_prompt_changed: false,
                             tools_changed: false,
@@ -1727,14 +1622,18 @@ impl Engine {
             let fleet_report_response = fleet_denial_guard
                 .as_ref()
                 .is_some_and(FleetDenialGuard::report_only);
+            // `take` is what keeps this request-scoped: the nudge is spent
+            // here and never reaches `self.session.messages`.
+            let request_nudge = reasoning_only_nudge.take();
             let mut request = prepare_primary_turn_request(PrimaryTurnRequest {
                 model: self.session.model.clone(),
                 messages: {
                     let mut messages = self.messages_with_turn_metadata();
-                    // `take` is what keeps this request-scoped: the nudge is
-                    // spent here and never reaches `self.session.messages`.
-                    if let Some(nudge) = reasoning_only_nudge.take() {
-                        messages.push(nudge);
+                    if let Some(nudge) = request_nudge.as_ref() {
+                        messages.push(self.runtime_text_message_with_turn_metadata(
+                            nudge.clone(),
+                            UserInputProvenance::Runtime,
+                        ));
                     }
                     messages
                 },
@@ -1747,10 +1646,11 @@ impl Engine {
                 system: self.session.system_prompt.clone(),
                 tools: active_tools.clone(),
                 tool_choice: if active_tools.is_some() {
-                    if fleet_report_response {
+                    if fleet_report_response || turn.budget_exhausted_final_report {
                         // Keep the pinned tool prefix; only this request's
                         // choice changes. Admission below also enforces this
-                        // if a provider ignores the report-only request.
+                        // if a provider ignores the report-only request
+                        // (C02-10: the step-budget final report included).
                         Some(json!("none"))
                     } else if strict_tool_mode {
                         Some(json!("required"))
@@ -1792,7 +1692,7 @@ impl Engine {
                     )
                     .replace("{model}", &self.session.model)
                     .replace("{count}", &fresh_images.to_string());
-                    let _ = self.tx_event.send(Event::status(status)).await;
+                    let _ = self.send_event(Event::status(status)).await;
                 }
             }
             let tool_request_snapshot =
@@ -1813,12 +1713,36 @@ impl Engine {
             // first call) so we can resend it on a transparent retry below
             // when the wire dies before any content was streamed (#103).
             let stream_request = request;
+            // Superfast Decision Gate (shadow mode, off by default). When
+            // SUPERFAST_ENABLED is set, this spawns a detached task that asks
+            // a small System One decision model about the user's turn and only
+            // logs the recommendation. It never changes routing, never skips
+            // the model call below, and never waits on the decision call.
+            // Fired only on the first model request of the turn, where the raw
+            // user message decides intent. See `crate::superfast`.
+            if turn.step == 0 {
+                // Detached on purpose: dropping the handle does not cancel it.
+                drop(crate::superfast::spawn_shadow_gate(
+                    &self.api_config,
+                    &stream_request.messages,
+                    self.config.compaction.runtime_cost_owner.as_deref(),
+                    &self.cancel_token,
+                ));
+            }
             let _ = self
-                .tx_event
-                .send(Event::ToolRequestSnapshot {
+                .send_event(Event::ToolRequestSnapshot {
                     snapshot: tool_request_snapshot,
                 })
                 .await;
+            if let Some(nudge) = request_nudge {
+                // The "Continuing — " prefix classifies the receipt as
+                // internal: durable clients keep it, collapsed.
+                let _ = self
+                    .send_event(Event::status(format!(
+                        "{REQUEST_NUDGE_RECEIPT_PREFIX}{nudge}"
+                    )))
+                    .await;
+            }
             if let Some(mut route) = turn.pending_route.take() {
                 if let Some(billing) = route.billing.as_mut() {
                     // Freeze the exact provider-live row at CodeWhale's
@@ -1842,8 +1766,7 @@ impl Engine {
                         });
                 }
                 let _ = self
-                    .tx_event
-                    .send(Event::RouteDispatched {
+                    .send_event(Event::RouteDispatched {
                         turn_id: turn.id.clone(),
                         route,
                     })
@@ -1865,7 +1788,7 @@ impl Engine {
             let stream_result = tokio::select! {
                 biased;
                 () = self.cancel_token.cancelled() => {
-                    let _ = self.tx_event.send(Event::status("Request cancelled")).await;
+                    let _ = self.send_event(Event::status("Request cancelled")).await;
                     return (TurnOutcomeStatus::Interrupted, None);
                 }
                 result = async {
@@ -1922,7 +1845,7 @@ impl Engine {
                             codewhale_localization::MessageId::ImageInputRejectedResent,
                         )
                         .replace("{model}", &self.session.model);
-                        let _ = self.tx_event.send(Event::status(status)).await;
+                        let _ = self.send_event(Event::status(status)).await;
                         continue;
                     }
                     let display_message = self.decorate_auth_error_message(
@@ -1954,7 +1877,7 @@ impl Engine {
                         turn.stop_diagnostics.stream_resumes =
                             turn.stop_diagnostics.stream_resumes.saturating_add(1);
                         if attempt == 2 {
-                            let _ = self.tx_event.send(Event::status("Reconnecting…")).await;
+                            let _ = self.send_event(Event::status("Reconnecting…")).await;
                         }
                         crate::logging::warn(format!(
                             "Stream failed to open (attempt {attempt}/{}); retrying request: {message}",
@@ -1976,7 +1899,7 @@ impl Engine {
                         self.emit_session_updated().await;
                     }
                     turn_error = Some(display_message);
-                    let _ = self.tx_event.send(Event::error(envelope)).await;
+                    let _ = self.send_event(Event::error(envelope)).await;
                     return (TurnOutcomeStatus::Failed, turn_error);
                 }
             };
@@ -2014,6 +1937,11 @@ impl Engine {
                 None,
                 Some(super::turn_heartbeat::PREPARING_PHASE_BOUND),
             );
+            // C02-05: a response whose stream failed — a provider error frame,
+            // a transport error, a stall, or a cap — is not a complete
+            // response. Unless the retry below re-issues the request, nothing
+            // it collected may execute or continue the turn.
+            let response_stream_failed = stream_error.is_some();
             turn_error = turn_error.or(stream_error);
             turn.stop_diagnostics
                 .observe_provider_response(stop_reason.as_deref(), tool_uses.len());
@@ -2048,8 +1976,7 @@ impl Engine {
             self.session.latest_parent_input_tokens = turn.latest_parent_input_tokens;
             if usage_reported {
                 let _ = self
-                    .tx_event
-                    .send(Event::TurnUsage {
+                    .send_event(Event::TurnUsage {
                         max_output_tokens: turn
                             .max_output_tokens
                             .map(|_| stream_request.max_tokens),
@@ -2087,7 +2014,7 @@ impl Engine {
             }
 
             if self.cancel_token.is_cancelled() {
-                let _ = self.tx_event.send(Event::status("Request cancelled")).await;
+                let _ = self.send_event(Event::status("Request cancelled")).await;
                 self.add_interrupted_assistant_text(&current_text_visible)
                     .await;
                 return (TurnOutcomeStatus::Interrupted, None);
@@ -2114,26 +2041,8 @@ impl Engine {
                     output_limit_truncated = Some(reason.to_string());
                     // Fall through to the normal content/tool dispatch below.
                 } else {
-                    for tool in &tool_uses {
-                        let _ = self
-                            .tx_event
-                            .send(Event::ToolCallStarted {
-                                id: tool.execution_id.clone(),
-                                model_call: Some(tool.model_call()),
-                                name: tool.name.clone(),
-                                input: final_tool_input(tool),
-                            })
-                            .await;
-                        let _ = self
-                            .tx_event
-                            .send(Event::ToolCallComplete {
-                                id: tool.execution_id.clone(),
-                                model_call: Some(tool.model_call()),
-                                name: tool.name.clone(),
-                                result: Ok(incomplete_tool_result(reason)),
-                            })
-                            .await;
-                    }
+                    self.settle_unadmitted_tool_calls(&tool_uses, &incomplete_tool_result(reason))
+                        .await;
                     // Do not emit MessageComplete: hosts must retain the visible
                     // fragment as interrupted/failed rather than recording it as
                     // a completed assistant item.
@@ -2185,7 +2094,7 @@ impl Engine {
                 // show one calm progress notice; diagnostics retain every
                 // attempt and an exhausted budget still fails visibly.
                 if attempt == 2 {
-                    let _ = self.tx_event.send(Event::status("Reconnecting…")).await;
+                    let _ = self.send_event(Event::status("Reconnecting…")).await;
                 }
                 match resume {
                     StreamResume::AfterSleep => {
@@ -2197,7 +2106,7 @@ impl Engine {
                         // appending to the pre-sleep fragment.
                         if pending_message_complete {
                             let index = last_text_index.unwrap_or(0);
-                            let _ = self.tx_event.send(Event::MessageComplete { index }).await;
+                            let _ = self.send_event(Event::MessageComplete { index }).await;
                         }
                     }
                     StreamResume::HeadlessNetworkDrop => {
@@ -2267,7 +2176,7 @@ impl Engine {
                             // fresh cell instead of appending to an
                             // unfinished one.
                             if let Some(index) = last_text_index {
-                                let _ = self.tx_event.send(Event::MessageComplete { index }).await;
+                                let _ = self.send_event(Event::MessageComplete { index }).await;
                             }
                             // Persist the fragment the operator already saw —
                             // exactly one assistant cell for it, and no
@@ -2310,6 +2219,16 @@ impl Engine {
             let mut final_text = current_text_visible.clone();
             if tool_uses.is_empty() && tool_parser::has_tool_call_markers(&current_text_raw) {
                 let parsed = tool_parser::parse_tool_calls(&current_text_raw);
+                if parsed.tool_calls.len() > super::streaming::MAX_TOOL_CALLS_PER_RESPONSE {
+                    let envelope = super::streaming::tool_call_limit_error();
+                    let error = envelope.message.clone();
+                    turn.stop_diagnostics.last_response_tool_calls_suppressed =
+                        Some(parsed.tool_calls.len());
+                    let _ = self.send_stream_event(Event::error(envelope)).await;
+                    self.add_interrupted_assistant_text(&current_text_visible)
+                        .await;
+                    return (TurnOutcomeStatus::Failed, Some(error));
+                }
                 final_text = parsed.clean_text;
                 for call in parsed.tool_calls {
                     tool_uses.push(ToolUseState {
@@ -2333,10 +2252,31 @@ impl Engine {
                 }
             }
 
+            // C02-05: the one admission authority for a failed stream. Calls
+            // collected before the failure are announced with an explicit
+            // not-executed result and never reach planning, approval or a
+            // handler; the visible text is kept as an interrupted fragment
+            // and no tool_use enters history, so the transcript stays paired.
+            // A retry never gets here: it `continue`d above with this batch
+            // dropped, and the re-issued request streams its own calls.
+            if response_stream_failed && !tool_uses.is_empty() {
+                let error = turn_error
+                    .clone()
+                    .unwrap_or_else(|| "provider stream failed".to_string());
+                self.settle_unadmitted_tool_calls(
+                    &tool_uses,
+                    &stream_failed_tool_result(&summarize_text(&error, 200)),
+                )
+                .await;
+                self.add_interrupted_assistant_text(&current_text_visible)
+                    .await;
+                turn.stop_diagnostics.last_response_tool_calls_suppressed = Some(tool_uses.len());
+                return (TurnOutcomeStatus::Failed, Some(error));
+            }
+
             for tool in &tool_uses {
                 let _ = self
-                    .tx_event
-                    .send(Event::ToolCallStarted {
+                    .send_event(Event::ToolCallStarted {
                         id: tool.execution_id.clone(),
                         model_call: Some(tool.model_call()),
                         name: tool.name.clone(),
@@ -2437,7 +2377,7 @@ impl Engine {
 
             if pending_message_complete {
                 let index = last_text_index.unwrap_or(0);
-                let _ = self.tx_event.send(Event::MessageComplete { index }).await;
+                let _ = self.send_event(Event::MessageComplete { index }).await;
             }
 
             // RLM is a structured tool call (`rlm_query`) handled by the
@@ -2483,6 +2423,15 @@ impl Engine {
                 .await;
             }
 
+            // C02-05: a failed stream that carried no tool call keeps its text
+            // (above) and ends the turn with the stream's error. It never
+            // runs a ```repl fence from the failed text, and never authorizes
+            // another request for an output-limit continuation, a steer, a
+            // sub-agent completion or a goal continuation.
+            if response_stream_failed {
+                break;
+            }
+
             // A truncated response with no tool call cannot continue through
             // tool execution: surface the truncation as a bounded observation
             // and resume the loop so the model can act on it instead of the
@@ -2509,8 +2458,7 @@ impl Engine {
                 )
                 .await;
                 let _ = self
-                    .tx_event
-                    .send(Event::status(
+                    .send_event(Event::status(
                         "Continuing — provider output limit reached; asking the model to continue"
                             .to_string(),
                     ))
@@ -2542,8 +2490,7 @@ impl Engine {
                             .await;
                     }
                     let _ = self
-                        .tx_event
-                        .send(Event::status("Continuing — queued steer input".to_string()))
+                        .send_event(Event::status("Continuing — queued steer input".to_string()))
                         .await;
                     turn.next_step();
                     continue;
@@ -2554,7 +2501,7 @@ impl Engine {
                     self.add_session_message(shell_completion_runtime_message(&shell_completions))
                         .await;
                     if let Some(status) = shell_completion_status_text(&shell_completions, "") {
-                        let _ = self.tx_event.send(Event::status(status)).await;
+                        let _ = self.send_event(Event::status(status)).await;
                     }
                 }
 
@@ -2565,8 +2512,7 @@ impl Engine {
                 let subagent_completions = self.drain_subagent_completion_events("").await;
                 if subagent_completions > 0 {
                     let _ = self
-                        .tx_event
-                        .send(Event::status(format!(
+                        .send_event(Event::status(format!(
                             "Continuing — {subagent_completions} sub-agent(s) completed"
                         )))
                         .await;
@@ -2590,12 +2536,7 @@ impl Engine {
                 // on this turn's surface, and only after the same approval.
                 let repl_fence_present = has_sendable_assistant_content
                     && crate::repl::sandbox::has_repl_block(&current_text_visible);
-                let repl_fence_offered = mode != AppMode::Plan
-                    && tool_catalog
-                        .iter()
-                        .any(|tool| tool.name == super::tool_catalog::CODE_EXECUTION_TOOL_NAME)
-                    && tool_policy.passes_allow_list(super::tool_catalog::CODE_EXECUTION_TOOL_NAME)
-                    && !tool_policy.denies_tool(super::tool_catalog::CODE_EXECUTION_TOOL_NAME);
+                let repl_fence_offered = code_execution_offered(mode, &tool_catalog, &tool_policy);
                 let mut repl_fence_skip_reason = (repl_fence_present && !repl_fence_offered)
                     .then(|| "code execution is not available on this turn".to_string());
                 let repl_blocks = if repl_fence_present && repl_fence_offered {
@@ -2608,6 +2549,7 @@ impl Engine {
                     repl_fence_skip_reason = self
                         .repl_fence_blocked_reason(
                             &repl_blocks,
+                            "the reply's ```repl block(s) in the session REPL kernel",
                             &approval_id,
                             client.as_ref(),
                             turn,
@@ -2622,21 +2564,44 @@ impl Engine {
                         .await;
                     // Admission may have applied a pending posture change.
                     mode = self.current_mode;
+                    if self.turn_wall_clock.exhausted() {
+                        let reason =
+                            "parent turn deadline exhausted before REPL execution".to_string();
+                        repl_fence_skip_reason = Some(reason.clone());
+                        turn_error = Some(reason);
+                    }
                 }
                 if let Some(reason) = repl_fence_skip_reason.as_deref() {
                     let _ = self
-                        .tx_event
-                        .send(Event::status(format!("REPL block not run: {reason}")))
+                        .send_event(Event::status(format!("REPL block not run: {reason}")))
                         .await;
                 }
                 if !repl_blocks.is_empty() && repl_fence_skip_reason.is_none() {
+                    let child_deadline = tokio::time::Instant::now()
+                        + crate::tools::subagent::DEFAULT_CHILD_WALL_TIME;
+                    let repl_deadline = self
+                        .nested_work_deadline()
+                        .map_or(child_deadline, |parent| parent.min(child_deadline));
+                    // A kernel left broken by a dropped turn refuses every round; kill it.
+                    drop(self.repl_kernel.take_if(|kernel| kernel.is_broken()));
                     if self.repl_kernel.is_none() {
-                        self.repl_kernel = match crate::repl::runtime::PythonRuntime::new().await {
+                        let startup = tokio::select! {
+                            biased;
+                            () = self.cancel_token.cancelled() => {
+                                Err("REPL startup cancelled".into())
+                            }
+                            result = tokio::time::timeout_at(
+                                repl_deadline,
+                                crate::repl::runtime::PythonRuntime::new(),
+                            ) => result.unwrap_or_else(|_| {
+                                Err("parent turn deadline reached during REPL startup".into())
+                            }),
+                        };
+                        self.repl_kernel = match startup {
                             Ok(runtime) => Some(runtime),
                             Err(e) => {
                                 let _ = self
-                                    .tx_event
-                                    .send(Event::status(format!("REPL init failed: {e}")))
+                                    .send_event(Event::status(format!("REPL init failed: {e}")))
                                     .await;
                                 turn_error = Some(format!("REPL init failed: {e}"));
                                 break;
@@ -2645,12 +2610,21 @@ impl Engine {
                     }
 
                     let kernel_context = self.repl_kernel_context();
-                    let refresh_result = self
-                        .repl_kernel
-                        .as_mut()
-                        .expect("REPL kernel initialized above")
-                        .replace_context(&kernel_context)
-                        .await;
+                    let refresh_result = tokio::select! {
+                        biased;
+                        () = self.cancel_token.cancelled() => {
+                            Err("REPL context refresh cancelled".into())
+                        }
+                        result = tokio::time::timeout_at(
+                            repl_deadline,
+                            self.repl_kernel
+                                .as_mut()
+                                .expect("REPL kernel initialized above")
+                                .replace_context(&kernel_context),
+                        ) => result.unwrap_or_else(|_| {
+                            Err("parent turn deadline reached during REPL context refresh".into())
+                        }),
+                    };
                     if let Err(e) = refresh_result {
                         // A broken subprocess cannot be trusted to retain
                         // state. Drop it so a later model step gets a clean,
@@ -2658,8 +2632,7 @@ impl Engine {
                         // hidden failure.
                         self.repl_kernel = None;
                         let _ = self
-                            .tx_event
-                            .send(Event::status(format!("REPL context refresh failed: {e}")))
+                            .send_event(Event::status(format!("REPL context refresh failed: {e}")))
                             .await;
                         turn_error = Some(format!("REPL context refresh failed: {e}"));
                         break;
@@ -2688,6 +2661,7 @@ impl Engine {
                         // A nested `rlm_query` reports on this turn's stream,
                         // so its model calls are part of the record (#6511).
                         .with_events(self.tx_event.clone())
+                        .with_deadline(Some(repl_deadline))
                     });
                     let repl_cost_scope = crate::cost_status::scope_token();
                     let repl_started = Instant::now();
@@ -2698,35 +2672,36 @@ impl Engine {
                     for (i, block) in repl_blocks.iter().enumerate() {
                         let round_num = i + 1;
                         let _ = self
-                            .tx_event
-                            .send(Event::status(format!(
+                            .send_event(Event::status(format!(
                                 "REPL round {round_num}: executing..."
                             )))
                             .await;
 
-                        let round_result = match bridge.as_ref() {
-                            Some(bridge) => {
+                        // Dropping the cancelled round also stops its owned
+                        // RPC/forwarder futures. The ledger below still
+                        // accounts completed and pending provider requests;
+                        // the kernel is discarded after any round failure.
+                        let round_result = tokio::select! {
+                            biased;
+                            () = self.cancel_token.cancelled() => {
+                                Err("REPL execution cancelled".into())
+                            }
+                            result = tokio::time::timeout_at(
+                                repl_deadline,
                                 self.repl_kernel
                                     .as_mut()
                                     .expect("REPL kernel stays alive during a round")
-                                    .run(&block.code, Some(bridge))
-                                    .await
-                            }
-                            None => {
-                                self.repl_kernel
-                                    .as_mut()
-                                    .expect("REPL kernel stays alive during a round")
-                                    .execute(&block.code)
-                                    .await
-                            }
+                                    .run(&block.code, bridge.as_ref()),
+                            ) => result.unwrap_or_else(|_| {
+                                Err("REPL execution reached the parent turn deadline".into())
+                            }),
                         };
 
                         match round_result {
                             Ok(round) => {
                                 if let Some(val) = &round.final_value {
                                     let _ = self
-                                        .tx_event
-                                        .send(Event::status(format!(
+                                        .send_event(Event::status(format!(
                                             "REPL round {round_num}: FINAL result obtained"
                                         )))
                                         .await;
@@ -2796,8 +2771,7 @@ impl Engine {
                             }
                             Err(e) => {
                                 let _ = self
-                                    .tx_event
-                                    .send(Event::status(format!(
+                                    .send_event(Event::status(format!(
                                         "REPL round {round_num} failed: {e}"
                                     )))
                                     .await;
@@ -2836,8 +2810,7 @@ impl Engine {
                         turn.add_routed_usage_dropped_records(residual_dropped_records);
                         if usage_has_reported_data(&snapshot.usage) {
                             let _ = self
-                                .tx_event
-                                .send(Event::RoutedTurnUsage {
+                                .send_event(Event::RoutedTurnUsage {
                                     usage: snapshot.usage.clone(),
                                     duration_ms: u64::try_from(repl_started.elapsed().as_millis())
                                         .unwrap_or(u64::MAX),
@@ -2890,9 +2863,7 @@ impl Engine {
                     }
 
                     // No FINAL — let the model iterate with the feedback.
-                    let _ = self
-                        .tx_event
-                        .send(Event::status(format!(
+                    let _ = self.send_event(Event::status(format!(
                             "Continuing — REPL round feedback (consecutive_empty={consecutive_empty_repl_rounds})"
                         )))
                         .await;
@@ -2922,14 +2893,13 @@ impl Engine {
                     if let Some(status) =
                         shell_completion_status_text(&late_shell_completions, "late")
                     {
-                        let _ = self.tx_event.send(Event::status(status)).await;
+                        let _ = self.send_event(Event::status(status)).await;
                     }
                 }
 
                 if self.drain_subagent_completion_events("late").await > 0 {
                     let _ = self
-                        .tx_event
-                        .send(Event::status(
+                        .send_event(Event::status(
                             "Continuing — late sub-agent completion".to_string(),
                         ))
                         .await;
@@ -2964,8 +2934,7 @@ impl Engine {
                     ))
                     .await;
                     let _ = self
-                        .tx_event
-                        .send(Event::status(format!(
+                        .send_event(Event::status(format!(
                             "Continuing — goal still active (pass {goal_continuations_this_turn})"
                         )))
                         .await;
@@ -3010,11 +2979,7 @@ impl Engine {
                                 crate::config::DEFAULT_REASONING_ONLY_REPROMPT_MESSAGE.to_string()
                             });
                         if !text.trim().is_empty() {
-                            reasoning_only_nudge =
-                                Some(self.runtime_text_message_with_turn_metadata(
-                                    text,
-                                    UserInputProvenance::Runtime,
-                                ));
+                            reasoning_only_nudge = Some(text);
                         }
                     }
                     let how = if nudged {
@@ -3026,8 +2991,7 @@ impl Engine {
                         "Model returned only reasoning with no answer or tool call (attempt {attempt}/{max_reprompts}); {how}"
                     ));
                     let _ = self
-                        .tx_event
-                        .send(Event::status(format!(
+                        .send_event(Event::status(format!(
                             "Model returned only reasoning; {how} ({attempt}/{max_reprompts})"
                         )))
                         .await;
@@ -3072,11 +3036,7 @@ impl Engine {
                                         .to_string()
                                 });
                             if !text.trim().is_empty() {
-                                reasoning_only_nudge =
-                                    Some(self.runtime_text_message_with_turn_metadata(
-                                        text,
-                                        UserInputProvenance::Runtime,
-                                    ));
+                                reasoning_only_nudge = Some(text);
                             }
                             "re-requesting the answer with a nudge"
                         }
@@ -3084,9 +3044,7 @@ impl Engine {
                     crate::logging::warn(format!(
                         "Model returned terminal stop reason `{reason}` with no answer or tool call (attempt {attempt}/{EMPTY_STOP_MAX_RETRIES}); {how}"
                     ));
-                    let _ = self
-                        .tx_event
-                        .send(Event::status(format!(
+                    let _ = self.send_event(Event::status(format!(
                             "Model returned an empty response; {how} ({attempt}/{EMPTY_STOP_MAX_RETRIES})"
                         )))
                         .await;
@@ -3138,8 +3096,7 @@ impl Engine {
                     crate::logging::warn(&message);
                     turn_error = Some(message.clone());
                     let _ = self
-                        .tx_event
-                        .send(Event::error(ErrorEnvelope::classify(message, true)))
+                        .send_event(Event::error(ErrorEnvelope::classify(message, true)))
                         .await;
                 }
 
@@ -3172,10 +3129,7 @@ impl Engine {
 
             // Execute tools
             if self.shared_paused.lock().is_ok_and(|paused| *paused) {
-                let _ = self
-                    .tx_event
-                    .send(Event::status("Request was Paused"))
-                    .await;
+                let _ = self.send_event(Event::status("Request was Paused")).await;
                 self.add_interrupted_assistant_text(&current_text_visible)
                     .await;
                 return (TurnOutcomeStatus::Interrupted, None);
@@ -3189,7 +3143,7 @@ impl Engine {
                 match self.ensure_mcp_pool().await {
                     Ok(pool) => Some(pool),
                     Err(err) => {
-                        let _ = self.tx_event.send(Event::status(err.to_string())).await;
+                        let _ = self.send_event(Event::status(err.to_string())).await;
                         None
                     }
                 }
@@ -3318,7 +3272,7 @@ impl Engine {
                     turn.stop_diagnostics.reason = Some(TurnStopReason::NoProgress);
                     FLEET_NO_PROGRESS_STOP.to_string()
                 };
-                let _ = self.tx_event.send(Event::status(error.clone())).await;
+                let _ = self.send_event(Event::status(error.clone())).await;
                 return (TurnOutcomeStatus::Failed, Some(error));
             } else {
                 let notice = match denial_action {
@@ -3365,8 +3319,7 @@ impl Engine {
             // synthetic resume. Declared per-task tool budgets and max_steps
             // remain the explicit limits for tool-driven work.
             let _ = self
-                .tx_event
-                .send(Event::status("Continuing — tool results".to_string()))
+                .send_event(Event::status("Continuing — tool results".to_string()))
                 .await;
             turn.next_step();
         }
@@ -3379,9 +3332,7 @@ impl Engine {
                 .as_ref()
                 .map_or(0, |registry| registry.active_count());
             if running > 0 {
-                let _ = self
-                    .tx_event
-                    .send(Event::status(format!(
+                let _ = self.send_event(Event::status(format!(
                         "Turn failed with {running} turn-owned sub-agent(s) still running; cancelling them."
                     )))
                     .await;
@@ -3392,9 +3343,7 @@ impl Engine {
             .as_ref()
             .map_or(0, |registry| registry.active_count());
         if running > 0 {
-            let _ = self
-                .tx_event
-                .send(Event::status(format!(
+            let _ = self.send_event(Event::status(format!(
                     "Turn ending with {running} turn-owned sub-agent(s) still running; keeping them running in the background."
                 )))
                 .await;
@@ -3409,9 +3358,7 @@ impl Engine {
             turn_detached_child_count(manager.running_count_for_session(&self.session.id), running)
         };
         if detached_running > 0 {
-            let _ = self
-                .tx_event
-                .send(Event::status(format!(
+            let _ = self.send_event(Event::status(format!(
                     "Turn ending with {detached_running} detached sub-agent(s) still running in the background; they'll report when done."
                 )))
                 .await;
@@ -3532,6 +3479,18 @@ impl Engine {
                 && let Some(guard) = fleet_denial_guard
             {
                 blocked_error = guard.admission_error(&tool_name, &tool_input);
+            }
+
+            // C02-10: the response granted after the step budget ran out is
+            // report-only. A provider that ignores `tool_choice: none` still
+            // gets no execution; the next loop pass ends the turn at the
+            // exhausted budget.
+            if blocked_error.is_none() && turn.budget_exhausted_final_report {
+                blocked_error = Some(ToolError::permission_denied(format!(
+                    "Model-step budget exhausted (limit: {}, {}): this is the final report response, so no tool may execute. Report what you did, what you found, what remains, and the evidence.",
+                    turn.max_steps,
+                    turn.budget_source.key_label(),
+                )));
             }
 
             if blocked_error.is_none()
@@ -3660,7 +3619,7 @@ impl Engine {
 
             if let Some(prepared) = prepared_policy {
                 let registered_non_bypassable =
-                    registered_tool_forces_prompt(&tool_name, prepared.call.approval);
+                    call_forces_prompt(&tool_name, &prepared.call.input, prepared.call.approval);
                 approval_required = registered_tool_approval_required(
                     &tool_name,
                     prepared.call.approval,
@@ -3797,72 +3756,78 @@ impl Engine {
             }
 
             if blocked_error.is_none() {
-                let review_context = crate::tui::auto_review::AutoReviewContext::from_tool_call(
-                    &tool_name,
-                    &tool_input,
-                    auto_review_run_origin_for_plan(detached_start),
-                    self.session.approval_mode,
-                    crate::config::is_workspace_trusted(&self.session.workspace),
-                    Some(&self.session.workspace),
-                );
-                let (decision, audit_event) = auto_review_plan_decision_for_context(
-                    &self.config.auto_review_policy,
-                    &review_context,
-                );
-                emit_tool_audit(json!({
-                    "event": "tool.auto_review",
-                    "gate": "deterministic",
-                    "tool_id": tool_id.clone(),
-                    "auto_review": audit_event,
-                }));
-                match decision {
-                    AutoReviewPlanDecision::NoChange => {}
-                    AutoReviewPlanDecision::Allow => {
-                        if !hook_requires_approval && !approval_force_prompt {
-                            approval_required = false;
-                        }
-                    }
-                    AutoReviewPlanDecision::ForcePrompt(reason) => {
-                        // The built-in safety floor is deliberately
-                        // non-bypassable. Ask/Auto-Review surface the hold;
-                        // Full Access turns this disposition into a hard
-                        // block below, without opening a modal.
-                        approval_required = true;
-                        approval_description = reason;
-                        approval_force_prompt = true;
-                    }
-                    AutoReviewPlanDecision::Block(reason) => {
-                        approval_required = false;
-                        approval_force_prompt = false;
-                        let _ = self
-                            .tx_event
-                            .send(Event::ToolGateDecision {
-                                agent_id: None,
-                                tool_id: tool_id.clone(),
-                                tool_name: tool_name.clone(),
-                                gate: crate::core::events::ToolGate::AutoReviewDeterministic,
-                                decision: crate::core::events::ToolGateVerdict::Denied,
-                                risk: None,
-                                reason: crate::core::events::bounded_gate_reason(&reason),
-                            })
-                            .await;
-                        blocked_error = Some(auto_review_block_tool_error(&reason));
-                    }
-                    AutoReviewPlanDecision::ConsultReviewer(held_reason) => {
-                        if let Err(error) = self
-                            .consult_auto_review_guardian(
-                                client,
-                                &review_context,
-                                &tool_input,
-                                &held_reason,
-                                &tool_id,
-                                turn,
-                            )
-                            .await
-                        {
-                            blocked_error = Some(error);
-                        } else if !hook_requires_approval && !approval_force_prompt {
-                            approval_required = false;
+                let review_context =
+                    crate::tui::auto_review::AutoReviewContext::from_tool_call_async(
+                        &tool_name,
+                        &tool_input,
+                        auto_review_run_origin_for_plan(detached_start),
+                        self.session.approval_mode,
+                        Some(&self.session.workspace),
+                    )
+                    .await;
+                match review_context {
+                    Err(error) => blocked_error = Some(error),
+                    Ok(review_context) => {
+                        let (decision, audit_event) = auto_review_plan_decision_for_context(
+                            &self.config.auto_review_policy,
+                            &review_context,
+                        );
+                        emit_tool_audit(json!({
+                            "event": "tool.auto_review",
+                            "gate": "deterministic",
+                            "tool_id": tool_id.clone(),
+                            "auto_review": audit_event,
+                        }));
+                        match decision {
+                            AutoReviewPlanDecision::NoChange => {}
+                            AutoReviewPlanDecision::Allow => {
+                                if !hook_requires_approval && !approval_force_prompt {
+                                    approval_required = false;
+                                }
+                            }
+                            AutoReviewPlanDecision::ForcePrompt(reason) => {
+                                // The built-in safety floor is deliberately
+                                // non-bypassable. Ask/Auto-Review surface the hold;
+                                // Full Access turns this disposition into a hard
+                                // block below, without opening a modal.
+                                approval_required = true;
+                                approval_description = reason;
+                                approval_force_prompt = true;
+                            }
+                            AutoReviewPlanDecision::Block(reason) => {
+                                approval_required = false;
+                                approval_force_prompt = false;
+                                let _ = self
+                                    .send_event(Event::ToolGateDecision {
+                                        agent_id: None,
+                                        tool_id: tool_id.clone(),
+                                        tool_name: tool_name.clone(),
+                                        gate:
+                                            crate::core::events::ToolGate::AutoReviewDeterministic,
+                                        decision: crate::core::events::ToolGateVerdict::Denied,
+                                        risk: None,
+                                        reason: crate::core::events::bounded_gate_reason(&reason),
+                                    })
+                                    .await;
+                                blocked_error = Some(auto_review_block_tool_error(&reason));
+                            }
+                            AutoReviewPlanDecision::ConsultReviewer(held_reason) => {
+                                if let Err(error) = self
+                                    .consult_auto_review_guardian(
+                                        client,
+                                        &review_context,
+                                        &tool_input,
+                                        &held_reason,
+                                        &tool_id,
+                                        turn,
+                                    )
+                                    .await
+                                {
+                                    blocked_error = Some(error);
+                                } else if !hook_requires_approval && !approval_force_prompt {
+                                    approval_required = false;
+                                }
+                            }
                         }
                     }
                 }
@@ -3997,6 +3962,24 @@ impl Engine {
                     }
                     Ok(None) => {}
                     Err(error) => blocked_error = Some(error),
+                }
+            }
+
+            // Consent is an exact human decision, never a standing grant or
+            // autonomous approval. Keep existing hard blocks authoritative.
+            if blocked_error.is_none()
+                && crate::tools::approval_cache::computer_use_user_gate(&tool_name, &tool_input)
+                    .is_some()
+            {
+                if batch_approval_mode == ApprovalMode::Suggest {
+                    approval_required = true;
+                    approval_force_prompt = true;
+                } else {
+                    approval_required = false;
+                    approval_force_prompt = false;
+                    blocked_error = Some(ToolError::permission_denied(
+                        "Computer Use consent, scripting and registration require the user's exact approval in Ask posture.".to_string()
+                    ));
                 }
             }
 
@@ -4139,16 +4122,13 @@ impl Engine {
                 "read-only tools"
             };
             let _ = self
-                .tx_event
-                .send(Event::status(format!(
+                .send_event(Event::status(format!(
                     "Executing {parallel_tool_count} {tool_kind} in {} parallel chunk(s)",
                     parallel_chunks.len(),
                 )))
                 .await;
         } else if plan_count > 1 {
-            let _ = self
-                .tx_event
-                .send(Event::status(
+            let _ = self.send_event(Event::status(
                     "Executing tools sequentially (writes, approvals, or non-parallel tools detected)",
                 ))
                 .await;
@@ -4177,8 +4157,7 @@ impl Engine {
                             .to_string(),
                     ));
                     let _ = self
-                        .tx_event
-                        .send(Event::ToolCallComplete {
+                        .send_event(Event::ToolCallComplete {
                             model_call: plan.model_call.clone(),
                             id: plan.id.clone(),
                             name: plan.name.clone(),
@@ -4217,8 +4196,7 @@ impl Engine {
                     let terminal = ToolExecutionOutcome::cancelled(interrupted_tool_result());
                     let result = terminal.legacy_result();
                     let _ = self
-                        .tx_event
-                        .send(Event::ToolCallComplete {
+                        .send_event(Event::ToolCallComplete {
                             model_call: plan.model_call.clone(),
                             id: plan.id.clone(),
                             name: plan.name.clone(),
@@ -4263,8 +4241,7 @@ impl Engine {
                     if let Some(result) = plan.guard_result.clone() {
                         let result = Ok(result);
                         let _ = self
-                            .tx_event
-                            .send(Event::ToolCallComplete {
+                            .send_event(Event::ToolCallComplete {
                                 model_call: plan.model_call.clone(),
                                 id: plan.id.clone(),
                                 name: plan.name.clone(),
@@ -4286,8 +4263,7 @@ impl Engine {
                     }
                     if let Some(err) = plan.blocked_error.clone() {
                         let _ = self
-                            .tx_event
-                            .send(Event::ToolCallComplete {
+                            .send_event(Event::ToolCallComplete {
                                 id: plan.id.clone(),
                                 model_call: plan.model_call.clone(),
                                 name: plan.name.clone(),
@@ -4323,27 +4299,42 @@ impl Engine {
                     let cancel_token = self.cancel_token.clone();
 
                     tool_tasks.push(async move {
-                        let _shell_permit =
-                            if matches!(plan.name.as_str(), "bash" | "Bash" | "exec_shell") {
-                                shell_permits.acquire_owned().await.ok()
-                            } else {
-                                None
-                            };
-                        let result = Engine::execute_tool_with_lock(
-                            lock,
-                            plan.supports_parallel || plan.detached_start,
-                            plan.interactive,
-                            tx_event.clone(),
-                            Some(cancel_token),
-                            plan.name.clone(),
-                            Some(plan.id.clone()),
-                            plan.input.clone(),
-                            workspace,
-                            registry,
-                            mcp_pool,
-                            context_override,
-                        )
-                        .await;
+                        if cancel_token.is_cancelled() {
+                            return None;
+                        }
+                        // Only still-active execution is cancelled. A result
+                        // that completed in this poll owns its guarded output
+                        // projection and receipt, even when it cancelled the
+                        // turn itself. Keep projection in this same future so
+                        // sibling executions continue to be polled normally.
+                        let execute = async {
+                            let _shell_permit =
+                                if matches!(plan.name.as_str(), "bash" | "Bash" | "exec_shell") {
+                                    shell_permits.acquire_owned().await.ok()
+                                } else {
+                                    None
+                                };
+                            Engine::execute_tool_with_lock(
+                                lock,
+                                plan.supports_parallel || plan.detached_start,
+                                plan.interactive,
+                                tx_event.clone(),
+                                Some(cancel_token.clone()),
+                                plan.name.clone(),
+                                Some(plan.id.clone()),
+                                plan.input.clone(),
+                                workspace,
+                                registry,
+                                mcp_pool,
+                                context_override,
+                            )
+                            .await
+                        };
+                        let result = tokio::select! {
+                            biased;
+                            result = execute => result,
+                            () = cancel_token.cancelled() => return None,
+                        };
 
                         let original_content_digest = result
                             .as_ref()
@@ -4383,16 +4374,22 @@ impl Engine {
                             .map(|result| result.content_blocks.clone())
                             .unwrap_or_default();
                         let legacy_result = result.map(RichToolResult::into_result);
-                        let _ = tx_event
-                            .send(Event::ToolCallComplete {
+                        if let Ok(permit) = super::streaming::reserve_event_capacity(
+                            &tx_event,
+                            Some(&cancel_token),
+                            super::streaming::EventReservationPolicy::Receipt,
+                        )
+                        .await
+                        {
+                            permit.send(Event::ToolCallComplete {
                                 model_call: plan.model_call.clone(),
                                 id: plan.id.clone(),
                                 name: plan.name.clone(),
                                 result: legacy_result.clone(),
-                            })
-                            .await;
+                            });
+                        }
 
-                        ToolExecOutcome {
+                        Some(ToolExecOutcome {
                             model_call: plan.model_call.clone(),
                             index: plan.index,
                             id: plan.id,
@@ -4402,28 +4399,22 @@ impl Engine {
                             terminal: ToolExecutionOutcome::from_legacy(legacy_result),
                             content_blocks,
                             original_content_digest,
-                        }
+                        })
                     });
                 }
 
                 let mut parallel_cancelled = false;
-                loop {
-                    tokio::select! {
-                        biased;
-                        () = self.cancel_token.cancelled() => {
-                            parallel_cancelled = true;
-                            break;
-                        }
-                        outcome = tool_tasks.next() => {
-                            let Some(outcome) = outcome else { break; };
-                            let index = outcome.index;
-                            outcomes[index] = Some(outcome);
-                        }
+                while let Some(outcome) = tool_tasks.next().await {
+                    if let Some(outcome) = outcome {
+                        let index = outcome.index;
+                        outcomes[index] = Some(outcome);
+                    } else {
+                        parallel_cancelled = true;
                     }
                 }
-                // Dropping FuturesUnordered drops every still-active tool
-                // future (including MCP transport calls) instead of merely
-                // waiting for cooperative cancellation inside each tool.
+                // Each task drops its still-active execution on cancellation;
+                // completed results finish guarded projection in the same
+                // FuturesUnordered authority before cancelled fallbacks settle.
                 drop(tool_tasks);
                 if parallel_cancelled {
                     for (index, model_call, id, name, input) in parallel_plan_receipts {
@@ -4435,8 +4426,7 @@ impl Engine {
                         );
                         let result = terminal.legacy_result();
                         let _ = self
-                            .tx_event
-                            .send(Event::ToolCallComplete {
+                            .send_event(Event::ToolCallComplete {
                                 model_call: model_call.clone(),
                                 id: id.clone(),
                                 name: name.clone(),
@@ -4466,8 +4456,7 @@ impl Engine {
                     if let Some(result) = plan.guard_result.clone() {
                         let result = Ok(result);
                         let _ = self
-                            .tx_event
-                            .send(Event::ToolCallComplete {
+                            .send_event(Event::ToolCallComplete {
                                 model_call: plan.model_call.clone(),
                                 id: tool_id.clone(),
                                 name: tool_name.clone(),
@@ -4491,8 +4480,7 @@ impl Engine {
                     if let Some(err) = plan.blocked_error.clone() {
                         let result = Err(err);
                         let _ = self
-                            .tx_event
-                            .send(Event::ToolCallComplete {
+                            .send_event(Event::ToolCallComplete {
                                 model_call: plan.model_call.clone(),
                                 id: tool_id.clone(),
                                 name: tool_name.clone(),
@@ -4508,66 +4496,6 @@ impl Engine {
                             started_at: Instant::now(),
                             terminal: ToolExecutionOutcome::from_legacy(result),
                             content_blocks: Vec::new(),
-                            original_content_digest: None,
-                        });
-                        continue;
-                    }
-
-                    if tool_name == MULTI_TOOL_PARALLEL_NAME {
-                        let started_at = Instant::now();
-                        let cancel_token = self.cancel_token.clone();
-                        let (terminal, content_blocks) = tokio::select! {
-                            biased;
-                            () = cancel_token.cancelled() => {
-                                (
-                                    ToolExecutionOutcome::cancelled(interrupted_active_tool_result()),
-                                    Vec::new(),
-                                )
-                            },
-                            result = self.execute_parallel_tool(
-                                tool_input.clone(),
-                                tool_registry,
-                                tool_exec_lock.clone(),
-                                tool_context_for_call(batch_tool_context.clone(), &tool_id),
-                            ) => match result {
-                                Ok(rich) => {
-                                    let rich = super::tool_media::project(rich, &self.session.id, &tool_id, &tool_name).await;
-                                    (ToolExecutionOutcome::from_legacy(Ok(rich.result)), rich.content_blocks)
-                                },
-                                Err(err) => (
-                                    ToolExecutionOutcome::from_legacy(Err(err)),
-                                    Vec::new(),
-                                ),
-                            },
-                        };
-                        let terminal = if terminal.status == ToolTerminalStatus::Cancelled {
-                            ToolExecutionOutcome::cancelled(
-                                self.cancelled_active_tool_result(&tool_id, origin_turn_id),
-                            )
-                        } else {
-                            terminal
-                        };
-                        let result = terminal.legacy_result();
-
-                        let _ = self
-                            .tx_event
-                            .send(Event::ToolCallComplete {
-                                model_call: plan.model_call.clone(),
-                                id: tool_id.clone(),
-                                name: tool_name.clone(),
-                                result: result.clone(),
-                            })
-                            .await;
-
-                        outcomes[plan.index] = Some(ToolExecOutcome {
-                            model_call: plan.model_call.clone(),
-                            index: plan.index,
-                            id: tool_id,
-                            name: tool_name,
-                            input: tool_input,
-                            started_at,
-                            terminal,
-                            content_blocks,
                             original_content_digest: None,
                         });
                         continue;
@@ -4593,8 +4521,7 @@ impl Engine {
                         }
 
                         let _ = self
-                            .tx_event
-                            .send(Event::ToolCallComplete {
+                            .send_event(Event::ToolCallComplete {
                                 model_call: plan.model_call.clone(),
                                 id: tool_id.clone(),
                                 name: tool_name.clone(),
@@ -4632,8 +4559,7 @@ impl Engine {
                         };
 
                         let _ = self
-                            .tx_event
-                            .send(Event::ToolCallComplete {
+                            .send_event(Event::ToolCallComplete {
                                 model_call: plan.model_call.clone(),
                                 id: tool_id.clone(),
                                 name: tool_name.clone(),
@@ -4697,7 +4623,7 @@ impl Engine {
                             .request_tool_approval(&tool_id, &tool_name, approval_event)
                             .await
                         {
-                            Ok(ApprovalResult::Approved) => {
+                            Ok(ApprovalResult::Approved(by)) => {
                                 let decision = if model_requested_policy.is_some() {
                                     "approved_with_requested_policy"
                                 } else {
@@ -4722,6 +4648,31 @@ impl Engine {
                                         None,
                                         elevated_context,
                                         Some(ToolApprovalStamp::ApprovedWithPolicy),
+                                    )
+                                } else if by == crate::approval_log::ApprovalDecider::User
+                                    && plan.approval_force_prompt
+                                    && crate::tools::approval_cache::computer_use_user_gate(
+                                        &tool_name,
+                                        &tool_input,
+                                    )
+                                    .is_some()
+                                {
+                                    // The person just approved this exact
+                                    // Computer Use call on its card: that
+                                    // decision travels with the call.
+                                    let decided_context =
+                                        batch_tool_context.clone().map(|context| {
+                                            context.with_human_decision(
+                                                super::approval::HumanDecision::from_card_allow(
+                                                    &tool_name,
+                                                    &tool_input,
+                                                ),
+                                            )
+                                        });
+                                    (
+                                        None,
+                                        decided_context,
+                                        Some(ToolApprovalStamp::ApprovedByUser),
                                     )
                                 } else {
                                     (None, None, Some(ToolApprovalStamp::ApprovedByUser))
@@ -4877,16 +4828,24 @@ impl Engine {
                     let call_context = tool_context_for_call(
                         context_override.or_else(|| batch_tool_context.clone()),
                         &tool_id,
-                    );
+                    )
+                    .map(|mut context| {
+                        // The batch may have waited for a person. Rebase the
+                        // absolute deadline from the same paused Engine clock.
+                        context.turn_deadline = self.nested_work_deadline();
+                        context
+                    });
                     let (mut result, cancelled_before_completion) = if let Some(result_override) =
                         result_override
                     {
                         (result_override.map(RichToolResult::plain), false)
-                    } else if tool_name == EXECUTE_TOOLS_TOOL_NAME
+                    } else if (tool_name == EXECUTE_TOOLS_TOOL_NAME
+                        || tool_name == crate::tools::rlm::RLM_TOOL_NAME)
                         && let Some(context) = call_context.clone()
                     {
                         self.execute_tools_with_nested_gate(
                             nested_gate_env,
+                            &tool_name,
                             &tool_id,
                             tool_input.clone(),
                             tool_exec_lock.clone(),
@@ -4990,8 +4949,7 @@ impl Engine {
                         .unwrap_or_default();
                     let legacy_result = result.map(RichToolResult::into_result);
                     let _ = self
-                        .tx_event
-                        .send(Event::ToolCallComplete {
+                        .send_event(Event::ToolCallComplete {
                             model_call: plan.model_call.clone(),
                             id: tool_id.clone(),
                             name: tool_name.clone(),
@@ -5023,7 +4981,9 @@ impl Engine {
         (outcomes, authority_changed)
     }
 
-    /// Run one `execute_tools` call while serving its nested-call gate.
+    /// Run one `execute_tools` (or `rlm`) call while serving its nested-call
+    /// gate. An `rlm` call's nested requests are the code rounds of its
+    /// recursive sub-turns, decided by [`Self::gate_rlm_round`].
     ///
     /// The program runs on the ordinary executor; each nested call it makes
     /// arrives here and is planned by `plan_tool_calls` (source: code mode)
@@ -5034,6 +4994,7 @@ impl Engine {
     async fn execute_tools_with_nested_gate(
         &mut self,
         nested_gate_env: &mut NestedGateEnv<'_>,
+        tool_name: &str,
         tool_id: &str,
         tool_input: serde_json::Value,
         tool_exec_lock: Arc<RwLock<()>>,
@@ -5057,7 +5018,7 @@ impl Engine {
             false,
             self.tx_event.clone(),
             Some(cancel.clone()),
-            EXECUTE_TOOLS_TOOL_NAME.to_string(),
+            tool_name.to_string(),
             Some(tool_id.to_string()),
             tool_input,
             self.session.workspace.clone(),
@@ -5076,8 +5037,8 @@ impl Engine {
                 result = &mut run => return (result, false),
                 Some(request) = requests.recv() => {
                     seq += 1;
-                    let verdict = self
-                        .gate_nested_call(
+                    let verdict = if tool_name == crate::tools::rlm::RLM_TOOL_NAME {
+                        self.gate_rlm_round(
                             nested_gate_env,
                             tool_id,
                             seq,
@@ -5088,7 +5049,21 @@ impl Engine {
                             tool_registry,
                             mode,
                         )
-                        .await;
+                        .await
+                    } else {
+                        self.gate_nested_call(
+                            nested_gate_env,
+                            tool_id,
+                            seq,
+                            request.name,
+                            request.input,
+                            tool_catalog,
+                            active_tool_names,
+                            tool_registry,
+                            mode,
+                        )
+                        .await
+                    };
                     let _ = request.reply.send(verdict);
                 }
             }
@@ -5103,6 +5078,83 @@ impl Engine {
             .budget()
             .saturating_sub(self.turn_wall_clock.spent())
             .max(Duration::from_secs(1))
+    }
+
+    /// Decide one code round of an `rlm` call's recursive sub-turn. The round
+    /// is model-written Python, so it is admitted exactly like an inline
+    /// ```repl block carrying the same code; the admitted input is returned
+    /// unchanged and the sub-turn runs nothing else.
+    #[allow(clippy::too_many_arguments)]
+    async fn gate_rlm_round(
+        &mut self,
+        nested_gate_env: &mut NestedGateEnv<'_>,
+        parent_id: &str,
+        seq: usize,
+        name: String,
+        input: serde_json::Value,
+        tool_catalog: &[codewhale_models::Tool],
+        active_tool_names: &mut std::collections::HashSet<String>,
+        tool_registry: Option<&crate::tools::ToolRegistry>,
+        mode: AppMode,
+    ) -> crate::tools::codemode::NestedCallVerdict {
+        use crate::tools::codemode::{NestedCallVerdict, NestedDecision};
+        let refused = |reason: String| NestedCallVerdict::Refused {
+            error: ToolError::permission_denied(reason),
+            decision: NestedDecision::Refused,
+        };
+
+        // Same rule as a nested program call: once the posture the `rlm`
+        // call started under has changed, no later round runs on it.
+        if !nested_gate_env.authority_changed && self.apply_pending_runtime_authority().await {
+            nested_gate_env.authority_changed = true;
+        }
+        if nested_gate_env.authority_changed {
+            return refused(
+                "permissions changed while this rlm call was running; retry it with the current permissions".to_string(),
+            );
+        }
+        let code = match input.get("code").and_then(Value::as_str) {
+            Some(code) if name == super::tool_catalog::CODE_EXECUTION_TOOL_NAME => code.to_string(),
+            _ => return refused("an rlm call may only ask to run a code round".to_string()),
+        };
+        if !code_execution_offered(mode, tool_catalog, nested_gate_env.tool_policy) {
+            return refused("code execution is not available on this turn".to_string());
+        }
+        let block = crate::repl::ReplBlock {
+            code,
+            start_offset: 0,
+            end_offset: 0,
+        };
+        let posture_before = self.applied_runtime_authority();
+        let reason = self
+            .repl_fence_blocked_reason(
+                std::slice::from_ref(&block),
+                "a recursive RLM round's Python in a child kernel",
+                &format!("{parent_id}.{seq}"),
+                nested_gate_env.client,
+                nested_gate_env.turn,
+                nested_gate_env.tool_policy,
+                tool_catalog,
+                tool_registry,
+                active_tool_names,
+                nested_gate_env.tool_call_budget,
+                mode,
+                nested_gate_env.fleet_denial_guard,
+            )
+            .await;
+        if self.applied_runtime_authority() != posture_before {
+            nested_gate_env.authority_changed = true;
+        }
+        match reason {
+            Some(reason) => refused(reason),
+            None => NestedCallVerdict::Run {
+                name,
+                input,
+                supports_parallel: false,
+                decision: NestedDecision::Auto,
+                hook_context: None,
+            },
+        }
     }
 
     /// Decide one nested `execute_tools` call through the direct-call gate.
@@ -5228,7 +5280,7 @@ impl Engine {
                 .request_tool_approval(&nested_id, &plan.name, approval_event)
                 .await;
             let (decision, refusal) = match answer {
-                Ok(ApprovalResult::Approved) => (NestedDecision::Approved, None),
+                Ok(ApprovalResult::Approved(_)) => (NestedDecision::Approved, None),
                 Ok(ApprovalResult::Denied) => (
                     NestedDecision::Denied,
                     Some(ToolError::permission_denied(format!(
@@ -5445,8 +5497,7 @@ impl Engine {
                     };
                     if usage_has_reported_data(&routed_usage) {
                         let _ = self
-                            .tx_event
-                            .send(Event::RoutedTurnUsage {
+                            .send_event(Event::RoutedTurnUsage {
                                 usage: routed_usage,
                                 duration_ms: routed_duration_ms,
                                 first_token_ms: None,
@@ -5499,7 +5550,7 @@ impl Engine {
                             self.current_mode,
                             &self.config.tools_always_load,
                             surface_budget,
-                        ) > 0;
+                        );
                     }
                     // Any of the legitimate mid-turn tool-surface changes above
                     // re-pin the header under a declared `change:tool_surface`
@@ -5768,7 +5819,7 @@ impl Engine {
                             // of ending "Completed" over a frozen block.
                             stream_errors = stream_errors.saturating_add(1);
                             stream_error.get_or_insert(envelope.message.clone());
-                            let _ = self.tx_event.send(Event::error(envelope)).await;
+                            let _ = self.send_stream_event(Event::error(envelope)).await;
                             None
                         }
                     }
@@ -5785,8 +5836,7 @@ impl Engine {
                 let preview = summarize_text(pending.content.trim(), 120);
                 pending_steers.push(pending);
                 let _ = self
-                    .tx_event
-                    .send(Event::status(format!("Steer input queued: {preview}")))
+                    .send_stream_event(Event::status(format!("Steer input queued: {preview}")))
                     .await;
             }
 
@@ -5802,19 +5852,7 @@ impl Engine {
                 .into_envelope();
                 crate::logging::warn(&envelope.message);
                 stream_error.get_or_insert(envelope.message.clone());
-                let _ = self.tx_event.send(Event::error(envelope)).await;
-                break;
-            }
-
-            // Guard: max accumulated content bytes
-            if stream_content_bytes > max_content_bytes {
-                let envelope = StreamError::Overflow {
-                    limit_bytes: max_content_bytes,
-                }
-                .into_envelope();
-                crate::logging::warn(&envelope.message);
-                stream_error.get_or_insert(envelope.message.clone());
-                let _ = self.tx_event.send(Event::error(envelope)).await;
+                let _ = self.send_stream_event(Event::error(envelope)).await;
                 break;
             }
 
@@ -5860,6 +5898,15 @@ impl Engine {
                             "Stream error after suspected system sleep ({:?} monotonic vs {:?} wall since last chunk); scheduling request retry: {message}",
                             last_progress_mono.elapsed(),
                             wall_elapsed,
+                        ));
+                        // Like the network-drop resumes below, keep the real
+                        // error as the prospective outcome: the retry clears
+                        // it, and an exhausted resume budget then fails the
+                        // turn with it instead of admitting the partial
+                        // response as if it had completed.
+                        stream_error.get_or_insert(stream_read_error_user_message(
+                            &message,
+                            any_content_received,
                         ));
                         pending_resume = Some(StreamResume::AfterSleep);
                         break;
@@ -5909,8 +5956,7 @@ impl Engine {
                                 ));
                                 stream_error.get_or_insert(retry_msg.clone());
                                 let _ = self
-                                    .tx_event
-                                    .send(Event::error(
+                                    .send_stream_event(Event::error(
                                         crate::error_taxonomy::envelope_for_llm_error(
                                             retry_err, retry_msg,
                                         ),
@@ -5998,13 +6044,46 @@ impl Engine {
                     // card. Recoverable classes (rate limit, network) keep
                     // the bounded retry tail.
                     let terminal = !envelope.recoverable;
-                    let _ = self.tx_event.send(Event::error(envelope)).await;
+                    let _ = self.send_stream_event(Event::error(envelope)).await;
                     if terminal || stream_errors >= retry_limits.max_errors {
                         break;
                     }
                     continue;
                 }
             };
+
+            // Guard: max accumulated content bytes (C02-13). Counted per
+            // event and checked before the event is applied, so the delta
+            // that crosses the cap is never forwarded or accumulated — even
+            // when it is the stream's last — and tool-argument JSON counts
+            // like text and reasoning.
+            stream_content_bytes =
+                stream_content_bytes.saturating_add(stream_event_content_bytes(&event));
+            if stream_content_bytes > max_content_bytes {
+                let envelope = StreamError::Overflow {
+                    limit_bytes: max_content_bytes,
+                }
+                .into_envelope();
+                crate::logging::warn(&envelope.message);
+                stream_error.get_or_insert(envelope.message.clone());
+                let _ = self.send_stream_event(Event::error(envelope)).await;
+                break;
+            }
+
+            if matches!(
+                &event,
+                StreamEvent::ContentBlockStart {
+                    content_block: ContentBlockStart::ToolUse { .. }
+                        | ContentBlockStart::ServerToolUse { .. },
+                    ..
+                }
+            ) && tool_uses.len() >= super::streaming::MAX_TOOL_CALLS_PER_RESPONSE
+            {
+                let envelope = super::streaming::tool_call_limit_error();
+                stream_error.get_or_insert(envelope.message.clone());
+                let _ = self.send_stream_event(Event::error(envelope)).await;
+                break;
+            }
 
             match event {
                 StreamEvent::ToolProjectionWarning {
@@ -6013,8 +6092,7 @@ impl Engine {
                     omitted_tool_count,
                 } => {
                     let _ = self
-                        .tx_event
-                        .send(Event::ToolProjectionWarning {
+                        .send_stream_event(Event::ToolProjectionWarning {
                             provider,
                             omitted_tool_names,
                             omitted_tool_count,
@@ -6044,15 +6122,16 @@ impl Engine {
                             && filtered.len() < current_text_raw.len()
                             && contains_fake_tool_wrapper(&current_text_raw)
                         {
-                            let _ = self.tx_event.send(Event::status(FAKE_WRAPPER_NOTICE)).await;
+                            let _ = self
+                                .send_stream_event(Event::status(FAKE_WRAPPER_NOTICE))
+                                .await;
                             fake_wrapper_notice_emitted = true;
                         }
                         current_text_visible.push_str(&filtered);
                         current_block_kind = Some(ContentBlockKind::Text);
                         last_text_index = Some(index as usize);
                         let _ = self
-                            .tx_event
-                            .send(Event::MessageStarted {
+                            .send_stream_event(Event::MessageStarted {
                                 index: index as usize,
                             })
                             .await;
@@ -6063,8 +6142,7 @@ impl Engine {
                         current_thinking_state = None;
                         current_block_kind = Some(ContentBlockKind::Thinking);
                         let _ = self
-                            .tx_event
-                            .send(Event::ThinkingStarted {
+                            .send_stream_event(Event::ThinkingStarted {
                                 index: index as usize,
                             })
                             .await;
@@ -6116,7 +6194,6 @@ impl Engine {
                 },
                 StreamEvent::ContentBlockDelta { index, delta } => match delta {
                     Delta::TextDelta { text } => {
-                        stream_content_bytes = stream_content_bytes.saturating_add(text.len());
                         current_text_raw.push_str(&text);
                         let filtered =
                             filter_tool_call_delta_with_state(&text, &mut tool_call_filter);
@@ -6124,14 +6201,15 @@ impl Engine {
                             && filtered.len() < text.len()
                             && contains_fake_tool_wrapper(&current_text_raw)
                         {
-                            let _ = self.tx_event.send(Event::status(FAKE_WRAPPER_NOTICE)).await;
+                            let _ = self
+                                .send_stream_event(Event::status(FAKE_WRAPPER_NOTICE))
+                                .await;
                             fake_wrapper_notice_emitted = true;
                         }
                         if !filtered.is_empty() {
                             current_text_visible.push_str(&filtered);
                             let _ = self
-                                .tx_event
-                                .send(Event::MessageDelta {
+                                .send_stream_event(Event::MessageDelta {
                                     index: index as usize,
                                     content: filtered,
                                 })
@@ -6139,12 +6217,10 @@ impl Engine {
                         }
                     }
                     Delta::ThinkingDelta { thinking } => {
-                        stream_content_bytes = stream_content_bytes.saturating_add(thinking.len());
                         current_thinking.push_str(&thinking);
                         if !thinking.is_empty() {
                             let _ = self
-                                .tx_event
-                                .send(Event::ThinkingDelta {
+                                .send_stream_event(Event::ThinkingDelta {
                                     index: index as usize,
                                     content: thinking,
                                 })
@@ -6195,8 +6271,7 @@ impl Engine {
                             if !flushed.is_empty() {
                                 current_text_visible.push_str(&flushed);
                                 let _ = self
-                                    .tx_event
-                                    .send(Event::MessageDelta {
+                                    .send_stream_event(Event::MessageDelta {
                                         index: index as usize,
                                         content: flushed,
                                     })
@@ -6207,8 +6282,7 @@ impl Engine {
                         }
                         Some(ContentBlockKind::Thinking) => {
                             let _ = self
-                                .tx_event
-                                .send(Event::ThinkingComplete {
+                                .send_stream_event(Event::ThinkingComplete {
                                     index: index as usize,
                                 })
                                 .await;
@@ -6261,9 +6335,28 @@ impl Engine {
                         .get("message")
                         .and_then(Value::as_str)
                         .unwrap_or("provider stream error");
-                    let envelope = ErrorEnvelope::classify(message.to_string(), true);
                     crate::logging::warn(format!("Provider stream error event: {message}"));
-                    let _ = self.tx_event.send(Event::error(envelope)).await;
+                    // #6795: a gateway can report a transient upstream failure
+                    // as an error frame inside a 200. With nothing actionable
+                    // streamed that is a no-content stream death like a
+                    // transport error or a stall: count it so the existing
+                    // retry budget re-issues the request, and keep it as the
+                    // prospective outcome so an exhausted budget fails the
+                    // turn with the provider's reason. No error event yet: a
+                    // retry that succeeds must not leave a terminal-looking
+                    // card behind. Auth, invalid-model and every other class
+                    // stays terminal on the first frame, as does any frame
+                    // after content (replaying would duplicate side effects).
+                    let transient = matches!(
+                        crate::error_taxonomy::classify_error_message(message),
+                        ErrorCategory::Network | ErrorCategory::Timeout
+                    );
+                    if transient && !any_content_received {
+                        stream_errors = stream_errors.saturating_add(1);
+                    } else {
+                        let envelope = ErrorEnvelope::classify(message.to_string(), false);
+                        let _ = self.send_stream_event(Event::error(envelope)).await;
+                    }
                     stream_error.get_or_insert(message.to_string());
                     break;
                 }
@@ -6304,6 +6397,30 @@ impl Engine {
         }
     }
 
+    /// Announce every call of a response that will not be admitted, each
+    /// paired with its not-executed `result`, so a host never shows a started
+    /// call without a completion. Nothing here plans, approves or executes.
+    async fn settle_unadmitted_tool_calls(&self, tool_uses: &[ToolUseState], result: &ToolResult) {
+        for tool in tool_uses {
+            let _ = self
+                .send_event(Event::ToolCallStarted {
+                    id: tool.execution_id.clone(),
+                    model_call: Some(tool.model_call()),
+                    name: tool.name.clone(),
+                    input: final_tool_input(tool),
+                })
+                .await;
+            let _ = self
+                .send_event(Event::ToolCallComplete {
+                    id: tool.execution_id.clone(),
+                    model_call: Some(tool.model_call()),
+                    name: tool.name.clone(),
+                    result: Ok(result.clone()),
+                })
+                .await;
+        }
+    }
+
     /// Finalize one streamed tool call's input from its accumulated buffer.
     ///
     /// The parse that lands here must be structurally intact: a value that
@@ -6341,8 +6458,7 @@ impl Engine {
         tool_state.input_parse_error = Some(error);
         tool_state.input = malformed_tool_arguments_input(&tool_state.input_buffer);
         let _ = self
-            .tx_event
-            .send(Event::status(format!(
+            .send_stream_event(Event::status(format!(
                 "⚠ Tool '{}' received malformed arguments from model",
                 tool_state.name
             )))
@@ -6396,7 +6512,7 @@ impl Engine {
         );
         if let crate::goal_loop::ContinuationDecision::Stop(reason) = decision {
             let message = format!("Goal continuation stopped: {reason:?}.");
-            let _ = self.tx_event.send(Event::status(message)).await;
+            let _ = self.send_event(Event::status(message)).await;
             return None;
         }
         Some(snapshot)
@@ -6435,8 +6551,7 @@ impl Engine {
         let was_delayed = wait.is_some();
         if let Some(wait) = wait {
             let _ = self
-                .tx_event
-                .send(Event::GoalContinuationWaiting {
+                .send_event(Event::GoalContinuationWaiting {
                     delay_seconds: wait.as_secs(),
                 })
                 .await;
@@ -6445,15 +6560,13 @@ impl Engine {
             == crate::goal_loop::ContinuationWaitOutcome::Cancelled
         {
             let _ = self
-                .tx_event
-                .send(Event::GoalContinuationWaitEnded { interrupted: true })
+                .send_event(Event::GoalContinuationWaitEnded { interrupted: true })
                 .await;
             return None;
         }
         if was_delayed {
             let _ = self
-                .tx_event
-                .send(Event::GoalContinuationWaitEnded { interrupted: false })
+                .send_event(Event::GoalContinuationWaitEnded { interrupted: false })
                 .await;
         }
 
@@ -6481,14 +6594,12 @@ impl Engine {
             }
         }
         let _ = self
-            .tx_event
-            .send(Event::GoalUpdated {
+            .send_event(Event::GoalUpdated {
                 snapshot: snapshot.clone(),
             })
             .await;
         let _ = self
-            .tx_event
-            .send(Event::status(format!(
+            .send_event(Event::status(format!(
                 "Continuing active goal (pass {} this turn, {} total)",
                 *continuations_this_turn, snapshot.continuation_count
             )))
@@ -7414,6 +7525,37 @@ fn stream_event_has_actionable_content(event: &StreamEvent) -> bool {
     }
 }
 
+/// Bytes an event adds to the response the engine accumulates: text,
+/// reasoning, tool calls (id, name and argument JSON, whether the arguments
+/// arrive whole in the block start or as `InputJsonDelta`s) and replay
+/// signatures. Opaque reasoning state is provider-owned and not counted.
+fn stream_event_content_bytes(event: &StreamEvent) -> usize {
+    fn initial_input_bytes(input: &Value) -> usize {
+        let empty = input.is_null() || input.as_object().is_some_and(serde_json::Map::is_empty);
+        if empty { 0 } else { input.to_string().len() }
+    }
+    match event {
+        StreamEvent::ContentBlockStart { content_block, .. } => match content_block {
+            ContentBlockStart::Text { text } => text.len(),
+            ContentBlockStart::Thinking { thinking } => thinking.len(),
+            ContentBlockStart::ToolUse {
+                id, name, input, ..
+            }
+            | ContentBlockStart::ServerToolUse { id, name, input } => {
+                id.len() + name.len() + initial_input_bytes(input)
+            }
+        },
+        StreamEvent::ContentBlockDelta { delta, .. } => match delta {
+            Delta::TextDelta { text } => text.len(),
+            Delta::ThinkingDelta { thinking } => thinking.len(),
+            Delta::InputJsonDelta { partial_json } => partial_json.len(),
+            Delta::SignatureDelta { signature } => signature.len(),
+            Delta::ReasoningStateDelta { .. } => 0,
+        },
+        _ => 0,
+    }
+}
+
 /// Sentinel reasoning-effort value meaning "let the auto-reasoning system
 /// decide" (#4158).
 pub(super) const REASONING_EFFORT_AUTO: &str = "auto";
@@ -7466,6 +7608,389 @@ mod tests {
     use std::path::PathBuf;
     use std::time::Duration;
     use tempfile::tempdir;
+
+    fn stream_backpressure_fixture(
+        workspace: &std::path::Path,
+        capacity: usize,
+    ) -> (
+        Engine,
+        Arc<crate::llm_client::mock::MockLlmClient>,
+        mpsc::Receiver<Event>,
+    ) {
+        let model = Arc::new(crate::llm_client::mock::MockLlmClient::new(Vec::new()));
+        let (mut engine, _handle) = Engine::new_with_model_client(
+            EngineConfig {
+                workspace: workspace.into(),
+                snapshots_enabled: false,
+                subagents_enabled: false,
+                terminal_chrome_enabled: false,
+                ..Default::default()
+            },
+            &Config::default(),
+            model.clone(),
+        );
+        let (tx, rx) = mpsc::channel(capacity);
+        engine.tx_event = tx;
+        (engine, model, rx)
+    }
+
+    fn stream_backpressure_request() -> codewhale_models::MessageRequest {
+        prepare_primary_turn_request(PrimaryTurnRequest {
+            model: "mock-model".into(),
+            messages: Vec::new(),
+            max_tokens: 128,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            reasoning_effort: None,
+        })
+    }
+
+    /// Hold the actual stream decoder in a full host queue, then cancel
+    /// without draining that queue. The provider suffix must never be polled.
+    #[tokio::test]
+    async fn stream_backpressure_cancellation_releases_every_observation_kind() {
+        use crate::llm_client::mock::canned;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        struct StreamDrop(Arc<AtomicBool>);
+        impl Drop for StreamDrop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let thinking_start = StreamEvent::ContentBlockStart {
+            index: 0,
+            content_block: ContentBlockStart::Thinking {
+                thinking: String::new(),
+            },
+        };
+        let cases = [
+            ("text start", vec![canned::text_block_start(0)], 0),
+            ("text delta", vec![canned::text_delta(0, "partial")], 0),
+            ("thinking start", vec![thinking_start.clone()], 0),
+            (
+                "thinking delta",
+                vec![canned::thinking_delta(0, "partial")],
+                0,
+            ),
+            (
+                "thinking stop",
+                vec![thinking_start, canned::block_stop(0)],
+                1,
+            ),
+            (
+                "projection warning",
+                vec![StreamEvent::ToolProjectionWarning {
+                    provider: "mock".into(),
+                    omitted_tool_names: vec!["omitted".into()],
+                    omitted_tool_count: 1,
+                }],
+                0,
+            ),
+            (
+                "provider error",
+                vec![StreamEvent::Error {
+                    error: json!({"message": "invalid provider request"}),
+                }],
+                0,
+            ),
+            (
+                "malformed tool arguments",
+                vec![
+                    canned::tool_use_block_start(0, "call_1", "read_file"),
+                    canned::tool_input_delta(0, "not-json"),
+                    canned::block_stop(0),
+                ],
+                0,
+            ),
+        ];
+
+        for (label, events, observations_before_block) in cases {
+            let tmp = tempdir().expect("tempdir");
+            let (mut engine, model, mut rx) =
+                stream_backpressure_fixture(tmp.path(), observations_before_block + 1);
+            engine
+                .tx_event
+                .send(Event::status("queue already occupied"))
+                .await
+                .unwrap();
+            let cancel = engine.cancel_token.clone();
+            let mut start = canned::message_start("backpressure");
+            if let StreamEvent::MessageStart { message } = &mut start {
+                message.usage.input_tokens = 17;
+            }
+            let expected_polls = events.len() + 1;
+            let polls = Arc::new(AtomicUsize::new(0));
+            let counted = Arc::clone(&polls);
+            let dropped = Arc::new(AtomicBool::new(false));
+            let drop_probe = StreamDrop(Arc::clone(&dropped));
+            let stream = futures_util::stream::iter(
+                std::iter::once(start)
+                    .chain(events)
+                    .chain(std::iter::once(canned::text_delta(0, "UNREAD-SUFFIX")))
+                    .map(Ok),
+            )
+            .inspect(move |_| {
+                let _ = &drop_probe;
+                counted.fetch_add(1, Ordering::SeqCst);
+            });
+            let request = stream_backpressure_request();
+            let mut diagnostics = crate::tool_inspection::TurnStopDiagnostics::default();
+            let mut process = Box::pin(engine.process_stream(
+                model.as_ref(),
+                Box::pin(stream),
+                &request,
+                Instant::now(),
+                0,
+                &mut diagnostics,
+            ));
+            assert!(
+                tokio::time::timeout(Duration::from_millis(25), &mut process)
+                    .await
+                    .is_err(),
+                "{label}: a live turn must wait for capacity"
+            );
+            assert_eq!(polls.load(Ordering::SeqCst), expected_polls, "{label}");
+            assert!(
+                !dropped.load(Ordering::SeqCst),
+                "{label}: stream is in flight"
+            );
+            cancel.cancel();
+            let outcome = tokio::time::timeout(Duration::from_secs(1), &mut process)
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("{label}: cancellation must release a full event queue")
+                });
+            drop(process);
+            assert!(
+                dropped.load(Ordering::SeqCst),
+                "{label}: provider stream released"
+            );
+            assert_eq!(
+                polls.load(Ordering::SeqCst),
+                expected_polls,
+                "{label}: suffix unread"
+            );
+            assert_eq!(
+                outcome.usage.input_tokens, 17,
+                "{label}: billed usage retained"
+            );
+            assert!(
+                outcome.pending_resume.is_none(),
+                "{label}: cancellation cannot retry"
+            );
+            assert_eq!(model.call_count(), 0, "{label}: no provider retry");
+            assert_eq!(
+                rx.len(),
+                observations_before_block + 1,
+                "{label}: no drain was needed"
+            );
+            while let Ok(event) = rx.try_recv() {
+                assert!(
+                    !matches!(event, Event::MessageDelta { content, .. } if content == "UNREAD-SUFFIX")
+                );
+            }
+            if label == "malformed tool arguments" {
+                assert!(outcome.tool_uses[0].input_parse_error.is_some());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_backpressure_live_delivery_preserves_order_and_usage() {
+        use crate::llm_client::mock::canned;
+
+        let tmp = tempdir().expect("tempdir");
+        let (mut engine, model, mut rx) = stream_backpressure_fixture(tmp.path(), 1);
+        engine
+            .tx_event
+            .send(Event::status("occupied"))
+            .await
+            .unwrap();
+        let stream = futures_util::stream::iter([
+            Ok(canned::text_delta(0, "first")),
+            Ok(canned::text_delta(0, "second")),
+            Ok(canned::message_delta(
+                "end_turn",
+                Some(Usage {
+                    output_tokens: 9,
+                    ..Default::default()
+                }),
+            )),
+        ]);
+        let request = stream_backpressure_request();
+        let mut diagnostics = crate::tool_inspection::TurnStopDiagnostics::default();
+        let mut process = Box::pin(engine.process_stream(
+            model.as_ref(),
+            Box::pin(stream),
+            &request,
+            Instant::now(),
+            0,
+            &mut diagnostics,
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), &mut process)
+                .await
+                .is_err()
+        );
+        assert!(matches!(rx.recv().await, Some(Event::Status { .. })));
+        let drain = async {
+            let first = rx.recv().await.expect("first delta");
+            let second = rx.recv().await.expect("second delta");
+            [first, second]
+        };
+        let (outcome, events) = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(&mut process, drain)
+        })
+        .await
+        .expect("draining the queue must resume lossless delivery");
+        assert!(matches!(&events[0], Event::MessageDelta { content, .. } if content == "first"));
+        assert!(matches!(&events[1], Event::MessageDelta { content, .. } if content == "second"));
+        assert_eq!(outcome.current_text_visible, "firstsecond");
+        assert_eq!(outcome.usage.output_tokens, 9);
+        assert_eq!(outcome.stop_reason.as_deref(), Some("end_turn"));
+    }
+
+    #[tokio::test]
+    async fn stream_response_tool_limit_bounds_empty_native_and_server_calls() {
+        use crate::llm_client::mock::canned;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        for server_tool in [false, true] {
+            for count in [
+                super::super::streaming::MAX_TOOL_CALLS_PER_RESPONSE,
+                super::super::streaming::MAX_TOOL_CALLS_PER_RESPONSE + 1,
+            ] {
+                let tmp = tempdir().expect("tempdir");
+                let (mut engine, model, mut rx) = stream_backpressure_fixture(tmp.path(), 4);
+                let events = (0..count).map(move |index| StreamEvent::ContentBlockStart {
+                    index: u32::try_from(index).unwrap(),
+                    content_block: if server_tool {
+                        ContentBlockStart::ServerToolUse {
+                            id: format!("call_{index}"),
+                            name: "web_search".into(),
+                            input: json!({}),
+                        }
+                    } else {
+                        ContentBlockStart::ToolUse {
+                            id: format!("call_{index}"),
+                            name: "read_file".into(),
+                            input: json!({}),
+                            caller: None,
+                            thought_signature: None,
+                        }
+                    },
+                });
+                let polls = Arc::new(AtomicUsize::new(0));
+                let counted = Arc::clone(&polls);
+                let stream = futures_util::stream::iter(
+                    events
+                        .chain(std::iter::once(canned::text_delta(
+                            0,
+                            "SUFFIX-AFTER-TOOL-BATCH",
+                        )))
+                        .map(Ok),
+                )
+                .inspect(move |_| {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                });
+                let request = stream_backpressure_request();
+                let mut diagnostics = crate::tool_inspection::TurnStopDiagnostics::default();
+                let outcome = tokio::time::timeout(
+                    Duration::from_secs(1),
+                    engine.process_stream(
+                        model.as_ref(),
+                        Box::pin(stream),
+                        &request,
+                        Instant::now(),
+                        0,
+                        &mut diagnostics,
+                    ),
+                )
+                .await
+                .expect("empty tool starts must be bounded");
+                assert_eq!(
+                    outcome.tool_uses.len(),
+                    super::super::streaming::MAX_TOOL_CALLS_PER_RESPONSE
+                );
+                if count > super::super::streaming::MAX_TOOL_CALLS_PER_RESPONSE {
+                    assert!(
+                        outcome
+                            .stream_error
+                            .as_deref()
+                            .is_some_and(|error| error.contains("256 tool calls"))
+                    );
+                    assert_eq!(
+                        polls.load(Ordering::SeqCst),
+                        count,
+                        "overflow stops before the suffix"
+                    );
+                    assert!(
+                        matches!(rx.try_recv(), Ok(Event::Error { envelope, .. }) if envelope.code == "response_tool_call_limit" && !envelope.recoverable)
+                    );
+                    assert!(outcome.current_text_raw.is_empty());
+                } else {
+                    assert!(
+                        outcome.stream_error.is_none(),
+                        "exactly256 calls remain valid"
+                    );
+                    assert_eq!(polls.load(Ordering::SeqCst), count + 1);
+                }
+                while let Ok(event) = rx.try_recv() {
+                    assert!(
+                        !matches!(event, Event::ToolCallStarted { .. }),
+                        "decoding cannot observe/execute a rejected batch"
+                    );
+                }
+                assert_eq!(
+                    model.call_count(),
+                    0,
+                    "tool cardinality overflow cannot retry"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn rlm_tool_context_inherits_the_spent_parent_clock() {
+        let tmp = tempdir().unwrap();
+        let (mut engine, _handle) = Engine::new(
+            EngineConfig {
+                workspace: tmp.path().into(),
+                turn_wall_clock: Duration::from_secs(60),
+                ..Default::default()
+            },
+            &Config::default(),
+        );
+        let registry = crate::tools::ToolRegistryBuilder::new()
+            .build(crate::tools::ToolContext::new(tmp.path()));
+        engine
+            .turn_wall_clock
+            .rewind_for_test(Duration::from_secs(55));
+        let context = engine.live_tool_context(Some(&registry)).unwrap();
+        let remaining = context
+            .turn_deadline
+            .expect("inherited deadline")
+            .saturating_duration_since(tokio::time::Instant::now());
+        assert!(
+            remaining <= Duration::from_secs(5),
+            "spent time must not reset"
+        );
+        engine
+            .turn_wall_clock
+            .rewind_for_test(Duration::from_secs(10));
+        assert!(
+            engine
+                .live_tool_context(Some(&registry))
+                .unwrap()
+                .turn_deadline
+                .unwrap()
+                <= tokio::time::Instant::now(),
+            "an exhausted turn gets no new allowance"
+        );
+    }
 
     #[test]
     fn tool_context_for_call_preserves_turn_and_sets_call_origin() {

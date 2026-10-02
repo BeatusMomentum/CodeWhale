@@ -1,14 +1,14 @@
 # 沙箱威胁模型
 
 > 英文原文：[SANDBOX.md](../SANDBOX.md)。
-> 最后与英文同步日期（last synced with English revision）：2026-09-26。
+> 最后与英文同步日期（last synced with English revision）：2026-09-29。
 
 Codewhale 可以执行由模型提出的 shell 命令。审批策略、感知工作区的工具，
 以及操作系统层面的命令包装器，这三套是彼此独立的控制手段：一次审批不等于沙箱，
 选择 `workspace-write` 也不代表当前平台真的提供了可用的操作系统包装器。
 
 本文只描述已经接入命令执行路径的行为。至于执行到达这条边界之前会先经过哪些
-策略层，见 [Authorization order](../AUTHORIZATION_ORDER.md)。
+策略层，见 [授权顺序（Authorization order）](AUTHORIZATION_ORDER.md)。
 
 ## 平台概览
 
@@ -33,7 +33,7 @@ Seatbelt profile。
 这层 profile 可以提供：
 
 - 大范围的文件系统读取；
-- 写入受所选策略限制，范围包括工作区，以及受支持工具所需的特定的运行时/缓存路径；
+- 写入受所选策略限制，范围包括工作区，以及受支持工具所需的特定运行时/缓存路径；
 - 只有在策略允许时才放开网络访问。
 
 探测失败，或 `sandbox-exec` 不可用时，Codewhale 会报告未启用操作系统沙箱，
@@ -119,8 +119,8 @@ Windows 主机的权限和审批策略仍然适用，但它们不是 Codewhale �
 唯一的例外是启动姿态（posture）本身。当启动沙箱模式解析为
 `danger-full-access`（通过 `CODEWHALE_SANDBOX_MODE` 或配置文件里的
 `sandbox_mode` 键）时，Codewhale 会跳过 `PR_SET_NO_NEW_PRIVS`，好让
-`sudo`/`su`/setuid 辅助程序能在 agent shell 里照常工作（#5723）——
-"full access" 就是这个意思。任何更窄的启动姿态都会保留该标志作为纵深防御，
+`sudo`/`su`/setuid 辅助程序能在智能体的 shell 里照常工作（#5723）——
+Full Access（完全访问）指的就是这种姿态。任何更窄的启动姿态都会保留该标志作为纵深防御，
 而 `CODEWHALE_NO_NEW_PRIVS` 可以双向覆盖姿态（#5413）：假值一律跳过该标志，
 真值一律设置它。该标志对整个进程树都不可逆，所以只能在启动时决定；会话内单次调用升级沙箱，
 也无法解除它。

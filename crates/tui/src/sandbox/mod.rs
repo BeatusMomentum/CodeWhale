@@ -11,7 +11,9 @@
 //! - **macOS**: Uses Seatbelt (`sandbox-exec`) when the runtime probe succeeds
 //! - **Linux**: Uses bubblewrap only when the user opts in and `/usr/bin/bwrap`
 //!   is executable. The seccomp helper is not wired into child execution and
-//!   therefore is not advertised.
+//!   therefore is not advertised. The extension host is the exception to the
+//!   opt-in: it uses bubblewrap whenever a probe shows it works
+//!   (`extension_host::supervisor::plan_launch`).
 //! - **OpenHarmony**: No local Linux sandbox is advertised. Bubblewrap,
 //!   seccomp, and Linux `prctl` hardening are gated out under `target_env =
 //!   "ohos"`.
@@ -112,13 +114,11 @@ impl CommandSpec {
         #[cfg(windows)]
         let (program, args) = {
             // Force UTF-8 output. cmd.exe uses chcp; PowerShell sets the
-            // console output encoding directly. See issue #982.
+            // console output encoding directly. See issue #982. Key on the
+            // PowerShell family so a custom PowerShell path keeps the same
+            // output contract as the two detected variants (#6745).
             let kind = dispatcher.kind();
-            let cmd = if matches!(
-                kind,
-                crate::shell_dispatcher::ShellKind::Pwsh
-                    | crate::shell_dispatcher::ShellKind::WindowsPowerShell
-            ) {
+            let cmd = if kind.is_powershell() {
                 format!("[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; {command}")
             } else if matches!(kind, crate::shell_dispatcher::ShellKind::Cmd) {
                 format!("chcp 65001 >NUL & {command}")
@@ -460,6 +460,89 @@ fn expand_home_prefix(path: PathBuf) -> PathBuf {
     path
 }
 
+/// The bubblewrap arguments that hide `path` from a sandboxed command: an
+/// empty tmpfs over an existing directory, `/dev/null` bound over an existing
+/// file, nothing for a path that does not exist (there is nothing to deny).
+/// Blocking. Platform-neutral so it is exercised on every host; only the
+/// Linux bwrap builder emits it.
+fn bwrap_mask_args(path: &std::path::Path) -> Vec<String> {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return Vec::new();
+    };
+    let path = path.to_string_lossy().into_owned();
+    if meta.is_dir() {
+        vec!["--tmpfs".to_string(), path]
+    } else {
+        vec!["--ro-bind".to_string(), "/dev/null".to_string(), path]
+    }
+}
+
+/// Arguments appended after the read deny-list masks so `exceptions` inside
+/// a masked directory stay visible. Only a denied directory that holds an
+/// existing exception opens up again: each such exception is bound read-only
+/// again, then each (canonical) writable root strictly inside such a
+/// directory is bound writable again, then every denied path strictly inside
+/// what was bound again is masked again, so an exception never re-exposes a
+/// denied path. Any other denied directory stays masked over whatever lies
+/// inside it, writable roots included. Empty, without touching the
+/// filesystem, when there are no exceptions (every caller but the extension
+/// host). Blocking (resolves paths).
+///
+/// This is how the extension host denies a Codewhale home whole — including
+/// entries created after it started, which a per-entry mask cannot cover —
+/// while its bundle, data dir and plugin code stay reachable.
+///
+/// Known limits: an exception or writable root that does not exist when the
+/// command starts stays hidden for its lifetime; a protected descendant
+/// (`.codewhale` inside a writable root) or an extra read-only root inside a
+/// masked directory is not re-applied. Only the extension host sets
+/// exceptions, and its data dir has neither.
+fn bwrap_exception_args(
+    denied: &[PathBuf],
+    exceptions: &[PathBuf],
+    writable_roots: &[PathBuf],
+) -> Vec<String> {
+    if exceptions.is_empty() {
+        return Vec::new();
+    }
+    let canonical = |path: &PathBuf| std::fs::canonicalize(path).ok();
+    let strictly_inside = |path: &std::path::Path, roots: &[PathBuf]| {
+        roots
+            .iter()
+            .any(|root| path != root.as_path() && path.starts_with(root))
+    };
+    let exceptions: Vec<PathBuf> = exceptions.iter().filter_map(canonical).collect();
+    let opened: Vec<PathBuf> = denied
+        .iter()
+        .filter(|path| path.is_dir())
+        .filter_map(canonical)
+        .filter(|dir| {
+            exceptions
+                .iter()
+                .any(|exception| strictly_inside(exception, std::slice::from_ref(dir)))
+        })
+        .collect();
+    let mut rebound: Vec<PathBuf> = Vec::new();
+    let mut args = Vec::new();
+    let candidates = exceptions
+        .iter()
+        .map(|path| ("--ro-bind", path))
+        .chain(writable_roots.iter().map(|path| ("--bind", path)));
+    for (flag, path) in candidates {
+        if strictly_inside(path, &opened) && !rebound.contains(path) {
+            let spelled = path.to_string_lossy().into_owned();
+            args.extend([flag.to_string(), spelled.clone(), spelled]);
+            rebound.push(path.clone());
+        }
+    }
+    for path in denied {
+        if canonical(path).is_some_and(|resolved| strictly_inside(&resolved, &rebound)) {
+            args.extend(bwrap_mask_args(path));
+        }
+    }
+    args
+}
+
 /// The `SandboxManager` is responsible for:
 /// - Detecting available sandbox technologies
 /// - Transforming `CommandSpecs` into sandboxed `ExecEnvs`
@@ -485,6 +568,11 @@ pub struct SandboxManager {
     /// read (Seatbelt appends last-match-wins deny rules; bubblewrap masks
     /// each path). Empty by default — today's behavior unchanged.
     denied_read_subpaths: Vec<PathBuf>,
+
+    /// Paths inside a denied directory that stay visible (bubblewrap only,
+    /// [`bwrap_exception_args`]; Seatbelt ignores this list). Empty by
+    /// default.
+    denied_read_exceptions: Vec<PathBuf>,
 }
 
 impl SandboxManager {
@@ -536,6 +624,14 @@ impl SandboxManager {
             }
         }
         self.denied_read_subpaths = resolved;
+    }
+
+    /// Set the paths inside a denied directory that stay visible under
+    /// bubblewrap ([`bwrap_exception_args`]). The extension host uses it to
+    /// deny a Codewhale home whole while keeping its own files and plugin
+    /// code readable.
+    pub fn set_denied_read_exceptions(&mut self, paths: Vec<PathBuf>) {
+        self.denied_read_exceptions = paths;
     }
 
     /// Test-only view of the resolved deny-list (post home-expansion and
@@ -669,6 +765,7 @@ impl SandboxManager {
             spec.sandbox_policy.has_network_access(),
             &self.bwrap_extensions,
             &self.denied_read_subpaths,
+            &self.denied_read_exceptions,
         );
 
         let mut env = spec.env.clone();
@@ -811,6 +908,77 @@ impl SandboxManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The extension host's deny-list form, platform-neutral so it runs on
+    /// every host: an exception and a writable root inside a masked
+    /// directory are bound again, a missing exception and the masked
+    /// directory itself are not, and a denied path inside an exception is
+    /// masked again.
+    #[test]
+    fn bwrap_exceptions_rebind_inside_masks_and_never_reexpose_a_denied_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let home = root.join("home");
+        std::fs::create_dir_all(home.join("extension-host/data")).unwrap();
+        std::fs::create_dir_all(home.join("extension-host/secret")).unwrap();
+        std::fs::write(home.join("token"), "s3cret").unwrap();
+        std::fs::create_dir_all(root.join("other/writable")).unwrap();
+        let bundle = home.join("extension-host");
+        let data = bundle.join("data");
+        let nested = bundle.join("secret");
+        let token = home.join("token");
+        let spell = |path: &std::path::Path| path.to_string_lossy().into_owned();
+        let (bundle_s, data_s, nested_s, home_s, token_s) = (
+            spell(&bundle),
+            spell(&data),
+            spell(&nested),
+            spell(&home),
+            spell(&token),
+        );
+
+        // `other` is denied without an exception: the writable root inside
+        // it stays masked, as it is for every caller that sets none.
+        let args = bwrap_exception_args(
+            &[
+                home.clone(),
+                token.clone(),
+                nested.clone(),
+                root.join("other"),
+            ],
+            &[bundle.clone(), home.join("plugins"), home.clone()],
+            &[data.clone(), root.clone(), root.join("other/writable")],
+        );
+        assert_eq!(
+            args,
+            [
+                "--ro-bind",
+                bundle_s.as_str(),
+                bundle_s.as_str(),
+                "--bind",
+                data_s.as_str(),
+                data_s.as_str(),
+                "--tmpfs",
+                nested_s.as_str(),
+            ]
+        );
+        // No exceptions, or none inside a masked directory: nothing to add.
+        assert!(
+            bwrap_exception_args(
+                std::slice::from_ref(&home),
+                &[],
+                std::slice::from_ref(&data)
+            )
+            .is_empty()
+        );
+        assert!(bwrap_exception_args(std::slice::from_ref(&token), &[bundle], &[data]).is_empty());
+
+        assert_eq!(bwrap_mask_args(&home), ["--tmpfs", home_s.as_str()]);
+        assert_eq!(
+            bwrap_mask_args(&token),
+            ["--ro-bind", "/dev/null", token_s.as_str()]
+        );
+        assert!(bwrap_mask_args(&home.join("missing")).is_empty());
+    }
 
     #[test]
     fn test_command_spec_shell() {

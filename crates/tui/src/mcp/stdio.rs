@@ -28,6 +28,13 @@ pub(super) struct StdioTransport {
     pub(super) authority_cancel_watch: Option<tokio::task::JoinHandle<()>>,
     /// Holds reviewed executable/script handles for the process lifetime.
     pub(super) _reviewed_launch: Option<super::ReviewedStdioLaunch>,
+    /// Everything the server started: its own process group on Unix, a Job
+    /// Object on Windows. Termination signals the whole tree, so a server's
+    /// grandchild (an `npx` wrapper's node, a shell's background job) dies
+    /// with it on shutdown and on plugin revocation. The last clone's drop
+    /// kills whatever is left. `None` only for a transport built around an
+    /// uncontained child (tests).
+    pub(super) process_tree: Option<Arc<crate::process_tree::ProcessTree>>,
 }
 
 /// How long `StdioTransport::shutdown` waits for the child to exit on SIGTERM
@@ -172,6 +179,9 @@ impl StdioTransport {
                 child_env::string_map_env(&expanded_env),
             );
         }
+        // Lead a process group of its own so teardown can reach descendants.
+        #[cfg(unix)]
+        cmd.process_group(0);
 
         let mut child = cmd.spawn().map_err(|error| {
             let message = if error.kind() == std::io::ErrorKind::NotFound
@@ -194,6 +204,16 @@ impl StdioTransport {
             };
             anyhow::Error::new(error).context(message)
         })?;
+
+        let process_tree = match crate::process_tree::ProcessTree::attach_tokio(&child) {
+            Ok(tree) => Arc::new(tree),
+            Err(error) => {
+                let _ = child.start_kill();
+                return Err(anyhow::Error::new(error).context(format!(
+                    "MCP server {server_name} could not be contained with its child processes"
+                )));
+            }
+        };
 
         let stdin = child.stdin.take().context("Failed to get MCP stdin")?;
         let stdout = child.stdout.take().context("Failed to get MCP stdout")?;
@@ -218,9 +238,10 @@ impl StdioTransport {
         let child = Arc::new(TokioMutex::new(child));
         let authority_cancel_watch = config.reviewed_plugin.as_ref().map(|_| {
             let watched_child = Arc::clone(&child);
+            let watched_tree = Arc::clone(&process_tree);
             tokio::spawn(async move {
                 cancel_token.cancelled().await;
-                terminate_child_for_authority_change(&watched_child).await;
+                terminate_child_for_authority_change(&watched_child, &watched_tree).await;
             })
         });
 
@@ -232,6 +253,7 @@ impl StdioTransport {
             stderr_tail,
             authority_cancel_watch,
             _reviewed_launch: reviewed_launch,
+            process_tree: Some(process_tree),
         })
     }
 }
@@ -315,19 +337,22 @@ async fn format_stderr_context(tail: &StderrTail) -> Option<String> {
     ))
 }
 
-/// Best-effort SIGTERM. On Unix uses `libc::kill`; on Windows there's no
-/// equivalent so we let `kill_on_drop` (TerminateProcess) handle it via the
-/// subsequent Drop. Returns whether a signal was actually sent.
-fn send_sigterm(child: &Child) -> bool {
+/// Best-effort SIGTERM. On Unix uses `libc::kill`, addressed to the child's
+/// whole process group when it leads one (`contained`); on Windows there's no
+/// equivalent so we let `kill_on_drop` (TerminateProcess) and the Job Object
+/// handle it. Returns whether a signal was actually sent.
+fn send_sigterm(child: &Child, contained: bool) -> bool {
     #[cfg(unix)]
     {
         if let Some(pid) = child.id() {
-            // SAFETY: pid was just obtained from `child.id()`. `libc::kill`
-            // with `SIGTERM` is async-signal-safe and never observes invalid
-            // memory. Worst case (pid wrap / process already gone) returns
-            // ESRCH, which we deliberately ignore.
+            let pid = pid as i32;
+            let target = if contained { -pid } else { pid };
+            // SAFETY: pid was just obtained from `child.id()` of an unreaped
+            // child, so neither it nor the group it leads can have been
+            // recycled. `libc::kill` with `SIGTERM` is async-signal-safe and
+            // never observes invalid memory. ESRCH is deliberately ignored.
             unsafe {
-                let _ = libc::kill(pid as i32, libc::SIGTERM);
+                let _ = libc::kill(target, libc::SIGTERM);
             }
             return true;
         }
@@ -335,27 +360,34 @@ fn send_sigterm(child: &Child) -> bool {
     }
     #[cfg(not(unix))]
     {
-        let _ = child;
+        let _ = (child, contained);
         false
     }
 }
 
-async fn terminate_child_for_authority_change(child: &Arc<TokioMutex<Child>>) {
+async fn terminate_child_for_authority_change(
+    child: &Arc<TokioMutex<Child>>,
+    tree: &crate::process_tree::ProcessTree,
+) {
     let mut child = child.lock().await;
-    terminate_child(&mut child).await;
+    terminate_child(&mut child, Some(tree)).await;
 }
 
-async fn terminate_child(child: &mut Child) {
+async fn terminate_child(child: &mut Child, tree: Option<&crate::process_tree::ProcessTree>) {
     // Reap an already-exited child before resolving its PID. Until it is
     // reaped, the OS cannot recycle that identity; after it is reaped there is
     // nothing left to signal. This avoids a PID-only watcher ever targeting an
     // unrelated process after rapid PID reuse.
     if child.try_wait().is_ok_and(|status| status.is_some()) {
+        // The server is gone, but what it started may not be.
+        if let Some(tree) = tree {
+            let _ = tree.kill();
+        }
         return;
     }
 
     #[cfg(unix)]
-    send_sigterm(child);
+    send_sigterm(child, tree.is_some());
 
     #[cfg(not(unix))]
     let _ = child.start_kill();
@@ -368,6 +400,10 @@ async fn terminate_child(child: &mut Child) {
             let _ = child.start_kill();
             let _ = child.wait().await;
         }
+    }
+    // Descendants that outlived the grace (or ignored SIGTERM) go now.
+    if let Some(tree) = tree {
+        let _ = tree.kill();
     }
 }
 
@@ -450,7 +486,7 @@ impl McpTransport for StdioTransport {
     /// then force termination and reap the child as the backstop.
     async fn shutdown(&mut self) {
         let mut child = self.child.lock().await;
-        terminate_child(&mut child).await;
+        terminate_child(&mut child, self.process_tree.as_deref()).await;
     }
 }
 
@@ -466,18 +502,22 @@ impl Drop for StdioTransport {
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             let child = Arc::clone(&self.child);
             let reviewed_launch = self._reviewed_launch.take();
+            // The task owns the tree so it is not killed before the grace.
+            let tree = self.process_tree.take();
             runtime.spawn(async move {
                 let _reviewed_launch = reviewed_launch;
                 let mut child = child.lock().await;
-                terminate_child(&mut child).await;
+                terminate_child(&mut child, tree.as_deref()).await;
             });
             return;
         }
         if let Ok(mut child) = self.child.try_lock()
             && !child.try_wait().is_ok_and(|status| status.is_some())
         {
-            send_sigterm(&child);
+            send_sigterm(&child, self.process_tree.is_some());
         }
+        // No runtime: dropping the tree below SIGKILLs the group / closes the
+        // job, the same backstop `kill_on_drop` gives the direct child.
     }
 }
 
@@ -485,7 +525,7 @@ impl Drop for StdioTransport {
 /// exceeds `max` bytes. Cancellation retains consumed bytes; the caller clears
 /// the buffer only after receiving a complete frame. Returns the total bytes
 /// accumulated; 0 means EOF.
-async fn read_line_capped<R>(
+pub(crate) async fn read_line_capped<R>(
     reader: &mut R,
     out: &mut Vec<u8>,
     max: usize,

@@ -1512,7 +1512,12 @@ impl ToolSpec for ReviewTool {
                     return Ok(review_error_with_usage(&route, &usage, error.to_string()));
                 }
             } else {
-                single_output = Some(ReviewOutput::from_str(&response_text));
+                match accept_single_review(&response_text) {
+                    Ok(output) => single_output = Some(output),
+                    Err(error) => {
+                        return Ok(review_error_with_usage(&route, &usage, error));
+                    }
+                }
             }
         }
         if let Err(error) = ensure_pr_source_current(&source, &context.workspace).await {
@@ -1552,6 +1557,28 @@ impl ToolSpec for ReviewTool {
         };
         Ok(result.with_metadata(metadata))
     }
+}
+
+/// Accept one non-PR review reply (#6561 D03-m4). Prose that ignores the
+/// JSON contract is still a review (see [`ReviewOutput::from_str`]), but an
+/// empty reply, or JSON that carries no summary, issue, suggestion or
+/// assessment (`{}`, an unrelated object), used to become an empty
+/// successful review that read as clean.
+fn accept_single_review(response_text: &str) -> Result<ReviewOutput, String> {
+    let output = ReviewOutput::from_str(response_text);
+    if response_text.trim().is_empty()
+        || (output.summary.is_empty()
+            && output.issues.is_empty()
+            && output.suggestions.is_empty()
+            && output.overall_assessment.is_empty())
+    {
+        return Err(
+            "Review response carried no review content (empty, or JSON without summary, \
+             issues, suggestions or overall_assessment); no review was accepted."
+                .to_string(),
+        );
+    }
+    Ok(output)
 }
 
 fn review_error_with_usage(
@@ -2777,6 +2804,23 @@ mod tests {
         assert_eq!(output.issues[0].severity, "warning");
         assert_eq!(output.issues[0].path.as_deref(), Some("src/main.rs"));
         assert_eq!(output.overall_assessment, "usable");
+    }
+
+    #[test]
+    fn single_review_refuses_blank_or_contractless_replies() {
+        for raw in ["", "   \n", "{}", r#"{"verdict":"ok"}"#, "```json\n{}\n```"] {
+            assert!(
+                accept_single_review(raw).is_err(),
+                "{raw:?} must not become a clean review"
+            );
+        }
+        let prose = accept_single_review("Looks good; no findings.").expect("prose review");
+        assert_eq!(prose.summary, "Looks good; no findings.");
+        let structured = accept_single_review(
+            r#"{"summary":"One risk","issues":[],"suggestions":[],"overall_assessment":"ok"}"#,
+        )
+        .expect("structured review");
+        assert_eq!(structured.summary, "One risk");
     }
 
     #[test]

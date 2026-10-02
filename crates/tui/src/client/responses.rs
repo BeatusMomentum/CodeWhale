@@ -21,7 +21,7 @@ use codewhale_models::{
 
 use super::prepared::WireDialect;
 use super::role_placement::{RolePlacement, role_placement};
-use super::wire::{extract_sse_data_value, next_sse_line};
+use super::wire::{extract_sse_data_value, next_sse_line, push_sse_event_data};
 use super::{
     CodewhaleClient, ERROR_BODY_MAX_BYTES, bounded_error_text, from_api_tool_name,
     system_to_instructions, to_api_tool_name,
@@ -180,10 +180,7 @@ impl CodewhaleClient {
         let account_id = self.codex_account_id.clone();
         let request_body =
             serde_json::to_vec(&body).context("Failed to serialize Responses API request body")?;
-        let open_req = super::stream_entry::StreamOpenRequest::new(
-            self.stream_open_timeout,
-            self.stream_idle_timeout,
-        );
+        let open_req = self.stream_open_request();
         let response = super::stream_entry::open_sse_response(&open_req, |policy| {
             let url = url.clone();
             let account_id = account_id.clone();
@@ -258,6 +255,9 @@ impl CodewhaleClient {
             // multi-byte UTF-8 char split across HTTP/2 DATA is never
             // corrupted to U+FFFD. Genuine invalid bytes fail closed.
             let mut buffer: Vec<u8> = Vec::new();
+            // `data:` fields of the event being assembled, dispatched at the
+            // blank line that ends it (or at stream end).
+            let mut event_data = String::new();
             let mut done = false;
             let mut ended = false;
             let mut content_block_counter: u32 = 0;
@@ -300,25 +300,37 @@ impl CodewhaleClient {
 
                 // Process complete SSE lines, and the unterminated tail at stream end.
                 loop {
-                    let line = match next_sse_line(&mut buffer, ended) {
-                        Ok(Some(line)) => line,
+                    let data = match next_sse_line(&mut buffer, ended) {
+                        // A blank line ends the event.
+                        Ok(Some(line)) if line.is_empty() => std::mem::take(&mut event_data),
+                        Ok(Some(line)) => {
+                            if line.starts_with(':') {
+                                // SSE comment keep-alive: the provider is alive (#6184).
+                                yield Ok(StreamEvent::Ping);
+                            } else if let Some(value) = extract_sse_data_value(&line)
+                                && let Err(err) = push_sse_event_data(&mut event_data, value)
+                            {
+                                yield Err(anyhow::anyhow!("{err}"));
+                                return;
+                            }
+                            continue;
+                        }
+                        // The final event may arrive without its blank line.
+                        Ok(None) if ended && !event_data.is_empty() => {
+                            std::mem::take(&mut event_data)
+                        }
                         Ok(None) => break,
                         Err(err) => {
                             yield Err(anyhow::anyhow!("{err}"));
                             return;
                         }
                     };
-
-                    if line.is_empty() {
-                        continue;
-                    }
-                    if line.starts_with(':') {
-                        // SSE comment keep-alive: the provider is alive (#6184).
-                        yield Ok(StreamEvent::Ping);
+                    if data.is_empty() {
                         continue;
                     }
 
-                    if let Some(data) = extract_sse_data_value(&line) {
+                    {
+                        let data = data.as_str();
                         if data == "[DONE]" {
                             done = true;
                             break;
@@ -564,7 +576,15 @@ impl CodewhaleClient {
                 }
             }
 
-            // Emit MessageStop.
+            // Only `[DONE]` or `response.completed`/`response.incomplete`
+            // proves the response is whole. A bare HTTP EOF is truncation, and
+            // a MessageStop here would hand the turn a partial answer as done.
+            if !done {
+                yield Err(anyhow::anyhow!(
+                    "Responses stream closed before response.completed or [DONE]"
+                ));
+                return;
+            }
             yield Ok(StreamEvent::MessageStop);
         };
 

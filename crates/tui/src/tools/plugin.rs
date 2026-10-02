@@ -12,12 +12,27 @@
 //! # name: my-tool
 //! # description: Does something useful
 //! # schema: {"type":"object","properties":{"input":{"type":"string"}}}
-//! # approval: auto
+//! # approval: required
 //! ```
 //!
 //! The script receives the tool's JSON input on **stdin** and must return
 //! a JSON `ToolResult` (`{"content": "...", "success": true}`) on **stdout**.
 //! Non-JSON output is wrapped in a `ToolResult` with `success: false`.
+//!
+//! # What a script tool cannot do (D4, CURRENT_DECISIONS §26)
+//!
+//! - **Approve itself.** `# approval:` accepts `suggest` (the default) and
+//!   `required`. `auto` is no longer honoured: the tool gets the default a
+//!   script without the line gets, and [`PluginMetadata::auto_approval_ignored`]
+//!   lets each loader say so (runtime log, `/plugin tools`) instead of
+//!   downgrading silently.
+//! - **Replace a built-in.** A drop-in script whose name is already registered
+//!   is refused by `ToolRegistry::load_plugins`, and a `[tools.overrides]`
+//!   `script` / `command` entry keyed by a built-in is refused by
+//!   `ToolRegistry::apply_overrides`; `disabled` still turns a built-in off.
+//!
+//! Known limitation: an unrecognised `# approval:` value (a typo such as
+//! `requried`) still falls back to the default without a diagnostic.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -25,7 +40,6 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::Value;
-use tokio::io::AsyncWriteExt;
 
 use super::spec::{
     ApprovalRequirement, ToolCapability, ToolContext, ToolError, ToolResult, ToolSpec,
@@ -47,8 +61,25 @@ pub struct PluginMetadata {
     /// Defaults to a permissive `{"type": "object"}` when absent.
     pub input_schema: Value,
     /// Approval requirement (from `# approval:`).
-    /// Defaults to `Suggest`.
+    /// Defaults to `Suggest`; never `Auto` (see the module docs).
     pub approval: ApprovalRequirement,
+    /// The frontmatter asked for `approval: auto`, which script tools may no
+    /// longer use; `approval` holds the default instead. Loaders report it
+    /// with `AUTO_APPROVAL_UNSUPPORTED`.
+    pub auto_approval_ignored: bool,
+}
+
+/// Why a script's `approval: auto` was ignored. Shared by the load warning and
+/// the `/plugin tools` diagnostic so the two surfaces say the same thing.
+pub(crate) const AUTO_APPROVAL_UNSUPPORTED: &str = "`approval: auto` is no longer supported for script tools; \
+     the tool follows the session's approval setting like a script with no `approval:` line";
+
+/// Log the D4 downgrade for a script tool registered as `tool_name`.
+fn warn_auto_approval_ignored(tool_name: &str) {
+    tracing::warn!(
+        "Script tool '{}': {AUTO_APPROVAL_UNSUPPORTED}",
+        crate::safe_label::SafeLabel::identifier(tool_name)
+    );
 }
 
 /// A tool backed by an external script or executable dropped into the
@@ -300,32 +331,17 @@ async fn run_plugin_child_raw(
     let input_bytes = serde_json::to_vec(&input)
         .map_err(|e| ToolError::invalid_input(format!("failed to serialize input: {e}")))?;
 
-    cmd.stdin(std::process::Stdio::piped());
-    cmd.stdout(std::process::Stdio::piped());
-    cmd.stderr(std::process::Stdio::piped());
-
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| ToolError::execution_failed(format!("failed to spawn {label}: {e}")))?;
-
-    let stdin_writer = child.stdin.take().map(|mut stdin| {
-        tokio::spawn(async move {
-            if stdin.write_all(&input_bytes).await.is_ok() {
-                let _ = stdin.shutdown().await;
-            }
-        })
-    });
-
-    let output = tokio::time::timeout(PLUGIN_EXECUTION_TIMEOUT, child.wait_with_output())
-        .await
-        .map_err(|_| ToolError::Timeout {
-            seconds: PLUGIN_EXECUTION_TIMEOUT.as_secs(),
-        })?
-        .map_err(|e| ToolError::execution_failed(format!("process error: {e}")))?;
-
-    if let Some(stdin_writer) = stdin_writer {
-        let _ = stdin_writer.await;
-    }
+    // Contained: a timed-out or cancelled plugin takes everything it started
+    // down with it, not just the interpreter that `kill_on_drop` would reach.
+    let output = tokio::time::timeout(
+        PLUGIN_EXECUTION_TIMEOUT,
+        crate::process_tree::contained_output_with_input(cmd, input_bytes),
+    )
+    .await
+    .map_err(|_| ToolError::Timeout {
+        seconds: PLUGIN_EXECUTION_TIMEOUT.as_secs(),
+    })?
+    .map_err(|e| ToolError::execution_failed(format!("failed to run {label}: {e}")))?;
 
     if output.status.success() {
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
@@ -359,7 +375,7 @@ async fn run_plugin_child_raw(
 /// # name: my-tool
 /// # description: Does something
 /// # schema: {"type":"object"}
-/// # approval: auto
+/// # approval: required
 /// ```
 ///
 /// Also supports `// ` prefix for JavaScript/TypeScript scripts and `-- ` for Lua.
@@ -397,10 +413,12 @@ pub fn parse_frontmatter(content: &str) -> PluginMetadata {
         serde_json::from_str(&schema_str).unwrap_or_else(|_| serde_json::json!({"type": "object"}))
     };
 
-    let approval = match approval_str.to_lowercase().as_str() {
-        "auto" => ApprovalRequirement::Auto,
-        "required" => ApprovalRequirement::Required,
-        _ => ApprovalRequirement::Suggest,
+    // A script cannot approve itself (D4): `auto` gets the default, flagged so
+    // the loaders can report it.
+    let (approval, auto_approval_ignored) = match approval_str.to_lowercase().as_str() {
+        "required" => (ApprovalRequirement::Required, false),
+        "auto" => (ApprovalRequirement::Suggest, true),
+        _ => (ApprovalRequirement::Suggest, false),
     };
 
     PluginMetadata {
@@ -416,6 +434,7 @@ pub fn parse_frontmatter(content: &str) -> PluginMetadata {
         },
         input_schema,
         approval,
+        auto_approval_ignored,
     }
 }
 
@@ -490,6 +509,9 @@ pub fn load_plugin_tools(plugin_dir: &Path) -> Vec<Arc<dyn ToolSpec>> {
             meta.name,
             path.display()
         );
+        if meta.auto_approval_ignored {
+            warn_auto_approval_ignored(&meta.name);
+        }
         tools.push(Arc::new(ScriptPluginTool {
             metadata: meta,
             script_path: path,
@@ -503,6 +525,8 @@ pub fn load_plugin_tools(plugin_dir: &Path) -> Vec<Arc<dyn ToolSpec>> {
 /// Create a single tool from a `ToolOverride` config entry.
 ///
 /// Returns `None` for `Disabled` (the caller handles removal separately).
+/// This builds the tool only; `ToolRegistry::apply_overrides` decides whether
+/// the name may be taken, and refuses one owned by a built-in.
 pub fn tool_from_override(
     tool_name: &str,
     override_cfg: &ToolOverride,
@@ -531,13 +555,17 @@ pub fn tool_from_override(
             // defaults if it has none.
             let mut meta = read_script_metadata(&script_path).unwrap_or_else(|| PluginMetadata {
                 name: tool_name.to_string(),
-                description: format!("Override for built-in tool '{tool_name}'"),
+                description: format!("Script tool '{tool_name}' from [tools.overrides]"),
                 input_schema: serde_json::json!({"type": "object"}),
                 approval: ApprovalRequirement::Suggest,
+                auto_approval_ignored: false,
             });
 
             // The config key owns the replacement target; frontmatter supplies metadata only.
             meta.name = tool_name.to_string();
+            if meta.auto_approval_ignored {
+                warn_auto_approval_ignored(tool_name);
+            }
 
             Some(Arc::new(ScriptPluginTool {
                 metadata: meta,
@@ -607,7 +635,8 @@ echo hello
 
         assert_eq!(meta.name, "compact-name");
         assert_eq!(meta.description, "spaced description");
-        assert_eq!(meta.approval, ApprovalRequirement::Auto);
+        assert_eq!(meta.approval, ApprovalRequirement::Suggest);
+        assert!(meta.auto_approval_ignored);
         assert_eq!(
             meta.input_schema,
             serde_json::json!({"type":"object","properties":{"ok":{"type":"boolean"}}})
@@ -726,6 +755,25 @@ echo hello
 
         assert!(result.success);
         assert!(result.content.len() > 64 * 1024);
+    }
+
+    /// A cancelled (or timed-out) plugin call kills what the plugin started,
+    /// not just the interpreter.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropped_plugin_call_kills_the_plugin_process_tree() {
+        let tmp = TempDir::new().unwrap();
+        let pid_file = tmp.path().join("grandchild.pid");
+        let mut cmd = tokio::process::Command::new("/bin/sh");
+        cmd.arg("-c")
+            .arg("sleep 300 & echo $! > grandchild.pid; wait")
+            .current_dir(tmp.path());
+        let run = run_plugin_child_raw(&mut cmd, "hanging plugin", serde_json::json!({}));
+        let grandchild = crate::process_tree::drop_once_pid_written(run, &pid_file).await;
+        assert!(
+            crate::process_tree::wait_for_pid_exit(grandchild, Duration::from_secs(5)),
+            "a process started by the cancelled plugin is still running"
+        );
     }
 
     #[test]
@@ -878,7 +926,9 @@ echo hello
             assert_eq!(parse_frontmatter(content).approval, expected);
         };
 
-        check("# name: x\n# approval: auto", ApprovalRequirement::Auto);
+        // D4: a script cannot approve itself; `auto` gets the default.
+        check("# name: x\n# approval: auto", ApprovalRequirement::Suggest);
+        check("# name: x\n# approval: AUTO", ApprovalRequirement::Suggest);
         check(
             "# name: x\n# approval: required",
             ApprovalRequirement::Required,

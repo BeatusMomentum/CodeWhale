@@ -717,23 +717,29 @@ impl ModalView for FilePickerView {
     }
 }
 
+/// Keep the path's tail within `max` display cells, cutting only between
+/// grapheme clusters: counting chars overflowed CJK rows and could split a
+/// ZWJ or combining sequence (U07-06). ASCII output is unchanged.
 fn truncate_path(path: &str, max: usize) -> String {
+    use unicode_segmentation::UnicodeSegmentation;
     if max == 0 {
         return String::new();
     }
-    if path.chars().count() <= max {
+    if crate::tui::ui_text::text_display_width(path) <= max {
         return path.to_string();
     }
-    let take = max.saturating_sub(1);
-    let truncated: String = path
-        .chars()
-        .rev()
-        .take(take)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect();
-    format!("…{truncated}")
+    let budget = max.saturating_sub(1);
+    let mut used = 0usize;
+    let mut start = path.len();
+    for (idx, grapheme) in path.grapheme_indices(true).rev() {
+        let width = crate::tui::ui_text::text_display_width(grapheme);
+        if used + width > budget {
+            break;
+        }
+        used += width;
+        start = idx;
+    }
+    format!("…{}", &path[start..])
 }
 
 /// Single-pass walk that collects workspace-relative paths. `max_depth` of
@@ -935,7 +941,10 @@ fn push_matching_files(
         }
         let path = entry.path();
         let rel = path.strip_prefix(display_root).unwrap_or(path);
-        if rel.as_os_str().is_empty() {
+        // A pick becomes @-mention text that must resolve back to this file.
+        // A non-UTF-8 name cannot round-trip through text, and its lossy form
+        // can collide with another file's name, so it is not offered (U07-06).
+        if rel.as_os_str().is_empty() || rel.to_str().is_none() {
             continue;
         }
         let display = path_to_workspace_string(rel);

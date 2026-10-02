@@ -15,6 +15,29 @@ export function sha256File(path) {
   return createHash('sha256').update(readFileSync(path)).digest('hex')
 }
 
+/** The runtime running these tests also runs the host: `node --test` or `bun test`. */
+export const IS_BUN = typeof process.versions.bun === 'string'
+
+/**
+ * The runtime flags and environment the Rust core passes
+ * (`supervisor::runtime_args` / `runtime_env`); keep them in sync. Bun ignores
+ * Node's heap and `__proto__` flags, so it gets its own: never auto-install
+ * packages, ignore `bunfig.toml` and `.env` files in the working directory,
+ * and no ShadowRealm. Node switches off `node:sqlite`, and `node:ffi` where
+ * this Node has it. Both get a blank `NODE_OPTIONS`, so an inherited preload
+ * cannot run before the native-code lockdown.
+ */
+export const HOST_ARGS = IS_BUN
+  ? ['--no-install', '--no-env-file', `--config=${process.platform === 'win32' ? 'NUL' : '/dev/null'}`, '--no-addons']
+  : [
+      '--max-old-space-size=256',
+      '--disable-proto=throw',
+      '--no-addons',
+      '--no-experimental-sqlite',
+      ...(process.allowedNodeEnvironmentFlags.has('--no-experimental-ffi') ? ['--no-experimental-ffi'] : []),
+    ]
+export const HOST_ENV = { NODE_OPTIONS: '', ...(IS_BUN ? { BUN_JSC_useShadowRealm: '0' } : {}) }
+
 export const LIMITS = { max_frame: 32 * 1024 * 1024, max_inflight: 256, dispose_deadline_ms: 2000, activate_deadline_ms: 5000 }
 
 /**
@@ -25,9 +48,9 @@ export async function startHost({ admit, env, ownGroup = false } = {}) {
   const started = performance.now()
   // `ownGroup` spawns the host as a process-group leader and tells it so, as
   // the Rust core does on Unix.
-  const child = spawn(process.execPath, ['--max-old-space-size=256', '--disable-proto=throw', '--no-addons', BUNDLE], {
+  const child = spawn(process.execPath, [...HOST_ARGS, BUNDLE], {
     stdio: ['pipe', 'pipe', 'pipe'],
-    env: { ...process.env, ...env, ...(ownGroup ? { CODEWHALE_HOST_PROCESS_GROUP: '1' } : {}) },
+    env: { ...process.env, ...HOST_ENV, ...env, ...(ownGroup ? { CODEWHALE_HOST_PROCESS_GROUP: '1' } : {}) },
     detached: ownGroup,
   })
   const decoder = new FrameDecoder()

@@ -1,3 +1,5 @@
+import type { DraftClaimLockNamespace, DraftClaimLockStub } from "./draft-claim-lock";
+import { OUTBOUND_TIMEOUT_MS } from "@/lib/bounded-body";
 import { fetchFeed, fetchRepoStats } from "@/lib/github";
 import { curate } from "@/lib/deepseek";
 import { putDispatchWithKv } from "@/lib/kv";
@@ -20,6 +22,7 @@ import {
 } from "@/lib/community-agent";
 
 export interface AgentEnv {
+  DRAFT_CLAIM_LOCK?: DraftClaimLockNamespace;
   CURATED_KV?: {
     get(k: string): Promise<string | null>;
     put(k: string, v: string, o?: { expirationTtl?: number }): Promise<void>;
@@ -45,7 +48,7 @@ function dsEnv(env: AgentEnv): DeepSeekEnv {
   };
 }
 
-export async function runCurate(env: AgentEnv): Promise<Record<string, unknown>> {
+async function generateCurate(env: AgentEnv): Promise<Record<string, unknown>> {
   if (!env.DEEPSEEK_API_KEY) {
     return { skipped: true, reason: "DEEPSEEK_API_KEY not set" };
   }
@@ -81,12 +84,13 @@ export async function runCurate(env: AgentEnv): Promise<Record<string, unknown>>
   }
 }
 
-export async function runTriage(env: AgentEnv): Promise<Record<string, unknown>> {
+async function generateTriage(env: AgentEnv): Promise<Record<string, unknown>> {
   const repo = env.GITHUB_REPO ?? "Hmbown/CodeWhale";
   try {
     const res = await fetch(
       `https://api.github.com/repos/${repo}/issues?state=open&sort=created&direction=desc&per_page=30`,
       {
+        signal: AbortSignal.timeout(OUTBOUND_TIMEOUT_MS),
         headers: {
           Accept: "application/vnd.github+json",
           "X-GitHub-Api-Version": "2022-11-28",
@@ -147,12 +151,13 @@ export async function runTriage(env: AgentEnv): Promise<Record<string, unknown>>
   }
 }
 
-export async function runPrReview(env: AgentEnv): Promise<Record<string, unknown>> {
+async function generatePrReview(env: AgentEnv): Promise<Record<string, unknown>> {
   const repo = env.GITHUB_REPO ?? "Hmbown/CodeWhale";
   try {
     const res = await fetch(
       `https://api.github.com/repos/${repo}/pulls?state=open&sort=created&direction=desc&per_page=20`,
       {
+        signal: AbortSignal.timeout(OUTBOUND_TIMEOUT_MS),
         headers: {
           Accept: "application/vnd.github+json",
           "X-GitHub-Api-Version": "2022-11-28",
@@ -177,6 +182,7 @@ export async function runPrReview(env: AgentEnv): Promise<Record<string, unknown
       if (!pr.changed_files) {
         try {
           const diffRes = await fetch(`https://api.github.com/repos/${repo}/pulls/${pr.number}`, {
+            signal: AbortSignal.timeout(OUTBOUND_TIMEOUT_MS),
             headers: {
               Accept: "application/vnd.github+json",
               "X-GitHub-Api-Version": "2022-11-28",
@@ -230,13 +236,14 @@ export async function runPrReview(env: AgentEnv): Promise<Record<string, unknown
   }
 }
 
-export async function runStale(env: AgentEnv): Promise<Record<string, unknown>> {
+async function generateStale(env: AgentEnv): Promise<Record<string, unknown>> {
   const repo = env.GITHUB_REPO ?? "Hmbown/CodeWhale";
   const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
   try {
     const res = await fetch(
       `https://api.github.com/search/issues?q=${encodeURIComponent(`repo:${repo} is:issue is:open updated:<${thirtyDaysAgo}`)}&sort=updated&per_page=20`,
       {
+        signal: AbortSignal.timeout(OUTBOUND_TIMEOUT_MS),
         headers: {
           Accept: "application/vnd.github+json",
           "X-GitHub-Api-Version": "2022-11-28",
@@ -297,12 +304,13 @@ export async function runStale(env: AgentEnv): Promise<Record<string, unknown>> 
   }
 }
 
-export async function runDupes(env: AgentEnv): Promise<Record<string, unknown>> {
+async function generateDupes(env: AgentEnv): Promise<Record<string, unknown>> {
   const repo = env.GITHUB_REPO ?? "Hmbown/CodeWhale";
   try {
     const res = await fetch(
       `https://api.github.com/repos/${repo}/issues?state=open&per_page=100`,
       {
+        signal: AbortSignal.timeout(OUTBOUND_TIMEOUT_MS),
         headers: {
           Accept: "application/vnd.github+json",
           "X-GitHub-Api-Version": "2022-11-28",
@@ -357,7 +365,7 @@ export async function runDupes(env: AgentEnv): Promise<Record<string, unknown>> 
   }
 }
 
-export async function runDigest(env: AgentEnv): Promise<Record<string, unknown>> {
+async function generateDigest(env: AgentEnv): Promise<Record<string, unknown>> {
   const repo = env.GITHUB_REPO ?? "Hmbown/CodeWhale";
   const weekAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
 
@@ -376,6 +384,7 @@ export async function runDigest(env: AgentEnv): Promise<Record<string, unknown>>
       fetch(
         `https://api.github.com/repos/${repo}/issues?state=all&since=${weekAgo}&per_page=50&sort=updated&direction=desc`,
         {
+          signal: AbortSignal.timeout(OUTBOUND_TIMEOUT_MS),
           headers: {
             Accept: "application/vnd.github+json",
             "X-GitHub-Api-Version": "2022-11-28",
@@ -387,6 +396,7 @@ export async function runDigest(env: AgentEnv): Promise<Record<string, unknown>>
       fetch(
         `https://api.github.com/repos/${repo}/pulls?state=all&sort=updated&direction=desc&per_page=50`,
         {
+          signal: AbortSignal.timeout(OUTBOUND_TIMEOUT_MS),
           headers: {
             Accept: "application/vnd.github+json",
             "X-GitHub-Api-Version": "2022-11-28",
@@ -465,3 +475,43 @@ export async function runDigest(env: AgentEnv): Promise<Record<string, unknown>>
     return { ok: false, error: String(e) };
   }
 }
+
+/** The existing durable claim authority also serializes each bounded cron batch.
+ * Missing bindings stop generation before provider spend; KV is never a lock.
+ * The 45-minute lease covers at most ten 180-second model calls and reads.
+ * A completed batch retains a short hold for its KV drafts to propagate.
+ */
+async function withGenerationClaim(env: AgentEnv, task: string, generate: () => Promise<Record<string, unknown>>): Promise<Record<string, unknown>> {
+  if (!env.DEEPSEEK_API_KEY) return { skipped: true, reason: "DEEPSEEK_API_KEY not set" };
+  if (!env.DRAFT_CLAIM_LOCK || !env.CURATED_KV) return { skipped: true, reason: "durable generation claim unavailable; no provider call started" };
+  let lock: DraftClaimLockStub;
+  const token = `generate:${crypto.randomUUID()}`;
+  try {
+    lock = env.DRAFT_CLAIM_LOCK.get(env.DRAFT_CLAIM_LOCK.idFromName(`draft-generation:${task}`));
+    const held = await lock.act({ op: "claim", token, action: "generate", leaseMs: 45 * 60 * 1000 });
+    if (!held.ok) return { ok: true, processed: 0, skipped: 1, reason: "generation already in progress or recently completed" };
+  } catch {
+    return { skipped: true, reason: "durable generation claim unavailable; no provider call started" };
+  }
+  let completed = false;
+  try {
+    const result = await generate();
+    completed = result.ok === true;
+    return result;
+  } finally {
+    // A release failure leaves the durable lease in place until its expiry.
+    await lock.act({ op: "release", token, holdMs: completed ? 120_000 : 0 }).catch(() => undefined);
+  }
+}
+
+export const runCurate = (env: AgentEnv) => withGenerationClaim(env, "curate", () => generateCurate(env));
+
+export const runTriage = (env: AgentEnv) => withGenerationClaim(env, "triage", () => generateTriage(env));
+
+export const runPrReview = (env: AgentEnv) => withGenerationClaim(env, "prreview", () => generatePrReview(env));
+
+export const runStale = (env: AgentEnv) => withGenerationClaim(env, "stale", () => generateStale(env));
+
+export const runDupes = (env: AgentEnv) => withGenerationClaim(env, "dupes", () => generateDupes(env));
+
+export const runDigest = (env: AgentEnv) => withGenerationClaim(env, "digest", () => generateDigest(env));

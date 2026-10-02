@@ -507,9 +507,21 @@ impl GoalState {
         true
     }
 
+    /// Whether a judged completion has sealed this goal. A sealed goal is
+    /// terminal: blocking or pausing it would overwrite the verified
+    /// completion, so only an explicit resume or a new goal moves it on.
+    fn completion_sealed(&self) -> bool {
+        self.status == Some(GoalStatus::Complete) || self.completion_verification.is_some()
+    }
+
     pub fn mark_blocked(&mut self, blocker: String) -> Result<(), &'static str> {
         if self.objective.is_none() {
             return Err("No active goal exists to block.");
+        }
+        if self.completion_sealed() {
+            return Err(
+                "The goal is already complete with a judged verification; it cannot be blocked.",
+            );
         }
         self.runtime_blocked = false;
         self.status = Some(GoalStatus::Blocked);
@@ -524,6 +536,11 @@ impl GoalState {
     pub fn mark_paused(&mut self, reason: GoalPauseReason) -> Result<(), &'static str> {
         if self.objective.is_none() {
             return Err("No active goal exists to pause.");
+        }
+        if self.completion_sealed() {
+            return Err(
+                "The goal is already complete with a judged verification; it cannot be paused.",
+            );
         }
         self.status = Some(GoalStatus::Paused);
         self.finished_at = Some(Instant::now());
@@ -1426,6 +1443,46 @@ mod tests {
         assert_eq!(resumed.evidence, None);
         assert_eq!(resumed.blocker, None);
         assert_eq!(resumed.completion_verification, None);
+    }
+
+    /// #6561 D04-12: blocking or pausing used to overwrite a sealed, judged
+    /// completion and clear its verification.
+    #[test]
+    fn sealed_completion_cannot_be_blocked_or_paused() {
+        let mut state = GoalState::default();
+        state
+            .create("ship the verified change".to_string(), None)
+            .expect("create goal");
+        state
+            .mark_complete(
+                "focused tests passed".to_string(),
+                GoalCompletionVerification {
+                    status: "passed".to_string(),
+                    check: "cargo test".to_string(),
+                    summary: "goal tests passed".to_string(),
+                    ..Default::default()
+                },
+            )
+            .expect("complete goal");
+        let sealed = state.snapshot();
+
+        assert!(state.mark_blocked("late blocker".to_string()).is_err());
+        assert!(
+            state
+                .mark_runtime_blocked("runtime stop".to_string())
+                .is_err()
+        );
+        assert!(state.mark_paused(GoalPauseReason::NoProgress).is_err());
+
+        let after = state.snapshot();
+        assert_eq!(after.status, "complete");
+        assert_eq!(after.evidence, sealed.evidence);
+        assert_eq!(after.blocker, None);
+        assert!(after.completion_verification.is_some());
+        assert_eq!(
+            after.completion_verification,
+            sealed.completion_verification
+        );
     }
 
     #[test]

@@ -2,8 +2,8 @@
 //!
 //! Codewhale's Rust core stays closed and authoritative: one turn loop, one
 //! event authority, one store, one prompt authority, one approval gate. The
-//! extension host (`crates/tui/extension-host`, a Node process running the
-//! embedded bundle) is the only extensible surface, and in phase 1 it can do
+//! extension host (`crates/tui/extension-host`, a Bun or Node process running
+//! the embedded bundle) is the only extensible surface, and in phase 1 it can do
 //! exactly one thing: contribute tools, which become ordinary registry
 //! `ToolSpec`s ([`tool::HostToolSpec`]) behind the existing gate.
 //!
@@ -36,14 +36,40 @@
 //!   explicit plugin change/reload to retry. Two dirty teardowns within ten
 //!   minutes retire the process once non-heartbeat calls are idle, without
 //!   resetting or consuming the unexpected-crash budget.
-//! * One host per engine process and one trust tier. On macOS (Seatbelt) the
-//!   host has no direct network, and cannot read the Codewhale home (except
-//!   the bundle, its data dir and plugin code), the Codex and DSH credential
-//!   homes, or the default credential stores (`supervisor::plan_launch`).
-//!   Other files the user can read — including project `.env` files — stay
-//!   readable, and Mach services are not restricted. On Linux and Windows it
-//!   runs unsandboxed with the user's permissions. Either way the flag is
-//!   Experimental.
+//! * Every awaited core→host request is bounded by its method's deadline
+//!   (`protocol::CoreRequest::deadline`) and then cancelled with `$/cancel`
+//!   (`supervisor::HostProcess::call`). Cancellation is a request: a plugin
+//!   that ignores its abort signal keeps running in the host until the host
+//!   is torn down, though the core has already failed the call.
+//! * One host per engine process and one trust tier. Under its OS sandbox
+//!   (Seatbelt on macOS; bubblewrap on Linux when a launch-time probe shows it
+//!   works) the host has no direct network, and cannot read the Codewhale
+//!   home (except the bundle, its data dir and plugin code), the Codex and
+//!   DSH credential homes, or the default credential stores
+//!   (`supervisor::plan_launch`, whose module docs list what bubblewrap does
+//!   not cover). Other files the user can read — including project `.env`
+//!   files — stay readable, and Mach services are not restricted. On Windows,
+//!   and on Linux where bwrap is missing or cannot start, it runs unsandboxed
+//!   with the user's permissions, and `/plugin`, doctor and the start
+//!   diagnostic say why. Either way the flag is Experimental.
+//! * The runtime (`[extension_host] runtime`) defaults to Node. Bun is an
+//!   opt-in (`bun`, or `auto`, which prefers a Bun >= 1.4.0 and uses Node
+//!   when none is found) and is qualified on macOS only. The runtime is
+//!   pinned once a host on it completes the handshake; restarts reuse it
+//!   without probing it again, and the handshake refuses a host reporting a
+//!   different runtime or version. Under `auto`, a Bun that fails to launch or
+//!   handshake before anything is pinned is reported once and Node is used
+//!   for the rest of the session; an explicit `bun`/`node` never falls back.
+//!   The 1 GiB memory cap is applied through `RLIMIT_DATA` on Linux, the Job
+//!   Object on Windows and, for a Bun host on macOS, a jetsam limit the host
+//!   applies to itself; a macOS Node host is checked at each heartbeat
+//!   instead. The Rust host tests have not run a Bun host on Linux or
+//!   Windows (`supervisor` module docs say what was measured where).
+//! * In-process native code is taken away from plugins by the host
+//!   (`extension-host/src/runtime.ts`), for the entry points found so far; a
+//!   native-code entry point a newer runtime adds is not covered until it is
+//!   added there. A process a plugin starts is outside that policy and runs
+//!   under the same OS sandbox (none on Windows, or where bwrap fails).
 //! * The owner token is a bug/staleness guard, not a boundary between
 //!   plugins that share the process: one plugin can alter another's
 //!   behaviour, which the approval card discloses.
@@ -75,6 +101,7 @@ pub(crate) mod tool;
 pub(crate) mod tests;
 
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
@@ -88,7 +115,7 @@ use self::protocol::{
     OwnerRef, RegisterResult,
 };
 use self::registry::{OwnerRegistry, OwnerState, ToolRegistration};
-use self::supervisor::{ACTIVATE_DEADLINE, DISPOSE_DEADLINE, HostEvents, HostProcess};
+use self::supervisor::{HostEvents, HostProcess};
 use crate::plugins::PluginRegistry;
 use crate::plugins::activation::{self, PluginActivationCapability};
 use crate::plugins::types::PluginAuthority;
@@ -179,8 +206,13 @@ fn materialize_bundle(root: &Path) -> Result<PathBuf, String> {
 /// Options fixed for the life of one manager.
 #[derive(Debug, Clone, Default)]
 pub struct ExtensionHostOptions {
+    /// `[extension_host] runtime`: `node` (the default), `bun`, or `auto`
+    /// (Bun first).
+    pub runtime: crate::config::ExtensionHostRuntime,
     /// `[extension_host] node`: tried before every `node` on `PATH`.
     pub node_override: Option<PathBuf>,
+    /// `[extension_host] bun`: tried before every `bun` on `PATH`.
+    pub bun_override: Option<PathBuf>,
     /// Where the bundle is materialized; defaults to the Codewhale home.
     pub root: Option<PathBuf>,
     /// Per-manager timings; tests can shorten them without global state.
@@ -198,6 +230,28 @@ pub struct SupervisionOptions {
     pub start_retry_cooldown: Duration,
     pub dirty_window: Duration,
     pub dirty_limit: usize,
+    /// Host memory cap in bytes (`supervisor::HOST_MEMORY_CAP`).
+    pub memory_cap: u64,
+    /// How long one extension tool call may take before the core cancels it
+    /// (`tool::TOOL_CALL_DEADLINE`); sent to the host as `deadline_ms`. The
+    /// other methods' deadlines are fixed (`CoreRequest::deadline`).
+    pub tool_call_deadline: Duration,
+}
+
+impl ExtensionHostOptions {
+    /// Options for the `[extension_host]` table (paths `~`-expanded).
+    #[must_use]
+    pub fn from_config(table: Option<&crate::config::ExtensionHostConfig>) -> Self {
+        let expand = |path: Option<&String>| {
+            path.map(|path| PathBuf::from(shellexpand::tilde(path).as_ref()))
+        };
+        Self {
+            runtime: table.map_or_else(Default::default, |table| table.effective_runtime()),
+            node_override: expand(table.and_then(|table| table.node.as_ref())),
+            bun_override: expand(table.and_then(|table| table.bun.as_ref())),
+            ..Default::default()
+        }
+    }
 }
 
 impl Default for SupervisionOptions {
@@ -205,13 +259,15 @@ impl Default for SupervisionOptions {
         Self {
             heartbeat_interval: Duration::from_secs(3),
             ping_timeout: Duration::from_secs(3),
-            hang_timeout: Duration::from_secs(10),
+            hang_timeout: supervisor::PING_DEADLINE,
             restart_backoff: Duration::from_millis(250),
             crash_window: Duration::from_secs(5 * 60),
             crash_limit: 3,
             start_retry_cooldown: Duration::from_secs(60),
             dirty_window: Duration::from_secs(10 * 60),
             dirty_limit: 2,
+            memory_cap: supervisor::HOST_MEMORY_CAP,
+            tool_call_deadline: tool::TOOL_CALL_DEADLINE,
         }
     }
 }
@@ -260,27 +316,61 @@ impl SupervisionState {
     }
 }
 
-/// Observable host state, for `/plugin`, doctor and tests.
+/// Observable host state: the one source for `/plugin` and for the error a
+/// tool call routed to the host gets while it is down ([`fmt::Display`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HostStatus {
+    /// `[features] extension_host` is off for this process.
+    Disabled,
+    /// Not started: nothing has needed it yet.
     Idle,
     Starting,
     Ready {
         pid: Option<u32>,
-        node_version: String,
-        /// `seatbelt` / `bwrap`, or `None` when the host runs unsandboxed.
-        sandbox: Option<String>,
+        /// `bun` or `node`.
+        runtime: &'static str,
+        /// As reported by the host (`host/hello`).
+        runtime_version: String,
+        sandbox: supervisor::HostSandbox,
+        /// How the memory cap is enforced for this process.
+        memory: supervisor::MemoryEnforcement,
     },
     Unresponsive {
         pid: Option<u32>,
     },
+    /// Crashed (or retired for maintenance); the supervisor restarts it.
     Restarting {
         reason: String,
     },
+    /// Start refused (`start failed: …`) or crash budget exhausted; only an
+    /// explicit plugin change or reload retries.
     Failed {
         reason: String,
         stderr_tail: String,
     },
+}
+
+/// Why the host can or cannot take a call, in one phrase.
+impl fmt::Display for HostStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Disabled => f.write_str("disabled by config ([features] extension_host is off)"),
+            Self::Idle => f.write_str(
+                "not started (it starts in the background when a reviewed plugin with host code is enabled)",
+            ),
+            Self::Starting => f.write_str("starting"),
+            Self::Ready { .. } => f.write_str("running"),
+            Self::Unresponsive { pid } => write!(
+                f,
+                "unresponsive (pid {} missed its heartbeat; the supervisor restarts it if it stays silent)",
+                pid.map_or_else(|| "?".to_string(), |pid| pid.to_string())
+            ),
+            Self::Restarting { reason } => write!(f, "restarting after: {reason}"),
+            Self::Failed { reason, .. } => {
+                write!(f, "{reason} (change or reload a plugin to retry)")
+            }
+        }
+    }
 }
 
 enum HostSlot {
@@ -290,6 +380,42 @@ enum HostSlot {
     Unresponsive(Arc<HostProcess>),
     Restarting { reason: String },
     Failed { reason: String, stderr_tail: String },
+}
+
+impl HostSlot {
+    fn status(&self) -> HostStatus {
+        match self {
+            Self::Idle => HostStatus::Idle,
+            Self::Starting => HostStatus::Starting,
+            Self::Ready(host) if host.is_retiring() => HostStatus::Restarting {
+                reason: DIRTY_RESTART_REASON.to_string(),
+            },
+            // The exit watcher reports the exit a moment later.
+            Self::Ready(host) | Self::Unresponsive(host) if host.has_exited() => {
+                HostStatus::Restarting {
+                    reason: "the host process exited".to_string(),
+                }
+            }
+            Self::Ready(host) => HostStatus::Ready {
+                pid: host.pid,
+                runtime: host.runtime.kind.name(),
+                runtime_version: host.runtime_version.get().cloned().unwrap_or_default(),
+                sandbox: host.sandbox.clone(),
+                memory: host.memory(),
+            },
+            Self::Unresponsive(host) => HostStatus::Unresponsive { pid: host.pid },
+            Self::Restarting { reason } => HostStatus::Restarting {
+                reason: reason.clone(),
+            },
+            Self::Failed {
+                reason,
+                stderr_tail,
+            } => HostStatus::Failed {
+                reason: reason.clone(),
+                stderr_tail: stderr_tail.clone(),
+            },
+        }
+    }
 }
 
 struct DesiredOwner {
@@ -317,17 +443,93 @@ pub(crate) struct ManagerShared {
     diagnostics: Mutex<VecDeque<Diagnostic>>,
     /// Lock order: host, supervision, registry. Never held across await.
     supervision: Mutex<SupervisionState>,
+    /// Never held with another lock.
+    runtime: Mutex<RuntimePin>,
+}
+
+/// Which runtime this manager's hosts run on.
+#[derive(Default)]
+struct RuntimePin {
+    /// Set by the first host that completes the handshake and reused by
+    /// every restart, so a session never switches runtime (a `bun` install
+    /// or removal mid-session changes nothing until the next process; a
+    /// binary replaced at the pinned path is refused at the handshake). With
+    /// the one-line summary of why it was chosen, for `/plugin`.
+    pinned: Option<(crate::dependencies::HostRuntime, String)>,
+    /// `runtime = "auto"` only: a Bun host failed to launch or handshake
+    /// before anything was pinned, so every later launch this session
+    /// resolves Node.
+    bun_failed: bool,
+}
+
+/// Resolve the runtime unless one is pinned, materialize the bundle and plan
+/// the launch. Returns the summary to pin once a host on this runtime
+/// completes the handshake, or `None` when the runtime was already pinned.
+/// Blocking.
+fn prepare_launch(
+    options: &ExtensionHostOptions,
+    pinned: Option<(crate::dependencies::HostRuntime, String)>,
+    bun_failed: bool,
+) -> Result<(supervisor::HostLaunch, Option<String>), String> {
+    let (runtime, summary) = match pinned {
+        Some((runtime, _)) => (runtime, None),
+        None => {
+            let choice = if bun_failed {
+                crate::config::ExtensionHostRuntime::Node
+            } else {
+                options.runtime
+            };
+            let mut resolution = crate::dependencies::resolve_extension_host_runtime(
+                choice,
+                options.node_override.as_deref(),
+                options.bun_override.as_deref(),
+            );
+            // Report the configured choice, not the Node-only fallback.
+            resolution.choice = options.runtime;
+            let note = if bun_failed {
+                "; Bun failed to start this session (see diagnostics)"
+            } else {
+                ""
+            };
+            let Some(runtime) = resolution.selected.clone() else {
+                return Err(format!("{}{note}", resolution.failure()));
+            };
+            (runtime, Some(format!("{}{note}", resolution.summary())))
+        }
+    };
+    let root = host_root(options)?;
+    let bundle = materialize_bundle(&root)?;
+    let launch = supervisor::plan_launch(&runtime, &bundle, &root, options.supervision.memory_cap)?;
+    Ok((launch, summary))
+}
+
+/// The Codewhale home the host lives under.
+fn host_root(options: &ExtensionHostOptions) -> Result<PathBuf, String> {
+    match options.root.clone() {
+        Some(root) => Ok(root),
+        None => codewhale_config::codewhale_home()
+            .map_err(|error| format!("Codewhale home unavailable: {error}")),
+    }
+}
+
+/// The OS sandbox a host started now on `runtime` would run under, planned —
+/// and on Linux probed — exactly as a launch does (for doctor). Blocking;
+/// creates the host's data dir, as a launch would.
+pub(crate) fn planned_sandbox(
+    options: &ExtensionHostOptions,
+    runtime: &crate::dependencies::HostRuntime,
+) -> Result<supervisor::HostSandbox, String> {
+    supervisor::planned_sandbox(runtime, &host_root(options)?)
 }
 
 impl ManagerShared {
     async fn deactivate_owner(&self, host: &Arc<HostProcess>, owner: &OwnerRef) {
         let diagnostic = match host
-            .request_with_deadline(
+            .call(
                 CoreRequest::Deactivate(DeactivateParams {
                     owner: owner.clone(),
                 }),
                 None,
-                DISPOSE_DEADLINE + Duration::from_millis(500),
             )
             .await
             .map(serde_json::from_value::<DeactivateResult>)
@@ -382,22 +584,29 @@ impl ManagerShared {
         }
     }
 
-    fn ready_host(&self) -> Option<Arc<HostProcess>> {
+    /// The host, when it can take a call; otherwise why not.
+    fn ready_host(&self) -> Result<Arc<HostProcess>, HostStatus> {
         match &*self.host.lock().expect("host lock") {
             HostSlot::Ready(host) if !host.has_exited() && !host.is_retiring() => {
-                Some(Arc::clone(host))
+                Ok(Arc::clone(host))
             }
-            _ => None,
+            slot => Err(slot.status()),
         }
     }
 
     /// Re-check everything a call depends on, immediately before it is sent:
+    /// a running host (first, so a call to a host that is down says why),
     /// exact owner generation, the reviewed receipt and staged bytes, the
-    /// Native adapter in this build's policy, and a running host.
+    /// Native adapter in this build's policy, and the host again.
     pub(crate) async fn live_host_for(
         &self,
         registration: &ToolRegistration,
     ) -> Result<Arc<HostProcess>, String> {
+        let policy = activation::extension_host_policy_enabled();
+        if !policy {
+            return Err(host_down(&HostStatus::Disabled));
+        }
+        self.ready_host().map_err(|status| host_down(&status))?;
         let authority = {
             let registry = self.registry.lock().expect("registry lock");
             if !registry.is_live(registration.handle, &registration.owner) {
@@ -410,7 +619,6 @@ impl ManagerShared {
                 .authority_for(&registration.owner)
                 .ok_or_else(|| "extension owner has no authority".to_string())?
         };
-        let policy = activation::extension_host_policy_enabled();
         tokio::task::spawn_blocking(move || {
             let _scope = activation::PolicyScope::propagate(policy);
             crate::plugins::registry::verify_plugin_component_authority(
@@ -420,9 +628,13 @@ impl ManagerShared {
         })
         .await
         .map_err(|error| format!("authority check failed: {error}"))??;
-        self.ready_host()
-            .ok_or_else(|| "the extension host is not running".to_string())
+        self.ready_host().map_err(|status| host_down(&status))
     }
+}
+
+/// The error a host tool call gets while the host cannot take it.
+fn host_down(status: &HostStatus) -> String {
+    format!("extension host is down: {status}")
 }
 
 /// Channel callbacks. Holds a `Weak` so the host process (which owns the
@@ -665,6 +877,20 @@ fn monitor_host(shared: &Arc<ManagerShared>, host: &Arc<HostProcess>, generation
             if restart_dirty_host_when_idle(&shared, &host, generation) {
                 return;
             }
+            // Only where no kernel limit is planned (a macOS Node host).
+            if host.memory() == supervisor::MemoryEnforcement::Heartbeat
+                && let Some(resident) = host.pid.and_then(supervisor::resident_bytes)
+                && resident > host.memory_cap
+            {
+                shared.diagnostic(format!(
+                    "extension host exceeded its memory cap ({} MiB resident, cap {} MiB); killed",
+                    resident / (1024 * 1024),
+                    host.memory_cap / (1024 * 1024)
+                ));
+                drop(shared);
+                host.terminate("exceeded the memory cap".into());
+                return;
+            }
             drop(shared);
             let (id, mut answer) = match host.start_request(CoreRequest::Ping, None) {
                 Ok(request) => {
@@ -752,35 +978,27 @@ impl ExtensionHostManager {
                 sync_lock: tokio::sync::Mutex::new(()),
                 diagnostics: Mutex::new(VecDeque::new()),
                 supervision: Mutex::new(SupervisionState::default()),
+                runtime: Mutex::new(RuntimePin::default()),
             }),
         }
     }
 
     #[must_use]
     pub fn status(&self) -> HostStatus {
-        match &*self.shared.host.lock().expect("host lock") {
-            HostSlot::Idle => HostStatus::Idle,
-            HostSlot::Starting => HostStatus::Starting,
-            HostSlot::Ready(host) if host.is_retiring() => HostStatus::Restarting {
-                reason: DIRTY_RESTART_REASON.to_string(),
-            },
-            HostSlot::Ready(host) => HostStatus::Ready {
-                pid: host.pid,
-                node_version: host.node_version.get().cloned().unwrap_or_default(),
-                sandbox: host.sandbox.clone(),
-            },
-            HostSlot::Unresponsive(host) => HostStatus::Unresponsive { pid: host.pid },
-            HostSlot::Restarting { reason } => HostStatus::Restarting {
-                reason: reason.clone(),
-            },
-            HostSlot::Failed {
-                reason,
-                stderr_tail,
-            } => HostStatus::Failed {
-                reason: reason.clone(),
-                stderr_tail: stderr_tail.clone(),
-            },
-        }
+        self.shared.host.lock().expect("host lock").status()
+    }
+
+    /// The pinned runtime's one-line summary, once a host on it has completed
+    /// the handshake.
+    #[must_use]
+    pub fn runtime_summary(&self) -> Option<String> {
+        self.shared
+            .runtime
+            .lock()
+            .expect("runtime lock")
+            .pinned
+            .as_ref()
+            .map(|(_, summary)| summary.clone())
     }
 
     /// How many times this manager has tried to start a host process.
@@ -1108,7 +1326,7 @@ impl ExtensionHostManager {
                 }
             }
         }
-        let host = shared.ready_host();
+        let host = shared.ready_host().ok();
         for owner in revoked {
             shared.plugin_diagnostic(
                 &owner.plugin_id,
@@ -1153,13 +1371,7 @@ impl ExtensionHostManager {
                 },
                 config: json!({}),
             });
-            let outcome = host
-                .request_with_deadline(
-                    request,
-                    Some(plugin_id.to_string()),
-                    ACTIVATE_DEADLINE + std::time::Duration::from_secs(1),
-                )
-                .await;
+            let outcome = host.call(request, Some(plugin_id.to_string())).await;
             match outcome.map(serde_json::from_value::<ActivateResult>) {
                 Ok(Ok(ActivateResult::Ok { tools: mut names })) => tools.append(&mut names),
                 Ok(Ok(ActivateResult::Failed { diagnostic })) => {
@@ -1216,23 +1428,14 @@ impl ExtensionHostManager {
 
     async fn ensure_host(&self, policy: bool) -> Result<Arc<HostProcess>, String> {
         let shared = &self.shared;
-        let generation = {
+        let mut generation = {
             let mut slot = shared.host.lock().expect("host lock");
             match &*slot {
                 HostSlot::Ready(host) if !host.has_exited() && !host.is_retiring() => {
                     return Ok(Arc::clone(host));
                 }
-                HostSlot::Ready(_) | HostSlot::Unresponsive(_) => {
-                    return Err("extension host is unavailable; waiting for supervision".into());
-                }
-                HostSlot::Restarting { .. } => return Err("extension host is restarting".into()),
-                HostSlot::Failed { reason, .. } => {
-                    return Err(format!(
-                        "extension host is failed ({reason}); change/reload a plugin to retry"
-                    ));
-                }
-                HostSlot::Starting => return Err("extension host is starting".into()),
                 HostSlot::Idle => {}
+                other => return Err(host_down(&other.status())),
             }
             *slot = HostSlot::Starting;
             let mut supervision = shared.supervision.lock().expect("supervision lock");
@@ -1244,52 +1447,82 @@ impl ExtensionHostManager {
             supervision.planned_restart = None;
             shared.host_generation.fetch_add(1, Ordering::SeqCst) + 1
         };
-        shared.spawn_attempts.fetch_add(1, Ordering::SeqCst);
-        let options = shared.options.clone();
-        let prepared = tokio::task::spawn_blocking(move || -> Result<supervisor::HostLaunch, String> {
-            let resolution =
-                crate::dependencies::resolve_node_for_extension_host(options.node_override.as_deref());
-            let Some((node, _)) = resolution.selected else {
-                return Err(format!(
-                    "the extension host needs Node.js ^22.19 || >=24 (set `[extension_host] node`); {}",
-                    resolution.describe_rejections()
-                ));
+        // At most two launches: under `auto`, before anything is pinned, a
+        // Bun that cannot start is reported once and Node is resolved for the
+        // rest of the session. An explicit `bun` or `node` never falls back.
+        let spawned = loop {
+            shared.spawn_attempts.fetch_add(1, Ordering::SeqCst);
+            let options = shared.options.clone();
+            let (pinned, bun_failed) = {
+                let runtime = shared.runtime.lock().expect("runtime lock");
+                (runtime.pinned.clone(), runtime.bun_failed)
             };
-            let root = match options.root {
-                Some(root) => root,
-                None => codewhale_config::codewhale_home()
-                    .map_err(|error| format!("Codewhale home unavailable: {error}"))?,
+            let prepared =
+                tokio::task::spawn_blocking(move || prepare_launch(&options, pinned, bun_failed))
+                    .await
+                    .map_err(|error| format!("extension host preparation failed: {error}"))
+                    .and_then(|result| result);
+            let (launch, summary) = match prepared {
+                Ok(prepared) => prepared,
+                Err(error) => break Err(error),
             };
-            let bundle = materialize_bundle(&root)?;
-            supervisor::plan_launch(&node, &bundle, &root)
-        })
-        .await
-        .map_err(|error| format!("extension host preparation failed: {error}"))
-        .and_then(|result| result);
-        let spawned = match prepared {
-            Ok(launch) => {
-                let events: Arc<dyn HostEvents> = Arc::new(Events {
-                    shared: Arc::downgrade(shared),
-                    generation,
-                });
-                HostProcess::spawn(generation, &launch, bundle_sha256(), events).await
+            let events: Arc<dyn HostEvents> = Arc::new(Events {
+                shared: Arc::downgrade(shared),
+                generation,
+            });
+            let reason =
+                match HostProcess::spawn(generation, &launch, bundle_sha256(), events).await {
+                    Ok(host) => break Ok((host, summary)),
+                    Err(reason) => reason,
+                };
+            if shared.options.runtime != crate::config::ExtensionHostRuntime::Auto
+                || launch.runtime.kind != crate::dependencies::HostRuntimeKind::Bun
+                || summary.is_none()
+            {
+                break Err(reason);
             }
-            Err(error) => Err(error),
+            shared.runtime.lock().expect("runtime lock").bun_failed = true;
+            shared.diagnostic(format!(
+                "extension host: Bun {} at {} failed to start ({reason}); runtime = \"auto\" uses Node for the rest of this session",
+                launch.runtime.version_string(),
+                launch.runtime.path.display()
+            ));
+            // A fresh generation, so the failed Bun host's exit report can
+            // never be taken for the Node host's.
+            generation = {
+                let slot = shared.host.lock().expect("host lock");
+                if shared.host_generation.load(Ordering::SeqCst) != generation
+                    || !matches!(&*slot, HostSlot::Starting)
+                {
+                    break Err("extension host startup was superseded".into());
+                }
+                shared.host_generation.fetch_add(1, Ordering::SeqCst) + 1
+            };
         };
         let mut slot = shared.host.lock().expect("host lock");
         if shared.host_generation.load(Ordering::SeqCst) != generation
             || !matches!(&*slot, HostSlot::Starting)
         {
             drop(slot);
-            if let Ok(host) = spawned {
+            if let Ok((host, _)) = spawned {
                 host.terminate("host startup superseded".into());
             }
             return Err("extension host startup was superseded".into());
         }
         match spawned {
-            Ok(host) => {
+            Ok((host, summary)) => {
                 *slot = HostSlot::Ready(Arc::clone(&host));
                 drop(slot);
+                // Pinned only once a host on this runtime has completed the
+                // handshake; every restart then reuses it.
+                if let Some(summary) = summary {
+                    let mut runtime = shared.runtime.lock().expect("runtime lock");
+                    if runtime.pinned.is_none() {
+                        runtime.pinned = Some((host.runtime.clone(), summary.clone()));
+                        drop(runtime);
+                        shared.diagnostic(format!("extension host runtime: {summary}"));
+                    }
+                }
                 if host.has_exited() {
                     Events {
                         shared: Arc::downgrade(shared),
@@ -1304,11 +1537,12 @@ impl ExtensionHostManager {
                 }
                 monitor_host(shared, &host, generation);
                 shared.diagnostic(format!(
-                    "extension host started (pid {}, node {}, sandbox {})",
+                    "extension host started (pid {}, {} {}, sandbox {})",
                     host.pid
                         .map_or_else(|| "?".to_string(), |pid| pid.to_string()),
-                    host.node_version.get().map_or("?", String::as_str),
-                    host.sandbox.as_deref().unwrap_or("none")
+                    host.runtime.kind.name(),
+                    host.runtime_version.get().map_or("?", String::as_str),
+                    host.sandbox.label()
                 ));
                 Ok(host)
             }
@@ -1319,7 +1553,7 @@ impl ExtensionHostManager {
                     .expect("supervision lock")
                     .launch_failed = true;
                 *slot = HostSlot::Failed {
-                    reason: reason.clone(),
+                    reason: format!("start failed: {reason}"),
                     stderr_tail: String::new(),
                 };
                 drop(slot);
@@ -1361,12 +1595,15 @@ impl ExtensionHostManager {
 
     #[cfg(test)]
     pub(crate) fn host_requests_started(&self) -> Option<u64> {
-        self.shared.ready_host().map(|host| host.requests_started())
+        self.shared
+            .ready_host()
+            .ok()
+            .map(|host| host.requests_started())
     }
 
     #[cfg(test)]
     pub(crate) fn host_pid(&self) -> Option<u32> {
-        self.shared.ready_host().and_then(|host| host.pid)
+        self.shared.ready_host().ok().and_then(|host| host.pid)
     }
 }
 
@@ -1374,37 +1611,23 @@ impl ExtensionHostManager {
 pub(crate) fn render_status(manager: &ExtensionHostManager) -> String {
     use std::fmt::Write as _;
     let mut out = String::from("Extension host (experimental): ");
-    match manager.status() {
-        HostStatus::Idle => out.push_str(
-            "not running (starts in the background when a reviewed plugin with host code is enabled)",
-        ),
-        HostStatus::Starting => out.push_str("starting"),
+    let status = manager.status();
+    match status.clone() {
         HostStatus::Ready {
             pid,
-            node_version,
+            runtime,
+            runtime_version,
             sandbox,
+            memory: _,
         } => {
             let _ = write!(
                 out,
-                "running · pid {} · node {node_version} · {}",
+                "running · pid {} · {runtime} {runtime_version} · {sandbox}",
                 pid.map_or_else(|| "?".to_string(), |pid| pid.to_string()),
-                match sandbox {
-                    Some(sandbox) => format!(
-                        "{sandbox} sandbox (no direct network; the Codewhale home except plugin code, the Codex and DSH credential homes and the default credential stores are unreadable; other files you can read, such as project .env files, are not protected)"
-                    ),
-                    None => "UNSANDBOXED: host code runs with your user permissions".to_string(),
-                }
             );
         }
-        HostStatus::Unresponsive { pid } => {
-            let _ = write!(out, "unresponsive · pid {} (supervisor is waiting for a pong)", pid.map_or_else(|| "?".into(), |pid| pid.to_string()));
-        }
-        HostStatus::Restarting { reason } => { let _ = write!(out, "restarting after: {reason}"); }
-        HostStatus::Failed {
-            reason,
-            stderr_tail,
-        } => {
-            let _ = write!(out, "failed: {reason} (change/reload a plugin to retry)");
+        HostStatus::Failed { stderr_tail, .. } => {
+            let _ = write!(out, "{status}");
             let tail = stderr_tail.trim();
             if !tail.is_empty() {
                 let start = tail
@@ -1414,6 +1637,18 @@ pub(crate) fn render_status(manager: &ExtensionHostManager) -> String {
                     .map_or(0, |(index, _)| index);
                 let _ = write!(out, "\n  stderr: {}", &tail[start..]);
             }
+        }
+        down => {
+            let _ = write!(out, "{down}");
+        }
+    }
+    if let Some(summary) = manager.runtime_summary() {
+        let _ = write!(out, "\n  runtime: {summary}");
+        // How the running host's cap is enforced, as its handshake settled
+        // it; with no host running there is nothing enforced to describe.
+        if let HostStatus::Ready { memory, .. } = &status {
+            let cap = manager.shared.options.supervision.memory_cap;
+            let _ = write!(out, " · {}", memory.describe(cap));
         }
     }
     let _ = write!(
@@ -1462,10 +1697,14 @@ pub fn plugins_changed(plugins: Arc<PluginRegistry>) {
     }
 }
 
-/// The `/plugin` section, or `None` when the experimental host is off.
+/// The `/plugin` section. With the experimental host off it is one line
+/// saying so.
 #[must_use]
-pub fn status_report() -> Option<String> {
-    activation::extension_host_policy_enabled().then(|| render_status(&manager()))
+pub fn status_report() -> String {
+    if !activation::extension_host_policy_enabled() {
+        return format!("Extension host (experimental): {}", HostStatus::Disabled);
+    }
+    render_status(&manager())
 }
 
 pub struct OwnerReport {

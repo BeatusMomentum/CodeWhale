@@ -169,6 +169,24 @@ pub(crate) fn render_underwater_surface(
     inner
 }
 
+/// Render wrapped detail text scrolled by *rendered* rows and return the
+/// largest useful scroll. Clamping by logical lines before wrapping left the
+/// wrapped tail unreachable and made each step jump a whole wrapped line.
+pub(crate) fn render_wrapped_detail(
+    lines: Vec<Line<'static>>,
+    area: Rect,
+    buf: &mut Buffer,
+    requested_scroll: usize,
+) -> usize {
+    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
+    let max_scroll = paragraph
+        .line_count(area.width.max(1))
+        .saturating_sub(usize::from(area.height).max(1));
+    let scroll = u16::try_from(requested_scroll.min(max_scroll)).unwrap_or(u16::MAX);
+    paragraph.scroll((scroll, 0)).render(area, buf);
+    max_scroll
+}
+
 /// Paint a scrollbar on the exact right edge of the panel it controls and
 /// return the content rect with that rail reserved. Nothing is drawn when all
 /// rows fit, so narrow surfaces do not spend a column on a fictional control.
@@ -2093,6 +2111,9 @@ pub struct ConfigView {
     selected: usize,
     scroll: usize,
     editing: Option<ConfigEdit>,
+    /// The editor as it was committed, kept until the host answers: a rejected
+    /// value reopens it with the typed buffer instead of dropping it (U09-m1).
+    pending_commit: Option<ConfigEdit>,
     filter: String,
     status: Option<String>,
     locale: Locale,
@@ -2820,6 +2841,7 @@ impl ConfigView {
             selected: 0,
             scroll: 0,
             editing: None,
+            pending_commit: None,
             filter: String::new(),
             status: None,
             locale: app.ui_locale,
@@ -2930,6 +2952,19 @@ impl ConfigView {
             None => view.editing = None,
         }
         view
+    }
+
+    /// Reopen the editor the host just rejected, with the value the user
+    /// typed, on a view rebuilt from disk truth. A row that no longer exists
+    /// has nothing to reopen.
+    pub(crate) fn restore_rejected_commit(&mut self, previous: &Self) {
+        let Some(edit) = previous.pending_commit.clone() else {
+            return;
+        };
+        if let Some(index) = self.rows.iter().position(|row| row.key == edit.key) {
+            self.selected = index;
+            self.editing = Some(edit);
+        }
     }
 
     pub(crate) fn restore_filter(&mut self, filter: String) {
@@ -3355,6 +3390,7 @@ impl ConfigView {
         let Some(edit) = self.editing.take() else {
             return ViewAction::None;
         };
+        self.pending_commit = Some(edit.clone());
         self.last_mouse_selected = None;
         self.clear_hover();
         let value = match edit.choices.as_ref() {
@@ -5751,14 +5787,16 @@ pub(crate) fn subagent_view_agents(
                 if seen.insert(card.agent_id.clone()) =>
             {
                 let agent_type = FleetRole::from_str(&card.agent_type).unwrap_or(FleetRole::Worker);
-                agents.push(live_subagent_result(
+                let mut row = live_subagent_result(
                     &card.agent_id,
                     agent_type,
-                    lifecycle_to_subagent_status(card.status),
+                    lifecycle_to_subagent_status(card.status, card.summary.as_deref()),
                     card.summary.as_deref().unwrap_or(card.agent_type.as_str()),
                     Some("transcript"),
                     None, // transcript-derived rows get nickname from manager on render
-                ));
+                );
+                row.worker_status = lifecycle_worker_status(card.status);
+                agents.push(row);
             }
             HistoryCell::SubAgent(SubAgentCell::Fanout(card)) => {
                 for worker in &card.workers {
@@ -5768,14 +5806,16 @@ pub(crate) fn subagent_view_agents(
                             summarize_tool_output(&card.kind),
                             summarize_tool_output(&worker.worker_id)
                         );
-                        agents.push(live_subagent_result(
+                        let mut row = live_subagent_result(
                             &worker.agent_id,
                             FleetRole::Worker,
-                            lifecycle_to_subagent_status(worker.status),
+                            lifecycle_to_subagent_status(worker.status, None),
                             &objective,
                             Some(card.kind.as_str()),
                             None, // fanout worker rows get nickname from manager on render
-                        ));
+                        );
+                        row.worker_status = lifecycle_worker_status(worker.status);
+                        agents.push(row);
                     }
                 }
             }
@@ -5814,16 +5854,39 @@ pub(crate) fn subagent_view_agents(
     agents
 }
 
-fn lifecycle_to_subagent_status(status: AgentLifecycle) -> SubAgentStatus {
+/// Project a transcript card's lifecycle onto the manager status vocabulary.
+/// A failure or interruption keeps the reason the card recorded from its
+/// terminal envelope; only a card that recorded none gets the generic line.
+///
+/// `SubAgentStatus` has no pending state; callers carry a pending worker as
+/// `worker_status: Queued` (see [`lifecycle_worker_status`]) so it is not
+/// shown as running.
+fn lifecycle_to_subagent_status(status: AgentLifecycle, reason: Option<&str>) -> SubAgentStatus {
+    let reason = |fallback: &str| {
+        reason
+            .map(str::trim)
+            .filter(|reason| !reason.is_empty())
+            .unwrap_or(fallback)
+            .to_string()
+    };
     match status {
         AgentLifecycle::Pending | AgentLifecycle::Running => SubAgentStatus::Running,
         AgentLifecycle::Completed => SubAgentStatus::Completed,
-        AgentLifecycle::Failed => SubAgentStatus::Failed("failed in transcript".to_string()),
+        AgentLifecycle::Failed => SubAgentStatus::Failed(reason("failed in transcript")),
         AgentLifecycle::Cancelled => SubAgentStatus::Cancelled,
         AgentLifecycle::Interrupted => {
-            SubAgentStatus::Interrupted("interrupted in transcript".to_string())
+            SubAgentStatus::Interrupted(reason("interrupted in transcript"))
         }
     }
+}
+
+/// The worker-status detail a transcript lifecycle adds to its projected
+/// manager status: a spawned but not yet started worker is `Queued`, which the
+/// row label and whale state show instead of the coarse `Running`.
+fn lifecycle_worker_status(
+    status: AgentLifecycle,
+) -> Option<crate::tools::subagent::AgentWorkerStatus> {
+    (status == AgentLifecycle::Pending).then_some(crate::tools::subagent::AgentWorkerStatus::Queued)
 }
 
 fn live_subagent_result(
@@ -6400,7 +6463,7 @@ fn append_subagent_group(
             .unwrap_or_else(|| format!("{id:<12}"));
         let kind = format_agent_type(whale.locale, &agent.agent_type);
         let (status, status_style, status_detail) =
-            format_agent_status(whale.locale, &agent.status);
+            format_agent_status(whale.locale, &agent.status, agent.worker_status);
 
         let name_style = if is_selected {
             Style::default().fg(palette::WHALE_ACTION).bold()
@@ -6610,10 +6673,21 @@ fn format_agent_type(locale: Locale, agent_type: &FleetRole) -> Cow<'static, str
 fn format_agent_status(
     locale: Locale,
     status: &SubAgentStatus,
+    worker_status: Option<crate::tools::subagent::AgentWorkerStatus>,
 ) -> (Cow<'static, str>, ratatui::style::Style, Option<&str>) {
     use ratatui::style::Style;
 
     match status {
+        // A worker that has not started yet waits; it is not running.
+        SubAgentStatus::Running
+            if worker_status == Some(crate::tools::subagent::AgentWorkerStatus::Queued) =>
+        {
+            (
+                tr(locale, MessageId::AutomationRunStatusQueued),
+                Style::default().fg(palette::STATUS_WARNING),
+                None,
+            )
+        }
         SubAgentStatus::Running => (
             tr(locale, MessageId::AutomationRunStatusRunning),
             Style::default().fg(palette::WHALE_ACTION),
@@ -6909,14 +6983,11 @@ mod tests {
                 Locale::ZhHans,
                 MessageId::SubagentsCurrentSessionFleetWorkersTitle
             ),
-            "当前会话的舰队工作器"
+            "本会话的智能体"
         );
+        assert!(zh_hans_compact.contains("本会话的智能体"), "{zh_hans_text}");
         assert!(
-            zh_hans_compact.contains("当前会话的舰队工作器"),
-            "{zh_hans_text}"
-        );
-        assert!(
-            zh_hans_compact.contains("子代理角色是当前会话的舰队工作器角色。"),
+            zh_hans_compact.contains("所示角色为本会话中智能体的角色。"),
             "{zh_hans_text}"
         );
         assert!(
@@ -6999,21 +7070,21 @@ mod tests {
             .filter(|ch| !ch.is_whitespace())
             .collect::<String>();
         for expected in [
-            "当前会话的舰队工作器",
+            "本会话的智能体",
             "运行中：1",
             "已中断：1",
-            "名册设置工作器",
-            "实时工作器状态·角色·目标·模型·已用时间",
+            "Fleet设置智能体",
+            "实时智能体状态·角色·目标·模型·已用时间",
             "运行中（1）",
             "构建者",
             "原因：manualreview",
             "角色：release",
-            "权限：网络=开·Shell=只读·写入=开",
+            "访问级别：网络=开·Shell=只读·写入=开",
             "Git：分支feature/localize@fleet-workers",
             "目标：verifylocalizedrow",
             "结果：allcheckspassed",
             "刷新",
-            "名册/设置",
+            "fleet/setup",
         ] {
             assert!(
                 zh_hans_compact.contains(expected),
@@ -9538,6 +9609,54 @@ context_window = 262144
         assert!(matches!(clear, ViewAction::None));
         assert!(view.filter.is_empty());
         assert!(!visible_row_keys(&view).is_empty());
+    }
+
+    #[test]
+    fn a_rejected_setting_reopens_the_editor_with_the_typed_value() {
+        let app = create_test_app();
+        let mut view = ConfigView::new_for_app(&app);
+        type_filter(&mut view, "mcp_config");
+        view.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        view.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        type_filter(&mut view, "servers.json");
+        assert!(matches!(
+            view.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            ViewAction::Emit(ViewEvent::ConfigUpdated { .. })
+        ));
+        assert!(view.editing.is_none());
+
+        let accepted = ConfigView::rebuild_preserving(&app, &view, "mcp_config_path");
+        assert!(
+            accepted.editing.is_none(),
+            "an accepted value closes the editor"
+        );
+
+        let mut rejected = ConfigView::rebuild_preserving(&app, &view, "mcp_config_path");
+        rejected.restore_rejected_commit(&view);
+        let edit = rejected.editing.as_ref().expect("a rejected value reopens");
+        assert_eq!(edit.key, "mcp_config_path");
+        assert_eq!(edit.buffer.iter().collect::<String>(), "servers.json");
+    }
+
+    #[test]
+    fn a_pending_worker_row_reads_queued_not_running() {
+        use crate::tools::subagent::AgentWorkerStatus;
+        assert_eq!(
+            super::lifecycle_worker_status(AgentLifecycle::Pending),
+            Some(AgentWorkerStatus::Queued)
+        );
+        assert_eq!(
+            super::lifecycle_worker_status(AgentLifecycle::Running),
+            None
+        );
+        let (queued, ..) = super::format_agent_status(
+            Locale::En,
+            &SubAgentStatus::Running,
+            Some(AgentWorkerStatus::Queued),
+        );
+        let (running, ..) = super::format_agent_status(Locale::En, &SubAgentStatus::Running, None);
+        assert_eq!(queued, tr(Locale::En, MessageId::AutomationRunStatusQueued));
+        assert_ne!(queued, running);
     }
 
     #[test]

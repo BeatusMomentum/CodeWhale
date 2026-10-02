@@ -3999,8 +3999,10 @@ impl ModalView for ModelPickerView {
             // Shift+D makes the visible provider/model pair the startup
             // default. Plain Enter deliberately stays session-local, so a
             // one-off route comparison cannot silently change the next launch.
+            // Exactly Shift: this chord persists the next launch's route, so
+            // Ctrl/Alt/Super+Shift+D must not save it by accident (U07-12).
             KeyCode::Char(ch)
-                if key.modifiers.contains(KeyModifiers::SHIFT)
+                if key.modifiers == KeyModifiers::SHIFT
                     && self.query.is_empty()
                     && ch.eq_ignore_ascii_case(&'d')
                     && self.selected_model_is_selectable() =>
@@ -4011,7 +4013,7 @@ impl ModalView for ModelPickerView {
             // ⇧D is query text: it used to open provider auth for a row that
             // was not locked at all (#6500).
             KeyCode::Char(ch)
-                if key.modifiers.contains(KeyModifiers::SHIFT)
+                if key.modifiers == KeyModifiers::SHIFT
                     && self.query.is_empty()
                     && ch.eq_ignore_ascii_case(&'d') =>
             {

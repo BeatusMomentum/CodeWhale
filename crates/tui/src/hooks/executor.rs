@@ -202,6 +202,83 @@ impl HookContext {
         self
     }
 
+    /// Project the shell's post-admission receipt into the versioned observer
+    /// contract. Never reconstruct execution identity from requested arguments.
+    fn tool_after_payload(&self) -> Option<serde_json::Value> {
+        let tool_name = self.tool_name.as_deref()?;
+        if !is_shell_tool_name(tool_name) {
+            return None;
+        }
+        let encoded = self.tool_execution_receipt.as_deref()?;
+        if encoded.len() > HOOK_EXECUTION_RECEIPT_MAX_BYTES {
+            return None;
+        }
+        let receipt: serde_json::Value = serde_json::from_str(encoded).ok()?;
+        if receipt.get("schema_version")?.as_u64()? != 1
+            || receipt.get("scope")?.as_str()? != "local"
+            || !matches!(receipt.get("state")?.as_str()?, "completed" | "interrupted")
+        {
+            return None;
+        }
+        let completion = self.tool_status.as_deref()?;
+        if !matches!(completion, "completed" | "failed" | "killed" | "timed_out") {
+            return None;
+        }
+        let command = receipt.get("command")?.as_str()?;
+        let cwd = receipt.get("cwd")?.as_str()?;
+        if command.is_empty()
+            || command.contains('\0')
+            || cwd.contains('\0')
+            || !std::path::Path::new(cwd).is_absolute()
+        {
+            return None;
+        }
+        let exit_code = receipt.get("exit_code")?;
+        if !exit_code.is_null() && exit_code.as_i64().is_none() {
+            return None;
+        }
+        let output_mode = receipt.get("output_kind")?.as_str()?;
+        let stdout = receipt.get("stdout")?.as_str()?;
+        let stderr = receipt.get("stderr")?.as_str()?;
+        if !matches!(output_mode, "separate" | "combined")
+            || (output_mode == "combined" && !stderr.is_empty())
+        {
+            return None;
+        }
+        // Bound correlation fields before the observer queue clamps its legacy
+        // environment context, so every stdin truncation flag remains truthful.
+        const ID_MAX_BYTES: usize = 1_024;
+        let bounded_id =
+            |id: &Option<String>| id.as_deref().map(|s| truncate_env_value(s, ID_MAX_BYTES));
+        let clipped_id = |id: &Option<String>| id.as_ref().is_some_and(|s| s.len() > ID_MAX_BYTES);
+        let payload = json!({
+            "schema_version": 1,
+            "event": "tool_call_after",
+            "tool_name": tool_name,
+            "session_id": bounded_id(&self.session_id),
+            "tool_call_id": bounded_id(&self.tool_call_id),
+            "session_id_truncated": clipped_id(&self.session_id),
+            "tool_call_id_truncated": clipped_id(&self.tool_call_id),
+            "tool_name_truncated": false,
+            "execution_receipt": {
+                "schema_version": 1,
+                "command": command,
+                "cwd": cwd,
+                "command_truncated": false,
+                "cwd_truncated": false,
+                "execution": "started",
+                "completion": completion,
+                "exit_code": exit_code,
+                "stdout": stdout,
+                "stderr": stderr,
+                "stdout_truncated": receipt.get("stdout_truncated")?.as_bool()?,
+                "stderr_truncated": receipt.get("stderr_truncated")?.as_bool()?,
+                "output_mode": output_mode,
+            },
+        });
+        (serde_json::to_vec(&payload).ok()?.len() <= 64 * 1024).then_some(payload)
+    }
+
     /// Convert to environment variables
     pub fn to_env_vars(&self) -> HashMap<String, String> {
         let mut env = HashMap::new();
@@ -1858,6 +1935,11 @@ impl HookExecutor {
             // tool dispatch even for users with zero hooks configured.
             return Vec::new();
         }
+        if event == HookEvent::ToolCallAfter
+            && let Some(payload) = context.tool_after_payload()
+        {
+            return self.execute_json_observer(event, context, &payload);
+        }
         let env_vars = context.to_env_vars();
         let mut results = Vec::new();
 
@@ -1959,6 +2041,11 @@ impl HookExecutor {
     pub fn submit_observer(&self, event: HookEvent, context: HookContext) -> Result<(), String> {
         if !self.has_hooks_for_event(event) {
             return Ok(());
+        }
+        if event == HookEvent::ToolCallAfter
+            && let Some(payload) = context.tool_after_payload()
+        {
+            return self.submit_json_observer(event, context, payload);
         }
         self.observer_dispatcher.submit(
             event,
@@ -5739,6 +5826,207 @@ command = "echo project"
                 .tool_execution_receipt
                 .is_none()
         );
+    }
+
+    fn shell_receipt_context() -> HookContext {
+        HookContext::new()
+            .with_tool_name("Bash")
+            .with_session_id("session-receipt")
+            .with_tool_call_id("call-receipt")
+            .with_tool_args(&json!({"command": "requested, not executed", "cwd": "/wrong"}))
+            .with_tool_outcome(&Ok(crate::tools::spec::ToolResult::success("preview")
+                .with_metadata(json!({
+                    "status": "Failed",
+                    "exit_code": 7,
+                    "execution_receipt": {
+                        "schema_version": 1, "command": "printf effective; exit 7",
+                        "cwd": std::env::temp_dir().to_str().unwrap(), "scope": "local",
+                        "state": "completed", "exit_code": 7, "stdout": "effective",
+                        "stderr": "diagnostic", "stdout_truncated": false,
+                        "stderr_truncated": true, "output_kind": "separate"
+                    }
+                }))))
+    }
+
+    #[test]
+    fn tool_after_stdin_uses_execution_evidence_and_truthful_bounds() {
+        let mut context = shell_receipt_context();
+        let original_env = context.to_env_vars();
+        for name in ["bash", "Bash", "exec_shell"] {
+            context.tool_name = Some(name.into());
+            let payload = context.tool_after_payload().unwrap();
+            assert_eq!(payload["schema_version"], 1);
+            assert_eq!(payload["event"], "tool_call_after");
+            assert_eq!(payload["tool_name"], name);
+            let receipt = &payload["execution_receipt"];
+            assert_eq!(receipt["command"], "printf effective; exit 7");
+            assert_eq!(receipt["cwd"], std::env::temp_dir().to_str().unwrap());
+            assert_eq!(receipt["completion"], "failed");
+            assert_eq!(receipt["execution"], "started");
+            assert_eq!(receipt["exit_code"], 7);
+            assert_eq!(receipt["stderr_truncated"], true);
+            assert_eq!(receipt["command_truncated"], false);
+            assert_eq!(receipt["cwd_truncated"], false);
+            assert_eq!(payload["session_id_truncated"], false);
+            assert_eq!(payload["tool_call_id_truncated"], false);
+            assert_eq!(payload["tool_name_truncated"], false);
+        }
+        context.tool_name = Some("Bash".into());
+        assert_eq!(
+            context.to_env_vars(),
+            original_env,
+            "legacy receipt is unchanged"
+        );
+        context.session_id = Some("用户\u{1}".repeat(20_000));
+        context.tool_call_id = Some("鲸鱼".repeat(20_000));
+        let payload = context.tool_after_payload().unwrap();
+        assert_eq!(payload["session_id_truncated"], true);
+        assert_eq!(payload["tool_call_id_truncated"], true);
+        assert!(payload["session_id"].as_str().unwrap().len() <= 1_024 + 16);
+        assert!(serde_json::to_vec(&payload).unwrap().len() <= 64 * 1024);
+
+        for (completion, code) in [
+            ("killed", json!(null)),
+            ("timed_out", json!(null)),
+            ("failed", json!(3_221_225_477_i64)),
+            ("completed", json!(0)),
+        ] {
+            context.tool_status = Some(completion.into());
+            let mut receipt: serde_json::Value =
+                serde_json::from_str(context.tool_execution_receipt.as_deref().unwrap()).unwrap();
+            receipt["exit_code"] = code.clone();
+            context.tool_execution_receipt = Some(receipt.to_string());
+            let payload = context.tool_after_payload().unwrap();
+            assert_eq!(payload["execution_receipt"]["exit_code"], code);
+            assert_eq!(payload["execution_receipt"]["completion"], completion);
+        }
+    }
+
+    #[test]
+    fn tool_after_stdin_has_no_receipt_for_unknown_or_unsupported_execution() {
+        for name in ["mcp_shell", "task", "BASH"] {
+            assert!(
+                shell_receipt_context()
+                    .with_tool_name(name)
+                    .tool_after_payload()
+                    .is_none()
+            );
+        }
+        for status in [None, Some("running"), Some("unknown")] {
+            let mut context = shell_receipt_context();
+            context.tool_status = status.map(str::to_owned);
+            assert!(context.tool_after_payload().is_none());
+        }
+        for receipt in [
+            None,
+            Some("not JSON".into()),
+            Some("x".repeat(HOOK_EXECUTION_RECEIPT_MAX_BYTES + 1)),
+        ] {
+            let mut context = shell_receipt_context();
+            context.tool_execution_receipt = receipt;
+            assert!(context.tool_after_payload().is_none());
+        }
+        for (field, value) in [
+            ("schema_version", json!(2)),
+            ("scope", json!("remote")),
+            ("state", json!("running")),
+            ("command", json!("")),
+            ("cwd", json!("relative")),
+            ("exit_code", json!("0")),
+            ("stdout_truncated", json!(null)),
+            ("output_kind", json!("guessed")),
+            ("output_kind", json!("combined")),
+        ] {
+            let mut context = shell_receipt_context();
+            let mut receipt: serde_json::Value =
+                serde_json::from_str(context.tool_execution_receipt.as_deref().unwrap()).unwrap();
+            receipt[field] = value;
+            context.tool_execution_receipt = Some(receipt.to_string());
+            assert!(
+                context.tool_after_payload().is_none(),
+                "accepted invalid {field}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tool_after_stdin_delivers_real_shell_receipt_to_direct_and_queued_observers() {
+        use crate::tools::spec::ToolSpec;
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("payload.json");
+        let command = write_hook_script(
+            &dir,
+            "capture.sh",
+            &format!(
+                "#!/bin/sh\ncat > '{}'\nprintf '%s' '{{\"decision\":\"deny\",\"updatedInput\":{{\"command\":\"false\"}}}}'\n",
+                out.display()
+            ),
+        );
+        for background in [false, true] {
+            for queued in [false, true] {
+                let mut hook = Hook::new(HookEvent::ToolCallAfter, &command);
+                hook.background = background;
+                let hooks = HookExecutor::new(
+                    HooksConfig {
+                        enabled: true,
+                        hooks: vec![hook],
+                        ..Default::default()
+                    },
+                    dir.path().to_owned(),
+                );
+                let mut tool_context = crate::tools::spec::ToolContext::new(dir.path())
+                    .with_elevated_sandbox_policy(crate::sandbox::SandboxPolicy::DangerFullAccess);
+                tool_context.auto_approve = true;
+                tool_context.runtime.hook_executor = Some(Arc::new(hooks.clone()));
+                let result = crate::tools::shell::BashTool::new("Bash")
+                    .execute(
+                        json!({"command": "printf actual; printf diagnostic >&2; exit 7"}),
+                        &tool_context,
+                    )
+                    .await;
+                let context = HookContext::new()
+                    .with_tool_name("Bash")
+                    .with_session_id("receipt-session")
+                    .with_tool_call_id("receipt-call")
+                    .with_tool_args(&json!({"command": "requested, not executed"}))
+                    .with_tool_outcome(&result);
+                if out.exists() {
+                    std::fs::remove_file(&out).unwrap();
+                }
+                if queued {
+                    hooks
+                        .submit_observer(HookEvent::ToolCallAfter, context)
+                        .unwrap();
+                } else {
+                    let results = hooks.execute(HookEvent::ToolCallAfter, &context);
+                    assert_eq!(results.len(), 1);
+                    assert!(results[0].success);
+                }
+                let payload: serde_json::Value =
+                    serde_json::from_str(&wait_for_captured_output(&out)).unwrap();
+                assert_eq!(payload["session_id"], "receipt-session");
+                assert_eq!(payload["tool_call_id"], "receipt-call");
+                let receipt = &payload["execution_receipt"];
+                assert_eq!(
+                    receipt["command"],
+                    "printf actual; printf diagnostic >&2; exit 7"
+                );
+                assert_eq!(
+                    receipt["cwd"],
+                    dir.path().canonicalize().unwrap().to_str().unwrap()
+                );
+                assert_eq!(receipt["exit_code"], 7);
+                assert_eq!(receipt["completion"], "failed");
+                assert_eq!(receipt["stdout"], "actual");
+                assert_eq!(receipt["stderr"], "diagnostic");
+                assert_eq!(receipt["output_mode"], "separate");
+                assert!(
+                    !result.as_ref().unwrap().success,
+                    "observer output cannot rewrite the settled call"
+                );
+            }
+        }
     }
 
     /// An absent receipt must be absent in the actual child environment,

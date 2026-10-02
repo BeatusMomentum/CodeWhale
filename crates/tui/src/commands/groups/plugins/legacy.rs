@@ -66,6 +66,7 @@ fn list_legacy_tools(
             tool.path.display()
         );
     }
+    super::append_diagnostics(presentation, &mut output, &scan.diagnostics);
     CommandResult::message(output)
 }
 
@@ -123,5 +124,12 @@ fn show_legacy_tool_detail(
             )
             .unwrap_or_default()
     );
+    let diagnostics: Vec<_> = scan
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.path.as_deref() == Some(tool.path.as_path()))
+        .cloned()
+        .collect();
+    super::append_diagnostics(presentation, &mut output, &diagnostics);
     CommandResult::message(output)
 }

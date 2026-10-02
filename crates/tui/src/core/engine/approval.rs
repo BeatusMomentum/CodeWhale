@@ -75,11 +75,47 @@ pub(super) enum UserInputDecision {
     },
 }
 
+/// A person pressed Allow on an approval card for this call.
+///
+/// Only the engine's card resolver can build one; auto-approval, Full
+/// Access, Auto-Review and session grants never do. Tools that act on a
+/// person's behalf (the Computer Use consent and script calls) forward it to
+/// the plugin as an attested decision.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct HumanDecision {
+    tool_name: String,
+    arguments: serde_json::Value,
+}
+
+impl HumanDecision {
+    pub(super) fn from_card_allow(tool_name: &str, arguments: &serde_json::Value) -> Self {
+        Self {
+            tool_name: tool_name.to_string(),
+            arguments: arguments.clone(),
+        }
+    }
+
+    pub(crate) fn authorizes(&self, tool_name: &str, arguments: &serde_json::Value) -> bool {
+        self.tool_name == tool_name && self.arguments == *arguments
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(tool_name: &str, arguments: &serde_json::Value) -> Self {
+        Self::from_card_allow(tool_name, arguments)
+    }
+}
+
+impl std::fmt::Debug for HumanDecision {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("HumanDecision(card allow)")
+    }
+}
+
 /// Result of awaiting tool approval from the user.
 #[derive(Debug)]
 pub(super) enum ApprovalResult {
     /// User approved the tool execution.
-    Approved,
+    Approved(ApprovalDecider),
     /// User denied the tool execution.
     Denied,
     /// The approval card expired unanswered. Nobody refused the call, so it
@@ -161,7 +197,7 @@ impl Engine {
     ) -> Result<ApprovalResult, ToolError> {
         self.commit_approval_receipt(ApprovalReceipt::asked(tool_id, tool_name))
             .await?;
-        if self.tx_event.send(event).await.is_err() {
+        if self.send_event(event).await.is_err() {
             self.commit_approval_outcome(
                 tool_id,
                 ApprovalOutcome::Unavailable,
@@ -222,7 +258,7 @@ impl Engine {
                     tracing::warn!(tool_id, waited_secs = waited.as_secs(), "{message}");
                     if !announced {
                         announced = true;
-                        let _ = self.tx_event.send(Event::Status { message }).await;
+                        let _ = self.send_event(Event::Status { message }).await;
                     }
                 }
                 _ = self.cancel_token.cancelled() => {
@@ -245,7 +281,7 @@ impl Engine {
                     match decision {
                         ApprovalDecision::Approved { id, by } if id == tool_id => {
                             self.commit_approval_outcome(tool_id, ApprovalOutcome::ApprovedOnce, Some(by)).await?;
-                            return Ok(ApprovalResult::Approved);
+                            return Ok(ApprovalResult::Approved(by));
                         }
                         ApprovalDecision::Denied { id, by } if id == tool_id => {
                             self.commit_approval_outcome(tool_id, ApprovalOutcome::Denied, Some(by)).await?;
@@ -272,12 +308,10 @@ impl Engine {
                             ).await?;
                             return Ok(ApprovalResult::RetryWithPolicy(policy));
                         }
-                        // A child prompt answered while the parent itself is
-                        // waiting: hand it to the child instead of dropping it.
-                        other => {
-                            self.route_child_approval_decision(other).await;
-                            continue;
-                        }
+                        // A stale answer for another call: no waiter here. (An
+                        // agent's answer never arrives here; the handle hands
+                        // it to the agent directly.)
+                        _ => continue,
                     }
                 }
             }
@@ -289,14 +323,35 @@ impl Engine {
         tool_id: &str,
         request: UserInputRequest,
     ) -> Result<UserInputResponse, ToolError> {
-        let _ = self
-            .tx_event
-            .send(Event::UserInputRequired {
+        // C02-19: a question that never reached a host has nobody to answer
+        // it. Fail now instead of waiting out the timeout — which by default
+        // is no timeout at all.
+        if self
+            .send_event(Event::UserInputRequired {
                 id: tool_id.to_string(),
                 request,
             })
-            .await;
+            .await
+            .is_err()
+        {
+            return Err(ToolError::execution_failed(
+                "User input request could not reach its host, so nobody was asked. \
+                 Continue without the answer or ask in your reply instead."
+                    .to_string(),
+            ));
+        }
+        // R1, as for tool approval: the per-turn wall-clock budget bounds the
+        // agent's own time, not how long a person takes to answer.
+        self.turn_wall_clock.begin_human_wait();
+        let response = self.await_user_input_decision(tool_id).await;
+        self.turn_wall_clock.end_human_wait();
+        response
+    }
 
+    async fn await_user_input_decision(
+        &mut self,
+        tool_id: &str,
+    ) -> Result<UserInputResponse, ToolError> {
         // #6003: `[tools] user_input_timeout_seconds`. Absent, or an explicit
         // 0, waits until the person answers or cancels. A positive value is
         // one absolute deadline for the whole wait: `select!` drops the
@@ -322,7 +377,7 @@ impl Engine {
                     tracing::warn!(tool_id, waited_secs = waited.as_secs(), "{message}");
                     if !announced {
                         announced = true;
-                        let _ = self.tx_event.send(Event::Status { message }).await;
+                        let _ = self.send_event(Event::Status { message }).await;
                     }
                 }
                 _ = self.cancel_token.cancelled() => {
@@ -360,9 +415,7 @@ impl Engine {
                         }
                         Err(_) => {
                             let seconds = wait.map(|wait| wait.as_secs()).unwrap_or(0);
-                            let _ = self
-                                .tx_event
-                                .send(Event::Status {
+                            let _ = self.send_event(Event::Status {
                                     message: format!("User input timed out after {seconds}s"),
                                 })
                                 .await;
@@ -1745,7 +1798,7 @@ mod tests {
             let result = task.await.expect("approval task");
             match expected {
                 ApprovalOutcome::ApprovedOnce => {
-                    assert!(matches!(result, Ok(ApprovalResult::Approved)));
+                    assert!(matches!(result, Ok(ApprovalResult::Approved(_))));
                 }
                 ApprovalOutcome::Denied => {
                     assert!(matches!(result, Ok(ApprovalResult::Denied)));

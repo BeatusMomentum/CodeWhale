@@ -1436,6 +1436,7 @@ pub(crate) async fn handle_config_updated(
     ) {
         app.force_next_full_repaint = true;
     }
+    let rejected = result.is_error;
     if apply_command_result(terminal, app, engine_handle, task_manager, config, result).await? {
         return Ok(true);
     }
@@ -1445,7 +1446,7 @@ pub(crate) async fn handle_config_updated(
     } else {
         &key
     };
-    refresh_config_view_if_open(app, focus_key);
+    refresh_config_view_after_commit(app, focus_key, rejected);
     if let Some((message, level)) = telemetry_toast {
         // The modal stays open, so a transcript-only command receipt would be
         // invisible. Keep the durable disk truth in the rebuilt row and show
@@ -1663,16 +1664,17 @@ pub(crate) async fn handle_view_events(
                 apply_user_input_submission_result(app, &tool_id, result);
             }
             ViewEvent::UserInputCancelled { tool_id } => {
-                if engine_handle
-                    .cancel_user_input(tool_id.clone())
-                    .await
-                    .is_ok()
-                {
-                    settle_user_input_request(app, &tool_id);
+                // A cancel is an answer too: when it cannot reach the engine
+                // the question is still pending there, so reopen it the way a
+                // failed submit does instead of recording a cancel (U02-04).
+                let result = engine_handle.cancel_user_input(tool_id.clone()).await;
+                let delivered = result.is_ok();
+                apply_user_input_submission_result(app, &tool_id, result);
+                if delivered {
+                    app.add_message(HistoryCell::System {
+                        content: "User input cancelled".to_string(),
+                    });
                 }
-                app.add_message(HistoryCell::System {
-                    content: "User input cancelled".to_string(),
-                });
             }
             ViewEvent::SessionSelected { session_id } => {
                 let manager = match SessionManager::default_location() {

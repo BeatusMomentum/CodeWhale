@@ -85,7 +85,10 @@ impl CredentialSource {
     pub(crate) fn label(&self) -> Cow<'static, str> {
         match self {
             Self::AuthModeNone => Cow::Borrowed("auth_mode = \"none\""),
-            Self::KeylessRoute { base_url } => Cow::Owned(format!("keyless route {base_url}")),
+            Self::KeylessRoute { base_url } => Cow::Owned(format!(
+                "keyless route {}",
+                crate::doctor::structural_url_authority(base_url)
+            )),
             Self::CliOverride => Cow::Borrowed("--api-key"),
             Self::ProviderConfigApiKey { table } => Cow::Owned(format!("[{table}] api_key")),
             Self::ProviderConfigEnv { var } => Cow::Owned(format!("api_key_env {var}")),
@@ -151,5 +154,42 @@ impl CredentialResolution {
             .probed()
             .iter()
             .find_map(|probe| probe.fix.as_deref())
+    }
+}
+
+#[cfg(test)]
+mod private_label_tests {
+    use super::CredentialSource;
+    #[test]
+    fn keyless_label_omits_credentials_and_still_names_the_endpoint() {
+        for url in [
+            "https://user:label-s10-synthetic@gateway.invalid/v1",
+            "https://label-s10-synthetic@gateway.invalid/v1",
+            "https://gateway.invalid/key/label-s10-synthetic/v1",
+            "https://gateway.invalid/v1?token=label-s10-synthetic",
+            "https://gateway.invalid/v1#label-s10-synthetic",
+        ] {
+            let label = CredentialSource::KeylessRoute {
+                base_url: url.into(),
+            }
+            .label()
+            .into_owned();
+            assert_eq!(label, "keyless route https://gateway.invalid");
+        }
+        let label = CredentialSource::KeylessRoute {
+            base_url: "http://localhost:11434/v1".into(),
+        }
+        .label()
+        .into_owned();
+        assert_eq!(label, "keyless route http://localhost:11434");
+        for url in ["not a url", "file:///etc/passwd", ""] {
+            let label = CredentialSource::KeylessRoute {
+                base_url: url.into(),
+            }
+            .label()
+            .into_owned();
+            assert!(label.contains("configured value omitted"));
+            assert!(!label.contains("passwd"));
+        }
     }
 }

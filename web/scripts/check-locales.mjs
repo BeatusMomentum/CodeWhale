@@ -49,10 +49,12 @@ const OPTIONAL_FILES = [
   "legal-privacy.ts",
   "digest.ts",
   "feed.ts",
+  "community.ts",
   "faq.ts",
   "roadmap.ts",
   "contribute.ts",
   "constitution.ts",
+  "runtime.ts",
   "computer-use.ts",
 ];
 

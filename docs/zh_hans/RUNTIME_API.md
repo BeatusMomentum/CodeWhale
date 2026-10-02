@@ -1,7 +1,7 @@
 # 运行时 API 与集成契约
 
 > 英文原文：[RUNTIME_API.md](../RUNTIME_API.md)。
-> 最后与英文同步日期（last synced with English revision）：2026-09-28。
+> 最后与英文同步日期（last synced with English revision）：2026-09-29。
 
 `codewhale app-server` 是本地运行时的规范 API 与控制面。本地 SDK、移动端/远程控制客户端
 以及编辑器集成都与它对话，而不是去抓取终端输出。它提供完整的 HTTP/SSE 运行时
@@ -38,9 +38,9 @@ local supervisor / SDK / automation harness
 引擎以仅限本地的进程运行。所有 API 默认绑定到 `localhost`。没有托管中转，
 不代管提供商令牌，也不泄漏任何密钥。
 
-关于为已完成的回合提议的只读审计导出，请参阅
-[`docs/RECEIPTS.md`](../RECEIPTS.md)。该文档是一份协议说明；回执的 CLI/API 表面
-尚未实现。
+关于线程或回合所做之事的只读记录，请参阅
+[`docs/RECEIPTS.md`](../RECEIPTS.md)：CLI 上的 `codewhale receipts`，以及下文
+**线程**下的 `/receipt` 路由。
 
 ## 运行时 API 入口
 
@@ -51,7 +51,7 @@ local supervisor / SDK / automation harness
 | `codewhale app-server --mobile` | 回环上的 HTTP/SSE + `/mobile` | 运行时 API + 本地移动端控制页 |
 | `codewhale app-server --stdio` | 基于 stdio 的 JSON-RPC 2.0 | 本地 SDK / 控制探针（不监听端口） |
 | `codewhale app-server --socket [--socket-path P]` | 基于权限为 `0600` 的 unix 域套接字的 JSON-RPC 2.0 | 桌面守护进程：多客户端、对端 uid 校验、`daemon/attach` 认领握手（macOS/Linux；Windows 命名管道已预留但未实现） |
-| `codewhale app-server` | 在 `127.0.0.1:8787` 上的 HTTP | 旧式进程内 app-server（`/healthz`、`/thread`、`/app`、`/prompt`、`/jobs`、`/mcp/startup`）；`/prompt` 与 `/thread` 消息会通过运行时桥执行真实回合。它没有直接的 `/tool` 路由：工具只在 Engine 回合内部、在 Engine 的工具目录与审批姿态下运行。这个旧式服务器不呈现审批：它的桥只转发文本增量和回合的完成，并且没有决策路由，所以一个受审批门控的调用会一直等不到答复。受审批门控的工作请通过运行时 API 驱动（`/v1/threads/*` 事件与 `POST /v1/approvals/{approval_id}`） |
+| `codewhale app-server` | 在 `127.0.0.1:8787` 上的 HTTP | 旧式进程内 app-server（`/healthz`、`/thread`、`/app`、`/prompt`、`/jobs`）；`/prompt` 与 `/thread` 消息会通过运行时桥执行真实回合。它没有直接的 `/tool` 路由：工具只在 Engine 回合内部、在 Engine 的工具目录与审批姿态下运行。这个旧式服务器不呈现审批：它的桥只转发文本增量和回合的完成，并且没有决策路由，所以一个受审批门控的调用会一直等不到答复。受审批门控的工作请通过运行时 API 驱动（`/v1/threads/*` 事件与 `POST /v1/approvals/{approval_id}`） |
 | `codewhale serve --http` / `--mobile` | 与 `app-server --http`/`--mobile` 相同的服务器 | 兼容别名 |
 
 `app-server --http` 与 `--mobile` 启动的是历史上经由 `serve --http` 访问的同一个
@@ -185,7 +185,7 @@ tree id 做 diff。不涉及第二个存储、快照或事件。
     `created`，重命名会折叠它的来源。
   - 工作区 delta 一旦结算，就对快照能看到的每个路径的净改动、`size` 与
     `revision` 具有权威。它会补上没有任何工具回执点名的文件，例如 shell 和
-    子代理的写入。对于快照跟踪到、但在回合结束时未改变的条目路径，它会去掉。
+    子智能体的写入。对于快照跟踪到、但在回合结束时未改变的条目路径，它会去掉。
   - 汇总上限为 1000 个引用，`workspace.truncated` / `workspace.omitted`
     报告截断情况。
 
@@ -253,7 +253,7 @@ Fleet 回执工件保留自己的路由
 
 `GET /v1/runtime/info` 报告 `codewhale_version`，以及由共享的 CLI/TUI 构建嵌入的
 完整 40 字符 `codewhale_commit`。无法提供精确 commit 的源码归档会报告 `unknown`，
-让兼容客户端可以失败关闭，而不是接受一对含义不明的二进制组合。
+让兼容客户端可以按失败即关闭（fail closed）处理，而不是接受一对含义不明的二进制组合。
 
 同一响应还会声明 `capabilities.account_session: true` 与
 `capabilities.turn_operation_idempotency: true`。客户端在依赖 `operation_key`
@@ -438,7 +438,7 @@ app-server 存在的意义是让外部 SDK 无需抓取 TUI
 | 事件流 | `GET /v1/threads/{id}/events`（回放 + 实时 SSE） | 可用 |
 | 回合状态 / 终态分类 | `TurnRecord.status` + 错误摘要 | 可用 |
 | Token 用量 | `TurnRecord.usage`；通过 `GET /v1/usage` 聚合 | 可用 |
-| 动作回执（文件、命令、web/MCP 调用、代理、审批及由谁决定、失败） | `GET /v1/threads/{id}/receipt`、`GET /v1/threads/{id}/turns/{turn_id}/receipt` | 可用（[RECEIPTS.md](../RECEIPTS.md)） |
+| 动作回执（文件、命令、web/MCP 调用、智能体、审批及由谁决定、失败） | `GET /v1/threads/{id}/receipt`、`GET /v1/threads/{id}/turns/{turn_id}/receipt` | 可用（[RECEIPTS.md](../RECEIPTS.md)） |
 
 对于一次性/无头自动化，优先使用 `codewhale exec` 并显式给出
 `--provider <id> --model <id>`，这样一旦失败就能确定是哪一对提供商/模型。
@@ -479,11 +479,11 @@ stdio 探针针对一份一次性配置运行，因此它从不读取真实密�
 - `session/cancel`
 
 提示词请求经由已配置的 Codewhale 客户端与当前默认模型路由。
-响应以 `session/update` 代理消息块的形式发出，随后是一个
+响应以 `session/update` 智能体消息块的形式发出，随后是一个
 `session/prompt` 响应，带 `stopReason: "end_turn"`。
 
 每个会话都通过一个注册表在本地执行工具调用，该注册表由
-与 CLI exec 代理相同的文件/搜索/git/patch/shell 工具构建，
+与 CLI exec 智能体相同的文件/搜索/git/patch/shell 工具构建，
 受 `session/request_permission` 门控，并作为 `tool_call` / `tool_call_update`
 会话更新上报。ACP 会话仍然缺少的是完整的线程/回合
 运行时：没有持久线程、快照、引导，也没有与
@@ -706,7 +706,10 @@ bootstrap URL。该能力会创建一个 30 分钟的进程内
 - `GET /v1/sessions?limit=50&search=<fuzzy>&include_archived=false&archived_only=false&workspace=<path>&sort=recent|name|size`
 - `GET /v1/sessions/summary?…`（相同的查询参数；投影后的行形态）
 - `GET /v1/sessions/{id}`（加上 `?peek=true&entries=12` 可得到有界的、已脱敏的
-  只读窥视，而不是完整转录）
+  只读窥视，而不是完整转录）。完整响应会在某个回合以 `Failed` 结束时携带
+  `turn_outcomes`：每次失败一条 `{ status, error, ended_at,
+  after_message_count }`，最旧的在前，最多 64 条，错误文本与转录中显示的一致，
+  且已对密钥脱敏
 - `PATCH /v1/sessions/{id}`（`{ "title"?: string, "archived"?: bool }`）
 - `DELETE /v1/sessions/{id}`
 - `POST /v1/sessions/{id}/resume-thread` 返回已经持有整个已保存会话的打开线程
@@ -723,8 +726,8 @@ bootstrap URL。该能力会创建一个 30 分钟的进程内
 - `GET /v1/sessions/repair` 返回最近一次会话存储修复的摘要；从未运行过时为 `null`
 
 会话与线程对同一对 `include_archived` / `archived_only`
-给出含义相同的响应，并且 `search` 与 TUI 会话选择器及 workbar
-Sessions 列表使用的是同一个模糊匹配（标题、id、
+给出含义相同的响应，并且 `search` 与 TUI 会话选择器及任务面板（workbar）
+中的 Sessions 列表使用的是同一个模糊匹配（标题、id、
 工作区——先子串，再子序列）。三个表面运行同一套投影
 （`crates/tui/src/session_projection.rs`），因此列表在
 终端与仪表盘之间不可能有差异。
@@ -841,7 +844,7 @@ Sessions 列表使用的是同一个模糊匹配（标题、id、
 分支无法读取时可能为 `null`。
 `head` 是该工作区当前可得的短 Git commit。
 `dirty` 在工作区有已暂存、未暂存或未跟踪的改动时为 true。
-包含 `workspace` 是为了让编辑器客户端能显示某个代理通道何时在
+包含 `workspace` 是为了让编辑器客户端能显示某个智能体通道何时在
 当前 VS Code 文件夹之外工作。
 
 线程 fork 是兄弟运行时线程，不是就地（in-place）的树投影。
@@ -863,7 +866,7 @@ fork 还可能包含 `backtrack_depth_from_tail` 与 `dropped_turn_id`，而
 
 `GET /v1/threads/{id}/notices` 是逐线程的活动通知表面
 （#6180）：TUI 可见、且只读客户端必须呈现的那些状况——
-`subagent-terminal`（一个子代理已完结）、`elevation-needed`（一个工具调用
+`subagent-terminal`（一个子智能体已完结）、`elevation-needed`（一个工具调用
 被提权拦住）、`model-notify`（模型请用户回来）——各自带有 `turn_id` 与一个用于定位的 `subject` id。
 通知是内存中的会话状态，每个线程最多 32 条（最旧的被淘汰），
 且永不持久化。清除：提权在它的工具调用
@@ -1313,9 +1316,6 @@ shell 命令不声明路径：它在被排除路径下写入的东西（构建�
 在较旧引擎上返回 `404`；客户端把任何非 `404` 都视为可用，
 否则以说明降级。
 
-**回执**（未来的只读审计导出）
-- 仅为提议：`GET /v1/threads/{thread_id}/turns/{turn_id}/receipt`
-
 **兼容流**（一次性、向后兼容）
 - `POST /v1/stream`
 
@@ -1435,11 +1435,11 @@ token 但成本为 `0.0`。于 v0.8.10 加入（#564）。
 **终端会话**（持久、由 Engine 拥有的 shell）
 
 上面的 jobs 族每个作业运行一条命令。终端面板需要的是
-**另一种**权威：代理自己的终端工具所驱动的、有状态且基于 PTY 的 shell，它在多次输入之间保持 cwd 与环境。
+**另一种**权威：智能体自己的终端工具所驱动的、有状态且基于 PTY 的 shell，它在多次输入之间保持 cwd 与环境。
 这些路由附着到那个会话，且从不创建会话——一个没有活动会话的名字返回
 `404`，因为从一次 HTTP 请求中凭空变出一个 shell 会让客户端得到一个
 Engine 并不知道的终端。输入可按路由归因：
-`input` 是客户端的写入通道，`terminal_send` 是代理的。
+`input` 是客户端的写入通道，`terminal_send` 是智能体的。
 
 - `GET /v1/terminal/{name}/output?cursor=<bytes>&max_bytes=<1-64KiB>&format=
   <base64|text>` — 可恢复的字节流。`{name, offset, next_cursor,
@@ -1467,12 +1467,16 @@ Engine 并不知道的终端。输入可按路由归因：
 **作业**（操作者范围内的 shell 作业；终端表面）
 - `GET /v1/jobs` — 跨所有线程的每个活动与已知过期作业
 - `GET /v1/threads/{id}/jobs` — 由一个线程的管理器拥有的作业：
-  模型启动的、子代理启动的与客户端启动的合在一起
+  模型启动的、子智能体启动的与客户端启动的合在一起
 - `POST /v1/threads/{id}/jobs` — `{ "command", "cwd"?, "timeout_ms"?,
   "tty"?, "env"? }` → `201 { "job" }`；在线程投影出的沙箱策略下作为后台 shell 运行。
   `tty: true` 会把 stderr 合并进 stdout，
   并给命令一个终端（交互式程序必需）；
-  后台作业永不会在 `timeout_ms` 时被杀掉
+  后台作业永不会在 `timeout_ms` 时被杀掉。相对 `cwd` 在线程工作区内解析。
+  未开启信任模式时，解析符号链接后的 `cwd` 必须仍在该工作区内，否则返回 `403`：
+  与 shell 工具不同，此路由不采用 `workspace_follow_symlinks` 或 `/trust add` 根目录，
+  所以指向工作区外的符号链接会被拒绝。作业在已解析并检查过的目录中运行，
+  之后重定向符号链接不会改变其运行目录；`cwd` 解析为非 UTF-8 路径时返回 `400`
 - `GET /v1/threads/{id}/jobs/{job_id}` — 单个作业的状态 + 元数据
 - `GET /v1/threads/{id}/jobs/{job_id}/output?stream=<stdout|stderr>&cursor=
   <bytes>&max_bytes=<1-512KiB>&wait_ms=<0-30s>&format=<base64|text>` —
@@ -1601,7 +1605,7 @@ Engine 并不知道的终端。输入可按路由归因：
   （仅已跟踪路径——没有 `all`，未跟踪路径失败关闭）；
   `POST /v1/git/commit` `{ "message", "all"? }`；stage、unstage、discard
   与 commit 还接受一个可选的 `expect`（见下文）；`POST /v1/git/push`
-  `{ "remote"?, "set_upstream"? }`；`POST /v1/git/branch`
+  `{ "remote"?, "set_upstream"? }`（`remote`，或仅提供 `set_upstream` 时使用的 `origin`，必须是已配置的远端名称）；`POST /v1/git/branch`
   `{ "name", "create"? }`
 
 diff 与前置条件令牌的读取通过加固过的审阅命令运行（过滤器、fsmonitor、钩子、
@@ -1650,7 +1654,7 @@ id 或 `null`；`index` 与 `revision` 为 64 位十六进制（显式的 `revis
 检查和它的写入相对于该运行时的其他窗口是原子的；第二个并发写入会回答 `409`，
 `error.code: "git_busy"`，而不是排在一个很长的 commit 钩子后面。push 不串行化：它只
 移动远程 ref，并且可能为网络等待最多 120 秒。该锁不覆盖此运行时之外的进程——终端、
-编辑器，或 Codewhale 自己的代理工具——它们仍可能在检查与 git 取得 `index.lock` 之间
+编辑器，或 Codewhale 自己的智能体工具——它们仍可能在检查与 git 取得 `index.lock` 之间
 的那一刻改动仓库；真正并发的 git 写入随后会在 git 自己的 `index.lock` 上失败（一个携带
 git 消息的 `400`）。通过 `commit-tree` 与 `update-ref` 做比较并交换的 commit 可以关闭
 这个窗口，但会跳过仓库的钩子，而审阅面板的 commit 必须运行这些钩子，所以没有采用。
@@ -1739,6 +1743,9 @@ basename 校验（无分隔符、无 `..`），列表有上限，读取是
 录音是每台主机一次阻塞式采集（请求串行化；输家得到
 `ok:false`/`no_speech`，而不是一个被争抢的设备）。提供商 ASR 惰性解析其
 密钥，因此本地 whisper 与 Groq 路径无需提供商认证即可工作。
+中间和最终转写均使用已选择的 ASR 后端。本地 whisper 或 Groq 失败时，
+错误保留在该后端；运行时不会把录音或输入区文本改发给当前模型提供商重试。
+如需使用该提供商，必须显式选择提供商 ASR。
 失败也是数据：`no_recorder`、`no_speech`、`no_provider_auth`、
 `transcription_failed`。`CODEWHALE_DISABLE_VOICE=1` 是操作者
 开关——无头的 `serve --http` 主机会报告 `available: false`，
@@ -1835,7 +1842,7 @@ basename 校验（无分隔符、无 `..`），列表有上限，读取是
 客户端实现了图片上传控件。
 
 `reasoning_effort` 使用同样的三种能力状态，描述
-该精确模型的元数据是否公布了可选的推理强度阶梯。
+该精确模型的元数据是否公布了可选的思考强度阶梯。
 `reasoning_effort_levels` 只包含来自该元数据的规范、被识别的活动强度等级。
 Off 与诸如 none 之类的提供商同义词被排除：
 Apps/Chat 协议把 off 当作省略，而这不证明支持一个
@@ -2006,7 +2013,7 @@ Runtime 的提供商或模型默认值。
 - `auto_approve` 标志作用于运行时审批桥与引擎
   工具上下文。当为某个线程/回合/任务启用时，需要审批的工具
   会在非交互式运行时路径中被自动批准，shell 安全检查
-  以自动批准模式运行，且派生的子代理继承该设置。
+  以自动批准模式运行，且派生的子智能体继承该设置。
 - 省略时，`auto_approve` 默认为 `false`。
 - [授权顺序](AUTHORIZATION_ORDER.md)描述了带类型的规则、
   已注册的工具要求、安全底线、仓库法律、审批
@@ -2143,7 +2150,7 @@ Fleet 流（`/v1/fleet/runs/{run_id}/events`）保留自己的结束帧，
 自己的记录不可读或不可写，且不会再有 `turn.completed`；
 等待该回合的客户端应把它当作失败。
 
-代理消息与推理增量会在其对应的 `item.delta` 事件被编序之前，物化进条目投影。
+智能体消息与推理增量会在其对应的 `item.delta` 事件被编序之前，物化进条目投影。
 为避免为每个提供商碎片做一次 fsync，相邻增量在发布之前
 被合并到配置的上限：最多 32 ms 或大约 16 KiB
 （一个不可分割的上游块本身可能超过字节目标）。在该未发布窗口内发生进程崩溃会丢掉最近的尾部；
@@ -2308,15 +2315,15 @@ worker 转换。事件正文省略提示词、工具调用 ID、完成文本、
 npm test --workspace @codewhale/runtime-sdk
 ```
 
-## 代理运行回执
+## 智能体运行回执
 
-子代理通道把紧凑的运行回执持久化在
+子智能体通道把紧凑的运行回执持久化在
 `.codewhale/state/subagents.v1.json`。运行时 API 把这些回执暴露为一个
 只读检查表面：
 
 | 操作 | 端点 |
 |---|---|
-| 列出已持久化的代理运行 | `GET /v1/agent-runs` |
+| 列出已持久化的智能体运行 | `GET /v1/agent-runs` |
 | 检查单个运行 | `GET /v1/agent-runs/{run_id}` |
 | 停止单个运行 | `POST /v1/agent-runs/{run_id}/cancel` |
 
@@ -2326,12 +2333,12 @@ npm test --workspace @codewhale/runtime-sdk
 回退为 worker id，且 `{run_id}` 可以是
 运行 id 或 worker id。
 
-这些端点不启动也不引导子代理。这个 API 表面存在的目的是让
+这些端点不启动也不引导子智能体。这个 API 表面存在的目的是让
 app/编辑器/无头客户端可以检查 TUI 与
 父模型看到的同一批交接回执，并停止一个它们正在展示的运行。
 
 `POST /v1/agent-runs/{run_id}/cancel` 不接受请求体。它通过与 TUI 的停止及 `agent/cancel` 工具相同的会话范围路径
-停止该运行：后代随它一起停止，且写入范围内的子代理被改动的文件会在
+停止该运行：后代随它一起停止，且写入范围内的子智能体被改动的文件会在
 其结果中被点名，而不是被丢掉。它用 worker 记录作答：
 
 - 当记录已是终态时返回 `200`（停止一个已完成的运行是

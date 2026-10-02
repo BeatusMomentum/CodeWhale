@@ -206,14 +206,19 @@ pub(crate) fn set_provider_model_document(
 }
 
 /// One persistent owner and atomic write for an explicitly saved route.
+///
+/// Also returns the undo for exactly this write, taken under the config lock,
+/// so a caller whose follow-up apply step is rejected can take back only the
+/// switch.
 pub(crate) fn persist_provider_selection(
     config_path: Option<&Path>,
     provider: ApiProvider,
     provider_identity: &str,
     model: Option<&str>,
-) -> anyhow::Result<PathBuf> {
+) -> anyhow::Result<(PathBuf, codewhale_config::ConfigDocumentUndo)> {
     let path = config_toml_path(config_path)?;
-    mutate_config_document(&path, |doc| {
+    let ((), undo) = codewhale_config::mutate_config_document_undoable(&path, |doc| {
+        migrate_legacy_route_preferences(&path, doc)?;
         let config = crate::config::parse_config_base(&doc.to_string())
             .map_err(|_| anyhow::anyhow!("Could not parse destination route; contents omitted"))?;
         let identity = config
@@ -238,7 +243,7 @@ pub(crate) fn persist_provider_selection(
         )?;
         reconcile_root_model_aliases(doc, &config, &identity)
     })?;
-    Ok(path)
+    Ok((path, undo))
 }
 
 /// Keep a root `default_text_model` alias from stranding a route switch,
@@ -516,15 +521,6 @@ pub(crate) fn persist_root_bool_key(
     Ok(path)
 }
 
-pub(crate) fn persist_tui_integer_key(
-    config_path: Option<&Path>,
-    key: &str,
-    value: u64,
-) -> anyhow::Result<PathBuf> {
-    let value = i64::try_from(value).context("integer value is too large for TOML")?;
-    persist_table_value_key(config_path, "tui", key, value.into())
-}
-
 pub(crate) fn persist_subagents_bool_key(
     config_path: Option<&Path>,
     key: &str,
@@ -568,7 +564,7 @@ pub(crate) fn persist_table_string_key(
     persist_table_value_key(config_path, table_name, key, value.into())
 }
 
-fn persist_table_value_key(
+pub(crate) fn persist_table_value_key(
     config_path: Option<&Path>,
     table_name: &str,
     key: &str,
@@ -1394,7 +1390,7 @@ action = "mode.plan"
         write_golden_config(&path);
 
         persist_root_bool_key(Some(&path), "allow_shell", true).unwrap();
-        persist_tui_integer_key(Some(&path), "scrollback_lines", 4000).unwrap();
+        persist_table_value_key(Some(&path), "tui", "scrollback_lines", 4000_i64.into()).unwrap();
         persist_table_string_key(Some(&path), "memory", "backend", "sqlite").unwrap();
         persist_subagents_bool_key(Some(&path), "enabled", true).unwrap();
         persist_route_base_url(

@@ -4053,12 +4053,210 @@ fn test_list_jobs_cleans_up_completed_old_processes() {
     // Both the completed job and any tracking state should be present.
     assert!(!manager.processes.is_empty());
 
-    // cleanup(ZERO) removes all completed processes immediately.
+    // cleanup(ZERO) removes every delivered completed process immediately.
+    manager.drain_finished_jobs_with_evidence();
     manager.cleanup(Duration::ZERO);
     assert!(
         manager.processes.is_empty(),
         "completed processes should be evicted by cleanup"
     );
+}
+
+/// A job that ran longer than the retention age must survive until its
+/// completion is delivered: age counts from the finish, not the start.
+#[test]
+fn cleanup_ages_jobs_from_finish() {
+    let tmp = tempdir().expect("tempdir");
+    let mut manager = ShellManager::new(tmp.path().to_path_buf());
+    let long_run = FINISHED_SHELL_MAX_AGE + Duration::from_secs(600);
+    manager.seed_finished_record_for_test("long-job", long_run);
+
+    // Started 70 minutes ago, finished just now, not yet delivered.
+    manager.list_jobs();
+    assert!(
+        manager.inspect_job("long-job").is_ok(),
+        "a long job must not be evicted the moment it finishes"
+    );
+    let delivered = manager.drain_finished_jobs_with_evidence();
+    assert_eq!(delivered.len(), 1, "the completion must still be delivered");
+    assert_eq!(delivered[0].event.task_id, "long-job");
+
+    // Delivered and recently finished: still inside the retention window.
+    manager.cleanup(FINISHED_SHELL_MAX_AGE);
+    assert!(manager.inspect_job("long-job").is_ok());
+
+    // Delivered and finished longer ago than the window: evicted.
+    let shell = manager.processes.get_mut("long-job").expect("record");
+    shell.finished_at = Instant::now().checked_sub(long_run);
+    manager.cleanup(FINISHED_SHELL_MAX_AGE);
+    assert!(manager.inspect_job("long-job").is_err());
+}
+
+/// Nothing ever drains a completion owned by a Runtime API scope or by a
+/// session that is no longer active, so an undelivered job must still age out
+/// (counted from when it finished) instead of staying until the count cap.
+#[test]
+fn cleanup_ages_out_undelivered_completions_after_finish() {
+    let tmp = tempdir().expect("tempdir");
+    let mut manager = ShellManager::new(tmp.path().to_path_buf());
+    let max_age = Duration::from_secs(30);
+    manager.seed_finished_record_for_test("api-job", Duration::from_secs(50));
+    let shell = manager.processes.get_mut("api-job").expect("record");
+    shell.owner_session_id = "api:thread-1".to_string();
+    shell.finished_at = Instant::now().checked_sub(Duration::from_secs(40));
+    assert!(!shell.completion_reported);
+
+    manager.cleanup(max_age);
+    assert!(
+        manager.inspect_job("api-job").is_err(),
+        "an undelivered completion finished longer ago than max_age must age out"
+    );
+}
+
+/// The count ceiling evicts the records that finished longest ago, the same
+/// clock the age rule uses: a long job that just finished is not "oldest".
+#[test]
+fn finished_job_bounds_evict_by_finish_time() {
+    let tmp = tempdir().expect("tempdir");
+    let mut manager = ShellManager::new(tmp.path().to_path_buf());
+    let now = Instant::now();
+    for index in 0..MAX_FINISHED_SHELL_RECORDS {
+        let id = format!("short-{index:03}");
+        // Started 20 s ago, finished 10 s ago.
+        manager.seed_finished_record_for_test(id.clone(), Duration::from_secs(20));
+        let shell = manager.processes.get_mut(&id).expect("record");
+        shell.finished_at = now.checked_sub(Duration::from_secs(10));
+        shell.completion_reported = true;
+    }
+    // Started 60 s ago, finished just now.
+    manager.seed_finished_record_for_test("long-job", Duration::from_secs(60));
+    manager
+        .processes
+        .get_mut("long-job")
+        .expect("record")
+        .completion_reported = true;
+
+    manager.cleanup(FINISHED_SHELL_MAX_AGE);
+    assert_eq!(manager.tracked_job_count(), MAX_FINISHED_SHELL_RECORDS);
+    assert!(
+        manager.inspect_job("long-job").is_ok(),
+        "the most recently finished job was evicted first"
+    );
+}
+
+/// The synchronous path closes stdin when there is no input: `cat` gets EOF
+/// instead of reading, or blocking on, Codewhale's own stdin.
+#[cfg(unix)]
+#[test]
+fn sync_command_without_input_gets_eof_not_inherited_stdin() {
+    let tmp = tempdir().expect("tempdir");
+    let mut manager = ShellManager::new(tmp.path().to_path_buf());
+    let started = Instant::now();
+    let result = manager
+        .execute_with_options_env(
+            "cat; echo after-eof",
+            None,
+            15_000,
+            false,
+            None,
+            false,
+            None,
+            HashMap::new(),
+        )
+        .expect("run");
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "stdin read blocked for {:?}",
+        started.elapsed()
+    );
+    assert!(result.stdout.contains("after-eof"), "{}", result.stdout);
+}
+
+/// A backgrounded lowercase `bash` job: each read returns only output the
+/// caller has not seen, not the whole retained tail again.
+#[cfg(unix)]
+#[test]
+fn bounded_job_delta_returns_only_new_output() {
+    let tmp = tempdir().expect("tempdir");
+    let mut manager = ShellManager::new(tmp.path().to_path_buf());
+    let started = manager
+        .execute_with_options_env_for_owner_and_work(
+            "printf 'first-chunk\\n'; while [ ! -e go ]; do sleep 0.05; done; printf 'second-chunk\\n'",
+            None,
+            60_000,
+            true,
+            None,
+            false,
+            None,
+            HashMap::new(),
+            None,
+            String::new(),
+            None,
+            None,
+            None,
+            None,
+            false,
+            (1, BASH_MAX_TIMEOUT_MS),
+        )
+        .expect("spawn bounded job");
+    let task_id = started.task_id.expect("task id");
+    assert!(
+        manager.processes[&task_id].bounded_output.is_some(),
+        "fixture must exercise the bounded accumulator"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut seen = String::new();
+    while !seen.contains("first-chunk") {
+        assert!(Instant::now() < deadline, "first chunk never arrived");
+        let delta = manager
+            .get_output_delta(&task_id, false, 0)
+            .expect("first delta");
+        seen.push_str(&delta.result.stdout);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(seen.matches("first-chunk").count(), 1, "{seen}");
+    // The fixture writes its second chunk only now, so the first delta cannot
+    // have raced past it.
+    std::fs::write(tmp.path().join("go"), "").expect("release fixture");
+
+    let rest = manager
+        .get_output_delta(&task_id, true, 10_000)
+        .expect("remaining delta");
+    assert_ne!(rest.result.status, ShellStatus::Running);
+    assert!(
+        rest.result.stdout.contains("second-chunk"),
+        "{}",
+        rest.result.stdout
+    );
+    assert!(
+        !rest.result.stdout.contains("first-chunk"),
+        "a delta must not repeat output already returned: {:?}",
+        rest.result.stdout
+    );
+}
+
+/// A foreground command that reads stdin gets EOF instead of blocking until
+/// the timeout kills it.
+#[cfg(unix)]
+#[tokio::test]
+async fn foreground_command_reading_stdin_gets_eof() {
+    let tmp = tempdir().expect("tempdir");
+    let ctx = ToolContext::new(tmp.path());
+    let started = Instant::now();
+    let result = BashTool::new("Bash")
+        .execute(
+            json!({"command": "cat; echo after-eof", "timeout_ms": 15_000}),
+            &ctx,
+        )
+        .await
+        .expect("execute");
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "stdin read blocked for {:?}",
+        started.elapsed()
+    );
+    assert!(result.content.contains("after-eof"), "{}", result.content);
 }
 
 /// Regression for #1691: a `git commit -m "feat: complete sub-pages"` shell

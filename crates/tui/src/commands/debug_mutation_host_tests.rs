@@ -9,7 +9,7 @@ fn patch_undo(app: &mut App) -> CommandResult {
 }
 fn undo_conversation(app: &mut App) -> CommandResult {
     super::debug_group::host_result(undo::conversation_result(
-        super::contract::debug_operations::undo_conversation(app),
+        super::contract::debug_operations::undo_conversation_for_engine(app),
     ))
 }
 fn retry(app: &mut App) -> CommandResult {
@@ -129,7 +129,7 @@ pub(in crate::commands) fn test_tool(name: &str) -> Tool {
 }
 
 #[test]
-fn test_undo_conversation_removes_last_exchange() {
+fn test_undo_conversation_stages_last_exchange_without_mutating_live_history() {
     let mut app = create_test_app();
     app.history.push(HistoryCell::User {
         content: "Hello".to_string(),
@@ -154,8 +154,38 @@ fn test_undo_conversation_removes_last_exchange() {
     assert!(result.message.is_some());
     let msg = result.message.unwrap();
     assert!(msg.contains("Removed"));
-    assert!(app.history.len() < initial_history_len);
-    assert!(app.api_messages.len() < initial_api_len);
+    assert_eq!(
+        app.history.len(),
+        initial_history_len,
+        "planning leaves live UI untouched"
+    );
+    assert_eq!(app.api_messages.len(), initial_api_len);
+    assert!(
+        matches!(result.action, Some(AppAction::ConversationUndo { sync, retry_input: None }) if sync.messages.is_empty())
+    );
+}
+
+#[test]
+fn conversation_undo_includes_following_tool_results_and_runtime_notes() {
+    let mut app = create_test_app();
+    app.history.push(HistoryCell::User {
+        content: "undo this".into(),
+    });
+    let messages: Vec<Message> = serde_json::from_value(serde_json::json!([
+        {"role":"user","content":[{"type":"text","text":"keep this"}]},
+        {"role":"assistant","content":[{"type":"text","text":"kept answer"}]},
+        {"role":"user","content":[{"type":"text","text":"undo this"}]},
+        {"role":"assistant","content":[{"type":"tool_use","id":"call-1","name":"read_file","input":{}}]},
+        {"role":"user","content":[{"type":"tool_result","tool_use_id":"call-1","content":"undone tool result"}]},
+        {"role":"assistant","content":[{"type":"text","text":"undone answer"}]}
+    ])).unwrap();
+    app.set_api_messages(std::sync::Arc::new(messages.clone()));
+    let result = undo_conversation(&mut app);
+    let Some(AppAction::ConversationUndo { sync, .. }) = result.action else {
+        panic!("missing rollback")
+    };
+    assert_eq!(sync.messages, messages[..2]);
+    assert_eq!(app.api_messages.as_ref(), &messages);
 }
 
 #[test]
@@ -186,7 +216,10 @@ fn test_retry_with_previous_message() {
     let msg = result.message.unwrap();
     assert!(msg.contains("Retrying"));
     assert!(msg.contains("Test message"));
-    assert!(matches!(result.action, Some(AppAction::SendMessage(_))));
+    assert!(matches!(
+        result.action.as_ref(),
+        Some(AppAction::ConversationUndo { retry_input: Some(input), .. }) if input == "Test message"
+    ));
 }
 
 #[test]
@@ -276,7 +309,27 @@ fn test_patch_undo_requests_session_resync_after_restore() {
         }],
     });
 
+    // A running turn owns the workspace: nothing is restored under it.
+    app.is_loading = true;
+    let refused = patch_undo(&mut app);
+    assert!(
+        refused
+            .message
+            .as_deref()
+            .is_some_and(|message| message.contains("still running")),
+        "{:?}",
+        refused.message
+    );
+    assert!(refused.action.is_none());
+    assert_eq!(
+        std::fs::read(workspace.join("a.txt")).unwrap(),
+        b"modified",
+        "a refused undo changes no file"
+    );
+    app.is_loading = false;
+
     let result = patch_undo(&mut app);
+    assert_eq!(std::fs::read(workspace.join("a.txt")).unwrap(), b"original");
 
     assert!(!result.is_error);
     assert!(matches!(
@@ -1403,6 +1456,7 @@ fn whole_debug_registry_matches_portable_inventory_and_exact_host_authority() {
                         lifecycle,
                         control,
                         export,
+                        structcopy,
                         debug_diagnostics,
                         debug_receipts,
                         debug_change,
@@ -1431,6 +1485,7 @@ fn whole_debug_registry_matches_portable_inventory_and_exact_host_authority() {
                         ("lifecycle", lifecycle.is_some(), Caps::SESSION_LIFECYCLE),
                         ("control", control.is_some(), Caps::SESSION_CONTROL),
                         ("export", export.is_some(), Caps::SESSION_EXPORT),
+                        ("structcopy", structcopy.is_some(), Caps::SESSION_STRUCTCOPY),
                         (
                             "debug_diagnostics",
                             debug_diagnostics.is_some(),

@@ -1,12 +1,12 @@
 # CNB Cool 镜像
 
 > 英文原文：[CNB_MIRROR.md](../CNB_MIRROR.md)。
-> 最后与英文同步日期（last synced with English revision）：2026-09-26。
+> 最后与英文同步日期（last synced with English revision）：2026-09-30。
 
 `cnb.cool/codewhale.net/codewhale` 是这个 GitHub 仓库的单向镜像，服务那些
 GitHub 慢或无法访问的网络环境（主要是中国大陆）。镜像会收到：`main` 的每一次
 推送，第一方发布工作用到的每个 `fix/*`、`rebrand/*` 和 `work/v*` 分支，以及
-每个 `v*` 发布标签。
+每个完整 GitHub Release 已发布后的 `v*` 发布标签。
 
 ## 来源
 
@@ -29,9 +29,10 @@ sha256sum -c codewhale-artifacts-sha256.txt --ignore-missing
 镜像由 [`Sync to CNB`](../../.github/workflows/sync-cnb.yml) GitHub Actions
 工作流维护：
 
-- **触发：** 推送到 `main`、推送任意 `v*` 标签、匹配 `work/v*` 的发布工作分支、
+- **触发：** 推送到 `main`、权威 Release 发布成功后的发布工作流、匹配 `work/v*` 的发布工作分支、
   匹配 `fix/*` 和 `rebrand/*` 的第一方修复与改名分支，或用于手动恢复的
-  `workflow_dispatch`。
+  `workflow_dispatch`。仅推送标签不会触发发布标签镜像。手动恢复标签也必须
+  验证 GitHub 已公开的完整资产清单及不可变的源码提交。
 - **认证：** HTTPS basic auth，用户名为 `cnb`，密码是仓库 secret
   `CNB_GIT_TOKEN`。
 - **范围：** 只推送触发本次运行的那个 ref。标签推送就推送该标签。分支推送镜像
@@ -59,6 +60,8 @@ CNB 流水线配置也纳入 GitHub 的源码管理，位置是
 这样，能访问 CNB 但访问不了 GitHub 的用户就有了一条 CNB 原生的发布路径。
 GitHub 仍是 macOS/Windows 的权威发布矩阵；CNB 标签流水线则是更适配中国网络的
 Linux x64 备用路径。
+GitHub 发布工作流只会在完整且经过验证的资产集公开后调用镜像。权威发布失败时，
+CNB 不会提前发布该版本。已有 CNB 标签必须与源码一致；恢复不会强制改写发布标签。
 
 ## CNB 上的 Linux CI 与发布预检
 

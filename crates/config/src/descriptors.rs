@@ -174,6 +174,19 @@ mod tests {
     }
 
     #[test]
+    fn cheaper_inference_is_a_descriptor_row() {
+        let row = provider_descriptor("cheaper-inference").expect("cheaperinference");
+        assert_eq!(row.id, "cheaperinference");
+        assert_eq!(row.base_url, "https://api.cheaperinference.com/v1");
+        assert_eq!(row.api_key_env, "CHEAPER_INFERENCE_API_KEY");
+        assert_eq!(row.default_model, "gpt-5.4-mini");
+        assert_eq!(
+            provider_descriptor("cheaper_inference").map(|row| row.id.as_str()),
+            Some("cheaperinference")
+        );
+    }
+
+    #[test]
     fn descriptors_do_not_embed_model_rosters() {
         let raw = DESCRIPTORS_JSON;
         assert!(

@@ -103,6 +103,7 @@ const COMPUTER_USE_FILES: &[(&str, &[u8])] = &[
     bundle_file!("src/registry.mjs"),
     bundle_file!("src/remote-runtime.mjs"),
     bundle_file!("src/sprite-task.mjs"),
+    bundle_file!("src/ssh-args.mjs"),
     bundle_file!("src/tools.mjs"),
     bundle_file!("src/trajectory.mjs"),
     bundle_file!("src/transport.mjs"),

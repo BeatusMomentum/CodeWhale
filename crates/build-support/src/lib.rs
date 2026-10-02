@@ -9,7 +9,8 @@
 //! environment asked for* (`CODEWHALE_BUILD_SHA`/`DEEPSEEK_BUILD_SHA`/`GITHUB_SHA`); an unstamped
 //! local checkout renders `(dev)`; an unstamped Cargo source package displays
 //! its package version without claiming a release-binary SHA.
-//! `CODEWHALE_RELEASE_BUILD_SHA` describes a *published* binary and has no
+//! `CODEWHALE_RELEASE_BUILD_SHA` describes a *published* binary: it reads only
+//! the explicit release variables (never the ambient `GITHUB_SHA`) and has no
 //! fallback at all, because it leaves the machine.
 //!
 //! ## Why the stamp never reads the local checkout (#5245)
@@ -126,7 +127,7 @@ fn format_build_version(
 }
 
 /// Declare the rerun conditions for [`emit_release_build_sha`] alone: the two
-/// release-CI SHA variables, and nothing about the local checkout.
+/// explicit release-build SHA variables, and nothing about the local checkout.
 ///
 /// Deliberately not [`declare_rerun_conditions`]: watching `.git/HEAD` would
 /// make the build script rerun on every local commit, for a value that is
@@ -134,7 +135,6 @@ fn format_build_version(
 pub fn declare_release_sha_rerun() {
     println!("cargo:rerun-if-env-changed=CODEWHALE_BUILD_SHA");
     println!("cargo:rerun-if-env-changed=DEEPSEEK_BUILD_SHA");
-    println!("cargo:rerun-if-env-changed=GITHUB_SHA");
 }
 
 /// Emit `cargo:rustc-env=CODEWHALE_RELEASE_BUILD_SHA=...` — the first 12 hex
@@ -167,15 +167,22 @@ pub fn emit_release_build_sha() {
 /// The decision behind [`emit_release_build_sha`], with the environment
 /// injected so it can be tested without mutating the process.
 ///
-/// `CODEWHALE_BUILD_SHA` wins over the legacy `DEEPSEEK_BUILD_SHA`, which wins over
-/// `GITHUB_SHA`; each must be a full 40-hex sha
-/// to be believed, and the result is the first 12 characters.
+/// `CODEWHALE_BUILD_SHA` wins over the legacy `DEEPSEEK_BUILD_SHA`; each must
+/// be a full 40-hex sha to be believed, and the result is the first 12
+/// characters.
+///
+/// Never `GITHUB_SHA`. Every GitHub Actions job sets it — pull-request CI,
+/// forks, any workflow that happens to build — so it proves only "built on
+/// Actions", not "published release". Every release, nightly, and CNB build
+/// exports `CODEWHALE_BUILD_SHA` explicitly, so dropping the ambient fallback
+/// leaves published binaries unchanged. The display stamp
+/// ([`emit_build_version`]) still accepts `GITHUB_SHA`: it is a version
+/// string, not provenance.
 #[must_use]
 pub fn release_build_sha(read_env: impl Fn(&str) -> Option<String>) -> Option<String> {
     read_env("CODEWHALE_BUILD_SHA")
         .and_then(full_sha)
         .or_else(|| read_env("DEEPSEEK_BUILD_SHA").and_then(full_sha))
-        .or_else(|| read_env("GITHUB_SHA").and_then(full_sha))
         .and_then(short_sha)
 }
 
@@ -316,12 +323,14 @@ mod tests {
     #[test]
     fn the_release_build_sha_comes_only_from_a_release_environment() {
         let ci = "abcdef0123456789abcdef0123456789abcdef01";
+        // Audit R02-m1: an ordinary Actions build (PR CI, a fork) has
+        // `GITHUB_SHA` and nothing else; that is not release provenance.
         assert_eq!(
             release_build_sha(|name| (name == "GITHUB_SHA").then(|| ci.to_string())),
-            Some("abcdef012345".to_string())
+            None
         );
         // The canonical Codewhale variable wins over the legacy
-        // DeepSeek-era one, which wins over the GitHub one.
+        // DeepSeek-era one; `GITHUB_SHA` never participates.
         assert_eq!(
             release_build_sha(|name| match name {
                 "CODEWHALE_BUILD_SHA" => Some("e".repeat(40)),

@@ -1151,6 +1151,24 @@ base_url = "https://api.deepseek.com/beta"
 # registry_url = "https://raw.githubusercontent.com/Hmbown/deepseek-skills/main/index.json"
 # max_install_size_bytes = 5_242_880
 # scan_codewhale_only = false # true: ignore Claude/OpenCode/Cursor/agentskills.io skill dirs
+# flat_workspace_root = false # true: opt in to trusted <workspace>/skills content
+
+# Model-stream budgets and HTTP transport. `config dump` shows effective values.
+# Legacy [tui] stream_* keys remain fallbacks when a canonical field is absent.
+[stream]
+open_timeout_secs = 45      # response headers, including connect (0 = env/default, 5-300)
+chunk_timeout_secs = 900    # per-SSE-chunk idle bound (0 = default, 1-3600)
+max_resumes = 3             # whole-request reissues after failed streams (0 = off, 0-10)
+max_transparent_retries = 2 # retry before any content (0 = off, 0-10)
+max_stream_errors = 5       # recoverable errors per stream (0 = default, 1-50)
+max_duration_secs = 1800    # one stream, not the whole turn (0 = default, 10-86400)
+max_content_mb = 10         # one stream's content (0 = default, 1-512)
+connect_timeout_secs = 30   # TCP/TLS setup (0 = default, 1-300)
+force_http1 = false         # a truthy CODEWHALE_FORCE_HTTP1 still pins HTTP/1.1
+# Keepalive settings apply to newly built model/catalog/fallback clients.
+tcp_keepalive_secs = 30             # idle TCP probes (0 = off, 1-3600)
+http2_keep_alive_interval_secs = 15  # active HTTP/2 PINGs (0 = off, 1-3600)
+http2_keep_alive_timeout_secs = 20   # PING ACK deadline (0 = default, 1-3600)
 
 # ─────────────────────────────────────────────────────────────────────────────────
 # TUI
@@ -1159,25 +1177,12 @@ base_url = "https://api.deepseek.com/beta"
 alternate_screen = "auto"   # auto/always start on the alternate screen; never starts inline (keeps terminal scrollback). /fullscreen and /inline switch at runtime
 mouse_capture = true        # true: TUI-owned mouse selection (payload set by selection_copy_markdown); false: raw terminal selection/copy
 selection_copy_markdown = true # true: copy transcript drag selections as Markdown source; false: rendered text
-stream_chunk_timeout_secs = 900 # optional SSE idle timeout per chunk (0 = default, 1-3600)
 # Model steps are uncapped by default. Uncomment to install an explicit
 # ceiling; omission or 0 means no step limit, positive values clamp to 1-100000.
 # max_model_steps = 1000
 # A turn has no wall-clock limit unless you set one; omission or 0 means none.
 # turn_wall_clock_secs = 7200  # cumulative wall clock for one turn, excluding
                                # time blocked on a human approval (30-86400)
-# Stream budgets remain finite; 0 selects their default.
-stream_max_content_mb = 10   # per-step cap on streamed content (0 = default, 1-512)
-stream_max_duration_secs = 1800 # per-step cap on one stream's duration (0 = default, 10-86400)
-# Stream retry budgets and transport timeouts. Every failed stream — one that
-# never opened, died before content, or dropped mid-stream — spends
-# stream_max_resumes. For the two retry counts 0 disables that retry kind;
-# stream_max_errors is a finite budget, so 0 selects its default.
-# stream_max_resumes = 3             # re-issue a failed stream's request (0 = off, 0-10)
-# stream_max_transparent_retries = 2 # in-stream re-request before any content (0 = off, 0-10)
-# stream_max_errors = 5              # recoverable errors tolerated per stream (0 = default, 1-50)
-# stream_open_timeout_secs = 45      # response-header wait (0 = env/default, 5-300)
-# connect_timeout_secs = 30          # TCP/TLS connect timeout (0 = default, 1-300)
 osc8_links = true            # emit OSC 8 escapes around URLs (Cmd+click in iTerm2/Ghostty/Kitty/WezTerm/Terminal.app 13+); set false for terminals that misrender
 # What the bottom chrome shows. Each key is one thing on screen: `mode` is the
 # posture bar's plan/act/operate chip, everything else is a segment of the
@@ -1240,6 +1245,7 @@ web_search = true # enables canonical web.run plus the compatibility web_search 
 apply_patch = true
 mcp = true
 exec_policy = true
+code_mode = true # execute_tools composes MCP/plugin/native calls; false defers it behind tool_search
 # vision_model = false  # enable vision model for image_analyze tool
 # verify_tool = false   # disable the agent-callable `verify` self-critique tool
                         # (#4196). On by default; the agent decides when to spend
@@ -1261,9 +1267,18 @@ exec_policy = true
                         # so every plugin must be re-reviewed afterwards.
 
 # [extension_host]
-# node = "/usr/local/bin/node"  # Node.js ^22.19 || >=24. Tried first; otherwise
-#                               # every `node` on PATH is tried in order and the
-#                               # first that runs and meets the floor is used.
+# runtime = "node"              # "node" (default), "bun" or "auto". Bun is an
+#                               # opt-in, qualified on macOS only. "auto" uses
+#                               # Bun >= 1.4.0 when one is found and starts,
+#                               # else Node. "bun"/"node" never fall back.
+#                               # Unset with only `bun` set: "bun".
+# bun = "~/.bun/bin/bun"        # Bun >= 1.4.0. When set, the only Bun tried; a
+#                               # broken one fails instead of searching PATH and
+#                               # $BUN_INSTALL/bin or ~/.bun/bin.
+# node = "/usr/local/bin/node"  # Node.js ^22.19 || >=24. When set, the only Node
+#                               # tried. Unset, every `node` on PATH is tried in
+#                               # order, skipping any inside node_modules or the
+#                               # working directory.
 
 # ─────────────────────────────────────────────────────────────────────────────────
 # Vision Model Configuration (optional)
@@ -1290,6 +1305,9 @@ max_retries = 3
 initial_delay = 1.0
 max_delay = 60.0
 exponential_base = 2.0
+# jitter = true                 # randomize each backoff delay
+# jitter_factor = 0.1           # ±10% spread (0.0-1.0)
+# respect_retry_after = true    # honor a server Retry-After header
 
 # ─────────────────────────────────────────────────────────────────────────────────
 # Goal loop (`[goal]`) — operate-mode persistent goals
@@ -1622,12 +1640,15 @@ base_url = "https://integrate.api.nvidia.com/v1"
 # ─────────────────────────────────────────────────────────────────────────────────
 # Tool Overrides & Plugins ([tools])
 # ─────────────────────────────────────────────────────────────────────────────────
-# The `[tools]` table lets you replace any built-in tool with a custom
-# implementation (script or command) or disable it entirely — without
-# forking or recompiling the binary.
+# The `[tools]` table lets you disable any built-in tool, or add your own
+# tool backed by a script or command — without forking or recompiling the
+# binary. A script or command cannot replace a built-in: an override keyed by
+# a built-in name is refused (logged) and the built-in stays active.
 #
 # Plugin scripts dropped in the plugin directory are auto-discovered and
-# registered as model-visible tools alongside the built-in ones.
+# registered as model-visible tools alongside the built-in ones. A script may
+# declare `# approval: suggest` (the default) or `# approval: required`;
+# `# approval: auto` is no longer supported and falls back to the default.
 #
 # Scripts receive the tool's JSON input on **stdin** and must return a
 # JSON `ToolResult` (`{"content": "...", "success": true}`) on **stdout**.
@@ -1638,35 +1659,40 @@ base_url = "https://integrate.api.nvidia.com/v1"
 #
 # [tools.overrides]
 # # Disable a tool entirely — removes it from the model-visible catalog.
-# "code_execution" = { type = "disabled" }
+# "Web" = { type = "disabled" }
 #
-# # Replace a tool with a script. Relative paths resolve against plugin_dir.
-# "exec_shell" = { type = "script", path = "audit-exec-shell.sh" }
+# # Add a tool backed by a script. Relative paths resolve against plugin_dir.
+# "audited_shell" = { type = "script", path = "audit-shell.sh" }
 #
-# # Replace a tool with a command (binary on PATH or absolute path).
-# "read_file" = { type = "command", command = "bat", args = ["--paging=never"] }
+# # Add a tool backed by a command (binary on PATH or absolute path).
+# "bat_reader" = { type = "command", command = "bat", args = ["--paging=never"] }
 #
 # # Scripts can also accept static arguments before the JSON input:
-# "fetch_url" = { type = "script", path = "cached-fetch.sh", args = ["--ttl", "300"] }
+# "cached_fetch" = { type = "script", path = "cached-fetch.sh", args = ["--ttl", "300"] }
 
-# ──────────── Enterprise example: audit-logging exec_shell wrapper ──────────────
-# Drop `audit-exec-shell.sh` in `~/.codewhale/tools/` and enable with:
+# ──────────── Enterprise example: audit-logging shell wrapper ──────────────
+# Drop `audit-shell.sh` (below) in `~/.codewhale/tools/`, where it registers
+# itself as `audited_shell`, and turn the built-in shell off (`Bash` and its
+# lowercase `bash` form). Other shell-capable tools, such as the terminal
+# tools, stay available; disable them too if every command must pass the
+# wrapper.
 #
 # [tools.overrides]
-# "exec_shell" = { type = "script", path = "audit-exec-shell.sh" }
+# "Bash" = { type = "disabled" }
+# "bash" = { type = "disabled" }
 #
-# The wrapper logs every request to `~/.codewhale/audit/exec_shell.log`, then
+# The wrapper logs every request to `~/.codewhale/audit/shell.log`, then
 # delegates to your own approved shell executor. Do not pipe the raw JSON
 # request into `sh -s`; parse the command field and enforce your policy first.
 #
 # ```sh
 # #!/usr/bin/env sh
-# # name: exec_shell
-# # description: Audit-logging wrapper for exec_shell
+# # name: audited_shell
+# # description: Audit-logging shell wrapper
 # # approval: required
 # LOGDIR="${HOME}/.codewhale/audit"
 # mkdir -p "$LOGDIR"
-# LOGFILE="$LOGDIR/exec_shell.log"
+# LOGFILE="$LOGDIR/shell.log"
 # input=$(cat)
 # echo "[$(date -Iseconds)] $input" >> "$LOGFILE"
 # printf '%s\n' '{"content":"audit wrapper dry run: configure an executor","success":false}'

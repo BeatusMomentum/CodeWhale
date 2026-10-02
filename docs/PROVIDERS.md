@@ -43,6 +43,8 @@ against the vendor's own docs before trusting any value here:
 | Alibaba Model Studio (DashScope) | `https://dashscope-intl.aliyuncs.com/compatible-mode/v1` | `qwen3.8-flash` | `DASHSCOPE_API_KEY` |
 | AICraft | `https://aicraftapi.com/v1` | `claude-4.6-sonnet`; DeepSeek / Claude / Gemini / Qwen / GLM / MiniMax / Doubao families | `AICRAFT_API_KEY` |
 | Tsubasa | `https://api.tsubasa.sh/v1` | `tsubasa-pro`, `tsubasa-fast` (32,768-token context) | `TSUBASA_API_KEY` |
+| Cheaper Inference | `https://api.cheaperinference.com/v1` | `gpt-5.4-mini`, `claude-sonnet-5`, `gemini-3.1-pro` | `CHEAPER_INFERENCE_API_KEY` |
+| Yolo-Auto | `https://yolo-auto.com/v1` | `qwen3.8-flash`; `yolo` / `yolo-small` | `YOLO_AUTO_API_KEY` |
 
 AICraft's roster spans DeepSeek, Anthropic Claude, Google Gemini, Qwen, GLM,
 MiniMax and Doubao ids on its OpenAI-compatible endpoint. The authority is
@@ -52,6 +54,13 @@ Tsubasa implements only `GET /v1/models` and Chat Completions. Its two public
 model ids share a 32,768-token context, smaller than the 128,000 tokens Codewhale assumes
 for an unknown model, so set it on the route after saving:
 `codewhale config set providers.tsubasa.context_window 32768`.
+
+Cheaper Inference is an OpenAI-compatible gateway with one key for models from
+several labs. Model ids are bare, such as `gpt-5.4-mini` or `claude-sonnet-5`.
+Pricing varies by model and route; consult the provider’s current catalog.
+The authority is `GET https://api.cheaperinference.com/v1/models` with your key.
+Docs: <https://cheaperinference.com/docs>.
+
 OpenCode Zen and OpenCode Go are first-class provider routes, configured like
 any other provider below; they are not part of this table. In `/provider`,
 type to filter the list (letters not bound to a row action); `Ctrl+T` probes the
@@ -134,7 +143,7 @@ Codewhale observation is retained. The separately attributed Codex-owned
 native cache keeps its existing freshness policy when no login-file version
 can be observed; this is not proof of account identity in an external keyring.
 
-The canonical provider IDs are the 44 entries of `ProviderKind::ALL`
+The canonical provider IDs are the entries of `ProviderKind::ALL`
 (`crates/config/src/provider_kind.rs`), in that order:
 
 `deepseek`, `nvidia-nim`, `openai`, `atlascloud`, `wanjie-ark`, `volcengine`,

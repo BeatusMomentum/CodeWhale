@@ -595,15 +595,17 @@ fn prune_output(input: &str) -> String {
         .char_indices()
         .find(|(index, _)| *index >= head)
         .map_or(input.len(), |(index, _)| index);
+    // The earliest boundary that still fits: the tail is where a build's
+    // error and the command's completion marker are.
     let tail_start = input
         .char_indices()
-        .rev()
-        .find(|(index, _)| input.len() - *index <= tail)
-        .map_or(0, |(index, _)| index);
+        .map(|(index, _)| index)
+        .find(|index| *index >= head_end && input.len() - *index <= tail)
+        .unwrap_or(input.len());
     format!(
         "{}\n… [output truncated: {} bytes omitted] …\n{}",
         &input[..head_end],
-        input.len() - OUTPUT_LIMIT,
+        tail_start - head_end,
         &input[tail_start..]
     )
 }
@@ -1107,6 +1109,24 @@ mod tests {
         start_command(&mut session, command).unwrap();
         let (done, timed_out) = wait_session(&mut session, timeout);
         session_result(&mut session, done, timed_out)
+    }
+
+    #[test]
+    fn prune_output_keeps_the_tail_and_counts_what_it_dropped() {
+        let input = format!(
+            "first-line\n{}\nerror: the last line é\n",
+            "x".repeat(OUTPUT_LIMIT * 2)
+        );
+        let pruned = prune_output(&input);
+        let (head, rest) = pruned
+            .split_once("\n… [output truncated: ")
+            .expect("truncation marker");
+        let (omitted, tail) = rest.split_once(" bytes omitted] …\n").expect("count");
+        let omitted: usize = omitted.parse().expect("omitted count");
+        assert!(head.starts_with("first-line"));
+        assert!(tail.ends_with("error: the last line é\n"), "{tail:?}");
+        assert!(tail.len() > OUTPUT_LIMIT / 2, "tail kept only {tail:?}");
+        assert_eq!(head.len() + omitted + tail.len(), input.len());
     }
 
     #[test]

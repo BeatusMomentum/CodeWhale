@@ -615,8 +615,19 @@ pub(crate) fn message_has_tool_use(message: &Message) -> bool {
         .any(|block| matches!(block, ContentBlock::ToolUse { .. }))
 }
 
+/// Conservative text estimate: three characters per token, but never below
+/// the bytes/4 estimate the message path uses. Characters alone read
+/// multibyte (CJK) text at ~0.33 tokens each, *under* the byte estimate's
+/// ~0.75, which made the "conservative" figure the smaller one exactly where
+/// it matters.
+///
+/// Known limitation: both are heuristics, not a tokenizer. CJK costs roughly
+/// 0.6-1.5 tokens per character depending on the provider's tokenizer, so a
+/// CJK-heavy prompt can still be underestimated; the compaction trigger
+/// bounds that by taking the larger of this estimate and the provider-billed
+/// prompt size.
 pub(crate) fn estimate_text_tokens_conservative(text: &str) -> usize {
-    text.chars().count().div_ceil(3)
+    text.chars().count().div_ceil(3).max(text.len().div_ceil(4))
 }
 
 fn estimate_system_tokens_conservative(system: Option<&SystemPrompt>) -> usize {
@@ -2728,10 +2739,7 @@ mod tests {
         let mut usage = Usage::default();
 
         let result = compact_messages_safe(&client, &messages, None, &envelope, &mut usage).await;
-        assert!(
-            result.is_ok(),
-            "the retry after shrinking must succeed: {result:?}"
-        );
+        assert!(result.is_ok(), "the retry after shrinking must succeed");
 
         let requests = client.requests.lock().expect("requests").clone();
         assert_eq!(requests.len(), 2, "one rejection, one retry");
@@ -2769,7 +2777,7 @@ mod tests {
         let result = compact_messages_safe(&client, &messages, None, &envelope, &mut usage).await;
         assert!(
             result.is_ok(),
-            "the retry after replacing images must succeed: {result:?}"
+            "the retry after replacing images must succeed"
         );
 
         let requests = client.requests.lock().expect("requests").clone();
@@ -2809,7 +2817,7 @@ mod tests {
         let result = compact_messages_safe(&client, &messages, None, &envelope, &mut usage).await;
         assert!(
             result.is_ok(),
-            "the gateway-page rejection must enter the ladder: {result:?}"
+            "the gateway-page rejection must enter the ladder"
         );
         let requests = client.requests.lock().expect("requests").clone();
         assert_eq!(requests.len(), 2, "one rejection, one retry");
@@ -2848,7 +2856,7 @@ mod tests {
         let result = compact_messages_safe(&client, &messages, None, &envelope, &mut usage).await;
         assert!(
             result.is_ok(),
-            "in-budget images must still let the ladder finish: {result:?}"
+            "in-budget images must still let the ladder finish"
         );
         let requests = client.requests.lock().expect("requests").clone();
         assert_eq!(requests.len(), 2, "replace directly, no identical retry");
@@ -3802,6 +3810,14 @@ mod tests {
         }];
         let tokens = estimate_tokens(&messages);
         assert!(tokens > 0 && tokens < 10);
+    }
+
+    #[test]
+    fn conservative_estimate_never_reads_cjk_below_the_byte_estimate() {
+        let cjk = "中".repeat(1200); // 3,600 UTF-8 bytes
+        assert!(estimate_text_tokens_conservative(&cjk) >= cjk.len() / 4);
+        // ASCII keeps its three-characters-per-token reading.
+        assert_eq!(estimate_text_tokens_conservative(&"a".repeat(300)), 100);
     }
 
     #[test]

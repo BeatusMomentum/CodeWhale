@@ -367,13 +367,14 @@ fn error_is_invalid_grant(error: &anyhow::Error) -> bool {
 /// authorization server has definitively rejected the stored grant — only a
 /// fresh login recovers it.
 pub fn error_text_looks_auth_required(text: &str) -> bool {
+    let status_401 = text_names_http_status(text, "401");
     let text = text.to_ascii_lowercase();
     // `auth required` and `requires oauth` are anchored to the shapes this
     // product and the Codex-compatible managers actually emit (`◆ auth
     // required`, `requires OAuth login/authentication/reauthentication`) —
     // bare substrings would misclassify incidental server errors like
     // "auth required parameter is missing".
-    text.contains("401")
+    status_401
         || text.contains("unauthorized")
         || text.contains("authentication_required")
         || text.contains("invalid_grant")
@@ -394,6 +395,21 @@ pub fn error_text_looks_auth_required(text: &str) -> bool {
         || text.contains("re-authorize")
         || text.contains("/mcp login")
         || text.contains("mcp login")
+}
+
+/// Whether error text names an HTTP status as a status, not as digits inside
+/// an address or a larger number. Transport errors carry the URL they failed
+/// on, so a bare substring match read the reset on
+/// `http://127.0.0.1:50401/mcp` as a 401 and put a healthy server into
+/// `◆ auth required` — whenever the ephemeral port happened to contain it.
+pub(crate) fn text_names_http_status(text: &str, status: &str) -> bool {
+    text.split_whitespace()
+        .filter(|token| !token.contains("://"))
+        .any(|token| {
+            token
+                .split(|c: char| !c.is_ascii_digit())
+                .any(|digits| digits == status)
+        })
 }
 
 pub fn auth_required_login_hint(server_name: &str) -> String {
@@ -826,13 +842,17 @@ impl McpOAuthRuntime {
     /// the rotated token while keeping our dead grant would make the next
     /// `invalid_grant` compare an "unchanged" store and delete the newer
     /// valid credential.
+    ///
+    /// The comparison and the delete are one step under the secret store's
+    /// entry lock (the same lock every save takes), so a login that lands
+    /// between them is never the credential that gets deleted.
     async fn clear_stored_tokens(&self, reason: &str) -> Result<()> {
         let held = { self.inner.last_tokens.lock().await.take() };
         let Some(held) = held else {
             return Ok(());
         };
-        match load_oauth_tokens(&self.inner.server_name, &self.inner.url)? {
-            Some(stored) if stored != held => {
+        match delete_oauth_tokens_if_held(&self.inner.server_name, &self.inner.url, &held)? {
+            Some(stored) => {
                 tracing::debug!(
                     target: "mcp",
                     server = %self.inner.server_name,
@@ -845,8 +865,7 @@ impl McpOAuthRuntime {
                 *self.inner.last_tokens.lock().await = Some(stored);
                 *self.inner.rejection.lock().await = None;
             }
-            _ => {
-                delete_oauth_tokens(&self.inner.server_name, &self.inner.url)?;
+            None => {
                 *self.inner.rejection.lock().await = Some(reason.to_string());
             }
         }
@@ -863,8 +882,9 @@ impl McpOAuthRuntime {
         };
         let Some(credentials) = credentials else {
             let mut last = self.inner.last_tokens.lock().await;
-            if last.take().is_some() {
-                delete_oauth_tokens(&self.inner.server_name, &self.inner.url)?;
+            if let Some(previous) = last.take() {
+                // Only our own credential goes; a newer login stays.
+                delete_oauth_tokens_if_held(&self.inner.server_name, &self.inner.url, &previous)?;
             }
             return Ok(());
         };
@@ -1444,9 +1464,42 @@ pub(crate) fn load_oauth_tokens(
     else {
         return Ok(None);
     };
-    let mut tokens = parse_stored_oauth_tokens(&serialized, server_name)?;
+    decode_stored_oauth_tokens(&serialized, server_name).map(Some)
+}
+
+fn decode_stored_oauth_tokens(serialized: &str, server_name: &str) -> Result<StoredMcpOAuthTokens> {
+    let mut tokens = parse_stored_oauth_tokens(serialized, server_name)?;
     refresh_expires_in_from_timestamp(&mut tokens);
-    Ok(Some(tokens))
+    Ok(tokens)
+}
+
+/// Delete the stored credential only while it is still exactly `held`,
+/// comparing and deleting under the store's entry lock. Returns the different
+/// credential found in its place (left untouched), or `None` when the entry
+/// was `held` and is now gone, or was already absent. An unreadable entry is
+/// an error and is left in place, as a plain load would report it.
+fn delete_oauth_tokens_if_held(
+    server_name: &str,
+    url: &str,
+    held: &StoredMcpOAuthTokens,
+) -> Result<Option<StoredMcpOAuthTokens>> {
+    let secrets = codewhale_secrets::Secrets::auto_detect();
+    let key = store_key(server_name, url);
+    secrets
+        .with_entry_transaction(&key, |current| {
+            let Some(serialized) = current.as_deref() else {
+                return Ok(Ok(None));
+            };
+            Ok(match decode_stored_oauth_tokens(serialized, server_name) {
+                Ok(stored) if stored == *held => {
+                    *current = None;
+                    Ok(None)
+                }
+                Ok(stored) => Ok(Some(stored)),
+                Err(error) => Err(error),
+            })
+        })
+        .with_context(|| format!("clearing the MCP OAuth token for '{server_name}'"))?
 }
 
 fn parse_stored_oauth_tokens(serialized: &str, server_name: &str) -> Result<StoredMcpOAuthTokens> {
@@ -2341,6 +2394,17 @@ mod tests {
 
         let err = anyhow!("connection refused");
         assert!(!error_looks_auth_required(&err));
+
+        assert!(error_text_looks_auth_required("HTTP 401 from upstream"));
+        assert!(error_text_looks_auth_required("request failed (401)"));
+        // The failure the classifier used to misread: a reset on a loopback
+        // server whose ephemeral port contains 401 is a transport error.
+        let reset = "error sending request for url (http://127.0.0.1:50401/mcp): \
+                     client error (SendRequest): connection closed before message completed";
+        assert!(!error_text_looks_auth_required(reset), "{reset}");
+        assert!(!error_text_looks_auth_required(
+            "read 14010 bytes before the stream reset"
+        ));
     }
 
     #[test]

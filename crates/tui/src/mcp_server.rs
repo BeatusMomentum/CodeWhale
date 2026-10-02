@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
 use crate::session_manager::SessionManager;
 use crate::tools::spec::{ToolError, ToolResult};
@@ -92,6 +92,14 @@ struct McpServer {
     registry: crate::tools::ToolRegistry,
     exposed_tools: Vec<ExposedTool>,
     require_approval: bool,
+    phase: SessionPhase,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SessionPhase {
+    Uninitialized,
+    InitializeResponded,
+    Ready,
 }
 
 impl McpServer {
@@ -121,6 +129,7 @@ impl McpServer {
             registry,
             exposed_tools,
             require_approval: settings.require_approval,
+            phase: SessionPhase::Uninitialized,
         })
     }
 
@@ -128,55 +137,136 @@ impl McpServer {
     /// stdio server answers one request at a time by definition, so it
     /// needs no private `Runtime` and no `block_on` (#6140).
     async fn run(&mut self) -> Result<()> {
-        let stdin = tokio::io::BufReader::new(tokio::io::stdin());
-        let mut stdout = tokio::io::stdout();
-        let mut lines = stdin.lines();
+        self.run_io(tokio::io::stdin(), tokio::io::stdout()).await
+    }
 
-        while let Some(line) = lines.next_line().await? {
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            let Ok(message) = serde_json::from_str::<Value>(trimmed) else {
-                continue;
+    async fn run_io<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+        &mut self,
+        input: R,
+        mut output: W,
+    ) -> Result<()> {
+        let mut reader = tokio::io::BufReader::new(input);
+        let mut frame = Vec::new();
+        loop {
+            let response = match crate::mcp::read_line_capped(
+                &mut reader,
+                &mut frame,
+                crate::mcp::MAX_MCP_RESPONSE_BYTES,
+            )
+            .await
+            {
+                Ok(0) => break,
+                Ok(_) if frame.iter().all(u8::is_ascii_whitespace) => {
+                    frame.clear();
+                    continue;
+                }
+                Ok(_) => match serde_json::from_slice(&frame) {
+                    Ok(message) => self.handle_message(message).await,
+                    Err(_) => respond_error(Some(&Value::Null), -32700, "Invalid JSON".into()),
+                },
+                Err(err) => {
+                    let response = respond_error(
+                        Some(&Value::Null),
+                        -32700,
+                        "Invalid or oversized JSON-RPC frame".into(),
+                    );
+                    if let Some(response) = response {
+                        output.write_all(response.to_string().as_bytes()).await?;
+                        output.write_all(b"\n").await?;
+                        output.flush().await?;
+                    }
+                    return Err(err).context("Failed to read bounded MCP input");
+                }
             };
-
-            if let Some(response) = self.handle_message(message).await {
-                let payload = serde_json::to_string(&response)?;
-                stdout.write_all(payload.as_bytes()).await?;
-                stdout.write_all(b"\n").await?;
-                stdout.flush().await?;
+            frame.clear();
+            if let Some(response) = response {
+                let payload = serde_json::to_vec(&response)?;
+                output.write_all(&payload).await?;
+                output.write_all(b"\n").await?;
+                output.flush().await?;
             }
         }
-
         Ok(())
     }
 
     async fn handle_message(&mut self, message: Value) -> Option<Value> {
-        let method = message.get("method").and_then(Value::as_str)?;
-        let id = message.get("id").cloned();
+        let id = message.get("id");
+        let method = message.get("method").and_then(Value::as_str);
+        if !message.is_object()
+            || message.get("jsonrpc").and_then(Value::as_str) != Some("2.0")
+            || method.is_none_or(str::is_empty)
+            || id.is_some_and(|id| !(id.is_null() || id.is_string() || id.is_i64() || id.is_u64()))
+            || message
+                .get("params")
+                .is_some_and(|params| !params.is_object())
+        {
+            return respond_error(
+                Some(&Value::Null),
+                -32600,
+                "Invalid JSON-RPC request".into(),
+            );
+        }
+        let method = method.unwrap_or_default();
+        if matches!(method, "tools/list" | "tools/call" | "resources/list")
+            && self.phase != SessionPhase::Ready
+        {
+            return respond_error(
+                id,
+                -32600,
+                "A completed initialize / notifications/initialized handshake is required".into(),
+            );
+        }
 
         match method {
-            "initialize" => respond(
-                id.as_ref(),
-                initialize_response(
-                    message
-                        .pointer("/params/protocolVersion")
-                        .and_then(Value::as_str),
-                ),
-            ),
-            "tools/list" => respond(id.as_ref(), self.list_tools_response()),
-            "tools/call" => {
-                let params = message.get("params").cloned().unwrap_or_else(|| json!({}));
-                match self.call_tool(params).await {
-                    Ok(result) => respond(id.as_ref(), result),
-                    Err(err) => respond_error(id.as_ref(), err.code, err.message),
+            "initialize" => {
+                // A notification has no response carrying the negotiated version
+                // and cannot advance the handshake.
+                id?;
+                if self.phase != SessionPhase::Uninitialized {
+                    return respond_error(id, -32600, "Initialize may only be sent once".into());
+                }
+                let requested = message
+                    .pointer("/params/protocolVersion")
+                    .and_then(Value::as_str);
+                if requested.is_none_or(|version| version.trim().is_empty())
+                    || ["name", "version"].iter().any(|field| {
+                        message["params"]["clientInfo"][*field]
+                            .as_str()
+                            .is_none_or(|value| value.trim().is_empty())
+                    })
+                    || !message["params"]["capabilities"].is_object()
+                {
+                    return respond_error(id, -32602, "Invalid MCP initialize parameters".into());
+                }
+                self.phase = SessionPhase::InitializeResponded;
+                respond(id, initialize_response(requested))
+            }
+            "notifications/initialized" => {
+                if id.is_none() && self.phase == SessionPhase::InitializeResponded {
+                    self.phase = SessionPhase::Ready;
+                    None
+                } else {
+                    respond_error(
+                        id,
+                        -32600,
+                        "Expected initialized notification after initialize".into(),
+                    )
                 }
             }
-            "resources/list" => respond(id.as_ref(), self.list_resources_response().await),
-            "ping" => respond(id.as_ref(), json!({})),
-            "notifications/initialized" => None,
-            _ => respond_error(id.as_ref(), -32601, format!("Method not found: {method}")),
+            "tools/list" => respond(id, self.list_tools_response()),
+            "tools/call" => {
+                // Calls without an identity are notifications and must not run
+                // a tool whose result the client cannot acknowledge.
+                id?;
+                let params = message.get("params").cloned().unwrap_or_else(|| json!({}));
+                match self.call_tool(params).await {
+                    Ok(result) => respond(id, result),
+                    Err(err) => respond_error(id, err.code, err.message),
+                }
+            }
+            "resources/list" => respond(id, self.list_resources_response().await),
+            "ping" => respond(id, json!({})),
+            _ => respond_error(id, -32601, format!("Method not found: {method}")),
         }
     }
 
@@ -282,6 +372,12 @@ impl McpServer {
             .get("arguments")
             .cloned()
             .unwrap_or_else(|| json!({}));
+        if !arguments.is_object() {
+            return Err(RpcError {
+                code: -32602,
+                message: "Tool arguments must be an object".into(),
+            });
+        }
         // Approval comes from the operator's config, never from the caller:
         // a request cannot vouch for itself.
         if self.require_approval
@@ -401,6 +497,207 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
+    fn initialize_request() -> Value {
+        json!({
+            "jsonrpc": "2.0", "id": 0, "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "clientInfo": {"name": "native-server-test", "version": "1"},
+                "capabilities": {}
+            }
+        })
+    }
+
+    async fn complete_handshake(server: &mut McpServer) {
+        let response = server.handle_message(initialize_request()).await.unwrap();
+        assert_eq!(response["result"]["protocolVersion"], "2024-11-05");
+        assert!(
+            server
+                .handle_message(json!({
+                    "jsonrpc": "2.0", "method": "notifications/initialized"
+                }))
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn native_server_validates_identity_without_echoing_request_data() {
+        let mut server = McpServer::new(
+            PathBuf::from("."),
+            McpServerSettings {
+                expose_tools: default_expose_tools(),
+                require_approval: true,
+            },
+        )
+        .unwrap();
+        for request in [
+            json!([]),
+            Value::Null,
+            json!({"method": "ping"}),
+            json!({"jsonrpc": "2", "id": 1, "method": "ping"}),
+            json!({"jsonrpc": "2.0", "id": true, "method": "ping"}),
+            json!({"jsonrpc": "2.0", "id": 1.5, "method": "ping"}),
+            json!({"jsonrpc": "2.0", "id": 1, "method": 7}),
+            json!({"jsonrpc": "2.0", "id": 1, "method": "ping", "params": "PRIVATE_TOKEN=sentinel"}),
+        ] {
+            let response = server.handle_message(request).await.unwrap();
+            assert!(response["id"].is_null(), "{response}");
+            assert_eq!(response["error"]["code"], -32600, "{response}");
+            assert!(!response.to_string().contains("PRIVATE_TOKEN"));
+            assert!(!response.to_string().contains("sentinel"));
+        }
+        let response = server
+            .handle_message(json!({"jsonrpc": "2.0", "id": null, "method": "ping"}))
+            .await
+            .unwrap();
+        assert!(response["id"].is_null());
+        assert_eq!(response["result"], json!({}));
+        assert!(
+            server
+                .handle_message(json!({"jsonrpc": "2.0", "method": "ping"}))
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn native_server_requires_completed_handshake_before_any_tool_effect() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut server = McpServer::new(
+            workspace.path().to_path_buf(),
+            McpServerSettings {
+                expose_tools: vec!["file_write".into()],
+                require_approval: false,
+            },
+        )
+        .unwrap();
+        let write = json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {
+            "name": "file_write", "arguments": {"path": "canary.txt", "content": "written"}
+        }});
+        let response = server.handle_message(write.clone()).await.unwrap();
+        assert_eq!(response["error"]["code"], -32600);
+        assert!(!workspace.path().join("canary.txt").exists());
+        assert!(
+            server
+                .handle_message(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}))
+                .await
+                .is_none()
+        );
+        let mut notification = initialize_request();
+        notification.as_object_mut().unwrap().remove("id");
+        assert!(server.handle_message(notification).await.is_none());
+        assert_eq!(
+            server.handle_message(write.clone()).await.unwrap()["error"]["code"],
+            -32600
+        );
+        let mut malformed = initialize_request();
+        malformed["params"]["clientInfo"]["name"] = json!("");
+        assert_eq!(
+            server.handle_message(malformed).await.unwrap()["error"]["code"],
+            -32602
+        );
+        let mut initialize = initialize_request();
+        initialize["id"] = Value::Null;
+        let response = server.handle_message(initialize).await.unwrap();
+        assert!(response["id"].is_null());
+        assert_eq!(response["result"]["protocolVersion"], "2024-11-05");
+        assert_eq!(
+            server.handle_message(initialize_request()).await.unwrap()["error"]["code"],
+            -32600
+        );
+        assert_eq!(
+            server.handle_message(write.clone()).await.unwrap()["error"]["code"],
+            -32600
+        );
+        assert_eq!(
+            server
+                .handle_message(
+                    json!({"jsonrpc": "2.0", "id": 3, "method": "notifications/initialized"})
+                )
+                .await
+                .unwrap()["error"]["code"],
+            -32600
+        );
+        assert_eq!(
+            server.handle_message(write.clone()).await.unwrap()["error"]["code"],
+            -32600
+        );
+        assert!(
+            server
+                .handle_message(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}))
+                .await
+                .is_none()
+        );
+        let mut unacknowledged = write.clone();
+        unacknowledged.as_object_mut().unwrap().remove("id");
+        assert!(server.handle_message(unacknowledged).await.is_none());
+        assert!(!workspace.path().join("canary.txt").exists());
+        let response = server.handle_message(write).await.unwrap();
+        assert!(response.get("error").is_none(), "{response}");
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join("canary.txt")).unwrap(),
+            "written"
+        );
+    }
+
+    async fn run_native_pipe(input: &[u8]) -> (Result<()>, Vec<u8>) {
+        use tokio::io::AsyncReadExt;
+        let mut server = McpServer::new(
+            PathBuf::from("."),
+            McpServerSettings {
+                expose_tools: default_expose_tools(),
+                require_approval: true,
+            },
+        )
+        .unwrap();
+        let (client, server_io) = tokio::io::duplex(8192);
+        let (mut reader, mut writer) = tokio::io::split(client);
+        let (server_reader, server_writer) = tokio::io::split(server_io);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(server.run_io(server_reader, server_writer), async {
+                // Oversized input deliberately closes the server before the
+                // writer finishes. Both halves still settle without a task.
+                let _ = writer.write_all(input).await;
+                let _ = writer.shutdown().await;
+                drop(writer);
+                let mut output = Vec::new();
+                reader.read_to_end(&mut output).await.unwrap();
+                output
+            })
+        })
+        .await
+        .expect("the bounded server pipe must settle")
+    }
+
+    #[tokio::test]
+    async fn native_pipe_reports_parse_error_and_preserves_the_following_frame() {
+        let (result, output) = run_native_pipe(b"{\"PRIVATE_TOKEN\":\"sentinel\",\n{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"ping\"}\n").await;
+        result.unwrap();
+        let text = String::from_utf8(output).unwrap();
+        assert!(!text.contains("PRIVATE_TOKEN"));
+        assert!(!text.contains("sentinel"));
+        let responses: Vec<Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(responses.len(), 2);
+        assert_eq!(responses[0]["error"]["code"], -32700);
+        assert!(responses[0]["id"].is_null());
+        assert_eq!(responses[1]["id"], 7);
+        assert_eq!(responses[1]["result"], json!({}));
+    }
+
+    #[tokio::test]
+    async fn native_pipe_refuses_oversized_unterminated_input() {
+        let input = vec![b'x'; crate::mcp::MAX_MCP_RESPONSE_BYTES + 8192];
+        let (result, output) = run_native_pipe(&input).await;
+        assert!(result.is_err());
+        let response: Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(response["error"]["code"], -32700);
+        assert!(response["id"].is_null());
+    }
+
     #[test]
     fn exposed_tools_map_aliases() {
         let names = vec![
@@ -471,6 +768,7 @@ mod tests {
             require_approval: false,
         };
         let mut server = McpServer::new(PathBuf::from("."), settings).expect("build server");
+        complete_handshake(&mut server).await;
 
         let tools = server.list_tools_response();
         assert_eq!(
@@ -543,6 +841,7 @@ mod tests {
         };
         let mut server =
             McpServer::new(workspace.path().to_path_buf(), settings).expect("build server");
+        complete_handshake(&mut server).await;
 
         let tools = server.list_tools_response();
         let names: Vec<&str> = tools["tools"]
@@ -587,6 +886,7 @@ mod tests {
         };
         let mut server =
             McpServer::new(workspace.path().to_path_buf(), settings).expect("build server");
+        complete_handshake(&mut server).await;
         let response = server
             .handle_message(json!({
                 "jsonrpc": "2.0",

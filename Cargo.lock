@@ -786,7 +786,6 @@ dependencies = [
  "codewhale-config",
  "codewhale-core",
  "codewhale-hooks",
- "codewhale-mcp",
  "codewhale-paths",
  "codewhale-protocol",
  "codewhale-release",
@@ -825,7 +824,6 @@ dependencies = [
  "codewhale-config",
  "codewhale-execpolicy",
  "codewhale-lane",
- "codewhale-mcp",
  "codewhale-paths",
  "codewhale-release",
  "codewhale-secrets",
@@ -875,7 +873,7 @@ name = "codewhale-command-contract"
 version = "0.10.1"
 dependencies = [
  "chrono",
- "codewhale-core",
+ "codewhale-protocol",
  "serde",
  "serde_json",
 ]
@@ -912,7 +910,6 @@ dependencies = [
  "chrono",
  "codewhale-config",
  "codewhale-hooks",
- "codewhale-mcp",
  "codewhale-protocol",
  "codewhale-state",
  "regex",
@@ -945,6 +942,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "chrono",
+ "codewhale-paths",
  "codewhale-protocol",
  "codewhale-release",
  "reqwest",
@@ -988,12 +986,8 @@ dependencies = [
 name = "codewhale-mcp"
 version = "0.10.1"
 dependencies = [
- "anyhow",
- "libc",
- "serde",
  "serde_json",
  "tracing",
- "windows",
 ]
 
 [[package]]
@@ -1051,6 +1045,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "codewhale-portable-session"
+version = "0.10.1"
+dependencies = [
+ "chrono",
+ "codewhale-command-contract",
+ "codewhale-sanitize",
+ "serde_json",
+ "unicode-segmentation",
+ "url",
+]
+
+[[package]]
 name = "codewhale-protocol"
 version = "0.10.1"
 dependencies = [
@@ -1102,22 +1108,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "codewhale-sanitize"
+version = "0.10.1"
+dependencies = [
+ "regex",
+ "serde_json",
+ "url",
+]
+
+[[package]]
 name = "codewhale-secrets"
 version = "0.10.1"
 dependencies = [
  "chrono",
  "codewhale-paths",
+ "codewhale-sanitize",
  "fd-lock",
  "keyring",
  "libc",
- "regex",
  "serde",
  "serde_json",
  "sha2 0.11.0",
  "tempfile",
  "thiserror 2.0.20",
  "tracing",
- "url",
 ]
 
 [[package]]
@@ -1193,6 +1207,7 @@ dependencies = [
  "codewhale-hooks",
  "codewhale-lane",
  "codewhale-localization",
+ "codewhale-mcp",
  "codewhale-memory",
  "codewhale-models",
  "codewhale-palette",
@@ -1200,6 +1215,7 @@ dependencies = [
  "codewhale-protocol",
  "codewhale-release",
  "codewhale-runtime",
+ "codewhale-sanitize",
  "codewhale-secrets",
  "codewhale-telemetry",
  "codewhale-tools",
@@ -1235,6 +1251,7 @@ dependencies = [
  "ratatui",
  "regex",
  "reqwest",
+ "ring",
  "rio-vt",
  "rmcp",
  "rquickjs",
@@ -1267,6 +1284,7 @@ dependencies = [
  "unicode-normalization",
  "unicode-segmentation",
  "unicode-width",
+ "url",
  "urlencoding",
  "uuid",
  "wait-timeout",

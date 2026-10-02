@@ -215,6 +215,17 @@ fn summarize_subagent_snapshot(
     lines.join("\n")
 }
 
+/// Guidance heading every summarized sub-agent result. It names only tools
+/// the model can call: `read` and `bash` are eager, and `handle_read` is
+/// deferred, so it carries its activation path (#6747).
+pub(crate) fn subagent_summary_guidance() -> String {
+    format!(
+        "Child results are self-reports; verify side effects with `read` (or `bash`, e.g. `git status`, where available) before claiming success.\n\
+         Use `handle_read` on `transcript_handle` for bounded transcript slices when the returned summary is not enough; {}.\n",
+        crate::tools::handle::HANDLE_READ_ACTIVATION_HINT
+    )
+}
+
 /// A payload is a sub-agent snapshot when it carries the identity/status shape
 /// this summarizer knows how to render (`agent_id`/`agent_type`, optionally
 /// wrapped in a `snapshot` field).
@@ -266,10 +277,7 @@ fn compact_subagent_tool_result_for_context(
     let result_limit = (budget / 2 / shown.max(1)).max(SUBAGENT_RESULT_MIN_CHARS);
     let mut lossy = snapshots.len() > SUBAGENT_SNAPSHOTS_SHOWN;
     let mut out = String::from("[sub-agent result summarized for parent context]\n");
-    out.push_str(
-        "Child results are self-reports; verify side effects with `File` actions like `read` or `list` before claiming success.\n",
-    );
-    out.push_str("Use `handle_read` on `transcript_handle` for bounded transcript slices when the returned summary is not enough.\n");
+    out.push_str(&subagent_summary_guidance());
     for (idx, snapshot) in snapshots.iter().enumerate() {
         if idx >= SUBAGENT_SNAPSHOTS_SHOWN {
             out.push_str(&format!(

@@ -1512,23 +1512,34 @@ impl BackgroundShell {
     }
 
     fn take_delta(&mut self) -> (String, String, usize, usize, usize, usize) {
-        if let Some(snapshot) = self.bounded_output_snapshot(false).ok().flatten() {
-            let changed = snapshot.total_bytes != self.stdout_cursor;
-            self.stdout_cursor = snapshot.total_bytes;
-            if changed {
-                self.last_output_at = Instant::now();
-                self.last_observed_output_len = snapshot.total_bytes;
-                let delta_len = snapshot.content.len();
-                return (
-                    snapshot.content,
-                    String::new(),
-                    delta_len,
-                    0,
-                    snapshot.total_bytes,
-                    0,
-                );
+        // Only the bytes after the cursor: returning the whole retained tail
+        // made every `wait` poll repeat output the caller already holds.
+        let bounded_delta = self.bounded_output.as_ref().and_then(|output| {
+            let output = output.lock().unwrap_or_else(|error| error.into_inner());
+            let total = output.total_bytes();
+            output
+                .delta_since(self.stdout_cursor)
+                .ok()
+                .map(|delta| (delta, total))
+        });
+        if let Some(((mut delta, omitted), total_bytes)) = bounded_delta {
+            let delta_len = total_bytes.saturating_sub(self.stdout_cursor);
+            self.stdout_cursor = total_bytes;
+            if delta_len == 0 {
+                return (String::new(), String::new(), 0, 0, total_bytes, 0);
             }
-            return (String::new(), String::new(), 0, 0, snapshot.total_bytes, 0);
+            self.last_output_at = Instant::now();
+            self.last_observed_output_len = total_bytes;
+            if omitted > 0
+                && let Some(output) = self.bounded_output.as_ref()
+            {
+                let notice = output
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .omitted_notice(omitted);
+                delta.insert_str(0, &notice);
+            }
+            return (delta, String::new(), delta_len, 0, total_bytes, 0);
         }
         let (stdout_delta, stdout_total) =
             take_delta_from_buffer(&self.stdout_buffer, &mut self.stdout_cursor);
@@ -2075,6 +2086,23 @@ impl ShellManager {
         self.sandbox_manager.configured_sandbox()
     }
 
+    /// Prepare a program for a tool that runs workspace code outside
+    /// `exec_shell`, under the policy and sandbox configuration a shell
+    /// command would get in this session.
+    fn prepare_runner(
+        &self,
+        program: &str,
+        args: Vec<String>,
+        cwd: &Path,
+        timeout: Duration,
+        policy_override: Option<ExecutionSandboxPolicy>,
+    ) -> ExecEnv {
+        let policy = policy_override.unwrap_or_else(|| self.sandbox_policy.clone());
+        let spec =
+            CommandSpec::program(program, args, cwd.to_path_buf(), timeout).with_policy(policy);
+        self.sandbox_manager.prepare(&spec)
+    }
+
     /// Request that the active foreground shell wait detach and leave its
     /// process running in the background job table.
     pub fn request_foreground_background(&mut self) {
@@ -2390,9 +2418,14 @@ impl ShellManager {
         }
         install_parent_death_signal(&mut cmd);
 
-        if stdin_data.is_some() {
-            cmd.stdin(Stdio::piped());
-        }
+        // Without input, stdin is closed rather than inherited: an unexpected
+        // read (`cat`, a prompt) gets EOF instead of blocking on, or reading,
+        // the operator's terminal until the timeout.
+        cmd.stdin(if stdin_data.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        });
 
         child_env::apply_to_command(&mut cmd, child_env::string_map_env(&exec_env.env));
         remove_readonly_redirect_env(&mut cmd, &exec_env.env);
@@ -3644,13 +3677,21 @@ impl ShellManager {
     /// Age alone is not a bound: it only fired from `list_jobs()`, so a session
     /// that never opened the jobs panel evicted nothing, and 500 finished
     /// records inside one hour were all retained regardless of size (#5472).
+    ///
+    /// Age counts from when a job finished, not when it started: a job that
+    /// ran longer than `max_age` would otherwise be dropped the moment it
+    /// exited, before its completion was delivered. Undelivered completions
+    /// age out too: jobs launched over the Runtime API, or owned by a session
+    /// that is no longer active, are never drained.
     pub fn cleanup(&mut self, max_age: Duration) {
         self.processes.retain(|_, shell| {
             if shell.status == ShellStatus::Running {
-                true
-            } else {
-                shell.started_at.elapsed() < max_age
+                return true;
             }
+            shell.mark_finished();
+            shell
+                .finished_at
+                .is_none_or(|finished| finished.elapsed() < max_age)
         });
         self.enforce_finished_job_bounds();
     }
@@ -3683,7 +3724,8 @@ impl ShellManager {
                 (
                     id.clone(),
                     shell.completion_reported,
-                    shell.started_at,
+                    // Oldest by finish, like the age rule in `cleanup`.
+                    shell.finished_at.unwrap_or(shell.started_at),
                     shell.retained_output_bytes(),
                 )
             })
@@ -4149,6 +4191,59 @@ fn is_native_readonly_sandbox(sandbox_type: SandboxType) -> bool {
         SandboxType::LinuxBubblewrap => true,
         _ => false,
     }
+}
+
+/// Build the child for a tool that runs workspace code outside `exec_shell`
+/// (gate commands, the cargo test runner). It gets exactly the confinement a
+/// shell command gets in this session: the same policy, the same OS sandbox
+/// wrapper, and the sanitized child environment. Callers keep their own
+/// process-tree containment, timeout and cancellation.
+///
+/// Known limitations: where the platform has no enforcing sandbox configured
+/// (Linux without bubblewrap, Windows) a workspace-write policy runs
+/// unsandboxed, as it does for `exec_shell`; a read-only policy refuses there.
+/// A session whose commands run in an external sandbox backend cannot run
+/// these local children at all.
+pub(crate) fn sandboxed_runner_command(
+    context: &crate::tools::spec::ToolContext,
+    program: &str,
+    args: Vec<String>,
+    cwd: &Path,
+    timeout: Duration,
+) -> std::result::Result<tokio::process::Command, crate::tools::spec::ToolError> {
+    use crate::tools::spec::ToolError;
+    if context.sandbox_backend.is_some() {
+        return Err(ToolError::not_available(
+            "this tool starts a local process, and this session runs commands in an external sandbox; run the command through the shell tool instead",
+        ));
+    }
+    let exec_env = context
+        .shell_manager
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .prepare_runner(
+            program,
+            args,
+            cwd,
+            timeout,
+            context.elevated_sandbox_policy.clone(),
+        );
+    if matches!(exec_env.policy, ExecutionSandboxPolicy::ReadOnly) {
+        require_native_readonly_execution(&exec_env)
+            .map_err(|error| ToolError::permission_denied(error.to_string()))?;
+    }
+    let mut cmd = tokio::process::Command::new(exec_env.program());
+    crate::utils::suppress_tokio_console_window(&mut cmd);
+    cmd.args(exec_env.args())
+        .current_dir(&exec_env.cwd)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    // Workspace code never inherits parent credentials.
+    crate::child_env::apply_to_tokio_command(
+        &mut cmd,
+        crate::child_env::string_map_env(&exec_env.env),
+    );
+    Ok(cmd)
 }
 
 fn require_native_readonly_execution(exec_env: &ExecEnv) -> Result<()> {
@@ -4870,7 +4965,12 @@ async fn execute_foreground_via_background(
         manager.attach_heavy_permit(&task_id, permit)?;
     }
 
-    if stdin_data.is_some() {
+    // A foreground pipe command gets EOF on stdin: an unexpected read (`cat`,
+    // `read x`, a confirmation prompt) then fails at once instead of blocking
+    // until the timeout kills it. A TTY keeps its terminal input. A command
+    // later moved to /jobs keeps the closed stdin; interactive input needs
+    // `background: true` from the start.
+    if stdin_data.is_some() || !tty {
         let mut manager = context
             .shell_manager
             .lock()

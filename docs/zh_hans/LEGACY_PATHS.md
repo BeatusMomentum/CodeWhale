@@ -1,7 +1,7 @@
 # 旧版 `.deepseek/` 兼容路径 —— 审计与迁移状态（#3068）
 
 > 英文原文：[LEGACY_PATHS.md](../LEGACY_PATHS.md)。
-> 最后与英文同步日期（last synced with English revision）：2026-09-27。
+> 最后与英文同步日期（last synced with English revision）：2026-09-29。
 
 ## v0.9.10 清理台账
 
@@ -9,7 +9,7 @@
 彼此可以互换。一条兼容条目必须指出仍然需要它的契约；
 新的生产代码必须使用当前路径。
 
-| 类别 | 表面 | 决定 / 契约 |
+| 类别 | 对象 | 决定 / 契约 |
 |---|---|---|
 | DELETE | 已退役的 underwater 构建版本测试覆盖项 | 已在 `1cc4d1d1b` 中移除；所属测试此前已经删除，仅用于生产的构建版本仍是权威。 |
 | MIGRATE | 跨任务 Agent Mail | `bd998495a` 与托管应用 `4ff7bc50d` 用一个可持久化的类型化运行时（runtime）协议，取代了靠猜的事件别名和同会话邮箱混用。 |
@@ -18,7 +18,7 @@
 | COMPATIBILITY | `agent_message` 转录（transcript）/协议解码 | 已持久化的转录和工具线上取值需要解码；它不是跨任务 Agent Mail 传输。 |
 | COMPATIBILITY | 托管运行时信封 schema 1 | 用于此前持久化/登记过的 runner 重放；当前本地 Codewhale Agent Mail 生产者是 schema 2，两者都会归一化为托管信封。 |
 | CURRENT | DeepSeek 提供商支持 | 一个真实可选的提供商，不是产品品牌；按提供商划分的名称与配置保留。 |
-| CURRENT | 同会话子代理（subagent）邮箱 | Start/status/peek/message/followup/interrupt/wait/cancel 的作用域仍限于父级运行时会话。 |
+| CURRENT | 同会话子智能体（subagent）邮箱 | Start/status/peek/message/followup/interrupt/wait/cancel 的作用域仍限于父级运行时会话。 |
 | CURRENT | Web 语言字典 | 应用与文档路由没有页面本地的 `isZh` 分支；新文案继续走字典。 |
 | CURRENT | 安全、授权、协议、持久化、迁移与数据完整性测试 | 它们保护外部或可持久化的契约，不是文案/布局清理的候选对象。 |
 

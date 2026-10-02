@@ -562,7 +562,11 @@ fn selected_output_indices(rows: &[OutputRow], line_limit: usize) -> Vec<usize> 
         return (0..total).collect();
     }
 
-    let head = TOOL_OUTPUT_HEAD_LINES.min(line_limit).min(total);
+    // Small previews must retain the result/error at the tail as well as
+    // the opening context. The usual 20-row budget still keeps 10 + 6.
+    let head = TOOL_OUTPUT_HEAD_LINES
+        .min(line_limit.div_ceil(2))
+        .min(total);
     let tail = TOOL_OUTPUT_TAIL_LINES
         .min(line_limit.saturating_sub(head))
         .min(total.saturating_sub(head));

@@ -818,9 +818,14 @@ fn preview_engine(config: &crate::config::Config) -> (Engine, EngineHandle, temp
     (engine, handle, tmp)
 }
 
-fn wire_preview_engine(config: &crate::config::Config) -> (Engine, tempfile::TempDir) {
+/// The engine plus its handle: a turn is admitted only while its event
+/// consumer is alive, as in every production embedding, so callers keep the
+/// handle for the engine's lifetime even though these fixtures read no events.
+fn wire_preview_engine(
+    config: &crate::config::Config,
+) -> (Engine, crate::core::engine::EngineHandle, tempfile::TempDir) {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let (mut engine, _handle) = Engine::new(
+    let (mut engine, handle) = Engine::new(
         EngineConfig {
             workspace: tmp.path().to_path_buf(),
             max_steps: 1,
@@ -832,7 +837,7 @@ fn wire_preview_engine(config: &crate::config::Config) -> (Engine, tempfile::Tem
     );
     engine.config.features.disable(Feature::Mcp);
     engine.config.subagents_enabled = false;
-    (engine, tmp)
+    (engine, handle, tmp)
 }
 
 fn inputs(
@@ -983,6 +988,7 @@ async fn assert_preview_matches_first_wire_body(
             provenance: UserInputProvenance::ExternalUser,
             images: Vec::new(),
             max_output_tokens: None,
+            submission_id: None,
         })
         .await;
 
@@ -1024,7 +1030,7 @@ async fn graph_backed_todo_is_not_reinjected_into_the_first_http_body() {
         .deepseek
         .base_url = Some(server.uri());
     let identity = deepseek_identity();
-    let (mut engine, _tmp) = wire_preview_engine(&config);
+    let (mut engine, _handle, _tmp) = wire_preview_engine(&config);
     let graph_todos = crate::tools::todo::TodoListSnapshot {
         items: vec![crate::tools::todo::TodoItem {
             id: 1,
@@ -1190,7 +1196,7 @@ async fn translation_prompt_context_matches_captured_first_production_body() {
         .deepseek
         .base_url = Some(server.uri());
     let identity = deepseek_identity();
-    let (mut engine, _tmp) = wire_preview_engine(&config);
+    let (mut engine, _handle, _tmp) = wire_preview_engine(&config);
     engine.config.translation_enabled = false;
     let planned = plan(&config, &identity, false, "/translate explain this").await;
     let _ = assert_preview_matches_first_wire_body(
@@ -1229,7 +1235,7 @@ async fn paused_detach_goal_context_matches_captured_first_production_body() {
         .deepseek
         .base_url = Some(server.uri());
     let identity = deepseek_identity();
-    let (mut engine, _tmp) = wire_preview_engine(&config);
+    let (mut engine, _handle, _tmp) = wire_preview_engine(&config);
     engine.config.goal_objective = Some("stale paused objective".to_string());
     sync_goal_state_from_host(
         &engine.config.goal_state,
@@ -1290,7 +1296,7 @@ async fn anthropic_preview_matches_the_first_native_messages_wire_body() {
         exact_id: None,
         migrated_legacy_ollama_cloud_route: false,
     };
-    let (mut engine, _tmp) = wire_preview_engine(&config);
+    let (mut engine, _handle, _tmp) = wire_preview_engine(&config);
     let prompt = "inspect the native Messages payload";
     let planned = plan_for(
         &config,
@@ -1547,7 +1553,7 @@ async fn assert_matrix_route(route: &MatrixRoute) {
         .await;
 
     let config = matrix_config(route);
-    let (mut engine, _tmp) = wire_preview_engine(&config);
+    let (mut engine, _handle, _tmp) = wire_preview_engine(&config);
     let prompt = "inspect the exact next request for this route";
     let uri = server.uri();
     let planned = matrix_planned_route(route, &config, Some(uri.as_str()), prompt).await;
@@ -1898,7 +1904,7 @@ async fn provider_reported_usage_is_unavailable_until_a_response_reports_it() {
         .deepseek
         .base_url = Some(server.uri());
     let identity = deepseek_identity();
-    let (mut engine, _tmp) = wire_preview_engine(&config);
+    let (mut engine, _handle, _tmp) = wire_preview_engine(&config);
 
     let prompt = "count the tokens this turn will report";
     let planned = plan(&config, &identity, false, prompt).await;
@@ -1950,6 +1956,7 @@ async fn provider_reported_usage_is_unavailable_until_a_response_reports_it() {
             provenance: UserInputProvenance::ExternalUser,
             images: Vec::new(),
             max_output_tokens: None,
+            submission_id: None,
         })
         .await;
 

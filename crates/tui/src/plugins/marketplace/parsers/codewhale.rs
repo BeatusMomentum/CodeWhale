@@ -171,6 +171,23 @@ fn parse_codewhale_entry(
         ));
         return None;
     };
+    // The name is the candidate's identity (registry lookup, `/plugin show`,
+    // install), so it is held to the plugin-name rules the other formats
+    // normalize to, rather than stored verbatim with controls or unbounded.
+    if crate::plugins::manifest::validate_plugin_name(name).is_err()
+        && !crate::plugins::agent_plugin::is_standard_plugin_name(name)
+    {
+        diagnostics.push(MarketplaceDiagnostic::error(
+            "INVALID_NAME",
+            format!(
+                "Codewhale plugin at index {index} has an invalid name {:?}: use lowercase letters, digits, and internal hyphens or dots",
+                name.chars().take(80).collect::<String>()
+            ),
+            None,
+            Some(index),
+        ));
+        return None;
+    }
     let name = name.to_string();
 
     let (source, bad_source) = str_field(obj, "source");

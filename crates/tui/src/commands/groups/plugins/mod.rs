@@ -356,12 +356,10 @@ fn list_bundles_and_legacy_tools(
         output
     };
     append_diagnostics(presentation, &mut output, &plugin.registry_diagnostics());
-    if let Some(report) = crate::extension_host::status_report() {
-        // Diagnostics and the stderr tail carry plugin-controlled text.
-        for line in report.lines() {
-            output.push('\n');
-            output.push_str(&escape_review_text(line));
-        }
+    // Diagnostics and the stderr tail carry plugin-controlled text.
+    for line in crate::extension_host::status_report().lines() {
+        output.push('\n');
+        output.push_str(&escape_review_text(line));
     }
 
     if let Ok(Some(scan)) = plugin.legacy_scan() {
@@ -387,6 +385,7 @@ fn list_bundles_and_legacy_tools(
                 escape_review_path(&tool.path)
             );
         }
+        append_diagnostics(presentation, &mut output, &scan.diagnostics);
     }
 
     if let Some(nudge) = plugin.reload_nudge() {

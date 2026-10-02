@@ -78,9 +78,17 @@ try:
     passed('source changes reject old producers and actions; clock continues without a view')
     audio_a=str(uuid.uuid4());audio_b=str(uuid.uuid4())
     assert request(d,'/v1/audio',{'client':audio_a,'enabled':True})['granted']
-    assert not request(d,'/v1/audio',{'client':audio_b,'enabled':True})['granted']
+    competitor=request(d,'/v1/audio',{'client':audio_b,'enabled':True})
+    if competitor['granted']:
+        # Headless hosts can lose the sink and release the first lease before
+        # this request. A second grant is valid only if the owner reports the
+        # failed device and also releases that lease; it is no audio proof.
+        frame_when(d,lambda f:f['audioUnavailable'] and not f['audioOwner'])
+        passed('unavailable audio releases its lease and reports device failure (no live audio proof)')
+    else:
+        passed('only one view can lease the companion audio device')
     request(d,'/v1/audio',{'client':audio_a,'enabled':False})
-    passed('only one view can lease the companion audio device')
+    request(d,'/v1/audio',{'client':audio_b,'enabled':False})
     before_style=request(d,'/v1/export')
     appearance={'background':[238,239,235],'backgroundTop':[255,255,250],'particle':[32,79,83],'eventColors':False,'brightness':1.4,'dotScale':1.2,'glow':.25,'environment':False}
     style_action={'identity':d['identity'],'client':str(uuid.uuid4()),'seq':1,'source_revision':b['sourceRevision'],'action':{'kind':'appearance','appearance':appearance}}

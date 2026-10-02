@@ -2447,6 +2447,7 @@ fn sample_thread(thread_id: &str) -> ThreadRecord {
 fn sample_turn(thread_id: &str, turn_id: &str, status: RuntimeTurnStatus) -> TurnRecord {
     let now = Utc::now();
     TurnRecord {
+        decision_receipts: Vec::new(),
         max_output_tokens: None,
         schema_version: CURRENT_RUNTIME_SCHEMA_VERSION,
         id: turn_id.to_string(),
@@ -8358,6 +8359,7 @@ async fn thread_lifecycle_persists_across_restart() -> Result<()> {
                     turn_id: "engine_turn_1".to_string(),
                     created_at: chrono::Utc::now(),
                     route: None,
+                    submission_id: None,
                 })
                 .await;
             let _ = tx_event
@@ -8464,6 +8466,7 @@ async fn initial_classifier_usage_is_persisted_before_terminal_and_merged_exactl
         Utc::now(),
     );
     let classifier_batch = crate::cost_status::RuntimeUsageBatch {
+        decisions: Vec::new(),
         records: vec![crate::cost_status::RuntimeUsageRecord {
             source_id: "auto-router:runtime-fixture".to_string(),
             usage: crate::cost_status::EffectiveRouteUsage {
@@ -8523,6 +8526,7 @@ async fn initial_classifier_usage_is_persisted_before_terminal_and_merged_exactl
             turn_id: "engine_classifier_receipt".to_string(),
             created_at: Utc::now(),
             route: None,
+            submission_id: None,
         })
         .await?;
     harness
@@ -8600,6 +8604,7 @@ fn classifier_settlement_batch(
     );
     route.billing_mode = crate::cost_status::RouteBillingMode::Subscription;
     crate::cost_status::RuntimeUsageBatch {
+        decisions: Vec::new(),
         records: vec![crate::cost_status::RuntimeUsageRecord {
             source_id: format!("auto-router:{source_prefix}-usage"),
             usage: crate::cost_status::EffectiveRouteUsage {
@@ -9100,6 +9105,7 @@ async fn monitor_deduplicates_sink_and_metadata_and_persists_metadata_only_missi
             turn_id: "engine_metadata_receipt".to_string(),
             created_at: Utc::now(),
             route: None,
+            submission_id: None,
         })
         .await?;
     for _ in 0..2 {
@@ -9183,6 +9189,7 @@ async fn monitor_separates_lifecycle_start_from_billing_dispatch_and_child_usage
             turn_id: "engine_route_receipt".to_string(),
             created_at: started_at,
             route: None,
+            submission_id: None,
         })
         .await?;
     harness
@@ -9357,6 +9364,7 @@ async fn monitor_separates_lifecycle_start_from_billing_dispatch_and_child_usage
             turn_id: second_engine_turn.to_string(),
             created_at: Utc::now(),
             route: None,
+            submission_id: None,
         })
         .await?;
     harness
@@ -9436,6 +9444,7 @@ async fn monitor_persists_request_snapshots_and_matching_terminal_diagnostics() 
             turn_id: engine_turn_id.to_string(),
             created_at: Utc::now(),
             route: None,
+            submission_id: None,
         })
         .await?;
     let mut tool = catalog_tool("mcp_computer_get_app_state");
@@ -9603,6 +9612,7 @@ async fn monitor_persists_request_snapshots_and_matching_terminal_diagnostics() 
             turn_id: second_engine_turn_id.to_string(),
             created_at: Utc::now(),
             route: None,
+            submission_id: None,
         })
         .await?;
     let pre_request = crate::tool_inspection::ToolInspectionSnapshot::from_prepared_request(
@@ -9694,6 +9704,7 @@ async fn completed_turn_without_engine_output_fails() -> Result<()> {
                     turn_id: "engine_empty_turn".to_string(),
                     created_at: chrono::Utc::now(),
                     route: None,
+                    submission_id: None,
                 })
                 .await;
             let _ = tx_event
@@ -9785,6 +9796,7 @@ async fn worker_lifecycle_receipts_preserve_owner_outcome_and_durable_replay() -
                     turn_id: "engine_worker_lifecycle".into(),
                     created_at: Utc::now(),
                     route: None,
+                    submission_id: None,
                 })
                 .await;
             for owner in [thread_id.clone(), foreign_id] {
@@ -9983,6 +9995,7 @@ async fn preturn_control_status_does_not_make_empty_turn_succeed() -> Result<()>
                     turn_id: "engine_empty_after_control_status".to_string(),
                     created_at: chrono::Utc::now(),
                     route: None,
+                    submission_id: None,
                 })
                 .await;
             let _ = tx_event
@@ -10040,6 +10053,7 @@ async fn engine_error_remains_failed_after_nominal_turn_complete() -> Result<()>
                     turn_id: "engine_error_then_complete".to_string(),
                     created_at: chrono::Utc::now(),
                     route: None,
+                    submission_id: None,
                 })
                 .await;
             let _ = tx_event
@@ -10851,6 +10865,7 @@ async fn multi_turn_continuity_same_thread() -> Result<()> {
                     turn_id: format!("engine_turn_{turn_index}"),
                     created_at: chrono::Utc::now(),
                     route: None,
+                    submission_id: None,
                 })
                 .await;
             let _ = tx_event
@@ -11092,6 +11107,7 @@ async fn host_goal_loop_kickoff_arms_one_continuation_and_parks_at_engine_cap() 
                     turn_id: format!("engine_goal_{pass}"),
                     created_at: chrono::Utc::now(),
                     route: None,
+                    submission_id: None,
                 })
                 .await;
             let _ = tx_event
@@ -11210,6 +11226,7 @@ async fn host_goal_loop_skips_rearm_without_update_goal_and_after_failed_pass() 
                     turn_id: "engine_goal_no_update".to_string(),
                     created_at: chrono::Utc::now(),
                     route: None,
+                    submission_id: None,
                 })
                 .await;
             let _ = tx_event
@@ -11300,6 +11317,7 @@ async fn host_goal_loop_skips_rearm_without_update_goal_and_after_failed_pass() 
                     turn_id: "engine_goal_failed".to_string(),
                     created_at: chrono::Utc::now(),
                     route: None,
+                    submission_id: None,
                 })
                 .await;
             let _ = failed_tx_event
@@ -11397,6 +11415,7 @@ async fn host_goal_loop_mirrors_terminal_snapshot_and_does_not_rearm() -> Result
                         turn_id: format!("engine_{status}"),
                         created_at: chrono::Utc::now(),
                         route: None,
+                        submission_id: None,
                     })
                     .await;
                 let _ = tx_event
@@ -11502,6 +11521,7 @@ async fn model_created_goal_persists_through_adopted_revision() -> Result<()> {
                     turn_id: "engine_model_created".to_string(),
                     created_at: chrono::Utc::now(),
                     route: None,
+                    submission_id: None,
                 })
                 .await;
             let _ = tx_event
@@ -11585,6 +11605,7 @@ async fn model_created_goal_never_overwrites_concurrent_explicit_goal() -> Resul
                     turn_id: "engine_concurrent".to_string(),
                     created_at: chrono::Utc::now(),
                     route: None,
+                    submission_id: None,
                 })
                 .await;
             let _ = tx_event
@@ -11730,6 +11751,347 @@ async fn live_goal_progress_is_revision_fenced_and_settled_once() -> Result<()> 
 }
 
 #[tokio::test]
+async fn startup_discards_an_unpublished_partial_seed_and_keeps_a_committed_one() -> Result<()> {
+    let runtime_dir = test_runtime_dir();
+    let manager = test_manager(runtime_dir.clone())?;
+    let messages: Vec<Message> = serde_json::from_value(json!([
+        {"role":"user","content":[{"type":"text","text":"SEEDED"}]},
+        {"role":"assistant","content":[{"type":"text","text":"SEEDED ANSWER"}]}
+    ]))?;
+    let mut fixtures = Vec::new();
+    for _ in 0..2 {
+        let thread = manager
+            .create_thread(CreateThreadRequest::default())
+            .await?;
+        manager
+            .seed_thread_from_messages(&thread.id, &messages)
+            .await?;
+        assert!(
+            !manager.store.seed_journal_path(&thread.id)?.exists(),
+            "a committed seed leaves no journal"
+        );
+        let turns = manager.store.list_turns_for_thread(&thread.id)?;
+        assert_eq!(turns.len(), 1);
+        let items = manager.store.list_items_for_turn(&turns[0].id)?;
+        assert_eq!(items.len(), 2);
+        // Fault fixture: the journal the seed wrote before its first record.
+        manager.store.save_seed_journal(&SeedJournal {
+            thread_id: thread.id.clone(),
+            previous_latest_turn_id: None,
+            turn_ids: turns.iter().map(|turn| turn.id.clone()).collect(),
+            item_ids: items.iter().map(|item| item.id.clone()).collect(),
+        })?;
+        fixtures.push((thread.id, turns, items));
+    }
+    // The first thread crashed before its commit record: every turn and item
+    // is on disk, but the thread pointer never advanced.
+    let (partial_id, partial_turns, partial_items) = &fixtures[0];
+    let mut uncommitted = manager.store.load_thread(partial_id)?;
+    uncommitted.latest_turn_id = None;
+    manager.store.save_thread(&uncommitted)?;
+    drop(manager);
+
+    let reopened = test_manager(runtime_dir)?;
+    assert!(
+        reopened.store.list_turns_for_thread(partial_id)?.is_empty(),
+        "an unpublished partial seed must not be restored as history"
+    );
+    for item in partial_items {
+        assert!(!reopened.store.item_path(&item.id)?.exists());
+    }
+    assert!(!reopened.store.turn_path(&partial_turns[0].id)?.exists());
+    assert_eq!(reopened.store.load_thread(partial_id)?.latest_turn_id, None);
+    assert!(!reopened.store.seed_journal_path(partial_id)?.exists());
+
+    // The second crashed after its commit, before removing the journal.
+    let (committed_id, committed_turns, _) = &fixtures[1];
+    assert_eq!(
+        reopened.store.list_turns_for_thread(committed_id)?.len(),
+        1,
+        "a committed seed survives recovery"
+    );
+    assert_eq!(
+        reopened.store.load_thread(committed_id)?.latest_turn_id,
+        Some(committed_turns[0].id.clone())
+    );
+    assert!(!reopened.store.seed_journal_path(committed_id)?.exists());
+    Ok(())
+}
+
+/// The next turn a thread admits after its seed, as it lands on disk,
+/// without running one.
+fn turn_after_seed(seeded: &TurnRecord, id: &str) -> TurnRecord {
+    let mut later = seeded.clone();
+    later.id = id.to_string();
+    later.created_at = seeded.created_at + chrono::Duration::seconds(1);
+    later.item_ids = Vec::new();
+    later
+}
+
+/// One uncertain seed journal quarantines only its own thread: the store
+/// opens, that thread's journal and records are left byte-for-byte for
+/// repair (no partial seed is published or deleted), and every other thread
+/// still recovers.
+#[tokio::test]
+async fn startup_quarantines_only_the_thread_whose_seed_journal_is_uncertain() -> Result<()> {
+    for failure in [
+        "unreadable-journal",
+        "wrong-thread",
+        "unreadable-thread",
+        "wrong-commit",
+        "seed-record-missing-beneath-later-turn",
+    ] {
+        let runtime_dir = test_runtime_dir();
+        let manager = test_manager(runtime_dir.clone())?;
+        let messages: Vec<Message> = serde_json::from_value(json!([
+            {"role":"user","content":[{"type":"text","text":"seed recovery canary"}]},
+            {"role":"assistant","content":[{"type":"text","text":"canary answer"}]}
+        ]))?;
+        // A healthy neighbour whose pointer recovery must still recompute.
+        let healthy = manager
+            .create_thread(CreateThreadRequest::default())
+            .await?;
+        manager
+            .seed_thread_from_messages(&healthy.id, &messages)
+            .await?;
+        let healthy_turn = manager.store.list_turns_for_thread(&healthy.id)?[0]
+            .id
+            .clone();
+        let mut stale = manager.store.load_thread(&healthy.id)?;
+        stale.latest_turn_id = None;
+        manager.store.save_thread(&stale)?;
+
+        let thread = manager
+            .create_thread(CreateThreadRequest::default())
+            .await?;
+        manager
+            .seed_thread_from_messages(&thread.id, &messages)
+            .await?;
+        let turns = manager.store.list_turns_for_thread(&thread.id)?;
+        let mut items = manager.store.list_items_for_turn(&turns[0].id)?;
+        let mut uncommitted = manager.store.load_thread(&thread.id)?;
+        uncommitted.latest_turn_id = None;
+        manager.store.save_thread(&uncommitted)?;
+        let journal = SeedJournal {
+            thread_id: thread.id.clone(),
+            previous_latest_turn_id: None,
+            turn_ids: turns.iter().map(|turn| turn.id.clone()).collect(),
+            item_ids: items.iter().map(|item| item.id.clone()).collect(),
+        };
+        manager.store.save_seed_journal(&journal)?;
+        let journal_path = manager.store.seed_journal_path(&thread.id)?;
+        let thread_path = manager.store.thread_path(&thread.id)?;
+        let mut paths = vec![journal_path.clone(), thread_path.clone()];
+        match failure {
+            "unreadable-journal" => fs::write(&journal_path, b"{truncated seed intent")?,
+            "wrong-thread" => {
+                let mut wrong = serde_json::to_value(&journal)?;
+                wrong["thread_id"] = json!("another-thread");
+                fs::write(&journal_path, serde_json::to_vec(&wrong)?)?;
+            }
+            "unreadable-thread" => fs::write(&thread_path, b"{truncated thread")?,
+            "wrong-commit" => {
+                uncommitted.latest_turn_id = Some("unrelated-turn".into());
+                manager.store.save_thread(&uncommitted)?;
+            }
+            "seed-record-missing-beneath-later-turn" => {
+                // The pointer moved past the seed, but the seed is no longer
+                // whole: nothing proves it committed.
+                let later = turn_after_seed(&turns[0], "turn_after_seed");
+                manager.store.save_turn(&later)?;
+                paths.push(manager.store.turn_path(&later.id)?);
+                uncommitted.latest_turn_id = Some(later.id);
+                manager.store.save_thread(&uncommitted)?;
+                let missing = items.pop().expect("seeded item");
+                fs::remove_file(manager.store.item_path(&missing.id)?)?;
+            }
+            _ => unreachable!(),
+        }
+        for turn in &turns {
+            paths.push(manager.store.turn_path(&turn.id)?);
+        }
+        for item in &items {
+            paths.push(manager.store.item_path(&item.id)?);
+        }
+        let original = paths
+            .iter()
+            .map(fs::read)
+            .collect::<std::io::Result<Vec<_>>>()?;
+        drop(manager);
+
+        let reopened = test_manager(runtime_dir)
+            .with_context(|| format!("{failure}: one uncertain journal must not fail the store"))?;
+        for (path, bytes) in paths.iter().zip(original) {
+            assert_eq!(
+                fs::read(path)?,
+                bytes,
+                "{failure}: retain {}",
+                path.display()
+            );
+        }
+        assert_eq!(
+            reopened.store.load_thread(&healthy.id)?.latest_turn_id,
+            Some(healthy_turn),
+            "{failure}: every other thread still recovers"
+        );
+    }
+    Ok(())
+}
+
+/// The seed committed, removing its journal failed, and the conversation
+/// went on. The stale journal is settled as committed: removed, with the
+/// whole seed kept as history beneath the later turn.
+#[tokio::test]
+async fn startup_keeps_a_committed_seed_whose_journal_outlived_later_turns() -> Result<()> {
+    let runtime_dir = test_runtime_dir();
+    let manager = test_manager(runtime_dir.clone())?;
+    let messages: Vec<Message> = serde_json::from_value(json!([
+        {"role":"user","content":[{"type":"text","text":"SEEDED"}]},
+        {"role":"assistant","content":[{"type":"text","text":"SEEDED ANSWER"}]}
+    ]))?;
+    let thread = manager
+        .create_thread(CreateThreadRequest::default())
+        .await?;
+    manager
+        .seed_thread_from_messages(&thread.id, &messages)
+        .await?;
+    let turns = manager.store.list_turns_for_thread(&thread.id)?;
+    let items = manager.store.list_items_for_turn(&turns[0].id)?;
+    manager.store.save_seed_journal(&SeedJournal {
+        thread_id: thread.id.clone(),
+        previous_latest_turn_id: None,
+        turn_ids: turns.iter().map(|turn| turn.id.clone()).collect(),
+        item_ids: items.iter().map(|item| item.id.clone()).collect(),
+    })?;
+    let later = turn_after_seed(&turns[0], "turn_after_seed");
+    manager.store.save_turn(&later)?;
+    let mut moved_on = manager.store.load_thread(&thread.id)?;
+    moved_on.latest_turn_id = Some(later.id.clone());
+    manager.store.save_thread(&moved_on)?;
+    drop(manager);
+
+    let reopened = test_manager(runtime_dir)?;
+    assert!(
+        !reopened.store.seed_journal_path(&thread.id)?.exists(),
+        "a committed seed's stale journal is removed"
+    );
+    assert_eq!(
+        reopened.store.list_turns_for_thread(&thread.id)?.len(),
+        2,
+        "the seed stays history beneath the later turn"
+    );
+    for item in &items {
+        assert!(reopened.store.item_path(&item.id)?.exists());
+    }
+    assert_eq!(
+        reopened.store.load_thread(&thread.id)?.latest_turn_id,
+        Some(later.id)
+    );
+    Ok(())
+}
+
+/// Missing records are not uncertainty: a journal whose thread record is
+/// gone (and some of whose own records already are) is an unpublished seed,
+/// and its remaining records are discarded.
+#[tokio::test]
+async fn startup_discards_a_seed_whose_thread_and_records_are_already_gone() -> Result<()> {
+    let runtime_dir = test_runtime_dir();
+    let manager = test_manager(runtime_dir.clone())?;
+    let messages: Vec<Message> = serde_json::from_value(json!([
+        {"role":"user","content":[{"type":"text","text":"orphaned seed"}]},
+        {"role":"assistant","content":[{"type":"text","text":"orphaned answer"}]}
+    ]))?;
+    let thread = manager
+        .create_thread(CreateThreadRequest::default())
+        .await?;
+    manager
+        .seed_thread_from_messages(&thread.id, &messages)
+        .await?;
+    let turns = manager.store.list_turns_for_thread(&thread.id)?;
+    let items = manager.store.list_items_for_turn(&turns[0].id)?;
+    manager.store.save_seed_journal(&SeedJournal {
+        thread_id: thread.id.clone(),
+        previous_latest_turn_id: None,
+        turn_ids: turns.iter().map(|turn| turn.id.clone()).collect(),
+        item_ids: items.iter().map(|item| item.id.clone()).collect(),
+    })?;
+    fs::remove_file(manager.store.thread_path(&thread.id)?)?;
+    fs::remove_file(manager.store.item_path(&items[0].id)?)?;
+    drop(manager);
+
+    let reopened = test_manager(runtime_dir)?;
+    assert!(!reopened.store.seed_journal_path(&thread.id)?.exists());
+    assert!(!reopened.store.turn_path(&turns[0].id)?.exists());
+    for item in &items {
+        assert!(!reopened.store.item_path(&item.id)?.exists());
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn seed_cleanup_validates_every_record_before_removing_anything() -> Result<()> {
+    for foreign in ["turn", "item"] {
+        let manager = test_manager(test_runtime_dir())?;
+        let messages: Vec<Message> = serde_json::from_value(json!([
+            {"role":"user","content":[{"type":"text","text":"keep both histories"}]}
+        ]))?;
+        let mut histories = Vec::new();
+        for _ in 0..2 {
+            let thread = manager
+                .create_thread(CreateThreadRequest::default())
+                .await?;
+            manager
+                .seed_thread_from_messages(&thread.id, &messages)
+                .await?;
+            let turns = manager.store.list_turns_for_thread(&thread.id)?;
+            let items = manager.store.list_items_for_turn(&turns[0].id)?;
+            histories.push((thread, turns, items));
+        }
+        let (thread, turns, items) = &histories[0];
+        let mut journal = SeedJournal {
+            thread_id: thread.id.clone(),
+            previous_latest_turn_id: None,
+            turn_ids: turns.iter().map(|turn| turn.id.clone()).collect(),
+            item_ids: items.iter().map(|item| item.id.clone()).collect(),
+        };
+        if foreign == "turn" {
+            journal.turn_ids.push(histories[1].1[0].id.clone());
+        } else {
+            journal.item_ids.push(histories[1].2[0].id.clone());
+        }
+        manager.store.save_seed_journal(&journal)?;
+        let mut paths = vec![manager.store.seed_journal_path(&thread.id)?];
+        for (thread, turns, items) in &histories {
+            paths.push(manager.store.thread_path(&thread.id)?);
+            for turn in turns {
+                paths.push(manager.store.turn_path(&turn.id)?);
+            }
+            for item in items {
+                paths.push(manager.store.item_path(&item.id)?);
+            }
+        }
+        let original = paths
+            .iter()
+            .map(fs::read)
+            .collect::<std::io::Result<Vec<_>>>()?;
+        let error = manager
+            .store
+            .discard_seed(&journal)
+            .expect_err("foreign history is not cleanup ownership");
+        assert!(format!("{error:#}").contains("outside"), "{error:#}");
+        for (path, bytes) in paths.iter().zip(original) {
+            assert_eq!(
+                fs::read(path)?,
+                bytes,
+                "validate the whole set before removing {}",
+                path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn transition_goal_status_commits_only_the_read_revision() -> Result<()> {
     let manager = test_manager(test_runtime_dir())?;
     let thread = manager
@@ -11743,12 +12105,33 @@ async fn transition_goal_status_commits_only_the_read_revision() -> Result<()> {
         .transition_goal_status(
             &thread.id,
             "goal_a",
+            codewhale_protocol::ThreadGoalStatus::Active,
             codewhale_protocol::ThreadGoalStatus::Complete,
         )
         .await?
         .ok_or_else(|| anyhow::anyhow!("current revision must commit"))?;
     assert_eq!(
         completed.status,
+        codewhale_protocol::ThreadGoalStatus::Complete
+    );
+
+    // A Blocked transition decided from the earlier Active read races the
+    // Complete above; the terminal state must survive it.
+    let raced = manager
+        .transition_goal_status(
+            &thread.id,
+            "goal_a",
+            codewhale_protocol::ThreadGoalStatus::Active,
+            codewhale_protocol::ThreadGoalStatus::Blocked,
+        )
+        .await?;
+    assert!(raced.is_none(), "a stale status read must not commit");
+    assert_eq!(
+        manager
+            .store
+            .load_goal(&thread.id)?
+            .ok_or_else(|| anyhow::anyhow!("goal record missing"))?
+            .status,
         codewhale_protocol::ThreadGoalStatus::Complete
     );
 
@@ -11760,6 +12143,7 @@ async fn transition_goal_status_commits_only_the_read_revision() -> Result<()> {
         .transition_goal_status(
             &thread.id,
             "goal_a",
+            codewhale_protocol::ThreadGoalStatus::Active,
             codewhale_protocol::ThreadGoalStatus::Blocked,
         )
         .await?;
@@ -11911,6 +12295,7 @@ async fn interrupt_turn_marks_interrupted_after_cleanup() -> Result<()> {
                     turn_id: "engine_turn_interrupt".to_string(),
                     created_at: chrono::Utc::now(),
                     route: None,
+                    submission_id: None,
                 })
                 .await;
             let _ = tx_event
@@ -12705,6 +13090,7 @@ async fn thread_detail_cursor_precedes_projection_reads_at_terminal_boundary() -
             turn_id: "snapshot_terminal".to_string(),
             created_at: Utc::now(),
             route: None,
+            submission_id: None,
         })
         .await?;
     harness
@@ -12886,6 +13272,7 @@ async fn thread_detail_materializes_stream_prefixes_before_their_delta_cursor() 
             turn_id: "delta_snapshot".to_string(),
             created_at: Utc::now(),
             route: None,
+            submission_id: None,
         })
         .await?;
     harness
@@ -13009,6 +13396,7 @@ async fn thread_detail_delta_boundary_is_replay_idempotent() -> Result<()> {
             turn_id: "delta_boundary".to_string(),
             created_at: Utc::now(),
             route: None,
+            submission_id: None,
         })
         .await?;
     harness
@@ -13352,6 +13740,7 @@ async fn dynamic_tool_result_settles_snapshot_and_emits_one_safe_resolution() ->
             turn_id: "dynamic_result".to_string(),
             created_at: Utc::now(),
             route: None,
+            submission_id: None,
         })
         .await?;
 
@@ -13513,6 +13902,7 @@ async fn dynamic_tool_result_receipt_outlives_canceled_delivery_future() -> Resu
             turn_id: "dynamic_detached_settlement".to_string(),
             created_at: Utc::now(),
             route: None,
+            submission_id: None,
         })
         .await?;
 
@@ -14455,6 +14845,7 @@ async fn dynamic_tool_timeout_clears_snapshot_and_emits_once() -> Result<()> {
             turn_id: "dynamic_timeout".to_string(),
             created_at: Utc::now(),
             route: None,
+            submission_id: None,
         })
         .await?;
 
@@ -14529,6 +14920,7 @@ async fn terminal_turn_cancels_pending_dynamic_tool_exactly_once() -> Result<()>
             turn_id: "dynamic_cancel".to_string(),
             created_at: Utc::now(),
             route: None,
+            submission_id: None,
         })
         .await?;
 
@@ -14638,6 +15030,7 @@ async fn approval_wait_heartbeat_is_never_sequenced_after_the_decision() -> Resu
             turn_id: "engine_turn_wait".to_string(),
             created_at: Utc::now(),
             route: None,
+            submission_id: None,
         })
         .await?;
     // The Responses client joins call and item ids with `|`.
@@ -15843,6 +16236,7 @@ async fn steer_turn_on_active_turn_records_item_and_event() -> Result<()> {
                     turn_id: "engine_turn_steer".to_string(),
                     created_at: chrono::Utc::now(),
                     route: None,
+                    submission_id: None,
                 })
                 .await;
             if let Some(steer) = rx_steer.recv().await {
@@ -16492,6 +16886,7 @@ async fn compaction_lifecycle_emits_item_events_with_compaction_counts() -> Resu
                             turn_id: "engine_turn_auto".to_string(),
                             created_at: chrono::Utc::now(),
                             route: None,
+                            submission_id: None,
                         })
                         .await;
                     let _ = tx_event
@@ -16747,6 +17142,7 @@ fn opening_manager_recovers_stale_queued_and_in_progress_work() -> Result<()> {
     manager.store.save_item(&queued_item)?;
 
     manager.store.save_turn(&TurnRecord {
+        decision_receipts: Vec::new(),
         max_output_tokens: None,
         schema_version: CURRENT_RUNTIME_SCHEMA_VERSION,
         id: "turn_in_progress".to_string(),
@@ -16785,6 +17181,7 @@ fn opening_manager_recovers_stale_queued_and_in_progress_work() -> Result<()> {
         workspace_snapshots: Vec::new(),
     })?;
     manager.store.save_turn(&TurnRecord {
+        decision_receipts: Vec::new(),
         max_output_tokens: None,
         schema_version: CURRENT_RUNTIME_SCHEMA_VERSION,
         id: "turn_queued".to_string(),
@@ -16981,6 +17378,7 @@ fn seed_turns_with_user_messages(
             ended_at: Some(created_at),
         })?;
         manager.store.save_turn(&TurnRecord {
+            decision_receipts: Vec::new(),
             max_output_tokens: None,
             schema_version: CURRENT_RUNTIME_SCHEMA_VERSION,
             id: turn_id.clone(),
@@ -17800,6 +18198,7 @@ fn restart_rebuild_restores_tool_call_identity_from_persisted_items() -> Result<
     manager.store.save_item(&user_item)?;
     manager.store.save_item(&call_item)?;
     manager.store.save_turn(&TurnRecord {
+        decision_receipts: Vec::new(),
         max_output_tokens: None,
         schema_version: CURRENT_RUNTIME_SCHEMA_VERSION,
         id: "turn_5823".to_string(),
@@ -17905,6 +18304,7 @@ fn restart_rebuild_keeps_in_flight_tool_call_identity() -> Result<()> {
     };
     manager.store.save_item(&call_item)?;
     manager.store.save_turn(&TurnRecord {
+        decision_receipts: Vec::new(),
         max_output_tokens: None,
         schema_version: CURRENT_RUNTIME_SCHEMA_VERSION,
         id: "turn_5823_inflight".to_string(),
@@ -18005,6 +18405,7 @@ fn restart_rebuild_skips_steers_the_engine_never_delivered() -> Result<()> {
     manager.store.save_item(&dropped)?;
     manager.store.save_item(&pending)?;
     manager.store.save_turn(&TurnRecord {
+        decision_receipts: Vec::new(),
         max_output_tokens: None,
         schema_version: CURRENT_RUNTIME_SCHEMA_VERSION,
         id: turn_id.clone(),
@@ -18106,6 +18507,7 @@ fn restart_rebuild_skips_legacy_tool_items_without_identity() -> Result<()> {
     manager.store.save_item(&user_item)?;
     manager.store.save_item(&legacy_tool_item)?;
     manager.store.save_turn(&TurnRecord {
+        decision_receipts: Vec::new(),
         max_output_tokens: None,
         schema_version: CURRENT_RUNTIME_SCHEMA_VERSION,
         id: "turn_5823_legacy".to_string(),
@@ -18948,6 +19350,7 @@ async fn notices_raise_from_engine_events_and_clear_on_settle_or_ack() -> Result
             turn_id: turn.id.clone(),
             created_at: Utc::now(),
             route: None,
+            submission_id: None,
         })
         .await?;
 
@@ -20005,6 +20408,7 @@ async fn engine_plumbing_items_are_tagged_internal_and_retry_hints_are_dropped()
             turn_id: "engine_plumbing_visibility".to_string(),
             created_at: Utc::now(),
             route: None,
+            submission_id: None,
         })
         .await?;
     for status in [
@@ -20673,6 +21077,7 @@ async fn runtime_receipts_mask_configured_secrets() -> Result<()> {
             turn_id: turn.id.clone(),
             created_at: Utc::now(),
             route: None,
+            submission_id: None,
         })
         .await?;
     harness
@@ -20920,6 +21325,7 @@ async fn tool_completion_items_carry_typed_artifact_refs() -> Result<()> {
             turn_id: turn.id.clone(),
             created_at: Utc::now(),
             route: None,
+            submission_id: None,
         })
         .await?;
     for (call, name) in [("call_write", "apply_patch"), ("call_shell", "exec_shell")] {
@@ -21159,6 +21565,7 @@ async fn run_workspace_turn(
             turn_id: "engine-turn".to_string(),
             created_at: Utc::now(),
             route: None,
+            submission_id: None,
         })
         .await?;
     let mut sent = Vec::new();
@@ -21757,6 +22164,7 @@ mod execution_identity {
                 turn_id: turn.id.clone(),
                 created_at: Utc::now(),
                 route: None,
+                submission_id: None,
             })
             .await?;
         for (id, name, model, fails) in [
@@ -21961,4 +22369,69 @@ mod execution_identity {
         );
         Ok(())
     }
+}
+
+#[tokio::test]
+async fn decision_receipt_lease_persists_terminal_turn_and_replays_exactly_once() -> Result<()> {
+    let _cost_scope = crate::cost_status::test_scope();
+    let directory = test_runtime_dir();
+    let manager = test_manager(directory.clone())?;
+    let thread = manager
+        .create_thread(CreateThreadRequest::default())
+        .await?;
+    let turn = sample_turn(
+        &thread.id,
+        "decision-terminal-origin",
+        RuntimeTurnStatus::Completed,
+    );
+    manager.store.save_turn(&turn)?;
+    manager.register_runtime_usage_sink(&turn.id);
+    let lease = crate::cost_status::acquire_runtime_usage_lease(&turn.id).expect("origin lease");
+    crate::cost_status::finish_runtime_usage_owner(&turn.id);
+    let receipt = crate::cost_status::decision_receipt_fixture("raw-runtime-decision-id");
+    let batch = crate::cost_status::RuntimeUsageBatch {
+        decisions: vec![receipt.clone()],
+        ..Default::default()
+    };
+    for _ in 0..2 {
+        crate::cost_status::report_runtime_usage_batch(
+            crate::cost_status::scope_token(),
+            Some(&turn.id),
+            &batch,
+        );
+    }
+    drop(lease);
+    drop(manager);
+    let restarted = test_manager(directory)?;
+    let reloaded = restarted.store.load_turn(&turn.id)?;
+    assert_eq!(reloaded.status, RuntimeTurnStatus::Completed);
+    assert_eq!(reloaded.decision_receipts, vec![receipt.sanitized()]);
+    assert_eq!(
+        reloaded.decision_receipts[0]
+            .evidence
+            .provider_reported_cost_usd
+            .as_deref(),
+        Some("0.000012054")
+    );
+    let aggregate = restarted
+        .aggregate_usage(None, None, UsageGroupBy::Thread)
+        .await?;
+    assert!(
+        aggregate
+            .totals
+            .route_receipts
+            .iter()
+            .any(|r| r.contains("0.000012054")),
+        "existing cost diagnostics expose retained provider evidence"
+    );
+    assert!(
+        reloaded.routed_usage.is_empty(),
+        "diagnostic receipt alone must not mint a second token charge"
+    );
+    assert_eq!(
+        unaccepted_routed_usage_turn_id(&thread.id, &batch),
+        unaccepted_routed_usage_turn_id(&thread.id, &batch)
+    );
+    assert!(!serde_json::to_string(&reloaded)?.contains("raw-runtime-decision-id"));
+    Ok(())
 }

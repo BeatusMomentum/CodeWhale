@@ -652,6 +652,15 @@ fn tmux_log_proxy_command(
     format!("exec {}", shell_join(&argv))
 }
 
+/// The tmux dry-run hook, honoured only in this crate's own unit tests.
+///
+/// It records a Running lane with no process, skips the tmux kill on stop,
+/// and blinds reconcile, so an inherited `CODEWHALE_LANE_TMUX_DRY_RUN` in a
+/// real build would fabricate lane state. Release builds ignore it.
+fn tmux_dry_run() -> bool {
+    cfg!(test) && std::env::var_os("CODEWHALE_LANE_TMUX_DRY_RUN").is_some()
+}
+
 fn apply_worktree(record: &mut LaneRecord, spec: &LaneStartSpec) -> Result<Option<PathBuf>> {
     let Some(wt) = spec.worktree.as_ref() else {
         return Ok(spec.cwd.clone());
@@ -682,7 +691,7 @@ impl RuntimeBackend for TmuxRuntime {
         }
         // Dry-run is an explicit test hook only. A missing/broken tmux binary
         // must fail closed rather than persisting a fictional Running Lane.
-        let dry_run = std::env::var_os("CODEWHALE_LANE_TMUX_DRY_RUN").is_some();
+        let dry_run = tmux_dry_run();
         if !dry_run && let Err(error) = ensure_tmux_available() {
             append_log_event(
                 &record.log_path,
@@ -843,7 +852,7 @@ impl RuntimeBackend for TmuxRuntime {
         record: &mut LaneRecord,
         fence: Option<u64>,
     ) -> Result<TerminalTransition> {
-        let dry_run = std::env::var_os("CODEWHALE_LANE_TMUX_DRY_RUN").is_some();
+        let dry_run = tmux_dry_run();
         let transition = registry.mark_terminal_if_active_fenced(
             record,
             LaneStatus::Stopped,
@@ -902,7 +911,7 @@ impl RuntimeBackend for TmuxRuntime {
                 "process_exit_receipt",
             )
         } else {
-            if std::env::var_os("CODEWHALE_LANE_TMUX_DRY_RUN").is_some() {
+            if tmux_dry_run() {
                 return Ok(false);
             }
             let (Some(socket), Some(session)) = (
@@ -963,6 +972,10 @@ impl RuntimeBackend for InlineRuntime {
             bail!("inline runtime requires a non-empty command");
         }
         let cwd = apply_worktree(record, spec)?;
+        // A concurrent stop that wins `mark_running_if_pending` replaces
+        // `record` with the stored one, which never saw the worktree; keep
+        // this copy so the worktree is still cleaned up, as tmux does.
+        let proposed_record = record.clone();
         append_log_event(
             &record.log_path,
             serde_json::json!({
@@ -973,6 +986,9 @@ impl RuntimeBackend for InlineRuntime {
             }),
         )?;
         if !registry.mark_running_if_pending(record)? {
+            let mut stopped_record = proposed_record;
+            stopped_record.stopped_at = record.stopped_at.clone();
+            self.cleanup_worktree(&stopped_record)?;
             bail!(
                 "lane `{}` was stopped before inline start completed",
                 record.id
@@ -1000,6 +1016,8 @@ impl RuntimeBackend for InlineRuntime {
                     }),
                 )?;
                 let _ = registry.mark_terminal_if_active(record, LaneStatus::Failed)?;
+                // Terminal now, so no later stop will clean the worktree up.
+                self.cleanup_worktree(record)?;
                 return Err(err).with_context(|| format!("run inline command {:?}", spec.command));
             }
         };
@@ -1339,6 +1357,44 @@ mod tests {
         let log = std::fs::read_to_string(&record.log_path).unwrap();
         assert!(log.contains("inline-ok"), "log={log}");
         assert!(log.contains("lane_completed"));
+    }
+
+    /// Audit R06-05: an inline command that cannot spawn marks the lane
+    /// failed and cleans up the worktree it provisioned. The lane is terminal
+    /// at that point, so no later stop would.
+    #[test]
+    fn inline_spawn_failure_cleans_up_its_worktree() {
+        let dir = tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        crate::worktree::tests::init_repo(&repo);
+        let wt_path = dir.path().join("wt-inline");
+        let reg = LaneRegistry::open(dir.path().join("lanes")).unwrap();
+        let mut record = reg
+            .create_pending(None, None, None, None, RuntimeBackendKind::Inline, Some(0))
+            .unwrap();
+        let result = InlineRuntime.start(
+            &reg,
+            &mut record,
+            &LaneStartSpec {
+                command: vec!["/nonexistent/codewhale-lane-test-binary".into()],
+                cwd: None,
+                environment: Vec::new(),
+                log_proxy: None,
+                worktree: Some(WorktreeProvision {
+                    repo_root: repo,
+                    branch: "codex/lane-spawn-fail".into(),
+                    path: wt_path.clone(),
+                    base_ref: Some("main".into()),
+                }),
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(record.status, LaneStatus::Failed);
+        assert!(
+            !wt_path.exists(),
+            "the failed lane's worktree was left behind"
+        );
     }
 
     #[test]

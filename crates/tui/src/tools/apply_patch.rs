@@ -420,10 +420,14 @@ impl ToolSpec for ApplyPatchTool {
             source_field,
         } = normalized
         {
-            let (mut pending, stats) =
-                build_pending_writes_from_replace(entries, source_field, context)?;
+            let entries = entries.to_vec();
+            let build_context = context.clone();
+            let (mut pending, stats) = patch_blocking(move || {
+                build_pending_writes_from_replace(&entries, source_field, &build_context)
+            })
+            .await?;
             normalize_pending_rust(&mut pending).await;
-            apply_pending_writes(&pending)?;
+            let pending = apply_pending_writes_blocking(pending).await?;
             // Resolve absolute paths for LSP diagnostics query.
             let abs_paths: Vec<PathBuf> = pending.iter().map(|p| p.path.clone()).collect();
             let diag_block = lsp_diagnostics_for_paths(context, &abs_paths).await;
@@ -472,11 +476,14 @@ impl ToolSpec for ApplyPatchTool {
             ApplyPatchPreflightKind::FilePatches(file_patches) => file_patches,
         };
 
-        let (mut pending, mut stats) =
-            build_pending_writes_from_patches(file_patches, context, fuzz)?;
+        let build_context = context.clone();
+        let (mut pending, mut stats) = patch_blocking(move || {
+            build_pending_writes_from_patches(file_patches, &build_context, fuzz)
+        })
+        .await?;
         stats.header_path_mismatch = preflight.summary.header_path_mismatch.clone();
         normalize_pending_rust(&mut pending).await;
-        apply_pending_writes(&pending)?;
+        let pending = apply_pending_writes_blocking(pending).await?;
         // Resolve absolute paths for LSP diagnostics query.
         let abs_paths: Vec<PathBuf> = pending
             .iter()
@@ -1452,6 +1459,24 @@ async fn normalize_pending_rust(pending: &mut [PendingWrite]) {
     }
 }
 
+/// Run the patch's synchronous file work (reads, the syntax gate, writes and
+/// rollback) on the blocking pool rather than an async worker (#6559 D01-06).
+async fn patch_blocking<T: Send + 'static>(
+    work: impl FnOnce() -> Result<T, ToolError> + Send + 'static,
+) -> Result<T, ToolError> {
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|error| ToolError::execution_failed(format!("patch task failed: {error}")))?
+}
+
+/// [`apply_pending_writes`] on the blocking pool, handing `pending` back for
+/// the result's diagnostics and metadata.
+async fn apply_pending_writes_blocking(
+    pending: Vec<PendingWrite>,
+) -> Result<Vec<PendingWrite>, ToolError> {
+    patch_blocking(move || apply_pending_writes(&pending).map(|()| pending)).await
+}
+
 fn apply_pending_writes(pending: &[PendingWrite]) -> Result<(), ToolError> {
     // Syntax gate (#6204) ahead of the first write, not per file: a patch is
     // transactional, so one unparseable result must leave every file in the
@@ -1501,8 +1526,17 @@ fn apply_pending_writes(pending: &[PendingWrite]) -> Result<(), ToolError> {
         };
 
         if let Err(err) = result {
-            rollback_pending_writes(&applied);
-            return Err(err);
+            let failures = rollback_pending_writes(&applied);
+            if failures.is_empty() {
+                return Err(err);
+            }
+            // A failed restore leaves the patch partly applied; say which
+            // files still hold it rather than implying nothing changed.
+            return Err(ToolError::execution_failed(format!(
+                "{err}. Rolling back the files already written also failed, so the patch is \
+                 partly applied: {}",
+                failures.join("; ")
+            )));
         }
 
         applied.push(entry.clone());
@@ -1511,17 +1545,23 @@ fn apply_pending_writes(pending: &[PendingWrite]) -> Result<(), ToolError> {
     Ok(())
 }
 
-fn rollback_pending_writes(applied: &[PendingWrite]) {
+/// Restore every already-applied entry, newest first. Returns one line per
+/// entry that could not be restored (#6559 D01-06: these were discarded).
+fn rollback_pending_writes(applied: &[PendingWrite]) -> Vec<String> {
+    let mut failures = Vec::new();
     for entry in applied.iter().rev() {
-        match entry.original.as_ref() {
-            Some(content) => {
-                let _ = crate::utils::write_atomic_workspace(&entry.path, content.as_bytes());
-            }
-            None => {
-                let _ = fs::remove_file(&entry.path);
-            }
+        let restored = match entry.original.as_ref() {
+            Some(content) => crate::utils::write_atomic_workspace(&entry.path, content.as_bytes()),
+            None => match fs::remove_file(&entry.path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                other => other,
+            },
+        };
+        if let Err(error) = restored {
+            failures.push(format!("{} ({error})", entry.path.display()));
         }
     }
+    failures
 }
 
 fn read_file_content(path: &PathBuf) -> Result<String, ToolError> {
@@ -1794,6 +1834,45 @@ fn matches_at_position(lines: &[String], old_lines: &[&str], pos: usize) -> bool
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    /// #6559 D01-06: a rollback that cannot restore a file used to be
+    /// discarded, so the error read as if nothing had changed. Deleting `x`
+    /// and creating `x/y.txt` leaves a directory at `x`; when the third write
+    /// fails, restoring the file `x` over that directory fails too.
+    #[test]
+    fn failed_rollback_is_reported_as_a_partly_applied_patch() {
+        let tmp = tempdir().expect("tempdir");
+        let root = tmp.path();
+        fs::write(root.join("x"), "original\n").expect("seed x");
+        fs::write(root.join("blocker"), "a file, not a directory\n").expect("seed blocker");
+        let pending = vec![
+            PendingWrite {
+                path: root.join("x"),
+                content: None,
+                original: Some("original\n".to_string()),
+            },
+            PendingWrite {
+                path: root.join("x").join("y.txt"),
+                content: Some("new\n".to_string()),
+                original: None,
+            },
+            PendingWrite {
+                path: root.join("blocker").join("z.txt"),
+                content: Some("never written\n".to_string()),
+                original: None,
+            },
+        ];
+
+        let message = apply_pending_writes(&pending)
+            .expect_err("the third write cannot create its directory")
+            .to_string();
+
+        assert!(message.contains("partly applied"), "{message}");
+        assert!(
+            message.contains(&root.join("x").display().to_string()),
+            "{message}"
+        );
+    }
 
     /// The receipt entry a created/updated file must carry: its size and
     /// SHA-256 are those of the bytes now on disk.

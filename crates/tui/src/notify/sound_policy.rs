@@ -165,6 +165,18 @@ pub fn decide(kind: NotificationKind, now_ms: u64, bell_transport: bool) -> Soun
         .unwrap_or(SoundDecision::Suppress(SuppressReason::Disabled))
 }
 
+/// Give back a repeat slot that `decide` reserved for a cue that did not play.
+/// Only the exact reservation is released, so a later decision in the same
+/// category keeps its own slot.
+pub fn release(kind: NotificationKind, reserved_ms: u64) {
+    if let Ok(mut policy) = policy_cell().write() {
+        let slot = &mut policy.last_played_ms[event_for_kind(kind).index()];
+        if *slot == Some(reserved_ms) {
+            *slot = None;
+        }
+    }
+}
+
 /// Decide from this request's configuration while holding the shared history
 /// lock. Request snapshots never replace the installed TUI/model policy.
 pub fn decide_configured(

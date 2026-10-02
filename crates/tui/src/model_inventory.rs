@@ -64,6 +64,13 @@ pub(crate) enum AutoRouterSetupIssue {
     Incomplete,
     /// The route is complete but its credential is missing.
     MissingKey,
+    /// `thinking` is not a reasoning tier; the classifier call would carry
+    /// an effort the provider rejects or silently reinterprets.
+    InvalidThinking,
+    /// `model` is not one the chat router's provider serves (checked where
+    /// the provider's model namespace is known; pass-through providers such
+    /// as OpenRouter or a custom endpoint are validated upstream).
+    InvalidModel,
 }
 
 impl AutoRouterSetupIssue {
@@ -76,6 +83,10 @@ impl AutoRouterSetupIssue {
             }
             Self::Incomplete => "[auto.router] needs a known provider and a model",
             Self::MissingKey => "no API key for the router route",
+            Self::InvalidThinking => {
+                "[auto.router] thinking must be auto, off, minimal, low, medium, high, xhigh, ultra, or max"
+            }
+            Self::InvalidModel => "[auto.router] model is not served by the router provider",
         }
     }
 }
@@ -322,20 +333,38 @@ impl ModelInventory {
                 router_setup_issue = Some(AutoRouterSetupIssue::UnknownKind);
                 None
             }
-            Some(AutoRouterKind::Chat) => router_provider_setting
-                .and_then(ApiProvider::parse)
-                .zip(router_model_setting)
-                .map(|(provider, model)| {
-                    (
-                        provider,
-                        model.to_string(),
-                        router_table
-                            .and_then(|router| router.thinking.as_deref())
-                            .map(str::trim)
-                            .filter(|t| !t.is_empty())
-                            .map(str::to_string),
-                    )
-                }),
+            Some(AutoRouterKind::Chat) => {
+                let thinking = router_table
+                    .and_then(|router| router.thinking.as_deref())
+                    .map(str::trim)
+                    .filter(|t| !t.is_empty());
+                // A typo here would otherwise ride every classifier request
+                // as an effort string the provider rejects, failing Auto back
+                // to the local fallback on every turn.
+                if thinking.is_some_and(|thinking| {
+                    crate::reasoning_preference::ReasoningEffort::parse_strict(thinking).is_err()
+                }) {
+                    router_setup_issue = Some(AutoRouterSetupIssue::InvalidThinking);
+                    None
+                } else {
+                    let route = router_provider_setting
+                        .and_then(ApiProvider::parse)
+                        .zip(router_model_setting);
+                    // Same check a session route gets: a model the provider
+                    // cannot serve would 404 every classifier call and fall
+                    // back to local routing on every turn.
+                    if route.is_some_and(|(provider, model)| {
+                        crate::config::validate_route(provider, model).is_err()
+                    }) {
+                        router_setup_issue = Some(AutoRouterSetupIssue::InvalidModel);
+                        None
+                    } else {
+                        route.map(|(provider, model)| {
+                            (provider, model.to_string(), thinking.map(str::to_string))
+                        })
+                    }
+                }
+            }
             Some(AutoRouterKind::Decision) => {
                 match router_provider_setting.map(DecisionRouterRoute::parse) {
                     Some(None) => {
@@ -1504,6 +1533,59 @@ mod decision_router_inventory_tests {
         assert_eq!(
             zai.router_setup_issue,
             Some(AutoRouterSetupIssue::UnsupportedDecisionProvider)
+        );
+    }
+
+    #[test]
+    fn a_chat_router_with_an_unknown_thinking_tier_is_not_configured() {
+        let _env = hermetic();
+        let chat = |thinking: &str| crate::config::AutoRouterConfig {
+            kind: Some("chat".to_string()),
+            provider: Some("openrouter".to_string()),
+            model: Some("openai/gpt-5-mini".to_string()),
+            thinking: Some(thinking.to_string()),
+            ..Default::default()
+        };
+        let typo = ModelInventory::from_config(&with_router(chat("hgih"), true));
+        assert!(!typo.router_configured);
+        assert!(!typo.router_available);
+        assert_eq!(
+            typo.router_setup_issue,
+            Some(AutoRouterSetupIssue::InvalidThinking)
+        );
+
+        let valid = ModelInventory::from_config(&with_router(chat("low"), true));
+        assert!(valid.router_available);
+        assert_eq!(valid.router_setup_issue, None);
+        assert_eq!(valid.router_thinking.as_deref(), Some("low"));
+    }
+
+    #[test]
+    fn a_chat_router_whose_provider_cannot_serve_the_model_is_not_configured() {
+        let _env = hermetic();
+        let chat = |provider: &str, model: &str| crate::config::AutoRouterConfig {
+            kind: Some("chat".to_string()),
+            provider: Some(provider.to_string()),
+            model: Some(model.to_string()),
+            ..Default::default()
+        };
+        // A model from another provider's namespace, either direction.
+        for (provider, model) in [("deepseek", "gpt-5-mini"), ("zai", "deepseek-v4-flash")] {
+            let wrong = ModelInventory::from_config(&with_router(chat(provider, model), true));
+            assert!(!wrong.router_configured, "{provider}/{model}");
+            assert_eq!(
+                wrong.router_setup_issue,
+                Some(AutoRouterSetupIssue::InvalidModel),
+                "{provider}/{model}"
+            );
+        }
+
+        let valid =
+            ModelInventory::from_config(&with_router(chat("deepseek", "deepseek-v4-flash"), true));
+        assert!(valid.router_configured);
+        assert_ne!(
+            valid.router_setup_issue,
+            Some(AutoRouterSetupIssue::InvalidModel)
         );
     }
 

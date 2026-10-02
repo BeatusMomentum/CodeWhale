@@ -72,7 +72,7 @@ Prebuilt binaries for the GitHub release are downloaded automatically:
 - Android arm64 / Termux (preview; requires matching Android assets in the
   selected GitHub Release)
 
-The source-candidate wrapper recognizes Android arm64 and resolves the
+The wrapper recognizes Android arm64 and resolves the
 Termux-native `codewhale` and `codew` assets. That path works only for package
 versions whose matching GitHub Release publishes both assets, and remains
 preview support pending real-device QA. See the support table in

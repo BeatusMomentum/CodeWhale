@@ -54,7 +54,7 @@ For the read-only record of what a thread or turn did, see
 | `codewhale app-server --mobile` | HTTP/SSE on loopback + `/mobile` | Runtime API + local mobile control page |
 | `codewhale app-server --stdio` | JSON-RPC 2.0 over stdio | Local SDK / control probe (no listener) |
 | `codewhale app-server --socket [--socket-path P]` | JSON-RPC 2.0 over a `0600` unix domain socket | Desktop daemon: multi-client, peer-uid checked, `daemon/attach` claim handshake (macOS/Linux; Windows named pipe reserved, not implemented) |
-| `codewhale app-server` | HTTP on `127.0.0.1:8787` | Legacy in-process app-server (`/healthz`, `/thread`, `/app`, `/prompt`, `/jobs`, `/mcp/startup`); `/prompt` and `/thread` messages execute real turns via the runtime bridge. There is no direct `/tool` route: tools run only inside Engine turns, under the Engine's tool catalog and approval posture. This legacy server does not surface approvals: its bridge forwards only text deltas and the turn's completion, and it has no decision route, so an approval-gated call waits unanswered. Drive approval-gated work through the Runtime API (`/v1/threads/*` events and `POST /v1/approvals/{approval_id}`) |
+| `codewhale app-server` | HTTP on `127.0.0.1:8787` | Legacy in-process app-server (`/healthz`, `/thread`, `/app`, `/prompt`, `/jobs`); `/prompt` and `/thread` messages execute real turns via the runtime bridge. There is no direct `/tool` route: tools run only inside Engine turns, under the Engine's tool catalog and approval posture. This legacy server does not surface approvals: its bridge forwards only text deltas and the turn's completion, and it has no decision route, so an approval-gated call waits unanswered. Drive approval-gated work through the Runtime API (`/v1/threads/*` events and `POST /v1/approvals/{approval_id}`) |
 | `codewhale serve --http` / `--mobile` | same server as `app-server --http`/`--mobile` | Compatibility aliases |
 
 `app-server --http` and `--mobile` launch the same mature runtime API server
@@ -452,6 +452,40 @@ in the app-server can produce model output, so a prompt either runs or fails.
 `POST /thread` with a `Message` body behaves the same way — it runs the turn
 and replies `status: "completed"` with the streamed frames in `events` — where
 it previously replied `accepted` without doing anything.
+
+### Thread ids and restarts
+
+`thread/message`, `thread/request` messages, and HTTP `POST /thread` messages
+take a thread id from `thread/create` (or `thread/fork`). An id that was never
+created fails with `-32004` (`thread_not_found`) on stdio, or HTTP `404` on
+`/thread`, before any runtime thread is started. `/prompt`, `prompt/request`,
+and `prompt/run` are different: their optional `thread_id` is any key the
+caller chooses, and a new key starts a new conversation.
+
+The runtime thread behind each created thread is recorded in the state store,
+so a message sent after the app-server restarts continues the same
+conversation. If the runtime no longer has that thread (its data directory was
+removed or replaced), the next message starts a new runtime thread in the
+thread's recorded workspace and records it; the earlier conversation is not
+recovered. `thread/resume` and `thread/fork` without `cwd` keep the recorded
+workspace (a fork uses its parent's). A new fork, or a persisted thread resumed
+through a fresh metadata manager, can record an explicit `cwd`. This control
+transport does not move an already linked Runtime thread: its workspace remains
+owned by the Runtime API. Updating that thread's workspace requires the Runtime
+`PATCH /v1/threads/{id}` operation; cached metadata resume also does not persist
+an explicit cwd change. These paths are not a cross-store workspace transaction.
+
+### Changing config
+
+`app/config/set` and `app/config/unset` write the change to the config file
+before replying: the `--config` path, or the default `config.toml` the runtime
+child also reads when no `--config` is given. They change user settings that
+outlive the app-server, not just this session. The change is applied to the
+file as it is on disk, so edits saved by other processes are kept. If the file
+cannot be read, parsed, or written, the reply is `ok: false` and nothing
+changes; a file that does not parse is not rewritten, so fix it by hand (or
+`app/config/reload` after fixing it). Over HTTP `/app`, a rejected key or value
+is `400` and a read or write failure is `500`.
 
 ### Answering a clarification question
 
@@ -1891,6 +1925,10 @@ implementation the TUI's `/voice` commands run, headless. Recording is one
 blocking capture per host (requests serialize; the loser gets
 `ok:false`/`no_speech`, not a fought-over device). Provider ASR resolves its
 key lazily so local-whisper and Groq paths work without provider auth.
+Interim and final transcription use the selected ASR backend. If local whisper
+or Groq fails, the error stays on that backend: the runtime never retries the
+recording or composer text with the active model provider. Select provider ASR
+explicitly to use that route.
 Failure is data: `no_recorder`, `no_speech`, `no_provider_auth`,
 `transcription_failed`. `CODEWHALE_DISABLE_VOICE=1` is an operator
 kill-switch — a headless `serve --http` host reports `available: false` and

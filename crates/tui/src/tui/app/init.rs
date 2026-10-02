@@ -650,16 +650,20 @@ impl App {
         let work_runtime =
             crate::work_graph::new_shared_work_runtime(todos.clone(), plan_state.clone());
 
-        let skills_scan_codewhale_only = config.skills_config().scan_codewhale_only();
+        let skills_discovery_mode =
+            crate::skills::SkillDiscoveryMode::from_config(&config.skills_config());
         let skills_dir = resolve_skills_dir(&workspace, &global_skills_dir, config);
         let cached_skills = Self::discover_cached_skills(
             &workspace,
             &skills_dir,
-            skills_scan_codewhale_only,
+            skills_discovery_mode,
             plugin_registry.as_ref(),
         );
 
-        let input_history = crate::composer_history::load_history();
+        // The recall cap applies from the first keystroke, not only after the
+        // first submit: the persisted file keeps its own larger cap (U01-m2).
+        let mut input_history = crate::composer_history::load_history();
+        input_history.drain(..input_history.len().saturating_sub(max_input_history));
         let mention_cwd = std::env::current_dir().ok();
         let start_remote_control = matches!(initial_input, Some(InitialInput::RemoteControl));
         let (initial_input_text, initial_input_cursor, auto_submit_initial_input) =
@@ -882,7 +886,7 @@ impl App {
                 .map(PathBuf::from),
             mcp_config_path: mcp_config_path.clone(),
             skills_dir,
-            skills_scan_codewhale_only,
+            skills_discovery_mode,
             project_context_pack_enabled: config.project_context_pack_enabled(),
             memory_path,
             use_memory,
@@ -1115,6 +1119,7 @@ impl App {
             cumulative_turn_duration: std::time::Duration::ZERO,
             session_metrics: crate::tui::session_metrics::SessionMetrics::default(),
             balance_cell: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            balance_route: None,
             draft_gen: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             fleet_draft_cell: std::sync::Arc::new(std::sync::Mutex::new(None)),
             constitution_draft_cell: std::sync::Arc::new(std::sync::Mutex::new(None)),

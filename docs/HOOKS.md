@@ -359,6 +359,32 @@ The rules are conservative:
 - It is set for a failed run as well as a passing one, so `on_error` for a
   failed shell call carries it too. Every other variable is unchanged.
 
+For `tool_call_after`, the same execution evidence is also delivered as a
+versioned JSON document on stdin, in foreground and background form:
+
+```json
+{"schema_version":1,"event":"tool_call_after","tool_name":"bash","session_id":"session-id","tool_call_id":"call-id","session_id_truncated":false,"tool_call_id_truncated":false,"tool_name_truncated":false,"execution_receipt":{"schema_version":1,"command":"printf hello","cwd":"/absolute/workspace","command_truncated":false,"cwd_truncated":false,"execution":"started","completion":"completed","exit_code":0,"stdout":"hello","stderr":"","stdout_truncated":false,"stderr_truncated":false,"output_mode":"combined"}}
+```
+
+The stdin projection leaves the environment receipt above unchanged.
+`completion` is the observed `completed`, `failed`, `killed`, or `timed_out`
+status; a nonzero exit is `failed`. `exit_code` remains a signed 64-bit integer
+or `null`. `output_mode` carries the existing receipt's `output_kind`:
+`separate` or `combined`. With combined output, empty `stderr` does not mean
+the command wrote nothing to stderr.
+
+The complete document is capped at 64 KiB. Correlation identifiers are capped
+at 1,024 UTF-8 bytes plus a truncation marker and carry individual flags;
+missing identifiers are `null`. The shell name is exact. Execution `command`
+and `cwd` retain the exact-or-absent rule above, so their truncation flags are
+always false. Output truncation flags include both capture and preview loss.
+
+Only a native shell call with a valid, settled receipt gets this stdin
+document. Unsupported or unobserved paths get no document, and absence still
+means unknown. Hooks remain observers: their stdout cannot allow, deny, or
+rewrite the completed call, and background hooks are not awaited. `on_error`
+continues to receive the environment receipt only.
+
 **Mode-spelling note.** UI-fired events (`session_start`, `session_end`,
 `message_submit`, `tool_call_after`, `mode_change`, `on_error`, `turn_end`,
 `subagent_*`, `session_busy`, `session_idle`, `session_error`, `waiting_for_user`)
@@ -541,9 +567,13 @@ condition = { type = "tool_category", category = "shell" }
 environment variables. Their stdout is ignored. Background forms of these
 events receive the same payload on stdin.
 
+`tool_call_after` also receives JSON on stdin for a settled native shell call
+with a tracked [execution receipt](#execution-receipt), in foreground and
+background form. Other tool calls have no stdin document.
+
 The remaining observer events — `session_start`, `session_end`,
-`tool_call_after`, `mode_change`, `on_error` — receive environment variables
-only, with no stdin payload, in both foreground and background form.
+`mode_change`, `on_error` — receive environment variables only, with no stdin
+payload, in both foreground and background form.
 
 ### Session state transitions
 

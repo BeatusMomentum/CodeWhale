@@ -31,7 +31,7 @@ export const home: HomeDict = {
   chapterTerminal: "你的终端",
   chapterTerminalTitle: "从你想做的项目开始",
   gainHeading: "你可以用 Codewhale 做什么",
-  gainLede: "从具体目标开始：修复错误、理解项目，或把重复任务变成工作流程。先用一个智能体，需要时再拆分大型任务。",
+  gainLede: "从具体目标开始：修复错误、理解项目，或把重复任务变成工作流。先用一个智能体，需要时再拆分大型任务。",
   gain: [
     [
       "开发项目并验证结果",
@@ -39,7 +39,7 @@ export const home: HomeDict = {
     ],
     [
       "复用重复的工作",
-      "把重复任务变成脚本或保存的工作流程。在脚本和 CI 中使用 codewhale exec，也可以让多个智能体分担大型任务。"
+      "把重复任务变成脚本或保存的工作流。在脚本和 CI 中使用 codewhale exec，也可以让多个智能体分担大型任务。"
     ],
     [
       "掌握执行过程",

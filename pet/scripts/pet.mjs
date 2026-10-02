@@ -32,7 +32,8 @@ try {
     return trace;
   };
   let trace = runtimeURL ? undefined : await load(), buckets = compilePetTelemetry(trace?.events ?? [], trace?.duration ?? 0);
-  if (live) recorder = await createPetRecorder(path, { resume: args.includes('--resume'), maxBuckets: option('segment-buckets') === undefined ? 216_000 : Number(option('segment-buckets')), report: text => console.error(text) });
+  const segmentBuckets = option('segment-buckets') === undefined ? 216_000 : Number(option('segment-buckets'));
+  if (live) recorder = await createPetRecorder(path, { resume: args.includes('--resume'), maxBuckets: segmentBuckets, report: text => console.error(text) });
   else output = await open(path, 'wx', 0o600);
   if (runtimeURL) runtime = await followRuntime({ baseUrl: runtimeURL, threadId: option('thread'),
     token: process.env.CODEWHALE_RUNTIME_TOKEN, report: text => console.error(text) });
@@ -45,7 +46,7 @@ try {
     const started = performance.now(), startedWall = Date.now();
     const origin = trace && 'originTime' in trace && trace.originTime ? Date.parse(trace.originTime) : NaN;
     const offset = Number.isFinite(origin) ? Math.max(0, Date.now() - origin) : trace?.duration ?? 0;
-    let dirty = false, running = false, sequence = 0, failed = false, stopping = false, lastBin = -1;
+    let dirty = false, running = false, sequence = 0, failed = false, stopping = false, lastBin = -1, outage = false;
     const empty = compilePetTelemetry([])[0];
     if (input) {
       monitor = watch(dirname(input), (_event, filename) => { if (!filename || String(filename) === basename(input)) dirty = true; });
@@ -72,12 +73,22 @@ try {
         }
         // A stalled host records skipped intervals as unknown instead of silently
         // compressing time. Never repeat onsets when timer jitter hits a source bin twice.
+        // At most one segment of them: a longer suspension would otherwise replay
+        // every missed 400 ms append (hours of I/O and archives of pure unknown)
+        // before observing again. It starts a new segment whose first bucket is
+        // unknown, as --resume does after an outage; the gap length is reported,
+        // not recorded.
+        if (target - sequence > segmentBuckets) {
+          console.error(`Recorder was suspended or stalled for ${Math.round((target - sequence) * 0.4)} s; starting a new segment instead of recording that many unknown buckets.`);
+          recorder.restart(); sequence = target; outage = true;
+        }
         while (sequence < target && !stopping) {
           await recorder.append({ ...empty, sequence, simTimeMs: sequence * 400 }); sequence++;
         }
         if (stopping) return;
         let state = empty;
-        if (runtime) {
+        if (outage) outage = false;
+        else if (runtime) {
           // Seal the preceding observation interval before recording its state.
           // A fixed recorder origin survives imports discovering older starts.
           // Accepting this state one bucket later matches the foreground host.

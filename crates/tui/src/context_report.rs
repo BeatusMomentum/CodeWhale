@@ -277,7 +277,7 @@ pub fn build_context_report(app: &App) -> PromptSourceMap {
         &app.workspace,
         Some(&app.skills_dir),
         app.project_context_pack_enabled,
-        app.skills_scan_codewhale_only,
+        app.skills_discovery_mode,
         app.ui_locale.tag(),
         app.mode,
         Some(app.plugin_registry.as_ref()),
@@ -375,7 +375,7 @@ pub fn build_headless_context_report(config: &Config, workspace: &Path) -> Promp
         workspace,
         Some(&selected_skills_dir),
         config.project_context_pack_enabled(),
-        config.skills_config().scan_codewhale_only(),
+        crate::skills::SkillDiscoveryMode::from_config(&config.skills_config()),
         "en",
         AppMode::Agent,
         None,
@@ -441,7 +441,7 @@ fn base_source_entries(
     workspace: &Path,
     skills_dir: Option<&Path>,
     project_pack_enabled: bool,
-    skills_scan_codewhale_only: bool,
+    skills_discovery_mode: crate::skills::SkillDiscoveryMode,
     locale_tag: &str,
     mode: AppMode,
     plugin_registry: Option<&crate::plugins::PluginRegistry>,
@@ -491,10 +491,13 @@ fn base_source_entries(
     }
 
     if let Some(content) = project_context.instructions.as_deref() {
-        let source = project_context
-            .source_path
-            .as_ref()
-            .map_or_else(|| "project".to_string(), |p| p.display().to_string());
+        // Same helper as ProjectContext::as_system_block, so the report's
+        // source token derives from the same label the prompt shows. (The
+        // entry below still displays the absolute source path for operators;
+        // only the prompt label is relativized.)
+        let source = crate::project_context::project_instructions_source_label(
+            project_context.source_path.as_deref(),
+        );
         let mut block = format!(
             "<project_instructions source=\"{source}\">\n{content}\n</project_instructions>"
         );
@@ -573,8 +576,7 @@ fn base_source_entries(
         ));
     }
 
-    let skill_discovery_mode =
-        crate::skills::SkillDiscoveryMode::from_codewhale_only(skills_scan_codewhale_only);
+    let skill_discovery_mode = skills_discovery_mode;
     let skills_budget = crate::skills::skills_prompt_budget_chars(context_window_tokens);
     let skills_block = match skills_dir {
         Some(dir) => crate::skills::render_available_skills_context_for_workspace_and_dir_with_mode_and_plugins(

@@ -59,7 +59,7 @@ pub(in crate::commands) fn relay_portable(
     let message = build_relay_instruction(control, focus);
     CommandResult::with_message_and_action(
         "Preparing session relay at .deepseek/handoff.md...",
-        crate::tui::app::AppAction::SendMessage(message),
+        codewhale_command_contract::outcome::SessionAction::SendMessage(message),
     )
 }
 
@@ -209,7 +209,9 @@ mod tests {
         let result = relay_portable(&mut fake, Some("focus on the handoff"));
         assert!(!result.is_error);
         let message = match result.action {
-            Some(crate::tui::app::AppAction::SendMessage(message)) => message,
+            Some(codewhale_command_contract::outcome::SessionAction::SendMessage(message)) => {
+                message
+            }
             other => panic!("expected SendMessage action, got {other:?}"),
         };
         assert!(
@@ -253,7 +255,9 @@ mod tests {
         };
         let result = relay_portable(&mut fake, None);
         let message = match result.action {
-            Some(crate::tui::app::AppAction::SendMessage(message)) => message,
+            Some(codewhale_command_contract::outcome::SessionAction::SendMessage(message)) => {
+                message
+            }
             other => panic!("expected SendMessage, got {other:?}"),
         };
         assert!(message.contains("\nTo-do: unavailable because the list is busy."));
@@ -289,7 +293,9 @@ mod tests {
         };
         let result = relay_portable(&mut fake, None);
         let message = match result.action {
-            Some(crate::tui::app::AppAction::SendMessage(message)) => message,
+            Some(codewhale_command_contract::outcome::SessionAction::SendMessage(message)) => {
+                message
+            }
             other => panic!("expected SendMessage, got {other:?}"),
         };
         assert!(message.contains("- Title: Relay Plan"));

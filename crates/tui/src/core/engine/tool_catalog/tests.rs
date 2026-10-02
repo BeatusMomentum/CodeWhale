@@ -425,3 +425,26 @@ fn execute_tools_is_eager_in_code_mode_and_deferred_in_direct() {
             .all(|definition| definition.name != "execute_tools")
     );
 }
+
+/// A timed-out or cancelled `code_execution` kills the interpreter and what the
+/// script started; a bare `output()` left both running.
+#[cfg(unix)]
+#[tokio::test]
+async fn dropped_code_execution_kills_the_interpreter_tree() {
+    if crate::dependencies::resolve_python_interpreter().is_none() {
+        return;
+    }
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let pid_file = tmp.path().join("grandchild.pid");
+    let code = format!(
+        "import subprocess\np = subprocess.Popen(['sleep', '300'])\nopen({:?}, 'w').write(str(p.pid))\np.wait()\n",
+        pid_file.display().to_string()
+    );
+    let input = json!({ "code": code });
+    let run = super::execute_code_execution_tool(&input, tmp.path());
+    let grandchild = crate::process_tree::drop_once_pid_written(run, &pid_file).await;
+    assert!(
+        crate::process_tree::wait_for_pid_exit(grandchild, std::time::Duration::from_secs(5)),
+        "a process the script started outlived the dropped code_execution call"
+    );
+}

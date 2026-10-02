@@ -1769,8 +1769,15 @@ impl ToolSpec for WriteFileTool {
         let file_path = context.resolve_path(path_str)?;
 
         // Snapshot the existing contents (if any) before we overwrite — used
-        // to render an inline diff in the tool result.
-        let existed_before = tokio::fs::try_exists(&file_path).await.unwrap_or(false);
+        // to render an inline diff in the tool result. Only a genuinely
+        // absent path is "new": a stat that fails for any other reason must
+        // not let an existing file be overwritten as if it were empty.
+        let existed_before = tokio::fs::try_exists(&file_path).await.map_err(|error| {
+            ToolError::execution_failed(format!(
+                "Failed to inspect {}: {error}",
+                file_path.display()
+            ))
+        })?;
         let prior_contents = if existed_before {
             tokio::fs::read_to_string(&file_path)
                 .await

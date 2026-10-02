@@ -540,7 +540,9 @@ pub(crate) async fn run_exec_agent(
         mcp_oauth_callback_port: None,
         mcp_oauth_callback_url: None,
         skills_dir: execution_config.skills_dir(),
-        skills_scan_codewhale_only: execution_config.skills_config().scan_codewhale_only(),
+        skills_discovery_mode: crate::skills::SkillDiscoveryMode::from_config(
+            &execution_config.skills_config(),
+        ),
         instructions: {
             let mut instrs: Vec<crate::prompts::InstructionSource> = execution_config
                 .instructions_paths()
@@ -764,6 +766,8 @@ pub(crate) async fn run_exec_agent(
             },
             verbosity: execution_config.verbosity.clone(),
             provenance: crate::core::ops::UserInputProvenance::ExternalUser,
+            // Headless exec does not correlate submissions.
+            submission_id: None,
         }))
         .await?;
 

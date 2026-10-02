@@ -46,7 +46,7 @@
 //! - Nested calls do not take per-tool locks against sibling top-level calls;
 //!   the program runs under its own exclusive lock instead. Inside the
 //!   program, calls the gate marks non-parallel run one at a time.
-//! - No nested `agent`, `workflow`, `request_user_input`, interpreter,
+//! - No nested `agent`, `workflow`, `rlm`, `request_user_input`, interpreter,
 //!   interactive shell, sandbox escalation, Computer Use consent/script, MCP
 //!   sign-in, or recursive `execute_tools`. Those stay direct calls.
 //! - Rich content blocks (images) from nested results are dropped; text and
@@ -109,6 +109,9 @@ const PROHIBITED_NESTED: &[&str] = &[
     "js_execution",
     "agent",
     "workflow",
+    // Recursive RLM rounds are admitted by the turn loop serving the direct
+    // `rlm` call; a program has no such server for a nested one.
+    "rlm",
     crate::core::engine::tool_catalog::REQUEST_USER_INPUT_NAME,
     crate::core::engine::tool_catalog::MULTI_TOOL_PARALLEL_NAME,
 ];
@@ -242,7 +245,9 @@ impl NestedCallGate {
         )
     }
 
-    async fn ask(&self, name: String, input: Value) -> NestedCallVerdict {
+    /// Ask the serving turn loop to decide one nested call. A gate nobody
+    /// serves any more refuses.
+    pub(crate) async fn ask(&self, name: String, input: Value) -> NestedCallVerdict {
         let unavailable = || NestedCallVerdict::Refused {
             error: ToolError::not_available(
                 "the turn that launched this program is no longer serving its permission gate",
@@ -259,6 +264,36 @@ impl NestedCallGate {
             return unavailable();
         }
         answer.await.unwrap_or_else(|_| unavailable())
+    }
+}
+
+#[cfg(test)]
+impl NestedCallGate {
+    /// A gate whose server admits every call exactly as asked, for tests of
+    /// consumers that are not about admission. Needs a Tokio runtime.
+    pub(crate) fn admitting_for_test() -> Self {
+        Self::answering_for_test(|name, input| NestedCallVerdict::Run {
+            name: name.to_string(),
+            input: input.clone(),
+            supports_parallel: false,
+            decision: NestedDecision::Auto,
+            hook_context: None,
+        })
+    }
+
+    /// A gate whose server answers every call with `answer`.
+    pub(crate) fn answering_for_test(
+        answer: impl Fn(&str, &Value) -> NestedCallVerdict + Send + 'static,
+    ) -> Self {
+        let (tx_event, mut rx_event) = mpsc::channel(64);
+        tokio::spawn(async move { while rx_event.recv().await.is_some() {} });
+        let (gate, mut requests) = Self::new(None, tx_event, Duration::from_secs(60));
+        tokio::spawn(async move {
+            while let Some(request) = requests.recv().await {
+                let _ = request.reply.send(answer(&request.name, &request.input));
+            }
+        });
+        gate
     }
 }
 
@@ -582,6 +617,8 @@ impl CodemodeInvoker {
                     &name,
                     input,
                     &disallowed,
+                    // Calls a program makes never carry a person's decision.
+                    None,
                 )
                 .await
             })
@@ -1163,7 +1200,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let context = ToolContext::new(dir.path());
         let invoker = CodemodeInvoker::new(vec![], context);
-        for name in ["agent", "workflow", "execute_tools", "tool_search", "nope"] {
+        for name in [
+            "agent",
+            "workflow",
+            "rlm",
+            "execute_tools",
+            "tool_search",
+            "nope",
+        ] {
             let err = invoker
                 .invoke(ToolCallRequest {
                     tool: name.to_string(),
@@ -1215,7 +1259,8 @@ mod tests {
             "---\nname: greet\ndescription: Say hello\n---\n# Greet\nSay hello warmly.\n",
         )
         .unwrap();
-        let context = ToolContext::new(&workspace).with_skills_config(&skills_root, false);
+        let context = ToolContext::new(&workspace)
+            .with_skills_config(&skills_root, crate::skills::SkillDiscoveryMode::Compatible);
         let registry = ToolRegistryBuilder::new()
             .with_tool(Arc::new(crate::tools::skill::LoadSkillTool))
             .build(context.clone());

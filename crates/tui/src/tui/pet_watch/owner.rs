@@ -23,6 +23,10 @@ use crate::fleet::files::{WorkspaceFile, same_file};
 
 const LEASE: Duration = Duration::from_secs(2);
 const MAX_CLIENTS: usize = 4096;
+/// Request body limit for every owner route. Clients size batches to it.
+pub(super) const MAX_REQUEST_BYTES: usize = 64 * 1024;
+/// How long a route waits for the world thread's reply before answering 503.
+pub(super) const WORK_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -190,7 +194,7 @@ async fn submit(
     if state.tx.try_send(make(tx)).is_err() {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
-    match tokio::time::timeout(Duration::from_secs(5), rx).await {
+    match tokio::time::timeout(WORK_REPLY_TIMEOUT, rx).await {
         Ok(Ok(result)) => answer(result),
         _ => StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
@@ -374,7 +378,7 @@ pub fn serve(root: PathBuf, requested_port: u16) -> anyhow::Result<()> {
         .route("/v1/frame", get(frame)).route("/v1/action", post(action))
         .route("/v1/producer", post(producer)).route("/v1/audio", post(audio))
         .route("/v1/export", get(export)).route("/v1/attach", post(attach))
-        .layer(DefaultBodyLimit::max(64 * 1024))
+        .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
         .layer(axum::middleware::from_fn(|request: axum::extract::Request, next: axum::middleware::Next| async move {
             let mut response = next.run(request).await;
             for (key, value) in [("cache-control", "no-store"), ("referrer-policy", "no-referrer"), ("x-content-type-options", "nosniff"), ("content-security-policy", "default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; img-src 'self' blob:; frame-ancestors 'none'; base-uri 'none'; form-action 'none'")] {

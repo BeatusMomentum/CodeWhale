@@ -77,12 +77,39 @@ pub fn parse_catalog(document: MarketplaceDocument) -> MarketplaceCatalog {
         explicit => explicit,
     };
 
-    match format {
+    let mut catalog = match format {
         MarketplaceFormat::Kimi => kimi::parse_kimi_catalog(document),
         MarketplaceFormat::Claude => claude::parse_claude_catalog(document),
         MarketplaceFormat::Codex => codex::parse_codex_catalog(document),
         MarketplaceFormat::Codewhale => codewhale::parse_codewhale_catalog(document),
         MarketplaceFormat::Auto => unreachable!("resolved above"),
+    };
+    flag_duplicate_names(&mut catalog);
+    catalog
+}
+
+/// A candidate's name is its identity: `/plugin show`, install, and registry
+/// lookups all resolve by it, and a lookup returns the first match. Entries
+/// sharing a name (after each format's normalization) are ambiguous, so every
+/// one of them carries an error and none installs from the catalog.
+fn flag_duplicate_names(catalog: &mut super::types::MarketplaceCatalog) {
+    let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for candidate in &catalog.candidates {
+        *counts.entry(candidate.name.clone()).or_default() += 1;
+    }
+    for candidate in &mut catalog.candidates {
+        let count = counts.get(&candidate.name).copied().unwrap_or(0);
+        if count > 1 {
+            candidate.diagnostics.push(MarketplaceDiagnostic::error(
+                "DUPLICATE_NAME",
+                format!(
+                    "{count} catalog entries are named `{}`; the entry's identity is ambiguous",
+                    candidate.name
+                ),
+                Some(candidate.name.clone()),
+                None,
+            ));
+        }
     }
 }
 

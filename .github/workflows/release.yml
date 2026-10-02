@@ -266,10 +266,15 @@ jobs:
           retention-days: 1
           overwrite: true
 
+  # Derived channel: the tagged/latest manifest is published only after the
+  # canonical GitHub Release exists. docker-build pushes by digest (untagged)
+  # and smokes each image before the release, so a broken image still stops
+  # the release, but no public tag can point at a version whose GitHub
+  # Release was never published.
   docker:
     timeout-minutes: 30
-    needs: [docker-build, resolve]
-    if: ${{ !cancelled() && needs.docker-build.result == 'success' }}
+    needs: [docker-build, release, resolve]
+    if: ${{ !cancelled() && needs.docker-build.result == 'success' && needs.release.result == 'success' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -373,8 +378,8 @@ jobs:
 
   release:
     timeout-minutes: 30
-    needs: [artifacts, docker, resolve]
-    if: ${{ !cancelled() && needs.artifacts.result == 'success' && needs.docker.result == 'success' }}
+    needs: [artifacts, docker-build, resolve]
+    if: ${{ !cancelled() && needs.artifacts.result == 'success' && needs.docker-build.result == 'success' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -412,14 +417,38 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ needs.resolve.outputs.tag }}
         run: node repo/scripts/release/ensure-release-assets-absent.js "${GITHUB_REPOSITORY}" "${TAG}"
+      # Upload into a DRAFT: 34 sequential uploads that die halfway must leave
+      # nothing public (and nothing a rerun's immutability guard refuses).
       - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
         with:
           tag_name: ${{ needs.resolve.outputs.tag }}
           files: artifacts/*
+          draft: true
           prerelease: false
           body_path: release-body.md
           overwrite_files: false
           fail_on_unmatched_files: true
+      - name: Verify the draft's exact asset set, then publish it at once
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+        run: |
+          node repo/scripts/release/verify-release-inventory.js \
+            --draft --asset-dir artifacts --publish \
+            "${GITHUB_REPOSITORY}" "${TAG}"
+
+  # CNB tag pushes start its public binary pipeline, so mirror only after
+  # the canonical release is complete. Calling the reusable workflow here
+  # also works when GITHUB_TOKEN publication suppresses release events.
+  cnb:
+    needs: [release, resolve]
+    if: ${{ !cancelled() && needs.release.result == 'success' }}
+    uses: ./.github/workflows/sync-cnb.yml
+    with:
+      release_tag: ${{ needs.resolve.outputs.tag }}
+      source_sha: ${{ needs.resolve.outputs.sha }}
+    secrets:
+      CNB_GIT_TOKEN: ${{ secrets.CNB_GIT_TOKEN }}
 
   npm:
     timeout-minutes: 20
