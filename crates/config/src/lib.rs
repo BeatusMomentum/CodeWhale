@@ -6984,6 +6984,10 @@ pub fn migrate_config_if_needed() -> Result<Option<ConfigMigration>> {
         return Ok(None);
     }
     let primary = codewhale_home()?.join(CONFIG_FILE_NAME);
+    // `exists()` follows links, so a dangling link would read as "absent" and
+    // the copy below would create whatever it points at. A link at the primary
+    // name is refused instead, dangling or not.
+    reject_path_symlink(&primary)?;
     if primary.exists() {
         return Ok(None);
     }
@@ -6991,11 +6995,10 @@ pub fn migrate_config_if_needed() -> Result<Option<ConfigMigration>> {
     if !legacy.exists() {
         return Ok(None);
     }
-    // Copy the config to the new home.
-    if let Some(parent) = primary.parent() {
-        std::fs::create_dir_all(parent).context("failed to create codewhale config directory")?;
-    }
-    std::fs::copy(&legacy, &primary)
+    // Copy the config to the new home, owner-only, through a temporary file
+    // renamed into place (the primary name is replaced, never written through).
+    let contents = std::fs::read(&legacy).context("failed to read legacy deepseek config")?;
+    persistence::atomic_write(&primary, &contents)
         .context("failed to migrate config from deepseek to codewhale home")?;
     tracing::info!(
         "Migrated config from {} to {}",
