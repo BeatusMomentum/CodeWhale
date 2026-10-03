@@ -831,14 +831,8 @@ fn validate_windows_handle_path(
     expected: &Path,
     expect_directory: bool,
 ) -> Result<fs::Metadata> {
-    use std::ffi::OsString;
-    use std::os::windows::ffi::OsStringExt as _;
     use std::os::windows::fs::MetadataExt as _;
-    use std::os::windows::io::AsRawHandle as _;
-    use windows_sys::Win32::Storage::FileSystem::{
-        FILE_ATTRIBUTE_REPARSE_POINT, FILE_NAME_NORMALIZED, GetFinalPathNameByHandleW,
-        VOLUME_NAME_DOS,
-    };
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
 
     let metadata = file.metadata().with_context(|| {
         format!(
@@ -858,6 +852,92 @@ fn validate_windows_handle_path(
         },
         "Codewhale-owned xAI OAuth path has the wrong filesystem type"
     );
+
+    // Compare the current selection to the captured object, not its lexical
+    // spelling: Windows can select the same object through an 8.3 short name.
+    // Keep every selected parent open without delete sharing until comparison
+    // finishes, and refuse reparse points at every component.
+    let components = open_windows_selected_components(expected, expect_directory)?;
+    let selected = components
+        .last()
+        .context("private selected path unavailable")?;
+    anyhow::ensure!(
+        windows_file_identity(file)? == windows_file_identity(selected)?
+            && normalize_windows_path_for_comparison(&windows_final_handle_path(file)?)?
+                == normalize_windows_path_for_comparison(&windows_final_handle_path(selected)?)?,
+        "Codewhale-owned xAI OAuth path was redirected while opening"
+    );
+    Ok(metadata)
+}
+
+#[cfg(windows)]
+fn open_windows_selected_components(expected: &Path, expect_directory: bool) -> Result<Vec<File>> {
+    use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+
+    anyhow::ensure!(
+        expected.is_absolute(),
+        "private selected path must be absolute"
+    );
+    let mut current = PathBuf::new();
+    let mut handles = Vec::new();
+    let mut components = expected.components().peekable();
+    while let Some(component) = components.next() {
+        match component {
+            Component::Prefix(prefix) => current.push(prefix.as_os_str()),
+            Component::RootDir => current.push(Path::new(r"\")),
+            Component::Normal(name) => {
+                current.push(name);
+                let directory = components.peek().is_some() || expect_directory;
+                let handle = fs::OpenOptions::new()
+                    .access_mode(FILE_READ_ATTRIBUTES)
+                    .share_mode(
+                        FILE_SHARE_READ
+                            | FILE_SHARE_WRITE
+                            | if directory { 0 } else { FILE_SHARE_DELETE },
+                    )
+                    .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+                    .open(&current)
+                    .context("opening the current private path selection")?;
+                let metadata = handle.metadata()?;
+                anyhow::ensure!(
+                    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0,
+                    "Codewhale-owned xAI OAuth path must not be a reparse point"
+                );
+                anyhow::ensure!(
+                    if directory {
+                        metadata.is_dir()
+                    } else {
+                        metadata.is_file()
+                    },
+                    "Codewhale-owned xAI OAuth path has the wrong filesystem type"
+                );
+                handles.push(handle);
+            }
+            Component::CurDir | Component::ParentDir => {
+                bail!("private selected path must be lexically normalized")
+            }
+        }
+    }
+    anyhow::ensure!(
+        !handles.is_empty(),
+        "private selected path cannot be a volume root"
+    );
+    Ok(handles)
+}
+
+#[cfg(windows)]
+fn windows_final_handle_path(file: &File) -> Result<PathBuf> {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt as _;
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_NAME_NORMALIZED, GetFinalPathNameByHandleW, VOLUME_NAME_DOS,
+    };
+
     let flags = FILE_NAME_NORMALIZED | VOLUME_NAME_DOS;
     let handle = file.as_raw_handle();
     // SAFETY: null output asks only for the required UTF-16 length.
@@ -875,13 +955,54 @@ fn validate_windows_handle_path(
         return Err(std::io::Error::last_os_error())
             .context("resolving Codewhale-owned xAI OAuth handle path");
     }
-    let actual = OsString::from_wide(&buffer[..written as usize]);
-    anyhow::ensure!(
-        normalize_windows_path_for_comparison(Path::new(&actual))?
-            == normalize_windows_path_for_comparison(expected)?,
-        "Codewhale-owned xAI OAuth path was redirected while opening"
-    );
-    Ok(metadata)
+    Ok(PathBuf::from(OsString::from_wide(
+        &buffer[..written as usize],
+    )))
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE,
+        FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+
+    #[test]
+    fn selected_path_alias_keeps_identity_and_replacement_is_refused() {
+        let root = tempfile::tempdir().expect("temporary root");
+        let selected = root.path().join("credentials");
+        fs::create_dir(&selected).expect("selected directory");
+        // Hosted Windows temporary roots can contain RUNNER~1 while the kernel
+        // reports the long spelling. Both must select the same retained object.
+        let canonical = selected
+            .canonicalize()
+            .expect("canonical selected directory");
+        let held = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(&selected)
+            .expect("captured selected directory");
+        validate_windows_handle_path(&held, &selected, true).expect("selected spelling");
+        validate_windows_handle_path(&held, &canonical, true).expect("canonical spelling");
+
+        let retained = root.path().join("retained");
+        fs::rename(&selected, &retained).expect("move captured object");
+        fs::create_dir(&selected).expect("replacement at the same selected path");
+        assert!(
+            validate_windows_handle_path(&held, &selected, true).is_err(),
+            "a replacement at the selected path must not inherit the captured identity"
+        );
+        validate_windows_handle_path(&held, &retained, true).expect("actual retained object");
+        fs::create_dir(root.path().join("other")).expect("existing unnormalized path component");
+        assert!(
+            validate_windows_handle_path(&held, &root.path().join("other/../retained"), true)
+                .is_err(),
+            "lexically unnormalized paths remain inadmissible"
+        );
+    }
 }
 
 #[cfg(windows)]

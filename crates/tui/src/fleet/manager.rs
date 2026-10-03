@@ -2855,15 +2855,29 @@ mod tests {
         );
         assert_eq!(lease.entry.run_id.0, rows[0].spec.run_id);
         drop(owner);
-        std::fs::rename(&selected, root.join("retired-selected")).unwrap();
-        std::fs::create_dir(&selected).unwrap();
-        assert!(
-            coordination
-                .try_read()
-                .unwrap()
-                .fleet_worker_records_for_workspace(&selected)
-                .is_err()
-        );
+        #[cfg(windows)]
+        {
+            // The retained directory handles prevent replacement on Windows.
+            let error = std::fs::rename(&selected, root.join("retired-selected")).unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(32), "{error}");
+            let owner = coordination.try_read().unwrap();
+            let rows = owner.fleet_worker_records_for_workspace(&selected).unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].spec.run_id, report.run_id.0);
+        }
+        #[cfg(not(windows))]
+        {
+            // Unix permits rename of a held directory; a replacement must refuse.
+            std::fs::rename(&selected, root.join("retired-selected")).unwrap();
+            std::fs::create_dir(&selected).unwrap();
+            assert!(
+                coordination
+                    .try_read()
+                    .unwrap()
+                    .fleet_worker_records_for_workspace(&selected)
+                    .is_err()
+            );
+        }
     }
 
     #[test]

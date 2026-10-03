@@ -1837,6 +1837,29 @@ async fn sandboxed_host_boundary(
         denied["ok"], false,
         "Native host reached {protocol} controller: {denied}"
     );
+    #[cfg(target_os = "linux")]
+    {
+        let controller = std::fs::read_link("/proc/self/ns/net").unwrap();
+        let controller = controller.to_str().unwrap();
+        let host = denied["network_namespace"].as_str().unwrap();
+        let namespace_id = |name: &str| {
+            name.strip_prefix("net:[")
+                .and_then(|name| name.strip_suffix(']'))
+                .and_then(|id| id.parse::<u64>().ok())
+                .filter(|id| *id != 0)
+                .expect("an actual bounded Linux kernel network namespace")
+        };
+        assert_ne!(
+            namespace_id(host),
+            namespace_id(controller),
+            "Native host must remain in its isolated kernel network namespace"
+        );
+        assert_eq!(
+            denied["code"], "ECONNREFUSED",
+            "the isolated loopback cannot reach the controller: {denied}"
+        );
+    }
+    #[cfg(not(target_os = "linux"))]
     assert!(
         matches!(denied["code"].as_str(), Some("EPERM" | "EACCES")),
         "connection must be refused by the OS sandbox: {denied}"
@@ -3904,7 +3927,12 @@ async fn memory_hog_is_stopped(
                 MemoryEnforcement::Rlimit | MemoryEnforcement::JobObject
             ) =>
         {
-            assert!(message.contains("allocation failed"), "{message}");
+            assert!(
+                message.contains("allocation failed")
+                    || (kind == crate::dependencies::HostRuntimeKind::Bun
+                        && message.ends_with("RangeError: Out of memory")),
+                "{message}"
+            );
         }
         Err(other) => panic!("unexpected error: {other:?}"),
     }
@@ -4835,9 +4863,19 @@ fn a_plugin_named_like_a_tier_zero_owner_fails_validation_and_never_reaches_the_
 
 #[test]
 fn launch_plans_carry_their_tier_and_use_a_data_directory_each() {
+    #[cfg(not(windows))]
     use crate::dependencies::{HostRuntime, HostRuntimeKind};
     let home = tempfile::tempdir().unwrap();
+    #[cfg(windows)]
+    let bundle = super::materialize_bundle(home.path()).unwrap();
+    #[cfg(not(windows))]
     let bundle = home.path().join("codewhale-extension-host.mjs");
+    // Windows admission verifies the real copied runtime and exact bundle.
+    #[cfg(windows)]
+    let runtime = crate::dependencies::resolve_extension_host_runtime(NODE, None, None)
+        .selected
+        .expect("tier planning requires the test Node runtime on Windows");
+    #[cfg(not(windows))]
     let runtime = HostRuntime {
         compiled: false,
         kind: HostRuntimeKind::Node,
@@ -5296,10 +5334,8 @@ async fn raw_agent_presets_use_one_default_and_all_five_caller_views() {
     let original = fixture.registry();
     assert_eq!(original.selected_native_entries().len(), 1);
     assert!(
-        original.selected_native_entries()[0]
-            .entry
-            .path
-            .ends_with("/a.mjs")
+        Path::new(&original.selected_native_entries()[0].entry.path).file_name()
+            == Some(std::ffi::OsStr::new("a.mjs"))
     );
     let manager = fixture.manager(node);
     let _manager = super::TestManagerGuard::install(Arc::clone(&manager));
@@ -5314,7 +5350,9 @@ async fn raw_agent_presets_use_one_default_and_all_five_caller_views() {
     assert_eq!(a.prompt_sections().await.unwrap()[0].text, "A:a");
     let selected_b = roster
         .iter()
-        .find(|(preset, _)| preset.entry.path.ends_with("/b.mjs"))
+        .find(|(preset, _)| {
+            Path::new(&preset.entry.path).file_name() == Some(std::ffi::OsStr::new("b.mjs"))
+        })
         .unwrap()
         .0
         .clone();
@@ -5463,7 +5501,9 @@ async fn raw_agent_presets_without_default_require_explicit_child_selection() {
     );
     let selected = roster
         .iter()
-        .find(|(preset, _)| preset.entry.path.ends_with("/b.mjs"))
+        .find(|(preset, _)| {
+            Path::new(&preset.entry.path).file_name() == Some(std::ffi::OsStr::new("b.mjs"))
+        })
         .unwrap()
         .0
         .clone();

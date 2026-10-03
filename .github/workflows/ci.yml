@@ -466,6 +466,9 @@ jobs:
           done
           sudo apt-get install -y libdbus-1-dev pkg-config bubblewrap apparmor-profiles
           sh scripts/prepare-linux-test-sandbox.sh
+      - name: Ubuntu build headroom
+        shell: bash
+        run: bash scripts/prepare-ubuntu-build-headroom.sh
       - uses: Swatinem/rust-cache@v2
         with:
           cache-bin: false
@@ -525,6 +528,10 @@ jobs:
             sleep 15
           done
           sudo apt-get install -y libdbus-1-dev pkg-config
+      - name: Ubuntu build headroom
+        if: needs.changes.outputs.heavy == 'true'
+        shell: bash
+        run: bash scripts/prepare-ubuntu-build-headroom.sh
       - uses: Swatinem/rust-cache@v2
         if: needs.changes.outputs.heavy == 'true'
         with:
@@ -886,24 +893,11 @@ jobs:
           sudo apt-get install -y libdbus-1-dev pkg-config bubblewrap apparmor-profiles
           sh scripts/prepare-linux-test-sandbox.sh
       - name: Ubuntu build headroom
-        # The combined wave/0.10.1-next workspace build was terminated
-        # mid-compile on every PR run ("runner has received a shutdown
-        # signal", exit 143, no newer push to cancel it) while single-fix PRs
-        # finished the same build in ~10 minutes. Drop preinstalled SDKs this
-        # job never uses and add swap so the full --all-features test build
-        # has disk and memory headroom; the Run tests step logs both.
+        # Reuse the same fixed hosted-runner provisioning as Safety and Lint.
+        # Exit 143 is a shutdown observation, not proof of OOM or timeout.
         if: needs.changes.outputs.heavy == 'true' && matrix.os == 'ubuntu-latest' && (github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request')
         shell: bash
-        run: |
-          df -h / /mnt; free -m
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
-          if sudo fallocate -l 8G /mnt/cw-swapfile && sudo chmod 600 /mnt/cw-swapfile \
-            && sudo mkswap /mnt/cw-swapfile >/dev/null && sudo swapon /mnt/cw-swapfile; then
-            echo "Added 8 GiB swap at /mnt/cw-swapfile"
-          else
-            echo "::warning::Could not add swap; continuing with the runner default"
-          fi
-          df -h / /mnt; free -m
+        run: bash scripts/prepare-ubuntu-build-headroom.sh
       - uses: Swatinem/rust-cache@v2
         if: needs.changes.outputs.heavy == 'true' && (matrix.os != 'ubuntu-latest' || github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request')
         with:

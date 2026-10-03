@@ -1615,10 +1615,10 @@ mod records_tests {
     use super::*;
     use serde_json::json;
 
-    fn scoped_root(path: &str) -> CoordinationClaimScope {
+    fn scoped_root(path: impl AsRef<Path>) -> CoordinationClaimScope {
         CoordinationClaimScope {
-            canonical_root: PathBuf::from(path),
-            platform: "unix".into(),
+            canonical_root: path.as_ref().to_path_buf(),
+            platform: if cfg!(windows) { "windows" } else { "unix" }.into(),
             volume: 1,
             index: 1,
         }
@@ -1635,14 +1635,16 @@ mod records_tests {
 
     #[test]
     fn attributed_claims_project_nested_and_alias_roots_and_keep_contracts_global() {
-        let original = Path::new("/work/original");
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let original = root.join("original");
         let mut ledger = CoordinationLedger::default();
         ledger
             .register_claim_in_scope(
                 root_claim("a", "src", None),
                 false,
-                Some(scoped_root("/work/shared")),
-                Some(original),
+                Some(scoped_root(root.join("shared"))),
+                Some(&original),
                 |_| true,
             )
             .unwrap();
@@ -1651,8 +1653,8 @@ mod records_tests {
                 .register_claim_in_scope(
                     root_claim("nested", ".", None),
                     false,
-                    Some(scoped_root("/work/shared/src")),
-                    Some(original),
+                    Some(scoped_root(root.join("shared/src"))),
+                    Some(&original),
                     |_| true
                 )
                 .is_err()
@@ -1662,8 +1664,8 @@ mod records_tests {
                 .register_claim_in_scope(
                     root_claim("alias", "src", None),
                     false,
-                    Some(scoped_root("/work/shared")),
-                    Some(original),
+                    Some(scoped_root(root.join("shared"))),
+                    Some(&original),
                     |_| true
                 )
                 .is_err()
@@ -1672,8 +1674,8 @@ mod records_tests {
             .register_claim_in_scope(
                 root_claim("disjoint", "src", Some("release")),
                 false,
-                Some(scoped_root("/work/other")),
-                Some(original),
+                Some(scoped_root(root.join("other"))),
+                Some(&original),
                 |_| true,
             )
             .unwrap();
@@ -1683,7 +1685,7 @@ mod records_tests {
                     root_claim("global-contract", "unrelated", Some("release")),
                     false,
                     None,
-                    Some(original),
+                    Some(&original),
                     |_| true
                 )
                 .is_err()
@@ -1692,7 +1694,9 @@ mod records_tests {
 
     #[test]
     fn attributed_schema_is_sticky_and_absent_map_or_orphan_receipt_refuses() {
-        let original = Path::new("/work/original");
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let original = root.join("original");
         let mut legacy = CoordinationLedger::default();
         legacy
             .register_claim(root_claim("legacy", "src", None), false, |_| false)
@@ -1710,8 +1714,8 @@ mod records_tests {
             .register_claim_in_scope(
                 root_claim("extra", "src", None),
                 false,
-                Some(scoped_root("/work/other")),
-                Some(original),
+                Some(scoped_root(root.join("other"))),
+                Some(&original),
                 |_| false,
             )
             .unwrap();
@@ -1727,7 +1731,7 @@ mod records_tests {
                 .unwrap_err()
                 .contains("requires explicit")
         );
-        decoded.claim_scopes = Some(HashMap::from([(100, scoped_root("/work/other"))]));
+        decoded.claim_scopes = Some(HashMap::from([(100, scoped_root(root.join("other")))]));
         assert!(
             decoded
                 .validate_replay()

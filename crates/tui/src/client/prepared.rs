@@ -1586,7 +1586,11 @@ mod dialect_seam_tests {
     fn codex_client() -> CodewhaleClient {
         let _env_lock = crate::test_support::lock_test_env();
         let home = tempfile::tempdir().expect("isolated ChatGPT credential home");
-        let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", home.path());
+        let root = home
+            .path()
+            .canonicalize()
+            .expect("canonical credential home");
+        let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", &root);
         let mut config = Config {
             provider: Some("openai-codex".to_string()),
             ..Config::default()

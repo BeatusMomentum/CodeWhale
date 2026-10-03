@@ -33361,6 +33361,7 @@ async fn persisted_queued_native_skill_is_denied_after_host_withdrawal() {
     let _manager = crate::extension_host::TestManagerGuard::install(Arc::clone(&manager));
     let engine = manager.attach(Arc::clone(&plugins));
     engine.sync().await.unwrap();
+    let plugins = engine.plugin_view();
     let catalog = crate::skills::discover_in_workspace_with_mode_and_plugins(
         fixture.workspace(),
         crate::skills::SkillDiscoveryMode::CodeWhaleOnly,
@@ -33374,6 +33375,7 @@ async fn persisted_queued_native_skill_is_denied_after_host_withdrawal() {
         queued_session_to_ui(serde_json::from_str::<QueuedSessionMessage>(&serialized).unwrap());
     let mut app = create_test_app();
     app.workspace = fixture.workspace().to_path_buf();
+    app.plugin_registry = Arc::clone(&plugins);
     let mut git = crate::tui::git_mention::GitMentionCache::default();
     assert!(
         queued_message_content_for_app(&app, &restored, None, &mut git)

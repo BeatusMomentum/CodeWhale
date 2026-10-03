@@ -474,9 +474,9 @@ fn exclusive_rename_outcome(renamed: bool) -> io::Result<bool> {
 /// admission. Every original absolute ancestor is opened without delete/write
 /// sharing and without following reparse points before path-based calls.
 #[cfg(windows)]
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct WindowsDirectory {
-    ancestors: Vec<File>,
+    ancestors: Vec<std::sync::Arc<File>>,
     directory: std::path::PathBuf,
 }
 
@@ -487,7 +487,6 @@ impl WindowsDirectory {
     }
 
     fn open_inner(path: &Path, create: bool, acl_target: bool) -> io::Result<Self> {
-        use std::os::windows::fs::OpenOptionsExt;
         if !path.is_absolute() {
             return Err(invalid_path());
         }
@@ -502,18 +501,7 @@ impl WindowsDirectory {
             if matches!(component, Component::Prefix(_)) {
                 continue;
             }
-            let open = || {
-                let mut options = std::fs::OpenOptions::new();
-                options.read(true).share_mode(1).custom_flags(0x0220_0000);
-                if acl_target && index + 1 == count {
-                    // SetSecurityInfo must not recursively follow/modify
-                    // descendants: SDK-documented MAXIMUM_ALLOWED disables
-                    // propagation. Each child is fenced/granted explicitly.
-                    options
-                        .access_mode(windows_sys::Win32::System::SystemServices::MAXIMUM_ALLOWED);
-                }
-                options.open(&directory)
-            };
+            let open = || Self::open_component(&directory, acl_target && index + 1 == count);
             let file = match open() {
                 Err(error) if create && error.kind() == io::ErrorKind::NotFound => {
                     match std::fs::create_dir(&directory) {
@@ -525,12 +513,47 @@ impl WindowsDirectory {
                 }
                 result => result?,
             };
-            let metadata = file.metadata()?;
-            if !metadata.is_dir() || crate::plugins::metadata_is_link_or_reparse(&metadata) {
-                return Err(invalid_path());
-            }
             ancestors.push(file);
         }
+        Ok(Self {
+            ancestors,
+            directory,
+        })
+    }
+
+    fn open_component(path: &Path, acl_target: bool) -> io::Result<std::sync::Arc<File>> {
+        use std::os::windows::fs::OpenOptionsExt;
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).share_mode(1).custom_flags(0x0220_0000);
+        if acl_target {
+            // SetSecurityInfo must not recursively follow/modify descendants:
+            // SDK-documented MAXIMUM_ALLOWED disables propagation. Each child
+            // is fenced/granted explicitly, without reopening pinned ancestors.
+            options.access_mode(windows_sys::Win32::System::SystemServices::MAXIMUM_ALLOWED);
+        }
+        let file = options.open(path)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_dir() || crate::plugins::metadata_is_link_or_reparse(&metadata) {
+            return Err(invalid_path());
+        }
+        Ok(std::sync::Arc::new(file))
+    }
+
+    pub(crate) fn child_path(&self, name: &std::ffi::OsStr) -> io::Result<std::path::PathBuf> {
+        let name = Path::new(name);
+        if !path_is_confined(name) || name.components().count() != 1 {
+            return Err(invalid_path());
+        }
+        Ok(self.directory.join(name))
+    }
+
+    /// Extend the actual held direct-parent chain. Reopening a MAXIMUM_ALLOWED
+    /// ancestor would conflict with its deliberate no-write/no-delete sharing.
+    pub(crate) fn open_acl_child(&self, name: &std::ffi::OsStr) -> io::Result<Self> {
+        let directory = self.child_path(name)?;
+        let file = Self::open_component(&directory, true)?;
+        let mut ancestors = self.ancestors.clone();
+        ancestors.push(file);
         Ok(Self {
             ancestors,
             directory,
@@ -542,7 +565,10 @@ impl WindowsDirectory {
     }
 
     pub(crate) fn acl_handle(&self) -> io::Result<&File> {
-        self.ancestors.last().ok_or_else(invalid_path)
+        self.ancestors
+            .last()
+            .map(std::sync::Arc::as_ref)
+            .ok_or_else(invalid_path)
     }
 }
 
@@ -551,7 +577,7 @@ impl WindowsDirectory {
 pub(crate) struct WorkspaceFile {
     // Retaining every ancestor without delete/write sharing prevents a path
     // swap or junction replacement while path-based Windows calls are running.
-    _ancestors: Vec<File>,
+    _ancestors: Vec<std::sync::Arc<File>>,
     directory: std::path::PathBuf,
     filename: std::ffi::OsString,
 }
@@ -596,11 +622,7 @@ impl WorkspaceFile {
             return Err(invalid_path());
         }
         Ok(Self {
-            _ancestors: self
-                ._ancestors
-                .iter()
-                .map(File::try_clone)
-                .collect::<io::Result<_>>()?,
+            _ancestors: self._ancestors.clone(),
             directory: self.directory.clone(),
             filename: name.into(),
         })

@@ -6126,7 +6126,12 @@ mod tests {
         )
         .await
         .expect("capabilities dispatch");
-        assert_eq!(caps.result["transport"], json!("unix-socket"));
+        let expected_transport = if cfg!(windows) {
+            "named-pipe"
+        } else {
+            "unix-socket"
+        };
+        assert_eq!(caps.result["transport"], json!(expected_transport));
         let methods: Vec<String> = caps.result["methods"]
             .as_array()
             .expect("methods array")

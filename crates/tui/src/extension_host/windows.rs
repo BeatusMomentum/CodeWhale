@@ -222,6 +222,7 @@ impl Drop for RetiredProfile {
 }
 
 fn retire_scope(root: &Path, scope: &GrantScope, sid: PSID) -> io::Result<()> {
+    let _serial = ACL_EDITS.lock().unwrap_or_else(|error| error.into_inner());
     if !root.try_exists()? {
         return Ok(());
     }
@@ -255,9 +256,9 @@ fn retire_scope(root: &Path, scope: &GrantScope, sid: PSID) -> io::Result<()> {
     }
     let mut pending = Vec::new();
     let mut count = 1;
-    enqueue_children(root, &mut pending, count)?;
+    enqueue_pinned_children(root, &root_pin, &mut pending, count)?;
     let mut failure = None;
-    while let Some(path) = pending.pop() {
+    while let Some((path, parent_pin)) = pending.pop() {
         count += 1;
         if count > MAX_GRANT_ENTRIES {
             return Err(io::Error::other(
@@ -272,14 +273,20 @@ fn retire_scope(root: &Path, scope: &GrantScope, sid: PSID) -> io::Result<()> {
                 ));
             }
             if metadata.is_dir() {
-                let directory = WindowsDirectory::open_acl(&path)?;
-                edit_acl(directory.acl_handle()?, sid, 0, 0, REVOKE_ACCESS)?;
-                enqueue_children(&path, &mut pending, count)
-            } else if metadata.is_file() {
-                let _ancestors = WindowsDirectory::open(
-                    path.parent()
-                        .ok_or_else(|| io::Error::other("grant has no parent"))?,
+                let directory = parent_pin.open_acl_child(
+                    path.file_name()
+                        .ok_or_else(|| io::Error::other("grant has no filename"))?,
                 )?;
+                edit_acl(directory.acl_handle()?, sid, 0, 0, REVOKE_ACCESS)?;
+                enqueue_pinned_children(&path, &directory, &mut pending, count)
+            } else if metadata.is_file() {
+                if parent_pin.child_path(
+                    path.file_name()
+                        .ok_or_else(|| io::Error::other("grant has no filename"))?,
+                )? != path
+                {
+                    return Err(io::Error::other("grant left its pinned parent"));
+                }
                 // Retiring this exact SID may overlap a new host's data
                 // writes. The physical handle stays pinned, but allow those
                 // legitimate writers/renames; never restore an old whole ACL.
@@ -314,6 +321,19 @@ fn enqueue_children(path: &Path, pending: &mut Vec<PathBuf>, visited: usize) -> 
         }
         pending.push(entry?.path());
     }
+    Ok(())
+}
+fn enqueue_pinned_children(
+    path: &Path,
+    pin: &WindowsDirectory,
+    pending: &mut Vec<(PathBuf, WindowsDirectory)>,
+    visited: usize,
+) -> io::Result<()> {
+    let mut children = Vec::new();
+    // Reuse the exact admission/retirement bound, including already pending
+    // entries. Each child keeps its actual direct parent pinned until visited.
+    enqueue_children(path, &mut children, visited + pending.len())?;
+    pending.extend(children.into_iter().map(|child| (child, pin.clone())));
     Ok(())
 }
 fn acl_file(path: &Path) -> io::Result<File> {
@@ -405,6 +425,7 @@ impl NativeSandbox {
     }
 
     fn grant_tree(&self, root: &Path, writable: bool) -> io::Result<()> {
+        let _serial = ACL_EDITS.lock().unwrap_or_else(|error| error.into_inner());
         let root_pin = WindowsDirectory::open_acl(root)?;
         self.profile.remember(root, root_pin.acl_handle()?, true)?;
         let access = FILE_GENERIC_READ
@@ -414,9 +435,16 @@ impl NativeSandbox {
             } else {
                 0
             };
-        let mut pending = vec![root.to_path_buf()];
-        let mut count = 0;
-        while let Some(path) = pending.pop() {
+        set_acl(
+            root_pin.acl_handle()?,
+            self.profile.sid,
+            access,
+            OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE,
+        )?;
+        let mut pending = Vec::new();
+        let mut count = 1;
+        enqueue_pinned_children(root, &root_pin, &mut pending, count)?;
+        while let Some((path, parent_pin)) = pending.pop() {
             count += 1;
             if count > MAX_GRANT_ENTRIES {
                 return Err(io::Error::other("sandbox grant tree exceeds 65536 entries"));
@@ -428,16 +456,19 @@ impl NativeSandbox {
                 ));
             }
             if metadata.is_dir() {
-                let pin = WindowsDirectory::open_acl(&path)?;
+                let pin = parent_pin.open_acl_child(
+                    path.file_name()
+                        .ok_or_else(|| io::Error::other("grant has no filename"))?,
+                )?;
                 set_acl(
                     pin.acl_handle()?,
                     self.profile.sid,
                     access,
                     OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE,
                 )?;
-                enqueue_children(&path, &mut pending, count)?;
+                enqueue_pinned_children(&path, &pin, &mut pending, count)?;
             } else if metadata.is_file() {
-                self.grant_file(&path, access, false)?;
+                self.grant_pinned_file(&parent_pin, &path, access, false)?;
             } else {
                 return Err(io::Error::other(
                     "sandbox grant refuses a non-regular entry",
@@ -448,10 +479,30 @@ impl NativeSandbox {
     }
 
     fn grant_file(&self, path: &Path, access: u32, remember: bool) -> io::Result<()> {
-        let _pin = WindowsDirectory::open(
+        let _serial = ACL_EDITS.lock().unwrap_or_else(|error| error.into_inner());
+        let pin = WindowsDirectory::open(
             path.parent()
                 .ok_or_else(|| io::Error::other("file has no parent"))?,
         )?;
+        self.grant_pinned_file(&pin, path, access, remember)
+    }
+
+    // The owning grant entrypoint holds ACL_EDITS. Tree files reuse the parent
+    // chain rather than reopen MAXIMUM_ALLOWED directory objects.
+    fn grant_pinned_file(
+        &self,
+        parent_pin: &WindowsDirectory,
+        path: &Path,
+        access: u32,
+        remember: bool,
+    ) -> io::Result<()> {
+        if parent_pin.child_path(
+            path.file_name()
+                .ok_or_else(|| io::Error::other("file has no filename"))?,
+        )? != path
+        {
+            return Err(io::Error::other("grant left its pinned parent"));
+        }
         let file = acl_file(path)?;
         if remember {
             self.profile.remember(path, &file, false)?;
@@ -822,7 +873,8 @@ fn edit_acl(
     inheritance: u32,
     mode: windows_sys::Win32::Security::Authorization::ACCESS_MODE,
 ) -> io::Result<()> {
-    let _serial = ACL_EDITS.lock().unwrap_or_else(|error| error.into_inner());
+    // The owning grant/retirement entrypoint holds ACL_EDITS while opening
+    // and editing its exact objects, including all shared pinned ancestors.
     let mut old_acl: *mut ACL = null_mut();
     let mut descriptor = null_mut();
     let result = unsafe {

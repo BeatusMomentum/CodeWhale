@@ -11055,7 +11055,7 @@ verbosity = "concise"
         );
         assert!(
             get.starts_with("xai: configured (source: Codewhale-owned OAuth generation"),
-            "{get}"
+            "owned OAuth must be reported as a configured generation"
         );
         assert!(
             !get.starts_with("xai: set"),
@@ -11071,8 +11071,7 @@ verbosity = "concise"
         // The assertion messages deliberately do not interpolate `get`: it is
         // built from fixed source labels only, but it flows from the runtime
         // API-key resolver, so CodeQL's cleartext-logging query treats a
-        // formatted copy as a credential sink. The two asserts above already
-        // print the line on failure.
+        // formatted copy as a credential sink.
         assert!(
             get.contains("token availability unprobed"),
             "the xAI get line must say only token availability is unprobed"
