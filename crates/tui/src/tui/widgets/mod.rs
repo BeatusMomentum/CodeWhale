@@ -272,6 +272,8 @@ impl ChatWidget {
             app.viewport.last_transcript_total = 0;
             app.viewport.last_transcript_padding_top = 0;
             app.viewport.jump_to_latest_button_area = None;
+            app.viewport.pinned_prompt_area = None;
+            app.viewport.pinned_prompt_line = None;
             return Self {
                 content_area,
                 transcript_area: content_area,
@@ -645,6 +647,20 @@ impl ChatWidget {
         // (Underwater, Shoreline): the cell's text sat on the terminal's own
         // background, and CJK trailing columns left black remnants when the
         // cell scrolled (#6704). The footer's `Alt+V:details` hint names it.
+        //
+        // The pinned header is clickable: a click jumps the viewport to the
+        // user message it describes. Record the hit box and target line in
+        // the same frame that paints the header, so the coordinates the
+        // mouse handler tests are the coordinates the user saw.
+        app.viewport.pinned_prompt_area = (pinned_prompt.is_some() && app.use_mouse_capture)
+            .then_some(Rect {
+                x: content_area.x,
+                y: content_area.y,
+                width: content_area.width,
+                height: 1,
+            });
+        app.viewport.pinned_prompt_line = pinned_prompt.as_ref().map(|(_, line)| *line);
+
         apply_selection(&mut lines, top, app);
 
         if let Some((pin, _)) = pinned_prompt {
@@ -8328,6 +8344,53 @@ mod tests {
             Some(expected_cell),
             "click, drag, selection, and right-click must share the actual body geometry"
         );
+    }
+
+    /// The pinned header records its own hit box and jump target on the frame
+    /// that paints it, so a click can return to the message it names.
+    #[test]
+    fn pinned_prompt_records_its_click_target_on_the_header_row() {
+        let mut app = create_test_app();
+        app.pin_last_prompt = true;
+        app.use_mouse_capture = true;
+        app.add_message(HistoryCell::User {
+            content: "keep this goal visible".into(),
+        });
+        for index in 0..8 {
+            app.add_message(HistoryCell::Assistant {
+                content: format!("answer {index}"),
+                streaming: false,
+            });
+        }
+
+        let area = Rect::new(2, 5, 48, 5);
+        let widget = ChatWidget::new_with_ocean_elapsed(&mut app, area, 0);
+
+        assert_eq!(
+            widget.transcript_area,
+            Rect::new(2, 6, 48, 4),
+            "the header takes the first content row"
+        );
+        assert_eq!(
+            app.viewport.pinned_prompt_area,
+            Some(Rect {
+                x: 2,
+                y: 5,
+                width: 48,
+                height: 1,
+            }),
+            "the hit box must cover the painted header row"
+        );
+        assert_eq!(
+            app.viewport.pinned_prompt_line,
+            Some(0),
+            "the header must jump to the user message's first rendered line"
+        );
+
+        // Without mouse capture the header stays decorative: no hit box.
+        app.use_mouse_capture = false;
+        let _ = ChatWidget::new_with_ocean_elapsed(&mut app, area, 0);
+        assert!(app.viewport.pinned_prompt_area.is_none());
     }
 
     #[test]
