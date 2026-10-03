@@ -4885,18 +4885,29 @@ fn jump_to_latest_button_click_scrolls_to_tail() {
 }
 
 /// Clicking the pinned prompt header returns the viewport to the user
-/// message the header names.
+/// message the header names, resolved against the current layout.
 #[test]
 fn pinned_prompt_click_jumps_to_the_message_it_names() {
     let mut app = create_test_app();
-    app.viewport.transcript_scroll = TranscriptScroll::at_line(0);
+    app.history = vec![HistoryCell::User {
+        content: "jump target".to_string(),
+    }];
+    app.resync_history_revisions();
+    app.viewport.transcript_cache.ensure(
+        &app.history,
+        &app.history_revisions,
+        80,
+        app.transcript_render_options(),
+    );
+    app.collapsed_cell_map = vec![0];
+    app.viewport.transcript_scroll = TranscriptScroll::at_line(5);
     app.viewport.pinned_prompt_area = Some(Rect {
         x: 4,
         y: 3,
         width: 40,
         height: 1,
     });
-    app.viewport.pinned_prompt_line = Some(12);
+    app.viewport.pinned_prompt_message = Some(0);
 
     let events = handle_mouse_event(
         &mut app,
@@ -4911,8 +4922,8 @@ fn pinned_prompt_click_jumps_to_the_message_it_names() {
     assert!(events.is_empty());
     assert_eq!(
         app.viewport.transcript_scroll,
-        TranscriptScroll::at_line(12),
-        "the click must pin the viewport to the message's first line"
+        TranscriptScroll::at_line(0),
+        "the click must pin the viewport to the resolved message's first line"
     );
     assert_eq!(app.viewport.pending_scroll_delta, 0);
     assert!(app.user_scrolled_during_stream);
@@ -4930,7 +4941,7 @@ fn pinned_prompt_click_only_claims_the_header_row() {
         width: 40,
         height: 1,
     });
-    app.viewport.pinned_prompt_line = Some(12);
+    app.viewport.pinned_prompt_message = Some(12);
 
     handle_mouse_event(
         &mut app,

@@ -1745,6 +1745,13 @@ pub(crate) fn render(f: &mut Frame, app: &mut App, _config: &Config) -> Option<(
                 shell_ocean = chat_widget.ocean_column();
             }
             app.viewport.pending_scroll_delta = parked_scroll_delta;
+            // The sampling constructor above records the pinned prompt header's
+            // hit box from the main session's transcript, but the focus pane
+            // never paints that header — its first row is the agent banner.
+            // Drop the stale box so the banner cannot answer a click meant for
+            // the (hidden) main transcript.
+            app.viewport.pinned_prompt_area = None;
+            app.viewport.pinned_prompt_message = None;
             crate::tui::agent_focus::refresh_focus(app);
             let buf = f.buffer_mut();
             crate::tui::agent_focus::render_focus(app, chat_area, buf);
