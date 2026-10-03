@@ -884,11 +884,18 @@ fn scrolled_user_prompt_pin(
             .get(*cell_index)
             .copied()
             .unwrap_or(*cell_index);
-        matches!(
-            history.get(original),
-            Some(HistoryCell::User { content }) if !content.trim().is_empty()
-        )
-        .then_some(original)
+        // Only a prompt with renderable first-line text can head the pin. A
+        // message that opens on a blank line is skipped here, not rejected
+        // later, so the scan keeps walking to an older message that can head
+        // the header instead of dropping out (review follow-up).
+        let content = match history.get(original) {
+            Some(HistoryCell::User { content }) => content,
+            _ => return None,
+        };
+        if content.lines().next().unwrap_or("").trim().is_empty() {
+            return None;
+        }
+        Some(original)
     };
     // Newest user message whose start sits above the viewport's top row,
     // scanned newest-first so a long prompt that began several screens up
@@ -8214,6 +8221,73 @@ mod tests {
         let (pin, line) = super::scrolled_user_prompt_pin(&history, &meta, &map, 1, 40)
             .expect("a turn above the viewport must keep a pinned header");
         assert!(pin_text(&pin).contains("first prompt"));
+        assert_eq!(line, 0);
+    }
+
+    /// The scan keys off a message's *first* rendered line and the filtered→
+    /// original cell mapping: a later line of a multi-line prompt must not
+    /// stand in for the message start, and filtered indices must resolve to
+    /// the original cell.
+    #[test]
+    fn pin_helper_uses_first_rendered_line_and_resolves_filtered_cells() {
+        let history = vec![
+            HistoryCell::Assistant {
+                content: "collapsed away".into(),
+                streaming: false,
+            },
+            HistoryCell::User {
+                content: "wrapped prompt line one\nline two".into(),
+            },
+            HistoryCell::Assistant {
+                content: "c1".into(),
+                streaming: false,
+            },
+            HistoryCell::Assistant {
+                content: "c2".into(),
+                streaming: false,
+            },
+        ];
+        // Original cell 0 is collapsed away, so the rendered (filtered) index
+        // 0 maps back to original 1 — the user message — across its two
+        // lines.
+        let meta = pin_meta(&[(0, 0), (0, 1), (1, 0), (2, 0)]);
+        let map = vec![1, 2, 3];
+        let (pin, line) = super::scrolled_user_prompt_pin(&history, &meta, &map, 3, 40)
+            .expect("multi-line prompt pins at its first rendered line");
+        assert!(pin_text(&pin).contains("wrapped prompt line one"));
+        assert!(
+            !pin_text(&pin).contains("line two"),
+            "the pin must show the first line, not a body line"
+        );
+        assert_eq!(line, 0, "the jump target is the message's first line");
+    }
+
+    /// A prompt whose first line is blank cannot head the header, and it must
+    /// not suppress an older message that can: the header keeps handing over
+    /// instead of dropping out (SpikeBot 003 review follow-up).
+    #[test]
+    fn pin_helper_skips_blank_first_line_prompts_and_keeps_handing_over() {
+        let history = vec![
+            HistoryCell::User {
+                content: "older prompt".into(),
+            },
+            HistoryCell::Assistant {
+                content: "a1".into(),
+                streaming: false,
+            },
+            HistoryCell::User {
+                content: "\nblank first line".into(),
+            },
+            HistoryCell::Assistant {
+                content: "b1".into(),
+                streaming: false,
+            },
+        ];
+        let meta = pin_meta(&[(0, 0), (1, 0), (2, 0), (3, 0)]);
+        let map: Vec<usize> = (0..4).collect();
+        let (pin, line) = super::scrolled_user_prompt_pin(&history, &meta, &map, 4, 40)
+            .expect("a blank-led prompt must not blank out the header");
+        assert!(pin_text(&pin).contains("older prompt"));
         assert_eq!(line, 0);
     }
 
