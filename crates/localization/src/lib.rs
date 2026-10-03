@@ -5545,6 +5545,38 @@ mod tests {
         }
     }
 
+    #[test]
+    fn context_inspector_and_command_hints_are_explicitly_localized() {
+        let ids = [
+            MessageId::CtxInspRowCompaction,
+            MessageId::CtxInspRowAnchors,
+            MessageId::CtxInspCompactionNever,
+            MessageId::CtxInspCompactionDetail,
+            MessageId::CtxInspCompactionRestored,
+            MessageId::CtxInspCompactionPathSummary,
+            MessageId::CtxInspCompactionPathPrune,
+            MessageId::CtxInspCompactionAssistantKept,
+            MessageId::CtxInspAnchorsNone,
+            MessageId::CtxInspAnchorsPresent,
+            MessageId::KbReasoningDetail,
+            MessageId::CmdTurnInspectDescription,
+            MessageId::CmdAdvisorDescription,
+        ];
+        for locale in Locale::shipped_complete() {
+            if *locale == Locale::En {
+                continue;
+            }
+            for id in ids {
+                assert_ne!(
+                    tr(*locale, id),
+                    tr(Locale::En, id),
+                    "{} ships the English text for {id:?}",
+                    locale.tag()
+                );
+            }
+        }
+    }
+
     fn raw_locale_messages(locale: Locale) -> serde_json::Map<String, serde_json::Value> {
         serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(locale_json_source(
             locale,
