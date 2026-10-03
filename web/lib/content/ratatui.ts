@@ -79,6 +79,25 @@ export interface RatatuiCopy {
   componentNavLabel: string;
   websiteNote: string;
   reducedMotionNote: string;
+  tasksTitle: string;
+  tasksDescription: string;
+  use: string;
+  guide: string;
+  runExample: string;
+  relatedMotion: string;
+  recipeNote: string;
+  recipeControls: string;
+  firstAppTitle: string;
+  firstAppDescription: string;
+  existingApp: string;
+  themeNote: string;
+  starterSource: string;
+  stateTitle: string;
+  stateDescription: string;
+  paintTitle: string;
+  paintDescription: string;
+  actionsTitle: string;
+  actionsDescription: string;
 }
 
 export const RATATUI_COPY: Record<keyof RatatuiCopy, LocalizedText> = {
@@ -98,7 +117,7 @@ export const RATATUI_COPY: Record<keyof RatatuiCopy, LocalizedText> = {
   families: { en: "Collections", zh: "组件集" },
   componentCount: { en: "{count} previews", zh: "{count} 个预览" },
   preview: { en: "Preview", zh: "预览" },
-  code: { en: "Rust source", zh: "Rust 源码" },
+  code: { en: "Gallery source", zh: "展示源码" },
   api: { en: "Components used", zh: "使用的组件" },
   source: { en: "Source", zh: "源码" },
   profile: { en: "Terminal profile", zh: "终端配置" },
@@ -128,14 +147,14 @@ export const RATATUI_COPY: Record<keyof RatatuiCopy, LocalizedText> = {
     zh: "使用单个组件，或组合成完整工作区。你的应用管理状态、时钟与操作；组件库负责渲染界面。",
   },
   installationTitle: { en: "Start building", zh: "开始构建" },
-  installationDescription: { en: "Add the library to your Cargo.toml. Your app chooses the terminal backend.", zh: "将组件库添加到 Cargo.toml。终端后端由你的应用选择。" },
+  installationDescription: { en: "Add the library to your Cargo.toml. Use your existing backend, or enable Crossterm for a new app.", zh: "将组件库添加到 Cargo.toml。可使用现有终端后端，或为新应用启用 Crossterm。" },
   tryLocally: { en: "Try the interactive gallery", zh: "试用交互式展示" },
   repository: { en: "GitHub repository", zh: "GitHub 仓库" },
   viewGuide: { en: "Terminal view guide", zh: "终端视图指南" },
   quality: { en: "Quality and compatibility", zh: "质量与兼容性" },
   releaseHistory: { en: "Release history", zh: "发布历史" },
   checks: { en: "Latest checks", zh: "最新检查" },
-  fixtureNote: { en: "This is the exact gallery source, with example state and helper calls. Open the source file for the full recipe.", zh: "这是展示中实际使用的源码，包含示例状态和辅助函数调用。请打开源文件查看完整示例。" },
+  fixtureNote: { en: "This source reproduces the gallery preview, including its example data and internal helpers. For public API code you can reuse, choose Use in your app.", zh: "此源码用于重现展示预览，包含示例数据和内部辅助函数。如需复用公开 API 代码，请选择“用于你的应用”。" },
   motionNote: { en: "Animation uses rendered frames. Your app supplies the clock.", zh: "动画使用实际渲染的帧。时钟由你的应用提供。" },
   rustVersion: { en: "Rust 1.89+", zh: "Rust 1.89+" },
   license: { en: "MIT license", zh: "MIT 许可证" },
@@ -170,6 +189,25 @@ export const RATATUI_COPY: Record<keyof RatatuiCopy, LocalizedText> = {
   componentNavLabel: { en: "Ratatui component collections", zh: "Ratatui 组件集" },
   websiteNote: { en: "Part of Codewhale. Built for your Ratatui app.", zh: "来自 Codewhale，用于你的 Ratatui 应用。" },
   reducedMotionNote: { en: "Playback is paused for reduced motion. You can step through the frames or choose Play.", zh: "已按减少动态效果的偏好暂停播放。你可以逐帧查看或选择播放。" },
+  tasksTitle: { en: "What are you building?", zh: "你想构建什么？" },
+  tasksDescription: { en: "Choose a starting point, or browse every component below.", zh: "选择一个起点，或浏览下方的全部组件。" },
+  use: { en: "Use in your app", zh: "用于你的应用" },
+  guide: { en: "Read the getting-started guide", zh: "阅读入门指南" },
+  runExample: { en: "Run from the cloned library", zh: "在克隆的组件库中运行" },
+  relatedMotion: { en: "Related animation demo", zh: "相关动画示例" },
+  recipeNote: { en: "A public API starting point from the runnable recipes example. Pass your app’s theme and state; adapt the data and layout to your app.", zh: "这是可运行示例中的公开 API 起点。传入应用的主题与状态，并按需调整数据和布局。" },
+  recipeControls: { en: "F1 composer · F2 workbar · F3 water · F4 whale · F5 animated whale. Press m in F5 to compare motion policies; Esc closes.", zh: "F1 输入框 · F2 工作栏 · F3 海洋背景 · F4 鲸鱼 · F5 动态鲸鱼。在 F5 中按 m 比较动画策略；Esc 退出。" },
+  firstAppTitle: { en: "Start with a working app", zh: "从可运行的应用开始" },
+  firstAppDescription: { en: "Type a message, press Enter to echo it, and Esc to exit. The starter connects editable input, the native composer and workbar in one small app.", zh: "输入消息，按 Enter 显示消息，按 Esc 退出。入门示例在一个小应用中连接可编辑输入、原生输入框与工作栏。" },
+  existingApp: { en: "Add to an existing Ratatui app", zh: "添加到现有 Ratatui 应用" },
+  themeNote: { en: "Detect the theme once when your app starts, then pass it to your draw function. Theme::detect().tui() selects the native terminal palette.", zh: "启动时检测一次主题，再传入绘制函数。Theme::detect().tui() 会选择原生终端配色。" },
+  starterSource: { en: "See the complete starter", zh: "查看完整入门示例" },
+  stateTitle: { en: "Keep the state", zh: "保存状态" },
+  stateDescription: { en: "Your app stores drafts, selection, work and a persistent whale Stage.", zh: "应用保存草稿、选中项、工作数据及持续使用的鲸鱼 Stage。" },
+  paintTitle: { en: "Render the view", zh: "渲染视图" },
+  paintDescription: { en: "Components paint the facts you supply into your Ratatui frame.", zh: "组件将你提供的数据绘制到 Ratatui 帧中。" },
+  actionsTitle: { en: "Handle the action", zh: "处理操作" },
+  actionsDescription: { en: "Route input outcomes to your app. Supply elapsed time when motion needs a redraw.", zh: "将输入结果交给应用处理；动画需要重绘时，提供经过的时间。" },
 };
 
 /** Use the site's deterministic locale selection rather than page-local copy forks. */

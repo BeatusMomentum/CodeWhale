@@ -1,4 +1,5 @@
 import catalogue from "@/public/ratatui/catalogue.json";
+import { discoveryText, normalizeSearch } from "./learning";
 
 export interface CatalogueEntry {
   name: string;
@@ -26,7 +27,7 @@ export interface EntryPreview {
   width: number;
   height: number;
   previews: Record<string, Record<string, string>>;
-  fixture: { code: string; imports: string; source: unknown };
+  fixture: { code: string; imports: string; helpers?: { name: string; code: string; line: number }[]; source: unknown };
 }
 
 /** Bundled at build time: no filesystem or remote repository dependency in the Worker. */
@@ -35,10 +36,10 @@ export function readCatalogue(): Catalogue {
 }
 
 export function searchEntries(entries: readonly CatalogueEntry[], query: string, family = "all") {
-  const terms = query.trim().toLocaleLowerCase().split(/\s+/).filter(Boolean);
+  const terms = normalizeSearch(query).split(/\s+/).filter(Boolean);
   return entries.filter((entry) => {
     if (family !== "all" && entry.family !== family) return false;
-    const text = [entry.name, entry.title, entry.description, ...entry.api].join(" ").toLocaleLowerCase();
+    const text = normalizeSearch([entry.name, entry.title, ...entry.api, discoveryText(entry)].join(" "));
     return terms.every((term) => text.includes(term));
   });
 }
