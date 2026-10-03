@@ -3960,6 +3960,37 @@ mod tests {
         config
     }
 
+    async fn wait_for_idle_store(managers: &[&TaskManager]) -> Result<()> {
+        let loads = || {
+            managers
+                .iter()
+                .map(|manager| manager.store_loads.load(Ordering::Relaxed))
+                .sum::<usize>()
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut last_loads = loads();
+        let mut quiet_since = Instant::now();
+        // Each worker schedules its retry after its initial claim completes.
+        // Slow startup can outlast a fixed sleep measured from manager creation.
+        // Require a quiet period longer than the retry plus the polling tick;
+        // continuous fallback reloads must time out, not count as settled.
+        let quiet_window = STORE_IDLE_POLL_INTERVAL + STORE_REFRESH_INTERVAL * 2;
+        loop {
+            sleep(STORE_REFRESH_INTERVAL).await;
+            let current_loads = loads();
+            if current_loads != last_loads {
+                last_loads = current_loads;
+                quiet_since = Instant::now();
+            }
+            if Instant::now() >= deadline {
+                bail!("idle store never settled: {current_loads} loads in 10s");
+            }
+            if quiet_since.elapsed() >= quiet_window {
+                return Ok(());
+            }
+        }
+    }
+
     /// #6573: idle managers sharing one data dir must not reload the store
     /// (and take its cross-process lock) every 200ms per worker.
     #[tokio::test]
@@ -3975,7 +4006,7 @@ mod tests {
         let second =
             TaskManager::start_with_executor_in_scope(config(), Arc::new(MockExecutor), "second")
                 .await?;
-        sleep(STORE_IDLE_POLL_INTERVAL + Duration::from_millis(300)).await;
+        wait_for_idle_store(&[&first, &second]).await?;
         for manager in [&first, &second] {
             manager.store_loads.store(0, Ordering::Relaxed);
         }
@@ -4110,7 +4141,7 @@ mod tests {
             "idle",
         )
         .await?;
-        sleep(STORE_IDLE_POLL_INTERVAL + Duration::from_millis(300)).await;
+        wait_for_idle_store(&[&idle]).await?;
         idle.store_loads.store(0, Ordering::Relaxed);
         let record = root.path().join("tasks").join(format!("{}.json", task.id));
         let flushed_before = fs::metadata(&record)?.modified()?;
