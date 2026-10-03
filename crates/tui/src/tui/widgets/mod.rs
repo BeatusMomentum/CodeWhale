@@ -647,7 +647,7 @@ impl ChatWidget {
         // cell scrolled (#6704). The footer's `Alt+V:details` hint names it.
         apply_selection(&mut lines, top, app);
 
-        if let Some(pin) = pinned_prompt {
+        if let Some((pin, _)) = pinned_prompt {
             lines.insert(0, pin);
             line_links.insert(0, Vec::new());
         }
@@ -830,50 +830,65 @@ pub(crate) fn active_entry_revision(active_rev: u64, salt: u64) -> u64 {
     revision_in_domain(mixed, true)
 }
 
-/// Build the last-user-prompt header when that message is above the resolved
-/// transcript viewport. The caller owns the one-row layout reservation so
-/// the header never masquerades as `top` or displaces the newest tail line.
+/// Build the pinned user-prompt header for the content at the top of the
+/// resolved transcript viewport.
+///
+/// The header belongs to whichever user message owns the content the
+/// viewport starts on: the newest user message whose first rendered line
+/// sits above `top`. The instant a newer prompt's first line reaches the top
+/// viewport row — scrolling up, or the tail sitting short — the header hands
+/// over to the previous turn's prompt, so it never blinks out while the user
+/// scrolls across a turn boundary. The returned line index lets a click on
+/// the header jump the viewport back to that message, and the caller owns
+/// the one-row layout reservation so the header never masquerades as `top`
+/// or displaces the newest tail line.
 fn scrolled_user_prompt_pin(
     history: &[HistoryCell],
     line_meta: &[TranscriptLineMeta],
     collapsed_cell_map: &[usize],
     top: usize,
     width: u16,
-) -> Option<Line<'static>> {
-    if width == 0 {
+) -> Option<(Line<'static>, usize)> {
+    if width == 0 || top == 0 {
         return None;
     }
-    let (orig_idx, content) =
-        history
-            .iter()
-            .enumerate()
-            .rev()
-            .find_map(|(idx, cell)| match cell {
-                HistoryCell::User { content } if !content.trim().is_empty() => {
-                    Some((idx, content.as_str()))
-                }
-                _ => None,
-            })?;
-    // The newest prompt sits near the tail, so search backward; a forward
-    // scan cost O(transcript) on every frame of a long session (#6652).
-    let first_line = line_meta.iter().rposition(|meta| match meta {
-        TranscriptLineMeta::CellLine {
+    // First rendered line of a non-blank user cell, as an original history
+    // index. Only `line_in_cell == 0` matches: later lines of a long prompt
+    // are its body, not the message start.
+    let user_first_line = |meta: &TranscriptLineMeta| -> Option<usize> {
+        let TranscriptLineMeta::CellLine {
             cell_index,
-            line_in_cell,
+            line_in_cell: 0,
             ..
-        } => {
-            let original = collapsed_cell_map
-                .get(*cell_index)
-                .copied()
-                .unwrap_or(*cell_index);
-            original == orig_idx && *line_in_cell == 0
-        }
-        _ => false,
-    });
-    let first_line = first_line?;
-    if first_line >= top {
-        return None;
-    }
+        } = meta
+        else {
+            return None;
+        };
+        let original = collapsed_cell_map
+            .get(*cell_index)
+            .copied()
+            .unwrap_or(*cell_index);
+        matches!(
+            history.get(original),
+            Some(HistoryCell::User { content }) if !content.trim().is_empty()
+        )
+        .then_some(original)
+    };
+    // Newest user message whose start sits above the viewport's top row,
+    // scanned newest-first so a long prompt that began several screens up
+    // still resolves to its own first line. A prompt whose first line is
+    // exactly the top row belongs to the screen, not the header, so the
+    // hand-over happens the instant it enters.
+    let (first_line, orig_idx) = line_meta
+        .iter()
+        .enumerate()
+        .take(top)
+        .rev()
+        .find_map(|(line_index, meta)| user_first_line(meta).map(|orig| (line_index, orig)))?;
+    let content = match history.get(orig_idx) {
+        Some(HistoryCell::User { content }) => content,
+        _ => return None,
+    };
 
     let first = content.lines().next().unwrap_or("").trim();
     if first.is_empty() {
@@ -894,15 +909,18 @@ fn scrolled_user_prompt_pin(
         shown.push('…');
     }
 
-    Some(Line::from(vec![
-        Span::styled(
-            format!("{} ", crate::tui::glyphs::USER),
-            Style::default()
-                .fg(palette::WHALE_HUMAN)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(shown, Style::default().fg(palette::TEXT_PRIMARY)),
-    ]))
+    Some((
+        Line::from(vec![
+            Span::styled(
+                format!("{} ", crate::tui::glyphs::USER),
+                Style::default()
+                    .fg(palette::WHALE_HUMAN)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(shown, Style::default().fg(palette::TEXT_PRIMARY)),
+        ]),
+        first_line,
+    ))
 }
 
 impl Renderable for ChatWidget {
@@ -8064,6 +8082,26 @@ mod tests {
         assert_eq!(first[(11, 14)].symbol(), second[(11, 14)].symbol());
     }
 
+    /// Rendered line metadata for pin tests: `(cell_index, line_in_cell)`.
+    fn pin_meta(entries: &[(usize, usize)]) -> Vec<TranscriptLineMeta> {
+        entries
+            .iter()
+            .map(|(cell_index, line_in_cell)| TranscriptLineMeta::CellLine {
+                cell_index: *cell_index,
+                line_in_cell: *line_in_cell,
+                copy_prefix_width: 0,
+                copy_separator_after: crate::tui::ui_text::CopyLineSeparator::None,
+            })
+            .collect()
+    }
+
+    fn pin_text(line: &Line<'static>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
     #[test]
     fn pin_helper_returns_header_when_user_line_is_above_viewport() {
         let history = vec![
@@ -8075,27 +8113,18 @@ mod tests {
                 streaming: false,
             },
         ];
-        let meta = vec![
-            TranscriptLineMeta::CellLine {
-                cell_index: 0,
-                line_in_cell: 0,
-                copy_prefix_width: 0,
-                copy_separator_after: crate::tui::ui_text::CopyLineSeparator::None,
-            },
-            TranscriptLineMeta::CellLine {
-                cell_index: 1,
-                line_in_cell: 0,
-                copy_prefix_width: 0,
-                copy_separator_after: crate::tui::ui_text::CopyLineSeparator::None,
-            },
-        ];
+        let meta = pin_meta(&[(0, 0), (1, 0)]);
         let map = vec![0, 1];
-        let pin = super::scrolled_user_prompt_pin(&history, &meta, &map, 1, 40)
+        let (pin, line) = super::scrolled_user_prompt_pin(&history, &meta, &map, 1, 40)
             .expect("scrolled user prompt should yield a pinned header");
-        let text: String = pin.spans.iter().map(|span| span.content.as_ref()).collect();
+        let text = pin_text(&pin);
         assert!(
             text.contains("remember this prompt"),
             "expected pinned user text, got {text:?}"
+        );
+        assert_eq!(
+            line, 0,
+            "the pin must name the prompt's first rendered line"
         );
     }
 
@@ -8104,14 +8133,122 @@ mod tests {
         let history = vec![HistoryCell::User {
             content: "still on screen".into(),
         }];
-        let meta = vec![TranscriptLineMeta::CellLine {
-            cell_index: 0,
-            line_in_cell: 0,
-            copy_prefix_width: 0,
-            copy_separator_after: crate::tui::ui_text::CopyLineSeparator::None,
-        }];
+        let meta = pin_meta(&[(0, 0)]);
         let map = vec![0];
         assert!(super::scrolled_user_prompt_pin(&history, &meta, &map, 0, 40).is_none());
+    }
+
+    /// Scrolling up a turn keeps the header alive: it re-pins to the previous
+    /// turn's prompt instead of dropping out once the newest prompt leaves the
+    /// viewport.
+    #[test]
+    fn pin_helper_follows_the_viewport_up_to_the_previous_turn() {
+        let history = vec![
+            HistoryCell::User {
+                content: "first prompt".into(),
+            },
+            HistoryCell::Assistant {
+                content: "a1".into(),
+                streaming: false,
+            },
+            HistoryCell::Assistant {
+                content: "a2".into(),
+                streaming: false,
+            },
+            HistoryCell::Assistant {
+                content: "a3".into(),
+                streaming: false,
+            },
+            HistoryCell::User {
+                content: "second prompt".into(),
+            },
+            HistoryCell::Assistant {
+                content: "b1".into(),
+                streaming: false,
+            },
+            HistoryCell::Assistant {
+                content: "b2".into(),
+                streaming: false,
+            },
+            HistoryCell::Assistant {
+                content: "b3".into(),
+                streaming: false,
+            },
+        ];
+        let meta = pin_meta(&[
+            (0, 0),
+            (1, 0),
+            (2, 0),
+            (3, 0),
+            (4, 0),
+            (5, 0),
+            (6, 0),
+            (7, 0),
+        ]);
+        let map: Vec<usize> = (0..8).collect();
+
+        // Viewport over the newest replies: the newest prompt owns the top.
+        let (pin, line) = super::scrolled_user_prompt_pin(&history, &meta, &map, 5, 40)
+            .expect("newest prompt pins while its line is above the viewport");
+        assert!(pin_text(&pin).contains("second prompt"));
+        assert_eq!(line, 4);
+
+        // Viewport scrolled up past the newest prompt: the header re-pins to
+        // the previous turn instead of disappearing.
+        let (pin, line) = super::scrolled_user_prompt_pin(&history, &meta, &map, 1, 40)
+            .expect("a turn above the viewport must keep a pinned header");
+        assert!(pin_text(&pin).contains("first prompt"));
+        assert_eq!(line, 0);
+    }
+
+    /// The header hands over the instant a newer prompt's first line reaches
+    /// the viewport's top row: no window where it blinks out while the user
+    /// scrolls across a turn boundary.
+    #[test]
+    fn pin_helper_hands_over_the_instant_the_newer_prompt_enters() {
+        let history = vec![
+            HistoryCell::User {
+                content: "first prompt".into(),
+            },
+            HistoryCell::Assistant {
+                content: "a1".into(),
+                streaming: false,
+            },
+            HistoryCell::Assistant {
+                content: "a2".into(),
+                streaming: false,
+            },
+            HistoryCell::User {
+                content: "second prompt".into(),
+            },
+            HistoryCell::Assistant {
+                content: "b1".into(),
+                streaming: false,
+            },
+        ];
+        let meta = pin_meta(&[(0, 0), (1, 0), (2, 0), (3, 0), (4, 0)]);
+        let map: Vec<usize> = (0..5).collect();
+
+        // One row before the newest prompt reaches the screen: still pinned
+        // to the newest prompt (line 3 is above a viewport starting at 4).
+        let (pin, line) = super::scrolled_user_prompt_pin(&history, &meta, &map, 4, 40)
+            .expect("the newest prompt is still pinned one row above the viewport");
+        assert!(pin_text(&pin).contains("second prompt"));
+        assert_eq!(line, 3);
+
+        // The newest prompt's first line is now the top row itself: hand over
+        // to the previous turn immediately, with no gap in between.
+        let (pin, line) = super::scrolled_user_prompt_pin(&history, &meta, &map, 3, 40)
+            .expect("the header must hand over instead of blinking out");
+        assert!(pin_text(&pin).contains("first prompt"));
+        assert_eq!(line, 0);
+
+        // Scrolling further keeps the previous turn pinned while its content
+        // fills the top of the screen.
+        let (pin, line) = super::scrolled_user_prompt_pin(&history, &meta, &map, 2, 40)
+            .expect("the previous turn stays pinned");
+        assert!(pin_text(&pin).contains("first prompt"));
+        assert_eq!(line, 0);
     }
 
     #[test]
