@@ -64,10 +64,10 @@ fn run(
         .is_some_and(|part| part.eq_ignore_ascii_case("remove"))
         || !matches!(parts.len(), 2 | 4)
     {
-        return CommandResult::error(m.text(Text::PermissionsUsage));
+        return CommandResult::error(m.text(Text::Usage));
     }
     let Ok(display_index) = parts[1].parse::<usize>() else {
-        return CommandResult::error(m.text(Text::PermissionsUsage));
+        return CommandResult::error(m.text(Text::Usage));
     };
     let Some(index) = display_index.checked_sub(1) else {
         return rule_not_found(m, display_index);
@@ -86,7 +86,7 @@ fn run(
         );
         return CommandResult::message(render(
             m,
-            Text::PermissionsRemovePreview,
+            Text::RemovePreview,
             &[
                 ("{index}", &display_index.to_string()),
                 ("{rule}", &format_rule(m, display_index, rule)),
@@ -95,14 +95,14 @@ fn run(
         ));
     }
     if !parts[2].eq_ignore_ascii_case("--confirm") || parts[3].is_empty() {
-        return CommandResult::error(m.text(Text::PermissionsUsage));
+        return CommandResult::error(m.text(Text::Usage));
     }
     // Every translation contract was validated before the atomic host operation.
     match permissions.remove_rule(index, parts[3]) {
         Ok(removed) => CommandResult::with_message_and_action(
             render(
                 m,
-                Text::PermissionsRemoved,
+                Text::Removed,
                 &[
                     ("{index}", &display_index.to_string()),
                     ("{action}", action_name(removed.action)),
@@ -116,13 +116,13 @@ fn run(
 }
 fn format_snapshot(m: &Messages, view: &PermissionsView) -> String {
     let state = match view.file_state {
-        CommandPermissionsFileState::Missing => Text::PermissionsFileMissing,
-        CommandPermissionsFileState::Empty => Text::PermissionsFileEmpty,
-        CommandPermissionsFileState::Present => Text::PermissionsFilePresent,
+        CommandPermissionsFileState::Missing => Text::FileMissing,
+        CommandPermissionsFileState::Empty => Text::FileEmpty,
+        CommandPermissionsFileState::Present => Text::FilePresent,
     };
     let mut output = render(
         m,
-        Text::PermissionsListHeader,
+        Text::ListHeader,
         &[
             ("{count}", &view.rules.len().to_string()),
             ("{file_state}", &m.text(state)),
@@ -131,7 +131,7 @@ fn format_snapshot(m: &Messages, view: &PermissionsView) -> String {
     );
     if view.rules.is_empty() {
         output.push('\n');
-        output.push_str(&m.text(Text::PermissionsNoRules));
+        output.push_str(&m.text(Text::NoRules));
     } else {
         for (index, rule) in view.rules.iter().enumerate() {
             output.push_str("\n\n");
@@ -140,16 +140,12 @@ fn format_snapshot(m: &Messages, view: &PermissionsView) -> String {
     }
     output.push_str("\n\n");
     let (label, explanation) = match view.approval_mode {
-        CommandApprovalMode::Suggest => ("Ask", Text::PermissionsPostureAsk),
-        CommandApprovalMode::Auto => ("Auto-Review", Text::PermissionsPostureAuto),
-        CommandApprovalMode::Bypass => ("Full Access", Text::PermissionsPostureBypass),
-        CommandApprovalMode::Never => ("Never", Text::PermissionsPostureNever),
+        CommandApprovalMode::Suggest => ("Ask", Text::PostureAsk),
+        CommandApprovalMode::Auto => ("Auto-Review", Text::PostureAuto),
+        CommandApprovalMode::Bypass => ("Full Access", Text::PostureBypass),
+        CommandApprovalMode::Never => ("Never", Text::PostureNever),
     };
-    output.push_str(&render(
-        m,
-        Text::PermissionsPostureHeader,
-        &[("{posture}", label)],
-    ));
+    output.push_str(&render(m, Text::PostureHeader, &[("{posture}", label)]));
     output.push('\n');
     output.push_str(&m.text(explanation));
     output.push('\n');
@@ -158,37 +154,33 @@ fn format_snapshot(m: &Messages, view: &PermissionsView) -> String {
         .as_deref()
         .map(quote_os_path)
         .unwrap_or_else(|| "$CODEWHALE_HOME/audit.log".into());
-    output.push_str(&render(
-        m,
-        Text::PermissionsReceiptsNote,
-        &[("{audit_path}", &path)],
-    ));
+    output.push_str(&render(m, Text::ReceiptsNote, &[("{audit_path}", &path)]));
     output
 }
 fn format_rule(m: &Messages, display_index: usize, rule: &PermissionRule) -> String {
     let scope = rule.workspace.as_deref().map_or_else(
-        || m.text(Text::PermissionsScopeGlobal).into_owned(),
+        || m.text(Text::ScopeGlobal).into_owned(),
         |workspace| {
             render(
                 m,
-                Text::PermissionsScopeRepo,
+                Text::ScopeRepo,
                 &[("{workspace}", &escape_field(workspace))],
             )
         },
     );
     let applicability = m.text(if rule.applies_here {
-        Text::PermissionsAppliesHere
+        Text::AppliesHere
     } else {
-        Text::PermissionsInactiveHere
+        Text::InactiveHere
     });
     let mut matchers = Vec::new();
     if let Some(command) = rule.command.as_deref() {
         matchers.push(render(
             m,
             if rule.command_exact {
-                Text::PermissionsMatchExactCommand
+                Text::MatchExactCommand
             } else {
-                Text::PermissionsMatchCommandPrefix
+                Text::MatchCommandPrefix
             },
             &[("{command}", &escape_field(command))],
         ));
@@ -196,18 +188,18 @@ fn format_rule(m: &Messages, display_index: usize, rule: &PermissionRule) -> Str
     if let Some(path) = rule.path.as_deref() {
         matchers.push(render(
             m,
-            Text::PermissionsMatchExactPath,
+            Text::MatchExactPath,
             &[("{path}", &escape_field(path))],
         ));
     }
     let matcher = if matchers.is_empty() {
-        m.text(Text::PermissionsMatchAnyInvocation).into_owned()
+        m.text(Text::MatchAnyInvocation).into_owned()
     } else {
         matchers.join(" + ")
     };
     render(
         m,
-        Text::PermissionsRuleEntry,
+        Text::RuleEntry,
         &[
             ("{index}", &display_index.to_string()),
             ("{action}", action_name(rule.action)),
@@ -228,16 +220,12 @@ fn action_name(action: CommandPermissionAction) -> &'static str {
 fn rule_not_found(m: &Messages, index: usize) -> CommandResult {
     CommandResult::error(render(
         m,
-        Text::PermissionsRuleNotFound,
+        Text::RuleNotFound,
         &[("{index}", &index.to_string())],
     ))
 }
 fn operation_error(m: &Messages, error: &str) -> CommandResult {
-    CommandResult::error(render(
-        m,
-        Text::PermissionsOperationFailed,
-        &[("{error}", error)],
-    ))
+    CommandResult::error(render(m, Text::OperationFailed, &[("{error}", error)]))
 }
 
 fn escape_field(value: &str) -> String {

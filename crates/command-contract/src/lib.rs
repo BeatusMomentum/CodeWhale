@@ -22,4 +22,5 @@ pub use types::*;
 mod tests;
 
 pub mod metrics;
+pub mod money;
 pub mod tool_outputs;

@@ -381,17 +381,6 @@ fn push_row(out: &mut String, locale: &Messages, label: MessageId, value: &str) 
     let _ = writeln!(out, "  {label:<LABEL_WIDTH$} {value}");
 }
 
-/// Selected-Fleet pin drift: saved `(provider, model)` pairs that are no
-/// longer among the routes the Fleet picker can offer — the provider table
-/// was removed, or the model dropped out of the provider's roster. A pin may
-/// still serve upstream, so this reports and never rewrites. `None` when no
-/// Fleet is selected or nothing drifted.
-
-/// The session's own pinned model, read-only (#6035): when the active route
-/// has a fresh live roster that no longer lists the pinned id, say so. The pin
-/// is never rewritten — the id may still answer, and a stale or missing
-/// roster proves nothing, so it stays silent then. `None` under Auto routing.
-
 fn safety_summary(view: &ConfigStatusView, locale: &Messages) -> Cow<'static, str> {
     let id = match view.safety {
         StatusSafety::ReadOnly { enforced: false } => MessageId::StatusSafetyReadOnlyUnenforced,

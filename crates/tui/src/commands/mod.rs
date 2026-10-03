@@ -2104,6 +2104,9 @@ mod tests {
             "export",
             // FEAT-026 completes the session structural-copy slice.
             "structcopy",
+            // FEAT-027 config policy/status slice; remaining config stays legacy.
+            "permissions",
+            "status",
             // FEAT-029 complete debug group, including receipts and mutation.
             "tokens",
             "cost",

@@ -2,9 +2,8 @@
 //! Remaining config commands are host-owned until their separate adoption.
 use codewhale_command_contract::handler::CommandHandler;
 use codewhale_command_contract::metadata::{CommandInfo, RegisterCommand};
+use codewhale_command_contract::money;
 use codewhale_command_contract::outcome::ConfigPolicyCommandResult as CommandResult;
-#[path = "../../../diagnostics_reports/money.rs"]
-mod money;
 #[path = "permissions.rs"]
 pub mod permissions;
 #[path = "policy_messages.rs"]

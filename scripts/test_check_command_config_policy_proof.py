@@ -36,7 +36,10 @@ class PolicyProofTests(unittest.TestCase):
                 self.fixture(root)
                 group = root / proof.GROUP
                 import re
-                group.write_text(re.sub(r'#\[path = "[^"]+"\]\s*(?:pub(?:\([^)]*\))?\s+)?mod ' + name + ';', '', group.read_text()))
+                if name == 'money':
+                    group.write_text(group.read_text().replace('use codewhale_command_contract::money;', ''))
+                else:
+                    group.write_text(re.sub(r'#\[path = "[^"]+"\]\s*(?:pub(?:\([^)]*\))?\s+)?mod ' + name + ';', '', group.read_text()))
                 self.assertTrue(proof.violations(root))
 
     def test_new_transitive_helper_cannot_import_host_services(self):

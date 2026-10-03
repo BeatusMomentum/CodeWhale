@@ -21,7 +21,7 @@ REQUIRED = {
     "crates/tui/src/commands/groups/config/status.rs",
     "crates/tui/src/commands/groups/config/policy_messages.rs",
     "crates/tui/src/commands/groups/config/policy_tests.rs",
-    "crates/tui/src/diagnostics_reports/money.rs",
+    "crates/command-contract/src/money.rs",
 }
 ALLOWED_WORKSPACE = {"codewhale-portable-config-policy", "codewhale-command-contract", "codewhale-protocol"}
 FORBIDDEN_SERVICES = {
@@ -58,6 +58,8 @@ def source_closure(root):
         source = "\n".join(line.split("//")[0] for line in path.read_text().splitlines())
         if HOST_IMPORT.search(source):
             errors.append(f"host service in policy source: {path.relative_to(root)}")
+        if "use codewhale_command_contract::money;" in source:
+            pending.append(root / "crates/command-contract/src/money.rs")
         for explicit, name in MODULE.findall(source):
             if explicit:
                 child = path.parent / explicit
