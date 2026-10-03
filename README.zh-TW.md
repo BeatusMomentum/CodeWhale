@@ -1,9 +1,9 @@
-<!-- source: README.md sha256:bbb8bfb61e57 -->
+<!-- source: README.md sha256:925619135f77 -->
 # Codewhale
 
 Codewhale 是一款開源代理，可使用你選擇的託管模型或本機模型讀取專案、編輯檔案、執行指令，並檢查自己的工作。從終端機中的一項任務開始。對於較大的工作，可以將部分任務交給使用不同模型、擔任不同角色的代理。
 
-![Codewhale 在終端機中執行](web/public/codewhale-tui-d7a9a1c.png)
+![Codewhale 在終端機中執行](web/public/codewhale-tui-5765d80.png)
 
 *終端機預覽截圖來自 v0.10.0 的開發建置版本。*
 
@@ -23,6 +23,8 @@ curl -fsSL https://codewhale.net/install.sh | sh
 "$HOME/.local/bin/codewhale"
 ```
 
+如果直接執行 `codewhale` 顯示 "command not found"，表示 `~/.local/bin` 尚未加入你的 PATH：執行安裝程式為你的 shell 印出的那一行指令，或參閱[將它加入 PATH](docs/INSTALL.md#put-it-on-your-path)。
+
 安裝程式會選擇最新的已發布版本。[更新日誌](CHANGELOG.md)也描述了下一版本尚未發布的候選建置；只有在該版本正式發布後，已發布的下載檔才會包含這些變更。
 
 Windows 請從 [GitHub Releases](https://github.com/Hmbown/CodeWhale/releases/latest) 下載對應的安裝程式或封存檔。已有的直接安裝使用 `codewhale update`；若只想檢查，使用 `codewhale update --check`。更新器會顯示執行檔路徑，並保留較新的建置版本。npm 和 Cargo 是次要套件安裝方式；套件管理器安裝的遷移與 PATH 設定請參閱[安裝指南](docs/INSTALL.md)。
@@ -33,7 +35,7 @@ Windows 請從 [GitHub Releases](https://github.com/Hmbown/CodeWhale/releases/la
 
 ## 使用
 
-在專案資料夾中開啟終端機並執行 `codewhale`。使用 `/provider` 選擇供應商，使用 `/model` 選擇模型，接著描述一項具體任務：
+在專案資料夾中開啟終端機並執行 `codewhale`（前提是它已[在你的 PATH 中](docs/INSTALL.md#put-it-on-your-path)）。使用 `/provider` 選擇供應商，使用 `/model` 選擇模型，接著描述一項具體任務：
 
 ```text
 Fix the failing tests and explain what changed.
@@ -76,6 +78,7 @@ Codewhale 在你的電腦上執行，且只擁有你授予的存取權限。核�
 
 ## 文件
 
+- [GitHub PR 審查設定](docs/GITHUB_ACTION.md)
 - [供應商與本機模型](docs/PROVIDERS.md)
 - [代理團隊](docs/FLEET.md)
 - [MCP](docs/MCP.md)、[掛鉤](docs/HOOKS.md)與[設定](docs/CONFIGURATION.md)

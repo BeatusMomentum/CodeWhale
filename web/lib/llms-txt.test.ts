@@ -28,6 +28,7 @@ describe("llms.txt", () => {
     for (const path of [
       "/en/faq",
       "/en/runtime",
+      "/en/computer-use",
       "/en/constitution",
       "/en/roadmap",
       "/en/feed",

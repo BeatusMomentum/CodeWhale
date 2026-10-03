@@ -36,10 +36,11 @@
   },
   {
     "reason": "unknown_billing_basis",
-    "review": "No mode/credential product is supplied. Both MiniMax dialects share a PAYG/plan endpoint that cannot prove product (route_billing.rs:253,402; pricing.rs:534); Ollama Cloud is unclassified possible spend, not local/free (pricing.rs:411). Generic Custom and six non-Baseten compatible defaults are transport descriptors without a reviewed product; production envelope refuses Unknown at cost_status.rs:239. AICraft is the sixth compatible default: dc170add3 restored its row from the closed PR #6171 with endpoint, credential env and bootstrap model only, and no billing product or pricing row was reviewed for it. Its default is claude-4.6-sonnet, which has no bundled/hand row either; that omission is recorded here on the shape of the descriptor, and a real source review of AICraft's billing basis is still owed.",
+    "review": "No mode/credential product is supplied. Both MiniMax dialects share a PAYG/plan endpoint that cannot prove product (route_billing.rs:253,402; pricing.rs:534); Ollama Cloud is unclassified possible spend, not local/free (pricing.rs:411). Generic Custom and nine non-Baseten compatible defaults are transport descriptors without a reviewed product; production envelope refuses Unknown at cost_status.rs:239. AICraft is the sixth compatible default: dc170add3 restored its row from the closed PR #6171 with endpoint, credential env and bootstrap model only, and no billing product or pricing row was reviewed for it. Its default is claude-4.6-sonnet, which has no bundled/hand row either; that omission is recorded here on the shape of the descriptor, and a real source review of AICraft's billing basis is still owed. Tsubasa (#6695) is the seventh: endpoint, credential env and bootstrap model tsubasa-pro only; its public site lists prepaid-credit per-token rates, but no pricing row was reviewed or frozen for it, so it stays Unknown here too. Yolo-Auto is the eighth: its row carries endpoint, credential env and bootstrap model (qwen3.8-flash, the vendor's recommended start model on free and paid plans) only, the gateway sells flat-rate subscription tiers with no published per-token catalog to review, and the URL proves no plan product, so the route stays Unknown rather than being guessed into subscription or local-no-bill; a source review of Yolo-Auto's billing basis is owed. Cheaper Inference is the ninth non-Baseten compatible default: its gpt-5.4-mini bootstrap model and API endpoint do not establish a billing product or reviewed price, so it also remains Unknown.",
     "routes": [
       ["aicraft", "claude-4.6-sonnet", "https://aicraftapi.com/v1", "chat_completions", "unknown"],
       ["cerebras", "llama-3.3-70b", "https://api.cerebras.ai/v1", "chat_completions", "unknown"],
+      ["cheaperinference", "gpt-5.4-mini", "https://api.cheaperinference.com/v1", "chat_completions", "unknown"],
       ["command-code", "deepseek/deepseek-v4-flash", "https://api.commandcode.ai/provider/v1", "chat_completions", "unknown"],
       ["custom", "custom-model", "http://localhost/v1", "chat_completions", "unknown"],
       ["dashscope", "qwen3.8-flash", "https://dashscope-intl.aliyuncs.com/compatible-mode/v1", "chat_completions", "unknown"],
@@ -47,7 +48,9 @@
       ["minimax", "MiniMax-M3", "https://api.minimax.io/v1", "chat_completions", "unknown"],
       ["minimax-anthropic", "MiniMax-M3", "https://api.minimax.io/anthropic", "anthropic_messages", "unknown"],
       ["ollama-cloud", "gpt-oss:120b", "https://ollama.com/v1", "chat_completions", "unknown"],
-      ["sensenova", "deepseek-v4-flash", "https://token.sensenova.cn/v1", "chat_completions", "unknown"]
+      ["sensenova", "deepseek-v4-flash", "https://token.sensenova.cn/v1", "chat_completions", "unknown"],
+      ["tsubasa", "tsubasa-pro", "https://api.tsubasa.sh/v1", "chat_completions", "unknown"],
+      ["yolo-auto", "qwen3.8-flash", "https://yolo-auto.com/v1", "chat_completions", "unknown"]
     ]
   },
   {

@@ -26,7 +26,7 @@ export const docsModes: DocsModesDict = {
             ],
             [
               "Operate",
-              "面向更大的目标。权限与 Work 相同，但 Codewhale 会先拆出有名字的步骤，把彼此独立的步骤并行交给子 Agent，并在汇报完成之前逐一核对结果。",
+              "面向更大的目标。权限与 Work 相同，但 Codewhale 会先拆出有名字的步骤，把彼此独立的步骤并行交给子智能体，并在汇报完成之前逐一核对结果。",
             ],
           ],
         },
@@ -106,7 +106,7 @@ timeout_seconds = 300              # default: wait indefinitely`,
     },
     {
       href: "/docs/subagents",
-      label: "并行运行 Agent",
+      label: "并行运行智能体",
       note: "Operate 如何处理彼此独立的步骤，以及怎样查看进度。",
     },
   ],

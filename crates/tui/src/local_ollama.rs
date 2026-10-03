@@ -1,10 +1,10 @@
-//! First-run / missing-key adoption of a live local Ollama catalog.
+//! Unconfigured first-run adoption of a live local Ollama catalog.
 //!
 //! Virgin sessions default to the DeepSeek costume (`deepseek-flash`). When a
 //! real local daemon answers `GET /api/tags` (or the OpenAI-compat
 //! `GET /v1/models` roster), the painted route must switch to a tag that
-//! actually exists — never leave DeepSeek flash as the chrome while a live
-//! local catalog is sitting on `:11434`.
+//! actually exists. Discovery never replaces an explicit provider/model,
+//! including a configured route whose credentials need repair.
 
 use std::time::Duration;
 
@@ -129,13 +129,16 @@ pub(crate) fn parse_ollama_show_response(payload: &str) -> anyhow::Result<Ollama
 
 /// True when this session should adopt a live local catalog into chrome.
 ///
-/// First-run and missing-key recovery paint DeepSeek by default; a live local
-/// roster must replace that costume. An already-keyed hosted route is left alone,
+/// An unconfigured first run paints DeepSeek by default; a live local
+/// roster can replace that default. Explicit routes are left alone,
 /// and so is a provider picker the person has already started using: the
 /// probe answers late, and switching provider under them would close the
 /// picker mid-choice or mid-key.
 #[must_use]
 pub(crate) fn should_adopt_live_local_ollama(app: &mut crate::tui::app::App) -> bool {
+    if app.startup_route_configured {
+        return false;
+    }
     if app.api_provider == ApiProvider::Ollama {
         // Already on Ollama — route_runtime + #5795 own the tag; don't fight it.
         return false;

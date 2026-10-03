@@ -385,11 +385,15 @@ pub struct TaskPanelEntry {
     pub current_tool: Option<String>,
     pub role: Option<String>,
     pub files_touched: u32,
+    /// A finished shell's exit code. `None` while running, and for durable
+    /// tasks.
+    pub exit_code: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskPanelEntryKind {
     Background,
+    Shell,
 }
 
 impl QueuedMessage {
@@ -519,6 +523,10 @@ impl ScreenMode {
 /// Actions emitted by the UI event loop.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AppAction {
+    SetWorkspaceTrust {
+        trusted: bool,
+        save: bool,
+    },
     Quit,
     #[allow(dead_code)] // For explicit /load command
     LoadSession(PathBuf),
@@ -635,6 +643,12 @@ pub enum AppAction {
     },
     /// Send a message to the AI (normal chat mode).
     SendMessage(String),
+    /// Same-session rollback. A retry is admitted only after the Engine
+    /// acknowledges this history and its persisted snapshot is durable.
+    ConversationUndo {
+        sync: codewhale_command_contract::facets::SessionSyncPayload,
+        retry_input: Option<String>,
+    },
     /// Send a built-in Workflow planning turn with separate user-visible text
     /// and bounded runtime guidance. Draft instructions carry a typed marker
     /// that makes the dispatch path expose no tools for that turn.

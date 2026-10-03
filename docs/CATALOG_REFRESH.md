@@ -16,7 +16,7 @@ Related docs: [`PROVIDERS.md`](./PROVIDERS.md), RFC
 |---|---|
 | Do users need a special model just to refresh models? | **No.** |
 | Does Codewhale auto-update the public model catalog? | **Yes, at runtime**, from [Models.dev](https://models.dev/catalog.json), ~24 h TTL. |
-| Is the offline bundled seed auto-committed in CI? | **Not yet.** Live cache covers running installs; the in-repo seed is still manual / PR-driven. |
+| Is the offline bundled seed auto-committed in CI? | **No, but it is generated.** A maintainer runs `seed lock` and `seed render` and opens a PR; CI fails a hand edit (`seed render --check`). |
 | Should an LLM rewrite catalog JSON? | **No.** Ingest is deterministic public JSON. An LLM can *review* a PR, not own the source of truth. |
 
 ---
@@ -27,8 +27,8 @@ The shared catalog compiler applies these layers from lowest to highest:
 
 ```
 0 bundled Models.dev
-5 bundled Codewhale facts
 10 live Models.dev
+12 Codewhale corrections (applied to layers 0 and 10 as they load)
 15 verified cloud facts (optional, off by default)
 20 exact provider-owned live roster
 25 Codewhale account roster
@@ -36,6 +36,20 @@ The shared catalog compiler applies these layers from lowest to highest:
 40 user overrides
 policy DENY (final)
 ```
+
+Codewhale corrections live in `crates/config/assets/catalog_corrections.json`.
+They are field patches in the cloud-facts `ModelFact` shape, applied by the same
+patch code to every Models.dev row, offline seed and live refresh alike, so a
+correction holds on every install. Use one when an upstream fact is true but
+misleading for a Codewhale route: `pricing_withheld` (a reason) clears the price
+so the route reports it as unknown, for tiered rates, plan quota and billing
+surfaces the catalog cannot tell apart; `max_output` and the other fields patch
+limits. Every entry carries its reason. Corrections only fix rows that exist,
+never add or hide one, and signed cloud facts can still override them. A
+corrected row keeps its own source; a price a correction owns reports
+`CatalogSource::CodewhaleBundled` as its price source. Do not hand-edit the offline seed
+to hold a value back: a live refresh replaces the seed row, so the hold would
+work only offline.
 
 Cloud facts use the existing compiler and provider lake, as described in
 [`CLOUD_FACTS.md`](./CLOUD_FACTS.md). Capability provenance and price provenance
@@ -64,6 +78,7 @@ Key code:
 | Compile + provenance | `crates/config/src/catalog.rs` | Ordered sources, independent price provenance, policy deny, id normalization |
 | Provider lake merge | `crates/tui/src/provider_lake.rs` | Shared catalog projection with exact route-scoped provider authority |
 | Offline seed asset | `crates/config/assets/models_dev.bundled.json` | Compact offline fallback only (`_meta.role` says so) |
+| Codewhale corrections | `crates/config/assets/catalog_corrections.json` | Field patches applied to every Models.dev row (`crates/config/src/catalog/corrections.rs`) |
 | Validation script | `scripts/catalog_models_dev.py` | Secret-free fetch/validate dry-run (#4117) |
 | Script tests | `scripts/catalog_models_dev_test.py` | Offline shape/scrub checks |
 
@@ -126,7 +141,7 @@ These stay hand-maintained or release-lane work until a scheduled PR lands:
 
 | Surface | Why it drifts |
 |---|---|
-| `models_dev.bundled.json` | Offline seed; intentionally smaller than full Models.dev |
+| `models_dev.bundled.json` | Offline seed, generated from a reviewed spec and a pinned lock (see below); refreshed by PR, not at runtime |
 | `model_catalog.bundled.json` | Compact TUI seed |
 | `provider_defaults.rs` / default model IDs | Product choice, not pure catalog dump |
 | Static tables in `models.rs` | Fallback heuristics when catalog misses a row |
@@ -160,25 +175,41 @@ Design constraints of the script (intentional):
 
 - Public endpoints only — no `Authorization` headers, no API keys.
 - Credential-shaped keys are scrubbed if present in remote JSON.
-- **Disk writes are disabled** (`--write` / `--write-cache` fail closed).
-  Staging a new seed is a separate maintainer step so remote JSON is never
-  blindly committed by automation without review.
+- `refresh` and `snapshot` never write (`--write` / `--write-cache` fail
+  closed). The one write path is `seed lock`, which pins only the rows the
+  spec references, projected onto allowlisted fields.
 
-### Staging a new offline seed (manual)
+### Regenerating the offline seed (#6396)
 
-1. Fetch Models.dev to a local file (curl / browser), or use
-   `CODEWHALE_MODELS_DEV_PATH` against a saved copy.
-2. Scrub to the allowlisted shape (`models`, `providers`, optional `_meta`).
-   Prefer the script’s public-document rules as the checklist.
-3. Keep seed **compact** — verified defaults for shipped providers, not a
-   full dump (see `_meta` on the existing asset).
-4. `python3 scripts/catalog_models_dev.py snapshot --check <path>`.
-5. Diff carefully: default wire IDs should stay aligned with
-   `DEFAULT_*_MODEL` offline.
-6. Open a normal PR. Do not force-push catalog history.
+`crates/config/assets/models_dev.bundled.json` is generated. Never edit it by
+hand: CI runs `seed render --check` and fails on any difference.
 
-Optional: use a cheap model **on the PR** to summarize “new / removed /
-default-risk” — never as the author of the JSON.
+| File | Holds | Edited by |
+|---|---|---|
+| `scripts/catalog/models_dev_seed.toml` | Which upstream rows to carry, their Codewhale provider id, wire id, default, canonical join, and the few curated rows upstream does not list | Hand, reviewed |
+| `scripts/catalog/models_dev_seed.lock.json` | The referenced upstream rows, allowlisted, plus the source URL, fetch time and sha256 | `seed lock` only |
+| `crates/config/assets/catalog_corrections.json` | Deliberate holds: withheld prices, clamped limits, reasoning controls | Hand, reviewed; applies online too |
+| `crates/config/assets/models_dev.bundled.json` | The rendered seed | `seed render` only |
+
+The spec selects and maps; it cannot state a value that disagrees with
+upstream (unknown keys are refused). If an upstream value is wrong for a
+Codewhale route, add a correction instead. Corrections apply to both the seed
+and live rows; a hold made only by hand-editing the seed would vanish on the
+first live refresh.
+
+1. `python3 scripts/catalog_models_dev.py seed lock --dry-run` prints the
+   review report: field changes per row, corrections that upstream now
+   agrees with (delete them), and upstream models not carried. It fails when
+   a referenced row disappeared upstream, or a curated row now exists
+   upstream (switch it to a derived row).
+2. Edit the spec or the corrections as the report requires.
+3. `python3 scripts/catalog_models_dev.py seed lock` writes the lock.
+4. `python3 scripts/catalog_models_dev.py seed render` writes the seed.
+5. Check that default wire IDs still match `DEFAULT_*_MODEL`, run the
+   catalog tests, and open a PR with the report in its body.
+
+Optional: use a cheap model to summarize “new / removed / default-risk” in
+the PR body — never as the author of the JSON.
 
 ---
 
@@ -195,8 +226,12 @@ cron (daily or weekly)
      (and optionally report new ids vs provider defaults)
   → if material change: open PR
        title: chore(catalog): refresh Models.dev offline seed
-  → optional: agent comments a human-readable diff summary on the PR
+  → optional: include an agent-written, human-readable diff summary in the PR body
 ```
+
+Such a job would run `seed lock` and `seed render` and open the PR. A PR
+opened with the default `GITHUB_TOKEN` does not trigger CI, so it needs a bot
+token or GitHub App, which a maintainer has to provision.
 
 ### In scope for automation
 
@@ -256,7 +291,8 @@ subscription OAuth or Claude Code identity headers.
       `/model refresh` after a big vendor launch.
 - [ ] Offline / CI hermetic: set `CODEWHALE_DISABLE_MODELS_DEV_FETCH=1` or
       point `CODEWHALE_MODELS_DEV_PATH` at a fixture.
-- [ ] Before release: `snapshot --check` on the bundled seed; skim
+- [ ] Before release: `seed lock --dry-run` to see how far the offline seed
+      has drifted from Models.dev; re-lock by PR if it matters. Skim
       `PROVIDERS.md` for known drift.
 - [ ] After Models.dev adds a major family you ship by default: consider
       seed PR + default-model decision separately.
@@ -270,4 +306,5 @@ subscription OAuth or Claude Code identity headers.
 - Live Models.dev layer: #4187
 - Bundled seed demoted (not competing truth): #4188
 - Catalog automation script (validate / dry-run): #4117
+- Generated offline seed and runtime corrections: #6396
 - Deeper metadata inventory and drift list: the `codewhale-ops` repo

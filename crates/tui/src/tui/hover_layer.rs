@@ -109,6 +109,11 @@ fn elapsed_ms() -> u128 {
 }
 
 /// Paint OSC-8 / file-ref underline glow on a hovered link span row.
+///
+/// Underline is a text-line decoration, so only a one-row target gets it. A
+/// multi-row control — the 3x3 jump-to-latest button, a workbar panel — is a
+/// box: underlining every row ruled a line through its borders and under its
+/// bottom edge (#6697). Those keep the foreground glow alone.
 pub fn paint_link_glow(
     buf: &mut Buffer,
     area: Rect,
@@ -117,6 +122,7 @@ pub fn paint_link_glow(
 ) {
     let ms = elapsed_ms();
     let style = link_hover_style(fg, reduced_motion, ms);
+    let underline = area.height == 1;
     for y in area.y..area.y.saturating_add(area.height) {
         for x in area.x..area.x.saturating_add(area.width) {
             if x >= buf.area.x.saturating_add(buf.area.width)
@@ -128,7 +134,9 @@ pub fn paint_link_glow(
             if let Some(color) = style.fg {
                 cell.set_fg(color);
             }
-            cell.modifier.insert(Modifier::UNDERLINED);
+            if underline {
+                cell.modifier.insert(Modifier::UNDERLINED);
+            }
         }
     }
 }
@@ -244,6 +252,49 @@ mod tests {
         assert_eq!(hit.kind, HoverTargetKind::Link);
         assert!(hit.copyable);
         clear_pointer();
+    }
+
+    /// #6697: hovering the 3x3 jump-to-latest button drew a horizontal rule
+    /// under each of its rows. A box control glows; only a one-row link
+    /// underlines.
+    #[test]
+    fn multi_row_button_hover_glows_without_underline_rules() {
+        let _guard = HOVER_TEST_LOCK.lock().unwrap();
+        let theme = palette::UI_THEME;
+        let glow = link_hover_style(theme.accent_primary, true, 0)
+            .fg
+            .expect("glow colour");
+        let mut buf = Buffer::empty(Rect::new(0, 0, 8, 5));
+        let button = Rect::new(4, 1, 3, 3);
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(ratatui::widgets::BorderType::Rounded)
+            .render(button, &mut buf);
+        let link = Rect::new(0, 0, 3, 1);
+
+        for (target, pointer) in [(button, (5, 2)), (link, (1, 0))] {
+            clear_pointer();
+            begin_frame();
+            set_pointer(pointer.0, pointer.1);
+            register_rect(HoverTargetKind::Link, target, "control", false);
+            apply_resolved_effects(&mut buf, true, &theme);
+        }
+        clear_pointer();
+
+        for y in button.y..button.bottom() {
+            for x in button.x..button.right() {
+                let cell = &buf[(x, y)];
+                assert!(
+                    !cell.modifier.contains(Modifier::UNDERLINED),
+                    "button cell ({x},{y}) {:?} must not be underlined",
+                    cell.symbol()
+                );
+                assert_eq!(cell.fg, glow, "button cell ({x},{y}) keeps the glow");
+            }
+        }
+        for x in link.x..link.right() {
+            assert!(buf[(x, 0)].modifier.contains(Modifier::UNDERLINED));
+        }
     }
 
     #[test]

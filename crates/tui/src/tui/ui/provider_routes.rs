@@ -307,17 +307,47 @@ pub(crate) fn should_fetch_provider_balance(app: &App) -> bool {
         && crate::config::provider_has_balance_api(app.api_provider)
 }
 
+/// The balance cell for this route. A reading belongs to the route that
+/// fetched it: when the provider, endpoint or key changes, a fresh cell
+/// replaces the old one, so a response still in flight for the previous route
+/// lands in a cell nothing reads (U03-08), and the new route is not held behind
+/// the previous route's fetch cooldown.
+pub(crate) fn balance_cell_for_route(
+    app: &mut App,
+    provider: ApiProvider,
+    api_key: &str,
+    base_url: &str,
+) -> std::sync::Arc<std::sync::Mutex<Option<crate::pricing::BalanceInfo>>> {
+    use std::hash::{Hash, Hasher};
+    let mut key_fingerprint = std::collections::hash_map::DefaultHasher::new();
+    api_key.hash(&mut key_fingerprint);
+    let route = format!(
+        "{}\u{1f}{base_url}\u{1f}{:016x}",
+        provider.as_str(),
+        key_fingerprint.finish()
+    );
+    if app.balance_route.as_deref() != Some(route.as_str()) {
+        app.balance_cell = std::sync::Arc::new(std::sync::Mutex::new(None));
+        app.balance_route = Some(route);
+        app.last_balance_fetch = None;
+    }
+    app.balance_cell.clone()
+}
+
 /// Kick a background remaining-credit fetch for the live route.
 ///
 /// `force` skips the status-item gate (used by `/balance`). Providers without
 /// a known endpoint clear the parked chip so a previous route cannot linger.
 pub(crate) fn schedule_balance_fetch(app: &mut App, api_key: &str, base_url: &str, force: bool) {
     if !crate::config::provider_has_balance_api(app.api_provider) {
-        if let Ok(mut guard) = app.balance_cell.lock() {
-            *guard = None;
-        }
+        // A fresh cell, not a cleared one: a fetch still in flight for the
+        // previous route holds the old cell and cannot repaint the chip.
+        app.balance_cell = std::sync::Arc::new(std::sync::Mutex::new(None));
+        app.balance_route = None;
         return;
     }
+    let provider = app.api_provider;
+    let cell = balance_cell_for_route(app, provider, api_key, base_url);
     if !force && !should_fetch_provider_balance(app) {
         return;
     }
@@ -332,8 +362,6 @@ pub(crate) fn schedule_balance_fetch(app: &mut App, api_key: &str, base_url: &st
         return;
     }
     app.last_balance_fetch = Some(Instant::now());
-    let cell = app.balance_cell.clone();
-    let provider = app.api_provider;
     let api_key = api_key.to_string();
     let base_url = base_url.to_string();
     tokio::spawn(async move {
@@ -624,6 +652,20 @@ pub(crate) async fn switch_provider(
         previous_api_key_env_only: app.api_key_env_only,
     });
 
+    // A session-local switch keeps the same ownership rule the persisted
+    // writers apply (`reconcile_root_model_aliases`): the root alias the
+    // outgoing route was using moves onto that route's own leaf, so coming
+    // back lands on it instead of the catalog default. Every failure path
+    // below restores `previous_config`.
+    if let Some((outgoing, value)) = config
+        .active_provider_identity(target)
+        .ok()
+        .and_then(|incoming| config.root_model_alias_owned_by_outgoing(&incoming))
+    {
+        config.set_provider_model_override(outgoing.provider, Some(value));
+        config.default_text_model = None;
+    }
+
     let resolved_route = match resolve_runtime_route(config, target, model_override.as_deref()) {
         Ok(route) => route,
         Err(reason) => {
@@ -705,6 +747,15 @@ pub(crate) async fn switch_provider(
         || previous_identity != target_identity
         || previous_model != new_model;
     app.set_provider_identity_record(target_identity_record);
+    // Launch computed "needs a key" for the launch provider. A switch to a
+    // route that has its credential answers that, even when the user left the
+    // picker with Esc first; otherwise the stale flag keeps the info line on
+    // "model not connected" and keeps local-Ollama adoption armed against the
+    // provider the user just chose. An auth-failure rollback restores it.
+    app.onboarding_needs_api_key = !crate::config::has_api_key(config);
+    if !app.onboarding_needs_api_key {
+        app.onboarding_missing_key_recovery = false;
+    }
     app.billing_presentation = crate::route_billing::for_route(config, target);
     app.max_subagents = config
         .max_subagents_for_provider(target)
@@ -1026,17 +1077,12 @@ pub(crate) fn mcp_import_apply(
 }
 
 pub(crate) fn clear_active_provider_api_key_from_memory(app: &App, config: &mut Config) {
-    let active_identity = app.provider_identity_for_persistence();
-    let clears_legacy_root = matches!(
-        app.api_provider,
-        ApiProvider::Deepseek | ApiProvider::DeepseekCN
-    ) || (app.api_provider == ApiProvider::Custom
-        && active_identity == ApiProvider::Custom.as_str()
-        && config.uses_legacy_literal_custom_route());
-    if clears_legacy_root {
-        config.api_key = None;
-    }
     config.set_provider_api_key_override(app.api_provider, None);
+    // DeepSeek-CN reads DeepSeek's key (they used to share the top-level key,
+    // #6394), so clearing it clears that shared key too, as on disk.
+    if app.api_provider == ApiProvider::DeepseekCN {
+        config.set_provider_api_key_override(ApiProvider::Deepseek, None);
+    }
     if app.api_provider == ApiProvider::Xai {
         let entry = config.provider_config_for_mut(ApiProvider::Xai);
         entry.auth_mode = None;

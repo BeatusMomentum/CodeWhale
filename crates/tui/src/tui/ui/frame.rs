@@ -5,7 +5,6 @@
 
 use super::*;
 use crate::tui::infoline::{InfoLine, InfoSegment, InfoSegmentId, infoline_hitboxes};
-use codewhale_models::Role;
 
 /// Context window percentage for the metrics line's reading — the same
 /// snapshot the posture bar's ≥80% microcopy reads, so the two can never
@@ -950,7 +949,7 @@ pub(crate) fn build_engine_config(app: &App, config: &Config) -> EngineConfig {
         mcp_oauth_callback_port: config.mcp_oauth_callback_port,
         mcp_oauth_callback_url: config.mcp_oauth_callback_url.clone(),
         skills_dir: app.skills_dir.clone(),
-        skills_scan_codewhale_only: app.skills_scan_codewhale_only,
+        skills_discovery_mode: app.skills_discovery_mode,
         plugin_registry: Some(std::sync::Arc::clone(&app.plugin_registry)),
         instructions: configured_instruction_sources(config),
         project_context_pack_enabled: config.project_context_pack_enabled(),
@@ -996,6 +995,9 @@ pub(crate) fn build_engine_config(app: &App, config: &Config) -> EngineConfig {
             .snapshots_config()
             .max_workspace_gb
             .saturating_mul(1024 * 1024 * 1024),
+        // The TUI records no snapshot receipts; its post-turn snapshot stays
+        // off the input path (#234).
+        record_restore_points: false,
         lsp_config: config
             .lsp
             .clone()
@@ -1014,6 +1016,8 @@ pub(crate) fn build_engine_config(app: &App, config: &Config) -> EngineConfig {
         turn_wall_clock: config.turn_wall_clock(),
         stream_max_content_bytes: config.stream_max_content_bytes(),
         stream_max_duration: config.stream_max_duration(),
+        stream_retry_limits: config.stream_retry_limits(),
+        stream_open_timeout: config.stream_open_timeout(),
         subagent_heartbeat_timeout: Duration::from_secs(
             config.subagent_heartbeat_timeout_secs_for_provider(provider),
         ),
@@ -1105,7 +1109,7 @@ pub(crate) fn build_app_system_prompt_with_goal(
             )),
             verbosity: app.verbosity.as_deref(),
             recovery_hint: recovery_hint.as_deref(),
-            skills_scan_codewhale_only: app.skills_scan_codewhale_only,
+            skills_discovery_mode: app.skills_discovery_mode,
             plugin_registry: Some(app.plugin_registry.as_ref()),
             mode: app.mode,
         },
@@ -1225,6 +1229,7 @@ pub(crate) fn build_session_snapshot(
     app.sync_cost_to_metadata(&mut session.metadata);
     session.context_references = app.session_context_references.clone();
     session.artifacts = app.session_artifacts.clone();
+    session.turn_outcomes = app.session_turn_outcomes.clone();
     session.work_state = work_state;
     session.last_auto_route = app.auto_route_for_persistence();
     session.window_title.clone_from(&app.window_title);
@@ -1238,7 +1243,7 @@ pub(crate) fn build_session_snapshot(
     // "the TUI holds the authoritative copy", which is exactly the condition
     // the conflict protects. A session that has never been snapshotted has no
     // in-memory state to lose, so leaving it unclaimed is correct, not a gap.
-    crate::session_manager::set_live_session(Some(&session.metadata.id));
+    manager.claim_live_session(&session.metadata.id);
     Ok(session)
 }
 
@@ -1349,57 +1354,6 @@ pub(crate) fn commit_streaming_display_tick(
     }
 
     updated
-}
-
-pub(crate) fn live_tool_receipt_messages(
-    app: &App,
-    id: &str,
-    raw: &str,
-    success: bool,
-) -> Vec<Message> {
-    let mut messages = Vec::with_capacity(2);
-    if let Some(tool_use_msg) = app.api_messages.iter().rev().find(|message| {
-        message.content.iter().any(|block| {
-            matches!(block, ContentBlock::ToolUse { id: tool_use_id, ..} if tool_use_id == id)
-        })
-    }) {
-        messages.push(tool_use_msg.clone());
-    }
-    messages.push(Message {
-        role: Role::User,
-        content: vec![ContentBlock::ToolResult {
-            tool_use_id: id.to_string(),
-            content: raw.to_string(),
-            is_error: Some(!success),
-            content_blocks: None,
-        }],
-    });
-    messages
-}
-
-pub(crate) fn compact_live_tool_receipt(
-    messages: Vec<Message>,
-    artifacts: Vec<crate::artifacts::ArtifactRecord>,
-    raw: String,
-) -> Option<String> {
-    let (compacted, _) =
-        crate::tool_output_receipts::compact_messages_for_persistence(&messages, &artifacts);
-    let content = compacted
-        .last()
-        .and_then(|message| message.content.first())
-        .and_then(|block| match block {
-            ContentBlock::ToolResult { content, .. } => Some(content),
-            _ => None,
-        })?;
-    if content != &raw && live_tool_content_is_receipt(content) {
-        Some(content.clone())
-    } else {
-        None
-    }
-}
-
-pub(crate) fn live_tool_content_is_receipt(content: &str) -> bool {
-    content.trim_start().starts_with("[TOOL_OUTPUT_RECEIPT]")
 }
 
 /// Build the pending-input preview widget from current `App` state.
@@ -2008,6 +1962,10 @@ pub(crate) fn render(f: &mut Frame, app: &mut App, _config: &Config) -> Option<(
         }
         let buf = f.buffer_mut();
         app.view_stack.render(size, buf);
+        // Any view on the stack owns the keyboard and paints over the
+        // composer, and no view draws its own text caret, so the composer's
+        // caret must not surface through the modal (#6545).
+        return None;
     }
 
     cursor_pos
@@ -2067,21 +2025,28 @@ pub(crate) fn draw_app_frame_inner(
     // whole viewport on every wrapped frame instead of deferring as the
     // standard requires). Settings::synchronized_output_enabled resolves
     // the user's setting against the Ptyxis env auto-detect.
-    let wrap_in_sync_update = app.synchronized_output_enabled;
-    if wrap_in_sync_update {
-        let _ = terminal.backend_mut().write_all(BEGIN_SYNC_UPDATE);
-    }
-
-    // Run fallible draw operations in a closure so END_SYNC_UPDATE is
-    // always sent even if an intermediate step fails. Without this, a
-    // failing `?` would return early and leave the terminal stuck in
-    // synchronized-update mode (screen frozen).
-    let result = (|| -> Result<()> {
+    let resized = app.viewport.pending_terminal_size.take();
+    let result = synchronized_frame(terminal, app.synchronized_output_enabled, |terminal| {
+        if let Some(size) = resized {
+            // Keep ratatui's resize clear in the same DEC 2026 transaction as
+            // the repaint. Inline mode rebuilds its fixed-height viewport.
+            let refit = if app.screen_mode == ScreenMode::Inline {
+                refit_inline_viewport(terminal, size)
+            } else {
+                terminal.resize(Rect::new(0, 0, size.width, size.height))
+            };
+            if let Err(err) = refit {
+                tracing::warn!(?err, "terminal resize failed; falling back to clear+draw");
+            }
+            // ConHost and Terminal.app can briefly report the previous size.
+            terminal.backend_mut().force_size(size);
+            terminal.backend_mut().set_terminal_size(size);
+        }
         // The terminal cursor itself is also input-method geometry. Hide it
         // before clear/diff operations move it, then restore the one composer
         // position after ratatui finishes drawing (#5023).
         prepare_frame_cursor(terminal)?;
-        if full_repaint {
+        if full_repaint || resized.is_some() {
             terminal.backend_mut().write_all(TERMINAL_ORIGIN_RESET)?;
             terminal.clear()?;
         }
@@ -2090,13 +2055,30 @@ pub(crate) fn draw_app_frame_inner(
         app.pet_watch.present(terminal.backend_mut())?;
         finish_frame_cursor(terminal, cursor_pos)?;
         Ok(())
-    })();
+    });
+    if resized.is_some() {
+        terminal.backend_mut().clear_forced_size();
+    }
+    result
+}
 
-    // Always end the synchronized update, regardless of success or failure.
-    if wrap_in_sync_update {
+/// End and flush the synchronized frame even when resizing or drawing fails.
+pub(super) fn synchronized_frame<B, T>(
+    terminal: &mut Terminal<B>,
+    enabled: bool,
+    draw: impl FnOnce(&mut Terminal<B>) -> Result<T>,
+) -> Result<T>
+where
+    B: ratatui::backend::Backend + Write,
+{
+    if enabled {
+        let _ = terminal.backend_mut().write_all(BEGIN_SYNC_UPDATE);
+    }
+    let result = draw(terminal);
+    if enabled {
         let _ = terminal.backend_mut().write_all(END_SYNC_UPDATE);
     }
-    let _ = terminal.backend_mut().flush();
+    let _ = std::io::Write::flush(terminal.backend_mut());
     result
 }
 
@@ -2218,6 +2200,19 @@ pub(crate) fn context_usage_snapshot(app: &App) -> Option<(i64, u32, f64)> {
 }
 
 pub(crate) fn context_usage_snapshot_for_window(app: &App, max: u32) -> Option<(i64, u32, f64)> {
+    // Before a conversation starts, the assembled startup prompt alone is not
+    // conversation usage, and compacting an empty session cannot reclaim it.
+    // A submitted first turn has started the conversation even before the
+    // engine mirrors its messages back, and so has any provider usage; those
+    // keep the real pressure reading.
+    let conversation_started =
+        !app.api_messages.is_empty() || app.is_loading || count_user_history_cells(app) > 0;
+    if !conversation_started
+        && app.session.last_prompt_tokens.unwrap_or(0) == 0
+        && app.last_billed_input_tokens.unwrap_or(0) == 0
+    {
+        return Some((0, max, 0.0));
+    }
     let max_i64 = i64::from(max);
     let reported = app
         .session
@@ -2244,6 +2239,12 @@ pub(crate) fn context_usage_snapshot_for_window(app: &App, max: u32) -> Option<(
     // fallback when no estimate is available (e.g., immediately after a
     // session restore before the api_messages are populated).
     let used = match (estimated, reported) {
+        // No messages yet (a restore before the projection lands): the
+        // estimate is only the system prompt, so the reported prompt is the
+        // better reading and must not be dropped to ~0%.
+        (Some(estimated), Some(reported)) if app.api_messages.is_empty() => {
+            estimated.max(reported).min(max_i64)
+        }
         (Some(estimated), _) => estimated.min(max_i64),
         (None, Some(reported)) => reported.min(max_i64),
         (None, None) => return None,
@@ -2538,6 +2539,40 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol().to_string())
             .collect::<String>()
+    }
+
+    #[test]
+    fn footer_keeps_reasoning_label_for_every_effort_tier() {
+        use crate::reasoning_preference::ReasoningEffort;
+
+        let mut app = app_with_context_percent(1);
+        app.api_provider = crate::config::ApiProvider::Openai;
+        app.active_route_base_url = "https://api.openai.com/v1".to_string();
+        app.model = "gpt-5.6".to_string();
+        app.auto_model = false;
+        app.ui_locale = codewhale_localization::Locale::En;
+
+        let mut missing = Vec::new();
+        for effort in [
+            ReasoningEffort::Off,
+            ReasoningEffort::Minimal,
+            ReasoningEffort::Low,
+            ReasoningEffort::Medium,
+            ReasoningEffort::High,
+            ReasoningEffort::XHigh,
+            ReasoningEffort::Ultra,
+            ReasoningEffort::Auto,
+            ReasoningEffort::Max,
+        ] {
+            app.reasoning_effort = effort;
+            let label = app.reasoning_effort_display_label();
+            assert!(!label.is_empty(), "{effort:?} must have a label");
+            let row = metrics_row(&app, 80);
+            if !row.contains(&format!("thinking: {label}")) {
+                missing.push(format!("{effort:?}: {row:?}"));
+            }
+        }
+        assert!(missing.is_empty(), "missing footer labels: {missing:#?}");
     }
 
     /// The reading used to go silent below 50% fullness, which is most of a

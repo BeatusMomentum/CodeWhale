@@ -120,6 +120,14 @@ impl Locale {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MessageId {
+    MobileStreamReplayFailed,
+    MobileStreamCatchUpFailed,
+    MobileStreamRuntimeShutdown,
+    MobileStreamEnded,
+    MobileStreamClosed,
+    MobileStreamReconnecting,
+    MobileStreamConnected,
+    ConversationChangedBeforeUndo,
     SessionArchiveExported,
     SessionArchiveSizes,
     SessionArchiveNoArtifacts,
@@ -172,6 +180,8 @@ pub enum MessageId {
     HistoryHintRestore,
     HistoryNoMatches,
     TranscriptReasoningExpand,
+    TranscriptThought,
+    TranscriptThoughtFor,
     ScreenModeFullscreenNotice,
     ScreenModeInlineNotice,
     ScreenModeMouseCaptureOn,
@@ -489,6 +499,7 @@ pub enum MessageId {
     CmdConstitutionDescription,
     CmdContextDescription,
     CmdCostDescription,
+    CmdReceiptsDescription,
     CmdDiffDescription,
     CmdEditDescription,
     CmdExitDescription,
@@ -624,6 +635,7 @@ pub enum MessageId {
     ExtensionsStateInapplicable,
     ExtensionsStateInvalid,
     ExtensionsStateNotInspected,
+    ExtensionsStateDisconnected,
     ExtensionsStateRejected,
     ExtensionsStateReviewedCandidate,
     ExtensionsStateUnderEvaluation,
@@ -699,6 +711,13 @@ pub enum MessageId {
     PluginSuggestionReason,
     PagerActionConfirm,
     CmdPluginBundleDetail,
+    CmdPluginOwnerReport,
+    CmdPluginOwnerActivating,
+    CmdPluginOwnerActive,
+    CmdPluginOwnerFailed,
+    CmdPluginOwnerFaulted,
+    CmdPluginOwnerRevoked,
+    CmdPluginOwnerInactive,
     CmdPluginBundleDiagnosticsHeader,
     CmdPluginBundleMutationSuccess,
     CmdPluginActionFailed,
@@ -875,6 +894,10 @@ pub enum MessageId {
     CmdCacheFootnote,
     CmdCacheHeader,
     CmdCacheNoData,
+    CmdCacheSessionRates,
+    CmdCacheRateParent,
+    CmdCacheRateAgents,
+    CmdCacheRateCombined,
     CmdCacheTotals,
     CmdCostReport,
     CmdCostReportSubtotal,
@@ -976,6 +999,7 @@ pub enum MessageId {
     ClipboardCutKeptText,
     /// Paste found nothing: the clipboard read came back empty or failed.
     ClipboardNothingToPaste,
+    ComposerOversizedSubmitHeld,
     KbContextMenu,
     KbPointerScroll,
     KbPointerClick,
@@ -1568,6 +1592,28 @@ pub enum MessageId {
     NotificationSubagentInterrupted,
     NotificationSubagentCancelled,
     NotificationSubagentBudgetExhausted,
+    NotificationShellFinished,
+    NotificationShellFailed,
+    NotificationShellStopped,
+    NotificationTaskFinished,
+    NotificationTaskFailed,
+    NotificationTaskStopped,
+    NotificationBackgroundFinished,
+    NotificationBackgroundMixed,
+    BackgroundFinishedHeading,
+    BackgroundFinishedHint,
+    BackgroundOutcomeDone,
+    BackgroundOutcomeFailed,
+    BackgroundOutcomeCancelled,
+    BackgroundOutcomeKilled,
+    BackgroundOutcomeTimedOut,
+    BackgroundExitCode,
+    BackgroundQuiet,
+    BackgroundUsingTool,
+    BackgroundStep,
+    BackgroundFilesChanged,
+    NotificationBackgroundStopped,
+    NotificationFullResultPointer,
     // Footer chips.
     FooterWorkedChip,
     FooterPermissionKeyHint,
@@ -1894,6 +1940,10 @@ pub enum MessageId {
     SessionsSortSize,
     SessionsSearchPrompt,
     SessionsDeleteFailed,
+    SessionsDeleteOpenHere,
+    SessionsDeleteOpenElsewhere,
+    SessionSaveFailed,
+    SessionSaveFailedAtExit,
     SessionsDeleted,
     SessionsNoSelection,
     SessionsTitleLength,
@@ -2602,6 +2652,10 @@ pub enum MessageId {
     McpShowUnavailableWhileTurnRuns,
     McpLivePoolRefreshDeferredWhileTurnRuns,
     McpRetryDeferredWhileTurnRuns,
+    McpRetryStarted,
+    McpRetryConnected,
+    McpRetryNeedsLogin,
+    McpRetryFailed,
     WorkflowCountRunning,
     WorkflowCountDone,
     WorkflowCountFailed,
@@ -2623,6 +2677,14 @@ pub enum MessageId {
 
 #[allow(dead_code)]
 pub const ALL_MESSAGE_IDS: &[MessageId] = &[
+    MessageId::MobileStreamReplayFailed,
+    MessageId::MobileStreamCatchUpFailed,
+    MessageId::MobileStreamRuntimeShutdown,
+    MessageId::MobileStreamEnded,
+    MessageId::MobileStreamClosed,
+    MessageId::MobileStreamReconnecting,
+    MessageId::MobileStreamConnected,
+    MessageId::ConversationChangedBeforeUndo,
     MessageId::SessionArchiveExported,
     MessageId::SessionArchiveSizes,
     MessageId::SessionArchiveNoArtifacts,
@@ -2675,6 +2737,8 @@ pub const ALL_MESSAGE_IDS: &[MessageId] = &[
     MessageId::HistoryHintRestore,
     MessageId::HistoryNoMatches,
     MessageId::TranscriptReasoningExpand,
+    MessageId::TranscriptThought,
+    MessageId::TranscriptThoughtFor,
     MessageId::ScreenModeFullscreenNotice,
     MessageId::ScreenModeInlineNotice,
     MessageId::ScreenModeMouseCaptureOn,
@@ -2983,6 +3047,7 @@ pub const ALL_MESSAGE_IDS: &[MessageId] = &[
     MessageId::CmdConstitutionDescription,
     MessageId::CmdContextDescription,
     MessageId::CmdCostDescription,
+    MessageId::CmdReceiptsDescription,
     MessageId::CmdDiffDescription,
     MessageId::CmdEditDescription,
     MessageId::CmdExitDescription,
@@ -3121,6 +3186,7 @@ pub const ALL_MESSAGE_IDS: &[MessageId] = &[
     MessageId::ExtensionsStateInapplicable,
     MessageId::ExtensionsStateInvalid,
     MessageId::ExtensionsStateNotInspected,
+    MessageId::ExtensionsStateDisconnected,
     MessageId::ExtensionsStateRejected,
     MessageId::ExtensionsStateReviewedCandidate,
     MessageId::ExtensionsStateUnderEvaluation,
@@ -3196,6 +3262,13 @@ pub const ALL_MESSAGE_IDS: &[MessageId] = &[
     MessageId::PluginSuggestionReason,
     MessageId::PagerActionConfirm,
     MessageId::CmdPluginBundleDetail,
+    MessageId::CmdPluginOwnerReport,
+    MessageId::CmdPluginOwnerActivating,
+    MessageId::CmdPluginOwnerActive,
+    MessageId::CmdPluginOwnerFailed,
+    MessageId::CmdPluginOwnerFaulted,
+    MessageId::CmdPluginOwnerRevoked,
+    MessageId::CmdPluginOwnerInactive,
     MessageId::CmdPluginBundleDiagnosticsHeader,
     MessageId::CmdPluginBundleMutationSuccess,
     MessageId::CmdPluginActionFailed,
@@ -3368,6 +3441,10 @@ pub const ALL_MESSAGE_IDS: &[MessageId] = &[
     MessageId::CmdCacheFootnote,
     MessageId::CmdCacheHeader,
     MessageId::CmdCacheNoData,
+    MessageId::CmdCacheSessionRates,
+    MessageId::CmdCacheRateParent,
+    MessageId::CmdCacheRateAgents,
+    MessageId::CmdCacheRateCombined,
     MessageId::CmdCacheTotals,
     MessageId::CmdChangeDescription,
     MessageId::CmdChangeHeader,
@@ -3467,6 +3544,7 @@ pub const ALL_MESSAGE_IDS: &[MessageId] = &[
     MessageId::ClipboardSentToTerminal,
     MessageId::ClipboardCutKeptText,
     MessageId::ClipboardNothingToPaste,
+    MessageId::ComposerOversizedSubmitHeld,
     MessageId::KbContextMenu,
     MessageId::KbPointerScroll,
     MessageId::KbPointerClick,
@@ -4022,6 +4100,28 @@ pub const ALL_MESSAGE_IDS: &[MessageId] = &[
     MessageId::NotificationSubagentInterrupted,
     MessageId::NotificationSubagentCancelled,
     MessageId::NotificationSubagentBudgetExhausted,
+    MessageId::NotificationShellFinished,
+    MessageId::NotificationShellFailed,
+    MessageId::NotificationShellStopped,
+    MessageId::NotificationTaskFinished,
+    MessageId::NotificationTaskFailed,
+    MessageId::NotificationTaskStopped,
+    MessageId::NotificationBackgroundFinished,
+    MessageId::NotificationBackgroundMixed,
+    MessageId::BackgroundFinishedHeading,
+    MessageId::BackgroundFinishedHint,
+    MessageId::BackgroundOutcomeDone,
+    MessageId::BackgroundOutcomeFailed,
+    MessageId::BackgroundOutcomeCancelled,
+    MessageId::BackgroundOutcomeKilled,
+    MessageId::BackgroundOutcomeTimedOut,
+    MessageId::BackgroundExitCode,
+    MessageId::BackgroundQuiet,
+    MessageId::BackgroundUsingTool,
+    MessageId::BackgroundStep,
+    MessageId::BackgroundFilesChanged,
+    MessageId::NotificationBackgroundStopped,
+    MessageId::NotificationFullResultPointer,
     MessageId::FooterWorkedChip,
     MessageId::FooterPermissionKeyHint,
     MessageId::ApprovalSummaryRunCommand,
@@ -4319,6 +4419,10 @@ pub const ALL_MESSAGE_IDS: &[MessageId] = &[
     MessageId::SessionsSortSize,
     MessageId::SessionsSearchPrompt,
     MessageId::SessionsDeleteFailed,
+    MessageId::SessionsDeleteOpenHere,
+    MessageId::SessionsDeleteOpenElsewhere,
+    MessageId::SessionSaveFailed,
+    MessageId::SessionSaveFailedAtExit,
     MessageId::SessionsDeleted,
     MessageId::SessionsNoSelection,
     MessageId::SessionsTitleLength,
@@ -4993,6 +5097,10 @@ pub const ALL_MESSAGE_IDS: &[MessageId] = &[
     MessageId::McpShowUnavailableWhileTurnRuns,
     MessageId::McpLivePoolRefreshDeferredWhileTurnRuns,
     MessageId::McpRetryDeferredWhileTurnRuns,
+    MessageId::McpRetryStarted,
+    MessageId::McpRetryConnected,
+    MessageId::McpRetryNeedsLogin,
+    MessageId::McpRetryFailed,
     MessageId::WorkflowCountRunning,
     MessageId::WorkflowCountDone,
     MessageId::WorkflowCountFailed,
@@ -5456,6 +5564,37 @@ mod tests {
             .collect()
     }
 
+    #[test]
+    fn plugin_owner_report_keeps_translated_state_and_placeholder_parity() {
+        let english = raw_locale_messages(Locale::En);
+        let keys: Vec<_> = english
+            .keys()
+            .filter(|key| key.starts_with("CmdPluginOwner"))
+            .collect();
+        assert_eq!(keys.len(), 7);
+        for locale in Locale::shipped_complete() {
+            let pack = raw_locale_messages(*locale);
+            for key in &keys {
+                let original = english[*key].as_str().unwrap();
+                let translated = pack[*key].as_str().unwrap();
+                assert_eq!(
+                    message_placeholders(translated),
+                    message_placeholders(original),
+                    "{} changed placeholders for {key}",
+                    locale.tag()
+                );
+                if *locale != Locale::En {
+                    assert_ne!(
+                        translated,
+                        original,
+                        "{} left {key} in English",
+                        locale.tag()
+                    );
+                }
+            }
+        }
+    }
+
     /// #5906: the parked-agent vocabulary is new copy on the busiest rows in
     /// the product, so it gets the same hard parity gate coordination copy
     /// has — and the recovery line must keep the tool tokens it names, or it
@@ -5495,6 +5634,37 @@ mod tests {
                 "{} fell back to the English parked recovery line",
                 locale.tag()
             );
+        }
+    }
+
+    #[test]
+    fn background_review_complete_packs_translate_copy_and_preserve_placeholders() {
+        let english = raw_locale_messages(Locale::En);
+        let keys = english
+            .keys()
+            .filter(|key| {
+                key.starts_with("Background") || key.as_str() == "NotificationBackgroundStopped"
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(keys.len(), 13);
+        for &locale in Locale::shipped_complete() {
+            let pack = raw_locale_messages(locale);
+            for key in &keys {
+                let source = english[*key].as_str().unwrap();
+                let translated = pack
+                    .get(*key)
+                    .and_then(serde_json::Value::as_str)
+                    .expect("translated background key");
+                assert_eq!(
+                    message_placeholders(translated),
+                    message_placeholders(source),
+                    "{} {key}",
+                    locale.tag()
+                );
+                if locale != Locale::En {
+                    assert_ne!(translated, source, "{} {key}", locale.tag());
+                }
+            }
         }
     }
 
@@ -5846,8 +6016,8 @@ mod tests {
             (Locale::Ru, "Воркеры флота текущего сеанса:"),
             (Locale::Uk, "Воркери флоту поточного сеансу:"),
             (Locale::Vi, "Worker hạm đội của phiên hiện tại:"),
-            (Locale::ZhHans, "当前会话的舰队工作器："),
-            (Locale::ZhHant, "目前工作階段的艦隊工作器："),
+            (Locale::ZhHans, "本会话的智能体："),
+            (Locale::ZhHant, "本工作階段的代理："),
         ];
         assert_eq!(expected.len(), Locale::shipped_complete().len());
 
@@ -6405,7 +6575,11 @@ mod tests {
             .filter(|key| key.starts_with("Extensions"))
             .cloned()
             .collect::<Vec<_>>();
-        assert_eq!(keys.len(), 99, "the complete extensions locale set changed");
+        assert_eq!(
+            keys.len(),
+            100,
+            "the complete extensions locale set changed"
+        );
 
         let prose_keys = [
             "ExtensionsMcpEmpty",

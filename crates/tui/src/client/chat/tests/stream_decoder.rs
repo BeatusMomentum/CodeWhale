@@ -4,7 +4,7 @@
 //! harness (issue #69 tracks that). For #103 we exercise the chunk decoder
 //! directly to verify each "class of stream failure" the engine relies on.
 use super::*;
-use crate::client::wire::{InvalidSseUtf8, SseLineDecoder};
+use crate::client::wire::{SseLineDecoder, SseLineError};
 use codewhale_models::{ContentBlockStart, Delta, StreamEvent};
 
 /// Decode a raw SSE-data JSON chunk into our internal events, mirroring
@@ -61,7 +61,7 @@ fn decode_chunks_with_style(
 
 /// Drive the Chat Completions SSE path with raw byte chunks so tests can
 /// split a multi-byte UTF-8 character across HTTP/2-style DATA boundaries.
-fn decode_sse_byte_chunks(chunks: &[&[u8]]) -> Result<Vec<StreamEvent>, InvalidSseUtf8> {
+fn decode_sse_byte_chunks(chunks: &[&[u8]]) -> Result<Vec<StreamEvent>, SseLineError> {
     struct FrameState {
         line_buf: String,
         content_index: u32,
@@ -998,6 +998,7 @@ fn tool_use_message(id: &str, name: &str, input: Value) -> Message {
     Message {
         role: Role::Assistant,
         content: vec![ContentBlock::ToolUse {
+            execution_id: None,
             id: id.to_string(),
             name: name.to_string(),
             input,
@@ -1011,6 +1012,7 @@ fn tool_result_message(id: &str, content: &str) -> Message {
     Message {
         role: Role::User,
         content: vec![ContentBlock::ToolResult {
+            execution_id: None,
             tool_use_id: id.to_string(),
             content: content.to_string(),
             is_error: None,
@@ -1231,7 +1233,7 @@ fn cache_inspect_reports_turn_meta_dedup_metadata() {
 
 #[test]
 fn request_builder_truncates_large_tool_result_for_wire() {
-    let long_output = format!("{}{}", "A".repeat(7_000), "Z".repeat(7_000));
+    let long_output = format!("{}{}", "A".repeat(70_000), "Z".repeat(70_000));
     let messages = vec![
         tool_use_message(
             "tool-long",
@@ -1247,20 +1249,92 @@ fn request_builder_truncates_large_tool_result_for_wire() {
     assert!(sent.contains("[TOOL_RESULT_TRUNCATED]"), "got: {sent}");
     assert!(sent.contains("tool_name: shell_command"), "got: {sent}");
     assert!(sent.contains("command_or_query: cargo test"), "got: {sent}");
-    assert!(sent.contains("original_chars: 14000"), "got: {sent}");
+    assert!(sent.contains("original_chars: 140000"), "got: {sent}");
     assert!(sent.contains("sha256:"), "got: {sent}");
     assert!(
         sent.contains("exact_detail: unavailable; no session-owned artifact was recorded"),
         "got: {sent}"
     );
     assert!(!sent.contains("retrieve_tool_result"), "got: {sent}");
-    assert!(sent.contains(&"A".repeat(4_000)), "got: {sent}");
-    assert!(sent.contains(&"Z".repeat(4_000)), "got: {sent}");
+    // The model catalog supplies the window when no explicit route is available.
+    let budget = tool_result_sent_char_budget("deepseek-v4-flash");
+    assert!(budget >= 100_000);
+    let excerpt = budget - TOOL_RESULT_EXCERPT_FRAME_CHARS;
+    let head = excerpt * 2 / 3;
+    assert!(sent.contains(&"A".repeat(head)), "head kept");
+    assert!(sent.contains(&"Z".repeat(excerpt - head)), "tail kept");
     assert!(
-        sent.contains("truncated 6000 chars from middle"),
-        "got: {sent}"
+        sent.contains(&format!(
+            "truncated {} chars from middle",
+            140_000 - excerpt
+        )),
+        "omitted count"
     );
     assert_ne!(sent, long_output);
+}
+
+#[test]
+fn restored_tool_results_obey_the_active_route_budget() {
+    let output = "x".repeat(20_000);
+    let recovery = format!(
+        "{output}\n{}",
+        crate::tools::truncate::SPILLOVER_RECOVERY_HINT
+    );
+    let request = MessageRequest {
+        model: "trinity-mini".into(),
+        messages: vec![
+            tool_use_message("raw", "read_file", json!({"path": "a.rs"})),
+            tool_result_message("raw", &output),
+            tool_use_message("repeat", "read_file", json!({"path": "a.rs"})),
+            tool_result_message("repeat", &output),
+            tool_use_message("saved", "read_file", json!({"path": "b.rs"})),
+            tool_result_message("saved", &recovery),
+        ],
+        max_tokens: 1_024,
+        system: None,
+        tools: None,
+        tool_choice: None,
+        metadata: None,
+        thinking: None,
+        reasoning_effort: None,
+        stream: None,
+        temperature: None,
+        top_p: None,
+    };
+    // The bundled 128K route and an explicit smaller offering both beat
+    // the old unknown-route 100K ceiling. Streaming and blocking share it.
+    for (limits, expected_budget) in [
+        (None, 15_360),
+        (
+            Some(RouteLimits {
+                context_tokens: Some(32_000),
+                ..RouteLimits::default()
+            }),
+            3_840,
+        ),
+    ] {
+        for stream in [false, true] {
+            let wire = build_chat_wire_body(
+                &request,
+                ApiProvider::Arcee,
+                "https://api.arcee.ai/api/v1",
+                stream,
+                limits,
+            )
+            .unwrap();
+            let messages = wire.body["messages"].as_array().unwrap();
+            for index in [0, 1] {
+                let sent = tool_message_content(messages, index);
+                assert!(sent.contains("[TOOL_RESULT_TRUNCATED]"));
+                assert!(sent.chars().count() <= expected_budget);
+                assert!(!sent.contains("<TOOL_RESULT_REF"));
+                assert!(sent.contains("exact_detail: unavailable"));
+            }
+            assert_eq!(tool_message_content(messages, 2), recovery);
+        }
+    }
+    assert!(matches!(&request.messages[1].content[0],
+        ContentBlock::ToolResult { content, .. } if content == &output));
 }
 
 #[test]
@@ -1288,7 +1362,7 @@ fn request_builder_keeps_unowned_extreme_tool_output_bounded_without_false_hint(
         assert!(sent.contains("exact_detail: unavailable"), "got: {sent}");
         assert!(!sent.contains("retrieve_tool_result"), "got: {sent}");
         assert!(
-            sent.chars().count() <= TOOL_RESULT_SENT_CHAR_BUDGET,
+            sent.chars().count() <= tool_result_sent_char_budget("deepseek-v4-flash"),
             "truncated result should stay bounded, sent {} chars",
             sent.chars().count()
         );
@@ -1323,7 +1397,7 @@ fn request_builder_does_not_dedup_short_tool_results_for_wire() {
 fn request_builder_deduplicates_medium_identical_tool_results_to_earlier_message() {
     with_tool_result_sha_spillover_root(|| {
         // 2,000 chars is intentionally above TOOL_RESULT_DEDUP_MIN_CHARS
-        // (1,024) but below TOOL_RESULT_SENT_CHAR_BUDGET (12,000). This
+        // (1,024) but below the wire backstop budget. This
         // verifies the cache-saving path for repeated medium outputs that
         // do not otherwise need truncation.
         let output = "A".repeat(2_000);
@@ -1408,7 +1482,7 @@ fn large_unowned_results_stay_bounded_without_false_retrieval_handles() {
     // session-owned artifact receipt before this provider-wire fallback.
     // If legacy/raw history reaches here, it may be excerpted but must not
     // advertise the process-wide SHA store as retrievable.
-    let big_diff = "D".repeat(20_000);
+    let big_diff = "D".repeat(120_000);
     let sha = sha256_hex(big_diff.as_bytes());
 
     let messages = vec![
@@ -1463,7 +1537,7 @@ fn large_unowned_results_stay_bounded_without_false_retrieval_handles() {
 
 #[test]
 fn tool_result_budget_is_wire_only_and_does_not_mutate_session_message() {
-    let long_output = format!("{}{}", "A".repeat(7_000), "Z".repeat(7_000));
+    let long_output = format!("{}{}", "A".repeat(70_000), "Z".repeat(70_000));
     let messages = vec![
         tool_use_message(
             "tool-long",
@@ -1485,7 +1559,7 @@ fn tool_result_budget_is_wire_only_and_does_not_mutate_session_message() {
 
 #[test]
 fn cache_inspect_reports_bounded_unowned_tool_result_metadata() {
-    let long_output = format!("{}{}", "A".repeat(7_000), "Z".repeat(7_000));
+    let long_output = format!("{}{}", "A".repeat(70_000), "Z".repeat(70_000));
     let request = MessageRequest {
         model: "deepseek-v4-flash".to_string(),
         messages: vec![
@@ -1515,7 +1589,7 @@ fn cache_inspect_reports_bounded_unowned_tool_result_metadata() {
 
     assert_eq!(tool_layers.len(), 2);
     for layer in tool_layers {
-        assert_eq!(layer.original_chars, 14_000);
+        assert_eq!(layer.original_chars, 140_000);
         assert!(layer.sent_chars < layer.original_chars);
         assert!(layer.truncated);
         assert!(!layer.deduplicated);

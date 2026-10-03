@@ -9,6 +9,7 @@
 use crate::tui::approval::{RiskLevel, ToolCategory, classify_risk, get_tool_category_for_call};
 use codewhale_execpolicy::ApprovalMode;
 use serde_json::{Value, json};
+use std::borrow::Cow;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AutoReviewAction {
@@ -87,11 +88,21 @@ impl ToolActionKind {
 
     #[must_use]
     pub fn from_tool_name(tool_name: &str, category: ToolCategory) -> Self {
-        Self::from_tool_call(tool_name, &Value::Null, category)
+        Self::from_tool_call(tool_name, &Value::Null, category, None)
     }
 
+    /// `workspace`, when known, lets a forced delete of a path inside it stay
+    /// ordinary work instead of a catastrophic system-path delete.
+    /// A workspace enables filesystem evidence, so runtime callers must use
+    /// the blocking-pool context constructor. UI-only classification passes
+    /// `None` and does no filesystem I/O.
     #[must_use]
-    pub fn from_tool_call(tool_name: &str, params: &Value, category: ToolCategory) -> Self {
+    pub fn from_tool_call(
+        tool_name: &str,
+        params: &Value,
+        category: ToolCategory,
+        workspace: Option<&std::path::Path>,
+    ) -> Self {
         let qualified = action_qualified_tool_name(tool_name, params);
         let normalized = qualified.to_ascii_lowercase();
         let normalized = normalized.as_str();
@@ -128,7 +139,9 @@ impl ToolActionKind {
         if matches!(category, ToolCategory::Shell) && shell_params_are_publish_like(params) {
             return Self::Publish;
         }
-        if matches!(category, ToolCategory::Shell) && shell_params_are_destructive_like(params) {
+        if matches!(category, ToolCategory::Shell)
+            && shell_params_are_destructive_like(params, workspace)
+        {
             return Self::Destructive;
         }
 
@@ -389,7 +402,7 @@ impl RunOrigin {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AutoReviewContext<'a> {
-    pub tool_name: &'a str,
+    pub tool_name: Cow<'a, str>,
     pub category: ToolCategory,
     pub risk: RiskLevel,
     pub action_kind: ToolActionKind,
@@ -406,6 +419,46 @@ pub struct AutoReviewContext<'a> {
 }
 
 impl<'a> AutoReviewContext<'a> {
+    /// Resolve filesystem and Git evidence on the blocking pool. Worker
+    /// failure is an admission error, never evidence that a call is safe.
+    pub async fn from_tool_call_async(
+        tool_name: &str,
+        params: &Value,
+        run_origin: RunOrigin,
+        approval_mode: ApprovalMode,
+        workspace: Option<&std::path::Path>,
+    ) -> Result<Self, crate::tools::spec::ToolError> {
+        let tool_name = tool_name.to_owned();
+        let params = params.clone();
+        let workspace = workspace.map(std::path::Path::to_path_buf);
+        #[cfg(test)]
+        let env_ticket = crate::test_support::env_scope_ticket();
+        tokio::task::spawn_blocking(move || {
+            #[cfg(test)]
+            let _membership = crate::test_support::join_env_scope(env_ticket);
+            let trusted = workspace
+                .as_deref()
+                .is_some_and(crate::config::is_workspace_trusted);
+            AutoReviewContext::<'static>::from_tool_call_inner(
+                Cow::Owned(tool_name),
+                &params,
+                run_origin,
+                approval_mode,
+                trusted,
+                workspace.as_deref(),
+            )
+        })
+        .await
+        .map_err(|error| {
+            crate::tools::spec::ToolError::execution_failed(format!(
+                "Auto-review evidence could not be prepared: {error}"
+            ))
+        })
+    }
+
+    /// Synchronous construction is reserved for focused policy tests. Runtime
+    /// callers must use the blocking-pool constructor above.
+    #[cfg(test)]
     #[must_use]
     pub fn from_tool_call(
         tool_name: &'a str,
@@ -415,19 +468,37 @@ impl<'a> AutoReviewContext<'a> {
         workspace_trusted: bool,
         workspace: Option<&std::path::Path>,
     ) -> Self {
-        let category = get_tool_category_for_call(tool_name, params);
+        Self::from_tool_call_inner(
+            Cow::Borrowed(tool_name),
+            params,
+            run_origin,
+            approval_mode,
+            workspace_trusted,
+            workspace,
+        )
+    }
+
+    fn from_tool_call_inner(
+        tool_name: Cow<'a, str>,
+        params: &Value,
+        run_origin: RunOrigin,
+        approval_mode: ApprovalMode,
+        workspace_trusted: bool,
+        workspace: Option<&std::path::Path>,
+    ) -> Self {
+        let name = tool_name.as_ref();
+        let category = get_tool_category_for_call(name, params);
         // A read-category name that also says it mutates is not benign, or
         // the read-only allow would wave it through before any review (V3).
         let risk = if matches!(category, ToolCategory::Safe | ToolCategory::McpRead)
-            && read_prefixed_name_mutates(&action_qualified_tool_name(tool_name, params))
+            && read_prefixed_name_mutates(&action_qualified_tool_name(name, params))
         {
             RiskLevel::Destructive
         } else {
-            classify_risk(tool_name, category, params)
+            classify_risk(name, category, params)
         };
-        let action_kind = ToolActionKind::from_tool_call(tool_name, params, category);
+        let action_kind = ToolActionKind::from_tool_call(name, params, category, workspace);
         Self {
-            tool_name,
             category,
             risk,
             action_kind,
@@ -437,18 +508,18 @@ impl<'a> AutoReviewContext<'a> {
             approval_mode,
             workspace_trusted,
             outbound_web_request: matches!(
-                crate::tools::canonical_action::canonical_action_alias(tool_name, params),
+                crate::tools::canonical_action::canonical_action_alias(name, params),
                 "web_search" | "fetch_url" | "web_run" | "web.run"
             ),
             write_targets_bounded: workspace
-                .zip(file_write_target_paths(tool_name, params))
+                .zip(file_write_target_paths(name, params))
                 .is_some_and(|(workspace, paths)| {
                     crate::core::authority::paths_within_workspace_write_carve_out(
                         workspace, &paths,
                     )
                 }),
             unrecoverable_deletes: {
-                let deletes = file_write_delete_paths(tool_name, params, workspace);
+                let deletes = file_write_delete_paths(name, params, workspace);
                 if deletes.is_empty() {
                     deletes
                 } else {
@@ -457,6 +528,7 @@ impl<'a> AutoReviewContext<'a> {
                         .unwrap_or(deletes)
                 }
             },
+            tool_name,
         }
     }
 }
@@ -504,7 +576,7 @@ impl AutoReviewRule {
 
     fn matches(&self, ctx: &AutoReviewContext<'_>) -> bool {
         if let Some(tool_name) = self.tool_name.as_deref()
-            && tool_name != ctx.tool_name
+            && tool_name != ctx.tool_name.as_ref()
         {
             return false;
         }
@@ -660,6 +732,9 @@ fn deterministic_fallback(
 }
 
 fn file_write_target_paths(tool_name: &str, input: &Value) -> Option<Vec<String>> {
+    // Judge the path the tool will write: it folds `file_path`/`filePath`
+    // onto `path` before executing.
+    let input = &*crate::tools::file::with_canonical_path_argument(input);
     let canonical = crate::tools::canonical_action::canonical_action_alias(tool_name, input);
     Some(match canonical {
         "write_file" | "edit_file" => vec![
@@ -695,6 +770,7 @@ fn file_write_delete_paths(
     input: &Value,
     workspace: Option<&std::path::Path>,
 ) -> Vec<String> {
+    let input = &*crate::tools::file::with_canonical_path_argument(input);
     let empties_existing = |entry: &Value| -> Option<String> {
         let path = entry
             .get("path")
@@ -893,9 +969,9 @@ pub(crate) fn build_reviewer_context(
     use codewhale_secrets::redact::{redact_json_model_bound_secrets, redact_model_bound_secrets};
 
     let input = redact_json_model_bound_secrets(tool_input);
-    let tool = redact_model_bound_secrets(ctx.tool_name);
+    let tool = redact_model_bound_secrets(ctx.tool_name.as_ref());
     let hold_reason = redact_model_bound_secrets(held_reason);
-    let credentials_masked = input != *tool_input || tool != ctx.tool_name;
+    let credentials_masked = input != *tool_input || tool != ctx.tool_name.as_ref();
     serde_json::to_string(&serde_json::json!({
         "proposed_tool_call": {
             "tool": tool,
@@ -1005,15 +1081,16 @@ fn shell_params_are_publish_like(params: &Value) -> bool {
         .any(|tokens| shell_tokens_are_publish_like(&tokens))
 }
 
-/// True when any segment of the shell command is genuinely destructive: the
-/// command-safety analyzer's `Dangerous` verdict (`rm -rf /`, `curl | sh`,
-/// `eval`, fork bombs) OR the catastrophic-write classes
-/// [`segment_is_device_or_filesystem_destroyer`] adds (`dd` to a device,
-/// `mkfs`/`shred`/`wipefs`, forced recursive deletion of an absolute system
-/// path). This is what keeps the background/headless durable-review floor
-/// armed now that the floor no longer treats every non-read-only command as
-/// destructive (#3883).
-fn shell_params_are_destructive_like(params: &Value) -> bool {
+/// True when the shell command is genuinely destructive: the command-safety
+/// analyzer's `Dangerous` verdict for any segment (`rm -rf /`, `curl | sh`,
+/// `eval`, fork bombs) OR a catastrophic write [`argv_is_destroyer`] finds in
+/// any command it could run. This is what keeps the background/headless
+/// durable-review floor armed now that the floor no longer treats every
+/// non-read-only command as destructive (#3883).
+fn shell_params_are_destructive_like(params: &Value, workspace: Option<&std::path::Path>) -> bool {
+    use codewhale_execpolicy::command_safety::{
+        SafetyLevel, analyze_command, command_invocations, is_literal_rm_invocation,
+    };
     let Some(command) = params
         .get("command")
         .or_else(|| params.get("cmd"))
@@ -1024,147 +1101,94 @@ fn shell_params_are_destructive_like(params: &Value) -> bool {
 
     split_shell_segments_for_review(command)
         .iter()
-        .any(|segment| {
-            codewhale_execpolicy::command_safety::analyze_command(segment).level
-                == codewhale_execpolicy::command_safety::SafetyLevel::Dangerous
-                || segment_is_device_or_filesystem_destroyer(segment)
+        .any(|segment| analyze_command(segment).level == SafetyLevel::Dangerous)
+        // Only one literal rm may use paths resolved before execution. Any
+        // earlier command could replace an ancestor (mv and Python can do
+        // that just as ln can), invalidating the workspace clearance.
+        || command_invocations(command).is_none_or(|argvs| {
+            let workspace = workspace.filter(|_| is_literal_rm_invocation(command));
+            argvs.iter().any(|argv| argv_is_destroyer(argv, workspace))
         })
 }
 
 /// The non-bypassable floor must hold genuinely catastrophic writes even when
 /// `command_safety` (tuned to avoid over-blocking build/test chains) rates
-/// them merely `RequiresApproval`. This covers the classes that irreversibly
-/// destroy a disk or a system tree — `dd`/`shred`/`wipefs` onto a device,
-/// `mkfs`, and forced recursive deletion of an absolute system path — so a
-/// background/headless call in YOLO cannot run them without durable review
-/// (#3883 follow-up; the earlier narrowing lost this coverage).
-fn segment_is_device_or_filesystem_destroyer(segment: &str) -> bool {
-    // A command may be piped (`cat x | dd of=/dev/sda`); each stage is its own
-    // effective command, so check every pipe stage.
-    segment
-        .split('|')
-        .any(stage_is_device_or_filesystem_destroyer)
-}
-
-/// Strip a surrounding pair of single or double quotes from a shell token so
-/// `"dd"`, `'mkfs'`, and `of="/dev/sda"` values match their bare forms.
-fn unquote_token(token: &str) -> &str {
-    let t = token.trim();
-    for q in ['"', '\''] {
-        if t.len() >= 2 && t.starts_with(q) && t.ends_with(q) {
-            return &t[1..t.len() - 1];
-        }
-    }
-    t
-}
-
-/// Peel leading `VAR=val` env assignments and command wrappers
-/// (`sudo`/`env`/`nohup`/`time`/`command`/`nice`/`ionice`/`doas`/`stdbuf`/
-/// `timeout`/`setsid`) plus their flags, so `FOO=bar sudo -n dd of=/dev/sda`
-/// resolves to the real `dd` command. Best-effort: exotic
-/// wrapper-with-positional-arg forms may slip, but the common evasions
-/// (env assignment, sudo/env/nohup prefix) are covered.
-fn effective_command_tokens<'a>(tokens: &'a [&'a str]) -> &'a [&'a str] {
-    const WRAPPERS: &[&str] = &[
-        "sudo", "env", "nohup", "time", "command", "nice", "ionice", "doas", "stdbuf", "timeout",
-        "setsid",
-    ];
-    let mut i = 0;
-    while i < tokens.len() {
-        let raw = unquote_token(tokens[i]);
-        // Leading env assignment: VAR=value (no slash before the '=').
-        if let Some(eq) = raw.find('=')
-            && eq > 0
-            && !raw[..eq].contains('/')
-        {
-            i += 1;
-            continue;
-        }
-        let base = raw
-            .trim_start_matches("./")
-            .rsplit('/')
-            .next()
-            .unwrap_or(raw);
-        if WRAPPERS.contains(&base) {
-            let is_timeout = base == "timeout";
-            i += 1;
-            // Skip that wrapper's leading flags and env's VAR=val args.
-            while i < tokens.len() {
-                let f = unquote_token(tokens[i]);
-                let is_env_assign = f
-                    .find('=')
-                    .is_some_and(|eq| eq > 0 && !f[..eq].contains('/'));
-                if f.starts_with('-') || is_env_assign {
-                    i += 1;
-                } else {
-                    break;
-                }
-            }
-            // `timeout` takes a positional DURATION before the command.
-            if is_timeout
-                && i < tokens.len()
-                && unquote_token(tokens[i])
-                    .chars()
-                    .next()
-                    .is_some_and(|c| c.is_ascii_digit())
-            {
-                i += 1;
-            }
-            continue;
-        }
-        break;
-    }
-    &tokens[i..]
-}
-
-fn stage_is_device_or_filesystem_destroyer(stage: &str) -> bool {
-    let raw_tokens: Vec<&str> = stage.split_whitespace().collect();
-    let tokens = effective_command_tokens(&raw_tokens);
-    let Some(cmd) = tokens
-        .first()
-        .map(|t| unquote_token(t).trim_start_matches("./"))
-    else {
+/// them merely `RequiresApproval`: `dd`/`shred`/`wipefs` onto a device,
+/// `mkfs`, and a forced recursive delete of an absolute path that is not
+/// provably inside a safe workspace (#3883 follow-up).
+fn argv_is_destroyer(argv: &[String], workspace: Option<&std::path::Path>) -> bool {
+    let Some((command, args)) = argv.split_first() else {
         return false;
     };
-    let base = cmd.rsplit('/').next().unwrap_or(cmd);
-    // Filesystem creation / whole-device wipes: the target IS destruction.
-    if matches!(base, "mkfs" | "wipefs" | "shred" | "blkdiscard") || base.starts_with("mkfs.") {
-        return true;
-    }
-    // `dd` writing to a block device (of=/dev/...): overwrites the raw disk.
-    if base == "dd" {
-        return tokens.iter().any(|t| {
-            unquote_token(t)
-                .strip_prefix("of=")
-                .map(|dest| unquote_token(dest).starts_with("/dev/"))
-                .unwrap_or(false)
-        });
-    }
-    // Forced recursive deletion aimed at an absolute path outside the
-    // workspace (e.g. `rm -rf /etc`, `/usr`, `/var`): command_safety only
-    // flags root/home/parent-escape, so catch absolute-system targets here.
-    if base == "rm" {
-        let mut recursive = false;
-        let mut force = false;
-        let mut abs_system_target = false;
-        for token in &tokens[1..] {
-            let token = unquote_token(token);
-            if token.starts_with("--") {
-                match token {
+    match command.as_str() {
+        "mkfs" | "wipefs" | "shred" | "blkdiscard" => true,
+        name if name.starts_with("mkfs.") => true,
+        "dd" => args.iter().any(|arg| {
+            arg.strip_prefix("of=")
+                .is_some_and(|dest| dest.starts_with("/dev/"))
+        }),
+        "rm" => {
+            let (mut recursive, mut force) = (false, false);
+            let mut outside_target = false;
+            for arg in args {
+                match arg.as_str() {
                     "--recursive" | "--dir" => recursive = true,
                     "--force" => force = true,
+                    flag if flag.starts_with('-') && !flag.starts_with("--") => {
+                        recursive |= flag.contains(['r', 'R']);
+                        force |= flag.contains('f');
+                    }
+                    target if target.starts_with('/') => {
+                        outside_target |= !strictly_inside(workspace, target);
+                    }
                     _ => {}
                 }
-            } else if let Some(flags) = token.strip_prefix('-') {
-                recursive |= flags.contains('r') || flags.contains('R');
-                force |= flags.contains('f');
-            } else if token.starts_with('/') {
-                abs_system_target = true;
             }
+            recursive && force && outside_target
         }
-        return recursive && force && abs_system_target;
+        _ => false,
     }
-    false
+}
+
+/// Whether absolute `target` provably resolves strictly below a safe
+/// `workspace`. Fails closed: no workspace, a workspace at `/`, home, or a
+/// top-level home folder, a target carrying glob, brace, `~` or `$` (their
+/// expansion is unknowable here, and `<ws>/*` is the whole workspace), a
+/// target that does not exist yet, the workspace root itself, a `..` escape,
+/// or a symlink hop out of it.
+fn strictly_inside(workspace: Option<&std::path::Path>, target: &str) -> bool {
+    use crate::tools::spec::normalize_path;
+    let Some(workspace) = workspace else {
+        return false;
+    };
+    if target.contains(['*', '?', '[', ']', '{', '}', '~', '$'])
+        || crate::snapshot::repo::unsafe_workspace_snapshot_reason(
+            &workspace
+                .canonicalize()
+                .unwrap_or_else(|_| workspace.to_path_buf()),
+            crate::config::effective_home_dir().as_deref(),
+        )
+        .is_some()
+    {
+        return false;
+    }
+    let target = std::path::Path::new(target);
+    let lexical = normalize_path(target);
+    // A target that does not exist yet proves nothing about what it will be
+    // when `rm` runs (`ln -s / ws/x && rm -rf ws/x/etc`).
+    let Ok(resolved) = target.canonicalize() else {
+        return false;
+    };
+    let roots = [
+        normalize_path(workspace),
+        workspace.canonicalize().unwrap_or_default(),
+    ];
+    let below = |path: &std::path::Path| {
+        roots
+            .iter()
+            .any(|root| !root.as_os_str().is_empty() && path.starts_with(root) && path != root)
+    };
+    below(&lexical) && below(&resolved)
 }
 
 fn shell_tokens_are_publish_like(tokens: &[&str]) -> bool {
@@ -1686,6 +1710,251 @@ mod tests {
                 ApprovalMode::Bypass,
             );
             assert_safety_gate(&policy.evaluate(&ctx));
+        }
+    }
+
+    fn destroyer_held(workspace: &std::path::Path, command: &str) -> bool {
+        let ctx = AutoReviewContext::from_tool_call(
+            "exec_shell",
+            &json!({ "command": command, "background": true }),
+            RunOrigin::Background,
+            ApprovalMode::Bypass,
+            true,
+            Some(workspace),
+        );
+        AutoReviewPolicy::default()
+            .evaluate(&ctx)
+            .built_in_safety_gate
+    }
+
+    /// A forced delete of an existing absolute path inside the workspace is
+    /// ordinary cleanup, not a system-tree destroyer. The workspace root
+    /// itself, a `..` escape, a symlink hop out, and a system path all hold.
+    // POSIX rm path clearance is exercised with Unix filesystem paths.
+    // Windows live-posture execution has native shell fixtures in subagent tests.
+    #[cfg(unix)]
+    #[test]
+    fn absolute_forced_delete_inside_the_workspace_is_not_a_destroyer() {
+        let workspace = tempfile::tempdir().expect("tempdir");
+        let root = workspace.path();
+        std::fs::create_dir_all(root.join("build")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("/usr", root.join("escape")).unwrap();
+        let at = |rel: &str| root.join(rel).display().to_string();
+        assert!(!destroyer_held(root, &format!("rm -rf {}", at("build"))));
+        assert!(destroyer_held(root, &format!("rm -rf {}", root.display())));
+        assert!(destroyer_held(
+            root,
+            &format!("rm -rf {}", at("build/../.."))
+        ));
+        #[cfg(unix)]
+        assert!(destroyer_held(root, &format!("rm -rf {}/", at("escape"))));
+        assert!(destroyer_held(root, "rm -rf /usr"));
+    }
+
+    /// Second review of 05264125e: once `rm -rf /` stopped matching every
+    /// absolute path, only the destroyer check held these, and its own
+    /// wrapper peeler was weaker than command_safety's. It now reads commands
+    /// with command_safety's reader; every one of these holds again.
+    #[test]
+    fn wrapped_system_deletes_are_destroyers() {
+        let workspace = tempfile::tempdir().expect("tempdir");
+        for command in [
+            "bash -c 'rm -rf /home/me'",
+            "sh -c \"rm -rf /etc\"",
+            "sh -c 'cd /tmp; rm -rf /etc'",
+            "echo x | xargs rm -rf /home/me",
+            "nice -n 19 rm -rf /home/me",
+            "ionice -c 3 rm -rf /home/me",
+            "timeout -s KILL 60 rm -rf /home/me",
+            "sudo -u me rm -rf /home/me",
+            "\\rm -rf /home/me",
+            "/bin/rm -rf /home/me",
+            "FOO=1 env -i rm -rf /home/me",
+            "command rm -rf /etc",
+            "exec rm -rf /etc",
+            "eval 'rm -rf /etc'",
+            "r''m -rf /etc",
+            "rm -r -f /etc",
+            "rm --recursive --force /etc",
+            "rm -rf -- /etc",
+            "find / -delete",
+            "busybox rm -rf /etc",
+            "nohup rm -rf /etc",
+            "xargs -0 rm -rf /etc",
+        ] {
+            assert!(destroyer_held(workspace.path(), command), "{command}");
+        }
+    }
+
+    #[test]
+    fn opaque_program_deletes_keep_the_legacy_destroyer_floor() {
+        let workspace = tempfile::tempdir().expect("tempdir");
+        for command in [
+            r#"python3 -c '__import__("os").system("rm -rf /etc")'"#,
+            r#"perl -e 'system("rm -rf /etc")'"#,
+        ] {
+            assert!(destroyer_held(workspace.path(), command), "{command}");
+        }
+    }
+
+    // POSIX rm path clearance is exercised with Unix filesystem paths.
+    // Windows live-posture execution has native shell fixtures in subagent tests.
+    #[cfg(unix)]
+    #[test]
+    fn wrappers_cannot_borrow_workspace_path_clearance() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        std::fs::create_dir(workspace.path().join("build")).unwrap();
+        let build = workspace.path().join("build").display().to_string();
+        for command in [
+            format!("sudo --chroot=/other-root rm -rf {build}"),
+            format!("sudo --chroot=/other-root rm -r -f {build}"),
+        ] {
+            assert!(destroyer_held(workspace.path(), &command), "{command}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn composed_deletes_cannot_clear_paths_that_an_earlier_command_rebinds() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let outside = tempfile::tempdir().expect("outside");
+        let root = workspace.path();
+        std::fs::create_dir_all(root.join("build/data")).unwrap();
+        std::fs::create_dir_all(outside.path().join("data")).unwrap();
+        let sentinel = outside.path().join("data/keep");
+        std::fs::write(&sentinel, b"keep").unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.join("link")).unwrap();
+        let ws = root.display();
+        for flags in ["-rf", "-r -f", "--recursive --force"] {
+            let command = format!(
+                "mv {ws}/build {ws}/saved && mv {ws}/link {ws}/build && rm {flags} {ws}/build/data"
+            );
+            assert!(destroyer_held(root, &command), "{command}");
+        }
+        // Exercise only the harmless rebinding, never the destructive command:
+        // the path checked inside the workspace would now delete outside it.
+        assert!(
+            root.join("build/data")
+                .canonicalize()
+                .unwrap()
+                .starts_with(root.canonicalize().unwrap())
+        );
+        std::fs::rename(root.join("build"), root.join("saved")).unwrap();
+        std::fs::rename(root.join("link"), root.join("build")).unwrap();
+        assert_eq!(
+            root.join("build/data").canonicalize().unwrap(),
+            outside.path().join("data").canonicalize().unwrap()
+        );
+        assert_eq!(std::fs::read(sentinel).unwrap(), b"keep");
+    }
+
+    // POSIX rm path clearance is exercised with Unix filesystem paths.
+    // Windows live-posture execution has native shell fixtures in subagent tests.
+    #[cfg(unix)]
+    #[test]
+    fn full_access_workspace_cleanup_stays_clear() {
+        use crate::core::engine::{AutoReviewPlanDecision, auto_review_plan_decision_for_context};
+
+        let workspace = tempfile::tempdir().expect("workspace");
+        let root = workspace.path();
+        for directory in ["target", "build", "node_modules"] {
+            std::fs::create_dir(root.join(directory)).unwrap();
+        }
+        let ws = root.display();
+        for command in [
+            "rm -rf target build node_modules".to_string(),
+            format!("rm -rf {ws}/target {ws}/build {ws}/node_modules"),
+        ] {
+            assert!(!destroyer_held(root, &command), "{command}");
+            let context = AutoReviewContext::from_tool_call(
+                "bash",
+                &json!({"command": command}),
+                RunOrigin::Interactive,
+                ApprovalMode::Bypass,
+                true,
+                Some(root),
+            );
+            let (decision, _) =
+                auto_review_plan_decision_for_context(&AutoReviewPolicy::default(), &context);
+            assert!(
+                !matches!(decision, AutoReviewPlanDecision::Block(_)),
+                "Full Access parent cleanup must run: {decision:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn full_access_blocks_detached_catastrophic_tools_without_prompting() {
+        use crate::core::engine::{AutoReviewPlanDecision, auto_review_plan_decision_for_context};
+
+        for run_origin in [RunOrigin::Background, RunOrigin::Headless] {
+            let context = AutoReviewContext::from_tool_call(
+                "exec_shell",
+                &json!({"command": "rm -rf ~/", "background": true}),
+                run_origin,
+                ApprovalMode::Bypass,
+                true,
+                None,
+            );
+            let (decision, audit) =
+                auto_review_plan_decision_for_context(&AutoReviewPolicy::default(), &context);
+            assert_eq!(
+                decision,
+                AutoReviewPlanDecision::Block(
+                    "Built-in safety gate requires approval: destructive background/headless action requires durable review"
+                        .to_string()
+                )
+            );
+            assert_eq!(audit["approval_mode"], "BYPASS");
+            assert_eq!(audit["run_origin"], run_origin.as_str());
+            assert_eq!(audit["decision"], "hold_for_review");
+        }
+    }
+
+    /// Second review of 05264125e: targets whose meaning is only known when
+    /// the shell runs never count as inside the workspace.
+    // POSIX rm path clearance is exercised with Unix filesystem paths.
+    // Windows live-posture execution has native shell fixtures in subagent tests.
+    #[cfg(unix)]
+    #[test]
+    fn unknowable_or_unsafe_targets_are_never_inside_the_workspace() {
+        let workspace = tempfile::tempdir().expect("tempdir");
+        #[cfg(unix)]
+        let outside = tempfile::tempdir().expect("tempdir");
+        let root = workspace.path();
+        std::fs::create_dir_all(root.join("build")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(outside.path(), root.join("data")).unwrap();
+        let ws = root.display();
+        for command in [
+            format!("rm -rf {ws}/data/*"),
+            format!("rm -rf {ws}/*"),
+            format!("rm -rf {ws}/{{build,..}}"),
+            format!("rm -rf {ws}/build?"),
+            format!("rm -rf {ws}/[b]uild"),
+            format!("rm -rf {ws}/$TARGET"),
+            format!("rm -rf {ws}/~"),
+            format!("ln -s / {ws}/x && rm -rf {ws}/x/etc"),
+            format!("ln -s / {ws}/build/x; rm -rf {ws}/build"),
+            format!("rm -rf {ws}/not-there-yet"),
+        ] {
+            assert!(destroyer_held(root, &command), "{command}");
+        }
+        // Unsafe workspaces clear nothing by being "inside" them.
+        assert!(destroyer_held(std::path::Path::new("/"), "rm -rf /usr"));
+        if let Some(home) = crate::config::effective_home_dir()
+            && let Some(existing) = std::fs::read_dir(&home).ok().and_then(|entries| {
+                entries
+                    .flatten()
+                    .map(|entry| entry.path())
+                    .find(|path| path.is_dir())
+            })
+        {
+            assert!(destroyer_held(
+                &home,
+                &format!("rm -rf {}", existing.display())
+            ));
         }
     }
 
@@ -2424,6 +2693,111 @@ mod tests {
         )
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn auto_review_worker_keeps_the_callers_sealed_environment() {
+        use crate::test_support::{EnvVarGuard, lock_test_env};
+        use std::time::Duration;
+
+        let _lock = lock_test_env();
+        let home = tempfile::tempdir().expect("test home");
+        let workspace = tempfile::tempdir().expect("workspace");
+        let _home = EnvVarGuard::set("CODEWHALE_HOME", home.path());
+        crate::config::save_workspace_trust(workspace.path()).expect("save trust");
+
+        let context = tokio::time::timeout(
+            Duration::from_secs(2),
+            AutoReviewContext::from_tool_call_async(
+                "read_file",
+                &json!({ "path": "README.md" }),
+                RunOrigin::Interactive,
+                ApprovalMode::Auto,
+                Some(workspace.path()),
+            ),
+        )
+        .await
+        .expect("worker must not wait for its awaiting caller's environment lock")
+        .expect("evidence");
+        assert!(
+            context.workspace_trusted,
+            "worker must read the sealed trust file"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn auto_review_filesystem_evidence_does_not_park_runtime() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::time::{Duration, Instant};
+
+        let dir = patch_workspace();
+        let config_path = dir.path().join(".git/config");
+        let saved_config_path = dir.path().join(".git/config.saved");
+        std::fs::rename(&config_path, &saved_config_path).unwrap();
+        let path = std::ffi::CString::new(config_path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: a live, NUL-terminated path inside this test's private repo.
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        let (opened_tx, opened_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            // Nonblocking writer-open bounds the case where admission never
+            // reaches Git. Once Git reads the FIFO, an independent OS-thread
+            // watchdog also releases it if the current-thread runtime stalls.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let pipe = loop {
+                match std::fs::OpenOptions::new()
+                    .write(true)
+                    .custom_flags(libc::O_NONBLOCK)
+                    .open(&config_path)
+                {
+                    Ok(pipe) => break Some(pipe),
+                    Err(_) if Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break None,
+                }
+            };
+            let peer_released = if pipe.is_some() {
+                let _ = opened_tx.send(());
+                release_rx.recv_timeout(Duration::from_secs(5)).is_ok()
+            } else {
+                false
+            };
+            // Replace the FIFO atomically before closing this writer: later
+            // Git opens see the original regular file, while the waiting
+            // reader receives EOF. No restoration write can block on a FIFO.
+            let restored = std::fs::rename(&saved_config_path, &config_path);
+            drop(pipe);
+            restored.unwrap();
+            peer_released
+        });
+
+        let workspace = dir.path().to_path_buf();
+        let params = delete_patch("untracked.txt", "only copy");
+        let review = tokio::spawn(async move {
+            AutoReviewContext::from_tool_call_async(
+                "apply_patch",
+                &params,
+                RunOrigin::Interactive,
+                ApprovalMode::Auto,
+                Some(&workspace),
+            )
+            .await
+        });
+        let opened = tokio::time::timeout(Duration::from_secs(12), opened_rx).await;
+        let peer_ran_before_watchdog =
+            opened.is_ok_and(|result| result.is_ok()) && release_tx.send(()).is_ok();
+        let context = review.await.unwrap().unwrap();
+        let released_by_peer = writer.join().unwrap();
+        assert!(
+            peer_ran_before_watchdog && released_by_peer,
+            "the runtime must release filesystem evidence before the OS-thread watchdog"
+        );
+        assert_eq!(context.tool_name, "apply_patch");
+        assert_eq!(context.unrecoverable_deletes, vec!["untracked.txt"]);
+        assert!(context.write_targets_bounded);
+    }
+
     #[test]
     fn patch_deletes_git_cannot_restore_are_reviewed() {
         use crate::core::engine::{AutoReviewPlanDecision, auto_review_plan_decision_for_context};
@@ -2505,6 +2879,19 @@ mod tests {
         let ctx = auto_write_ctx("write_file", &empty, root);
         assert_eq!(ctx.unrecoverable_deletes, vec!["untracked.txt".to_string()]);
         assert_eq!(policy.evaluate(&ctx).action, AutoReviewAction::AskUser);
+
+        // The tool folds `file_path`/`filePath` onto `path`; so does review.
+        for key in ["file_path", "filePath"] {
+            let aliased = json!({key: "untracked.txt", "content": ""});
+            let ctx = auto_write_ctx("write_file", &aliased, root);
+            assert_eq!(
+                ctx.unrecoverable_deletes,
+                vec!["untracked.txt".to_string()],
+                "{key}"
+            );
+            assert!(ctx.write_targets_bounded, "{key}");
+            assert_eq!(policy.evaluate(&ctx).action, AutoReviewAction::AskUser);
+        }
 
         let replace = json!({"replace": [
             {"path": "untracked.txt", "content": ""},

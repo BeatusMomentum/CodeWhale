@@ -677,20 +677,25 @@ async fn gather_diff_evidence(
 /// Run `git diff <args>` in `workspace`. Returns `Ok(None)` for an empty diff or
 /// when git is unavailable, and `Err` when git runs but reports failure.
 async fn run_git_diff(workspace: &Path, args: &[String]) -> Result<Option<String>, ToolError> {
-    let Some(mut cmd) = crate::dependencies::Git::command() else {
+    if !crate::dependencies::Git::available() {
         // git not installed: degrade gracefully rather than failing the tool.
         return Ok(None);
-    };
-    cmd.args(["diff", "--no-ext-diff", "--no-textconv"]);
-    for arg in args {
-        cmd.arg(arg);
     }
-    cmd.arg("--").current_dir(workspace);
-
-    let output = tokio::task::spawn_blocking(move || cmd.output())
-        .await
-        .map_err(|e| ToolError::execution_failed(format!("git diff task panicked: {e}")))?
-        .map_err(|e| ToolError::execution_failed(format!("failed to run git diff: {e}")))?;
+    let workspace = workspace.to_path_buf();
+    let args = args.to_vec();
+    let output = tokio::task::spawn_blocking(move || {
+        // The review command keeps the workspace's fsmonitor, hooks and
+        // filters from running during the diff.
+        let mut cmd = super::git::read_only_git_command(&workspace)?;
+        cmd.arg("diff")
+            .args(crate::dependencies::Git::REVIEW_DIFF_ARGS)
+            .args(&args)
+            .arg("--");
+        cmd.output()
+            .map_err(|e| ToolError::execution_failed(format!("failed to run git diff: {e}")))
+    })
+    .await
+    .map_err(|e| ToolError::execution_failed(format!("git diff task panicked: {e}")))??;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(ToolError::execution_failed(format!(
@@ -1183,6 +1188,52 @@ mod tests {
                     .any(|block| block.body.contains("changed-marker"))
             );
         }
+    }
+
+    /// The working-tree evidence read must not run the repository's clean
+    /// filter, which `--no-ext-diff`/`--no-textconv` do not cover.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn worktree_diff_evidence_runs_no_clean_filter() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let marker = outside.path().join("marker");
+        let clean = outside.path().join("clean.sh");
+        std::fs::write(
+            &clean,
+            format!("#!/bin/sh\necho clean >> '{}'\ncat\n", marker.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&clean, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let repo = tmp.path();
+        run_git(repo, &["init", "-q"]);
+        run_git(repo, &["config", "user.email", "t@example.com"]);
+        run_git(repo, &["config", "user.name", "Test"]);
+        run_git(repo, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(repo.join("f.txt"), "original\n").unwrap();
+        std::fs::write(repo.join(".gitattributes"), "f.txt filter=x\n").unwrap();
+        run_git(repo, &["add", "."]);
+        run_git(repo, &["commit", "-q", "-m", "base"]);
+        run_git(
+            repo,
+            &["config", "filter.x.clean", &clean.display().to_string()],
+        );
+        std::fs::write(repo.join("f.txt"), "changed-marker\n").unwrap();
+
+        let blocks = gather_diff_evidence(repo, false, None).await.unwrap();
+        assert!(
+            !marker.exists(),
+            "the evidence read ran the clean filter: {}",
+            std::fs::read_to_string(&marker).unwrap_or_default()
+        );
+        assert!(
+            blocks
+                .iter()
+                .any(|block| block.body.contains("+changed-marker")),
+            "{:?}",
+            blocks.iter().map(|block| &block.body).collect::<Vec<_>>()
+        );
     }
 
     #[tokio::test]

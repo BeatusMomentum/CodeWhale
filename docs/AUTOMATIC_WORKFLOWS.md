@@ -1,5 +1,7 @@
 # Automatic Workflows
 
+> 阅读简体中文版：[zh_hans/AUTOMATIC_WORKFLOWS.md](zh_hans/AUTOMATIC_WORKFLOWS.md)。
+
 You do **not** need to write a `.workflow.js` file to coordinate agents. Operate
 handles small or tightly coupled work directly. Multi-step delegation starts
 with a compact Workflow plan: named steps, dependencies, bounded scopes, and

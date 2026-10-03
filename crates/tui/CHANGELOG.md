@@ -7,25 +7,239 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-The website's not-found page now uses the Codwhale poster and typo joke,
-with English/Chinese recovery links to home and docs
-([#6419](https://github.com/Hmbown/Codewhale/issues/6419),
-[#6420](https://github.com/Hmbown/Codewhale/pull/6420)).
+## [0.10.1] - 2026-10-01
 
-Planned for Codewhale v0.10.1: a reliability and first-run release. Turns that
+Codewhale v0.10.1 focuses on reliability and first-run behavior. Turns that
 stall now say so, approvals keep what you approved, plugin suggestions are
 quieter, and Fleet runs can be checked before they spend anything.
 
+### Changed
+
+- On Windows, every PowerShell command Codewhale starts now passes
+  `-ExecutionPolicy Bypass` for that process only, so a local `Restricted` or
+  `AllSigned` policy no longer blocks multi-line commands. A policy set by
+  Group Policy still wins and the command is refused with PowerShell's own
+  message. Scripts that a command invokes run under the same process-scoped
+  setting. Not verified on a native Windows machine
+  ([#6745](https://github.com/Hmbown/Codewhale/issues/6745)).
+- The website's not-found page now uses the Codwhale poster and typo joke,
+  with English/Chinese recovery links to home and docs
+  ([#6419](https://github.com/Hmbown/Codewhale/issues/6419),
+  [#6420](https://github.com/Hmbown/Codewhale/pull/6420)).
+- Script tools can no longer approve themselves or replace built-in tools
+  (founder decision D4). A `# approval: auto` line in a script under
+  `~/.codewhale/tools` (or `[tools].plugin_dir`) is ignored: the tool follows
+  the session's approval setting like a script with no `approval:` line, and
+  the runtime log and `/plugin tools` name each script that still declares it.
+  A `[tools.overrides]` entry of `type = "script"` or `type = "command"` keyed
+  by a built-in tool name is refused, and the built-in stays active; a status
+  line names the key once per session, and the runtime log records it. `type = "disabled"` still turns a
+  built-in off, and script or command overrides under a new name still work.
+  To keep a wrapper such as an audited shell, disable the built-in and give
+  the wrapper its own name
+  ([configuration](docs/CONFIGURATION.md#script-tools-and-overrides)).
+
+- Complete the session slash-command group’s shared command boundary, including
+  `/structcopy`, so all seventeen commands can compile independently of the TUI.
+  Host operations remain behind capability interfaces; command behavior and
+  upstream tool-execution identity safeguards are preserved
+  ([#6792](https://github.com/Hmbown/Codewhale/issues/6792),
+  [#6145](https://github.com/Hmbown/Codewhale/issues/6145)).
+
+### Release reliability
+
+- Upload the complete release into a private draft, verify every asset's size
+  and SHA-256 digest, then publish. An interrupted retry cannot reuse stale
+  same-size bytes. CNB and GHCR version tags follow canonical publication.
+- Ubuntu Lighthouse bootstrap requires trusted SSH source CIDRs or an explicit
+  public-SSH opt-in before changing the host; malformed IPv6 and broad default
+  networks are refused.
+
+### Security
+
+- Update development tooling to Undici 7.29.1 or newer for
+  [GHSA-w293-vg96-wgc3](https://github.com/advisories/GHSA-w293-vg96-wgc3),
+  brace-expansion 1.1.21/5.0.12 for
+  [GHSA-q2hr-2g5m-vwhr](https://github.com/advisories/GHSA-q2hr-2g5m-vwhr),
+  and the VS Code extension's markdown-it to 14.3.2 for
+  [GHSA-253c-mchw-3w2r](https://github.com/advisories/GHSA-253c-mchw-3w2r).
+- Harden local runtime browser sessions, fleet SSH trust, agent continuation
+  ownership, task gate approval, plugin tool registration, bridge action tokens,
+  and release metadata credential forwarding. Browser sessions recover across
+  reloads and new tabs, and stream tickets retry after transient failures.
+  Fleet SSH known-host checks support OpenSSH 7.x and later. SSH host configs
+  using `host_key_fingerprint` must migrate to `known_hosts` with verified host
+  keys; the unsupported fingerprint field now fails at configuration load.
+- Harden workspace instruction, note, and anchor file access with shared
+  no-follow reads and writes. Compaction loads pinned anchors only from
+  trusted workspaces. Validate registry skill names before selecting cache paths.
+- Tighten approval, execution and endpoint boundaries. Computer control
+  consent and script calls need an exact decision a person gave on that call's
+  own approval card. Automatic Git status and review reads go through the
+  sanitized review command and stay pinned to the checked Git executable.
+  Config backups, config dumps, MCP listings and notification payloads share
+  one sensitive-key vocabulary; structured exports now also redact keys ending
+  in `key`. Python a child model writes during a recursive `rlm` call is
+  admitted round by round like an inline `repl` block, and Python kernels are
+  discarded when permissions narrow. Gate commands and the cargo test runner
+  start inside the session's shell sandbox. Mutable session artifacts are
+  written and read through pinned session-relative paths. The stdio bridge's
+  Runtime child chooses and reports its own loopback port.
+- Chat bridges (Feishu, Telegram, WeCom, Weixin) accept an approval decision
+  only from the person who started that turn, for the Runtime's current
+  pending approval. After upgrading, approvals for turns that were already
+  running are decided from the TUI, and WeCom `/allow` no longer takes
+  `remember`.
+- More file and network paths are confined. A task or automation created by a
+  session without full shell access no longer inherits the host's shell
+  default. The commit planner, oversized-paste backup and project harness
+  notes do not read or write through links that leave the workspace. Audit and approval logs are created
+  owner-only and are not opened through a link. Lane ids must be plain names.
+  A session file is refused when it records a different session id than its
+  name. The updater does not follow a redirect from HTTPS to plain HTTP and
+  stops reading a response larger than 512 MB.
+
+### Fixed
+
+- `/undo` and `/restore <N>` refuse while a turn is running in the workspace,
+  instead of rewriting files under it.
+- `--resume <id>` after a crash recovers that session's interrupted turn from
+  its crash checkpoint, as `--continue` does.
+- `/resume <file>` keeps an imported session on the current provider route
+  instead of a default one.
+- When the stall watchdog recovers a turn, the Engine's turn is ended too, so
+  the next message is accepted
+  ([#6800](https://github.com/Hmbown/Codewhale/issues/6800)). The dispatch
+  wait still blocks input for its bound.
+- A transient upstream failure that a gateway reports as an error frame inside
+  a successful response ("Provider returned an empty response") is retried
+  under the stream retry budget when nothing had streamed; authentication and
+  invalid-model frames still fail at once
+  ([#6795](https://github.com/Hmbown/Codewhale/issues/6795)).
+- Long sessions no longer start every turn late. Once a workspace held more
+  than 50 undo snapshots (around the sixteenth turn), each new snapshot rebuilt
+  the whole snapshot history before the provider request, about 2.8 s per turn
+  in a small workspace. Old snapshots are now dropped half a window at a time.
+- Resuming a crashed session from inside the TUI recovers its interrupted
+  turn too.
+- Release builds compile on Rust 1.99.
+- TUI undo and retry rewind the Engine conversation and saved session before
+  replacement inference. If the conversation or its settings change while
+  undo is being prepared, it refuses without overwriting that newer state or
+  changing the draft. Retained compaction summaries survive the rewind and
+  cannot be selected as editable user prompts
+  ([#6788](https://github.com/Hmbown/Codewhale/issues/6788)).
+- `/edit` replaces the exchange it revises through the same rollback: the old
+  prompt and its answer leave the transcript, the model's context and the
+  saved session before the edited prompt is sent.
+- A session can still be resumed by its id when a stray copy of its file sits
+  in the sessions directory; before, the id was reported as ambiguous.
+- Agents follow the Permissions you choose while they run: switching to
+  Full Access reaches an agent that is already working, instead of leaving
+  it with the Auto-Review guardian that denied it. Tightening reaches it too.
+  An agent's answer to an approval prompt is delivered while the main
+  session is busy, and a forced delete inside the workspace is no longer
+  treated as a catastrophic system delete. On Linux, Full Access switched on
+  at runtime cannot lift the kernel no-new-privileges flag set at startup,
+  so `sudo` and setuid helpers still fail; start with
+  `sandbox_mode = "danger-full-access"` or `CODEWHALE_NO_NEW_PRIVS=0` if
+  agents need them.
+- Stream limits and transport settings share a typed `[stream]` configuration
+  table, including retry budgets, TCP keepalive and HTTP/2 keepalive. Explicit
+  values take precedence over legacy `[tui]` aliases; omitted values preserve
+  existing defaults and environment behavior. A configured HTTP/1 pin stays
+  pinned during recovery. `/config stream_chunk_timeout_secs ... --save`
+  updates the canonical setting so it survives reopening a configuration
+  that already had a timeout. Transport changes apply when a client is built
+  ([#6700](https://github.com/Hmbown/Codewhale/issues/6700)).
+- Switching providers keeps a model set only in the root `default_text_model`
+  with the provider it belongs to. Switching away and back (`/provider` in the
+  TUI, or the desktop app's model chip) used to land on the provider's catalog
+  default such as `gpt-5.6`, and a pass-through provider switched to in between
+  inherited the other provider's model, or a stale legacy root `model` that the
+  root default had been shadowing
+  ([#6693](https://github.com/Hmbown/Codewhale/pull/6693)).
+- A turn no longer stops after an hour of work. The cumulative per-turn wall
+  clock is unlimited by default, like model steps; set
+  `[tui].turn_wall_clock_secs` to cap it.
+
 ### Contributors
 
-- **[@gaord](https://github.com/gaord)** — let a client fork a thread at a named turn ([#6580](https://github.com/Hmbown/Codewhale/pull/6580)), let undo roll back files for the turn it is undoing ([#6483](https://github.com/Hmbown/Codewhale/pull/6483)), stopped resume and fork from duplicating threads and sessions ([#6406](https://github.com/Hmbown/Codewhale/pull/6406)), and exposed user-defined provider routes to native clients ([#6404](https://github.com/Hmbown/Codewhale/pull/6404)).
-- **[@Lstarsky0](https://github.com/Lstarsky0)** — moved the docs/work, legal, digest and FAQ pages onto the dictionary spine ([#6405](https://github.com/Hmbown/Codewhale/pull/6405), [#6417](https://github.com/Hmbown/Codewhale/pull/6417), [#6499](https://github.com/Hmbown/Codewhale/pull/6499), [#6574](https://github.com/Hmbown/Codewhale/pull/6574)), tightened the Chinese-branching ceiling to 18 ([#6403](https://github.com/Hmbown/Codewhale/pull/6403)), and made Fleet publish without a two-link window ([#6431](https://github.com/Hmbown/Codewhale/pull/6431)).
-- **[@aboimpinto](https://github.com/aboimpinto)** — restored a green Linux full-workspace test gate without loosening any test ([#6581](https://github.com/Hmbown/Codewhale/pull/6581)).
+- **[@harryvgiunta](https://github.com/harryvgiunta)** — added Yolo-Auto as a bundled OpenAI-compatible host, starting on the vendor's recommended `qwen3.8-flash` model ([#6408](https://github.com/Hmbown/Codewhale/pull/6408)).
+- **[@asto18089](https://github.com/asto18089)** — contributed the integrated runtime liveness, context, search, JavaScript execution, stopship scout and pet repairs, preserving their original contributor commits ([#6799](https://github.com/Hmbown/Codewhale/pull/6799)).
+- **[@qiuYliangM](https://github.com/qiuYliangM)** — made provider-bound project instruction and constitution labels stable across directory moves and kept their absolute paths in operator reports ([#6799](https://github.com/Hmbown/Codewhale/pull/6799)).
+- **[@zhuowp](https://github.com/zhuowp)** — supplied the process-scoped PowerShell execution-policy repair adapted for Codewhale, preserving machine and user Group Policy precedence ([#6745](https://github.com/Hmbown/Codewhale/issues/6745)).
+- **[@Andrea-Bruno](https://github.com/Andrea-Bruno)** — designed the Superfast Decision Gate and contributed its off-by-default shadow classifier ([#6604](https://github.com/Hmbown/Codewhale/pull/6604), [#6603](https://github.com/Hmbown/Codewhale/issues/6603)).
+- **[@aiapienthusiast](https://github.com/aiapienthusiast)** — added Cheaper Inference to the bundled provider catalog ([#6761](https://github.com/Hmbown/Codewhale/pull/6761)).
+- **[@gaord](https://github.com/gaord)** — let a client fork a thread at a named turn ([#6580](https://github.com/Hmbown/Codewhale/pull/6580)), let undo roll back files for the turn it is undoing ([#6483](https://github.com/Hmbown/Codewhale/pull/6483)), stopped resume and fork from duplicating threads and sessions ([#6406](https://github.com/Hmbown/Codewhale/pull/6406)), exposed user-defined provider routes to native clients ([#6404](https://github.com/Hmbown/Codewhale/pull/6404)), and kept a fork going when a turn lost its tool call ([#6664](https://github.com/Hmbown/Codewhale/pull/6664)).
+- **[@Lstarsky0](https://github.com/Lstarsky0)** — moved the docs/work, legal, digest and FAQ pages onto the dictionary spine ([#6405](https://github.com/Hmbown/Codewhale/pull/6405), [#6417](https://github.com/Hmbown/Codewhale/pull/6417), [#6499](https://github.com/Hmbown/Codewhale/pull/6499), [#6574](https://github.com/Hmbown/Codewhale/pull/6574)), tightened the Chinese-branching ceiling to 18 ([#6403](https://github.com/Hmbown/Codewhale/pull/6403)), and made Fleet publish without a two-link window ([#6431](https://github.com/Hmbown/Codewhale/pull/6431)). Also moved the constitution page onto the dictionary spine and kept its install link in the selected locale ([#6733](https://github.com/Hmbown/Codewhale/pull/6733)).
+- **[@aboimpinto](https://github.com/aboimpinto)** — restored a green Linux full-workspace test gate without loosening any test, twice ([#6581](https://github.com/Hmbown/Codewhale/pull/6581), [#6666](https://github.com/Hmbown/Codewhale/pull/6666)). Completed the seventeen-command portable session group, including `/structcopy` ([#6793](https://github.com/Hmbown/Codewhale/pull/6793)).
 - **[@dajiaohuang](https://github.com/dajiaohuang)** — `codewhale config set` checks a known setting's value against its schema type before saving it ([#6568](https://github.com/Hmbown/Codewhale/pull/6568)).
+- **[@cenab](https://github.com/cenab)** — requested the Tsubasa provider row and supplied its endpoint, key and model values ([#6695](https://github.com/Hmbown/Codewhale/issues/6695)).
+- **[@BX166](https://github.com/BX166)** — reported the AICraft provider row missing its key console, docs link and guidance, and supplied the values ([#6616](https://github.com/Hmbown/Codewhale/issues/6616)).
 - **[@Water-Run](https://github.com/Water-Run)** — ingested namespaced model-only catalog entries so models present only in the canonical `models` map reach the offering list ([#6400](https://github.com/Hmbown/Codewhale/pull/6400)), and retired the blanket dead-code allowance with its unused feature stages, tightening the budget to match ([#6402](https://github.com/Hmbown/Codewhale/pull/6402)).
+- **[@wuisabel-gif](https://github.com/wuisabel-gif)** — designed the `tool_call_after` execution-receipt contract and its tests on a reference branch, which landed re-implemented on the current hook seam ([#6689](https://github.com/Hmbown/Codewhale/issues/6689), [#6713](https://github.com/Hmbown/Codewhale/pull/6713)).
+- **[@SparkofSpike](https://github.com/SparkofSpike)** — let making room survive a provider request-body limit (HTTP 413) by shrinking, then replacing, inline images for that one summary pass ([#6642](https://github.com/Hmbown/Codewhale/pull/6642)). Translated seventeen Tier-2 guides and thirteen developer and internal docs into Simplified Chinese, and connected the localized documentation ([#6662](https://github.com/Hmbown/Codewhale/pull/6662), [#6663](https://github.com/Hmbown/Codewhale/pull/6663)); added regression coverage for rejecting unknown website locales before dictionary lookup ([#6786](https://github.com/Hmbown/Codewhale/pull/6786)).
 
 ### Added
 
+- Experimental extension host: the host can now run on Bun 1.4.0 or newer as an opt-in; Node stays the default. `[extension_host] runtime = "node" | "bun" | "auto"` chooses: unset means `node` (or `bun` when the table sets only a `bun` path), `bun` runs only Bun, and `auto` prefers a supported Bun and uses Node when none is found or the Bun host fails to start. An explicit choice never falls back, and restarts keep the runtime the session first started on; a runtime binary replaced mid-session is refused. A configured `node` or `bun` path is used as given and fails loudly rather than falling through to `PATH`, and a runtime found on `PATH` inside a `node_modules` directory or the working directory is skipped, not run. `codewhale doctor` and `/plugin` show which runtime runs the host, why, and how its memory is capped. Under Bun the host never auto-installs packages and ignores `.env` and `bunfig.toml` in its data directory. Extensions cannot run native code inside the host on either runtime: `bun:ffi`, `Bun.FFI`, `node:ffi`, the SQLite builtins, `process.dlopen`, `process.execve`, Worker threads and `ShadowRealm` are refused, and the host will not start if one of these restrictions does not hold. Known limit: that lockdown covers the native-code entry points found so far (Bun 1.4, Node 22 and 26); one a newer runtime adds is not covered until it is added. The 1 GiB memory cap uses `RLIMIT_DATA` on Linux, the Job Object on Windows and, for a Bun host, a kernel jetsam limit on macOS; a Node host on macOS is checked at each heartbeat. Bun is qualified on macOS only: the Rust host tests, the memory cap included, have not run a Bun host on Linux or Windows (CI runs them with Node, and the JS host suites under Bun 1.4.0 on Linux). `host/hello` reports the runtime and version that actually run.
+- `docs/features.toml` lists every user feature with its status, first
+  release, docs page and owning code. A test fails when a `[features]` flag
+  and its row disagree, or when a listed docs page or code path is missing.
+  The configuration reference now lists the `verify_tool`, `vision_model` and
+  `extension_host` flags, and `config.example.toml` lists `code_mode`.
+- A reusable GitHub Action runs PR reviews with a configurable model endpoint
+  and a checksum-pinned Codewhale binary. It checks the PR's eligibility and
+  exact revisions before inference; fork events receive no model key
+  ([#6780](https://github.com/Hmbown/Codewhale/pull/6780)).
+- An optional, off-by-default shadow Decision Gate classifies the first request
+  of a turn — tool need, answerability from context, intent — through the
+  existing System One client and only logs a typed recommendation; it never
+  changes routing or delays the model call. Configure it with
+  `SUPERFAST_ENABLED` and `SUPERFAST_PROVIDER` (docs/CONFIGURATION.md)
+  ([#6603](https://github.com/Hmbown/Codewhale/issues/6603),
+  [#6604](https://github.com/Hmbown/Codewhale/pull/6604), thanks @Andrea-Bruno).
+- `tool_call_after` hooks for shell tools receive `DEEPSEEK_TOOL_EXECUTION_RECEIPT`: the command that actually ran after admission, its working directory, how it ended, and bounded stdout/stderr previews, so a hook can record exactly what executed ([#6689](https://github.com/Hmbown/Codewhale/issues/6689), requested by [@wuisabel-gif](https://github.com/wuisabel-gif)).
+  Supported settled local shell calls also send a versioned JSON document on
+  stdin to foreground or background observers, with session/tool-call IDs,
+  nullable exit status and output truncation flags. Existing environment fields
+  stay available; unsupported execution paths send no document, and observer
+  output cannot change the completed call
+  ([#6582](https://github.com/Hmbown/Codewhale/issues/6582)).
+- Runtime API: turns now record what they produced. Each item and turn
+  carries typed artifact references (path, kind, size, revision, and a
+  restore point when file-revert would accept one) for files a tool wrote,
+  spilled tool output, and media.
+  - Once the post-turn snapshot settles, the turn also lists what changed in
+    the workspace while it ran, including shell and sub-agent writes. It then
+    publishes `turn.artifacts`.
+  - `GET /v1/threads/{id}/turns/{turn_id}/artifacts` lists a turn's
+    references, and `.../artifacts/{artifact_id}` reads one from the
+    workspace, the post-turn snapshot or the session artifact directory.
+  - Spills from unbound runtime threads were unreadable before; they are now
+    readable.
+  - The legacy `artifact_refs` field is now filled with the workspace files a
+    tool call wrote, so Preview in current desktop builds shows them
+  ([#6653](https://github.com/Hmbown/Codewhale/issues/6653)).
+- Runtime API: git stage, unstage, discard and commit accept optional
+  `expect` preconditions (full HEAD id, an index token, per-file `rev`, or a
+  whole-tree `revision`, all read from `GET /v1/git`). When the repository
+  changed since the client read it, the write does nothing and answers 409
+  `git_state_changed` with the current state, so a Review sheet can no
+  longer stage bytes, discard edits or commit an index the user never saw.
+  Requests without `expect` behave as before. Path writes now use literal
+  pathspecs, as the docs already said, and `files[].path` is
+  workspace-relative in a subdirectory workspace. Guards cover executable
+  mode, submodule HEAD and changes outside that workspace; oversized or
+  budget-limited stat-only revisions cannot authorize a guarded write.
+  Status stays best-effort: unreadable paths, symlinked ancestors, special
+  files and broken nested repositories withhold only affected row tokens
+  and the whole-tree revision. Normal Git filters and untracked settings
+  apply, with directory inventories scoped to the rows or paths that need
+  them. Untracked workspace files and renames leaving the workspace remain
+  visible, and broken HEADs cannot satisfy an unborn-HEAD guard
+  ([#6647](https://github.com/Hmbown/Codewhale/issues/6647)).
 - Runtime API: `POST /v1/threads/{id}/fork-at-turn` forks a thread at a named
   user turn, keeping that turn and every turn before it. The receipt matches
   `/undo` and returns the first dropped prompt so a client can put it back in
@@ -48,15 +262,245 @@ quieter, and Fleet runs can be checked before they spend anything.
   Computer Use bundle
   ([#6562](https://github.com/Hmbown/Codewhale/issues/6562),
   [#6509](https://github.com/Hmbown/Codewhale/issues/6509)).
+- Tsubasa is a bundled OpenAI-compatible provider row: base
+  `https://api.tsubasa.sh/v1`, key `TSUBASA_API_KEY`, model `tsubasa-pro`
+  (also `tsubasa-fast`). Its window is 32,768 tokens; set
+  `providers.tsubasa.context_window` to match
+  ([#6695](https://github.com/Hmbown/Codewhale/issues/6695), thanks @cenab).
+
+### Security
+
+- Inline ```` ```repl ```` blocks in a reply now follow the same rules as the
+  `code_execution` tool. They never run in Plan mode or when
+  `code_execution` is not on the turn's tool surface, and they are admitted
+  like a `code_execution` call with the same code: before-tool hooks,
+  disallowed-tool rules, Auto-Review (including its reviewer) and repository
+  law all apply, then the same approval under the session's permission
+  posture (a blocked, denied or unanswerable call skips them with a visible
+  note). Only a fence that opens its own line counts, here and in the `rlm`
+  tool's child rounds, so a reply that mentions a fence in prose runs nothing.
+  An `rlm(...)` call from a fence gets a one-shot child answer rather than a
+  child that runs its own code. The docs no longer describe the REPL kernel
+  as sandboxed.
+- `codewhale serve --mcp` now exposes only read-only tools by default
+  (`file_read`, `search`). Tools that write files or run commands are
+  neither listed nor run unless the operator sets `require_approval = false`
+  in the MCP server config; a client's own `approved` flag no longer counts
+  as approval. At startup the server names on stderr each configured tool it
+  withholds and the setting that allows it.
+- A `Bash` entry in the disallowed tools now also blocks `start_mcp_server`
+  and `start_registry_mcp_server`, which launch local processes.
+- An MCP tool call whose connection closes before it answers is no longer
+  sent again on a new connection, since the server may already have run it.
+  The same holds for a server error reply that mentions an expired or invalid
+  session. The call reports an unknown outcome and the next call reconnects.
+  Only a call the HTTP transport turned away for a stale session, before the
+  server handled it, is still retried once.
 
 ### Fixed
 
-- Making room now recovers from a provider request-body limit (HTTP 413)
-  instead of failing the pass. A summary request that is refused for size
-  re-encodes the conversation's inline images smaller and retries, says so in
-  the status line while it does, and — if the request is still refused —
-  replaces the images with text notes for that one summary pass. Session
-  history keeps the real images either way.
+- OpenRouter turns are priced again instead of always showing "rate
+  unavailable". The model-list refresh no longer fails as a whole on one bad
+  row: `~` "latest" aliases are dropped, routers that publish a `-1`
+  variable price are listed without a rate, and other malformed rows are
+  skipped and counted. Main interactive turns now honor a `[[custom_models]]`
+  rate the same way background work does, a declaration without rates no
+  longer hides the catalog price, and an explicit declared rate prices a
+  vendor-pinned OpenRouter route
+  ([#6690](https://github.com/Hmbown/Codewhale/issues/6690)).
+- `codewhale exec` can take prompts past the OS argument limit (~128 KiB on
+  Linux, where larger prompts failed with `Argument list too long` before
+  Codewhale started): `--prompt-file <PATH>` reads the prompt from a file, and
+  `--prompt-file -` reads it from stdin; a positional `-` stays literal text
+  ([#6688](https://github.com/Hmbown/Codewhale/issues/6688)).
+- Keep reasoning effort labels, including `xhigh` and `ultra`, visible beside
+  short model names in the 80-column terminal footer.
+- First-run TUI startup keeps explicitly configured providers, models and
+  endpoints (including environment overrides and a legacy top-level
+  `base_url`), even with a missing key, instead of adopting a detected local
+  Ollama model. The `default_text_model` line written into the generated
+  first-launch config is not treated as a choice, so starting Ollama after the
+  first launch is still detected. Usable configured routes skip the provider
+  picker and record the provider step as configured, without claiming a
+  successful check; missing-key recovery focuses the configured provider even
+  on a fresh home. Switching from that recovery picker (or after Esc) to a
+  provider that has its key clears the launch "needs a key" state, so the
+  footer names the route instead of "model not connected" and a detected local
+  Ollama can no longer take over the provider just chosen. Empty sessions no
+  longer show a full context window from the startup prompt; a submitted first
+  turn or reported usage still shows real pressure.
+- `/trust on|off` changes file-tool trust for this session. Add `--save` to
+  persist workspace trust for project skills, commands, hooks, MCP servers,
+  and project context. Skipped-skill notices stay out of conversation titles
+  and user bubbles, and trust changes append a correction to the model's history.
+- Stored-secret cleanup skips busy Runtime stores and reports unreadable paths
+  while continuing through other files. Configured storage roots may be symlinks;
+  discovered symlinks are not followed. Cleanup also masks current configured
+  credentials, and doctor's bounded scan reserves capacity for saved transcripts
+  and checkpoints separately from Runtime receipts.
+- Hooks: `tool_call_after` and `on_error` now get a shell command's exit code
+  in `DEEPSEEK_TOOL_EXIT_CODE` on Runtime API threads as well as in the TUI,
+  and for a failing command as well as a passing one, so `exit_code`
+  conditions match. The Runtime API path passed no exit code at all, and a
+  command that exited nonzero, timed out, or was killed reached hooks with no
+  exit code on either surface. The new `DEEPSEEK_TOOL_STATUS` says how the
+  command ended (`completed`, `failed`, `timed_out`, `killed`)
+  ([#6582](https://github.com/Hmbown/Codewhale/issues/6582)).
+- Scrolling a long transcript repaints the reasoning reveal hint in place
+  instead of rebuilding the transcript tail. Wheel and scrollbar input use
+  interactive frame pacing, collapsed tool groups reuse cached summaries, and
+  height-only resizes keep wrapped history. Width changes still rewrap content,
+  and other per-frame work still grows with session length
+  ([#6652](https://github.com/Hmbown/Codewhale/issues/6652)).
+- Calm transcript previews keep the latest three rows of live thought and a
+  single duration header when it settles. Successful tool headers are quieter;
+  failed generic and MCP calls keep a bounded head-and-tail excerpt, with full
+  output available in details. Existing collapsed groups show their hidden
+  count and reveal cue, and explicit thought expansion stays available.
+- Composer history preserves multiline entries and literal quoted text while
+  retaining the old history file during migration. An oversized message stays
+  in the composer if its paste file cannot be saved, with a localized notice;
+  mouse placement and quoted file mentions handle multibyte text and spaces
+  ([#6776](https://github.com/Hmbown/Codewhale/pull/6776)).
+- Model-facing guidance names callable tools and explains discovery before a
+  deferred read. The stopship workflow uses bounded `grep_files` evidence,
+  optional `tool_search` activation and the current workflow source path
+  ([#6747](https://github.com/Hmbown/Codewhale/issues/6747)).
+- Simplified and Traditional Chinese permission, provider and session wording
+  now follows the current behavior. Chinese guides correct hook receipts,
+  trusted skills, MCP startup and Windows limitations, preserving the
+  contributor translations and a shared glossary.
+- Unknown website locale segments, including dotted missing paths, return a
+  real 404 with noindex metadata and no home-page canonical URL. The existing
+  layout guards now have regression coverage across all registered locales
+  ([#6786](https://github.com/Hmbown/Codewhale/pull/6786)).
+- The terminal caret no longer blinks at the hidden composer while a picker,
+  settings screen or other view covers it; it returns when the view closes
+  ([#6545](https://github.com/Hmbown/Codewhale/issues/6545)).
+- On Linux and macOS, a `background: true` shell's process group is now
+  stopped when the TUI dies without cleaning up (SIGKILL, a crash, or the
+  signal exit path). The shell and the processes it started used to keep
+  running as orphans. Processes that move to their own process group or
+  session, staged services you choose to keep, and `tty: true` background
+  shells are not covered. Under the bwrap sandbox, the sandboxed command
+  now also exits when bwrap does
+  ([#6654](https://github.com/Hmbown/Codewhale/issues/6654)).
+- Idle task workers stop periodically reloading a settled, unchanged empty
+  queue, and task listings reuse an unchanged store snapshot. New queue writes
+  and local notifications still wake workers; recent or unreadable metadata and
+  failed claims keep bounded retries. This reduces repeated disk work when
+  several TUIs share a data directory without changing task ownership or
+  cancellation ([#6573](https://github.com/Hmbown/Codewhale/issues/6573),
+  [#6728](https://github.com/Hmbown/Codewhale/issues/6728)).
+- File writes, including legacy `File` and `write_file` calls, stop if the
+  original contents cannot be read; legacy writers also reject non-UTF-8
+  originals, keeping undo and diffs from recording an empty original file.
+- Resuming a session preserves user messages that quote a compaction marker.
+- Requirements allow-lists now check unset approval and sandbox defaults,
+  accept equivalent approval aliases, and lock permission posture when sandbox
+  modes are constrained so saved Full Access and YOLO cannot bypass them.
+- Logout completes xAI OAuth revocation and attempts every credential deletion
+  before reporting remaining credentials with a non-zero exit status.
+- `doctor --fix` keeps temporary files modified within the last hour.
+- Provider streams stop with a clear error if an SSE line exceeds 8 MiB.
+- Recursive `rlm_query` turns inherit the parent's remaining deadline,
+  bounded by the existing child budget, including asynchronous lock waits,
+  startup, model requests and Python evaluation. Expired work is refused before
+  dispatch; a timeout returns the last response with an incomplete-result error.
+  Nested code and status receipts accompany the enclosing tool result on success
+  or failure and survive its session save/reopen. In-flight receipts still need
+  that result to be handed back before they become durable
+  ([#6511](https://github.com/Hmbown/Codewhale/issues/6511)).
+- The TUI keeps redrawing while its terminal is unfocused. v0.10.0 held
+  every frame on focus loss, so on Windows Terminal, macOS and other
+  terminals a window sitting behind another one looked frozen until you
+  clicked back into it. Frames are now held only on GTK/VTE terminals, which
+  replay the damage themselves when they return. That hold was added for the
+  MATE flicker in [#6311](https://github.com/Hmbown/Codewhale/issues/6311)
+  ([#6651](https://github.com/Hmbown/Codewhale/issues/6651)).
+- TUI `/undo` now restores only the files the undone tool call or turn
+  changed, and refuses, changing nothing, when one of them changed since.
+  Before, it checked out the whole snapshot tree, which also reverted later
+  edits to other files. It also finds restore points older than the newest
+  100 snapshots, and a forked session can undo the turns it inherited. It
+  waits for a post-turn snapshot that is still being written, leaves a
+  changed symlink or other non-regular path in place (and says so) instead
+  of refusing the whole undo, and writes nothing to the snapshot store when
+  it refuses outside trusted mode
+  ([#6644](https://github.com/Hmbown/Codewhale/issues/6644)).
+- On a fixed model, each Ctrl+T press now moves to a different thinking
+  tier. Ctrl+T and the `/model` picker could list tiers the route treats as
+  the same one — DeepSeek's `medium` is `high`, and Z.ai GLM-5.2's `low` is
+  `high` — so some presses changed nothing. They now share one list per
+  route with one entry per effective tier. Under Auto model routing, Ctrl+T
+  walks the picker's Auto list instead of a longer private one; the tier is
+  still settled when the turn is routed, so two neighbouring choices can
+  land on the same tier. DeepSeek now reports `minimal`, `xhigh` and `ultra`
+  as the `low`, `high` and `max` it sends, in `/status`, receipts and
+  `/effort`, and Kimi Code K3 no longer offers `off`, which it always ran as
+  `low` ([#6650](https://github.com/Hmbown/Codewhale/issues/6650)).
+- A top-level `base_url` or `api_key` in `config.toml` now means one thing
+  everywhere. Every reader used its own rule for which routes inherited it,
+  which is how a DeepSeek endpoint became the Xiaomi MiMo route's and failed
+  with DeepSeek's 401. Old files keep working: the keys are read as
+  `[providers.deepseek]` (or the vendor whose official host they name), the
+  next save moves them there with a one-time backup and a one-line note, and
+  a value that disagrees with its table is left for `codewhale config migrate
+  --prefer` to settle. `codewhale config doctor` shows what is in use
+  ([#6394](https://github.com/Hmbown/Codewhale/issues/6394)).
+- Setting up a bundled OpenAI-compatible host from `/provider` now shows
+  that host's key console, docs link and guidance on the setup form, the same
+  way the built-in providers' key entry does; before, the descriptor file
+  carried them and nothing read them. AICraft gains all three
+  ([#6616](https://github.com/Hmbown/Codewhale/issues/6616), thanks @BX166).
+- Runtime API undo now restores the files of the turns it undoes, for every
+  kind of thread. Before, a new thread's turns were not linked to their
+  workspace snapshots, so `patch-undo` returned `201` and rewound the
+  conversation but left the files changed, and `file-revert` refused. Each
+  turn record now lists its snapshots in `workspace_snapshots`, the engine runs
+  under the thread's own id across restarts, and a fork owns the turns it
+  inherited. `patch-undo` restores only the files the undone turns changed,
+  including every write in a turn, and leaves later edits by the user or
+  another thread alone. Every tool call that may write is bounded by its own
+  snapshots, so a file another thread or an editor changed while the turn ran
+  is never reverted as the turn's, and a turn's restore points survive the
+  snapshot count cap. When it cannot restore files (including a write to a
+  gitignored path) it now refuses with `409` and an `error.code` instead of
+  returning `201`. A nameless `PUT /v1/sessions` updates the document the
+  thread is bound to
+  ([#6621](https://github.com/Hmbown/Codewhale/issues/6621)).
+- A Runtime thread that is not bound to a saved session keeps one engine
+  session id, its own thread id, across its first turn, eviction and
+  restarts. Before, each engine spawn generated a new id, so the thread's
+  tool-output spills, snapshot tags and shell jobs were scattered across a
+  different `sessions/<id>/` per spawn
+  ([#6659](https://github.com/Hmbown/Codewhale/issues/6659)).
+- Saved sessions no longer go orphaned, and existing orphans are repaired at
+  launch. Deleting a session now sets aside the Runtime store it was actually
+  bound to, and switching a conversation to another host's store sets aside the
+  store it left, unless another session still uses that store or it holds
+  work. Exporting a thread (`POST /v1/sessions`) updates the thread's own
+  document instead of creating a new one each time. A thread whose document was
+  appended to elsewhere keeps loading. A thread whose document was deleted or
+  rewritten loads from its own turns instead of failing, and threads write
+  their files under the session they belong to. Each launch and `codewhale
+  serve` repairs the store in the background: a store holding threads with no
+  session gets a "Recovered:" session for each thread, and unreadable
+  documents, unused empty stores and old files no session names move to
+  `sessions/.set-aside/` with a manifest. Nothing is deleted. `codewhale doctor`
+  reports the last repair, and `codewhale doctor --repair-sessions [--dry-run]`
+  runs one now. `PUT` and `DELETE /v1/sessions` refuse a session that another
+  Codewhale process has open
+  ([#6144](https://github.com/Hmbown/Codewhale/issues/6144)).
+- Runtime API: the thread event stream now ends with a typed `stream.end`
+  frame (reason and resume cursor) whenever the server closes it, including
+  on shutdown, so clients can tell a Runtime error from a dropped connection
+  and resume from the right event. A replay worker crash no longer ends
+  history early and skips events without a detectable gap, and the mobile
+  page resumes from its last event instead of replaying from zero, with stream
+  statuses in the configured UI language. Cross-origin clients can read the
+  stream-end and replay-progress capability headers, and the SDK exports
+  `isThreadStreamEnd` for TypeScript narrowing.
 - `codewhale exec --auto` no longer exits 141 with no output when a child
   it writes to, such as a stdio MCP server, closes its pipe early. Headless
   exec now ignores SIGPIPE while it runs, as the interactive TUI already did,
@@ -65,6 +509,21 @@ quieter, and Fleet runs can be checked before they spend anything.
   answer: the markup is removed, and an answer that was only a tool call
   fails at once with the reason and a pointer to `--auto`, instead of asking
   the model again and blaming an incomplete provider response.
+- Resuming a session keeps its "Resumed:" confirmation on screen instead of
+  replacing it with "Make room automatically: on" when nothing was switched.
+- Tool output is no longer cut off where you can't get it back. Search
+  answers, test runs, git, verifier and web results reach the model whole up
+  to one budget sized to the model's context window, and anything beyond it
+  can be read back with `retrieve_tool_result`, including read-only tools
+  executed alone or in parallel. Restored raw results use the
+  active route's same inline budget; existing recovery receipts stay intact.
+  Tiny budgets use a compact retrieval reference instead of a long artifact
+  path and instructions; a complete reference is kept even when it alone
+  exceeds the allowance.
+  Native search now asks for answers up to 8,192 tokens (was 2,048–4,096)
+  and waits long enough for
+  them to arrive, and an answer the provider still cuts short is marked as
+  cut ([#6508](https://github.com/Hmbown/Codewhale/issues/6508)).
 - The installation page is generated from `docs/INSTALL.md`, so the website
   and the guide can no longer disagree; broken anchors and unsafe links fail
   the build ([#6450](https://github.com/Hmbown/Codewhale/pull/6450)).
@@ -72,6 +531,37 @@ quieter, and Fleet runs can be checked before they spend anything.
   (a word for an on/off switch, text for a number, a choice outside the list)
   instead of saving it ([#6568](https://github.com/Hmbown/Codewhale/pull/6568),
   thanks @dajiaohuang).
+- Receipts: `/receipts`, `codewhale receipts [ID|--last] [--format md|json]`,
+  and `GET /v1/threads/{id}/receipt` (plus a per-turn form) list what a session
+  did, one line per action: files changed with line counts, commands with exit
+  codes, web and MCP calls, agents, approvals and who gave them, and failures.
+  They also count what ran without asking and name the posture each turn ran
+  under, read from the turn's own record. A call Codewhale blocked before it
+  started (Auto-Review or guardian, a tool policy, a refused sandbox
+  escalation, invalid input, a missing tool) is listed as blocked, with the
+  reason, and is not counted as run or as ran without asking. Only
+  Codewhale's own refusal text counts: an MCP server, a fetched page, or a
+  program cannot make a call that ran read as blocked. A terminal
+  session's receipt also lists the files a command changed in each turn,
+  from the workspace snapshots taken before and after it (not ignored files
+  or anything outside the workspace), with control characters in paths
+  escaped so a file name cannot forge a receipt line. All three read the
+  records Codewhale already keeps and say what those records do not hold
+  ([docs/RECEIPTS.md](docs/RECEIPTS.md)). `audit.log` is not that record: it
+  logs security events, and it logs an approval only when one is requested,
+  which under Full Access is almost never.
+
+### Fixed
+
+- Approvals now record who decided: you, a session rule, or the posture. An
+  automatic approval used to be saved exactly like one you gave, and an app
+  approval that expired was saved as your denial. `GET /v1/approvals` now
+  returns `decided_by`.
+- Network audit lines now go to the same `audit.log` as every other audit
+  event (`$CODEWHALE_HOME` included), and test runs no longer append to your
+  real one.
+- Auto-Review verdicts now reach `audit.log`, as `/permissions` said they
+  did. They were written only when `CODEWHALE_TOOL_AUDIT_LOG` was set.
 - A turn that stops producing output now reports itself: the turn loop records
   its phase and last progress, and an overdue phase surfaces instead of
   hanging silently until the stream idle timeout. A delegated agent's final result is
@@ -86,6 +576,13 @@ quieter, and Fleet runs can be checked before they spend anything.
 - The context meter, the point where Codewhale makes room, preflight,
   `/context` and turn receipts show one pressure number instead of disagreeing
   ([#6407](https://github.com/Hmbown/Codewhale/pull/6407)).
+- When Codewhale makes room, the note it leaves for the next turn is written in
+  its own words, under fixed headings: the objective, the user's corrections,
+  permissions and limits, changed files, what is still running and the checks
+  left. A message that quotes the note's opening words now stays in the
+  conversation instead of being dropped. If the summary request itself is too
+  large, older history is dropped but the previous note is kept, and making
+  room stops rather than write a new note without it.
 - Continuing a conversation that is already open no longer adds a second
   thread, and a fork keeps its own session file, so autosave on one side no
   longer leaves the other unloadable
@@ -147,6 +644,188 @@ quieter, and Fleet runs can be checked before they spend anything.
   images, never that it refuses them, and a provider that does refuse gets one
   resend without the image and a message saying so
   ([#6396](https://github.com/Hmbown/Codewhale/issues/6396)).
+- Model prices that a flat rate would get wrong now show as unknown after the
+  model list refreshes online, as they already did offline: DeepSeek (priced by
+  time of day, or from Codewhale's reviewed table on hosted providers), Grok and MiniMax M3 (rates rise on long prompts), Xiaomi MiMo
+  (pay-as-you-go and Token Plan keys look the same), GLM-5.3 and the Alibaba
+  Model Studio plans (quota or credits, not per-token) and StepFun. DeepSeek's output limit stays at its
+  published 384K instead of the refreshed 393,216, and the reasoning controls
+  Codewhale records for Grok, MiniMax, Qwen 3.8 Max, Muse Spark and Step 3.5
+  (defaults, always-on thinking, extra effort tiers) survive the refresh.
+  Committed corrections now fail at load if their provider or model is missing
+  from the bundled seed; partial live refreshes may still omit those rows
+  ([#6396](https://github.com/Hmbown/Codewhale/issues/6396)).
+- The offline model list is now generated from Models.dev instead of edited by
+  hand, so a fresh install without network sees the same limits, image
+  support and reasoning controls as an online one. Claude, GPT-5.5, Kimi and
+  several OpenRouter models now show image input offline, and a model whose
+  catalog row offers an on/off switch next to its effort tiers keeps Off in
+  `/effort` and Ctrl+T instead of rounding it up
+  ([#6396](https://github.com/Hmbown/Codewhale/issues/6396),
+  [#6612](https://github.com/Hmbown/Codewhale/pull/6612)).
+- Cost estimates for GPT-5.6 and GPT-5.6 Sol use OpenAI's current rates of
+  $4 input, $0.40 cached input and $20 output per million tokens. They were
+  still at the older $5, $0.50 and $30
+  ([#6396](https://github.com/Hmbown/Codewhale/issues/6396)).
+
+### Security
+
+- Durable tasks and scheduled automations created by the agent no longer
+  carry more authority than the session that created them: requested
+  `auto_approve`, `trust_mode` and `allow_shell` are capped at what that
+  session holds, a task's workspace and an automation's directories must be
+  reachable from the session, and a task's turn runs under the posture pinned
+  when it was created instead of re-deriving one from the legacy bit or a
+  legacy mode alias.
+- The approval card for creating a task or creating/updating an automation
+  now lists the requested trust mode, shell, auto-approve, mode and
+  workspace as labeled lines.
+- "Approve for session" on a shell command now covers only a simple, known
+  command family (`git status` still covers `git status -s`). Compound,
+  wrapper, interpreter, unrecognised and option-configured commands are
+  granted as the exact command, and interact/wait calls on a running shell as
+  the exact call.
+- Workflow plan approval flags shell, network and file-write capability for
+  the `Bash`, `Web` and `File` tool families regardless of letter case.
+- An agent session can no longer update, resume or run an automation whose
+  stored `auto_approve`, `trust_mode` or `allow_shell` is more than the
+  session holds, unless the same update lowers those fields.
+- The approval summary every Runtime client receives for task and
+  automation create/update now names the requested trust mode, shell,
+  auto-approve, mode and workspace, from the same fields the TUI card shows.
+- A shell session grant keeps its command family only when every option is a
+  known value-free option such as `--release` or `--porcelain`; other options,
+  in any spelling, grant the exact command. Families whose arguments are what
+  runs or is installed (`go run`, `deno run`, `cargo run`, `make`,
+  `git bisect`, `git submodule`, package installs) grant the exact command.
+- Workflow plan approval recognises tool names in any quote style and with a
+  pattern suffix (`'Web'`, `` `File` ``, `Web(*)`), and flags `rlm`, Git and
+  GitHub, computer and browser control, and task/automation tools with the
+  capabilities they carry.
+
+### Security
+
+- Model-run code no longer inherits provider credentials or other secrets
+  from Codewhale's environment. Python `code_execution` (and every other
+  Python runner), `gate_run` task gates, custom and completion verifier gates,
+  persistent `terminal` sessions, and `run_tests` now start from the same
+  scrubbed child environment as `exec_shell`; variables a gate declares are
+  still passed through. `gate_run` also runs `/bin/sh -c` instead of a login
+  shell, so profile files cannot re-export what was removed.
+- A `workflow` start with `verify: true` now needs approval even for a
+  read-only plan, because the completion gates run workspace build and test
+  scripts.
+- Git commands no longer hand provider credentials to programs that a
+  workspace's git config can start (`core.fsmonitor`, hooks, filters): every
+  git child starts from the scrubbed environment plus the ssh agent, global
+  config location and author identity. The read-only `git_status`,
+  `git_diff`, history and `verify` tools also disable the workspace's
+  fsmonitor, hooks and clean/process filters.
+- Language servers started for post-edit diagnostics, and every Python and
+  Node command constructor, start from the scrubbed child environment.
+- Proxy URLs passed to model-run children (`HTTP_PROXY`, `HTTPS_PROXY`,
+  `ALL_PROXY`, `FTP_PROXY`, `CARGO_HTTP_PROXY`) keep their host and port but
+  lose any `user:password@` part.
+- Behaviour change: the scrubbed child environment now keeps non-secret build
+  configuration — `CARGO_*` (except registry and token-like keys),
+  `RUSTFLAGS`, `RUST_LOG`, `RUST_BACKTRACE`, `VIRTUAL_ENV`, `JAVA_HOME`, Go
+  paths, `NVM_*`/`NODE_OPTIONS` and CA-bundle variables — so `run_tests` and
+  gates keep the user's target dir, job limit and toolchain. Connection
+  strings such as `DATABASE_URL` are still dropped; declare them in a
+  verifier gate's `env` or the project's own config when a build needs them.
+
+### Security
+
+- Deny rules now hold when the command word is only known when the shell runs
+  it: a variable (`$v`), a substitution, a glob or brace list, escaped ANSI-C
+  quoting, or a shell reading its script from a pipe, here-string or process
+  substitution. While any deny rule is configured, such a command is refused
+  instead of being checked against text the shell will rewrite (an
+  approval-always policy asks instead). This also applies to common forms such
+  as `source "$HOME/.cargo/env"`, `eval "$(pyenv init -)"` and `$PYTHON -m
+  pytest`; name the command directly to run it. The same holds when the text
+  does not parse cleanly (an unterminated quote, substitution or heredoc, a
+  `case` inside `$( … )`) or when a parse budget runs out. Commands after
+  `if`, `then`, `while`, `do`, `!` and similar words, `function f { … }`
+  bodies, and `find -exec` payloads are now checked like any other command.
+- Wrapper commands are unwrapped by their real option grammar, so
+  `chroot DIR cmd`, `sudo --user NAME cmd` and `timeout -s SIG N cmd` expose
+  `cmd` (and any `-c` payload) to deny rules. Options missing from a wrapper's
+  table are read both with and without a value, BSD and macOS options are
+  covered (`env -P`, `xargs -J`, `chroot -u`), and more wrappers are recognized
+  (`caffeinate`, `arch`, `sandbox-exec`, `nsenter`, `unshare`, `runuser`,
+  `flock`, `watch`, `wsl`, `noglob`, `nocorrect`), including `.exe` spellings.
+  Code passed as a string to `trap`, `su -c`, `flock -c`, `script -c`,
+  `watch`, `cmd /c` and PowerShell `-Command` is checked as a command line.
+- `(( … ))` arithmetic no longer reads `<<` as a heredoc that hides the lines
+  after it, and an `xargs` or `find -exec` replacement string used as the
+  command or as shell code (`xargs -I{} sh -c {}`) counts as known only at run
+  time.
+- `task_shell_start` and task gate commands are now checked against shell deny
+  and ask rules, like any other shell command.
+- An "approve for session" grant for a shell command covers only flag variants
+  of that command as written; a command with options before the subcommand,
+  a chain, or nested code matches only an identical repeat.
+- The read-only shell surface for sub-agents rejects a word that starts with
+  an unquoted `*`, whose matches could be read as options; quote the pattern
+  or give it a path prefix (`src/*.rs`).
+- A trusted or allow prefix such as `git status` no longer covers options
+  placed before the subcommand (`git -c key=value status`,
+  `git --exec-path=… status`), nor a command that runs nested code or whose
+  command word is resolved at run time. Such commands ask instead. Typed deny
+  rules also match a path-qualified command word (`/bin/rm`).
+- Commands containing parentheses are no longer auto-approved as parallel
+  read-only commands, since some shells treat them as glob qualifiers or
+  command substitution.
+
+### Security
+
+- Sub-agent worktrees stay under the per-repo `.codewhale-worktrees/<repo>/`
+  root: an absolute `worktree_path` is now held to the same containment as a
+  relative one, with symlinks resolved before the check. Any start that asks
+  for a worktree keeps the approval card, even for a read-only role. A
+  `worktree_base` starting with `-` is refused, and `git worktree add` now
+  receives its path and base after `--`.
+- Fleet and reasoning-router names must be plain file names (optionally
+  `origin/name`); a name with path separators or `..` is refused before any
+  file is looked up, through one shared check in the workflow crate.
+- `pandoc_convert` and `image_ocr` apply the same read deny-list and
+  credential-store checks as `read`, through one shared helper, and pandoc
+  always runs with `--sandbox`. This needs pandoc 2.15 or newer; an older
+  pandoc gets an upgrade message instead of a conversion.
+- Computer Use: screenshot and zoom output paths must be `.png`/`.jpg`/`.jpeg`
+  files inside the recordings directory, and zoom always crops the last
+  captured raster instead of a caller-named source file.
+- Skill registry sync refuses an index key that is not a single path-safe
+  name before it is used as a cache directory, the same check an installed
+  skill name already gets.
+
+### Security
+
+- A project's `.codewhale/config.toml` can no longer set `notes_path`; it is
+  ignored with the other user-only keys. The `note` tool and `/note` refuse a
+  notes file that is a symlink or whose directory resolves outside the
+  workspace, and a note is flushed to disk before the tool reports success.
+- Diffs and shows that read repository content (`codewhale review`, the
+  `git_diff`/`git_show` tools, verification, delivery, task attempt records,
+  `@diff` and the runtime API diff routes) share one flag set: no external
+  diff, no textconv, and submodules compared by commit only, so a submodule's
+  configured filters and diff drivers never run. Reads of the working tree
+  (`git_diff`, `git_show`, `git_blame`, commit planning, verification, task
+  attempt records, `@diff`/`@git`) also run through the hardened review
+  command, so the repository's clean filters do not run either. `git_blame`
+  and read-only shell `git blame` skip textconv, and read-only shell `git`
+  reads neutralize the repository's clean filters.
+- `git_fetch` refuses refspecs that would write a local branch or tag: a
+  `src:dst` destination must be under `refs/remotes/`, and the two-word
+  `tag <name>` form is rejected.
+- Opening a URL on Windows goes through the URL protocol handler instead of
+  `cmd /C start`, so characters in the URL are not interpreted by the shell.
+- Skill downloads and the skills registry index are read through a streaming
+  size cap shared with the MCP HTTP transport, instead of buffering the whole
+  body before checking its size.
+- Durable runtime thread, turn and item ids carry a full UUID instead of 32
+  random bits, so two records can no longer collide and overwrite each other.
 
 ### Removed
 
@@ -204,8 +883,15 @@ quieter, and Fleet runs can be checked before they spend anything.
 - `codewhale fleet run <spec> --check` runs every validation a real run would
   and stops there: nothing is created, launched or spent.
 - A queued agent says why it is waiting, for example when launches are
-  throttled after provider rate limits, and when its time budget ends
+  throttled after provider rate limits, and when it stops waiting
   ([#6277](https://github.com/Hmbown/Codewhale/issues/6277)).
+- Read-only agents can run chained inspection commands (a leading `cd`,
+  `&&`, `;`, `echo` separators, `2>/dev/null`), and a refused command now
+  names the rule it broke and what to do instead. Durable Fleet workers
+  accept the same read-only commands as in-session agents. An agent's time
+  budget starts when it launches, and a queued agent that never gets a slot
+  says it never started
+  ([#6015](https://github.com/Hmbown/Codewhale/issues/6015)).
 - Stopping an agent that writes files keeps and names the work it had
   changed, as a budget stop already did
   ([#5529](https://github.com/Hmbown/Codewhale/issues/5529)).
@@ -219,6 +905,42 @@ quieter, and Fleet runs can be checked before they spend anything.
   Each agent also has one name: a workflow task's label or its dispatch name
   appears on the rows, the notification and the runtime API alike, never its
   internal id ([#6565](https://github.com/Hmbown/Codewhale/issues/6565)).
+- The mobile page shows the thread's agents: a strip naming each one, its
+  state, and what it is doing or what it found, rebuilt when the page
+  reconnects. Sub-agent prompt caching now counts toward the session, including
+  cache-write-only reports. PRICE and `/cache` show the parent, agents and
+  combined hit rates, each labelled and weighted by all input tokens,
+  including cache writes,
+  and the footer `cache N%` still means this conversation's own requests
+  ([#6565](https://github.com/Hmbown/Codewhale/issues/6565)).
+- The dock's GIT, FILES and NOTES views are real. GIT shows the branch and
+  where it stands against its upstream, the changes (with their paths one
+  Enter away), linked worktrees and the last five commits, and it keeps
+  updating during a turn while it is open. It says "not a git repository"
+  only when that is true, reports failed status probes in the view and composer
+  instead of claiming a clean tree, counts every unmerged path as a conflict, and only
+  says there are more changed paths when the list is capped. FILES lists the
+  files this session edited, including writes without diff receipts, and the
+  files it read, with every unique path retained beyond the activity summary's
+  twelve-path preview. FILES and its badge refresh from the current session
+  even before TASKS opens. Edits with receipts show their size and open their diff.
+  NOTES lists your `/note` notes. The git
+  badge, the Git view and the model's git line now share one
+  `git status --porcelain=v2` call, so there are fewer git processes than
+  before ([#6565](https://github.com/Hmbown/Codewhale/issues/6565)).
+- Background work tells you when it ends, even between refreshes. Batched
+  shell notices cover explicitly backgrounded or detached commands; foreground
+  results and old completions from before this TUI session stay quiet.
+  Switching sessions does not repeat a completion notice. Batched
+  notices count completed, failed and stopped work separately; shell commands,
+  task prompts and errors stay in the app, away from lock-screen notifications.
+  A running dev server no longer holds the notice back. Failed, killed and
+  timed-out shells retain their outcomes, and the last eight finished shells
+  stay listed per session. Finished tasks no longer look live or reopen the
+  dock. Background labels follow the UI language, long agent previews keep
+  their full-result pointer, and the quiet indicator uses the engine's clock
+  and limit without marking an active tool as quiet
+  ([#6565](https://github.com/Hmbown/Codewhale/issues/6565)).
 
 ### Plugins
 
@@ -5893,594 +6615,6 @@ Thank you to the contributors whose code, reports, and reviews shaped v0.9.1:
   one canonical freshness namespace, admin discard is restricted to validated
   draft objects, public feed requests cannot spend the server-held GitHub
   token, and maintainer login bodies are type- and size-bounded before parsing.
-
-## [0.9.0] - 2026-07-16
-
-Codewhale v0.9.0 replaces the default terminal shell with the underwater
-interaction system, makes Operate message-first, and hardens the Fleet,
-Workflow, routing, accounting, and release surfaces that support day-to-day
-agent work. The release also expands localization and gives the public site a
-quieter, docs-first community foundation. Its provider work replaces the old
-hand-maintained picker boundary with live ProviderLake discovery and adds the
-largest curated model-and-pricing expansion in the project so far.
-
-### Fixed — final integration
-
-- Redact configured, environment, file-backed, and bare active credentials
-  from every tool result before it crosses any model-provider wire protocol;
-  retrieved spillover content is sanitized again at that boundary. The
-  `read_file` tool also refuses CodeWhale configuration, backup, and
-  credential-store paths, preventing routine tool use from exposing those
-  local files.
-- Keep immediate TUI submit failures inside the shell: custom-provider route
-  preflight and closed-mailbox errors now restore the exact composer draft and
-  selected skill for retry, with a sticky visible error instead of exiting.
-- Anchor automatic compaction thresholds to the route's spendable input
-  budget after output reservation and safety headroom, so large-output and
-  tight self-hosted routes compact before provider context rejection. The TUI
-  pre-send gate and warning copy now use the same token threshold as the
-  engine. Preserve the 262K Kimi route's usable input budget and use the
-  documented 32K default generation budget instead of mirroring the context
-  window as output (#4293 by @SamhandsomeLee, #4368 by @bruce6135, and #4378
-  by @mvanhorn).
-- Fail closed instead of reporting base-rate dollar estimates for direct OpenAI
-  GPT-5.4/5.4 Pro, GPT-5.5 (including dated snapshots), and GPT-5.6
-  Sol/Terra/Luna requests above 272K input tokens. Exact tiered accounting
-  remains deferred to the generalized pricing schema; smaller 5.4 variants,
-  GPT-5.5 Pro, Codex subscription, and foreign-provider routes are unchanged
-  (#4317).
-- Retire `deepseek-chat` and `deepseek-reasoner` before they reach DeepSeek's
-  first-party OpenAI or Anthropic wire APIs, migrating both to the documented
-  `deepseek-v4-flash` replacement while preserving legacy non-thinking /
-  thinking intent when no explicit reasoning tier is set. Aggregator, Wanjie
-  Ark, self-hosted, and custom endpoint model ids remain provider-owned (#4320).
-- Make Operate a message-first multitask surface: ordinary prompts work without
-  a Workflow, direct parent tools follow the same approval, sandbox, shell,
-  ask-rule, and repository protections as Act, and follow-ups can queue while
-  work is active. Bounded background workers remain preferred for independent,
-  parallel, isolated, or long-running work; child handoffs cannot inherit
-  standing Full Access, and each dispatch produces one durable completion
-  receipt.
-- Let personal Fleet profiles in `CODEWHALE_HOME/agents` travel across
-  repositories while project profiles in `.codewhale/agents` override them.
-  Saving refreshes the live roster, and the UI now says explicitly that profile
-  availability does not expand workspace, trust, or filesystem authority.
-- Move file-mention discovery onto one bounded, generation-safe background
-  worker so a slow filesystem read cannot freeze composer input. Exact paths
-  resolve on send; fuzzy matches stay in the completion popup instead of
-  silently attaching an arbitrary same-name file (#4365 by @WavesMan, with the
-  initial bounded-walk approach from #4367 by @LeoLin990405).
-- Keep the opt-in `remember` tool in the model-visible first-turn catalog so
-  durable preference capture works without requiring a model to discover a
-  tool it cannot yet know exists (#4373 by @Angel-Hair and #4377 by
-  @mvanhorn).
-- Make `review` handle a staged snapshot relative to a base ref by comparing
-  the branch merge-base tree with the index. This preserves committed and
-  staged branch work, excludes unstaged edits, and avoids the invalid
-  `git diff --cached <base>...HEAD` form.
-- Honor each MCP server's advertised discovery capabilities before calling
-  optional tools, resources, templates, or prompts; keep optional probes
-  independently bounded and fail-soft (#4308 by @nsfoxer).
-- Make offline `scorecard` pricing provider-aware: `turn_end` records carry the
-  effective route and a non-secret billing surface, runtime exports and
-  supported aliases ingest cleanly, legacy/unknown routes remain explicitly
-  unpriced, and route-scoped cache and recorded-time pricing replace model-only
-  guesses. Historical runtime aggregates use each turn's recorded time;
-  costless catalog routes fail closed while exact provider-owned hand-price
-  rows remain available. StepFun PAYG and Step Plan usage now stay distinct
-  without persisting raw endpoint URLs, so subscription quota is never reported
-  as token spend (#4335). Completion-only shell, manual-compaction, and purge
-  events remain visible to `turn_end` observers as explicitly non-model
-  lifecycle records. This builds on the scorecard introduced by @findshan in
-  #3388.
-- Preserve named custom-provider identity across TUI sessions, `exec --resume`,
-  runtime threads, exports, cache and Workflow receipts. Restores resolve the
-  saved provider against live configuration before creating a client, never
-  infer a provider from the model ID, and fail closed when the named route was
-  removed, invalid, or ambiguous (#4334).
-- Bind credentials to the endpoint that owns them. Environment-selected custom
-  hosts can no longer inherit saved provider keys, keyring entries, OAuth, or
-  ambient provider variables; only an explicitly source-marked CLI key may
-  follow an explicit CLI endpoint override. `auth_mode = "none"` also strips
-  credential-shaped custom headers consistently in the TUI and app server,
-  while keyless loopback routes remain usable as local runtimes.
-- Make hosted runtime threads deterministic and provider-exact: serialize
-  thread, turn, and event mutation; keep cancellation ownership with the host;
-  preserve the selected provider through every durable turn; terminalize
-  exceptional streams once; and prevent the runtime manager from silently
-  dispatching unclaimed goal continuations or child turns.
-- Treat required user confirmation as a real goal blocker instead of a failed
-  goal, and explain how to recover when a previously cached approval is denied.
-  Cached-denial recovery is also committed as a settled transcript receipt, so
-  tool completion or a later status update cannot erase it from scrollback or
-  accessibility output. The notice now describes matching, process-scoped
-  denials truthfully across all shipped locales; approval audits honor
-  `CODEWHALE_HOME`, and expired status toasts cannot remain trapped behind a
-  persistent entry. Both states remain visible and actionable instead of
-  looking like unexplained model or tool failure (#4374 and #4375 by
-  @Angel-Hair, with the final hardening in #4385 by @nightt5879).
-- Make Fleet launch and teardown deterministic: route flags are placed before
-  `exec`, workers are contained in owned Unix sessions or Windows Job Objects,
-  and cancellation reaps surviving descendants with bounded escalation before
-  manager state settles. Fence progress, terminal status, verification
-  receipts, and evidence by durable attempt generation so a stale process can
-  never complete or overwrite a restarted attempt; terminal state and receipt
-  now commit atomically, stale-heartbeat decisions use a full lease CAS,
-  exhausted-retry alerts are exactly once, and crash-truncated ledger tails are
-  quarantined before the next append. Standalone CLI and Runtime API restart
-  controls now drive the replacement attempt through a real executor to its
-  terminal receipt, while per-run manager ownership prevents concurrent
-  controllers from launching the same attempt twice.
-- Keep the stopship Workflow fixture bounded to measured 24k-per-turn role
-  budgets and a 360k aggregate. Authored child step and wall-time limits now
-  reach the live runtime, including launch-queue wait; promoted evidence stays
-  intact between roles, tool-free handoff consumers omit tool fields on the
-  provider wire, and a terminal `BLOCK` fails the Workflow instead of producing
-  a successful Lane receipt. Free-form descriptions no longer fabricate write,
-  shell, or network risk; unknown structured risk remains fail-closed.
-- Keep repository trust affirmative and explicit: only `1`/`Y` are advertised
-  as acceptance keys, while Enter remains non-affirmative and explains the
-  required choice.
-- Replace literal legal and doctrinal metaphors in Simplified Chinese setup and
-  `/constitution` copy with direct collaboration terminology reviewed by a
-  native speaker (#4369 by @hmr-BH).
-- Keep the transcript reviewable while an inline approval card is active:
-  Page Up/Down, modified arrows, Home/End, and the mouse wheel now move through
-  the visible evidence without changing or dismissing the pending decision
-  (#4371 by @amuthantamil).
-- Match generated worker names to the active UI language while preserving
-  explicit user names, and tighten the 89x50 shell rhythm across Fleet rows,
-  choice dialogs, transcript boundaries, and the idle composer.
-- Put docs content and search before the full index on small screens, reduce
-  mobile dead space, and keep the public community copy focused on issues,
-  pull requests, and international contributors.
-
-### Changed — the underwater shell
-
-- Replace the default TUI shell with the underwater interaction system: one
-  renderer owns the header, top work strip, transcript ledger, composer, and
-  footer, with explicit compact/normal/wide tiers and no legacy sidebar or
-  dashboard in the default path. The legacy composition survives only behind
-  the internal `classic` treatment.
-- Add a distinct pre-session launch screen — new session, new worktree (with
-  inline naming and real lane provisioning), scoped resume count, changelog,
-  quit — with reliable non-colliding keys and row/keyboard parity.
-- Render turns as a ledger: user message, short narration, settled tool
-  receipts, and exactly one live row. Fast tool bursts land directly as
-  batch receipts (no spinner churn), completed receipts stay inspectable,
-  failures hold a coral receipt with stderr one `v` away, and one shared
-  tool rail replaces nested card borders.
-- Make completion a one-shot exhale: `working -> finishing -> done` in the
-  footer only, with no transcript repaint, no lingering loop, and no stale
-  cancel action in the completed state.
-- Rebuild the secondary rooms on one hairline grammar — config, setup,
-  sessions, help, context, theme, model/route, Fleet, file attach — each
-  with a title hairline, row objects with focus/selection/mouse parity,
-  one panel-owned scroll rail, and wrapped action footers.
-- Make `/model` a model-first atomic route picker across configured
-  providers: provider and model switch together on apply, and every row
-  prints the resolved model. `/theme` gains a live preview with truthful
-  Esc revert across all 12 shipped themes.
-- Add a live context inspector (Alt+C) backed by the current route: exact
-  system/messages/free token buckets, a proportional map, drill-down into
-  the detail pager, and no frozen session while it is open.
-- Project Workflow runs as an in-stream run map: a collapsed one-line card
-  that unfolds into per-lane rows with role, resolved model, worktree,
-  elapsed track, and per-member running/waiting/failed/cancelled/done
-  states, plus gates and a debrief built only from real run data. Child
-  transcripts never flood the parent shell.
-- Unify Fleet into roster/setup/workers rooms: the operator is pinned first
-  with the live session route, members show resolved route truth (inherit /
-  fast lane / pinned), and the workers tab is a control surface with
-  row-local open/stop and real lifecycle counts.
-- Distinguish repository-law approvals from ordinary approvals: the
-  constitution prompt names its authority, source, matched rule, and target,
-  and Full Access never bypasses it. Ordinary approvals render as a still
-  coral band above the visible transcript.
-- Keep streaming honest and cheap: provider-unit deltas replace per-grapheme
-  queueing, the transcript is top-anchored so appended lines stop shifting
-  settled rows, ambient animation stops during real work, and ordinary
-  completion no longer triggers full-screen clears (verified by render-diff
-  logs: suffix updates of tens of cells while streaming, zero periodic
-  full repaints).
-- Give every underwater treatment ambient life: ombre breathes its water
-  column while flat and Terminal-owned keep the idle fish and bubble
-  (foreground-only for Terminal), a typed treatment setting replaces string
-  comparisons, reduced motion freezes life legibly, `fancy_animations =
-  false` stills the chrome, and typing scatters the fish immediately. Fish
-  keep a one-cell gap from occupied text; the whale remains the single brand
-  mark and returns to stillness between caustic sweeps.
-- Bring the whale mark to life with a soft diagonal caustic sweep, then let it
-  genuinely rest. Active markers now share a smoother 8 Hz clock after the
-  existing earned-motion delay, while reduced motion, hidden/off-screen views,
-  modal ownership, and compact-terminal redraw budgets remain authoritative.
-  The motion is adapted from the Apache-2.0 Grok Build interaction language,
-  not copied as a global pulse or high-frequency receipt cascade.
-- Keep compact terminals operable: `/config` and `/resume` collapse
-  secondary chrome before sacrificing their selectable rows at 40x12 and
-  60x16, bodies budget for the footer's real wrapped height, and the
-  selection stays visible through resizes.
-- Route footer notices through the classified toast system so informational
-  acknowledgements (for example "Auto-compaction enabled") expire instead of
-  becoming permanent idle chrome, while warnings and errors hold as sticky
-  notices until their window passes.
-- Complete the `CODEWHALE_ASCII_SAFE=1` decorative tier: the whale mark,
-  context meter, braille state markers (mapped by dot density so the working
-  bubble still reads as a rising fill), bubbles, rails, and role/lane glyphs
-  all narrow to semantic ASCII while user, model, and CJK text passes
-  through untouched. Verified by whole-surface rendered-buffer sweeps.
-- Repair the Help catalog to match handler truth (`Alt+G`, `Alt+Shift+G`,
-  `Alt+[`, `Alt+]`, `Alt+L`, `Alt+?`), and give theme, Help, model, and
-  config rows direct mouse paths with the same activation as Enter.
-
-### Changed — integrated runtime and TUI
-
-- Make worker delegation route-aware and identity-safe: workers receive a
-  small role-scoped system prompt instead of stale parent/model boilerplate,
-  faster routes resolve through the configured provider, and opening a worker
-  shows its complete available transcript. Remove `token_budget` from the
-  ordinary model-facing Agent schema so agents do not micromanage ad-hoc
-  launches; explicit legacy calls remain readable for compatibility.
-- Mature `/config` interaction for enumerated and boolean settings with
-  pickers/toggles, mouse-wheel scrolling, stable focus, and configured-provider
-  selection. Startup mode is now only Agent or Plan; legacy `operate`/`yolo`
-  settings migrate to Agent with permission posture represented separately.
-- Show where effective permission policy comes from and keep profile,
-  environment, project, managed, and requirements-controlled posture read-only
-  in the in-session editor. Runtime presets edit only proven user-owned root
-  settings and no longer persist temporary environment overlays.
-- Restore the original four-line whale mark and make ambient ocean motion
-  coherent across the full scroll surface: one continuous ombre, eased fish
-  that face their direction of travel, fish in otherwise blank scrollback, and
-  explicit reduced-motion and animation controls.
-- Keep model reasoning in the transcript rather than the Tasks strip, retain
-  the live header status indicator, separate worker and success colors, and use
-  the same rail grammar for both work-strip and transcript scrollbars.
-- Present the default Z.AI Coding Plan route, including child routes, as
-  subscription quota instead of estimated per-token dollars. No undocumented
-  account endpoint is called by this change.
-
-### Added
-
-- Thinking Machines Lab's Inkling through Together using the exact wire model
-  `thinkingmachines/inkling`, with `inkling` and `together-inkling` aliases and
-  exact `none` / `minimal` / `low` / `medium` / `high` / `max` reasoning
-  values. Codewhale does not invent a context window, price, or offline picker
-  claim while the provider's public catalog metadata remains inconsistent.
-- Expand the verified offline catalog with Claude Sonnet 5, Claude Fable 5,
-  GPT-5.3 Codex, and Qwen3.7 Plus, including time-aware Sonnet 5 introductory
-  pricing and explicit cache rates. Refresh stale GLM-5.1, Kimi K2.6, Trinity,
-  Qwen3.6, Nemotron, Anthropic, GLM-5.2, Kimi K2.7 Code, GLM-5 Turbo, and
-  GPT-5 Codex price or limit rows; keep Xiaomi MiMo explicitly unpriced where
-  the provider's token plan and pay-as-you-go surfaces cannot be distinguished.
-- MiniMax Messages provider support for MiniMax-M3 and MiniMax-M2.7, with
-  OpenAI-compatible and Messages routes, regional endpoint guidance, request
-  coverage, catalog limits, and tier-aware pricing (PR #4354 by @octo-patch).
-- Dynamic MCP server infrastructure and an approval-gated tool that lets the
-  model start a configured MCP server from chat context. Harvested from
-  #3869 and #3866 by @bistack with authorship preserved.
-- Parent `--disallowed-tools` restrictions now flow into sub-agents and Fleet
-  workers by default, including deny-wins, wildcard, catalog-filtering, and
-  multi-generation inheritance coverage. Harvested from #4096 by @JayBeest
-  (#4042).
-- Korean (ko) UI locale with full key parity and onboarding/setup wiring
-  (PR #4347 by @moduvoice).
-- Localize the entire underwater layer: 104 new UI strings — launch menu,
-  phase words, mode/permission chips, footer hints, session picker, context
-  inspector, route and theme pickers, Fleet roster, workflow status, sidebar
-  work strip, repository-law approval copy, and file-attach titles — wired
-  through MessageIds and translated into ja, zh-Hans, es-419, pt-BR, vi,
-  and ko. Every complete pack now holds exact raw key parity with English
-  (856 keys), enforced by new tests that the old English-fallback gate could
-  not perform. The permission chip maps from typed state, so localization
-  can never silently collapse it. Machine-authored translations follow each
-  pack's existing terminology and are flagged for native review.
-- Anthropic adapter: sanitize top-level `oneOf`/`anyOf`/`allOf` in tool
-  input schemas so affected tools no longer fail the whole request with
-  HTTP 400 (PR #4346 by @qinlinwang).
-- Anthropic pricing: bill cache-write tokens at published rates
-  (PR #4348 by @knqiufan, #4318).
-- NetBSD: generate QuickJS bindings at build time so `codewhale-workflow-js`
-  compiles (PR #4349 by @ci4ic4).
-- Real-PTY release gates for six-worker fan-out liveness with Esc cancel,
-  multi-terminal route isolation, queued steering via terminal-safe Ctrl+G
-  (with Ctrl+S retained where the terminal forwards it), the one-shot
-  completion footer, and per-theme ANSI output for every shipped palette.
-
-### Fixed
-
-- Make release publication complete and source-anchored: every build checks out
-  the resolved tag commit, tag movement is rejected before GHCR, GitHub
-  Release, Homebrew, Cargo, or npm writes, and registry helpers require a clean
-  checkout exactly matching the remote tag. Manual recovery runs are
-  exact-tag-only and execute the same parity gate as automatic tag pushes.
-- Publish a coherent distribution set: both checksum manifests now contain
-  usable public basenames and cover the full 29-asset matrix; GHCR, Homebrew,
-  GitHub archives, and the Linux x64 CNB mirror carry `codewhale`, `codew`, and
-  `codewhale-tui`. The CNB shortcut now fails clearly outside Linux/OpenHarmony
-  x64 instead of promising assets that the mirror does not build.
-- Preserve task text when a skill is invoked through dollar, unified-slash, or
-  explicit skill syntax, while keeping bare skill invocations and management
-  subcommands intact (PR #4372 by @nightt5879, co-authored by @CCChisato;
-  #3915).
-- Honor MCP server discovery capabilities: require advertised or legacy
-  `tools/list`, keep optional resource/template/prompt probes independently
-  bounded and fail-soft, and format descriptions Unicode-safely (#4308,
-  harvested with co-authorship from @nsfoxer).
-- Age-evict terminal sub-agent worker records from the state ledger so
-  long-lived, high-fan-out sessions do not keep rewriting multi-megabyte
-  terminal history (#4217; root-cause and fix direction from @yekern).
-- Resolve the sub-agent completion/cancellation race with one terminal-state
-  claim: cancellation suppresses late mailbox/parent/UI delivery, while a
-  completed result remains publicly running until its notification is safely
-  delivered.
-- Keep Workflow panel controls from stealing ordinary composer letters. Enter,
-  Delete, Up/Down, and Esc own panel actions; typed characters return focus to
-  the composer and start the message normally.
-- Preserve the composer prompt gutter from the first typed character through
-  wrapping, scrolling, cursor placement, and mouse hit-testing so the `>` does
-  not disappear or make input appear to jump.
-- Emit terminal-native OSC 8 metadata for rendered URLs without placing escape
-  payload bytes in the measured text, keeping long links visible, selectable,
-  and clickable in supporting terminals.
-
-- Keep headless structured output terminal-clean: `codewhale exec` engines
-  no longer emit interactive terminal-title/taskbar OSC sequences, so
-  `--output-format stream-json` stdout stays parseable, escape-free JSONL.
-  Interactive TUI sessions keep their terminal chrome.
-- Localization honesty: the parity gate was blinded by its own English
-  fallback — two keybinding rows (`KbCyclePermissions`, `KbCycleThinking`)
-  were missing from all five "complete" packs and now ship translated; the
-  Operate-mode copy that drifted in English was retranslated in every pack
-  (including zh-Hant's slice); three MessageIds absent from
-  ALL_MESSAGE_IDS are visible to tests again; and the `/config`
-  theme/locale hints and the invalid-locale error derive from the shipped
-  registries instead of stale hand lists that advertised 4 of 12 themes
-  and 4 of 8 locales.
-- The setup wizard's constitution step no longer claims a "55-line core"
-  in any language (the bundled core is larger today); the guided draft says
-  "the bundled core stays active" instead.
-- In-app selection copy is rail-clean and now regression-tested: copied
-  transcript text excludes the `▎ ╎ │ ●` decorations via cache metadata
-  (#4208 — thanks @eugenicum for the report and code-aware fix direction;
-  terminal-native selection with mouse capture off remains a product
-  decision on the proposed `rail_style` option).
-
-### Docs
-
-- Stamp every 0.9-era roadmap document with an explicit status (current,
-  historical, superseded, principle-only, or future RFC), correct trackers
-  that recorded unshipped work as done, and describe what remains after
-  v0.9.0 in `docs/AGENT_RUNTIME.md`.
-- Add `docs/rfcs/UNIFIED_PROVIDER_LOGIN.md`: one `codewhale auth login`
-  surface for Anthropic, OpenAI Codex, and xAI, with the Anthropic adapter
-  gated on verifying flow permissions before any constants are adopted.
-- Refresh `docs/ACCESSIBILITY.md` for treatment-independent ambient life
-  and the completed ASCII tier.
-
-### Changed — runtime foundations
-
-- Make the advertised Android/Termux release target buildable by generating
-  QuickJS bindings against the Android NDK instead of expecting an upstream
-  pre-generated `aarch64-linux-android` binding file, and give Android CLI/TUI
-  HTTP clients a preconfigured rustls root store (Mozilla WebPKI roots) so
-  standalone Termux processes stop panicking inside
-  `rustls-platform-verifier`'s JVM expectations (#4236, #4242).
-- Rebalance the bundled Constitution after the v0.8.67 prompt ablation: keep
-  the procedural policy tail in mode-specific layers, while restoring concise
-  behavioral guidance for momentum, causal investigation, constraint-first
-  decisions, mechanism-backed guarantees, and clean continuity.
-- Wire live catalog cache into provider/model pickers without dropping stale or
-  prior rows after TTL expiry / refresh failure (#4139). Remove the dead
-  `OFFERING_SEEDS` hand table so the bundled Models.dev catalog is the sole
-  seed source; pickers show a compact `stale` / `cache failed` chrome chip when
-  the Models.dev layer is past TTL or last refresh failed.
-- Make `work_update` the sole model-facing To-do / Work progress tool (#4132).
-  `checklist_*` and `todo_*` remain registered as hidden compat aliases for
-  transcript replay; `update_plan` stays Strategy metadata/context/route, not
-  a second checklist. Mode/approval prompts nudge the single surface.
-- Demote the bundled Models.dev snapshot to an offline/stale fallback after
-  live catalog refresh (#4188). ProviderLake precedence is live Models.dev >
-  bundled seed > legacy hardcoded completion names; pickers, inventory, and
-  subagent validation stay catalog-backed, and Codewhale-only providers keep
-  defaults when Models.dev has no rows.
-
-### Added
-- Wire xAI device-code OAuth into `codewhale auth xai-device`, the TUI
-  `/auth xai-device` command, and guided provider setup, with comment-preserving
-  auth-mode persistence and loopback exchange coverage (#4257).
-- Add GPT-5.6 Sol, Terra, and Luna to the OpenAI API route, including their
-  1.05M context metadata, 128K output limits, pricing, and `max` reasoning
-  effort. Add Meta Model API as a first-class OpenAI-compatible provider for
-  Muse Spark 1.1 with 1M context, tool/reasoning metadata, provider aliases,
-  and both `META_MODEL_API_KEY` and Meta's `MODEL_API_KEY` credential names.
-- Catalog automation: `scripts/catalog_models_dev.py` refreshes secret-free
-  Models.dev / OpenRouter listings and validates the offline seed snapshot
-  (`snapshot --check`) without ever persisting API keys (#4117).
-- `/model` picker cycles six catalog views with `A` (Configured → Catalog →
-  Recent → Coding → Cheap → Long context) and richer row metadata from the
-  live/bundled catalog (context, max output, tools, reasoning, price/M,
-  freshness). Discoverability views do not auto-apply a surprising route
-  (#4115).
-
-- Workflow runs are now durable: every run appends to a
-  `.codewhale/workflow-runs.jsonl` journal and hydrates on startup, so
-  `workflow status` survives restarts; runs left `running` by a dead process
-  are recovered as failed (#4011). The transcript renders workflow tool
-  output as a run card (status, goal, children, progress, verification)
-  instead of a generic one-liner (#4038), and `workflow` accepts a `verify`
-  flag that runs post-completion verification gates and fails the run when
-  gates fail (#4013).
-- Hotbar sources for MCP tools and skills: MCP tool slots prefill the
-  composer (execution stays behind the normal tool-approval flow) and skill
-  slots activate through the existing `$skill` alias (#2068, #2069).
-- Mode & permission surface: Tab cycles Plan → Act → Operate; Shift+Tab
-  cycles the Agent permission posture (Ask / Auto-Review / Full Access) with
-  a footer permission chip; Ctrl+T cycles reasoning effort and Ctrl+Shift+T
-  opens the live transcript overlay. Operate is the orchestration mode
-  (delegate, wait, inspect, dispatch) and raises sub-agent fan-out while
-  focusing the Agents sidebar.
-- Provider lake facade: the provider/model pickers, hotbar, and model
-  inventory now enumerate configured providers' models from the bundled
-  catalog (with an `A` toggle to browse the full catalog), replacing the
-  hardcoded per-provider model table (#3830 follow-up).
-- Added Cursor-integrated-terminal dogfood evidence for the published v0.8.67
-  release, covering installed binary provenance, release/publication checks,
-  headless runtime smoke, setup QA, and remaining manual visual TUI checks.
-- README and README.zh-CN now point users to the community-maintained
-  CodeWhale for VS Code GUI frontend while clarifying that this repository's
-  `extensions/vscode/` scaffold remains the read-only Phase 0 viewer (#4035).
-
-### Fixed
-
-- Sub-agent waiting no longer peek→sleep polls: `agent(action="wait")` joins
-  children, unchanged peeks are throttled (~30s) with an anti-polling nudge,
-  and mode prompts teach the join primitive (#4097). Harvested from PR #4098
-  by [@Mr-Moon121](https://github.com/Mr-Moon121) (Jeffrey Luna).
-- `/provider` picker remembers catalog/configured view and highlighted row
-  across reopen, matching `/model` picker memory.
-- Mode picker roster is exactly Act / Plan / Operate (no Multitask, no
-  numeric `4`/`5` gaps). Legacy `yolo`/`4` remain invisible one-way
-  permission shorthand for Act + Bypass.
-
-- Fleet setup is a role/profile roster editor, not a provider-scoped model
-  picker: the Model step lists routes from every configured provider (not
-  only the active one), a picked route's provider is persisted explicitly in
-  the saved profile TOML (`provider = "..."`, never inferred from the model
-  id), and the loader/route resolver read that field back out verbatim. The
-  draft-preview save keypress no longer competes with a separate pager's
-  `g`/`G` scroll bindings — the exact TOML preview now renders inline on the
-  same Review step that saves it (#4093).
-- `codewhale fleet run` and interactive in-process Fleet launches now honor a
-  profile-pinned provider/model route instead of merely recording it on the
-  receipt. Headless workers receive the non-secret `--provider` and `--model`
-  pair; TUI workers resolve the same explicit route in process. Credentials
-  still come from the worker's environment, provider is never inferred from a
-  model id, and unpinned workers continue to inherit the run route (#4093,
-  #4193).
-- The Fleet setup `m` model-assisted redraft no longer drops a picked
-  cross-provider route: the provider/model the operator chose are re-pinned
-  onto the drafted profile (a model draft is always `provider: None`), so
-  saving it keeps the explicit route instead of persisting an ambiguous,
-  provider-scoped profile (#4093).
-- Saving a Fleet profile now fails with a clear message when it pins a
-  provider that has no configured credentials, using the same
-  configured-provider check the model picker uses (#4093).
-- Workflow correctness: completion polling fails closed instead of
-  fabricating success when a sub-agent reports no terminal status; cancel
-  interrupts the JS VM (cancel handle + abort) and blocks further spawns;
-  and `budget.spent()` reports real manager-scope usage instead of always 0.
-- Sub-agent spawns validate the model↔provider pair before dispatch:
-  inherited/faster routes remap foreign models to the provider's catalog
-  default, and explicit pins fail fast with a diagnostic instead of an
-  upstream model-not-found error.
-- TUI stability: engine event drains break every 8–16 events / 8 ms to keep
-  input live (#1830, #2317, #1198); the terminal input pump restarts after
-  stall recovery on macOS/Linux too; the startup raw-mode probe no longer
-  leaks raw mode on timeout; recovery snapshots persist every 45 s during
-  long turns and the offline queue persists on every push (#1830);
-  queue/steer paths surface toasts while streaming (#2317, #1338); and
-  modal submit errors re-open the modal instead of being swallowed (#1198).
-- Core/state: paused jobs persist as paused across restarts; unarchive
-  updates the in-memory cache; tool dispatch has a timeout; MCP
-  notifications no longer receive responses; corrupted checkpoints surface
-  errors instead of loading empty state; the session index compacts instead
-  of growing unbounded; and recording thread-goal usage no longer
-  self-deadlocks the state store.
-- Runtime compaction summaries are now persisted into `/v1` thread records so
-  engine reloads and restarts preserve compacted context. Contributed by
-  MXAntian (@MXAntian) (#4091).
-- The TUI leaves xterm alternate-scroll mode off when mouse capture is disabled,
-  preserving native terminal text selection in light-theme/no-mouse-capture
-  sessions. Contributed by Nightt (@nightt5879) (#4088, #4026).
-- The public `/api/github/feed` endpoint is now forced dynamic on Cloudflare so
-  it returns live GitHub activity instead of a build-time empty feed.
-
-### Security
-
-- Require bearer authentication for `/v1/chat/completions`, compare tokens in
-  constant time, return accurate 4xx/5xx statuses, bound request bodies and SSE
-  frames, redact secrets from stdio `config get`, and reliably reap the runtime
-  child during shutdown.
-- Keep trust precedence and secret persistence fail-closed: user ExecPolicy
-  rules outrank agent-layer rules, chained commands cannot propose unsafe
-  trusted-prefix amendments, and config and secret writes are atomic with
-  filesystem synchronization on every supported platform.
-
-### Changed
-
-- Tool-hang watchdog trimmed from 15 minutes to 10 (#1862); approval modal
-  footer hints use a higher-contrast tier (#3380); status/mode copy is
-  disclosed once across header, footer, cards, and sidebar instead of
-  repeated per layer.
-- Removed the unused `tui::whale_routes` taxonomy module and its tests.
-  Contributed by Darrell Thomas (@DarrellThomas) (#4041, #3852).
-
-### Deprecated
-
-- YOLO mode: `--yolo`, `default_mode = "yolo"`, and the hotbar YOLO action
-  now map to Act + Full Access permissions via a compatibility shim and
-  show a one-shot deprecation notice. Removal is deferred beyond v0.9.0 so
-  this release does not break existing scripts without a dedicated cutover.
-
-- Google Gemini is its own backend (`/provider google`) on the official
-  OpenAI-compatible route with thought-signature capture/replay and
-  fail-closed replay for thinking models. Antigravity (`agy` 1.1.13) joins
-  as a separate credential-plane provider: consent-gated read-only import
-  of the official CLI's login with `ANTIGRAVITY_API_KEY`/`AGY_ADC_AUTH`
-  precedence; requests fail closed until the cloud-code wire protocol is
-  implemented.
-
-### Removed
-
-- Remove the deprecated `deepseek` and `deepseek-tui` binary shims in this
-  breaking release. `codewhale`, `codew`, and `codewhale-tui` are the supported
-  entry points; existing DeepSeek provider support and legacy config/session
-  migration remain intact.
-
-### Known issues
-
-- Android/Termux arm64 remains a preview in v0.9.0. The target, asset wiring,
-  updater selection, dependency graph, and source-build path have automated or
-  static coverage, but shell/PTY/config/TUI startup and runtime behavior remain
-  unverified on a real device (#4236, #4242). Do not use a GNU/Linux arm64
-  archive in Termux.
-
-### Contributors
-
-Thank you to the international community whose code, reports, reviews, and
-reproductions shaped v0.9.0:
-
-- [@amuthantamil](https://github.com/amuthantamil),
-  [@bistack](https://github.com/bistack),
-  [@bruce6135](https://github.com/bruce6135),
-  [@CCChisato](https://github.com/CCChisato),
-  [@ci4ic4](https://github.com/ci4ic4),
-  [@cyq1017](https://github.com/cyq1017), and
-  [@DarrellThomas](https://github.com/DarrellThomas).
-- [@eugenicum](https://github.com/eugenicum),
-  [@findshan](https://github.com/findshan),
-  [@gaord](https://github.com/gaord),
-  [@hmr-BH](https://github.com/hmr-BH),
-  [@hongqitai](https://github.com/hongqitai), and
-  [@idling11](https://github.com/idling11).
-- [@JayBeest](https://github.com/JayBeest),
-  [@knqiufan](https://github.com/knqiufan),
-  [@LeoLin990405](https://github.com/LeoLin990405),
-  [@moduvoice](https://github.com/moduvoice),
-  [@mvanhorn](https://github.com/mvanhorn),
-  [@Mr-Moon121](https://github.com/Mr-Moon121), and
-  [@MXAntian](https://github.com/MXAntian).
-- [@Angel-Hair](https://github.com/Angel-Hair),
-  [@nightt5879](https://github.com/nightt5879),
-  [@nsfoxer](https://github.com/nsfoxer),
-  [@octo-patch](https://github.com/octo-patch),
-  [@qinlinwang](https://github.com/qinlinwang),
-  [@SamhandsomeLee](https://github.com/SamhandsomeLee), and
-  [@taixinguo](https://github.com/taixinguo).
-- [@WavesMan](https://github.com/WavesMan),
-  [@wuisabel-gif](https://github.com/wuisabel-gif), and
-  [@yekern](https://github.com/yekern).
 
 ---
 

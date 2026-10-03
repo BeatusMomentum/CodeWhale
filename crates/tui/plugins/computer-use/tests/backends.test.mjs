@@ -47,7 +47,7 @@ function harmonyFixtureExec(t) {
       return fakeJpeg(168, 120);
     },
   };
-  return { exec, calls };
+  return { exec, calls, layout };
 }
 
 test("harmony: parseBounds handles uitest bounds strings", () => {
@@ -78,11 +78,13 @@ test("harmony: get_app_state flattens dumpLayout with indices and actions", asyn
   assert.ok(ok.actions.includes("click"));
 });
 
-test("harmony: screenshot pulls the file and reports panel dimensions", async () => {
+test("harmony: screenshot pulls the file and reports panel dimensions", async (t) => {
   const { exec } = harmonyFixtureExec();
   const mod = await import("../src/backends/harmonyos.mjs");
   const b = mod.create({ exec });
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cu-hm-test-"));
+  const oldRec = process.env.CODEWHALE_CU_RECORDINGS_DIR; process.env.CODEWHALE_CU_RECORDINGS_DIR = dir;
+  t.after(() => { if (oldRec === undefined) delete process.env.CODEWHALE_CU_RECORDINGS_DIR; else process.env.CODEWHALE_CU_RECORDINGS_DIR = oldRec; });
   const shot = await b.screenshot({ path: path.join(dir, "shot.jpeg") });
   assert.equal(shot.pixels.w, 168);
   assert.equal(shot.pixels.h, 120);
@@ -98,6 +100,24 @@ test("harmony: click routes through uitest uiInput with validated args", async (
   assert.equal(r.action_sent, true);
   const ui = calls.find((c) => c.args[0] === "uitest");
   assert.deepEqual(ui.args, ["uitest", "uiInput", "click", "124", "45"]);
+});
+
+test("harmony: element actions re-find the observed element and refuse a reordered tree", async () => {
+  const { exec, calls, layout } = harmonyFixtureExec();
+  const mod = await import("../src/backends/harmonyos.mjs");
+  const b = mod.create({ exec });
+  const ok = (await b.get_app_state({})).elements.find((e) => e.label === "OK");
+  const target = { index: ok.index, path: ok.path, role: ok.role, label: ok.label };
+  await b.perform_action({ target, action: "click" });
+  assert.deepEqual(calls.filter((c) => c.args?.[1] === "uiInput").at(-1).args, ["uitest", "uiInput", "click", "200", "230"]);
+  // A new sibling ahead of OK shifts every uitest index: the stored index now
+  // names "Delete". Nothing may be clicked.
+  layout.children.unshift({ attributes: { type: "Button", text: "Delete", bounds: "[0,300][100,360]" }, children: [] });
+  const before = calls.filter((c) => c.args?.[1] === "uiInput").length;
+  await assert.rejects(b.perform_action({ target, action: "click" }), (error) => error.code === "element_stale" && /label changed/.test(error.message));
+  await assert.rejects(b.set_value({ target, value: "x" }), (error) => error.code === "element_stale");
+  await assert.rejects(b.perform_action({ target: { index: ok.index }, action: "click" }), (error) => error.code === "element_stale", "a bare index has no identity to verify");
+  assert.equal(calls.filter((c) => c.args?.[1] === "uiInput").length, before, "no input after the tree changed");
 });
 
 test("harmony: clipboard and select_text fail closed with named reasons", async () => {

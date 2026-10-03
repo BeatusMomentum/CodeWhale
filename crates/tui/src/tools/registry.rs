@@ -38,6 +38,15 @@ pub struct ToolRegistry {
     api_cache: OnceLock<Vec<Tool>>,
 }
 
+/// The one sentence naming a `[tools.overrides]` entry that D4 refused, shared
+/// by the runtime log and the engine's user-facing status line.
+pub(crate) fn override_refusal_notice(tool_name: &str) -> String {
+    format!(
+        "Refused [tools.overrides.{name}]: a script or command override cannot replace the built-in tool '{name}', which stays active. Set type = \"disabled\" to turn it off, or key the override by a new tool name.",
+        name = crate::safe_label::SafeLabel::identifier(tool_name)
+    )
+}
+
 impl ToolRegistry {
     /// Create a new empty registry with the given context.
     #[must_use]
@@ -367,15 +376,27 @@ impl ToolRegistry {
     /// Apply config.toml tool overrides to this registry.
     ///
     /// For each entry in `overrides`:
-    /// - `Disabled` removes the tool.
-    /// - `Script` / `Command` replaces the tool with the user's implementation.
+    /// - `Disabled` removes the tool, built-ins included.
+    /// - `Script` / `Command` registers the user's implementation under a name
+    ///   no built-in owns: a new tool, or a replacement for a drop-in plugin
+    ///   script of that name.
+    /// - `Script` / `Command` keyed by a name in `builtin_names` is refused and
+    ///   the built-in stays active: script tools cannot shadow built-ins (D4,
+    ///   CURRENT_DECISIONS §26).
+    ///
+    /// Returns the refused override names so the engine can name each one to
+    /// the user ([`override_refusal_notice`]); the runtime log records every
+    /// refusal. `/plugin` does not list `[tools.overrides]` entries, so it
+    /// cannot show them there.
     ///
     /// `plugin_dir` is used as the base for relative script paths.
     pub fn apply_overrides(
         &mut self,
         overrides: &std::collections::HashMap<String, crate::config::ToolOverride>,
         plugin_dir: &Path,
-    ) {
+        builtin_names: &std::collections::HashSet<String>,
+    ) -> Vec<String> {
+        let mut refused = Vec::new();
         for (tool_name, override_cfg) in overrides {
             match override_cfg {
                 crate::config::ToolOverride::Disabled => {
@@ -384,6 +405,10 @@ impl ToolRegistry {
                     } else {
                         tracing::warn!("Cannot disable tool '{}': not registered", tool_name);
                     }
+                }
+                _ if builtin_names.contains(tool_name) => {
+                    tracing::error!("{}", override_refusal_notice(tool_name));
+                    refused.push(tool_name.clone());
                 }
                 _ => {
                     // Script and Command overrides create replacement tools.
@@ -410,13 +435,14 @@ impl ToolRegistry {
                 }
             }
         }
+        refused
     }
 
     /// Load and register plugin tools from a directory.
     ///
     /// Each script with valid frontmatter (`# name:`, `# description:`, etc.)
-    /// becomes a registered `ScriptPluginTool`. Tools whose name matches an
-    /// already-registered tool will overwrite it.
+    /// becomes a registered `ScriptPluginTool`. Name collisions are refused:
+    /// a script tool never replaces a registered tool.
     pub fn load_plugins(&mut self, plugin_dir: &Path) {
         if !plugin_dir.exists() {
             tracing::debug!(
@@ -426,9 +452,19 @@ impl ToolRegistry {
             return;
         }
         let plugins = crate::tools::plugin::load_plugin_tools(plugin_dir);
-        let count = plugins.len();
+        let mut count = 0;
         for tool in plugins {
+            if let Some(previous) = self.get(tool.name()) {
+                tracing::error!(
+                    previous_origin = ?previous.registration_origin(),
+                    plugin_origin = ?tool.registration_origin(),
+                    "Cannot load plugin tool '{}': name is already registered; script tools cannot replace a registered tool, so give the script its own name",
+                    crate::safe_label::SafeLabel::identifier(tool.name())
+                );
+                continue;
+            }
             self.register(tool);
+            count += 1;
         }
         if count > 0 {
             tracing::info!(
@@ -539,42 +575,53 @@ pub(crate) fn enforce_tool_authority(
     }
     let capabilities = tool.capabilities();
     if matches!(name, "bash" | "Bash" | "exec_shell") {
-        // Numeric sed inspection already has an execution-time read-only
-        // grammar. Reuse it here without promoting the broader child shell
-        // surface (including pipelines/network reads) into machine authority,
-        // or changing the parent's parallel/approval classification (#6015).
-        let bounded_sed = context.shell_policy == crate::worker_profile::ShellPolicy::ReadOnly
-            && input
-                .get("command")
-                .and_then(Value::as_str)
-                .is_some_and(|command| {
-                    command.split_whitespace().next() == Some("sed") && !command.contains('|')
-                })
-            && super::shell::agent_readonly_bash_input(input);
-        if tool.is_read_only_for(input) || bounded_sed {
-            if authority.shell != crate::tools::spec::ToolShellAuthority::ReadOnly {
-                return Err(ToolError::permission_denied(format!(
+        // One authority (#6015): a durable worker's shell is judged by the
+        // same agent read-only grammar and input normalization as in-session
+        // agents (`agent_readonly_bash_verdict`), and `BashTool::execute`
+        // applies it again under the clamped `ShellPolicy::ReadOnly`. The
+        // parent's parallel/approval classification (`is_read_only_for`) is
+        // not an authority here.
+        let verdict = super::shell::agent_readonly_bash_verdict(input);
+        if authority.shell != crate::tools::spec::ToolShellAuthority::ReadOnly {
+            return Err(ToolError::permission_denied(if verdict.is_ok() {
+                format!(
                     "worker '{}' cannot run {name}: its machine-readable authority envelope does not grant read-only shell access",
                     authority.owner
-                )));
-            }
-            let networked_read = input
-                .get("command")
-                .and_then(Value::as_str)
-                .is_some_and(codewhale_execpolicy::command_safety::is_github_readonly_command);
-            if networked_read && authority.network_access != Some(true) {
-                return Err(ToolError::permission_denied(format!(
-                    "worker '{}' cannot use read-only GitHub CLI access: its machine-readable authority envelope does not grant network access",
-                    authority.owner
-                )));
-            }
-            return Ok(());
+                )
+            } else {
+                format!(
+                    "worker '{}' cannot run {name}: arbitrary command execution is outside its machine-readable authority envelope. {}",
+                    authority.owner,
+                    codewhale_execpolicy::command_safety::readonly_command_help()
+                )
+            }));
         }
-        return Err(ToolError::permission_denied(format!(
-            "worker '{}' cannot run {name}: arbitrary command execution is outside its machine-readable authority envelope. {}",
-            authority.owner,
-            codewhale_execpolicy::command_safety::readonly_command_help()
-        )));
+        if let Err(rejection) = verdict {
+            return Err(ToolError::permission_denied(format!(
+                "worker '{}' cannot run {name}: {}",
+                authority.owner,
+                super::shell::readonly_refusal(
+                    &rejection,
+                    super::shell::readonly_enforced_lane_available(context)
+                )
+            )));
+        }
+        let hosts = input
+            .get("command")
+            .and_then(Value::as_str)
+            .map(codewhale_execpolicy::command_safety::readonly_network_reads)
+            .unwrap_or_default()
+            .into_iter()
+            .map(codewhale_execpolicy::command_safety::NetworkRead::host)
+            .collect::<Vec<_>>();
+        if !hosts.is_empty() && authority.network_access != Some(true) {
+            return Err(ToolError::permission_denied(format!(
+                "worker '{}' cannot use read-only network access to {}: its machine-readable authority envelope does not grant network access",
+                authority.owner,
+                hosts.join(", ")
+            )));
+        }
+        return Ok(());
     }
     if name == "Run" {
         if bounded_verifier {
@@ -747,12 +794,36 @@ impl ToolRegistryBuilder {
         self
     }
 
+    /// Add client-executed runtime tools. A dynamic tool never replaces a
+    /// tool already in the builder (#6559 D04-10): `with_tool` treats a
+    /// repeated name as a planned upgrade, which let a client's `exec_shell`
+    /// or `read` silently take over the builtin handler and its approval
+    /// policy. The model-facing name is the bare `name`, so a second dynamic
+    /// tool with the same name in another namespace is refused the same way.
+    /// Both refusals are logged with the two origins.
+    ///
+    /// Known limitation: the refusal reaches the log, not the runtime client
+    /// that sent the spec; rejecting it at the API boundary, and exposing a
+    /// namespaced model-facing name, are protocol changes.
     #[must_use]
     pub fn with_dynamic_tools(mut self, dynamic_tools: &[DynamicToolSpec]) -> Self {
-        for tool in dynamic_tools {
-            self = self.with_tool(Arc::new(super::dynamic::RuntimeDynamicTool::new(
-                tool.clone(),
-            )));
+        for spec in dynamic_tools {
+            let tool: Arc<dyn ToolSpec> =
+                Arc::new(super::dynamic::RuntimeDynamicTool::new(spec.clone()));
+            if let Some(existing) = self
+                .tools
+                .iter()
+                .find(|existing| existing.name() == tool.name())
+            {
+                tracing::warn!(
+                    existing_origin = ?existing.registration_origin(),
+                    refused_origin = ?tool.registration_origin(),
+                    "Refusing runtime dynamic tool that collides with a registered tool: {}",
+                    crate::safe_label::SafeLabel::identifier(tool.name())
+                );
+                continue;
+            }
+            self.tools.push(tool);
         }
         self
     }
@@ -885,7 +956,9 @@ impl ToolRegistryBuilder {
     /// sees a binary it can't actually use.
     #[must_use]
     pub fn with_pandoc_tools(self) -> Self {
-        if crate::dependencies::resolve_pandoc().is_some() {
+        if crate::dependencies::host_tool_available("pandoc_convert", || {
+            crate::dependencies::resolve_pandoc().is_some()
+        }) {
             use super::pandoc::PandocConvertTool;
             self.with_tool(Arc::new(PandocConvertTool))
         } else {
@@ -898,7 +971,7 @@ impl ToolRegistryBuilder {
     /// Tesseract when installed.
     #[must_use]
     pub fn with_image_ocr_tools(self) -> Self {
-        if super::image_ocr::ocr_available() {
+        if crate::dependencies::host_tool_available("image_ocr", super::image_ocr::ocr_available) {
             use super::image_ocr::ImageOcrTool;
             self.with_tool(Arc::new(ImageOcrTool))
         } else {
@@ -1093,7 +1166,7 @@ impl ToolRegistryBuilder {
     pub fn with_rlm_tool(self, client: Option<CodewhaleClient>, root_model: String) -> Self {
         use super::rlm::RlmTool;
         self.with_tool(Arc::new(
-            RlmTool::new("rlm", client).with_root_model(root_model),
+            RlmTool::new(super::rlm::RLM_TOOL_NAME, client).with_root_model(root_model),
         ))
     }
 
@@ -1575,7 +1648,12 @@ impl ToolSpec for McpToolAdapter {
     ) -> Result<RichToolResult, ToolError> {
         let mut pool = self.pool.lock().await;
         let result = pool
-            .call_tool_with_disallowed(&self.name, input, &context.disallowed_tools)
+            .call_tool_with_disallowed(
+                &self.name,
+                input,
+                &context.disallowed_tools,
+                context.human_decision.as_ref(),
+            )
             .await
             .map_err(|e| ToolError::execution_failed(format!("MCP tool failed: {e}")))?;
         Ok(mcp_result_to_bounded_rich_tool_result(result))

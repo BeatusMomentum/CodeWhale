@@ -2,7 +2,7 @@
 
 Documentation and community site for [Codewhale](https://github.com/Hmbown/CodeWhale) — lives at **codewhale.net**.
 
-Next.js 15 (App Router) + Tailwind, deployed to Cloudflare Workers via [`@opennextjs/cloudflare`](https://opennext.js.org/cloudflare). Curated "Today's Dispatch" content is regenerated every 6 hours by a Cloudflare Cron Trigger that calls `deepseek-v4-flash` to summarise recent repo activity, and stored in Workers KV.
+Next.js 15 (App Router) + Tailwind, deployed to Cloudflare Workers via [`@opennextjs/cloudflare`](https://opennext.js.org/cloudflare). Curated "Today's Dispatch" content is regenerated every 6 hours by a Cloudflare Cron Trigger that calls `deepseek-flash` to summarise recent repo activity, and stored in Workers KV.
 
 ## Local dev
 
@@ -21,7 +21,7 @@ Env (mirrors `.env.example`):
 | `GITHUB_TOKEN`              | Fine-grained PAT, public-repo read scope                         | optional (raises rate limit 60 → 5000 req/h) |
 | `GITHUB_REPO`               | Defaults to `Hmbown/CodeWhale`                                   | optional             |
 | `CRON_SECRET`               | Shared secret for manual `/api/cron` invocation                  | optional (Cloudflare cron triggers don't need it) |
-| `DEEPSEEK_MODEL`            | Defaults to `deepseek-v4-flash`                                  | optional             |
+| `DEEPSEEK_MODEL`            | Defaults to `deepseek-flash`                                     | optional             |
 | `DEEPSEEK_BASE_URL`         | Defaults to `https://api.deepseek.com`                           | optional             |
 | `MAINTAINER_TOKEN`          | Admin panel auth; enter it in the `/admin` login form            | only for `/admin`    |
 | `MAINTAINER_GITHUB_PAT`     | PAT with `issues:write`, for posting comments via `/admin`       | only for `/admin` posting |
@@ -126,7 +126,7 @@ web/
 │   ├── whale.tsx               shared Codewhale mark
 │   ├── ticker.tsx              live wire: merges, issues, releases + handles
 │   ├── feed-card.tsx           one issue/PR card
-│   ├── locale-switcher.tsx     N-locale dropdown with partial badges
+│   ├── locale-switcher.tsx     N-locale dropdown; partial packs grouped last
 │   └── install-*.tsx           install page blocks (binary, code block, tiles)
 ├── lib/
 │   ├── types.ts                shared types
@@ -135,11 +135,15 @@ web/
 │   ├── deepseek.ts             v4-flash chat client + curate() prompt
 │   ├── facts.ts                getFacts(): KV value, else build-time FACTS
 │   ├── facts.generated.ts      GENERATED — do not edit by hand
+│   ├── changelog.generated.ts  GENERATED at build/test time, untracked
+│   ├── install-guide.generated.ts GENERATED at build/test time, untracked
 │   ├── facts-drift.ts          runtime re-derivation for the drift cron
 │   ├── community-agent.ts      triage / pr-review / digest cron tasks
 │   └── kv.ts                   Cloudflare KV access via OpenNext bindings
 ├── scripts/
 │   ├── derive-facts.mjs        prebuild: repo sources → lib/facts.generated.ts
+│   ├── derive-changelog.mjs    prebuild + vitest setup: CHANGELOG.md → lib/changelog.generated.ts
+│   ├── derive-install.mjs      prebuild + vitest setup: docs/INSTALL.md → lib/install-guide.generated.ts
 │   ├── compare-deployed-facts.mjs credential-free exact-SHA receipt check
 │   └── check-kv-id.mjs         predeploy guard for KV namespace ids
 ├── wrangler.jsonc              CF Worker config + cron + KV binding

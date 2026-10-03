@@ -15,7 +15,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
-use crate::command_safety::prefix_allow_matches;
+use crate::command_safety::{prefix_allow_matches, prefix_grant_is_eligible};
 use crate::matcher::pattern_matches;
 
 /// Verdict of evaluating a command against the TOML rule sets.
@@ -68,18 +68,39 @@ impl ExecPolicyConfig {
         // Only the deny loop is widened. The allow loop below still matches the
         // command as written, so a broader expansion can never turn into a
         // broader auto-approval.
-        let deny_targets = crate::shell_expand::expanded_commands(command);
+        let expansion = crate::shell_expand::expand_command(command);
+        let prefix_eligible = prefix_grant_is_eligible(command, &expansion);
+        let deny_targets = expansion.commands;
+        // A command word only known at run time cannot be checked against a
+        // deny pattern: fail closed while any deny pattern is configured, and
+        // never let an allow pattern written for the outer command approve
+        // nested or unresolved code.
+        if expansion.dynamic && self.rules.values().any(|rules| !rules.deny.is_empty()) {
+            return RuleDecision::Deny(
+                "execpolicy: command word cannot be resolved statically while deny rules are in force"
+                    .to_string(),
+            );
+        }
+        // A deny pattern names a command prefix, as the permission engine's
+        // deny rules do: `git push --force` also denies
+        // `git push --force origin main`. The whole-command glob still
+        // applies for patterns that spell out `*` wildcards.
         for (group, rules) in &self.rules {
             for pattern in &rules.deny {
-                if deny_targets
-                    .iter()
-                    .any(|target| pattern_matches(pattern, target))
-                {
+                if deny_targets.iter().any(|target| {
+                    crate::denied_prefix_matches(pattern, target)
+                        || pattern_matches(pattern, target)
+                }) {
                     return RuleDecision::Deny(format!("execpolicy denied by {group}: {pattern}"));
                 }
             }
         }
 
+        if !prefix_eligible {
+            return RuleDecision::AskUser(
+                "execpolicy: command syntax or arguments require an exact approval".to_string(),
+            );
+        }
         for (group, rules) in &self.rules {
             for pattern in &rules.allow {
                 // Allow rules use arity-aware prefix matching first so that
@@ -214,6 +235,42 @@ mod tests {
             }
         }
         assert!(evaded.is_empty(), "deny pattern bypassed by: {evaded:#?}");
+    }
+
+    #[test]
+    fn deny_pattern_is_a_command_prefix() {
+        let config = ExecPolicyConfig {
+            rules: BTreeMap::from([(
+                "danger".to_string(),
+                RuleSet {
+                    allow: vec!["git *".to_string()],
+                    deny: vec!["git push --force".to_string(), "rm -rf /".to_string()],
+                },
+            )]),
+        };
+        for command in [
+            "git push --force",
+            "git push --force origin main",
+            "git push origin main --force",
+            "rm -rf / --no-preserve-root",
+            "git -C . push --force",
+            "git commit -m 'a\nb' && git push --force",
+        ] {
+            assert!(
+                matches!(config.evaluate(command), RuleDecision::Deny(_)),
+                "{command:?} must be denied"
+            );
+        }
+        for command in [
+            "git push origin main",
+            "git push --force-with-lease",
+            "rm -rf ./x",
+        ] {
+            assert!(
+                !matches!(config.evaluate(command), RuleDecision::Deny(_)),
+                "{command:?} must not be denied"
+            );
+        }
     }
 
     /// The fix must not deny a command merely for containing a metacharacter.

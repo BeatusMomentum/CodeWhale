@@ -77,8 +77,7 @@ impl Engine {
         }
         if found > 0 {
             let _ = self
-                .tx_event
-                .send(Event::LspRepairUpdate {
+                .send_event(Event::LspRepairUpdate {
                     diagnostics_found: found,
                     files,
                     injected: false,
@@ -109,8 +108,7 @@ impl Engine {
         ))
         .await;
         let _ = self
-            .tx_event
-            .send(Event::LspRepairUpdate {
+            .send_event(Event::LspRepairUpdate {
                 diagnostics_found: found,
                 files,
                 injected: true,

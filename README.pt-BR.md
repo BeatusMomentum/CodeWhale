@@ -1,9 +1,9 @@
-<!-- source: README.md sha256:bbb8bfb61e57 -->
+<!-- source: README.md sha256:925619135f77 -->
 # Codewhale
 
 Codewhale é um agente de código aberto que lê seu projeto, edita arquivos, executa comandos e verifica o próprio trabalho usando um modelo hospedado ou local à sua escolha. Comece com uma tarefa no terminal. Para um trabalho maior, distribua partes do trabalho entre agentes com diferentes modelos e funções.
 
-![Codewhale em execução em um terminal](web/public/codewhale-tui-d7a9a1c.png)
+![Codewhale em execução em um terminal](web/public/codewhale-tui-5765d80.png)
 
 *Prévia do terminal em uma build de desenvolvimento da v0.10.0.*
 
@@ -23,6 +23,8 @@ curl -fsSL https://codewhale.net/install.sh | sh
 "$HOME/.local/bin/codewhale"
 ```
 
+Se executar apenas `codewhale` mostrar "command not found", `~/.local/bin` ainda não está no seu PATH: execute a linha que o instalador exibe para o seu shell ou consulte [Colocar no PATH](docs/INSTALL.md#put-it-on-your-path).
+
 O instalador seleciona a versão publicada mais recente. O [histórico de alterações](CHANGELOG.md) também descreve a versão candidata ainda não publicada da próxima versão; essas alterações só são incluídas nos downloads publicados quando a versão estiver disponível.
 
 No Windows, baixe o instalador ou arquivo correspondente em [GitHub Releases](https://github.com/Hmbown/CodeWhale/releases/latest). Para atualizar uma instalação direta existente, execute `codewhale update`, ou `codewhale update --check` apenas para verificar. O atualizador mostra o caminho do executável e preserva builds mais recentes. npm e Cargo são opções secundárias; consulte o [guia de instalação](docs/INSTALL.md) para migrar de um gerenciador de pacotes e configurar PATH.
@@ -33,7 +35,7 @@ O preenchimento automático com Tab é ativado com um comando por shell — `cod
 
 ## Uso
 
-Abra um terminal na pasta do seu projeto e execute `codewhale`. Escolha seu provedor com `/provider` e seu modelo com `/model`. Depois, descreva uma tarefa concreta:
+Abra um terminal na pasta do seu projeto e execute `codewhale` (depois que ele estiver [no seu PATH](docs/INSTALL.md#put-it-on-your-path)). Escolha seu provedor com `/provider` e seu modelo com `/model`. Depois, descreva uma tarefa concreta:
 
 ```text
 Fix the failing tests and explain what changed.
@@ -76,6 +78,7 @@ Leia a [ordem de autorização](docs/AUTHORIZATION_ORDER.md) para conhecer a hie
 
 ## Documentação
 
+- [Configuração da revisão de PRs no GitHub](docs/GITHUB_ACTION.md)
 - [Provedores e modelos locais](docs/PROVIDERS.md)
 - [Equipes de agentes](docs/FLEET.md)
 - [MCP](docs/MCP.md), [hooks](docs/HOOKS.md) e [configuração](docs/CONFIGURATION.md)

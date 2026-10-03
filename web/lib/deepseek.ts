@@ -1,7 +1,7 @@
 import type { CuratedDispatch, FeedItem, RepoStats } from "./types";
 
 const FALLBACK_BASE = "https://api.deepseek.com";
-const FALLBACK_MODEL = "deepseek-v4-flash";
+const FALLBACK_MODEL = "deepseek-flash";
 
 interface ChatMessage {
   role: "system" | "user" | "assistant";
@@ -27,6 +27,8 @@ export async function chat(
   const model = dsEnv?.model ?? process.env.DEEPSEEK_MODEL ?? FALLBACK_MODEL;
   const res = await fetch(`${base}/v1/chat/completions`, {
     method: "POST",
+    // Same bound as agentChat: a stalled provider must not hold the cron run.
+    signal: AbortSignal.timeout(180_000),
     headers: {
       "Content-Type": "application/json",
       Authorization: `Bearer ${apiKey}`,

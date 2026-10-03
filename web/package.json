@@ -13,7 +13,7 @@
     "check:facts": "node scripts/check-facts.mjs && node scripts/check-cloud-facts.mjs",
     "sync:latest-release": "node scripts/sync-latest-release.mjs",
     "check:latest-release": "node scripts/sync-latest-release.mjs --check",
-    "check:docs": "node scripts/derive-install.mjs --check && node scripts/check-docs.mjs",
+    "check:docs": "node scripts/derive-install.mjs && node scripts/check-docs.mjs && node scripts/render-terminal-capture.mjs --check",
     "check:tokens": "python3 ../scripts/export-design-tokens.py --check",
     "check:locales": "node scripts/check-locales.mjs && node scripts/gt-site.mjs check",
     "i18n:gt": "node scripts/gt-site.mjs",
@@ -27,12 +27,12 @@
     "cf-typegen": "wrangler types"
   },
   "dependencies": {
-    "next": "^16.3.3",
+    "next": "^16.3.6",
     "react": "^19.2.8",
     "react-dom": "^19.2.8"
   },
   "devDependencies": {
-    "@opennextjs/cloudflare": "^1.20.4",
+    "@opennextjs/cloudflare": "^1.20.6",
     "@types/node": "^26.6.1",
     "@types/react": "^19.0.7",
     "@types/react-dom": "^19.2.5",
@@ -46,7 +46,7 @@
     "tailwindcss": "^3.4.17",
     "typescript": "^5.7.3",
     "vitest": "^4.1.11",
-    "wrangler": "^4.132.0"
+    "wrangler": "^4.137.0"
   },
   "overrides": {
     "esbuild": "0.28.1",
@@ -54,6 +54,6 @@
     "postcss": "^8.5.18",
     "sharp": "0.35.4",
     "ws": "8.21.0",
-    "undici": "7.29.0"
+    "undici": "7.29.1"
   }
 }

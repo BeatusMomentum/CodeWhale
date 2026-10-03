@@ -46,7 +46,7 @@
 //! - Nested calls do not take per-tool locks against sibling top-level calls;
 //!   the program runs under its own exclusive lock instead. Inside the
 //!   program, calls the gate marks non-parallel run one at a time.
-//! - No nested `agent`, `workflow`, `request_user_input`, interpreter,
+//! - No nested `agent`, `workflow`, `rlm`, `request_user_input`, interpreter,
 //!   interactive shell, sandbox escalation, Computer Use consent/script, MCP
 //!   sign-in, or recursive `execute_tools`. Those stay direct calls.
 //! - Rich content blocks (images) from nested results are dropped; text and
@@ -84,10 +84,10 @@ const EXECUTE_TOOLS_TOOL_TYPE: &str = "execute_tools_20260918";
 const MAX_CODE_BYTES: usize = 64 * 1024;
 /// Run deadline when no engine turn serves the program (sub-agents, direct
 /// unit calls). Those callers bound the whole call themselves (the sub-agent
-/// tool timeout), so this is the turn-sized backstop rather than an invented
-/// short cap. A gated run takes the remaining turn wall clock instead.
-const FALLBACK_RUN_DEADLINE: Duration =
-    Duration::from_secs(crate::core::engine::turn_budget::DEFAULT_TURN_WALL_CLOCK_SECS);
+/// tool timeout), so this is an hour-long backstop rather than an invented
+/// short cap. A gated run takes the remaining turn wall clock instead, which
+/// is unbounded unless `[tui].turn_wall_clock_secs` is set.
+const FALLBACK_RUN_DEADLINE: Duration = Duration::from_secs(3_600);
 /// How often the run watchdog re-checks while the program is paused on the
 /// gate (approval card, hook, review). Bounds the overrun after a pause.
 const PAUSED_WATCHDOG_POLL: Duration = Duration::from_millis(200);
@@ -109,6 +109,9 @@ const PROHIBITED_NESTED: &[&str] = &[
     "js_execution",
     "agent",
     "workflow",
+    // Recursive RLM rounds are admitted by the turn loop serving the direct
+    // `rlm` call; a program has no such server for a nested one.
+    "rlm",
     crate::core::engine::tool_catalog::REQUEST_USER_INPUT_NAME,
     crate::core::engine::tool_catalog::MULTI_TOOL_PARALLEL_NAME,
 ];
@@ -169,8 +172,11 @@ pub(crate) enum NestedDecision {
     Auto,
     /// A person approved this exact nested call.
     Approved,
-    /// A person denied it, or the approval card expired.
+    /// A person denied it.
     Denied,
+    /// The approval card expired with no answer. The call did not run, and
+    /// the user did not deny it.
+    TimedOut,
     /// A gate refused it before any prompt (policy, hook, authority, or a
     /// name that stays a direct call).
     Refused,
@@ -239,7 +245,9 @@ impl NestedCallGate {
         )
     }
 
-    async fn ask(&self, name: String, input: Value) -> NestedCallVerdict {
+    /// Ask the serving turn loop to decide one nested call. A gate nobody
+    /// serves any more refuses.
+    pub(crate) async fn ask(&self, name: String, input: Value) -> NestedCallVerdict {
         let unavailable = || NestedCallVerdict::Refused {
             error: ToolError::not_available(
                 "the turn that launched this program is no longer serving its permission gate",
@@ -256,6 +264,36 @@ impl NestedCallGate {
             return unavailable();
         }
         answer.await.unwrap_or_else(|_| unavailable())
+    }
+}
+
+#[cfg(test)]
+impl NestedCallGate {
+    /// A gate whose server admits every call exactly as asked, for tests of
+    /// consumers that are not about admission. Needs a Tokio runtime.
+    pub(crate) fn admitting_for_test() -> Self {
+        Self::answering_for_test(|name, input| NestedCallVerdict::Run {
+            name: name.to_string(),
+            input: input.clone(),
+            supports_parallel: false,
+            decision: NestedDecision::Auto,
+            hook_context: None,
+        })
+    }
+
+    /// A gate whose server answers every call with `answer`.
+    pub(crate) fn answering_for_test(
+        answer: impl Fn(&str, &Value) -> NestedCallVerdict + Send + 'static,
+    ) -> Self {
+        let (tx_event, mut rx_event) = mpsc::channel(64);
+        tokio::spawn(async move { while rx_event.recv().await.is_some() {} });
+        let (gate, mut requests) = Self::new(None, tx_event, Duration::from_secs(60));
+        tokio::spawn(async move {
+            while let Some(request) = requests.recv().await {
+                let _ = request.reply.send(answer(&request.name, &request.input));
+            }
+        });
+        gate
     }
 }
 
@@ -579,6 +617,8 @@ impl CodemodeInvoker {
                     &name,
                     input,
                     &disallowed,
+                    // Calls a program makes never carry a person's decision.
+                    None,
                 )
                 .await
             })
@@ -1160,7 +1200,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let context = ToolContext::new(dir.path());
         let invoker = CodemodeInvoker::new(vec![], context);
-        for name in ["agent", "workflow", "execute_tools", "tool_search", "nope"] {
+        for name in [
+            "agent",
+            "workflow",
+            "rlm",
+            "execute_tools",
+            "tool_search",
+            "nope",
+        ] {
             let err = invoker
                 .invoke(ToolCallRequest {
                     tool: name.to_string(),
@@ -1198,15 +1245,22 @@ mod tests {
         // Skills-as-tools composes with code mode: `load_skill` is
         // read-only and auto-approved, so a program can list and load
         // skills at runtime without widening its authority.
+        // A configured skills dir, not a project root: project skills load
+        // only in a trusted workspace, which this composition test is not
+        // about.
         let dir = tempfile::tempdir().unwrap();
-        let skill_dir = dir.path().join(".agents/skills/greet");
+        let workspace = dir.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let skills_root = dir.path().join("configured-skills");
+        let skill_dir = skills_root.join("greet");
         std::fs::create_dir_all(&skill_dir).unwrap();
         std::fs::write(
             skill_dir.join("SKILL.md"),
             "---\nname: greet\ndescription: Say hello\n---\n# Greet\nSay hello warmly.\n",
         )
         .unwrap();
-        let context = ToolContext::new(dir.path());
+        let context = ToolContext::new(&workspace)
+            .with_skills_config(&skills_root, crate::skills::SkillDiscoveryMode::Compatible);
         let registry = ToolRegistryBuilder::new()
             .with_tool(Arc::new(crate::tools::skill::LoadSkillTool))
             .build(context.clone());

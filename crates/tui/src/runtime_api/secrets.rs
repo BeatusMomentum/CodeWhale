@@ -262,6 +262,11 @@ pub(super) async fn set_provider_key(
     // not own, which must refuse before the write rather than appear to
     // succeed against a source that still wins at request time.
     let (provider, kind) = writable_provider(&state, &id)?;
+    if kind == codewhale_config::ProviderKind::OpenaiCodex {
+        return Err(ApiError::bad_request(
+            codewhale_config::credentials::OPENAI_CODEX_API_KEY_REFUSAL,
+        ));
+    }
 
     let key = request.key;
     let key = key.trim();
@@ -317,7 +322,11 @@ pub(super) async fn set_provider_key(
     // mirrored; the key itself never enters the runtime config.
     {
         let mut config = state.config.write();
-        config.auth_mode = Some("api_key".to_string());
+        // Match the shared writer: the root marker belongs only to the
+        // active provider, while an inactive provider keeps its own marker.
+        if provider_owned == config.api_provider() {
+            config.auth_mode = Some("api_key".to_string());
+        }
         {
             let entry = config.provider_config_for_mut(provider_owned);
             entry.auth_mode = Some("api_key".to_string());
@@ -329,9 +338,6 @@ pub(super) async fn set_provider_key(
         }
         // No model is mirrored: saving a key never changes which model runs
         // (see `prepare_provider_api_key_metadata`).
-        if provider_owned == ApiProvider::Deepseek {
-            config.api_key = None;
-        }
     }
 
     let credential_state: ProviderCredentialState =
@@ -482,10 +488,11 @@ fn writable_provider(
 
 /// `DELETE /v1/providers/{id}/key` — remove a Codewhale-owned credential.
 ///
-/// Refuses for exactly the sources `PUT` refuses for, and for the same reason:
-/// a route that reports "cleared" for a credential it cannot reach has lied
-/// about a security action. The secret-store leg is reported separately,
-/// because the config write lands first and the backend can still refuse.
+/// Shares `PUT`'s credential-ownership checks: reporting "cleared" for a
+/// credential this route cannot reach would misrepresent a security action.
+/// Unlike creating a new key, clearing can remove a legacy unused Codex key.
+/// The secret-store leg is reported separately because the config write lands
+/// first and the backend can still refuse.
 pub(super) async fn clear_provider_key(
     State(state): State<RuntimeApiState>,
     Path(id): Path<String>,
@@ -529,9 +536,6 @@ pub(super) async fn clear_provider_key(
             entry.auth_mode = None;
             entry.external_credentials = None;
             entry.oauth_credential_generation = None;
-        }
-        if provider == ApiProvider::Deepseek {
-            config.api_key = None;
         }
     }
 

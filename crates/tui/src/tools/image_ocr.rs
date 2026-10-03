@@ -54,7 +54,9 @@ impl ToolSpec for ImageOcrTool {
 
     async fn execute(&self, input: Value, context: &ToolContext) -> Result<ToolResult, ToolError> {
         let path_str = required_str(&input, "path")?;
-        let image_path = context.resolve_path(path_str)?;
+        // OCR text is file content: the same read guards as `read` apply.
+        let image_path =
+            crate::tools::file::resolve_guarded_read_path(context, path_str, "image_ocr")?;
         // OCR shells out to tesseract (or runs a Vision pass): the blocking
         // subprocess call stays on the blocking pool (blocking-call
         // convention, #6149).
@@ -357,6 +359,31 @@ mod tests {
             msg.contains("does not exist"),
             "error must call out missing path; got {msg}"
         );
+    }
+
+    #[tokio::test]
+    async fn image_ocr_refuses_deny_listed_paths() {
+        // `.env` is on the default read deny-list, so no global guard setup
+        // is needed; the refusal precedes any OCR backend.
+        let tmp = tempdir().expect("tempdir");
+        fs::copy(ocr_fixture_path(), tmp.path().join(".env")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(tmp.path().join(".env"), tmp.path().join("pic.png")).unwrap();
+        let ctx = ToolContext::new(tmp.path().to_path_buf());
+        let mut paths = vec![".env"];
+        if cfg!(unix) {
+            paths.push("pic.png");
+        }
+        for path in paths {
+            let err = ImageOcrTool
+                .execute(json!({ "path": path }), &ctx)
+                .await
+                .expect_err("a deny-listed image must be refused");
+            assert!(
+                matches!(err, ToolError::PermissionDenied { .. }),
+                "{path}: {err:?}"
+            );
+        }
     }
 
     #[tokio::test]

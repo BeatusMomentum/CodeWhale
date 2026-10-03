@@ -3,6 +3,7 @@ use std::fmt::Write as _;
 use std::path::{Component, Path};
 use std::time::Instant;
 
+use codewhale_localization::{Locale, MessageId, tr};
 use ratatui::layout::Rect;
 
 use crate::settings::InlineDiffMode;
@@ -10,6 +11,7 @@ use crate::tools::canonical_action::canonical_action_alias;
 use crate::tools::subagent::{AgentWorkerStatus, SubAgentResult, SubAgentStatus};
 use crate::tui::app::{
     AgentCurrentActivityStatus, AgentProgressMeta, App, SidebarRowAction, TaskPanelEntry,
+    TaskPanelEntryKind,
 };
 use crate::tui::background_indicator::is_live_shell_entry;
 use crate::tui::history::{
@@ -336,6 +338,10 @@ pub struct WorkSurfaceState {
     /// clears it and the dock goes back to showing whichever work view has
     /// content.
     pub explicit_view: bool,
+    /// The settled file activity `project()` computed this frame for the
+    /// TASKS view. The FILES view and its tab badge read it, so the history
+    /// is scanned once per frame, not once per view (#6565).
+    pub(super) file_activity: SettledFileActivity,
     pub top_height: u16,
     pub side_width: u16,
     pub(super) resizing: bool,
@@ -429,6 +435,7 @@ impl WorkSurfaceState {
             effective_placement: placement,
             panel: RailPanel::default(),
             explicit_view: false,
+            file_activity: SettledFileActivity::default(),
             top_height: top_height.clamp(TOP_HEIGHT_MIN, TOP_HEIGHT_MAX),
             side_width: side_width.clamp(SIDE_WIDTH_MIN, SIDE_WIDTH_MAX),
             resizing: false,
@@ -605,6 +612,7 @@ pub(super) fn project(app: &mut App) -> Vec<WorkRow> {
     let agents = agent_rows(app);
     let coordination = coordination_row(app);
     let activity = settled_file_activity(app);
+    app.work_surface.file_activity = activity.clone();
     let capture = app.runtime_services.work.as_ref().map(|work| {
         work.try_capture(app.current_session_id.as_deref())
             .map(|snapshot| snapshot.map(|snapshot| snapshot.graph))
@@ -901,37 +909,66 @@ pub(super) fn live_agent_row_count(app: &mut App) -> usize {
 }
 
 /// Whether the background view holds anything actually running: a live
-/// shell or a durable task.
+/// shell or a queued or running durable task. Finished work stays listed but
+/// never opens the dock or counts as live (#6565).
 pub(super) fn background_has_live_work(app: &mut App) -> bool {
     !shell_work_rows(app).is_empty() || !durable_task_rows(app).is_empty()
 }
 
-/// The background view: live shells and durable background tasks.
-/// The scheduled count opens the existing automations manager directly.
+/// The background view: live shells, live durable tasks, then a muted
+/// `Finished N` group with the shells and tasks that ended, and how.
 fn background_view_rows(app: &mut App) -> Vec<WorkRow> {
     let mut out = Vec::new();
     push_shell_group(&mut out, shell_work_rows(app));
     out.extend(durable_task_rows(app));
+    let finished = finished_background_rows(app);
+    if !finished.is_empty() {
+        out.push(section_heading(
+            "finished",
+            &tr(app.ui_locale, MessageId::BackgroundFinishedHeading)
+                .replace("{count}", &finished.len().to_string()),
+            &tr(app.ui_locale, MessageId::BackgroundFinishedHint),
+        ));
+        out.extend(finished);
+    }
     app.work_surface.latest_rows = out.clone();
     out
 }
 
+/// A background shell row, live or finished.
+fn is_shell_entry(entry: &TaskPanelEntry) -> bool {
+    entry.kind == TaskPanelEntryKind::Shell
+}
+
+/// Queued or running. A stale running task still needs a look, so it stays.
+fn is_live_task_status(status: &str) -> bool {
+    matches!(status, "queued" | "running")
+}
+
+/// Live durable tasks (queued or running).
 fn durable_task_rows(app: &App) -> Vec<WorkRow> {
     app.task_panel
         .iter()
-        .filter(|entry| !is_live_shell_entry(entry))
+        .filter(|entry| !is_shell_entry(entry) && is_live_task_status(&entry.status))
         .map(|entry| {
             let status = if entry.stale {
                 "stale"
             } else {
                 entry.status.as_str()
             };
+            let bucket = if entry.stale {
+                WorkBucket::Attention
+            } else if entry.status == "queued" {
+                WorkBucket::Ready
+            } else {
+                WorkBucket::Active
+            };
             WorkRow {
                 id: WorkRowId(format!("task:{}", entry.id)),
-                mark: agent_mark(WorkBucket::Active),
+                mark: agent_mark(bucket),
                 label: entry.prompt_summary.clone(),
                 detail: format!("{status} · {}", entry.id),
-                tone: WorkTone::Live,
+                tone: bucket_tone(bucket),
                 selectable: true,
                 primary_action: Some(SidebarRowAction::Command(format!(
                     "/jobs show {}",
@@ -941,6 +978,126 @@ fn durable_task_rows(app: &App) -> Vec<WorkRow> {
             }
         })
         .collect()
+}
+
+/// Finished shells and durable tasks, muted, each saying how it ended:
+/// `exit 0 · 12s`, `failed · exit 2`, `killed`, `timed out`. The shell
+/// leads with its command; its id is only in the detail and inspector.
+fn finished_background_rows(app: &App) -> Vec<WorkRow> {
+    app.task_panel
+        .iter()
+        .filter(|entry| !is_live_task_status(&entry.status))
+        .map(|entry| {
+            let failed = matches!(entry.status.as_str(), "failed");
+            let tone = if failed {
+                WorkTone::Failure
+            } else {
+                WorkTone::Muted
+            };
+            let mark = if failed {
+                crate::tui::glyphs::ATTENTION
+            } else {
+                crate::tui::glyphs::DONE
+            };
+            if is_shell_entry(entry) {
+                let command = shell_command(entry);
+                let outcome = finished_shell_outcome(app.ui_locale, entry);
+                WorkRow {
+                    id: WorkRowId(format!("shell:{}", entry.id)),
+                    mark,
+                    label: command.clone(),
+                    detail: format!("{outcome} · {}", entry.id),
+                    tone,
+                    selectable: true,
+                    primary_action: Some(SidebarRowAction::InspectWork {
+                        title: format!("Shell {}", entry.id),
+                        body: shell_inspector_body(app, entry, &command, &outcome),
+                        stop_action: None,
+                    }),
+                    agent: Some(AgentRowFacts {
+                        role_label: "shell".to_string(),
+                        status: outcome,
+                        objective: command,
+                        elapsed_secs: entry.duration_ms.map(|ms| ms / 1_000),
+                        model: None,
+                        tokens: None,
+                        todos_remaining: None,
+                        holds_dock_open: false,
+                    }),
+                }
+            } else {
+                let took = entry
+                    .duration_ms
+                    .map(|ms| format!(" · {}", crate::agent_roster::format_duration(ms)))
+                    .unwrap_or_default();
+                WorkRow {
+                    id: WorkRowId(format!("task:{}", entry.id)),
+                    mark,
+                    label: entry.prompt_summary.clone(),
+                    detail: format!(
+                        "{}{took} · {}",
+                        tr(
+                            app.ui_locale,
+                            match entry.status.as_str() {
+                                "completed" => MessageId::BackgroundOutcomeDone,
+                                "failed" => MessageId::BackgroundOutcomeFailed,
+                                _ => MessageId::BackgroundOutcomeCancelled,
+                            }
+                        ),
+                        entry.id
+                    ),
+                    tone,
+                    selectable: true,
+                    primary_action: Some(SidebarRowAction::Command(format!(
+                        "/jobs show {}",
+                        entry.id
+                    ))),
+                    agent: None,
+                }
+            }
+        })
+        .collect()
+}
+
+/// A shell entry's command, without the `shell: ` prefix; its id when the
+/// command is empty.
+fn shell_command(entry: &TaskPanelEntry) -> String {
+    let command = entry
+        .prompt_summary
+        .strip_prefix("shell: ")
+        .unwrap_or(entry.prompt_summary.as_str())
+        .trim();
+    if command.is_empty() {
+        entry.id.clone()
+    } else {
+        crate::tui::history::summarize_tool_output(command).replace(['\n', '\r'], " ")
+    }
+}
+
+/// How a finished shell ended, the same words its notice uses.
+fn finished_shell_outcome(locale: Locale, entry: &TaskPanelEntry) -> String {
+    let exit = entry
+        .exit_code
+        .map(|code| tr(locale, MessageId::BackgroundExitCode).replace("{code}", &code.to_string()));
+    match entry.status.as_str() {
+        "completed" => {
+            let took = entry
+                .duration_ms
+                .map(|ms| format!(" · {}", crate::agent_roster::format_duration(ms)))
+                .unwrap_or_default();
+            format!(
+                "{}{took}",
+                exit.unwrap_or_else(|| tr(locale, MessageId::BackgroundOutcomeDone).into_owned())
+            )
+        }
+        "failed" => {
+            let failed = tr(locale, MessageId::BackgroundOutcomeFailed);
+            exit.map_or_else(|| failed.to_string(), |exit| format!("{failed} · {exit}"))
+        }
+        "killed" => tr(locale, MessageId::BackgroundOutcomeKilled).into_owned(),
+        "timed_out" => tr(locale, MessageId::BackgroundOutcomeTimedOut).into_owned(),
+        other => other.to_string(),
+    }
 }
 
 /// Row ids of the plan-step (to-do) nodes in the cached graph.
@@ -1085,6 +1242,7 @@ struct RankedWorkRow {
     row: WorkRow,
 }
 
+/// Complete unique targets; only the aggregate summary presentation is capped.
 #[derive(Default, Clone)]
 pub(super) struct SettledFileActivity {
     pub(super) summary: FileActivitySummary,
@@ -1093,7 +1251,17 @@ pub(super) struct SettledFileActivity {
     search: Vec<String>,
     pub(super) write: Vec<String>,
     pub(super) mutations: Vec<FileMutationReceipt>,
-    inline_diff_mode: InlineDiffMode,
+    pub(super) inline_diff_mode: InlineDiffMode,
+}
+
+impl std::fmt::Debug for SettledFileActivity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SettledFileActivity")
+            .field("read", &self.read.len())
+            .field("write", &self.write.len())
+            .field("mutations", &self.mutations.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl SettledFileActivity {
@@ -1124,6 +1292,12 @@ fn ordered_rows(
                 })
                 .filter(|node| !is_settled_transient_operation(node))
                 .filter(|node| !surface.is_prior_instance_residue(node))
+                // A plan step dropped from the Plan/To-do list (e.g. the model
+                // cleared it with an empty `todo_write`) stays in the graph
+                // but must leave the rail (#6546).
+                .filter(|node| {
+                    node.kind != NodeKind::PlanStep || snapshot.compat.projects(&node.id)
+                })
                 .enumerate()
                 .map(|(order, node)| RankedWorkRow {
                     bucket: node_bucket(node),
@@ -1678,10 +1852,14 @@ fn agent_rows(app: &App) -> Vec<RankedWorkRow> {
                     .map(|meta| meta.files_touched)
                     .filter(|count| *count > 0)
                 {
-                    facts.push(format!("{files} files changed"));
+                    facts.push(
+                        tr(app.ui_locale, MessageId::BackgroundFilesChanged)
+                            .replace("{count}", &files.to_string()),
+                    );
                 }
             } else {
                 facts.extend(live_activity_facts(app, &agent.agent_id));
+                facts.extend(quiet_fact(app, agent, meta));
             }
             AgentRowSeed {
                 agent_id: agent.agent_id.clone(),
@@ -1824,21 +2002,77 @@ fn live_activity_facts(app: &App, agent_id: &str) -> Vec<String> {
     if let Some(tool) = activity.and_then(|activity| activity.current_tool.as_deref())
         && !said(tool)
     {
-        facts.push(format!("using {tool}"));
+        facts.push(tr(app.ui_locale, MessageId::BackgroundUsingTool).replace("{tool}", tool));
     }
-    if let Some(step) = activity.and_then(|activity| activity.step) {
-        let step = format!("step {step}");
-        if !said(&step) {
-            facts.push(step);
-        }
+    if let Some(step) = activity.and_then(|activity| activity.step)
+        && !said(&format!("step {step}"))
+    {
+        facts.push(
+            tr(app.ui_locale, MessageId::BackgroundStep).replace("{step}", &step.to_string()),
+        );
     }
     if let Some(files) = meta
         .map(|meta| meta.files_touched)
         .filter(|count| *count > 0)
     {
-        facts.push(format!("{files} files changed"));
+        facts.push(
+            tr(app.ui_locale, MessageId::BackgroundFilesChanged)
+                .replace("{count}", &files.to_string()),
+        );
     }
     facts
+}
+
+/// A running agent quiet this long says so on its row.
+const QUIET_AFTER_MS: u64 = 60_000;
+
+/// `quiet 2m · auto-stop at 5m` for a running agent that has shown the manager
+/// no progress for a minute and has no tool in flight (#6565).
+///
+/// This reads the engine's own clock (`idle_ms`, the one its heartbeat reads)
+/// and the bound that heartbeat enforces, capped by the last envelope the TUI
+/// saw from the child, because `AgentList` snapshots are not refreshed by
+/// ordinary progress. A tool in flight is never quiet: a long tool is expected, and the
+/// heartbeat bound sits above the tool timeout. When the engine does stop the
+/// agent, the row's result says so ("Auto-cancelled after 300s without
+/// sub-agent progress"), and Stop on the row ends it sooner.
+fn quiet_fact(
+    app: &App,
+    agent: &SubAgentResult,
+    meta: Option<&AgentProgressMeta>,
+) -> Option<String> {
+    if agent.worker_status == Some(AgentWorkerStatus::RunningTool)
+        || meta.and_then(|meta| meta.current_tool.as_ref()).is_some()
+    {
+        return None;
+    }
+    let since_snapshot = app.subagent_cache_received_at.map_or(0, |at| {
+        u64::try_from(at.elapsed().as_millis()).unwrap_or(u64::MAX)
+    });
+    let mut idle = agent.idle_ms?.saturating_add(since_snapshot);
+    // The snapshot is not refreshed by ordinary progress, so an agent that
+    // kept working after it would otherwise read as quiet. Any envelope the
+    // TUI saw from the child since then caps the estimate.
+    if let Some(at) = meta.and_then(|meta| meta.last_progress_at) {
+        idle = idle.min(u64::try_from(at.elapsed().as_millis()).unwrap_or(u64::MAX));
+    }
+    if idle < QUIET_AFTER_MS {
+        return None;
+    }
+    let bound = agent.heartbeat_timeout_ms?;
+    let coarse = |millis: u64| {
+        let seconds = millis / 1_000;
+        if seconds < 60 {
+            format!("{seconds}s")
+        } else {
+            format!("{}m", seconds / 60)
+        }
+    };
+    Some(
+        tr(app.ui_locale, MessageId::BackgroundQuiet)
+            .replace("{idle}", &coarse(idle.min(bound)))
+            .replace("{bound}", &coarse(bound)),
+    )
 }
 
 /// Whether `text` names `fact` as a whole token: "step 1" is not said by
@@ -2112,7 +2346,6 @@ pub(super) fn settled_file_activity(app: &App) -> SettledFileActivity {
             FileActivityKind::Write => &mut activity.write,
         };
         if let Some(target) = target
-            && details.len() < 12
             && !details.contains(&target)
         {
             details.push(target);
@@ -2156,7 +2389,10 @@ fn aggregate_activity_row(activity: &SettledFileActivity) -> Option<RankedWorkRo
         if details.is_empty() {
             continue;
         }
-        body_parts.push(format!("{kind}:\n{}", details.join("\n")));
+        body_parts.push(format!(
+            "{kind}:\n{}",
+            details[..details.len().min(12)].join("\n")
+        ));
     }
     if body_parts.is_empty() {
         body_parts.push("No safe target detail retained".to_string());
@@ -2199,7 +2435,10 @@ fn activity_rows(activity: SettledFileActivity) -> Vec<RankedWorkRow> {
     aggregate_activity_row(&activity).into_iter().collect()
 }
 
-fn settled_mutation_body(receipts: &[FileMutationReceipt], mode: InlineDiffMode) -> String {
+pub(super) fn settled_mutation_body(
+    receipts: &[FileMutationReceipt],
+    mode: InlineDiffMode,
+) -> String {
     let Some(receipt) = receipts.last() else {
         return String::new();
     };
@@ -2366,26 +2605,21 @@ fn shell_work_rows(app: &App) -> Vec<WorkRow> {
         .iter()
         .filter(|entry| is_live_shell_entry(entry))
         .map(|entry| {
-            let command = entry
-                .prompt_summary
-                .strip_prefix("shell: ")
-                .unwrap_or(entry.prompt_summary.as_str())
-                .trim();
+            let command = shell_command(entry);
+            let command = command.as_str();
             let status = if entry.stale {
                 "stale"
             } else {
                 entry.status.as_str()
             };
             let elapsed_secs = entry.duration_ms.map(|ms| ms / 1_000);
-            let objective = if command.is_empty() {
-                entry.id.clone()
-            } else {
-                command.to_string()
-            };
+            let objective = command.to_string();
             WorkRow {
                 id: WorkRowId(format!("shell:{}", entry.id)),
                 mark: agent_mark(WorkBucket::Active),
-                label: entry.id.clone(),
+                // The command is what a person recognises; the id stays in
+                // the detail and the inspector (#6565).
+                label: objective.clone(),
                 detail: format!("{status} · {}", entry.id),
                 tone: WorkTone::Live,
                 selectable: true,
@@ -3013,6 +3247,8 @@ mod tests {
             duration_ms: 100,
             started_at: None,
             from_prior_session: false,
+            idle_ms: None,
+            heartbeat_timeout_ms: None,
         }
     }
 
@@ -3399,6 +3635,11 @@ mod tests {
         let mut transient = operation(NodeState::Completed, "settled-op");
         transient.binding.as_mut().expect("binding").durable = true;
         let mut snapshot = WorkGraphSnapshot::new();
+        snapshot.compat.todos.push(CompatTodoBinding {
+            legacy_id: 1,
+            node: plan_step.id.clone(),
+            plan_index: None,
+        });
         snapshot.nodes = vec![plan_step, transient];
 
         let mut surface = surface();
@@ -3536,6 +3777,72 @@ mod tests {
                 .iter()
                 .any(|node| node.title == "operation settled"),
             "projection filtering must retain the historical graph receipt"
+        );
+    }
+
+    /// #6546: clearing the To-do list (an empty `todo_write`) drops the
+    /// compat bindings but keeps the old plan-step nodes in the graph. The
+    /// rail must follow the projection, not every plan step ever written.
+    #[tokio::test]
+    async fn cleared_todo_list_leaves_no_plan_step_rows() {
+        use crate::tools::todo::{TodoList, TodoStatus};
+
+        let todos = crate::tools::todo::new_shared_todo_list();
+        let plan = crate::tools::plan::new_shared_plan_state();
+        let work = crate::work_graph::new_shared_work_runtime(todos.clone(), plan);
+        let mut written = TodoList::new();
+        written.add("stale finished item".to_string(), TodoStatus::Completed);
+        work.apply_todo_update("session-6546", "todo_write", &written.snapshot())
+            .await
+            .expect("write todo");
+        work.publish_pending().await.expect("publish write");
+        let rows_for = |graph: &WorkGraphSnapshot| {
+            graph_rows(
+                &mut surface(),
+                graph,
+                None,
+                Vec::new(),
+                None,
+                SettledFileActivity::default(),
+            )
+            .into_iter()
+            .map(|row| row.label)
+            .collect::<Vec<_>>()
+        };
+        let before = work
+            .capture(Some("session-6546"))
+            .expect("capture")
+            .expect("graph");
+        assert!(
+            rows_for(&before.graph)
+                .iter()
+                .any(|label| label.contains("stale finished item")),
+            "precondition: the written item renders"
+        );
+
+        work.apply_todo_update("session-6546", "todo_write", &TodoList::new().snapshot())
+            .await
+            .expect("clear todos");
+        work.publish_pending().await.expect("publish clear");
+        let after = work
+            .capture(Some("session-6546"))
+            .expect("capture")
+            .expect("graph keeps its history");
+        assert!(after.todos.is_empty());
+        assert!(
+            after
+                .graph
+                .nodes
+                .iter()
+                .any(|node| node.title == "stale finished item"),
+            "precondition: the retired node is still in the graph"
+        );
+        let labels = rows_for(&after.graph);
+        assert!(
+            !labels
+                .iter()
+                .any(|label| label.contains("stale finished item")),
+            "cleared To-do item must leave the rail: {labels:?}"
         );
     }
 
@@ -3911,6 +4218,47 @@ mod tests {
     }
 
     #[test]
+    fn files_keep_all_unique_paths_while_activity_summary_is_capped() {
+        use super::super::views::{files_rows, files_touched_count};
+        let mut app = test_app();
+        for action in ["read", "write"] {
+            // Repeat the thirteenth path under a new call ID to check uniqueness.
+            for index in 0..14 {
+                let id = format!("{action}-{index}");
+                let path = format!("{action}-{:02}.rs", index.min(12));
+                let input = serde_json::json!({"action": action, "path": path, "content": "new"});
+                handle_tool_call_started(&mut app, &id, "File", &input);
+                handle_tool_call_complete(&mut app, &id, "File", &Ok(ToolResult::success("ok")));
+                app.flush_active_cell();
+            }
+        }
+        app.work_surface.file_activity = settled_file_activity(&app);
+        assert!(app.work_surface.file_activity.mutations.is_empty());
+        assert_eq!(files_touched_count(&mut app), 26);
+        let rows = files_rows(&mut app);
+        assert!(rows.iter().any(|row| row.label == "Read 13"));
+        assert!(rows.iter().any(|row| row.label == "Edited 13"));
+        for action in ["read", "write"] {
+            for index in 0..13 {
+                let path = format!("{action}-{index:02}.rs");
+                assert_eq!(
+                    rows.iter().filter(|row| row.label == path).count(),
+                    1,
+                    "{path}"
+                );
+            }
+        }
+        let summary = aggregate_activity_row(&app.work_surface.file_activity).unwrap();
+        let Some(SidebarRowAction::InspectWork { body, .. }) = summary.row.primary_action else {
+            panic!("activity summary opens its preview");
+        };
+        for action in ["read", "write"] {
+            assert!(body.contains(&format!("{action}-11.rs")));
+            assert!(!body.contains(&format!("{action}-12.rs")));
+        }
+    }
+
+    #[test]
     fn activity_receipts_aggregate_and_expire_without_raw_payloads() {
         let activity = SettledFileActivity {
             summary: FileActivitySummary {
@@ -3968,11 +4316,12 @@ mod tests {
 
     fn running_shell_entry(id: &str, command: &str) -> crate::tui::app::TaskPanelEntry {
         crate::tui::app::TaskPanelEntry {
+            exit_code: None,
             id: id.to_string(),
             status: "running".to_string(),
             prompt_summary: format!("shell: {command}"),
             duration_ms: Some(42_000),
-            kind: crate::tui::app::TaskPanelEntryKind::Background,
+            kind: crate::tui::app::TaskPanelEntryKind::Shell,
             stale: false,
             elapsed_since_output_ms: None,
             owner_agent_id: None,
@@ -4016,7 +4365,9 @@ mod tests {
             .iter()
             .find(|row| row.id.0 == "shell:shell_a1b2c3d4")
             .expect("navigable shell row");
-        assert_eq!(shell.label, "shell_a1b2c3d4");
+        // #6565: the command leads; the id stays in the detail.
+        assert_eq!(shell.label, "cd /workspace/example-project");
+        assert!(shell.detail.contains("shell_a1b2c3d4"), "{}", shell.detail);
         let Some(SidebarRowAction::InspectWork {
             title,
             body,
@@ -4054,6 +4405,7 @@ mod tests {
         app.work_surface.placement = WorkSurfacePlacement::Top;
         app.work_surface.effective_placement = WorkSurfacePlacement::Top;
         app.task_panel.push(crate::tui::app::TaskPanelEntry {
+            exit_code: None,
             id: "run".to_string(),
             status: "running".to_string(),
             prompt_summary: "background confirmation test".to_string(),
@@ -4072,6 +4424,258 @@ mod tests {
             rows.iter()
                 .all(|row| !row.id.0.starts_with("shell:") && row.id.0 != "section:shells"),
             "non-shell task_panel entries must not become Shells rows: {rows:?}"
+        );
+    }
+
+    fn finished_entry(
+        id: &str,
+        summary: &str,
+        status: &str,
+        exit_code: Option<i64>,
+    ) -> crate::tui::app::TaskPanelEntry {
+        crate::tui::app::TaskPanelEntry {
+            exit_code,
+            status: status.to_string(),
+            prompt_summary: summary.to_string(),
+            duration_ms: Some(12_000),
+            ..running_shell_entry(id, "unused")
+        }
+    }
+
+    #[test]
+    fn finished_shells_and_tasks_sit_muted_under_finished_and_never_count_as_live() {
+        // #6565: a finished task looked live and reopened the dock; a
+        // finished shell vanished with no trace of how it ended.
+        let mut app = test_app();
+        app.task_panel
+            .push(running_shell_entry("shell_dev", "npm run dev"));
+        app.task_panel.push(finished_entry(
+            "shell_ok",
+            "shell: cargo build",
+            "completed",
+            Some(0),
+        ));
+        app.task_panel.push(finished_entry(
+            "shell_bad",
+            "shell: npm test",
+            "failed",
+            Some(2),
+        ));
+        app.task_panel.push(finished_entry(
+            "shell_kill",
+            "shell: sleep 99",
+            "killed",
+            None,
+        ));
+        app.task_panel.push(finished_entry(
+            "shell_slow",
+            "shell: make e2e",
+            "timed_out",
+            None,
+        ));
+        app.task_panel.push(TaskPanelEntry {
+            kind: TaskPanelEntryKind::Background,
+            ..finished_entry("task_done", "summarize the logs", "completed", None)
+        });
+        let rows = visible_rows_for(&mut app, RailPanel::Background);
+        let ids = rows.iter().map(|row| row.id.0.as_str()).collect::<Vec<_>>();
+        assert_eq!(
+            ids,
+            [
+                "section:shells",
+                "shell:shell_dev",
+                "section:finished",
+                "shell:shell_ok",
+                "shell:shell_bad",
+                "shell:shell_kill",
+                "shell:shell_slow",
+                "task:task_done",
+            ]
+        );
+        let row = |id: &str| rows.iter().find(|row| row.id.0 == id).unwrap();
+        assert_eq!(row("section:finished").label, "Finished 5");
+        assert_eq!(row("shell:shell_ok").label, "cargo build");
+        assert_eq!(row("shell:shell_ok").detail, "exit 0 · 12s · shell_ok");
+        assert_eq!(row("shell:shell_ok").tone, WorkTone::Muted);
+        assert_eq!(row("shell:shell_bad").detail, "failed · exit 2 · shell_bad");
+        assert_eq!(row("shell:shell_bad").tone, WorkTone::Failure);
+        assert_eq!(row("shell:shell_kill").detail, "killed · shell_kill");
+        assert_eq!(row("shell:shell_slow").detail, "timed out · shell_slow");
+        assert_eq!(row("task:task_done").tone, WorkTone::Muted);
+        assert!(
+            row("shell:shell_ok")
+                .agent
+                .as_ref()
+                .is_some_and(|facts| !facts.holds_dock_open && facts.role_label == "shell")
+        );
+
+        // The running dev server is the only live work.
+        assert!(background_has_live_work(&mut app));
+        app.task_panel.remove(0);
+        assert!(!background_has_live_work(&mut app));
+        assert_eq!(auto_work_rows(&mut app), 0);
+    }
+
+    #[test]
+    fn a_quiet_running_agent_shows_the_engines_idle_clock_and_bound() {
+        let mut app = test_app();
+        let mut agent = running_agent("agent_quiet");
+        agent.idle_ms = Some(125_000);
+        agent.heartbeat_timeout_ms = Some(300_000);
+        app.subagent_cache.push(agent);
+        let detail = |app: &App| {
+            agent_rows(app)
+                .into_iter()
+                .find(|ranked| ranked.row.id.0 == "worker:agent_quiet")
+                .expect("row")
+                .row
+                .detail
+        };
+        assert!(
+            detail(&app).ends_with("quiet 2m · auto-stop at 5m"),
+            "{}",
+            detail(&app)
+        );
+        // A tool in flight is never quiet.
+        app.agent_progress_meta
+            .entry("agent_quiet".to_string())
+            .or_default()
+            .current_tool = Some("exec_shell".to_string());
+        assert!(!detail(&app).contains("quiet"), "{}", detail(&app));
+        // Under a minute says nothing.
+        app.agent_progress_meta.clear();
+        app.subagent_cache[0].idle_ms = Some(20_000);
+        assert!(!detail(&app).contains("quiet"), "{}", detail(&app));
+    }
+
+    #[test]
+    fn progress_after_an_old_snapshot_keeps_a_working_agent_from_reading_quiet() {
+        let mut app = test_app();
+        let mut agent = running_agent("agent_busy");
+        // The snapshot is ten minutes old; its idle clock would read quiet.
+        agent.idle_ms = Some(0);
+        agent.heartbeat_timeout_ms = Some(300_000);
+        app.subagent_cache.push(agent);
+        app.subagent_cache_received_at =
+            std::time::Instant::now().checked_sub(std::time::Duration::from_secs(600));
+        let detail = |app: &App| {
+            agent_rows(app)
+                .into_iter()
+                .find(|ranked| ranked.row.id.0 == "worker:agent_busy")
+                .expect("row")
+                .row
+                .detail
+        };
+        assert!(detail(&app).contains("quiet 5m"), "{}", detail(&app));
+        // A progress envelope since then, with no tool in flight between
+        // read-only tools, means the agent is working.
+        app.agent_progress_meta
+            .entry("agent_busy".to_string())
+            .or_default()
+            .last_progress_at = Some(std::time::Instant::now());
+        assert!(!detail(&app).contains("quiet"), "{}", detail(&app));
+        // The TUI's clock only caps the engine's, never extends it: a child
+        // quiet since its last envelope two minutes ago reads 2m.
+        app.agent_progress_meta
+            .get_mut("agent_busy")
+            .expect("meta")
+            .last_progress_at =
+            std::time::Instant::now().checked_sub(std::time::Duration::from_secs(125));
+        assert!(detail(&app).contains("quiet 2m"), "{}", detail(&app));
+    }
+
+    #[test]
+    fn background_review_shell_prefixed_tasks_keep_task_actions() {
+        let mut app = test_app();
+        for (id, summary) in [
+            ("task_real", "shell: explain this command"),
+            ("shell_legacy", "ordinary task"),
+        ] {
+            app.task_panel.push(TaskPanelEntry {
+                kind: TaskPanelEntryKind::Background,
+                prompt_summary: summary.into(),
+                ..running_shell_entry(id, "unused")
+            });
+        }
+        assert!(
+            app.task_panel
+                .iter()
+                .all(|entry| !is_live_shell_entry(entry))
+        );
+        assert_eq!(
+            crate::tui::background_indicator::pending_work_from_app(&app)
+                .count(crate::tui::background_indicator::PendingItemKind::Task),
+            2
+        );
+        for status in ["running", "completed"] {
+            for entry in &mut app.task_panel {
+                entry.status = status.into();
+            }
+            let rows = visible_rows_for(&mut app, RailPanel::Background);
+            for id in ["task_real", "shell_legacy"] {
+                let row = rows
+                    .iter()
+                    .find(|row| row.id.0 == format!("task:{id}"))
+                    .expect("task row");
+                assert!(
+                    matches!(&row.primary_action, Some(SidebarRowAction::Command(command)) if command == &format!("/jobs show {id}"))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn background_review_snapshot_tool_is_never_quiet_without_progress_metadata() {
+        let app = test_app();
+        let mut agent = running_agent("agent_tool");
+        agent.idle_ms = Some(125_000);
+        agent.heartbeat_timeout_ms = Some(300_000);
+        agent.worker_status = Some(AgentWorkerStatus::RunningTool);
+        assert_eq!(quiet_fact(&app, &agent, None), None);
+        assert_eq!(
+            quiet_fact(&app, &agent, Some(&AgentProgressMeta::default())),
+            None
+        );
+        agent.worker_status = None;
+        assert!(quiet_fact(&app, &agent, None).is_some());
+    }
+
+    #[test]
+    fn background_review_finished_rows_and_quiet_copy_use_the_selected_locale() {
+        let mut app = test_app();
+        app.ui_locale = Locale::Fr;
+        app.task_panel.push(finished_entry(
+            "shell_kill",
+            "shell: sleep 99",
+            "killed",
+            None,
+        ));
+        let rows = visible_rows_for(&mut app, RailPanel::Background);
+        assert_eq!(rows[0].label, "Terminés 1");
+        assert_eq!(rows[0].detail, "Ouvrez une ligne pour voir sa sortie");
+        assert!(rows[1].detail.starts_with("arrêté de force"));
+        for (status, expected) in [
+            ("completed", "code de sortie 0"),
+            ("failed", "échec"),
+            ("timed_out", "délai dépassé"),
+        ] {
+            let entry = finished_entry("shell", "shell: command", status, Some(0));
+            assert!(finished_shell_outcome(Locale::Fr, &entry).contains(expected));
+        }
+        for (status, expected) in [("failed", "échec"), ("canceled", "annulation")] {
+            app.task_panel = vec![TaskPanelEntry {
+                kind: TaskPanelEntryKind::Background,
+                ..finished_entry("task", "vérifier", status, None)
+            }];
+            let rows = finished_background_rows(&app);
+            assert_eq!(rows[0].detail, format!("{expected} · 12s · task"));
+        }
+        let mut agent = running_agent("agent_quiet");
+        agent.idle_ms = Some(125_000);
+        agent.heartbeat_timeout_ms = Some(300_000);
+        assert_eq!(
+            quiet_fact(&app, &agent, None).as_deref(),
+            Some("sans progrès depuis 2m · arrêt automatique à 5m")
         );
     }
 }

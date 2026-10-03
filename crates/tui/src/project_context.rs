@@ -28,6 +28,7 @@ use self::pack::generate_bounded_project_overview;
 pub use self::pack::generate_project_context_pack;
 pub use self::types::ProjectContext;
 use self::types::ProjectContextError;
+pub(crate) use self::types::project_instructions_source_label;
 
 /// Names of project context files to look for, in priority order.
 ///
@@ -278,7 +279,7 @@ fn rules_dir_has_loadable_content(workspace: &Path, rules_dir_name: &str) -> boo
     candidates
         .into_iter()
         .take(MAX_RULES_FILES)
-        .any(|path| load_context_file(&path).is_ok())
+        .any(|path| load_context_file(workspace, &path).is_ok())
 }
 
 /// Foreign instruction files that exist in the workspace but were not
@@ -296,7 +297,7 @@ fn unimported_foreign_warnings(
         let direct_context_present = format
             .context_files()
             .iter()
-            .any(|relative| load_context_file(&workspace.join(relative)).is_ok());
+            .any(|relative| load_context_file(workspace, &workspace.join(relative)).is_ok());
         let rules_present = format
             .rules_dirs()
             .iter()
@@ -553,7 +554,7 @@ fn load_dir_instructions(
         let file_path = dir.join(filename);
 
         if context_candidate_exists(&file_path) {
-            match load_context_file(&file_path) {
+            match load_context_file(dir, &file_path) {
                 Ok(content) => {
                     tracing::info!(
                         "Loaded project context from {} ({} bytes)",
@@ -1011,69 +1012,17 @@ fn generate_ephemeral_context(workspace: &Path) -> Option<String> {
     ))
 }
 
-/// Load a context file with size checking
-fn load_context_file(path: &Path) -> Result<String, ProjectContextError> {
-    load_context_file_with_symlink_policy(path, false)
-}
-
-/// Load a user-level context file, following a symlink to its target.
-///
-/// The refusal in [`load_context_file`] protects checkouts: a link planted in
-/// an untrusted repository could point the loader at anything on the machine.
-/// The user-level layer is the operator's own file in `$HOME`, where that
-/// escape does not apply and a symlink is the ordinary way to share one
-/// instruction set between agents (`~/.deepseek/AGENTS.md` -> `~/AGENTS.md`).
-/// Refusing it there failed silently: the refusal is collected as a warning,
-/// so the whole user-level layer was dropped without any visible error.
-fn load_global_context_file(path: &Path) -> Result<String, ProjectContextError> {
-    load_context_file_with_symlink_policy(path, true)
-}
-
-/// Resolve a symlinked context file to its target.
-///
-/// `open_context_file` opens with `O_NOFOLLOW`, so the resolved target is what
-/// must be opened, never the link itself.
-fn resolve_symlinked_context_path(path: &Path) -> Result<PathBuf, ProjectContextError> {
-    let metadata = fs::symlink_metadata(path).map_err(|source| ProjectContextError::Metadata {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    if !metadata.file_type().is_symlink() {
-        return Ok(path.to_path_buf());
-    }
-    fs::canonicalize(path).map_err(|source| ProjectContextError::Metadata {
-        path: path.to_path_buf(),
-        source,
-    })
-}
-
-fn load_context_file_with_symlink_policy(
-    path: &Path,
-    follow_symlinks: bool,
-) -> Result<String, ProjectContextError> {
-    let resolved = follow_symlinks
-        .then(|| resolve_symlinked_context_path(path))
-        .transpose()?;
-    let path = resolved.as_deref().unwrap_or(path);
-    let metadata = fs::symlink_metadata(path).map_err(|source| ProjectContextError::Metadata {
-        path: path.to_path_buf(),
-        source,
-    })?;
-
-    let file_type = metadata.file_type();
-    if file_type.is_symlink() {
-        return Err(ProjectContextError::Symlink {
+/// Load a context file with size checking and no links below its scope root.
+fn load_context_file(root: &Path, path: &Path) -> Result<String, ProjectContextError> {
+    let file =
+        crate::fs_confined::open_read(root, path).map_err(|source| ProjectContextError::Read {
             path: path.to_path_buf(),
-        });
-    }
+            source,
+        })?;
+    read_context_file(file, path)
+}
 
-    if !file_type.is_file() {
-        return Err(ProjectContextError::NotFile {
-            path: path.to_path_buf(),
-        });
-    }
-
-    let mut file = open_context_file(path)?;
+fn read_context_file(mut file: fs::File, path: &Path) -> Result<String, ProjectContextError> {
     let metadata = file
         .metadata()
         .map_err(|source| ProjectContextError::Metadata {
@@ -1168,7 +1117,7 @@ fn load_rules_from_dir(workspace: &Path, rules_dir_name: &str) -> Vec<(PathBuf, 
     }
 
     for path in file_paths {
-        match load_context_file(&path) {
+        match load_context_file(workspace, &path) {
             Ok(content) => {
                 tracing::info!(
                     "Loaded project rule from {} ({} bytes)",
@@ -1191,26 +1140,14 @@ fn load_rules_from_dir(workspace: &Path, rules_dir_name: &str) -> Vec<(PathBuf, 
     entries
 }
 
-#[cfg(unix)]
-fn open_context_file(path: &Path) -> Result<fs::File, ProjectContextError> {
-    use std::os::unix::fs::OpenOptionsExt;
-
-    fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)
-        .map_err(|source| ProjectContextError::Read {
+/// User-owned global instructions may intentionally resolve through links.
+fn load_global_context_file(path: &Path) -> Result<String, ProjectContextError> {
+    let file =
+        crate::fs_confined::open_user_read(path).map_err(|source| ProjectContextError::Read {
             path: path.to_path_buf(),
             source,
-        })
-}
-
-#[cfg(not(unix))]
-fn open_context_file(path: &Path) -> Result<fs::File, ProjectContextError> {
-    fs::File::open(path).map_err(|source| ProjectContextError::Read {
-        path: path.to_path_buf(),
-        source,
-    })
+        })?;
+    read_context_file(file, path)
 }
 
 /// Check if this project is marked as trusted
@@ -1436,7 +1373,7 @@ pub fn project_instruction_sources(
                 &dir,
                 dir.join(filename),
                 &mut scope_loaded,
-                load_context_file,
+                |path| load_context_file(&dir, path),
             );
         }
     }
@@ -1486,7 +1423,7 @@ pub fn project_instruction_sources(
                     )),
                 )
             } else {
-                match load_context_file(&path) {
+                match load_context_file(&workspace, &path) {
                     Ok(_) => (InstructionSourceStatus::Loaded, None),
                     Err(error) => (InstructionSourceStatus::Skipped, Some(error.to_string())),
                 }
@@ -1713,6 +1650,44 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    #[cfg(unix)]
+    #[test]
+    fn confined_global_context_refuses_a_directory_target() {
+        let home = tempdir().unwrap();
+        let path = home.path().join("AGENTS.md");
+        std::os::unix::fs::symlink("/", &path).unwrap();
+        assert!(load_global_context_file(&path).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn confined_context_refuses_linked_parent_directories() {
+        for directory in [".codewhale", ".deepseek"] {
+            let workspace = tempdir().unwrap();
+            let outside = tempdir().unwrap();
+            fs::write(
+                outside.path().join("instructions.md"),
+                "separate instructions",
+            )
+            .unwrap();
+            fs::create_dir(outside.path().join("rules")).unwrap();
+            fs::write(outside.path().join("rules/rule.md"), "separate rule").unwrap();
+            fs::write(
+                outside.path().join("constitution.json"),
+                r#"{"purpose":"separate purpose"}"#,
+            )
+            .unwrap();
+            std::os::unix::fs::symlink(outside.path(), workspace.path().join(directory)).unwrap();
+            let context = load_project_context_with_imports(
+                workspace.path(),
+                &ForeignInstructionImports::none(),
+            );
+            assert!(context.instructions.is_none());
+            assert!(context.rules_block.is_none());
+            assert!(load_repo_constitution_block(workspace.path()).0.is_none());
+        }
+    }
+
     #[test]
     fn test_load_project_context_empty() {
         let tmp = tempdir().expect("tempdir");
@@ -1815,6 +1790,51 @@ mod tests {
         assert!(block.contains("<project_instructions"));
         assert!(block.contains("Test content"));
         assert!(block.contains("</project_instructions>"));
+    }
+
+    #[test]
+    fn project_instructions_source_label_falls_back_to_project() {
+        use crate::project_context::project_instructions_source_label;
+        assert_eq!(
+            project_instructions_source_label(None),
+            "project",
+            "a missing source path keeps the historical literal label"
+        );
+        assert_eq!(
+            project_instructions_source_label(Some(std::path::Path::new("/etc/AGENTS.md"))),
+            "AGENTS.md"
+        );
+    }
+
+    #[test]
+    fn project_instructions_source_is_file_name_not_absolute_path() {
+        // The source label sits inside the pinned system prompt: loading the
+        // same AGENTS.md from a different directory must leave the
+        // instructions block byte-identical, so a move emits no spurious
+        // `<context_update>` history append and no absolute path enters a
+        // provider-bound label. Scope note: ancestor-chain and project-rule
+        // labels keep their own (absolute) spellings; relativizing those is
+        // a separate decision.
+        let dir_a = tempdir().expect("tempdir a");
+        let dir_b = tempdir().expect("tempdir b");
+        fs::write(dir_a.path().join("AGENTS.md"), "Pinned content").expect("write a");
+        fs::write(dir_b.path().join("AGENTS.md"), "Pinned content").expect("write b");
+
+        let block_a = load_project_context(dir_a.path())
+            .as_system_block()
+            .expect("block a");
+        let block_b = load_project_context(dir_b.path())
+            .as_system_block()
+            .expect("block b");
+        assert_eq!(
+            block_a, block_b,
+            "a directory move must not change the project instructions block"
+        );
+        assert!(block_a.contains("source=\"AGENTS.md\""));
+        assert!(
+            !block_a.contains(&dir_a.path().display().to_string()),
+            "absolute paths must not enter prompt source labels"
+        );
     }
 
     #[test]
@@ -2083,6 +2103,14 @@ mod tests {
             .as_deref()
             .expect("constitution block rendered");
         assert!(block.contains("<codewhale_repo_constitution"));
+        // Same origin-label convention as project_instructions: file name
+        // only, no absolute path in the provider-bound label (the locator
+        // stays available via constitution_source_path and /constitution).
+        assert!(block.contains("source=\"constitution.json\""));
+        assert!(
+            !block.contains(&tmp.path().display().to_string()),
+            "the constitution prompt label must not carry the absolute path"
+        );
         assert!(block.contains("current user request"));
         assert!(block.contains("run focused tests"));
         assert!(block.contains("keep the tool-catalog head byte-stable"));
@@ -2456,6 +2484,8 @@ mod tests {
         let home = tempdir().expect("home tempdir");
         let shared = home.path().join("AGENTS.md");
         fs::write(&shared, "Shared global instructions").expect("write shared agents");
+        fs::hard_link(&shared, home.path().join("shared-copy.md"))
+            .expect("hard link global agents");
         let global_dir = home.path().join(".deepseek");
         fs::create_dir(&global_dir).expect("mkdir .deepseek");
         let link = global_dir.join("AGENTS.md");

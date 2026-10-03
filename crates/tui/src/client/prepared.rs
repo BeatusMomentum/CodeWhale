@@ -1367,6 +1367,7 @@ mod dialect_seam_tests {
             client.api_provider(),
             client.base_url(),
             true,
+            None,
         )
         .expect("reference body builds");
 
@@ -1414,6 +1415,7 @@ mod dialect_seam_tests {
             client.api_provider(),
             client.base_url(),
             true,
+            None,
         )
         .expect("reference body builds");
         assert_eq!(

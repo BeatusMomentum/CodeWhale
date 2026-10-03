@@ -136,6 +136,17 @@ pub struct MessageRecord {
     pub parent_entry_id: Option<i64>,
 }
 
+/// One message for [`StateStore::append_messages`].
+#[derive(Debug, Clone)]
+pub struct NewMessage {
+    /// Role of the message sender (e.g. `"user"`, `"history"`).
+    pub role: String,
+    /// Text content of the message.
+    pub content: String,
+    /// Optional structured item payload.
+    pub item: Option<Value>,
+}
+
 /// A named checkpoint capturing the state of a thread at a point in time.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CheckpointRecord {
@@ -272,6 +283,9 @@ fn session_index_compact_line_threshold() -> usize {
     if cfg!(test) { 5 } else { 5_000 }
 }
 
+/// The `user_version` the last step of `StateStore::migrate_schema` writes.
+const SCHEMA_VERSION: u32 = 6;
+
 /// Persistent storage for conversation threads, messages, checkpoints, and jobs.
 ///
 /// Backed by a SQLite database and an append-only JSONL session index file.
@@ -366,6 +380,33 @@ impl StateStore {
     }
 
     fn init_schema(conn: &Connection) -> Result<()> {
+        let user_version: u32 = conn.query_row("PRAGMA user_version;", [], |row| row.get(0))?;
+        if user_version >= SCHEMA_VERSION {
+            return Ok(());
+        }
+        // Take the write lock *before* reading the version or probing
+        // columns. Two processes opening a fresh database used to both read
+        // v0 and "column missing" outside any transaction; the loser then
+        // waited out the winner's commit and re-ran its `ADD COLUMN`, failing
+        // the open with "duplicate column name". Under `BEGIN IMMEDIATE` the
+        // loser waits (busy_timeout) and then decides from the committed
+        // schema. The version read above is only a fast path for the
+        // already-current database, which never takes the write lock.
+        conn.execute_batch("BEGIN IMMEDIATE;")
+            .context("failed to lock the state db for its schema migration")?;
+        let migrated = Self::migrate_schema(conn).and_then(|()| {
+            conn.execute_batch("COMMIT;")
+                .context("failed to commit the state db schema migration")
+        });
+        if migrated.is_err() {
+            let _ = conn.execute_batch("ROLLBACK;");
+        }
+        migrated
+    }
+
+    /// Every schema step, run inside the one transaction [`Self::init_schema`]
+    /// holds; the steps themselves never begin or commit.
+    fn migrate_schema(conn: &Connection) -> Result<()> {
         let mut user_version: u32 = conn.query_row("PRAGMA user_version;", [], |row| row.get(0))?;
         if user_version == 0 {
             // Guard each ALTER: a database restored with a v0 header (or
@@ -385,7 +426,6 @@ impl StateStore {
             };
             conn.execute_batch(&format!(
                 r#"
-                BEGIN;
                 CREATE TABLE IF NOT EXISTS threads (
                     id TEXT PRIMARY KEY,
                     rollout_path TEXT,
@@ -486,7 +526,6 @@ impl StateStore {
                     );
 
                 PRAGMA user_version = 1;
-                COMMIT;
                 "#
             ))
             .context("failed to initialize thread schema")?;
@@ -495,7 +534,6 @@ impl StateStore {
         if user_version < 2 {
             conn.execute_batch(
                 r#"
-                BEGIN;
                 CREATE TABLE IF NOT EXISTS workflow_runs (
                     id TEXT PRIMARY KEY,
                     workflow_id TEXT NOT NULL,
@@ -584,7 +622,6 @@ impl StateStore {
                     ON teacher_candidates(control_node_run_id);
 
                 PRAGMA user_version = 2;
-                COMMIT;
                 "#,
             )
             .context("failed to initialize workflow trace schema")?;
@@ -593,7 +630,6 @@ impl StateStore {
         if user_version < 3 {
             conn.execute_batch(
                 r#"
-                BEGIN;
                 CREATE TABLE IF NOT EXISTS thread_goals (
                     thread_id TEXT PRIMARY KEY NOT NULL,
                     goal_id TEXT NOT NULL,
@@ -615,7 +651,6 @@ impl StateStore {
                 );
 
                 PRAGMA user_version = 3;
-                COMMIT;
                 "#,
             )
             .context("failed to initialize thread goal schema")?;
@@ -635,11 +670,9 @@ impl StateStore {
             };
             conn.execute_batch(&format!(
                 r#"
-                BEGIN;
                 {add_continuation_count}
 
                 PRAGMA user_version = 4;
-                COMMIT;
                 "#
             ))
             .context("failed to initialize thread goal continuation schema")?;
@@ -659,11 +692,57 @@ impl StateStore {
                     ));
                 }
             }
-            conn.execute_batch(&format!(
-                "BEGIN; {additions} PRAGMA user_version = 5; COMMIT;"
-            ))
-            .context("failed to initialize durable goal stall schema")?;
+            conn.execute_batch(&format!("{additions} PRAGMA user_version = 5;"))
+                .context("failed to initialize durable goal stall schema")?;
+            user_version = 5;
         }
+        if user_version < 6 {
+            conn.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS thread_runtime_links (
+                    thread_id TEXT PRIMARY KEY NOT NULL,
+                    runtime_thread_id TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    FOREIGN KEY(thread_id) REFERENCES threads(id) ON DELETE CASCADE
+                );
+
+                PRAGMA user_version = 6;
+                "#,
+            )
+            .context("failed to initialize thread runtime link schema")?;
+        }
+        Ok(())
+    }
+
+    /// The runtime (turn engine) thread a client-facing thread runs on, if
+    /// one was linked. Links outlive the app-server process, so a thread
+    /// keeps its conversation across a daemon restart.
+    pub fn get_runtime_thread_link(&self, thread_id: &str) -> Result<Option<String>> {
+        let conn = self.conn()?;
+        conn.query_row(
+            "SELECT runtime_thread_id FROM thread_runtime_links WHERE thread_id = ?1",
+            params![thread_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .with_context(|| format!("failed to read runtime link for thread {thread_id}"))
+    }
+
+    /// Record the runtime thread for `thread_id`. The thread must exist; the
+    /// link is removed with it.
+    pub fn set_runtime_thread_link(&self, thread_id: &str, runtime_thread_id: &str) -> Result<()> {
+        let conn = self.conn()?;
+        conn.execute(
+            r#"
+            INSERT INTO thread_runtime_links(thread_id, runtime_thread_id, created_at)
+            VALUES (?1, ?2, ?3)
+            ON CONFLICT(thread_id) DO UPDATE SET
+                runtime_thread_id = excluded.runtime_thread_id,
+                created_at = excluded.created_at
+            "#,
+            params![thread_id, runtime_thread_id, Utc::now().timestamp()],
+        )
+        .with_context(|| format!("failed to save runtime link for thread {thread_id}"))?;
         Ok(())
     }
 
@@ -817,12 +896,26 @@ impl StateStore {
     }
 
     /// Permanently delete a thread and all of its associated data
-    /// (messages, checkpoints, dynamic tools) via cascading foreign keys.
+    /// (messages, checkpoints, dynamic tools) via cascading foreign keys, and
+    /// drop it from the session index.
+    ///
+    /// The index is append-only and name lookups read it without the
+    /// database, so a deleted thread left there kept answering for its name —
+    /// shadowing a live thread of the same name when it was newer.
     pub fn delete_thread(&self, id: &str) -> Result<()> {
-        let conn = self.conn()?;
-        conn.execute("DELETE FROM threads WHERE id = ?1", params![id])
-            .context("failed to delete thread")?;
-        Ok(())
+        {
+            let conn = self.conn()?;
+            conn.execute("DELETE FROM threads WHERE id = ?1", params![id])
+                .context("failed to delete thread")?;
+        }
+        let _guard = SESSION_INDEX_LOCK.lock().unwrap();
+        self.with_session_index_lock(|| {
+            let mut latest = self.session_index_map()?;
+            if latest.remove(id).is_some() {
+                self.rewrite_session_index_locked(&latest)?;
+            }
+            Ok(())
+        })
     }
 
     /// Insert or replace the persisted goal for a thread.
@@ -1132,19 +1225,48 @@ impl StateStore {
         content: &str,
         item: Option<Value>,
     ) -> Result<i64> {
+        let ids = self.append_messages(
+            thread_id,
+            &[NewMessage {
+                role: role.to_string(),
+                content: content.to_string(),
+                item,
+            }],
+        )?;
+        ids.first()
+            .copied()
+            .context("append message transaction returned no id")
+    }
+
+    /// Append `messages` to a thread's current branch in one transaction.
+    ///
+    /// Each message is linked to the one before it (the first to the thread's
+    /// current leaf), and the leaf ends on the last. All or nothing: a failure
+    /// part-way leaves the thread exactly as it was, never a partial history.
+    /// Returns the new message ids in order.
+    pub fn append_messages(&self, thread_id: &str, messages: &[NewMessage]) -> Result<Vec<i64>> {
+        if messages.is_empty() {
+            return Ok(Vec::new());
+        }
+        let encoded = messages
+            .iter()
+            .map(|message| {
+                message
+                    .item
+                    .as_ref()
+                    .map(serde_json::to_string)
+                    .transpose()
+                    .context("failed to serialize message item payload")
+            })
+            .collect::<Result<Vec<_>>>()?;
         let mut conn = self.conn()?;
         let created_at = Utc::now().timestamp();
-        let item_json = item
-            .as_ref()
-            .map(serde_json::to_string)
-            .transpose()
-            .context("failed to serialize message item payload")?;
 
         let tx = conn
             .transaction()
             .context("failed to begin append message transaction")?;
 
-        let current_leaf_id: Option<i64> = tx
+        let mut leaf_id: Option<i64> = tx
             .query_row(
                 "SELECT current_leaf_id FROM threads WHERE id = ?1",
                 params![thread_id],
@@ -1154,13 +1276,18 @@ impl StateStore {
                 format!("failed to query thread current leaf id for thread {thread_id}")
             })?;
 
-        let next_leaf_id: i64 = tx.query_row(
-            r#"
-                INSERT INTO messages(thread_id, role, content, item_json, created_at, parent_entry_id)
-                SELECT ?1, ?2, ?3, ?4, ?5, ?6
-                RETURNING id
-            "#, params![thread_id, role, content, item_json, created_at, current_leaf_id], |row| row.get(0)
-        ).with_context(|| format!("failed to append message for thread {thread_id}"))?;
+        let mut ids = Vec::with_capacity(messages.len());
+        for (message, item_json) in messages.iter().zip(encoded) {
+            let next_leaf_id: i64 = tx.query_row(
+                r#"
+                    INSERT INTO messages(thread_id, role, content, item_json, created_at, parent_entry_id)
+                    SELECT ?1, ?2, ?3, ?4, ?5, ?6
+                    RETURNING id
+                "#, params![thread_id, message.role, message.content, item_json, created_at, leaf_id], |row| row.get(0)
+            ).with_context(|| format!("failed to append message for thread {thread_id}"))?;
+            leaf_id = Some(next_leaf_id);
+            ids.push(next_leaf_id);
+        }
 
         tx.execute(
             r#"
@@ -1168,7 +1295,7 @@ impl StateStore {
             SET current_leaf_id = ?1
             WHERE id = ?2;
             "#,
-            params![next_leaf_id, thread_id],
+            params![leaf_id, thread_id],
         )
         .with_context(|| {
             format!("failed to update thread current leaf id for thread {thread_id}")
@@ -1177,7 +1304,7 @@ impl StateStore {
         tx.commit()
             .context("failed to commit append message transaction")?;
 
-        Ok(next_leaf_id)
+        Ok(ids)
     }
 
     /// List messages in the current conversation branch, walking backwards from
@@ -1725,6 +1852,15 @@ impl StateStore {
         }
 
         let latest = self.session_index_map()?;
+        self.rewrite_session_index_locked(&latest)
+    }
+
+    /// Replace the session index with exactly `latest`, one line per thread.
+    /// The caller holds the lock from [`Self::with_session_index_lock`].
+    fn rewrite_session_index_locked(
+        &self,
+        latest: &HashMap<String, SessionIndexEntry>,
+    ) -> Result<()> {
         let compact_path = self.session_index_path.with_extension("jsonl.compact");
         {
             let mut file = OpenOptions::new()
@@ -2196,6 +2332,162 @@ mod tests {
         assert!(err.to_string().contains("thread missing-thread not found"));
     }
 
+    /// Audit R03-07: two first opens of one fresh database. The loser must
+    /// decide from the winner's committed schema, not from a probe taken
+    /// before it could write. The old code read "column missing" outside its
+    /// transaction, waited out the winner, then failed its own `ADD COLUMN`
+    /// with "duplicate column name".
+    #[test]
+    fn a_first_open_that_loses_the_migration_race_still_opens() {
+        let dir = temp_state_dir("migration-race");
+        let path = dir.join("state.db");
+        let winner = Connection::open(&path).expect("open winner");
+        let mode: String = winner
+            .query_row("PRAGMA journal_mode=WAL;", [], |row| row.get(0))
+            .expect("wal");
+        assert_eq!(mode, "wal");
+        // The winner is mid-migration: the v1 columns exist inside its
+        // uncommitted write transaction, user_version is still 0.
+        winner
+            .execute_batch(
+                r#"
+                BEGIN IMMEDIATE;
+                CREATE TABLE threads (
+                    id TEXT PRIMARY KEY, rollout_path TEXT, preview TEXT NOT NULL,
+                    ephemeral INTEGER NOT NULL, model_provider TEXT NOT NULL,
+                    created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+                    status TEXT NOT NULL, path TEXT, cwd TEXT NOT NULL,
+                    cli_version TEXT NOT NULL, source TEXT NOT NULL, title TEXT,
+                    sandbox_policy TEXT, approval_mode TEXT,
+                    archived INTEGER NOT NULL DEFAULT 0, archived_at INTEGER,
+                    git_sha TEXT, git_branch TEXT, git_origin_url TEXT,
+                    memory_mode TEXT, current_leaf_id INTEGER NULL
+                );
+                CREATE TABLE messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, thread_id TEXT NOT NULL,
+                    role TEXT NOT NULL, content TEXT NOT NULL, item_json TEXT,
+                    created_at INTEGER NOT NULL, parent_entry_id INTEGER NULL,
+                    FOREIGN KEY(thread_id) REFERENCES threads(id) ON DELETE CASCADE
+                );
+                "#,
+            )
+            .expect("winner begins its migration");
+
+        let loser = {
+            let path = path.clone();
+            thread::spawn(move || StateStore::open(Some(path)).map(|_| ()))
+        };
+        // Long enough for the loser to probe the schema; well inside its
+        // five-second busy timeout.
+        thread::sleep(Duration::from_millis(500));
+        winner.execute_batch("COMMIT;").expect("winner commits");
+
+        loser
+            .join()
+            .expect("loser thread")
+            .expect("the losing first open must succeed");
+    }
+
+    /// Audit R05-05: a batch append is all or nothing. The pattern it
+    /// replaces (one `append_message` transaction per item) leaves a
+    /// partial chain when a later item fails.
+    #[test]
+    fn append_messages_is_all_or_nothing() {
+        let store = temp_state_store("append-batch-atomic");
+        store
+            .upsert_thread(&test_thread("thread-1"))
+            .expect("upsert thread");
+        store
+            .conn()
+            .expect("conn")
+            .execute_batch(
+                "CREATE TRIGGER refuse_boom BEFORE INSERT ON messages \
+                 WHEN NEW.content = 'boom' BEGIN SELECT RAISE(ABORT, 'boom'); END;",
+            )
+            .expect("install failing trigger");
+        let batch = ["one", "boom"].map(|content| NewMessage {
+            role: "history".to_string(),
+            content: content.to_string(),
+            item: None,
+        });
+
+        // The per-item pattern leaves "one" behind.
+        let per_item: Result<Vec<i64>> = batch
+            .iter()
+            .map(|message| store.append_message("thread-1", &message.role, &message.content, None))
+            .collect();
+        assert!(per_item.is_err());
+        let partial = store.list_messages("thread-1", None).expect("list");
+        assert_eq!(partial.len(), 1, "per-item appends leave a partial chain");
+        store.clear_messages("thread-1").expect("reset");
+
+        assert!(store.append_messages("thread-1", &batch).is_err());
+        assert!(
+            store
+                .list_messages("thread-1", None)
+                .expect("list")
+                .is_empty(),
+            "a failed batch must leave no messages"
+        );
+        let leaf: Option<i64> = store
+            .conn()
+            .expect("conn")
+            .query_row(
+                "SELECT current_leaf_id FROM threads WHERE id = 'thread-1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("leaf");
+        assert_eq!(leaf, None, "a failed batch must not move the leaf");
+
+        let ok = ["a", "b", "c"].map(|content| NewMessage {
+            role: "history".to_string(),
+            content: content.to_string(),
+            item: None,
+        });
+        let ids = store
+            .append_messages("thread-1", &ok)
+            .expect("append batch");
+        let chain = store.list_messages("thread-1", None).expect("list");
+        assert_eq!(chain.iter().map(|m| m.id).collect::<Vec<_>>(), ids);
+        assert_eq!(chain[1].parent_entry_id, Some(ids[0]));
+        assert_eq!(chain[2].parent_entry_id, Some(ids[1]));
+    }
+
+    /// Audit R03-09: a deleted thread must not keep answering for its name
+    /// in the session index, shadowing a live thread of the same name.
+    #[test]
+    fn deleted_thread_leaves_the_session_index() {
+        let store = temp_state_store("delete-index");
+        store
+            .append_thread_name(
+                "live",
+                Some("Build".to_string()),
+                100,
+                Some(PathBuf::from("/live")),
+            )
+            .expect("index live");
+        store
+            .append_thread_name(
+                "gone",
+                Some("build".to_string()),
+                200,
+                Some(PathBuf::from("/gone")),
+            )
+            .expect("index gone");
+        assert_eq!(
+            store.find_thread_path_by_name_str("build").expect("find"),
+            Some(PathBuf::from("/gone"))
+        );
+
+        store.delete_thread("gone").expect("delete");
+
+        assert_eq!(
+            store.find_thread_path_by_name_str("build").expect("find"),
+            Some(PathBuf::from("/live"))
+        );
+    }
+
     #[test]
     fn delete_thread_cascades_child_rows() {
         let store = temp_state_store("thread-delete-cascade");
@@ -2387,6 +2679,46 @@ mod tests {
         assert_eq!(listed.len(), 2, "both writers should persist their jobs");
 
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn runtime_thread_link_round_trips_and_goes_with_its_thread() {
+        let store = temp_state_store("runtime-thread-link");
+        store
+            .upsert_thread(&test_thread("thread-linked"))
+            .expect("upsert thread");
+        assert_eq!(
+            store
+                .get_runtime_thread_link("thread-linked")
+                .expect("read"),
+            None
+        );
+        store
+            .set_runtime_thread_link("thread-linked", "thr_runtime_1")
+            .expect("link");
+        store
+            .set_runtime_thread_link("thread-linked", "thr_runtime_2")
+            .expect("relink");
+        assert_eq!(
+            store
+                .get_runtime_thread_link("thread-linked")
+                .expect("read")
+                .as_deref(),
+            Some("thr_runtime_2")
+        );
+        assert!(
+            store
+                .set_runtime_thread_link("no-such-thread", "thr_runtime_3")
+                .is_err(),
+            "a link needs an existing thread"
+        );
+        store.delete_thread("thread-linked").expect("delete thread");
+        assert_eq!(
+            store
+                .get_runtime_thread_link("thread-linked")
+                .expect("read"),
+            None
+        );
     }
 
     #[test]

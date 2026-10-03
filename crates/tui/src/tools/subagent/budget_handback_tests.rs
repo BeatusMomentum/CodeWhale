@@ -44,7 +44,13 @@ async fn fixture(mode: &'static str, first_tokens: u64, max_steps: u32) -> Fixtu
     // Only these cases exercise wall/API timeouts. The other cases exercise
     // budget and report semantics, so leave room for full-suite scheduling.
     let timeout_case = matches!(mode, "hold" | "timeout" | "work-timeout");
-    let wall_time_secs = if timeout_case { 5 } else { 30 };
+    // "work-timeout" narrows its own deadline below; its 30s budget sizes the
+    // hand-back reserve and must not undercut that deadline.
+    let wall_time_secs = if matches!(mode, "hold" | "timeout") {
+        5
+    } else {
+        30
+    };
     let workspace = tempdir().unwrap();
     fs::write(
         workspace.path().join("README.md"),
@@ -106,17 +112,22 @@ async fn fixture(mode: &'static str, first_tokens: u64, max_steps: u32) -> Fixtu
         axum::serve(listener, app).await.unwrap();
     });
     let config = crate::config::Config {
-        api_key: Some("fixture-key".to_string()),
-        base_url: Some(format!("http://{address}/v1")),
         retry: Some(crate::config::RetryConfig {
             enabled: Some(false),
             max_retries: Some(0),
             initial_delay: Some(0.0),
             max_delay: Some(0.0),
             exponential_base: Some(1.0),
+            jitter: None,
+            jitter_factor: None,
+            respect_retry_after: None,
         }),
         ..Default::default()
-    };
+    }
+    .with_legacy_root(
+        Some("fixture-key".to_string()),
+        Some(format!("http://{address}/v1")),
+    );
     let manager = Arc::new(RwLock::new(
         SubAgentManager::new(workspace.path().to_path_buf(), 4)
             .with_state_path(workspace.path().join(".codewhale/subagents/state.json")),
@@ -129,7 +140,20 @@ async fn fixture(mode: &'static str, first_tokens: u64, max_steps: u32) -> Fixtu
     if mode == "work-timeout" {
         // A partly consumed original deadline leaves time to persist the
         // missing-coverage receipt after the in-flight call is abandoned.
-        spec.runtime_profile.wall_deadline_ms = Some(epoch_millis_now() + 2_000);
+        //
+        // The hand-back window is the reserve `wall_deadlines` carves off the
+        // hard deadline: `wall_time_secs * 100ms`. The shared 5s budget made
+        // that only 500ms, which had to cover the digest artifact, the
+        // unreported-usage state write, the pre-report checkpoint and the
+        // loopback connect before the report reached the server. On Windows
+        // CI it did not fit, so the report fell back without reaching the
+        // server (2 requests, not 3). A 30s budget reserves 3s. The work
+        // deadline lands 6s in: the first call, its tool, and the dispatch of
+        // the second call must all fit before it, and a loaded shared-process
+        // `cargo test --workspace` run overran the earlier 2s (#6698). The
+        // step API timeout below is longer than that, so the in-flight call
+        // is still abandoned by wall time, not by a step timeout.
+        spec.runtime_profile.wall_deadline_ms = Some(epoch_millis_now() + 9_000);
     }
     spec.launch_manifest = Some(serde_json::from_value(json!({
         "owner_session": "root", "child_id": "report-worker", "profile": spec.runtime_profile,
@@ -152,6 +176,10 @@ async fn fixture(mode: &'static str, first_tokens: u64, max_steps: u32) -> Fixtu
     runtime.accept_edits = false;
     runtime.step_api_timeout = if mode == "timeout" {
         Duration::from_millis(100)
+    } else if mode == "work-timeout" {
+        // Past the 6s work deadline, and bounding the held hand-back call
+        // no tighter than the 9s hard deadline already does.
+        Duration::from_secs(10)
     } else if timeout_case {
         Duration::from_secs(2)
     } else {
@@ -197,6 +225,7 @@ async fn fixture(mode: &'static str, first_tokens: u64, max_steps: u32) -> Fixtu
         started_at: Instant::now(),
         max_steps,
         wall_time: Duration::from_secs(wall_time_secs),
+        wall_ceiling_ms: None,
         input_rx,
         launch_gate: None,
         _foreground_child_registration: None,
@@ -1022,6 +1051,7 @@ fn assistant_message(content: Vec<ContentBlock>) -> Message {
 
 fn tool_use(name: &str, input: Value) -> ContentBlock {
     ContentBlock::ToolUse {
+        execution_id: None,
         id: format!("call_{name}"),
         name: name.to_string(),
         input,
@@ -1107,4 +1137,22 @@ fn fallback_partial_text_is_silent_only_when_nothing_was_recorded() {
         budget_handback::fallback_partial_text(&user_only)
             .contains("No assistant text was recorded")
     );
+}
+
+#[test]
+fn budget_repair_only_rewrites_the_newly_synthesized_final_execution() {
+    for (first, last) in [(Some("first"), Some("last")), (None, None)] {
+        let mut messages: Vec<Message> = serde_json::from_value(json!([
+            {"role":"assistant","content":[{"type":"tool_use","id":"reused","execution_id":first,"name":"read","input":{}}]},
+            {"role":"user","content":[{"type":"tool_result","tool_use_id":"reused","execution_id":first,"content":"earlier completed output"}]},
+            {"role":"assistant","content":[{"type":"tool_use","id":"reused","execution_id":last,"name":"read","input":{}}]}
+        ])).unwrap();
+        let earlier = messages[..2].to_vec();
+        budget_handback::repair_stopped_tool_calls(&mut messages, "fixture deadline");
+        assert_eq!(&messages[..2], earlier.as_slice());
+        assert!(
+            matches!(&messages[3].content[0], ContentBlock::ToolResult { execution_id, content, .. }
+            if execution_id.as_deref() == last && content.contains("budget_exhausted"))
+        );
+    }
 }

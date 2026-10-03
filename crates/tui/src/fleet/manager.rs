@@ -911,21 +911,25 @@ impl FleetManager {
 
         for worker_id in executor.worker_ids() {
             let tracked_attempt = executor.tracked_attempt(&worker_id);
-            if let Some(attempt) = tracked_attempt.as_ref()
-                && self
-                    .executor_task_context_for_attempt(&worker_id, attempt)?
-                    .is_none()
-            {
-                // The ledger advanced to another attempt (restart), or made
-                // this attempt terminal (cancel/stop), while this process was
-                // still alive. The executor owns the host handle, so fence and
-                // reap the old process without publishing any event against the
-                // replacement generation.
-                executor.stop_worker(&worker_id)?;
-                executor.forget_worker(&worker_id);
-                report.terminals += 1;
-                continue;
-            }
+            let tracked_task = match tracked_attempt.as_ref() {
+                Some(attempt) => {
+                    let Some(task) = self.executor_task_context_for_attempt(&worker_id, attempt)?
+                    else {
+                        // The ledger advanced to another attempt (restart), or
+                        // made this attempt terminal (cancel/stop), while this
+                        // process was still alive. The executor owns the host
+                        // handle, so fence and reap the old process without
+                        // publishing any event against the replacement
+                        // generation.
+                        executor.stop_worker(&worker_id)?;
+                        executor.forget_worker(&worker_id);
+                        report.terminals += 1;
+                        continue;
+                    };
+                    Some(task)
+                }
+                None => None,
+            };
             if tracked_attempt.is_none()
                 && let Some(_task) = self.cancelled_executor_task_context(&worker_id)?
             {
@@ -976,34 +980,43 @@ impl FleetManager {
                 report.events += 1;
             }
 
-            if let Some(terminal) = executor.poll_terminal_with_status(&worker_id) {
-                let task = if let Some(attempt) = tracked_attempt.as_ref() {
-                    self.executor_task_context_for_attempt(&worker_id, attempt)?
-                } else {
-                    self.executor_task_context(&worker_id)?
+            let Some(terminal) = executor.poll_terminal_with_status(&worker_id) else {
+                // Per-task wall-clock limit (R5), enforced on the live
+                // process: a worker that never exits must not hold its lease
+                // (and spend) forever. Stop it first, then finalize with an
+                // honest Timeout receipt.
+                let task = match tracked_task {
+                    Some(task) => Some(task),
+                    None => self.executor_task_context(&worker_id)?,
                 };
-                let Some(task) = task else {
-                    executor.forget_worker(&worker_id);
-                    continue;
-                };
-                // Per-task wall-clock limit (R5): the process is the
-                // completion authority, so a deadline kills the worker first
-                // and finalizes with an honest Timeout receipt afterwards.
-                if let Some(limit) = task_wall_clock_limit(&task.task_spec)
-                    && let Some(running) = executor.worker_running_for(&worker_id)
-                    && running >= limit
+                if let Some(task) = task
+                    && let Some(limit) = task_wall_clock_limit(&task.task_spec)
+                    && executor
+                        .worker_running_for(&worker_id)
+                        .is_some_and(|running| running >= limit)
                 {
                     executor.stop_worker(&worker_id)?;
                     executor.forget_worker(&worker_id);
                     self.record_task_timeout(&task, limit)?;
                     report.terminals += 1;
-                    continue;
                 }
-                if self.record_task_outcome(&task, terminal)? {
-                    report.terminals += 1;
-                }
+                continue;
+            };
+            // The process already exited: its exit is the completion
+            // authority, even when this tick observed it after the deadline.
+            let task = if let Some(attempt) = tracked_attempt.as_ref() {
+                self.executor_task_context_for_attempt(&worker_id, attempt)?
+            } else {
+                self.executor_task_context(&worker_id)?
+            };
+            let Some(task) = task else {
                 executor.forget_worker(&worker_id);
+                continue;
+            };
+            if self.record_task_outcome(&task, terminal)? {
+                report.terminals += 1;
             }
+            executor.forget_worker(&worker_id);
         }
 
         self.refresh_run_status(run_id)?;
@@ -2673,10 +2686,10 @@ mod tests {
         providers.zai.api_key = Some("test-key".to_string());
         Config {
             provider: Some("deepseek".to_string()),
-            api_key: Some("test-key".to_string()),
             providers: Some(providers),
             ..Config::default()
         }
+        .with_legacy_root(Some("test-key".to_string()), None)
     }
 
     fn select_test_fleet(workspace: &Path, members: &[(&str, &str)]) {
@@ -3287,6 +3300,27 @@ mod tests {
         corrupt.objective.push_str("\n\narbitrary stale prompt");
         corrupt.launch_manifest.as_mut().unwrap().prompt = corrupt.objective.clone();
         assert!(validate_registered_launch_spec(&corrupt, &task_b).is_err());
+    }
+
+    #[test]
+    fn configured_policy_prompt_keeps_registered_launch_spec_consistent() {
+        let tmp = TempDir::new().unwrap();
+        let exec = codewhale_config::FleetExecConfig {
+            append_system_prompt: "never push to main".to_string(),
+            ..Default::default()
+        };
+        // Registration and launch both derive the spec through the same
+        // hardening; a configured policy prompt must not make the registered
+        // spec disagree with its own persisted manifest prompt.
+        let hardened = bind_fleet_launch_attempt(
+            worker_runtime::apply_exec_hardening(
+                read_only_launch_spec(tmp.path(), "task-a", 1),
+                &exec,
+            ),
+            1,
+        );
+        validate_registered_launch_spec(&hardened, &hardened)
+            .expect("configured policy prompt must not fail launch preparation");
     }
 
     #[test]
@@ -3913,6 +3947,160 @@ mod tests {
     #[cfg(unix)]
     fn skip_if_process_table_unavailable() -> bool {
         !crate::fleet::host::process_table_inspection_available()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wall_clock_limit_stops_a_hung_worker_and_records_timeout() {
+        if skip_if_process_table_unavailable() {
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let manager = test_manager(tmp.path()).unwrap();
+        let mut spec = task("task-a");
+        spec.timeout_seconds = Some(1);
+        let path = task_spec_file(&tmp, vec![spec]);
+        let fake = fake_codewhale(
+            &tmp,
+            r#"#!/bin/sh
+printf '{"type":"content","content":"running"}\n'
+sleep 30
+"#,
+        );
+        let report = manager.create_run_from_task_spec_path(&path, 1).unwrap();
+        let mut executor = FleetExecutor::new(&manager.workspace);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+
+        let status = rt
+            .block_on(async {
+                tokio::time::timeout(
+                    Duration::from_secs(10),
+                    manager.run_to_completion(
+                        &report.run_id,
+                        1,
+                        &mut executor,
+                        &fake.display().to_string(),
+                        None,
+                        Duration::from_millis(20),
+                    ),
+                )
+                .await
+            })
+            .expect("a hung worker must be stopped at its wall-clock limit")
+            .unwrap();
+
+        assert_eq!(status.running, 0);
+        assert!(executor.worker_ids().is_empty());
+        let state = manager.rebuild_state().unwrap();
+        let key = task_key(&report.run_id.0, "task-a");
+        assert_eq!(state.tasks[&key].status, FleetTaskLedgerStatus::Failed);
+        assert_eq!(state.receipts[&key].result, FleetTaskResult::Timeout);
+    }
+
+    /// A worker that exits on its own keeps its real outcome even when the
+    /// tick that observes the exit runs after the wall-clock limit.
+    #[cfg(unix)]
+    #[test]
+    fn worker_exit_observed_after_the_deadline_keeps_its_real_outcome() {
+        if skip_if_process_table_unavailable() {
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let manager = test_manager(tmp.path()).unwrap();
+        let mut spec = task("task-a");
+        spec.timeout_seconds = Some(1);
+        spec.scorer = Some(FleetScorerSpec::ExitCode);
+        let path = task_spec_file(&tmp, vec![spec]);
+        let fake = fake_codewhale(
+            &tmp,
+            r#"#!/bin/sh
+sleep 0.2
+printf '{"type":"done"}\n'
+exit 0
+"#,
+        );
+        let report = manager.create_run_from_task_spec_path(&path, 1).unwrap();
+        let mut executor = FleetExecutor::new(&manager.workspace);
+        let binary = fake.display().to_string();
+
+        let started = manager
+            .drive_executor_tick(&report.run_id, &mut executor, &binary, None)
+            .unwrap();
+        assert_eq!(started.started, 1);
+        assert_eq!(started.terminals, 0, "the worker is still running");
+        // The worker exits well inside its limit; the next tick is late.
+        std::thread::sleep(Duration::from_millis(1_500));
+        let observed = manager
+            .drive_executor_tick(&report.run_id, &mut executor, &binary, None)
+            .unwrap();
+
+        assert_eq!(observed.terminals, 1);
+        assert!(executor.worker_ids().is_empty());
+        let state = manager.rebuild_state().unwrap();
+        let key = task_key(&report.run_id.0, "task-a");
+        assert_eq!(state.receipts[&key].result, FleetTaskResult::Pass);
+    }
+
+    /// An exit the executor already handed out (for example to a tick whose
+    /// ledger write then failed) is not "still running": a later tick past
+    /// the deadline must not stop it and record a Timeout over its outcome.
+    #[cfg(unix)]
+    #[test]
+    fn consumed_worker_exit_is_not_recorded_as_a_timeout() {
+        if skip_if_process_table_unavailable() {
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let manager = test_manager(tmp.path()).unwrap();
+        let mut spec = task("task-a");
+        spec.timeout_seconds = Some(1);
+        let path = task_spec_file(&tmp, vec![spec]);
+        let fake = fake_codewhale(
+            &tmp,
+            r#"#!/bin/sh
+sleep 0.2
+printf '{"type":"done"}\n'
+exit 0
+"#,
+        );
+        let report = manager.create_run_from_task_spec_path(&path, 1).unwrap();
+        let mut executor = FleetExecutor::new(&manager.workspace);
+        let binary = fake.display().to_string();
+        let started = manager
+            .drive_executor_tick(&report.run_id, &mut executor, &binary, None)
+            .unwrap();
+        assert_eq!(started.started, 1);
+        let worker_id = report.worker_ids[0].clone();
+        assert!(
+            executor.is_tracking(&worker_id),
+            "the worker is still running"
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let consumed = loop {
+            if let Some(terminal) = executor.poll_terminal_with_status(&worker_id) {
+                break terminal;
+            }
+            assert!(std::time::Instant::now() < deadline, "worker never exited");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert!(matches!(
+            consumed.payload,
+            FleetWorkerEventPayload::Completed { .. }
+        ));
+        assert_eq!(executor.worker_running_for(&worker_id), None);
+        std::thread::sleep(Duration::from_millis(1_200));
+
+        let late = manager
+            .drive_executor_tick(&report.run_id, &mut executor, &binary, None)
+            .unwrap();
+
+        assert_eq!(late.terminals, 0);
+        let state = manager.rebuild_state().unwrap();
+        let key = task_key(&report.run_id.0, "task-a");
+        assert!(
+            !state.receipts.contains_key(&key),
+            "no Timeout receipt may replace the consumed exit"
+        );
     }
 
     #[cfg(unix)]

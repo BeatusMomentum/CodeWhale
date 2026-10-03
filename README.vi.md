@@ -1,9 +1,9 @@
-<!-- source: README.md sha256:bbb8bfb61e57 -->
+<!-- source: README.md sha256:925619135f77 -->
 # Codewhale
 
 Codewhale là tác nhân mã nguồn mở có thể đọc dự án, chỉnh sửa tệp, chạy lệnh và kiểm tra công việc của mình bằng mô hình do nhà cung cấp lưu trữ hoặc mô hình cục bộ mà bạn chọn. Hãy bắt đầu với một tác vụ trong terminal. Với công việc lớn hơn, bạn có thể giao từng phần cho các tác nhân dùng mô hình và đảm nhiệm vai trò khác nhau.
 
-![Codewhale đang chạy trong terminal](web/public/codewhale-tui-d7a9a1c.png)
+![Codewhale đang chạy trong terminal](web/public/codewhale-tui-5765d80.png)
 
 *Hình xem trước terminal từ bản dựng phát triển v0.10.0.*
 
@@ -23,6 +23,8 @@ curl -fsSL https://codewhale.net/install.sh | sh
 "$HOME/.local/bin/codewhale"
 ```
 
+Nếu chạy `codewhale` trực tiếp mà báo "command not found", nghĩa là `~/.local/bin` chưa nằm trong PATH của bạn: hãy chạy dòng lệnh mà trình cài đặt in ra cho shell của bạn, hoặc xem [Thêm vào PATH](docs/INSTALL.md#put-it-on-your-path).
+
 Trình cài đặt chọn bản phát hành mới nhất đã được công bố. [Nhật ký thay đổi](CHANGELOG.md) cũng mô tả bản ứng viên chưa công bố của lần phát hành tiếp theo; những thay đổi đó chỉ có trong các bản tải xuống công khai khi bản phát hành tương ứng được công bố.
 
 Trên Windows, tải bộ cài hoặc gói lưu trữ phù hợp từ [GitHub Releases](https://github.com/Hmbown/CodeWhale/releases/latest). Với bản cài trực tiếp đã có, chạy `codewhale update`; dùng `codewhale update --check` nếu chỉ muốn kiểm tra. Trình cập nhật hiển thị đường dẫn tệp thực thi và giữ lại các bản dựng mới hơn. npm và Cargo là lựa chọn phụ; xem [hướng dẫn cài đặt](docs/INSTALL.md) để chuyển từ trình quản lý gói và thiết lập PATH.
@@ -33,7 +35,7 @@ Mỗi shell chỉ cần một lệnh để bật tính năng hoàn thành bằng
 
 ## Sử dụng
 
-Mở terminal trong thư mục dự án và chạy `codewhale`. Chọn nhà cung cấp bằng `/provider` và mô hình bằng `/model`. Sau đó mô tả một tác vụ cụ thể:
+Mở terminal trong thư mục dự án và chạy `codewhale` (sau khi nó đã [nằm trong PATH](docs/INSTALL.md#put-it-on-your-path)). Chọn nhà cung cấp bằng `/provider` và mô hình bằng `/model`. Sau đó mô tả một tác vụ cụ thể:
 
 ```text
 Fix the failing tests and explain what changed.
@@ -76,6 +78,7 @@ Codewhale chạy trên máy của bạn với quyền truy cập do bạn cấp.
 
 ## Tài liệu
 
+- [Thiết lập đánh giá PR trên GitHub](docs/GITHUB_ACTION.md)
 - [Nhà cung cấp và mô hình cục bộ](docs/PROVIDERS.md)
 - [Nhóm tác nhân](docs/FLEET.md)
 - [MCP](docs/MCP.md), [hook](docs/HOOKS.md) và [cấu hình](docs/CONFIGURATION.md)

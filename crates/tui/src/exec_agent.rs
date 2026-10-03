@@ -388,7 +388,7 @@ pub(crate) async fn run_exec_agent(
         Some(&effective_model),
     )
     .map_err(anyhow::Error::msg)?
-    .validate()
+    .validate_for(crate::route_runtime::RouteErrorSurface::Headless)
     .map_err(anyhow::Error::msg)?;
     let effective_provider_name = validated_route.identity.key.clone();
     let effective_provider_id = validated_route.identity.exact_id.clone();
@@ -540,7 +540,9 @@ pub(crate) async fn run_exec_agent(
         mcp_oauth_callback_port: None,
         mcp_oauth_callback_url: None,
         skills_dir: execution_config.skills_dir(),
-        skills_scan_codewhale_only: execution_config.skills_config().scan_codewhale_only(),
+        skills_discovery_mode: crate::skills::SkillDiscoveryMode::from_config(
+            &execution_config.skills_config(),
+        ),
         instructions: {
             let mut instrs: Vec<crate::prompts::InstructionSource> = execution_config
                 .instructions_paths()
@@ -584,6 +586,8 @@ pub(crate) async fn run_exec_agent(
             .snapshots_config()
             .max_workspace_gb
             .saturating_mul(1024 * 1024 * 1024),
+        // No host here records snapshot receipts.
+        record_restore_points: false,
         lsp_config,
         runtime_services,
         subagent_model_overrides: execution_config.subagent_model_overrides(),
@@ -601,6 +605,8 @@ pub(crate) async fn run_exec_agent(
         turn_wall_clock: execution_config.turn_wall_clock(),
         stream_max_content_bytes: execution_config.stream_max_content_bytes(),
         stream_max_duration: execution_config.stream_max_duration(),
+        stream_retry_limits: execution_config.stream_retry_limits(),
+        stream_open_timeout: execution_config.stream_open_timeout(),
         subagent_heartbeat_timeout: std::time::Duration::from_secs(
             execution_config.subagent_heartbeat_timeout_secs_for_provider(effective_provider),
         ),
@@ -760,6 +766,8 @@ pub(crate) async fn run_exec_agent(
             },
             verbosity: execution_config.verbosity.clone(),
             provenance: crate::core::ops::UserInputProvenance::ExternalUser,
+            // Headless exec does not correlate submissions.
+            submission_id: None,
         }))
         .await?;
 
@@ -810,10 +818,12 @@ pub(crate) async fn run_exec_agent(
     let mut ends_with_newline = false;
     // One absolute host deadline includes every autonomous child fan-in turn;
     // child-specific shorter deadlines remain enforced by their runtime.
-    let mut events = ExecAgentEvents::new(
-        engine_handle.clone(),
-        exec_turn_started_at + execution_config.turn_wall_clock(),
-    );
+    // The default wall clock is unbounded (`Duration::MAX`); a century
+    // stands in for "never" without overflowing `Instant`.
+    let exec_deadline = exec_turn_started_at
+        .checked_add(execution_config.turn_wall_clock())
+        .unwrap_or_else(|| exec_turn_started_at + Duration::from_secs(100 * 365 * 86_400));
+    let mut events = ExecAgentEvents::new(engine_handle.clone(), exec_deadline);
     loop {
         let Some(event) = events.next().await else {
             break;
@@ -854,7 +864,9 @@ pub(crate) async fn run_exec_agent(
                     )
                 );
             }
-            Event::ToolCallStarted { id, name, input } => {
+            Event::ToolCallStarted {
+                id, name, input, ..
+            } => {
                 let started_at = chrono::Utc::now().to_rfc3339();
                 tool_starts.insert(id.clone(), (Instant::now(), started_at.clone()));
                 if output_format == ExecOutputFormat::StreamJson {
@@ -1024,12 +1036,18 @@ pub(crate) async fn run_exec_agent(
             {
                 emit_exec_stream_event(&ExecStreamEvent::WorkflowEvent { run_id, event })?;
             }
+            // Headless runs have no person at the prompt: the run's flags
+            // (the posture) answer every request.
             Event::ApprovalRequired { id, .. } => {
                 if auto_approve {
-                    let _ = engine_handle.approve_tool_call(id).await;
+                    let _ = engine_handle
+                        .approve_tool_call_by(id, crate::approval_log::ApprovalDecider::Posture)
+                        .await;
                 } else {
                     approval_required = true;
-                    let _ = engine_handle.deny_tool_call(id).await;
+                    let _ = engine_handle
+                        .deny_tool_call_by(id, crate::approval_log::ApprovalDecider::Posture)
+                        .await;
                 }
             }
             Event::ElevationRequired {
@@ -1040,7 +1058,13 @@ pub(crate) async fn run_exec_agent(
             } => {
                 if can_elevate_sandbox {
                     let policy = crate::sandbox::SandboxPolicy::DangerFullAccess;
-                    let _ = engine_handle.retry_tool_with_policy(tool_id, policy).await;
+                    let _ = engine_handle
+                        .retry_tool_with_policy_by(
+                            tool_id,
+                            policy,
+                            crate::approval_log::ApprovalDecider::Posture,
+                        )
+                        .await;
                 } else {
                     sandbox_denied = true;
                     approval_required = true;
@@ -1064,7 +1088,9 @@ pub(crate) async fn run_exec_agent(
                             outcome: "approval_required".to_string(),
                         })?;
                     }
-                    let _ = engine_handle.deny_tool_call(tool_id).await;
+                    let _ = engine_handle
+                        .deny_tool_call_by(tool_id, crate::approval_log::ApprovalDecider::Posture)
+                        .await;
                 }
             }
             Event::Error {
@@ -1469,6 +1495,9 @@ pub(crate) async fn run_exec_agent(
         // the process level without parsing the stream. Genuine failures
         // keep the historical `bail!` → exit 1 path.
         let exit_code = exec_failure_exit_code(summary.error_category.as_deref());
+        // The final line always carries the message: automation greps it and
+        // a caller may keep only the last stderr line, even when the stream
+        // already printed the same error above.
         if exit_code != 1 {
             eprintln!("Error: exec turn failed: {error}");
             let _ = io::stdout().flush();
@@ -1491,6 +1520,7 @@ pub(crate) async fn run_exec_agent(
 #[cfg(test)]
 mod tests {
     use super::{ExecAgentEvents, exec_automation_services, exec_disallowed_tools};
+
     use crate::core::engine::mock_engine_handle;
     use crate::core::engine::tool_catalog::REQUEST_USER_INPUT_NAME;
     use crate::core::events::{Event, TurnOutcomeStatus};

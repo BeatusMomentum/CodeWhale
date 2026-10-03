@@ -78,8 +78,8 @@ fn mark_workspace_trusted(workspace: &Path) -> WorkspaceTrustConfigGuard {
 #[test]
 fn test_mcp_config_defaults() {
     let config = McpConfig::default();
-    assert_eq!(config.timeouts.connect_timeout, 10);
-    assert_eq!(config.timeouts.execute_timeout, 60);
+    assert_eq!(config.timeouts.connect_timeout, 30);
+    assert_eq!(config.timeouts.execute_timeout, 1800);
     assert_eq!(config.timeouts.read_timeout, 120);
     assert!(config.servers.is_empty());
 }
@@ -1946,6 +1946,48 @@ async fn plugin_stdio_does_not_surface_reviewed_child_stderr() {
     assert!(!error.contains("ARBITRARY_PLUGIN_CREDENTIAL"));
 }
 
+/// Shutdown reaches what the server started, not only the server: a
+/// background grandchild (an `npx` wrapper's node, a shell job) must not
+/// survive the transport.
+#[cfg(unix)]
+#[tokio::test]
+async fn stdio_shutdown_also_terminates_the_servers_grandchildren() {
+    let mut config = test_server_config();
+    config.command = Some("sh".to_string());
+    config.args = vec!["-c".to_string(), "sleep 300 & echo $!; wait".to_string()];
+    let mut transport = StdioTransport::spawn(
+        "grandparent",
+        "sh",
+        &config,
+        tokio_util::sync::CancellationToken::new(),
+    )
+    .unwrap();
+    let line = tokio::time::timeout(Duration::from_secs(5), transport.recv())
+        .await
+        .expect("grandchild pid line")
+        .unwrap();
+    let grandchild: i32 = String::from_utf8(line).unwrap().trim().parse().unwrap();
+
+    transport.shutdown().await;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        // SAFETY: signal 0 only probes whether the pid still exists.
+        if unsafe { libc::kill(grandchild, 0) } != 0 {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            // Do not leak the sleeper past a failing run.
+            // SAFETY: plain kill(2) of the pid this test started.
+            unsafe {
+                libc::kill(grandchild, libc::SIGKILL);
+            }
+            panic!("the MCP server's grandchild outlived the transport");
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 /// #6187: a crashed stdio child must stop reading as "ready" before any
 /// call is in flight — `is_ready` probes the child, so the pool rebuilds
 /// the connection on the next use instead of handing the dead transport
@@ -2805,7 +2847,10 @@ fn test_server_effective_timeouts() {
     };
 
     assert_eq!(server_with_override.effective_connect_timeout(&global), 20);
-    assert_eq!(server_with_override.effective_execute_timeout(&global), 60); // global default
+    assert_eq!(
+        server_with_override.effective_execute_timeout(&global),
+        1800
+    ); // global default
     assert_eq!(server_with_override.effective_read_timeout(&global), 180);
 }
 
@@ -2881,6 +2926,21 @@ impl McpTransport for ScriptedThenHangingTransport {
             Some(response) => Ok(response),
             None => std::future::pending().await,
         }
+    }
+}
+
+/// A transport that answers inside `send`, as Streamable HTTP reads the reply
+/// within the POST, and never finishes that send.
+struct HangingSendTransport;
+
+#[async_trait::async_trait]
+impl McpTransport for HangingSendTransport {
+    async fn send(&mut self, _msg: Vec<u8>) -> Result<()> {
+        std::future::pending().await
+    }
+
+    async fn recv(&mut self) -> Result<Vec<u8>> {
+        std::future::pending().await
     }
 }
 
@@ -2960,12 +3020,14 @@ fn test_connection(transport: Box<dyn McpTransport>) -> McpConnection {
         state: ConnectionState::Ready,
         config: test_server_config(),
         server_capabilities: None,
+        instructions: None,
         discovery_timeout: Duration::from_secs(default_connect_timeout()),
         read_timeout_secs: default_read_timeout(),
         cancel_token: tokio_util::sync::CancellationToken::new(),
         authority_revocation_reason: Arc::new(std::sync::Mutex::new(None)),
         authority_watch: None,
         catalog_generation: 0,
+        decision_key: None,
     }
 }
 
@@ -3045,6 +3107,126 @@ IFS= read -r keep_open
 
 fn json_frame(value: serde_json::Value) -> Vec<u8> {
     serde_json::to_vec(&value).unwrap()
+}
+
+#[test]
+fn http_request_ceiling_covers_the_execute_budget() {
+    let mut config = test_server_config();
+    config.execute_timeout = Some(1800);
+    config.read_timeout = Some(120);
+    let global = McpTimeouts {
+        connect_timeout: 10,
+        execute_timeout: 1800,
+        read_timeout: 120,
+    };
+    assert_eq!(http_request_ceiling_secs(&config, &global), 1800);
+
+    // A per-server read knob above both stays intact.
+    config.read_timeout = Some(3600);
+    assert_eq!(http_request_ceiling_secs(&config, &global), 3600);
+}
+
+/// A transport that stays silent for a fixed delay, then answers with a
+/// matching result — the shape of an MCP server executing a long tool call.
+struct DelayedResponseTransport {
+    delay: Duration,
+    pending: Option<Vec<u8>>,
+}
+
+#[async_trait::async_trait]
+impl McpTransport for DelayedResponseTransport {
+    async fn send(&mut self, msg: Vec<u8>) -> Result<()> {
+        // Echo the request id so every call gets its matching response.
+        let request: serde_json::Value = serde_json::from_slice(&msg)?;
+        let response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": request["id"].clone(),
+            "result": {"ok": true}
+        });
+        self.pending = Some(json_frame(response));
+        Ok(())
+    }
+
+    async fn recv(&mut self) -> Result<Vec<u8>> {
+        tokio::time::sleep(self.delay).await;
+        self.pending.take().context("delayed transport exhausted")
+    }
+}
+
+#[tokio::test]
+async fn a_tool_response_after_the_read_knob_still_completes_within_the_execute_budget() {
+    let mut connection = test_connection(Box::new(DelayedResponseTransport {
+        // The response arrives after the read knob (1s) but well inside the
+        // execute budget (30s): the read knob must not bound a request's
+        // receive and mark the connection dead before the reply lands.
+        delay: Duration::from_millis(1500),
+        pending: None,
+    }));
+    connection.read_timeout_secs = 1;
+    let result = connection
+        .call_tool("slow", serde_json::json!({}), 30)
+        .await
+        .expect("a silent tool execution must not be cut off by the read knob");
+    assert_eq!(result, serde_json::json!({"ok": true}));
+    assert!(
+        connection.is_ready(),
+        "a completed call keeps the connection"
+    );
+}
+
+/// A wedged server fails a request at the request's own budget, and the
+/// request is abandoned, not the connection: its late reply carries the
+/// abandoned id and is skipped (see the stdio fixtures below). The read knob
+/// (1s) and the budget (2s) are distinct on purpose: equal deadlines used to
+/// race, and whichever timer won decided whether the connection survived.
+/// The per-frame read-knob disconnect is still pinned for the handshake by
+/// `recv_times_out_waiting_for_mcp_response_and_disconnects`.
+#[tokio::test]
+async fn a_wedged_request_fails_at_its_own_budget_and_keeps_the_connection() {
+    let mut connection = test_connection(Box::new(HangingValueTransport {
+        sent: Arc::new(Mutex::new(Vec::new())),
+    }));
+    connection.read_timeout_secs = 1;
+    let error = connection
+        .read_resource("file:///wedged", 2)
+        .await
+        .expect_err("a wedged server must fail the request at its budget");
+    assert!(
+        error
+            .to_string()
+            .contains("MCP method 'resources/read' on server 'mock' timed out after 2s"),
+        "the request budget, not the read knob, must end the request: {error:#}"
+    );
+    assert!(
+        connection.is_ready(),
+        "an expired request must not declare the connection dead"
+    );
+}
+
+/// A request whose transport blocks inside `send` (Streamable HTTP) still
+/// ends at its own budget, not at the transport's larger client ceiling, and
+/// the connection is rebuilt because the abandoned write may be partial.
+#[tokio::test]
+async fn a_request_blocked_inside_send_ends_at_its_own_budget() {
+    let mut connection = test_connection(Box::new(HangingSendTransport));
+    connection.read_timeout_secs = 30;
+    let error = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        connection.read_resource("file:///wedged-post", 1),
+    )
+    .await
+    .expect("the request budget, not the transport, must end a blocked send")
+    .expect_err("a POST that never completes must end at the request budget");
+    assert!(
+        error
+            .to_string()
+            .contains("MCP method 'resources/read' on server 'mock' timed out after 1s"),
+        "{error:#}"
+    );
+    assert!(
+        !connection.is_ready(),
+        "a send abandoned mid-write leaves the frame boundary unknown, so the connection is rebuilt"
+    );
 }
 
 #[tokio::test]
@@ -5119,6 +5301,7 @@ async fn stdio_transport_shutdown_terminates_child() {
         stderr_tail: StderrTail::new(),
         authority_cancel_watch: None,
         _reviewed_launch: None,
+        process_tree: None,
     };
 
     // shutdown() should send SIGTERM and complete within the grace window.
@@ -5248,6 +5431,7 @@ async fn stdio_transport_recv_error_includes_stderr_tail() {
         stderr_tail,
         authority_cancel_watch: None,
         _reviewed_launch: None,
+        process_tree: None,
     };
 
     // Give the subprocess time to write its stderr line and exit.
@@ -6035,51 +6219,58 @@ async fn legacy_sse_session_expiry_is_marked_stale() {
     server.abort();
 }
 
-#[tokio::test]
-async fn legacy_sse_closed_stream_reconnects_and_retries_tool_call() {
-    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::{TcpListener, TcpStream};
-    use tokio::sync::mpsc;
-
-    async fn read_http_request(socket: &mut TcpStream) -> (String, serde_json::Value) {
-        let mut request = Vec::new();
-        let mut buf = [0; 4096];
-        let header_end = loop {
-            let n = socket.read(&mut buf).await.unwrap();
-            if n == 0 {
-                return (String::new(), serde_json::Value::Null);
-            }
-            request.extend_from_slice(&buf[..n]);
-            if let Some(pos) = request.windows(4).position(|w| w == b"\r\n\r\n") {
-                break pos + 4;
-            }
-        };
-        let headers = String::from_utf8_lossy(&request[..header_end]).to_string();
-        let content_length = headers
-            .lines()
-            .find_map(|line| {
-                let (name, value) = line.split_once(':')?;
-                name.eq_ignore_ascii_case("content-length")
-                    .then(|| value.trim().parse::<usize>().ok())
-                    .flatten()
-            })
-            .unwrap_or(0);
-        while request.len() < header_end + content_length {
-            let n = socket.read(&mut buf).await.unwrap();
-            if n == 0 {
-                return (headers, serde_json::Value::Null);
-            }
-            request.extend_from_slice(&buf[..n]);
+/// Read one HTTP/1.1 request from a legacy SSE test server socket.
+async fn read_legacy_sse_http_request(
+    socket: &mut tokio::net::TcpStream,
+) -> (String, serde_json::Value) {
+    let mut request = Vec::new();
+    let mut buf = [0; 4096];
+    let header_end = loop {
+        let n = tokio::io::AsyncReadExt::read(socket, &mut buf)
+            .await
+            .unwrap();
+        if n == 0 {
+            return (String::new(), serde_json::Value::Null);
         }
-        let body = &request[header_end..header_end + content_length];
-        let json = if body.is_empty() {
-            serde_json::Value::Null
-        } else {
-            serde_json::from_slice(body).unwrap()
-        };
-        (headers, json)
+        request.extend_from_slice(&buf[..n]);
+        if let Some(pos) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+            break pos + 4;
+        }
+    };
+    let headers = String::from_utf8_lossy(&request[..header_end]).to_string();
+    let content_length = headers
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().ok())
+                .flatten()
+        })
+        .unwrap_or(0);
+    while request.len() < header_end + content_length {
+        let n = tokio::io::AsyncReadExt::read(socket, &mut buf)
+            .await
+            .unwrap();
+        if n == 0 {
+            return (headers, serde_json::Value::Null);
+        }
+        request.extend_from_slice(&buf[..n]);
     }
+    let body = &request[header_end..header_end + content_length];
+    let json = if body.is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::from_slice(body).unwrap()
+    };
+    (headers, json)
+}
+
+#[tokio::test]
+async fn legacy_sse_closed_stream_reports_unknown_outcome_and_reconnects_without_replay() {
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpListener;
+    use tokio::sync::mpsc;
 
     // A concurrent proxy fixture changes process-wide HTTP_PROXY/NO_PROXY.
     // Hold the environment guard before the loopback guard, as other MCP
@@ -6108,7 +6299,7 @@ async fn legacy_sse_closed_stream_reconnects_and_retries_tool_call() {
             let tool_call_count = Arc::clone(&server_tool_call_count);
             let success_seen = Arc::clone(&server_success_seen);
             tokio::spawn(async move {
-                let (headers, request_json) = read_http_request(&mut socket).await;
+                let (headers, request_json) = read_legacy_sse_http_request(&mut socket).await;
                 if headers.starts_with("GET /sse ") {
                     get_count.fetch_add(1, AtomicOrdering::SeqCst);
                     let (tx, mut rx) = mpsc::unbounded_channel::<Option<String>>();
@@ -6244,11 +6435,24 @@ async fn legacy_sse_closed_stream_reconnects_and_retries_tool_call() {
     );
     let mut pool = McpPool::new(cfg);
 
+    // The server received the call and then closed the stream: it may have
+    // run the tool, so the call must fail as unknown instead of replaying.
+    let err = pool
+        .call_tool("mcp_dephy_search", serde_json::json!({ "query": "dephy" }))
+        .await
+        .expect_err("a call whose transport closed mid-flight must not be replayed");
+    assert!(
+        format!("{err:#}").contains("outcome unknown, not retried"),
+        "unexpected error: {err:#}"
+    );
+    assert_eq!(tool_call_count.load(AtomicOrdering::SeqCst), 1);
+    assert!(!success_seen.load(AtomicOrdering::SeqCst));
+
+    // The dead connection was dropped, so the next call reconnects.
     let result = pool
         .call_tool("mcp_dephy_search", serde_json::json!({ "query": "dephy" }))
         .await
         .unwrap();
-
     assert_eq!(
         result,
         serde_json::json!({ "content": [{ "type": "text", "text": "ok" }] })
@@ -6256,6 +6460,152 @@ async fn legacy_sse_closed_stream_reconnects_and_retries_tool_call() {
     assert_eq!(tool_call_count.load(AtomicOrdering::SeqCst), 2);
     assert_eq!(get_count.load(AtomicOrdering::SeqCst), 2);
     assert!(success_seen.load(AtomicOrdering::SeqCst));
+
+    server.abort();
+}
+
+/// Servers without an explicit `transport = "sse"` reach legacy SSE through
+/// the Streamable HTTP fallback, inside `HttpTransport`. An event stream that
+/// closes while idle must read as not ready there too, so the next call
+/// reconnects before it dispatches instead of losing the result.
+#[tokio::test]
+async fn fallback_sse_stream_closed_while_idle_reconnects_before_dispatch() {
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpListener;
+    use tokio::sync::mpsc;
+
+    let _env = crate::test_support::lock_test_env();
+    let _lock = lock_mcp_loopback_tests().await;
+    let _no_proxy = crate::test_support::EnvVarGuard::set("NO_PROXY", "*");
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let active_sse = Arc::new(Mutex::new(None::<mpsc::UnboundedSender<Option<String>>>));
+    let initialize_count = Arc::new(AtomicUsize::new(0));
+    let tool_call_count = Arc::new(AtomicUsize::new(0));
+    let server_active_sse = Arc::clone(&active_sse);
+    let server_initialize_count = Arc::clone(&initialize_count);
+    let server_tool_call_count = Arc::clone(&tool_call_count);
+
+    let server = tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            let active_sse = Arc::clone(&server_active_sse);
+            let initialize_count = Arc::clone(&server_initialize_count);
+            let tool_call_count = Arc::clone(&server_tool_call_count);
+            tokio::spawn(async move {
+                let (headers, request_json) = read_legacy_sse_http_request(&mut socket).await;
+                if headers.starts_with("GET /mcp ") {
+                    // The session preflight and the fallback stream both land
+                    // here; the later GET replaces the earlier stream.
+                    let (tx, mut rx) = mpsc::unbounded_channel::<Option<String>>();
+                    *active_sse.lock().unwrap() = Some(tx);
+                    let opened = socket
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\nevent: endpoint\ndata: /messages\n\n")
+                        .await;
+                    if opened.is_err() {
+                        return;
+                    }
+                    while let Some(Some(message)) = rx.recv().await {
+                        let event = format!("event: message\ndata: {message}\n\n");
+                        if socket.write_all(event.as_bytes()).await.is_err() {
+                            return;
+                        }
+                    }
+                    return;
+                }
+                if headers.starts_with("POST /mcp ") {
+                    // No Streamable HTTP: the client falls back to legacy SSE.
+                    let _ = socket
+                        .write_all(b"HTTP/1.1 405 Method Not Allowed\r\nConnection: close\r\nContent-Length: 0\r\n\r\n")
+                        .await;
+                    return;
+                }
+                if !headers.starts_with("POST /messages ") {
+                    return;
+                }
+                let _ = socket
+                    .write_all(
+                        b"HTTP/1.1 202 Accepted\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+                    )
+                    .await;
+                let method = request_json
+                    .get("method")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                let result = match method {
+                    "notifications/initialized" => return,
+                    "initialize" => {
+                        initialize_count.fetch_add(1, AtomicOrdering::SeqCst);
+                        serde_json::json!({
+                            "protocolVersion": "2024-11-05",
+                            "capabilities": {"tools": {}}
+                        })
+                    }
+                    "tools/list" => serde_json::json!({
+                        "tools": [{ "name": "search", "inputSchema": {} }]
+                    }),
+                    "resources/list" => serde_json::json!({ "resources": [] }),
+                    "resources/templates/list" => serde_json::json!({ "resourceTemplates": [] }),
+                    "prompts/list" => serde_json::json!({ "prompts": [] }),
+                    "tools/call" => {
+                        tool_call_count.fetch_add(1, AtomicOrdering::SeqCst);
+                        serde_json::json!({ "content": [{ "type": "text", "text": "ok" }] })
+                    }
+                    other => panic!("unexpected method: {other}"),
+                };
+                let response = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": request_json.get("id").cloned().unwrap_or(serde_json::Value::Null),
+                    "result": result
+                })
+                .to_string();
+                let tx = active_sse.lock().unwrap().as_ref().cloned();
+                if let Some(tx) = tx {
+                    let _ = tx.send(Some(response));
+                }
+            });
+        }
+    });
+
+    let mut cfg = McpConfig::default();
+    let mut server_config = test_server_config();
+    server_config.command = None;
+    server_config.url = Some(format!("http://{addr}/mcp"));
+    server_config.connect_timeout = Some(10);
+    server_config.execute_timeout = Some(10);
+    cfg.servers.insert("fallback".to_string(), server_config);
+    let mut pool = McpPool::new(cfg);
+    let ok = serde_json::json!({ "content": [{ "type": "text", "text": "ok" }] });
+
+    let result = pool
+        .call_tool("mcp_fallback_search", serde_json::json!({}))
+        .await
+        .unwrap();
+    assert_eq!(result, ok);
+
+    // The server ends the event stream while the connection is idle.
+    let stream = active_sse
+        .lock()
+        .unwrap()
+        .take()
+        .expect("fallback stream open");
+    stream.send(None).unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while pool.connections["fallback"].is_transport_ready() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "a closed fallback SSE stream must stop reading as ready"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // The next call reconnects first, so it is dispatched once and answered.
+    let result = pool
+        .call_tool("mcp_fallback_search", serde_json::json!({}))
+        .await
+        .unwrap();
+    assert_eq!(result, ok);
+    assert_eq!(tool_call_count.load(AtomicOrdering::SeqCst), 2);
+    assert_eq!(initialize_count.load(AtomicOrdering::SeqCst), 2);
 
     server.abort();
 }
@@ -6514,6 +6864,419 @@ fn removed_runtime_server_config_can_be_retried_with_same_name() {
     pool.remove_runtime_server_config("retryable");
     pool.add_runtime_server_config("retryable".to_string(), config)
         .expect("rollback must release the deterministic runtime name");
+}
+
+#[tokio::test]
+async fn mcp_initialize_sends_empty_client_capabilities_and_accepts_2025_11_25() {
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let transport = ScriptedValueTransport {
+        sent: Arc::clone(&sent),
+        responses: VecDeque::from([json_frame(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "protocolVersion": "2025-11-25",
+                "serverInfo": {"name": "current-sdk", "version": "1.0.0"},
+                "capabilities": {"tools": {}}
+            }
+        }))]),
+    };
+    let mut conn = test_connection(Box::new(transport));
+
+    conn.initialize()
+        .await
+        .expect("a 2025-11-25 server must complete the handshake");
+
+    let sent = sent.lock().unwrap();
+    let initialize = sent
+        .iter()
+        .find(|message| message["method"] == "initialize")
+        .expect("initialize sent");
+    assert_eq!(
+        initialize["params"],
+        serde_json::json!({
+            "protocolVersion": MCP_PROTOCOL_VERSION,
+            "clientInfo": {"name": "codewhale-tui", "version": env!("CARGO_PKG_VERSION")},
+            "capabilities": {}
+        }),
+        "client capabilities must not declare server-side tools/resources/prompts"
+    );
+}
+
+#[tokio::test]
+async fn mcp_initialize_rejection_from_expired_aws_sso_names_the_login_command() {
+    let transport = ScriptedValueTransport {
+        sent: Arc::new(Mutex::new(Vec::new())),
+        responses: VecDeque::from([json_frame(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "error": {
+                "code": -32602,
+                "message": "Error retrieving credentials: The SSO session associated with this profile has expired or is otherwise invalid."
+            }
+        }))]),
+    };
+    let mut conn = test_connection(Box::new(transport));
+    conn.config.args = vec![
+        "mcp-proxy-for-aws@1.6.4".to_string(),
+        "--profile".to_string(),
+        "work-sso".to_string(),
+    ];
+
+    let error = format!("{:#}", conn.initialize().await.expect_err("rejected"));
+    assert!(
+        error.contains(
+            "run `aws sso login --profile work-sso` in a terminal, then `/mcp retry mock`"
+        ),
+        "{error}"
+    );
+    assert_eq!(
+        mcp_recovery_kind(true, true, false, Some(&error), false),
+        Some(McpRecoveryKind::AwsLogin)
+    );
+}
+
+#[test]
+fn mcp_recovery_kind_routes_expired_aws_credentials_to_external_login() {
+    for stderr in [
+        "The SSO session associated with this profile has expired or is otherwise invalid. To refresh this SSO session run aws sso login with the corresponding profile.",
+        "Error loading SSO Token: Token for my-sso does not exist",
+        "An error occurred (ExpiredTokenException) when calling the GetCallerIdentity operation: The security token included in the request is expired",
+        // An expired AWS token that also says 401/Unauthorized must not be
+        // routed to `/mcp login`, an OAuth flow that cannot renew it.
+        "UnauthorizedException (401): AWS token has expired",
+    ] {
+        assert_eq!(
+            mcp_recovery_kind(true, true, false, Some(stderr), false),
+            Some(McpRecoveryKind::AwsLogin),
+            "{stderr}"
+        );
+    }
+    // Unrelated text that merely shares substrings stays where it was.
+    for (stderr, expected) in [
+        ("processor token invalid", McpRecoveryKind::Diagnose),
+        ("401 Unauthorized", McpRecoveryKind::Reauth),
+        (
+            "oauth token expired; invalid_grant",
+            McpRecoveryKind::Reauth,
+        ),
+        (
+            "laws of token expiry were expired",
+            McpRecoveryKind::Diagnose,
+        ),
+    ] {
+        assert_eq!(
+            mcp_recovery_kind(true, true, false, Some(stderr), false),
+            Some(expected),
+            "{stderr}"
+        );
+    }
+    assert_eq!(
+        McpRecoveryKind::AwsLogin.slash_command("aws"),
+        "/mcp retry aws"
+    );
+    assert_eq!(
+        McpRecoveryKind::AwsLogin.slash_command("name with spaces"),
+        "/mcp reload"
+    );
+
+    let mut config = test_server_config();
+    assert_eq!(
+        aws_login_hint(&config, "aws", ""),
+        "AWS credentials expired: run `aws sso login` in a terminal, then `/mcp retry aws`"
+    );
+    config
+        .env
+        .insert("AWS_PROFILE".to_string(), "from-env".to_string());
+    assert!(aws_login_hint(&config, "aws", "").contains("aws sso login --profile from-env"));
+    config.args = vec!["--profile=from-arg".to_string()];
+    assert!(aws_login_hint(&config, "aws", "").contains("aws sso login --profile from-arg"));
+    // A profile the shell could misread is left out rather than quoted.
+    config.args = vec!["--profile".to_string(), "x; rm -rf ~".to_string()];
+    config.env.clear();
+    assert!(aws_login_hint(&config, "aws", "").contains("run `aws sso login` in"));
+    config.args = vec!["--profile=--no-sign-request".to_string()];
+    assert!(aws_login_hint(&config, "aws", "").contains("run `aws sso login` in"));
+}
+
+/// Review of #6789: the AWS-before-OAuth ordering lived only in the free
+/// classifier, while the panel read the typed needs-auth flag first. A stdio
+/// AWS proxy whose token expired with `401`/`Unauthorized` wording must not
+/// enter the needs-auth set, must not read `auth_required`, and its row must
+/// route to the in-place retry with the login command in the detail.
+#[test]
+fn expired_aws_login_with_401_wording_never_reaches_oauth_needs_auth() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = McpConfig::default();
+    let mut server = test_server_config();
+    server.args = vec!["--profile".to_string(), "work".to_string()];
+    config.servers.insert("aws".to_string(), server);
+    let mut pool = McpPool::new(config);
+
+    // Not the initialize branch: no hint was appended to this error.
+    let error = anyhow::anyhow!("UnauthorizedException (401): AWS token has expired");
+    pool.note_connect_failure("aws", &error);
+    assert!(!pool.server_needs_auth("aws"));
+
+    let errors = HashMap::from([("aws".to_string(), format_mcp_error_for_display(&error))]);
+    let snapshot = pool.manager_snapshot(&dir.path().join("mcp.json"), false, &errors);
+    let aws = snapshot
+        .servers
+        .iter()
+        .find(|server| server.name == "aws")
+        .expect("aws in snapshot");
+    assert!(!aws.auth_required, "{aws:?}");
+    let recovery = aws
+        .recovery_kind(false)
+        .expect("a failed server has a recovery");
+    assert_eq!(recovery, McpRecoveryKind::AwsLogin);
+    assert_eq!(recovery.slash_command("aws"), "/mcp retry aws");
+    // Labelled for what it runs, not "re-auth".
+    assert_eq!(
+        recovery.label_key(),
+        codewhale_localization::MessageId::ExtensionsActionReconnect
+    );
+    let detail = aws.error.as_deref().unwrap_or_default();
+    assert!(
+        detail.contains("run `aws sso login --profile work` in a terminal, then `/mcp retry aws`"),
+        "{detail}"
+    );
+
+    // A genuine OAuth 401 on the same pool still enters the needs-auth set.
+    pool.note_connect_failure("aws", &anyhow::anyhow!("HTTP 401 Unauthorized"));
+    assert!(pool.server_needs_auth("aws"));
+}
+
+#[tokio::test]
+async fn live_aws_expiry_retires_the_catalog_and_lists_external_recovery() {
+    for method in ["tools/call", "resources/read", "prompts/get"] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = McpConfig::default();
+        let server = test_server_config();
+        config.servers.insert("aws".to_string(), server.clone());
+        let mut pool = McpPool::new(config);
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let mut connection = test_connection(Box::new(ScriptedValueTransport {
+            sent: Arc::clone(&sent),
+            responses: VecDeque::from([json_frame(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "error": { "code": -32000, "message": "UnauthorizedException (401): AWS token has expired" }
+            }))]),
+        }));
+        connection.name = "aws".to_string();
+        connection.config = server;
+        connection.catalog_generation = pool.current_catalog_generation();
+        connection.tools.push(McpTool {
+            name: "lookup".to_string(),
+            description: None,
+            input_schema: serde_json::json!({"type": "object"}),
+            annotations: None,
+        });
+        connection.resources.push(McpResource {
+            uri: "aws://example".to_string(),
+            name: "example".to_string(),
+            description: None,
+            mime_type: None,
+        });
+        connection.prompts.push(McpPrompt {
+            name: "lookup".to_string(),
+            description: None,
+            arguments: Vec::new(),
+        });
+        pool.store_ready_connection("aws".to_string(), connection)
+            .unwrap();
+
+        let result = match method {
+            "tools/call" => {
+                pool.call_tool("mcp_aws_lookup", serde_json::json!({}))
+                    .await
+            }
+            "resources/read" => pool.read_resource("aws", "aws://example").await,
+            "prompts/get" => {
+                pool.get_prompt("aws", "lookup", serde_json::json!({}))
+                    .await
+            }
+            _ => unreachable!(),
+        };
+        let error = result.expect_err("expired AWS credentials fail the call");
+        assert!(format!("{error:#}").contains("aws sso login"));
+        assert_eq!(sent.lock().unwrap().len(), 1, "never replay the call");
+        assert!(!pool.connected_servers().contains(&"aws"));
+        assert!(!pool.server_needs_auth("aws"));
+        assert!(
+            pool.to_api_tools()
+                .iter()
+                .all(|tool| !tool.name.starts_with("mcp_aws_"))
+        );
+
+        // No external boot error map: the latest pool failure owns this row.
+        let snapshot = pool.manager_snapshot(&dir.path().join("mcp.json"), false, &HashMap::new());
+        let row = &snapshot.servers[0];
+        assert!(!row.connected && !row.auth_required);
+        assert_eq!(row.recovery_kind(false), Some(McpRecoveryKind::AwsLogin));
+        assert!(
+            row.error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("aws sso login")
+        );
+
+        // Backoff reuses the recorded failure, so neither listing spawns a
+        // process or logs in. Both model surfaces name the external recovery.
+        for items in [
+            pool.list_resources(None).await.unwrap(),
+            pool.list_resource_templates(None).await.unwrap(),
+        ] {
+            let item = items
+                .iter()
+                .find(|item| item["server"] == "aws")
+                .expect("AWS failure item");
+            assert_eq!(item["error"], "aws_login_required");
+            assert!(item.get("authenticate_tool").is_none());
+            let message = item["message"].as_str().unwrap();
+            assert!(message.contains("aws sso login") && message.contains("/mcp retry aws"));
+            assert!(!message.contains("/mcp login"));
+        }
+    }
+}
+
+#[test]
+fn sso_wording_on_an_oauth_capable_server_stays_on_the_oauth_route() {
+    // Corporate SSO in front of an OAuth HTTP server: `aws sso login` cannot
+    // help it, `/mcp login` can.
+    assert!(!mcp_error_is_aws_login(
+        "401 Unauthorized: SSO token expired",
+        true
+    ));
+    assert_eq!(
+        mcp_recovery_kind(
+            true,
+            true,
+            false,
+            Some("401 Unauthorized: SSO token expired"),
+            true
+        ),
+        Some(McpRecoveryKind::Reauth)
+    );
+    assert_eq!(
+        mcp_recovery_kind(true, true, false, Some("SSO token expired"), true),
+        Some(McpRecoveryKind::Diagnose)
+    );
+    // The same text from a stdio server is still the AWS route.
+    assert_eq!(
+        mcp_recovery_kind(true, true, false, Some("SSO token expired"), false),
+        Some(McpRecoveryKind::AwsLogin)
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = McpConfig::default();
+    let mut server = test_server_config();
+    server.command = None;
+    server.url = Some("https://mcp.example.test/mcp".to_string());
+    // Automatic OAuth discovery works without explicit scopes/client config.
+    assert!(mcp_server_oauth_capable(&server));
+    config.servers.insert("corp".to_string(), server);
+    let mut pool = McpPool::new(config);
+    pool.note_connect_failure(
+        "corp",
+        &anyhow::anyhow!("401 Unauthorized: SSO token expired"),
+    );
+    assert!(pool.server_needs_auth("corp"));
+    let errors = HashMap::new();
+    let snapshot = pool.manager_snapshot(&dir.path().join("mcp.json"), false, &errors);
+    let corp = &snapshot.servers[0];
+    assert!(corp.auth_required);
+    assert_eq!(corp.recovery_kind(true), Some(McpRecoveryKind::Reauth));
+}
+
+/// Review of #6789: a reviewed plugin's initialize/live error is suppressed to
+/// protect environment-backed credentials, which also hid the AWS wording
+/// the recovery keys on. The classification now runs on the raw text first
+/// and only our fixed hint survives — never the server's own words, and
+/// never the plugin's `AWS_PROFILE` env value.
+#[tokio::test]
+async fn reviewed_plugin_rejection_keeps_aws_recovery_but_not_server_text() {
+    let dir = tempfile::tempdir().unwrap();
+    let plugins_root = dir.path().join("plugins");
+    let plugin_base = plugins_root.join("aws-guard");
+    fs::create_dir_all(&plugin_base).unwrap();
+    fs::create_dir_all(dir.path().join("project")).unwrap();
+    fs::write(
+        plugin_base.join("plugin.toml"),
+        "schema_version = 1\n[plugin]\nname = \"aws-guard\"\nversion = \"1.0.0\"\n",
+    )
+    .unwrap();
+    let discovery = crate::plugins::discovery::DiscoveryConfig {
+        workspace: dir.path().join("project"),
+        user_plugins_dir: plugins_root,
+        workspace_plugins_dir: dir.path().join("workspace-plugins-unused"),
+        builtin_plugin_dirs: Vec::new(),
+        state_path: dir.path().join("plugin-state/state.json"),
+    };
+    let mut registry = crate::plugins::discovery::discover_with_config(&discovery);
+    registry.trust("aws-guard").unwrap();
+    registry.enable("aws-guard").unwrap();
+    let authority = registry.authority_for("aws-guard").unwrap();
+
+    let mut config = test_server_config();
+    config
+        .env
+        .insert("AWS_PROFILE".to_string(), "env-profile-secret".to_string());
+    config.reviewed_plugin = Some(
+        ReviewedPluginMcpSource::from_authority(
+            authority,
+            None,
+            Arc::new(crate::plugins::HostEnvironment::capture()),
+        )
+        .unwrap(),
+    );
+
+    for initialize in [true, false] {
+        for (server_error, login) in [
+            (
+                "Error retrieving credentials for acct-SECRET-123: The SSO session associated with this profile has expired or is otherwise invalid.",
+                "aws sso login",
+            ),
+            (
+                "acct-SECRET-123 LoginRefreshRequired: Please reauthenticate using aws login",
+                "aws login",
+            ),
+        ] {
+            let transport = ScriptedValueTransport {
+                sent: Arc::new(Mutex::new(Vec::new())),
+                responses: VecDeque::from([json_frame(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "error": { "code": -32602, "message": server_error }
+                }))]),
+            };
+            let mut conn = test_connection(Box::new(transport));
+            conn.config = config.clone();
+            let error = if initialize {
+                conn.initialize().await.expect_err("initialize rejected")
+            } else {
+                conn.call_method("tools/call", serde_json::json!({}), 5)
+                    .await
+                    .expect_err("live call rejected")
+            };
+            let error = format!("{error:#}");
+            assert!(error.contains("server details suppressed"), "{error}");
+            assert!(!error.contains("acct-SECRET-123"), "{error}");
+            assert!(!error.contains("env-profile-secret"), "{error}");
+            let hint = format!(
+                "AWS credentials expired: run `{login}` in a terminal, then `/mcp retry mock`"
+            );
+            assert!(error.contains(&hint), "{error}");
+            assert_eq!(
+                mcp_recovery_kind(true, true, false, Some(&error), false),
+                Some(McpRecoveryKind::AwsLogin)
+            );
+            // Pool/snapshot/listing classification sees only sanitized text;
+            // it must preserve aws login versus aws sso login on that pass.
+            assert_eq!(aws_login_hint(&config, "mock", &error), hint);
+        }
+    }
 }
 
 #[test]
@@ -8042,13 +8805,13 @@ async fn mcp_ceiling_child_scoped_meta_calls_do_not_widen_or_mutate_sibling_poli
         ("list_mcp_resource_templates", "templates"),
     ] {
         let child = pool
-            .call_tool_with_disallowed(method, serde_json::json!({}), &child_rules)
+            .call_tool_with_disallowed(method, serde_json::json!({}), &child_rules, None)
             .await
             .unwrap();
         assert_eq!(child[field].as_array().unwrap().len(), 1);
         assert_eq!(child[field][0]["server"], "public");
         let sibling = pool
-            .call_tool_with_disallowed(method, serde_json::json!({}), &[])
+            .call_tool_with_disallowed(method, serde_json::json!({}), &[], None)
             .await
             .unwrap();
         assert_eq!(sibling[field].as_array().unwrap().len(), 2);
@@ -8057,19 +8820,25 @@ async fn mcp_ceiling_child_scoped_meta_calls_do_not_widen_or_mutate_sibling_poli
         pool.call_tool_with_disallowed(
             "read_mcp_resource",
             serde_json::json!({"server":"private_a","uri":"memory://one"}),
-            &child_rules
+            &child_rules,
+            None
         )
         .await
         .is_err()
     );
     assert!(
-        pool.call_tool_with_disallowed("mcp_private_a_read", serde_json::json!({}), &child_rules)
-            .await
-            .is_err()
+        pool.call_tool_with_disallowed(
+            "mcp_private_a_read",
+            serde_json::json!({}),
+            &child_rules,
+            None
+        )
+        .await
+        .is_err()
     );
     assert!(sent.lock().unwrap().is_empty());
     assert_eq!(
-        pool.call_tool_with_disallowed("mcp_private_a_read", serde_json::json!({}), &[])
+        pool.call_tool_with_disallowed("mcp_private_a_read", serde_json::json!({}), &[], None)
             .await
             .unwrap(),
         serde_json::json!({"ok":true})
@@ -8144,7 +8913,8 @@ async fn mcp_ceiling_preserves_ordinary_tool_result_tools_field() {
         pool.call_tool_with_disallowed(
             "mcp_public_read",
             serde_json::json!({}),
-            &["mcp_private_*".to_string()]
+            &["mcp_private_*".to_string()],
+            None
         )
         .await
         .unwrap(),
@@ -8349,22 +9119,554 @@ async fn manual_retry_clears_supervision_marks() {
     assert!(!pool.supervised_parked.contains("alpha"));
 }
 
-/// #6187: tool-call retry covers a dead pipe/socket, not just stale sessions.
+/// #6187: a dead pipe/socket rebuilds the connection, not just a stale
+/// session. Only a refused session id proves the server never ran the
+/// request, so only that class may replay a tool call.
 #[test]
-fn retriable_call_error_covers_closed_transports() {
-    use super::wire::is_retriable_mcp_call_error;
-    assert!(is_retriable_mcp_call_error(&anyhow::anyhow!(
-        "MCP session expired"
-    )));
-    assert!(is_retriable_mcp_call_error(&anyhow::anyhow!(
-        "connection reset by peer"
-    )));
-    assert!(is_retriable_mcp_call_error(&anyhow::anyhow!(
-        "Stdio transport closed"
-    )));
-    assert!(!is_retriable_mcp_call_error(&anyhow::anyhow!(
-        "tool returned an application error"
-    )));
+fn connection_lost_covers_closed_transports_but_only_rejected_sessions_replay() {
+    use super::wire::{
+        McpSessionRejected, is_mcp_connection_lost_error, is_mcp_session_rejected_error,
+    };
+    for rejected in [
+        "MCP session expired (transport=sse endpoint=x status=400 Bad Request): session invalid",
+        "MCP Streamable HTTP session expired; retry with a new session required (404)",
+    ] {
+        let err = anyhow::Error::from(McpSessionRejected(rejected.to_string()))
+            .context("MCP method 'tools/call' failed");
+        assert!(is_mcp_connection_lost_error(&err), "{rejected}");
+        assert!(is_mcp_session_rejected_error(&err), "{rejected}");
+        // The same words without the transport's type are not a refusal:
+        // a JSON-RPC error answering the request can carry them.
+        let text_only = anyhow::anyhow!("{rejected}");
+        assert!(is_mcp_connection_lost_error(&text_only), "{rejected}");
+        assert!(!is_mcp_session_rejected_error(&text_only), "{rejected}");
+    }
+    for ambiguous in [
+        "MCP session expired: {\"code\":-32000,\"message\":\"session invalid\"}",
+        "connection reset by peer",
+        "Stdio transport closed",
+        "Stdio transport closed (exit status: 1)\nsession invalid",
+        "SSE transport closed",
+        "MCP SSE POST send failed (transport=sse endpoint=x): connection closed",
+    ] {
+        let err = anyhow::anyhow!("{ambiguous}");
+        assert!(is_mcp_connection_lost_error(&err), "{ambiguous}");
+        assert!(!is_mcp_session_rejected_error(&err), "{ambiguous}");
+    }
+    let app = anyhow::anyhow!("tool returned an application error");
+    assert!(!is_mcp_connection_lost_error(&app));
+    assert!(!is_mcp_session_rejected_error(&app));
+}
+
+/// A stdio server that logs every `tools/call` it receives to `$CALL_LOG`,
+/// so a test can count how many times the tool really ran. `$FIRST_CALL`
+/// picks what happens to the first call after it has run: `exit` kills the
+/// child before replying, `session-error` answers it with a JSON-RPC error
+/// whose text mentions an invalid session.
+#[cfg(unix)]
+const COUNTING_STDIO_SERVER: &str = r#"#!/bin/sh
+while IFS= read -r line; do
+    id=$(printf '%s\n' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+    case "$line" in
+        *'"method":"notifications/'*)
+            ;;
+        *'"method":"initialize"'*)
+            printf '{"jsonrpc":"2.0","id":"%s","result":{"protocolVersion":"2024-11-05","serverInfo":{"name":"counter","version":"1.0.0"},"capabilities":{"tools":{}}}}\n' "$id"
+            ;;
+        *'"method":"tools/list"'*)
+            printf '{"jsonrpc":"2.0","id":"%s","result":{"tools":[{"name":"act","inputSchema":{"type":"object"}}]}}\n' "$id"
+            ;;
+        *'"method":"tools/call"'*)
+            echo call >> "$CALL_LOG"
+            if [ "$(wc -l < "$CALL_LOG")" -eq 1 ]; then
+                case "$FIRST_CALL" in
+                    exit) exit 0 ;;
+                    session-error)
+                        printf '{"jsonrpc":"2.0","id":"%s","error":{"code":-32000,"message":"session invalid"}}\n' "$id"
+                        continue
+                        ;;
+                esac
+            fi
+            printf '{"jsonrpc":"2.0","id":"%s","result":{"content":[{"type":"text","text":"ok"}]}}\n' "$id"
+            ;;
+        *)
+            [ -n "$id" ] && printf '{"jsonrpc":"2.0","id":"%s","result":{}}\n' "$id"
+            ;;
+    esac
+done
+"#;
+
+#[cfg(unix)]
+fn counting_stdio_pool(dir: &Path, first_call: &str) -> (McpPool, PathBuf) {
+    let script = dir.join("server.sh");
+    fs::write(&script, COUNTING_STDIO_SERVER).unwrap();
+    let call_log = dir.join("calls.log");
+    let mut server = test_server_config();
+    server.command = Some("sh".to_string());
+    server.args = vec![script.to_string_lossy().into_owned()];
+    server.env.insert(
+        "CALL_LOG".to_string(),
+        call_log.to_string_lossy().into_owned(),
+    );
+    server
+        .env
+        .insert("FIRST_CALL".to_string(), first_call.to_string());
+    server.connect_timeout = Some(10);
+    server.execute_timeout = Some(10);
+    let mut cfg = McpConfig::default();
+    cfg.servers.insert("counter".to_string(), server);
+    (McpPool::new(cfg), call_log)
+}
+
+#[cfg(unix)]
+fn server_call_count(call_log: &Path) -> usize {
+    fs::read_to_string(call_log)
+        .map(|log| log.lines().count())
+        .unwrap_or(0)
+}
+
+/// A stdio child that dies after reading `tools/call` may have run it: the
+/// call fails as unknown, runs once, and the next call gets a fresh child.
+#[cfg(unix)]
+#[tokio::test]
+async fn stdio_child_exit_during_tool_call_is_not_replayed() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut pool, call_log) = counting_stdio_pool(dir.path(), "exit");
+
+    let err = pool
+        .call_tool("mcp_counter_act", serde_json::json!({}))
+        .await
+        .expect_err("a call whose child exited mid-flight must not be replayed");
+    assert!(
+        format!("{err:#}").contains("outcome unknown, not retried"),
+        "unexpected error: {err:#}"
+    );
+    assert_eq!(server_call_count(&call_log), 1);
+
+    let result = pool
+        .call_tool("mcp_counter_act", serde_json::json!({}))
+        .await
+        .expect("the next call reconnects");
+    assert_eq!(
+        result,
+        serde_json::json!({ "content": [{ "type": "text", "text": "ok" }] })
+    );
+    assert_eq!(server_call_count(&call_log), 2);
+}
+
+/// A JSON-RPC error answering the call id means the server processed the
+/// request, even when its text mentions an invalid session: the tool may
+/// have acted before failing, so the call is not sent again.
+#[cfg(unix)]
+#[tokio::test]
+async fn json_rpc_session_error_on_tool_call_is_not_replayed() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut pool, call_log) = counting_stdio_pool(dir.path(), "session-error");
+
+    let err = pool
+        .call_tool("mcp_counter_act", serde_json::json!({}))
+        .await
+        .expect_err("a session error answering the call must not be replayed");
+    assert!(
+        format!("{err:#}").contains("outcome unknown, not retried"),
+        "unexpected error: {err:#}"
+    );
+    assert_eq!(server_call_count(&call_log), 1);
+
+    let result = pool
+        .call_tool("mcp_counter_act", serde_json::json!({}))
+        .await
+        .expect("the next call reconnects");
+    assert_eq!(
+        result,
+        serde_json::json!({ "content": [{ "type": "text", "text": "ok" }] })
+    );
+    assert_eq!(server_call_count(&call_log), 2);
+}
+
+/// A sequential stdio server for the `tools/call` deadline fixtures. Every
+/// `initialize` appends `init <pid>` to `$INIT_LOG`, so a test can tell a
+/// reused connection from a rebuilt one; every `tools/call` appends
+/// `<tool> <id>` to `$CALL_LOG` before it runs, and its reply text is that
+/// same line, so a test can tell which request a reply answers. `slow` sleeps
+/// `$SLOW_SECS` before replying, `hang` never replies, `fast` replies at once.
+#[cfg(unix)]
+const DEADLINE_STDIO_SERVER: &str = r#"#!/bin/sh
+while IFS= read -r line; do
+    id=$(printf '%s\n' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+    case "$line" in
+        *'"method":"notifications/'*)
+            ;;
+        *'"method":"initialize"'*)
+            echo "init $$" >> "$INIT_LOG"
+            printf '{"jsonrpc":"2.0","id":"%s","result":{"protocolVersion":"2024-11-05","serverInfo":{"name":"deadline","version":"1.0.0"},"capabilities":{"tools":{}}}}\n' "$id"
+            ;;
+        *'"method":"tools/list"'*)
+            printf '{"jsonrpc":"2.0","id":"%s","result":{"tools":[{"name":"slow","inputSchema":{"type":"object"}},{"name":"fast","inputSchema":{"type":"object"}},{"name":"hang","inputSchema":{"type":"object"}}]}}\n' "$id"
+            ;;
+        *'"method":"tools/call"'*)
+            tool=$(printf '%s\n' "$line" | sed -n 's/.*"name":"\([^"]*\)".*/\1/p')
+            echo "$tool $id" >> "$CALL_LOG"
+            case "$tool" in
+                slow) sleep "$SLOW_SECS" ;;
+                hang) while :; do sleep 0.05; done ;;
+            esac
+            printf '{"jsonrpc":"2.0","id":"%s","result":{"content":[{"type":"text","text":"%s %s"}]}}\n' "$id" "$tool" "$id"
+            ;;
+        *)
+            [ -n "$id" ] && printf '{"jsonrpc":"2.0","id":"%s","result":{}}\n' "$id"
+            ;;
+    esac
+done
+"#;
+
+/// A pool with one `deadline` stdio server; returns it with the call and
+/// init log paths.
+#[cfg(unix)]
+fn deadline_stdio_pool(
+    dir: &Path,
+    slow_secs: &str,
+    configure: impl FnOnce(&mut McpServerConfig),
+) -> (McpPool, PathBuf, PathBuf) {
+    let script = dir.join("server.sh");
+    fs::write(&script, DEADLINE_STDIO_SERVER).unwrap();
+    let call_log = dir.join("calls.log");
+    let init_log = dir.join("inits.log");
+    let mut server = test_server_config();
+    server.command = Some("sh".to_string());
+    server.args = vec![script.to_string_lossy().into_owned()];
+    for (key, value) in [
+        ("CALL_LOG", call_log.to_string_lossy().into_owned()),
+        ("INIT_LOG", init_log.to_string_lossy().into_owned()),
+        ("SLOW_SECS", slow_secs.to_string()),
+    ] {
+        server.env.insert(key.to_string(), value);
+    }
+    configure(&mut server);
+    let mut cfg = McpConfig::default();
+    cfg.servers.insert("deadline".to_string(), server);
+    (McpPool::new(cfg), call_log, init_log)
+}
+
+#[cfg(unix)]
+fn log_lines(path: &Path) -> Vec<String> {
+    fs::read_to_string(path)
+        .map(|log| log.lines().map(str::to_string).collect())
+        .unwrap_or_default()
+}
+
+/// The result `DEADLINE_STDIO_SERVER` returns for the call it logged as `call`.
+#[cfg(unix)]
+fn deadline_reply(call: &str) -> serde_json::Value {
+    serde_json::json!({ "content": [{ "type": "text", "text": call }] })
+}
+
+/// #6741 over a real stdio child: a `tools/call` whose reply arrives after
+/// the read knob — the receive budget every request used to get — but inside
+/// the execute budget completes, and the next call on the same connection gets
+/// its own reply. The late frame is consumed once, by the request it answers;
+/// nothing is replayed and the child is not restarted.
+#[cfg(unix)]
+#[tokio::test]
+async fn stdio_tool_reply_after_the_read_knob_completes_within_the_execute_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut pool, call_log, init_log) = deadline_stdio_pool(dir.path(), "3", |server| {
+        server.read_timeout = Some(1);
+        server.execute_timeout = Some(30);
+    });
+
+    let started = std::time::Instant::now();
+    let slow = pool
+        .call_tool("mcp_deadline_slow", serde_json::json!({}))
+        .await
+        .expect("a reply inside the execute budget must not be cut off at the read knob");
+    assert!(
+        started.elapsed() >= Duration::from_secs(3),
+        "the reply must really have outlived the 1s read knob"
+    );
+    let fast = pool
+        .call_tool("mcp_deadline_fast", serde_json::json!({}))
+        .await
+        .expect("the next call on the same connection must get its own reply");
+
+    let calls = log_lines(&call_log);
+    assert_eq!(calls.len(), 2, "neither call may be replayed: {calls:?}");
+    assert!(calls[0].starts_with("slow ") && calls[1].starts_with("fast "));
+    assert_eq!(slow, deadline_reply(&calls[0]));
+    assert_eq!(fast, deadline_reply(&calls[1]));
+    assert_eq!(
+        log_lines(&init_log).len(),
+        1,
+        "both calls must share one connection and child"
+    );
+}
+
+/// An explicit `execute_timeout` shorter than the read knob still governs a
+/// real stdio `tools/call`: the call fails at its own 2s budget, not at the
+/// 120s read knob or the 1800s default. The request is abandoned, not the
+/// connection: the child's late reply to it reaches the pipe ahead of the
+/// next call's reply and is skipped, so the next call gets its own reply on
+/// the same child.
+#[cfg(unix)]
+#[tokio::test]
+async fn explicit_shorter_execute_budget_ends_a_stdio_tool_call_and_skips_its_late_reply() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut pool, call_log, init_log) = deadline_stdio_pool(dir.path(), "3", |server| {
+        server.execute_timeout = Some(2);
+    });
+    pool.get_or_connect("deadline").await.unwrap();
+
+    let started = std::time::Instant::now();
+    let error = pool
+        .call_tool("mcp_deadline_slow", serde_json::json!({}))
+        .await
+        .expect_err("an explicit shorter budget must end the call");
+    let elapsed = started.elapsed();
+    assert!(
+        format!("{error:#}")
+            .contains("MCP method 'tools/call' on server 'deadline' timed out after 2s"),
+        "unexpected error: {error:#}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "the explicit budget, not the 3s reply, must end the call: {elapsed:?}"
+    );
+
+    let fast = pool
+        .call_tool("mcp_deadline_fast", serde_json::json!({}))
+        .await
+        .expect("the kept connection must answer the next call");
+    let calls = log_lines(&call_log);
+    assert_eq!(calls.len(), 2, "neither call may be replayed: {calls:?}");
+    assert!(calls[0].starts_with("slow ") && calls[1].starts_with("fast "));
+    assert_eq!(
+        fast,
+        deadline_reply(&calls[1]),
+        "the abandoned call's late reply must not answer the next call"
+    );
+    assert_eq!(
+        log_lines(&init_log).len(),
+        1,
+        "an expired request must not rebuild the connection"
+    );
+}
+
+/// Owned cancellation of an in-flight stdio `tools/call` under the default
+/// 1800s execute budget: cancelling the connection's own token ends the call
+/// promptly instead of waiting out the budget, and marks the connection dead.
+/// The next call rebuilds it on a fresh child, the cancelled call's child is
+/// terminated rather than left running, and the cancelled call is not replayed.
+#[cfg(unix)]
+#[tokio::test]
+async fn cancelling_an_inflight_stdio_tool_call_does_not_wait_for_the_execute_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut pool, call_log, init_log) = deadline_stdio_pool(dir.path(), "0", |_| {});
+    assert_eq!(
+        pool.config.servers["deadline"].effective_execute_timeout(&pool.config.timeouts),
+        1800,
+        "the fixture must run under the default execute budget"
+    );
+    pool.get_or_connect("deadline").await.unwrap();
+    let cancel = pool.connections["deadline"].cancel_token.clone();
+
+    let call = tokio::spawn(async move {
+        let result = pool
+            .call_tool("mcp_deadline_hang", serde_json::json!({}))
+            .await;
+        (pool, result)
+    });
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while log_lines(&call_log).is_empty() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the child never received the call");
+
+    cancel.cancel();
+    let (mut pool, result) = tokio::time::timeout(Duration::from_secs(5), call)
+        .await
+        .expect("cancellation must not wait for the execute budget")
+        .expect("the call task panicked");
+    let error = result.expect_err("a cancelled call must not report success");
+    assert!(
+        format!("{error:#}").contains("MCP connection 'deadline' was cancelled"),
+        "unexpected error: {error:#}"
+    );
+    assert!(
+        pool.connected_servers().is_empty(),
+        "a cancelled connection must not be reused"
+    );
+
+    let fast = pool
+        .call_tool("mcp_deadline_fast", serde_json::json!({}))
+        .await
+        .expect("the next call must rebuild the connection");
+    let calls = log_lines(&call_log);
+    assert_eq!(
+        calls.len(),
+        2,
+        "the cancelled call must not be replayed: {calls:?}"
+    );
+    assert!(calls[0].starts_with("hang ") && calls[1].starts_with("fast "));
+    assert_eq!(fast, deadline_reply(&calls[1]));
+
+    let inits = log_lines(&init_log);
+    assert_eq!(
+        inits.len(),
+        2,
+        "the next call must run on a fresh child: {inits:?}"
+    );
+    let cancelled_pid: i32 = inits[0]
+        .strip_prefix("init ")
+        .and_then(|pid| pid.parse().ok())
+        .expect("the init log records the child pid");
+    tokio::time::timeout(STDIO_SHUTDOWN_GRACE + Duration::from_secs(1), async {
+        // SAFETY: signal zero only checks whether the pid still exists.
+        while unsafe { libc::kill(cancelled_pid, 0) } == 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the cancelled call's child must be terminated, not left running");
+}
+
+/// A Streamable HTTP server that reads the whole `tools/call` POST and then
+/// drops the connection may have run it: the call runs once and the next
+/// call succeeds on a rebuilt connection.
+#[tokio::test]
+async fn streamable_http_reset_after_tool_call_post_is_not_replayed() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let _lock = lock_mcp_loopback_tests().await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let tool_calls = Arc::new(AtomicUsize::new(0));
+    let server_tool_calls = Arc::clone(&tool_calls);
+
+    let server = tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            let tool_calls = Arc::clone(&server_tool_calls);
+            tokio::spawn(async move {
+                let mut request = Vec::new();
+                let mut buf = [0; 4096];
+                let header_end = loop {
+                    let Ok(n) = socket.read(&mut buf).await else {
+                        return;
+                    };
+                    if n == 0 {
+                        return;
+                    }
+                    request.extend_from_slice(&buf[..n]);
+                    if let Some(pos) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break pos + 4;
+                    }
+                };
+                let headers = String::from_utf8_lossy(&request[..header_end]).to_string();
+                if headers.starts_with("GET ") {
+                    let _ = socket
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+                        )
+                        .await;
+                    return;
+                }
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                    .unwrap_or(0);
+                while request.len() < header_end + content_length {
+                    let Ok(n) = socket.read(&mut buf).await else {
+                        return;
+                    };
+                    if n == 0 {
+                        return;
+                    }
+                    request.extend_from_slice(&buf[..n]);
+                }
+                let request_json: serde_json::Value =
+                    serde_json::from_slice(&request[header_end..header_end + content_length])
+                        .unwrap();
+                let method = request_json["method"].as_str().unwrap_or("");
+                let Some(id) = request_json.get("id").cloned() else {
+                    let _ = socket
+                        .write_all(
+                            b"HTTP/1.1 202 Accepted\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+                        )
+                        .await;
+                    return;
+                };
+                let result = match method {
+                    "initialize" => serde_json::json!({
+                        "protocolVersion": "2024-11-05",
+                        "capabilities": {"tools": {}}
+                    }),
+                    "tools/list" => serde_json::json!({
+                        "tools": [{ "name": "act", "inputSchema": {"type": "object"} }]
+                    }),
+                    "tools/call" => {
+                        // The tool runs, then the connection drops before
+                        // any reply is written.
+                        if tool_calls.fetch_add(1, AtomicOrdering::SeqCst) == 0 {
+                            drop(socket);
+                            return;
+                        }
+                        serde_json::json!({ "content": [{ "type": "text", "text": "ok" }] })
+                    }
+                    _ => serde_json::json!({}),
+                };
+                let body =
+                    serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": result }).to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            });
+        }
+    });
+
+    let mut server_config = test_server_config();
+    server_config.command = None;
+    server_config.url = Some(format!("http://{addr}/mcp"));
+    server_config.connect_timeout = Some(10);
+    server_config.execute_timeout = Some(10);
+    let mut cfg = McpConfig::default();
+    cfg.servers.insert("remote".to_string(), server_config);
+    let mut pool = McpPool::new(cfg);
+
+    let err = pool
+        .call_tool("mcp_remote_act", serde_json::json!({}))
+        .await
+        .expect_err("a call whose connection dropped mid-flight must not be replayed");
+    assert!(
+        format!("{err:#}").contains("outcome unknown, not retried"),
+        "unexpected error: {err:#}"
+    );
+    assert_eq!(tool_calls.load(AtomicOrdering::SeqCst), 1);
+
+    let result = pool
+        .call_tool("mcp_remote_act", serde_json::json!({}))
+        .await
+        .expect("the next call reconnects");
+    assert_eq!(
+        result,
+        serde_json::json!({ "content": [{ "type": "text", "text": "ok" }] })
+    );
+    assert_eq!(tool_calls.load(AtomicOrdering::SeqCst), 2);
+
+    server.abort();
 }
 
 // Executed both as an ordinary no-op test and as an isolated OS-process worker.
@@ -8669,4 +9971,445 @@ fn computer_use_duplicate_warning_names_user_copies_of_the_enabled_bundle() {
         .expect("bundle entry")
         .enabled = false;
     assert!(duplicate_computer_use_servers(&config).is_empty());
+}
+
+/// Founder run: an `uvx mcp-proxy-for-aws` server answered `initialize` with
+/// JSON-RPC -32602 and the only thing surfaced was
+/// "MCP error in 'initialize': {...}". The proxy had explained itself on
+/// stderr (expired AWS login). The error now says the server rejected the
+/// handshake, names what was launched, and carries that last stderr line.
+#[cfg(unix)]
+#[tokio::test]
+async fn initialize_rejection_names_the_server_command_and_its_stderr_reason() {
+    let mut config = test_server_config();
+    config.command = Some("sh".to_string());
+    config.args = vec![
+        "-c".to_string(),
+        concat!(
+            "read line; ",
+            "echo 'LoginRefreshRequired: Please reauthenticate using aws login' 1>&2; ",
+            "echo '{\"jsonrpc\":\"2.0\",\"id\":\"1\",\"error\":{\"code\":-32602,\"message\":\"Invalid request parameters\"}}'; ",
+            "sleep 5"
+        )
+        .to_string(),
+    ];
+    let error = McpConnection::connect_with_policy(
+        "aws".to_string(),
+        config,
+        &McpTimeouts::default(),
+        None,
+    )
+    .await
+    .err()
+    .expect("a JSON-RPC error on initialize ends the handshake");
+    let text = format_mcp_error_for_display(&error);
+    assert!(
+        text.contains("MCP server 'aws' rejected initialize"),
+        "{text}"
+    );
+    assert!(text.contains("command `sh`"), "{text}");
+    assert!(text.contains("-32602"), "{text}");
+    assert!(
+        text.contains("server stderr: LoginRefreshRequired: Please reauthenticate using aws login"),
+        "{text}"
+    );
+    // The founder's exact stderr is an AWS CLI `aws login` session, renewed
+    // with `aws login` (not `aws sso login`).
+    assert!(
+        text.contains(
+            "AWS credentials expired: run `aws login` in a terminal, then `/mcp retry aws`"
+        ),
+        "{text}"
+    );
+}
+
+/// The file the founder had carried both `"disabled": true` and
+/// `"enabled": false`; a hand edit can leave them disagreeing. Enabling (and
+/// disabling) must always write the pair so the two keys agree.
+#[test]
+fn set_server_enabled_makes_the_enabled_and_disabled_keys_agree() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mcp.json");
+    fs::write(
+        &path,
+        r#"{"servers":{"linear":{"url":"https://mcp.linear.app/mcp","enabled":true,"disabled":true}}}"#,
+    )
+    .unwrap();
+    assert!(!load_config(&path).unwrap().servers["linear"].is_enabled());
+
+    set_server_enabled(&path, "linear", true).unwrap();
+    let raw: serde_json::Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(raw["servers"]["linear"]["enabled"], serde_json::json!(true));
+    assert_eq!(
+        raw["servers"]["linear"]["disabled"],
+        serde_json::json!(false)
+    );
+    assert!(load_config(&path).unwrap().servers["linear"].is_enabled());
+
+    set_server_enabled(&path, "linear", false).unwrap();
+    let raw: serde_json::Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(
+        raw["servers"]["linear"]["enabled"],
+        serde_json::json!(false)
+    );
+    assert_eq!(
+        raw["servers"]["linear"]["disabled"],
+        serde_json::json!(true)
+    );
+}
+
+/// Lazy boot (#6033) leaves an unselected server with no connection, no
+/// failure and no observed capabilities. That is "never started" — its
+/// recovery is `connect`, not `reconnect`, and an OAuth-capable one is not
+/// yet known to need a login.
+#[test]
+fn never_started_server_recovers_with_connect_not_reconnect() {
+    let snapshot = McpServerSnapshot {
+        name: "lazy".into(),
+        enabled: true,
+        required: false,
+        transport: "stdio".into(),
+        command_or_url: "lazy-mcp".into(),
+        connect_timeout: 5,
+        execute_timeout: 5,
+        read_timeout: 5,
+        connected: false,
+        error: None,
+        auth_required: false,
+        capability_metadata: McpServerCapabilityMetadata::NotObserved,
+        tools: Vec::new(),
+        resources: Vec::new(),
+        prompts: Vec::new(),
+    };
+    assert!(!snapshot.started());
+    assert_eq!(
+        snapshot.recovery_kind(false),
+        Some(McpRecoveryKind::Connect)
+    );
+    assert_eq!(snapshot.recovery_kind(true), Some(McpRecoveryKind::Connect));
+
+    // A server that had a live connection and lost it is a reconnect.
+    let dropped = McpServerSnapshot {
+        capability_metadata: McpServerCapabilityMetadata::LegacyFallback,
+        ..snapshot
+    };
+    assert!(dropped.started());
+    assert_eq!(
+        dropped.recovery_kind(false),
+        Some(McpRecoveryKind::Reconnect)
+    );
+}
+
+#[tokio::test]
+async fn initialize_captures_sanitized_server_instructions() {
+    let transport = ScriptedValueTransport {
+        sent: Arc::new(Mutex::new(Vec::new())),
+        responses: VecDeque::from([json_frame(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "protocolVersion": "2024-11-05",
+                "serverInfo": {"name": "guided", "version": "1.0.0"},
+                "capabilities": {"tools": {}},
+                "instructions": "  Prefer search\u{7} before fetch.\r\n\tKeep queries short.\u{202E}  "
+            }
+        }))]),
+    };
+    let mut conn = test_connection(Box::new(transport));
+    conn.initialize().await.expect("initialize");
+    assert_eq!(
+        conn.instructions(),
+        Some("Prefer search before fetch.\n\tKeep queries short.")
+    );
+
+    let transport = ScriptedValueTransport {
+        sent: Arc::new(Mutex::new(Vec::new())),
+        responses: VecDeque::from([json_frame(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "protocolVersion": "2024-11-05",
+                "serverInfo": {"name": "verbose", "version": "1.0.0"},
+                "capabilities": {"tools": {}},
+                "instructions": "x".repeat(10_000)
+            }
+        }))]),
+    };
+    let mut conn = test_connection(Box::new(transport));
+    conn.initialize().await.expect("initialize");
+    let capped = conn.instructions().expect("capped guidance");
+    assert!(capped.len() <= codewhale_mcp::MAX_SERVER_INSTRUCTIONS_BYTES);
+    assert!(capped.ends_with("[truncated]"));
+}
+
+#[tokio::test]
+async fn initialize_ignores_non_string_instructions_without_failing_the_handshake() {
+    let transport = ScriptedValueTransport {
+        sent: Arc::new(Mutex::new(Vec::new())),
+        responses: VecDeque::from([json_frame(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "protocolVersion": "2024-11-05",
+                "serverInfo": {"name": "odd", "version": "1.0.0"},
+                "capabilities": {"tools": {}},
+                "instructions": {"text": "not a string"}
+            }
+        }))]),
+    };
+    let mut conn = test_connection(Box::new(transport));
+    conn.initialize()
+        .await
+        .expect("non-string instructions must not fail the handshake");
+    assert_eq!(conn.instructions(), None);
+}
+
+#[tokio::test]
+async fn mcp_server_instructions_exclude_servers_whose_tools_are_all_denied() {
+    let mut pool = McpPool::new(McpConfig::default())
+        .with_disallowed_tools(vec!["mcp_denied_write".to_string()]);
+    pool.insert_test_connection("guided", &["search"], Some("Use search."));
+    pool.insert_test_connection("denied", &["write"], Some("Denied guidance."));
+    pool.insert_test_connection("hidden", &["read"], Some("Hidden guidance."));
+    pool.insert_test_connection("silent", &["ping"], None);
+
+    // `hidden` is allowed by the pool but absent from the turn's catalog.
+    let visible = |name: &str| name != "mcp_hidden_read";
+    assert_eq!(
+        pool.model_server_instructions(visible),
+        vec![("guided".to_string(), "Use search.".to_string())]
+    );
+}
+
+#[tokio::test]
+async fn computer_use_call_carries_an_attested_decision_only_when_a_person_approved() {
+    let respond = |id: u64| {
+        json_frame(serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {"ok": true}}))
+    };
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let mut connection = test_connection(Box::new(ScriptedValueTransport {
+        sent: Arc::clone(&sent),
+        responses: VecDeque::from([respond(1), respond(2), respond(3)]),
+    }));
+    let key = [7_u8; 32];
+    connection.decision_key = Some(key);
+    let args = serde_json::json!({"action": "allow", "app": "Safari", "remember": 1.0});
+    let decision = crate::core::engine::HumanDecision::for_test("mcp_fixture_consent", &args);
+    connection
+        .call_tool_decided("consent", args.clone(), 5, Some(&decision))
+        .await
+        .expect("decided call");
+    connection
+        .call_tool_decided("consent", args.clone(), 5, None)
+        .await
+        .expect("plain call");
+    connection.decision_key = None;
+    connection
+        .call_tool_decided("consent", args.clone(), 5, Some(&decision))
+        .await
+        .expect("call without a shared key");
+
+    let sent = sent.lock().unwrap().clone();
+    let attested = &sent[0]["params"]["_meta"][COMPUTER_USE_DECISION_META];
+    let nonce = attested["nonce"].as_str().expect("nonce");
+    let args_json = attested["args_json"].as_str().expect("args_json");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(args_json).unwrap(),
+        sent[0]["params"]["arguments"]
+    );
+    let message = [
+        b"consent".as_slice(),
+        b"\0",
+        args_json.as_bytes(),
+        b"\0",
+        nonce.as_bytes(),
+    ]
+    .concat();
+    let expected = ring::hmac::sign(
+        &ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &key),
+        &message,
+    );
+    assert_eq!(attested["mac"], hex_encode(expected.as_ref()));
+    assert!(sent[1]["params"].get("_meta").is_none(), "{}", sent[1]);
+    assert!(sent[2]["params"].get("_meta").is_none(), "{}", sent[2]);
+}
+
+#[tokio::test]
+async fn copied_human_decision_cannot_authorize_another_mcp_call() {
+    let input = serde_json::json!({"action": "allow", "app": "Safari"});
+    let decision = crate::core::engine::HumanDecision::for_test("mcp_fixture_consent", &input);
+    let mut pool = McpPool::new(McpConfig::default());
+    for (name, arguments) in [
+        (
+            "mcp_fixture_consent",
+            serde_json::json!({"action": "allow", "app": "Terminal"}),
+        ),
+        ("mcp_other_consent", input.clone()),
+    ] {
+        let error = pool
+            .call_tool_with_decision(name, arguments, Some(&decision))
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("does not authorize this exact MCP call"),
+            "{error:#}"
+        );
+    }
+    assert!(decision.authorizes("mcp_fixture_consent", &input));
+}
+
+/// Actual shipped plugin, reviewed and staged by the normal plugin authority.
+/// Every backend and state path is isolated; this fixture never drives a real app.
+pub(crate) fn computer_use_test_fixture() -> (
+    tempfile::TempDir,
+    Arc<crate::plugins::PluginRegistry>,
+    McpPool,
+    String,
+) {
+    let root = tempfile::tempdir().expect("private fixture root");
+    let workspace = root.path().join("workspace");
+    fs::create_dir(&workspace).unwrap();
+    let plugin_base = root.path().join("plugins/computer-use");
+    let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("plugins/computer-use");
+    let mut pending = vec![(source, plugin_base.clone())];
+    while let Some((from, to)) = pending.pop() {
+        fs::create_dir_all(&to).unwrap();
+        for entry in fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            let destination = to.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                pending.push((entry.path(), destination));
+            } else {
+                fs::copy(entry.path(), destination).unwrap();
+            }
+        }
+    }
+    let state = root.path().join("cu-state");
+    let recordings = root.path().join("recordings");
+    let fake = plugin_base.join("tests/fixtures/fake-backend.mjs");
+    fs::write(
+        plugin_base.join("plugin.toml"),
+        format!(
+            "schema_version = 1\n[plugin]\nname = \"computer-use\"\nversion = \"1.0.0\"\n\
+             [mcp_servers.local]\ncommand = \"node\"\nargs = [\"mcp/server.mjs\"]\nconnect_timeout = 5\n\
+             [mcp_servers.local.env]\nCODEWHALE_CU_APP = \"off\"\n\
+             CODEWHALE_CU_STATE_DIR = {}\nCODEWHALE_CU_RECORDINGS_DIR = {}\nCODEWHALE_CU_TEST_BACKEND = {}\n",
+            serde_json::to_string(&state.to_string_lossy()).unwrap(),
+            serde_json::to_string(&recordings.to_string_lossy()).unwrap(),
+            serde_json::to_string(&fake.to_string_lossy()).unwrap(),
+        ),
+    )
+    .unwrap();
+    let discovery = crate::plugins::discovery::DiscoveryConfig {
+        workspace,
+        user_plugins_dir: root.path().join("plugins"),
+        workspace_plugins_dir: root.path().join("unused-workspace-plugins"),
+        builtin_plugin_dirs: Vec::new(),
+        state_path: root.path().join("plugin-state/state.json"),
+    };
+    let mut registry = crate::plugins::discovery::discover_with_config(&discovery);
+    registry.trust("computer-use").unwrap();
+    registry.enable("computer-use").unwrap();
+    let plugin = registry.get("computer-use").unwrap().clone();
+    let authority = registry.authority_for("computer-use").unwrap();
+    let config = merge_plugin_mcp_servers_from_plugins(
+        McpConfig::default(),
+        vec![("computer-use".to_string(), plugin, authority)],
+    )
+    .unwrap();
+    let server = config
+        .servers
+        .keys()
+        .next()
+        .expect("plugin MCP server")
+        .clone();
+    (root, Arc::new(registry), McpPool::new(config), server)
+}
+
+#[tokio::test]
+async fn computer_use_real_plugin_host_handshake_rejects_tamper_replay_and_late_keys() {
+    // The bundled Computer Use plugin applies only to macOS hosts; elsewhere
+    // there is no live plugin to start.
+    if !cfg!(target_os = "macos") {
+        return;
+    }
+    let _env = crate::test_support::lock_test_env();
+    let (root, _registry, mut pool, server) = computer_use_test_fixture();
+    let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", root.path());
+    let _backend = crate::test_support::EnvVarGuard::set("CODEWHALE_SECRET_BACKEND", "file");
+    let connection = pool
+        .get_or_connect(&server)
+        .await
+        .expect("actual reviewed Node plugin");
+    let key = connection
+        .decision_key
+        .expect("first-message key from the host");
+    let args = serde_json::json!({"scope":"foreground", "remember":false});
+    let decision = crate::core::engine::HumanDecision::for_test("mcp_fixture_consent_allow", &args);
+    let decode = |result: serde_json::Value| {
+        serde_json::from_str::<serde_json::Value>(result["content"][0]["text"].as_str().unwrap())
+            .unwrap()
+    };
+    let unsigned = decode(
+        connection
+            .call_tool_decided("consent_allow", args.clone(), 5, None)
+            .await
+            .unwrap(),
+    );
+    assert_eq!(
+        unsigned["error"]["code"], "consent_needs_user",
+        "{unsigned}"
+    );
+    let approved = decode(
+        connection
+            .call_tool_decided("consent_allow", args.clone(), 5, Some(&decision))
+            .await
+            .unwrap(),
+    );
+    assert_eq!(approved["ok"], true, "{approved}");
+
+    // A later key notification must not replace the first connection key.
+    let wrong_key = [8_u8; 32];
+    connection.send(serde_json::json!({"jsonrpc":"2.0","method":COMPUTER_USE_HOST_KEYS_METHOD,"params":{"decision_key":hex_encode(&wrong_key)}})).await.unwrap();
+    let fresh = attest_decision(&key, "consent_revoke", &args).unwrap();
+    for (tool, arguments, tag) in [
+        (
+            "consent_revoke",
+            args.clone(),
+            attest_decision(&wrong_key, "consent_revoke", &args).unwrap(),
+        ),
+        (
+            "consent_revoke",
+            serde_json::json!({"scope":"foreground","remember":true}),
+            fresh.clone(),
+        ),
+        ("consent_allow", args.clone(), fresh.clone()),
+    ] {
+        let rejected = decode(connection.call_method("tools/call", serde_json::json!({"name":tool,"arguments":arguments,"_meta":{COMPUTER_USE_DECISION_META:tag}}), 5).await.unwrap());
+        assert_eq!(
+            rejected["error"]["code"], "consent_needs_user",
+            "{rejected}"
+        );
+    }
+    let exact = serde_json::json!({"name":"consent_revoke","arguments":args,"_meta":{COMPUTER_USE_DECISION_META:fresh}});
+    let allowed = decode(
+        connection
+            .call_method("tools/call", exact.clone(), 5)
+            .await
+            .unwrap(),
+    );
+    assert_eq!(
+        allowed["ok"], true,
+        "the original key remains authoritative: {allowed}"
+    );
+    let replay = decode(
+        connection
+            .call_method("tools/call", exact, 5)
+            .await
+            .unwrap(),
+    );
+    assert_eq!(replay["error"]["code"], "consent_needs_user", "{replay}");
+    pool.shutdown_all().await;
 }

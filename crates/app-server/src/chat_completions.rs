@@ -115,11 +115,7 @@ fn resolve_endpoint(
     });
     let auth_disabled = auth_mode_disables_api_key(auth_mode);
 
-    let configured_api_key = provider_cfg.api_key.as_deref().or_else(|| {
-        (provider_kind == ProviderKind::Deepseek)
-            .then_some(config.api_key.as_deref())
-            .flatten()
-    });
+    let configured_api_key = provider_cfg.api_key.as_deref();
 
     // Provider auth comes only from the resolved endpoint configuration. The
     // HTTP request's Authorization header authenticates the caller to the local
@@ -191,11 +187,6 @@ fn provider_base_url(config: &ConfigToml, provider: ProviderKind) -> String {
         .for_provider(provider)
         .base_url
         .clone()
-        .or_else(|| {
-            (provider == ProviderKind::Deepseek)
-                .then(|| config.base_url.clone())
-                .flatten()
-        })
         .unwrap_or_else(|| metadata.default_base_url().to_string())
 }
 
@@ -313,7 +304,10 @@ pub(crate) async fn chat_completions_handler(
     // Extract model from body.
     let request_model = body.get("model").and_then(|v| v.as_str());
 
-    // Resolve endpoint.
+    // Resolve endpoint. Everything the upstream call needs is copied out of
+    // the config here and the read guard is released before any network
+    // I/O: a slow upstream must never hold the shared config lock, because
+    // a queued `app/config/set` writer would then stall every later reader.
     let config = state.config.read().await;
     let vendor = config
         .providers
@@ -322,7 +316,9 @@ pub(crate) async fn chat_completions_handler(
         .as_deref()
         .unwrap_or_default();
     let openrouter_vendor = match validate_openrouter_vendor(vendor) {
-        Ok(vendor) if vendor.is_none() || config.provider == ProviderKind::Openrouter => vendor,
+        Ok(vendor) if vendor.is_none() || config.provider == ProviderKind::Openrouter => {
+            vendor.map(str::to_owned)
+        }
         _ => {
             return (
                 StatusCode::BAD_REQUEST,
@@ -337,7 +333,9 @@ pub(crate) async fn chat_completions_handler(
                 .into_response();
         }
     };
-    let endpoint = match resolve_endpoint(&config, &state.registry, request_model) {
+    let resolved = resolve_endpoint(&config, &state.registry, request_model);
+    drop(config);
+    let endpoint = match resolved {
         Ok(endpoint) => endpoint,
         Err(error) => {
             return (
@@ -378,7 +376,7 @@ pub(crate) async fn chat_completions_handler(
     body["model"] = serde_json::Value::String(endpoint.model.clone());
     // The operator pin overrides caller ordering/fallback preferences while
     // retaining caller restrictions such as only, ignore, and privacy policy.
-    apply_openrouter_vendor(&mut body, openrouter_vendor);
+    apply_openrouter_vendor(&mut body, openrouter_vendor.as_deref());
 
     let url = upstream_url(&endpoint, &body);
 
@@ -790,6 +788,77 @@ api_key = {provider_api_key:?}
                 assert_eq!(forwarded["model"], "fixture/model");
             }
         }
+        upstream_task.abort();
+    }
+
+    #[tokio::test]
+    async fn upstream_request_does_not_hold_the_config_lock() {
+        // A slow upstream used to keep `state.config.read()` alive for the
+        // whole request, so a concurrent `app/config/set` (a writer) blocked
+        // and, with tokio's writer-preferring lock, every later reader
+        // queued behind it.
+        install_crypto_provider();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mock_url = format!("http://{}", listener.local_addr().unwrap());
+        let (arrived_tx, mut arrived_rx) = mpsc::unbounded_channel::<()>();
+        let release = std::sync::Arc::new(tokio::sync::Notify::new());
+        let upstream_release = release.clone();
+        let upstream = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(move || {
+                let arrived = arrived_tx.clone();
+                let release = upstream_release.clone();
+                async move {
+                    arrived.send(()).unwrap();
+                    release.notified().await;
+                    Json(serde_json::json!({"choices": []}))
+                }
+            }),
+        );
+        let upstream_task = tokio::spawn(async move {
+            axum::serve(listener, upstream).await.unwrap();
+        });
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config_path = tmp.path().join("config.toml");
+        fs::write(
+            &config_path,
+            format!(
+                "provider = \"arcee\"\n[providers.arcee]\nbase_url = {mock_url:?}\nmodel = \"trinity-large-thinking\"\napi_key = \"arcee-configured-key\"\n"
+            ),
+        )
+        .expect("write config");
+        let state = build_state(Some(config_path), None).expect("state");
+        let app = app_router(state.clone(), &[]);
+        let body = serde_json::json!({"messages": [{"role": "user", "content": "hello"}]});
+        let request = tokio::spawn(async move {
+            app.oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), arrived_rx.recv())
+            .await
+            .expect("upstream should receive the request")
+            .expect("arrival signal");
+        assert!(
+            state.config.try_write().is_ok(),
+            "config must be writable while the upstream request is in flight"
+        );
+
+        release.notify_one();
+        let response = tokio::time::timeout(std::time::Duration::from_secs(10), request)
+            .await
+            .expect("request should finish once upstream answers")
+            .expect("join request");
+        assert_eq!(response.status(), StatusCode::OK);
         upstream_task.abort();
     }
 

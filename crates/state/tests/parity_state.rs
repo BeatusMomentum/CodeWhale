@@ -19,8 +19,8 @@ fn assert_workflow_trace_schema(conn: &Connection) {
     // v5 (goal stall-history migration) adds `thread_goals.last_gap_fingerprint`,
     // `repeated_gap_count`, `last_gap_pass` and `pause_reason` on top of the v4
     // continuation-count column and the v3 workflow-trace + thread_goals tables.
-    // The table set asserted below is unchanged; only the schema version advanced.
-    assert_eq!(user_version, 5);
+    // v6 adds `thread_runtime_links` (client thread -> runtime thread).
+    assert_eq!(user_version, 6);
 
     for table in [
         "workflow_runs",
@@ -29,6 +29,7 @@ fn assert_workflow_trace_schema(conn: &Connection) {
         "control_node_runs",
         "teacher_candidates",
         "thread_goals",
+        "thread_runtime_links",
     ] {
         let exists: bool = conn
             .query_row(

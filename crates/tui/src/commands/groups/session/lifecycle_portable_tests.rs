@@ -12,7 +12,7 @@ use codewhale_command_contract::facets::{
 use codewhale_command_contract::handler::CommandContexts;
 use std::path::PathBuf;
 
-use crate::tui::app::AppAction;
+use codewhale_command_contract::outcome::SessionAction;
 
 use super::lifecycle_test_support::{CannedLifecycle, sync_payload};
 
@@ -105,7 +105,7 @@ fn branch_composes_exact_baseline_messages() {
         )
     );
     assert!(
-        matches!(result.action, Some(AppAction::SyncSession { session_id: Some(ref id), .. }) if id == "branched-session")
+        matches!(result.action, Some(SessionAction::SyncSession(codewhale_command_contract::facets::SessionSyncPayload { session_id: Some(ref id), .. })) if id == "branched-session")
     );
     assert_eq!(canned.branch_entries, ["entry-3"]);
 
@@ -177,7 +177,7 @@ fn fork_composes_exact_baseline_messages_and_actions() {
     );
     assert!(matches!(
         result.action,
-        Some(AppAction::SyncSession { session_id: Some(ref id), .. }) if id == "child2"
+        Some(SessionAction::SyncSession(codewhale_command_contract::facets::SessionSyncPayload { session_id: Some(ref id), .. })) if id == "child2"
     ));
     assert_eq!(canned.transition_checks.get(), 1);
 
@@ -237,7 +237,7 @@ fn load_composes_exact_baseline_outcomes() {
     assert!(result.message.is_none(), "no premature receipt: {result:?}");
     assert!(matches!(
         result.action,
-        Some(AppAction::LoadSession(ref p)) if p == &PathBuf::from("/tmp/loaded.json")
+        Some(SessionAction::LoadSession(ref p)) if p == &PathBuf::from("/tmp/loaded.json")
     ));
     assert_eq!(canned.load_paths, ["/tmp/loaded.json"]);
     assert_eq!(canned.transition_checks.get(), 1);
@@ -309,7 +309,7 @@ fn new_composes_exact_baseline_outcomes() {
     );
     assert!(matches!(
         result.action,
-        Some(AppAction::SyncSession { session_id: Some(ref id), .. }) if id == "new-123"
+        Some(SessionAction::SyncSession(codewhale_command_contract::facets::SessionSyncPayload { session_id: Some(ref id), .. })) if id == "new-123"
     ));
     assert_eq!(canned.fresh_forces, [true]);
     assert_eq!(canned.transition_checks.get(), 1);

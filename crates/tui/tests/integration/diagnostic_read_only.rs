@@ -138,9 +138,17 @@ api_key = "doctor-json-arbitrary-secret"
     let report: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("machine-readable doctor error");
     assert_eq!(report["error"]["kind"], "config_validation");
-    assert_eq!(
-        report["error"]["message"],
-        "configuration validation failed; details omitted because configuration errors may contain credential material"
+    // A plain value error names the key and the valid values, never the
+    // rejected value itself (it may be a pasted secret).
+    let message = report["error"]["message"].as_str().expect("message");
+    assert!(
+        message.starts_with("Invalid provider (value not shown): expected deepseek"),
+        "{message}"
+    );
+    let fix = report["error"]["fix"].as_str().expect("fix");
+    assert!(
+        fix.starts_with("codewhale config set provider deepseek (if CODEWHALE_PROVIDER"),
+        "{fix}"
     );
     let all_output = format!(
         "{}\n{}",

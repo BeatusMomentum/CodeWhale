@@ -1892,7 +1892,6 @@ fn malformed_managed_policy_fails_closed() {
 
 #[test]
 fn managed_policy_path_env_override_is_honored() {
-    let _lock = crate::test_support::lock_test_env();
     let tmp = tempfile::tempdir().unwrap();
     let config = config(tmp.path());
     write_plugin(&config, "");
@@ -1904,8 +1903,13 @@ fn managed_policy_path_env_override_is_honored() {
         "the default sibling must stay absent so the override is proven"
     );
 
-    let _guard = crate::test_support::EnvVarGuard::set(MANAGED_POLICY_PATH_ENV, &custom);
-    let mut registry = discover_with_config(&config);
+    let environment = super::context::HostEnvironment::from_entries([(
+        std::ffi::OsString::from(MANAGED_POLICY_PATH_ENV),
+        custom.as_os_str().to_os_string(),
+    )]);
+    let context =
+        super::context::PluginDiscoveryContext::from_config_and_environment(&config, environment);
+    let mut registry = super::discovery::discover_with_context(&config, context);
     assert_eq!(
         registry.managed_policy_path(),
         Some(custom.as_path()),

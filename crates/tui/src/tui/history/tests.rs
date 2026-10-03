@@ -304,14 +304,10 @@ fn a_live_card_spends_the_whole_output_budget_it_advertises() {
     }
 }
 
-/// Failure output is the one thing worth the vertical space. Whatever the
-/// display settings say about density, a failed tool's body stays expanded and
-/// is never traded for an omission marker or a "see details" affordance — the
-/// user should not have to press a key to learn why something broke.
-///
-/// Replaces four tests that differed only in which option flag they set.
+/// Failure keeps the invocation plus head/tail evidence visible under every
+/// density setting; the full record remains in the details view.
 #[test]
-fn failed_tool_output_is_never_traded_for_an_affordance() {
+fn calm1_failed_tool_keeps_context_and_result_under_every_density_setting() {
     let total = 30usize;
     let last = format!("row {:02} plain content", total - 1);
 
@@ -341,8 +337,8 @@ fn failed_tool_output_is_never_traded_for_an_affordance() {
 
         let text = lines_text(&cell.lines_with_options(80, options));
         assert!(
-            !text.contains("lines omitted"),
-            "[{label}] failed output must not be hidden behind an omission marker: {text}"
+            text.contains("lines omitted"),
+            "[{label}] a bounded failure must advertise omitted output: {text}"
         );
         assert!(
             text.contains(&last),
@@ -417,8 +413,8 @@ fn whatever_live_truncates_the_transcript_still_holds() {
          rows: {live_text}"
     );
     assert!(
-        live_text.contains(first) && !live_text.contains(&last),
-        "the preview reads from the top and stops: {live_text}"
+        live_text.contains(first) && live_text.contains(&last),
+        "the bounded preview retains context and the final result: {live_text}"
     );
     assert!(transcript_text.contains(first) && transcript_text.contains(&last));
 
@@ -1530,6 +1526,30 @@ fn error_severity_ranks_stay_visually_distinguishable() {
     assert_eq!(body_fg, error_fg);
 }
 
+#[test]
+fn error_guidance_keeps_recovery_commands_on_their_own_line() {
+    let cell = HistoryCell::Error {
+        message: "DeepSeek API key not found.\nSave it:\n  codewhale auth set --provider deepseek"
+            .to_string(),
+        severity: crate::error_taxonomy::ErrorSeverity::Error,
+    };
+    for width in [80, 140] {
+        let lines = cell.lines(width);
+        let command_line = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .find(|line| line.contains("codewhale auth set --provider deepseek"))
+            .expect("recovery command stays intact");
+        assert!(!command_line.contains('\n'), "{command_line:?}");
+        assert!(!command_line.contains("Save it:"), "{command_line:?}");
+    }
+}
+
 /// A multiline failure can run past the bottom of the terminal while its full
 /// text stays in history. The live cell advertises the pager; the pager and the
 /// transcript must carry the recovery instruction verbatim and must not
@@ -1590,9 +1610,9 @@ fn a_web_search_receipt_names_its_source_and_any_degradation() {
     }
 }
 
-/// A workflow's transcript is its start and its finish; live progress is the
+/// A workflow's transcript is one row per run; live progress is the
 /// workbar's. A foreground `run` card that returned its settled record says
-/// both — started, then finished with agents — without repeating the header
+/// only the finish — the final state replaces `started` — without repeating the header
 /// in a body; the expanded card adds the goal, the child labels, the final
 /// result and the error; the status card lists the runs it found.
 ///
@@ -1622,12 +1642,15 @@ fn workflow_cards_report_lifecycle_children_phases_and_failures() {
     run.input_summary = Some("action: run".to_string());
     run.output = Some(run_output);
     let text = lines_text(&run.lines_with_mode(120, true, RenderMode::Live));
-    assert!(text.contains("started"), "the start line: {text:?}");
     assert!(
-        text.contains("finished") && text.contains("/3 agents"),
-        "the finish line with finished/total agents: {text:?}"
+        !text.contains("started"),
+        "the settled record replaces the start line: {text:?}"
     );
-    assert_eq!(text.lines().count(), 2, "start and finish only: {text:?}");
+    assert!(
+        text.contains("finished") && text.contains("/3 done"),
+        "the finish line with done/total agents: {text:?}"
+    );
+    assert_eq!(text.lines().count(), 1, "one row for the run: {text:?}");
     // #6503: a run with no failures does not announce `0 fail`.
     assert!(!text.contains("fail"), "no zero failure count: {text:?}");
     assert!(
@@ -1693,6 +1716,76 @@ fn workflow_cards_report_lifecycle_children_phases_and_failures() {
             "the status card must list {needle:?}: {text:?}"
         );
     }
+}
+
+/// The founder's transcript (2026-09-28): a refused `start` echoed
+/// `action: start` and hid its reason; the settled run's reason was cut
+/// mid-word. Each is one row that says why.
+#[test]
+fn workflow_rows_say_why_without_raw_action_or_mid_word_cuts() {
+    let mut refused = generic_tool("workflow", ToolStatus::Failed);
+    refused.input_summary = Some("action: start".to_string());
+    refused.output = Some(
+        "Error: Invalid input for tool 'workflow': Workflow leaf 'engine-readiness': \
+         task(): cwd entries must be bounded repo-relative paths\n\
+         Tool validation feedback: {\"category\":\"invalid_input\"}"
+            .to_string(),
+    );
+    let text = lines_text(&refused.lines_with_mode(100, true, RenderMode::Live));
+    assert!(!text.contains("action: start"), "{text}");
+    assert!(
+        text.contains("cwd entries must be bounded repo-relative paths"),
+        "{text}"
+    );
+    assert!(!text.contains("Invalid input for tool"), "{text}");
+
+    let reason = "[auth] Authorization failed: You have run out of credits or need a Grok \
+                  subscription. Add credits at https://grok.com/?_s=usage.";
+    let failed = serde_json::json!({
+        "run_id": "workflow_6409ebe6",
+        "status": "failed",
+        "workflow_goal": "Read-only release-readiness audit for Codewhale v0.10.1. Determine blockers.",
+        "started_at_ms": 1_000,
+        "completed_at_ms": 1_355,
+        "error": "no task produced a result: all 2 task(s) failed and 1 fan-out(s) lost every slot (no work survived them); the recorded result reflects no completed work",
+        "transcript_line": "finished",
+        "events": [
+            {"type": "run_started", "at_ms": 1_000, "workflow_goal": "Read-only release-readiness audit for Codewhale v0.10.1. Determine blockers."},
+            {"type": "task_started", "at_ms": 1_080, "task_id": "a", "workflow_task_label": "engine-readiness"},
+            {"type": "task_started", "at_ms": 1_117, "task_id": "b", "workflow_task_label": "desktop-readiness"},
+            {"type": "task_completed", "at_ms": 1_329, "task_id": "a", "status": "failed", "reason": reason},
+            {"type": "task_completed", "at_ms": 1_338, "task_id": "b", "status": "failed", "reason": reason},
+            {"type": "run_completed", "at_ms": 1_355, "status": "failed"},
+        ],
+    })
+    .to_string();
+    let mut finish = generic_tool("workflow", ToolStatus::Failed);
+    finish.output = Some(failed);
+    let text = lines_text(&finish.lines_with_mode(60, true, RenderMode::Live));
+    assert!(!text.contains("started"), "{text}");
+    assert!(text.contains("0/2 done · 2 failed"), "{text}");
+    assert!(text.contains("355ms"), "{text}");
+    // The whole first sentence, wrapped, never cut.
+    let flat = text
+        .split_whitespace()
+        .filter(|word| {
+            !word
+                .chars()
+                .all(|ch| ('\u{2500}'..='\u{259F}').contains(&ch))
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        flat.contains(
+            "Authorization failed: You have run out of credits or need a Grok subscription"
+        ),
+        "{text}"
+    );
+    assert!(
+        !flat.contains("grok.com"),
+        "only the first sentence: {text}"
+    );
+    assert!(!text.contains("..."), "{text}");
 }
 
 #[test]
@@ -1915,7 +2008,7 @@ fn an_activity_group_renders_as_a_single_metadata_line() {
     let lines = cell.lines_with_mode(120, true, RenderMode::Live);
 
     assert_eq!(lines.len(), 1);
-    assert_eq!(lines_text(&lines), "Explored 2 files, 1 search");
+    assert_eq!(lines_text(&lines), "Explored 2 files, 1 search ›");
     assert!(!lines_text(&lines).contains("activity_group"));
 }
 
@@ -2014,6 +2107,7 @@ fn replay_routes_repair_receipts_and_plan_calls_to_typed_cells() {
     let plan = Message {
         role: Role::Assistant,
         content: vec![ContentBlock::ToolUse {
+            execution_id: None,
             id: "plan-1".to_string(),
             name: "update_plan".to_string(),
             input: serde_json::json!({
@@ -2440,18 +2534,10 @@ fn card_rail_carries_the_cell_status() {
             .style
             .fg
             .expect("header status glyph must be styled");
-        if status == ToolStatus::Success {
-            // A settled card dims its border but keeps an identifying glyph.
-            assert_ne!(
-                rail_color, glyph_color,
-                "a settled card must not dim its glyph along with its rail"
-            );
-        } else {
-            assert_eq!(
-                rail_color, glyph_color,
-                "{status:?} must read the same on the rail and the glyph"
-            );
-        }
+        assert_eq!(
+            rail_color, glyph_color,
+            "{status:?} must read the same on the rail and the glyph"
+        );
 
         rails.push((status, rail_color));
     }
@@ -2466,32 +2552,30 @@ fn card_rail_carries_the_cell_status() {
     }
 }
 
-/// The header glyph reports identity, not just lifecycle: a passed `verify`
-/// card keeps its green tick where a finished `read` keeps the family accent
-/// the mockup draws as a blue magnifier. Relationship, not token — the two must
-/// simply not collapse into one another.
+/// Finished work shares quiet ink while its glyph shape preserves identity:
+/// a passed verify and a completed read must still be distinguishable.
 #[test]
 fn a_settled_verify_glyph_does_not_read_as_a_settled_read() {
     let verify = generic_tool("run_tests", ToolStatus::Success);
     let read = generic_tool("read_file", ToolStatus::Success);
 
-    let glyph_color = |cell: &GenericToolCell| {
+    let glyph = |cell: &GenericToolCell| {
         cell.lines_with_mode_and_locale(
             80,
             /*low_motion*/ true,
             RenderMode::Live,
             codewhale_localization::Locale::En,
         )[0]
-        .spans[1]
-            .style
-            .fg
-            .expect("header status glyph must be styled")
+        // Rail, shared status mark, then the tool-family identity glyph.
+        .spans[2]
+            .clone()
     };
-
-    assert_ne!(
-        glyph_color(&verify),
-        glyph_color(&read),
-        "a passed verify and a finished read must not share a glyph colour"
+    let verify = glyph(&verify);
+    let read = glyph(&read);
+    assert_ne!(verify.content, read.content, "tool identity stays visible");
+    assert_eq!(
+        verify.style.fg, read.style.fg,
+        "settled work shares quiet ink"
     );
 }
 
@@ -2585,41 +2669,38 @@ fn tool_rail_is_distinct_for_every_status() {
     }
 }
 
-/// The rail reports lifecycle, the glyph reports identity, and each half of
-/// that split is load-bearing: a settled card must dim its border while
-/// keeping an identifying glyph, a passed verify must not share a glyph with a
-/// finished read, and the two must never disagree about trouble.
+/// Finished rows recede while failures and warnings retain attention ink.
 #[test]
-fn rail_and_glyph_split_only_where_the_card_has_settled() {
+fn calm1_settled_headers_are_muted_without_hiding_failures() {
     use crate::tui::widgets::tool_card::ToolFamily;
+    use ratatui::style::Modifier;
     for family in [ToolFamily::Read, ToolFamily::Verify] {
-        for status in [ToolStatus::Running, ToolStatus::Warning, ToolStatus::Failed] {
+        for status in [
+            ToolStatus::Running,
+            ToolStatus::Success,
+            ToolStatus::Hydrated,
+            ToolStatus::Warning,
+            ToolStatus::Failed,
+        ] {
             assert_eq!(
                 super::tool_rail_color(status),
-                super::tool_glyph_color(status, family),
-                "{status:?} must read the same on the rail and the glyph"
+                super::tool_glyph_color(status, family)
             );
         }
         assert_ne!(
-            super::tool_rail_color(ToolStatus::Success),
             super::tool_glyph_color(ToolStatus::Success, family),
-            "a settled {family:?} card must dim its border without dimming its glyph"
-        );
-        assert_eq!(
-            super::tool_glyph_color(ToolStatus::Hydrated, family),
-            super::tool_rail_color(ToolStatus::Hydrated),
-            "a hydrated {family:?} card has not succeeded at anything and must not borrow an accent"
+            super::tool_glyph_color(ToolStatus::Failed, family)
         );
     }
-    assert_ne!(
-        super::tool_glyph_color(ToolStatus::Success, ToolFamily::Verify),
-        super::tool_glyph_color(ToolStatus::Success, ToolFamily::Read),
-        "a passed verify and a finished read must not share a glyph colour"
+    assert!(
+        !super::tool_title_style(ToolStatus::Success)
+            .add_modifier
+            .contains(Modifier::BOLD)
     );
-    assert_eq!(
-        super::tool_glyph_color(ToolStatus::Success, ToolFamily::Read),
-        super::tool_glyph_color(ToolStatus::Running, ToolFamily::Read),
-        "a finished read keeps the accent it wore while running"
+    assert!(
+        super::tool_title_style(ToolStatus::Failed)
+            .add_modifier
+            .contains(Modifier::BOLD)
     );
 }
 
@@ -2861,4 +2942,126 @@ fn first_file_line_reference_skips_unresolvable_and_malformed_rows() {
         super::first_file_line_reference("no references here\n", workspace).is_none(),
         "a cell with nothing to open must report nothing, not a default"
     );
+}
+
+/// #6601: the project-trust warning is a runtime-owned internal message; the
+/// model reads it, the transcript never shows it as the user's words.
+#[test]
+fn workspace_trust_warning_renders_no_transcript_cell() {
+    for warning in [Some("untrusted project skills were skipped"), None] {
+        let message = crate::runtime_handoff::workspace_trust_runtime_message(warning);
+        assert!(crate::runtime_handoff::is_internal_runtime_handoff(
+            &message
+        ));
+        assert!(
+            super::history_cells_from_message(&message).is_empty(),
+            "{warning:?}"
+        );
+    }
+}
+
+#[test]
+fn calm1_failed_tool_preview_matrix_preserves_full_details_and_mcp_identity() {
+    for width in [40, 60, 80, 140] {
+        for status in [ToolStatus::Running, ToolStatus::Success, ToolStatus::Failed] {
+            let output = (0..30)
+                .map(|i| format!("row {i:02}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let mcp = HistoryCell::Tool(ToolCell::Mcp(super::McpToolCell {
+                tool: "linear_get_issue".into(),
+                status,
+                content: Some(output.clone()),
+                is_image: false,
+            }));
+            let mut generic = generic_tool("read_file", status);
+            generic.output = Some(output);
+            for (cell, is_mcp) in [
+                (mcp, true),
+                (HistoryCell::Tool(ToolCell::Generic(generic)), false),
+            ] {
+                let options = TranscriptRenderOptions {
+                    calm_mode: true,
+                    show_tool_details: false,
+                    low_motion: true,
+                    ..Default::default()
+                };
+                let live = cell.lines_with_options(width, options);
+                let text = lines_text(&live);
+                let full = lines_text(&cell.transcript_lines(width));
+                assert!(
+                    full.contains("row 15"),
+                    "full details must preserve omitted content"
+                );
+                if is_mcp {
+                    assert_eq!(text.matches("linear_get_issue").count(), 1, "{text}");
+                }
+                if status == ToolStatus::Failed {
+                    assert!(text.contains("row 00") && text.contains("row 29"), "{text}");
+                    assert!(!text.contains("row 15"), "{text}");
+                    assert!(text.contains("lines omitted"), "{text}");
+                    assert_eq!(
+                        (0..30)
+                            .filter(|i| text.contains(&format!("row {i:02}")))
+                            .count(),
+                        6
+                    );
+                    if is_mcp {
+                        assert!(live.len() <= 8, "{text}");
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn calm1_settled_reasoning_is_one_localized_row_and_stays_expandable() {
+    for (locale, expected) in [
+        (codewhale_localization::Locale::En, "Thought for 12s"),
+        (codewhale_localization::Locale::ZhHans, "思考用时 12s"),
+    ] {
+        let cell = HistoryCell::Thinking {
+            content: "private reasoning body\nlast step".into(),
+            streaming: false,
+            duration_secs: Some(12.0),
+        };
+        let options = TranscriptRenderOptions {
+            calm_mode: true,
+            locale,
+            ..Default::default()
+        };
+        let (lines, action) = cell.lines_with_options_folded(80, options, None);
+        assert_eq!(lines.len(), 1);
+        assert!(
+            lines_text(&lines).contains(expected),
+            "{}",
+            lines_text(&lines)
+        );
+        assert_eq!(action, Some(super::ReasoningAction::Expand));
+        let expanded = cell
+            .lines_with_options_folded(80, options, Some(ThinkingFold::Expanded))
+            .0;
+        assert!(lines_text(&expanded).contains("private reasoning body"));
+    }
+}
+
+#[test]
+fn calm1_calm_and_hidden_details_share_one_card_budget() {
+    let mut exec = exec_tool("command", ToolStatus::Success);
+    exec.output = Some(numbered_output(40));
+    let cell = HistoryCell::Tool(ToolCell::Exec(exec));
+    let mut rendered = Vec::new();
+    for (calm_mode, show_tool_details) in [(true, false), (true, true), (false, false)] {
+        let options = TranscriptRenderOptions {
+            calm_mode,
+            show_tool_details,
+            low_motion: true,
+            ..Default::default()
+        };
+        let lines = cell.lines_with_options(80, options);
+        assert!(lines.len() <= super::constants::TOOL_SUMMARY_CARD_LINES);
+        rendered.push(lines_text(&lines));
+    }
+    assert!(rendered.windows(2).all(|pair| pair[0] == pair[1]));
 }

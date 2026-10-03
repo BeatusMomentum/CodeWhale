@@ -453,14 +453,30 @@ impl FleetListView {
             return;
         }
 
-        let rows_visible = usize::from(area.height).max(1);
-        let scroll = self.row.saturating_sub(rows_visible.saturating_sub(1));
+        // Entries paint two rows (name + summary), one while a delete is
+        // armed. Scroll and fit by painted rows, not entry count, so the
+        // selected entry is always fully on screen.
+        let height = usize::from(area.height).max(1);
+        let entry_height = |idx: usize| {
+            if self.pending_delete == Some(idx) {
+                1
+            } else {
+                2
+            }
+        };
+        let row = self.row.min(self.entries.len() - 1);
+        let mut scroll = row;
+        let mut used = entry_height(row);
+        while scroll > 0 && used + entry_height(scroll - 1) <= height {
+            scroll -= 1;
+            used += entry_height(scroll);
+        }
 
         let mut lines = Vec::new();
         let mut hitboxes = Vec::new();
-        for (idx, entry) in self.entries.iter().enumerate() {
-            if idx < scroll || idx >= scroll + rows_visible {
-                continue;
+        for (idx, entry) in self.entries.iter().enumerate().skip(scroll) {
+            if !lines.is_empty() && lines.len() + entry_height(idx) > height {
+                break;
             }
             let selected = idx == self.row;
             let is_selected_fleet = self
@@ -1080,5 +1096,38 @@ provider = "deepseek"
             codewhale_palette::SURFACE_ELEVATED,
             "hovered entry must show the shared hover band"
         );
+    }
+
+    /// U09-m5: entries paint two rows (name + summary). Scrolling by entry
+    /// count pushed the selected bottom entry below the list; every painted
+    /// entry, the selected one included, must fit inside the list area.
+    #[test]
+    fn selected_entry_stays_on_screen_when_entries_are_two_rows() {
+        let _lock = crate::test_support::lock_test_env();
+        let home = tempfile::TempDir::new().unwrap();
+        let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", home.path());
+        let ws = tempfile::TempDir::new().unwrap();
+        for name in ["Alpha", "Bravo", "Charlie", "Delta", "Echo"] {
+            save_in(ws.path(), FleetScope::Workspace, name);
+        }
+        let mut view = FleetListView::new(&app_in(ws.path().to_path_buf()), &Config::default());
+        assert_eq!(view.entries.len(), 5);
+        let area = Rect::new(0, 0, 80, 4);
+        for row in 0..view.entries.len() {
+            view.row = row;
+            let mut buf = Buffer::empty(area);
+            view.render_rows(area, &mut buf);
+            let hitboxes = view.row_hitboxes.borrow();
+            assert!(
+                hitboxes.iter().any(|(_, idx)| *idx == row),
+                "row {row} not painted: {hitboxes:?}"
+            );
+            assert!(
+                hitboxes
+                    .iter()
+                    .all(|(rect, _)| rect.bottom() <= area.bottom()),
+                "row {row}: {hitboxes:?}"
+            );
+        }
     }
 }

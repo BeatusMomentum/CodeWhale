@@ -286,6 +286,12 @@ pub trait WorkflowDriver: Send + Sync {
 
     /// Receive a script progress event (ordered, synchronous).
     fn progress(&self, event: ProgressEvent);
+
+    /// The run's workspace root. When known, `task()` accepts an absolute
+    /// `cwd` inside it and normalizes it to the repo-relative form.
+    fn workspace_root(&self) -> Option<std::path::PathBuf> {
+        None
+    }
 }
 
 /// One `tools.call()` invocation: a tool name plus its JSON arguments.

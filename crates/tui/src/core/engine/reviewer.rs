@@ -74,7 +74,7 @@ impl ReviewerOutcome {
                 "Auto-Review guardian denied tool '{tool_name}': {reason}. Do not work around this denial; find a materially safer path or stop."
             ))),
             Self::Unavailable { reason } => Err(ToolError::permission_denied(format!(
-                "Auto-Review guardian unavailable ({reason}); the call was denied (fail closed). Switch to Ask to review this call yourself."
+                "Auto-Review guardian unavailable ({reason}); the call was denied (fail closed). To run it, the person can switch Permissions to Full Access, or to Ask where a prompt can be answered."
             ))),
             Self::Cancelled => Err(ToolError::cancelled(
                 "Auto-Review guardian request cancelled",
@@ -230,11 +230,15 @@ mod tests {
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let server = MockServer::start().await;
-        let client = crate::client::CodewhaleClient::new(&crate::config::Config {
-            api_key: Some("test-guardian-cache-key".to_string()),
-            base_url: Some(server.uri()),
-            ..Default::default()
-        })
+        let client = crate::client::CodewhaleClient::new(
+            &crate::config::Config {
+                ..Default::default()
+            }
+            .with_legacy_root(
+                Some("test-guardian-cache-key".to_string()),
+                Some(server.uri()),
+            ),
+        )
         .unwrap();
         for (decision, risk) in [("allow", "low"), ("deny", "high")] {
             server.reset().await;

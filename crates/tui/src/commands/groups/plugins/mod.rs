@@ -356,12 +356,10 @@ fn list_bundles_and_legacy_tools(
         output
     };
     append_diagnostics(presentation, &mut output, &plugin.registry_diagnostics());
-    if let Some(report) = crate::extension_host::status_report() {
-        // Diagnostics and the stderr tail carry plugin-controlled text.
-        for line in report.lines() {
-            output.push('\n');
-            output.push_str(&escape_review_text(line));
-        }
+    // Diagnostics and the stderr tail carry plugin-controlled text.
+    for line in crate::extension_host::status_report().lines() {
+        output.push('\n');
+        output.push_str(&escape_review_text(line));
     }
 
     if let Ok(Some(scan)) = plugin.legacy_scan() {
@@ -387,6 +385,7 @@ fn list_bundles_and_legacy_tools(
                 escape_review_path(&tool.path)
             );
         }
+        append_diagnostics(presentation, &mut output, &scan.diagnostics);
     }
 
     if let Some(nudge) = plugin.reload_nudge() {
@@ -412,7 +411,62 @@ fn show_bundle(
             );
         }
     };
-    CommandResult::message(render::render_bundle_detail(presentation, &detail, true))
+    let mut output = render::render_bundle_detail(presentation, &detail, true);
+    if let Some(report) = crate::extension_host::owner_report(&detail.id) {
+        append_host_owner_report(presentation, &mut output, &report);
+    }
+    CommandResult::message(output)
+}
+
+fn append_host_owner_report(
+    presentation: &dyn CommandPresentationContext,
+    output: &mut String,
+    report: &crate::extension_host::OwnerReport,
+) {
+    use crate::extension_host::registry::OwnerState;
+
+    let (state_key, reason) = match &report.state {
+        Some(OwnerState::Activating) => ("cmd_plugin_owner_activating", None),
+        Some(OwnerState::Active) => ("cmd_plugin_owner_active", None),
+        Some(OwnerState::Failed(reason)) => ("cmd_plugin_owner_failed", Some(reason)),
+        Some(OwnerState::Faulted(reason)) => ("cmd_plugin_owner_faulted", Some(reason)),
+        Some(OwnerState::Revoked) => ("cmd_plugin_owner_revoked", None),
+        None => ("cmd_plugin_owner_inactive", None),
+    };
+    let reason = reason.map(|value| escape_review_text(value));
+    let replacements = reason
+        .as_deref()
+        .map(|value| vec![("reason", value)])
+        .unwrap_or_default();
+    let state = presentation
+        .translate(state_key, &replacements)
+        .unwrap_or_default();
+    let tools = report
+        .tools
+        .iter()
+        .map(|name| escape_review_text(name))
+        .collect::<Vec<_>>();
+    let tool_names = if tools.is_empty() {
+        "—".to_string()
+    } else {
+        tools.join(", ")
+    };
+    output.push('\n');
+    output.push_str(
+        &presentation
+            .translate(
+                "cmd_plugin_owner_report",
+                &[
+                    ("state", &state),
+                    ("count", &tools.len().to_string()),
+                    ("tools", &tool_names),
+                ],
+            )
+            .unwrap_or_default(),
+    );
+    for line in &report.diagnostics {
+        let _ = write!(output, "\n  · {}", escape_review_text(line));
+    }
 }
 
 /// `/plugin export <name> <target-dir>` — publish a loaded bundle as a

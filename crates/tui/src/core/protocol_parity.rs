@@ -218,7 +218,7 @@ fn tool_error_to_wire(error: &ToolError) -> wire::ToolCallError {
             field: field.clone(),
         },
         ToolError::PathEscape { path } => wire::ToolCallError::PathEscape { path: path.clone() },
-        ToolError::ExecutionFailed { message } => wire::ToolCallError::ExecutionFailed {
+        ToolError::ExecutionFailed { message, .. } => wire::ToolCallError::ExecutionFailed {
             message: message.clone(),
         },
         ToolError::Timeout { seconds } => wire::ToolCallError::Timeout { seconds: *seconds },
@@ -385,6 +385,10 @@ fn compaction_to_wire(config: &CompactionConfig) -> wire_op::CompactionPolicy {
 /// fields (`initial_routed_usage`, `hook_executor`) and resolved routes are
 /// stripped; only their non-secret receipts cross.
 fn turn_spec_to_wire(spec: &crate::core::ops::TurnSpec) -> wire_op::TurnSpec {
+    // `spec.submission_id` is deliberately not projected: the token is
+    // host-process-local by design and the wire op has no correlation twin,
+    // so wire submitters observe `TurnStarted.submission_id` always absent
+    // and cannot correlate submissions on that channel.
     wire_op::TurnSpec {
         max_output_tokens: spec.max_output_tokens,
         content: spec.content.clone(),
@@ -486,7 +490,9 @@ pub fn event_to_protocol(event: &Event, ids: &ProtocolIds) -> wire::EventMsg {
             session_id,
             index: count(*index),
         },
-        Event::ToolCallStarted { id, name, input } => wire::EventMsg::ToolCallStarted {
+        Event::ToolCallStarted {
+            id, name, input, ..
+        } => wire::EventMsg::ToolCallStarted {
             thread_id,
             session_id,
             tool_call_id: id.clone(),
@@ -497,7 +503,9 @@ pub fn event_to_protocol(event: &Event, ids: &ProtocolIds) -> wire::EventMsg {
             thread_id,
             session_id,
         },
-        Event::ToolCallComplete { id, name, result } => wire::EventMsg::ToolCallComplete {
+        Event::ToolCallComplete {
+            id, name, result, ..
+        } => wire::EventMsg::ToolCallComplete {
             thread_id,
             session_id,
             tool_call_id: id.clone(),
@@ -537,14 +545,21 @@ pub fn event_to_protocol(event: &Event, ids: &ProtocolIds) -> wire::EventMsg {
             turn_id,
             created_at,
             route,
+            submission_id,
         } => wire::EventMsg::TurnStarted {
             thread_id,
             session_id,
             turn_id: turn_id.clone(),
             created_at: *created_at,
             route: route.as_ref().map(route_to_wire),
+            submission_id: submission_id.clone(),
         },
         Event::ToolRequestSnapshot { snapshot } => wire::EventMsg::ToolRequestSnapshot {
+            thread_id,
+            session_id,
+            snapshot: to_value(snapshot),
+        },
+        Event::WorkspaceSnapshotTaken { snapshot } => wire::EventMsg::WorkspaceSnapshotTaken {
             thread_id,
             session_id,
             snapshot: to_value(snapshot),
@@ -1153,6 +1168,14 @@ pub fn op_to_protocol(op: &Op) -> wire_op::Op {
             workspace: workspace.clone(),
             mode: app_mode_str(*mode).to_string(),
         },
+        Op::RewindConversation {
+            expected,
+            messages,
+            tx: _,
+        } => wire_op::Op::RewindConversation {
+            expected: to_value(expected),
+            messages: messages.iter().map(to_value).collect(),
+        },
         Op::CompactContext {
             id,
             route,
@@ -1174,7 +1197,10 @@ pub fn op_to_protocol(op: &Op) -> wire_op::Op {
             config_path: config_path.clone(),
         },
         Op::PurgeContext => wire_op::Op::PurgeContext,
-        Op::EditLastTurn { new_message } => wire_op::Op::EditLastTurn {
+        Op::EditLastTurn {
+            new_message,
+            submission_id: _,
+        } => wire_op::Op::EditLastTurn {
             new_message: new_message.clone(),
         },
         Op::SetAdvisorEnabled { enabled } => wire_op::Op::SetAdvisorEnabled { enabled: *enabled },
@@ -1412,17 +1438,20 @@ mod tests {
                 content: "hmm".into(),
             },
             Event::ToolCallStarted {
+                model_call: None,
                 id: "c1".into(),
                 name: "read_file".into(),
                 input: json!({"path": "x"}),
             },
             Event::ToolCallHeartbeat,
             Event::ToolCallComplete {
+                model_call: None,
                 id: "c1".into(),
                 name: "read_file".into(),
                 result: Ok(ToolResult::success("ok")),
             },
             Event::ToolCallComplete {
+                model_call: None,
                 id: "c2".into(),
                 name: "bash".into(),
                 result: Err(ToolError::Timeout { seconds: 9 }),
@@ -1431,6 +1460,9 @@ mod tests {
                 turn_id: "turn-1".into(),
                 created_at: chrono::Utc::now(),
                 route: None,
+                // A host-stamped token, not `None`: the projection must carry
+                // it verbatim or the assertion on `events[7]` below fails.
+                submission_id: Some("sub-host-1".into()),
             },
             Event::TurnComplete {
                 usage: usage.clone(),
@@ -1440,6 +1472,17 @@ mod tests {
                 error: Some("stopped".into()),
                 tool_catalog: None,
                 base_url: Some("https://example.invalid".into()),
+            },
+            Event::WorkspaceSnapshotTaken {
+                snapshot: crate::snapshot::WorkspaceSnapshotRef {
+                    kind: crate::snapshot::WorkspaceSnapshotKind::Tool,
+                    snapshot_id: "a".repeat(40),
+                    tree_id: "b".repeat(40),
+                    session_id: "thr_1".into(),
+                    tool_call_id: Some("c1".into()),
+                    write_paths: Some(vec!["src/lib.rs".into()]),
+                    changed_paths: Some(Vec::new()),
+                },
             },
             Event::RoutedTurnUsage {
                 usage: usage.clone(),
@@ -1518,6 +1561,13 @@ mod tests {
             serde_json::to_value(events[6].to_protocol(&ids)).unwrap()["result"],
             json!({"outcome": "err", "error": {"kind": "timeout", "seconds": 9}})
         );
+        // The host correlation token must cross the projection verbatim: the
+        // app forwarder binds its submit-window actions to this echo, so a
+        // silently dropped mapping would defeat the contract.
+        assert_eq!(
+            serde_json::to_value(events[7].to_protocol(&ids)).unwrap()["submission_id"],
+            json!("sub-host-1")
+        );
         assert_eq!(
             serde_json::to_value(events[8].to_protocol(&ids)).unwrap()["status"],
             "interrupted"
@@ -1529,6 +1579,35 @@ mod tests {
         let error = serde_json::to_value(error.to_protocol(&ids)).unwrap();
         assert_eq!(error["category"], "rate_limit");
         assert_eq!(error["severity"], "warning");
+    }
+
+    #[test]
+    fn conditional_rewind_projection_preserves_expected_state_and_reply_owner() {
+        let expected = crate::core::ops::SessionSnapshot {
+            session_id: "observed-conversation".into(),
+            messages: vec![],
+            total_tokens: 9,
+            model: "observed-model".into(),
+            model_provider: "deepseek".into(),
+            model_provider_id: Some("configured-provider".into()),
+            workspace: std::path::PathBuf::from("/observed/workspace"),
+            system_prompt: None,
+            mode: "agent".into(),
+        };
+        let (tx, mut receive) = tokio::sync::oneshot::channel();
+        let op = Op::RewindConversation {
+            expected: Box::new(expected.clone()),
+            messages: vec![],
+            tx,
+        };
+        let value = serde_json::to_value(op.to_protocol()).unwrap();
+        assert_eq!(value["kind"], "rewind_conversation");
+        assert!(value["expected"] == to_value(&expected));
+        assert!(value.get("tx").is_none());
+        assert!(matches!(
+            receive.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
     }
 
     #[test]
@@ -1587,6 +1666,7 @@ mod tests {
             Op::PurgeContext,
             Op::EditLastTurn {
                 new_message: "again".into(),
+                submission_id: None,
             },
             Op::SetAdvisorEnabled { enabled: true },
             Op::GetSubAgentSettlement {

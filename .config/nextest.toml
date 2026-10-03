@@ -1,10 +1,12 @@
 # cargo-nextest profile for contributors (`cargo nextest run --workspace`).
 #
-# `cargo test --workspace --all-features --locked` remains the authoritative
-# release gate. nextest is a faster local loop: it runs each test in its own
-# process, so the 10k-test codewhale-tui unit suite finishes in well under
-# half the wall-clock time of libtest on a multi-core machine, and slow or
-# hanging tests are named instead of stalling the whole binary.
+# Required GitHub CI and RC/release parity use nextest plus Cargo doctests.
+# nextest runs each test in its own process; that does not establish a pass
+# under libtest's shared-process globals. GH6698 separately requires two full
+# `cargo test --workspace --all-features --locked -- --format=pretty` passes
+# at one exact revision. CI's manual `shared-process-twice` mode records that
+# evidence; adding the mode or passing nextest does not satisfy the issue.
+# nextest also remains a faster local loop with named slow/hanging tests.
 #
 # Because tests no longer share a process, integration suites that serialize
 # on in-process locks must be bounded here when they contend for mock-server
@@ -42,6 +44,11 @@ exec-persistent-service = { max-threads = 1 }
 # (a durable heartbeat and a `ps` sample on every scheduler tick) is now
 # bounded to once a second per worker.
 fleet-manager-lifecycle = { max-threads = 1 }
+# Extension fixtures launch real Node hosts with a five-second production
+# handshake deadline. Windows full-suite runs on #6776/#6780 reported ordinary
+# hosts missing that deadline. Bound contention across nextest processes;
+# keep production deadlines and the explicit hang-detection tests unchanged.
+extension-host = { max-threads = 1 }
 
 # First matching test-group override wins. Keep these more-specific
 # integration filters before binary(integration) so they are not stolen
@@ -67,6 +74,10 @@ test-group = 'telemetry-contract'
 [[profile.default.overrides]]
 filter = 'package(codewhale-tui) & kind(lib) & test(/^fleet::manager::tests::/)'
 test-group = 'fleet-manager-lifecycle'
+
+[[profile.default.overrides]]
+filter = 'package(codewhale-tui) & kind(lib) & (test(/^extension_host::/) | test(/^core::engine::.*extension/))'
+test-group = 'extension-host'
 
 [[profile.default.overrides]]
 filter = 'binary(integration) & test(/^exec_persistent_service::/)'

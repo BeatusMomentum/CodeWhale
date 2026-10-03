@@ -19,7 +19,11 @@ import { MAX_ENVELOPE_BYTES, validateEnvelope } from "@/lib/telemetry/product-us
  * holds it.
  */
 
-export const runtime = "edge";
+// No `runtime = "edge"`: @opennextjs/cloudflare does not support the edge
+// runtime. Its `migrate` command says to remove the declaration, and its
+// server bundle replaces Next's edge runtime with an empty shim. How the
+// deployed route behaved while it was declared has not been checked. The
+// default runtime already has fetch, Request, and TextDecoder.
 
 export const CANONICAL_INGEST_URL = "https://telemetry.codewhale.net/v1/telemetry";
 const FORWARD_TIMEOUT_MS = 1500;

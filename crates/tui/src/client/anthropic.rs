@@ -34,10 +34,10 @@ use crate::logging;
 use crate::tools::schema_sanitize;
 use codewhale_models::{ContentBlock, MessageRequest, MessageResponse, StreamEvent, Usage};
 
+use super::CodewhaleClient;
 use super::prepared::WireDialect;
 use super::role_placement::{RolePlacement, role_placement};
-use super::wire::{extract_sse_data_value, next_sse_line};
-use super::{CodewhaleClient, ERROR_BODY_MAX_BYTES, bounded_error_text};
+use super::wire::{extract_sse_data_value, next_sse_line, push_sse_event_data};
 
 /// Maximum `cache_control` breakpoints Anthropic accepts per request.
 const MAX_CACHE_BREAKPOINTS: usize = 4;
@@ -213,81 +213,64 @@ impl CodewhaleClient {
         body
     }
 
+    /// Non-streaming send through the shared typed retry path
+    /// (`send_with_retry`): 429/5xx/transport failures retry with backoff and
+    /// honor `Retry-After`, and a final failure stays a downcastable
+    /// `LlmError` so the engine can classify auth, rate-limit, context and
+    /// invalid-request failures like every other wire.
     async fn send_anthropic_request(&self, url: &str, body: &Value) -> Result<reqwest::Response> {
         let url = self.messages_transport_url(url);
-        self.wait_for_rate_limit().await;
-        let response = self
-            .http_client
-            .post(&url)
-            .header("Accept", "text/event-stream")
-            .json(body)
-            .send()
-            .await
-            .context("Anthropic Messages API request failed")?;
-        self.check_anthropic_response(response).await
-    }
-
-    /// Shared status/error-envelope handling for streaming and
-    /// non-streaming Messages responses.
-    async fn check_anthropic_response(
-        &self,
-        response: reqwest::Response,
-    ) -> Result<reqwest::Response> {
-        let status = response.status();
-        if !status.is_success() {
-            let raw = bounded_error_text(response, ERROR_BODY_MAX_BYTES).await;
-            let (error_type, message) = parse_anthropic_error_envelope(&raw);
-            self.mark_request_failure(&format!("anthropic status={status}"))
-                .await;
-            anyhow::bail!("Anthropic API error (HTTP {status} {error_type}): {message}");
-        }
-        self.mark_request_success().await;
-        Ok(response)
+        let request_body =
+            serde_json::to_vec(body).context("Failed to serialize Anthropic Messages request")?;
+        self.send_with_retry(|| {
+            self.http_client
+                .post(&url)
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .header("Accept", "text/event-stream")
+                .body(request_body.clone())
+        })
+        .await
+        .context("Anthropic Messages API request failed")
     }
 
     /// Open the streaming Messages request through the shared stream-entry
     /// transport policy: bounded header wait, dual-client selection, and at
     /// most one HTTP/1.1 fallback retry on a classified H2 header stall.
-    /// Wire-specific request construction (headers, endpoint, body) stays
-    /// here at the adapter edge.
+    /// Inside each open attempt the provider retry loop (`send_with_retry`)
+    /// handles rate limits and transient upstream failures before any stream
+    /// body exists, as the Chat and Responses adapters do. Wire-specific
+    /// request construction (headers, endpoint, body) stays here at the
+    /// adapter edge.
     async fn open_anthropic_stream_response(
         &self,
         url: &str,
         body: &Value,
     ) -> Result<reqwest::Response> {
         let url = self.messages_transport_url(url);
-        let open_req = super::stream_entry::StreamOpenRequest::new(
-            super::stream_entry::stream_open_timeout(),
-            self.stream_idle_timeout,
-        );
-        let opened = super::stream_entry::open_sse_response(&open_req, |policy| {
+        let request_body =
+            serde_json::to_vec(body).context("Failed to serialize Anthropic Messages request")?;
+        let open_req = self.stream_open_request();
+        super::stream_entry::open_sse_response(&open_req, |policy| {
             let url = url.clone();
+            let request_body = request_body.clone();
             async move {
-                self.wait_for_rate_limit().await;
                 let client = super::stream_entry::client_for_policy(
                     &self.http_client,
                     self.http1_fallback_client(),
                     policy,
                 );
-                client
-                    .post(&url)
-                    .header("Accept", "text/event-stream")
-                    .json(body)
-                    .send()
-                    .await
-                    .context("Anthropic Messages API request failed")
+                self.send_with_retry(|| {
+                    client
+                        .post(&url)
+                        .header(reqwest::header::CONTENT_TYPE, "application/json")
+                        .header("Accept", "text/event-stream")
+                        .body(request_body.clone())
+                })
+                .await
+                .context("Anthropic Messages API request failed")
             }
         })
-        .await;
-        let response = match opened {
-            Ok(response) => response,
-            Err(err) => {
-                self.mark_request_failure(&format!("anthropic stream open: {err}"))
-                    .await;
-                return Err(err);
-            }
-        };
-        self.check_anthropic_response(response).await
+        .await
     }
 
     /// Handle a streaming Messages API request.
@@ -315,6 +298,9 @@ impl CodewhaleClient {
             // multi-byte UTF-8 char (CJK/emoji) split across HTTP/2 DATA is
             // never corrupted to U+FFFD. Genuine invalid bytes fail closed.
             let mut buffer: Vec<u8> = Vec::new();
+            // `data:` fields of the event being assembled, dispatched at the
+            // blank line that ends it (or at stream end).
+            let mut event_data = String::new();
             let stream_start = std::time::Instant::now();
             let mut last_chunk_at = std::time::Instant::now();
             let mut bytes_received: usize = 0;
@@ -353,22 +339,36 @@ impl CodewhaleClient {
                 }
 
                 loop {
-                    let line = match next_sse_line(&mut buffer, ended) {
-                        Ok(Some(line)) => line,
+                    let data = match next_sse_line(&mut buffer, ended) {
+                        // A blank line ends the event.
+                        Ok(Some(line)) if line.is_empty() => std::mem::take(&mut event_data),
+                        Ok(Some(line)) => {
+                            // `event:` lines are redundant (the data payload
+                            // carries `type`) and comment/heartbeat lines are
+                            // ignorable.
+                            if let Some(value) = extract_sse_data_value(&line)
+                                && let Err(err) = push_sse_event_data(&mut event_data, value)
+                            {
+                                yield Err(anyhow::anyhow!("{err}"));
+                                return;
+                            }
+                            continue;
+                        }
+                        // The final event may arrive without its blank line.
+                        Ok(None) if ended && !event_data.is_empty() => {
+                            std::mem::take(&mut event_data)
+                        }
                         Ok(None) => break,
                         Err(err) => {
                             yield Err(anyhow::anyhow!("{err}"));
                             return;
                         }
                     };
-
-                    // `event:` lines are redundant (the data payload carries
-                    // `type`) and comment/heartbeat lines are ignorable.
-                    let Some(data) = extract_sse_data_value(&line) else {
+                    if data.is_empty() {
                         continue;
-                    };
+                    }
 
-                    match convert_anthropic_sse_data(data) {
+                    match convert_anthropic_sse_data(&data) {
                         Some(Ok(StreamEvent::Error { error })) => {
                             let (error_type, message) = anthropic_error_fields(&error);
                             yield Err(anyhow::anyhow!(
@@ -394,6 +394,12 @@ impl CodewhaleClient {
                     break;
                 }
             }
+            // Only `message_stop` (returned above) or a provider error proves
+            // the response is whole. A bare HTTP EOF is truncation, and ending
+            // the stream quietly would hand the turn a partial answer as done.
+            yield Err(anyhow::anyhow!(
+                "Anthropic Messages stream closed before message_stop"
+            ));
         };
 
         Ok(Box::pin(stream))
@@ -407,15 +413,33 @@ impl CodewhaleClient {
         let response = self
             .send_anthropic_request(&prepared.endpoint.url, &prepared.body)
             .await?;
-        let mut value: Value = response
+        let value: Value = response
             .json()
             .await
             .context("Failed to parse Anthropic Messages response")?;
-        if let Some(usage) = value.get_mut("usage") {
-            *usage = json!(parse_anthropic_usage(usage));
-        }
-        serde_json::from_value(value).context("Failed to decode Anthropic Messages response")
+        decode_anthropic_message(value)
     }
+}
+
+fn discard_provider_execution_ids(value: &mut Value) {
+    // Shared history retains execution ids on disk. Incoming provider content
+    // cannot choose one, including a value that would not deserialize as the
+    // host field. Live execution must mint its own correlation instead.
+    if let Some(blocks) = value.get_mut("content").and_then(Value::as_array_mut) {
+        for block in blocks {
+            if let Some(block) = block.as_object_mut() {
+                block.remove("execution_id");
+            }
+        }
+    }
+}
+
+fn decode_anthropic_message(mut value: Value) -> Result<MessageResponse> {
+    discard_provider_execution_ids(&mut value);
+    if let Some(usage) = value.get_mut("usage") {
+        *usage = json!(parse_anthropic_usage(usage));
+    }
+    serde_json::from_value(value).context("Failed to decode Anthropic Messages response")
 }
 
 /// Build the `/v1/messages` endpoint URL, tolerating base URLs that already
@@ -745,6 +769,7 @@ fn content_block_to_anthropic(block: &ContentBlock) -> Option<Value> {
             content,
             is_error,
             content_blocks,
+            ..
         } => {
             let mut value = json!({
                 "type": "tool_result",
@@ -923,11 +948,11 @@ fn convert_anthropic_sse_usage_event(trimmed: &str) -> Option<Result<StreamEvent
 
     match value.get("type").and_then(Value::as_str) {
         Some("message_start") => {
-            if let Some(usage) = value
-                .get_mut("message")
-                .and_then(|message| message.get_mut("usage"))
-            {
-                *usage = json!(parse_anthropic_usage(usage));
+            if let Some(message) = value.get_mut("message") {
+                discard_provider_execution_ids(message);
+                if let Some(usage) = message.get_mut("usage") {
+                    *usage = json!(parse_anthropic_usage(usage));
+                }
             }
         }
         Some("message_delta") => {
@@ -978,14 +1003,6 @@ fn parse_anthropic_usage(usage: &Value) -> Usage {
 /// Extract `error.type` / `error.message` from an Anthropic error envelope
 /// (`{"type":"error","error":{"type":...,"message":...}}`), falling back to
 /// the raw body so nothing is swallowed.
-fn parse_anthropic_error_envelope(raw: &str) -> (String, String) {
-    let Ok(value) = serde_json::from_str::<Value>(raw) else {
-        return ("unknown".to_string(), raw.to_string());
-    };
-    let error = value.get("error").unwrap_or(&value);
-    anthropic_error_fields(error)
-}
-
 fn anthropic_error_fields(error: &Value) -> (String, String) {
     let error_type = error
         .get("type")
@@ -1005,6 +1022,67 @@ mod tests {
     use super::*;
     use codewhale_models::Role;
     use codewhale_models::{CacheControl, Message, SystemBlock, SystemPrompt, Tool};
+
+    #[test]
+    fn provider_messages_cannot_supply_host_execution_identity() {
+        for supplied in [json!("forged-local"), json!({"invalid": "host id"})] {
+            let value = json!({
+                "id": "provider-message", "type": "message", "role": "assistant",
+                "model": "claude-sonnet-4-6", "stop_reason": "tool_use",
+                "content": [
+                    {"type": "tool_use", "id": "wire-call", "name": "read",
+                     "input": {"execution_id": "ordinary argument"},
+                     "execution_id": supplied,
+                     "caller": {"type": "code_execution", "tool_id": "parent-wire"},
+                     "thought_signature": "provider-signature"},
+                    {"type": "tool_result", "tool_use_id": "wire-call", "content": "result",
+                     "execution_id": supplied},
+                ],
+                "usage": {"input_tokens": 3, "output_tokens": 2},
+            });
+            let decoded = decode_anthropic_message(value.clone()).unwrap();
+            let event = convert_anthropic_sse_data(
+                &json!({
+                    "type": "message_start", "message": value,
+                })
+                .to_string(),
+            )
+            .unwrap()
+            .unwrap();
+            let StreamEvent::MessageStart { message: streamed } = event else {
+                panic!("expected message start")
+            };
+            for message in [decoded, streamed] {
+                let ContentBlock::ToolUse {
+                    id,
+                    input,
+                    execution_id,
+                    caller,
+                    thought_signature,
+                    ..
+                } = &message.content[0]
+                else {
+                    panic!("expected tool use")
+                };
+                assert!(execution_id.is_none());
+                assert_eq!(id, "wire-call");
+                assert_eq!(input["execution_id"], "ordinary argument");
+                assert_eq!(
+                    caller.as_ref().unwrap().tool_id.as_deref(),
+                    Some("parent-wire")
+                );
+                assert_eq!(thought_signature.as_deref(), Some("provider-signature"));
+                assert!(matches!(
+                    &message.content[1],
+                    ContentBlock::ToolResult {
+                        execution_id: None,
+                        ..
+                    }
+                ));
+                assert_eq!(message.usage.input_tokens, 3);
+            }
+        }
+    }
 
     fn request_with(
         model: &str,
@@ -1053,6 +1131,7 @@ mod tests {
         let client = test_client();
         let mut request = request_with("claude-sonnet-4-6", None, None, None);
         let tool_use = |id: &str, path: &str| ContentBlock::ToolUse {
+            execution_id: None,
             id: id.to_string(),
             name: "read".to_string(),
             input: json!({ "path": path }),
@@ -1060,6 +1139,7 @@ mod tests {
             thought_signature: None,
         };
         let tool_result = |id: &str, content: &str| ContentBlock::ToolResult {
+            execution_id: None,
             tool_use_id: id.to_string(),
             content: content.to_string(),
             is_error: None,
@@ -1381,6 +1461,7 @@ mod tests {
                 role: Role::Assistant,
                 content: vec![
                     ContentBlock::ToolUse {
+                        execution_id: None,
                         id: "toolu_ok".to_string(),
                         name: "read_file".to_string(),
                         input: json!({"path": "a.txt"}),
@@ -1388,6 +1469,7 @@ mod tests {
                         thought_signature: None,
                     },
                     ContentBlock::ToolUse {
+                        execution_id: None,
                         id: "toolu_orphan".to_string(),
                         name: "task".to_string(),
                         input: json!({}),
@@ -1400,6 +1482,7 @@ mod tests {
             Message {
                 role: Role::User,
                 content: vec![ContentBlock::ToolResult {
+                    execution_id: None,
                     tool_use_id: "toolu_ok".to_string(),
                     content: "contents".to_string(),
                     is_error: None,
@@ -1410,6 +1493,7 @@ mod tests {
             Message {
                 role: Role::Assistant,
                 content: vec![ContentBlock::ToolUse {
+                    execution_id: None,
                     id: "toolu_tail".to_string(),
                     name: "task".to_string(),
                     input: json!({}),
@@ -1709,6 +1793,7 @@ mod tests {
                         state: None,
                     },
                     ContentBlock::ToolUse {
+                        execution_id: None,
                         id: "toolu_1".to_string(),
                         name: "read_file".to_string(),
                         input: json!({"path": "a.txt"}),
@@ -1720,6 +1805,7 @@ mod tests {
             Message {
                 role: Role::User,
                 content: vec![ContentBlock::ToolResult {
+                    execution_id: None,
                     tool_use_id: "toolu_1".to_string(),
                     content: "contents".to_string(),
                     is_error: None,
@@ -1943,19 +2029,6 @@ mod tests {
     }
 
     #[test]
-    fn error_envelope_parses_type_and_message() {
-        let (error_type, message) = parse_anthropic_error_envelope(
-            r#"{"type":"error","error":{"type":"rate_limit_error","message":"Too many requests"},"request_id":"req_1"}"#,
-        );
-        assert_eq!(error_type, "rate_limit_error");
-        assert_eq!(message, "Too many requests");
-
-        let (error_type, message) = parse_anthropic_error_envelope("upstream blew up");
-        assert_eq!(error_type, "unknown");
-        assert_eq!(message, "upstream blew up");
-    }
-
-    #[test]
     fn data_url_image_becomes_a_base64_source_not_a_url_source() {
         // Anthropic rejects a `data:` URL under `{"type":"url"}`. This is the
         // whole reason the projection exists; if it regresses, every locally
@@ -2163,6 +2236,73 @@ mod tests {
         assert!(saw_stop, "message_stop should arrive through the seam");
     }
 
+    async fn collect_anthropic_stream(body: &'static str) -> Vec<Result<StreamEvent>> {
+        use futures_util::StreamExt;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Type", "text/event-stream")
+                    .set_body_string(body),
+            )
+            .mount(&server)
+            .await;
+        let client = deepseek_test_client(&server.uri());
+        let stream = client
+            .handle_anthropic_stream(
+                &client
+                    .prepare_outbound_request(request_with("deepseek-v4", None, None, None), true)
+                    .expect("anthropic request prepares"),
+            )
+            .await
+            .expect("stream opens");
+        tokio::time::timeout(std::time::Duration::from_secs(5), stream.collect())
+            .await
+            .expect("stream ends")
+    }
+
+    #[tokio::test]
+    async fn anthropic_stream_joins_multiline_data_fields_into_one_event() {
+        use codewhale_models::Delta;
+        // One JSON payload split across two `data:` fields of a single event.
+        let events = collect_anthropic_stream(concat!(
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\n",
+            "data: \"delta\":{\"type\":\"text_delta\",\"text\":\"joined\"}}\n\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        ))
+        .await;
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                Ok(StreamEvent::ContentBlockDelta {
+                    delta: Delta::TextDelta { text },
+                    ..
+                }) if text == "joined"
+            )),
+            "the split event was lost: {events:?}"
+        );
+        assert!(matches!(events.last(), Some(Ok(StreamEvent::MessageStop))));
+    }
+
+    #[tokio::test]
+    async fn anthropic_stream_eof_without_message_stop_is_an_error() {
+        let events = collect_anthropic_stream(
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n",
+        )
+        .await;
+        let last = events.last().expect("the delta and a terminal item");
+        assert!(
+            last.as_ref()
+                .is_err_and(|error| error.to_string().contains("closed before message_stop")),
+            "a truncated stream must not end quietly: {events:?}"
+        );
+    }
+
     /// Fault injection (#6184): a provider that answers the headers and then
     /// sends nothing fails the stream at the first-byte bound with a
     /// distinct error and a `crashes/` stall record, instead of holding the
@@ -2259,10 +2399,71 @@ mod tests {
             Ok(_) => panic!("auth errors must fail fast"),
             Err(err) => err,
         };
-        let text = err.to_string();
+        // Typed through the shared classifier, provider message kept.
         assert!(
-            text.contains("HTTP 401") && text.contains("authentication_error"),
-            "error envelope should be preserved: {text}"
+            matches!(
+                err.chain()
+                    .find_map(|cause| cause.downcast_ref::<crate::llm_client::LlmError>()),
+                Some(crate::llm_client::LlmError::AuthenticationError(_))
+            ),
+            "a 401 must stay a typed authentication error: {err:#}"
+        );
+        assert!(format!("{err:#}").contains("bad key"), "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn anthropic_rate_limit_is_retried_honoring_retry_after() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("retry-after", "1")
+                    .set_body_string(
+                        "{\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"slow down\"}}",
+                    ),
+            )
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Type", "text/event-stream")
+                    .set_body_string("data: {\"type\":\"message_stop\"}\n\n"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut client = deepseek_test_client(&server.uri());
+        client.retry.enabled = true;
+        client.retry.max_retries = 2;
+        client.retry.initial_delay = 0.0;
+        client.retry.max_delay = 0.0;
+        let started = std::time::Instant::now();
+        let stream = client
+            .handle_anthropic_stream(
+                &client
+                    .prepare_outbound_request(request_with("deepseek-v4", None, None, None), true)
+                    .expect("anthropic request prepares"),
+            )
+            .await;
+        assert!(
+            stream.is_ok(),
+            "a 429 before the stream body must be retried, not surfaced"
+        );
+        // The backoff is configured to zero, so only the provider's
+        // `Retry-After: 1` can account for the wait before the retry.
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(900),
+            "the retry must wait out Retry-After, waited {:?}",
+            started.elapsed()
         );
     }
 

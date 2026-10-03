@@ -192,10 +192,11 @@ Legacy note: `/set approval_mode ...` was retired in favor of `/config`.
 - `suggest` (**Ask**, default): tool approvals may interrupt, and Codewhale asks
   when an unresolved user choice materially changes authority, cost, scope, or
   outcome.
-- `auto` (**Auto-Review**): the fully autonomous posture. It never opens a user
-  question; the model resolves ambiguity from context, chooses a safe reversible
-  interpretation, or reports that it cannot proceed safely. Tool safety holds
-  remain separate from user questions. Two layers decide approvals. The
+- `auto` (**Auto-Review**): reviews tool calls automatically. Deliberate user
+  questions remain available in interactive sessions through `request_user_input`;
+  a question parks the turn until answered, canceled, or its configured timeout
+  expires. Headless `exec` withholds that tool because it has no responder.
+  Tool safety holds remain separate from user questions. Two layers decide approvals. The
   **deterministic floor** (configured block rules plus the built-in safety
   floor) allows proven-safe calls and hard-blocks publish-like actions and
   destructive background/headless work; it is never model-reviewed. Fallback
@@ -228,8 +229,8 @@ also has no LLM reviewer. Its ordered
 [permission policy](https://github.com/MoonshotAI/kimi-code/blob/1414d4602898f406e540b23342cb18db23ff9efc/packages/agent-core-v2/src/agent/permissionPolicy/permissionPolicyService.ts)
 applies explicit deny rules and then its
 [Auto policy](https://github.com/MoonshotAI/kimi-code/blob/1414d4602898f406e540b23342cb18db23ff9efc/packages/agent-core-v2/src/agent/permissionPolicy/policies/auto-mode-approve.ts)
-returns `approve` directly. Codewhale borrows Kimi's no-question autonomous UX,
-not that blanket approval rule.
+returns `approve` directly. Codewhale uses the deterministic floor and guardian
+described above, while keeping deliberate user questions available.
 
 The sandbox and escalation baseline is grounded in DeepSeek Harness
 `0.1.0-rc.5` at
@@ -330,6 +331,7 @@ Run `codewhale --help` for the canonical list. Common flags:
 
 - `-p, --prompt <TEXT>`: one-shot prompt mode (prints and exits)
 - `codewhale exec --auto --output-format stream-json <PROMPT>`: run the tool-backed non-interactive agent and emit one JSON object per line for harnesses and backend wrappers. Exit codes: `0` on success, `1` for genuine task/agent failures, `75` (`EX_TEMPFAIL`) when the turn ended on a retryable infrastructure failure (provider/transport `network`/`timeout` after all in-session retries) so harnesses can tell a retryable infra exit apart from a task failure; the terminal stream `metadata` event's `error_category` carries the same classification
+- `codewhale exec --prompt-file <PATH>` / `cat prompt.txt | codewhale exec --prompt-file -`: read the prompt from a file or stdin instead of argv, for prompts past the OS per-argument limit (~128 KiB on Linux). Conflicts with a positional prompt, and a positional `-` is literal prompt text; `--prompt-file -` is refused with `--parent-death-watch`, which owns stdin
 - `codewhale exec --resume <ID|PREFIX> <PROMPT>` / `--session-id <ID|PREFIX>`: continue a saved session non-interactively
 - `codewhale exec --continue <PROMPT>`: continue the most recent saved session for this workspace non-interactively
 - `codewhale fork <ID|PREFIX>` / `codewhale fork --last`: copy a saved session into a new sibling session; forked sessions retain additive parent-session metadata and show that lineage in session listings

@@ -135,7 +135,7 @@ static VERBOSE_INFO: CommandInfo = CommandInfo {
 static TRUST_INFO: CommandInfo = CommandInfo {
     name: "trust",
     aliases: &["xinren"],
-    usage: "/trust [on|off|add <path>|remove <path>|list]",
+    usage: "/trust [on|off [--save]|add <path>|remove <path>|list]",
     description_id: MessageId::CmdTrustDescription,
 };
 static LOGOUT_INFO: CommandInfo = CommandInfo {

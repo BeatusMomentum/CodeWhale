@@ -7,10 +7,12 @@ use crate::task_manager::{TaskManager, TaskManagerConfig};
 
 fn fixture_config() -> Config {
     let mut config = Config {
-        api_key: Some("local-runtime-binding-fixture".into()),
-        base_url: Some("http://127.0.0.1:1/v1".into()),
         ..Config::default()
-    };
+    }
+    .with_legacy_root(
+        Some("local-runtime-binding-fixture".into()),
+        Some("http://127.0.0.1:1/v1".into()),
+    );
     config.set_feature("mcp", false).unwrap();
     config.set_feature("subagents", false).unwrap();
     config
@@ -100,7 +102,12 @@ async fn runtime_store_binding_exit_preserves_inflight_recovery() -> anyhow::Res
     let root = tempfile::tempdir()?;
     let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", root.path());
     let sessions = SessionManager::default_location()?;
-    for (loading, dispatch) in [(true, false), (false, true)] {
+    // U02-09: a locally cancelled turn still owes its terminal event.
+    for (loading, dispatch, cancelled) in [
+        (true, false, false),
+        (false, true, false),
+        (false, false, true),
+    ] {
         let original = crate::session_manager::create_saved_session_with_mode(
             &[],
             "deepseek-v4-pro",
@@ -117,6 +124,7 @@ async fn runtime_store_binding_exit_preserves_inflight_recovery() -> anyhow::Res
         app.current_session_id = Some(original.metadata.id.clone());
         app.is_loading = loading;
         app.dispatch_in_flight = dispatch;
+        app.suppress_stream_events_until_turn_complete = cancelled;
         let (handle, actor) =
             persistence_actor::spawn_persistence_actor(SessionManager::default_location()?);
         assert!(
@@ -903,6 +911,89 @@ async fn picker_adopts_existing_empty_unheld_store() -> anyhow::Result<()> {
     let durable = sessions.load_session("picker-adoptable")?;
     assert_eq!(durable.metadata.runtime_store.as_ref(), Some(&binding));
     assert_eq!(durable.messages, saved.messages);
+    // #6144 P1a: the store the conversation left is set aside where it was
+    // abandoned, not left on disk with nothing pointing at it. The switch
+    // hands that off the UI runtime. Moving the store precedes writing its
+    // manifest, so wait for both rather than treating the move as completion.
+    let abandoned = root.path().join("sessions/previous/runtime");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let set_aside = loop {
+        let manifest = std::fs::read_dir(root.path().join("sessions/.set-aside"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|run| {
+                std::fs::read_to_string(run.path().join("MANIFEST.jsonl")).unwrap_or_default()
+            })
+            .collect::<String>();
+        if (!abandoned.exists() && manifest.contains("previous"))
+            || std::time::Instant::now() >= deadline
+        {
+            break manifest;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    };
+    assert!(!abandoned.exists());
+    assert!(set_aside.contains("previous"), "{set_aside}");
+    tasks.shutdown_and_wait().await?;
+    Ok(())
+}
+
+/// #6144 P1a: an abandoned store another document still binds is kept.
+#[tokio::test]
+async fn picker_adoption_keeps_a_store_another_document_binds() -> anyhow::Result<()> {
+    let _environment = crate::test_support::lock_test_env();
+    let root = tempfile::tempdir()?;
+    let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", root.path());
+    let _runtime = crate::test_support::EnvVarGuard::remove("CODEWHALE_RUNTIME_DIR");
+    let _legacy = crate::test_support::EnvVarGuard::remove("DEEPSEEK_RUNTIME_DIR");
+    let sessions = SessionManager::default_location()?;
+    let mut config = fixture_config();
+
+    let store_dir = root.path().join("sessions/previous/runtime");
+    drop(crate::runtime_threads::RuntimeThreadStore::open(
+        store_dir.clone(),
+    )?);
+    let binding = crate::runtime_threads::RuntimeStoreBinding::for_store_dir(&store_dir)?;
+    let mut saved = crate::session_manager::create_saved_session_with_id_and_mode(
+        "picker-adoptable".into(),
+        &[text_message("user", "retain my work")],
+        "deepseek-v4-pro",
+        root.path(),
+        0,
+        None,
+        None,
+    );
+    saved.metadata.runtime_store = Some(binding.clone());
+    sessions.save_session(&saved)?;
+    let mut sibling = crate::session_manager::create_saved_session_with_id_and_mode(
+        "same-host-sibling".into(),
+        &[text_message("user", "saved in the same host")],
+        "deepseek-v4-pro",
+        root.path(),
+        0,
+        None,
+        None,
+    );
+    sibling.metadata.runtime_store = Some(binding);
+    sessions.save_session(&sibling)?;
+
+    let mut app = Box::new(create_test_app());
+    let tasks = TaskManager::start(
+        TaskManagerConfig::from_runtime(&config, root.path().into(), None, Some(1)),
+        config.clone(),
+        app.plugin_registry.clone(),
+        "picker-current",
+        None,
+    )
+    .await?;
+    app.runtime_services.task_manager = Some(tasks.clone());
+    app.current_session_id = Some("picker-current".into());
+    apply_loaded_session_with_goal(&mut app, &mut config, saved, None)
+        .map_err(anyhow::Error::msg)?;
+    // Give the background retirement time to (wrongly) act.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(store_dir.is_dir(), "the sibling still binds it");
     tasks.shutdown_and_wait().await?;
     Ok(())
 }

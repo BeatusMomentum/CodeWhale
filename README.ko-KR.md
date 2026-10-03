@@ -1,9 +1,9 @@
-<!-- source: README.md sha256:bbb8bfb61e57 -->
+<!-- source: README.md sha256:925619135f77 -->
 # Codewhale
 
 Codewhale은 사용자가 선택한 호스팅 모델이나 로컬 모델로 프로젝트를 읽고, 파일을 편집하고, 명령을 실행하며, 작업 결과를 확인하는 오픈 소스 에이전트입니다. 터미널에서 하나의 작업으로 시작하세요. 더 큰 작업은 서로 다른 모델과 역할을 가진 에이전트에게 나누어 맡길 수 있습니다.
 
-![터미널에서 실행 중인 Codewhale](web/public/codewhale-tui-d7a9a1c.png)
+![터미널에서 실행 중인 Codewhale](web/public/codewhale-tui-5765d80.png)
 
 *v0.10.0 개발 빌드의 터미널 미리보기입니다.*
 
@@ -23,6 +23,8 @@ curl -fsSL https://codewhale.net/install.sh | sh
 "$HOME/.local/bin/codewhale"
 ```
 
+`codewhale`만 입력했을 때 "command not found"가 표시되면 `~/.local/bin`이 아직 PATH에 없는 것입니다. 설치 도구가 사용 중인 셸에 맞게 출력하는 한 줄 명령을 실행하거나 [PATH에 추가하기](docs/INSTALL.md#put-it-on-your-path)를 참조하세요.
+
 설치 도구는 공개된 최신 릴리스를 선택합니다. [변경 이력](CHANGELOG.md)에는 다음 릴리스의 미공개 후보 버전도 설명되어 있지만, 해당 릴리스가 공개되기 전에는 그 변경 사항이 공개 다운로드에 포함되지 않습니다.
 
 Windows에서는 [GitHub Releases](https://github.com/Hmbown/CodeWhale/releases/latest)에서 맞는 설치 프로그램이나 아카이브를 받으세요. 기존 직접 설치는 `codewhale update`로 업데이트하고, 확인만 하려면 `codewhale update --check`를 사용하세요. 업데이트 도구는 실행 파일 경로를 표시하며 더 최신인 빌드는 유지합니다. npm과 Cargo는 보조 패키지 설치 방법입니다. 패키지 관리자 설치에서 이전하거나 PATH를 설정하려면 [설치 안내서](docs/INSTALL.md)를 참조하세요.
@@ -33,7 +35,7 @@ Windows에서는 [GitHub Releases](https://github.com/Hmbown/CodeWhale/releases/
 
 ## 사용법
 
-프로젝트 폴더에서 터미널을 열고 `codewhale`을 실행하세요. `/provider`로 공급자를, `/model`로 모델을 선택한 다음 구체적인 작업을 설명하세요:
+프로젝트 폴더에서 터미널을 열고 `codewhale`을 실행하세요([PATH에 추가](docs/INSTALL.md#put-it-on-your-path)되어 있어야 합니다). `/provider`로 공급자를, `/model`로 모델을 선택한 다음 구체적인 작업을 설명하세요:
 
 ```text
 Fix the failing tests and explain what changed.
@@ -76,6 +78,7 @@ Codewhale은 사용자가 허용한 접근 권한으로 사용자의 컴퓨터�
 
 ## 문서
 
+- [GitHub PR 검토 설정](docs/GITHUB_ACTION.md)
 - [공급자와 로컬 모델](docs/PROVIDERS.md)
 - [에이전트 팀](docs/FLEET.md)
 - [MCP](docs/MCP.md), [훅](docs/HOOKS.md), [구성](docs/CONFIGURATION.md)

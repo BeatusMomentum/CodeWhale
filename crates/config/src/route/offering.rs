@@ -74,9 +74,6 @@ pub struct ProviderModelOffering {
     pub pricing: PricingSku,
 }
 
-// Transport snapshot verified against https://opencode.ai/docs/zen on
-// 2026-07-17. Gemini rows are intentionally absent because they use Google's
-// model-specific wire protocol, which CodeWhale does not currently implement.
 /// Token Plan text models (Text Generation / Reasoning, coding scope).
 ///
 /// Available on both Token Plan Personal and Team. The same model set is also
@@ -104,7 +101,22 @@ const MODELSTUDIO_TEXT_MODELS: &[&str] = &[
     "glm-5.2",
 ];
 
+// OpenCode Zen transport snapshot, refreshed 2026-09-28 (#6705) against the
+// endpoint table at https://opencode.ai/docs/zen and the `opencode` provider
+// in https://models.dev/catalog.json, whose per-model `provider.npm` names the
+// AI SDK package (and so the wire) OpenCode itself uses. The two sources agree
+// row for row. This list is only the offline floor: a Models.dev snapshot
+// carries the same fact for models released after this build (see
+// `opencode_zen_endpoint_key_for_npm`), so a new Zen model routes without a
+// Codewhale release once the catalog knows it.
+//
+// Gemini (`/models/{id}`, Google's generateContent wire) and Jev
+// (`/systemone`) are deliberately absent: Codewhale speaks neither protocol,
+// so those models fail closed with their endpoint named.
 pub(crate) const OPENCODE_ZEN_RESPONSES_MODELS: &[&str] = &[
+    "gpt-6-astra",
+    "gpt-6-sol",
+    "gpt-6-luna",
     "gpt-5.6-sol",
     "gpt-5.6-terra",
     "gpt-5.6-luna",
@@ -125,23 +137,39 @@ pub(crate) const OPENCODE_ZEN_RESPONSES_MODELS: &[&str] = &[
     "gpt-5",
     "gpt-5-codex",
     "gpt-5-nano",
+    // Zen serves Grok over Responses (`@ai-sdk/openai`); snapshots before
+    // 2026-09-28 listed grok-4.5 and grok-build-0.1 under Chat Completions.
+    "grok-4.7",
+    "grok-4.6",
+    "grok-4.5",
+    "grok-build-0.1",
     // Muse Spark via OpenCode Zen gateway — Responses-only (reported
     // 2026-08-29: muse-spark-1.2-contributor-free rejects Chat Completions).
+    "muse-spark-1.3",
+    "muse-spark-1.3-contributor-free",
     "muse-spark-1.2",
     "muse-spark-1.2-contributor",
     "muse-spark-1.2-contributor-free",
 ];
 
 pub(crate) const OPENCODE_ZEN_MESSAGES_MODELS: &[&str] = &[
+    "claude-fable-5-1",
     "claude-fable-5",
+    "claude-opus-5-5",
+    "claude-opus-5",
     "claude-opus-4-8",
     "claude-opus-4-7",
     "claude-opus-4-6",
     "claude-opus-4-5",
+    // claude-sonnet-5-5 and claude-sonnet-4 are on Zen's live `/models` and
+    // Models.dev lists both as `@ai-sdk/anthropic`; the docs table omits them.
+    "claude-sonnet-5-5",
     "claude-sonnet-5",
     "claude-sonnet-4-6",
     "claude-sonnet-4-5",
+    "claude-sonnet-4",
     "claude-haiku-4-5",
+    "qwen3.8-flash",
     "qwen3.7-max",
     "qwen3.7-plus",
     "qwen3.6-plus",
@@ -149,29 +177,62 @@ pub(crate) const OPENCODE_ZEN_MESSAGES_MODELS: &[&str] = &[
 ];
 
 pub(crate) const OPENCODE_ZEN_CHAT_MODELS: &[&str] = &[
+    "deepseek-v4.1-flash",
     "deepseek-v4-pro",
     "deepseek-v4-flash",
+    "deepseek-v4-flash-vision-exp",
     "minimax-m3",
     "minimax-m2.7",
     "minimax-m2.5",
-    // glm-5.3 is deliberately absent (2026-08-03): this snapshot tracks the
-    // official OpenCode Zen endpoint table, which lists no glm-5.3 row. Zen
-    // fails closed on unknown models by design; registering a route Zen does
-    // not serve would convert that into a guaranteed upstream 404.
+    // Zen's endpoint table lists glm-5.3 and glm-5.3-flash as of 2026-09-28.
+    "glm-5.3-flash",
+    "glm-5.3",
     "glm-5.2",
     "glm-5.1",
     "glm-5",
-    "kimi-k2.5",
-    "kimi-k2.6",
+    "kimi-k3",
     "kimi-k2.7-code",
-    "grok-4.5",
-    "grok-build-0.1",
+    "kimi-k2.6",
+    "kimi-k2.5",
+    // Unlike its Qwen siblings, qwen3.8-max is served over Chat Completions.
+    "qwen3.8-max",
     "big-pickle",
+    "space-bunny-free",
+    "longcat-2.5-preview-free",
+    "mimo-v2.6-flash-free",
     "mimo-v2.5-free",
+    "ling-3.0-flash-fin-free",
     "north-mini-code-free",
     "nemotron-3-ultra-free",
+    "nemotron-3.5-lightning-free",
     "deepseek-v4-flash-free",
 ];
+
+/// Endpoint key for a Zen catalog row Models.dev marks `deprecated`. It names
+/// no protocol, so the resolver refuses the model locally with this reason
+/// instead of sending a request Zen no longer serves.
+pub const OPENCODE_ZEN_DEPRECATED_ENDPOINT_KEY: &str = "deprecated";
+
+/// Endpoint key OpenCode Zen serves a model on, from the AI SDK package
+/// OpenCode's own catalog names for it.
+///
+/// Models.dev's `opencode` provider is Zen's published catalog: its provider
+/// default is `@ai-sdk/openai-compatible`, and a model served over another
+/// wire overrides that with `provider.npm`. The package is the wire fact, so it
+/// is mapped exactly and never guessed from a model-id family, which does not
+/// hold on Zen (qwen3.8-flash is Messages while qwen3.8-max is Chat). Google's
+/// package maps to `"google"` and any other to `"unproven"`; neither resolves
+/// to a protocol, so the resolver fails closed and names the endpoint.
+#[must_use]
+pub fn opencode_zen_endpoint_key_for_npm(npm: Option<&str>) -> &'static str {
+    match npm.map(str::trim) {
+        Some("@ai-sdk/openai") => "responses",
+        Some("@ai-sdk/anthropic") => "messages",
+        Some("@ai-sdk/openai-compatible") => "chat",
+        Some("@ai-sdk/google") => "google",
+        _ => "unproven",
+    }
+}
 
 /// Logical default plus every documented Zen wire id, for picker fallbacks
 /// when Models.dev is stale or failed. `gpt-5.6` is the user-facing default;

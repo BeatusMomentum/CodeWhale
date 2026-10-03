@@ -37,6 +37,7 @@ is the source. Translations live beside their English page (`*.id.md`) or in
 - [Installing plugins](PLUGINS.md), [writing a plugin](PLUGIN_AUTHORING.md),
   [plugin bundles](PLUGIN_BUNDLES.md), [the first-party marketplace](PLUGIN_MARKETPLACE.md),
   and [Claude plugin compatibility](CLAUDE_PLUGIN_COMPAT.md)
+- [Writing an extension tool](EXTENSIONS.md) (experimental `extension_host`)
 - [LSP: PHP and custom language servers](LSP_PHP_CUSTOM.md)
 - [Runtime API and integration contract](RUNTIME_API.md)
 - [GitHub App setup](GITHUB_APP.md)
@@ -81,6 +82,8 @@ is the source. Translations live beside their English page (`*.id.md`) or in
 
 ## History and reference
 
+- [Feature registry](features.toml): every user feature with its status, first
+  release, docs page and owning code, checked against the code by a test
 - [Contributors](CONTRIBUTORS.md)
 - [Changelog archive](CHANGELOG_ARCHIVE.md) and the
   [lifecycle outbox changelog](changelog-lifecycle-outbox.md)

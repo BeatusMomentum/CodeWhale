@@ -144,7 +144,10 @@ async function downloadJson(url, redirects = 0) {
   if (redirects > 10) {
     throw new Error(`Too many redirects while downloading ${url}`);
   }
-  const client = url.startsWith("https:") ? https : http;
+  const parsedUrl = new URL(url);
+  if (parsedUrl.protocol !== "https:") {
+    throw new Error("Release metadata requires HTTPS");
+  }
   return new Promise((resolve, reject) => {
     const headers = {
       Accept: "application/vnd.github+json",
@@ -152,10 +155,10 @@ async function downloadJson(url, redirects = 0) {
       "X-GitHub-Api-Version": "2022-11-28",
     };
     const token = process.env.GITHUB_TOKEN || process.env.GH_TOKEN;
-    if (token) {
+    if (token && parsedUrl.origin === "https://api.github.com") {
       headers.Authorization = `Bearer ${token}`;
     }
-    client
+    https
       .get(url, { headers }, (res) => {
         const status = res.statusCode || 0;
         if (status >= 300 && status < 400 && res.headers.location) {
@@ -378,6 +381,7 @@ if (require.main === module) {
 }
 
 module.exports = {
+  downloadJson,
   assertChecksumManifestIncludes,
   assertPackageVersionMatchesBinaryVersion,
   assertReleaseAssetsFresh,

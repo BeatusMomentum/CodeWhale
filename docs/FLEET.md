@@ -233,6 +233,12 @@ live parent. For standalone `codewhale fleet` execution, Runtime instead uses
 the bounded tool-authority envelope minted from the task's explicit write
 scope together with live config, sandbox, and platform enforcement. Neither
 path reads authority from the profile's storage scope or identity selector.
+A worker whose envelope grants read-only shell access runs the same read-only
+command grammar as an in-session read-only agent, including pipelines, chains
+and a leading `cd` (see "Read-only shell commands" in `docs/SUBAGENTS.md`);
+Admitted `gh` reads also need the envelope's network grant. `npm view` remains
+outside the read-only grammar because npm configuration can select executable
+helpers; a network grant does not authorize those helpers.
 
 Picking a concrete model pins its provider explicitly: the saved profile records both
 `model` and `provider` fields, so the route it names doesn't depend on
@@ -815,6 +821,14 @@ SSH workers run through the system `ssh` client with `BatchMode=yes` and a
 bounded connect timeout. Remote environment variables are sent with OpenSSH
 `SendEnv`; values are not embedded in the local ssh argv or fleet logs.
 
+Host keys must already be trusted: connections use `StrictHostKeyChecking=yes`
+and never accept a new key automatically. An explicit `known_hosts` file limits
+trust to that file; when it is omitted, OpenSSH uses its normal known-host stores.
+Verify the host key before adding it to either store. The legacy
+`host_key_fingerprint` field is unsupported and is rejected; migrate it to a
+verified `known_hosts` entry. The `identity` file selects the client login key;
+it does not verify the remote host.
+
 Example SSH worker spec:
 
 ```json
@@ -827,6 +841,7 @@ Example SSH worker spec:
     "user": "codewhale",
     "port": 22,
     "identity": "~/.ssh/codewhale_fleet",
+    "known_hosts": "~/.ssh/codewhale_fleet_known_hosts",
     "working_directory": "/srv/codewhale/work",
     "env_allowlist": ["CODEWHALE_PROFILE"],
     "codewhale_binary": "/usr/local/bin/codewhale"

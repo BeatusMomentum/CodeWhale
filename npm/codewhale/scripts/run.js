@@ -1,4 +1,5 @@
-const { spawnSync } = require("child_process");
+const { spawn: spawnChild } = require("child_process");
+const os = require("os");
 const { getBinaryPath, installFailureHint } = require("./install");
 
 const pkg = require("../package.json");
@@ -41,11 +42,85 @@ function printVersionFallback(binaryName, error) {
   }
 }
 
+// Signals that end the wrapper must end the native binary too. With a
+// blocking spawn the wrapper died on SIGTERM and left the child running (still
+// executing tools, still holding its port); as PID 1 in a container it ignored
+// SIGTERM entirely. So SIGTERM, which a terminal never sends, is forwarded.
+//
+// SIGINT (Ctrl-C) and SIGHUP (terminal hangup) come from the terminal, which
+// delivers them to the whole foreground process group, native child included.
+// Forwarding them would deliver each one twice, and the native binary treats a
+// second signal as "skip the graceful drain". On Windows `child.kill()` is a
+// hard TerminateProcess, which would race the child's own Ctrl-C cleanup. The
+// wrapper only has to outlive them, then mirror how the child ended.
+const FORWARDED_SIGNALS = process.platform === "win32" ? [] : ["SIGTERM"];
+const OUTLIVED_SIGNALS = ["SIGINT", "SIGHUP"];
+
+function ignoreSignal() {}
+
+// Run the native binary and settle with how it ended. While it runs, the
+// forwarded signals go to the child and the outlived ones do not kill the
+// wrapper.
+function runChild(spawn, binaryPath, args, proc) {
+  return new Promise((resolve) => {
+    let child;
+    try {
+      child = spawn(binaryPath, args, { stdio: "inherit" });
+    } catch (error) {
+      resolve({ error });
+      return;
+    }
+    const listeners = [
+      ...FORWARDED_SIGNALS.map((signal) => [
+        signal,
+        () => {
+          try {
+            child.kill(signal);
+          } catch {
+            // The child already exited; its exit event settles the run.
+          }
+        },
+      ]),
+      ...OUTLIVED_SIGNALS.map((signal) => [signal, ignoreSignal]),
+    ];
+    for (const [signal, listener] of listeners) {
+      proc.on(signal, listener);
+    }
+    let settled = false;
+    const settle = (result) => {
+      if (settled) return;
+      settled = true;
+      for (const [signal, listener] of listeners) {
+        proc.removeListener(signal, listener);
+      }
+      resolve(result);
+    };
+    child.once("error", (error) => settle({ error }));
+    child.once("exit", (status, signal) => settle({ status, signal }));
+  });
+}
+
+// Mirror a signal death to the parent shell: re-raise it on the wrapper once
+// our listeners are gone, and fall back to the conventional 128 + n.
+function exitLikeChild(result, exit, proc) {
+  if (result.signal) {
+    try {
+      proc.kill(proc.pid, result.signal);
+    } catch {
+      // fall through to the numeric status
+    }
+    const number = os.constants.signals[result.signal];
+    return exit(number ? 128 + number : 1);
+  }
+  return exit(result.status ?? 1);
+}
+
 async function run(binaryName, options = {}) {
   const args = options.args || process.argv.slice(2);
   const resolveBinaryPath = options.getBinaryPath || getBinaryPath;
-  const spawn = options.spawnSync || spawnSync;
+  const spawn = options.spawn || spawnChild;
   const exit = options.exit || process.exit;
+  const proc = options.process || process;
   const versionFlag = isVersionFlag(args);
 
   let binaryPath;
@@ -59,9 +134,7 @@ async function run(binaryName, options = {}) {
     throw error;
   }
 
-  const result = spawn(binaryPath, args, {
-    stdio: "inherit",
-  });
+  const result = await runChild(spawn, binaryPath, args, proc);
   if (result.error) {
     if (versionFlag) {
       printVersionFallback(binaryName, result.error);
@@ -69,7 +142,7 @@ async function run(binaryName, options = {}) {
     }
     throw result.error;
   }
-  return exit(result.status ?? 1);
+  return exitLikeChild(result, exit, proc);
 }
 
 async function runCodeWhale() {
@@ -89,7 +162,7 @@ module.exports = {
   runCodeWhale,
   runCodeWhaleTui,
   reportStartFailure,
-  _internal: { isVersionFlag, printVersionFallback },
+  _internal: { isVersionFlag, printVersionFallback, FORWARDED_SIGNALS, OUTLIVED_SIGNALS },
 };
 
 if (require.main === module) {

@@ -48,7 +48,10 @@ pub struct ImportCandidate {
     pub name: String,
     pub source_kind: ExternalMcpSourceKind,
     pub source_path: PathBuf,
-    /// Hex sha256 of the raw source file (or marketplace entry blob).
+    /// Hex sha256 of this server's name and entry as parsed from the source.
+    /// It covers exactly what an approval imports, so review tokens and
+    /// decisions survive unrelated rewrites of the same file (Claude Code
+    /// rewrites `~/.claude.json` on nearly every run).
     pub content_hash: String,
     pub summary: String,
     /// When true the entry is present but must never connect.
@@ -119,18 +122,33 @@ pub fn discover_external_sources(
 }
 
 fn discover_from_json_file(path: &Path, kind: ExternalMcpSourceKind) -> Vec<ImportCandidate> {
-    checked_source(path, kind).unwrap_or_default()
+    checked_source(path, kind)
+        .map(|(candidates, _)| candidates)
+        .unwrap_or_default()
 }
 
+/// Most per-entry problems reported for one source; the rest are counted.
+const MAX_PROBLEMS_PER_SOURCE: usize = 20;
+
+/// Read one source. A file-level failure is an `Err`; an entry that fails
+/// validation is reported in the second list (content-free) and skipped, so
+/// one unsupported entry cannot hide its valid siblings. At most
+/// [`MAX_PROBLEMS_PER_SOURCE`] entries are named, then one summary line.
 fn checked_source(
     path: &Path,
     kind: ExternalMcpSourceKind,
-) -> anyhow::Result<Vec<ImportCandidate>> {
+) -> anyhow::Result<(Vec<ImportCandidate>, Vec<String>)> {
     super::validate_mcp_config_path(path)?;
-    let Some(raw) = super::read_mcp_config_file(path)? else {
-        return Ok(Vec::new());
+    // `~/.claude.json` is Claude Code's whole state file (project history,
+    // caches), routinely past the 1 MiB MCP config bound. Use the bound
+    // `/import-claude` already reads it with.
+    let max_bytes = match kind {
+        ExternalMcpSourceKind::ClaudeJson => crate::import_claude::MAX_SOURCE_BYTES,
+        _ => super::MAX_MCP_CONFIG_BYTES,
     };
-    let hash = hex_sha256(raw.as_bytes());
+    let Some(raw) = super::read_bounded_mcp_config_file(path, max_bytes)? else {
+        return Ok((Vec::new(), Vec::new()));
+    };
     let value: Value = serde_json::from_str(&raw)
         .map_err(|_| anyhow::anyhow!("Source is not valid JSON; contents omitted"))?;
     anyhow::ensure!(
@@ -142,93 +160,162 @@ fn checked_source(
         "Source has no supported MCP server map"
     );
     let mut out = Vec::new();
-    for (name, mut config) in extract_servers_map(&value) {
-        anyhow::ensure!(
-            super::mcp_name_is_command_safe(&name) && name.len() <= 128,
-            "Source contains an unsupported server name"
-        );
-        if value.is_array()
-            && let Some(map) = config.as_object_mut()
-        {
-            map.remove("name");
+    let mut problems = Vec::new();
+    let mut unreported = 0usize;
+    let mut report = |problem: String| {
+        if problems.len() < MAX_PROBLEMS_PER_SOURCE {
+            problems.push(problem);
+        } else {
+            unreported += 1;
         }
-        let fields = config
-            .as_object()
-            .ok_or_else(|| anyhow::anyhow!("Invalid MCP entry; contents omitted"))?;
-        const ALLOWED: &[&str] = &[
-            "command",
-            "args",
-            "env",
-            "cwd",
-            "url",
-            "allow_private_network",
-            "transport",
-            "connect_timeout",
-            "execute_timeout",
-            "read_timeout",
-            "disabled",
-            "enabled",
-            "required",
-            "enabled_tools",
-            "disabled_tools",
-            "headers",
-            "env_headers",
-            "env_http_headers",
-            "bearer_token_env_var",
-            "scopes",
-            "oauth",
-            "oauth_resource",
-        ];
-        anyhow::ensure!(
-            fields.keys().all(|key| ALLOWED.contains(&key.as_str())),
-            "Source contains unsupported MCP fields; review it at its source"
-        );
-        if let Some(oauth) = fields.get("oauth").filter(|v| !v.is_null()) {
-            anyhow::ensure!(
-                oauth
-                    .as_object()
-                    .is_some_and(|map| map.keys().all(|key| key == "client_id")),
-                "Source contains unsupported OAuth fields"
-            );
+    };
+    for (name, config) in extract_servers_map(&value) {
+        if !(super::mcp_name_is_command_safe(&name) && name.len() <= 128) {
+            report("An entry with an unsupported server name was skipped".to_string());
+            continue;
         }
-        let server: McpServerConfig = serde_json::from_value(config)
-            .map_err(|_| anyhow::anyhow!("Invalid MCP entry; contents omitted"))?;
-        anyhow::ensure!(
-            server.command.is_some() != server.url.is_some(),
-            "MCP entry must have one target"
-        );
-        if let Some(command) = &server.command {
-            anyhow::ensure!(
-                !command.trim().is_empty() && !command.chars().any(char::is_control),
-                "Invalid MCP command"
-            );
-        }
-        if let Some(url) = &server.url {
-            let parsed =
-                reqwest::Url::parse(url).map_err(|_| anyhow::anyhow!("Invalid MCP URL"))?;
-            anyhow::ensure!(
-                matches!(parsed.scheme(), "http" | "https")
-                    && parsed.host_str().is_some()
-                    && parsed.username().is_empty()
-                    && parsed.password().is_none(),
-                "Unsupported MCP URL"
-            );
-        }
-        super::validate_mcp_transport(server.transport.as_deref())
-            .map_err(|_| anyhow::anyhow!("Unsupported MCP transport"))?;
+        let hash = entry_hash(&name, &config);
+        let server = match checked_entry(config, value.is_array()) {
+            Ok(server) => server,
+            Err(error) => {
+                report(format!("Server '{name}' was skipped: {error}"));
+                continue;
+            }
+        };
         let hard_blocked = !server.is_enabled();
         out.push(ImportCandidate {
             summary: server_summary(&name, &server),
             name,
             source_kind: kind.clone(),
             source_path: path.to_path_buf(),
-            content_hash: hash.clone(),
+            content_hash: hash,
             hard_blocked,
             block_reason: hard_blocked.then(|| "Disabled at its source; cannot import".into()),
             server,
         });
     }
-    Ok(out)
+    if unreported > 0 {
+        problems.push(format!("{unreported} more entries were skipped"));
+    }
+    Ok((out, problems))
+}
+
+fn entry_hash(name: &str, entry: &Value) -> String {
+    let mut bytes = name.as_bytes().to_vec();
+    bytes.push(0);
+    bytes.extend(entry.to_string().into_bytes());
+    hex_sha256(&bytes)
+}
+
+/// Validate one server entry. Error messages never echo entry contents.
+fn checked_entry(mut config: Value, from_array: bool) -> anyhow::Result<McpServerConfig> {
+    if let Some(map) = config.as_object_mut() {
+        if from_array {
+            map.remove("name");
+        }
+        translate_entry_type(map)?;
+    }
+    let fields = config
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("Invalid MCP entry; contents omitted"))?;
+    const ALLOWED: &[&str] = &[
+        "command",
+        "args",
+        "env",
+        "cwd",
+        "url",
+        "allow_private_network",
+        "transport",
+        "connect_timeout",
+        "execute_timeout",
+        "read_timeout",
+        "disabled",
+        "enabled",
+        "required",
+        "enabled_tools",
+        "disabled_tools",
+        "headers",
+        "env_headers",
+        "env_http_headers",
+        "bearer_token_env_var",
+        "scopes",
+        "oauth",
+        "oauth_resource",
+    ];
+    anyhow::ensure!(
+        fields.keys().all(|key| ALLOWED.contains(&key.as_str())),
+        "Entry contains unsupported MCP fields; review it at its source"
+    );
+    if let Some(oauth) = fields.get("oauth").filter(|v| !v.is_null()) {
+        anyhow::ensure!(
+            oauth
+                .as_object()
+                .is_some_and(|map| map.keys().all(|key| key == "client_id")),
+            "Entry contains unsupported OAuth fields"
+        );
+    }
+    let server: McpServerConfig = serde_json::from_value(config)
+        .map_err(|_| anyhow::anyhow!("Invalid MCP entry; contents omitted"))?;
+    anyhow::ensure!(
+        server.command.is_some() != server.url.is_some(),
+        "MCP entry must have one target"
+    );
+    if let Some(command) = &server.command {
+        anyhow::ensure!(
+            !command.trim().is_empty() && !command.chars().any(char::is_control),
+            "Invalid MCP command"
+        );
+    }
+    if let Some(url) = &server.url {
+        let parsed = reqwest::Url::parse(url).map_err(|_| anyhow::anyhow!("Invalid MCP URL"))?;
+        anyhow::ensure!(
+            matches!(parsed.scheme(), "http" | "https")
+                && parsed.host_str().is_some()
+                && parsed.username().is_empty()
+                && parsed.password().is_none(),
+            "Unsupported MCP URL"
+        );
+    }
+    super::validate_mcp_transport(server.transport.as_deref())
+        .map_err(|_| anyhow::anyhow!("Unsupported MCP transport"))?;
+    Ok(server)
+}
+
+/// Claude Code writes `"type": "stdio" | "http" | "sse"` on every entry. Fold
+/// it into Codewhale's shape: the target field already selects stdio versus
+/// HTTP, and only legacy SSE needs an explicit `transport`. A `type` that
+/// contradicts the entry's target or transport is refused, never guessed.
+fn translate_entry_type(map: &mut serde_json::Map<String, Value>) -> anyhow::Result<()> {
+    let Some(kind) = map.remove("type") else {
+        return Ok(());
+    };
+    let kind = kind
+        .as_str()
+        .map(|kind| kind.trim().to_ascii_lowercase())
+        .ok_or_else(|| anyhow::anyhow!("Unsupported MCP entry type"))?;
+    let transport = map
+        .get("transport")
+        .map(|transport| transport.as_str().map(str::trim));
+    let is_sse = transport.is_some_and(|t| t.is_some_and(|t| t.eq_ignore_ascii_case("sse")));
+    match kind.as_str() {
+        "stdio" => anyhow::ensure!(
+            map.contains_key("command") && transport.is_none(),
+            "MCP entry type does not match its target"
+        ),
+        "http" | "streamable-http" => anyhow::ensure!(
+            map.contains_key("url") && !is_sse,
+            "MCP entry type does not match its target"
+        ),
+        "sse" => {
+            anyhow::ensure!(
+                map.contains_key("url") && (transport.is_none() || is_sse),
+                "MCP entry type does not match its target"
+            );
+            map.insert("transport".to_string(), Value::String("sse".to_string()));
+        }
+        _ => anyhow::bail!("Unsupported MCP entry type"),
+    }
+    Ok(())
 }
 
 fn extract_servers_map(value: &Value) -> Vec<(String, Value)> {
@@ -376,7 +463,7 @@ pub fn record_decisions(
     decisions: &HashMap<String, ImportDecision>,
     now_unix: u64,
 ) {
-    // Group by source path + hash so one file approval is one entry.
+    // Group by source path + entry hash: one record per reviewed entry.
     let mut by_source: HashMap<(PathBuf, String), Vec<(&ImportCandidate, ImportDecision)>> =
         HashMap::new();
     for candidate in candidates {
@@ -529,7 +616,13 @@ impl<'a> ImportContext<'a> {
         let mut problems = Vec::new();
         for (path, kind) in sources {
             match checked_source(&path, kind.clone()) {
-                Ok(found) => candidates.extend(found),
+                Ok((found, skipped)) => {
+                    candidates.extend(found);
+                    problems.extend(skipped.into_iter().map(|message| ImportProblem {
+                        source_kind: kind.clone(),
+                        message,
+                    }));
+                }
                 Err(_) => problems.push(ImportProblem { source_kind: kind,
                     message: "Source could not be safely read or contains unsupported configuration; review it at its source".into() }),
             }
@@ -918,7 +1011,7 @@ mod tests {
             let path = context.home.join(".claude.json");
             fs::write(
                 &path,
-                vec![b' '; super::super::MAX_MCP_CONFIG_BYTES as usize + 1],
+                vec![b' '; crate::import_claude::MAX_SOURCE_BYTES as usize + 1],
             )
             .unwrap();
             let preview = preview_imports(context).unwrap();
@@ -934,6 +1027,127 @@ mod tests {
                 assert!(preview.candidates.is_empty());
                 assert_eq!(preview.problems.len(), 1);
             }
+        });
+    }
+
+    #[test]
+    fn claude_code_entries_with_type_import_and_bad_siblings_are_skipped_alone() {
+        with_import_context(|context| {
+            write_claude_json(
+                &context.home,
+                r#"{"mcpServers":{
+                    "local":{"type":"stdio","command":"npx","args":["-y","pkg"]},
+                    "remote":{"type":"http","url":"https://mcp.example.test/mcp"},
+                    "legacy":{"type":"sse","url":"https://sse.example.test/sse"},
+                    "odd":{"type":"sse","command":"npx"},
+                    "extra":{"command":"echo","unknownField":"secret-value"}
+                }}"#,
+            );
+            let preview = preview_imports(context).unwrap();
+            let mut names: Vec<_> = preview.candidates.iter().map(|c| c.name.as_str()).collect();
+            names.sort_unstable();
+            assert_eq!(names, ["legacy", "local", "remote"]);
+            let messages: Vec<_> = preview
+                .problems
+                .iter()
+                .map(|p| p.message.as_str())
+                .collect();
+            assert_eq!(messages.len(), 2, "{messages:?}");
+            assert!(messages.iter().any(|m| m.contains("'odd'")));
+            assert!(messages.iter().any(|m| m.contains("'extra'")));
+            assert!(
+                !serde_json::to_string(&preview)
+                    .unwrap()
+                    .contains("secret-value")
+            );
+
+            let candidates = discover_external_sources(&context.home, context.workspace, &[]);
+            let legacy = candidates.iter().find(|c| c.name == "legacy").unwrap();
+            assert_eq!(legacy.server.transport.as_deref(), Some("sse"));
+            let remote = candidates.iter().find(|c| c.name == "remote").unwrap();
+            assert_eq!(remote.server.transport, None);
+        });
+    }
+
+    #[test]
+    fn skipped_entries_from_one_source_are_capped() {
+        with_import_context(|context| {
+            let entries: Vec<String> = (0..MAX_PROBLEMS_PER_SOURCE + 5)
+                .map(|i| format!(r#""bad{i}":{{"x":1}}"#))
+                .collect();
+            write_claude_json(
+                &context.home,
+                &format!(
+                    r#"{{"mcpServers":{{{},"ok":{{"command":"echo"}}}}}}"#,
+                    entries.join(",")
+                ),
+            );
+            let preview = preview_imports(context).unwrap();
+            assert_eq!(preview.candidates.len(), 1);
+            assert_eq!(preview.problems.len(), MAX_PROBLEMS_PER_SOURCE + 1);
+            assert_eq!(
+                preview.problems.last().unwrap().message,
+                "5 more entries were skipped"
+            );
+        });
+    }
+
+    #[test]
+    fn unrelated_source_rewrites_keep_review_tokens_and_declines() {
+        with_import_context(|context| {
+            let source = write_claude_json(
+                &context.home,
+                r#"{"numStartups":1,"mcpServers":{"x":{"command":"echo"},"y":{"command":"echo"}}}"#,
+            );
+            let preview = preview_imports(context).unwrap();
+            // Claude Code rewrites its state file on every run.
+            fs::write(
+                &source,
+                r#"{"numStartups":2,"mcpServers":{"x":{"command":"echo"},"y":{"command":"echo"}}}"#,
+            )
+            .unwrap();
+            let row = preview.candidates.iter().find(|c| c.name == "x").unwrap();
+            let receipt = apply_reviewed_import(
+                context,
+                &row.id,
+                &row.content_hash,
+                &preview.revision,
+                ImportDecision::Approve,
+            )
+            .unwrap();
+            assert!(receipt.imported);
+
+            let candidates = discover_from_json_file(&source, ExternalMcpSourceKind::ClaudeJson);
+            let mut store = ImportConsentStore::default();
+            let decisions = HashMap::from([("y".to_string(), ImportDecision::Decline)]);
+            record_decisions(&mut store, &candidates, &decisions, 1);
+            fs::write(
+                &source,
+                r#"{"numStartups":3,"mcpServers":{"x":{"command":"echo"},"y":{"command":"echo"}}}"#,
+            )
+            .unwrap();
+            let refreshed = discover_from_json_file(&source, ExternalMcpSourceKind::ClaudeJson);
+            let needing: Vec<_> = candidates_needing_consent(&refreshed, &store)
+                .into_iter()
+                .map(|c| c.name)
+                .collect();
+            // `y` stays declined; `x` was never decided in this store.
+            assert_eq!(needing, ["x"]);
+        });
+    }
+
+    #[test]
+    fn claude_json_larger_than_the_mcp_config_bound_is_discovered() {
+        with_import_context(|context| {
+            let padding = "x".repeat(super::super::MAX_MCP_CONFIG_BYTES as usize * 3 / 2);
+            write_claude_json(
+                &context.home,
+                &format!(r#"{{"history":"{padding}","mcpServers":{{"x":{{"command":"echo"}}}}}}"#),
+            );
+            let preview = preview_imports(context).unwrap();
+            assert!(preview.problems.is_empty());
+            assert_eq!(preview.candidates.len(), 1);
+            assert_eq!(preview.candidates[0].name, "x");
         });
     }
 

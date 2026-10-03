@@ -13,7 +13,6 @@ import buildSitemap from "../app/sitemap";
 import { DOC_TOPICS, docTopicHref, getTopic } from "./docs-map";
 import { docsTopicIsCurrent } from "./docs-navigation";
 import { locales } from "./i18n/config";
-import { contentLocalesForPath } from "./i18n/content-locales";
 import { getChrome, getHome } from "./i18n/dictionaries";
 import {
   currentNavHref,
@@ -91,9 +90,10 @@ describe("sitemap and hreflang preservation", () => {
   });
 
   it("keeps sitemap and hreflang output aligned with real translation coverage", () => {
-    // 18 home locales + 10 guide locales + English-only install + (en, zh) for every other route
-    // (including /product, /plugins, and /changelog, whose bodies ship en/zh only).
-    expect(sitemapEntries).toHaveLength(99);
+    // 18 home locales + 18 /computer-use locales + English-only install + (en, zh) for every
+    // other route (including /docs/guide, /product, /plugins, and /changelog, whose bodies
+    // ship en/zh only).
+    expect(sitemapEntries).toHaveLength(107);
     expect(sitemapEntries.filter(entry => entry.url.endsWith("/install")).map(entry => entry.url))
       .toEqual([`${SITE_URL}/en/install`]);
     expect(sitemapEntries.some(entry => entry.url.endsWith("/pricing"))).toBe(false);
@@ -105,7 +105,8 @@ describe("sitemap and hreflang preservation", () => {
     }
     for (const [path, expectedLocales] of [
       ["/", locales],
-      ["/docs/guide", contentLocalesForPath("/docs/guide")],
+      ["/docs/guide", ["en", "zh"]],
+      ["/computer-use", locales],
       ["/install", ["en"]],
       ["/docs", ["en", "zh"]],
     ] as const) {
@@ -365,7 +366,9 @@ describe("homepage integration", () => {
     // (plain "Unreleased", per docs/design/WEB_VOICE.md).
     expect(homepage).toContain("d.sourceCandidate");
     expect(getHome("en").sourceCandidate).toBe("Unreleased");
-    expect(homepage).toContain("src={TERMINAL_SCREENSHOT.src}");
+    // The terminal is the live capture, labelled with the captured build.
+    expect(homepage).toContain("<TerminalCapture");
+    expect(homepage).toContain("TERMINAL_SCREENSHOT.version");
     for (const label of ["Plan", "Work", "Operate", "Ask", "Auto-Review", "Full Access"]) {
       expect(homepage).toContain(label);
     }

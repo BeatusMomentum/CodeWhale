@@ -115,7 +115,8 @@ export interface ChromeDict {
   /**
    * Visible badge marking a partial locale pack in the switcher, e.g.
    * "(partial)" — honest scope signal, per the localization quality
-   * contract. Keep it short.
+   * contract. Keep it short. The switcher shows it, brackets stripped, as
+   * the heading of the group that lists partial packs.
    */
   partialBadge: string;
 }
@@ -159,12 +160,18 @@ export interface HomeDict {
   /** "released" / "unreleased" — the machine-readable source-state label. */
   publishedRelease: string;
   figcaptionSourceCandidate: string;
+  /** Running head of the terminal chapter ("01 / Your terminal"). */
+  chapterTerminal: string;
+  /** Title of the terminal chapter, above the live capture. */
+  chapterTerminalTitle: string;
 
   /** What a person gains: heading, lede, and three [title, body] columns. */
   gainHeading: string;
   gainLede: string;
   gain: [string, string][];
 
+  /** Running head of the models chapter ("02 / Your models"). */
+  chapterModels: string;
   modelsHeading: string;
   modelsBody: string;
   /** Three [route kind, description] rows. */
@@ -176,6 +183,8 @@ export interface HomeDict {
   startGuideLink: string;
   startVocabularyLink: string;
 
+  /** Running head of the availability chapter ("04 / Where it runs"). */
+  chapterAvailability: string;
   availabilityHeading: string;
   availabilityLede: string;
   availability: [string, string, string][];
@@ -266,6 +275,8 @@ export interface DocsShellDict {
   webGuideTag: string;
   /** Row tag for a GitHub source document. */
   sourceDocTag: string;
+  /** Per-row disclosure that reveals the repository files a topic comes from. */
+  sourceDetails: string;
   emptyTitle: string;
   emptyBody: string;
   emptyCta: string;
@@ -295,6 +306,13 @@ export interface DocsShellDict {
   noteLabel: string;
   /** Accessible name of a page's table of contents. */
   onThisPage: string;
+
+  // --- session recording panel (components/session-media.tsx) ---
+  /** Shown in place of a recording that has not been made yet. */
+  mediaPendingNote: string;
+  mediaPlanLink: string;
+  mediaGifFallback: string;
+  mediaTranscript: string;
 }
 
 /**
@@ -317,6 +335,8 @@ export interface StatesDict {
   notFoundTitle: string;
   notFoundBody: string;
   notFoundHomeLink: string;
+  /** Alt text for the 404 poster (public/codwhale-404.webp). */
+  notFoundPosterAlt: string;
   /**
    * A data-bearing page whose source was not asked (build-time prerender)
    * or refused (rate limit, outage). Distinct from `empty`, which asserts
@@ -458,6 +478,56 @@ export interface DigestDict {
   lead: string;
 }
 
+/** `app/[locale]/feed/page.tsx`. */
+export interface FeedDict {
+  metaTitle: string;
+  metaDescription: string;
+  /** Page H1. */
+  title: string;
+  /** The H1 again in the other script, set beside it (the bilingual Han title). */
+  titleAside: string;
+  /** BCP 47 language of `titleAside`. */
+  titleAsideLang: string;
+  /** `{repo}` is where the page typesets the repository link. */
+  lede: string;
+  pulls: string;
+  issues: string;
+  /** Items in a column; `{count}` is filled at render time. */
+  shownCount: string;
+  openIssue: string;
+  openPull: string;
+  startDiscussion: string;
+}
+
+/** `app/[locale]/community/page.tsx`. */
+export interface CommunityDict {
+  metaTitle: string;
+  metaDescription: string;
+  kicker: string;
+  /** Page H1. */
+  title: string;
+  lede: string;
+  fileIssue: string;
+  browsePulls: string;
+  readGuide: string;
+  pathsTitle: string;
+  pathsScope: string;
+  recordTitle: string;
+  recordScope: string;
+  creditTitle: string;
+  /** Credit scope once the source version is the published release. */
+  creditScope: string;
+  /** Credit scope while the source version is ahead of the published release. */
+  creditScopeUnreleased: string;
+  /** Credit heading for the published release; `{version}` is filled at render time. */
+  creditLabel: string;
+  /** Credit heading while the source version is unreleased; `{version}` is filled at render time. */
+  creditLabelUnreleased: string;
+  mergedTitle: string;
+  helpersTitle: string;
+  fullRecord: string;
+}
+
 /** `app/[locale]/faq/page.tsx` and its `components/faq-search.tsx`. */
 export interface FaqDict {
   metaTitle: string;
@@ -465,6 +535,10 @@ export interface FaqDict {
   eyebrow: string;
   /** Page H1. */
   title: string;
+  /** The H1 again in the other script, set beside it (the bilingual Han title). */
+  titleAside: string;
+  /** BCP 47 language of `titleAside`. */
+  titleAsideLang: string;
   lead: string;
   notCovered: string;
   openIssue: string;
@@ -480,6 +554,121 @@ export interface FaqDict {
   sourcesLabel: string;
   noResultsTitle: string;
   noResultsBody: string;
+}
+
+/** `app/[locale]/roadmap/page.tsx`. */
+export interface RoadmapDict {
+  metaTitle: string;
+  metaDescription: string;
+  eyebrow: string;
+  /** Page H1. */
+  title: string;
+  introduction: string;
+  sectionTitle: string;
+  browseIssues: string;
+  /** Track size; `{count}` is filled at render time. */
+  trackCount: string;
+  /** Track size when it is exactly one. */
+  trackCountOne: string;
+  contributeTitle: string;
+  contributeBody: string;
+  issuesDetail: string;
+  discussionsDetail: string;
+  pullsDetail: string;
+}
+
+/** `app/[locale]/docs/vocabulary/page.tsx`. */
+export interface DocsVocabularyDict {
+  metaTitle: string;
+  metaDescription: string;
+  /** Classes on every body paragraph; zh loosens leading and tracking. */
+  bodyClassName: string;
+  /** Page H1. */
+  title: string;
+  lead: string;
+  executionHeading: string;
+  controlHeading: string;
+  controlLead: string;
+  routeHeading: string;
+  advisoryHeading: string;
+  measurementHeading: string;
+  leaderboardNote: string;
+  /** Maintainer pointer, carried in a hidden `data-source-note`. */
+  sourceNote: string;
+}
+
+/** `app/[locale]/contribute/page.tsx`. */
+export interface ContributeDict {
+  metaTitle: string;
+  metaDescription: string;
+  kicker: string;
+  /** Page H1. */
+  title: string;
+  lede: string;
+  fileIssue: string;
+  browsePulls: string;
+  fullGuide: string;
+  pathsTitle: string;
+  workflowTitle: string;
+  reviewTitle: string;
+  reviewScope: string;
+  devTitle: string;
+  devScope: string;
+}
+
+/** `app/[locale]/constitution/page.tsx` and its `components/thinking-trace.tsx`. */
+export interface ConstitutionDict {
+  metaTitle: string;
+  metaDescription: string;
+  kicker: string;
+  /** Page H1. */
+  title: string;
+  /** The H1 again in the other script, set beside it (the bilingual Han title). */
+  titleAside: string;
+  /** BCP 47 language of `titleAside`. */
+  titleAsideLang: string;
+  lede: string;
+  /** Status label on the setup callout. */
+  since: string;
+  sinceBody: string;
+  rankTitle: string;
+  rankScope: string;
+  boundaryTitle: string;
+  boundaryBody: string;
+  traceTitle: string;
+  traceScope: string;
+  /** The label every traced scene carries: these are illustrations, not transcripts. */
+  illustration: string;
+  install: string;
+  configuration: string;
+}
+
+/** `app/[locale]/runtime/page.tsx`. */
+export interface RuntimeDict {
+  metaTitle: string;
+  metaDescription: string;
+  kicker: string;
+  /** Page H1. */
+  title: string;
+  /** The H1 again in the other script, set beside it (the bilingual Han title). */
+  titleAside: string;
+  /** BCP 47 language of `titleAside`. */
+  titleAsideLang: string;
+  lede: string;
+  integrationsTitle: string;
+  /** Status label on an experimental integration. */
+  experimental: string;
+  trustTitle: string;
+  factsTitle: string;
+  version: string;
+  toolCount: string;
+  sandboxBackends: string;
+  /** Summary of the maintainer-facing disclosure (crates, source revision). */
+  details: string;
+  sourceRevision: string;
+  docsLead: string;
+  runtimeApiDoc: string;
+  mcpDoc: string;
 }
 
 export type DocsHooksDict = DocsPageDict;

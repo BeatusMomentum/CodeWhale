@@ -24,7 +24,7 @@ fn provider_model_id(key: &str) -> Option<&str> {
 }
 
 fn parse_config(body: &str) -> Result<Config> {
-    toml::from_str(body)
+    crate::config::parse_config_base(body)
         .map_err(|_| anyhow::anyhow!("Could not parse route configuration; contents omitted"))
 }
 
@@ -58,7 +58,7 @@ fn model_identity(config: &Config, key: &str) -> Result<ProviderIdentity> {
                 })
                 .map_or(id, |provider| provider.as_str())
         };
-        config.resolve_provider_pin_identity(selector)
+        config.resolve_provider_selection_identity(selector)
     } else {
         config.active_provider_identity(config.api_provider())
     }
@@ -369,7 +369,7 @@ pub fn set_document(
     let config = parse_config(&doc.to_string())?;
     if key == "provider" {
         let identity = config
-            .resolve_provider_pin_identity(value)
+            .resolve_provider_selection_identity(value)
             .map_err(anyhow::Error::msg)?;
         persistence::set_document_value(
             doc,
@@ -501,7 +501,7 @@ mod tests {
         assert_eq!(std::fs::read_to_string(settings_path)?, settings);
         // An unrelated typed store write must preserve the migration receipt.
         let mut store = codewhale_config::ConfigStore::load(Some(path.clone()))?;
-        store.config.set_value("verbosity", "quiet")?;
+        store.config.set_value("verbosity", "concise")?;
         store.save()?;
         assert_eq!(
             document(&path)["route_preferences_version"].as_integer(),
@@ -576,18 +576,17 @@ model = "Other-X"
         .collect();
         let path = home.path().join("config.toml");
 
-        // The incoming route owns its own leaf, so the outgoing root fallback
-        // is inert saved state. A CLI switch must not delete it, and switching
-        // back must still find it.
+        // The outgoing route was resolving the root fallback as its own
+        // model, so a CLI switch moves it onto that route's leaf (never
+        // deletes it), and switching back must still find it.
         std::fs::write(
             &path,
             "route_preferences_version = 1\nprovider = \"zai\"\ndefault_text_model = \"GLM-4.6\"\n[providers.deepseek]\nmodel = \"deepseek-v4-pro\"\n",
         )?;
         set(&path, "provider", "deepseek")?;
-        assert_eq!(
-            document(&path)["default_text_model"].as_str(),
-            Some("GLM-4.6")
-        );
+        let doc = document(&path);
+        assert!(doc.get("default_text_model").is_none());
+        assert_eq!(doc["providers"]["zai"]["model"].as_str(), Some("GLM-4.6"));
         let switched = Config::load(Some(path.clone()), None)
             .expect("a CLI provider switch must remain loadable");
         assert_eq!(switched.api_provider(), ApiProvider::Deepseek);

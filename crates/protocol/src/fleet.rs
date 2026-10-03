@@ -432,9 +432,8 @@ pub enum FleetHostSpec {
         /// Known hosts file for host-key verification.
         #[serde(skip_serializing_if = "Option::is_none")]
         known_hosts: Option<PathBuf>,
-        /// Expected host key fingerprint (SHA256:...) for key pinning.
-        /// When set, the connection is only trusted if the server's
-        /// host key matches this fingerprint exactly.
+        /// Legacy field retained for decoding; the SSH host adapter rejects it
+        /// when set. Configure `known_hosts` for host-key verification instead.
         #[serde(skip_serializing_if = "Option::is_none")]
         host_key_fingerprint: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -666,7 +665,9 @@ pub enum FleetWorkerAuth {
         /// Known hosts file for host-key verification.
         #[serde(skip_serializing_if = "Option::is_none")]
         known_hosts: Option<PathBuf>,
-        /// Expected host key fingerprint for pinning.
+        /// Legacy metadata; does not enforce key pinning. The SSH host adapter
+        /// rejects `FleetHostSpec::Ssh::host_key_fingerprint` when set; configure
+        /// `known_hosts` on the host spec for host-key verification instead.
         #[serde(skip_serializing_if = "Option::is_none")]
         host_key_fingerprint: Option<String>,
         /// SSH user for the connection.

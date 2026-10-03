@@ -142,6 +142,10 @@ pub struct TranscriptViewCache {
     line_meta: Vec<TranscriptLineMeta>,
     /// Visual-only prefix widths let selection copy strip rails without glyph guesses.
     rail_prefix_widths: Vec<usize>,
+    /// Flat line index at which each cell's rendered lines begin (hidden
+    /// cells record where their successor starts). Lets a suffix rebuild
+    /// truncate and an action-hint move repaint without scanning every row.
+    cell_line_starts: Vec<usize>,
     streaming_source_receipt: Option<StreamingSourceReceipt>,
     streaming_lines_reflattened: u64,
     streaming_meta_rows_scanned: u64,
@@ -165,6 +169,7 @@ impl TranscriptViewCache {
             line_links: Vec::new(),
             line_meta: Vec::new(),
             rail_prefix_widths: Vec::new(),
+            cell_line_starts: Vec::new(),
             streaming_source_receipt: None,
             streaming_lines_reflattened: 0,
             streaming_meta_rows_scanned: 0,
@@ -189,8 +194,17 @@ impl TranscriptViewCache {
         owner: Option<TranscriptActionOwner>,
         original_index_map: Option<&[usize]>,
     ) {
-        if let Some(first) = self.set_action_owner(owner, original_index_map) {
-            self.flatten_from(self.options.spacing, first.saturating_sub(1));
+        // Scrolling moves the owner to the newest visible cell, so this runs
+        // on scroll frames. The hint only rewrites one line of the previous
+        // and next owner, so repaint those rows in place instead of
+        // re-flattening the transcript tail below them (#6652).
+        if let Some(change) = self.set_action_owner(owner, original_index_map)
+            && !self.repaint_action_hints(change)
+        {
+            self.flatten_from(
+                self.options.spacing,
+                first_hint_cell(change).saturating_sub(1),
+            );
         }
     }
 
@@ -288,6 +302,8 @@ impl TranscriptViewCache {
             self.identity_epoch = Some(owner.identity_epoch);
         }
         self.transcript_action_owner = action_owner;
+        // Collapsed reasoning has a fixed preview budget; viewport height
+        // does not participate in wrapping or cached cell identity.
         let layout_changed = self.width != width || self.options != options || identity_changed;
         let folded_changed = self.thinking_folds != *thinking_folds;
         // `todo_write` replaces the whole list on every call, so only the
@@ -350,7 +366,6 @@ impl TranscriptViewCache {
         let revisions_match = cell_revisions.len() == total_cells;
         let mut dirty_cells = 0usize;
         let mut streaming_tail_update = None;
-        let mut newest_reasoning = None;
 
         let mut idx: usize = 0;
         for cell in cells {
@@ -363,8 +378,6 @@ impl TranscriptViewCache {
             let original_idx = original_index_map
                 .map(|m| *m.get(idx).unwrap_or(&idx))
                 .unwrap_or(idx);
-            let is_layout_aware_preview = idx + 1 == total_cells;
-            let was_layout_aware_preview = idx + 1 == old_len;
             let is_tool_groupable = matches!(cell, HistoryCell::Tool(_));
             let render_width = if is_tool_groupable {
                 width.saturating_sub(2).max(1)
@@ -372,12 +385,7 @@ impl TranscriptViewCache {
                 width
             };
             let fold = thinking_folds.get(&original_idx).copied();
-            if is_layout_aware_preview && matches!(cell, HistoryCell::Thinking { .. }) {
-                newest_reasoning = Some((idx, cell, current_rev, fold));
-            }
             if !layout_changed
-                && is_layout_aware_preview == was_layout_aware_preview
-                && !(is_layout_aware_preview && any_dirty)
                 && revisions_match
                 && old_per_cell
                     .get(idx)
@@ -471,7 +479,6 @@ impl TranscriptViewCache {
             }
 
             let mut cell_options = options;
-            cell_options.reasoning_preview_extra_lines = 0;
             cell_options.superseded_work_receipt = matches!(
                 cell,
                 HistoryCell::Tool(tool) if tool.is_durable_work_receipt()
@@ -490,9 +497,35 @@ impl TranscriptViewCache {
         }
 
         self.per_cell = new_per_cell;
-        if let Some(target_first) = self.set_action_owner(action_owner, original_index_map) {
-            any_dirty = true;
-            first_dirty = Some(first_dirty.map_or(target_first, |dirty| dirty.min(target_first)));
+        // Rows from here down are rebuilt this frame; rows above it are
+        // untouched and still sit at their recorded `cell_line_starts`.
+        let mut rebuild_from = if !any_dirty {
+            usize::MAX
+        } else if layout_changed {
+            0
+        } else {
+            self.visible_rebuild_start(first_dirty.unwrap_or(0).saturating_sub(1))
+        };
+        let mut hint_settled = true;
+        if let Some(change) = self.set_action_owner(action_owner, original_index_map) {
+            // Scrolling moves the owner to the newest visible cell, including
+            // while a reply streams and its cell is dirty every frame. A
+            // hinted cell inside the rebuilt suffix is re-flattened with the
+            // new hint anyway; one above it keeps its geometry, so repaint its
+            // single hint row instead of rebuilding the tail below it (#6652).
+            let above = |cell: Option<usize>| cell.filter(|&cell| cell < rebuild_from);
+            let in_place = HintChange {
+                previous: above(change.previous),
+                next: above(change.next),
+            };
+            let repainted = self.repaint_action_hints(in_place);
+            if !repainted {
+                any_dirty = true;
+                rebuild_from = self.visible_rebuild_start(
+                    rebuild_from.min(first_hint_cell(change).saturating_sub(1)),
+                );
+            }
+            hint_settled = repainted && in_place == change;
         }
 
         if !any_dirty {
@@ -501,7 +534,7 @@ impl TranscriptViewCache {
 
         if !layout_changed
             && !folded_changed
-            && previous_rendered_target == self.reasoning_action_rendered_cell
+            && (hint_settled || previous_rendered_target == self.reasoning_action_rendered_cell)
             && old_len == total_cells
             && dirty_cells == 1
             && let Some((cell_index, line_from)) = streaming_tail_update
@@ -511,48 +544,25 @@ impl TranscriptViewCache {
             return;
         }
 
-        let mut rebuild_from = if layout_changed {
-            0
-        } else {
-            first_dirty.unwrap_or(0).saturating_sub(1)
-        };
-        // A hidden cell has no line boundary at which to truncate. Rebuild from
-        // a visible predecessor so appearance/disappearance cannot leave its
-        // old spacer or the following cell's boundary behind.
-        while rebuild_from > 0
-            && self
-                .per_cell
-                .get(rebuild_from)
-                .is_some_and(|cell| cell.is_empty)
-        {
-            rebuild_from -= 1;
-        }
         self.flatten_from(options.spacing, rebuild_from);
-
-        let Some(viewport_lines) = options.reasoning_preview_viewport_lines else {
-            return;
-        };
-        let free_rows = viewport_lines.saturating_sub(self.total_lines());
-        let Some((idx, cell, current_rev, fold)) = newest_reasoning.filter(|_| free_rows > 0)
-        else {
-            return;
-        };
-        let mut expanded_options = options;
-        expanded_options.reasoning_preview_extra_lines = free_rows;
-        let expanded = render_cached_cell(cell, current_rev, width, expanded_options, fold);
-        if expanded.lines == self.per_cell[idx].lines {
-            return;
-        }
-        self.per_cell[idx] = expanded;
-        self.set_action_owner(action_owner, original_index_map);
-        self.flatten_from(options.spacing, idx.saturating_sub(1));
     }
 
+    /// A hidden cell has no line boundary at which to truncate. Rebuild from
+    /// a visible predecessor so appearance/disappearance cannot leave its old
+    /// spacer or the following cell's boundary behind.
+    fn visible_rebuild_start(&self, mut from: usize) -> usize {
+        while from > 0 && self.per_cell.get(from).is_some_and(|cell| cell.is_empty) {
+            from -= 1;
+        }
+        from
+    }
+
+    /// Returns the previous and next hinted cells when the hint moved.
     fn set_action_owner(
         &mut self,
         owner: Option<TranscriptActionOwner>,
         original_index_map: Option<&[usize]>,
-    ) -> Option<usize> {
+    ) -> Option<HintChange> {
         self.transcript_action_owner = owner;
         let rendered = owner.and_then(|owner| match original_index_map {
             Some(map) => map.iter().position(|&index| index == owner.cell_index),
@@ -570,7 +580,131 @@ impl TranscriptViewCache {
             .and(rendered);
         let previous = self.reasoning_action_rendered_cell;
         self.reasoning_action_rendered_cell = next;
-        (previous != next).then(|| previous.into_iter().chain(next).min().unwrap_or(0))
+        (previous != next).then_some(HintChange { previous, next })
+    }
+
+    /// Rewrite the affordance row of the cells whose hint changed. The hint
+    /// only swaps the final span of a cell's header, so geometry, spacers,
+    /// and every other row are unchanged. Returns false when the flat index
+    /// cannot vouch for a cell, and the caller falls back to a rebuild.
+    fn repaint_action_hints(&mut self, change: HintChange) -> bool {
+        let hint = self.action_hint();
+        for cell_index in [change.previous, change.next].into_iter().flatten() {
+            let Some(cached) = self.per_cell.get(cell_index) else {
+                return false;
+            };
+            if cached.lines.is_empty() {
+                continue;
+            }
+            let line_in_cell = 0;
+            let Some(at) = self
+                .cell_line_starts
+                .get(cell_index)
+                .map(|start| start + line_in_cell)
+            else {
+                return false;
+            };
+            if self
+                .line_meta
+                .get(at)
+                .and_then(TranscriptLineMeta::cell_line)
+                != Some((cell_index, line_in_cell))
+            {
+                return false;
+            }
+            let (line, links, rail_prefix_width, meta) =
+                self.flat_cell_line(hint.as_deref(), cell_index, line_in_cell);
+            self.lines[at] = line;
+            self.line_links[at] = links;
+            self.rail_prefix_widths[at] = rail_prefix_width;
+            self.line_meta[at] = meta;
+            self.streaming_lines_reflattened = self.streaming_lines_reflattened.saturating_add(1);
+        }
+        true
+    }
+
+    /// Localized Space affordance, or None when it cannot fit the width.
+    fn action_hint(&self) -> Option<String> {
+        let hint = format!(
+            "Space:{}",
+            tr(self.options.locale, MessageId::TranscriptReasoningExpand)
+        );
+        (unicode_width::UnicodeWidthStr::width(hint.as_str())
+            <= usize::from(self.width).saturating_sub(2))
+        .then_some(hint)
+    }
+
+    /// Final flat form of one cached cell line: hint, group rail, links, and
+    /// copy metadata. Shared by flattening and in-place hint repaint.
+    fn flat_cell_line(
+        &self,
+        hint: Option<&str>,
+        cell_index: usize,
+        line_in_cell: usize,
+    ) -> (
+        Line<'static>,
+        Vec<crate::tui::osc8::LineLink>,
+        usize,
+        TranscriptLineMeta,
+    ) {
+        let cached = &self.per_cell[cell_index];
+        let rendered_line_count = cached.lines.len();
+        let line = &cached.lines[line_in_cell];
+        let hint = hint.filter(|hint| {
+            self.reasoning_action_rendered_cell == Some(cell_index)
+                && line_in_cell == 0
+                && line
+                    .width()
+                    .saturating_sub(line.spans.last().map_or(0, Span::width))
+                    + unicode_width::UnicodeWidthStr::width(*hint)
+                    < usize::from(self.width)
+        });
+        let is_hint = hint.is_some();
+        let hinted = hint.map(|hint| {
+            let mut hinted = line.clone();
+            if let Some(span) = hinted.spans.last_mut() {
+                span.content = format!(" {hint}").into();
+            }
+            hinted
+        });
+        let line = hinted.as_ref().unwrap_or(line);
+        let rail = tool_group_rail(
+            self.per_cell.as_slice(),
+            cell_index,
+            line_in_cell,
+            rendered_line_count,
+        );
+        let final_line = line_with_group_rail(line, rail, usize::from(self.width));
+        let final_links = if is_hint {
+            Vec::new()
+        } else {
+            links_with_group_rail(
+                cached.links.get(line_in_cell).map_or(&[], Vec::as_slice),
+                rail,
+                usize::from(self.width),
+            )
+        };
+        let rail_prefix_width = compute_rail_prefix_width(&final_line);
+        let copy_prefix_width = if is_hint {
+            final_line.width().saturating_sub(rail_prefix_width)
+        } else {
+            cached
+                .copy_prefix_widths
+                .get(line_in_cell)
+                .copied()
+                .unwrap_or(0)
+        };
+        let meta = TranscriptLineMeta::CellLine {
+            cell_index,
+            line_in_cell,
+            copy_prefix_width,
+            copy_separator_after: cached
+                .copy_separators
+                .get(line_in_cell)
+                .copied()
+                .unwrap_or(CopyLineSeparator::Newline),
+        };
+        (final_line, final_links, rail_prefix_width, meta)
     }
 
     fn flatten(&mut self, spacing: TranscriptSpacing) {
@@ -578,6 +712,7 @@ impl TranscriptViewCache {
         self.line_links.clear();
         self.line_meta.clear();
         self.rail_prefix_widths.clear();
+        self.cell_line_starts.clear();
         self.append_flattened_cells(spacing, 0);
     }
 
@@ -591,14 +726,19 @@ impl TranscriptViewCache {
             return;
         }
 
-        let truncate_at = self
-            .line_meta
-            .iter()
-            .position(|meta| match meta {
-                TranscriptLineMeta::CellLine { cell_index, .. } => *cell_index >= first_cell,
-                TranscriptLineMeta::Spacer { .. } => false,
-            })
-            .unwrap_or(self.lines.len());
+        let truncate_at = match self.cell_line_starts.get(first_cell) {
+            Some(&start) => start,
+            None => self
+                .line_meta
+                .iter()
+                .position(|meta| match meta {
+                    TranscriptLineMeta::CellLine { cell_index, .. } => *cell_index >= first_cell,
+                    TranscriptLineMeta::Spacer { .. } => false,
+                })
+                .unwrap_or(self.lines.len()),
+        };
+        self.cell_line_starts
+            .truncate(first_cell.min(self.cell_line_starts.len()));
         self.lines.truncate(truncate_at);
         self.line_links.truncate(truncate_at);
         self.line_meta.truncate(truncate_at);
@@ -675,72 +815,31 @@ impl TranscriptViewCache {
     }
 
     fn append_flattened_cells(&mut self, spacing: TranscriptSpacing, start_cell: usize) {
-        let hint = format!(
-            "Space:{}",
-            tr(self.options.locale, MessageId::TranscriptReasoningExpand)
-        );
-        let hint_fits = unicode_width::UnicodeWidthStr::width(hint.as_str())
-            <= usize::from(self.width).saturating_sub(2);
-        for (cell_index, cached) in self.per_cell.iter().enumerate().skip(start_cell) {
+        let hint = self.action_hint();
+        // A start beyond the recorded prefix is only reachable through the
+        // fallback scan; pad so indices stay aligned with cells.
+        let pad_to = start_cell.min(self.per_cell.len());
+        while self.cell_line_starts.len() < pad_to {
+            self.cell_line_starts.push(self.lines.len());
+        }
+        for cell_index in start_cell..self.per_cell.len() {
+            self.cell_line_starts.push(self.lines.len());
+            let cached = &self.per_cell[cell_index];
             if cached.is_empty {
                 continue;
             }
-            let rendered_line_count = cached.lines.len();
-            for (line_in_cell, line) in cached.lines.iter().enumerate() {
-                let is_hint = self.reasoning_action_rendered_cell == Some(cell_index)
-                    && line_in_cell + 1 == rendered_line_count
-                    && hint_fits;
-                let hinted = is_hint.then(|| {
-                    let mut hinted = line.clone();
-                    if let Some(span) = hinted.spans.last_mut() {
-                        span.content = hint.clone().into();
-                    }
-                    hinted
-                });
-                let line = hinted.as_ref().unwrap_or(line);
-                let rail = tool_group_rail(
-                    self.per_cell.as_slice(),
-                    cell_index,
-                    line_in_cell,
-                    rendered_line_count,
-                );
-                let final_line = line_with_group_rail(line, rail, usize::from(self.width));
-                let final_links = if is_hint {
-                    Vec::new()
-                } else {
-                    links_with_group_rail(
-                        cached.links.get(line_in_cell).map_or(&[], Vec::as_slice),
-                        rail,
-                        usize::from(self.width),
-                    )
-                };
-                let rail_prefix_width = compute_rail_prefix_width(&final_line);
-                let copy_prefix_width = if is_hint {
-                    final_line.width().saturating_sub(rail_prefix_width)
-                } else {
-                    cached
-                        .copy_prefix_widths
-                        .get(line_in_cell)
-                        .copied()
-                        .unwrap_or(0)
-                };
+            for line_in_cell in 0..cached.lines.len() {
+                let (final_line, final_links, rail_prefix_width, meta) =
+                    self.flat_cell_line(hint.as_deref(), cell_index, line_in_cell);
                 self.rail_prefix_widths.push(rail_prefix_width);
                 self.lines.push(final_line);
                 self.line_links.push(final_links);
-                self.line_meta.push(TranscriptLineMeta::CellLine {
-                    cell_index,
-                    line_in_cell,
-                    copy_prefix_width,
-                    copy_separator_after: cached
-                        .copy_separators
-                        .get(line_in_cell)
-                        .copied()
-                        .unwrap_or(CopyLineSeparator::Newline),
-                });
+                self.line_meta.push(meta);
                 self.streaming_lines_reflattened =
                     self.streaming_lines_reflattened.saturating_add(1);
             }
 
+            let cached = &self.per_cell[cell_index];
             if let Some(next) = next_visible_cell(&self.per_cell, cell_index) {
                 let separator = separator_between(cached, next, spacing);
                 let rail = separator
@@ -788,6 +887,22 @@ impl TranscriptViewCache {
     }
 }
 
+/// Previous and next cells carrying the Space affordance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HintChange {
+    previous: Option<usize>,
+    next: Option<usize>,
+}
+
+/// Earliest cell whose hint changed; rebuilds start one cell earlier.
+fn first_hint_cell(change: HintChange) -> usize {
+    [change.previous, change.next]
+        .into_iter()
+        .flatten()
+        .min()
+        .unwrap_or(0)
+}
+
 fn render_cached_cell(
     cell: &HistoryCell,
     revision: u64,
@@ -818,13 +933,16 @@ fn render_cached_cell(
         copy_separators.push(rendered_line.copy_separator_after);
     }
     if reasoning_action == Some(ReasoningAction::Expand)
-        && let Some(line) = lines.last()
+        && let Some(line) = lines.first()
     {
         let prefix = line.width().saturating_sub(compute_rail_prefix_width(line));
         *copy_prefix_widths
-            .last_mut()
-            .expect("reasoning affordance line") = prefix;
-        links.last_mut().expect("reasoning affordance line").clear();
+            .first_mut()
+            .expect("reasoning affordance header") = prefix;
+        links
+            .first_mut()
+            .expect("reasoning affordance header")
+            .clear();
     }
     let is_empty = lines.is_empty();
     let ends_blank = last_line_is_blank(&lines);

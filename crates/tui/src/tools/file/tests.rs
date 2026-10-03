@@ -16,7 +16,7 @@ async fn missing_pdf_path_precedes_unavailable_helper() {
     .expect_err("missing path must fail before the missing helper is launched");
 
     match error {
-        ToolError::ExecutionFailed { message } => {
+        ToolError::ExecutionFailed { message, .. } => {
             assert!(message.contains("Failed to read"), "{message}");
             assert!(message.contains("missing.pdf"), "{message}");
         }
@@ -542,6 +542,7 @@ fn contract_edit_fuzzy_normalization_preserves_untouched_lines() {
             new_text: "She said hello.".to_string(),
         }],
         "doc.txt",
+        false,
     )
     .expect("fuzzy edit");
     assert_eq!(updated, "untouched line  \nShe said hello.\ntail  \n");
@@ -569,6 +570,40 @@ async fn contract_edit_preserves_bom_and_crlf_without_prior_read() {
     assert_eq!(
         std::fs::read(&path).expect("updated"),
         "\u{FEFF}one\r\ntwo\r\n".as_bytes()
+    );
+    // The receipt describes the bytes written (BOM and CRLF included), not
+    // the edited text, so a turn artifact's revision matches the file read.
+    let on_disk = std::fs::read(&path).expect("updated");
+    assert_eq!(
+        result.metadata.as_ref().expect("metadata")["mutation"]["files"],
+        json!([{
+            "path": "doc.txt",
+            "outcome": "updated",
+            "size": on_disk.len(),
+            "sha256": crate::hashing::sha256_hex(&on_disk),
+        }])
+    );
+}
+
+#[tokio::test]
+async fn contract_write_receipt_carries_written_size_and_sha256() {
+    let temporary = tempfile::tempdir().expect("tempdir");
+    let context = ToolContext::new(temporary.path());
+    let result = WriteFileTool::execute_contract_write(
+        json!({"path": "notes/out.md", "content": "# Title\n"}),
+        &context,
+    )
+    .await
+    .expect("write");
+    let on_disk = std::fs::read(temporary.path().join("notes/out.md")).expect("written");
+    assert_eq!(
+        result.metadata.as_ref().expect("metadata")["mutation"]["files"],
+        json!([{
+            "path": "notes/out.md",
+            "outcome": "created",
+            "size": on_disk.len(),
+            "sha256": crate::hashing::sha256_hex(&on_disk),
+        }])
     );
 }
 
@@ -694,6 +729,85 @@ async fn cancelled_queued_pi_write_never_starts() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn contract_write_preserves_unreadable_existing_file() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temporary = tempfile::tempdir().expect("tempdir");
+    let path = temporary.path().join("write-only.txt");
+    std::fs::write(&path, "original\n").expect("fixture");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o200))
+        .expect("make unreadable");
+    let context = ToolContext::new(temporary.path());
+    let result = WriteFileTool::execute_contract_write(
+        json!({"path": "write-only.txt", "content": "replacement\n"}),
+        &context,
+    )
+    .await;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+        .expect("restore permissions");
+
+    let error = result.expect_err("cannot overwrite without the prior contents");
+    assert!(error.to_string().contains("Failed to read"), "{error}");
+    assert_eq!(
+        std::fs::read_to_string(path).expect("unchanged"),
+        "original\n"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn compatibility_write_preserves_unreadable_existing_file() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temporary = tempfile::tempdir().expect("tempdir");
+    let path = temporary.path().join("write-only.txt");
+    let context = ToolContext::new(temporary.path());
+    let file_tool = crate::tools::file_tool::FileTool::new("File");
+    for tool in [&WriteFileTool as &dyn ToolSpec, &file_tool] {
+        std::fs::write(&path, "original\n").expect("fixture");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o200))
+            .expect("make unreadable");
+        let mut input = json!({"path": "write-only.txt", "content": "replacement\n"});
+        if tool.name() == "File" {
+            input["action"] = json!("write");
+        }
+        let result = tool.execute(input, &context).await;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .expect("restore permissions");
+
+        let error = result.expect_err("cannot overwrite without the prior contents");
+        assert!(error.to_string().contains("Failed to read"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("unchanged"),
+            "original\n"
+        );
+    }
+}
+
+#[tokio::test]
+async fn compatibility_write_preserves_non_utf8_existing_file() {
+    let temporary = tempfile::tempdir().expect("tempdir");
+    let path = temporary.path().join("latin1.txt");
+    let original = b"caf\xe9\n";
+    std::fs::write(&path, original).expect("fixture");
+    let context = ToolContext::new(temporary.path());
+    let file_tool = crate::tools::file_tool::FileTool::new("File");
+    for tool in [&WriteFileTool as &dyn ToolSpec, &file_tool] {
+        let mut input = json!({"path": "latin1.txt", "content": "replacement\n"});
+        if tool.name() == "File" {
+            input["action"] = json!("write");
+        }
+        let error = tool
+            .execute(input, &context)
+            .await
+            .expect_err("must decode original");
+        assert!(error.to_string().contains("Failed to read"), "{error}");
+        assert_eq!(std::fs::read(&path).expect("unchanged"), original);
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn contract_edit_rejects_read_only_target_before_atomic_replace() {
     use std::os::unix::fs::PermissionsExt;
 
@@ -712,4 +826,273 @@ async fn contract_edit_rejects_read_only_target_before_atomic_replace() {
     let error = result.expect_err("read-only target must fail");
     assert!(error.to_string().contains("readable and writable"));
     assert_eq!(std::fs::read_to_string(path).expect("unchanged"), "alpha\n");
+}
+
+async fn run_contract_bounds_operation(
+    operation: &str,
+    path: &str,
+    context: &ToolContext,
+) -> Result<(), ToolError> {
+    match operation {
+        "read" => ReadFileTool::execute_contract_read(
+            json!({"path": path, "offset": 1, "limit": 1}),
+            context,
+        )
+        .await
+        .map(|_| ()),
+        "write" => WriteFileTool::execute_contract_write(
+            json!({"path": path, "content": "replacement"}),
+            context,
+        )
+        .await
+        .map(|_| ()),
+        "edit" => EditFileTool::execute_contract_edits(
+            json!({"path": path, "edits": [{"oldText": "seed", "newText": "replacement"}]}),
+            context,
+        )
+        .await
+        .map(|_| ()),
+        _ => unreachable!(),
+    }
+}
+
+#[tokio::test]
+async fn contract_source_cap_refuses_sparse_files_without_paging_or_mutation() {
+    use std::io::{Read as _, Write as _};
+    let temporary = tempfile::tempdir().unwrap();
+    let path = temporary.path().join("large.txt");
+    let mut file = fs::File::create(&path).unwrap();
+    file.write_all(b"seed").unwrap();
+    file.set_len(CONTRACT_FILE_MAX_BYTES as u64 + 1).unwrap();
+    drop(file);
+    let context = ToolContext::new(temporary.path());
+    for operation in ["read", "write", "edit"] {
+        let error = tokio::time::timeout(
+            Duration::from_secs(2),
+            run_contract_bounds_operation(operation, "large.txt", &context),
+        )
+        .await
+        .expect("bounded refusal")
+        .expect_err("source cap");
+        let message = error.to_string();
+        assert!(
+            message.contains("16 MiB processing cap"),
+            "{operation}: {message}"
+        );
+        assert!(
+            !message.contains("offset=") && !message.contains("max_bytes"),
+            "{message}"
+        );
+        assert_eq!(
+            fs::metadata(&path).unwrap().len(),
+            CONTRACT_FILE_MAX_BYTES as u64 + 1
+        );
+        let mut prefix = [0; 4];
+        fs::File::open(&path)
+            .unwrap()
+            .read_exact(&mut prefix)
+            .unwrap();
+        assert_eq!(&prefix, b"seed");
+        assert!(context.require_fresh_file_read(&path, "large.txt").is_err());
+    }
+}
+
+#[test]
+fn contract_source_actual_reads_stop_at_cap_plus_one_and_poll_cancellation() {
+    use std::io::Read as _;
+    let mut exact = std::io::repeat(b'x').take(CONTRACT_FILE_MAX_BYTES as u64);
+    assert_eq!(
+        read_contract_source(&mut exact, None).unwrap().len(),
+        CONTRACT_FILE_MAX_BYTES
+    );
+
+    struct Reader {
+        consumed: usize,
+        cancel: Option<CancellationToken>,
+    }
+    impl std::io::Read for Reader {
+        fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+            bytes.fill(b'x');
+            self.consumed += bytes.len();
+            if let Some(cancel) = &self.cancel {
+                cancel.cancel();
+            }
+            Ok(bytes.len())
+        }
+    }
+    // No metadata shortcut: this represents a growing/virtual regular file.
+    let mut growing = Reader {
+        consumed: 0,
+        cancel: None,
+    };
+    assert!(read_contract_source(&mut growing, None).is_err());
+    assert_eq!(growing.consumed, CONTRACT_FILE_MAX_BYTES + 1);
+
+    let token = CancellationToken::new();
+    let mut interrupted = Reader {
+        consumed: 0,
+        cancel: Some(token.clone()),
+    };
+    assert!(matches!(
+        read_contract_source(&mut interrupted, Some(&token)),
+        Err(ToolError::Cancelled { .. })
+    ));
+    assert_eq!(interrupted.consumed, 64 * 1024);
+    interrupted.consumed = 0;
+    assert!(matches!(
+        read_contract_source(&mut interrupted, Some(&token)),
+        Err(ToolError::Cancelled { .. })
+    ));
+    assert_eq!(interrupted.consumed, 0);
+}
+
+#[tokio::test]
+async fn contract_source_directory_and_cancelled_calls_leave_targets_untouched() {
+    let temporary = tempfile::tempdir().unwrap();
+    fs::create_dir(temporary.path().join("directory")).unwrap();
+    let path = temporary.path().join("plain.txt");
+    fs::write(&path, b"seed").unwrap();
+    let context = ToolContext::new(temporary.path());
+    for operation in ["read", "write", "edit"] {
+        assert!(
+            run_contract_bounds_operation(operation, "directory", &context)
+                .await
+                .is_err()
+        );
+    }
+    let token = CancellationToken::new();
+    token.cancel();
+    let cancelled = context.with_cancel_token(token);
+    for operation in ["read", "write", "edit"] {
+        let error = run_contract_bounds_operation(operation, "plain.txt", &cancelled)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, ToolError::Cancelled { .. }),
+            "{operation}: {error}"
+        );
+        assert_eq!(fs::read(&path).unwrap(), b"seed");
+        assert!(
+            cancelled
+                .require_fresh_file_read(&path, "plain.txt")
+                .is_err()
+        );
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn contract_source_fifo_without_writer_and_hard_links_are_refused_promptly() {
+    use std::os::unix::ffi::OsStrExt as _;
+    let temporary = tempfile::tempdir().unwrap();
+    let fifo = temporary.path().join("pipe");
+    let cpath = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(cpath.as_ptr(), 0o600) }, 0);
+    let plain = temporary.path().join("plain.txt");
+    fs::write(&plain, b"seed").unwrap();
+    fs::hard_link(&plain, temporary.path().join("linked.txt")).unwrap();
+    let context = ToolContext::new(temporary.path());
+    for path in ["pipe", "linked.txt"] {
+        for operation in ["read", "write", "edit"] {
+            let error = tokio::time::timeout(
+                Duration::from_secs(2),
+                run_contract_bounds_operation(operation, path, &context),
+            )
+            .await
+            .expect("must not block opening a FIFO")
+            .expect_err("regular single-link target only");
+            assert!(
+                error.to_string().contains("regular"),
+                "{operation}: {error}"
+            );
+        }
+    }
+    assert_eq!(fs::read(&plain).unwrap(), b"seed");
+}
+
+#[tokio::test]
+async fn contract_read_newline_dense_ranges_preserve_trailing_and_empty_lines() {
+    let temporary = tempfile::tempdir().unwrap();
+    let text = "\n".repeat(2 * 1024 * 1024);
+    fs::write(temporary.path().join("dense.txt"), &text).unwrap();
+    let context = ToolContext::new(temporary.path());
+    let result = ReadFileTool::execute_contract_read(
+        json!({"path": "dense.txt", "offset": text.len(), "limit": 2}),
+        &context,
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.content, "\n");
+    let metadata = result.metadata.as_ref().unwrap();
+    assert_eq!(metadata["size"], text.len());
+    assert_eq!(metadata["line_count"], text.len() + 1);
+    assert_eq!(metadata["truncated"], false);
+    let empty = ReadFileTool::execute_contract_read(
+        json!({"path": "dense.txt", "offset": text.len() + 1, "limit": 0}),
+        &context,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        empty.content,
+        "\n\n[1 more lines in file (2.0MB total). Use offset=2097153 to continue.]"
+    );
+}
+
+#[tokio::test]
+async fn contract_write_and_edit_reject_payload_or_line_ending_growth_before_mutation() {
+    let temporary = tempfile::tempdir().unwrap();
+    let path = temporary.path().join("plain.txt");
+    let context = ToolContext::new(temporary.path());
+    fs::write(&path, b"seed\r\n").unwrap();
+    let error = WriteFileTool::execute_contract_write(
+        json!({"path": "plain.txt", "content": "x".repeat(CONTRACT_FILE_MAX_BYTES + 1)}),
+        &context,
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("16 MiB processing cap"));
+    for operation in ["write", "edit"] {
+        let newlines = "\n".repeat(CONTRACT_FILE_MAX_BYTES / 2 + 1);
+        let result = if operation == "write" {
+            WriteFileTool::execute_contract_write(
+                json!({"path": "plain.txt", "content": newlines}),
+                &context,
+            )
+            .await
+        } else {
+            EditFileTool::execute_contract_edits(
+                json!({"path": "plain.txt", "edits": [{"oldText": "seed", "newText": newlines}]}),
+                &context,
+            )
+            .await
+        };
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("16 MiB processing cap")
+        );
+        assert_eq!(fs::read(&path).unwrap(), b"seed\r\n");
+        assert!(context.require_fresh_file_read(&path, "plain.txt").is_err());
+    }
+}
+
+#[tokio::test]
+async fn contract_edit_rejects_oversized_intermediate_replacement_even_if_later_edit_shrinks() {
+    let temporary = tempfile::tempdir().unwrap();
+    let path = temporary.path().join("plain.txt");
+    fs::write(&path, b"ab").unwrap();
+    let context = ToolContext::new(temporary.path());
+    let error = EditFileTool::execute_contract_edits(
+        json!({"path": "plain.txt", "edits": [
+            {"oldText": "a", "newText": ""},
+            {"oldText": "b", "newText": "x".repeat(CONTRACT_FILE_MAX_BYTES)}
+        ]}),
+        &context,
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("16 MiB processing cap"));
+    assert_eq!(fs::read(&path).unwrap(), b"ab");
 }

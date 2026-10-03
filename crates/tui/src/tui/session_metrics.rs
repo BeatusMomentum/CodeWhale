@@ -440,15 +440,42 @@ impl RenderedStrip {
     }
 }
 
+pub use codewhale_command_contract::facets::DebugCacheRates as CacheRates;
+
+fn hit_percent(hit: u64, miss: u64, write: u64) -> Option<u8> {
+    let total = hit.saturating_add(miss).saturating_add(write);
+    (total > 0).then(|| u8::try_from((hit.saturating_mul(100) + total / 2) / total).unwrap_or(100))
+}
+
+#[must_use]
+pub fn cache_rates(app: &crate::tui::app::App) -> CacheRates {
+    let parent_hit = u64::from(app.session.displayed_total_cache_hit_tokens());
+    let parent_miss = u64::from(app.session.displayed_total_cache_miss_tokens());
+    let parent_write = u64::from(app.session.displayed_total_cache_write_tokens());
+    let agent_write = app.session.subagent_cache_write_tokens.unwrap_or(0);
+    let agents = app
+        .session
+        .subagent_cache_hit_tokens
+        .zip(app.session.subagent_cache_miss_tokens);
+    CacheRates {
+        parent: hit_percent(parent_hit, parent_miss, parent_write),
+        agents: agents.and_then(|(hit, miss)| hit_percent(hit, miss, agent_write)),
+        combined: agents.and_then(|(hit, miss)| {
+            hit_percent(
+                parent_hit.saturating_add(hit),
+                parent_miss.saturating_add(miss),
+                parent_write.saturating_add(agent_write),
+            )
+        }),
+    }
+}
+
 /// Snapshot the live app state into the strip's inputs.
 #[must_use]
 pub fn snapshot_from_app(app: &crate::tui::app::App) -> MetricsSnapshot {
-    let hit = u64::from(app.session.displayed_total_cache_hit_tokens());
-    let miss = u64::from(app.session.displayed_total_cache_miss_tokens());
-    let cache_hit_percent = (hit + miss > 0).then(|| {
-        // Widen before adding so saturated counters never exceed 100%.
-        u8::try_from((hit * 100 + (hit + miss) / 2) / (hit + miss)).unwrap_or(100)
-    });
+    // The footer rate is this conversation's own requests; sub-agent cache
+    // is shown beside it, labelled, in PRICE and `/cache` (#6565).
+    let cache_hit_percent = cache_rates(app).parent;
     MetricsSnapshot {
         turns: app.turn_counter,
         steps: app.session_metrics.steps(),
@@ -673,5 +700,97 @@ mod tests {
         metrics.clear_in_flight();
         metrics.record_tool_completed_at("b", t0 + Duration::from_secs(5));
         assert_eq!(metrics.tool_time, Duration::from_millis(1_500));
+    }
+
+    #[test]
+    fn cache_rates_count_writes_in_agent_and_combined_input() {
+        let mut app = crate::tui::app::App::new(
+            crate::test_support::test_tui_options(std::path::PathBuf::from(".")),
+            &crate::config::Config::default(),
+        );
+        assert_eq!(cache_rates(&app), CacheRates::default());
+        app.session.total_cache_hit_tokens = 800;
+        app.session.total_cache_miss_tokens = 200;
+        app.session.subagent_cache_hit_tokens = Some(600);
+        app.session.subagent_cache_miss_tokens = Some(0);
+        app.session.subagent_cache_write_tokens = Some(400);
+        assert_eq!(
+            cache_rates(&app),
+            CacheRates {
+                parent: Some(80),
+                agents: Some(60),
+                combined: Some(70),
+            }
+        );
+        // Writes are input in both scopes, including an in-flight parent call.
+        app.session.total_cache_write_tokens = 200;
+        app.session.pending_turn_cache_write_tokens = 400;
+        assert_eq!(
+            cache_rates(&app),
+            CacheRates {
+                parent: Some(50),
+                agents: Some(60),
+                combined: Some(54),
+            }
+        );
+        app.session.reset_token_breakdown();
+        app.session.subagent_cache_hit_tokens = Some(0);
+        app.session.subagent_cache_miss_tokens = Some(0);
+        app.session.subagent_cache_write_tokens = Some(400);
+        assert_eq!(
+            cache_rates(&app),
+            CacheRates {
+                parent: None,
+                agents: Some(0),
+                combined: Some(0),
+            }
+        );
+    }
+
+    #[test]
+    fn sub_agent_cache_is_shown_beside_the_parent_rate_never_folded_into_it() {
+        // #6565: the footer rate keeps meaning this conversation's requests;
+        // agents and the token-weighted combination are labelled beside it.
+        let mut app = crate::tui::app::App::new(
+            crate::test_support::test_tui_options(std::path::PathBuf::from(".")),
+            &crate::config::Config::default(),
+        );
+        assert_eq!(cache_rates(&app), CacheRates::default());
+        assert_eq!(
+            cache_rates(&app).labelled("parent", "agents", "combined"),
+            None
+        );
+
+        app.session.total_cache_hit_tokens = 800;
+        app.session.total_cache_miss_tokens = 200;
+        assert_eq!(snapshot_from_app(&app).cache_hit_percent, Some(80));
+        assert_eq!(
+            cache_rates(&app)
+                .labelled("parent", "agents", "combined")
+                .as_deref(),
+            Some("80%")
+        );
+
+        app.session.subagent_cache_hit_tokens = Some(200);
+        app.session.subagent_cache_miss_tokens = Some(800);
+        let rates = cache_rates(&app);
+        assert_eq!(
+            rates,
+            CacheRates {
+                parent: Some(80),
+                agents: Some(20),
+                combined: Some(50),
+            }
+        );
+        assert_eq!(
+            rates.labelled("parent", "agents", "combined").as_deref(),
+            Some("parent 80% · agents 20% · combined 50%")
+        );
+        // The footer figure did not move.
+        assert_eq!(snapshot_from_app(&app).cache_hit_percent, Some(80));
+
+        // A loaded session starts the scope over, like the parent totals.
+        app.session.reset_token_breakdown();
+        assert_eq!(app.session.subagent_cache_hit_tokens, None);
     }
 }

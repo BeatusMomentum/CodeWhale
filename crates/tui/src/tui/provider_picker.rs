@@ -228,6 +228,10 @@ pub struct ProviderPickerView {
     custom_provider_base_url: String,
     custom_provider_model: String,
     custom_provider_api_key_env: String,
+    /// Bundled descriptor the custom form was prefilled from, so the form can
+    /// show that host's credential console, docs and guidance (#6616). `None`
+    /// for a hand-entered host and the other prefilled local routes.
+    custom_provider_descriptor: Option<&'static ProviderDescriptor>,
     /// Pointer geometry for the two-pane picker (Slice D): provider-strip
     /// rows on the left, model rows on the right/under, recorded during
     /// render like the consent hitboxes below.
@@ -1799,6 +1803,7 @@ impl ProviderPickerView {
             custom_provider_base_url: String::new(),
             custom_provider_model: String::new(),
             custom_provider_api_key_env: String::new(),
+            custom_provider_descriptor: None,
             list_row_hitboxes: RefCell::new(Vec::new()),
             model_row_hitboxes: RefCell::new(Vec::new()),
             consent_row_hitboxes: RefCell::new(Vec::new()),
@@ -2449,6 +2454,7 @@ impl ProviderPickerView {
         self.custom_provider_base_url = base_url.to_string();
         self.custom_provider_model = model.to_string();
         self.custom_provider_api_key_env = api_key_env.to_string();
+        self.custom_provider_descriptor = None;
     }
 
     fn enter_custom_form(&mut self) {
@@ -2460,7 +2466,7 @@ impl ProviderPickerView {
     /// credential env var, so the only field left is which env var holds the
     /// key. Submitting writes `[providers.<id>]` through the same path a
     /// hand-entered custom provider uses.
-    fn enter_descriptor_form(&mut self, descriptor: &ProviderDescriptor) {
+    fn enter_descriptor_form(&mut self, descriptor: &'static ProviderDescriptor) {
         self.prefill_custom_form(
             &descriptor.id,
             &descriptor.base_url,
@@ -2468,6 +2474,7 @@ impl ProviderPickerView {
             &descriptor.api_key_env,
             CustomProviderField::ApiKeyEnv,
         );
+        self.custom_provider_descriptor = Some(descriptor);
     }
 
     fn enter_ds4_form(&mut self) {
@@ -4071,6 +4078,11 @@ impl ProviderPickerView {
             "API key env",
             "optional",
         );
+        if let Some(descriptor) = self.custom_provider_descriptor {
+            Paragraph::new(descriptor_help_lines(descriptor))
+                .wrap(Wrap { trim: true })
+                .render(layout[5], buf);
+        }
     }
 
     fn render_custom_form_field(
@@ -4982,6 +4994,9 @@ impl ModalView for ProviderPickerView {
             Stage::PlanTier => 10,
             Stage::StepfunBillingRoute => 11,
             Stage::Confirm => 10,
+            // A bundled descriptor adds its credential console, docs and
+            // guidance under the fields; the guidance sentence wraps.
+            Stage::CustomForm if self.custom_provider_descriptor.is_some() => 17,
             Stage::CustomForm => 12,
         };
         let popup_area = centered_modal_area(area, 120, preferred_height, 64, 8);
@@ -5067,6 +5082,37 @@ fn descriptor_dashboard_rows(
         .filter(|descriptor| !configured.iter().any(|id| descriptor.matches(id)))
         .map(|descriptor| descriptor_dashboard_row(descriptor, active, config, runtime_status))
         .collect()
+}
+
+/// Credential console, docs and guidance a bundled descriptor carries, in the
+/// same `Credentials:` / `Docs:` shape the built-in key-entry stage uses. A
+/// descriptor without a console falls back to its guidance on the
+/// `Credentials:` line, exactly as a built-in provider without one does.
+fn descriptor_help_lines(descriptor: &ProviderDescriptor) -> Vec<Line<'static>> {
+    let muted = Style::default().fg(palette::TEXT_MUTED);
+    let mut lines = vec![Line::from("")];
+    match (&descriptor.credential_url, &descriptor.guidance) {
+        (Some(url), _) => lines.push(Line::from(Span::styled(
+            format!("Credentials: {url}"),
+            muted,
+        ))),
+        (None, Some(guidance)) => {
+            lines.push(Line::from(Span::styled(
+                format!("Credentials: {guidance}"),
+                muted,
+            )));
+        }
+        (None, None) => {}
+    }
+    if let Some(url) = &descriptor.docs_url {
+        lines.push(Line::from(Span::styled(format!("Docs: {url}"), muted)));
+    }
+    if descriptor.credential_url.is_some()
+        && let Some(guidance) = &descriptor.guidance
+    {
+        lines.push(Line::from(Span::styled(guidance.clone(), muted)));
+    }
+    lines
 }
 
 fn descriptor_dashboard_row(
@@ -5496,6 +5542,43 @@ mod tests {
         assert_eq!(rows.len(), 1, "the configured row wins");
         assert!(rows[0].is_configured);
         assert_eq!(rows[0].display_name, "groq (custom)");
+    }
+
+    /// #6616: a bundled descriptor's credential console, docs link and
+    /// guidance reach the user on the form that sets it up, in the same
+    /// `Credentials:` / `Docs:` shape the built-in key-entry stage uses.
+    /// A hand-entered custom host carries none of them.
+    #[test]
+    fn descriptor_form_shows_the_hosts_credential_docs_and_guidance() {
+        let _env = crate::test_support::lock_test_env();
+        let descriptor = provider_descriptor("aicraft").expect("aicraft descriptor");
+        let _key = crate::test_support::EnvVarGuard::remove(&descriptor.api_key_env);
+        let config = Config::default();
+        let mut picker = ProviderPickerView::new(ApiProvider::Deepseek, &config);
+        picker.view = ProviderListView::Catalog;
+        picker.selected_idx = picker
+            .rows
+            .iter()
+            .position(|row| row.provider_id == descriptor.id)
+            .expect("an AICraft row");
+        picker.handle_key(key(KeyCode::Enter));
+        assert_eq!(picker.stage, Stage::CustomForm);
+
+        let rendered = render_text(&picker, 120, 24);
+        assert!(
+            rendered.contains("Credentials: https://aicraftapi.com/dashboard.html"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("Docs: https://aicraftapi.com/docs.html#codewhale"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("Store AICRAFT_API_KEY"), "{rendered}");
+
+        picker.enter_custom_form();
+        let rendered = render_text(&picker, 120, 24);
+        assert!(!rendered.contains("Credentials:"), "{rendered}");
+        assert!(!rendered.contains("aicraftapi.com"), "{rendered}");
     }
 
     /// Setting a descriptor row up goes through the named-custom-provider
@@ -6243,9 +6326,9 @@ mod tests {
     #[test]
     fn provider_health_requires_observed_success_and_keeps_failure_reason() {
         let config = Config {
-            api_key: Some("saved-key".to_string()),
             ..Config::default()
-        };
+        }
+        .with_legacy_root(Some("saved-key".to_string()), None);
         let unchecked = ProviderPickerView::new(ApiProvider::Deepseek, &config);
         let row = unchecked
             .rows
@@ -7454,7 +7537,6 @@ mod tests {
     #[test]
     fn provider_dashboard_row_marks_route_resolver_errors_as_invalid() {
         let config = Config {
-            api_key: Some("deepseek-key".to_string()),
             providers: Some(crate::config::ProvidersConfig {
                 deepseek: crate::config::ProviderConfig {
                     model: Some("anthropic/claude-foreign".to_string()),
@@ -7463,7 +7545,8 @@ mod tests {
                 ..Default::default()
             }),
             ..Config::default()
-        };
+        }
+        .with_legacy_root(Some("deepseek-key".to_string()), None);
         let row = ProviderDashboardRow::from_config(
             ApiProvider::Deepseek,
             ApiProvider::Deepseek,
@@ -7665,9 +7748,9 @@ mod tests {
     #[test]
     fn enter_with_existing_key_emits_apply_and_closes() {
         let config = Config {
-            api_key: Some("existing-deepseek-key".to_string()),
             ..Config::default()
-        };
+        }
+        .with_legacy_root(Some("existing-deepseek-key".to_string()), None);
         let mut picker = ProviderPickerView::new(ApiProvider::NvidiaNim, &config);
         // Navigate to DeepSeek, which has a key from the top-level config.
         move_to_provider(&mut picker, ApiProvider::Deepseek);
@@ -7775,6 +7858,150 @@ mod tests {
             picker.visible_row_count(),
             picker.rows.len(),
             "onboarding must show the whole provider catalog"
+        );
+    }
+
+    fn with_first_run_config(document: &str, check: impl FnOnce(crate::tui::app::App, Config)) {
+        let _lock = crate::test_support::lock_test_env();
+        let home = tempfile::tempdir().expect("fresh home");
+        let _home = EnvVarGuard::set("CODEWHALE_HOME", home.path());
+        let config_path = home.path().join("config.toml");
+        let _config_path = EnvVarGuard::set("CODEWHALE_CONFIG_PATH", &config_path);
+        let _env: Vec<_> = [
+            "CODEWHALE_PROVIDER",
+            "DEEPSEEK_PROVIDER",
+            "CODEWHALE_MODEL",
+            "DEEPSEEK_MODEL",
+            "DEEPSEEK_API_KEY",
+            "OPENAI_API_KEY",
+            "OPENAI_BASE_URL",
+            "DEEPSEEK_BASE_URL",
+        ]
+        .into_iter()
+        .map(EnvVarGuard::remove)
+        .collect();
+        std::fs::write(&config_path, document).expect("config only");
+        let config = Config::load(Some(config_path.clone()), None).expect("load route");
+        let mut options = crate::test_support::test_tui_options(home.path());
+        options.config_path = Some(config_path);
+        options.skip_onboarding = false;
+        check(crate::tui::app::App::new(options, &config), config);
+    }
+
+    #[test]
+    fn first_run_configured_route_skips_picker_and_records_configuration() {
+        for key in ["api_key = \"fixture-not-a-key\"", ""] {
+            let document = format!(
+                "provider = \"openai\"\ndefault_text_model = \"gpui-fixture\"\n\
+                 [providers.openai]\n{key}\nbase_url = \"http://127.0.0.1:4880/v1\"\n"
+            );
+            with_first_run_config(&document, |mut app, _config| {
+                assert_eq!(app.api_provider, ApiProvider::Openai);
+                assert_eq!(app.model, "gpui-fixture");
+                assert_eq!(app.active_route_base_url, "http://127.0.0.1:4880/v1");
+                assert_eq!(app.onboarding, crate::tui::app::OnboardingState::None);
+                assert!(!crate::local_ollama::should_adopt_live_local_ollama(
+                    &mut app
+                ));
+
+                let runtime = tokio::runtime::Runtime::new().unwrap();
+                runtime
+                    .block_on(crate::tui::setup::record_configured_route(&app))
+                    .unwrap();
+                let state = codewhale_config::SetupState::load().unwrap().unwrap();
+                let entry = &state.steps[&codewhale_config::SetupStep::ProviderModel];
+                assert_eq!(entry.status, codewhale_config::StepStatus::Configured);
+                assert!(entry.status.is_settled());
+                let result = entry.result.as_deref().unwrap();
+                assert!(result.contains("provider=openai, model=gpui-fixture"));
+                assert!(result.contains("not checked"));
+                assert!(!result.contains("fixture-not-a-key"));
+            });
+        }
+    }
+
+    #[test]
+    fn first_run_configured_provider_is_preselected_when_picker_is_needed() {
+        with_first_run_config(
+            "provider = \"openai\"\ndefault_text_model = \"gpui-fixture\"\n\
+             [providers.openai]\nbase_url = \"https://fixture.invalid/v1\"\nauth_mode = \"api_key\"\n",
+            |app, config| {
+                assert_eq!(app.onboarding, crate::tui::app::OnboardingState::Provider);
+                assert!(app.onboarding_recovers_configured_route());
+                let picker = ProviderPickerView::new_for_onboarding(
+                    app.api_provider,
+                    app.onboarding_recovers_configured_route()
+                        .then_some(app.onboarding_provider),
+                    &config,
+                    None,
+                );
+                assert_eq!(picker.stage, Stage::List);
+                assert_eq!(picker.selected_provider(), ApiProvider::Openai);
+            },
+        );
+    }
+
+    #[test]
+    fn first_run_unconfigured_route_keeps_picker_and_local_discovery() {
+        with_first_run_config("", |mut app, config| {
+            assert_eq!(app.onboarding, crate::tui::app::OnboardingState::Provider);
+            assert!(!app.onboarding_recovers_configured_route());
+            assert!(crate::local_ollama::should_adopt_live_local_ollama(
+                &mut app
+            ));
+            let picker =
+                ProviderPickerView::new_for_onboarding(app.api_provider, None, &config, None);
+            assert_eq!(picker.stage, Stage::List);
+            assert_eq!(picker.selected_provider(), ApiProvider::Deepseek);
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            runtime
+                .block_on(crate::tui::setup::record_configured_route(&app))
+                .unwrap();
+            assert!(codewhale_config::SetupState::load().unwrap().is_none());
+        });
+    }
+
+    #[test]
+    fn first_run_configured_receipt_preserves_decisions_and_rejects_corrupt_state() {
+        use codewhale_config::{SetupState, SetupStep, StepEntry, StepStatus};
+        with_first_run_config(
+            "provider = \"openai\"\ndefault_text_model = \"gpui-fixture\"\n\
+             [providers.openai]\nbase_url = \"http://127.0.0.1:4880/v1\"\n",
+            |app, _config| {
+                let runtime = tokio::runtime::Runtime::new().unwrap();
+                let mut state = SetupState::default();
+                state.record_telemetry_notice("4", false);
+                state.save().unwrap();
+                runtime
+                    .block_on(crate::tui::setup::record_configured_route(&app))
+                    .unwrap();
+                let saved = SetupState::load().unwrap().unwrap();
+                assert!(saved.telemetry_opted_out());
+                assert_eq!(
+                    saved.status(SetupStep::ProviderModel),
+                    StepStatus::Configured
+                );
+
+                for status in [StepStatus::Verified, StepStatus::NeedsAction] {
+                    state.set_step(
+                        SetupStep::ProviderModel,
+                        StepEntry::new(status, true, "test"),
+                    );
+                    state.save().unwrap();
+                    runtime
+                        .block_on(crate::tui::setup::record_configured_route(&app))
+                        .unwrap();
+                    assert_eq!(SetupState::load().unwrap().unwrap(), state);
+                }
+                let path = SetupState::path().unwrap();
+                std::fs::write(&path, "not-json").unwrap();
+                assert!(
+                    runtime
+                        .block_on(crate::tui::setup::record_configured_route(&app))
+                        .is_err()
+                );
+                assert_eq!(std::fs::read_to_string(path).unwrap(), "not-json");
+            },
         );
     }
 
@@ -8894,9 +9121,9 @@ mod tests {
     #[test]
     fn configured_provider_footer_mentions_edit_key() {
         let config = Config {
-            api_key: Some("existing-deepseek-key".to_string()),
             ..Config::default()
-        };
+        }
+        .with_legacy_root(Some("existing-deepseek-key".to_string()), None);
         let picker = ProviderPickerView::new(ApiProvider::Deepseek, &config);
 
         let rendered = render_text(&picker, 80, 14);

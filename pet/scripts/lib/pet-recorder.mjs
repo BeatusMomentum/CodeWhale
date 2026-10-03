@@ -95,6 +95,12 @@ export async function createPetRecorder(path, { maxBuckets = 216_000, maxBytes =
     expectedMtime ??= (await output.stat({ bigint: true })).mtimeNs;
   } catch (error) { try { await output?.close(); } finally { lock.close(); } throw error; }
   return {
+    /** The next append archives the current segment and starts a new one at
+     * sequence zero, exactly as --resume does after an outage. */
+    restart() {
+      if (!output || busy) throw new Error('Pet recorder is closed or already writing.');
+      restart = true;
+    },
     async append(bucket) {
       if (!output || busy) throw new Error('Pet recorder is closed or already writing.');
       validatePetBucket(bucket);

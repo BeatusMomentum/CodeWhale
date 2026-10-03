@@ -161,6 +161,11 @@ export class CodeWhaleRuntimeClient {
 
   async #rawRequest(path, options = {}) {
     const method = options.method ?? "GET";
+    const base = new URL(this.baseUrl);
+    const url = new URL(path, base);
+    if (!["http:", "https:"].includes(url.protocol) || url.origin !== base.origin || url.username || url.password) {
+      throw new TypeError("Runtime API requests must stay on the configured HTTP(S) origin without URL credentials");
+    }
     const headers = new Headers(options.headers);
     headers.set("accept", options.accept ?? "application/json");
     if (this.token) {
@@ -168,13 +173,16 @@ export class CodeWhaleRuntimeClient {
     }
     const init = { method, headers };
     if (options.signal) init.signal = options.signal;
-    if (options.redirect) init.redirect = options.redirect;
+    // A redirect can change the request's destination or repeat a mutation.
+    // Authenticated requests must not leave the origin checked above.
+    if (headers.has("authorization")) init.redirect = "error";
+    else if (options.redirect) init.redirect = options.redirect;
     if (options.body !== undefined) {
       headers.set("content-type", "application/json");
       init.body = JSON.stringify(options.body);
     }
 
-    const response = await this.fetchImpl(new URL(path, this.baseUrl), init);
+    const response = await this.fetchImpl(url, init);
     if (response.ok) {
       return response;
     }
@@ -197,6 +205,11 @@ export class CodeWhaleRuntimeClient {
 
 export function createRuntimeClient(options = {}) {
   return new CodeWhaleRuntimeClient(options);
+}
+
+/** Distinguish a stream-end transport frame from thread journal/progress events. */
+export function isThreadStreamEnd(event) {
+  return event.event === "stream.end";
 }
 
 function normalizeBaseUrl(value) {

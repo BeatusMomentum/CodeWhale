@@ -88,18 +88,139 @@ pub fn approval_summary_in(
             None => with(MessageId::ApprovalSummaryUseTool, "name", name),
         },
         name if name.starts_with("mcp_") => mcp_summary(locale, name, input, workspace),
-        name => match (locale, argument_hint(input, workspace)) {
-            (Locale::En, Some(hint)) => format!("{}: {hint}", humanize(name)),
-            (Locale::En, None) => format!("Use the {name} tool"),
-            (_, Some(hint)) => {
-                format!(
-                    "{}: {hint}",
-                    with(MessageId::ApprovalSummaryUseName, "name", name)
-                )
+        // Delegated work runs later without the person watching, so every
+        // client's summary names the authority it asks for, not only the TUI
+        // card.
+        name if is_delegated_work_tool(name) => {
+            let base = generic_summary(locale, name, input, workspace);
+            let zh = locale == Locale::ZhHans;
+            let separator = if zh { "：" } else { ": " };
+            let fields = delegated_authority_fields(name, input, zh)
+                .into_iter()
+                .map(|(label, value)| format!("{label}{separator}{value}"))
+                .collect::<Vec<_>>();
+            if fields.is_empty() {
+                base
+            } else {
+                format!("{base} ({})", fields.join("; "))
             }
-            (_, None) => with(MessageId::ApprovalSummaryUseTool, "name", name),
-        },
+        }
+        name => generic_summary(locale, name, input, workspace),
     }
+}
+
+/// The summary for a tool with no dedicated sentence: its name and the most
+/// telling argument.
+fn generic_summary(locale: Locale, name: &str, input: &Value, workspace: Option<&Path>) -> String {
+    let with = |id: MessageId, slot: &str, value: &str| {
+        tr(locale, id).replace(&format!("{{{slot}}}"), value)
+    };
+    match (locale, argument_hint(input, workspace)) {
+        (Locale::En, Some(hint)) => format!("{}: {hint}", humanize(name)),
+        (Locale::En, None) => format!("Use the {name} tool"),
+        (_, Some(hint)) => {
+            format!(
+                "{}: {hint}",
+                with(MessageId::ApprovalSummaryUseName, "name", name)
+            )
+        }
+        (_, None) => with(MessageId::ApprovalSummaryUseTool, "name", name),
+    }
+}
+
+fn is_delegated_work_tool(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "task_create" | "automation_create" | "automation_update"
+    )
+}
+
+fn flag_word(value: bool, zh: bool) -> &'static str {
+    match (value, zh) {
+        (true, false) => "on",
+        (false, false) => "off",
+        (true, true) => "开启",
+        (false, true) => "关闭",
+    }
+}
+
+/// Labeled authority fields a delegated-work call asks for: shell access,
+/// trust mode, auto-approval, mode and the directories it would run in.
+/// Shown for every such call, whatever its stakes or key order, so the card
+/// never hides what the later run is allowed to do.
+pub(crate) fn delegated_authority_fields(
+    tool_name: &str,
+    params: &Value,
+    zh: bool,
+) -> Vec<(String, String)> {
+    if !is_delegated_work_tool(tool_name) {
+        return Vec::new();
+    }
+    let mut fields = Vec::new();
+    let flags: [(&str, &str, &str); 3] = [
+        ("trust_mode", "Trust mode", "信任模式"),
+        ("allow_shell", "Shell", "Shell"),
+        ("auto_approve", "Auto-approve", "自动批准"),
+    ];
+    for (key, en, zh_label) in flags {
+        let Some(value) = params.get(key) else {
+            continue;
+        };
+        let rendered = match value.as_bool() {
+            Some(flag) => flag_word(flag, zh).to_string(),
+            None => truncate_string_value(&value.to_string(), 40),
+        };
+        fields.push((if zh { zh_label } else { en }.to_string(), rendered));
+    }
+    for (keys, en, zh_label) in [
+        (&["mode"][..], "Mode", "模式"),
+        (&["workspace", "cwds"][..], "Workspace", "工作区"),
+    ] {
+        if let Some(value) = param_preview(params, keys, 120) {
+            fields.push((if zh { zh_label } else { en }.to_string(), value));
+        }
+    }
+    fields
+}
+
+pub(crate) fn param_preview(params: &Value, keys: &[&str], max_len: usize) -> Option<String> {
+    let Value::Object(map) = params else {
+        return None;
+    };
+
+    for key in keys {
+        let Some(value) = map.get(*key) else {
+            continue;
+        };
+        match value {
+            Value::String(text) => return Some(truncate_string_value(text, max_len)),
+            Value::Number(number) => return Some(number.to_string()),
+            Value::Bool(flag) => return Some(flag.to_string()),
+            Value::Array(items) if !items.is_empty() => {
+                let preview = items
+                    .iter()
+                    .take(3)
+                    .map(|item| match item {
+                        Value::String(text) => truncate_string_value(text, max_len / 2),
+                        other => truncate_string_value(&other.to_string(), max_len / 2),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Some(truncate_string_value(&preview, max_len));
+            }
+            other => return Some(truncate_string_value(&other.to_string(), max_len)),
+        }
+    }
+
+    None
+}
+
+pub(crate) fn truncate_string_value(value: &str, max_len: usize) -> String {
+    if value.chars().count() <= max_len {
+        return value.to_string();
+    }
+    let truncated: String = value.chars().take(max_len).collect();
+    format!("{truncated}...")
 }
 
 fn run_command_summary(locale: Locale, command: &str) -> String {
@@ -529,6 +650,40 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn delegated_work_summary_names_the_authority_it_asks_for() {
+        let summary = approval_summary(
+            "tasks",
+            &json!({
+                "action": "create",
+                "prompt": "tidy up",
+                "trust_mode": true,
+                "allow_shell": false,
+                "workspace": "sub/dir"
+            }),
+            None,
+        );
+        assert!(summary.contains("Trust mode: on"), "{summary}");
+        assert!(summary.contains("Shell: off"), "{summary}");
+        assert!(summary.contains("Workspace: sub/dir"), "{summary}");
+
+        let summary = approval_summary(
+            "automation",
+            &json!({"action": "update", "automation_id": "a1", "auto_approve": true, "cwds": ["/x"]}),
+            None,
+        );
+        assert!(summary.contains("Auto-approve: on"), "{summary}");
+        assert!(summary.contains("Workspace: /x"), "{summary}");
+
+        let zh = approval_summary_in(
+            Locale::ZhHans,
+            "automation",
+            &json!({"action": "create", "name": "n", "trust_mode": true}),
+            None,
+        );
+        assert!(zh.contains("信任模式：开启"), "{zh}");
+    }
+
+    #[test]
     fn web_run_search_names_the_query() {
         let summary = approval_summary(
             "web.run",
@@ -800,7 +955,7 @@ mod tests {
                 &json!({"search_query": [{"q": "espresso"}, {"q": "grinder"}]}),
                 None,
             ),
-            "在网上搜索“espresso”（另 1 项）"
+            "在网上搜索“espresso” （另 1 项）"
         );
         assert_eq!(
             approval_summary_in(Locale::Fr, "mcp_github_create_issue", &json!({}), None),

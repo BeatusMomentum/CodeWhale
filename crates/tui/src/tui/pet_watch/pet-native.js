@@ -90,7 +90,12 @@ class PetNative {
         this.world.voices = [];
         return this.world.frame.timeMs;
     }
-    observeEngine(metadataJSON, timeMs) { this.engine.observe(JSON.parse(metadataJSON), timeMs); }
+    /** A rejected observation leaves the reducer exactly as it was, like a batch. */
+    observeEngine(metadataJSON, timeMs) {
+        const next = this.engine.clone();
+        next.observe(JSON.parse(metadataJSON), timeMs);
+        this.engine = next;
+    }
     observeEngineBatch(metadataJSON, timeMs) {
         const events = JSON.parse(metadataJSON);
         if (!Array.isArray(events) || events.length > 64)
@@ -1846,6 +1851,9 @@ class PetEngineTelemetry {
         next.completedTurns = new Set(this.completedTurns);
         return next;
     }
+    /** Mutates in place: clock, freshness and the event window change before
+     * type-specific fields are checked. Callers that continue after a throw must
+     * observe on a clone() and swap it in on success, as PetNative does. */
     observe(value, at) {
         if (!Number.isFinite(at) || at < this.lastTime || at > pet_sim_js_1.PET_MAX_SECONDS * 1000)
             throw new Error('Invalid Engine pet clock.');

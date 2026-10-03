@@ -369,6 +369,7 @@ pub fn notify_done(
     threshold: Duration,
     elapsed: Duration,
 ) -> DeliveryOutcome {
+    let reserved = std::cell::Cell::new(None);
     notify_with_sinks(
         method,
         in_tmux,
@@ -379,13 +380,31 @@ pub fn notify_done(
         attention_delivery_allowed(),
         &mut io::stdout(),
         &mut |kind, bell| {
-            crate::notify::sound_policy::decide(
-                kind,
-                crate::notify::sound_policy::epoch_millis_now(),
-                bell,
-            )
+            let now_ms = crate::notify::sound_policy::epoch_millis_now();
+            let decision = crate::notify::sound_policy::decide(kind, now_ms, bell);
+            if matches!(
+                decision,
+                crate::notify::sound_policy::SoundDecision::Play(_)
+            ) {
+                reserved.set(Some((kind, now_ms)));
+            }
+            decision
         },
-        &mut crate::notify::audio::dispatch,
+        &mut |cue, sink| {
+            let outcome = crate::notify::audio::dispatch(cue, sink);
+            // A cue that never played must not spend the category's repeat
+            // window: the next notification may try again (U06-m3).
+            if matches!(
+                outcome,
+                crate::notify::audio::AudioOutcome::Busy
+                    | crate::notify::audio::AudioOutcome::Unsupported
+                    | crate::notify::audio::AudioOutcome::Failed
+            ) && let Some((kind, reserved_ms)) = reserved.take()
+            {
+                crate::notify::sound_policy::release(kind, reserved_ms);
+            }
+            outcome
+        },
         &mut dispatch_native,
     )
 }
@@ -973,33 +992,6 @@ pub fn completed_turn_payload(
     NotificationPayload::turn_complete(&headline).with_preview(preview.as_deref())
 }
 
-/// Compose a notification payload for a terminal sub-agent outcome. The
-/// agent's name (the same label every other surface shows, never its raw id)
-/// is the detail line, and the headline of its result is the (redacted,
-/// bounded) preview: the first sentence of prose, not a `## Summary` heading
-/// (#6565). The headline reflects the actual status so a Stop/failed worker is
-/// never announced as successfully complete (#4408).
-pub fn subagent_terminal_payload(
-    locale: Locale,
-    label: &str,
-    result: &str,
-    status: &SubAgentStatus,
-    include_summary: bool,
-    elapsed: Duration,
-) -> NotificationPayload {
-    let headline = completion_status(
-        &tr(locale, subagent_terminal_label(status)),
-        include_summary,
-        elapsed,
-        None,
-    );
-    let preview = crate::agent_roster::result_headline(result)
-        .as_deref()
-        .and_then(text_summary);
-
-    NotificationPayload::subagent_terminal(&headline, label).with_preview(preview.as_deref())
-}
-
 pub(crate) fn subagent_terminal_label(status: &SubAgentStatus) -> MessageId {
     match status {
         SubAgentStatus::Completed => MessageId::NotificationSubagentComplete,
@@ -1044,7 +1036,7 @@ pub fn elevation_needed_payload(
     )
 }
 
-fn completion_status(
+pub(crate) fn completion_status(
     label: &str,
     include_summary: bool,
     elapsed: Duration,
@@ -1354,6 +1346,7 @@ mod tests {
         for kind in [
             NotificationKind::TurnComplete,
             NotificationKind::SubagentTerminal,
+            NotificationKind::BackgroundTerminal,
             NotificationKind::ApprovalNeeded,
             NotificationKind::InputNeeded,
             NotificationKind::ElevationNeeded,
@@ -1372,6 +1365,7 @@ mod tests {
         for kind in [
             NotificationKind::TurnComplete,
             NotificationKind::SubagentTerminal,
+            NotificationKind::BackgroundTerminal,
             NotificationKind::ApprovalNeeded,
             NotificationKind::InputNeeded,
             NotificationKind::ElevationNeeded,
@@ -2247,6 +2241,7 @@ impl TidelineInboxRecord {
         match self.kind {
             NotificationKind::TurnComplete => "turn done",
             NotificationKind::SubagentTerminal => "whale done",
+            NotificationKind::BackgroundTerminal => "work done",
             NotificationKind::ApprovalNeeded => "approval",
             NotificationKind::InputNeeded => "question",
             NotificationKind::ElevationNeeded => "sandbox",
@@ -2260,7 +2255,9 @@ impl TidelineInboxRecord {
     pub fn kind_ink(&self) -> ChromeInk {
         match self.kind {
             NotificationKind::TurnComplete => ChromeInk::Outcome,
-            NotificationKind::SubagentTerminal => ChromeInk::Info,
+            NotificationKind::SubagentTerminal | NotificationKind::BackgroundTerminal => {
+                ChromeInk::Info
+            }
             NotificationKind::ApprovalNeeded | NotificationKind::InputNeeded => {
                 ChromeInk::PermissionAsk
             }

@@ -71,10 +71,10 @@ const DEEPSEEK_PICKER_EFFORTS: &[ReasoningEffort] = &[
 /// Kimi Code K3 accepts route-specific low and medium controls at the
 /// official membership endpoint. Medium becomes K3's nested high wire effort,
 /// but keeping the selected intent visible is important for recovery and
-/// route receipts.
+/// route receipts. K3 is always-thinking, so `off` would only land on `low`
+/// and is not offered.
 const KIMI_CODE_K3_PICKER_EFFORTS: &[ReasoningEffort] = &[
     ReasoningEffort::Auto,
-    ReasoningEffort::Off,
     ReasoningEffort::Low,
     ReasoningEffort::Medium,
     ReasoningEffort::High,
@@ -2372,14 +2372,6 @@ fn inactive_custom_route_identities(app: &App, config: &Config) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default();
-    // The legacy root-field `provider = "custom"` shape owns no
-    // `[providers.<name>]` table but is still a real route.
-    if config.uses_legacy_literal_custom_route() {
-        let literal = ApiProvider::Custom.as_str().to_string();
-        if !identities.contains(&literal) {
-            identities.push(literal);
-        }
-    }
     identities.sort();
     identities.retain(|identity| active != Some(identity.as_str()));
     identities
@@ -4007,8 +3999,10 @@ impl ModalView for ModelPickerView {
             // Shift+D makes the visible provider/model pair the startup
             // default. Plain Enter deliberately stays session-local, so a
             // one-off route comparison cannot silently change the next launch.
+            // Exactly Shift: this chord persists the next launch's route, so
+            // Ctrl/Alt/Super+Shift+D must not save it by accident (U07-12).
             KeyCode::Char(ch)
-                if key.modifiers.contains(KeyModifiers::SHIFT)
+                if key.modifiers == KeyModifiers::SHIFT
                     && self.query.is_empty()
                     && ch.eq_ignore_ascii_case(&'d')
                     && self.selected_model_is_selectable() =>
@@ -4019,7 +4013,7 @@ impl ModalView for ModelPickerView {
             // ⇧D is query text: it used to open provider auth for a row that
             // was not locked at all (#6500).
             KeyCode::Char(ch)
-                if key.modifiers.contains(KeyModifiers::SHIFT)
+                if key.modifiers == KeyModifiers::SHIFT
                     && self.query.is_empty()
                     && ch.eq_ignore_ascii_case(&'d') =>
             {
@@ -4492,6 +4486,81 @@ pub(crate) fn picker_efforts_for_route(
     if model_is_auto {
         return AUTO_MODEL_PICKER_EFFORTS.to_vec();
     }
+    distinct_effective_efforts(
+        route_picker_efforts(provider, base_url, wire_model),
+        provider,
+        base_url,
+        wire_model,
+    )
+}
+
+/// The tier a concrete route receives for `effort`: the route-constrained
+/// receipt tier when the route's dialect is narrower than the generic
+/// normalization (Z.ai GLM, Kimi Code K3), otherwise
+/// [`ReasoningEffort::normalize_for_route`]. This is the effective tier the
+/// effort status line and Work receipts report, so the ladder and the cycler
+/// dedupe against the same value the operator sees.
+pub(crate) fn effective_tier_for_route(
+    effort: ReasoningEffort,
+    provider: ApiProvider,
+    base_url: &str,
+    wire_model: &str,
+) -> ReasoningEffort {
+    match crate::work_graph::constrained_effective_reasoning_for_route(
+        effort.into(),
+        provider,
+        base_url,
+        wire_model,
+    )
+    .map(crate::reasoning_preference::EffectiveReasoningEffort::from)
+    {
+        Some(crate::reasoning_preference::EffectiveReasoningEffort::Tier(tier)) => tier,
+        _ => effort.normalize_for_route(provider, base_url, wire_model),
+    }
+}
+
+/// Drop rungs that resolve to the same effective tier as another rung on the
+/// route (#6650). The picker and the Ctrl+T cycler walk this ladder, so a rung
+/// whose effective tier is already offered would be a row that changes
+/// nothing and a key press that does nothing — DeepSeek's `medium` lands on
+/// `high`, Z.ai GLM-5.2's `low` lands on `high`, an always-thinking route's
+/// `off` lands on its lowest tier, and a catalog `thinking: disabled` value
+/// the effort dialect cannot express lands on the catalog default. When two
+/// rungs collide, the one whose own value is the effective tier wins, so the
+/// row names what the route will receive. `Auto` always stays: it is the
+/// "leave it to the route" preference, not a tier, and is displayed as its
+/// own state. Routes whose effective tier cannot be proven (a custom endpoint,
+/// an enabled-but-untiered toggle) keep their rows.
+fn distinct_effective_efforts(
+    efforts: Vec<ReasoningEffort>,
+    provider: ApiProvider,
+    base_url: &str,
+    wire_model: &str,
+) -> Vec<ReasoningEffort> {
+    let effective =
+        |effort: ReasoningEffort| effective_tier_for_route(effort, provider, base_url, wire_model);
+    let mut seen = Vec::with_capacity(efforts.len());
+    let mut distinct = Vec::with_capacity(efforts.len());
+    for &effort in &efforts {
+        if effort == ReasoningEffort::Auto {
+            distinct.push(effort);
+            continue;
+        }
+        let tier = effective(effort);
+        if (tier != effort && efforts.contains(&tier)) || seen.contains(&tier) {
+            continue;
+        }
+        seen.push(tier);
+        distinct.push(effort);
+    }
+    distinct
+}
+
+fn route_picker_efforts(
+    provider: ApiProvider,
+    base_url: &str,
+    wire_model: &str,
+) -> Vec<ReasoningEffort> {
     // Exact-route overrides still win over catalog metadata: Kimi Code K3 and
     // OpenAI Codex have wire dialects the generic Models.dev shape does not
     // fully describe.
@@ -4549,12 +4618,17 @@ fn catalog_picker_efforts(provider: ApiProvider, wire_model: &str) -> Option<Vec
     let offering = catalog_offering_for_model(provider, wire_model)?;
     let mut efforts = Vec::new();
     let mut saw_effort_list = false;
+    let mut has_toggle = false;
     for option in &offering.reasoning_options {
         let option_type = option
             .get("type")
             .and_then(|value| value.as_str())
             .unwrap_or("")
             .to_ascii_lowercase();
+        if option_type == "toggle" {
+            has_toggle = true;
+            continue;
+        }
         // Prefer explicit effort lists; also accept thinking-mode lists whose
         // values map onto our tiers (adaptive→auto, disabled→off, always_on→max).
         if option_type != "effort" && option_type != "thinking" {
@@ -4577,6 +4651,11 @@ fn catalog_picker_efforts(provider: ApiProvider, wire_model: &str) -> Option<Vec
     }
     if !saw_effort_list || efforts.is_empty() {
         return None;
+    }
+    // A Models.dev `toggle` beside the ladder means reasoning can also be
+    // switched off (#6396).
+    if has_toggle && !efforts.contains(&ReasoningEffort::Off) {
+        efforts.insert(0, ReasoningEffort::Off);
     }
     // Always offer Auto when the catalog published discrete tiers so the
     // operator can still leave the choice to the route default. Do not invent
@@ -4664,6 +4743,33 @@ fn default_picker_effort_idx(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn picker_ladder_drops_rungs_that_resolve_to_an_offered_tier() {
+        use ReasoningEffort::*;
+        // DeepSeek collapses minimal/medium/xhigh/ultra onto low/high/max, so
+        // a catalog that published every spelling still shows one row per
+        // wire tier (#6650).
+        assert_eq!(
+            distinct_effective_efforts(
+                vec![Auto, Off, Minimal, Low, Medium, High, XHigh, Ultra, Max],
+                ApiProvider::Deepseek,
+                crate::config::DEFAULT_DEEPSEEK_BASE_URL,
+                "deepseek-v4.1-flash",
+            ),
+            vec![Auto, Off, Low, High, Max]
+        );
+        // When the alias comes first, the rung that names the tier still wins.
+        assert_eq!(
+            distinct_effective_efforts(
+                vec![Auto, Medium, High, Max],
+                ApiProvider::Deepseek,
+                crate::config::DEFAULT_DEEPSEEK_BASE_URL,
+                "deepseek-v4.1-flash",
+            ),
+            vec![Auto, High, Max]
+        );
+    }
 
     #[test]
     fn configured_model_picker_and_runtime_share_exact_persisted_metadata() {
@@ -5365,14 +5471,17 @@ mod tests {
                 }
                 let mut picker = ModelPickerView::new(&app, &config);
                 let visible = picker.visible_model_rows();
-                // The current route leads (#6533); the pins follow it.
+                // The current route leads (#6533); the pins follow it. The
+                // configured `default_text_model` is the startup route, so the
+                // lower pin is also the current row.
+                assert_eq!(app.model, lower);
                 assert_eq!(visible[0].id, app.model);
-                assert_eq!(
-                    visible[1].id, lower,
+                let lower_index = visible.iter().position(|row| row.id == lower).unwrap();
+                let upper_index = visible.iter().position(|row| row.id == upper).unwrap();
+                assert!(
+                    lower_index < upper_index,
                     "saved pin order precedes lexical order"
                 );
-                assert_eq!(visible[2].id, upper);
-                let upper_index = visible.iter().position(|row| row.id == upper).unwrap();
                 drop(visible);
                 picker.selected_model_idx = upper_index;
                 picker.re_resolve_from_app(&app, &config);

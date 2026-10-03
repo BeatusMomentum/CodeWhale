@@ -59,42 +59,44 @@ fn classify_composer_click(
     }
 }
 
-/// Byte bounds of the word (or CJK run) containing `pos`.
+/// Char-index bounds of the word (or CJK run) containing char `pos`.
+///
+/// Takes and returns char indices, the unit of `App::cursor_position` and
+/// `App::selection_anchor`, so a multi-byte composer never mixes the two.
 fn composer_word_bounds(text: &str, pos: usize) -> (usize, usize) {
-    let chars: Vec<(usize, char)> = text.char_indices().collect();
+    let chars: Vec<char> = text.chars().collect();
     if chars.is_empty() {
         return (0, 0);
     }
     let is_word = |ch: char| ch.is_alphanumeric() || (ch as u32) >= 0x80;
-    let idx = chars.partition_point(|(byte, _)| *byte < pos);
-    let idx = idx.min(chars.len().saturating_sub(1));
-    if !is_word(chars[idx].1) {
-        return (chars[idx].0, chars[idx].0 + chars[idx].1.len_utf8());
+    let idx = pos.min(chars.len() - 1);
+    if !is_word(chars[idx]) {
+        return (idx, idx + 1);
     }
     let mut start = idx;
-    while start > 0 && is_word(chars[start - 1].1) {
+    while start > 0 && is_word(chars[start - 1]) {
         start -= 1;
     }
     let mut end = idx + 1;
-    while end < chars.len() && is_word(chars[end].1) {
+    while end < chars.len() && is_word(chars[end]) {
         end += 1;
     }
-    let start_byte = chars[start].0;
-    let end_byte = if end < chars.len() {
-        chars[end].0
-    } else {
-        text.len()
-    };
-    (start_byte, end_byte)
+    (start, end)
 }
 
-/// Byte bounds of the logical line containing `pos` (excluding the newline).
+/// Char-index bounds of the logical line containing char `pos` (excluding
+/// the newline).
 fn composer_line_bounds(text: &str, pos: usize) -> (usize, usize) {
-    let pos = pos.min(text.len());
-    let start = text[..pos].rfind('\n').map_or(0, |i| i + 1);
-    let end = text[pos..]
-        .find('\n')
-        .map_or(text.len(), |offset| pos + offset);
+    let chars: Vec<char> = text.chars().collect();
+    let pos = pos.min(chars.len());
+    let start = chars[..pos]
+        .iter()
+        .rposition(|&ch| ch == '\n')
+        .map_or(0, |i| i + 1);
+    let end = chars[pos..]
+        .iter()
+        .position(|&ch| ch == '\n')
+        .map_or(chars.len(), |offset| pos + offset);
     (start, end)
 }
 
@@ -1818,7 +1820,7 @@ pub(crate) fn apply_context_menu_action(
                 build_command_palette_entries(
                     app.ui_locale,
                     &app.skills_dir,
-                    app.skills_scan_codewhale_only,
+                    app.skills_discovery_mode,
                     &app.workspace,
                     &app.mcp_config_path,
                     app.mcp_snapshot.as_ref(),
@@ -3659,14 +3661,28 @@ mod tests {
 
         #[test]
         fn word_bounds_select_words_and_respect_cjk() {
-            // Bytes: fix(0-2) sp(3) the(4-6) sp(7) 深=3B(8-10) 海=3B(11-13) sp(14) test.rs(15-21)
+            // Chars: fix(0-2) sp(3) the(4-6) sp(7) 深(8) 海(9) sp(10) test.rs(11-17)
             let text = "fix the 深海 test.rs";
             assert_eq!(composer_word_bounds(text, 2), (0, 3)); // 'fix'
             assert_eq!(composer_word_bounds(text, 5), (4, 7)); // 'the'
-            assert_eq!(composer_word_bounds(text, 10), (8, 14)); // '深海' (space at 14)
-            assert_eq!(composer_word_bounds(text, 15), (15, 19)); // 'test' (stops at '.')
-            assert_eq!(composer_word_bounds(text, 19), (19, 20)); // '.'
-            assert_eq!(composer_word_bounds(text, 20), (20, 22)); // 'rs'
+            assert_eq!(composer_word_bounds(text, 9), (8, 10)); // '深海' (space at 10)
+            assert_eq!(composer_word_bounds(text, 11), (11, 15)); // 'test' (stops at '.')
+            assert_eq!(composer_word_bounds(text, 15), (15, 16)); // '.'
+            assert_eq!(composer_word_bounds(text, 16), (16, 18)); // 'rs'
+        }
+
+        #[test]
+        fn click_bounds_are_char_indices_on_multibyte_text() {
+            // The click maps to a char index and the result becomes the
+            // char-indexed cursor/anchor. Byte math here panicked on a
+            // triple-click inside CJK text and skewed double-click spans.
+            let text = "你好\n世界 ok";
+            assert_eq!(composer_line_bounds(text, 1), (0, 2));
+            assert_eq!(composer_line_bounds(text, 4), (3, 8));
+            assert_eq!(composer_word_bounds(text, 3), (3, 5)); // '世界'
+            assert_eq!(composer_word_bounds(text, 6), (6, 8)); // 'ok'
+            let mixed = "fix 深海 test";
+            assert_eq!(composer_word_bounds(mixed, 8), (7, 11)); // 'test'
         }
 
         #[test]

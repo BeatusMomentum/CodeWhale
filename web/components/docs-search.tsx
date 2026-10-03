@@ -12,11 +12,16 @@ import {
 import { DOC_TASKS, docTaskHaystack, type DocTask } from "@/lib/docs-tasks";
 import { fill, getDocsShell, pickText } from "@/lib/i18n/dictionaries";
 import { docTopicHaystack, highlightSpan } from "@/lib/search-utils";
+import { isSlashShortcut } from "@/lib/slash-shortcut";
 import { EmptyState } from "./surface-state";
 
 /* ------------------------------------------------------------------ */
 /*  Helpers                                                            */
 /* ------------------------------------------------------------------ */
+
+function topicSources(topic: DocTopic): string[] {
+  return Array.isArray(topic.repoSource) ? topic.repoSource : [topic.repoSource];
+}
 
 function highlight(text: string, query: string): React.ReactNode {
   // Index arithmetic lives in search-utils: lowercasing can change a
@@ -55,32 +60,51 @@ function TopicRow({
   query,
   webGuideTag,
   sourceDocTag,
+  sourceDetails,
 }: {
   topic: DocTopic;
   locale: string;
   query: string;
   webGuideTag: string;
   sourceDocTag: string;
+  sourceDetails: string;
 }) {
   const href = docTopicHref(topic, locale);
   const isExternal = docTopicIsExternal(topic);
+  const sources = topicSources(topic);
 
+  // The row is a link; its provenance (the repository files the entry is
+  // written from) sits beside it behind a disclosure, so it is there for
+  // maintainers without crowding the index.
   return (
-    <Link
-      href={href}
-      target={isExternal ? "_blank" : undefined}
-      rel={isExternal ? "noreferrer" : undefined}
-      className="docs-topic-row"
-    >
-      <div className="docs-topic-main">
-        <div className="docs-topic-title">
-          {highlight(pickText(topic.label, locale), query)}
-          <span>{isExternal ? sourceDocTag : webGuideTag}</span>
+    <div className="docs-topic-item">
+      <Link
+        href={href}
+        target={isExternal ? "_blank" : undefined}
+        rel={isExternal ? "noreferrer" : undefined}
+        className="docs-topic-row"
+      >
+        <div className="docs-topic-main">
+          <div className="docs-topic-title">
+            {highlight(pickText(topic.label, locale), query)}
+            <span>{isExternal ? sourceDocTag : webGuideTag}</span>
+          </div>
+          <p>{highlight(pickText(topic.description, locale), query)}</p>
         </div>
-        <p>{highlight(pickText(topic.description, locale), query)}</p>
-      </div>
-      <span className="docs-topic-arrow" aria-hidden="true">{isExternal ? "↗" : "→"}</span>
-    </Link>
+        <span className="docs-topic-arrow" aria-hidden="true">{isExternal ? "↗" : "→"}</span>
+      </Link>
+      <details className="docs-topic-details">
+        <summary>{sourceDetails}</summary>
+        <p className="docs-topic-source">
+          {sources.map((s, i) => (
+            <span key={s}>
+              {i > 0 && ", "}
+              <code>{highlight(s, query)}</code>
+            </span>
+          ))}
+        </p>
+      </details>
+    </div>
   );
 }
 
@@ -123,9 +147,9 @@ export function DocsSearch({ locale }: { locale: string }) {
     return map;
   }, [filteredTopics]);
 
-  // Keyboard shortcut: focus search on "/".
+  // Keyboard shortcut: focus search on an unmodified "/" typed outside a field.
   const handleKeyDown = useCallback((e: KeyboardEvent) => {
-    if (e.key === "/" && document.activeElement?.tagName !== "INPUT") {
+    if (isSlashShortcut(e)) {
       e.preventDefault();
       inputRef.current?.focus();
     }
@@ -221,6 +245,7 @@ export function DocsSearch({ locale }: { locale: string }) {
                         query={query}
                         webGuideTag={t.webGuideTag}
                         sourceDocTag={t.sourceDocTag}
+                        sourceDetails={t.sourceDetails}
                       />
                     ))}
                   </div>

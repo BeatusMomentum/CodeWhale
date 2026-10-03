@@ -18,16 +18,15 @@ pub const USER_SHELL_TOOL_ID_PREFIX: &str = "user_shell_";
 
 /// Snapshot of session state for saving to disk.
 /// Returned by `Op::GetSessionSnapshot` via a oneshot channel.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct SessionSnapshot {
     /// The live conversation id this engine session is running under.
     ///
-    /// It is the id every workspace snapshot this conversation takes
-    /// (`tool:` / `pre-turn:`) is tagged with, so a save of the conversation
-    /// has to persist it as the session document's own id: a document minted
-    /// under a different id leaves the thread bound to a session that owns no
-    /// snapshots, and `/undo` and the file-revert endpoint both select by that
-    /// binding (see `patch_undo_workspace_files`).
+    /// Every workspace snapshot the conversation takes is tagged with it. A
+    /// Runtime thread's engine runs under the thread's own id; a save that
+    /// names no document persists under this id, so one conversation keeps
+    /// one document. Runtime snapshot ownership is the receipts recorded on
+    /// the thread's turns, not this binding (see `patch_undo_workspace_files`).
     pub session_id: String,
     pub messages: Vec<Message>,
     pub total_tokens: u64,
@@ -217,6 +216,18 @@ pub struct TurnSpec {
     /// Structural input origin. This gates whether the turn may inherit
     /// YOLO/auto-approval authority; user-shaped text is not enough.
     pub provenance: UserInputProvenance,
+    /// Host-supplied correlation token for this submission, echoed verbatim on
+    /// the turn's `Event::TurnStarted`. Hosts that arm submit→`TurnStarted`
+    /// window actions (e.g. a deferred stop replay) use the echo to bind those
+    /// actions to the turn that actually started: every engine self-started
+    /// turn (idle sub-agent completion, background shell wake, goal
+    /// continuation) and the composer shell command turn carry no token, so
+    /// their start cannot be mistaken for a pending submission even when it
+    /// overtakes it in the event stream. `None` for callers that do not
+    /// correlate. The token only survives the in-process engine path: the
+    /// wire op projection and the durable-runtime submission path carry none,
+    /// so hosts submitting over those channels cannot correlate.
+    pub submission_id: Option<String>,
 }
 
 /// Operations that can be submitted to the engine.
@@ -364,6 +375,15 @@ pub enum Op {
         mode: AppMode,
     },
 
+    /// Rewind only the exact conversation observed by the caller. The Engine
+    /// compares the full expected state before changing history or caches.
+    /// A rejected rewind returns None and performs no mutation or inference.
+    RewindConversation {
+        expected: Box<SessionSnapshot>,
+        messages: Vec<Message>,
+        tx: tokio::sync::oneshot::Sender<Option<SessionSnapshot>>,
+    },
+
     /// Run context compaction on one exact, structurally resolved provider
     /// route with policy derived from that same descriptor.
     CompactContext {
@@ -433,7 +453,12 @@ pub enum Op {
     /// Edit the last user message: remove the last user+assistant exchange
     /// from the session, then re-send with the new content.
     #[cfg_attr(not(test), expect(dead_code))]
-    EditLastTurn { new_message: String },
+    EditLastTurn {
+        new_message: String,
+        /// Host-supplied correlation token, echoed on the replayed turn's
+        /// `Event::TurnStarted` (see `TurnSpec::submission_id`).
+        submission_id: Option<String>,
+    },
 
     /// Enable or disable the background advisor watcher for this session.
     /// When enabled, a fire-and-forget background task runs after each turn

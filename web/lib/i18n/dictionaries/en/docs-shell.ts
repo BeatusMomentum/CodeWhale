@@ -4,7 +4,8 @@ import type { DocsShellDict } from "../types";
  * English reference dictionary for the docs shell: the portal hero in
  * `app/[locale]/docs/layout.tsx`, the hub metadata, the task/topic search,
  * the sidebar and breadcrumb chrome, the release-truth band, the contextual
- * help band that closes every docs page, and the shared page-body chrome.
+ * help band that closes every docs page, the shared page-body chrome, and the
+ * session recording panel.
  */
 export const docsShell: DocsShellDict = {
   metaTitle: "Docs · Codewhale",
@@ -33,6 +34,7 @@ export const docsShell: DocsShellDict = {
   topicsHeading: "By topic",
   webGuideTag: "Web guide",
   sourceDocTag: "Source doc",
+  sourceDetails: "Details",
   emptyTitle: "No matching entry",
   emptyBody:
     "Try a different word — searches match English and Chinese — or browse the complete docs directory on GitHub.",
@@ -58,4 +60,10 @@ export const docsShell: DocsShellDict = {
   nextHeading: "Next",
   noteLabel: "Note:",
   onThisPage: "On this page",
+
+  mediaPendingNote:
+    "There is no recording yet. When there is, it goes here with captions, a transcript, and an optional GIF download.",
+  mediaPlanLink: "Recording plan and acceptance checklist ↗",
+  mediaGifFallback: "GIF fallback download (no-video environments)",
+  mediaTranscript: "Transcript ↗",
 };

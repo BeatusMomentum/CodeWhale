@@ -15,10 +15,6 @@ use std::process::Command;
 
 pub(super) const MAX_DELIVERABLES: usize = 16;
 const MAX_BASELINE_PATHS: usize = 4096;
-/// Past this many changed paths the explicit `git add` arg list is the
-/// bigger risk, so the checkpoint falls back to a whole-tree add (isolated
-/// worktrees only — the caller guarantees that).
-const MAX_CHECKPOINT_PATHS: usize = 1000;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DeliverableVerdict {
@@ -45,8 +41,9 @@ struct GitDeliveryBaseline {
     dirty: BTreeMap<String, String>,
 }
 
-fn git_output(root: &Path, args: &[&str]) -> Option<std::process::Output> {
-    Command::new("git")
+fn git_command(root: &Path) -> Command {
+    let mut command = Command::new("git");
+    command
         .arg("-C")
         .arg(root)
         .args([
@@ -55,11 +52,13 @@ fn git_output(root: &Path, args: &[&str]) -> Option<std::process::Output> {
             "-c",
             "core.untrackedCache=false",
         ])
-        .args(args)
         .env("GIT_OPTIONAL_LOCKS", "0")
-        .env("GIT_NO_LAZY_FETCH", "1")
-        .output()
-        .ok()
+        .env("GIT_NO_LAZY_FETCH", "1");
+    command
+}
+
+fn git_output(root: &Path, args: &[&str]) -> Option<std::process::Output> {
+    git_command(root).args(args).output().ok()
 }
 
 fn git(root: &Path, args: &[&str]) -> Option<Vec<u8>> {
@@ -70,6 +69,38 @@ fn git(root: &Path, args: &[&str]) -> Option<Vec<u8>> {
 /// `git` that reports stderr on failure, for checkpoint notes.
 fn git_captured(root: &Path, args: &[&str]) -> Result<String, String> {
     let output = git_output(root, args).ok_or_else(|| "git spawn failed".to_string())?;
+    if !output.status.success() {
+        return Err(first_line_lossy(&output.stderr, 200));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// [`git_captured`] with `paths` fed to git's stdin NUL-terminated, for
+/// commands reading `-z --stdin` or `--pathspec-from-file=- --pathspec-file-nul`.
+/// No argv length limit applies, so no path count ever needs a wider
+/// command instead of the exact list.
+fn git_captured_paths(root: &Path, args: &[&str], paths: &[&str]) -> Result<String, String> {
+    use std::io::Write as _;
+    use std::process::Stdio;
+    let mut child = git_command(root)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|_| "git spawn failed".to_string())?;
+    let mut input = Vec::new();
+    for path in paths {
+        input.extend_from_slice(path.as_bytes());
+        input.push(0);
+    }
+    if let Some(mut stdin) = child.stdin.take() {
+        // A write error means git exited early; its stderr says why.
+        let _ = stdin.write_all(&input);
+    }
+    let output = child
+        .wait_with_output()
+        .map_err(|_| "git wait failed".to_string())?;
     if !output.status.success() {
         return Err(first_line_lossy(&output.stderr, 200));
     }
@@ -208,19 +239,10 @@ impl DeliveryEvidence {
         let mut candidates = status_paths(&baseline.root)?;
         candidates.extend(baseline.dirty.keys().cloned());
         if let Some(head) = baseline.head.as_deref() {
-            let output = git(
-                &baseline.root,
-                &[
-                    "diff",
-                    "--no-ext-diff",
-                    "--no-textconv",
-                    "--name-only",
-                    "-z",
-                    head,
-                    "HEAD",
-                    "--",
-                ],
-            )?;
+            let mut args = vec!["diff"];
+            args.extend(crate::dependencies::Git::REVIEW_DIFF_ARGS);
+            args.extend(["--name-only", "-z", head, "HEAD", "--"]);
+            let output = git(&baseline.root, &args)?;
             for path in output
                 .split(|byte| *byte == 0)
                 .filter(|path| !path.is_empty())
@@ -266,8 +288,17 @@ impl DeliveryEvidence {
     /// on an isolated worktree (#6194 item 4, #5529). Synchronous git reads
     /// and writes: call under `spawn_blocking`, never under the manager
     /// lock. `changed` is the `changed_paths` inventory the caller already
-    /// computed; the commit is skipped (not forced) when the tree is already
-    /// clean, and every failure degrades to a note — never an error.
+    /// computed; the commit is skipped (not forced) when none of it is still
+    /// uncommitted, and every failure degrades to a note — never an error.
+    ///
+    /// Ownership is exact at every size (#6557 D02-11): only paths that are
+    /// both in `changed` and dirty now are staged and committed. A
+    /// pre-existing dirty file the worker never touched stays dirty, and a
+    /// file staged by someone else stays staged but outside the commit
+    /// (`git commit --only` with the owned pathspecs). Paths travel on stdin
+    /// as literal pathspecs, so a name like `*.rs` is never a glob and no
+    /// inventory size widens staging to the whole tree. A dirty tree larger
+    /// than the baseline bound is refused rather than guessed at.
     pub(super) fn checkpoint_uncommitted(
         &self,
         changed: &BTreeSet<String>,
@@ -289,26 +320,31 @@ impl DeliveryEvidence {
                 reason: "no delivery baseline".to_string(),
             };
         };
-        match git_captured(&baseline.root, &["status", "--porcelain=v1", "-z", "--"]) {
-            Ok(status) if status.trim().is_empty() => return Clean,
-            Err(reason) => return Failed { reason },
-            Ok(_) => {}
+        let Some(dirty) = status_paths(&baseline.root) else {
+            return Failed {
+                reason: format!(
+                    "git status failed or listed more than {MAX_BASELINE_PATHS} paths; nothing was staged"
+                ),
+            };
+        };
+        // Status spelling is what git matches; `changed` is normalized.
+        let owned: Vec<&str> = dirty
+            .iter()
+            .filter(|path| normalize_claim_path(path).is_ok_and(|path| changed.contains(&path)))
+            .map(String::as_str)
+            .collect();
+        if owned.is_empty() {
+            return Clean;
         }
-        // Stage exactly the worker-attributable inventory, not the whole
-        // tree: a pre-existing dirty file the worker never touched must not
-        // ride into the checkpoint.
-        if changed.len() > MAX_CHECKPOINT_PATHS {
-            if let Err(reason) = git_captured(&baseline.root, &["add", "-A", "--"]) {
-                return Failed { reason };
-            }
-        } else {
-            let mut args = Vec::with_capacity(changed.len() + 2);
-            args.push("add");
-            args.push("--");
-            args.extend(changed.iter().map(String::as_str));
-            if let Err(reason) = git_captured(&baseline.root, &args) {
-                return Failed { reason };
-            }
+        // `update-index` takes literal paths and stages every status shape:
+        // edits, new files (`--add`), and deletions or rename sources whose
+        // file is gone (`--remove`), where `git add <path>` would fail.
+        if let Err(reason) = git_captured_paths(
+            &baseline.root,
+            &["update-index", "--add", "--remove", "-z", "--stdin"],
+            &owned,
+        ) {
+            return Failed { reason };
         }
         let cause_short: String = cause
             .lines()
@@ -319,20 +355,25 @@ impl DeliveryEvidence {
             .collect();
         let message = format!(
             "checkpoint: {agent_id} ({cause_short}) - {} uncommitted file(s) at budget death; unreviewed salvage",
-            changed.len()
+            owned.len()
         );
-        if let Err(reason) = git_captured(
+        if let Err(reason) = git_captured_paths(
             &baseline.root,
             &[
+                "--literal-pathspecs",
                 "-c",
                 "user.name=Codewhale Subagent",
                 "-c",
                 "user.email=subagent@codewhale.invalid",
                 "commit",
                 "--quiet",
+                "--only",
                 "-m",
                 &message,
+                "--pathspec-from-file=-",
+                "--pathspec-file-nul",
             ],
+            &owned,
         ) {
             return Failed { reason };
         }
@@ -390,7 +431,7 @@ pub(super) fn declared_paths(
         if path == "."
             || path
                 .split('/')
-                .any(|part| part.eq_ignore_ascii_case(".git"))
+                .any(|part| crate::snapshot::is_git_metadata_name(std::ffi::OsStr::new(part)))
         {
             return Err("deliverables must name files outside git metadata".into());
         }

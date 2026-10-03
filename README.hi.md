@@ -1,9 +1,9 @@
-<!-- source: README.md sha256:bbb8bfb61e57 -->
+<!-- source: README.md sha256:925619135f77 -->
 # Codewhale
 
 Codewhale एक ओपन सोर्स एजेंट है जो आपकी पसंद के होस्ट किए गए या लोकल मॉडल से आपका प्रोजेक्ट पढ़ता है, फ़ाइलें संपादित करता है, कमांड चलाता है और अपने काम की जाँच करता है। टर्मिनल में एक काम से शुरुआत करें। बड़े काम के हिस्से अलग-अलग मॉडल और भूमिकाओं वाले एजेंटों को सौंपें।
 
-![टर्मिनल में चलता Codewhale](web/public/codewhale-tui-d7a9a1c.png)
+![टर्मिनल में चलता Codewhale](web/public/codewhale-tui-5765d80.png)
 
 *v0.10.0 के विकासाधीन बिल्ड से टर्मिनल का पूर्वावलोकन।*
 
@@ -23,6 +23,8 @@ curl -fsSL https://codewhale.net/install.sh | sh
 "$HOME/.local/bin/codewhale"
 ```
 
+अगर सिर्फ़ `codewhale` चलाने पर "command not found" दिखे, तो इसका मतलब है कि `~/.local/bin` अभी आपके PATH में नहीं है: इंस्टॉलर आपके शेल के लिए जो एक लाइन प्रिंट करता है उसे चलाएँ, या [इसे PATH में जोड़ें](docs/INSTALL.md#put-it-on-your-path) देखें।
+
 इंस्टॉलर सबसे नई प्रकाशित रिलीज़ चुनता है। [बदलावों की सूची](CHANGELOG.md) में अगली रिलीज़ के अभी तक अप्रकाशित कैंडिडेट का भी विवरण है; रिलीज़ उपलब्ध होने तक ये बदलाव प्रकाशित डाउनलोड में शामिल नहीं होते।
 
 Windows पर [GitHub Releases](https://github.com/Hmbown/CodeWhale/releases/latest) से उपयुक्त इंस्टॉलर या आर्काइव डाउनलोड करें। मौजूदा सीधे इंस्टॉलेशन को अपडेट करने के लिए `codewhale update` चलाएँ; केवल जाँच के लिए `codewhale update --check` इस्तेमाल करें। अपडेटर executable का पथ दिखाता है और नए बिल्ड सुरक्षित रखता है। npm और Cargo वैकल्पिक पैकेजिंग तरीके हैं। पैकेज मैनेजर वाले इंस्टॉलेशन से माइग्रेशन और PATH के लिए [इंस्टॉलेशन गाइड](docs/INSTALL.md) देखें।
@@ -33,7 +35,7 @@ Windows पर [GitHub Releases](https://github.com/Hmbown/CodeWhale/releases/la
 
 ## उपयोग
 
-अपने प्रोजेक्ट फ़ोल्डर में टर्मिनल खोलें और `codewhale` चलाएँ। `/provider` से अपना प्रोवाइडर और `/model` से अपना मॉडल चुनें। फिर कोई ठोस काम बताएँ:
+अपने प्रोजेक्ट फ़ोल्डर में टर्मिनल खोलें और `codewhale` चलाएँ (जब यह [आपके PATH में](docs/INSTALL.md#put-it-on-your-path) हो)। `/provider` से अपना प्रोवाइडर और `/model` से अपना मॉडल चुनें। फिर कोई ठोस काम बताएँ:
 
 ```text
 Fix the failing tests and explain what changed.
@@ -76,6 +78,7 @@ Codewhale आपकी मशीन पर उतने ही एक्से�
 
 ## दस्तावेज़
 
+- [GitHub PR समीक्षा सेटअप](docs/GITHUB_ACTION.md)
 - [प्रोवाइडर और लोकल मॉडल](docs/PROVIDERS.md)
 - [एजेंट टीमें](docs/FLEET.md)
 - [MCP](docs/MCP.md), [हुक](docs/HOOKS.md) और [कॉन्फ़िगरेशन](docs/CONFIGURATION.md)

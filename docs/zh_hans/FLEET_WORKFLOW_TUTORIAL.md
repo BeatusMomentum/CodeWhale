@@ -1,25 +1,25 @@
 # Fleet + Workflow 教程
 
 > 英文原文：[FLEET_WORKFLOW_TUTORIAL.md](../FLEET_WORKFLOW_TUTORIAL.md)。
-> 最后与英文同步日期（last synced with English revision）：2026-09-26。
+> 最后与英文同步日期（last synced with English revision）：2026-09-29。
 
 Fleet 和 Workflow 设计上要配合使用，但解决的是问题的不同部分：
 
-- **Fleet** 负责配置并管理同一批子代理（subagent）：可复用的角色、模型路由、权限、日志、
+- **Fleet** 负责配置并管理同一批智能体（sub-agent）：可复用的角色、模型路由、权限、日志、
   产物，以及状态/重启/停止控制。
-- **Workflow** 描述编排：阶段、分支、归约、循环，以及可通过 fleet/子代理运行时
-  派发的 agent 叶子节点。
+- **Workflow** 描述编排：阶段、分支、归约、循环，以及可通过 fleet/子智能体运行时
+  派发的 智能体叶子节点。
 
 **默认的产品路径：** 用自然语言提需求。规模小或耦合紧密的工作，Operate 会在
-当前姿态下直接处理。多步委派使用一份精简的 Workflow 计划：具名步骤、依赖、
+当前权限设置下直接处理。多步委派使用一份精简的 Workflow 计划：具名步骤、依赖、
 受限范围和完成检查；结果与证据传递给需要它们的步骤。一个受限的独立任务可以
-直接用后台代理（agent）。要继续同一个代理的工作，用 `followup`。后台任务运行期间，
-输入框依然可用，普通的多代理工作也不需要工作流文件。详见：
-[Automatic Workflows](../AUTOMATIC_WORKFLOWS.md)。
+直接用后台智能体（agent）。要继续同一个智能体的工作，用 `followup`。后台任务运行期间，
+输入框依然可用，普通的多智能体工作也不需要工作流文件。详见：
+[Automatic Workflows](AUTOMATIC_WORKFLOWS.md)。
 
 本教程讲的是**手动**的 fleet 任务规范 / 入库 Workflow 路径，面向需要持久宿主
 worker 和可审阅规范的运维者。一句话的请求仍然不应该悄悄生成 `tasks.json`；
-worker 卡片和权限姿态让派发过程可见，又不必暴露编写机制。
+worker 卡片和权限设置让派发过程可见，又不必暴露编写机制。
 
 示例使用 `codewhale fleet` 和 `/fleet`。磁盘路径、配置键和 Workflow 的
 `--fleet` 标志都用 Fleet 这个名字。
@@ -44,15 +44,15 @@ codewhale fleet init
 选一个角色，决定这份配置是继承操作者路由，还是固定某个提供商（provider）/模型，再选配置
 放在哪里（**This project** → `.codewhale/agents/<role>.toml`，或
 **Personal** → `$CODEWHALE_HOME/agents/<role>.toml`，跨仓库可用，但同 id 的
-项目配置仍是优先级更高的覆盖项），然后审阅确切的文件、权限/工具/路由姿态，
+项目配置仍是优先级更高的覆盖项），然后审阅确切的文件、权限/工具/路由设置，
 并保存。保存控件会写明它的效果（"Save to this project" /
 "Save as Personal profile"），替换已有文件时，一定会再确认一次。fleet 任务规范
 可以用 `worker.agent_profile` 或更短的 `worker.profile` 别名引用任一解析出的
 配置。
 
-这样，fleet 定义就是跨仓库的，而不是某个运行中会话的管辖范围。多仓库操作请从
+这样，fleet 定义就是跨仓库的，而不是某个运行中会话的权限来源。多仓库操作请从
 共享父工作区启动 Codewhale。配置能用，不等于已经拿到文件系统访问权；会话的工作区、
-显式受信任路径、信任模式和权限姿态仍然拥有最终决定权。
+显式受信任路径、信任模式和权限设置仍然拥有最终决定权。
 
 ## 2. 编写 fleet 任务规范
 
@@ -135,7 +135,7 @@ codewhale fleet init
 | `worker.model` | 首选的显式模型固定项。提供商/模型的校验仍由路由解析负责。 |
 | `worker.model_class`, `worker.loadout` | 面向旧任务规范的兼容路由提示；新规范请优先用 `worker.profile` 加已保存配置里的路由固定项。 |
 | `workspace.required_files` | 任务启动前必须存在的文件。 |
-| `workspace.writable_paths` | 当前生效的运行时姿态允许写入时，该任务可写的路径。 |
+| `workspace.writable_paths` | 当前生效的运行时权限允许写入时，该任务可写的路径。 |
 | `workspace.environment` | 必需或列入允许清单的环境变量，只按名字给出。 |
 | `input_files`, `context` | 要串进任务提示词的额外文件和字符串。 |
 | `expected_artifacts` | 期望出现的产物类型：`log`、`report`、`patch`、`test_result`、`checkpoint` 或 `receipt`。 |
@@ -177,7 +177,7 @@ codewhale fleet stop --all
 
 ## 4. 编写 Workflow
 
-Workflow 源码是声明式 JavaScript 或 TypeScript，会被降级为带类型的 Rust
+Workflow 源码是声明式 JavaScript 或 TypeScript，会被编译（lower）为带类型的 Rust
 `WorkflowSpec`。它不是通用的 JavaScript 运行时：imports、进程访问、
 文件系统读写、网络调用、`eval`、`async` 和 `await` 都会被拒绝。
 

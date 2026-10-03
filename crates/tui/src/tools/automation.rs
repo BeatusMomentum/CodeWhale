@@ -10,8 +10,8 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 
 use crate::automation_manager::{
-    AUTOMATION_WATCHER_NO_REPORT_SENTINEL, AutomationDeliveryMode, AutomationStatus,
-    CreateAutomationRequest, UpdateAutomationRequest, run_now_shared,
+    AUTOMATION_WATCHER_NO_REPORT_SENTINEL, AutomationDeliveryMode, AutomationRecord,
+    AutomationStatus, CreateAutomationRequest, UpdateAutomationRequest, run_now_shared,
 };
 use crate::tools::spec::{
     ApprovalRequirement, ToolCapability, ToolContext, ToolError, ToolResult, ToolSpec,
@@ -332,21 +332,25 @@ impl AutomationTool {
             .as_ref()
             .ok_or_else(|| ToolError::not_available("AutomationManager is not attached"))?;
         let manager = manager.lock().await;
+        // A scheduled run keeps no creating session to ask, so the authority
+        // it asks for is capped at what this session holds now.
+        let (allow_shell, trust_mode, auto_approve) = context.cap_delegated_authority(
+            optional_bool_value(input, "allow_shell"),
+            optional_bool_value(input, "trust_mode"),
+            optional_bool_value(input, "auto_approve"),
+        );
         let req = CreateAutomationRequest {
             name: required_str(input, "name")?.to_string(),
             prompt: required_str(input, "prompt")?.to_string(),
             rrule: required_str(input, "rrule")?.to_string(),
-            cwds: string_array(input, "cwds")?
-                .into_iter()
-                .map(PathBuf::from)
-                .collect(),
+            cwds: session_reachable_cwds(context, string_array(input, "cwds")?)?,
             model: optional_str(input, "model")?.map(ToString::to_string),
             model_provider: optional_str(input, "model_provider")?.map(ToString::to_string),
             model_provider_id: optional_str(input, "model_provider_id")?.map(ToString::to_string),
             mode: optional_str(input, "mode")?.map(ToString::to_string),
-            allow_shell: optional_bool_value(input, "allow_shell"),
-            trust_mode: optional_bool_value(input, "trust_mode"),
-            auto_approve: optional_bool_value(input, "auto_approve"),
+            allow_shell,
+            trust_mode,
+            auto_approve,
             delivery_mode: optional_delivery_mode(input)?,
             status: Some(
                 if input
@@ -426,17 +430,38 @@ impl AutomationTool {
         if status == Some(AutomationStatus::Active) {
             require_dispatch_owner(&manager, "activate an automation")?;
         }
+        let (allow_shell, trust_mode, auto_approve) = context.cap_delegated_authority(
+            optional_bool_value(input, "allow_shell"),
+            optional_bool_value(input, "trust_mode"),
+            optional_bool_value(input, "auto_approve"),
+        );
+        let id = required_str(input, "automation_id")?;
+        let existing = manager
+            .get_automation(id)
+            .map_err(|e| ToolError::execution_failed(e.to_string()))?;
+        // Fields the call leaves out keep their stored values, so the record
+        // that results must also sit within this session's authority: a
+        // session cannot edit the prompt of an automation that runs with more
+        // than it holds.
+        require_within_session_authority(
+            context,
+            &AutomationRecord {
+                allow_shell: allow_shell.or(existing.allow_shell),
+                trust_mode: trust_mode.or(existing.trust_mode),
+                auto_approve: auto_approve.or(existing.auto_approve),
+                ..existing
+            },
+            "update",
+        )?;
         let req = UpdateAutomationRequest {
             name: optional_str(input, "name")?.map(ToString::to_string),
             prompt: optional_str(input, "prompt")?.map(ToString::to_string),
             rrule: optional_str(input, "rrule")?.map(ToString::to_string),
             cwds: if input.get("cwds").is_some() {
-                Some(
-                    string_array(input, "cwds")?
-                        .into_iter()
-                        .map(PathBuf::from)
-                        .collect(),
-                )
+                Some(session_reachable_cwds(
+                    context,
+                    string_array(input, "cwds")?,
+                )?)
             } else {
                 None
             },
@@ -444,14 +469,14 @@ impl AutomationTool {
             model_provider: optional_str(input, "model_provider")?.map(ToString::to_string),
             model_provider_id: optional_str(input, "model_provider_id")?.map(ToString::to_string),
             mode: optional_str(input, "mode")?.map(ToString::to_string),
-            allow_shell: optional_bool_value(input, "allow_shell"),
-            trust_mode: optional_bool_value(input, "trust_mode"),
-            auto_approve: optional_bool_value(input, "auto_approve"),
+            allow_shell,
+            trust_mode,
+            auto_approve,
             delivery_mode: optional_delivery_mode(input)?,
             status,
         };
         let automation = manager
-            .update_automation(required_str(input, "automation_id")?, req)
+            .update_automation(id, req)
             .map_err(|e| ToolError::execution_failed(e.to_string()))?;
         ToolResult::json(&automation).map_err(|e| ToolError::execution_failed(e.to_string()))
     }
@@ -470,6 +495,10 @@ impl AutomationTool {
             .ok_or_else(|| ToolError::not_available("AutomationManager is not attached"))?;
         let manager = manager.lock().await;
         if action == "resume" {
+            // An unknown id falls through to resume's own error.
+            if let Ok(existing) = manager.get_automation(required_str(input, "automation_id")?) {
+                require_within_session_authority(context, &existing, "resume")?;
+            }
             require_dispatch_owner(&manager, "resume an automation")?;
         }
         let automation = match action {
@@ -492,6 +521,15 @@ impl AutomationTool {
             .automations
             .as_ref()
             .ok_or_else(|| ToolError::not_available("AutomationManager is not attached"))?;
+        let id = required_str(input, "automation_id")?;
+        {
+            let existing = manager
+                .lock()
+                .await
+                .get_automation(id)
+                .map_err(|e| ToolError::execution_failed(e.to_string()))?;
+            require_within_session_authority(context, &existing, "run")?;
+        }
         let task_manager = context.runtime.task_manager.as_ref().ok_or_else(|| {
             ToolError::not_available(format!(
                 "TaskManager is not attached — {DISPATCH_OWNER_HINT}"
@@ -499,11 +537,52 @@ impl AutomationTool {
         })?;
         // run_now_shared handles its own lock phases so the manager mutex is
         // never held across the task-manager await.
-        let run = run_now_shared(manager, required_str(input, "automation_id")?, task_manager)
+        let run = run_now_shared(manager, id, task_manager)
             .await
             .map_err(|e| ToolError::execution_failed(e.to_string()))?;
         ToolResult::json(&run).map_err(|e| ToolError::execution_failed(e.to_string()))
     }
+}
+
+/// Refuse to update, resume or run an automation whose stored authority is
+/// more than this session holds.
+///
+/// A scheduled run executes the record's prompt with the record's own
+/// `allow_shell` / `trust_mode` / `auto_approve`. A session with less than
+/// that could otherwise rewrite or start work that runs with more, and the
+/// approval card for the call would only show the fields the call sent.
+/// Pausing and deleting only reduce what runs, so they are not checked.
+fn require_within_session_authority(
+    context: &ToolContext,
+    automation: &AutomationRecord,
+    verb: &str,
+) -> Result<(), ToolError> {
+    let stored = [
+        ("allow_shell", automation.allow_shell),
+        ("trust_mode", automation.trust_mode),
+        ("auto_approve", automation.auto_approve),
+    ];
+    let (shell, trust, auto) = context.cap_delegated_authority(
+        automation.allow_shell,
+        automation.trust_mode,
+        automation.auto_approve,
+    );
+    let capped = [shell, trust, auto];
+    let above: Vec<&str> = stored
+        .iter()
+        .zip(capped)
+        .filter(|((_, value), capped)| *value == Some(true) && *capped != Some(true))
+        .map(|((name, _), _)| *name)
+        .collect();
+    if above.is_empty() {
+        return Ok(());
+    }
+    Err(ToolError::permission_denied(format!(
+        "automation: cannot {verb} `{}`: it runs with {} = true, which this session does not hold. Set {} to false in the same update, or ask the user to {verb} it from a session that holds that access.",
+        automation.id,
+        above.join(", "),
+        above.join(" / "),
+    )))
 }
 
 /// The exact schema the legacy per-action tool exposed, kept so hidden alias
@@ -599,6 +678,15 @@ fn string_array(input: &Value, field: &str) -> Result<Vec<String>, ToolError> {
         .unwrap_or_default())
 }
 
+/// Automation directories must be ones this session can already reach:
+/// inside its workspace, or anywhere in trust mode.
+fn session_reachable_cwds(
+    context: &ToolContext,
+    cwds: Vec<String>,
+) -> Result<Vec<PathBuf>, ToolError> {
+    cwds.iter().map(|raw| context.resolve_path(raw)).collect()
+}
+
 fn optional_bool_value(input: &Value, field: &str) -> Option<bool> {
     input.get(field).and_then(Value::as_bool)
 }
@@ -630,6 +718,178 @@ fn optional_delivery_mode(input: &Value) -> Result<Option<AutomationDeliveryMode
 mod tests {
     use super::*;
     use crate::tools::spec::ToolSpec;
+
+    #[tokio::test]
+    async fn create_and_update_cap_requested_authority_at_the_session() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let manager = crate::automation_manager::AutomationManager::open_for_test(
+            workspace.path().join("automations"),
+        )
+        .expect("automation manager");
+        let mut context = ToolContext::new(workspace.path());
+        context.shell_policy = crate::worker_profile::ShellPolicy::None;
+        context.runtime.automations = Some(std::sync::Arc::new(tokio::sync::Mutex::new(manager)));
+        let tool = AutomationTool::new("automation");
+
+        let created = tool
+            .execute(
+                json!({
+                    "action": "create",
+                    "name": "nightly",
+                    "prompt": "summarise the day",
+                    "rrule": "FREQ=HOURLY",
+                    "paused": true,
+                    "auto_approve": true,
+                    "trust_mode": true,
+                    "allow_shell": true
+                }),
+                &context,
+            )
+            .await
+            .expect("create accepted");
+        let record: Value = serde_json::from_str(&created.content).expect("record json");
+        assert_eq!(record["auto_approve"], json!(false), "{record}");
+        assert_eq!(record["trust_mode"], json!(false), "{record}");
+        assert_eq!(record["allow_shell"], json!(false), "{record}");
+        let id = record["id"].as_str().expect("id").to_string();
+
+        let updated = tool
+            .execute(
+                json!({"action": "update", "automation_id": id, "auto_approve": true}),
+                &context,
+            )
+            .await
+            .expect("update accepted");
+        let record: Value = serde_json::from_str(&updated.content).expect("record json");
+        assert_eq!(record["auto_approve"], json!(false), "{record}");
+
+        let outside = tool
+            .execute(
+                json!({
+                    "action": "create",
+                    "name": "elsewhere",
+                    "prompt": "summarise",
+                    "rrule": "FREQ=HOURLY",
+                    "paused": true,
+                    "cwds": ["/"]
+                }),
+                &context,
+            )
+            .await;
+        assert!(
+            outside.is_err(),
+            "a directory outside the workspace is refused"
+        );
+
+        // A session that holds the authority can still hand it on.
+        context.approval_mode = codewhale_execpolicy::ApprovalMode::Bypass;
+        context.trust_mode = true;
+        let granted = tool
+            .execute(
+                json!({
+                    "action": "create",
+                    "name": "unattended",
+                    "prompt": "summarise",
+                    "rrule": "FREQ=HOURLY",
+                    "paused": true,
+                    "auto_approve": true,
+                    "trust_mode": true
+                }),
+                &context,
+            )
+            .await
+            .expect("create accepted");
+        let record: Value = serde_json::from_str(&granted.content).expect("record json");
+        assert_eq!(record["auto_approve"], json!(true), "{record}");
+        assert_eq!(record["trust_mode"], json!(true), "{record}");
+    }
+
+    #[tokio::test]
+    async fn a_session_cannot_edit_or_start_an_automation_that_holds_more_than_it() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let manager = crate::automation_manager::AutomationManager::open_for_test(
+            workspace.path().join("automations"),
+        )
+        .expect("automation manager");
+        let mut full = ToolContext::new(workspace.path());
+        full.approval_mode = codewhale_execpolicy::ApprovalMode::Bypass;
+        full.trust_mode = true;
+        full.runtime.automations = Some(std::sync::Arc::new(tokio::sync::Mutex::new(manager)));
+        let tool = AutomationTool::new("automation");
+        let created = tool
+            .execute(
+                json!({
+                    "action": "create",
+                    "name": "unattended",
+                    "prompt": "summarise",
+                    "rrule": "FREQ=HOURLY",
+                    "paused": true,
+                    "auto_approve": true,
+                    "trust_mode": true
+                }),
+                &full,
+            )
+            .await
+            .expect("create accepted");
+        let record: Value = serde_json::from_str(&created.content).expect("record json");
+        assert_eq!(record["auto_approve"], json!(true), "{record}");
+        let id = record["id"].as_str().expect("id").to_string();
+
+        // The same store, seen from a session in the default approval mode.
+        let mut lesser = full.clone();
+        lesser.approval_mode = codewhale_execpolicy::ApprovalMode::default();
+        lesser.trust_mode = false;
+        assert_ne!(
+            lesser.approval_mode,
+            codewhale_execpolicy::ApprovalMode::Bypass
+        );
+
+        for call in [
+            json!({"action": "update", "automation_id": id, "prompt": "something else"}),
+            json!({"action": "update", "automation_id": id, "auto_approve": false, "prompt": "x"}),
+            json!({"action": "resume", "automation_id": id}),
+            json!({"action": "run", "automation_id": id}),
+        ] {
+            let err = tool
+                .execute(call.clone(), &lesser)
+                .await
+                .expect_err("refused while stored authority exceeds the session");
+            assert!(err.to_string().contains("does not hold"), "{call}: {err}");
+        }
+        let unchanged = full
+            .runtime
+            .automations
+            .as_ref()
+            .expect("store")
+            .lock()
+            .await
+            .get_automation(&id)
+            .expect("record");
+        assert_eq!(unchanged.prompt, "summarise");
+
+        // Lowering every stored field in the same update is allowed, and
+        // pausing never needs the authority.
+        let lowered = tool
+            .execute(
+                json!({
+                    "action": "update",
+                    "automation_id": id,
+                    "prompt": "something else",
+                    "auto_approve": false,
+                    "trust_mode": false
+                }),
+                &lesser,
+            )
+            .await
+            .expect("lowering update accepted");
+        let record: Value = serde_json::from_str(&lowered.content).expect("record json");
+        assert_eq!(record["auto_approve"], json!(false), "{record}");
+        assert_eq!(record["trust_mode"], json!(false), "{record}");
+        assert_eq!(record["prompt"], json!("something else"), "{record}");
+        tool.execute(json!({"action": "pause", "automation_id": id}), &lesser)
+            .await
+            .expect("pause accepted");
+    }
 
     #[test]
     fn create_schema_exposes_rrule() {

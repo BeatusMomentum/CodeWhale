@@ -42,6 +42,15 @@ pub struct HookContext {
     /// (`0xC0000005`) is a real value `exec_shell` reports, and narrowing it
     /// to `i32` used to discard exactly the failures a hook most wants to see.
     pub tool_exit_code: Option<i64>,
+    /// How a process-backed tool ended (`completed`, `failed`, `timed_out`,
+    /// `killed`, `running`), when it reported one. A timed-out or killed
+    /// command usually has no exit code, so this is how a hook tells it apart
+    /// from a tool that reported nothing.
+    pub tool_status: Option<String>,
+    /// Serialized post-admission shell execution receipt (#6689), exported as
+    /// `DEEPSEEK_TOOL_EXECUTION_RECEIPT`. Complete JSON or absent — never a
+    /// truncated document — and at most [`HOOK_EXECUTION_RECEIPT_MAX_BYTES`].
+    pub tool_execution_receipt: Option<String>,
     /// Whether tool succeeded
     pub tool_success: Option<bool>,
     /// Current mode
@@ -95,6 +104,23 @@ impl HookContext {
         self.tool_success = Some(success);
         self.tool_exit_code = exit_code;
         self
+    }
+
+    /// Record a settled tool call: its text, success flag, and — when the
+    /// tool reported them, on success or failure — its exit code and status.
+    /// The TUI and Runtime API completion hooks both build their context here.
+    pub fn with_tool_outcome(
+        self,
+        result: &Result<crate::tools::spec::ToolResult, crate::tools::spec::ToolError>,
+    ) -> Self {
+        let (text, success) = match result {
+            Ok(output) => (output.content.clone(), output.success),
+            Err(error) => (error.to_string(), false),
+        };
+        let mut context = self.with_tool_result(&text, success, reported_tool_exit_code(result));
+        context.tool_status = reported_tool_status(result).map(str::to_string);
+        context.tool_execution_receipt = reported_tool_execution_receipt(result);
+        context
     }
 
     pub fn with_mode(mut self, mode: &str) -> Self {
@@ -158,6 +184,15 @@ impl HookContext {
         bound(&mut self.message, HOOK_MESSAGE_CONTEXT_MAX_BYTES);
         bound(&mut self.error_message, HOOK_ERROR_CONTEXT_MAX_BYTES);
         bound(&mut self.model, HOOK_OBSERVER_METADATA_MAX_BYTES);
+        // A receipt is complete JSON or nothing: truncating it would export a
+        // broken document, so an oversized one is dropped instead.
+        if self
+            .tool_execution_receipt
+            .as_ref()
+            .is_some_and(|receipt| receipt.len() > HOOK_EXECUTION_RECEIPT_MAX_BYTES)
+        {
+            self.tool_execution_receipt = None;
+        }
         if let Some(workspace) = self.workspace.take() {
             self.workspace = Some(PathBuf::from(truncate_env_value(
                 &workspace.to_string_lossy(),
@@ -165,6 +200,83 @@ impl HookContext {
             )));
         }
         self
+    }
+
+    /// Project the shell's post-admission receipt into the versioned observer
+    /// contract. Never reconstruct execution identity from requested arguments.
+    fn tool_after_payload(&self) -> Option<serde_json::Value> {
+        let tool_name = self.tool_name.as_deref()?;
+        if !is_shell_tool_name(tool_name) {
+            return None;
+        }
+        let encoded = self.tool_execution_receipt.as_deref()?;
+        if encoded.len() > HOOK_EXECUTION_RECEIPT_MAX_BYTES {
+            return None;
+        }
+        let receipt: serde_json::Value = serde_json::from_str(encoded).ok()?;
+        if receipt.get("schema_version")?.as_u64()? != 1
+            || receipt.get("scope")?.as_str()? != "local"
+            || !matches!(receipt.get("state")?.as_str()?, "completed" | "interrupted")
+        {
+            return None;
+        }
+        let completion = self.tool_status.as_deref()?;
+        if !matches!(completion, "completed" | "failed" | "killed" | "timed_out") {
+            return None;
+        }
+        let command = receipt.get("command")?.as_str()?;
+        let cwd = receipt.get("cwd")?.as_str()?;
+        if command.is_empty()
+            || command.contains('\0')
+            || cwd.contains('\0')
+            || !std::path::Path::new(cwd).is_absolute()
+        {
+            return None;
+        }
+        let exit_code = receipt.get("exit_code")?;
+        if !exit_code.is_null() && exit_code.as_i64().is_none() {
+            return None;
+        }
+        let output_mode = receipt.get("output_kind")?.as_str()?;
+        let stdout = receipt.get("stdout")?.as_str()?;
+        let stderr = receipt.get("stderr")?.as_str()?;
+        if !matches!(output_mode, "separate" | "combined")
+            || (output_mode == "combined" && !stderr.is_empty())
+        {
+            return None;
+        }
+        // Bound correlation fields before the observer queue clamps its legacy
+        // environment context, so every stdin truncation flag remains truthful.
+        const ID_MAX_BYTES: usize = 1_024;
+        let bounded_id =
+            |id: &Option<String>| id.as_deref().map(|s| truncate_env_value(s, ID_MAX_BYTES));
+        let clipped_id = |id: &Option<String>| id.as_ref().is_some_and(|s| s.len() > ID_MAX_BYTES);
+        let payload = json!({
+            "schema_version": 1,
+            "event": "tool_call_after",
+            "tool_name": tool_name,
+            "session_id": bounded_id(&self.session_id),
+            "tool_call_id": bounded_id(&self.tool_call_id),
+            "session_id_truncated": clipped_id(&self.session_id),
+            "tool_call_id_truncated": clipped_id(&self.tool_call_id),
+            "tool_name_truncated": false,
+            "execution_receipt": {
+                "schema_version": 1,
+                "command": command,
+                "cwd": cwd,
+                "command_truncated": false,
+                "cwd_truncated": false,
+                "execution": "started",
+                "completion": completion,
+                "exit_code": exit_code,
+                "stdout": stdout,
+                "stderr": stderr,
+                "stdout_truncated": receipt.get("stdout_truncated")?.as_bool()?,
+                "stderr_truncated": receipt.get("stderr_truncated")?.as_bool()?,
+                "output_mode": output_mode,
+            },
+        });
+        (serde_json::to_vec(&payload).ok()?.len() <= 64 * 1024).then_some(payload)
     }
 
     /// Convert to environment variables
@@ -200,6 +312,17 @@ impl HookContext {
         }
         if let Some(success) = self.tool_success {
             env.insert("DEEPSEEK_TOOL_SUCCESS".to_string(), success.to_string());
+        }
+        if let Some(ref status) = self.tool_status {
+            env.insert("DEEPSEEK_TOOL_STATUS".to_string(), status.clone());
+        }
+        if let Some(ref receipt) = self.tool_execution_receipt
+            && receipt.len() <= HOOK_EXECUTION_RECEIPT_MAX_BYTES
+        {
+            env.insert(
+                "DEEPSEEK_TOOL_EXECUTION_RECEIPT".to_string(),
+                receipt.clone(),
+            );
         }
         if let Some(ref mode) = self.mode {
             env.insert("DEEPSEEK_MODE".to_string(), mode.clone());
@@ -380,6 +503,12 @@ const HOOK_TOOL_ARGS_ENV_MAX_BYTES: usize = 10_000;
 
 /// Largest raw tool result retained in an observer job before enqueue.
 const HOOK_TOOL_RESULT_CONTEXT_MAX_BYTES: usize = 10_000;
+
+/// Largest serialized shell execution receipt exported through
+/// `DEEPSEEK_TOOL_EXECUTION_RECEIPT`. The shell tool fits its output previews
+/// beneath this bound; the hook boundary drops anything larger rather than
+/// truncate a JSON document.
+pub(crate) const HOOK_EXECUTION_RECEIPT_MAX_BYTES: usize = 32 * 1024;
 
 /// Largest error retained in an observer job before enqueue.
 const HOOK_ERROR_CONTEXT_MAX_BYTES: usize = 5_000;
@@ -1411,6 +1540,9 @@ impl HookExecutor {
             // raw_arg: cmd.exe does not parse the CRT-style \" escapes that
             // Command::arg would insert, so pass the command line verbatim.
             cmd.arg("/C").raw_arg(command);
+            // Only this call's context may supply a receipt. In particular,
+            // a Codewhale launched from another hook must not inherit one.
+            cmd.env_remove("DEEPSEEK_TOOL_EXECUTION_RECEIPT");
             cmd
         }
         #[cfg(not(windows))]
@@ -1422,6 +1554,9 @@ impl HookExecutor {
                 use std::os::unix::process::CommandExt as _;
                 cmd.process_group(0);
             }
+            // Only this call's context may supply a receipt. In particular,
+            // a Codewhale launched from another hook must not inherit one.
+            cmd.env_remove("DEEPSEEK_TOOL_EXECUTION_RECEIPT");
             cmd
         }
     }
@@ -1800,6 +1935,11 @@ impl HookExecutor {
             // tool dispatch even for users with zero hooks configured.
             return Vec::new();
         }
+        if event == HookEvent::ToolCallAfter
+            && let Some(payload) = context.tool_after_payload()
+        {
+            return self.execute_json_observer(event, context, &payload);
+        }
         let env_vars = context.to_env_vars();
         let mut results = Vec::new();
 
@@ -1901,6 +2041,11 @@ impl HookExecutor {
     pub fn submit_observer(&self, event: HookEvent, context: HookContext) -> Result<(), String> {
         if !self.has_hooks_for_event(event) {
             return Ok(());
+        }
+        if event == HookEvent::ToolCallAfter
+            && let Some(payload) = context.tool_after_payload()
+        {
+            return self.submit_json_observer(event, context, payload);
         }
         self.observer_dispatcher.submit(
             event,
@@ -2956,6 +3101,78 @@ fn parse_env_lines(stdout: &str) -> HashMap<String, String> {
     out
 }
 
+/// Metadata a settled tool call reported, whether it succeeded or failed.
+///
+/// `bash` reports a nonzero exit, timeout, or kill as an error, so the error
+/// carries the metadata then; reading only `Ok` results lost the exit code of
+/// every failing command.
+fn reported_tool_metadata(
+    result: &Result<crate::tools::spec::ToolResult, crate::tools::spec::ToolError>,
+) -> Option<&serde_json::Value> {
+    match result {
+        Ok(output) => output.metadata.as_ref(),
+        Err(error) => error.metadata(),
+    }
+}
+
+/// Read how a process-backed tool ended, for `DEEPSEEK_TOOL_STATUS`.
+///
+/// Only the shell statuses the tools record count; anything else stays `None`
+/// rather than passing an arbitrary metadata string into a hook's environment.
+fn reported_tool_status(
+    result: &Result<crate::tools::spec::ToolResult, crate::tools::spec::ToolError>,
+) -> Option<&'static str> {
+    match reported_tool_metadata(result)?.get("status")?.as_str()? {
+        "Completed" => Some("completed"),
+        "Failed" => Some("failed"),
+        "TimedOut" => Some("timed_out"),
+        "Killed" => Some("killed"),
+        "Running" => Some("running"),
+        _ => None,
+    }
+}
+
+/// Read the post-admission execution receipt a shell tool recorded (#6689),
+/// serialized for `DEEPSEEK_TOOL_EXECUTION_RECEIPT`.
+///
+/// Only a schema-1 object within the size bound counts. The receipt is built
+/// by the shell tool from what its process manager recorded at spawn; it is
+/// never reconstructed here from the before-hook input, which can differ from
+/// what actually ran.
+fn reported_tool_execution_receipt(
+    result: &Result<crate::tools::spec::ToolResult, crate::tools::spec::ToolError>,
+) -> Option<String> {
+    let receipt = reported_tool_metadata(result)?.get("execution_receipt")?;
+    if receipt.get("schema_version")?.as_u64()? != 1 {
+        return None;
+    }
+    let encoded = serde_json::to_string(receipt).ok()?;
+    (encoded.len() <= HOOK_EXECUTION_RECEIPT_MAX_BYTES).then_some(encoded)
+}
+
+/// Read the process exit code a tool reported, when it reported one.
+///
+/// The one source for `DEEPSEEK_TOOL_EXIT_CODE`: the TUI and the Runtime API
+/// thread path both reach it through [`HookContext::with_tool_outcome`].
+///
+/// Only process-backed tools (`exec_shell`, `bash`, task runners) carry one,
+/// on a successful result or a failed one, and only a real, integer-valued
+/// `exit_code` counts. Everything else stays `None` so
+/// an `exit_code` condition never matches on a fabricated value.
+/// Reported as `i64`, not `i32`: a Windows crash code such as `3221225477`
+/// (`0xC0000005`) is a real value the shell tool records in its metadata, and
+/// narrowing it dropped exactly those codes — the hook saw no exit code at all
+/// for the crashes it most wanted to catch.
+fn reported_tool_exit_code(
+    result: &Result<crate::tools::spec::ToolResult, crate::tools::spec::ToolError>,
+) -> Option<i64> {
+    let code = reported_tool_metadata(result)?.get("exit_code")?;
+    if code.is_null() {
+        return None;
+    }
+    code.as_i64()
+}
+
 // === Unit Tests ===
 
 #[cfg(test)]
@@ -2969,6 +3186,90 @@ mod tests {
         let guard = EnvVarGuard::set("CODEWHALE_CONFIG_PATH", config_path);
         crate::config::save_workspace_trust(workspace).expect("save workspace trust");
         guard
+    }
+
+    /// #455 — `exit_code` conditions must only ever see a real, reported exit
+    /// code. `tool_call_after` used to hard-code `None`, which made every
+    /// `{ type = "exit_code" }` condition permanently unmatchable.
+    #[test]
+    fn reported_tool_exit_code_reads_only_real_metadata_codes() {
+        use crate::tools::spec::{ToolError, ToolResult};
+
+        let with_code = Ok(ToolResult {
+            content: "boom".to_string(),
+            success: false,
+            metadata: Some(serde_json::json!({ "exit_code": 127 })),
+        });
+        assert_eq!(reported_tool_exit_code(&with_code), Some(127));
+
+        // Zero is a real code, not a missing one.
+        let zero = Ok(ToolResult {
+            content: "ok".to_string(),
+            success: true,
+            metadata: Some(serde_json::json!({ "exit_code": 0 })),
+        });
+        assert_eq!(reported_tool_exit_code(&zero), Some(0));
+
+        // Tools that report no exit code stay `None` — never synthesized from
+        // the success flag.
+        let no_metadata = Ok(ToolResult::error("failed"));
+        assert_eq!(reported_tool_exit_code(&no_metadata), None);
+
+        let null_code = Ok(ToolResult {
+            content: String::new(),
+            success: true,
+            metadata: Some(serde_json::json!({ "exit_code": serde_json::Value::Null })),
+        });
+        assert_eq!(reported_tool_exit_code(&null_code), None);
+
+        let wrong_type = Ok(ToolResult {
+            content: String::new(),
+            success: false,
+            metadata: Some(serde_json::json!({ "exit_code": "127" })),
+        });
+        assert_eq!(reported_tool_exit_code(&wrong_type), None);
+
+        // A Windows crash code does not fit in an `i32`, but it is a real code
+        // and a hook scoped to it must be able to see it.
+        let windows_crash = Ok(ToolResult {
+            content: String::new(),
+            success: false,
+            metadata: Some(serde_json::json!({ "exit_code": 3_221_225_477_i64 })),
+        });
+        assert_eq!(reported_tool_exit_code(&windows_crash), Some(3_221_225_477));
+
+        // A transport-level tool error has no metadata at all.
+        let errored: Result<ToolResult, ToolError> =
+            Err(ToolError::execution_failed("no such tool"));
+        assert_eq!(reported_tool_exit_code(&errored), None);
+        assert_eq!(reported_tool_status(&errored), None);
+
+        // A failed command reported as an error still carries its code and
+        // status.
+        let failed_command: Result<ToolResult, ToolError> =
+            Err(ToolError::execution_failed_with_metadata(
+                "Command exited with code 127",
+                serde_json::json!({ "exit_code": 127, "status": "Failed" }),
+            ));
+        assert_eq!(reported_tool_exit_code(&failed_command), Some(127));
+        assert_eq!(reported_tool_status(&failed_command), Some("failed"));
+
+        // A timeout has a status but no exit code; the code is not invented.
+        let timed_out: Result<ToolResult, ToolError> =
+            Err(ToolError::execution_failed_with_metadata(
+                "Command timed out after 1 seconds",
+                serde_json::json!({ "exit_code": null, "status": "TimedOut" }),
+            ));
+        assert_eq!(reported_tool_exit_code(&timed_out), None);
+        assert_eq!(reported_tool_status(&timed_out), Some("timed_out"));
+
+        // An unknown status string is not passed through.
+        let odd_status = Ok(ToolResult {
+            content: String::new(),
+            success: true,
+            metadata: Some(serde_json::json!({ "status": "$(boom)" })),
+        });
+        assert_eq!(reported_tool_status(&odd_status), None);
     }
 
     #[test]
@@ -5453,6 +5754,331 @@ command = "echo project"
             error,
             "turn_end observer hook dispatcher is unavailable; event was not submitted"
         );
+    }
+
+    /// #6689: `DEEPSEEK_TOOL_EXECUTION_RECEIPT` is read from the metadata a
+    /// shell tool recorded — on a failed call as well as a successful one —
+    /// and is complete JSON or absent. The existing variables do not change.
+    #[test]
+    fn execution_receipt_env_is_complete_json_or_absent() {
+        use crate::tools::spec::{ToolError, ToolResult};
+
+        let receipt = json!({"schema_version": 1, "command": "printf effective",
+            "cwd": "/tmp", "state": "completed", "scope": "local", "exit_code": 7,
+            "stdout": "\u{1f40b}", "stderr": "", "stdout_truncated": false,
+            "stderr_truncated": false, "output_kind": "separate"});
+        let plain = HookContext::new()
+            .with_tool_name("Bash")
+            .with_tool_outcome(&Ok(ToolResult::success("out")));
+        let legacy = plain.to_env_vars();
+        assert!(!legacy.contains_key("DEEPSEEK_TOOL_EXECUTION_RECEIPT"));
+
+        let with_receipt = HookContext::new()
+            .with_tool_name("Bash")
+            .with_tool_outcome(&Ok(
+                ToolResult::success("out").with_metadata(json!({"execution_receipt": receipt}))
+            ));
+        let mut env = with_receipt.to_env_vars();
+        let encoded = env
+            .remove("DEEPSEEK_TOOL_EXECUTION_RECEIPT")
+            .expect("receipt exported");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&encoded).unwrap(),
+            receipt
+        );
+        assert_eq!(env, legacy, "existing variables are unchanged");
+
+        let failed =
+            HookContext::new().with_tool_outcome(&Err(ToolError::execution_failed_with_metadata(
+                "boom",
+                json!({"exit_code": 7, "execution_receipt": receipt}),
+            )));
+        assert!(
+            failed
+                .to_env_vars()
+                .contains_key("DEEPSEEK_TOOL_EXECUTION_RECEIPT")
+        );
+
+        // An unknown schema or an oversized document is dropped, not cut.
+        for bad in [
+            json!({"schema_version": 2, "command": "x"}),
+            json!({"command": "x"}),
+            json!({"schema_version": 1,
+                "stdout": "x".repeat(super::HOOK_EXECUTION_RECEIPT_MAX_BYTES)}),
+        ] {
+            let context = HookContext::new().with_tool_outcome(&Ok(
+                ToolResult::success("out").with_metadata(json!({"execution_receipt": bad}))
+            ));
+            assert!(context.tool_execution_receipt.is_none());
+        }
+        let oversized = HookContext {
+            tool_execution_receipt: Some("x".repeat(super::HOOK_EXECUTION_RECEIPT_MAX_BYTES + 1)),
+            ..HookContext::new()
+        };
+        assert!(
+            !oversized
+                .to_env_vars()
+                .contains_key("DEEPSEEK_TOOL_EXECUTION_RECEIPT")
+        );
+        assert!(
+            oversized
+                .bounded_for_observer()
+                .tool_execution_receipt
+                .is_none()
+        );
+    }
+
+    fn shell_receipt_context() -> HookContext {
+        HookContext::new()
+            .with_tool_name("Bash")
+            .with_session_id("session-receipt")
+            .with_tool_call_id("call-receipt")
+            .with_tool_args(&json!({"command": "requested, not executed", "cwd": "/wrong"}))
+            .with_tool_outcome(&Ok(crate::tools::spec::ToolResult::success("preview")
+                .with_metadata(json!({
+                    "status": "Failed",
+                    "exit_code": 7,
+                    "execution_receipt": {
+                        "schema_version": 1, "command": "printf effective; exit 7",
+                        "cwd": std::env::temp_dir().to_str().unwrap(), "scope": "local",
+                        "state": "completed", "exit_code": 7, "stdout": "effective",
+                        "stderr": "diagnostic", "stdout_truncated": false,
+                        "stderr_truncated": true, "output_kind": "separate"
+                    }
+                }))))
+    }
+
+    #[test]
+    fn tool_after_stdin_uses_execution_evidence_and_truthful_bounds() {
+        let mut context = shell_receipt_context();
+        let original_env = context.to_env_vars();
+        for name in ["bash", "Bash", "exec_shell"] {
+            context.tool_name = Some(name.into());
+            let payload = context.tool_after_payload().unwrap();
+            assert_eq!(payload["schema_version"], 1);
+            assert_eq!(payload["event"], "tool_call_after");
+            assert_eq!(payload["tool_name"], name);
+            let receipt = &payload["execution_receipt"];
+            assert_eq!(receipt["command"], "printf effective; exit 7");
+            assert_eq!(receipt["cwd"], std::env::temp_dir().to_str().unwrap());
+            assert_eq!(receipt["completion"], "failed");
+            assert_eq!(receipt["execution"], "started");
+            assert_eq!(receipt["exit_code"], 7);
+            assert_eq!(receipt["stderr_truncated"], true);
+            assert_eq!(receipt["command_truncated"], false);
+            assert_eq!(receipt["cwd_truncated"], false);
+            assert_eq!(payload["session_id_truncated"], false);
+            assert_eq!(payload["tool_call_id_truncated"], false);
+            assert_eq!(payload["tool_name_truncated"], false);
+        }
+        context.tool_name = Some("Bash".into());
+        assert_eq!(
+            context.to_env_vars(),
+            original_env,
+            "legacy receipt is unchanged"
+        );
+        context.session_id = Some("用户\u{1}".repeat(20_000));
+        context.tool_call_id = Some("鲸鱼".repeat(20_000));
+        let payload = context.tool_after_payload().unwrap();
+        assert_eq!(payload["session_id_truncated"], true);
+        assert_eq!(payload["tool_call_id_truncated"], true);
+        assert!(payload["session_id"].as_str().unwrap().len() <= 1_024 + 16);
+        assert!(serde_json::to_vec(&payload).unwrap().len() <= 64 * 1024);
+
+        for (completion, code) in [
+            ("killed", json!(null)),
+            ("timed_out", json!(null)),
+            ("failed", json!(3_221_225_477_i64)),
+            ("completed", json!(0)),
+        ] {
+            context.tool_status = Some(completion.into());
+            let mut receipt: serde_json::Value =
+                serde_json::from_str(context.tool_execution_receipt.as_deref().unwrap()).unwrap();
+            receipt["exit_code"] = code.clone();
+            context.tool_execution_receipt = Some(receipt.to_string());
+            let payload = context.tool_after_payload().unwrap();
+            assert_eq!(payload["execution_receipt"]["exit_code"], code);
+            assert_eq!(payload["execution_receipt"]["completion"], completion);
+        }
+    }
+
+    #[test]
+    fn tool_after_stdin_has_no_receipt_for_unknown_or_unsupported_execution() {
+        for name in ["mcp_shell", "task", "BASH"] {
+            assert!(
+                shell_receipt_context()
+                    .with_tool_name(name)
+                    .tool_after_payload()
+                    .is_none()
+            );
+        }
+        for status in [None, Some("running"), Some("unknown")] {
+            let mut context = shell_receipt_context();
+            context.tool_status = status.map(str::to_owned);
+            assert!(context.tool_after_payload().is_none());
+        }
+        for receipt in [
+            None,
+            Some("not JSON".into()),
+            Some("x".repeat(HOOK_EXECUTION_RECEIPT_MAX_BYTES + 1)),
+        ] {
+            let mut context = shell_receipt_context();
+            context.tool_execution_receipt = receipt;
+            assert!(context.tool_after_payload().is_none());
+        }
+        for (field, value) in [
+            ("schema_version", json!(2)),
+            ("scope", json!("remote")),
+            ("state", json!("running")),
+            ("command", json!("")),
+            ("cwd", json!("relative")),
+            ("exit_code", json!("0")),
+            ("stdout_truncated", json!(null)),
+            ("output_kind", json!("guessed")),
+            ("output_kind", json!("combined")),
+        ] {
+            let mut context = shell_receipt_context();
+            let mut receipt: serde_json::Value =
+                serde_json::from_str(context.tool_execution_receipt.as_deref().unwrap()).unwrap();
+            receipt[field] = value;
+            context.tool_execution_receipt = Some(receipt.to_string());
+            assert!(
+                context.tool_after_payload().is_none(),
+                "accepted invalid {field}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tool_after_stdin_delivers_real_shell_receipt_to_direct_and_queued_observers() {
+        use crate::tools::spec::ToolSpec;
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("payload.json");
+        let command = write_hook_script(
+            &dir,
+            "capture.sh",
+            &format!(
+                "#!/bin/sh\ncat > '{}'\nprintf '%s' '{{\"decision\":\"deny\",\"updatedInput\":{{\"command\":\"false\"}}}}'\n",
+                out.display()
+            ),
+        );
+        for background in [false, true] {
+            for queued in [false, true] {
+                let mut hook = Hook::new(HookEvent::ToolCallAfter, &command);
+                hook.background = background;
+                let hooks = HookExecutor::new(
+                    HooksConfig {
+                        enabled: true,
+                        hooks: vec![hook],
+                        ..Default::default()
+                    },
+                    dir.path().to_owned(),
+                );
+                let mut tool_context = crate::tools::spec::ToolContext::new(dir.path())
+                    .with_elevated_sandbox_policy(crate::sandbox::SandboxPolicy::DangerFullAccess);
+                tool_context.auto_approve = true;
+                tool_context.runtime.hook_executor = Some(Arc::new(hooks.clone()));
+                let result = crate::tools::shell::BashTool::new("Bash")
+                    .execute(
+                        json!({"command": "printf actual; printf diagnostic >&2; exit 7"}),
+                        &tool_context,
+                    )
+                    .await;
+                let context = HookContext::new()
+                    .with_tool_name("Bash")
+                    .with_session_id("receipt-session")
+                    .with_tool_call_id("receipt-call")
+                    .with_tool_args(&json!({"command": "requested, not executed"}))
+                    .with_tool_outcome(&result);
+                if out.exists() {
+                    std::fs::remove_file(&out).unwrap();
+                }
+                if queued {
+                    hooks
+                        .submit_observer(HookEvent::ToolCallAfter, context)
+                        .unwrap();
+                } else {
+                    let results = hooks.execute(HookEvent::ToolCallAfter, &context);
+                    assert_eq!(results.len(), 1);
+                    assert!(results[0].success);
+                }
+                let payload: serde_json::Value =
+                    serde_json::from_str(&wait_for_captured_output(&out)).unwrap();
+                assert_eq!(payload["session_id"], "receipt-session");
+                assert_eq!(payload["tool_call_id"], "receipt-call");
+                let receipt = &payload["execution_receipt"];
+                assert_eq!(
+                    receipt["command"],
+                    "printf actual; printf diagnostic >&2; exit 7"
+                );
+                assert_eq!(
+                    receipt["cwd"],
+                    dir.path().canonicalize().unwrap().to_str().unwrap()
+                );
+                assert_eq!(receipt["exit_code"], 7);
+                assert_eq!(receipt["completion"], "failed");
+                assert_eq!(receipt["stdout"], "actual");
+                assert_eq!(receipt["stderr"], "diagnostic");
+                assert_eq!(receipt["output_mode"], "separate");
+                assert!(
+                    !result.as_ref().unwrap().success,
+                    "observer output cannot rewrite the settled call"
+                );
+            }
+        }
+    }
+
+    /// An absent receipt must be absent in the actual child environment,
+    /// even when a nested Codewhale inherited an outer hook's receipt.
+    #[cfg(unix)]
+    #[test]
+    fn execution_receipt_never_inherits_another_calls_environment() {
+        let _env = lock_test_env();
+        let _stale = EnvVarGuard::set("DEEPSEEK_TOOL_EXECUTION_RECEIPT", "stale-outer-receipt");
+        let current = r#"{"schema_version":1,"command":"current call"}"#;
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("receipt-env.txt");
+        let command = write_hook_script(
+            &dir,
+            "capture_receipt_env.sh",
+            &format!(
+                "#!/bin/sh\nprintf '%s' \"${{DEEPSEEK_TOOL_EXECUTION_RECEIPT-unset}}\" > {}\n",
+                out.display()
+            ),
+        );
+        for background in [false, true] {
+            let mut hook = Hook::new(HookEvent::ToolCallAfter, &command);
+            hook.background = background;
+            let executor = HookExecutor::new(
+                HooksConfig {
+                    enabled: true,
+                    hooks: vec![hook],
+                    ..HooksConfig::default()
+                },
+                dir.path().to_path_buf(),
+            );
+            for (receipt, expected) in [
+                (None, "unset"),
+                (
+                    Some("x".repeat(HOOK_EXECUTION_RECEIPT_MAX_BYTES + 1)),
+                    "unset",
+                ),
+                (Some(current.to_string()), current),
+            ] {
+                if out.exists() {
+                    std::fs::remove_file(&out).unwrap();
+                }
+                let context = HookContext {
+                    tool_execution_receipt: receipt,
+                    ..HookContext::new()
+                };
+                let results = executor.execute(HookEvent::ToolCallAfter, &context);
+                assert_eq!(results.len(), 1);
+                assert!(results[0].success);
+                assert_eq!(wait_for_captured_output(&out), expected);
+            }
+        }
     }
 
     #[test]

@@ -10,15 +10,14 @@ use crate::work_graph::ReasoningEffortTier;
 /// Reasoning-effort tier, mirrored across DeepSeek and Codex effort pickers.
 ///
 /// The config file accepts every supported string value for forward-compat with
-/// providers that expose the full spectrum; DeepSeek currently collapses
-/// `Low`/`Medium` → `high`. OpenAI Codex normalizes inherited DeepSeek-only
+/// providers that expose the full spectrum; first-party DeepSeek routes send
+/// `low`/`high`/`max`, so `Minimal` → `low`, `Medium`/`XHigh` → `high`, and
+/// `Ultra` → `max`. OpenAI Codex normalizes inherited DeepSeek-only
 /// `Off` to `Low` and keeps `XHigh`, `Max`, and `Ultra` distinct at the
 /// provider boundary. The default keyboard cycler walks the three DeepSeek-distinct
 /// tiers: `Off` → `High` → `Max` → `Off`; provider-aware callers should use
-/// [`ReasoningEffort::cycle_next_in`] with the route's effort list. Auto
-/// routing has no concrete provider yet, so
-/// [`ReasoningEffort::cycle_next_for_auto_model`] retains the full
-/// provider-neutral preference vocabulary until dispatch.
+/// [`ReasoningEffort::cycle_next_in`] with the route's picker ladder
+/// (`picker_efforts_for_route`), which also covers Auto routing.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum ReasoningEffort {
     Off,
@@ -262,11 +261,14 @@ impl ReasoningEffort {
         // First-party DeepSeek routes document `reasoning_effort` low/high/max
         // on the wire (no medium), so `low` is a real, cheaper tier there and
         // must reach the wire as low; `medium` rounds up to high because the
-        // dialect has no such value (#52).
+        // dialect has no such value (#52). `minimal`, `xhigh`, and `ultra`
+        // collapse exactly as `client::deepseek_effort` sends them, so the
+        // effective tier names what the wire receives (#6650).
         if matches!(provider, ApiProvider::Deepseek | ApiProvider::DeepseekCN) {
             return match normalized {
-                Self::Low => Self::Low,
-                Self::Medium => Self::High,
+                Self::Minimal => Self::Low,
+                Self::Medium | Self::XHigh => Self::High,
+                Self::Ultra => Self::Max,
                 other => other,
             };
         }
@@ -307,12 +309,14 @@ impl ReasoningEffort {
     pub fn catalog_effort_values(provider: ApiProvider, wire_model: &str) -> Option<Vec<Self>> {
         let offering = crate::provider_lake::catalog_offering_for_model(provider, wire_model)?;
         let mut efforts = Vec::new();
+        let mut has_toggle = false;
         for option in &offering.reasoning_options {
-            if !option
-                .get("type")
-                .and_then(|value| value.as_str())
-                .is_some_and(|kind| kind.eq_ignore_ascii_case("effort"))
-            {
+            let kind = option.get("type").and_then(|value| value.as_str());
+            if kind.is_some_and(|kind| kind.eq_ignore_ascii_case("toggle")) {
+                has_toggle = true;
+                continue;
+            }
+            if !kind.is_some_and(|kind| kind.eq_ignore_ascii_case("effort")) {
                 continue;
             }
             let Some(values) = option.get("values").and_then(|value| value.as_array()) else {
@@ -325,6 +329,11 @@ impl ReasoningEffort {
                     efforts.push(effort);
                 }
             }
+        }
+        // A Models.dev `toggle` beside an effort ladder means reasoning can also
+        // be switched off (#6396); an explicit off must not round up.
+        if has_toggle && !efforts.is_empty() && !efforts.contains(&Self::Off) {
+            efforts.insert(0, Self::Off);
         }
         (!efforts.is_empty()).then_some(efforts)
     }
@@ -499,23 +508,6 @@ impl ReasoningEffort {
     fn index_in(self, efforts: &[Self]) -> Option<usize> {
         efforts.iter().position(|&effort| effort == self)
     }
-
-    /// Cycle the unresolved auto-model preference without applying any
-    /// provider's normalization rules prematurely.
-    #[must_use]
-    pub fn cycle_next_for_auto_model(self) -> Self {
-        match self {
-            Self::Auto => Self::Off,
-            Self::Off => Self::Minimal,
-            Self::Minimal => Self::Low,
-            Self::Low => Self::Medium,
-            Self::Medium => Self::High,
-            Self::High => Self::XHigh,
-            Self::XHigh => Self::Ultra,
-            Self::Ultra => Self::Max,
-            Self::Max => Self::Auto,
-        }
-    }
 }
 
 #[cfg(test)]
@@ -621,21 +613,5 @@ mod tests {
         assert_eq!(XHigh.cycle_next_in(&capped), Off);
         // An empty ladder falls back to the provider-neutral cycle.
         assert_eq!(Off.cycle_next_in(&[]), Off.cycle_next());
-    }
-
-    #[test]
-    fn reasoning_effort_cycle_for_auto_model_walks_the_full_vocabulary() {
-        use ReasoningEffort::*;
-        let mut effort = Auto;
-        let mut seen = vec![effort];
-        for _ in 0..8 {
-            effort = effort.cycle_next_for_auto_model();
-            seen.push(effort);
-        }
-        assert_eq!(
-            seen,
-            vec![Auto, Off, Minimal, Low, Medium, High, XHigh, Ultra, Max]
-        );
-        assert_eq!(Max.cycle_next_for_auto_model(), Auto);
     }
 }

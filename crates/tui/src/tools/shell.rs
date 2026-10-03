@@ -206,6 +206,12 @@ pub struct ShellJobSnapshot {
     pub command: String,
     pub cwd: PathBuf,
     pub status: ShellStatus,
+    /// Explicitly backgrounded or detached from the foreground waiter.
+    #[serde(default)]
+    pub background: bool,
+    /// First observed terminal time; legacy snapshots cannot trigger notices.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<chrono::DateTime<chrono::Utc>>,
     pub exit_code: Option<i64>,
     pub elapsed_ms: u64,
     pub stdout_tail: String,
@@ -519,21 +525,94 @@ fn terminate_child_process_group(child: &mut Child) -> std::io::Result<()> {
 #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 fn install_parent_death_signal(cmd: &mut Command) {
     use std::os::unix::process::CommandExt;
+    // Captured before the fork so the child can tell whether the TUI already
+    // died in the fork→prctl window, where the signal would never arrive.
+    let parent_pid = std::process::id() as libc::pid_t;
     // SAFETY: `pre_exec` runs in the child between fork and exec. The closure
-    // only calls `libc::prctl` with stack-allocated constant arguments and
-    // does not touch heap memory or the parent's locks. Both requirements
-    // (async-signal-safe + no allocation in the post-fork window) are met.
+    // only calls `libc::prctl` / `libc::getppid` with stack-allocated
+    // arguments and does not touch heap memory or the parent's locks. Both
+    // requirements (async-signal-safe + no allocation in the post-fork
+    // window) are met.
     unsafe {
-        cmd.pre_exec(|| {
+        cmd.pre_exec(move || {
             let result = libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM, 0, 0, 0);
             if result == -1 {
                 // Surface the errno but do not abort the spawn — the child
                 // will simply lose the parent-death cleanup safety net.
-                Err(std::io::Error::last_os_error())
-            } else {
-                Ok(())
+                return Err(std::io::Error::last_os_error());
             }
+            if libc::getppid() != parent_pid {
+                // The TUI exited before the signal was armed: do not exec an
+                // orphan nobody will ever reap.
+                return Err(std::io::Error::from_raw_os_error(libc::ESRCH));
+            }
+            Ok(())
         });
+    }
+}
+
+/// Watcher script for [`watch_process_group_for_parent_death`]. `$1` is the
+/// process group id. The outer `sh` only forks the watcher and exits, so the
+/// watcher is reparented away from the TUI and never needs reaping. The
+/// watcher blocks reading the pipe the TUI holds the other end of: the read
+/// ends at EOF when every write end closes, which happens however the TUI
+/// dies. It then SIGTERMs the group, waits briefly and SIGKILLs it. It sits in
+/// the job's own process group, so the group id cannot be reused while it
+/// waits, and the TUI's normal group kills take it down with the job.
+#[cfg(unix)]
+const PROCESS_GROUP_WATCHER_SCRIPT: &str = r#"exec 3<&0
+(
+  trap '' TERM
+  read -r _ <&3 || {
+    kill -TERM -"$1" 2>/dev/null
+    sleep 2
+    kill -KILL -"$1" 2>/dev/null
+  }
+) >/dev/null 2>&1 &"#;
+
+/// Kill a `Managed` background shell's whole process group when the TUI dies
+/// (#6654).
+///
+/// `PR_SET_PDEATHSIG` is not enough here: it signals only the direct child
+/// (the `sh -c` wrapper), a fork clears it in grandchildren, so a command that
+/// does not `exec` its last step (`cd app && npm run dev; echo done`,
+/// `a | b`) keeps its real workload alive; it also fires when the forking
+/// *thread* exits, and background spawns run on threads that retire. So a
+/// small watcher joins the job's process group and blocks on a pipe whose
+/// write end only the TUI holds (it is close-on-exec, so no child inherits
+/// it). The returned write end lives in the `BackgroundShell`; closing it —
+/// by dropping the shell or by the TUI dying in any way, SIGKILL included —
+/// makes the watcher terminate the group. This works on Linux and macOS alike.
+///
+/// Best effort: if the watcher cannot start, the job still runs, just
+/// without this cleanup. A TUI that dies between the job spawn and the
+/// watcher spawn also leaves the job running.
+#[cfg(unix)]
+fn watch_process_group_for_parent_death(
+    process_group_id: u32,
+) -> std::io::Result<std::io::PipeWriter> {
+    let (reader, writer) = std::io::pipe()?;
+    let pgid = i32::try_from(process_group_id)
+        .map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?;
+    let mut cmd = Command::new("/bin/sh");
+    cmd.args([
+        "-c",
+        PROCESS_GROUP_WATCHER_SCRIPT,
+        "codewhale-bg-watch",
+        &process_group_id.to_string(),
+    ])
+    .stdin(Stdio::from(reader))
+    .stdout(Stdio::null())
+    .stderr(Stdio::null())
+    .process_group(pgid);
+    // The outer `sh` exits as soon as it has forked the watcher.
+    let status = cmd.spawn()?.wait()?;
+    if status.success() {
+        Ok(writer)
+    } else {
+        Err(std::io::Error::other(format!(
+            "process-group watcher exited with {status}"
+        )))
     }
 }
 
@@ -583,7 +662,16 @@ fn install_parent_death_signal(_cmd: &mut Command) {
     // No kernel-level equivalent on macOS / Windows. The cooperative
     // cancellation + process_group SIGKILL path covers normal shutdown;
     // abnormal exit (panic without unwind, SIGKILL of the TUI) can still
-    // leak children on those platforms — tracked as a follow-up.
+    // leak children on those platforms — tracked as a follow-up. Pipe-backed
+    // background shells are covered on every platform: Unix by the
+    // process-group watcher (`watch_process_group_for_parent_death`), Windows
+    // by their KILL_ON_JOB_CLOSE job object.
+    //
+    // Known limitations on every platform (#6654): `tty: true` background
+    // shells spawn through `portable_pty`, which never goes through
+    // `std::process::Command`, so they get no watcher (or job object); and
+    // staged persistent services (`persist_pending`) stay deliberately
+    // unwatched because the user can take ownership of the service.
 }
 
 #[cfg(windows)]
@@ -994,12 +1082,14 @@ pub struct BackgroundShell {
     pub command: String,
     pub working_dir: PathBuf,
     pub status: ShellStatus,
+    background: bool,
     pub exit_code: Option<i64>,
     pub started_at: Instant,
     /// When the job reached a terminal status. A finished job reports the
     /// duration it finished with; without this, `started_at.elapsed()` kept
     /// growing and `/jobs` showed "2m 07s" for a 12-second command (#5478).
     finished_at: Option<Instant>,
+    finished_at_utc: Option<chrono::DateTime<chrono::Utc>>,
     last_output_at: Instant,
     last_observed_output_len: usize,
     pub sandbox_type: SandboxType,
@@ -1026,12 +1116,20 @@ pub struct BackgroundShell {
     child: Option<ShellChild>,
     #[cfg(windows)]
     windows_job: Option<WindowsJob>,
+    /// Write end of the process-group watcher's pipe for `Managed` shells;
+    /// closing it (drop, or the TUI dying) kills the job's group (#6654).
+    #[cfg(unix)]
+    #[allow(dead_code, reason = "held only so its Drop closes the pipe")]
+    parent_death_watch: Option<std::io::PipeWriter>,
     stdout_thread: Option<std::thread::JoinHandle<()>>,
     stderr_thread: Option<std::thread::JoinHandle<()>>,
     work_lifecycle: Option<ShellWorkLifecycle>,
     lifecycle_seq: u64,
     last_lifecycle_status: Option<ShellStatus>,
     last_lifecycle_bytes: usize,
+    /// The terminal status came from a failed `try_wait`, not an observed
+    /// exit or signal. Such a run gets no execution receipt (#6689).
+    wait_failed: bool,
 }
 
 #[derive(Clone)]
@@ -1169,6 +1267,7 @@ impl BackgroundShell {
     fn mark_finished(&mut self) {
         if self.finished_at.is_none() && self.status != ShellStatus::Running {
             self.finished_at = Some(Instant::now());
+            self.finished_at_utc = Some(chrono::Utc::now());
         }
     }
 
@@ -1201,6 +1300,7 @@ impl BackgroundShell {
                 Ok(None) => false, // Still running
                 Err(_) => {
                     self.status = ShellStatus::Failed;
+                    self.wait_failed = true;
                     self.heavy_permit.take();
                     self.collect_output();
                     true
@@ -1412,23 +1512,34 @@ impl BackgroundShell {
     }
 
     fn take_delta(&mut self) -> (String, String, usize, usize, usize, usize) {
-        if let Some(snapshot) = self.bounded_output_snapshot(false).ok().flatten() {
-            let changed = snapshot.total_bytes != self.stdout_cursor;
-            self.stdout_cursor = snapshot.total_bytes;
-            if changed {
-                self.last_output_at = Instant::now();
-                self.last_observed_output_len = snapshot.total_bytes;
-                let delta_len = snapshot.content.len();
-                return (
-                    snapshot.content,
-                    String::new(),
-                    delta_len,
-                    0,
-                    snapshot.total_bytes,
-                    0,
-                );
+        // Only the bytes after the cursor: returning the whole retained tail
+        // made every `wait` poll repeat output the caller already holds.
+        let bounded_delta = self.bounded_output.as_ref().and_then(|output| {
+            let output = output.lock().unwrap_or_else(|error| error.into_inner());
+            let total = output.total_bytes();
+            output
+                .delta_since(self.stdout_cursor)
+                .ok()
+                .map(|delta| (delta, total))
+        });
+        if let Some(((mut delta, omitted), total_bytes)) = bounded_delta {
+            let delta_len = total_bytes.saturating_sub(self.stdout_cursor);
+            self.stdout_cursor = total_bytes;
+            if delta_len == 0 {
+                return (String::new(), String::new(), 0, 0, total_bytes, 0);
             }
-            return (String::new(), String::new(), 0, 0, snapshot.total_bytes, 0);
+            self.last_output_at = Instant::now();
+            self.last_observed_output_len = total_bytes;
+            if omitted > 0
+                && let Some(output) = self.bounded_output.as_ref()
+            {
+                let notice = output
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .omitted_notice(omitted);
+                delta.insert_str(0, &notice);
+            }
+            return (delta, String::new(), delta_len, 0, total_bytes, 0);
         }
         let (stdout_delta, stdout_total) =
             take_delta_from_buffer(&self.stdout_buffer, &mut self.stdout_cursor);
@@ -1600,15 +1711,21 @@ impl BackgroundShell {
             .unwrap_or((0, String::new()));
         let elapsed_since_output_ms = (self.status == ShellStatus::Running)
             .then(|| u64::try_from(self.last_output_at.elapsed().as_millis()).unwrap_or(u64::MAX));
-        let stale = elapsed_since_output_ms.is_some_and(|elapsed| {
-            elapsed >= u64::try_from(STALE_NO_OUTPUT_AFTER.as_millis()).unwrap_or(u64::MAX)
-        });
+        // A live PTY can wait indefinitely for input. Silence does not mean it
+        // lost its process owner; marking it stale hides its transport from API
+        // clients and incorrectly prevents reconnect/resize after one minute.
+        let stale = self.terminal_size.is_none()
+            && elapsed_since_output_ms.is_some_and(|elapsed| {
+                elapsed >= u64::try_from(STALE_NO_OUTPUT_AFTER.as_millis()).unwrap_or(u64::MAX)
+            });
         ShellJobSnapshot {
             id: self.id.clone(),
             job_id: self.id.clone(),
             command: self.command.clone(),
             cwd: self.working_dir.clone(),
             status: self.status.clone(),
+            background: self.background,
+            finished_at: self.finished_at_utc,
             exit_code: self.exit_code,
             elapsed_ms: self.wall_millis(),
             stdout_tail,
@@ -1889,9 +2006,11 @@ impl ShellManager {
                 command: String::new(),
                 working_dir: self.default_workspace.clone(),
                 status: ShellStatus::Completed,
+                background: true,
                 exit_code: Some(0),
                 started_at,
                 finished_at: Some(now),
+                finished_at_utc: Some(chrono::Utc::now()),
                 last_output_at: now,
                 last_observed_output_len: 0,
                 sandbox_type: SandboxType::None,
@@ -1915,12 +2034,15 @@ impl ShellManager {
                 child: None,
                 #[cfg(windows)]
                 windows_job: None,
+                #[cfg(unix)]
+                parent_death_watch: None,
                 stdout_thread: None,
                 stderr_thread: None,
                 work_lifecycle: None,
                 lifecycle_seq: 0,
                 last_lifecycle_status: None,
                 last_lifecycle_bytes: 0,
+                wait_failed: false,
             },
         );
     }
@@ -1964,6 +2086,23 @@ impl ShellManager {
         self.sandbox_manager.configured_sandbox()
     }
 
+    /// Prepare a program for a tool that runs workspace code outside
+    /// `exec_shell`, under the policy and sandbox configuration a shell
+    /// command would get in this session.
+    fn prepare_runner(
+        &self,
+        program: &str,
+        args: Vec<String>,
+        cwd: &Path,
+        timeout: Duration,
+        policy_override: Option<ExecutionSandboxPolicy>,
+    ) -> ExecEnv {
+        let policy = policy_override.unwrap_or_else(|| self.sandbox_policy.clone());
+        let spec =
+            CommandSpec::program(program, args, cwd.to_path_buf(), timeout).with_policy(policy);
+        self.sandbox_manager.prepare(&spec)
+    }
+
     /// Request that the active foreground shell wait detach and leave its
     /// process running in the background job table.
     pub fn request_foreground_background(&mut self) {
@@ -1979,9 +2118,12 @@ impl ShellManager {
         self.foreground_background_requested = false;
     }
 
-    fn take_foreground_background_request(&mut self) -> bool {
+    fn take_foreground_background_request(&mut self, task_id: &str) -> bool {
         let requested = self.foreground_background_requested;
         self.foreground_background_requested = false;
+        if requested && let Some(shell) = self.processes.get_mut(task_id) {
+            shell.background = true;
+        }
         requested
     }
 
@@ -2154,9 +2296,9 @@ impl ShellManager {
 
         // Create command spec and prepare sandboxed environment
         let spec = if let Some(workspace) = readonly_workspace {
-            if command.contains('|') {
-                let piped = hardened_readonly_pipeline(command, workspace)?;
-                CommandSpec::shell(&piped, work_dir.clone(), Duration::from_millis(timeout_ms))
+            if readonly_command_needs_shell(command) {
+                let script = hardened_readonly_script(command, workspace)?;
+                CommandSpec::shell(&script, work_dir.clone(), Duration::from_millis(timeout_ms))
             } else {
                 let (program, args) = hardened_readonly_argv(command)?;
                 let program = resolve_readonly_program(&program, workspace)?;
@@ -2276,9 +2418,14 @@ impl ShellManager {
         }
         install_parent_death_signal(&mut cmd);
 
-        if stdin_data.is_some() {
-            cmd.stdin(Stdio::piped());
-        }
+        // Without input, stdin is closed rather than inherited: an unexpected
+        // read (`cat`, a prompt) gets EOF instead of blocking on, or reading,
+        // the operator's terminal until the timeout.
+        cmd.stdin(if stdin_data.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        });
 
         child_env::apply_to_command(&mut cmd, child_env::string_map_env(&exec_env.env));
         remove_readonly_redirect_env(&mut cmd, &exec_env.env);
@@ -2562,6 +2709,8 @@ impl ShellManager {
 
         #[cfg(windows)]
         let mut windows_job = None;
+        #[cfg(unix)]
+        let mut parent_death_watch = None;
 
         #[cfg(not(target_env = "ohos"))]
         let mut pty_master = None;
@@ -2632,6 +2781,9 @@ impl ShellManager {
             {
                 cmd.process_group(0);
             }
+            // Deliberately no parent-death cleanup: a staged service can be
+            // handed to the user (`ShellOwnership::Released`) and must then
+            // outlive the TUI (#6654).
 
             child_env::apply_to_command(&mut cmd, child_env::string_map_env(&exec_env.env));
             remove_readonly_redirect_env(&mut cmd, &exec_env.env);
@@ -2665,6 +2817,18 @@ impl ShellManager {
             let mut child = cmd
                 .spawn()
                 .with_context(|| format!("Failed to spawn background: {original_command}"))?;
+            // Managed children die with the TUI (#6654); unlike the
+            // persistent branch above, nobody can take ownership of them.
+            #[cfg(unix)]
+            {
+                parent_death_watch = watch_process_group_for_parent_death(child.id())
+                    .inspect_err(|err| {
+                        tracing::warn!(
+                            "background shell {task_id} has no parent-death cleanup: {err}"
+                        );
+                    })
+                    .ok();
+            }
             #[cfg(windows)]
             {
                 windows_job = attach_windows_job(&child, original_command);
@@ -2717,9 +2881,11 @@ impl ShellManager {
             command: original_command.to_string(),
             working_dir: working_dir.to_path_buf(),
             status: ShellStatus::Running,
+            background: true,
             exit_code: None,
             started_at: started,
             finished_at: None,
+            finished_at_utc: None,
             last_output_at: started,
             last_observed_output_len: 0,
             sandbox_type,
@@ -2747,12 +2913,15 @@ impl ShellManager {
             child: Some(child),
             #[cfg(windows)]
             windows_job,
+            #[cfg(unix)]
+            parent_death_watch,
             stdout_thread,
             stderr_thread,
             work_lifecycle,
             lifecycle_seq: 0,
             last_lifecycle_status: None,
             last_lifecycle_bytes: 0,
+            wait_failed: false,
         };
 
         #[cfg(unix)]
@@ -3481,6 +3650,8 @@ impl ShellManager {
                 command: command.into(),
                 cwd,
                 status: ShellStatus::Killed,
+                background: true,
+                finished_at: None,
                 exit_code: None,
                 elapsed_ms: 0,
                 stdout_tail: String::new(),
@@ -3506,13 +3677,21 @@ impl ShellManager {
     /// Age alone is not a bound: it only fired from `list_jobs()`, so a session
     /// that never opened the jobs panel evicted nothing, and 500 finished
     /// records inside one hour were all retained regardless of size (#5472).
+    ///
+    /// Age counts from when a job finished, not when it started: a job that
+    /// ran longer than `max_age` would otherwise be dropped the moment it
+    /// exited, before its completion was delivered. Undelivered completions
+    /// age out too: jobs launched over the Runtime API, or owned by a session
+    /// that is no longer active, are never drained.
     pub fn cleanup(&mut self, max_age: Duration) {
         self.processes.retain(|_, shell| {
             if shell.status == ShellStatus::Running {
-                true
-            } else {
-                shell.started_at.elapsed() < max_age
+                return true;
             }
+            shell.mark_finished();
+            shell
+                .finished_at
+                .is_none_or(|finished| finished.elapsed() < max_age)
         });
         self.enforce_finished_job_bounds();
     }
@@ -3545,7 +3724,8 @@ impl ShellManager {
                 (
                     id.clone(),
                     shell.completion_reported,
-                    shell.started_at,
+                    // Oldest by finish, like the age rule in `cleanup`.
+                    shell.finished_at.unwrap_or(shell.started_at),
                     shell.retained_output_bytes(),
                 )
             })
@@ -3604,8 +3784,9 @@ use crate::tools::spec::{
 };
 use async_trait::async_trait;
 use codewhale_execpolicy::command_safety::{
-    SafetyLevel, analyze_command, extract_primary_command, is_agent_readonly_shell_command,
-    is_github_readonly_command, is_parallel_readonly_command, normalize_windows_command_paths,
+    NetworkRead, ReadonlyRejection, SafetyLevel, agent_readonly_verdict, analyze_command,
+    extract_primary_command, is_parallel_readonly_command, normalize_windows_command_paths,
+    readonly_network_reads, split_leading_cd,
 };
 use codewhale_execpolicy::toml_rules::{ExecPolicyConfig, RuleDecision};
 use serde_json::json;
@@ -3946,29 +4127,37 @@ fn require_no_nul<'a>(value: &'a str, field: &str) -> Result<&'a str, ToolError>
     Ok(value)
 }
 
-fn enforce_readonly_github_network_policy(
-    command: &str,
-    context: &ToolContext,
-) -> Result<(), ToolError> {
-    if !is_github_readonly_command(command) {
-        return Ok(());
-    }
+/// Apply the network policy to every network read inside a read-only
+/// command, segment by segment, so a pipeline or chain cannot hide one.
+/// A full shell keeps its historical scope here: only a lone `gh` read is
+/// judged, because its other network use is governed elsewhere.
+fn enforce_readonly_network_reads(command: &str, context: &ToolContext) -> Result<(), ToolError> {
     let Some(decider) = context.network_policy.as_ref() else {
         return Ok(());
     };
-
-    use crate::network_policy::Decision;
-    match decider.evaluate("api.github.com", "Bash") {
-        Decision::Allow => Ok(()),
-        Decision::Deny => Err(ToolError::permission_denied(
-            "Read-only GitHub CLI access to 'api.github.com' is blocked by the active network policy."
-                .to_string(),
-        )),
-        Decision::Prompt => Err(ToolError::permission_denied(
-            "Read-only GitHub CLI access to 'api.github.com' requires network approval; allow that host in the parent session or network policy before dispatching the scout."
-                .to_string(),
-        )),
+    let mut reads = readonly_network_reads(command);
+    if context.shell_policy != ShellPolicy::ReadOnly {
+        let lone = agent_readonly_verdict(command).is_ok_and(|segments| segments.len() == 1);
+        reads.retain(|read| lone && *read == NetworkRead::GitHub);
     }
+    use crate::network_policy::Decision;
+    for read in reads {
+        let host = read.host();
+        match decider.evaluate(host, "Bash") {
+            Decision::Allow => {}
+            Decision::Deny => {
+                return Err(ToolError::permission_denied(format!(
+                    "Read-only network access to '{host}' is blocked by the active network policy."
+                )));
+            }
+            Decision::Prompt => {
+                return Err(ToolError::permission_denied(format!(
+                    "Read-only network access to '{host}' requires network approval; allow that host in the parent session or network policy first."
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// This is a request for mandatory filesystem/network isolation, not a claim
@@ -4004,6 +4193,59 @@ fn is_native_readonly_sandbox(sandbox_type: SandboxType) -> bool {
     }
 }
 
+/// Build the child for a tool that runs workspace code outside `exec_shell`
+/// (gate commands, the cargo test runner). It gets exactly the confinement a
+/// shell command gets in this session: the same policy, the same OS sandbox
+/// wrapper, and the sanitized child environment. Callers keep their own
+/// process-tree containment, timeout and cancellation.
+///
+/// Known limitations: where the platform has no enforcing sandbox configured
+/// (Linux without bubblewrap, Windows) a workspace-write policy runs
+/// unsandboxed, as it does for `exec_shell`; a read-only policy refuses there.
+/// A session whose commands run in an external sandbox backend cannot run
+/// these local children at all.
+pub(crate) fn sandboxed_runner_command(
+    context: &crate::tools::spec::ToolContext,
+    program: &str,
+    args: Vec<String>,
+    cwd: &Path,
+    timeout: Duration,
+) -> std::result::Result<tokio::process::Command, crate::tools::spec::ToolError> {
+    use crate::tools::spec::ToolError;
+    if context.sandbox_backend.is_some() {
+        return Err(ToolError::not_available(
+            "this tool starts a local process, and this session runs commands in an external sandbox; run the command through the shell tool instead",
+        ));
+    }
+    let exec_env = context
+        .shell_manager
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .prepare_runner(
+            program,
+            args,
+            cwd,
+            timeout,
+            context.elevated_sandbox_policy.clone(),
+        );
+    if matches!(exec_env.policy, ExecutionSandboxPolicy::ReadOnly) {
+        require_native_readonly_execution(&exec_env)
+            .map_err(|error| ToolError::permission_denied(error.to_string()))?;
+    }
+    let mut cmd = tokio::process::Command::new(exec_env.program());
+    crate::utils::suppress_tokio_console_window(&mut cmd);
+    cmd.args(exec_env.args())
+        .current_dir(&exec_env.cwd)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    // Workspace code never inherits parent credentials.
+    crate::child_env::apply_to_tokio_command(
+        &mut cmd,
+        crate::child_env::string_map_env(&exec_env.env),
+    );
+    Ok(cmd)
+}
+
 fn require_native_readonly_execution(exec_env: &ExecEnv) -> Result<()> {
     if matches!(exec_env.policy, ExecutionSandboxPolicy::ReadOnly)
         && is_native_readonly_sandbox(exec_env.sandbox_type)
@@ -4018,37 +4260,113 @@ fn require_native_readonly_execution(exec_env: &ExecEnv) -> Result<()> {
 
 /// `exec_shell_input_is_parallel_readonly` with the agent-posture classifier:
 /// same input-shape restrictions (run action only, no background/tty/stdin),
-/// but commands are judged by [`is_agent_readonly_shell_command`] so
+/// but commands are judged by
+/// [`codewhale_execpolicy::command_safety::agent_readonly_verdict`] so
 /// `ShellPolicy::ReadOnly` agents keep a usable inspection surface
-/// (pipelines, globs, `git -C`, `find`, `sed -n`, `npm view`).
-fn exec_shell_input_agent_readonly(input: &serde_json::Value) -> bool {
+/// (pipelines and chains of reads, globs, `git -C`, `find`, `sed -n`,
+/// `npm view`). Callers pass input already through [`normalize_readonly_cd`].
+fn exec_shell_input_agent_readonly_verdict(
+    input: &serde_json::Value,
+) -> Result<(), ReadonlyRejection> {
     if enforced_readonly_input(input) {
-        return true;
+        return Ok(());
     }
     if !exec_shell_input_is_parallel_readonly_shape(input) {
-        return false;
+        return Err(ReadonlyRejection::new(
+            "shape",
+            "read-only shell accepts only a foreground `command` with optional `cwd` and timeout; background, stdin, interactive and TTY modes are not admitted",
+        ));
     }
     let command = input
         .get("command")
         .and_then(serde_json::Value::as_str)
         .expect("shape check established a command string");
-    is_agent_readonly_shell_command(command)
+    agent_readonly_verdict(command).map(|_| ())
 }
 
-/// `exec_shell_input_agent_readonly` is also the gate-side predicate for the
+/// Move a leading `cd <dir> &&` into the `cwd` field, resolved against any
+/// `cwd` already present, so no gate has to interpret `cd`: the ordinary
+/// working-directory workspace check then judges the directory, and every
+/// gate and the executor see the same rewritten input. Only the shape
+/// [`split_leading_cd`] accepts is rewritten; `read_only: true` input runs
+/// its command unchanged under the enforced lane.
+pub(crate) fn normalize_readonly_cd(input: &serde_json::Value) -> serde_json::Value {
+    let mut input = input.clone();
+    if enforced_readonly_input(&input) {
+        return input;
+    }
+    // Bounded: each pass removes one leading `cd`.
+    for _ in 0..4 {
+        let Some((dir, rest)) = input
+            .get("command")
+            .and_then(serde_json::Value::as_str)
+            .and_then(split_leading_cd)
+        else {
+            break;
+        };
+        let cwd = match input.get("cwd") {
+            None | Some(serde_json::Value::Null) => dir,
+            Some(serde_json::Value::String(existing)) => std::path::Path::new(existing)
+                .join(&dir)
+                .to_string_lossy()
+                .into_owned(),
+            // A wrong type is reported by the executor's own type check.
+            Some(_) => break,
+        };
+        input["command"] = json!(rest);
+        input["cwd"] = json!(cwd);
+    }
+    input
+}
+
+/// The refusal a read-only agent sees, shared by every gate that judges the
+/// agent grammar (subagent posture, durable authority, and the executor), so
+/// the rule text is byte-identical wherever a command is refused. The next
+/// steps name only tools such an agent has.
+pub(crate) fn readonly_refusal(rejection: &ReadonlyRejection, enforced_lane: bool) -> String {
+    let lane = if enforced_lane {
+        ", rerun it with `read_only: true` to run it in an enforced read-only sandbox"
+    } else {
+        ""
+    };
+    format!(
+        "{rejection}. Next: use admitted reads only (the shell tool description lists the grammar), read or search files with the File tool{lane}, or, if the probe is essential, return your findings and the blocked probe to the parent."
+    )
+}
+
+/// Whether `read_only: true` can run here: a native enforcing sandbox and
+/// no external backend.
+pub(crate) fn readonly_enforced_lane_available(context: &ToolContext) -> bool {
+    context.sandbox_backend.is_none()
+        && context.shell_manager.lock().is_ok_and(|manager| {
+            manager
+                .configured_sandbox_type()
+                .is_some_and(is_native_readonly_sandbox)
+        })
+}
+
+/// `exec_shell_input_agent_readonly_verdict` is also the gate-side predicate for the
 /// subagent posture check (#5426): the catalog carve-out that admits
 /// canonical `bash` to Scout/Reviewer/Planner must judge the same call the
 /// `BashTool::execute` `ShellPolicy::ReadOnly` branch will judge, so the
 /// posture gate can admit a proven-readonly call without ever widening past
 /// the execute-time refusal.
 pub(crate) fn agent_readonly_bash_input(input: &serde_json::Value) -> bool {
+    agent_readonly_bash_verdict(input).is_ok()
+}
+
+/// [`agent_readonly_bash_input`] with the rule that refused the call.
+pub(crate) fn agent_readonly_bash_verdict(
+    input: &serde_json::Value,
+) -> Result<(), ReadonlyRejection> {
     // Canonical lowercase `bash` advertises `timeout` in seconds, while the
     // internal executor contract uses `timeout_ms`. Normalize through the same
     // translator the concrete tool uses so posture, session approval, envelope,
     // and execute judge one input (#5595). Legacy/internal shapes fall back to
-    // their existing direct classification.
+    // their existing direct classification. A leading `cd` is then moved into
+    // `cwd` exactly as `BashTool::execute` does.
     let translated = contract_bash_legacy_input(input).unwrap_or_else(|_| input.clone());
-    exec_shell_input_agent_readonly(&translated)
+    exec_shell_input_agent_readonly_verdict(&normalize_readonly_cd(&translated))
 }
 
 fn exec_shell_input_is_parallel_readonly(input: &serde_json::Value) -> bool {
@@ -4110,7 +4428,15 @@ fn exec_shell_input_is_parallel_readonly_shape(input: &serde_json::Value) -> boo
         .is_some()
 }
 
-fn hardened_readonly_pipeline(command: &str, workspace: &std::path::Path) -> Result<String> {
+/// Whether a classifier-approved read needs a shell to join its segments or
+/// apply an admitted redirect; a lone plain command runs as direct argv.
+fn readonly_command_needs_shell(command: &str) -> bool {
+    agent_readonly_verdict(command).map_or(true, |segments| {
+        segments.len() > 1 || segments.iter().any(|segment| !segment.redirects.is_empty())
+    })
+}
+
+fn hardened_readonly_script(command: &str, workspace: &std::path::Path) -> Result<String> {
     use crate::shell_dispatcher::ShellKind;
     // POSIX quoting must never be passed to a different command interpreter.
     let supported = match crate::shell_dispatcher::global_dispatcher().kind() {
@@ -4125,32 +4451,35 @@ fn hardened_readonly_pipeline(command: &str, workspace: &std::path::Path) -> Res
     };
     if !supported {
         return Err(anyhow!(
-            "read-only pipelines require bash or zsh; run each read separately"
+            "read-only pipelines and chains require bash or zsh; run each read separately"
         ));
     }
-    if !is_agent_readonly_shell_command(command) {
-        return Err(anyhow!(
-            "pipeline contains a command outside the read-only policy"
-        ));
+    let segments = agent_readonly_verdict(command)
+        .map_err(|rejection| anyhow!("command is outside the read-only policy: {rejection}"))?;
+    let mut script = String::from("set -o pipefail;");
+    for segment in &segments {
+        let (program, args) = hardened_readonly_argv(&segment.command)?;
+        let program = resolve_readonly_program(&program, workspace)?;
+        let program = program
+            .to_str()
+            .ok_or_else(|| anyhow!("read-only executable path is not valid UTF-8"))?;
+        for word in std::iter::once(program).chain(args.iter().map(String::as_str)) {
+            script.push(' ');
+            script.push_str(&shell_words::quote(word));
+        }
+        for redirect in &segment.redirects {
+            script.push(' ');
+            script.push_str(redirect);
+        }
+        if let Some(join) = segment.join {
+            script.push(' ');
+            script.push_str(join.as_str());
+        }
     }
-    let segments = command
-        .split('|')
-        .map(|segment| {
-            let (program, args) = hardened_readonly_argv(segment)?;
-            let program = resolve_readonly_program(&program, workspace)?;
-            let program = program
-                .to_str()
-                .ok_or_else(|| anyhow!("read-only executable path is not valid UTF-8"))?;
-            Ok(std::iter::once(program)
-                .chain(args.iter().map(String::as_str))
-                .map(|arg| shell_words::quote(arg).into_owned())
-                .collect::<Vec<_>>()
-                .join(" "))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    // The only shell operators are our pipes. Filenames cannot expand into
-    // options or unvalidated symlinks; every Git stage retains helper guards.
-    Ok(format!("set -o pipefail; {}", segments.join(" | ")))
+    // The only shell syntax is the admitted operators and redirect words.
+    // Filenames cannot expand into options or unvalidated symlinks; every Git
+    // stage retains helper guards.
+    Ok(script)
 }
 
 fn hardened_readonly_argv(command: &str) -> Result<(String, Vec<String>)> {
@@ -4187,21 +4516,24 @@ fn hardened_readonly_argv(command: &str) -> Result<(String, Vec<String>)> {
                 let at = subcommand_index + 1;
                 argv.splice(
                     at..at,
-                    ["--no-ext-diff".to_string(), "--no-textconv".to_string()],
+                    crate::dependencies::Git::REVIEW_DIFF_ARGS.map(String::from),
                 );
             }
             "log" | "show" => {
                 let at = subcommand_index + 1;
                 argv.splice(
                     at..at,
-                    [
-                        "--no-ext-diff".to_string(),
-                        "--no-textconv".to_string(),
-                        "--no-show-signature".to_string(),
-                    ],
+                    crate::dependencies::Git::REVIEW_DIFF_ARGS
+                        .into_iter()
+                        .chain(["--no-show-signature"])
+                        .map(String::from),
                 );
             }
-            "status" | "ls-files" | "blame" | "grep" => {}
+            "blame" => {
+                let at = subcommand_index + 1;
+                argv.insert(at, "--no-textconv".to_string());
+            }
+            "status" | "ls-files" | "grep" => {}
             _ => {
                 return Err(anyhow!(
                     "classifier-approved Git read did not keep its subcommand in argv[1]"
@@ -4214,7 +4546,65 @@ fn hardened_readonly_argv(command: &str) -> Result<(String, Vec<String>)> {
     Ok((program, argv))
 }
 
+/// The directory each `git` segment of a read-only command runs in: `cwd`
+/// followed through any leading `-C` hops, as git itself resolves them.
+fn readonly_git_dirs(command: &str, cwd: &std::path::Path) -> Vec<std::path::PathBuf> {
+    // Split with the same lexer the classifier and executor use (#6637), so a
+    // `git` segment after `&&`, `||` or `;` gets its filter hardening too.
+    let segments = agent_readonly_verdict(command).map_or_else(
+        |_| command.split('|').map(str::to_string).collect::<Vec<_>>(),
+        |segments| {
+            segments
+                .into_iter()
+                .map(|segment| segment.command)
+                .collect()
+        },
+    );
+    segments
+        .iter()
+        .filter_map(|segment| shell_words::split(&normalize_windows_command_paths(segment)).ok())
+        .filter(|argv| argv.first().is_some_and(|program| program == "git"))
+        .map(|argv| {
+            let mut dir = cwd.to_path_buf();
+            let mut args = argv.iter().skip(1);
+            while let Some(flag) = args.next() {
+                match flag.as_str() {
+                    "--no-pager" => {}
+                    "-C" => match args.next() {
+                        Some(target) => dir = dir.join(target),
+                        None => break,
+                    },
+                    _ => break,
+                }
+            }
+            dir
+        })
+        .collect()
+}
+
 fn enforce_readonly_workspace_operands(
+    command: &str,
+    workspace: &std::path::Path,
+    effective_cwd: &std::path::Path,
+) -> Result<(), ToolError> {
+    // Judge each segment of a pipeline or chain on its own, so the `gh`
+    // exemption below covers only the `gh` segment itself.
+    let segments = agent_readonly_verdict(command).map_or_else(
+        |_| vec![command.to_string()],
+        |segments| {
+            segments
+                .into_iter()
+                .map(|segment| segment.command)
+                .collect()
+        },
+    );
+    for segment in &segments {
+        enforce_readonly_segment_operands(segment, workspace, effective_cwd)?;
+    }
+    Ok(())
+}
+
+fn enforce_readonly_segment_operands(
     command: &str,
     workspace: &std::path::Path,
     effective_cwd: &std::path::Path,
@@ -4478,11 +4868,30 @@ async fn execute_foreground_via_background(
     extra_env: HashMap<String, String>,
     direct_argv: bool,
     timeout_bounds_ms: (u64, u64),
+    wants_receipt: bool,
+    receipt_identity: &mut Option<ShellExecutionIdentity>,
 ) -> Result<ShellResult> {
     let timeout_ms =
         timeout_ms.map(|timeout| timeout.clamp(timeout_bounds_ms.0, timeout_bounds_ms.1));
     let spawn_timeout_ms = timeout_ms.unwrap_or(timeout_bounds_ms.1);
-    let spawned = {
+    // Freeze the receipt's directory before execution and hand that same
+    // resolved spelling to the OS. Looking up the original symlink after
+    // the command runs can name a different directory than the one it used.
+    // Resolution is asynchronous; failure leaves the ordinary execution
+    // path intact but cannot produce an exact receipt.
+    let receipt_cwd = if wants_receipt {
+        match working_dir.as_deref() {
+            Some(cwd) => tokio::fs::canonicalize(cwd)
+                .await
+                .ok()
+                .and_then(|path| path.into_os_string().into_string().ok()),
+            None => None,
+        }
+    } else {
+        None
+    };
+    let working_dir = receipt_cwd.clone().or(working_dir);
+    let task_id = {
         let mut manager = context
             .shell_manager
             .lock()
@@ -4490,7 +4899,7 @@ async fn execute_foreground_via_background(
         manager.clear_foreground_background_request();
         let owner = shell_job_owner_from_context(context);
         let lifecycle = shell_work_lifecycle_from_context(context);
-        manager.execute_with_options_env_for_owner_and_work(
+        let spawned = manager.execute_with_options_env_for_owner_and_work(
             command,
             working_dir.as_deref(),
             spawn_timeout_ms,
@@ -4507,11 +4916,42 @@ async fn execute_foreground_via_background(
             direct_argv.then_some(context.workspace.as_path()),
             false,
             timeout_bounds_ms,
-        )?
+        )?;
+        let task_id = spawned
+            .task_id
+            .ok_or_else(|| anyhow!("foreground shell did not return a process id"))?;
+        // Classify before releasing the manager lock: even an immediately
+        // completed foreground command must never look like background work.
+        let process = manager
+            .processes
+            .get_mut(&task_id)
+            .ok_or_else(|| anyhow!("foreground shell {task_id} is not tracked"))?;
+        process.background = false;
+        // #6689: the receipt identity is what the manager recorded for this
+        // spawn — the admitted command and the directory handed to the OS —
+        // never the before-hook request. Only pipe-backed, unsandboxed local
+        // runs through a POSIX-style `<shell> <flag> <source>` dispatcher
+        // qualify: a PTY, the hardened read-only argv rewrite, an OS sandbox
+        // wrapper, Windows shell prefixes, and a PowerShell dispatcher (even
+        // `$SHELL=pwsh` on Unix, which wraps the source or runs it from a temp
+        // `-File`) all change what the process executes relative to this string.
+        if receipt_cwd.is_some()
+            && !cfg!(windows)
+            && !tty
+            && !direct_argv
+            && !spawned.sandboxed
+            && !spawned.sandbox_denied
+            && !crate::shell_dispatcher::global_dispatcher()
+                .kind()
+                .is_powershell()
+        {
+            *receipt_identity = Some(ShellExecutionIdentity {
+                command: process.command.clone(),
+                cwd: process.working_dir.clone(),
+            });
+        }
+        task_id
     };
-    let task_id = spawned
-        .task_id
-        .ok_or_else(|| anyhow!("foreground shell did not return a process id"))?;
     let mut foreground = ForegroundShellGuard {
         manager: context.shell_manager.clone(),
         task_id: task_id.clone(),
@@ -4525,7 +4965,12 @@ async fn execute_foreground_via_background(
         manager.attach_heavy_permit(&task_id, permit)?;
     }
 
-    if stdin_data.is_some() {
+    // A foreground pipe command gets EOF on stdin: an unexpected read (`cat`,
+    // `read x`, a confirmation prompt) then fails at once instead of blocking
+    // until the timeout kills it. A TTY keeps its terminal input. A command
+    // later moved to /jobs keeps the closed stdin; interactive input needs
+    // `background: true` from the start.
+    if stdin_data.is_some() || !tty {
         let mut manager = context
             .shell_manager
             .lock()
@@ -4566,7 +5011,7 @@ async fn execute_foreground_via_background(
                 .shell_manager
                 .lock()
                 .map_err(|_| anyhow!("shell manager lock poisoned"))?;
-            if manager.take_foreground_background_request() {
+            if manager.take_foreground_background_request(&task_id) {
                 let snapshot = manager.get_output(&task_id, false, 0)?;
                 foreground.armed = false;
                 return Ok(snapshot);
@@ -4574,6 +5019,16 @@ async fn execute_foreground_via_background(
             if manager.poll_status(&task_id)? == ShellStatus::Running {
                 None
             } else {
+                // #6689: a status from a failed wait is neither an observed
+                // exit nor an interruption, so the receipt is left out rather
+                // than reporting a guessed state.
+                if manager
+                    .processes
+                    .get(&task_id)
+                    .is_none_or(|shell| shell.wait_failed)
+                {
+                    *receipt_identity = None;
+                }
                 let snapshot = manager.get_output(&task_id, false, 0)?;
                 // Ordering matters: the snapshot is taken before the
                 // acknowledgement releases the retained bytes.
@@ -4637,6 +5092,110 @@ impl Drop for ForegroundShellGuard {
             // but do not let an abandoned foreground wait wake a new model turn.
             shell.completion_reported = true;
         }
+    }
+}
+
+/// The admitted command and working directory a foreground spawn recorded,
+/// for the `tool_call_after` execution receipt (#6689).
+struct ShellExecutionIdentity {
+    command: String,
+    cwd: PathBuf,
+}
+
+/// Largest command or working directory a receipt carries. Identities are
+/// exact or absent, never truncated.
+const EXECUTION_RECEIPT_IDENTITY_MAX_BYTES: usize = 8 * 1024;
+
+/// Starting per-stream output preview in an execution receipt. Halved until
+/// the serialized receipt fits `HOOK_EXECUTION_RECEIPT_MAX_BYTES`.
+const EXECUTION_RECEIPT_PREVIEW_MAX_BYTES: usize = 8 * 1024;
+
+/// Keep both ends of an output stream — the first lines and the final
+/// diagnostic — cut on UTF-8 boundaries with a visible marker.
+fn execution_receipt_preview(text: &str, budget: usize) -> (String, bool) {
+    if text.len() <= budget {
+        return (text.to_owned(), false);
+    }
+    let mut head = budget / 2;
+    while !text.is_char_boundary(head) {
+        head -= 1;
+    }
+    let mut tail = text.len() - budget / 2;
+    while !text.is_char_boundary(tail) {
+        tail += 1;
+    }
+    (
+        format!(
+            "{}\n[receipt preview truncated]\n{}",
+            &text[..head],
+            &text[tail..]
+        ),
+        true,
+    )
+}
+
+/// Build the schema-1 execution receipt for a settled foreground shell run
+/// (#6689), exported to `tool_call_after` hooks as
+/// `DEEPSEEK_TOOL_EXECUTION_RECEIPT`.
+///
+/// Returns `None` — absence, which implies neither success nor failure — for
+/// a run still in flight, a sandboxed run, or an identity that is not exact:
+/// empty, over the identity bound, containing NUL, or a relative or non-UTF-8
+/// directory. `output_kind` is `"combined"` when stdout and stderr shared one
+/// pipe, so `stdout` holds the combined preview.
+fn shell_execution_receipt(
+    identity: &ShellExecutionIdentity,
+    result: &ShellResult,
+    output_kind: &'static str,
+) -> Option<serde_json::Value> {
+    let command = identity.command.as_str();
+    let cwd = identity.cwd.to_str()?;
+    if command.is_empty()
+        || command.len() > EXECUTION_RECEIPT_IDENTITY_MAX_BYTES
+        || command.contains('\0')
+        || cwd.len() > EXECUTION_RECEIPT_IDENTITY_MAX_BYTES
+        || cwd.contains('\0')
+        || !identity.cwd.is_absolute()
+        || result.sandboxed
+        || result.sandbox_denied
+    {
+        return None;
+    }
+    // A nonzero exit is still a completed run; `interrupted` is a signal,
+    // kill, cancel, or timeout. The exit code is only ever the observed one.
+    let state = match result.status {
+        ShellStatus::Completed => "completed",
+        ShellStatus::Failed if result.exit_code.is_some() => "completed",
+        ShellStatus::Failed | ShellStatus::Killed | ShellStatus::TimedOut => "interrupted",
+        ShellStatus::Running => return None,
+    };
+    let mut budget = EXECUTION_RECEIPT_PREVIEW_MAX_BYTES;
+    loop {
+        let (stdout, stdout_clipped) = execution_receipt_preview(&result.stdout, budget);
+        let (stderr, stderr_clipped) = execution_receipt_preview(&result.stderr, budget);
+        let receipt = json!({
+            "schema_version": 1,
+            "command": command,
+            "cwd": cwd,
+            "state": state,
+            "scope": "local",
+            "exit_code": result.exit_code,
+            "stdout": stdout,
+            "stderr": stderr,
+            "stdout_truncated": result.stdout_truncated || stdout_clipped,
+            "stderr_truncated": result.stderr_truncated || stderr_clipped,
+            "output_kind": output_kind,
+        });
+        // The bound is on the serialized form, so JSON escaping counts.
+        if serde_json::to_vec(&receipt).ok()?.len()
+            <= crate::hooks::HOOK_EXECUTION_RECEIPT_MAX_BYTES
+        {
+            return Some(receipt);
+        }
+        if budget == 0 {
+            return None;
+        }
+        budget /= 2;
     }
 }
 
@@ -4708,6 +5267,7 @@ fn finish_contract_bash_result(
     result: ShellResult,
     timeout_ms: Option<u64>,
     context: &ToolContext,
+    execution_receipt: Option<serde_json::Value>,
 ) -> Result<ToolResult, ToolError> {
     let sandbox_denied_hint = shell_sandbox_denied_hint(context, &result);
     let mut output = result.stdout.clone();
@@ -4719,12 +5279,15 @@ fn finish_contract_bash_result(
             format!("{hint}\n\n{output}")
         };
     }
-    let metadata = json!({
+    let mut metadata = json!({
         "evidence_routing": "inline", "exit_code": result.exit_code,
         "status": format!("{:?}", result.status), "duration_ms": result.duration_ms,
         "sandboxed": result.sandboxed, "sandbox_type": result.sandbox_type,
         "task_id": result.task_id, "backgrounded": result.status == ShellStatus::Running,
     });
+    if let Some(receipt) = execution_receipt {
+        metadata["execution_receipt"] = receipt;
+    }
     if result.status == ShellStatus::Running {
         let task_id = result.task_id.as_deref().unwrap_or("unknown");
         let partial = (!output.is_empty()).then(|| format!("\n\nOutput so far:\n{output}"));
@@ -4734,12 +5297,19 @@ fn finish_contract_bash_result(
         )).with_metadata(metadata));
     }
     if result.status != ShellStatus::Completed {
+        // A nonzero exit, timeout, or kill stays a failed tool call, but it
+        // keeps the same metadata a success carries: hooks read `exit_code`
+        // and `status` from it, and an error with no metadata left them blind
+        // to exactly the commands that failed.
         let status = contract_bash_error_status(&result, timeout_ms);
-        return Err(ToolError::execution_failed(if output.is_empty() {
-            status
-        } else {
-            format!("{output}\n\n{status}")
-        }));
+        return Err(ToolError::execution_failed_with_metadata(
+            if output.is_empty() {
+                status
+            } else {
+                format!("{output}\n\n{status}")
+            },
+            metadata,
+        ));
     }
 
     Ok(ToolResult::success(if output.is_empty() {
@@ -5111,6 +5681,13 @@ impl ToolSpec for BashTool {
         input: serde_json::Value,
         context: &ToolContext,
     ) -> Result<ToolResult, ToolError> {
+        // A leading `cd <dir> &&` becomes the working directory before any
+        // check, exactly as the read-only gates judged it.
+        let input = if context.shell_policy == ShellPolicy::ReadOnly {
+            normalize_readonly_cd(&input)
+        } else {
+            input
+        };
         // `and_then(as_str).unwrap_or("run")` treated *any* non-string
         // `action` as absent and fell through to the branch that runs
         // arbitrary code: `Bash{action: 3, command: "…"}` executed the
@@ -5190,20 +5767,27 @@ impl ToolSpec for BashTool {
                     "Shell tools are disabled by the active permission profile.",
                 ));
             }
-            ShellPolicy::ReadOnly if !exec_shell_input_agent_readonly(&input) => {
-                // #6298: a child has no mode to switch to, so the parent's
-                // `/mode work` advice is unreachable. Name the child's own
-                // alternatives instead, plus the escalation path.
-                let message = if context.owner_agent_id.is_some() {
-                    "Shell command blocked by read-only shell policy. As a sub-agent you cannot switch modes: read files with read_file/grep_files, inspect Git with fetch/log/show (merge_tree for merge results), run checks with Run tests/verifiers (pass `cwd` when the checks live in a subdirectory), and report the blocked probe to the parent instead of working around it."
-                } else {
-                    "Shell command blocked by read-only shell policy. Use a non-mutating, non-background inspection command, or switch to Work mode (`/mode work`) for write-capable shell work."
-                };
-                return Ok(ToolResult::error(message));
+            ShellPolicy::ReadOnly => {
+                if let Err(rejection) = exec_shell_input_agent_readonly_verdict(&input) {
+                    // A typed denial, so a Fleet worker's no-progress guard
+                    // counts it. #6298: an agent has no mode to switch to,
+                    // so it gets the same next steps as the other read-only
+                    // gates; only a parent session is pointed at Work mode.
+                    let message = if context.owner_agent_id.is_some()
+                        || context.tool_authority.is_some()
+                    {
+                        readonly_refusal(&rejection, readonly_enforced_lane_available(context))
+                    } else {
+                        format!(
+                            "{rejection}. Use a read-only inspection command, or switch to Work mode (`/mode work`) for write-capable shell work."
+                        )
+                    };
+                    return Err(ToolError::permission_denied(message));
+                }
             }
-            ShellPolicy::ReadOnly | ShellPolicy::Full => {}
+            ShellPolicy::Full => {}
         }
-        enforce_readonly_github_network_policy(command, context)?;
+        enforce_readonly_network_reads(command, context)?;
         let requested_timeout_ms = if self.optional_timeout {
             input
                 .get("timeout_ms")
@@ -5437,7 +6021,6 @@ impl ToolSpec for BashTool {
             if let Some(path) = readonly_sanitized_path(&context.workspace) {
                 extra_env.insert("PATH".to_string(), path);
             }
-            extra_env.insert("GIT_CONFIG_COUNT".to_string(), "3".to_string());
             extra_env.insert("GIT_CONFIG_KEY_0".to_string(), "core.fsmonitor".to_string());
             extra_env.insert("GIT_CONFIG_VALUE_0".to_string(), "false".to_string());
             extra_env.insert("GIT_CONFIG_KEY_1".to_string(), "core.hooksPath".to_string());
@@ -5447,6 +6030,35 @@ impl ToolSpec for BashTool {
                 "log.showSignature".to_string(),
             );
             extra_env.insert("GIT_CONFIG_VALUE_2".to_string(), "false".to_string());
+            // A working-tree read (diff, status, blame) runs the repository's
+            // clean filters, which no command-line flag disables.
+            let git_dirs = readonly_git_dirs(
+                command,
+                working_dir
+                    .as_deref()
+                    .map_or(context.workspace.as_path(), std::path::Path::new),
+            );
+            let overrides = tokio::task::spawn_blocking(move || {
+                let mut overrides = std::collections::BTreeSet::new();
+                for dir in git_dirs {
+                    overrides.extend(crate::dependencies::Git::review_filter_overrides(&dir)?);
+                }
+                anyhow::Ok(overrides)
+            })
+            .await
+            .map_err(|e| ToolError::execution_failed(format!("git task panicked: {e}")))?
+            .map_err(|e| {
+                ToolError::permission_denied(format!(
+                    "Read-only shell could not inspect the repository's Git filters: {e:#}"
+                ))
+            })?;
+            let mut count = 3;
+            for (key, value) in overrides {
+                extra_env.insert(format!("GIT_CONFIG_KEY_{count}"), key);
+                extra_env.insert(format!("GIT_CONFIG_VALUE_{count}"), value.to_string());
+                count += 1;
+            }
+            extra_env.insert("GIT_CONFIG_COUNT".to_string(), count.to_string());
             extra_env.insert(READONLY_ENV_MARKER.to_string(), "1".to_string());
         }
 
@@ -5586,6 +6198,14 @@ impl ToolSpec for BashTool {
         }
 
         let mut lifecycle_warning = None;
+        let mut receipt_identity = None;
+        // #6689: the receipt exists for completion hooks to read. Without one
+        // registered it would only ride along in tool metadata, which the
+        // Runtime API persists and emits for every call.
+        let wants_receipt = context.runtime.hook_executor.as_ref().is_some_and(|hooks| {
+            hooks.has_hooks_for_event(crate::hooks::HookEvent::ToolCallAfter)
+                || hooks.has_hooks_for_event(crate::hooks::HookEvent::OnError)
+        });
         let result = if interactive {
             let mut manager = context
                 .shell_manager
@@ -5669,6 +6289,8 @@ impl ToolSpec for BashTool {
                 } else {
                     (1_000, 600_000)
                 },
+                wants_receipt,
+                &mut receipt_identity,
             )
             .await
         };
@@ -5691,8 +6313,26 @@ impl ToolSpec for BashTool {
                     .cancel_token
                     .as_ref()
                     .is_some_and(|token| token.is_cancelled());
+                // Lowercase `bash` joins stdout and stderr on one pipe, so
+                // its preview is combined output, not stdout.
+                let execution_receipt = receipt_identity.as_ref().and_then(|identity| {
+                    shell_execution_receipt(
+                        identity,
+                        &result,
+                        if self.optional_timeout {
+                            "combined"
+                        } else {
+                            "separate"
+                        },
+                    )
+                });
                 if self.optional_timeout {
-                    return finish_contract_bash_result(result, timeout_ms, context);
+                    return finish_contract_bash_result(
+                        result,
+                        timeout_ms,
+                        context,
+                        execution_receipt,
+                    );
                 }
                 let task_id_str = result.task_id.clone().unwrap_or_default();
                 let stdout_summary = summarize_output(&result.stdout);
@@ -5823,6 +6463,9 @@ impl ToolSpec for BashTool {
                         }),
                     }),
                 });
+                if let Some(receipt) = execution_receipt {
+                    metadata["execution_receipt"] = receipt;
+                }
                 metadata["backgrounded"] = json!(background || backgrounded_foreground);
                 if persist {
                     metadata["persist_requested"] = json!(true);
@@ -6566,6 +7209,49 @@ fn shell_delta_with_accumulated_output(
     }
 }
 
+/// Refuse a notes target this auto-approved tool must not append to.
+///
+/// The file itself must not be a symlink (a committed `notes.md -> ~/.zshrc`
+/// would redirect the append), and a target placed inside the workspace must
+/// resolve inside it after symlinked parent directories are followed.
+async fn ensure_notes_target_is_safe(
+    notes_path: &std::path::Path,
+    workspace: &std::path::Path,
+) -> Result<(), ToolError> {
+    if let Ok(meta) = tokio::fs::symlink_metadata(notes_path).await
+        && (meta.file_type().is_symlink() || !meta.is_file())
+    {
+        return Err(ToolError::permission_denied(format!(
+            "Refusing to append a note to {}: the notes path is a symlink or not a regular file.",
+            notes_path.display()
+        )));
+    }
+    if notes_path.starts_with(workspace)
+        && let (Some(parent), Ok(root)) = (
+            notes_path.parent(),
+            tokio::fs::canonicalize(workspace).await,
+        )
+    {
+        // Walk up to the nearest existing ancestor: the rest is created
+        // below as real directories, so only existing links can redirect.
+        let mut existing = parent.to_path_buf();
+        while !tokio::fs::try_exists(&existing).await.unwrap_or(false) {
+            if !existing.pop() {
+                break;
+            }
+        }
+        if let Ok(resolved) = tokio::fs::canonicalize(&existing).await
+            && !resolved.starts_with(&root)
+        {
+            return Err(ToolError::permission_denied(format!(
+                "Refusing to append a note to {}: its directory resolves outside the workspace.",
+                notes_path.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Tool for appending notes to a notes file.
 pub struct NoteTool;
 
@@ -6606,6 +7292,7 @@ impl ToolSpec for NoteTool {
         context: &ToolContext,
     ) -> Result<ToolResult, ToolError> {
         let note_content = required_str(&input, "content")?;
+        ensure_notes_target_is_safe(&context.notes_path, &context.workspace).await?;
 
         // Ensure parent directory exists. Tool handlers run on the Tokio
         // runtime, so filesystem calls use tokio::fs (blocking-call
@@ -6626,6 +7313,11 @@ impl ToolSpec for NoteTool {
 
         use tokio::io::AsyncWriteExt;
         file.write_all(format!("\n---\n{note_content}\n").as_bytes())
+            .await
+            .map_err(|e| ToolError::execution_failed(format!("Failed to write note: {e}")))?;
+        // tokio's File finishes a write on a background thread; report
+        // success only once the bytes reached the file.
+        file.flush()
             .await
             .map_err(|e| ToolError::execution_failed(format!("Failed to write note: {e}")))?;
 

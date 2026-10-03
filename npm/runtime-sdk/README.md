@@ -95,4 +95,32 @@ both durable history and the already queued live tail have been drained. A
 request answered during replay therefore settles before readiness is reported.
 Later lag can return the same connection to `replaying`. Consumers should stop
 extending activity while replaying or disconnected and validate the thread and
-cursor. Default streams retain the original event-only contract.
+cursor. Default streams retain the original event-only contract, plus the
+final frame below.
+
+### Stream end
+
+Whenever the Runtime ends a thread stream on purpose, the last item is
+`{ event: "stream.end", thread_id, reason, last_seq, retryable }`. It is not a
+journal event and has no `seq`. When `retryable` is true, call `threadEvents`
+again with `sinceSeq: last_seq`; otherwise stop and reload the thread snapshot.
+Runtimes that send it advertise `x-codewhale-stream-end: 1`. If the iterator
+ends without it, the connection was lost: resume from the last `seq` you
+accepted. The full client rule is in
+[`docs/RUNTIME_API.md`](../../docs/RUNTIME_API.md#ending-and-resuming-a-thread-stream).
+
+Use `isThreadStreamEnd` to narrow iterator items in TypeScript. Journal event
+names remain open-ended, so checking `event === "stream.end"` alone cannot
+narrow the union:
+
+```ts
+import { isThreadStreamEnd } from "@codewhale/runtime-sdk";
+
+for await (const item of client.threadEvents(threadId)) {
+  if (isThreadStreamEnd(item)) {
+    console.log(item.reason, item.last_seq, item.retryable);
+  } else {
+    console.log(item.seq, item.payload);
+  }
+}
+```

@@ -262,8 +262,7 @@ impl ChatWidget {
         let jump_border = app.ui_theme.border;
         let jump_arrow = app.ui_theme.status_working;
         let visible_lines = content_area.height as usize;
-        let mut render_options = app.transcript_render_options();
-        render_options.reasoning_preview_viewport_lines = Some(visible_lines);
+        let render_options = app.transcript_render_options();
 
         if render_empty_state {
             let lines = build_empty_state_lines(app, content_area);
@@ -345,60 +344,78 @@ impl ChatWidget {
             .active_cell
             .as_ref()
             .map_or(&[], |active| active.entries());
-        let superseded_todos = superseded_todo_write_indices(&app.history, active_entries);
-
         let history_len = app.history.len();
-        let mut tool_runs = if app.tool_collapse_active() {
-            let cache_key_matches = app.tool_run_cache.history_version == app.history_version
-                && app.tool_run_cache.active_cell_revision == app.active_cell_revision
-                && app.tool_run_cache.active_len == active_entries.len()
-                && app.tool_run_cache.threshold == app.tool_collapse_threshold
-                && app.tool_run_cache.mode == app.tool_collapse_mode
-                && app.tool_run_cache.calm_mode == app.calm_mode;
-            if !cache_key_matches {
-                app.tool_run_cache.runs = crate::tui::history::detect_tool_runs_from_slices(
+        // Cache the group projection, not the whole frame: filtered refs and
+        // transcript bookkeeping below still walk the retained history.
+        let cache_key_matches = app.tool_run_cache.history_version == app.history_version
+            && app.tool_run_cache.history_len == history_len
+            && app.tool_run_cache.active_cell_revision == app.active_cell_revision
+            && app.tool_run_cache.active_len == active_entries.len()
+            && app.tool_run_cache.threshold == app.tool_collapse_threshold
+            && app.tool_run_cache.mode == app.tool_collapse_mode
+            && app.tool_run_cache.calm_mode == app.calm_mode
+            && app.tool_run_cache.expanded_runs == app.expanded_tool_runs;
+        if !cache_key_matches {
+            let superseded_todos = superseded_todo_write_indices(&app.history, active_entries);
+            let runs = if app.tool_collapse_active() {
+                crate::tui::history::detect_tool_runs_from_slices(
                     &app.history,
                     active_entries,
                     app.tool_collapse_threshold,
+                )
+            } else {
+                Vec::new()
+            };
+            let cache = &mut app.tool_run_cache;
+            #[cfg(test)]
+            {
+                cache.projection_builds += 1;
+            }
+            cache.summaries.clear();
+            cache.hidden_indices.clear();
+            for run in &runs {
+                // A hidden replacement snapshot cannot own a group summary.
+                if app.expanded_tool_runs.contains(&run.start)
+                    || (run.start..run.start.saturating_add(run.count))
+                        .any(|index| superseded_todos.contains(&index))
+                {
+                    continue;
+                }
+                cache.summaries.insert(
+                    run.start,
+                    (
+                        tool_run_summary_cell(run),
+                        tool_run_summary_revision(
+                            run,
+                            &app.history_revisions,
+                            history_len,
+                            app.active_cell_revision,
+                        ),
+                    ),
                 );
-                app.tool_run_cache.history_version = app.history_version;
-                app.tool_run_cache.active_cell_revision = app.active_cell_revision;
-                app.tool_run_cache.active_len = active_entries.len();
-                app.tool_run_cache.threshold = app.tool_collapse_threshold;
-                app.tool_run_cache.mode = app.tool_collapse_mode;
-                app.tool_run_cache.calm_mode = app.calm_mode;
+                cache
+                    .hidden_indices
+                    .extend(run.start + 1..run.start + run.count);
             }
-            app.tool_run_cache.runs.clone()
-        } else {
-            Vec::new()
-        };
-        // A collapsed run that crosses a hidden replacement snapshot would
-        // otherwise lose its summary start or count a row the user cannot
-        // see. Leave only that run expanded; unrelated dense runs still use
-        // the normal collapse path.
-        tool_runs.retain(|run| {
-            !(run.start..run.start.saturating_add(run.count))
-                .any(|index| superseded_todos.contains(&index))
-        });
-        let collapsed_run_starts: HashSet<usize> = tool_runs
-            .iter()
-            .filter_map(|run| (!app.expanded_tool_runs.contains(&run.start)).then_some(run.start))
-            .collect();
-        let mut collapsed_tool_indices: HashSet<usize> = HashSet::new();
-        for run in &tool_runs {
-            if !collapsed_run_starts.contains(&run.start) {
-                continue;
-            }
-            for offset in 1..run.count {
-                collapsed_tool_indices.insert(run.start + offset);
-            }
+            cache.superseded_todos = superseded_todos;
+            cache.history_version = app.history_version;
+            cache.history_len = history_len;
+            cache.active_cell_revision = app.active_cell_revision;
+            cache.active_len = active_entries.len();
+            cache.threshold = app.tool_collapse_threshold;
+            cache.mode = app.tool_collapse_mode;
+            cache.calm_mode = app.calm_mode;
+            cache.expanded_runs.clone_from(&app.expanded_tool_runs);
         }
+        let superseded_todos = &app.tool_run_cache.superseded_todos;
+        let collapsed_tool_indices = &app.tool_run_cache.hidden_indices;
+        let summary_cells = &app.tool_run_cache.summaries;
 
         // v0.9.1: do not collapse concurrent sub-agent cards into an Enter-
         // expand shelf. Count lives in header chrome; full cards stay visible;
         // sidebar / SubAgents modal are the drill-in surface.
         let has_collapsed = !app.collapsed_cells.is_empty()
-            || !collapsed_run_starts.is_empty()
+            || !summary_cells.is_empty()
             || !superseded_todos.is_empty();
 
         // Fast path: no collapsed cells — use original slices directly.
@@ -440,22 +457,8 @@ impl ChatWidget {
             // Slow path: borrow non-collapsed cells into a filtered ref list
             // so collapsed cells are excluded from rendering, and build the
             // filtered→original index mapping. Collapsed run starts render a
-            // synthetic summary cell; those few summaries are materialized
-            // up front so the ref list can borrow from a stable Vec —
-            // avoiding the per-frame deep clone of every visible cell that
-            // this path used to pay (#3896).
-            let summary_cells: Vec<(usize, HistoryCell)> = tool_runs
-                .iter()
-                .filter(|run| collapsed_run_starts.contains(&run.start))
-                .map(|run| (run.start, tool_run_summary_cell(run)))
-                .collect();
-            let summary_cell_for = |idx: usize| -> Option<&HistoryCell> {
-                summary_cells
-                    .iter()
-                    .find(|(start, _)| *start == idx)
-                    .map(|(_, cell)| cell)
-            };
-
+            // synthetic summary cell borrowed from the generation cache.
+            // No history cells or summary bodies are cloned on scroll frames.
             let mut filtered_cells: Vec<&HistoryCell> =
                 Vec::with_capacity(history_len + active_entries.len());
             let mut filtered_revs: Vec<u64> =
@@ -473,17 +476,9 @@ impl ChatWidget {
                 if collapsed_tool_indices.contains(&idx) {
                     continue;
                 }
-                if let Some(run) = tool_runs
-                    .iter()
-                    .find(|run| run.start == idx && collapsed_run_starts.contains(&idx))
-                {
-                    filtered_cells.push(summary_cell_for(idx).expect("summary cell materialized"));
-                    filtered_revs.push(tool_run_summary_revision(
-                        run,
-                        &app.history_revisions,
-                        history_len,
-                        app.active_cell_revision,
-                    ));
+                if let Some((summary, revision)) = summary_cells.get(&idx) {
+                    filtered_cells.push(summary);
+                    filtered_revs.push(*revision);
                     filtered_to_original.push(idx);
                     continue;
                 }
@@ -505,17 +500,9 @@ impl ChatWidget {
                     if collapsed_tool_indices.contains(&original_idx) {
                         continue;
                     }
-                    if let Some(run) = tool_runs.iter().find(|run| {
-                        run.start == original_idx && collapsed_run_starts.contains(&original_idx)
-                    }) {
-                        filtered_cells
-                            .push(summary_cell_for(original_idx).expect("summary materialized"));
-                        filtered_revs.push(tool_run_summary_revision(
-                            run,
-                            &app.history_revisions,
-                            history_len,
-                            active_rev,
-                        ));
+                    if let Some((summary, revision)) = summary_cells.get(&original_idx) {
+                        filtered_cells.push(summary);
+                        filtered_revs.push(*revision);
                         filtered_to_original.push(original_idx);
                         continue;
                     }
@@ -600,9 +587,6 @@ impl ChatWidget {
 
         app.viewport.last_transcript_area = Some(transcript_area);
         app.viewport.last_transcript_padding_top = 0;
-        let detail_target_cell = (!app.viewport.transcript_selection.is_active())
-            .then(|| app.detail_cell_index_for_viewport(top, visible_lines, line_meta))
-            .flatten();
 
         let end = (top + visible_lines).min(total_lines);
         let mut lines = if total_lines == 0 {
@@ -655,16 +639,12 @@ impl ChatWidget {
             app.last_send_at = None;
         }
 
-        if let Some(target_cell) = detail_target_cell {
-            apply_detail_target_highlight(
-                &mut lines,
-                top,
-                target_cell,
-                line_meta,
-                &app.collapsed_cell_map,
-            );
-        }
-
+        // No background "highlight" for the Alt+V detail target: it used to
+        // paint the target cell's spans `Color::Reset`, which is invisible on
+        // terminal-owned themes and a black hole on painted surfaces
+        // (Underwater, Shoreline): the cell's text sat on the terminal's own
+        // background, and CJK trailing columns left black remnants when the
+        // cell scrolled (#6704). The footer's `Alt+V:details` hint names it.
         apply_selection(&mut lines, top, app);
 
         if let Some(pin) = pinned_prompt {
@@ -792,7 +772,7 @@ fn tool_run_summary_cell(run: &ToolRun) -> HistoryCell {
         output: None,
         prompts: None,
         spillover_path: None,
-        output_summary: None,
+        output_summary: Some(format!("+{}", run.count)),
         is_diff: false,
     }))
 }
@@ -874,7 +854,9 @@ fn scrolled_user_prompt_pin(
                 }
                 _ => None,
             })?;
-    let first_line = line_meta.iter().position(|meta| match meta {
+    // The newest prompt sits near the tail, so search backward; a forward
+    // scan cost O(transcript) on every frame of a long session (#6652).
+    let first_line = line_meta.iter().rposition(|meta| match meta {
         TranscriptLineMeta::CellLine {
             cell_index,
             line_in_cell,
@@ -3500,24 +3482,20 @@ impl Renderable for ElevationWidget<'_> {
                 Style::default()
             };
 
-            let (key, label_id, desc_id) = match option {
+            let (label_id, desc_id) = match option {
                 ElevationOption::WithNetwork => (
-                    "n",
                     MessageId::ElevationOptionNetwork,
                     MessageId::ElevationOptionNetworkDesc,
                 ),
                 ElevationOption::WithWriteAccess(_) => (
-                    "w",
                     MessageId::ElevationOptionWrite,
                     MessageId::ElevationOptionWriteDesc,
                 ),
                 ElevationOption::FullAccess => (
-                    "f",
                     MessageId::ElevationOptionFullAccess,
                     MessageId::ElevationOptionFullAccessDesc,
                 ),
                 ElevationOption::Abort => (
-                    "a",
                     MessageId::ElevationOptionAbort,
                     MessageId::ElevationOptionAbortDesc,
                 ),
@@ -3532,8 +3510,8 @@ impl Renderable for ElevationWidget<'_> {
             lines.push(Line::from(vec![
                 Span::raw("  "),
                 Span::styled(
-                    format!("[{key}] "),
-                    Style::default().fg(palette::STATUS_SUCCESS),
+                    format!("{} ", crate::tui::glyphs::selection_marker(is_selected)),
+                    style,
                 ),
                 Span::styled(tr(self.locale, label_id), style.fg(label_color)),
             ]));
@@ -3557,12 +3535,39 @@ impl Renderable for ElevationWidget<'_> {
         let inner_width = popup_width.saturating_sub(CHROME);
         let max_inner_height = area.height.saturating_sub(2).saturating_sub(CHROME);
 
+        // The same binding table routes these keys. Reserve its hint alongside
+        // the choices so truncating the denial never hides keyboard access.
+        use crate::tui::shell_key_routing::{ShellBindingId, binding};
+        let controls = Line::from(Span::styled(
+            format!(
+                "  {}/{} · {} · {}",
+                binding(ShellBindingId::ElevationUp).footer_chord,
+                binding(ShellBindingId::ElevationDown).footer_chord,
+                binding(ShellBindingId::ElevationConfirm).footer_chord,
+                binding(ShellBindingId::ElevationAbort).footer_chord,
+            ),
+            Style::default().fg(palette::TEXT_MUTED),
+        ));
+        let controls_rows = measure_wrapped_rows(std::slice::from_ref(&controls), inner_width);
+        // Elevation has no details pager. Do not reuse the initial-approval
+        // hint that advertises a details shortcut this card cannot handle.
+        let truncation_hint = Line::from(Span::styled(
+            "  …",
+            Style::default().fg(palette::TEXT_MUTED),
+        ));
+        let truncation_rows =
+            measure_wrapped_rows(std::slice::from_ref(&truncation_hint), inner_width);
+
         let mut option_lines = lines.split_off(option_start);
         // Each option is a label row followed by a description row. On a terminal
         // too small for both, the description is chrome and the choice is
         // content, so the descriptions go first and every option keeps its row.
         let mut rows_per_option = 2usize;
-        if measure_wrapped_rows(&option_lines, inner_width) > max_inner_height {
+        if measure_wrapped_rows(&option_lines, inner_width)
+            .saturating_add(controls_rows)
+            .saturating_add(2 + truncation_rows)
+            > max_inner_height
+        {
             option_lines = option_lines
                 .into_iter()
                 .enumerate()
@@ -3570,21 +3575,35 @@ impl Renderable for ElevationWidget<'_> {
                 .collect();
             rows_per_option = 1;
         }
-        let option_rows = measure_wrapped_rows(&option_lines, inner_width);
-        // Trim the denial detail down to the title rather than the option list.
+        let option_rows =
+            measure_wrapped_rows(&option_lines, inner_width).saturating_add(controls_rows);
+        // Empty separators are chrome. Remove them before truncating useful
+        // detail; on the smallest frame even the preamble can go, since the
+        // border still names the card and the choices must remain reachable.
+        if measure_wrapped_rows(&lines, inner_width)
+            .saturating_add(option_rows)
+            .saturating_add(truncation_rows)
+            > max_inner_height
+        {
+            lines.retain(|line| line.width() != 0);
+        }
         let mut truncated = false;
-        while lines.len() > 2
-            && measure_wrapped_rows(&lines, inner_width).saturating_add(option_rows)
+        while !lines.is_empty()
+            && measure_wrapped_rows(&lines, inner_width)
+                .saturating_add(option_rows)
+                .saturating_add(truncation_rows)
                 > max_inner_height
         {
             lines.pop();
             truncated = true;
         }
-        if truncated {
-            lines.push(Line::from(Span::styled(
-                approval_truncation_hint(self.locale),
-                Style::default().fg(palette::TEXT_MUTED),
-            )));
+        if truncated
+            && measure_wrapped_rows(&lines, inner_width)
+                .saturating_add(option_rows)
+                .saturating_add(truncation_rows)
+                <= max_inner_height
+        {
+            lines.push(truncation_hint);
         }
 
         // Row offsets are measured after wrapping, not counted in source lines:
@@ -3601,6 +3620,7 @@ impl Renderable for ElevationWidget<'_> {
             offsets
         };
         lines.extend(option_lines);
+        lines.push(controls);
 
         let popup_height = measure_wrapped_rows(&lines, inner_width)
             .saturating_add(CHROME)
@@ -3682,30 +3702,6 @@ fn apply_selection(lines: &mut [Line<'static>], top: usize, app: &App) {
         }
 
         line.spans = apply_selection_to_line(line, col_start, col_end, selection_style);
-    }
-}
-
-fn apply_detail_target_highlight(
-    lines: &mut [Line<'static>],
-    top: usize,
-    target_cell: usize,
-    line_meta: &[TranscriptLineMeta],
-    original_index_map: &[usize],
-) {
-    let highlight_bg = Color::Reset;
-    for (idx, line) in lines.iter_mut().enumerate() {
-        let line_index = top + idx;
-        if let Some(TranscriptLineMeta::CellLine { cell_index, .. }) = line_meta.get(line_index)
-            && original_index_map
-                .get(*cell_index)
-                .copied()
-                .unwrap_or(*cell_index)
-                == target_cell
-        {
-            for span in &mut line.spans {
-                span.style = span.style.bg(highlight_bg);
-            }
-        }
     }
 }
 
@@ -3821,10 +3817,7 @@ pub(crate) fn should_render_empty_state(app: &App) -> bool {
         && !app.is_compacting
         && !app.is_purging
         && !app.attention_hold_active()
-        && !app
-            .task_panel
-            .iter()
-            .any(|task| task.kind == crate::tui::app::TaskPanelEntryKind::Background)
+        && app.task_panel.is_empty()
         // Live work suppresses the empty state. On lock contention, treat
         // the todo store as non-empty rather than flash the empty ocean.
         && !app
@@ -4936,15 +4929,15 @@ mod tests {
     use super::{
         ACTIVE_REVISION_DOMAIN, ApprovalWidget, COMPOSER_PANEL_HEIGHT, COMPOSER_PLACEHOLDER,
         ChatWidget, ComposerWidget, Renderable, SlashMenuEntry, active_composer_submit_rect,
-        active_entry_revision, apply_detail_target_highlight, apply_selection_to_line,
-        apply_send_flash, approval_palette, approval_truncation_hint, build_empty_state_lines,
-        composer_content_geometry, composer_empty_hint_text, composer_height, composer_inner_area,
-        composer_max_height, composer_submit_hint, composer_top_padding, cursor_row_col,
-        empty_composer_visual_rows, enclosed_composer_panel_fits, fish_flee_offset, fish_heading,
-        fish_mark, history_entry_revision, layout_input, layout_input_with_scroll,
-        placeholder_visual_lines, push_command_entry, receipt_is_settling, revision_in_domain,
-        should_render_empty_state, slash_completion_hints, tool_run_summary_revision,
-        wrap_input_lines, wrap_input_lines_for_mouse, wrap_text,
+        active_entry_revision, apply_selection_to_line, apply_send_flash, approval_palette,
+        approval_truncation_hint, build_empty_state_lines, composer_content_geometry,
+        composer_empty_hint_text, composer_height, composer_inner_area, composer_max_height,
+        composer_submit_hint, composer_top_padding, cursor_row_col, empty_composer_visual_rows,
+        enclosed_composer_panel_fits, fish_flee_offset, fish_heading, fish_mark,
+        history_entry_revision, layout_input, layout_input_with_scroll, placeholder_visual_lines,
+        push_command_entry, receipt_is_settling, revision_in_domain, should_render_empty_state,
+        slash_completion_hints, tool_run_summary_revision, wrap_input_lines,
+        wrap_input_lines_for_mouse, wrap_text,
     };
     use crate::config::{ApiProvider, Config};
     use crate::tui::active_cell::ActiveCell;
@@ -5232,20 +5225,37 @@ mod tests {
         );
     }
 
+    /// #6704: the Alt+V detail target (here a visible error cell) must not
+    /// punch the terminal's own background through a painted surface. Its
+    /// text used to be forced to `Color::Reset`, which Windows Terminal shows
+    /// as black under the Underwater theme's navy water.
     #[test]
-    fn detail_highlight_uses_original_index_map_for_collapsed_rows() {
-        let mut lines = vec![Line::from("tool group")];
-        let line_meta = vec![TranscriptLineMeta::CellLine {
-            cell_index: 0,
-            line_in_cell: 0,
-            copy_prefix_width: 0,
-            copy_separator_after: crate::tui::ui_text::CopyLineSeparator::Newline,
-        }];
-        let original_index_map = vec![4];
+    fn detail_target_text_keeps_the_painted_surface() {
+        let mut app = create_test_app();
+        app.theme_id = codewhale_palette::ThemeId::Underwater;
+        app.ui_theme = palette::UNDERWATER_UI_THEME;
+        app.add_message(HistoryCell::User {
+            content: "run the check".to_string(),
+        });
+        app.add_message(HistoryCell::Error {
+            message: "验证失败 detail target".to_string(),
+            severity: crate::error_taxonomy::ErrorSeverity::Error,
+        });
 
-        apply_detail_target_highlight(&mut lines, 0, 4, &line_meta, &original_index_map);
+        let area = Rect::new(0, 0, 80, 12);
+        let mut buf = Buffer::empty(area);
+        ChatWidget::new_with_ocean_elapsed(&mut app, area, 0).render(area, &mut buf);
 
-        assert_eq!(lines[0].spans[0].style.bg, Some(Color::Reset));
+        let rendered = buffer_text(&buf, area);
+        assert!(rendered.contains("detail target"), "{rendered}");
+        let holes = (area.y..area.bottom())
+            .flat_map(|y| (area.x..area.right()).map(move |x| (x, y)))
+            .filter(|&pos| buf[pos].bg == Color::Reset)
+            .collect::<Vec<_>>();
+        assert!(
+            holes.is_empty(),
+            "cells fell through to the terminal background at {holes:?}:\n{rendered}"
+        );
     }
 
     #[test]
@@ -5317,6 +5327,98 @@ mod tests {
             !rendered.contains("full output from list_dir"),
             "{rendered}"
         );
+    }
+
+    #[test]
+    fn g3_collapsed_projection_reuses_summaries_until_content_or_expansion_changes() {
+        let mut app = create_test_app();
+        app.tool_collapse_mode = ToolCollapseMode::Compact;
+        app.tool_collapse_threshold = 3;
+        add_dense_tool_run(&mut app);
+        let area = Rect::new(0, 0, 80, 20);
+        let _ = ChatWidget::new(&mut app, area);
+        assert_eq!(app.tool_run_cache.projection_builds, 1);
+        app.scroll_up(3);
+        let _ = ChatWidget::new(&mut app, area);
+        assert_eq!(app.tool_run_cache.projection_builds, 1);
+        app.expanded_tool_runs.insert(0);
+        let _ = ChatWidget::new(&mut app, area);
+        assert_eq!(app.collapsed_cell_map, vec![0, 1, 2]);
+        app.expanded_tool_runs.clear();
+        if let HistoryCell::Tool(ToolCell::Generic(tool)) = &mut app.history[1] {
+            tool.status = ToolStatus::Failed;
+        }
+        app.bump_history_cell(1);
+        let _ = ChatWidget::new(&mut app, area);
+        assert!(app.tool_run_cache.summaries.is_empty());
+        assert_eq!(app.collapsed_cell_map, vec![0, 1, 2]);
+    }
+
+    /// Isolates the former per-cell linear run lookup from rendering and I/O.
+    #[test]
+    #[ignore = "timing benchmark, not a correctness gate"]
+    #[allow(clippy::print_stderr)]
+    fn bench_g3_collapsed_projection_lookup() {
+        for groups in [100usize, 1_000] {
+            let mut app = create_test_app();
+            app.tool_collapse_mode = ToolCollapseMode::Compact;
+            app.tool_collapse_threshold = 3;
+            for _ in 0..groups {
+                add_dense_tool_run(&mut app);
+                app.push_history_cell(HistoryCell::Assistant {
+                    content: "done".into(),
+                    streaming: false,
+                });
+            }
+            let area = Rect::new(0, 0, 140, 40);
+            let _ = ChatWidget::new(&mut app, area);
+            let runs = crate::tui::history::detect_tool_runs_from_slices(&app.history, &[], 3);
+            let frames = 200u32;
+            let started = std::time::Instant::now();
+            for _ in 0..frames {
+                for index in 0..app.history.len() {
+                    std::hint::black_box(
+                        runs.iter()
+                            .find(|run| run.start == std::hint::black_box(index)),
+                    );
+                }
+            }
+            let before = started.elapsed() / frames;
+            let started = std::time::Instant::now();
+            for _ in 0..frames {
+                for index in 0..app.history.len() {
+                    std::hint::black_box(
+                        app.tool_run_cache
+                            .summaries
+                            .get(&std::hint::black_box(index)),
+                    );
+                }
+            }
+            let after = started.elapsed() / frames;
+            eprintln!(
+                "#6652 lookup: {} cells, {} groups, linear {:?}, cached direct {:?} per frame",
+                app.history.len(),
+                runs.len(),
+                before,
+                after
+            );
+        }
+    }
+
+    #[test]
+    fn calm1_collapsed_group_keeps_count_and_reveal_affordance() {
+        let mut app = create_test_app();
+        app.tool_collapse_mode = ToolCollapseMode::Compact;
+        app.tool_collapse_threshold = 3;
+        add_dense_tool_run(&mut app);
+        for width in [40, 60, 80, 140] {
+            let area = Rect::new(0, 0, width, 8);
+            let mut buf = Buffer::empty(area);
+            ChatWidget::new(&mut app, area).render(area, &mut buf);
+            let text = buffer_text(&buf, area);
+            assert!(text.contains("+3 ›"), "{text}");
+            assert_eq!(app.collapsed_cell_map, vec![0]);
+        }
     }
 
     #[test]
@@ -5910,6 +6012,7 @@ mod tests {
     fn slash_completion_hints_use_user_command_frontmatter_description() {
         let tmp = tempfile::TempDir::new().unwrap();
         let commands_dir = tmp.path().join(".deepseek").join("commands");
+        crate::test_support::trust_workspace(tmp.path());
         std::fs::create_dir_all(&commands_dir).unwrap();
         std::fs::write(
             commands_dir.join("git-scan.md"),
@@ -5935,6 +6038,7 @@ mod tests {
     #[test]
     fn slash_completion_hints_use_user_command_argument_hint() {
         let tmp = tempfile::TempDir::new().unwrap();
+        crate::test_support::trust_workspace(tmp.path());
         let commands_dir = tmp.path().join(".deepseek").join("commands");
         std::fs::create_dir_all(&commands_dir).unwrap();
         std::fs::write(
@@ -5962,6 +6066,7 @@ mod tests {
     fn slash_completion_uses_frontmatter_name_and_usage() {
         let tmp = tempfile::TempDir::new().unwrap();
         let commands_dir = tmp.path().join(".codewhale").join("commands");
+        crate::test_support::trust_workspace(tmp.path());
         std::fs::create_dir_all(&commands_dir).unwrap();
         std::fs::write(
             commands_dir.join("workflow-file.md"),
@@ -5990,6 +6095,7 @@ mod tests {
     fn slash_completion_uses_arguments_when_usage_and_legacy_hint_are_absent() {
         let tmp = tempfile::TempDir::new().unwrap();
         let commands_dir = tmp.path().join(".codewhale").join("commands");
+        crate::test_support::trust_workspace(tmp.path());
         std::fs::create_dir_all(&commands_dir).unwrap();
         std::fs::write(
             commands_dir.join("deploy.md"),
@@ -6137,6 +6243,7 @@ mod tests {
     fn slash_completion_hints_exclude_hidden_user_commands() {
         let tmp = tempfile::TempDir::new().unwrap();
         let commands_dir = tmp.path().join(".codewhale").join("commands");
+        crate::test_support::trust_workspace(tmp.path());
         std::fs::create_dir_all(&commands_dir).unwrap();
         std::fs::write(
             commands_dir.join("secret.md"),
@@ -6160,6 +6267,7 @@ mod tests {
     fn hidden_name_override_filters_shadowed_builtin_from_slash_completion() {
         let tmp = tempfile::TempDir::new().unwrap();
         let commands_dir = tmp.path().join(".codewhale").join("commands");
+        crate::test_support::trust_workspace(tmp.path());
         std::fs::create_dir_all(&commands_dir).unwrap();
         std::fs::write(
             commands_dir.join("private-help.md"),
@@ -6183,6 +6291,7 @@ mod tests {
     fn slash_completion_hints_match_user_command_aliases() {
         let tmp = tempfile::TempDir::new().unwrap();
         let commands_dir = tmp.path().join(".codewhale").join("commands");
+        crate::test_support::trust_workspace(tmp.path());
         std::fs::create_dir_all(&commands_dir).unwrap();
         std::fs::write(
             commands_dir.join("deploy-target.md"),
@@ -6227,6 +6336,7 @@ mod tests {
     fn slash_completion_omits_rejected_user_alias_collisions() {
         let tmp = tempfile::TempDir::new().unwrap();
         let commands_dir = tmp.path().join(".codewhale").join("commands");
+        crate::test_support::trust_workspace(tmp.path());
         std::fs::create_dir_all(&commands_dir).unwrap();
         std::fs::write(
             commands_dir.join("alpha.md"),
@@ -6259,6 +6369,7 @@ mod tests {
     fn slash_completion_hints_keep_builtin_canonical_when_only_builtin_alias_is_shadowed() {
         let tmp = tempfile::TempDir::new().unwrap();
         let commands_dir = tmp.path().join(".codewhale").join("commands");
+        crate::test_support::trust_workspace(tmp.path());
         std::fs::create_dir_all(&commands_dir).unwrap();
         std::fs::write(
             commands_dir.join("attach-review.md"),
@@ -6312,6 +6423,7 @@ mod tests {
         // suggestion is absent and the user command appears for the alias.
         let tmp = tempfile::TempDir::new().unwrap();
         let commands_dir = tmp.path().join(".codewhale").join("commands");
+        crate::test_support::trust_workspace(tmp.path());
         std::fs::create_dir_all(&commands_dir).unwrap();
         std::fs::write(
             commands_dir.join("assistant.md"),
@@ -6342,6 +6454,7 @@ mod tests {
     fn slash_completion_hints_prefer_user_metadata_for_shadowed_builtin() {
         let tmp = tempfile::TempDir::new().unwrap();
         let commands_dir = tmp.path().join(".codewhale").join("commands");
+        crate::test_support::trust_workspace(tmp.path());
         std::fs::create_dir_all(&commands_dir).unwrap();
         std::fs::write(
             commands_dir.join("help.md"),
@@ -7497,6 +7610,7 @@ mod tests {
     fn durable_tasks_suppress_the_launch_tableau() {
         let mut app = create_test_app();
         app.task_panel.push(TaskPanelEntry {
+            exit_code: None,
             id: "shell_1".to_string(),
             status: "running".to_string(),
             prompt_summary: "cargo test".to_string(),

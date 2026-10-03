@@ -249,6 +249,32 @@ impl FleetDetailView {
             .and_then(|idx| self.fleet.members.get(idx))
     }
 
+    /// Whether the file on disk is still exactly what this editor loaded (or
+    /// last wrote). Every write from the editor checks it first, so a save
+    /// never replaces a newer version written by another session or by hand,
+    /// and never recreates a file that was removed meanwhile.
+    ///
+    /// Known limitation: this is check-then-write, not a lock; a write that
+    /// lands between the check and the atomic rename is not detected.
+    fn source_unchanged(&self) -> bool {
+        self.saved_source.is_some()
+            && std::fs::read_to_string(&self.source).ok() == self.saved_source
+    }
+
+    /// The pager shown when the source moved underneath the editor.
+    fn stale_source_action(&self, title: &str) -> ViewAction {
+        ViewAction::Emit(ViewEvent::OpenTextPager {
+            title: title.to_string(),
+            content: format!(
+                "Nothing was written.\n\n{} changed on disk after this editor opened it \
+                 (another session or an external edit). Saving now would overwrite \
+                 that newer version.\n\nClose this editor and reopen the team to load \
+                 the current file, then make the change again.",
+                self.source.display()
+            ),
+        })
+    }
+
     fn start_rename(&mut self) {
         self.rename_mode = true;
         self.rename_input = self.fleet.name.clone();
@@ -263,6 +289,10 @@ impl FleetDetailView {
         if new_name == self.fleet.name {
             self.rename_mode = false;
             return Some(ViewAction::None);
+        }
+        if !self.source_unchanged() {
+            self.rename_mode = false;
+            return Some(self.stale_source_action("Rename refused"));
         }
         // The rename must not collide with a different Fleet of the same slug
         // in this scope (the store refuses that at save).
@@ -479,10 +509,7 @@ impl FleetDetailView {
     ) -> Result<String, String> {
         // A picker belongs to one editor instance and the exact saved file
         // it opened. Never recreate a removed file or overwrite newer edits.
-        if editor_id != self.editor_id
-            || self.saved_source.is_none()
-            || std::fs::read_to_string(&self.source).ok() != self.saved_source
-        {
+        if editor_id != self.editor_id || !self.source_unchanged() {
             return Err(tr(self.locale, MessageId::FleetRoutePickUnavailable).into_owned());
         }
         if let FleetRouteTarget::Member(idx) = target
@@ -643,6 +670,9 @@ impl FleetDetailView {
     }
 
     fn save(&self) -> Option<ViewAction> {
+        if !self.source_unchanged() {
+            return Some(self.stale_source_action("Save refused"));
+        }
         match save_fleet(&self.fleet, self.scope, &self.workspace) {
             Ok(path) => Some(ViewAction::EmitAndClose(ViewEvent::FleetStoreChanged {
                 message: format!(
@@ -1822,9 +1852,9 @@ mod tests {
         save_fleet(&fleet, FleetScope::Workspace, ws.path()).unwrap();
         let config = Config {
             provider: Some("deepseek".into()),
-            api_key: Some("test-key".into()),
             ..Default::default()
-        };
+        }
+        .with_legacy_root(Some("test-key".into()), None);
         let mut view = FleetDetailView::open_for_member(
             &app_in(ws.path().to_path_buf()),
             &config,
@@ -2119,5 +2149,59 @@ mod tests {
         view.handle_key(key(KeyCode::Char('d')));
         view.handle_key(key(KeyCode::Char('y')));
         assert_eq!(view.fleet.members, fleet.members);
+    }
+
+    /// U09-01: an ordinary Save or rename never overwrites a Fleet file that
+    /// changed on disk after the editor opened it; the newer version survives
+    /// and the editor says to reload.
+    #[test]
+    fn save_and_rename_refuse_an_externally_newer_source() {
+        let ws = tempfile::TempDir::new().unwrap();
+        let fleet = sample_fleet("Fleet S");
+        let path = save_fleet(&fleet, FleetScope::Workspace, ws.path()).unwrap();
+        let mut view = FleetDetailView::open(
+            &app_in(ws.path().to_path_buf()),
+            &Config::default(),
+            "Fleet S",
+            FleetScope::Workspace,
+        )
+        .expect("open");
+
+        // Another session saves a newer version of the same team.
+        let mut newer = fleet.clone();
+        newer.operator = Some(FleetOperator {
+            provider: "openai".to_string(),
+            model: "gpt-5.6".to_string(),
+            reasoning: None,
+        });
+        save_fleet(&newer, FleetScope::Workspace, ws.path()).unwrap();
+        let on_disk = std::fs::read(&path).unwrap();
+
+        view.fleet.operator = Some(FleetOperator {
+            provider: "deepseek".to_string(),
+            model: "deepseek-v4-pro".to_string(),
+            reasoning: None,
+        });
+        let action = view.handle_key(key(KeyCode::Char('s')));
+        assert!(
+            matches!(&action, ViewAction::Emit(ViewEvent::OpenTextPager { title, .. }) if title == "Save refused"),
+            "{action:?}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), on_disk);
+
+        view.handle_key(key(KeyCode::Char('r')));
+        for _ in "Fleet S".chars() {
+            view.handle_key(key(KeyCode::Backspace));
+        }
+        for ch in "Fleet T".chars() {
+            view.handle_key(key(KeyCode::Char(ch)));
+        }
+        let action = view.handle_key(key(KeyCode::Enter));
+        assert!(
+            matches!(&action, ViewAction::Emit(ViewEvent::OpenTextPager { title, .. }) if title == "Rename refused"),
+            "{action:?}"
+        );
+        assert_eq!(view.fleet.name, "Fleet S");
+        assert_eq!(std::fs::read(&path).unwrap(), on_disk);
     }
 }

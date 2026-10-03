@@ -11,7 +11,9 @@ use std::sync::{OnceLock, RwLock};
 pub fn event_for_kind(kind: NotificationKind) -> SoundEvent {
     match kind {
         NotificationKind::TurnComplete => SoundEvent::TurnComplete,
-        NotificationKind::SubagentTerminal => SoundEvent::SubagentTerminal,
+        NotificationKind::SubagentTerminal | NotificationKind::BackgroundTerminal => {
+            SoundEvent::SubagentTerminal
+        }
         NotificationKind::ApprovalNeeded => SoundEvent::ApprovalNeeded,
         NotificationKind::InputNeeded => SoundEvent::InputNeeded,
         NotificationKind::ElevationNeeded => SoundEvent::ElevationNeeded,
@@ -161,6 +163,18 @@ pub fn decide(kind: NotificationKind, now_ms: u64, bell_transport: bool) -> Soun
         .write()
         .map(|mut policy| policy.decide(event_for_kind(kind), now_ms, bell_transport))
         .unwrap_or(SoundDecision::Suppress(SuppressReason::Disabled))
+}
+
+/// Give back a repeat slot that `decide` reserved for a cue that did not play.
+/// Only the exact reservation is released, so a later decision in the same
+/// category keeps its own slot.
+pub fn release(kind: NotificationKind, reserved_ms: u64) {
+    if let Ok(mut policy) = policy_cell().write() {
+        let slot = &mut policy.last_played_ms[event_for_kind(kind).index()];
+        if *slot == Some(reserved_ms) {
+            *slot = None;
+        }
+    }
 }
 
 /// Decide from this request's configuration while holding the shared history
@@ -498,6 +512,10 @@ mod tests {
             NotificationKind::ModelNotify,
         ];
         assert_eq!(kinds.map(event_for_kind), SoundEvent::ALL);
+        assert_eq!(
+            event_for_kind(NotificationKind::BackgroundTerminal),
+            SoundEvent::SubagentTerminal
+        );
         for event in SoundEvent::ALL {
             assert_eq!(SoundEvent::parse(event.as_str()), Some(event));
         }

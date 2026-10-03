@@ -107,6 +107,8 @@ pub enum StepStatus {
     Deferred,
     /// Currently being worked on.
     InProgress,
+    /// A usable route is configured, but has not been checked with the provider.
+    Configured,
     /// Completed and checked (e.g. key validated, mode confirmed).
     Verified,
     /// Reached a usable-but-incomplete state needing user action
@@ -125,7 +127,8 @@ impl StepStatus {
     pub fn is_settled(self) -> bool {
         matches!(
             self,
-            StepStatus::Verified
+            StepStatus::Configured
+                | StepStatus::Verified
                 | StepStatus::NeedsAction
                 | StepStatus::Deferred
                 | StepStatus::Optional
@@ -424,14 +427,14 @@ impl SetupState {
         self.status(step) == StepStatus::Verified
     }
 
-    /// Provider/model is acceptable for first-run readiness when it is either
-    /// verified or in an actionable needs-action state (the EPIC keeps a
-    /// failed-key path reaching the ready screen).
+    /// Provider/model is acceptable for first-run readiness when configured,
+    /// verified or in an actionable needs-action state (the failed-key path
+    /// still reaches the ready screen).
     #[must_use]
     fn provider_model_ready_or_needs_action(&self) -> bool {
         matches!(
             self.status(SetupStep::ProviderModel),
-            StepStatus::Verified | StepStatus::NeedsAction
+            StepStatus::Configured | StepStatus::Verified | StepStatus::NeedsAction
         )
     }
 
@@ -499,12 +502,12 @@ impl SetupState {
         self
     }
 
-    /// Update only telemetry metadata from the latest readable sidecar.
+    /// Update fields from the latest readable sidecar under the shared lock.
     ///
-    /// Disclosure bookkeeping and explicit preference writes share this lock:
-    /// a stale disclosure write must never erase a concurrently saved decline.
+    /// Startup configuration receipts, disclosure bookkeeping and explicit
+    /// privacy writes share this lock so none can erase a concurrent decision.
     /// Missing state is fresh; corrupt state is never replaced with defaults.
-    pub fn update_telemetry_at(path: &Path, update: impl FnOnce(&mut Self)) -> Result<()> {
+    pub fn update_at(path: &Path, update: impl FnOnce(&mut Self)) -> Result<()> {
         let parent = path.parent().context("setup-state path has no parent")?;
         std::fs::create_dir_all(parent)?;
         let file = std::fs::OpenOptions::new()
@@ -512,6 +515,7 @@ impl SetupState {
             .truncate(false)
             .read(true)
             .write(true)
+            // Keep the released lock path for concurrent older processes.
             .open(path.with_extension("telemetry.lock"))?;
         let mut lock = fd_lock::RwLock::new(file);
         let _guard = lock.try_write()?;
@@ -565,8 +569,8 @@ impl SetupState {
 
     /// Derive a safe inherited state for an existing user with no persisted
     /// `setup_state.json`. Surfaces they already configured become
-    /// [`StepStatus::Verified`]; an update never looks like a fresh, broken
-    /// setup. The constitution checkpoint is intentionally left incomplete so
+    /// settled; a provider route is only [`StepStatus::Configured`] until checked.
+    /// The constitution checkpoint is intentionally left incomplete so
     /// updating users still see it once.
     #[must_use]
     pub fn derive_inherited(facts: &InheritedConfigFacts) -> Self {
@@ -587,7 +591,7 @@ impl SetupState {
         if facts.has_provider_route && facts.has_credentials_or_local_runtime {
             state.set_step(
                 SetupStep::ProviderModel,
-                StepEntry::new(StepStatus::Verified, true, inherited),
+                StepEntry::new(StepStatus::Configured, true, inherited),
             );
         } else if facts.has_provider_route {
             state.set_step(
@@ -784,6 +788,24 @@ mod tests {
     }
 
     #[test]
+    fn configured_provider_settles_first_run_without_verifying_operate() {
+        let mut state = SetupState::default();
+        state.set_step(SetupStep::Language, verified("test"));
+        state.set_step(
+            SetupStep::ProviderModel,
+            StepEntry::new(StepStatus::Configured, true, "test"),
+        );
+        state.set_step(SetupStep::OperateFleet, verified("test"));
+        state.runtime_posture_source = RuntimePostureSource::Confirmed;
+        state.constitution_choice = ConstitutionChoice::Bundled;
+        state.operate_receipts_verified = true;
+        assert!(state.first_run_ready());
+        assert!(!state.operate_ready());
+        state.set_step(SetupStep::ProviderModel, verified("test"));
+        assert!(state.operate_ready());
+    }
+
+    #[test]
     fn needs_action_provider_still_reaches_ready() {
         let mut state = SetupState::default();
         state.set_step(SetupStep::Language, verified("0.8.67"));
@@ -828,7 +850,10 @@ mod tests {
         let state = SetupState::derive_inherited(&facts);
         assert!(state.inherited);
         assert_eq!(state.status(SetupStep::Language), StepStatus::Verified);
-        assert_eq!(state.status(SetupStep::ProviderModel), StepStatus::Verified);
+        assert_eq!(
+            state.status(SetupStep::ProviderModel),
+            StepStatus::Configured
+        );
         assert_eq!(state.status(SetupStep::TrustSandbox), StepStatus::Verified);
         assert_eq!(state.constitution_source, ConstitutionSource::Bundled);
         // The update checkpoint must still be shown to an upgrading user.

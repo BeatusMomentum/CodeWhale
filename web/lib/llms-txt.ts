@@ -1,4 +1,5 @@
 import { DOC_TOPICS, REPO_DOCS_BASE, docTopicHref } from "./docs-map";
+import { computerUse } from "./i18n/dictionaries/en/computer-use";
 import { DISCORD_URL, REPO_URL } from "./i18n/links";
 import { IDENTITY_PHRASE, SITE_NAME, SITE_URL } from "./page-meta";
 
@@ -30,6 +31,12 @@ const EXTRA_PAGES: readonly { path: string; title: string; description: string }
     title: "Runtime & Integrations",
     description:
       "Local Runtime API, HTTP/SSE, baseline ACP stdio adapter, MCP servers, and an early VS Code companion.",
+  },
+  {
+    // The page's own English copy, so the index cannot drift from it (W01-03).
+    path: "/computer-use",
+    title: computerUse.title,
+    description: computerUse.metaDescription,
   },
   {
     path: "/constitution",

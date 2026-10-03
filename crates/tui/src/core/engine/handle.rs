@@ -22,6 +22,7 @@ use super::{
     CancelReason, EngineHandle, LiveRuntimeAuthority, Op, RuntimePermissionAuthority,
     UserInputResponse,
 };
+use crate::approval_log::ApprovalDecider;
 
 #[derive(Clone)]
 pub(super) struct TurnControl {
@@ -486,30 +487,72 @@ impl EngineHandle {
         }
     }
 
-    /// Approve a pending tool call
-    pub async fn approve_tool_call(&self, id: impl Into<String>) -> Result<()> {
-        self.tx_approval
-            .send(ApprovalDecision::Approved { id: id.into() })
-            .await?;
+    /// Deliver one approval answer. An agent's pending call gets it directly
+    /// — the engine may be streaming or running tools and not reading
+    /// approvals — and everything else goes to the engine's own waiting call.
+    async fn send_approval(&self, decision: ApprovalDecision) -> Result<()> {
+        use crate::tools::subagent::ChildApprovalOutcome;
+        let child = match &decision {
+            ApprovalDecision::Approved { id, .. } => Some((id, ChildApprovalOutcome::Approved)),
+            ApprovalDecision::Denied { id, .. } => Some((id, ChildApprovalOutcome::Denied)),
+            // An agent has no timeout outcome of its own (#6101): an expired
+            // card is a deny for whichever call it was answering.
+            ApprovalDecision::TimedOut { id } => Some((id, ChildApprovalOutcome::Denied)),
+            ApprovalDecision::Unavailable { id } => Some((id, ChildApprovalOutcome::Unavailable)),
+            // A sandbox retry only exists for the parent's own tool call.
+            ApprovalDecision::RetryWithPolicy { .. } => None,
+        };
+        if let Some((id, outcome)) = child
+            && crate::tools::subagent::SubAgentManager::is_child_approval_id(id)
+            && self
+                .subagent_manager
+                .write()
+                .await
+                .resolve_child_approval(id, outcome)
+        {
+            return Ok(());
+        }
+        self.tx_approval.send(decision).await?;
         Ok(())
     }
 
-    /// Deny a pending tool call
+    /// Approve a pending tool call because a person said yes.
+    pub async fn approve_tool_call(&self, id: impl Into<String>) -> Result<()> {
+        self.approve_tool_call_by(id, ApprovalDecider::User).await
+    }
+
+    /// Approve a pending tool call, recording who answered: a person, a
+    /// session rule, or the active posture. The approval receipt keeps it.
+    pub async fn approve_tool_call_by(
+        &self,
+        id: impl Into<String>,
+        by: ApprovalDecider,
+    ) -> Result<()> {
+        self.send_approval(ApprovalDecision::Approved { id: id.into(), by })
+            .await
+    }
+
+    /// Deny a pending tool call because a person said no.
     pub async fn deny_tool_call(&self, id: impl Into<String>) -> Result<()> {
-        self.tx_approval
-            .send(ApprovalDecision::Denied { id: id.into() })
-            .await?;
-        Ok(())
+        self.deny_tool_call_by(id, ApprovalDecider::User).await
+    }
+
+    /// Deny a pending tool call, recording who answered.
+    pub async fn deny_tool_call_by(
+        &self,
+        id: impl Into<String>,
+        by: ApprovalDecider,
+    ) -> Result<()> {
+        self.send_approval(ApprovalDecision::Denied { id: id.into(), by })
+            .await
     }
 
     /// Deny a pending tool call because its interactive approval card
     /// expired (#6101). Kept distinct from [`Self::deny_tool_call`] so the
     /// receipt records a timeout instead of an operator denial.
     pub async fn deny_tool_call_timed_out(&self, id: impl Into<String>) -> Result<()> {
-        self.tx_approval
-            .send(ApprovalDecision::TimedOut { id: id.into() })
-            .await?;
-        Ok(())
+        self.send_approval(ApprovalDecision::TimedOut { id: id.into() })
+            .await
     }
 
     /// Resolve a pending tool call whose request could not be put in front
@@ -517,22 +560,32 @@ impl EngineHandle {
     /// conversation). Kept distinct from [`Self::deny_tool_call`] so neither
     /// the receipt nor the model message claims the person denied it.
     pub async fn deny_tool_call_unavailable(&self, id: impl Into<String>) -> Result<()> {
-        self.tx_approval
-            .send(ApprovalDecision::Unavailable { id: id.into() })
-            .await?;
-        Ok(())
+        self.send_approval(ApprovalDecision::Unavailable { id: id.into() })
+            .await
     }
 
-    /// Retry a tool call with an elevated sandbox policy.
+    /// Retry a tool call with an elevated sandbox policy a person chose.
     pub async fn retry_tool_with_policy(
         &self,
         id: impl Into<String>,
         policy: crate::sandbox::SandboxPolicy,
     ) -> Result<()> {
+        self.retry_tool_with_policy_by(id, policy, ApprovalDecider::User)
+            .await
+    }
+
+    /// Retry a tool call with an elevated sandbox policy, recording who chose it.
+    pub async fn retry_tool_with_policy_by(
+        &self,
+        id: impl Into<String>,
+        policy: crate::sandbox::SandboxPolicy,
+        by: ApprovalDecider,
+    ) -> Result<()> {
         self.tx_approval
             .send(ApprovalDecision::RetryWithPolicy {
                 id: id.into(),
                 policy,
+                by,
             })
             .await?;
         Ok(())

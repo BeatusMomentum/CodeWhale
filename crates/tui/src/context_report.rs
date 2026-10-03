@@ -10,7 +10,9 @@
 //! guard, never as the headline. Per-source entries keep the conservative
 //! per-text heuristic.
 
-use std::fmt::Write as _;
+mod portable_projection;
+pub(crate) use portable_projection::source_map as project_source_map;
+
 use std::path::Path;
 
 use chrono::{SecondsFormat, Utc};
@@ -21,6 +23,7 @@ use crate::compaction::{
     estimate_text_tokens_conservative,
 };
 use crate::config::Config;
+#[cfg(test)]
 use crate::context_budget::PressureLevel;
 use crate::prompts::{CORE_EXECUTION_PROFILE_PROMPT, Personality};
 use crate::route_budget::route_context_window_tokens;
@@ -274,7 +277,7 @@ pub fn build_context_report(app: &App) -> PromptSourceMap {
         &app.workspace,
         Some(&app.skills_dir),
         app.project_context_pack_enabled,
-        app.skills_scan_codewhale_only,
+        app.skills_discovery_mode,
         app.ui_locale.tag(),
         app.mode,
         Some(app.plugin_registry.as_ref()),
@@ -372,7 +375,7 @@ pub fn build_headless_context_report(config: &Config, workspace: &Path) -> Promp
         workspace,
         Some(&selected_skills_dir),
         config.project_context_pack_enabled(),
-        config.skills_config().scan_codewhale_only(),
+        crate::skills::SkillDiscoveryMode::from_config(&config.skills_config()),
         "en",
         AppMode::Agent,
         None,
@@ -438,7 +441,7 @@ fn base_source_entries(
     workspace: &Path,
     skills_dir: Option<&Path>,
     project_pack_enabled: bool,
-    skills_scan_codewhale_only: bool,
+    skills_discovery_mode: crate::skills::SkillDiscoveryMode,
     locale_tag: &str,
     mode: AppMode,
     plugin_registry: Option<&crate::plugins::PluginRegistry>,
@@ -488,10 +491,13 @@ fn base_source_entries(
     }
 
     if let Some(content) = project_context.instructions.as_deref() {
-        let source = project_context
-            .source_path
-            .as_ref()
-            .map_or_else(|| "project".to_string(), |p| p.display().to_string());
+        // Same helper as ProjectContext::as_system_block, so the report's
+        // source token derives from the same label the prompt shows. (The
+        // entry below still displays the absolute source path for operators;
+        // only the prompt label is relativized.)
+        let source = crate::project_context::project_instructions_source_label(
+            project_context.source_path.as_deref(),
+        );
         let mut block = format!(
             "<project_instructions source=\"{source}\">\n{content}\n</project_instructions>"
         );
@@ -570,8 +576,7 @@ fn base_source_entries(
         ));
     }
 
-    let skill_discovery_mode =
-        crate::skills::SkillDiscoveryMode::from_codewhale_only(skills_scan_codewhale_only);
+    let skill_discovery_mode = skills_discovery_mode;
     let skills_budget = crate::skills::skills_prompt_budget_chars(context_window_tokens);
     let skills_block = match skills_dir {
         Some(dir) => crate::skills::render_available_skills_context_for_workspace_and_dir_with_mode_and_plugins(
@@ -849,6 +854,7 @@ fn content_block_text(block: &ContentBlock) -> String {
     }
 }
 
+#[cfg(test)]
 fn pressure_label(percent: Option<f64>) -> &'static str {
     // Delegate to the unified pressure thresholds so this diagnostic label can't
     // drift from `context_budget::PressureLevel`. `None` (unknown window) keeps
@@ -859,147 +865,18 @@ fn pressure_label(percent: Option<f64>) -> &'static str {
     }
 }
 
+#[cfg(test)]
 pub fn format_context_report(report: &PromptSourceMap) -> String {
-    let mut out = String::new();
-    let _ = writeln!(out, "Context Source Map");
-    let _ = writeln!(
-        out,
-        "Estimated active context: {} tokens",
-        report.active_context_estimated_tokens
-    );
-    write_overflow_guard_line(&mut out, report);
-    match (report.context_window_tokens, report.budget_used_percent) {
-        (Some(window), Some(percent)) => {
-            let source = report
-                .context_window_source
-                .as_deref()
-                .unwrap_or_else(|| crate::route_runtime::ContextWindowSource::Fallback.label());
-            // An unverified rung is a guess about the window printed on this
-            // same line; it must not claim a fixed 128K default the capability
-            // matrix may not hold. A label from no known rung is no evidence
-            // either, so it reads the same way.
-            let source_label = if crate::route_runtime::ContextWindowSource::from_label(source)
-                .is_some_and(crate::route_runtime::ContextWindowSource::is_verified)
-            {
-                source.to_string()
-            } else {
-                format!(
-                    "{source} (unverified — nothing describes this model, so this window is a guess)"
-                )
-            };
-            let _ = writeln!(
-                out,
-                "Window: {window} tokens ({percent:.1}% used, {}; source: {})",
-                pressure_label(Some(percent)),
-                source_label
-            );
-        }
-        _ => {
-            let _ = writeln!(out, "Window: unknown");
-        }
-    }
-    // #5134: the source label says where the window came from but not how to
-    // change it. Name the key here so the report answers the question it
-    // provokes.
-    let _ = writeln!(
-        out,
-        "Change the window: set `context_window` on the active `[providers.<name>]` table in config.toml (docs/CONFIGURATION.md, \"Context length\")."
-    );
-    let _ = writeln!(
-        out,
-        "Source-entry total: {} tokens",
-        report.total_estimated_tokens
-    );
-    let _ = writeln!(
-        out,
-        "Manage standing law: /constitution (status/preview), /constitution repo (repo-local law), /setup report (readiness)."
-    );
-    let _ = writeln!(out);
-    let _ = writeln!(out, "Sources:");
-    for entry in &report.entries {
-        let path = entry
-            .source_path
-            .as_deref()
-            .map(|path| format!(" [{path}]"))
-            .unwrap_or_default();
-        let tier = entry
-            .authority_tier
-            .map(|tier| format!(", tier {tier}"))
-            .unwrap_or_default();
-        let omitted = entry
-            .truncation_reason
-            .as_deref()
-            .map(|reason| format!(" - {reason}"))
-            .unwrap_or_default();
-        let _ = writeln!(
-            out,
-            "- {:?}: {}{} - {} tokens ({:?}{}){}",
-            entry.source_kind,
-            entry.label,
-            path,
-            entry.estimated_tokens,
-            entry.counting_confidence,
-            tier,
-            omitted
-        );
-    }
-    let _ = writeln!(out);
-    let _ = write!(out, "{}", report.note);
-    out
+    crate::diagnostics_reports::format_context_report(&project_source_map(report.clone()))
 }
 
-/// Secondary line: the inflated overflow-guard figure, labeled so nobody
-/// reads it as the pressure the meter and the compaction gate act on.
-fn write_overflow_guard_line(out: &mut String, report: &PromptSourceMap) {
-    if let Some(guard) = report.overflow_guard_estimated_tokens {
-        let _ = writeln!(
-            out,
-            "Overflow guard: {guard} tokens (conservative 1.5x estimate that blocks oversized requests; not the pressure the meter and auto-compaction read)"
-        );
-    }
-}
-
+#[cfg(test)]
 pub fn format_context_summary(report: &PromptSourceMap) -> String {
-    let mut entries = report.entries.clone();
-    entries.sort_by_key(|entry| std::cmp::Reverse(entry.estimated_tokens));
-    let top = entries
-        .iter()
-        .take(5)
-        .map(|entry| format!("{} ({})", entry.label, entry.estimated_tokens))
-        .collect::<Vec<_>>()
-        .join(", ");
-
-    let mut out = String::new();
-    let _ = writeln!(out, "Context Summary");
-    let _ = writeln!(
-        out,
-        "Pressure: {}",
-        pressure_label(report.budget_used_percent)
-    );
-    let _ = writeln!(
-        out,
-        "Estimated active context: {} tokens",
-        report.active_context_estimated_tokens
-    );
-    if let Some(percent) = report.budget_used_percent {
-        let _ = writeln!(out, "Budget used: {percent:.1}%");
-    }
-    write_overflow_guard_line(&mut out, report);
-    let _ = write!(out, "Top sources: {top}");
-    out
+    crate::diagnostics_reports::format_context_summary(&project_source_map(report.clone()))
 }
 
 pub fn context_report_json(report: &PromptSourceMap) -> String {
-    serde_json::to_string_pretty(report).unwrap_or_else(|err| {
-        format!("{{\"error\":\"failed to serialize context report: {err}\"}}")
-    })
-}
-
-#[must_use]
-pub fn prompt_context_json(context: &PromptContext) -> String {
-    serde_json::to_string_pretty(context).unwrap_or_else(|error| {
-        format!(r#"{{"error":"failed to serialize prompt context: {error}"}}"#)
-    })
+    crate::diagnostics_reports::context_report_json(&project_source_map(report.clone()))
 }
 
 #[cfg(test)]
@@ -1029,6 +906,7 @@ mod tests {
             Message {
                 role: Role::Assistant,
                 content: vec![ContentBlock::ToolResult {
+                    execution_id: None,
                     tool_use_id: "call_1".to_string(),
                     content: "large tool output".repeat(40),
                     is_error: None,

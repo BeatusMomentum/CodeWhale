@@ -1,5 +1,7 @@
 # Tool surface
 
+> 阅读简体中文版：[zh_hans/TOOL_SURFACE.md](zh_hans/TOOL_SURFACE.md)。
+
 This document describes the current model-facing tool contract. The v0.9.1
 cutover that produced it is recorded in `docs/RUNTIME_SIMPLIFICATION_DESIGN.md`;
 read the workspace version from `Cargo.toml`, not from this line. The registry
@@ -73,7 +75,11 @@ does not mean "unable to research."
 
 The durable `github`, `automation`, and `rlm` action families are also deferred
 by default. `rlm` owns `open`, `eval`, `configure`, and `close` actions for a
-persistent sandboxed Python session. Feature-gated native tools may be added to
+persistent local Python session (a subprocess with a scrubbed environment, not
+an OS sandbox). Inline ```` ```repl ```` fences in a reply run in the same kind of
+kernel only when `code_execution` is on the turn's surface (never in Plan mode),
+only when the fence opens its own line, and only after `code_execution`'s
+approval under the session posture. Feature-gated native tools may be added to
 the active or deferred catalog only when their implementation and host
 dependencies are available.
 

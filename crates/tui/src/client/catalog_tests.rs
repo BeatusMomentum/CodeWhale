@@ -704,10 +704,12 @@ async fn raw_rows_keep_duplicate_known_fields_invalid_in_existing_parsers() {
             body.contains(malformed),
             "collector must retain original row fields"
         );
-        assert_eq!(
-            parse_openrouter_models_response(&body).unwrap_err(),
-            CatalogRefreshError::InvalidResponse
-        );
+        // OpenRouter decodes per row (#6690): the ambiguous row is skipped as
+        // malformed, never accepted with a last-wins value, and the valid row
+        // survives.
+        let openrouter = parse_openrouter_models_response(&body).unwrap();
+        let ids: Vec<&str> = openrouter.iter().map(|item| item.id.as_str()).collect();
+        assert_eq!(ids, ["first"]);
         assert_eq!(
             parse_baseten_models_response(&body).unwrap_err(),
             CatalogRefreshError::InvalidResponse

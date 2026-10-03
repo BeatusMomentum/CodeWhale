@@ -24,9 +24,21 @@ pub(crate) fn mutate_config_document<F>(path: &Path, mutate: F) -> anyhow::Resul
 where
     F: FnOnce(&mut toml_edit::DocumentMut) -> anyhow::Result<()>,
 {
-    codewhale_config::mutate_config_document(path, |doc| {
+    mutate_config_document_with_migration(path, |doc, _| mutate(doc))
+}
+
+/// [`mutate_config_document`], also handing `mutate` the receipt of the legacy
+/// top-level `base_url` / `api_key` move this same write made (#6394).
+pub(crate) fn mutate_config_document_with_migration<F>(path: &Path, mutate: F) -> anyhow::Result<()>
+where
+    F: FnOnce(
+        &mut toml_edit::DocumentMut,
+        &codewhale_config::legacy_root::LegacyRootMigration,
+    ) -> anyhow::Result<()>,
+{
+    codewhale_config::mutate_config_document_with_migration(path, |doc, moved| {
         migrate_legacy_route_preferences(path, doc)?;
-        mutate(doc)
+        mutate(doc, moved)
     })
 }
 
@@ -46,7 +58,7 @@ pub(crate) fn migrate_legacy_route_preferences(
     {
         return Ok(());
     }
-    let mut config: crate::config::Config = toml::from_str(&doc.to_string()).map_err(|_| {
+    let mut config = crate::config::parse_config_base(&doc.to_string()).map_err(|_| {
         anyhow::anyhow!(
             "Could not parse configuration for route preference migration; contents omitted"
         )
@@ -164,7 +176,7 @@ pub(crate) fn set_provider_model_document(
         !model.trim().is_empty() && !model.chars().any(char::is_control),
         "model must be nonempty and contain no control characters"
     );
-    let config: crate::config::Config = toml::from_str(&doc.to_string()).map_err(|_| {
+    let config = crate::config::parse_config_base(&doc.to_string()).map_err(|_| {
         anyhow::anyhow!("Could not parse destination route identity; contents omitted")
     })?;
     let identity = config
@@ -194,15 +206,20 @@ pub(crate) fn set_provider_model_document(
 }
 
 /// One persistent owner and atomic write for an explicitly saved route.
+///
+/// Also returns the undo for exactly this write, taken under the config lock,
+/// so a caller whose follow-up apply step is rejected can take back only the
+/// switch.
 pub(crate) fn persist_provider_selection(
     config_path: Option<&Path>,
     provider: ApiProvider,
     provider_identity: &str,
     model: Option<&str>,
-) -> anyhow::Result<PathBuf> {
+) -> anyhow::Result<(PathBuf, codewhale_config::ConfigDocumentUndo)> {
     let path = config_toml_path(config_path)?;
-    mutate_config_document(&path, |doc| {
-        let config: crate::config::Config = toml::from_str(&doc.to_string())
+    let ((), undo) = codewhale_config::mutate_config_document_undoable(&path, |doc| {
+        migrate_legacy_route_preferences(&path, doc)?;
+        let config = crate::config::parse_config_base(&doc.to_string())
             .map_err(|_| anyhow::anyhow!("Could not parse destination route; contents omitted"))?;
         let identity = config
             .resolve_provider_pin_identity(provider_identity)
@@ -226,7 +243,7 @@ pub(crate) fn persist_provider_selection(
         )?;
         reconcile_root_model_aliases(doc, &config, &identity)
     })?;
-    Ok(path)
+    Ok((path, undo))
 }
 
 /// Keep a root `default_text_model` alias from stranding a route switch,
@@ -236,13 +253,16 @@ pub(crate) fn persist_provider_selection(
 /// when the selected route has no model of its own. A switch that leaves the
 /// incoming route without a leaf therefore hands it an alias naming the route
 /// on its way out, and `Config::load` rejects the file the caller just wrote —
-/// a committed switch that produces an unloadable config.
+/// a committed switch that produces an unloadable config — or, on a
+/// pass-through incoming route that loads it, a model the incoming route never
+/// chose while the outgoing route comes back on its catalog default.
 ///
-/// Relocate that value onto the outgoing route's own canonical leaf, because
-/// it is real saved state, and only then clear the alias. An alias the
-/// incoming route already shadows with its own leaf is inert and stays:
-/// deleting a saved choice to satisfy validation of a value nothing resolves
-/// is data loss, not a repair. Likewise an unnamed custom route stores its
+/// When the outgoing route has no leaf and was resolving the alias, relocate
+/// that value onto the outgoing route's own canonical leaf, because it is real
+/// saved state, and only then clear the alias. Any other alias the incoming
+/// route already shadows with its own leaf is inert and stays: deleting a
+/// saved choice to satisfy validation of a value nothing resolves is data
+/// loss, not a repair. Likewise an unnamed custom route stores its
 /// model in the alias itself and has no leaf to receive it. If the incoming
 /// route cannot shadow that value, refuse the switch atomically and ask for an
 /// explicit destination model instead of saving an unloadable configuration.
@@ -261,11 +281,26 @@ pub(crate) fn reconcile_root_model_aliases(
     if incoming.provider == ApiProvider::Custom && incoming.persisted_id().is_none() {
         return Ok(());
     }
-    // Only `default_text_model` is read here. The legacy root `model` key is
+    // The outgoing route was resolving the alias as its own model. Move it
+    // onto that route's leaf even when the incoming route could load it: a
+    // pass-through incoming route would otherwise inherit a model it never
+    // chose, and the outgoing route would come back on its catalog default.
+    if let Some((outgoing, value)) = previous.root_model_alias_owned_by_outgoing(incoming) {
+        set_provider_model_document(
+            doc,
+            outgoing.provider,
+            outgoing.persisted_id().unwrap_or(&outgoing.key),
+            &value,
+        )?;
+        unset_root_model_aliases(doc)?;
+        return Ok(());
+    }
+    // Below, only `default_text_model` is read. The legacy root `model` key is
     // never what blocks a load: `Config::default_model` already refuses to
     // route a foreign legacy value to a provider that cannot serve it, and
     // `Config::validate` does not consult it, so relocating it would move a
-    // value nothing is asking about.
+    // value nothing is asking about. It is still cleared together with the
+    // alias that shadows it (`unset_root_model_aliases`).
     const ROOT_KEY: &str = "default_text_model";
     let Some(value) = doc
         .get(ROOT_KEY)
@@ -274,7 +309,7 @@ pub(crate) fn reconcile_root_model_aliases(
     else {
         return Ok(());
     };
-    let switched: crate::config::Config = toml::from_str(&doc.to_string())
+    let switched = crate::config::parse_config_base(&doc.to_string())
         .map_err(|_| anyhow::anyhow!("Could not parse switched route; contents omitted"))?;
     // `Config::validate` is the single authority on what the incoming route can
     // serve, so a writer cannot disagree with the loader. Act only when this
@@ -294,7 +329,7 @@ pub(crate) fn reconcile_root_model_aliases(
     // An empty or control-bearing alias names no saved model. Nothing to
     // relocate, and clearing it loses nothing.
     if value.trim().is_empty() || value.chars().any(char::is_control) {
-        unset_document_value(doc, &[ROOT_KEY])?;
+        unset_root_model_aliases(doc)?;
         return Ok(());
     }
     // No leaf can hold this value. Keep the only copy of the user's choice
@@ -332,7 +367,20 @@ pub(crate) fn reconcile_root_model_aliases(
     // The outgoing route either already saved its own choice or has just
     // received this one, so the alias is now a shadowed duplicate that only
     // blocks the incoming route.
-    unset_document_value(doc, &[ROOT_KEY])?;
+    unset_root_model_aliases(doc)?;
+    Ok(())
+}
+
+/// Clear the root model alias: `default_text_model` and the legacy root
+/// `model` that `Config::default_model` falls back to when the former is
+/// unset. While `default_text_model` is present the legacy key resolves on no
+/// route, so removing only the alias would resurrect a stale legacy model on
+/// the incoming route (a pass-through route would then use a model nobody
+/// chose for it). When the legacy key *is* the alias, the caller has already
+/// moved its value onto the outgoing route's leaf.
+fn unset_root_model_aliases(doc: &mut toml_edit::DocumentMut) -> anyhow::Result<()> {
+    unset_document_value(doc, &["default_text_model"])?;
+    unset_document_value(doc, &["model"])?;
     Ok(())
 }
 
@@ -473,15 +521,6 @@ pub(crate) fn persist_root_bool_key(
     Ok(path)
 }
 
-pub(crate) fn persist_tui_integer_key(
-    config_path: Option<&Path>,
-    key: &str,
-    value: u64,
-) -> anyhow::Result<PathBuf> {
-    let value = i64::try_from(value).context("integer value is too large for TOML")?;
-    persist_table_value_key(config_path, "tui", key, value.into())
-}
-
 pub(crate) fn persist_subagents_bool_key(
     config_path: Option<&Path>,
     key: &str,
@@ -525,7 +564,7 @@ pub(crate) fn persist_table_string_key(
     persist_table_value_key(config_path, table_name, key, value.into())
 }
 
-fn persist_table_value_key(
+pub(crate) fn persist_table_value_key(
     config_path: Option<&Path>,
     table_name: &str,
     key: &str,
@@ -538,30 +577,13 @@ fn persist_table_value_key(
     Ok(path)
 }
 
-pub(crate) fn persist_provider_base_url_key(
-    config_path: Option<&Path>,
-    provider: ApiProvider,
-    value: &str,
-) -> anyhow::Result<PathBuf> {
-    let provider_key = provider_base_url_table_key(provider)?;
-    let path = config_toml_path(config_path)?;
-    mutate_config_document(&path, |doc| {
-        set_document_value(doc, &["providers", provider_key, "base_url"], value)
-    })?;
-    Ok(path)
-}
-
 /// Persist the endpoint that `GET /v1/config` reports as `base_url`.
 ///
 /// That value belongs to exactly one route, and the route keeps it in exactly
-/// one place: the root `base_url` for DeepSeek and the released legacy
-/// root-level custom route, or the provider's own typed `[providers.<table>]`
-/// table for every other built-in. Writing anywhere else reports success and
-/// changes nothing — which is what this key used to do, into a root
-/// `active_route_base_url` that no reader ever resolves. A user-defined
-/// `[providers.<name>]` route is refused with the same guidance the TUI's own
-/// `/config provider_url` gives: its endpoint lives in the named table, and
-/// writing it through this static-key path is out of the #1519 slice.
+/// one place: its own `[providers.<table>]` table — the typed table for a
+/// built-in, the exact `[providers.<name>]` table for a custom route. There is
+/// no top-level `base_url` any more (#6394); writing one used to hand a
+/// DeepSeek endpoint to every route that inherited it.
 pub(crate) fn persist_route_base_url(
     config_path: Option<&Path>,
     provider: ApiProvider,
@@ -569,16 +591,18 @@ pub(crate) fn persist_route_base_url(
     value: &str,
 ) -> anyhow::Result<PathBuf> {
     let path = config_toml_path(config_path)?;
-    let root_route = matches!(provider, ApiProvider::Deepseek | ApiProvider::DeepseekCN)
-        || (provider == ApiProvider::Custom
-            && provider_identity
-                .trim()
-                .eq_ignore_ascii_case(ApiProvider::Custom.as_str()));
-    if root_route {
-        mutate_config_document(&path, |doc| set_document_value(doc, &["base_url"], value))?;
-        return Ok(path);
-    }
-    let table = provider_base_url_table_key(provider)?;
+    // The literal `custom` route owns `[providers.custom]`, where its older
+    // top-level endpoint now lives. A named `[providers.<name>]` route keeps
+    // being edited in its own table (#1519).
+    let table = if provider == ApiProvider::Custom
+        && provider_identity
+            .trim()
+            .eq_ignore_ascii_case(ApiProvider::Custom.as_str())
+    {
+        ApiProvider::Custom.as_str()
+    } else {
+        provider_base_url_table_key(provider)?
+    };
     mutate_config_document(&path, |doc| {
         set_document_value(doc, &["providers", table, "base_url"], value)
     })?;
@@ -606,9 +630,10 @@ pub(crate) fn persist_provider_model_key(
 
 fn provider_base_url_table_key(provider: ApiProvider) -> anyhow::Result<&'static str> {
     match provider {
-        ApiProvider::Deepseek | ApiProvider::DeepseekCN => {
-            anyhow::bail!("DeepSeek uses the root base_url setting")
-        }
+        // DeepSeek-CN reads `[providers.deepseek]` when its own table has no
+        // endpoint: the two identities used to share the top-level
+        // `base_url` (#6394).
+        ApiProvider::Deepseek | ApiProvider::DeepseekCN => Ok("deepseek"),
         ApiProvider::DeepseekAnthropic => Ok("deepseek_anthropic"),
         ApiProvider::NvidiaNim => Ok("nvidia_nim"),
         ApiProvider::Openai => Ok("openai"),
@@ -1365,12 +1390,13 @@ action = "mode.plan"
         write_golden_config(&path);
 
         persist_root_bool_key(Some(&path), "allow_shell", true).unwrap();
-        persist_tui_integer_key(Some(&path), "scrollback_lines", 4000).unwrap();
+        persist_table_value_key(Some(&path), "tui", "scrollback_lines", 4000_i64.into()).unwrap();
         persist_table_string_key(Some(&path), "memory", "backend", "sqlite").unwrap();
         persist_subagents_bool_key(Some(&path), "enabled", true).unwrap();
-        persist_provider_base_url_key(
+        persist_route_base_url(
             Some(&path),
             crate::config::ApiProvider::Openrouter,
+            "openrouter",
             "https://openrouter.example/v2",
         )
         .unwrap();
@@ -1824,6 +1850,47 @@ slot = 1
     }
 
     #[test]
+    fn moving_root_default_off_the_root_does_not_resurrect_a_shadowed_legacy_model() {
+        use crate::test_support::{EnvVarGuard, lock_test_env};
+        let _lock = lock_test_env();
+        let home = tempfile::tempdir().unwrap();
+        let _home = EnvVarGuard::set("CODEWHALE_HOME", home.path());
+        let _model_guard = ModelEnvGuard::new();
+        let path = home.path().join("config.toml");
+        // `default_text_model` shadows the legacy root `model` on every route.
+        // Moving the alias onto openai's leaf must not un-shadow the legacy
+        // value for the pass-through incoming route.
+        fs::write(
+            &path,
+            "route_preferences_version = 1\nprovider = 'openai'\nmodel = 'deepseek-v4-flash'\ndefault_text_model = 'gpui-fixture'\n",
+        )
+        .unwrap();
+        persist_provider_selection(Some(&path), ApiProvider::Openrouter, "openrouter", None)
+            .unwrap();
+        let doc: toml::Value = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(doc.get("default_text_model").is_none(), "{doc:?}");
+        assert!(doc.get("model").is_none(), "{doc:?}");
+        assert_eq!(
+            doc["providers"]["openai"]["model"].as_str(),
+            Some("gpui-fixture")
+        );
+        let switched = crate::config::Config::load(Some(path.clone()), None).unwrap();
+        assert_eq!(switched.api_provider(), ApiProvider::Openrouter);
+        // OpenRouter normalizes the stale value to `deepseek/deepseek-v4-flash`.
+        assert!(
+            !switched.default_model().contains("deepseek-v4-flash"),
+            "{}",
+            switched.default_model()
+        );
+        assert_ne!(switched.default_model(), "gpui-fixture");
+
+        persist_provider_selection(Some(&path), ApiProvider::Openai, "openai", None).unwrap();
+        let returned = crate::config::Config::load(Some(path.clone()), None).unwrap();
+        assert_eq!(returned.api_provider(), ApiProvider::Openai);
+        assert_eq!(returned.default_model(), "gpui-fixture");
+    }
+
+    #[test]
     fn switching_provider_away_and_back_preserves_every_route_selection() {
         use crate::test_support::{EnvVarGuard, lock_test_env};
         let _lock = lock_test_env();
@@ -1848,14 +1915,24 @@ slot = 1
                 )
                 .unwrap();
                 let doc: toml::Value = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
-                // The incoming route owns its own leaf, so the outgoing root
-                // alias is inert. It is a saved choice: deleting it to satisfy
-                // validation of a value nothing resolves would be data loss.
-                assert_eq!(
-                    doc[root_key].as_str(),
-                    Some("GLM-4.6"),
-                    "an inert root fallback must survive the switch"
-                );
+                // The outgoing route was resolving the root alias only when it
+                // had no leaf; then the choice moves onto that leaf. Otherwise
+                // the alias is inert saved state and stays. Neither case may
+                // delete it.
+                if existing.is_none() {
+                    assert!(doc.get(root_key).is_none(), "{doc:?}");
+                    assert_eq!(
+                        doc["providers"]["zai"]["model"].as_str(),
+                        Some("GLM-4.6"),
+                        "the outgoing route's choice must follow it onto its leaf"
+                    );
+                } else {
+                    assert_eq!(
+                        doc[root_key].as_str(),
+                        Some("GLM-4.6"),
+                        "an inert root fallback must survive the switch"
+                    );
+                }
                 assert_eq!(
                     doc["providers"]["deepseek"]["model"].as_str(),
                     Some("deepseek-v4-pro")
@@ -1920,7 +1997,7 @@ slot = 1
     }
 
     #[test]
-    fn bare_switch_from_legacy_custom_never_commits_an_unloadable_config() {
+    fn bare_switch_from_legacy_custom_commits_a_loadable_config() {
         use crate::test_support::{EnvVarGuard, lock_test_env};
         let _lock = lock_test_env();
         let home = tempfile::tempdir().unwrap();
@@ -1930,20 +2007,22 @@ slot = 1
         let original = "route_preferences_version = 1\nprovider = 'custom'\nbase_url = 'https://proxy.example.test/v1'\ndefault_text_model = 'proxy-wire-id'\n[providers.deepseek]\nbase_url = 'https://api.deepseek.com/beta'\n";
         fs::write(&path, original).unwrap();
         crate::config::Config::load(Some(path.clone()), None).unwrap();
-        let error =
-            persist_provider_selection(Some(&path), ApiProvider::Deepseek, "deepseek", None)
-                .unwrap_err();
-        assert!(error.to_string().contains("Choose a model"));
-        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        // The write moves the top-level route into `[providers.custom]`,
+        // model included (#6394), so the custom model is no longer the
+        // switch's only copy and a bare switch commits a loadable config.
+        persist_provider_selection(Some(&path), ApiProvider::Deepseek, "deepseek", None).unwrap();
+        let switched = crate::config::Config::load(Some(path.clone()), None)
+            .expect("a bare provider switch must remain loadable");
+        assert_eq!(switched.api_provider(), ApiProvider::Deepseek);
+        let doc: toml::Value = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(
-            crate::config::Config::load(Some(path.clone()), None)
-                .unwrap()
-                .default_model(),
-            "proxy-wire-id"
+            doc["providers"]["custom"]["model"].as_str(),
+            Some("proxy-wire-id")
         );
-        let error = crate::route_preferences::set(&path, "provider", "deepseek").unwrap_err();
-        assert!(error.to_string().contains("Choose a model"));
-        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        assert_eq!(
+            doc["providers"]["custom"]["base_url"].as_str(),
+            Some("https://proxy.example.test/v1")
+        );
     }
 
     #[test]
@@ -1993,7 +2072,7 @@ slot = 1
     }
 
     #[test]
-    fn canonical_model_writer_keeps_legacy_custom_shape_and_exact_named_ids() {
+    fn canonical_model_writer_targets_the_literal_custom_table_and_exact_named_ids() {
         use crate::test_support::{EnvVarGuard, lock_test_env};
         let _lock = lock_test_env();
         let home = tempfile::tempdir().unwrap();
@@ -2007,9 +2086,13 @@ slot = 1
             Some("Exact-New-ID"),
         )
         .unwrap();
+        // The literal route is the `[providers.custom]` table since #6394.
         let doc: toml::Value = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(doc["default_text_model"].as_str(), Some("Exact-New-ID"));
-        assert!(doc.get("providers").is_none());
+        assert_eq!(
+            doc["providers"]["custom"]["model"].as_str(),
+            Some("Exact-New-ID")
+        );
+        assert!(doc.get("base_url").is_none());
 
         fs::write(&path, "route_preferences_version = 1\nprovider = 'Team.A'\n[providers.'Team.A']\nkind = 'openai-compatible'\nbase_url = 'https://named.example.test/v1'\nmodel = 'old'\n").unwrap();
         persist_provider_selection(

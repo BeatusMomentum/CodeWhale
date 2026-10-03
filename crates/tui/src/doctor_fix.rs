@@ -6,7 +6,7 @@
 //! narrowly scoped and reversible:
 //!
 //! - delete stale `.tmp*` files left behind by interrupted atomic writes in
-//!   the Codewhale home;
+//!   the Codewhale home, only when last modified more than an hour ago;
 //! - tighten secret-store file permissions to `0600` on Unix when group or
 //!   world bits are set (the secret store writes private files, but a file
 //!   restored from backup or moved from another machine may have drifted);
@@ -31,7 +31,8 @@ use crate::mcp;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum DoctorFixAction {
     /// Delete an interrupted-atomic-write leftover. Only ever a regular file
-    /// whose name starts with `.tmp` directly inside the Codewhale home.
+    /// whose name starts with `.tmp` directly inside the Codewhale home and
+    /// whose last modification was more than an hour ago.
     DeleteStaleTempFile { path: PathBuf },
     /// Restrict a secret-store file to owner-only on Unix.
     #[cfg(unix)]
@@ -95,7 +96,22 @@ impl DoctorFixPlan {
     }
 }
 
+fn is_stale_temp_file(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with(".tmp"))
+        && std::fs::symlink_metadata(path).is_ok_and(|meta| {
+            meta.is_file()
+                && meta.modified().is_ok_and(|modified| {
+                    modified
+                        .elapsed()
+                        .is_ok_and(|age| age > std::time::Duration::from_secs(60 * 60))
+                })
+        })
+}
+
 /// Stale `.tmp*` regular files directly inside the Codewhale home.
+/// Recent files and files with unknown or future modification times are kept.
 fn stale_temp_files() -> Vec<PathBuf> {
     let Ok(home) = codewhale_config::codewhale_home() else {
         return Vec::new();
@@ -105,11 +121,8 @@ fn stale_temp_files() -> Vec<PathBuf> {
     };
     let mut files = entries
         .flatten()
-        .filter(|entry| {
-            entry.file_name().to_string_lossy().starts_with(".tmp")
-                && entry.file_type().is_ok_and(|kind| kind.is_file())
-        })
         .map(|entry| entry.path())
+        .filter(|path| is_stale_temp_file(path))
         .collect::<Vec<_>>();
     files.sort();
     files
@@ -244,14 +257,7 @@ fn apply_one(action: &DoctorFixAction) -> DoctorFixOutcome {
         DoctorFixAction::DeleteStaleTempFile { path } => {
             // Re-verify the deletion guard at apply time: the plan was
             // computed before consent, so the file may have changed.
-            let still_stale = path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with(".tmp"))
-                && std::fs::symlink_metadata(path)
-                    .ok()
-                    .is_some_and(|meta| meta.is_file());
-            if !still_stale {
+            if !is_stale_temp_file(path) {
                 return DoctorFixOutcome::Applied;
             }
             match std::fs::remove_file(path) {
@@ -402,6 +408,23 @@ mod tests {
         let (home, config) = ScratchHome::new();
         std::fs::write(home.path().join(".tmpAbC123"), b"orphaned").expect("write stale");
         std::fs::write(home.path().join(".tmpOther"), b"orphaned 2").expect("write stale 2");
+        let now = std::time::SystemTime::now();
+        for name in [".tmpAbC123", ".tmpOther"] {
+            std::fs::File::options()
+                .write(true)
+                .open(home.path().join(name))
+                .unwrap()
+                .set_modified(now - std::time::Duration::from_secs(2 * 60 * 60))
+                .unwrap();
+        }
+        for (name, modified) in [
+            (".tmpLive", now),
+            (".tmpRecent", now - std::time::Duration::from_secs(30 * 60)),
+            (".tmpFuture", now + std::time::Duration::from_secs(60 * 60)),
+        ] {
+            let file = std::fs::File::create(home.path().join(name)).expect("temp file");
+            file.set_modified(modified).expect("mtime");
+        }
         std::fs::write(home.path().join("keep.txt"), b"keep").expect("write keep");
         std::fs::create_dir_all(home.path().join(".tmpDir")).expect("mkdir .tmpDir");
 
@@ -418,6 +441,13 @@ mod tests {
             .count();
         assert_eq!(temp_deletions, 2, "{:?}", plan.actions);
 
+        // A stale candidate may become active while waiting for consent.
+        std::fs::File::options()
+            .write(true)
+            .open(home.path().join(".tmpOther"))
+            .unwrap()
+            .set_modified(now)
+            .unwrap();
         let results = apply_fixes(&DoctorFixPlan {
             actions: plan
                 .actions
@@ -428,6 +458,15 @@ mod tests {
         });
         assert!(results.iter().all(|(_, o)| *o == DoctorFixOutcome::Applied));
         assert!(!home.path().join(".tmpAbC123").exists());
+        for name in [
+            ".tmpOther",
+            ".tmpLive",
+            ".tmpRecent",
+            ".tmpFuture",
+            ".tmpDir",
+        ] {
+            assert!(home.path().join(name).exists(), "must preserve {name}");
+        }
         assert!(home.path().join("keep.txt").exists());
     }
 

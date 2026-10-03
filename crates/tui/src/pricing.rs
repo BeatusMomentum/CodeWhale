@@ -399,6 +399,22 @@ fn host_of(url: &str) -> Option<String> {
         .map(str::to_ascii_lowercase)
 }
 
+/// The ChatGPT backend the Codex OAuth route ships with
+/// (`https://chatgpt.com/backend-api`, or a path under it). Only this endpoint
+/// carries the Codex OAuth quota; the billing surface and the route
+/// presentation both decide from it.
+pub(crate) fn is_chatgpt_codex_backend(base_url: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(base_url.trim()) else {
+        return false;
+    };
+    let path = url.path().trim_end_matches('/');
+    url.scheme() == "https"
+        && url.host_str() == Some("chatgpt.com")
+        && url.port().is_none()
+        && url.username().is_empty()
+        && (path == "/backend-api" || path.starts_with("/backend-api/"))
+}
+
 /// Reduce a concrete request endpoint to non-secret billing provenance.
 ///
 /// Every reachable endpoint now gets a positive classification, including
@@ -421,8 +437,19 @@ pub(crate) fn billing_surface_for_route(
         // of PAYG dollars: keep it in money coverage as unclassified until an
         // authoritative billing surface is available.
         ApiProvider::OllamaCloud => return Some(UNCLASSIFIED_BILLING_SURFACE),
-        ApiProvider::OpenaiCodex | ApiProvider::OpencodeGo => {
-            return Some(OAUTH_SUBSCRIPTION_BILLING_SURFACE);
+        ApiProvider::OpencodeGo => return Some(OAUTH_SUBSCRIPTION_BILLING_SURFACE),
+        // The Codex OAuth quota is a fact of the ChatGPT backend, not of the
+        // provider name: a custom endpoint (a gateway, a proxy) sells its own
+        // terms, so it is unclassified rather than a subscription that would
+        // drop its spend out of money coverage. No endpoint at all keeps the
+        // provider default, which is the ChatGPT backend.
+        ApiProvider::OpenaiCodex => {
+            return Some(
+                match base_url.map(str::trim).filter(|url| !url.is_empty()) {
+                    Some(url) if !is_chatgpt_codex_backend(url) => UNCLASSIFIED_BILLING_SURFACE,
+                    _ => OAUTH_SUBSCRIPTION_BILLING_SURFACE,
+                },
+            );
         }
         // A named custom endpoint is never assumed to be metered; the billing
         // presentation layer decides that from explicit config.
@@ -702,8 +729,12 @@ fn pricing_for_model_at(model: &str, now: DateTime<Utc>) -> Option<ModelPricing>
 
 fn known_pricing_for_model(model_lower: &str) -> Option<ModelPricing> {
     let explicit = match model_lower {
+        // GPT-5.6 Sol short-context (<=272K) rates, re-verified 2026-09-26
+        // against the model page (Input / Cached / Output); `gpt-5.6` is the
+        // alias that routes to Sol:
+        // https://developers.openai.com/api/docs/models/gpt-5.6-sol
         "openai/gpt-5.6" | "openai/gpt-5.6-sol" | "gpt-5.6" | "gpt-5.6-sol" => {
-            Some(usd_only_pricing(0.50, 5.00, 30.00))
+            Some(usd_only_pricing(0.40, 4.00, 20.00))
         }
         // GPT-5.6 Terra / Luna short-context (<=272K) rates, re-verified
         // 2026-08-17 against the model pages (Input / Cached / Output):
@@ -2750,14 +2781,11 @@ pub fn format_cost_amount(cost: f64, currency: CostCurrency) -> String {
 /// Format a cost amount for detailed reports in the chosen currency.
 #[must_use]
 pub fn format_cost_amount_precise(cost: f64, currency: CostCurrency) -> String {
-    let symbol = currency.symbol();
-    if cost == 0.0 {
-        format!("{symbol}0.0000")
-    } else if cost > 0.0 && cost < 0.0001 {
-        format!("<{symbol}0.0001")
-    } else {
-        format!("{symbol}{cost:.4}")
-    }
+    let selected = match currency {
+        CostCurrency::Usd => codewhale_command_contract::types::CommandCurrency::Usd,
+        CostCurrency::Cny => codewhale_command_contract::types::CommandCurrency::Cny,
+    };
+    crate::diagnostics_reports::format_cost_amount_precise(cost, selected)
 }
 
 /// Format a dual-currency estimate using the selected display currency.
@@ -3947,6 +3975,57 @@ mod tests {
         assert_eq!(pricing.usd.cache_write, CacheWritePolicy::Rate(0.375));
     }
 
+    /// The offline seed's price and the reviewed provider-owned table must
+    /// agree wherever both price a row: the route audit reads a catalog rate
+    /// before the hand table, so a disagreement silently changes the offline
+    /// estimate (#6396). A deliberate difference belongs in
+    /// `catalog_corrections.json`, which this reads through.
+    #[test]
+    fn bundled_seed_prices_agree_with_provider_owned_table() {
+        let at = Utc.with_ymd_and_hms(2026, 9, 26, 12, 0, 0).unwrap();
+        let close = |a: f64, b: f64| (a - b).abs() < 1e-9;
+        let mut checked = 0;
+        let mut mismatches = Vec::new();
+        for row in codewhale_config::catalog::bundled_catalog_offerings() {
+            let Some(cost) = row.cost.as_ref() else {
+                continue;
+            };
+            let Some(provider) = ApiProvider::parse(&row.provider) else {
+                continue;
+            };
+            let Some(hand) = provider_owned_hand_pricing_at(provider, &row.wire_model_id, at)
+            else {
+                continue;
+            };
+            checked += 1;
+            let usd = &hand.usd;
+            let pairs = [
+                ("input", cost.input, usd.input_cache_miss_per_million),
+                ("output", cost.output, usd.output_per_million),
+                (
+                    "cache_read",
+                    cost.cache_read,
+                    usd.input_cache_hit_per_million,
+                ),
+            ];
+            for (field, seed, table) in pairs {
+                if let Some(seed) = seed
+                    && !close(seed, table)
+                {
+                    mismatches.push(format!(
+                        "{}/{} {field}: seed {seed} vs table {table}",
+                        row.provider, row.wire_model_id
+                    ));
+                }
+            }
+        }
+        assert!(
+            checked > 0,
+            "no bundled row has a provider-owned table price"
+        );
+        assert!(mismatches.is_empty(), "{mismatches:#?}");
+    }
+
     #[test]
     fn curated_usd_only_models_have_pricing_and_accrue_cost() {
         let usage = Usage {
@@ -3985,7 +4064,8 @@ mod tests {
             ("gpt-5.5", 0.50, 5.00, 30.00),
             // GPT-5.5 Pro has no cached-input discount: cache-hit == input.
             ("gpt-5.5-pro", 30.00, 30.00, 180.00),
-            ("gpt-5.6-sol", 0.50, 5.00, 30.00),
+            ("gpt-5.6", 0.40, 4.00, 20.00),
+            ("gpt-5.6-sol", 0.40, 4.00, 20.00),
             ("gpt-5.6-terra", 0.20, 2.00, 12.00),
             ("gpt-5.6-luna", 0.02, 0.20, 1.20),
             ("gpt-5-codex", 0.125, 1.25, 10.00),

@@ -8,7 +8,8 @@ use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::dependencies::{ExternalTool as _, Git};
+use crate::dependencies::Git;
+use crate::snapshot::is_git_metadata_name;
 
 use super::{ApiError, RuntimeApiState};
 
@@ -104,10 +105,20 @@ pub(super) struct WorkspaceGitMetadata {
     pub(super) dirty: bool,
 }
 
+/// Status is several blocking `git` spawns, so it runs off the async workers
+/// (#6149) like every other git read on this surface. It deliberately keeps
+/// normal Git filters and untracked settings rather than the full review
+/// command, so its counts match `git status` and the operator writes (see
+/// `git.rs`), but it never runs a repository-configured helper: fsmonitor and
+/// hooks are off, as on every read-only review path (see `run_git`).
 pub(super) async fn workspace_status(
     State(state): State<RuntimeApiState>,
 ) -> Result<Json<WorkspaceStatusResponse>, ApiError> {
-    Ok(Json(collect_workspace_status(&state.workspace)))
+    let workspace = state.workspace.clone();
+    tokio::task::spawn_blocking(move || collect_workspace_status(&workspace))
+        .await
+        .map(Json)
+        .map_err(|_| ApiError::internal("workspace status failed"))
 }
 
 pub(super) fn collect_workspace_status(workspace: &FsPath) -> WorkspaceStatusResponse {
@@ -185,8 +196,12 @@ pub(super) fn collect_workspace_git_metadata(workspace: &FsPath) -> WorkspaceGit
     }
 }
 
+/// Read-only git for status and metadata. `Git::review_base` disables
+/// `core.fsmonitor`, `core.hooksPath`, lazy fetch and replace objects: a
+/// status poll must not execute a helper the repository's config names.
 fn run_git(workspace: &FsPath, args: &[&str]) -> Option<String> {
-    let output = Git::output(args, workspace).ok()?;
+    let mut command = Git::review_base(workspace).ok()?;
+    let output = command.args(args).output().ok()?;
     if !output.status.success() {
         return None;
     }
@@ -232,7 +247,7 @@ pub(super) const FILE_READ_LIMIT_DEFAULT: usize = 256 * 1024;
 pub(super) const FILE_READ_LIMIT_MAX: usize = 4 * 1024 * 1024;
 /// Files above this size are not served at all: the revision is a digest of
 /// the whole file, and a Files browser should not page through larger blobs.
-const FILE_SERVE_MAX_BYTES: u64 = 16 * 1024 * 1024;
+pub(super) const FILE_SERVE_MAX_BYTES: u64 = 16 * 1024 * 1024;
 pub(super) const FILE_WRITE_MAX_BYTES: usize = 4 * 1024 * 1024;
 /// Request-body ceiling for the write route: the content cap plus headroom for
 /// base64 expansion and the JSON envelope, so an oversized `content` reaches
@@ -412,7 +427,7 @@ pub(super) fn relative_request_path(raw: &str, allow_root: bool) -> Result<PathB
     }
     if path
         .components()
-        .any(|component| matches!(component, Component::Normal(name) if name == ".git"))
+        .any(|component| matches!(component, Component::Normal(name) if is_git_metadata_name(name)))
     {
         return Err(ApiError::forbidden("the .git directory is not served"));
     }
@@ -495,7 +510,7 @@ fn list_workspace_directory(
         let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
             continue;
         };
-        if name == ".git" {
+        if is_git_metadata_name(std::ffi::OsStr::new(&name)) {
             continue;
         }
         let Ok(file_type) = entry.file_type() else {
@@ -707,8 +722,11 @@ fn write_workspace_file(
         _ => {}
     }
     // Parents are created only for a new file, and only through the confined
-    // opener, which refuses links at every component.
-    let file = open_confined_file(&root, relative, created)?;
+    // opener, which refuses links at every component. This is the user's own
+    // file, not a private store: keep its mode on edit, follow the umask on
+    // creation.
+    let file = crate::fleet::files::WorkspaceFile::open_shared(&root, relative, created)
+        .map_err(|error| map_fs_error(error, "file"))?;
     if let Some(expected) = expected_revision {
         let current = read_confined_bytes(&file)?;
         if current.revision != expected {
@@ -880,6 +898,80 @@ pub(super) async fn workspace_instructions(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use crate::dependencies::ExternalTool as _;
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_status_does_not_run_the_repository_fsmonitor() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir()?;
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo)?;
+        let git = |args: &[&str]| Git::status(args, &repo).is_ok_and(|status| status.success());
+        if !git(&["init", "-q"]) {
+            return Ok(());
+        }
+        std::fs::write(repo.join("file.txt"), "hello\n")?;
+        assert!(git(&["add", "file.txt"]));
+        assert!(git(&[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@example.invalid",
+            "commit",
+            "-qm",
+            "init",
+        ]));
+        std::fs::write(repo.join("file.txt"), "hello\nworld\n")?;
+        let marker = tmp.path().join("ran");
+        let hook = tmp.path().join("fsmonitor.sh");
+        std::fs::write(
+            &hook,
+            format!("#!/bin/sh\ntouch '{}'\nexit 1\n", marker.display()),
+        )?;
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755))?;
+        assert!(git(&["config", "core.fsmonitor", &hook.to_string_lossy()]));
+
+        let status = collect_workspace_status(&repo);
+        assert!(status.git_repo);
+        assert_eq!(status.unstaged, 1);
+        assert!(!marker.exists(), "the repository's fsmonitor hook ran");
+        Ok(())
+    }
+
+    #[test]
+    fn git_metadata_directory_is_refused_in_any_letter_case() {
+        for raw in [
+            ".git",
+            ".git/config",
+            ".GIT/config",
+            ".Git/hooks/pre-commit",
+            "sub/.gIt/HEAD",
+        ] {
+            let error = relative_request_path(raw, false).expect_err(raw);
+            assert_eq!(error.status, StatusCode::FORBIDDEN, "{raw}");
+        }
+        for raw in [".github/workflows/ci.yml", "a.git/b", ".gitignore", "git"] {
+            assert!(relative_request_path(raw, false).is_ok(), "{raw}");
+        }
+    }
+
+    #[test]
+    fn listing_hides_git_metadata_directory_in_any_letter_case() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        std::fs::create_dir_all(tmp.path().join(".Git"))?;
+        std::fs::write(tmp.path().join("kept.txt"), "kept")?;
+        let listing = list_workspace_directory(tmp.path(), FsPath::new(""), 100)
+            .map_err(|error| anyhow::anyhow!(error.message))?;
+        let names: Vec<&str> = listing
+            .entries
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect();
+        assert_eq!(names, ["kept.txt"]);
+        Ok(())
+    }
 
     #[test]
     fn workspace_file_search_reuses_discovery_ignores() -> anyhow::Result<()> {

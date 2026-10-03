@@ -29,8 +29,10 @@
 //! schema description; the dispatch logic is whitelist-driven so
 //! anything in the list goes through unchanged.
 
-use std::path::PathBuf;
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::OnceLock;
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -119,7 +121,13 @@ impl ToolSpec for PandocConvertTool {
             )));
         }
 
-        let source_path = context.resolve_path(source_path_str)?;
+        // pandoc reads the source in full and its output goes to the model,
+        // so it takes the same read guards as `read`.
+        let source_path = crate::tools::file::resolve_guarded_read_path(
+            context,
+            source_path_str,
+            "pandoc_convert",
+        )?;
         if !source_path.exists() {
             return Err(ToolError::execution_failed(format!(
                 "source_path does not exist: {}",
@@ -148,18 +156,20 @@ impl ToolSpec for PandocConvertTool {
         let pandoc = crate::dependencies::resolve_pandoc().ok_or_else(|| {
             ToolError::execution_failed(
                 "pandoc_convert: pandoc binary not found on PATH. \
-                 Install pandoc (macOS: `brew install pandoc`; \
-                 Debian/Ubuntu: `apt install pandoc`; \
+                 Install pandoc 2.15 or newer (macOS: `brew install pandoc`; \
+                 Linux: the release package from https://pandoc.org/installing.html, \
+                 since older distro packages predate 2.15; \
                  Windows: `winget install JohnMacFarlane.Pandoc`) and restart codewhale.",
             )
         })?;
+        require_sandbox_support(&pandoc)?;
 
         let mut cmd = Command::new(&pandoc);
-        cmd.arg(&source_path);
-        cmd.arg("--to").arg(&target_format);
-        if let Some(out) = resolved_output_path.as_ref() {
-            cmd.arg("--output").arg(out);
-        }
+        cmd.args(pandoc_args(
+            &source_path,
+            &target_format,
+            resolved_output_path.as_deref(),
+        ));
         cmd.stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -188,6 +198,63 @@ impl ToolSpec for PandocConvertTool {
             return Ok(ToolResult::success(text));
         };
         Ok(ToolResult::success(summary))
+    }
+}
+
+/// First pandoc release that understands `--sandbox`.
+const MIN_SANDBOX_VERSION: (u32, u32) = (2, 15);
+
+/// Arguments for one conversion. `--sandbox` stops readers and writers from
+/// touching any file but the named source and output: no include
+/// directives, no embedded images or other resources fetched from disk or
+/// the network. It is always present; a pandoc without it is refused by
+/// [`require_sandbox_support`] rather than run without it.
+fn pandoc_args(source: &Path, target_format: &str, output: Option<&Path>) -> Vec<OsString> {
+    let mut args: Vec<OsString> = vec![
+        "--sandbox".into(),
+        source.as_os_str().to_owned(),
+        "--to".into(),
+        target_format.into(),
+    ];
+    if let Some(out) = output {
+        args.push("--output".into());
+        args.push(out.as_os_str().to_owned());
+    }
+    args
+}
+
+/// Parse `major.minor` from the first line of `pandoc --version`
+/// (`pandoc 3.1.9`, `pandoc.exe 2.9.2.1`).
+fn parse_pandoc_version(banner: &str) -> Option<(u32, u32)> {
+    let version = banner.lines().next()?.split_whitespace().nth(1)?;
+    let mut parts = version.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next().map_or(Some(0), |m| m.parse().ok())?;
+    Some((major, minor))
+}
+
+/// Refuse a pandoc older than 2.15 with an actionable message instead of
+/// pandoc's own "Unknown option --sandbox". The version probe runs once per
+/// process; an unparseable banner is let through, and pandoc itself then
+/// rejects the flag if it does not know it.
+fn require_sandbox_support(pandoc: &str) -> Result<(), ToolError> {
+    static VERSION: OnceLock<Option<(u32, u32)>> = OnceLock::new();
+    let version = *VERSION.get_or_init(|| {
+        let out = Command::new(pandoc)
+            .arg("--version")
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .ok()?;
+        parse_pandoc_version(&String::from_utf8_lossy(&out.stdout))
+    });
+    match version {
+        Some(found) if found < MIN_SANDBOX_VERSION => Err(ToolError::execution_failed(format!(
+            "pandoc_convert: pandoc {}.{} or newer is required (found {}.{}). \
+             Upgrade from https://pandoc.org/installing.html and restart codewhale.",
+            MIN_SANDBOX_VERSION.0, MIN_SANDBOX_VERSION.1, found.0, found.1
+        ))),
+        _ => Ok(()),
     }
 }
 
@@ -260,6 +327,97 @@ mod tests {
         ] {
             assert!(!format_is_binary(fmt));
         }
+    }
+
+    #[tokio::test]
+    async fn pandoc_convert_refuses_deny_listed_sources() {
+        // `.env` is on the default read deny-list; the refusal comes before
+        // pandoc would run, so this holds with or without pandoc installed.
+        let tmp = tempdir().expect("tempdir");
+        fs::write(tmp.path().join(".env"), "TOKEN=SECRET_PANDOC_VALUE\n").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(tmp.path().join(".env"), tmp.path().join("notes.md")).unwrap();
+        let ctx = ToolContext::new(tmp.path().to_path_buf());
+        let mut sources = vec![".env"];
+        if cfg!(unix) {
+            sources.push("notes.md");
+        }
+        for source in sources {
+            let err = PandocConvertTool
+                .execute(
+                    json!({"source_path": source, "target_format": "plain"}),
+                    &ctx,
+                )
+                .await
+                .expect_err("a deny-listed source must be refused");
+            assert!(
+                matches!(err, ToolError::PermissionDenied { .. }),
+                "{source}: {err:?}"
+            );
+            assert!(!err.to_string().contains("SECRET_PANDOC_VALUE"));
+        }
+    }
+
+    #[tokio::test]
+    async fn pandoc_convert_does_not_follow_include_directives() {
+        if !pandoc_present() {
+            return;
+        }
+        let outside = tempdir().expect("outside");
+        let secret = outside.path().join("outside.txt");
+        fs::write(&secret, "SECRET_INCLUDED_VALUE\n").unwrap();
+        let tmp = tempdir().expect("tempdir");
+        fs::write(
+            tmp.path().join("p.rst"),
+            format!("Intro\n\n.. include:: {}\n", secret.display()),
+        )
+        .unwrap();
+        let ctx = ToolContext::new(tmp.path().to_path_buf());
+        let result = PandocConvertTool
+            .execute(
+                json!({"source_path": "p.rst", "target_format": "plain"}),
+                &ctx,
+            )
+            .await;
+        if let Err(err) = &result
+            && pandoc_environment_unavailable(err)
+        {
+            return;
+        }
+        if let Ok(result) = result {
+            assert!(
+                !result.content.contains("SECRET_INCLUDED_VALUE"),
+                "include directive must not pull in outside files: {}",
+                result.content
+            );
+        }
+    }
+
+    #[test]
+    fn pandoc_args_always_include_sandbox() {
+        for output in [None, Some(Path::new("/w/out.docx"))] {
+            let args = pandoc_args(Path::new("/w/in.md"), "docx", output);
+            assert_eq!(
+                args.first().map(OsString::as_os_str),
+                Some("--sandbox".as_ref())
+            );
+            assert_eq!(args.iter().filter(|a| *a == "--sandbox").count(), 1);
+        }
+    }
+
+    #[test]
+    fn pandoc_version_gate_matches_sandbox_release() {
+        assert_eq!(
+            parse_pandoc_version("pandoc 2.9.2.1\nCompiled with"),
+            Some((2, 9))
+        );
+        assert_eq!(parse_pandoc_version("pandoc.exe 3.1.9\n"), Some((3, 1)));
+        assert_eq!(parse_pandoc_version("pandoc 3\n"), Some((3, 0)));
+        assert_eq!(parse_pandoc_version("garbage"), None);
+        assert!((2, 9) < MIN_SANDBOX_VERSION);
+        assert!((2, 14) < MIN_SANDBOX_VERSION);
+        assert!((2, 15) >= MIN_SANDBOX_VERSION);
+        assert!((3, 0) >= MIN_SANDBOX_VERSION);
     }
 
     #[tokio::test]

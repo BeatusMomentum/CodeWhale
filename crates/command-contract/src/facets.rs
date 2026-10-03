@@ -7,7 +7,20 @@
 
 use std::path::{Path, PathBuf};
 
-use codewhale_core::request::{Message, SystemPrompt};
+mod session_structcopy;
+pub use session_structcopy::*;
+
+mod debug_operations;
+pub mod debug_receipts;
+pub use debug_operations::*;
+pub use debug_receipts::*;
+
+mod diagnostics_report;
+mod diagnostics_tools;
+pub use diagnostics_report::*;
+pub use diagnostics_tools::*;
+
+use codewhale_protocol::request::{Message, SystemPrompt};
 use serde_json::Value;
 
 use crate::types::{CommandApprovalMode, CommandCurrency, CommandMode, CommandProviderId};
@@ -112,6 +125,284 @@ pub struct MediaAttachmentReceipt {
 pub trait CommandMediaContext {
     /// Validate and insert a resolved media path atomically.
     fn attach_media(&mut self, resolved_path: &Path) -> Result<MediaAttachmentReceipt, String>;
+}
+
+// ---------------------------------------------------------------------------
+// Debug diagnostics (FEAT-029 D3)
+// ---------------------------------------------------------------------------
+
+/// Only the provider identity and support decision consumed by `/balance`.
+/// The adapter derives support from the authoritative provider policy; the
+/// portable handler decides whether to emit `FetchBalance` or the original text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DebugBalanceProjection {
+    pub provider_display_name: String,
+    pub supports_balance_api: bool,
+}
+
+/// Source text consumed by `/system`; retain Text/Blocks/None separately
+/// so the portable handler alone owns the separators and empty-state text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DebugSystemPrompt {
+    None,
+    Text(String),
+    Blocks(Vec<String>),
+}
+
+/// Only the data read by the `/system` renderer, with the host's mode label.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DebugSystemProjection {
+    pub mode_label: String,
+    pub prompt: DebugSystemPrompt,
+}
+
+/// Published usage telemetry remains optional: absence is not zero.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DebugTokenProjection {
+    pub active_context_used: usize,
+    pub context_window: u32,
+    pub last_input: Option<u32>,
+    pub last_output: Option<u32>,
+    pub cache_hit: Option<u32>,
+    pub cache_miss: Option<u32>,
+    pub total_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub api_message_count: usize,
+    pub chat_message_count: usize,
+    pub model: String,
+    pub cost: DebugCostProjection,
+}
+
+/// Already-authoritative monetary values and bounded route attribution.
+/// Calculation and price/source selection stay with the TUI host; formatting,
+/// ordering and coverage wording belong to the portable handlers.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DebugCostProjection {
+    pub currency: CommandCurrency,
+    pub total: f64,
+    pub parent_turns: f64,
+    pub subagents: f64,
+    pub display_floor: f64,
+    pub priced_turns: u32,
+    pub unpriced_turns: u32,
+    pub legacy_coverage_unknown: bool,
+    pub user_declared_estimates: bool,
+    pub itemized_turns: u32,
+    pub route_amounts: Vec<DebugRouteCost>,
+    pub turn_history_capacity: usize,
+    pub unpriced_reason_labels: Vec<String>,
+    pub unpriced_classes: Vec<String>,
+    pub pricing_provenances: Vec<String>,
+    pub live_pricing_defects: Vec<String>,
+    pub unusable_pricing_defects: Vec<String>,
+    pub route_receipts: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DebugRouteCost {
+    pub route: String,
+    pub amount: f64,
+}
+
+/// A cache inspection's semantic layer, retaining the same public JSON
+/// field order as the baseline without borrowing the client request type.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct DebugPromptLayer {
+    pub name: String,
+    pub stability: DebugPromptLayerStability,
+    pub char_len: usize,
+    pub byte_len: usize,
+    pub token_estimate: usize,
+    pub sha256: String,
+    pub tool_result: Option<DebugToolResultInspection>,
+    pub turn_meta: Option<DebugTurnMetaInspection>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub enum DebugPromptLayerStability {
+    Static,
+    History,
+    Dynamic,
+}
+
+impl DebugPromptLayerStability {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Static => "static",
+            Self::History => "history",
+            Self::Dynamic => "dynamic",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct DebugToolResultInspection {
+    pub original_chars: usize,
+    pub sent_chars: usize,
+    pub truncated: bool,
+    pub deduplicated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct DebugTurnMetaInspection {
+    pub original_chars: usize,
+    pub sent_chars: usize,
+    pub deduplicated: bool,
+    pub sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct DebugPromptInspection {
+    pub base_static_prefix_hash: String,
+    pub full_request_prefix_hash: String,
+    pub tool_catalog_hash: String,
+    pub layers: Vec<DebugPromptLayer>,
+}
+
+/// Full key fields are needed for the existing comparison and JSON report;
+/// the short hash is computed by the authoritative host hashing function.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct DebugWarmupKey {
+    pub provider: String,
+    pub model: String,
+    pub base_url: String,
+    pub static_prefix_hash: String,
+    pub tool_catalog_hash: String,
+    pub project_pack_hash: String,
+    pub skills_hash: String,
+}
+
+/// One coherent observation, including previous inspection before any write.
+/// Inspect errors occur before this value exists and never update session state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DebugCacheInspectionObservation {
+    pub current: DebugPromptInspection,
+    pub previous: Option<DebugPromptInspection>,
+    pub current_warmup_key: DebugWarmupKey,
+    pub last_warmup_key: Option<DebugWarmupKey>,
+    pub current_warmup_hash_short: String,
+    pub last_warmup_hash_short: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DebugCacheInspectionUnavailable {
+    NoConcreteRoute,
+    MissingCapturedEndpoint,
+}
+
+/// A bounded turn row. Pricing class partition and amount come from the
+/// authoritative host, not a second implementation of provider billing.
+/// Missing telemetry, missing audit and a measured zero remain distinct.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DebugCacheTurn {
+    pub provider: Option<String>,
+    pub provider_identity: Option<String>,
+    pub model: Option<String>,
+    pub auto_model: bool,
+    pub input_tokens: u32,
+    pub output_tokens: u32,
+    pub cache_hit_tokens: Option<u32>,
+    pub cache_miss_tokens: Option<u32>,
+    pub cache_write_tokens: Option<u32>,
+    pub reasoning_tokens: Option<u32>,
+    pub reasoning_replay_tokens: Option<u32>,
+    pub priced_amount: Option<f64>,
+    pub unpriced_reason_key: Option<String>,
+    /// Original host enum order for deduplicated /cache note ordering.
+    pub unpriced_reason_sort_rank: Option<u8>,
+    pub unpriced_classes: Vec<String>,
+    pub priced_cache_read: u64,
+    pub priced_cache_miss: u64,
+    pub priced_cache_write: u64,
+    /// Coherent age at observation time; portable display rounds seconds.
+    pub age_seconds: u64,
+}
+
+/// Prompt-cache hit rates, each labelled by whose requests it covers (#6565).
+///
+/// `parent` is this conversation's own requests: the footer `cache N%` and it
+/// never change meaning. `agents` covers sub-agent and other background
+/// requests. `combined` weights both by their tokens. Each is `None` when its
+/// requests reported no cache telemetry; no report is never 0%.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DebugCacheRates {
+    pub parent: Option<u8>,
+    pub agents: Option<u8>,
+    pub combined: Option<u8>,
+}
+
+impl DebugCacheRates {
+    /// `parent 82% · agents 64% · combined 75%` with the given words, or just
+    /// `82%` when only the parent reported. `None` when nothing did.
+    #[must_use]
+    pub fn labelled(&self, parent: &str, agents: &str, combined: &str) -> Option<String> {
+        match (self.parent, self.agents) {
+            (Some(pct), None) => Some(format!("{pct}%")),
+            (None, None) => None,
+            _ => Some(
+                [
+                    (parent, self.parent),
+                    (agents, self.agents),
+                    (combined, self.combined),
+                ]
+                .into_iter()
+                .filter_map(|(word, pct)| pct.map(|pct| format!("{word} {pct}%")))
+                .collect::<Vec<_>>()
+                .join(" · "),
+            ),
+        }
+    }
+}
+
+/// Shared source for `/cache [count|stats|zones]` branches. One host read
+/// preserves ring order, optional telemetry and prefix stability evidence.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DebugCacheTelemetry {
+    pub model: String,
+    /// Parent/agent/combined percentages computed once by the host.
+    pub session_cache_rates: DebugCacheRates,
+    pub history: Vec<DebugCacheTurn>,
+    pub history_capacity: usize,
+    pub prefix_stability_pct: Option<u32>,
+    pub prefix_checks_total: u64,
+    pub prefix_change_count: u64,
+    pub prefix_drift_count: u64,
+    pub prefix_context_updates: u64,
+    pub prefix_pin_reason: Option<String>,
+    pub prefix_last_miss_reason: Option<String>,
+    pub last_prefix_change_desc: Option<String>,
+    pub last_pinned_prefix_hash: Option<String>,
+    pub api_message_count: usize,
+    pub non_system_message_count: usize,
+}
+
+/// Narrow, synchronous data boundary for the debug diagnostics slice.
+///
+/// No concrete provider, App, completed message, or network operation crosses
+/// this interface. Add operations only when their live branches require them.
+/// Portable handlers consume these facts without concrete host access.
+pub trait CommandDebugDiagnosticsContext {
+    fn balance_projection(&self) -> DebugBalanceProjection;
+    fn system_projection(&self) -> DebugSystemProjection;
+    fn token_projection(&self) -> DebugTokenProjection;
+    fn cost_projection(&self) -> DebugCostProjection;
+    fn cache_telemetry(&self) -> DebugCacheTelemetry;
+    /// The report builder stays host-owned; format and JSON serialization
+    /// consume only this data-only source map.
+    fn context_source_map(&self) -> DebugPromptSourceMap;
+    fn prompt_context(&self) -> DebugPromptContext;
+    /// None means no prepared snapshot exists; argument validation occurs
+    /// only after this check in the portable `/tools` handler.
+    fn tool_snapshot(&self) -> Option<DebugToolSnapshot>;
+    /// Route resolution and request inspection remain host-owned. This call
+    /// must not update the remembered inspection on failure or success.
+    fn inspect_cache(
+        &self,
+    ) -> Result<DebugCacheInspectionObservation, DebugCacheInspectionUnavailable>;
+    /// Store the already-observed inspection after portable rendering, without
+    /// rebuilding or re-inspecting the request. The baseline also commits on
+    /// JSON serialization fallback.
+    fn remember_cache_inspection(&mut self, inspection: DebugPromptInspection);
 }
 
 // ---------------------------------------------------------------------------
@@ -457,11 +748,13 @@ pub struct PluginLegacyTool {
     pub path: PathBuf,
 }
 
-/// Portable legacy-tool scan result: directory and discovered tools.
+/// Portable legacy-tool scan result: directory, discovered tools, and load
+/// diagnostics for scripts that asked for something the loader ignored.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PluginLegacyScan {
     pub dir: PathBuf,
     pub tools: Vec<PluginLegacyTool>,
+    pub diagnostics: Vec<PluginDiagnostic>,
 }
 
 /// Portable Kimi managed-plugin candidate (FEAT-020 D2).
@@ -863,6 +1156,10 @@ pub enum SkillActivationError {
         available: Vec<String>,
         warnings: Vec<String>,
     },
+    InvocationRejected {
+        name: String,
+        reason: String,
+    },
     PluginRejected {
         name: String,
         reason: String,
@@ -980,11 +1277,9 @@ pub trait CommandSkillGroupContext {
 // the handlers retain exact message composition (D2/D5).
 // ---------------------------------------------------------------------------
 
-/// Portable synchronization fields a lifecycle handler maps into the
-/// temporary `SyncSession` action payload. The conversation and prompt types
-/// are `codewhale-core` request types shared by the contract and the TUI
-/// (FEAT-037 will move shared outcome ownership; FEAT-023 keeps the bounded
-/// reference only for `/fork` and `/new` transitions, D6).
+/// Portable synchronization fields carried by shared session and debug actions.
+/// Conversation and prompt types are protocol-owned shapes; concrete runtime
+/// state and host action conversion remain outside the command contract.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SessionSyncPayload {
     pub session_id: Option<String>,

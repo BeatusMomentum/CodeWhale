@@ -10,8 +10,8 @@
 //!
 //! ```text
 //! bundled Models.dev snapshot         (legacy seed, not competing truth)
-//!   < bundled Codewhale catalog       (Codewhale-owned offline snapshot)
 //!   < live Models.dev                 (public catalog, external enrichment)
+//!   < Codewhale corrections           (bundled field patches, see [`corrections`])
 //!   < signed cloud facts              (curated correction, off by default)
 //!   < live provider `/v1/models`      (credential-scoped workspace list)
 //!   < config.toml / user overrides
@@ -52,6 +52,7 @@ use crate::models_dev::{ModelsDevCatalog, ModelsDevCost, ModelsDevLimit, ModelsD
 use crate::route::{ModelId, ProviderId, ProviderModelOffering, RouteLimits, WireModelId};
 
 pub mod configured;
+pub mod corrections;
 
 /// Provenance of a catalog row. Drives layer precedence and UI provenance.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -85,7 +86,10 @@ pub enum CatalogSource {
     ModelsDevLive { fetched_at: u64 },
     /// `config.toml` `[providers.*]` override (layer 30).
     ConfigOverride,
-    /// Codewhale-owned bundled catalog snapshot (offline authority seed).
+    /// A Codewhale correction ([`corrections`]) owns this price (set or
+    /// withheld). Corrections rank above both Models.dev layers, bundled and
+    /// live, and below signed cloud facts, which may still correct them. Used
+    /// as a `cost_source`: a corrected row keeps its own `source`.
     CodewhaleBundled { revision: String },
     /// Signed field patch, below provider-owned rows and explicit overrides.
     ///
@@ -251,11 +255,12 @@ impl CatalogOffering {
 ///
 /// This is **not** a competing curated source of truth. Preferred metadata comes
 /// from the live Models.dev catalog (#4187). The bundled asset is a compact
-/// network-free seed of verified in-repo defaults (context/output from
-/// `crates/tui/src/models.rs`, USD pricing from `crates/tui/src/pricing.rs`) so
-/// [`crate::route::RouteResolver::new`] and pickers still work offline or after
-/// a failed refresh. See the asset's `_meta.role` / `_meta.source` and the
-/// honesty rule on omitted pricing (`UnknownOrStale`, never a fabricated zero).
+/// network-free projection of the Models.dev rows Codewhale ships, generated
+/// by `scripts/catalog_models_dev.py seed render` from a reviewed spec and a
+/// pinned lock (#6396), so [`crate::route::RouteResolver::new`] and pickers
+/// still work offline or after a failed refresh. Deliberate holds (withheld
+/// prices, clamped limits) are not in the asset: [`corrections`] applies them
+/// to it and to live rows alike.
 pub const BUNDLED_MODELS_DEV_JSON: &str = include_str!("../assets/models_dev.bundled.json");
 
 /// Parse-once cache for the committed bundled Models.dev snapshot.
@@ -287,11 +292,14 @@ pub fn bundled_models_dev_catalog() -> &'static ModelsDevCatalog {
 /// Bundled-layer [`CatalogOffering`] rows from the offline snapshot (#4188).
 ///
 /// Lowest-precedence catalog layer: every text-chat row from
-/// [`BUNDLED_MODELS_DEV_JSON`], tagged [`CatalogSource::Bundled`]. Live Models.dev
-/// rows override these on `(provider, wire_model_id)` when available.
+/// [`BUNDLED_MODELS_DEV_JSON`], tagged [`CatalogSource::Bundled`], with
+/// Codewhale's [`corrections`] applied. Live Models.dev rows override these on
+/// `(provider, wire_model_id)` when available.
 #[must_use]
 pub fn bundled_catalog_offerings() -> Vec<CatalogOffering> {
-    bundled_offerings_from_models_dev(bundled_models_dev_catalog())
+    let mut rows = bundled_offerings_from_models_dev(bundled_models_dev_catalog());
+    corrections::bundled_corrections().apply_to(&mut rows);
+    rows
 }
 
 /// Hydrate bundled [`CatalogOffering`] rows from a parsed Models.dev catalog.
@@ -303,9 +311,11 @@ pub fn bundled_catalog_offerings() -> Vec<CatalogOffering> {
 /// an explicit `base_model`. Namespaced entries in the canonical `models` map
 /// fill missing offerings, retaining their map key as the canonical identity.
 ///
-/// Provider ids are kept verbatim from the Models.dev payload (the committed
-/// bundled asset already uses CodeWhale ids). Live refresh normalizes aliases
-/// via [`live_offerings_from_models_dev`].
+/// Provider-row ids are kept verbatim from the Models.dev payload (the
+/// committed bundled asset already uses CodeWhale ids). Namespaced canonical
+/// keys (`xiaomi/mimo-v2.6-pro`) name an upstream vendor, so their namespace is
+/// normalized onto the CodeWhale provider id here too (#6396). Live refresh
+/// also normalizes provider-row aliases via [`live_offerings_from_models_dev`].
 #[must_use]
 pub fn bundled_offerings_from_models_dev(catalog: &ModelsDevCatalog) -> Vec<CatalogOffering> {
     offerings_from_models_dev(catalog, CatalogSource::Bundled, false)
@@ -317,6 +327,8 @@ pub fn bundled_offerings_from_models_dev(catalog: &ModelsDevCatalog) -> Vec<Cata
 /// is tagged [`CatalogSource::ModelsDevLive`] with the fetch timestamp, so a
 /// refresh lands on layer 10: above the bundled seed it supersedes, below the
 /// signed cloud layer that may correct it, and far below a provider roster.
+/// Codewhale's [`corrections`] are applied here as they are to the seed, so a
+/// refresh cannot undo one.
 /// Provider keys are normalized onto CodeWhale [`crate::ProviderKind`] ids when
 /// an alias match exists (`moonshotai` → `moonshot`, `togetherai` → `together`,
 /// `zhipuai` → `zai`, …); unknown Models.dev providers keep their upstream id so
@@ -334,7 +346,10 @@ pub fn live_offerings_from_models_dev(
     catalog: &ModelsDevCatalog,
     fetched_at: u64,
 ) -> Vec<CatalogOffering> {
-    offerings_from_models_dev(catalog, CatalogSource::ModelsDevLive { fetched_at }, true)
+    let mut rows =
+        offerings_from_models_dev(catalog, CatalogSource::ModelsDevLive { fetched_at }, true);
+    corrections::bundled_corrections().apply_to(&mut rows);
+    rows
 }
 
 fn offerings_from_models_dev(
@@ -344,12 +359,15 @@ fn offerings_from_models_dev(
 ) -> Vec<CatalogOffering> {
     let mut out = Vec::new();
     let mut provider_rows = BTreeSet::new();
+    // Unknown upstream ids remain discoverable catalog rows, not routes.
+    let normalized = |raw_id: &str| {
+        crate::ProviderKind::parse(raw_id)
+            .map(|kind| kind.as_str().to_string())
+            .unwrap_or_else(|| raw_id.to_string())
+    };
     let provider_id = |raw_id: &str| {
         if normalize_provider_ids {
-            // Unknown upstream ids remain discoverable catalog rows, not routes.
-            crate::ProviderKind::parse(raw_id)
-                .map(|kind| kind.as_str().to_string())
-                .unwrap_or_else(|| raw_id.to_string())
+            normalized(raw_id)
         } else {
             raw_id.to_string()
         }
@@ -364,6 +382,9 @@ fn offerings_from_models_dev(
             continue;
         }
         let provider_id = provider_id(raw_id);
+        // Gap-filling compares on the normalized identity, so a verbatim
+        // bundled `moonshotai` row still shadows `moonshotai/<model>`.
+        let route_id = normalized(raw_id);
         for (model_key, model) in &provider.models {
             let wire_model_id = if model.id.trim().is_empty() {
                 model_key.trim()
@@ -373,15 +394,34 @@ fn offerings_from_models_dev(
             if wire_model_id.is_empty() {
                 continue;
             }
-            provider_rows.insert((provider_id.clone(), wire_model_id.to_string()));
+            provider_rows.insert((route_id.clone(), wire_model_id.to_string()));
             if !model.supports_text_chat() {
                 continue;
             }
+            // OpenCode Zen is model-aware: its catalog names each model's AI
+            // SDK package, which is the wire (#6705). Every other provider's
+            // endpoint key stays the Chat placeholder its fixed policy ignores.
+            // A deprecated Zen row stays visible but is not a route: Zen no
+            // longer serves it, so sending it would be a guaranteed upstream
+            // failure instead of a local refusal that names the reason.
+            let endpoint_key = if route_id != crate::ProviderKind::OpencodeZen.as_str() {
+                "chat"
+            } else if model.is_deprecated() {
+                crate::route::OPENCODE_ZEN_DEPRECATED_ENDPOINT_KEY
+            } else {
+                crate::route::opencode_zen_endpoint_key_for_npm(
+                    model
+                        .provider
+                        .as_ref()
+                        .and_then(|transport| transport.npm.as_deref())
+                        .or(provider.npm.as_deref()),
+                )
+            };
             out.push(CatalogOffering {
                 provider: provider_id.clone(),
                 wire_model_id: wire_model_id.to_string(),
                 canonical_model: model.base_model.clone(),
-                endpoint_key: "chat".to_string(),
+                endpoint_key: endpoint_key.to_string(),
                 default_for_provider: model.default_for_provider,
                 family: model.family.clone(),
                 limit: model.limit.clone(),
@@ -400,8 +440,11 @@ fn offerings_from_models_dev(
     }
 
     // Namespaced model facts fill gaps without overriding provider-owned rows,
-    // including their non-chat exclusions. Bare legacy seed keys cannot name a
-    // provider; migrating that offline snapshot is a separate slice of #6396.
+    // including their non-chat exclusions. The namespace is always the
+    // upstream vendor id (`xiaomi`, `moonshotai`), never a CodeWhale provider
+    // id, so it is normalized in both modes: that is what lets an
+    // upstream-shaped offline seed land on the same route as live refresh
+    // (#6396). Bare keys cannot name a provider and are skipped.
     for (canonical_id, model) in &catalog.models {
         let Some((provider_key, wire_model_id)) = canonical_id.trim().split_once('/') else {
             continue;
@@ -411,7 +454,11 @@ fn offerings_from_models_dev(
         if provider_key.is_empty() || wire_model_id.is_empty() || !model.supports_text_chat() {
             continue;
         }
-        let provider = provider_id(provider_key);
+        let provider = normalized(provider_key);
+        // A canonical fact names no transport, and Zen's wire is per model.
+        if provider == crate::ProviderKind::OpencodeZen.as_str() {
+            continue;
+        }
         if !provider_rows.insert((provider.clone(), wire_model_id.to_string())) {
             continue;
         }
@@ -743,8 +790,9 @@ impl CatalogSnapshot {
 ///
 /// ```text
 ///  0 bundled              committed models.dev-shaped snapshot
-///  5 codewhale bundled    Codewhale-owned offline snapshot
 /// 10 live models.dev      models.dev refresh
+/// 12 codewhale            bundled corrections, applied as rows 0 and 10
+///                         are hydrated (see [`corrections`])
 /// 15 cloud facts          verified field patches (default off)
 /// 20 provider             per-provider /v1/models refresh
 /// 30 config               config.toml [providers.*] overrides
@@ -764,7 +812,6 @@ impl CatalogSnapshot {
 #[derive(Debug, Clone, Default)]
 pub struct CatalogCompiler {
     bundled: Vec<CatalogOffering>,
-    codewhale_bundled: Vec<CatalogOffering>,
     models_dev_live: Vec<CatalogOffering>,
     cloud_facts: Option<(crate::cloud_facts::ScopedFacts, u64)>,
     provider_live: Vec<CatalogOffering>,
@@ -862,12 +909,7 @@ impl CatalogCompiler {
     #[must_use]
     pub fn compile(self) -> CatalogSnapshot {
         let mut merged: BTreeMap<(String, String), CatalogOffering> = BTreeMap::new();
-        for row in self
-            .bundled
-            .into_iter()
-            .chain(self.codewhale_bundled)
-            .chain(self.models_dev_live)
-        {
+        for row in self.bundled.into_iter().chain(self.models_dev_live) {
             merged.insert(row.merge_key(), row);
         }
         if let Some((facts, fetched_at)) = self.cloud_facts {

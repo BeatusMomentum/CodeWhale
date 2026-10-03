@@ -116,13 +116,8 @@ pub(crate) fn load_fleet_document(
     use super::store::{self, FleetScope};
 
     let roots = fleet_search_roots(workspace);
-    let trimmed = name.trim();
-    let (origin, bare) = match trimmed.split_once('/') {
-        Some((origin, bare)) if !origin.trim().is_empty() && !bare.trim().is_empty() => {
-            (Some(origin.trim()), bare.trim())
-        }
-        _ => (None, trimmed),
-    };
+    // Validates the bare name before any path below is built from it.
+    let (origin, bare) = codewhale_workflow::split_qualified_fleet_name(name)?;
     let store_error = |error: store::FleetStoreError| match error {
         store::FleetStoreError::NotFound(what) => NamedFleetError::NotFound(what),
         store::FleetStoreError::Io { path, message } => NamedFleetError::Io { path, message },
@@ -3263,6 +3258,36 @@ permissions = "read_only"
         let (_, id) =
             load_fleet_document("workspace_root/glm-pair", ws.path(), None).expect("qualified");
         assert_eq!(id.origin, "workspace_root");
+    }
+
+    #[test]
+    fn fleet_names_that_leave_the_fleets_directory_are_refused() {
+        let _lock = crate::test_support::lock_test_env();
+        let home = tempfile::tempdir().expect("home");
+        let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", home.path());
+        let outer = tempfile::tempdir().expect("outer");
+        let ws = outer.path().join("ws");
+        std::fs::create_dir_all(ws.join("fleets")).expect("fleets dir");
+        std::fs::write(outer.path().join("outside.toml"), GLM_FLEET).expect("outside");
+        let absolute = outer.path().join("outside");
+
+        for name in [
+            absolute.to_string_lossy().to_string(),
+            "workspace_root/../../outside".to_string(),
+            "codewhale_home/../outside".to_string(),
+            "user/../outside".to_string(),
+        ] {
+            let err = load_fleet_document(&name, &ws, None).expect_err(&name);
+            assert!(
+                matches!(err, NamedFleetError::InvalidName),
+                "{name}: expected InvalidName, got {err:?}"
+            );
+            let message = err.to_string();
+            assert!(
+                !message.contains(outer.path().to_string_lossy().as_ref()),
+                "{message}"
+            );
+        }
     }
 
     /// A Fleet saved through the store at workspace scope is found by the

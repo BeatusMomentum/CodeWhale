@@ -16,8 +16,17 @@ use crate::tools::subagent::{AgentWorkerStatus, CoordinationDetailProjection, Su
 use crate::tools::user_input::UserInputRequest;
 use codewhale_models::{Message, SystemPrompt, Tool, Usage};
 
+/// Provider correlation retained only for model-history reconstruction.
+/// Event ids remain host execution ids; this is not approval authority.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModelToolCall {
+    pub provider_id: String,
+    pub caller: Option<codewhale_models::ToolCaller>,
+    pub thought_signature: Option<String>,
+}
+
 /// Final status for a turn.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TurnOutcomeStatus {
     Completed,
@@ -234,6 +243,7 @@ pub enum Event {
     /// Tool call initiated
     ToolCallStarted {
         id: String,
+        model_call: Option<ModelToolCall>,
         name: String,
         input: Value,
     },
@@ -248,6 +258,7 @@ pub enum Event {
     /// Tool call completed
     ToolCallComplete {
         id: String,
+        model_call: Option<ModelToolCall>,
         name: String,
         result: Result<ToolResult, ToolError>,
     },
@@ -273,12 +284,33 @@ pub enum Event {
         /// Legacy/non-model hosts may still attach a route at start. Model
         /// turns emit it separately at the application dispatch boundary.
         route: Option<TurnRoute>,
+        /// Correlation with the host submission that produced this turn: the
+        /// verbatim echo of the `submission_id` the host stamped on its
+        /// `SendMessage`/`EditLastTurn` op, `None` for every runtime
+        /// self-started turn (idle sub-agent completion, background shell
+        /// wake, goal continuation) and for the composer shell command turn.
+        /// Hosts use the echo to tell their own pending submission's
+        /// `TurnStarted` apart from an autonomous follow-up whose start event
+        /// overtook it in the stream, so a deferred submit-window action is
+        /// only ever consumed by the turn it targets.
+        submission_id: Option<String>,
     },
 
     /// Bounded tool-field projection from a prepared model-client request.
     /// Delivery remains unknown; this event is emitted before connection setup.
     ToolRequestSnapshot {
         snapshot: crate::tool_inspection::ToolInspectionSnapshot,
+    },
+
+    /// The engine took a workspace snapshot for the running turn: before it
+    /// (`pre_turn`), before one file-modifying tool call (`tool`), after that
+    /// call (`post_tool`, recording hosts only), or after the turn
+    /// (`post_turn`). A host that records these on its turn records owns
+    /// exactly those restore points (see `crate::snapshot::WorkspaceSnapshotRef`).
+    /// With `EngineConfig::record_restore_points` every receipt of a turn
+    /// arrives before its `TurnComplete`.
+    WorkspaceSnapshotTaken {
+        snapshot: crate::snapshot::WorkspaceSnapshotRef,
     },
 
     /// Immutable billing route captured at CodeWhale's pre-permit application
@@ -620,6 +652,15 @@ pub enum Event {
     },
 
     /// Request user decision after sandbox denial
+    // Consumers (TUI, runtime threads, exec agent, protocol parity) handle
+    // this, but the engine never emits it. It stayed "live" only because the
+    // deleted public `rlm::run_rlm_turn` put `Event` in the crate's public
+    // API (#6511). Whether to wire the emitter or drop the elevation flow is
+    // a separate product decision.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "no engine emitter yet; tests construct it")
+    )]
     ElevationRequired {
         tool_id: String,
         tool_name: String,
@@ -953,7 +994,7 @@ pub fn bounded_gate_reason(reason: &str) -> String {
     out
 }
 
-fn is_bidi_format_control(c: char) -> bool {
+pub(crate) fn is_bidi_format_control(c: char) -> bool {
     matches!(
         c,
         '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'

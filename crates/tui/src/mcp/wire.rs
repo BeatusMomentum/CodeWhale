@@ -10,17 +10,44 @@ pub(super) const MAX_SSE_FRAME_BYTES: usize = 8 * 1024 * 1024;
 /// or malicious server could otherwise stream an unbounded body (or a
 /// newline-free multi-GB "line") and OOM the process at transport-read time,
 /// before any transcript-level spillover applies.
-pub(super) const MAX_MCP_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+pub(crate) const MAX_MCP_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 
 pub(super) fn is_mcp_stale_session_body(body: &str) -> bool {
     let body = body.to_ascii_lowercase();
     body.contains("session") && (body.contains("expired") || body.contains("invalid"))
 }
 
-/// A tool call worth replaying after drop→reconnect: either the server
-/// rejected the session id, or the transport itself is gone (dead
-/// pipe/socket) rather than merely idle.
-pub(super) fn is_retriable_mcp_call_error(err: &anyhow::Error) -> bool {
+/// A transport-level refusal of the session id, raised only where the
+/// HTTP layer turned the request away before handing it to the server's
+/// method dispatch: a Streamable HTTP stale-session status, or a legacy SSE
+/// POST rejected with a stale-session body. A JSON-RPC error response is
+/// never this type: it answers the request id, so the server processed it.
+#[derive(Debug)]
+pub(super) struct McpSessionRejected(pub(super) String);
+
+impl std::fmt::Display for McpSessionRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for McpSessionRejected {}
+
+/// The transport refused the session id, so the server provably did not run
+/// the request. This is the only failure after which a non-idempotent
+/// `tools/call` may be replayed on a fresh connection. Typed, not matched on
+/// text, so a tool error that merely mentions an expired session cannot
+/// qualify.
+pub(super) fn is_mcp_session_rejected_error(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<McpSessionRejected>().is_some()
+}
+
+/// The connection is unusable: either the server rejected the session id,
+/// or the transport itself is gone (dead pipe/socket) rather than merely
+/// idle. The connection must be rebuilt, but a request already written to
+/// a transport that then died may have run, so this alone does not make a
+/// `tools/call` safe to replay.
+pub(super) fn is_mcp_connection_lost_error(err: &anyhow::Error) -> bool {
     if is_mcp_stale_session_error(err) {
         return true;
     }

@@ -132,18 +132,40 @@ impl SkillRootCatalog {
         let mut roots = Vec::new();
         let mut precedence = 0usize;
 
-        // Runtime-compatible workspace roots (existing order — do not reorder).
-        push_existing(
+        // Codewhale-owned roots win within each scope: installing or
+        // updating a skill must change the copy runtime discovery selects.
+        push_descriptor(
             &mut roots,
             &mut precedence,
-            SkillRootKind::CompatibleProject(CompatibleHarness::Agents),
-            SkillRootAccess::ReadOnlyExternal,
+            SkillRootKind::CodeWhaleProject,
+            SkillRootAccess::WritableOwned,
             SkillScope::Project,
-            workspace.join(".agents").join("skills"),
+            workspace.join(".codewhale/skills"),
             true,
             true,
-            "project-agents",
+            "project-codewhale",
+            true,
         );
+        for (harness, directory, id) in [
+            (CompatibleHarness::Agents, ".agents", "project-agents"),
+            (CompatibleHarness::Claude, ".claude", "project-claude"),
+            (CompatibleHarness::OpenCode, ".opencode", "project-opencode"),
+            (CompatibleHarness::Cursor, ".cursor", "project-cursor"),
+        ] {
+            push_existing(
+                &mut roots,
+                &mut precedence,
+                SkillRootKind::CompatibleProject(harness),
+                SkillRootAccess::ReadOnlyExternal,
+                SkillScope::Project,
+                workspace.join(directory).join("skills"),
+                true,
+                true,
+                id,
+            );
+        }
+        // Product repositories often keep ordinary content in skills/.
+        // It is an audit candidate until session configuration opts in.
         push_existing(
             &mut roots,
             &mut precedence,
@@ -151,59 +173,9 @@ impl SkillRootCatalog {
             SkillRootAccess::ReadOnlyExternal,
             SkillScope::Project,
             workspace.join("skills"),
-            true,
+            false,
             true,
             "project-flat-skills",
-        );
-        push_existing(
-            &mut roots,
-            &mut precedence,
-            SkillRootKind::CompatibleProject(CompatibleHarness::OpenCode),
-            SkillRootAccess::ReadOnlyExternal,
-            SkillScope::Project,
-            workspace.join(".opencode").join("skills"),
-            true,
-            true,
-            "project-opencode",
-        );
-        push_existing(
-            &mut roots,
-            &mut precedence,
-            SkillRootKind::CompatibleProject(CompatibleHarness::Claude),
-            SkillRootAccess::ReadOnlyExternal,
-            SkillScope::Project,
-            workspace.join(".claude").join("skills"),
-            true,
-            true,
-            "project-claude",
-        );
-        push_existing(
-            &mut roots,
-            &mut precedence,
-            SkillRootKind::CompatibleProject(CompatibleHarness::Cursor),
-            SkillRootAccess::ReadOnlyExternal,
-            SkillScope::Project,
-            workspace.join(".cursor").join("skills"),
-            true,
-            true,
-            "project-cursor",
-        );
-
-        // CodeWhale project root — always listed for ownership; runtime
-        // CodeWhale-only mode additionally requires the path stay inside the
-        // workspace (symlink escape check happens in path selection helpers).
-        let project_owned = workspace.join(".codewhale").join("skills");
-        push_descriptor(
-            &mut roots,
-            &mut precedence,
-            SkillRootKind::CodeWhaleProject,
-            SkillRootAccess::WritableOwned,
-            SkillScope::Project,
-            project_owned,
-            true,
-            true,
-            "project-codewhale",
-            true, // include even if missing — owned target may be created later
         );
 
         // Codex project: audit-compatible only; never active for runtime in #4651.
@@ -220,54 +192,39 @@ impl SkillRootCatalog {
         );
 
         if let Some(home) = home_dir {
-            push_existing(
-                &mut roots,
-                &mut precedence,
-                SkillRootKind::CompatibleGlobal(CompatibleHarness::Agents),
-                SkillRootAccess::ReadOnlyExternal,
-                SkillScope::Global,
-                home.join(".agents").join("skills"),
-                true,
-                true,
-                "global-agents",
-            );
-            push_existing(
-                &mut roots,
-                &mut precedence,
-                SkillRootKind::CompatibleGlobal(CompatibleHarness::Claude),
-                SkillRootAccess::ReadOnlyExternal,
-                SkillScope::Global,
-                home.join(".claude").join("skills"),
-                true,
-                true,
-                "global-claude",
-            );
-
-            let global_owned = home.join(".codewhale").join("skills");
             push_descriptor(
                 &mut roots,
                 &mut precedence,
                 SkillRootKind::CodeWhaleGlobal,
                 SkillRootAccess::WritableOwned,
                 SkillScope::Global,
-                global_owned,
+                home.join(".codewhale/skills"),
                 true,
                 true,
                 "global-codewhale",
                 true,
             );
-
-            push_existing(
-                &mut roots,
-                &mut precedence,
-                SkillRootKind::CompatibleGlobal(CompatibleHarness::DeepSeekLegacy),
-                SkillRootAccess::ReadOnlyExternal,
-                SkillScope::Global,
-                home.join(".deepseek").join("skills"),
-                true,
-                true,
-                "global-deepseek",
-            );
+            for (harness, directory, id) in [
+                (CompatibleHarness::Agents, ".agents", "global-agents"),
+                (CompatibleHarness::Claude, ".claude", "global-claude"),
+                (
+                    CompatibleHarness::DeepSeekLegacy,
+                    ".deepseek",
+                    "global-deepseek",
+                ),
+            ] {
+                push_existing(
+                    &mut roots,
+                    &mut precedence,
+                    SkillRootKind::CompatibleGlobal(harness),
+                    SkillRootAccess::ReadOnlyExternal,
+                    SkillScope::Global,
+                    home.join(directory).join("skills"),
+                    true,
+                    true,
+                    id,
+                );
+            }
 
             // Codex global: audit-compatible only.
             push_existing(
@@ -296,20 +253,6 @@ impl SkillRootCatalog {
                 "registry-cache",
                 false,
             );
-        } else {
-            // Match legacy fallback when HOME is unavailable.
-            push_descriptor(
-                &mut roots,
-                &mut precedence,
-                SkillRootKind::CodeWhaleGlobal,
-                SkillRootAccess::WritableOwned,
-                SkillScope::Global,
-                PathBuf::from("/tmp/codewhale/skills"),
-                true,
-                true,
-                "global-codewhale-fallback",
-                true,
-            );
         }
 
         if let Some(configured) = configured_skills_dir {
@@ -317,6 +260,16 @@ impl SkillRootCatalog {
         }
 
         Self { roots }
+    }
+
+    /// Apply session policy without changing ownership or audit visibility.
+    pub fn with_flat_workspace_root(mut self, enabled: bool) -> Self {
+        for root in &mut self.roots {
+            if root.kind == SkillRootKind::CompatibleProject(CompatibleHarness::FlatProjectSkills) {
+                root.active_for_runtime = enabled;
+            }
+        }
+        self
     }
 
     /// Paths used by runtime discovery for the given mode (existing dirs only,
@@ -330,13 +283,25 @@ impl SkillRootCatalog {
     ) -> Vec<PathBuf> {
         let mut out = Vec::new();
         let mut seen = HashSet::new();
+        // Repository-supplied skills are instructions the user never
+        // reviewed; they load only once the workspace is trusted. Resolved
+        // lazily so a workspace without project skill dirs never reads config.
+        let mut workspace_trusted = None;
 
         for root in &self.roots {
             if !root.active_for_runtime {
                 continue;
             }
+            if root.scope == SkillScope::Project
+                && path_is_existing_dir(&root.path)
+                && !*workspace_trusted
+                    .get_or_insert_with(|| crate::config::is_workspace_trusted(workspace))
+            {
+                continue;
+            }
             match mode {
-                super::SkillDiscoveryMode::Compatible => {}
+                super::SkillDiscoveryMode::Compatible
+                | super::SkillDiscoveryMode::CompatibleWithFlatWorkspace => {}
                 super::SkillDiscoveryMode::CodeWhaleOnly => {
                     if !matches!(
                         root.kind,
@@ -408,6 +373,56 @@ impl SkillRootCatalog {
     }
 }
 
+/// Project skill directories that exist but were not loaded because the
+/// workspace is not trusted, so discovery can say so instead of dropping them
+/// silently.
+#[must_use]
+pub fn untrusted_project_skill_dirs(
+    workspace: &Path,
+    home_dir: Option<&Path>,
+    configured_skills_dir: Option<&Path>,
+    mode: super::SkillDiscoveryMode,
+) -> Vec<PathBuf> {
+    let catalog = SkillRootCatalog::build(workspace, home_dir, configured_skills_dir)
+        .with_flat_workspace_root(mode.flat_workspace_root());
+    let present: Vec<PathBuf> = catalog
+        .roots
+        .iter()
+        .filter(|root| {
+            let explicit = configured_skills_dir
+                .is_some_and(|configured| paths_refer_to_same_dir(configured, &root.path));
+            root.scope == SkillScope::Project
+                && (root.active_for_runtime || explicit)
+                && (mode != super::SkillDiscoveryMode::CodeWhaleOnly
+                    || root.is_writable_owned()
+                    || explicit)
+                && path_is_existing_dir(&root.path)
+        })
+        .map(|root| root.path.clone())
+        .collect();
+    if present.is_empty() || crate::config::is_workspace_trusted(workspace) {
+        return Vec::new();
+    }
+    present
+}
+
+/// Whether `skills_dir` may load right now. A directory in project scope
+/// (repository-supplied, resolving inside the workspace) is held to the same
+/// workspace-trust gate as [`SkillRootCatalog::runtime_directories`], so an
+/// explicit or resolved skills dir cannot re-admit what the catalog filtered.
+/// A session rooted at the home directory is exempt: every path under it is
+/// the user's own global content, which the catalog also loads as global.
+#[must_use]
+pub fn skills_dir_allowed_by_workspace_trust(
+    workspace: &Path,
+    home_dir: Option<&Path>,
+    skills_dir: &Path,
+) -> bool {
+    classify_configured_skills_dir(workspace, home_dir, skills_dir).2 != SkillScope::Project
+        || home_dir.is_some_and(|home| paths_refer_to_same_dir(home, workspace))
+        || crate::config::is_workspace_trusted(workspace)
+}
+
 /// Resolve candidate skill directories for runtime discovery (existing paths
 /// only), preserving historical precedence.
 #[must_use]
@@ -416,7 +431,9 @@ pub fn skills_directories_with_home_and_mode(
     home_dir: Option<&Path>,
     mode: super::SkillDiscoveryMode,
 ) -> Vec<PathBuf> {
-    SkillRootCatalog::build(workspace, home_dir, None).runtime_directories(workspace, mode)
+    SkillRootCatalog::build(workspace, home_dir, None)
+        .with_flat_workspace_root(mode.flat_workspace_root())
+        .runtime_directories(workspace, mode)
 }
 
 /// CodeWhale project skills dir when it exists and stays inside the workspace.
@@ -735,10 +752,27 @@ mod tests {
     }
 
     #[test]
-    fn runtime_compatible_preserves_historical_workspace_order() {
+    fn unavailable_home_has_no_ambient_global_or_cache_root() {
+        let tmp = TempDir::new().unwrap();
+        let catalog = SkillRootCatalog::build(tmp.path(), None, None);
+        assert!(
+            catalog
+                .roots
+                .iter()
+                .all(|root| root.scope == SkillScope::Project)
+        );
+        let owned = catalog.owned_writable_roots();
+        assert_eq!(owned.len(), 1);
+        assert_eq!(owned[0].kind, SkillRootKind::CodeWhaleProject);
+        assert_eq!(owned[0].path, tmp.path().join(".codewhale/skills"));
+    }
+
+    #[test]
+    fn runtime_compatible_prioritizes_owned_workspace_roots() {
         let tmp = TempDir::new().unwrap();
         let workspace = tmp.path().join("ws");
         let home = tmp.path().join("home");
+        crate::test_support::trust_workspace(&workspace);
         write_dir(&workspace.join(".agents").join("skills"));
         write_dir(&workspace.join("skills"));
         write_dir(&workspace.join(".claude").join("skills"));
@@ -753,11 +787,10 @@ mod tests {
         assert_eq!(
             dirs,
             vec![
+                workspace.join(".codewhale").join("skills"),
                 workspace.join(".agents").join("skills"),
-                workspace.join("skills"),
                 workspace.join(".claude").join("skills"),
                 workspace.join(".cursor").join("skills"),
-                workspace.join(".codewhale").join("skills"),
                 home.join(".codewhale").join("skills"),
             ]
         );
@@ -798,6 +831,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let workspace = tmp.path().join("ws");
         let home = tmp.path().join("home");
+        crate::test_support::trust_workspace(&workspace);
         write_dir(&workspace.join(".agents").join("skills"));
         write_dir(&workspace.join(".codewhale").join("skills"));
         write_dir(&home.join(".codewhale").join("skills"));
@@ -850,6 +884,37 @@ mod tests {
         assert_eq!(
             safe_display_path(&project, Some(&workspace), Some(&home)),
             "<workspace>/.codewhale/skills"
+        );
+    }
+    #[test]
+    fn flat_workspace_root_remains_audit_only_until_opted_in() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path().join("ws");
+        crate::test_support::trust_workspace(&workspace);
+        let flat = workspace.join("skills");
+        write_dir(&flat);
+        let catalog = SkillRootCatalog::build(&workspace, None, None);
+        assert!(
+            catalog
+                .audit_compatible_directories()
+                .iter()
+                .any(|root| root.path == flat && !root.active_for_runtime)
+        );
+        assert!(
+            !catalog
+                .runtime_directories(&workspace, SkillDiscoveryMode::Compatible)
+                .contains(&flat)
+        );
+        let enabled = catalog.with_flat_workspace_root(true);
+        assert!(
+            enabled
+                .runtime_directories(&workspace, SkillDiscoveryMode::CompatibleWithFlatWorkspace)
+                .contains(&flat)
+        );
+        assert!(
+            !enabled
+                .runtime_directories(&workspace, SkillDiscoveryMode::CodeWhaleOnly)
+                .contains(&flat)
         );
     }
 }

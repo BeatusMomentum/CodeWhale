@@ -238,6 +238,11 @@ impl HandleStore {
     }
 }
 
+/// `handle_read` is deferred on the default catalog, so model-facing text
+/// that points at it also teaches how to activate it (#6747).
+pub(crate) const HANDLE_READ_ACTIVATION_HINT: &str =
+    "if `handle_read` is not in your tool list, load it with `tool_search` first";
+
 pub struct HandleReadTool;
 
 #[async_trait]

@@ -48,6 +48,8 @@ fn create_discovery_app(tmpdir: &TempDir) -> App {
 }
 
 fn write_user_command(tmpdir: &TempDir, name: &str, content: &str) {
+    // Workspace commands load only in a trusted workspace.
+    crate::test_support::trust_workspace(tmpdir.path());
     let commands_dir = tmpdir.path().join(".codewhale").join("commands");
     std::fs::create_dir_all(commands_dir).expect("create commands dir");
     let path = tmpdir
@@ -62,7 +64,7 @@ fn palette_entries(tmpdir: &TempDir) -> Vec<CommandPaletteEntry> {
     command_palette::build_entries(
         Locale::En,
         tmpdir.path().join("skills").as_path(),
-        false,
+        crate::skills::SkillDiscoveryMode::Compatible,
         tmpdir.path(),
         tmpdir.path().join("mcp.json").as_path(),
         None,

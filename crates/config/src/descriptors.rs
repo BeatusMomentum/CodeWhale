@@ -130,6 +130,62 @@ mod tests {
         );
     }
 
+    /// #6616: AICraft carries the console, docs and guidance its neighbours
+    /// do, and every link a descriptor publishes is HTTPS.
+    #[test]
+    fn aicraft_carries_console_docs_and_guidance() {
+        let aicraft = provider_descriptor("ai-craft").expect("aicraft");
+        assert_eq!(aicraft.id, "aicraft");
+        assert_eq!(
+            aicraft.docs_url.as_deref(),
+            Some("https://aicraftapi.com/docs.html#codewhale")
+        );
+        assert_eq!(
+            aicraft.credential_url.as_deref(),
+            Some("https://aicraftapi.com/dashboard.html")
+        );
+        let guidance = aicraft.guidance.as_deref().expect("aicraft guidance");
+        assert!(guidance.contains("Store AICRAFT_API_KEY"), "{guidance}");
+        for row in bundled_provider_descriptors() {
+            for url in [&row.docs_url, &row.credential_url].into_iter().flatten() {
+                assert!(url.starts_with("https://"), "{}: {url}", row.id);
+            }
+        }
+    }
+
+    /// #6695: Tsubasa is a data row on the existing compatible transport with
+    /// its own key env. The row carries no context field, so the guidance is
+    /// where the 32K window and the second public model id reach the user.
+    #[test]
+    fn tsubasa_is_a_compatible_row_with_its_own_key() {
+        let tsubasa = provider_descriptor("tsubasa").expect("tsubasa");
+        assert_eq!(tsubasa.wire, DescriptorWire::OpenaiCompatible);
+        assert_eq!(tsubasa.base_url, "https://api.tsubasa.sh/v1");
+        assert_eq!(tsubasa.api_key_env, "TSUBASA_API_KEY");
+        assert_eq!(tsubasa.default_model, "tsubasa-pro");
+        let guidance = tsubasa.guidance.as_deref().expect("tsubasa guidance");
+        for needle in [
+            "tsubasa-fast",
+            "context_window = 32768",
+            "Store TSUBASA_API_KEY",
+        ] {
+            assert!(guidance.contains(needle), "{needle}: {guidance}");
+        }
+    }
+
+    #[test]
+    fn cheaper_inference_is_a_descriptor_row() {
+        let row = provider_descriptor("cheaper-inference").expect("cheaperinference");
+        assert_eq!(row.id, "cheaperinference");
+        assert_eq!(row.base_url, "https://api.cheaperinference.com/v1");
+        assert_eq!(row.api_key_env, "CHEAPER_INFERENCE_API_KEY");
+        assert_eq!(row.default_model, "gpt-5.4-mini");
+        assert_eq!(
+            provider_descriptor("cheaper_inference").map(|row| row.id.as_str()),
+            Some("cheaperinference")
+        );
+    }
+
     #[test]
     fn descriptors_do_not_embed_model_rosters() {
         let raw = DESCRIPTORS_JSON;

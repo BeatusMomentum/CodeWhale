@@ -28,6 +28,13 @@ pub(super) struct StdioTransport {
     pub(super) authority_cancel_watch: Option<tokio::task::JoinHandle<()>>,
     /// Holds reviewed executable/script handles for the process lifetime.
     pub(super) _reviewed_launch: Option<super::ReviewedStdioLaunch>,
+    /// Everything the server started: its own process group on Unix, a Job
+    /// Object on Windows. Termination signals the whole tree, so a server's
+    /// grandchild (an `npx` wrapper's node, a shell's background job) dies
+    /// with it on shutdown and on plugin revocation. The last clone's drop
+    /// kills whatever is left. `None` only for a transport built around an
+    /// uncontained child (tests).
+    pub(super) process_tree: Option<Arc<crate::process_tree::ProcessTree>>,
 }
 
 /// How long `StdioTransport::shutdown` waits for the child to exit on SIGTERM
@@ -66,6 +73,17 @@ impl StderrTail {
 
     async fn snapshot(&self) -> Vec<String> {
         self.lines.lock().await.iter().cloned().collect()
+    }
+
+    async fn last_line(&self) -> Option<String> {
+        self.lines
+            .lock()
+            .await
+            .iter()
+            .rev()
+            .map(|line| line.trim())
+            .find(|line| !line.is_empty())
+            .map(str::to_string)
     }
 }
 
@@ -161,6 +179,9 @@ impl StdioTransport {
                 child_env::string_map_env(&expanded_env),
             );
         }
+        // Lead a process group of its own so teardown can reach descendants.
+        #[cfg(unix)]
+        cmd.process_group(0);
 
         let mut child = cmd.spawn().map_err(|error| {
             let message = if error.kind() == std::io::ErrorKind::NotFound
@@ -184,6 +205,16 @@ impl StdioTransport {
             anyhow::Error::new(error).context(message)
         })?;
 
+        let process_tree = match crate::process_tree::ProcessTree::attach_tokio(&child) {
+            Ok(tree) => Arc::new(tree),
+            Err(error) => {
+                let _ = child.start_kill();
+                return Err(anyhow::Error::new(error).context(format!(
+                    "MCP server {server_name} could not be contained with its child processes"
+                )));
+            }
+        };
+
         let stdin = child.stdin.take().context("Failed to get MCP stdin")?;
         let stdout = child.stdout.take().context("Failed to get MCP stdout")?;
         let stderr = child.stderr.take().context("Failed to get MCP stderr")?;
@@ -200,23 +231,17 @@ impl StdioTransport {
             // stderr to avoid blocking, but do not retain or surface arbitrary
             // child output that could echo those credentials into a chat or
             // persisted transcript.
-            let capture_lines = config.reviewed_plugin.is_none();
-            tokio::spawn(async move {
-                let mut lines = tokio::io::BufReader::new(stderr).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    if capture_lines {
-                        tail.push(line).await;
-                    }
-                }
-            });
+            let capture = config.reviewed_plugin.is_none().then_some(tail);
+            tokio::spawn(drain_stderr(stderr, capture));
         }
 
         let child = Arc::new(TokioMutex::new(child));
         let authority_cancel_watch = config.reviewed_plugin.as_ref().map(|_| {
             let watched_child = Arc::clone(&child);
+            let watched_tree = Arc::clone(&process_tree);
             tokio::spawn(async move {
                 cancel_token.cancelled().await;
-                terminate_child_for_authority_change(&watched_child).await;
+                terminate_child_for_authority_change(&watched_child, &watched_tree).await;
             })
         });
 
@@ -228,8 +253,73 @@ impl StdioTransport {
             stderr_tail,
             authority_cancel_watch,
             _reviewed_launch: reviewed_launch,
+            process_tree: Some(process_tree),
         })
     }
+}
+
+/// Longest stderr line retained in the tail, in bytes after decoding. An
+/// overlong line keeps its end, where the error usually is, and the start is
+/// drained and discarded so a newline-free progress stream cannot grow memory.
+const STDERR_LINE_CAP: usize = 4 * 1024;
+
+/// Drain a child's stderr until EOF, retaining lossily decoded, length-capped
+/// lines in `tail` when given. Stderr is not a protocol channel: a non-UTF-8
+/// byte or an endless line must never stop the drain, because dropping the
+/// pipe makes the child's next stderr write fail (EPIPE/SIGPIPE) and hides
+/// the context this tail exists to keep.
+async fn drain_stderr<R>(stderr: R, tail: Option<Arc<StderrTail>>)
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut reader = tokio::io::BufReader::new(stderr);
+    let mut line = Vec::new();
+    loop {
+        let (consumed, line_ended) = {
+            let available = match reader.fill_buf().await {
+                Ok(available) => available,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            };
+            if available.is_empty() {
+                break;
+            }
+            let (consumed, line_ended) = match available.iter().position(|&b| b == b'\n') {
+                Some(pos) => (pos + 1, true),
+                None => (available.len(), false),
+            };
+            if tail.is_some() {
+                let content = &available[..consumed - usize::from(line_ended)];
+                let keep = content.len().min(STDERR_LINE_CAP);
+                let overflow = (line.len() + keep).saturating_sub(STDERR_LINE_CAP);
+                line.drain(..overflow);
+                line.extend_from_slice(&content[content.len() - keep..]);
+            }
+            (consumed, line_ended)
+        };
+        reader.consume(consumed);
+        if line_ended {
+            push_stderr_line(tail.as_deref(), &mut line).await;
+        }
+    }
+    if !line.is_empty() {
+        push_stderr_line(tail.as_deref(), &mut line).await;
+    }
+}
+
+async fn push_stderr_line(tail: Option<&StderrTail>, line: &mut Vec<u8>) {
+    if let Some(tail) = tail {
+        let bytes: &[u8] = line;
+        let text = String::from_utf8_lossy(bytes.strip_suffix(b"\r").unwrap_or(bytes));
+        // Lossy decoding can triple invalid bytes; hold the retained size to
+        // the cap too, again keeping the end.
+        let mut start = text.len().saturating_sub(STDERR_LINE_CAP);
+        while !text.is_char_boundary(start) {
+            start += 1;
+        }
+        tail.push(text[start..].to_owned()).await;
+    }
+    line.clear();
 }
 
 /// Format the captured stderr tail for inclusion in an error message. Empty
@@ -247,19 +337,22 @@ async fn format_stderr_context(tail: &StderrTail) -> Option<String> {
     ))
 }
 
-/// Best-effort SIGTERM. On Unix uses `libc::kill`; on Windows there's no
-/// equivalent so we let `kill_on_drop` (TerminateProcess) handle it via the
-/// subsequent Drop. Returns whether a signal was actually sent.
-fn send_sigterm(child: &Child) -> bool {
+/// Best-effort SIGTERM. On Unix uses `libc::kill`, addressed to the child's
+/// whole process group when it leads one (`contained`); on Windows there's no
+/// equivalent so we let `kill_on_drop` (TerminateProcess) and the Job Object
+/// handle it. Returns whether a signal was actually sent.
+fn send_sigterm(child: &Child, contained: bool) -> bool {
     #[cfg(unix)]
     {
         if let Some(pid) = child.id() {
-            // SAFETY: pid was just obtained from `child.id()`. `libc::kill`
-            // with `SIGTERM` is async-signal-safe and never observes invalid
-            // memory. Worst case (pid wrap / process already gone) returns
-            // ESRCH, which we deliberately ignore.
+            let pid = pid as i32;
+            let target = if contained { -pid } else { pid };
+            // SAFETY: pid was just obtained from `child.id()` of an unreaped
+            // child, so neither it nor the group it leads can have been
+            // recycled. `libc::kill` with `SIGTERM` is async-signal-safe and
+            // never observes invalid memory. ESRCH is deliberately ignored.
             unsafe {
-                let _ = libc::kill(pid as i32, libc::SIGTERM);
+                let _ = libc::kill(target, libc::SIGTERM);
             }
             return true;
         }
@@ -267,27 +360,34 @@ fn send_sigterm(child: &Child) -> bool {
     }
     #[cfg(not(unix))]
     {
-        let _ = child;
+        let _ = (child, contained);
         false
     }
 }
 
-async fn terminate_child_for_authority_change(child: &Arc<TokioMutex<Child>>) {
+async fn terminate_child_for_authority_change(
+    child: &Arc<TokioMutex<Child>>,
+    tree: &crate::process_tree::ProcessTree,
+) {
     let mut child = child.lock().await;
-    terminate_child(&mut child).await;
+    terminate_child(&mut child, Some(tree)).await;
 }
 
-async fn terminate_child(child: &mut Child) {
+async fn terminate_child(child: &mut Child, tree: Option<&crate::process_tree::ProcessTree>) {
     // Reap an already-exited child before resolving its PID. Until it is
     // reaped, the OS cannot recycle that identity; after it is reaped there is
     // nothing left to signal. This avoids a PID-only watcher ever targeting an
     // unrelated process after rapid PID reuse.
     if child.try_wait().is_ok_and(|status| status.is_some()) {
+        // The server is gone, but what it started may not be.
+        if let Some(tree) = tree {
+            let _ = tree.kill();
+        }
         return;
     }
 
     #[cfg(unix)]
-    send_sigterm(child);
+    send_sigterm(child, tree.is_some());
 
     #[cfg(not(unix))]
     let _ = child.start_kill();
@@ -301,10 +401,25 @@ async fn terminate_child(child: &mut Child) {
             let _ = child.wait().await;
         }
     }
+    // Descendants that outlived the grace (or ignored SIGTERM) go now.
+    if let Some(tree) = tree {
+        let _ = tree.kill();
+    }
 }
 
 #[async_trait::async_trait]
 impl McpTransport for StdioTransport {
+    async fn last_stderr_line(&self) -> Option<String> {
+        // The child usually writes its reason to stderr just before the error
+        // reply; give the drain task a bounded moment to catch up.
+        tokio::task::yield_now().await;
+        if let Some(line) = self.stderr_tail.last_line().await {
+            return Some(line);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        self.stderr_tail.last_line().await
+    }
+
     async fn send(&mut self, mut msg: Vec<u8>) -> Result<()> {
         msg.push(b'\n');
         self.stdin.write_all(&msg).await?;
@@ -371,7 +486,7 @@ impl McpTransport for StdioTransport {
     /// then force termination and reap the child as the backstop.
     async fn shutdown(&mut self) {
         let mut child = self.child.lock().await;
-        terminate_child(&mut child).await;
+        terminate_child(&mut child, self.process_tree.as_deref()).await;
     }
 }
 
@@ -387,18 +502,22 @@ impl Drop for StdioTransport {
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             let child = Arc::clone(&self.child);
             let reviewed_launch = self._reviewed_launch.take();
+            // The task owns the tree so it is not killed before the grace.
+            let tree = self.process_tree.take();
             runtime.spawn(async move {
                 let _reviewed_launch = reviewed_launch;
                 let mut child = child.lock().await;
-                terminate_child(&mut child).await;
+                terminate_child(&mut child, tree.as_deref()).await;
             });
             return;
         }
         if let Ok(mut child) = self.child.try_lock()
             && !child.try_wait().is_ok_and(|status| status.is_some())
         {
-            send_sigterm(&child);
+            send_sigterm(&child, self.process_tree.is_some());
         }
+        // No runtime: dropping the tree below SIGKILLs the group / closes the
+        // job, the same backstop `kill_on_drop` gives the direct child.
     }
 }
 
@@ -406,7 +525,7 @@ impl Drop for StdioTransport {
 /// exceeds `max` bytes. Cancellation retains consumed bytes; the caller clears
 /// the buffer only after receiving a complete frame. Returns the total bytes
 /// accumulated; 0 means EOF.
-async fn read_line_capped<R>(
+pub(crate) async fn read_line_capped<R>(
     reader: &mut R,
     out: &mut Vec<u8>,
     max: usize,
@@ -441,6 +560,77 @@ where
         }
     }
     Ok(out.len())
+}
+
+#[cfg(test)]
+mod stderr_drain_tests {
+    use super::{STDERR_LINE_CAP, StderrTail, drain_stderr};
+    use tokio::io::AsyncWriteExt;
+
+    #[tokio::test]
+    async fn invalid_utf8_and_long_lines_do_not_stop_the_drain() {
+        let (mut writer, reader) = tokio::io::duplex(64);
+        let tail = StderrTail::new();
+        let drain = tokio::spawn(drain_stderr(reader, Some(tail.clone())));
+        writer.write_all(b"starting\r\n").await.unwrap();
+        writer.write_all(b"caf\xe9 \xff\xfe\n").await.unwrap();
+        writer
+            .write_all(&vec![b'#'; STDERR_LINE_CAP * 3])
+            .await
+            .unwrap();
+        writer.write_all(b"\npanic: boom").await.unwrap();
+        drop(writer);
+        drain.await.unwrap();
+        let lines = tail.snapshot().await;
+        assert_eq!(lines.len(), 4, "{lines:?}");
+        assert_eq!(lines[0], "starting");
+        assert_eq!(lines[1], "caf\u{fffd} \u{fffd}\u{fffd}");
+        assert_eq!(lines[2].len(), STDERR_LINE_CAP);
+        assert_eq!(lines[3], "panic: boom");
+    }
+
+    #[tokio::test]
+    async fn overlong_lines_keep_their_end_within_the_cap() {
+        let (mut writer, reader) = tokio::io::duplex(64);
+        let tail = StderrTail::new();
+        let drain = tokio::spawn(drain_stderr(reader, Some(tail.clone())));
+        // A long prefix, then the actual failure at the end of the line.
+        writer
+            .write_all(&vec![b'.'; STDERR_LINE_CAP * 3])
+            .await
+            .unwrap();
+        writer.write_all(b"error: config missing\n").await.unwrap();
+        // Invalid bytes decode to three-byte U+FFFD each.
+        writer
+            .write_all(&vec![0xff; STDERR_LINE_CAP])
+            .await
+            .unwrap();
+        writer.write_all(b"\n").await.unwrap();
+        drop(writer);
+        drain.await.unwrap();
+        let lines = tail.snapshot().await;
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(
+            lines[0].ends_with("error: config missing"),
+            "{:?}",
+            &lines[0][lines[0].len() - 40..]
+        );
+        assert_eq!(lines[0].len(), STDERR_LINE_CAP);
+        assert!(lines[1].len() <= STDERR_LINE_CAP, "{}", lines[1].len());
+        assert!(lines[1].chars().all(|c| c == '\u{fffd}'));
+    }
+
+    #[tokio::test]
+    async fn uncaptured_stderr_is_still_drained_to_eof() {
+        let (mut writer, reader) = tokio::io::duplex(16);
+        let drain = tokio::spawn(drain_stderr(reader, None));
+        // A non-UTF-8 line, then far more than the pipe buffer: a drain that
+        // stopped at the bad line would fail this write with a broken pipe.
+        writer.write_all(b"\xff\n").await.unwrap();
+        writer.write_all(&[b'x'; 4096]).await.unwrap();
+        drop(writer);
+        drain.await.unwrap();
+    }
 }
 
 #[cfg(test)]

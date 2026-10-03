@@ -30,3 +30,16 @@ advisories requires a separate assessment.
 
 The Apps desktop lockfile and its platform dependencies are a separate graph;
 this Core cleanup does not resolve their maintenance or GLib qualification work.
+
+Automatic Git review and workspace polling require the runtime configuration
+override interface introduced in [Git 2.31](https://github.com/git/git/blob/master/Documentation/RelNotes/2.31.0.adoc). The shared read authority probes the
+resolved absolute executable once per process and pins subsequent commands to
+that executable even if PATH changes. It refuses automatic reads if the executable
+cannot honor those overrides; explicit user Git writes retain their existing behavior.
+The porcelain-v1 display fallback does not waive this safety requirement.
+The absolute path fixes executable search selection; it does not authenticate an
+executable replaced at that path by the same local user.
+
+Local fixtures cover native modern Git and an emulated executable that ignores
+runtime overrides. They do not qualify a real older-Git installation, partial
+clones, or all platform-specific Git behavior.

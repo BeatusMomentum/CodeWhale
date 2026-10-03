@@ -114,14 +114,16 @@ pub(crate) struct RouteIdentityField {
     pub text: String,
 }
 
-/// The info line's route budget: the row's width less the brand lockup,
-/// meter, and clock floor, never below 24.
+/// The info line's route budget: reserve 60 columns for other metrics, with
+/// a floor that grows from 24 to 32 columns with half the row's width. This
+/// keeps longer effort labels at 80 columns without crowding narrower rows.
 ///
 /// One owner. The rule used to be written out at the call site in
 /// `ui/frame.rs` and copied again into two tests with a comment pointing
 /// back at the original, which is how a shed rule drifts.
 pub(crate) fn info_route_budget(width: u16) -> usize {
-    usize::from(width).saturating_sub(60).max(24)
+    let width = usize::from(width);
+    width.saturating_sub(60).max((width / 2).clamp(24, 32))
 }
 
 /// Split a notice at its joints, coarsest first.
@@ -463,8 +465,7 @@ mod tests {
         );
         app.ui_locale = codewhale_localization::Locale::En;
 
-        // The info line's own budget rule (ui/frame.rs): width minus the brand
-        // lockup, meter, and clock floor, never below 24.
+        // Use the info line's own budget rule, including its adaptive floor.
         let fields = |width: u16| {
             route_identity_fields(
                 &app,

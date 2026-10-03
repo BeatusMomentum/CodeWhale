@@ -91,7 +91,19 @@ pub(super) async fn auto_deny_session_approval(
             "session_id": app.current_session_id,
         }),
     );
-    let _ = engine_handle.deny_tool_call(id.to_string()).await;
+    // The notice claims the call was denied; say so only when the denial
+    // reached the engine (U03-06). A failed send means the engine's approval
+    // mailbox is closed, so nothing is left waiting on this decision.
+    if let Err(error) = engine_handle
+        .deny_tool_call_by(
+            id.to_string(),
+            crate::approval_log::ApprovalDecider::SessionRule,
+        )
+        .await
+    {
+        tracing::warn!(tool_name, %error, "session-rule denial did not reach the engine");
+        return;
+    }
     surface_session_denied_notice(app, tool_name);
 }
 
@@ -111,6 +123,24 @@ fn app_turn_authority_for_approvals(app: &App) -> crate::core::authority::TurnAu
         app_auto_approve_enabled(app),
         app.approval_mode,
     )
+}
+
+/// Who answered an `AutoApprove` disposition: the posture when it allows the
+/// call on its own, otherwise the remembered session rule that did.
+pub(super) fn auto_approval_decider(
+    app: &App,
+    approval_force_prompt: bool,
+) -> crate::approval_log::ApprovalDecider {
+    use crate::core::authority::ApprovalRequestDisposition;
+    match crate::core::authority::resolve_approval_request_disposition(
+        &app_turn_authority_for_approvals(app),
+        false,
+        false,
+        approval_force_prompt,
+    ) {
+        ApprovalRequestDisposition::AutoApprove => crate::approval_log::ApprovalDecider::Posture,
+        _ => crate::approval_log::ApprovalDecider::SessionRule,
+    }
 }
 
 pub(super) fn resolve_ui_approval_disposition(

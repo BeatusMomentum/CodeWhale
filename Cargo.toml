@@ -21,18 +21,21 @@ members = [
     "crates/release",
     "crates/runtime",
     "crates/secrets",
+    "crates/sanitize",
     "crates/state",
     "crates/telemetry",
     "crates/tools",
     "crates/tui",
     "crates/workflow",
     "crates/workflow-js",
+    "tests/portable-debug-diagnostics",
+    "tests/portable-session",
 ]
 default-members = ["crates/cli"]
 resolver = "2"
 
 [workspace.package]
-version = "0.10.0"
+version = "0.10.1"
 edition = "2024"
 # Rust 1.88 stabilized `let_chains` in `if`/`while` conditions, which the
 # codebase relies on extensively. Cargo enforces this so users on older
@@ -65,7 +68,7 @@ libc = "0.2"
 reqwest = { version = "0.13.1", default-features = false, features = ["json", "rustls-no-provider", "socks"] }
 # NOT "parallel": the Workflow VM stays single-threaded and bridges to the
 # multi-thread engine over channels (see crates/workflow-js).
-rquickjs = { version = "0.12", features = ["futures"] }
+rquickjs = { version = "0.14", features = ["futures"] }
 rustls = { version = "0.23.36", default-features = false, features = ["ring", "std", "tls12"] }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 serde = { version = "1.0.228", features = ["derive"] }

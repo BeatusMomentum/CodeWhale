@@ -218,17 +218,9 @@ pub(super) async fn read_body_capped(
     response: reqwest::Response,
     max_bytes: usize,
 ) -> Result<String> {
-    use futures_util::StreamExt;
-
-    let mut stream = response.bytes_stream();
-    let mut buf: Vec<u8> = Vec::new();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.context("failed to read MCP response body")?;
-        if buf.len().saturating_add(chunk.len()) > max_bytes {
-            anyhow::bail!("MCP response body exceeds {max_bytes} bytes — aborting");
-        }
-        buf.extend_from_slice(&chunk);
-    }
+    let buf = crate::utils::read_response_body_capped(response, max_bytes)
+        .await
+        .map_err(|error| anyhow::anyhow!("MCP {error:#}"))?;
     Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 

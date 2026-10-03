@@ -470,8 +470,8 @@ fn read_audit_log(
     earlier_roots: &HashMap<[u8; 32], u64>,
     root_counts: &mut HashMap<[u8; 32], u64>,
 ) {
-    let content = match std::fs::read_to_string(path) {
-        Ok(c) => c,
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
         Err(e) => {
             tracing::trace!(
@@ -483,7 +483,14 @@ fn read_audit_log(
         }
     };
 
-    for raw_line in content.lines() {
+    // Streamed line by line: an append-only log is unbounded, and holding it
+    // whole only to aggregate one line at a time made allocation scale with it.
+    for raw_line in std::io::BufRead::lines(std::io::BufReader::new(file)) {
+        let Ok(raw_line) = raw_line.inspect_err(|e| {
+            tracing::trace!("metrics: stopped reading audit log {}: {e}", path.display());
+        }) else {
+            break;
+        };
         rollup.total_lines += 1;
         let line = raw_line.trim();
         if line.is_empty() {
@@ -893,8 +900,8 @@ fn read_events_jsonl(
     rollup: &mut Rollup,
     dedup: &mut RuntimeEventDedup,
 ) {
-    let content = match std::fs::read_to_string(path) {
-        Ok(c) => c,
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
         Err(e) => {
             tracing::trace!(
                 "metrics: could not read events file {}: {}",
@@ -905,7 +912,16 @@ fn read_events_jsonl(
         }
     };
 
-    for raw_line in content.lines() {
+    // Streamed like the audit log: allocation follows one line, not the file.
+    for raw_line in std::io::BufRead::lines(std::io::BufReader::new(file)) {
+        let Ok(raw_line) = raw_line.inspect_err(|e| {
+            tracing::trace!(
+                "metrics: stopped reading events file {}: {e}",
+                path.display()
+            );
+        }) else {
+            break;
+        };
         rollup.total_lines += 1;
         let line = raw_line.trim();
         if line.is_empty() {

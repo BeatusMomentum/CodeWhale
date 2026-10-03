@@ -2703,6 +2703,32 @@ mod launch_card_tests {
         assert!(app.input.is_empty());
     }
 
+    /// The migration notice ends with the reassurance that nothing applies
+    /// unapproved; a truncated notice drops exactly that half. The English
+    /// line must fit the card measure whole at a wide terminal.
+    #[test]
+    fn claude_notice_is_never_truncated_on_a_wide_terminal() {
+        let notice = codewhale_localization::tr(
+            codewhale_localization::Locale::En,
+            codewhale_localization::MessageId::LaunchNoticeClaude,
+        );
+        assert!(
+            text_display_width(&notice) <= LAUNCH_CARD_MEASURE,
+            "notice is {} cells; the card lane is {LAUNCH_CARD_MEASURE}: {notice:?}",
+            text_display_width(&notice),
+        );
+        let mut app = app_with_recent(&["one"], 1);
+        app.launch.claude_code_detected = true;
+        let state = launch_empty_state(&app, Rect::new(0, 0, 160, 40));
+        assert!(
+            state
+                .lines
+                .iter()
+                .any(|line| flatten(line).contains(notice.as_ref())),
+            "the full notice must paint at 160 columns",
+        );
+    }
+
     #[test]
     fn every_hitbox_points_at_the_row_that_painted() {
         let app = app_with_recent(&["one", "two", "three"], 9);

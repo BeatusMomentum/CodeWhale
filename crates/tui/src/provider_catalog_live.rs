@@ -203,6 +203,20 @@ where
 }
 
 impl ProviderLivePricingQuote {
+    /// Whether the quote names at least one rate. A `[[custom_models]]` row
+    /// declared only to add a model to a roster freezes a rate-less quote.
+    #[must_use]
+    pub(crate) fn carries_rates(&self) -> bool {
+        [
+            &self.input_per_million,
+            &self.output_per_million,
+            &self.cache_read_per_million,
+            &self.cache_write_per_million,
+        ]
+        .into_iter()
+        .any(Option::is_some)
+    }
+
     fn is_structurally_valid(&self) -> bool {
         self.pricing_for_route(
             self.provider,
@@ -1383,6 +1397,21 @@ pub(crate) fn configured_dispatch_pricing_quote_at(
         dispatched_at,
         &pricing,
     )
+}
+
+/// Pick the dispatch quote from an operator declaration and the endpoint's
+/// catalog. A declared rate wins. A declaration with no rates yields to the
+/// catalog's price for the same exact endpoint (#6690), and is kept (frozen,
+/// rate-less) only when the catalog has none, so a same-named bundled price
+/// still cannot fill the gap.
+pub(crate) fn declared_or_catalog_quote(
+    declared: Option<ProviderLivePricingQuote>,
+    catalog: impl FnOnce() -> Option<ProviderLivePricingQuote>,
+) -> Option<ProviderLivePricingQuote> {
+    match declared {
+        Some(quote) if quote.carries_rates() => Some(quote),
+        declared => catalog().or(declared),
+    }
 }
 
 pub(crate) fn fresh_dispatch_pricing_quote_at(

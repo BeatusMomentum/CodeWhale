@@ -10,6 +10,84 @@ use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[test]
+fn requirements_check_implicit_approval_and_sandbox_defaults() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let path = temp.path().join("requirements.toml");
+    let mut config = Config {
+        requirements_path: Some(path.display().to_string()),
+        ..Config::default()
+    };
+
+    fs::write(&path, "allowed_approval_policies = ['never']\n").unwrap();
+    let error = apply_requirements(&mut config).expect_err("default approval must be checked");
+    assert!(error.to_string().contains("approval_policy 'on-request'"));
+    config.approval_policy = Some("never".into());
+    apply_requirements(&mut config).expect("explicit allowed policy");
+
+    fs::write(&path, "allowed_sandbox_modes = ['read-only']\n").unwrap();
+    let error = apply_requirements(&mut config).expect_err("default sandbox must be checked");
+    assert!(error.to_string().contains("sandbox_mode 'workspace-write'"));
+    config.sandbox_mode = Some("read-only".into());
+    apply_requirements(&mut config).expect("explicit allowed sandbox");
+
+    config.approval_policy = None;
+    config.sandbox_mode = None;
+    fs::write(
+        &path,
+        "allowed_approval_policies = ['ON-REQUEST']\nallowed_sandbox_modes = ['WORKSPACE-WRITE']\n",
+    )
+    .unwrap();
+    apply_requirements(&mut config).expect("allowed implicit defaults");
+    config.yolo = Some(true);
+    apply_requirements(&mut config).expect("managed approvals prevent the YOLO override");
+    fs::write(&path, "allowed_sandbox_modes = ['workspace-write']\n").unwrap();
+    apply_requirements(&mut config).expect("managed sandbox prevents the YOLO override");
+    config.approval_policy = Some("full-access".into());
+    let error =
+        apply_requirements(&mut config).expect_err("full access changes the sandbox default");
+    assert!(
+        error
+            .to_string()
+            .contains("sandbox_mode 'danger-full-access'")
+    );
+}
+
+#[test]
+fn requirements_accept_equivalent_approval_aliases() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let path = temp.path().join("requirements.toml");
+    let mut config = Config {
+        requirements_path: Some(path.display().to_string()),
+        ..Config::default()
+    };
+    for alias in ["untrusted", "ask", "suggest", "ON-REQUEST"] {
+        fs::write(&path, format!("allowed_approval_policies = ['{alias}']\n")).unwrap();
+        for policy in [None, Some("on-request"), Some("ask")] {
+            config.approval_policy = policy.map(str::to_string);
+            apply_requirements(&mut config).expect("equivalent approval mode is allowed");
+        }
+        config.approval_policy = Some("full-access".into());
+        assert!(
+            apply_requirements(&mut config).is_err(),
+            "{alias} must not allow bypass"
+        );
+    }
+    fs::write(&path, "allowed_approval_policies = ['unknown']\n").unwrap();
+    config.approval_policy = None;
+    assert!(
+        apply_requirements(&mut config).is_err(),
+        "unknown is not the default"
+    );
+    config.approval_policy = Some("other-unknown".into());
+    assert!(
+        apply_requirements(&mut config).is_err(),
+        "unknown modes must not compare equal"
+    );
+    config.approval_policy = Some("UNKNOWN".into());
+    apply_requirements(&mut config).expect("unparsed policies retain literal comparison");
+}
+
+#[test]
 fn remembered_deepseek_cn_and_layered_root_models_keep_their_precedence() {
     let _lock = lock_test_env();
     let home = tempfile::tempdir().unwrap();
@@ -1210,7 +1288,7 @@ web_search = true
     let config = Config::load(None, None)?;
 
     assert_eq!(config.provider.as_deref(), Some("zai"));
-    assert_eq!(config.api_key.as_deref(), Some("deepseek-test-key"));
+    assert_eq!(config.deepseek_table_api_key(), Some("deepseek-test-key"));
     assert_eq!(
         config.default_text_model.as_deref(),
         Some("deepseek-v4-pro")
@@ -1407,6 +1485,7 @@ fn profile_hotbar_override_replaces_entire_user_list() {
             ..Config::default()
         }),
         profiles: Some(profiles),
+        legacy_root: Default::default(),
     };
 
     let merged = apply_profile(config, Some("compact")).expect("profile");
@@ -1438,6 +1517,7 @@ fn profile_without_scenario() {
                 ..Config::default()
             }),
             profiles: Some(profiles),
+            legacy_root: Default::default(),
         };
 
         let merged = apply_profile(config, Some("work")).expect("profile");
@@ -1463,6 +1543,7 @@ fn profile_without_scenario() {
                 ..Default::default()
             }),
             profiles: Some(profiles),
+            legacy_root: Default::default(),
         };
 
         let merged = apply_profile(config, Some("work")).expect("profile");
@@ -2474,7 +2555,7 @@ fn structural_config_load_keeps_safe_environment_overrides_but_omits_secret_valu
             .is_none()
     );
     assert_eq!(
-        structural.base_url.as_deref(),
+        structural.deepseek_table_base_url(),
         Some("https://safe.example:8443/v1")
     );
     assert_eq!(structural.allow_shell, Some(false));
@@ -4888,9 +4969,9 @@ fn has_api_key_detects_in_memory_override_and_env_var() -> Result<()> {
     // Explicit in-memory key wins over every other source per
     // `Config::active_route_api_key`'s "Path 0" override.
     let cfg = Config {
-        api_key: Some("sk-in-memory-override".to_string()),
         ..Default::default()
-    };
+    }
+    .with_legacy_root(Some("sk-in-memory-override".to_string()), None);
     assert!(
         has_api_key(&cfg),
         "in-memory override must be detected as a usable key"
@@ -4920,9 +5001,9 @@ fn deepseek_dispatcher_env_key_overrides_config_key() -> Result<()> {
         std::env::set_var("DEEPSEEK_API_KEY_SOURCE", "cli");
     }
     let config = Config {
-        api_key: Some("saved-deepseek-key".to_string()),
         ..Default::default()
-    };
+    }
+    .with_legacy_root(Some("saved-deepseek-key".to_string()), None);
 
     assert_eq!(config.active_route_api_key()?, "ark-dispatcher-key");
 
@@ -5064,9 +5145,9 @@ fn has_api_scenario() -> Result<()> {
         for provider in ["deepseek", "deepseek-cn"] {
             let config = Config {
                 provider: Some(provider.to_string()),
-                api_key: Some("root-config-key".to_string()),
                 ..Config::default()
-            };
+            }
+            .with_legacy_root(Some("root-config-key".to_string()), None);
 
             assert!(
                 has_api_key(&config),
@@ -5102,9 +5183,9 @@ fn has_api_scenario() -> Result<()> {
     {
         let _lock = lock_test_env();
         let config = Config {
-            api_key: Some("root-config-key".to_string()),
             ..Config::default()
-        };
+        }
+        .with_legacy_root(Some("root-config-key".to_string()), None);
 
         assert!(has_api_key_for(&config, ApiProvider::Deepseek));
         assert!(has_api_key_for(&config, ApiProvider::DeepseekCN));
@@ -5242,10 +5323,13 @@ fn save_api_key_inserts_key_when_only_a_comment_mentions_it() -> Result<()> {
     );
     let parsed: toml::Value = toml::from_str(&after)?;
     assert_eq!(
-        parsed.get("api_key").and_then(toml::Value::as_str),
+        parsed["providers"]["deepseek"]
+            .get("api_key")
+            .and_then(toml::Value::as_str),
         Some("fresh-key"),
         "real key must be inserted despite the comment: {after}"
     );
+    assert!(parsed.get("api_key").is_none(), "{after}");
     Ok(())
 }
 
@@ -5282,10 +5366,16 @@ base_url = "https://openrouter.ai/api/v1"
 
     save_api_key("new-key")?;
 
+    // The key moved into `[providers.deepseek]` with its comment (#6394).
     let after = fs::read_to_string(&config_path)?;
     assert!(
         after.contains("api_key = \"new-key\" # keep secret"),
         "value must be replaced in place with its comment: {after}"
+    );
+    let parsed: toml::Table = toml::from_str(&after)?;
+    assert_eq!(
+        parsed["providers"]["deepseek"]["api_key"].as_str(),
+        Some("new-key")
     );
     assert!(!after.contains("old-key"), "{after}");
     assert!(after.contains("# top note"), "{after}");
@@ -5488,6 +5578,75 @@ api_key = "unrelated-key"
 }
 
 #[test]
+fn clear_active_provider_api_key_deepseek_cn_keeps_deepseek_own_key() -> Result<()> {
+    let _lock = lock_test_env();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let temp_root = env::temp_dir().join(format!(
+        "codewhale-tui-clear-deepseek-cn-keeps-intl-{}-{}",
+        std::process::id(),
+        nanos
+    ));
+    fs::create_dir_all(&temp_root)?;
+    let _guard = EnvGuard::new(&temp_root);
+    let config_path = temp_root.join(".deepseek").join("config.toml");
+    fs::create_dir_all(config_path.parent().unwrap())?;
+
+    // Each identity holds its own key: signing CN out leaves DeepSeek's.
+    fs::write(
+        &config_path,
+        r#"provider = "deepseek-cn"
+
+[providers.deepseek]
+api_key = "sk-intl"
+
+[providers.deepseek_cn]
+api_key = "sk-cn"
+"#,
+    )?;
+    clear_active_provider_api_key("deepseek-cn")?;
+    let after = fs::read_to_string(&config_path)?;
+    assert!(!after.contains("sk-cn"), "{after}");
+    assert!(after.contains("sk-intl"), "{after}");
+
+    // CN without a key of its own reads DeepSeek's, so that shared key goes.
+    fs::write(
+        &config_path,
+        r#"provider = "deepseek-cn"
+
+[providers.deepseek]
+api_key = "sk-shared"
+"#,
+    )?;
+    clear_active_provider_api_key("deepseek-cn")?;
+    let after = fs::read_to_string(&config_path)?;
+    assert!(!after.contains("sk-shared"), "{after}");
+
+    // A top-level key this write moves beside CN's own key was the shared
+    // one; a DeepSeek key that only merged with it was DeepSeek's own too.
+    fs::write(
+        &config_path,
+        r#"provider = "deepseek-cn"
+api_key = "sk-root"
+
+[providers.deepseek]
+api_key = "sk-root"
+
+[providers.deepseek_cn]
+api_key = "sk-cn"
+"#,
+    )?;
+    clear_active_provider_api_key("deepseek-cn")?;
+    let after = fs::read_to_string(&config_path)?;
+    assert!(!after.contains("sk-cn"), "{after}");
+    assert!(after.contains("[providers.deepseek]"), "{after}");
+    assert!(after.contains("sk-root"), "{after}");
+    Ok(())
+}
+
+#[test]
 fn clear_active_provider_api_key_distinguishes_literal_and_named_custom_routes() -> Result<()> {
     let _lock = lock_test_env();
     let nanos = SystemTime::now()
@@ -5639,9 +5798,9 @@ fn deepseek_api_key_prefers_explicit_in_memory_override() -> Result<()> {
     let _guard = EnvGuard::new(&temp_root);
 
     let config = Config {
-        api_key: Some("freshly-typed-key".to_string()),
         ..Config::default()
-    };
+    }
+    .with_legacy_root(Some("freshly-typed-key".to_string()), None);
     let resolved = config
         .active_route_api_key()
         .expect("explicit override must resolve");
@@ -5668,9 +5827,9 @@ fn deepseek_api_key_prefers_saved_config_over_stale_env() -> Result<()> {
         env::set_var("DEEPSEEK_API_KEY", "stale-env-key");
     }
     let config = Config {
-        api_key: Some("fresh-config-key".to_string()),
         ..Config::default()
-    };
+    }
+    .with_legacy_root(Some("fresh-config-key".to_string()), None);
     assert_eq!(config.active_route_api_key()?, "fresh-config-key");
     unsafe {
         env::remove_var("DEEPSEEK_API_KEY");
@@ -5698,9 +5857,9 @@ fn standalone_tui_reads_saved_secret_before_ambient_env() -> Result<()> {
     assert!(active_provider_has_config_api_key(&config));
 
     let configured = Config {
-        api_key: Some("fresh-config-key".to_string()),
         ..Config::default()
-    };
+    }
+    .with_legacy_root(Some("fresh-config-key".to_string()), None);
     assert_eq!(configured.active_route_api_key()?, "fresh-config-key");
     Ok(())
 }
@@ -6434,7 +6593,7 @@ fn active_provider_detects_env_only_api_key() -> Result<()> {
     assert!(!active_provider_has_config_api_key(&config));
     assert!(active_provider_uses_env_only_api_key(&config));
 
-    config.api_key = Some("config-key".to_string());
+    config.set_legacy_root(Some("config-key".to_string()), None);
     assert!(active_provider_has_config_api_key(&config));
     assert!(!active_provider_uses_env_only_api_key(&config));
 
@@ -6460,9 +6619,9 @@ fn deepseek_api_key_ignores_sentinel_placeholder() -> Result<()> {
     let _guard = EnvGuard::new(&temp_root);
 
     let config = Config {
-        api_key: Some(API_KEYRING_SENTINEL.to_string()),
         ..Config::default()
-    };
+    }
+    .with_legacy_root(Some(API_KEYRING_SENTINEL.to_string()), None);
     // Sentinel must not be treated as a real key — the resolver should
     // fall through to env / config-provider and ultimately bail out
     // with a "key not found" error.
@@ -6868,7 +7027,7 @@ fn test_load_uses_tilde_expanded_deepseek_config_path() -> Result<()> {
     }
 
     let config = Config::load(None, None)?;
-    assert_eq!(config.api_key.as_deref(), Some("test-key"));
+    assert_eq!(config.deepseek_table_api_key(), Some("test-key"));
     Ok(())
 }
 
@@ -6901,7 +7060,8 @@ fn missing_env_config_path_does_not_fall_back_to_a_different_home_file() -> Resu
 
     let config = Config::load(None, None)?;
     assert_eq!(
-        config.api_key, None,
+        config.deepseek_table_api_key(),
+        None,
         "reads must honor the same missing env target that writes will create"
     );
     Ok(())
@@ -6974,6 +7134,7 @@ fn test_nonexistent_profile_error() {
     let config = ConfigFile {
         base: Box::default(),
         profiles: Some(profiles),
+        legacy_root: Default::default(),
     };
 
     let err = apply_profile(config, Some("nonexistent")).unwrap_err();
@@ -7025,6 +7186,7 @@ fn test_profile_with_no_profiles_section() {
     let config = ConfigFile {
         base: Box::default(),
         profiles: None,
+        legacy_root: Default::default(),
     };
 
     let err = apply_profile(config, Some("missing")).unwrap_err();
@@ -7064,12 +7226,15 @@ fn test_save_api_key_doesnt_match_similar_keys() -> Result<()> {
 }
 
 #[test]
-fn test_empty_api_key_rejected() {
+fn test_empty_top_level_api_key_counts_as_absent() {
+    // An empty legacy top-level key is dropped when the file is parsed
+    // (#6394); it never reaches a route as an empty credential.
     let config = Config {
-        api_key: Some("   ".to_string()),
         ..Default::default()
-    };
-    assert!(config.validate().is_err());
+    }
+    .with_legacy_root(Some("   ".to_string()), None);
+    assert!(config.validate().is_ok());
+    assert_eq!(config.deepseek_table_api_key(), None);
 }
 
 #[test]
@@ -7102,12 +7267,12 @@ fn apply_env_overrides_ignores_empty_api_key() -> Result<()> {
     }
 
     let mut config = Config {
-        api_key: Some("from-config-file".to_string()),
         ..Default::default()
-    };
+    }
+    .with_legacy_root(Some("from-config-file".to_string()), None);
     apply_env_overrides(&mut config, ConfigEnvironmentPolicy::Runtime);
 
-    assert_eq!(config.api_key.as_deref(), Some("from-config-file"));
+    assert_eq!(config.deepseek_table_api_key(), Some("from-config-file"));
     config.validate()?;
     Ok(())
 }
@@ -7133,7 +7298,7 @@ fn apply_env_overrides_does_not_copy_api_key_into_config() -> Result<()> {
     let mut config = Config::default();
     apply_env_overrides(&mut config, ConfigEnvironmentPolicy::Runtime);
 
-    assert_eq!(config.api_key, None);
+    assert_eq!(config.deepseek_table_api_key(), None);
     assert_eq!(config.active_route_api_key()?, "env-key");
     unsafe {
         env::remove_var("DEEPSEEK_API_KEY");
@@ -7402,10 +7567,10 @@ fn retired_deepseek_aliases_keep_mode_intent_unless_effort_is_explicit() {
 
     let mut custom_endpoint = Config {
         provider: Some("deepseek".to_string()),
-        base_url: Some("https://gateway.example/v1".to_string()),
         default_text_model: Some("deepseek-chat".to_string()),
         ..Default::default()
-    };
+    }
+    .with_legacy_root(None, Some("https://gateway.example/v1".to_string()));
     normalize_model_config(&mut custom_endpoint);
     assert_eq!(
         custom_endpoint.default_text_model.as_deref(),
@@ -8090,6 +8255,7 @@ fn profile_skills_config_merges_individual_fields() {
         Config {
             skills: Some(SkillsConfig {
                 scan_codewhale_only: Some(true),
+                flat_workspace_root: Some(false),
                 ..Default::default()
             }),
             ..Default::default()
@@ -8100,11 +8266,13 @@ fn profile_skills_config_merges_individual_fields() {
             skills: Some(SkillsConfig {
                 registry_url: Some("https://registry.example/skills.json".to_string()),
                 max_install_size_bytes: Some(1234),
+                flat_workspace_root: Some(true),
                 ..Default::default()
             }),
             ..Default::default()
         }),
         profiles: Some(profiles),
+        legacy_root: Default::default(),
     };
 
     let merged = apply_profile(config, Some("strict")).expect("profile");
@@ -8115,6 +8283,7 @@ fn profile_skills_config_merges_individual_fields() {
     );
     assert_eq!(skills.max_install_size_bytes, Some(1234));
     assert_eq!(skills.scan_codewhale_only, Some(true));
+    assert_eq!(skills.flat_workspace_root, Some(false));
 }
 
 #[test]
@@ -8182,9 +8351,9 @@ fn deepseek_provider_defaults_to_beta_endpoint() {
 #[test]
 fn explicit_deepseek_base_url_overrides_beta_default() {
     let config = Config {
-        base_url: Some("https://api.deepseek.com".to_string()),
         ..Default::default()
-    };
+    }
+    .with_legacy_root(None, Some("https://api.deepseek.com".to_string()));
 
     assert_eq!(config.api_provider(), ApiProvider::Deepseek);
     assert_eq!(config.active_route_base_url(), "https://api.deepseek.com");
@@ -8194,9 +8363,9 @@ fn explicit_deepseek_base_url_overrides_beta_default() {
 fn loopback_deepseek_base_url_runs_without_api_key() -> Result<()> {
     let _lock = lock_test_env();
     let config = Config {
-        base_url: Some("http://127.0.0.1:8000/v1".to_string()),
         ..Default::default()
-    };
+    }
+    .with_legacy_root(None, Some("http://127.0.0.1:8000/v1".to_string()));
 
     assert_eq!(config.api_provider(), ApiProvider::Deepseek);
     assert!(has_api_key(&config));
@@ -8774,10 +8943,13 @@ fn xiaomi_mimo_scenario() -> Result<()> {
     {
         let config = Config {
             provider: Some("xiaomi-mimo".to_string()),
-            base_url: Some("https://token-plan-cn.xiaomimimo.com/v1".to_string()),
             default_text_model: Some("mimo-v2.5".to_string()),
             ..Default::default()
-        };
+        }
+        .with_legacy_root(
+            None,
+            Some("https://token-plan-cn.xiaomimimo.com/v1".to_string()),
+        );
 
         config.validate()?;
         assert_eq!(config.api_provider(), ApiProvider::XiaomiMimo);
@@ -8858,11 +9030,11 @@ fn only_the_identity_that_owns_the_legacy_root_may_inherit_it() -> Result<()> {
         let Some(provider) = ApiProvider::parse(name) else {
             continue;
         };
-        let config = Config {
-            provider: Some(name.to_string()),
-            base_url: Some(foreign.to_string()),
-            ..Default::default()
-        };
+        // Parsed, not constructed: the legacy top-level key only exists in a
+        // file, and parsing moves it into its owner's table (#6394).
+        let config = legacy_config(&format!(
+            "provider = \"{name}\"\nbase_url = \"{foreign}\"\n"
+        ));
         config.validate()?;
         let resolved = config.active_route_base_url();
         if matches!(provider, ApiProvider::Deepseek | ApiProvider::DeepseekCN) {
@@ -8883,22 +9055,21 @@ fn xiaomi_mimo_ignores_an_unrelated_legacy_root_base_url() -> Result<()> {
     // traffic — and the MiMo key probe — at api.deepseek.com, whose
     // unauthenticated 401 ("Authentication Fails (governor)") then read as a
     // rejected MiMo key. Only MiMo's own hosts may be inherited.
-    let config = Config {
-        provider: Some("xiaomi-mimo".to_string()),
-        base_url: Some("https://api.deepseek.com".to_string()),
-        ..Default::default()
-    };
+    let config =
+        legacy_config("provider = \"xiaomi-mimo\"\nbase_url = \"https://api.deepseek.com\"\n");
 
     config.validate()?;
     assert_eq!(config.api_provider(), ApiProvider::XiaomiMimo);
     assert_eq!(config.active_route_base_url(), DEFAULT_XIAOMI_MIMO_BASE_URL);
+    assert_eq!(
+        config.base_url_for_route(ApiProvider::Deepseek),
+        "https://api.deepseek.com"
+    );
 
-    // A MiMo host on the same legacy field is still honoured.
-    let config = Config {
-        provider: Some("xiaomi-mimo".to_string()),
-        base_url: Some("https://token-plan-ams.xiaomimimo.com/v1".to_string()),
-        ..Default::default()
-    };
+    // A MiMo host on the same legacy field moves to `[providers.xiaomi_mimo]`.
+    let config = legacy_config(
+        "provider = \"xiaomi-mimo\"\nbase_url = \"https://token-plan-ams.xiaomimimo.com/v1\"\n",
+    );
 
     config.validate()?;
     assert_eq!(
@@ -8910,15 +9081,12 @@ fn xiaomi_mimo_ignores_an_unrelated_legacy_root_base_url() -> Result<()> {
 
 #[test]
 fn openai_codex_provider_ignores_legacy_root_base_url() -> Result<()> {
-    let config = Config {
-        provider: Some("openai-codex".to_string()),
-        // `base_url` is the legacy DeepSeek setting in a normal multi-provider
-        // config. Switching to Codex must not inherit it and make the official
-        // CLI OAuth login ineligible.
-        base_url: Some("https://api.deepseek.com".to_string()),
-        default_text_model: Some("gpt-5.5".to_string()),
-        ..Default::default()
-    };
+    // `base_url` is the legacy DeepSeek setting in a normal multi-provider
+    // config. Switching to Codex must not inherit it and make the official
+    // CLI OAuth login ineligible.
+    let config = legacy_config(
+        "provider = \"openai-codex\"\nbase_url = \"https://api.deepseek.com\"\ndefault_text_model = \"gpt-5.5\"\n",
+    );
 
     config.validate()?;
     assert_eq!(config.api_provider(), ApiProvider::OpenaiCodex);
@@ -11727,10 +11895,15 @@ fn save_api_key_for_deepseek_cn_uses_root_deepseek_storage() -> Result<()> {
     let contents = fs::read_to_string(&path)?;
     let parsed: toml::Value = toml::from_str(&contents)?;
 
+    // DeepSeek-CN reads `[providers.deepseek]`, which replaced the shared
+    // top-level key (#6394).
     assert_eq!(
-        parsed.get("api_key").and_then(toml::Value::as_str),
+        parsed["providers"]["deepseek"]
+            .get("api_key")
+            .and_then(toml::Value::as_str),
         Some("cn-saved-key")
     );
+    assert!(parsed.get("api_key").is_none(), "{contents}");
     Ok(())
 }
 
@@ -13335,7 +13508,6 @@ fn literal_custom_table_round_trips_as_exact_historical_route() {
         session_custom_provider_config("custom", "openai-compatible", "http://127.0.0.1:1234/v1");
 
     assert_eq!(config.api_provider(), ApiProvider::Custom);
-    assert!(!config.uses_legacy_literal_custom_route());
     let identity = config
         .resolve_provider_identity("custom")
         .expect("exact [providers.custom] identity");
@@ -13360,73 +13532,67 @@ fn literal_custom_table_round_trips_as_exact_historical_route() {
 }
 
 #[test]
-fn persisted_custom_fields_distinguish_legacy_root_from_exact_literal_table() {
+fn persisted_custom_fields_resolve_the_literal_table_with_or_without_an_id() {
+    // Since #6394 the released top-level `provider = "custom"` route is the
+    // `[providers.custom]` table, so an id-less record and an exact record
+    // name the same route. An older top-level endpoint beside that table is
+    // DeepSeek's, never the custom route's.
     let table_only =
         session_custom_provider_config("custom", "openai-compatible", "http://127.0.0.1:1234/v1");
-    let table_only_error = table_only
+    let idless = table_only
         .resolve_persisted_provider_identity(Some("custom"), None)
-        .expect_err("id-less custom records authorize only the legacy root route");
-    assert!(
-        table_only_error.contains("root-level"),
-        "{table_only_error}"
-    );
-    assert!(table_only_error.contains("fall back"), "{table_only_error}");
+        .expect("id-less custom record resolves to the literal table");
+    assert_eq!(idless.provider, ApiProvider::Custom);
+    assert_eq!(idless.key, "custom");
+    assert_eq!(idless.exact_id.as_deref(), Some("custom"));
 
     let mut coexist = table_only.clone();
-    coexist.base_url = Some("http://127.0.0.1:18180/v1".to_string());
-    coexist.default_text_model = Some("legacy-root-model".to_string());
+    coexist.set_legacy_root(None, Some("http://127.0.0.1:18180/v1".to_string()));
     let root = coexist
         .resolve_persisted_provider_identity(Some("custom"), None)
-        .expect("id-less record remains bound to the root route");
-    assert_eq!(root.provider, ApiProvider::Custom);
-    assert_eq!(root.key, "custom");
-    assert_eq!(root.exact_id, None);
-    let root_route = crate::route_runtime::resolve_runtime_route_for_identity(
+        .expect("id-less record resolves to the literal table");
+    let route = crate::route_runtime::resolve_runtime_route_for_identity(
         &coexist,
         &root,
-        Some("legacy-root-model"),
+        Some("local-model"),
     )
-    .expect("scope root identity")
+    .expect("scope literal identity")
     .validate()
-    .expect("validate root identity");
-    assert_eq!(root_route.client.base_url(), "http://127.0.0.1:18180/v1");
-    assert_eq!(root_route.identity.exact_id, None);
+    .expect("validate literal identity");
+    assert_eq!(route.client.base_url(), "http://127.0.0.1:1234/v1");
+    assert_eq!(
+        coexist.deepseek_table_base_url(),
+        Some("http://127.0.0.1:18180/v1")
+    );
 
     let exact_table = coexist
         .resolve_persisted_provider_identity(Some("custom"), Some("custom"))
-        .expect("additive exact id intentionally selects the table");
-    assert_eq!(exact_table.provider, ApiProvider::Custom);
-    assert_eq!(exact_table.key, "custom");
-    assert_eq!(exact_table.exact_id.as_deref(), Some("custom"));
+        .expect("additive exact id selects the table");
+    assert_eq!(exact_table, root);
 
+    // A top-level-only literal route became the table too, so an exact
+    // record resolves on it.
     let root_only = Config {
         provider: Some("custom".to_string()),
-        base_url: Some("http://127.0.0.1:18180/v1".to_string()),
         default_text_model: Some("legacy-root-model".to_string()),
         ..Config::default()
-    };
-    let exact_error = root_only
+    }
+    .with_legacy_root(None, Some("http://127.0.0.1:18180/v1".to_string()));
+    let exact = root_only
         .resolve_persisted_provider_identity(Some("custom"), Some("custom"))
-        .expect_err("exact table record cannot fall back to a legacy root route");
-    assert!(exact_error.contains("[providers.custom]"), "{exact_error}");
-    assert!(exact_error.contains("will not fall back"), "{exact_error}");
-    let exact_route_error = crate::route_runtime::resolve_runtime_route_for_identity(
-        &root_only,
-        &exact_table,
-        Some("table-model"),
-    )
-    .expect_err("runtime route must revalidate exact table provenance");
-    assert!(
-        exact_route_error.contains("[providers.custom]"),
-        "{exact_route_error}"
+        .expect("the migrated table serves an exact record");
+    assert_eq!(exact.exact_id.as_deref(), Some("custom"));
+    assert_eq!(
+        root_only.active_route_base_url(),
+        "http://127.0.0.1:18180/v1"
     );
 }
 
 #[test]
-fn persisted_empty_custom_id_never_falls_back_to_legacy_root() {
+fn persisted_empty_custom_id_never_authorizes_a_route() {
     let mut config =
         session_custom_provider_config("custom", "openai-compatible", "http://127.0.0.1:18181/v1");
-    config.base_url = Some("http://127.0.0.1:18180/v1".to_string());
+    config.set_legacy_root(None, Some("http://127.0.0.1:18180/v1".to_string()));
     config.default_text_model = Some("legacy-root-model".to_string());
 
     for malformed_id in ["", "   "] {
@@ -13439,8 +13605,8 @@ fn persisted_empty_custom_id_never_falls_back_to_legacy_root() {
 
     let root = config
         .resolve_persisted_provider_identity(Some("custom"), None)
-        .expect("a genuinely missing id retains legacy root compatibility");
-    assert_eq!(root.exact_id, None);
+        .expect("a genuinely missing id resolves the literal table (#6394)");
+    assert_eq!(root.exact_id.as_deref(), Some("custom"));
     let exact = config
         .resolve_persisted_provider_identity(Some("custom"), Some("custom"))
         .expect("a non-empty exact id selects the literal table");
@@ -13508,26 +13674,30 @@ fn case_colliding_custom_table_preserves_exact_spelling_across_receipts() {
 }
 
 #[test]
-fn legacy_literal_custom_identity_requires_one_valid_root_route() {
+fn legacy_literal_custom_identity_resolves_to_its_migrated_table() {
     let _lock = lock_test_env();
     let _source = EnvVarGuard::remove("DEEPSEEK_API_KEY_SOURCE");
     let _cli_key = EnvVarGuard::remove("CODEWHALE_CLI_API_KEY");
     let legacy = Config {
         provider: Some("custom".to_string()),
-        api_key: Some("legacy-root-key".to_string()),
-        base_url: Some("http://127.0.0.1:1234/v1".to_string()),
         default_text_model: Some("local-legacy-model".to_string()),
         ..Config::default()
-    };
+    }
+    .with_legacy_root(
+        Some("legacy-root-key".to_string()),
+        Some("http://127.0.0.1:1234/v1".to_string()),
+    );
 
     assert_eq!(
         legacy
             .resolve_provider_identity("custom")
             .expect("unchanged legacy root route"),
+        // The top-level route became the exact `[providers.custom]` table
+        // when parsed (#6394).
         ProviderIdentity {
             provider: ApiProvider::Custom,
             key: "custom".to_string(),
-            exact_id: None,
+            exact_id: Some("custom".to_string()),
             migrated_legacy_ollama_cloud_route: false,
         }
     );
@@ -13540,7 +13710,7 @@ fn legacy_literal_custom_identity_requires_one_valid_root_route() {
         "openai-compatible",
         "https://api.example.com/v1",
     );
-    named.api_key = Some("must-not-leak-to-named-route".to_string());
+    named.set_legacy_root(Some("must-not-leak-to-named-route".to_string()), None);
     let named_key_error = named
         .active_route_api_key()
         .expect_err("root legacy key must never authorize a named custom route")
@@ -13572,49 +13742,6 @@ fn legacy_literal_custom_identity_requires_one_valid_root_route() {
     );
     assert!(ambiguous_named_error.contains("will not guess or fall back"));
 
-    let mut missing_model = legacy.clone();
-    missing_model.default_text_model = None;
-    let model_error = missing_model
-        .resolve_provider_identity("custom")
-        .expect_err("legacy root route needs an explicit model");
-    assert!(model_error.contains("default_text_model"), "{model_error}");
-
-    let mut auto_model = legacy.clone();
-    auto_model.default_text_model = Some("auto".to_string());
-    let auto_error = auto_model
-        .resolve_provider_identity("custom")
-        .expect_err("legacy root route cannot guess an auto model");
-    assert!(auto_error.contains("not `auto`"), "{auto_error}");
-
-    let mut invalid_url = legacy.clone();
-    invalid_url.base_url = Some("not a provider URL".to_string());
-    let url_error = invalid_url
-        .resolve_provider_identity("custom")
-        .expect_err("legacy root route needs a valid endpoint");
-    assert!(url_error.contains("base_url"), "{url_error}");
-    assert!(url_error.contains("will not fall back"), "{url_error}");
-
-    let mut ambiguous = legacy.clone();
-    ambiguous.providers = Some(ProvidersConfig {
-        custom: HashMap::from([(
-            "CUSTOM".to_string(),
-            ProviderConfig {
-                kind: Some("openai-compatible".to_string()),
-                base_url: Some("http://127.0.0.1:5678/v1".to_string()),
-                model: Some("table-model".to_string()),
-                ..ProviderConfig::default()
-            },
-        )]),
-        ..ProvidersConfig::default()
-    });
-    let ambiguous_error = ambiguous
-        .resolve_provider_identity("custom")
-        .expect_err("root and table routes cannot share the generic identity");
-    assert!(
-        ambiguous_error.contains("[providers.custom]") && ambiguous_error.contains("ambiguous"),
-        "{ambiguous_error}"
-    );
-
     let removed_named = legacy
         .resolve_provider_identity("lm-studio")
         .expect_err("a removed named route must not fall back to legacy custom");
@@ -13623,7 +13750,7 @@ fn legacy_literal_custom_identity_requires_one_valid_root_route() {
 }
 
 #[test]
-fn legacy_literal_custom_env_overrides_preserve_root_route_shape() -> Result<()> {
+fn legacy_literal_custom_env_overrides_keep_the_literal_route() -> Result<()> {
     let _lock = lock_test_env();
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -13658,12 +13785,13 @@ default_text_model = "legacy-model"
 
     let config = Config::load(None, None)?;
 
-    assert!(config.uses_legacy_literal_custom_route());
+    // The top-level route moved into `[providers.custom]` when parsed (#6394).
+    assert!(config.selects_literal_custom_provider());
     assert!(
         config
             .providers
             .as_ref()
-            .is_none_or(|providers| !providers.custom.contains_key("custom"))
+            .is_some_and(|providers| providers.custom.contains_key("custom"))
     );
     assert_eq!(config.active_route_base_url(), "http://127.0.0.1:18185/v1");
     assert_eq!(config.default_model(), "env-legacy-model");
@@ -14149,8 +14277,9 @@ fn file_owned_legacy_root_base_url_stays_shared_by_both_deepseek_identities() ->
 
     let config = Config::load(Some(config_path), None)?;
 
-    // No environment write, so the root field is the user's own. Both
-    // identities keep reading it, exactly as they always have.
+    // No environment write, so the value is the user's own. Parsing moved it
+    // to `[providers.deepseek]` (#6394), which DeepSeek-CN also reads, so
+    // both identities keep the endpoint exactly as they always have.
     for provider in [ApiProvider::Deepseek, ApiProvider::DeepseekCN] {
         assert_eq!(
             config.base_url_for_route(provider),
@@ -14190,7 +14319,6 @@ fn managed_overlay_keeps_pinned_children_off_the_ambient_generic_host() -> Resul
     // being cleared: a cleared receipt reads as "never met the environment
     // layer" and re-enables the generic fallback for every pinned child.
     assert_eq!(config.base_url_env_receipt, BaseUrlEnvReceipt::NoOwner);
-    assert_eq!(config.root_base_url_owner, BaseUrlEnvReceipt::NoOwner);
     for provider in [
         ApiProvider::Moonshot,
         ApiProvider::Zai,
@@ -14297,7 +14425,7 @@ default_text_model = "legacy-1"
 
     let config = Config::load(Some(config_path), None)?;
 
-    assert!(config.uses_legacy_literal_custom_route());
+    assert!(config.selects_literal_custom_provider());
     assert_eq!(
         config.base_url_for_route_identity(ApiProvider::Custom, "custom"),
         "https://legacy-root.example.test/v1"
@@ -14609,7 +14737,7 @@ default_text_model = "DeepSeek-V4-Flash"
     ];
 
     for (label, body) in shapes {
-        let mut config: Config = toml::from_str(body).expect("config parses");
+        let mut config = crate::config::parse_config_base(body).expect("config parses");
         normalize_model_config(&mut config);
         let provider = config.api_provider();
         let base_url = config.base_url_for_route(provider);
@@ -15141,4 +15269,473 @@ fn notifications_real_cli_file_is_consumed_by_actual_tui_loader() {
     assert_eq!(loaded.condition, Some(NotificationCondition::Always));
     assert_eq!(loaded.threshold_secs, 17);
     assert_eq!(loaded.event_sound.events, ["model-notify", "input-needed"]);
+}
+
+/// Parse a config layer the way a file is loaded, so legacy top-level keys
+/// go through the #6394 canonicalizer.
+fn legacy_config(body: &str) -> Config {
+    crate::config::parse_config_base(body).expect("legacy config parses")
+}
+
+#[test]
+fn official_codex_host_on_the_legacy_root_belongs_to_codex_in_both_crates() -> Result<()> {
+    // The config crate always let Codex read an official Codex endpoint from
+    // the top level; the TUI refused it. One rule now: it is Codex's (#6394).
+    let body = "provider = \"openai-codex\"\nbase_url = \"https://chatgpt.com/backend-api\"\n";
+    let config = legacy_config(body);
+    assert_eq!(
+        config
+            .provider_config_for(ApiProvider::OpenaiCodex)
+            .and_then(|entry| entry.base_url.as_deref()),
+        Some("https://chatgpt.com/backend-api")
+    );
+    let store = codewhale_config::parse_config_toml(body)?;
+    assert_eq!(
+        store.providers.openai_codex.base_url.as_deref(),
+        Some("https://chatgpt.com/backend-api")
+    );
+    assert!(store.providers.deepseek.base_url.is_none());
+    Ok(())
+}
+
+// ── #6394: the TUI reads legacy top-level keys by the same rule ───────────
+
+fn legacy_fixture(name: &str) -> String {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../config/tests/fixtures/legacy_root")
+        .join(name);
+    fs::read_to_string(&path).expect("legacy fixture")
+}
+
+fn migrated_fixture(body: &str) -> String {
+    codewhale_config::legacy_root::migrated_document_text(body).unwrap_or_else(|| body.to_string())
+}
+
+#[test]
+fn legacy_upgrade_fixtures_resolve_the_same_route_before_and_after_migrate() -> Result<()> {
+    let _lock = lock_test_env();
+    let _source = EnvVarGuard::remove("DEEPSEEK_API_KEY_SOURCE");
+    let _cli_key = EnvVarGuard::remove("CODEWHALE_CLI_API_KEY");
+    for (fixture, profile, provider, base_url, key) in [
+        (
+            "v0_10_0_example.toml",
+            None,
+            ApiProvider::Deepseek,
+            "https://api.deepseek.com/beta",
+            Some("YOUR_DEEPSEEK_API_KEY"),
+        ),
+        (
+            // The shipped profile's key finally reaches NIM.
+            "v0_10_0_example.toml",
+            Some("nvidia-nim"),
+            ApiProvider::NvidiaNim,
+            "https://integrate.api.nvidia.com/v1",
+            Some("YOUR_NVIDIA_API_KEY"),
+        ),
+        (
+            "v0_9_9_auth_set.toml",
+            None,
+            ApiProvider::Deepseek,
+            DEFAULT_DEEPSEEK_BASE_URL,
+            Some("sk-legacy-auth-set"),
+        ),
+        (
+            "config_base_url_save.toml",
+            None,
+            ApiProvider::Deepseek,
+            "https://proxy.example.test/v1",
+            Some("sk-proxy-key"),
+        ),
+        (
+            "literal_custom.toml",
+            None,
+            ApiProvider::Custom,
+            "http://127.0.0.1:18181/v1",
+            Some("sk-literal-custom"),
+        ),
+        (
+            "url_guessed_nim.toml",
+            None,
+            ApiProvider::NvidiaNim,
+            "https://integrate.api.nvidia.com/v1",
+            None,
+        ),
+    ] {
+        let body = legacy_fixture(fixture);
+        for (stage, text) in [("before", body.clone()), ("after", migrated_fixture(&body))] {
+            let config = Config::from_saved_document(&text, profile)?;
+            let label = format!("{fixture} {profile:?} {stage}");
+            assert_eq!(config.api_provider(), provider, "{label}");
+            assert_eq!(
+                config.active_route_base_url().trim_end_matches('/'),
+                base_url.trim_end_matches('/'),
+                "{label}"
+            );
+            let configured_key = config
+                .provider_route_string_with_deepseek_fallback(provider, |entry| {
+                    entry.api_key.clone()
+                });
+            assert_eq!(configured_key.as_deref(), key, "{label}");
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn a_profile_endpoint_now_overrides_the_base_deepseek_table() -> Result<()> {
+    // v0.10 let the base `[providers.deepseek] base_url` silently win over a
+    // profile's top-level `base_url`; the profile's value now lands in the
+    // profile's own table and overrides it (#6394).
+    let body = r#"
+[providers.deepseek]
+base_url = "https://api.deepseek.com/beta"
+
+[profiles.work]
+base_url = "https://work.example.test/v1"
+"#;
+    let work = Config::from_saved_document(body, Some("work"))?;
+    assert_eq!(work.active_route_base_url(), "https://work.example.test/v1");
+    let base = Config::from_saved_document(body, None)?;
+    assert_eq!(
+        base.active_route_base_url(),
+        "https://api.deepseek.com/beta"
+    );
+    Ok(())
+}
+
+#[test]
+fn conflicting_top_level_key_wins_in_memory_like_before() -> Result<()> {
+    let _lock = lock_test_env();
+    let _source = EnvVarGuard::remove("DEEPSEEK_API_KEY_SOURCE");
+    let _cli_key = EnvVarGuard::remove("CODEWHALE_CLI_API_KEY");
+    let config = Config::from_saved_document(
+        r#"
+api_key = "sk-top-level"
+base_url = "https://top.example.test/v1"
+
+[providers.deepseek]
+api_key = "sk-table"
+base_url = "https://table.example.test/v1"
+"#,
+        None,
+    )?;
+    // The key the TUI always sent, and the endpoint both crates always used.
+    assert_eq!(config.deepseek_table_api_key(), Some("sk-top-level"));
+    assert_eq!(
+        config.active_route_base_url(),
+        "https://table.example.test/v1"
+    );
+    assert_eq!(config.legacy_root.unresolved_conflicts().count(), 2);
+    Ok(())
+}
+
+#[test]
+fn deepseek_cn_shares_the_deepseek_endpoint_and_key_but_not_its_model() -> Result<()> {
+    let config = Config::from_saved_document(
+        r#"
+provider = "deepseek-cn"
+
+[providers.deepseek]
+api_key = "sk-shared"
+base_url = "https://gateway.example.test/v1"
+model = "deepseek-only-model"
+"#,
+        None,
+    )?;
+    assert_eq!(config.api_provider(), ApiProvider::DeepseekCN);
+    assert_eq!(
+        config.active_route_base_url(),
+        "https://gateway.example.test/v1"
+    );
+    assert_eq!(
+        config
+            .provider_route_string_with_deepseek_fallback(ApiProvider::DeepseekCN, |entry| {
+                entry.api_key.clone()
+            })
+            .as_deref(),
+        Some("sk-shared")
+    );
+    assert_eq!(
+        config.provider_config_string_with_runtime_fallback(ApiProvider::DeepseekCN, |entry| {
+            entry.model.clone()
+        }),
+        None,
+        "the model is not shared"
+    );
+    Ok(())
+}
+
+#[test]
+fn vision_keeps_the_top_level_key_it_inherited_and_nothing_more() -> Result<()> {
+    let legacy = Config::from_saved_document(
+        "api_key = \"sk-root\"\n[vision_model]\nmodel = \"vision-x\"\nbase_url = \"https://vision.example.test/v1\"\n",
+        None,
+    )?;
+    assert_eq!(
+        legacy
+            .vision_model_config()
+            .and_then(|vision| vision.api_key)
+            .as_deref(),
+        Some("sk-root")
+    );
+    // A new-shape DeepSeek key is not handed to the vision host.
+    let current = Config::from_saved_document(
+        "[providers.deepseek]\napi_key = \"sk-deepseek\"\n[vision_model]\nmodel = \"vision-x\"\nbase_url = \"https://vision.example.test/v1\"\n",
+        None,
+    )?;
+    assert_eq!(
+        current
+            .vision_model_config()
+            .and_then(|vision| vision.api_key),
+        None
+    );
+    Ok(())
+}
+
+#[test]
+fn a_mimo_host_on_the_top_level_moves_to_mimo_and_a_deepseek_host_does_not() -> Result<()> {
+    let mimo = Config::from_saved_document(
+        "provider = \"xiaomi-mimo\"\nbase_url = \"https://api.xiaomimimo.com/v1\"\n",
+        None,
+    )?;
+    assert_eq!(
+        mimo.provider_config_for(ApiProvider::XiaomiMimo)
+            .and_then(|entry| entry.base_url.as_deref()),
+        Some("https://api.xiaomimimo.com/v1")
+    );
+    let deepseek_host = Config::from_saved_document(
+        "provider = \"xiaomi-mimo\"\nbase_url = \"https://api.deepseek.com\"\n",
+        None,
+    )?;
+    assert_eq!(
+        deepseek_host.active_route_base_url(),
+        DEFAULT_XIAOMI_MIMO_BASE_URL
+    );
+    Ok(())
+}
+
+#[test]
+fn no_parse_leaves_a_top_level_key_behind() -> Result<()> {
+    let body = legacy_fixture("v0_10_0_example.toml");
+    let parsed = parse_config_file(&body)?;
+    assert!(!parsed.legacy_root.is_empty());
+    let (text, _) = codewhale_config::legacy_root::canonicalize_text(&body)?;
+    let table: toml::Table = toml::from_str(&text)?;
+    assert!(!codewhale_config::legacy_root::has_legacy_root_keys(&table));
+    Ok(())
+}
+
+#[test]
+fn config_set_provider_typo_reuses_the_invalid_provider_wording() {
+    let config = Config::default();
+    let error = config
+        .resolve_provider_selection_identity("deepsek")
+        .expect_err("a typo is not a provider");
+    assert!(
+        error.starts_with("Invalid provider 'deepsek': expected deepseek"),
+        "{error}"
+    );
+    assert!(!error.contains("saved session"), "{error}");
+    // The resume path keeps its own saved-session wording.
+    let resume = config
+        .resolve_provider_pin_identity("deepsek")
+        .expect_err("missing custom route");
+    assert!(resume.starts_with("saved session requires"), "{resume}");
+    assert_eq!(
+        config
+            .resolve_provider_selection_identity("deepseek")
+            .expect("built-in provider")
+            .provider,
+        ApiProvider::Deepseek
+    );
+}
+
+#[test]
+fn deepseek_missing_key_message_keeps_commands_copyable_and_harness_advice_conditional() {
+    let plain = deepseek_missing_key_message();
+    assert!(
+        plain.contains("\n  codewhale auth set --provider deepseek\n"),
+        "{plain}"
+    );
+    assert!(
+        plain.contains("If you already use DeepSeek Harness, grant read-only access:"),
+        "{plain}"
+    );
+    assert!(
+        plain.ends_with("\n  codewhale auth external-consent --provider deepseek --mode read-only"),
+        "{plain}"
+    );
+}
+
+#[test]
+fn invalid_value_fixes_are_commands_that_work_and_name_overriding_layers() {
+    let error = Config {
+        tui: Some(TuiConfig {
+            alternate_screen: Some("sometimes".to_string()),
+            ..TuiConfig::default()
+        }),
+        ..Config::default()
+    }
+    .validate()
+    .expect_err("unknown alternate_screen");
+    let diagnostic = SafeConfigDiagnostic::find_in(&error).expect("safe diagnostic");
+    // `config set` refuses dotted keys, so the fix edits the table instead.
+    assert_eq!(
+        diagnostic.fix(),
+        Some(
+            "set alternate_screen = \"auto\" in the [tui] table of config.toml (if a profile or managed config sets it, correct it there)"
+        )
+    );
+
+    let error = Config {
+        sandbox_mode: Some("bogus".to_string()),
+        ..Config::default()
+    }
+    .validate()
+    .expect_err("unknown sandbox_mode");
+    let fix = SafeConfigDiagnostic::find_in(&error)
+        .and_then(SafeConfigDiagnostic::fix)
+        .expect("fix");
+    assert!(
+        fix.starts_with("codewhale config set sandbox_mode workspace-write (if CODEWHALE_SANDBOX_MODE, a profile, or managed config sets it"),
+        "{fix}"
+    );
+}
+
+#[test]
+fn missing_profile_diagnostic_does_not_show_the_requested_name() {
+    let mut profiles = HashMap::new();
+    profiles.insert("work".to_string(), Config::default());
+    let config = ConfigFile {
+        base: Box::default(),
+        profiles: Some(profiles),
+        legacy_root: Default::default(),
+    };
+    let error = apply_profile(config, Some("sk-pasted-token")).expect_err("no such profile");
+    let diagnostic = SafeConfigDiagnostic::find_in(&error).expect("safe diagnostic");
+    let shown = diagnostic.display_message();
+    assert_eq!(
+        shown,
+        "Profile not found (name not shown). Available profiles: work"
+    );
+    // The local error keeps the typed name for the person at the terminal.
+    assert!(error.to_string().contains("sk-pasted-token"), "{error}");
+}
+
+/// #6700: `[retry].jitter`, `jitter_factor` and `respect_retry_after` reach
+/// the resolved policy (and the client's `RetryConfig`) instead of being
+/// dropped for compiled-in defaults.
+#[test]
+fn retry_policy_reads_jitter_and_retry_after_keys() {
+    let parse = |body: &str| toml::from_str::<Config>(body).expect("config parses");
+
+    let defaults = parse("[retry]\nmax_retries = 2\n").retry_policy();
+    assert!(defaults.jitter);
+    assert!((defaults.jitter_factor - 0.1).abs() < f64::EPSILON);
+    assert!(defaults.respect_retry_after);
+
+    let tuned =
+        parse("[retry]\njitter = false\njitter_factor = 0.3\nrespect_retry_after = false\n")
+            .retry_policy();
+    assert!(!tuned.jitter);
+    assert!((tuned.jitter_factor - 0.3).abs() < f64::EPSILON);
+    assert!(!tuned.respect_retry_after);
+    let client: crate::llm_client::RetryConfig = tuned.into();
+    assert!(!client.jitter);
+    assert!((client.jitter_factor - 0.3).abs() < f64::EPSILON);
+    assert!(!client.respect_retry_after);
+
+    let high = parse("[retry]\njitter_factor = 7.5\n").retry_policy();
+    assert!((high.jitter_factor - 1.0).abs() < f64::EPSILON);
+    let negative = parse("[retry]\njitter_factor = -0.5\n").retry_policy();
+    assert!(negative.jitter_factor.abs() < f64::EPSILON);
+}
+
+/// #6700: `[tui].force_http1 = true` pins HTTP/1.1 without the env var.
+/// (The env-only path is covered by `force_http1_scenario` under its lock.)
+#[test]
+fn tui_force_http1_key_pins_http1() {
+    let config: Config = toml::from_str("[tui]\nforce_http1 = true\n").expect("config parses");
+    assert!(config.force_http1());
+}
+
+#[test]
+fn canonical_stream_config_preserves_legacy_resolution_and_precedence() {
+    let _lock = lock_test_env();
+    let _pin = EnvVarGuard::remove("CODEWHALE_FORCE_HTTP1");
+    let _legacy_pin = EnvVarGuard::remove("DEEPSEEK_FORCE_HTTP1");
+    let legacy = "[tui]\nstream_open_timeout_secs=80\nstream_chunk_timeout_secs=120\nforce_http1=true\nstream_max_resumes=4\nstream_max_transparent_retries=3\nstream_max_errors=7\nstream_max_duration_secs=900\nstream_max_content_mb=12\nconnect_timeout_secs=60\n";
+    let canonical = "[stream]\nopen_timeout_secs=80\nchunk_timeout_secs=120\nforce_http1=true\nmax_resumes=4\nmax_transparent_retries=3\nmax_stream_errors=7\nmax_duration_secs=900\nmax_content_mb=12\nconnect_timeout_secs=60\n";
+    let parse = |body: &str| toml::from_str::<Config>(body).unwrap();
+    assert_eq!(
+        toml::Value::try_from(parse(legacy).resolved_stream_settings()).unwrap(),
+        toml::Value::try_from(parse(canonical).resolved_stream_settings()).unwrap(),
+    );
+    let mixed = parse(&format!(
+        "{legacy}\n[stream]\nmax_resumes=0\nforce_http1=false\n"
+    ));
+    assert_eq!(mixed.stream_retry_limits().max_resumes, 0);
+    assert_eq!(mixed.stream_retry_limits().max_errors, 7);
+    assert_eq!(mixed.stream_open_timeout(), Duration::from_secs(80));
+    assert!(!mixed.force_http1());
+    let _pin = EnvVarGuard::set("CODEWHALE_FORCE_HTTP1", "1");
+    assert!(
+        mixed.force_http1(),
+        "the existing environment pin still wins"
+    );
+}
+
+#[test]
+fn canonical_stream_config_env_clamps_and_keepalive_disable() {
+    let _lock = lock_test_env();
+    let _open = EnvVarGuard::set("CODEWHALE_STREAM_OPEN_TIMEOUT_SECS", "70");
+    let _idle = EnvVarGuard::set("CODEWHALE_STREAM_IDLE_TIMEOUT_SECS", "90");
+    let config: Config = toml::from_str("[stream]\nopen_timeout_secs=0\nchunk_timeout_secs=0\nmax_resumes=99\nmax_transparent_retries=99\nmax_stream_errors=0\nmax_duration_secs=999999\nmax_content_mb=999999\nconnect_timeout_secs=999999\ntcp_keepalive_secs=0\nhttp2_keep_alive_interval_secs=0\nhttp2_keep_alive_timeout_secs=0\n").unwrap();
+    assert_eq!(config.stream_open_timeout(), Duration::from_secs(70));
+    assert_eq!(
+        config.stream_chunk_timeout_secs(),
+        900,
+        "zero retains idle default semantics"
+    );
+    assert_eq!(config.stream_retry_limits().max_resumes, 10);
+    assert_eq!(config.stream_retry_limits().max_transparent_retries, 10);
+    assert_eq!(config.stream_retry_limits().max_errors, 5);
+    assert_eq!(config.stream_max_duration(), Duration::from_secs(86400));
+    assert_eq!(config.stream_max_content_bytes(), 512 * 1024 * 1024);
+    assert_eq!(config.connect_timeout(), Duration::from_secs(300));
+    assert_eq!(config.tcp_keepalive(), None);
+    assert_eq!(config.http2_keep_alive_interval(), None);
+    assert_eq!(config.http2_keep_alive_timeout(), Duration::from_secs(20));
+    let positive: Config = toml::from_str("[stream]\nopen_timeout_secs=12\nchunk_timeout_secs=14\ntcp_keepalive_secs=9000\nhttp2_keep_alive_interval_secs=9000\nhttp2_keep_alive_timeout_secs=9000\n").unwrap();
+    assert_eq!(positive.stream_open_timeout(), Duration::from_secs(12));
+    assert_eq!(positive.stream_chunk_timeout_secs(), 14);
+    assert_eq!(positive.tcp_keepalive(), Some(Duration::from_secs(3600)));
+    assert_eq!(
+        positive.http2_keep_alive_interval(),
+        Some(Duration::from_secs(3600))
+    );
+    assert_eq!(
+        positive.http2_keep_alive_timeout(),
+        Duration::from_secs(3600)
+    );
+    for invalid in [
+        "open_timeout_secs=-1",
+        "max_resumes=4294967296",
+        "force_http1='yes'",
+        "open_timout_secs=45",
+    ] {
+        assert!(
+            toml::from_str::<Config>(&format!("[stream]\n{invalid}\n")).is_err(),
+            "{invalid}"
+        );
+    }
+}
+
+#[test]
+fn canonical_stream_config_profile_merges_independent_keys() {
+    let config = parse_config_file("[stream]\nmax_resumes=7\ntcp_keepalive_secs=41\n[profiles.mobile.stream]\nopen_timeout_secs=180\n").unwrap();
+    let resolved = apply_profile(config, Some("mobile")).unwrap();
+    assert_eq!(resolved.stream_retry_limits().max_resumes, 7);
+    assert_eq!(resolved.tcp_keepalive(), Some(Duration::from_secs(41)));
+    assert_eq!(resolved.stream_open_timeout(), Duration::from_secs(180));
 }

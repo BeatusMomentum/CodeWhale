@@ -42,6 +42,8 @@ struct RlmUsageState {
     records: Vec<Option<RlmUsageSlot>>,
     drop_records: Vec<crate::cost_status::RuntimeUsageDropRecord>,
     dropped_records: u64,
+    nested_events: Vec<serde_json::Value>,
+    nested_runs: usize,
 }
 
 #[derive(Debug)]
@@ -74,6 +76,9 @@ pub(crate) struct RlmUsageSnapshot {
     /// Calls whose execution/usage became ambiguous (for example a timeout).
     /// They are never represented as authoritative zero-usage responses.
     pub dropped_records: u64,
+    /// Producer-owned nested loop events, retained in the enclosing tool body
+    /// so every session host persists them through its existing result path.
+    pub nested_events: Vec<serde_json::Value>,
 }
 
 impl RlmUsageAccumulator {
@@ -175,6 +180,22 @@ impl RlmUsageAccumulator {
         }
     }
 
+    /// Bound even nested runs that fail before their first provider request.
+    /// Without this reservation repeated setup failures could grow event
+    /// receipts while never consuming the existing provider-call bound.
+    async fn reserve_nested_turn(&self) -> std::result::Result<(), String> {
+        let mut state = self.state.lock().await;
+        if state.nested_runs == crate::cost_status::MAX_CHILD_USAGE_RECORDS {
+            return Err("RLM nested-turn receipt limit reached before dispatch".into());
+        }
+        state.nested_runs += 1;
+        Ok(())
+    }
+
+    pub(crate) async fn record_nested_event(&self, event: serde_json::Value) {
+        self.state.lock().await.nested_events.push(event);
+    }
+
     pub(crate) async fn snapshot(&self) -> RlmUsageSnapshot {
         let state = self.state.lock().await;
         let pending = state
@@ -190,6 +211,7 @@ impl RlmUsageAccumulator {
         let mut drop_records = state.drop_records.clone();
         drop_records.extend(pending.iter().cloned());
         RlmUsageSnapshot {
+            nested_events: state.nested_events.clone(),
             usage: state.usage.clone(),
             records: state
                 .records
@@ -303,9 +325,15 @@ pub struct RlmBridge {
     /// zero, those requests fall back to plain `Llm` completions.
     depth_remaining: u32,
     usage: RlmUsageAccumulator,
-    /// Where a nested sub-RLM's events go (#6511). `None` logs them through
-    /// `tracing` instead; they are never silently drained.
+    /// Optional live forwarding. Durable receipts are collected at their
+    /// producer and returned through the enclosing tool, independent of this
+    /// best-effort stream (#6511).
     events: Option<tokio::sync::mpsc::Sender<crate::core::events::Event>>,
+    deadline: tokio::time::Instant,
+    /// The serving turn's permission gate. A nested RLM turn runs each round
+    /// of model-written Python only after this gate admits that exact code;
+    /// without one the nested turn runs no code at all.
+    gate: Option<crate::tools::codemode::NestedCallGate>,
 }
 
 impl RlmBridge {
@@ -334,11 +362,36 @@ impl RlmBridge {
             depth_remaining,
             usage,
             events: None,
+            deadline: tokio::time::Instant::now() + crate::tools::subagent::DEFAULT_CHILD_WALL_TIME,
+            gate: None,
         }
     }
 
-    /// Forward nested sub-RLM events to `events` (the parent turn's stream),
-    /// so recursive model calls reach the session record.
+    /// Admit nested RLM code rounds through the serving turn's gate.
+    #[must_use]
+    pub(crate) fn with_gate(
+        mut self,
+        gate: Option<crate::tools::codemode::NestedCallGate>,
+    ) -> Self {
+        self.gate = gate;
+        self
+    }
+
+    /// Clamp recursive work to the already-spent parent budget. An unbounded
+    /// parent keeps the existing child safety cap; no recursive call resets it.
+    pub(crate) fn with_deadline(mut self, deadline: Option<tokio::time::Instant>) -> Self {
+        if let Some(deadline) = deadline {
+            self.deadline = self.deadline.min(deadline);
+        }
+        self
+    }
+
+    pub(crate) fn deadline(&self) -> tokio::time::Instant {
+        self.deadline
+    }
+
+    /// Forward nested sub-RLM events to the parent's live stream. The shared
+    /// receipt batch independently retains the same producer events.
     #[must_use]
     pub(crate) fn with_events(
         mut self,
@@ -359,6 +412,12 @@ impl RlmBridge {
         max_tokens: Option<u32>,
         system: Option<String>,
     ) -> SingleResp {
+        if tokio::time::Instant::now() >= self.deadline {
+            return SingleResp {
+                text: String::new(),
+                error: Some("llm_query parent turn deadline exhausted before dispatch".into()),
+            };
+        }
         let request_route = self
             .client
             .effective_route_envelope(&self.child_model, chrono::Utc::now());
@@ -403,24 +462,29 @@ impl RlmBridge {
         };
 
         let fut = self.client.create_message_boxed(request);
-        let response =
-            match tokio::time::timeout(Duration::from_secs(CHILD_TIMEOUT_SECS), fut).await {
-                Ok(Ok(r)) => r,
-                Ok(Err(e)) => {
-                    self.usage.cancel(reservation, false).await;
-                    return SingleResp {
-                        text: String::new(),
-                        error: Some(format!("llm_query failed: {e}")),
-                    };
-                }
-                Err(_) => {
-                    self.usage.cancel(reservation, true).await;
-                    return SingleResp {
-                        text: String::new(),
-                        error: Some(format!("llm_query timed out after {CHILD_TIMEOUT_SECS}s")),
-                    };
-                }
-            };
+        let response = match tokio::time::timeout_at(
+            self.deadline
+                .min(tokio::time::Instant::now() + Duration::from_secs(CHILD_TIMEOUT_SECS)),
+            fut,
+        )
+        .await
+        {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => {
+                self.usage.cancel(reservation, false).await;
+                return SingleResp {
+                    text: String::new(),
+                    error: Some(format!("llm_query failed: {e}")),
+                };
+            }
+            Err(_) => {
+                self.usage.cancel(reservation, true).await;
+                return SingleResp {
+                    text: String::new(),
+                    error: Some("llm_query timed out at its parent or per-call deadline".into()),
+                };
+            }
+        };
 
         // Incomplete output is rejected below, but it is still a successful
         // provider response and therefore billed. Complete the reserved route
@@ -478,11 +542,24 @@ impl RlmBridge {
     }
 
     async fn dispatch_rlm(&self, prompt: String, _model: Option<String>) -> SingleResp {
+        if tokio::time::Instant::now() >= self.deadline {
+            return SingleResp {
+                text: String::new(),
+                error: Some("rlm_query parent turn deadline exhausted before dispatch".into()),
+            };
+        }
         if self.depth_remaining == 0 {
             // Budget exhausted — fall back to a one-shot child completion
             // rather than returning an error. Matches the paper's behaviour
             // ("sub_RLM gracefully degrades to llm_query at depth=0").
             return self.dispatch_llm(prompt, None, None, None).await;
+        }
+
+        if let Err(error) = self.usage.reserve_nested_turn().await {
+            return SingleResp {
+                text: String::new(),
+                error: Some(error),
+            };
         }
 
         // Forward the nested turn's events to the parent stream as status
@@ -492,7 +569,7 @@ impl RlmBridge {
         let (tx, mut rx) = tokio::sync::mpsc::channel(64);
         let parent = self.events.clone();
         let depth = self.depth_remaining;
-        let forwarder = spawn_supervised(
+        let mut forwarder = crate::core::engine::turn_heartbeat::AbortOnDrop(spawn_supervised(
             "rlm-bridge-forward",
             std::panic::Location::caller(),
             async move {
@@ -508,7 +585,7 @@ impl RlmBridge {
                     }
                 }
             },
-        );
+        ));
 
         let child_model = self.child_model.clone();
 
@@ -523,12 +600,17 @@ impl RlmBridge {
             tx,
             self.depth_remaining.saturating_sub(1),
             self.usage.clone(),
+            self.deadline,
+            self.gate.clone(),
         )
         .await;
 
         // The nested turn has returned and dropped its senders; let the
         // forwarder flush the tail instead of aborting it mid-record.
-        let _ = tokio::time::timeout(Duration::from_secs(5), forwarder).await;
+        let flush_deadline = self
+            .deadline
+            .min(tokio::time::Instant::now() + Duration::from_secs(5));
+        let _ = tokio::time::timeout_at(flush_deadline, &mut forwarder.0).await;
 
         SingleResp {
             text: result.answer,
@@ -685,7 +767,88 @@ mod tests {
 
     fn bridge_for(mock: Arc<MockLlmClient>, depth_remaining: u32) -> RlmBridge {
         let client: Arc<dyn RlmLlmClient> = mock;
-        RlmBridge::new(client, "child-model".to_string(), depth_remaining)
+        RlmBridge::new(client, "child-model".to_string(), depth_remaining).with_gate(Some(
+            crate::tools::codemode::NestedCallGate::admitting_for_test(),
+        ))
+    }
+
+    #[tokio::test]
+    async fn expired_parent_deadline_and_nested_receipt_bound_refuse_before_work() {
+        let mock = Arc::new(MockLlmClient::new(Vec::new()));
+        for depth in [0, 1] {
+            let bridge =
+                bridge_for(mock.clone(), depth).with_deadline(Some(tokio::time::Instant::now()));
+            let response = bridge.dispatch_rlm("must not dispatch".into(), None).await;
+            assert!(response.error.unwrap().contains("deadline exhausted"));
+            assert_eq!(mock.call_count(), 0);
+            assert!(bridge.usage_snapshot().await.nested_events.is_empty());
+        }
+        let bridge = bridge_for(mock.clone(), 1);
+        for _ in 0..crate::cost_status::MAX_CHILD_USAGE_RECORDS {
+            bridge.usage.reserve_nested_turn().await.unwrap();
+        }
+        let response = bridge
+            .dispatch_rlm("must not spawn Python".into(), None)
+            .await;
+        assert!(response.error.unwrap().contains("receipt limit"));
+        assert_eq!(mock.call_count(), 0);
+        assert!(bridge.usage_snapshot().await.nested_events.is_empty());
+    }
+
+    struct PendingClient(MockLlmClient);
+
+    impl RlmLlmClient for PendingClient {
+        fn effective_route_envelope(
+            &self,
+            model: &str,
+            at: chrono::DateTime<chrono::Utc>,
+        ) -> crate::cost_status::EffectiveRouteEnvelope {
+            RlmLlmClient::effective_route_envelope(&self.0, model, at)
+        }
+        fn effective_max_output_tokens(&self, model: &str) -> u32 {
+            RlmLlmClient::effective_max_output_tokens(&self.0, model)
+        }
+        fn create_message_boxed(
+            &self,
+            _: MessageRequest,
+        ) -> Pin<Box<dyn Future<Output = Result<MessageResponse>> + Send + '_>> {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    #[tokio::test]
+    async fn parent_deadline_interrupts_plain_and_recursive_model_calls() {
+        for depth in [0, 1] {
+            let bridge = RlmBridge::new(
+                Arc::new(PendingClient(MockLlmClient::new(Vec::new()))),
+                "child-model".into(),
+                depth,
+            )
+            .with_deadline(Some(
+                tokio::time::Instant::now() + Duration::from_millis(500),
+            ));
+            let response = tokio::time::timeout(
+                Duration::from_secs(5),
+                bridge.dispatch_rlm("bounded nested context".into(), None),
+            )
+            .await
+            .expect("a child must not replace the inherited budget");
+            assert!(
+                response
+                    .error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("deadline")),
+                "{:?}",
+                response.error
+            );
+            if depth == 0 {
+                assert_eq!(
+                    bridge.usage_snapshot().await.dropped_records,
+                    1,
+                    "canceled provider work has unknown usage, never priced zero"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1086,6 +1249,20 @@ mod tests {
                 .any(|line| line.contains("RLM finished: Final")),
             "{lines:#?}"
         );
+        let receipts = bridge.usage_snapshot().await.nested_events;
+        assert_eq!(receipts.len(), lines.len(), "one record per producer event");
+        assert_eq!(
+            receipts
+                .iter()
+                .filter(|entry| entry["kind"] == "code")
+                .count(),
+            1
+        );
+        assert!(receipts.iter().any(|entry| {
+            entry["content"]
+                .as_str()
+                .is_some_and(|text| text.contains("RLM finished: Final"))
+        }));
         assert_eq!(
             crate::core::events::status_visibility(&lines[0]),
             crate::core::events::StatusVisibility::Internal

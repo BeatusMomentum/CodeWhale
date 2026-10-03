@@ -31,9 +31,12 @@
 
 /// The restore byte string, written in a single `write(2)`.
 ///
-/// Mirrors `emergency_restore_terminal`'s mode teardown, minus raw mode
-/// (termios state lives behind a lock that may be held by the dying thread)
-/// and minus every query (a dead process cannot read replies). Modes left
+/// Mirrors `emergency_restore_terminal`'s mode teardown, minus every query
+/// (a dead process cannot read replies). Raw mode is not in these bytes:
+/// crossterm's termios state sits behind a lock the dying thread may hold, so
+/// the handler restores the job-control guard's lock-free cooked snapshot with
+/// `tcsetattr` instead (U03-02). When that guard is disabled or its snapshot
+/// failed there is no snapshot, and raw mode is left for `stty sane`. Modes left
 /// over that a shell does not self-heal are the ones that poison input:
 /// mouse capture and the kitty keyboard stack get the full reset.
 #[cfg(unix)]
@@ -108,8 +111,8 @@ pub(crate) fn install_fatal_signal_guard() {
 ///
 /// # Safety
 ///
-/// Only async-signal-safe operations: `write(2)`, `open(2)`, `close(2)`,
-/// `signal(2)`, `raise(2)`, and fixed-buffer arithmetic. No allocation, no
+/// Only async-signal-safe operations: `write(2)`, `tcsetattr(3)`, `open(2)`,
+/// `close(2)`, `signal(2)`, `raise(2)`, and fixed-buffer arithmetic. No allocation, no
 /// locks (the `OnceLock`/`AtomicUsize` reads complete before any thread
 /// exists and are never written again).
 #[cfg(unix)]
@@ -135,6 +138,11 @@ unsafe extern "C" fn fatal_signal_handler(signal: libc::c_int) {
                 FATAL_RESTORE_BYTES.as_ptr() as *const libc::c_void,
                 FATAL_RESTORE_BYTES.len(),
             );
+        }
+        // Leave raw mode from the cooked snapshot taken before it was enabled.
+        // `tcsetattr` is async-signal-safe; TCSANOW never waits on output.
+        if let Some(original) = super::job_control_guard::original_termios() {
+            let _ = libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, original);
         }
 
         // 2. Append the one-line marker (mtime timestamps it).

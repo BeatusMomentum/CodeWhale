@@ -708,6 +708,170 @@ fn mcp_scoped_config_path(
     })
 }
 
+/// Whether a turn (or its compaction work) owns the engine. The engine
+/// services ops only between turns, so an op sent now waits for that turn.
+fn mcp_engine_busy(app: &App) -> bool {
+    app.is_loading
+        || app.dispatch_in_flight
+        || matches!(app.runtime_turn_status.as_deref(), Some("in_progress"))
+        || app.is_compacting
+        || app.manual_compaction_queued
+}
+
+/// Rebuild the open Extensions panel from live state, so a row's pending or
+/// settled retry shows without waiting for the next MCP generation.
+fn refresh_open_extensions(app: &mut App) {
+    if app.view_stack.extensions_is_top() {
+        let snapshot = crate::tui::views::extensions::ExtensionsSnapshot::from_app(app);
+        app.view_stack.refresh_extensions(snapshot);
+    }
+    app.needs_redraw = true;
+}
+
+/// Reconnect one MCP server through the engine-owned pool without awaiting it
+/// on the UI loop. While a turn runs, the op waits in the engine mailbox and
+/// runs as soon as the turn ends — the person asked once, so they are not
+/// told to ask again.
+fn start_mcp_retry(app: &mut App, engine_handle: &EngineHandle, name: String) {
+    use crate::tui::app::PendingMcpRetry;
+
+    let already = app
+        .mcp_retries
+        .iter()
+        .find(|pending| pending.server == name);
+    let queued = already.map_or_else(|| mcp_engine_busy(app), |pending| pending.queued);
+    if already.is_none() {
+        tracing::info!(target: "mcp", server = %name, queued, "MCP server retry requested");
+        let result = Arc::new(std::sync::Mutex::new(None));
+        app.mcp_retries.push(PendingMcpRetry {
+            server: name.clone(),
+            queued,
+            result: Arc::clone(&result),
+        });
+        let handle = engine_handle.clone();
+        let server = name.clone();
+        tokio::spawn(async move {
+            let outcome = handle
+                .retry_mcp_server(server)
+                .await
+                .map_err(|error| crate::mcp::format_mcp_error_for_display(&error));
+            if let Ok(mut cell) = result.lock() {
+                *cell = Some(outcome);
+            }
+        });
+    }
+    let message = if queued {
+        app.tr(MessageId::McpRetryDeferredWhileTurnRuns)
+    } else {
+        app.tr(MessageId::McpRetryStarted)
+    }
+    .replace("{server}", &name);
+    report_mcp_login(app, message, StatusToastLevel::Info);
+    refresh_open_extensions(app);
+}
+
+/// Deliver every settled `/mcp retry`: apply its snapshot and say what
+/// happened to that server — connected, needs a login, or why it failed.
+pub(crate) fn poll_mcp_retries(app: &mut App) {
+    if app.mcp_retries.is_empty() {
+        return;
+    }
+    let mut settled = Vec::new();
+    app.mcp_retries.retain(|pending| {
+        match pending
+            .result
+            .try_lock()
+            .ok()
+            .and_then(|mut cell| cell.take())
+        {
+            Some(outcome) => {
+                settled.push((pending.server.clone(), outcome));
+                false
+            }
+            None => true,
+        }
+    });
+    if settled.is_empty() {
+        return;
+    }
+    for (server, outcome) in settled {
+        let (message, level) = match outcome {
+            Ok(update) => {
+                let receipt = mcp_retry_receipt(app, &server, &update.snapshot);
+                apply_mcp_session_boot_event(
+                    app,
+                    update.generation,
+                    update.snapshot,
+                    Vec::new(),
+                    true,
+                );
+                receipt
+            }
+            Err(error) => {
+                tracing::warn!(target: "mcp", server = %server, error = %error, "MCP server retry could not run");
+                (
+                    app.tr(MessageId::McpRetryFailed)
+                        .replace("{server}", &server)
+                        .replace("{error}", &error),
+                    StatusToastLevel::Error,
+                )
+            }
+        };
+        report_mcp_login(app, message, level);
+    }
+    refresh_open_extensions(app);
+}
+
+/// The one-line outcome of a retry for `server`, read from the snapshot the
+/// engine returned for it.
+fn mcp_retry_receipt(
+    app: &App,
+    server: &str,
+    snapshot: &crate::mcp::McpManagerSnapshot,
+) -> (String, StatusToastLevel) {
+    let Some(observed) = snapshot.servers.iter().find(|row| row.name == server) else {
+        return (
+            app.tr(MessageId::McpRetryFailed)
+                .replace("{server}", server)
+                .replace(
+                    "{error}",
+                    &app.tr(MessageId::McpLoginServerNotFound)
+                        .replace("{server}", server),
+                ),
+            StatusToastLevel::Error,
+        );
+    };
+    if observed.connected {
+        (
+            app.tr(MessageId::McpRetryConnected)
+                .replace("{server}", server)
+                .replace("{tools}", &observed.tools.len().to_string()),
+            StatusToastLevel::Success,
+        )
+    } else if observed.auth_required {
+        (
+            app.tr(MessageId::McpRetryNeedsLogin)
+                .replace("{server}", server)
+                .replace(
+                    "{command}",
+                    &crate::mcp::McpRecoveryKind::Reauth.slash_command(server),
+                ),
+            StatusToastLevel::Warning,
+        )
+    } else {
+        let error = observed
+            .error
+            .clone()
+            .unwrap_or_else(|| app.tr(MessageId::ExtensionsStateDisconnected).into_owned());
+        (
+            app.tr(MessageId::McpRetryFailed)
+                .replace("{server}", server)
+                .replace("{error}", &error),
+            StatusToastLevel::Error,
+        )
+    }
+}
+
 pub(crate) async fn handle_mcp_ui_action(
     app: &mut App,
     engine_handle: &EngineHandle,
@@ -730,10 +894,14 @@ pub(crate) async fn handle_mcp_ui_action(
         add_mcp_message(app, app.tr(MessageId::McpReloadAlreadyRunning).into_owned());
         return;
     }
-    let retry_name = match &action {
-        crate::tui::app::McpUiAction::Retry { name } => Some(name.clone()),
-        _ => None,
-    };
+    // A retry never runs on this path: it is an engine op, and awaiting it
+    // here parked input behind the connect (or behind a running turn,
+    // #6159). It goes to the engine from a background task instead, so a
+    // running turn simply queues it; `poll_mcp_retries` reports the outcome.
+    if let crate::tui::app::McpUiAction::Retry { name } = &action {
+        start_mcp_retry(app, engine_handle, name.clone());
+        return;
+    }
     let snapshot_live_pool = matches!(&action, crate::tui::app::McpUiAction::Show);
     let discover = mcp_ui_action_refreshes_discovery(&action);
 
@@ -883,6 +1051,7 @@ pub(crate) async fn handle_mcp_ui_action(
             }
         }
         crate::tui::app::McpUiAction::Validate | crate::tui::app::McpUiAction::Reload => Ok(()),
+        // Dispatched before this match.
         crate::tui::app::McpUiAction::Retry { .. } => Ok(()),
     };
 
@@ -906,12 +1075,8 @@ pub(crate) async fn handle_mcp_ui_action(
     // known snapshot and say so; mutations name the deferral instead of
     // freezing. `reject_inline_inference_while_runtime_chat_owns_run`
     // (apply.rs) is the same fail-closed rule for inline inference.
-    let engine_busy = app.is_loading
-        || app.dispatch_in_flight
-        || matches!(app.runtime_turn_status.as_deref(), Some("in_progress"))
-        || app.is_compacting
-        || app.manual_compaction_queued;
-    if engine_busy && (retry_name.is_some() || snapshot_live_pool || is_reload || changed) {
+    let engine_busy = mcp_engine_busy(app);
+    if engine_busy && (snapshot_live_pool || is_reload || changed) {
         if snapshot_live_pool {
             match app.mcp_snapshot.clone() {
                 Some(snapshot) => {
@@ -933,12 +1098,6 @@ pub(crate) async fn handle_mcp_ui_action(
                         .into_owned(),
                 ),
             }
-        } else if let Some(name) = retry_name.as_deref() {
-            add_mcp_message(
-                app,
-                app.tr(MessageId::McpRetryDeferredWhileTurnRuns)
-                    .replace("{server}", name),
-            );
         } else {
             add_mcp_message(
                 app,
@@ -955,12 +1114,7 @@ pub(crate) async fn handle_mcp_ui_action(
     // second, easy-to-miss reload step. The standalone reload action remains
     // the retry/compatibility path for externally edited configuration.
     let rebuild_live_pool = is_reload || changed;
-    let snapshot_result = if let Some(name) = retry_name.as_deref() {
-        engine_handle
-            .retry_mcp_server(name)
-            .await
-            .map(|update| (update.snapshot, Some(update.generation)))
-    } else if snapshot_live_pool {
+    let snapshot_result = if snapshot_live_pool {
         engine_handle
             .bootstrap_mcp()
             .await
@@ -1046,10 +1200,6 @@ pub(crate) async fn handle_mcp_ui_action(
             app.hotbar_actions.replace_mcp_tools(Some(&snapshot));
             open_mcp_extensions(app);
         }
-        Err(err) if retry_name.is_some() => add_mcp_message(
-            app,
-            format!("MCP server retry failed; the live tool pool is unchanged: {err}"),
-        ),
         Err(err) if rebuild_live_pool => add_mcp_message(
             app,
             format!("MCP reload failed; the live tool pool is unchanged: {err}"),
@@ -1286,6 +1436,7 @@ pub(crate) async fn handle_config_updated(
     ) {
         app.force_next_full_repaint = true;
     }
+    let rejected = result.is_error;
     if apply_command_result(terminal, app, engine_handle, task_manager, config, result).await? {
         return Ok(true);
     }
@@ -1295,7 +1446,7 @@ pub(crate) async fn handle_config_updated(
     } else {
         &key
     };
-    refresh_config_view_if_open(app, focus_key);
+    refresh_config_view_after_commit(app, focus_key, rejected);
     if let Some((message, level)) = telemetry_toast {
         // The modal stays open, so a transcript-only command receipt would be
         // invisible. Keep the durable disk truth in the rebuilt row and show
@@ -1513,16 +1664,17 @@ pub(crate) async fn handle_view_events(
                 apply_user_input_submission_result(app, &tool_id, result);
             }
             ViewEvent::UserInputCancelled { tool_id } => {
-                if engine_handle
-                    .cancel_user_input(tool_id.clone())
-                    .await
-                    .is_ok()
-                {
-                    settle_user_input_request(app, &tool_id);
+                // A cancel is an answer too: when it cannot reach the engine
+                // the question is still pending there, so reopen it the way a
+                // failed submit does instead of recording a cancel (U02-04).
+                let result = engine_handle.cancel_user_input(tool_id.clone()).await;
+                let delivered = result.is_ok();
+                apply_user_input_submission_result(app, &tool_id, result);
+                if delivered {
+                    app.add_message(HistoryCell::System {
+                        content: "User input cancelled".to_string(),
+                    });
                 }
-                app.add_message(HistoryCell::System {
-                    content: "User input cancelled".to_string(),
-                });
             }
             ViewEvent::SessionSelected { session_id } => {
                 let manager = match SessionManager::default_location() {
@@ -1534,8 +1686,10 @@ pub(crate) async fn handle_view_events(
                     }
                 };
 
-                match manager.resume_session(&session_id) {
-                    Ok(recovery) => {
+                // Another window's open session is refused, not attached
+                // as a second autosaving writer.
+                match manager.attach_session(&session_id) {
+                    Ok((recovery, lease)) => {
                         let session = recovery.session;
                         let next_config = config.clone();
                         let message_count = session.metadata.message_count;
@@ -1549,7 +1703,13 @@ pub(crate) async fn handle_view_events(
                             next_config,
                             false,
                         ) {
-                            Ok(outcome) => outcome,
+                            Ok(outcome) => {
+                                // Only now does this window give up the
+                                // session it had open; a failed restore
+                                // above keeps that session's lease.
+                                lease.commit();
+                                outcome
+                            }
                             Err(err) => {
                                 crate::tui::ui::session_state::surface_session_load_failure(
                                     app,
@@ -2340,7 +2500,7 @@ pub(crate) async fn handle_view_events(
                     insertion.push(' ');
                 }
                 insertion.push('@');
-                insertion.push_str(&path);
+                insertion.push_str(&crate::tui::file_mention::file_mention_body(&path));
                 insertion.push(' ');
                 app.insert_str(&insertion);
                 app.status_message = Some(format!("Attached @{path}"));

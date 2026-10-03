@@ -182,6 +182,8 @@ test("win32: wheel packets preserve signed DWORD bits in both axes and clamp not
 test('win32: single-monitor discovery preserves an array and negative raster origins', async t => {
   const fs = await import('node:fs'); const os = await import('node:os'); const path = await import('node:path');
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cu-win-capture-'));
+  const oldRec = process.env.CODEWHALE_CU_RECORDINGS_DIR; process.env.CODEWHALE_CU_RECORDINGS_DIR = dir;
+  t.after(() => { if (oldRec === undefined) delete process.env.CODEWHALE_CU_RECORDINGS_DIR; else process.env.CODEWHALE_CU_RECORDINGS_DIR = oldRec; });
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const file = path.join(dir, 'shot.png');
   const scripts = [];

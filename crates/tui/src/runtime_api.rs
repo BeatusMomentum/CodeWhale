@@ -113,6 +113,7 @@ mod secrets;
 mod sessions;
 mod targets;
 mod terminal;
+mod turn_artifacts;
 mod voice;
 mod web;
 mod workspace;
@@ -123,9 +124,9 @@ use self::auth::{
     runtime_request_is_authorized,
 };
 use self::sessions::{
-    create_session_from_thread, delete_session, get_session, list_session_artifacts, list_sessions,
-    list_sessions_summary, patch_session, read_session_artifact, resume_session_thread,
-    save_current_session,
+    create_session_from_thread, delete_session, get_session, get_session_repair,
+    list_session_artifacts, list_sessions, list_sessions_summary, patch_session,
+    read_session_artifact, resume_session_thread, save_current_session,
 };
 #[cfg(test)]
 use self::sessions::{messages_from_thread_detail, session_to_detail};
@@ -220,8 +221,101 @@ pub struct RuntimeApiState {
     /// The computer this Engine runs on: display socket, human control
     /// lease, device client tokens and `computer.*` events (§3.3).
     computer: computer_display::ComputerState,
+    /// Fires when the server stops on purpose, so open thread event streams
+    /// end with a typed `stream.end` rather than a bare EOF.
+    shutdown: RuntimeServerShutdown,
+    /// Serializes this runtime's git writes (stage/unstage/discard/commit/
+    /// branch) so a precondition check and its write are atomic with respect
+    /// to other windows on the same server (#6647).
+    git_writes: Arc<tokio::sync::Mutex<()>>,
+    /// Serializes provider switches: each one saves, applies and, when the
+    /// apply is refused, takes back its own save before the next one starts.
+    provider_switches: Arc<tokio::sync::Mutex<()>>,
     #[cfg(test)]
     compat_stream_test_hook: Option<tokio::sync::mpsc::UnboundedSender<CompatStreamTestPoint>>,
+}
+
+/// How the Runtime API server stops on purpose.
+///
+/// `requested` fires once the server decides to stop: the listener stops
+/// accepting, idle connections close, and every open thread event stream sends
+/// `stream.end {reason: "runtime_shutdown"}` and finishes. `stopped` fires once
+/// `serve_runtime_api` has drained every connection.
+#[derive(Clone, Default)]
+pub(crate) struct RuntimeServerShutdown {
+    requested: CancellationToken,
+    stopped: CancellationToken,
+}
+
+impl RuntimeServerShutdown {
+    /// Ask the server to stop and wait at most `deadline` for it to drain.
+    /// Returns whether it drained in time; a long-lived response that does not
+    /// watch `requested` (a turn or Fleet stream) can hold it to the deadline.
+    pub(crate) async fn drain(&self, deadline: Duration) -> bool {
+        self.requested.cancel();
+        tokio::time::timeout(deadline, self.stopped.cancelled())
+            .await
+            .is_ok()
+    }
+}
+
+/// Serve `app` until `shutdown` is requested, then drain gracefully so the
+/// final frames of open streams reach their clients before connections close.
+async fn serve_runtime_api(
+    listener: TcpListener,
+    app: Router,
+    shutdown: RuntimeServerShutdown,
+) -> std::io::Result<()> {
+    let result = axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown.requested.clone().cancelled_owned())
+    .await;
+    shutdown.stopped.cancel();
+    result
+}
+
+/// The serving Runtime API, for the process signal handler (`lib.rs`), which
+/// exits the process on a terminating signal. Without this it would cut every
+/// open stream mid-connection, indistinguishable from a network drop.
+static SIGNAL_SHUTDOWN: std::sync::Mutex<Option<RuntimeServerShutdown>> =
+    std::sync::Mutex::new(None);
+
+/// How long a terminating signal waits for open streams to say goodbye. A
+/// second signal skips the wait.
+const SIGNAL_SHUTDOWN_DRAIN: Duration = Duration::from_secs(2);
+
+/// Clears `SIGNAL_SHUTDOWN` when the server that registered it returns.
+struct SignalShutdownRegistration;
+
+impl SignalShutdownRegistration {
+    fn register(shutdown: &RuntimeServerShutdown) -> Self {
+        if let Ok(mut slot) = SIGNAL_SHUTDOWN.lock() {
+            *slot = Some(shutdown.clone());
+        }
+        Self
+    }
+}
+
+impl Drop for SignalShutdownRegistration {
+    fn drop(&mut self) {
+        if let Ok(mut slot) = SIGNAL_SHUTDOWN.lock() {
+            *slot = None;
+        }
+    }
+}
+
+/// Called by the process signal handler before it exits: stop the serving
+/// Runtime API (if any) and give its open streams a bounded window to send
+/// their final `stream.end` frame.
+pub(crate) async fn drain_for_signal_exit() {
+    let shutdown = SIGNAL_SHUTDOWN.lock().ok().and_then(|slot| slot.clone());
+    if let Some(shutdown) = shutdown
+        && !shutdown.drain(SIGNAL_SHUTDOWN_DRAIN).await
+    {
+        tracing::warn!("Runtime API did not drain within the signal shutdown window");
+    }
 }
 
 #[cfg(test)]
@@ -955,6 +1049,9 @@ fn open_runtime_threads_for_server(
     Ok((manager, workshop_activation))
 }
 
+/// Prefix of the first line the Runtime prints once it holds its listener.
+pub const RUNTIME_LISTENING_PREFIX: &str = "Runtime API listening on http://";
+
 /// Start the runtime API server.
 pub async fn run_http_server(
     config: Config,
@@ -963,6 +1060,17 @@ pub async fn run_http_server(
     options: RuntimeApiOptions,
 ) -> Result<()> {
     validate_runtime_listener_security(&options)?;
+
+    // Own the endpoint before building anything that names it: with an
+    // ephemeral port (`--port 0`) the kernel picks the port, and the address
+    // this process reports is the one it actually holds.
+    let addr = runtime_bind_address(&options.host, options.port)?;
+    let listener = TcpListener::bind(addr)
+        .await
+        .with_context(|| format!("Failed to bind {addr}"))?;
+    let bound_addr = listener
+        .local_addr()
+        .context("Failed to read Runtime API listener address")?;
 
     // Keep the server usable before a local catalog arrives. Omitted API
     // requests are checked at admission; background tasks keep the auto sentinel.
@@ -996,6 +1104,9 @@ pub async fn run_http_server(
     );
 
     let sessions_dir = default_sessions_dir().unwrap_or_else(|_| fallback_sessions_dir());
+    // Repair the saved-session store once per server start (#6144); this
+    // server's own store is open by now, so it reads as in use.
+    crate::session_reconcile::spawn_background_reconcile(None);
     let runtime_token_env = runtime_token_environment(&|name| std::env::var(name).ok());
     let runtime_token_alias_warning =
         runtime_token_alias_warning(options.auth_token.as_deref(), &runtime_token_env);
@@ -1024,6 +1135,18 @@ pub async fn run_http_server(
     let skill_state = SkillStateStore::load_default()
         .context("load persistent Skill activation state for Runtime API")?;
     let sub_agent_manager = runtime_api_sub_agent_manager(&workspace, options.workers);
+    let shutdown = RuntimeServerShutdown::default();
+    // Opening a thread is every client's first read, and the store can only
+    // answer it after one pass over the whole items directory (an item's
+    // filename names the item, not its turn). Every open used to pay that pass;
+    // here it is paid once, while the server is starting and nobody is waiting
+    // for it. See [`RuntimeThreadStore::ensure_item_index`].
+    let warm_threads = runtime_threads.clone();
+    tokio::task::spawn_blocking(move || {
+        if let Err(error) = warm_threads.warm_item_index() {
+            tracing::warn!(%error, "thread item index warm-up failed");
+        }
+    });
     let state = RuntimeApiState {
         config: Arc::new(parking_lot::RwLock::new(config.clone())),
         workspace,
@@ -1040,7 +1163,7 @@ pub async fn run_http_server(
         skill_state: Arc::new(Mutex::new(skill_state)),
         auth_required: auth_enabled,
         bind_host: options.host.clone(),
-        bind_port: options.port,
+        bind_port: bound_addr.port(),
         mobile_enabled: options.mobile,
         mobile,
         web,
@@ -1048,20 +1171,18 @@ pub async fn run_http_server(
         mcp_pool: Arc::new(Mutex::new(None)),
         lsp_manager: Arc::new(std::sync::OnceLock::new()),
         computer: computer_display::ComputerState::from_env(),
+        shutdown: shutdown.clone(),
+        git_writes: Arc::new(tokio::sync::Mutex::new(())),
+        provider_switches: Arc::new(tokio::sync::Mutex::new(())),
         #[cfg(test)]
         compat_stream_test_hook: None,
     };
     let app = build_router(state);
 
-    let addr = runtime_bind_address(&options.host, options.port)?;
-    let listener = TcpListener::bind(addr)
-        .await
-        .with_context(|| format!("Failed to bind {addr}"))?;
-
-    let bound_addr = listener
-        .local_addr()
-        .context("Failed to read Runtime API listener address")?;
-    println!("Runtime API listening on http://{bound_addr}");
+    // First stdout line, flushed: a supervising parent reads the endpoint
+    // from here instead of guessing a port (stdout is block-buffered on a pipe).
+    println!("{RUNTIME_LISTENING_PREFIX}{bound_addr}");
+    let _ = std::io::Write::flush(&mut std::io::stdout());
     for line in runtime_auth_status_lines(&resolved_auth) {
         println!("{line}");
     }
@@ -1104,16 +1225,15 @@ pub async fn run_http_server(
         println!(
             "  /v1/runtime/info reports bind_host={host:?}, port={port}, auth_required={auth}.",
             host = options.host,
-            port = options.port,
+            port = bound_addr.port(),
             auth = auth_enabled,
         );
     }
-    let serve_result = axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .await
-    .map_err(|e| anyhow!("Runtime API server error: {e}"));
+    let signal_registration = SignalShutdownRegistration::register(&shutdown);
+    let serve_result = serve_runtime_api(listener, app, shutdown)
+        .await
+        .map_err(|e| anyhow!("Runtime API server error: {e}"));
+    drop(signal_registration);
     scheduler_cancel.cancel();
     scheduler_handle.abort();
     task_manager.shutdown_and_wait().await?;
@@ -1124,7 +1244,10 @@ pub async fn run_http_server(
 /// overlay transport, so a non-loopback listener would expose the Runtime API
 /// to peers that can observe or replay browser traffic.
 fn validate_runtime_listener_security(options: &RuntimeApiOptions) -> Result<()> {
-    if options.port == 0 {
+    // Port 0 asks the kernel for an ephemeral port. Only a plain loopback
+    // Runtime may use it: web and mobile clients are given a fixed endpoint.
+    if options.port == 0 && (options.web || options.mobile || !is_loopback_bind_host(&options.host))
+    {
         bail!("Port must be > 0");
     }
     if options.web && options.host != "127.0.0.1" {
@@ -1188,6 +1311,7 @@ pub fn build_router(state: RuntimeApiState) -> Router {
                 .put(save_current_session),
         )
         .route("/v1/sessions/summary", get(list_sessions_summary))
+        .route("/v1/sessions/repair", get(get_session_repair))
         .route(
             "/v1/sessions/{id}",
             get(get_session).patch(patch_session).delete(delete_session),
@@ -1375,6 +1499,14 @@ pub fn build_router(state: RuntimeApiState) -> Router {
             post(steer_thread_turn),
         )
         .route(
+            "/v1/threads/{id}/turns/{turn_id}/artifacts",
+            get(turn_artifacts::list_turn_artifacts),
+        )
+        .route(
+            "/v1/threads/{id}/turns/{turn_id}/artifacts/{artifact_id}",
+            get(turn_artifacts::read_turn_artifact),
+        )
+        .route(
             "/v1/threads/{id}/turns/{turn_id}/interrupt",
             post(interrupt_thread_turn),
         )
@@ -1384,6 +1516,11 @@ pub fn build_router(state: RuntimeApiState) -> Router {
         )
         .route("/v1/threads/{id}/compact", post(compact_thread))
         .route("/v1/threads/{id}/usage", get(get_thread_usage))
+        .route("/v1/threads/{id}/receipt", get(get_thread_receipt))
+        .route(
+            "/v1/threads/{id}/turns/{turn_id}/receipt",
+            get(get_turn_receipt),
+        )
         .route("/v1/threads/{id}/events", get(stream_thread_events))
         .route("/v1/agent-mail", post(send_agent_mail))
         .route("/v1/threads/{id}/agent-mail", get(list_agent_mail))
@@ -1586,6 +1723,10 @@ pub fn build_router(state: RuntimeApiState) -> Router {
             get(web::exchange_bootstrap),
         )
         .route(
+            "/__codewhale/web/stream-ticket",
+            post(web::refresh_stream_ticket),
+        )
+        .route(
             "/__codewhale/mobile/bootstrap/{nonce}",
             get(exchange_mobile_bootstrap),
         )
@@ -1609,18 +1750,22 @@ pub fn build_router(state: RuntimeApiState) -> Router {
         .with_state(state)
 }
 
-async fn mobile_page(State(state): State<RuntimeApiState>, req: Request) -> Response {
+async fn mobile_page(State(state): State<RuntimeApiState>) -> Result<Response, ApiError> {
     if !state.mobile_enabled {
-        return (
+        return Ok((
             StatusCode::NOT_FOUND,
             "mobile control is disabled; start with `codewhale serve --mobile`",
         )
-            .into_response();
+            .into_response());
     }
-    let _ = req;
-    let mut response = Html(MOBILE_HTML).into_response();
+    let settings = tokio::task::spawn_blocking(crate::settings::Settings::load_read_only)
+        .await
+        .map_err(|err| ApiError::internal(format!("mobile settings task failed: {err}")))?
+        .map_err(|err| ApiError::internal(format!("mobile settings unavailable: {err}")))?;
+    let locale = codewhale_localization::resolve_locale(&settings.locale);
+    let mut response = Html(mobile_html(locale)).into_response();
     secure_mobile_response(&mut response);
-    response
+    Ok(response)
 }
 
 #[derive(Serialize)]
@@ -3643,9 +3788,7 @@ async fn list_skills(
     let (skills_dir, mode) = {
         let config = state.config.read();
         let skills_dir = resolve_skills_dir(&config, &state.workspace);
-        let mode = crate::skills::SkillDiscoveryMode::from_codewhale_only(
-            config.skills_config().scan_codewhale_only(),
-        );
+        let mode = crate::skills::SkillDiscoveryMode::from_config(&config.skills_config());
         (skills_dir, mode)
     };
     let plugin_registry = state
@@ -3694,7 +3837,8 @@ async fn list_skills(
                 plugin_id,
                 plugin_generation,
                 plugin_content_hash,
-                enabled: skill_state.is_enabled(&skill.name),
+                enabled: skill_state
+                    .is_enabled_with_legacy(&skill.name, skill.legacy_activation_name.as_deref()),
                 is_bundled: skill_entry_is_bundled(skill, &skills_dir),
             }
         })
@@ -3715,9 +3859,7 @@ async fn set_skill_enabled(
     let (skills_dir, mode) = {
         let config = state.config.read();
         let skills_dir = resolve_skills_dir(&config, &state.workspace);
-        let mode = crate::skills::SkillDiscoveryMode::from_codewhale_only(
-            config.skills_config().scan_codewhale_only(),
-        );
+        let mode = crate::skills::SkillDiscoveryMode::from_config(&config.skills_config());
         (skills_dir, mode)
     };
     let plugin_registry = state
@@ -4169,6 +4311,10 @@ struct ApprovalHistoryRow {
     approval_id: String,
     tool_name: String,
     outcome: String,
+    /// Who resolved it: `user`, `session_rule`, `posture`, or `host`.
+    /// Absent while pending and on records written before deciders were kept.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    decided_by: Option<crate::approval_log::ApprovalDecider>,
     asked_at: chrono::DateTime<Utc>,
     decided_at: Option<chrono::DateTime<Utc>>,
 }
@@ -4198,6 +4344,7 @@ fn approval_history_rows(replay: &crate::approval_log::ApprovalReplay) -> Vec<Ap
                 approval_id: completed.ask.approval_id().to_string(),
                 tool_name: completed.ask.tool_name().unwrap_or("unknown").to_string(),
                 outcome: approval_outcome_label(&completed.outcome).to_string(),
+                decided_by: completed.decided_by,
                 asked_at,
                 decided_at: Some(completed.decided_at),
             }
@@ -4206,6 +4353,7 @@ fn approval_history_rows(replay: &crate::approval_log::ApprovalReplay) -> Vec<Ap
             approval_id: ask.approval_id().to_string(),
             tool_name: ask.tool_name().unwrap_or("unknown").to_string(),
             outcome: "pending".to_string(),
+            decided_by: None,
             asked_at: ask.created_at(),
             decided_at: None,
         }))
@@ -4494,6 +4642,7 @@ fn mcp_mutation_error(error: anyhow::Error) -> ApiError {
         ApiError {
             status: StatusCode::PRECONDITION_FAILED,
             message: error.to_string(),
+            code: None,
         }
     } else if let Some(error) = error.downcast_ref::<McpManagementFailure>() {
         error.0.clone()
@@ -4509,6 +4658,7 @@ fn mcp_expected_revision(headers: &axum::http::HeaderMap) -> Result<String, ApiE
             status: StatusCode::PRECONDITION_REQUIRED,
             message: "Read the MCP configuration and send its revision in If-Match before saving"
                 .into(),
+            code: None,
         })?
         .to_str()
         .map_err(|_| ApiError::bad_request("Invalid MCP revision"))?
@@ -4592,6 +4742,7 @@ fn require_writable_mcp_server(state: &RuntimeApiState, name: &str) -> Result<()
             message: format!(
                 "MCP server '{name}' is owned by {origin} configuration; manage it at its source"
             ),
+            code: None,
         }),
         None => Err(ApiError::not_found(format!(
             "MCP server '{name}' not found"
@@ -4841,6 +4992,7 @@ async fn create_mcp_server(
                     message: format!(
                         "MCP server '{target_name}' already exists in the effective configuration"
                     ),
+                    code: None,
                 });
             }
             config.servers.insert(target_name, new_cfg.clone());
@@ -4900,6 +5052,7 @@ async fn update_mcp_server(
             return Err(ApiError {
                 status: StatusCode::CONFLICT,
                 message: "Clear this connector's credential configuration before changing its command, arguments, URL, or transport; retained credentials cannot be forwarded to a different target".to_owned(),
+                code: None,
             });
         }
         if existing.command.is_none() && existing.url.is_none() {
@@ -5568,6 +5721,44 @@ async fn get_thread_usage(
     }))
 }
 
+/// `GET /v1/threads/{id}/receipt` — what the thread did, built by the one
+/// receipt builder from the thread snapshot and its `approval.*` events
+/// (`docs/RECEIPTS.md`). Read-only.
+async fn get_thread_receipt(
+    State(state): State<RuntimeApiState>,
+    Path(id): Path<String>,
+) -> Result<Json<crate::receipts::Receipt>, ApiError> {
+    thread_receipt(&state, &id, None).await.map(Json)
+}
+
+/// `GET /v1/threads/{id}/turns/{turn_id}/receipt` — the same receipt scoped
+/// to one turn.
+async fn get_turn_receipt(
+    State(state): State<RuntimeApiState>,
+    Path((id, turn_id)): Path<(String, String)>,
+) -> Result<Json<crate::receipts::Receipt>, ApiError> {
+    thread_receipt(&state, &id, Some(&turn_id)).await.map(Json)
+}
+
+async fn thread_receipt(
+    state: &RuntimeApiState,
+    id: &str,
+    turn: Option<&str>,
+) -> Result<crate::receipts::Receipt, ApiError> {
+    let detail = state
+        .runtime_threads
+        .get_thread_detail(id)
+        .await
+        .map_err(map_thread_err)?;
+    let events = state
+        .runtime_threads
+        .events_since_async(id, None)
+        .await
+        .map_err(map_thread_err)?;
+    crate::receipts::thread_receipt(&detail.thread, &detail.turns, &detail.items, &events, turn)
+        .map_err(|error| ApiError::not_found(error.to_string()))
+}
+
 async fn update_thread(
     State(state): State<RuntimeApiState>,
     Path(id): Path<String>,
@@ -5693,9 +5884,11 @@ async fn fork_thread_at_turn(
 struct PatchUndoResult {
     /// Whether files were restored from a snapshot.
     files_restored: bool,
-    /// Human-readable summary of what was restored (diff stat).
+    /// Human-readable summary: one `<action> <path>` line per restored file,
+    /// or why nothing needed restoring.
     summary: Option<String>,
-    /// The label of the restored snapshot (e.g. "tool:apply_patch" or "pre-turn:3").
+    /// Label of the pre-turn snapshot the files went back to (e.g.
+    /// "pre-turn:3: fix the parser").
     snapshot_label: Option<String>,
 }
 
@@ -5745,12 +5938,15 @@ async fn patch_undo_thread_turn(
         // client does not get to assert it.
         let trusted = thread.trust_mode || thread.auto_approve;
         let workspace = thread.workspace.clone();
-        let session_id = thread.session_id.clone();
+        // The restore points come from the dropped turns' own records, not
+        // from the thread's saved-session binding or a scan of the shared
+        // snapshot store: those are the snapshots this thread owns.
+        let dropped_turns = prepared.dropped_turns().to_vec();
         // Step 1: snapshot-based file rollback. The `?` is deliberate: a
         // refusal or a failed restore aborts *before* the conversation is
         // forked, so the turn never disappears while its file changes stay.
         let patch_result = tokio::task::spawn_blocking(move || {
-            patch_undo_workspace_files(&workspace, session_id.as_deref(), trusted)
+            patch_undo_workspace_files(&workspace, &dropped_turns, trusted)
         })
         .await
         .map_err(|e| ApiError::internal(format!("Patch undo task failed: {e}")))??;
@@ -5787,125 +5983,541 @@ async fn patch_undo_thread_turn(
     .map_err(|e| ApiError::internal(format!("Patch undo task failed: {e}")))?
 }
 
-/// Restore the newest `tool:` or `pre-turn:` snapshot that differs from the
-/// current workspace — same target selection as the TUI's `patch_undo`.
+/// Error codes a patch-undo refusal carries in `error.code`. A client offers a
+/// conversation-only `POST /v1/threads/{id}/undo` for the first four.
+const PATCH_UNDO_NO_RESTORE_POINT: &str = "restore_point_unavailable";
+const PATCH_UNDO_RESTORE_POINT_PRUNED: &str = "restore_point_pruned";
+const PATCH_UNDO_PATH_NOT_SNAPSHOTTED: &str = "path_not_snapshotted";
+const PATCH_UNDO_WORKSPACE_CHANGED: &str = "workspace_changed_since_turn";
+const PATCH_UNDO_UNTRUSTED: &str = "restore_requires_trust";
+const PATCH_UNDO_WORKSPACE_UNAVAILABLE: &str = "workspace_unavailable";
+
+/// One pre-turn → post-turn window of a dropped turn, resolved to the trees
+/// the snapshot store still holds.
+struct UndoSegment {
+    turn_id: String,
+    pre: crate::snapshot::SnapshotId,
+    post: crate::snapshot::SnapshotId,
+    pre_label: String,
+    /// Paths that changed in the window only while one of the turn's own
+    /// tool calls was running: the turn's changes.
+    owned: std::collections::BTreeSet<PathBuf>,
+    /// Paths that changed in the window while none of the turn's tools could
+    /// have written them: someone else's changes.
+    foreign: std::collections::BTreeSet<PathBuf>,
+}
+
+/// Pair each `pre_turn` receipt of a turn with the `post_turn` receipt that
+/// closes it, in recorded order, as index ranges into `snapshots` (the
+/// `tool`/`post_tool` receipts between them are the window's inner spans). A
+/// turn can hold more than one window (a shell turn and a model turn under
+/// one runtime turn); a `post_turn` with no open window cannot belong to this
+/// turn and is skipped. `None` means a window the engine never closed (the
+/// turn died before its post-turn snapshot) or no window at all.
+fn turn_snapshot_windows(
+    snapshots: &[crate::snapshot::WorkspaceSnapshotRef],
+) -> Option<Vec<std::ops::RangeInclusive<usize>>> {
+    use crate::snapshot::WorkspaceSnapshotKind;
+    let mut windows = Vec::new();
+    let mut open = None;
+    for (index, snapshot) in snapshots.iter().enumerate() {
+        match snapshot.kind {
+            WorkspaceSnapshotKind::PreTurn => {
+                if open.is_some() {
+                    return None;
+                }
+                open = Some(index);
+            }
+            WorkspaceSnapshotKind::PostTurn => {
+                if let Some(pre) = open.take() {
+                    windows.push(pre..=index);
+                }
+            }
+            WorkspaceSnapshotKind::Tool | WorkspaceSnapshotKind::PostTool => {}
+        }
+    }
+    (open.is_none() && !windows.is_empty()).then_some(windows)
+}
+
+/// A path a file tool declared it writes, as a workspace-relative path the
+/// snapshots would hold, or `None` when it is outside the workspace.
+fn declared_write_path(workspace: &FsPath, raw: &str) -> Option<PathBuf> {
+    use std::path::Component;
+    let candidate = FsPath::new(raw);
+    let rel = if candidate.is_absolute() {
+        let canonical_workspace = workspace.canonicalize().ok();
+        let canonical_candidate = candidate
+            .parent()
+            .and_then(|parent| parent.canonicalize().ok())
+            .zip(candidate.file_name())
+            .map(|(parent, name)| parent.join(name));
+        [Some(workspace), canonical_workspace.as_deref()]
+            .into_iter()
+            .flatten()
+            .find_map(|root| {
+                candidate
+                    .strip_prefix(root)
+                    .ok()
+                    .or_else(|| canonical_candidate.as_deref()?.strip_prefix(root).ok())
+                    .map(FsPath::to_path_buf)
+            })?
+    } else {
+        candidate.to_path_buf()
+    };
+    let rel: PathBuf = rel
+        .components()
+        .filter(|component| !matches!(component, Component::CurDir))
+        .collect();
+    crate::snapshot::workspace_relative_path(workspace, rel.to_str()?)
+}
+
+/// Who could have changed the workspace in the span after one receipt.
+enum SpanWriter {
+    /// None of the turn's tool calls was running.
+    Nobody,
+    /// A call whose writes are not declared (a shell command, a program).
+    Undeclared,
+    /// A file tool that declared exactly these paths.
+    Declared(std::collections::BTreeSet<PathBuf>),
+}
+
+/// Split a window's changes into the turn's own and everyone else's, from
+/// the spans its receipts bound: a path belongs to the turn only if it
+/// changed while one of the turn's tool calls was running and, for a file
+/// tool, is one the call declared. A span whose changes were not recorded
+/// (a snapshot in it failed) cannot be attributed and fails closed.
+fn attribute_window(
+    workspace: &FsPath,
+    turn_id: &str,
+    receipts: &[crate::snapshot::WorkspaceSnapshotRef],
+) -> Result<
+    (
+        std::collections::BTreeSet<PathBuf>,
+        std::collections::BTreeSet<PathBuf>,
+    ),
+    ApiError,
+> {
+    use crate::snapshot::WorkspaceSnapshotKind;
+    let mut owned = std::collections::BTreeSet::new();
+    let mut foreign = std::collections::BTreeSet::new();
+    // Undeclared calls whose `post_tool` receipt is still ahead: everything
+    // up to it (a program's nested calls included) is theirs.
+    let mut open_undeclared: Vec<&str> = Vec::new();
+    let mut writer = SpanWriter::Nobody;
+    for (index, receipt) in receipts.iter().enumerate() {
+        if index > 0 {
+            let Some(changed) = receipt.changed_paths.as_ref() else {
+                return Err(no_restore_point(
+                    turn_id,
+                    "has an incomplete record of what changed while it ran (a snapshot during the turn failed), so its changes cannot be told apart from anyone else's",
+                ));
+            };
+            for path in changed {
+                let path = PathBuf::from(path);
+                match &writer {
+                    SpanWriter::Undeclared => {
+                        owned.insert(path);
+                    }
+                    SpanWriter::Declared(declared) if declared.contains(&path) => {
+                        owned.insert(path);
+                    }
+                    SpanWriter::Declared(_) | SpanWriter::Nobody => {
+                        foreign.insert(path);
+                    }
+                }
+            }
+        }
+        match receipt.kind {
+            WorkspaceSnapshotKind::Tool => {
+                if receipt.write_paths.is_none()
+                    && let Some(call) = receipt.tool_call_id.as_deref()
+                    && receipts[index + 1..].iter().any(|later| {
+                        later.kind == WorkspaceSnapshotKind::PostTool
+                            && later.tool_call_id.as_deref() == Some(call)
+                    })
+                {
+                    open_undeclared.push(call);
+                }
+            }
+            WorkspaceSnapshotKind::PostTool => {
+                if let Some(call) = receipt.tool_call_id.as_deref() {
+                    open_undeclared.retain(|open| *open != call);
+                }
+            }
+            WorkspaceSnapshotKind::PreTurn | WorkspaceSnapshotKind::PostTurn => {}
+        }
+        writer = if !open_undeclared.is_empty() {
+            SpanWriter::Undeclared
+        } else {
+            match receipt.kind {
+                // A shell turn: its command runs from the pre-turn snapshot.
+                WorkspaceSnapshotKind::PreTurn if receipt.tool_call_id.is_some() => {
+                    SpanWriter::Undeclared
+                }
+                WorkspaceSnapshotKind::Tool => match receipt.write_paths.as_ref() {
+                    Some(paths) => SpanWriter::Declared(
+                        paths
+                            .iter()
+                            .filter_map(|raw| declared_write_path(workspace, raw))
+                            .collect(),
+                    ),
+                    None => SpanWriter::Undeclared,
+                },
+                _ => SpanWriter::Nobody,
+            }
+        };
+    }
+    Ok((owned, foreign))
+}
+
+fn no_restore_point(turn_id: &str, why: &str) -> ApiError {
+    ApiError::conflict(format!(
+        "Turn {turn_id} {why}, so its workspace changes cannot be restored; nothing was changed. \
+         Use POST /v1/threads/{{id}}/undo for a conversation-only undo."
+    ))
+    .with_code(PATCH_UNDO_NO_RESTORE_POINT)
+}
+
+/// Roll the workspace files back to where they were before the first dropped
+/// turn — only the files the dropped turns changed, and only when nothing
+/// else changed them since.
+///
+/// # Ownership
+///
+/// The restore points are the `pre_turn`/`post_turn` receipts recorded on the
+/// dropped turns themselves (`TurnRecord::workspace_snapshots`), resolved by
+/// tree and session tag against the snapshot store. Nothing is selected by
+/// scanning the shared store, so another thread's (or the TUI's) snapshots in
+/// the same workspace are never candidates, and a fork restores the turns it
+/// inherited because it carries their records.
+///
+/// # What is restored
+///
+/// For each dropped turn's window, the paths that differ between its
+/// pre-turn and post-turn snapshots are candidates, and each must be the
+/// turn's own: it changed only while one of the turn's tool calls was running
+/// (the engine bounds every call that may write with a `tool` and a
+/// `post_tool` snapshot and records what changed in each span), and, for a
+/// file tool, it is a path the call declared. A path that changed while none
+/// of the turn's tools could have written it — another thread, an editor, a
+/// background process — is someone else's change: the undo is refused rather
+/// than revert it. Each of the turn's paths goes back to its content before
+/// the first dropped turn that changed it, and nothing outside that set is
+/// touched, so later work survives. The whole turn goes, not just its last
+/// write.
+///
+/// A path a file tool declared that the snapshots cannot hold (ignored by
+/// `.gitignore` or the built-in exclusions, or outside the workspace) is
+/// refused too: no snapshot can put it back, so "nothing to restore" would
+/// be a lie.
 ///
 /// # The rollback contract
 ///
 /// `Ok` is a decision the conversation fork may proceed on: either the files
-/// were restored, or there was *provably* nothing to restore. `Err` aborts the
-/// whole undo, and the caller must not fork either — dropping the turn while
-/// leaving its file changes on disk hands the user a workspace the transcript
-/// can no longer account for, which is worse than refusing outright.
+/// were restored, or there was *provably* nothing to restore (the dropped
+/// turns ran here without tools, changed no files, or the files are back at
+/// their pre-turn state). `Err` aborts the whole undo, and the caller must not
+/// fork either: a turn that has no recorded restore point, a pruned restore
+/// point, or a path changed since the turn is a `409` with a stable
+/// `error.code`, never a `201` that forks while the files stay changed.
 ///
 /// `trusted` mirrors the gate the TUI's `patch_undo()` applies
-/// (`yolo || trust_mode`). It is evaluated *after* a real target is found, so
-/// that "there was nothing to revert" still undoes the conversation, while
-/// "there is something to revert but you are not trusted" aborts.
+/// (`yolo || trust_mode`), evaluated once a real change is known.
 fn patch_undo_workspace_files(
     workspace: &FsPath,
-    current_session_id: Option<&str>,
+    dropped_turns: &[crate::runtime_threads::DroppedTurnSnapshots],
     trusted: bool,
 ) -> Result<PatchUndoResult, ApiError> {
     // An unreadable workspace directory (unmounted volume, disconnected
     // share, permissions) proves nothing about the files a turn changed, so
-    // the conversation is not forked away from them. Every repository
-    // failure is operational and aborts for the same reason: "no snapshots"
-    // cannot be proven while Git is unavailable.
+    // the conversation is not forked away from them.
     if !workspace.is_dir() {
         return Err(ApiError::conflict(format!(
             "Workspace directory {} is not available; mount or restore it before undoing files, or use /undo for a conversation-only undo.",
             workspace.display()
-        )));
+        ))
+        .with_code(PATCH_UNDO_WORKSPACE_UNAVAILABLE));
     }
+
+    // Which windows matter. A turn that ran no tool changed no file; a turn
+    // that did must have recorded where it started and ended.
+    let mut windows = Vec::new();
+    for turn in dropped_turns {
+        if !turn.may_change_files {
+            continue;
+        }
+        if turn.snapshots.is_empty() {
+            return Err(no_restore_point(
+                &turn.turn_id,
+                "has no recorded workspace restore point (it predates restore-point receipts, was imported from a saved session, or ran with snapshots off or unavailable)",
+            ));
+        }
+        let Some(turn_windows) = turn_snapshot_windows(&turn.snapshots) else {
+            return Err(no_restore_point(
+                &turn.turn_id,
+                "has no complete pre-turn/post-turn restore point (its snapshot failed or the turn stopped before it was taken)",
+            ));
+        };
+        windows.extend(
+            turn_windows
+                .into_iter()
+                .map(|range| (turn, &turn.snapshots[range])),
+        );
+    }
+    if windows.is_empty() {
+        return Ok(PatchUndoResult {
+            files_restored: false,
+            summary: Some(
+                "The undone turn(s) ran no tools, so they changed no workspace files; nothing to restore."
+                    .to_string(),
+            ),
+            snapshot_label: None,
+        });
+    }
+
+    // Every repository failure is operational and aborts: "nothing to
+    // restore" cannot be proven while Git is unavailable.
     let repo = crate::snapshot::SnapshotRepo::open_or_init(workspace).map_err(|e| {
         ApiError::internal(format!(
             "Snapshot repo unavailable; conversation preserved: {e}"
         ))
     })?;
-    let Some(current_session_id) = current_session_id else {
-        return Ok(PatchUndoResult {
-            files_restored: false,
-            summary: Some(
-                "No current session is bound to this thread; workspace files were not changed."
-                    .to_string(),
-            ),
-            snapshot_label: None,
-        });
-    };
-    let snapshots = repo
-        .list(100)
+    // Resolve by id against the whole store — no listing cap, so an old but
+    // retained restore point is never mistaken for a pruned one.
+    let listed = repo
+        .list(usize::MAX)
         .map_err(|e| ApiError::internal(format!("Failed to list snapshots: {e}")))?;
-    let mut target = None;
-    for snapshot in snapshots
-        .iter()
-        .filter(|s| s.label.starts_with("tool:") || s.label.starts_with("pre-turn:"))
-        .filter(|s| s.session_id.as_deref() == Some(current_session_id))
-    {
-        if !repo.work_tree_matches_snapshot(&snapshot.id).map_err(|e| {
-            ApiError::internal(format!(
-                "Failed to compare snapshot; conversation preserved: {e}"
-            ))
-        })? {
-            target = Some(snapshot);
-            break;
-        }
-    }
-    let Some(target) = target else {
-        return Ok(PatchUndoResult {
-            files_restored: false,
-            summary: Some(
-                "No current-session tool or pre-turn snapshots differ from the current workspace."
-                    .to_string(),
-            ),
-            snapshot_label: None,
-        });
+    let resolve = |turn_id: &str,
+                   receipt: &crate::snapshot::WorkspaceSnapshotRef|
+     -> Result<(crate::snapshot::SnapshotId, String), ApiError> {
+        listed
+            .iter()
+            .find(|snapshot| receipt.matches(snapshot))
+            .map(|snapshot| (snapshot.tree.clone(), snapshot.label.clone()))
+            .ok_or_else(|| {
+                ApiError::conflict(format!(
+                    "The {} restore point of turn {turn_id} is no longer in the snapshot store (pruned, or its session tag changed), so its workspace changes cannot be restored; nothing was changed. Use POST /v1/threads/{{id}}/undo for a conversation-only undo.",
+                    receipt.kind.label_prefix().trim_end_matches(':')
+                ))
+                .with_code(PATCH_UNDO_RESTORE_POINT_PRUNED)
+            })
     };
 
+    // Every path a dropped file-tool call declared must be one the snapshots
+    // hold; otherwise its change is invisible to them and cannot be undone.
+    let mut not_snapshotted = std::collections::BTreeSet::new();
+    for turn in dropped_turns.iter().filter(|turn| turn.may_change_files) {
+        let receipt_writes = turn
+            .snapshots
+            .iter()
+            .filter(|receipt| {
+                receipt
+                    .tool_call_id
+                    .as_ref()
+                    .is_none_or(|call| !turn.unrun_tool_calls.contains(call))
+            })
+            .filter_map(|receipt| receipt.write_paths.as_ref())
+            .flatten();
+        for raw in turn.declared_writes.iter().chain(receipt_writes) {
+            let covered = match declared_write_path(workspace, raw) {
+                Some(rel) => !repo.path_is_excluded(&rel).map_err(|e| {
+                    ApiError::internal(format!(
+                        "Failed to check snapshot coverage; conversation preserved: {e}"
+                    ))
+                })?,
+                None => false,
+            };
+            if !covered {
+                not_snapshotted.insert(raw.clone());
+            }
+        }
+    }
+    if !not_snapshotted.is_empty() {
+        return Err(ApiError::conflict(format!(
+            "The undone turn(s) wrote {}, which workspace snapshots do not hold (ignored by .gitignore or the built-in snapshot exclusions, or outside the workspace), so those changes cannot be restored; nothing was changed. Use POST /v1/threads/{{id}}/undo for a conversation-only undo and restore those files yourself.",
+            not_snapshotted.into_iter().collect::<Vec<_>>().join(", ")
+        ))
+        .with_code(PATCH_UNDO_PATH_NOT_SNAPSHOTTED));
+    }
+
+    let mut segments = Vec::with_capacity(windows.len());
+    for (turn, receipts) in windows {
+        let (pre, pre_label) = resolve(&turn.turn_id, &receipts[0])?;
+        let (post, _) = resolve(&turn.turn_id, &receipts[receipts.len() - 1])?;
+        let (owned, foreign) = attribute_window(workspace, &turn.turn_id, receipts)?;
+        segments.push(UndoSegment {
+            turn_id: turn.turn_id.clone(),
+            pre,
+            post,
+            pre_label,
+            owned,
+            foreign,
+        });
+    }
+
+    let compare_err = |e: std::io::Error| {
+        if e.kind() == std::io::ErrorKind::InvalidInput {
+            ApiError::conflict(format!(
+                "A path the undone turn(s) changed cannot be restored file by file: {e}. Nothing was changed; use /restore for a whole-workspace rollback."
+            ))
+            .with_code(PATCH_UNDO_WORKSPACE_CHANGED)
+        } else {
+            ApiError::internal(format!(
+                "Failed to compare snapshots; conversation preserved: {e}"
+            ))
+        }
+    };
+
+    // path -> (content to restore, content the dropped turns left)
+    let mut plan: std::collections::BTreeMap<
+        PathBuf,
+        (crate::snapshot::SnapshotId, crate::snapshot::SnapshotId),
+    > = std::collections::BTreeMap::new();
+    for segment in &segments {
+        let changed = repo
+            .changed_paths_between(&segment.pre, &segment.post)
+            .map_err(compare_err)?;
+        // A path someone else changed while the turn ran cannot be told
+        // apart from the turn's own change to it, and reverting it would
+        // erase their work: refuse instead of guessing.
+        let not_owned: Vec<String> = changed
+            .iter()
+            .filter(|path| segment.foreign.contains(*path) || !segment.owned.contains(*path))
+            .map(|path| path.display().to_string())
+            .collect();
+        if !not_owned.is_empty() {
+            return Err(ApiError::conflict(format!(
+                "{} changed while turn {} ran but outside its own tool calls (another thread, an editor or a background process), so undoing the turn would revert changes it did not make; nothing was changed. Revert the turn's files individually with file-revert, or use /undo for a conversation-only undo.",
+                not_owned.join(", "),
+                segment.turn_id
+            ))
+            .with_code(PATCH_UNDO_WORKSPACE_CHANGED));
+        }
+        for path in changed {
+            match plan.get_mut(&path) {
+                None => {
+                    plan.insert(path, (segment.pre.clone(), segment.post.clone()));
+                }
+                Some((_, left)) => {
+                    // Between two dropped turns that both changed this path,
+                    // something else changed it too; restoring the earlier
+                    // content would erase that change.
+                    if !repo
+                        .path_same_in_snapshots(left, &segment.pre, &path)
+                        .map_err(compare_err)?
+                    {
+                        return Err(ApiError::conflict(format!(
+                            "'{}' was changed outside turn {} between the undone turns; undoing would erase that change. Nothing was changed.",
+                            path.display(),
+                            segment.turn_id
+                        ))
+                        .with_code(PATCH_UNDO_WORKSPACE_CHANGED));
+                    }
+                    *left = segment.post.clone();
+                }
+            }
+        }
+    }
+
+    // Compare each changed path with the workspace now: already back at its
+    // pre-turn content (skip), still as the turns left it (restore), or
+    // changed since by someone else (refuse — never clobber later work).
+    let mut to_restore = Vec::new();
+    let mut changed_since = Vec::new();
+    for (path, (before, after)) in &plan {
+        if repo
+            .path_matches_snapshot(before, path)
+            .map_err(compare_err)?
+        {
+            continue;
+        }
+        if repo
+            .path_matches_snapshot(after, path)
+            .map_err(compare_err)?
+        {
+            to_restore.push((path.clone(), before.clone(), after.clone()));
+        } else {
+            changed_since.push(path.display().to_string());
+        }
+    }
+    if !changed_since.is_empty() {
+        return Err(ApiError::conflict(format!(
+            "These files changed after the undone turn(s): {}. Undoing would overwrite those changes; nothing was changed. Revert individual files with file-revert, or use /undo for a conversation-only undo.",
+            changed_since.join(", ")
+        ))
+        .with_code(PATCH_UNDO_WORKSPACE_CHANGED));
+    }
+    let first = &segments[0];
+    if to_restore.is_empty() {
+        return Ok(PatchUndoResult {
+            files_restored: false,
+            summary: Some(if plan.is_empty() {
+                "The undone turn(s) left workspace files unchanged; nothing to restore.".to_string()
+            } else {
+                format!(
+                    "The files the undone turn(s) changed are already at their state before turn {}; nothing to restore.",
+                    first.turn_id
+                )
+            }),
+            snapshot_label: None,
+        });
+    }
+
     // Restoring is a workspace mutation. Gate it exactly where the TUI gates
-    // it — after a real, current-session target is known — so the two surfaces
-    // cannot drift into "one refuses, the other half-undoes".
+    // it — after a real, owned change is known — so the two surfaces cannot
+    // drift into "one refuses, the other half-undoes".
     if !trusted {
         return Err(ApiError::conflict(
             "Refusing to undo workspace files outside trusted mode. \
              Turn on /trust or switch this thread to Full Access, then undo again.",
-        ));
+        )
+        .with_code(PATCH_UNDO_UNTRUSTED));
     }
 
-    // Capture what this restore is about to change *before* it runs: after the
-    // checkout the work tree matches the snapshot, so a post-restore stat would
-    // always be empty. Runs against the side repo, not the user's — the user's
-    // `git diff --stat` reports their own uncommitted work, which is not what
-    // the undo changed.
-    let diff_stat = match repo.snapshot_diff_stat(&target.id) {
-        Ok(stat) => stat,
-        Err(e) => {
-            tracing::warn!(
-                target: "snapshot",
-                "diff stat for the patch-undo summary failed: {e}"
-            );
-            None
-        }
-    };
+    let restore_plan: Vec<(PathBuf, crate::snapshot::SnapshotId)> = to_restore
+        .iter()
+        .map(|(path, before, _)| (path.clone(), before.clone()))
+        .collect();
+    let short = &first.pre.as_str()[..first.pre.as_str().len().min(12)];
+    let outcomes = repo
+        .restore_path_plan(&restore_plan, &format!("pre-restore:{short}"), true, || {
+            // Re-verify immediately before the first mutation, after the
+            // safety snapshot: a write that landed meanwhile is refused.
+            for (path, _, after) in &to_restore {
+                if !repo.path_matches_snapshot(after, path)? {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::WouldBlock,
+                        format!(
+                            "'{}' changed while the undo was being prepared; nothing was changed.",
+                            path.display()
+                        ),
+                    ));
+                }
+            }
+            Ok(())
+        })
+        .map_err(|e| match e.kind() {
+            std::io::ErrorKind::WouldBlock => {
+                ApiError::conflict(e.to_string()).with_code(PATCH_UNDO_WORKSPACE_CHANGED)
+            }
+            std::io::ErrorKind::InvalidInput => compare_err(e),
+            _ => ApiError::internal(format!("Restore failed: {e}")),
+        })?;
 
-    repo.restore(&target.id)
-        .map_err(|e| ApiError::internal(format!("Restore failed: {e}")))?;
-
-    let short = &target.id.as_str()[..target.id.as_str().len().min(8)];
-    let summary = match diff_stat {
-        Some(ref stat) => format!(
-            "Restored snapshot '{}' ({}). Files affected:\n{stat}",
-            target.label, short
-        ),
-        None => format!(
-            "Restored snapshot '{}' ({}). No diff stat available.",
-            target.label, short
-        ),
-    };
+    let lines: Vec<String> = outcomes
+        .iter()
+        .map(|outcome| format!("{} {}", outcome.action.as_str(), outcome.path.display()))
+        .collect();
     Ok(PatchUndoResult {
         files_restored: true,
-        summary: Some(summary),
-        snapshot_label: Some(target.label.clone()),
+        summary: Some(format!(
+            "Restored {} file(s) to their state before turn {} (snapshot '{}'):\n{}",
+            outcomes.len(),
+            first.turn_id,
+            first.pre_label,
+            lines.join("\n")
+        )),
+        snapshot_label: Some(first.pre_label.clone()),
     })
 }
 
@@ -5914,7 +6526,9 @@ struct RevertThreadFileRequest {
     /// The single file to restore, relative to the thread's workspace.
     /// Absolute paths inside the workspace are accepted and normalized.
     path: String,
-    /// Exact pre-tool/pre-turn snapshot from the change the user selected.
+    /// Exact pre-tool/pre-turn restore point from the change the user
+    /// selected: a commit id from `GET /v1/snapshots`, or the `snapshot_id` /
+    /// `tree_id` of a receipt in the thread's `workspace_snapshots`.
     snapshot_id: String,
     /// SHA-256 of the bytes reviewed by the client, or `absent` for deletion.
     expected_hash: String,
@@ -5941,9 +6555,10 @@ struct RevertThreadFileResponse {
 /// hash of the bytes it reviewed; the server never guesses a "newest differing"
 /// snapshot, because an unrelated newer snapshot can erase later user edits.
 ///
-/// Ownership follows the rule the TUI's `/undo` applies: only snapshots tagged
-/// with this thread's own session are candidates, and the thread must be in
-/// trusted mode or Full Access. Nothing to revert is a `409`, not a silent
+/// Ownership: only the `tool:`/`pre-turn:` restore points recorded on this
+/// thread's own turns (`TurnRecord::workspace_snapshots`, fork-inherited turns
+/// included) are candidates, never another thread's or the TUI's snapshots in
+/// the same workspace, and the thread must be in trusted mode or Full Access. Nothing to revert is a `409`, not a silent
 /// success, so the GUI can tell the user why the button did nothing.
 async fn revert_thread_file(
     State(state): State<RuntimeApiState>,
@@ -5972,18 +6587,20 @@ async fn revert_thread_file(
             "Refusing to restore workspace files outside trusted mode. Turn on /trust or switch this thread to Full Access, then retry.",
         ));
     }
-    let Some(session_id) = thread.session_id else {
-        return Err(ApiError::conflict(
-            "Thread has no bound session, so no snapshot can be proven to own this file.",
-        ));
-    };
+    // The restore points this thread owns: the receipts on its own turns
+    // (including turns a fork cloned). Read under the restore reservation, so
+    // no turn is recording one meanwhile.
+    let owned = state
+        .runtime_threads
+        .thread_workspace_snapshots(&thread.id)
+        .map_err(map_thread_err)?;
     let workspace = thread.workspace;
     // The worker owns the reservation: a client disconnect cannot release it
     // while Git is still changing files. Snapshot listing, diffing and
     // checkout all shell out to git; keep that off the async workers.
     let response = tokio::task::spawn_blocking(move || {
         let _reservation = reservation;
-        revert_file_from_snapshot(&workspace, &session_id, &req)
+        revert_file_from_snapshot(&workspace, &owned, &req)
     })
     .await
     .map_err(|e| ApiError::internal(format!("file restore task failed: {e}")))??;
@@ -6006,7 +6623,7 @@ fn expected_hash_is_well_formed(hash: &str) -> bool {
 
 fn revert_file_from_snapshot(
     workspace: &FsPath,
-    session_id: &str,
+    owned: &[crate::snapshot::WorkspaceSnapshotRef],
     req: &RevertThreadFileRequest,
 ) -> Result<RevertThreadFileResponse, ApiError> {
     // Every caller-supplied path passes through this one gate. It accepts a
@@ -6034,22 +6651,43 @@ fn revert_file_from_snapshot(
     let snapshots = repo
         .list(usize::MAX)
         .map_err(|e| ApiError::internal(format!("Failed to list snapshots: {e}")))?;
-    // Exact identity only: the snapshot must exist, be owned by this thread's
-    // session and be a tool/pre-turn restore point. A stale or foreign id is
-    // a conflict the client resolves by refreshing its change record.
-    let target = snapshots
+    // Exact identity only: the snapshot must still exist, be a tool/pre-turn
+    // restore point recorded on one of this thread's turns, and still carry
+    // the session tag it was recorded with. The client may name it by the
+    // commit id `GET /v1/snapshots` lists now, or by the `snapshot_id` or
+    // `tree_id` its turn record holds (a prune rewrites commit ids but keeps
+    // trees). A foreign, unrecorded or pruned id is a conflict the client
+    // resolves by refreshing its change record.
+    let restore_points: Vec<&crate::snapshot::WorkspaceSnapshotRef> = owned
         .iter()
-        .find(|snapshot| {
-            snapshot.id.as_str() == req.snapshot_id
-                && snapshot.session_id.as_deref() == Some(session_id)
-                && (snapshot.label.starts_with("tool:")
-                    || snapshot.label.starts_with("pre-turn:"))
-        })
-        .ok_or_else(|| {
-            ApiError::conflict(
-                "Selected restore point is unavailable or belongs to another session; refresh the change record and select the change again.",
+        .filter(|receipt| {
+            matches!(
+                receipt.kind,
+                crate::snapshot::WorkspaceSnapshotKind::Tool
+                    | crate::snapshot::WorkspaceSnapshotKind::PreTurn
             )
-        })?;
+        })
+        .collect();
+    let target = match snapshots
+        .iter()
+        .find(|snapshot| snapshot.id.as_str() == req.snapshot_id)
+    {
+        Some(listed) => restore_points
+            .iter()
+            .any(|receipt| receipt.matches(listed))
+            .then_some(listed),
+        None => restore_points
+            .iter()
+            .find(|receipt| {
+                receipt.snapshot_id == req.snapshot_id || receipt.tree_id == req.snapshot_id
+            })
+            .and_then(|receipt| snapshots.iter().find(|listed| receipt.matches(listed))),
+    }
+    .ok_or_else(|| {
+        ApiError::conflict(
+            "Selected restore point is unavailable or belongs to another thread; refresh the change record and select the change again.",
+        )
+    })?;
 
     if !repo
         .path_differs_from_snapshot(&target.id, &rel)
@@ -6533,6 +7171,7 @@ async fn complete_thread_goal(
         return Err(ApiError {
             status: StatusCode::CONFLICT,
             message: format!("goal for thread '{id}' is already complete"),
+            code: None,
         });
     }
     let updated = state
@@ -6540,6 +7179,7 @@ async fn complete_thread_goal(
         .transition_goal_status(
             &id,
             &goal.goal_id,
+            goal.status.clone(),
             codewhale_protocol::ThreadGoalStatus::Complete,
         )
         .await
@@ -6547,6 +7187,7 @@ async fn complete_thread_goal(
         .ok_or_else(|| ApiError {
             status: StatusCode::CONFLICT,
             message: format!("goal for thread '{id}' changed concurrently; retry"),
+            code: None,
         })?;
     let _ = state
         .runtime_threads
@@ -6583,6 +7224,7 @@ async fn block_thread_goal(
             message: format!(
                 "goal for thread '{id}' is already complete; cannot transition to blocked"
             ),
+            code: None,
         });
     }
     let updated = state
@@ -6590,6 +7232,7 @@ async fn block_thread_goal(
         .transition_goal_status(
             &id,
             &goal.goal_id,
+            goal.status.clone(),
             codewhale_protocol::ThreadGoalStatus::Blocked,
         )
         .await
@@ -6597,6 +7240,7 @@ async fn block_thread_goal(
         .ok_or_else(|| ApiError {
             status: StatusCode::CONFLICT,
             message: format!("goal for thread '{id}' changed concurrently; retry"),
+            code: None,
         })?;
     let _ = state
         .runtime_threads
@@ -6708,6 +7352,7 @@ async fn stream_thread_events(
         replay.batches,
         live,
         query.progress,
+        state.shutdown.requested.clone(),
     );
 
     let mut response = Sse::new(stream)
@@ -6717,6 +7362,12 @@ async fn stream_thread_events(
                 .text("keepalive"),
         )
         .into_response();
+    // Every server-initiated end of this stream is a `stream.end` frame. The
+    // header lets a client tell that EOF without one is transport loss, which
+    // an older Runtime cannot promise.
+    response
+        .headers_mut()
+        .insert("x-codewhale-stream-end", HeaderValue::from_static("1"));
     if query.progress {
         response
             .headers_mut()
@@ -6725,53 +7376,156 @@ async fn stream_thread_events(
     Ok(response)
 }
 
+/// Opt-in transport frame at the existing journal cursor. It carries the same
+/// envelope identity (`schema_version`, `event`, `kind`, `thread_id`) as the
+/// journal and `stream.end`, but never a journal `seq` of its own.
 fn thread_stream_progress(thread_id: &str, seq: u64, live: bool) -> SseEvent {
     sse_json(
         "stream.progress",
         json!({
-            "event": "stream.progress", "thread_id": thread_id, "seq": seq,
+            "schema_version": RUNTIME_EVENT_ENVELOPE_SCHEMA_VERSION,
+            "event": "stream.progress", "kind": "stream.progress",
+            "thread_id": thread_id, "seq": seq,
             "state": if live { "live" } else { "replaying" },
         }),
     )
+}
+
+/// Why the server ended a thread event stream it had already opened. Every
+/// server-initiated end is one of these, sent as the final `stream.end` frame;
+/// an EOF without that frame is the transport or the process dying, never the
+/// server choosing to stop.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ThreadStreamEnd {
+    /// The durable history read that feeds the opening replay failed.
+    ReplayFailed,
+    /// The durable re-read after broadcast lag could not be opened or failed.
+    CatchUpFailed,
+    /// The Runtime API server is stopping (a terminating signal).
+    RuntimeShutdown,
+}
+
+impl ThreadStreamEnd {
+    const fn reason(self) -> &'static str {
+        match self {
+            Self::ReplayFailed => "replay_failed",
+            Self::CatchUpFailed => "catch_up_failed",
+            Self::RuntimeShutdown => "runtime_shutdown",
+        }
+    }
+
+    /// Every current end is resumable from `last_seq`. The flag exists so the
+    /// client rule keys on it rather than on the reason list: a future
+    /// non-resumable end stops clients without a client change.
+    const fn retryable(self) -> bool {
+        match self {
+            Self::ReplayFailed | Self::CatchUpFailed | Self::RuntimeShutdown => true,
+        }
+    }
+}
+
+/// The final frame of a server-ended thread stream. It has no `seq` and no SSE
+/// `id:` because it is not a journal event: seq-keyed consumers skip it, and a
+/// browser `EventSource` keeps `Last-Event-ID` on the last real event.
+/// `last_seq` is exactly the `since_seq` that resumes without loss or repeats.
+/// The underlying error stays in the server log; it can carry store paths.
+fn thread_stream_end(thread_id: &str, end: ThreadStreamEnd, last_seq: u64) -> SseEvent {
+    sse_json(
+        "stream.end",
+        json!({
+            "schema_version": RUNTIME_EVENT_ENVELOPE_SCHEMA_VERSION,
+            "event": "stream.end", "kind": "stream.end",
+            "thread_id": thread_id, "reason": end.reason(),
+            "last_seq": last_seq, "retryable": end.retryable(),
+        }),
+    )
+}
+
+/// The journal frame for `event` on this thread's stream, advancing the
+/// connection cursor. `None` for another thread's event or one already sent.
+fn thread_journal_frame(
+    thread_id: &str,
+    last_seq: &mut u64,
+    event: crate::runtime_threads::RuntimeEventRecord,
+) -> Option<SseEvent> {
+    if event.thread_id != thread_id || event.seq <= *last_seq {
+        return None;
+    }
+    let previous_seq = std::mem::replace(last_seq, event.seq);
+    let event_name = event.event.clone();
+    Some(
+        sse_json(
+            &event_name,
+            runtime_event_payload_with_previous(event, previous_seq),
+        )
+        .id(last_seq.to_string()),
+    )
+}
+
+type ThreadReplayBatches = tokio::sync::mpsc::Receiver<
+    std::result::Result<Vec<crate::runtime_threads::RuntimeEventRecord>, String>,
+>;
+
+enum ThreadReplayStep {
+    Events(Vec<crate::runtime_threads::RuntimeEventRecord>),
+    Complete,
+    Failed(String),
+    Shutdown,
+}
+
+/// The next durable-history batch, unless the server starts stopping first.
+async fn next_thread_replay_step(
+    shutdown: &CancellationToken,
+    batches: &mut ThreadReplayBatches,
+) -> ThreadReplayStep {
+    tokio::select! {
+        biased;
+        () = shutdown.cancelled() => ThreadReplayStep::Shutdown,
+        batch = batches.recv() => match batch {
+            None => ThreadReplayStep::Complete,
+            Some(Ok(events)) => ThreadReplayStep::Events(events),
+            Some(Err(error)) => ThreadReplayStep::Failed(error),
+        },
+    }
 }
 
 fn replay_live_thread_events(
     runtime_threads: SharedRuntimeThreadManager,
     thread_id: String,
     mut last_seq: u64,
-    mut backlog: tokio::sync::mpsc::Receiver<
-        std::result::Result<Vec<crate::runtime_threads::RuntimeEventRecord>, String>,
-    >,
+    mut backlog: ThreadReplayBatches,
     mut live: tokio::sync::broadcast::Receiver<crate::runtime_threads::RuntimeEventRecord>,
     progress: bool,
+    shutdown: CancellationToken,
 ) -> impl futures_util::Stream<Item = Result<SseEvent, Infallible>> {
+    // Every exit below is a `stream.end` followed by `return`; the live loop
+    // never breaks. An EOF this stream produces is therefore never silent.
     stream! {
         if progress { yield Ok(thread_stream_progress(&thread_id, last_seq, false)); }
-        while let Some(batch) = backlog.recv().await {
-            let events = match batch {
-                Ok(events) => events,
-                Err(error) => {
+        loop {
+            match next_thread_replay_step(&shutdown, &mut backlog).await {
+                ThreadReplayStep::Events(events) => {
+                    for event in events {
+                        if let Some(frame) = thread_journal_frame(&thread_id, &mut last_seq, event) {
+                            yield Ok(frame);
+                        }
+                    }
+                }
+                ThreadReplayStep::Complete => break,
+                ThreadReplayStep::Failed(error) => {
                     tracing::warn!(
                         thread_id = %thread_id,
                         last_seq,
                         %error,
                         "Failed to replay Runtime web event stream from durable history"
                     );
+                    yield Ok(thread_stream_end(&thread_id, ThreadStreamEnd::ReplayFailed, last_seq));
                     return;
                 }
-            };
-            for event in events {
-                if event.thread_id != thread_id || event.seq <= last_seq {
-                    continue;
+                ThreadReplayStep::Shutdown => {
+                    yield Ok(thread_stream_end(&thread_id, ThreadStreamEnd::RuntimeShutdown, last_seq));
+                    return;
                 }
-                let previous_seq = last_seq;
-                last_seq = event.seq;
-                let event_name = event.event.clone();
-                yield Ok(sse_json(
-                    &event_name,
-                    runtime_event_payload_with_previous(event, previous_seq),
-                )
-                .id(last_seq.to_string()));
             }
         }
 
@@ -6780,7 +7534,11 @@ fn replay_live_thread_events(
         // before declaring the observation current. These opt-in frames carry
         // transport progress, never new journal events or sequence numbers.
         let mut replaying = progress;
-        'live: loop {
+        loop {
+            if shutdown.is_cancelled() {
+                yield Ok(thread_stream_end(&thread_id, ThreadStreamEnd::RuntimeShutdown, last_seq));
+                return;
+            }
             let next = if replaying {
                 use tokio::sync::broadcast::error::{RecvError, TryRecvError};
                 match live.try_recv() {
@@ -6793,20 +7551,21 @@ fn replay_live_thread_events(
                     Err(TryRecvError::Lagged(skipped)) => Err(RecvError::Lagged(skipped)),
                     Err(TryRecvError::Closed) => Err(RecvError::Closed),
                 }
-            } else { live.recv().await };
+            } else {
+                let received = tokio::select! {
+                    biased;
+                    () = shutdown.cancelled() => None,
+                    received = live.recv() => Some(received),
+                };
+                // Shutdown is answered by the check at the top of the loop.
+                let Some(received) = received else { continue };
+                received
+            };
             match next {
                 Ok(event) => {
-                    if event.thread_id != thread_id || event.seq <= last_seq {
-                        continue;
+                    if let Some(frame) = thread_journal_frame(&thread_id, &mut last_seq, event) {
+                        yield Ok(frame);
                     }
-                    let previous_seq = last_seq;
-                    last_seq = event.seq;
-                    let event_name = event.event.clone();
-                    yield Ok(sse_json(
-                        &event_name,
-                        runtime_event_payload_with_previous(event, previous_seq),
-                    )
-                    .id(last_seq.to_string()));
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                     if progress {
@@ -6829,13 +7588,21 @@ fn replay_live_thread_events(
                                 %error,
                                 "Failed to recover lagged Runtime web event stream from durable history"
                             );
-                            break 'live;
+                            yield Ok(thread_stream_end(&thread_id, ThreadStreamEnd::CatchUpFailed, last_seq));
+                            return;
                         }
                     };
-                    while let Some(batch) = recovered.recv().await {
-                        let events = match batch {
-                            Ok(events) => events,
-                            Err(error) => {
+                    loop {
+                        match next_thread_replay_step(&shutdown, &mut recovered).await {
+                            ThreadReplayStep::Events(events) => {
+                                for event in events {
+                                    if let Some(frame) = thread_journal_frame(&thread_id, &mut last_seq, event) {
+                                        yield Ok(frame);
+                                    }
+                                }
+                            }
+                            ThreadReplayStep::Complete => break,
+                            ThreadReplayStep::Failed(error) => {
                                 tracing::warn!(
                                     thread_id = %thread_id,
                                     last_seq,
@@ -6843,25 +7610,22 @@ fn replay_live_thread_events(
                                     %error,
                                     "Failed to recover lagged Runtime web event stream from durable history"
                                 );
-                                break 'live;
+                                yield Ok(thread_stream_end(&thread_id, ThreadStreamEnd::CatchUpFailed, last_seq));
+                                return;
                             }
-                        };
-                        for event in events {
-                            if event.thread_id != thread_id || event.seq <= last_seq {
-                                continue;
-                            }
-                            let previous_seq = last_seq;
-                            last_seq = event.seq;
-                            let event_name = event.event.clone();
-                            yield Ok(sse_json(
-                                &event_name,
-                                runtime_event_payload_with_previous(event, previous_seq),
-                            )
-                            .id(last_seq.to_string()));
+                            // Answered by the check at the top of the live loop.
+                            ThreadReplayStep::Shutdown => break,
                         }
                     }
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                // The sender is owned by the `RuntimeThreadManager` this stream
+                // holds an `Arc` of, so it cannot close while the stream runs.
+                // If that ever changes, the live source is gone only because
+                // the Runtime is: say so rather than end silently.
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    yield Ok(thread_stream_end(&thread_id, ThreadStreamEnd::RuntimeShutdown, last_seq));
+                    return;
+                }
             }
         }
     }
@@ -7421,6 +8185,10 @@ fn resolve_skills_dir(config: &Config, workspace: &std::path::Path) -> PathBuf {
             return config.skills_dir();
         }
         if let Some(codewhale_skills_dir) = crate::skills::codewhale_workspace_skills_dir(workspace)
+            && crate::skills::skills_dir_allowed_by_workspace_trust(
+                workspace,
+                &codewhale_skills_dir,
+            )
             && let Ok(canonical_skills) = fs::canonicalize(&codewhale_skills_dir)
         {
             return canonical_skills;
@@ -7437,8 +8205,11 @@ fn resolve_skills_dir(config: &Config, workspace: &std::path::Path) -> PathBuf {
         Err(_) => return config.skills_dir(),
     };
     for candidate in [
-        canonical_workspace.join(".agents").join("skills"),
-        canonical_workspace.join("skills"),
+        canonical_workspace.join(".codewhale/skills"),
+        canonical_workspace.join(".agents/skills"),
+        canonical_workspace.join(".claude/skills"),
+        canonical_workspace.join(".opencode/skills"),
+        canonical_workspace.join(".cursor/skills"),
     ] {
         // Re-canonicalize the candidate so a `.agents/skills` symlink to e.g.
         // `/etc` cannot promote arbitrary filesystem locations into the
@@ -7447,9 +8218,19 @@ fn resolve_skills_dir(config: &Config, workspace: &std::path::Path) -> PathBuf {
         if let Ok(canon) = fs::canonicalize(&candidate)
             && canon.starts_with(&canonical_workspace)
             && canon.is_dir()
+            && crate::skills::skills_dir_allowed_by_workspace_trust(workspace, &canon)
         {
             return canon;
         }
+    }
+    let flat = canonical_workspace.join("skills");
+    if config.skills_config().flat_workspace_root()
+        && let Ok(canonical) = fs::canonicalize(&flat)
+        && canonical.starts_with(&canonical_workspace)
+        && canonical.is_dir()
+        && crate::skills::skills_dir_allowed_by_workspace_trust(workspace, &canonical)
+    {
+        return canonical;
     }
     config.skills_dir()
 }
@@ -8580,8 +9361,9 @@ struct SwitchProviderRequest {
     /// addresses them everywhere else: the generic kind in the id (`custom`)
     /// plus this additive exact id, exactly as `ProviderEntry`
     /// `model_provider_id` and `POST /v1/threads` already carry it. Omitted
-    /// keeps the pre-existing meaning — the built-in id, or the active
-    /// legacy root-level custom route.
+    /// keeps the pre-existing meaning — the built-in id, or the literal
+    /// `[providers.custom]` route (where the older top-level custom route
+    /// lives since #6394).
     #[serde(default)]
     model_provider_id: Option<String>,
 }
@@ -8636,6 +9418,9 @@ struct SwitchProviderResponse {
 ///   are committed together through the canonical Config writer.
 /// - Config is reloaded from disk and synced to active engines via
 ///   `runtime_threads.reload_config`, exactly like `POST /v1/config/reload`.
+/// - A reload that fails or is rejected rolls the persisted selection back
+///   (only while the file still holds what this write left), so disk and the
+///   running config never disagree about the provider. The error says which.
 async fn switch_provider(
     State(state): State<RuntimeApiState>,
     Path(id): Path<String>,
@@ -8715,43 +9500,89 @@ async fn switch_provider(
     // model arg) MUST NOT write a `model` key, otherwise the user's
     // per-provider `[providers.<id>].model` config gets overwritten with
     // whatever the runtime resolves as the default.
-    config_persistence::persist_provider_selection(
-        state.config_path.as_deref(),
-        target,
-        &provider_identity,
-        model_override.as_deref(),
-    )
-    .map_err(|e| ApiError::internal(format!("Failed to persist provider selection: {e}")))?;
+    // The save, the reload and the undo of a refused save run as one task
+    // detached from this request: a client that disconnects or times out
+    // mid-reload drops only its wait, never the undo, and never leaves the
+    // engines on the new config while `state.config` keeps the old one.
+    let task_state = state.clone();
+    let task_identity = provider_identity.clone();
+    let task_model = model_override.clone();
+    let runtime = tokio::runtime::Handle::current();
+    #[cfg(test)]
+    let env_ticket = crate::test_support::env_scope_ticket();
+    let (active_provider, active_model) = tokio::spawn(async move {
+        let state = task_state;
+        let _one_switch_at_a_time = state.provider_switches.lock().await;
+        // Keep the cancellation-safe owned switch, while all filesystem and
+        // keyring work runs off the async worker under the same serialization.
+        tokio::task::spawn_blocking(move || {
+            #[cfg(test)]
+            let _membership = crate::test_support::join_env_scope(env_ticket);
+            let (config_toml, undo) = config_persistence::persist_provider_selection(
+                state.config_path.as_deref(),
+                target,
+                &task_identity,
+                task_model.as_deref(),
+            )
+            .map_err(|e| ApiError::internal(format!("Failed to persist provider selection: {e}")))?;
 
-    // Reload config from disk and sync to active engines. This matches
-    // `POST /v1/config/reload` exactly: load → validate thread routes →
-    // swap in the new config. A failure here means an active thread's
-    // route is invalid under the new provider — surface it so the GUI can
-    // tell the user to fix their config.
-    let mut reloaded = Config::load(state.config_path.clone(), state.config_profile.as_deref())
-        .map_err(|e| ApiError::internal(format!("Failed to reload config: {e}")))?;
-    reloaded.account_model_access = state.config.read().account_model_access.clone();
-    state
-        .runtime_threads
-        .reload_config(reloaded.clone())
+            // Reload config from disk and sync to active engines. This matches
+            // `POST /v1/config/reload` exactly: load → validate thread routes →
+            // swap in the new config. A failure here means an active thread's
+            // route is invalid under the new provider — surface it so the GUI can
+            // tell the user to fix their config.
+            let applied =
+                match Config::load(state.config_path.clone(), state.config_profile.as_deref()) {
+                    Ok(mut reloaded) => {
+                        reloaded.account_model_access =
+                            state.config.read().account_model_access.clone();
+                        match runtime.block_on(state.runtime_threads.reload_config(reloaded.clone())) {
+                            Ok(_) => Ok(reloaded),
+                            Err(err) => Err(ApiError::bad_request(format!(
+                                "Config reload rejected: {err}"
+                            ))),
+                        }
+                    }
+                    Err(e) => Err(ApiError::internal(format!("Failed to reload config: {e}"))),
+                };
+            match applied {
+                // Report the route this switch applied, not whatever a later
+                // switch leaves in `state.config` by the time this reply is built.
+                Ok(reloaded) => {
+                    let provider = reloaded.api_provider();
+                    let model = provider_default_model_for_api(&reloaded, provider, provider);
+                    *state.config.write() = reloaded;
+                    Ok::<_, ApiError>((provider, model))
+                }
+                // A rejected switch must not stay on disk, or the next restart or
+                // reload silently applies the switch this response reports as
+                // refused. Only this save is taken back; a newer one wins.
+                Err(mut error) => {
+                    let path = config_toml.display();
+                    match undo.undo() {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            error.message = format!(
+                                "{}; {path} changed after this switch was saved, so the newer contents were kept",
+                                error.message
+                            );
+                        }
+                        Err(restore) => {
+                            error.message = format!(
+                                "{}; the provider selection could not be reverted in {path}: {restore}",
+                                error.message
+                            );
+                        }
+                    }
+                    Err(error)
+                }
+            }
+        })
         .await
-        .map_err(|err| ApiError::bad_request(format!("Config reload rejected: {err}")))?;
-    {
-        let mut config = state.config.write();
-        *config = reloaded;
-    }
-
-    // Read the resolved active model + provider from the freshly reloaded
-    // config. This is the value the GUI must display — NOT the catalog
-    // default and NOT the previously-active model.
-    let (active_provider, active_model) = {
-        let config = state.config.read();
-        let provider = config.api_provider();
-        (
-            provider,
-            provider_default_model_for_api(&config, provider, provider),
-        )
-    };
+        .map_err(|_| ApiError::internal("provider switch blocking task failed"))?
+    })
+    .await
+    .map_err(|_| ApiError::internal("provider switch task failed"))??;
 
     let model_available = !active_model.is_empty();
     // Name the route the user selected, not the kind it routes through: a
@@ -9861,7 +10692,8 @@ fn memory_hit_to_record(
 }
 
 /// Resolve a scope query parameter into a `MemoryScope` filter and an
-/// optional workspace_id.  `"all"` / absent → `(None, None)`.
+/// optional workspace_id. `"all"` / absent → `(None, None)`: each caller
+/// decides what "all" spans (see `list_memory` and `clear_memory`).
 fn resolve_memory_scope(
     scope_param: &Option<String>,
     workspace: &FsPath,
@@ -9871,10 +10703,15 @@ fn resolve_memory_scope(
         "global" => Ok((Some(crate::native_memory::MemoryScope::Global), None)),
         "workspace" => {
             let workspace_id = crate::native_memory::NativeMemoryStore::workspace_id(workspace)
-                .map_err(|e| ApiError::internal(format!("resolve workspace id: {e}")))?;
+                .map_err(|e| ApiError::internal(format!("resolve workspace id: {e}")))?
+                .ok_or_else(|| {
+                    ApiError::bad_request(
+                        "workspace scope requires a git repository with a remote origin",
+                    )
+                })?;
             Ok((
                 Some(crate::native_memory::MemoryScope::Workspace),
-                workspace_id,
+                Some(workspace_id),
             ))
         }
         other => Err(ApiError::bad_request(format!(
@@ -9887,7 +10724,8 @@ fn resolve_memory_scope(
 /// filtering.
 ///
 /// Query params:
-/// - `scope` — `"global"`, `"workspace"`, or `"all"` (default)
+/// - `scope` — `"global"`, `"workspace"`, or `"all"` (default: global memory
+///   plus this repository's workspace memory)
 /// - `q` — FTS search query (max 256 chars; omit to list all)
 /// - `limit` — max results (default 50, max 200)
 async fn list_memory(
@@ -9908,7 +10746,17 @@ async fn list_memory(
 
     let store = native_store_for_state(&state);
     let root = store.root().to_path_buf();
-    let (scope_filter, workspace_id) = resolve_memory_scope(&query.scope, &state.workspace)?;
+    let (scope_filter, mut workspace_id) = resolve_memory_scope(&query.scope, &state.workspace)?;
+    if scope_filter.is_none() {
+        // "all" is global memory plus this repository's. With no identity
+        // (no origin remote, or git unavailable) there is no workspace memory
+        // to show, and the listing still serves global memory.
+        workspace_id = crate::native_memory::NativeMemoryStore::workspace_id(&state.workspace)
+            .unwrap_or_else(|error| {
+                tracing::warn!("memory list shows global memory only: {error}");
+                None
+            });
+    }
 
     let hits = if let Some(ref q) = query.q {
         let q = q.trim();
@@ -9916,6 +10764,9 @@ async fn list_memory(
             return Err(ApiError::bad_request("q must be 1–256 characters"));
         }
         match scope_filter {
+            None if workspace_id.is_some() => {
+                store.search_in_workspace(workspace_id.as_deref(), &state.workspace, q, limit)
+            }
             None => store.search(q, limit),
             Some(crate::native_memory::MemoryScope::Global) => store.search(q, limit).map(|h| {
                 h.into_iter()
@@ -10011,7 +10862,9 @@ async fn create_memory_entry(
 /// `DELETE /v1/memory` — clear all memory entries for the given scope.
 ///
 /// The `scope` query parameter is required: `"global"`, `"workspace"`, or
-/// `"all"`.  This is a destructive, non-reversible operation.
+/// `"all"`. `"all"` clears every local scope, including other repositories'
+/// workspace memory, which is wider than what `GET` lists for `"all"`. This
+/// is a destructive, non-reversible operation.
 async fn clear_memory(
     State(state): State<RuntimeApiState>,
     Query(query): Query<ClearMemoryQuery>,
@@ -10025,6 +10878,28 @@ async fn clear_memory(
 }
 
 const MOBILE_HTML: &str = include_str!("runtime_mobile.html");
+
+// Only stream statuses are localized here; the rest of the mobile shell is
+// still English. Reload the page after changing the Runtime's UI locale.
+fn mobile_html(locale: codewhale_localization::Locale) -> String {
+    use codewhale_localization::{MessageId, tr};
+
+    let messages = json!({
+        "replay_failed": tr(locale, MessageId::MobileStreamReplayFailed),
+        "catch_up_failed": tr(locale, MessageId::MobileStreamCatchUpFailed),
+        "runtime_shutdown": tr(locale, MessageId::MobileStreamRuntimeShutdown),
+        "ended": tr(locale, MessageId::MobileStreamEnded),
+        "closed": tr(locale, MessageId::MobileStreamClosed),
+        "reconnecting": tr(locale, MessageId::MobileStreamReconnecting),
+        "connected": tr(locale, MessageId::MobileStreamConnected),
+    });
+    // JSON quoting protects JS strings; escaping '<' also prevents a catalog
+    // value from closing the enclosing script element.
+    MOBILE_HTML.replace(
+        "__CODEWHALE_STREAM_MESSAGES__",
+        &messages.to_string().replace('<', "\\u003c"),
+    )
+}
 
 /// Built-in dev origins always allowed by the runtime API (whalescale#255).
 const DEFAULT_CORS_ORIGINS: &[&str] = &[
@@ -10058,6 +10933,7 @@ fn cors_layer(extra_origins: &[String]) -> CorsLayer {
         .allow_methods([
             Method::GET,
             Method::POST,
+            Method::PUT,
             Method::PATCH,
             Method::DELETE,
             Method::OPTIONS,
@@ -10069,6 +10945,10 @@ fn cors_layer(extra_origins: &[String]) -> CorsLayer {
             header::IF_MATCH,
             HeaderName::from_static("x-codewhale-runtime-token"),
             HeaderName::from_static("x-deepseek-runtime-token"),
+        ])
+        .expose_headers([
+            HeaderName::from_static("x-codewhale-stream-end"),
+            HeaderName::from_static("x-codewhale-event-progress"),
         ])
 }
 
@@ -10147,6 +11027,9 @@ fn map_agent_mail_err(err: anyhow::Error) -> ApiError {
 struct ApiError {
     status: StatusCode,
     message: String,
+    /// Stable machine-readable reason, serialized as `error.code` when set,
+    /// for refusals a client must branch on rather than show.
+    code: Option<&'static str>,
 }
 
 impl ApiError {
@@ -10154,6 +11037,7 @@ impl ApiError {
         Self {
             status: StatusCode::BAD_REQUEST,
             message: message.into(),
+            code: None,
         }
     }
 
@@ -10161,6 +11045,7 @@ impl ApiError {
         Self {
             status: StatusCode::NOT_FOUND,
             message: message.into(),
+            code: None,
         }
     }
 
@@ -10168,6 +11053,7 @@ impl ApiError {
         Self {
             status: StatusCode::CONFLICT,
             message: message.into(),
+            code: None,
         }
     }
 
@@ -10175,6 +11061,7 @@ impl ApiError {
         Self {
             status: StatusCode::NOT_IMPLEMENTED,
             message: message.into(),
+            code: None,
         }
     }
 
@@ -10182,6 +11069,7 @@ impl ApiError {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             message: message.into(),
+            code: None,
         }
     }
 
@@ -10189,6 +11077,7 @@ impl ApiError {
         Self {
             status: StatusCode::FORBIDDEN,
             message: message.into(),
+            code: None,
         }
     }
 
@@ -10196,7 +11085,21 @@ impl ApiError {
         Self {
             status: StatusCode::PAYLOAD_TOO_LARGE,
             message: message.into(),
+            code: None,
         }
+    }
+
+    fn gone(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::GONE,
+            message: message.into(),
+            code: None,
+        }
+    }
+
+    fn with_code(mut self, code: &'static str) -> Self {
+        self.code = Some(code);
+        self
     }
 }
 
@@ -10204,12 +11107,21 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         (
             self.status,
-            Json(json!({
-                "error": {
-                    "message": self.message,
-                    "status": self.status.as_u16(),
-                }
-            })),
+            Json(match self.code {
+                Some(code) => json!({
+                    "error": {
+                        "message": self.message,
+                        "status": self.status.as_u16(),
+                        "code": code,
+                    }
+                }),
+                None => json!({
+                    "error": {
+                        "message": self.message,
+                        "status": self.status.as_u16(),
+                    }
+                }),
+            }),
         )
             .into_response()
     }
@@ -10331,6 +11243,9 @@ base_url = "http://127.0.0.1:9/v1"
             mcp_pool: Arc::new(Mutex::new(None)),
             lsp_manager: Arc::new(std::sync::OnceLock::new()),
             computer: computer_display::ComputerState::from_env(),
+            shutdown: RuntimeServerShutdown::default(),
+            git_writes: Arc::new(tokio::sync::Mutex::new(())),
+            provider_switches: Arc::new(tokio::sync::Mutex::new(())),
             compat_stream_test_hook: None,
         };
         let router = build_router(state.clone());

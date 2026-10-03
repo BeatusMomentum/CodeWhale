@@ -404,6 +404,27 @@ impl ModalView for UserInputView {
         }
     }
 
+    /// A pasted custom answer lands in the free-text field (U08-m1); while
+    /// choosing among options the paste is not consumed. Line breaks become
+    /// spaces because Enter submits this single-line answer.
+    fn handle_paste(&mut self, text: &str) -> bool {
+        if self.mode != InputMode::OtherInput {
+            return false;
+        }
+        self.other_input.extend(
+            text.chars()
+                .map(|ch| {
+                    if matches!(ch, '\n' | '\r' | '\t') {
+                        ' '
+                    } else {
+                        ch
+                    }
+                })
+                .filter(|ch| !ch.is_control()),
+        );
+        true
+    }
+
     fn handle_mouse(&mut self, mouse: MouseEvent) -> ViewAction {
         let scroll = match mouse.kind {
             MouseEventKind::ScrollUp => self.scroll_offset.get().saturating_sub(3),

@@ -30,6 +30,12 @@ const MAX_PHASE_SUMMARY: usize = 6;
 const MAX_DISPATCH_FAILURES_RETAINED: usize = 12;
 /// Rejected dispatches shown at once in the live panel/history body.
 const MAX_VISIBLE_DISPATCH_FAILURES: usize = 3;
+/// Columns the transcript card header gives its summary
+/// (`history::constants::TOOL_HEADER_SUMMARY_LIMIT`); the finish line's facts
+/// are fitted to it so the header never cuts the counts.
+const FINISH_FACTS_COLS: usize = 72;
+/// The title keeps at least this much of itself on the finish line.
+const MIN_FINISH_TITLE_COLS: usize = 16;
 
 /// Lifecycle of the active (or most recently completed) workflow run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -393,8 +399,8 @@ impl WorkflowPanelDispatchFailure {
                 .collect::<Vec<_>>()
                 .join(" ")
         };
-        let label = label.map(&bounded).filter(|value| !value.is_empty());
-        let phase = phase.map(&bounded).filter(|value| !value.is_empty());
+        let label = label.map(bounded).filter(|value| !value.is_empty());
+        let phase = phase.map(bounded).filter(|value| !value.is_empty());
         let message = bounded(message);
         Self {
             label,
@@ -496,6 +502,10 @@ pub enum WorkflowPanelEvent {
         status: WorkflowRowStatus,
         /// Terminal usage receipt carried by this event, if any (#4039).
         usage: Option<WorkflowRowUsage>,
+        /// Why a failed or cancelled task ended (`reason` on the wire). The
+        /// run's own error is often an aggregate ("all 2 task(s) failed"); the
+        /// task's reason is the cause a person can act on.
+        reason: Option<String>,
         at_ms: u64,
     },
     GateUpdated {
@@ -548,11 +558,13 @@ impl WorkflowPanelEvent {
                 at_ms,
             }),
             "run_completed" => {
+                // A terminal receipt without a readable status is not
+                // evidence of success; it fails closed like an unknown one.
                 let status = value
                     .get("status")
                     .and_then(Value::as_str)
                     .map(lifecycle_from_status)
-                    .unwrap_or(WorkflowPanelLifecycle::Succeeded);
+                    .unwrap_or(WorkflowPanelLifecycle::Failed);
                 Some(Self::RunCompleted {
                     status,
                     error: opt_str(value, "error"),
@@ -585,15 +597,25 @@ impl WorkflowPanelEvent {
                 at_ms,
             }),
             "task_completed" => {
+                // Like `run_completed`: a missing status, or a completion
+                // receipt that still says running/pending, is contradictory
+                // and fails closed rather than leaving a live-looking row.
                 let status = value
                     .get("status")
                     .and_then(Value::as_str)
                     .map(WorkflowRowStatus::from_ir_status)
-                    .unwrap_or(WorkflowRowStatus::Succeeded);
+                    .filter(|status| {
+                        !matches!(
+                            status,
+                            WorkflowRowStatus::Running | WorkflowRowStatus::Pending
+                        )
+                    })
+                    .unwrap_or(WorkflowRowStatus::Failed);
                 Some(Self::TaskCompleted {
                     task_id: opt_str(value, "task_id")?,
                     status,
                     usage: value.get("usage").and_then(usage_from_json),
+                    reason: opt_str(value, "reason").or_else(|| opt_str(value, "error")),
                     at_ms,
                 })
             }
@@ -1373,6 +1395,27 @@ impl WorkflowPanel {
                 token_budget,
                 at_ms,
             } => {
+                // A repeated or replayed start of this same run never resets
+                // it: rebuilding would erase settled rows and a terminal
+                // outcome (U05-01). It names the run (its goal is fixed for
+                // the run) and fills only what the panel still lacks, such as
+                // the start time of a placeholder opened by a late event.
+                if run_id == self.run_id {
+                    if let Some(label) = workflow_goal.or(workflow_id) {
+                        self.label = label;
+                    }
+                    if self.started_at_ms == 0 {
+                        self.started_at_ms = at_ms;
+                    }
+                    if self.budget_total.is_none() {
+                        self.budget_total = token_budget;
+                        self.budget_remaining = token_budget;
+                    }
+                    if self.source_path.is_none() {
+                        self.source_path = source_path;
+                    }
+                    return;
+                }
                 // New run replaces preserved completed state.
                 let locale = self.locale;
                 *self = Self::new(
@@ -1398,8 +1441,10 @@ impl WorkflowPanel {
                 if self.lifecycle == WorkflowPanelLifecycle::Cancelled {
                     return;
                 }
-                self.lifecycle = if matches!(status, WorkflowPanelLifecycle::Running) {
-                    WorkflowPanelLifecycle::Succeeded
+                // A completion receipt that still says running/pending is
+                // contradictory, not a success.
+                self.lifecycle = if status.is_running() {
+                    WorkflowPanelLifecycle::Failed
                 } else {
                     status
                 };
@@ -1431,13 +1476,22 @@ impl WorkflowPanel {
                 route,
                 at_ms,
             } => {
+                // A settled run is final. A child launch that raced the
+                // cancel (or any late same-run start) is recorded, but it
+                // never reopens the run or resets a row that already settled.
+                let settled = self.lifecycle.is_terminal();
+                if settled && self.find_row_mut(&task_id).is_some() {
+                    return;
+                }
                 if self.phases.is_empty() {
                     self.phases.push(WorkflowPanelPhase::new("Work"));
                     self.selected_phase = 0;
                 }
-                let phase_idx = self.selected_phase.min(self.phases.len().saturating_sub(1));
+                // Tasks join the runtime's newest phase. `selected_phase` is
+                // the render cursor and never routes an arriving task.
+                let phase_idx = self.phases.len().saturating_sub(1);
                 let display_model = resolved_model.or(model);
-                let row = WorkflowPanelRow {
+                let mut row = WorkflowPanelRow {
                     task_id: task_id.clone(),
                     label: label
                         .filter(|s| !s.trim().is_empty())
@@ -1455,22 +1509,36 @@ impl WorkflowPanel {
                     route: *route,
                     usage: None,
                 };
+                if self.lifecycle == WorkflowPanelLifecycle::Cancelled {
+                    // Same finalization the cancel applied to running rows.
+                    row.status = WorkflowRowStatus::Cancelled;
+                    row.completed_at_ms = Some(at_ms);
+                    row.usage = Some(WorkflowRowUsage::default());
+                }
                 if let Some(existing) = self.find_row_mut(&task_id) {
                     *existing = row;
                 } else if let Some(phase) = self.phases.get_mut(phase_idx) {
                     phase.rows.push(row);
                 }
-                self.lifecycle = WorkflowPanelLifecycle::Running;
+                if !settled {
+                    self.lifecycle = WorkflowPanelLifecycle::Running;
+                }
             }
             WorkflowPanelEvent::TaskCompleted {
                 task_id,
                 status,
                 usage,
+                reason,
                 at_ms,
             } => {
                 if let Some(row) = self.find_row_mut(&task_id) {
                     row.status = status;
                     row.completed_at_ms = Some(at_ms);
+                    if (status.is_failure() || status.is_cancel())
+                        && let Some(reason) = reason.filter(|text| !text.trim().is_empty())
+                    {
+                        row.error = Some(reason);
+                    }
                     // A completed row always carries a usage receipt, even when
                     // every counter in it is unknown (#4039).
                     row.usage = Some(usage.unwrap_or_default());
@@ -1508,7 +1576,7 @@ impl WorkflowPanel {
                     if self.phases.is_empty() {
                         self.phases.push(WorkflowPanelPhase::new("Work"));
                     }
-                    let phase_idx = self.selected_phase.min(self.phases.len().saturating_sub(1));
+                    let phase_idx = self.phases.len().saturating_sub(1);
                     if let Some(phase) = self.phases.get_mut(phase_idx) {
                         phase.rows.push(WorkflowPanelRow {
                             task_id,
@@ -1660,8 +1728,11 @@ impl WorkflowPanel {
     }
 
     /// The transcript's finish line for a settled run: the state word, the
-    /// facts (`name · 3/5 agents · 2m 14s · ↓1.2M`), and the result or the
-    /// reason it stopped. `None` while the run is live.
+    /// facts (`name · 1/3 done · 2 failed · 2m 14s · ↓1.2M`), and the result
+    /// or the one reason it fell short. The name is the goal's first sentence
+    /// and the reason is a first sentence too; the full goal, every agent's
+    /// error and the run's own error stay on the expanded card. `None` while
+    /// the run is live.
     #[must_use]
     pub fn finish_line(&self) -> Option<(String, String, Option<String>)> {
         let state = match self.lifecycle {
@@ -1671,35 +1742,39 @@ impl WorkflowPanel {
             WorkflowPanelLifecycle::Failed => MessageId::WorkflowLineFailed,
             WorkflowPanelLifecycle::Cancelled => MessageId::WorkflowLineStopped,
         };
-        let (_, total) = self.done_total();
-        let finished = self
-            .phases
-            .iter()
-            .flat_map(|phase| phase.rows.iter())
-            .filter(|row| row.status == WorkflowRowStatus::Succeeded)
-            .count();
-        let mut facts = vec![self.label.split_whitespace().collect::<Vec<_>>().join(" ")];
-        if total > 0 {
-            facts.push(
-                tr(self.locale, MessageId::WorkflowLineAgents)
-                    .replace("{done}", &finished.to_string())
-                    .replace("{total}", &total.to_string()),
-            );
+        let (_, _, _, total) = self.row_outcomes();
+        let mut rest = Vec::new();
+        if total > 0 || self.dispatch_failure_count > 0 {
+            rest.push(self.outcome_counts_text());
         }
-        facts.push(self.elapsed_label());
+        rest.push(self.elapsed_label());
         if let Some(tokens) = self.tokens_so_far() {
-            facts.push(format!(
+            rest.push(format!(
                 "↓{}",
                 crate::tui::footer_ui::format_token_count_compact(tokens)
             ));
         }
+        // The title gives way, at a word boundary, so the counts and elapsed
+        // are never the part the card header cuts off.
+        let rest = rest.join(" · ");
+        let title_cols = FINISH_FACTS_COLS
+            .saturating_sub(rest.width() + 3)
+            .max(MIN_FINISH_TITLE_COLS);
+        let facts = [
+            crate::tui::ui_text::semantic_truncate(&self.short_title(), title_cols),
+            rest,
+        ];
         let detail = match self.lifecycle {
-            WorkflowPanelLifecycle::Failed | WorkflowPanelLifecycle::Cancelled => {
-                self.error.clone().or_else(|| self.result_summary.clone())
-            }
-            _ => self.result_summary.clone().or_else(|| self.error.clone()),
+            WorkflowPanelLifecycle::Succeeded | WorkflowPanelLifecycle::Degraded => self
+                .result_summary
+                .clone()
+                .map(|text| text.split_whitespace().collect::<Vec<_>>().join(" "))
+                .or_else(|| self.outcome_reason())
+                .or_else(|| self.error.as_deref().map(first_sentence)),
+            _ => self
+                .outcome_reason()
+                .or_else(|| self.result_summary.as_deref().map(first_sentence)),
         }
-        .map(|text| text.split_whitespace().collect::<Vec<_>>().join(" "))
         .filter(|text| !text.is_empty());
         Some((
             tr(self.locale, state).into_owned(),
@@ -1742,6 +1817,111 @@ impl WorkflowPanel {
             }
         }
         (failed, cancelled)
+    }
+
+    /// Rows by outcome: `(succeeded, failed, cancelled, total)`. Rejected
+    /// dispatches are not rows, so they are not in these counts.
+    #[must_use]
+    pub fn row_outcomes(&self) -> (usize, usize, usize, usize) {
+        self.phases.iter().map(WorkflowPanelPhase::counts).fold(
+            (0, 0, 0, 0),
+            |acc, (done, running, failed, cancelled)| {
+                (
+                    acc.0 + done,
+                    acc.1 + failed,
+                    acc.2 + cancelled,
+                    acc.3 + done + running + failed + cancelled,
+                )
+            },
+        )
+    }
+
+    /// The run's name on one-line surfaces: the goal's first sentence. The
+    /// full goal stays on the expanded card, so a paragraph-long goal is not
+    /// the title of every row that names the run.
+    #[must_use]
+    pub fn short_title(&self) -> String {
+        let title = first_sentence(&self.label);
+        if title.is_empty() {
+            "workflow".to_string()
+        } else {
+            title
+        }
+    }
+
+    /// `k/n done · m failed · c cancelled`: what finished, and what did not.
+    /// Only the done count is always there; a failed or cancelled count shows
+    /// only when it is not zero. Settled-but-failed agents never count as done.
+    #[must_use]
+    pub fn outcome_counts_text(&self) -> String {
+        let (succeeded, _, _, total) = self.row_outcomes();
+        let (failed, cancelled) = self.failure_cancel_counts();
+        let mut parts = Vec::new();
+        if total > 0 {
+            parts.push(
+                tr(self.locale, MessageId::WorkflowSettledOfTotal)
+                    .replace("{done}", &succeeded.to_string())
+                    .replace("{total}", &total.to_string()),
+            );
+        } else if failed == 0 {
+            parts.push(tr(self.locale, MessageId::WorkflowNoTasksYet).into_owned());
+        }
+        if failed > 0 {
+            parts.push(count_text(
+                self.locale,
+                MessageId::WorkflowCountFailed,
+                failed,
+            ));
+        }
+        if cancelled > 0 {
+            parts.push(count_text(
+                self.locale,
+                MessageId::WorkflowCountCancelled,
+                cancelled,
+            ));
+        }
+        parts.join(" · ")
+    }
+
+    /// The one reason worth showing for a run that settled short of success,
+    /// as its first sentence. When nothing succeeded, a failed agent's own
+    /// reason ("Authorization failed: …") beats the run's aggregate ("no task
+    /// produced a result: all 2 task(s) failed …"): it is the cause a person
+    /// can act on. `None` for a live or fully successful run.
+    #[must_use]
+    pub fn outcome_reason(&self) -> Option<String> {
+        let row_reason = || {
+            self.phases
+                .iter()
+                .flat_map(|phase| phase.rows.iter())
+                .filter(|row| row.status.is_failure())
+                .find_map(|row| row.error.as_deref().or(row.schema_error.as_deref()))
+                .map(str::to_string)
+                .or_else(|| {
+                    self.dispatch_failures
+                        .first()
+                        .map(|failure| failure.message.clone())
+                })
+        };
+        let run_error = || self.error.clone();
+        let reason = match self.lifecycle {
+            WorkflowPanelLifecycle::Pending
+            | WorkflowPanelLifecycle::Running
+            | WorkflowPanelLifecycle::Succeeded => return None,
+            WorkflowPanelLifecycle::Cancelled => run_error(),
+            WorkflowPanelLifecycle::Degraded => row_reason().or_else(run_error),
+            WorkflowPanelLifecycle::Failed => {
+                let (succeeded, _, _, _) = self.row_outcomes();
+                if succeeded == 0 {
+                    row_reason().or_else(run_error)
+                } else {
+                    run_error().or_else(row_reason)
+                }
+            }
+        };
+        reason
+            .map(|text| first_sentence(strip_error_tag(&text)))
+            .filter(|text| !text.is_empty())
     }
 
     fn record_dispatch_failure(
@@ -1924,6 +2104,47 @@ fn lifecycle_from_status(status: &str) -> WorkflowPanelLifecycle {
         "pending" => WorkflowPanelLifecycle::Pending,
         _ => WorkflowPanelLifecycle::Failed,
     }
+}
+
+/// Drop a leading error-taxonomy tag (`[auth] `, `[rate_limit] `): the
+/// sentence after it already says what kind of failure it was, and a one-row
+/// surface has no columns to spare. The full error keeps its tag.
+fn strip_error_tag(text: &str) -> &str {
+    let trimmed = text.trim_start();
+    trimmed
+        .strip_prefix('[')
+        .and_then(|rest| rest.split_once("] "))
+        .filter(|(tag, _)| {
+            !tag.is_empty()
+                && tag.len() <= 24
+                && tag
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+        })
+        .map_or(trimmed, |(_, rest)| rest)
+}
+
+/// The first sentence of `text`, whitespace-flattened, without its closing
+/// full stop. A sentence ends at `.`, `!` or `?` followed by whitespace, or at
+/// `;` — so `v0.10.1.` inside a sentence and `a.rs` never split it. Nothing is
+/// cut mid-word: the caller truncates, at a word boundary, only what does not
+/// fit.
+pub(crate) fn first_sentence(text: &str) -> String {
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut end = flat.len();
+    let mut chars = flat.char_indices().peekable();
+    while let Some((index, ch)) = chars.next() {
+        let next_is_space = chars.peek().is_some_and(|(_, next)| *next == ' ');
+        if ch == ';' || (matches!(ch, '.' | '!' | '?') && next_is_space) {
+            end = if ch == '.' || ch == ';' {
+                index
+            } else {
+                index + ch.len_utf8()
+            };
+            break;
+        }
+    }
+    flat[..end].trim_end_matches(['.', ' ']).trim().to_string()
 }
 
 /// `{count} running`-style labelled count.
@@ -2537,6 +2758,101 @@ mod tests {
         );
     }
 
+    /// U05-01: a child launch that raced the cancel (or any late same-run
+    /// `task_started`) lands after the run settled. It is recorded, but it
+    /// never reopens the run, and a settled row is never reset to running.
+    #[test]
+    fn late_task_started_never_reopens_a_settled_run() {
+        let mut panel = started_panel();
+        panel.apply_json_event(&json!({
+            "type": "run_cancelled", "run_id": "workflow_abc",
+            "reason": "stopped by you", "at_ms": 2_000,
+        }));
+        panel.apply_json_event(&task_started_json("t2", "deepseek", "flash"));
+        panel.apply_json_event(&task_started_json("t1", "deepseek", "flash"));
+        assert_eq!(panel.lifecycle, WorkflowPanelLifecycle::Cancelled);
+        assert_eq!(
+            panel.find_row_mut("t1").expect("t1").status,
+            WorkflowRowStatus::Cancelled
+        );
+        assert_eq!(
+            panel
+                .find_row_mut("t2")
+                .expect("late t2 is recorded")
+                .status,
+            WorkflowRowStatus::Cancelled
+        );
+
+        let mut panel = started_panel();
+        panel.apply_json_event(&json!({
+            "type": "task_completed", "run_id": "workflow_abc",
+            "task_id": "t1", "status": "succeeded", "at_ms": 1_500,
+        }));
+        panel.apply_json_event(&json!({
+            "type": "run_completed", "run_id": "workflow_abc",
+            "status": "completed", "at_ms": 1_600,
+        }));
+        panel.apply_json_event(&task_started_json("t1", "deepseek", "flash"));
+        assert_eq!(panel.lifecycle, WorkflowPanelLifecycle::Succeeded);
+        assert_eq!(
+            panel.find_row_mut("t1").expect("t1").status,
+            WorkflowRowStatus::Succeeded
+        );
+    }
+
+    /// U05-m1: an arriving task joins the runtime's newest phase, never the
+    /// phase the user's cursor happens to rest on.
+    #[test]
+    fn arriving_task_joins_the_newest_phase_not_the_selected_one() {
+        let mut panel = started_panel();
+        panel.apply_event(WorkflowPanelEvent::PhaseStarted {
+            title: "Verify".to_string(),
+            at_ms: 1_300,
+        });
+        panel.selected_phase = 0;
+        panel.apply_json_event(&task_started_json("t2", "deepseek", "flash"));
+        let ids = |phase: &WorkflowPanelPhase| {
+            phase
+                .rows
+                .iter()
+                .map(|row| row.task_id.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids(&panel.phases[0]), ["t1"]);
+        assert_eq!(ids(&panel.phases[1]), ["t2"]);
+    }
+
+    /// U05-02: a terminal receipt with a missing or contradictory status is
+    /// not evidence of success; it fails closed like an unknown status.
+    #[test]
+    fn malformed_completion_status_never_reads_as_success() {
+        for status in [None, Some("running"), Some("pending")] {
+            let mut panel = started_panel();
+            let mut completed = json!({
+                "type": "run_completed", "run_id": "workflow_abc", "at_ms": 2_000,
+            });
+            let mut task_completed = json!({
+                "type": "task_completed", "run_id": "workflow_abc",
+                "task_id": "t1", "at_ms": 1_900,
+            });
+            if let Some(status) = status {
+                completed["status"] = json!(status);
+                task_completed["status"] = json!(status);
+            }
+            panel.apply_json_event(&task_completed);
+            panel.apply_json_event(&completed);
+            assert_eq!(
+                panel.lifecycle,
+                WorkflowPanelLifecycle::Failed,
+                "{status:?}"
+            );
+            assert_eq!(
+                panel.find_row_mut("t1").expect("row").status,
+                WorkflowRowStatus::Failed
+            );
+        }
+    }
+
     /// #4208: every decorative glyph the run map emits — expand marks, role
     /// marks, lane glyphs, gates, status marks across running, waiting,
     /// failed, cancelled, and completed members — must narrow to an
@@ -2568,6 +2884,7 @@ mod tests {
                 task_id: task_id.to_string(),
                 status,
                 usage: None,
+                reason: None,
                 at_ms: 2_500,
             });
         }
@@ -2597,6 +2914,40 @@ mod tests {
                 ch as u32
             );
         }
+    }
+
+    #[test]
+    fn a_repeated_start_of_the_same_run_keeps_settled_rows_and_outcome() {
+        let mut panel = started_panel();
+        panel.apply_event(WorkflowPanelEvent::TaskCompleted {
+            task_id: "t1".to_string(),
+            status: WorkflowRowStatus::Succeeded,
+            usage: None,
+            reason: None,
+            at_ms: 1_400,
+        });
+        panel.apply_event(WorkflowPanelEvent::RunCompleted {
+            status: WorkflowPanelLifecycle::Succeeded,
+            error: None,
+            at_ms: 1_500,
+        });
+        let rows = |panel: &WorkflowPanel| panel.phases.iter().map(|p| p.rows.len()).sum::<usize>();
+        let settled_rows = rows(&panel);
+        assert!(settled_rows > 0);
+        assert!(panel.apply_json_event(&json!({
+            "type": "run_started",
+            "run_id": "workflow_abc",
+            "at_ms": 1_600,
+            "workflow_goal": "ship v0.8.68",
+            "token_budget": 9_000
+        })));
+        assert_eq!(panel.lifecycle, WorkflowPanelLifecycle::Succeeded);
+        assert_eq!(rows(&panel), settled_rows);
+        assert_eq!(
+            panel.budget_total,
+            Some(9_000),
+            "missing metadata is filled"
+        );
     }
 
     #[test]
@@ -2692,12 +3043,14 @@ mod tests {
             task_id: "t1".to_string(),
             status: WorkflowRowStatus::Failed,
             usage: None,
+            reason: None,
             at_ms: 1_400,
         });
         panel.apply_event(WorkflowPanelEvent::TaskCompleted {
             task_id: "t2".to_string(),
             status: WorkflowRowStatus::Cancelled,
             usage: None,
+            reason: None,
             at_ms: 1_500,
         });
         let (failed, cancelled) = panel.failure_cancel_counts();
@@ -3006,6 +3359,7 @@ mod tests {
             task_id: "t1".to_string(),
             status: WorkflowRowStatus::Failed,
             usage: None,
+            reason: None,
             at_ms: 2_000,
         });
         panel.apply_event(WorkflowPanelEvent::RunCompleted {
@@ -3048,6 +3402,7 @@ mod tests {
             task_id: "t1".to_string(),
             status: WorkflowRowStatus::Failed,
             usage: None,
+            reason: None,
             at_ms: 2_000,
         });
         if let Some(row) = panel.find_row_mut("t1") {
@@ -3222,6 +3577,7 @@ mod tests {
                 task_id: id.to_string(),
                 status: WorkflowRowStatus::Succeeded,
                 usage: None,
+                reason: None,
                 at_ms: 1_500,
             });
         }
@@ -3245,6 +3601,7 @@ mod tests {
             task_id: "t4".to_string(),
             status: WorkflowRowStatus::Succeeded,
             usage: None,
+            reason: None,
             at_ms: 2_000,
         });
         panel.apply_event(WorkflowPanelEvent::RunCompleted {
@@ -3331,6 +3688,7 @@ mod tests {
             task_id: "impl".to_string(),
             status: WorkflowRowStatus::Succeeded,
             usage: None,
+            reason: None,
             at_ms: 2_000,
         });
         panel.apply_event(WorkflowPanelEvent::PhaseStarted {
@@ -3353,6 +3711,7 @@ mod tests {
             task_id: "ver".to_string(),
             status: WorkflowRowStatus::Succeeded,
             usage: None,
+            reason: None,
             at_ms: 3_000,
         });
         panel.apply_event(WorkflowPanelEvent::RunCompleted {
@@ -3428,6 +3787,7 @@ mod tests {
                 task_id: id.to_string(),
                 status,
                 usage: None,
+                reason: None,
                 at_ms: 1_500,
             });
         }
@@ -3454,6 +3814,7 @@ mod tests {
             task_id: "syn".to_string(),
             status: WorkflowRowStatus::Succeeded,
             usage: None,
+            reason: None,
             at_ms: 2_000,
         });
         // Partial success at run level: completed with surviving synthesis.
@@ -3525,6 +3886,7 @@ mod tests {
             task_id: "slow-1".to_string(),
             status: WorkflowRowStatus::Succeeded,
             usage: None,
+            reason: None,
             at_ms: 1_500,
         });
 

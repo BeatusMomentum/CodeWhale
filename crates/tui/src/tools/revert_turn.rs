@@ -7,6 +7,12 @@
 //! index, so the model doesn't have to count entries.
 //!
 //! Approval is `Required` because this mutates the workspace.
+//!
+//! Known limit: like `/restore`, this is a whole-tree rollback. It restores
+//! every path to the pre-turn snapshot, so an edit made after that turn (the
+//! user's, or another session's) is overwritten too; it does not have the
+//! path scoping, changed-since refusal, uncapped lookup or fork-inherited
+//! restore points of `/undo` (#6644).
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -33,9 +39,9 @@ impl ToolSpec for RevertTurnTool {
     fn description(&self) -> &str {
         "Roll back the workspace files to the snapshot taken before a recent turn. \
          Use when the user explicitly asks to undo, revert, or roll back the most recent edits. \
-         `turn_offset` is 1-based: 1 reverts the most recent turn, 2 reverts the previous one, \
-         and so on (max 50). Conversation history is NOT modified — only working-tree files are \
-         restored from the side-git snapshot repo."
+         `turn_offset` is 1-based: 1 reverts the most recent turn (max 50). Conversation \
+         history is NOT modified. The whole workspace is restored, so later edits, including \
+         the user's own, are overwritten."
     }
 
     fn input_schema(&self) -> Value {

@@ -83,7 +83,7 @@ impl ToolSpec for GitTool {
                 "action": {
                     "type": "string",
                     "enum": ["status", "diff", "log", "show", "blame", "commit_plan", "fetch", "merge_tree"],
-                    "description": "Action to perform. commit_plan returns a proposed split of the working tree into dependency-ordered commits (rejecting cycles) and writes nothing; land each group with git add/commit. fetch updates remote-tracking refs from a configured remote only; merge_tree computes a merge result without touching the working tree."
+                    "description": "Action to perform. commit_plan returns a proposed split of the working tree into dependency-ordered commits (rejecting cycles) and writes nothing; land each group with git add/commit. merge_tree computes a merge result without touching the working tree."
                 },
                 "path": {
                     "type": "string",
@@ -144,7 +144,7 @@ impl ToolSpec for GitTool {
                 "refspecs": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": "Optional refspecs to fetch, e.g. pull/123/head (action=fetch). Empty fetches the remote's defaults."
+                    "description": "Optional refspecs to fetch, e.g. pull/123/head (action=fetch); a `src:dst` destination must be under refs/remotes/. Empty fetches the remote's defaults."
                 },
                 "ours": {
                     "type": "string",

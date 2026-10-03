@@ -19,6 +19,7 @@ const {
   assertChecksumManifestIncludes,
   assertPackageVersionMatchesBinaryVersion,
   assertReleaseAssetsFresh,
+  downloadJson,
   findReleaseWorkflowRun,
   parseChecksumManifest,
 } = require("../scripts/verify-release-assets");
@@ -307,4 +308,45 @@ test("full local release fixture satisfies the public asset inventory", () => {
   } finally {
     fs.rmSync(fixtureRoot, { recursive: true, force: true });
   }
+});
+
+test("downloadJson confines credentials to the GitHub API origin across redirects", async (t) => {
+  const https = require("node:https");
+  const { PassThrough } = require("node:stream");
+  const { EventEmitter } = require("node:events");
+  const previous = process.env.GITHUB_TOKEN;
+  process.env.GITHUB_TOKEN = "test-release-token";
+  t.after(() => {
+    if (previous === undefined) delete process.env.GITHUB_TOKEN;
+    else process.env.GITHUB_TOKEN = previous;
+  });
+  const calls = [];
+  const replies = [
+    { status: 302, location: "/next" },
+    { status: 302, location: "https://downloads.example.test/metadata" },
+    { status: 200 },
+    { status: 302, location: "http://downloads.example.test/metadata" },
+    { status: 302, location: "ftp://downloads.example.test/metadata" },
+    { status: 200 },
+  ];
+  t.mock.method(https, "get", (url, options, callback) => {
+    calls.push({ url, headers: options.headers });
+    const reply = replies.shift();
+    assert.ok(reply, "unexpected metadata request");
+    const res = new PassThrough();
+    res.statusCode = reply.status;
+    res.headers = reply.location ? { location: reply.location } : {};
+    process.nextTick(() => { callback(res); res.end("{}"); });
+    return new EventEmitter();
+  });
+  t.mock.method(require("node:http"), "get", () => { throw new Error("unexpected HTTP request"); });
+  assert.deepEqual(await downloadJson("https://api.github.com/start"), {});
+  assert.equal(calls[0].headers.Authorization, "Bearer test-release-token");
+  assert.equal(calls[1].headers.Authorization, "Bearer test-release-token");
+  assert.equal(calls[2].headers.Authorization, undefined);
+  await assert.rejects(downloadJson("https://api.github.com/downgrade"), /requires HTTPS/);
+  await assert.rejects(downloadJson("https://api.github.com/other-scheme"), /requires HTTPS/);
+  assert.deepEqual(await downloadJson("https://api.github.com:444/metadata"), {});
+  assert.equal(calls.at(-1).headers.Authorization, undefined);
+  assert.equal(calls.length, 6);
 });

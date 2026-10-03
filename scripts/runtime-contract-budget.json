@@ -9,39 +9,39 @@
         "identity_sha256": "5130806e324482a4b5ec28ae6fc408846b894844db9b7c38f3cfcf48e2ac63d8"
       },
       "goal": {
-        "bytes": 9427,
+        "bytes": 9415,
         "delta_bytes": 81,
-        "identity_sha256": "629b6e17a29e8d90c30e9c6b4ea3dcb5a0215c86e553f0dad4f06615eab10d9b"
+        "identity_sha256": "7f004aa61453193c3ad328efb86bc70ad57d86ee5f28af5e4cb05d228a18d817"
       },
       "handoff": {
-        "bytes": 9815,
+        "bytes": 9803,
         "delta_bytes": 388,
-        "identity_sha256": "46334b196f232df646a4facbf4d179cc59c9cb5492b27b4904a58c4a0a9963db"
+        "identity_sha256": "350a47b56a210bf3cd027204d9db5e791e2e2c26af5ab37ca514415ba1527c65"
       },
       "instructions": {
-        "bytes": 7617,
+        "bytes": 7605,
         "delta_bytes": 131,
-        "identity_sha256": "8969522cba6be01fe1c2334b485593f606bd025133adf8e5c9dd7b3c55015826"
+        "identity_sha256": "85bd54a1ca30028f852c6a531c6b1aa04b6b971f1ed3498c66e942f055b276c1"
       },
       "memory": {
-        "bytes": 9346,
+        "bytes": 9334,
         "delta_bytes": 963,
-        "identity_sha256": "68943a444273c382716687a5339ffb550ec296f03aa3eea176fb8f7a7c76e3e3"
+        "identity_sha256": "d21379b0fa308b121649e5d756da4d8b6e31d5a0b10e2d87b5511197a7959bcd"
       },
       "project": {
-        "bytes": 7486,
-        "delta_bytes": 255,
-        "identity_sha256": "76040a685b00b96529bffbaf72690df413a9cc67455510d490abe4ffc441d1c2"
+        "bytes": 7474,
+        "delta_bytes": 243,
+        "identity_sha256": "918a55fd0c6da2a1334cdad93b2da61bcee660723ebc0443cd0a7b045979a0f8"
       },
       "skill": {
-        "bytes": 8383,
+        "bytes": 8371,
         "delta_bytes": 766,
-        "identity_sha256": "b4b43f5f26dc066557d6565e8484457481277ff395510e5e2ec1c36f0e843cfa"
+        "identity_sha256": "1cb100b5a923dead5fe2486539a37e9ab11ab03c82cb00bfa8eb3de2cb5c4a38"
       }
     },
     "system_prompt_blocks": 6,
-    "total_bytes": 9815,
-    "total_tokens_est": 2454
+    "total_bytes": 9803,
+    "total_tokens_est": 2451
   },
   "schema_version": 1,
   "skill_discovery": {
@@ -107,9 +107,9 @@
           "tools": 13
         },
         "full": {
-          "bytes": 84021,
+          "bytes": 84151,
           "identity_sha256": "45e989bbe5ac0bb1f2d9084361c021009f30a06539f132ebd4fd2331a1bb1954",
-          "tokens_est": 21006,
+          "tokens_est": 21038,
           "tool_names": [
             "Git",
             "Run",
@@ -191,9 +191,9 @@
           "tools": 13
         },
         "full": {
-          "bytes": 84021,
+          "bytes": 84151,
           "identity_sha256": "45e989bbe5ac0bb1f2d9084361c021009f30a06539f132ebd4fd2331a1bb1954",
-          "tokens_est": 21006,
+          "tokens_est": 21038,
           "tool_names": [
             "Git",
             "Run",
@@ -274,9 +274,9 @@
           "tools": 12
         },
         "full": {
-          "bytes": 53785,
+          "bytes": 53772,
           "identity_sha256": "ac8af1f4988199825be7b00b054c258724a44074b1d4e6de6c92ade7c1cffe63",
-          "tokens_est": 13447,
+          "tokens_est": 13443,
           "tool_names": [
             "Git",
             "Web",
@@ -314,5 +314,6 @@
       }
     },
     "surface_profile": "production-default-builtins-no-mcp-no-host-interpreters-bash-v2"
-  }
+  },
+  "_codex_0101_remeasure": "2026-10-01: lock the composed candidate measurement after the audited composition-required schema repair (46835a2fc, D04-11) and shared finance-timeout documentation (7c36620d4, D03-m3). Their parent-surface causal controls are recorded in 6655b191e. Act/Operate full catalog measured 84151 bytes / 21038 estimated tokens versus stale 83988 / 20997; no tools or surface identities changed. Plan/active surfaces and other budgets use their measured values. Estimate only, not provider usage. Receipt: CW/artifacts/codex-0101-takeover-20260930/root-runtime-contract-receipt.json."
 }

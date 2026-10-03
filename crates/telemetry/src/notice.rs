@@ -61,7 +61,7 @@ pub(crate) fn show_startup_disclosure(surface: crate::event::Surface) {
     }
     use std::io::Write;
     if writeln!(std::io::stderr().lock(), "{STARTUP_DISCLOSURE}").is_ok() {
-        let _ = codewhale_config::SetupState::update_telemetry_at(&path, |latest| {
+        let _ = codewhale_config::SetupState::update_at(&path, |latest| {
             latest.record_telemetry_notice_shown(codewhale_config::TELEMETRY_NOTICE_VERSION);
         });
     }

@@ -249,6 +249,7 @@ pub(crate) fn apply_engine_error_to_app(
         app.dispatch_started_at = None;
     }
     app.turn_error_posted = true;
+    app.turn_error_notice = Some(message.clone());
     if credential_rejected_before_output {
         // #6566: the provider refused the key before any model output, so the
         // engine takes the question back out of the session. Give it back to
@@ -331,6 +332,18 @@ pub(crate) fn apply_message_submit_outcome(
     match outcome {
         crate::hooks::MessageSubmitOutcome::Unchanged { .. } => true,
         crate::hooks::MessageSubmitOutcome::Replaced { text, .. } => {
+            // A queued message was already echoed with its pre-hook text.
+            // Retarget that one cell so dispatch reuses it instead of adding a
+            // second User cell beside the stale echo (U02-03).
+            if message.history_echoed
+                && let Some(idx) =
+                    crate::tui::ui::dispatch::echoed_user_turn_cell(app, &message.display)
+            {
+                app.history[idx] = HistoryCell::User {
+                    content: text.clone(),
+                };
+                app.bump_history_cell(idx);
+            }
             message.display = text;
             true
         }
@@ -1311,7 +1324,125 @@ pub(crate) fn apply_notification_update(
     Ok(())
 }
 
+/// Roll back only this idle Engine conversation, then require a durability
+/// receipt before a retry can reach inference. A save failure leaves the
+/// acknowledged undo visible, reports the error, and sends no replacement turn.
+async fn apply_conversation_undo(
+    app: &mut App,
+    engine: &EngineHandle,
+    sync: codewhale_command_contract::facets::SessionSyncPayload,
+) -> Result<()> {
+    anyhow::ensure!(
+        !app.is_loading
+            && !app.dispatch_in_flight
+            && !app.remote_control.runtime_chat_blocks_local_dispatch(),
+        "wait for the active turn to finish before undoing its conversation"
+    );
+    let before = engine.get_session_snapshot().await?;
+    let before_prompt =
+        crate::compaction::strip_compaction_summaries(before.system_prompt.as_ref());
+    anyhow::ensure!(
+        app.current_session_id
+            .as_deref()
+            .is_none_or(|id| id == before.session_id)
+            && sync.session_id == app.current_session_id
+            && sync.workspace == before.workspace
+            && sync.model == before.model
+            && before.mode == app.mode.as_setting()
+            && crate::compaction::strip_compaction_summaries(app.system_prompt.as_ref())
+                == before_prompt
+            && crate::compaction::strip_compaction_summaries(sync.system_prompt.as_ref())
+                == before_prompt
+            && before.messages.as_slice() == app.api_messages.as_slice()
+            && sync.messages.len() < before.messages.len()
+            && before.messages.starts_with(&sync.messages),
+        "{}",
+        app.tr(MessageId::ConversationChangedBeforeUndo)
+    );
+    let id = before.session_id.clone();
+    // A live rewind retains the checkpoint already owned by these messages.
+    // The Engine alone restores it and invalidates dependent caches.
+    let expected =
+        crate::runtime_handoff::project_owned_messages_for_restore(sync.messages.clone());
+    let (tx, receive) = tokio::sync::oneshot::channel();
+    engine
+        .send(Op::RewindConversation {
+            expected: Box::new(before),
+            messages: sync.messages,
+            tx,
+        })
+        .await?;
+    // This receipt comes from the same Engine operation that compares and
+    // installs history. A queued update between preflight and rewind refuses.
+    let installed = receive.await?.ok_or_else(|| {
+        anyhow::anyhow!(
+            app.tr(MessageId::ConversationChangedBeforeUndo)
+                .into_owned()
+        )
+    })?;
+    anyhow::ensure!(
+        installed.session_id == id && installed.messages == expected,
+        "the Engine did not acknowledge the conversation rollback"
+    );
+    while !app.history.is_empty() {
+        let last_is_user = matches!(app.history.last(), Some(HistoryCell::User { .. }));
+        app.pop_history();
+        if last_is_user {
+            break;
+        }
+    }
+    app.set_api_messages(Arc::new(installed.messages));
+    app.current_session_id = Some(id);
+    app.tool_cells.clear();
+    app.tool_details_by_cell.clear();
+    app.exploring_entries.clear();
+    app.ignored_tool_calls.clear();
+    app.mark_history_updated();
+    let manager = tokio::task::spawn_blocking(SessionManager::default_location).await??;
+    let session = build_session_snapshot(app, &manager).map_err(anyhow::Error::msg)?;
+    // CompletedCommit supersedes an older queued checkpoint as well as its
+    // snapshot. A plain snapshot could let crash recovery revive the old turn.
+    anyhow::ensure!(
+        persistence_actor::try_persist(PersistRequest::CompletedCommit { session }),
+        "the session persistence worker is unavailable"
+    );
+    let (reply, receive) = tokio::sync::oneshot::channel();
+    anyhow::ensure!(
+        persistence_actor::try_persist(PersistRequest::FlushAndReport { reply }),
+        "could not request the session save receipt"
+    );
+    let report = receive.await?;
+    anyhow::ensure!(
+        report.failures.is_empty(),
+        "the session save failed: {:?}",
+        report.failures
+    );
+    publish_pending_work_projection(app)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    Ok(())
+}
+
 pub(crate) async fn apply_command_result(
+    terminal: &mut AppTerminal,
+    app: &mut App,
+    engine_handle: &mut EngineHandle,
+    task_manager: &SharedTaskManager,
+    config: &mut Config,
+    result: commands::CommandResult,
+) -> Result<bool> {
+    let outcome =
+        apply_command_result_inner(terminal, app, engine_handle, task_manager, config, result)
+            .await;
+    // A save the command made may have moved legacy top-level `base_url` /
+    // `api_key` into their provider tables (#6394); say so once.
+    for notice in codewhale_config::legacy_root::take_notices() {
+        app.push_status_toast(notice, StatusToastLevel::Info, Some(10_000));
+    }
+    outcome
+}
+
+async fn apply_command_result_inner(
     terminal: &mut AppTerminal,
     app: &mut App,
     engine_handle: &mut EngineHandle,
@@ -1327,8 +1458,14 @@ pub(crate) async fn apply_command_result(
     if reject_inline_inference_while_runtime_chat_owns_run(app, &result) {
         return Ok(false);
     }
+    let conversation_message = matches!(result.action, Some(AppAction::ConversationUndo { .. }))
+        .then(|| result.message.clone())
+        .flatten();
     if let Some(msg) = result.message
-        && !matches!(result.action, Some(AppAction::OpenCommandReview { .. }))
+        && !matches!(
+            result.action,
+            Some(AppAction::OpenCommandReview { .. } | AppAction::ConversationUndo { .. })
+        )
     {
         app.add_message(HistoryCell::System { content: msg });
     }
@@ -1357,28 +1494,19 @@ pub(crate) async fn apply_command_result(
                         return Ok(false);
                     }
                 };
-                // A managed record resumes through the manager so its repair is
-                // hydrated, applied, and persisted in place. A foreign `/load`
-                // file is not ours to rewrite: hydrate its journal projection
-                // and repair in memory only.
-                let session = match SessionManager::default_location() {
-                    Ok(manager) if manager.owns_session_path(&parsed.metadata.id, &path) => {
-                        match manager.resume_session(&parsed.metadata.id) {
-                            Ok(recovery) => recovery.session,
-                            Err(err) => {
-                                crate::tui::ui::session_state::surface_session_load_failure(
-                                    app,
-                                    format!("Failed to resume session {}: {err}", path.display()),
-                                );
-                                return Ok(false);
-                            }
-                        }
-                    }
-                    _ => {
-                        let mut session = parsed;
-                        session.ensure_journal();
-                        crate::session_manager::repair_recovered_session(&mut session);
-                        session
+                // `/load` shares the attach contract of `resume` and the
+                // picker (`SessionManager::attach_session_file`); the lease is
+                // committed only once the session is applied.
+                let attached = SessionManager::default_location()
+                    .and_then(|manager| manager.attach_session_file(parsed, &path));
+                let (session, lease) = match attached {
+                    Ok(attached) => attached,
+                    Err(err) => {
+                        crate::tui::ui::session_state::surface_session_load_failure(
+                            app,
+                            format!("Failed to resume session {}: {err}", path.display()),
+                        );
+                        return Ok(false);
                     }
                 };
                 let fresh_config =
@@ -1402,7 +1530,10 @@ pub(crate) async fn apply_command_result(
                     fresh_config,
                     true,
                 ) {
-                    Ok(outcome) => outcome,
+                    Ok(outcome) => {
+                        lease.commit();
+                        outcome
+                    }
                     Err(err) => {
                         crate::tui::ui::session_state::surface_session_load_failure(
                             app,
@@ -1547,6 +1678,43 @@ pub(crate) async fn apply_command_result(
                     persist_full_reset_snapshot(app);
                 }
             }
+            AppAction::SetWorkspaceTrust { trusted, save } => {
+                let result = crate::commands::set_workspace_trust(app, trusted, save).await;
+                sync_mode_update(app, engine_handle).await;
+                match result {
+                    Ok(()) => {
+                        app.push_status_toast(
+                            format!(
+                                "/trust: {} ({})",
+                                tr(
+                                    app.ui_locale,
+                                    if trusted {
+                                        MessageId::ConfigValueOn
+                                    } else {
+                                        MessageId::ConfigValueOff
+                                    }
+                                ),
+                                tr(
+                                    app.ui_locale,
+                                    if save {
+                                        MessageId::ConfigScopeSaved
+                                    } else {
+                                        MessageId::ConfigScopeSession
+                                    }
+                                ),
+                            ),
+                            StatusToastLevel::Info,
+                            None,
+                        );
+                    }
+                    Err(error) => app.push_status_toast(
+                        tr(app.ui_locale, MessageId::AutomationEditorSaveFailed)
+                            .replace("{error}", &format!("/trust: {error:#}")),
+                        StatusToastLevel::Error,
+                        None,
+                    ),
+                }
+            }
             AppAction::ModeChanged(_mode) => {
                 sync_mode_update(app, engine_handle).await;
             }
@@ -1612,6 +1780,31 @@ pub(crate) async fn apply_command_result(
                             mode: app.mode,
                         })
                         .await;
+                }
+            }
+            AppAction::ConversationUndo { sync, retry_input } => {
+                if let Err(error) = apply_conversation_undo(app, engine_handle, sync).await {
+                    app.push_status_toast(
+                        format!("Conversation rollback failed; retry was not sent: {error:#}"),
+                        StatusToastLevel::Error,
+                        None,
+                    );
+                    return Ok(false);
+                }
+                if let Some(message) = conversation_message {
+                    app.add_message(HistoryCell::System { content: message });
+                }
+                if let Some(content) = retry_input {
+                    let queued = build_queued_message(app, content);
+                    dispatch_composer_message(
+                        app,
+                        config,
+                        engine_handle,
+                        queued,
+                        DispatchRecovery::Immediate,
+                        ComposerSubmitAction::Submit(app.decide_submit_disposition()),
+                    )
+                    .await?;
                 }
             }
             AppAction::SendMessage(content) => {
@@ -1782,7 +1975,10 @@ pub(crate) async fn apply_command_result(
                         let base_url = config.active_route_base_url();
                         match fetch_provider_balance(provider, &api_key, &base_url).await {
                             Some(info) => {
-                                if let Ok(mut guard) = app.balance_cell.lock() {
+                                if let Ok(mut guard) =
+                                    balance_cell_for_route(app, provider, &api_key, &base_url)
+                                        .lock()
+                                {
                                     *guard = Some(info.clone());
                                 }
                                 app.last_balance_fetch = Some(Instant::now());
@@ -2719,7 +2915,8 @@ pub(crate) fn apply_workspace_runtime_state(app: &mut App, config: &Config, work
         workspace.clone(),
     );
     app.skills_dir = crate::tui::app::resolve_skills_dir(&workspace, &config.skills_dir(), config);
-    app.skills_scan_codewhale_only = config.skills_config().scan_codewhale_only();
+    app.skills_discovery_mode =
+        crate::skills::SkillDiscoveryMode::from_config(&config.skills_config());
     app.project_context_pack_enabled = config.project_context_pack_enabled();
     app.refresh_skill_cache();
     app.workspace_context = None;
@@ -3735,10 +3932,23 @@ pub(crate) fn apply_loaded_session_with_goal(
         // is contended, the current conversation stays intact and a retry can
         // use this durably repaired binding to the same host.
         let mut recovered = session.clone();
-        recovered.metadata.runtime_store = Some(binding.clone());
-        SessionManager::default_location()
-            .and_then(|manager| manager.save_session(&recovered))
+        let abandoned = recovered.metadata.runtime_store.replace(binding.clone());
+        let manager = SessionManager::default_location()
             .map_err(|error| format!("Session recovery could not be saved: {error}"))?;
+        manager
+            .save_session(&recovered)
+            .map_err(|error| format!("Session recovery could not be saved: {error}"))?;
+        // The conversation now lives in this host's store. The empty store it
+        // left is set aside here, where it is abandoned, unless another
+        // document still binds it (#6144 P1a) — otherwise it stayed on disk
+        // with nothing pointing at it.
+        if let Some(abandoned) = abandoned {
+            crate::session_reconcile::retire_unbound_store_in_background(
+                manager,
+                abandoned.data_dir,
+                "conversation rebound to another host's store",
+            );
+        }
     }
     app.restore_work_state(
         &session.metadata.id,
@@ -3767,6 +3977,20 @@ pub(crate) fn apply_loaded_session_with_goal(
     app.last_exec_wait_command = None;
     let messages = app.api_messages.clone();
     let mut message_to_cell = std::collections::HashMap::new();
+    // Failed-turn notices are replayed where they happened: after the
+    // messages that existed when the turn ended (clamped to the transcript).
+    let mut turn_outcomes = session.turn_outcomes.iter().peekable();
+    let mut replay_outcomes_through = |app: &mut App, message_count: usize, last: bool| {
+        while let Some(outcome) =
+            turn_outcomes.next_if(|outcome| last || outcome.after_message_count <= message_count)
+        {
+            app.extend_history(std::iter::once(HistoryCell::Error {
+                message: outcome.error.clone(),
+                severity: crate::error_taxonomy::ErrorSeverity::Warning,
+            }));
+        }
+    };
+    replay_outcomes_through(app, 0, messages.is_empty());
     for (message_index, msg) in messages.iter().enumerate() {
         let mut cells = history_cells_from_message(msg);
         if msg.role == "user"
@@ -3790,6 +4014,7 @@ pub(crate) fn apply_loaded_session_with_goal(
             message_to_cell.insert(message_index, base + offset);
         }
         app.extend_history(cells);
+        replay_outcomes_through(app, message_index + 1, message_index + 1 == messages.len());
     }
     app.rebuild_completed_assistant_outputs_from_restored_history();
     app.sync_context_references_from_session(&session.context_references, &message_to_cell);
@@ -3938,6 +4163,7 @@ pub(crate) fn apply_loaded_session_with_goal(
         );
     }
     app.session_artifacts = session.artifacts;
+    app.session_turn_outcomes = session.turn_outcomes;
     app.window_title = session.window_title;
     app.workspace_context = None;
     app.workspace_is_linked_worktree = false;
@@ -3997,7 +4223,7 @@ mod profile_snapshot_tests {
             "../../../../config/tests/fixtures/custom_models.toml"
         ))
         .expect("profile fixture");
-        config.api_key = Some("profile-snapshot-local-fixture".to_string());
+        config.set_legacy_root(Some("profile-snapshot-local-fixture".to_string()), None);
         config.default_text_model = Some(model.to_string());
         config.providers.as_mut().unwrap().deepseek.base_url = Some(base_url.to_string());
         let declaration = &mut config.custom_models.as_mut().unwrap()[0];

@@ -104,16 +104,21 @@ pub fn inspect_compaction_keep(messages: &[Message]) -> CompactionKeep {
     }
 }
 
+/// Workspace anchors are passive model input; only user-configured trust admits
+/// them. Missing, linked, unreadable, or empty anchors contribute no text.
 #[must_use]
 pub fn pinned_anchors_text(workspace: Option<&std::path::Path>) -> Option<String> {
     let workspace = workspace?;
+    if !crate::config::is_workspace_trusted(workspace) {
+        return None;
+    }
     let primary = workspace.join(".codewhale").join("anchors.md");
-    let path = if primary.exists() {
+    let path = if primary.symlink_metadata().is_ok() || workspace.join(".codewhale").is_symlink() {
         primary
     } else {
         workspace.join(".deepseek").join("anchors.md")
     };
-    std::fs::read_to_string(path)
+    crate::fs_confined::read_to_string(workspace, &path)
         .ok()
         .map(|contents| contents.trim().to_string())
         .filter(|contents| !contents.is_empty())
@@ -287,44 +292,61 @@ pub(super) fn bound_last_round(messages: &[Message]) -> Vec<Message> {
     round
 }
 
-fn tool_result_ids(message: &Message) -> Vec<String> {
+fn tool_result_ids(message: &Message) -> Vec<(codewhale_models::ToolCallKey<'_>, &str)> {
     message
         .content
         .iter()
         .filter_map(|block| match block {
-            ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.clone()),
+            ContentBlock::ToolResult { tool_use_id, .. } => {
+                block.tool_call_key().map(|key| (key, tool_use_id.as_str()))
+            }
             _ => None,
         })
         .collect()
 }
 
-fn has_tool_result_id(message: &Message, id: &str) -> bool {
+fn has_tool_result_id(message: &Message, id: &(codewhale_models::ToolCallKey<'_>, &str)) -> bool {
+    if id.0.as_str().trim().is_empty() {
+        return false;
+    }
     message.content.iter().any(|block| {
         matches!(
             block,
-            ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == id
+            ContentBlock::ToolResult { tool_use_id, .. } if block.tool_call_key() == Some(id.0) && tool_use_id == id.1
         )
     })
 }
 
-fn tool_use_ids(message: &Message) -> Vec<String> {
+fn tool_use_ids(message: &Message) -> Vec<(codewhale_models::ToolCallKey<'_>, &str)> {
     message
         .content
         .iter()
         .filter_map(|block| match block {
-            ContentBlock::ToolUse { id, .. } => Some(id.clone()),
+            ContentBlock::ToolUse { id, .. } => block.tool_call_key().map(|key| (key, id.as_str())),
             _ => None,
         })
         .collect()
 }
 
-fn has_tool_use_id(message: &Message, id: &str) -> bool {
+fn has_tool_use_id(message: &Message, id: &(codewhale_models::ToolCallKey<'_>, &str)) -> bool {
+    if id.0.as_str().trim().is_empty() {
+        return false;
+    }
     message.content.iter().any(|block| {
         matches!(
             block,
-            ContentBlock::ToolUse { id: seen, .. } if seen == id
+            ContentBlock::ToolUse { id: provider, .. } if block.tool_call_key() == Some(id.0) && provider == id.1
         )
     })
+}
+
+fn tool_call_identity_label(id: &(codewhale_models::ToolCallKey<'_>, &str)) -> String {
+    match id.0 {
+        codewhale_models::ToolCallKey::Execution(execution_id) => {
+            format!("execution {execution_id} (provider call {})", id.1)
+        }
+        codewhale_models::ToolCallKey::LegacyProvider(provider_id) => provider_id.to_string(),
+    }
 }
 
 fn assistant_text_of(message: &Message) -> Option<String> {
@@ -378,8 +400,9 @@ pub(crate) fn validate_last_round_coverage(
             .iter()
             .any(|message| has_tool_result_id(message, &id))
         {
+            let label = tool_call_identity_label(&id);
             anyhow::bail!(
-                "Making room stopped: last-round tool result {id} was dropped; history was not replaced."
+                "Making room stopped: last-round tool result {label} was dropped; history was not replaced."
             );
         }
     }
@@ -390,8 +413,9 @@ pub(crate) fn validate_last_round_coverage(
             .iter()
             .any(|message| has_tool_use_id(message, &id))
         {
+            let label = tool_call_identity_label(&id);
             anyhow::bail!(
-                "Making room stopped: last-round tool call {id} was dropped; history was not replaced."
+                "Making room stopped: last-round tool call {label} was dropped; history was not replaced."
             );
         }
     }
@@ -515,6 +539,117 @@ mod tests {
     use codewhale_models::{ContentBlock, Role};
     use serde_json::json;
 
+    #[test]
+    fn coverage_requires_the_original_execution_and_provider_pair() {
+        let original: Vec<Message> = serde_json::from_value(json!([
+            {"role":"user","content":[{"type":"text","text":"keep this exchange"}]},
+            {"role":"assistant","content":[{"type":"tool_use","id":"wire","execution_id":"local","name":"read","input":{}}]},
+            {"role":"user","content":[{"type":"tool_result","tool_use_id":"wire","execution_id":"local","content":"kept"}]}
+        ])).unwrap();
+        assert!(validate_last_round_coverage(&original, &original).is_ok());
+        for identity in [None, Some("different")] {
+            let mut replacement = original.clone();
+            for block in replacement
+                .iter_mut()
+                .flat_map(|message| &mut message.content)
+            {
+                match block {
+                    ContentBlock::ToolUse { execution_id, .. }
+                    | ContentBlock::ToolResult { execution_id, .. } => {
+                        *execution_id = identity.map(str::to_string)
+                    }
+                    _ => {}
+                }
+            }
+            assert!(validate_last_round_coverage(&original, &replacement).is_err());
+        }
+        let mut replacement = original.clone();
+        if let ContentBlock::ToolResult { tool_use_id, .. } = &mut replacement[2].content[0] {
+            *tool_use_id = "wrong-wire".to_string();
+        }
+        let error = validate_last_round_coverage(&original, &replacement).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Making room stopped: last-round tool result execution local (provider call wire) was dropped; history was not replaced."
+        );
+        let mut replacement = original.clone();
+        if let ContentBlock::ToolUse { id, .. } = &mut replacement[1].content[0] {
+            *id = "wrong-wire".to_string();
+        }
+        let error = validate_last_round_coverage(&original, &replacement).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Making room stopped: last-round tool call execution local (provider call wire) was dropped; history was not replaced."
+        );
+    }
+
+    #[test]
+    fn confined_pinned_anchors_require_workspace_trust() {
+        use crate::test_support::{EnvVarGuard, lock_test_env};
+        let _lock = lock_test_env();
+        let workspace = tempfile::tempdir().unwrap();
+        let config = tempfile::tempdir().unwrap();
+        let _config = EnvVarGuard::set("CODEWHALE_CONFIG_PATH", config.path().join("config.toml"));
+        let legacy = workspace.path().join(".deepseek");
+        std::fs::create_dir(&legacy).unwrap();
+        std::fs::write(legacy.join("anchors.md"), " legacy anchor \n").unwrap();
+        std::fs::write(legacy.join("trusted"), "true").unwrap();
+        assert_eq!(pinned_anchors_text(None), None);
+        assert_eq!(pinned_anchors_text(Some(workspace.path())), None);
+
+        crate::config::save_workspace_trust(workspace.path()).unwrap();
+        assert!(crate::config::is_workspace_trusted(workspace.path()));
+        assert_eq!(
+            pinned_anchors_text(Some(workspace.path())).as_deref(),
+            Some("legacy anchor")
+        );
+        let primary = workspace.path().join(".codewhale");
+        std::fs::create_dir(&primary).unwrap();
+        std::fs::write(primary.join("anchors.md"), " primary anchor \n").unwrap();
+        assert_eq!(
+            pinned_anchors_text(Some(workspace.path())).as_deref(),
+            Some("primary anchor")
+        );
+        std::fs::write(primary.join("anchors.md"), " \n").unwrap();
+        assert_eq!(pinned_anchors_text(Some(workspace.path())), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn confined_pinned_anchors_refuse_linked_files_and_directories() {
+        use crate::test_support::{EnvVarGuard, lock_test_env};
+        use std::os::unix::fs::symlink;
+        let _lock = lock_test_env();
+        let config = tempfile::tempdir().unwrap();
+        let _config = EnvVarGuard::set("CODEWHALE_CONFIG_PATH", config.path().join("config.toml"));
+        for directory in [".codewhale", ".deepseek"] {
+            for linked_directory in [false, true] {
+                let workspace = tempfile::tempdir().unwrap();
+                let outside = tempfile::tempdir().unwrap();
+                crate::config::save_workspace_trust(workspace.path()).unwrap();
+                assert!(crate::config::is_workspace_trusted(workspace.path()));
+                let target = outside.path().join("anchors.md");
+                std::fs::write(&target, "separate anchor").unwrap();
+                let parent = workspace.path().join(directory);
+                if linked_directory {
+                    symlink(outside.path(), &parent).unwrap();
+                } else {
+                    std::fs::create_dir(&parent).unwrap();
+                    symlink(&target, parent.join("anchors.md")).unwrap();
+                }
+                assert_eq!(pinned_anchors_text(Some(workspace.path())), None);
+                // A dangling preferred path must not select legacy content.
+                if directory == ".codewhale" {
+                    let legacy = workspace.path().join(".deepseek");
+                    std::fs::create_dir(&legacy).unwrap();
+                    std::fs::write(legacy.join("anchors.md"), "legacy anchor").unwrap();
+                }
+                std::fs::remove_file(&target).unwrap();
+                assert_eq!(pinned_anchors_text(Some(workspace.path())), None);
+            }
+        }
+    }
+
     fn msg(role: &str, text: &str) -> Message {
         Message {
             role: Role::from(role),
@@ -529,6 +664,7 @@ mod tests {
         Message {
             role: Role::Assistant,
             content: vec![ContentBlock::ToolUse {
+                execution_id: None,
                 id: id.to_string(),
                 name: name.to_string(),
                 input,
@@ -542,6 +678,7 @@ mod tests {
         Message {
             role: Role::User,
             content: vec![ContentBlock::ToolResult {
+                execution_id: None,
                 tool_use_id: id.to_string(),
                 content: content.to_string(),
                 is_error: None,
@@ -554,6 +691,67 @@ mod tests {
         compaction_checkpoint_message(&SystemPrompt::Text(format!(
             "{COMPACTION_SUMMARY_MARKER}: {summary}"
         )))
+    }
+
+    /// The handoff header tells the next turn what survived. It must match
+    /// what the replacement history keeps: only the last steps of a long
+    /// round, with long tool output shortened and marked.
+    #[test]
+    fn summary_header_matches_what_replacement_history_keeps() {
+        let long_output = "x".repeat(LAST_ROUND_TOOL_RESULT_MAX_CHARS * 2);
+        let original = vec![
+            msg("user", "Fix the build."),
+            tool_use("first", "Bash", json!({"command": "cargo check"})),
+            tool_result("first", "first step output"),
+            tool_use("second", "Bash", json!({"command": "cargo build"})),
+            tool_result("second", "second step output"),
+            tool_use("third", "Bash", json!({"command": "cargo test"})),
+            tool_result("third", &long_output),
+        ];
+        let kept = replacement_messages(&original, 20_000);
+        let kept_ids: Vec<&str> = kept
+            .iter()
+            .flat_map(tool_result_ids)
+            .map(|(_, wire)| wire)
+            .collect();
+        assert_eq!(kept_ids, ["second", "third"], "earlier steps are dropped");
+        assert!(
+            kept.iter()
+                .any(|m| user_text_of(m).as_deref() == Some("Fix the build."))
+        );
+        let shortened = kept
+            .iter()
+            .flat_map(|m| &m.content)
+            .find_map(|block| match block {
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    ..
+                } if tool_use_id == "third" => Some(content.clone()),
+                _ => None,
+            })
+            .expect("the last tool result is kept");
+        assert!(shortened.len() < long_output.len());
+        assert!(shortened.starts_with("[tool result retained-history truncated from"));
+
+        let header = crate::compaction::SUMMARY_HEADER;
+        assert!(
+            header.contains("last steps of the current round"),
+            "{header}"
+        );
+        assert!(
+            header.contains("including earlier steps of this round"),
+            "{header}"
+        );
+        assert!(
+            header.contains("Long tool output there is shortened"),
+            "{header}"
+        );
+        assert!(
+            header.contains("with a marker where it was cut"),
+            "{header}"
+        );
+        assert!(!header.contains("as they were"), "{header}");
     }
 
     #[test]
@@ -747,16 +945,20 @@ mod tests {
                 user_text_of(message).as_deref() == Some(long_question.as_str())
             })
         );
-        assert!(
-            second
-                .iter()
-                .any(|message| has_tool_use_id(message, "call_1"))
-        );
-        assert!(
-            second
-                .iter()
-                .any(|message| has_tool_result_id(message, "call_1"))
-        );
+        assert!(second.iter().any(|message| has_tool_use_id(
+            message,
+            &(
+                codewhale_models::ToolCallKey::LegacyProvider("call_1"),
+                "call_1"
+            )
+        )));
+        assert!(second.iter().any(|message| has_tool_result_id(
+            message,
+            &(
+                codewhale_models::ToolCallKey::LegacyProvider("call_1"),
+                "call_1"
+            )
+        )));
         let without_question = second
             .iter()
             .filter(|message| user_text_of(message).as_deref() != Some(long_question.as_str()))

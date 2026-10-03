@@ -35,11 +35,15 @@ pub fn provision_worktree(spec: &WorktreeProvision) -> Result<ProvisionedWorktre
     if !spec.repo_root.exists() {
         bail!("repo root does not exist: {}", spec.repo_root.display());
     }
+    let base = spec.base_ref.as_deref().unwrap_or("HEAD");
+    // A leading '-' would be parsed as a `git worktree add` option.
+    if spec.branch.starts_with('-') || base.starts_with('-') {
+        bail!("worktree branch and base ref must not start with '-'");
+    }
     if let Some(parent) = spec.path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("create worktree parent {}", parent.display()))?;
     }
-    let base = spec.base_ref.as_deref().unwrap_or("HEAD");
     // Capture git output instead of inheriting the caller's terminal. Runtime
     // callers include the raw-mode TUI launch screen, where even one inherited
     // progress/error line corrupts the alternate-screen buffer.
@@ -50,6 +54,7 @@ pub fn provision_worktree(spec: &WorktreeProvision) -> Result<ProvisionedWorktre
             "add",
             "-b",
             &spec.branch,
+            "--",
             &spec.path.to_string_lossy(),
             base,
         ])
@@ -275,12 +280,12 @@ fn delete_lane_branch(repo_root: &Path, branch: &str) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::process::Command;
     use tempfile::tempdir;
 
-    fn init_repo(root: &Path) {
+    pub(crate) fn init_repo(root: &Path) {
         assert!(
             Command::new("git")
                 .args(["init", "-b", "main"])
@@ -346,6 +351,54 @@ mod tests {
             !wt_path.exists(),
             "TTL 0 should remove worktree immediately"
         );
+    }
+
+    #[test]
+    fn provision_refuses_option_shaped_base_ref() {
+        let dir = tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+        let wt_path = dir.path().join("nested").join("wt-lane");
+        let err = provision_worktree(&WorktreeProvision {
+            repo_root: repo.clone(),
+            branch: "codex/lane-opt".into(),
+            path: wt_path.clone(),
+            base_ref: Some("--lock".into()),
+        })
+        .expect_err("option-shaped base ref must be refused");
+        assert!(
+            err.to_string().contains("must not start with '-'"),
+            "{err:#}"
+        );
+        assert!(!wt_path.exists());
+        assert!(!dir.path().join("nested").exists(), "nothing created");
+        assert!(!branch_exists(&repo, "codex/lane-opt"));
+        let list = Command::new("git")
+            .current_dir(&repo)
+            .args(["worktree", "list", "--porcelain"])
+            .output()
+            .unwrap();
+        assert!(!String::from_utf8_lossy(&list.stdout).contains("locked"));
+    }
+
+    #[test]
+    fn provision_accepts_a_path_that_looks_like_an_option() {
+        let dir = tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+        // With `--` before the positionals, git reads this as a path.
+        let provisioned = provision_worktree(&WorktreeProvision {
+            repo_root: repo.clone(),
+            branch: "codex/lane-dash-path".into(),
+            path: PathBuf::from("--detach"),
+            base_ref: Some("main".into()),
+        })
+        .unwrap();
+        assert!(repo.join("--detach").join("README").is_file());
+        assert!(branch_exists(&repo, "codex/lane-dash-path"));
+        drop(provisioned);
     }
 
     fn branch_exists(repo: &Path, branch: &str) -> bool {

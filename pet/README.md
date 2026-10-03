@@ -88,8 +88,8 @@ The Rust particle implementation lives in the product's
 `crates/tui/src/tui/ambient_life/pet_sim.rs`; this package's runner imports it.
 Swift and Kotlin particle ports must match its conformance digests. Generated
 native bundles are committed so the product Rust build needs no Node compiler.
-Run `npm run sync` after changing core source; the generated-byte check in CI
-rejects a stale bundle. Local Whalesong consumers use aliases to these same
+Run `npm run sync` after changing core source; `npm run check` (run by CI)
+rejects a stale bundle or `shared.html` copy. Local Whalesong consumers use aliases to these same
 canonical files, not separately maintained source copies.
 
 The original Whalesong importer, signal model, schema and browser storage code
@@ -129,7 +129,9 @@ Live recording continues in segments. At 216,000 buckets (24 hours) or 64 MiB,
 the recorder syncs the completed file, preserves it as
 `OUTPUT.segment-000001.jsonl` (then `000002`, etc.), and atomically replaces the
 same live pathname. Each segment starts at sequence zero and replays independently.
-Use `--segment-buckets=N` to rotate sooner. Followers establish a new baseline
+Use `--segment-buckets=N` to rotate sooner. A stall or suspension shorter than
+one segment is recorded as unknown buckets; a longer one starts a new segment
+whose first bucket is unknown, as `--resume` does, and only reports its length. Followers establish a new baseline
 after replacement, then accept subsequent appends as current observations.
 
 The live importer retains unfinished lifetimes and 16 seconds of completed

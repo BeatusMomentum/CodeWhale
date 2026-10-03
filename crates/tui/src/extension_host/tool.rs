@@ -2,13 +2,18 @@
 //!
 //! Because it is a registry tool, every existing gate applies unchanged:
 //! plan mode, the authority envelope, deferral, hooks, approval, and code
-//! mode (which, on main, refuses it as mutating/needs-approval before any
-//! host call). Two rules are specific to extension tools:
+//! mode (which suspends gated calls for approval and refuses ungated calls
+//! before any host call). Three rules are specific to extension tools:
 //!
 //! * **Always `ApprovalRequirement::Required`.** A plugin's own read-only
 //!   hint (`presentCall` `kind: 'read'`, MCP-style annotations) is display
 //!   data at most. Honouring it would let a plugin switch approval off for a
 //!   tool whose body runs arbitrary Node — self-approval.
+//! * **Approval grants are receipt-bound.** Keys are
+//!   `ext:<plugin_id>@<content_hash>:<name>:<hash(input)>` for both the exact
+//!   and the session-grant key ([`ToolSpec::approval_scope`]), so an updated
+//!   plugin, or a different plugin that later takes the same tool name, never
+//!   inherits a grant.
 //! * **Liveness is re-checked at call time**: the plugin's reviewed receipt,
 //!   the Native adapter in this build's policy, and the exact owner
 //!   generation. A revocation mid-turn fails the call closed.
@@ -22,13 +27,14 @@ use serde_json::Value;
 use super::ManagerShared;
 use super::protocol::{ContentBlockWire, CoreRequest, ToolCallParams, ToolResultWire};
 use super::registry::ToolRegistration;
-use super::supervisor::{HostCallError, HostProcess};
+use super::supervisor::HostCallError;
 use crate::tools::spec::{
     ApprovalRequirement, PreparedToolCall, ToolCapability, ToolContext, ToolError, ToolResult,
     ToolSpec,
 };
 
-/// Default per-call deadline, matching script tools.
+/// Default per-call deadline, matching script tools
+/// (`SupervisionOptions::tool_call_deadline`).
 pub const TOOL_CALL_DEADLINE: Duration = Duration::from_secs(120);
 
 pub(crate) struct HostToolSpec {
@@ -88,29 +94,12 @@ impl std::fmt::Debug for HostToolSpec {
     }
 }
 
-/// Sends `$/cancel` if the call future is dropped before it resolves (turn
-/// interrupt, deadline, or the engine abandoning the call).
-struct CancelOnDrop {
-    host: Arc<HostProcess>,
-    id: u64,
-    armed: bool,
-}
-
-impl Drop for CancelOnDrop {
-    fn drop(&mut self) {
-        if self.armed {
-            self.host.cancel(self.id);
-            self.host.forget(self.id);
-        }
-    }
-}
-
 fn map_call_error(tool: &str, error: HostCallError) -> ToolError {
     match error {
         HostCallError::Cancelled(reason) => ToolError::Cancelled {
             message: format!("extension tool `{tool}`: {reason}"),
         },
-        HostCallError::Timeout(after) => ToolError::Timeout {
+        HostCallError::Timeout { after, .. } => ToolError::Timeout {
             seconds: after.as_secs(),
         },
         HostCallError::Exited(reason) => {
@@ -192,6 +181,14 @@ impl ToolSpec for HostToolSpec {
         true
     }
 
+    /// Grants are bound to the plugin's reviewed receipt (design §4.3).
+    fn approval_scope(&self) -> Option<String> {
+        Some(format!(
+            "ext:{}@{}",
+            self.registration.owner.plugin_id, self.registration.content_hash
+        ))
+    }
+
     fn prepare(&self, input: Value, _context: &ToolContext) -> Result<PreparedToolCall, ToolError> {
         Ok(PreparedToolCall {
             name: self.registration.name.clone(),
@@ -219,31 +216,19 @@ impl ToolSpec for HostToolSpec {
             .clone()
             .map(|agent| format!("{agent}:{}", uuid::Uuid::new_v4().simple()))
             .unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
+        // The deadline travels with the call: the host is told the bound
+        // `HostProcess::call` enforces (and cancels at).
+        let deadline = self.manager.options.supervision.tool_call_deadline;
         let request = CoreRequest::ToolCall(ToolCallParams {
             handle: registration.handle,
             call_id,
             input,
-            deadline_ms: TOOL_CALL_DEADLINE.as_millis() as u64,
+            deadline_ms: u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX),
         });
-        let (id, rx) = host
-            .start_request(request, Some(registration.owner.plugin_id.clone()))
+        let value = host
+            .call(request, Some(registration.owner.plugin_id.clone()))
+            .await
             .map_err(|error| map_call_error(&registration.name, error))?;
-        let mut guard = CancelOnDrop {
-            host: Arc::clone(&host),
-            id,
-            armed: true,
-        };
-        let outcome = match tokio::time::timeout(TOOL_CALL_DEADLINE, rx).await {
-            Ok(Ok(result)) => result,
-            Ok(Err(_)) => Err(HostCallError::Exited("channel closed".to_string())),
-            Err(_) => Err(HostCallError::Timeout(TOOL_CALL_DEADLINE)),
-        };
-        // A timeout leaves the guard armed so the host is told to stop.
-        if !matches!(outcome, Err(HostCallError::Timeout(_))) {
-            guard.armed = false;
-        }
-        drop(guard);
-        let value = outcome.map_err(|error| map_call_error(&registration.name, error))?;
         let wire: ToolResultWire = serde_json::from_value(value).map_err(|error| {
             ToolError::execution_failed(format!(
                 "extension tool `{}` returned a malformed result: {error}",

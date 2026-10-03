@@ -39,6 +39,7 @@ use crate::route_runtime::resolve_runtime_route;
 use crate::route_runtime::{
     ResolvedRuntimeRoute, ValidatedRuntimeRoute, resolve_runtime_route_for_identity,
 };
+use crate::snapshot::{WorkspaceSnapshotKind, WorkspaceSnapshotRef};
 use crate::tools::goal::{
     GoalPauseReason, GoalSnapshot, GoalStatus, SharedGoalState, new_shared_goal_state,
 };
@@ -83,7 +84,7 @@ use super::ops::{
 };
 use super::session::Session;
 use super::tool_parser;
-use super::turn::{TurnContext, post_turn_snapshot, pre_turn_snapshot};
+use super::turn::{TurnContext, format_snapshot_label, post_turn_snapshot};
 use codewhale_models::Role;
 
 const ENGINE_OP_CHANNEL_CAPACITY: usize = 32;
@@ -135,6 +136,10 @@ fn agent_list_event(manager: &SubAgentManager, active_session_id: &str) -> Event
     }
 }
 
+/// The `<turn_meta>` line naming the permission posture a turn ran under
+/// (`permission_chip_label`). Receipts read it back from saved transcripts,
+/// so the writer and the reader share this prefix.
+pub(crate) const PERMISSION_POSTURE_LINE: &str = "Current permission posture: ";
 const MCP_REGISTRY_FIRST_INSTRUCTION_SOURCE: &str = "runtime:mcp-registry-first";
 const MCP_REGISTRY_FIRST_INSTRUCTION: &str = "## MCP Registry\n\nThe Registry installs and connects a local MCP server when this session lacks a capability. It is a fallback for a capability you do not have, not a step before ordinary work.\n\nPrefer what is already available, in order: tools already in this catalog, the project's own scripts, tests, and dev tooling, and platform capabilities. Creating a file, reading a fixture, running a repo command, and checking your own output are ordinary work — do them directly.\n\nReach for the Registry once you have identified a specific capability that no available tool covers and that you would otherwise install or reimplement, such as a document or media converter, access to an external database or service, or a protocol client. Then call `registry_sync` with a `query` naming that capability; it scores the local Registry snapshot host-side and returns at most eight matches, so the full index never enters the conversation. When a returned server plausibly covers that capability, call `start_registry_mcp_server` with its exact name rather than installing or running its package command through the shell. If nothing matches, refine the query once, then continue with local tools.\n\nBoth Registry tools are deferred: load one with `tool_search` before its first call, and use the returned schema. If a call instead reports that it only loaded the schema, retry once with that schema. Do not go searching for them for work you can already do.";
 /// The one system prompt for an isolated Runtime Chat session. The engine owns
@@ -312,7 +317,7 @@ pub struct EngineConfig {
     pub skills_dir: PathBuf,
     /// Restrict skill discovery to CodeWhale-owned roots plus explicit
     /// `skills_dir` configuration.
-    pub skills_scan_codewhale_only: bool,
+    pub skills_discovery_mode: crate::skills::SkillDiscoveryMode,
     /// Immutable plugin authority snapshot scoped to `workspace`. Normal App
     /// hosts provide this explicitly; headless/embed callers that leave it
     /// unset receive a fresh workspace-specific snapshot in [`Engine::new`].
@@ -372,6 +377,26 @@ pub struct EngineConfig {
     /// first init. `0` disables the cap. Resolved from
     /// `[snapshots] max_workspace_gb` × 1 GB at engine construction.
     pub snapshots_max_workspace_bytes: u64,
+    /// The host records every `Event::WorkspaceSnapshotTaken` receipt on the
+    /// running turn and resolves turn-scoped undo from them (the Runtime
+    /// API). The engine then:
+    ///
+    /// - takes the post-turn snapshot *before* `TurnComplete`, so its receipt
+    ///   belongs to the turn it closes — one arriving after `TurnComplete`
+    ///   would land after the turn settled, on the next turn, or nowhere once
+    ///   the engine is evicted;
+    /// - bounds every tool call that may write (any call not read-only) with
+    ///   a `tool` snapshot before it and a `post_tool` snapshot after it, so
+    ///   the spans in which the turn's own tools ran are known and a change
+    ///   made outside them (another thread, an editor) is never taken for the
+    ///   turn's;
+    /// - reports on each receipt the paths changed since the turn's previous
+    ///   one.
+    ///
+    /// Interactive hosts keep `false`: the TUI does not record receipts,
+    /// keeps the post-turn snapshot off its input path (#234), and snapshots
+    /// only before file-writing tools.
+    pub record_restore_points: bool,
     /// Post-edit LSP diagnostics injection (#136). When `None`, the engine
     /// constructs a disabled manager so the field is always present.
     pub lsp_config: Option<crate::lsp::LspConfig>,
@@ -469,8 +494,8 @@ pub struct EngineConfig {
     pub stream_chunk_timeout: Duration,
     /// Cumulative wall-clock budget for one turn (R1). Counted across every
     /// model step of the turn, excluding time blocked on a human approval
-    /// decision. Resolved from `[tui].turn_wall_clock_secs`; always finite —
-    /// see [`turn_budget::resolve_turn_wall_clock`].
+    /// decision. Resolved from `[tui].turn_wall_clock_secs`; `Duration::MAX`
+    /// (no limit) by default — see [`turn_budget::resolve_turn_wall_clock`].
     pub turn_wall_clock: Duration,
     /// Per-step cap on accumulated streamed content, in bytes (R1). Resolved
     /// from `[tui].stream_max_content_mb`. Pre-R1 this was the hard-coded
@@ -481,6 +506,17 @@ pub struct EngineConfig {
     /// from `[tui].stream_max_duration_secs`. Pre-R1 this was the hard-coded
     /// `STREAM_MAX_DURATION_SECS`.
     pub stream_max_duration: Duration,
+    /// Stream-level retry budgets (#6700): whole-request resumes (also spent
+    /// by stream-open failures, #6699), in-stream transparent retries, and
+    /// the per-stream error streak. Resolved from `[tui].stream_max_resumes`,
+    /// `[tui].stream_max_transparent_retries` and `[tui].stream_max_errors`;
+    /// the defaults are the historical compiled-in values.
+    pub stream_retry_limits: turn_budget::StreamRetryLimits,
+    /// Bounded wait for SSE response headers (#6700). Resolved from
+    /// `[tui].stream_open_timeout_secs`, then
+    /// `CODEWHALE_STREAM_OPEN_TIMEOUT_SECS`; only the awaiting-model
+    /// heartbeat bound reads it here — the client owns the real timeout.
+    pub stream_open_timeout: Duration,
     /// No-progress heartbeat timeout for live sub-agents. Used by the manager
     /// and parent wait loop to auto-cancel stuck children before they exhaust
     /// the sub-agent slot pool indefinitely (#2614).
@@ -555,7 +591,7 @@ impl Default for EngineConfig {
             mcp_oauth_callback_port: None,
             mcp_oauth_callback_url: None,
             skills_dir: crate::skills::default_skills_dir(),
-            skills_scan_codewhale_only: false,
+            skills_discovery_mode: crate::skills::SkillDiscoveryMode::Compatible,
             plugin_registry: None,
             instructions: Vec::new(),
             project_context_pack_enabled: false,
@@ -577,6 +613,7 @@ impl Default for EngineConfig {
             snapshots_enabled: true,
             snapshots_max_workspace_bytes:
                 crate::snapshot::DEFAULT_MAX_WORKSPACE_BYTES_FOR_SNAPSHOT,
+            record_restore_points: false,
             lsp_config: None,
             runtime_services: RuntimeToolServices::default(),
             subagent_model_overrides: HashMap::new(),
@@ -616,6 +653,8 @@ impl Default for EngineConfig {
             turn_wall_clock: turn_budget::resolve_turn_wall_clock(None),
             stream_max_content_bytes: turn_budget::DEFAULT_STREAM_MAX_CONTENT_BYTES,
             stream_max_duration: Duration::from_secs(turn_budget::DEFAULT_STREAM_MAX_DURATION_SECS),
+            stream_retry_limits: turn_budget::StreamRetryLimits::default(),
+            stream_open_timeout: crate::client::resolve_stream_open_timeout(None),
             subagent_heartbeat_timeout: Duration::from_secs(
                 crate::config::DEFAULT_SUBAGENT_HEARTBEAT_TIMEOUT_SECS,
             ),
@@ -663,6 +702,8 @@ pub enum CancelReason {
     /// Engine internals tore down the turn (drop, channel close,
     /// shutdown). Rare — surfaced as an internal error.
     Internal,
+    /// The UI watchdog ended a turn that stopped making progress.
+    Stalled,
 }
 
 impl CancelReason {
@@ -672,6 +713,7 @@ impl CancelReason {
             Self::External => "request cancelled by external caller",
             Self::Preempted => "request was preempted by a new turn",
             Self::Internal => "engine torn down before approval resolved",
+            Self::Stalled => "the turn stalled and was ended by the watchdog",
         }
     }
 }
@@ -713,6 +755,10 @@ pub struct EngineHandle {
     compaction_cancellation: Arc<StdMutex<CompactionCancellationState>>,
     /// Read-only view of the engine's turn-phase heartbeat (#6184).
     turn_heartbeat: Arc<turn_heartbeat::TurnHeartbeat>,
+    /// Where an agent's pending approval waits. An answer to one is handed
+    /// straight to it: the engine may be streaming or running tools and not
+    /// reading approvals for a long time.
+    subagent_manager: SharedSubAgentManager,
 }
 
 const MAX_PENDING_COMPACTION_CANCELLATIONS: usize = 64;
@@ -869,17 +915,28 @@ pub struct Engine {
     /// the channel closing (task exited with the pool) disarms it and the
     /// next pool ensure respawns.
     mcp_supervisor_rx: Option<mpsc::Receiver<McpSupervisorUpdate>>,
+    /// Abort the supervisor's reconnect handshakes when its pool is retired.
+    mcp_supervisor_task: Option<tokio::task::AbortHandle>,
     mcp_boot_done: Option<tokio::sync::watch::Receiver<bool>>,
     /// Generation owned by the currently installed boot receiver. Terminal
     /// cleanup is conditional on this exact value so an older pass can never
     /// clear a newer receiver.
     mcp_boot_generation: Option<u64>,
+    /// Abort handle for the boot pass that owns `mcp_boot_generation`. A
+    /// session or workspace boundary drops the pool that pass is dialing
+    /// into, so it aborts the pass instead of letting it run on (C02-08).
+    mcp_boot_task: Option<tokio::task::AbortHandle>,
     /// Monotonic generation for engine-authored MCP session snapshots. Boot
     /// task updates retain their spawn generation so later passes can reject
     /// only genuinely stale work.
     mcp_event_generation: u64,
     /// Workspace-scoped immutable plugin catalogue and authority receipts.
     plugin_registry: Arc<crate::plugins::PluginRegistry>,
+    /// This engine's hold on the process-wide extension host (`[features]
+    /// extension_host`), carrying `plugin_registry`. `None` with the flag off
+    /// and for engines without a plugin snapshot of their own (isolated
+    /// chats), which must never revoke another engine's plugins.
+    extension_host: Option<crate::extension_host::HostAttachment>,
     api_provider: ApiProvider,
     /// Exact configured route key. Named custom providers share the `Custom`
     /// enum, so the enum alone cannot prove that the active client is current.
@@ -936,6 +993,11 @@ pub struct Engine {
     pub(super) cancel_reason: Arc<StdMutex<Option<CancelReason>>>,
     tool_exec_lock: Arc<RwLock<()>>,
     turn_counter: u64,
+    /// Tree of the running turn's latest restore-point snapshot, the base the
+    /// next receipt's `changed_paths` is computed against. `None` before a
+    /// turn's first snapshot and after one failed, so a span that cannot be
+    /// accounted for is reported as unknown rather than folded into the next.
+    restore_point_since: Option<crate::snapshot::SnapshotId>,
     /// Post-edit LSP diagnostics injection (#136). Populated unconditionally
     /// — when LSP is disabled in config, this is an inert manager that
     /// always returns `None` from `diagnostics_for`.
@@ -946,6 +1008,10 @@ pub struct Engine {
     /// Session-pinned execution boundary used by model-visible sandbox labels.
     /// This must not be re-probed per turn or metadata bytes can drift.
     sandbox_enforcement: crate::sandbox::policy::SandboxEnforcement,
+    /// Live no-new-privileges flag, read once at construction beside
+    /// `sandbox_enforcement`: both are fixed for the process, so the per-turn
+    /// posture line stays byte-stable for the session.
+    no_new_privs_active: Option<bool>,
     /// Diagnostics collected during the current step's tool calls. Drained
     /// and forwarded as a synthetic user message before the next API call.
     pending_lsp_blocks: Vec<crate::lsp::DiagnosticBlock>,
@@ -989,7 +1055,7 @@ pub struct Engine {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct LiveRuntimeAuthority {
+pub(crate) struct LiveRuntimeAuthority {
     mode: AppMode,
     allow_shell: bool,
     trust_mode: bool,
@@ -1038,7 +1104,7 @@ impl LiveRuntimeAuthority {
     ///
     /// A call the user approved under `prior` stays approved under a posture
     /// that is equal or broader; only a narrowing sends it back for a retry.
-    fn narrows(&self, prior: &Self) -> bool {
+    pub(crate) fn narrows(&self, prior: &Self) -> bool {
         fn posture_rank(mode: ApprovalMode) -> u8 {
             match mode {
                 ApprovalMode::Never => 0,
@@ -1098,6 +1164,110 @@ impl LiveRuntimeAuthorityState {
             applied_revision: 0,
             authority,
         }
+    }
+}
+
+/// The session's live permission posture, as every agent it spawned reads it.
+///
+/// Agents used to copy the posture when they were spawned, so a session the
+/// person switched to Full Access kept gating its running agents with the old
+/// posture: an agent spawned under Auto-Review went on asking the guardian,
+/// and being denied, after the person had granted Full Access. Each agent call
+/// now re-reads the posture the person last chose — the same cell the TUI
+/// decides that agent's approval prompts against — through the projection
+/// the parent turn uses (trust, approval, shell policy, sandbox).
+#[derive(Clone)]
+pub(crate) struct LivePosture {
+    state: Arc<StdMutex<LiveRuntimeAuthorityState>>,
+    workspace: PathBuf,
+    network_access: crate::core::authority::SandboxNetworkAccess,
+}
+
+impl LivePosture {
+    /// The posture the person last chose.
+    pub(crate) fn read(&self) -> LiveRuntimeAuthority {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .authority
+            .clone()
+    }
+
+    /// Project the live posture onto one agent call — the same projection the
+    /// parent turn applies to its own calls — and return what was read.
+    pub(crate) fn apply(&self, context: &mut ToolContext) -> LiveRuntimeAuthority {
+        let live = self.read();
+        project_turn_authority(
+            context,
+            &TurnAuthority::from_effective_fields(
+                live.mode,
+                live.allow_shell,
+                live.trust_mode,
+                live.auto_approve,
+                live.approval_mode,
+            ),
+            &self.workspace,
+            live.configured_sandbox_mode.as_deref(),
+            self.network_access,
+        );
+        live
+    }
+}
+
+/// Project one permission authority onto a tool context: trust, approval,
+/// shell policy, and the sandbox that posture implies. The parent turn and
+/// every agent call use this one projection.
+fn project_turn_authority(
+    context: &mut ToolContext,
+    authority: &TurnAuthority,
+    workspace: &Path,
+    configured_sandbox_mode: Option<&str>,
+    network_access: crate::core::authority::SandboxNetworkAccess,
+) {
+    context.trust_mode = authority.trust_mode;
+    context.auto_approve = authority.auto_approve;
+    context.approval_mode = authority.approval_mode;
+    context.set_shell_policy(authority.shell_policy());
+    context.elevated_sandbox_policy =
+        Some(authority.sandbox_policy(workspace, configured_sandbox_mode, network_access));
+    context.shell_network_denied_hint =
+        matches!(authority.mode, AppMode::Plan).then(|| PLAN_SHELL_NETWORK_DENIED_HINT.to_string());
+}
+
+#[cfg(test)]
+impl LivePosture {
+    /// A posture cell a test switches the way the TUI does.
+    pub(crate) fn for_tests(workspace: &Path, approval_mode: ApprovalMode) -> Self {
+        let posture = Self {
+            state: Arc::new(StdMutex::new(LiveRuntimeAuthorityState::new(
+                LiveRuntimeAuthority::from_fields(
+                    AppMode::Agent,
+                    true,
+                    false,
+                    false,
+                    ApprovalMode::Suggest,
+                    None,
+                ),
+            ))),
+            workspace: workspace.to_path_buf(),
+            network_access: crate::core::authority::SandboxNetworkAccess::Restricted,
+        };
+        posture.switch_for_tests(approval_mode);
+        posture
+    }
+
+    pub(crate) fn switch_for_tests(&self, approval_mode: ApprovalMode) {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .authority = LiveRuntimeAuthority::from_fields(
+            AppMode::Agent,
+            true,
+            false,
+            false,
+            approval_mode,
+            None,
+        );
     }
 }
 
@@ -1290,13 +1460,27 @@ impl Engine {
                 &self.config.locale_tag,
             ));
             let _ = self
-                .tx_event
-                .send(Event::SnapshotsDisabled {
+                .send_event(Event::SnapshotsDisabled {
                     workspace: notice.workspace,
                     reason,
                 })
                 .await;
         }
+    }
+
+    /// Replay the execution-boundary facts a conformance golden was recorded
+    /// under. They reach the model only through `<turn_meta>`'s sandbox
+    /// posture line; production engines always probe this host at
+    /// construction, and never call this. Its only caller, the scripted
+    /// conformance families, is Unix-only.
+    #[cfg(all(test, unix))]
+    pub(crate) fn pin_recorded_platform_posture(
+        &mut self,
+        enforcement: crate::sandbox::policy::SandboxEnforcement,
+        no_new_privs_active: Option<bool>,
+    ) {
+        self.sandbox_enforcement = enforcement;
+        self.no_new_privs_active = no_new_privs_active;
     }
 
     fn begin_turn_control(&mut self) -> handle::TurnControlGuard {
@@ -1656,19 +1840,26 @@ impl Engine {
         let compaction_cancellation =
             Arc::new(StdMutex::new(CompactionCancellationState::default()));
         let tool_exec_lock = Arc::new(RwLock::new(()));
-        let plugin_registry = config
+        let own_plugin_registry = config
             .plugin_registry
             .as_ref()
             .filter(|registry| registry.workspace() == config.workspace)
-            .cloned()
-            .unwrap_or_else(|| Arc::new(crate::plugins::PluginRegistry::empty(&config.workspace)));
+            .cloned();
         // Experimental extension host: start in the background, never on the
-        // first-prompt path. Its tools join at the next turn's rebuild.
-        if config.features.enabled(Feature::ExtensionHost) {
-            let manager = crate::extension_host::manager();
-            manager.begin_session();
-            manager.sync_in_background(Arc::clone(&plugin_registry));
-        }
+        // first-prompt path. Its tools join at the next turn's rebuild. Only
+        // an engine with its own plugin snapshot attaches; the empty fallback
+        // below would desire nothing and must not affect other engines.
+        let extension_host = own_plugin_registry
+            .as_ref()
+            .filter(|_| config.features.enabled(Feature::ExtensionHost))
+            .map(|registry| {
+                let manager = crate::extension_host::manager();
+                let attachment = manager.attach(Arc::clone(registry));
+                attachment.sync_in_background();
+                attachment
+            });
+        let plugin_registry = own_plugin_registry
+            .unwrap_or_else(|| Arc::new(crate::plugins::PluginRegistry::empty(&config.workspace)));
 
         // Create clients for both providers
         let (codewhale_client, codewhale_client_error) = match CodewhaleClient::new(api_config) {
@@ -1684,9 +1875,7 @@ impl Engine {
             .map(|identity| (identity.key, identity.exact_id))
             .unwrap_or_else(|_| {
                 let key = api_config.provider_identity_for(api_provider);
-                let exact_id = (!(api_provider == ApiProvider::Custom
-                    && api_config.uses_legacy_literal_custom_route()))
-                .then(|| key.clone());
+                let exact_id = Some(key.clone());
                 (key, exact_id)
             });
         let api_key_env_only_recovery = Self::env_only_api_key_recovery_hint(api_config);
@@ -1774,7 +1963,7 @@ impl Engine {
                     ),
                     verbosity: config.verbosity.as_deref(),
                     recovery_hint: recovery_hint.as_deref(),
-                    skills_scan_codewhale_only: config.skills_scan_codewhale_only,
+                    skills_discovery_mode: config.skills_discovery_mode,
                     plugin_registry: Some(plugin_registry.as_ref()),
                     // Matches `current_mode`'s initial value below; a later
                     // `/mode` switch re-runs `refresh_system_prompt`.
@@ -1898,10 +2087,13 @@ impl Engine {
             mcp_boot_in_flight: false,
             mcp_boot_rx: None,
             mcp_supervisor_rx: None,
+            mcp_supervisor_task: None,
             mcp_boot_done: None,
             mcp_boot_generation: None,
+            mcp_boot_task: None,
             mcp_event_generation: 0,
             plugin_registry,
+            extension_host,
             api_provider,
             api_provider_identity,
             api_provider_id,
@@ -1929,10 +2121,12 @@ impl Engine {
             cancel_reason: cancel_reason.clone(),
             tool_exec_lock,
             turn_counter: 0,
+            restore_point_since: None,
             lsp_manager,
             pending_lsp_blocks: Vec::new(),
             sandbox_backend,
             sandbox_enforcement,
+            no_new_privs_active: crate::sandbox::process_hardening::no_new_privs_active(),
             current_mode: AppMode::Agent,
             turn_wall_clock: turn_budget::TurnWallClock::start(turn_wall_clock_budget),
             last_policy_narrowing: None,
@@ -1957,6 +2151,7 @@ impl Engine {
             live_runtime_authority,
             compaction_cancellation,
             turn_heartbeat: Arc::clone(&engine.turn_heartbeat),
+            subagent_manager: Arc::clone(&engine.subagent_manager),
         };
 
         (engine, handle)
@@ -1966,7 +2161,6 @@ impl Engine {
     /// client. The event loop, prompt assembly, tool registry/execution,
     /// cancellation, and session projection are unchanged; only the model I/O
     /// boundary is replaced.
-    #[allow(dead_code)] // Production injection seam; currently exercised by deterministic Engine tests.
     pub fn new_with_model_client(
         config: EngineConfig,
         api_config: &Config,
@@ -1990,6 +2184,24 @@ impl Engine {
         approval_mode: ApprovalMode,
     ) {
         let turn_control = self.begin_turn_control();
+        let Ok(terminal_permit) = streaming::reserve_event_capacity(
+            &self.tx_event,
+            Some(&self.cancel_token),
+            streaming::EventReservationPolicy::Strict,
+        )
+        .await
+        else {
+            return;
+        };
+        let Ok(start_permit) = streaming::reserve_event_capacity(
+            &self.tx_event,
+            Some(&self.cancel_token),
+            streaming::EventReservationPolicy::Strict,
+        )
+        .await
+        else {
+            return;
+        };
         self.turn_counter = self.turn_counter.saturating_add(1);
 
         let turn_id = format!(
@@ -2012,40 +2224,33 @@ impl Engine {
             auto_approve,
             approval_mode,
         );
+        let prior = self.applied_runtime_authority();
         self.apply_runtime_mode_policy(&authority);
+        self.discard_kernels_if_narrowed(&prior).await;
 
-        let _ = self
-            .tx_event
-            .send(Event::TurnStarted {
-                turn_id: turn_id.clone(),
-                created_at: chrono::Utc::now(),
-                route: None,
-            })
-            .await;
+        start_permit.send(Event::TurnStarted {
+            turn_id: turn_id.clone(),
+            created_at: chrono::Utc::now(),
+            route: None,
+            // Composer shell commands have no host submission envelope.
+            submission_id: None,
+        });
 
-        if self.config.snapshots_enabled {
-            let pre_workspace = self.session.workspace.clone();
-            let pre_seq = self.turn_counter;
-            let pre_cap = self.config.snapshots_max_workspace_bytes;
-            let pre_prompt = snapshot_prompt.clone();
-            let pre_sid = self.session.id.clone();
-            let _ = tokio::task::spawn_blocking(move || {
-                pre_turn_snapshot(
-                    &pre_workspace,
-                    pre_seq,
-                    pre_cap,
-                    Some(&pre_prompt),
-                    Some(&pre_sid),
-                )
-            })
-            .await;
-        }
+        // The command runs from this snapshot to the post-turn one, so the
+        // receipt names it as the call that span belongs to.
+        self.take_restore_point(
+            WorkspaceSnapshotKind::PreTurn,
+            format_snapshot_label("pre-turn", self.turn_counter, Some(&snapshot_prompt)),
+            Some(tool_id.as_str()),
+            None,
+        )
+        .await;
 
         self.emit_pending_snapshot_notices().await;
 
         let _ = self
-            .tx_event
-            .send(Event::ToolCallStarted {
+            .send_event(Event::ToolCallStarted {
+                model_call: None,
                 id: tool_id.clone(),
                 name: tool_name.clone(),
                 input: tool_input.clone(),
@@ -2134,8 +2339,8 @@ impl Engine {
         let error = result.as_ref().err().map(ToString::to_string);
 
         let _ = self
-            .tx_event
-            .send(Event::ToolCallComplete {
+            .send_event(Event::ToolCallComplete {
+                model_call: None,
                 id: tool_id,
                 name: tool_name,
                 result,
@@ -2145,35 +2350,131 @@ impl Engine {
         if status == TurnOutcomeStatus::Interrupted {
             self.emit_interrupted_survivor_status().await;
         }
-        drop(turn_control);
-        let _ = self
-            .tx_event
-            .send(Event::TurnComplete {
-                usage: Usage::default(),
-                parent_route_usage: Usage::default(),
-                routed_usage_dropped_records: 0,
-                status,
-                error,
-                tool_catalog: None,
-                base_url: None,
-            })
+        self.post_turn_snapshot_before_complete(&snapshot_prompt)
             .await;
+        let pending_post_turn = self.reserve_post_turn_snapshot();
+        let status = terminal_turn_status_at_settlement(status, self.cancel_token.is_cancelled());
+        terminal_permit.send(Event::TurnComplete {
+            usage: Usage::default(),
+            parent_route_usage: Usage::default(),
+            routed_usage_dropped_records: 0,
+            status,
+            error,
+            tool_catalog: None,
+            base_url: None,
+        });
 
-        if self.config.snapshots_enabled {
-            let post_workspace = self.session.workspace.clone();
-            let post_seq = self.turn_counter;
-            let post_cap = self.config.snapshots_max_workspace_bytes;
-            let post_sid = self.session.id.clone();
-            crate::utils::spawn_blocking_supervised("post-shell-turn-snapshot", move || {
-                post_turn_snapshot(
-                    &post_workspace,
-                    post_seq,
-                    post_cap,
-                    Some(&snapshot_prompt),
-                    Some(&post_sid),
-                );
-            });
+        self.post_turn_snapshot_after_complete(
+            "post-shell-turn-snapshot",
+            snapshot_prompt,
+            pending_post_turn,
+        );
+        drop(turn_control);
+    }
+
+    /// Take one workspace snapshot for the running turn and report it as an
+    /// `Event::WorkspaceSnapshotTaken` receipt. Returns whether it was taken.
+    ///
+    /// A snapshot that fails (or is gated off) reports nothing: the host then
+    /// has no such restore point for the turn and must say so rather than
+    /// guess one. With [`EngineConfig::record_restore_points`] the receipt
+    /// also carries the paths changed since the turn's previous snapshot,
+    /// and a failure leaves the next span unknown instead of merging it into
+    /// the one before.
+    pub(crate) async fn take_restore_point(
+        &mut self,
+        kind: WorkspaceSnapshotKind,
+        label: String,
+        tool_call_id: Option<&str>,
+        write_paths: Option<Vec<String>>,
+    ) -> bool {
+        if !self.config.snapshots_enabled {
+            return false;
         }
+        let record = self.config.record_restore_points;
+        let since = if record && kind != WorkspaceSnapshotKind::PreTurn {
+            self.restore_point_since.clone()
+        } else {
+            None
+        };
+        let workspace = self.session.workspace.clone();
+        let cap = self.config.snapshots_max_workspace_bytes;
+        let sid = self.session.id.clone();
+        let taken = tokio::task::spawn_blocking(move || {
+            super::turn::restore_point_snapshot(&workspace, &label, cap, Some(&sid), since.as_ref())
+        })
+        .await
+        .ok()
+        .flatten();
+        let Some((taken, changed)) = taken else {
+            self.restore_point_since = None;
+            return false;
+        };
+        if record {
+            self.restore_point_since = Some(taken.tree.clone());
+        }
+        let mut snapshot = WorkspaceSnapshotRef::new(kind, &taken, &self.session.id, tool_call_id);
+        snapshot.write_paths = write_paths;
+        snapshot.changed_paths = changed.map(|paths| {
+            paths
+                .into_iter()
+                .map(|path| path.to_string_lossy().into_owned())
+                .collect()
+        });
+        let _ = self
+            .send_event(Event::WorkspaceSnapshotTaken { snapshot })
+            .await;
+        true
+    }
+
+    /// With [`EngineConfig::record_restore_points`], take the post-turn
+    /// snapshot now — before `TurnComplete` — and report it.
+    async fn post_turn_snapshot_before_complete(&mut self, prompt: &str) {
+        if !self.config.record_restore_points {
+            return;
+        }
+        let label = format_snapshot_label("post-turn", self.turn_counter, Some(prompt));
+        self.take_restore_point(WorkspaceSnapshotKind::PostTurn, label, None, None)
+            .await;
+    }
+
+    /// Without [`EngineConfig::record_restore_points`], reserve the post-turn
+    /// snapshot [`Self::post_turn_snapshot_after_complete`] takes. Called
+    /// before `TurnComplete`, so a `/undo` the user types as soon as the
+    /// turn ends waits for that snapshot instead of racing it (#6644).
+    fn reserve_post_turn_snapshot(&self) -> Option<crate::snapshot::PendingPostTurnSnapshot> {
+        (self.config.snapshots_enabled && !self.config.record_restore_points)
+            .then(crate::snapshot::PendingPostTurnSnapshot::reserve)
+    }
+
+    /// Take the post-turn snapshot reserved by
+    /// [`Self::reserve_post_turn_snapshot`] fire-and-forget: `TurnComplete`
+    /// is already emitted, so the UI is unblocked and the user can type /
+    /// select / paste immediately (#234). The git work proceeds on the
+    /// blocking pool, and the reservation is released once it is done.
+    fn post_turn_snapshot_after_complete(
+        &self,
+        task: &'static str,
+        prompt: String,
+        pending: Option<crate::snapshot::PendingPostTurnSnapshot>,
+    ) {
+        let Some(pending) = pending else {
+            return;
+        };
+        let post_workspace = self.session.workspace.clone();
+        let post_seq = self.turn_counter;
+        let post_cap = self.config.snapshots_max_workspace_bytes;
+        let post_sid = self.session.id.clone();
+        crate::utils::spawn_blocking_supervised(task, move || {
+            post_turn_snapshot(
+                &post_workspace,
+                post_seq,
+                post_cap,
+                Some(&prompt),
+                Some(&post_sid),
+            );
+            drop(pending);
+        });
     }
 
     /// Apply a user/host mode-or-posture change to the live session.
@@ -2204,15 +2505,16 @@ impl Engine {
                 != (authority.auto_approve || effective_approval == ApprovalMode::Bypass)
             || self.session.approval_mode != effective_approval
             || self.api_config.sandbox_mode != configured_sandbox_mode;
+        let prior = self.applied_runtime_authority();
         self.api_config.sandbox_mode = configured_sandbox_mode;
         self.apply_runtime_mode_policy(&authority);
+        self.discard_kernels_if_narrowed(&prior).await;
         if !changed {
             return false;
         }
         self.emit_session_updated().await;
         let _ = self
-            .tx_event
-            .send(Event::status(format!(
+            .send_event(Event::status(format!(
                 // Payload first, and short enough for the posture bar's right
                 // slot. "Runtime policy changed to: X / Y" sheds at the colon —
                 // the bar's notice shedder cuts at clause joints and keeps the
@@ -2305,6 +2607,28 @@ impl Engine {
         }
     }
 
+    /// A Python kernel keeps whatever it imported, opened or started under the
+    /// posture it ran in. Once the posture grants less than `prior`, drop the
+    /// session kernel and every persistent RLM kernel so later code starts in
+    /// a fresh interpreter. Nothing takes a kernel out and puts it back, so a
+    /// round already in flight cannot restore one.
+    ///
+    /// Known limitation: these interpreters are approval-gated local
+    /// subprocesses, not OS-sandboxed; discarding them bounds reuse, it does
+    /// not undo effects of code that already ran.
+    async fn discard_kernels_if_narrowed(&mut self, prior: &LiveRuntimeAuthority) {
+        if !self.applied_runtime_authority().narrows(prior) {
+            return;
+        }
+        self.repl_kernel = None;
+        self.config
+            .runtime_services
+            .rlm_sessions
+            .lock()
+            .await
+            .clear();
+    }
+
     fn apply_runtime_mode_policy(&mut self, authority: &TurnAuthority) {
         // Prompt composition is mode-agnostic. Keep the hash-guarded refresh
         // because embedders may still derive custom prompt bytes from session
@@ -2346,8 +2670,7 @@ impl Engine {
             self.try_flush_pending_goal_continuation();
             if should_announce {
                 let _ = self
-                    .tx_event
-                    .send(Event::GoalContinuationWaiting { delay_seconds })
+                    .send_event(Event::GoalContinuationWaiting { delay_seconds })
                     .await;
             }
             return;
@@ -2365,8 +2688,7 @@ impl Engine {
         self.try_flush_pending_goal_continuation();
         if delay_seconds > 0 {
             let _ = self
-                .tx_event
-                .send(Event::GoalContinuationWaiting { delay_seconds })
+                .send_event(Event::GoalContinuationWaiting { delay_seconds })
                 .await;
         }
     }
@@ -2378,8 +2700,7 @@ impl Engine {
             );
             if scheduled.was_delayed {
                 let _ = self
-                    .tx_event
-                    .send(Event::GoalContinuationWaitEnded { interrupted })
+                    .send_event(Event::GoalContinuationWaitEnded { interrupted })
                     .await;
             }
         }
@@ -2431,6 +2752,95 @@ impl Engine {
         &self.session.id
     }
 
+    /// Install one restored history and invalidate every dependent prompt/token
+    /// cache. Resume and conditional undo share this exact implementation.
+    fn restore_session_history(
+        &mut self,
+        messages: Vec<codewhale_models::Message>,
+        system_prompt: Option<codewhale_models::SystemPrompt>,
+        system_prompt_override: bool,
+    ) {
+        self.session.tool_activation_cache.clear();
+        let compaction_checkpoint = extract_compaction_summary_prompt(system_prompt.clone())
+            .or_else(|| {
+                // Current Engine projections carry the checkpoint in history,
+                // with a stripped system prompt. Only the existing structural
+                // validator can authorize a history block as that checkpoint.
+                messages.iter().rev().find_map(|message| {
+                    if !crate::compaction::is_wire_compaction_checkpoint_message(message) {
+                        return None;
+                    }
+                    match &message.content[0] {
+                        codewhale_models::ContentBlock::Text { text, .. } => {
+                            Some(codewhale_models::SystemPrompt::Text(text.clone()))
+                        }
+                        _ => None,
+                    }
+                })
+            });
+        // The op owns the synced history: move each message
+        // through the projection instead of cloning the whole
+        // conversation and dropping the original (M3).
+        let restored_messages =
+            crate::runtime_handoff::project_owned_messages_for_restore(messages);
+        // Replace the checkpoint in place so turns after the
+        // compaction boundary keep their chronology.
+        let restored_messages = crate::compaction::restore_compaction_checkpoint(
+            restored_messages,
+            compaction_checkpoint.as_ref(),
+        );
+        self.session.messages = restored_messages.into();
+        // Direct field assignment bypasses `add_message` /
+        // `replace_messages`, which own the messages-revision
+        // bump the token-estimate cache keys on (#perf-r5).
+        // Without this bump the first estimate after a
+        // session restore is computed against whatever
+        // history revision was current before the sync — a
+        // stale number can flow into capacity checkpoints.
+        self.session.bump_messages_revision();
+        self.session.latest_parent_input_tokens = None;
+        self.session.compaction_summary_prompt = compaction_checkpoint;
+        self.session.system_prompt =
+            crate::compaction::strip_compaction_summaries(system_prompt.as_ref());
+        self.session.last_system_prompt_hash =
+            Some(system_prompt_hash(self.session.system_prompt.as_ref()));
+        // Prompt pins and drift baselines describe the
+        // conversation that was active before this sync. The
+        // next submitted turn must establish the installed
+        // conversation's own full prefix instead of comparing
+        // it with that stale baseline and emitting a
+        // `<context_update>` from an empty/restored prompt.
+        // Host-owned overrides remain byte-stable because the
+        // refresh path exits early while the override is set.
+        self.session.pinned_prompt_context = None;
+        self.session.context_update_baseline = None;
+        // A session sync installs a new (or restored) prefix.
+        // Declare it so the next request re-pins the KV-cache
+        // prefix under a logged `resume` reason instead of
+        // reporting undeclared drift.
+        self.session.pending_prefix_change_reason = Some("resume".to_string());
+        // Host-supplied prompts are persisted prefixes. Keep them
+        // byte-stable; mode/runtime state is projected per request.
+        self.session.system_prompt_override =
+            system_prompt_override && self.session.system_prompt.is_some();
+    }
+
+    fn session_snapshot(&self) -> SessionSnapshot {
+        let total_tokens =
+            self.session.total_usage.input_tokens + self.session.total_usage.output_tokens;
+        SessionSnapshot {
+            session_id: self.session.id.clone(),
+            messages: self.session.messages.to_vec(),
+            total_tokens,
+            model: self.session.model.clone(),
+            model_provider: self.api_provider.as_str().to_string(),
+            model_provider_id: self.api_provider_id.clone(),
+            workspace: self.session.workspace.clone(),
+            system_prompt: self.session.system_prompt.clone(),
+            mode: self.current_mode.as_setting().to_string(),
+        }
+    }
+
     fn install_synced_session_id(&mut self, next_session_id: String) -> Option<String> {
         let previous_session_id = self.session.id.clone();
         if next_session_id == previous_session_id {
@@ -2442,7 +2852,12 @@ impl Engine {
         // Runtime-added MCP servers are conversation capabilities even when
         // both conversations use the same workspace. Configured servers can
         // reconnect lazily after the new session is installed.
-        self.mcp_pool = None;
+        self.drop_mcp_pool();
+        // C02-17: cumulative usage belongs to the conversation that spent
+        // it. The sync carries no prior total for the installed session, so
+        // it starts from zero instead of inheriting the previous session's
+        // tokens into its snapshot and saved `total_tokens`.
+        self.session.total_usage = Default::default();
         self.session.id = next_session_id;
         Some(previous_session_id)
     }
@@ -2575,7 +2990,7 @@ impl Engine {
                                 && scheduled.ready_at == Some(ready_at)
                             {
                                 scheduled.ready_at = None;
-                                let _ = self.tx_event.send(Event::GoalContinuationWaitEnded {
+                                let _ = self.send_event(Event::GoalContinuationWaitEnded {
                                     interrupted: false,
                                 }).await;
                             }
@@ -2604,14 +3019,10 @@ impl Engine {
                     completion = self.rx_subagent_completion.recv(), if subagent_wake_armed => {
                         return completion.map(EngineRunInput::SubAgentCompletion);
                     }
-                    // A background child may be waiting on a person's answer
-                    // while the parent turn is idle: route it. Any other
-                    // decision has no waiter and is dropped, as before.
-                    decision = self.rx_approval.recv() => {
-                        if let Some(decision) = decision {
-                            self.route_child_approval_decision(decision).await;
-                        }
-                    }
+                    // No call of this engine awaits approval while idle, and
+                    // the handle hands agent answers to the agent directly:
+                    // a stale decision has no waiter and is dropped.
+                    _ = self.rx_approval.recv() => {}
                     update = async {
                         match self.mcp_boot_rx.as_mut() {
                             Some(rx) => rx.recv().await,
@@ -2649,40 +3060,6 @@ impl Engine {
                 }
             }
         }
-    }
-
-    /// Deliver an approval decision to a child waiting on it. Returns whether
-    /// a child took it; the parent's own awaiting call keeps every other id.
-    async fn route_child_approval_decision(
-        &self,
-        decision: super::engine::approval::ApprovalDecision,
-    ) -> bool {
-        use crate::tools::subagent::{ChildApprovalOutcome, SubAgentManager};
-        let (id, outcome) = match &decision {
-            super::engine::approval::ApprovalDecision::Approved { id } => {
-                (id.clone(), ChildApprovalOutcome::Approved)
-            }
-            super::engine::approval::ApprovalDecision::Denied { id } => {
-                (id.clone(), ChildApprovalOutcome::Denied)
-            }
-            // A child has no timeout outcome of its own (#6101); an expired
-            // card is a deny for whichever call it was answering.
-            super::engine::approval::ApprovalDecision::TimedOut { id } => {
-                (id.clone(), ChildApprovalOutcome::Denied)
-            }
-            super::engine::approval::ApprovalDecision::Unavailable { id } => {
-                (id.clone(), ChildApprovalOutcome::Unavailable)
-            }
-            // A sandbox retry only exists for the parent's own tool call.
-            super::engine::approval::ApprovalDecision::RetryWithPolicy { .. } => return false,
-        };
-        if !SubAgentManager::is_child_approval_id(&id) {
-            return false;
-        }
-        self.subagent_manager
-            .write()
-            .await
-            .resolve_child_approval(&id, outcome)
     }
 
     /// Whether the idle loop should poll for background shell completion: a
@@ -2730,8 +3107,7 @@ impl Engine {
             .unwrap_or(false);
         if goal_active {
             let _ = self
-                .tx_event
-                .send(Event::status(
+                .send_event(Event::status(
                     "Background shell work finished; continuing the active goal".to_string(),
                 ))
                 .await;
@@ -2754,9 +3130,7 @@ impl Engine {
                             .len()
                     })
                     .unwrap_or(0);
-                let _ = self
-                    .tx_event
-                    .send(Event::error(ErrorEnvelope::fatal_auth(format!(
+                let _ = self.send_event(Event::error(ErrorEnvelope::fatal_auth(format!(
                         "{finished} background shell task(s) finished, but the turn cannot resume because the provider route is no longer valid: {err}. Their output stays available via /jobs."
                     ))))
                     .await;
@@ -2764,8 +3138,7 @@ impl Engine {
             }
         };
         let _ = self
-            .tx_event
-            .send(Event::status(
+            .send_event(Event::status(
                 "Background shell work finished; resuming the turn".to_string(),
             ))
             .await;
@@ -2796,6 +3169,9 @@ impl Engine {
                 provenance: UserInputProvenance::Runtime,
                 images: Vec::new(),
                 max_output_tokens: None,
+                // Background shell completion wake: no host submission to
+                // correlate with.
+                submission_id: None,
             })
             .await;
     }
@@ -2937,9 +3313,7 @@ impl Engine {
                                 let message = format!(
                                     "Goal continuation blocked because its provider route is no longer valid: {err}. Fix the route, then resume the goal."
                                 );
-                                let _ = self
-                                    .tx_event
-                                    .send(Event::error(ErrorEnvelope::fatal_auth(format!(
+                                let _ = self.send_event(Event::error(ErrorEnvelope::fatal_auth(format!(
                                         "Goal continuation stopped because its provider route is no longer valid: {err}"
                                     ))))
                                     .await;
@@ -2975,6 +3349,9 @@ impl Engine {
                                 provenance: UserInputProvenance::Runtime,
                                 images: Vec::new(),
                                 max_output_tokens: None,
+                                // Engine-scheduled goal continuation: no host
+                                // submission to correlate with.
+                                submission_id: None,
                             })
                             .await;
                     }
@@ -3032,8 +3409,7 @@ impl Engine {
                             }
                         };
                         let _ = self
-                            .tx_event
-                            .send(Event::RequestManifestReady { rendered })
+                            .send_event(Event::RequestManifestReady { rendered })
                             .await;
                     }
                     Op::ListSubAgents => {
@@ -3137,8 +3513,7 @@ impl Engine {
                             (outcome, agent_list_event(&manager, &active_session_id))
                         };
                         let _ = self
-                            .tx_event
-                            .send(Event::SubAgentFollowUp {
+                            .send_event(Event::SubAgentFollowUp {
                                 owner_session_id: active_session_id,
                                 agent_id,
                                 outcome,
@@ -3187,24 +3562,26 @@ impl Engine {
                         self.refresh_system_prompt_with_reason("model");
                         self.emit_session_updated().await;
                         let _ = self
-                            .tx_event
-                            .send(Event::status(format!(
+                            .send_event(Event::status(format!(
                                 "Model set to: {}",
                                 self.session.model
                             )))
                             .await;
                     }
                     Op::SetCompaction { config } => {
-                        // Hosts resend the compaction config on every route
-                        // or model sync. An unchanged config is not news; its
-                        // acknowledgement used to overwrite a real error in
-                        // the footer (U1).
-                        if self.config.compaction != config {
-                            let enabled = config.enabled;
-                            self.config.compaction = config;
+                        // Hosts resend the compaction config on every route,
+                        // model or session sync, and those syncs move the
+                        // model, window and thresholds without the user
+                        // touching the switch. Only the switch is news: an
+                        // acknowledgement for anything else used to overwrite
+                        // a real error in the footer (U1) and the "Resumed:"
+                        // receipt a session restore had just shown.
+                        let enabled = config.enabled;
+                        let switched = self.config.compaction.enabled != enabled;
+                        self.config.compaction = config;
+                        if switched {
                             let _ = self
-                                .tx_event
-                                .send(Event::status(format!(
+                                .send_event(Event::status(format!(
                                     "Make room automatically: {}",
                                     if enabled { "on" } else { "off" }
                                 )))
@@ -3214,8 +3591,7 @@ impl Engine {
                     Op::SetStreamChunkTimeout { timeout_secs } => {
                         self.config.stream_chunk_timeout = Duration::from_secs(timeout_secs);
                         let _ = self
-                            .tx_event
-                            .send(Event::status(format!(
+                            .send_event(Event::status(format!(
                                 "Stream chunk timeout set to {timeout_secs}s"
                             )))
                             .await;
@@ -3252,9 +3628,7 @@ impl Engine {
                         } else {
                             "; launch_concurrency takes full effect after active sub-agents finish or the session restarts"
                         };
-                        let _ = self
-                            .tx_event
-                            .send(Event::status(format!(
+                        let _ = self.send_event(Event::status(format!(
                                 "Sub-agent runtime updated: enabled={enabled}, max_subagents={}, launch_concurrency={}, max_depth={}{}",
                                 self.config.max_subagents,
                                 self.config.launch_concurrency,
@@ -3266,8 +3640,7 @@ impl Engine {
                     Op::SetFleetRoster { roster } => {
                         self.config.fleet_roster = roster;
                         let _ = self
-                            .tx_event
-                            .send(Event::status(
+                            .send_event(Event::status(
                                 "Fleet roster refreshed for subsequent turns".to_string(),
                             ))
                             .await;
@@ -3281,12 +3654,6 @@ impl Engine {
                         workspace,
                         mode,
                     } => {
-                        // Deferred tool activations belong to one
-                        // conversation. SyncSession installs a conversation's
-                        // identity, history, and workspace (including the
-                        // generated-ID new-session path), so never carry the
-                        // previous conversation's toolbox across this edge.
-                        self.session.tool_activation_cache.clear();
                         let plugin_workspace_changed =
                             self.plugin_registry.workspace() != workspace.as_path();
                         let previous_session_id = self.session.id.clone();
@@ -3321,53 +3688,11 @@ impl Engine {
                                 );
                             }
                         }
-                        let compaction_checkpoint =
-                            extract_compaction_summary_prompt(system_prompt.clone());
-                        // The op owns the synced history: move each message
-                        // through the projection instead of cloning the whole
-                        // conversation and dropping the original (M3).
-                        let restored_messages =
-                            crate::runtime_handoff::project_owned_messages_for_restore(messages);
-                        // Replace the checkpoint in place so turns after the
-                        // compaction boundary keep their chronology.
-                        let restored_messages = crate::compaction::restore_compaction_checkpoint(
-                            restored_messages,
-                            compaction_checkpoint.as_ref(),
+                        self.restore_session_history(
+                            messages,
+                            system_prompt,
+                            system_prompt_override,
                         );
-                        self.session.messages = restored_messages.into();
-                        // Direct field assignment bypasses `add_message` /
-                        // `replace_messages`, which own the messages-revision
-                        // bump the token-estimate cache keys on (#perf-r5).
-                        // Without this bump the first estimate after a
-                        // session restore is computed against whatever
-                        // history revision was current before the sync — a
-                        // stale number can flow into capacity checkpoints.
-                        self.session.bump_messages_revision();
-                        self.session.latest_parent_input_tokens = None;
-                        self.session.compaction_summary_prompt = compaction_checkpoint;
-                        self.session.system_prompt =
-                            crate::compaction::strip_compaction_summaries(system_prompt.as_ref());
-                        self.session.last_system_prompt_hash =
-                            Some(system_prompt_hash(self.session.system_prompt.as_ref()));
-                        // Prompt pins and drift baselines describe the
-                        // conversation that was active before this sync. The
-                        // next submitted turn must establish the installed
-                        // conversation's own full prefix instead of comparing
-                        // it with that stale baseline and emitting a
-                        // `<context_update>` from an empty/restored prompt.
-                        // Host-owned overrides remain byte-stable because the
-                        // refresh path exits early while the override is set.
-                        self.session.pinned_prompt_context = None;
-                        self.session.context_update_baseline = None;
-                        // A session sync installs a new (or restored) prefix.
-                        // Declare it so the next request re-pins the KV-cache
-                        // prefix under a logged `resume` reason instead of
-                        // reporting undeclared drift.
-                        self.session.pending_prefix_change_reason = Some("resume".to_string());
-                        // Host-supplied prompts are persisted prefixes. Keep them
-                        // byte-stable; mode/runtime state is projected per request.
-                        self.session.system_prompt_override =
-                            system_prompt_override && self.session.system_prompt.is_some();
                         self.session.auto_model = model.trim().eq_ignore_ascii_case("auto");
                         self.session.model = model;
                         self.session.workspace = workspace.clone();
@@ -3380,7 +3705,11 @@ impl Engine {
                             self.config.plugin_registry = Some(Arc::clone(&self.plugin_registry));
                             // A pool may contain plugin servers and authority
                             // receipts from the previous workspace snapshot.
-                            self.mcp_pool = None;
+                            self.drop_mcp_pool();
+                            if let Some(attachment) = &self.extension_host {
+                                attachment.set_plugins(Arc::clone(&self.plugin_registry));
+                                attachment.sync_in_background();
+                            }
                         }
                         let ctx =
                             crate::project_context::load_project_context_with_parents(&workspace);
@@ -3391,11 +3720,34 @@ impl Engine {
                         };
                         self.session.rebuild_working_set();
                         self.reconcile_restored_work_bindings().await;
+                        // SessionUpdated acknowledges the sync. A generic status
+                        // would immediately cover the host's confirmed resume receipt.
                         self.emit_session_updated().await;
-                        let _ = self
-                            .tx_event
-                            .send(Event::status("Session context synced".to_string()))
-                            .await;
+                    }
+                    Op::RewindConversation {
+                        expected,
+                        messages,
+                        tx,
+                    } => {
+                        // Compare at the Engine mailbox boundary, not only in
+                        // the UI: queued work may have changed the conversation
+                        // since preflight. Refuse before touching any state.
+                        if self.session_snapshot() != *expected
+                            || messages.len() >= expected.messages.len()
+                            || !expected.messages.starts_with(&messages)
+                        {
+                            let _ = tx.send(None);
+                            continue;
+                        }
+                        self.restore_session_history(
+                            messages,
+                            self.session.system_prompt.clone(),
+                            self.session.system_prompt_override,
+                        );
+                        self.session.rebuild_working_set();
+                        self.reconcile_restored_work_bindings().await;
+                        let _ = tx.send(Some(self.session_snapshot()));
+                        self.emit_session_updated().await;
                     }
                     Op::CompactContext {
                         id,
@@ -3412,19 +3764,7 @@ impl Engine {
                         self.finish_compaction(&id);
                     }
                     Op::GetSessionSnapshot { tx } => {
-                        let total_tokens = self.session.total_usage.input_tokens
-                            + self.session.total_usage.output_tokens;
-                        let snapshot = SessionSnapshot {
-                            session_id: self.session.id.clone(),
-                            messages: self.session.messages.to_vec(),
-                            total_tokens,
-                            model: self.session.model.clone(),
-                            model_provider: self.api_provider.as_str().to_string(),
-                            model_provider_id: self.api_provider_id.clone(),
-                            workspace: self.session.workspace.clone(),
-                            system_prompt: self.session.system_prompt.clone(),
-                            mode: self.current_mode.as_setting().to_string(),
-                        };
+                        let snapshot = self.session_snapshot();
                         if let Some(tx) = tx.lock().ok().and_then(|mut g| g.take()) {
                             let _ = tx.send(snapshot);
                         }
@@ -3510,7 +3850,10 @@ impl Engine {
                         }
                         self.handle_purge().await;
                     }
-                    Op::EditLastTurn { new_message } => {
+                    Op::EditLastTurn {
+                        new_message,
+                        submission_id,
+                    } => {
                         let route = match self.current_runtime_route() {
                             Ok(route) => route,
                             Err(err) => {
@@ -3561,46 +3904,71 @@ impl Engine {
                                 continue;
                             }
                         };
+                        // C02-02: stage the cut. The removed exchange is kept
+                        // until the replacement turn actually starts; a send
+                        // that never starts puts it back (below).
+                        let removed_exchange = self
+                            .session
+                            .messages
+                            .get(idx..)
+                            .map(<[_]>::to_vec)
+                            .unwrap_or_default();
                         self.session.messages.truncate_to(idx);
                         self.session.bump_messages_revision();
                         // Now dispatch the new message as a normal send,
                         // reusing the engine's stored mode/model config.
                         let mode = self.current_mode;
-                        self.handle_send_message(TurnSpec {
-                            content: new_message.clone(),
-                            mode,
-                            route: Box::new(route),
-                            compaction: Box::new(self.config.compaction.clone()),
-                            initial_routed_usage: Box::new(
-                                crate::cost_status::RuntimeUsageBatch::default(),
-                            ),
-                            goal_objective: self.config.goal_objective.clone(),
-                            goal_token_budget: self.config.goal_token_budget,
-                            goal_status: self.config.goal_status,
-                            reasoning_effort: self.session.reasoning_effort.clone(),
-                            reasoning_effort_auto: self.session.reasoning_effort_auto,
-                            auto_model: self.session.auto_model,
-                            allow_shell: self.session.allow_shell,
-                            trust_mode: self.session.trust_mode,
-                            auto_approve: self.session.auto_approve,
-                            approval_mode: self.session.approval_mode,
-                            translation_enabled: self.config.translation_enabled,
-                            allowed_tools: self.config.allowed_tools.clone(),
-                            dynamic_tools: Vec::new(),
-                            hook_executor: self.config.hook_executor.clone(),
-                            verbosity: self.config.verbosity.clone(),
-                            provenance: UserInputProvenance::ExternalUser,
-                            images: Vec::new(),
-                            max_output_tokens: None,
-                        })
-                        .await;
+                        let outcome = self
+                            .handle_send_message(TurnSpec {
+                                content: new_message.clone(),
+                                mode,
+                                route: Box::new(route),
+                                compaction: Box::new(self.config.compaction.clone()),
+                                initial_routed_usage: Box::new(
+                                    crate::cost_status::RuntimeUsageBatch::default(),
+                                ),
+                                goal_objective: self.config.goal_objective.clone(),
+                                goal_token_budget: self.config.goal_token_budget,
+                                goal_status: self.config.goal_status,
+                                reasoning_effort: self.session.reasoning_effort.clone(),
+                                reasoning_effort_auto: self.session.reasoning_effort_auto,
+                                auto_model: self.session.auto_model,
+                                allow_shell: self.session.allow_shell,
+                                trust_mode: self.session.trust_mode,
+                                auto_approve: self.session.auto_approve,
+                                approval_mode: self.session.approval_mode,
+                                translation_enabled: self.config.translation_enabled,
+                                allowed_tools: self.config.allowed_tools.clone(),
+                                dynamic_tools: Vec::new(),
+                                hook_executor: self.config.hook_executor.clone(),
+                                verbosity: self.config.verbosity.clone(),
+                                provenance: UserInputProvenance::ExternalUser,
+                                images: Vec::new(),
+                                max_output_tokens: None,
+                                submission_id,
+                            })
+                            .await;
+                        if matches!(outcome, SendMessageOutcome::NotStarted { .. }) {
+                            // Anything the failed send appended after the cut
+                            // (a drained shell-completion notice) stays, after
+                            // the restored exchange.
+                            let appended = self
+                                .session
+                                .messages
+                                .get(idx..)
+                                .map(<[_]>::to_vec)
+                                .unwrap_or_default();
+                            self.session.messages.truncate_to(idx);
+                            self.session.messages.push_batch(removed_exchange);
+                            self.session.messages.push_batch(appended);
+                            self.session.bump_messages_revision();
+                            self.emit_session_updated().await;
+                        }
                     }
                     Op::SetAdvisorEnabled { enabled } => {
                         self.config.advisor_config.enabled = enabled;
                         let state = if enabled { "enabled" } else { "disabled" };
-                        let _ = self
-                            .tx_event
-                            .send(Event::status(format!(
+                        let _ = self.send_event(Event::status(format!(
                                 "Advisor watcher {state}. Notes will appear after turns with tool calls."
                             )))
                             .await;
@@ -3667,8 +4035,7 @@ impl Engine {
 
     async fn emit_session_updated(&self) {
         let _ = self
-            .tx_event
-            .send(Event::SessionUpdated {
+            .send_event(Event::SessionUpdated {
                 session_id: self.session.id.clone(),
                 messages: self.session.messages.snapshot(),
                 system_prompt: self.session.system_prompt.clone(),
@@ -3693,7 +4060,7 @@ impl Engine {
 
     async fn emit_goal_updated(&self) {
         if let Some(snapshot) = self.goal_snapshot_for_event() {
-            let _ = self.tx_event.send(Event::GoalUpdated { snapshot }).await;
+            let _ = self.send_event(Event::GoalUpdated { snapshot }).await;
         }
     }
 
@@ -3784,9 +4151,43 @@ impl Engine {
         Some(format!("Active goal token budget: {token_budget}"))
     }
 
-    async fn add_session_message(&mut self, message: Message) {
+    async fn add_session_message(&mut self, mut message: Message) {
+        self.redact_tool_results_for_transcript(&mut message);
         self.session.add_message(message);
         self.emit_session_updated().await;
+    }
+
+    /// Scrub credentials from tool output once, as it enters the transcript
+    /// (B1). The transcript is what session JSON, the journal and every
+    /// later request are built from, so a token a tool printed is never
+    /// written to disk live. Honors the confirmed `[redaction] model_bound`
+    /// opt-out the same way the request boundary does.
+    fn redact_tool_results_for_transcript(&self, message: &mut Message) {
+        for block in &mut message.content {
+            let ContentBlock::ToolResult {
+                content,
+                content_blocks,
+                ..
+            } = block
+            else {
+                continue;
+            };
+            *content = self.redact_tool_output_for_transcript(content);
+            for value in content_blocks.iter_mut().flatten() {
+                if value.get("type").and_then(serde_json::Value::as_str) == Some("text")
+                    && let Some(serde_json::Value::String(text)) = value.get_mut("text")
+                {
+                    *text = self.redact_tool_output_for_transcript(text);
+                }
+            }
+        }
+    }
+
+    fn redact_tool_output_for_transcript(&self, text: &str) -> String {
+        match self.codewhale_client.as_ref() {
+            Some(client) => client.redact_tool_output_for_transcript(text),
+            None => codewhale_config::persistence::redact_model_bound_secrets(text),
+        }
     }
 
     async fn add_interrupted_assistant_text(&mut self, text: &str) {
@@ -3904,16 +4305,14 @@ impl Engine {
             // `render_environment_block` for the prefix-cache rationale).
             format!("Current workspace: {}", self.config.workspace.display()),
             format!(
-                "Current permission posture: {}",
+                "{PERMISSION_POSTURE_LINE}{}",
                 approval_mode.permission_chip_label()
             ),
             format!(
                 "Current sandbox posture: {}",
                 sandbox_posture.posture_label_with_enforcement_and_no_new_privs(
                     self.sandbox_enforcement,
-                    // Fixed at process start, so the per-turn line stays
-                    // byte-stable for the session.
-                    crate::sandbox::process_hardening::no_new_privs_active(),
+                    self.no_new_privs_active,
                 )
             ),
         ];
@@ -4172,9 +4571,7 @@ impl Engine {
                 for agent_id in claimed_ids {
                     self.delivered_subagent_completion_ids.remove(&agent_id);
                 }
-                let _ = self
-                    .tx_event
-                    .send(Event::error(ErrorEnvelope::fatal_auth(format!(
+                let _ = self.send_event(Event::error(ErrorEnvelope::fatal_auth(format!(
                         "Cannot resume the turn because its provider route is no longer valid: {err}"
                     ))))
                     .await;
@@ -4210,8 +4607,7 @@ impl Engine {
         };
 
         let _ = self
-            .tx_event
-            .send(Event::status(format!(
+            .send_event(Event::status(format!(
                 "Resuming turn with {count} idle sub-agent completion(s){failure_suffix}"
             )))
             .await;
@@ -4241,6 +4637,9 @@ impl Engine {
                 provenance: UserInputProvenance::SubAgentHandoff,
                 images: Vec::new(),
                 max_output_tokens: None,
+                // Idle sub-agent completion resume: no host submission to
+                // correlate with.
+                submission_id: None,
             })
             .await;
         if !outcome.started() {
@@ -4301,10 +4700,15 @@ impl Engine {
             // (turnBudget per-task, resumable): token/time are telemetry only
             // unless `[goal] enforce_token_budget` opts a set budget into a
             // hard stop (#6013); otherwise only Completed/Blocked/
-            // ContinuationLimit pause the loop.
-            crate::goal_loop::GoalBudget::unbounded()
-                .with_enforced_token_budget(self.config.goal_enforce_token_budget)
-                .with_max_continuations(self.config.goal_max_continuations),
+            // ContinuationLimit pause the loop. The goal's own budget must be
+            // carried here: `unbounded()` has none, which left the enforced
+            // stop unreachable on this cross-turn gate (T08-03).
+            crate::goal_loop::GoalBudget {
+                token_budget: snapshot.token_budget.map(u64::from),
+                time_budget_seconds: None,
+                enforce_token_budget: self.config.goal_enforce_token_budget,
+                max_continuations: self.config.goal_max_continuations,
+            },
         );
 
         match decision {
@@ -4359,10 +4763,9 @@ impl Engine {
     /// releases their busy state and closes the admitted operation.
     async fn reject_edit_last_turn(&mut self, envelope: ErrorEnvelope) {
         let message = envelope.message.clone();
-        let _ = self.tx_event.send(Event::error(envelope)).await;
+        let _ = self.send_event(Event::error(envelope)).await;
         let _ = self
-            .tx_event
-            .send(Event::TurnComplete {
+            .send_event(Event::TurnComplete {
                 usage: Usage::default(),
                 parent_route_usage: Usage::default(),
                 routed_usage_dropped_records: 0,
@@ -4418,7 +4821,7 @@ impl Engine {
                 } else {
                     "Turn interrupted."
                 };
-                let _ = self.tx_event.send(Event::status(message.to_string())).await;
+                let _ = self.send_event(Event::status(message.to_string())).await;
             }
             SendMessageOutcome::Finished {
                 status: TurnOutcomeStatus::Completed,
@@ -4467,9 +4870,16 @@ impl Engine {
                 }
                 let snapshot = state.snapshot();
                 if snapshot.status != GoalStatus::Blocked.as_str() {
-                    tracing::warn!(
+                    // Not an ordering bug: only an Active goal is moved to
+                    // Blocked above, so reaching here means there was no
+                    // active goal to block — most often no goal at all
+                    // (`status=none`) on an ordinary turn that failed, or one
+                    // the user paused or completed during the turn. The
+                    // turn's own failure already reached the host through
+                    // `TurnComplete`; there is nothing goal-side to publish.
+                    tracing::debug!(
                         status = %snapshot.status,
-                        "goal changed before continuation blocker could be published"
+                        "no active goal to block after a non-completed turn"
                     );
                     return;
                 }
@@ -4486,8 +4896,8 @@ impl Engine {
         self.config.goal_status = GoalStatus::Blocked;
         self.refresh_system_prompt_with_reason("goal");
         self.emit_session_updated().await;
-        let _ = self.tx_event.send(Event::GoalUpdated { snapshot }).await;
-        let _ = self.tx_event.send(Event::status(message)).await;
+        let _ = self.send_event(Event::GoalUpdated { snapshot }).await;
+        let _ = self.send_event(Event::status(message)).await;
     }
 
     /// Resume the shared goal when its only blocker was a runtime stop and it
@@ -4511,10 +4921,9 @@ impl Engine {
         };
         self.config.goal_status = GoalStatus::Active;
         self.emit_session_updated().await;
-        let _ = self.tx_event.send(Event::GoalUpdated { snapshot }).await;
+        let _ = self.send_event(Event::GoalUpdated { snapshot }).await;
         let _ = self
-            .tx_event
-            .send(Event::status(
+            .send_event(Event::status(
                 "Goal resumed: your message continues the work the earlier turn stopped",
             ))
             .await;
@@ -4546,8 +4955,8 @@ impl Engine {
         self.config.goal_status = GoalStatus::Paused;
         self.refresh_system_prompt_with_reason("goal");
         self.emit_session_updated().await;
-        let _ = self.tx_event.send(Event::GoalUpdated { snapshot }).await;
-        let _ = self.tx_event.send(Event::status(message)).await;
+        let _ = self.send_event(Event::GoalUpdated { snapshot }).await;
+        let _ = self.send_event(Event::status(message)).await;
     }
 
     /// Handle `/goal pause|resume|clear|complete|blocked` by writing the new
@@ -4617,7 +5026,7 @@ impl Engine {
         // the UI while still letting the clear win over a preceding active
         // TurnComplete snapshot.
         let snapshot_has_objective = snapshot.objective.is_some();
-        let _ = self.tx_event.send(Event::GoalUpdated { snapshot }).await;
+        let _ = self.send_event(Event::GoalUpdated { snapshot }).await;
 
         let label = if clear {
             "cleared"
@@ -4630,8 +5039,7 @@ impl Engine {
             }
         };
         let _ = self
-            .tx_event
-            .send(Event::status(format!("Goal {label}.")))
+            .send_event(Event::status(format!("Goal {label}.")))
             .await;
 
         // Resuming an objective-bearing goal restarts the runtime's own
@@ -4657,8 +5065,7 @@ impl Engine {
     ) {
         let Some(objective) = normalized_goal_objective(Some(&objective)) else {
             let _ = self
-                .tx_event
-                .send(Event::status(
+                .send_event(Event::status(
                     "Goal not set: the objective is empty after trimming.".to_string(),
                 ))
                 .await;
@@ -4683,10 +5090,9 @@ impl Engine {
                 return;
             }
         };
-        let _ = self.tx_event.send(Event::GoalUpdated { snapshot }).await;
+        let _ = self.send_event(Event::GoalUpdated { snapshot }).await;
         let _ = self
-            .tx_event
-            .send(Event::status("Goal set; starting goal work.".to_string()))
+            .send_event(Event::status("Goal set; starting goal work.".to_string()))
             .await;
         self.schedule_goal_continuation(Vec::new()).await;
     }
@@ -4909,7 +5315,6 @@ impl Engine {
                 .with_parent_mode(input_policy.mode)
                 .with_approval_receipt_store(self.approval_receipt_store.clone())
                 .with_permission_posture(
-                    self.session.approval_mode,
                     Arc::clone(&self.shared_auto_review_policy),
                     self.config.terminal_chrome_enabled,
                 );
@@ -4950,23 +5355,36 @@ impl Engine {
 
         // Load plugin tools from the user's tools directory and apply any
         // config.toml overrides. Explicit overrides win over auto-discovered
-        // scripts with the same tool name.
+        // scripts with the same tool name; neither may replace a built-in.
         let extension_host = self
-            .config
-            .features
-            .enabled(Feature::ExtensionHost)
-            .then(crate::extension_host::manager);
-        if let Some(manager) = &extension_host {
+            .extension_host
+            .as_ref()
+            .filter(|_| self.config.features.enabled(Feature::ExtensionHost));
+        if let Some(attachment) = extension_host {
             // Natives only: scripts are added next and must not count as built-ins.
-            manager.note_native_names(tool_registry.names());
-            manager.sync_in_background(Arc::clone(&self.plugin_registry));
+            attachment
+                .manager()
+                .note_native_names(tool_registry.names());
+            attachment.sync_in_background();
         }
-        let mut plugin_tool_names =
+        let (mut plugin_tool_names, refused_overrides) =
             configure_plugin_tools(&mut tool_registry, self.config.tools.as_ref());
+        // The registry is rebuilt every turn: name each refused override to
+        // the user once per process, not once per turn.
+        for name in refused_overrides {
+            if first_override_refusal(&name) {
+                let _ = self
+                    .send_event(Event::status(
+                        crate::tools::registry::override_refusal_notice(&name),
+                    ))
+                    .await;
+            }
+        }
         // Extension tools go in last and never replace a name already present
-        // (`ToolRegistry::register` would overwrite it silently).
-        if let Some(manager) = &extension_host {
-            plugin_tool_names.extend(manager.install_tools(&mut tool_registry));
+        // (`ToolRegistry::register` would overwrite it silently). Only this
+        // engine's own plugins' tools are installed.
+        if let Some(attachment) = extension_host {
+            plugin_tool_names.extend(attachment.install_tools(&mut tool_registry));
         }
 
         let mcp_state = if self.config.features.enabled(Feature::Mcp) {
@@ -5089,19 +5507,38 @@ impl Engine {
             hook_executor,
             verbosity,
             provenance,
+            submission_id,
         } = spec;
         let route = *route;
         let compaction = *compaction;
         let initial_routed_usage = *initial_routed_usage;
+        let initial_usage_owner = compaction.runtime_cost_owner.clone();
+        let autonomous = self.admitted_turn_control.is_none() && !provenance.can_authorize_work();
+        // A queued Op already installed its control in run(). Own its guard
+        // before any rejecting input path, so invalid images cannot retain
+        // an active control or inherit cancellation into a later request.
+        let turn_control = self.begin_turn_control_for_provenance(provenance);
+        if autonomous && self.cancel_token.is_cancelled() {
+            crate::cost_status::report_runtime_usage_batch(
+                crate::cost_status::scope_token(),
+                initial_usage_owner.as_deref(),
+                &initial_routed_usage,
+            );
+            return SendMessageOutcome::NotStarted { error: None };
+        }
         // All surfaces reuse the same bounded validator. Runtime already checks
         // before admission; this also protects direct in-process operations.
         let images = match crate::image_attach::prepare_stored_images(&images) {
             Ok(images) => images,
             Err(error) => {
                 let message = error.to_string();
+                crate::cost_status::report_runtime_usage_batch(
+                    crate::cost_status::scope_token(),
+                    initial_usage_owner.as_deref(),
+                    &initial_routed_usage,
+                );
                 let _ = self
-                    .tx_event
-                    .send(Event::error(ErrorEnvelope::new(
+                    .send_event(Event::error(ErrorEnvelope::new(
                         crate::error_taxonomy::ErrorCategory::InvalidInput,
                         crate::error_taxonomy::ErrorSeverity::Error,
                         true,
@@ -5114,12 +5551,52 @@ impl Engine {
                 };
             }
         };
-        let autonomous = self.admitted_turn_control.is_none() && !provenance.can_authorize_work();
-        let turn_control = self.begin_turn_control_for_provenance(provenance);
-        if autonomous && self.cancel_token.is_cancelled() {
-            return SendMessageOutcome::NotStarted { error: None };
-        }
-        let initial_usage_owner = compaction.runtime_cost_owner.clone();
+        // Reserve both lifecycle observations before mutating the session.
+        // Otherwise cancellation during a blocked TurnStarted send could
+        // create a completion with no start. The production queue has 256
+        // slots; these local permits do not create a second event authority.
+        //
+        // A durable host (Runtime threads) recorded this turn before the
+        // engine saw it and settles it only on its terminal event. A queued
+        // cancellation there must still yield the ordered TurnStarted and
+        // Interrupted TurnComplete (the cancelled token stops the turn before
+        // any provider dispatch), so its admission waits for capacity instead
+        // of refusing on cancellation. An interactive queued cancellation
+        // keeps no lifecycle.
+        let admission_cancel = (!self.host_managed_turns()).then_some(&self.cancel_token);
+        let admission = async {
+            let terminal = streaming::reserve_event_capacity(
+                &self.tx_event,
+                admission_cancel,
+                streaming::EventReservationPolicy::Strict,
+            )
+            .await?;
+            let started = streaming::reserve_event_capacity(
+                &self.tx_event,
+                admission_cancel,
+                streaming::EventReservationPolicy::Strict,
+            )
+            .await?;
+            Ok::<_, streaming::EventSendError>((terminal, started))
+        };
+        let (terminal_permit, start_permit) = match admission.await {
+            Ok(permits) => permits,
+            Err(reason) => {
+                // A queued operation is not an admitted turn. No TurnStarted,
+                // session mutation or provider dispatch happened, but an Auto
+                // classifier may already have produced billed routed usage.
+                crate::cost_status::report_runtime_usage_batch(
+                    crate::cost_status::scope_token(),
+                    initial_usage_owner.as_deref(),
+                    &initial_routed_usage,
+                );
+                return SendMessageOutcome::NotStarted {
+                    error: (reason == streaming::EventSendError::Closed).then(|| {
+                        "Cannot start the turn because its event consumer is closed".to_string()
+                    }),
+                };
+            }
+        };
 
         // Goals are created by the model (`create_goal`) or by the leading
         // `/goal <objective>` command; the host never infers one from
@@ -5159,8 +5636,7 @@ impl Engine {
                 &initial_routed_usage,
             );
             let _ = self
-                .tx_event
-                .send(Event::error(ErrorEnvelope::fatal_auth(format!(
+                .send_event(Event::error(ErrorEnvelope::fatal_auth(format!(
                     "Cannot start the turn because its provider route is not ready: {err}"
                 ))))
                 .await;
@@ -5186,7 +5662,7 @@ impl Engine {
             if let Some(status) =
                 crate::core::engine::turn_loop::shell_completion_status_text(&shell_completions, "")
             {
-                let _ = self.tx_event.send(Event::status(status)).await;
+                let _ = self.send_event(Event::status(status)).await;
             }
         }
 
@@ -5230,13 +5706,15 @@ impl Engine {
         // it), then rendered to the UI from that same value.
         self.last_policy_narrowing = input_policy.narrowing.clone();
         if let Some(status) = input_policy.status() {
-            let _ = self.tx_event.send(Event::status(status)).await;
+            let _ = self.send_event(Event::status(status)).await;
         }
 
         // Track the complete effective mode policy so mid-turn metadata, `/edit`,
         // idle worker resumptions, and approval gates cannot read a stale policy
         // after the UI changed modes (#3568).
+        let prior = self.applied_runtime_authority();
         self.apply_runtime_mode_policy(&input_policy);
+        self.discard_kernels_if_narrowed(&prior).await;
 
         // Create turn context first so start event includes a stable turn id.
         // An active goal gets the host's goal allowance (#5994); turns with
@@ -5336,14 +5814,13 @@ impl Engine {
         // Emit turn started event IMMEDIATELY so the UI knows the turn is
         // active. The snapshot below can take 30+ seconds on slow filesystems
         // (e.g. WSL2 /mnt/c) and must not delay the TurnStarted event.
-        let _ = self
-            .tx_event
-            .send(Event::TurnStarted {
-                turn_id: turn.id.clone(),
-                created_at: turn_started_at,
-                route: Some(turn_route),
-            })
-            .await;
+        start_permit.send(Event::TurnStarted {
+            turn_id: turn.id.clone(),
+            created_at: turn_started_at,
+            route: Some(turn_route),
+            // Bind submit-window actions to the turn admitted by this permit.
+            submission_id,
+        });
 
         // Auto's classifier completed before this parent turn was admitted.
         // Bind its exact routed records to the now-accepted turn: total tokens
@@ -5364,6 +5841,14 @@ impl Engine {
         );
         turn.add_routed_usage_dropped_records(residual_dropped_records);
         let initial_cost_scope = crate::cost_status::scope_token();
+        crate::cost_status::report_runtime_usage_batch(
+            initial_cost_scope,
+            initial_usage_owner.as_deref(),
+            &crate::cost_status::RuntimeUsageBatch {
+                decisions: initial_routed_usage.decisions.clone(),
+                ..Default::default()
+            },
+        );
         for record in &initial_routed_usage.records {
             crate::cost_status::report_effective_route_for_runtime(
                 initial_cost_scope,
@@ -5373,8 +5858,7 @@ impl Engine {
                 &record.usage.usage,
             );
             let _ = self
-                .tx_event
-                .send(Event::RoutedTurnUsage {
+                .send_event(Event::RoutedTurnUsage {
                     usage: record.usage.usage.clone(),
                     duration_ms: 0,
                     first_token_ms: None,
@@ -5399,28 +5883,15 @@ impl Engine {
         // Snapshot the workspace BEFORE we touch a single tool. Run the git
         // work on the blocking pool so the async runtime stays responsive;
         // failure is non-fatal (the helper logs at WARN).
-        if self.config.snapshots_enabled {
-            // Clone the user prompt now — `content` is moved into
-            // `user_text_message_with_turn_metadata_for_route` below, so we need
-            // a copy for both pre- and post-turn snapshot labels. The
-            // label carries a truncated first line so `/restore`
-            // listings are human-readable.
-            let snapshot_prompt = content.clone();
-            let pre_workspace = self.session.workspace.clone();
-            let pre_seq = self.turn_counter;
-            let pre_cap = self.config.snapshots_max_workspace_bytes;
-            let pre_sid = self.session.id.clone();
-            let _ = tokio::task::spawn_blocking(move || {
-                pre_turn_snapshot(
-                    &pre_workspace,
-                    pre_seq,
-                    pre_cap,
-                    Some(&snapshot_prompt),
-                    Some(&pre_sid),
-                )
-            })
-            .await;
-        }
+        // The label carries a truncated first line of the prompt so
+        // `/restore` listings are human-readable.
+        self.take_restore_point(
+            WorkspaceSnapshotKind::PreTurn,
+            format_snapshot_label("pre-turn", self.turn_counter, Some(&content)),
+            None,
+            None,
+        )
+        .await;
 
         self.emit_pending_snapshot_notices().await;
 
@@ -5441,26 +5912,31 @@ impl Engine {
                 .map(|err| format!("Failed to send message: {err}"))
                 .unwrap_or_else(|| "Failed to send message: API client not configured".to_string());
             let _ = self
-                .tx_event
-                .send(Event::error(ErrorEnvelope::fatal_auth(message.clone())))
+                .send_event(Event::error(ErrorEnvelope::fatal_auth(message.clone())))
                 .await;
-            let _ = self
-                .tx_event
-                .send(Event::TurnComplete {
-                    usage: turn.usage.clone(),
-                    parent_route_usage: turn.parent_route_usage.clone(),
-                    routed_usage_dropped_records: turn.routed_usage_dropped_records,
-                    status: TurnOutcomeStatus::Failed,
-                    error: Some(message.clone()),
-                    tool_catalog: None,
-                    base_url: None,
-                })
-                .await;
+            let status = terminal_turn_status_at_settlement(
+                TurnOutcomeStatus::Failed,
+                self.cancel_token.is_cancelled(),
+            );
+            let error = (status == TurnOutcomeStatus::Failed).then_some(message.clone());
+            terminal_permit.send(Event::TurnComplete {
+                usage: turn.usage.clone(),
+                parent_route_usage: turn.parent_route_usage.clone(),
+                routed_usage_dropped_records: turn.routed_usage_dropped_records,
+                status,
+                error: error.clone(),
+                tool_catalog: None,
+                base_url: None,
+            });
             self.sync_unstarted_goal_for_terminal_projection(
                 goal_objective.as_deref(),
                 goal_token_budget,
                 goal_status,
             );
+            // The reserved lifecycle is settled above, but no model client
+            // ever received this turn: it did not start. `/edit` restores the
+            // exchange it cut only for NotStarted (C02-02), and goal
+            // reconciliation names the same fact.
             let outcome = SendMessageOutcome::NotStarted {
                 error: Some(message),
             };
@@ -5695,18 +6171,17 @@ impl Engine {
         if status_at_settlement != status {
             status = status_at_settlement;
             let _ = self
-                .tx_event
-                .send(Event::status(
+                .send_event(Event::status(
                     "Request cancelled while settling turn-owned sub-agents",
                 ))
                 .await;
         }
 
-        // Seal and fully forward every accepted mailbox envelope before the
-        // terminal event. This is the durability barrier for child usage: an
-        // event can no longer arrive after `TurnComplete` and be mistaken for
-        // the following turn (or lost by a runtime monitor that already
-        // settled the record).
+        // Seal the mailbox before the terminal event and flush under its
+        // existing grace. A stopped consumer can force that drainer to be
+        // aborted; the warning names the lost observation boundary. Child
+        // cost owners/leases remain independent of UI delivery, and no late
+        // envelope is attached to the following turn.
         if let Some(barrier) = mailbox_for_runtime.take() {
             if status == TurnOutcomeStatus::Completed && !turn.budget_exhausted_final_report {
                 barrier.continue_and_flush().await;
@@ -5716,9 +6191,7 @@ impl Engine {
                 // than withholding `TurnComplete` forever (#6184).
                 let unsettled = barrier.cancel_and_flush().await;
                 if !unsettled.is_empty() {
-                    let _ = self
-                        .tx_event
-                        .send(Event::status(format!(
+                    let _ = self.send_event(Event::status(format!(
                             "Turn ended while sub-agent(s) were still shutting down: {}. Their late receipts were dropped.",
                             unsettled.join(", ")
                         )))
@@ -5755,28 +6228,29 @@ impl Engine {
         }
         if let Some(snapshot) = turn.terminal_request_snapshot(status) {
             let _ = self
-                .tx_event
-                .send(Event::ToolRequestSnapshot { snapshot })
+                .send_event(Event::ToolRequestSnapshot { snapshot })
                 .await;
         }
-        drop(turn_control);
+        self.post_turn_snapshot_before_complete(&snapshot_prompt_post)
+            .await;
+        let pending_post_turn = self.reserve_post_turn_snapshot();
+        // Cancellation still owns the decision while mailbox/snapshot
+        // bookkeeping runs. The reserved completion itself never waits.
+        status = terminal_turn_status_at_settlement(status, self.cancel_token.is_cancelled());
         // `event_sent` means the TurnComplete event reached the UI channel —
         // never that the user saw model output. (#6184: the old `delivered`
         // name was read as user-visible delivery on Interrupted turns that
         // rendered nothing.)
-        let turn_complete_event_sent = self
-            .tx_event
-            .send(Event::TurnComplete {
-                usage: turn.usage,
-                parent_route_usage: turn.parent_route_usage,
-                routed_usage_dropped_records: turn.routed_usage_dropped_records,
-                status,
-                error: error.clone(),
-                tool_catalog: tool_catalog_for_event,
-                base_url: base_url_for_event,
-            })
-            .await
-            .is_ok();
+        let completion_sender = terminal_permit.send(Event::TurnComplete {
+            usage: turn.usage,
+            parent_route_usage: turn.parent_route_usage,
+            routed_usage_dropped_records: turn.routed_usage_dropped_records,
+            status,
+            error: error.clone(),
+            tool_catalog: tool_catalog_for_event,
+            base_url: base_url_for_event,
+        });
+        let turn_complete_event_sent = !completion_sender.is_closed();
         tracing::info!(
             target: "engine.turn",
             status = ?status,
@@ -5784,27 +6258,13 @@ impl Engine {
             "engine turn completion settled"
         );
 
-        // Post-turn snapshot. Fire-and-forget: TurnComplete is already
-        // emitted, so the UI is unblocked and the user can type / select /
-        // paste immediately (#234). The git work proceeds on the blocking
-        // pool without forcing the engine loop to await it.
-        if self.config.snapshots_enabled {
-            // `snapshot_prompt_post` was cloned from `content` above,
-            // before `content` was moved into the session messages.
-            let post_workspace = self.session.workspace.clone();
-            let post_seq = self.turn_counter;
-            let post_cap = self.config.snapshots_max_workspace_bytes;
-            let post_sid = self.session.id.clone();
-            crate::utils::spawn_blocking_supervised("post-turn-snapshot", move || {
-                post_turn_snapshot(
-                    &post_workspace,
-                    post_seq,
-                    post_cap,
-                    Some(&snapshot_prompt_post),
-                    Some(&post_sid),
-                );
-            });
-        }
+        // Post-turn snapshot, unless it was already taken before
+        // TurnComplete (see `EngineConfig::record_restore_points`).
+        self.post_turn_snapshot_after_complete(
+            "post-turn-snapshot",
+            snapshot_prompt_post,
+            pending_post_turn,
+        );
 
         // ── Background advisor watcher (#3982) ────────────────────────────
         // Fire-and-forget: TurnComplete is already emitted. The advisor
@@ -5906,6 +6366,7 @@ impl Engine {
         } else {
             self.reconcile_non_completed_goal_turn(&outcome).await;
         }
+        drop(turn_control);
         outcome
     }
 
@@ -5919,12 +6380,10 @@ impl Engine {
             let message = "Purge unavailable: API client not configured".to_string();
             emit_purge_failed(&self.tx_event, message.clone()).await;
             let _ = self
-                .tx_event
-                .send(Event::error(ErrorEnvelope::fatal_auth(message.clone())))
+                .send_event(Event::error(ErrorEnvelope::fatal_auth(message.clone())))
                 .await;
             let _ = self
-                .tx_event
-                .send(Event::TurnComplete {
+                .send_event(Event::TurnComplete {
                     usage: zero_usage,
                     parent_route_usage: Usage::default(),
                     routed_usage_dropped_records: 0,
@@ -5983,8 +6442,7 @@ impl Engine {
         };
 
         let _ = self
-            .tx_event
-            .send(Event::TurnComplete {
+            .send_event(Event::TurnComplete {
                 usage: zero_usage,
                 parent_route_usage: Usage::default(),
                 routed_usage_dropped_records: 0,
@@ -6027,9 +6485,7 @@ impl Engine {
         if survivors.is_empty() {
             return;
         }
-        let _ = self
-            .tx_event
-            .send(Event::status(format!(
+        let _ = self.send_event(Event::status(format!(
                 "Turn interrupted, but {} background shell job(s) continue and may still write files: {}. Use /jobs to inspect or kill.",
                 survivors.len(),
                 survivors.join(", ")
@@ -6129,7 +6585,6 @@ impl Engine {
         .with_parent_mode(mode)
         .with_approval_receipt_store(self.approval_receipt_store.clone())
         .with_permission_posture(
-            self.session.approval_mode,
             Arc::clone(&self.shared_auto_review_policy),
             self.config.terminal_chrome_enabled,
         );
@@ -6156,20 +6611,27 @@ impl Engine {
             self.session.auto_approve,
             self.session.approval_mode,
         );
-        context.trust_mode = authority.trust_mode;
-        context.auto_approve = authority.auto_approve;
-        context.approval_mode = authority.approval_mode;
-        context.set_shell_policy(authority.shell_policy());
-        context.elevated_sandbox_policy = Some(authority.sandbox_policy(
+        project_turn_authority(
+            &mut context,
+            &authority,
             &self.session.workspace,
             self.api_config.sandbox_mode.as_deref(),
             crate::core::authority::SandboxNetworkAccess::from_config(
                 self.api_config.sandbox_network_access,
             ),
-        ));
-        context.shell_network_denied_hint = matches!(authority.mode, AppMode::Plan)
-            .then(|| PLAN_SHELL_NETWORK_DENIED_HINT.to_string());
+        );
+        context.turn_deadline = self.nested_work_deadline();
         Some(context)
+    }
+
+    /// One absolute bound for admitted nested work, resolved after any human
+    /// wait so approval time remains excluded by the Engine's clock.
+    fn nested_work_deadline(&self) -> Option<tokio::time::Instant> {
+        tokio::time::Instant::now().checked_add(
+            self.turn_wall_clock
+                .budget()
+                .saturating_sub(self.turn_wall_clock.spent()),
+        )
     }
 
     /// Build one tool context from the already-resolved turn authority and
@@ -6215,7 +6677,7 @@ impl Engine {
         .with_runtime_services(self.config.runtime_services.clone())
         .with_skills_config(
             self.config.skills_dir.clone(),
-            self.config.skills_scan_codewhale_only,
+            self.config.skills_discovery_mode,
         )
         .with_plugin_registry(Arc::clone(&self.plugin_registry))
         .with_session_objects(crate::rlm::session::SessionObjectSnapshot::new(
@@ -6278,14 +6740,20 @@ impl Engine {
                 .and_then(crate::client::ProviderNativeSearchClient::new);
         }
 
+        let network_access = crate::core::authority::SandboxNetworkAccess::from_config(
+            self.api_config.sandbox_network_access,
+        );
         let policy = authority.sandbox_policy(
             &self.session.workspace,
             self.api_config.sandbox_mode.as_deref(),
-            crate::core::authority::SandboxNetworkAccess::from_config(
-                self.api_config.sandbox_network_access,
-            ),
+            network_access,
         );
         let mut ctx = ctx.with_elevated_sandbox_policy(policy);
+        ctx.live_posture = Some(LivePosture {
+            state: Arc::clone(&self.live_runtime_authority),
+            workspace: self.session.workspace.clone(),
+            network_access,
+        });
         if matches!(authority.mode, AppMode::Plan) {
             ctx = ctx.with_shell_network_denied_hint(PLAN_SHELL_NETWORK_DENIED_HINT);
         }
@@ -6401,29 +6869,40 @@ impl Engine {
             self.ensure_mcp_supervisor();
             return Ok(pool);
         }
+        // C02-18: misconfiguration fails loud. A missing file is an ordinary
+        // empty config (`load_config` returns the default); an unreadable or
+        // malformed one still yields an empty, source-aware pool so a fixed
+        // file and `/mcp reload` recover in-process — but the person is told
+        // that the configured servers are gone, not left to find no tools.
+        let mut load_failure = None;
         let mut pool = McpPool::from_config_path_with_workspace_and_plugins(
             &self.session.mcp_config_path,
             &self.session.workspace,
             Arc::clone(&self.plugin_registry),
         )
         .unwrap_or_else(|e| {
-            tracing::debug!(
-                "MCP config unavailable: {}",
-                crate::mcp::format_mcp_error_for_display(&e)
-            );
+            let reason = crate::mcp::format_mcp_error_for_display(&e);
+            tracing::warn!("MCP config unavailable: {reason}");
+            load_failure = Some(reason);
             McpPool::empty_with_workspace_config_sources(
                 &self.session.mcp_config_path,
                 &self.session.workspace,
                 Arc::clone(&self.plugin_registry),
             )
             .unwrap_or_else(|fallback_error| {
-                tracing::debug!(
+                tracing::warn!(
                     "MCP reload source setup failed: {}",
                     crate::mcp::format_mcp_error_for_display(&fallback_error)
                 );
                 McpPool::new(McpConfig::default())
             })
         });
+        if let Some(reason) = load_failure {
+            let _ = self.send_event(Event::status(format!(
+                    "MCP config could not be loaded, so none of its servers are available: {reason}. Fix it, then run /mcp reload."
+                )))
+                .await;
+        }
         pool = pool.with_disallowed_tools(self.config.disallowed_tools.clone().unwrap_or_default());
         if let Some(decider) = self.config.network_policy.as_ref() {
             pool = pool.with_network_policy(decider.clone());
@@ -6442,8 +6921,8 @@ impl Engine {
     }
 
     /// Start the connection supervisor once per pool. The task holds only a
-    /// Weak: pool replacement lets the old task exit, its channel closes, the
-    /// run loop disarms, and the next ensure respawns against the new pool.
+    /// Weak between sweeps, but an in-flight handshake holds the pool. Keep
+    /// its abort handle so a boundary stops that work and queued diagnoses.
     fn ensure_mcp_supervisor(&mut self) {
         if self.mcp_supervisor_rx.is_some() {
             return;
@@ -6454,11 +6933,12 @@ impl Engine {
         let (tx, rx) = mpsc::channel(16);
         self.mcp_supervisor_rx = Some(rx);
         let weak = Arc::downgrade(pool);
-        spawn_supervised(
+        let task = spawn_supervised(
             "mcp-supervisor",
             std::panic::Location::caller(),
             McpPool::supervise_pool(weak, tx),
         );
+        self.mcp_supervisor_task = Some(task.abort_handle());
     }
 
     /// Apply one supervisor sweep: deaths and failures refresh the engine's
@@ -6576,10 +7056,32 @@ impl Engine {
             return false;
         }
         self.mcp_boot_generation = None;
+        self.mcp_boot_task = None;
         self.mcp_boot_in_flight = false;
         self.mcp_boot_rx = None;
         self.mcp_boot_done = None;
         true
+    }
+
+    /// Drop the engine-owned MCP pool at a session or workspace boundary.
+    /// The in-flight boot pass dials into the dropped pool: abort it and
+    /// clear its generation, receiver and diagnoses, so the next pool starts
+    /// clean instead of waiting on — or adopting progress and connection
+    /// errors from — the previous conversation's pass (C02-08).
+    fn drop_mcp_pool(&mut self) {
+        self.mcp_pool = None;
+        if let Some(task) = self.mcp_boot_task.take() {
+            task.abort();
+        }
+        if let Some(task) = self.mcp_supervisor_task.take() {
+            task.abort();
+        }
+        self.mcp_supervisor_rx = None;
+        self.mcp_boot_generation = None;
+        self.mcp_boot_in_flight = false;
+        self.mcp_boot_rx = None;
+        self.mcp_boot_done = None;
+        self.mcp_connection_errors.clear();
     }
 
     async fn emit_mcp_session_boot(&self, generation: u64, finished: bool) {
@@ -7027,7 +7529,7 @@ impl Engine {
         self.emit_mcp_session_boot(generation, false).await;
 
         let pool_for_task = Arc::clone(&pool);
-        spawn_supervised(
+        let boot_task = spawn_supervised(
             "mcp-session-boot",
             std::panic::Location::caller(),
             async move {
@@ -7109,6 +7611,7 @@ impl Engine {
                 let _ = done_tx.send(true);
             },
         );
+        self.mcp_boot_task = Some(boot_task.abort_handle());
 
         Ok(generation)
     }
@@ -7150,15 +7653,28 @@ impl Engine {
             .await
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
         let mut pool = pool.lock().await;
+        // The outcome is logged here, at the one manager every surface drives,
+        // so a panel retry, `/mcp retry`, and the runtime API all leave the
+        // same receipt in the session log.
         match pool.retry_connection(name).await {
-            Ok(_) => {
+            Ok(connection) => {
+                tracing::info!(
+                    target: "mcp",
+                    server = %name,
+                    tools = connection.tools().len(),
+                    "MCP server connected on retry"
+                );
                 self.mcp_connection_errors.remove(name);
             }
             Err(error) => {
-                self.mcp_connection_errors.insert(
-                    name.to_string(),
-                    crate::mcp::format_mcp_error_for_display(&error),
+                let reason = crate::mcp::format_mcp_error_for_display(&error);
+                tracing::warn!(
+                    target: "mcp",
+                    server = %name,
+                    error = %reason,
+                    "MCP server retry failed"
                 );
+                self.mcp_connection_errors.insert(name.to_string(), reason);
             }
         }
         let snapshot = pool.manager_snapshot(
@@ -7242,6 +7758,81 @@ impl Engine {
         self.refresh_system_prompt_from_context_with_reason(&context, reason);
     }
 
+    // KV-cache effect: append-only user history. SessionUpdated persists this
+    // warning even when an explicit prompt rebuild replaces the system prefix.
+    fn record_project_trust_warning(&mut self) {
+        let warning = crate::skills::untrusted_project_skills_warning(
+            &self.session.workspace,
+            Some(&self.config.skills_dir),
+            self.config.skills_discovery_mode,
+        );
+        let previous = self
+            .session
+            .messages
+            .iter()
+            .rev()
+            .find(|message| crate::runtime_handoff::is_workspace_trust_message(message));
+        if warning.is_none() && previous.is_none() {
+            return;
+        }
+        let message = crate::runtime_handoff::workspace_trust_runtime_message(warning.as_deref());
+        if previous != Some(&message) {
+            self.session.add_message(message);
+        }
+    }
+
+    /// Record connected MCP servers' `initialize` guidance in session history
+    /// before a model request (KV-cache effect: append-only user history).
+    ///
+    /// Only servers owning at least one tool in `catalog` — the turn's final
+    /// model-facing catalog, already narrowed by the allow/deny posture — are
+    /// included. A new event is appended only when the rendered guidance
+    /// differs from the latest one in history, so an unchanged server set
+    /// never grows the transcript or moves the cached prefix, and guidance a
+    /// compaction dropped is re-recorded. The event is persisted with the
+    /// session and rendered in the transcript, so what the model saw stays
+    /// auditable.
+    pub(super) async fn record_mcp_server_instructions(&mut self, catalog: &[Tool]) {
+        let visible: std::collections::HashSet<&str> = catalog
+            .iter()
+            .filter(|tool| crate::mcp::McpPool::is_mcp_tool(&tool.name))
+            .map(|tool| tool.name.as_str())
+            .collect();
+        let servers = match self.mcp_pool.as_ref() {
+            Some(pool) if !visible.is_empty() => {
+                // Never stall a model request behind a pool busy with a
+                // handshake; the next request boundary records it instead.
+                let Ok(pool) = pool.try_lock() else {
+                    return;
+                };
+                pool.model_server_instructions(|name| visible.contains(name))
+            }
+            _ => Vec::new(),
+        };
+        let previous =
+            self.session.messages.iter().rev().find(|message| {
+                crate::runtime_handoff::is_mcp_server_instructions_message(message)
+            });
+        if servers.is_empty() && previous.is_none() {
+            return;
+        }
+        let message = crate::runtime_handoff::mcp_server_instructions_runtime_message(&servers);
+        if previous == Some(&message) {
+            return;
+        }
+        self.add_session_message(message).await;
+        let status = if servers.is_empty() {
+            "MCP server guidance withdrawn from context".to_string()
+        } else {
+            let names: Vec<&str> = servers.iter().map(|(name, _)| name.as_str()).collect();
+            format!(
+                "MCP server guidance added to context (shown in transcript): {}",
+                names.join(", ")
+            )
+        };
+        let _ = self.send_event(Event::status(status)).await;
+    }
+
     /// Recompose the stable system prompt from current context. When the bytes
     /// actually change (hash differs), record `reason` as the declared cause
     /// so the turn loop's prefix check re-pins the KV-cache prefix under a
@@ -7254,6 +7845,7 @@ impl Engine {
         context: &NextTurnPromptContext,
         reason: &str,
     ) {
+        self.record_project_trust_warning();
         let stable_prompt = self.compose_stable_system_prompt(context);
 
         let stable_hash = system_prompt_hash(stable_prompt.as_ref());
@@ -7287,6 +7879,7 @@ impl Engine {
         &mut self,
         context: &NextTurnPromptContext,
     ) -> Option<String> {
+        self.record_project_trust_warning();
         if self.session.system_prompt_override {
             return None;
         }
@@ -7381,7 +7974,7 @@ impl Engine {
                     ),
                     verbosity: context.verbosity.as_deref(),
                     recovery_hint: recovery_hint.as_deref(),
-                    skills_scan_codewhale_only: self.config.skills_scan_codewhale_only,
+                    skills_discovery_mode: self.config.skills_discovery_mode,
                     plugin_registry: Some(self.plugin_registry.as_ref()),
                     mode: context.mode,
                 },
@@ -7426,11 +8019,27 @@ fn plugin_tools_dir(tools_config: Option<&crate::config::ToolsConfig>) -> PathBu
     default_plugin_tools_dir()
 }
 
+/// Whether this process has not yet told the user about the refused
+/// `[tools.overrides.<name>]`.
+fn first_override_refusal(name: &str) -> bool {
+    static NOTIFIED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    NOTIFIED
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(name.to_string())
+}
+
+/// Load drop-in scripts and apply `[tools.overrides]`. Returns the tool names
+/// this added and the overrides refused for naming a built-in (D4).
 fn configure_plugin_tools(
     tool_registry: &mut crate::tools::ToolRegistry,
     tools_config: Option<&crate::config::ToolsConfig>,
-) -> std::collections::HashSet<String> {
-    let names_before: std::collections::HashSet<String> = tool_registry
+) -> (std::collections::HashSet<String>, Vec<String>) {
+    // Everything registered before the plugin directory loads is built in
+    // (native and host-dynamic tools); no script tool may replace it (D4).
+    let builtin_names: std::collections::HashSet<String> = tool_registry
         .names()
         .into_iter()
         .map(|s| s.to_string())
@@ -7439,18 +8048,17 @@ fn configure_plugin_tools(
     let plugin_dir = plugin_tools_dir(tools_config);
     tool_registry.load_plugins(&plugin_dir);
 
-    if let Some(tools_config) = tools_config
-        && let Some(ref overrides) = tools_config.overrides
-    {
-        tool_registry.apply_overrides(overrides, &plugin_dir);
-    }
+    let refused = match tools_config.and_then(|config| config.overrides.as_ref()) {
+        Some(overrides) => tool_registry.apply_overrides(overrides, &plugin_dir, &builtin_names),
+        None => Vec::new(),
+    };
 
     let names_after: std::collections::HashSet<String> = tool_registry
         .names()
         .into_iter()
         .map(|s| s.to_string())
         .collect();
-    &names_after - &names_before
+    (&names_after - &builtin_names, refused)
 }
 
 fn system_prompt_hash(prompt: Option<&SystemPrompt>) -> u64 {
@@ -7540,7 +8148,7 @@ pub(crate) enum AutoReviewPlanDecision {
     ConsultReviewer(String),
 }
 
-pub(super) fn auto_review_run_origin_for_plan(
+pub(crate) fn auto_review_run_origin_for_plan(
     detached_start: bool,
 ) -> crate::tui::auto_review::RunOrigin {
     if detached_start {
@@ -7634,18 +8242,26 @@ pub(crate) fn exec_shell_ask_rule_decision_for_policy(
 ) -> Option<ToolAskRuleDecision> {
     let policy_tool_name =
         crate::tools::canonical_action::canonical_action_alias(tool_name, tool_input);
-    if policy_tool_name != "exec_shell" {
+    // Task tools that hand a command string to the shell answer to the same
+    // shell deny and ask rules. Their own approval requirement stays: a shell
+    // allow rule does not waive it.
+    let runs_shell_command = matches!(policy_tool_name, "task_shell_start" | "task_gate_run");
+    if policy_tool_name != "exec_shell" && !runs_shell_command {
         return None;
     }
     let command = tool_input.get("command").and_then(Value::as_str)?;
-    tool_ask_rule_decision_for_context(
+    let decision = tool_ask_rule_decision_for_context(
         exec_policy_engine,
-        policy_tool_name,
+        "exec_shell",
         command,
         None,
         workspace,
         approval_mode,
-    )
+    );
+    if runs_shell_command && matches!(decision, Some(ToolAskRuleDecision::Allow)) {
+        return None;
+    }
+    decision
 }
 
 pub(super) fn file_tool_ask_rule_decision(
@@ -7678,6 +8294,12 @@ pub(crate) fn file_tool_ask_rule_decision_for_policy(
         crate::tools::canonical_action::canonical_action_alias(tool_name, tool_input);
     let paths = file_tool_permission_paths(policy_tool_name, tool_input)?;
     if paths.is_empty() {
+        if matches!(policy_tool_name, "write_file" | "edit_file" | "apply_patch") {
+            return Some(ToolAskRuleDecision::Block(
+                "File write has no resolvable target; provide an explicit path or valid patch."
+                    .to_string(),
+            ));
+        }
         return tool_ask_rule_decision_for_context(
             exec_policy_engine,
             policy_tool_name,
@@ -7760,15 +8382,32 @@ fn tool_ask_rule_decision_for_context(
     }
 }
 
+/// Every path the file tool will act on. The tools fold `file_path` /
+/// `filePath` onto `path` before executing, so each alias spelling is read
+/// here too; a rule keyed on `path` would otherwise never see that target.
 fn file_tool_permission_paths(tool_name: &str, input: &Value) -> Option<Vec<String>> {
+    let path_arguments = || {
+        let mut paths: Vec<String> = crate::tools::file::path_argument_keys()
+            .filter_map(|key| string_field(input, key))
+            .collect();
+        paths.dedup();
+        paths
+    };
     match tool_name {
         "read_file" | "write_file" | "edit_file" | "file_search" | "grep_files" => {
-            Some(string_field(input, "path").into_iter().collect())
+            Some(path_arguments())
         }
-        "list_dir" => Some(vec![
-            string_field(input, "path").unwrap_or_else(|| ".".to_string()),
-        ]),
-        "apply_patch" => Some(apply_patch_permission_paths(input)),
+        "list_dir" => {
+            let paths = path_arguments();
+            Some(if paths.is_empty() {
+                vec![".".to_string()]
+            } else {
+                paths
+            })
+        }
+        "apply_patch" => Some(apply_patch_permission_paths(
+            &crate::tools::file::with_canonical_path_argument(input),
+        )),
         _ => None,
     }
 }
@@ -7776,7 +8415,7 @@ fn file_tool_permission_paths(tool_name: &str, input: &Value) -> Option<Vec<Stri
 /// Target paths when a call is one of the canonical workspace file-write
 /// tools (`write_file` / `edit_file` / `apply_patch`), `None` for any other
 /// tool. Feeds the in-workspace write carve-out (#5185).
-fn file_write_tool_target_paths(tool_name: &str, input: &Value) -> Option<Vec<String>> {
+pub(crate) fn file_write_tool_target_paths(tool_name: &str, input: &Value) -> Option<Vec<String>> {
     let canonical = crate::tools::canonical_action::canonical_action_alias(tool_name, input);
     if !matches!(canonical, "write_file" | "edit_file" | "apply_patch") {
         return None;
@@ -7821,8 +8460,15 @@ pub(crate) fn spawn_engine_with_authoritative_route_config(
     config: EngineConfig,
     api_config: &Config,
     authoritative_route_config: Arc<parking_lot::RwLock<Config>>,
+    model_client: Option<SharedModelClient>,
 ) -> (EngineHandle, tokio::task::JoinHandle<()>) {
-    let (mut engine, handle) = Engine::new(config, api_config);
+    // `model_client` replaces only the model I/O boundary (see
+    // `Engine::new_with_model_client`); hosts pass `None` for the provider
+    // client the route resolves.
+    let (mut engine, handle) = match model_client {
+        Some(client) => Engine::new_with_model_client(config, api_config, client),
+        None => Engine::new(config, api_config),
+    };
     engine.authoritative_route_config = Some(authoritative_route_config);
 
     let worker = spawn_supervised(
@@ -7869,15 +8515,26 @@ pub(crate) enum MockApprovalEvent {
 #[cfg(test)]
 impl MockEngineHandle {
     pub(crate) async fn recv_approval_event(&mut self) -> Option<MockApprovalEvent> {
-        match self.rx_approval.recv().await? {
-            ApprovalDecision::Approved { id } => Some(MockApprovalEvent::Approved { id }),
-            ApprovalDecision::Denied { id } => Some(MockApprovalEvent::Denied { id }),
-            ApprovalDecision::TimedOut { id } => Some(MockApprovalEvent::TimedOut { id }),
-            ApprovalDecision::Unavailable { id } => Some(MockApprovalEvent::Unavailable { id }),
-            ApprovalDecision::RetryWithPolicy { id, policy } => {
-                Some(MockApprovalEvent::RetryWithPolicy { id, policy })
+        self.recv_approval_decision().await.map(|(event, _)| event)
+    }
+
+    /// The next decision and who the host said made it (`None` for a
+    /// timeout or an unavailable request, which name their own cause).
+    pub(crate) async fn recv_approval_decision(
+        &mut self,
+    ) -> Option<(
+        MockApprovalEvent,
+        Option<crate::approval_log::ApprovalDecider>,
+    )> {
+        Some(match self.rx_approval.recv().await? {
+            ApprovalDecision::Approved { id, by } => (MockApprovalEvent::Approved { id }, Some(by)),
+            ApprovalDecision::Denied { id, by } => (MockApprovalEvent::Denied { id }, Some(by)),
+            ApprovalDecision::TimedOut { id } => (MockApprovalEvent::TimedOut { id }, None),
+            ApprovalDecision::Unavailable { id } => (MockApprovalEvent::Unavailable { id }, None),
+            ApprovalDecision::RetryWithPolicy { id, policy, by } => {
+                (MockApprovalEvent::RetryWithPolicy { id, policy }, Some(by))
             }
-        }
+        })
     }
 
     pub(crate) async fn recv_user_input_submission(
@@ -7941,6 +8598,10 @@ pub(crate) fn mock_engine_handle() -> MockEngineHandle {
         live_runtime_authority,
         compaction_cancellation,
         turn_heartbeat: turn_heartbeat::TurnHeartbeat::new(),
+        subagent_manager: crate::tools::subagent::new_shared_subagent_manager(
+            std::env::temp_dir(),
+            1,
+        ),
     };
 
     MockEngineHandle {
@@ -8360,12 +9021,15 @@ mod streaming;
 mod token_estimate_cache;
 pub(crate) mod tool_catalog;
 mod tool_execution;
+#[cfg(all(test, unix))]
+pub(crate) use tool_execution::pin_replay_span_sequence;
 mod tool_media;
 mod tool_preparation;
 mod tool_setup;
 pub(crate) mod turn_budget;
 pub(crate) mod turn_heartbeat;
 pub(crate) mod turn_loop;
+pub(crate) use approval::HumanDecision;
 pub(crate) use dispatch::{
     FLEET_FINAL_REPORT_NOTICE, FLEET_NO_PROGRESS_STOP, FLEET_STRATEGY_SWITCH_NOTICE,
     FleetDenialAction, FleetDenialBatch, FleetDenialGuard, content_without_approval_note,
@@ -8381,10 +9045,9 @@ pub(crate) fn default_active_native_tool_names() -> &'static [&'static str] {
 
 use self::approval::{ApprovalDecision, ApprovalResult, UserInputDecision};
 use self::dispatch::{
-    ParallelToolResult, ParallelToolResultEntry, ToolApprovalStamp, ToolExecGuard, ToolExecOutcome,
-    ToolExecutionBatch, ToolExecutionPlan, caller_allowed_for_tool, caller_type_for_tool_use,
-    final_tool_input, format_tool_error_with_schema, malformed_tool_arguments_error,
-    malformed_tool_arguments_input, mcp_tool_is_parallel_safe, parse_parallel_tool_calls,
+    ToolApprovalStamp, ToolExecGuard, ToolExecOutcome, ToolExecutionBatch, ToolExecutionPlan,
+    caller_allowed_for_tool, caller_type_for_tool_use, final_tool_input,
+    format_tool_error_with_schema, malformed_tool_arguments_error, malformed_tool_arguments_input,
     parse_tool_input, plan_tool_execution_batches, stamp_tool_result_approval,
 };
 #[cfg(test)]
@@ -8397,16 +9060,19 @@ use self::streaming::TOOL_CALL_START_MARKERS;
 #[cfg(test)]
 use self::streaming::filter_tool_call_delta;
 use self::streaming::{
-    ContentBlockKind, MAX_STREAM_ERRORS_BEFORE_FAIL, MAX_STREAM_RETRIES,
-    MAX_TRANSPARENT_STREAM_RETRIES, StreamResume, StreamRetryBudget, ToolCallDeltaFilterState,
-    ToolUseState, contains_fake_tool_wrapper, filter_tool_call_delta_with_state,
-    flush_tool_call_delta_state, should_resume_after_network_drop, should_resume_after_sleep,
+    ContentBlockKind, StreamResume, StreamRetryBudget, ToolCallDeltaFilterState, ToolUseState,
+    contains_fake_tool_wrapper, filter_tool_call_delta_with_state, flush_tool_call_delta_state,
+    should_resume_after_network_drop, should_resume_after_sleep,
     should_resume_interactive_after_network_drop, should_transparently_retry_stream,
     sleep_gap_detected, stream_read_error_user_message,
 };
+#[cfg(test)]
+use self::streaming::{
+    MAX_STREAM_ERRORS_BEFORE_FAIL, MAX_STREAM_RETRIES, MAX_TRANSPARENT_STREAM_RETRIES,
+};
 use self::tool_catalog::{
     CODE_EXECUTION_TOOL_NAME, EXECUTE_TOOLS_TOOL_NAME, JS_EXECUTION_TOOL_NAME,
-    MULTI_TOOL_PARALLEL_NAME, REQUEST_USER_INPUT_NAME, ToolSurfacePolicy, active_tools_for_request,
+    REQUEST_USER_INPUT_NAME, ToolSurfacePolicy, active_tools_for_request,
     build_model_tool_catalog_with_surface, default_synthetic_catalog_tool_names,
     execute_code_execution_tool, is_tool_search_tool, maybe_hydrate_requested_deferred_tool,
     missing_tool_error_message,

@@ -15,7 +15,7 @@ use codewhale_command_contract::metadata::{
     CommandInfo as ContractInfo, RegisterCommand as ContractRegisterCommand,
 };
 
-use crate::tui::app::AppAction;
+use codewhale_command_contract::outcome::SessionAction;
 
 pub(in crate::commands) const CONTRACT_INFO: ContractInfo = ContractInfo {
     name: "purge",
@@ -38,14 +38,14 @@ impl ContractRegisterCommand<CommandResult> for PurgeCmd {
 pub(in crate::commands) fn purge_pure(_arg: Option<&str>) -> CommandResult {
     CommandResult::with_message_and_action(
         "Agent context purge triggered...".to_string(),
-        AppAction::PurgeContext,
+        SessionAction::PurgeContext,
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tui::app::AppAction;
+    use codewhale_command_contract::outcome::SessionAction;
 
     #[test]
     fn pure_purge_matches_baseline_receipt() {
@@ -54,7 +54,7 @@ mod tests {
             result.message.as_deref(),
             Some("Agent context purge triggered...")
         );
-        assert!(matches!(result.action, Some(AppAction::PurgeContext)));
+        assert!(matches!(result.action, Some(SessionAction::PurgeContext)));
         assert!(!result.is_error);
     }
 }

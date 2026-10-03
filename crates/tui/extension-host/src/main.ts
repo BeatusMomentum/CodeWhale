@@ -6,8 +6,8 @@
  */
 import { createHash } from 'node:crypto'
 import { readFileSync } from 'node:fs'
+import { createRequire } from 'node:module'
 import { fileURLToPath } from 'node:url'
-import { Worker } from 'node:worker_threads'
 import * as cordis from '@deepseek-ai/cordis'
 import * as schemastery from '@deepseek-ai/schemastery'
 import * as cosmokit from '@deepseek-ai/cosmokit'
@@ -17,8 +17,13 @@ import { installResolveHooks } from './dsh/resolve-hooks.ts'
 import { ErrorCode, FrameDecoder, encodeFrame, PROTOCOL_VERSION, type Message } from './protocol.ts'
 import { RpcError, RpcPeer } from './rpc.ts'
 import { HostRoot, ownerStorage } from './root.ts'
+import { RUNTIME, applyMemoryLimit, denyNativeCode } from './runtime.ts'
 
 export const HOST_VERSION = '0.1.0'
+
+// 0. The kernel memory limit the core asked for (macOS + Bun). This may
+//    re-execute the process in place, so it runs before anything else.
+const MEMORY_LIMIT_MIB = applyMemoryLimit()
 
 // 1. Own the protocol channel; rebind every other stdout writer to stderr.
 const channelWrite = process.stdout.write.bind(process.stdout)
@@ -77,6 +82,9 @@ function killHostTree(): never {
 // A plugin that blocks the event loop would never see stdin EOF, so a
 // watchdog on its own thread notices the parent going away (the host is
 // re-parented, which PID reuse cannot fake) and kills the tree from there.
+// `require`, not `import`: under Bun an ESM import would fix the module's
+// namespace before `denyNativeCode` replaces `Worker` for plugins.
+const { Worker } = createRequire(import.meta.url)('node:worker_threads') as typeof import('node:worker_threads')
 const watchdog = new Worker(
   `const { workerData } = require('node:worker_threads')
   const parent = process.ppid
@@ -87,6 +95,10 @@ const watchdog = new Worker(
   { eval: true, workerData: { pid: process.pid, group: OWN_GROUP }, resourceLimits: { maxOldGenerationSizeMb: 8 } },
 )
 watchdog.unref()
+
+// 3c. No in-process native code for plugins (`runtime.ts`). After the
+//     watchdog, which is the host's only Worker.
+await denyNativeCode()
 
 function shutdownNow(code: number) {
   // Let queued frames flush before exiting.
@@ -114,6 +126,11 @@ rpc.onRequest('host/initialize', (params: any) => {
 function requireInitialized() {
   if (!initialized) throw new RpcError(ErrorCode.InvalidRequest, 'host is not initialized')
 }
+
+rpc.onRequest('host/ping', () => {
+  requireInitialized()
+  return {}
+})
 
 rpc.onRequest('ext/activate', async (params: any) => {
   requireInitialized()
@@ -180,5 +197,6 @@ rpc.notify('host/hello', {
   protocol: { min: PROTOCOL_VERSION, max: PROTOCOL_VERSION },
   host_version: HOST_VERSION,
   bundle_sha256: bundleDigest(),
-  node_version: process.versions.node,
+  runtime: RUNTIME,
+  ...(MEMORY_LIMIT_MIB === undefined ? {} : { memory_limit_mib: MEMORY_LIMIT_MIB }),
 })

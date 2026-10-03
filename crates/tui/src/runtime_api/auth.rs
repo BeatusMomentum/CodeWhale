@@ -3,9 +3,10 @@ use axum::extract::{Request, State};
 use axum::http::{Method, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
+use codewhale_core::secret_eq::constant_time_eq;
 use serde_json::json;
 
-use super::{RuntimeApiState, mobile};
+use super::{RuntimeApiState, mobile, web};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct ResolvedRuntimeAuth {
@@ -88,13 +89,11 @@ pub(super) fn runtime_request_is_authorized(req: &Request, state: &RuntimeApiSta
     if request_bearer(req).is_some_and(|token| state.computer.client_principal(token).is_some()) {
         return true;
     }
-    if state.web.as_ref().is_some_and(|web| {
-        web.matches_session_cookie(
-            req.headers()
-                .get(header::COOKIE)
-                .and_then(|value| value.to_str().ok()),
-        ) && web_cookie_request_is_same_origin(req, state)
-    }) {
+    if state
+        .web
+        .as_ref()
+        .is_some_and(|web| web_session_request_is_authorized(req, state, web))
+    {
         return true;
     }
     state
@@ -120,45 +119,58 @@ pub(super) fn request_has_header_runtime_token(req: &Request, expected: &str) ->
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(|raw| raw.strip_prefix("Bearer "))
-        .is_some_and(|token| token == expected)
+        .is_some_and(|token| constant_time_eq(token.as_bytes(), expected.as_bytes()))
         || req
             .headers()
             .get("x-codewhale-runtime-token")
             .and_then(|value| value.to_str().ok())
-            .is_some_and(|token| token == expected)
+            .is_some_and(|token| constant_time_eq(token.as_bytes(), expected.as_bytes()))
         || req
             .headers()
             .get("x-deepseek-runtime-token")
             .and_then(|value| value.to_str().ok())
-            .is_some_and(|token| token == expected)
+            .is_some_and(|token| constant_time_eq(token.as_bytes(), expected.as_bytes()))
 }
 
-/// The web bootstrap adds cookie authentication to the existing bearer/header
-/// boundary. SameSite is site-scoped rather than origin-scoped, so a sibling
-/// loopback port can still receive the cookie. Require browser-origin evidence
-/// for unsafe methods and reject Fetch Metadata that identifies any
-/// cross-origin cookie request. Bearer and explicit runtime-token headers keep
-/// their existing behavior.
-fn web_cookie_request_is_same_origin(req: &Request, state: &RuntimeApiState) -> bool {
+/// Web fetches require a cookie and an origin-scoped proof; streams consume
+/// a single-use ticket instead. Origin metadata is an additional check only.
+pub(super) fn web_session_request_is_authorized(
+    req: &Request,
+    state: &RuntimeApiState,
+    web: &web::RuntimeWebState,
+) -> bool {
+    web_request_is_authorized(req, &runtime_http_origin(state), web)
+}
+
+fn web_request_is_authorized(
+    req: &Request,
+    expected_origin: &str,
+    web: &web::RuntimeWebState,
+) -> bool {
     if req
         .headers()
         .get("sec-fetch-site")
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|site| !site.eq_ignore_ascii_case("same-origin"))
+        .is_some_and(|value| value != "same-origin")
+        || req
+            .headers()
+            .get(header::ORIGIN)
+            .is_some_and(|value| value != expected_origin)
     {
         return false;
     }
-
-    let expected_origin = runtime_http_origin(state);
-    if let Some(origin) = req
+    let cookie = req
         .headers()
-        .get(header::ORIGIN)
-        .and_then(|value| value.to_str().ok())
-    {
-        return origin == expected_origin;
+        .get(header::COOKIE)
+        .and_then(|value| value.to_str().ok());
+    if is_thread_stream_request(req) {
+        return web.consume_stream_ticket(cookie, stream_ticket(req, web::WEB_STREAM_TICKET_QUERY));
     }
-
-    matches!(*req.method(), Method::GET | Method::HEAD | Method::OPTIONS)
+    web.matches_request(
+        cookie,
+        req.headers()
+            .get(web::WEB_REQUEST_HEADER)
+            .and_then(|value| value.to_str().ok()),
+    )
 }
 
 /// Mobile cookies are host-scoped and can be attached to a sibling loopback
@@ -178,8 +190,11 @@ pub(super) fn mobile_session_request_is_authorized(
         .headers()
         .get(header::COOKIE)
         .and_then(|value| value.to_str().ok());
-    if is_mobile_stream_request(req) {
-        return mobile_state.consume_stream_ticket(cookie_header, mobile_stream_ticket(req));
+    if is_thread_stream_request(req) {
+        return mobile_state.consume_stream_ticket(
+            cookie_header,
+            stream_ticket(req, mobile::MOBILE_STREAM_TICKET_QUERY),
+        );
     }
     mobile_state.matches_request(
         cookie_header,
@@ -231,19 +246,19 @@ fn runtime_http_origin_for_bind(bind_host: &str, bind_port: u16) -> String {
     }
 }
 
-fn is_mobile_stream_request(req: &Request) -> bool {
+fn is_thread_stream_request(req: &Request) -> bool {
     req.method() == Method::GET
         && req.uri().path().starts_with("/v1/threads/")
         && req.uri().path().ends_with("/events")
 }
 
-fn mobile_stream_ticket(req: &Request) -> Option<&str> {
+fn stream_ticket<'a>(req: &'a Request, query_key: &str) -> Option<&'a str> {
     let mut tickets = req
         .uri()
         .query()?
         .split('&')
         .filter_map(|pair| pair.split_once('='))
-        .filter_map(|(key, value)| (key == mobile::MOBILE_STREAM_TICKET_QUERY).then_some(value));
+        .filter_map(|(key, value)| (key == query_key).then_some(value));
     let ticket = tickets.next()?;
     tickets.next().is_none().then_some(ticket)
 }
@@ -264,6 +279,93 @@ pub(super) fn runtime_token_required_response() -> Response {
 #[cfg(test)]
 mod tests {
     use super::runtime_http_origin_for_bind;
+
+    #[test]
+    fn runtime_surface_hardening_web_requests_require_proof() {
+        use super::*;
+        use axum::body::Body;
+        let (web, nonce) = web::RuntimeWebState::new();
+        let (token, proof) = web.consume(&nonce, "127.0.0.1".parse().unwrap()).unwrap();
+        let cookie = format!("codewhale_web_session={token}");
+        let origin = "http://127.0.0.1:7878";
+        let request = |method: Method, path: &str, proof: Option<&str>, metadata: bool| {
+            let mut builder = Request::builder()
+                .method(method)
+                .uri(path)
+                .header(header::COOKIE, &cookie);
+            if metadata {
+                builder = builder
+                    .header(header::ORIGIN, origin)
+                    .header("sec-fetch-site", "same-origin");
+            }
+            if let Some(proof) = proof {
+                builder = builder.header(web::WEB_REQUEST_HEADER, proof);
+            }
+            builder.body(Body::empty()).unwrap()
+        };
+        for method in [Method::GET, Method::POST, Method::HEAD, Method::OPTIONS] {
+            for metadata in [false, true] {
+                for presented in [None, Some("wrong-proof")] {
+                    assert!(!web_request_is_authorized(
+                        &request(method.clone(), "/v1/threads", presented, metadata),
+                        origin,
+                        &web
+                    ));
+                }
+                assert!(web_request_is_authorized(
+                    &request(method.clone(), "/v1/threads", Some(&proof), metadata),
+                    origin,
+                    &web
+                ));
+            }
+        }
+        let mut wrong_origin = request(Method::POST, "/v1/threads", Some(&proof), true);
+        wrong_origin
+            .headers_mut()
+            .insert(header::ORIGIN, "http://127.0.0.1:3000".parse().unwrap());
+        assert!(!web_request_is_authorized(&wrong_origin, origin, &web));
+        let mut cross_site = request(Method::GET, "/v1/threads", Some(&proof), true);
+        cross_site
+            .headers_mut()
+            .insert("sec-fetch-site", "same-site".parse().unwrap());
+        assert!(!web_request_is_authorized(&cross_site, origin, &web));
+
+        assert!(web.refresh_stream_ticket(Some(&cookie), None).is_none());
+        let ticket = web
+            .refresh_stream_ticket(Some(&cookie), Some(&proof))
+            .unwrap();
+        let path = format!("/v1/threads/thread-1/events?web_stream_ticket={ticket}");
+        assert!(!web_request_is_authorized(
+            &request(
+                Method::GET,
+                "/v1/threads/thread-1/events",
+                Some(&proof),
+                true
+            ),
+            origin,
+            &web
+        ));
+        assert!(!web_request_is_authorized(
+            &request(
+                Method::GET,
+                &format!("{path}&web_stream_ticket=extra"),
+                None,
+                true
+            ),
+            origin,
+            &web
+        ));
+        assert!(web_request_is_authorized(
+            &request(Method::GET, &path, None, true),
+            origin,
+            &web
+        ));
+        assert!(!web_request_is_authorized(
+            &request(Method::GET, &path, None, true),
+            origin,
+            &web
+        ));
+    }
 
     #[test]
     fn expected_origin_canonicalizes_ipv6_loopback_literals() {

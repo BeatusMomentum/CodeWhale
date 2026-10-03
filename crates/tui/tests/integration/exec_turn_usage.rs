@@ -185,6 +185,16 @@ fn run_exec_in_home(
     exec_args: &[&str],
     prepare_home: impl FnOnce(&std::path::Path),
 ) -> (bool, String, String) {
+    run_exec_with_stdin(server, exec_args, prepare_home, None)
+}
+
+/// [`run_exec_in_home`] that optionally pipes `stdin` into the child.
+fn run_exec_with_stdin(
+    server: &MockServer,
+    exec_args: &[&str],
+    prepare_home: impl FnOnce(&std::path::Path),
+    stdin: Option<Vec<u8>>,
+) -> (bool, String, String) {
     let workspace = TempDir::new().expect("workspace tempdir");
     let home = TempDir::new().expect("home tempdir");
 
@@ -223,7 +233,18 @@ fn run_exec_in_home(
     std::fs::create_dir_all(home.path().join(".deepseek")).expect("create deepseek config dir");
     prepare_home(home.path());
 
+    if stdin.is_some() {
+        command.stdin(Stdio::piped());
+    }
     let mut child = command.spawn().expect("spawn codewhale-tui exec");
+    let stdin_writer = stdin.map(|bytes| {
+        let mut pipe = child.stdin.take().expect("stdin pipe");
+        std::thread::spawn(move || {
+            use std::io::Write;
+            // The child may exit without reading; a broken pipe is fine.
+            let _ = pipe.write_all(&bytes);
+        })
+    });
     let stdout_reader = read_pipe_in_background(child.stdout.take().expect("stdout pipe"));
     let stderr_reader = read_pipe_in_background(child.stderr.take().expect("stderr pipe"));
 
@@ -245,6 +266,9 @@ fn run_exec_in_home(
         }
     };
 
+    if let Some(writer) = stdin_writer {
+        writer.join().expect("stdin writer thread");
+    }
     let stdout = join_pipe_reader(stdout_reader, "stdout");
     let stderr = join_pipe_reader(stderr_reader, "stderr");
     (
@@ -676,4 +700,69 @@ async fn one_shot_exec_strips_deepseek_dsml_and_points_at_auto() {
         1,
         "a zero-tool text call must not be re-requested\nstderr:\n{stderr}"
     );
+}
+
+/// Last user message text of a chat-completions body, without the
+/// `<turn_meta>` block the engine appends.
+fn last_user_text(body: &Value) -> String {
+    let message = body["messages"]
+        .as_array()
+        .expect("messages array")
+        .iter()
+        .rev()
+        .find(|message| message["role"] == "user")
+        .expect("a user message");
+    let text = match &message["content"] {
+        Value::String(text) => text.clone(),
+        other => other.to_string(),
+    };
+    match text.split_once("\n<turn_meta>") {
+        Some((prompt, _)) => prompt.to_string(),
+        None => text,
+    }
+}
+
+/// #6688: the prompt the model receives comes from `--prompt-file <PATH>` or
+/// `--prompt-file -` (stdin), past argv's 128 KiB per-argument ceiling, while
+/// a positional `-` stays literal text (cloud dispatch passes job prompts
+/// verbatim as argv) and never reads stdin.
+#[tokio::test(flavor = "multi_thread")]
+async fn exec_prompt_reaches_the_model_from_prompt_file_and_stdin() {
+    let server = start_mock_llm(answer_sse_with_usage("pong")).await;
+    let dir = TempDir::new().expect("prompt tempdir");
+    let file_body = format!("FILE-PROMPT {}", "x".repeat(200 * 1024));
+    let file = dir.path().join("prompt.txt");
+    std::fs::write(&file, &file_body).expect("write prompt file");
+    let file_arg = file.to_str().expect("utf-8 path");
+
+    let (ok, stdout, stderr) = run_exec_with_stdin(
+        &server,
+        &["--model", TEST_MODEL, "--prompt-file", file_arg],
+        |_| {},
+        None,
+    );
+    assert!(
+        ok,
+        "--prompt-file <PATH>\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let (ok, stdout, stderr) = run_exec_with_stdin(
+        &server,
+        &["--model", TEST_MODEL, "--prompt-file", "-"],
+        |_| {},
+        Some(b"STDIN-PROMPT answer briefly".to_vec()),
+    );
+    assert!(ok, "--prompt-file -\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    let (ok, stdout, stderr) = run_exec_with_stdin(
+        &server,
+        &["--model", TEST_MODEL, "-"],
+        |_| {},
+        Some(b"STDIN-MUST-NOT-BE-READ".to_vec()),
+    );
+    assert!(ok, "positional -\nstdout:\n{stdout}\nstderr:\n{stderr}");
+
+    let bodies = chat_bodies(&server).await;
+    assert_eq!(bodies.len(), 3, "one model call per run");
+    assert_eq!(last_user_text(&bodies[0]), file_body);
+    assert_eq!(last_user_text(&bodies[1]), "STDIN-PROMPT answer briefly");
+    assert_eq!(last_user_text(&bodies[2]), "-");
 }

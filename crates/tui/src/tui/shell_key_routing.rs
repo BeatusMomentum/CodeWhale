@@ -52,6 +52,8 @@ pub enum Focus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FocusScope {
     PetHabitat,
+    /// Only the sandbox-elevation decision card.
+    Elevation,
     /// Only the model-bound redaction consent gate.
     RedactionGate,
     /// A live session: the composer, or a rail/workflow panel that has taken
@@ -72,6 +74,7 @@ impl FocusScope {
     pub fn admits(self, focus: Focus) -> bool {
         match self {
             Self::PetHabitat => focus == Focus::Modal(ModalKind::PetHabitat),
+            Self::Elevation => focus == Focus::Modal(ModalKind::Elevation),
             Self::RedactionGate => focus == Focus::RedactionGate,
             Self::SessionShell => matches!(focus, Focus::Composer | Focus::Panel),
             Self::AnyShell => matches!(focus, Focus::Composer | Focus::Panel | Focus::Launch),
@@ -87,6 +90,10 @@ impl FocusScope {
 /// Stable binding ids shared by handlers, footer hints, and help catalog.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShellBindingId {
+    ElevationUp,
+    ElevationDown,
+    ElevationConfirm,
+    ElevationAbort,
     PetResultUp,
     PetResultDown,
     PetResultPageUp,
@@ -133,6 +140,12 @@ impl ShellBinding {
     #[must_use]
     pub fn matches(&self, key: &KeyEvent) -> bool {
         match self.id {
+            ShellBindingId::ElevationUp => key.code == KeyCode::Up && key.modifiers.is_empty(),
+            ShellBindingId::ElevationDown => key.code == KeyCode::Down && key.modifiers.is_empty(),
+            ShellBindingId::ElevationConfirm => {
+                key.code == KeyCode::Enter && key.modifiers.is_empty()
+            }
+            ShellBindingId::ElevationAbort => key.code == KeyCode::Esc && key.modifiers.is_empty(),
             ShellBindingId::PetResultUp => key.code == KeyCode::Up && key.modifiers.is_empty(),
             ShellBindingId::PetResultDown => key.code == KeyCode::Down && key.modifiers.is_empty(),
             ShellBindingId::PetResultPageUp => {
@@ -185,6 +198,30 @@ pub fn route(focus: Focus, key: &KeyEvent) -> Option<ShellBindingId> {
 
 /// Canonical shell bindings. Handlers and chrome read from here.
 pub const SHELL_BINDINGS: &[ShellBinding] = &[
+    ShellBinding {
+        id: ShellBindingId::ElevationUp,
+        catalog_chord: "Up",
+        footer_chord: "↑",
+        focus: FocusScope::Elevation,
+    },
+    ShellBinding {
+        id: ShellBindingId::ElevationDown,
+        catalog_chord: "Down",
+        footer_chord: "↓",
+        focus: FocusScope::Elevation,
+    },
+    ShellBinding {
+        id: ShellBindingId::ElevationConfirm,
+        catalog_chord: "Enter",
+        footer_chord: "Enter",
+        focus: FocusScope::Elevation,
+    },
+    ShellBinding {
+        id: ShellBindingId::ElevationAbort,
+        catalog_chord: "Esc",
+        footer_chord: "Esc",
+        focus: FocusScope::Elevation,
+    },
     ShellBinding {
         id: ShellBindingId::PetResultUp,
         catalog_chord: "Up",
@@ -771,6 +808,50 @@ mod tests {
         assert!(hint.starts_with(help.footer_chord), "{hint}");
         assert_eq!(help.focus, FocusScope::Everywhere);
         assert!(help.matches(&KeyEvent::new(KeyCode::Char('/'), KeyModifiers::CONTROL)));
+    }
+
+    #[test]
+    fn elevation_bindings_are_nontext_and_stay_in_the_elevation_card() {
+        for (code, id) in [
+            (KeyCode::Up, ShellBindingId::ElevationUp),
+            (KeyCode::Down, ShellBindingId::ElevationDown),
+            (KeyCode::Enter, ShellBindingId::ElevationConfirm),
+            (KeyCode::Esc, ShellBindingId::ElevationAbort),
+        ] {
+            let key = KeyEvent::new(code, KeyModifiers::NONE);
+            assert_eq!(route(Focus::Modal(ModalKind::Elevation), &key), Some(id));
+            assert!(!binding(id).footer_chord.is_empty());
+            for focus in [
+                Focus::Composer,
+                Focus::Launch,
+                Focus::Modal(ModalKind::Approval),
+            ] {
+                assert_ne!(route(focus, &key), Some(id));
+            }
+            for modifiers in [
+                KeyModifiers::ALT,
+                KeyModifiers::CONTROL,
+                KeyModifiers::SUPER,
+                KeyModifiers::SHIFT,
+            ] {
+                assert_ne!(
+                    route(
+                        Focus::Modal(ModalKind::Elevation),
+                        &KeyEvent::new(code, modifiers)
+                    ),
+                    Some(id)
+                );
+            }
+        }
+        for letter in "nwfajkN W F A J K123".chars() {
+            assert_eq!(
+                route(
+                    Focus::Modal(ModalKind::Elevation),
+                    &KeyEvent::new(KeyCode::Char(letter), KeyModifiers::NONE)
+                ),
+                None
+            );
+        }
     }
 
     #[test]

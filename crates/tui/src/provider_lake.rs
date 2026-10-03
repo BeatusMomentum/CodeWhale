@@ -165,6 +165,10 @@ static MERGED_CACHE: RwLock<Option<MergedCacheEntry>> = RwLock::new(None);
 /// 600+ row OpenRouter catalog for every route candidate.
 static RUNTIME_RESOLVER_CACHE: RwLock<BTreeMap<String, RuntimeResolverCacheEntry>> =
     RwLock::new(BTreeMap::new());
+/// Most distinct endpoints the resolver cache holds at once. Entries from an
+/// older catalog generation can never hit again and are dropped on insert;
+/// this caps the endpoints of the current generation.
+const MAX_RUNTIME_RESOLVER_CACHE_ENTRIES: usize = 64;
 
 #[derive(Clone)]
 struct RuntimeResolverCacheEntry {
@@ -294,6 +298,7 @@ pub fn set_live_snapshot(snapshot: CatalogSnapshot, source: LiveSource) {
 /// scoped persistent caches need that distinction: switching Baseten to a new
 /// base URL with no matching cache must remove the old URL's Baseten rows
 /// immediately instead of presenting them as if they belonged to the new host.
+#[cfg(test)]
 pub fn replace_provider_live_snapshot(provider: &str, snapshot: CatalogSnapshot) {
     let provider = provider.trim();
     if provider.is_empty() {
@@ -407,25 +412,59 @@ pub fn live_catalog_origin(provider: ApiProvider, wire_model_id: &str) -> Option
     let Ok(guard) = LIVE_SNAPSHOT.read() else {
         return None;
     };
-    let matches = |row: &CatalogOffering| {
-        row.provider.eq_ignore_ascii_case(catalog_id)
-            && row.wire_model_id.eq_ignore_ascii_case(needle)
-    };
-    if guard
-        .per_provider
-        .get(&owner)
-        .is_some_and(|snap| snap.offerings.iter().any(matches))
-    {
-        return Some(LiveSource::PerProvider);
-    }
-    if guard
-        .models_dev
-        .as_ref()
-        .is_some_and(|snap| snap.offerings.iter().any(|row| matches(row)))
-    {
-        return Some(LiveSource::ModelsDev);
+    // Wire ids are opaque and case-sensitive: an exact row in either
+    // partition decides before a case-folded one does.
+    for exact in [true, false] {
+        let matches = |row: &CatalogOffering| {
+            row.provider.eq_ignore_ascii_case(catalog_id)
+                && if exact {
+                    row.wire_model_id == needle
+                } else {
+                    row.wire_model_id.eq_ignore_ascii_case(needle)
+                }
+        };
+        if guard
+            .per_provider
+            .get(&owner)
+            .is_some_and(|snap| snap.offerings.iter().any(matches))
+        {
+            return Some(LiveSource::PerProvider);
+        }
+        if guard
+            .models_dev
+            .as_ref()
+            .is_some_and(|snap| snap.offerings.iter().any(|row| matches(row)))
+        {
+            return Some(LiveSource::ModelsDev);
+        }
     }
     None
+}
+
+/// The row whose wire id is exactly `needle`, else the one wire id equal to
+/// it ignoring ASCII case. Wire ids are opaque and case-sensitive, so the
+/// fallback only forgives a case slip when it cannot choose between two
+/// distinct ids; otherwise it answers nothing rather than another model's
+/// metadata.
+fn find_wire_model<'a>(
+    rows: impl IntoIterator<Item = &'a CatalogOffering>,
+    needle: &str,
+) -> Option<&'a CatalogOffering> {
+    let mut folded: Option<&'a CatalogOffering> = None;
+    let mut ambiguous = false;
+    for row in rows {
+        if row.wire_model_id == needle {
+            return Some(row);
+        }
+        if row.wire_model_id.eq_ignore_ascii_case(needle) {
+            match folded {
+                None => folded = Some(row),
+                Some(first) if first.wire_model_id != row.wire_model_id => ambiguous = true,
+                Some(_) => {}
+            }
+        }
+    }
+    folded.filter(|_| !ambiguous)
 }
 
 /// Serialize tests that mutate the process-wide live snapshot.
@@ -937,6 +976,12 @@ pub(crate) fn runtime_catalog_resolver_for_identity(
 
     let resolver = RouteResolver::from_offerings(route_offerings.into_values().collect());
     if let Ok(mut cache) = RUNTIME_RESOLVER_CACHE.write() {
+        cache.retain(|_, entry| {
+            entry.generation == generation && entry.cloud_generation == cloud_generation
+        });
+        if cache.len() >= MAX_RUNTIME_RESOLVER_CACHE_ENTRIES && !cache.contains_key(&cache_key) {
+            cache.pop_first();
+        }
         cache.insert(
             cache_key,
             RuntimeResolverCacheEntry {
@@ -981,15 +1026,16 @@ fn exact_custom_offerings(provider_identity: &str) -> Vec<CatalogOffering> {
         .unwrap_or_default()
 }
 
+/// Wire model ids are opaque and case-sensitive (`org/Model-A` and
+/// `org/model-a` may be two models), so dedup compares them exactly; folding
+/// case here would hide a real row. Only lookup forgives a case slip, and only
+/// when it is unambiguous (see `find_wire_model`).
 fn push_unique_model(models: &mut Vec<String>, model: &str) {
     let model = model.trim();
     if model.is_empty() {
         return;
     }
-    if !models
-        .iter()
-        .any(|existing| existing.eq_ignore_ascii_case(model))
-    {
+    if !models.iter().any(|existing| existing == model) {
         models.push(model.to_string());
     }
 }
@@ -1109,14 +1155,14 @@ pub fn catalog_offering_for_model_identity(
         return None;
     }
     if provider == ApiProvider::Custom {
-        return exact_custom_offerings(catalog_id.as_ref())
-            .into_iter()
-            .find(|row| row.wire_model_id.eq_ignore_ascii_case(needle));
+        let rows = exact_custom_offerings(catalog_id.as_ref());
+        return find_wire_model(&rows, needle).cloned();
     }
-    offerings_for_provider_identity(&merged_snapshot(), catalog_id.as_ref())
-        .into_iter()
-        .find(|row| row.wire_model_id.eq_ignore_ascii_case(needle))
-        .cloned()
+    find_wire_model(
+        offerings_for_provider_identity(&merged_snapshot(), catalog_id.as_ref()),
+        needle,
+    )
+    .cloned()
 }
 
 /// Metadata from the exact route, without borrowing another endpoint's live facts.
@@ -1251,11 +1297,11 @@ pub fn bundled_catalog_offering_for_model(
     if needle.is_empty() {
         return None;
     }
-    bundled_snapshot()
-        .offerings_for_provider(catalog_id)
-        .into_iter()
-        .find(|row| row.wire_model_id.eq_ignore_ascii_case(needle))
-        .cloned()
+    find_wire_model(
+        bundled_snapshot().offerings_for_provider(catalog_id),
+        needle,
+    )
+    .cloned()
 }
 
 /// Count of merged-catalog models for one provider (catalog view / dashboard).
@@ -1858,6 +1904,30 @@ mod tests {
     use super::*;
     use crate::config::{DEFAULT_TOGETHER_FLASH_MODEL, DEFAULT_TOGETHER_MODEL};
     use codewhale_config::catalog::CatalogSource;
+
+    #[test]
+    fn wire_model_lookup_is_exact_first_and_never_guesses_between_case_variants() {
+        let row = |id: &str| CatalogOffering {
+            provider: "p".to_string(),
+            wire_model_id: id.to_string(),
+            ..Default::default()
+        };
+        let rows = vec![row("org/Model-A"), row("org/model-a"), row("org/Model-B")];
+        let found =
+            |needle: &str| find_wire_model(&rows, needle).map(|row| row.wire_model_id.clone());
+        assert_eq!(found("org/model-a").as_deref(), Some("org/model-a"));
+        assert_eq!(found("org/Model-A").as_deref(), Some("org/Model-A"));
+        assert_eq!(found("ORG/MODEL-A"), None, "two distinct ids fold together");
+        assert_eq!(found("org/model-b").as_deref(), Some("org/Model-B"));
+
+        // Listing keeps both case variants: each is a distinct, pickable id.
+        let listed = catalog_models_from_offerings(rows.iter());
+        assert!(
+            listed.contains(&"org/Model-A".to_string())
+                && listed.contains(&"org/model-a".to_string()),
+            "case variants of a wire id are distinct models: {listed:?}"
+        );
+    }
 
     fn catalog_test_config(first_url: &str, second_url: &str) -> Config {
         use crate::config::{ProviderConfig, ProvidersConfig};
@@ -4231,5 +4301,77 @@ mod tests {
             catalog_offering_for_route(provider, "deepseek", base, model).is_none(),
             "an unattested correction cannot survive the roster's omission"
         );
+    }
+
+    /// #6705: through the production runtime resolver, a curated Zen
+    /// transport row wins over a Models.dev row for the same id, a
+    /// catalog-only row routes on the wire its row declares, and a deprecated
+    /// catalog row stays unroutable.
+    #[test]
+    fn opencode_zen_runtime_resolver_keeps_curated_wire_over_models_dev_row() {
+        use codewhale_config::models_dev::ModelsDevCatalog;
+        use codewhale_config::route::{LogicalModelRef, RequestProtocol, RouteError, RouteRequest};
+
+        let _live = lock_live_snapshot();
+        clear_live_snapshot();
+        let raw = r#"{
+          "providers": {
+            "opencode": {
+              "id": "opencode",
+              "npm": "@ai-sdk/openai-compatible",
+              "models": {
+                "gpt-5.6-sol": { "id": "gpt-5.6-sol", "provider": { "npm": "@ai-sdk/anthropic" } },
+                "claude-opus-9": { "id": "claude-opus-9", "provider": { "npm": "@ai-sdk/anthropic" } },
+                "claude-2-retired": {
+                  "id": "claude-2-retired",
+                  "status": "deprecated",
+                  "provider": { "npm": "@ai-sdk/anthropic" }
+                }
+              }
+            }
+          }
+        }"#;
+        let catalog = ModelsDevCatalog::parse_json(raw).expect("fixture parses");
+        set_live_snapshot(
+            CatalogSnapshot {
+                offerings: codewhale_config::catalog::live_offerings_from_models_dev(&catalog, 1),
+            },
+            LiveSource::ModelsDev,
+        );
+
+        let provider = ApiProvider::OpencodeZen;
+        let resolver = runtime_catalog_resolver_for_identity(
+            provider,
+            None,
+            provider.default_base_url(),
+            CatalogStatus::Unknown,
+        )
+        .resolver;
+        let resolve = |model: &str| {
+            resolver.resolve(&RouteRequest {
+                explicit_provider: provider.kind(),
+                model_selector: Some(LogicalModelRef::from(model)),
+                saved_provider_model: None,
+                base_url_override: None,
+                limit_overrides: Vec::new(),
+            })
+        };
+
+        let curated = resolve("gpt-5.6-sol").expect("curated Zen row resolves");
+        assert_eq!(
+            curated.protocol(),
+            RequestProtocol::Responses,
+            "the curated transport row must win over the catalog's conflicting row"
+        );
+        let catalog_only = resolve("claude-opus-9").expect("catalog-proven Zen row resolves");
+        assert_eq!(catalog_only.protocol(), RequestProtocol::AnthropicMessages);
+        match resolve("claude-2-retired") {
+            Err(RouteError::UnsupportedModelProtocol { endpoint_key, .. }) => {
+                assert_eq!(endpoint_key, "deprecated");
+            }
+            other => panic!("a deprecated Zen row must fail closed, got {other:?}"),
+        }
+
+        clear_live_snapshot();
     }
 }

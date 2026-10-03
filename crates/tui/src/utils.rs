@@ -12,6 +12,11 @@ use codewhale_models::{ContentBlock, Message};
 use ignore::WalkBuilder;
 use std::io;
 
+// Split out so the integration harness can `#[path]`-include it with
+// `skills/install.rs`, which reads registry downloads through it.
+mod response_body;
+pub use response_body::read_response_body_capped;
+
 /// A writer that counts bytes written without storing them.
 pub(crate) struct CountingWriter {
     count: usize,
@@ -674,11 +679,36 @@ pub fn open_append(path: &Path) -> std::io::Result<std::io::BufWriter<std::fs::F
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)?;
+    let file = private_log_options().append(true).open(path)?;
+    restrict_to_owner(&file)?;
     Ok(std::io::BufWriter::new(file))
+}
+
+/// Open options for an owner-only log or lock file: created 0600 and never
+/// opened through a link at the final component (Unix). Callers add the
+/// access mode they need.
+pub fn private_log_options() -> std::fs::OpenOptions {
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    options
+}
+
+/// Tighten a log created by an earlier version at the default mode. No-op
+/// outside Unix.
+pub fn restrict_to_owner(file: &std::fs::File) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    #[cfg(not(unix))]
+    let _ = file;
+    Ok(())
 }
 
 /// Flush a `BufWriter` wrapping a `File`, then `fsync` the underlying file.
@@ -692,7 +722,7 @@ pub fn flush_and_sync(writer: &mut std::io::BufWriter<std::fs::File>) -> std::io
 /// Dispatches to the platform-appropriate opener:
 /// - macOS: `open`
 /// - Linux / BSD: `xdg-open`
-/// - Windows: `cmd /C start ""`
+/// - Windows: `rundll32 url.dll,FileProtocolHandler`
 /// - Other: returns an error.
 ///
 /// This is the single entry point for URL opening — every call site in
@@ -733,10 +763,12 @@ fn browser_open_command(url: &str) -> Result<Command> {
         Ok(command)
     }
 
+    // Not `cmd /C start`: cmd.exe would parse `&`, `|`, `^` and `%` inside
+    // the URL. The protocol handler receives it as data.
     #[cfg(target_os = "windows")]
     {
-        let mut cmd = Command::new("cmd");
-        cmd.args(["/C", "start", "", url]);
+        let mut cmd = Command::new("rundll32");
+        cmd.args(["url.dll,FileProtocolHandler", url]);
         Ok(cmd)
     }
 
@@ -1723,7 +1755,8 @@ mod spawn_supervised_tests {
         );
     }
 
-    /// The public writer path keeps the crash log in the selected profile.
+    /// The public writer keeps its named log in the selected profile even
+    /// when another supervised task also writes a crash there.
     #[test]
     fn write_panic_dump_writes_named_log() {
         let _lock = crate::test_support::lock_test_env();
@@ -1731,21 +1764,55 @@ mod spawn_supervised_tests {
         let _profile = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", tmp.path());
         let crash_dir = tmp.path().join("crashes");
         let location = std::panic::Location::caller();
-        write_panic_dump("panic-fixture", location, "boom").expect("write dump");
 
+        // Crash directories hold multiple tasks' logs. The other supervised
+        // panic tests can write here while this process-wide profile is set.
+        write_panic_dump("another-task", location, "other boom").expect("write other dump");
+        let other_entries: Vec<_> = std::fs::read_dir(&crash_dir)
+            .expect("crashes dir exists")
+            .collect::<std::io::Result<Vec<_>>>()
+            .expect("read crash entries")
+            .into_iter()
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with("-another-task.log")
+            })
+            .collect();
+        assert_eq!(
+            other_entries.len(),
+            1,
+            "exactly one other-task log expected"
+        );
+        let other_path = other_entries[0].path();
+        let other_dump = std::fs::read(&other_path).expect("read other dump");
+
+        write_panic_dump("panic-fixture", location, "boom").expect("write dump");
         let entries: Vec<_> = std::fs::read_dir(&crash_dir)
             .expect("crashes dir exists")
-            .flatten()
+            .collect::<std::io::Result<Vec<_>>>()
+            .expect("read crash entries")
+            .into_iter()
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with("-panic-fixture.log")
+            })
             .collect();
-        assert_eq!(entries.len(), 1, "exactly one crash dump expected");
+        assert_eq!(entries.len(), 1, "exactly one panic-fixture log expected");
         let dump = std::fs::read_to_string(entries[0].path()).expect("read dump");
+        assert!(dump.lines().any(|line| line == "Task: panic-fixture"));
         assert!(
-            dump.contains("panic-fixture"),
-            "dump must include the task name; got: {dump}"
+            dump.lines()
+                .any(|line| line == format!("Location: {location}"))
         );
-        assert!(
-            dump.contains("boom"),
-            "dump must include the panic message; got: {dump}"
+        assert!(dump.lines().any(|line| line == "Panic: boom"));
+        assert_eq!(
+            std::fs::read(other_path).expect("other dump remains"),
+            other_dump,
+            "writing a named crash must preserve other tasks' logs"
         );
     }
 }
@@ -1908,13 +1975,24 @@ mod project_mapping_tests {
 
         #[cfg(target_os = "windows")]
         {
-            assert_eq!(command.get_program(), "cmd");
+            assert_eq!(command.get_program(), "rundll32");
             assert_eq!(
                 command
                     .get_args()
                     .map(|arg| arg.to_string_lossy().into_owned())
                     .collect::<Vec<_>>(),
-                vec!["/C", "start", "", "https://example.com"]
+                vec!["url.dll,FileProtocolHandler", "https://example.com"]
+            );
+            // Shell metacharacters stay inside the single URL argument.
+            let url = "https://example.com/?a=1&b=2|x^y%PATH%";
+            let command = super::browser_open_command(url).expect("command");
+            assert_eq!(command.get_program(), "rundll32");
+            assert_eq!(
+                command
+                    .get_args()
+                    .last()
+                    .map(|arg| arg.to_string_lossy().into_owned()),
+                Some(url.to_string())
             );
         }
     }
@@ -1931,5 +2009,29 @@ mod project_mapping_tests {
                 assert!(msg.contains("empty"), "unexpected error message: {msg}");
             }
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn append_logs_are_owner_only_and_not_opened_through_links() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let log = dir.path().join("audit.log");
+        drop(super::open_append(&log).expect("open"));
+        let mode = std::fs::metadata(&log).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+
+        // A log left world-readable by an earlier version is tightened.
+        std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o644)).unwrap();
+        drop(super::open_append(&log).expect("reopen"));
+        let mode = std::fs::metadata(&log).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+
+        let target = dir.path().join("elsewhere");
+        std::fs::write(&target, "").unwrap();
+        let link = dir.path().join("linked.log");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(super::open_append(&link).is_err());
     }
 }

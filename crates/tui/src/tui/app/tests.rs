@@ -47,7 +47,7 @@ fn missing_api_stamps_never_drop_messages_or_shift_preserved_times() {
     assert_eq!(app.api_message_stamps.len(), 3);
     assert_eq!(app.api_message_stamps[0], first);
     assert_eq!(app.api_message_stamps[2], third);
-    app.pop_api_message();
+    app.truncate_api_messages(2);
     assert_eq!(app.api_messages.len(), 2);
     assert_eq!(app.api_message_stamps.len(), 2);
     app.truncate_api_messages(1);
@@ -1101,7 +1101,7 @@ fn zai_gateway_off_and_high_receipts_remain_unavailable() {
 #[test]
 fn kimi_code_high_and_max_work_receipts_preserve_exact_tiers() {
     for (previous, requested) in [
-        (ReasoningEffort::Off, ReasoningEffort::Low),
+        (ReasoningEffort::Auto, ReasoningEffort::Low),
         (ReasoningEffort::High, ReasoningEffort::Max),
     ] {
         let mut app = App::new(test_options(false), &Config::default());
@@ -1630,9 +1630,9 @@ fn app_new_scenario() {
         let _legacy_provider_env = EnvVarGuard::remove("DEEPSEEK_PROVIDER");
 
         let config = Config {
-            api_key: Some("sk-test-onboarding-key".to_string()),
             ..Config::default()
-        };
+        }
+        .with_legacy_root(Some("sk-test-onboarding-key".to_string()), None);
         let app = App::new(test_options(false), &config);
         assert!(
             !app.onboarding_needs_api_key,
@@ -2802,6 +2802,7 @@ fn new_caches_workspace_skills_for_slash_menu() {
     let workspace = tmp.path().join("workspace");
     let skill_dir = workspace.join(".agents").join("skills").join("local-skill");
     std::fs::create_dir_all(&skill_dir).expect("skill dir");
+    crate::test_support::trust_workspace(&workspace);
     std::fs::write(
         skill_dir.join("SKILL.md"),
         "---\nname: local-skill\ndescription: Local workspace skill\n---\nUse the local skill.\n",
@@ -2823,6 +2824,7 @@ fn new_caches_workspace_skills_for_slash_menu() {
 fn cached_skills_merges_across_candidate_directories() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let workspace = tmp.path().join("workspace");
+    crate::test_support::trust_workspace(&workspace);
 
     // Higher-precedence directory contains a stale empty dir for `foo`
     // (no SKILL.md). This used to shadow the real definition further
@@ -2857,6 +2859,7 @@ fn cached_skills_merges_across_candidate_directories() {
 fn cached_skills_respect_codewhale_only_scan_config() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let workspace = tmp.path().join("workspace");
+    crate::test_support::trust_workspace(&workspace);
 
     let claude_dir = workspace
         .join(".claude")
@@ -2937,6 +2940,39 @@ fn resolve_skills_dir_requires_codewhale_skills_to_be_directory() {
 }
 
 #[test]
+fn resolve_skills_dir_ignores_untrusted_workspace_skills() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let global_skills_dir = tmp.path().join("global-skills");
+    for relative in [".agents/skills", "skills"] {
+        let workspace = tmp
+            .path()
+            .join(format!("ws-{}", relative.replace('/', "-")));
+        let local_skills = workspace.join(relative);
+        std::fs::create_dir_all(&local_skills).expect("skills dir");
+        let config = Config {
+            skills_dir: Some(global_skills_dir.to_string_lossy().into_owned()),
+            skills: Some(crate::config::SkillsConfig {
+                flat_workspace_root: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            resolve_skills_dir(&workspace, &global_skills_dir, &config),
+            global_skills_dir,
+            "untrusted {relative} must not be resolved as the skills dir"
+        );
+        crate::test_support::trust_workspace(&workspace);
+        assert_eq!(
+            resolve_skills_dir(&workspace, &global_skills_dir, &config),
+            local_skills,
+            "trusted {relative} resolves as before"
+        );
+    }
+}
+
+#[test]
 fn cached_skills_include_configured_directory() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let workspace = tmp.path().join("workspace");
@@ -2973,6 +3009,7 @@ fn cached_skills_include_configured_directory() {
 fn cached_skills_preserve_configured_directory_in_codewhale_only_scan() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let workspace = tmp.path().join("workspace");
+    crate::test_support::trust_workspace(&workspace);
 
     let codewhale_skill_dir = workspace
         .join(".codewhale")
@@ -3277,6 +3314,35 @@ fn submit_input_consolidates_oversized_input_into_paste_file() {
 
     // The composer must be clear after submit.
     assert!(app.input.is_empty());
+}
+
+#[test]
+fn submit_input_holds_oversized_input_when_paste_file_cannot_be_written() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    // `.codewhale` is a file, so `.codewhale/pastes` cannot be created.
+    std::fs::write(tmp.path().join(".codewhale"), "not a dir").expect("seed file");
+    let mut opts = test_options(false);
+    opts.workspace = tmp.path().to_path_buf();
+    let mut app = App::new(opts, &Config::default());
+    let full_content = "y".repeat(MAX_SUBMITTED_INPUT_CHARS + 128);
+    app.input = full_content.clone();
+    app.cursor_position = app.input.chars().count();
+
+    assert_eq!(
+        app.submit_input(),
+        None,
+        "a truncated prompt must not be sent"
+    );
+    assert_eq!(
+        app.input, full_content,
+        "the full text stays in the composer"
+    );
+    assert!(
+        app.status_toasts
+            .iter()
+            .any(|toast| toast.text.starts_with("Not sent") && toast.text.contains("shorten it")),
+        "expected an actionable not-sent toast"
+    );
 }
 
 #[test]
@@ -4143,6 +4209,53 @@ fn managed_requirements_ignore_saved_full_access_and_lock_changes() {
             .iter()
             .any(|toast| toast.text.contains("controlled"))
     );
+}
+
+#[test]
+fn sandbox_requirements_prevent_full_access_overrides() {
+    let _env_lock = lock_test_env();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let config_path = tmp.path().join("config.toml");
+    let requirements_path = tmp.path().join("requirements.toml");
+    std::fs::write(
+        &requirements_path,
+        "allowed_sandbox_modes = [\"workspace-write\"]\n",
+    )
+    .expect("requirements");
+    let _home = EnvVarGuard::set("CODEWHALE_HOME", tmp.path());
+    let _config_env = EnvVarGuard::set("DEEPSEEK_CONFIG_PATH", &config_path);
+    let config = Config {
+        requirements_path: Some(requirements_path.to_string_lossy().into_owned()),
+        ..Config::default()
+    };
+
+    for (settings, cli_yolo) in [
+        ("permission_posture = \"full-access\"\n", false),
+        ("", true),
+        ("default_mode = \"yolo\"\n", false),
+    ] {
+        std::fs::write(tmp.path().join("settings.toml"), settings).expect("settings");
+        let mut options = test_options(cli_yolo);
+        options.workspace = tmp.path().to_path_buf();
+        let mut app = App::new(options, &config);
+
+        assert_eq!(app.approval_mode, ApprovalMode::Suggest);
+        assert!(!app.trust_mode);
+        assert!(!app.yolo);
+        assert!(app.approval_policy_requirements_managed());
+        assert!(!app.cycle_approval_posture());
+        assert_eq!(app.select_yolo_compat(), SettingSelection::Refused);
+        assert!(matches!(
+            crate::core::authority::sandbox_policy_for_turn(
+                app.mode,
+                app.approval_mode,
+                config.sandbox_mode.as_deref(),
+                &app.workspace,
+                crate::core::authority::SandboxNetworkAccess::Restricted,
+            ),
+            crate::sandbox::SandboxPolicy::WorkspaceWrite { .. }
+        ));
+    }
 }
 
 #[test]
@@ -5953,6 +6066,37 @@ fn cursor_moves_by_grapheme_over_emoji_and_cjk() {
     assert_eq!(app.cursor_position, 0); // clamped at start
 }
 
+/// U01-m4: vim Normal-mode clamps, `a`, and `j`/`k` column moves land on
+/// grapheme-cluster starts, never inside a combining or skin-tone sequence.
+#[test]
+fn vim_cursor_moves_never_split_a_grapheme_cluster() {
+    let mut app = App::new(test_options(false), &Config::default());
+    app.vim_enabled = true;
+    // "e" + COMBINING ACUTE: two scalars, one cluster.
+    app.input = "e\u{301}".to_string();
+    app.cursor_position = char_count(&app.input);
+    app.vim_enter_normal();
+    assert_eq!(
+        app.cursor_position, 0,
+        "Normal mode sits on the cluster start"
+    );
+    app.vim_enter_append();
+    assert_eq!(
+        app.cursor_position, 2,
+        "`a` appends after the whole cluster"
+    );
+
+    // Scalar column 1 falls inside the other line's skin-tone emoji.
+    app.input = "ab\n\u{1f44d}\u{1f3fd}c".to_string();
+    app.cursor_position = 1; // on `b`
+    app.vim_move_down();
+    assert_eq!(app.cursor_position, 3, "`j` lands on the emoji's start");
+    app.input = "\u{1f44d}\u{1f3fd}c\nab".to_string();
+    app.cursor_position = 5; // on `b`
+    app.vim_move_up();
+    assert_eq!(app.cursor_position, 0, "`k` lands on the emoji's start");
+}
+
 #[test]
 fn backspace_removes_whole_emoji_cluster() {
     let mut app = App::new(test_options(false), &Config::default());
@@ -6273,7 +6417,6 @@ fn startup_and_fallback_skip_inactive_external_only_routes_without_io() {
 
     let config = Config {
         provider: Some(ApiProvider::Deepseek.as_str().to_string()),
-        api_key: Some("active-deepseek-key".to_string()),
         fallback_providers: vec![
             codewhale_config::ProviderKind::OpenaiCodex,
             codewhale_config::ProviderKind::Xai,
@@ -6304,7 +6447,8 @@ fn startup_and_fallback_skip_inactive_external_only_routes_without_io() {
             ..Default::default()
         }),
         ..Default::default()
-    };
+    }
+    .with_legacy_root(Some("active-deepseek-key".to_string()), None);
     let mut options = test_options(false);
     options.skip_onboarding = true;
 
@@ -7603,4 +7747,206 @@ fn owned_restore_moves_the_journal_and_matches_the_borrowing_restore() {
         legacy_borrowed.session_journal.entries.len()
     );
     assert_eq!(legacy_owned.api_message_stamps.len(), 2);
+}
+
+/// Walk Ctrl+T for two full laps on a concrete route and assert that every
+/// press changes the effective tier — the value `/status`, the effort status
+/// line, and Work receipts report — not merely the requested label.
+fn assert_every_ctrl_t_press_changes_the_effective_tier(
+    provider: ApiProvider,
+    base_url: &str,
+    model: &str,
+) -> Vec<ReasoningEffort> {
+    let mut app = App::new(test_options(false), &Config::default());
+    app.api_provider = provider;
+    app.auto_model = false;
+    app.active_route_base_url = base_url.to_string();
+    app.model = model.to_string();
+    app.reasoning_effort = ReasoningEffort::Auto;
+    let ladder =
+        crate::tui::model_picker::picker_efforts_for_route(provider, base_url, model, false);
+    let mut effective = app.effective_reasoning_effort_for_active_route(app.reasoning_effort);
+    let mut walked = Vec::new();
+    // Two full laps: the report was about presses after the first lap.
+    for press in 0..ladder.len() * 2 {
+        assert_eq!(app.cycle_effort(), SettingSelection::Changed);
+        let next = app.effective_reasoning_effort_for_active_route(app.reasoning_effort);
+        assert_ne!(
+            next, effective,
+            "{model}: press {press} ({:?}) left the effective tier at {effective:?}",
+            app.reasoning_effort
+        );
+        effective = next;
+        walked.push(app.reasoning_effort);
+    }
+    let mut expected = ladder.clone();
+    expected.rotate_left(1);
+    expected.extend(expected.clone());
+    assert_eq!(walked, expected, "{model} walks the picker ladder");
+    ladder
+}
+
+#[test]
+fn every_ctrl_t_press_changes_the_effective_thinking_tier() {
+    // #6650: Ctrl+T walked rungs that resolved to the tier already in effect,
+    // so presses looked dead.
+    let _catalog = crate::provider_lake::lock_live_snapshot();
+    crate::provider_lake::clear_live_snapshot();
+    for (provider, base_url, model) in [
+        (
+            ApiProvider::Deepseek,
+            crate::config::DEFAULT_DEEPSEEK_BASE_URL,
+            "deepseek-v4.1-flash",
+        ),
+        (
+            ApiProvider::Deepseek,
+            crate::config::DEFAULT_DEEPSEEK_BASE_URL,
+            "deepseek-v4.1",
+        ),
+        (
+            ApiProvider::Moonshot,
+            crate::config::DEFAULT_KIMI_CODE_BASE_URL,
+            crate::config::KIMI_CODE_K3_MODEL,
+        ),
+        (
+            ApiProvider::Xai,
+            crate::config::DEFAULT_XAI_BASE_URL,
+            crate::config::XAI_GROK_4_6_MODEL,
+        ),
+    ] {
+        assert_every_ctrl_t_press_changes_the_effective_tier(provider, base_url, model);
+    }
+}
+
+#[test]
+fn ctrl_t_skips_catalog_rungs_that_resolve_to_an_offered_tier() {
+    // A catalog can publish effort spellings the route collapses: DeepSeek
+    // sends `medium`/`xhigh` as `high`, and Z.ai GLM-5.2 sends `low`/`medium`
+    // as `high`. Each Ctrl+T press must still reach a new effective tier.
+    use ReasoningEffort::{Auto, High, Low, Max, Off};
+    let _catalog = crate::provider_lake::lock_live_snapshot();
+    crate::provider_lake::clear_live_snapshot();
+    let fetched_at = u64::try_from(chrono::Utc::now().timestamp()).expect("timestamp");
+    let offering = |provider: ApiProvider, model: &str, values: &[&str]| {
+        codewhale_config::catalog::CatalogOffering {
+            provider: provider.as_str().to_string(),
+            wire_model_id: model.to_string(),
+            endpoint_key: "chat".to_string(),
+            reasoning_options: vec![serde_json::json!({ "type": "effort", "values": values })],
+            source: codewhale_config::catalog::CatalogSource::Live {
+                base_url_fingerprint: "models-dev-capabilities".to_string(),
+                fetched_at,
+            },
+            ..Default::default()
+        }
+    };
+    crate::provider_lake::set_live_snapshot(
+        codewhale_config::catalog::CatalogSnapshot {
+            offerings: vec![
+                offering(
+                    ApiProvider::Deepseek,
+                    "deepseek-v4.1-flash",
+                    &["low", "medium", "high", "xhigh", "max"],
+                ),
+                offering(
+                    ApiProvider::Zai,
+                    crate::config::ZAI_GLM_5_2_MODEL,
+                    &["off", "low", "medium", "high", "max"],
+                ),
+            ],
+        },
+        crate::provider_lake::LiveSource::ModelsDev,
+    );
+
+    let deepseek = assert_every_ctrl_t_press_changes_the_effective_tier(
+        ApiProvider::Deepseek,
+        crate::config::DEFAULT_DEEPSEEK_BASE_URL,
+        "deepseek-v4.1-flash",
+    );
+    let zai = assert_every_ctrl_t_press_changes_the_effective_tier(
+        ApiProvider::Zai,
+        crate::config::DEFAULT_ZAI_BASE_URL,
+        crate::config::ZAI_GLM_5_2_MODEL,
+    );
+    crate::provider_lake::clear_live_snapshot();
+
+    assert_eq!(deepseek, vec![Auto, Low, High, Max]);
+    assert_eq!(zai, vec![Auto, Off, High, Max]);
+}
+
+#[test]
+fn ctrl_t_moves_past_a_persisted_alias_the_ladder_dropped() {
+    // DeepSeek has no `medium`; it resolves to `high`, so the next press must
+    // reach `max` rather than re-select `high`.
+    let _catalog = crate::provider_lake::lock_live_snapshot();
+    let mut app = App::new(test_options(false), &Config::default());
+    app.api_provider = ApiProvider::Deepseek;
+    app.auto_model = false;
+    app.active_route_base_url = crate::config::DEFAULT_DEEPSEEK_BASE_URL.to_string();
+    app.model = "deepseek-v4.1-flash".to_string();
+    app.reasoning_effort = ReasoningEffort::Medium;
+
+    app.cycle_effort();
+
+    assert_eq!(app.reasoning_effort, ReasoningEffort::Max);
+}
+
+#[test]
+fn skills_cache_hides_model_only_and_preserves_argument_hint() {
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace = tmp.path().join("workspace");
+    crate::test_support::trust_workspace(&workspace);
+    let root = workspace.join(".codewhale/skills");
+    for (name, policy) in [
+        ("model", "user-invocable: false"),
+        (
+            "user",
+            "disable-model-invocation: true\nargument-hint: '[path]'",
+        ),
+        (
+            "disabled",
+            "disable-model-invocation: true\nuser-invocable: false",
+        ),
+    ] {
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: routing\n{policy}\n---\nbody"),
+        )
+        .unwrap();
+    }
+    let mut options = test_options(false);
+    options.workspace = workspace;
+    options.skills_dir = root;
+    let app = App::new(options, &Config::default());
+    assert!(
+        app.cached_skills
+            .iter()
+            .all(|(name, _)| name != "model" && name != "disabled")
+    );
+    assert!(
+        app.cached_skills
+            .iter()
+            .any(|(name, description)| name == "user" && description.contains("[path]"))
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn oversized_paste_is_not_written_through_a_linked_pastes_directory() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let outside = tempfile::TempDir::new().expect("outside");
+    std::os::unix::fs::symlink(outside.path(), tmp.path().join(".codewhale")).expect("link");
+    let mut opts = test_options(false);
+    opts.workspace = tmp.path().to_path_buf();
+    let mut app = App::new(opts, &Config::default());
+    app.insert_paste_text(&"y".repeat(MAX_SUBMITTED_INPUT_CHARS + 256));
+
+    let _ = app.submit_input();
+
+    assert!(
+        std::fs::read_dir(outside.path()).unwrap().next().is_none(),
+        "the pasted text must not land outside the workspace"
+    );
 }

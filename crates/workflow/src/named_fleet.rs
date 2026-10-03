@@ -51,14 +51,39 @@ impl FleetSearchRoot {
 }
 
 /// Split `origin/name` into its parts. A bare name yields `(None, name)`.
-fn split_qualified_fleet_name(name: &str) -> (Option<&str>, &str) {
+///
+/// The bare part becomes a `<name>.toml` file name, so it is validated here
+/// with [`validate_fleet_file_stem`] before any caller touches the disk.
+pub fn split_qualified_fleet_name(name: &str) -> Result<(Option<&str>, &str), NamedFleetError> {
     let trimmed = name.trim();
-    match trimmed.split_once('/') {
+    let (origin, bare) = match trimmed.split_once('/') {
         Some((origin, bare)) if !origin.trim().is_empty() && !bare.trim().is_empty() => {
             (Some(origin.trim()), bare.trim())
         }
         _ => (None, trimmed),
+    };
+    validate_fleet_file_stem(bare)?;
+    Ok((origin, bare))
+}
+
+/// A fleet or router name is one file name inside a `fleets/`-style
+/// directory: non-empty, a single normal path component, and free of path
+/// separators, drive prefixes and NUL. Anything else is refused before a
+/// path is built from it.
+pub fn validate_fleet_file_stem(stem: &str) -> Result<(), NamedFleetError> {
+    let single_component = matches!(
+        Path::new(stem).components().collect::<Vec<_>>().as_slice(),
+        [std::path::Component::Normal(_)]
+    );
+    if stem.is_empty()
+        || stem == "."
+        || stem == ".."
+        || stem.contains(['/', '\\', ':', '\0'])
+        || !single_component
+    {
+        return Err(NamedFleetError::InvalidName);
     }
+    Ok(())
 }
 
 /// Parsed named fleet file.
@@ -75,6 +100,13 @@ pub struct NamedFleet {
 pub enum NamedFleetError {
     #[error("fleet file not found: {0}")]
     NotFound(String),
+    /// Carries no text from the rejected name, so the refusal cannot echo a
+    /// path back.
+    #[error(
+        "invalid fleet name: use a plain name (optionally `origin/name`) without path \
+         separators or `..`"
+    )]
+    InvalidName,
     #[error("failed to read fleet file {path}: {message}")]
     Io { path: String, message: String },
     #[error("failed to parse fleet file {path}: {message}")]
@@ -195,7 +227,7 @@ impl FleetDocument {
         name: &str,
         search_roots: &[FleetSearchRoot],
     ) -> Result<(Self, QualifiedFleetId), NamedFleetError> {
-        let (requested_origin, bare_name) = split_qualified_fleet_name(name);
+        let (requested_origin, bare_name) = split_qualified_fleet_name(name)?;
         let file_name = format!("{bare_name}.toml");
 
         let mut candidates: Vec<(&FleetSearchRoot, PathBuf)> = Vec::new();
@@ -502,6 +534,7 @@ pub fn load_named_fleet(
     name: &str,
     search_roots: &[PathBuf],
 ) -> Result<NamedFleet, NamedFleetError> {
+    validate_fleet_file_stem(name)?;
     let file_name = format!("{name}.toml");
     for root in search_roots {
         let path = root.join("fleets").join(&file_name);
@@ -592,6 +625,48 @@ release_lead = "manager"
         assert_eq!(fleet.resolve("reviewer").unwrap(), "reviewer");
         assert_eq!(fleet.resolve("test").unwrap(), "verifier");
         assert_eq!(fleet.resolve("release_lead").unwrap(), "manager");
+    }
+
+    #[test]
+    fn fleet_names_cannot_leave_the_fleets_directory() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let ws = tmp.path().join("ws");
+        std::fs::create_dir_all(ws.join("fleets")).expect("fleets dir");
+        let planted = STOPSHIP_TOML.replace("\"stopship\"", "\"outside\"");
+        // Reachable by `workspace/../../outside` and by an absolute name.
+        std::fs::write(tmp.path().join("outside.toml"), &planted).expect("outside");
+        // Reachable by a bare `../outside` from `ws/fleets`.
+        std::fs::write(ws.join("outside.toml"), &planted).expect("sibling");
+        let roots = vec![FleetSearchRoot::new("workspace", &ws)];
+        let absolute = tmp.path().join("outside");
+        let absolute = absolute.to_string_lossy();
+
+        for name in [
+            "workspace/../../outside",
+            "workspace/../outside",
+            absolute.as_ref(),
+            "workspace/sub/outside",
+            "..",
+            "",
+        ] {
+            let err = FleetDocument::load_by_name(name, &roots).expect_err(name);
+            assert!(
+                matches!(err, NamedFleetError::InvalidName),
+                "{name}: expected InvalidName, got {err:?}"
+            );
+            assert!(
+                !err.to_string()
+                    .contains(tmp.path().to_string_lossy().as_ref())
+            );
+        }
+        let err = load_named_fleet("../outside", std::slice::from_ref(&ws)).expect_err("legacy");
+        assert!(matches!(err, NamedFleetError::InvalidName), "{err:?}");
+
+        // A plain name still loads.
+        std::fs::write(ws.join("fleets").join("stopship.toml"), STOPSHIP_TOML).expect("fleet");
+        FleetDocument::load_by_name("stopship", &roots).expect("plain name");
+        FleetDocument::load_by_name("workspace/stopship", &roots).expect("qualified name");
+        load_named_fleet("stopship", std::slice::from_ref(&ws)).expect("legacy plain name");
     }
 
     #[test]

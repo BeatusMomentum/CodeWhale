@@ -150,23 +150,6 @@ pub struct AuthenticationErrorContext {
 
 impl AuthenticationErrorContext {
     #[must_use]
-    pub fn new(
-        provider: &str,
-        base_url: &str,
-        model: &str,
-        key_source: &str,
-        api_key: &str,
-    ) -> Self {
-        Self::from_parts(
-            Some(provider),
-            Some(base_url),
-            Some(model),
-            Some(key_source),
-            Some(api_key),
-        )
-    }
-
-    #[must_use]
     pub fn from_parts(
         provider: Option<&str>,
         base_url: Option<&str>,
@@ -257,11 +240,6 @@ impl AuthenticationErrorDetail {
     }
 
     #[must_use]
-    pub fn message(&self) -> &str {
-        &self.message
-    }
-
-    #[must_use]
     pub fn to_user_message(&self) -> String {
         let Some(context) = self.context.as_ref() else {
             return self.message.clone();
@@ -328,6 +306,7 @@ fn public_key_prefix(api_key: &str) -> Option<&str> {
         .find(|prefix| api_key.starts_with(prefix))
 }
 
+#[cfg(test)]
 fn redact_api_key_from_message(message: &str, api_key: Option<&str>) -> String {
     let Some(api_key) = api_key.and_then(non_empty_trimmed) else {
         return message.to_string();
@@ -518,11 +497,7 @@ impl LlmError {
                         status,
                         message: body.to_string(),
                     }
-                } else if body_lower.contains("context_length")
-                    || body_lower.contains("token")
-                    || body_lower.contains("too long")
-                    || body_lower.contains("maximum")
-                {
+                } else if is_context_length_message(&body_lower) {
                     LlmError::ContextLengthError(body.to_string())
                 } else if body_lower.contains("content_policy")
                     || body_lower.contains("safety")
@@ -578,6 +553,7 @@ impl LlmError {
     /// Constructs an `LlmError` from HTTP response data plus request context
     /// that is safe to display when authentication fails.
     #[must_use]
+    #[cfg(test)]
     pub fn from_http_response_with_request_context(
         status: u16,
         body: &str,
@@ -745,6 +721,32 @@ fn looks_like_authentication_failure(body: &str) -> bool {
         || lower.contains("invalid token")
         || lower.contains("bearer token")
         || lower.contains("missing token")
+}
+
+/// A provider error is a context overflow only when it says so. Bare
+/// "token", "too long" or "maximum" also appear in ordinary invalid-request
+/// errors (`max_tokens must be ...`, a field value too long), which compaction
+/// or a bigger window cannot fix. This is the one phrase list: the typed 400
+/// classification here and the engine's string classifier both read it.
+/// `lower` must already be lowercase.
+pub(crate) fn is_context_length_message(lower: &str) -> bool {
+    [
+        "context_length",
+        "context length",
+        "context window",
+        "context limit",
+        "maximum context",
+        "prompt is too long",
+        "input is too long",
+        "maximum prompt length",
+        "exceeded model token limit",
+        "tokens exceed",
+        "exceeds the maximum number of tokens",
+        // llama.cpp: "the request exceeds the available context size".
+        "available context size",
+    ]
+    .iter()
+    .any(|phrase| lower.contains(phrase))
 }
 
 /// Quota exhaustion is a durable account state, not a generic rate-limit
@@ -1136,6 +1138,9 @@ impl From<RetryPolicy> for RetryConfig {
             initial_delay: policy.initial_delay,
             max_delay: policy.max_delay,
             exponential_base: policy.exponential_base,
+            jitter: policy.jitter,
+            jitter_factor: policy.jitter_factor,
+            respect_retry_after: policy.respect_retry_after,
             ..Default::default()
         }
     }
@@ -1150,6 +1155,9 @@ impl From<RetryConfig> for RetryPolicy {
             initial_delay: config.initial_delay,
             max_delay: config.max_delay,
             exponential_base: config.exponential_base,
+            jitter: config.jitter,
+            jitter_factor: config.jitter_factor,
+            respect_retry_after: config.respect_retry_after,
         }
     }
 }
@@ -1213,6 +1221,17 @@ pub type RetryCallback = Box<dyn Fn(&LlmError, u32, Duration) + Send + Sync>;
 ///
 /// * `Ok(T)` - The successful result from the operation
 /// * `Err(RetryError)` - All retries exhausted or non-retryable error encountered
+///
+/// # Known limitation: ambiguous failures are replayed
+///
+/// A timeout or connection loss after the request was written is retried
+/// like a connect failure, so a provider that already accepted the first
+/// attempt may bill a second completion. Every caller sends model inference
+/// (messages, FIM, translation, speech, provider web search): a replay costs
+/// compute but has no external side effect, and the provider APIs used here
+/// expose no idempotency key for these requests that could dedupe it. An
+/// operation with an external side effect must not be retried through this
+/// helper without an idempotency key the server honors.
 ///
 /// # Example
 ///
@@ -1753,6 +1772,9 @@ mod tests {
             initial_delay: 2.0,
             max_delay: 30.0,
             exponential_base: 3.0,
+            jitter: false,
+            jitter_factor: 0.25,
+            respect_retry_after: false,
         };
 
         let config: RetryConfig = policy.clone().into();
@@ -1762,10 +1784,19 @@ mod tests {
         assert_f64_eq(config.max_delay, policy.max_delay);
         assert_f64_eq(config.exponential_base, policy.exponential_base);
 
+        // #6700: the jitter and Retry-After knobs survive the conversion
+        // instead of silently resetting to `RetryConfig::default()`.
+        assert!(!config.jitter);
+        assert_f64_eq(config.jitter_factor, 0.25);
+        assert!(!config.respect_retry_after);
+
         // Convert back
         let policy2: RetryPolicy = config.into();
         assert_eq!(policy2.enabled, policy.enabled);
         assert_eq!(policy2.max_retries, policy.max_retries);
+        assert_eq!(policy2.jitter, policy.jitter);
+        assert_f64_eq(policy2.jitter_factor, policy.jitter_factor);
+        assert_eq!(policy2.respect_retry_after, policy.respect_retry_after);
     }
 
     #[tokio::test]

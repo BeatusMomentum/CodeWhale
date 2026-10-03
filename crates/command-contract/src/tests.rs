@@ -1,8 +1,8 @@
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 
-use codewhale_core::request::{ContentBlock, Message, SystemPrompt};
-use codewhale_core::role::Role;
+use codewhale_protocol::request::{ContentBlock, Message, SystemPrompt};
+use codewhale_protocol::role::Role;
 
 use crate::*;
 
@@ -143,6 +143,397 @@ fn envelope_carries_independent_facets() {
     assert_eq!(parts.session.expect("session").total_tokens(), 42);
     assert!(parts.model.expect("model").auto_model());
     assert!(parts.cost.is_none());
+}
+
+struct DebugDiagnostics;
+impl CommandDebugDiagnosticsContext for DebugDiagnostics {
+    fn balance_projection(&self) -> DebugBalanceProjection {
+        DebugBalanceProjection {
+            provider_display_name: "Example".into(),
+            supports_balance_api: false,
+        }
+    }
+    fn system_projection(&self) -> DebugSystemProjection {
+        DebugSystemProjection {
+            mode_label: "plan".into(),
+            prompt: DebugSystemPrompt::Blocks(vec!["first".into(), "second".into()]),
+        }
+    }
+    fn token_projection(&self) -> DebugTokenProjection {
+        DebugTokenProjection {
+            active_context_used: 0,
+            context_window: 8192,
+            last_input: None,
+            last_output: Some(0),
+            cache_hit: None,
+            cache_miss: Some(0),
+            total_tokens: 0,
+            cache_write_tokens: 0,
+            api_message_count: 0,
+            chat_message_count: 0,
+            model: "example".into(),
+            cost: self.cost_projection(),
+        }
+    }
+    fn cost_projection(&self) -> DebugCostProjection {
+        DebugCostProjection {
+            currency: CommandCurrency::Usd,
+            total: 0.0,
+            parent_turns: 0.0,
+            subagents: 0.0,
+            display_floor: 0.0,
+            priced_turns: 0,
+            unpriced_turns: 0,
+            legacy_coverage_unknown: false,
+            user_declared_estimates: false,
+            itemized_turns: 0,
+            route_amounts: vec![],
+            turn_history_capacity: 10,
+            unpriced_reason_labels: vec![],
+            unpriced_classes: vec![],
+            pricing_provenances: vec![],
+            live_pricing_defects: vec![],
+            unusable_pricing_defects: vec![],
+            route_receipts: vec![],
+        }
+    }
+    fn cache_telemetry(&self) -> DebugCacheTelemetry {
+        DebugCacheTelemetry {
+            model: "example".into(),
+            session_cache_rates: DebugCacheRates::default(),
+            history: vec![],
+            history_capacity: 50,
+            prefix_stability_pct: None,
+            prefix_checks_total: 0,
+            prefix_change_count: 0,
+            prefix_drift_count: 0,
+            prefix_context_updates: 0,
+            prefix_pin_reason: None,
+            prefix_last_miss_reason: None,
+            last_prefix_change_desc: None,
+            last_pinned_prefix_hash: None,
+            api_message_count: 0,
+            non_system_message_count: 0,
+        }
+    }
+    fn context_source_map(&self) -> DebugPromptSourceMap {
+        DebugPromptSourceMap {
+            entries: vec![],
+            total_estimated_tokens: 0,
+            active_context_estimated_tokens: 0,
+            overflow_guard_estimated_tokens: None,
+            context_window_tokens: None,
+            context_window_source: None,
+            budget_used_percent: None,
+            pressure_label: "unknown".into(),
+            context_window_verified: false,
+            generated_at: "2026-01-01T00:00:00Z".into(),
+            note: String::new(),
+        }
+    }
+    fn prompt_context(&self) -> DebugPromptContext {
+        DebugPromptContext {
+            schema_version: 1,
+            provider: "example".into(),
+            model: "model".into(),
+            system_prompt_state: "unknown".into(),
+            tool_catalog_state: "absent".into(),
+            sections: vec![],
+            tools: vec![],
+            source_map: self.context_source_map(),
+        }
+    }
+    fn tool_snapshot(&self) -> Option<DebugToolSnapshot> {
+        None
+    }
+    fn inspect_cache(
+        &self,
+    ) -> Result<DebugCacheInspectionObservation, DebugCacheInspectionUnavailable> {
+        Err(DebugCacheInspectionUnavailable::NoConcreteRoute)
+    }
+    fn remember_cache_inspection(&mut self, _inspection: DebugPromptInspection) {}
+}
+
+#[test]
+fn debug_inspection_schema_preserves_order_and_absence() {
+    let inspection = DebugPromptInspection {
+        base_static_prefix_hash: "base".into(),
+        full_request_prefix_hash: "full".into(),
+        tool_catalog_hash: "".into(),
+        layers: vec![DebugPromptLayer {
+            name: "history".into(),
+            stability: DebugPromptLayerStability::History,
+            char_len: 0,
+            byte_len: 0,
+            token_estimate: 0,
+            sha256: "digest".into(),
+            tool_result: None,
+            turn_meta: None,
+        }],
+    };
+    assert_eq!(
+        serde_json::to_string(&inspection).expect("structured inspection"),
+        r#"{"base_static_prefix_hash":"base","full_request_prefix_hash":"full","tool_catalog_hash":"","layers":[{"name":"history","stability":"History","char_len":0,"byte_len":0,"token_estimate":0,"sha256":"digest","tool_result":null,"turn_meta":null}]}"#,
+    );
+    assert_eq!(DebugPromptLayerStability::Static.label(), "static");
+    assert_eq!(DebugPromptLayerStability::Dynamic.label(), "dynamic");
+    assert_ne!(
+        DebugCacheInspectionUnavailable::NoConcreteRoute,
+        DebugCacheInspectionUnavailable::MissingCapturedEndpoint,
+    );
+    let key = DebugWarmupKey {
+        provider: "provider".into(),
+        model: "model".into(),
+        base_url: "local".into(),
+        static_prefix_hash: "static".into(),
+        tool_catalog_hash: "".into(),
+        project_pack_hash: "".into(),
+        skills_hash: "".into(),
+    };
+    assert_eq!(
+        serde_json::to_string(&key).expect("structured key"),
+        r#"{"provider":"provider","model":"model","base_url":"local","static_prefix_hash":"static","tool_catalog_hash":"","project_pack_hash":"","skills_hash":""}"#,
+    );
+    assert_eq!(
+        DebugDiagnostics.inspect_cache(),
+        Err(DebugCacheInspectionUnavailable::NoConcreteRoute)
+    );
+}
+
+#[test]
+fn debug_context_schema_preserves_explicit_nulls_and_omits_optional_tool_fields() {
+    let mut context = DebugDiagnostics.prompt_context();
+    context.tools.push(DebugPromptTool {
+        tool_type: None,
+        name: "search".into(),
+        description: "Search".into(),
+        input_schema: serde_json::json!({"type": "object"}),
+        allowed_callers: None,
+        defer_loading: Some(false),
+        input_examples: None,
+        strict: None,
+        cache_control: None,
+    });
+    let value = serde_json::to_value(&context).expect("semantic prompt context");
+    assert_eq!(
+        value["source_map"]["context_window_tokens"],
+        serde_json::Value::Null
+    );
+    assert_eq!(value["system_prompt_state"], "unknown");
+    assert_eq!(value["tool_catalog_state"], "absent");
+    assert_eq!(value["tools"][0]["defer_loading"], false);
+    assert!(value["tools"][0].get("type").is_none());
+    assert!(value["tools"][0].get("input_examples").is_none());
+    assert_eq!(
+        serde_json::to_value(DebugSourceKind::ProjectContextWarning).unwrap(),
+        "project_context_warning"
+    );
+    assert_eq!(
+        serde_json::to_value(DebugActivationReason::PerRequest).unwrap(),
+        "per_request"
+    );
+}
+
+#[test]
+fn debug_tool_schema_keeps_unknown_distinct_from_known_empty() {
+    let unknown: DebugEvidence<DebugBoundedList> = DebugEvidence::Unknown {
+        reason: "no surface".into(),
+    };
+    let empty = DebugEvidence::Known {
+        value: DebugBoundedList {
+            count: 0,
+            rendered: vec![],
+            omitted: 0,
+        },
+    };
+    assert_eq!(
+        serde_json::to_value(unknown).unwrap(),
+        serde_json::json!({"status":"unknown", "reason":"no surface"}),
+    );
+    assert_eq!(
+        serde_json::to_value(empty).unwrap(),
+        serde_json::json!({"status":"known", "value":{"count":0,"rendered":[],"omitted":0}}),
+    );
+    assert_eq!(
+        serde_json::to_value(DebugProviderAvailability::Unknown).unwrap(),
+        serde_json::json!({"status":"unknown"}),
+    );
+    assert_eq!(
+        serde_json::to_value(DebugToolVisibility::InRequest).unwrap(),
+        "in_request"
+    );
+}
+
+#[test]
+fn debug_tool_snapshot_schema_preserves_unobserved_and_absent_states() {
+    let snapshot = DebugToolSnapshot {
+        schema_version: 1,
+        capture_source: "prepared model-client request".into(),
+        delivery_status: "unknown (capture does not prove provider delivery)".into(),
+        turn_id: DebugBoundedString {
+            value: "turn".into(),
+            truncated: false,
+        },
+        step: 0,
+        terminal: None,
+        tools_field_present: false,
+        tool_count: 0,
+        rendered_tool_count: 0,
+        omitted_tool_count: 0,
+        payload_json_bytes: None,
+        payload_measurement_status: "unavailable".into(),
+        active_tool_catalog_sha256: None,
+        unavailable_for_this_request: vec!["provider_wire_payload".into()],
+        provider: DebugProviderAvailability::Unknown,
+        registry_facts_present: false,
+        registry_tool_count: DebugEvidence::Unknown {
+            reason: "not captured".into(),
+        },
+        registry_only_tools: DebugEvidence::Unknown {
+            reason: "not captured".into(),
+        },
+        tools: vec![],
+    };
+    let value = serde_json::to_value(&snapshot).expect("bounded snapshot");
+    assert!(
+        value.get("terminal").is_none(),
+        "absent terminal is omitted"
+    );
+    assert!(
+        value["payload_json_bytes"].is_null(),
+        "unmeasured is not zero"
+    );
+    assert!(value["active_tool_catalog_sha256"].is_null());
+    assert_eq!(value["registry_tool_count"]["status"], "unknown");
+    assert_eq!(value["provider"]["status"], "unknown");
+    assert_eq!(
+        value["unavailable_for_this_request"],
+        serde_json::json!(["provider_wire_payload"])
+    );
+    assert_eq!(snapshot.tools, vec![]);
+}
+
+#[test]
+fn debug_cache_observation_keeps_current_and_previous_distinct() {
+    let previous = DebugPromptInspection {
+        base_static_prefix_hash: "before".into(),
+        full_request_prefix_hash: "before".into(),
+        tool_catalog_hash: "".into(),
+        layers: vec![],
+    };
+    let mut current = previous.clone();
+    current.base_static_prefix_hash = "after".into();
+    let observation = DebugCacheInspectionObservation {
+        current: current.clone(),
+        previous: Some(previous),
+        current_warmup_key: DebugWarmupKey {
+            provider: "provider".into(),
+            model: "model".into(),
+            base_url: "endpoint".into(),
+            static_prefix_hash: "after".into(),
+            tool_catalog_hash: "".into(),
+            project_pack_hash: "".into(),
+            skills_hash: "".into(),
+        },
+        last_warmup_key: None,
+        current_warmup_hash_short: "digest".into(),
+        last_warmup_hash_short: None,
+    };
+    assert_eq!(
+        observation
+            .previous
+            .as_ref()
+            .unwrap()
+            .base_static_prefix_hash,
+        "before"
+    );
+    assert_eq!(observation.current.base_static_prefix_hash, "after");
+    assert_ne!(observation.previous.as_ref(), Some(&observation.current));
+    // Contract data alone cannot prove a host write; Phase 3 adapter tests
+    // must assert that the synchronous post-render commit stores `current`.
+}
+
+#[test]
+fn debug_diagnostics_facet_is_object_safe_and_independently_transportable() {
+    fn object_safe(_: &dyn CommandDebugDiagnosticsContext) {}
+    object_safe(&DebugDiagnostics);
+
+    let mut diagnostics = DebugDiagnostics;
+    let parts = CommandContexts::empty()
+        .with_debug_diagnostics(&mut diagnostics)
+        .into_parts();
+    assert_eq!(
+        parts
+            .debug_diagnostics
+            .expect("declared diagnostics facet")
+            .balance_projection(),
+        DebugBalanceProjection {
+            provider_display_name: "Example".into(),
+            supports_balance_api: false,
+        }
+    );
+    assert_eq!(
+        DebugDiagnostics.system_projection(),
+        DebugSystemProjection {
+            mode_label: "plan".into(),
+            prompt: DebugSystemPrompt::Blocks(vec!["first".into(), "second".into()]),
+        }
+    );
+    assert_ne!(
+        DebugSystemPrompt::None,
+        DebugSystemPrompt::Text(String::new())
+    );
+    assert_ne!(DebugSystemPrompt::Blocks(vec![]), DebugSystemPrompt::None);
+    let usage = DebugDiagnostics.token_projection();
+    assert_eq!(
+        DebugDiagnostics.cache_telemetry().prefix_stability_pct,
+        None
+    );
+    assert_eq!(
+        DebugDiagnostics.prompt_context().tool_catalog_state,
+        "absent"
+    );
+    assert!(DebugDiagnostics.tool_snapshot().is_none());
+    assert_eq!(usage.last_input, None);
+    assert_eq!(usage.last_output, Some(0));
+    assert_eq!(usage.cache_miss, Some(0));
+    assert_eq!(usage.cost, DebugDiagnostics.cost_projection());
+    for absent in [
+        parts.session.is_none(),
+        parts.model.is_none(),
+        parts.cost.is_none(),
+        parts.mode_policy.is_none(),
+        parts.system_prompt.is_none(),
+        parts.skills.is_none(),
+        parts.workspace.is_none(),
+        parts.presentation.is_none(),
+        parts.media.is_none(),
+        parts.memory.is_none(),
+        parts.project.is_none(),
+        parts.skill_group.is_none(),
+        parts.plugin.is_none(),
+        parts.lifecycle.is_none(),
+        parts.control.is_none(),
+        parts.export.is_none(),
+    ] {
+        assert!(absent, "diagnostics must not expose another facet");
+    }
+    assert!(
+        CommandContexts::empty()
+            .into_parts()
+            .debug_diagnostics
+            .is_none()
+    );
+}
+
+#[test]
+#[should_panic(expected = "debug diagnostics facet already set")]
+fn debug_diagnostics_envelope_rejects_duplicate_authority() {
+    let mut first = DebugDiagnostics;
+    let mut second = DebugDiagnostics;
+    let _ = CommandContexts::empty()
+        .with_debug_diagnostics(&mut first)
+        .with_debug_diagnostics(&mut second);
 }
 
 fn pure(value: Option<&str>) -> String {
@@ -2561,24 +2952,21 @@ fn export_capability_is_stable_distinct_and_non_conflicting() {
     );
     assert!(!CommandCapabilities::SESSION_CONTROL.contains(export));
     assert!(!export.contains(CommandCapabilities::SESSION_CONTROL));
-    // Storage remains `u16`-backed: bit 15 (1 << 15 = 32768) fits without the
-    // speculative widening FEAT-023's maintainer review ruled out.
+    // FEAT-029 widened storage after bit 15 filled the original space; export
+    // retains its exact published identity.
     assert_eq!(
         std::mem::size_of::<CommandCapabilities>(),
-        std::mem::size_of::<u16>(),
-        "CommandCapabilities storage must stay u16"
+        std::mem::size_of::<u32>(),
+        "CommandCapabilities storage must be widened for diagnostics"
     );
 }
 
-/// Canary: after FEAT-025 the `u16` capability space is *exactly* full.
+/// Canary: FEAT-029 widened the previously full 16-bit capability space.
 ///
-/// This is deliberate capacity documentation, not a health check. When FEAT-026
-/// (session structcopy) adds its own facet it must widen the backing storage to
-/// `u32`, and this test is expected to be updated in that commit. Until then it
-/// guarantees that no capability bit is silently reused, and that anyone who
-/// adds a seventeenth capability is told why `1 << 16` on a `u16` will not do.
+/// The first sixteen identities stay published as before; diagnostics takes
+/// bit 16 and later slices can allocate independently without renumbering.
 #[test]
-fn export_capability_space_is_exactly_full() {
+fn debug_diagnostics_capability_preserves_published_bits() {
     let all = [
         CommandCapabilities::SESSION,
         CommandCapabilities::MODEL,
@@ -2596,13 +2984,14 @@ fn export_capability_space_is_exactly_full() {
         CommandCapabilities::SESSION_LIFECYCLE,
         CommandCapabilities::SESSION_CONTROL,
         CommandCapabilities::SESSION_EXPORT,
+        CommandCapabilities::DEBUG_DIAGNOSTICS,
     ];
 
     let mut union = CommandCapabilities::NONE;
     for (index, capability) in all.iter().enumerate() {
         assert_eq!(
             capability.bits_for_test(),
-            1u16 << index,
+            1u32 << index,
             "capability {index} must occupy exactly bit {index}"
         );
         union = union.union(*capability);
@@ -2610,14 +2999,20 @@ fn export_capability_space_is_exactly_full() {
 
     assert_eq!(
         all.len(),
-        u16::BITS as usize,
-        "the declared capability count must consume the whole u16 space"
+        u16::BITS as usize + 1,
+        "diagnostics is the first bit after the original u16 space"
     );
     assert_eq!(
         union.bits_for_test(),
-        u16::MAX,
-        "bits 0-15 are fully allocated; FEAT-026 must widen the storage to u32"
+        u32::from(u16::MAX) | (1u32 << 16),
+        "bits 0-15 retain their published values and diagnostics occupies bit 16"
     );
+    assert!(union.contains(CommandCapabilities::DEBUG_DIAGNOSTICS));
+    assert!(!CommandCapabilities::SESSION_EXPORT.contains(CommandCapabilities::DEBUG_DIAGNOSTICS));
+    assert!(!CommandCapabilities::DEBUG_DIAGNOSTICS.contains(CommandCapabilities::SESSION_EXPORT));
+    assert!(CommandCapabilities::NONE.is_empty());
+    assert!(!CommandCapabilities::NONE.contains(CommandCapabilities::DEBUG_DIAGNOSTICS));
+    assert!(!CommandCapabilities::DEBUG_DIAGNOSTICS.contains(CommandCapabilities::NONE));
 }
 
 /// Deterministic fake export facet: every delegate returns canned portable
@@ -3046,4 +3441,254 @@ fn envelope_export_slot_is_independent_and_rejects_duplicates() {
     let inserted = CommandContexts::empty().with_export(&mut projection);
     let export = inserted.into_parts().export.expect("inserted export");
     assert!(export.clipboard_requires_terminal_paste());
+}
+
+#[test]
+fn whole_debug_capabilities_extend_published_bits_without_aliasing_authority() {
+    let old = (1u32 << 17) - 1;
+    let capabilities = [
+        CommandCapabilities::DEBUG_RECEIPTS,
+        CommandCapabilities::DEBUG_CHANGE,
+        CommandCapabilities::DEBUG_HISTORY,
+        CommandCapabilities::DEBUG_DIFF,
+        CommandCapabilities::DEBUG_UNDO,
+    ];
+    let mut seen = old;
+    for (index, capability) in capabilities.into_iter().enumerate() {
+        assert_eq!(capability.bits_for_test(), 1 << (17 + index));
+        assert_eq!(seen & capability.bits_for_test(), 0);
+        assert!(!capability.contains(CommandCapabilities::DEBUG_DIAGNOSTICS));
+        seen |= capability.bits_for_test();
+    }
+    assert_eq!(seen, (1u32 << 22) - 1);
+}
+
+struct StructcopyFixture {
+    delivery: Result<StructcopyTransport, String>,
+    writes: RefCell<Vec<String>>,
+}
+impl CommandSessionStructcopyContext for StructcopyFixture {
+    fn transcript_item(&self, index: usize) -> Result<StructcopyTranscript, StructcopyError> {
+        Ok(StructcopyTranscript {
+            index,
+            role: "system".into(),
+            content: StructcopyContent::InternalContext,
+        })
+    }
+    fn tool_pair(&self, _: &str) -> Result<StructcopyToolPair, StructcopyError> {
+        Ok(StructcopyToolPair {
+            name: "tool".into(),
+            input: serde_json::json!({}),
+            result: None,
+        })
+    }
+    fn plan_snapshot(&self) -> Result<StructcopyPlan, StructcopyError> {
+        Err(StructcopyError::Busy)
+    }
+    fn workflow_projection(&self, _: &str) -> Result<StructcopyWorkflow, StructcopyError> {
+        Err(StructcopyError::Unavailable)
+    }
+    fn path_roots(&self) -> StructcopyPathRoots {
+        StructcopyPathRoots::default()
+    }
+    fn write_clipboard(&self, text: &str) -> Result<StructcopyTransport, String> {
+        self.writes.borrow_mut().push(text.into());
+        self.delivery.clone()
+    }
+}
+
+#[test]
+fn structcopy_capability_preserves_all_published_identities() {
+    let capabilities = [
+        CommandCapabilities::SESSION,
+        CommandCapabilities::MODEL,
+        CommandCapabilities::COST,
+        CommandCapabilities::MODE_POLICY,
+        CommandCapabilities::SYSTEM_PROMPT,
+        CommandCapabilities::SKILLS,
+        CommandCapabilities::WORKSPACE,
+        CommandCapabilities::PRESENTATION,
+        CommandCapabilities::MEDIA,
+        CommandCapabilities::MEMORY,
+        CommandCapabilities::PROJECT,
+        CommandCapabilities::SKILL_GROUP,
+        CommandCapabilities::PLUGIN,
+        CommandCapabilities::SESSION_LIFECYCLE,
+        CommandCapabilities::SESSION_CONTROL,
+        CommandCapabilities::SESSION_EXPORT,
+        CommandCapabilities::DEBUG_DIAGNOSTICS,
+        CommandCapabilities::DEBUG_RECEIPTS,
+        CommandCapabilities::DEBUG_CHANGE,
+        CommandCapabilities::DEBUG_HISTORY,
+        CommandCapabilities::DEBUG_DIFF,
+        CommandCapabilities::DEBUG_UNDO,
+        CommandCapabilities::SESSION_STRUCTCOPY,
+    ];
+    let exact = CommandCapabilities::SESSION_STRUCTCOPY | CommandCapabilities::PRESENTATION;
+    for (index, capability) in capabilities.into_iter().enumerate() {
+        assert_eq!(capability.bits_for_test(), 1u32 << index);
+        assert_eq!(exact.contains(capability), index == 7 || index == 22);
+    }
+    assert!(!exact.contains(CommandCapabilities::NONE));
+}
+
+#[test]
+fn structcopy_slot_is_optional_and_does_not_grant_other_authority() {
+    assert!(CommandContexts::empty().into_parts().structcopy.is_none());
+    let mut fixture = StructcopyFixture {
+        delivery: Ok(StructcopyTransport::Native),
+        writes: RefCell::default(),
+    };
+    let mut presentation = Presentation;
+    let ContextParts {
+        session,
+        model,
+        cost,
+        mode_policy,
+        system_prompt,
+        skills,
+        workspace,
+        presentation,
+        media,
+        memory,
+        project,
+        skill_group,
+        plugin,
+        lifecycle,
+        control,
+        export,
+        structcopy,
+        debug_receipts,
+        debug_change,
+        debug_history,
+        debug_diff,
+        debug_undo,
+        debug_diagnostics,
+    } = CommandContexts::empty()
+        .with_structcopy(&mut fixture)
+        .with_presentation(&mut presentation)
+        .into_parts();
+    assert!(presentation.is_some());
+    let copy = structcopy.expect("selected structcopy facet");
+    assert_eq!(
+        copy.transcript_item(3).unwrap(),
+        StructcopyTranscript {
+            index: 3,
+            role: "system".into(),
+            content: StructcopyContent::InternalContext
+        }
+    );
+    assert_eq!(copy.tool_pair("id").unwrap().result, None);
+    assert_eq!(copy.plan_snapshot(), Err(StructcopyError::Busy));
+    assert_eq!(
+        copy.workflow_projection("id"),
+        Err(StructcopyError::Unavailable)
+    );
+    for present in [
+        session.is_some(),
+        model.is_some(),
+        cost.is_some(),
+        mode_policy.is_some(),
+        system_prompt.is_some(),
+        skills.is_some(),
+        workspace.is_some(),
+        media.is_some(),
+        memory.is_some(),
+        project.is_some(),
+        skill_group.is_some(),
+        plugin.is_some(),
+        lifecycle.is_some(),
+        control.is_some(),
+        export.is_some(),
+        debug_receipts.is_some(),
+        debug_change.is_some(),
+        debug_history.is_some(),
+        debug_diff.is_some(),
+        debug_undo.is_some(),
+        debug_diagnostics.is_some(),
+    ] {
+        assert!(!present);
+    }
+    assert!(
+        fixture.writes.borrow().is_empty(),
+        "observations do not write clipboard"
+    );
+}
+
+#[test]
+#[should_panic(expected = "structcopy facet already set")]
+fn structcopy_duplicate_slot_fails_loudly() {
+    let mut a = StructcopyFixture {
+        delivery: Ok(StructcopyTransport::Native),
+        writes: RefCell::default(),
+    };
+    let mut b = StructcopyFixture {
+        delivery: Ok(StructcopyTransport::Native),
+        writes: RefCell::default(),
+    };
+    let _ = CommandContexts::empty()
+        .with_structcopy(&mut a)
+        .with_structcopy(&mut b);
+}
+
+#[test]
+fn structcopy_transport_and_unknown_observations_remain_distinct() {
+    for delivery in [
+        Ok(StructcopyTransport::Native),
+        Ok(StructcopyTransport::TerminalQueued),
+        Err("original host error".into()),
+    ] {
+        let fixture = StructcopyFixture {
+            delivery: delivery.clone(),
+            writes: RefCell::default(),
+        };
+        assert_eq!(fixture.write_clipboard("exact bytes"), delivery);
+        assert_eq!(*fixture.writes.borrow(), ["exact bytes"]);
+    }
+    let unknown = StructcopyToolResult {
+        content: "recorded".into(),
+        is_error: None,
+        content_blocks: None,
+    };
+    assert_ne!(
+        unknown,
+        StructcopyToolResult {
+            is_error: Some(false),
+            ..unknown.clone()
+        }
+    );
+    assert_ne!(
+        StructcopyError::Preparation("detail".into()),
+        StructcopyError::Unavailable
+    );
+    let result = crate::outcome::StructcopyCommandResult::error("detail");
+    assert_eq!(result.message.as_deref(), Some("Error: detail"));
+    assert!(result.action.is_none());
+}
+
+#[test]
+fn structcopy_known_projection_fields_preserve_nulls_and_omission_rules() {
+    let plan: StructcopyPlan = serde_json::from_value(
+        serde_json::json!({"title":"plan","items":[{"step":"one","status":"in_progress"}]}),
+    )
+    .unwrap();
+    assert_eq!(
+        serde_json::to_value(plan).unwrap(),
+        serde_json::json!({"title":"plan","items":[{"step":"one","status":"in_progress"}]})
+    );
+    let workflow = serde_json::json!({
+        "run_id":"run","status":"degraded","lifecycle_seq":1,"started_at_ms":2,"completed_at_ms":null,
+        "source_file":"flow.js","workflow_id":null,"workflow_goal":null,"token_budget":null,
+        "child_count":0,"schema_error_count":0,"schema_repair_count":0,"dispatch_failure_count":0,
+        "progress_count":0,"last_progress":null,"event_count":0,"last_event_type":null,
+        "leaf_count":null,"branch_count":null,"control_count":null,"execution_status":null,
+        "gate_count":1,"blocked_gate_count":0,"gate_status":[{"gate_id":"gate","state":"pending"}],
+        "error":null,"usage":{"tasks_reported":0,"input_tokens":0},"events_dropped":4
+    });
+    let parsed: StructcopyWorkflow = serde_json::from_value(workflow.clone()).unwrap();
+    assert_eq!(parsed.status, StructcopyWorkflowStatus::Degraded);
+    assert_eq!(parsed.leaf_count, None);
+    assert_eq!(parsed.usage.as_ref().unwrap().input_tokens, Some(0));
+    assert_eq!(parsed.usage.as_ref().unwrap().output_tokens, None);
+    assert_eq!(serde_json::to_value(parsed).unwrap(), workflow);
 }

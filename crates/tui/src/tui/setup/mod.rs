@@ -50,6 +50,7 @@ mod tools_mcp;
 pub(crate) use fleet_draft::{draft_fleet_profile_with_model, workspace_fingerprint};
 pub(crate) use model_draft::draft_constitution_with_model;
 use persistence::SetupPersistenceFacts;
+pub(crate) use provider::record_configured_route;
 use remote::SetupRemoteFacts;
 
 /// Target lane for the once-per-version constitution checkpoint. Bumped per
@@ -190,6 +191,10 @@ pub struct SetupWizardView {
     /// Display label of the model that authored `model_draft` (safe metadata,
     /// e.g. "GLM-5.2"), for provenance copy only.
     model_draft_label: Option<String>,
+    /// The answers (and free-form note) the in-flight model draft was asked
+    /// to write. A draft lands only while they are still the wizard's
+    /// answers; one requested for answers since changed is stale (U08-06).
+    model_draft_request: Option<(GuidedConstitutionDraft, Option<String>)>,
     runtime_preset: SetupRuntimePreset,
     runtime_preset_preview_seen: bool,
     body_scroll: usize,
@@ -202,6 +207,7 @@ struct SetupRuntimeFacts {
     auth: String,
     health: String,
     provider_ready: bool,
+    provider_status: StepStatus,
     provider_result: String,
     work_intent: String,
     approval: String,
@@ -262,6 +268,7 @@ impl Default for SetupRuntimeFacts {
             auth: "not checked".to_string(),
             health: "not checked".to_string(),
             provider_ready: false,
+            provider_status: StepStatus::NeedsAction,
             provider_result: "provider/model not loaded".to_string(),
             work_intent: "not loaded".to_string(),
             approval: "not loaded".to_string(),
@@ -326,11 +333,11 @@ impl SetupRuntimeFacts {
         // setup receipt must not certify it as healthy. Saved-unchecked and
         // local-unchecked are honest reviewed configuration states; an actual
         // session failure is NeedsAction until a later success replaces it.
-        let provider_ready = readiness.can_attempt()
-            && !matches!(
-                &readiness,
-                crate::provider_readiness::ResolvedProviderReadiness::SavedLastCheckFailed { .. }
-            );
+        let provider_status = provider::step_status(&readiness);
+        let provider_ready = matches!(
+            provider_status,
+            StepStatus::Configured | StepStatus::Verified
+        );
         let model = app.model_display_label();
         let provider_name = if app.api_provider == crate::config::ApiProvider::Custom {
             app.provider_identity_for_persistence().to_string()
@@ -486,6 +493,7 @@ impl SetupRuntimeFacts {
             auth,
             health,
             provider_ready,
+            provider_status,
             provider_result,
             work_intent: app.mode.display_name().to_string(),
             approval: app
@@ -2312,6 +2320,7 @@ impl SetupWizardView {
             existing_preview_seen: false,
             model_draft: None,
             model_draft_label: None,
+            model_draft_request: None,
             runtime_preset: SetupRuntimePreset::default(),
             runtime_preset_preview_seen: false,
             body_scroll: 0,
@@ -2339,6 +2348,7 @@ impl SetupWizardView {
             existing_preview_seen: false,
             model_draft: None,
             model_draft_label: None,
+            model_draft_request: None,
             runtime_preset: SetupRuntimePreset::default(),
             runtime_preset_preview_seen: false,
             body_scroll: 0,
@@ -2466,19 +2476,19 @@ impl SetupWizardView {
     }
 
     fn commit_provider_model_review(&mut self) -> ViewAction {
-        let status = provider::step_status(self.facts.provider_ready);
+        let status = self.facts.provider_status;
         let mut state = self.state.clone();
         state.set_step(
             SetupStep::ProviderModel,
             provider::step_entry(
-                self.facts.provider_ready,
+                status,
                 CONSTITUTION_CHECKPOINT_VERSION,
                 self.facts.provider_result.clone(),
             ),
         );
         self.state = state.clone();
         self.move_next();
-        let message_id = if status == StepStatus::Verified {
+        let message_id = if self.facts.provider_ready {
             MessageId::SetupProviderModelReviewed
         } else {
             MessageId::SetupProviderModelNeedsActionSaved
@@ -2840,10 +2850,11 @@ impl SetupWizardView {
     /// `A` on the constitution step: ask the first configured model to draft.
     /// Requires a ready provider route; otherwise the key is inert and the
     /// deterministic guided flow stands untouched.
-    fn request_model_draft(&self) -> ViewAction {
+    fn request_model_draft(&mut self) -> ViewAction {
         if !self.facts.provider_ready {
             return ViewAction::None;
         }
+        self.model_draft_request = Some(self.current_model_draft_request());
         ViewAction::Emit(ViewEvent::SetupConstitutionModelDraftRequested {
             draft: self.guided_draft,
             freeform_note: self.freeform_note_for_draft().map(str::to_string),
@@ -2856,6 +2867,13 @@ impl SetupWizardView {
             self.editing_freeform_note = !self.editing_freeform_note;
         }
         ViewAction::None
+    }
+
+    fn current_model_draft_request(&self) -> (GuidedConstitutionDraft, Option<String>) {
+        (
+            self.guided_draft,
+            self.freeform_note_for_draft().map(str::to_string),
+        )
     }
 
     fn freeform_note_for_draft(&self) -> Option<&str> {
@@ -2902,12 +2920,20 @@ impl SetupWizardView {
     /// ratification preview the host must open in the same breath — that is
     /// what satisfies the preview gate. Ratifying still takes the explicit
     /// `G` keypress afterwards.
+    ///
+    /// Returns `None`, installing nothing, when the answers or note changed
+    /// after the draft was requested: that draft is law for answers the
+    /// person no longer holds (U08-06).
     #[must_use]
     pub(crate) fn install_model_draft(
         &mut self,
         constitution: Box<UserConstitution>,
         model_label: String,
-    ) -> (String, String) {
+    ) -> Option<(String, String)> {
+        if self.model_draft_request.as_ref() != Some(&self.current_model_draft_request()) {
+            return None;
+        }
+        self.model_draft_request = None;
         let content = constitution_ratification_text(
             self.locale,
             &constitution,
@@ -2916,7 +2942,7 @@ impl SetupWizardView {
         self.model_draft = Some(constitution);
         self.model_draft_label = Some(model_label);
         self.guided_preview_seen = true;
-        (ratification_preview_title(self.locale).to_string(), content)
+        Some((ratification_preview_title(self.locale).to_string(), content))
     }
 
     fn commit_constitution(&self, kind: SetupCommitKind) -> ViewAction {
@@ -3014,6 +3040,7 @@ impl SetupWizardView {
                 StepStatus::Optional => MessageId::SetupStatusOptional,
                 StepStatus::Deferred => MessageId::SetupStatusDeferred,
                 StepStatus::InProgress => MessageId::SetupStatusInProgress,
+                StepStatus::Configured => MessageId::PickerActionConfigured,
                 StepStatus::NeedsAction => MessageId::SetupStatusNeedsAction,
                 StepStatus::Verified => MessageId::SetupStatusVerified,
                 StepStatus::Skipped => MessageId::SetupStatusSkipped,
@@ -4083,7 +4110,7 @@ impl SetupWizardView {
         }
         if !matches!(
             self.state.status(SetupStep::ProviderModel),
-            StepStatus::Verified | StepStatus::NeedsAction
+            StepStatus::Configured | StepStatus::Verified | StepStatus::NeedsAction
         ) {
             return MessageId::SetupReportNextActionProvider;
         }
@@ -5362,7 +5389,7 @@ pub(crate) fn record_provider_model_setup_state_for_app(
     state.set_step(
         SetupStep::ProviderModel,
         provider::step_entry(
-            facts.provider_ready,
+            facts.provider_status,
             CONSTITUTION_CHECKPOINT_VERSION,
             facts.provider_result,
         ),
@@ -5452,6 +5479,11 @@ mod progressive_tests {
             model: "stub-model".to_string(),
             auth: if provider_ready { "ready" } else { "missing" }.to_string(),
             provider_ready,
+            provider_status: if provider_ready {
+                StepStatus::Configured
+            } else {
+                StepStatus::NeedsAction
+            },
             runtime_result: "approval=ask; sandbox=workspace; network=prompt".to_string(),
             tools_mcp_result: "mcp=off, skills=off, tools=off, plugins=off, overall=off"
                 .to_string(),

@@ -140,7 +140,7 @@ to `npm install -g codewhale`.
 
 ### Homebrew
 
-**Current published state (v0.9.13, published 2026-09-14; workspace source version 0.9.13):** The
+**Historical migration state as of v0.9.13 (published 2026-09-14):** The
 formula is `codewhale`. New installs:
 
 ```bash

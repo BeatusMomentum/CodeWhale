@@ -19,9 +19,8 @@ Enforces the EPIC-006 boundary contract:
 
 1. `codewhale-command-contract` and `codewhale-secrets` may not transitively
    depend on `codewhale-tui` (normal edges, via `cargo metadata`).
-   `codewhale-secrets` owns the shared output sanitizer that portable command
-   helpers consume (FEAT-025 D4), so it must stay TUI-free before
-   `codewhale-commands` depends on it.
+   Pure portable sanitization lives in `codewhale-sanitize`; contract, protocol
+   and sanitizer also reject runtime and storage dependencies through tree rules.
 2. `codewhale-command-contract` source may not import the concrete `App`,
    widget/renderer/view/event-loop surfaces, or `ratatui`/`crossterm`.
 3. No composite `CommandContext` symbol (supertrait/struct/enum) may exist in
@@ -402,15 +401,20 @@ BOUNDARY_RULES = (
         CONTRACT_DIR,
         check_contract_source_text,
     ),
-    # `codewhale-secrets` owns the shared pure sanitizer the contract's
-    # handlers consume (FEAT-025 D4); a TUI edge would drag the TUI into
-    # `codewhale-commands` (FEAT-016/043).
+    # Storage remains UI-free; portable callers use codewhale-sanitize directly.
     BoundaryRule(
         "codewhale-secrets",
         "metadata",
         (FORBIDDEN_TUI_PACKAGE,),
-        "the shared sanitizer must stay UI-free",
+        "secret storage must stay UI-free",
     ),
+    *(BoundaryRule(
+        package, "tree",
+        ("codewhale-tui", "codewhale-core", "codewhale-runtime", "codewhale-config",
+         "codewhale-state", "codewhale-mcp", "codewhale-hooks", "codewhale-secrets",
+         "reqwest", "tokio", "rusqlite", "keyring", "dbus", "zbus", "ratatui", "crossterm"),
+        "portable shapes and sanitization must not import host services",
+    ) for package in ("codewhale-command-contract", "codewhale-protocol", "codewhale-sanitize")),
     # The headless runtime split out of the TUI (docs/design/TUI_DECONSTRUCTION.md):
     # never a terminal UI crate or library, checked with per-package feature
     # resolution because the TUI turns on palette's `ratatui` feature.

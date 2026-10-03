@@ -11,7 +11,7 @@ import {
 } from "./cloud-facts";
 import { TRUSTED_KEYS, type TrustedKey } from "./cloud-facts/keys";
 import { GET, HEAD } from "../app/api/facts/v1/[channel]/route";
-import { activePublishingKey, emitSql, readBoundedFile, readBoundedResponse, verifyEnvelope as verifyForPublisher } from "../scripts/facts-publish.mjs";
+import { activePublishingKey, emitSql, publishRelease, readBoundedFile, readBoundedResponse, revokeRelease, verifyEnvelope as verifyForPublisher } from "../scripts/facts-publish.mjs";
 import { parseRustKeys, parseTsKeys } from "../scripts/check-cloud-facts.mjs";
 
 const fixturePath = new URL("../../docs/cloud-facts/fixtures/envelope-stable-v7.json", import.meta.url);
@@ -225,6 +225,21 @@ describe("cloud facts transport", () => {
     expect((await resolveCloudFacts("stable", { ...env, CURATED_KV: kv }, { keys: [EPHEMERAL_KEY], now: () => NOW, fetchImpl: failing })).kind).toBe("unavailable");
   });
 
+  it("never resurrects a revoked head through the stale cache after an outage", async () => {
+    const kv = new MemKV();
+    const ttls: unknown[] = [];
+    const put = kv.put.bind(kv);
+    kv.put = async (key: string, value: string, options?: { expirationTtl?: number }) => { ttls.push(options?.expirationTtl); await put(key, value); };
+    expect((await resolveCloudFacts("stable", { ...env, CURATED_KV: kv }, { ...opts, fetchImpl: supabaseFetch([rowFrom(fixture)]) })).kind).toBe("ok");
+    // The operator revokes the head: facts_current returns no row.
+    expect((await resolveCloudFacts("stable", { ...env, CURATED_KV: kv }, { ...opts, fetchImpl: supabaseFetch([]) })).kind).toBe("none");
+    // Supabase then goes down. The revoked envelope must not come back.
+    expect(await resolveCloudFacts("stable", { ...env, CURATED_KV: kv }, { ...opts, fetchImpl: failing })).toMatchObject({ kind: "unavailable" });
+    // The bridge lasts no longer than a client's own 6 h staleness bound.
+    expect(ttls.length).toBeGreaterThan(0);
+    expect(ttls.every((ttl) => ttl === 6 * 60 * 60)).toBe(true);
+  });
+
   it("caps and cancels PostgREST streaming bodies before JSON parsing", async () => {
     const oversized = overflowingStream();
     const fetchImpl = vi.fn(async () => new Response(oversized.stream));
@@ -300,6 +315,47 @@ describe("facts response protocol", () => {
 
 describe("facts publisher boundaries", () => {
   const script = fileURLToPath(new URL("../scripts/facts-publish.mjs", import.meta.url));
+
+  /** A PostgREST double over one channel and its releases. */
+  function fakePostgrest(head: number, releases: { facts_version: number; status: string; payload_sha256: string; revoked_at?: string; revoke_reason?: string }[]) {
+    const calls: string[] = [];
+    const request = async (path: string, init: { method?: string; body?: Record<string, unknown> } = {}) => {
+      calls.push(`${init.method ?? "GET"} ${path}`);
+      if (path.startsWith("facts_channel")) return [{ id: "c1", max_facts_version: head }];
+      if (path === "facts_key") return null;
+      if (path === "facts_release") {
+        if (Number(init.body?.facts_version) <= head) throw Object.assign(new Error("PostgREST request failed (HTTP 409)"), { status: 409 });
+        head = Number(init.body?.facts_version);
+        const stored = { id: "r-new", facts_version: head, status: "published", payload_sha256: fixture.sha256 };
+        releases.push(stored);
+        return [stored];
+      }
+      const version = Number(/facts_version=eq\.(\d+)/.exec(path)?.[1]);
+      const matches = releases.filter((r) => r.facts_version === version && (!path.includes("status=eq.published") || r.status === "published"));
+      if (init.method === "PATCH") for (const r of matches) Object.assign(r, init.body);
+      return matches.map((r) => ({ id: `r-${r.facts_version}`, ...r }));
+    };
+    return { request, calls, releases };
+  }
+
+  it("revokes once, keeps the first revocation on a re-run, and refuses an unknown version", async () => {
+    const pg = fakePostgrest(3, [{ facts_version: 3, status: "published", payload_sha256: "a" }]);
+    expect(await revokeRelease(pg.request, { channel: "stable", version: 3, reason: "bad price", at: "2026-09-30T00:00:00Z" }))
+      .toMatchObject({ revoked: 1, already_revoked: false, head: true });
+    const again = await revokeRelease(pg.request, { channel: "stable", version: 3, reason: "second run", at: "2026-10-01T00:00:00Z" });
+    expect(again).toMatchObject({ revoked: 0, already_revoked: true, revoked_at: "2026-09-30T00:00:00Z", revoke_reason: "bad price" });
+    expect(pg.releases[0]).toMatchObject({ revoked_at: "2026-09-30T00:00:00Z", revoke_reason: "bad price" });
+    await expect(revokeRelease(pg.request, { channel: "stable", version: 9, reason: "typo", at: "2026-10-01T00:00:00Z" })).rejects.toThrow("no published facts_version 9");
+  });
+
+  it("publishes exactly the envelope and treats a replay of the same bytes as already published", async () => {
+    const pg = fakePostgrest(fixture.facts_version - 1, []);
+    const row = { facts_version: fixture.facts_version };
+    expect(await publishRelease(pg.request, fixture, row, "pub")).toMatchObject({ published: true, payload_sha256: fixture.sha256 });
+    expect(await publishRelease(pg.request, fixture, row, "pub")).toMatchObject({ published: false, already_published: true, release_id: "r-new" });
+    const other = { ...fixture, sha256: "f".repeat(64) };
+    await expect(publishRelease(pg.request, other, row, "pub")).rejects.toThrow("high-water mark");
+  });
 
   it("requires an active pinned primary key and cannot publish with an explicit fixture public key", () => {
     expect(() => activePublishingKey(fixture, [])).toThrow("not pinned and active");

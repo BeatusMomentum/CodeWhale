@@ -161,7 +161,7 @@ pub(crate) fn record_presented() {
     let Ok(path) = SetupState::path() else {
         return;
     };
-    let _ = SetupState::update_telemetry_at(&path, |state| {
+    let _ = SetupState::update_at(&path, |state| {
         state.record_telemetry_notice_shown(TELEMETRY_NOTICE_VERSION);
     });
 }
@@ -248,7 +248,7 @@ fn apply_persistent_preference_at(
                 ))),
             };
         }
-        if let Err(error) = SetupState::update_telemetry_at(&setup_state_path, |state| {
+        if let Err(error) = SetupState::update_at(&setup_state_path, |state| {
             state.record_telemetry_notice(TELEMETRY_NOTICE_VERSION, true);
         }) {
             return AppliedTelemetryPreference {
@@ -265,7 +265,7 @@ fn apply_persistent_preference_at(
             // The config Off floor is authoritative, but put the privacy
             // sidecar back in the same fail-closed state as well. Otherwise a
             // later manual edit could expose the partial enable as consent.
-            if let Err(rollback) = SetupState::update_telemetry_at(&setup_state_path, |state| {
+            if let Err(rollback) = SetupState::update_at(&setup_state_path, |state| {
                 state.record_telemetry_notice(TELEMETRY_NOTICE_VERSION, false);
             }) {
                 failures.push(format!("restoring the privacy opt-out: {rollback}"));
@@ -282,7 +282,7 @@ fn apply_persistent_preference_at(
     }
 
     let config_result = write_config_preference(config_path, false);
-    let state_result = SetupState::update_telemetry_at(&setup_state_path, |state| {
+    let state_result = SetupState::update_at(&setup_state_path, |state| {
         state.record_telemetry_notice(TELEMETRY_NOTICE_VERSION, false);
     });
     // Wipe even if both durable writes fail: a successful tombstone stops the

@@ -631,24 +631,6 @@ fn visible_tool_output(content: &str) -> Option<String> {
     }
 }
 
-/// Read the process exit code a tool reported, when it reported one.
-///
-/// Only process-backed tools (`exec_shell`, task runners) carry one, and only
-/// a real, integer-valued `exit_code` counts. Everything else stays `None` so
-/// an `exit_code` condition never matches on a fabricated value.
-/// Reported as `i64`, not `i32`: a Windows crash code such as `3221225477`
-/// (`0xC0000005`) is a real value the shell tool records in its metadata, and
-/// narrowing it dropped exactly those codes — the hook saw no exit code at all
-/// for the crashes it most wanted to catch.
-pub(crate) fn reported_tool_exit_code(result: &Result<ToolResult, ToolError>) -> Option<i64> {
-    let metadata = result.as_ref().ok()?.metadata.as_ref()?;
-    let code = metadata.get("exit_code")?;
-    if code.is_null() {
-        return None;
-    }
-    code.as_i64()
-}
-
 /// Fire `tool_call_after` for every settled tool call, plus `on_error` when
 /// the call failed.
 ///
@@ -677,33 +659,26 @@ fn fire_tool_completion_hooks(
         return;
     }
 
-    let (result_text, success): (String, bool) = match result.as_ref() {
-        Ok(tool_result) => (tool_result.content.clone(), tool_result.success),
-        Err(err) => (err.to_string(), false),
-    };
-    let exit_code = reported_tool_exit_code(result);
+    let context = app
+        .base_hook_context()
+        .with_tool_name(name)
+        .with_tool_call_id(id)
+        .with_tool_outcome(result);
+    let failed = context.tool_success == Some(false);
+    let error_context = (wants_error && failed).then(|| {
+        let text = context.tool_result.as_deref().unwrap_or_default();
+        let message = format!("tool `{name}` failed: {text}");
+        context.clone().with_error(&message)
+    });
 
-    if wants_after {
-        let context = app
-            .base_hook_context()
-            .with_tool_name(name)
-            .with_tool_call_id(id)
-            .with_tool_result(&result_text, success, exit_code);
-        if let Err(error) = app.submit_hooks(HookEvent::ToolCallAfter, context) {
-            app.surface_observer_hook_submission_failure(error);
-        }
+    if wants_after && let Err(error) = app.submit_hooks(HookEvent::ToolCallAfter, context) {
+        app.surface_observer_hook_submission_failure(error);
     }
 
-    if wants_error && !success {
-        let context = app
-            .base_hook_context()
-            .with_tool_name(name)
-            .with_tool_call_id(id)
-            .with_tool_result(&result_text, success, exit_code)
-            .with_error(&format!("tool `{name}` failed: {result_text}"));
-        if let Err(error) = app.submit_hooks(crate::hooks::HookEvent::OnError, context) {
-            app.surface_observer_hook_submission_failure(error);
-        }
+    if let Some(context) = error_context
+        && let Err(error) = app.submit_hooks(crate::hooks::HookEvent::OnError, context)
+    {
+        app.surface_observer_hook_submission_failure(error);
     }
 }
 
@@ -2263,7 +2238,8 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(rendered.contains("started"), "{rendered}");
+        // The settled record replaces `started`: one row for the run.
+        assert!(!rendered.contains("started"), "{rendered}");
         assert!(rendered.contains("finished"), "{rendered}");
         assert!(rendered.contains("3 findings"), "{rendered}");
     }
@@ -2301,12 +2277,13 @@ mod tests {
         );
 
         app.flush_active_cell();
-        assert_eq!(app.history.len(), 2, "start card, then finish line");
-        let HistoryCell::Tool(ToolCell::Generic(finish)) = &app.history[1] else {
+        // One row per run: the start card becomes the finish, in place.
+        assert_eq!(app.history.len(), 1, "the start card is the finish line");
+        let HistoryCell::Tool(ToolCell::Generic(finish)) = &app.history[0] else {
             panic!("finish line is a workflow card");
         };
         assert_eq!(finish.status, ToolStatus::Failed);
-        let rendered = app.history[1]
+        let rendered = app.history[0]
             .lines(100)
             .iter()
             .map(|line| {
@@ -2320,25 +2297,105 @@ mod tests {
         assert!(rendered.contains("failed"), "{rendered}");
         assert!(rendered.contains("quick"), "{rendered}");
         assert!(rendered.contains("script error, line 3"), "{rendered}");
-        let start = app.history[0]
-            .lines(100)
-            .iter()
-            .map(|line| {
-                line.spans
-                    .iter()
-                    .map(|s| s.content.as_ref())
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(
-            start.contains("started") && start.contains("quick"),
-            "{start}"
+        assert!(!rendered.contains("started"), "{rendered}");
+
+        // The live stream repeating the terminal event writes nothing more.
+        apply_workflow_ui_event(
+            &mut app,
+            "run-fast",
+            &json!({"type": "run_completed", "status": "failed", "error": "script error, line 3", "at_ms": 1_400}),
         );
-        assert_eq!(
-            start.lines().count(),
-            1,
-            "the start card is one line: {start}"
+        assert_eq!(app.history.len(), 1);
+    }
+
+    fn workflow_card(record: serde_json::Value) -> HistoryCell {
+        HistoryCell::Tool(ToolCell::Generic(GenericToolCell {
+            name: "workflow".to_string(),
+            status: ToolStatus::Success,
+            input_summary: None,
+            output: Some(record.to_string()),
+            prompts: None,
+            spillover_path: None,
+            output_summary: None,
+            is_diff: false,
+        }))
+    }
+
+    fn is_finish_card(cell: &HistoryCell) -> bool {
+        let HistoryCell::Tool(ToolCell::Generic(tool)) = cell else {
+            return false;
+        };
+        tool.output
+            .as_deref()
+            .and_then(|out| serde_json::from_str::<serde_json::Value>(out).ok())
+            .is_some_and(|value| value.get("transcript_line").is_some())
+    }
+
+    fn settle_run(app: &mut App, run_id: &str) {
+        for event in [
+            json!({"type": "run_started", "workflow_goal": "quick", "at_ms": 1_000}),
+            json!({"type": "run_completed", "status": "failed", "error": "script error", "at_ms": 1_355}),
+        ] {
+            apply_workflow_ui_event(app, run_id, &event);
+        }
+    }
+
+    #[test]
+    fn a_status_poll_that_returned_the_settled_record_is_the_only_finish() {
+        let mut app = crate::test_support::test_app_with_options(
+            crate::test_support::test_tui_options(std::path::PathBuf::from(".")),
+        );
+        let mut active = crate::tui::active_cell::ActiveCell::new();
+        active.push_untracked(workflow_card(
+            json!({"run_id": "run-x", "workflow_goal": "quick", "status": "running"}),
+        ));
+        active.push_untracked(workflow_card(
+            json!({"run_id": "run-x", "workflow_goal": "quick", "status": "failed"}),
+        ));
+        app.active_cell = Some(active);
+        settle_run(&mut app, "run-x");
+        app.flush_active_cell();
+
+        assert_eq!(app.history.len(), 2, "no extra finish appended");
+        assert!(
+            !app.history.iter().any(is_finish_card),
+            "the poll already shows the finish; the start card must not repeat it"
+        );
+    }
+
+    #[test]
+    fn the_finish_rewrites_the_start_card_not_a_later_status_poll() {
+        let mut app = crate::test_support::test_app_with_options(
+            crate::test_support::test_tui_options(std::path::PathBuf::from(".")),
+        );
+        let running = json!({"run_id": "run-x", "workflow_goal": "quick", "status": "running"});
+        app.add_message(workflow_card(running.clone()));
+        app.add_message(workflow_card(running));
+        settle_run(&mut app, "run-x");
+
+        assert_eq!(app.history.len(), 2);
+        assert!(is_finish_card(&app.history[0]), "the start card settles");
+        assert!(!is_finish_card(&app.history[1]), "the poll is left alone");
+    }
+
+    #[test]
+    fn a_run_that_settles_after_the_conversation_moved_on_finishes_at_the_tail() {
+        let mut app = crate::test_support::test_app_with_options(
+            crate::test_support::test_tui_options(std::path::PathBuf::from(".")),
+        );
+        app.add_message(workflow_card(
+            json!({"run_id": "run-x", "workflow_goal": "quick", "status": "running"}),
+        ));
+        app.add_message(HistoryCell::User {
+            content: "meanwhile, something else".to_string(),
+        });
+        settle_run(&mut app, "run-x");
+
+        assert_eq!(app.history.len(), 3, "the finish is appended");
+        assert!(!is_finish_card(&app.history[0]));
+        assert!(
+            is_finish_card(&app.history[2]),
+            "the finish sits at the tail"
         );
     }
 
@@ -2424,6 +2481,85 @@ mod tests {
         let errors = hook_log_lines_eventually(&error_log, 1);
         assert_eq!(after, vec![id, second]);
         assert_eq!(errors, vec![id]);
+    }
+
+    /// #6582: hooks see a `bash` command's real exit code and status, for a
+    /// failing command as well as a passing one. `bash` reports a nonzero
+    /// exit or a timeout as a `ToolError`, and the hook used to read the code
+    /// only from a successful result, so every failing command reached
+    /// `tool_call_after` and `on_error` with no exit code.
+    #[cfg(unix)]
+    #[test]
+    fn bash_completion_hooks_get_exit_code_and_status_for_failures() {
+        use crate::hooks::{Hook, HookEvent, HookExecutor, HooksConfig};
+        use crate::tools::spec::{ToolContext, ToolSpec};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let after_log = dir.path().join("after.log");
+        let error_log = dir.path().join("error.log");
+        let script = |path: &std::path::Path| {
+            format!(
+                "printf '%s %s %s %s\\n' \"$DEEPSEEK_TOOL_CALL_ID\" \"${{DEEPSEEK_TOOL_EXIT_CODE-unset}}\" \"${{DEEPSEEK_TOOL_STATUS-unset}}\" \"$DEEPSEEK_TOOL_SUCCESS\" >> {}",
+                path.display()
+            )
+        };
+        let mut app = crate::test_support::test_app_with_options(
+            crate::test_support::test_tui_options(dir.path()),
+        );
+        app.workspace = dir.path().to_path_buf();
+        app.hooks = HookExecutor::new(
+            HooksConfig {
+                enabled: true,
+                hooks: vec![
+                    Hook::new(HookEvent::ToolCallAfter, &script(&after_log)),
+                    Hook::new(HookEvent::OnError, &script(&error_log)),
+                ],
+                ..HooksConfig::default()
+            },
+            dir.path().to_path_buf(),
+        );
+
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let context = ToolContext::new(dir.path());
+        let cases = [
+            ("call-exit-0", json!({"command": "exit 0"})),
+            ("call-exit-1", json!({"command": "exit 1"})),
+            (
+                "call-exit-127",
+                json!({"command": "codewhale-no-such-command-6582"}),
+            ),
+            (
+                "call-timeout",
+                json!({"command": "sleep 5", "timeout": 0.2}),
+            ),
+        ];
+        for (id, input) in cases {
+            let result =
+                runtime.block_on(crate::tools::shell::LowercaseBashTool.execute(input, &context));
+            handle_tool_call_complete(&mut app, id, "bash", &result);
+        }
+
+        let mut after = hook_log_lines_eventually(&after_log, 4);
+        let mut errors = hook_log_lines_eventually(&error_log, 3);
+        after.sort();
+        errors.sort();
+        assert_eq!(
+            after,
+            vec![
+                "call-exit-0 0 completed true",
+                "call-exit-1 1 failed false",
+                "call-exit-127 127 failed false",
+                "call-timeout unset timed_out false",
+            ]
+        );
+        assert_eq!(
+            errors,
+            vec![
+                "call-exit-1 1 failed false",
+                "call-exit-127 127 failed false",
+                "call-timeout unset timed_out false",
+            ]
+        );
     }
 
     #[test]
@@ -2628,63 +2764,6 @@ mod tests {
             transcript.contains("(no output)"),
             "Transcript mode still records the placeholder: {transcript:?}"
         );
-    }
-
-    /// #455 — `exit_code` conditions must only ever see a real, reported exit
-    /// code. `tool_call_after` used to hard-code `None`, which made every
-    /// `{ type = "exit_code" }` condition permanently unmatchable.
-    #[test]
-    fn reported_tool_exit_code_reads_only_real_metadata_codes() {
-        let with_code = Ok(ToolResult {
-            content: "boom".to_string(),
-            success: false,
-            metadata: Some(serde_json::json!({ "exit_code": 127 })),
-        });
-        assert_eq!(super::reported_tool_exit_code(&with_code), Some(127));
-
-        // Zero is a real code, not a missing one.
-        let zero = Ok(ToolResult {
-            content: "ok".to_string(),
-            success: true,
-            metadata: Some(serde_json::json!({ "exit_code": 0 })),
-        });
-        assert_eq!(super::reported_tool_exit_code(&zero), Some(0));
-
-        // Tools that report no exit code stay `None` — never synthesized from
-        // the success flag.
-        let no_metadata = Ok(ToolResult::error("failed"));
-        assert_eq!(super::reported_tool_exit_code(&no_metadata), None);
-
-        let null_code = Ok(ToolResult {
-            content: String::new(),
-            success: true,
-            metadata: Some(serde_json::json!({ "exit_code": serde_json::Value::Null })),
-        });
-        assert_eq!(super::reported_tool_exit_code(&null_code), None);
-
-        let wrong_type = Ok(ToolResult {
-            content: String::new(),
-            success: false,
-            metadata: Some(serde_json::json!({ "exit_code": "127" })),
-        });
-        assert_eq!(super::reported_tool_exit_code(&wrong_type), None);
-
-        // A Windows crash code does not fit in an `i32`, but it is a real code
-        // and a hook scoped to it must be able to see it.
-        let windows_crash = Ok(ToolResult {
-            content: String::new(),
-            success: false,
-            metadata: Some(serde_json::json!({ "exit_code": 3_221_225_477_i64 })),
-        });
-        assert_eq!(
-            super::reported_tool_exit_code(&windows_crash),
-            Some(3_221_225_477)
-        );
-
-        // A transport-level tool error has no metadata at all.
-        let errored: Result<ToolResult, ToolError> =
-            Err(ToolError::execution_failed("no such tool"));
-        assert_eq!(super::reported_tool_exit_code(&errored), None);
     }
 
     // === #5472 finding 3: retained tool outputs are bounded ===

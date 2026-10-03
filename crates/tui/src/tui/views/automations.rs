@@ -54,6 +54,9 @@ pub(crate) struct AutomationRow {
     pub(crate) record: AutomationRecord,
     /// Newest first.
     pub(crate) runs: Vec<AutomationRunRecord>,
+    /// The run history could not be read. Painted instead of "no recorded
+    /// runs", which would claim an empty history nobody observed.
+    pub(crate) runs_error: Option<String>,
 }
 
 impl AutomationRow {
@@ -73,6 +76,9 @@ pub struct AutomationsView {
     row: usize,
     detail_open: bool,
     detail_scroll: usize,
+    /// Largest useful detail scroll in rendered (wrapped) rows, from the last
+    /// paint; ↓ stops there instead of piling up invisible scroll.
+    detail_max_scroll: Cell<usize>,
     locale: Locale,
     manager: Option<SharedAutomationManager>,
     /// Refreshes ride the modal tick, not every frame.
@@ -99,6 +105,7 @@ impl AutomationsView {
             row: 0,
             detail_open: false,
             detail_scroll: 0,
+            detail_max_scroll: Cell::new(usize::MAX),
             locale: app.ui_locale,
             manager: app.runtime_services.automations.clone(),
             last_refresh_at: Instant::now(),
@@ -128,6 +135,7 @@ impl AutomationsView {
             row: 0,
             detail_open: false,
             detail_scroll: 0,
+            detail_max_scroll: Cell::new(usize::MAX),
             locale,
             manager: None,
             last_refresh_at: Instant::now(),
@@ -237,10 +245,15 @@ impl AutomationsView {
         self.rows = records
             .into_iter()
             .map(|record| {
-                let runs = manager
-                    .list_runs(&record.id, Some(RECENT_RUNS))
-                    .unwrap_or_default();
-                AutomationRow { record, runs }
+                let (runs, runs_error) = match manager.list_runs(&record.id, Some(RECENT_RUNS)) {
+                    Ok(runs) => (runs, None),
+                    Err(error) => (Vec::new(), Some(error.to_string())),
+                };
+                AutomationRow {
+                    record,
+                    runs,
+                    runs_error,
+                }
             })
             .collect();
         self.problem = None;
@@ -546,7 +559,16 @@ impl AutomationsView {
             format!("  {}", tr(locale, MessageId::AutomationRecentRunsLabel)),
             Style::default().fg(palette::TEXT_PRIMARY).bold(),
         )));
-        if row.runs.is_empty() {
+        if let Some(error) = row.runs_error.as_deref() {
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "    {} · {}",
+                    tr(locale, MessageId::AutomationRunsUnavailable),
+                    display_text(error)
+                ),
+                Style::default().fg(palette::STATUS_ERROR),
+            )));
+        } else if row.runs.is_empty() {
             lines.push(Line::from(Span::styled(
                 format!("    {}", tr(locale, MessageId::AutomationNoRuns)),
                 Style::default().fg(palette::TEXT_DIM),
@@ -593,11 +615,12 @@ impl AutomationsView {
             return;
         };
         let lines = self.detail_lines(row);
-        let visible = usize::from(area.height).max(1);
-        let scroll = self.detail_scroll.min(lines.len().saturating_sub(visible));
-        Paragraph::new(lines.into_iter().skip(scroll).collect::<Vec<_>>())
-            .wrap(Wrap { trim: false })
-            .render(area, buf);
+        self.detail_max_scroll.set(super::render_wrapped_detail(
+            lines,
+            area,
+            buf,
+            self.detail_scroll,
+        ));
     }
 }
 
@@ -668,7 +691,10 @@ impl ModalView for AutomationsView {
             }
             KeyCode::Down | KeyCode::Char('j') => {
                 if self.detail_open {
-                    self.detail_scroll = self.detail_scroll.saturating_add(1);
+                    self.detail_scroll = self
+                        .detail_scroll
+                        .saturating_add(1)
+                        .min(self.detail_max_scroll.get());
                 } else {
                     self.move_row(1);
                 }
@@ -883,10 +909,12 @@ mod tests {
                 AutomationRow {
                     record: record("vision", AutomationStatus::Active),
                     runs: vec![run("vision", AutomationRunStatus::Running)],
+                    runs_error: None,
                 },
                 AutomationRow {
                     record: record("infra", AutomationStatus::Paused),
                     runs: Vec::new(),
+                    runs_error: None,
                 },
             ],
             Locale::En,
@@ -1092,5 +1120,61 @@ mod tests {
         assert!(text.contains("x cancel"), "{text}");
         assert!(text.contains("p pause"), "{text}");
         assert!(text.contains("follow you into every repository"), "{text}");
+    }
+
+    /// U09-m3: a run history that could not be read is reported as such,
+    /// never painted as "no recorded runs".
+    #[test]
+    fn unreadable_run_history_is_not_shown_as_empty() {
+        let view = AutomationsView::from_rows(
+            vec![AutomationRow {
+                record: record("vision", AutomationStatus::Active),
+                runs: Vec::new(),
+                runs_error: Some("run store unreadable".to_string()),
+            }],
+            Locale::En,
+        );
+        let text = view
+            .detail_lines(&view.rows[0])
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("runs unavailable"), "{text}");
+        assert!(text.contains("run store unreadable"), "{text}");
+        assert!(!text.contains("no recorded runs"), "{text}");
+    }
+
+    /// U09-m6: detail scroll counts wrapped rows, so a long prompt's tail is
+    /// reachable and ↓ stops at the real end instead of piling up scroll.
+    #[test]
+    fn detail_scroll_reaches_the_wrapped_tail() {
+        let mut long = record("long", AutomationStatus::Active);
+        long.prompt = format!("{}TAILMARK", "word ".repeat(80));
+        let mut view = AutomationsView::from_rows(
+            vec![AutomationRow {
+                record: long,
+                runs: Vec::new(),
+                runs_error: None,
+            }],
+            Locale::En,
+        );
+        view.detail_open = true;
+        let area = Rect::new(0, 0, 30, 8);
+        let mut buf = Buffer::empty(area);
+        view.render_detail(area, &mut buf);
+        for _ in 0..200 {
+            view.handle_key(key(KeyCode::Down));
+        }
+        assert_eq!(view.detail_scroll, view.detail_max_scroll.get());
+        let mut buf = Buffer::empty(area);
+        view.render_detail(area, &mut buf);
+        let text = rendered_text(area, &buf);
+        assert!(text.contains("TAILMARK"), "{text}");
     }
 }

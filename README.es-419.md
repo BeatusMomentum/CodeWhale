@@ -1,9 +1,9 @@
-<!-- source: README.md sha256:bbb8bfb61e57 -->
+<!-- source: README.md sha256:925619135f77 -->
 # Codewhale
 
 Codewhale es un agente de código abierto que lee tu proyecto, edita archivos, ejecuta comandos y comprueba su trabajo con un modelo alojado o local que tú eliges. Empieza con una tarea en la terminal. Para un trabajo más grande, asigna partes del trabajo a agentes con distintos modelos y roles.
 
-![Codewhale ejecutándose en una terminal](web/public/codewhale-tui-d7a9a1c.png)
+![Codewhale ejecutándose en una terminal](web/public/codewhale-tui-5765d80.png)
 
 *Vista previa de la terminal de una compilación de desarrollo de v0.10.0.*
 
@@ -23,6 +23,8 @@ curl -fsSL https://codewhale.net/install.sh | sh
 "$HOME/.local/bin/codewhale"
 ```
 
+Si al ejecutar solo `codewhale` aparece "command not found", `~/.local/bin` todavía no está en tu PATH: ejecuta la línea que el instalador muestra para tu shell o consulta [Agregarlo al PATH](docs/INSTALL.md#put-it-on-your-path).
+
 El instalador selecciona la última versión publicada. El [registro de cambios](CHANGELOG.md) también describe la versión candidata aún no publicada de la próxima versión; esos cambios no se incluyen en las descargas publicadas hasta que la versión esté disponible.
 
 En Windows, descarga el instalador o archivo correspondiente de [GitHub Releases](https://github.com/Hmbown/CodeWhale/releases/latest). Para actualizar una instalación directa existente, ejecuta `codewhale update`, o `codewhale update --check` para consultar sin instalar. El actualizador muestra la ruta del ejecutable y conserva las compilaciones más recientes. npm y Cargo son opciones secundarias; consulta la [guía de instalación](docs/INSTALL.md) para migrar desde un gestor de paquetes y configurar PATH.
@@ -33,7 +35,7 @@ El completado con Tab se configura con un comando por shell — `codewhale compl
 
 ## Uso
 
-Abre una terminal en la carpeta de tu proyecto y ejecuta `codewhale`. Elige tu proveedor con `/provider` y tu modelo con `/model`. Después, describe una tarea concreta:
+Abre una terminal en la carpeta de tu proyecto y ejecuta `codewhale` (una vez que esté [en tu PATH](docs/INSTALL.md#put-it-on-your-path)). Elige tu proveedor con `/provider` y tu modelo con `/model`. Después, describe una tarea concreta:
 
 ```text
 Fix the failing tests and explain what changed.
@@ -76,6 +78,7 @@ Lee el [orden de autorización](docs/AUTHORIZATION_ORDER.md) para conocer la jer
 
 ## Documentación
 
+- [Configuración de revisiones de PR en GitHub](docs/GITHUB_ACTION.md)
 - [Proveedores y modelos locales](docs/PROVIDERS.md)
 - [Equipos de agentes](docs/FLEET.md)
 - [MCP](docs/MCP.md), [hooks](docs/HOOKS.md) y [configuración](docs/CONFIGURATION.md)

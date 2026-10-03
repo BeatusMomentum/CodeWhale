@@ -18,8 +18,8 @@ agents with different models and roles.
 [![Discord](https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white)](https://discord.gg/37gfS3ksug)
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="web/public/codewhale-tui-d7a9a1c.png">
-  <img src="web/public/codewhale-tui-d7a9a1c.png" alt="A Codewhale terminal session" width="720">
+  <source media="(prefers-color-scheme: dark)" srcset="web/public/codewhale-tui-5765d80.png">
+  <img src="web/public/codewhale-tui-5765d80.png" alt="A Codewhale terminal session" width="720">
 </picture>
 
 *Terminal preview from a v0.10.0 development build.*
@@ -32,6 +32,10 @@ macOS / Linux — install the official GitHub release:
 curl -fsSL https://codewhale.net/install.sh | sh
 "$HOME/.local/bin/codewhale"
 ```
+
+If plain `codewhale` then says "command not found", `~/.local/bin` is not on
+your PATH yet: run the one line that installer prints for your shell, or see
+[Put it on your PATH](docs/INSTALL.md#put-it-on-your-path).
 
 The installer selects the latest published release. The [changelog](CHANGELOG.md)
 also describes the next release's unreleased candidate; those changes are not
@@ -57,7 +61,8 @@ See [shell completions](docs/INSTALL.md#8-shell-completions).
 
 ## Use
 
-Open a terminal in your project folder and run `codewhale`. Choose your provider
+Open a terminal in your project folder and run `codewhale` (once it is
+[on your PATH](docs/INSTALL.md#put-it-on-your-path)). Choose your provider
 with `/provider` and your model with `/model`. Then describe a concrete task:
 
 ```text
@@ -132,6 +137,7 @@ stack and [configuration](docs/CONFIGURATION.md) for local settings.
 
 ## Documentation
 
+- [GitHub PR review setup](docs/GITHUB_ACTION.md)
 - [Providers and local models](docs/PROVIDERS.md)
 - [Agent teams](docs/FLEET.md)
 - [MCP](docs/MCP.md), [hooks](docs/HOOKS.md), and [configuration](docs/CONFIGURATION.md)

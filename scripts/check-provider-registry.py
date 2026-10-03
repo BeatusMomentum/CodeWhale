@@ -599,7 +599,7 @@ def report_provider_enum_drift(
 
 
 def report_huggingface_coverage(
-    config_rs: str, tui_config_rs: str, providers_md: str
+    config_rs: str, provider_rs: str, tui_config_rs: str, providers_md: str
 ) -> list[str]:
     errors = []
 
@@ -628,14 +628,26 @@ def report_huggingface_coverage(
         code_spans & HUGGINGFACE_ALIASES,
     )
 
+    # crates/config resolves provider API keys from the descriptor's env list
+    # (`Provider::env_vars`), so the auth order lives in provider.rs.
+    auth_label = "Hugging Face auth env precedence"
+    errors += report_string_order(
+        auth_label,
+        provider_rs,
+        [
+            "[" + ", ".join(f'"{name}"' for name in HUGGINGFACE_API_KEY_ENV_ORDER) + "]"
+        ],
+        "crates/config/src/provider.rs",
+    )
     for label, env_order in [
-        ("Hugging Face auth env precedence", HUGGINGFACE_API_KEY_ENV_ORDER),
+        (auth_label, HUGGINGFACE_API_KEY_ENV_ORDER),
         ("Hugging Face base URL env precedence", HUGGINGFACE_BASE_URL_ENV_ORDER),
         ("Hugging Face model env precedence", HUGGINGFACE_MODEL_ENV_ORDER),
     ]:
-        errors += report_env_lookup_order(
-            label, config_rs, env_order, "crates/config/src/lib.rs"
-        )
+        if label != auth_label:
+            errors += report_env_lookup_order(
+                label, config_rs, env_order, "crates/config/src/lib.rs"
+            )
         errors += report_env_lookup_order(
             label, tui_config_rs, env_order, "crates/tui/src/config.rs"
         )
@@ -724,7 +736,9 @@ def main() -> int:
             selectable_provider_ids,
             documented_selectable_provider_ids(providers_md),
         )
-        errors += report_huggingface_coverage(config_rs, tui_config_rs, providers_md)
+        errors += report_huggingface_coverage(
+            config_rs, read(PROVIDER_RS), tui_config_rs, providers_md
+        )
         errors += report_antigravity_public_contract(
             providers_md,
             configuration_md,

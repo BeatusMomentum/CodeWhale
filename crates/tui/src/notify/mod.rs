@@ -179,7 +179,9 @@ impl NotificationGate {
         }
         match kind {
             NotificationKind::TurnComplete => self.turn_complete,
-            NotificationKind::SubagentTerminal => self.subagent_terminal,
+            NotificationKind::SubagentTerminal | NotificationKind::BackgroundTerminal => {
+                self.subagent_terminal
+            }
             NotificationKind::ApprovalNeeded => self.approval_needed,
             NotificationKind::InputNeeded => self.input_needed,
             NotificationKind::ElevationNeeded => self.elevation_needed,

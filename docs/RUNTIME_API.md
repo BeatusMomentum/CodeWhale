@@ -1,5 +1,7 @@
 # Runtime API & Integration Contract
 
+> 阅读简体中文版：[zh_hans/RUNTIME_API.md](zh_hans/RUNTIME_API.md)。
+
 `codewhale app-server` is the canonical local runtime API and control plane.
 Local SDKs, mobile/remote-control clients, and editor integrations talk to it
 instead of screen-scraping terminal output. It serves the full HTTP/SSE runtime
@@ -39,9 +41,9 @@ local supervisor / SDK / automation harness
 The engine runs as a local-only process. All APIs bind to `localhost` by
 default. No hosted relay, no provider-token custody, no secret leakage.
 
-For a proposed read-only audit export over completed turns, see
-[`docs/RECEIPTS.md`](RECEIPTS.md). That document is a protocol note; the receipt
-CLI/API surfaces are not implemented yet.
+For the read-only record of what a thread or turn did, see
+[`docs/RECEIPTS.md`](RECEIPTS.md): `codewhale receipts` on the CLI and the
+`/receipt` routes under **Threads** below.
 
 ## Runtime API entrypoints
 
@@ -52,7 +54,7 @@ CLI/API surfaces are not implemented yet.
 | `codewhale app-server --mobile` | HTTP/SSE on loopback + `/mobile` | Runtime API + local mobile control page |
 | `codewhale app-server --stdio` | JSON-RPC 2.0 over stdio | Local SDK / control probe (no listener) |
 | `codewhale app-server --socket [--socket-path P]` | JSON-RPC 2.0 over a `0600` unix domain socket | Desktop daemon: multi-client, peer-uid checked, `daemon/attach` claim handshake (macOS/Linux; Windows named pipe reserved, not implemented) |
-| `codewhale app-server` | HTTP on `127.0.0.1:8787` | Legacy in-process app-server (`/healthz`, `/thread`, `/app`, `/prompt`, `/jobs`, `/mcp/startup`); `/prompt` and `/thread` messages execute real turns via the runtime bridge. There is no direct `/tool` route: tools run only inside Engine turns, under the Engine's tool catalog and approval posture. This legacy server does not surface approvals: its bridge forwards only text deltas and the turn's completion, and it has no decision route, so an approval-gated call waits unanswered. Drive approval-gated work through the Runtime API (`/v1/threads/*` events and `POST /v1/approvals/{approval_id}`) |
+| `codewhale app-server` | HTTP on `127.0.0.1:8787` | Legacy in-process app-server (`/healthz`, `/thread`, `/app`, `/prompt`, `/jobs`); `/prompt` and `/thread` messages execute real turns via the runtime bridge. There is no direct `/tool` route: tools run only inside Engine turns, under the Engine's tool catalog and approval posture. This legacy server does not surface approvals: its bridge forwards only text deltas and the turn's completion, and it has no decision route, so an approval-gated call waits unanswered. Drive approval-gated work through the Runtime API (`/v1/threads/*` events and `POST /v1/approvals/{approval_id}`) |
 | `codewhale serve --http` / `--mobile` | same server as `app-server --http`/`--mobile` | Compatibility aliases |
 
 `app-server --http` and `--mobile` launch the same mature runtime API server
@@ -153,6 +155,130 @@ Session artifacts are the oversized tool outputs a session recorded as
   artifact with the same window, `revision` and `encoding` contract as the
   workspace file read. A record whose stored path is absolute or leaves the
   session directory is 403; a record whose file is gone is 404.
+
+These routes only serve what a SavedSession indexes (plus immutable image
+evidence). A runtime turn's spills are read through the turn route below. An
+unbound runtime thread's engine has no SavedSession index at all, so for its
+spills the turn record is the only way in.
+
+#### Turn artifacts
+
+A turn records what it produced as typed references on its items and on the
+turn itself. Nothing is scanned to build them. Each fact is recorded where the
+bytes were written:
+- file tools and `apply_patch` report `size`/`sha256` in `mutation.files[]`;
+- spills report `artifact_digest`;
+- tool media reports `sha256`.
+
+The workspace-level half comes from the turn's own restore points: the
+`pre_turn` and `post_turn` receipts in `TurnRecord.workspace_snapshots` (see
+"Workspace restore points" below), diffed by tree id in the existing side
+repo. No second store, snapshot or event is involved.
+
+A reference (`TurnArtifactRef`) carries:
+
+| Field | Meaning |
+| --- | --- |
+| `id` | Stable within the turn. A file's id is `file_` plus the first 32 hex digits of SHA-256(path). A spill's is `art_<call>`. Media's is `art_image_<sha256>`. |
+| `kind` | `file`, `tool_output` or `media`. |
+| `path` | For `file`: workspace-relative with `/` separators. For `tool_output` and `media`: session-relative (`artifacts/...`). |
+| `change` | For `file` only: `created`, `updated`, `deleted` or `renamed`. A rename also has `previous_path`. |
+| `size` | Byte size. Absent when the file was deleted. |
+| `revision` | SHA-256 hex of the whole content. This is the value `GET /v1/workspace/files/read` reports as `revision`, and file-revert's `expected_hash` is `sha256:` + `revision`. Absent when the file was deleted, or for a delta blob over 16 MiB. |
+| `content_type` | For `media`: the exact media type. |
+| `session_id` | For `tool_output` and `media`: the artifact session that owns the bytes. |
+| `item_id`, `tool_call_id`, `tool_name` | The tool call that wrote it. Absent for a change seen only in the workspace delta. |
+| `source` | `tool_mutation`, `tool_output_spill`, `tool_media`, or `workspace_changed_during_turn`. |
+| `restore_snapshot_id` | A restore point `POST /v1/threads/{id}/file-revert` accepts for this path on this thread: the `tree_id` of a receipt recorded on this turn's `workspace_snapshots`, so the thread owns it whether or not it is bound to a saved session. For a tool write it is the call's `tool` receipt; for a delta change it is the turn's `pre_turn` receipt. Absent when the turn recorded no such receipt. |
+| `recorded_at` | When the reference was recorded. |
+
+Where references appear:
+- **Items.** `TurnItemRecord.artifacts` lists what one tool call produced. It
+  is set when the call completes, succeeded or failed, so `item.completed` and
+  `item.failed` carry it live.
+- **Legacy projection.** `artifact_refs` is derived from `artifacts`. It holds
+  only the workspace-relative paths of files that still exist: never spills,
+  media or deleted files.
+- **Turns.** `TurnRecord.artifacts` is the turn aggregate. It is computed by
+  one merge and ordered most recent first.
+  - Spill and media refs are always kept.
+  - File refs compose in item order: created then deleted drops the file,
+    created then updated stays `created`, and a rename folds its origin.
+  - Once the workspace delta settles, it is authoritative for the net change,
+    `size` and `revision` of every path the snapshots can see. It adds files
+    no tool receipt named, such as shell and sub-agent writes. It drops an item
+    path the snapshots track but that ended the turn unchanged.
+  - The aggregate is capped at 1000 refs, and `workspace.truncated` /
+    `workspace.omitted` report the cut.
+
+`TurnRecord.workspace` follows the delta's lifecycle. It is `null` while the
+turn runs. `turn.completed` carries it with one of these states:
+- `pending`: the turn recorded both a `pre_turn` and a `post_turn` receipt,
+  and their diff is still running. When it finishes, the runtime publishes
+  `turn.artifacts`
+  (`{turn_id, workspace, artifacts}`). That event may arrive after the next
+  turn's `turn.started`, so key it by `turn_id`.
+- `settled`: the delta is merged. `pre_turn_snapshot_id` and
+  `post_turn_snapshot_id` are the tree ids of the pair.
+- `unavailable`: no delta will come. `reason` says why:
+  - `snapshots_disabled`, `workspace_too_large`, `too_many_files`,
+    `unsafe_location`, `snapshot_failed`: the snapshot gates. A turn with a
+    `pre_turn` receipt but no `post_turn` one keeps `pre_turn_snapshot_id`.
+  - `not_captured`: the turn recorded no restore point: a compaction or purge
+    operation, or a turn whose engine ended before taking one.
+  - `runtime_restarted`: the process stopped before the delta settled. This is
+    reconciled at startup and never recomputed.
+  - `delta_failed`: the diff itself failed.
+
+  `artifacts` still holds what the tool receipts recorded. `turn.artifacts` is
+  published for every settlement outcome, so a client waiting on `pending`
+  always hears back.
+
+What the delta means, and what it cannot see:
+- **It is a workspace diff, not attribution.** A delta change is everything
+  that changed in the workspace while the turn ran. That includes an editor,
+  another thread, or a background job writing the same workspace at the same
+  time. `source: workspace_changed_during_turn` says exactly that.
+- **Excluded paths are invisible to snapshots.** This covers the built-in
+  excludes (for example `node_modules/`, `target/`, `dist/`, `build/`,
+  `.next/`, and binary and media extensions) and the workspace's `.gitignore`. A file tool's write to
+  such a path is still reported from its receipt. A shell command's write to
+  one is not reported at all.
+- **Shell writes have no per-call record.** A shell command's writes are
+  never attributed to its item, only to the turn, and only when snapshots are
+  enabled.
+
+Routes:
+
+- `GET /v1/threads/{id}/turns/{turn_id}/artifacts` returns
+  `{thread_id, turn_id, workspace, artifacts}` from the runtime store's turn
+  record. While the turn runs, `artifacts` is merged from its items on the fly
+  and `workspace` is `null`. An unknown turn, or a turn of another thread, is
+  404.
+- `GET /v1/threads/{id}/turns/{turn_id}/artifacts/{artifact_id}?offset=&limit=&revision=`
+  reads one reference.
+  - It uses the workspace file read's window contract (`size`, `revision`,
+    `offset`, `bytes`, `truncated`, `encoding`, `content`) and adds:
+    - `artifact`: the reference;
+    - `source`: `workspace`, `snapshot` or `session_artifact`;
+    - `current`: whether the workspace still holds these bytes, or `null`
+      when that is not a question for this reference.
+  - `revision` selects an intermediate revision one of the turn's items
+    recorded. The default is the reference's own revision.
+  - A `file` is served from the workspace when it still holds the recorded
+    revision (`current: true`). Otherwise it comes from the turn's post-turn
+    snapshot (`current: false`).
+  - A `tool_output` or `media` reference is read under the session artifact
+    root the writer used. The same confinement, image-manifest and integrity
+    checks apply as for the session route.
+
+| Status | When |
+| --- | --- |
+| 404 | Unknown thread, turn or artifact id, or a `revision` this turn never recorded. |
+| 409 | A file's recorded revision is in neither the workspace nor the snapshot store (snapshots are pruned after 50 per workspace or 7 days), or a session artifact's bytes no longer hash to the recorded revision. The message names the current revision. |
+| 410 | The turn deleted the file (restore it with `file-revert` and `restore_snapshot_id`), or a session artifact's bytes were pruned. |
+| 413 | Content over 16 MiB. |
+| 403 | A symlink, or a reference that leaves its root. |
 
 Fleet receipt artifacts keep their own route
 (`GET /v1/fleet/runs/{run_id}/receipts/{task_id}/evidence`).
@@ -327,6 +453,40 @@ in the app-server can produce model output, so a prompt either runs or fails.
 and replies `status: "completed"` with the streamed frames in `events` — where
 it previously replied `accepted` without doing anything.
 
+### Thread ids and restarts
+
+`thread/message`, `thread/request` messages, and HTTP `POST /thread` messages
+take a thread id from `thread/create` (or `thread/fork`). An id that was never
+created fails with `-32004` (`thread_not_found`) on stdio, or HTTP `404` on
+`/thread`, before any runtime thread is started. `/prompt`, `prompt/request`,
+and `prompt/run` are different: their optional `thread_id` is any key the
+caller chooses, and a new key starts a new conversation.
+
+The runtime thread behind each created thread is recorded in the state store,
+so a message sent after the app-server restarts continues the same
+conversation. If the runtime no longer has that thread (its data directory was
+removed or replaced), the next message starts a new runtime thread in the
+thread's recorded workspace and records it; the earlier conversation is not
+recovered. `thread/resume` and `thread/fork` without `cwd` keep the recorded
+workspace (a fork uses its parent's). A new fork, or a persisted thread resumed
+through a fresh metadata manager, can record an explicit `cwd`. This control
+transport does not move an already linked Runtime thread: its workspace remains
+owned by the Runtime API. Updating that thread's workspace requires the Runtime
+`PATCH /v1/threads/{id}` operation; cached metadata resume also does not persist
+an explicit cwd change. These paths are not a cross-store workspace transaction.
+
+### Changing config
+
+`app/config/set` and `app/config/unset` write the change to the config file
+before replying: the `--config` path, or the default `config.toml` the runtime
+child also reads when no `--config` is given. They change user settings that
+outlive the app-server, not just this session. The change is applied to the
+file as it is on disk, so edits saved by other processes are kept. If the file
+cannot be read, parsed, or written, the reply is `ok: false` and nothing
+changes; a file that does not parse is not rewritten, so fix it by hand (or
+`app/config/reload` after fixing it). Over HTTP `/app`, a rejected key or value
+is `400` and a read or write failure is `500`.
+
 ### Answering a clarification question
 
 When a headless turn calls `request_user_input`, the runtime emits a
@@ -359,7 +519,7 @@ this; the table maps each integration need to where a local client reads it.
 | Event stream | `GET /v1/threads/{id}/events` (replay + live SSE) | available |
 | Turn status / terminal classification | `TurnRecord.status` + error summary | available |
 | Token usage | `TurnRecord.usage`; aggregate via `GET /v1/usage` | available |
-| Single-read run receipt (route + usage + cost) | `GET /v1/threads/{id}/turns/{turn_id}/receipt` | proposed ([RECEIPTS.md](RECEIPTS.md)) |
+| Action receipt (files, commands, web/MCP calls, agents, approvals and who decided, failures) | `GET /v1/threads/{id}/receipt`, `GET /v1/threads/{id}/turns/{turn_id}/receipt` | available ([RECEIPTS.md](RECEIPTS.md)) |
 
 For one-shot/headless automation, prefer `codewhale exec` with explicit
 `--provider <id> --model <id>` so a failure identifies the exact provider/model
@@ -568,11 +728,20 @@ local terminal and transits the OS browser launcher's argument list. A same-user
 process could race the browser to the exchange, which is why the capability is
 single-use, loopback-only, and expires after ten minutes — and why a same-user
 attacker has strictly easier local avenues than this race.
-Existing bearer/header/cookie authorization for `/v1/*` is unchanged outside
-web mode. In web mode, cookie-authenticated unsafe requests must also carry the
-exact local web origin, and Fetch Metadata identifying a cross-origin cookie
-request is rejected. Explicit bearer and Runtime-token header clients keep
-their existing behavior.
+Web fetches require the session cookie plus an origin-scoped request proof;
+streams use a fresh single-use ticket. The initial redirect carries the proof
+in a fragment, which the client removes and saves in origin-scoped
+`sessionStorage`. On reload or in a second tab, an authenticated `GET /` also
+embeds the proof in a meta tag when `Sec-Fetch-Site` is `same-origin` or `none`
+(direct navigation). The page uses `no-store`, disallows framing, and grants no
+cross-origin read access. This lets a new tab recover without reusing the
+bootstrap URL, including when storage is unavailable. Clients without Fetch
+Metadata can only reuse the fragment or their existing stored proof; recovery
+does not extend the server session or replace an expired cookie.
+Cross-origin Fetch Metadata or a mismatched Origin is rejected on web API
+requests. Explicit bearer and Runtime-token header clients keep their existing
+behavior. Transient stream-ticket failures retry with capped backoff; HTTP
+401/403 stops ticket retries until a fresh session is opened.
 
 The embedded client provides a responsive thread/search rail, Runtime-owned
 session facts, transcript and tool receipts, and a bottom composer. It can
@@ -592,8 +761,9 @@ subscribing so a reload cannot strand work whose request event is at or before
 An existing thread's model, mode, permission posture, workspace, and branch are
 display-only in this client. Files/Changes, PTY/terminal, preview, artifacts,
 provider login or global-default switching, Fleet creation, and
-undo/retry/restore controls are intentionally absent until the Runtime publishes
-explicit contracts for them.
+undo/retry/restore controls are not built into this page. The native desktop
+client covers them through the workspace-file, turn-artifact, terminal and
+workspace-restore routes documented here.
 
 ### Mobile control page
 
@@ -625,12 +795,28 @@ a TLS or verified transport boundary.
 - `GET /v1/sessions?limit=50&search=<fuzzy>&include_archived=false&archived_only=false&workspace=<path>&sort=recent|name|size`
 - `GET /v1/sessions/summary?…` (same query params; projected row shape)
 - `GET /v1/sessions/{id}` (add `?peek=true&entries=12` for a bounded, redacted
-  read-only peek instead of the full transcript)
+  read-only peek instead of the full transcript). The full response carries
+  `turn_outcomes` when a turn ended `Failed`: `{ status, error, ended_at,
+  after_message_count }` per failure, oldest first, bounded to 64, with the
+  error text the transcript showed and secrets redacted
 - `PATCH /v1/sessions/{id}` (`{ "title"?: string, "archived"?: bool }`)
 - `DELETE /v1/sessions/{id}`
-- `POST /v1/sessions/{id}/resume-thread`
+- `POST /v1/sessions/{id}/resume-thread` returns the open thread that already
+  holds the whole saved session (`200`), or seeds a new thread from it (`201`)
+  when none does, including when the session grew after that thread opened it.
 - `GET /v1/sessions/{id}/artifacts` and `GET /v1/sessions/{id}/artifacts/{artifact_id}?offset=&limit=`
-  (see workspace files and session artifacts above)
+  (see workspace files and session artifacts above; runtime-turn spills are
+  read through `GET /v1/threads/{id}/turns/{turn_id}/artifacts/{artifact_id}`)
+- `POST /v1/sessions` (`{ "thread_id": string, "title"?: string }`) exports a
+  thread as a saved session. It is idempotent: it writes only the document
+  whose id is derived from the thread, creating it the first time (`201`) and
+  updating it after (`200`), so a retry never makes a duplicate. A session the
+  thread was resumed from is left unchanged.
+- `PUT /v1/sessions` (`{ "thread_id"?: string, "session_id"?: string }`) saves
+  a thread's live conversation. Naming a `session_id` that another thread is
+  bound to returns `409 Conflict`.
+- `GET /v1/sessions/repair` returns the last session-store repair summary, or
+  `null` if none has run
 
 Sessions and threads answer the same `include_archived` / `archived_only` pair
 with the same meaning, and `search` is the same fuzzy match (title, id,
@@ -667,9 +853,20 @@ archive notion.
 
 While a session is open in an interactive Codewhale process, that process holds
 the authoritative copy in memory and rewrites the whole document on its next
-autosave. `PATCH` therefore fails closed on it with `409 Conflict` rather than
-writing something that would be silently reverted. Change it in the terminal
-instead. A standalone `codewhale web` holds nothing open and is never blocked.
+autosave. `PATCH`, `PUT` and `DELETE` therefore fail closed on it with
+`409 Conflict` rather than writing something that would be silently reverted.
+Change it in the terminal instead. The open process holds a lock on the
+session (`sessions/.late-usage/<id>.live`), so this holds whether the request
+reaches the API inside that process or a separate `codewhale serve`.
+
+The session store is repaired in the background at each launch and each
+`codewhale serve` start. The repair gives a "Recovered:" session to each thread
+in a Runtime store that no session is bound to. It unbinds threads whose session
+document is gone; they then load from their own turns. It moves unreadable
+documents, empty unbound stores, and old artifact directories that no session
+names to `sessions/.set-aside/<run>/`, and writes a `MANIFEST.jsonl` there.
+Nothing is deleted. `GET /v1/sessions/repair` and `codewhale doctor` report the
+last run; `codewhale doctor --repair-sessions [--dry-run]` runs one on demand.
 
 `GET /v1/sessions/{id}?peek=true` returns a bounded, redacted, read-only view
 instead of the transcript: at most 12 entries of at most 400 characters each
@@ -691,6 +888,10 @@ and live state comes only from a resumed thread's SSE stream.
 - `PATCH /v1/threads/{id}` (see body shape below)
 - `POST /v1/threads/{id}/resume`
 - `POST /v1/threads/{id}/fork`
+- `GET /v1/threads/{id}/receipt` — what the thread did, one entry per action
+  (read-only; shape in [RECEIPTS.md](RECEIPTS.md))
+- `GET /v1/threads/{id}/turns/{turn_id}/receipt` — the same, for one turn;
+  `404` for an unknown thread or a turn that is not this thread's
 
 `POST /v1/threads` accepts optional execution defaults in addition to the
 provider, model, workspace, and permission fields:
@@ -810,11 +1011,13 @@ route.
 - `POST /v1/threads/{id}/turns`
 - `POST /v1/threads/{id}/turns/{turn_id}/steer` - inject guidance into the running turn. The response is a receipt for what actually happened, not for what was attempted; see [Steer delivery](#steer-delivery).
 - `POST /v1/threads/{id}/turns/{turn_id}/interrupt`
+- `GET /v1/threads/{id}/turns/{turn_id}/artifacts` - what the turn produced: typed references plus the workspace-delta state. See [Turn artifacts](#turn-artifacts).
+- `GET /v1/threads/{id}/turns/{turn_id}/artifacts/{artifact_id}?offset=&limit=&revision=` - read one reference from the workspace, the post-turn snapshot, or the session artifact directory.
 - `POST /v1/threads/{id}/compact` (manual compaction)
 - `POST /v1/threads/{id}/undo` - fork the thread with the last N turns removed (`{"depth": N}`, default 0 = last turn only); returns the forked thread plus `original_user_text` so a GUI can pre-populate the input box
 - `POST /v1/threads/{id}/fork-at-turn` - fork at one named user turn (`{"turn_id": "turn_…"}`, as `GET /v1/threads/{id}` reports it). The fork *keeps* that turn and every turn before it, and drops the turns after it; naming the last turn therefore keeps the whole conversation. The receipt is `/undo`'s (`thread`, `original_user_text`, `original_user_images`), carrying the *first dropped* user turn's prompt — what was asked next, even when a prompt-less turn such as a manual `/compact` sits between — so a client can put it back in the composer for editing. The source thread, its session document and the workspace are untouched, and there is no file rollback: a fork is a sibling conversation, and rewinding the workspace would rewind the branch left behind with it. Clients should name the turn instead of computing a `depth` — the transcript they render and the turn list this cuts are not the same list (steers, image-only prompts and injected handoffs each sit on one side only), and a client-side count that is off by one forks the wrong prefix while answering `201`. `400` when the turn is not a user turn of that thread.
-- `POST /v1/threads/{id}/patch-undo` - snapshot-based whole-workspace rollback followed by the same fork (`{"depth": N}`); returns `patch_result` (`files_restored`, `summary`, `snapshot_label`) alongside the forked thread. See [Workspace restore endpoints](#workspace-restore-endpoints) for the trust, admission and abort rules.
-- `POST /v1/threads/{id}/file-revert` - restore exactly one file from one named snapshot (`{"path", "snapshot_id", "expected_hash"}`); never forks the conversation. See [Workspace restore endpoints](#workspace-restore-endpoints).
+- `POST /v1/threads/{id}/patch-undo` - rolls back the files the dropped turns changed, then the same fork (`{"depth": N}`); returns `patch_result` (`files_restored`, `summary`, `snapshot_label`) alongside the forked thread. See [Workspace restore endpoints](#workspace-restore-endpoints) for ownership, the trust, admission and abort rules, and the `error.code` values of a refusal.
+- `POST /v1/threads/{id}/file-revert` - restore exactly one file from one restore point the thread owns (`{"path", "snapshot_id", "expected_hash"}`); never forks the conversation. See [Workspace restore endpoints](#workspace-restore-endpoints).
 - `POST /v1/threads/{id}/retry` - fork with the last N turns removed and immediately start a new turn (`{"depth": N, "prompt": "..."}`; `prompt` overrides the original user text, which is re-used when omitted)
 
 `POST /v1/threads/{id}/turns` accepts the same optional
@@ -953,11 +1156,18 @@ where `id` is the capability above. `summary` (also on `approval.required`) is
 a one-line description of the gated call built from the tool name and its
 arguments only, never from model text ("Search the web for 'espresso'",
 "Write notes/espresso.md"); paths inside the workspace are workspace-relative.
-Clients show it first and keep the raw arguments behind it.
+Clients show it first and keep the raw arguments behind it. For task and
+automation create/update, `summary` also names the requested trust mode,
+shell, auto-approve, mode and workspace.
 
 `"remember": true` on an `allow` records a **session grant** for that tool and
-argument class (the approval grouping key: a shell command family, a patch's
-file set, a `fetch_url` host, an MCP tool, a `web.run` action kind — for
+argument class (the approval grouping key: a shell command family for a
+simple, known command such as `git status` whose only options are value-free
+ones like `-s` or `--porcelain` — a compound, wrapper, interpreter or
+unrecognised command, one with any other option, or one whose arguments are
+what runs or is installed (`go run`, `make`, `git bisect`, package installs)
+is granted as its full normalized command, and a
+shell interact or wait call as the exact call — a patch's file set, a `fetch_url` host, an MCP tool, a `web.run` action kind — for
 `open`, the hosts it opened). Computer Use consent and `app_script` calls, and
 any tool without a class, are granted for the exact call only. A grant never
 changes the thread's permission posture. Later matching calls on the thread are
@@ -1012,14 +1222,48 @@ shutdown may close the model receiver after acceptance. Once the Runtime has
 accepted the result, that call is terminal and a duplicate result returns 404.
 
 **Events** (SSE replay + live stream)
-- `GET /v1/threads/{id}/events?since_seq=<u64>`
+- `GET /v1/threads/{id}/events?since_seq=<u64>&replay_limit=<n>&progress=true`
+
+Cursors:
+
+- `since_seq` is the per-thread cursor: events with `seq > since_seq` are sent.
+  Omitted (and no `Last-Event-ID`), the stream starts from the beginning of the
+  thread's history.
+- Every journal frame carries `id: <seq>`, so a browser `EventSource` can
+  resume through the `Last-Event-ID` header it sends on reconnect. An explicit
+  `since_seq` wins over the header, so a deliberate replay from `0` is never
+  overridden by a stale id. A header value that is not a decimal integer is
+  ignored.
+- `replay_limit` (at most 4096) returns only the newest tail of the requested
+  history; `previous_seq` on the first returned event advances past exactly the
+  omitted history.
 
 Durable history parsing runs off the async server workers and reaches SSE in
 bounded batches of at most 256 events through a backpressured channel. Broadcast
 delivery is only a wake-up optimization: a lagged receiver opens the same
-bounded durable replay from its last accepted cursor. Optional `replay_limit`
-returns the newest requested tail and may not exceed 4096; `previous_seq` on
-the first returned event advances past exactly the omitted history.
+bounded durable replay from its last accepted cursor.
+
+`progress=true` adds `stream.progress` transport frames
+(`{schema_version, event, kind, thread_id, seq, state}`, `state` is
+`replaying` or `live`) at the current cursor and advertises them with
+`x-codewhale-event-progress: 1`. The stream reports `live` only after durable
+history and the already-queued live tail are both drained; broadcast-lag
+recovery returns it to `replaying`. Progress frames never carry a new sequence
+number.
+
+Failures before the stream opens are ordinary HTTP errors with the JSON error
+body, never SSE:
+
+| Status | When |
+| --- | --- |
+| `401` / `403` | Missing or wrong Runtime credential |
+| `404` | Unknown thread |
+| `400` | `replay_limit` above 4096 |
+| `500` | The durable history could not be opened (including a replay worker crash before the first cursor) |
+
+Once the response is `200`, every end the server chooses is a final
+`stream.end` frame; see [Ending and resuming a thread
+stream](#ending-and-resuming-a-thread-stream).
 
 **Snapshots** (side-git restore point listing + restore)
 - `GET /v1/snapshots?limit=20`
@@ -1052,7 +1296,7 @@ admission rule and one safety net, and they differ in scope and trust.
 | Route | Scope | Trust | Forks the thread |
 | --- | --- | --- | --- |
 | `POST /v1/snapshots/{id}/restore` | whole server workspace | bearer token only (operator action) | no |
-| `POST /v1/threads/{id}/patch-undo` | whole thread workspace | thread `trust_mode` or `auto_approve` when files would change | yes |
+| `POST /v1/threads/{id}/patch-undo` | the files the dropped turns changed | thread `trust_mode` or `auto_approve` when files would change | yes |
 | `POST /v1/threads/{id}/file-revert` | exactly one regular file | thread `trust_mode` or `auto_approve`, always | no |
 
 **Admission.** A restore reserves the same admission the Runtime uses for
@@ -1070,6 +1314,48 @@ restore. A thread whose workspace directory is not available (unmounted
 volume, disconnected share, missing directory) is refused with `409` rather
 than treated as having nothing to restore.
 
+**Ownership.** A thread owns exactly the workspace restore points recorded on
+its own turns. While a turn runs, the engine reports each snapshot it takes —
+`pre_turn` before the turn, `tool` before and `post_tool` after each tool call
+that may write (every call that is not read-only: file tools, shell commands,
+programs, write-capable MCP tools), `post_turn` when it ends (always before
+the turn settles) — and the Runtime appends it to the turn record's
+`workspace_snapshots`, in order:
+
+```json
+"workspace_snapshots": [
+  { "kind": "pre_turn", "snapshot_id": "<commit>", "tree_id": "<tree>", "session_id": "thr_1a2b3c4d" },
+  { "kind": "tool", "snapshot_id": "<commit>", "tree_id": "<tree>", "session_id": "thr_1a2b3c4d", "tool_call_id": "call_…", "write_paths": ["src/lib.rs"], "changed_paths": [] },
+  { "kind": "post_tool", "snapshot_id": "<commit>", "tree_id": "<tree>", "session_id": "thr_1a2b3c4d", "tool_call_id": "call_…", "changed_paths": ["src/lib.rs"] },
+  { "kind": "post_turn", "snapshot_id": "<commit>", "tree_id": "<tree>", "session_id": "thr_1a2b3c4d", "changed_paths": [] }
+]
+```
+
+`changed_paths` lists the workspace-relative paths whose content changed since
+the turn's previous receipt — what happened in the span the receipt closes; it
+is absent on `pre_turn` and when it could not be computed (a snapshot in
+between failed). `write_paths` is set on the `tool` receipt of a file tool
+(`write_file`, `edit_file`, `apply_patch`) to the paths the call declared, as
+it named them; a tool without it (a shell command) may write any path. On a
+user shell turn the `pre_turn` receipt carries the command's `tool_call_id`,
+since the command runs from it to `post_turn`.
+
+Each receipt is also published as a `turn.workspace_snapshot` event (payload:
+the receipt). The engine runs every Runtime thread under the thread's own id,
+across restarts and engine eviction, so `session_id` is the thread id for turns
+the thread ran itself; it does not follow the thread's saved-session binding
+(`PUT`/`POST /v1/sessions`, resume), which only names a document. A fork clones
+its source's turn records and so owns the restore points of the turns it
+inherited. Another thread's, or a TUI session's, snapshots in the same
+workspace are never candidates. `tree_id` is the durable identity: a prune
+rebuilds the side repo and rewrites every commit id but keeps each tree, and a
+restore point resolves only to a stored snapshot with the same tree, session
+tag and kind. The count prune after each snapshot keeps the newest 50
+snapshots plus the newest 50 turn boundaries (`pre-turn:`/`post-turn:`), so a
+turn with more tool calls than that, or a burst from another thread, never
+pushes out a recent turn's own restore points. Turns recorded before receipts existed, turns imported by
+`resume-thread`, and turns run with snapshots off or unavailable have none.
+
 **Safety net.** Every restore first records a `pre-restore:<target>` snapshot
 of the current workspace. That label is never a `/undo`, `patch-undo` or
 `file-revert` candidate, so the net does not change what later undos select.
@@ -1077,20 +1363,49 @@ For `file-revert` the backup is mandatory: if it cannot be written, or the
 requested file is excluded from it (for example by `.gitignore`), the request
 fails and nothing is changed.
 
-**`patch-undo`.** Selects the newest `tool:`/`pre-turn:` snapshot owned by the
-thread's own session whose tree differs from the workspace, restores the whole
-tree from it, then forks the conversation exactly as `/undo` does. `Ok` means
-either files were restored or there was provably nothing to restore (no bound
-session, or no differing session-owned snapshot); `files_restored` says which.
-When there is something to restore and the thread is not trusted, the whole
-undo aborts with `409` and neither files nor conversation change. Snapshot
-repository, listing or comparison failures abort with `500`, and an unavailable
-workspace directory aborts with `409`; both preserve the conversation, so a
-turn is never dropped while its file changes stay on disk.
-Depth and history are validated before any file changes. If the fork cannot be
-persisted after files were restored, the response is a `500` that names the
-restored snapshot; the original thread still holds the turn and the
-`pre-restore:` snapshot holds the previous files.
+**`patch-undo`.** Undoes whole turns. For each dropped turn's `pre_turn` →
+`post_turn` window, the paths that differ between the two snapshots must all be
+the turn's own: changed only in the span of one of the turn's tool calls (a
+`tool` → `post_tool` span, or a shell turn's whole window), and, inside a file
+tool's span, a path that call declared. A path that changed while none of the
+turn's tools could have written it — another thread, an editor, a background
+process — is someone else's change, and the undo is refused rather than revert
+it. Each of the turn's paths goes back to its content before the first dropped
+turn that changed it, and nothing else is touched, so later work by the user or
+another thread in the same workspace survives. Then the conversation forks
+exactly as `/undo` does.
+
+Snapshots never hold paths excluded by the workspace's `.gitignore` files or
+the built-in snapshot exclusions (`node_modules/`, `target/`, `dist/`, build
+caches, binary artifacts), nor paths outside the workspace. A dropped file-tool
+call that declared such a path is refused with `path_not_snapshotted`, because
+no snapshot can put it back. A shell command declares no paths: what it writes
+under an excluded path (build output, dependency installs) is outside what
+`patch-undo` restores and is not reported. `201` means either files were restored (`files_restored: true`, one
+`<action> <path>` line per file in `summary`, `snapshot_label` naming the
+pre-turn snapshot) or there was provably nothing to restore
+(`files_restored: false`): every dropped turn ran here without a tool call,
+changed no file, or its files are already back at their pre-turn content.
+Anything that cannot be restored aborts the whole undo with `409`, nothing is
+changed and no fork is published; `error.code` says why:
+
+| `error.code` | Meaning |
+| --- | --- |
+| `restore_point_unavailable` | a dropped turn that may have changed files has no complete recorded restore point (older record, imported by `resume-thread`, snapshots off, or the snapshot failed) |
+| `restore_point_pruned` | the restore point is no longer in the snapshot store |
+| `path_not_snapshotted` | a dropped file-tool call wrote a path snapshots do not hold (ignored, built-in exclusion, or outside the workspace) |
+| `workspace_changed_since_turn` | a path the turns changed was changed afterwards (or between two dropped turns), a path changed while a dropped turn ran but outside its own tool calls, or a path that is not a regular file |
+| `restore_requires_trust` | there is something to restore and the thread is not in trusted mode or Full Access |
+| `workspace_unavailable` | the workspace directory is not available |
+
+For the first four a client can offer the conversation-only
+`POST /v1/threads/{id}/undo` instead, and `file-revert` for individual files.
+Snapshot repository, listing or comparison failures abort with `500` and also
+preserve the conversation, so a turn is never dropped while its file changes
+stay on disk. Depth and history are validated before any file changes. If the
+fork cannot be persisted after files were restored, the response is a `500`
+that names the restored snapshot; the original thread still holds the turn and
+the `pre-restore:` snapshot holds the previous files.
 
 **`file-revert`.** Request body:
 
@@ -1106,11 +1421,14 @@ restored snapshot; the original thread still holds the turn and the
   name is literal (brackets, spaces and glob characters are filename bytes;
   Git runs with `--literal-pathspecs`). It must name a regular file: directories,
   symlinks anywhere in the path, and `.git` components are `400`.
-- `snapshot_id`: the exact `tool:<call_id>` or `pre-turn:<n>` snapshot from the
-  change the user selected. Clients obtain ids from `GET /v1/snapshots` (labels
-  carry the tool call id) and must keep the selected change's identity; the
-  server never picks "the newest snapshot that differs", because an unrelated
-  newer snapshot can erase later user edits while leaving the tool's change.
+- `snapshot_id`: the exact `tool` or `pre_turn` restore point of the change
+  the user selected, from the thread's own turn records: a receipt's
+  `snapshot_id` or `tree_id` (for a tool call, the receipt whose
+  `tool_call_id` matches), or the current commit id `GET /v1/snapshots` lists
+  for it. It must be a restore point recorded on one of this thread's turns;
+  the server never picks "the newest snapshot that differs", because an
+  unrelated newer snapshot can erase later user edits while leaving the tool's
+  change.
 - `expected_hash`: `sha256:` of the current file bytes the client displayed,
   or `absent` when the client saw the file as deleted. It is checked before the
   safety backup and again immediately before the mutation.
@@ -1124,10 +1442,11 @@ Responses:
 - `400`: malformed `snapshot_id`/`expected_hash`, path outside the workspace,
   or a path that is not a regular file on either side.
 - `404`: unknown thread.
-- `409`: thread not in trusted mode or Full Access; no bound session; active
-  turn in an overlapping workspace; workspace directory not available;
-  snapshot unknown, owned by another session
-  or not a restore point (refresh the change record); file already matches the
+- `409`: thread not in trusted mode or Full Access; active turn in an
+  overlapping workspace; workspace directory not available; snapshot unknown,
+  pruned, not recorded on this thread's turns (another thread's or a TUI
+  session's), or not a restore point (refresh the change record); file already
+  matches the
   snapshot (nothing to revert); or the file changed after the reviewed
   `expected_hash` (refresh and review again). Nothing is changed in any of
   these cases.
@@ -1139,9 +1458,6 @@ Responses:
 Capability probe: `GET` on the route returns `405` where the endpoint exists
 and `404` on an older engine; clients treat any non-`404` as available and
 degrade with an explanation otherwise.
-
-**Receipts** (future read-only audit export)
-- Proposed only: `GET /v1/threads/{thread_id}/turns/{turn_id}/receipt`
 
 **Compatibility stream** (one-shot, backwards-compatible)
 - `POST /v1/stream`
@@ -1301,7 +1617,13 @@ routes are the contract for now.
   "tty"?, "env"? }` → `201 { "job" }`; runs as a background shell under the
   thread's projected sandbox policy. `tty: true` merges stderr into stdout
   and gives the command a terminal (required for interactive programs);
-  background jobs are never killed at `timeout_ms`
+  background jobs are never killed at `timeout_ms`. A relative `cwd`
+  resolves against the thread workspace. Outside trust mode `cwd` must stay
+  inside it after symlinks resolve (`403` otherwise): unlike the shell tool,
+  this route does not follow `workspace_follow_symlinks` or `/trust add`
+  roots, so a symlink leading out of the workspace is refused. The job runs
+  in the resolved directory that was checked (a later symlink retarget does
+  not move it); a `cwd` that resolves to a non-UTF-8 path is a `400`
 - `GET /v1/threads/{id}/jobs/{job_id}` — one job's status + metadata
 - `GET /v1/threads/{id}/jobs/{job_id}/output?stream=<stdout|stderr>&cursor=
   <bytes>&max_bytes=<1-512KiB>&wait_ms=<0-30s>&format=<base64|text>` — the
@@ -1389,13 +1711,46 @@ also how a client sees model-spawned work.
   resolved.
 
 **Git** (workspace repository operations, APPS-106)
-- `GET /v1/git` — status detail: `git_repo`, `branch`, `head`,
+- `GET /v1/git` — status detail: `git_repo`, `branch`, `head`
+  (abbreviated, for display), `head_oid`, `index_token`, `revision`,
   `ahead`/`behind`, counts, per-file porcelain `files[]`
-  (`{path, index, worktree, staged, status, old_path?}`), `branches`,
-  `remotes`
-- `GET /v1/changes` — the same porcelain `files[]` projection minus repo
-  chrome (branches/remotes): one authority, so the change list can never
-  disagree with the status read
+  (`{path, index, worktree, staged, status, old_path?, rev}`), `branches`,
+  `remotes`. `files[].path` and `old_path` are workspace-relative, the same
+  frame the write routes take; in a workspace that is a subdirectory of its
+  repository, rows outside the workspace are not listed (the counts stay
+  repository-wide). A rename out of the workspace appears as its source
+  deletion. Normal Git filters and untracked settings apply. Untracked
+  directories stay collapsed; only a row naming the workspace itself is
+  expanded to individually addressable files. The precondition tokens are
+  opaque:
+  - `head_oid` — the full HEAD commit id; `null` on an unborn branch or when
+    HEAD cannot be read
+  - `index_token` — the whole index (mode, blob, stage and path of every
+    entry, repository-wide). A stat-only refresh by `git status` does not
+    change it. Status remains best-effort on repository read failures;
+    unavailable tokens are `null`, and broken HEADs cannot satisfy guards
+  - `files[].rev` — one row: its index entries plus the working-tree state
+    of every file it covers (including a rename's in-workspace source).
+    Content tokens (`c-…`) include file bytes, the executable bit on Unix,
+    symlink targets, and submodule HEAD/status. Submodule dirty contents
+    are summarized by porcelain status, not recursively hashed; ordinary
+    stage/discard do not write those contents. A read hashes at most
+    64 MiB / 4,096 files; rows past that budget or containing a file over
+    16 MiB carry a display-only size-and-mtime token (`s-…`). Those tokens
+    cannot guard writes. Unreadable paths, paths beneath symlinked
+    directories, special files and broken nested repositories have `rev: null`;
+    other rows retain their tokens. If a broken tracked submodule aborts
+    porcelain, ordinary rows are recovered without submodule recursion and
+    the unreadable submodule is shown with `status: "unknown"`, `worktree: "?"`
+  - `revision` — the whole tree: `head_oid`, `index_token`, every row's
+    `rev`, including the working-tree state of rows outside a subdirectory
+    workspace. `null` when any row is stat-only or unreadable, a repository
+    read is incomplete, or untracked paths are hidden; whole-tree guarded
+    writes are unavailable in that case. Clients must not silently omit a guard
+- `GET /v1/changes` — the same porcelain `files[]` projection plus
+  `head_oid`, `index_token` and `revision`, minus repo chrome
+  (branches/remotes): one authority, so the change list can never disagree
+  with the status read
 - `GET /v1/diff?path=` — one file's unified `diff` against `base` (`HEAD`,
   or the empty tree on an unborn branch — which reads staged adds as new
   files). Covers staged+unstaged in one patch; `truncated` reports the
@@ -1412,19 +1767,75 @@ also how a client sees model-spawned work.
 - `POST /v1/git/stage` `{ "paths": [...] }` or `{ "all": true }`;
   `POST /v1/git/unstage` same; `POST /v1/git/discard` `{ "paths": [...] }`
   (tracked paths only — no `all`, an untracked path fails closed);
-  `POST /v1/git/commit` `{ "message", "all"? }`; `POST /v1/git/push`
-  `{ "remote"?, "set_upstream"? }`; `POST /v1/git/branch`
+  `POST /v1/git/commit` `{ "message", "all"? }`; stage, unstage, discard
+  and commit also take an optional `expect` (below); `POST /v1/git/push`
+  `{ "remote"?, "set_upstream"? }` (`remote`, or `origin` when only
+  `set_upstream` is given, must name a configured remote);
+  `POST /v1/git/branch`
   `{ "name", "create"? }`
 
-Reads run through the hardened review command (filters, fsmonitor, hooks,
-lazy fetches and replace-objects neutralized); writes run through the
-non-interactive command path (`GIT_TERMINAL_PROMPT=0`, BatchMode ssh) so a
-credential or host-key prompt can never hang a request. Path lists are
-workspace-relative under the same confinement as the file routes (traversal
-→ 400, `.git` → 403), passed after `--` with literal pathspecs. Mutations
-answer `{ok, output, status}` with the refreshed status, so a client
-re-reads nothing after an operation. A workspace that is not a repository
-answers `404`.
+Diffs and precondition token reads run through the hardened review command
+(filters, fsmonitor, hooks, lazy fetches and replace-objects neutralized).
+Porcelain status uses normal Git, matching the workspace counts and filters;
+writes run through the non-interactive command path
+(`GIT_TERMINAL_PROMPT=0`, BatchMode ssh) so a credential or host-key prompt
+can never hang a request. Path lists are workspace-relative under the same
+confinement as the file routes (traversal → 400, `.git` → 403), passed after
+`--` under `--literal-pathspecs`, so `src/*` names a file called `*` and is
+never a glob. (Unstage of the whole tree uses the `:/` root pathspec.)
+Mutations answer `{ok, output, status, current}`: the refreshed status and
+the full `GET /v1/git` detail, so a client re-reads nothing after an
+operation and can chain the next write from fresh tokens. A workspace that
+is not a repository answers `404`.
+
+*Preconditions.* Stage, unstage, discard and commit accept
+`expect: { head?, index?, revision?, files? }`, built from the last
+`GET /v1/git`. Each present field is checked and an absent one is not;
+`head: null` means "HEAD must still be unborn". Without `expect` (or with
+`expect: {}`) a write behaves exactly as before. Recommended use:
+
+| Operation | `expect` |
+| --- | --- |
+| stage / unstage `paths` | `{head, files: {path: rev}}` |
+| stage / unstage `all` | `{head, revision}` |
+| discard (always — it destroys edits) | `{head, files: {path: rev}}` |
+| commit | `{head, index}` |
+| commit `all` | `{head, revision}` |
+
+Malformed preconditions answer `400` before anything runs: `head` must be a
+40- or 64-hex id or `null`; `index` and `revision` 64 hex (an explicit
+`revision: null` is refused); `files` values a content-safe `c-` rev (`s-`
+tokens answer `400`). `files` keys
+(workspace-relative; `dir/` and `dir` are the same key)
+must name exactly the requested paths, so no path is left unguarded by
+accident. `files` is refused with `all: true` (use `revision`) and on
+commit. An unknown key inside `expect` is rejected like any other unknown
+field. When the repository no longer matches, the route writes nothing and
+answers `409`:
+
+```json
+{ "error": { "message": "The repository changed since it was read (HEAD moved; src/a.rs changed). Nothing was written; refresh and review again.",
+             "status": 409, "code": "git_state_changed" },
+  "stale": ["head", "files"], "stale_paths": ["src/a.rs"],
+  "current": { "...": "the GET /v1/git detail" } }
+```
+
+`stale` lists the components that moved (`head`, `index`, `files`,
+`revision`); `stale_paths` the `files` keys whose `rev` changed. A client
+re-renders from `current`, keeps the user's selection, and asks again.
+
+Stage, unstage, discard, commit and branch from one runtime are serialized,
+so a check and its write are atomic with respect to that runtime's other
+windows; a second concurrent write answers `409` with
+`error.code: "git_busy"` rather than queueing behind a long commit hook.
+Push is not serialized: it only moves a remote ref and can wait on the
+network for up to 120 s. The lock does not cover processes outside this
+runtime — a terminal, an editor, or Codewhale's own agent tools — which can
+still change the repository in the moment between the check and git taking
+`index.lock`; a truly concurrent git write then fails on git's own
+`index.lock` (a `400` carrying git's message). A compare-and-swap commit via
+`commit-tree` and `update-ref` would close that window but skip the
+repository's hooks, which a Review-sheet commit must run, so it is not used.
 
 **Diagnostics** (read-only logs, crashes, process — APPS-103)
 - `GET /v1/logs` → `{sources: [{dir, files: [{name, size, modified}]}]}` —
@@ -1514,6 +1925,10 @@ implementation the TUI's `/voice` commands run, headless. Recording is one
 blocking capture per host (requests serialize; the loser gets
 `ok:false`/`no_speech`, not a fought-over device). Provider ASR resolves its
 key lazily so local-whisper and Groq paths work without provider auth.
+Interim and final transcription use the selected ASR backend. If local whisper
+or Groq fails, the error stays on that backend: the runtime never retries the
+recording or composer text with the active model provider. Select provider ASR
+explicitly to use that route.
 Failure is data: `no_recorder`, `no_speech`, `no_provider_auth`,
 `transcription_failed`. `CODEWHALE_DISABLE_VOICE=1` is an operator
 kill-switch — a headless `serve --http` host reports `available: false` and
@@ -1749,10 +2164,12 @@ The runtime uses a durable Thread/Turn/Item lifecycle.
   `latest_response_bookmark`, `archived`
 - **TurnRecord** — `id`, `thread_id`, `status` (`queued|in_progress|completed|
   failed|interrupted|canceled`), `effective_provider`, `effective_model`,
-  `effective_billing_surface`, timestamps, duration, usage, error summary
+  `effective_billing_surface`, timestamps, duration, usage, error summary,
+  `artifacts` and `workspace` (see [Turn artifacts](#turn-artifacts))
 - **TurnItemRecord** — `id`, `turn_id`, `kind` (`user_message|agent_message|
   tool_call|file_change|command_execution|context_compaction|status|error`),
-  lifecycle `status`, `metadata`
+  lifecycle `status`, `metadata`, `artifacts` and the legacy
+  `artifact_refs` projection
 
 Events are append-only with a global monotonic `seq` for replay/resume.
 
@@ -1838,6 +2255,66 @@ Compatibility notes:
   is an equivalent alias for clients that use `created_at` naming elsewhere; do
   not require both fields to be present.
 
+### Ending and resuming a thread stream
+
+Whenever the server ends a `/v1/threads/{id}/events` stream that already
+returned `200`, the last frame is `stream.end`, sent exactly once and always
+(it does not need `progress=true`):
+
+```
+event: stream.end
+data: {"schema_version":1,"event":"stream.end","kind":"stream.end","thread_id":"thr_1234abcd","reason":"replay_failed","last_seq":42,"retryable":true}
+```
+
+- It is a transport frame, not a journal event: it has **no `seq`** and **no
+  SSE `id:`**. Clients that acknowledge on `seq` skip it, and a browser's
+  `Last-Event-ID` stays on the last real event.
+- `last_seq` is the stream's cursor when it ended: the last journal `seq`
+  delivered on this connection, or the effective start cursor if none was
+  (after a `replay_limit` tail, that is already past the omitted history). It
+  is exactly the `since_seq` that resumes with no loss and no repeats.
+- `retryable` says whether resuming from `last_seq` can succeed. Key the client
+  on it, not on the reason list. Treat an unknown `reason` by its `retryable`.
+- There is no free-text message. The underlying error is in the Runtime log,
+  and it can contain store paths.
+
+| `reason` | Meaning | `retryable` |
+| --- | --- | --- |
+| `replay_failed` | The durable history read that feeds the opening replay failed, including a replay worker crash after the first cursor | `true` |
+| `catch_up_failed` | After broadcast lag, the durable re-read from the stream's cursor could not be opened or failed | `true` |
+| `runtime_shutdown` | The Runtime API server is stopping (SIGINT, SIGTERM, or SIGHUP; Ctrl+C or Ctrl+Break on Windows). Open streams get this frame within a bounded drain window before the process exits | `true` |
+
+Every `200` response carries `x-codewhale-stream-end: 1`. With that header, an
+EOF **without** `stream.end` means the connection or the Runtime process died
+without the server choosing to end the stream: a network or proxy drop, a
+crash, or a kill that allows no drain (for example `SIGKILL`). A Runtime that
+predates this frame sends no header; there EOF stays ambiguous, so treat it as
+connection loss.
+
+Client resume rule:
+
+1. Keep `cursor` = the `seq` of the last journal frame you accepted. Ignore
+   frames with `seq <= cursor`. If a frame's `previous_seq` is not your
+   `cursor`, you missed events: reload the thread snapshot rather than trust
+   local state.
+2. On `stream.end` with `retryable: true`, reconnect with
+   `since_seq = last_seq` after a bounded backoff, and tell the user what the
+   Runtime said (for example, "Runtime is shutting down — reconnecting").
+   With `retryable: false`, stop, show the reason, and fall back to the
+   snapshot.
+3. On EOF or a transport error without `stream.end`, reconnect with
+   `since_seq = cursor` after a bounded backoff and show a connection problem,
+   not a Runtime error.
+4. A `401`/`403` or `404` before the stream opens is terminal (a credential or
+   thread problem). Retry `5xx` with backoff.
+5. Never reconnect from `0` to "start over": replay is idempotent only by
+   cursor.
+
+Fleet streams (`/v1/fleet/runs/{run_id}/events`) keep their own end frames,
+`fleet.stream.error {retryable}` and `fleet.replay.cursor_unavailable`. They
+differ from `stream.end`: they carry no cursor, because a Fleet client resumes
+from the opaque `cursor` of the last Fleet event it accepted.
+
 ### Steer delivery
 
 Putting a steer into the engine's mailbox is not the same as the model reading
@@ -1864,12 +2341,12 @@ case: read the item's status, or wait for the event.
 
 Common event names: `thread.started`, `thread.forked`, `turn.started`,
 `turn.lifecycle`, `turn.steered`, `turn.steer_dropped`, `turn.interrupt_requested`,
-`turn.completed`, `item.started`, `item.delta`, `item.completed`,
+`turn.completed`, `turn.artifacts`, `item.started`, `item.delta`, `item.completed`,
 `item.failed`, `item.interrupted`, `approval.required`, `approval.decided`,
 `approval.timeout`, `user_input.required`, `user_input.answered`,
 `user_input.canceled`, `tool_call.requested`, `tool_call.resolved`,
 `tool_call.timeout`, `tool_call.canceled`, `sandbox.denied`,
-`runtime.store_failure`.
+`turn.workspace_snapshot`, `runtime.store_failure`.
 
 `runtime.store_failure` is the runtime reporting a fault in the operator's own
 on-disk state: a thread, turn, or item record under the session's runtime
@@ -2093,6 +2570,7 @@ its result rather than dropped. It answers with the worker record:
 | Get session | `GET /v1/sessions/{id}` |
 | Rename / archive session | `PATCH /v1/sessions/{id}` |
 | Delete session | `DELETE /v1/sessions/{id}` |
+| Session store repair summary | `GET /v1/sessions/repair` |
 | Resume into thread | `POST /v1/sessions/{id}/resume-thread` |
 | Create thread | `POST /v1/threads` |
 | List threads | `GET /v1/threads` |

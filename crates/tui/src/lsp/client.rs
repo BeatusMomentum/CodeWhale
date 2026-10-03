@@ -195,6 +195,10 @@ impl StdioLspTransport {
     ) -> Result<Self> {
         let mut cmd = Command::new(command);
         cmd.args(args);
+        // Language servers execute workspace code (rust-analyzer runs build
+        // scripts and proc-macros, tsserver loads tsconfig plugins), so they
+        // start from the sanitized child environment like `exec_shell`.
+        crate::child_env::apply_to_tokio_command(&mut cmd, std::iter::empty::<(&str, &str)>());
         cmd.stdin(Stdio::piped());
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
@@ -1116,6 +1120,37 @@ while True:
         assert!(error.to_string().contains("channel closed"), "{error:#}");
         assert!(transport.pending.lock().await.is_empty());
         assert_fixture_exited(root.path()).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn language_server_does_not_inherit_parent_secret_env() {
+        use crate::test_support::{EnvVarGuard, lock_test_env};
+        let _env_lock = lock_test_env();
+        let _secret = EnvVarGuard::set("CODEWHALE_TEST_LSP_SECRET", "lsp-secret-value");
+        let root = tempfile::tempdir().unwrap();
+        let report = root.path().join("env");
+        // A fake server that records what it can see and exits before
+        // answering `initialize`.
+        let script = format!(
+            "printf 'secret=%s\\n' \"${{CODEWHALE_TEST_LSP_SECRET-unset}}\" > '{}'; \
+             [ -n \"$PATH\" ] && printf 'path-ok\\n' >> '{}'",
+            report.display(),
+            report.display()
+        );
+        let result = StdioLspTransport::spawn_with_timeout(
+            "/bin/sh",
+            &["-c".into(), script],
+            "rust",
+            root.path().to_path_buf(),
+            Duration::from_secs(3),
+        )
+        .await;
+        assert!(result.is_err(), "fake server exits without initializing");
+        let seen = std::fs::read_to_string(&report).expect("fake server ran");
+        assert!(seen.contains("secret=unset"), "{seen}");
+        assert!(!seen.contains("lsp-secret-value"), "{seen}");
+        assert!(seen.contains("path-ok"), "{seen}");
     }
 
     #[tokio::test]

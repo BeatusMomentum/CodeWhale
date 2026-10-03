@@ -27,7 +27,8 @@
 //!   | Tool           | Grouping key                             |
 //!   |---------------|------------------------------------------|
 //!   | `apply_patch`  | `patch:<hash of file paths>`             |
-//!   | shell tools    | `shell:<command prefix>`                 |
+//!   | shell tools    | `shell:<command family>` for a simple, known command; `shell:cmd:<full normalized command>` otherwise |
+//!   | shell interact / wait | `shell:<tool_name>:<hash of args>` |
 //!   | `fetch_url`    | `net:<hostname>`                         |
 //!   | Computer Use consent / `app_script` | `cu:<tool_name>:<hash of input>` |
 //!   | other MCP tools| `mcp:<tool_name>` (the reviewed kind)    |
@@ -48,15 +49,15 @@
 //! Known limits of this stopgap: the calls are matched by MCP tool-name suffix
 //! (`_consent`, `_consent_allow`, `_consent_revoke`, `_app_script`), so a
 //! different MCP server exposing a tool with one of those names is gated the
-//! same way (fail closed). The consent decision still travels through a model
-//! tool call; MCP elicitation, where the plugin asks the host for the user's
-//! answer directly, is the real fix and is not built.
+//! same way (fail closed). Consent, script and computer registration/spawn
+//! calls force an exact human card. Only its human decision can be attested
+//! to the reviewed built-in plugin; grants and autonomous modes cannot mint it.
 use std::fmt::Write as _;
 
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use codewhale_execpolicy::command_safety::classify_command;
+use codewhale_execpolicy::command_safety::{canonical_prefix_is_leading, classify_command};
 
 /// The fingerprint of a tool call — stable enough to match repeated
 /// calls but specific enough to avoid privilege confusion.
@@ -106,14 +107,12 @@ pub fn build_approval_grouping_key(tool_name: &str, input: &serde_json::Value) -
             let paths_hash = hash_patch_paths(input);
             format!("patch:{paths_hash}")
         }
-        "exec_shell"
-        | "task_shell_start"
-        | "exec_shell_wait"
-        | "exec_shell_interact"
-        | "exec_wait"
-        | "exec_interact" => {
-            let prefix = command_prefix(input);
-            format!("shell:{prefix}")
+        "exec_shell" | "task_shell_start" => shell_command_grant_scope(input),
+        // Interact and wait calls carry no command, only input for a live
+        // session. Keying them on the (empty) command prefix gave every one
+        // of them the same grant; a grant covers the exact call only.
+        "exec_shell_wait" | "exec_shell_interact" | "exec_wait" | "exec_interact" => {
+            format!("shell:{tool_name}:{}", hash_json_value(input))
         }
         "fetch_url" | "web.fetch" | "web_fetch" => {
             let host = parse_host(input);
@@ -142,6 +141,34 @@ pub fn build_approval_grouping_key(tool_name: &str, input: &serde_json::Value) -
         _ => format!("tool:{tool_name}:{}", hash_json_value(input)),
     };
     ApprovalKey(fingerprint)
+}
+
+/// Exact and grouping keys for one call, as the engine puts them on an
+/// approval request. A tool with an [`approval_scope`] (extension tools) is
+/// keyed `<scope>:<tool_name>:<hash of input>` for both, so its grants are
+/// bound to the reviewed plugin build and never widened to a family; every
+/// other tool keeps [`build_approval_key`] / [`build_approval_grouping_key`].
+///
+/// [`approval_scope`]: crate::tools::spec::ToolSpec::approval_scope
+#[must_use]
+pub fn approval_keys_for_call(
+    registry: Option<&crate::tools::ToolRegistry>,
+    tool_name: &str,
+    input: &serde_json::Value,
+) -> (ApprovalKey, ApprovalKey) {
+    let scope = registry
+        .and_then(|registry| registry.get(tool_name))
+        .and_then(|tool| tool.approval_scope());
+    match scope {
+        Some(scope) => {
+            let key = ApprovalKey(format!("{scope}:{tool_name}:{}", hash_json_value(input)));
+            (key.clone(), key)
+        }
+        None => (
+            build_approval_key(tool_name, input),
+            build_approval_grouping_key(tool_name, input),
+        ),
+    }
 }
 
 /// The sorted `web.run` action kinds present in `input`, e.g. `open+search_query`.
@@ -225,6 +252,14 @@ pub(crate) enum ComputerUseUserGate {
         /// not shown by `first_line`.
         line_count: usize,
     },
+    /// Registering or spawning a computer the plugin will then drive (and,
+    /// for ssh, push an agent to).
+    Computer {
+        action: &'static str,
+        transport: Option<String>,
+        /// `user@host:port` for ssh, the target or image otherwise.
+        destination: Option<String>,
+    },
 }
 
 /// Classify an MCP tool call as a Computer Use call that needs a human
@@ -245,6 +280,41 @@ pub(crate) fn computer_use_user_gate(
             .filter(|value| !value.is_empty())
             .map(str::to_string)
     };
+    let computer_action = if tool_name.ends_with("_computer_register") {
+        Some("register")
+    } else if tool_name.ends_with("_computer_spawn") {
+        Some("spawn")
+    } else if tool_name.ends_with("_computer") {
+        match input.get("action").and_then(Value::as_str) {
+            Some("register") => Some("register"),
+            Some("spawn") => Some("spawn"),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    if let Some(action) = computer_action {
+        let host = text("host");
+        let destination = match host {
+            Some(host) => {
+                let user = text("user")
+                    .map(|user| format!("{user}@"))
+                    .unwrap_or_default();
+                let port = input
+                    .get("port")
+                    .and_then(Value::as_u64)
+                    .map(|port| format!(":{port}"))
+                    .unwrap_or_default();
+                Some(format!("{user}{host}{port}"))
+            }
+            None => text("target").or_else(|| text("image")),
+        };
+        return Some(ComputerUseUserGate::Computer {
+            action,
+            transport: text("transport"),
+            destination,
+        });
+    }
     let action = if tool_name.ends_with("_consent_allow") {
         "allow"
     } else if tool_name.ends_with("_consent_revoke") {
@@ -327,18 +397,251 @@ pub(crate) fn computer_use_batch_hidden_gate(tool_name: &str, input: &Value) -> 
         })
 }
 
-/// Return the canonical command prefix for the shell command in `input`.
+/// The session-grant scope for a shell command.
 ///
-/// Uses [`classify_command`] from the arity dictionary so that approving
-/// `git status` also covers `git status -s` / `git status --porcelain`
-/// without also covering `git push`.
-fn command_prefix(input: &serde_json::Value) -> String {
+/// A simple command whose family is in the arity dictionary keeps the
+/// family grant, so approving `git status` also covers `git status -s`
+/// without covering `git push`. Everything else fails closed to the full
+/// normalized command:
+///
+/// * compound commands (`;`, `&&`, `|`, redirects, substitutions, `$VAR`):
+///   a grant for `cd` must not extend to whatever is chained after it;
+/// * wrappers and interpreters (`bash -c`, `env`, `sudo`, `xargs`,
+///   `python -c`, `docker run`, …): the first word says nothing about what
+///   runs;
+/// * commands the dictionary does not know, which used to collapse to their
+///   first word, so one approval covered every use of that program.
+fn shell_command_grant_scope(input: &serde_json::Value) -> String {
     let cmd = input.get("command").and_then(|v| v.as_str()).unwrap_or("");
     let tokens: Vec<&str> = cmd.split_whitespace().collect();
     if tokens.is_empty() {
-        return "<empty>".to_string();
+        return "shell:<empty>".to_string();
     }
-    classify_command(&tokens)
+    if !shell_command_is_compound(cmd)
+        && !shell_command_is_wrapper(&tokens)
+        && !shell_command_has_code_option(&tokens)
+    {
+        let family = classify_command(&tokens);
+        // Options wedged before a subcommand (`git -c k=v status`), a chain,
+        // or code that runs nested or resolves only at run time also keep
+        // the grant to this exact command (#6675).
+        let expansion = codewhale_execpolicy::shell_expand::expand_command(cmd);
+        if command_family_is_known(&family)
+            && !family_arguments_are_config(&family)
+            && !family_arguments_are_code(&family)
+            && !expansion.dynamic
+            && !expansion.nested
+            && expansion.commands.len() == 1
+            && canonical_prefix_is_leading(&tokens, &family)
+        {
+            return format!("shell:{family}");
+        }
+    }
+    format!("shell:cmd:{}", normalize_shell_command(cmd))
+}
+
+/// Whether any option could change what a known command runs, reads or
+/// writes. The family ignores flags, so a family grant is kept only when
+/// every option is on [`INERT_OPTIONS`]; anything else keys the grant on the
+/// full command.
+///
+/// An allow-list, not a deny-list: options take values in too many spellings
+/// (`-C../x`, `-f/tmp/x`, `--output out.patch`, `-x "cmd"`, `-exec ./x`,
+/// `-O<cmd>`) for a list of dangerous ones to be complete.
+fn shell_command_has_code_option(tokens: &[&str]) -> bool {
+    tokens.iter().skip(1).any(|token| {
+        token.contains('=') || (token.starts_with('-') && !INERT_OPTIONS.contains(token))
+    })
+}
+
+/// Value-free options that only change how much a command prints or which of
+/// its own outputs it builds, never what it runs or where it writes.
+const INERT_OPTIONS: &[&str] = &[
+    "-h",
+    "--help",
+    "-V",
+    "--version",
+    "-v",
+    "-vv",
+    "--verbose",
+    "-q",
+    "--quiet",
+    "-s",
+    "--short",
+    "--porcelain",
+    "--oneline",
+    "--stat",
+    "--name-only",
+    "--name-status",
+    "--cached",
+    "--staged",
+    "--no-color",
+    "--release",
+    "-p",
+    "--package",
+    "--workspace",
+    "--all-targets",
+    "--all-features",
+    "--lib",
+    "--bins",
+    "--tests",
+    "--locked",
+    "--frozen",
+    "--offline",
+    "--no-fail-fast",
+    "--dry-run",
+];
+
+/// Families whose positional arguments beyond the family are themselves what
+/// runs or gets installed (`go run <file>`, `git bisect run <cmd>`,
+/// `make <target>`, `npm install <pkg>`), so one grant would cover any of
+/// them.
+fn family_arguments_are_code(family: &str) -> bool {
+    const FAMILIES: &[&str] = &[
+        "make",
+        "go run",
+        "go install",
+        "go get",
+        "go generate",
+        "deno run",
+        "bun run",
+        "cargo run",
+        "cargo install",
+        "cargo add",
+        "git bisect",
+        "git submodule",
+        "npm install",
+        "yarn add",
+        "pnpm add",
+        "bun add",
+        "pip install",
+        "pip3 install",
+        "docker compose run",
+        "docker compose exec",
+        "docker container run",
+        "docker container exec",
+    ];
+    FAMILIES.contains(&family)
+}
+
+/// Families whose arguments are settings, so one grant would cover every
+/// setting (`git config user.name x` covering `git config core.fsmonitor`).
+fn family_arguments_are_config(family: &str) -> bool {
+    matches!(family.split(' ').nth(1), Some("config" | "set" | "remote"))
+}
+
+/// Whether the dictionary recognised `family`, rather than falling back to
+/// the bare first word.
+fn command_family_is_known(family: &str) -> bool {
+    use codewhale_execpolicy::command_safety::COMMAND_ARITY;
+    COMMAND_ARITY
+        .iter()
+        .any(|(key, _)| family == *key || family.starts_with(&format!("{key} ")))
+}
+
+/// Any shell syntax that chains, redirects, substitutes, or expands.
+fn shell_command_is_compound(cmd: &str) -> bool {
+    cmd.contains(|c: char| {
+        matches!(
+            c,
+            ';' | '&' | '|' | '<' | '>' | '`' | '$' | '(' | ')' | '{' | '}' | '\n' | '\r'
+        )
+    })
+}
+
+/// Commands whose first word runs something else the grant cannot see.
+fn shell_command_is_wrapper(tokens: &[&str]) -> bool {
+    const WRAPPERS: &[&str] = &[
+        "bash",
+        "sh",
+        "zsh",
+        "dash",
+        "ksh",
+        "fish",
+        "csh",
+        "tcsh",
+        "env",
+        "sudo",
+        "doas",
+        "su",
+        "xargs",
+        "nohup",
+        "time",
+        "timeout",
+        "nice",
+        "ionice",
+        "exec",
+        "eval",
+        "command",
+        "builtin",
+        "stdbuf",
+        "script",
+        "watch",
+        "parallel",
+        "chroot",
+        "nsenter",
+        "unshare",
+        "setsid",
+        "caffeinate",
+        "strace",
+        "ltrace",
+        "gdb",
+        "lldb",
+        "osascript",
+        "pwsh",
+        "powershell",
+        "cmd",
+        "npx",
+        "pnpx",
+        "bunx",
+        "uvx",
+        "node",
+        "perl",
+        "ruby",
+        "php",
+        "python",
+        "python2",
+        "python3",
+        "find",
+        "ssh",
+    ];
+    const RUNNERS: &[&str] = &[
+        "docker run",
+        "docker exec",
+        "kubectl exec",
+        "npm exec",
+        "pnpm exec",
+        "pnpm dlx",
+        "yarn dlx",
+        "uv run",
+        "poetry run",
+    ];
+    let first = tokens[0];
+    // `FOO=1 cmd`: an environment assignment can change what `cmd` does.
+    if first.contains('=') {
+        return true;
+    }
+    let program = first.rsplit('/').next().unwrap_or(first);
+    if WRAPPERS.contains(&program) {
+        return true;
+    }
+    let lead = tokens
+        .iter()
+        .take(2)
+        .map(|token| token.rsplit('/').next().unwrap_or(token))
+        .collect::<Vec<_>>()
+        .join(" ");
+    RUNNERS.contains(&lead.as_str())
+}
+
+/// Collapse insignificant whitespace. Quoted text keeps its exact spacing:
+/// `echo "a  b"` and `echo "a b"` are different commands.
+fn normalize_shell_command(cmd: &str) -> String {
+    if cmd.contains(['"', '\'', '\\']) {
+        cmd.trim().to_string()
+    } else {
+        cmd.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
 }
 
 /// Hash the sorted set of file paths referenced by a patch input.
@@ -542,6 +845,133 @@ mod tests {
     }
 
     #[test]
+    fn shell_grants_fail_closed_on_compound_wrapper_and_unknown_commands() {
+        let key = |cmd: &str| build_approval_grouping_key("exec_shell", &json!({"command": cmd}));
+        // Compound: a grant for `cd` never covers what is chained after it.
+        assert_ne!(key("cd src"), key("cd src && make clean"));
+        assert_ne!(key("cargo build"), key("cargo build; make install"));
+        assert_ne!(key("cargo build"), key("cargo build > out.log"));
+        assert_ne!(key("git status"), key("git status $(pwd)"));
+        // Wrappers and interpreters are keyed by the whole command.
+        assert_ne!(key("bash build.sh"), key("bash -c 'make clean'"));
+        assert_ne!(key("python3 script.py"), key("python3 -c 'import os'"));
+        assert_ne!(key("env FOO=1 make"), key("env FOO=1 make clean"));
+        assert_ne!(key("FOO=1 make"), key("FOO=1 make install"));
+        assert_ne!(
+            key("docker run alpine ls"),
+            key("docker run alpine touch x")
+        );
+        assert_ne!(key("/usr/bin/sudo ls"), key("/usr/bin/sudo make install"));
+        // Unknown commands no longer collapse to their first word.
+        assert_ne!(key("rm tmp/x"), key("rm -r build"));
+        assert_ne!(key("cat README.md"), key("cat notes/other.txt"));
+        // The full-command key still matches an exact repeat, modulo
+        // insignificant whitespace, but not a quoted-spacing change.
+        assert_eq!(key("cd src && make"), key("  cd src   &&  make "));
+        assert_ne!(key("echo \"a  b\""), key("echo \"a b\""));
+        assert!(key("rm -r build").0.starts_with("shell:cmd:"));
+        // Options and config arguments that can run code key the full
+        // command, though the family ignores flags.
+        assert_ne!(key("git status"), key("git -ccore.fsmonitor=./hook status"));
+        assert_ne!(key("git status"), key("git -C ../other status"));
+        assert_ne!(
+            key("cargo build"),
+            key("cargo build --config build.rustc-wrapper=./x")
+        );
+        assert_ne!(key("git diff"), key("git diff --output=out.patch"));
+        assert_ne!(key("make"), key("make -f /tmp/x"));
+        assert_ne!(
+            key("git config user.name x"),
+            key("git config core.fsmonitor ./x.sh")
+        );
+        // A known, simple command keeps its family grant.
+        assert_eq!(key("git status"), key("git status --porcelain"));
+        assert_ne!(key("git status"), key("git push"));
+    }
+
+    #[test]
+    fn shell_family_grants_survive_only_inert_options() {
+        let key = |cmd: &str| build_approval_grouping_key("exec_shell", &json!({"command": cmd}));
+        // Options with an attached or separate value, and single-dash long
+        // options, key the full command.
+        for (granted, other) in [
+            ("git status", "git -C../other status"),
+            ("make", "make -f/tmp/x"),
+            ("git diff", "git diff --output out.patch"),
+            ("git rebase HEAD~1", "git rebase -x \"touch x\" HEAD~1"),
+            ("go test ./...", "go test -exec ./x ./..."),
+            ("go build ./...", "go build -toolexec ./x ./..."),
+            ("git clone ./repo", "git clone -u \"cmd\" ./repo"),
+            ("git grep pat", "git grep -Ocmd pat"),
+            ("git log", "git log --git-dir x"),
+            ("cargo test", "cargo test -- --nocapture"),
+        ] {
+            assert_ne!(key(granted), key(other), "{other}");
+            assert!(key(other).0.starts_with("shell:cmd:"), "{other}");
+        }
+        // Every option once listed as able to run code still keys the full
+        // command.
+        for option in [
+            "-c",
+            "-C",
+            "--config",
+            "--exec",
+            "--exec-path",
+            "--script-shell",
+            "-f",
+            "--file",
+            "--makefile",
+            "-e",
+            "--eval",
+            "--require",
+            "--upload-pack",
+            "--receive-pack",
+            "--manifest-path",
+        ] {
+            assert!(!INERT_OPTIONS.contains(&option), "{option}");
+        }
+        // Families whose arguments are the code that runs or is installed
+        // key the full command.
+        for (granted, other) in [
+            ("go run ./cmd/tool", "go run /tmp/other.go"),
+            ("deno run main.ts", "deno run https://host/x.ts"),
+            ("cargo run", "cargo run --bin other"),
+            ("git bisect start", "git bisect run ./x"),
+            ("git submodule update", "git submodule foreach ./x"),
+            ("make build", "make clean"),
+            ("npm install", "npm install left-pad"),
+            ("pip install requests", "pip install other"),
+            ("cargo install ripgrep", "cargo install other"),
+        ] {
+            assert_ne!(key(granted), key(other), "{other}");
+        }
+        // Inert options keep the family grant.
+        assert_eq!(key("cargo build"), key("cargo build --release --locked"));
+        assert_eq!(key("git status"), key("git status -s"));
+        assert_eq!(key("git diff"), key("git diff --stat --cached"));
+    }
+
+    #[test]
+    fn shell_interact_grants_are_per_exact_call() {
+        for tool in [
+            "exec_shell_interact",
+            "exec_interact",
+            "exec_shell_wait",
+            "exec_wait",
+        ] {
+            let a = build_approval_grouping_key(tool, &json!({"task_id": "t1", "input": "y\n"}));
+            let b = build_approval_grouping_key(tool, &json!({"task_id": "t1", "input": "n\n"}));
+            let c = build_approval_grouping_key(tool, &json!({"task_id": "t2", "input": "y\n"}));
+            assert_ne!(a, b, "{tool}: different input must not share a grant");
+            assert_ne!(a, c, "{tool}: a different session must not share a grant");
+            assert_eq!(
+                a,
+                build_approval_grouping_key(tool, &json!({"task_id": "t1", "input": "y\n"}))
+            );
+        }
+    }
+
+    #[test]
     fn grouping_key_grants_mcp_tools_as_reviewed_kinds() {
         // A session grant for a reviewed plugin MCP tool is the kind
         // (`mcp:<tool>`), not the exact arguments: the plugin e2e acceptance
@@ -659,6 +1089,25 @@ mod tests {
         let key_a = build_approval_grouping_key("exec_shell", &json!({"command": "git status"}));
         let key_b = build_approval_grouping_key("exec_shell", &json!({"command": "git push"}));
         assert_ne!(key_a, key_b);
+    }
+
+    #[test]
+    fn grouping_key_does_not_cover_interposed_options_chains_or_nested_code() {
+        let key =
+            |command: &str| build_approval_grouping_key("exec_shell", &json!({"command": command}));
+        let granted = key("git status");
+        assert_eq!(granted, key("git status -s"));
+        for command in [
+            "git --git-dir=/tmp/e/.git status",
+            "git --exec-path=/x status",
+            "git status $(touch p)",
+            "git status && rm x",
+        ] {
+            assert_ne!(granted, key(command), "{command}");
+        }
+        // Such a command still matches an identical repeat, and only that.
+        assert_eq!(key("git status && ls"), key("git status && ls"));
+        assert_ne!(key("git status && ls"), key("git status && pwd"));
     }
 
     /// #6247. The `path` override is the documented way to patch without
@@ -898,6 +1347,67 @@ mod tests {
             build_approval_key("web.run", &search("espresso")),
             build_approval_key("web.run", &search("grinders")),
             "denials stay exact-call scoped"
+        );
+    }
+    #[test]
+    fn computer_register_and_spawn_need_a_human_card() {
+        for (tool, input) in [
+            (
+                "mcp_codewhale-cu_computer_register",
+                json!({"computer": "box", "transport": "ssh", "host": "box.example", "user": "me", "port": 2222}),
+            ),
+            (
+                "mcp_codewhale-cu_computer",
+                json!({"action": "register", "id": "box", "transport": "ssh", "host": "box.example"}),
+            ),
+            (
+                "mcp_codewhale-cu_computer_spawn",
+                json!({"image": "desktop"}),
+            ),
+            (
+                "mcp_codewhale-cu_computer",
+                json!({"action": "spawn", "id": "d"}),
+            ),
+        ] {
+            assert!(
+                matches!(
+                    computer_use_user_gate(tool, &input),
+                    Some(ComputerUseUserGate::Computer { .. })
+                ),
+                "{tool} {input}"
+            );
+        }
+        assert_eq!(
+            computer_use_user_gate(
+                "mcp_codewhale-cu_computer_register",
+                &json!({"transport": "ssh", "host": "box.example", "user": "me", "port": 2222}),
+            ),
+            Some(ComputerUseUserGate::Computer {
+                action: "register",
+                transport: Some("ssh".to_string()),
+                destination: Some("me@box.example:2222".to_string()),
+            })
+        );
+        for (tool, input) in [
+            ("mcp_codewhale-cu_computer", json!({"action": "list"})),
+            (
+                "mcp_codewhale-cu_computer",
+                json!({"action": "switch", "id": "box"}),
+            ),
+            (
+                "mcp_codewhale-cu_computer_switch",
+                json!({"computer": "box"}),
+            ),
+        ] {
+            assert_eq!(computer_use_user_gate(tool, &input), None, "{tool}");
+        }
+        assert_eq!(
+            computer_use_batch_hidden_gate(
+                "mcp_codewhale-cu_run_actions",
+                &json!({"steps": [{"tool": "codewhale-cu_computer_register", "arguments": {"host": "x"}}]}),
+            )
+            .as_deref(),
+            Some("codewhale-cu_computer_register")
         );
     }
 }

@@ -62,7 +62,7 @@ use crate::config::{
 };
 use crate::core::engine::{EngineConfig, EngineHandle, spawn_engine};
 use crate::core::events::Event as EngineEvent;
-use crate::core::ops::{Op, ProviderRuntimeStatus, USER_SHELL_TOOL_ID_PREFIX, UserInputProvenance};
+use crate::core::ops::{Op, ProviderRuntimeStatus, UserInputProvenance};
 use crate::hooks::{HookEvent, HookExecutor, TurnEndPayloadInput, TurnEndTotals};
 use crate::llm_client::LlmClient;
 use crate::prompts;
@@ -262,7 +262,7 @@ const REQUIRED_RELEASE_ASSETS: &[&str] = &[
 
 type AppTerminal = Terminal<ColorCompatBackend<Stdout>>;
 
-type PendingToolUses = Vec<(String, String, serde_json::Value)>;
+type PendingToolUses = Vec<ContentBlock>;
 
 #[derive(Debug)]
 enum TranslationEvent {
@@ -606,7 +606,9 @@ fn deliver_constitution_draft_result(
                 let preview = boxed
                     .as_any_mut()
                     .downcast_mut::<crate::tui::setup::SetupWizardView>()
-                    .map(|wizard| wizard.install_model_draft(constitution, model_label.clone()));
+                    .and_then(|wizard| {
+                        wizard.install_model_draft(constitution, model_label.clone())
+                    });
                 app.view_stack.push_boxed(boxed);
                 if let Some((title, content)) = preview {
                     open_text_pager(app, title, content);
@@ -653,7 +655,7 @@ fn deliver_fleet_draft_result(
                 let installed = boxed
                     .as_any_mut()
                     .downcast_mut::<crate::tui::views::fleet_setup::FleetSetupView>()
-                    .map(|wizard| {
+                    .and_then(|wizard| {
                         wizard.install_model_draft(
                             draft,
                             model_label.clone(),
@@ -738,47 +740,13 @@ fn active_turn_has_running_tool(app: &App) -> bool {
 // Per-turn notification composition (settings, message body, summary)
 // moved to `tui/notifications.rs` alongside the dispatch primitives.
 
-async fn tool_result_content_for_api_message(
-    app: &App,
-    id: &str,
-    name: &str,
-    output: &ToolResult,
-) -> String {
-    let raw = output.content.trim();
-    if raw.is_empty() {
-        return String::new();
-    }
-
-    if matches!(
-        name,
-        "run_tests" | "run_verifiers" | "task_gate_run" | "tasks"
-    ) {
-        return crate::core::engine::compact_tool_result_for_route(
-            app.api_provider,
-            &app.model,
-            app.active_route_limits,
-            name,
-            output,
-        );
-    }
-
-    if raw.chars().count() > crate::tool_output_receipts::RAW_TOOL_OUTPUT_RECEIPT_THRESHOLD_CHARS {
-        let messages = live_tool_receipt_messages(app, id, raw, output.success);
-        let artifacts = app.session_artifacts.clone();
-        let raw = raw.to_string();
-        match tokio::task::spawn_blocking(move || {
-            compact_live_tool_receipt(messages, artifacts, raw)
-        })
-        .await
-        {
-            Ok(Some(receipt)) => return receipt,
-            Ok(None) => {}
-            Err(err) => {
-                crate::logging::warn(format!("live tool-output receipt compaction failed: {err}"));
-            }
-        }
-    }
-
+/// The TUI's copy of a tool result for its API-message mirror. It is the same
+/// view the engine gives the model (#6508): whole within the route's inline
+/// budget, otherwise cut around a footer that names the saved full output.
+/// A separate receipt here used to replace anything over 12,000 characters
+/// with a 240-character preview, and that copy is what `SyncSession` sends
+/// back to the engine.
+fn tool_result_content_for_api_message(app: &App, name: &str, output: &ToolResult) -> String {
     crate::core::engine::compact_tool_result_for_route(
         app.api_provider,
         &app.model,
@@ -801,10 +769,6 @@ pub(crate) struct UserDispatchOutcome {
     effective_provider_label: String,
     effective_reasoning_effort: EffectiveReasoningEffort,
     auto_selection: Option<crate::model_routing::AutoRouteSelection>,
-}
-
-fn is_model_visible_tool_call(id: &str) -> bool {
-    !id.starts_with(USER_SHELL_TOOL_ID_PREFIX)
 }
 
 /// Tell the operator that an explicit "make this my default" request did not
@@ -1010,6 +974,15 @@ async fn execute_command_input(
     }
 
     let result = commands::execute(input, app);
+    // The NOTES view reads the notes file off the render path on the
+    // workspace-context tick; a `/note` change refreshes it at once (#6565).
+    if input
+        .split_whitespace()
+        .next()
+        .is_some_and(|command| command.eq_ignore_ascii_case("/note"))
+    {
+        workspace_context::refresh_now(app, Instant::now());
+    }
     // After /logout: clear the in-memory api_key fields so the next
     // onboarding round entering a new key doesn't see the stale value
     // (#343). The on-disk side is handled by clear_api_key() inside
@@ -1262,7 +1235,7 @@ pub(crate) fn prefill_jobs_cancel_all_if_tasks_sidebar(app: &mut App) -> bool {
         || !app
             .task_panel
             .iter()
-            .any(|task| task.id.starts_with("shell_") && task.status == "running")
+            .any(crate::tui::background_indicator::is_live_shell_entry)
     {
         return false;
     }
@@ -1298,20 +1271,80 @@ pub(crate) fn clamp_event_poll_timeout(timeout: Duration) -> Duration {
     timeout.max(MIN_EVENT_POLL_TIMEOUT)
 }
 
-/// Decide whether an `AgentComplete` event should fire a subagent-completion
-/// desktop notification, per the `[notifications].subagent_completion` mode.
+/// Announce the background work that finished since the last notice, when
+/// the `[notifications].subagent_completion` mode says it is time (#6565).
+///
+/// Finite work still live (running agents that are not suspect ghosts, a
+/// running workflow, queued or running durable tasks that are not stale)
+/// holds a `final-only`
+/// batch; a running background shell never does. `parent_idle` forces the
+/// parent-turn half of the rule open, for the moment a turn completes.
 /// `settings()` still has the final say (method=off / condition=never).
-fn should_notify_subagent_completion(
-    mode: crate::config::SubagentCompletionNotification,
-    has_other_running_subagents: bool,
-    workflow_tool_running: bool,
-) -> bool {
-    use crate::config::SubagentCompletionNotification as Mode;
-    match mode {
-        Mode::Off => false,
-        Mode::Always => true,
-        Mode::FinalOnly => !has_other_running_subagents && !workflow_tool_running,
+pub(crate) fn flush_background_finished(app: &mut App, config: &Config, parent_idle: bool) {
+    use crate::tui::background_finished::{background_finished_payload, ready_to_flush};
+    if app.background_finished.is_empty() {
+        return;
     }
+    let mode = config.notifications_config().subagent_completion;
+    let finite_work_live = session_state::live_running_agent_count(app, Instant::now()) > 0
+        || frame::workflow_tool_is_running(app)
+        || app.task_panel.iter().any(|entry| {
+            // A stale entry (a recovered task whose ownership is unverified)
+            // is not known to be running and could hold the batch forever,
+            // the same reason suspect ghost agents are left out.
+            !entry.stale
+                && entry.kind != TaskPanelEntryKind::Shell
+                && matches!(entry.status.as_str(), "queued" | "running")
+        });
+    let parent_busy = app.is_loading && !parent_idle;
+    if !ready_to_flush(
+        mode,
+        &app.background_finished,
+        finite_work_live,
+        parent_busy,
+    ) {
+        return;
+    }
+    let batch = std::mem::take(&mut app.background_finished);
+    if mode == crate::config::SubagentCompletionNotification::Off {
+        return;
+    }
+    let Some((method, threshold, include_summary)) = notifications::settings(config) else {
+        return;
+    };
+    let in_tmux = std::env::var("TMUX").is_ok_and(|v| !v.is_empty());
+    let notices: Vec<&[crate::tui::background_finished::FinishedWork]> =
+        if mode == crate::config::SubagentCompletionNotification::Always {
+            batch.chunks(1).collect()
+        } else {
+            vec![batch.as_slice()]
+        };
+    for items in notices {
+        let elapsed = items
+            .iter()
+            .map(|item| item.elapsed)
+            .max()
+            .unwrap_or_default();
+        if let Some(payload) = background_finished_payload(app.ui_locale, items, include_summary) {
+            notifications::notify_done(method, in_tmux, &payload, threshold, elapsed);
+        }
+    }
+}
+
+/// Settle the background-finished batch when the parent turn ends (#6565).
+///
+/// A completed turn sends its own notice, which covers the shells and tasks
+/// that finished while it ran, so those are dropped rather than announced a
+/// second time. Whatever else was held for the turn is then flushed.
+pub(crate) fn settle_background_finished_at_turn_end(
+    app: &mut App,
+    config: &Config,
+    turn_completed: bool,
+) {
+    if turn_completed {
+        crate::tui::background_finished::drop_reported_by_turn(&mut app.background_finished);
+    }
+    flush_background_finished(app, config, true);
 }
 
 // Keyboard-shortcut predicates moved to `tui/key_shortcuts.rs`.
@@ -2258,7 +2291,7 @@ model = "model-b"
     }
 
     #[test]
-    fn legacy_literal_custom_identity_persistence_stays_root_shaped() {
+    fn legacy_literal_custom_identity_persistence_moves_into_the_custom_table() {
         let config_env = ConfigPathEnvGuard::new();
         std::fs::write(
             config_env.config_path(),
@@ -2270,10 +2303,10 @@ default_text_model = "legacy-model"
         .expect("seed legacy root route");
         let config = Config {
             provider: Some("custom".to_string()),
-            base_url: Some("http://127.0.0.1:18180/v1".to_string()),
             default_text_model: Some("legacy-model".to_string()),
             ..Default::default()
-        };
+        }
+        .with_legacy_root(None, Some("http://127.0.0.1:18180/v1".to_string()));
         let identity = config
             .resolve_provider_identity("custom")
             .expect("legacy identity");
@@ -2283,12 +2316,26 @@ default_text_model = "legacy-model"
         crate::config::save_provider_model_for_identity(&identity, &config, "legacy-model-updated")
             .expect("save legacy model");
 
+        // The literal custom route's top-level fields now live in
+        // `[providers.custom]` (#6394); the saves write there and the write
+        // moves the old top-level endpoint alongside.
         let saved = std::fs::read_to_string(config_env.config_path()).expect("saved config");
-        assert!(saved.contains("api_key = \"legacy-saved-key\""));
-        assert!(saved.contains("default_text_model = \"legacy-model-updated\""));
-        assert!(!saved.contains("[providers.custom]"));
+        let table: toml::Table = toml::from_str(&saved).expect("saved config parses");
+        assert!(
+            !codewhale_config::legacy_root::has_legacy_root_keys(&table),
+            "{saved}"
+        );
+        let custom = table["providers"]["custom"]
+            .as_table()
+            .expect("custom table");
+        assert_eq!(custom["api_key"].as_str(), Some("legacy-saved-key"));
+        assert_eq!(custom["model"].as_str(), Some("legacy-model-updated"));
+        assert_eq!(
+            custom["base_url"].as_str(),
+            Some("http://127.0.0.1:18180/v1")
+        );
         let reloaded = Config::load(Some(config_env.config_path()), None).expect("reload legacy");
-        assert!(reloaded.uses_legacy_literal_custom_route());
+        assert!(reloaded.selects_literal_custom_provider());
         assert_eq!(
             reloaded
                 .resolve_provider_identity("custom")
@@ -2321,7 +2368,7 @@ model = "model-b"
         )
         .expect("seed coexistence config");
         let config = Config::load(Some(config_env.config_path()), None).expect("load config");
-        assert!(config.uses_legacy_literal_custom_route());
+        assert!(config.selects_literal_custom_provider());
         let identity = config
             .resolve_provider_identity("custom-b")
             .expect("named custom identity");
@@ -2332,7 +2379,13 @@ model = "model-b"
             .expect("save named custom model");
 
         let saved = std::fs::read_to_string(config_env.config_path()).expect("saved config");
-        assert!(saved.contains("api_key = \"legacy-root-key\""));
+        let table: toml::Table = toml::from_str(&saved).expect("saved config parses");
+        // The literal route's key moved into its own table, untouched by the
+        // named route's save (#6394).
+        assert_eq!(
+            table["providers"]["custom"]["api_key"].as_str(),
+            Some("legacy-root-key")
+        );
         assert!(saved.contains("default_text_model = \"legacy-model\""));
         assert!(saved.contains("[providers.custom-b]"));
         assert!(saved.contains("api_key = \"saved-b-key\""));

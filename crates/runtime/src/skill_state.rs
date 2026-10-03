@@ -12,6 +12,14 @@
 //! disabled = ["skill-name-1", "skill-name-2"]
 //! ```
 //!
+//! Reserved `!codewhale-skill-state:1:*` entries retain legacy vetoes and
+//! exact enables in that same set. The leading `!` cannot be a discovered
+//! skill name. v0.10.0 writers preserve these strings, unlike unknown TOML
+//! fields. This preserves new-reader policy through their serialization;
+//! it does not make old readers understand distinct Unicode identities or
+//! old lossy/no-op toggles express the new per-skill choices. Upgrade all
+//! runtimes sharing this directory for consistent activation controls.
+//!
 //! Default state when the file does not exist: empty list (everything enabled).
 //! A present but unreadable or malformed file is an error. Callers may keep
 //! native Skills available for recovery, but reviewed plugin Skills must stay
@@ -25,6 +33,9 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 const STATE_FILE_NAME: &str = "skills_state.toml";
+const MARKER_PREFIX: &str = "!codewhale-skill-state:";
+const ENABLED_PREFIX: &str = "!codewhale-skill-state:1:enabled:";
+const HISTORY_PREFIX: &str = "!codewhale-skill-state:1:history:";
 
 #[derive(Debug, Clone)]
 pub struct SkillStateStore {
@@ -50,7 +61,28 @@ impl SkillStateStore {
     }
 
     pub fn is_enabled(&self, skill_name: &str) -> bool {
-        !self.disabled.contains(skill_name)
+        self.is_enabled_with_legacy(skill_name, None)
+    }
+
+    /// Raw exact denies win even over a retained enable (including a later
+    /// v0.10.0 toggle). Enables override only inherited legacy vetoes.
+    pub fn is_enabled_with_legacy(&self, skill_name: &str, legacy_name: Option<&str>) -> bool {
+        if self.disabled.contains(skill_name) {
+            return false;
+        }
+        if self
+            .disabled
+            .contains(&format!("{ENABLED_PREFIX}{skill_name}"))
+        {
+            return true;
+        }
+        !self
+            .disabled
+            .contains(&format!("{HISTORY_PREFIX}{skill_name}"))
+            && !legacy_name.is_some_and(|legacy| {
+                self.disabled.contains(legacy)
+                    || self.disabled.contains(&format!("{HISTORY_PREFIX}{legacy}"))
+            })
     }
 
     pub fn set_enabled(&mut self, skill_name: &str, enabled: bool) -> Result<()> {
@@ -67,8 +99,14 @@ impl SkillStateStore {
         Ok(())
     }
 
+    /// Raw exact denies only; inherited vetoes need discovered identity
+    /// metadata and cannot be enumerated as a list of effective skill names.
     pub fn disabled(&self) -> Vec<String> {
-        self.disabled.iter().cloned().collect()
+        self.disabled
+            .iter()
+            .filter(|name| !name.starts_with(MARKER_PREFIX))
+            .cloned()
+            .collect()
     }
 
     fn set_enabled_with_persist(
@@ -77,6 +115,10 @@ impl SkillStateStore {
         enabled: bool,
         persist: impl FnOnce(&Path, &BTreeSet<String>) -> Result<()>,
     ) -> Result<()> {
+        anyhow::ensure!(
+            !skill_name.is_empty() && !skill_name.starts_with(MARKER_PREFIX),
+            "invalid skill activation identity"
+        );
         if let Some(parent) = self
             .path
             .parent()
@@ -96,13 +138,26 @@ impl SkillStateStore {
         // requested exact-name change to this latest snapshot merges updates
         // from other Runtime API/TUI processes instead of replacing them with
         // the caller's possibly stale in-memory view.
-        let mut next = load_disabled_unlocked(&self.path)?;
-        let changed = if enabled {
-            next.remove(skill_name)
+        let previous = load_disabled_unlocked(&self.path)?;
+        let mut next = previous.clone();
+        // A raw name may also govern an undiscovered legacy collision cohort.
+        // Preserve every veto before removing any, without discovery writes.
+        next.extend(
+            previous
+                .iter()
+                .filter(|name| !name.is_empty() && !name.starts_with(MARKER_PREFIX))
+                .map(|name| format!("{HISTORY_PREFIX}{name}")),
+        );
+        let exact_enable = format!("{ENABLED_PREFIX}{skill_name}");
+        if enabled {
+            next.remove(skill_name);
+            next.insert(exact_enable);
         } else {
-            next.insert(skill_name.to_string())
-        };
-        if changed {
+            next.insert(skill_name.to_string());
+            next.insert(format!("{HISTORY_PREFIX}{skill_name}"));
+            next.remove(&exact_enable);
+        }
+        if next != previous {
             // Disk is authoritative. Publish to memory only after the atomic
             // write succeeds so a failed persistence attempt cannot make this
             // process report a toggle that no other process can observe.
@@ -146,6 +201,18 @@ fn load_disabled_unlocked(path: &Path) -> Result<BTreeSet<String>> {
     };
     let parsed: OnDiskState =
         toml::from_str(&raw).with_context(|| format!("parse skill state at {}", path.display()))?;
+    for entry in &parsed.disabled {
+        if entry.starts_with(MARKER_PREFIX) {
+            let identity = entry
+                .strip_prefix(ENABLED_PREFIX)
+                .or_else(|| entry.strip_prefix(HISTORY_PREFIX));
+            anyhow::ensure!(
+                identity.is_some_and(|name| !name.is_empty() && !name.starts_with(MARKER_PREFIX)),
+                "parse skill state at {}: unsupported or malformed activation marker",
+                path.display()
+            );
+        }
+    }
     Ok(parsed.disabled.into_iter().collect())
 }
 
@@ -284,10 +351,142 @@ mod tests {
     }
 
     #[test]
-    fn redundant_toggle_is_noop() {
-        let (_dir, mut store) = fresh();
+    fn explicit_enable_records_a_choice_then_repeated_toggle_is_noop() {
+        let (dir, mut store) = fresh();
         store.set_enabled("foo", true).unwrap();
         assert!(store.disabled().is_empty());
+        let path = dir.path().join(STATE_FILE_NAME);
+        let before = fs::read(&path).unwrap();
+        store
+            .set_enabled_with_persist("foo", true, |_, _| {
+                panic!("repeating the same choice must not rewrite the store")
+            })
+            .unwrap();
+        assert_eq!(fs::read(path).unwrap(), before);
+    }
+
+    // The released v0.10.0 serde shape and exact-set writer semantics at
+    // 1be1a703b975fc0a6c125886c761141341615a32. This intentionally does not
+    // interpret markers or use the upgraded loader/writer.
+    fn released_writer_toggle(path: &Path, name: &str, enabled: bool) -> bool {
+        #[derive(Deserialize, Serialize)]
+        struct ReleasedState {
+            #[serde(default)]
+            disabled: Vec<String>,
+        }
+        let old: ReleasedState = toml::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+        let mut next: BTreeSet<String> = old.disabled.into_iter().collect();
+        let changed = if enabled {
+            next.remove(name)
+        } else {
+            next.insert(name.to_string())
+        };
+        if changed {
+            fs::write(
+                path,
+                toml::to_string_pretty(&ReleasedState {
+                    disabled: next.into_iter().collect(),
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        }
+        changed
+    }
+
+    #[test]
+    fn legacy_veto_and_exact_choices_survive_released_writer_serialization() {
+        for legacy in ["skill", "pdf", "demo:skill"] {
+            let (dir, mut store) = fresh();
+            let path = dir.path().join(STATE_FILE_NAME);
+            let original = format!("disabled = [\"{legacy}\"]\n");
+            fs::write(&path, &original).unwrap();
+            store.refresh().unwrap();
+            let a = format!("{legacy}-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+            let b = format!("{legacy}-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+            assert!(!store.is_enabled_with_legacy(&a, Some(legacy)));
+            assert!(!store.is_enabled_with_legacy(&b, Some(legacy)));
+            assert_eq!(
+                fs::read_to_string(&path).unwrap(),
+                original,
+                "reads never migrate"
+            );
+
+            store.set_enabled(&a, true).unwrap();
+            assert!(released_writer_toggle(&path, "unrelated", false));
+            store.refresh().unwrap();
+            assert!(store.is_enabled_with_legacy(&a, Some(legacy)));
+            assert!(!store.is_enabled_with_legacy(&b, Some(legacy)));
+            // Old serialization cannot erase the history when removing L.
+            assert!(released_writer_toggle(&path, legacy, true));
+            store.refresh().unwrap();
+            assert!(!store.is_enabled_with_legacy(&b, Some(legacy)));
+            assert!(!store.is_enabled(legacy));
+
+            store.set_enabled(legacy, true).unwrap();
+            assert!(
+                store.is_enabled(legacy),
+                "literal ASCII identity has its own exception"
+            );
+            assert!(!store.is_enabled_with_legacy(&b, Some(legacy)));
+            assert!(released_writer_toggle(&path, legacy, false));
+            store.refresh().unwrap();
+            assert!(
+                !store.is_enabled(legacy),
+                "later raw exact disable beats an exception"
+            );
+            // The old lossy/no-op toggle cannot express a new per-skill
+            // revocation. Preserve this limit rather than claim parity.
+            assert!(!released_writer_toggle(&path, legacy, false));
+            store.refresh().unwrap();
+            assert!(store.is_enabled_with_legacy(&a, Some(legacy)));
+
+            store.set_enabled(&a, false).unwrap();
+            released_writer_toggle(&path, legacy, true);
+            store.refresh().unwrap();
+            assert!(!store.is_enabled_with_legacy(&a, Some(legacy)));
+            assert!(!store.is_enabled_with_legacy(&b, Some(legacy)));
+        }
+    }
+
+    #[test]
+    fn malformed_or_unknown_activation_markers_preserve_bytes_and_memory() {
+        let (dir, mut store) = fresh();
+        let path = dir.path().join(STATE_FILE_NAME);
+        store.set_enabled("kept", false).unwrap();
+        for marker in [
+            "!codewhale-skill-state:1:enabled:",
+            "!codewhale-skill-state:2:enabled:kept",
+            "!codewhale-skill-state:1:unknown:kept",
+            "!codewhale-skill-state:1:history:!codewhale-skill-state:1:enabled:kept",
+        ] {
+            let bytes = format!("disabled = [\"{marker}\"]\n");
+            fs::write(&path, &bytes).unwrap();
+            assert!(store.refresh().is_err());
+            assert!(store.set_enabled("kept", true).is_err());
+            assert!(!store.is_enabled("kept"));
+            assert_eq!(fs::read_to_string(&path).unwrap(), bytes);
+        }
+        fs::write(&path, "disabled = [\"unrelated opaque entry\"]\n").unwrap();
+        store.refresh().unwrap();
+        store.set_enabled("foo", false).unwrap();
+        assert!(!store.is_enabled("unrelated opaque entry"));
+    }
+
+    #[test]
+    fn failed_exact_enable_does_not_publish_or_replace_legacy_policy() {
+        let (dir, mut store) = fresh();
+        let path = dir.path().join(STATE_FILE_NAME);
+        let original = b"disabled = [\"skill\"]\n";
+        fs::write(&path, original).unwrap();
+        store.refresh().unwrap();
+        let name = "skill-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let result = store.set_enabled_with_persist(name, true, |_, _| {
+            anyhow::bail!("injected persistence failure")
+        });
+        assert!(result.is_err());
+        assert!(!store.is_enabled_with_legacy(name, Some("skill")));
+        assert_eq!(fs::read(path).unwrap(), original);
     }
 
     #[test]

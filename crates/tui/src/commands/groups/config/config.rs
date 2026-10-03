@@ -12,9 +12,9 @@ use crate::config::{
     normalize_custom_model_id, normalize_model_name_for_provider, validate_route,
 };
 use crate::config_persistence::{
-    persist_provider_base_url_key, persist_root_bool_key, persist_root_string_key,
-    persist_subagents_bool_key, persist_subagents_integer_key, persist_table_string_key,
-    persist_tui_integer_key, persist_unset_root_key,
+    persist_root_bool_key, persist_root_string_key, persist_subagents_bool_key,
+    persist_subagents_integer_key, persist_table_string_key, persist_table_value_key,
+    persist_unset_root_key,
 };
 use crate::reasoning_preference::ReasoningEffort;
 use crate::settings::Settings;
@@ -967,7 +967,7 @@ fn config_editability_audit(app: &App) -> CommandResult {
             app.stream_chunk_timeout_secs.to_string(),
             "runtime+persisted",
             "/config stream_chunk_timeout_secs <0|1..3600> --save",
-            "Writes [tui].stream_chunk_timeout_secs and updates the running stream timeout.",
+            "Writes [stream].chunk_timeout_secs and updates the running stream timeout.",
         ),
         (
             "posture_bar",
@@ -2121,7 +2121,7 @@ pub fn set_config_value(app: &mut App, key: &str, value: &str, persist: bool) ->
                     provider_id,
                     Some(&model),
                 ) {
-                    Ok(path) => Some(path),
+                    Ok((path, _)) => Some(path),
                     Err(error) => {
                         return CommandResult::error(format!("Failed to save model: {error}"));
                     }
@@ -2348,54 +2348,41 @@ pub fn set_config_value(app: &mut App, key: &str, value: &str, persist: bool) ->
             }
             let next_path = PathBuf::from(expand_tilde(value));
             let path_changed = next_path != app.mcp_config_path;
-            app.mcp_config_path = next_path;
-            if path_changed {
-                app.mcp_reload_required = true;
-            }
             let reload_note = if path_changed {
                 "; run /mcp reload to rebuild the live tool pool"
             } else {
                 ""
             };
-            let message = if persist {
+            // Persist before touching live state (C01-08): a failed save
+            // must leave the session exactly as it was, not report failure
+            // over a path and reload flag that already moved.
+            let saved_to = if persist {
                 match persist_root_string_key(app.config_path.as_deref(), "mcp_config_path", value)
                 {
-                    Ok(path) => format!(
-                        "mcp_config_path = {} (saved to {}){}",
-                        app.mcp_config_path.display(),
-                        path.display(),
-                        reload_note
-                    ),
+                    Ok(path) => Some(path),
                     Err(err) => return CommandResult::error(format!("Failed to save: {err}")),
                 }
             } else {
-                format!(
+                None
+            };
+            app.mcp_config_path = next_path;
+            if path_changed {
+                app.mcp_reload_required = true;
+            }
+            let message = match saved_to {
+                Some(path) => format!(
+                    "mcp_config_path = {} (saved to {}){}",
+                    app.mcp_config_path.display(),
+                    path.display(),
+                    reload_note
+                ),
+                None => format!(
                     "mcp_config_path = {} (session only){}",
                     app.mcp_config_path.display(),
                     reload_note
-                )
+                ),
             };
             return CommandResult::message(message);
-        }
-        "base_url" => {
-            let value = value.trim();
-            if value.is_empty() {
-                return CommandResult::error("base_url cannot be empty");
-            }
-            if persist {
-                match persist_root_string_key(app.config_path.as_deref(), "base_url", value) {
-                    Ok(path) => {
-                        return CommandResult::message(format!(
-                            "base_url = {value} (saved to {})",
-                            path.display()
-                        ));
-                    }
-                    Err(err) => return CommandResult::error(format!("Failed to save: {err}")),
-                }
-            }
-            return CommandResult::error(
-                "base_url must be saved with --save; client base URL is loaded from config on startup. Restart and re-open your session after saving.",
-            );
         }
         "title" | "window_title" | "tab_title" => {
             // Keep the config setter under the same terminal-control and
@@ -2426,35 +2413,26 @@ pub fn set_config_value(app: &mut App, key: &str, value: &str, persist: bool) ->
                 "title = {value}{suffix} — terminal window titles now read [\"{value}\"] … until /title overrides this session"
             ));
         }
-        "provider_url" | "provider_base_url" | "endpoint" => {
+        // `base_url` is the older spelling. It used to write a top-level key
+        // that every DeepSeek-family route inherited; it now writes the
+        // active route's own `[providers.<name>]` table like `provider_url`
+        // (#6394).
+        url_key @ ("base_url" | "provider_url" | "provider_base_url" | "endpoint") => {
             let value = match resolve_provider_url_value(app.api_provider, value) {
                 Ok(value) => value,
                 Err(err) => return CommandResult::error(err),
             };
-            if matches!(
-                app.api_provider,
-                ApiProvider::Deepseek | ApiProvider::DeepseekCN
-            ) {
-                if persist {
-                    match persist_root_string_key(app.config_path.as_deref(), "base_url", &value) {
-                        Ok(path) => {
-                            return CommandResult::message(format!(
-                                "provider_url = {value} (saved to {}; restart required)",
-                                path.display()
-                            ));
-                        }
-                        Err(err) => return CommandResult::error(format!("Failed to save: {err}")),
-                    }
-                }
-            } else if persist {
-                match persist_provider_base_url_key(
+            if persist {
+                let identity = app.provider_identity_for_persistence();
+                match crate::config_persistence::persist_route_base_url(
                     app.config_path.as_deref(),
                     app.api_provider,
+                    identity,
                     &value,
                 ) {
                     Ok(path) => {
                         return CommandResult::message(format!(
-                            "provider_url = {value} for {} (saved to {}; restart required)",
+                            "{url_key} = {value} for {} (saved to {}; restart required)",
                             app.api_provider.as_str(),
                             path.display()
                         ));
@@ -2462,9 +2440,9 @@ pub fn set_config_value(app: &mut App, key: &str, value: &str, persist: bool) ->
                     Err(err) => return CommandResult::error(format!("Failed to save: {err}")),
                 }
             }
-            return CommandResult::error(
-                "provider_url must be saved with --save; client base URL is loaded from config on startup. Restart and re-open your session after saving.",
-            );
+            return CommandResult::error(format!(
+                "{url_key} must be saved with --save; client base URL is loaded from config on startup. Restart and re-open your session after saving."
+            ));
         }
         // The two bottom-chrome rows' size presets (`tui.posture_bar`,
         // `tui.metrics_line`, #5950). Live on the next frame; `--save`
@@ -2554,15 +2532,18 @@ pub fn set_config_value(app: &mut App, key: &str, value: &str, persist: bool) ->
             } else {
                 raw
             };
-            app.stream_chunk_timeout_secs = resolved;
             let value_label = stream_chunk_timeout_value_label(raw, resolved);
             if persist {
-                match persist_tui_integer_key(
+                match persist_table_value_key(
                     app.config_path.as_deref(),
-                    "stream_chunk_timeout_secs",
-                    raw,
+                    "stream",
+                    "chunk_timeout_secs",
+                    (raw as i64).into(), // validated above: at most 3600
                 ) {
                     Ok(path) => {
+                        // Live state moves only with the engine action and
+                        // only after the save landed (C01-08).
+                        app.stream_chunk_timeout_secs = resolved;
                         return CommandResult::with_message_and_action(
                             format!(
                                 "stream_chunk_timeout_secs = {value_label} (saved to {}; affects subsequent turns in this session)",
@@ -2574,6 +2555,7 @@ pub fn set_config_value(app: &mut App, key: &str, value: &str, persist: bool) ->
                     Err(err) => return CommandResult::error(format!("Failed to save: {err}")),
                 }
             }
+            app.stream_chunk_timeout_secs = resolved;
             return CommandResult::with_message_and_action(
                 format!(
                     "stream_chunk_timeout_secs = {value_label} (session only; affects subsequent turns in this session)"
@@ -2759,14 +2741,8 @@ pub fn set_config_value(app: &mut App, key: &str, value: &str, persist: bool) ->
                 Ok(value) => value,
                 Err(err) => return CommandResult::error(err),
             };
-            match field {
-                "keep_header" => app.mini_window.keep_header = value,
-                "keep_input" => app.mini_window.keep_input = value,
-                "keep_todo" => app.mini_window.keep_todo = value,
-                "keep_sidebar" => app.mini_window.keep_sidebar = value,
-                "keep_footer" => app.mini_window.keep_footer = value,
-                _ => unreachable!("mini_window field matched above"),
-            }
+            // Persist first: a failed save leaves the live layout as it was
+            // (C01-08).
             if persist
                 && let Err(err) = crate::config_persistence::persist_mini_window_bool_key(
                     app.config_path.as_deref(),
@@ -2775,6 +2751,14 @@ pub fn set_config_value(app: &mut App, key: &str, value: &str, persist: bool) ->
                 )
             {
                 return CommandResult::error(format!("Failed to persist: {err}"));
+            }
+            match field {
+                "keep_header" => app.mini_window.keep_header = value,
+                "keep_input" => app.mini_window.keep_input = value,
+                "keep_todo" => app.mini_window.keep_todo = value,
+                "keep_sidebar" => app.mini_window.keep_sidebar = value,
+                "keep_footer" => app.mini_window.keep_footer = value,
+                _ => unreachable!("mini_window field matched above"),
             }
             app.needs_redraw = true;
         }
@@ -2826,15 +2810,17 @@ pub fn set_config_value(app: &mut App, key: &str, value: &str, persist: bool) ->
             app.needs_redraw = true;
         }
         "workspace_follow_symlinks" | "follow_symlinks" => {
+            // Persist first: a failed save leaves the live value as it was
+            // (C01-08).
+            if persist && let Err(e) = persist_single_setting(&key, value) {
+                return CommandResult::error(format!("Failed to save: {e}"));
+            }
             app.workspace_follow_symlinks = settings.workspace_follow_symlinks;
             app.composer.mention_completion_cache = None;
             app.composer.mention_discovery.invalidate();
             app.needs_redraw = true;
             // Engine tools use EngineConfig which is fixed at startup
             return CommandResult::message(if persist {
-                if let Err(e) = persist_single_setting(&key, value) {
-                    return CommandResult::error(format!("Failed to save: {e}"));
-                }
                 format!(
                     "workspace_follow_symlinks = {} (saved; restart required for engine tools)",
                     settings.workspace_follow_symlinks
@@ -2932,7 +2918,18 @@ pub fn set_config_value(app: &mut App, key: &str, value: &str, persist: bool) ->
 
     let message = if persist {
         if let Err(e) = persist_single_setting(&key, value) {
-            return CommandResult::error(format!("Failed to save: {e}"));
+            // C01-08: the projection above already changed live state (and
+            // some arms validate only while projecting, so saving first could
+            // persist a value that never applied). Report exactly that partial
+            // effect, and keep the action so the engine matches the UI instead
+            // of silently diverging from it.
+            return CommandResult {
+                message: Some(format!(
+                    "Error: {key} = {display_value} applies to this session only; saving failed: {e}"
+                )),
+                action,
+                is_error: true,
+            };
         }
         format!("{key} = {display_value} (saved)")
     } else {
@@ -3061,8 +3058,8 @@ pub fn theme(app: &mut App, arg: Option<&str>) -> CommandResult {
 ///
 /// Subcommands:
 /// - `/trust`            – show current state and trusted external paths
-/// - `/trust on`         – legacy: trust the entire workspace (turn off all path checks)
-/// - `/trust off`        – disable workspace-level trust mode
+/// - `/trust on|off`     – change file-tool trust for this session only
+/// - `/trust on|off --save` – also persist workspace trust for project sources
 /// - `/trust add <path>` – add a directory to the allowlist (#29)
 /// - `/trust remove <path>` (alias `rm`) – remove a path from the allowlist
 /// - `/trust list`       – list trusted external paths for this workspace
@@ -3075,23 +3072,46 @@ pub fn trust(app: &mut App, arg: Option<&str>) -> CommandResult {
 
     match sub.as_str() {
         "" | "status" | "list" => trust_status(&workspace, app, sub == "list"),
-        "on" | "enable" | "yes" | "y" => {
-            app.trust_mode = true;
-            CommandResult::message(
-                "Workspace trust mode enabled — agent file tools can now read/write any path. \
-                 Use `/trust off` to revert; prefer `/trust add <path>` for a narrower opt-in.",
-            )
-        }
-        "off" | "disable" | "no" | "n" => {
-            app.trust_mode = false;
-            CommandResult::message("Workspace trust mode disabled.")
+        "on" | "enable" | "yes" | "y" | "off" | "disable" | "no" | "n" => {
+            if !matches!(rest, "" | "--save") {
+                return CommandResult::error(format!(
+                    "{} /trust on|off [--save]",
+                    tr(app.ui_locale, MessageId::HelpUsageLabel)
+                ));
+            }
+            CommandResult::action(AppAction::SetWorkspaceTrust {
+                trusted: matches!(sub.as_str(), "on" | "enable" | "yes" | "y"),
+                save: rest == "--save",
+            })
         }
         "add" => trust_add(&workspace, rest),
         "remove" | "rm" | "del" | "delete" => trust_remove(&workspace, rest),
         other => CommandResult::error(format!(
-            "Unknown /trust action `{other}`. Use `/trust`, `/trust on|off`, `/trust add <path>`, or `/trust remove <path>`."
+            "Unknown /trust action `{other}`. Use `/trust`, `/trust on|off [--save]`, `/trust add <path>`, or `/trust remove <path>`."
         )),
     }
+}
+
+pub(crate) async fn set_workspace_trust(app: &mut App, trusted: bool, save: bool) -> Result<()> {
+    if !save {
+        app.trust_mode = trusted;
+        return Ok(());
+    }
+    // Revocation restricts live file access even if the saved decision cannot be updated.
+    if !trusted {
+        app.trust_mode = false;
+    }
+    let workspace = app.workspace.clone();
+    #[cfg(test)]
+    let ticket = crate::test_support::env_scope_ticket();
+    tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        let _membership = crate::test_support::join_env_scope(ticket);
+        crate::config::set_workspace_trust(&workspace, trusted)
+    })
+    .await??;
+    app.trust_mode = trusted;
+    Ok(())
 }
 
 fn trust_status(workspace: &Path, app: &App, force_paths: bool) -> CommandResult {
@@ -4620,14 +4640,20 @@ mod tests {
         let saved_path = crate::config_persistence::config_toml_path(None).unwrap();
         let saved = fs::read_to_string(&saved_path).unwrap();
 
+        // The active DeepSeek route's own table, not a top-level key (#6394).
         assert_eq!(
             msg,
             format!(
-                "base_url = https://example.internal.local/v1 (saved to {})",
+                "base_url = https://example.internal.local/v1 for deepseek (saved to {}; restart required)",
                 saved_path.display()
             )
         );
-        assert!(saved.contains("base_url = \"https://example.internal.local/v1\""));
+        let table: toml::Table = toml::from_str(&saved).unwrap();
+        assert_eq!(
+            table["providers"]["deepseek"]["base_url"].as_str(),
+            Some("https://example.internal.local/v1")
+        );
+        assert!(table.get("base_url").is_none(), "{saved}");
     }
 
     #[test]
@@ -5352,11 +5378,15 @@ context_window = 262144
         assert_eq!(
             msg,
             format!(
-                "base_url = https://example.session.local/v1 (saved to {})",
+                "base_url = https://example.session.local/v1 for deepseek (saved to {}; restart required)",
                 config_path.display()
             )
         );
-        assert!(saved.contains("base_url = \"https://example.session.local/v1\""));
+        let table: toml::Table = toml::from_str(&saved).unwrap();
+        assert_eq!(
+            table["providers"]["deepseek"]["base_url"].as_str(),
+            Some("https://example.session.local/v1")
+        );
     }
 
     #[test]
@@ -5380,7 +5410,36 @@ context_window = 262144
     }
 
     #[test]
-    fn config_command_stream_chunk_timeout_save_persists_tui_key() {
+    fn failed_save_leaves_live_config_state_untouched() {
+        // C01-08: a `--save` that cannot write must not report failure over
+        // live state that already moved.
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = EnvGuard::new(temp.path());
+        let blocker = temp.path().join("not-a-directory");
+        fs::write(&blocker, "a file where the config directory should be").unwrap();
+        let mut app = create_test_app();
+        app.config_path = Some(blocker.join("config.toml"));
+        let mcp_before = app.mcp_config_path.clone();
+        app.mcp_reload_required = false;
+        let timeout_before = app.stream_chunk_timeout_secs;
+
+        let result = set_config_value(&mut app, "mcp_config_path", "/elsewhere/mcp.json", true);
+        assert!(result.is_error, "{:?}", result.message);
+        assert_eq!(app.mcp_config_path, mcp_before);
+        assert!(!app.mcp_reload_required);
+
+        let next_timeout = if timeout_before == 120 { "121" } else { "120" };
+        let result = set_config_value(&mut app, "stream_chunk_timeout_secs", next_timeout, true);
+        assert!(result.is_error, "{:?}", result.message);
+        assert!(
+            result.action.is_none(),
+            "no engine update for an unsaved value"
+        );
+        assert_eq!(app.stream_chunk_timeout_secs, timeout_before);
+    }
+
+    #[test]
+    fn config_command_stream_chunk_timeout_save_overrides_canonical_value() {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -5394,6 +5453,11 @@ context_window = 262144
         let _guard = EnvGuard::new(&temp_root);
 
         let config_path = temp_root.join("custom-config.toml");
+        fs::write(
+            &config_path,
+            "[stream]\nchunk_timeout_secs=45\n[tui]\nstream_chunk_timeout_secs=30\n",
+        )
+        .unwrap();
         let mut app = create_test_app();
         app.config_path = Some(config_path.clone());
 
@@ -5408,8 +5472,17 @@ context_window = 262144
                 config_path.display()
             )
         );
-        assert!(saved.contains("[tui]"));
-        assert!(saved.contains("stream_chunk_timeout_secs = 120"));
+        let reopened: Config = toml::from_str(&saved).unwrap();
+        assert_eq!(
+            reopened.stream_chunk_timeout_secs(),
+            120,
+            "saved value must survive reopening when a canonical value already existed"
+        );
+        assert_eq!(
+            reopened.tui.unwrap().stream_chunk_timeout_secs,
+            Some(30),
+            "legacy compatibility input is preserved"
+        );
         assert_eq!(app.stream_chunk_timeout_secs, 120);
         assert!(matches!(
             result.action,
@@ -6241,15 +6314,86 @@ context_window = 262144
         assert!(app.needs_redraw);
     }
 
-    #[test]
-    fn test_trust_on_enables_flag() {
+    #[tokio::test]
+    async fn trust_only_persists_with_save() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = EnvGuard::new(tmp.path());
+        let config_path = tmp.path().join("config.toml");
+        let _config = EnvVarGuard::set("CODEWHALE_CONFIG_PATH", &config_path);
+        let workspace = tmp.path().join("workspace");
+        let commands = workspace.join(".claude/commands");
+        let skills = workspace.join(".claude/skills/review-example");
+        fs::create_dir_all(&commands).unwrap();
+        fs::create_dir_all(&skills).unwrap();
+        fs::write(commands.join("review-example.md"), "Review the example").unwrap();
+        fs::write(
+            skills.join("SKILL.md"),
+            "---\nname: review-example\ndescription: Review the example\n---\nRead the example.",
+        )
+        .unwrap();
         let mut app = create_test_app();
-        // Normalize trust state regardless of user settings on the host machine.
+        app.workspace = workspace.clone();
         app.trust_mode = false;
-        let result = trust(&mut app, Some("on"));
-        let msg = result.message.expect("message");
-        assert!(msg.contains("Workspace trust mode enabled"));
-        assert!(app.trust_mode);
+        for trusted in [false, true, false] {
+            if trusted || app.trust_mode {
+                let result = trust(
+                    &mut app,
+                    Some(if trusted { "on --save" } else { "off --save" }),
+                );
+                assert_eq!(
+                    result.action,
+                    Some(AppAction::SetWorkspaceTrust {
+                        trusted,
+                        save: true
+                    })
+                );
+                set_workspace_trust(&mut app, trusted, true).await.unwrap();
+            }
+            let saved = fs::read(&config_path).ok();
+            for session_trusted in [true, false] {
+                let result = trust(&mut app, Some(if session_trusted { "on" } else { "off" }));
+                assert_eq!(
+                    result.action,
+                    Some(AppAction::SetWorkspaceTrust {
+                        trusted: session_trusted,
+                        save: false
+                    })
+                );
+                set_workspace_trust(&mut app, session_trusted, false)
+                    .await
+                    .unwrap();
+                assert_eq!(app.trust_mode, session_trusted);
+                assert_eq!(
+                    fs::read(&config_path).ok(),
+                    saved,
+                    "session toggle must not write config"
+                );
+                assert_eq!(crate::config::is_workspace_trusted(&workspace), trusted);
+            }
+            app.trust_mode = trusted;
+            assert!(trust(&mut app, Some("on --typo")).is_error);
+            assert_eq!(crate::config::is_workspace_trusted(&workspace), trusted);
+            crate::commands::user_registry::with_registry_for_workspace(
+                Some(&workspace),
+                |registry| {
+                    assert_eq!(registry.get("review-example").is_some(), trusted);
+                },
+            );
+            assert_eq!(
+                crate::skills::discover_in_workspace(&workspace)
+                    .get("review-example")
+                    .is_some(),
+                trusted
+            );
+        }
+        // A failed write must not grant trust in memory.
+        fs::create_dir_all(tmp.path().join("bad-config")).unwrap();
+        let _bad_config = EnvVarGuard::set("CODEWHALE_CONFIG_PATH", tmp.path().join("bad-config"));
+        assert!(set_workspace_trust(&mut app, true, true).await.is_err());
+        assert!(!app.trust_mode);
+        app.trust_mode = true;
+        assert!(set_workspace_trust(&mut app, false, true).await.is_err());
+        assert!(!app.trust_mode);
     }
 
     #[test]

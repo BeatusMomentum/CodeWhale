@@ -210,7 +210,7 @@ impl ToolSpec for FinanceTool {
                 },
                 "timeout_ms": {
                     "type": "integer",
-                    "description": "Request timeout in milliseconds (default: 10000, max: 60000)."
+                    "description": "Total lookup timeout in milliseconds, shared by the quote request and its chart fallback (default: 10000, max: 60000)."
                 }
             },
             "anyOf": [
@@ -260,6 +260,11 @@ impl ToolSpec for FinanceTool {
         // cannot leak a request through the chart fallback.
         check_network_policy(context, &self.endpoints)?;
 
+        // One budget covers the quote request and its chart fallback
+        // (#6557 D03-m3): the fallback gets only what the first attempt left,
+        // so `timeout_ms` — and the Timeout error that reports it — is the
+        // real wall-clock bound rather than half of it.
+        let deadline = std::time::Instant::now() + timeout;
         let quote_result =
             fetch_quote_endpoint(&self.client, timeout, &self.endpoints, &request).await;
         match quote_result {
@@ -267,7 +272,13 @@ impl ToolSpec for FinanceTool {
                 ToolResult::json(&result).map_err(|e| ToolError::execution_failed(e.to_string()))
             }
             Err(first_failure) => {
-                match fetch_chart_endpoint(&self.client, timeout, &self.endpoints, &request).await {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                let chart_result = if remaining.is_zero() {
+                    Err(AttemptFailure::timeout(CHART_SOURCE))
+                } else {
+                    fetch_chart_endpoint(&self.client, remaining, &self.endpoints, &request).await
+                };
+                match chart_result {
                     Ok(result) => ToolResult::json(&result)
                         .map_err(|e| ToolError::execution_failed(e.to_string())),
                     Err(second_failure) => Err(finalize_failure(
@@ -819,7 +830,7 @@ mod tests {
             .expect_err("double upstream failure should error");
 
         match err {
-            ToolError::ExecutionFailed { message } => {
+            ToolError::ExecutionFailed { message, .. } => {
                 assert!(message.contains(QUOTE_SOURCE));
                 assert!(message.contains("HTTP 401"));
                 assert!(message.contains(CHART_SOURCE));
@@ -853,7 +864,7 @@ mod tests {
             .expect_err("mixed upstream/not-found failures should not look like an invalid symbol");
 
         match err {
-            ToolError::ExecutionFailed { message } => {
+            ToolError::ExecutionFailed { message, .. } => {
                 assert!(message.contains(QUOTE_SOURCE));
                 assert!(message.contains("HTTP 503"));
                 assert!(message.contains(CHART_SOURCE));
@@ -887,7 +898,7 @@ mod tests {
             .expect_err("quote auth failures should not collapse into invalid input");
 
         match err {
-            ToolError::ExecutionFailed { message } => {
+            ToolError::ExecutionFailed { message, .. } => {
                 assert!(message.contains(QUOTE_SOURCE));
                 assert!(message.contains("HTTP 401"));
                 assert!(message.contains(CHART_SOURCE));
@@ -936,6 +947,87 @@ mod tests {
             .expect_err("timeout should surface cleanly");
 
         assert!(matches!(err, ToolError::Timeout { .. }));
+    }
+
+    /// #6557 D03-m3: the chart fallback used to get a fresh full timeout, so
+    /// a lookup could run for twice `timeout_ms`. Here the quote attempt
+    /// spends the whole budget; the fallback, which would answer in 150ms,
+    /// must not be given a second budget.
+    #[tokio::test]
+    async fn finance_fallback_shares_one_timeout_budget() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/quote"))
+            .and(query_param("symbols", "AAPL"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_millis(3_000))
+                    .set_body_json(json!({"quoteResponse": {"result": []}})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/chart/AAPL"))
+            .and(query_param("interval", "1d"))
+            .and(query_param("range", "5d"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_millis(150))
+                    .set_body_json(json!({
+                        "chart": {
+                            "result": [{
+                                "meta": {
+                                    "symbol": "AAPL",
+                                    "regularMarketPrice": 260.48,
+                                    "chartPreviousClose": 255.92
+                                }
+                            }],
+                            "error": null
+                        }
+                    })),
+            )
+            .mount(&server)
+            .await;
+
+        let tool = tool_with_server(&server);
+        let started = std::time::Instant::now();
+        let err = tool
+            .execute(json!({"ticker": "AAPL", "timeout_ms": 500}), &context().0)
+            .await
+            .expect_err("the shared budget is spent before the fallback can answer");
+        assert!(matches!(err, ToolError::Timeout { seconds: 1 }), "{err:?}");
+        assert!(
+            started.elapsed() < Duration::from_millis(2_500),
+            "lookup overran its budget: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// JSON cannot carry NaN or infinity, and an overflowing literal is a
+    /// parse error rather than an infinite price.
+    #[tokio::test]
+    async fn finance_rejects_an_overflowing_price_literal() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/quote"))
+            .and(query_param("symbols", "AAPL"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                r#"{"quoteResponse":{"result":[{"symbol":"AAPL","regularMarketPrice":1e400}]}}"#,
+                "application/json",
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/chart/AAPL"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        let err = tool_with_server(&server)
+            .execute(json!({"ticker": "AAPL"}), &context().0)
+            .await
+            .expect_err("an overflowing price is not a quote");
+        assert!(err.to_string().contains("invalid JSON response"), "{err}");
     }
 
     #[tokio::test]
