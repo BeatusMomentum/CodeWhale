@@ -6,6 +6,7 @@
 //! per PR; only after all groups are decoupled will they move to a commands
 //! crate, again one group per PR.
 
+pub mod config_policy;
 pub mod facets;
 pub mod handler;
 pub mod metadata;
