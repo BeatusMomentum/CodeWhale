@@ -493,8 +493,15 @@ fn failed_same_identity_route_preflight_leaves_old_client_untouched() {
         .and_then(|providers| providers.custom.get_mut("lm-studio"))
         .expect("named custom provider")
         .base_url = Some("ftp://invalid.example/v1".to_string());
-    let err = resolve_runtime_route(&invalid, ProviderKind::Custom, Some("local-model"))
-        .expect_err("invalid route must fail before installation");
+    let err = crate::route_runtime::resolve_runtime_route_for_identity(
+        &invalid,
+        engine
+            .api_provider_identity
+            .as_ref()
+            .expect("captured named identity"),
+        Some("local-model"),
+    )
+    .expect_err("invalid route must fail before installation");
 
     assert!(err.contains("must be an http(s) URL with a host"), "{err}");
     assert_eq!(

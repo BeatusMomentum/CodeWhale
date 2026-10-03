@@ -185,11 +185,20 @@ fn cost_report_states_its_coverage_and_names_what_it_excludes() {
     assert!(!unpriced.is_priced(), "fixture must fail closed");
     app.record_turn_cost_audit(&unpriced);
 
-    let oauth = audit_turn_cost_for_provider_at(
+    let billing =
+        crate::route_billing::for_dispatched_receipt(crate::route_billing::DispatchedReceipt {
+            provider: crate::config::ProviderKind::OpenaiCodex,
+            identity: Some("openai_codex"),
+            base_url: "https://api.openai.com/v1",
+            product: crate::route_billing::RouteProduct::Subscription("ChatGPT plan allowance"),
+        });
+    let oauth = crate::pricing::audit_turn_cost_for_route(
         crate::config::ProviderKind::OpenaiCodex,
         "gpt-5.5",
+        None,
         &write_heavy,
         now,
+        billing,
     );
     app.record_turn_cost_audit(&oauth);
     assert!(

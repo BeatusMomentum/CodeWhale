@@ -231,8 +231,9 @@ Examples:
   codewhale exec --auto \"list crates/ with ls\"
   codewhale exec --auto --output-format stream-json \"fix the failing test\"
 
-Global options such as --model, --provider, --config and --profile go before exec:
+Run options such as --model, --provider, --config and --profile work before or after exec:
   codewhale --model MODEL exec \"explain this function\"
+  codewhale exec --model MODEL \"explain this function\"
 
 Common forwarded flags:
   --auto                           Enable tool-backed agent mode with auto-approvals
@@ -571,10 +572,7 @@ fn prepare_raw_provider_tui_dispatch(
     }
 
     let passthrough = match command {
-        Some(Commands::Exec(args)) => {
-            reject_exec_global_flags(&args.args)?;
-            tui_args("exec", args.clone())
-        }
+        Some(Commands::Exec(args)) => tui_args("exec", args.clone()),
         Some(Commands::Fleet(args)) => tui_args("fleet", args.clone()),
         _ => unreachable!("raw provider validation only permits Exec and Fleet"),
     };
@@ -2157,9 +2155,12 @@ fn argv_secret_warning(cli: &Cli, command: Option<&Commands>) -> Option<&'static
 }
 
 fn run() -> Result<()> {
-    let matches = Cli::command().get_matches();
+    let argv: Vec<_> = std::env::args_os().collect();
+    let matches = Cli::command().get_matches_from(&argv);
     let project_bundle_scope = config_command_targets_project(&matches);
     let mut cli = Cli::from_arg_matches(&matches).unwrap_or_else(|error| error.exit());
+    preserve_exec_separator(&mut cli, &argv);
+    capture_exec_startup_options(&mut cli)?;
 
     // The detached log proxy must not depend on user config parsing: its job
     // is to frame child output and publish a terminal receipt even when the
@@ -2223,13 +2224,23 @@ fn run() -> Result<()> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let config_path =
         config_store_path_for_dispatch(cli.config.clone(), project_bundle_scope, &cwd);
-    let mut store = ConfigStore::load(config_path).map_err(|error| {
-        if pipe_api_key_handoff {
-            anyhow!("unavailable credential")
-        } else {
-            error
+    let mut store = match ConfigStore::load(config_path) {
+        Ok(store) => store,
+        Err(error) => {
+            if let Some(Commands::Doctor(args)) = command {
+                // Only transport diagnostic options. The TUI reopens the
+                // rejected source with its structural loader and owns the
+                // redacted error formatter; no request can use this default.
+                let diagnostic = ConfigToml::default().resolve_runtime_options(&runtime_overrides);
+                return run_tui_in_process(&cli, &diagnostic, tui_args("doctor", args));
+            }
+            return Err(if pipe_api_key_handoff {
+                anyhow!("unavailable credential")
+            } else {
+                error
+            });
         }
-    })?;
+    };
     // Root session flags only reach the TUI through the `None` branch below;
     // no subcommand handler reads them. Accepting them silently resumes
     // nothing -- `codewhale --resume abc exec "..."` would start a fresh
@@ -2310,7 +2321,6 @@ fn run() -> Result<()> {
             run_tui_in_process(&cli, &resolved_runtime, remote_setup_tui_args(args))
         }
         Some(Commands::Exec(args)) => {
-            reject_exec_global_flags(&args.args)?;
             let resolved_runtime = resolve_runtime_for_dispatch(&mut store, &runtime_overrides);
             run_tui_in_process(&cli, &resolved_runtime, tui_args("exec", args))
         }
@@ -2461,7 +2471,7 @@ fn run() -> Result<()> {
                 );
                 let outcome =
                     run_auth_command_with_runtime(&mut store, command, &runtime_overrides);
-                finish_cli_telemetry(session, &outcome);
+                finish_cli_telemetry(session, &outcome, cli.verbose);
                 outcome
             }
         },
@@ -2494,7 +2504,7 @@ fn run() -> Result<()> {
                 project_bundle_scope,
                 &cli.overrides,
             );
-            finish_cli_telemetry(session, &outcome);
+            finish_cli_telemetry(session, &outcome, cli.verbose);
             outcome
         }
         Some(Commands::Model(args)) => {
@@ -2552,7 +2562,7 @@ fn run() -> Result<()> {
                     "self-update is not supported on HarmonyOS/OpenHarmony yet"
                 ))
             };
-            finish_cli_telemetry(session, &outcome);
+            finish_cli_telemetry(session, &outcome, cli.verbose);
             outcome
         }
         Some(Commands::Providers(args)) => run_providers_command(args),
@@ -2693,16 +2703,16 @@ fn resolve_cli_telemetry_consent(
     Some(consent.with_config_path(config_path))
 }
 
-/// Close the session opened by [`start_cli_telemetry`] and flush, bounded.
+/// Close the short CLI session and seal its events to the local buffer, bounded.
 ///
 /// The exit class comes from what actually happened, never from an exit code:
 /// a cancelled run and a SIGINT both exit 130, so a code-derived class would
 /// mislabel every cancel as a signal.
 ///
-/// The flush re-resolves telemetry from disk before it sends anything, which is
-/// what makes `codewhale config set telemetry false` take effect on the very run
-/// that wrote it rather than on the next one.
-fn finish_cli_telemetry(session: Option<CliTelemetrySession>, outcome: &Result<()>) {
+/// Local persistence re-resolves consent from disk, so a setting changed by
+/// this command takes effect immediately. Configured endpoints send the sealed
+/// events during a later interactive shutdown rather than this short command.
+fn finish_cli_telemetry(session: Option<CliTelemetrySession>, outcome: &Result<()>, verbose: bool) {
     let Some(session) = session else {
         return;
     };
@@ -2723,7 +2733,10 @@ fn finish_cli_telemetry(session: Option<CliTelemetrySession>, outcome: &Result<(
         errors: Errors::default(),
         turn_wall: TurnWall::default(),
     });
-    let _ = telemetry::shutdown_blocking(telemetry::SHUTDOWN_FLUSH_TIMEOUT);
+    let persistence = telemetry::persist_local_blocking();
+    if verbose {
+        eprintln!("telemetry local persistence outcome={persistence:?}");
+    }
 }
 
 fn resolve_runtime_for_dispatch_with_secrets(
@@ -2747,21 +2760,82 @@ fn setup_is_status_report(args: &TuiPassthroughArgs) -> bool {
     args.args.iter().any(|arg| arg == "--status")
 }
 
-fn reject_exec_global_flags(args: &[String]) -> Result<()> {
-    const GLOBAL_ONLY_FLAGS: &[&str] = &["--provider", "--model", "--api-key", "--base-url"];
+/// Clap consumes the escape immediately after the subcommand. Restore it
+/// from the exact argv suffix before interpreting forwarded startup options.
+fn preserve_exec_separator(cli: &mut Cli, argv: &[impl AsRef<std::ffi::OsStr>]) {
+    let Some(Commands::Exec(args)) = cli.command.as_mut() else {
+        return;
+    };
+    let Some(start) = argv.len().checked_sub(args.args.len() + 2) else {
+        return;
+    };
+    if argv[start].as_ref() == "exec"
+        && argv[start + 1].as_ref() == "--"
+        && argv[start + 2..]
+            .iter()
+            .zip(&args.args)
+            .all(|(raw, parsed)| raw.as_ref() == std::ffi::OsStr::new(parsed))
+    {
+        args.args.insert(0, "--".to_string());
+    }
+}
 
-    for arg in args {
+/// Admit exec's recognized startup options through the same Clap definitions
+/// before the one runtime override capture. Unknown forwarded options and all
+/// tokens after `--` retain their order and their existing exec meaning.
+fn capture_exec_startup_options(cli: &mut Cli) -> Result<()> {
+    let Some(Commands::Exec(args)) = cli.command.as_ref() else {
+        return Ok(());
+    };
+    let mut startup = vec!["codewhale".to_string()];
+    let mut forwarded = Vec::with_capacity(args.args.len());
+    let mut seen = std::collections::HashSet::new();
+    let mut args = args.args.iter();
+    while let Some(arg) = args.next() {
         if arg == "--" {
+            forwarded.push(arg.clone());
+            forwarded.extend(args.cloned());
             break;
         }
-        let flag = arg.split_once('=').map_or(arg.as_str(), |(flag, _)| flag);
-        if GLOBAL_ONLY_FLAGS.contains(&flag) {
-            bail!(
-                "{flag} must be placed before `exec`.\n\nUse:\n  codewhale {flag} <value> exec \"<prompt>\""
-            );
+        let (flag, inline) = arg
+            .split_once('=')
+            .map_or((arg.as_str(), None), |(flag, value)| (flag, Some(value)));
+        let already_captured = match flag {
+            "--provider" => cli.provider.is_some(),
+            "--model" => cli.model.is_some(),
+            "--api-key" => cli.api_key.is_some(),
+            "--base-url" => cli.base_url.is_some(),
+            "--config" => cli.config.is_some(),
+            "--profile" => cli.profile.is_some(),
+            _ => {
+                forwarded.push(arg.clone());
+                continue;
+            }
+        };
+        if already_captured || !seen.insert(flag) {
+            bail!("{flag} may be supplied only once, before or after `exec`");
+        }
+        startup.push(arg.clone());
+        if inline.is_none() {
+            let Some(value) = args.next() else {
+                bail!("{flag} requires a value");
+            };
+            startup.push(value.clone());
         }
     }
-
+    // Reuse the canonical parsers, including native config paths and exact
+    // configured provider identifiers. This does not resolve a second route.
+    let captured = Cli::try_parse_from(startup)?;
+    cli.provider = cli.provider.take().or(captured.provider);
+    cli.model = cli.model.take().or(captured.model);
+    cli.api_key = cli.api_key.take().or(captured.api_key);
+    cli.base_url = cli.base_url.take().or(captured.base_url);
+    cli.config = cli.config.take().or(captured.runtime_options.config);
+    cli.profile = cli.profile.take().or(captured.runtime_options.profile);
+    let Some(Commands::Exec(args)) = cli.command.as_mut() else {
+        unreachable!("only exec startup options were captured");
+    };
+    args.args = forwarded;
     Ok(())
 }
 
@@ -6276,7 +6350,10 @@ mod tests {
     use std::sync::{Mutex, OnceLock};
 
     fn parse_ok(argv: &[&str]) -> Cli {
-        Cli::try_parse_from(argv).unwrap_or_else(|err| panic!("parse failed for {argv:?}: {err}"))
+        let mut cli = Cli::try_parse_from(argv)
+            .unwrap_or_else(|err| panic!("parse failed for {argv:?}: {err}"));
+        preserve_exec_separator(&mut cli, argv);
+        cli
     }
 
     /// `lane logs --tail` reads backwards; a line split across a chunk
@@ -9206,54 +9283,162 @@ verbosity = "concise"
     }
 
     #[test]
-    fn exec_rejects_provider_after_subcommand() {
-        let args = vec![
-            "--provider".to_string(),
-            "definitely-not-a-provider".to_string(),
-            "Reply OK".to_string(),
-        ];
-
-        let err = reject_exec_global_flags(&args).expect_err("provider after exec should fail");
-
-        assert!(
-            err.to_string()
-                .contains("--provider must be placed before `exec`")
+    fn exec_routes_provider_after_subcommand_once() {
+        let before = parse_ok(&[
+            "codewhale",
+            "--provider",
+            "openai",
+            "--model",
+            "gpt-5.6",
+            "exec",
+            "Reply OK",
+        ]);
+        let mut after = parse_ok(&[
+            "codewhale",
+            "exec",
+            "--provider",
+            "openai",
+            "--model",
+            "gpt-5.6",
+            "Reply OK",
+        ]);
+        capture_exec_startup_options(&mut after).expect("canonical startup capture");
+        assert_eq!(after.provider, before.provider);
+        assert_eq!(after.model, before.model);
+        assert_eq!(
+            top_level_provider_override(after.provider.as_deref(), after.command.as_ref()).unwrap(),
+            Some(ProviderKind::Openai)
         );
+        let Some(Commands::Exec(args)) = after.command else {
+            panic!("expected exec");
+        };
+        assert_eq!(args.args, ["Reply OK"]);
     }
 
     #[test]
-    fn exec_rejects_equals_form_provider_after_subcommand() {
-        let args = vec!["--provider=openmodel".to_string(), "Reply OK".to_string()];
-
-        let err = reject_exec_global_flags(&args).expect_err("provider after exec should fail");
-
-        assert!(
-            err.to_string()
-                .contains("--provider must be placed before `exec`")
-        );
+    fn exec_rejects_duplicate_startup_options_across_positions() {
+        for tail in ["openai", "openrouter"] {
+            let mut cli = parse_ok(&[
+                "codewhale",
+                "--provider",
+                "openai",
+                "exec",
+                &format!("--provider={tail}"),
+                "Reply OK",
+            ]);
+            let err = capture_exec_startup_options(&mut cli).expect_err("duplicate route pin");
+            assert!(
+                err.to_string()
+                    .contains("--provider may be supplied only once")
+            );
+            assert_eq!(cli.provider.as_deref(), Some("openai"));
+        }
+        let mut cli = parse_ok(&[
+            "codewhale",
+            "exec",
+            "--provider=openai",
+            "--provider=openai",
+            "Reply OK",
+        ]);
+        assert!(capture_exec_startup_options(&mut cli).is_err());
+        assert_eq!(cli.provider, None);
     }
 
     #[test]
     fn exec_allows_documented_forwarded_flags() {
-        let args = vec![
-            "--auto".to_string(),
-            "--output-format".to_string(),
-            "stream-json".to_string(),
-            "fix tests".to_string(),
-        ];
-
-        reject_exec_global_flags(&args).expect("documented exec flags should pass");
+        let mut cli = parse_ok(&[
+            "codewhale",
+            "exec",
+            "--auto",
+            "--model=gpt-5.6",
+            "--output-format",
+            "stream-json",
+            "fix tests",
+        ]);
+        capture_exec_startup_options(&mut cli).expect("documented exec flags should pass");
+        assert_eq!(cli.model.as_deref(), Some("gpt-5.6"));
+        let Some(Commands::Exec(args)) = cli.command else {
+            panic!("expected exec");
+        };
+        assert_eq!(
+            args.args,
+            ["--auto", "--output-format", "stream-json", "fix tests"]
+        );
     }
 
     #[test]
     fn exec_allows_literal_prompt_flags_after_separator() {
-        let args = vec![
-            "--".to_string(),
-            "--provider".to_string(),
-            "is literal prompt text".to_string(),
-        ];
+        let mut cli = parse_ok(&[
+            "codewhale",
+            "exec",
+            "--",
+            "--provider",
+            "is literal prompt text",
+        ]);
+        capture_exec_startup_options(&mut cli).expect("separator should stop startup capture");
+        assert_eq!(cli.provider, None);
+        let Some(Commands::Exec(args)) = cli.command else {
+            panic!("expected exec");
+        };
+        assert_eq!(args.args, ["--", "--provider", "is literal prompt text"]);
 
-        reject_exec_global_flags(&args).expect("separator should stop global flag validation");
+        let mut cli = parse_ok(&[
+            "codewhale",
+            "--provider=openai",
+            "exec",
+            "--",
+            "--provider=literal",
+            "--model=literal",
+            "--",
+        ]);
+        capture_exec_startup_options(&mut cli).expect("escaped route flags stay literal");
+        assert_eq!(cli.provider.as_deref(), Some("openai"));
+        assert_eq!(cli.model, None);
+        let Some(Commands::Exec(args)) = cli.command else {
+            panic!("expected exec");
+        };
+        assert_eq!(
+            args.args,
+            ["--", "--provider=literal", "--model=literal", "--"]
+        );
+    }
+
+    #[test]
+    fn exec_captures_config_and_profile_before_runtime_precedence() {
+        let mut cli = parse_ok(&[
+            "codewhale",
+            "exec",
+            "--config=chosen.toml",
+            "--profile",
+            "chosen",
+            "--provider=openai",
+            "--api-key=fixture-key",
+            "--base-url=http://127.0.0.1:9/v1",
+            "Reply OK",
+        ]);
+        capture_exec_startup_options(&mut cli).expect("canonical typed options");
+        assert_eq!(cli.config.as_deref(), Some(Path::new("chosen.toml")));
+        assert_eq!(cli.profile.as_deref(), Some("chosen"));
+        assert_eq!(cli.api_key.as_deref(), Some("fixture-key"));
+        assert_eq!(cli.base_url.as_deref(), Some("http://127.0.0.1:9/v1"));
+        for flag in [
+            "--config",
+            "--profile",
+            "--api-key",
+            "--base-url",
+            "--model",
+        ] {
+            let mut cli = parse_ok(&[
+                "codewhale",
+                flag,
+                "first",
+                "exec",
+                flag,
+                "second",
+                "Reply OK",
+            ]);
+            assert!(capture_exec_startup_options(&mut cli).is_err(), "{flag}");
+        }
     }
 
     #[test]
@@ -10457,11 +10642,23 @@ verbosity = "concise"
             status.contains("CODEWHALE_CHATGPT_NEW_ACCOUNT=1 codewhale auth chatgpt"),
             "{status}"
         );
-        assert!(get.starts_with("openai-codex: not set"), "{get}");
+        assert!(
+            get.starts_with("openai-codex: not set"),
+            "official ChatGPT must remain unset without an owned grant"
+        );
         for output in [&status, &get, &list, &summary] {
-            assert!(!output.contains("secret-99"), "{output}");
-            assert!(!output.contains("active source: env"), "{output}");
-            assert!(!output.contains("external-consent"), "{output}");
+            assert!(
+                !output.contains("secret-99"),
+                "authentication diagnostic leaked token material"
+            );
+            assert!(
+                !output.contains("active source: env"),
+                "official ChatGPT must not select ambient credentials"
+            );
+            assert!(
+                !output.contains("external-consent"),
+                "authentication diagnostic leaked external consent"
+            );
         }
         assert!(
             !keyring.queried().iter().any(|slot| slot == "openai-codex"),
@@ -10505,9 +10702,18 @@ verbosity = "concise"
             "{status}"
         );
         for output in [&status, &get, &list, &summary] {
-            assert!(output.contains("config (last4: ...9966)"), "{output}");
-            assert!(!output.contains("secret-99"), "{output}");
-            assert!(!output.contains("verified grant"), "{output}");
+            assert!(
+                output.contains("config (last4: ...9966)"),
+                "custom endpoint diagnostic must report its bound key source"
+            );
+            assert!(
+                !output.contains("secret-99"),
+                "custom endpoint diagnostic leaked token material"
+            );
+            assert!(
+                !output.contains("verified grant"),
+                "custom endpoint must not report an official OAuth grant"
+            );
         }
         assert!(!status.contains("switch account:"), "{status}");
 
@@ -10521,10 +10727,13 @@ verbosity = "concise"
             ProviderKind::OpenaiCodex,
             &another_endpoint,
         );
-        assert!(get.starts_with("openai-codex: not set"), "{get}");
+        assert!(
+            get.starts_with("openai-codex: not set"),
+            "a different endpoint must not reuse the configured key"
+        );
         assert!(
             !get.contains("9966"),
-            "key must remain bound to its configured endpoint: {get}"
+            "key must remain bound to its configured endpoint"
         );
         let explicit = CliRuntimeOverrides {
             api_key: Some("explicit-secret-9977".to_string()),
@@ -10532,8 +10741,14 @@ verbosity = "concise"
         };
         let get =
             auth_get_line_with_runtime(&store, &secrets, ProviderKind::OpenaiCodex, &explicit);
-        assert!(get.contains("cli (last4: ...9977)"), "{get}");
-        assert!(!get.contains("explicit-secret"), "{get}");
+        assert!(
+            get.contains("cli (last4: ...9977)"),
+            "an explicit key must report its CLI source"
+        );
+        assert!(
+            !get.contains("explicit-secret"),
+            "authentication diagnostic leaked the explicit key"
+        );
     }
 
     #[test]
@@ -10573,7 +10788,7 @@ verbosity = "concise"
             ] {
                 assert!(
                     !output.contains(secret),
-                    "URL or credential leaked in diagnostic output: {output}"
+                    "URL or credential leaked in diagnostic output"
                 );
             }
         }
@@ -10703,7 +10918,10 @@ verbosity = "concise"
         );
         for output in [&codex, &xai, &list] {
             for secret in ["secret-99", chatgpt_claims, xai_claims] {
-                assert!(!output.contains(secret), "{secret} leaked: {output}");
+                assert!(
+                    !output.contains(secret),
+                    "owned sign-in diagnostic leaked token material"
+                );
             }
         }
 
@@ -10731,7 +10949,10 @@ verbosity = "concise"
                 ProviderKind::OpenaiCodex,
                 &CliRuntimeOverrides::default(),
             );
-            assert!(get.contains("b@example.com (pro)"), "{get}");
+            assert!(
+                get.contains("b@example.com (pro)"),
+                "owned sign-in diagnostic must retain the selected account label"
+            );
             let summary = auth_status_all_providers(&store, &secrets).join("\n");
             assert!(
                 summary.contains("Codewhale-owned ChatGPT sign-in as b@example.com (pro)"),
@@ -10836,8 +11057,14 @@ verbosity = "concise"
             get.starts_with("xai: configured (source: Codewhale-owned OAuth generation"),
             "{get}"
         );
-        assert!(!get.starts_with("xai: set"), "{get}");
-        assert!(!get.contains("fallback"), "{get}");
+        assert!(
+            !get.starts_with("xai: set"),
+            "owned OAuth must not be reported as an API key"
+        );
+        assert!(
+            !get.contains("fallback"),
+            "owned OAuth must not report a fallback credential"
+        );
         // #6715 review: no surface says "storage unprobed" for a route whose
         // generation `auth status` opens for the account label; only the
         // token's availability is left unverified.
@@ -12781,8 +13008,9 @@ verbosity = "concise"
             }
         }
         let exec = help_for(&["codewhale", "exec", "--help"]);
-        assert!(exec.contains("go before exec"), "{exec}");
+        assert!(exec.contains("work before or after exec"), "{exec}");
         assert!(exec.contains("codewhale --model MODEL exec"), "{exec}");
+        assert!(exec.contains("codewhale exec --model MODEL"), "{exec}");
         let rc = help_for(&["codewhale", "rc", "--help"]);
         assert!(rc.contains("hand it to the Codewhale web app"), "{rc}");
     }

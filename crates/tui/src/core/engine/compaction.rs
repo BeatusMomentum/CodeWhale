@@ -129,7 +129,11 @@ impl Engine {
         details["session_id"] = serde_json::json!(self.session.id);
         details["thread_id"] = serde_json::json!(self.config.runtime_services.active_thread_id);
         details["model"] = serde_json::json!(self.config.model);
+        #[cfg(test)]
+        let env_ticket = crate::test_support::env_scope_ticket();
         if let Err(error) = tokio::task::spawn_blocking(move || {
+            #[cfg(test)]
+            let _membership = crate::test_support::join_env_scope(env_ticket);
             crate::audit::log_sensitive_event(event, details);
         })
         .await

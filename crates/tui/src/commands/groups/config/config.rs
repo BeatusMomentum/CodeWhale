@@ -4546,7 +4546,12 @@ mod tests {
         .expect("legacy hosted config");
         let mut app = create_test_app();
         app.config_path = Some(config_path.clone());
-        app.set_provider_identity(ProviderKind::OllamaCloud, "ollama");
+        app.set_provider_identity_record(
+            Config::load(Some(config_path.clone()), None)
+                .expect("captured hosted config")
+                .active_provider_identity()
+                .expect("captured hosted identity"),
+        );
         app.active_route_base_url = "https://ollama.com/v1".to_string();
         app.model_ids_passthrough = true;
 
@@ -5302,7 +5307,11 @@ context_window = 262144
         .unwrap();
         let mut app = create_test_app();
         app.config_path = Some(config_path);
-        app.api_provider = ProviderKind::Moonshot;
+        app.set_provider_identity_record(
+            crate::config::Config::default()
+                .resolve_provider_identity(ProviderKind::Moonshot.as_str())
+                .expect("captured fixture provider"),
+        );
         app.model = "kimi-k3".to_string();
         app.active_route_limits = Some(codewhale_config::route::RouteLimits {
             context_tokens: Some(262_144),
@@ -5716,7 +5725,11 @@ context_window = 262144
         let config_path = temp_root.join("custom-config.toml");
 
         let mut app = create_test_app();
-        app.api_provider = ProviderKind::XiaomiMimo;
+        app.set_provider_identity_record(
+            crate::config::Config::default()
+                .resolve_provider_identity(ProviderKind::XiaomiMimo.as_str())
+                .expect("captured fixture provider"),
+        );
         app.config_path = Some(config_path.clone());
         let result = config_command(&mut app, Some("provider_url token-plan --save"));
         let msg = result.message.unwrap();
@@ -6514,8 +6527,10 @@ context_window = 262144
         );
         let message = result.message.expect("error message");
 
+        assert!(result.is_error);
+        assert!(result.action.is_none());
         assert!(
-            message.contains("named [providers.<name>] table"),
+            message.contains("[providers.custom-a]") && message.contains("missing"),
             "{message}"
         );
     }

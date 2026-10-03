@@ -7365,7 +7365,11 @@ mod tests {
         std::fs::write(&import_file, &json).unwrap();
 
         // This window is on a non-default route; the import must bind to it.
-        app.api_provider = crate::config::ProviderKind::Openai;
+        app.set_provider_identity_record(
+            crate::config::Config::default()
+                .resolve_provider_identity(crate::config::ProviderKind::Openai.as_str())
+                .expect("captured fixture provider"),
+        );
         let receipt = {
             let mut bundle = app.command_contexts();
             let mut parts = bundle.parts();

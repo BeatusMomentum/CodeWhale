@@ -280,23 +280,28 @@ fn acl_snapshot(path: &Path, exclude: Option<PSID>) -> Vec<Vec<u8>> {
     };
     assert_eq!(error, 0, "cannot inspect control ACL");
     let _descriptor = LocalAllocation(descriptor);
-    assert!(!dacl.is_null(), "control must have an actual DACL");
+    let dacl = std::ptr::NonNull::new(dacl).expect("control must have an actual DACL");
     let mut result = Vec::new();
-    for index in 0..unsafe { (*dacl).AceCount as u32 } {
+    for index in 0..unsafe { dacl.as_ref().AceCount as u32 } {
         let mut ace = null_mut();
-        assert_ne!(unsafe { GetAce(dacl, index, &mut ace) }, 0);
-        let header = unsafe { &*(ace as *const ACE_HEADER) };
+        assert_ne!(unsafe { GetAce(dacl.as_ptr(), index, &mut ace) }, 0);
+        let ace = std::ptr::NonNull::new(ace).expect("GetAce must return an actual ACE");
+        let header = unsafe { ace.cast::<ACE_HEADER>().as_ref() };
+        assert!(header.AceSize as usize >= std::mem::size_of::<ACE_HEADER>());
         if header.AceType as u32 == ACCESS_ALLOWED_ACE_TYPE {
             assert!(header.AceSize as usize >= std::mem::size_of::<ACCESS_ALLOWED_ACE>());
-            let sid =
-                unsafe { std::ptr::addr_of_mut!((*(ace as *mut ACCESS_ALLOWED_ACE)).SidStart) };
+            let sid = unsafe {
+                std::ptr::addr_of_mut!((*ace.cast::<ACCESS_ALLOWED_ACE>().as_ptr()).SidStart)
+            };
             if exclude.is_some_and(|profile| unsafe { EqualSid(profile, sid.cast()) } != 0) {
                 continue;
             }
         }
         result.push(
-            unsafe { std::slice::from_raw_parts(ace as *const u8, header.AceSize as usize) }
-                .to_vec(),
+            unsafe {
+                std::slice::from_raw_parts(ace.cast::<u8>().as_ptr(), header.AceSize as usize)
+            }
+            .to_vec(),
         );
     }
     result

@@ -1302,7 +1302,11 @@ mod tests {
             seed.save().expect("seed settings");
         }
         let mut app = create_test_app();
-        app.api_provider = crate::config::ProviderKind::Zai;
+        app.set_provider_identity_record(
+            crate::config::Config::default()
+                .resolve_provider_identity(crate::config::ProviderKind::Zai.as_str())
+                .expect("captured fixture provider"),
+        );
         app.model_ids_passthrough = false;
         app.model = crate::config::DEFAULT_ZAI_MODEL.to_string();
         app.auto_model = false;
@@ -1333,7 +1337,11 @@ mod tests {
     fn model_command_keeps_glm_53_as_its_own_wire_id() {
         let _settings = SettingsPathGuard::new();
         let mut app = create_test_app();
-        app.api_provider = crate::config::ProviderKind::Zai;
+        app.set_provider_identity_record(
+            crate::config::Config::default()
+                .resolve_provider_identity(crate::config::ProviderKind::Zai.as_str())
+                .expect("captured fixture provider"),
+        );
         app.model_ids_passthrough = false;
         app.model = crate::config::ZAI_GLM_5_2_MODEL.to_string();
         app.auto_model = false;
@@ -1674,7 +1682,10 @@ mod tests {
         assert!(msg.contains("https://cloud.baidu.com/doc/qianfan/index.html"));
         assert!(msg.contains("Local Ollama is keyless by default"));
         assert!(msg.contains("codewhale auth chatgpt"));
-        assert!(msg.contains("codex login"));
+        assert!(
+            !msg.contains("codex login"),
+            "official sign-in must not direct users to external CLI credentials"
+        );
         assert!(msg.contains("no canonical vendor credential page exists"));
         assert!(msg.contains("OPENAI_API_KEY"));
         assert!(msg.contains("XIAOMI_MIMO_TOKEN_PLAN_API_KEY"));

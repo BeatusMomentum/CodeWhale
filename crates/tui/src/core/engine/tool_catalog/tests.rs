@@ -26,10 +26,8 @@ fn tool(name: &str) -> Tool {
     }
 }
 
-/// `code_execution` writes the script to a tempdir and runs it as a plain
-/// child process in the workspace — no seccomp, no jail, no container. The
-/// description is model-facing, so calling it a sandbox would tell the model
-/// it has isolation the runtime never provides.
+/// The shared launcher applies policy only where enforcement is available.
+/// The model-facing description must not promise unconditional isolation.
 #[test]
 fn code_execution_description_does_not_claim_process_sandboxing() {
     assert!(CODE_EXECUTION_DESCRIPTION.contains("local Python interpreter"));
@@ -441,7 +439,8 @@ async fn dropped_code_execution_kills_the_interpreter_tree() {
         pid_file.display().to_string()
     );
     let input = json!({ "code": code });
-    let run = super::execute_code_execution_tool(&input, tmp.path());
+    let context = crate::tools::spec::ToolContext::new(tmp.path());
+    let run = super::execute_code_execution_tool(&input, tmp.path(), &context);
     let grandchild = crate::process_tree::drop_once_pid_written(run, &pid_file).await;
     assert!(
         crate::process_tree::wait_for_pid_exit(grandchild, std::time::Duration::from_secs(5)),

@@ -1243,98 +1243,112 @@ async fn injected_model_sandbox_escalation_applies_only_after_exact_call_approva
     use crate::llm_client::mock::{MockLlmClient, canned};
 
     const COMMAND: &str = "echo elevated > escalation.txt";
-    let workspace = tempdir().expect("tempdir");
-    let mock = std::sync::Arc::new(MockLlmClient::new(vec![
-        canned::tool_call_turn(
-            "call-escalated-bash",
-            "bash",
-            r#"{"command":"echo elevated > escalation.txt","sandbox_permissions":"workspace-write","justification":"the exact command writes the requested workspace proof"}"#,
+    for (tool, source) in [
+        ("bash", json!({"command": COMMAND})),
+        (
+            CODE_EXECUTION_TOOL_NAME,
+            json!({"code": "open('escalation.txt', 'w').write('approved')"}),
         ),
-        canned::simple_text_turn("Escalated command complete."),
-    ]));
-    let client: crate::core::model_client::SharedModelClient = mock.clone();
-    let config = Config {
-        sandbox_mode: Some("read-only".to_string()),
-        ..Config::default()
-    };
-    let mut engine_config = deterministic_engine_config(workspace.path());
-    engine_config.exec_policy_engine = ask_rule_engine(COMMAND);
-    let (engine, handle) = Engine::new_with_model_client(engine_config, &config, client);
-    let task = tokio::spawn(engine.run());
-    handle
-        .send(external_user_message_op(
-            "Create the escalation proof after approval.",
-            AppMode::Agent,
-            &config,
-        ))
-        .await
-        .expect("send escalation journey");
-
-    let mut approved_result = None;
-    let mut rx = handle.rx_event.write().await;
-    loop {
-        let event = tokio::time::timeout(model_turn_event_timeout(), rx.recv())
+        (
+            JS_EXECUTION_TOOL_NAME,
+            json!({"code": "require('fs').writeFileSync('escalation.txt', 'approved')"}),
+        ),
+    ] {
+        let mut input = source;
+        input["sandbox_permissions"] = json!("workspace-write");
+        input["justification"] = json!("the exact command writes the requested workspace proof");
+        let workspace = tempdir().expect("tempdir");
+        let mock = std::sync::Arc::new(MockLlmClient::new(vec![
+            canned::tool_call_turn("call-escalated-bash", tool, &input.to_string()),
+            canned::simple_text_turn("Escalated command complete."),
+        ]));
+        let client: crate::core::model_client::SharedModelClient = mock.clone();
+        let config = Config {
+            sandbox_mode: Some("read-only".to_string()),
+            ..Config::default()
+        };
+        let mut engine_config = deterministic_engine_config(workspace.path());
+        engine_config.exec_policy_engine = ask_rule_engine(COMMAND);
+        let (engine, handle) = Engine::new_with_model_client(engine_config, &config, client);
+        let task = tokio::spawn(engine.run());
+        handle
+            .send(external_user_message_op(
+                "Create the escalation proof after approval.",
+                AppMode::Agent,
+                &config,
+            ))
             .await
-            .expect("timed out waiting for escalation journey")
-            .expect("engine event stream closed");
-        match event {
-            Event::ApprovalRequired {
-                id,
-                input,
-                description,
-                ..
-            } => {
-                assert_eq!(input["sandbox_permissions"], "workspace-write");
-                assert!(
-                    description.contains("the exact command writes the requested workspace proof"),
-                    "{description}"
-                );
-                assert!(
-                    description.contains("Additional approval gate"),
-                    "the sandbox grant must not hide the typed ask rule: {description}"
-                );
-                assert!(
-                    description.contains("Typed ask rule"),
-                    "the typed ask rule must not hide the sandbox grant: {description}"
-                );
-                assert!(
-                    !workspace.path().join("escalation.txt").exists(),
-                    "approval must happen before execution"
-                );
-                handle
-                    .approve_tool_call(&id)
-                    .await
-                    .expect("approve exact escalated call");
-            }
-            Event::ToolCallComplete {
-                model_call: Some(model_call),
-                result,
-                ..
-            } if model_call.provider_id == "call-escalated-bash" => {
-                approved_result = Some(result.expect("approved escalation result"));
-            }
-            Event::TurnComplete { status, error, .. } => {
-                assert_eq!(status, TurnOutcomeStatus::Completed, "{error:?}");
-                break;
-            }
-            _ => {}
-        }
-    }
-    drop(rx);
+            .expect("send escalation journey");
 
-    let result = approved_result.expect("paired escalated tool result");
-    assert!(result.success, "{result:?}");
-    assert!(
-        result
-            .content
-            .contains("approved by the user with an adjusted execution policy"),
-        "{}",
-        result.content
-    );
-    assert!(workspace.path().join("escalation.txt").exists());
-    assert_eq!(mock.call_count(), 2);
-    handle.send(Op::Shutdown).await.expect("shutdown engine");
-    task.await.expect("engine task");
+        let mut approved_result = None;
+        let mut rx = handle.rx_event.write().await;
+        loop {
+            let event = tokio::time::timeout(model_turn_event_timeout(), rx.recv())
+                .await
+                .expect("timed out waiting for escalation journey")
+                .expect("engine event stream closed");
+            match event {
+                Event::ApprovalRequired {
+                    id,
+                    input,
+                    description,
+                    ..
+                } => {
+                    assert_eq!(input["sandbox_permissions"], "workspace-write");
+                    assert!(
+                        description
+                            .contains("the exact command writes the requested workspace proof"),
+                        "{description}"
+                    );
+                    if tool == "bash" {
+                        assert!(
+                            description.contains("Additional approval gate"),
+                            "the sandbox grant must not hide the typed ask rule: {description}"
+                        );
+                        assert!(
+                            description.contains("Typed ask rule"),
+                            "the typed ask rule must not hide the sandbox grant: {description}"
+                        );
+                    }
+                    assert!(
+                        !workspace.path().join("escalation.txt").exists(),
+                        "approval must happen before execution"
+                    );
+                    handle
+                        .approve_tool_call(&id)
+                        .await
+                        .expect("approve exact escalated call");
+                }
+                Event::ToolCallComplete {
+                    model_call: Some(model_call),
+                    result,
+                    ..
+                } if model_call.provider_id == "call-escalated-bash" => {
+                    approved_result = Some(result.expect("approved escalation result"));
+                }
+                Event::TurnComplete { status, error, .. } => {
+                    assert_eq!(status, TurnOutcomeStatus::Completed, "{error:?}");
+                    break;
+                }
+                _ => {}
+            }
+        }
+        drop(rx);
+
+        let result = approved_result.expect("paired escalated tool result");
+        assert!(result.success, "{result:?}");
+        assert!(
+            result
+                .content
+                .contains("approved by the user with an adjusted execution policy"),
+            "{}",
+            result.content
+        );
+        assert!(workspace.path().join("escalation.txt").exists());
+        assert_eq!(mock.call_count(), 2);
+        handle.send(Op::Shutdown).await.expect("shutdown engine");
+        task.await.expect("engine task");
+    }
 }
 
 #[tokio::test]
@@ -1355,85 +1369,92 @@ async fn sandbox_escalation_fails_closed_when_the_posture_cannot_prompt() {
             "requires a one-shot user approval",
         ),
     ] {
-        let workspace = tempdir().expect("tempdir");
-        let mock = std::sync::Arc::new(MockLlmClient::new(vec![
-            canned::tool_call_turn(
-                "call-unattended-escalation",
-                "bash",
-                r#"{"command":"echo denied > escalation.txt","sandbox_permissions":"workspace-write","justification":"the command needs workspace write access"}"#,
-            ),
-            canned::simple_text_turn("Escalation was unavailable."),
-        ]));
-        if matches!(approval_mode, ApprovalMode::Auto) {
-            // Let Auto-Review's independent guardian approve the bounded
-            // fixture call so this test reaches the separate rule under test:
-            // unattended postures still cannot mint a sandbox escalation.
-            mock.push_message_response(guardian_fixture_response(
-                r#"{"risk_level":"low","decision":"allow","reason":"isolated fixture write"}"#,
-            ));
-        }
-        let client: crate::core::model_client::SharedModelClient = mock.clone();
-        let config = Config {
-            sandbox_mode: Some("read-only".to_string()),
-            ..Config::default()
-        };
-        let (engine, handle) = Engine::new_with_model_client(
-            deterministic_engine_config(workspace.path()),
-            &config,
-            client,
-        );
-        let task = tokio::spawn(engine.run());
-        let mut op = external_user_message_op(
-            "Do not pause for an unattended escalation.",
-            AppMode::Agent,
-            &config,
-        );
-        let Op::SendMessage(TurnSpec {
-            approval_mode: op_approval_mode,
-            auto_approve: op_auto_approve,
-            ..
-        }) = &mut op
-        else {
-            panic!("user message op")
-        };
-        *op_approval_mode = approval_mode;
-        *op_auto_approve = auto_approve;
-        handle.send(op).await.expect("send unattended escalation");
-
-        let mut saw_denial = false;
-        let mut rx = handle.rx_event.write().await;
-        loop {
-            let event = tokio::time::timeout(model_turn_event_timeout(), rx.recv())
-                .await
-                .expect("timed out waiting for unattended escalation")
-                .expect("engine event stream closed");
-            match event {
-                Event::ApprovalRequired { .. } => {
-                    panic!("{posture} must not open an escalation prompt")
-                }
-                Event::ToolCallComplete {
-                    model_call: Some(model_call),
-                    result,
-                    ..
-                } if model_call.provider_id == "call-unattended-escalation" => {
-                    let error = result.expect_err("unattended escalation must be denied");
-                    assert!(error.to_string().contains(expected_denial), "{error}");
-                    assert!(error.to_string().contains(posture), "{error}");
-                    saw_denial = true;
-                }
-                Event::TurnComplete { status, error, .. } => {
-                    assert_eq!(status, TurnOutcomeStatus::Completed, "{error:?}");
-                    break;
-                }
-                _ => {}
+        for tool in ["bash", CODE_EXECUTION_TOOL_NAME, JS_EXECUTION_TOOL_NAME] {
+            let mut input = if tool == CODE_EXECUTION_TOOL_NAME {
+                json!({"code": "open('escalation.txt', 'w').write('denied')"})
+            } else if tool == JS_EXECUTION_TOOL_NAME {
+                json!({"code": "require('fs').writeFileSync('escalation.txt', 'denied')"})
+            } else {
+                json!({"command": "echo denied > escalation.txt"})
+            };
+            input["sandbox_permissions"] = json!("workspace-write");
+            input["justification"] = json!("this execution needs workspace write access");
+            let workspace = tempdir().expect("tempdir");
+            let mock = std::sync::Arc::new(MockLlmClient::new(vec![
+                canned::tool_call_turn("call-unattended-escalation", tool, &input.to_string()),
+                canned::simple_text_turn("Escalation was unavailable."),
+            ]));
+            if matches!(approval_mode, ApprovalMode::Auto) {
+                // Let Auto-Review's independent guardian approve the bounded
+                // fixture call so this test reaches the separate rule under test:
+                // unattended postures still cannot mint a sandbox escalation.
+                mock.push_message_response(guardian_fixture_response(
+                    r#"{"risk_level":"low","decision":"allow","reason":"isolated fixture write"}"#,
+                ));
             }
-        }
-        drop(rx);
+            let client: crate::core::model_client::SharedModelClient = mock.clone();
+            let config = Config {
+                sandbox_mode: Some("read-only".to_string()),
+                ..Config::default()
+            };
+            let (engine, handle) = Engine::new_with_model_client(
+                deterministic_engine_config(workspace.path()),
+                &config,
+                client,
+            );
+            let task = tokio::spawn(engine.run());
+            let mut op = external_user_message_op(
+                "Do not pause for an unattended escalation.",
+                AppMode::Agent,
+                &config,
+            );
+            let Op::SendMessage(TurnSpec {
+                approval_mode: op_approval_mode,
+                auto_approve: op_auto_approve,
+                ..
+            }) = &mut op
+            else {
+                panic!("user message op")
+            };
+            *op_approval_mode = approval_mode;
+            *op_auto_approve = auto_approve;
+            handle.send(op).await.expect("send unattended escalation");
 
-        assert!(saw_denial);
-        assert!(!workspace.path().join("escalation.txt").exists());
-        handle.send(Op::Shutdown).await.expect("shutdown engine");
-        task.await.expect("engine task");
+            let mut saw_denial = false;
+            let mut rx = handle.rx_event.write().await;
+            loop {
+                let event = tokio::time::timeout(model_turn_event_timeout(), rx.recv())
+                    .await
+                    .expect("timed out waiting for unattended escalation")
+                    .expect("engine event stream closed");
+                match event {
+                    Event::ApprovalRequired { .. } => {
+                        panic!("{posture} must not open an escalation prompt")
+                    }
+                    Event::ToolCallComplete {
+                        model_call: Some(model_call),
+                        result,
+                        ..
+                    } if model_call.provider_id == "call-unattended-escalation" => {
+                        let error = result.expect_err("unattended escalation must be denied");
+                        assert!(error.to_string().contains(expected_denial), "{error}");
+                        assert!(error.to_string().contains(posture), "{error}");
+                        saw_denial = true;
+                    }
+                    Event::TurnComplete { status, error, .. } => {
+                        assert_eq!(status, TurnOutcomeStatus::Completed, "{error:?}");
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            drop(rx);
+
+            assert!(saw_denial);
+            assert!(!workspace.path().join("escalation.txt").exists());
+            handle.send(Op::Shutdown).await.expect("shutdown engine");
+            task.await.expect("engine task");
+        }
     }
 }
 

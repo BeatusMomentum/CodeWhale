@@ -836,14 +836,25 @@ mod tests {
     #[test]
     fn provider_fallback_reset_targets_primary_even_when_on_fallback() {
         let _lock = lock_test_env();
-        let mut app = create_test_app();
+        let mut providers = crate::config::ProvidersConfig::default();
+        providers.openrouter.api_key = Some("fixture-fallback-key".to_string());
+        let config = crate::config::Config {
+            provider: Some("deepseek".to_string()),
+            fallback_providers: vec![ProviderKind::Openrouter],
+            providers: Some(providers),
+            ..Default::default()
+        };
+        let mut app = App::new(
+            crate::test_support::test_tui_options(std::path::PathBuf::from(".")),
+            &config,
+        );
         app.api_provider = ProviderKind::Deepseek;
         app.provider_chain = Some(codewhale_config::ProviderChain::new(
             codewhale_config::ProviderKind::Deepseek,
             &[codewhale_config::ProviderKind::Openrouter],
         ));
         // Simulate having already fallen back to the secondary provider.
-        // (Openrouter is treated as ready by default — no readiness snapshot.)
+        // The secondary route is admitted from the captured fixture config.
         let advanced = app.advance_fallback("recoverable error");
         assert_eq!(advanced, Some(ProviderKind::Openrouter));
         assert_eq!(app.api_provider, ProviderKind::Openrouter);

@@ -1,6 +1,7 @@
 //! Frozen mounted transcript rendering counterpart from the Composer-inherited base.
 //! Unused ambient wrappers and the wall-clock constructor are omitted; the
-//! retained rendering and selection fragments stay unchanged.
+//! retained rendering and selection fragments stay unchanged except for the
+//! explicitly adopted viewport-relative prompt pin and its row reservation.
 use super::*;
 use ratatui::widgets::{Scrollbar, ScrollbarOrientation, ScrollbarState, StatefulWidget};
 const JUMP_TO_LATEST_BUTTON_WIDTH: u16 = 3;
@@ -455,7 +456,7 @@ impl ChatWidget {
         // only when the prompt has actually scrolled above it. Resolving once
         // more with the smaller body keeps the newest tail line visible.
         let mut transcript_area = content_area;
-        let pinned_prompt = (app.pin_last_prompt && content_area.height > 1)
+        let mut pinned_prompt = (app.pin_last_prompt && content_area.height > 1)
             .then(|| {
                 scrolled_user_prompt_pin(
                     &app.history,
@@ -472,6 +473,15 @@ impl ChatWidget {
             let visible = usize::from(transcript_area.height);
             (total_lines, top, was_explicit_tail) =
                 resolve_transcript_viewport_after_layout(&mut app.viewport, visible);
+            // The approved pin follows the final viewport after its row is
+            // reserved, including a newer prompt that was at the old top.
+            pinned_prompt = scrolled_user_prompt_pin(
+                &app.history,
+                app.viewport.transcript_cache.line_meta(),
+                &app.collapsed_cell_map,
+                top,
+                content_area.width,
+            );
             visible
         } else {
             visible_lines
@@ -745,40 +755,38 @@ fn scrolled_user_prompt_pin(
     top: usize,
     width: u16,
 ) -> Option<Line<'static>> {
-    if width == 0 {
+    if width == 0 || top == 0 {
         return None;
     }
-    let (orig_idx, content) =
-        history
-            .iter()
-            .enumerate()
-            .rev()
-            .find_map(|(idx, cell)| match cell {
-                HistoryCell::User { content } if !content.trim().is_empty() => {
-                    Some((idx, content.as_str()))
-                }
-                _ => None,
-            })?;
-    // The newest prompt sits near the tail, so search backward; a forward
-    // scan cost O(transcript) on every frame of a long session (#6652).
-    let first_line = line_meta.iter().rposition(|meta| match meta {
-        TranscriptLineMeta::CellLine {
+    // Freeze the approved viewport-relative pin semantics while retaining
+    // this renderer's independent full-buffer and layout comparison.
+    let user_first_line = |meta: &TranscriptLineMeta| -> Option<usize> {
+        let TranscriptLineMeta::CellLine {
             cell_index,
-            line_in_cell,
+            line_in_cell: 0,
             ..
-        } => {
-            let original = collapsed_cell_map
-                .get(*cell_index)
-                .copied()
-                .unwrap_or(*cell_index);
-            original == orig_idx && *line_in_cell == 0
+        } = meta
+        else {
+            return None;
+        };
+        let original = collapsed_cell_map
+            .get(*cell_index)
+            .copied()
+            .unwrap_or(*cell_index);
+        let content = match history.get(original) {
+            Some(HistoryCell::User { content }) => content,
+            _ => return None,
+        };
+        if content.lines().next().unwrap_or("").trim().is_empty() {
+            return None;
         }
-        _ => false,
-    });
-    let first_line = first_line?;
-    if first_line >= top {
-        return None;
-    }
+        Some(original)
+    };
+    let orig_idx = line_meta.iter().take(top).rev().find_map(user_first_line)?;
+    let content = match history.get(orig_idx) {
+        Some(HistoryCell::User { content }) => content,
+        _ => return None,
+    };
 
     let first = content.lines().next().unwrap_or("").trim();
     if first.is_empty() {

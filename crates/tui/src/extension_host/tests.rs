@@ -1763,6 +1763,96 @@ async fn sandboxed_host_boundary(
         assert_eq!(escaped["ok"], false, "{escaped}");
         assert!(!leaked);
     }
+    // Bun's TCP error adapter collapses Darwin's EPERM into ECONNREFUSED.
+    // Its UDP adapter retains the OS errno, so use a real bound datagram
+    // receiver there; every other runtime/platform keeps the TCP control.
+    let (denied, accepted_count, protocol) =
+        if cfg!(target_os = "macos") && choice == crate::config::ExtensionHostRuntime::Bun {
+            let listener = tokio::net::UdpSocket::bind(("127.0.0.1", 0)).await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let positive = tokio::net::UdpSocket::bind(("127.0.0.1", 0)).await.unwrap();
+            let marker = b"controller-network-probe";
+            assert_eq!(
+                positive.send_to(marker, address).await.unwrap(),
+                marker.len()
+            );
+            let mut packet = [0_u8; 64];
+            let (bytes, sender) =
+                tokio::time::timeout(Duration::from_secs(2), listener.recv_from(&mut packet))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(&packet[..bytes], marker);
+            assert_eq!(sender, positive.local_addr().unwrap());
+            let mut accepted_count = 1;
+            let send = host_tool(&engine, fixture.workspace(), "probe_send");
+            let result = tokio::time::timeout(
+                Duration::from_secs(5),
+                send.execute(json!({"port": address.port()}), &context),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let denied: Value = serde_json::from_str(&result.content).unwrap();
+            if tokio::time::timeout(Duration::from_millis(100), listener.recv_from(&mut packet))
+                .await
+                .is_ok()
+            {
+                accepted_count += 1;
+            }
+            (denied, accepted_count, "udp")
+        } else {
+            // The unsandboxed controller reaches this actual listener. The Native
+            // host must fail the same connection at its own OS sandbox boundary.
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .unwrap();
+            let address = listener.local_addr().unwrap();
+            let positive = tokio::net::TcpStream::connect(address).await.unwrap();
+            let (accepted, _) = tokio::time::timeout(Duration::from_secs(2), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            let mut accepted_count = 1;
+            drop(positive);
+            drop(accepted);
+            let connect = host_tool(&engine, fixture.workspace(), "probe_connect");
+            let result = tokio::time::timeout(
+                Duration::from_secs(5),
+                connect.execute(json!({"port": address.port()}), &context),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let denied: Value = serde_json::from_str(&result.content).unwrap();
+            if tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                .await
+                .is_ok()
+            {
+                accepted_count += 1;
+            }
+            (denied, accepted_count, "tcp")
+        };
+    assert_eq!(
+        denied["ok"], false,
+        "Native host reached {protocol} controller: {denied}"
+    );
+    assert!(
+        matches!(denied["code"].as_str(), Some("EPERM" | "EACCES")),
+        "connection must be refused by the OS sandbox: {denied}"
+    );
+    assert_eq!(
+        accepted_count, 1,
+        "only the controller reached the listener"
+    );
+    if choice == crate::config::ExtensionHostRuntime::Bun {
+        eprintln!(
+            "compiled-native-network=passed controller_accepts=1 host_errno={} platform={} arch={} protocol={protocol}",
+            denied["code"].as_str().unwrap(),
+            std::env::consts::OS,
+            std::env::consts::ARCH,
+        );
+    }
     manager.shutdown().await;
 }
 

@@ -312,6 +312,11 @@ pub(crate) fn resolve_sse_endpoint_url(
     } else {
         base.join(endpoint_url)?
     };
+    // reqwest converts userinfo into Basic Authorization while building a
+    // request, before the request-time guard can inspect the original URL.
+    if !resolved.username().is_empty() || resolved.password().is_some() {
+        anyhow::bail!("MCP SSE endpoint must not contain URL credentials");
+    }
     // Security: the server-supplied `endpoint` event must stay same-origin
     // as the connect URL. The connect host is vetted by network policy
     // once, but the endpoint host is never re-checked — so an absolute
@@ -361,5 +366,19 @@ mod endpoint_tests {
         assert!(resolve_sse_endpoint_url(base, "http://mcp.example.com/messages").is_err());
         // Different port -> rejected.
         assert!(resolve_sse_endpoint_url(base, "https://mcp.example.com:8443/x").is_err());
+        // Same-origin userinfo must not become an implicit Basic credential.
+        for endpoint in [
+            "https://fixture-user:fixture-password@mcp.example.com/messages",
+            "//fixture-user@mcp.example.com/messages",
+        ] {
+            let error = resolve_sse_endpoint_url(base, endpoint).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("must not contain URL credentials")
+            );
+            assert!(!error.to_string().contains("fixture-user"));
+            assert!(!error.to_string().contains("fixture-password"));
+        }
     }
 }

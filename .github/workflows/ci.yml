@@ -464,15 +464,19 @@ jobs:
             echo "apt-get update failed (attempt $i); retrying in 15s"
             sleep 15
           done
-          sudo apt-get install -y libdbus-1-dev pkg-config
+          sudo apt-get install -y libdbus-1-dev pkg-config bubblewrap
       - uses: Swatinem/rust-cache@v2
         with:
           cache-bin: false
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@nextest
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
       - name: Hermetic safety and authorization tests
         env:
           RUST_MIN_STACK: "8388608"
+          CODEWHALE_EXT_HOST_TESTS: '1'
         # nextest fails when the filter selects no test (`--no-tests=fail`),
         # so moving these modules to another crate cannot turn this step into
         # a silent 0-test pass. It does not catch a step that merely shrinks,
@@ -878,7 +882,7 @@ jobs:
             echo "apt-get update failed (attempt $i); retrying in 15s"
             sleep 15
           done
-          sudo apt-get install -y libdbus-1-dev pkg-config
+          sudo apt-get install -y libdbus-1-dev pkg-config bubblewrap
       - name: Ubuntu build headroom
         # The combined wave/0.10.1-next workspace build was terminated
         # mid-compile on every PR run ("runner has received a shutdown

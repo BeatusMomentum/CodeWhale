@@ -11,7 +11,7 @@
 //! redact sensitive fields.
 
 use std::collections::BTreeMap;
-use std::io::{Read, Write as _};
+use std::io::{IsTerminal, Read, Write as _};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -797,8 +797,39 @@ fn poll_device_grant(
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum OAuthChallengeStream {
+    Stderr,
+    Stdout,
+}
+
+fn oauth_challenge_stream(
+    stderr_terminal: bool,
+    stdout_terminal: bool,
+) -> Result<OAuthChallengeStream> {
+    if stderr_terminal {
+        Ok(OAuthChallengeStream::Stderr)
+    } else if stdout_terminal {
+        Ok(OAuthChallengeStream::Stdout)
+    } else {
+        bail!(
+            "Sign-in requires a terminal for the private login challenge; run codewhale auth in an interactive terminal without redirecting both output streams"
+        );
+    }
+}
+
+fn oauth_challenge_writer() -> Result<Box<dyn std::io::Write + Send>> {
+    match oauth_challenge_stream(
+        std::io::stderr().is_terminal(),
+        std::io::stdout().is_terminal(),
+    )? {
+        OAuthChallengeStream::Stderr => Ok(Box::new(std::io::stderr())),
+        OAuthChallengeStream::Stdout => Ok(Box::new(std::io::stdout())),
+    }
+}
+
 /// Interactive device-code login for any provider whose row offers it.
-/// Prints the verification URL + user code to stderr and polls until
+/// Shows the verification URL + user code only on a terminal and polls until
 /// approved. A provider with no device flow (ChatGPT) fails here with the
 /// reason, instead of deep in transport code.
 pub async fn device_code_login(provider: OAuthProvider) -> Result<PendingOAuthLogin> {
@@ -814,17 +845,30 @@ pub async fn device_code_login(provider: OAuthProvider) -> Result<PendingOAuthLo
     }
     let inputs = params.resolve_inputs();
     let display_name = params.display_name;
-    tokio::task::spawn_blocking(move || device_code_login_with(provider, &inputs))
+    let challenge = oauth_challenge_writer()?;
+    device_code_login_on_worker(provider, inputs, challenge)
         .await
-        .with_context(|| format!("{display_name} device-code login worker failed"))?
+        .with_context(|| format!("{display_name} device-code login worker failed"))
 }
 
-/// Blocking worker body for [`device_code_login`]. `pub(crate)` so the
-/// legacy activation tests can drive the unified login end to end until
-/// activation unifies in 3b-ii.
-pub(crate) fn device_code_login_with(
+async fn device_code_login_on_worker(
+    provider: OAuthProvider,
+    inputs: ResolvedOAuthInputs,
+    mut challenge: Box<dyn std::io::Write + Send>,
+) -> Result<PendingOAuthLogin> {
+    tokio::task::spawn_blocking(move || {
+        device_code_login_with(provider, &inputs, challenge.as_mut())
+    })
+    .await
+    .context("device-code protocol worker failed")?
+}
+
+/// Blocking protocol worker. Production callers capture a terminal first;
+/// protocol tests inject a private output buffer or sink.
+fn device_code_login_with(
     provider: OAuthProvider,
     inputs: &ResolvedOAuthInputs,
+    challenge: &mut dyn std::io::Write,
 ) -> Result<PendingOAuthLogin> {
     let params = oauth_provider_params(provider);
     let display_name = params.display_name;
@@ -849,16 +893,25 @@ pub(crate) fn device_code_login_with(
         &format!("{display_name} device-code request"),
     )?;
     let user_code = grant.user_code.unwrap_or_default();
+    anyhow::ensure!(
+        user_code.len() <= 1024 && !user_code.chars().any(char::is_control),
+        "device-code login returned invalid user-code display data"
+    );
 
-    eprintln!("{display_name} device-code login");
-    eprintln!("  Open:  {verify}");
-    eprintln!("  Code:  {user_code}");
-    eprintln!("{}", account_choice_hint(display_name));
-    eprintln!("Waiting for approval in the browser… (Ctrl+C to abort)");
-    if inputs.open_browser
-        && let Err(err) = webbrowser::open(&verify)
-    {
-        eprintln!("Could not open the browser automatically: {err}");
+    writeln!(challenge, "{display_name} device-code login")?;
+    writeln!(challenge, "  Open:  {verify}")?;
+    writeln!(challenge, "  Code:  {user_code}")?;
+    writeln!(challenge, "{}", account_choice_hint(display_name))?;
+    writeln!(
+        challenge,
+        "Waiting for approval in the browser… (Ctrl+C to abort)"
+    )?;
+    challenge.flush()?;
+    if inputs.open_browser && webbrowser::open(&verify).is_err() {
+        writeln!(
+            challenge,
+            "Could not open the browser automatically; open the displayed URL manually"
+        )?;
     }
 
     let lifetime = Duration::from_secs(
@@ -935,9 +988,12 @@ pub async fn login_with_config(
         inputs.issuer == CHATGPT_OAUTH_ISSUER,
         "Official ChatGPT sign-in requires https://auth.openai.com; remove the issuer override"
     );
-    tokio::task::spawn_blocking(move || pkce_login_with_selected(provider, &inputs, selected))
-        .await
-        .context("ChatGPT PKCE login worker failed")?
+    let mut challenge = oauth_challenge_writer()?;
+    tokio::task::spawn_blocking(move || {
+        pkce_login_with_selected(provider, &inputs, selected, challenge.as_mut())
+    })
+    .await
+    .context("ChatGPT PKCE login worker failed")?
 }
 
 // ── form-post transport seam ──────────────────────────────────────────
@@ -1611,7 +1667,7 @@ pub(crate) fn exchange_authorization_code(
 }
 
 /// Interactive PKCE browser login for any provider whose row offers it.
-/// Prints the authorize URL, opens a browser, and waits for the loopback
+/// Shows the authorize URL only on a terminal, opens a browser, and waits for the loopback
 /// callback. A provider with no browser flow (xAI) fails here with the
 /// reason, before any listener binds.
 pub async fn pkce_login(provider: OAuthProvider) -> Result<PendingOAuthLogin> {
@@ -1630,24 +1686,20 @@ pub async fn pkce_login(provider: OAuthProvider) -> Result<PendingOAuthLogin> {
         );
     }
     let display_name = params.display_name;
-    tokio::task::spawn_blocking(move || pkce_login_with(provider, &inputs))
-        .await
-        .with_context(|| format!("{display_name} PKCE login worker failed"))?
+    let mut challenge = oauth_challenge_writer()?;
+    tokio::task::spawn_blocking(move || {
+        pkce_login_with_selected(provider, &inputs, None, challenge.as_mut())
+    })
+    .await
+    .with_context(|| format!("{display_name} PKCE login worker failed"))?
 }
 
-/// Blocking worker body for [`pkce_login`]. `pub(crate)` so the activation
-/// tests can drive the unified login end to end until activation unifies.
-pub(crate) fn pkce_login_with(
-    provider: OAuthProvider,
-    inputs: &ResolvedOAuthInputs,
-) -> Result<PendingOAuthLogin> {
-    pkce_login_with_selected(provider, inputs, None)
-}
-
+/// Blocking browser protocol worker with a previously admitted terminal.
 fn pkce_login_with_selected(
     provider: OAuthProvider,
     inputs: &ResolvedOAuthInputs,
     selected: Option<ChatgptRegistration>,
+    challenge: &mut dyn std::io::Write,
 ) -> Result<PendingOAuthLogin> {
     let params = oauth_provider_params(provider);
     let display_name = params.display_name;
@@ -1692,14 +1744,19 @@ fn pkce_login_with_selected(
         }
         request.authorize_url = url.to_string();
     }
-    eprintln!("{display_name} sign-in (PKCE)");
-    eprintln!("  Open:  {}", request.authorize_url);
-    eprintln!("{}", account_choice_hint(display_name));
-    eprintln!("Waiting for the browser callback… (Ctrl+C to abort)");
-    if inputs.open_browser
-        && let Err(err) = webbrowser::open(&request.authorize_url)
-    {
-        eprintln!("Could not open the browser automatically: {err}");
+    writeln!(challenge, "{display_name} sign-in (PKCE)")?;
+    writeln!(challenge, "  Open:  {}", request.authorize_url)?;
+    writeln!(challenge, "{}", account_choice_hint(display_name))?;
+    writeln!(
+        challenge,
+        "Waiting for the browser callback… (Ctrl+C to abort)"
+    )?;
+    challenge.flush()?;
+    if inputs.open_browser && webbrowser::open(&request.authorize_url).is_err() {
+        writeln!(
+            challenge,
+            "Could not open the browser automatically; open the displayed URL manually"
+        )?;
     }
     let (code, callback_id) = wait_for_callback(&listeners, params, &request.state)?;
     let client_id = if provider == OAuthProvider::Chatgpt {
@@ -4202,6 +4259,25 @@ mod tests {
         assert_eq!(material.access_token.as_deref(), Some("at"));
     }
 
+    #[test]
+    fn oauth_challenges_require_a_terminal_and_avoid_redirected_streams() {
+        assert_eq!(
+            oauth_challenge_stream(true, false).unwrap(),
+            OAuthChallengeStream::Stderr
+        );
+        assert_eq!(
+            oauth_challenge_stream(true, true).unwrap(),
+            OAuthChallengeStream::Stderr
+        );
+        assert_eq!(
+            oauth_challenge_stream(false, true).unwrap(),
+            OAuthChallengeStream::Stdout
+        );
+        let error = oauth_challenge_stream(false, false).unwrap_err();
+        assert!(error.to_string().contains("requires a terminal"));
+        assert!(!error.to_string().contains("token"));
+    }
+
     #[tokio::test]
     async fn device_login_without_a_device_flow_fails_before_network() {
         let result = device_code_login(OAuthProvider::Chatgpt).await;
@@ -4365,8 +4441,9 @@ mod tests {
             scopes: "openid".to_string(),
             open_browser: false,
         };
-        let result =
-            tokio::task::block_in_place(|| device_code_login_with(OAuthProvider::Xai, &inputs));
+        let result = tokio::task::block_in_place(|| {
+            device_code_login_with(OAuthProvider::Xai, &inputs, &mut std::io::sink())
+        });
         let Err(error) = result else {
             panic!("a non-web verification URI must abort login");
         };
@@ -4374,6 +4451,51 @@ mod tests {
             format!("{error:#}").contains("untrusted verification URI"),
             "{error:#}"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn device_login_refuses_terminal_controls_before_display_or_polling() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/.well-known/openid-configuration"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "issuer": server.uri(),
+                "device_authorization_endpoint": format!("{}/device", server.uri()),
+                "token_endpoint": format!("{}/token", server.uri())
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/device"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "device_code": "fixture-private-device-code",
+                "user_code": "CW-\u{1b}]52;clipboard-payload",
+                "verification_uri": format!("{}/verify", server.uri()),
+                "expires_in": 60,
+                "interval": 1
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let inputs = ResolvedOAuthInputs {
+            issuer: server.uri(),
+            client_id: "test-client".to_string(),
+            scopes: "openid".to_string(),
+            open_browser: false,
+        };
+        let mut challenge = Vec::new();
+        let error = tokio::task::block_in_place(|| {
+            device_code_login_with(OAuthProvider::Xai, &inputs, &mut challenge)
+        })
+        .err()
+        .expect("terminal controls must be refused");
+        assert!(error.to_string().contains("invalid user-code display data"));
+        assert!(challenge.is_empty());
+        assert!(!error.to_string().contains("clipboard-payload"));
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
     }
 
     /// Discovery + device grant run on the blocking worker: this fails with
@@ -4408,7 +4530,12 @@ mod tests {
         let _no_browser =
             crate::test_support::EnvVarGuard::set("CODEWHALE_XAI_OAUTH_NO_BROWSER", "1");
 
-        let result = device_code_login(OAuthProvider::Xai).await;
+        let result = device_code_login_on_worker(
+            OAuthProvider::Xai,
+            XAI_OAUTH_PARAMS.resolve_inputs(),
+            Box::new(std::io::sink()),
+        )
+        .await;
         let Err(error) = result else {
             panic!("mock device request must fail without a runtime-drop panic");
         };
@@ -4461,9 +4588,16 @@ mod tests {
             scopes: "openid".to_string(),
             open_browser: false,
         };
-        let pending =
-            tokio::task::block_in_place(|| device_code_login_with(OAuthProvider::Xai, &inputs))
-                .expect("mock login exchanges");
+        let mut challenge = Vec::new();
+        let pending = tokio::task::block_in_place(|| {
+            device_code_login_with(OAuthProvider::Xai, &inputs, &mut challenge)
+        })
+        .expect("mock login exchanges");
+        let challenge = String::from_utf8(challenge).unwrap();
+        assert!(challenge.contains(&format!("{}/verify", server.uri())));
+        assert!(challenge.contains("CW-TEST"));
+        assert!(!challenge.contains("unified-access"));
+        assert!(!challenge.contains("unified-refresh"));
         assert_eq!(pending.issuer, server.uri());
         assert_eq!(
             pending.token.access_token.as_deref(),
@@ -4564,8 +4698,9 @@ mod tests {
             scopes: "openid".to_string(),
             open_browser: false,
         };
-        let result =
-            tokio::task::block_in_place(|| device_code_login_with(OAuthProvider::Xai, &inputs));
+        let result = tokio::task::block_in_place(|| {
+            device_code_login_with(OAuthProvider::Xai, &inputs, &mut std::io::sink())
+        });
         let Err(error) = result else {
             panic!("user denial must stop the login");
         };
@@ -4681,9 +4816,10 @@ mod tests {
             scopes: "openid".to_string(),
             open_browser: false,
         };
-        let pending =
-            tokio::task::block_in_place(|| device_code_login_with(OAuthProvider::Xai, &inputs))
-                .expect("mock login exchanges");
+        let pending = tokio::task::block_in_place(|| {
+            device_code_login_with(OAuthProvider::Xai, &inputs, &mut std::io::sink())
+        })
+        .expect("mock login exchanges");
         assert_eq!(pending.token.access_token.as_deref(), Some("form-access"));
     }
 
@@ -4935,10 +5071,13 @@ mod tests {
     #[test]
     fn usage_limit_guidance_names_account_and_switch_command() {
         let chatgpt = usage_limit_guidance(OAuthProvider::Chatgpt, Some("a@example.com (plus)"));
-        assert!(chatgpt.contains("a@example.com (plus)"), "{chatgpt}");
+        assert!(
+            chatgpt.contains("a@example.com (plus)"),
+            "usage guidance must name the selected account"
+        );
         assert!(
             chatgpt.contains("`CODEWHALE_CHATGPT_NEW_ACCOUNT=1 codewhale auth chatgpt`"),
-            "{chatgpt}"
+            "usage guidance must name the explicit account replacement command"
         );
         // A running session does not see a shell login. Returning login
         // stays on its verified account; explicit replacement needs a restart.
@@ -6749,7 +6888,11 @@ consent_version = 1
             open_browser: false,
         };
         let unified = tokio::task::block_in_place(|| {
-            crate::oauth::device_code_login_with(crate::oauth::OAuthProvider::Xai, &inputs)
+            crate::oauth::device_code_login_with(
+                crate::oauth::OAuthProvider::Xai,
+                &inputs,
+                &mut std::io::sink(),
+            )
         })
         .expect("device login against mock xAI");
         let pending = unified;

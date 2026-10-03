@@ -30,8 +30,8 @@ impl RouteFixture {
         let fleet = FleetFile::new("Workflow fixture".into(), None).expect("empty saved Fleet");
         save_fleet(&fleet, FleetScope::Workspace, workspace).expect("save fixture Fleet");
         set_selected(&fleet.name, FleetScope::Workspace, workspace).expect("select fixture Fleet");
-        let (parent, parent_calls, _) = tests::fake_chat_client_capturing("parent route").await;
-        let (target, target_calls, target_bodies) =
+        let (parent, parent_calls, _, _) = tests::fake_chat_client_capturing("parent route").await;
+        let (target, target_calls, target_bodies, _) =
             tests::fake_chat_client_capturing("frozen route result").await;
         let mut config = Config {
             ..Default::default()

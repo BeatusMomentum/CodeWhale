@@ -1064,6 +1064,7 @@ mod tests {
                 custom: std::collections::HashMap::from([(
                     "custom".to_string(),
                     crate::config::ProviderConfig {
+                        kind: Some("openai-compatible".to_string()),
                         api_key: Some("test-private-key".to_string()),
                         base_url: Some("https://private.test/v1".to_string()),
                         model: Some("private-1m-deployment-v9".to_string()),

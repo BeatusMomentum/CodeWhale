@@ -6,6 +6,8 @@
 
 #![allow(dead_code)]
 
+pub use crate::core::authority::RunOrigin;
+
 use crate::tui::approval::{RiskLevel, ToolCategory, classify_risk, get_tool_category_for_call};
 use codewhale_execpolicy::ApprovalMode;
 use serde_json::{Value, json};
@@ -380,24 +382,6 @@ fn tool_name_words(name: &str) -> Vec<String> {
         words.push(current);
     }
     words
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RunOrigin {
-    Interactive,
-    Headless,
-    Background,
-}
-
-impl RunOrigin {
-    #[must_use]
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Interactive => "interactive",
-            Self::Headless => "headless",
-            Self::Background => "background",
-        }
-    }
 }
 
 /// Process-name termination can include every npm launcher, including other

@@ -5,6 +5,7 @@ import {createHash} from 'node:crypto'
 import {mkdtempSync,mkdirSync,writeFileSync,readFileSync,rmSync} from 'node:fs'
 import {join,dirname} from 'node:path'
 import {tmpdir} from 'node:os'
+import {fileURLToPath} from 'node:url'
 import {reviewAgentPresets,containedPackageModule} from '../dist/agent-presets.mjs'
 import {spawnSync} from 'node:child_process'
 import {activate,startHost} from './harness.mjs'
@@ -158,7 +159,7 @@ test('actual installed source counterparts mount default and explicitly selected
     const root=new URL(`../../tests/fixtures/extension_host/raw-agent-presets${suffix}/`,import.meta.url)
     const catalog=JSON.parse(readFileSync(new URL('native/presets.json',root),'utf8'))
     assert.equal(catalog.default,suffix?undefined:'a')
-    const row=catalog.presets.find(p=>p.id==='b'),entry=new URL(row.entry.path,root).pathname
+    const row=catalog.presets.find(p=>p.id==='b'),entry=fileURLToPath(new URL(row.entry.path,root))
     assert.equal(hash(readFileSync(entry)),row.entry.sha256)
     const admitted=await activate(host,'counterpart'+suffix,entry,{scope:{path:entry,sha256:row.entry.sha256}})
     assert.equal(admitted.result.status,'ok',admitted.result.diagnostic+' '+host.stderr)
@@ -173,7 +174,7 @@ test('the existing upstream patch authority retains exact skipped operation iden
   const first='- insert:\n  - {id: group, group: true, config: []}\n  - {id: docs-entry, name: portable}\n'
   const second='- {id: missing-group, insert: []}\n- {disabled: true}\n- {id: missing-row, disabled: true}\n- {id: docs-entry, name: wrong-package, disabled: true}\n- id: group\n  insert:\n  - {id: child, name: ./row.mjs}\n'
   const spec={version:1,layers:[{path:'first.yml',source:first,sha256:hash(first)},{path:'overlay.yml',source:second,sha256:hash(second)}],modules:[],files:{}}
-  const result=spawnSync(process.execPath,[new URL('../dist/dsh-composition-review.mjs',import.meta.url).pathname],{input:JSON.stringify(spec),encoding:'utf8',timeout:5000})
+  const result=spawnSync(process.execPath,[fileURLToPath(new URL('../dist/dsh-composition-review.mjs',import.meta.url))],{input:JSON.stringify(spec),encoding:'utf8',timeout:5000})
   assert.equal(result.status,0,result.stderr)
   const reviewed=JSON.parse(result.stdout)
   assert.deepEqual(reviewed.skipped.map(row=>[row.row??null,row.layer,row.patch]),[['missing-group','overlay.yml',1],[null,'overlay.yml',2],['missing-row','overlay.yml',3],['docs-entry','overlay.yml',4]])

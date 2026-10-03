@@ -1685,9 +1685,20 @@ mod provider_key_validation_tests {
             "status names connection-probe success: {:?}",
             app.status_message
         );
+        // The probe proves only this temporary credential generation, not the
+        // original uncredentialed Config or any model's entitlement.
+        let mut probed_config = config.clone();
+        let probed_identity = picker_provider_identity(&config, ProviderKind::Openrouter, None)
+            .expect("captured OpenRouter identity");
+        probed_config
+            .scope_to_provider_identity(&probed_identity)
+            .expect("scope probe");
+        probed_config
+            .set_provider_api_key_override(&probed_identity, Some("sk-verified".to_string()))
+            .expect("temporary probe key");
         let verified_route = crate::provider_readiness::route_identity_for_model(
-            &config,
-            &(config).test_identity_for_kind(ProviderKind::Openrouter),
+            &probed_config,
+            &probed_identity,
             crate::config::DEFAULT_OPENROUTER_MODEL,
         );
         assert_eq!(

@@ -1331,6 +1331,68 @@ mod tests {
         assert!(unix_process_start(u32::MAX).is_err());
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_process_generation_survives_nondumpable_hardening() {
+        const CHILD: &str = "CODEWHALE_PROCESS_IDENTITY_TEST_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let pid = std::process::id();
+            let before = unix_process_start(pid).unwrap();
+            // SAFETY: changes only this isolated child test process.
+            assert_eq!(unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) }, 0);
+            // SAFETY: queries only the calling process with no pointer arguments.
+            assert_eq!(unsafe { libc::prctl(libc::PR_GET_DUMPABLE, 0, 0, 0, 0) }, 0);
+            if PrivateDirectory::current_user_id() != 0 {
+                use std::os::unix::fs::MetadataExt as _;
+                assert_eq!(fs::metadata(format!("/proc/{pid}/stat")).unwrap().uid(), 0);
+            }
+            assert_eq!(unix_process_start(pid).unwrap(), before);
+            assert!(unix_process_start(0).is_err());
+            assert!(unix_process_start(u32::MAX).is_err());
+            println!("HARDENED_PROCESS_GENERATION_VERIFIED");
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "private_directory::tests::linux_process_generation_survives_nondumpable_hardening",
+                "--exact",
+                "--nocapture",
+            ])
+            .env_clear()
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "isolated hardened process failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout)
+                .contains("HARDENED_PROCESS_GENERATION_VERIFIED")
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_process_status_refuses_foreign_or_malformed_principals() {
+        let valid = "Name:\tfixture\nPid:\t42\nUid:\t100\t101\t102\t103\n";
+        assert!(validate_linux_process_status(valid, 42, 101).is_ok());
+        assert!(validate_linux_process_status(valid, 42, 100).is_err());
+        assert!(validate_linux_process_status(valid, 43, 101).is_err());
+        for status in [
+            "Uid:\t100 101 102 103\n",
+            "Pid:\t42\n",
+            "Pid:\t42\nUid:\t100 101 102\n",
+            "Pid:\t42\nUid:\t100 101 102 103 104\n",
+            "Pid:\t42\nUid:\t100 invalid 102 103\n",
+            "Pid:\t42\nPid:\t42\nUid:\t100 101 102 103\n",
+            "Pid:\t42\nUid:\t100 101 102 103\nUid:\t100 101 102 103\n",
+        ] {
+            assert!(validate_linux_process_status(status, 42, 101).is_err());
+        }
+    }
+
     #[test]
     fn endpoint_admission_refuses_public_existing_directory_without_repair() {
         let root = root();
@@ -1452,14 +1514,45 @@ pub fn unix_process_start(pid: u32) -> Result<String> {
     #[cfg(target_os = "linux")]
     {
         use std::io::Read as _;
-        let mut bytes = Vec::new();
-        use std::os::unix::fs::MetadataExt as _;
-        let process = File::open(format!("/proc/{pid}/stat"))?;
+        use std::os::fd::{AsRawFd as _, FromRawFd as _};
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        // Keep stat and credentials on one kernel process object. A retained
+        // proc directory cannot be redirected to a reused PID after exit.
+        let directory = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(format!("/proc/{pid}"))?;
+        let mut filesystem = std::mem::MaybeUninit::<libc::statfs>::uninit();
+        // SAFETY: the live directory descriptor and output buffer are valid.
+        let result = unsafe { libc::fstatfs(directory.as_raw_fd(), filesystem.as_mut_ptr()) };
+        if result != 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("inspecting kernel process directory");
+        }
+        // SAFETY: successful fstatfs initialized the output buffer.
         anyhow::ensure!(
-            process.metadata()?.uid() == PrivateDirectory::current_user_id(),
-            "local process principal changed"
+            unsafe { filesystem.assume_init() }.f_type == libc::PROC_SUPER_MAGIC,
+            "local process identity is not on procfs"
         );
-        process.take(8193).read_to_end(&mut bytes)?;
+        let open = |name: &std::ffi::CStr| -> Result<File> {
+            // SAFETY: the retained directory and constant basename remain valid.
+            let fd = unsafe {
+                libc::openat(
+                    directory.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                )
+            };
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error())
+                    .context("opening kernel process identity");
+            }
+            // SAFETY: openat returned a newly owned descriptor.
+            Ok(unsafe { File::from_raw_fd(fd) })
+        };
+        let mut bytes = Vec::new();
+        open(c"stat")?.take(8193).read_to_end(&mut bytes)?;
         anyhow::ensure!(bytes.len() <= 8192, "oversized kernel process identity");
         let stat = std::str::from_utf8(&bytes)?;
         anyhow::ensure!(
@@ -1473,6 +1566,13 @@ pub fn unix_process_start(pid: u32) -> Result<String> {
             .nth(19)
             .context("kernel process start field unavailable")?
             .parse::<u64>()?;
+        // PR_SET_DUMPABLE=0 makes proc inode ownership root even for a local
+        // user's process. Authenticate the effective UID in the kernel status
+        // header instead; do not disable hardening or trust the inode owner.
+        // Pid/Uid precede potentially large supplementary-group lists.
+        let mut status = String::new();
+        open(c"status")?.take(8192).read_to_string(&mut status)?;
+        validate_linux_process_status(&status, pid, PrivateDirectory::current_user_id())?;
         let mut boot = String::new();
         File::open("/proc/sys/kernel/random/boot_id")?
             .take(65)
@@ -1486,6 +1586,29 @@ pub fn unix_process_start(pid: u32) -> Result<String> {
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     bail!("local process generation authentication unsupported on this platform")
+}
+
+#[cfg(target_os = "linux")]
+fn validate_linux_process_status(status: &str, pid: u32, uid: u32) -> Result<()> {
+    let mut actual_pid = None;
+    let mut actual_uid = None;
+    for line in status.lines() {
+        if let Some(value) = line.strip_prefix("Pid:") {
+            anyhow::ensure!(actual_pid.is_none(), "duplicate kernel process PID");
+            actual_pid = Some(value.trim().parse::<u32>()?);
+        } else if let Some(value) = line.strip_prefix("Uid:") {
+            anyhow::ensure!(actual_uid.is_none(), "duplicate kernel process credentials");
+            let values = value
+                .split_whitespace()
+                .map(str::parse::<u32>)
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            anyhow::ensure!(values.len() == 4, "invalid kernel process credentials");
+            actual_uid = Some(values[1]);
+        }
+    }
+    anyhow::ensure!(actual_pid == Some(pid), "kernel process PID changed");
+    anyhow::ensure!(actual_uid == Some(uid), "local process principal changed");
+    Ok(())
 }
 
 #[cfg(unix)]

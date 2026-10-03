@@ -12741,7 +12741,9 @@ async fn provider_catalog_and_switch_preserve_each_listed_route_identity() -> Re
             );
         }
     }
-    for invalid in ["deepseek-cn", "antigravity", "not-a-provider"] {
+    let legacy_alias = get_provider_models(&client, &addr, "deepseek-cn").await;
+    assert_eq!(legacy_alias["provider"], "deepseek-cn");
+    for invalid in ["deepseek-cn-unknown", "antigravity", "not-a-provider"] {
         let response = client
             .get(format!("http://{addr}/v1/providers/{invalid}/models"))
             .send()
@@ -12966,28 +12968,66 @@ async fn provider_models_expose_exact_image_input_facts_and_thread_selection_sta
 fn provider_reasoning_metadata_keeps_exact_roster_levels_and_unknown_boundaries() {
     let _lock = crate::test_support::lock_test_env();
     let root = tempfile::tempdir().unwrap();
-    let _codex_home = crate::test_support::EnvVarGuard::set("CODEX_HOME", root.path());
-    let config = Config {
+    let canonical_home = root
+        .path()
+        .canonicalize()
+        .expect("canonical private fixture home");
+    let _codex_home = crate::test_support::EnvVarGuard::set("CODEX_HOME", &canonical_home);
+    let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", &canonical_home);
+    let mut config = Config {
         provider: Some("openai-codex".to_string()),
         ..Config::default()
     };
-    let cache_path = root.path().join("models_cache.json");
-    let cache = json!({
-        "fetched_at": chrono::Utc::now(),
-        "models": [
-            {"slug": "gpt-6-astra", "supported_reasoning_levels": [
-                {"effort": "low"}, {"effort": "medium"}, {"effort": "high"},
-                {"effort": "xhigh"}, {"effort": "max"}, {"effort": "ultra"},
-                {"effort": "unexpected-private-value"}
-            ]},
-            {"slug": "gpt-5.5", "supported_reasoning_levels": [{"effort": "high"}, {"effort": "xhigh"}]},
-            {"slug": "no-reasoning", "supported_reasoning_levels": []},
-            {"slug": "optional-reasoning", "supported_reasoning_levels": [{"effort": "none"}, {"effort": "minimal"}, {"effort": "low"}]},
-            {"slug": "no-effort-metadata"},
-            {"slug": "unrecognized-efforts", "supported_reasoning_levels": [{"effort": "future-value"}]}
+    let access_token = crate::oauth::install_test_chatgpt_registration(&mut config).unwrap();
+    crate::codex_model_cache::install_test_chatgpt_roster_with_metadata(
+        &config,
+        [
+            (
+                "gpt-6-astra",
+                None,
+                vec![
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "max",
+                    "ultra",
+                    "unexpected-private-value",
+                ],
+            ),
+            ("gpt-5.5", None, vec!["high", "xhigh"]),
+            ("no-reasoning", Some(false), vec![]),
+            ("optional-reasoning", None, vec!["none", "minimal", "low"]),
+            ("no-effort-metadata", None, vec![]),
+            ("unrecognized-efforts", None, vec!["future-value"]),
         ]
-    });
-    fs::write(&cache_path, serde_json::to_vec(&cache).unwrap()).unwrap();
+        .into_iter()
+        .map(
+            |(id, reasoning, efforts)| crate::codex_model_cache::CodexModelMetadata {
+                id: id.into(),
+                display_name: None,
+                context_window: None,
+                reasoning,
+                efforts: efforts.into_iter().map(str::to_string).collect(),
+            },
+        )
+        .collect(),
+    )
+    .unwrap();
+    // Locate the one snapshot actually created by the account-scoped helper;
+    // an external CODEX_HOME cache is not an account roster authority.
+    let catalog_path = crate::models_dev_live::cache_path().unwrap();
+    let snapshots: Vec<_> = fs::read_dir(catalog_path.parent().unwrap())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("chatgpt-plan-"))
+        })
+        .collect();
+    assert_eq!(snapshots.len(), 1);
+    let cache_path = &snapshots[0];
     let astra = provider_model_entry_for_api(
         &config,
         &(config).test_identity_for_kind(ProviderKind::OpenaiCodex),
@@ -13001,7 +13041,7 @@ fn provider_reasoning_metadata_keeps_exact_roster_levels_and_unknown_boundaries(
         astra.reasoning_effort_levels,
         ["low", "medium", "high", "xhigh", "max", "ultra"]
     );
-    assert_eq!(astra.reasoning_effort_source, Some("codex_cli_cache"));
+    assert_eq!(astra.reasoning_effort_source, Some("chatgpt_plan_api"));
     // The relay preserves the same model facts without elevating them into
     // a tool-execution or account-entitlement receipt.
     let _token = crate::test_support::EnvVarGuard::set("OPENAI_CODEX_ACCESS_TOKEN", "test-token");
@@ -13018,9 +13058,10 @@ fn provider_reasoning_metadata_keeps_exact_roster_levels_and_unknown_boundaries(
         relayed_astra["reasoningEffortLevels"],
         json!(astra.reasoning_effort_levels)
     );
-    assert_eq!(relayed_astra["reasoningEffortSource"], "codex_cli_cache");
+    assert_eq!(relayed_astra["reasoningEffortSource"], "chatgpt_plan_api");
     assert_eq!(relay["runtime"]["capabilities"]["tool_execution"], false);
     assert!(!relay.to_string().contains("test-token"));
+    assert!(!relay.to_string().contains(&access_token));
     let older = provider_model_entry_for_api(
         &config,
         &(config).test_identity_for_kind(ProviderKind::OpenaiCodex),
@@ -13084,9 +13125,9 @@ fn provider_reasoning_metadata_keeps_exact_roster_levels_and_unknown_boundaries(
         codewhale_config::route::CapabilityState::Unknown
     );
     assert!(proxy.reasoning_effort_levels.is_empty());
-    let mut stale = cache;
+    let mut stale: Value = serde_json::from_slice(&fs::read(cache_path).unwrap()).unwrap();
     stale["fetched_at"] = json!(chrono::Utc::now() - chrono::Duration::hours(48));
-    fs::write(&cache_path, serde_json::to_vec(&stale).unwrap()).unwrap();
+    fs::write(cache_path, serde_json::to_vec(&stale).unwrap()).unwrap();
     let stale = provider_model_entry_for_api(
         &config,
         &(config).test_identity_for_kind(ProviderKind::OpenaiCodex),
@@ -13680,23 +13721,35 @@ base_url = "http://127.0.0.1:18191/v1"
         route["has_model_catalog"], true,
         "the flag must describe what this route's own model endpoint returns"
     );
-    assert!(
-        catalog
-            .iter()
-            .all(|entry| entry["model_provider_id"] != "not-a-routable-route"),
-        "a table without the openai-compatible kind is not a routable route: {providers}"
+    let unavailable: Vec<_> = catalog
+        .iter()
+        .filter(|entry| entry["model_provider_id"] == "not-a-routable-route")
+        .collect();
+    assert_eq!(unavailable.len(), 1);
+    assert_eq!(
+        unavailable[0]["display_name"],
+        "not-a-routable-route (unavailable)"
     );
-    // Only the selected route carries an exact id. An inactive entry that
-    // borrowed the active route's id would be read by a client as the route
-    // that is selected — which is worse than carrying none.
+    assert_eq!(unavailable[0]["has_model_catalog"], false);
+    assert_eq!(unavailable[0]["credentialState"], "legacy");
+    assert_eq!(unavailable[0]["credentialWritable"], false);
+    // Every admitted built-in carries its own exact id, including inactive
+    // entries. None may borrow the selected route's id.
     for entry in catalog {
         if entry["id"] != "deepseek" && entry["id"] != "custom" {
-            assert!(
-                entry["model_provider_id"].is_null(),
-                "an inactive provider must not carry an exact id: {entry}"
+            assert_eq!(
+                entry["model_provider_id"], entry["id"],
+                "an inactive provider must carry its own exact id: {entry}"
             );
         }
     }
+    let unavailable_models = client
+        .get(format!(
+            "http://{addr}/v1/providers/custom/models?model_provider_id=not-a-routable-route"
+        ))
+        .send()
+        .await?;
+    assert_eq!(unavailable_models.status(), StatusCode::BAD_REQUEST);
 
     // The route's model catalog is reachable with the identity the catalog
     // just published — no other spelling is needed by a client.
@@ -13946,9 +13999,8 @@ async fn set_config_base_url_moves_the_root_route_endpoint() -> Result<()> {
 
 #[tokio::test]
 async fn set_config_base_url_refuses_a_named_route_with_guidance() -> Result<()> {
-    // A user-defined `[providers.<name>]` route keeps its endpoint in the table
-    // it is named by. This path cannot write it, and saying so beats writing a
-    // key that changes nothing while reporting success.
+    // Keep the existing selector while adopting the canonical named-table
+    // writer: the endpoint moves only in that exact table, after reload.
     let root = std::env::temp_dir().join(format!(
         "codewhale-config-base-url-custom-{}",
         Uuid::new_v4()
@@ -13982,17 +14034,40 @@ model = "glm-5.3"
         true,
     )
     .await;
-    assert_ne!(status, StatusCode::OK, "body: {body}");
-    let message = body["error"]["message"].as_str().unwrap_or_default();
-    assert!(
-        message.contains("providers.<name>") || message.contains("named"),
-        "the refusal must say where the endpoint lives, got: {message}"
+    assert_eq!(status, StatusCode::OK, "named-table write should succeed");
+    assert_eq!(body["persisted"], true);
+    assert_eq!(body["requires_reload"], true);
+    let before_reload = get_config(&client, &addr).await;
+    assert_eq!(
+        before_reload["base_url"],
+        "https://open.bigmodel.cn/api/paas/v4"
     );
     let persisted = fs::read_to_string(&config_file)?;
-    assert!(
-        !persisted.contains("active_route_base_url") && !persisted.contains("moved.example.test"),
-        "a refused write changes nothing:\n{persisted}"
+    let saved: toml::Value = toml::from_str(&persisted)?;
+    assert_eq!(
+        saved["providers"]["bigmodel-cn"]["base_url"].as_str(),
+        Some("https://moved.example.test/v1")
     );
+    assert_eq!(
+        saved["providers"]["bigmodel-cn"]["model"].as_str(),
+        Some("glm-5.3")
+    );
+    assert!(saved.get("base_url").is_none());
+    assert!(
+        !persisted.contains("active_route_base_url"),
+        "no dead endpoint key may be written"
+    );
+    let (status, _) = post_set_config(&client, &addr, "provider", "missing-route", true).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(fs::read_to_string(&config_file)?, persisted);
+    let reload = client
+        .post(format!("http://{addr}/v1/config/reload"))
+        .send()
+        .await?;
+    assert_eq!(reload.status(), StatusCode::OK);
+    let after_reload = get_config(&client, &addr).await;
+    assert_eq!(after_reload["provider"], "bigmodel-cn");
+    assert_eq!(after_reload["base_url"], "https://moved.example.test/v1");
 
     handle.abort();
     Ok(())
@@ -15126,10 +15201,13 @@ async fn set_config_model_follows_persisted_provider_before_reload() -> Result<(
         config_body.contains(&format!("model = \"{expected_wire}\"")),
         "volcengine model should be written to the provider table as its wire id"
     );
-    assert!(
-        config_body.contains("default_text_model = \"deepseek-v4-pro\""),
-        "switching provider model must not overwrite DeepSeek's root default_text_model"
+    let saved: toml::Value = toml::from_str(&config_body)?;
+    assert_eq!(
+        saved["providers"]["deepseek"]["model"].as_str(),
+        Some("deepseek-v4-pro"),
+        "switching provider model must preserve DeepSeek's migrated model table"
     );
+    assert!(saved.get("default_text_model").is_none());
 
     let reload_resp = client
         .post(format!("http://{addr}/v1/config/reload"))
@@ -17729,14 +17807,27 @@ async fn dsh_package_preview_then_exact_install_over_http() -> Result<()> {
     };
     let client = crate::tls::reqwest_client();
 
-    let preview: serde_json::Value = client
+    let mut preview_response = client
         .post(format!("http://{addr}/v1/apps/plugins/import/dsh/preview"))
         .json(&serde_json::json!({"path": package.display().to_string()}))
         .send()
-        .await?
-        .error_for_status()?
-        .json()
         .await?;
+    if !preview_response.status().is_success() {
+        let status = preview_response.status();
+        let mut diagnostic = Vec::new();
+        while let Some(chunk) = preview_response.chunk().await? {
+            let remaining = 1024 - diagnostic.len();
+            diagnostic.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+            if diagnostic.len() == 1024 {
+                break;
+            }
+        }
+        anyhow::bail!(
+            "DSH fixture preview {status}: {}",
+            String::from_utf8_lossy(&diagnostic)
+        );
+    }
+    let preview: serde_json::Value = preview_response.json().await?;
     assert_eq!(preview["conversion"]["plugin_name"], "docs-dsh");
     assert_eq!(
         preview["conversion"]["network_hosts"],
@@ -19103,14 +19194,15 @@ async fn runtime_image_named_catalog_resolves_and_echoes_exact_configured_identi
             StatusCode::BAD_REQUEST
         );
     }
-    let legacy: Value = client
+    let legacy = client
         .get(format!("http://{addr}/v1/providers/custom/models"))
         .send()
-        .await?
-        .error_for_status()?
-        .json()
         .await?;
-    assert!(legacy.get("model_provider_id").is_none());
+    assert_eq!(legacy.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        get_config(&client, &addr).await["provider"],
+        "vision-personal"
+    );
     server.abort();
     Ok(())
 }
@@ -22413,7 +22505,7 @@ api_key = "refresh-fixture-key"
         "custom/models/refresh?model_provider_id=",
         "custom/models/refresh?model_provider_id=missing",
         "openai/models/refresh?model_provider_id=second",
-        "deepseek-cn/models/refresh",
+        "deepseek-cn-unknown/models/refresh",
         "custom/models/refresh?base_url=https://untrusted.invalid",
     ] {
         assert_eq!(

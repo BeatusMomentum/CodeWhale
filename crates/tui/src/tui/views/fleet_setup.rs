@@ -5094,37 +5094,20 @@ approval_required = true
     #[test]
     fn fleet_setup_includes_openai_codex_account_roster_with_dormant_consent() {
         let _env = crate::test_support::lock_test_env();
-        let codex_home = tempfile::tempdir().expect("Codex home");
-        let _home = crate::test_support::EnvVarGuard::set("CODEX_HOME", codex_home.path());
-        std::fs::write(
-            codex_home.path().join("models_cache.json"),
-            serde_json::to_vec(&serde_json::json!({
-                "fetched_at": chrono::Utc::now(),
-                "models": [
-                    { "slug": "gpt-5.6-sol", "priority": 1 },
-                    { "slug": "gpt-5.6-terra", "priority": 2 },
-                    { "slug": "gpt-5.6-luna", "priority": 3 }
-                ]
-            }))
-            .expect("serialize cache"),
-        )
-        .expect("write cache");
-
+        let home = tempfile::tempdir().expect("owned ChatGPT home");
+        let canonical_home = home
+            .path()
+            .canonicalize()
+            .expect("canonical private fixture home");
+        let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", &canonical_home);
         let mut config = crate::config::Config::default();
-        config.providers = Some(crate::config::ProvidersConfig {
-            openai_codex: crate::config::ProviderConfig {
-                auth_mode: Some("oauth".to_string()),
-                external_credentials: Some(
-                    codewhale_config::ExternalCredentialConsentToml::read_only(
-                        codewhale_config::ProviderKind::OpenaiCodex,
-                        codewhale_config::ExternalCredentialSource::CodexCli,
-                        codex_home.path().join("auth.json"),
-                    ),
-                ),
-                ..Default::default()
-            },
-            ..Default::default()
-        });
+        crate::oauth::install_test_chatgpt_registration(&mut config)
+            .expect("owned ChatGPT registration");
+        crate::codex_model_cache::install_test_chatgpt_roster(
+            &config,
+            &["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"],
+        )
+        .expect("account-scoped roster");
 
         let routes = cross_provider_model_routes(
             &config,
@@ -5139,10 +5122,10 @@ approval_required = true
                         && m == model
                         && matches!(
                             readiness,
-                            crate::provider_readiness::ResolvedProviderReadiness::ExternalConsentPendingSelection
+                            crate::provider_readiness::ResolvedProviderReadiness::SavedUnchecked
                         )
                 }),
-                "missing dormant-consent Codex route for {model}: {routes:?}"
+                "missing unchecked owned ChatGPT route for {model}: {routes:?}"
             );
         }
     }

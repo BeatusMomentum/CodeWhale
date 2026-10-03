@@ -4010,10 +4010,13 @@ mod tests {
     }
 
     fn deepseek_envelope() -> EffectiveRouteEnvelope {
-        EffectiveRouteEnvelope::capture(
-            None,
-            ProviderKind::Deepseek,
-            "deepseek-primary",
+        let config = crate::config::Config::default();
+        let identity = config
+            .active_provider_identity()
+            .expect("captured DeepSeek identity");
+        EffectiveRouteEnvelope::from_admitted(
+            Some(&config),
+            &identity,
             "deepseek-v4-flash",
             Some(crate::config::DEFAULT_DEEPSEEK_BASE_URL),
             Utc::now(),

@@ -1,5 +1,3 @@
-
-
 #[tokio::test]
 async fn trust_warning_is_internal_and_tracks_current_state() {
     let _lock = lock_test_env();
@@ -836,6 +834,7 @@ async fn code_execution_does_not_inherit_parent_secret_env() {
     let result = execute_code_execution_tool(
         &json!({"code":"import os; print(os.environ.get('CODEWHALE_TEST_FAKE_API_KEY', 'absent'))"}),
         tmp.path(),
+        &crate::tools::spec::ToolContext::new(tmp.path()),
     )
     .await
     .expect("code execution should run");
@@ -856,6 +855,7 @@ async fn code_execution_scenario() {
         let result = execute_code_execution_tool(
             &json!({"code":"print('hello from code exec')"}),
             tmp.path(),
+            &crate::tools::spec::ToolContext::new(tmp.path()),
         )
         .await
         .expect("code execution should run");
@@ -878,7 +878,7 @@ async fn code_execution_scenario() {
             tmp.path().to_path_buf(),
             None,
             None,
-            None,
+            Some(crate::tools::spec::ToolContext::new(tmp.path())),
         )
         .await
         .expect("code_execution should run through common executor");
@@ -886,6 +886,91 @@ async fn code_execution_scenario() {
         assert!(result.result.content.contains("common executor code exec"));
         assert!(result.result.content.contains("return_code"));
     }
+}
+
+#[tokio::test]
+async fn interpreter_execution_policy_preserves_readonly_and_exact_call_elevation() {
+    use crate::sandbox::SandboxPolicy;
+    use crate::tools::spec::ToolContext;
+    for tool in [CODE_EXECUTION_TOOL_NAME, JS_EXECUTION_TOOL_NAME] {
+        let workspace = tempdir().expect("workspace");
+        let outside = tempdir().expect("outside workspace");
+        let context = ToolContext::new(workspace.path())
+            .with_elevated_sandbox_policy(SandboxPolicy::ReadOnly);
+        for (name, policy, allowed) in [
+            ("ordinary.txt", SandboxPolicy::ReadOnly, false),
+            ("approved.txt", SandboxPolicy::DangerFullAccess, true),
+            ("ordinary-again.txt", SandboxPolicy::ReadOnly, false),
+        ] {
+            let path = outside.path().join(name);
+            let literal = json!(path.to_string_lossy()).to_string();
+            let code = if tool == CODE_EXECUTION_TOOL_NAME {
+                format!("open({literal}, 'w').write('proof')")
+            } else {
+                format!("require('fs').writeFileSync({literal}, 'proof')")
+            };
+            let result = Engine::execute_tool_with_lock(
+                Arc::new(RwLock::new(())),
+                false,
+                false,
+                mpsc::channel(8).0,
+                None,
+                tool.to_string(),
+                None,
+                json!({"code": code}),
+                workspace.path().to_path_buf(),
+                None,
+                None,
+                Some(context.clone().with_elevated_sandbox_policy(policy)),
+            )
+            .await;
+            if allowed {
+                let result = result.expect("explicitly elevated execution");
+                assert!(result.result.success, "{tool}: {:?}", result.result);
+            } else if let Ok(result) = result {
+                assert!(!result.result.success, "{tool} ran a read-only write");
+            }
+            assert_eq!(path.exists(), allowed, "{tool}: {name}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn interpreter_execution_policy_refuses_external_backend_local_fallback() {
+    use crate::tools::spec::ToolContext;
+    let workspace = tempdir().expect("workspace");
+    let backend = crate::sandbox::backend::create_backend(&Config {
+        sandbox_backend: Some("unsupported-regression-backend".to_string()),
+        ..Config::default()
+    })
+    .expect("backend policy")
+    .expect("external boundary");
+    let context = ToolContext::new(workspace.path()).with_sandbox_backend(Arc::from(backend));
+    for tool in [CODE_EXECUTION_TOOL_NAME, JS_EXECUTION_TOOL_NAME] {
+        let code = if tool == CODE_EXECUTION_TOOL_NAME {
+            "open('external-fallback.txt', 'w').write('bad')"
+        } else {
+            "require('fs').writeFileSync('external-fallback.txt', 'bad')"
+        };
+        let error = Engine::execute_tool_with_lock(
+            Arc::new(RwLock::new(())),
+            false,
+            false,
+            mpsc::channel(8).0,
+            None,
+            tool.to_string(),
+            None,
+            json!({"code": code}),
+            workspace.path().to_path_buf(),
+            None,
+            None,
+            Some(context.clone()),
+        )
+        .await
+        .expect_err("external backend cannot run a local interpreter");
+        assert!(error.to_string().contains("external sandbox"), "{error}");
+    }
+    assert!(!workspace.path().join("external-fallback.txt").exists());
 }
 
 #[test]

@@ -736,14 +736,25 @@ impl Engine {
                     "tool '{tool_name}' is not registered"
                 )))
             }
-        } else if tool_name == CODE_EXECUTION_TOOL_NAME {
-            execute_code_execution_tool(&tool_input, &workspace)
-                .await
-                .map(RichToolResult::plain)
-        } else if tool_name == JS_EXECUTION_TOOL_NAME {
-            execute_js_execution_tool(&tool_input, &workspace)
-                .await
-                .map(RichToolResult::plain)
+        } else if matches!(
+            tool_name.as_str(),
+            CODE_EXECUTION_TOOL_NAME | JS_EXECUTION_TOOL_NAME
+        ) {
+            if let Some(context) = context_override
+                .as_ref()
+                .or_else(|| registry.map(|registry| registry.context()))
+            {
+                let result = if tool_name == CODE_EXECUTION_TOOL_NAME {
+                    execute_code_execution_tool(&tool_input, &workspace, context).await
+                } else {
+                    execute_js_execution_tool(&tool_input, &workspace, context).await
+                };
+                result.map(RichToolResult::plain)
+            } else {
+                Err(ToolError::not_available(
+                    "local code execution requires an effective tool context",
+                ))
+            }
         } else if tool_name == EXECUTE_TOOLS_TOOL_NAME {
             if let Some(registry) = registry {
                 let context = context_override

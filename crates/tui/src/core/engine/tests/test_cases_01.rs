@@ -470,6 +470,7 @@ async fn event_capacity_cancelled_repl_child_keeps_unknown_cost_and_discards_ker
     use crate::llm_client::mock::{MockLlmClient, canned};
     struct ReplClient {
         inner: MockLlmClient,
+        stream_requests: std::sync::atomic::AtomicUsize,
         child_entered: Arc<tokio::sync::Notify>,
         child_dropped: Arc<std::sync::atomic::AtomicBool>,
     }
@@ -485,16 +486,26 @@ async fn event_capacity_cancelled_repl_child_keeps_unknown_cost_and_discards_ker
             &self,
             _: codewhale_models::MessageRequest,
         ) -> anyhow::Result<codewhale_models::MessageResponse> {
-            let _drop = DropSignal(Arc::clone(&self.child_dropped));
-            self.child_entered.notify_one();
-            std::future::pending().await
+            anyhow::bail!("fixture expects canonical streaming requests")
         }
         async fn create_message_stream(
             &self,
             request: codewhale_models::MessageRequest,
         ) -> anyhow::Result<crate::llm_client::StreamEventBox> {
-            crate::core::model_client::ModelClient::create_message_stream(&self.inner, request)
-                .await
+            if self
+                .stream_requests
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                == 0
+            {
+                return crate::core::model_client::ModelClient::create_message_stream(
+                    &self.inner,
+                    request,
+                )
+                .await;
+            }
+            let _drop = DropSignal(Arc::clone(&self.child_dropped));
+            self.child_entered.notify_one();
+            std::future::pending().await
         }
         async fn health_check(&self) -> anyhow::Result<bool> {
             Ok(true)
@@ -518,14 +529,20 @@ async fn event_capacity_cancelled_repl_child_keeps_unknown_cost_and_discards_ker
     }
     let client = Arc::new(ReplClient {
         inner: MockLlmClient::new(vec![response]),
+        stream_requests: std::sync::atomic::AtomicUsize::new(0),
         child_entered: Arc::clone(&entered),
         child_dropped: Arc::clone(&dropped),
     });
+    let api_config = rlm_host::fixture_config("mock-model");
     let (mut engine, handle) = Engine::new_with_model_client(
-        deterministic_engine_config(workspace.path()),
-        &Config::default(),
+        EngineConfig {
+            model: "mock-model".into(),
+            ..deterministic_engine_config(workspace.path())
+        },
+        &api_config,
         client.clone(),
     );
+    rlm_host::install_fixture_route(&mut engine);
     engine.session.auto_approve = true;
     engine.session.add_message(Message {
         role: Role::User,
@@ -534,18 +551,16 @@ async fn event_capacity_cancelled_repl_child_keeps_unknown_cost_and_discards_ker
             cache_control: None,
         }],
     });
-    let registry = crate::tools::ToolRegistry::new(crate::tools::ToolContext::new(
-        workspace.path().to_owned(),
-    ));
+    let turn_guard = engine.begin_turn_control();
+    let mut turn = TurnContext::new(4);
+    let registry = crate::tools::ToolRegistry::new(rlm_host::admitted_context(&engine, &turn.id));
     let policy = test_tool_surface(
         &engine,
         registry,
         Some(vec![catalog_tool(CODE_EXECUTION_TOOL_NAME)]),
         AppMode::Agent,
     );
-    let turn_guard = engine.begin_turn_control();
     let tx = engine.tx_event.clone();
-    let mut turn = TurnContext::new(4);
     let mut run = Box::pin(engine.run_turn(&mut turn, policy, None, None));
     tokio::time::timeout(Duration::from_secs(10), async {
         tokio::select! {
@@ -574,11 +589,21 @@ async fn event_capacity_cancelled_repl_child_keeps_unknown_cost_and_discards_ker
     );
     assert_eq!((turn.usage.input_tokens, turn.usage.output_tokens), (11, 5));
     let cost = crate::cost_status::drain();
+    // The child provider future never returned a response; its canonical
+    // dispatch guard records an unknown outcome, not success without usage.
     assert!(
         cost.unpriced_reasons
-            .contains("provider_success_missing_usage"),
+            .contains(crate::cost_status::RuntimeUsageMissingReason::RequestOutcomeUnknown.label()),
         "pending child usage stays unknown, never zero"
     );
+    assert_eq!(cost.priced_turns, 0);
+    assert_eq!(cost.unpriced_turns, 1);
+    assert_eq!(cost.missing_usage_sources.len(), 1);
+    assert!(cost.missing_usage_sources.values().all(|coverage| {
+        coverage.reason == crate::cost_status::RuntimeUsageMissingReason::RequestOutcomeUnknown
+            && coverage.money_metered
+    }));
+    assert!(cost.resolved_missing_usage_sources.is_empty());
     assert_eq!(
         client.inner.call_count(),
         1,

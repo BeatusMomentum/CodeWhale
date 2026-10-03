@@ -42,14 +42,22 @@ fn render(result: &CommandResult) -> String {
 #[test]
 fn balance_branch_pair_matches_baseline() {
     let mut harness = DiagnosticsHarness::new();
-    harness.app.api_provider = ProviderKind::Deepseek;
+    harness.app.set_provider_identity_record(
+        crate::config::Config::default()
+            .resolve_provider_identity(ProviderKind::Deepseek.as_str())
+            .expect("captured fixture provider"),
+    );
     assert_fixture(
         "balance_supported.txt",
         &render(&execute("/balance", &mut harness.app)),
     );
 
     let mut harness = DiagnosticsHarness::new();
-    harness.app.api_provider = ProviderKind::Ollama;
+    harness.app.set_provider_identity_record(
+        crate::config::Config::default()
+            .resolve_provider_identity(ProviderKind::Ollama.as_str())
+            .expect("captured fixture provider"),
+    );
     assert_fixture(
         "balance_unsupported.txt",
         &render(&execute("/balance", &mut harness.app)),

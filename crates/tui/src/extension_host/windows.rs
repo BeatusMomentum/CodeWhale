@@ -225,16 +225,18 @@ fn retire_scope(root: &Path, scope: &GrantScope, sid: PSID) -> io::Result<()> {
     if !root.try_exists()? {
         return Ok(());
     }
-    let root_pin;
-    let root_file;
-    let file = if scope.tree {
-        root_pin = WindowsDirectory::open_acl(root)?;
-        root_pin.acl_handle()?
+    let root_pin = if scope.tree {
+        WindowsDirectory::open_acl(root)?
     } else {
-        root_pin = WindowsDirectory::open(
+        WindowsDirectory::open(
             root.parent()
                 .ok_or_else(|| io::Error::other("grant has no parent"))?,
-        )?;
+        )?
+    };
+    let root_file;
+    let file = if scope.tree {
+        root_pin.acl_handle()?
+    } else {
         root_file = acl_file_with_share(root, 1 | 2 | 4)?;
         &root_file
     };

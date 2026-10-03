@@ -19202,8 +19202,9 @@ fn apply_slash_menu_selection_honors_user_argument_metadata_and_builtin_override
     .expect("write argument command");
     // Workspace commands load only in a trusted workspace.
     crate::config::save_workspace_trust(tmp.path()).expect("trust test workspace");
-    let mut app = create_test_app();
-    app.workspace = tmp.path().to_path_buf();
+    let mut app = crate::test_support::test_app_with_options(
+        crate::test_support::test_tui_options(tmp.path()),
+    );
     let entries = vec![
         crate::tui::widgets::SlashMenuEntry {
             name: "/model".to_string(),
@@ -26524,7 +26525,18 @@ fn auth_error_does_not_trigger_provider_fallback() {
 fn fallback_switch_status_shows_one_based_position_and_reason() {
     use crate::error_taxonomy::{ErrorCategory, ErrorEnvelope, ErrorSeverity};
 
-    let mut app = create_test_app();
+    let mut providers = crate::config::ProvidersConfig::default();
+    providers.openrouter.api_key = Some("fixture-fallback-key".to_string());
+    let config = crate::config::Config {
+        provider: Some("deepseek".to_string()),
+        fallback_providers: vec![ProviderKind::Openrouter],
+        providers: Some(providers),
+        ..Default::default()
+    };
+    let mut app = App::new(
+        crate::test_support::test_tui_options(std::path::PathBuf::from(".")),
+        &config,
+    );
     app.api_provider = ProviderKind::Deepseek;
     app.provider_chain = Some(codewhale_config::ProviderChain::new(
         codewhale_config::ProviderKind::Deepseek,

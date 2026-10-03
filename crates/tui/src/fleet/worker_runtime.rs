@@ -720,8 +720,8 @@ pub(crate) fn resolve_fleet_route_with_config(
         let candidate = resolve_route_candidate(
             provider,
             model_selector,
-            Some(metadata.base_url),
-            None,
+            Some(metadata.default_model),
+            Some(metadata.base_url.to_owned()),
             None,
             None,
         )

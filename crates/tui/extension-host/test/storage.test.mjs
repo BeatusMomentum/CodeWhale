@@ -218,3 +218,124 @@ test('same-key writers publish complete last-writer-wins records during concurre
   for (const run of [first, second]) assert.equal((await run.exited)[0], 0, run.stderr())
   assert.ok(['first', 'second'].includes((await store.get('shared')).writer))
 })
+
+// Faults are injected in an owned subprocess. These prove retry/guard behavior,
+// not Windows kernel semantics; the unchanged concurrent-writer case runs there.
+async function sharingWorker(t, directory, body) {
+  const run = worker(t, directory, `
+    (async () => {
+      const fs = require('node:fs'), { syncBuiltinESMExports } = require('node:module');
+      const { createStorage } = await import(${JSON.stringify(moduleUrl)});
+      ${body}
+      process.disconnect();
+    })().catch(e => { console.error(e); process.exit(1); });
+  `)
+  const message = once(run.child, 'message', { signal: AbortSignal.timeout(5000) })
+  const [report] = await Promise.race([message, run.exited.then(() => { throw new Error(run.stderr()) })])
+  assert.equal((await run.exited)[0], 0, run.stderr())
+  return report
+}
+
+test('Windows sharing retries keep complete records and retain atomic replacement', async (t) => {
+  const { a } = await fixture(t)
+  const report = await sharingWorker(t, a, `
+    const store = createStorage({ dataDir: process.argv[1], isActive: () => true });
+    await store.set('shared', 'original');
+    Object.defineProperty(process, 'platform', { value: 'win32' });
+    const realOpen = fs.promises.open, realRename = fs.promises.rename;
+    let reads = 0, publications = 0;
+    fs.promises.open = async (...args) => {
+      if (String(args[0]).endsWith('.json') && reads++ < 2) throw Object.assign(new Error('sharing'), { code: 'EPERM' });
+      return realOpen(...args);
+    };
+    fs.promises.rename = async (...args) => {
+      if (publications++ < 2) throw Object.assign(new Error('sharing'), { code: 'EACCES' });
+      return realRename(...args);
+    };
+    syncBuiltinESMExports();
+    await store.set('shared', 'complete replacement');
+    const value = await store.get('shared');
+    process.send({ value, publications, reads, names: await fs.promises.readdir(require('node:path').join(process.argv[1], 'storage-v1')) });
+  `)
+  assert.equal(report.value, 'complete replacement')
+  assert.equal(report.publications, 3)
+  assert.ok(report.reads >= 3)
+  assert.equal(report.names.length, 1)
+  assert.match(report.names[0], /^[a-f0-9]{64}\.json$/u)
+})
+
+test('Windows sharing retries refuse revocation, corrupt replacements and permanent denial', async (t) => {
+  const { a } = await fixture(t)
+  for (const mode of ['revoked', 'corrupt', 'denied']) {
+    const directory = join(a, mode)
+    await mkdir(directory, { mode: 0o700 })
+    const report = await sharingWorker(t, directory, `
+      let live = true;
+      const store = createStorage({ dataDir: process.argv[1], isActive: () => live });
+      await store.set('shared', 'original');
+      const path = require('node:path').join(process.argv[1], 'storage-v1', require('node:crypto').createHash('sha256').update('shared').digest('hex') + '.json');
+      const original = await fs.promises.readFile(path, 'utf8');
+      Object.defineProperty(process, 'platform', { value: 'win32' });
+      let publications = 0;
+      fs.promises.rename = async () => {
+        publications++;
+        if (${JSON.stringify(mode)} === 'revoked') live = false;
+        if (${JSON.stringify(mode)} === 'corrupt') await fs.promises.writeFile(path, '{broken');
+        throw Object.assign(new Error('sharing'), { code: 'EPERM' });
+      };
+      syncBuiltinESMExports();
+      let code;
+      try { await store.set('shared', 'must not publish'); throw new Error('unexpected publication'); } catch (error) { code = error.code; }
+      process.send({ code, publications, bytes: await fs.promises.readFile(path, 'utf8'), original, names: await fs.promises.readdir(require('node:path').dirname(path)) });
+    `)
+    assert.equal(report.code, mode === 'revoked' ? 'not_available' : mode === 'corrupt' ? 'corrupt' : 'io')
+    assert.equal(report.publications, mode === 'denied' ? 11 : 1)
+    assert.equal(report.bytes, mode === 'corrupt' ? '{broken' : report.original)
+    assert.equal(report.names.length, 1, 'only this invocation temporary file is cleaned up')
+  }
+})
+
+test('sharing failures on other platforms remain visible without replaying publication', async (t) => {
+  const { a } = await fixture(t)
+  const report = await sharingWorker(t, a, `
+    const store = createStorage({ dataDir: process.argv[1], isActive: () => true });
+    await store.set('shared', 'original');
+    Object.defineProperty(process, 'platform', { value: 'linux' });
+    let publications = 0;
+    fs.promises.rename = async () => { publications++; throw Object.assign(new Error('denied'), { code: 'EPERM' }); };
+    syncBuiltinESMExports();
+    let code;
+    try { await store.set('shared', 'must not publish'); throw new Error('unexpected publication'); } catch (error) { code = error.code; }
+    process.send({ code, publications, value: await store.get('shared') });
+  `)
+  assert.equal(report.code, 'io')
+  assert.equal(report.publications, 1)
+  assert.equal(report.value, 'original')
+})
+
+test('Windows sharing read retries refuse revocation before reopening private state', async (t) => {
+  const { a } = await fixture(t)
+  const report = await sharingWorker(t, a, `
+    let live = true;
+    const store = createStorage({ dataDir: process.argv[1], isActive: () => live });
+    await store.set('shared', 'private value');
+    Object.defineProperty(process, 'platform', { value: 'win32' });
+    const realOpen = fs.promises.open;
+    let opens = 0;
+    fs.promises.open = async (...args) => {
+      if (String(args[0]).endsWith('.json')) {
+        opens++;
+        live = false;
+        throw Object.assign(new Error('sharing'), { code: 'EPERM' });
+      }
+      return realOpen(...args);
+    };
+    syncBuiltinESMExports();
+    let code, value;
+    try { value = await store.get('shared'); } catch (error) { code = error.code; }
+    process.send({ code, opens, value });
+  `)
+  assert.equal(report.code, 'not_available')
+  assert.equal(report.opens, 1)
+  assert.equal(Object.hasOwn(report, 'value'), false, 'revoked state is never returned over IPC')
+})

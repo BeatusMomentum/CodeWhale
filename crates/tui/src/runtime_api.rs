@@ -5815,7 +5815,11 @@ async fn mcp_pool_handle(
             }
             let mut held = pool.clone().lock_owned().await;
             let current = state.clone();
+            #[cfg(test)]
+            let env_ticket = crate::test_support::env_scope_ticket();
             codewhale_app_server::daemon_socket::owner_work(move || {
+                #[cfg(test)]
+                let _membership = crate::test_support::join_env_scope(env_ticket);
                 // Keep the exact scope/owner alive through synchronous disk
                 // reload even if this request is cancelled after admission.
                 current.workspace_scope.validate_sync()?;
@@ -5830,7 +5834,11 @@ async fn mcp_pool_handle(
             slot.as_mut().expect("retained pool").0 = generation;
         } else if create {
             let current = state.clone();
+            #[cfg(test)]
+            let env_ticket = crate::test_support::env_scope_ticket();
             let pool = codewhale_app_server::daemon_socket::owner_work(move || {
+                #[cfg(test)]
+                let _membership = crate::test_support::join_env_scope(env_ticket);
                 current.workspace_scope.validate_sync()?;
                 let path = current.config.read().mcp_config_path();
                 let plugins = current
@@ -7012,6 +7020,8 @@ async fn patch_undo_thread_turn(
     // Once admitted, own the operation even when the HTTP caller disconnects:
     // the reservation must outlive both the file mutation and the fork
     // publication, so a dropped connection cannot release it mid-Git.
+    #[cfg(test)]
+    let env_ticket = crate::test_support::env_scope_ticket();
     tokio::spawn(async move {
         let reservation = reservation;
         // Validate depth/history before touching any file, so an invalid
@@ -7034,6 +7044,8 @@ async fn patch_undo_thread_turn(
         // refusal or a failed restore aborts *before* the conversation is
         // forked, so the turn never disappears while its file changes stay.
         let patch_result = tokio::task::spawn_blocking(move || {
+            #[cfg(test)]
+            let _membership = crate::test_support::join_env_scope(env_ticket);
             patch_undo_workspace_files(&workspace, &dropped_turns, trusted)
         })
         .await

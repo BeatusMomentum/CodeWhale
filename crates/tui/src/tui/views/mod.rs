@@ -2271,7 +2271,17 @@ impl ConfigView {
                 value: config
                     .active_provider_identity()
                     .ok()
-                    .filter(|identity| identity.key.as_str() == active_provider_identity)
+                    .filter(|identity| {
+                        // Display names are labels; saved facts require the
+                        // exact provider identity admitted by this App.
+                        app.admitted_provider_identity()
+                            .is_ok_and(|active| active == identity)
+                            && identity.provider == active_route_provider
+                            && (!app.auto_model
+                                || app.last_effective_provider.is_none()
+                                || app.last_effective_provider_identity.as_deref()
+                                    == Some(identity.key.as_str()))
+                    })
                     .and_then(|identity| config.context_window_for_provider_config(&identity))
                     .map_or_else(|| "(not set)".to_string(), |tokens| tokens.to_string()),
                 editable: false,
@@ -9191,6 +9201,7 @@ base_url = "https://api.xiaomimimo.com/v1"
 
     #[test]
     fn config_view_exposes_configured_and_effective_context_window() {
+        let _env = crate::test_support::lock_test_env();
         let temp = tempfile::tempdir().expect("config fixture");
         let config_path = temp.path().join("config.toml");
         std::fs::write(
@@ -9203,9 +9214,23 @@ context_window = 262144
 "#,
         )
         .expect("config");
-        let mut app = create_test_app();
-        app.config_path = Some(config_path);
-        app.api_provider = crate::config::ProviderKind::Moonshot;
+        let _config_path =
+            crate::test_support::EnvVarGuard::set("DEEPSEEK_CONFIG_PATH", &config_path);
+        let config =
+            Config::load(Some(config_path.clone()), None).expect("captured fixture config");
+        let options = TuiOptions {
+            config_path: Some(config_path),
+            ..crate::test_support::test_tui_options(temp.path())
+        };
+        let mut app = App::new(options, &config);
+        let identity = config
+            .active_provider_identity()
+            .expect("captured fixture provider");
+        assert_eq!(
+            config.context_window_for_provider_config(&identity),
+            Some(262_144)
+        );
+        app.set_provider_identity_record(identity);
         app.model = "kimi-k3".to_string();
         app.active_route_limits = Some(codewhale_config::route::RouteLimits {
             context_tokens: Some(262_144),
@@ -9227,6 +9252,97 @@ context_window = 262144
 
         assert_eq!(configured.value, "262144");
         assert_eq!(effective.value, "262144 tokens · configured");
+
+        app.auto_model = true;
+        app.last_effective_provider = Some(app.api_provider);
+        app.last_effective_provider_identity = Some("other-moonshot".to_string());
+        let automatic_view = ConfigView::new_for_app(&app);
+        let configured = automatic_view
+            .rows
+            .iter()
+            .find(|row| row.key == "context_window")
+            .expect("automatic configured context row");
+        assert_eq!(configured.value, "(not set)");
+        app.pending_turn_route = Some((app.api_provider, "kimi-k3".to_string(), true));
+        let pending_view = ConfigView::new_for_app(&app);
+        let configured = pending_view
+            .rows
+            .iter()
+            .find(|row| row.key == "context_window")
+            .expect("pending foreign configured context row");
+        assert_eq!(configured.value, "(not set)");
+        app.pending_turn_route = None;
+        app.auto_model = false;
+
+        // Same provider kind is insufficient when a different owned table is
+        // selected. The saved row must not borrow another table's limit.
+        let saved_path = PathBuf::from(
+            std::env::var_os("DEEPSEEK_CONFIG_PATH").expect("isolated saved config path"),
+        );
+        std::fs::write(
+            &saved_path,
+            r#"
+provider = "custom-current"
+[providers.custom-current]
+kind = "openai-compatible"
+base_url = "https://current.example.invalid/v1"
+model = "fixture-model"
+context_window = 131072
+"#,
+        )
+        .expect("saved custom provider");
+        let saved = Config::load(Some(saved_path.clone()), None).expect("saved custom config");
+        let saved_identity = saved
+            .active_provider_identity()
+            .expect("saved admitted custom identity");
+        assert_eq!(saved_identity.provider, crate::config::ProviderKind::Custom);
+        assert_eq!(saved_identity.key.as_str(), "custom-current");
+        assert_eq!(
+            saved.context_window_for_provider_config(&saved_identity),
+            Some(131_072)
+        );
+        let options = TuiOptions {
+            config_path: Some(saved_path),
+            ..crate::test_support::test_tui_options(temp.path())
+        };
+        let mut app = App::new(options, &saved);
+        app.set_provider_identity_record(saved_identity.clone());
+        let saved_view = ConfigView::new_for_app(&app);
+        let configured = saved_view
+            .rows
+            .iter()
+            .find(|row| row.key == "context_window")
+            .expect("saved custom configured context row");
+        assert_eq!(configured.value, "131072");
+        let foreign: Config = toml::from_str(
+            r#"
+provider = "custom-other"
+[providers.custom-other]
+kind = "openai-compatible"
+base_url = "https://other.example.invalid/v1"
+model = "fixture-model"
+context_window = 131072
+"#,
+        )
+        .expect("foreign configured provider");
+        let foreign_identity = foreign
+            .active_provider_identity()
+            .expect("foreign admitted provider identity");
+        assert_eq!(
+            foreign_identity.provider,
+            crate::config::ProviderKind::Custom
+        );
+        assert_eq!(foreign_identity.provider, app.api_provider);
+        assert_eq!(foreign_identity.key.as_str(), "custom-other");
+        assert_ne!(foreign_identity.key, saved_identity.key);
+        app.set_provider_identity_record(foreign_identity);
+        let foreign_view = ConfigView::new_for_app(&app);
+        let configured = foreign_view
+            .rows
+            .iter()
+            .find(|row| row.key == "context_window")
+            .expect("foreign configured context row");
+        assert_eq!(configured.value, "(not set)");
     }
 
     #[test]

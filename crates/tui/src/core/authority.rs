@@ -17,6 +17,24 @@ use serde_json::Value;
 
 use super::ops::UserInputProvenance;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunOrigin {
+    Interactive,
+    Headless,
+    Background,
+}
+
+impl RunOrigin {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Interactive => "interactive",
+            Self::Headless => "headless",
+            Self::Background => "background",
+        }
+    }
+}
+
 /// Durable Agent-era permission baseline that Plan/YOLO restore to (#3386).
 ///
 /// Mode cycling used to be tangled with permission policy: each mode mutated

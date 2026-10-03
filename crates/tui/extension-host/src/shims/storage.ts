@@ -3,6 +3,7 @@ import { constants } from 'node:fs'
 import { lstat, mkdir, open, readdir, realpath, rename, unlink } from 'node:fs/promises'
 import { isAbsolute, join } from 'node:path'
 import { createHash, randomUUID } from 'node:crypto'
+import { setTimeout as delay } from 'node:timers/promises'
 import { isJson } from '../json.ts'
 import type { Json } from '../protocol.ts'
 
@@ -73,10 +74,22 @@ function fsCode(error: unknown): string | undefined {
   return (error as NodeJS.ErrnoException)?.code
 }
 
+// Windows may briefly deny access while another process replaces a record.
+// Retry only sharing-related I/O errors; permanent denial still fails closed.
+async function retryWindowsSharing<T>(operation: () => Promise<T>, beforeRetry?: () => unknown | Promise<unknown>): Promise<T> {
+  for (let retry = 0; ; retry++) {
+    if (retry) await beforeRetry?.()
+    try { return await operation() } catch (error) {
+      if (process.platform !== 'win32' || retry >= 10 || !['EACCES', 'EBUSY', 'EPERM'].includes(fsCode(error) ?? '')) throw error
+      await delay(50)
+    }
+  }
+}
+
 interface RecordSnapshot { key: string; value: Json; bytes: number }
 
 /** Read one bounded, complete record without following a link. */
-async function readRecord(directory: string, name: string): Promise<RecordSnapshot | undefined> {
+async function readRecordOnce(directory: string, name: string): Promise<RecordSnapshot | undefined> {
   const path = join(directory, name)
   let file
   try {
@@ -135,6 +148,10 @@ export function createStorage({ dataDir, isActive, onWarning }: StorageOptions):
     if (!isActive()) throw new StorageError('not_available', 'plugin storage owner is no longer active')
   }
 
+  async function readRecord(directory: string, name: string): Promise<RecordSnapshot | undefined> {
+    return retryWindowsSharing(() => readRecordOnce(directory, name), active)
+  }
+
   async function directory(): Promise<string> {
     const stat = await lstat(dataDir)
     if (!stat.isDirectory() || stat.isSymbolicLink()) throw new StorageError('invalid', 'plugin storage dataDir must be a real directory')
@@ -189,8 +206,14 @@ export function createStorage({ dataDir, isActive, onWarning }: StorageOptions):
       await file.sync()
       await file.close()
       file = undefined
-      active()
-      await rename(temporary, join(directory, name))
+      await retryWindowsSharing(async () => {
+        active()
+        await rename(temporary, join(directory, name))
+      }, async () => {
+        // A retry never bypasses a newly corrupt/linked destination or revocation.
+        active()
+        await readRecord(directory, name)
+      })
       published = true
       await syncDirectory(directory)
     } finally {

@@ -2634,7 +2634,11 @@ mod tests {
         let registry = HotbarActionRegistry::with_builtins();
         let reasoning = registry.get("reasoning.cycle").expect("reasoning action");
         let mut app = test_app();
-        app.api_provider = ProviderKind::OpenaiCodex;
+        app.set_provider_identity_record(
+            crate::config::Config::default()
+                .resolve_provider_identity(ProviderKind::OpenaiCodex.as_str())
+                .expect("captured fixture provider"),
+        );
         app.auto_model = false;
         app.reasoning_effort = ReasoningEffort::Low;
 

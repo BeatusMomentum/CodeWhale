@@ -939,6 +939,7 @@ async fn encoded_oversize_creation_refuses_before_owner_effect() {
 
 #[tokio::test]
 async fn declared_oversize_response_refuses_complete_document_without_truncation() {
+    crate::install_test_crypto_provider();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let app = Router::new().route(

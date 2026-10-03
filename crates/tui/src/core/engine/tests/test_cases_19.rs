@@ -1190,14 +1190,12 @@ fn engine_adopts_host_owned_session_id_from_config() {
     );
     assert!(
         uuid::Uuid::parse_str(engine.session_id()).is_ok(),
-        "a blank host id must keep a generated uuid, got {:?}",
-        engine.session_id()
+        "a blank host id must keep a generated uuid"
     );
 
     let (engine, _handle) = Engine::new(EngineConfig::default(), &config);
     assert!(
         uuid::Uuid::parse_str(engine.session_id()).is_ok(),
-        "headless callers keep the generated uuid, got {:?}",
-        engine.session_id()
+        "headless callers keep the generated uuid"
     );
 }

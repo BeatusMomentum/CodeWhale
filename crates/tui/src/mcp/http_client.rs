@@ -136,6 +136,8 @@ pub(crate) struct McpHttpClient {
     connect_timeout: Duration,
     read_timeout: Duration,
     default_headers: header::HeaderMap,
+    // OAuth form bodies carry credentials independently of MCP auth headers.
+    credential_bearing: bool,
     // Bound once after OAuth setup; clones keep the same request-time authority.
     // Raw OAuth execute/send deliberately do not resolve this MCP auth policy.
     mcp_auth: McpHttpAuth,
@@ -171,6 +173,7 @@ impl McpHttpClient {
             connect_timeout,
             read_timeout,
             default_headers: header::HeaderMap::new(),
+            credential_bearing: false,
             mcp_auth: McpHttpAuth::default(),
             request_builder: guarded_reqwest_client_builder().build()?,
             clients: Arc::new(Mutex::new(HashMap::new())),
@@ -183,6 +186,31 @@ impl McpHttpClient {
         self
     }
 
+    pub(super) fn with_credential_transport(mut self) -> Result<Self> {
+        validate_credential_transport(&Url::parse(&self.origin)?, true)?;
+        self.credential_bearing = true;
+        Ok(self)
+    }
+
+    fn validate_request_transport(&self, request: &Request) -> Result<()> {
+        // All configured/custom headers are potentially sensitive, regardless
+        // of their names or whether an environment value is currently present.
+        // Only the transport's fixed framing headers are non-credential input.
+        let credentials = self.credential_bearing
+            || !self.mcp_auth.headers.is_empty()
+            || !self.mcp_auth.env_headers.is_empty()
+            || self.mcp_auth.bearer_token_env_var.is_some()
+            || self.mcp_auth.oauth.is_some()
+            || !self.default_headers.is_empty()
+            || request.headers().keys().any(|name| {
+                !matches!(
+                    name.as_str(),
+                    "accept" | "content-type" | "content-length" | "mcp-protocol-version"
+                )
+            });
+        validate_credential_transport(request.url(), credentials)
+    }
+
     /// Prepare the MCP request's fixed framing headers and live credentials.
     /// This remains separate from send so callers retain their existing auth,
     /// header and long-lived-body cancellation/deadline boundaries. OAuth uses
@@ -192,6 +220,12 @@ impl McpHttpClient {
         request: reqwest::RequestBuilder,
         json_body: bool,
     ) -> Result<reqwest::RequestBuilder> {
+        self.validate_request_transport(
+            &request
+                .try_clone()
+                .context("MCP request body cannot be replayed")?
+                .build()?,
+        )?;
         let headers = self.mcp_auth.resolved_headers().await?;
         Ok(apply_safe_custom_headers(
             with_default_mcp_http_headers(request, json_body),
@@ -369,6 +403,7 @@ impl McpHttpClient {
         for redirect_count in 0..=5 {
             let url = request.url().clone();
             validate()?;
+            self.validate_request_transport(&request)?;
             let client = self.client_for_target(&url).await?;
             // DNS/guarded-client selection yielded. Owner generation, exact
             // operation expiry and reviewed source must still authorize the
@@ -509,6 +544,17 @@ fn validate_url(url: &Url) -> Result<()> {
     if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
         bail!("MCP HTTP requires an http:// or https:// URL with a host");
     }
+    if url_has_credentials(url) {
+        bail!("MCP HTTP URL must not contain credentials; use configured headers");
+    }
+    Ok(())
+}
+
+fn validate_credential_transport(url: &Url, credentials: bool) -> Result<()> {
+    validate_url(url)?;
+    if credentials && url.scheme() != "https" && !explicit_loopback_target(url) {
+        bail!("MCP HTTP credentials require HTTPS except on an explicit loopback endpoint");
+    }
     Ok(())
 }
 
@@ -564,6 +610,19 @@ fn explicit_local_target(url: &Url) -> bool {
             .is_ok_and(|ip| is_restricted_ip(&ip))
 }
 
+fn explicit_loopback_target(url: &Url) -> bool {
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    let host = host.trim_end_matches('.');
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
 fn validated_public_address(addresses: &[SocketAddr]) -> Result<SocketAddr> {
     if addresses
         .iter()
@@ -610,6 +669,246 @@ mod tests {
         }
         socket.write_all(response.as_bytes()).await.unwrap();
         String::from_utf8(bytes).unwrap()
+    }
+
+    #[test]
+    fn credential_transport_requires_https_or_an_explicit_loopback_endpoint() {
+        for endpoint in [
+            "https://example.invalid/mcp",
+            "http://127.0.0.1/mcp",
+            "http://127.9.8.7/mcp",
+            "http://[::1]/mcp",
+            "http://localhost/mcp",
+            "http://localhost./mcp",
+        ] {
+            assert!(validate_credential_transport(&Url::parse(endpoint).unwrap(), true).is_ok());
+        }
+        for endpoint in [
+            "http://example.invalid/mcp",
+            "http://192.0.2.1/mcp",
+            "http://10.0.0.1/mcp",
+            "http://169.254.169.254/mcp",
+            "http://service.localhost/mcp",
+        ] {
+            let url = Url::parse(endpoint).unwrap();
+            assert!(validate_credential_transport(&url, true).is_err());
+            assert!(validate_credential_transport(&url, false).is_ok());
+        }
+        for endpoint in [
+            "https://fixture-user:fixture-password@example.invalid/mcp",
+            "http://fixture-user@127.0.0.1/mcp",
+        ] {
+            let url = Url::parse(endpoint).unwrap();
+            assert!(validate_credential_transport(&url, true).is_err());
+            assert!(validate_credential_transport(&url, false).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn configured_mcp_credentials_refuse_remote_http_before_header_resolution() {
+        let _env = crate::test_support::lock_test_env();
+        crate::tls::ensure_rustls_crypto_provider();
+        let _token = crate::test_support::EnvVarGuard::set(
+            "CODEWHALE_TEST_MCP_TLS_BEARER",
+            "fixture-private-value",
+        );
+        let _header = crate::test_support::EnvVarGuard::set(
+            "CODEWHALE_TEST_MCP_TLS_HEADER",
+            "fixture-private-value",
+        );
+        let url = "http://mcp-guard-fixture.invalid/mcp";
+        for auth in [
+            McpHttpAuth {
+                headers: HashMap::from([(
+                    "X-Arbitrary".to_string(),
+                    "fixture-private-value".to_string(),
+                )]),
+                ..Default::default()
+            },
+            McpHttpAuth {
+                // Configured framing overrides are still operator-supplied input.
+                headers: HashMap::from([(
+                    "Accept".to_string(),
+                    "fixture-private-value".to_string(),
+                )]),
+                ..Default::default()
+            },
+            McpHttpAuth {
+                env_headers: HashMap::from([(
+                    "X-Arbitrary".to_string(),
+                    "CODEWHALE_TEST_MCP_TLS_HEADER".to_string(),
+                )]),
+                ..Default::default()
+            },
+            McpHttpAuth {
+                bearer_token_env_var: Some("CODEWHALE_TEST_MCP_TLS_BEARER".to_string()),
+                ..Default::default()
+            },
+            McpHttpAuth {
+                // An absent environment value cannot turn an unsafe credential
+                // configuration into an authorized transport.
+                env_headers: HashMap::from([(
+                    "X-Arbitrary".to_string(),
+                    "CODEWHALE_TEST_MCP_TLS_ABSENT".to_string(),
+                )]),
+                ..Default::default()
+            },
+        ] {
+            let session = client(url, false).with_mcp_auth(auth);
+            let error = session
+                .prepare_mcp_request(session.post(url).body("{}"), true)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("credentials require HTTPS"));
+            assert!(!error.to_string().contains("fixture-private-value"));
+            assert!(session.clients.lock().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_http_custom_credentials_never_reach_an_operator_proxy() {
+        let _env = crate::test_support::lock_test_env();
+        crate::tls::ensure_rustls_crypto_provider();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_url = format!("http://{}", listener.local_addr().unwrap());
+        let _https_proxy = crate::test_support::EnvVarGuard::set("HTTPS_PROXY", &proxy_url);
+        let _http_proxy = crate::test_support::EnvVarGuard::set("HTTP_PROXY", &proxy_url);
+        let _no_proxy = crate::test_support::EnvVarGuard::set("NO_PROXY", "");
+        let _lower_no_proxy = crate::test_support::EnvVarGuard::set("no_proxy", "");
+        let url = "http://mcp-guard-fixture.invalid/mcp";
+        let mut defaults = header::HeaderMap::new();
+        defaults.insert(
+            "X-Arbitrary",
+            header::HeaderValue::from_static("fixture-private-value"),
+        );
+        let session = client(url, false).with_default_headers(defaults);
+        let error = session
+            .send(session.post(url).body("{}"))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("credentials require HTTPS"));
+        assert!(!error.to_string().contains("fixture-private-value"));
+        let session = client(url, false);
+        for name in ["X-Arbitrary", "Mcp-Session-Id"] {
+            let error = session
+                .send(
+                    session
+                        .post(url)
+                        .header(name, "fixture-private-value")
+                        .body("{}"),
+                )
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("credentials require HTTPS"));
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), listener.accept())
+                .await
+                .is_err()
+        );
+
+        // The same configured public HTTP route remains usable without credentials.
+        let server = tokio::spawn(reply_once(
+            listener,
+            "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 2\r\n\r\nok".to_string(),
+        ));
+        let response = session
+            .send_mcp_request(
+                session
+                    .post(url)
+                    .header("mcp-protocol-version", "2025-03-26")
+                    .body("{}"),
+                true,
+                false,
+                false,
+                || Ok(()),
+                |_| Ok(()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.text().await.unwrap(), "ok");
+        let seen = server.await.unwrap().to_ascii_lowercase();
+        assert!(seen.contains("accept: application/json, text/event-stream"));
+        assert!(!seen.contains("fixture-private-value"));
+        assert!(seen.contains("mcp-protocol-version: 2025-03-26"));
+    }
+
+    #[tokio::test]
+    async fn loopback_mcp_credentials_keep_live_auth_and_protocol_framing() {
+        let _env = crate::test_support::lock_test_env();
+        let _no_proxy = crate::test_support::EnvVarGuard::set("NO_PROXY", "*");
+        crate::tls::ensure_rustls_crypto_provider();
+        let _token =
+            crate::test_support::EnvVarGuard::set("CODEWHALE_TEST_MCP_TLS_BEARER", "fixture-token");
+        let _live =
+            crate::test_support::EnvVarGuard::set("CODEWHALE_TEST_MCP_TLS_HEADER", "fixture-live");
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let server = tokio::spawn(reply_once(
+            listener,
+            "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 2\r\n\r\nok".to_string(),
+        ));
+        let session = client(&url, false).with_mcp_auth(McpHttpAuth {
+            headers: HashMap::from([("X-Arbitrary".to_string(), "fixture-static".to_string())]),
+            env_headers: HashMap::from([(
+                "X-Live".to_string(),
+                "CODEWHALE_TEST_MCP_TLS_HEADER".to_string(),
+            )]),
+            bearer_token_env_var: Some("CODEWHALE_TEST_MCP_TLS_BEARER".to_string()),
+            ..Default::default()
+        });
+        let response = session
+            .send_mcp_request(
+                session.post(&url).body("{}"),
+                true,
+                false,
+                false,
+                || Ok(()),
+                |_| Ok(()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.text().await.unwrap(), "ok");
+        let seen = server.await.unwrap().to_ascii_lowercase();
+        assert!(seen.contains("authorization: bearer fixture-token"));
+        assert!(seen.contains("x-arbitrary: fixture-static"));
+        assert!(seen.contains("x-live: fixture-live"));
+        assert!(seen.contains("accept: application/json, text/event-stream"));
+        assert!(seen.contains("content-type: application/json"));
+    }
+
+    #[tokio::test]
+    async fn oauth_form_credentials_refuse_http_redirect_before_destination_resolution() {
+        let _env = crate::test_support::lock_test_env();
+        let _no_proxy = crate::test_support::EnvVarGuard::set("NO_PROXY", "*");
+        crate::tls::ensure_rustls_crypto_provider();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/token", listener.local_addr().unwrap());
+        let server = tokio::spawn(reply_once(listener, "HTTP/1.1 307 Redirect\r\nLocation: http://mcp-guard-fixture.invalid/token\r\nConnection: close\r\nContent-Length: 0\r\n\r\n".to_string()));
+        let session = client(&url, false).with_credential_transport().unwrap();
+        *session.dns_answers.lock().unwrap() = Some(std::collections::VecDeque::from([vec![
+            "93.184.216.34:80".parse().unwrap(),
+        ]]));
+        let error = session
+            .clone()
+            .execute(
+                session
+                    .post(&url)
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body("refresh_token=fixture-private-value")
+                    .build()
+                    .unwrap(),
+                true,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("credentials require HTTPS"));
+        assert!(!error.to_string().contains("fixture-private-value"));
+        assert_eq!(
+            session.dns_answers.lock().unwrap().as_ref().unwrap().len(),
+            1
+        );
+        assert!(server.await.unwrap().contains("POST /token"));
     }
 
     #[tokio::test]

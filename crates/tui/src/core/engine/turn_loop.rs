@@ -520,8 +520,10 @@ pub(super) fn requested_sandbox_escalation(
 ) -> Result<Option<(crate::sandbox::SandboxPolicy, String)>, ToolError> {
     let requested = input.get("sandbox_permissions");
     let justification = input.get("justification");
-    if !matches!(tool_name, "bash" | "Bash" | "exec_shell")
-        || (requested.is_none() && justification.is_none())
+    if !matches!(
+        tool_name,
+        "bash" | "Bash" | "exec_shell" | CODE_EXECUTION_TOOL_NAME | JS_EXECUTION_TOOL_NAME
+    ) || (requested.is_none() && justification.is_none())
     {
         return Ok(None);
     }
@@ -531,7 +533,7 @@ pub(super) fn requested_sandbox_escalation(
         .is_some_and(|action| action != "run")
     {
         return Err(ToolError::invalid_input(
-            "sandbox_permissions is only valid for Bash action=run",
+            "sandbox_permissions is only valid for code execution or Bash action=run",
         ));
     }
     let requested = requested
@@ -2107,14 +2109,14 @@ impl Engine {
                         &tool_name,
                         &tool_input,
                         if self.is_acp_turn() {
-                            crate::tui::auto_review::RunOrigin::Headless
+                            RunOrigin::Headless
                         } else if self.child_host.as_ref().is_some_and(|child| {
                             !child.authority.runtime.has_foreground_ownership()
                         }) {
                             // A detached child's caller remains background even
                             // for a synchronous tool. Full Access cannot bypass
                             // the existing catastrophic-background safety floor.
-                            crate::tui::auto_review::RunOrigin::Background
+                            RunOrigin::Background
                         } else {
                             auto_review_run_origin_for_plan(detached_start)
                         },
@@ -2301,6 +2303,11 @@ impl Engine {
             // elevated approval grants. A hard block above still wins.
             if blocked_error.is_none() {
                 match requested_sandbox_escalation(&tool_name, &tool_input, &batch_sandbox_policy) {
+                    Ok(Some(_)) if tool_registry.is_none() => {
+                        blocked_error = Some(ToolError::not_available(
+                            "sandbox escalation requires an effective tool context",
+                        ));
+                    }
                     Ok(Some((_policy, justification)))
                         if batch_approval_mode == ApprovalMode::Suggest =>
                     {
@@ -2351,14 +2358,20 @@ impl Engine {
 
             // An ordinary approval does not change the sandbox. Say that
             // on the gate itself; an explicit sandbox_permissions request
-            // takes the separate exact-call path above. Scoped to shell —
-            // file tools do not execute through the sandbox.
+            // takes the separate exact-call path above. Shell and interpreter
+            // tools share this policy; file tools do not launch sandboxed code.
             if approval_required
                 && batch_sandbox_read_only
                 && tool_input.get("sandbox_permissions").is_none()
                 && matches!(
                     tool_name.as_str(),
-                    "bash" | "Bash" | "Run" | "exec_shell" | "task_shell_start"
+                    "bash"
+                        | "Bash"
+                        | "Run"
+                        | "exec_shell"
+                        | "task_shell_start"
+                        | CODE_EXECUTION_TOOL_NAME
+                        | JS_EXECUTION_TOOL_NAME
                 )
             {
                 approval_description = format!(
@@ -3068,7 +3081,7 @@ impl Engine {
                                     let elevated_context = Some(
                                         batch_tool_context
                                             .clone()
-                                            .expect("registered shell tool context")
+                                            .expect("tool context validated while planning sandbox escalation")
                                             .with_elevated_sandbox_policy(policy),
                                     );
                                     (

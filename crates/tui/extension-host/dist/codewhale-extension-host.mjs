@@ -13642,6 +13642,7 @@ import { constants as constants2 } from "node:fs";
 import { lstat, mkdir, open, readdir, realpath, rename as rename2, unlink } from "node:fs/promises";
 import { isAbsolute as isAbsolute3, join } from "node:path";
 import { createHash as createHash3, randomUUID } from "node:crypto";
+import { setTimeout as delay2 } from "node:timers/promises";
 function checkKey(key) {
   if (typeof key !== "string" || !key.length || key.includes("\0") || Buffer.byteLength(key) > STORAGE_LIMITS.keyBytes) {
     throw new StorageError("invalid", `storage key must contain 1 to ${STORAGE_LIMITS.keyBytes} UTF-8 bytes and no NUL`);
@@ -13674,7 +13675,18 @@ function recordName(key) {
 function fsCode(error) {
   return error?.code;
 }
-async function readRecord(directory, name) {
+async function retryWindowsSharing(operation, beforeRetry) {
+  for (let retry = 0; ; retry++) {
+    if (retry) await beforeRetry?.();
+    try {
+      return await operation();
+    } catch (error) {
+      if (process.platform !== "win32" || retry >= 10 || !["EACCES", "EBUSY", "EPERM"].includes(fsCode(error) ?? "")) throw error;
+      await delay2(50);
+    }
+  }
+}
+async function readRecordOnce(directory, name) {
   const path = join(directory, name);
   let file;
   try {
@@ -13714,6 +13726,9 @@ function createStorage({ dataDir, isActive, onWarning }) {
   if (typeof dataDir !== "string" || !isAbsolute3(dataDir)) throw new StorageError("invalid", "plugin storage needs its assigned absolute dataDir");
   function active() {
     if (!isActive()) throw new StorageError("not_available", "plugin storage owner is no longer active");
+  }
+  async function readRecord(directory2, name) {
+    return retryWindowsSharing(() => readRecordOnce(directory2, name), active);
   }
   async function directory() {
     const stat = await lstat(dataDir);
@@ -13769,8 +13784,13 @@ function createStorage({ dataDir, isActive, onWarning }) {
       await file.sync();
       await file.close();
       file = void 0;
-      active();
-      await rename2(temporary, join(directory2, name));
+      await retryWindowsSharing(async () => {
+        active();
+        await rename2(temporary, join(directory2, name));
+      }, async () => {
+        active();
+        await readRecord(directory2, name);
+      });
       published = true;
       await syncDirectory(directory2);
     } finally {

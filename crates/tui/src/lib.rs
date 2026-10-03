@@ -2820,6 +2820,10 @@ async fn run_async_main_dispatch(
                 }
             }
             Commands::Resume { session_id, last } => {
+                tui::ui::require_interactive_terminal(
+                    io::stdin().is_terminal(),
+                    io::stdout().is_terminal(),
+                )?;
                 let config = load_config_from_cli(&cli)?;
                 let workspace = resolve_workspace(&cli);
                 let resume_id = resolve_session_id(session_id, last, &workspace)?;
@@ -2834,6 +2838,10 @@ async fn run_async_main_dispatch(
                 .await
             }
             Commands::Fork { session_id, last } => {
+                tui::ui::require_interactive_terminal(
+                    io::stdin().is_terminal(),
+                    io::stdout().is_terminal(),
+                )?;
                 let config = load_config_from_cli(&cli)?;
                 let prepared = prepare_interactive_config(&cli, &config, true)?;
                 let source_id = resolve_session_id(session_id, last, &prepared.workspace)?;
@@ -2858,6 +2866,8 @@ async fn run_async_main_dispatch(
             }
         };
     }
+
+    tui::ui::require_interactive_terminal(io::stdin().is_terminal(), io::stdout().is_terminal())?;
 
     // Top-level prompt mode: submit the initial prompt, then keep the TUI alive
     // for follow-up messages. Use `codewhale exec` for explicit non-interactive
@@ -12670,6 +12680,7 @@ async fn run_interactive_with_notice(
     pending_telemetry_notice: Option<crate::telemetry_notice::PendingTelemetryNotice>,
     plugin_registry: std::sync::Arc<crate::plugins::PluginRegistry>,
 ) -> Result<()> {
+    tui::ui::require_interactive_terminal(io::stdin().is_terminal(), io::stdout().is_terminal())?;
     let prepared = prepare_interactive_config(cli, config, resume_session_id.is_some())?;
     let (prepared, resume_session_id) = if let Some(selector) = resume_session_id {
         let (prepared, id) = prepare_mounted_session(
@@ -15938,7 +15949,7 @@ mod doctor_endpoint_tests {
 
         assert_eq!(report["provider"], "openai");
         assert_eq!(report["provider_source"], "config");
-        assert_eq!(report["provider_config_table"], "openai");
+        assert_eq!(report["provider_config_table"], "providers.openai");
         assert_eq!(report["model"], "deepseek-ai/DeepSeek-V4-Pro");
         assert_eq!(report["wire_protocol"], "chat_completions");
         assert_eq!(
@@ -15973,7 +15984,7 @@ mod doctor_endpoint_tests {
         let serialized = report.to_string();
 
         assert_eq!(report["provider"], "siliconflow-CN");
-        assert_eq!(report["provider_config_table"], "siliconflow_cn");
+        assert_eq!(report["provider_config_table"], "providers.siliconflow_cn");
         assert_eq!(report["model"], crate::config::DEFAULT_SILICONFLOW_MODEL);
         assert_eq!(
             report["base_url"]["redacted"],
@@ -19199,7 +19210,9 @@ mod setup_helper_tests {
             include_str!("logging.rs"),
             include_str!("../../config/src/lib.rs"),
             include_str!("../../config/src/provider.rs"),
+            include_str!("../../config/assets/provider_descriptors.json"),
             include_str!("../../cli/src/main.rs"),
+            include_str!("../../secrets/src/lib.rs"),
         ]
         .join("\n");
 
@@ -19372,7 +19385,7 @@ mod setup_helper_tests {
         assert_eq!(doctor_auth_scheme(&cloud), "bearer");
         let report = doctor_route_report(&cloud);
         assert_eq!(report["provider"], "ollama-cloud");
-        assert_eq!(report["provider_config_table"], "ollama_cloud");
+        assert_eq!(report["provider_config_table"], "providers.ollama_cloud");
 
         let custom_remote = ollama_config("https://ollama-gateway.example.test/v1");
         assert_eq!(
@@ -19518,11 +19531,11 @@ mod setup_helper_tests {
     fn provider_status_helpers_use_provider_metadata() {
         assert_eq!(
             provider_config_table_key(crate::config::ProviderKind::Anthropic),
-            "anthropic"
+            "providers.anthropic"
         );
         assert_eq!(
             provider_config_table_key(crate::config::ProviderKind::SiliconflowCN),
-            "siliconflow_cn"
+            "providers.siliconflow_cn"
         );
     }
 

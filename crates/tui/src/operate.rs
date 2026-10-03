@@ -1475,12 +1475,15 @@ api_key_env = "CW_OPERATE_MISSING_TEST_KEY"
         let _cli = crate::test_support::EnvVarGuard::remove("CODEWHALE_CLI_API_KEY");
         let root = TempDir::new()?;
         let manager = AutomationManager::open_for_test(root.path().join("automations"))?;
-        let config = crate::config::Config {
-            provider: Some("custom".into()),
-            default_text_model: Some("legacy-model".into()),
-            ..Default::default()
-        }
-        .with_legacy_root(None, Some("https://legacy.example.test/v1".into()));
+        let config = crate::config::parse_config_base(
+            r#"provider = "custom"
+[providers.custom]
+kind = "openai-compatible"
+base_url = "https://legacy.example.test/v1"
+model = "legacy-model"
+auth_mode = "none"
+"#,
+        )?;
         upsert_keepalive(&manager, root.path(), false, &config, None)?;
         let record = manager.get_automation(OPERATE_KEEPALIVE_ID)?;
         assert_eq!(record.model.as_deref(), Some("legacy-model"));

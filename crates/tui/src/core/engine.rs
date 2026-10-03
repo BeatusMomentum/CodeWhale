@@ -75,7 +75,7 @@ use codewhale_models::{
 #[cfg(test)]
 use super::authority::agent_approval_mode_for_turn;
 use super::authority::{
-    PolicyNarrowingEvent, TurnAuthority, effective_input_policy, shell_policy_for_mode,
+    PolicyNarrowingEvent, RunOrigin, TurnAuthority, effective_input_policy, shell_policy_for_mode,
 };
 use super::events::{Event, TurnOutcomeStatus, TurnRoute};
 use super::ops::{
@@ -2540,7 +2540,11 @@ impl Engine {
         let workspace = self.session.workspace.clone();
         let cap = self.config.snapshots_max_workspace_bytes;
         let sid = self.session.id.clone();
+        #[cfg(test)]
+        let env_ticket = crate::test_support::env_scope_ticket();
         let taken = tokio::task::spawn_blocking(move || {
+            #[cfg(test)]
+            let _membership = crate::test_support::join_env_scope(env_ticket);
             super::turn::restore_point_snapshot(&workspace, &label, cap, Some(&sid), since.as_ref())
         })
         .await
@@ -8652,13 +8656,11 @@ pub(crate) enum AutoReviewPlanDecision {
     ConsultReviewer(String),
 }
 
-pub(crate) fn auto_review_run_origin_for_plan(
-    detached_start: bool,
-) -> crate::tui::auto_review::RunOrigin {
+pub(crate) fn auto_review_run_origin_for_plan(detached_start: bool) -> RunOrigin {
     if detached_start {
-        crate::tui::auto_review::RunOrigin::Background
+        RunOrigin::Background
     } else {
-        crate::tui::auto_review::RunOrigin::Interactive
+        RunOrigin::Interactive
     }
 }
 

@@ -111,6 +111,59 @@ model = "k3[1m]"
 }
 
 #[test]
+fn doctor_json_parse_failure_never_enters_provider_dispatch() {
+    let fixture = TempDir::new().expect("fixture root");
+    let workspace = fixture.path().join("workspace");
+    let home = fixture.path().join("home");
+    let codewhale_home = fixture.path().join("isolated-codewhale-home");
+    fs::create_dir_all(&workspace).expect("workspace");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("owned provider listener");
+    listener
+        .set_nonblocking(true)
+        .expect("nonblocking listener");
+    let endpoint = listener.local_addr().expect("provider address");
+    let config = workspace.join("malformed.toml");
+    let config_bytes = format!(
+        "provider = \"openai\"\n[providers.openai]\nbase_url = \"http://{endpoint}/v1\"\napi_key = \"doctor-malformed-secret\"\nmodel =\n"
+    );
+    fs::write(&config, &config_bytes).expect("write malformed source");
+    let output = diagnostic_command(&workspace, &home)
+        .args([
+            "--config",
+            config.to_str().expect("config path"),
+            "doctor",
+            "--json",
+        ])
+        .env("CODEWHALE_HOME", &codewhale_home)
+        .output()
+        .expect("run malformed doctor json");
+
+    assert!(!output.status.success());
+    let report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("machine-readable parse error");
+    assert_eq!(report["error"]["kind"], "config_validation");
+    let all_output = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!all_output.contains("doctor-malformed-secret"));
+    assert!(
+        matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+        "a rejected diagnostic source must not contact its provider"
+    );
+    assert_eq!(
+        fs::read(&config).expect("source after report"),
+        config_bytes.as_bytes()
+    );
+    assert!(!home.exists(), "doctor must not create HOME state");
+    assert!(
+        !codewhale_home.exists(),
+        "doctor must not create Codewhale state"
+    );
+}
+
+#[test]
 fn doctor_json_omits_untrusted_config_validation_details() {
     let fixture = TempDir::new().expect("fixture root");
     let workspace = fixture.path().join("workspace");

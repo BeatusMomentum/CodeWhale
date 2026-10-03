@@ -1,5 +1,3 @@
-
-
 #[test]
 fn runtime_mcp_refresh_replaces_the_pool_slice() {
     let mut existing = api_tool("mcp_static_read");
@@ -237,64 +235,66 @@ fn workspace_write_carve_out_covers_the_default_ask_posture_only() {
 fn sandbox_escalation_requires_a_pair_and_a_strictly_wider_mode() {
     use crate::sandbox::SandboxPolicy;
 
-    let read_only = SandboxPolicy::ReadOnly;
-    let (workspace_write, reason) = requested_sandbox_escalation(
-        "bash",
-        &json!({
-            "command": "touch proof.txt",
-            "sandbox_permissions": "workspace-write",
-            "justification": "the command writes the requested workspace file"
-        }),
-        &read_only,
-    )
-    .expect("valid request")
-    .expect("escalation request");
-    assert!(matches!(
-        workspace_write,
-        SandboxPolicy::WorkspaceWrite { .. }
-    ));
-    assert_eq!(reason, "the command writes the requested workspace file");
-
-    let workspace_policy = SandboxPolicy::default();
-    let error = requested_sandbox_escalation(
-        "bash",
-        &json!({
-            "command": "touch proof.txt",
-            "sandbox_permissions": "workspace-write",
-            "justification": "same mode"
-        }),
-        &workspace_policy,
-    )
-    .expect_err("same policy is not an escalation");
-    assert!(error.to_string().contains("not strictly wider"), "{error}");
-
-    let error = requested_sandbox_escalation(
-        "bash",
-        &json!({
-            "command": "touch proof.txt",
-            "sandbox_permissions": "danger-full-access"
-        }),
-        &workspace_policy,
-    )
-    .expect_err("justification is required");
-    assert!(
-        error.to_string().contains("requires a justification"),
-        "{error}"
-    );
-
-    assert!(
-        requested_sandbox_escalation(
-            "dynamic_tool",
+    for tool in ["bash", CODE_EXECUTION_TOOL_NAME, JS_EXECUTION_TOOL_NAME] {
+        let read_only = SandboxPolicy::ReadOnly;
+        let (workspace_write, reason) = requested_sandbox_escalation(
+            tool,
             &json!({
-                "sandbox_permissions": "danger-full-access",
-                "justification": "same field names, unrelated contract"
+                "command": "touch proof.txt",
+                "sandbox_permissions": "workspace-write",
+                "justification": "the command writes the requested workspace file"
             }),
             &read_only,
         )
-        .expect("unrelated tool")
-        .is_none(),
-        "field-name collisions on non-shell tools must not create authority"
-    );
+        .expect("valid request")
+        .expect("escalation request");
+        assert!(matches!(
+            workspace_write,
+            SandboxPolicy::WorkspaceWrite { .. }
+        ));
+        assert_eq!(reason, "the command writes the requested workspace file");
+
+        let workspace_policy = SandboxPolicy::default();
+        let error = requested_sandbox_escalation(
+            tool,
+            &json!({
+                "command": "touch proof.txt",
+                "sandbox_permissions": "workspace-write",
+                "justification": "same mode"
+            }),
+            &workspace_policy,
+        )
+        .expect_err("same policy is not an escalation");
+        assert!(error.to_string().contains("not strictly wider"), "{error}");
+
+        let error = requested_sandbox_escalation(
+            tool,
+            &json!({
+                "command": "touch proof.txt",
+                "sandbox_permissions": "danger-full-access"
+            }),
+            &workspace_policy,
+        )
+        .expect_err("justification is required");
+        assert!(
+            error.to_string().contains("requires a justification"),
+            "{error}"
+        );
+
+        assert!(
+            requested_sandbox_escalation(
+                "dynamic_tool",
+                &json!({
+                    "sandbox_permissions": "danger-full-access",
+                    "justification": "same field names, unrelated contract"
+                }),
+                &read_only,
+            )
+            .expect("unrelated tool")
+            .is_none(),
+            "field-name collisions on non-shell tools must not create authority"
+        );
+    }
 }
 
 #[test]

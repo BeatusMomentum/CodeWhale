@@ -919,7 +919,7 @@
         for secret in [FILE_STORED_INACTIVE, BUILTIN_ENV_SECRET, CUSTOM_ENV_SECRET] {
             assert!(
                 !content.contains(secret),
-                "inactive secret survived: {secret}"
+                "inactive secret survived redaction"
             );
         }
         assert!(content.contains(codewhale_config::persistence::REDACTED));

@@ -723,7 +723,11 @@ fn cycle_effort_updates_effort_status_and_compaction() {
 #[test]
 fn glm_5_turbo_records_enabled_with_granularity_unavailable() {
     let mut app = App::new(test_options(false), &Config::default());
-    app.api_provider = ProviderKind::Zai;
+    app.set_provider_identity_record(
+        crate::config::Config::default()
+            .resolve_provider_identity(ProviderKind::Zai.as_str())
+            .expect("captured fixture provider"),
+    );
     app.auto_model = false;
     app.active_route_base_url = crate::config::DEFAULT_ZAI_BASE_URL.to_string();
     app.model = crate::config::ZAI_GLM_5_TURBO_MODEL.to_string();
@@ -772,7 +776,11 @@ fn glm_5_turbo_records_enabled_with_granularity_unavailable() {
 #[test]
 fn glm_5_1_records_enabled_with_granularity_unavailable() {
     let mut app = App::new(test_options(false), &Config::default());
-    app.api_provider = ProviderKind::Zai;
+    app.set_provider_identity_record(
+        crate::config::Config::default()
+            .resolve_provider_identity(ProviderKind::Zai.as_str())
+            .expect("captured fixture provider"),
+    );
     app.auto_model = false;
     app.active_route_base_url = crate::config::DEFAULT_ZAI_BASE_URL.to_string();
     app.model = crate::config::ZAI_GLM_5_1_MODEL.to_string();
@@ -804,7 +812,11 @@ fn glm_5_1_records_enabled_with_granularity_unavailable() {
 #[test]
 fn unknown_model_on_exact_zai_endpoint_records_effective_unavailable() {
     let mut app = App::new(test_options(false), &Config::default());
-    app.api_provider = ProviderKind::Zai;
+    app.set_provider_identity_record(
+        crate::config::Config::default()
+            .resolve_provider_identity(ProviderKind::Zai.as_str())
+            .expect("captured fixture provider"),
+    );
     app.auto_model = false;
     app.active_route_base_url = crate::config::DEFAULT_ZAI_BASE_URL.to_string();
     app.model = "glm-future-unknown".to_string();
@@ -836,7 +848,11 @@ fn unknown_model_on_exact_zai_endpoint_records_effective_unavailable() {
 #[test]
 fn compatible_zai_gateway_records_effective_unavailable() {
     let mut app = App::new(test_options(false), &Config::default());
-    app.api_provider = ProviderKind::Zai;
+    app.set_provider_identity_record(
+        crate::config::Config::default()
+            .resolve_provider_identity(ProviderKind::Zai.as_str())
+            .expect("captured fixture provider"),
+    );
     app.auto_model = false;
     app.active_route_base_url = "https://gateway.example/v1".to_string();
     app.model = crate::config::ZAI_GLM_5_2_MODEL.to_string();
@@ -889,7 +905,11 @@ fn minimax_m3_high_and_max_receipts_do_not_claim_tier_granularity() {
         (ReasoningEffort::Auto, ReasoningEffort::Off, "off"),
     ] {
         let mut app = App::new(test_options(false), &Config::default());
-        app.api_provider = ProviderKind::Minimax;
+        app.set_provider_identity_record(
+            crate::config::Config::default()
+                .resolve_provider_identity(ProviderKind::Minimax.as_str())
+                .expect("captured fixture provider"),
+        );
         app.auto_model = false;
         app.active_route_base_url = crate::config::DEFAULT_MINIMAX_BASE_URL.to_string();
         app.model = crate::config::DEFAULT_MINIMAX_MODEL.to_string();
@@ -939,7 +959,11 @@ fn minimax_anthropic_m3_high_and_max_receipts_match_adaptive_wire_truth() {
         (ReasoningEffort::Auto, ReasoningEffort::Off, "off"),
     ] {
         let mut app = App::new(test_options(false), &Config::default());
-        app.api_provider = ProviderKind::MinimaxAnthropic;
+        app.set_provider_identity_record(
+            crate::config::Config::default()
+                .resolve_provider_identity(ProviderKind::MinimaxAnthropic.as_str())
+                .expect("captured fixture provider"),
+        );
         app.auto_model = false;
         app.active_route_base_url = crate::config::DEFAULT_MINIMAX_ANTHROPIC_BASE_URL.to_string();
         app.model = crate::config::DEFAULT_MINIMAX_MODEL.to_string();
@@ -1082,7 +1106,11 @@ fn zai_gateway_off_and_high_receipts_remain_unavailable() {
         (ReasoningEffort::Max, ReasoningEffort::Auto, "auto"),
     ] {
         let mut app = App::new(test_options(false), &Config::default());
-        app.api_provider = ProviderKind::Zai;
+        app.set_provider_identity_record(
+            crate::config::Config::default()
+                .resolve_provider_identity(ProviderKind::Zai.as_str())
+                .expect("captured fixture provider"),
+        );
         app.auto_model = false;
         app.active_route_base_url = "https://gateway.example/v1".to_string();
         app.model = crate::config::ZAI_GLM_5_2_MODEL.to_string();
@@ -1105,7 +1133,11 @@ fn kimi_code_high_and_max_work_receipts_preserve_exact_tiers() {
         (ReasoningEffort::High, ReasoningEffort::Max),
     ] {
         let mut app = App::new(test_options(false), &Config::default());
-        app.api_provider = ProviderKind::Moonshot;
+        app.set_provider_identity_record(
+            crate::config::Config::default()
+                .resolve_provider_identity(ProviderKind::Moonshot.as_str())
+                .expect("captured fixture provider"),
+        );
         app.auto_model = false;
         app.active_route_base_url = crate::config::DEFAULT_KIMI_CODE_BASE_URL.to_string();
         app.model = crate::config::KIMI_CODE_K3_MODEL.to_string();
@@ -1655,7 +1687,11 @@ fn cycle_effort_scenario() {
     // from cycle_effort_walks_grok_46_official_ladder
     {
         let mut app = App::new(test_options(false), &Config::default());
-        app.api_provider = ProviderKind::Xai;
+        app.set_provider_identity_record(
+            crate::config::Config::default()
+                .resolve_provider_identity(ProviderKind::Xai.as_str())
+                .expect("captured fixture provider"),
+        );
         app.auto_model = false;
         app.active_route_base_url = crate::config::DEFAULT_XAI_BASE_URL.to_string();
         app.model = crate::config::XAI_GROK_4_6_MODEL.to_string();
@@ -1676,7 +1712,11 @@ fn cycle_effort_scenario() {
     // from cycle_effort_walks_grok_45_official_ladder_without_xhigh
     {
         let mut app = App::new(test_options(false), &Config::default());
-        app.api_provider = ProviderKind::Xai;
+        app.set_provider_identity_record(
+            crate::config::Config::default()
+                .resolve_provider_identity(ProviderKind::Xai.as_str())
+                .expect("captured fixture provider"),
+        );
         app.auto_model = false;
         app.active_route_base_url = crate::config::DEFAULT_XAI_BASE_URL.to_string();
         app.model = crate::config::XAI_GROK_4_5_MODEL.to_string();
@@ -1837,27 +1877,14 @@ fn app_new_exposes_direct_moonshot_k3_off_as_effective_low() {
 fn codex_startup_threads_fresh_roster_context_into_active_route_limits() {
     let _lock = lock_test_env();
     let tmp = tempfile::tempdir().expect("tempdir");
+    let canonical_home = tmp
+        .path()
+        .canonicalize()
+        .expect("canonical private fixture home");
     let config_path = tmp.path().join("config.toml");
-    let codex_home = tmp.path().join("codex-home");
-    std::fs::create_dir_all(&codex_home).expect("Codex home");
-    std::fs::write(
-        codex_home.join("models_cache.json"),
-        serde_json::to_vec(&serde_json::json!({
-            "fetched_at": chrono::Utc::now(),
-            "models": [{
-                "slug": crate::config::DEFAULT_OPENAI_CODEX_MODEL,
-                "priority": 1,
-                "context_window": 128000,
-                "supported_reasoning_levels": [{"effort": "high"}]
-            }]
-        }))
-        .expect("serialize cache"),
-    )
-    .expect("write cache");
     let _config_path = EnvVarGuard::set("DEEPSEEK_CONFIG_PATH", &config_path);
-    let _codex_home = EnvVarGuard::set("CODEX_HOME", &codex_home);
-    let _token = EnvVarGuard::set("OPENAI_CODEX_ACCESS_TOKEN", "test-codex-startup-token");
-    let config = Config {
+    let _home = EnvVarGuard::set("CODEWHALE_HOME", &canonical_home);
+    let mut config = Config {
         provider: Some("openai-codex".to_string()),
         providers: Some(ProvidersConfig {
             openai_codex: ProviderConfig {
@@ -1868,6 +1895,20 @@ fn codex_startup_threads_fresh_roster_context_into_active_route_limits() {
         }),
         ..Config::default()
     };
+
+    crate::oauth::install_test_chatgpt_registration(&mut config)
+        .expect("owned ChatGPT registration");
+    crate::codex_model_cache::install_test_chatgpt_roster_with_metadata(
+        &config,
+        vec![crate::codex_model_cache::CodexModelMetadata {
+            id: crate::config::DEFAULT_OPENAI_CODEX_MODEL.to_string(),
+            display_name: None,
+            context_window: Some(128_000),
+            reasoning: Some(true),
+            efforts: vec!["high".to_string()],
+        }],
+    )
+    .expect("account-scoped roster");
 
     let mut options = test_options(false);
     options.model = crate::config::DEFAULT_OPENAI_CODEX_MODEL.to_string();
@@ -6930,7 +6971,11 @@ async fn fixed_route_thinking_cycle_persists_raw_preference() {
     let _writes = crate::tui::startup_defaults::allow_writes_in_tests();
 
     let mut app = App::new(test_options(false), &Config::default());
-    app.api_provider = ProviderKind::Moonshot;
+    app.set_provider_identity_record(
+        crate::config::Config::default()
+            .resolve_provider_identity(ProviderKind::Moonshot.as_str())
+            .expect("captured fixture provider"),
+    );
     app.auto_model = false;
     app.active_route_base_url = crate::config::DEFAULT_MOONSHOT_BASE_URL.to_string();
     app.model = crate::config::MOONSHOT_KIMI_K3_MODEL.to_string();
@@ -7771,7 +7816,11 @@ fn assert_every_ctrl_t_press_changes_the_effective_tier(
     model: &str,
 ) -> Vec<ReasoningEffort> {
     let mut app = App::new(test_options(false), &Config::default());
-    app.api_provider = provider;
+    app.set_provider_identity_record(
+        crate::config::Config::default()
+            .resolve_provider_identity(provider.as_str())
+            .expect("captured fixture provider"),
+    );
     app.auto_model = false;
     app.active_route_base_url = base_url.to_string();
     app.model = model.to_string();

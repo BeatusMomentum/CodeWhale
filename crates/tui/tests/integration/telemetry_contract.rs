@@ -165,20 +165,22 @@ impl Fixture {
     /// The cheapest subcommand that still traverses the whole telemetry
     /// lifecycle: arm, `session_start`, dispatch, `session_end`, bounded local
     /// persistence. Verbose logging exposes the actual persistence outcome.
-    /// Structural `doctor` is a read-only Engine command: it traverses the
-    /// shared telemetry lifecycle without provider, MCP, or model execution.
+    /// The read-only `config telemetry` query traverses the shared command
+    /// lifecycle without provider, MCP, or model execution. Structural Doctor
+    /// deliberately has no telemetry lifecycle or persistence side effects.
     fn run_short_command(&self) -> Output {
         let mut command = self.command();
         command.args([
             "--verbose",
             "--config",
             self.config_path.to_str().expect("config path"),
-            "doctor",
+            "config",
+            "telemetry",
         ]);
-        let output = command.output().expect("run codewhale doctor");
+        let output = command.output().expect("run codewhale config telemetry");
         assert!(
             output.status.success(),
-            "doctor failed\nstdout:\n{}\nstderr:\n{}",
+            "config telemetry failed\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
@@ -700,10 +702,11 @@ async fn skip_onboarding_writes_no_telemetry_decision() {
             "--config",
             fixture.config_path.to_str().expect("config path"),
             "--skip-onboarding",
-            "doctor",
+            "config",
+            "telemetry",
         ])
         .output()
-        .expect("run codewhale doctor");
+        .expect("run short telemetry config command");
     assert!(output.status.success());
 
     let stdout = String::from_utf8_lossy(&output.stdout);

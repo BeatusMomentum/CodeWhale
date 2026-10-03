@@ -1,5 +1,3 @@
-
-
 #[tokio::test]
 async fn sync_session_projects_persisted_subagent_handoff_for_headless_restore() {
     let tmp = tempdir().expect("tempdir");
@@ -70,12 +68,16 @@ async fn sync_session_projects_persisted_subagent_handoff_for_headless_restore()
 #[tokio::test]
 async fn session_snapshot_records_the_literal_custom_table_id() {
     let tmp = tempdir().expect("tempdir");
-    let api_config = Config {
-        provider: Some("custom".to_string()),
-        default_text_model: Some("legacy-root-model".to_string()),
-        ..Config::default()
-    }
-    .with_legacy_root(None, Some("http://127.0.0.1:18180/v1".to_string()));
+    let api_config = crate::config::parse_config_base(
+        r#"provider = "custom"
+[providers.custom]
+kind = "openai-compatible"
+base_url = "http://127.0.0.1:18180/v1"
+model = "legacy-root-model"
+auth_mode = "none"
+"#,
+    )
+    .expect("canonical literal custom table");
     let config = EngineConfig {
         workspace: tmp.path().to_path_buf(),
         model: "legacy-root-model".to_string(),
@@ -1073,8 +1075,11 @@ fn reasoning_max_does_not_add_a_second_deepseek_v4_output_reservation() {
         input_tokens: None,
         output_tokens: None,
     };
-    let cap =
-        effective_max_output_tokens_for_route(ProviderKind::Vllm, "DeepSeek-V4-Flash", Some(limits));
+    let cap = effective_max_output_tokens_for_route(
+        ProviderKind::Vllm,
+        "DeepSeek-V4-Flash",
+        Some(limits),
+    );
     let request = codewhale_core::request::prepare_primary_turn_request(
         codewhale_core::request::PrimaryTurnRequest {
             model: "DeepSeek-V4-Flash".to_string(),
@@ -1173,7 +1178,8 @@ fn internal_context_budget_uses_the_wire_cap_across_window_sizes() {
         context_input_budget_for_provider(ProviderKind::Openai, "qwen3-32b-256k")
             .expect("a 256K-suffix model must yield Some budget via the effective-cap branch");
     let effective_output =
-        effective_max_output_tokens_for_route(ProviderKind::Openai, "qwen3-32b-256k", None) as usize;
+        effective_max_output_tokens_for_route(ProviderKind::Openai, "qwen3-32b-256k", None)
+            as usize;
     let expected_small = 256_000 - effective_output - 1_024;
     assert_eq!(small_window_budget, expected_small);
 }
@@ -1182,7 +1188,11 @@ const ROUTE_128K: &str = "deepseek-v3.2-128k";
 const SESSION_6508: &str = "session-6508";
 
 fn budget_128k() -> usize {
-    crate::route_budget::route_inline_char_budget_for_route(ProviderKind::Deepseek, ROUTE_128K, None)
+    crate::route_budget::route_inline_char_budget_for_route(
+        ProviderKind::Deepseek,
+        ROUTE_128K,
+        None,
+    )
 }
 
 fn view_128k(tool_name: &str, output: &ToolResult) -> super::context::ToolResultContextView {

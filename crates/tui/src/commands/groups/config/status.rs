@@ -910,7 +910,11 @@ mod tests {
     fn status_report_names_context_window_source_and_override_key() {
         let tmpdir = TempDir::new().expect("temp dir");
         let mut app = create_test_app(tmpdir.path().to_path_buf());
-        app.api_provider = ProviderKind::Moonshot;
+        app.set_provider_identity_record(
+            crate::config::Config::default()
+                .resolve_provider_identity(ProviderKind::Moonshot.as_str())
+                .expect("captured fixture provider"),
+        );
 
         let msg = status(&mut app).message.expect("status message");
 

@@ -576,8 +576,9 @@ mod tests {
         )
         .unwrap();
 
-        let mut app = create_test_app();
-        app.workspace = temp.path().to_path_buf();
+        let mut app = crate::test_support::test_app_with_options(
+            crate::test_support::test_tui_options(temp.path()),
+        );
         super::user_registry::reload(Some(temp.path()));
 
         let result = execute("/help now", &mut app);
@@ -597,8 +598,9 @@ mod tests {
         let command_path = commands_dir.join("help.md");
         std::fs::write(&command_path, "user help").unwrap();
 
-        let mut app = create_test_app();
-        app.workspace = temp.path().to_path_buf();
+        let mut app = crate::test_support::test_app_with_options(
+            crate::test_support::test_tui_options(temp.path()),
+        );
         super::user_registry::reload(Some(temp.path()));
         assert!(matches!(
             execute("/help config", &mut app).action,
