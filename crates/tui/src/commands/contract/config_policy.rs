@@ -358,7 +358,15 @@ mod tests {
         let original = "# keep\n[[rules]]\ntool = \"exec_shell\"\naction = \"allow\"\n\n[[rules]]\ntool = \"edit_file\"\naction = \"deny\"\n";
         fs::write(&path, original).unwrap();
         let before = facet.snapshot().unwrap();
-        assert_eq!(before.path, path);
+        // The config layer resolves the sibling file through
+        // `normalize_config_file_path`, so the reported path is canonical:
+        // `/private/var/...` on macOS and `\\?\C:\...` with the long name on
+        // Windows. Ask the same resolver instead of assuming the raw `TempDir`
+        // string, which only matches on Linux.
+        let resolved_path =
+            codewhale_config::resolve_permissions_path(Some(temp.path().join("config.toml")))
+                .unwrap();
+        assert_eq!(before.path, resolved_path);
         assert_eq!(before.rules[0].action, CommandPermissionAction::Allow);
         assert_eq!(before.rules[1].action, CommandPermissionAction::Deny);
         assert!(before.rules.iter().all(|r| r.applies_here));

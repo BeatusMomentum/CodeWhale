@@ -25,12 +25,26 @@ fn app(temp: &TempDir) -> App {
 }
 
 fn normalize(message: &str, temp: &TempDir) -> String {
-    let mut text = message.replace(
-        &codewhale_config::quote_os_path(&temp.path().join("permissions.toml")),
-        "\"<WORKSPACE>/permissions.toml\"",
-    );
-    text = text.replace(&crate::utils::display_path(temp.path()), "<WORKSPACE>");
-    text = text.replace(temp.path().to_str().unwrap(), "<WORKSPACE>");
+    let mut text = message.to_string();
+    // The permission path is canonicalised by the config layer
+    // (`normalize_config_file_path`): `/private/var/...` on macOS and
+    // `\\?\C:\...` with the long name on Windows. Replace the canonical form
+    // first — substituting the raw workspace prefix inside it would leave a
+    // stray `/private` behind — then the raw form used by the fixture.
+    let canonical = temp
+        .path()
+        .canonicalize()
+        .unwrap_or_else(|_| temp.path().to_path_buf());
+    for workspace in [canonical.as_path(), temp.path()] {
+        text = text.replace(
+            &codewhale_config::quote_os_path(&workspace.join("permissions.toml")),
+            "\"<WORKSPACE>/permissions.toml\"",
+        );
+        text = text.replace(&crate::utils::display_path(workspace), "<WORKSPACE>");
+        if let Some(workspace) = workspace.to_str() {
+            text = text.replace(workspace, "<WORKSPACE>");
+        }
+    }
     if let Some(audit) = crate::audit::audit_log_path() {
         text = text.replace(
             &codewhale_config::quote_os_path(&audit),
