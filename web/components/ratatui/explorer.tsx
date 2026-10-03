@@ -4,7 +4,10 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { Icon } from "@/components/icon";
 import type { RatatuiCopy } from "@/lib/content/ratatui";
+import { pickText } from "@/lib/i18n/dictionaries";
 import { motionId, previewAssetPath, searchEntries, type Catalogue, type EntryPreview } from "@/lib/ratatui/catalogue";
+import { TASKS, filterByTask, getGuidance } from "@/lib/ratatui/learning";
+import { getRecipe, recipeSourceUrl, learningGuideUrl } from "@/lib/ratatui/recipes";
 import "./explorer.css";
 
 type MotionTrack = {
@@ -20,7 +23,7 @@ type MotionTrack = {
 
 const REPOSITORY = "https://github.com/Hmbown/codewhale-ratatui";
 
-function CopyButton({ text, copy }: { text: string; copy: RatatuiCopy }) {
+export function CopyButton({ text, copy }: { text: string; copy: RatatuiCopy }) {
   const [status, setStatus] = useState<"idle" | "copied" | "error">("idle");
   useEffect(() => {
     if (status === "idle") return;
@@ -88,7 +91,7 @@ function MotionPlayer({ id, copy, fit }: { id: string; copy: RatatuiCopy; fit: b
   if (error) return <div className="rat-load" role="alert"><p>{copy.previewError}</p><button className="rat-button" onClick={() => setAttempt((value) => value + 1)}>{copy.retry}</button></div>;
   if (!track) return <div className="rat-load" role="status">{copy.loading}</div>;
   return <div className="rat-motion">
-    <div className="rat-motion-intro"><p>{track.title}</p><span>{track.profile} · {copy.frameCount.replace("{count}", String(track.frames.length))}</span></div>
+    <div className="rat-motion-intro"><p>{copy.relatedMotion}: {track.title}</p><span>{track.profile} · {copy.frameCount.replace("{count}", String(track.frames.length))}</span></div>
     <TerminalImage svg={track.frames[frame]} label={`${track.title} · ${copy.frame} ${frame + 1}`} fit={fit} width={track.width} height={track.height} />
     <div className="rat-motion-controls">
       <button type="button" className="rat-button rat-button-primary" onClick={() => setPlaying(!playing)} aria-pressed={playing}>{playing ? copy.pause : copy.play}</button>
@@ -106,21 +109,25 @@ export function RatatuiExplorer({ catalogue, locale, copy, initialEntry }: { cat
   const [selected, setSelected] = useState(first.name);
   const [query, setQuery] = useState("");
   const [family, setFamily] = useState("all");
+  const [task, setTask] = useState("all");
   const [browserExpanded, setBrowserExpanded] = useState(true);
   const [mobile, setMobile] = useState(false);
   const [profile, setProfile] = useState("dark-truecolor");
   const [size, setSize] = useState("native");
   const [fit, setFit] = useState(true);
-  const [tab, setTab] = useState<"preview" | "code" | "motion">("preview");
+  const [tab, setTab] = useState<"preview" | "use" | "code" | "motion">("preview");
   const [data, setData] = useState<EntryPreview | null>(null);
   const [error, setError] = useState(false);
   const [attempt, setAttempt] = useState(0);
   const searchRef = useRef<HTMLInputElement>(null);
-  const entry = catalogue.entries.find((item) => item.name === selected) ?? first;
+  const filtered = useMemo(() => searchEntries(filterByTask(catalogue.entries, task), query, family), [catalogue.entries, query, family, task]);
+  const entry = filtered.find((item) => item.name === selected) ?? filtered[0] ?? first;
   const collection = catalogue.families.find((item) => item.id === entry.family);
-  const filtered = useMemo(() => searchEntries(catalogue.entries, query, family), [catalogue.entries, query, family]);
+  const guidance = getGuidance(entry, locale);
+  const recipe = getRecipe(guidance.recipeId);
   const animation = motionId(entry, profile);
-  const currentIndex = filtered.findIndex((item) => item.name === selected);
+  const activeTab = tab === "motion" && !animation ? "preview" : tab;
+  const currentIndex = filtered.findIndex((item) => item.name === entry.name);
   const svg = data?.previews[profile]?.[size];
   const label = copy.terminalPreviewLabel.replace("{name}", entry.title);
   const sourceUrl = entry.source.url;
@@ -153,38 +160,57 @@ export function RatatuiExplorer({ catalogue, locale, copy, initialEntry }: { cat
     return () => media.removeEventListener("change", update);
   }, []);
   const choose = (name: string) => { setSelected(name); setTab("preview"); if (mobile) setBrowserExpanded(false); };
-  const example = data ? [data.fixture.imports, data.fixture.code].filter(Boolean).join("\n\n") : "";
+  const helpers = data?.fixture.helpers?.map((helper) => helper.code).join("\n\n") ?? "";
+  const example = data ? [data.fixture.imports, data.fixture.code, helpers].filter(Boolean).join("\n\n") : "";
+  const clearFilters = () => { setQuery(""); setFamily("all"); setTask("all"); };
   return <section className="rat-explorer" aria-label={copy.title}>
+    <div className="rat-task-picker">
+      <div><h2>{copy.tasksTitle}</h2><p>{copy.tasksDescription}</p></div>
+      <div className="rat-task-options" role="group" aria-label={copy.tasksTitle}>
+        <button type="button" className="rat-button" aria-pressed={task === "all"} onClick={clearFilters}>{copy.allComponents}</button>
+        {TASKS.map((item) => <button key={item.id} type="button" className="rat-button" aria-pressed={task === item.id} onClick={() => {
+          setTask(item.id); setFamily("all"); setQuery("");
+          choose(item.recommended.find((name) => catalogue.entries.some((candidate) => candidate.name === name)) ?? first.name);
+        }}>{pickText(item.label, locale)}</button>)}
+      </div>
+      {task !== "all" && <p className="rat-task-description">{pickText(TASKS.find((item) => item.id === task)!.description, locale)}</p>}
+    </div>
     <aside className="rat-browser" aria-label={copy.componentNavLabel}>
       <label className="rat-search" htmlFor="rat-search"><span>{copy.searchLabel}</span><div><Icon name="search" /><input id="rat-search" ref={searchRef} type="search" value={query} placeholder={copy.searchPlaceholder} onChange={(event) => { setQuery(event.target.value); if (mobile) setBrowserExpanded(true); }} onKeyDown={(event) => { if (event.key === "Escape") setQuery(""); }} /><kbd>/</kbd></div></label>
-      <label className="rat-family-field" htmlFor="rat-family">{copy.families}<select id="rat-family" value={family} onChange={(event) => { setFamily(event.target.value); if (mobile) setBrowserExpanded(true); }}><option value="all">{copy.allComponents}</option>{catalogue.families.map((item) => <option key={item.id} value={item.id}>{item.title} ({item.count})</option>)}</select></label>
+      <label className="rat-family-field" htmlFor="rat-family">{copy.families}<select id="rat-family" value={family} onChange={(event) => { setFamily(event.target.value); setTask("all"); if (mobile) setBrowserExpanded(true); }}><option value="all">{copy.allComponents}</option>{catalogue.families.map((item) => <option key={item.id} value={item.id}>{item.title} ({item.count})</option>)}</select></label>
       <p className="rat-count" role="status">{copy.visibleCount.replace("{visible}", String(filtered.length)).replace("{total}", String(catalogue.entries.length))}</p>
       <details className="rat-browser-results" open={browserExpanded} onToggle={(event) => setBrowserExpanded(event.currentTarget.open)}><summary>{copy.allComponents}<Icon name="chevron-down" /></summary>
       <nav className="rat-entry-list" aria-label={copy.resultsLabel}>
         {catalogue.families.map((item) => {
           const entries = filtered.filter((candidate) => candidate.family === item.id);
-          return entries.length ? <div className="rat-family" key={item.id}><h3>{item.title}</h3>{entries.map((candidate) => <button type="button" key={candidate.name} className="rat-entry" aria-current={candidate.name === selected ? "true" : undefined} onClick={() => choose(candidate.name)}><span>{candidate.title}</span><span className="rat-entry-width">{candidate.width}</span></button>)}</div> : null;
+          return entries.length ? <div className="rat-family" key={item.id}><h3>{item.title}</h3>{entries.map((candidate) => <button type="button" key={candidate.name} className="rat-entry" aria-current={candidate.name === entry.name ? "true" : undefined} onClick={() => choose(candidate.name)}><span>{candidate.title}</span><span className="rat-entry-width">{candidate.width}</span></button>)}</div> : null;
         })}
-        {filtered.length === 0 && <div className="rat-empty"><h3>{copy.emptyTitle}</h3><p>{copy.emptyDescription}</p><button className="rat-button" onClick={() => { setQuery(""); setFamily("all"); }}>{copy.clearSearch}</button></div>}
       </nav></details>
     </aside>
-    <div className="rat-study">
+    {filtered.length === 0 ? <div className="rat-study rat-empty-study"><h2>{copy.emptyTitle}</h2><p>{copy.emptyDescription}</p><button className="rat-button" onClick={clearFilters}>{copy.clearSearch}</button></div> : <div className="rat-study">
       <div className="rat-study-heading"><div><p>{collection?.title}</p><h2>{entry.title}</h2></div><Link href={`/${locale}/ratatui/${entry.name}`} className="rat-link" title={copy.share}>{copy.share}<Icon name="external" /></Link></div>
       <p className="rat-description">{entry.description}</p>
       <div className="rat-study-tabs" role="group" aria-label={copy.preview}>
-        <button type="button" aria-pressed={tab === "preview"} onClick={() => setTab("preview")}>{copy.preview}</button>
-        <button type="button" aria-pressed={tab === "code"} onClick={() => setTab("code")}>{copy.code}</button>
-        {animation && <button type="button" aria-pressed={tab === "motion"} onClick={() => { setTab("motion"); if (profile !== "light-truecolor") setProfile("dark-truecolor"); }}>{copy.motion}</button>}
+        <button type="button" aria-pressed={activeTab === "preview"} onClick={() => setTab("preview")}>{copy.preview}</button>
+        <button type="button" aria-pressed={activeTab === "use"} onClick={() => setTab("use")}>{copy.use}</button>
+        <button type="button" aria-pressed={activeTab === "code"} onClick={() => setTab("code")}>{copy.code}</button>
+        {animation && <button type="button" aria-pressed={activeTab === "motion"} onClick={() => { setTab("motion"); if (profile !== "light-truecolor") setProfile("dark-truecolor"); }}>{copy.motion}</button>}
         <div className="rat-pager"><button type="button" aria-label={copy.previous} disabled={currentIndex <= 0} onClick={() => choose(filtered[currentIndex - 1].name)}><Icon name="arrow-right" className="rat-prev-icon" /></button><button type="button" aria-label={copy.next} disabled={currentIndex < 0 || currentIndex >= filtered.length - 1} onClick={() => choose(filtered[currentIndex + 1].name)}><Icon name="arrow-right" /></button></div>
       </div>
-      {tab !== "code" && <div className="rat-preview-controls">{(tab !== "motion" || !["whale", "habitat"].includes(animation ?? "")) && <label className="rat-field">{copy.profile}<select aria-label={copy.profile} value={profile} onChange={(event) => setProfile(event.target.value)}>{catalogue.profiles.filter((item) => tab !== "motion" || ["dark-truecolor", "light-truecolor"].includes(item.id)).map((item) => <option key={item.id} value={item.id}>{item.label}</option>)}</select></label>}{tab === "preview" && <label className="rat-field">{copy.size}<select aria-label={copy.size} value={size} onChange={(event) => setSize(event.target.value)}>{catalogue.sizes.map((item) => <option key={item.id} value={item.id}>{item.id === "native" ? copy.nativeSize : copy.columns.replace("{count}", item.id)}</option>)}</select></label>}<button type="button" className="rat-button rat-scale" onClick={() => setFit(!fit)} aria-pressed={!fit}>{fit ? copy.actualSize : copy.fit}</button></div>}
-      {tab === "motion" && animation ? <MotionPlayer key={animation} id={animation} copy={copy} fit={fit} /> : tab === "code" ? <div className="rat-code-panel"><div className="rat-code-heading"><h3>{copy.fixtureTitle}</h3><CopyButton text={example} copy={copy} /></div>{data ? <pre tabIndex={0} dir="ltr"><code>{example}</code></pre> : <p role="status">{error ? copy.previewError : copy.loading}</p>}<p className="rat-note">{copy.fixtureNote} <a href={sourceUrl}>{copy.openSource}<Icon name="external" /></a></p></div> : <>
+      {(activeTab === "preview" || activeTab === "motion") && <div className="rat-preview-controls">{(activeTab !== "motion" || !["whale", "habitat"].includes(animation ?? "")) && <label className="rat-field">{copy.profile}<select aria-label={copy.profile} value={profile} onChange={(event) => setProfile(event.target.value)}>{catalogue.profiles.filter((item) => activeTab !== "motion" || ["dark-truecolor", "light-truecolor"].includes(item.id)).map((item) => <option key={item.id} value={item.id}>{item.label}</option>)}</select></label>}{activeTab === "preview" && <label className="rat-field">{copy.size}<select aria-label={copy.size} value={size} onChange={(event) => setSize(event.target.value)}>{catalogue.sizes.map((item) => <option key={item.id} value={item.id}>{item.id === "native" ? copy.nativeSize : copy.columns.replace("{count}", item.id)}</option>)}</select></label>}<button type="button" className="rat-button rat-scale" onClick={() => setFit(!fit)} aria-pressed={!fit}>{fit ? copy.actualSize : copy.fit}</button></div>}
+      {activeTab === "use" ? <div className="rat-code-panel rat-usage-panel">
+        <h3>{guidance.title}</h3><p>{guidance.description}</p><p className="rat-note">{guidance.hostNote}</p>
+        {recipe && <><div className="rat-code-heading"><h4>{copy.use}</h4><CopyButton text={recipe.code} copy={copy} /></div><pre tabIndex={0} dir="ltr"><code>{recipe.code}</code></pre><p className="rat-note">{copy.recipeNote} <a href={recipeSourceUrl(recipe.line)}>{copy.openSource}<Icon name="external" /></a></p></>}
+        <div className="rat-usage-links"><a className="rat-link" href={learningGuideUrl(guidance.guideAnchor)}>{copy.guide}<Icon name="external" /></a><Link className="rat-link" href={`/${locale}/ratatui#ratatui-install`}>{copy.gettingStarted}<Icon name="arrow-right" /></Link></div>
+        <p className="rat-note">{copy.runExample}</p><pre tabIndex={0} dir="ltr"><code>{`cargo run --locked --example ${recipe ? "recipes" : guidance.example.replace(/^examples\//, "").replace(/\.rs$/, "")}`}</code></pre>{recipe && <p className="rat-note">{copy.recipeControls}</p>}
+      </div> :
+      activeTab === "motion" && animation ? <MotionPlayer key={animation} id={animation} copy={copy} fit={fit} /> : activeTab === "code" ? <div className="rat-code-panel"><div className="rat-code-heading"><h3>{copy.fixtureTitle}</h3><CopyButton text={example} copy={copy} /></div>{data ? <pre tabIndex={0} dir="ltr"><code>{example}</code></pre> : <div className="rat-load" role={error ? "alert" : "status"}><p>{error ? copy.previewError : copy.loading}</p>{error && <button className="rat-button" onClick={() => setAttempt((value) => value + 1)}>{copy.retry}</button>}</div>}<p className="rat-note">{copy.fixtureNote} <a href={sourceUrl}>{copy.openSource}<Icon name="external" /></a></p></div> : <>
         {error ? <div className="rat-load" role="alert"><p>{copy.previewError}</p><button className="rat-button" type="button" onClick={() => setAttempt((value) => value + 1)}>{copy.retry}</button></div> : svg ? <TerminalImage svg={svg} label={label} fit={fit} width={columns} height={entry.height} /> : <div className="rat-load" role="status">{copy.previewLoading}</div>}
         <div className="rat-preview-meta"><span>{columns} × {entry.height}</span><span>{profile}</span>{svg && <a className="rat-link" href={`data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`} download={`${entry.name}.${profile}.${size}.svg`}>{copy.downloadSvg}<Icon name="external" /></a>}</div>
         <p className="rat-note">{copy.renderedPreviewNote}</p>
       </>}
       <div className="rat-api"><h3>{copy.api}</h3><div>{entry.api.map((symbol) => <a key={symbol} href={sourceUrl}><code>{symbol}</code></a>)}</div><p>{copy.hostNote}</p></div>
       <div className="rat-project"><h3>{copy.projectStatus}</h3><div className="rat-project-links"><a href={`${REPOSITORY}/commit/${catalogue.source.revision}`}>{copy.sourceRevision}<code>{catalogue.source.revision.slice(0, 7)}</code></a><a href={`${REPOSITORY}/actions/workflows/ci.yml?query=branch%3Amain`}>{copy.buildChecks}<Icon name="external" /></a><a href={`${REPOSITORY}/actions/workflows/gallery.yml?query=branch%3Amain`}>{copy.galleryChecks}<Icon name="external" /></a><a href={`${REPOSITORY}/releases`}>{copy.releaseHistory}<Icon name="external" /></a></div></div>
-    </div>
+    </div>}
   </section>;
 }
