@@ -20,6 +20,7 @@
 
 /** Contributors whose PRs were merged or harvested into this release. */
 export const RELEASE_CONTRIBUTORS: string[] = [
+  "@Guan0923",
   "@Andrea-Bruno",
   "@aiapienthusiast",
   "@gaord",
