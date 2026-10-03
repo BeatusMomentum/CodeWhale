@@ -31,10 +31,11 @@ impl RegisterCommand<CommandResult> for PermissionsCmd {
 }
 pub fn execute(contexts: CommandContexts<'_>, arg: Option<&str>) -> CommandResult {
     let parts = contexts.into_parts();
-    let (Some(permissions), Some(presentation)) = (parts.permissions, parts.presentation) else {
-        return CommandResult::error(
-            "permissions command requires permission and presentation capabilities",
-        );
+    let Some(permissions) = parts.permissions else {
+        return CommandResult::error("Command capability unavailable: permissions");
+    };
+    let Some(presentation) = parts.presentation else {
+        return CommandResult::error("Command capability unavailable: presentation");
     };
     let messages = match Messages::load(presentation) {
         Ok(messages) => messages,

@@ -383,3 +383,54 @@ fn status_translation_failure_never_observes_host() {
     assert!(result.action.is_none());
     assert_eq!(s.reads.get(), 0);
 }
+
+#[test]
+fn missing_facets_use_the_inherited_exact_error_contract() {
+    let missing = permissions::execute(CommandContexts::empty(), None);
+    assert_eq!(
+        missing.message.as_deref(),
+        Some("Error: Command capability unavailable: permissions")
+    );
+    let missing = status::execute(CommandContexts::empty(), None);
+    assert_eq!(
+        missing.message.as_deref(),
+        Some("Error: Command capability unavailable: config_status")
+    );
+    let mut permissions = Permissions::new();
+    let missing = permissions::execute(
+        CommandContexts::empty().with_permissions(&mut permissions),
+        None,
+    );
+    assert_eq!(
+        missing.message.as_deref(),
+        Some("Error: Command capability unavailable: presentation")
+    );
+    let mut status = Status {
+        view: status_view(),
+        reads: Cell::new(0),
+    };
+    let missing = status::execute(
+        CommandContexts::empty().with_config_status(&mut status),
+        None,
+    );
+    assert_eq!(
+        missing.message.as_deref(),
+        Some("Error: Command capability unavailable: presentation")
+    );
+    assert_eq!(permissions.reads.get(), 0);
+    assert_eq!(status.reads.get(), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn permissions_quote_non_utf8_paths_without_losing_bytes_or_emitting_controls() {
+    use std::os::unix::ffi::OsStringExt;
+    let mut permissions = Permissions::new();
+    permissions.view.path = std::ffi::OsString::from_vec(vec![b'b', b'a', b'd', 0xff, 0x1b]).into();
+    let result = permission(&mut permissions, None);
+    assert!(!result.is_error);
+    let text = result.message.unwrap();
+    assert!(text.contains("\"bad\\xff\\x1b\""), "{text}");
+    assert!(!text.contains('\u{1b}'));
+    assert!(permissions.removals.is_empty());
+}

@@ -35,10 +35,11 @@ fn tr(messages: &Messages, id: MessageId) -> Cow<'static, str> {
 /// Show a compact runtime status report for the current TUI session.
 pub fn execute(contexts: CommandContexts<'_>, _arg: Option<&str>) -> CommandResult {
     let parts = contexts.into_parts();
-    let (Some(status), Some(presentation)) = (parts.config_status, parts.presentation) else {
-        return CommandResult::error(
-            "status command requires status and presentation capabilities",
-        );
+    let Some(status) = parts.config_status else {
+        return CommandResult::error("Command capability unavailable: config_status");
+    };
+    let Some(presentation) = parts.presentation else {
+        return CommandResult::error("Command capability unavailable: presentation");
     };
     let messages = match Messages::load(presentation) {
         Ok(messages) => messages,

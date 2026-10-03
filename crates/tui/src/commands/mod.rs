@@ -3104,6 +3104,8 @@ mod tests {
 }
 
 #[cfg(test)]
+mod config_policy_host_tests;
+#[cfg(test)]
 mod config_policy_permissions_tests;
 #[cfg(test)]
 mod config_policy_status_tests;
