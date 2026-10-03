@@ -20,3 +20,6 @@ pub use types::*;
 
 #[cfg(test)]
 mod tests;
+
+pub mod metrics;
+pub mod tool_outputs;

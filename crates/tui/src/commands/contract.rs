@@ -38,6 +38,7 @@ use config_policy::{ConfigStatusAdapter, PermissionsAdapter};
 mod debug_diagnostics;
 pub(in crate::commands) mod debug_operations;
 use debug_operations::DebugOperationsAdapter;
+mod config_policy_messages;
 mod diagnostics_messages;
 #[cfg(test)]
 pub(crate) use debug_diagnostics::CostComponents as DebugCostComponents;
@@ -2057,6 +2058,7 @@ impl CommandPresentationContext for PresentationAdapter<'_> {
             .or_else(|| key_to_plugin_message_id(key))
             .or_else(|| key_to_session_message_id(key))
             .or_else(|| diagnostics_messages::resolve(key))
+            .or_else(|| config_policy_messages::resolve(key))
         else {
             return Err("unknown translation key".to_string());
         };

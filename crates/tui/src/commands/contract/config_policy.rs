@@ -153,26 +153,7 @@ fn project_status(app: &App) -> ConfigStatusView {
         snapshot_notice: crate::core::turn::snapshots_disabled_status(
             &app.workspace,
             app.current_session_id.as_deref(),
-        )
-        .map(|notice| StatusSnapshotNotice {
-            workspace: notice.workspace,
-            limit: notice.limit,
-            scope: match notice.scope {
-                crate::core::turn::SnapshotsDisabledScope::WorkspaceTooLarge => {
-                    StatusSnapshotScope::WorkspaceTooLarge
-                }
-                crate::core::turn::SnapshotsDisabledScope::TooManyFiles => {
-                    StatusSnapshotScope::TooManyFiles
-                }
-                crate::core::turn::SnapshotsDisabledScope::UnsafeLocation => {
-                    StatusSnapshotScope::UnsafeLocation
-                }
-                crate::core::turn::SnapshotsDisabledScope::HistoryRepaired => {
-                    StatusSnapshotScope::HistoryRepaired
-                }
-                crate::core::turn::SnapshotsDisabledScope::Failing => StatusSnapshotScope::Failing,
-            },
-        }),
+        ),
         context_used,
         context_window,
         context_source,
@@ -204,24 +185,9 @@ fn project_status(app: &App) -> ConfigStatusView {
         cache_miss_tokens: app.session.displayed_total_cache_miss_tokens(),
         cost: app.session_cost_for_currency(app.cost_currency),
         currency: to_command_currency(app.cost_display_currency(app.cost_currency)),
-        metrics: StatusMetrics {
-            turns: metrics.turns,
-            steps: metrics.steps,
-            llm_time: metrics.llm_time,
-            tool_time: metrics.tool_time,
-            ttft_avg: metrics.ttft_avg,
-            tokens_per_second: metrics.tokens_per_second,
-            cache_hit_percent: metrics.cache_hit_percent,
-            input_tokens: metrics.input_tokens,
-        },
+        metrics,
         ascii_safe: crate::tui::color_compat::ascii_safe_enabled(),
-        tool_outputs: StatusToolOutputs {
-            raw_large_count: outputs.raw_large_count,
-            raw_large_chars: outputs.raw_large_chars,
-            receipt_count: outputs.receipt_count,
-            artifact_count: outputs.artifact_count,
-            artifact_bytes: outputs.artifact_bytes,
-        },
+        tool_outputs: outputs,
     }
 }
 

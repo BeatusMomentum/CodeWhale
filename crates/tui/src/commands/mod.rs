@@ -6,6 +6,7 @@
 //! module keeps registry construction, user-command precedence, and the
 //! fall-through behaviour.
 
+mod config_policy_host;
 mod contract;
 pub mod discovery;
 mod groups;
@@ -3101,3 +3102,8 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod config_policy_permissions_tests;
+#[cfg(test)]
+mod config_policy_status_tests;

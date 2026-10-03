@@ -76,13 +76,19 @@ pub struct StatusFleetDrift {
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatusSnapshotScope {
+    /// Snapshot-eligible content exceeds the configured workspace size cap.
     WorkspaceTooLarge,
+    /// The entry ceiling is independent from the configurable size cap.
     TooManyFiles,
+    /// Home/root locations remain refused regardless of the size setting.
     UnsafeLocation,
+    /// Missing history was restarted; earlier restore points are gone.
     HistoryRepaired,
+    /// A real git/disk failure; the notice limit field carries the error.
     Failing,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Retained semantic observation shared by status and transient host notices.
 pub struct StatusSnapshotNotice {
     pub workspace: String,
     pub scope: StatusSnapshotScope,
@@ -190,4 +196,19 @@ pub struct ConfigStatusView {
 /// No config/session mutation, provider refresh or rendered-report callback.
 pub trait CommandConfigStatusContext {
     fn snapshot(&self) -> ConfigStatusView;
+}
+
+/// The size-cap remedy is shared by the status report and host toast.
+pub const SNAPSHOTS_CAP_CONFIG_KEY: &str = "[snapshots] max_workspace_gb";
+impl StatusSnapshotNotice {
+    pub fn render(&self, template: &str) -> String {
+        codewhale_protocol::display::interpolate(
+            template,
+            &[
+                ("{workspace}", &self.workspace),
+                ("{limit}", &self.limit),
+                ("{config_key}", SNAPSHOTS_CAP_CONFIG_KEY),
+            ],
+        )
+    }
 }
